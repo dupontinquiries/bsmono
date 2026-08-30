@@ -74,14 +74,21 @@ fn quad(ui: &mut Vec<UiVert>, x0: f32, y0: f32, x1: f32, y1: f32, c: [f32; 4]) {
     ui.extend_from_slice(&[v(x0, y0), v(x1, y0), v(x1, y1), v(x0, y0), v(x1, y1), v(x0, y1)]);
 }
 
-const INK: [f32; 4] = [0.10, 0.09, 0.13, 0.85];
-const PAPER: [f32; 4] = [1.0, 0.98, 0.94, 0.95];
-const GOLD: [f32; 4] = [1.0, 0.84, 0.30, 0.95];
-const DIM: [f32; 4] = [1.0, 0.98, 0.94, 0.55];
-const SEL: [f32; 4] = [0.17, 0.21, 0.25, 0.92]; // soldier's button fill
-const CYAN: [f32; 4] = [0.59, 0.82, 0.92, 0.95];  // soldier's info color
-const WARN: [f32; 4] = [1.0, 0.35, 0.30, 0.95];
-const SHADOW: [f32; 4] = [0.02, 0.02, 0.05, 0.75];
+// ── THEME: "neon glass" — cyberpunk × unendlich (operator-directed mix) ──
+// The custom blackstar art style arrives later; until then, unendlich's
+// frosted-glass language (deep blue-glass panels, ice text, the #6fc3ff
+// accent) crossed with cyberpunk neon (electric amber for the pick, hot
+// magenta for warnings, harder darks). One palette block so every screen
+// — pause, tweaks, maps, catalog, the shipboard consoles — shifts together
+// and cannot disagree with itself. Previous "warm paper" palette in git.
+const INK: [f32; 4] = [0.045, 0.060, 0.105, 0.88]; // deep glass backdrop
+const PAPER: [f32; 4] = [0.874, 0.902, 0.957, 0.97]; // unendlich ice text (223,230,244)
+const GOLD: [f32; 4] = [1.0, 0.80, 0.22, 0.97]; // electric amber — the pick
+const DIM: [f32; 4] = [0.72, 0.77, 0.86, 0.55]; // ice text, faded
+const SEL: [f32; 4] = [0.24, 0.35, 0.53, 0.62]; // unendlich glass-blue button fill
+const CYAN: [f32; 4] = [0.435, 0.765, 1.0, 0.97]; // the unendlich accent, #6fc3ff
+const WARN: [f32; 4] = [1.0, 0.24, 0.55, 0.97]; // hot magenta — cyber warn
+const SHADOW: [f32; 4] = [0.01, 0.02, 0.05, 0.80];
 
 /// Drop-shadowed text: one dark offset copy under the real one.
 /// A filled circle in NDC (aspect-corrected), for the touch controls.
@@ -286,7 +293,7 @@ pub fn draw_deck(ui: &mut Vec<UiVert>, a: f32, v: &crate::deck::DeckView) {
 pub fn draw_menu(ui: &mut Vec<UiVert>, a: f32, m: &crate::menu::Menu) {
     quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.55]);
     let scr = ui_layout::Screen::new(a);
-    let cmds = ui_layout::menu_cmds(&scr, m, T_BODY, PAPER, DIM, [0.22, 0.34, 0.58, 0.55]);
+    let cmds = ui_layout::menu_cmds(&scr, m, T_BODY, PAPER, DIM, [0.27, 0.45, 0.66, 0.55]);
     draw_cmds(ui, a, &cmds);
 }
 
@@ -500,8 +507,6 @@ pub fn maps_row_h() -> f32 {
     // fixed: the map list scrolls rather than squeezing 30 rooms onto one page
     0.058
 }
-pub const ONL_TOP: f32 = 0.60;
-pub const ONL_ROW_H: f32 = 0.105;
 
 /// The replay banner: what the game decided you just did.
 pub fn replay_banner(ui: &mut Vec<UiVert>, a: f32, title: &str, t: f32, total: f32) {
@@ -1222,7 +1227,7 @@ fn minimap(ui: &mut Vec<UiVert>, a: f32, world: &World, car: &Car, ball: &Ball, 
 }
 
 // ---------------------------------------------------------------- pause ----
-pub fn pause(ui: &mut Vec<UiVert>, a: f32, save: &Save, best_air_now: f32, cur: (f32, f32)) {
+pub fn pause(ui: &mut Vec<UiVert>, a: f32, save: &Save, best_air_now: f32, cur: (f32, f32), sel: usize) {
     quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.45]);
     panel(ui, a, -0.78, -0.90, 0.78, 0.90);
     label_c(ui, 0.78, 0.024, a, PAPER, "PAUSED");
@@ -1254,19 +1259,26 @@ pub fn pause(ui: &mut Vec<UiVert>, a: f32, save: &Save, best_air_now: f32, cur: 
     label_c(ui, -0.52, 0.0078, a, DIM, "MODELS: JAKO (FAIRLIGHT51) + 97MASON, CC-BY 4.0.  A FAN HOMAGE - ROCKET LEAGUE IS PSYONIX/EPIC'S.");
     label_c(ui, -0.56, 0.0078, a, DIM, "NETCODE, MAP MOODS + MENU KIT IDEAS FROM THE LOGSCOPE-C4 MONOREPO");
 
-    // tappable buttons: the whole pause menu works with a finger
+    // tappable buttons: the whole pause menu works with a finger — and now
+    // with arrows too (`sel` is the keyboard cursor; hover and selection
+    // share the highlight so the two input styles read as one).
     for (i, name) in PAUSE_BTNS.iter().enumerate() {
         let x0 = pbtn_x0(i);
         let (y0, y1) = (PBTN_Y - PBTN_H * 0.5, PBTN_Y + PBTN_H * 0.5);
-        let hot = hit_pause_btn(cur.0, cur.1) == Some(i);
+        let hot = hit_pause_btn(cur.0, cur.1) == Some(i) || i == sel;
         let bg = if hot { [0.24, 0.30, 0.38, 0.95 * a] } else { [0.13, 0.15, 0.20, 0.85 * a] };
         quad(ui, x0, y0, x0 + PBTN_W, y1, bg);
         quad(ui, x0, y1 - 0.006, x0 + PBTN_W, y1, [GOLD[0], GOLD[1], GOLD[2], (if hot { 0.9 } else { 0.35 }) * a]);
+        // the keyboard cursor gets a second rail on the bottom edge, so the
+        // selected button is findable even while the mouse hovers another
+        if i == sel {
+            quad(ui, x0, y0, x0 + PBTN_W, y0 + 0.006, [CYAN[0], CYAN[1], CYAN[2], 0.9 * a]);
+        }
         let k = ui_k(a);
         let txt = fit(name, PBTN_W * 0.86, 0.0105 * k, a);
         label_c_at(ui, x0 + PBTN_W * 0.5, PBTN_Y - 0.011 * k, 0.0105 * k, a, if hot { PAPER } else { DIM }, &txt);
     }
-    legend(ui, -0.80, a, 0.0098, &[("ESC", "RESUME"), ("ENTER", "SETTINGS"), ("TAP", "ANY BUTTON")]);
+    legend(ui, -0.80, a, 0.0098, &[("ARROWS", "SELECT"), ("ENTER", "ACTIVATE"), ("ESC", "RESUME"), ("TAP", "ANY BUTTON")]);
 }
 
 // ------------------------------------------------------------- controls ----
@@ -1360,56 +1372,27 @@ pub fn maps_menu(ui: &mut Vec<UiVert>, a: f32, sel: usize, current: usize, seed:
 }
 
 // --------------------------------------------------------------- online ----
-pub struct OnlineUi<'a> {
-    pub sel: usize,
-    pub name: &'a str,
-    pub friend: &'a str,
-    pub status: &'a str,
-    pub players: Vec<String>,
-    pub online: bool,
-}
+// OnlineUi retired: the Online screen is a menu::Menu now (online_screen.rs)
+// drawn via draw_menu + online_footer.
 
-pub const ONLINE_ROWS: usize = 6; // name, friend, host, join, leave, back
 
-pub fn online_menu(ui: &mut Vec<UiVert>, a: f32, o: &OnlineUi, blink: f32) {
-    quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.45]);
-    panel(ui, a, -0.70, -0.985, 0.70, 0.955);
-    label_c(ui, 0.885, 0.019, a, PAPER, "ONLINE");
+/// The Online screen's live footer — status line + pilots-in-session list —
+/// drawn UNDER the shared `draw_menu` output (the rows themselves are a
+/// `menu::Menu` now; see main's Mode::Online arm and `online_screen.rs`).
+pub fn online_footer(ui: &mut Vec<UiVert>, a: f32, status: &str, players: &[String], online: bool) {
     label_c(ui, 0.825, 0.0088, a, DIM, "SESSIONS RIDE THE FLEET NETCODE STORE - SAME MACHINE OR A SHARED TEMP DIR");
-
-    let row_h = ONL_ROW_H;
-    let top = ONL_TOP;
-    let cursor = if (blink * 2.5).sin() > 0.0 { "_" } else { " " };
-    let rows: [String; ONLINE_ROWS] = [
-        format!("NAME:   {}{}", o.name, if o.sel == 0 { cursor } else { "" }),
-        format!("FRIEND: {}{}", o.friend, if o.sel == 1 { cursor } else { "" }),
-        "> HOST A SESSION".to_string(),
-        "> JOIN FRIEND".to_string(),
-        "> LEAVE / GO OFFLINE".to_string(),
-        "BACK".to_string(),
-    ];
-    for (i, row) in rows.iter().enumerate() {
-        let y = top - i as f32 * row_h;
-        if i == o.sel {
-            quad(ui, -0.62, y - row_h + 0.045, 0.62, y + 0.028, SEL);
-            quad(ui, -0.635, y - row_h + 0.045, -0.62, y + 0.028, GOLD);
-        }
-        font::text(ui, -0.55, y, 0.0112, a, if i == o.sel { GOLD } else { PAPER }, row);
-    }
-
-    if !o.status.is_empty() {
-        label_c(ui, -0.16, 0.0105, a, GOLD, o.status);
+    if !status.is_empty() {
+        label_c(ui, -0.16, 0.0105, a, GOLD, status);
     }
     let mut y = -0.26;
-    if o.online {
+    if online {
         label_c(ui, y, 0.0105, a, PAPER, "PILOTS IN SESSION:");
         y -= 0.048;
-        for p in o.players.iter().take(8) {
+        for p in players.iter().take(8) {
             label_c(ui, y, 0.0095, a, DIM, p);
             y -= 0.042;
         }
     }
-
     label_c(ui, -0.86, 0.0085, a, DIM, "HOSTING ANNOUNCES YOU AS <NAME> FOR FRIENDS TO JOIN BY THAT NAME");
     legend(ui, -0.93, a, T_HINT, &[("TYPE", "EDIT FIELD"), ("CLICK / ENTER", "ACTIVATE"), ("ESC", "BACK")]);
 }

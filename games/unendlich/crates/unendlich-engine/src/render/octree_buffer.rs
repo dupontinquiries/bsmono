@@ -108,7 +108,12 @@ pub fn runtime_octree_pool_bytes() -> u64 {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .map(|m| m.clamp(MIN_MB, MAX_MB) * 1024 * 1024)
-        .unwrap_or(DEFAULT_OCTREE_BUFFER_SIZE);
+        .unwrap_or_else(|| {
+            // No override: size for THIS device. The fixed desktop constant
+            // handed a phone the same pool as an M2 — see device_budget.
+            let caps = crate::device_budget::DeviceCaps::detect();
+            (crate::device_budget::octree_pool_mb(&caps) as u64) * 1024 * 1024
+        });
     mb
 }
 
@@ -220,7 +225,19 @@ impl CpuOctreePool {
             }));
         }
         let bytes_needed = node_count as u64 * OCTREE_NODE_BYTES as u64;
-        let span: Span = self.alloc.alloc(bytes_needed).map_err(OctreePoolError::Alloc)?;
+        // ALIGNMENT SLACK (found by the headless lavapipe soak): span offsets
+        // are 256-aligned and nodes are 40 B; gcd(256, 40) = 8, so
+        // offset % 40 ∈ {0, 8, 16, 24, 32} and the worst head pad to the next
+        // node boundary is 40 − 8 = 32 bytes — while the allocator's
+        // round-up-to-256 tail slack can be as little as 0. The old request
+        // relied on that tail slack ("worst-case slack is 40-16=24", wrong on
+        // both numbers) and overran its span by up to 8 bytes: a debug panic
+        // here, SILENT corruption of the next slot's head in release. Request
+        // the worst-case pad explicitly; the assert below now proves the
+        // invariant instead of hoping for it.
+        const WORST_HEAD_PAD: u64 = OCTREE_NODE_BYTES as u64 - 8; // gcd(256,40)=8
+        let span: Span =
+            self.alloc.alloc(bytes_needed + WORST_HEAD_PAD).map_err(OctreePoolError::Alloc)?;
         // Promote the span's offset to a node-aligned address. The
         // SpanAllocator aligns to 256 B; 256 % 40 = 16, so the first
         // node-aligned position may sit a few bytes into the span.
@@ -234,13 +251,11 @@ impl CpuOctreePool {
                 span.offset + (OCTREE_NODE_BYTES as u64 - rem)
             }
         };
-        // The aligned offset must still fit inside the allocated span
-        // along with the payload. The 256-byte allocator alignment
-        // guarantees this for our 40-byte nodes (worst-case slack
-        // is 40-16=24 bytes at the head, and bytes_needed ≤
-        // node_count * 40 < span.size which is ≥ bytes_needed
-        // rounded up to 256).
-        debug_assert!(node_aligned_offset + bytes_needed <= span.offset + span.size,
+        // The aligned offset must fit inside the span along with the
+        // payload — guaranteed now by the explicit WORST_HEAD_PAD above.
+        // Hard assert (not debug_): an overrun here is silent GPU-buffer
+        // corruption in release, which is strictly worse than a crash.
+        assert!(node_aligned_offset + bytes_needed <= span.offset + span.size,
             "node alignment pushed past span end: aligned {} + bytes {} vs span {}..{}",
             node_aligned_offset, bytes_needed, span.offset, span.offset + span.size);
 
@@ -623,6 +638,47 @@ unsafe fn create_octree_buffer(
     Ok((buffer, memory, ptr))
 }
 
+
+#[cfg(test)]
+mod alignment_overrun_regression {
+    use super::*;
+
+    /// Reproduces the headless-soak crash class: span offsets are 256-aligned
+    /// and nodes are 40 B, so offsets land on every residue in
+    /// {0, 8, 16, 24, 32} mod 40 and the head pad can reach 32 bytes — which
+    /// the old payload-only span request did not reserve (debug panic /
+    /// silent neighbour corruption in release). Varied alloc sizes walk the
+    /// residues; the hard assert inside alloc() proves span containment, and
+    /// this test additionally proves node alignment and that no two live
+    /// payloads overlap.
+    #[test]
+    fn aligned_payload_never_escapes_its_span() {
+        let mut pool = CpuOctreePool::new(1024 * 1024);
+        let mut slots = Vec::new();
+        for i in 0..64u32 {
+            let nodes = 13 + i * 7; // varied sizes → varied span offsets
+            let slot = pool.alloc(nodes).expect("pool is big enough");
+            assert_eq!(
+                slot.byte_offset % OCTREE_NODE_BYTES as u64,
+                0,
+                "slot must be node-aligned"
+            );
+            slots.push((slot.byte_offset, nodes as u64 * OCTREE_NODE_BYTES as u64));
+        }
+        slots.sort();
+        for w in slots.windows(2) {
+            let (a_off, a_len) = w[0];
+            let (b_off, _) = w[1];
+            assert!(
+                a_off + a_len <= b_off,
+                "payloads overlap: {}+{} spills into {}",
+                a_off,
+                a_len,
+                b_off
+            );
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

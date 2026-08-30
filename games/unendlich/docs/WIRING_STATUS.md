@@ -11881,3 +11881,423 @@ r586) → the r591/r592 disturber.
 - TEST ON M2: foliage must RE-MESH to pick up the tag — walk to fresh chunks or reload the world. Then: (1) grass/plants/
   leaves visibly sway in wind (r586, now actually active); (2) with the F3 disturber slider up, foliage parts around you.
   If it now works, we set a sane default disturber strength and (next) add the mob/dragon disturber array.
+
+## r595 — WIRE: the foliage disturber ARRAY (mobs/dragons/LAN avatars part the grass)
+The r594 sway-tag fix made foliage react; r591's disturbance was still camera-only, and its own comment named the next
+step ("mobs become extra entries in a disturber array later"). Landed:
+- CameraUbo: `disturbers[8]` (xyz pos, w reach) + `disturber_meta.x` count, appended LAST per house rule. chunk.vert
+  declares the intermediate water/flow members as reach-through padding (offsets exact; it reads none of them).
+- chunk.vert: loop over the array — every nearby mover parts foliage with the r591 falloff; pushes accumulate; ±5-block
+  vertical gate so canopy doesn't part for ground walkers. count==0 keeps the r591 camera-only fallback so the F3 slider
+  demos alone. Slider (sun_color.a) remains the ONE strength knob for all disturbers. Validated (glslangValidator +
+  spirv-val); .spv + sidecar rebuilt via build.rs.
+- sim::foliage_sway::select_disturbers — pure nearest-first selection (cap 8, range 28) + 2 tests.
+- renderer: set_foliage_disturbers; bin feeds player (2.5) + roamers (dragon 4.0 / dino 3.0 / else 2.2) + LAN peer
+  avatars (2.5) each frame next to set_season.
+Gates: fullgame + lib clean; foliage_sway+shader_artifacts 21/0. TEST ON M2 (after r594's own re-mesh caveat): walk a
+tamed herd through tall grass — a multi-lane part should track each body, and a LAN friend's avatar should part grass
+with no local input.
+
+## r596 — BUGHUNT: the full game now RUNS in-sandbox (xvfb + lavapipe); two real crashes found + fixed
+Infrastructure: mesa lavapipe (software Vulkan) + Xvfb run the ACTUAL unendlich-fullgame binary headless, bounded by
+UNENDLICH_MAX_DURATION_MS. gpu-headless-probe GREEN (headless ctx, offscreen targets, GPU meshing 36 chunks, all shader
+modules). The checkable loop now covers the live render/sim loop, not just unit tests.
+Soak findings (60 s title-screen run):
+1) WILD CHUNK COORDS: eviction membership crashed on i32 subtract-overflow — a chunk coord of (i32::MIN)³ (the NaN/-inf
+   float→int saturation signature) entered the loaded set ~45 s in, right after ecosystem/rest events. FIXED the crash
+   class: wild coords are rejected BEFORE distance math (abs(i32::MIN) itself panics; (i32::MIN)² overflows even i64 —
+   both hit during the fix) and get EVICTED, with a one-shot [watchdog] WILD log naming the coords. Producer hunt OPEN:
+   the log fires once per run; suspect a creature/ecosystem position going non-finite. Player-pose watchdog also added
+   (snaps to last sane pose with forensics; player was NOT the source this time).
+2) OCTREE POOL OVERRUN (render/octree_buffer.rs): span offsets are 256-aligned, nodes 40 B ⇒ gcd 8 ⇒ head pad up to 32 B,
+   which the payload-only span request did not reserve — debug panic, SILENT neighbour-slot corruption in release
+   (masked on M2 by the huge pool; exposed by the r-budget-scaled pool). FIXED: request includes the worst-case pad;
+   invariant is now a hard assert; regression test walks all offset residues and proves node alignment + no payload
+   overlap. This may explain any historical "corrupt/flickering chunk" reports under memory pressure.
+Result: 60 s soak exits 0 with zero panics. Ledger note: soaks run the title-screen world (no input); an input-script
+harness (synthetic clicks → in-world soak) is the natural next escalation.
+
+## r597 — SOAKS GO IN-WORLD: UNENDLICH_AUTOPLAY + the double-world question answered LIVE
+UNENDLICH_AUTOPLAY=1 auto-creates a world from the title screen through the SAME one-click r186 spree path the UI uses
+(two stages: request wizard, then arm the spree only once the panel shows it — the panel reflects the app one frame
+late, and under lavapipe a frame is SECONDS, so a same-frame arm self-cancelled). Found along the way: presented-frame
+counters (frame_count) stay 0 under Xvfb — the swapchain never presents — so anything gated on frames never fires in
+soaks; autoplay gates on wall clock. A 1 Hz [autoplay-dbg] heartbeat (screen/state/spree/panel) stays in, soak-only.
+RESULT (120 s soak): Confirm → Launch(StartLocal, Survival, "Soak"); [diag] rebuild_for_seed CALL #1 — EXACTLY ONE call
+per create, live confirmation of what the headless shell-protocol tests pinned (the "Create fires twice" question now
+has an in-vivo datapoint: no double-fire); state=InGame for the rest of the run; exit 0, zero panics; player watchdog
+silent in-world. The WILD chunk coord still fires ONCE per run on the TITLE screen (~pre-autoplay), so the producer is
+a menu-phase system (cinematic/backdrop/ecosystem around spawn) — narrowed, hunt continues.
+
+## r598 — WILD-COORD PRODUCER HUNT: five traps armed, six suspects eliminated, world hardened
+The (i32::MIN)³ chunk (NaN/-inf float→int saturation) fires ONCE per soak on the title screen. This round's traps
+(one-shot backtraces, all left ARMED in-tree — they cost nothing until they fire) plus sweeps ELIMINATED, in order:
+1. Player pose (watchdog present, silent — not the player). 2. Roamers (per-frame sanity sweep added: a non-finite
+roamer now logs kind+pos+vel and snaps to its home column — real robustness net regardless). 3. set_block writes (trap
+at the choke; wild writes now REFUSED — a NaN can no longer edit the world). 4. The renderer mesh map (trap silent).
+5. All three ChunkManager chunks.insert sites (traps silent — the wild chunk is somehow never INSERTED). The wild key
+DOES enter empty_mesh_versions via upload_prebuilt_mesh (backtrace inlined to main — async pool hides the requester).
+Remaining suspects (narrow): LOD key/parent-snap math on a sane coord, or a completed-mesh race around cinematic-world
+settle (~45 s in). The traps will name it on the next firing — including on-device, where the same logs now exist.
+Meanwhile the harm is fully contained: eviction rejects+logs, set_block refuses, roamers self-heal, player snaps back.
+
+## r599 — PERF: clone-free transition remesh (the transition-set stutter)
+The per-tick transition sweep deep-cloned every due chunk (32³ blocks Vec + metadata, clone_for_edit) purely to bump
+version+dirty so the mesh scheduler would re-run — per strided tick, per transitioning chunk, for the whole 3-second
+animation. Replaced with a VIRTUAL version bump: `transition_remesh_count` (pure companion to transition_remesh_due —
+same cadence, same per-coord phase; parity pinned by test across strides 1..8) is added to a transitioning chunk's
+reported version at read time via `ChunkManager::effective_version`, which the bin's submit path now reads. The sweep
+body is now: advance the clock + prune evicted coords. Zero clones, zero Arc churn, identical remesh schedule.
+Tests: cadence parity vs due(); the clone-free proof (same Arc pointer + same stored version across 8 sim ticks while
+effective version advances; non-transitioning chunks report base verbatim). chunk_manager 32/0; fullgame gate clean;
+90 s in-world soak exit 0 / zero panics. NOTE: full shader-side animation (mesh once at to_stage, progress in the
+vertex shader) remains the deeper end-state — this lands the scheduling half without touching geometry emission.
+
+## r600 — SOAK-WITH-MOVEMENT: autoplay walks a spiral
+Under UNENDLICH_AUTOPLAY, once InGame (and not paused), a steady forward push + slow yaw drift (~14°/s) is injected at
+the SAME seam keyboard input lands — everything downstream (controller, physics body, streaming, eviction, foliage
+disturbance, creature encounters) is the real player path under real motion, not a parallel one. 150 s soak: exit 0,
+zero panics; ecosystem anchor crossed chunk boundaries (0,0)→(-1,0)→(0,0) proving the walk; armed NaN traps unchanged
+(the wild coord remains a title-screen, pre-autoplay event). Movement soaks are now the default deepest rung of the
+in-sandbox ladder: unit suite → GPU probe → title soak → in-world soak → MOVING in-world soak.
+
+## r601 — CASE CLOSED: the "wild coord" was the debug-overlay SENTINEL (by design), now named + exempted
+The r596-598 hunt's conclusion, revising those entries' narrative: the (i32::MIN)³ chunk was never a NaN producer. It
+is the F4 debug-overlay system's DELIBERATE out-of-band mesh key — an inline literal at the upload site ("the world
+renderer skips frustum culling for this coord"), uploaded every frame, entering empty_mesh_versions whenever the scene
+is disabled. The original r596 crash was still real (the sentinel meeting unguarded i32 distance math in eviction) and
+every guard added remains correct and NECESSARY — they now protect against GENUINE saturation (any +inf/mixed-axis
+pattern). Landed: ChunkCoord::DEBUG_OVERLAY (named constant, documented ambiguity: a true -inf triple would look
+identical; everything else still trips), the upload site uses it, eviction treats it as always-in-range (never evicted,
+never churned), and all five traps + the drain fingerprint exempt exactly it. PROOF: 90 s moving in-world soak with a
+COMPLETELY CLEAN log — exit 0, zero panics, zero watchdog lines. The armed traps stay in-tree for real NaN classes.
+Elimination work retained: roamer sanity sweep, player-pose watchdog, set_block wild-write refusal — all real nets.
+
+## r602 — THE TWO-MACHINE JOIN, RUN IN-SANDBOX: three live bugs fixed, the full chain verified
+Two fullgame processes (host: UNENDLICH_AUTOPLAY create+host; joiner: UNENDLICH_LAN_HOST=127.0.0.1:9878 direct-connect)
+under xvfb+lavapipe. Six takes, three REAL bugs any hardware pair would have hit:
+1. SESSION SOCKET NESTED IN THE BEACON: a second instance (gossip port taken) had its ENTIRE LAN I/O silently dead —
+   direct-connect never fired. Fix: LanBeacon::bind_or_muted (ephemeral fallback: adverts still SEND, the host list
+   stays empty, direct-connect + session socket live). Log: "gossip port taken — discovery muted".
+2. DUPLICATE ACCEPTS RELAUNCHED THE WORLD (~every 6 s): the direct path never set lan_peer_addr, so the 2 s retry kept
+   re-joining and each Accept re-triggered a full world load. Fix: sender becomes upstream on Accept; a duplicate
+   Accept for the already-joined (name, seed) is a no-op (lan_joined_world).
+3. JOIN-SYNC EDITS SILENTLY DROPPED, twice over: batches arriving during the blocking world load applied to the
+   PRE-LAUNCH chunk manager (rebuild erased them), and set_block REFUSES non-resident chunks (no implicit carry — an
+   assumption in the r-join bundle's comment, now corrected). Fix: a load-spanning backlog drained post-launch, and
+   apply_edit_records returns (applied, remaining) with a 2 s re-drain — records wait out chunk streaming and
+   self-clear (unit-tested: resident applies, non-resident waits, applies after load).
+VERIFIED CHAIN (take 6 logs): direct-connect JOIN → Accept (assigned eid 1<<32) → clock adopted ONCE → world loads →
+join-sync 7 records / 17 batches from the host → joiner applies 758 then 602 edits as chunks stream ("N still
+waiting" shrinking). Zero panics both sides. Residue: records for chunks beyond the joiner's render distance sit in
+the backlog until the player walks there — arguably correct; revisit if backlogs ever grow large (persist-on-carry
+would be the deep fix).
+
+## r603 — DUAL-MOTION SOAK: walk mode, the loading-phase keepalive, and one OPEN item
+UNENDLICH_AUTOPLAY=walk: movement-only mode for JOINER processes (their world comes from the host). One-shot
+"[lan-mp] first entity state from peer N" logs at the receive path — the greppable proof entity replication flows, for
+soaks and device tests alike. FIXED (found by this soak): the joiner's replication is InGame-gated, so during its
+seconds-long world load it heartbeats NOTHING, the host pruned it at PEER_TIMEOUT, and post-load states from a
+now-unknown address were dropped forever — a real mid-session dropout for any slow-loading joiner. Fix: while an
+upstream is set but not yet InGame, re-send Join every 2 s; the host's idempotent rejoin re-Accepts (verified: "admitted
+… (rejoined)" cadence, ZERO prunes) and the joiner's duplicate-Accept guard eats the replies.
+VERIFIED: host→joiner entity flow live ("first entity state from peer 9878 at (4.1, 65.1, 14.9)" — the host's avatar
+at a plausible world position; the one-shot re-fires under lavapipe because the joiner's own prune runs between its
+seconds-long frames — cosmetic, frames are 16 ms on hardware).
+OPEN: joiner→host entity states do NOT arrive (host log shows no first-entity line). Eliminated so far: SnapshotGate is
+per-entity (multi-sender safe), receive() is stateless (no session key), the host table stays alive (keepalive), the
+joiner's send path is correctly gated and addressed. Remaining suspects: silent send_to failure (errors are swallowed
+joiner-side), or host-side drain order. Next: temp send-error logs + a host-side raw CH_ENTITY per-sender counter.
+
+## r603 — THE JOINER NEVER LEFT MainMenu: the FSM edge the join path was missing, found by the dual-motion soak
+Symptom chain from the capstone soak (joiner walking, host walking): host→joiner entity states flowed; joiner→host
+NEVER arrived. Eliminated in order: seal/receive (pure codec + per-entity newest-wins gate — multi-sender safe),
+SnapshotGate keying (per entity id), lan_peer_addr lifecycle (never cleared), one OOM-killed-host false alarm (a
+"Killed" tail line invalidated a whole take — check process lifetimes before code), and finally the state heartbeat
+told the truth: 48/48 frames `state=MainMenu` on a joiner whose world was fully loaded and running. ROOT CAUSE: the
+LAN-join synthetic launch (fg_pending_load → AppStep::Launch) rebuilt the world and called enter_game(), but
+enter_game() (WorldReady) only transitions from Loading — and nothing had ever moved the FSM out of MainMenu, so it
+no-opped forever. Fallout beyond entity sends: walk-mode inert (InGame gate), the Loading keepalive re-joining every
+2 s for the entire session, and the title overlay logic still considering the menu open over a joined world.
+FIX, three layers deep with the architecture (not a bin hack): GameFlow::begin_external_load (MainMenu → Loading,
+same edge as StartNewGame, idempotent elsewhere — a duplicate Accept must not bounce the FSM; unit-tested),
+MenuController + App wrappers, and the bin's synthetic-launch branch drives it before the launch step. Supporting
+work this round: UNENDLICH_AUTOPLAY=walk (joiner mode: walk once InGame, no create), one-shot SENT/first-received
+entity logs both sides (permanent — device tests grep for these), Loading-phase JOIN keepalive (lan_keepalive_ms:
+without it a slow-loading joiner is pruned at PEER_TIMEOUT and its post-load states arrive from an unknown address).
+CAPSTONE VERIFIED (take 4): host logs "first entity state from peer 4294967296"; joiner heartbeats 5×MainMenu →
+32×InGame; keepalive rejoins 2 total, quiescing 3 s before InGame; zero panics both sides. BIDIRECTIONAL entity
+replication + join-sync + clock adoption all live in one soak. Cosmetic residue: the joiner re-logs "first entity"
+after prune gaps between seconds-long lavapipe frames — a software-rasterizer artifact, not a device behavior.
+
+## r604 — TREE SILHOUETTES from the operator's field studies + THE NOISE FORK (major pre-existing finding)
+The operator supplied two West-African forest field studies (distilled in docs/design/biomes_west_africa.md). First
+landing: world/tree_form — tree SILHOUETTES as pure layer geometry (CanopyForm::{Dome, FlatTop, Baobab, Shrub}), with
+Dome pinned BYTE-IDENTICAL to the pre-r604 inline formula (unit test), so all existing biomes are untouched. Savanna
+now grows FlatTop umbrellas (clear trunk, thin wide crown, radius capped at 3 — radius 4 would silently truncate at
+chunk borders: both backends' canopy scans are sized for 3+1). Baobab brings 2×2 trunks; Shrub is the understory
+stratum for r605's islands. CPU generator routes canopy+trunk through the form fns; the GLSL twin
+(chunk_generation.comp) mirrors all of it — form rides two previously-free bits in the packed tree decision. Gates:
+tree_form 5/0 including a LITERAL GLSL-transliteration test (the mirror's real gate — see below), biomes+cpu_generator
+42/0, fullgame clean, 90 s in-world soak exit 0 / zero watchdog lines. Both .spv artifacts rebuilt.
+THE FINDING: building a worldgen-parity probe for the mirror (gpu-headless-probe UNENDLICH_PROBE_PARITY=1, _FAR=1,
+_SEED=N) surfaced a PRE-EXISTING CPU↔GPU fork: shader noise is f32, CPU is f64, and over land the backends disagree on
+~0.5%+ of blocks (surface ±1 along contours; shoreline-origin seeds diverge massively at once; separate deep-band
+y-chunk-1 mismatch even at origin: world (0,32,0) cpu=Stone gpu=Water — suspects: env-gated multi_scale_caves and the
+CPU-side aquifer pass). terrain_generator.rs's "byte-identical" claim holds only over boundary-free ocean. MULTIPLAYER
+IMPLICATION: join-sync's "same seed ⇒ same terrain" carries a same-backend caveat (a CPU-only joiner on a GPU host
+forks terrain). Probe seeds on record: 3405691582/7777 exact-but-treeless (ocean origins); 424242/90210/1337/8888/
+555000/271828/31415926/12648430 all diverge over land. The world-level mirror is UNGATEABLE until the fork is fixed
+(fix directions ranked in the design doc); the probe stays as the drift instrument. r605 (forest islands with
+per-island palettes — the 8%-species-overlap rule — plus termite micro-clusters) is designed in the doc and waits on
+the operator's on-device art check of the r604 silhouettes.
+
+## r605 — FOREST ISLANDS in the savanna (the Comoé study, live in both backends)
+world/forest_islands: the island field (96-block cells, p=0.18, jittered centres, radius 12-44), per-island PALETTES
+(each island rolls one of 3 — the study's 8%-species-overlap finding as a mechanic: crossing islands reads as visiting
+different forests; palettes differ by silhouette mix, height bands, and Oak/Birch species since those are the blocks
+that exist), three strata per the Comoé tables (Dominant/Mid/Under at 20/35/45; Under is always Shrub), and
+termite-mound micro-clusters (24-block fine field, p=0.05, r=3.5) out in open grass. All pure f32/u32 math chosen to
+transliterate: the GLSL twin in chunk_generation.comp is line-for-line (fi_* helpers + the BIOME_SAVANNA override in
+the tree decision), gated by the transliteration test in forest_islands.rs (the r604 lesson — world-level parity can't
+gate mirrors while the noise fork stands). CPU wiring overrides density (0.006 → up to 0.046 at core) + profile per
+column. Gates: forest_islands 4/0; combined tree_form+biomes+cpu_generator+islands 52/0; the END-TO-END pin
+(savanna_islands_are_denser_than_open_grass: island-core chunk ≥2× open-grass tree blocks, analytic island-centre
+enumeration + fixed seed list); shader validated (-V; note: bare `glslangValidator -S comp` without -V rejects
+push_constant — Vulkan mode is required), both .spv artifacts rebuilt; fullgame clean; 90 s in-world soak exit 0 /
+zero watchdog lines. VISUALLY UNVERIFIED — r604 silhouettes + r605 islands are one on-device art-check item now.
+Deferred per the design doc: forêt claire biome (new id 29, both backends), gallery forests (needs the river field),
+giant 200-300 ha islands (biome-scale).
+
+## r606 — DEEP-BAND HUNT VERDICT: the GPU worldgen produces a DIFFERENT WORLD (and prior parity results are suspect)
+Instrumented isolation (gpu-headless-probe UNENDLICH_PROBE_DEEP=1 / UNENDLICH_PROBE_PRISTINE=1 / _BS=N), pristine
+single-instance, batch-size-independent, deterministic. PINNED: raw generate_batch at seed 0xCAFE_F00D yields surface
+TERRAIN in y-chunk 0, ALL-Water y-chunk 1, ALL-Air y-chunks 2-3 — a coherent world whose origin surface is y=15 where
+the CPU's is y=54 (altimetry printed by the probe). The "all-water deep band" that started this hunt was never a deep
+bug: it is the GPU world's OCEAN — the GPU worldgen simply generates a DIFFERENT WORLD than the CPU. Structural
+formulas mirror (sea_level/continental/hills read line-equal); the fork is below them, in the noise primitives /
+region sampling / the GLSL SEED_* constants vs Rust seeds::* table — the named next step is a mechanical diff of
+those constant tables. SECOND FINDING, method-critical: TerrainGenerator::generate hides per-batch GPU failure behind
+a SILENT CPU fallback (log::warn only) — so every earlier "byte-identical near origin" parity result is suspect
+(likely CPU-vs-CPU with the warn unnoticed), and the r604 entry's "f32 drift" narrative is DEMOTED to unconfirmed:
+the dominant, reproducible phenomenon is the different-world fork. The parity probe's assertion mode should not be
+trusted until it verifies which backend actually generated (expose a gpu-batches-succeeded counter on
+TerrainGenerator — queued). LIVE IMPACT, honestly bounded: the operator's device falls back to CPU (M2 lacks the
+required feature, per chunk_loader's own comment), and any successful-GPU player would get an internally-consistent
+(just different) world — but a mid-session GPU→CPU fallback, or a CPU joiner on a GPU host, would CROSS worlds. Until
+the fork is fixed, GPU worldgen should be considered NOT world-compatible with CPU worldgen.
+
+## r607 — THE DIFFERENT-WORLD ROOT CAUSE AND FIX: biome-classifier veto asymmetry
+The r606 fork is root-caused and fixed. After the exhaustive static diff came up empty (seeds table, region sizes,
+baselines, hash/noise/fbm 2D+3D, quintic fade, normalization, corner math, spv load path, push-constant seed delivery
+— ALL equal, seed-sensitivity verified), the asymmetry was in WHICH classifier feeds surface_target: the CPU uses the
+CLIMATE-ONLY world_model::biome_at_2d (no topographic veto — the r192 Ocean/Beach veto lives in
+cpu_generator::biome_at_3d, used for trees/surface blocks), while the SHADER had folded the veto into its single
+biome_at_2d and fed THAT into surface_target. An origin the CPU scores as forest (+5 height modifier) got vetoed to
+Ocean (-30) on GPU — a ~35-block surface swing = the different world. FIX (direction: align GPU toward CPU, since CPU
+worlds are what players have): new GLSL biome_at_2d_climate (stops at determine_biome) feeds the two surface-target
+sites (model_density + the Phase A1 cache); the veto'd biome_at_2d remains for tree/surface-block sites, matching the
+CPU's own split. VERIFIED: pristine altimetry now cpu 54 / gpu 54 EXACT; y-chunk-1 GPU is real terrain with Water 8364
+and Air 4913 counts EXACTLY matching CPU. ALSO: TerrainGenerator gains gpu_batches_ok/failed counters +
+gpu_batch_stats(); the parity probe prints them and exits VOID if any batch silently fell back — the instrument flaw
+that fooled every pre-r607 parity result is closed. FIRST HONEST PARITY RUN (near set, 64 chunks, ok=4 fell_back=0):
+terrain diffs 11,242 (~0.5%, all material-class: cpu=Stone gpu=Dirt/Gravel/Sand — the subsurface STRATA pass differs;
+named follow-up), tree cells 52 with 100% diff (GPU perforation/branches by design + possible spawn drift;
+too few cells to separate — widen the tree sample in the follow-up). All prior parity numbers remain void per r606.
+Gates: lib subset 9/0, fullgame clean, spv rebuilt (assets path = the ONLY spv, load order verified in r607 hunt).
+
+## r608 — SUBSURFACE-STRATA PARITY: analysis round (no fix yet — fork structure mapped, writer unidentified)
+Chased the r607 residual (11,242 material-class diffs; deep-origin CPU histogram Stone 15021 / Gravel 3072 / Sand 1024
+vs GPU Stone 14092 / id3 3734 / id12 1295 / id16 285). MAPPED: CPU surface materials = biomes.rs::surface_block
+(Ocean→Sand — the 1024 = exactly one 32×32 seabed layer) + pick_subsurface_block → biome-def REGISTRY
+(assets/biomes/unendlich/*.json — NO def declares subsurface_block today, so the registry always falls through to
+legacy_subsurface_block: Desert/Beach→Sand, canyons→RedSandstone, else Dirt). GPU = surface_block_type (mirrors the
+Rust table incl. Ocean→Sand) + a CLIMATE-ONLY subsurface_block_type — structurally different from the CPU's
+registry+legacy chain. UNIDENTIFIED: the writer of the CPU's 3-layer Gravel band (3072 = exactly 3 layers) — it is NOT
+cpu_generator, biomes.rs, the registry defs, or aquatic_materials (that classifier is pure and UNWIRED — comments in
+sea_level.rs/coral.rs reference it aspirationally). Candidate suspects for next session: a phase module
+(beach_band/alluvial_fan/aquifer_coupling) reached from generate_chunk indirectly, or Chunk::from_blocks-adjacent
+conversion. IMPORTANT interpretation fork left open: if GPU id3=Gravel and id12=Sand (ids unverified this round —
+check blocks.rs first thing), the GPU already HAS a gravel/sand pass and the divergence is boundary-placement drift
+(counts 3734 vs 3072, 1295 vs 1024), i.e. much smaller than a missing pass; the fix would then be threshold alignment,
+not a port. NEXT: verify ids, find the gravel writer via targeted instrumentation (per-block-id first-write phase
+logging in a debug build), then align. Honest state: r607's macro-world fix stands (altimetry exact); strata parity is
+open with the search space narrowed to one unidentified writer.
+
+## r609 — GRAVEL WRITER FOUND: arena biome defs leak into overworld strata via registry climate best_fit
+The r608 mystery is closed. The CPU's seabed gravel is written by Phase 2's 3-deep subsurface loop (surface-hugging
+shell, y-histogram peaked at the seabed — instrumented via the deep probe's new gravel locator), whose block choice
+runs pick_subsurface_block → biome_def_at → registry.best_fit(mc_temp, humid) over the ENTIRE loaded assets/biomes/
+tree — arena defs included. At the ocean origin the local climate is (mc_temp 0.90, humid 0.52); arenas/
+gilded_glade.json (temperature 0.85, downfall 0.5, subsurface_block "gravel") wins the fit by a wide margin over
+unendlich/ocean.json (0.75, 1.0, no strata fields). So OVERWORLD seabeds carry ARENA strata: gravel from a MOBA-lane
+def. No Rust token "BlockId::Gravel" exists in any generation path — the block arrives by string through the
+registry, which is why r608's grep hunt came up empty (lesson recorded: data-driven content makes token-grep
+insufficient; grep asset trees too). THE FORK IS NOW FULLY CHARACTERIZED END-TO-END: GPU subsurface_block_type is
+climate-only code; CPU subsurface is registry-best-fit over a json tree with accidental arena participation.
+FIX PATHS, ranked, for the operator's call: (a) PARITY-FAITHFUL — mirror observed CPU behavior in the shader via a
+small uniform table of resolved (surface, subsurface) blocks per climate cell, uploaded from the same registry at
+generator init (a designed seam: descriptor addition + table bake; preserves every existing CPU world byte-for-byte,
+warts included); (b) JUDGE-THE-LEAK-A-BUG — gate best_fit to the world's namespace (arena defs stop competing in the
+overworld), which is cleaner but CHANGES EXISTING CPU WORLDS (seabed gravel shells become dirt) and therefore needs a
+world-version gate + the operator's explicit sign-off. No code changed this round beyond the probe's gravel locator;
+r607's macro fix stands, the strata residual is now fully explained rather than mysterious.
+
+## r610 — TREE-PARITY VERDICT: positional split is by design; the MASS gap is the r609 leak again (now known to suppress CPU trees)
+Instrumented the parity probe with a (cpu→gpu) diff-pair histogram + a tree-MASS metric. VERDICTS: (1) POSITIONAL tree
+parity is out of scope BY EXISTING DESIGN — the shader's tree-origin hashes are documented u32 rewrites of the CPU's
+u64 hashes ("GPU-canonical strategy"), so backends spawn trees at different columns on purpose; the honest metric is
+mass. (2) The MASS gap (gpu/cpu ratio 1.14 at seed 424242, 2.28 at 90210, and cpu=0/gpu=697 at 31415926) is NOT the
+designed perforation/branch extras: it is the r609 REGISTRY LEAK from the other side — CPU pick_surface_block's
+climate best_fit hands whole climate bands ARENA surface blocks (tuff/slate/basalt), which fail the CPU's
+Grass/Moss tree-substrate check, so the CPU grows NO TREES there while the registry-less GPU plants normally. So the
+leak is not just cosmetic strata: OPERATOR SHOULD KNOW their existing CPU overworlds likely contain arena-material
+surface patches and correspondingly TREELESS BANDS wherever arena defs win the climate fit. (3) LANDED this round: the
+shader's tree decision now mirrors the CPU's substrate gate (surface_block_type must be GRASS/MOSS; forward-decl
+added) — correct and kept, but ineffective until the surface SOURCE matches; the registry-table upload (r609 fix path
+(a)) closes strata AND tree-mass in one stroke, and is now clearly the next implementation item. spv rebuilt; mass
+numbers re-verified unchanged post-gate (expected, per the analysis). GLSL gotcha recorded: use-before-declaration
+needs a prototype — the first "clean" spv rebuild had silently FAILED compile ("SPIR-V is not generated") while the
+stale artifact kept running; always grep validator output for ERROR, not just exit status.
+
+## r611 — REGISTRY TABLE UPLOADED TO THE SHADER: the r609 leak now leaks IDENTICALLY on both backends
+Implemented r609 fix path (a), parity-faithful. Rust side: BiomeRegistry::defs() accessor; gpu_generator bakes the
+loaded registry into a fixed table ({count; vec4 climate[64] = (t, h, themed_penalty_sq, 0); uvec4 blocks[64] =
+(surface, subsurface, ·, ·), sentinel 0xFFFFFFFF = "def declares nothing"}), uploaded write-once into a NEW binding-1
+SSBO (descriptor layout grew to two bindings; pool count 2; dual writes; buffer freed in Drop). Registry is loaded
+inside VulkanChunkGenerator::new the same way TerrainGenerator loads it (deliberate duplicate read of read-only json —
+kept new()'s signature stable everywhere incl. the probe's pristine mode). Empty/absent registry bakes count 0 →
+shader falls back to legacy mirrors = the CPU's no-registry path. GLSL side: registry_best_fit is the EXACT argmin
+(squared euclid on climate_coord with the 0.01 themed penalty pre-baked per def; target = (model temp, model humid)
+clamped — the CPU's mc_temp×2-then-÷2 cancels), plus pick_surface_block_gpu / pick_subsurface_block_gpu (registry →
+sentinel → legacy; NEW legacy_subsurface_mirror = exact CPU legacy_subsurface_block). Rerouted: Pass B surface pick,
+Pass B subsurface pick (sbiome now computed in that branch — scope fix), and the r610 tree substrate gate.
+RESULTS (probe seed panel, honest counters green): seed 31415926 now FULLY CLEAN — 64 chunks, terrain diffs 0, tree
+mass exact (the CPU's arena-surface treeless band is now reproduced by the GPU, warts-as-specified); ocean origin
+11,242 → 2,016 terrain diffs (-82%, the gravel shell matches); phantom GPU trees eliminated on every seed (the r610
+substrate gate now bites). RESIDUALS, bounded and named: 424242 12k / 90210 9.5k terrain diffs and tree-mass 0.72 /
+1.49 — the per-cell registry fits still disagree at some columns, most plausibly a CLIMATE-EVALUATION-Y mismatch
+between call sites (CPU tree gate samples temp/humid at the column's surface_y; the shader's decision climate comes
+from the surface-target probe height sl+10; Phase-2 CPU per-cell y vs my per-cell dyf should already align — audit
+each site's exact y next). Verification honesty: no soak this round, but the probe panel exercised the full
+production TerrainGenerator GPU path (4 seeds × 64 chunks through the new binding) without error; fullgame check
+clean; biome_loader 11/0. Next: per-site climate-y audit, then promote the probe to a gate on the clean seeds.
+
+## r612 — TREE-GATE CLIMATE-Y FIX + the last structural asymmetry, fully specified
+The r611 residual audit's first finding is fixed: the shader's tree substrate gate fitted the registry with the
+DECISION's classification climate (sampled at the sea_level+10 probe height), while the CPU's gate fits at the
+column's ACTUAL surface_y (pick_surface_block(biome, wx, surface_y, wz)). Altitude moves climate enough to flip fits
+on hills. The gate now recomputes temp/humid at d.surface_y. MEASURED: tree-mass ratios 0.719→0.921 (seed 424242) and
+1.491→1.369 (90210); terrain diffs unchanged (12,061 / 9,507 — the gate doesn't touch terrain), clean seeds stay
+clean. spv rebuilt (ERROR-grep discipline per r610).
+THE LAST STRUCTURAL ASYMMETRY, now fully specified from reading biome_at_3d: the CPU classifier is not
+determine_biome+veto — per r177 "the registry owns the LAND climate biomes": legacy_verdict decides water/shore
+(topography), but LAND columns are re-fit against the REGISTRY and mapped through each def's _legacy_enum to a Biome;
+the r192 biome-free-base veto then applies (with a documented Skylands/deep-valley bugfix in the same block). The
+shader's veto'd biome_at_2d runs only determine_biome+veto — no registry step — so tree profiles/densities and
+legacy-branch surface picks classify differently wherever the registry fit disagrees with the raw climate tree.
+PORT DESIGN (next item, all pieces in place): bake each def's legacy Biome id into the table's UNUSED blocks[].z slot
+(sentinel for themed/none — BiomeDef already has the legacy_enum→Biome mapping fn), then mirror the full
+verdict→registry-land-fit→veto chain in the shader's veto'd classifier at the tree/surface sites, sampling climate at
+the right per-site y (surface_y for trees — now already plumbed). Expect this to close most of the remaining ~10-12k
+terrain diffs (legacy surface branch) and the tree-mass skews together.
+
+## r613 — biome_at_3d PORTED TO GLSL; Pass B adopts it (terrain -94% on seed 90210); tree-site adoption REVERTED with an open puzzle
+The classifier port from the r612 design: bake each def's to_legacy() Biome id into the table's blocks[].z (total —
+Plains for themed, exactly like the CPU's own use), and biome_at_3d_gpu in the shader mirrors the full CPU chain —
+climate at the CALLER'S y, NO jitter (the CPU 3D path has none; the old veto'd biome_at_2d jitters), legacy_verdict,
+the r192 biome-free-base topo veto with the height-modifier-widened threshold, the SHELF REFINEMENT as a bounded
+top-down standable scan over [sl-120, sl+8] mirroring surface_y_at's solidity terms (full-model density + is_cave, no
+cave_field) INCLUDING the fall-through-to-climate case, and the r177 registry-owns-the-land step mapping the best-fit
+def through blocks[].z (registry presence == def_count>0). Forward declarations added (model_density/is_cave/
+registry_best_fit are defined later — the r610 prototype lesson again).
+ADOPTED at the two Pass B sites, mirroring the CPU's Phase 2 exactly (biome_at_3d at the CHUNK ORIGIN's y, one per
+column). MEASURED (4-seed panel, honest counters): seed 90210 terrain 9,507 → 610 (-94%); ocean origin 2,016 → 1,736;
+424242 12,061 → 10,805; 31415926 stays perfect; tree numbers unchanged from r612 (0.921 / 1.369 / exact / exact).
+Best measured state to date on every seed.
+REVERTED at the tree site after measurement: classifying tree columns with biome_at_3d_gpu(surface_target) regressed
+mass hard (0.92→2.35, 1.37→2.68, 239 phantom tree cells on the ocean seed) — the OPEN PUZZLE for next round: why does
+the ALIGNED classifier over-plant when the CPU, using the same chain, does not? Suspects in the revert comment:
+profile/density keyed off registry-mapped biomes interacting with the by-design u32 spawn hashes, or a
+shelf-refinement edge hit at scale on land seeds. The tree site keeps the r612 form until answered. Cumulative
+context: terrain diffs at the panel's worst seed are down from ~105k (pre-r607) to ~10.8k, with two seeds at 0 and
+610. No soak this round (three shader rounds without one — it MUST lead the next slice before any device claim).
+
+## r614 — SOAK DEBT PAID; the tree-site puzzle narrowed: the classifier mirror is EXACT, the regression is downstream
+Soak first (the r613 debt): fullgame rebuilt on the accumulated r611-r613 shader state, 90 s autoplay soak exit 0,
+zero panics/watchdog, 39 InGame frames — the registry SSBO + classifier port are live-stable in-world.
+THE PUZZLE INSTRUMENTED: (1) glsl_biome_at_3d_transliteration_vs_cpu — a literal f32 Rust transliteration of
+biome_at_3d_gpu (defs baked pre-Arc; registry loaded workspace-relative for test cwd) diffed against the REAL
+biome_at_3d over a 6,873-column surface grid at the regressing seed: **0 mismatches**. The classifier mirror is
+EXACT; the r613 tree-site regression is entirely DOWNSTREAM of classification. (Caveat recorded: the transliteration
+reuses the CPU's surface_y_at for the shelf refinement rather than re-transliterating the GLSL scan — the scan itself
+is pinned only indirectly.) (2) Biome-id-table audit: Rust discriminants vs GLSL BIOME_* constants match 0-28 exactly
+— the baked blocks[].z ids are sound. (3) NEW probe instrument UNENDLICH_PROBE_TREE_BIOMES=1: per-biome tree-cell
+histograms, classifying each tree column CPU-side (valid because the mirror is exact). BASELINE at seed 424242 under
+the current r612 tree site: TemperateForest (18,046 cpu / 17,131 gpu) and Plains (1,918 / 1,091) balanced; small
+GPU-only leakage on Beach (6/109) and Ocean (0/71) — the old 2D classifier planting shoreline trees, which the r613
+adoption would fix once its over-plant is understood. NEXT-SESSION PLAY, one move: temporarily re-apply the tree-site
+classifier switch, run THIS histogram at 424242, and the biome the 2.35x excess concentrates in names the amplifier
+(prime candidates: a registry-mapped biome with a dense profile, or the Savanna→islands branch activating where the
+2D classifier didn't).
+
+## r615 — THE AMPLIFIER CORNERED TO ONE TERM: TemperateForest effective-density inputs under the r613 form
+The one-move diagnosis ran: tree-site switch re-applied, per-biome histogram at seed 424242, then reverted (verified
+restored: ratio 0.921). THE EXCESS IS ENTIRELY TemperateForest — 18,046 cpu vs 45,482 gpu tree cells on columns BOTH
+backends classify identically (histogram classifies CPU-side; the mirror is exactness-proven per r614). Eliminated
+this round with measurements: (1) tree_origin_hash's low tail is FAIR — python transliteration over the near-set
+footprint gives P(h<thr) within 1% of thr at 0.01/0.02/0.04/0.06; (2) climate_tree_factor formulas are line-identical
+both sides (same bell, same humid slope, same hot-dry cutoff). With classification, profile tables, hash fairness,
+and the factor formula all equal, the only term left is the FACTOR'S INPUTS: under r613 the GPU feeds
+climate_tree_factor temp/humid at surface_target while the CPU feeds it climate at the SCANNED surface_y — and the
+r612 "balance" (0.921) is now understood as two errors partially cancelling (wrong biome source × wrong climate y).
+Arithmetic bound: the factor spans [0.06, 1.5], so a 2.5x input-driven swing is possible iff temp/humid move
+materially between those y's — which indicts the MODEL'S y-dependence (lapse strength) as the quantity to measure.
+NEXT MEASUREMENT, precisely: CPU-side, over the histogram's TemperateForest columns, print
+(temp, humid, factor) at scanned-surface_y vs surface_target vs sl+10 — three numbers per column, averaged; whichever
+input pair reproduces the 2.5x factor ratio identifies the exact term, and the fix is then either aligning the
+GPU's climate y to the scanned surface (the decision already scans it — reorder so climate is computed AFTER
+d.surface_y) or documenting a model-lapse quirk. State shipped: tree site at r612 form (best measured), all
+instruments in-tree, panel numbers unchanged from r613's best (0/610/10.8k/1.7k terrain; 1.000/1.369/0.921/1.000
+mass).
+
+## r616 — LAPSE THEORY MEASURED DEAD; the puzzle escapes CPU-side reproduction — shader decision-export instrument specified
+The r615 measurement ran: over 15,302 TemperateForest columns at seed 424242, mean climate_tree_factor at the three
+candidate heights is scan=1.007, surface_target=1.008, sl+10=1.000 — the model's climate barely lapses with y at
+these altitudes. The climate-input theory is DEAD, and r615's reinterpretation of the r612 balance as "two errors
+cancelling" is RETRACTED (the climate-y term is a no-op; the 0.921 ratio stands on its own merits again).
+PUZZLE STATUS, stated plainly: every CPU-side reproduction of the r613 tree-site pipeline comes out CPU-equal —
+classifier transliteration exact (r614, with its shelf-scan caveat), id tables exact, hash tail fair, factor formula
+identical, factor inputs y-insensitive (this round) — yet the LIVE shader under that form plants 2.5x in
+TemperateForest. The divergence is inside the running GLSL in a way the f64-model-backed transliterations don't
+capture. Plausible residual classes: f32 GLSL noise vs f64 model noise flipping registry fits ASYMMETRICALLY across a
+determine_biome/best_fit threshold at scale; the biome_at_3d_gpu shelf scan (the one indirectly-pinned piece)
+misbehaving on land seeds; or a decision-pipeline interaction invisible to per-function analysis.
+THE INSTRUMENT THAT ENDS THE THEORIZING (next session, one build): a shader DEBUG-EXPORT mode — pc flag that makes
+Phase A write each column's decision internals (biome id, effective_density x1e4 as uint, accepted bit) into the
+block buffer's first words for one chunk; the probe reads them back and diffs against the CPU's per-column values.
+Whatever disagrees first IS the bug, no theories required. State shipped: unchanged from r613's best (tree site r612
+form; panel 0/610/10.8k/1.7k terrain, 1.000/1.369/0.921/1.000 mass); the lapse instrument stays in the probe.
+
+## r617 — THE INSTRUMENT ENDED THE THEORIZING: the tree puzzle IS the surface-height fork, root cause proven
+Built the decision-export instrument: shader pc gains debug_mode (the _pad word); when 1, Phase A writes each interior
+column's r613-form decision internals (biome, effective_density, tree_origin_hash, surface_target — 4 words/col) into
+the chunk slot and returns; VulkanChunkGenerator::export_decisions reads the raw words; probe mode
+UNENDLICH_PROBE_DECISIONS=1 diffs per-column against the CPU pipeline.
+FINDINGS, in order: (1) 535/4096 columns mismatch, ALL one-directional (cpu Plains → gpu TemperateForest), clustered
+in spatial bands along the registry-fit boundary; effective densities agree EXACTLY wherever classification agrees —
+the whole 2.5x is classification. (2) The y-vs-f32 discriminator: cpu@st == gpu@st == TemperateForest — the CPU's own
+f64 math at the GPU's y agrees with the GPU. The classifier mirror is fully vindicated; the cause is the
+classification HEIGHT (st=75.3 vs cpu sy=73; the fit boundary is knife-edge where the factor bell is flat — r616
+measured the right quantity at the wrong sensitivity). (3) The obvious fix — reclassify inside the decision at the
+GLSL's own SCANNED surface (d.surface_y) — regressed IDENTICALLY (mass 2.358), which PROVES the GLSL r447 scan lands
+~2 blocks above the CPU's surface_y_at at these columns: THE BACKENDS DISAGREE ABOUT WHERE THE SURFACE IS. Reverted
+with a postmortem comment at the site (verified restored: 0.921).
+THE UNIFIED PICTURE, finally: the tree-mass skews AND the residual ~10.8k terrain diffs are ONE phenomenon — a ±1-2
+block surface-height divergence along contours, i.e. the genuine f32(GLSL)-vs-f64(CPU) density-crossing drift first
+suspected in r604 and now PROVEN the last standing fork. Everything else — classifier, registry, ids, hashes, factor,
+tables — is measured equal. The endgame is therefore exactly one project: make the two backends agree on the density
+field's zero crossing (candidate directions unchanged from the r604 ledger: CPU noise to f32 behind a world-version
+gate, precomputed noise tiles, or f64 emulation in GLSL). Until then: tree site stays r612 (0.921/1.369 mass — honest
+numbers for an honestly-forked surface), clean seeds stay gate-worthy (0 and 610 terrain), and every instrument
+(parity panel, tree-biome histogram, lapse, decision-export) is in-tree for the surface project to verify against.

@@ -11,21 +11,165 @@ use egui::{Color32, Context, ImageData, RawInput, Rect, TextureId};
 use unendlich_engine::sim::menu_controller::MenuController;
 use unendlich_engine::sim::title_flow::MenuId;
 
-const W: usize = 720;
-const H: usize = 520;
+const W: usize = 960;
+const H: usize = 720;
 const PPP: f32 = 3.0; // supersample: lay out in points, rasterize at 3x for crisp text
 
 fn main() {
-    // Title screen.
+    // App-core menu view (the future canonical menu).
     render(&MenuController::with_defaults(), "/mnt/user-data/outputs/menu_title.png");
-    // New-game wizard screen.
     let mut m = MenuController::with_defaults();
     m.select(MenuId::NewGame);
     render(&m, "/mnt/user-data/outputs/menu_wizard.png");
+
+    // THE LIVE MENU — the extracted `app::live_menu::live_menu_body`, i.e. the
+    // exact code the fullgame's title window draws. Photographed per screen
+    // kind with representative data, so menu work is visible in-sandbox.
+    let mp = vec![
+        "kessler — Vale (seed 7) @ 192.168.1.10:9878".to_string(),
+        "server — Highlands (seed 41) @ 192.168.1.20:9878".to_string(),
+    ];
+    let worlds = vec![
+        "Vale  ·  seed 7  ·  creative".to_string(),
+        "Highlands  ·  seed 41  ·  survival".to_string(),
+        "Testbed  ·  seed 1337  ·  creative".to_string(),
+    ];
+    let rb = vec![
+        "#5 · autosave · 2m ago · 14 chunks".to_string(),
+        "#4 · crafting · 9m ago · 12 chunks".to_string(),
+        "#3 · long travel · 21m ago · 30 chunks".to_string(),
+    ];
+    render_pause("/mnt/user-data/outputs/menu_live_pause.png");
+    render_tooltips("/mnt/user-data/outputs/menu_live_tooltips.png");
+    render_wizard("/mnt/user-data/outputs/menu_live_wizard.png");
+    for (kind, name) in [
+        (0u8, "live_title"),
+        (1, "live_confirm_quit"),
+        (2, "live_multiplayer"),
+        (3, "live_load"),
+        (4, "live_singleplayer"),
+    ] {
+        render_live(kind, &mp, &worlds, &rb, &format!("/mnt/user-data/outputs/menu_{name}.png"));
+    }
+}
+
+fn render_wizard(out: &str) {
+    use unendlich_engine::app::live_menu::{wizard_body, WizardState};
+    let name = std::cell::RefCell::new(String::from("Vale"));
+    let seed = std::cell::RefCell::new(String::from("90210"));
+    render_with(out, |c| {
+        #[cfg(feature = "unendlich-ui")]
+        unendlich_ui::set_theme(c, unendlich_ui::Theme::DARK);
+        egui::CentralPanel::default().show(c, |ui| {
+            let mut st = WizardState {
+                title: "New World",
+                summary: "mode: survival \u{00b7} seed: 90210",
+                can_next: true,
+                at_confirm: false,
+                focus_name: false,
+                name_buf: &mut name.borrow_mut(),
+                seed_buf: &mut seed.borrow_mut(),
+                preview: None,
+            };
+            let _ = wizard_body(ui, &mut st);
+        });
+    });
+}
+
+fn render_tooltips(out: &str) {
+    use unendlich_engine::app::live_menu::{item_tooltip_from_tip, item_tooltip_ui, rarity_color};
+    use unendlich_engine::sim::item_tooltip::{compose, AffixView, ItemTooltipView};
+    let _ = rarity_color(0);
+    render_with(out, |c| {
+        #[cfg(feature = "unendlich-ui")]
+        unendlich_ui::set_theme(c, unendlich_ui::Theme::DARK);
+        egui::CentralPanel::default().show(c, |ui| {
+            ui.columns(2, |cols| {
+                // Left: the bin's canonical tip strings, composed + painted.
+                cols[0].strong("from tip_for strings");
+                cols[0].group(|ui| {
+                    item_tooltip_from_tip(ui, "Greatsword\nHeavy two-hander; big swing\n3 Iron Ingot + a plank handle");
+                });
+                cols[0].group(|ui| {
+                    item_tooltip_from_tip(ui, "Cooked Meat\nRaw meat seared over coal\nRestores far more than raw — and won't turn");
+                });
+                // Right: the full structured view (what item_modifier unlocks).
+                cols[1].strong("full view (future affixed item)");
+                let affixes = [
+                    AffixView { label: "+0.14 to effective S threshold", magnitude: 0.14 },
+                    AffixView { label: "+6% swing speed", magnitude: 0.06 },
+                ];
+                for tier in [1u8, 3, 5] {
+                    let view = ItemTooltipView {
+                        name: "Seismic Focus Stone",
+                        rarity: tier,
+                        kind_label: Some("Bending Instrument"),
+                        slot_label: Some("Off-hand"),
+                        affixes: &affixes,
+                        lore: "Hold it long enough and you feel the mountain's pulse answer yours.",
+                        attribution: Some("— Teaching inscription, Earthbound Dojo"),
+                        lore_cols: 34,
+                    };
+                    cols[1].group(|ui| item_tooltip_ui(ui, &compose(&view), tier));
+                }
+            });
+        });
+    });
+}
+
+fn render_pause(out: &str) {
+    render_with(out, |c| {
+        #[cfg(feature = "unendlich-ui")]
+        unendlich_ui::set_theme(c, unendlich_ui::Theme::DARK);
+        egui::CentralPanel::default().show(c, |ui| {
+            let _ = unendlich_engine::app::live_menu::pause_menu_body(ui, "menu build snapshot");
+        });
+    });
+}
+
+fn render_live(kind: u8, mp: &[String], worlds: &[String], rb: &[String], out: &str) {
+    use unendlich_engine::app::live_menu::{live_menu_body, LiveMenuState};
+    render_with(out, |c| {
+        // With the kit compiled in, photograph the REAL art style — theme +
+        // fonts applied exactly as the renderer applies them. Build with
+        //   cargo run --example menu_snapshot --features egui,unendlich-ui
+        // for kit shots; plain `egui` gives structural (fallback) shots.
+        #[cfg(feature = "unendlich-ui")]
+        unendlich_ui::set_theme(c, unendlich_ui::Theme::DARK);
+        egui::CentralPanel::default().show(c, |ui| {
+            let s = LiveMenuState {
+                screen_kind: kind,
+                mp_list: mp,
+                world_list: worlds,
+                rollback_list: rb,
+                show_rollbacks: kind == 3,
+                world_delete_ask: -1,
+                dev_mode: kind == 3, // show the dev row on the load shot
+            };
+            let _ = live_menu_body(ui, &s);
+        });
+    });
 }
 
 fn render(menu: &MenuController, out: &str) {
+    render_with(out, |c| {
+        let _ = unendlich_engine::app::menu_view::menu_ui(c, menu);
+    });
+}
+
+fn render_with(out: &str, draw: impl Fn(&Context)) {
     let ctx = Context::default();
+    // Mirror EguiOverlay::new: the blocky/glyph fonts must be REGISTERED on
+    // the context or every blocks_font label panics ("blocks is not bound").
+    // In-game the overlay installs them at init; headless we do it here. This
+    // is the art-style reingest hazard in one line — the body and its fonts
+    // must travel together.
+    #[cfg(feature = "unendlich-ui")]
+    unendlich_ui::menu::install_fonts(
+        &ctx,
+        include_bytes!("../../../docs/design/UnendlichBlocks-Regular.ttf"),
+        include_bytes!("../../../docs/design/UnendlichGlyphs-Regular.ttf"),
+    );
     ctx.set_pixels_per_point(PPP);
     let mut input = RawInput::default();
     input.screen_rect = Some(Rect::from_min_size(
@@ -35,22 +179,41 @@ fn render(menu: &MenuController, out: &str) {
     // run twice: the FIRST frame uploads the font atlas (it appears in that
     // frame's textures_delta); the second frame has stable shapes. We must read
     // the atlas from the first frame — the second's delta is empty.
-    let first = ctx.run(input.clone(), |c| {
-        let _ = unendlich_engine::app::menu_view::menu_ui(c, menu);
-    });
-    let full = ctx.run(input, |c| {
-        let _ = unendlich_engine::app::menu_view::menu_ui(c, menu);
-    });
+    let first = ctx.run(input.clone(), |c| draw(c));
+    let full = ctx.run(input, |c| draw(c));
 
     // Grab the font atlas from the texture deltas. In egui 0.34 the atlas is a
     // ColorImage; glyph coverage lives in the alpha channel (and the solid
     // WHITE_UV texel is opaque, so this path covers fills too).
-    let mut atlas = (1usize, 1usize, vec![1.0f32]);
+    //
+    // Deltas can be PARTIAL (delta.pos = Some(origin)): a growing atlas (new
+    // glyphs mid-run) patches a region rather than replacing the image.
+    // Treating a patch as the whole atlas is how the first capped-button run
+    // rendered as UV smears — apply patches at their position.
+    let mut atlas: (usize, usize, Vec<f32>) = (1, 1, vec![1.0f32]);
     for (id, delta) in first.textures_delta.set.iter().chain(full.textures_delta.set.iter()) {
         if *id == TextureId::Managed(0) {
             let ImageData::Color(img) = &delta.image;
-            let cov: Vec<f32> = img.pixels.iter().map(|c| c.a() as f32 / 255.0).collect();
-            atlas = (img.size[0], img.size[1], cov);
+            match delta.pos {
+                None => {
+                    // Full upload: replace.
+                    let cov: Vec<f32> = img.pixels.iter().map(|c| c.a() as f32 / 255.0).collect();
+                    atlas = (img.size[0], img.size[1], cov);
+                }
+                Some([ox, oy]) => {
+                    // Partial patch into the existing atlas.
+                    let (aw, ah, ref mut cov) = atlas;
+                    for py in 0..img.size[1] {
+                        for px in 0..img.size[0] {
+                            let (dx, dy) = (ox + px, oy + py);
+                            if dx < aw && dy < ah {
+                                cov[dy * aw + dx] =
+                                    img.pixels[py * img.size[0] + px].a() as f32 / 255.0;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     let (aw, ah, ref apx) = atlas;

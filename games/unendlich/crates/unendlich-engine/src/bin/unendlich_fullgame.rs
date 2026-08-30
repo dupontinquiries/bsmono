@@ -796,7 +796,12 @@ fn main() {
     };
     log::info!("Terrain generator ready (gpu={})", generator.has_gpu());
 
-    let num_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    // Worker threads via device_budget: leaves headroom for the main/render
+    // threads, and on mobile an extra core for the OS (an 8-core phone running
+    // 8 worker threads plus render starves itself into thermal throttle).
+    let num_workers = unendlich_engine::device_budget::worker_threads(
+        &unendlich_engine::device_budget::DeviceCaps::detect(),
+    ) as usize;
     // World persistence path: pristine chunks aren't saved (no overhead);
     // only chunks with player edits write to disk.
     //
@@ -1313,6 +1318,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         unendlich_engine::physics::BodyId::LOCAL_PLAYER,
         spawn_pos,
     );
+    // Watchdog memory: the last finite, in-bounds player pose (pos, yaw,
+    // pitch). Seeded from the spawn pose; refreshed every sane frame; used to
+    // snap back if the position ever goes non-finite (see the frame-loop
+    // watchdog — found by the first headless lavapipe soak).
+    let mut fg_last_sane_pose: (glm::Vec3, f32, f32) =
+        (local_player.view.position, local_player.view.yaw, local_player.view.pitch);
     if survival_mode {
         // r124: survival revokes creative flight (set after construction —
         // the flag itself is read near the feature banner, before this point).
@@ -2867,6 +2878,21 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         whitelist.len()
     );
     let mut fg_create_spree: u8 = 0; // r186: Create World presses-through
+    // r597 soak harness: UNENDLICH_AUTOPLAY=1 auto-creates a world from the
+    // title screen through the SAME one-click spree path the UI uses, so
+    // headless soaks run IN-WORLD (physics, creatures, streaming). Fires
+    // once, after boot settles.
+    // "1" = create a world AND walk; "walk" = walk only once InGame (the
+    // JOINER's mode in dual-process soaks — its world comes from the host).
+    let fg_autoplay_raw = std::env::var("UNENDLICH_AUTOPLAY").unwrap_or_default();
+    let fg_autoplay: bool = fg_autoplay_raw == "1";
+    let fg_autoplay_walk: bool = fg_autoplay || fg_autoplay_raw == "walk";
+    // 0 = idle, 1 = wizard requested (waiting for the panel to show it),
+    // 2 = spree armed. Two stages because the panel reflects the app ONE
+    // frame late and the spree self-cancels when the panel lags (each frame
+    // is seconds long under lavapipe, so "one frame" is a long time).
+    let mut fg_autoplay_stage: u8 = 0;
+    let mut fg_autoplay_dbg_ms: u64 = 0;
     let mut fg_rebuild_call_count: u32 = 0; // DIAGNOSTIC (temporary) — see the log at rebuild_for_seed's call site
     let mut ocean_diag_logged: u32 = 0; // DIAGNOSTIC (temporary) — caps the [diag-surface] formula-term dump
     // r661: (removed fg_host_pending — Host World now opens the wizard normally)
@@ -2890,9 +2916,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // inert state, so single-player is unaffected if binding can't happen.
     let lan_mp_enabled = std::env::var("UNENDLICH_LAN_MP").map(|v| v != "0").unwrap_or(true);
     let lan_beacon: Option<unendlich_engine::sim::lan_discovery::LanBeacon> = if lan_mp_enabled {
-        match unendlich_engine::sim::lan_discovery::LanBeacon::bind() {
-            Ok(b) => {
-                log::info!("[lan-mp] discovery beacon bound (UNENDLICH_LAN_MP=1)");
+        match unendlich_engine::sim::lan_discovery::LanBeacon::bind_or_muted() {
+            Ok((b, muted)) => {
+                if muted {
+                    // r602: the gossip port is taken (second instance on this
+                    // machine) — beacon is on an ephemeral port: adverts SEND
+                    // but the host list stays empty here. Direct-connect
+                    // (UNENDLICH_LAN_HOST) and the whole session socket still
+                    // run — they were wrongly dead in this case before.
+                    log::warn!("[lan-mp] gossip port taken — discovery muted (direct-connect still works)");
+                } else {
+                    log::info!("[lan-mp] discovery beacon bound (UNENDLICH_LAN_MP=1)");
+                }
                 Some(b)
             }
             Err(e) => {
@@ -2913,10 +2948,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // r397: addresses of discovered hosts, parallel to renderer.menu_mp_list, so a
     // clicked index maps to a candidate to send a JOIN to.
     let mut lan_host_addrs: Vec<std::net::SocketAddrV4> = Vec::new();
-    // r399: peer-to-peer transform replication state. Each side is authoritative for
-    // its own player and sends it to the connected peer; the receiver newest-wins per
-    // entity id (`SnapshotGate`). The local entity id is the session port, distinct per
-    // process on a LAN, so host + joiner ids never collide.
+    // r399 → multi-peer: transform replication state. Each side is authoritative
+    // for its own player; the receiver newest-wins per entity id (`SnapshotGate`).
+    // `lan_peer_addr` is now the JOINER'S UPSTREAM HOST only (set when we click a
+    // host or direct-connect). When WE host, connected peers live in `lan_host`
+    // below — the old single-slot host tracking replaced a first joiner with the
+    // second, and its port-derived ids collided when two machines both bound 9878.
     let mut lan_peer_addr: Option<std::net::SocketAddrV4> = None;
     let mut lan_stamper = unendlich_engine::sim::net::entity_snapshot::AuthorityStamper::new();
     let mut lan_gate = unendlich_engine::sim::net::entity_snapshot::SnapshotGate::new();
@@ -2987,6 +3024,36 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         .and_then(|s| s.local_addr().ok())
         .map(|a| a.port())
         .unwrap_or(0);
+    // Multi-peer host table (sim::net::lan_host). Replaces the old single
+    // `lan_peer_addr` HOST-side tracking — a second joiner used to silently
+    // REPLACE the first, and joiners never saw each other. The table assigns
+    // collision-free entity ids (both sides binding 9878 used to merge two
+    // joiners into one avatar), fans datagrams out to everyone-but-source
+    // (star relay through the host), and prunes silent peers.
+    let mut lan_host = unendlich_engine::sim::net::lan_host::LanHost::new(
+        &active_character.name,
+        lan_session_port as u64,
+    );
+    // The id WE stamp on outbound entity states. Hosts keep the legacy
+    // port-derived id; a joiner adopts the id its host assigned in Accept.
+    let mut lan_my_eid: u64 = lan_session_port as u64;
+    // Join-at-any-time: per-joiner catch-up plans (the host streams its edit
+    // overlay in the timebending storage layout — join_sync records, paced),
+    // and the world clock a joiner adopts from its host's Accept so it lands
+    // in the host's evening rather than a fresh dawn.
+    let mut lan_join_syncs: Vec<(std::net::SocketAddrV4, unendlich_engine::sim::net::join_sync::SyncPlan)> = Vec::new();
+    let mut lan_adopt_time_ms: Option<u64> = None;
+    // r602: the (name, seed) we already joined — duplicate Accepts for it
+    // are no-ops instead of world relaunches.
+    let mut lan_joined_world: Option<(String, u64)> = None;
+    // r602: join-sync records that arrived while the joined world was still
+    // LOADING (the host paces batches right after Accept; the rebuild is a
+    // blocking, seconds-long call under software Vulkan) — applying them to
+    // the pre-launch chunk manager would let the rebuild erase them. Drained
+    // right after the launch handler, alongside clock adoption.
+    let mut lan_joinsync_backlog: Vec<unendlich_engine::sim::net::join_sync::ChunkEditRecord> = Vec::new();
+    let mut lan_joinsync_retry_ms: u64 = 0;
+    let mut lan_keepalive_ms: u64 = 0;
     let lan_local_ip: Option<[u8; 4]> = if lan_beacon.is_some() {
         let ip = unendlich_engine::sim::lan_discovery::local_lan_ipv4();
         match ip {
@@ -4124,6 +4191,38 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // every animation by 1.3s, jerking the camera/gait on top of the low FPS.
         // Was `dt_ms/1000` (unclamped); now the clamped `dt`. Identical below 100ms.
         let frame_dt_s = dt;
+        // POSITION WATCHDOG (found by the first headless lavapipe soak: the
+        // player's position went non-finite, its chunk coord collapsed to
+        // i32::MIN, and the eviction membership check crashed on i32
+        // subtraction — in release the same state silently wraps and evicts
+        // the world instead). A wild pose logs its forensics ONCE per event
+        // and snaps back to the last sane pose with zeroed velocity; the
+        // session survives and the log points at the polluting system.
+        {
+            let p = local_player.view.position;
+            let sane = p.x.is_finite() && p.y.is_finite() && p.z.is_finite()
+                && p.x.abs() < 3.0e7 && p.y.abs() < 3.0e7 && p.z.abs() < 3.0e7;
+            if sane {
+                fg_last_sane_pose = (p, local_player.view.yaw, local_player.view.pitch);
+            } else {
+                let v = body.as_ref().map(|b| b.velocity).unwrap_or([0.0; 3]);
+                log::error!(
+                    "[watchdog] player position went wild: pos=({:?},{:?},{:?}) vel=({:?},{:?},{:?}) — snapping back to last sane pose {:?}",
+                    p.x, p.y, p.z, v[0], v[1], v[2], fg_last_sane_pose.0
+                );
+                local_player.view.position = fg_last_sane_pose.0;
+                local_player.view.yaw = fg_last_sane_pose.1;
+                local_player.view.pitch = fg_last_sane_pose.2;
+                if let Some(b) = body.as_mut() {
+                    b.velocity = [0.0; 3];
+                    b.position = [
+                        fg_last_sane_pose.0.x,
+                        fg_last_sane_pose.0.y,
+                        fg_last_sane_pose.0.z,
+                    ];
+                }
+            }
+        }
 
         // ── r526: MOB AI + MOVEMENT ──────────────────────────────────────
         // Tick each test mob's brain (wander / seek / flee) and advance it with
@@ -6994,6 +7093,20 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         if bindings.is_action_pressed(GameAction::MoveRight, &input)    { move_local.z += 1.0; }
         if bindings.is_action_pressed(GameAction::MoveLeft, &input)     { move_local.z -= 1.0; }
 
+        // r600 (soak-with-movement): under UNENDLICH_AUTOPLAY, once in-world,
+        // walk. A steady forward push with a slow yaw drift traces a wide
+        // spiral: chunk streaming, eviction, physics, foliage disturbance and
+        // creature encounters all run under real motion instead of a
+        // statue-at-spawn. Injected at the SAME seam keyboard input lands, so
+        // everything downstream is the player path, not a parallel one.
+        if fg_autoplay_walk
+            && matches!(fg_app.state(), unendlich_engine::sim::game_flow::AppState::InGame)
+            && !game_paused
+        {
+            move_local.x += 1.0; // forward
+            local_player.view.yaw += 0.25 * dt; // ~14°/s — a lazy arc
+        }
+
         match body.as_mut() {
             None => {
                 // Fly mode: direct camera control, no physics. The Jump and
@@ -9306,9 +9419,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // When the scene is disabled, build_debug_mesh returns empty,
         // and upload_prebuilt_mesh evicts any prior mesh — clean.
         let debug_mesh = unendlich_engine::debug_overlay::build_debug_mesh(&debug_scene);
-        let debug_coord = unendlich_engine::world::chunk::ChunkCoord {
-            x: i32::MIN, y: i32::MIN, z: i32::MIN,
-        };
+        let debug_coord = unendlich_engine::world::chunk::ChunkCoord::DEBUG_OVERLAY;
         if let Err(e) = renderer.upload_prebuilt_mesh(&ctx, debug_coord, debug_mesh, 0) {
             log::warn!("debug overlay upload failed: {}", e);
         }
@@ -10692,10 +10803,36 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // per loaded chunk); shell-iterator for submit (walks outward
         // from the player in Chebyshev order and short-circuits).
         let in_render_distance = |c: ChunkCoord| -> bool {
-            let dx = c.x - player_chunk.x;
-            let dy = c.y - player_chunk.y;
-            let dz = c.z - player_chunk.z;
-            dx*dx + dy*dy + dz*dz <= rd_sq
+            // r601: the debug-overlay sentinel is a DESIGNED out-of-band key
+            // (see ChunkCoord::DEBUG_OVERLAY) — always "in range", never
+            // evicted, never warned about. The r596 hunt started from this
+            // very coord crashing the distance math below.
+            if c == ChunkCoord::DEBUG_OVERLAY {
+                return true;
+            }
+            // Genuine wild coords (any other saturation pattern) are rejected
+            // BEFORE any distance math ((i32::MIN)² overflows even i64;
+            // abs(i32::MIN) panics — unsigned_abs) and get evicted, with a
+            // one-shot log naming the evidence.
+            let wild = c.x.unsigned_abs() > 1_000_000
+                || c.y.unsigned_abs() > 1_000_000
+                || c.z.unsigned_abs() > 1_000_000;
+            if wild {
+                static WILD_ONCE: std::sync::Once = std::sync::Once::new();
+                WILD_ONCE.call_once(|| {
+                    log::error!(
+                        "[watchdog] WILD chunk coord in the loaded set: ({}, {}, {}) — \
+                         some system fed a non-finite/absurd world position into \
+                         chunk lookup (evicting it; hunt the producer)",
+                        c.x, c.y, c.z
+                    );
+                });
+                return false;
+            }
+            let dx = (c.x - player_chunk.x) as i64;
+            let dy = (c.y - player_chunk.y) as i64;
+            let dz = (c.z - player_chunk.z) as i64;
+            dx * dx + dy * dy + dz * dz <= rd_sq as i64
         };
 
         // Evict any meshes that are no longer desired. v0.24.67: only when the
@@ -10938,7 +11075,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         Some(c) => c,
                         None => continue, // not yet generated
                     };
-                    let chunk_ver = chunk.version;
+                    let chunk_ver = chunk_manager.effective_version(coord, chunk.version); // r599: virtual transition bump
 
                     // r703: FULLY-BURIED chunk cull (moved here from the submission
                     // site so buried chunks never consume candidate budget). If this
@@ -11040,7 +11177,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     Some(c) => c,
                     None => continue,
                 };
-                let chunk_ver = chunk.version;
+                let chunk_ver = chunk_manager.effective_version(coord, chunk.version); // r599: virtual transition bump
                 let needs_submit = match renderer.mesh_or_empty_version_for_lod(coord, lod) {
                     None => true,
                     Some(r) => r != chunk_ver,
@@ -11443,6 +11580,28 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     log::warn!("Deferrable upload failed for {:?} at {:?}: {}", result.coord, result.lod, e);
                     continue;
                 }
+            } else if {
+                // r601 producer trap (drain side): fingerprint a wild-coord
+                // mesh RESULT before upload — version/lod/vertex counts tell
+                // a default-constructed placeholder apart from an echoed
+                // wild request.
+                if result.coord != unendlich_engine::world::chunk::ChunkCoord::DEBUG_OVERLAY
+                    && result.coord.x.unsigned_abs() > 1_000_000
+                    || result.coord.y.unsigned_abs() > 1_000_000
+                    || result.coord.z.unsigned_abs() > 1_000_000
+                {
+                    static TRAP_DRAIN_ONCE: std::sync::Once = std::sync::Once::new();
+                    TRAP_DRAIN_ONCE.call_once(|| {
+                        log::error!(
+                            "[watchdog] WILD mesh RESULT drained: coord=({},{},{}) lod={:?} version={} verts={} — a poisoned request or a placeholder result",
+                            result.coord.x, result.coord.y, result.coord.z,
+                            result.lod, result.version, result.mesh.vertices.len()
+                        );
+                    });
+                }
+                false
+            } {
+                unreachable!()
             } else if let Err(e) = renderer.upload_prebuilt_mesh_at_lod(&ctx, result.coord, result.lod, result.mesh, result.version) {
                 log::warn!("Upload failed for {:?} at {:?}: {}", result.coord, result.lod, e);
                 continue;
@@ -12794,7 +12953,56 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 start.elapsed().as_secs_f32(),
             );
         }
+        // r598: ROAMER SANITY SWEEP — the wild-chunk producer hunt points at
+        // an entity position going non-finite during the menu-phase ecosystem
+        // tick (NaN position → streamed chunk at (i32::MIN)³ → generated,
+        // meshed, uploaded, evicted). Catch it AT the animal: log the species
+        // + state once per event and snap the body back to its home column
+        // instead of letting a NaN walk the world into the chunk manager.
+        for r in roamers.iter_mut() {
+            let bp = r.creature.body.position;
+            let bad = !(bp[0].is_finite() && bp[1].is_finite() && bp[2].is_finite())
+                || bp[0].abs() > 3.0e7 || bp[1].abs() > 3.0e7 || bp[2].abs() > 3.0e7;
+            if bad {
+                let v = r.creature.body.velocity;
+                log::error!(
+                    "[watchdog] roamer position went wild: kind={:?} pos=({:?},{:?},{:?}) vel=({:?},{:?},{:?}) home={:?} — snapping to home",
+                    r.kind, bp[0], bp[1], bp[2], v[0], v[1], v[2], r.home
+                );
+                r.creature.body.position =
+                    [r.home.0 as f32 + 0.5, 96.0, r.home.1 as f32 + 0.5];
+                r.creature.body.velocity = [0.0; 3];
+            }
+        }
         renderer.set_season(current_season01); // r499: foliage seasonal tint
+        // r595: feed the foliage disturber ARRAY — every nearby mover parts
+        // the grass, not just the camera. Candidates: the player, live
+        // roamers (dragons get a wider wake), and LAN peer avatars; the pure
+        // selector keeps the 8 nearest within 28 blocks of the camera.
+        {
+            let pp = local_player.view.position;
+            let mut cands: Vec<([f32; 3], f32)> = Vec::with_capacity(roamers.len() + 4);
+            cands.push(([pp.x, pp.y, pp.z], 2.5)); // the player
+            for r in &roamers {
+                let bp = r.creature.body.position; // [f32; 3]
+                let reach = match r.kind {
+                    unendlich_engine::item::CreatureKind::Dragon => 4.0,
+                    unendlich_engine::item::CreatureKind::Dinosaur => 3.0,
+                    _ => 2.2,
+                };
+                cands.push((bp, reach));
+            }
+            for c in lan_remote_creatures.values() {
+                cands.push((c.body.position, 2.5));
+            }
+            let picked = unendlich_engine::sim::foliage_sway::select_disturbers(
+                &cands,
+                [pp.x, pp.y, pp.z],
+                28.0,
+                8,
+            );
+            renderer.set_foliage_disturbers(&picked);
+        }
 
         // r476: timebend snapshot/scrub. While LIVE, record the player's vantage
         // on the capture cadence. While SCRUBBING, override the camera + world
@@ -13704,6 +13912,40 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             use unendlich_engine::sim::new_world_config::SeedChoice;
             use unendlich_engine::sim::title_flow::{MenuId, Screen};
 
+            // r597: AUTOPLAY — open the wizard and arm the r186 spree exactly
+            // as a Create World click would. The launch then flows through the
+            // NORMAL path (Launch handler, world build, enter_game), so the
+            // soak exercises the same code a player does. Gated on WALL CLOCK,
+            // not frame_count: under Xvfb the swapchain never presents, so
+            // presented-frame counters stay 0 while the sim runs fine.
+            if fg_autoplay && fg_autoplay_stage == 0 && renderer.menu_open
+                && start.elapsed().as_millis() > 2500
+            {
+                fg_autoplay_stage = 1;
+                let _ = fg_app.tick(AppInput::Select(MenuId::NewGame), 0);
+                let _ = fg_app.tick(AppInput::WizardSetName("Soak".into()), 0);
+                log::info!("[autoplay] wizard requested for world 'Soak'");
+            }
+            if fg_autoplay && fg_autoplay_stage == 1 && renderer.wizard_open {
+                // The panel caught up — NOW the spree can survive its own
+                // wizard_open check.
+                fg_autoplay_stage = 2;
+                fg_create_spree = 6;
+                log::info!("[autoplay] wizard visible — arming the one-click spree");
+            }
+            // r597: autoplay flight recorder — once per second under
+            // UNENDLICH_AUTOPLAY only. Soak logs WANT this heartbeat: it
+            // proved the launch flow live (one rebuild call per create) and
+            // shows at a glance whether a soak is in-world or stuck.
+            let ap_now_ms = start.elapsed().as_millis() as u64;
+            if fg_autoplay_walk && ap_now_ms > 2500 && ap_now_ms.saturating_sub(fg_autoplay_dbg_ms) >= 1000 {
+                fg_autoplay_dbg_ms = ap_now_ms;
+                log::info!(
+                    "[autoplay-dbg] screen={:?} state={:?} spree={} wizard_open={} at_confirm={} menu_open={}",
+                    fg_app.screen(), fg_app.state(), fg_create_spree,
+                    renderer.wizard_open, renderer.wizard_at_confirm, renderer.menu_open
+                );
+            }
             // r401: Host World opened the wizard; once it's actually open, fire the
             // proven one-click Create (wizard_action 9) so a single Host World click
             // launches a world without manual wizard steps.
@@ -13721,16 +13963,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // seed/name and one-click launch through the FSM (drives MainMenu →
             // Loading → InGame properly), then arm the arena stamp at spawn.
             // r679: replaced by AppInput::StartTutorial (direct launch, no wizard).
-            let input = if renderer.menu_world_pick >= 0 {
-                // r385 LOAD FIX: a clicked saved-world row goes through the App FSM
-                // (SelectSlot → resolve_load → Launch(StartLocal) AND the state machine
-                // leaves the menu → InGame). The old bin bypass (fg_pending_load below)
-                // rebuilt the terrain but never drove the App state, so it bounced back
-                // to the menu with a fresh backdrop seed instead of entering the world.
-                let p = renderer.menu_world_pick as u8;
-                renderer.menu_world_pick = -1; // consume here so the bypass below can't double-fire
-                AppInput::SelectSlot(p)
-            } else if renderer.menu_choice != 0 {
+            let input = if renderer.menu_choice != 0 {
+                // r-loadfix: menu_world_pick is NO LONGER consumed here. The r385
+                // SelectSlot route resolved the click against the MENU's catalog,
+                // which is frozen at boot (r131 records new worlds FILE-only), so
+                // clicking a world created THIS session did nothing (resolve_load
+                // → None → Stay), and even for boot worlds the row order could
+                // diverge from the displayed list (built from the FILE catalog),
+                // loading the wrong world. The LoadSlots block below builds the
+                // display list from the file catalog AND consumes the click
+                // against those same entries (→ fg_pending_load → the full launch
+                // handler, which now drives the App via enter_game — the gap r385
+                // was actually fixing). One list, one consumer, one catalog.
                 let c = renderer.menu_choice;
                 renderer.menu_choice = 0;
                 // r385 MP FIX: menu_choice is screen-dependent. On the Multiplayer
@@ -13882,6 +14126,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     multiplayer: false,
                 };
                 step = AppStep::Launch(LaunchPlan::StartLocal(init));
+                // r603 (the dual-motion soak's find): this synthetic launch
+                // used to leave the app FSM in MainMenu forever — enter_game()
+                // below no-ops outside Loading, so the joiner never reached
+                // InGame: no outbound entity states, walk-mode inert, the
+                // Loading keepalive re-joining every 2 s for the whole
+                // session, and the title overlay drawn over the joined world.
+                // Drive the same MainMenu → Loading edge the menu path takes.
+                fg_app.begin_external_launch();
             }
 
             if in_dbg != "None" {
@@ -14129,7 +14381,28 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         }
                     }
                     fg_app.enter_game();
-                    renderer.ui_pointer_active = false;
+
+                // Join-at-any-time: land at the HOST's time of day, not a fresh
+                // dawn — the clock rode the Accept (world_time_ms) and applies
+                // once, after this world (the host's world) finished loading.
+                if let Some(t_ms) = lan_adopt_time_ms.take() {
+                    sky_state.time_seconds = (t_ms as f64) / 1000.0;
+                    log::info!(
+                        "[lan-mp] adopted host world clock: {:.0}s into the day cycle",
+                        sky_state.time_seconds
+                    );
+                }
+                // r602: drain join-sync records that arrived during the load —
+                // NOW they land in the world they were meant for.
+                if !lan_joinsync_backlog.is_empty() {
+                    let records = std::mem::take(&mut lan_joinsync_backlog);
+                    let (n, rest) = chunk_manager.apply_edit_records(&records);
+                    log::info!(
+                        "[lan-mp] join-sync applied {n} backlogged edit(s) post-load ({} awaiting chunk load)",
+                        rest.len()
+                    );
+                    lan_joinsync_backlog = rest;
+                }                    renderer.ui_pointer_active = false;
                     window.set_cursor_mode(CursorMode::Disabled);
                     log::info!("fullgame: launch {plan:?} — entering game");
                 }
@@ -14160,6 +14433,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     const CH_ENTITY: u8 = 2;
                     const CH_WORLDCMD: u8 = 3;
                     const CH_AVATAR: u8 = 4; // r494: peer character appearance
+                    const CH_JOINSYNC: u8 = 5; // join-at-any-time: host→joiner edit catch-up (timebending layout)
                     use unendlich_engine::sim::net::world_cmd_wire::{decode_batch, encode_batch};
 
                     // Inbound: drain pending datagrams (non-blocking), route by channel.
@@ -14168,46 +14442,132 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         match sock.recv_from(&mut buf) {
                             Ok((n, src)) if n >= 1 => {
                                 let payload = &buf[1..n];
+                                // v4 source + peer-table upkeep, shared by every arm. When WE
+                                // are the host (no upstream), non-handshake datagrams from a
+                                // peer are STAR-RELAYED verbatim to every other peer — that's
+                                // what lets joiner A see joiner B through the host.
+                                let src4: Option<std::net::SocketAddrV4> = match src {
+                                    std::net::SocketAddr::V4(a) => Some(a),
+                                    _ => None, // LAN sessions are v4-only today
+                                };
+                                if let Some(a) = src4 {
+                                    lan_host.note_seen(a, now_ms);
+                                }
+                                let relay_as_host = |from: std::net::SocketAddrV4,
+                                                     lan_host: &unendlich_engine::sim::net::lan_host::LanHost| {
+                                    if lan_peer_addr.is_none() {
+                                        for target in lan_host.fanout(Some(from)) {
+                                            let _ = sock.send_to(&buf[..n], target);
+                                        }
+                                    }
+                                };
                                 match buf[0] {
                                     CH_HANDSHAKE => match LanJoin::parse(payload) {
                                         Some(LanJoin::Join { name }) => {
-                                            // r518: enforce the access policy. Open hosts admit
-                                            // anyone; closed hosts admit only whitelisted names.
-                                            if !whitelist.admits(&name) {
-                                                log::info!("[lan-mp] join DENIED for '{name}' ({src}) — not on whitelist");
-                                                let deny = LanJoin::Deny {
-                                                    reason: "not on this server's whitelist".into(),
+                                            let src4 = match src {
+                                                std::net::SocketAddr::V4(a) => a,
+                                                _ => continue, // LAN sessions are v4-only today
+                                            };
+                                            let allowed = whitelist.admits(&name);
+                                            use unendlich_engine::sim::net::lan_host::{Admit, DenyReason};
+                                            match lan_host.admit(&name, src4, allowed, now_ms) {
+                                                Admit::Accepted { entity_id, rejoined } => {
+                                                    log::info!(
+                                                        "[lan-mp] join request from '{name}' ({src}) — admitted as entity {entity_id}{} ({} player(s))",
+                                                        if rejoined { " (rejoined)" } else { "" },
+                                                        lan_host.player_count()
+                                                    );
+                                                    whitelist.allow(&name); // remember joiners so the host can later close + keep them
+                                                    let reply = LanJoin::Accept {
+                                                        world_name: current_world_name
+                                                            .clone()
+                                                            .unwrap_or_else(|| "World".into()),
+                                                        world_seed: fg_world_seed,
+                                                        entity_id: Some(entity_id),
+                                                        // join at any time = join at the host's NOW
+                                                        world_time_ms: Some(
+                                                            (sky_state.time_seconds.max(0.0) * 1000.0) as u64,
+                                                        ),
+                                                    }
+                                                    .encode();
+                                                    let mut dg = vec![CH_HANDSHAKE];
+                                                    dg.extend_from_slice(&reply);
+                                                    let _ = sock.send_to(&dg, src);
+                                                    // Queue the edit catch-up: the joiner regenerates
+                                                    // the seed's base; everything we DIVERGED from it
+                                                    // streams over in the timebending storage layout
+                                                    // (tick-0 = today's timeless overlay). Paced so a
+                                                    // built-up world doesn't stall the frame.
+                                                    if !rejoined || !lan_join_syncs.iter().any(|(a, _)| *a == src4) {
+                                                        let records = chunk_manager.edited_chunk_records();
+                                                        if !records.is_empty() {
+                                                            let plan = unendlich_engine::sim::net::join_sync::SyncPlan::new(&records, 4);
+                                                            log::info!(
+                                                                "[lan-mp] join-sync for '{name}': {} edited chunk record(s), {} batch(es)",
+                                                                records.len(), plan.total_batches()
+                                                            );
+                                                            lan_join_syncs.retain(|(a, _)| *a != src4);
+                                                            lan_join_syncs.push((src4, plan));
+                                                        }
+                                                    }
                                                 }
-                                                .encode();
-                                                let mut dg = vec![CH_HANDSHAKE];
-                                                dg.extend_from_slice(&deny);
-                                                let _ = sock.send_to(&dg, src);
-                                                continue;
+                                                Admit::Denied(reason) => {
+                                                    let text = match reason {
+                                                        DenyReason::NotAllowed => {
+                                                            "not on this server's whitelist"
+                                                        }
+                                                        DenyReason::Full => "world full",
+                                                    };
+                                                    log::info!(
+                                                        "[lan-mp] join DENIED for '{name}' ({src}) — {text}"
+                                                    );
+                                                    let deny =
+                                                        LanJoin::Deny { reason: text.into() }.encode();
+                                                    let mut dg = vec![CH_HANDSHAKE];
+                                                    dg.extend_from_slice(&deny);
+                                                    let _ = sock.send_to(&dg, src);
+                                                }
                                             }
-                                            log::info!("[lan-mp] join request from '{name}' ({src}) — admitted");
-                                            whitelist.allow(&name); // remember joiners so the host can later close + keep them
-                                            if let std::net::SocketAddr::V4(a) = src {
-                                                lan_peer_addr = Some(a); // host learns where to replicate
-                                            }
-                                            let reply = LanJoin::Accept {
-                                                world_name: current_world_name
-                                                    .clone()
-                                                    .unwrap_or_else(|| "World".into()),
-                                                world_seed: fg_world_seed,
-                                            }
-                                            .encode();
-                                            let mut dg = vec![CH_HANDSHAKE];
-                                            dg.extend_from_slice(&reply);
-                                            let _ = sock.send_to(&dg, src);
                                         }
-                                        Some(LanJoin::Accept { world_name, world_seed }) => {
+                                        Some(LanJoin::Accept { world_name, world_seed, entity_id, world_time_ms }) => {
+                                            // r602 (found by the two-process soak): Accepts can
+                                            // arrive REPEATEDLY — the direct-connect loop retries
+                                            // every 2 s until lan_peer_addr is set, and it was
+                                            // never set on this path, so every duplicate Accept
+                                            // RELAUNCHED the world (~every 6 s). Both halves
+                                            // fixed here: adopt the sender as our upstream so the
+                                            // retry loop stops, and treat a duplicate Accept for
+                                            // the world we already joined as a no-op.
+                                            if let Some(a) = src4 {
+                                                lan_peer_addr = Some(a);
+                                            }
+                                            let dup = lan_joined_world
+                                                .as_ref()
+                                                .is_some_and(|(n, s)| *n == world_name && *s == world_seed);
+                                            if dup {
+                                                // keep the freshest id/clock, but do NOT reload
+                                                if let Some(eid) = entity_id {
+                                                    lan_my_eid = eid;
+                                                }
+                                            } else {
+                                            // Adopt the host-assigned id (fixes the both-bound-
+                                            // 9878 collision). An old host sends none → keep the
+                                            // legacy port-derived id.
+                                            if let Some(eid) = entity_id {
+                                                lan_my_eid = eid;
+                                            }
+                                            // Adopt the host's world clock after the world loads —
+                                            // joining at any time lands at the host's time of day.
+                                            lan_adopt_time_ms = world_time_ms;
                                             log::info!(
-                                                "[lan-mp] accepted by host: joining world '{world_name}' seed {world_seed}"
+                                                "[lan-mp] accepted by host: joining world '{world_name}' seed {world_seed} as entity {lan_my_eid}"
                                             );
+                                            lan_joined_world = Some((world_name.clone(), world_seed));
                                             // Adopt the host's seed and load via the existing
                                             // synthetic-StartLocal launch path (rebuild_for_seed →
                                             // MainMenu→Loading→InGame). Same seed ⇒ same terrain.
                                             fg_pending_load = Some((world_name, world_seed, false));
+                                            }
                                         }
                                         Some(LanJoin::Deny { reason }) => {
                                             log::info!("[lan-mp] join denied: {reason}");
@@ -14215,11 +14575,31 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                         None => {}
                                     },
                                     CH_ENTITY => {
+                                        // r603-inv: raw arrival, BEFORE the gate — tells
+                                        // packets-arriving apart from gate-rejecting.
+                                        if let Some(a) = src4 {
+                                            static RAW_ONCE: std::sync::Once = std::sync::Once::new();
+                                            RAW_ONCE.call_once(|| {
+                                                log::info!("[lan-mp] first raw CH_ENTITY datagram from {a} ({} bytes)", payload.len());
+                                            });
+                                        }
                                         if let Some(states) = receive(&mut lan_gate, payload) {
                                             for s in &states {
+                                                if s.id == lan_my_eid {
+                                                    continue; // never avatar ourselves off a stray echo
+                                                }
                                                 let pos =
                                                     [s.x.to_f32(), s.y.to_f32(), s.z.to_f32()];
                                                 let yaw = s.yaw as f32 / 10000.0;
+                                                if !lan_remote_last_seen.contains_key(&s.id) {
+                                                    // r603: one-shot per peer — the observable
+                                                    // proof entity replication is flowing (soaks
+                                                    // and device tests grep for this).
+                                                    log::info!(
+                                                        "[lan-mp] first entity state from peer {} at ({:.1}, {:.1}, {:.1})",
+                                                        s.id, pos[0], pos[1], pos[2]
+                                                    );
+                                                }
                                                 lan_remote_last_seen.insert(s.id, now_ms);
                                                 match lan_remote_creatures.get_mut(&s.id) {
                                                     Some(cr) => {
@@ -14247,6 +14627,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                                 }
                                             }
                                         }
+                                        if let Some(a) = src4 {
+                                            relay_as_host(a, &lan_host);
+                                        }
                                     }
                                     CH_WORLDCMD => {
                                         // r498: payload is packet_compress-framed.
@@ -14272,6 +14655,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                                 }
                                             }
                                         }
+                                        }
+                                        if let Some(a) = src4 {
+                                            relay_as_host(a, &lan_host);
                                         }
                                     }
                                     CH_AVATAR => {
@@ -14304,6 +14690,34 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                                 }
                                             }
                                         }
+                                        if let Some(a) = src4 {
+                                            relay_as_host(a, &lan_host);
+                                        }
+                                    }
+                                    CH_JOINSYNC => {
+                                        // World-edit catch-up from OUR host only — targeted state,
+                                        // never relayed, ignored from anyone but the upstream.
+                                        if src4.is_some() && src4 == lan_peer_addr {
+                                            if let Some(raw) = unendlich_engine::sim::net::packet_compress::unpack(payload, 256 * 1024) {
+                                                if let Some(records) = unendlich_engine::sim::net::join_sync::decode_records(&raw) {
+                                                    // r602: while the joined world is still loading,
+                                                    // BACKLOG — applying now would target the
+                                                    // pre-launch manager and the rebuild erases it.
+                                                    if fg_pending_load.is_some()
+                                                        || fg_app.state() != unendlich_engine::sim::game_flow::AppState::InGame
+                                                    {
+                                                        lan_joinsync_backlog.extend(records);
+                                                    } else {
+                                                        let (n, rest) = chunk_manager.apply_edit_records(&records);
+                                                        if n > 0 {
+                                                            log::info!("[lan-mp] join-sync applied {n} edit(s) from host");
+                                                        }
+                                                        // chunks still streaming — retry as they land
+                                                        lan_joinsync_backlog.extend(rest);
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -14328,13 +14742,52 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         lan_remote_last_seen.remove(&id);
                         log::info!("[lan-mp] remote entity {id} timed out — avatar removed");
                     }
+                    // Host-side peer prune: silent peers leave the table, so the star
+                    // relay + our outbound fanout stop addressing them, the advert
+                    // player count drops, and their roster slot parks for reconnect
+                    // (a rejoin from the same machine reclaims the same entity id).
+                    for eid in lan_host.prune(now_ms, PEER_TIMEOUT_MS) {
+                        lan_remote_creatures.remove(&eid);
+                        lan_remote_appearance.remove(&eid);
+                        lan_remote_last_seen.remove(&eid);
+                        log::info!("[lan-mp] peer entity {eid} left the host table (timeout)");
+                    }
+                    // Drain join-sync catch-up plans, a few batches per frame per
+                    // joiner. A peer that vanished mid-sync gets dropped with its
+                    // table entry (send_to just fails silently either way).
+                    // r602: re-drain OUR backlog as chunks stream in (joiner
+                    // side; applied records fall out, the rest wait).
+                    if !lan_joinsync_backlog.is_empty()
+                        && now_ms.saturating_sub(lan_joinsync_retry_ms) >= 2000
+                    {
+                        lan_joinsync_retry_ms = now_ms;
+                        let records = std::mem::take(&mut lan_joinsync_backlog);
+                        let (n, rest) = chunk_manager.apply_edit_records(&records);
+                        if n > 0 {
+                            log::info!(
+                                "[lan-mp] join-sync applied {n} edit(s) as chunks loaded ({} still waiting)",
+                                rest.len()
+                            );
+                        }
+                        lan_joinsync_backlog = rest;
+                    }
+                    lan_join_syncs.retain_mut(|(addr, plan)| {
+                        for batch in plan.drain_frame() {
+                            let mut dg = vec![CH_JOINSYNC];
+                            dg.extend_from_slice(
+                                &unendlich_engine::sim::net::packet_compress::pack(batch, 48),
+                            );
+                            let _ = sock.send_to(&dg, std::net::SocketAddr::V4(*addr));
+                        }
+                        !plan.is_done()
+                    });
 
                     // Outbound handshake: a clicked host → send a JOIN to its candidate.
                     if renderer.menu_mp_pick >= 0 {
                         let pick = renderer.menu_mp_pick as usize;
                         renderer.menu_mp_pick = -1;
                         if let Some(addr) = lan_host_addrs.get(pick).copied() {
-                            let join = LanJoin::Join { name: "joiner".to_string() }.encode();
+                            let join = LanJoin::Join { name: active_character.name.clone() }.encode(); // real name: whitelists match the joiner, not a placeholder
                             let mut dg = vec![CH_HANDSHAKE];
                             dg.extend_from_slice(&join);
                             match sock.send_to(&dg, addr) {
@@ -14353,7 +14806,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     if let Some(host) = lan_direct_host {
                         if lan_peer_addr.is_none() && now_ms.saturating_sub(lan_direct_last_ms) >= 2000 {
                             lan_direct_last_ms = now_ms;
-                            let join = LanJoin::Join { name: "joiner".to_string() }.encode();
+                            let join = LanJoin::Join { name: active_character.name.clone() }.encode(); // real name: whitelists match the joiner, not a placeholder
                             let mut dg = vec![CH_HANDSHAKE];
                             dg.extend_from_slice(&join);
                             match sock.send_to(&dg, host) {
@@ -14363,16 +14816,43 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         }
                     }
 
-                    // Outbound replication: in-game with a peer → send our player transform
-                    // ~15/sec (host-authoritative for our own entity; seal() stamps the seq).
+                    // Outbound replication: in-game → send our player transform ~15/sec
+                    // (authoritative for our own entity; seal() stamps the seq). Targets:
+                    // the upstream host when WE joined someone, else every peer in the
+                    // host table (the old code addressed exactly one peer, so with two
+                    // joiners the second silently starved the first of our updates).
+                    // r603 (found by the dual-motion soak): while the joined
+                    // world LOADS (seconds-long frames under a cold cache),
+                    // the InGame-gated replication below sends NOTHING, the
+                    // host prunes us at PEER_TIMEOUT, and our post-load
+                    // entity states arrive from an unknown address — dropped
+                    // forever. Keepalive: while we have an upstream but are
+                    // not yet InGame, re-send JOIN every 2 s; the host treats
+                    // it as a rejoin (cheap re-Accept), and our duplicate-
+                    // Accept guard makes the reply a no-op.
+                    if let Some(up) = lan_peer_addr {
+                        if fg_app.state() != AppState::InGame
+                            && now_ms.saturating_sub(lan_keepalive_ms) >= 2000
+                        {
+                            lan_keepalive_ms = now_ms;
+                            let join = LanJoin::Join { name: active_character.name.clone() }.encode();
+                            let mut dg = vec![CH_HANDSHAKE];
+                            dg.extend_from_slice(&join);
+                            let _ = sock.send_to(&dg, std::net::SocketAddr::V4(up));
+                        }
+                    }
                     if fg_app.state() == AppState::InGame {
-                        if let Some(peer) = lan_peer_addr {
+                        let out_targets: Vec<std::net::SocketAddrV4> = match lan_peer_addr {
+                            Some(up) => vec![up],
+                            None => lan_host.fanout(None),
+                        };
+                        if !out_targets.is_empty() {
                             if now_ms.saturating_sub(lan_repl_last_ms) >= 66 {
                                 lan_repl_last_ms = now_ms;
                                 lan_repl_tick += 1;
                                 let p = local_player.view.position;
                                 let me = EntityState {
-                                    id: lan_session_port as u64,
+                                    id: lan_my_eid,
                                     kind: EntityKind::Player,
                                     x: Fixed::from_f64(p.x as f64),
                                     y: Fixed::from_f64(p.y as f64),
@@ -14385,23 +14865,40 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 let bytes = seal(&mut lan_stamper, lan_repl_tick, &[me]);
                                 let mut dg = vec![CH_ENTITY];
                                 dg.extend_from_slice(&bytes);
-                                let _ = sock.send_to(&dg, std::net::SocketAddr::V4(peer));
+                                for t in &out_targets {
+                                    // r603-inv: send errors were swallowed — the open
+                                    // joiner→host investigation needs them visible.
+                                    {
+                                        static SEND_ONCE: std::sync::Once = std::sync::Once::new();
+                                        SEND_ONCE.call_once(|| {
+                                            log::info!("[lan-mp] first entity state SENT to {t} (id {lan_my_eid})");
+                                        });
+                                    }
+                                    if let Err(e) = sock.send_to(&dg, std::net::SocketAddr::V4(*t)) {
+                                        static SEND_ERR_ONCE: std::sync::Once = std::sync::Once::new();
+                                        SEND_ERR_ONCE.call_once(|| {
+                                            log::warn!("[lan-mp] entity send_to {t} failed: {e}");
+                                        });
+                                    }
+                                }
                             }
 
                             // r494: broadcast our chosen-character appearance ~every 2s so
-                            // the peer renders us as our character, not a default avatar.
+                            // peers render us as our character, not a default avatar.
                             if now_ms.saturating_sub(lan_avatar_last_sent_ms) >= 2000 {
                                 lan_avatar_last_sent_ms = now_ms;
                                 let mut dg = vec![CH_AVATAR];
-                                dg.extend_from_slice(&(lan_session_port as u64).to_le_bytes());
+                                dg.extend_from_slice(&lan_my_eid.to_le_bytes());
                                 dg.extend_from_slice(&active_character.to_appearance_bytes());
-                                let _ = sock.send_to(&dg, std::net::SocketAddr::V4(peer));
+                                for t in &out_targets {
+                                    let _ = sock.send_to(&dg, std::net::SocketAddr::V4(*t));
+                                }
                             }
 
                             // Outbound block edits: drain this frame's place/break edits
-                            // to the peer so building/mining propagates.
+                            // to every target so building/mining propagates.
                             if !session.lan_outgoing_edits.is_empty() {
-                                let pid = lan_session_port as u64;
+                                let pid = lan_my_eid;
                                 let batch: Vec<_> = session.lan_outgoing_edits
                                     .drain(..)
                                     .map(|cmd| (pid, cmd))
@@ -14413,12 +14910,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 dg.extend_from_slice(
                                     &unendlich_engine::sim::net::packet_compress::pack(&bytes, 48),
                                 );
-                                let _ = sock.send_to(&dg, std::net::SocketAddr::V4(peer));
+                                for t in &out_targets {
+                                    let _ = sock.send_to(&dg, std::net::SocketAddr::V4(*t));
+                                }
                             }
+                        } else {
+                            // In game but nobody connected: don't let edits accumulate.
+                            session.lan_outgoing_edits.clear();
                         }
                     } else {
-                        // Not in game / no peer: don't let edits accumulate unbounded.
-                        if lan_peer_addr.is_none() {
+                        // Not in game: don't let edits accumulate unbounded.
+                        if lan_peer_addr.is_none() && lan_host.live_peer_count() == 0 {
                             session.lan_outgoing_edits.clear();
                         }
                     }
@@ -14441,9 +14943,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     // While in-game we are a host: announce the live world on cadence.
                     if fg_app.state() == AppState::InGame {
                         let advert = unendlich_engine::sim::session_mode::WorldAdvert {
-                            host_username: "host".to_string(),
+                            host_username: active_character.name.clone(), // real name in the server browser
                             world_name: current_world_name.clone().unwrap_or_else(|| "World".into()),
-                            players: 1,
+                            players: lan_host.player_count() as u16,
                             max_players: 8,
                             last_seen_ms: now_ms,
                             candidates: match lan_local_ip {

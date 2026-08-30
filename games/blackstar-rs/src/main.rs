@@ -80,6 +80,7 @@ mod menu;
 mod meshgen;
 mod model;
 mod net;
+mod online_screen;
 mod physics;
 mod powers;
 mod platform;
@@ -191,7 +192,7 @@ enum Mode {
     Trials { sel: usize },
     Splash,
     Play,
-    Pause,
+    Pause { sel: usize },
     Binds { sel: usize, capturing: bool },
     Maps { sel: usize },
     Online { sel: usize },
@@ -850,6 +851,10 @@ struct Game {
     analog: analog::Analog,
     bots: Vec<bots::Bot>,
     friend: String,
+    /// The Online screen's live menu (first `menu::Menu` consumer). Built on
+    /// open, dropped on close; sel/scroll live inside it, so Mode::Online's
+    /// `sel` remains only as a legacy mirror for the shared draw tables.
+    online_menu: Option<menu::Menu>,
     toast: String,
     toast_t: f32,
     /// counts down to the next beacon pulse during a raid Assault —
@@ -2024,6 +2029,7 @@ fn main() {
         analog: analog::Analog::new(),
         bots: Vec::new(),
         friend: String::new(),
+        online_menu: None,
         toast: String::new(),
         toast_t: 0.0,
         beacon_fx_t: 0.0,
@@ -3705,13 +3711,20 @@ impl Game {
     }
 
     fn open_menu(&mut self, m: Mode) {
-        self.menu_from_pause = self.mode == Mode::Pause;
+        if let Mode::Online { .. } = m {
+            self.online_menu = Some(online_screen::build(
+                &self.save.name,
+                &self.friend,
+                self.net.role != net::Role::Offline,
+            ));
+        }
+        self.menu_from_pause = matches!(self.mode, Mode::Pause { .. });
         self.mode = m;
         self.mscroll = 0.0;
         self.mfling = 0.0;
     }
     fn close_menu(&mut self) {
-        self.mode = if self.menu_from_pause { Mode::Pause } else { Mode::Splash };
+        self.mode = if self.menu_from_pause { Mode::Pause { sel: 0 } } else { Mode::Splash };
     }
 
     fn mouse_down(&mut self, b: MouseButton, win: &winit::window::Window) {
@@ -3794,7 +3807,7 @@ impl Game {
                     self.mode = Mode::Play;
                 }
             }
-            Mode::Pause => {
+            Mode::Pause { .. } => {
                 if b == MouseButton::Right {
                     self.mode = Mode::Play;
                 }
@@ -3828,9 +3841,16 @@ impl Game {
             Mode::Online { sel } => match b {
                 MouseButton::Left => {
                     if let Some(i) = self.hover_row() {
-                        self.mode = Mode::Online { sel: i };
-                        if i >= 2 {
-                            self.online_key(&enter, "", i);
+                        if let Some(mut m) = self.online_menu.take() {
+                            m.point_at(i);
+                            self.mode = Mode::Online { sel: m.sel() };
+                            // Clicking an Action row activates it; clicking a
+                            // Field row just focuses it for typing — the Menu
+                            // decides (activate is a no-op on fields).
+                            if let Some(ev) = m.activate() {
+                                self.apply_online_event(ev, &mut m);
+                            }
+                            self.online_menu = Some(m);
                         }
                     }
                 }
@@ -4025,26 +4045,16 @@ impl Game {
             return;
         }
         if let Some(b) = hud::hit_nav(self.cursor.0, self.cursor.1) {
-            if !matches!(self.mode, Mode::Splash | Mode::Play | Mode::Pause) {
+            if !matches!(self.mode, Mode::Splash | Mode::Play | Mode::Pause { .. }) {
                 self.nav_to(b, elwt);
                 return;
             }
         }
         match self.mode {
             Mode::Splash => self.mode = Mode::Play,
-            Mode::Pause => {
+            Mode::Pause { .. } => {
                 if let Some(b) = hud::hit_pause_btn(self.cursor.0, self.cursor.1) {
-                    match b {
-                        0 => self.mode = Mode::Play,
-                        1 => self.open_menu(Mode::Tweaks { menu: 0, sel: 0 }),
-                        2 => self.open_menu(Mode::Maps { sel: self.save.map }),
-                        3 => self.open_menu(Mode::Online { sel: 0 }),
-                        _ => {
-                            self.net.leave();
-                            self.persist();
-                            elwt.exit();
-                        }
-                    }
+                    self.pause_activate(b, elwt);
                 }
             }
             Mode::Tweaks { menu, sel } => {
@@ -4101,17 +4111,34 @@ impl Game {
         }
     }
 
+    /// Activate pause button `i` — ONE function for mouse taps, touch, and
+    /// the keyboard's Enter, so the input paths cannot diverge on what a
+    /// button does (the old code held this match twice).
+    fn pause_activate(&mut self, i: usize, elwt: &winit::event_loop::EventLoopWindowTarget<()>) {
+        match i {
+            0 => self.mode = Mode::Play,
+            1 => self.open_menu(Mode::Tweaks { menu: 0, sel: 0 }),
+            2 => self.open_menu(Mode::Maps { sel: self.save.map }),
+            3 => self.open_menu(Mode::Online { sel: 0 }),
+            _ => {
+                self.net.leave();
+                self.persist();
+                elwt.exit();
+            }
+        }
+    }
+
     /// Escape-equivalent for gestures: leave the current menu.
     fn menu_back(&mut self, _elwt: &winit::event_loop::EventLoopWindowTarget<()>) {
         self.mode = match self.mode {
             Mode::Tweaks { .. } | Mode::Binds { .. } | Mode::Maps { .. } | Mode::Online { .. } => {
                 if self.menu_from_pause {
-                    Mode::Pause
+                    Mode::Pause { sel: 0 }
                 } else {
                     Mode::Splash
                 }
             }
-            Mode::Pause => Mode::Play,
+            Mode::Pause { .. } => Mode::Play,
             m => m,
         };
     }
@@ -4313,7 +4340,12 @@ impl Game {
                 let start = self.mscroll.max(0.0) as usize;
                 hud::hit_row_scrolled(hud::MAPS_TOP, hud::maps_row_h(), n, vis, start, y)
             }
-            Mode::Online { .. } => hud::hit_row(hud::ONL_TOP, hud::ONL_ROW_H, hud::ONLINE_ROWS, y),
+            Mode::Online { .. } => {
+                // shared-menu geometry (draw_menu ⇄ menu_hit stay in lockstep)
+                let m = self.online_menu.as_ref()?;
+                let scr = ui::Screen::new(self.gpu.aspect());
+                ui::menu_hit(&scr, m, hud::T_BODY, (self.cursor.0, y))
+            }
             // These three had no arm at all, so `hover_row` returned None and
             // every click on them did nothing.
             Mode::Trials { .. } => {
@@ -4866,11 +4898,25 @@ impl Game {
                 (_, "o") => self.open_menu(Mode::Online { sel: 0 }),
                 _ => self.mode = Mode::Play, // any other key starts; press consumed
             },
-            Mode::Pause => match (&key, ch) {
+            Mode::Pause { sel } => match (&key, ch) {
                 (Key::Named(NamedKey::Escape), _) | (Key::Named(NamedKey::Tab), _) => {
                     self.mode = Mode::Play
                 }
-                (Key::Named(NamedKey::Enter), _) => self.open_menu(Mode::Tweaks { menu: 0, sel: 0 }),
+                // Arrow-key navigation across the button row (wraps). Up/Left
+                // and Down/Right are aliases so a d-pad or stick mapped to
+                // either axis walks the row — the same nav feel as the list
+                // menus, on the one screen that never had it.
+                (Key::Named(NamedKey::ArrowLeft), _) | (Key::Named(NamedKey::ArrowUp), _) => {
+                    let n = hud::PAUSE_BTNS.len();
+                    self.mode = Mode::Pause { sel: (sel + n - 1) % n };
+                }
+                (Key::Named(NamedKey::ArrowRight), _) | (Key::Named(NamedKey::ArrowDown), _) => {
+                    self.mode = Mode::Pause { sel: (sel + 1) % hud::PAUSE_BTNS.len() };
+                }
+                // Enter activates the SELECTED button (default RESUME). The
+                // old Enter-opens-Settings shortcut is superseded by the nav;
+                // g/o/q stay as fast paths.
+                (Key::Named(NamedKey::Enter), _) => self.pause_activate(sel, elwt),
                 (_, "g") => self.open_menu(Mode::Maps { sel: self.save.map }),
                 (_, "o") => self.open_menu(Mode::Online { sel: 0 }),
                 (_, "q") | (_, "x") => {
@@ -4891,7 +4937,7 @@ impl Game {
                             self.watching = None; // skip the replay
                             return;
                         }
-                        self.mode = Mode::Pause;
+                        self.mode = Mode::Pause { sel: 0 };
                         self.persist(); // checkpoint whenever the player pauses
                         return;
                     }
@@ -5156,71 +5202,86 @@ impl Game {
             self.follow_selection();
     }
 
-    fn online_key(&mut self, key: &Key, ch: &str, sel: usize) {
-        match key {
+    fn online_key(&mut self, key: &Key, ch: &str, _sel: usize) {
+        // First live menu::Menu consumer (see online_screen.rs): nav, text
+        // entry, and activation are the Menu's own ops; this fn only routes
+        // keys in and applies the events that come back.
+        let Some(mut m) = self.online_menu.take() else {
+            self.online_menu = Some(online_screen::build(
+                &self.save.name,
+                &self.friend,
+                self.net.role != net::Role::Offline,
+            ));
+            return;
+        };
+        let ev = match key {
             Key::Named(NamedKey::Escape) => {
                 self.persist();
                 self.close_menu();
+                self.online_menu = None;
                 return;
             }
             Key::Named(NamedKey::ArrowUp) => {
-                self.mode = Mode::Online { sel: (sel + hud::ONLINE_ROWS - 1) % hud::ONLINE_ROWS };
-                return;
+                m.step(-1);
+                None
             }
             Key::Named(NamedKey::ArrowDown) => {
-                self.mode = Mode::Online { sel: (sel + 1) % hud::ONLINE_ROWS };
-                return;
+                m.step(1);
+                None
             }
-            Key::Named(NamedKey::Backspace) => {
-                match sel {
-                    0 => {
-                        self.save.name.pop();
-                    }
-                    1 => {
-                        self.friend.pop();
-                    }
-                    _ => {}
+            Key::Named(NamedKey::Backspace) => m.backspace(),
+            Key::Named(NamedKey::Enter) => m.activate(),
+            _ => {
+                if let Some(c) = ch.chars().next() {
+                    m.input_char(c)
+                } else {
+                    None
                 }
-                return;
             }
-            Key::Named(NamedKey::Enter) => {
-                match sel {
-                    2 => {
-                        let n = self.save.name.clone();
-                        let s = self.net.host(&n);
-                        self.toastf(&s);
-                    }
-                    3 => {
-                        let n = self.save.name.clone();
-                        let f = self.friend.clone();
-                        let s = self.net.join(&n, &f);
-                        self.toastf(&s);
-                    }
-                    4 => {
-                        self.net.leave();
-                        self.toastf("OFFLINE");
-                    }
-                    5 => {
-                        self.persist();
-                        self.close_menu();
-                    }
-                    _ => {}
-                }
-                return;
+        };
+        // Mirror the Menu's selection into Mode::Online{sel} so the shared
+        // hover/draw tables keep working until they migrate too.
+        self.mode = Mode::Online { sel: m.sel() };
+        if let Some(ev) = ev {
+            self.apply_online_event(ev, &mut m);
+        }
+        self.online_menu = Some(m);
+    }
+
+    /// Apply an Online-screen menu event. Split out so mouse clicks and
+    /// touch can route through the same arm as the keyboard.
+    fn apply_online_event(&mut self, ev: menu::Event, m: &mut menu::Menu) {
+        use online_screen as os;
+        match ev {
+            menu::Event::Changed(os::ID_NAME, menu::Value::Text(t)) => self.save.name = t,
+            menu::Event::Changed(os::ID_FRIEND, menu::Value::Text(t)) => self.friend = t,
+            menu::Event::Pressed(os::ID_HOST) => {
+                let n = self.save.name.clone();
+                let st = self.net.host(&n);
+                self.toastf(&st);
+                set_row_enabled(m, os::ID_LEAVE, self.net.role != net::Role::Offline);
+            }
+            menu::Event::Pressed(os::ID_JOIN) => {
+                let n = self.save.name.clone();
+                let f = self.friend.clone();
+                let st = self.net.join(&n, &f);
+                self.toastf(&st);
+                set_row_enabled(m, os::ID_LEAVE, self.net.role != net::Role::Offline);
+            }
+            menu::Event::Pressed(os::ID_LEAVE) => {
+                self.net.leave();
+                self.toastf("OFFLINE");
+                set_row_enabled(m, os::ID_LEAVE, false);
+            }
+            menu::Event::Pressed(os::ID_BACK) | menu::Event::Close => {
+                self.persist();
+                self.close_menu();
+                self.online_menu = None;
             }
             _ => {}
         }
-        // text entry into the selected field
-        if (sel == 0 || sel == 1) && !ch.is_empty() {
-            let c = ch.chars().next().unwrap_or(' ');
-            if c.is_ascii_graphic() {
-                let field = if sel == 0 { &mut self.save.name } else { &mut self.friend };
-                if field.len() < 16 {
-                    field.push(c);
-                }
-            }
-        }
     }
+
 
     /// Movement axis with the Wooting wind-in: full press = 1.0 and any press
     /// lands high (still snappy), but a feathered key trims the output — the
@@ -5489,9 +5550,9 @@ impl Game {
         self.last_pad = ps;
         if ps.start_pressed {
             match self.mode {
-                Mode::Splash | Mode::Pause => self.mode = Mode::Play,
+                Mode::Splash | Mode::Pause { .. } => self.mode = Mode::Play,
                 Mode::Play => {
-                    self.mode = Mode::Pause;
+                    self.mode = Mode::Pause { sel: 0 };
                     self.persist();
                 }
                 _ => {}
@@ -5540,7 +5601,7 @@ impl Game {
             // detent. Player only; bots keep raw controls.
             // the on-screen MENU button: a phone has no Escape key
             if self.tpad.enabled && self.tpad.menu_tapped() {
-                self.mode = Mode::Pause;
+                self.mode = Mode::Pause { sel: 0 };
                 self.mscroll = 0.0;
             }
             // GYRO DRIVE: device motion folded in beside the sticks
@@ -6134,9 +6195,9 @@ impl Game {
                 self.draw_hud(&mut ui, aspect);
                 self.draw_touch_ui(&mut ui, aspect);
             }
-            Mode::Pause => {
+            Mode::Pause { sel } => {
                 self.draw_hud(&mut ui, aspect);
-                hud::pause(&mut ui, aspect, &self.save, self.air_t, self.cursor);
+                hud::pause(&mut ui, aspect, &self.save, self.air_t, self.cursor, sel);
             }
             Mode::Binds { sel, capturing } => {
                 hud::bindings_menu(&mut ui, aspect, &self.binds, sel, capturing, self.mscroll.max(0.0) as usize, self.cursor)
@@ -6169,27 +6230,33 @@ impl Game {
                     .collect();
                 hud::tweaks_menu(&mut ui, aspect, menu_title(menu), &trs, sel, self.mscroll.max(0.0) as usize, self.cursor, nav_here(menu));
             }
-            Mode::Online { sel } => {
-                let players: Vec<String> = std::iter::once(format!(
-                    "{} (YOU)",
-                    if self.save.name.is_empty() { "PILOT" } else { &self.save.name }
-                ))
-                .chain(self.net.peers().map(|p| p.name.clone()))
-                .collect();
-                let o = hud::OnlineUi {
-                    sel,
-                    name: &self.save.name,
-                    friend: &self.friend,
-                    status: if self.toast.is_empty() { &self.net.status } else { &self.toast },
-                    players,
-                    online: self.net.online(),
-                };
-                hud::online_menu(&mut ui, aspect, &o, self.time);
+            Mode::Online { .. } => {
+                // First live consumer of the shared menu draw path
+                // (menu::Menu → ui::menu_cmds → draw). The status line and
+                // players list stay as a bespoke footer under it — they're
+                // live data, not rows.
+                if let Some(m) = &self.online_menu {
+                    hud::draw_menu(&mut ui, aspect, m);
+                }
+                let status =
+                    if self.toast.is_empty() { &self.net.status } else { &self.toast };
+                hud::online_footer(
+                    &mut ui,
+                    aspect,
+                    status,
+                    &std::iter::once(format!(
+                        "{} (YOU)",
+                        if self.save.name.is_empty() { "PILOT" } else { &self.save.name }
+                    ))
+                    .chain(self.net.peers().map(|p| p.name.clone()))
+                    .collect::<Vec<_>>(),
+                    self.net.online(),
+                );
             }
         }
 
         // cinema bars
-        if self.cfg.video.letterbox && matches!(self.mode, Mode::Play | Mode::Pause) {
+        if self.cfg.video.letterbox && matches!(self.mode, Mode::Play | Mode::Pause { .. }) {
             let bar = [0.0, 0.0, 0.0, 1.0];
             let v = |x: f32, y: f32| UiVert { pos: [x, y], color: bar };
             for (y0, y1) in [(0.865_f32, 1.0_f32), (-1.0, -0.865)] {
@@ -8222,5 +8289,14 @@ mod tweak_reach_tests {
                 menu_title(m)
             );
         }
+    }
+}
+
+
+/// Row-enable helper for the Online screen (menu::Menu has no setter; rows
+/// are public data).
+fn set_row_enabled(m: &mut menu::Menu, id: &str, on: bool) {
+    if let Some(r) = m.rows.iter_mut().find(|r| r.id == id) {
+        r.enabled = on;
     }
 }

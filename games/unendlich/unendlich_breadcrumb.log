@@ -1,0 +1,49 @@
+--- unendlich breadcrumbs (fsync'd; LAST line = last stage reached before any crash) ---
+1788094702334 #0 main: startup
+1788094706559 #1 gpu: creating Vulkan context (instance + physical device + queues)
+1788094706568 #2 gpu: Vulkan context ready
+1788094706740 #3 gpu: creating WorldRenderer (Vulkan device/swapchain/pipelines)
+1788094707432 #4 gpu: WorldRenderer ready
+1788094709828 #5 gpu: first frame presented OK
+1788094710671 #6 gpu: first frame presented OK
+1788094713621 #7 gpu: first frame presented OK
+1788094715018 #8 gpu: first frame presented OK
+1788094726122 #9 gpu: first frame presented OK
+1788094727210 #10 gpu: first frame presented OK
+1788094728314 #11 gpu: first frame presented OK
+1788094729434 #12 gpu: first frame presented OK
+1788094730526 #13 gpu: first frame presented OK
+1788094733662 #14 gpu: first frame presented OK
+1788094734626 #15 gpu: first frame presented OK
+1788094736085 #16 gpu: first frame presented OK
+1788094737547 #17 gpu: first frame presented OK
+1788094738956 #18 gpu: first frame presented OK
+1788094740442 #19 gpu: first frame presented OK
+1788094741898 #20 gpu: first frame presented OK
+1788094743392 #21 gpu: first frame presented OK
+1788094744785 #22 gpu: first frame presented OK
+1788094746146 #23 gpu: first frame presented OK
+1788094747531 #24 gpu: first frame presented OK
+1788094748931 #25 gpu: first frame presented OK
+1788094750342 #26 gpu: first frame presented OK
+1788094751965 #27 gpu: first frame presented OK
+1788094753806 #28 gpu: first frame presented OK
+1788094754938 #29 gpu: first frame presented OK
+1788094756399 #30 gpu: first frame presented OK
+1788094758294 #31 gpu: first frame presented OK
+1788094760081 #32 gpu: first frame presented OK
+1788094762130 #33 gpu: first frame presented OK
+1788094764631 #34 gpu: first frame presented OK
+1788094766749 #35 gpu: first frame presented OK
+1788094769066 #36 gpu: first frame presented OK
+1788094771655 #37 gpu: first frame presented OK
+1788094774368 #38 gpu: first frame presented OK
+1788094776949 #39 gpu: first frame presented OK
+1788094780158 #40 gpu: first frame presented OK
+1788094783596 #41 gpu: first frame presented OK
+1788094786234 #42 gpu: first frame presented OK
+1788094789677 #43 gpu: first frame presented OK
+1788094793085 #44 gpu: first frame presented OK
+1788094796737 #45 gpu: first frame presented OK
+1788094799274 #46 gpu: first frame presented OK
+1788094802866 #47 gpu: first frame presented OK

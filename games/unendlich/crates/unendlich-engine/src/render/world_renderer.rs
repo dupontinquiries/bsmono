@@ -74,11 +74,11 @@ fn tbtn(ui: &mut egui::Ui, label: &str) -> bool {
     let accent = unendlich_ui::current_theme(ui.ctx()).accent;
     unendlich_ui::button(ui, label, accent).clicked()
 }
-#[cfg(feature = "ui-overlay")]
-fn tbtn_sized(ui: &mut egui::Ui, label: &str, w: f32, h: f32) -> bool {
-    let accent = unendlich_ui::current_theme(ui.ctx()).accent;
-    unendlich_ui::button_sized(ui, label, accent, egui::vec2(w, h)).clicked()
-}
+// tbtn_sized moved to app::live_menu::pause_button with the pause body
+// (r-extract) — one implementation, drawn in-game and headless alike.
+
+// r330-items tooltip painter lives in app::live_menu (snapshotable +
+// tested like the rest of the menu bodies); the hover sites below call it.
 
 impl From<vk::Result> for WorldRenderError {
     fn from(r: vk::Result) -> Self { WorldRenderError::Vulkan(r) }
@@ -176,6 +176,14 @@ struct CameraUbo {
     /// r431: 16×16 water-depth cells (blocks), packed 4 per vec4. Drives real depth-color
     /// (shallow→clear, deep→dark) instead of the view-angle guess. Zero/disabled = unchanged.
     water_depth_grid: [[f32; 4]; 64],
+    /// r595 (disturber array): up to 8 foliage disturbers — the player, nearby
+    /// mobs/dragons, LAN avatars. xyz = world position, w = reach radius
+    /// (blocks). Appended LAST (house rule: offsets of everything above are
+    /// unchanged; shaders that don't declare this never see it).
+    disturbers: [[f32; 4]; 8],
+    /// x = live disturber count (0..=8); count 0 ⇒ chunk.vert falls back to
+    /// the r591 camera-only disturbance so the F3 slider still demos alone.
+    disturber_meta: [f32; 4],
 }
 
 /// Per-frame atmosphere/climate state, sampled by the bin and passed to
@@ -418,6 +426,9 @@ pub struct WorldRenderer {
     /// r499: current season phase [0,1) (spring→summer→autumn→winter), packed
     /// into fx_params.z for the foliage seasonal tint in chunk.frag.
     world_season01: f32,
+    /// r595: this frame's foliage disturbers (pos.xyz + reach.w), bin-fed.
+    foliage_disturbers: [[f32; 4]; 8],
+    foliage_disturber_count: usize,
     /// r431: water-depth grid + coverage for depth-color.
     water_depth_cov: [f32; 4],
     water_depth_grid: Box<[[f32; 4]; 64]>,
@@ -1432,13 +1443,22 @@ impl WorldRenderer {
             format!("Failed to create cascade-fit pipeline: {}", e)
         ))?;
 
-        // Indirect drawing kill-switch. UNENDLICH_INDIRECT=0 falls back
-        // to the v0.19 per-chunk draw loop (preserved as a fallback for
-        // diagnostic A/B testing).
+        // Indirect drawing kill-switch — and (v0.24.110, re-landed as
+        // AUTOMATIC) the device-capability gate. Calling
+        // cmd_draw_indexed_indirect_count on a device that didn't enable
+        // drawIndirectCount is the MoltenVK failure mode: a validation flood
+        // and invisible terrain. The context negotiated the feature at device
+        // creation; without it we take the v0.19 per-chunk CPU-cull loop
+        // without the operator having to remember UNENDLICH_INDIRECT=0.
         let use_indirect = std::env::var("UNENDLICH_INDIRECT")
             .map(|v| v != "0")
-            .unwrap_or(true);
-        if !use_indirect {
+            .unwrap_or(true)
+            && ctx.draw_indirect_count_enabled;
+        if !ctx.draw_indirect_count_enabled {
+            log::info!(
+                "Indirect drawing DISABLED: device lacks drawIndirectCount — per-chunk draw loop (CPU cull)"
+            );
+        } else if !use_indirect {
             log::info!("UNENDLICH_INDIRECT=0: using v0.19 per-chunk draw loop fallback");
         } else {
             log::info!("Indirect drawing ENABLED (set UNENDLICH_INDIRECT=0 for fallback)");
@@ -1534,6 +1554,8 @@ impl WorldRenderer {
             water_flow_grid: Box::new([[0.0; 4]; 128]),
             fx_params: [0.0; 4],
             world_season01: 0.0,
+            foliage_disturbers: [[0.0; 4]; 8],
+            foliage_disturber_count: 0,
             water_depth_cov: [0.0; 4],
             water_depth_grid: Box::new([[0.0; 4]; 64]),
             gbuffer,
@@ -1865,7 +1887,39 @@ impl WorldRenderer {
             // dispatcher doesn't re-mesh this coord on every dispatch
             // round just because `meshes` has no entry. The next mesh
             // request fires only when chunk.version changes.
-            self.empty_mesh_versions.insert(key, version);
+            // r598 producer trap (empty-mesh path — the meshes-map trap
+            // stayed silent, so the wild coord arrives as an EMPTY mesh).
+            if key.coord != crate::world::chunk::ChunkCoord::DEBUG_OVERLAY
+                && (key.coord.x.unsigned_abs() > 1_000_000
+                    || key.coord.y.unsigned_abs() > 1_000_000
+                    || key.coord.z.unsigned_abs() > 1_000_000)
+            {
+                static TRAP_EMPTY_ONCE: std::sync::Once = std::sync::Once::new();
+                TRAP_EMPTY_ONCE.call_once(|| {
+                    log::error!(
+                        "[watchdog] WILD coord entering empty_mesh_versions: ({}, {}, {}) — producer backtrace:\n{}",
+                        key.coord.x, key.coord.y, key.coord.z,
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                });
+            }
+            // r598 producer trap (empty-mesh path — the meshes-map trap
+        // stayed silent, so the wild coord arrives as an EMPTY mesh).
+        if key.coord != crate::world::chunk::ChunkCoord::DEBUG_OVERLAY
+            && (key.coord.x.unsigned_abs() > 1_000_000
+                || key.coord.y.unsigned_abs() > 1_000_000
+                || key.coord.z.unsigned_abs() > 1_000_000)
+        {
+            static TRAP_EMPTY_ONCE: std::sync::Once = std::sync::Once::new();
+            TRAP_EMPTY_ONCE.call_once(|| {
+                log::error!(
+                "[watchdog] WILD coord entering empty_mesh_versions: ({}, {}, {}) — producer backtrace:\n{}",
+                key.coord.x, key.coord.y, key.coord.z,
+                std::backtrace::Backtrace::force_capture()
+                );
+            });
+        }
+        self.empty_mesh_versions.insert(key, version);
             return Ok(());
         }
 
@@ -2143,6 +2197,24 @@ impl WorldRenderer {
 
         // Defer-free the old mesh's slots (mesh + draw) so the GPU
         // finishes any in-flight draw using them before reuse.
+        // r598 PRODUCER TRAP: the soaks show one wild (i32::MIN)³ coord
+        // entering the loaded set per run (menu phase). The eviction guard
+        // rejects it downstream; THIS one-shot names the producer — the
+        // captured backtrace is the whole hunt.
+        if coord != crate::world::chunk::ChunkCoord::DEBUG_OVERLAY
+            && (coord.x.unsigned_abs() > 1_000_000
+                || coord.y.unsigned_abs() > 1_000_000
+                || coord.z.unsigned_abs() > 1_000_000)
+        {
+            static TRAP_ONCE: std::sync::Once = std::sync::Once::new();
+            TRAP_ONCE.call_once(|| {
+                log::error!(
+                    "[watchdog] WILD coord entering the mesh set: ({}, {}, {}) — producer backtrace:\n{}",
+                    coord.x, coord.y, coord.z,
+                    std::backtrace::Backtrace::force_capture()
+                );
+            });
+        }
         if let Some(old) = self.meshes.insert(crate::world::lod::MeshSlotKey::at(coord, lod), new) {
             self.pending_destroy.push(PendingDestroy {
                 slot: old.slot,
@@ -3166,6 +3238,19 @@ impl WorldRenderer {
         self.fx_params = [submerged, time, 0.0, 0.0];
     }
 
+    /// r595: this frame's foliage disturbers (nearest-first from
+    /// `sim::foliage_sway::select_disturbers`); more than 8 are ignored.
+    pub fn set_foliage_disturbers(&mut self, list: &[[f32; 4]]) {
+        self.foliage_disturber_count = list.len().min(8);
+        for i in 0..8 {
+            self.foliage_disturbers[i] = if i < self.foliage_disturber_count {
+                list[i]
+            } else {
+                [0.0; 4]
+            };
+        }
+    }
+
     /// r499: set the world season phase [0,1) for the foliage seasonal tint.
     pub fn set_season(&mut self, season01: f32) {
         self.world_season01 = season01.rem_euclid(1.0);
@@ -3384,14 +3469,9 @@ impl WorldRenderer {
             let mut wizard_preview_click_out: Option<(f32, f32, bool)> = None;
             let loading_fade = self.loading_fade;
             let loading_label = self.loading_label.clone();
-            // r187: destiny-esque menu button — full-width hit area, an
-            // accent bar that grows on hover (animate_bool), letterspaced
-            // caps. Kit v1; sounds + sweep shaders join at frosted.
-fn dest_button(ui: &mut egui::Ui, label: &str) -> bool {
-                // r317: the front/title menu uses the candidate button (style 1 default).
-                let accent = unendlich_ui::current_theme(ui.ctx()).accent;
-                unendlich_ui::button_sized(ui, label, accent, egui::vec2(220.0, 34.0)).clicked()
-            }
+            // r187 destiny-esque menu button — MOVED to app::live_menu with
+            // the rest of the menu body (r-extract), so the in-game menu and
+            // the headless snapshot draw through literally one implementation.
             // r181: shared translucent window chrome ("glass" until the
             // frosted-blur PostFx pass lands).
             // r190: glass v2 — per-window open interpolation (margin grows
@@ -3660,259 +3740,47 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                         .title_bar(false)
                         .show(c, |ui| {
                             unendlich_ui::set_theme(ui.ctx(), unendlich_ui::Theme::DARK);
-                            ui.vertical_centered(|ui| {
-                                // r223: title in the blocky voxel game font
-                                // (UnendlichBlocks), letterspaced caps — the
-                                // mockup's hero treatment.
-                                ui.label(
-                                    egui::RichText::new("UNENDLICH")
-                                        .font(unendlich_ui::menu::blocks_font(34.0))
-                                        .color(unendlich_ui::INK)
-                                        .extra_letter_spacing(6.0),
-                                );
-                                ui.add_space(14.0);
-                                match menu_screen_kind {
-                                    1 => {
-                                        // r186: ConfirmQuit screen (was
-                                        // undrawn -> quit "did nothing").
-                                        ui.label("quit unendlich?");
-                                        ui.add_space(8.0);
-                                        if dest_button(ui, "Quit") { menu_pick = 5; }
-                                        ui.add_space(4.0);
-                                        if dest_button(ui, "Back") { menu_pick = 6; }
-                                    }
-                                    2 => {
-                                        ui.label("multiplayer");
-                                        ui.add_space(8.0);
-                                        if dest_button(ui, "Host World") { menu_pick = 2; }
-                                        ui.add_space(4.0);
-                                        if dest_button(ui, "Join Server") { menu_pick = 3; }
-                                        ui.add_space(8.0);
-                                        // r394: LAN hosts discovered via the gossip beacon
-                                        // (display-only this slice; selecting → join is next).
-                                        ui.separator();
-                                        ui.label("LAN games");
-                                        if menu_mp_list.is_empty() {
-                                            ui.weak("(searching… none found yet)");
-                                        } else {
-                                            for (i, label) in menu_mp_list.iter().enumerate() {
-                                                // click a host → bin sends a JOIN to its candidate
-                                                if dest_button(ui, label) { menu_mp_pick_local = i as i32; }
-                                            }
-                                        }
-                                        ui.add_space(8.0);
-                                        if dest_button(ui, "Back") { menu_pick = 6; }
-                                    }
-                                    3 => {
-                                        // r197: LOAD WORLD — list saved worlds
-                                        // (was undrawn: "can't view previously
-                                        // created worlds"). Each row is a button;
-                                        // click sets menu_world_pick for the bin.
-                                        ui.label("load world");
-                                        ui.add_space(8.0);
-                                        if menu_world_list.is_empty() {
-                                            ui.weak("(no saved worlds yet)");
-                                        } else {
-                                            egui::ScrollArea::vertical()
-                                                .id_salt("world_list_scroll")
-                                                .max_height(180.0)
-                                                .show(ui, |ui| {
-                                                    for (i, label) in menu_world_list.iter().enumerate() {
-                                                        ui.horizontal(|ui| {
-                                                            if dest_button(ui, label) {
-                                                                menu_world_pick_local = i as i32;
-                                                            }
-                                                            // r203: peek this world's rollback
-                                                            // history without launching it.
-                                                            if ui.add_sized([70.0, 20.0],
-                                                                egui::Button::new("history")).clicked()
-                                                            {
-                                                                menu_rollback_peek_local = i as i32;
-                                                            }
-                                                            // r205: delete (with confirm). Lets
-                                                            // the dev prune accumulated test
-                                                            // worlds without leaving the menu.
-                                                            let del = egui::Button::new("\u{1f5d1}")
-                                                                .fill(egui::Color32::from_rgb(60, 24, 24));
-                                                            if ui.add_sized([28.0, 20.0], del)
-                                                                .on_hover_text("delete world")
-                                                                .clicked()
-                                                            {
-                                                                menu_world_delete_ask_local = i as i32;
-                                                            }
-                                                        });
-                                                    }
-                                                });
-                                            // r205: delete confirmation row — armed by the
-                                            // trash button, shows the world name and a
-                                            // confirm/cancel pair so a misclick can't wipe
-                                            // a world.
-                                            if menu_world_delete_ask >= 0
-                                                && (menu_world_delete_ask as usize) < menu_world_list.len()
-                                            {
-                                                ui.add_space(6.0);
-                                                ui.separator();
-                                                let idx = menu_world_delete_ask as usize;
-                                                ui.colored_label(
-                                                    egui::Color32::from_rgb(230, 140, 140),
-                                                    format!("delete \u{201c}{}\u{201d}? this cannot be undone.",
-                                                        menu_world_list[idx]),
-                                                );
-                                                ui.horizontal(|ui| {
-                                                    let yes = egui::Button::new("  delete  ")
-                                                        .fill(egui::Color32::from_rgb(120, 30, 30));
-                                                    if ui.add(yes).clicked() {
-                                                        menu_world_delete_confirm_local = idx as i32;
-                                                    }
-                                                    if ui.button("  cancel  ").clicked() {
-                                                        menu_world_delete_cancel_local = true;
-                                                    }
-                                                });
-                                            }
-                                        }
-                                        // r203: ROLLBACK BROWSE. When a world's
-                                        // history is requested, the bin fills
-                                        // menu_rollback_list with its restore
-                                        // points (newest first). "Step backward
-                                        // through the rollback system" begins as
-                                        // visibility: see the points, their reason
-                                        // and size, then restore.
-                                        if menu_show_rollbacks {
-                                            ui.add_space(6.0);
-                                            ui.separator();
-                                            ui.horizontal(|ui| {
-                                                // r227: blocky header in the menu language
-                                                ui.label(
-                                                    egui::RichText::new("WORLD HISTORY")
-                                                        .font(unendlich_ui::menu::blocks_font(15.0))
-                                                        .color(egui::Color32::from_rgb(0xee, 0xf3, 0xe8))
-                                                        .extra_letter_spacing(3.0),
-                                                );
-                                                ui.weak("(newest first)");
-                                                // r206: a small "more info" hint —
-                                                // explains what history points are
-                                                // and how they're made.
-                                                ui.label("\u{2139}").on_hover_text(
-                                                    "World-history points snapshot your world so you can step back.\n\
-                                                     They're created on a timer, after long travel, and on crafting.\n\
-                                                     In dev mode (UNENDLICH_DEV=1) they're created far more often,\n\
-                                                     and you can force one with the button below. Restore loads a\n\
-                                                     point on next launch; delete prunes a bad one.",
-                                                );
-                                            });
-                                            ui.add_space(4.0);
-                                            if menu_rollback_list.is_empty() {
-                                                ui.weak("(no rollback points for this world yet)");
-                                            } else {
-                                                let accent = unendlich_ui::current_theme(ui.ctx()).accent;
-                                                egui::ScrollArea::vertical()
-                                                    .id_salt("rollback_scroll")
-                                                    .max_height(140.0)
-                                                    .show(ui, |ui| {
-                                                        for (i, label) in menu_rollback_list.iter().enumerate() {
-                                                            ui.horizontal(|ui| {
-                                                                // r227: diamond marker (the menu's
-                                                                // history-point motif) before each row.
-                                                                let (drect, _) = ui.allocate_exact_size(
-                                                                    egui::vec2(16.0, 20.0), egui::Sense::hover());
-                                                                let c = drect.center();
-                                                                let h = 5.0;
-                                                                ui.painter().add(egui::Shape::convex_polygon(
-                                                                    vec![
-                                                                        egui::pos2(c.x, c.y - h),
-                                                                        egui::pos2(c.x + h, c.y),
-                                                                        egui::pos2(c.x, c.y + h),
-                                                                        egui::pos2(c.x - h, c.y),
-                                                                    ],
-                                                                    accent,
-                                                                    egui::Stroke::NONE,
-                                                                ));
-                                                                ui.add_sized([186.0, 20.0],
-                                                                    egui::Label::new(label.as_str()));
-                                                                if ui.add_sized([72.0, 20.0],
-                                                                    egui::Button::new("restore")).clicked()
-                                                                {
-                                                                    menu_rollback_restore_local = i as i32;
-                                                                }
-                                                                // r206: delete a bad point
-                                                                // (operator request).
-                                                                let del = egui::Button::new("\u{1f5d1}")
-                                                                    .fill(egui::Color32::from_rgb(60, 24, 24));
-                                                                if ui.add_sized([26.0, 20.0], del)
-                                                                    .on_hover_text("delete this point")
-                                                                    .clicked()
-                                                                {
-                                                                    menu_rollback_delete_local = i as i32;
-                                                                }
-                                                            });
-                                                        }
-                                                    });
-                                            }
-                                            // r206: dev-only "create history point now".
-                                            if dev_mode_on {
-                                                ui.add_space(4.0);
-                                                if ui.button("\u{2795} create history point now").clicked() {
-                                                    dev_make_point_local = true;
-                                                }
-                                            }
-                                        }
-                                        ui.add_space(8.0);
-                                        if dest_button(ui, "Back") { menu_pick = 6; }
-                                    }
-
-                                    4 => {
-                                        // r656: Singleplayer submenu — groups
-                                        // Create / Load / Bending Tutorial.
-                                        ui.label("singleplayer");
-                                        ui.add_space(8.0);
-                                        if dest_button(ui, "Create World") { menu_pick = 1; }
-                                        ui.add_space(4.0);
-                                        if dest_button(ui, "Load World") { menu_pick = 7; }
-                                        ui.add_space(4.0);
-                                        if dest_button(ui, "Bending Tutorial") { menu_pick = 9; }
-                                        ui.add_space(8.0);
-                                        if dest_button(ui, "Back") { menu_pick = 6; }
-                                    }
-
-                                    _ => {
-                                        // r656: top level now groups play modes —
-                                        // Singleplayer (Create/Load/Tutorial) and
-                                        // Multiplayer (Host/Join) each open a submenu.
-                                        if dest_button(ui, "Singleplayer") { menu_pick = 8; }
-                                        ui.add_space(4.0);
-                                        if dest_button(ui, "Multiplayer") { menu_pick = 2; }
-                                        ui.add_space(4.0);
-                                        // r203: Settings reachable from the MAIN MENU
-                                        // (was pause-menu only). Opens the tabbed
-                                        // settings window (Video/Audio/Gameplay/
-                                        // Controls/Performance) — which already
-                                        // renders over any screen and has its own
-                                        // "Done" close button.
-                                        if dest_button(ui, "Settings") { settings_menu_open_local = true; }
-                                        ui.add_space(4.0);
-                                        // r488: open the character-select / customizer.
-                                        if dest_button(ui, "Character") { open_character_local = true; }
-                                        ui.add_space(12.0);
-                                        if dest_button(ui, "Quit") { menu_pick = 4; }
-                                    }
-
-                                }
-                                fresnel(ui, ui.max_rect().expand(10.0), gt); // r190
-                                // r232: the mockup's "frame draws itself in" —
-                                // an outer→inner border ring that fills on each
-                                // navigation. animate_bool_with_time, keyed by
-                                // the screen kind, ramps 0→1 once when a screen
-                                // appears; border_fill wants 0=thick..1=gone, so
-                                // we pass 1.0 - that ramp and replay per screen.
-                                let bf_id = egui::Id::new(("menu_border_fill", menu_screen_kind));
-                                let ramp = ui.ctx().animate_bool_with_time(bf_id, true, 0.62);
-                                let accent = unendlich_ui::current_theme(ui.ctx()).accent;
-                                if unendlich_ui::menu::border_fill(
-                                    ui, ui.max_rect().expand(10.0), accent, 1.0 - ramp,
-                                ) {
-                                    ui.ctx().request_repaint();
-                                }
-                            });
+                            // r-extract: the menu BODY now lives in
+                            // app::live_menu — library code, drawn identically
+                            // here and in the headless snapshot example, so the
+                            // ACTUAL menu is photographable + unit-tested. This
+                            // window keeps only the chrome (glass, fresnel,
+                            // border fill-in) and maps clicks onto the locals.
+                            let lm = crate::app::live_menu::live_menu_body(
+                                ui,
+                                &crate::app::live_menu::LiveMenuState {
+                                    screen_kind: menu_screen_kind,
+                                    mp_list: &menu_mp_list,
+                                    world_list: &menu_world_list,
+                                    rollback_list: &menu_rollback_list,
+                                    show_rollbacks: menu_show_rollbacks,
+                                    world_delete_ask: menu_world_delete_ask,
+                                    dev_mode: dev_mode_on,
+                                },
+                            );
+                            if lm.menu_pick != 0 { menu_pick = lm.menu_pick; }
+                            if lm.mp_pick >= 0 { menu_mp_pick_local = lm.mp_pick; }
+                            if lm.world_pick >= 0 { menu_world_pick_local = lm.world_pick; }
+                            if lm.rollback_peek >= 0 { menu_rollback_peek_local = lm.rollback_peek; }
+                            if lm.rollback_restore >= 0 { menu_rollback_restore_local = lm.rollback_restore; }
+                            if lm.rollback_delete >= 0 { menu_rollback_delete_local = lm.rollback_delete; }
+                            if lm.world_delete_ask >= 0 { menu_world_delete_ask_local = lm.world_delete_ask; }
+                            if lm.world_delete_confirm >= 0 { menu_world_delete_confirm_local = lm.world_delete_confirm; }
+                            if lm.world_delete_cancel { menu_world_delete_cancel_local = true; }
+                            if lm.dev_make_point { dev_make_point_local = true; }
+                            if lm.open_settings { settings_menu_open_local = true; }
+                            if lm.open_character { open_character_local = true; }
+                            // window chrome (unchanged): fresnel sheen + the
+                            // r232 "frame draws itself in" border ring.
+                            fresnel(ui, ui.max_rect().expand(10.0), gt); // r190
+                            let bf_id = egui::Id::new(("menu_border_fill", menu_screen_kind));
+                            let ramp = ui.ctx().animate_bool_with_time(bf_id, true, 0.62);
+                            let accent = unendlich_ui::current_theme(ui.ctx()).accent;
+                            if unendlich_ui::menu::border_fill(
+                                ui, ui.max_rect().expand(10.0), accent, 1.0 - ramp,
+                            ) {
+                                ui.ctx().request_repaint();
+                            }
                         });
                     } // r190: end gt scope
                 }
@@ -3963,29 +3831,12 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                         .title_bar(false)
                         .show(c, |ui| {
                             unendlich_ui::set_theme(ui.ctx(), unendlich_ui::Theme::DARK);
-                            ui.set_min_width(300.0);
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(6.0);
-                                ui.label(
-                                    egui::RichText::new("unendlich")
-                                        .size(30.0)
-                                        .strong(),
-                                );
-                                ui.label(egui::RichText::new("\u{2014} paused \u{2014}").size(13.0).weak());
-                                ui.weak("menu build r171"); // r170: stale-binary detector
-                                ui.add_space(14.0);
-                                if tbtn_sized(ui, "Resume", 220.0, 32.0) { pause_pick = 1; }
-                                ui.add_space(6.0);
-                                if tbtn_sized(ui, "Settings", 220.0, 32.0) { pause_pick = 2; }
-                                ui.add_space(6.0);
-                                // r533: change character WITHOUT leaving the world — the
-                                // selector was previously only on the title screen.
-                                if tbtn_sized(ui, "Character", 220.0, 32.0) { open_character_local = true; }
-                                ui.add_space(6.0);
-                                ui.separator();
-                                ui.add_space(6.0);
-                                if tbtn_sized(ui, "Save & Quit to Title", 220.0, 32.0) { pause_pick = 3; }
-                            });
+                            // r-extract: pause body lives in app::live_menu
+                            // (headless-snapshotable, tested) — this window
+                            // is chrome + output mapping only.
+                            let p = crate::app::live_menu::pause_menu_body(ui, "menu build r171");
+                            if p.pick != 0 { pause_pick = p.pick; }
+                            if p.open_character { open_character_local = true; }
                         });
                 }
                 // r169: shared sparkline subcomponent (settings·video +
@@ -4437,10 +4288,11 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                 ui.horizontal(|ui| {
                                     ui.add_enabled_ui(*can, |ui| {
                                         let b = ui.button(format!("  craft  {name}  "));
-                                        // r176: canonical tooltip (doc
-                                        // format: effects, italic lore,
-                                        // attribution) on hover.
-                                        let b = b.on_hover_text(tip.clone());
+                                        // r176 → r330 wiring: canonical tooltip,
+                                        // now COMPOSED (item_tooltip core) and
+                                        // painted with roles — strong title,
+                                        // italic lore — not one grey blob.
+                                        let b = b.on_hover_ui(|ui| crate::app::live_menu::item_tooltip_from_tip(ui, tip));
                                         if b.clicked() {
                                             craft_pick = (i + 1) as u8;
                                         }
@@ -4716,91 +4568,39 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                         .title_bar(false)
                         .show(c, |ui| {
                             unendlich_ui::set_theme(ui.ctx(), unendlich_ui::Theme::DARK);
-                            ui.vertical_centered(|ui| {
-                                ui.label(
-                                    egui::RichText::new(wizard_title.to_uppercase())
-                                        .font(unendlich_ui::menu::blocks_font(24.0))
-                                        .color(egui::Color32::from_rgb(0xee, 0xf3, 0xe8))
-                                        .extra_letter_spacing(4.0),
-                                );
-                                ui.add_space(8.0);
-                                ui.label(&wizard_summary);
-                                ui.add_space(12.0);
-                                ui.horizontal(|ui| {
-                                    if tbtn(ui, " Mode ") { wizard_pick = 5; }
-                                    if tbtn(ui, " Seed ") { wizard_pick = 6; }
-                                });
-                                // r179: name the world (action 7 applies).
-                                ui.horizontal(|ui| {
-                                    ui.label("name:");
-                                    let resp = ui.text_edit_singleline(&mut wizard_name_buf);
-                                    // r205: focus the name box the first frame
-                                    // the wizard opens, so typing works without
-                                    // a precise click on the field (part of the
-                                    // "text entry not passing through" fix).
-                                    if wizard_focus_name {
-                                        resp.request_focus();
-                                    }
-                                    if resp.lost_focus() || tbtn(ui, "set") {
-                                        wizard_pick = 7;
-                                    }
-                                });
-                                // r181: birds-eye equirect strip of the
-                                // chosen seed (96x48, nearest-scaled 3x).
-                                if wizard_preview_dirty && !wizard_preview_uploaded {
-                                    let img = egui::ColorImage::from_rgb(
-                                        [96, 48],
-                                        &wizard_preview_rgb,
-                                    );
-                                    wizard_preview_tex = Some(c.load_texture(
-                                        "unendlich_seed_preview",
-                                        img,
-                                        egui::TextureOptions::NEAREST,
-                                    ));
-                                    wizard_preview_uploaded = true;
-                                }
-                                if let Some(tex) = &wizard_preview_tex {
-                                    ui.add_space(8.0);
-                                    let img = ui.add(
-                                        egui::Image::new((tex.id(), egui::vec2(288.0, 144.0)))
-                                            .sense(egui::Sense::click()),
-                                    );
-                                    // r185: click a region -> seek seeds that
-                                    // MATCH it (right-click: AVOID it).
-                                    if img.clicked() || img.secondary_clicked() {
-                                        if let Some(pos) = img.interact_pointer_pos() {
-                                            let r = img.rect;
-                                            let u = ((pos.x - r.min.x) / r.width()).clamp(0.0, 1.0);
-                                            let v = ((pos.y - r.min.y) / r.height()).clamp(0.0, 1.0);
-                                            wizard_preview_click_out = Some((u, v, img.secondary_clicked()));
-                                        }
-                                    }
-                                    ui.weak("birds-eye \u{00b7} equirect strip");
-                                    ui.add_space(4.0);
-                                }
-                                // r181: type a seed directly (Enter/apply).
-                                ui.horizontal(|ui| {
-                                    ui.label("seed:");
-                                    let resp = ui.text_edit_singleline(&mut wizard_seed_buf);
-                                    if resp.lost_focus() || tbtn(ui, "apply") {
-                                        wizard_pick = 8;
-                                    }
-                                });
-                                ui.add_space(10.0);
-                                ui.horizontal(|ui| {
-                                    if tbtn(ui, " Back ") { wizard_pick = 1; }
-                                    if wizard_at_confirm {
-                                        if tbtn(ui, " Create ") { wizard_pick = 3; }
-                                    } else if wizard_can_next {
-                                        if tbtn(ui, " Next ") { wizard_pick = 2; }
-                                    }
-                                    // r185: one-click create from any step —
-                                    // blank name gets a default bin-side.
-                                    if tbtn(ui, " Create World ") { wizard_pick = 9; }
-                                });
-                                ui.add_space(6.0);
-                                if tbtn(ui, " Cancel ") { wizard_pick = 4; }
-                            });
+                            // r-extract: the wizard body lives in
+                            // app::live_menu::wizard_body (headless-drawable,
+                            // tested, photographed). This window handles ONLY
+                            // chrome + the preview-texture lifecycle + pick
+                            // mapping.
+                            if wizard_preview_dirty && !wizard_preview_uploaded {
+                                let img = egui::ColorImage::from_rgb([96, 48], &wizard_preview_rgb);
+                                wizard_preview_tex = Some(c.load_texture(
+                                    "unendlich_seed_preview",
+                                    img,
+                                    egui::TextureOptions::NEAREST,
+                                ));
+                                wizard_preview_uploaded = true;
+                            }
+                            let mut wstate = crate::app::live_menu::WizardState {
+                                title: &wizard_title,
+                                summary: &wizard_summary,
+                                can_next: wizard_can_next,
+                                at_confirm: wizard_at_confirm,
+                                focus_name: wizard_focus_name,
+                                name_buf: &mut wizard_name_buf,
+                                seed_buf: &mut wizard_seed_buf,
+                                preview: wizard_preview_tex
+                                    .as_ref()
+                                    .map(|t| (t.id(), egui::vec2(288.0, 144.0))),
+                            };
+                            let w = crate::app::live_menu::wizard_body(ui, &mut wstate);
+                            if w.pick != 0 {
+                                wizard_pick = w.pick as u32;
+                            }
+                            if let Some(clk) = w.preview_click {
+                                wizard_preview_click_out = Some(clk);
+                            }
                         });
                 }
                 // ── Debug · shaderpack panel (Esc) ──
@@ -5272,7 +5072,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                                     ui.add_enabled_ui(*can, |ui| {
                                                         if ui
                                                             .button(format!("craft  {name}"))
-                                                            .on_hover_text(tip.clone())
+                                                            .on_hover_ui(|ui| crate::app::live_menu::item_tooltip_from_tip(ui, tip))
                                                             .clicked()
                                                         {
                                                             craft_pick = (i + 1) as u8;
@@ -5878,6 +5678,8 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             },
             water_depth_cov: self.water_depth_cov,
             water_depth_grid: *self.water_depth_grid,
+            disturbers: self.foliage_disturbers,
+            disturber_meta: [self.foliage_disturber_count as f32, 0.0, 0.0, 0.0],
         };
         unsafe {
             std::ptr::copy_nonoverlapping(

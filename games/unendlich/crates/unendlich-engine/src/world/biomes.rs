@@ -114,6 +114,7 @@ impl Biome {
                 canopy_radius: 3,
                 trunk_block: BlockId::OakLog,
                 leaves_block: BlockId::OakLeaves,
+                form: crate::world::tree_form::CanopyForm::Dome,
             }),
             Biome::BirchForest => Some(TreeProfile {
                 base_density: 0.035,       // dense, slightly sparser than temp.
@@ -122,6 +123,7 @@ impl Biome {
                 canopy_radius: 2,           // narrower canopy
                 trunk_block: BlockId::BirchLog,
                 leaves_block: BlockId::BirchLeaves,
+                form: crate::world::tree_form::CanopyForm::Dome,
             }),
             Biome::MapleForest => Some(TreeProfile {
                 base_density: 0.04,
@@ -131,6 +133,7 @@ impl Biome {
                 trunk_block: BlockId::OakLog,   // No MapleLog yet — reuse oak.
                 leaves_block: BlockId::OakLeaves, // visual variation via biome lighting later.
                                                   // TODO: add MapleLog/MapleLeaves blocks.
+                form: crate::world::tree_form::CanopyForm::Dome,
             }),
             Biome::CloudForest => Some(TreeProfile {
                 base_density: 0.06,        // dense canopy — wettest forest
@@ -139,6 +142,7 @@ impl Biome {
                 canopy_radius: 4,           // very wide canopy
                 trunk_block: BlockId::OakLog,
                 leaves_block: BlockId::OakLeaves,
+                form: crate::world::tree_form::CanopyForm::Dome,
             }),
 
             // Highlands: sparse, shorter trees (cold + windy).
@@ -149,6 +153,7 @@ impl Biome {
                 canopy_radius: 2,
                 trunk_block: BlockId::OakLog,
                 leaves_block: BlockId::OakLeaves,
+                form: crate::world::tree_form::CanopyForm::Dome,
             }),
             Biome::AlpineHighlands => Some(TreeProfile {
                 base_density: 0.008,       // very sparse — high altitude / cold
@@ -157,6 +162,7 @@ impl Biome {
                 canopy_radius: 1,           // narrow conifer-like crown
                 trunk_block: BlockId::BirchLog,    // birch as cold-climate substitute
                 leaves_block: BlockId::BirchLeaves,
+                form: crate::world::tree_form::CanopyForm::Dome,
             }),
 
             // Plains: occasional trees.
@@ -167,6 +173,7 @@ impl Biome {
                 canopy_radius: 3,
                 trunk_block: BlockId::OakLog,
                 leaves_block: BlockId::OakLeaves,
+                form: crate::world::tree_form::CanopyForm::Dome,
             }),
 
             // Swamp: short, wide-crowned trees in waterlogged ground.
@@ -177,17 +184,26 @@ impl Biome {
                 canopy_radius: 3,
                 trunk_block: BlockId::OakLog,
                 leaves_block: BlockId::OakLeaves,
+                form: crate::world::tree_form::CanopyForm::Dome,
             }),
 
             // No-tree biomes.
             // Savanna: sparse, scattered flat-topped trees over open grass.
+            // r604: the savanna umbrella (Vachellia/Acacia habit — see
+            // docs/design/biomes_west_africa.md): a clear trunk under a
+            // thin, WIDE flat crown. Taller minimum + wider canopy than
+            // the old dome so the silhouette reads at distance.
             Biome::Savanna => Some(TreeProfile {
                 base_density: 0.006,
-                trunk_min_height: 4,
-                trunk_max_height: 7,
+                trunk_min_height: 5,
+                trunk_max_height: 8,
+                // radius 3, NOT 4: both backends' canopy-scan
+                // neighborhoods are sized for max radius 3 (+1 margin);
+                // 4 would silently truncate crowns at chunk borders.
                 canopy_radius: 3,
                 trunk_block: BlockId::OakLog,
                 leaves_block: BlockId::OakLeaves,
+                form: crate::world::tree_form::CanopyForm::FlatTop,
             }),
             // Jungle: very dense, tall, broad canopy — the wettest, hottest forest.
             Biome::Jungle => Some(TreeProfile {
@@ -197,6 +213,7 @@ impl Biome {
                 canopy_radius: 3,
                 trunk_block: BlockId::OakLog,
                 leaves_block: BlockId::OakLeaves,
+                form: crate::world::tree_form::CanopyForm::Dome,
             }),
             // Taiga: tall, narrow conifers at moderate density.
             Biome::Taiga => Some(TreeProfile {
@@ -206,6 +223,7 @@ impl Biome {
                 canopy_radius: 2,
                 trunk_block: BlockId::OakLog,
                 leaves_block: BlockId::OakLeaves,
+                form: crate::world::tree_form::CanopyForm::Dome,
             }),
             // r336-biomes: Mangrove — short, wide, dense canopy in waterlogged
             // tidal ground (reuses oak geometry until Mangrove blocks exist).
@@ -216,6 +234,7 @@ impl Biome {
                 canopy_radius: 3,
                 trunk_block: BlockId::OakLog,
                 leaves_block: BlockId::OakLeaves,
+                form: crate::world::tree_form::CanopyForm::Dome,
             }),
             Biome::Desert
             | Biome::Beach
@@ -337,6 +356,10 @@ pub struct TreeProfile {
     pub trunk_block: BlockId,
     /// Block used for the canopy.
     pub leaves_block: BlockId,
+    /// r604: tree SILHOUETTE (see `world::tree_form`). `Dome` reproduces
+    /// the pre-r604 shape byte-for-byte, so every profile below that
+    /// doesn't say otherwise is untouched.
+    pub form: crate::world::tree_form::CanopyForm,
 }
 
 impl TryFrom<u32> for Biome {

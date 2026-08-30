@@ -855,7 +855,7 @@ impl WorldGenerator {
                 // Determine biome at surface; reject biomes that don't
                 // have trees (oceans, deserts, etc.).
                 let surface_sample = self.biome_at_3d(wx, surface_y, wz);
-                let profile = match surface_sample.biome.tree_profile() {
+                let mut profile = match surface_sample.biome.tree_profile() {
                     Some(p) => p,
                     None => continue,
                 };
@@ -867,7 +867,25 @@ impl WorldGenerator {
                 let temp = surface_sample.temperature;
                 let humid = surface_sample.humidity;
                 let climate_factor = climate_tree_factor(temp, humid);
-                let effective_density = profile.base_density * climate_factor;
+                let mut effective_density = profile.base_density * climate_factor;
+
+                // r605: FOREST ISLANDS in the savanna (Comoé study — see
+                // docs/design/biomes_west_africa.md and world::forest_islands).
+                // Inside an island, density rises with the core and each
+                // tree draws a STRATUM (D/d/o) from the island's own
+                // palette — crossing to the next island reads as a
+                // different forest (the 8 %-species-overlap rule as a
+                // mechanic). MIRRORED in chunk_generation.comp; the
+                // transliteration tests in forest_islands.rs gate the twin.
+                if surface_sample.biome == Biome::Savanna {
+                    use crate::world::forest_islands as fi;
+                    let isl = fi::sample(wx, wz, self.seed());
+                    if isl.in_island {
+                        effective_density = fi::island_density(isl.core) * climate_factor as f64;
+                        let strat_h = fi::cell_hash01(wx, wz, 0x57A7, self.seed());
+                        profile = fi::island_profile(isl.palette, fi::stratum_for(strat_h));
+                    }
+                }
                 if pos_hash >= effective_density { continue; }
 
                 // Reject if surface block isn't a tree-suitable substrate.
@@ -945,10 +963,23 @@ impl WorldGenerator {
                 };
 
                 // ---- Stamp trunk (with lean offset per block) ----
+                // r604: thickness from the form — the baobab's 2×2 trunk
+                // mass IS its silhouette. Extra columns extend +x/+z.
+                let tt = crate::world::tree_form::trunk_thickness(profile.form);
                 for h in 1..=trunk_height {
                     let off_x = (lean_dx * h as f64).round() as i32;
                     let off_z = (lean_dz * h as f64).round() as i32;
-                    try_write(&mut blocks, wx + off_x, surface_y + h, wz + off_z, profile.trunk_block);
+                    for txo in 0..tt {
+                        for tzo in 0..tt {
+                            try_write(
+                                &mut blocks,
+                                wx + off_x + txo,
+                                surface_y + h,
+                                wz + off_z + tzo,
+                                profile.trunk_block,
+                            );
+                        }
+                    }
                 }
 
                 // ---- Stamp leaf canopy (centered on trunk-top, lean-shifted) ----
@@ -957,14 +988,19 @@ impl WorldGenerator {
                 let canopy_off_z = (lean_dz * trunk_height as f64).round() as i32;
                 let canopy_cx = wx + canopy_off_x;
                 let canopy_cz = wz + canopy_off_z;
-                let v_extent = r_max.max(1);
+                // r604: canopy geometry now comes from the profile's FORM
+                // (world::tree_form). Dome reproduces the old inline math
+                // byte-for-byte (pinned by unit test); FlatTop/Baobab/Shrub
+                // are the new West-African silhouettes. MIRRORED in
+                // chunk_generation.comp — the worldgen-parity probe diffs
+                // full chunks across backends to keep the twins honest.
+                use crate::world::tree_form as tf;
+                let v_extent = tf::canopy_v_extent(profile.form, r_max);
                 for cy in (canopy_cy - v_extent) ..= (canopy_cy + v_extent) {
                     let dy = cy - canopy_cy;
-                    let r = if v_extent <= 1 {
-                        1
-                    } else {
-                        let frac = 1.0 - (dy.abs() as f64 / v_extent as f64);
-                        ((r_max as f64) * frac).round().max(1.0) as i32
+                    let Some(r) = tf::canopy_layer_radius(profile.form, dy, v_extent, r_max)
+                    else {
+                        continue;
                     };
                     for cz in (canopy_cz - r) ..= (canopy_cz + r) {
                         for cx in (canopy_cx - r) ..= (canopy_cx + r) {
@@ -1716,6 +1752,216 @@ mod tests {
         let f = climate_tree_factor(0.9, 0.1);
         assert_eq!(f, 0.0,
             "hot+dry should fully suppress trees, got {}", f);
+    }
+
+    /// r605 end-to-end: forest islands make savanna chunks measurably
+    /// denser. Scan a seed for a savanna column sitting in an island CORE
+    /// and one in open grass, generate both chunks, and require the island
+    /// chunk to carry clearly more tree blocks. (The exact counts are seed
+    /// noise; the ORDER is the invariant.)
+    #[test]
+    fn savanna_islands_are_denser_than_open_grass() {
+        use crate::world::forest_islands as fi;
+        use crate::world::biomes::Biome;
+        // Savanna placement is seed luck; try a fixed list until one seed
+        // yields both an island-core column and open grass. Deterministic:
+        // the list is fixed and the first hit wins.
+        let mut found: Option<(WorldGenerator, (i32, i32), (i32, i32))> = None;
+        'seeds: for s in [0xBEEF_5A7Au32, 42, 7, 12345, 999_331, 0xCAFE, 2024, 555_000] {
+        let g = WorldGenerator::new(s);
+        let seed = g.seed();
+        // Enumerate island CENTRES analytically from the cell field (a
+        // blind grid scan strides over the 5–18-block cores), then keep
+        // the first whose centre is savanna.
+        let mut island_col: Option<(i32, i32)> = None;
+        let mut open_col: Option<(i32, i32)> = None;
+        'cells: for cx in -60i32..60 {
+            for cz in -60i32..60 {
+                if fi::cell_hash01(cx, cz, 0x15AD, seed) >= fi::ISLAND_P {
+                    continue;
+                }
+                let jx = fi::cell_hash01(cx, cz, 0xC311, seed);
+                let jz = fi::cell_hash01(cx, cz, 0xC312, seed);
+                let wx = (cx as f32 * fi::ISLAND_CELL as f32
+                    + (0.25 + 0.5 * jx) * fi::ISLAND_CELL as f32) as i32;
+                let wz = (cz as f32 * fi::ISLAND_CELL as f32
+                    + (0.25 + 0.5 * jz) * fi::ISLAND_CELL as f32) as i32;
+                let sy = match g.surface_y_at(wx, wz, -64, 256) {
+                    Some(y) => y,
+                    None => continue,
+                };
+                if g.biome_at_3d(wx, sy, wz).biome != Biome::Savanna {
+                    continue;
+                }
+                let isl = fi::sample(wx, wz, seed);
+                if isl.in_island && isl.core > 0.6 && isl.palette != fi::TERMITE_PALETTE {
+                    island_col = Some((wx, wz));
+                    // Open grass: walk outward until the field says open
+                    // AND biome is still savanna.
+                    for step in 1..40 {
+                        let (ox, oz) = (wx + step * 13, wz + step * 7);
+                        let osy = match g.surface_y_at(ox, oz, -64, 256) {
+                            Some(y) => y,
+                            None => continue,
+                        };
+                        if g.biome_at_3d(ox, osy, oz).biome == Biome::Savanna
+                            && !fi::sample(ox, oz, seed).in_island
+                        {
+                            open_col = Some((ox, oz));
+                            break 'cells;
+                        }
+                    }
+                }
+            }
+        }
+        if let (Some(i), Some(o)) = (island_col, open_col) {
+            found = Some((g, i, o));
+            break 'seeds;
+        }
+        }
+        let (g, (ix, iz), (ox, oz)) =
+            found.expect("no seed in the fixed list yields a savanna island + open grass pair");
+        let count_trees = |wx: i32, wz: i32| -> usize {
+            let cs = crate::constants::CHUNK_SIZE;
+            let coord = ChunkCoord::new(wx.div_euclid(cs), 2, wz.div_euclid(cs));
+            let chunk = g.generate_chunk(coord);
+            chunk
+                .blocks
+                .iter()
+                .filter(|b| {
+                    matches!(
+                        **b,
+                        BlockId::OakLog
+                            | BlockId::OakLeaves
+                            | BlockId::BirchLog
+                            | BlockId::BirchLeaves
+                    )
+                })
+                .count()
+        };
+        let dense = count_trees(ix, iz);
+        let open = count_trees(ox, oz);
+        assert!(
+            dense > open.saturating_mul(2).max(20),
+            "island chunk ({ix},{iz}) must be much denser than open ({ox},{oz}): {dense} vs {open}"
+        );
+    }
+
+    /// r614: the tree-site puzzle instrument. The GLSL biome_at_3d_gpu
+    /// (transliterated below, f32, literally) is diffed against the REAL
+    /// biome_at_3d over a coordinate grid at the regressing seed. Zero or
+    /// near-zero mismatches ⇒ the r613 tree-site regression is DOWNSTREAM
+    /// of classification (profile/density/hash interplay); a large count
+    /// ⇒ a mirror bug, located by the printed mismatch cases.
+    #[test]
+    fn glsl_biome_at_3d_transliteration_vs_cpu() {
+        use crate::world::biome_loader::BiomeRegistry;
+        // load_standard resolves cwd-dependently; tests run from the
+        // crate dir, so try the workspace-relative path explicitly.
+        let mut reg = BiomeRegistry::empty();
+        let loaded = ["../../assets/biomes", "assets/biomes"]
+            .iter()
+            .find_map(|p| reg.load_directory(p).ok());
+        if loaded.is_none() {
+            eprintln!("SKIP: no biome assets from test cwd");
+            return;
+        }
+        // Bake the def table BEFORE the registry moves into the Arc.
+        let defs: Vec<(f32, f32, f32, u32)> = reg
+            .defs()
+            .iter()
+            .map(|d| {
+                let (t, h) = d.climate_coord();
+                let pen = if d.legacy_enum.is_none() { 0.01f32 } else { 0.0 };
+                (t as f32, h as f32, pen, d.to_legacy() as u32)
+            })
+            .collect();
+        let g = WorldGenerator::with_biome_registry(424242, std::sync::Arc::new(reg));
+
+        // ---- literal transliteration of biome_at_3d_gpu (f32) ----
+        let glsl = |x: f32, y: f32, z: f32| -> u32 {
+            let temp = g.model().temperature(x as f64, y as f64, z as f64, 0.0) as f32;
+            let humid = g.model().humidity(x as f64, y as f64, z as f64, 0.0) as f32;
+            let erosion_raw = ((crate::world::noise::fbm_2d(
+                (x * 0.0008) as f64,
+                (z * 0.0008) as f64,
+                g.seed().wrapping_add(0xE105),
+                2,
+                1.0,
+                1.0,
+            ) as f32)
+                - 0.5)
+                * 2.0;
+            let erosion_unit = (erosion_raw + 1.0) * 0.5;
+            let legacy_verdict =
+                determine_biome(temp as f64, humid as f64, erosion_unit as f64);
+            let sl = g.model().sea_level(x as f64, z as f64, 0.0) as f32;
+            let st = sl
+                + g.model().continental(x as f64, z as f64) as f32 * 30.0
+                + g.model().hills(x as f64, z as f64) as f32 * 15.0;
+            let ocean_threshold =
+                sl - 2.0 - (legacy_verdict.height_modifier() as f32).max(0.0);
+            let shelf_threshold = sl + 6.0;
+            let mut topo: Option<Biome> = None;
+            if st < ocean_threshold {
+                topo = Some(Biome::Ocean);
+            } else if st < shelf_threshold {
+                match g.surface_y_at(x as i32, z as i32, (sl - 120.0) as i32, (sl + 8.0) as i32)
+                {
+                    Some(sy) if (sy as f32) < sl - 2.0 => topo = Some(Biome::Ocean),
+                    Some(sy) if (sy as f32) < sl + 2.0 => topo = Some(Biome::Beach),
+                    _ => {}
+                }
+            }
+            if let Some(t) = topo {
+                return t as u32;
+            }
+            if matches!(legacy_verdict, Biome::Ocean | Biome::Beach) {
+                return legacy_verdict as u32;
+            }
+            let (tt, th) = (temp.clamp(0.0, 1.0), humid.clamp(0.0, 1.0));
+            let mut best = -1i32;
+            let mut best_d2 = f32::INFINITY;
+            for (i, &(dt_, dh_, pen, _)) in defs.iter().enumerate() {
+                let dt = dt_ - tt;
+                let dh = dh_ - th;
+                let d2 = dt * dt + dh * dh + pen;
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best = i as i32;
+                }
+            }
+            if best >= 0 {
+                return defs[best as usize].3;
+            }
+            legacy_verdict as u32
+        };
+        // ---- end transliteration ----
+
+        let (mut mismatch, mut total) = (0u32, 0u32);
+        let mut cases: Vec<(i32, i32, u32, u32)> = Vec::new();
+        for wx in (-1600..1600).step_by(37) {
+            for wz in (-1600..1600).step_by(41) {
+                let sy = match g.surface_y_at(wx, wz, -64, 256) {
+                    Some(y) => y,
+                    None => continue,
+                };
+                total += 1;
+                let cpu = g.biome_at_3d(wx, sy, wz).biome as u32;
+                let gpu = glsl(wx as f32, sy as f32, wz as f32);
+                if cpu != gpu {
+                    mismatch += 1;
+                    if cases.len() < 8 {
+                        cases.push((wx, wz, cpu, gpu));
+                    }
+                }
+            }
+        }
+        println!("biome_at_3d transliteration: {mismatch}/{total} mismatches; first: {cases:?}");
+        assert!(
+            (mismatch as f64) < (total as f64) * 0.02,
+            "mirror diverges materially: {mismatch}/{total}, cases {cases:?}"
+        );
     }
 
     /// Climate tree factor: peak in mild + humid (>1.0).

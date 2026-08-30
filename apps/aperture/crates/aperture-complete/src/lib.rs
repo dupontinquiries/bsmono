@@ -22,6 +22,9 @@ pub mod engine;
 /// layer that keeps identical requests from reaching the model at all.
 /// Keeping the prompt's PREFIX stable so a KV-cached engine can skip
 /// re-prefilling context that did not change — where the latency is.
+/// Turn one raw model reply into blocks you can build with: comments,
+/// keyed suggestions, and nothing that deletes your file when accepted.
+pub mod multipass;
 pub mod kvplan;
 pub mod prefixcache;
 pub mod providers;

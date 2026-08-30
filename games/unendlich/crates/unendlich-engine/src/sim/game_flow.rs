@@ -121,6 +121,22 @@ impl GameFlow {
         }
     }
 
+    /// r603: enter `Loading` for a launch that did NOT come from the title
+    /// menu — joining a LAN host adopts the host's world (name + seed ride
+    /// the Accept) and bypasses the wizard entirely. Same edge as
+    /// `StartNewGame`, so the later `world_ready()` (Loading → InGame)
+    /// works identically for both paths. Idempotent outside `MainMenu`:
+    /// already Loading/InGame → no transition (a duplicate Accept must not
+    /// bounce the state machine).
+    pub fn begin_external_load(&mut self) -> AppEvent {
+        if self.state == AppState::MainMenu {
+            self.state = AppState::Loading;
+            AppEvent::EnterLoading
+        } else {
+            AppEvent::None
+        }
+    }
+
     /// Main-menu handling: forward `Title(..)` to the embedded flow and lift its
     /// events to app transitions. Starting or loading a game enters `Loading`;
     /// confirming quit-to-desktop from the menu exits. Non-`Title` commands are
@@ -152,6 +168,25 @@ mod tests {
     use crate::sim::title_flow::{MenuId, Screen, TitleCmd};
 
     const NEW_GAME: AppCmd = AppCmd::Title(TitleCmd::Select(MenuId::NewGame));
+
+    /// r603: the LAN-join synthetic launch takes the same edges as the menu
+    /// path — MainMenu → (external load) → Loading → (WorldReady) → InGame —
+    /// and duplicate calls don't bounce the state machine.
+    #[test]
+    fn external_load_drives_loading_then_ingame_and_is_idempotent() {
+        let mut gf = GameFlow::new(false, 3);
+        assert_eq!(gf.state(), AppState::MainMenu);
+        assert_eq!(gf.begin_external_load(), AppEvent::EnterLoading);
+        assert_eq!(gf.state(), AppState::Loading);
+        // A duplicate Accept mid-load must not re-fire the transition.
+        assert_eq!(gf.begin_external_load(), AppEvent::None);
+        assert_eq!(gf.state(), AppState::Loading);
+        assert_eq!(gf.apply(AppCmd::WorldReady), AppEvent::BeginPlay);
+        assert_eq!(gf.state(), AppState::InGame);
+        // And once InGame it stays a no-op.
+        assert_eq!(gf.begin_external_load(), AppEvent::None);
+        assert_eq!(gf.state(), AppState::InGame);
+    }
 
     /// New game: MainMenu → (Select NewGame) → Loading → (WorldReady) → InGame.
     /// `title_flow` emits `StartNewGame` on `Select(NewGame)` in one step.

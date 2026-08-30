@@ -107,6 +107,35 @@ pub fn transition_remesh_due(coord: ChunkCoord, tick: u64, stride: u64) -> bool 
     tick % stride == phase
 }
 
+/// r599 (clone-free transition remesh): how many remesh events
+/// `transition_remesh_due` has fired for `coord` in ticks `1..=tick` — a
+/// monotone counter that steps exactly when `due` is true, with the same
+/// per-coord phase. Added to a transitioning chunk's reported version, it
+/// makes the mesh scheduler see the chunk as stale on the same cadence the
+/// old sweep re-meshed it — WITHOUT the deep chunk clone the sweep paid per
+/// event. Pure + deterministic.
+#[inline]
+pub fn transition_remesh_count(coord: ChunkCoord, tick: u64, stride: u64) -> u64 {
+    if tick == 0 {
+        return 0;
+    }
+    if stride <= 1 {
+        return tick;
+    }
+    let h = (coord.x as i64).wrapping_mul(73_856_093)
+        ^ (coord.y as i64).wrapping_mul(19_349_663)
+        ^ (coord.z as i64).wrapping_mul(83_492_791);
+    let phase = (h as u64) % stride;
+    // Count of t in [1, tick] with t % stride == phase.
+    if phase == 0 {
+        tick / stride
+    } else if tick >= phase {
+        (tick - phase) / stride + 1
+    } else {
+        0
+    }
+}
+
 /// Whether a chunk is entirely empty sky and can be skipped from the load set.
 /// `surface_target` is the 2D-estimated terrain elevation (blocks) at the
 /// chunk's column; `chunk_y` is the chunk coordinate's Y; `margin_chunks` is
@@ -524,6 +553,70 @@ impl ChunkManager {
         self.world_edit_tick.load(Ordering::Relaxed)
     }
 
+    /// Join-at-any-time support: the current edit overlay of every LOADED
+    /// chunk, in the timebending storage layout (`sim::net::join_sync`
+    /// records; `tick: 0` = today's timeless overlay, per the storage-
+    /// integration doc's backward-compat rule). Deterministically ordered.
+    ///
+    /// Carried edits for UNLOADED chunks are not included: they materialise
+    /// when the host loads those chunks, and until then a joiner regenerates
+    /// the identical procedural base — nothing to hand over yet.
+    pub fn edited_chunk_records(&self) -> Vec<crate::sim::net::join_sync::ChunkEditRecord> {
+        use crate::sim::net::join_sync::{ChunkEditRecord, StampedEdit};
+        let mut out = Vec::new();
+        for entry in self.chunks.iter() {
+            let chunk = entry.value();
+            if chunk.explicit_indices.is_empty() {
+                continue;
+            }
+            let edits = chunk
+                .explicit_indices
+                .iter()
+                .map(|&idx| StampedEdit {
+                    tick: 0,
+                    index: idx,
+                    block: chunk.blocks[idx as usize] as u8,
+                })
+                .collect();
+            out.push(ChunkEditRecord { coord: chunk.coord, edits });
+        }
+        out.sort_by_key(|r| (r.coord.x, r.coord.y, r.coord.z));
+        out
+    }
+
+    /// Joiner side of join-sync: overlay received edit records onto the
+    /// regenerated base. `set_block` REFUSES writes into chunks that aren't
+    /// resident yet (r602 finding: there is no implicit carry), so this
+    /// returns `(applied, remaining)` — the caller keeps `remaining` and
+    /// re-drains as chunks stream in; records self-clear as the world loads.
+    pub fn apply_edit_records(
+        &self,
+        records: &[crate::sim::net::join_sync::ChunkEditRecord],
+    ) -> (usize, Vec<crate::sim::net::join_sync::ChunkEditRecord>) {
+        let cs = crate::constants::CHUNK_SIZE;
+        let mut applied = 0usize;
+        let mut remaining = Vec::new();
+        for r in records {
+            if !self.chunks.contains_key(&r.coord) {
+                remaining.push(r.clone());
+                continue;
+            }
+            for e in &r.edits {
+                let i = e.index as i32;
+                // Inverse of Chunk::block_index: x + z*S + y*S*S.
+                let (lx, lz, ly) = (i % cs, (i / cs) % cs, i / (cs * cs));
+                let (wx, wy, wz) =
+                    (r.coord.x * cs + lx, r.coord.y * cs + ly, r.coord.z * cs + lz);
+                if let Ok(b) = crate::world::blocks::BlockId::try_from(e.block) {
+                    if self.set_block(wx, wy, wz, b) {
+                        applied += 1;
+                    }
+                }
+            }
+        }
+        (applied, remaining)
+    }
+
     /// B1 (r102): the current world epoch. Incremented on every world reset
     /// (`reset_with_generator`/`rebuild_for_seed`). The renderer/mesher should
     /// read this when a mesh job is issued and again when its result returns,
@@ -538,6 +631,20 @@ impl ChunkManager {
     /// stay in sync.
     fn install_chunk(&self, chunk: Chunk, octree: OctreeArray) {
         let coord = chunk.coord;
+        // r598 producer trap: name whoever inserts a wild-coord chunk.
+        if coord.x.unsigned_abs() > 1_000_000
+            || coord.y.unsigned_abs() > 1_000_000
+            || coord.z.unsigned_abs() > 1_000_000
+        {
+            static TRAP_ONCE: std::sync::Once = std::sync::Once::new();
+            TRAP_ONCE.call_once(|| {
+                log::error!(
+                    "[watchdog] WILD chunk INSERTED into the manager at ({}, {}, {}) — producer backtrace:\n{}",
+                    coord.x, coord.y, coord.z,
+                    std::backtrace::Backtrace::force_capture()
+                );
+            });
+        }
         self.chunks.insert(coord, Arc::new(chunk));
         self.octrees.insert(coord, Arc::new(octree));
     }
@@ -582,6 +689,20 @@ impl ChunkManager {
             }
         };
 
+        // r598 producer trap: name whoever inserts a wild-coord chunk.
+        if coord.x.unsigned_abs() > 1_000_000
+            || coord.y.unsigned_abs() > 1_000_000
+            || coord.z.unsigned_abs() > 1_000_000
+        {
+            static TRAP_ONCE: std::sync::Once = std::sync::Once::new();
+            TRAP_ONCE.call_once(|| {
+                log::error!(
+                    "[watchdog] WILD chunk INSERTED into the manager at ({}, {}, {}) — producer backtrace:\n{}",
+                    coord.x, coord.y, coord.z,
+                    std::backtrace::Backtrace::force_capture()
+                );
+            });
+        }
         self.chunks.insert(coord, Arc::new(new_chunk));
         self.octrees.insert(coord, Arc::new(new_octree));
     }
@@ -669,6 +790,20 @@ impl ChunkManager {
             }
         };
 
+        // r598 producer trap: name whoever inserts a wild-coord chunk.
+        if coord.x.unsigned_abs() > 1_000_000
+            || coord.y.unsigned_abs() > 1_000_000
+            || coord.z.unsigned_abs() > 1_000_000
+        {
+            static TRAP_ONCE: std::sync::Once = std::sync::Once::new();
+            TRAP_ONCE.call_once(|| {
+                log::error!(
+                    "[watchdog] WILD chunk INSERTED into the manager at ({}, {}, {}) — producer backtrace:\n{}",
+                    coord.x, coord.y, coord.z,
+                    std::backtrace::Backtrace::force_capture()
+                );
+            });
+        }
         self.chunks.insert(coord, Arc::new(new_chunk));
         self.octrees.insert(coord, Arc::new(new_octree));
     }
@@ -1462,32 +1597,18 @@ impl ChunkManager {
         // For 2a, per-tick re-mesh is the simplest path that gives
         // visible smooth transitions without shader work.
         if !self.chunks_with_transitions.is_empty() {
+            // r599: CLONE-FREE. The old sweep deep-cloned every due chunk
+            // (blocks Vec + metadata) purely to bump version+dirty so the
+            // mesh scheduler would re-run — the transition-set stutter. The
+            // version bump is now VIRTUAL: `effective_version` adds
+            // `transition_remesh_count` (same cadence, same phase) to a
+            // transitioning chunk's reported version at read time, so the
+            // scheduler sees staleness on the identical schedule with zero
+            // clones, zero Arc churn, zero apply-phase work here. This block
+            // only advances the clock and prunes evicted coords.
             self.transition_remesh_tick = self.transition_remesh_tick.wrapping_add(1);
-            let tick = self.transition_remesh_tick;
-            let stride = self.transition_remesh_stride;
-            // Clone-collect to avoid borrowing self twice (the get_mut
-            // below also borrows self via self.chunks).
-            let coords: Vec<ChunkCoord> =
-                self.chunks_with_transitions.iter().copied().collect();
-            for coord in coords {
-                // Stride gate: re-mesh each transitioning chunk every `stride`
-                // ticks, phase-offset by coord so the per-tick remesh count is
-                // ~1/stride of the transition set spread evenly (no bursts).
-                // stride==1 → always true → original every-tick behavior.
-                if !transition_remesh_due(coord, tick, stride) {
-                    continue;
-                }
-                if let Some(mut entry) = self.chunks.get_mut(&coord) {
-                    // clone_for_edit already bumps version + sets dirty.
-                    // We don't need to call bump_version_only afterwards.
-                    let new_chunk = entry.value().clone_for_edit();
-                    *entry = Arc::new(new_chunk);
-                } else {
-                    // Chunk was evicted while transitioning. Remove
-                    // from the index so we don't keep trying.
-                    self.chunks_with_transitions.remove(&coord);
-                }
-            }
+            self.chunks_with_transitions
+                .retain(|c| self.chunks.contains_key(c));
         }
 
         // Stash the per-handler timing for the diagnostic log to read.
@@ -2165,6 +2286,31 @@ impl ChunkManager {
         self.chunks.get(&coord).map(|r| Arc::clone(r.value()))
     }
 
+    /// r599: the version the MESH SCHEDULER should compare against — the
+    /// chunk's stored version plus the virtual transition-remesh counter for
+    /// chunks with active transitions (see `transition_remesh_count`). For
+    /// everything else this is exactly `base_version`. The submit path reads
+    /// versions through this so transitioning chunks re-mesh on the stride
+    /// cadence without the old per-event deep clone.
+    pub fn effective_version(&self, coord: ChunkCoord, base_version: u64) -> u64 {
+        if self.chunks_with_transitions.contains(&coord) {
+            base_version.wrapping_add(transition_remesh_count(
+                coord,
+                self.transition_remesh_tick,
+                self.transition_remesh_stride,
+            ))
+        } else {
+            base_version
+        }
+    }
+
+    /// r599 test hook: mark a coord as transitioning without walking the
+    /// full block-edit apply path.
+    #[cfg(test)]
+    pub(crate) fn test_mark_transitioning(&mut self, coord: ChunkCoord) {
+        self.chunks_with_transitions.insert(coord);
+    }
+
     /// Read the block at a world position. Returns Air if the chunk
     /// containing it isn't loaded.
     pub fn block_at(&self, world_x: i32, world_y: i32, world_z: i32) -> BlockId {
@@ -2302,6 +2448,22 @@ impl ChunkManager {
 
     /// Set a block via copy-on-write. Returns true if the chunk was loaded.
     pub fn set_block(&self, world_x: i32, world_y: i32, world_z: i32, block: BlockId) -> bool {
+        // r598 producer trap: a set_block at wild world coords is the NaN
+        // position signature entering the world model — name the caller.
+        if world_x.unsigned_abs() > 30_000_000
+            || world_y.unsigned_abs() > 30_000_000
+            || world_z.unsigned_abs() > 30_000_000
+        {
+            static TRAP_SB_ONCE: std::sync::Once = std::sync::Once::new();
+            TRAP_SB_ONCE.call_once(|| {
+                log::error!(
+                    "[watchdog] WILD set_block at world ({}, {}, {}) block={:?} — producer backtrace:\n{}",
+                    world_x, world_y, world_z, block,
+                    std::backtrace::Backtrace::force_capture()
+                );
+            });
+            return false; // refuse the write — a NaN must not edit the world
+        }
         let coord = block_to_chunk(world_x, world_y, world_z);
         let lx = world_x.rem_euclid(CHUNK_SIZE);
         let ly = world_y.rem_euclid(CHUNK_SIZE);
@@ -2509,6 +2671,104 @@ mod tests {
     use crate::world::chunk::Chunk;
     use crate::world::biomes::Biome;
     use crate::world::terrain_generator::TerrainGenerator;
+
+    #[test]
+    /// r602: apply_edit_records applies into RESIDENT chunks and returns the
+    /// rest — the joiner's re-drain loop depends on exactly this: records
+    /// wait out chunk streaming instead of being silently dropped (set_block
+    /// refuses non-resident writes), and fall out once their chunk loads.
+    #[test]
+    fn edit_records_wait_for_their_chunk_then_apply() {
+        use crate::sim::net::join_sync::{ChunkEditRecord, StampedEdit};
+        let mgr = make_manager();
+        let here = ChunkCoord::new(0, 0, 0);
+        let far = ChunkCoord::new(9, 0, 0);
+        insert_chunk_at(&mgr, here);
+        let records = vec![
+            ChunkEditRecord {
+                coord: here,
+                edits: vec![StampedEdit { tick: 0, index: crate::world::chunk::Chunk::block_index(3, 4, 5) as u16, block: crate::world::blocks::BlockId::Stone as u8 }],
+            },
+            ChunkEditRecord {
+                coord: far,
+                edits: vec![StampedEdit { tick: 0, index: 0, block: crate::world::blocks::BlockId::Dirt as u8 }],
+            },
+        ];
+        let (applied, rest) = mgr.apply_edit_records(&records);
+        assert_eq!(applied, 1, "resident chunk's edit applies immediately");
+        assert_eq!(rest.len(), 1, "non-resident chunk's record WAITS, not drops");
+        assert_eq!(rest[0].coord, far);
+        assert_eq!(
+            mgr.block_at(3, 4, 5),
+            crate::world::blocks::BlockId::Stone,
+            "the applied edit is really in the world"
+        );
+        // The chunk streams in; the re-drain applies the remainder.
+        insert_chunk_at(&mgr, far);
+        let (applied2, rest2) = mgr.apply_edit_records(&rest);
+        assert_eq!(applied2, 1);
+        assert!(rest2.is_empty(), "backlog self-clears once the chunk is resident");
+    }
+
+    /// r599: the virtual counter steps exactly when `due` fires — same
+    /// cadence, same phase — so the clone-free path re-meshes on the old
+    /// sweep's schedule.
+    #[test]
+    fn transition_count_matches_due_cadence() {
+        for &stride in &[1u64, 2, 3, 5, 8] {
+            for cx in -3..=3 {
+                let c = ChunkCoord::new(cx, cx * 2, -cx);
+                let mut expect = 0u64;
+                for tick in 1..=64u64 {
+                    if transition_remesh_due(c, tick, stride) {
+                        expect += 1;
+                    }
+                    assert_eq!(
+                        transition_remesh_count(c, tick, stride),
+                        expect,
+                        "coord {c:?} stride {stride} tick {tick}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// r599: a transitioning chunk's EFFECTIVE version advances on the stride
+    /// cadence while the chunk itself is NEVER cloned (same Arc pointer, same
+    /// stored version) — the whole point of the clone-free sweep.
+    #[test]
+    fn transitioning_chunk_gets_virtual_bumps_without_cloning() {
+        let mgr = make_manager();
+        let coord = ChunkCoord::new(0, 0, 0);
+        insert_chunk_at(&mgr, coord);
+        // tick_simulation early-returns without a ticks registry — install an
+        // empty one so the transition clock actually runs in this test.
+        let mut mgr = mgr.with_ticks(std::sync::Arc::new(
+            crate::world::ticks::TickRegistry::new(),
+        ));
+        mgr.test_mark_transitioning(coord);
+        let before = mgr.get_chunk(coord).unwrap();
+        let base = before.version;
+        let v0 = mgr.effective_version(coord, base);
+        // Drive several sim ticks (each advances the transition clock since
+        // the set is non-empty).
+        for _ in 0..8 {
+            mgr.tick_simulation(0.6);
+        }
+        let after = mgr.get_chunk(coord).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&before, &after),
+            "clone-free: the chunk Arc must be UNTOUCHED by the transition clock"
+        );
+        assert_eq!(after.version, base, "stored version untouched");
+        let v1 = mgr.effective_version(coord, after.version);
+        assert!(v1 > v0, "effective version must advance for a transitioning chunk ({v0} -> {v1})");
+        // A non-transitioning neighbour reports its base version verbatim.
+        let other = ChunkCoord::new(1, 0, 0);
+        insert_chunk_at(&mgr, other);
+        let oc = mgr.get_chunk(other).unwrap();
+        assert_eq!(mgr.effective_version(other, oc.version), oc.version);
+    }
 
     #[test]
     fn transition_stride_one_always_remeshes() {

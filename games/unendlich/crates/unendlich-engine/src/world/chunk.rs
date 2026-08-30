@@ -30,6 +30,17 @@ pub struct ChunkCoord {
 impl ChunkCoord {
     pub const fn new(x: i32, y: i32, z: i32) -> Self { Self { x, y, z } }
 
+    /// r601: the debug-overlay SENTINEL coordinate. The F4 debug scene
+    /// uploads its mesh at this out-of-band chunk key every frame; the
+    /// renderer skips frustum culling for it. It is NOT a corrupt value —
+    /// the r596-598 "wild coord" hunt traced every (i32::MIN)³ sighting to
+    /// exactly this constant (previously an inline literal). Eviction and
+    /// the wild-coord watchdogs exempt it by name. (Ambiguity accepted: a
+    /// genuine -inf→i32 saturation would produce the same triple; every
+    /// OTHER wild value — +inf → MAX, mixed axes — still trips the traps.)
+    pub const DEBUG_OVERLAY: ChunkCoord =
+        ChunkCoord { x: i32::MIN, y: i32::MIN, z: i32::MIN };
+
     /// Squared Euclidean distance in chunk-coord space. Useful as a priority
     /// metric when streaming chunks around the player.
     pub fn distance_sq(self, other: ChunkCoord) -> i32 {

@@ -310,6 +310,53 @@ pub fn button_sized(ui: &mut Ui, label: &str, accent: Color32, min_size: Vec2) -
     it.resp
 }
 
+/// Like [`button_sized`], but the given size is a HARD cap: a label too long
+/// for it is elided with `…` until it fits. This is the row-budgeting button —
+/// `geometry` treats a size as a *minimum* and grows with the letterspaced
+/// label, which let long world names push their row's sibling controls
+/// (history / delete) clean off the screen. A row that must share its width
+/// uses this and keeps its promises.
+pub fn button_capped(ui: &mut Ui, label: &str, accent: Color32, size: Vec2) -> Response {
+    let fits = |s: &str| {
+        ui.painter()
+            .layout_no_wrap(label_spaced(s), egui::FontId::proportional(FONT_PX), Color32::WHITE)
+            .size()
+            .x
+            + 34.0
+            <= size.x
+    };
+    let shown: std::borrow::Cow<'_, str> = if fits(label) {
+        std::borrow::Cow::Borrowed(label)
+    } else {
+        // Elision is a layout-measuring loop — cache it per (label, width
+        // bucket) in ctx memory so it runs once, not every frame. (Uncached
+        // it also churns the font atlas with throwaway candidate galleys.)
+        let key = egui::Id::new(("button_capped_elide", label, size.x as i32));
+        if let Some(cached) = ui.ctx().data(|d| d.get_temp::<String>(key)) {
+            std::borrow::Cow::Owned(cached)
+        } else {
+            let mut chars: Vec<char> = label.chars().collect();
+            let done: String = loop {
+                chars.pop();
+                if chars.is_empty() {
+                    break "…".to_string();
+                }
+                let cand: String = chars.iter().collect::<String>() + "…";
+                if fits(&cand) {
+                    break cand;
+                }
+            };
+            ui.ctx().data_mut(|d| d.insert_temp(key, done.clone()));
+            std::borrow::Cow::Owned(done)
+        }
+    };
+    let it = interact(ui, size);
+    let th = current_theme(ui.ctx());
+    let sk = candidate(button_style(), &th, accent);
+    paint(ui, &it, &sk, &shown, accent, &th);
+    it.resp
+}
+
 pub fn button(ui: &mut Ui, label: &str, accent: Color32) -> Response {
     button_sized(ui, label, accent, Vec2::ZERO)
 }

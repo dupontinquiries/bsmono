@@ -350,6 +350,12 @@ pub fn button_sized(ui: &mut Ui, label: &str, accent: Color32, min_size: egui::V
     widget::button_sized(ui, label, accent, min_size)
 }
 
+/// Row-budgeting button: `size` is a HARD cap; long labels elide with `…` —
+/// see [`widget::button_capped`].
+pub fn button_capped(ui: &mut Ui, label: &str, accent: Color32, size: egui::Vec2) -> Response {
+    widget::button_capped(ui, label, accent, size)
+}
+
 /// The "elegant" button (cursor-tied dither infill) — see [`widget::elegant_button`].
 pub fn elegant_button(ui: &mut Ui, label: &str) -> Response {
     widget::elegant_button(ui, label)

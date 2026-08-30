@@ -60,6 +60,17 @@ pub fn frame(root: &mut Ui, state: &mut AppState) {
     // This is the way into the palette on a touch screen: Ctrl+P is
     // unreachable there, which made every command in it desktop-only by
     // accident rather than by decision.
+    // THE MULTIPASS MENU. A keymap you cannot see is not a keymap, so
+    // the blocks and their keys are drawn above the status bar whenever
+    // there are any — no toggle, because the menu only exists for as long
+    // as an unaccepted reply does, and it disappears on ESC or on any
+    // choice.
+    if !state.menu.is_empty() || !state.menu_prose.is_empty() {
+        egui::Panel::bottom("aperture_completion_menu").show_inside(root, |ui| {
+            completion_menu(ui, state, &colors);
+        });
+    }
+
     if state.cmd_strip.visible {
         egui::Panel::bottom("aperture_cmd_strip").show_inside(root, |ui| {
             cmd_strip_bar(ui, state, &colors, now_ms);
@@ -749,6 +760,59 @@ fn mark_span(rail: Rect, line0: usize, line1: usize, total_lines: usize) -> (f32
 /// the first recent instead, because on a strip whose whole point is the
 /// last thing you used, a tap that opened a menu would put a step in
 /// front of the common case.
+/// Draw the blocks a reply produced, each with the key that takes it.
+///
+/// PROSE FIRST, as a comment. The model's explanation is often the most
+/// useful part of a reply and the part that must never be compiled;
+/// showing it here is what lets the code blocks stay code.
+fn completion_menu(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors) {
+    use aperture_complete::multipass::Kind;
+    for p in &state.menu_prose {
+        // Rendered as a comment, visually: it is the model talking, and
+        // it should look like the thing it is rather than like an option.
+        let first = p.lines().next().unwrap_or("").trim();
+        ui.label(
+            egui::RichText::new(format!("// {first}"))
+                .color(colors.text_weak)
+                .small()
+                .italics(),
+        );
+    }
+    ui.horizontal_wrapped(|ui| {
+        for b in &state.menu {
+            match b.key {
+                Some(k) => {
+                    // The key first and in strong type: it is what the
+                    // hand needs, and the hint is what the eye reads.
+                    ui.label(egui::RichText::new(format!("[{k}]")).strong().color(colors.accent));
+                    ui.label(egui::RichText::new(&b.hint).color(colors.text).small());
+                }
+                None => {
+                    // No key: an elision, a stub, or past the eighth
+                    // block. Shown greyed WITH its reason rather than
+                    // hidden, so "why is that not offered" has an answer
+                    // on screen instead of looking like a dropped
+                    // suggestion.
+                    let why = match b.kind {
+                        Kind::Elision => "would delete code",
+                        Kind::Stub => "stub",
+                        Kind::Prose => "prose",
+                        Kind::Code => "no key left",
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("{} ({why})", b.hint))
+                            .color(colors.text_weak)
+                            .small()
+                            .strikethrough(),
+                    );
+                }
+            }
+            ui.separator();
+        }
+        ui.label(egui::RichText::new("esc to type").color(colors.text_weak).small());
+    });
+}
+
 fn cmd_strip_bar(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, now_ms: u64) {
     use uikit_egui::cmdstrip::Release;
     let dt = ui.input(|i| i.stable_dt);

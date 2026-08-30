@@ -2144,3 +2144,59 @@ missing.
   not — the file is `egui_lib.rs` — so the guard protected nothing and I
   reverted it. An unused guard is a thing the next reader has to rule
   out, which is a real cost for a line that never fires.
+
+## 36. Multipass autocomplete: one reply is several candidates
+
+Operator report from build 80: completions "rely on manual cleanup
+afterward". The pasted example shows why, and it is not model quality.
+One reply contained four different kinds of thing at once:
+
+  - real code (`if state.show_loop_pane { ... }`)
+  - a HALLUCINATED construct (`egui::Panel { title = "Frame"; }` — not
+    egui's API)
+  - an ELISION (`// ... rest of the code remains the same`)
+  - a STUB (`fn main() { ... }`)
+  - PROSE ("The provided code snippet appears to be...")
+
+Single-pass insertion pastes all of it. The elision is the dangerous
+one: it LOOKS like a comment, so a naive filter keeps it, and accepting
+it into a real file replaces working code with a note saying the code
+used to be there.
+
+`aperture_complete::multipass` is the fix, as four pure passes:
+split_fences, blocks, classify, assign_keys. Nothing talks to a model or
+an editor, so the awkward cases are testable — and the awkward cases are
+the point, since a well-formed reply was never the problem.
+
+Wired: `Ghost::on_outcome` runs `plan` and shows the FIRST insertable
+block, so Tab still means "take the obvious one" and the common case is
+unchanged. The rest go to `AppState::menu` on home-row keys (f j d k s l
+a ;), drawn above the status bar. ESC clears the menu and returns to
+typing.
+
+Decisions worth keeping:
+  - Only INSERTABLE blocks get keys, so there is no keystroke that can
+    accept an elision. Enforced at assignment rather than re-checked at
+    the accept site — two places deciding one safety rule is how they
+    drift.
+  - Unkeyed blocks are shown greyed WITH their reason ("would delete
+    code", "stub") rather than hidden, so "why is that not offered" has
+    an answer on screen.
+  - The menu claims home-row keys only WHILE IT IS UP, and
+    `accept_menu_key` returns false for an unbound key so the letter
+    still reaches the buffer. The menu never swallows a keystroke it has
+    no use for.
+  - Prose is kept and rendered as a comment. It is often the most useful
+    part of a reply and must never be compiled.
+  - No mode flag: an empty menu IS the no-menu state. A flag and a menu
+    that can disagree is how a UI gets stuck in a mode with nothing in
+    it.
+
+- **C12-36a — NOT COMPILED.** Written under an explicit "don't compile,
+  I need to iterate" instruction. The multipass module is pure and its
+  tests are written; the wiring (ghost signature change, two call sites,
+  state fields, key routing, the panel) has not been built once.
+- **C12-36b — the ghost still shows one block.** A person cannot see the
+  alternatives until they look at the menu. Showing the chosen block
+  inline and the others below is right for now; whether the ghost should
+  cycle with the keys is a real question and not obviously yes.

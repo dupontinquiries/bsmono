@@ -105,6 +105,13 @@ pub struct VulkanChunkGenerator {
     _entry: Entry,
 
     batch_size: u32,
+
+    // r611: the baked biome-def registry table (binding 1). Write-once at
+    // init; lets the shader run the SAME best_fit argmin the CPU runs, so
+    // surface/subsurface picks come from the same data (closes the r609
+    // arena-leak parity gap from the GPU side, warts preserved).
+    defs_buffer: vk::Buffer,
+    defs_memory: vk::DeviceMemory,
 }
 
 // SAFETY: `block_ptr` is a persistent map into HOST_VISIBLE+HOST_COHERENT
@@ -151,9 +158,27 @@ impl VulkanChunkGenerator {
             device.map_memory(block_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *mut u8
         };
 
+        // r611: bake the biome-def registry into the shader's table.
+        // Loaded here the same way TerrainGenerator loads it (a second
+        // read of the same read-only json tree; keeping new()'s signature
+        // stable was worth the duplicate load). On any failure the table
+        // bakes EMPTY (count 0) and the shader falls back to its legacy
+        // mirrors — exactly what the CPU does without a registry.
+        let baked = bake_biome_def_table(
+            crate::world::biome_loader::BiomeRegistry::load_standard().ok().as_ref(),
+        );
+        let (defs_buffer, defs_memory) =
+            create_storage_buffer(&instance, &device, physical_device, baked.len() as u64)?;
+        unsafe {
+            let ptr = device.map_memory(defs_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
+                as *mut u8;
+            std::ptr::copy_nonoverlapping(baked.as_ptr(), ptr, baked.len());
+            device.unmap_memory(defs_memory);
+        }
+
         let (descriptor_pool, descriptor_set) =
             allocate_descriptor_set(&device, descriptor_set_layout)?;
-        update_descriptor_set(&device, descriptor_set, block_buffer);
+        update_descriptor_set(&device, descriptor_set, block_buffer, defs_buffer);
 
         let command_buffer = unsafe {
             device.allocate_command_buffers(
@@ -179,12 +204,39 @@ impl VulkanChunkGenerator {
             _instance: instance,
             _entry: entry,
             batch_size,
+            defs_buffer,
+            defs_memory,
         })
     }
 
     pub fn batch_size(&self) -> u32 { self.batch_size }
 
     pub fn generate_batch(&self, coords: &[ChunkCoord], seed: u32) -> Result<Vec<GpuGeneratedChunk>> {
+        self.generate_batch_inner(coords, seed, 0)
+    }
+
+    /// r617: DECISION-EXPORT mode — dispatch with pc.debug_mode = 1, which
+    /// makes the shader write each interior column's tree-decision
+    /// internals (r613-form biome, effective_density, pos_hash,
+    /// surface_target) into the chunk slot's first words instead of
+    /// terrain. Returns the raw words for the FIRST coord's slot. The
+    /// instrument that ends the tree-mass theorizing: whatever disagrees
+    /// with the CPU per-column first IS the bug.
+    pub fn export_decisions(&self, coord: ChunkCoord, seed: u32) -> Result<Vec<u32>> {
+        let raw = self.generate_batch_inner(&[coord], seed, 1)?;
+        // blocks come back unpacked to BlockId — we need raw words, so
+        // re-read from the mapped buffer directly instead.
+        drop(raw);
+        let words = 4usize * 32 * 32;
+        let mut out = vec![0u32; words];
+        unsafe {
+            let src = self.block_ptr as *const u32;
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), words);
+        }
+        Ok(out)
+    }
+
+    fn generate_batch_inner(&self, coords: &[ChunkCoord], seed: u32, debug_mode: u32) -> Result<Vec<GpuGeneratedChunk>> {
         if coords.is_empty() { return Ok(Vec::new()); }
         if coords.len() > self.batch_size as usize {
             return Err(GpuGenError::Other(format!(
@@ -241,7 +293,7 @@ impl VulkanChunkGenerator {
                     chunk_x: c.x, chunk_y: c.y, chunk_z: c.z,
                     seed,
                     chunk_index: slot as u32,
-                    _pad: 0,
+                    _pad: debug_mode, // r617: 1 = decision-export
                 };
                 let bytes = std::slice::from_raw_parts(
                     &pc as *const _ as *const u8,
@@ -328,6 +380,9 @@ impl Drop for VulkanChunkGenerator {
             self.device.destroy_buffer(self.block_buffer, None);
             self.device.free_memory(self.block_memory, None);
 
+            self.device.destroy_buffer(self.defs_buffer, None);
+            self.device.free_memory(self.defs_memory, None);
+
             self.device.destroy_descriptor_pool(self.descriptor_pool, None);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_pipeline_layout(self.pipeline_layout, None);
@@ -348,8 +403,28 @@ fn create_instance(entry: &Entry) -> Result<Instance> {
         .engine_name(unsafe { CStr::from_bytes_with_nul_unchecked(b"Meinkraft\0") })
         .engine_version(vk::make_api_version(0, 0, 2, 0))
         .api_version(vk::make_api_version(0, 1, 2, 0));
-    let info = vk::InstanceCreateInfo::builder().application_info(&app_info);
-    Ok(unsafe { entry.create_instance(&info, None)? })
+    // v0.24.112 (re-landed): macOS/MoltenVK — this HEADLESS compute context
+    // builds its own VkInstance, and without portability enumeration the
+    // loader refuses to expose the Metal device (ERROR_INCOMPATIBLE_DRIVER →
+    // the silent "GPU unavailable … Using CPU" fallback on Mac). Same proven
+    // treatment as render/context.rs; Linux is byte-for-byte unchanged.
+    #[cfg(target_os = "macos")]
+    {
+        let exts = [
+            vk::KhrPortabilityEnumerationFn::name().as_ptr(),
+            vk::KhrGetPhysicalDeviceProperties2Fn::name().as_ptr(),
+        ];
+        let info = vk::InstanceCreateInfo::builder()
+            .application_info(&app_info)
+            .enabled_extension_names(&exts)
+            .flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR);
+        return Ok(unsafe { entry.create_instance(&info, None)? });
+    }
+    #[allow(unreachable_code)]
+    {
+        let info = vk::InstanceCreateInfo::builder().application_info(&app_info);
+        Ok(unsafe { entry.create_instance(&info, None)? })
+    }
 }
 
 fn pick_physical_device(instance: &Instance) -> Result<vk::PhysicalDevice> {
@@ -383,6 +458,27 @@ fn find_compute_queue_family(instance: &Instance, dev: vk::PhysicalDevice) -> Re
 }
 
 fn create_device(instance: &Instance, dev: vk::PhysicalDevice, queue_family: u32) -> Result<Device> {
+    // v0.24.112 (re-landed): MoltenVK advertises VK_KHR_portability_subset and
+    // the spec REQUIRES enabling it when present. FP32-only compute, no
+    // swapchain, no gated features — the extension alone suffices here.
+    #[cfg(target_os = "macos")]
+    let mac_portability: Vec<*const std::os::raw::c_char> = {
+        let has = unsafe { instance.enumerate_device_extension_properties(dev) }
+            .map(|exts| {
+                exts.iter().any(|e| {
+                    unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) }
+                        .to_bytes()
+                        == b"VK_KHR_portability_subset"
+                })
+            })
+            .unwrap_or(false);
+        if has {
+            vec![b"VK_KHR_portability_subset\0".as_ptr() as *const std::os::raw::c_char]
+        } else {
+            Vec::new()
+        }
+    };
+
     let priorities = [1.0f32];
     let queue_info = vk::DeviceQueueCreateInfo::builder()
         .queue_family_index(queue_family)
@@ -398,18 +494,30 @@ fn create_device(instance: &Instance, dev: vk::PhysicalDevice, queue_family: u32
     let info = vk::DeviceCreateInfo::builder()
         .queue_create_infos(std::slice::from_ref(&queue_info))
         .enabled_features(&features);
+    #[cfg(target_os = "macos")]
+    let info = if mac_portability.is_empty() { info } else { info.enabled_extension_names(&mac_portability) };
+
 
     Ok(unsafe { instance.create_device(dev, &info, None)? })
 }
 
 fn create_descriptor_set_layout(device: &Device) -> Result<vk::DescriptorSetLayout> {
-    // Only one binding now: the block buffer.
-    let bindings = [vk::DescriptorSetLayoutBinding::builder()
-        .binding(0)
-        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-        .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::COMPUTE)
-        .build()];
+    // Binding 0: the block buffer. Binding 1 (r611): the baked biome-def
+    // registry table.
+    let bindings = [
+        vk::DescriptorSetLayoutBinding::builder()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .build(),
+        vk::DescriptorSetLayoutBinding::builder()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .build(),
+    ];
 
     let info = vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings);
     Ok(unsafe { device.create_descriptor_set_layout(&info, None)? })
@@ -465,7 +573,7 @@ fn allocate_descriptor_set(device: &Device, layout: vk::DescriptorSetLayout)
 {
     let sizes = [vk::DescriptorPoolSize {
         ty: vk::DescriptorType::STORAGE_BUFFER,
-        descriptor_count: 1,
+        descriptor_count: 2, // r611: block buffer + biome-def table
     }];
     let pool_info = vk::DescriptorPoolCreateInfo::builder()
         .pool_sizes(&sizes)
@@ -478,20 +586,92 @@ fn allocate_descriptor_set(device: &Device, layout: vk::DescriptorSetLayout)
     Ok((pool, sets[0]))
 }
 
-fn update_descriptor_set(device: &Device, set: vk::DescriptorSet, block_buf: vk::Buffer) {
-    let info = vk::DescriptorBufferInfo::builder()
+fn update_descriptor_set(
+    device: &Device,
+    set: vk::DescriptorSet,
+    block_buf: vk::Buffer,
+    defs_buf: vk::Buffer,
+) {
+    let block_info = vk::DescriptorBufferInfo::builder()
         .buffer(block_buf)
         .range(vk::WHOLE_SIZE)
         .build();
-
-    let write = vk::WriteDescriptorSet::builder()
-        .dst_set(set)
-        .dst_binding(0)
-        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-        .buffer_info(std::slice::from_ref(&info))
+    let defs_info = vk::DescriptorBufferInfo::builder()
+        .buffer(defs_buf)
+        .range(vk::WHOLE_SIZE)
         .build();
 
-    unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]); }
+    let writes = [
+        vk::WriteDescriptorSet::builder()
+            .dst_set(set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&block_info))
+            .build(),
+        vk::WriteDescriptorSet::builder()
+            .dst_set(set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&defs_info))
+            .build(),
+    ];
+
+    unsafe { device.update_descriptor_sets(&writes, &[]); }
+}
+
+/// r611: bake the biome-def registry into the shader's table layout:
+/// `{ uint count; uint pad[3]; vec4 climate[64]; uvec4 blocks[64] }`.
+/// climate[i] = (t, h, themed_penalty_sq, 0) with (t, h) = climate_coord()
+/// exactly as best_fit uses them; blocks[i] = (surface, subsurface, 0, 0)
+/// with u32::MAX as the "def declares nothing — use legacy" sentinel.
+/// Registry absent or over-capacity tail → count clamped; empty registry →
+/// count 0 (shader falls back to legacy mirrors everywhere, matching the
+/// CPU's no-registry path).
+fn bake_biome_def_table(reg: Option<&crate::world::biome_loader::BiomeRegistry>) -> Vec<u8> {
+    const MAX_DEFS: usize = 64;
+    let mut out = Vec::with_capacity(16 + MAX_DEFS * 16 * 2);
+    let defs = reg.map(|r| r.defs()).unwrap_or(&[]);
+    let count = defs.len().min(MAX_DEFS) as u32;
+    if defs.len() > MAX_DEFS {
+        log::warn!(
+            "biome-def table: {} defs exceed shader capacity {MAX_DEFS}; tail ignored",
+            defs.len()
+        );
+    }
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&[0u8; 12]); // pad to 16
+    const SENTINEL: u32 = u32::MAX;
+    let mut climate = Vec::with_capacity(MAX_DEFS * 16);
+    let mut blocks = Vec::with_capacity(MAX_DEFS * 16);
+    for i in 0..MAX_DEFS {
+        if i < count as usize {
+            let d = &defs[i];
+            let (t, h) = d.climate_coord();
+            let pen_sq: f32 = if d.legacy_enum.is_none() { 0.10f32 * 0.10 } else { 0.0 };
+            climate.extend_from_slice(&(t as f32).to_le_bytes());
+            climate.extend_from_slice(&(h as f32).to_le_bytes());
+            climate.extend_from_slice(&pen_sq.to_le_bytes());
+            climate.extend_from_slice(&0f32.to_le_bytes());
+            let sb = d.resolve_surface_block().map(|b| b as u32).unwrap_or(SENTINEL);
+            let ub = d.resolve_subsurface_block().map(|b| b as u32).unwrap_or(SENTINEL);
+            // r613: the def's legacy Biome id, for the shader's mirror of
+            // biome_at_3d's "registry owns the land biomes" step.
+            // to_legacy() is TOTAL (Plains for unmapped/themed), exactly
+            // like the CPU's own use of it — no sentinel needed.
+            let lb = d.to_legacy() as u32;
+            blocks.extend_from_slice(&sb.to_le_bytes());
+            blocks.extend_from_slice(&ub.to_le_bytes());
+            blocks.extend_from_slice(&lb.to_le_bytes());
+            blocks.extend_from_slice(&0u32.to_le_bytes());
+        } else {
+            climate.extend_from_slice(&[0u8; 16]);
+            blocks.extend_from_slice(&[0xFFu8; 8]);
+            blocks.extend_from_slice(&[0u8; 8]);
+        }
+    }
+    out.extend_from_slice(&climate);
+    out.extend_from_slice(&blocks);
+    out
 }
 
 pub(crate) fn create_storage_buffer(

@@ -38,11 +38,50 @@ impl Ghost {
     /// Feed an engine outcome. Accepts only a success matching the buffer
     /// version we're *now* at; everything else quietly returns to Idle (an
     /// error message is the caller's to log — the loop pane does).
-    pub fn on_outcome(&mut self, generation: u64, current_version: u64, result: &Result<String, String>) {
+    /// Returns the multipass MENU when one was produced: the blocks
+    /// beyond the first, plus the model's prose. The caller stores them;
+    /// the ghost stays a single string so every existing site — accept,
+    /// accept-word, dismiss, the tests — keeps working unchanged.
+    ///
+    /// Returning rather than storing is deliberate. `Ghost` is a small
+    /// value type that several paths pattern-match on, and widening its
+    /// `Shown` variant to carry a menu would touch ten call sites to
+    /// deliver something only one of them wants.
+    pub fn on_outcome(
+        &mut self,
+        generation: u64,
+        current_version: u64,
+        result: &Result<String, String>,
+    ) -> Option<(Vec<aperture_complete::multipass::Block>, Vec<String>)> {
         let expected = matches!(*self, Ghost::Pending { generation: g } if g == generation);
         match result {
             Ok(text) if expected && generation == current_version && !text.is_empty() => {
-                *self = Ghost::Shown { text: text.clone() };
+                // MULTIPASS, rather than showing the reply verbatim.
+                //
+                // A raw reply mixes several kinds of thing: real code,
+                // hallucinated constructs, an elision like "// ... rest
+                // of the code remains the same" that DELETES a function
+                // if accepted, a `fn main() { ... }` stub, and prose
+                // explaining the code to someone already looking at it.
+                // Inserting all of that costs more than typing it, which
+                // is what "relies on manual cleanup afterward" meant.
+                //
+                // `plan` splits it into keyed blocks and separates the
+                // prose. The FIRST insertable block becomes the ghost, so
+                // Tab still means "take the obvious one" and nothing has
+                // to change for the common case; the rest are offered on
+                // home-row keys.
+                let (blocks, prose) = aperture_complete::multipass::plan(text);
+                match blocks.iter().find(|b| b.kind.insertable()) {
+                    Some(first) => {
+                        *self = Ghost::Shown { text: first.text.clone() };
+                    }
+                    // Every block was an elision, a stub, or prose. There
+                    // is nothing safe to insert, and showing the raw text
+                    // anyway is exactly the behaviour being fixed.
+                    None => *self = Ghost::Idle,
+                }
+                return Some((blocks, prose));
             }
             _ => {
                 if expected {
@@ -50,6 +89,7 @@ impl Ghost {
                 }
             }
         }
+        None
     }
 
     /// The user typed `typed`. Returns true when the ghost consumed it

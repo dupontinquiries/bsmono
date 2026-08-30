@@ -18,6 +18,9 @@
 #[cfg(feature = "egui")]
 pub mod menu_view;
 
+#[cfg(feature = "egui")]
+pub mod live_menu;
+
 pub mod multiplayer_svc;
 
 use crate::sim::affinity_access::Fields;
@@ -302,6 +305,14 @@ impl App {
         matches!(self.menu.world_ready(), AppEvent::BeginPlay)
     }
 
+    /// r603: a launch that bypassed the title menu (LAN join adopting the
+    /// host's world). Moves MainMenu → Loading so the follow-up
+    /// `enter_game()` completes Loading → InGame exactly like the create
+    /// path. Idempotent elsewhere.
+    pub fn begin_external_launch(&mut self) {
+        let _ = self.menu.begin_external_load();
+    }
+
     /// Tick the gameplay services that the CURRENT PHASE whitelists. In `Menu` and
     /// `Paused` the gameplay layer is blacklisted — services are frozen and this
     /// returns an empty frame (this is the "the menu blacklists gameplay" idea,
@@ -381,6 +392,104 @@ mod tests {
         assert_eq!(app.screen(), Screen::NewGame);
         assert_eq!(app.tick(AppInput::Back, 0), AppStep::Menu);
         assert_eq!(app.screen(), Screen::Title);
+    }
+
+    // ── "double world" regression net ─────────────────────────────────────
+    // The bin instrumented rebuild_for_seed with a call counter to settle
+    // whether Create World can fire twice for one click (the on-device
+    // question). These tests model the SHELL PROTOCOL headlessly — the
+    // one-frame panel lag + the r186 create-spree that keeps injecting
+    // wizard actions until the wizard closes — and pin the invariant the
+    // world's memory depends on: one click, one Launch.
+
+    /// Model of the bin's spree loop: panel state reflects the app AFTER the
+    /// previous tick (one frame late, like the real renderer), and the spree
+    /// injects Next/Confirm while the panel still shows the wizard. Returns
+    /// how many Launches were emitted over `frames`.
+    fn run_create_spree(app: &mut App, frames: u32) -> u32 {
+        let mut launches = 0u32;
+        let mut spree: u8 = 6; // r186 arms 6
+        // Panel mirror, one frame stale (what the renderer showed last frame).
+        let mut panel_wizard_open = app.screen() == Screen::NewGame;
+        let mut panel_at_confirm =
+            app.menu().wizard().map(|w| w.at_confirm()).unwrap_or(false);
+        for _ in 0..frames {
+            let input = if spree > 0 {
+                if !panel_wizard_open {
+                    spree = 0;
+                    AppInput::None
+                } else {
+                    spree -= 1;
+                    if panel_at_confirm { AppInput::Confirm } else { AppInput::WizardNext }
+                }
+            } else {
+                AppInput::None
+            };
+            if matches!(app.tick(input, 0x5EED), AppStep::Launch(_)) {
+                launches += 1;
+            }
+            // Panel refresh AFTER the tick (the bin's reflect step).
+            panel_wizard_open = app.screen() == Screen::NewGame;
+            panel_at_confirm = app.menu().wizard().map(|w| w.at_confirm()).unwrap_or(false);
+        }
+        launches
+    }
+
+    #[test]
+    fn one_click_create_launches_exactly_once_despite_the_spree() {
+        let mut app = App::with_defaults();
+        app.tick(AppInput::Select(MenuId::NewGame), 0);
+        app.tick(AppInput::WizardSetName("Once".into()), 0);
+        let launches = run_create_spree(&mut app, 12);
+        assert_eq!(
+            launches, 1,
+            "the spree + one-frame panel lag must produce exactly one Launch \
+             (2+ = the double-world; 0 = a dead Create button)"
+        );
+    }
+
+    #[test]
+    fn spree_with_stale_panel_cannot_relaunch_after_the_wizard_closed() {
+        // Worst-case shell: pretend the panel NEVER noticed the wizard closed
+        // and keeps firing Confirm. The core must stay launched-once — the
+        // wizard is consumed by the first launch, so later Confirms are inert.
+        let mut app = App::with_defaults();
+        app.tick(AppInput::Select(MenuId::NewGame), 0);
+        app.tick(AppInput::WizardSetName("Stale".into()), 0);
+        for _ in 0..3 {
+            app.tick(AppInput::WizardNext, 0);
+        }
+        let mut launches = 0;
+        for _ in 0..6 {
+            if matches!(app.tick(AppInput::Confirm, 7), AppStep::Launch(_)) {
+                launches += 1;
+            }
+        }
+        assert_eq!(launches, 1, "repeated Confirm must be inert after the launch");
+    }
+
+    #[test]
+    fn a_random_seed_is_committed_at_launch_not_rerolled_per_confirm() {
+        // The double-world's nastier sibling: if two Launches CAN happen, a
+        // Random seed would roll differently each time (entropy differs per
+        // frame) and the two rebuilds would be two DIFFERENT worlds. Pin the
+        // seed at the single launch and prove a second create is a fresh,
+        // deliberate world — not an echo.
+        let mut app = App::with_defaults();
+        app.tick(AppInput::Select(MenuId::NewGame), 0);
+        app.tick(AppInput::WizardSetName("A".into()), 0);
+        for _ in 0..3 {
+            app.tick(AppInput::WizardNext, 0);
+        }
+        let first = match app.tick(AppInput::Confirm, 111) {
+            AppStep::Launch(LaunchPlan::StartLocal(init)) => init.seed,
+            other => panic!("expected launch, got {other:?}"),
+        };
+        assert_eq!(first, 111, "Random commits the entropy passed at the launch tick");
+        // Echo Confirms with different entropy must not mint a second world.
+        for e in [222u64, 333] {
+            assert_eq!(app.tick(AppInput::Confirm, e), AppStep::Menu);
+        }
     }
 
     #[test]

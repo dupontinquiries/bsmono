@@ -387,6 +387,14 @@ pub struct AppState {
     /// hold gesture that opens the palette without a keyboard. Off until
     /// asked for — see `uikit_egui::cmdstrip`.
     pub cmd_strip: uikit_egui::cmdstrip::Strip,
+    /// The multipass menu for the current reply: blocks beyond the ghost,
+    /// each bound to a home-row key, plus the model's prose.
+    ///
+    /// Empty means "no menu showing", which is also the state ESC returns
+    /// to. No separate mode flag: a flag and a menu that can disagree is
+    /// how a UI gets stuck in a mode with nothing in it.
+    pub menu: Vec<aperture_complete::multipass::Block>,
+    pub menu_prose: Vec<String>,
     /// Hold detection for the strip's palette button.
     pub cmd_hold: uikit_egui::cmdstrip::Hold,
     /// The last yank, for `p`. Editor-local rather than the system
@@ -412,6 +420,39 @@ pub struct AppState {
     pub palette: Option<crate::palette_ui::PaletteState>,
     pub theme_id: snapclone_theme::PaletteId,
     pub status: Option<(String, u64)>, // message, expires_at_ms
+}
+
+/// The strip as it starts: empty recents, a few pinned quick actions.
+///
+/// Pinned rather than left blank, because the first time someone turns
+/// the strip on there ARE no recents — an empty bar beside a palette
+/// button teaches that the feature does nothing, and they turn it back
+/// off before it can learn anything.
+///
+/// Chosen for TOUCH specifically, which is what the strip is for. Save
+/// and Find are the two things hardest to reach without a keyboard
+/// (Ctrl+S, Ctrl+Shift+F), and "Complete now" is the one command a
+/// person on a phone wants a button for rather than a debounce wait.
+/// Everything else stays discoverable through the palette, which the
+/// hold gesture reaches.
+///
+/// These fall off the visible strip as recents fill it, by design:
+/// `Strip::entries` puts recents first, so the bar converges on what
+/// this person actually uses and the defaults are only a starting
+/// posture.
+fn default_cmd_strip() -> uikit_egui::cmdstrip::Strip {
+    use uikit_egui::cmdstrip::{Cmd, Strip};
+    let mut s = Strip::new(5);
+    for label in [
+        "File: Save",
+        "Find: In Project… (Ctrl+Shift+F)",
+        "AI: Complete now",
+    ] {
+        // id == label: the palette has no separate command id, and
+        // `run_strip_command` matches on the label for the same reason.
+        s.pin(Cmd::new(label, label));
+    }
+    s
 }
 
 impl AppState {
@@ -489,7 +530,9 @@ impl AppState {
             prefix_cache: aperture_complete::prefixcache::PrefixCache::new(256),
             scope: aperture_complete::scope::Scope::default(),
             helix: aperture_core::helix::Mode::Normal,
-            cmd_strip: uikit_egui::cmdstrip::Strip::new(5),
+            cmd_strip: default_cmd_strip(),
+            menu: Vec::new(),
+            menu_prose: Vec::new(),
             cmd_hold: uikit_egui::cmdstrip::Hold::new(),
             yank: String::new(),
             line_scope_lines: aperture_complete::scope::DEFAULT_LINE_COUNT,
@@ -1506,6 +1549,15 @@ impl AppState {
                     _ => None,
                 };
                 match one {
+                    // THE MENU CLAIMS HOME-ROW KEYS WHILE IT IS UP, and
+                    // only while it is up. That is the whole bargain: a
+                    // letter builds a block when there is something to
+                    // build, and types a letter the rest of the time.
+                    // `accept_menu_key` returns false when nothing is
+                    // bound to that key, so an unbound letter still
+                    // reaches the buffer — the menu never swallows a
+                    // keystroke it has no use for.
+                    Some(c) if !self.menu.is_empty() && self.accept_menu_key(c, now_ms) => {}
                     Some(c) if self.helix_key(c, c.is_uppercase(), now_ms) => {}
                     _ => self.type_text(&t, now_ms),
                 }
@@ -1719,6 +1771,11 @@ impl AppState {
                 self.after_edit(now_ms);
             }
             (Escape, _) => {
+                // ESC IS ALWAYS THE WAY BACK TO TYPING. Clearing the menu
+                // first so one press does the obvious thing: the menu is
+                // the loudest thing on screen when it is up, so it is
+                // what a person means by "get out of this".
+                self.dismiss_menu();
                 self.ghost.dismiss();
                 self.debounce.cancel();
                 // Escape is the way BACK to Normal, which is what makes
@@ -1928,6 +1985,59 @@ impl AppState {
         crate::palette_ui::apply(cmd, self, now_ms);
     }
 
+    /// Store the menu a reply produced.
+    ///
+    /// The first insertable block is already the ghost, so it is dropped
+    /// here — offering it twice, once on Tab and once on a letter, would
+    /// make one suggestion look like two.
+    pub fn set_completion_menu(
+        &mut self,
+        blocks: Vec<aperture_complete::multipass::Block>,
+        prose: Vec<String>,
+    ) {
+        let mut took_ghost = false;
+        self.menu = blocks
+            .into_iter()
+            .filter(|b| {
+                if b.kind.insertable() && !took_ghost {
+                    took_ghost = true;
+                    return false;
+                }
+                true
+            })
+            .collect();
+        self.menu_prose = prose;
+    }
+
+    /// Accept the block bound to `key`.
+    ///
+    /// Returns true when something was inserted, so the caller knows the
+    /// keystroke was CONSUMED and must not also reach the buffer — the
+    /// same ordering that caused the Tab fight.
+    ///
+    /// Only insertable blocks carry keys (`multipass::assign_keys`), so
+    /// there is no path here that can insert an elision. Enforced by the
+    /// assignment rather than re-checked here: two places deciding one
+    /// safety rule is how they drift apart.
+    pub fn accept_menu_key(&mut self, key: char, now_ms: u64) -> bool {
+        let Some(block) = self.menu.iter().find(|b| b.key == Some(key)).cloned() else {
+            return false;
+        };
+        self.editor.insert_text(&block.text, now_ms);
+        self.after_edit(now_ms);
+        // Spent: the blocks were alternatives to each other, and leaving
+        // them offered invites building a function from two mutually
+        // exclusive halves.
+        self.dismiss_menu();
+        true
+    }
+
+    /// ESC: back to typing, nothing inserted.
+    pub fn dismiss_menu(&mut self) {
+        self.menu.clear();
+        self.menu_prose.clear();
+    }
+
     pub fn trigger_completion_now(&mut self, _now_ms: u64) {
         let ctx = self.fim_context();
         let Some(engine) = &self.engine else { return };
@@ -2031,7 +2141,11 @@ impl AppState {
                 // — a cached suggestion must not bypass the staleness
                 // rules a fresh one obeys.
                 self.ghost.request_sent(req.generation);
-                self.ghost.on_outcome(req.generation, self.editor.version, &Ok(text));
+                if let Some((menu, prose)) = self.ghost.on_outcome(
+                    req.generation, self.editor.version, &Ok(text))
+                {
+                    self.set_completion_menu(menu, prose);
+                }
                 let (h, m) = self.prefix_cache.stats();
                 self.status = Some((format!("completion from cache ({h} hit / {m} miss)"), 1_200));
                 return;
@@ -2061,7 +2175,11 @@ impl AppState {
         // Ghost text updates on EVERY outcome, partial or final — that's
         // the whole point of streaming: the text grows on screen as it
         // arrives, not just once at the end.
-        self.ghost.on_outcome(out.generation, self.editor.version, &out.result);
+        if let Some((menu, prose)) =
+            self.ghost.on_outcome(out.generation, self.editor.version, &out.result)
+        {
+            self.set_completion_menu(menu, prose);
+        }
         // FILE THE ANSWER. Keyed on the prefix the request was actually
         // built from (captured at dispatch), not on the buffer as it looks
         // now — by the time an answer lands the caret has often moved, and
@@ -3197,4 +3315,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+}
+
+#[cfg(test)]
+mod strip_defaults_tests {
+    #[test]
+    fn every_pinned_default_names_a_real_command() {
+        // A pinned label that does not match a command is a DEAD BUTTON:
+        // it draws, it is tappable, and `run_strip_command` reports "no
+        // longer available". Three of those on a fresh strip would be a
+        // worse first impression than the empty bar the pins exist to
+        // avoid, so the labels are checked against the palette rather
+        // than trusted to stay in sync by hand.
+        let known: Vec<String> = crate::palette_ui::command_list()
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect();
+        let strip = super::default_cmd_strip();
+        let pinned: Vec<&str> = strip.entries().iter().map(|c| c.id.as_str()).collect();
+        assert!(!pinned.is_empty(), "a fresh strip must not be empty");
+        for id in pinned {
+            assert!(known.iter().any(|k| k == id),
+                    "pinned {id:?} is not a palette command — a dead button");
+        }
+    }
 }

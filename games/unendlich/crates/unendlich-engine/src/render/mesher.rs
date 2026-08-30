@@ -2279,7 +2279,7 @@ fn mesh_chunk_greedy_undecorated(chunk: &Chunk, sky: Option<&crate::sky::Sky>) -
                         let block_wz = origin_z + v;
                         let weathering = weathering_at_world(inner, block_wx, block_wy, block_wz);
                         if weathering > 0.05 {
-                            emit_subdivided_top(&mut mesh, slice, u, v, inner, [origin_x, origin_y, origin_z], sky, chunk, world_model);
+                            emit_subdivided_top(&mut mesh, slice, u, v, inner, [origin_x, origin_y, origin_z], sky, chunk, world_model, weathering);
                         } else {
                             emit_jittered_top(&mut mesh, slice, u, v, inner, [origin_x, origin_y, origin_z], sky, chunk, world_model);
                         }

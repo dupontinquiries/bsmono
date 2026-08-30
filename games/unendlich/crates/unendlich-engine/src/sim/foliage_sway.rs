@@ -385,3 +385,59 @@ mod tests {
         assert_ne!(plant_tip, [0.0, 0.0, 0.0]);
     }
 }
+
+
+/// r-disturbers: pick the (at most `out_max`) NEAREST disturber candidates to
+/// `center`, within `max_dist` — the per-frame selection that feeds the
+/// chunk.vert disturber array (8 UBO slots; the world can hold hundreds of
+/// mobs). Deterministic: stable nearest-first order; ties keep input order.
+/// Each candidate is `(world_pos, reach_radius)`; output packs them as the
+/// shader's `vec4` (xyz = pos, w = reach).
+pub fn select_disturbers(
+    candidates: &[([f32; 3], f32)],
+    center: [f32; 3],
+    max_dist: f32,
+    out_max: usize,
+) -> Vec<[f32; 4]> {
+    let d2 = |p: [f32; 3]| {
+        let dx = p[0] - center[0];
+        let dy = p[1] - center[1];
+        let dz = p[2] - center[2];
+        dx * dx + dy * dy + dz * dz
+    };
+    let lim = max_dist * max_dist;
+    let mut picked: Vec<(f32, [f32; 4])> = candidates
+        .iter()
+        .filter(|(p, _)| d2(*p) <= lim)
+        .map(|&(p, r)| (d2(p), [p[0], p[1], p[2], r]))
+        .collect();
+    picked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    picked.truncate(out_max);
+    picked.into_iter().map(|(_, v)| v).collect()
+}
+
+#[cfg(test)]
+mod disturber_tests {
+    use super::select_disturbers;
+
+    #[test]
+    fn nearest_first_capped_and_range_filtered() {
+        let cands = vec![
+            ([10.0, 0.0, 0.0], 2.0), // d=10
+            ([2.0, 0.0, 0.0], 2.5),  // d=2 — nearest
+            ([100.0, 0.0, 0.0], 3.0), // beyond max_dist
+            ([5.0, 0.0, 0.0], 2.0),  // d=5
+        ];
+        let out = select_disturbers(&cands, [0.0; 3], 24.0, 2);
+        assert_eq!(out.len(), 2, "capped at out_max");
+        assert_eq!(out[0], [2.0, 0.0, 0.0, 2.5], "nearest first");
+        assert_eq!(out[1], [5.0, 0.0, 0.0, 2.0]);
+    }
+
+    #[test]
+    fn empty_and_all_out_of_range_yield_empty() {
+        assert!(select_disturbers(&[], [0.0; 3], 24.0, 8).is_empty());
+        let far = vec![([1000.0, 0.0, 0.0], 2.0)];
+        assert!(select_disturbers(&far, [0.0; 3], 24.0, 8).is_empty());
+    }
+}
