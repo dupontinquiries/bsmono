@@ -1329,3 +1329,74 @@ fn checks_run_marker_and_candidates() {
     assert!(cands.iter().any(|c| c.commit == a.oid), "A is a candidate");
     assert!(!cands.iter().any(|c| c.commit == b.oid), "B is not a candidate");
 }
+
+// ---- 'R' raw chunk encoding (incompressible content) ----
+
+/// Deterministic xorshift noise: incompressible without a rand dep.
+fn xs_noise(n: usize, mut seed: u64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(n);
+    while v.len() < n {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        v.extend_from_slice(&seed.to_le_bytes());
+    }
+    v.truncate(n);
+    v
+}
+
+#[test]
+fn store_incompressible_chunks_are_stored_raw_not_inflated() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ChunkStore::open(dir.path().join("s.redb")).unwrap();
+
+    // 4 MiB of noise: pre-'R', every ~64 KiB chunk paid zstd frame
+    // overhead; now stored bytes must be ≤ raw + 1 byte per chunk.
+    let data = xs_noise(4 << 20, 0xC0FFEE);
+    let rep = store.ingest("noise.bin", &data[..]).unwrap();
+    assert!(
+        rep.new_bytes_stored <= rep.total_len + rep.chunk_count as u64,
+        "stored {} for {} raw in {} chunks",
+        rep.new_bytes_stored,
+        rep.total_len,
+        rep.chunk_count
+    );
+
+    // And the bytes come back exact.
+    let mut out = Vec::new();
+    store.restore(rep.blob_oid, &mut out).unwrap();
+    assert_eq!(out, data);
+}
+
+#[test]
+fn store_compressible_content_still_compresses() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ChunkStore::open(dir.path().join("s.redb")).unwrap();
+    let data = b"the same line over and over\n".repeat(100_000);
+    let rep = store.ingest("log.txt", &data[..]).unwrap();
+    assert!(
+        rep.new_bytes_stored < rep.total_len / 10,
+        "text must still zstd well: {} vs {}",
+        rep.new_bytes_stored,
+        rep.total_len
+    );
+    let mut out = Vec::new();
+    store.restore(rep.blob_oid, &mut out).unwrap();
+    assert_eq!(out, data);
+}
+
+#[test]
+fn store_mixed_file_uses_both_encodings_and_roundtrips() {
+    // Half text, half noise, glued: chunks land in both encoders and the
+    // manifest walks across the boundary transparently.
+    let dir = tempfile::tempdir().unwrap();
+    let store = ChunkStore::open(dir.path().join("s.redb")).unwrap();
+    let mut data = b"header text region\n".repeat(50_000);
+    data.extend(xs_noise(1 << 20, 7));
+    let rep = store.ingest("mixed.bin", &data[..]).unwrap();
+    let mut out = Vec::new();
+    store.restore(rep.blob_oid, &mut out).unwrap();
+    assert_eq!(out, data);
+    // Stored strictly less than raw (the text half must win us something).
+    assert!(rep.new_bytes_stored < rep.total_len);
+}

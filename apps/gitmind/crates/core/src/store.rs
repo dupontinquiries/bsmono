@@ -141,17 +141,31 @@ pub struct ChunkStore {
     db: Database,
 }
 
-/// Decode a stored chunk value. Plain chunks are a bare zstd frame (first
-/// byte 0x28). A delta chunk is tagged `'D'` and stores
-/// `'D' || base_oid(32) || u32_le len || zstd(raw, dict = base raw)`; we
-/// reconstruct the base (recursively, depth-guarded) and zstd-decode against
-/// it. This is how cross-file similarity becomes storage savings. `get`
-/// returns a base chunk's stored (still-encoded) value by oid.
+/// Decode a stored chunk value. Three encodings, told apart by the first
+/// byte (safe because a zstd frame always begins 0x28, the low byte of the
+/// frame magic — the same disambiguation the `'D'` tag already relies on):
+///
+///   0x28  plain: a bare zstd frame
+///   'D'   delta: `'D' || base_oid(32) || u32_le len || zstd(raw, dict=base)`
+///   'R'   raw:   `'R' || raw bytes` — written by ingest when zstd cannot
+///         shrink the chunk (already-compressed media, encrypted data,
+///         model weights). Storing such chunks as zstd frames costs frame
+///         overhead on every one and CPU on both ends for nothing; the raw
+///         tag caps a chunk's stored size at raw+1 bytes.
+///
+/// Compat: new readers open old stores untouched (old stores simply have
+/// no 'R' values). A store WRITTEN by this version may contain 'R' chunks
+/// that pre-'R' binaries would misread as corrupt zstd — same one-way
+/// property the 'D' tag introduced with repack. The tree is the toolchain;
+/// mixed-version fleets should update readers first.
 fn decode_chunk(
     value: &[u8],
     get: &dyn Fn(&[u8]) -> Result<Option<Vec<u8>>, String>,
     depth: u8,
 ) -> Result<Vec<u8>, String> {
+    if value.first() == Some(&b'R') {
+        return Ok(value[1..].to_vec());
+    }
     if value.first() == Some(&b'D') {
         if depth > 16 {
             return Err("delta chain too deep".into());
@@ -171,6 +185,61 @@ fn decode_chunk(
     } else {
         zstd::decode_all(value).map_err(|e| format!("unzstd: {e}"))
     }
+}
+
+/// Encode a raw chunk for storage: zstd when it wins, `'R' || raw` when it
+/// can't. Two layers, both cheap relative to what they save:
+///
+///   1. ENTROPY GATE. Shannon entropy of the first 4 KiB. Above 7.9
+///      bits/byte the chunk is effectively random to any entropy coder —
+///      the 64 KiB-average CDC chunks of a video or a zip land here — so
+///      we skip zstd entirely: no compression CPU spent to learn what the
+///      probe already told us. 4 KiB is enough sample for a verdict this
+///      lopsided, and a rare false "compressible" only costs one wasted
+///      zstd call, caught by layer 2.
+///   2. COMPARE. If zstd ran, keep its output only when strictly smaller
+///      than raw+1 (the raw encoding's cost). This is the exact guarantee:
+///      NO chunk is ever stored larger than its raw size + 1 tag byte,
+///      where previously an incompressible chunk paid the zstd frame
+///      overhead (~13 bytes) and occasionally more.
+fn encode_chunk_value(data: &[u8]) -> Result<Vec<u8>, String> {
+    let probe = &data[..data.len().min(4096)];
+    if chunk_entropy(probe) > 7.9 {
+        let mut v = Vec::with_capacity(data.len() + 1);
+        v.push(b'R');
+        v.extend_from_slice(data);
+        return Ok(v);
+    }
+    let comp = zstd::encode_all(data, ZSTD_LEVEL).map_err(|e| format!("zstd: {e}"))?;
+    if comp.len() < data.len() + 1 {
+        Ok(comp)
+    } else {
+        let mut v = Vec::with_capacity(data.len() + 1);
+        v.push(b'R');
+        v.extend_from_slice(data);
+        Ok(v)
+    }
+}
+
+/// Shannon entropy in bits/byte over a sample. Local, dependency-free —
+/// the probe runs on every new chunk, so it must stay allocation-light.
+pub(crate) fn chunk_entropy(data: &[u8]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u64; 256];
+    for &b in data {
+        counts[b as usize] += 1;
+    }
+    let n = data.len() as f64;
+    counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / n;
+            -p * p.log2()
+        })
+        .sum()
 }
 
 impl ChunkStore {
@@ -215,13 +284,12 @@ impl ChunkStore {
                 lens.push(data.len() as u32);
                 chunks.push(oid);
 
-                // Dedup: only compress + store chunks we haven't seen.
+                // Dedup: only encode + store chunks we haven't seen.
                 if t.get(oid.0.as_slice()).map_err(|e| e.to_string())?.is_none() {
-                    let comp = zstd::encode_all(&data[..], ZSTD_LEVEL)
-                        .map_err(|e| format!("zstd: {e}"))?;
-                    new_bytes_stored += comp.len() as u64;
+                    let val = encode_chunk_value(&data)?;
+                    new_bytes_stored += val.len() as u64;
                     new_chunks += 1;
-                    t.insert(oid.0.as_slice(), comp.as_slice())
+                    t.insert(oid.0.as_slice(), val.as_slice())
                         .map_err(|e| e.to_string())?;
                 }
             }
