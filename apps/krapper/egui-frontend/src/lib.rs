@@ -165,8 +165,15 @@ impl Writer {
 }
 
 /// Draw the surface. Returns a blurb if one was clicked.
+/// `a11y` is the scene the suggestion buttons register with, so a voice
+/// or switch user can pick one by name rather than by pointing.
+///
+/// Parity reported `a11y=0` for this app. Its only controls are buttons
+/// and a text area, so it needed the button path rather than the toggle
+/// sweep the other apps took.
 pub fn writer_ui(ui: &mut egui::Ui, w: &mut Writer,
-                 colors: &uikit_egui::PaletteColors) -> Option<String> {
+                 colors: &uikit_egui::PaletteColors,
+                 a11y: &mut uikit_egui::a11y::A11yScene) -> Option<String> {
     let mut picked = None;
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(format!("{:.0} bpm", w.vibe.bpm)).strong());
@@ -232,7 +239,15 @@ pub fn writer_ui(ui: &mut egui::Ui, w: &mut Writer,
     } else {
         ui.horizontal_wrapped(|ui| {
             for b in fits {
-                if ui.button(&b).clicked() { picked = Some(b.clone()); }
+                // ID FROM THE TEXT, not the loop index. These are
+                // suggestions that reorder as the bar fills, so an
+                // index-derived id would point at a different blurb
+                // between frames — and `A11yScene` keeps focus BY ID, so
+                // focus would land on whatever moved into that slot.
+                let id = egui::Id::new(("krapper.blurb", b.as_str())).value();
+                if uikit_egui::a11y::note_button(a11y, id, &b, ui.button(&b)).clicked() {
+                    picked = Some(b.clone());
+                }
             }
         });
     }
@@ -250,14 +265,20 @@ pub fn run(title: &str) -> eframe::Result<()> {
 
 #[cfg(feature = "app")]
 #[derive(Default)]
-struct Shell { w: Writer }
+struct Shell {
+    w: Writer,
+    /// Held on the shell rather than built per frame: `A11yScene`
+    /// remembers focus BY ID between frames, and a per-frame scene
+    /// forgets — which presents as focus jumping, not as a missing scene.
+    a11y: uikit_egui::a11y::A11yScene,
+}
 
 #[cfg(feature = "app")]
 impl eframe::App for Shell {
     fn ui(&mut self, ui: &mut egui::Ui, _f: &mut eframe::Frame) {
         let colors = uikit_egui::palette_colors("midnight");
         egui::CentralPanel::default().show(ui.ctx(), |ui| {
-            if let Some(b) = writer_ui(ui, &mut self.w, &colors) {
+            if let Some(b) = writer_ui(ui, &mut self.w, &colors, &mut self.a11y) {
                 if !self.w.lyrics.is_empty() && !self.w.lyrics.ends_with(' ') {
                     self.w.lyrics.push(' ');
                 }

@@ -433,6 +433,18 @@ pub fn semantic_button(ui: &mut Ui, scene: &mut A11yScene, id: u64, label: &str)
 }
 
 /// Same, for a toggle (checkbox): reflects on/off in the spoken value.
+/// Register a BUTTON that was already drawn, returning its `Response`.
+///
+/// The button counterpart of [`note`]. Same reason to exist: a call site
+/// that chains `.on_hover_text(...)`, `.clicked()`, or an enabled check
+/// cannot use `semantic_button` without being restructured, and
+/// restructuring working code to gain accessibility is how these
+/// adoptions start costing more than they give.
+pub fn note_button(scene: &mut A11yScene, id: u64, label: &str, resp: Response) -> Response {
+    scene.add(id, Semantics::button(label), Some(resp.rect));
+    resp
+}
+
 /// Register a toggle that was already drawn, returning its `Response`.
 ///
 /// `semantic_toggle` draws the checkbox for you, which is the right shape
