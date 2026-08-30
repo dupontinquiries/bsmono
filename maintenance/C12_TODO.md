@@ -1896,3 +1896,46 @@ last number is older than the locked one, this is the fault.
   gtk4-layer-shell-sys`. A missing system library, unrelated to uuid.
   Worth separating, because a summary that groups 25 failures under one
   heading buries the one that is not that heading.
+
+## 33. blackstar-rs merge: what is wired and what is a subcommand
+
+Operator report: "the code from the patch either didn't do much or
+wasn't wired yet". Checked each module for callers OUTSIDE itself, and
+the answer splits cleanly in two.
+
+**GENUINELY WIRED into the playable game:**
+- `align` + the fold work. `skeleton::FoldStep { rot, pivot, shift }` is
+  the type of `Model::pack`, and `build_morph` (main.rs:2824) is called
+  from the live transform path at 2788, gated on `Mode::Play` and
+  offline. So pressing transform in-game does go through the new
+  alignment and the hinge. This is the part that closed C12-21a and it
+  is real.
+- `fleet` — 12 call sites outside itself.
+
+**NOT wired — headless subcommands only:**
+- `helmai` — ZERO references outside itself. Reachable solely via
+  `--helm` (main.rs:1212), a CLI simulation.
+- `holomap` — its only "reference" outside itself is a COMMENT inside
+  helmai.rs. Reachable solely via `--holo`.
+- Neither `sim.rs`, `world.rs` nor `physics.rs` mentions any of
+  helmai/holomap/fleet. The live game loop does not touch them.
+
+So the merge landed one real feature (folding) plus two simulators that
+run as `blackstar --helm` / `--holo` and never appear in the game. That
+is not nothing — a headless sim is how this codebase has tested
+everything from raids to driveline physics, and both have tests — but it
+is also not what "the ship flies itself" and "the system on the plot
+table" sound like in a commit subject.
+
+- **C12-33a — decide what those two are FOR.** If they are design
+  spikes, the commit subjects should say so; if they are meant to be in
+  the game, they need a call site in the update loop and something to
+  draw with. Worth asking the session that wrote them rather than
+  guessing, since a simulator that was always meant to stay headless is
+  finished work and wiring it would be wrong.
+- **C12-33b — this is the FOURTH built-but-unhosted finding this
+  session** (snapclone's ~35 entry points, logscope's trust gate,
+  voiceterm's launcher, now these). Consistent enough to be a standing
+  check rather than a coincidence: after any merge, grep each new module
+  for references outside itself. `orphan_check` catches files nothing
+  compiles; nothing yet catches modules that compile and nothing calls.
