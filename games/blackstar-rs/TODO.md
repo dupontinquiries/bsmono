@@ -476,14 +476,38 @@ scoped version of "handcrafted mechanics in the raids json" — a real,
 bounded refactor (define a schema, a loader, keep the const as a
 compiled-in fallback/default set), not a vague ask.
 
-**Not confirmed, worth checking before touching anything:** whether the
-19 narrative bosses actually spawn as one of the 9 scaled chassis during
-a live raid fight, or whether combat currently uses a generic/disconnected
-enemy model. Traced `raidflow::RaidFlow::begin` (picks a boss by id for
-wave/arena/loot structure) but did not find where — or whether — it
-selects a 3D model. This needs settling before "bosses should be bigger"
-work proceeds, since if the two systems are disconnected today, scale
-and mechanic data might not even reach the same fight.
+**Resolved, definitively — the earlier "not confirmed" note above was
+too narrow a question.** Traced this all the way through this session:
+`boss.id` is never used anywhere to select a 3D model (only as a hash
+seed and a save-progress key — checked every use of `.id` across
+`raidflow.rs`/`raidgen.rs`). `EncSpec`/`PhaseSpec` (the actual encounter-
+planning data a `RaidPlan` produces) carry no model reference at all —
+just position, an abstract `EncKind` (`Anchor`/`Standard`), a mech type,
+and a minimum unit count. That `EncKind::Anchor` comment references
+"the C engine" directly, which led to checking `games/blackstar` — a
+**separate, real C implementation of this same game**
+(`engine_src/game.c`, `engine_src/exengine/raid_plan.h`) that the Rust
+`Mech`/`EncSpec` enums are numerically kept compatible with. The actual
+boss/champion spawn logic lives there, and it's a **much smaller,
+different, hardcoded set**: `g_champion_kind` is 0-5 — `Cryotek`,
+`Blackstar`, `Jhiaxus`, `The Watch`, `Unicron`. Only "Jhiaxus" overlaps
+the Rust 19-boss table by name (`jhiaxus_omega`, "Devastator Jhiaxus")
+at all.
+
+**So the real picture**: `raidcon.rs`'s 19-boss table (now the JSON
+file) is newer, richer, Rust-side-only content — genuinely well
+authored, but currently disconnected from the C engine's actual,
+already-shipping champion-spawn mechanism, not just missing a lookup
+table to wire it up. The two systems don't even have the same roster
+size or names. Before doing ANY more work on "which chassis a boss
+looks like," the real open question is architectural: is `blackstar-rs`
+meant to fully replace the C engine's raid system (in which case the
+19-boss table needs its own spawn logic built from scratch, since there
+is nothing to hook into), or does the 19-boss content eventually need
+to reconcile with the 5-6 existing C-engine champions (in which case
+much of `raidcon.rs`'s roster is speculative/future content, not a
+near-term integration target)? That's a real product decision, not
+something I should guess at by picking one and building toward it.
 
 **Not implemented at all:** anything that exempts a boss from the
 standard vehicle<->robot fold. Every chassis, boss or not, goes through
