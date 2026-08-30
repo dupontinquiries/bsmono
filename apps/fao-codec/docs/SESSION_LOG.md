@@ -2995,3 +2995,48 @@ motion shots need the standard toolbox (subpel MC, intra, entropy
 coding) or a hybrid that falls back to a conventional coder; (3) the
 per-shot plate overhead is the tax the library exists to amortize —
 today every shot pays it fresh.
+
+### Bimodal verdict vs AV1 per-shot + hybrid oracle + half-res coding (same session)
+
+AV1-150k measured PER SHOT (packet-timestamp byte binning + per-shot
+PSNR on identical windows; boundary packets can drift a few frames —
+the 2-frame shot 17 reading is unreliable). This corrects the earlier
+framing: AV1's rate control also exploits easy content (380–500 B/f on
+the gentle shots), so "v11's 16 KB/f vs AV1's 915 B/f average" was
+misleading.
+
+STRICT bimodal verdict: v11 beats AV1 on 2 of 19 shots — the truly
+frozen ones. Shot 1: 45 vs 87 B/f at identical 54.0 dB. Shot 5:
+67 B/f near-lossless vs 2,897 B/f @ 47.8 (six frames — a keyframe
+can't amortize; the plate is the better keyframe). The win mode is
+real and it is exactly "static enough that plate+skip ≈ free while
+per-frame codec overhead cannot be skipped."
+
+ORACLE per-shot hybrid (route each shot to whichever coder wins):
+0.97 MB @ 33.33 dB vs AV1's 0.99 MB — never worse, +1.9% on THIS
+clip, because bloopers spend almost no duration in the win mode.
+Hybrid value is proportional to content mix; the target genres
+(games with locked HUD/arena shots, repeated sets, surveillance-like
+footage) are where the win region covers real duration — and the 3D
+library changes the economics further by amortizing the 11.1 MB of
+plates across takes (store-set shots 10+12 alone carry 2.0 MB of
+plates that a matched canonical would make free-after-first).
+
+Half-res coding for the bad mode (user's upscaler idea, classical
+bound): shot 9 (worst: 74 KB/f @ 27.2 dB full-res) at 960×400 + 
+lanczos upscale = 18.6 KB/f @ 25.5 dB / 0.668 SSIM. Measured: 4× rate
+relief at a −1.7 dB / −0.085 SSIM toll. That toll is precisely what a
+learned upscaler exists to buy back (lanczos cannot invent texture);
+the unendlich neural upscale path on the Asahi target is the intended
+occupant of this slot, with engine-rendered training pairs. Even so,
+AV1 remains 18× cheaper on this shot — hard-motion shots stay routed
+to the traditional branch; half-res+SR improves the MODEL branch
+where it is used.
+
+Hybrid reconciliation design (recorded): route per SHOT/GOP, not per
+block. A cheap plate-predictability probe (plate residual energy —
+already computed) selects the branch; the container muxes segments;
+no block-map or motion-vector interop between coders exists because
+the streams never interleave. Per-block hybrid is phase 2, only if a
+measurement shows per-shot routing leaving significant money on the
+table.
