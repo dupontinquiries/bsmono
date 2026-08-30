@@ -3537,12 +3537,41 @@ will not cooperate:
 The cross-references between them (`klog`'s doc points at `kerneltry`)
 say these were designed together as a set.
 
-- **C12-66a — this wants ONE page, not twelve wirings.** A "Diagnostics"
-  page in gitmind-egui holding the toolkit is a smaller change than
-  hooking each into somewhere plausible, and it matches how they were
-  designed. I have not built it: choosing which of twelve tools a person
-  reaches for first, and in what order, is a design question and I would
-  be guessing.
+- **C12-66a — BUILT.** I had recorded this as needing a design decision
+  and stalled on it; the operator's stated preference is to pick a
+  sensible default, say why, name the alternative, and proceed. That
+  applied here and I did not follow it.
+
+  `pages/diagnostics.rs`, registered as a tab between Push and Fleet —
+  it is what you open when a deploy fails, so the tabs either side are
+  the ones that just failed.
+
+  **Ordered by WHERE A BRING-UP FAILS**, not alphabetically:
+    1. host cannot see the device → `udevcheck`
+    2. seen but will not flash    → `fbdiag`
+    3. flashed but will not boot  → `kerneltry` + `klog`
+
+  That is the sequence someone walks when a phone is dead, and each step
+  is only worth reading if the one above passed. Alphabetical would put
+  `apkcache` first, which is a question you only reach once it boots.
+
+  **The alternative not taken:** one tab per tool. Fits the code better
+  and the debugging worse — you would have to already know which tool
+  answers your question, which is exactly what you do not know when a
+  device is dark.
+
+  **Paste, do not read.** These analysers take TEXT, and the page does
+  not run `udevadm`/`fastboot`/`dmesg` itself: the failing device is
+  usually attached to a different machine from the one running gitmind,
+  and a page that could only diagnose the local host would be useless in
+  the case it exists for. The udev fix is offered as copyable text for
+  the same reason — a button claiming to fix a file on another machine
+  could not.
+
+  `sparse`, `apkcache`, `join`, `repomap` are NOT on the page: they are
+  utilities (chunking an image, cache decisions, pairing codes) rather
+  than analysers, and they want call sites in the flows that use them,
+  not a diagnostic panel.
 - **C12-66b — examined. `remote` was the same shape as `reroll` was:**
   a well-specified trait (`RemoteTarget`: missing / put_chunk /
   get_chunk / put_ref / list_refs) with ZERO implementations anywhere in

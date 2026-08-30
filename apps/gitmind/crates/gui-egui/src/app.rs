@@ -16,17 +16,23 @@ pub enum Tab {
     Timeline,
     Artifacts,
     Share,
+    /// Device bring-up diagnostics: the cockpit toolkit's door.
+    Diagnostics,
     Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 11] = [Tab::Fleet, Tab::Push, Tab::Network, Tab::Share, Tab::Apps, Tab::Import, Tab::Branches, Tab::Files, Tab::Artifacts, Tab::Timeline, Tab::Settings];
+    // Diagnostics sits next to Push and Fleet, not beside Settings: it is
+    // what you open when a deploy fails, and the tabs either side of it
+    // are the ones that just failed.
+    pub const ALL: [Tab; 12] = [Tab::Fleet, Tab::Push, Tab::Diagnostics, Tab::Network, Tab::Share, Tab::Apps, Tab::Import, Tab::Branches, Tab::Files, Tab::Artifacts, Tab::Timeline, Tab::Settings];
     pub fn label(self) -> &'static str {
         match self {
             Tab::Fleet => "Fleet",
             Tab::Push => "Push",
             Tab::Network => "Network",
             Tab::Share => "Share",
+            Tab::Diagnostics => "Diagnostics",
             Tab::Apps => "Apps",
             Tab::Import => "Import",
             Tab::Branches => "Branches",
@@ -44,6 +50,7 @@ impl Tab {
             Tab::Push => "⬆",
             Tab::Network => "🌐",
             Tab::Share => "📡",
+            Tab::Diagnostics => "🩺",
             Tab::Apps => "📦",
             Tab::Import => "📥",
             Tab::Branches => "🌿",
@@ -78,6 +85,7 @@ pub struct App {
     pub import: pages::import::State,
     pub branches: pages::branches::State,
     pub dupes: pages::dupes::State,
+    pub diagnostics: pages::diagnostics::State,
     pub files: pages::files::State,
     /// Horizontal swipe-between-tabs gesture (with detent), used on the phone's bottom-bar layout.
     pub nav_gesture: uikit_egui::GestureLayer,
@@ -107,6 +115,7 @@ impl Default for App {
             import: pages::import::State::default(),
             branches: pages::branches::State::default(),
             dupes: pages::dupes::State::default(),
+            diagnostics: pages::diagnostics::State::default(),
             files: pages::files::State::default(),
             nav_gesture: uikit_egui::GestureLayer::horizontal_page(320.0),
         }
@@ -196,6 +205,7 @@ impl App {
                     match self.tab {
                         Tab::Network => pages::network::ui(self, ui),
                         Tab::Share => pages::share::ui(self, ui),
+                        Tab::Diagnostics => pages::diagnostics::ui(self, ui),
                         Tab::Apps => pages::apps::ui(self, ui),
                         Tab::Import => pages::import::ui(self, ui),
                         Tab::Branches => pages::branches::ui(self, ui),

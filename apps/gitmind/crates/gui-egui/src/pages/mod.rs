@@ -1,4 +1,5 @@
 pub mod bluetooth;
+pub mod diagnostics;
 pub mod share;
 pub mod artifacts;
 pub mod fleet;
