@@ -255,8 +255,21 @@ impl IncomingCall {
     pub fn decline(&mut self) -> Option<Answer> { self.answer(Answer::Declined) }
 }
 
-/// Draw the bottom sheet. Returns the answer the moment one is given.
-pub fn ring_ui(ui: &mut egui::Ui, call: &mut IncomingCall,
+/// Draw the bottom sheet. Returns which button was pressed, and **does not
+/// apply it**.
+///
+/// It used to take `&mut IncomingCall` and call `accept()`/`decline()` itself,
+/// which made this the second implementation of answering a call: the shell's
+/// own `Snapclone::answer_call` did the same mutation plus the dismissal, and
+/// was consequently unreachable — it would have found the call already
+/// answered and returned early. Two paths that can disagree about whether a
+/// call ended is exactly the shape this tree keeps finding, and here it had
+/// already cost the app its non-UI answer path.
+///
+/// So the sheet reports the press and the shell owns the transition. The
+/// borrow is `&` rather than `&mut` to make that structural rather than a
+/// convention — this function no longer CAN answer a call.
+pub fn ring_ui(ui: &mut egui::Ui, call: &IncomingCall,
                c: &uikit_egui::PaletteColors) -> Option<Answer> {
     if !call.ringing() { return None; }
     let mut out = None;
@@ -269,10 +282,10 @@ pub fn ring_ui(ui: &mut egui::Ui, call: &mut IncomingCall,
         ui.colored_label(c.text_weak, format!("{:.0}s", call.remaining_secs()));
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if ui.button("Decline").clicked() { out = call.decline(); }
+            if ui.button("Decline").clicked() { out = Some(Answer::Declined); }
             if ui.add(egui::Button::new(
                 egui::RichText::new("Accept").color(c.bg_base)).fill(c.accent)).clicked() {
-                out = call.accept();
+                out = Some(Answer::Accepted);
             }
         });
         ui.add_space(8.0);

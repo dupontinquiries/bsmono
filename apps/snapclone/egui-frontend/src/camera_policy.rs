@@ -74,6 +74,26 @@ pub struct CameraPolicy {
     pub frame_rate_degraded_ratio: f32,
     /// Rotation override, empty means "as the sensor reports".
     pub rotation: String,
+
+    /// Offload colour conversion and scaling to the GPU
+    /// (`glupload`/`glcolorconvert`/`glcolorscale`/`gldownload`).
+    ///
+    /// OFF by default, and the reason is specific rather than cautious: that
+    /// pipeline failed to negotiate on the FP5/postmarketOS GL stack during
+    /// testing, while the CPU dual-videoconvert path is proven. Enabling it
+    /// cannot permanently break the camera — the backend falls back to CPU on
+    /// the same device when the GL path will not link — so it is exposed as an
+    /// opt-in for hardware where it does work.
+    pub prefer_gpu_convert: bool,
+
+    /// Whether two camera streams may run at once (rear viewfinder plus a
+    /// front selfie overlay: picture-in-picture, multi-camera).
+    ///
+    /// OFF by default because single-ISP phones cannot do it, and the failure
+    /// is not an error — the second camera simply never starts, which reads as
+    /// the feature being broken. Desktops with USB webcams, and phones with
+    /// independent sensors, can turn it on.
+    pub simultaneous_capture: bool,
 }
 
 impl Default for CameraPolicy {
@@ -92,6 +112,8 @@ impl Default for CameraPolicy {
             low_quality_ratio: 0.75,
             frame_rate_degraded_ratio: 1.5,
             rotation: String::new(),
+            prefer_gpu_convert: false,
+            simultaneous_capture: false,
         }
     }
 }

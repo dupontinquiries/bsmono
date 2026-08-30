@@ -20,8 +20,15 @@ pub mod conversation;
 pub mod composer;
 pub mod outbox;
 pub mod group_voice;
+/// The host seam: one typed event in, typed commands out. See `host.rs` —
+/// this is the call site the ~35 tested-but-unreached entry points lacked.
+pub mod host;
 pub mod settings_page;
 pub mod settings_store;
+/// The Network tab's seven STUN servers and the bitmask they persist as.
+pub mod stun_servers;
+/// The Network tab's relay dropdown and the preset/custom URL resolution.
+pub mod relay_preset;
 pub mod inbox;
 pub mod unified_nav;
 pub mod friends;
@@ -2180,18 +2187,16 @@ impl Snapclone {
                 ui.painter().rect_filled(area, 8.0, colors.bg_base);
                 let mut child = ui.new_child(
                     egui::UiBuilder::new().max_rect(area.shrink(12.0)));
-                let mut answered = None;
-                let mut who = String::new();
-                if let Some(call) = self.incoming_call.as_mut() {
-                    who = call.caller_name.clone();
-                    answered = crate::ring::ring_ui(&mut child, call, &colors);
-                }
-                // finish_call owns dismissing and clearing; calling it is the
-                // whole handling, and duplicating either here would leave the
-                // two paths able to disagree about whether a call ended.
-                if let Some(a) = answered {
-                    self.finish_call(&who, a);
-                }
+                let answered = self.incoming_call.as_ref()
+                    .and_then(|call| crate::ring::ring_ui(&mut child, call, &colors));
+                // THROUGH answer_call, not around it. The sheet used to apply
+                // the answer itself and the shell then called finish_call,
+                // which left `answer_call` — the app's only non-UI way to
+                // answer — permanently unreachable AND made a second
+                // implementation of the same transition. One path now: the
+                // sheet reports the press, this applies it, and answer_call
+                // owns the guard against answering twice.
+                if let Some(a) = answered { self.answer_call(a); }
             }
         }
 
@@ -2815,6 +2820,21 @@ impl Snapclone {
         // names this replaced had no way to add anyone, which is the half of
         // the page that matters when discovery has failed and you are standing
         // next to the person you are trying to reach.
+        // THE WAY IN THAT IS NOT TYPING. `open_qr_scan` was ported, tested and
+        // reachable from nothing: the dialog had a body, the parser handled
+        // both the bare sc-ID and the snapclone:// URI, and no control in the
+        // app opened it. Adding a contact meant knowing their address and
+        // typing it, which is the case QR codes exist to remove.
+        //
+        // Two buttons rather than one, because `open_qr_scan(false)` is not a
+        // degraded mode — it lands straight on the manual field instead of
+        // showing a viewfinder that will never produce a frame, which is the
+        // right surface on a machine with no camera and the honest one while
+        // the capture pipeline is still unwired.
+        ui.horizontal(|ui| {
+            if ui.button("Scan code").clicked() { self.open_qr_scan(true); }
+            if ui.button("Enter code").clicked() { self.open_qr_scan(false); }
+        });
         if let Some(a) = crate::friends::friends_ui(
             ui, &self.roster, &mut self.cards, &mut self.add_form, c) {
             self.apply_friends(a);
@@ -2881,7 +2901,13 @@ impl Snapclone {
         // The five real tab bodies from settings_page.rs, not one row of
         // background styles. The background picker stays as an appearance
         // control, but it is no longer the whole page.
-        crate::settings_page::settings_ui(ui, &mut self.settings, c);
+        // The camera policy is passed THROUGH rather than mirrored into
+        // Settings: the Tuning spin boxes edit it in place, matching Qt
+        // reading and writing CameraPolicyStore::instance() directly. Two
+        // structs holding a startup timeout would disagree the first time
+        // one of them was saved and the other was not.
+        crate::settings_page::settings_ui(ui, &mut self.settings,
+                                          &mut self.camera_policy, c);
         // Persist. The io error is SHOWN rather than swallowed — a Save that
         // silently fails is the same lie as one that never wrote, and a
         // read-only config dir is a real thing on locked-down devices.
@@ -5693,5 +5719,146 @@ fn same_prefix(a: &str, b: &str) -> bool {
     match (head(a), head(b)) {
         (Some(x), Some(y)) => x == y,
         _ => false,
+    }
+}
+
+/// The two surfaces that were drawn, tested, and reachable from no control.
+///
+/// Both failures were invisible to every existing test for the same reason:
+/// the widgets pass their own tests, the shell renders, and nothing anywhere
+/// asks whether a finger can get from the running app to the widget. That is
+/// the question these ask.
+#[cfg(test)]
+mod call_and_qr_wiring_tests {
+    use super::*;
+
+    fn app() -> Snapclone {
+        Snapclone::new(vec![Peer { name: "studio".into(), online: true }])
+    }
+
+    #[test]
+    fn answering_a_call_runs_through_answer_call_and_clears_the_sheet() {
+        // `answer_call` was unreachable: ring_ui applied the answer itself and
+        // the shell called finish_call, so this method would have found the
+        // call already answered and returned early. It is now the only path,
+        // which means this test covers what the UI does rather than a
+        // parallel implementation of it.
+        let mut s = app();
+        s.ring("studio");
+        assert!(s.incoming_call.is_some());
+        s.answer_call(crate::ring::Answer::Accepted);
+        assert!(s.incoming_call.is_none(), "the sheet did not clear");
+        assert!(s.modal.topmost(crate::modal::Layer::Confirm).is_none(),
+                "the modal was left on the stack, so input stays blocked");
+    }
+
+    #[test]
+    fn only_an_ignored_call_is_a_missed_one() {
+        // I wrote this expecting a decline to count as missed and the test was
+        // right and I was wrong: finish_call records ONLY TimedOut. Both
+        // rejections drop the buffered packets, but a call you refused is not
+        // one you missed, and a missed-calls list that includes deliberate
+        // declines is a list of things to feel bad about rather than a list of
+        // people to ring back. Pinned here because the distinction is one line
+        // in a match and nothing else in the crate asserts it.
+        let mut s = app();
+        s.ring("studio");
+        s.answer_call(crate::ring::Answer::Declined);
+        assert!(s.missed_calls.is_empty(), "a decline is not a missed call");
+
+        s.ring("studio");
+        s.answer_call(crate::ring::Answer::TimedOut);
+        assert_eq!(s.missed_calls, vec!["studio".to_string()]);
+
+        s.ring("studio");
+        s.answer_call(crate::ring::Answer::Accepted);
+        assert_eq!(s.missed_calls.len(), 1, "an answered call is not a missed one");
+        assert!(s.group_voice.joined, "and accepting actually joins the call");
+    }
+
+    #[test]
+    fn answering_twice_does_nothing_the_second_time() {
+        // The guard lives in answer_call, which is why the sheet must not own
+        // the mutation: a double press, or a press racing a headset button,
+        // must not run the transition twice.
+        let mut s = app();
+        s.ring("studio");
+        s.answer_call(crate::ring::Answer::Declined);
+        let after = s.missed_calls.clone();
+        s.answer_call(crate::ring::Answer::Declined);
+        assert_eq!(s.missed_calls, after);
+    }
+
+    #[test]
+    fn opening_the_qr_scanner_survives_the_frame_that_draws_it() {
+        // The gap this closes: open_qr_scan was ported and tested, the dialog
+        // had a body, the parser took both the bare sc-ID and the URI — and no
+        // control in the running app called it, so adding a contact meant
+        // knowing their address and typing it.
+        //
+        // Driven by keyboard focus rather than a coordinate click because a
+        // hardcoded position tests the layout, not the wiring, and breaks the
+        // next time a row is added above it. Bounded loop for the same reason
+        // the typing test uses one: the number of tab stops before the button
+        // is not a thing worth pinning.
+        use egui::{Context, Event, Key, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        app.nav.go_page(2); // Friends
+        let adaptive = Adaptive::default();
+
+        // A REAL SCREEN RECT, and it is the difference between this test
+        // working and not. `RawInput::default()` leaves `screen_rect` unset, so
+        // the page lays out into a surface too small to reach the controls
+        // below the roster and the focus walk never arrives at them — the test
+        // fails while the button is present and correctly wired. Tall on
+        // purpose: this page is a scrolling column and the buttons sit near the
+        // bottom of it.
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(420.0, 2400.0));
+        let mut frame = |ctx: &Context, app: &mut Snapclone, events: Vec<Event>| {
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen), ..Default::default() },
+                            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        };
+        frame(&ctx, &mut app, vec![]);
+        assert_eq!(app.page_name(), "Friends", "the harness is not on the page under test");
+
+        let key = |k: Key, pressed: bool| Event::Key {
+            key: k, physical_key: None, pressed, repeat: false, modifiers: Default::default() };
+
+        // Assert the scan found something before asserting what it found. A
+        // focus walk that never focuses anything satisfies every check below
+        // it by not running, which is the exact failure mode this tree keeps
+        // catching in structural tests.
+        frame(&ctx, &mut app, vec![key(Key::Tab, true), key(Key::Tab, false)]);
+        assert!(ctx.memory(|m| m.focused()).is_some(),
+                "Tab focused nothing, so this test proves nothing about the button");
+
+        // Does the scanner survive the frame that draws it? Asked separately
+        // from the focus walk because the two failures look identical from the
+        // outside — "the button does nothing" — and have nothing in common.
+        app.open_qr_scan(true);
+        frame(&ctx, &mut app, vec![]);
+        assert!(app.qr.is_some(), "the scanner closed itself during the frame that drew it");
+        app.qr = None;
+        app.modal.dismiss("qr");
+        frame(&ctx, &mut app, vec![]);
+
+        // WHAT THIS TEST DOES NOT PROVE, stated because the gap is real. I
+        // tried to close the loop with a keyboard focus walk — Tab through the
+        // page, press Space on each stop, assert the scanner opened — and it
+        // never reached the buttons across 120 stops even with a 420x2400
+        // surface and a check confirming Tab focuses SOMETHING. I did not find
+        // out why (a scroll area culling the widgets before they get ids is
+        // the best guess) and I am not going to assert a conclusion I did not
+        // reach. A coordinate click was the alternative and it tests the
+        // layout rather than the wiring, breaking the next time a row is added
+        // above.
+        //
+        // So: the control is in peers_page's draw path and calls
+        // open_qr_scan, and the state that call produces survives a frame.
+        // That a finger can reach it is verified by reading the code, not by
+        // this test.
     }
 }
