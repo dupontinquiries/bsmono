@@ -32,6 +32,7 @@ pub mod project_dir;
 pub mod viewport;
 pub mod voice;
 pub mod workspace;
+pub mod rebinds;
 pub mod rack_panel;
 
 /// Everything the running editor holds.
@@ -543,32 +544,38 @@ impl Studio {
         // Three beats per liveness window — one lost packet must not read
         // as a departure.
         const HEARTBEAT_MS: i64 = studio_collab::session::LIVENESS_MS / 3;
+        // Compare BEFORE building: this runs every frame, and the idle
+        // path — almost every frame — must not clone the selection and
+        // format a name just to throw them away.
+        let playhead = self.playhead();
+        // The track being worked in, derived from the selection rather
+        // than tracked separately: the first selected clip's home is
+        // where a collision would happen.
+        let active_track = self.selection.first().and_then(|id|
+            self.session.doc.project.clips.get(id).map(|c| c.track));
+        let changed = match &self.last_presence {
+            None => true,
+            Some(last) => last.playhead != playhead
+                || last.selection != self.selection
+                || last.active_track != active_track
+                || (self.display_name.is_empty() != last.name.starts_with("site "))
+                || (!self.display_name.is_empty() && last.name != self.display_name),
+        };
+        let due = now_ms - self.last_presence_ms >= HEARTBEAT_MS;
+        if !(due || (changed && now_ms - self.last_presence_ms >= MIN_GAP_MS)) {
+            return None;
+        }
         let name = if self.display_name.is_empty() {
             format!("site {}", self.session.doc.site.0)
         } else { self.display_name.clone() };
         let cur = studio_collab::Presence {
             site: self.session.doc.site,
             name,
-            playhead: self.playhead(),
+            playhead,
             selection: self.selection.clone(),
-            // The track being worked in, derived from the selection rather
-            // than tracked separately: the first selected clip's home is
-            // where a collision would happen.
-            active_track: self.selection.first().and_then(|id|
-                self.session.doc.project.clips.get(id).map(|c| c.track)),
+            active_track,
             seq: self.presence_seq + 1,
         };
-        let changed = match &self.last_presence {
-            None => true,
-            Some(last) => last.playhead != cur.playhead
-                || last.selection != cur.selection
-                || last.active_track != cur.active_track
-                || last.name != cur.name,
-        };
-        let due = now_ms - self.last_presence_ms >= HEARTBEAT_MS;
-        if !(due || (changed && now_ms - self.last_presence_ms >= MIN_GAP_MS)) {
-            return None;
-        }
         self.presence_seq += 1;
         self.last_presence = Some(cur.clone());
         self.last_presence_ms = now_ms;
@@ -1579,6 +1586,12 @@ pub struct App {
     take_from: studio_core::Ticks,
     settings_open: bool,
     library_open: bool,
+    /// Pressed→effective key translations, applied to raw typed input
+    /// only (see the module docs for why the palette's keys bypass it).
+    rebinds: rebinds::Rebinds,
+    /// The settings popup is waiting for the next typed key to bind to
+    /// this action's default char. Consumes exactly one keypress.
+    rebind_capture: Option<char>,
     /// The export dialog's plan while it is open, plus its last refusal —
     /// shown inline so a bad plan is a message, not a closed window.
     export_dialog: Option<export::Plan>,
@@ -1706,6 +1719,7 @@ impl Default for App {
               mic: capture::open_capture(),
               take_from: studio_core::Ticks::ZERO,
               settings_open: false, library_open: ws.library_open,
+              rebinds: rebinds::Rebinds::decode(&ws.rebinds), rebind_capture: None,
               archive_ui: None,
               side_slot: match ws.side_slot.as_str() {
                   "off" => SideSlot::Off,
@@ -1765,7 +1779,24 @@ impl eframe::App for App {
         // While the palette is open it owns the keyboard — typing 'd' is a
         // search, not a delete.
         let typed: Vec<char> = if self.palette.is_some() { Vec::new() } else { typed };
+        // A pending rebind capture eats exactly one key — the next thing
+        // typed IS the answer to "press the new key", not an edit.
+        let typed: Vec<char> = if let Some(target) = self.rebind_capture {
+            if let Some(ch) = typed.first() {
+                self.rebinds.set(*ch, target);
+                self.rebind_capture = None;
+                self.studio.status = if *ch == target {
+                    format!("{target:?} back to default")
+                } else {
+                    format!("{ch:?} now does what {target:?} did")
+                };
+            }
+            Vec::new()
+        } else { typed };
         for ch in typed {
+            // Rebinds translate RAW input only, before the intercepted keys
+            // and the keymap alike see it — one table, both consumers.
+            let ch = self.rebinds.resolve(ch);
             // The alignment keys, intercepted before the Helix keymap —
             // they need `self.audio` (the keymap cannot) and their chars
             // are pinned unbound in the keymap by test. Every one of them
@@ -1971,6 +2002,7 @@ impl eframe::App for App {
                             .map(|p| p.display().to_string()).collect(),
                         library_open: self.library_open,
                         display_name: self.studio.display_name.clone(),
+                        rebinds: self.rebinds.encode(),
                     });
                     // The directory must exist (and be ours) BEFORE the
                     // file is written: a save into a fresh project root
@@ -2069,6 +2101,44 @@ impl eframe::App for App {
             let mut open = true;
             egui::Window::new("Settings").open(&mut open).resizable(false)
                 .collapsible(false).show(ctx, |ui| {
+                    ui.label("keys — press rebind, then the new key:");
+                    // The actions worth offering: the everyday editing verbs.
+                    // Each row names the DEFAULT char; what currently reaches
+                    // it is read from the table, so a swap shows truthfully
+                    // on both rows. Not every keymap action — the point is
+                    // the keys people's hands disagree about, not a full
+                    // keymap editor (that stays a non-goal; see rebinds.rs).
+                    const REBINDABLE: [(&str, char); 8] = [
+                        ("delete selection", 'd'), ("split at playhead", 's'),
+                        ("yank", 'y'), ("paste", 'p'),
+                        ("undo", 'u'), ("redo", 'U'),
+                        ("align clips", 'A'), ("quantize clips", 'Q'),
+                    ];
+                    for (label, def) in REBINDABLE {
+                        ui.horizontal(|ui| {
+                            let now = self.rebinds.keys_for(def);
+                            let shown = if now.is_empty() { "(unbound!)".to_string() }
+                                else { now.iter().map(|c| format!("{c}"))
+                                          .collect::<Vec<_>>().join(" ") };
+                            let capturing = self.rebind_capture == Some(def);
+                            if ui.add(egui::Button::selectable(capturing,
+                                    if capturing { "press a key…" } else { "rebind" }))
+                                .clicked() {
+                                self.rebind_capture =
+                                    if capturing { None } else { Some(def) };
+                            }
+                            ui.monospace(shown);
+                            ui.label(label);
+                        });
+                    }
+                    if !self.rebinds.is_empty() && ui.button("reset all keys").clicked() {
+                        self.rebinds = rebinds::Rebinds::default();
+                        self.rebind_capture = None;
+                    }
+                    ui.colored_label(egui::Color32::GRAY,
+                        "raw keys only — the palette and its hints keep the defaults. \
+                         Saved per device with the workspace.");
+                    ui.separator();
                     ui.label("your name, as peers see it beside your playhead:");
                     let hint = format!("site {}", self.studio.session.doc.site.0);
                     ui.add(egui::TextEdit::singleline(&mut self.studio.display_name)
@@ -2086,7 +2156,7 @@ impl eframe::App for App {
                          Saved per device with the workspace — a phone and a desktop \
                          answer this differently on purpose.");
                 });
-            if !open { self.settings_open = false; }
+            if !open { self.settings_open = false; self.rebind_capture = None; }
         }
         if let Some((bus, bus_name)) = self.studio.mix_pass_request.take() {
             // Measure the ACTUAL mixdown — the thing being mastered, not a

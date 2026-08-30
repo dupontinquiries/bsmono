@@ -421,8 +421,13 @@ impl Prefs {
 /// Order a listing by preference: pinned first, demoted last, everything
 /// else in the order it arrived (alphabetical from the scan). Stable, so
 /// a pin moves ONE row and nothing else jumps.
-pub fn arrange(entries: &[LibraryEntry], prefs: &Prefs) -> Vec<LibraryEntry> {
-    let mut out = entries.to_vec();
+pub fn arrange<'a>(entries: &'a [LibraryEntry], prefs: &Prefs) -> Vec<&'a LibraryEntry> {
+    // References, not clones: this runs per frame per visible directory,
+    // and the 23,000-file library the module doc names is exactly where a
+    // to_vec() of labels and paths per frame becomes the sidebar's whole
+    // frame budget. Sorting fat entries also MOVES them repeatedly; sorting
+    // pointers is what a rank sort should cost.
+    let mut out: Vec<&LibraryEntry> = entries.iter().collect();
     out.sort_by_key(|e| prefs.rank(&e.path));
     out
 }
@@ -431,7 +436,8 @@ pub fn arrange(entries: &[LibraryEntry], prefs: &Prefs) -> Vec<LibraryEntry> {
 /// deep library shows `zaytoven/808s & Kicks` ONCE with bare filenames
 /// under it, instead of repeating the folder on every row and forcing the
 /// sidebar wide enough for the longest path in the pack.
-pub fn sections(entries: &[LibraryEntry]) -> Vec<(String, Vec<LibraryEntry>)> {
+pub fn sections<'a>(entries: impl IntoIterator<Item = &'a LibraryEntry>)
+    -> Vec<(String, Vec<LibraryEntry>)> {
     let mut out: Vec<(String, Vec<LibraryEntry>)> = Vec::new();
     for e in entries {
         let (dir, file) = match e.label.rsplit_once('/') {
@@ -532,12 +538,16 @@ impl TreeState {
         self.last_focus = None;
         self.results.clear();
     }
-    fn listing(&mut self, dir: &Path) -> DirListing {
-        if let Some(l) = self.cache.get(dir) { return l.clone(); }
-        let l = scan_dir(dir);
-        self.cache.insert(dir.to_path_buf(), l.clone());
-        l
+    /// Scan-if-absent. Split from the read so a caller can take a plain
+    /// borrow afterwards instead of a per-frame clone of every entry —
+    /// the borrow checker's price for the old `-> DirListing` was paid in
+    /// heap traffic on every frame an expanded tree was visible.
+    fn ensure(&mut self, dir: &Path) {
+        if !self.cache.contains_key(dir) {
+            self.cache.insert(dir.to_path_buf(), scan_dir(dir));
+        }
     }
+    fn cached(&self, dir: &Path) -> Option<&DirListing> { self.cache.get(dir) }
 }
 
 /// A control whose touch area and glyph are the same square. Uniform
@@ -747,8 +757,8 @@ pub fn show_tree(ui: &mut egui::Ui, roots: &Roots, state: &mut TreeState,
             // Search results carry their folder in the label, which is
             // what made this sidebar so wide. Grouped under one header
             // each, the rows only need the filename.
-            let results = arrange(&state.results.clone(), prefs);
-            for (header, list) in sections(&results) {
+            let results = arrange(&state.results, prefs);
+            for (header, list) in sections(results.iter().copied()) {
                 if !header.is_empty() {
                     ui.add_space(2.0);
                     ui.colored_label(c.text_weak, header);
@@ -764,8 +774,14 @@ pub fn show_tree(ui: &mut egui::Ui, roots: &Roots, state: &mut TreeState,
                 rack: &studio_live::Rack, project: &studio_core::Project,
                 prefs: &Prefs, compact: bool, c: &uikit_egui::PaletteColors,
                 action: &mut Option<LibraryAction>) {
-            let listing = state.listing(dir);
-            for (name, sub) in &listing.dirs {
+            state.ensure(dir);
+            // Subdirectory names are cloned (a handful of short strings) so
+            // the loop can mutate `expanded` and recurse; the FILES — the
+            // heavy half, thousands of entries in a real pack — are drawn
+            // from a plain borrow below, in their own scope, cloning nothing.
+            let dirs: Vec<(String, PathBuf)> = state.cached(dir)
+                .map(|l| l.dirs.clone()).unwrap_or_default();
+            for (name, sub) in &dirs {
                 let open = state.expanded.contains(sub);
                 let glyph = if open { "▾" } else { "▸" };
                 if ui.selectable_label(open, format!("{glyph} {name}")).clicked() {
@@ -779,12 +795,16 @@ pub fn show_tree(ui: &mut egui::Ui, roots: &Roots, state: &mut TreeState,
                     });
                 }
             }
-            for e in &arrange(&listing.files, prefs) {
-                sample_row(ui, e, compact, rack, project, prefs, c, action);
+            if let Some(listing) = state.cached(dir) {
+                for e in arrange(&listing.files, prefs) {
+                    sample_row(ui, e, compact, rack, project, prefs, c, action);
+                }
             }
         }
-        let top = state.listing(root);
-        if top.dirs.is_empty() && top.files.is_empty() {
+        state.ensure(root);
+        let top_empty = state.cached(root)
+            .map(|l| l.dirs.is_empty() && l.files.is_empty()).unwrap_or(true);
+        if top_empty {
             ui.colored_label(c.text_weak,
                 "empty. Set STUDIO_LIBRARY or put samples in ./library");
         }

@@ -44,6 +44,10 @@ pub struct WorkspaceState {
     /// with `combined` and friends rather than being forgotten every
     /// launch (it was: the flag existed only in the shell).
     pub library_open: bool,
+    /// Pressed→effective key translations, in `rebinds::Rebinds`' own
+    /// codepoint encoding. A string here rather than a parsed type so the
+    /// sidecar stays a dumb tolerant format; the shell parses on load.
+    pub rebinds: String,
     /// What presence packets call this device's person. Per DEVICE on
     /// purpose — the same person on a phone and a desktop may want
     /// "kes (phone)" vs "kes", and the sidecar is exactly the file that
@@ -60,14 +64,15 @@ impl Default for WorkspaceState {
                          bounce_format: "opus-192".into(),
                          pinned: Vec::new(), demoted: Vec::new(),
                          voice_domains: "common,instruments".into(),
-                         library_open: true, display_name: String::new() }
+                         library_open: true, display_name: String::new(),
+                         rebinds: String::new() }
     }
 }
 
 impl WorkspaceState {
     pub fn encode(&self) -> String {
         format!("# per-device layout; safe to delete, never load-bearing\n\
-                 combined={}\npanel={}\nside_slot={}\npx_per_sec={}\nscroll_ticks={}\nclosed_groups={}\nbounce_format={}\npinned={}\ndemoted={}\nvoice_domains={}\nlibrary_open={}\ndisplay_name={}\n",
+                 combined={}\npanel={}\nside_slot={}\npx_per_sec={}\nscroll_ticks={}\nclosed_groups={}\nbounce_format={}\npinned={}\ndemoted={}\nvoice_domains={}\nlibrary_open={}\ndisplay_name={}\nrebinds={}\n",
                 self.combined, self.panel, self.side_slot,
                 self.px_per_sec, self.scroll_ticks,
                 self.closed_groups.iter().map(|g| g.to_string())
@@ -78,7 +83,8 @@ impl WorkspaceState {
                 // silent, confusing failure.
                 self.pinned.join("\t"),
                 self.demoted.join("\t"),
-                self.voice_domains, self.library_open, self.display_name)
+                self.voice_domains, self.library_open, self.display_name,
+                self.rebinds)
     }
     /// Parse leniently: defaults underneath, known keys on top, everything
     /// else ignored. There is no error case ON PURPOSE.
@@ -108,6 +114,7 @@ impl WorkspaceState {
                 "voice_domains" => w.voice_domains = v.trim().to_string(),
                 "library_open" => if let Ok(b) = v.trim().parse() { w.library_open = b },
                 "display_name" => w.display_name = v.trim().to_string(),
+                "rebinds" => w.rebinds = v.trim().to_string(),
                 _ => {} // a newer build's key, not our business
             }
         }
@@ -213,7 +220,8 @@ mod tests {
             closed_groups: vec![3, 9], bounce_format: "flac".into(),
             pinned: vec!["kicks/808, big.wav".into()], demoted: vec!["hats/tick.opus".into()],
             voice_domains: "trap,film".into(),
-            library_open: false, display_name: "kes".into() };
+            library_open: false, display_name: "kes".into(),
+            rebinds: "44>46,107>100".into() };
         assert_eq!(WorkspaceState::decode(&w.encode()), w);
         // A newer build's key rides along harmlessly; garbage lines too.
         let with_future = format!("{}\nfuture_key=whatever\n<<<garbage", w.encode());
