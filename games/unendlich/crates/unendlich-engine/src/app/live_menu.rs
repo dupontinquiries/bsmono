@@ -212,6 +212,137 @@ pub fn item_tooltip_from_tip(ui: &mut egui::Ui, tip: &str) {
 }
 
 
+
+/// Inputs the new-game WIZARD body draws from. The two text buffers are
+/// caller-owned `&mut String`s (egui edits in place); the seed preview is a
+/// caller-uploaded texture (the renderer owns the handle + dirty flags —
+/// this body only draws what it's given).
+pub struct WizardState<'a> {
+    pub title: &'a str,
+    pub summary: &'a str,
+    pub can_next: bool,
+    pub at_confirm: bool,
+    /// r205: focus the name box this frame (first frame open).
+    pub focus_name: bool,
+    pub name_buf: &'a mut String,
+    pub seed_buf: &'a mut String,
+    /// Pre-uploaded seed-preview texture + draw size, if ready.
+    pub preview: Option<(egui::TextureId, egui::Vec2)>,
+}
+
+/// What the wizard decided this frame. `pick` uses the bin's action codes:
+/// 1 Back, 2 Next, 3 Create, 4 Cancel, 5 Mode, 6 Seed, 7 set-name,
+/// 8 apply-seed, 9 one-click Create World. `preview_click` = (u, v,
+/// secondary) on the birds-eye strip (r185 seek/avoid).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WizardOut {
+    pub pick: u8,
+    pub preview_click: Option<(f32, f32, bool)>,
+}
+
+/// The wizard's flexible-width button — the original `tbtn` art.
+fn wiz_button(ui: &mut egui::Ui, label: &str) -> bool {
+    #[cfg(feature = "unendlich-ui")]
+    {
+        let accent = unendlich_ui::current_theme(ui.ctx()).accent;
+        unendlich_ui::button(ui, label, accent).clicked()
+    }
+    #[cfg(not(feature = "unendlich-ui"))]
+    {
+        ui.button(label).clicked()
+    }
+}
+
+/// The new-game WIZARD body (r179-r205), extracted from the renderer window
+/// with the live_menu contract: headless-drawable, kit-optional, tested,
+/// photographed. The caller owns the window chrome, the text buffers, the
+/// preview texture lifecycle, and applies the picks.
+pub fn wizard_body(ui: &mut egui::Ui, s: &mut WizardState<'_>) -> WizardOut {
+    let mut out = WizardOut::default();
+    ui.vertical_centered(|ui| {
+        #[cfg(feature = "unendlich-ui")]
+        ui.label(
+            egui::RichText::new(s.title.to_uppercase())
+                .font(unendlich_ui::menu::blocks_font(24.0))
+                .color(egui::Color32::from_rgb(0xee, 0xf3, 0xe8))
+                .extra_letter_spacing(4.0),
+        );
+        #[cfg(not(feature = "unendlich-ui"))]
+        ui.label(egui::RichText::new(s.title.to_uppercase()).size(24.0).strong());
+        ui.add_space(8.0);
+        ui.label(s.summary);
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if wiz_button(ui, " Mode ") {
+                out.pick = 5;
+            }
+            if wiz_button(ui, " Seed ") {
+                out.pick = 6;
+            }
+        });
+        // r179: name the world (action 7 applies).
+        ui.horizontal(|ui| {
+            ui.label("name:");
+            let resp = ui.text_edit_singleline(s.name_buf);
+            // r205: focus the name box the first frame the wizard opens, so
+            // typing works without a precise click on the field.
+            if s.focus_name {
+                resp.request_focus();
+            }
+            if resp.lost_focus() || wiz_button(ui, "set") {
+                out.pick = 7;
+            }
+        });
+        // r181/r185: birds-eye equirect strip; click seeks matching seeds,
+        // right-click avoids.
+        if let Some((tex_id, size)) = s.preview {
+            ui.add_space(8.0);
+            let img = ui.add(egui::Image::new((tex_id, size)).sense(egui::Sense::click()));
+            if img.clicked() || img.secondary_clicked() {
+                if let Some(pos) = img.interact_pointer_pos() {
+                    let r = img.rect;
+                    let u = ((pos.x - r.min.x) / r.width()).clamp(0.0, 1.0);
+                    let v = ((pos.y - r.min.y) / r.height()).clamp(0.0, 1.0);
+                    out.preview_click = Some((u, v, img.secondary_clicked()));
+                }
+            }
+            ui.weak("birds-eye \u{00b7} equirect strip");
+            ui.add_space(4.0);
+        }
+        // r181: type a seed directly (Enter/apply).
+        ui.horizontal(|ui| {
+            ui.label("seed:");
+            let resp = ui.text_edit_singleline(s.seed_buf);
+            if resp.lost_focus() || wiz_button(ui, "apply") {
+                out.pick = 8;
+            }
+        });
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if wiz_button(ui, " Back ") {
+                out.pick = 1;
+            }
+            if s.at_confirm {
+                if wiz_button(ui, " Create ") {
+                    out.pick = 3;
+                }
+            } else if s.can_next && wiz_button(ui, " Next ") {
+                out.pick = 2;
+            }
+            // r185: one-click create from any step — blank name gets a
+            // default bin-side.
+            if wiz_button(ui, " Create World ") {
+                out.pick = 9;
+            }
+        });
+        ui.add_space(6.0);
+        if wiz_button(ui, " Cancel ") {
+            out.pick = 4;
+        }
+    });
+    out
+}
+
 /// What the pause menu decided this frame. `pick` uses the bin's r167 codes:
 /// 0 nothing, 1 Resume, 2 Settings, 3 Save & Quit to Title.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -612,6 +743,38 @@ mod tests {
                 "screen kind {kind} produced no shapes — the menu did not draw"
             );
         }
+    }
+
+    /// The wizard body draws headless with editable buffers and a default
+    /// (no-click) outcome — the extraction contract, on both feature paths.
+    #[test]
+    fn wizard_draws_headless_with_no_outputs() {
+        let ctx = test_ctx();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(720.0, 560.0),
+        ));
+        let mut name = String::from("Vale");
+        let mut seed = String::from("1337");
+        let out = ctx.run(input, |c| {
+            egui::CentralPanel::default().show(c, |ui| {
+                let mut st = WizardState {
+                    title: "New World",
+                    summary: "mode: survival · seed: 1337",
+                    can_next: true,
+                    at_confirm: false,
+                    focus_name: false,
+                    name_buf: &mut name,
+                    seed_buf: &mut seed,
+                    preview: None,
+                };
+                let w = wizard_body(ui, &mut st);
+                assert_eq!(w, WizardOut::default(), "no clicks → no outputs");
+            });
+        });
+        assert!(!out.shapes.is_empty(), "the wizard drew nothing");
+        assert_eq!(name, "Vale", "buffers untouched without input");
     }
 
     /// The composed item tooltip paints every rarity tier headless — the

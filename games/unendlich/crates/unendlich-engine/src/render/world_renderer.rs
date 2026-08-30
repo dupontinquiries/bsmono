@@ -4568,91 +4568,39 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                         .title_bar(false)
                         .show(c, |ui| {
                             unendlich_ui::set_theme(ui.ctx(), unendlich_ui::Theme::DARK);
-                            ui.vertical_centered(|ui| {
-                                ui.label(
-                                    egui::RichText::new(wizard_title.to_uppercase())
-                                        .font(unendlich_ui::menu::blocks_font(24.0))
-                                        .color(egui::Color32::from_rgb(0xee, 0xf3, 0xe8))
-                                        .extra_letter_spacing(4.0),
-                                );
-                                ui.add_space(8.0);
-                                ui.label(&wizard_summary);
-                                ui.add_space(12.0);
-                                ui.horizontal(|ui| {
-                                    if tbtn(ui, " Mode ") { wizard_pick = 5; }
-                                    if tbtn(ui, " Seed ") { wizard_pick = 6; }
-                                });
-                                // r179: name the world (action 7 applies).
-                                ui.horizontal(|ui| {
-                                    ui.label("name:");
-                                    let resp = ui.text_edit_singleline(&mut wizard_name_buf);
-                                    // r205: focus the name box the first frame
-                                    // the wizard opens, so typing works without
-                                    // a precise click on the field (part of the
-                                    // "text entry not passing through" fix).
-                                    if wizard_focus_name {
-                                        resp.request_focus();
-                                    }
-                                    if resp.lost_focus() || tbtn(ui, "set") {
-                                        wizard_pick = 7;
-                                    }
-                                });
-                                // r181: birds-eye equirect strip of the
-                                // chosen seed (96x48, nearest-scaled 3x).
-                                if wizard_preview_dirty && !wizard_preview_uploaded {
-                                    let img = egui::ColorImage::from_rgb(
-                                        [96, 48],
-                                        &wizard_preview_rgb,
-                                    );
-                                    wizard_preview_tex = Some(c.load_texture(
-                                        "unendlich_seed_preview",
-                                        img,
-                                        egui::TextureOptions::NEAREST,
-                                    ));
-                                    wizard_preview_uploaded = true;
-                                }
-                                if let Some(tex) = &wizard_preview_tex {
-                                    ui.add_space(8.0);
-                                    let img = ui.add(
-                                        egui::Image::new((tex.id(), egui::vec2(288.0, 144.0)))
-                                            .sense(egui::Sense::click()),
-                                    );
-                                    // r185: click a region -> seek seeds that
-                                    // MATCH it (right-click: AVOID it).
-                                    if img.clicked() || img.secondary_clicked() {
-                                        if let Some(pos) = img.interact_pointer_pos() {
-                                            let r = img.rect;
-                                            let u = ((pos.x - r.min.x) / r.width()).clamp(0.0, 1.0);
-                                            let v = ((pos.y - r.min.y) / r.height()).clamp(0.0, 1.0);
-                                            wizard_preview_click_out = Some((u, v, img.secondary_clicked()));
-                                        }
-                                    }
-                                    ui.weak("birds-eye \u{00b7} equirect strip");
-                                    ui.add_space(4.0);
-                                }
-                                // r181: type a seed directly (Enter/apply).
-                                ui.horizontal(|ui| {
-                                    ui.label("seed:");
-                                    let resp = ui.text_edit_singleline(&mut wizard_seed_buf);
-                                    if resp.lost_focus() || tbtn(ui, "apply") {
-                                        wizard_pick = 8;
-                                    }
-                                });
-                                ui.add_space(10.0);
-                                ui.horizontal(|ui| {
-                                    if tbtn(ui, " Back ") { wizard_pick = 1; }
-                                    if wizard_at_confirm {
-                                        if tbtn(ui, " Create ") { wizard_pick = 3; }
-                                    } else if wizard_can_next {
-                                        if tbtn(ui, " Next ") { wizard_pick = 2; }
-                                    }
-                                    // r185: one-click create from any step —
-                                    // blank name gets a default bin-side.
-                                    if tbtn(ui, " Create World ") { wizard_pick = 9; }
-                                });
-                                ui.add_space(6.0);
-                                if tbtn(ui, " Cancel ") { wizard_pick = 4; }
-                            });
+                            // r-extract: the wizard body lives in
+                            // app::live_menu::wizard_body (headless-drawable,
+                            // tested, photographed). This window handles ONLY
+                            // chrome + the preview-texture lifecycle + pick
+                            // mapping.
+                            if wizard_preview_dirty && !wizard_preview_uploaded {
+                                let img = egui::ColorImage::from_rgb([96, 48], &wizard_preview_rgb);
+                                wizard_preview_tex = Some(c.load_texture(
+                                    "unendlich_seed_preview",
+                                    img,
+                                    egui::TextureOptions::NEAREST,
+                                ));
+                                wizard_preview_uploaded = true;
+                            }
+                            let mut wstate = crate::app::live_menu::WizardState {
+                                title: &wizard_title,
+                                summary: &wizard_summary,
+                                can_next: wizard_can_next,
+                                at_confirm: wizard_at_confirm,
+                                focus_name: wizard_focus_name,
+                                name_buf: &mut wizard_name_buf,
+                                seed_buf: &mut wizard_seed_buf,
+                                preview: wizard_preview_tex
+                                    .as_ref()
+                                    .map(|t| (t.id(), egui::vec2(288.0, 144.0))),
+                            };
+                            let w = crate::app::live_menu::wizard_body(ui, &mut wstate);
+                            if w.pick != 0 {
+                                wizard_pick = w.pick as u32;
+                            }
+                            if let Some(clk) = w.preview_click {
+                                wizard_preview_click_out = Some(clk);
+                            }
                         });
                 }
                 // ── Debug · shaderpack panel (Esc) ──

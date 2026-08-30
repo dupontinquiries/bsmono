@@ -41,6 +41,7 @@ fn main() {
     ];
     render_pause("/mnt/user-data/outputs/menu_live_pause.png");
     render_tooltips("/mnt/user-data/outputs/menu_live_tooltips.png");
+    render_wizard("/mnt/user-data/outputs/menu_live_wizard.png");
     for (kind, name) in [
         (0u8, "live_title"),
         (1, "live_confirm_quit"),
@@ -50,6 +51,29 @@ fn main() {
     ] {
         render_live(kind, &mp, &worlds, &rb, &format!("/mnt/user-data/outputs/menu_{name}.png"));
     }
+}
+
+fn render_wizard(out: &str) {
+    use unendlich_engine::app::live_menu::{wizard_body, WizardState};
+    let name = std::cell::RefCell::new(String::from("Vale"));
+    let seed = std::cell::RefCell::new(String::from("90210"));
+    render_with(out, |c| {
+        #[cfg(feature = "unendlich-ui")]
+        unendlich_ui::set_theme(c, unendlich_ui::Theme::DARK);
+        egui::CentralPanel::default().show(c, |ui| {
+            let mut st = WizardState {
+                title: "New World",
+                summary: "mode: survival \u{00b7} seed: 90210",
+                can_next: true,
+                at_confirm: false,
+                focus_name: false,
+                name_buf: &mut name.borrow_mut(),
+                seed_buf: &mut seed.borrow_mut(),
+                preview: None,
+            };
+            let _ = wizard_body(ui, &mut st);
+        });
+    });
 }
 
 fn render_tooltips(out: &str) {

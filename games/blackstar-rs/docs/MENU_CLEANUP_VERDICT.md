@@ -84,3 +84,26 @@ write-back — a ready extraction seam), and it has no arrow-key navigation.
 `menu.rs`'s navigation model (wrap, skip-unselectable, scroll-follow) is the
 thing worth porting THERE once the closure is extracted; the two games then
 share the navigation brain while keeping their own art.
+
+
+## Final state (2026-08-29): the cleanup is COMPLETE per this verdict
+
+- **Pause** — arrow-nav added the lightweight way (horizontal bar, not a list).
+- **Maps** — stays bespoke: per-row ART (style swatches, markers) that generic
+  rows would erase; input already complete.
+- **Online** — migrated; the first live `menu::Menu` consumer proved the
+  machinery (and grew `Item::Field` for every future text-entry screen).
+- **Tweaks** — AUDITED, STAYS on its binding-row model (2026-08-29): its rows
+  carry getter/setter FUNCTION POINTERS into `Config` — direct two-way
+  binding across ~40 sliders/toggles on multiple pages, with per-row
+  defaults and formats. Migrating onto `menu::Menu`'s value+event model
+  would replace that with a giant id→setter match: more code, more
+  regression surface, zero behavior gained. The binding-row model is the
+  BETTER design for settings; if anything ever converges, it should be
+  `menu::Menu` learning binding rows, not Tweaks abandoning them.
+- **Binds** — stays bespoke: key-capture is modal by nature (the next
+  keypress is DATA, not navigation) and shares nothing with list menus.
+
+The duplication this document was written to kill is dead where killing it
+paid (Online), and deliberately spared where the "duplication" was actually
+a better-fitting design (Maps' art, Tweaks' bindings, Binds' capture).
