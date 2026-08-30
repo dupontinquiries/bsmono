@@ -3666,7 +3666,33 @@ The recogniser lives on the tab, not per frame: a tap is a press AND a
 release, so a recogniser rebuilt each frame can never see the second
 half of one.
 
-- **C68a — row hit-testing is the next step**, and it unlocks the other
-  half of the table (tap-to-fold a section, selection). It needs row
-  rects from the draw loop, which is a real change rather than a wiring
-  one.
+- **C68a — DONE. Rows are hit-tested.** The draw loop records
+  `(document line, rect)` per row and gestures resolve against them, so
+  `Hit::Line` reaches `map_gesture` instead of `Hit::Nothing`.
+
+  Rects are rebuilt EVERY FRAME rather than cached. Rows move when the
+  fold state changes or the window resizes, and a stale rect maps a tap
+  to the wrong line — which for `ToggleFold` folds a section the person
+  did not touch. One rect per VISIBLE row (the ScrollArea only draws
+  those), so caching would trade a real bug for nothing.
+
+  The rects are necessarily LAST frame's: gestures are resolved before
+  rows are drawn. That is correct for a tap — the row was under the
+  finger when it was pressed — and it bounds the staleness at one frame,
+  which is the argument for rebuilding rather than caching.
+
+  The index stored is the DOCUMENT line, not the row position: a folded
+  view has fewer rows than lines, and `ToggleFold(usize)` means a line.
+
+  `gesture_pos` only returns a point for POSITIONAL gestures. A swipe
+  carries velocity and no point — it is a whole-view gesture, and
+  resolving it against a row would attach a global action to whichever
+  line happened to be under the finger.
+
+  `ToggleFold` expands rather than toggling one section: Peek's fold is
+  a single `collapse` flag, so per-section state does not exist. That is
+  the closest honest behaviour and what a person tapping a "12×" row
+  expects.
+
+- **C68b — selection is the last unreachable part** of the table, and it
+  needs a selection model Peek does not have. Not a wiring job.

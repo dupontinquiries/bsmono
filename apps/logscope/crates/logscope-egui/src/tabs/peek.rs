@@ -14,6 +14,10 @@ pub struct Peek {
     /// press AND a release, and a per-frame recogniser can never see the
     /// second half of one.
     touch: touchkit::Recognizer,
+    /// (document line index, screen rect) for each row drawn last frame.
+    /// Feeds gesture hit-testing; see the draw loop for why it is not
+    /// cached.
+    row_rects: Vec<(usize, egui::Rect)>,
 }
 impl Default for Peek {
     fn default() -> Self {
@@ -22,7 +26,23 @@ impl Default for Peek {
             collapse: false,
             goto_top: false,
             touch: touchkit::Recognizer::new(touchkit::Config::default()),
+            row_rects: Vec::new(),
         }
+    }
+}
+
+/// Where a gesture happened, for hit-testing against row rects.
+///
+/// Only the POSITIONAL gestures have one. A swipe carries a velocity and
+/// no point — it is a whole-view gesture, so resolving it against a row
+/// would attach a global action to whichever line happened to be under
+/// the finger.
+fn gesture_pos(g: &touchkit::Gesture) -> Option<touchkit::Vec2> {
+    use touchkit::Gesture as G;
+    match g {
+        G::Tap(p) | G::DoubleTap(p) | G::LongPress(p) | G::PanStart(p) | G::PanEnd(p) => Some(*p),
+        G::Pan { pos, .. } => Some(*pos),
+        _ => None,
     }
 }
 
@@ -85,21 +105,40 @@ impl Peek {
                     .collect()
             });
             for g in self.touch.update(&touches, now) {
-                // `Hit::Nothing` because Peek draws rows inside a
-                // ScrollArea and does not currently know which row a
-                // point landed on. Passing a real hit needs row rects,
-                // which is the next step rather than a guess — a wrong
-                // row index folds the wrong section.
-                match map_gesture(Mode::Read, &g, Hit::Nothing) {
+                // A REAL HIT, from the rects recorded last frame.
+                //
+                // Last frame's, necessarily: the gesture is resolved
+                // before the rows are drawn, so the only rects available
+                // are the previous frame's. That is correct for a tap —
+                // the row was under the finger when it was pressed — and
+                // it is why the rects are rebuilt rather than cached: a
+                // fold or a resize moves them, and one frame of staleness
+                // is the most this can carry.
+                let hit = gesture_pos(&g)
+                    .and_then(|p| {
+                        self.row_rects.iter()
+                            .find(|(_, r)| r.contains(egui::pos2(p.x, p.y)))
+                            .map(|(line, _)| Hit::Line(*line))
+                    })
+                    .unwrap_or(Hit::Nothing);
+                match map_gesture(Mode::Read, &g, hit) {
                     LogAction::FoldAll => self.collapse = true,
                     LogAction::UnfoldAll => self.collapse = false,
                     // Scroll is egui's own job inside a ScrollArea;
                     // applying it here would double every drag.
                     LogAction::Scroll { .. } | LogAction::None => {}
+                    // Tap a folded run to expand everything. Peek's
+                    // fold is all-or-nothing (`collapse` is one flag),
+                    // so a per-section toggle would need per-run state
+                    // this tab does not have — expanding is the closest
+                    // honest behaviour, and it is what a person taps a
+                    // "12×" row expecting.
+                    LogAction::ToggleFold(_) => self.collapse = false,
                     other => {
-                        // Named rather than ignored, so a reader can see
-                        // which half of the table is still unreachable.
-                        let _ = other; // needs a row hit / selection model
+                        // Selection still has no model here. Named
+                        // rather than ignored so a reader can see which
+                        // part of the table remains unreachable.
+                        let _ = other;
                     }
                 }
             }
@@ -108,9 +147,22 @@ impl Peek {
         let mut sa = egui::ScrollArea::vertical().id_salt("peek").auto_shrink([false, false]);
         if self.goto_top { sa = sa.vertical_scroll_offset(0.0); self.goto_top = false; }
         sa.show(ui, |ui| {
+            // ROW RECTS, recorded as they are drawn.
+            //
+            // Rebuilt every frame rather than cached: rows move when the
+            // fold state changes or the window resizes, and a stale rect
+            // maps a tap to the wrong line — which for `ToggleFold` folds
+            // a section the person did not touch. Cheap enough (one rect
+            // per visible row, and the ScrollArea only draws visible
+            // ones) that caching would trade a real bug for nothing.
+            //
+            // The index stored is the DOCUMENT line, not the row
+            // position, because a folded view has fewer rows than lines
+            // and `LogAction::ToggleFold(usize)` means a line.
+            self.row_rects.clear();
             match &runs {
                 Some(r) => for &(start, line, count) in r {
-                    ui.horizontal(|ui| {
+                    let resp = ui.horizontal(|ui| {
                         if count > 1 {
                             ui.label(RichText::new(format!("{count:>4}×")).color(theme::AMBER()).monospace().strong());
                         } else {
@@ -118,12 +170,14 @@ impl Peek {
                         }
                         ui.label(RichText::new(line).color(self.line_color(line)).monospace());
                     });
+                    self.row_rects.push((start.saturating_sub(1), resp.response.rect));
                 },
                 None => for (n, line) in doc.lines.iter().enumerate() {
-                    ui.horizontal(|ui| {
+                    let resp = ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("{:>4}", n + 1)).color(theme::FAINT()).monospace());
                         ui.label(RichText::new(line).color(self.line_color(line)).monospace());
                     });
+                    self.row_rects.push((n, resp.response.rect));
                 },
             }
         });
