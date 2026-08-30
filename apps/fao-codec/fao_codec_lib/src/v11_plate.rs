@@ -935,12 +935,50 @@ pub fn temporal_denoise(cur: &Yuv420, pred: &Yuv420, band: i32) -> (Yuv420, f32)
     (out, sigma)
 }
 
-/// Deterministic luma grain, reproducible from (seed, σ). Triangular
-/// distribution (sum of two uniforms) ≈ film grain's soft look, cheap.
-pub fn synth_grain(f: &mut Yuv420, sigma: f32, seed: u64) {
+/// Lag-1 horizontal autocorrelation of the in-band (grain-attributed)
+/// component of cur − pred. Real scan/film grain is spatially LOW-PASS
+/// (ρ ≈ 0.2–0.5 after the optical chain and any prior encode); white
+/// synthesis reads as electronic noise and costs SSIM. The decoder's
+/// shader needs this one number to match the spectrum's first moment.
+pub fn grain_lag1(cur: &Yuv420, pred: &Yuv420, band: i32) -> f32 {
+    let (w, h) = (cur.w, cur.h);
+    let mut num = 0.0f64;
+    let mut den = 0.0f64;
+    for y in 0..h {
+        let mut prev_d: Option<f64> = None;
+        for x in 0..w {
+            let i = y * w + x;
+            let d = cur.y[i] as i32 - pred.y[i] as i32;
+            if d.abs() <= band {
+                let df = d as f64;
+                den += df * df;
+                if let Some(pd) = prev_d {
+                    num += df * pd;
+                }
+                prev_d = Some(df);
+            } else {
+                prev_d = None;
+            }
+        }
+    }
+    if den > 1.0 {
+        (num / den) as f32
+    } else {
+        0.0
+    }
+}
+
+/// Deterministic luma grain, reproducible from (seed, σ, ρ). White
+/// triangular noise shaped by a separable AR(1) filter with the MEASURED
+/// lag-1 correlation, then variance-normalized back to σ — the cheap
+/// version of AV1's AR-coefficient film-grain synthesis, and the
+/// difference between "believable film grain" and "electronic snow".
+pub fn synth_grain(f: &mut Yuv420, sigma: f32, rho: f32, seed: u64) {
     if sigma <= 0.05 {
         return;
     }
+    let (w, h) = (f.w, f.h);
+    let rho = rho.clamp(0.0, 0.9);
     let mut s = seed | 1;
     let mut next = move || {
         s ^= s << 13;
@@ -948,14 +986,33 @@ pub fn synth_grain(f: &mut Yuv420, sigma: f32, seed: u64) {
         s ^= s << 17;
         s
     };
-    // Triangular on [-a, a] has σ = a/√6 → a = σ·√6.
-    let a = sigma * 2.449_49;
-    for p in f.y.iter_mut() {
+    // White triangular field, unit-ish variance.
+    let mut g = vec![0.0f32; w * h];
+    for v in g.iter_mut() {
         let r = next();
         let u1 = ((r & 0xFFFF) as f32 / 65535.0) - 0.5;
         let u2 = (((r >> 16) & 0xFFFF) as f32 / 65535.0) - 0.5;
-        let g = (u1 + u2) * 2.0 * a;
-        *p = (*p as f32 + g).round().clamp(0.0, 255.0) as u8;
+        *v = (u1 + u2) * 2.449_49; // σ ≈ 1
+    }
+    if rho > 0.01 {
+        // AR(1) along x then y. Each pass scales variance by 1/(1−ρ²);
+        // compensate so the field keeps σ ≈ 1 before final scaling.
+        let norm = (1.0 - rho * rho).sqrt();
+        for y in 0..h {
+            for x in 1..w {
+                let i = y * w + x;
+                g[i] = rho * g[i - 1] + norm * g[i];
+            }
+        }
+        for x in 0..w {
+            for y in 1..h {
+                let i = y * w + x;
+                g[i] = rho * g[i - w] + norm * g[i];
+            }
+        }
+    }
+    for (p, gv) in f.y.iter_mut().zip(&g) {
+        *p = (*p as f32 + gv * sigma).round().clamp(0.0, 255.0) as u8;
     }
 }
 
@@ -968,7 +1025,7 @@ pub fn encode_gop_v4(
     plate: &Plate,
     opts: &ResidualOpts,
     band: i32,
-) -> (PlateEncodeReportV2, f32) {
+) -> (PlateEncodeReportV2, f32, f32) {
     let fw = frames[0].w;
     let fh = frames[0].h;
     let (gw, gh) = (fw / REGION, fh / REGION);
@@ -987,6 +1044,7 @@ pub fn encode_gop_v4(
     let mut display_recon: Vec<Yuv420> = Vec::with_capacity(frames.len());
     let mut prev_share_acc = 0.0f64;
     let mut sigma_acc = 0.0f64;
+    let mut rho_acc = 0.0f64;
 
     for (fi, (f, m)) in frames.iter().zip(motions).enumerate() {
         let plate_pred = predict_frame(plate, m, fw, fh);
@@ -1016,13 +1074,16 @@ pub fn encode_gop_v4(
         };
 
         // The grain split: denoise the target toward the prediction, code
-        // the clean difference, remember σ for decode-side synthesis.
-        let (target, sigma) = if band > 0 {
-            temporal_denoise(f, &composite, band)
+        // the clean difference, remember (σ, ρ) for decode-side synthesis.
+        let (target, sigma, rho) = if band > 0 {
+            let (t, sg) = temporal_denoise(f, &composite, band);
+            let rh = grain_lag1(f, &composite, band);
+            (t, sg, rh)
         } else {
-            (f.clone(), 0.0)
+            (f.clone(), 0.0, 0.0)
         };
         sigma_acc += sigma as f64;
+        rho_acc += rho as f64;
 
         let mut side = vec![0u8; (modes.len() + 7) / 8];
         for (i, &b) in modes.iter().enumerate() {
@@ -1067,8 +1128,9 @@ pub fn encode_gop_v4(
             side.extend_from_slice(&nz);
             side.extend_from_slice(&deltas);
         }
-        // σ ships as one byte (σ×16, saturating) per frame.
+        // σ and ρ ship as one byte each (σ×16, ρ×255) per frame.
         side.push(((sigma * 16.0).round() as u32).min(255) as u8);
+        side.push(((rho.max(0.0) * 255.0).round() as u32).min(255) as u8);
         let mode_bytes = zstd::encode_all(side.as_slice(), 19).map(|c| c.len()).unwrap_or(side.len());
 
         let p444 = interleave_444(&composite);
@@ -1084,7 +1146,7 @@ pub fn encode_gop_v4(
         // the display copy gets the synthesized grain. Referencing grained
         // frames would feed synthetic noise back into motion search.
         clean_recon.push(rec.clone());
-        synth_grain(&mut rec, sigma, 0x5EED_0000 + fi as u64);
+        synth_grain(&mut rec, sigma, rho, 0x5EED_0000 + fi as u64);
         display_recon.push(rec);
         out_frames.push(FrameCost { mode_bytes, residual_bytes });
     }
@@ -1098,5 +1160,60 @@ pub fn encode_gop_v4(
             prev_mode_share: (prev_share_acc / denom) as f32,
         },
         (sigma_acc / frames.len() as f64) as f32,
+        (rho_acc / frames.len() as f64) as f32,
+    )
+}
+
+/// The user's two-branch question, measured: of the high-pass energy in
+/// a frame, how much is WORLD-DERIVED (survives motion-compensated
+/// prediction — texture the web should own) vs FLAT-MASK (correlates
+/// with nothing temporally — synthesizable screen-space noise)?
+/// Returns (world_fraction, mask_fraction, hp_rms). The high-pass here
+/// is (pixel − 3×3 box mean); "survives prediction" means the co-sited
+/// high-pass of the prediction agrees in sign and comparable magnitude.
+pub fn classify_highpass(cur: &Yuv420, pred: &Yuv420) -> (f32, f32, f32) {
+    let (w, h) = (cur.w, cur.h);
+    let hp = |img: &[u8], x: usize, y: usize| -> f32 {
+        let mut sum = 0i32;
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let sx = (x as i32 + dx).clamp(0, w as i32 - 1) as usize;
+                let sy = (y as i32 + dy).clamp(0, h as i32 - 1) as usize;
+                sum += img[sy * w + sx] as i32;
+            }
+        }
+        img[y * w + x] as f32 - sum as f32 / 9.0
+    };
+    let mut world = 0.0f64;
+    let mut mask = 0.0f64;
+    let mut total = 0.0f64;
+    // Sample every 2nd pixel for speed; statistics, not reconstruction.
+    let mut y = 1;
+    while y + 1 < h {
+        let mut x = 1;
+        while x + 1 < w {
+            let hc = hp(&cur.y, x, y);
+            let hpre = hp(&pred.y, x, y);
+            let e = (hc * hc) as f64;
+            total += e;
+            // Same sign and at least half the magnitude → the prediction
+            // already carries this detail → world-derived.
+            if hc * hpre > 0.0 && hpre.abs() * 2.0 >= hc.abs() {
+                world += e;
+            } else {
+                mask += e;
+            }
+            x += 2;
+        }
+        y += 2;
+    }
+    if total < 1.0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let n = (((h - 2) / 2) * ((w - 2) / 2)) as f64;
+    (
+        (world / total) as f32,
+        (mask / total) as f32,
+        ((total / n).sqrt()) as f32,
     )
 }

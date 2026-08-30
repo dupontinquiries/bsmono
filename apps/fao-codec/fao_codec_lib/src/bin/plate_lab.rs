@@ -138,13 +138,22 @@ fn main() {
     let t2 = std::time::Instant::now();
     if let Some(bandstr) = arg_val(&args, "--band") {
         let band: i32 = bandstr.parse().unwrap_or(0);
-        let (rep, sigma) = plate::encode_gop_v4(&frames, &motions, &pl, &opts, band);
+        let (rep, sigma, rho) = plate::encode_gop_v4(&frames, &motions, &pl, &opts, band);
+        // Two-branch high-pass classification on a mid-GOP frame: how much
+        // detail is world-derived (web's job) vs flat-mask (shader's job)?
+        {
+            let mid = frames.len() / 2;
+            let m = &motions[mid];
+            let pp = plate::predict_frame(&pl, m, frames[0].w, frames[0].h);
+            let (wf, mf, hprms) = plate::classify_highpass(&frames[mid], &pp);
+            println!("highpass_split world {:.2} mask {:.2} hp_rms {:.2} (vs plate pred, mid frame)", wf, mf, hprms);
+        }
         let res_total: usize = rep.frames.iter().map(|c| c.residual_bytes).sum();
         let mode_total: usize = rep.frames.iter().map(|c| c.mode_bytes).sum();
         let n = frames.len();
         let total = rep.plate_bytes + rep.motion_bytes + res_total + mode_total;
         println!("plate_bytes {}", rep.plate_bytes);
-        println!("mode_total {} residual_total {}  prev_mode_share {:.3}  grain_sigma {:.2}", mode_total, res_total, rep.prev_mode_share, sigma);
+        println!("mode_total {} residual_total {}  prev_mode_share {:.3}  grain_sigma {:.2} grain_rho {:.2}", mode_total, res_total, rep.prev_mode_share, sigma, rho);
         println!(
             "total_bytes {total}  amortized_per_frame {}  marginal_per_frame {}",
             total / n,

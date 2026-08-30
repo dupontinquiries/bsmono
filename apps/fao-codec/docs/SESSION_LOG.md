@@ -2516,3 +2516,35 @@ Files: fao_codec_lib/src/v11_plate.rs (5 unit tests), src/bin/plate_lab.rs
 median is O(frames) per pixel; chroma coded at full res through the
 3-channel interleave (2x chroma waste); mode decision uses raw SAD which
 is a weak proxy at high deadzone.
+
+### v11.4b — AR grain + the two-branch classifier (same session)
+
+Measured the source's grain lag-1 spatial correlation: ρ = 0.71–0.76 —
+strongly low-pass (optical chain + the h264 layer), which is exactly why
+white synthesis read as electronic snow. synth_grain now shapes white
+triangular noise with a separable AR(1) at the measured ρ (variance-
+normalized, one ρ byte/frame on the wire). SSIM at dz32: 0.926 with AR
+grain vs 0.835 with white (band differs slightly; the direction is
+unambiguous). Rate verdict unchanged and honest: at dz≥32 the deadzone
+already discards grain, so the split buys believability, not bytes, on
+this source; a cleaner (non-pre-compressed) film scan is where the rate
+win should appear.
+
+classify_highpass() quantifies the "flat-mask vs world-derived" split:
+high-pass energy that survives the plate prediction (sign + ≥half
+magnitude co-sited) is world texture; the rest is mask. shotB mid-frame:
+world 0.09 / mask 0.91 — i.e. 91% of fine-detail energy on this shot is
+screen-space-noise-like. Caveat recorded: the plate's median denoising
+means real texture it blurred also lands in "mask", and mover texture
+(absent from the plate) does too — the statistic is conservative toward
+mask; per-mode (MC-prev) classification would tighten it.
+
+Dual-reference scoring context: grainy-source vs denoised-reference =
+39.27 dB — the ceiling ANY synthesis-based codec (AV1 FGS included)
+faces vs the grainy original, independent of rate.
+
+Open RD item, now ranked first: the MV rate bias (v3c) dropped
+prev-mode share 0.69→0.33 and cost ~1.5 dB at matched dz — the
+plate-vs-prev decision uses raw SAD, a weak proxy for post-deadzone
+residual cost. Needs a deadzone-aware cost (SATD or coefficient-count
+above threshold) before further grain/entropy work.
