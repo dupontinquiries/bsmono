@@ -1103,6 +1103,14 @@ fn parse_imported_chat(text: &str) -> Vec<(Role, String)> {
 }
 
 pub struct Chat {
+    /// The accessibility scene the mode toggles register with.
+    ///
+    /// Parity reported `a11y=0` for this app: the registry has existed
+    /// since bot-arena adopted it and nothing here fed it. Held on the
+    /// tab rather than built per frame because `A11yScene` remembers
+    /// focus BY ID between frames — a per-frame scene forgets, which
+    /// presents as focus jumping rather than as a missing scene.
+    pub a11y: uikit_egui::a11y::A11yScene,
     /// Model name for turns generated from now on; None until one is known. Deliberately stamped at
     /// creation rather than derived at render time from whatever is loaded — deriving would relabel
     /// history on every switch, which is the opposite of provenance.
@@ -1365,6 +1373,7 @@ pub struct Chat {
 impl Default for Chat {
     fn default() -> Self {
         Self {
+            a11y: uikit_egui::a11y::A11yScene::new(),
             stamp_model: None,
             win_floor: std::cell::Cell::new(None),
             msgs: Vec::new(), input: String::new(),
@@ -8565,27 +8574,42 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                     let (mut auto_continue, mut patch_mode) = (self.auto_continue, self.patch_mode);
                     let mut summarize_on_squeeze = self.summarize_on_squeeze;
                     {
+                        // Split the borrow: the closure below already
+                        // holds `&mut` locals, so reaching through `self`
+                        // inside it would conflict. Same pattern the
+                        // bot-arena and snapclone adoptions needed.
+                        let a11y = &mut self.a11y;
                         let mut modes = |ui: &mut egui::Ui| {
-                        ui.checkbox(&mut panel_mode, RichText::new("debate panel").small())
+                        uikit_egui::a11y::note(a11y, egui::Id::new("logscope.chat.panel_mode").value(),
+                            "debate panel", panel_mode,
+                            ui.checkbox(&mut panel_mode, RichText::new("debate panel").small()))
                             .on_hover_text("Several small models debate instead of one thinker. They can pause to \
     ask you a question between messages, and one member is held BLIND to the answer — so the next \
     round can tell whether your hint drove the conclusion or the question did.");
-                        ui.checkbox(&mut stepwise, RichText::new("stepwise").small())
+                        uikit_egui::a11y::note(a11y, egui::Id::new("logscope.chat.stepwise").value(),
+                            "stepwise", stepwise,
+                            ui.checkbox(&mut stepwise, RichText::new("stepwise").small()))
                             .on_hover_text("checkpoint mode: the model works in numbered steps, pausing at ⏸ STEP k/n markers; the harness continues for you (warm-KV). Each pause is a fan-out injection point.");
-                        ui.checkbox(&mut auto_continue, RichText::new("auto-continue").small())
+                        uikit_egui::a11y::note(a11y, egui::Id::new("logscope.chat.auto_continue").value(),
+                            "auto-continue", auto_continue,
+                            ui.checkbox(&mut auto_continue, RichText::new("auto-continue").small()))
                             .on_hover_text("When a reply hits the length cap, keep generating to finish it");
                         // The relief policy, next to the mode it modifies. Enabled only with
                         // auto-continue on: that is the mode whose replies are long enough for the
                         // budget squeeze to cost an answer, and a checkbox that silently does
                         // nothing is worse than one that is visibly unavailable.
                         ui.add_enabled_ui(auto_continue, |ui| {
-                            ui.checkbox(&mut summarize_on_squeeze, RichText::new("summarize, don't squeeze").small())
+                            uikit_egui::a11y::note(a11y, egui::Id::new("logscope.chat.summarize_on_squeeze").value(),
+                            "summarize, don't squeeze", summarize_on_squeeze,
+                            ui.checkbox(&mut summarize_on_squeeze, RichText::new("summarize, don't squeeze").small()))
                                 .on_hover_text("Long-horizon: when the prompt has grown enough that the reply \
 budget would drop below a usable answer, STOP and summarize the older turns, then continue with the \
 freed room — instead of silently shrinking every reply from here on (the default, which walked one \
 session's budget from 2470 down to 814 tokens over seventeen turns without saying so).");
                         });
-                        ui.checkbox(&mut patch_mode, RichText::new("patch mode").small())
+                        uikit_egui::a11y::note(a11y, egui::Id::new("logscope.chat.patch_mode").value(),
+                            "patch mode", patch_mode,
+                            ui.checkbox(&mut patch_mode, RichText::new("patch mode").small()))
                             .on_hover_text("edit mode: the model emits unified-diff patches (only changed lines) instead of rewriting whole files — fewer tokens per edit, applied context-anchored and committed via gitmind.");
                         };
                         if overflow { ui.menu_button("⋯ modes", |ui| modes(ui)); } else { modes(ui); }

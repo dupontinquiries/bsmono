@@ -33,7 +33,7 @@
 //! the descriptions are plain strings a TTS stage speaks. The only egui touch is painting
 //! the focus ring.
 
-use egui::{Color32, Rect, CornerRadius, Stroke, Ui};
+use egui::{Color32, CornerRadius, Rect, Response, Stroke, Ui};
 use crate::glove::{Target, TargetKind};
 
 /// The kind of a widget, for spoken descriptions ("Play, button").
@@ -433,6 +433,23 @@ pub fn semantic_button(ui: &mut Ui, scene: &mut A11yScene, id: u64, label: &str)
 }
 
 /// Same, for a toggle (checkbox): reflects on/off in the spoken value.
+/// Register a toggle that was already drawn, returning its `Response`.
+///
+/// `semantic_toggle` draws the checkbox for you, which is the right shape
+/// when nothing else is attached to it. It is the WRONG shape when the
+/// call site chains onto the response — `.on_hover_text(...)`, an enabled
+/// check, a custom id — because swapping it in silently drops whatever
+/// was chained. logscope's chat toggles all carry substantial hover text
+/// explaining what the mode does, and losing that to gain a11y would be
+/// trading one kind of user's understanding for another's.
+///
+/// So this takes the response instead of producing it: draw however you
+/// like, hand the result here, keep chaining.
+pub fn note(scene: &mut A11yScene, id: u64, label: &str, on: bool, resp: Response) -> Response {
+    scene.add(id, Semantics::toggle(label, on), Some(resp.rect));
+    resp
+}
+
 pub fn semantic_toggle(ui: &mut Ui, scene: &mut A11yScene, id: u64, label: &str, on: &mut bool) -> bool {
     let resp = ui.checkbox(on, label);
     scene.add(id, Semantics::toggle(label, *on), Some(resp.rect));
