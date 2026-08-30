@@ -135,6 +135,24 @@ fn main() {
         opts.skip_threshold, opts.saliency_boost, opts.dead_zone, opts.skip_block_rle, opts.dc_prediction, opts.channel_deinterleave
     );
 
+    if args.iter().any(|a| a == "--features") {
+        // Detection probe: FAST keypoints on first + mid frame, with
+        // spatial coverage = fraction of 64px cells holding ≥1 keypoint.
+        use fao_codec::v8_reconstruction_codec::FastDetector;
+        let det = FastDetector { max_keypoints: 5000, ..FastDetector::default() };
+        for (label, fi) in [("first", 0usize), ("mid", frames.len() / 2)] {
+            let f = &frames[fi];
+            let kps = det.detect(&f.y, f.w, f.h);
+            let (cw, ch) = ((f.w + 63) / 64, (f.h + 63) / 64);
+            let mut cells = vec![false; cw * ch];
+            for k in &kps {
+                cells[(k.y as usize / 64) * cw + (k.x as usize / 64)] = true;
+            }
+            let cov = cells.iter().filter(|&&c| c).count() as f32 / cells.len() as f32;
+            println!("features {label}: n {} coverage {:.2}", kps.len(), cov);
+        }
+        return;
+    }
     let t2 = std::time::Instant::now();
     if args.iter().any(|a| a == "--sr") {
         // Fence-slit experiment: prediction quality of the S=2

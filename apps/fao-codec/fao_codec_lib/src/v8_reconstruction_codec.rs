@@ -3431,8 +3431,17 @@ impl FastDetector {
                 let bright = center + self.threshold as i32;
                 let dim = center - self.threshold as i32;
                 
-                // Quick reject: check 4 cardinal points first (top, right, 
-                // bottom, left). At least 3 must agree on brighter or darker.
+                // Quick reject via the 4 cardinal points (top, right,
+                // bottom, left). For the arc-9 test used below, the sound
+                // requirement is that at least 2 cardinals agree: cardinals
+                // sit 4 apart on the 16-circle, so a contiguous run of 9
+                // can cover as few as 2 of them (e.g. indices 1..=9 touch
+                // only 4 and 8). The previous >=3 rule is only valid for
+                // FAST-12 and mathematically rejected legitimate FAST-9
+                // corners — including every near-tip detection at a
+                // right-angle step corner (at most 2 cardinals reach into
+                // the opposing region there), which is why rectilinear
+                // game/architecture content starved the tracker.
                 let cards = [
                     yuv[(y - 3) * width + x] as i32,        // top
                     yuv[y * width + (x + 3)] as i32,        // right
@@ -3441,7 +3450,7 @@ impl FastDetector {
                 ];
                 let n_brighter = cards.iter().filter(|&&v| v > bright).count();
                 let n_darker = cards.iter().filter(|&&v| v < dim).count();
-                if n_brighter < 3 && n_darker < 3 { continue; }
+                if n_brighter < 2 && n_darker < 2 { continue; }
                 
                 // Full circle check: find longest contiguous arc of 9+
                 // Doubled-array trick: walk the 32-length doubled circle once
@@ -3489,17 +3498,34 @@ impl FastDetector {
         }
         
         // Non-max suppression: sort by score desc, then greedily keep points
-        // not within nms_radius of an already-kept point.
+        // not within nms_radius of an already-kept point — WITH a per-cell
+        // budget. Global top-N lets one busy region (a game HUD, a single
+        // high-contrast prop) hoard the entire keypoint budget while most
+        // of the frame contributes nothing; pose estimation and whole-scene
+        // reconstruction need SPREAD, not local density (the reason
+        // fragments got reconstructed but never full maps). Cell size 64px,
+        // per-cell cap sized so the full budget cannot fit into a corner
+        // of the frame. Same discipline as ORB-SLAM's quadtree culling.
         candidates.sort_by(|a, b| b.score.cmp(&a.score));
         let r2 = (self.nms_radius * self.nms_radius) as f32;
+        let cw = (width + 63) / 64;
+        let ch = (height + 63) / 64;
+        let n_cells = cw * ch;
+        let per_cell_cap = (self.max_keypoints * 4 / n_cells.max(1)).max(2);
+        let mut cell_counts = vec![0usize; n_cells];
         let mut kept: Vec<Keypoint> = Vec::with_capacity(self.max_keypoints);
         for c in candidates {
+            let ci = (c.y as usize / 64) * cw + (c.x as usize / 64);
+            if cell_counts[ci] >= per_cell_cap {
+                continue;
+            }
             let too_close = kept.iter().any(|k| {
                 let dx = k.x - c.x;
                 let dy = k.y - c.y;
                 dx * dx + dy * dy < r2
             });
             if !too_close {
+                cell_counts[ci] += 1;
                 kept.push(c);
                 if kept.len() >= self.max_keypoints { break; }
             }

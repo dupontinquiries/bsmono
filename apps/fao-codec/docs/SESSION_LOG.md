@@ -2607,3 +2607,35 @@ debt to clear before trusting it on real GOPs. The stairs-on-Anakin
 result came from this stack; pointing it at strong-geometry synthetic
 content (the SMITE arena) with the now-fixed confidence gate is the
 planned 3D step.
+
+### Detection fixes — why fragments, never whole scenes (same session)
+
+Measured the starvation directly (plate_lab --features: keypoint count +
+fraction of 64px cells with ≥1 keypoint). Pre-fix: shotB (dark film)
+422 keypoints, 22% coverage; smiteB capped at 5000 with 56% coverage,
+everything hoarded by the HUD. Pose and triangulation can't build a
+scene from that — hence stairs-here-and-there, never a whole map.
+
+Fix 1 — FAST quick-reject was calibrated for the wrong detector: it
+required ≥3 of 4 cardinal points to agree, which is sound for FAST-12
+but NOT for the arc-9 test this detector runs — a contiguous 9-run can
+touch as few as 2 cardinals (they sit 4 apart on the 16-circle; run
+1..=9 touches only 4 and 8). The ≥3 rule mathematically rejected valid
+FAST-9 corners, including every near-tip detection at right-angle step
+corners — i.e., exactly the corners rectilinear game/architecture
+content is made of. Now ≥2. The long-documented
+fast_finds_synthetic_corner failure (root-caused in README as
+"geometrically impossible") flips to PASSING: it was never a design
+call, it was a soundness bug in the prefilter. Pre-existing failures
+6 → 5.
+
+Fix 2 — per-cell keypoint budget in NMS (64px cells, cap =
+4×max/n_cells): global top-N let one busy region hoard the budget;
+whole-scene reconstruction needs spread. smiteB coverage 0.54→0.61.
+
+Honest remaining limit: shotB still 654 kps / 24% coverage — the fixed
+threshold (20) exceeds local contrast across dark regions. Next
+detection lever is adaptive/per-tile thresholding (or local contrast
+normalization before detect); after that, FeatureTrackPass's own
+pre-existing failure and single-scale LK (no pyramid → small motions
+only) are the tracking debt.
