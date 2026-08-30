@@ -167,6 +167,26 @@ fn main() {
         let coords = vec![ChunkCoord::new(0, 1, 0)];
         let cc = &cpu.generate(&coords)[0];
         let gc = &gpu.generate(&coords)[0];
+        // r609: locate the CPU's Gravel — per-y counts identify the pass
+        // (contiguous sub-seabed layers vs noise-scattered pockets).
+        {
+            let cs = unendlich_engine::constants::CHUNK_SIZE as usize;
+            let mut by_y: std::collections::BTreeMap<i32, u32> = Default::default();
+            let mut sample: Vec<(usize, i32, usize)> = Vec::new();
+            for i in 0..cc.blocks.len() {
+                if cc.blocks[i] == BlockId::Gravel {
+                    let lx = i % cs;
+                    let lz = (i / cs) % cs;
+                    let ly = (i / (cs * cs)) as i32;
+                    *by_y.entry(32 + ly).or_default() += 1;
+                    if sample.len() < 5 {
+                        sample.push((lx, 32 + ly, lz));
+                    }
+                }
+            }
+            println!("  cpu gravel by world-y: {by_y:?}");
+            println!("  cpu gravel sample cells: {sample:?}");
+        }
         let mut hist_c: std::collections::HashMap<BlockId, u32> = Default::default();
         let mut hist_g: std::collections::HashMap<BlockId, u32> = Default::default();
         let cs = unendlich_engine::constants::CHUNK_SIZE as usize;

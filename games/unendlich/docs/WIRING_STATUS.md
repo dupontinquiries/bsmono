@@ -12123,3 +12123,22 @@ check blocks.rs first thing), the GPU already HAS a gravel/sand pass and the div
 not a port. NEXT: verify ids, find the gravel writer via targeted instrumentation (per-block-id first-write phase
 logging in a debug build), then align. Honest state: r607's macro-world fix stands (altimetry exact); strata parity is
 open with the search space narrowed to one unidentified writer.
+
+## r609 — GRAVEL WRITER FOUND: arena biome defs leak into overworld strata via registry climate best_fit
+The r608 mystery is closed. The CPU's seabed gravel is written by Phase 2's 3-deep subsurface loop (surface-hugging
+shell, y-histogram peaked at the seabed — instrumented via the deep probe's new gravel locator), whose block choice
+runs pick_subsurface_block → biome_def_at → registry.best_fit(mc_temp, humid) over the ENTIRE loaded assets/biomes/
+tree — arena defs included. At the ocean origin the local climate is (mc_temp 0.90, humid 0.52); arenas/
+gilded_glade.json (temperature 0.85, downfall 0.5, subsurface_block "gravel") wins the fit by a wide margin over
+unendlich/ocean.json (0.75, 1.0, no strata fields). So OVERWORLD seabeds carry ARENA strata: gravel from a MOBA-lane
+def. No Rust token "BlockId::Gravel" exists in any generation path — the block arrives by string through the
+registry, which is why r608's grep hunt came up empty (lesson recorded: data-driven content makes token-grep
+insufficient; grep asset trees too). THE FORK IS NOW FULLY CHARACTERIZED END-TO-END: GPU subsurface_block_type is
+climate-only code; CPU subsurface is registry-best-fit over a json tree with accidental arena participation.
+FIX PATHS, ranked, for the operator's call: (a) PARITY-FAITHFUL — mirror observed CPU behavior in the shader via a
+small uniform table of resolved (surface, subsurface) blocks per climate cell, uploaded from the same registry at
+generator init (a designed seam: descriptor addition + table bake; preserves every existing CPU world byte-for-byte,
+warts included); (b) JUDGE-THE-LEAK-A-BUG — gate best_fit to the world's namespace (arena defs stop competing in the
+overworld), which is cleaner but CHANGES EXISTING CPU WORLDS (seabed gravel shells become dirt) and therefore needs a
+world-version gate + the operator's explicit sign-off. No code changed this round beyond the probe's gravel locator;
+r607's macro fix stands, the strata residual is now fully explained rather than mysterious.
