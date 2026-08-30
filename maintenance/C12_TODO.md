@@ -3478,9 +3478,27 @@ A borrow split was needed — `st` is `&mut app.fleet` and the run needs
 touched. Same shape as the a11y scene split in the chat tab, third time
 this pattern has come up.
 
-- **C12-65a — the whole path is now UNTESTED END TO END rather than
-  unbuilt.** Plan → button → runner → ssh. The first thing to check is
-  build/install failure attribution (§62a): a compile error will be
-  reported against the install step and confined to one device, where
-  `execute`'s rules say it should skip that app on every device sharing
-  the triple.
+- **C12-65a — the divergence is FIXED, not just flagged.** `build` now
+  calls `ops::build_locally_logged` and caches the binary by
+  (app, triple); `install` scp's it to `/tmp/<app>` and runs
+  `installer::push_install_script`, which is the staging pair
+  `installer` documents.
+
+  Why it was worth the extra code rather than living with the note:
+  `execute` skips an app on every device sharing a triple when its build
+  fails. Deferring the build confined a compile error to ONE device, so
+  the other three with that triple each rebuilt the same broken crate
+  and failed identically — three redundant failures, three wasted build
+  cycles, and a report blaming the devices instead of the code.
+
+  The cache is keyed by app AND triple. One slot per app would hand an
+  aarch64 build to an x86 device, and that failure surfaces at run time
+  ON THE DEVICE rather than here — the worst place for it.
+
+  `install` without a prior successful build is REFUSED rather than
+  rebuilding: `execute`'s rules forbid the call, so reaching it means
+  the two have diverged, and a silent rebuild would hide the invariant
+  break and take minutes doing it.
+
+  Still untested end to end (plan → button → runner → ssh), but the
+  semantics now match what `execute` documents.

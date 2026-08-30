@@ -14,27 +14,31 @@
 //! | `Runner` method | backed by                          |
 //! |-----------------|------------------------------------|
 //! | `enroll`        | `deploy::trust_host` + `setup_key` |
-//! | `build`         | folded into `install` — see below  |
+//! | `build`         | `ops::build_locally_logged`        |
 //! | `install`       | `flow::deploy_app_remote_logged`   |
 //! | `rename`        | `deploy::remote_capture` + hostnamectl |
 //! | `refresh`       | `deploy::remote_capture` + apk     |
 //! | `triple_of`     | the roster                         |
 //!
-//! ## Why `build` does not build
+//! ## Why build and install are separate here
 //!
-//! `flow::deploy_app_remote_logged` builds AND installs in one call —
-//! it has to, because it needs the built binary's path to scp it, and
-//! then runs `installer::push_install_script` to place it and write the
-//! `.desktop` entry. Splitting that pair would mean reimplementing the
-//! second half here, against a contract documented in `installer`.
+//! `flow::deploy_app_remote_logged` does both in one call, and the first
+//! version of this file used it — `build` logged "deferred" and returned
+//! Ok. That was wrong in a way worth recording, because it looked like a
+//! harmless simplification.
 //!
-//! So `build` records the target as attempted and returns Ok, and
-//! `install` does the real work. That is a compromise and it has a
-//! visible consequence: a compile error is reported against the INSTALL
-//! step rather than the build step. Recorded rather than hidden, because
-//! `reroll::execute`'s failure rules distinguish the two — a failed build
-//! is supposed to skip that app on every device sharing the triple,
-//! and through this runner it will not.
+//! `reroll::execute` skips an app on EVERY device sharing a triple when
+//! its build fails. Deferring the build confined a compile error to one
+//! device, so the other three with the same triple each rebuilt the same
+//! broken crate and failed identically — three redundant failures, three
+//! wasted build cycles, and a report blaming the devices instead of the
+//! code.
+//!
+//! So `build` calls `ops::build_locally_logged` and caches the binary by
+//! (app, triple); `install` scp's that binary to `/tmp/<app>` and runs
+//! `installer::push_install_script`, which is the staging pair
+//! `installer` documents — the script also writes the `.desktop` entry,
+//! and a binary placed anywhere else would not be on PATH.
 //!
 //! ## Untested against a real device
 //!
@@ -70,11 +74,31 @@ pub struct SshRunner {
     pub credential: Credential,
     /// Every line the underlying operations emit, for the run log.
     pub log: Vec<String>,
+    /// Binaries `build` produced, keyed by (app, triple).
+    ///
+    /// Keyed by BOTH because the same app for two architectures is two
+    /// different files — one slot per app would send an aarch64 build to
+    /// an x86 device, and the failure would be at run time on the
+    /// device rather than here.
+    built: std::collections::HashMap<(String, String), std::path::PathBuf>,
+}
+
+/// Look an app up in the catalog.
+///
+/// Not in the catalog is an error rather than a skip: the plan was built
+/// from the same catalog, so a name that misses means they have diverged.
+fn catalog_app(app: &str) -> Result<cockpit::suite::SuiteApp, String> {
+    cockpit::flow::store_groups()
+        .into_iter()
+        .flat_map(|g| g.apps)
+        .find(|a| a.name == app)
+        .ok_or_else(|| format!("{app} is not in the catalog"))
 }
 
 impl SshRunner {
     pub fn new(user: &str, devices: Vec<(String, String, String)>, credential: Credential) -> Self {
-        SshRunner { user: user.to_string(), devices, credential, log: Vec::new() }
+        SshRunner { user: user.to_string(), devices, credential,
+                    log: Vec::new(), built: std::collections::HashMap::new() }
     }
 
     /// Resolve a device id to its host.
@@ -116,12 +140,30 @@ impl Runner for SshRunner {
     }
 
     fn build(&mut self, app: &str, triple: &str) -> Result<(), String> {
-        // Deliberately not a build. See the module note: the build and
-        // the install are one call in `flow`, because the install needs
-        // the binary's path and then runs a script that also writes the
-        // .desktop entry. Splitting them here would reimplement that
-        // contract.
-        self.log.push(format!("build {app} ({triple}) — deferred to install"));
+        // A REAL BUILD, and the reason this is worth the extra code:
+        // `execute` skips an app on EVERY device sharing a triple when
+        // its build fails. Deferring the build to install (the first
+        // version of this file) confined a compile error to one device,
+        // so the other three with the same triple each rebuilt the same
+        // broken crate and failed identically — three redundant failures
+        // and a report that blames the devices instead of the code.
+        let suite_app = catalog_app(app)?;
+        let dir = cockpit::ops::resolve_app_dir(&suite_app.path);
+        let mut lines: Vec<String> = Vec::new();
+        let built = {
+            let mut on_line = |l: &str| lines.push(l.to_string());
+            cockpit::ops::build_locally_logged(
+                &suite_app.name, &dir, triple, &suite_app.features,
+                suite_app.no_default, &mut on_line)
+        };
+        // Kept on both paths: on failure this is the only place the
+        // compiler error appears.
+        self.log.extend(lines);
+        let (bin, _) = built?;
+        // Keyed by (app, triple) because the same app built for two
+        // architectures is two different binaries — one cache slot would
+        // send an aarch64 build to an x86 device.
+        self.built.insert((app.to_string(), triple.to_string()), bin);
         Ok(())
     }
 
@@ -130,22 +172,27 @@ impl Runner for SshRunner {
         let triple = self
             .triple_of(device)
             .ok_or_else(|| format!("{device} has no target triple"))?;
-        let suite_app = cockpit::flow::store_groups()
-            .into_iter()
-            .flat_map(|g| g.apps)
-            .find(|a| a.name == app)
-            .ok_or_else(|| format!("{app} is not in the catalog"))?;
-        let mut lines: Vec<String> = Vec::new();
-        let r = {
-            let mut on_line = |l: &str| lines.push(l.to_string());
-            cockpit::flow::deploy_app_remote_logged(
-                &suite_app, &triple, &self.user, &host, &mut on_line)
-        };
-        // The build output is kept on BOTH paths. On failure it is the
-        // only place the compiler error appears, and discarding it would
-        // leave "install: build failed" with nothing to act on.
-        self.log.extend(lines);
-        r.map(|msg| self.log.push(msg))
+        // The binary `build` produced. Absent means `execute` called
+        // install without a successful build for this triple, which its
+        // own rules forbid — so this is an invariant violation worth
+        // naming rather than a rebuild worth attempting.
+        let bin = self
+            .built
+            .get(&(app.to_string(), triple.clone()))
+            .ok_or_else(|| format!("{app} was not built for {triple}"))?
+            .clone();
+        // Staged in /tmp then moved by the install script, which is the
+        // pairing `installer` documents: the script also writes the
+        // .desktop entry, and a binary placed anywhere else would not be
+        // on PATH with a launcher pointing at nothing.
+        cockpit::deploy::scp_push(
+            &bin.display().to_string(), &self.user, &host, &format!("/tmp/{app}"))
+            .map_err(|e| format!("push: {e}"))?;
+        let out = cockpit::deploy::remote_capture(
+            &self.user, &host, &cockpit::installer::push_install_script(app, false))
+            .map_err(|e| format!("install: {e}"))?;
+        self.log.push(format!("{device}: installed {app} {out}"));
+        Ok(())
     }
 
     fn rename(&mut self, device: &str, hostname: &str) -> Result<(), String> {
@@ -247,13 +294,27 @@ mod tests {
     }
 
     #[test]
-    fn build_is_recorded_as_deferred_rather_than_claiming_success() {
-        // `build` returning Ok without building is a compromise, and the
-        // log line is what makes it visible: a reader of the run log can
-        // see the build did not happen HERE and that a compile error
-        // will surface against install.
+    fn installing_without_a_successful_build_is_refused() {
+        // `execute`'s rules forbid it, so reaching here means the two
+        // have diverged — worth naming rather than papering over with a
+        // rebuild, which would hide the invariant break AND take minutes.
         let mut r = runner();
-        r.build("gitmind", "aarch64-unknown-linux-musl").unwrap();
-        assert!(r.log.iter().any(|l| l.contains("deferred to install")), "{:?}", r.log);
+        let e = r.install("gitmind", "pine").unwrap_err();
+        assert!(e.contains("not built"), "{e}");
+    }
+
+    #[test]
+    fn the_binary_cache_is_keyed_by_app_AND_triple() {
+        // One slot per app would send an aarch64 build to an x86 device,
+        // and that failure would surface at run time ON THE DEVICE
+        // rather than here — the worst place for it.
+        let mut r = runner();
+        r.built.insert(
+            ("gitmind".into(), "aarch64-unknown-linux-musl".into()),
+            std::path::PathBuf::from("/tmp/arm/gitmind"));
+        // Present for arm, absent for x86: the x86 device must not be
+        // handed the arm binary.
+        assert!(r.install("gitmind", "x86box").is_err(),
+                "an x86 device accepted a build made for aarch64");
     }
 }
