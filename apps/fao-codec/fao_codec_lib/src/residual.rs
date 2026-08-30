@@ -308,7 +308,11 @@ pub fn encode(
     
     // zstd compress. Adaptive level — small payloads (typical case) 
     // get the high-quality treatment.
-    let lvl = if payload.len() <= 65536 { 12 } else { 6 };
+    // Level 6 on big payloads was leaving compression on the table for
+    // exactly the frames that dominate total bytes; 15 is the
+    // speed/ratio middle ground now that band-major order gives the
+    // entropy stage real structure to exploit.
+    let lvl = if payload.len() <= 65536 { 12 } else { 15 };
     let compressed = match zstd::encode_all(payload.as_slice(), lvl) {
         Ok(c) => c,
         Err(_) => payload.clone(),
@@ -404,9 +408,18 @@ fn pack_skip_rle(
                 for j in 0..n_nonskip as usize {
                     out.push(blocks[nonskip_start + j].1[c].pack());
                 }
-                for j in 0..n_nonskip as usize {
-                    for &q in &blocks[nonskip_start + j].0[c] {
-                        out.push(q as u8);
+                // BAND-MAJOR coefficient order: coef k of every block in
+                // the segment, k = 0..16, instead of 16 coefs per block.
+                // Each spectral band has coherent statistics (DC deltas
+                // small and smooth; high-AC mostly zero), and grouping a
+                // band gives zstd's entropy stage a homogeneous local
+                // distribution to model instead of interleaved bands —
+                // structure LZ matching cannot find across a 17-byte
+                // block stride. Same bytes, different order; measured on
+                // real residual payloads before committing.
+                for k in 0..16 {
+                    for j in 0..n_nonskip as usize {
+                        out.push(blocks[nonskip_start + j].0[c][k] as u8);
                     }
                 }
             }
@@ -595,7 +608,9 @@ fn unpack_skip_rle(
                     if block_idx + j >= n_blocks { break; }
                     blocks[block_idx + j].1[c] = QuantParams::unpack(data[params_start + j]);
                     for k in 0..16 {
-                        blocks[block_idx + j].0[c][k] = data[coefs_start + j * 16 + k] as i8;
+                        // band-major mirror: band k of the segment is a
+                        // contiguous run of n_nonskip bytes.
+                        blocks[block_idx + j].0[c][k] = data[coefs_start + k * n_nonskip + j] as i8;
                     }
                 }
                 off += n_nonskip * 17;  // n params + n*16 coefs

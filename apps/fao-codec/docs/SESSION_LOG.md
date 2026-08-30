@@ -3367,3 +3367,25 @@ was chosen by residual-ledger attribution, not intuition. The
 remaining gap is pure rate: 40.3×, owned by entropy coding (2–3×
 estimated), intra modes, lookahead RD, mover compositing, and — for
 the target regimes — canonical citation amortization.
+
+### Band-major coefficient order + zstd level (same session)
+
+The entropy chain's cheapest structural fix: within each nonskip
+segment, coefficients now serialize BAND-MAJOR (coef k of every block
+together) instead of block-major. Each spectral band has homogeneous
+statistics (DC deltas small/smooth, high-AC mostly zero); grouping a
+band hands zstd's entropy stage a coherent local distribution that LZ
+matching cannot reconstruct across a 17-byte block stride. Plus
+level 6 → 15 on large payloads (exactly the frames dominating total
+bytes). Same reconstruction by construction — measured bit-identical
+PSNR (six decimals) with fewer bytes: worst shot −8.8%, control
+−1.8%. Residual roundtrip tests green.
+
+Full-suite ladder update:
+  int-pel   : 45.95 MB @ 31.33 / 0.895   (46.5×, −2.00 dB)
+  half-pel  : 42.88 MB @ 32.62 / 0.922   (43.4×, −0.71 dB)
+  qpel+gain : 39.90 MB @ 33.69 / 0.934   (40.3×, +0.36 dB)
+  band-major: 37.90 MB @ 33.69 / 0.934   (38.3×, +0.36 dB)
+The rate gap is 38.3× at +0.36 dB over the AV1 anchor. The rest of
+the entropy estimate (adaptive rANS with per-band context models —
+the real 1.5–2×) remains the largest single uncollected item.
