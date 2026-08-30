@@ -30,6 +30,16 @@
 //! device and the pixels; this owns what a photo IS and where it may go, which
 //! is the part worth testing without a webcam attached.
 
+/// The viewfinder: where the photo will be, at the right aspect.
+///
+/// Behind `app` because it uses egui types. The RULES it encodes
+/// (aspect, mirroring, hit-testing) are the interesting part and are
+/// tested with the feature on; `--no-default-features` still checks the
+/// photo rules in `lib.rs` without a display, which is the split this
+/// crate's header describes.
+#[cfg(feature = "app")]
+pub mod preview;
+
 /// Where a photo is allowed to go.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ShareTarget {

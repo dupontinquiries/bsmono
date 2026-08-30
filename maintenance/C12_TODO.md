@@ -4390,5 +4390,33 @@ Same shape as cadscope: a WORKSPACE whose runnable crate is
 simple list would look for a package at `apps/aperture` and find a
 workspace manifest with no bin — the phantom-entry failure from §72.
 
-- **C82a — snapshot-cam's preview window is NOT done.** Asked for in the
-  same message; snapclone's viewfinder is the model. Not started.
+- **C82a — DONE. `snapshot_cam::preview`.** Modelled on snapclone's
+  `camera::Viewfinder`, which already solved the two things that matter:
+  aspect handling that does not distort, and a front camera MIRRORED so
+  the preview matches the mirror the subject expects.
+
+  REIMPLEMENTED rather than imported, on dependency grounds rather than
+  taste: snapshot-cam does not depend on snapclone-egui, and adding an
+  app-to-app dependency for two geometry functions would tie a small
+  self-contained tool to a large one. What is shared is the rule, and
+  the rule is short enough to state in a test.
+
+  **It shows a placeholder, deliberately.** `main.rs` already says the
+  capture is a stub — there is no frame source in this app. A preview
+  that drew nothing would be indistinguishable from a broken one, so it
+  draws the frame the photo will occupy, at the right aspect, with the
+  reason written inside it. 16:9 because that is what the capture stub
+  records (1920x1080): a preview at a different aspect from the file
+  would mis-teach framing, which is the one job it has.
+
+  Six tests on the rules — no distortion at any box shape, letterbox
+  fits inside while full-bleed covers, a zero-sized box does not produce
+  a NaN rect (invisible failure in the widget whose purpose is being
+  visible), front mirrored and rear not, a tap on a letterbox bar is not
+  a tap on the picture, and sensor coordinates survive a resize.
+
+  `Default` is hand-written at 16:9: a derived one gives
+  `sensor_aspect: 0.0`, which clamps to 0.01 and draws as a sliver.
+
+  21/21 with `--features app`, 14/14 headless — the split this crate's
+  header describes still holds.

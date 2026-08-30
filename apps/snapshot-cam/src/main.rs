@@ -17,6 +17,9 @@ fn main() -> eframe::Result<()> {
 #[derive(Default)]
 struct Cam {
     roll: Roll,
+    /// The viewfinder's geometry. 16:9 to match what the capture stub
+    /// records, so the preview and the file agree about shape.
+    preview: snapshot_cam::preview::Preview,
     /// The contact to send to. Free text until snapclone's contact list is
     /// wired in — a picker over a list this app cannot yet read would be a
     /// dropdown with nothing in it.
@@ -34,6 +37,41 @@ impl eframe::App for Cam {
             ui.heading("snapshot-cam");
             ui.label(egui::RichText::new(
                 "photos stay on this device until you send them").weak().small());
+
+            // THE VIEWFINDER, above the shutter where a camera app puts
+            // it. 16:9 because that is what the capture stub records
+            // (1920x1080) — the preview and the photo agreeing about
+            // shape is the whole point, and a preview at a different
+            // aspect from the file would mis-teach framing.
+            //
+            // A tap sets focus in normalised sensor coordinates, which
+            // is the geometry a real frame source will need; nothing
+            // consumes it yet, so it is shown rather than stored.
+            let shown = snapshot_cam::preview::show(
+                ui, &self.preview,
+                "no camera attached — this is where the photo will be");
+            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                if ui.input(|i| i.pointer.primary_clicked()) {
+                    if let Some(s) = self.preview.to_sensor(pos, shown) {
+                        self.note = format!("focus {:.2}, {:.2}", s[0], s[1]);
+                    }
+                }
+            }
+            ui.horizontal(|ui| {
+                if ui.selectable_label(
+                    self.preview.facing == snapshot_cam::preview::Facing::Front,
+                    "front").clicked()
+                {
+                    self.preview.facing = snapshot_cam::preview::Facing::Front;
+                }
+                if ui.selectable_label(
+                    self.preview.facing == snapshot_cam::preview::Facing::Rear,
+                    "rear").clicked()
+                {
+                    self.preview.facing = snapshot_cam::preview::Facing::Rear;
+                }
+                ui.checkbox(&mut self.preview.full_bleed, "fill");
+            });
 
             if ui.button("take photo").clicked() {
                 let now = std::time::SystemTime::now()
