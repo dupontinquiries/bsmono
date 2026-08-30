@@ -1,0 +1,23 @@
+[package]
+name = "drivemind-egui"
+version = "0.1.0"
+edition = "2021"
+description = "The drivemind egui shell on uikit-egui: device rail with attach classification, per-device SMART verdict tiles, verify/cleanup/advise panes, and a live log_view of the engine's Event stream — the same loop the CLI prints, rendered."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "drivemind-egui"
+path = "src/bin/drivemind_egui.rs"
+required-features = ["app"]
+
+[dependencies]
+egui = "0.34"
+uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
+snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }
+drivemind-core = { path = "../core" }
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
+
+[features]
+# `app` default-on per the house convention for every -egui frontend.
+default = ["app"]
+app = ["dep:eframe"]

@@ -1,0 +1,14 @@
+[package]
+name = "drivemind-cli"
+version = "0.1.0"
+edition = "2021"
+description = "The scriptable drivemind frontend (`dvm`): devices, smart, health, verify, cleanup, videos, gitscan, clone, advise — hand-rolled dispatch in the gin style, every engine event printed as it happens."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "dvm"
+path = "src/bin/dvm.rs"
+
+[dependencies]
+drivemind-core = { path = "../core" }
+serde_json = "1"
