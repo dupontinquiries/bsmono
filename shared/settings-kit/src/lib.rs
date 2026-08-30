@@ -766,7 +766,7 @@ mod anim_scale_tests {
 
 #[cfg(test)]
 mod voice_prefs_tests {
-    use super::Prefs;
+    use super::{AnimationStyle, ColorFilter, Handedness, MovementLayout, Prefs, VoiceFilter};
     #[test]
     fn voice_prefs_round_trip_through_kv() {
         let mut p = Prefs::default();
@@ -777,5 +777,89 @@ mod voice_prefs_tests {
         p.voice.partners = vec!["desktop".into(), "laptop".into()];
         let back = Prefs::from_kv(&p.to_kv());
         assert_eq!(back.voice, p.voice);
+    }
+
+    /// A `Prefs` with every field moved off its default, for the two whole-schema
+    /// tests below. Written once because the risk it guards against is a field
+    /// added to the struct and to `to_kv` but forgotten in `apply_kv` — and a
+    /// helper that quietly stops covering a field would hide exactly that.
+    fn everything_non_default() -> Prefs {
+        let mut p = Prefs::default();
+        p.gesture.sensitivity = 1.75;
+        p.gesture.commit_fraction = 0.42;
+        p.gesture.flick_velocity = 1234.0;
+        p.gesture.animation = AnimationStyle::all().iter().copied()
+            .find(|a| *a != Prefs::default().gesture.animation).expect("a second animation style");
+        p.touch.min_target = 51.0;
+        p.touch.scale = 1.3;
+        p.touch.text_scale = 1.25;
+        p.touch.button_scale = 1.4;
+        p.a11y.voice = !p.a11y.voice;
+        p.a11y.tts = !p.a11y.tts;
+        p.a11y.voice_filter = VoiceFilter::Strict;
+        p.display.white_point = 4200.0;
+        p.display.color_filter = ColorFilter::parse("protanopia");
+        p.display.opacity = 0.55;
+        p.input.handedness = Handedness::parse("left");
+        p.input.double_tilt = !p.input.double_tilt;
+        p.input.movement = MovementLayout::parse("wasd");
+        p.palette = "some-other-palette".into();
+        p.voice.mic_enabled = !p.voice.mic_enabled;
+        p.voice.offload_enabled = !p.voice.offload_enabled;
+        p.voice.compute_host = "desktop".into();
+        p.voice.speaker_id = !p.voice.speaker_id;
+        p.voice.partners = vec!["desktop".into(), "laptop".into()];
+        p.pool_dir = "/models".into();
+        p
+    }
+
+    #[test]
+    fn every_key_to_kv_writes_is_read_back_by_apply_kv() {
+        // THE ASYMMETRY THIS CATCHES. `to_kv` and `apply_kv` are two hand-maintained
+        // lists of the same 25 keys. A field added to the struct and to the writer
+        // but missed in the reader persists to disk and silently reverts to its
+        // default on the next load — a bug the user experiences as "the setting
+        // didn't stick", with nothing in any log.
+        //
+        // The existing round-trip tests are per-section (display, swipe, voice,
+        // voice_filter) and a new field belongs to whichever section its author
+        // was thinking about, so a new field can miss every one of them. This is
+        // per-KEY and derived from `to_kv` itself, so it covers a field the day it
+        // is added rather than the day someone remembers to extend a test.
+        //
+        // Checked one key at a time so the failure NAMES the field. Applying the
+        // whole set and diffing would only say "something did not round-trip".
+        let non_default = everything_non_default();
+        let baseline = Prefs::default().to_kv();
+        let mut checked = 0usize;
+        for (k, v) in non_default.to_kv() {
+            let default_v = baseline.iter().find(|(bk, _)| *bk == k).map(|(_, bv)| bv.clone())
+                .expect("to_kv must emit a stable key set");
+            // Only meaningful where the helper actually moved the value.
+            if default_v == v { continue; }
+            checked += 1;
+            let mut p = Prefs::default();
+            p.apply_kv(&[(k.clone(), v.clone())]);
+            let got = p.to_kv().into_iter().find(|(gk, _)| *gk == k).map(|(_, gv)| gv)
+                .expect("key vanished from to_kv after apply_kv");
+            assert_eq!(got, v,
+                "`{k}` is written by to_kv but not read back by apply_kv: setting it to {v:?} \
+                 left it at {got:?}. It will persist to disk and silently revert on load.");
+        }
+        // ASSERT THE SCAN FOUND SOMETHING. Without this the test passes when
+        // `everything_non_default` stops moving anything — a helper drifting into
+        // a no-op would make every assertion above vacuous.
+        assert!(checked >= 20,
+            "only {checked} keys differed from default; the helper has stopped exercising the schema");
+    }
+
+    #[test]
+    fn a_fully_non_default_prefs_survives_a_round_trip() {
+        // The whole-struct complement to the per-key test: catches a value that
+        // round-trips through its own key but is mangled on the way (a clamp, a
+        // lossy parse, a unit change), which the per-key check would report as a
+        // mismatch but which is worth stating as one equality over the real type.
+        let p = everything_non_default();
+        assert_eq!(Prefs::from_kv(&p.to_kv()), p);
     }
 }
