@@ -3397,3 +3397,36 @@ fused-canonical arithmetic, same fix: numbers go in the log AFTER
 they print). Ladder end state: 36.35 MB @ 33.69 dB / 0.934 = 36.8×
 the AV1 anchor at +0.36 dB, from 46.5× at −2.00 dB at ladder start —
 −21% bytes and +2.36 dB across the session's constructions.
+
+### Per-context rANS entropy coder (same session)
+
+rans.rs: standard byte-renormalizing rANS (state u32, L=1<<16,
+freqs to 1<<12), semi-adaptive per-frame static tables, per-context
+models. Contexts = channel class (Y vs chroma) × band group
+(DC | 1–3 | 4–9 | 10–15) = 8. Residual coding splits into a structure
+stream (RLE counts + params → zstd) and a coefficient stream
+(per-context rANS); a method byte selects min(zstd, rANS) per frame,
+so the path can never lose more than one byte. Roundtrip unit test;
+suite 83/0.
+
+Two bugs found by real data before the numbers: a 255-symbol table's
+count byte collided with the absent-context marker (255), read back
+as "absent", misaligned the stream, and the slot builder indexed past
+the table BEFORE the sum check — fixed by reserving 255 (≥254-symbol
+tables use the dense format) and guarding accumulation to fail-None
+instead of panic.
+
+Measured, bit-identical reconstruction throughout (PSNR to six
+decimals): worst shot 4.79 → 4.43 MB (−7.5%; entropy work cumulative
+on that shot: −15.6%); locked shot −0.4% (small payloads: zstd-12 +
+table overhead compete). Full suite (aggregate printed BEFORE this
+entry, per the twice-learned rule):
+  band-major : 36.35 MB @ 33.69 / 0.934   (36.8×)
+  rANS       : 33.89 MB @ 33.69 / 0.934   (34.3×)
+Entropy arc total: 39.90 → 33.89 MB (−15.1%) at identical
+reconstructions. The 8-context order-0 model beat zstd by what
+order-0 separation is worth; the remaining entropy headroom is
+richer contexts (neighbor-magnitude conditioning, zero-run symbols)
+— the last step toward the original 2–3× entropy estimate.
+
+Session ladder, whole 45 s: 46.5× @ −2.00 dB → 34.3× @ +0.36 dB.

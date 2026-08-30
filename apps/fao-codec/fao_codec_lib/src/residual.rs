@@ -317,6 +317,22 @@ pub fn encode(
         Ok(c) => c,
         Err(_) => payload.clone(),
     };
+    // rANS-split candidate (skip-RLE mode only): structure → zstd,
+    // coefficients → per-context rANS. Best-of per frame via a method
+    // byte, so this path can never lose more than one byte.
+    let rans_candidate: Option<Vec<u8>> = if opts.skip_block_rle {
+        let (structure, pairs) = pack_skip_rle_split(&blocks, opts);
+        let z_struct = zstd::encode_all(structure.as_slice(), lvl).unwrap_or(structure);
+        crate::rans::encode(&pairs, 8).map(|rblob| {
+            let mut v = Vec::with_capacity(4 + z_struct.len() + rblob.len());
+            v.extend_from_slice(&(z_struct.len() as u32).to_le_bytes());
+            v.extend_from_slice(&z_struct);
+            v.extend_from_slice(&rblob);
+            v
+        })
+    } else {
+        None
+    };
     
     // Assemble final output: 4-byte header (rw_field, rh) + zstd payload.
     let mut rw_field: u16 = (rw as u16) & RW_MASK;
@@ -325,10 +341,24 @@ pub fn encode(
     if opts.dc_prediction       { rw_field |= FLAG_DC_PREDICTION; }
     if opts.channel_deinterleave { rw_field |= FLAG_DEINTERLEAVE; }
     
-    let mut out = Vec::with_capacity(4 + compressed.len());
+    // Method byte after the 4-byte header: 0 = whole-payload zstd,
+    // 1 = rANS-split (structure zstd + per-context rANS coefficients).
+    // Chosen per frame by size; the flag costs one byte and the rANS
+    // path can therefore never lose more than that.
+    let use_rans = rans_candidate
+        .as_ref()
+        .map(|r| r.len() < compressed.len())
+        .unwrap_or(false);
+    let body: &[u8] = if use_rans {
+        rans_candidate.as_deref().unwrap()
+    } else {
+        &compressed
+    };
+    let mut out = Vec::with_capacity(5 + body.len());
     out.extend_from_slice(&rw_field.to_le_bytes());
     out.extend_from_slice(&(rh as u16).to_le_bytes());
-    out.extend_from_slice(&compressed);
+    out.push(if use_rans { 1 } else { 0 });
+    out.extend_from_slice(body);
     Some(out)
 }
 
@@ -439,6 +469,143 @@ fn pack_skip_rle(
     out
 }
 
+/// Split variant of `pack_skip_rle` for the rANS path: the STRUCTURE
+/// stream (RLE counts, segment sizes, params) goes to zstd; the
+/// COEFFICIENT bytes go out as (context, symbol) pairs in decode order
+/// for per-context entropy coding. Context = channel class (Y vs
+/// chroma) × band group (DC | 1–3 | 4–9 | 10–15): 8 contexts whose
+/// distributions differ by orders of magnitude — exactly what a
+/// generic sliding-window entropy stage blurs together.
+fn coef_ctx(c: usize, k: usize) -> u8 {
+    let class = if c == 0 { 0u8 } else { 1 };
+    let group = match k {
+        0 => 0u8,
+        1..=3 => 1,
+        4..=9 => 2,
+        _ => 3,
+    };
+    class * 4 + group
+}
+
+fn pack_skip_rle_split(
+    blocks: &[([[i8; 16]; 3], [QuantParams; 3])],
+    opts: &ResidualOpts,
+) -> (Vec<u8>, Vec<(u8, u8)>) {
+    let thresh = opts.skip_threshold;
+    let is_skip = |qs: &[[i8; 16]; 3]| -> bool {
+        for c in 0..3 {
+            for v in &qs[c] {
+                if v.abs() > thresh {
+                    return false;
+                }
+            }
+        }
+        true
+    };
+    let mut structure = Vec::new();
+    let mut pairs: Vec<(u8, u8)> = Vec::new();
+    let mut i = 0;
+    while i < blocks.len() {
+        let mut skip_count = 0u32;
+        while i < blocks.len() && is_skip(&blocks[i].0) {
+            skip_count += 1;
+            i += 1;
+        }
+        let nonskip_start = i;
+        let mut n_nonskip = 0u8;
+        while i < blocks.len() && !is_skip(&blocks[i].0) && n_nonskip < 255 {
+            n_nonskip += 1;
+            i += 1;
+        }
+        if skip_count == 0 && n_nonskip == 0 {
+            break;
+        }
+        structure.extend_from_slice(&skip_count.to_le_bytes());
+        structure.push(n_nonskip);
+        for c in 0..3 {
+            for j in 0..n_nonskip as usize {
+                structure.push(blocks[nonskip_start + j].1[c].pack());
+            }
+            for k in 0..16 {
+                let ctx = coef_ctx(c, k);
+                for j in 0..n_nonskip as usize {
+                    pairs.push((ctx, blocks[nonskip_start + j].0[c][k] as u8));
+                }
+            }
+        }
+    }
+    (structure, pairs)
+}
+
+/// Decode-side mirror: walk the structure stream, emit the context of
+/// every coefficient symbol (same order as pack_skip_rle_split), and
+/// record where each segment's params/coefs land so the caller can
+/// scatter decoded symbols into blocks.
+fn unpack_split(
+    structure: &[u8],
+    coefs: &[u8],
+    blocks: &mut [([[i8; 16]; 3], [QuantParams; 3])],
+) -> bool {
+    let n_blocks = blocks.len();
+    let mut off = 0usize;
+    let mut ci = 0usize;
+    let mut block_idx = 0usize;
+    while off < structure.len() && block_idx < n_blocks {
+        if off + 5 > structure.len() {
+            return false;
+        }
+        let skip_count = u32::from_le_bytes([
+            structure[off],
+            structure[off + 1],
+            structure[off + 2],
+            structure[off + 3],
+        ]) as usize;
+        let n_nonskip = structure[off + 4] as usize;
+        off += 5;
+        block_idx += skip_count;
+        for c in 0..3 {
+            for j in 0..n_nonskip {
+                if block_idx + j >= n_blocks || off >= structure.len() {
+                    return false;
+                }
+                blocks[block_idx + j].1[c] = QuantParams::unpack(structure[off]);
+                off += 1;
+            }
+            for k in 0..16 {
+                for j in 0..n_nonskip {
+                    if block_idx + j >= n_blocks || ci >= coefs.len() {
+                        return false;
+                    }
+                    blocks[block_idx + j].0[c][k] = coefs[ci] as i8;
+                    ci += 1;
+                }
+            }
+        }
+        block_idx += n_nonskip;
+    }
+    true
+}
+
+/// Context sequence for the rANS decoder, derived from the structure
+/// stream alone (must match pack_skip_rle_split's emission order).
+fn ctx_sequence(structure: &[u8]) -> Vec<u8> {
+    let mut seq = Vec::new();
+    let mut off = 0usize;
+    while off + 5 <= structure.len() {
+        let n_nonskip = structure[off + 4] as usize;
+        off += 5;
+        for c in 0..3 {
+            off += n_nonskip; // this channel's params
+            for k in 0..16 {
+                for _ in 0..n_nonskip {
+                    seq.push(coef_ctx(c, k));
+                }
+            }
+        }
+    }
+    seq
+}
+
 // ──────────────────────────────────────────────────────────────────
 // Decoder
 // ──────────────────────────────────────────────────────────────────
@@ -474,22 +641,45 @@ pub fn apply(predicted: Vec<u8>, residual_bytes: &[u8], w: usize, h: usize) -> V
     if rw == 0 || rh == 0 { return predicted; }
     if rw * 4 > w || rh * 4 > h { return predicted; }
     
-    let decompressed = match zstd::decode_all(&residual_bytes[4..]) {
-        Ok(d) => d,
-        Err(_) => return predicted,
-    };
-    
+    let method = *residual_bytes.get(4).unwrap_or(&0);
     let n_blocks = rw * rh;
     let mut blocks: Vec<([[i8; 16]; 3], [QuantParams; 3])> = vec![
         ([[0; 16]; 3], [QuantParams { scale_byte: 0, saliency_boost: 0 }; 3]); 
         n_blocks
     ];
     
-    // Unpack into the blocks array.
-    let parse_ok = if skip_rle {
-        unpack_skip_rle(&decompressed, &mut blocks, deint)
+    let parse_ok = if method == 1 {
+        // rANS-split path: [struct_len u32][zstd structure][rANS blob].
+        let body = &residual_bytes[5..];
+        if body.len() < 4 {
+            return predicted;
+        }
+        let sl = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+        if body.len() < 4 + sl {
+            return predicted;
+        }
+        match zstd::decode_all(&body[4..4 + sl]) {
+            Ok(structure) => {
+                let seq = ctx_sequence(&structure);
+                match crate::rans::decode(&body[4 + sl..], &mut |i| seq[i]) {
+                    Some(coefs) if coefs.len() == seq.len() => {
+                        unpack_split(&structure, &coefs, &mut blocks)
+                    }
+                    _ => false,
+                }
+            }
+            Err(_) => false,
+        }
     } else {
-        unpack_dense(&decompressed, &mut blocks)
+        let decompressed = match zstd::decode_all(&residual_bytes[5..]) {
+            Ok(d) => d,
+            Err(_) => return predicted,
+        };
+        if skip_rle {
+            unpack_skip_rle(&decompressed, &mut blocks, deint)
+        } else {
+            unpack_dense(&decompressed, &mut blocks)
+        }
     };
     if !parse_ok { return predicted; }
     
