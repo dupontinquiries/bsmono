@@ -46,9 +46,23 @@ impl App {
     fn handle(&mut self, cmds: Vec<HostCommand>) {
         for c in cmds {
             match c {
-                // These two the app can answer for itself: they are bookkeeping
-                // about what the user already saw, not work for a backend.
-                HostCommand::MarkViewed(_) | HostCommand::MarkExpired(_) => {}
+                // NOT app-internal after all, despite what this comment
+                // used to claim. `MarkViewed`'s own doc says "mark as
+                // seen IN STORAGE" and `MarkExpired`'s says "storage does
+                // different things with each" — so these are the two
+                // commands that most need a store, and they were the two
+                // being silently discarded while everything else was
+                // reported.
+                //
+                // The in-memory state exists and is tested (`snaps.rs`),
+                // so today a snap is viewed until restart and unviewed
+                // afterwards. Until there is a persistence layer they
+                // report like the rest: a comment claiming something is
+                // handled is worse than no arm at all, because it stops
+                // anyone looking.
+                other @ (HostCommand::MarkViewed(_) | HostCommand::MarkExpired(_)) => {
+                    eprintln!("snapclone: {other:?} — no store yet, viewed state is in-memory only");
+                }
                 other => eprintln!("snapclone: unhandled host command: {other:?}"),
             }
         }

@@ -2291,3 +2291,46 @@ Two decisions:
   preview string is now a MIRROR of what was sent rather than the
   destination, which is what stops it and the focused window
   disagreeing.
+
+## 39. snapclone-egui: the host boundary is honest, and one arm is not
+
+Operator says the QML/Qt-translation approach is working here — agreed,
+and the audit backs it: 49 surfaces, all present, 0 absent, and
+`unhosted_check` reports 0 uncalled modules. It is the healthiest of the
+three front-ends.
+
+Checked the failure shape that caught rusty-board and voiceterm this
+turn — a queue with no reader — and snapclone does NOT have it.
+`Host::drain_commands` feeds `on_event`, the binary consumes the result,
+and the sink is explicitly labelled:
+
+    Deliberately a debug sink and labelled as one. Capture, export and
+    retry all need a camera pipeline, an archiver and a socket that this
+    binary does not have yet; printing is not a stand-in for them, it is
+    a way to SEE that the request reached the boundary.
+
+That is the right way to leave an unfinished boundary: the gap is named,
+and an unhandled command is LOUD on stderr rather than silently dropped.
+Worth recording as a pass, since the same author wrote the two that
+failed.
+
+- **C12-39a — one arm contradicts its own comment.**
+  `MarkViewed`/`MarkExpired` are matched with `=> {}` under the note
+  "these two the app can answer for itself: bookkeeping about what the
+  user already saw". But `HostCommand::MarkViewed`'s own doc says "mark
+  as seen IN STORAGE", and `MarkExpired`'s says "storage does different
+  things with each". So they are not app-internal bookkeeping; they are
+  the two commands that need a store, and they are the two that are
+  silently discarded rather than reported like the rest.
+
+  In-memory viewed state exists (`snaps.rs`, tested:
+  `opening_a_snap_marks_it_viewed_immediately`), so the effect today is
+  that a snap is viewed until restart and then unviewed again. Not
+  built here because it needs a persistence layer decision — a JSON
+  sidecar, the settings store, or the same place `snap_expiry` will
+  want — and guessing at it is how two stores end up disagreeing about
+  what was seen.
+
+  The narrow fix meanwhile: make those two arms report like the others
+  instead of claiming to have handled them. A comment that says a thing
+  is handled is worse than no arm at all.
