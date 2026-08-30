@@ -29,6 +29,12 @@ pub enum CamMode {
     /// a defensive gun position: rear-facing, or ventral, depending on what
     /// the model actually carries
     Gunner,
+    /// THE FOLD SHOT. A director's camera for the ~1.3s the body is
+    /// mid-morph: it drops the stick input entirely and flies a low,
+    /// wide-angle arc around the subject, matched to `xform::Profile`'s
+    /// beats rather than to anything the player is doing. Restores the
+    /// mode that was active before the fold when it ends.
+    Cinematic,
 }
 
 /// Where a gunner sits. Which one a chassis offers is a property OF THE
@@ -85,6 +91,9 @@ impl CamMode {
                 }
             }
             CamMode::Gunner => CamMode::Ball,
+            // never reached by cycling — the fold shot is entered and left
+            // by `start_cinematic`/`end_cinematic`, not the camera key
+            CamMode::Cinematic => CamMode::Cinematic,
         }
     }
     pub fn label(self) -> &'static str {
@@ -93,6 +102,7 @@ impl CamMode {
             CamMode::Chase => "CHASE CAM",
             CamMode::First => "FIRST PERSON",
             CamMode::Gunner => "GUNNER",
+            CamMode::Cinematic => "",
         }
     }
 }
@@ -138,6 +148,17 @@ pub struct Camera {
     /// stops flattening itself into the horizontal plane, which is right for
     /// a ground game and wrong for a dogfight
     pub combat: bool,
+    /// what to go back to when the fold ends; `None` outside `Cinematic`
+    cine_prev: Option<CamMode>,
+    /// which way the fold arc turns — picked once per fold so it doesn't
+    /// re-decide every frame, but varies fold to fold
+    cine_side: f32,
+    /// total arc (radians) the shot sweeps over the whole fold, from
+    /// `content::Chassis::fold_spin` — a whippy chassis gets a faster
+    /// camera turn, a lumbering one a slower one
+    cine_sweep: f32,
+    /// added on top of `cfg.fov_deg` for the punch-in on the closing beat
+    pub fov_punch: f32,
 }
 
 impl Camera {
@@ -161,7 +182,41 @@ impl Camera {
             nose_cam: false,
             gun_seat: None,
             combat: false,
+            cine_prev: None,
+            cine_side: 1.0,
+            cine_sweep: 1.3,
+            fov_punch: 0.0,
         }
+    }
+
+    /// Enter the fold shot. Called once, on the frame a transform starts.
+    /// `seed` just needs to vary between folds (e.g. the car's position or
+    /// an incrementing counter) — it only decides which way the arc turns.
+    /// `spin_deg` is the chassis's `content::Chassis::fold_spin`: how much
+    /// the shot sweeps is tied to how whippy this body's fold actually is,
+    /// same as `dur_mul` already ties the blend's own speed to it.
+    pub fn start_cinematic(&mut self, seed: f32, spin_deg: f32) {
+        if self.cine_prev.is_none() {
+            self.cine_prev = Some(self.mode);
+        }
+        self.cine_side = if seed.fract().abs() < 0.5 { 1.0 } else { -1.0 };
+        self.cine_sweep = (spin_deg.to_radians() * 0.55).clamp(0.9, 2.7);
+        self.mode = CamMode::Cinematic;
+    }
+
+    /// Leave the fold shot and hand control back. Safe to call even if a
+    /// cinematic was never started — `advance_xform` calls it unconditionally
+    /// once `t` reaches an endpoint, folding or not.
+    pub fn end_cinematic(&mut self) {
+        if let Some(prev) = self.cine_prev.take() {
+            self.mode = prev;
+        }
+        self.fov_punch = 0.0;
+    }
+
+    /// True while the director, not the player, owns the camera.
+    pub fn in_cinematic(&self) -> bool {
+        self.mode == CamMode::Cinematic
     }
 
     /// Current shake, for the SHIVER rig (parts jolt when the car is hit).
@@ -218,6 +273,13 @@ impl Camera {
         flipping: bool,
         rear: bool,
         dt: f32,
+        // `Some(t)` while `Cinematic` is driving the shot, 0..1 through the
+        // fold in the vehicle -> robot direction regardless of which way it
+        // is actually running (the arc looks the same either way; only the
+        // body under it changes). `None` the rest of the time — cheaper
+        // than plumbing `xform::Xform` itself in here, and this is the only
+        // number the shot needs.
+        fold_t: Option<f32>,
     ) {
         // ---- gravity-aware up basis: smoothed, rate-capped, blendable ----
         let g = world.gravity_dir(car.pos);
@@ -257,6 +319,9 @@ impl Camera {
                 Some(GunSeat::Ventral) => car.pos - self.up * 40.0,
                 _ => car.pos - self.heading * 40.0 + self.up * eye_h * 0.5,
             },
+            // unused: the Cinematic branch below computes its own look
+            // point directly from `fold_t` and never reads `target`
+            CamMode::Cinematic => car.pos,
         };
         let mut dir = target - car.pos;
         if dir.length_squared() < 1e-4 {
@@ -366,20 +431,37 @@ impl Camera {
             } else {
                 car.pos + self.up * (car.half_h * 1.55) + f * (car.half_len * 0.55 + 0.25)
             };
+        } else if self.mode == CamMode::Cinematic {
+            // THE FOLD SHOT. Low and wide at the start — a hero angle
+            // looking up the body as it breaks apart — rising to a level,
+            // slightly-elevated framing for the reveal as `ft` reaches 1.
+            // Fully overrides the boom: this is a director's camera, not
+            // the player's, so none of the chase smoothing or terrain
+            // clamp above applies to it.
+            let ft = fold_t.unwrap_or(0.0).clamp(0.0, 1.0);
+            let sweep = self.cine_side * self.cine_sweep * (0.35 + 0.65 * ft);
+            let orbit_dir = Quat::from_axis_angle(self.up, sweep) * (-self.heading);
+            let radius = (car.half_len.max(car.half_h) * 3.6 + 2.4).max(4.5);
+            let eye_h = car.half_h * (0.10 + 0.5 * ft) + (1.0 - ft) * 0.30;
+            self.pos = car.pos + orbit_dir * radius + self.up * eye_h;
+            let look_h = car.half_h * (0.5 + 0.4 * ft);
+            self.look = car.pos + self.up * look_h;
         } else {
             self.pos += (want - self.pos) * k;
         }
 
-        let aim = if rear { car.pos - (target - car.pos) } else { target };
-        // the boom's downward tilt is a third-person framing device; from
-        // the head there is no boom, so there is nothing to tilt
-        let tilt = if self.mode == CamMode::First {
-            0.0
-        } else {
-            cfg.dist * (-cfg.angle_deg.to_radians()).tan()
-        };
-        let want_look = aim + self.up * (0.35 - tilt);
-        self.look += (want_look - self.look) * (1.0 - (-14.0 * cfg.stiffness * dt).exp());
+        if self.mode != CamMode::Cinematic {
+            let aim = if rear { car.pos - (target - car.pos) } else { target };
+            // the boom's downward tilt is a third-person framing device; from
+            // the head there is no boom, so there is nothing to tilt
+            let tilt = if self.mode == CamMode::First {
+                0.0
+            } else {
+                cfg.dist * (-cfg.angle_deg.to_radians()).tan()
+            };
+            let want_look = aim + self.up * (0.35 - tilt);
+            self.look += (want_look - self.look) * (1.0 - (-14.0 * cfg.stiffness * dt).exp());
+        }
 
         // INDOORS THE BOOM HAS TO COME IN. A 4.9 m chase distance is fine on
         // a field and wrong in a corridor: the eye ends up outside the hull
@@ -432,7 +514,8 @@ impl Camera {
         // within ten centimetres of a chase camera. Tested in `scale.rs`.
         let shot = (self.look - self.pos).length();
         let near = crate::scale::near_for(shot);
-        let proj = Mat4::perspective_rh(cfg.fov_deg.to_radians(), aspect, near, Self::FAR_M);
+        let fov = (cfg.fov_deg - self.fov_punch).clamp(20.0, 140.0);
+        let proj = Mat4::perspective_rh(fov.to_radians(), aspect, near, Self::FAR_M);
         let vp = proj * view;
         (vp, vp.inverse())
     }
@@ -498,6 +581,78 @@ mod tests {
         for m in [CamMode::Ball, CamMode::Chase, CamMode::First, CamMode::Gunner] {
             assert!(!m.label().is_empty());
         }
+    }
+
+    #[test]
+    fn the_fold_shot_hands_the_camera_back_to_where_it_was() {
+        let mut c = Camera::new();
+        c.mode = CamMode::Gunner;
+        c.start_cinematic(0.1, 220.0);
+        assert_eq!(c.mode, CamMode::Cinematic);
+        assert!(c.in_cinematic());
+        c.end_cinematic();
+        assert_eq!(c.mode, CamMode::Gunner, "did not restore the pre-fold mode");
+        assert!(!c.in_cinematic());
+    }
+
+    #[test]
+    fn a_fold_that_starts_mid_fold_does_not_forget_the_original_mode() {
+        // reversing direction mid-transform (xform::Xform::request already
+        // allows this) re-enters start_cinematic while still Cinematic —
+        // the ORIGINAL pre-fold mode must survive, not get overwritten
+        // with Cinematic itself
+        let mut c = Camera::new();
+        c.mode = CamMode::First;
+        c.start_cinematic(0.1, 220.0);
+        c.start_cinematic(0.9, 300.0); // re-entrant, as a direction flip would do
+        c.end_cinematic();
+        assert_eq!(c.mode, CamMode::First, "lost the mode from before the fold");
+    }
+
+    #[test]
+    fn ending_a_fold_that_never_started_is_a_harmless_no_op() {
+        // `advance_xform` calls `end_cinematic` unconditionally on every
+        // frame the fold's endpoint lands, folding or not — it must not
+        // require a matching `start_cinematic` first
+        let mut c = Camera::new();
+        c.mode = CamMode::Ball;
+        c.end_cinematic();
+        assert_eq!(c.mode, CamMode::Ball);
+        assert_eq!(c.fov_punch, 0.0);
+    }
+
+    #[test]
+    fn fold_spin_maps_to_a_bounded_camera_sweep() {
+        // content::CHASSIS spans roughly 160..300 degrees; whatever comes
+        // in, the shot's own arc must stay within a range that still reads
+        // as a controlled camera move rather than a spin or a static shot
+        let mut c = Camera::new();
+        for spin in [1.0f32, 160.0, 220.0, 300.0, 1000.0] {
+            c.start_cinematic(0.3, spin);
+            assert!(c.cine_sweep >= 0.9 && c.cine_sweep <= 2.7, "spin {spin} -> sweep {}", c.cine_sweep);
+        }
+    }
+
+    #[test]
+    fn fov_punch_cannot_push_the_lens_past_the_clamp() {
+        let cfg = CamCfg {
+            fov_deg: 30.0,
+            dist: 4.9,
+            height: 1.2,
+            angle_deg: 20.0,
+            stiffness: 1.0,
+            shake: 0.0,
+            grav_follow: 1.0,
+            plat_bend: 0.0,
+        };
+        let mut c = Camera::new();
+        c.pos = Vec3::new(0.0, 0.0, 10.0);
+        c.look = Vec3::ZERO;
+        c.up = Vec3::Y;
+        c.fov_punch = 1000.0; // absurd on purpose: a runaway punch must not go negative-FOV
+        // no panic and no degenerate (NaN/zero) projection is the assertion
+        let (vp, _) = c.view_proj(&cfg, 16.0 / 9.0);
+        assert!(vp.determinant().is_finite() && vp.determinant() != 0.0);
     }
 }
 
