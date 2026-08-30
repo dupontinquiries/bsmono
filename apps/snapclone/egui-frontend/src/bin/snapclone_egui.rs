@@ -116,6 +116,7 @@ impl App {
                         // approximation and the cap it feeds was already
                         // enforced by the socket's own buffer.
                         datagram_len: len,
+                        public: a.public,
                     });
                     self.handle(cmds);
                 }
@@ -194,6 +195,12 @@ impl App {
                     }
                 }
                 HostCommand::GossipAdmitted(true) => {}
+                HostCommand::PeerKeyChanged(id) => {
+                    eprintln!("snapclone: {id} is signing with a different key than the one \
+                               on file. They may have reinstalled — or someone is \
+                               impersonating them. Refused; delete and re-add the contact \
+                               if you know it was a reinstall.");
+                }
                 HostCommand::IdentityUnavailable => {
                     eprintln!("snapclone: no identity — /dev/urandom was unreadable. \
                                Nobody can add this device and the QR code will be blank.");

@@ -47,6 +47,17 @@ pub struct Contact {
     /// Unix ms. Kept for ordering: a list that reshuffles between launches is
     /// one people stop trusting their eyes on.
     pub added_ms: u64,
+    /// Their Ed25519 key, pinned the first time a signed announcement from them
+    /// verified. `None` until then — a contact added by QR or by hand has an
+    /// sc-ID and nothing else.
+    ///
+    /// **This is what makes the sc-ID safe.** The id is four bytes of the key's
+    /// hash, so grinding a keypair whose fingerprint matches a chosen sc-ID is
+    /// about 2^32 work — minutes. Pinning removes the payoff: once a real key
+    /// is on file for that id, a ground one no longer matches and is refused.
+    /// Trust on first use, with everything that implies: the FIRST sighting is
+    /// the one that cannot be checked.
+    pub public: Option<[u8; 32]>,
 }
 
 impl Contact {
@@ -90,7 +101,7 @@ impl ContactBook {
             return true;
         }
         self.entries.push(Contact {
-            sc_id: sc_id.to_string(), nickname: String::new(), port, added_ms,
+            sc_id: sc_id.to_string(), nickname: String::new(), port, added_ms, public: None,
         });
         true
     }
@@ -102,6 +113,23 @@ impl ContactBook {
         match self.entries.iter_mut().find(|c| c.sc_id == sc_id) {
             Some(c) if c.nickname != to.trim() => { c.nickname = to.trim().to_string(); true }
             _ => false,
+        }
+    }
+
+    /// Record or check a contact's key.
+    ///
+    /// Not a setter: the whole value is in refusing the third case.
+    pub fn pin(&mut self, sc_id: &str, public: [u8; 32]) -> Pin {
+        let Some(c) = self.entries.iter_mut().find(|c| c.sc_id == sc_id) else {
+            // Not a contact. Nothing to pin against and nowhere to keep it —
+            // pinning strangers would mean writing the address book every time
+            // an unknown device on the subnet said hello.
+            return Pin::Unknown;
+        };
+        match c.public {
+            None => { c.public = Some(public); Pin::First }
+            Some(k) if k == public => Pin::Same,
+            Some(_) => Pin::Changed,
         }
     }
 
@@ -124,6 +152,25 @@ impl ContactBook {
     }
 }
 
+/// What happened when a key was checked against a contact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pin {
+    /// First signed sighting; the key is now on file.
+    First,
+    /// Matches what we had.
+    Same,
+    /// A DIFFERENT key for an id we have a key for.
+    ///
+    /// Either they reinstalled, or somebody ground a keypair to collide with
+    /// their sc-ID. Those are indistinguishable from here, which is exactly why
+    /// this is refused and surfaced rather than silently re-pinned: silently
+    /// taking the new key makes the pin worthless, and silently dropping the
+    /// datagram makes a legitimate reinstall look like a broken network.
+    Changed,
+    /// Not in the address book at all.
+    Unknown,
+}
+
 /// The file, beside `settings.conf`.
 pub const FILE: &str = "contacts.conf";
 
@@ -139,6 +186,10 @@ pub fn render(book: &ContactBook) -> String {
         out.push_str(&format!("nickname = {}\n", c.nickname));
         out.push_str(&format!("port = {}\n", c.port));
         out.push_str(&format!("added_ms = {}\n", c.added_ms));
+        if let Some(k) = c.public {
+            out.push_str(&format!("public = {}\n",
+                                  k.iter().map(|b| format!("{b:02x}")).collect::<String>()));
+        }
     }
     out
 }
@@ -160,11 +211,24 @@ pub fn parse(text: &str) -> ContactBook {
             .unwrap_or(crate::qr::DEFAULT_PORT);
         let added_ms = ini.get(sc_id, "added_ms").and_then(|v| v.trim().parse().ok())
             .unwrap_or(0);
+        // A malformed key is dropped rather than kept: half a pin is worse than
+        // none, because the next verified sighting would read as a key CHANGE
+        // and refuse a peer who did nothing wrong.
+        let public = ini.get(sc_id, "public").and_then(|v| {
+            let v = v.trim();
+            if v.len() != 64 { return None; }
+            let mut out = [0u8; 32];
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = u8::from_str_radix(v.get(i * 2..i * 2 + 2)?, 16).ok()?;
+            }
+            Some(out)
+        });
         book.entries.push(Contact {
             sc_id: sc_id.to_string(),
             nickname: ini.get(sc_id, "nickname").unwrap_or("").trim().to_string(),
             port,
             added_ms,
+            public,
         });
     }
     // Oldest first, so the list a user sees does not reshuffle when the file's
@@ -285,6 +349,46 @@ mod tests {
         let names: Vec<String> = b.to_peers().into_iter().map(|p| p.name).collect();
         assert!(names.contains(&"Ada".to_string()));
         assert!(names.contains(&"sc-11223344".to_string()), "and the bare id otherwise");
+    }
+
+    #[test]
+    fn a_key_is_pinned_on_the_first_signed_sighting_and_matches_after() {
+        let mut b = book();
+        assert_eq!(b.pin("sc-aabbccdd", [7u8; 32]), Pin::First);
+        assert_eq!(b.pin("sc-aabbccdd", [7u8; 32]), Pin::Same);
+        assert_eq!(b.get("sc-aabbccdd").unwrap().public, Some([7u8; 32]));
+    }
+
+    #[test]
+    fn a_different_key_for_a_pinned_id_is_refused_rather_than_re_pinned() {
+        // The attack the pin exists for: the sc-ID is four bytes of the key's
+        // hash, so grinding a keypair to collide with a chosen id is about 2^32
+        // work. Silently taking the new key would make the pin worthless.
+        let mut b = book();
+        b.pin("sc-aabbccdd", [7u8; 32]);
+        assert_eq!(b.pin("sc-aabbccdd", [8u8; 32]), Pin::Changed);
+        assert_eq!(b.get("sc-aabbccdd").unwrap().public, Some([7u8; 32]),
+                   "the stored key was overwritten by the challenger");
+    }
+
+    #[test]
+    fn a_stranger_is_not_pinned_because_there_is_nowhere_to_keep_it() {
+        // Pinning unknown devices would write the address book every time
+        // anything on the subnet said hello.
+        let mut b = book();
+        assert_eq!(b.pin("sc-99999999", [7u8; 32]), Pin::Unknown);
+        assert_eq!(b.len(), 2);
+    }
+
+    #[test]
+    fn a_pinned_key_survives_the_file_and_a_broken_one_does_not_half_survive() {
+        let mut b = book();
+        b.pin("sc-aabbccdd", [7u8; 32]);
+        assert_eq!(parse(&render(&b)), b);
+        // Half a pin is worse than none: the next verified sighting would read
+        // as a key CHANGE and refuse a peer who did nothing wrong.
+        let broken = parse("[sc-aabbccdd]\nport = 9876\npublic = beef\n");
+        assert_eq!(broken.get("sc-aabbccdd").unwrap().public, None);
     }
 
     #[test]

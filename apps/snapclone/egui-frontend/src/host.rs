@@ -115,7 +115,14 @@ pub enum HostEvent {
     /// A discovery record arrived on the subnet. `datagram_len` is carried
     /// because the app's own admission check uses it — gossip arrives from
     /// anyone, and an oversized record is one of the things that gets refused.
-    GossipHeard { record: gossip::PeerRecord, datagram_len: usize },
+    GossipHeard {
+        record: gossip::PeerRecord,
+        datagram_len: usize,
+        /// The verifying key the datagram carried, when it carried one. Kept
+        /// beside the record rather than inside it: this is something the
+        /// decode learned, not part of the peer view's currency.
+        public: Option<[u8; 32]>,
+    },
     /// Presence changed for a known peer.
     PeerPresence { id: String, online: bool },
     /// A peer's address was observed, for hole punching.
@@ -223,6 +230,11 @@ pub enum HostCommand {
     /// signalling "go read the app's field", so a host can write it from
     /// another thread without borrowing the app.
     SaveContacts(Box<contact_book::ContactBook>),
+    /// A contact's announcement was signed by a key that is not the one on
+    /// file. Either they reinstalled or somebody ground a keypair to collide
+    /// with their sc-ID, and those are indistinguishable from here — so this
+    /// reaches the user rather than being resolved automatically.
+    PeerKeyChanged(String),
     /// No identity could be established. The app runs, but nobody can add this
     /// device, and the QR code it shows is empty — the host should say so
     /// rather than let that be discovered socially.
@@ -283,8 +295,9 @@ impl Snapclone {
             HostEvent::QrPayload(p) => out.push(HostCommand::QrLatched(self.qr_frame(&p))),
             HostEvent::AmbientPixels { pixels, side } => self.sample_ambient(&pixels, side),
 
-            HostEvent::GossipHeard { record, datagram_len } => {
-                out.push(HostCommand::GossipAdmitted(self.on_gossip(record, datagram_len)));
+            HostEvent::GossipHeard { record, datagram_len, public } => {
+                out.push(HostCommand::GossipAdmitted(
+                    self.on_gossip(record, datagram_len, public)));
             }
             HostEvent::PeerPresence { id, online } => {
                 self.roster.mark_online(&id, online);
@@ -378,6 +391,9 @@ impl Snapclone {
         for (field, text) in std::mem::take(&mut self.dictated) {
             out.push(HostCommand::ApplyDictation { field, text });
         }
+        for id in std::mem::take(&mut self.key_conflicts) {
+            out.push(HostCommand::PeerKeyChanged(id));
+        }
         if std::mem::take(&mut self.contacts_dirty) {
             out.push(HostCommand::SaveContacts(Box::new(self.contact_book.clone())));
         }
@@ -465,7 +481,8 @@ mod tests {
             id: "studio".into(), host: "10.0.0.9".into(), port: 9876,
             last_seen_ms: 1_000, verified: true,
         };
-        let out = s.apply(HostEvent::GossipHeard { record: rec, datagram_len: 64 });
+        let out = s.apply(HostEvent::GossipHeard {
+            record: rec, datagram_len: 64, public: None });
         assert!(out.iter().any(|c| matches!(c, HostCommand::GossipAdmitted(_))),
                 "the decision was dropped: {out:?}");
     }
@@ -687,7 +704,8 @@ mod tests {
         assert!(heard.verified);
 
         let out = s.apply(HostEvent::GossipHeard {
-            record: heard.sender_record(), datagram_len: bytes.len() });
+            record: heard.sender_record(), datagram_len: bytes.len(),
+            public: heard.public });
         assert!(out.contains(&HostCommand::GossipAdmitted(true)), "{out:?}");
         assert!(s.peers.iter().any(|p| p.name == id.sc_id && p.online),
                 "an admitted record did not bring the contact online");
@@ -697,6 +715,59 @@ mod tests {
         // not removed: a device that stopped gossiping may just be asleep.
         s.tick_gossip(5_000 + crate::gossip::FAILURE_MS + crate::gossip::PRUNE_MS + 1);
         assert!(s.peers.iter().all(|p| !p.online), "a pruned peer stayed green");
+    }
+
+    #[test]
+    fn a_first_signed_sighting_pins_the_key_and_saves_it() {
+        let mut s = app();
+        let id = identity::create().expect("entropy");
+        let mut book = contact_book::ContactBook::default();
+        book.upsert(&id.sc_id, 9876, 1_000);
+        s.apply(HostEvent::ContactsLoaded(Box::new(book)));
+
+        let a = crate::gossip_wire::Announce {
+            id: id.sc_id.clone(), host: "10.0.0.7".into(), port: 9876, ts: 5_000,
+            peers: Vec::new(), public: None, verified: false,
+        };
+        let bytes = crate::gossip_wire::encode_signed(&a, &id.secret, &id.public).unwrap();
+        let heard = crate::gossip_wire::decode(&bytes).unwrap();
+        let out = s.apply(HostEvent::GossipHeard {
+            record: heard.sender_record(), datagram_len: bytes.len(), public: heard.public });
+
+        assert!(out.contains(&HostCommand::GossipAdmitted(true)));
+        assert_eq!(s.contact_book.get(&id.sc_id).unwrap().public, Some(id.public));
+        assert!(out.iter().any(|c| matches!(c, HostCommand::SaveContacts(_))),
+                "the pin was not written, so it is forgotten on restart: {out:?}");
+    }
+
+    #[test]
+    fn a_second_key_for_a_pinned_contact_is_refused_and_reaches_the_user() {
+        // A ground keypair colliding with a chosen sc-ID is ~2^32 work, so I am
+        // not generating a real collision — I am supplying the two values the
+        // decoder WOULD produce for one: the victim's id, and the attacker's
+        // key. That is exactly the pair the pin exists to reject.
+        let mut s = app();
+        let victim = identity::create().unwrap();
+        let attacker = identity::create().unwrap();
+        let mut book = contact_book::ContactBook::default();
+        book.upsert(&victim.sc_id, 9876, 1_000);
+        s.apply(HostEvent::ContactsLoaded(Box::new(book)));
+        s.contact_book.pin(&victim.sc_id, victim.public);
+
+        let rec = crate::gossip::PeerRecord {
+            id: victim.sc_id.clone(), host: "10.0.0.9".into(), port: 9876,
+            last_seen_ms: 5_000, verified: true,
+        };
+        let out = s.apply(HostEvent::GossipHeard {
+            record: rec, datagram_len: 200, public: Some(attacker.public) });
+
+        assert!(out.contains(&HostCommand::GossipAdmitted(false)), "{out:?}");
+        assert!(out.contains(&HostCommand::PeerKeyChanged(victim.sc_id.clone())),
+                "refused silently, which makes a legitimate reinstall look like a broken \
+                 network: {out:?}");
+        assert_eq!(s.contact_book.get(&victim.sc_id).unwrap().public, Some(victim.public),
+                   "the pinned key was replaced by the challenger");
+        assert!(s.peers.iter().all(|p| !p.online), "the impostor brought the contact online");
     }
 
     #[test]
