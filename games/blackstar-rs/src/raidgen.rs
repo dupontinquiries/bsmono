@@ -24,7 +24,7 @@
 //! you happened to open it — the same promise `loot::roll` makes.
 
 use crate::raid::{Raid, Run};
-use crate::raidcon::{arena, Arena, Boss, Mech, ARENAS, BOSSES};
+use crate::raidcon::{arena, Arena, Boss, Mech, ARENAS};
 use crate::sun::Orbit;
 use crate::survival::{Body, Bunker, Weather};
 
@@ -162,7 +162,7 @@ pub fn plan_for(boss: &'static Boss, phases: usize, seed: u64) -> RaidPlan {
 
 /// The whole roster for a seed.
 pub fn plan_all(seed: u64) -> Vec<RaidPlan> {
-    BOSSES.iter().map(|b| plan_for(b, 3, seed)).collect()
+    crate::raidcon::all_bosses().iter().map(|b| plan_for(b, 3, seed)).collect()
 }
 
 /// A tiny stable string hash so two bosses at the same seed do not share a
@@ -270,6 +270,7 @@ pub fn takeable(orbit: &Orbit, weather: Weather, sites: &[crate::foothold::Site]
 mod tests {
     use super::*;
     use crate::raid::Phase;
+    use crate::raidcon::BOSSES;
 
     #[test]
     fn nineteen_plans_of_three_phases() {

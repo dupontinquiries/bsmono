@@ -165,7 +165,7 @@ pub fn arena(id: &str) -> Option<&'static Arena> {
 /// from; `relic` is the codex entry a clear unlocks (original terse prose in
 /// the style of the C engine's lore.c); `shard` is what this machine was
 /// FOR — the memory-shard line that feeds the Seal's hidden campaign.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Boss {
     pub id: &'static str,
     pub name: &'static str,
@@ -361,7 +361,269 @@ pub const BOSSES: &[Boss] = &[
 ];
 
 pub fn boss(id: &str) -> Option<&'static Boss> {
-    BOSSES.iter().find(|b| b.id == id)
+    all_bosses().iter().find(|b| b.id == id)
+}
+
+/// Every boss the game will actually offer: the JSON file if one exists
+/// and parses, the compiled-in `BOSSES` otherwise. Loaded once and
+/// cached — raids don't need this re-read every frame, and `Box::leak`
+/// (below) only wants to run once per process, the same tradeoff
+/// `raidflow::RaidFlow::begin` already makes for a single raid's plan.
+pub fn all_bosses() -> &'static [Boss] {
+    static CACHE: std::sync::OnceLock<Vec<Boss>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| load_bosses_json(&bosses_json_path()).unwrap_or_else(|| BOSSES.to_vec()))
+}
+
+fn bosses_json_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/raids/bosses.json")
+}
+
+/// Read and parse `assets/raids/bosses.json` into real `Boss` entries.
+/// `None` on any failure — missing file, bad JSON, an unknown `mech`/
+/// `element` name, a missing field — so `all_bosses()` falls back to the
+/// known-good compiled set rather than shipping a partially-loaded
+/// roster. This is deliberately all-or-nothing: a raid roster half from
+/// one source and half from another is a harder bug to find than a
+/// clean fallback.
+fn load_bosses_json(path: &std::path::Path) -> Option<Vec<Boss>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let json = json::parse(&text)?;
+    let arr = json.as_arr()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let obj = entry.as_obj()?;
+        let get = |k: &str| obj.iter().find(|(key, _)| key == k).map(|(_, v)| v);
+        let id: &'static str = Box::leak(get("id")?.as_str()?.to_string().into_boxed_str());
+        let name: &'static str = Box::leak(get("name")?.as_str()?.to_string().into_boxed_str());
+        let title: &'static str = Box::leak(get("title")?.as_str()?.to_string().into_boxed_str());
+        let mech = parse_mech(get("mech")?.as_str()?)?;
+        let element = parse_element(get("element")?.as_str()?)?;
+        let arena: &'static str = Box::leak(get("arena")?.as_str()?.to_string().into_boxed_str());
+        let tier = get("tier")?.as_num()? as u8;
+        let premise: &'static str = Box::leak(get("premise")?.as_str()?.to_string().into_boxed_str());
+        let relic_vals = get("relic")?.as_arr()?;
+        let mut relic_owned: Vec<&'static str> = Vec::with_capacity(relic_vals.len());
+        for v in relic_vals {
+            relic_owned.push(Box::leak(v.as_str()?.to_string().into_boxed_str()));
+        }
+        let relic: &'static [&'static str] = Box::leak(relic_owned.into_boxed_slice());
+        let shard: &'static str = Box::leak(get("shard")?.as_str()?.to_string().into_boxed_str());
+        out.push(Boss { id, name, title, mech, element, arena, premise, tier, relic, shard });
+    }
+    if out.is_empty() {
+        return None; // an empty roster is a parse failure, not a valid raid set
+    }
+    Some(out)
+}
+
+fn parse_mech(s: &str) -> Option<Mech> {
+    match s {
+        "Purge" => Some(Mech::Purge),
+        "Ground" => Some(Mech::Ground),
+        "Air" => Some(Mech::Air),
+        "Sync" => Some(Mech::Sync),
+        _ => None,
+    }
+}
+
+fn parse_element(s: &str) -> Option<Element> {
+    match s {
+        "None" => Some(Element::None),
+        "Ice" => Some(Element::Ice),
+        "Fire" => Some(Element::Fire),
+        "Air" => Some(Element::Air),
+        "Electric" => Some(Element::Electric),
+        "Vine" => Some(Element::Vine),
+        "Rock" => Some(Element::Rock),
+        "Water" => Some(Element::Water),
+        _ => None,
+    }
+}
+
+/// A minimal JSON reader — no external crate, matching this codebase's
+/// existing hand-parse convention (`roster::load_tiers` etc.) rather
+/// than adding serde for one file. Handles exactly what a boss roster
+/// needs: objects, arrays, strings (with `\"`, `\\`, `\n` escapes),
+/// numbers, `true`/`false`/`null`. Not a general JSON parser — no
+/// unicode `\u` escapes, no exponent notation — deliberately, since
+/// pulling in more than the schema needs is how a "simple hand parse"
+/// grows into an unmaintained second JSON implementation.
+mod json {
+    #[derive(Debug)]
+    pub enum Value {
+        Null,
+        Bool(bool),
+        Num(f64),
+        Str(String),
+        Arr(Vec<Value>),
+        Obj(Vec<(String, Value)>),
+    }
+
+    impl Value {
+        pub fn as_str(&self) -> Option<&str> {
+            match self {
+                Value::Str(s) => Some(s),
+                _ => None,
+            }
+        }
+        pub fn as_num(&self) -> Option<f64> {
+            match self {
+                Value::Num(n) => Some(*n),
+                _ => None,
+            }
+        }
+        pub fn as_arr(&self) -> Option<&[Value]> {
+            match self {
+                Value::Arr(v) => Some(v),
+                _ => None,
+            }
+        }
+        pub fn as_obj(&self) -> Option<&[(String, Value)]> {
+            match self {
+                Value::Obj(v) => Some(v),
+                _ => None,
+            }
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Value> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0;
+        let v = parse_value(&chars, &mut i)?;
+        skip_ws(&chars, &mut i);
+        Some(v)
+    }
+
+    fn skip_ws(c: &[char], i: &mut usize) {
+        while *i < c.len() && c[*i].is_whitespace() {
+            *i += 1;
+        }
+    }
+
+    fn parse_value(c: &[char], i: &mut usize) -> Option<Value> {
+        skip_ws(c, i);
+        match c.get(*i)? {
+            '{' => parse_obj(c, i),
+            '[' => parse_arr(c, i),
+            '"' => parse_str(c, i).map(Value::Str),
+            't' => {
+                *i += 4;
+                Some(Value::Bool(true))
+            }
+            'f' => {
+                *i += 5;
+                Some(Value::Bool(false))
+            }
+            'n' => {
+                *i += 4;
+                Some(Value::Null)
+            }
+            _ => parse_num(c, i),
+        }
+    }
+
+    fn parse_obj(c: &[char], i: &mut usize) -> Option<Value> {
+        *i += 1; // '{'
+        let mut out = Vec::new();
+        skip_ws(c, i);
+        if c.get(*i) == Some(&'}') {
+            *i += 1;
+            return Some(Value::Obj(out));
+        }
+        loop {
+            skip_ws(c, i);
+            let key = parse_str(c, i)?;
+            skip_ws(c, i);
+            if c.get(*i) != Some(&':') {
+                return None;
+            }
+            *i += 1;
+            let val = parse_value(c, i)?;
+            out.push((key, val));
+            skip_ws(c, i);
+            match c.get(*i)? {
+                ',' => {
+                    *i += 1;
+                }
+                '}' => {
+                    *i += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        Some(Value::Obj(out))
+    }
+
+    fn parse_arr(c: &[char], i: &mut usize) -> Option<Value> {
+        *i += 1; // '['
+        let mut out = Vec::new();
+        skip_ws(c, i);
+        if c.get(*i) == Some(&']') {
+            *i += 1;
+            return Some(Value::Arr(out));
+        }
+        loop {
+            let val = parse_value(c, i)?;
+            out.push(val);
+            skip_ws(c, i);
+            match c.get(*i)? {
+                ',' => {
+                    *i += 1;
+                }
+                ']' => {
+                    *i += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        Some(Value::Arr(out))
+    }
+
+    fn parse_str(c: &[char], i: &mut usize) -> Option<String> {
+        if c.get(*i) != Some(&'"') {
+            return None;
+        }
+        *i += 1;
+        let mut s = String::new();
+        loop {
+            let ch = *c.get(*i)?;
+            *i += 1;
+            match ch {
+                '"' => break,
+                '\\' => {
+                    let esc = *c.get(*i)?;
+                    *i += 1;
+                    s.push(match esc {
+                        'n' => '\n',
+                        't' => '\t',
+                        '"' => '"',
+                        '\\' => '\\',
+                        '/' => '/',
+                        other => other, // not fully general on purpose; see module doc
+                    });
+                }
+                other => s.push(other),
+            }
+        }
+        Some(s)
+    }
+
+    fn parse_num(c: &[char], i: &mut usize) -> Option<Value> {
+        let start = *i;
+        if c.get(*i) == Some(&'-') {
+            *i += 1;
+        }
+        while c.get(*i).is_some_and(|ch| ch.is_ascii_digit() || *ch == '.') {
+            *i += 1;
+        }
+        if *i == start {
+            return None;
+        }
+        let s: String = c[start..*i].iter().collect();
+        s.parse::<f64>().ok().map(Value::Num)
+    }
 }
 
 // ---------------------------------------------------------------- seal ---
@@ -518,5 +780,73 @@ mod tests {
             assert!(now >= prev, "shard {s} put the forge back to sleep");
             prev = now;
         }
+    }
+
+    /// `assets/raids/bosses.json` is meant to be the game's real source
+    /// once it exists — this proves the file actually checked in matches
+    /// the compiled `BOSSES` byte for byte, field for field, not just in
+    /// count. A JSON file that "parses" but silently drops a relic line
+    /// or swaps two bosses' elements would pass a length check and fail
+    /// a player who reads the lore; this is the test that would catch it.
+    #[test]
+    fn the_bosses_json_file_matches_the_compiled_roster_exactly() {
+        let loaded = load_bosses_json(&bosses_json_path())
+            .expect("assets/raids/bosses.json should exist and parse — this is the file this test exists to check");
+        assert_eq!(loaded.len(), BOSSES.len(), "boss count mismatch between JSON and the compiled roster");
+        for want in BOSSES {
+            let got = loaded.iter().find(|b| b.id == want.id)
+                .unwrap_or_else(|| panic!("{} is in BOSSES but missing from bosses.json", want.id));
+            assert_eq!(got.name, want.name, "{}: name", want.id);
+            assert_eq!(got.title, want.title, "{}: title", want.id);
+            assert_eq!(got.mech, want.mech, "{}: mech", want.id);
+            assert_eq!(got.element, want.element, "{}: element", want.id);
+            assert_eq!(got.arena, want.arena, "{}: arena", want.id);
+            assert_eq!(got.tier, want.tier, "{}: tier", want.id);
+            assert_eq!(got.premise, want.premise, "{}: premise", want.id);
+            assert_eq!(got.shard, want.shard, "{}: shard", want.id);
+            assert_eq!(got.relic, want.relic, "{}: relic", want.id);
+        }
+    }
+
+    /// `all_bosses()` must never come back empty or half-loaded just
+    /// because a file went missing mid-session — the fallback exists
+    /// specifically so a bad or absent JSON file degrades to "exactly
+    /// what shipped before this feature existed", not to "no raids".
+    #[test]
+    fn a_missing_or_malformed_json_file_falls_back_to_the_compiled_roster() {
+        let missing = load_bosses_json(std::path::Path::new("/nonexistent/path/does/not/exist.json"));
+        assert!(missing.is_none(), "a missing file should fail to load, not silently produce an empty roster");
+
+        let dir = std::env::temp_dir().join(format!("raidcon_bad_json_test_{}", std::process::id()));
+        std::fs::write(&dir, "{ this is not valid json at all [[[").unwrap();
+        let bad = load_bosses_json(&dir);
+        let _ = std::fs::remove_file(&dir);
+        assert!(bad.is_none(), "malformed JSON should fail to load, not silently produce a partial roster");
+
+        // and the public accessor actually falls back rather than
+        // propagating the failure to callers who never asked to care
+        assert_eq!(all_bosses().len(), BOSSES.len());
+    }
+
+    /// The hand-rolled parser itself, isolated from any file on disk —
+    /// covers the shapes `bosses.json` actually uses: nested objects,
+    /// string arrays, escaped quotes inside a string, and a bare number.
+    #[test]
+    fn the_minimal_json_parser_handles_the_boss_schema() {
+        let text = r#"[
+            {"id": "test_boss", "name": "Test \"Quoted\" Boss", "title": "T",
+             "mech": "Sync", "element": "Fire", "arena": "unicron", "tier": 2,
+             "premise": "p", "relic": ["line one", "line two"], "shard": "s"}
+        ]"#;
+        let v = json::parse(text).expect("valid JSON should parse");
+        let arr = v.as_arr().expect("top level is an array");
+        assert_eq!(arr.len(), 1);
+        let obj = arr[0].as_obj().expect("entry is an object");
+        let get = |k: &str| obj.iter().find(|(key, _)| key == k).map(|(_, v)| v);
+        assert_eq!(get("name").unwrap().as_str().unwrap(), "Test \"Quoted\" Boss");
+        assert_eq!(get("tier").unwrap().as_num().unwrap(), 2.0);
+        let relic = get("relic").unwrap().as_arr().unwrap();
+        assert_eq!(relic.len(), 2);
+        assert_eq!(relic[0].as_str().unwrap(), "line one");
     }
 }
