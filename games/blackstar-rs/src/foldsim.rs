@@ -28,15 +28,76 @@ fn bots_dir() -> PathBuf {
 /// The fold strip for a chassis: f00, f01, ... in order. Walk poses
 /// (w*) are locomotion, not the fold, and are deliberately excluded.
 fn fold_poses(bot_dir: &Path) -> Vec<PathBuf> {
+    poses_with(bot_dir, 'f')
+}
+
+/// Pose directories with a given prefix, sorted — 'f' is the fold strip,
+/// 'w' the walk strip.
+fn poses_with(bot_dir: &Path, prefix: char) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(bot_dir) else { return Vec::new() };
     let mut names: Vec<String> = rd
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| n.starts_with('f'))
+        .filter(|n| n.starts_with(prefix))
         .collect();
     names.sort();
     names.into_iter().map(|n| bot_dir.join(n)).collect()
+}
+
+/// WALK STRIPS through the same alignment the runtime uses — with pose 0
+/// appended again, because the runtime closes the loop that way (a
+/// stride wraps). One verdict per chassis: how much of the union
+/// persists, how much fades, or why it refused. This is the headless
+/// stand-in for watching 46 bots walk on hardware this sandbox lacks.
+pub fn walkcheck() {
+    let Ok(rd) = std::fs::read_dir(bots_dir()) else { return };
+    let mut names: Vec<String> = rd
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    let (mut ok, mut refused, mut none) = (0usize, 0usize, 0usize);
+    for name in &names {
+        let dirs = poses_with(&bots_dir().join(name), 'w');
+        if dirs.len() < 2 {
+            none += 1;
+            continue;
+        }
+        let mut strip: Vec<Vec<model::RawPrim>> = Vec::new();
+        let mut bad = false;
+        for d in dirs.iter().chain(std::iter::once(&dirs[0])) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model::load_raw(d, 4.0))) {
+                Ok((raws, _)) => strip.push(raws),
+                Err(_) => {
+                    bad = true;
+                    break;
+                }
+            }
+        }
+        if bad {
+            refused += 1;
+            println!("   LOAD-PANIC  {name}");
+            continue;
+        }
+        match crate::align::unify(strip) {
+            Some(u) => {
+                ok += 1;
+                println!(
+                    "   ok  {name:44} {} union ({} extra)  {}",
+                    u.poses[0].len(),
+                    u.extras.len(),
+                    u.report.line()
+                );
+            }
+            None => {
+                refused += 1;
+                println!("   REFUSED     {name}  (flipbook stays)");
+            }
+        }
+    }
+    println!("---\n{ok} walk strips blend, {refused} refused, {none} without walks");
 }
 
 /// STRIP ALIGNMENT DIAGNOSTIC — why a fold does or does not blend.
@@ -589,6 +650,7 @@ pub fn run(argv: &[String]) {
             Some(bot) => align_probe(bot),
             None => align_probe_all(),
         },
+        Some("walkcheck") => walkcheck(),
         Some("union") => match argv.get(i + 2) {
             Some(bot) => union_table(bot),
             None => println!("usage: --fold union <bot>"),
