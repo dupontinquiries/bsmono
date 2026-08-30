@@ -245,15 +245,31 @@ number is not evidence either way. Compared directly instead, file by file:
 | Mastodon | **Not a port gap.** Doesn't exist in voiceterm-qt either — `C9_TODO.md` names Tokodon (a separate KDE app) as reading material for an idea never built on either side. Don't spend effort "porting" something with no source. |
 | Niftycharts | Qt has niftyplot-equivalent rendering wired to `nifty-core` (extended this session with the hardware-diagram parser, `fd59fd3c`). egui-frontend has no nifty view file at all, despite already depending on `nifty-core` elsewhere (voiceterm's own `link_graph.rs`). Closest thing to a pure "the pieces exist, nobody wired the last one" gap. |
 | Web browsing | `browser.rs` exists (362 lines) — real module, depth unchecked. |
-| Settings | **Nothing.** No settings module, no settings file, anywhere in egui-frontend. Qt's Settings popup is large (model setup, wake-word config, alignment recalibration, notification toggles, per-section state) and none of it has a home on the egui side. |
+| Settings | **WRONG AS WRITTEN — a settings screen exists and is wired.** `shell.rs::settings_panel` (a real panel: animation, palette, text size, surface opacity, gesture sensitivity/commit/flick, mic, offload host, speaker id), reached as `Surface::Settings` from `voiceterm_egui.rs:1463`, applied live via `App::apply_settings` and persisted through `load_prefs`/`save_prefs` onto `shared/settings-kit`'s kv schema. voiceterm-egui has depended on settings-kit the whole time. What IS missing is four of the five areas the Qt popup carries: model setup, wake-word config, alignment recalibration, and notification toggles — none of which appear in the panel. Also unexposed: `Prefs` fields the kit defines and no voiceterm screen offers — `touch.min_target`, `touch.scale`, `touch.button_scale`, `input.handedness`, `input.double_tilt`, `input.movement`, `a11y.voice`, `a11y.tts`, `a11y.voice_filter`, `display.white_point`, `display.color_filter`, `model.pool_dir`. Those sit at their defaults forever with no way for a user to reach them, and handedness plus touch sizing are precisely the MOBILE affordances (a left-handed PinePhone user, a bigger tap target) this fleet is meant to serve. |
 | Manpages | `manpage_view.rs` exists but documents its own real limitation in its header comment: it renders documents handed to it rather than owning the registry, because that logic lives inside `manpages.rs` (4,117 lines) tangled with Qt-only code, and splitting it needs a Qt-buildable host to verify against — which this sandbox has never had. An honest, named blocker, not neglect. |
 
-- **C12-9a** — IRC and Settings are the two genuine zero-to-something gaps.
-  Niftycharts is close behind (the hard part, `nifty-core`, already exists —
-  this is a wiring job, not a build-from-scratch). Recommended order:
-  Settings, then niftycharts, then IRC, then a real depth-check on
-  graph/mail/browser before touching them (their line counts say "real
-  module," not "feature-complete").
+- **C12-9a — the recommendation was built on the wrong row, and the order
+  changes.** This said "IRC and Settings are the two genuine zero-to-something
+  gaps" and put Settings first. Settings is not a zero-to-something gap: the
+  screen exists, is wired, persists, and applies live (see the corrected row
+  above). Only IRC is. Verified against code this session rather than against
+  the table, which is CLAUDE.md 5's exact failure — a session following this
+  entry would have built a settings screen next to an existing one.
+  Revised order, with what each actually needs:
+  1. **IRC** — still genuinely absent (zero irc-anything in egui-frontend), and
+     `shared/irc-kit` exists, so check it before writing a client.
+  2. **The unexposed `Prefs` fields** — the cheapest real win here. The kit
+     already defines, persists and round-trips handedness, touch sizing, a11y
+     and colour filters; only the PANEL is missing rows. That is UI work with
+     no model, no protocol and no new state, and it is what makes the mobile
+     affordances reachable.
+  3. **Niftycharts** — unchanged, still a wiring job over `nifty-core`.
+  4. **The four Qt settings areas** the panel lacks (model setup, wake-word,
+     alignment recalibration, notification toggles) — these are the real
+     Settings gap, and unlike (2) they need backing state that may not exist
+     on the egui side yet. Check before assuming it is only UI.
+  5. **Depth-check graph/mail/browser** before touching them — unchanged; their
+     line counts say "real module", not "feature-complete".
 
 ## 10. logscope gpu-gemm: an architecture the wgpu engine correctly refuses
 
