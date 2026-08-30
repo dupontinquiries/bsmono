@@ -59,7 +59,6 @@ pub use logscope_fan::bridge;
 pub mod voice_session;
 pub mod voice_intent;
 pub mod imprint;
-pub mod picking;
 pub mod physui;
 pub mod repetition; // pure repetition detection + graded recovery (decode + agent loops)
 #[allow(dead_code)] pub mod tripwire; // pure deterministic scanners over in-progress code → review-point signal

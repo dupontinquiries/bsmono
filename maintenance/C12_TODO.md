@@ -2347,7 +2347,33 @@ hand-check I gave the voiceterm five, and §33's did get one.
   duplicate. `workbench` (5 tests) claims to own "the non-chat tabs",
   which the `tabs/` modules already do.
 
-- **C12-40b — NOT started: decide replace-vs-wire per module.** These
+- **C12-40b — IN PROGRESS. Two decided, and they went opposite ways,
+  which is why each needed reading rather than a policy.**
+
+  `picking` — DELETED. `scenepick` does everything it did and more:
+  both expose `pick`, but scenepick also projects (`project_target`),
+  orders by depth, distinguishes a real hit from one that only landed in
+  the touch padding, and handles `min_touch_target` (18 references) —
+  which is the fat-finger case `picking::pick_slop` existed for. A
+  strictly-smaller second implementation of a job already done, and
+  wiring it would have put two hit-testers on one scene.
+
+  `tab_layout` — TO WIRE, not delete, and the reason is the opposite of
+  picking's. There is no used sibling: grepping `src/tabs/` for
+  `DeviceClass`, `responsive_nav` or `is_compact` returns NOTHING, so no
+  tab does adaptive layout by any route. Its own doc says the render
+  code "reads these flags instead of hard-coding a desktop layout" —
+  and every tab currently hard-codes a desktop layout. It is pure, has 4
+  tests, and exposes a small API (`master_detail`, `content_layout`).
+  The cost is per-tab and belongs with someone who can run the app on a
+  phone.
+
+  STILL TO DECIDE: `chat_layout` (tab_layout's stated sibling — likely
+  the same wire-up verdict), `workbench` (claims "the non-chat tabs",
+  which `tabs/` already owns, so possibly a picking-shaped duplicate),
+  and the remaining seven.
+
+- **C12-40c — the original entry, for the reasoning:** These
   split into two piles and the piles want opposite treatment. A module
   superseded by a working sibling should go; a module nothing else does
   should be wired. Guessing wrong in either direction is expensive —
