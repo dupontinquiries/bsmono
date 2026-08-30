@@ -195,6 +195,105 @@ fn main() {
         );
         return;
     }
+    if args.iter().any(|a| a == "--triangulate") {
+        // First whole-scene geometry attempt with the unblocked inputs:
+        // track (spatially reseeded, pyramid, blur-tolerant) → classify
+        // (HUD excluded) → observations for Static tracks → v8's actual
+        // TriangulatePass over the translation-only pose track built the
+        // way v8's encode chain builds it (cumulative negated phase-corr
+        // motion, identity rotation, focal ≈ frame dims).
+        use fao_codec::v8_reconstruction_codec::{
+            FeatureTrackPass, MotionConsensusPass, MotionClass, CameraPose, FeatureObservation,
+            TriangulatePass,
+        };
+        use fao_codec::geometry::Vec3;
+        use fao_codec::phase_correlation::PhaseCorrelationPass;
+        let (w, h) = (frames[0].w, frames[0].h);
+        let mut pass = FeatureTrackPass::default();
+        let consensus = MotionConsensusPass::default();
+        let pc = PhaseCorrelationPass::new(512.min(w.min(h)));
+        let mut prev: Option<&Vec<u8>> = None;
+        let mut poses: Vec<CameraPose> = Vec::new();
+        let mut cum = Vec3::zero();
+        let mut obs: std::collections::HashMap<u32, Vec<FeatureObservation>> =
+            std::collections::HashMap::new();
+        let mut classes: std::collections::HashMap<u32, MotionClass> = std::collections::HashMap::new();
+        for (i, f) in frames.iter().enumerate() {
+            if let Some(pv) = prev {
+                let cam = pc.estimate(&f.y, pv, w, h);
+                if cam.confidence > 0.15 {
+                    cum.x += -cam.dx;
+                    cum.y += -cam.dy;
+                }
+                let feats = pass.process(&f.y, Some(pv.as_slice()), w, h, i as u32);
+                consensus.classify(&mut pass.live_tracks, cam.dx, cam.dy, cam.confidence);
+                for t in &pass.live_tracks {
+                    classes.insert(t.feature_id, t.motion_class);
+                }
+                for sf in &feats {
+                    obs.entry(sf.feature_id).or_default().push(FeatureObservation {
+                        frame_idx: i as u32,
+                        screen_x: sf.screen_x,
+                        screen_y: sf.screen_y,
+                    });
+                }
+            } else {
+                let feats = pass.process(&f.y, None, w, h, i as u32);
+                for sf in &feats {
+                    obs.entry(sf.feature_id).or_default().push(FeatureObservation {
+                        frame_idx: 0,
+                        screen_x: sf.screen_x,
+                        screen_y: sf.screen_y,
+                    });
+                }
+            }
+            poses.push(CameraPose {
+                position: cum,
+                rotation: [1.0, 0.0, 0.0, 0.0],
+                focal: [w as f32, h as f32],
+                principal: [w as f32 / 2.0, h as f32 / 2.0],
+                distortion: 0.0,
+            });
+            prev = Some(&f.y);
+        }
+        // Static world tracks only, ≥4 observations.
+        let world: Vec<(u32, Vec<FeatureObservation>)> = obs
+            .into_iter()
+            .filter(|(id, v)| v.len() >= 4 && matches!(classes.get(id), Some(MotionClass::Static)))
+            .collect();
+        let cam_span = {
+            let (mut minx, mut maxx, mut miny, mut maxy) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+            for p in &poses {
+                minx = minx.min(p.position.x);
+                maxx = maxx.max(p.position.x);
+                miny = miny.min(p.position.y);
+                maxy = maxy.max(p.position.y);
+            }
+            ((maxx - minx).powi(2) + (maxy - miny).powi(2)).sqrt()
+        };
+        println!("candidates: {} static world tracks (>=4 obs) | camera span {:.1}px", world.len(), cam_span);
+        let tri = TriangulatePass::default();
+        let pts = tri.triangulate_all(&world, &poses);
+        if pts.is_empty() {
+            println!("triangulated: 0");
+            return;
+        }
+        let mut depths: Vec<f32> = pts.iter().map(|p| p.world_pos.z).collect();
+        depths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mean_rep: f32 = pts.iter().map(|p| p.reprojection_error).sum::<f32>() / pts.len() as f32;
+        let mean_base: f32 = pts.iter().map(|p| p.baseline).sum::<f32>() / pts.len() as f32;
+        println!(
+            "triangulated: {} of {} | depth z p10 {:.0} median {:.0} p90 {:.0} | mean reproj {:.2}px | mean baseline {:.1}px",
+            pts.len(),
+            world.len(),
+            depths[depths.len() / 10],
+            depths[depths.len() / 2],
+            depths[depths.len() * 9 / 10],
+            mean_rep,
+            mean_base
+        );
+        return;
+    }
     if args.iter().any(|a| a == "--track") {
         // Whole-scene readiness probe: run the real FeatureTrackPass over
         // the GOP and report the statistics pose estimation lives on —

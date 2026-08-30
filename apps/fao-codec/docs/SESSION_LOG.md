@@ -2760,3 +2760,36 @@ scene motion, whose exclusion from pose is safe (zero parallax
 information) and arguably beneficial. UiOverlay is already
 hard-excluded from v8's pose/densify paths, so the world pool feeding
 pose is now HUD-free on broadcast content.
+
+### First end-to-end geometry (same session)
+
+plate_lab --triangulate runs the entire chain exactly as v8's encode
+path composes it: FeatureTrackPass (spatial reseed, pyramid,
+blur-tolerant gate) → MotionConsensusPass (HUD screen-lock axis live)
+→ Static-track observations → v8's translation-only pose convention
+(cumulative negated phase-corr motion, identity rotation, focal ≈
+frame dims) → TriangulatePass.
+
+Results (48-frame GOPs):
+  shotA  93/247 tracks triangulated | z 784..2638 | reproj 1.13px | baseline 34.5px
+  shotB  96/302                     | z 929..2075 | reproj 1.94px | baseline 26.8px
+  smiteB 61/168                     | z 901..3775 | reproj 1.67px | baseline 22.6px
+
+All depths positive and content-plausible; handheld film reprojects at
+~1.1px through a TRANSLATION-ONLY pose model. shotB triangulates off
+its own gate weave (the same sub-pixel drift the SR plate feeds on).
+This is the first time the full chain has produced clean sparse
+geometry on any of these content classes.
+
+TriangulatePass gained a cheirality check: the midpoint solution must
+sit at positive depth along BOTH observing rays. Before it, the
+game-broadcast GOP reported p10 depth −3301 — rays from a ROTATING
+camera forced through the translation-only model intersect behind the
+cameras, and reprojection error cannot catch that (projection is
+symmetric through the pinhole). After: all outputs front-of-camera.
+
+The indicted next bottleneck, by these numbers: rotation in the pose
+model. smiteB's 107 rejected candidates are dominated by
+rotation-as-translation inconsistency; the reserved CameraMotion.zoom
+field and log-polar phase correlation are the planned path, or 2-view
+rotation from the now-clean static track pairs.

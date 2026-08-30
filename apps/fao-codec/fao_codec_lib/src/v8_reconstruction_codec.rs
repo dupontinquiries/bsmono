@@ -5404,6 +5404,24 @@ impl TriangulatePass {
                 None => continue,
             };
             
+            // Cheirality: the point must lie at POSITIVE depth along both
+            // observing rays. Rays from inconsistent observations (a
+            // rotating camera forced through this translation-only pose
+            // model, mismatched tracks) can intersect BEHIND the cameras
+            // — measured on a game-broadcast GOP as a p10 depth of −3301
+            // before this check. A behind-camera point is wrong under any
+            // model; reprojection error alone does not catch it because
+            // projection is symmetric through the pinhole.
+            let da = (world_pos.x - pose_a.position.x) * ray_a.x
+                + (world_pos.y - pose_a.position.y) * ray_a.y
+                + (world_pos.z - pose_a.position.z) * ray_a.z;
+            let db = (world_pos.x - pose_b.position.x) * ray_b.x
+                + (world_pos.y - pose_b.position.y) * ray_b.y
+                + (world_pos.z - pose_b.position.z) * ray_b.z;
+            if da <= 0.0 || db <= 0.0 {
+                continue;
+            }
+            
             // Compute reprojection error: project world_pos through both poses,
             // compare to actual observations.
             let (rx_a, ry_a) = self.project(&pose_a, world_pos);
