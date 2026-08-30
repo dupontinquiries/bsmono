@@ -497,6 +497,32 @@ uint determine_biome(float temperature, float humidity, float erosion) {
 // RC39: biome at world (x, z). Samples climate at the surface band
 // (sea_level + 10) so biome boundaries respect actual surface position.
 // Matches `world_model::biome_at_2d`.
+// r607 THE DIFFERENT-WORLD FIX: the CPU computes surface_target with the
+// CLIMATE-ONLY classifier (world_model::biome_at_2d has NO topographic
+// veto — the veto lives in cpu_generator::biome_at_3d, a different
+// function used for trees/surface blocks). This shader had folded the
+// veto into its one biome_at_2d and fed THAT into surface_target, so an
+// origin the CPU scores as forest (+5) got vetoed to Ocean (-30) here — a
+// ~35-block surface swing that made the GPU generate a DIFFERENT WORLD
+// (pinned by the r606 altimetry: cpu 54 vs gpu 15). Split: this
+// climate-only variant feeds surface_target/density; the veto'd
+// `biome_at_2d` below stays for trees + surface blocks, matching the
+// CPU's own split.
+uint biome_at_2d_climate(float x, float z, uint world_seed) {
+    float sl = model_sea_level(x, z, world_seed);
+    float surface_y = sl + 10.0;
+    float temp = model_temperature(x, surface_y, z, world_seed);
+    float humid = model_humidity(x, surface_y, z, world_seed);
+    float jx = (noise_2d(x * 0.18, z * 0.18, world_seed + SEED_BIOME_JITTER) - 0.5) * 0.06;
+    float jy = (noise_2d(x * 0.18 + 137.7, z * 0.18 + 91.3, world_seed + SEED_BIOME_JITTER) - 0.5) * 0.06;
+    temp  = clamp(temp + jx, 0.0, 1.0);
+    humid = clamp(humid + jy, 0.0, 1.0);
+    float erosion_raw = (fbm_2d(x * 0.0008, z * 0.0008,
+                                 world_seed + SEED_EROSION, 2, 1.0, 1.0) - 0.5) * 2.0;
+    float erosion_unit = (erosion_raw + 1.0) * 0.5;
+    return determine_biome(temp, humid, erosion_unit);
+}
+
 uint biome_at_2d(float x, float z, uint world_seed) {
     float sl = model_sea_level(x, z, world_seed);
     float surface_y = sl + 10.0;
@@ -1032,7 +1058,7 @@ shared int  tree_surface_y_cache[NEIGHBORHOOD_COLS];
 float model_density(float x, float y, float z, uint world_seed) {
     float sea = model_sea_level(x, z, world_seed);
     float cont_height = model_continental(x, z, world_seed) * 30.0;
-    uint biome = biome_at_2d(x, z, world_seed);
+    uint biome = biome_at_2d_climate(x, z, world_seed); // r607: CPU parity
     float biome_height = biome_height_modifier(biome);
     float hills_height = model_hills(x, z, world_seed) * 15.0;
     float surface_target = sea + cont_height + biome_height + hills_height;
@@ -1529,7 +1555,7 @@ void main() {
         float wz = float(chunk_origin.z + lz_nb);
         float sea = model_sea_level(wx, wz, world_seed);
         float cont_height = model_continental(wx, wz, world_seed) * 30.0;
-        uint  biome = biome_at_2d(wx, wz, world_seed);
+        uint  biome = biome_at_2d_climate(wx, wz, world_seed); // r607: CPU parity
         float biome_height = biome_height_modifier(biome);
         float hills_height = model_hills(wx, wz, world_seed) * 15.0;
         cached_surface_target[col] = sea + cont_height + biome_height + hills_height;

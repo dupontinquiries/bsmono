@@ -12086,3 +12086,22 @@ TerrainGenerator — queued). LIVE IMPACT, honestly bounded: the operator's devi
 required feature, per chunk_loader's own comment), and any successful-GPU player would get an internally-consistent
 (just different) world — but a mid-session GPU→CPU fallback, or a CPU joiner on a GPU host, would CROSS worlds. Until
 the fork is fixed, GPU worldgen should be considered NOT world-compatible with CPU worldgen.
+
+## r607 — THE DIFFERENT-WORLD ROOT CAUSE AND FIX: biome-classifier veto asymmetry
+The r606 fork is root-caused and fixed. After the exhaustive static diff came up empty (seeds table, region sizes,
+baselines, hash/noise/fbm 2D+3D, quintic fade, normalization, corner math, spv load path, push-constant seed delivery
+— ALL equal, seed-sensitivity verified), the asymmetry was in WHICH classifier feeds surface_target: the CPU uses the
+CLIMATE-ONLY world_model::biome_at_2d (no topographic veto — the r192 Ocean/Beach veto lives in
+cpu_generator::biome_at_3d, used for trees/surface blocks), while the SHADER had folded the veto into its single
+biome_at_2d and fed THAT into surface_target. An origin the CPU scores as forest (+5 height modifier) got vetoed to
+Ocean (-30) on GPU — a ~35-block surface swing = the different world. FIX (direction: align GPU toward CPU, since CPU
+worlds are what players have): new GLSL biome_at_2d_climate (stops at determine_biome) feeds the two surface-target
+sites (model_density + the Phase A1 cache); the veto'd biome_at_2d remains for tree/surface-block sites, matching the
+CPU's own split. VERIFIED: pristine altimetry now cpu 54 / gpu 54 EXACT; y-chunk-1 GPU is real terrain with Water 8364
+and Air 4913 counts EXACTLY matching CPU. ALSO: TerrainGenerator gains gpu_batches_ok/failed counters +
+gpu_batch_stats(); the parity probe prints them and exits VOID if any batch silently fell back — the instrument flaw
+that fooled every pre-r607 parity result is closed. FIRST HONEST PARITY RUN (near set, 64 chunks, ok=4 fell_back=0):
+terrain diffs 11,242 (~0.5%, all material-class: cpu=Stone gpu=Dirt/Gravel/Sand — the subsurface STRATA pass differs;
+named follow-up), tree cells 52 with 100% diff (GPU perforation/branches by design + possible spawn drift;
+too few cells to separate — widen the tree sample in the follow-up). All prior parity numbers remain void per r606.
+Gates: lib subset 9/0, fullgame clean, spv rebuilt (assets path = the ONLY spv, load order verified in r607 hunt).

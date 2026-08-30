@@ -55,6 +55,25 @@ fn main() {
                 }
             }
             println!("PRISTINE gpu top-solid in column (0,_,0) = {top_solid:?}");
+            // CPU-side term breakdown at the origin column: which term
+            // could move a surface by ~39 blocks? (Ocean's biome height
+            // modifier alone is -30 — a biome-classification flip between
+            // backends would explain a discrete jump, not a drift.)
+            let bs = cg.biome_at_3d(0, 54, 0);
+            println!(
+                "PRISTINE cpu terms at (0,0): biome={:?} temp={:.3} humid={:.3}",
+                bs.biome, bs.temperature, bs.humidity
+            );
+        }
+        // Seed sensitivity: if the GPU output is IDENTICAL across seeds,
+        // the shader isn't receiving the seed (push-constant layout skew)
+        // — which would explain a fixed "different world" regardless of
+        // what the CPU generates.
+        {
+            let a = g.generate_batch(&[ChunkCoord::new(0, 0, 0)], 0x1111_1111).expect("a");
+            let b = g.generate_batch(&[ChunkCoord::new(0, 0, 0)], 0x2222_2222).expect("b");
+            let same = a[0].blocks == b[0].blocks;
+            println!("PRISTINE seed-sensitivity at (0,0,0): identical-across-seeds = {same}");
         }
         for y in [1i32, 2, 0, 3] {
             let raw = g
@@ -261,6 +280,14 @@ fn main() {
         }
         let cpu_chunks = cpu.generate(&coords);
         let gpu_chunks = gpu.generate(&coords);
+        // r607: refuse to report parity numbers if the "gpu" side silently
+        // fell back to CPU for any batch — that fooled every pre-r607 run.
+        let (ok, failed) = gpu.gpu_batch_stats();
+        println!("worldgen-parity gpu batches: ok={ok} fell_back={failed}");
+        if failed > 0 || ok == 0 {
+            eprintln!("worldgen-parity VOID: gpu side mixed/absent (ok={ok} failed={failed})");
+            std::process::exit(5);
+        }
         let is_tree = |b: BlockId| {
             matches!(
                 b,

@@ -52,6 +52,10 @@ pub struct TerrainGenerator {
     #[cfg(feature = "gpu")]
     gpu: Option<Arc<VulkanChunkGenerator>>,
     seed: u32,
+    // r607: parity instruments were fooled by the silent per-batch CPU
+    // fallback below — these counters make the actual backend visible.
+    gpu_batches_ok: std::sync::atomic::AtomicU64,
+    gpu_batches_failed: std::sync::atomic::AtomicU64,
 }
 
 impl TerrainGenerator {
@@ -103,10 +107,20 @@ impl TerrainGenerator {
             #[cfg(feature = "gpu")]
             gpu,
             seed: seed32,
+            gpu_batches_ok: std::sync::atomic::AtomicU64::new(0),
+            gpu_batches_failed: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
     pub fn seed(&self) -> u32 { self.seed }
+
+    /// r607: (gpu batches succeeded, gpu batches that fell back to CPU).
+    /// Any nonzero second element means output mixed backends — parity
+    /// comparisons and world-compatibility claims are void for this run.
+    pub fn gpu_batch_stats(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.gpu_batches_ok.load(Relaxed), self.gpu_batches_failed.load(Relaxed))
+    }
 
     pub fn has_gpu(&self) -> bool {
         #[cfg(feature = "gpu")] { self.gpu.is_some() }
@@ -155,12 +169,15 @@ impl TerrainGenerator {
                     // Chunk, so plant/wood indices and biome-flavored ruins are correct.
                     match gpu.generate_batch(batch, self.seed) {
                         Ok(raw) => {
+                            self.gpu_batches_ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             for mut g in raw {
                                 self.cpu.stamp_ruins(&mut g.blocks, g.coord);
                                 all.push(crate::world::chunk::Chunk::from_blocks(g.coord, g.blocks));
                             }
                         }
                         Err(e) => {
+                            self.gpu_batches_failed
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             log::warn!("GPU batch failed ({}). Falling back to CPU.", e);
                             for &c in batch { all.push(self.cpu.generate_chunk(c)); }
                         }
