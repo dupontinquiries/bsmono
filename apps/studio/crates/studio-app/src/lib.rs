@@ -151,6 +151,19 @@ pub struct Studio {
     pub trim_side: studio_egui::TrimSide,
     /// Set by the panel's bounce button; the shell performs it.
     pub pending_bounce: bool,
+    /// What this device's person is called in presence packets — per device
+    /// (it rides the workspace sidecar), because the same account on a phone
+    /// and a desktop may legitimately want "kes (phone)" vs "kes". Empty
+    /// means "site N", never an error.
+    pub display_name: String,
+    /// Monotonic stamp for outgoing presence, so a reordered packet cannot
+    /// resurrect a stale playhead on a peer — the receiving side's `seq`
+    /// check is only as good as the sender's discipline here.
+    presence_seq: u64,
+    /// What we last shipped, compared by content to decide whether anything
+    /// worth announcing changed.
+    last_presence: Option<studio_collab::Presence>,
+    last_presence_ms: i64,
 }
 
 impl Studio {
@@ -197,6 +210,10 @@ impl Studio {
             octave: 0,
             trim_side: studio_egui::TrimSide::default(),
             pending_bounce: false,
+            display_name: String::new(),
+            presence_seq: 0,
+            last_presence: None,
+            last_presence_ms: i64::MIN / 2,
         }
     }
 
@@ -510,6 +527,54 @@ impl Studio {
         Ok(s)
     }
 
+    /// The outgoing half of presence. [`Studio::integrate_packet`] has merged
+    /// peers' whereabouts since the wire existed, but nothing ever SENT ours —
+    /// two connected shells each drew an empty room, and the timeline's
+    /// peer-playhead rendering was dead code between real instances. The shell
+    /// calls this once per frame with the wall clock; it returns a packet when
+    /// where-we-are changed (rate-limited so a scrub is ~10 packets a second,
+    /// not sixty) or when the heartbeat is due, and `None` the rest of the
+    /// time. The heartbeat matters independently of change: presence is the
+    /// only sign of life the wire carries (there is no join packet), so a
+    /// reader parked on one frame must still beat inside the sweep's
+    /// `LIVENESS_MS` window or be swept as a ghost by every peer.
+    pub fn presence_beat(&mut self, now_ms: i64) -> Option<studio_collab::wire::Packet> {
+        const MIN_GAP_MS: i64 = 100;
+        // Three beats per liveness window — one lost packet must not read
+        // as a departure.
+        const HEARTBEAT_MS: i64 = studio_collab::session::LIVENESS_MS / 3;
+        let name = if self.display_name.is_empty() {
+            format!("site {}", self.session.doc.site.0)
+        } else { self.display_name.clone() };
+        let cur = studio_collab::Presence {
+            site: self.session.doc.site,
+            name,
+            playhead: self.playhead(),
+            selection: self.selection.clone(),
+            // The track being worked in, derived from the selection rather
+            // than tracked separately: the first selected clip's home is
+            // where a collision would happen.
+            active_track: self.selection.first().and_then(|id|
+                self.session.doc.project.clips.get(id).map(|c| c.track)),
+            seq: self.presence_seq + 1,
+        };
+        let changed = match &self.last_presence {
+            None => true,
+            Some(last) => last.playhead != cur.playhead
+                || last.selection != cur.selection
+                || last.active_track != cur.active_track
+                || last.name != cur.name,
+        };
+        let due = now_ms - self.last_presence_ms >= HEARTBEAT_MS;
+        if !(due || (changed && now_ms - self.last_presence_ms >= MIN_GAP_MS)) {
+            return None;
+        }
+        self.presence_seq += 1;
+        self.last_presence = Some(cur.clone());
+        self.last_presence_ms = now_ms;
+        Some(studio_collab::wire::Packet::Presence(cur))
+    }
+
     /// Everything local since the last drain, for any carrier to ship.
     pub fn drain_outbox(&mut self) -> Vec<studio_collab::wire::Packet> {
         std::mem::take(&mut self.outbox)
@@ -641,7 +706,7 @@ impl Studio {
 
     /// Feed one packet from a peer. Returns any reply packets (a `Hello`
     /// earns a catch-up; assets earn their fetch steps; the rest is silent).
-    pub fn integrate_packet(&mut self, p: studio_collab::wire::Packet)
+    pub fn integrate_packet(&mut self, p: studio_collab::wire::Packet, now_ms: i64)
         -> Vec<studio_collab::wire::Packet>
     {
         use studio_collab::wire::Packet;
@@ -739,7 +804,12 @@ impl Studio {
                 Vec::new()
             }
             Packet::Presence(pr) => {
-                self.session.doc.presence(pr);
+                // Through the SESSION, not the doc: `Session::presence` is
+                // the doc merge PLUS the sign-of-life accounting the sweep
+                // reads. Routing around it (as this arm originally did) is
+                // exactly how "a peer who is actively scrubbing gets swept
+                // for silence" — its own doc-comment's warning.
+                self.session.presence(pr, now_ms);
                 Vec::new()
             }
             Packet::Hello { since, .. } => {
@@ -1275,6 +1345,75 @@ impl Studio {
 mod tests {
     use super::*;
     use studio_egui::keys::Key;
+
+
+    /// The presence beat: the SENDING half. The receive path (integrate ->
+    /// session -> doc -> timeline ghost playheads) existed for a long time
+    /// with nothing on the other end — this pins down the contract that
+    /// makes it live: first call sends, silence is cheap, change is fast
+    /// (but rate-limited), and the heartbeat always lands inside the sweep
+    /// window even when nothing moves.
+    #[test]
+    fn presence_beat_sends_changes_and_heartbeats_but_not_every_frame() {
+        let mut s = Studio::demo();
+        // First call: always sends — peers know we exist.
+        let first = s.presence_beat(10_000).expect("first beat sends");
+        let pr = match first {
+            studio_collab::wire::Packet::Presence(pr) => pr,
+            other => panic!("expected Presence, got {other:?}"),
+        };
+        assert_eq!(pr.site, s.session.doc.site);
+        assert_eq!(pr.name, format!("site {}", s.session.doc.site.0),
+                   "empty display_name falls back, never sends an empty string");
+        assert_eq!(pr.seq, 1);
+
+        // Nothing changed, heartbeat not due: an idle shell is near-silent.
+        assert!(s.presence_beat(10_016).is_none(), "16ms later, idle: no packet");
+
+        // The playhead moved right after a send: news, but rate-limited —
+        // the gap counts from the LAST SEND, so a scrub is ~10 pkt/s, not 60.
+        s.transport.set_position(studio_core::Ticks::from_seconds(3.0));
+        assert!(s.presence_beat(10_050).is_none(),
+                "changed but only 50ms since the last send: held");
+        let moved = s.presence_beat(10_120).expect("past the gap: the move ships");
+        match moved {
+            studio_collab::wire::Packet::Presence(pr) => {
+                assert_eq!(pr.playhead, studio_core::Ticks::from_seconds(3.0));
+                assert_eq!(pr.seq, 2, "seq is monotonic");
+            }
+            other => panic!("expected Presence, got {other:?}"),
+        }
+
+        // Idle again — but the heartbeat must still beat inside LIVENESS_MS,
+        // or every peer sweeps us as a ghost while we sit and listen.
+        let hb = studio_collab::session::LIVENESS_MS / 3;
+        assert!(s.presence_beat(10_120 + hb - 1).is_none());
+        assert!(s.presence_beat(10_120 + hb).is_some(), "heartbeat due: sends unchanged state");
+        assert!(hb * 2 < studio_collab::session::LIVENESS_MS,
+                "two consecutive lost heartbeats still leave a beat inside the window");
+    }
+
+    /// Selection changes are presence too — the warning edge peers draw
+    /// around a clip someone else is inside is only as fresh as this.
+    #[test]
+    fn presence_beat_announces_selection_and_derived_track() {
+        let mut s = Studio::demo();
+        s.presence_beat(0);
+        let (clip, track) = {
+            let (id, c) = s.session.doc.project.clips.iter().next()
+                .expect("demo project has clips");
+            (*id, c.track)
+        };
+        s.selection = vec![clip];
+        match s.presence_beat(1_000) {
+            Some(studio_collab::wire::Packet::Presence(pr)) => {
+                assert_eq!(pr.selection, vec![clip]);
+                assert_eq!(pr.active_track, Some(track),
+                           "active track derives from the first selected clip");
+            }
+            other => panic!("selection change must ship: {other:?}"),
+        }
+    }
 
     #[test]
     fn each_song_remembers_its_own_camera() {
@@ -2046,13 +2185,29 @@ impl eframe::App for App {
                     }
                 }
             }
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64).unwrap_or(0);
             for p in carrier.poll() {
-                for reply in self.studio.integrate_packet(p) {
+                for reply in self.studio.integrate_packet(p, now_ms) {
                     carrier.send(reply);
                 }
             }
             for p in self.studio.drain_outbox() {
                 carrier.send(p);
+            }
+            // Our own presence: the sending half of what integrate_packet
+            // merges. Rate-limited and heartbeat'd inside; called every
+            // frame, sends when it should.
+            if let Some(p) = self.studio.presence_beat(now_ms) {
+                carrier.send(p);
+            }
+            // And the silence sweep — members time out with an announcement,
+            // presence-only ghosts are pruned quietly.
+            for ev in self.studio.session.sweep(now_ms) {
+                if let studio_collab::session::Event::TimedOut(site) = ev {
+                    self.studio.status = format!("site {} timed out", site.0);
+                }
             }
             // Packets arrive between frames; a connected shell keeps frames
             // coming so a peer's edit shows without waiting for a local one.
@@ -3994,7 +4149,7 @@ mod collab_tests {
 
     fn pipe(from: &mut Studio, to: &mut Studio) {
         for p in from.drain_outbox() {
-            to.integrate_packet(p);
+            to.integrate_packet(p, 0);
         }
     }
 
@@ -4065,10 +4220,10 @@ mod collab_tests {
         a.drain_outbox(); // lost in transit — B heard none of it
 
         let replies = a.integrate_packet(
-            studio_collab::wire::Packet::Hello { site: SiteId(2), since: 0 });
+            studio_collab::wire::Packet::Hello { site: SiteId(2), since: 0 }, 0);
         assert!(!replies.is_empty(), "a Hello is answered");
         for p in replies {
-            b.integrate_packet(p);
+            b.integrate_packet(p, 0);
         }
         assert_eq!(b.session.doc.project, a.session.doc.project, "B caught up on the project");
         assert_eq!(b.rack, a.rack, "and on the rack");
@@ -4088,9 +4243,9 @@ mod collab_tests {
         let mut c = Studio::new(
             Project { name: a.session.doc.project.name.clone(), ..Default::default() },
             SiteId(3), Team::from_contacts("trio", &["sc-c".into()]));
-        c.integrate_packet(a.session.broadcast());
+        c.integrate_packet(a.session.broadcast(), 0);
         if let Some(rack) = a.session.rack_broadcast() {
-            c.integrate_packet(rack);
+            c.integrate_packet(rack, 0);
         }
         assert_eq!(c.session.doc.project, a.session.doc.project, "C holds the project");
         assert_eq!(c.rack, a.rack, "and the rack");
@@ -4107,8 +4262,8 @@ mod collab_tests {
         b.sync_rack_if_changed();
         let from_a = a.drain_outbox();
         let from_b = b.drain_outbox();
-        for p in from_a { b.integrate_packet(p); }
-        for p in from_b { a.integrate_packet(p); }
+        for p in from_a { b.integrate_packet(p, 0); }
+        for p in from_b { a.integrate_packet(p, 0); }
         assert_eq!(a.rack, b.rack, "one rack, agreed without a referee");
         assert!(a.rack.swing == 0.10 || a.rack.swing == 0.40);
     }
@@ -4128,17 +4283,17 @@ mod asset_transfer_tests {
             let mut to_a: Vec<_> = b.drain_outbox();
             while let Some(p) = to_b.pop() {
                 quiet = false;
-                to_a.extend(b.integrate_packet(p));
+                to_a.extend(b.integrate_packet(p, 0));
             }
             while let Some(p) = to_a.pop() {
                 quiet = false;
-                to_b.extend(a.integrate_packet(p));
+                to_b.extend(a.integrate_packet(p, 0));
             }
             while let Some(p) = to_b.pop() {
-                to_a.extend(b.integrate_packet(p));
+                to_a.extend(b.integrate_packet(p, 0));
             }
             for p in to_a {
-                a.integrate_packet(p);
+                a.integrate_packet(p, 0);
             }
             if quiet && a.outbox.is_empty() && b.outbox.is_empty() {
                 break;
@@ -4192,12 +4347,12 @@ mod asset_transfer_tests {
         // A's chunk replies to B IN REVERSE ORDER.
         let mut to_b = a.drain_outbox();
         let mut req = Vec::new();
-        for p in to_b.drain(..) { req.extend(b.integrate_packet(p)); }
+        for p in to_b.drain(..) { req.extend(b.integrate_packet(p, 0)); }
         let mut chunks = Vec::new();
-        for p in req { chunks.extend(a.integrate_packet(p)); }
+        for p in req { chunks.extend(a.integrate_packet(p, 0)); }
         assert!(chunks.len() >= 2, "big enough to have several chunks: {}", chunks.len());
         chunks.reverse();
-        for p in chunks { b.integrate_packet(p); }
+        for p in chunks { b.integrate_packet(p, 0); }
         assert!(b.pending_assets.is_empty(), "assembled despite the order");
         assert!(b.manifests.contains_key(&src), "and B can now serve it onward");
         assert!(b.status.contains("undecodable"), "the media failure was said: {:?}", b.status);
@@ -4210,9 +4365,9 @@ mod asset_transfer_tests {
         let id = studio_collab::assets::hash(&real);
         b.integrate_packet(studio_collab::wire::Packet::Chunk {
             id, bytes: vec![8u8; 20_000], // wrong content for that id
-        });
+        }, 0);
         assert!(!b.chunk_store.contains_key(&id), "a lying chunk never enters the store");
-        b.integrate_packet(studio_collab::wire::Packet::Chunk { id, bytes: real });
+        b.integrate_packet(studio_collab::wire::Packet::Chunk { id, bytes: real }, 0);
         assert!(b.chunk_store.contains_key(&id), "the honest one does");
     }
 
@@ -4232,7 +4387,7 @@ mod asset_transfer_tests {
             sample_rate: 48_000, channels: 1, has_video: false } }, "seeded");
         a.register_asset(src_a, &sample);
         let mut replies = Vec::new();
-        for p in a.drain_outbox() { replies.extend(b.integrate_packet(p)); }
+        for p in a.drain_outbox() { replies.extend(b.integrate_packet(p, 0)); }
         assert!(replies.iter().all(|p| !matches!(p,
             studio_collab::wire::Packet::ChunkRequest { .. })),
             "no chunks were requested for bytes already held");
@@ -4259,7 +4414,7 @@ mod tcp_carrier_tests {
             }
         }
         for p in c.poll() {
-            for r in s.integrate_packet(p) {
+            for r in s.integrate_packet(p, 0) {
                 c.send(r);
             }
         }
