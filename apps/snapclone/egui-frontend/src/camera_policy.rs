@@ -221,10 +221,24 @@ impl CameraHealth {
     /// Is a result old enough to reprobe?
     ///
     /// An absent result is stale by definition: never looked is not fresh.
+    ///
+    /// A result timestamped in the FUTURE is also stale. `now_ms - at_ms`
+    /// goes negative when the clock steps back — an NTP correction, a
+    /// timezone-less device syncing after boot, a phone that guessed at
+    /// the time before it had a network — and a negative age is never
+    /// greater than the window, so the probe would read as fresh forever
+    /// and that camera would never be reprobed again.
+    ///
+    /// It cannot panic (these are i64, not u64), which is why it would
+    /// have gone unnoticed: the symptom is one camera silently missing
+    /// from `stale_ids` until the app restarts.
     pub fn is_stale(&self, id: &str, now_ms: i64) -> bool {
         match self.get(id) {
             None => true,
-            Some(p) => now_ms - p.at_ms > STALE_AFTER_MS,
+            Some(p) => {
+                let age = now_ms - p.at_ms;
+                age < 0 || age > STALE_AFTER_MS
+            }
         }
     }
 
@@ -397,6 +411,12 @@ mod tests {
         let mut h = CameraHealth::default();
         h.record("cam0", probe(Health::Broken, 0, Facing::Rear, 0));
         assert!(!h.is_stale("cam0", STALE_AFTER_MS));
+        // A result from the FUTURE is stale, not eternally fresh. The
+        // clock stepping back — an NTP correction, a phone syncing after
+        // boot — used to make `now - at` negative, which is never greater
+        // than the window, so the camera dropped out of `stale_ids` for
+        // the life of the process.
+        assert!(h.is_stale("cam0", -1), "a future timestamp read as fresh");
         assert!(h.is_stale("cam0", STALE_AFTER_MS + 1));
     }
 

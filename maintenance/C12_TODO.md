@@ -3112,3 +3112,33 @@ Two things deliberately left discarding errors, and documented as such:
 
 That asymmetry is the useful part: the same `let _ =` is right on the
 read and wrong on the write, and only the consequence distinguishes them.
+
+## 57. Bughunt: a camera that stops being reprobed when the clock steps back
+
+Swept timestamp arithmetic across the frontends. Most is guarded and
+several sites say why — `relative_time` returns "just now" for a
+negative delta with the comment "a clock skew must not read 'in -3s'",
+and `subtitle` uses `saturating_sub`. Worth recording as passes.
+
+One was not. `camera_policy::is_stale` was
+`now_ms - p.at_ms > STALE_AFTER_MS`. These are i64, so it cannot panic —
+which is exactly why it would go unnoticed. When the clock steps BACK
+(an NTP correction, a phone that guessed at the time before it had a
+network, a device syncing after boot), the age goes negative, a negative
+age is never greater than the window, and the probe reads as fresh
+FOREVER.
+
+The symptom is not an error. It is one camera silently missing from
+`stale_ids` for the life of the process, so a camera that was broken at
+boot and works now never gets reconsidered — which is the exact case the
+staleness window exists for, named in the test above it: "a camera fixed
+by a reboot is reconsidered".
+
+Now `age < 0 || age > STALE_AFTER_MS`, with a test asserting a future
+timestamp is stale.
+
+The general shape, and the reason this class is worth sweeping: signed
+timestamp math does not crash, so a clock-skew bug produces a
+behavioural silence rather than a stack trace. The unsigned version of
+the same mistake would have panicked on the first NTP correction and
+been fixed years ago.
