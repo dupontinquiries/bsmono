@@ -37,11 +37,11 @@ pub trait Backend {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum BackendKind { LlamaCpp, Wgpu }
+pub enum BackendKind { LlamaCpp, Wgpu, Daemon }
 impl BackendKind {
-    pub const ALL: [BackendKind; 2] = [BackendKind::LlamaCpp, BackendKind::Wgpu];
+    pub const ALL: [BackendKind; 3] = [BackendKind::LlamaCpp, BackendKind::Wgpu, BackendKind::Daemon];
     pub fn label(self) -> &'static str {
-        match self { BackendKind::LlamaCpp => "llama.cpp · Vulkan", BackendKind::Wgpu => "wgpu/Burn (experimental)" }
+        match self { BackendKind::LlamaCpp => "llama.cpp · Vulkan", BackendKind::Wgpu => "wgpu/Burn (experimental)", BackendKind::Daemon => "shared daemon (one copy of the weights)" }
     }
     /// The backend to use by default: llama.cpp when its FFI is compiled in (mature,
     /// fast), otherwise the clean-room wgpu engine. Loading and chatting must agree on
@@ -2227,6 +2227,144 @@ pub fn make(kind: BackendKind) -> Box<dyn Backend> {
     match kind {
         BackendKind::LlamaCpp => Box::new(LlamaCpp { model: None }),
         BackendKind::Wgpu => Box::new(Wgpu { #[cfg(feature = "wgpu-engine")] engine: None }),
+        BackendKind::Daemon => Box::new(Daemon::default()),
+    }
+}
+
+/// Talk to a shared daemon instead of loading our own copy of the model.
+///
+/// WHY: one 8B model is 7.2 GiB resident and ~86 s to load, and this
+/// machine's loader already clamps its GPU budget from 48 GiB to 31. Two
+/// apps each holding their own copy is the situation the daemon exists to
+/// avoid, and this app is the heavier of the two.
+///
+/// `load` does not load anything — it CHECKS that a daemon is listening
+/// and remembers the path. The weights are already resident in another
+/// process; the model path is still recorded so `loaded()` and the UI can
+/// say which model is being talked to.
+///
+/// Streams. `logscope-serve --unix` answers `/generate` with chunked
+/// transfer, and `on_token` is called per chunk as it lands — at ~4 tok/s
+/// the alternative is forty seconds of a still UI followed by a
+/// paragraph, which would make the daemon feel worse than loading a model
+/// of our own in exactly the app where its memory saving is largest.
+#[derive(Default)]
+pub struct Daemon {
+    path: Option<std::path::PathBuf>,
+    model: Option<String>,
+}
+
+impl Backend for Daemon {
+    fn name(&self) -> &'static str { "daemon" }
+    fn loaded(&self) -> bool { self.path.is_some() }
+
+    fn load(&mut self, path: &str, _params: &GenParams) -> Result<(), String> {
+        let sock = daemon_socket_path();
+        // Fail FAST and name the path. This is what the caller uses to
+        // decide whether to fall back to loading in-process, so a slow
+        // failure here is a slow startup for everyone without a daemon.
+        std::os::unix::net::UnixStream::connect(&sock)
+            .map_err(|e| format!("no daemon at {}: {e}", sock.display()))?;
+        self.path = Some(sock);
+        self.model = Some(path.to_string());
+        Ok(())
+    }
+
+    fn generate(&mut self, prompt: &str, params: &GenParams, cancel: &dyn Fn() -> bool,
+                on_token: &mut dyn FnMut(&str) -> bool) -> Result<usize, String> {
+        use std::io::{Read, Write};
+        let sock_path = self.path.clone().ok_or("no daemon connected")?;
+        let mut sock = std::os::unix::net::UnixStream::connect(&sock_path)
+            .map_err(|e| format!("connect: {e}"))?;
+        let req = format!(
+            "POST /generate?max={} HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{prompt}",
+            params.max_tokens.clamp(1, 8192), prompt.len());
+        sock.write_all(req.as_bytes()).map_err(|e| format!("write: {e}"))?;
+
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let head_end = loop {
+            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") { break p; }
+            let n = sock.read(&mut tmp).map_err(|e| format!("read: {e}"))?;
+            if n == 0 { return Err("daemon closed before sending a header".into()); }
+            buf.extend_from_slice(&tmp[..n]);
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+        if !head.lines().next().unwrap_or("").contains(" 200") {
+            return Err(format!("daemon: {}", head.lines().next().unwrap_or("").trim()));
+        }
+        let chunked = head.lines().any(|l| {
+            let l = l.to_ascii_lowercase();
+            l.starts_with("transfer-encoding:") && l.contains("chunked")
+        });
+
+        let mut pending = String::from_utf8_lossy(&buf[head_end + 4..]).into_owned();
+        let mut n_tokens = 0usize;
+        if !chunked {
+            // An older daemon, or `serve_unix` rather than the streaming
+            // one. Mixed versions on a machine are normal mid-upgrade.
+            let mut rest = String::new();
+            sock.read_to_string(&mut rest).map_err(|e| format!("read: {e}"))?;
+            pending.push_str(&rest);
+            let _ = on_token(&pending);
+            return Ok(pending.split_whitespace().count());
+        }
+        loop {
+            if cancel() {
+                // Dropping the socket is what stops the daemon
+                // generating, rather than it finishing into the void.
+                return Ok(n_tokens);
+            }
+            let (text, rest, done) = drain_chunks(&pending);
+            pending = rest;
+            if !text.is_empty() {
+                n_tokens += text.split_whitespace().count();
+                if !on_token(&text) { return Ok(n_tokens); }
+            }
+            if done { return Ok(n_tokens); }
+            let n = sock.read(&mut tmp).map_err(|e| format!("read: {e}"))?;
+            if n == 0 {
+                // A half-reply accepted as whole is worse than an error.
+                return Err("daemon closed the connection mid-reply".into());
+            }
+            pending.push_str(&String::from_utf8_lossy(&tmp[..n]));
+        }
+    }
+}
+
+/// Where the daemon listens. Must agree with `netserve::default_socket_path`
+/// and `aperture-engine`'s client, or the halves never meet — the rule is
+/// duplicated here rather than imported because this crate does not
+/// depend on gpu-gemm in every configuration.
+fn daemon_socket_path() -> std::path::PathBuf {
+    if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
+        return std::path::Path::new(&rt).join("logscope-engine.sock");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::Path::new(&home).join(".logscope-engine.sock")
+}
+
+/// Pull every COMPLETE chunk from `buf`; leave a partial one for the next
+/// read. Guessing at a partial chunk is the difference between streaming
+/// and corrupting, and a chunk split across two reads is the normal case.
+fn drain_chunks(buf: &str) -> (String, String, bool) {
+    let mut out = String::new();
+    let mut rest = buf;
+    loop {
+        let Some((len_s, tail)) = rest.split_once("\r\n") else {
+            return (out, rest.to_string(), false);
+        };
+        let Some(first) = len_s.split(';').next() else {
+            return (out, rest.to_string(), false);
+        };
+        let Ok(n) = usize::from_str_radix(first.trim(), 16) else {
+            return (out, rest.to_string(), false);
+        };
+        if n == 0 { return (out, String::new(), true); }
+        if tail.len() < n + 2 { return (out, rest.to_string(), false); }
+        out.push_str(&tail[..n]);
+        rest = &tail[n + 2..];
     }
 }
 
@@ -3061,5 +3199,80 @@ what COMPACT_REQUEST was until the compaction banner landed");
 either wire it up or delete it, but a measurement nobody reads is not a feature");
         }
         assert!(checked >= 1, "the accessor scan matched nothing — it has stopped working");
+    }
+}
+
+#[cfg(test)]
+mod daemon_tests {
+    use super::*;
+
+    /// Serialises the two tests that set XDG_RUNTIME_DIR.
+    ///
+    /// Fifth time this shape has come up this week (bo-suite,
+    /// aperture-engine, gitmind, voiceterm's snapshot store). Env vars
+    /// are process-global and cargo runs tests in parallel, so a test
+    /// that sets one races every other test that reads it. Adding the
+    /// lock up front rather than after a flake.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        L.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn chunks_are_drained_only_when_complete() {
+        // A chunk split across two socket reads is the NORMAL case, not
+        // an edge one. Decoding a partial chunk would emit half a token
+        // and then desynchronise the stream, which reads as the model
+        // producing garbage.
+        let (text, rest, done) = drain_chunks("5\r\nhello\r\n3\r\nwo");
+        assert_eq!(text, "hello", "the complete chunk came out");
+        assert_eq!(rest, "3\r\nwo", "the partial one was kept whole");
+        assert!(!done);
+
+        // Feed the remainder and it completes.
+        let (text, rest, done) = drain_chunks("3\r\nwor\r\n0\r\n\r\n");
+        assert_eq!(text, "wor");
+        assert!(rest.is_empty());
+        assert!(done, "the zero chunk terminates");
+    }
+
+    #[test]
+    fn a_chunk_boundary_inside_a_length_prefix_is_survivable() {
+        // The nastiest split: the hex length itself arrives in pieces.
+        let (text, rest, done) = drain_chunks("1");
+        assert!(text.is_empty() && !done, "nothing decodable yet");
+        assert_eq!(rest, "1", "kept for the next read");
+    }
+
+    #[test]
+    fn the_socket_path_matches_the_servers_rule() {
+        let _serial = env_lock();
+        let prev = std::env::var("XDG_RUNTIME_DIR").ok();
+        // If the client and the daemon disagree about where to meet,
+        // each concludes the other is not running — a failure with no
+        // useful error anywhere.
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/4242");
+        assert_eq!(daemon_socket_path(),
+                   std::path::Path::new("/run/user/4242/logscope-engine.sock"));
+        match prev { Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                     None => std::env::remove_var("XDG_RUNTIME_DIR") }
+    }
+
+    #[test]
+    fn loading_without_a_daemon_fails_fast_and_names_the_path() {
+        let _serial = env_lock();
+        let prev = std::env::var("XDG_RUNTIME_DIR").ok();
+        // This is what the caller uses to decide whether to fall back to
+        // an in-process load, so it must be quick and it must say where
+        // it looked.
+        std::env::set_var("XDG_RUNTIME_DIR", "/nonexistent-daemon-dir");
+        let mut d = Daemon::default();
+        let err = d.load("model.gguf", &GenParams::default()).unwrap_err();
+        assert!(err.contains("nonexistent-daemon-dir"), "{err}");
+        assert!(!d.loaded(), "a failed load must not look connected");
+        match prev { Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                     None => std::env::remove_var("XDG_RUNTIME_DIR") }
     }
 }
