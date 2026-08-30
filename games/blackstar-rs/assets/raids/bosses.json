@@ -1,0 +1,306 @@
+[
+  {
+    "id": "speakerman",
+    "name": "Astro Armor Titan Speakerman",
+    "title": "The Last Resonance",
+    "mech": "Sync",
+    "element": "Electric",
+    "arena": "unicron",
+    "tier": 3,
+    "premise": "sings across half a galaxy; fractures planets by matching tectonic resonance",
+    "relic": [
+      "a walking observatory that made moons into transmitters.",
+      "when the war infected the frequencies, the voice became",
+      "the weapon. it still broadcasts. no fleet that answers returns."
+    ],
+    "shard": "it was not singing to anyone. it was holding a note."
+  },
+  {
+    "id": "jhiaxus_omega",
+    "name": "Devastator Jhiaxus",
+    "title": "Prototype Omega",
+    "mech": "Purge",
+    "element": "Fire",
+    "arena": "kuiper",
+    "tier": 3,
+    "premise": "destroying one only caused it to rebuild itself",
+    "relic": [
+      "the architect thought individuals obsolete. his answer:",
+      "a body whose organs are factories. it drifted unfinished",
+      "into the dark, and has spent four million years finishing."
+    ],
+    "shard": "the foundries were not building it. they were reinforcing something."
+  },
+  {
+    "id": "mechagodzilla",
+    "name": "Plasma's Mechagodzilla",
+    "title": "The Planet Burner",
+    "mech": "Ground",
+    "element": "Fire",
+    "arena": "emberpit",
+    "tier": 3,
+    "premise": "its spinal plasma spine could ignite gas giants",
+    "relic": [
+      "built around a captured shard of a stellar core. it never",
+      "transformed; its body was the weapon. civilizations surrendered",
+      "at the sight of its fins over the horizon. the star inside refuses to die."
+    ],
+    "shard": "the fire was never aimed outward. it was a furnace kept lit."
+  },
+  {
+    "id": "cherno",
+    "name": "Cherno Alpha",
+    "title": "The Walking Reactor",
+    "mech": "Ground",
+    "element": "Electric",
+    "arena": "frostline",
+    "tier": 2,
+    "premise": "if it ever stops walking, the reactor reaches criticality",
+    "relic": [
+      "its armor is not armor. it is containment. every step",
+      "relieves pressure, and the engineers removed the shutdown",
+      "on purpose. millions of years later, it is still marching."
+    ],
+    "shard": "the march has a route. the route is a circle around something."
+  },
+  {
+    "id": "gigadrill",
+    "name": "Gigadrill",
+    "title": "The Core Piercer",
+    "mech": "Air",
+    "element": "Rock",
+    "arena": "cybertron",
+    "tier": 2,
+    "premise": "it drilled through moons, worlds, dwarf planets",
+    "relic": [
+      "built to learn why planets have metallic hearts. some worlds",
+      "screamed; some contained machinery older than cybertron.",
+      "it vanished under a rogue planet and came back marked."
+    ],
+    "shard": "it stopped drilling down. the last bore was a way OUT for something."
+  },
+  {
+    "id": "hardboil",
+    "name": "Hardboil",
+    "title": "The Pressure King",
+    "mech": "Purge",
+    "element": "Water",
+    "arena": "trench",
+    "tier": 2,
+    "premise": "built for depths that crush ordinary alloys",
+    "relic": [
+      "gas-giant warfare: no missiles, only pressure. it compressed",
+      "atmosphere into shells of neutron density; fleets vanished",
+      "without explosions. its chambers still cycle. moons feel it."
+    ],
+    "shard": "the pressure was a hand. the hand was holding a lid shut."
+  },
+  {
+    "id": "hussar",
+    "name": "Hussar Tank",
+    "title": "The Charge",
+    "mech": "Ground",
+    "element": "Fire",
+    "arena": "mars",
+    "tier": 1,
+    "premise": "it does not manoeuvre; it commits",
+    "relic": [
+      "built by an order of knights. it accelerates and does not",
+      "stop; past a certain distance nothing survives the arrival.",
+      "one destroyed an orbital ring by refusing to. its engines never cooled."
+    ],
+    "shard": "the charge was never at an enemy. it was AWAY from a place."
+  },
+  {
+    "id": "judgementor",
+    "name": "Judgementor",
+    "title": "Executor of Empires",
+    "mech": "Sync",
+    "element": "Electric",
+    "arena": "unicron",
+    "tier": 3,
+    "premise": "it did not fight wars, it ended them",
+    "relic": [
+      "not a tank. a mobile courtroom. civilizations stood trial",
+      "under its cathedral body, and its rail cannons were called",
+      "sentences. ancient defendants still orbit as asteroid belts."
+    ],
+    "shard": "one verdict was never delivered. the case is still open."
+  },
+  {
+    "id": "mantis",
+    "name": "Primitive Mantis Mech",
+    "title": "The First Hunter",
+    "mech": "Purge",
+    "element": "Vine",
+    "arena": "frostline",
+    "tier": 1,
+    "premise": "the oldest predator pattern Cybertron ever built",
+    "relic": [
+      "older than language, older than cities, older than elegant",
+      "transformation. its nerves evolved rather than being engineered.",
+      "it studies prey, learns habits, and returns centuries later."
+    ],
+    "shard": "it was not hunting. it was patrolling a perimeter that predates it."
+  },
+  {
+    "id": "pyrachnid",
+    "name": "Pyrachnid",
+    "title": "Forge Widow",
+    "mech": "Sync",
+    "element": "Fire",
+    "arena": "unicron",
+    "tier": 2,
+    "premise": "it spins its own foundry around its prey",
+    "relic": [
+      "born inside stellar furnaces. the web is superconducting",
+      "plasma; battleships are caught, then slowly melted. forge",
+      "worlds called it sacred — every web made alloys known nowhere else."
+    ],
+    "shard": "the web is a weave. the weave is a patch over a tear."
+  },
+  {
+    "id": "scorpion",
+    "name": "Scorpion Commander",
+    "title": "The Frontier Marshal",
+    "mech": "Ground",
+    "element": "Vine",
+    "arena": "mars",
+    "tier": 1,
+    "premise": "held a border that no longer exists",
+    "relic": [
+      "not a soldier; a colonizer. its tail deployed factories,",
+      "grids, terraformers — every claw a city, every leg a road.",
+      "abandoned colonies still wait for orders from a marshal presumed dead."
+    ],
+    "shard": "the border it held was not around territory. it was around a site."
+  },
+  {
+    "id": "starlord",
+    "name": "Starlord",
+    "title": "Twin Hammers",
+    "mech": "Air",
+    "element": "Electric",
+    "arena": "pluto",
+    "tier": 1,
+    "premise": "two hammers that are sentry guns",
+    "relic": [
+      "human-sized; almost overlooked. the ceremonial hammers unfold",
+      "into autonomous fortresses — batteries, arrays, nests, towers —",
+      "and no one knows whether they protect their bearer or imprison it."
+    ],
+    "shard": "the hammers do not answer to it. they answer to the same thing it does."
+  },
+  {
+    "id": "strider",
+    "name": "Strider Tank",
+    "title": "The Horizon Walker",
+    "mech": "Air",
+    "element": "Air",
+    "arena": "outer_rim",
+    "tier": 2,
+    "premise": "it walks toward the horizon and the horizon moves",
+    "relic": [
+      "built for impossible terrain: ranges, trenches, asteroid",
+      "fields. its stride predicts gravity seconds before it changes.",
+      "explorers said: if a strider chose a destination, it would arrive."
+    ],
+    "shard": "it has a destination. it has been refusing to arrive for an age."
+  },
+  {
+    "id": "tremor",
+    "name": "Tremor",
+    "title": "Planetbreaker",
+    "mech": "Ground",
+    "element": "Rock",
+    "arena": "cybertron",
+    "tier": 2,
+    "premise": "the ground is its weapon",
+    "relic": [
+      "not seismic — gravitational. singularity oscillators in the",
+      "legs shake spacetime; quakes are a side effect. satellites",
+      "fall slowly. stars wobble. its heartbeat carries light-years."
+    ],
+    "shard": "the heartbeat is a countermeasure. it is jamming a deeper signal."
+  },
+  {
+    "id": "trenchmaster",
+    "name": "Trenchmaster",
+    "title": "The Ocean King",
+    "mech": "Sync",
+    "element": "Water",
+    "arena": "unicron",
+    "tier": 3,
+    "premise": "the ocean king; the water rises to meet it",
+    "relic": [
+      "made for abyssal wars. it treats the deep as a highway and",
+      "commands water by pressure resonance; continental shelves",
+      "rose at its word. some sonar recordings continue today."
+    ],
+    "shard": "the flood was a moat. what it circled has no name in the record."
+  },
+  {
+    "id": "sigillum",
+    "name": "Wuthering Waves Sigillum",
+    "title": "The Seal",
+    "mech": "Purge",
+    "element": "Ice",
+    "arena": "shield_edge",
+    "tier": 2,
+    "premise": "a seal is only a door that has not been opened",
+    "relic": [
+      "nobody knows what it is. it is not a warrior; it is a lock.",
+      "the inscriptions repeat: THE SIGILLUM SHALL NEVER AWAKEN.",
+      "every attack it makes looks like a defense of something behind it."
+    ],
+    "shard": "destroying it may not be victory. it may simply open the door."
+  },
+  {
+    "id": "archivist",
+    "name": "Titan Cameraman 3.0 Armor",
+    "title": "Archivist",
+    "mech": "Air",
+    "element": "Electric",
+    "arena": "pluto",
+    "tier": 2,
+    "premise": "it records everything; it has never stopped",
+    "relic": [
+      "the camera titans were never soldiers. every photon they",
+      "captured is stored in quantum crystal. this one remembers",
+      "cybertron's birth. damaging its armor physically erases history."
+    ],
+    "shard": "the oldest frame in its memory is of the lock being built."
+  },
+  {
+    "id": "observer",
+    "name": "Sphere Robot",
+    "title": "The Observer",
+    "mech": "Purge",
+    "element": "Ice",
+    "arena": "kuiper",
+    "tier": 1,
+    "premise": "it watches, and being watched changes what you do",
+    "relic": [
+      "found drifting between galaxies. no engines, no weapons, no",
+      "visible sensors — and it always arrives before the event.",
+      "its shell predates known matter. a probe, or an eye."
+    ],
+    "shard": "it does not watch events. it watches the thing that causes them."
+  },
+  {
+    "id": "divergence",
+    "name": "Titan Cameraman 3.0 (What If...)",
+    "title": "The Divergence",
+    "mech": "Sync",
+    "element": "Electric",
+    "arena": "unicron",
+    "tier": 3,
+    "premise": "the recording and the event no longer agree",
+    "relic": [
+      "not from this timeline. its memory holds events that never",
+      "happened: fallen primes who live, victors who lost. its armor",
+      "phases, and pieces of other histories briefly become real."
+    ],
+    "shard": "in every timeline it remembers, the lock is in the same place."
+  }
+]

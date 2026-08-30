@@ -82,3 +82,23 @@ path = "examples/rigpose.rs"
 [[example]]
 name = "stripcheck"
 path = "examples/stripcheck.rs"
+
+[[example]]
+name = "refusal_audit"
+path = "examples/refusal_audit.rs"
+
+[[example]]
+name = "sample_density_check"
+path = "examples/sample_density_check.rs"
+
+[[example]]
+name = "silhouette_audit"
+path = "examples/silhouette_audit.rs"
+
+[[example]]
+name = "trace_compact"
+path = "examples/trace_compact.rs"
+
+[[example]]
+name = "check_treads"
+path = "examples/check_treads.rs"

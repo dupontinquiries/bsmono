@@ -160,16 +160,16 @@ fn key_of(seq: &[u64]) -> u64 {
     )
 }
 
-/// Align a strip into a union-prim blend input. `None` refuses — the
-/// caller falls back to stepping, exactly today's behaviour.
-pub fn unify(strip: Vec<Vec<RawPrim>>) -> Option<Unified> {
+/// The matching pass shared by `unify` and `diagnose`: for each pose in
+/// order, key each prim by its UV sequence and match it against the
+/// nearest same-key entry not yet filled at this pose, falling back to a
+/// new entry (a join) when nothing matches. Returns the resulting
+/// entries, the match `Report`, and `pair_slots` (the threshold
+/// denominator: `min(prims)` summed over adjacent pose pairs). Pulled out
+/// of `unify` verbatim so `diagnose` can see the report on a refusal
+/// `unify` itself would just return `None` for.
+fn match_pass(strip: Vec<Vec<RawPrim>>) -> (Vec<Entry>, Report, usize) {
     let n_poses = strip.len();
-    if n_poses < 2 || strip.iter().any(|p| p.is_empty()) {
-        return None;
-    }
-    // the travel bound: a part moving further than the body's own
-    // longest half-extent between ADJACENT poses is a mismatch, not a
-    // fold — measured travel on real strips is a fraction of this
     let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
     for r in &strip[0] {
         for v in &r.verts {
@@ -182,7 +182,7 @@ pub fn unify(strip: Vec<Vec<RawPrim>>) -> Option<Unified> {
 
     let mut entries: Vec<Entry> = Vec::new();
     let mut report = Report::default();
-    let mut pair_slots = 0usize; // min(prims) summed over adjacent pairs
+    let mut pair_slots = 0usize;
     let mut prev_count = 0usize;
 
     for (k, pose) in strip.into_iter().enumerate() {
@@ -194,10 +194,6 @@ pub fn unify(strip: Vec<Vec<RawPrim>>) -> Option<Unified> {
             let seq = uv_seq(&r.verts);
             let key = key_of(&seq);
             let c = centroid(&r.verts);
-            // candidates: union entries with this key, not yet filled at
-            // this pose — nearest last-known centroid wins, so identical
-            // duplicate parts (mirrored wheels share a key) each take
-            // the copy they are closest to instead of trading places
             let cand = entries
                 .iter()
                 .enumerate()
@@ -210,12 +206,6 @@ pub fn unify(strip: Vec<Vec<RawPrim>>) -> Option<Unified> {
                 });
             let accepted = match cand {
                 Some((ei, e)) if k > 0 => {
-                    // two ways a key match can still be wrong, both
-                    // downgraded to a fade rather than lerped: the
-                    // vertex ORDER disagrees (never observed, but a
-                    // per-index lerp of it would smear the part), or
-                    // the travel is bigger than the body (a duplicate
-                    // matched across the whole hull)
                     if e.seq == seq && (e.last_c - c).length() <= travel_cap {
                         Some(ei)
                     } else {
@@ -250,6 +240,165 @@ pub fn unify(strip: Vec<Vec<RawPrim>>) -> Option<Unified> {
             }
         }
     }
+    (entries, report, pair_slots)
+}
+
+/// Same match pass as `diagnose`, but names which prims (by pose-local
+/// index) never found a partner in the pose before them — the actual
+/// list behind the percentage, for finding out whether a near-miss is
+/// one bad prim or scattered noise.
+pub fn diagnose_unmatched(strip: &[Vec<RawPrim>]) -> Vec<(usize, usize)> {
+    if strip.len() < 2 || strip.iter().any(|p| p.is_empty()) {
+        return Vec::new();
+    }
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for r in &strip[0] {
+        for v in &r.verts {
+            let p = Vec3::from_array(v.pos);
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
+    }
+    let travel_cap = ((hi - lo) * 0.5).max_element().max(0.1);
+
+    struct Light {
+        key: u64,
+        seq: Vec<u64>,
+        last_c: Vec3,
+        filled: Vec<bool>,
+    }
+    let n_poses = strip.len();
+    let mut entries: Vec<Light> = Vec::new();
+    let mut unmatched: Vec<(usize, usize)> = Vec::new(); // (pose, prim-in-pose)
+
+    for (k, pose) in strip.iter().enumerate() {
+        for (pi, r) in pose.iter().enumerate() {
+            let seq = uv_seq(&r.verts);
+            let key = key_of(&seq);
+            let c = centroid(&r.verts);
+            let cand = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.key == key && !e.filled[k])
+                .min_by(|(_, a), (_, b)| {
+                    (a.last_c - c)
+                        .length_squared()
+                        .partial_cmp(&(b.last_c - c).length_squared())
+                        .unwrap()
+                });
+            let accepted = match cand {
+                Some((ei, e)) if k > 0 => {
+                    (e.seq == seq && (e.last_c - c).length() <= travel_cap).then_some(ei)
+                }
+                _ => None,
+            };
+            match accepted {
+                Some(ei) => {
+                    entries[ei].last_c = c;
+                    entries[ei].filled[k] = true;
+                }
+                None => {
+                    if k > 0 {
+                        unmatched.push((k, pi));
+                    }
+                    let mut filled = vec![false; n_poses];
+                    filled[k] = true;
+                    entries.push(Light { key, seq, last_c: c, filled });
+                }
+            }
+        }
+    }
+    unmatched
+}
+
+/// Read-only diagnostic: how close a strip got to unifying, even when it
+/// refused. Returns `(matched, pair_slots)` — `unify` refuses below
+/// `MIN_MATCHED * pair_slots`, so `matched as f32 / pair_slots as f32`
+/// against `MIN_MATCHED` (0.5) tells a caller whether a chassis is a
+/// near-miss worth a second look or wildly mismatched. `None` only for
+/// the same degenerate inputs `unify` itself refuses outright (fewer
+/// than 2 poses, or an empty pose).
+///
+/// Deliberately independent of `match_pass`/`unify` rather than sharing
+/// it: `RawPrim` isn't `Clone` and this only needs the match counts, not
+/// ownership of every vertex, so it re-derives just the key/centroid
+/// bookkeeping by reference instead of taking `strip` twice.
+pub fn diagnose(strip: &[Vec<RawPrim>]) -> Option<(usize, usize)> {
+    if strip.len() < 2 || strip.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for r in &strip[0] {
+        for v in &r.verts {
+            let p = Vec3::from_array(v.pos);
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
+    }
+    let travel_cap = ((hi - lo) * 0.5).max_element().max(0.1);
+
+    struct Light {
+        key: u64,
+        seq: Vec<u64>,
+        last_c: Vec3,
+        filled: Vec<bool>,
+    }
+    let n_poses = strip.len();
+    let mut entries: Vec<Light> = Vec::new();
+    let mut matched = 0usize;
+    let mut pair_slots = 0usize;
+    let mut prev_count = 0usize;
+
+    for (k, pose) in strip.iter().enumerate() {
+        if k > 0 {
+            pair_slots += prev_count.min(pose.len());
+        }
+        prev_count = pose.len();
+        for r in pose {
+            let seq = uv_seq(&r.verts);
+            let key = key_of(&seq);
+            let c = centroid(&r.verts);
+            let cand = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.key == key && !e.filled[k])
+                .min_by(|(_, a), (_, b)| {
+                    (a.last_c - c)
+                        .length_squared()
+                        .partial_cmp(&(b.last_c - c).length_squared())
+                        .unwrap()
+                });
+            let accepted = match cand {
+                Some((ei, e)) if k > 0 => {
+                    (e.seq == seq && (e.last_c - c).length() <= travel_cap).then_some(ei)
+                }
+                _ => None,
+            };
+            match accepted {
+                Some(ei) => {
+                    matched += 1;
+                    entries[ei].last_c = c;
+                    entries[ei].filled[k] = true;
+                }
+                None => {
+                    let mut filled = vec![false; n_poses];
+                    filled[k] = true;
+                    entries.push(Light { key, seq, last_c: c, filled });
+                }
+            }
+        }
+    }
+    Some((matched, pair_slots))
+}
+
+/// Align a strip into a union-prim blend input. `None` refuses — the
+/// caller falls back to stepping, exactly today's behaviour.
+pub fn unify(strip: Vec<Vec<RawPrim>>) -> Option<Unified> {
+    let n_poses = strip.len();
+    if n_poses < 2 || strip.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let (entries, report, pair_slots) = match_pass(strip);
 
     if pair_slots > 0 && (report.matched as f32) < MIN_MATCHED * pair_slots as f32 {
         return None; // not the measured pattern — the known fallback wins

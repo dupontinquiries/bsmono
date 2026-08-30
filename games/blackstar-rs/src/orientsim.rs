@@ -142,7 +142,8 @@ fn guess_for(pose_dir: &Path) -> Option<(orient::Guess, Vec<crate::meshgen::Vert
         if let Some((half, ride)) = crate::massfilter::bounds(&refs, &mass.keep) {
             let sink = ride - half.y;
             println!(
-                "       seat: ride_h {:.2}  half_h {:.2}  {}",
+                "       seat[{}]: ride_h {:.2}  half_h {:.2}  {}",
+                pose_dir.display(),
                 ride,
                 half.y,
                 if sink.abs() < 0.02 {

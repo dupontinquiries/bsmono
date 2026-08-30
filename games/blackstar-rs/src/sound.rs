@@ -20,6 +20,11 @@ pub enum Sfx {
     Land(f32),     // car landing, arg = impact speed
     Goal,          // ball in the net: a little chord fanfare
     Horn,          // team scored in a sparta match: stadium airhorn
+    /// servo-sweep over the whole blend — true = folding up into the robot
+    /// (rising), false = folding down into the vehicle (falling)
+    XformFold(bool),
+    /// the metal clank on the frame the fold actually lands
+    XformSnap,
 }
 
 // ======================================================================
@@ -300,6 +305,32 @@ mod imp {
                     if a > 0.08 {
                         self.spawn(Voice { t: 0.0, dur: 0.14, f0: 70.0, f1: 45.0, amp: 0.5 * a, noise: 0.6, phase: 0.0, second: 0.0 });
                     }
+                }
+                Sfx::XformFold(to_robot) => {
+                    // one long glide for the whole 1.3s blend, plus a
+                    // detuned octave-up layer so it reads as machinery
+                    // rather than a single clean tone. Direction carries
+                    // the meaning: rising into the robot, falling into
+                    // the vehicle — the ear gets which way it's folding
+                    // before the eye finishes the shot.
+                    let (f0, f1) = if to_robot { (110.0, 360.0) } else { (360.0, 110.0) };
+                    self.spawn(Voice { t: 0.0, dur: 1.15, f0, f1, amp: 0.22, noise: 0.35, phase: 0.0, second: 0.5 });
+                    self.spawn(Voice {
+                        t: 0.0,
+                        dur: 1.05,
+                        f0: f0 * 2.02,
+                        f1: f1 * 2.02,
+                        amp: 0.10,
+                        noise: 0.25,
+                        phase: 0.31,
+                        second: 0.0,
+                    });
+                }
+                Sfx::XformSnap => {
+                    // the landing beat: a bright metallic transient over a
+                    // short low thump, fired the frame the fold finishes
+                    self.spawn(Voice { t: 0.0, dur: 0.16, f0: 1500.0, f1: 220.0, amp: 0.45, noise: 0.55, phase: 0.0, second: 0.0 });
+                    self.spawn(Voice { t: 0.0, dur: 0.28, f0: 95.0, f1: 55.0, amp: 0.35, noise: 0.2, phase: 0.0, second: 0.0 });
                 }
             }
         }

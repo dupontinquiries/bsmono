@@ -3,12 +3,15 @@
 //! Three tables, chosen because each one closes a gap something already
 //! built was leaving open rather than because it was next in the directory.
 //!
-//! * **Chassis** carries `xform_dur` and `fold_spin`. `xform::Xform` has had
-//!   a `dur_mul` field since the state machine landed and nothing has ever
-//!   set it — every chassis folded at the same speed. These are the numbers
-//!   that were missing, and they are a real spread: a juggernaut takes 1.35x
-//!   as long as standard and a raptor 0.8x, so a heavy machine visibly
-//!   labours through the same fold a light one snaps through.
+//! * **Chassis** carries `xform_dur` and `fold_spin`, feeding
+//!   `xform::Xform::dur_mul` and the cinematic fold camera's arc
+//!   respectively. Both sat unread for a while — every chassis folded at
+//!   the same speed under the same camera sweep — until `main.rs`'s
+//!   `chassis_fold_mul`/`chassis_fold_spin` picked them up. The numbers are
+//!   a real spread: a juggernaut takes 1.35x as long as standard and turns
+//!   the camera through less arc doing it; a raptor is 0.8x and whips
+//!   round faster, so a heavy machine visibly labours through the same
+//!   fold a light one snaps through, on screen as well as in the blend.
 //! * **Troops** are the hostiles `patrol.rs` needs. It has factions, events
 //!   and a `credit_kill` and nothing to kill. Seventeen records: ten player
 //!   classes, four enemies, three elemental variants.
@@ -29,7 +32,8 @@ pub struct Chassis {
     pub id: &'static str,
     /// fold duration multiplier — feeds `xform::Xform::dur_mul`
     pub xform_dur: f32,
-    /// degrees of spin the fold carries, for the choreography
+    /// degrees of spin the fold carries — feeds the cinematic fold
+    /// camera's sweep in `camera::Camera::start_cinematic`
     pub fold_spin: f32,
     pub bulk: f32,
     pub height: f32,

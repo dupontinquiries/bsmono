@@ -46,7 +46,7 @@ use crate::drop::{Drop, Landing, Mode};
 use crate::dropship;
 use crate::foothold::{self, Approach, Plan, Site};
 use crate::bigbody::BigBody;
-use crate::raidcon::{Arena, BOSSES, Boss};
+use crate::raidcon::{Arena, Boss};
 use crate::raidgen::{phase_raid, plan_for, strhash, EncKind, RaidPlan};
 use crate::raidrun::{Beacon, Event, RaidRun, Unit};
 use crate::sections;
@@ -119,7 +119,7 @@ impl RaidFlow {
     /// Accept the Wardeck's order. The ladder gate lives in the console
     /// (`stations::apply`); this trusts it and builds the plan.
     pub fn begin(boss_id: &str) -> Result<RaidFlow, &'static str> {
-        let boss = BOSSES.iter().find(|b| b.id == boss_id).ok_or("no such warden")?;
+        let boss = crate::raidcon::boss(boss_id).ok_or("no such warden")?;
         // deterministic per boss: the same signal plans the same raid
         let plan: &'static RaidPlan = Box::leak(Box::new(plan_for(boss, 3, strhash(boss.id))));
         Self::from_plan(plan, true)
@@ -617,6 +617,7 @@ impl RaidFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raidcon::BOSSES;
 
     fn first_boss() -> &'static str {
         BOSSES[0].id

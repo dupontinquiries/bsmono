@@ -7154,7 +7154,7 @@ pub fn run(args: &[String]) {
             cfg.cam.angle_deg = ang;
             let mut cam = crate::camera::Camera::new();
             for _ in 0..600 {
-                cam.update(&car, &ball, &world, &cfg.cam, false, false, DT);
+                cam.update(&car, &ball, &world, &cfg.cam, false, false, DT, None);
             }
             let boom = cam.pos - car.pos;
             let look_up = (cam.look - car.pos).dot(Vec3::Y);

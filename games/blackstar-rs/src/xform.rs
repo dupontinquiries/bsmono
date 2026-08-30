@@ -198,6 +198,14 @@ impl Xform {
         self.profile.ease(self.t)
     }
 
+    /// Which way the current or most recent fold is/was running: `true`
+    /// toward the robot, `false` toward the vehicle. Exists so callers that
+    /// only need the direction (a sound cue, say) don't need `dir` itself
+    /// made public.
+    pub fn folding_to_robot(&self) -> bool {
+        self.dir > 0.0
+    }
+
     pub fn locked(&self) -> bool {
         self.lock_timer > 0.0
     }
@@ -692,5 +700,30 @@ mod tests {
         let b = m.half_at(0.5).y;
         let c = m.half_at(1.0).y;
         assert!(a < b && b < c, "the hitbox did not grow with the body: {a} {b} {c}");
+    }
+
+    #[test]
+    fn folding_to_robot_reports_the_direction_a_sound_cue_needs() {
+        // fresh Xform: a first request always folds vehicle -> robot
+        let mut x = Xform::new();
+        assert!(x.request(1.0));
+        assert!(x.folding_to_robot());
+        x.update(BLEND_SEC * 2.0);
+        assert_eq!(x.mode, Mode::Robot);
+
+        // second request from Robot folds back down
+        assert!(x.request(1.0));
+        assert!(!x.folding_to_robot());
+        x.update(BLEND_SEC * 2.0);
+        assert_eq!(x.mode, Mode::Vehicle);
+
+        // reversing mid-fold flips what the direction should report too —
+        // this is the exact scenario `camera::Camera::start_cinematic`
+        // gets re-entered under, so the sound and the shot must agree
+        assert!(x.request(1.0));
+        assert!(x.folding_to_robot());
+        x.update(BLEND_SEC * 0.3);
+        assert!(x.request(1.0)); // reverse
+        assert!(!x.folding_to_robot(), "direction did not flip on reversal");
     }
 }
