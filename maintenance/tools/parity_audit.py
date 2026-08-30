@@ -616,6 +616,15 @@ def main():
         text = port_text(d)
         hit = {s for s in surf if covered(s, text)}
         wired = {s for s in surf if covered_in_code(s, text)}
+        # THE MIDDLE BUCKET. A surface can fail `covered_in_code` two very
+        # different ways: the name appears only in a module doc while the
+        # code uses an idiomatic Rust name (a false negative — the house
+        # style this tool's own docstring warns about), or it appears
+        # nowhere at all (a real gap). Collapsing those into one number is
+        # what made snapclone's 24 doc-only surfaces read as 24 missing
+        # ones. Separated so the headline says which kind.
+        doc_only = {s for s in surf - wired if s in text}
+        absent = surf - wired - doc_only
         # Named somewhere the app can actually reach. Sits between the two:
         # not fooled by a mention in prose alone, not fooled by the house
         # style either.
@@ -629,6 +638,9 @@ def main():
             "wired_pct": round(100.0 * len(wired) / max(len(surf), 1)),
             "live": len(live),
             "live_pct": round(100.0 * len(live) / max(len(surf), 1)),
+            # `doc_only` is not work; `absent` is. See C12_TODO 35.
+            "doc_only": len(doc_only),
+            "absent": sorted(absent),
             # The list worth acting on: somebody named the surface, and
             # nothing the app calls mentions it.
             "stranded": sorted(hit - live)[:8],
@@ -647,6 +659,19 @@ def main():
               f"{r['live']:>5} {r['live_pct']:>3}%  "
               f"{'yes' if r['bin'] else ' no':>3}  {'yes' if r['app_default'] else ' no':>6}  "
               f"{'yes' if r['manifest'] else ' NO':>7}  {'yes' if r['primary'] else '  -':>6}")
+    print()
+    # The distinction that matters when `code` looks low: doc-only is the
+    # house style (Qt name in the module doc, idiomatic Rust below) and is
+    # NOT work; absent is. Printed separately so a low `code` column can
+    # be read correctly at a glance instead of investigated from scratch.
+    for r in rows:
+        if r.get("doc_only") or r.get("absent"):
+            bits = []
+            if r.get("doc_only"):
+                bits.append(f"{r['doc_only']} doc-only (house style, not work)")
+            if r.get("absent"):
+                bits.append(f"{len(r['absent'])} ABSENT: {', '.join(r['absent'][:6])}")
+            print(f"  {r['app']:<16} " + "; ".join(bits))
     print()
     for r in rows:
         if r["missing"]:

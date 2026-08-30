@@ -2035,9 +2035,14 @@ missing.
   `SegmentedTabStrip` to satisfy an audit would trade idiomatic Rust for
   a metric, and the metric already reports both bounds precisely so it
   does not have to be gamed.
-- **C12-35b — worth one improvement to the tool, though.** It could
-  report the three-way split itself: named-and-in-code, named-in-doc-only
-  (this case), and absent. The middle bucket is currently
-  indistinguishable from the third in the headline number, which is what
-  made this look like 24 missing surfaces. That is a real reporting gap
-  even though it is not a code gap.
+- **C12-35b — DONE.** The audit now splits the two: `doc_only` (Qt name
+  in a module doc, idiomatic Rust below — house style, not work) and
+  `absent` (nowhere at all — real). Printed under the table so a low
+  `code` column can be read at a glance instead of investigated from
+  scratch, which is what cost me an hour here.
+
+  Run across the fleet, the answer is the same everywhere: bo-suite 13
+  doc-only, snapclone 24, voiceterm 2, bot-arena 1, and **ZERO absent in
+  any app**. So every `code` score below 100% in this repo is currently
+  the naming convention, not a missing surface. Worth knowing before the
+  next person reads that column as a to-do list.
