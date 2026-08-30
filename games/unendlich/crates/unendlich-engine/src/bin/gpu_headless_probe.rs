@@ -219,6 +219,94 @@ fn main() {
         return;
     }
 
+    // r617: DECISION-DIFF mode — read the shader's per-column decision
+    // export and diff against the CPU pipeline. Whatever disagrees first
+    // IS the tree-mass bug; no theories required.
+    if std::env::var("UNENDLICH_PROBE_DECISIONS").map(|v| v == "1").unwrap_or(false) {
+        use unendlich_engine::world::biome_loader::BiomeRegistry;
+        use unendlich_engine::world::cpu_generator::WorldGenerator;
+        use unendlich_engine::world::gpu_generator::VulkanChunkGenerator;
+        use unendlich_engine::world::ChunkCoord;
+        let seed: u32 = std::env::var("UNENDLICH_PROBE_PARITY_SEED")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(424242);
+        let mut reg = BiomeRegistry::empty();
+        let _ = reg.load_directory("assets/biomes");
+        let wg = WorldGenerator::with_biome_registry(seed, std::sync::Arc::new(reg));
+        let g = VulkanChunkGenerator::new(4).expect("gen");
+        // Chunks spanning the r613-regressing near-set (surface band).
+        let mut biome_mism = 0u32;
+        let mut eff_mism = 0u32;
+        let mut checked = 0u32;
+        let mut cases: Vec<String> = Vec::new();
+        for &(cx, cz) in &[(0i32, 0i32), (6, 2), (-8, 5), (3, -4)] {
+            let coord = ChunkCoord::new(cx, 2, cz);
+            let words = g.export_decisions(coord, seed).expect("export");
+            for col in 0..1024usize {
+                let lx = (col % 32) as i32;
+                let lz = (col / 32) as i32;
+                let wx = cx * 32 + lx;
+                let wz = cz * 32 + lz;
+                let g_biome = words[col * 4];
+                let g_eff = f32::from_bits(words[col * 4 + 1]);
+                let g_st = f32::from_bits(words[col * 4 + 3]);
+                // CPU pipeline: classify at the SCANNED surface (its real
+                // pipeline), plus its effective density.
+                let sy = match wg.surface_y_at(wx, wz, -64, 256) {
+                    Some(y) => y,
+                    None => continue,
+                };
+                checked += 1;
+                let bs = wg.biome_at_3d(wx, sy, wz);
+                let c_biome = bs.biome as u32;
+                let c_eff = match bs.biome.tree_profile() {
+                    Some(p) => {
+                        let ctf = |t: f64, h: f64| -> f64 {
+                            if t > 0.75 && h < 0.25 { return 0.0; }
+                            let td = t - 0.5;
+                            ((1.0 - 1.4 * td * td).max(0.2)) * (0.3 + h * 1.2)
+                        };
+                        let mut e = p.base_density * ctf(bs.temperature, bs.humidity);
+                        if bs.biome == unendlich_engine::world::biomes::Biome::Savanna {
+                            use unendlich_engine::world::forest_islands as fi;
+                            let isl = fi::sample(wx, wz, seed);
+                            if isl.in_island {
+                                e = fi::island_density(isl.core) * ctf(bs.temperature, bs.humidity);
+                            }
+                        }
+                        e
+                    }
+                    None => 0.0,
+                };
+                if g_biome != c_biome {
+                    biome_mism += 1;
+                    if cases.len() < 10 {
+                        // Discriminator: classify CPU-side (f64) at the
+                        // GPU's y. Matches gpu ⇒ the y is the cause;
+                        // still cpu ⇒ f32 noise bias.
+                        let at_st = wg.biome_at_3d(wx, g_st as i32, wz).biome as u32;
+                        cases.push(format!(
+                            "({wx},{wz}) biome cpu@sy={c_biome} gpu@st={g_biome} cpu@st={at_st} sy={sy} st={g_st:.1}"
+                        ));
+                    }
+                } else if (g_eff as f64 - c_eff).abs() > 0.004 {
+                    eff_mism += 1;
+                    if cases.len() < 10 {
+                        cases.push(format!(
+                            "({wx},{wz}) eff cpu={c_eff:.4} gpu={g_eff:.4} biome={c_biome}"
+                        ));
+                    }
+                }
+            }
+        }
+        println!(
+            "decision-diff seed {seed}: checked {checked} cols | biome mismatches {biome_mism} | eff mismatches {eff_mism}"
+        );
+        for c in &cases {
+            println!("  {c}");
+        }
+        return;
+    }
+
     if std::env::var("UNENDLICH_PROBE_PARITY").map(|v| v == "1").unwrap_or(false) {
         // r604 WORLDGEN-PARITY: build the PRODUCTION TerrainGenerator twice
         // (Backend::Cpu vs Backend::Gpu) from the same seed and diff every

@@ -212,6 +212,31 @@ impl VulkanChunkGenerator {
     pub fn batch_size(&self) -> u32 { self.batch_size }
 
     pub fn generate_batch(&self, coords: &[ChunkCoord], seed: u32) -> Result<Vec<GpuGeneratedChunk>> {
+        self.generate_batch_inner(coords, seed, 0)
+    }
+
+    /// r617: DECISION-EXPORT mode — dispatch with pc.debug_mode = 1, which
+    /// makes the shader write each interior column's tree-decision
+    /// internals (r613-form biome, effective_density, pos_hash,
+    /// surface_target) into the chunk slot's first words instead of
+    /// terrain. Returns the raw words for the FIRST coord's slot. The
+    /// instrument that ends the tree-mass theorizing: whatever disagrees
+    /// with the CPU per-column first IS the bug.
+    pub fn export_decisions(&self, coord: ChunkCoord, seed: u32) -> Result<Vec<u32>> {
+        let raw = self.generate_batch_inner(&[coord], seed, 1)?;
+        // blocks come back unpacked to BlockId — we need raw words, so
+        // re-read from the mapped buffer directly instead.
+        drop(raw);
+        let words = 4usize * 32 * 32;
+        let mut out = vec![0u32; words];
+        unsafe {
+            let src = self.block_ptr as *const u32;
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), words);
+        }
+        Ok(out)
+    }
+
+    fn generate_batch_inner(&self, coords: &[ChunkCoord], seed: u32, debug_mode: u32) -> Result<Vec<GpuGeneratedChunk>> {
         if coords.is_empty() { return Ok(Vec::new()); }
         if coords.len() > self.batch_size as usize {
             return Err(GpuGenError::Other(format!(
@@ -268,7 +293,7 @@ impl VulkanChunkGenerator {
                     chunk_x: c.x, chunk_y: c.y, chunk_z: c.z,
                     seed,
                     chunk_index: slot as u32,
-                    _pad: 0,
+                    _pad: debug_mode, // r617: 1 = decision-export
                 };
                 let bytes = std::slice::from_raw_parts(
                     &pc as *const _ as *const u8,

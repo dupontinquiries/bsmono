@@ -49,6 +49,7 @@ layout(push_constant) uniform PushConstants {
     ivec3 chunk_coord;     // 3D chunk coordinate
     uint seed;             // world seed (32-bit)
     uint chunk_index;      // index within the batch (which output chunk slot)
+    uint debug_mode;       // r617: 1 = decision-export (see export block in main)
 } pc;
 
 // ============================================================================
@@ -1101,6 +1102,17 @@ TreeDecision compute_tree_decision(
         }
     }
 
+    // r617 POSTMORTEM of the reclassify-at-scanned-surface fix: it
+    // regressed identically to r613 (mass 2.358), which PROVES the GLSL
+    // r447 scan lands ~2 blocks above the CPU's surface_y_at at these
+    // columns — the backends disagree about WHERE THE SURFACE IS, and no
+    // choice of classification y can fix knife-edge registry fits while
+    // the surfaces differ. The residual ~10.8k terrain diffs are the SAME
+    // phenomenon (surface ±1-2 along contours): the genuine f32-vs-f64
+    // density-crossing drift, now proven the last standing fork. The
+    // classification stays at the caller's r612 form (best measured)
+    // until the surface-height fork itself is addressed.
+
     // v0.24.NEXT-submerged-trees: skip submerged origins. Mirrors CPU
     // cpu_generator's surface_y < SEA_LEVEL_BASELINE skip — Pass A floods
     // those columns with water, so trees there would otherwise drown.
@@ -1709,6 +1721,46 @@ void main() {
         cached_surface_target[col] = sea + cont_height + biome_height + hills_height;
     }
     barrier();
+
+    // ── r617: DECISION-EXPORT mode (pc.debug_mode == 1) — write each
+    // interior column's r613-form tree-decision internals into the chunk
+    // slot's first words and stop. 4 words per column (32×32 cols = 4096
+    // words, fits the 8192-word slot): [0] biome (biome_at_3d_gpu at the
+    // cached surface_target), [1] effective_density bits (profile ×
+    // climate, savanna-islands branch included), [2] tree_origin_hash
+    // bits, [3] surface_target bits. The probe reads these back and diffs
+    // per-column against the CPU pipeline — whatever disagrees first IS
+    // the tree-mass bug. Writes are exclusive per column: no atomics.
+    if (pc.debug_mode == 1u) {
+        for (int k = 0; k < 2; k++) {
+            int col = int(inv_idx) * 2 + k;
+            if (col >= 1024) break;
+            int lx = col % 32;
+            int lz = col / 32;
+            float wx = float(chunk_origin.x + lx);
+            float wz = float(chunk_origin.z + lz);
+            int col_nb = (lx + TREE_PADDING) + (lz + TREE_PADDING) * NEIGHBORHOOD_SIZE;
+            float st = cached_surface_target[col_nb];
+            uint dbiome = biome_at_3d_gpu(wx, st, wz, world_seed);
+            float t = model_temperature(wx, st, wz, world_seed);
+            float h = model_humidity(wx, st, wz, world_seed);
+            TreeProfile prof = biome_tree_profile(dbiome);
+            float eff = prof.has_trees ? prof.base_density * climate_tree_factor(t, h) : 0.0;
+            if (dbiome == BIOME_SAVANNA) {
+                vec3 isl = fi_sample(chunk_origin.x + lx, chunk_origin.z + lz, world_seed);
+                if (isl.x > 0.5) {
+                    eff = fi_island_density(isl.y) * climate_tree_factor(t, h);
+                }
+            }
+            uint base = pc.chunk_index * (32u * 32u * 32u / 4u) + uint(col) * 4u;
+            blocks_packed[base + 0u] = dbiome;
+            blocks_packed[base + 1u] = floatBitsToUint(eff);
+            blocks_packed[base + 2u] =
+                floatBitsToUint(tree_origin_hash(chunk_origin.x + lx, chunk_origin.z + lz, world_seed));
+            blocks_packed[base + 3u] = floatBitsToUint(st);
+        }
+        return;
+    }
 
     // ---- Phase A2: tree decisions for neighborhood ----
     //

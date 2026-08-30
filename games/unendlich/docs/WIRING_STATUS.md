@@ -12278,3 +12278,26 @@ Phase A write each column's decision internals (biome id, effective_density x1e4
 block buffer's first words for one chunk; the probe reads them back and diffs against the CPU's per-column values.
 Whatever disagrees first IS the bug, no theories required. State shipped: unchanged from r613's best (tree site r612
 form; panel 0/610/10.8k/1.7k terrain, 1.000/1.369/0.921/1.000 mass); the lapse instrument stays in the probe.
+
+## r617 — THE INSTRUMENT ENDED THE THEORIZING: the tree puzzle IS the surface-height fork, root cause proven
+Built the decision-export instrument: shader pc gains debug_mode (the _pad word); when 1, Phase A writes each interior
+column's r613-form decision internals (biome, effective_density, tree_origin_hash, surface_target — 4 words/col) into
+the chunk slot and returns; VulkanChunkGenerator::export_decisions reads the raw words; probe mode
+UNENDLICH_PROBE_DECISIONS=1 diffs per-column against the CPU pipeline.
+FINDINGS, in order: (1) 535/4096 columns mismatch, ALL one-directional (cpu Plains → gpu TemperateForest), clustered
+in spatial bands along the registry-fit boundary; effective densities agree EXACTLY wherever classification agrees —
+the whole 2.5x is classification. (2) The y-vs-f32 discriminator: cpu@st == gpu@st == TemperateForest — the CPU's own
+f64 math at the GPU's y agrees with the GPU. The classifier mirror is fully vindicated; the cause is the
+classification HEIGHT (st=75.3 vs cpu sy=73; the fit boundary is knife-edge where the factor bell is flat — r616
+measured the right quantity at the wrong sensitivity). (3) The obvious fix — reclassify inside the decision at the
+GLSL's own SCANNED surface (d.surface_y) — regressed IDENTICALLY (mass 2.358), which PROVES the GLSL r447 scan lands
+~2 blocks above the CPU's surface_y_at at these columns: THE BACKENDS DISAGREE ABOUT WHERE THE SURFACE IS. Reverted
+with a postmortem comment at the site (verified restored: 0.921).
+THE UNIFIED PICTURE, finally: the tree-mass skews AND the residual ~10.8k terrain diffs are ONE phenomenon — a ±1-2
+block surface-height divergence along contours, i.e. the genuine f32(GLSL)-vs-f64(CPU) density-crossing drift first
+suspected in r604 and now PROVEN the last standing fork. Everything else — classifier, registry, ids, hashes, factor,
+tables — is measured equal. The endgame is therefore exactly one project: make the two backends agree on the density
+field's zero crossing (candidate directions unchanged from the r604 ledger: CPU noise to f32 behind a world-version
+gate, precomputed noise tiles, or f64 emulation in GLSL). Until then: tree site stays r612 (0.921/1.369 mass — honest
+numbers for an honestly-forked surface), clean seeds stay gate-worthy (0 and 610 terrain), and every instrument
+(parity panel, tree-biome histogram, lapse, decision-export) is in-tree for the surface project to verify against.
