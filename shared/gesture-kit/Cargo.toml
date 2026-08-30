@@ -1,0 +1,7 @@
+[package]
+name = "gesture-kit"
+version = "0.1.0"
+edition = "2021"
+description = "Two-tier scroll/swipe gesture model: sustained over-scroll fires a sub-page detent, a flick commits a page jump. Platform-free; feed deltas + timestamps, get decisions."
+
+[dependencies]

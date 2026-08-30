@@ -163,6 +163,29 @@ decode/asset side; nothing wires them into `library.rs`'s add-flow yet.
   and display a frame, or it just moves the silent drop one layer
   later. That is §13's av1/fao-codec item, which is the real blocker
   and is still not started.
+  **CLOSED — and the gate above was already open when this was
+  written.** Checked per CLAUDE.md §5 (code over docs): `viewport.rs` +
+  `studio_video::frame_rgb` decode and display the frame under the
+  playhead (ffmpeg seek, half-second cache) — the exact condition this
+  section set. So the join landed: `Studio::import_video_clip`
+  (headless, tested) puts the source in with `has_video: true`, length
+  from the PROBE (a video may outlast its own audio), and the clip on a
+  video track — CREATING one when none has room, where `import_clip`
+  refuses, because video tracks are scarce, an overlay is two pictures
+  at once on purpose, and §6's own words were "give the timeline a
+  video track to put it on"; AddTrack is an undoable op either way. The
+  shell's ToTimeline door branches on `library::is_video_path` BEFORE
+  `decode_bytes` (symphonia cannot open an mp4 — the silent
+  has_video:false began exactly there), probes, extracts the audio half
+  when the container has one (soundless imports still land: the picture
+  is the point), and registers the raw file as the asset peers fetch.
+  ffmpeg absent → a status line naming it, no import. To the RACK a
+  video still goes through its audio, unchanged — refusing a video's
+  audio to a sampler would be the tool overruling the musician.
+  §13's av1/fao-codec NATIVE decode remains open and is now purely a
+  performance/dependency upgrade (subprocess-per-frame → real decoder),
+  no longer gating correctness. C12-14c (the song↔video association)
+  is next in line now that a video can actually exist on the timeline.
 
 ## 7. aperture / aperture-view: a semantic-navigation and marker system
 
@@ -472,29 +495,141 @@ What's still needed, roughly in dependency order:
   song's video") that doesn't depend on decode actually working yet.
 - **C12-14f — the four pieces still genuinely untouched, named
   explicitly so "the tempo work" doesn't read as more done than it is:**
-  - **Grid rendering.** Non-uniform tick markers on screen, following
-    `TempoMap`'s detents instead of a fixed spacing — "something unique
-    in the code," per the original framing, and a separate
-    rendering-layer task now that the model underneath it is trustworthy
-    (tested), not before.
+  - **Grid rendering — closed (see `studio-egui::beatgrid`).** The
+    ruler follows the map: `beat_grid()` is the pure layer (positions
+    from `beat_to_tick`, so non-uniform spacing falls out of the map
+    rather than being an effect; density ladder beats→bars→strided bars
+    keyed off the FASTEST visible section; 512-tick hostile-input cap;
+    4 tests incl. spacing across a 120→150 change and stride anchoring
+    at bar 1). `timeline()` takes `Option<&TempoMap>`: `Some` draws the
+    musical ruler (bars labelled 1-based, beats as texture), `None`
+    keeps the clock — and the shell passes the ACTIVE SONG's map only,
+    because the whole-project view has no single musical truth until
+    the project/rack tempo relationship is decided (C12-14e). TempoMap's
+    own docs already name the cursor-variant optimization if per-frame
+    beat_to_tick ever shows up; capped tick counts keep it moot today.
   - **Clip-stretching/alignment DSP.** Explicitly still hard, explicitly
     NOT "stretch every clip to the workspace tempo" — that's the
     antipattern `TempoMap` was designed around, not toward.
-  - **Export-popup wizard grouping.** By-section vs. chapters vs. a
-    single export, as a distinct grouping/wizard on the export popup —
-    ties into C12-14e below (what "export the album" means) but is its
-    own UI work regardless of how that question resolves.
-  - **Palette wiring for tempo.** "Set song tempo" doesn't exist yet in
-    `palette.rs` — should mirror "set song key"'s three-step shape
-    (`Ask::SongForKey` → root → scale becomes something equivalent for
-    a BPM value or a tap-tempo entry) now that `SetGroupTempo` is
-    verified, the same order C12-14a/14d already followed.
-- **C12-14e — what "the whole project" means once songs exist.** Export
-  (`bounce`), the mixer, and anything that currently assumes one
-  timeline for the whole project need a decision: does exporting "the
-  album" concatenate every song's timeline, or is each song exported
-  independently and the album is an organizational container only?
-  Affects `studio-app`'s export flow, not yet looked at.
+  - **Export-popup wizard grouping — the per-song half landed with
+    C12-14e's `Scope::EachSong` (see below); by-section/chapters beyond
+    per-song remains open, and now has a settled foundation to extend
+    (another Scope variant producing Jobs, same pure planner).**
+  - **Palette wiring for tempo — closed (`4b4f6ada`).** "set song tempo"
+    mirrors "set song key"'s walk, one step shorter: song, then a BPM
+    from a curated ladder (60–174, the list doubling as a readout of
+    each song's current tempo), landing on `Op::SetGroupTempo` with
+    `TempoMap::constant`, plus "clear (follow the project)" → `None`.
+    Tested to land on the group op, never project-wide. Tap-tempo and
+    free numeric entry remain open — both are one more candidate row
+    on the same `SongTempoPick` step, no new op.
+- **C12-14e — DECIDED and first slice landed: the album is an
+  organizational container; songs export independently.** Rationale (in
+  `Scope::EachSong`'s docs): a concatenated single-file album would
+  invent an ordering and a gaplessness the model never stated, and
+  distribution wants per-track files; "whole timeline as one file"
+  already exists as `Scope::Full`, untouched. `Scope::EachSong`: one
+  job per song, TIMELINE order (the one ordering the model expresses),
+  span = the group's clip hull, named after the song with id
+  disambiguation on duplicates. The governing principle — a song's
+  export is its SPAN of the arrangement, exactly what playback of that
+  span plays — cuts both ways: ungrouped material inside the span is
+  included, and two songs sharing a time range are REFUSED out loud
+  (their files would bleed into each other) rather than shipped as a
+  surprise. Stems×EachSong refused with the workaround named. Dialog
+  shows "each song", greyed (not hidden) without songs. Six new
+  assertions across three tests. STILL OPEN from the original item:
+  the mixer's own per-song awareness, and the export-popup's
+  by-section/chapters refinement beyond this per-song grouping.
+
+## 14g. studio, c13 session: presence sends, ghosts sweep, rooms exist
+
+Three things this queue's studio sections implied but never listed:
+
+- **Presence had no sending half (`d3304ab5`).** The timeline drew peer
+  playheads since the wire existed and drew an empty room between two
+  real shells. `Studio::presence_beat` (change-triggered, rate-limited,
+  heartbeat at LIVENESS_MS/3), `Packet::Presence` routed through
+  `Session::presence` (was `doc.presence` — the exact bypass its own doc
+  warns about), and `Session.heard` + sweep pruning for presence-only
+  ghosts (the wire has no join packet, so silence is the only leave an
+  ad-hoc peer ever sends). Shell sweeps and beats in the carrier block.
+- **Workspaces (`4b4f6ada`).** The dashboard/workspace/workflow decision:
+  presets over existing primitives, rationale in `workspace.rs`' docs.
+  C-1..C-4, palette entries, sidecar-vocabulary, camera untouched. Panel
+  tabs go through `responsive_nav` (studio is its third adopter);
+  compact width gets a picker so no panel is unreachable.
+- **Keybind customization — closed (`42c2cb2d`).** Rebinds as a raw-input
+  translation (pressed→effective, one step, identity-is-absence,
+  codepoint-encoded in the sidecar because , . < > are the likeliest
+  targets), applied once in the shell's typed loop; the palette's
+  Act::Key deliberately bypasses it. Settings press-to-capture section
+  over eight everyday verbs, keys_for() readout, reset-all. STILL OPEN
+  from it: hints (CLIP_HINTS, palette hint column) show defaults —
+  rebind-aware hints across every key-printing surface is its own item.
+- **gesture-kit extracted (`shared/gesture-kit`).** snapclone's two-tier
+  over-scroll model, moved at its second call site per the house rule;
+  `apps/snapclone`'s crate is now a re-export + its FFI seam (11 kit
+  tests + 4 ffi tests green). `system/snapclone`'s copy deliberately
+  untouched — that tree's divergence is SNAPCLONE_TWO_TREES.md's thread,
+  not this one. studio-egui gained `touch::PanelNav` (detent→neighbour
+  panel, clamped never wrapped, tested) as the DECISION layer only.
+  Shell wiring — DONE, with the risk profile inverted rather than
+  accepted. `scroll_edge::classify` (pure, tested) gates the gesture:
+  any frame the offset MOVED is normal scrolling regardless of deltas,
+  so the feared failure (panels jumping mid-scroll) is structurally
+  excluded, not merely unlikely; the three panels' show() return a
+  ScrollReport from their own ScrollAreaOutput (offset vs content size,
+  frame-to-frame offset memory in egui temp data keyed by area id); the
+  central panel is the only reporter the nav reads (side-slot/workbench
+  copies discard theirs), the timeline never reports, and pages_mode is
+  recomputed from real width every frame. A pane with no scroll room is
+  at both limits and pages both ways — the phone-height mixer case,
+  pinned by test. STILL UNVERIFIED (needs a display): whether egui 0.34
+  leaves smooth_scroll_delta readable beside a consuming ScrollArea; if
+  not, the failure direction is SAFE — over-scroll never fires and the
+  compact picker remains the route.
+- **Perf (`42c2cb2d`):** library sidebar's per-frame DirListing clones
+  removed (ensure+borrow, arrange over refs); presence_beat compares
+  before building. Both were every-frame paths; neither was measured
+  end-to-end — the fixes are allocation-shape arguments, honestly.
+
+## 14h. studio, c13 continued: shared pattern packs and calibrated piano zones
+
+Two asks landed in one stretch, plus their named leftovers:
+
+- **Pattern packs (`pattern_pack.rs`).** The shareable unit is pattern +
+  channels + the sample FILES (the compressed originals — import_audio's
+  own rule). Own small container (magic/length/whole-file refusal, JSON
+  meta + binary media; Pattern's tuple-keyed maps flattened for JSON —
+  the wire's hand-rolled binary never met that, serde_json does), NOT a
+  bent .studioarch: an archive means "reopen this session", a pack means
+  "drop this loop into a DIFFERENT session". Publishing IS placement in
+  `$XDG_CACHE_HOME/studio-live` (`$STUDIO_LIVE_CACHE` overrides; ~/.cache
+  fallback) — no second public/private flag to disagree with where the
+  file is; a pack is also just a file to throw around. Import mints
+  sources through ordinary ops and SHIFTS rows/mods/rolls by the
+  importing rack's channel count (pinned by test — an off-by-one plays
+  the hat pattern on the kick); tempo/swing deliberately not adopted.
+  Palette: "share pattern with other projects" (acts on the CURRENT
+  pattern — the 'split at playhead' simplification, because a wizard
+  would need candidates() to see the Rack, a 25-call-site signature
+  change), "import shared pattern" (candidates read the cache — the one
+  fs-reading candidate list, on purpose: the shelf IS a directory).
+  STILL OPEN: the library-sidebar "patterns" section (per-project rows +
+  the shared shelf with share/import buttons) — palette-only today; and
+  candidates() seeing the Rack, which unlocks share-any-pattern wizards.
+- **Piano zones (`playkeys::Zones`/`Calibration`).** The layout was
+  ALREADY physical-position based (Dvorak/AZERTY safe) and analog-kit
+  was ALREADY wired (WootingAnalog in the shell — skydribble's POC was
+  extracted in c9); what was missing was the step beyond: per-device
+  calibrated regions, several physical keys per piano key (a fingertip
+  between keycaps still plays the note it aimed at). Calibration walk in
+  Settings: press every key that should mean C, Enter, C#, … — closing
+  mid-walk KEEPS the half-calibration (zones first, tracker fallback, so
+  it always plays). Saved in the sidecar as codepoints beside rebinds.
+  STILL OPEN: nothing structural; a display session should feel the
+  velocity curve and the region widths.
 
 ## 15. responsive_nav: two apps done, and a bug found along the way
 

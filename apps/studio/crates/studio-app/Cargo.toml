@@ -18,6 +18,8 @@ studio-fx = { path = "../studio-fx" }
 studio-voice = { path = "../studio-voice" }
 studio-media = { path = "../studio-media" }
 studio-video = { path = "../studio-video" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 studio-copilot = { path = "../studio-copilot" }
 voiceprint-kit = { path = "../../../../shared/voiceprint-kit" }
 analog-kit = { path = "../../../../shared/analog-kit" }

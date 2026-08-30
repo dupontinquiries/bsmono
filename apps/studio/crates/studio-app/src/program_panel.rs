@@ -24,7 +24,8 @@ const ROWS: usize = 49;
 /// audition sink reports (already wrapped), or `None` when stopped — the
 /// same value the Rack tab draws, so the two tabs agree about where the
 /// music is.
-pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Option<u32>) {
+pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Option<u32>)
+    -> crate::scroll_edge::ScrollReport {
     let before = s.rack.clone();
 
     // ── channel row ─────────────────────────────────────────────────────
@@ -47,14 +48,14 @@ pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Opti
 
     let Some(pattern) = s.rack.patterns.get(s.current_pattern) else {
         ui.colored_label(c.text_weak, "No pattern. Add one on the Rack tab.");
-        return;
+        return crate::scroll_edge::ScrollReport::default();
     };
     let pattern = pattern.clone(); // the view takes &Pattern; edits come back as values
     let channel = s.selected_channel;
 
     // ── the roll ────────────────────────────────────────────────────────
     let mut edits = Vec::new();
-    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+    let out = egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
         edits = roll::roll(ui, &pattern, channel, TOP, ROWS,
                            &mut s.roll_drag, playhead,
                            s.session.doc.project.key,
@@ -82,4 +83,5 @@ pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors, playhead: Opti
     if s.rack != before {
         s.loop_dirty = true;
     }
+    crate::scroll_edge::report(ui, &out)
 }

@@ -9,6 +9,9 @@ description = "Studio's timeline UI on uikit-egui: tracks, clips, ruler, and the
 # the pattern, and a second definition of what a step is would drift from the
 # one the audio thread reads.
 studio-live = { path = "../studio-live" }
+# The over-scroll detent model, at its second call site — the extraction
+# that moved it to shared/. Decision logic only; the shell owns scrollbars.
+gesture-kit = { path = "../../../../shared/gesture-kit" }
 # The transcript index and routine repertoire. A dependency rather than a copy:
 # the palette is a VIEW of the repertoire, and a second notion of what a routine
 # is would drift from the one that actually runs.

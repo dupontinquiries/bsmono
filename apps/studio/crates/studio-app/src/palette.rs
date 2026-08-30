@@ -58,6 +58,20 @@ pub enum ShellVerb {
     ToggleLibrary,
     /// Make the timeline show this song (`None` = the whole project).
     SwitchSong(Option<studio_core::GroupId>),
+    /// Put the shell in one of the named rooms (`workspace::LAYOUTS`
+    /// order — the same index `C-1`..`C-4` reaches).
+    Workspace(u8),
+    /// Publish the CURRENT rack pattern to the machine-wide cache
+    /// (`pattern_pack::cache_dir()`), where every project's palette can
+    /// import it. Acts on the pattern being edited — the same "verbs act
+    /// on where you are" simplification 'split at playhead' uses.
+    SharePattern,
+    /// Import the i-th pack from the cache's name-sorted listing. The
+    /// index is resolved against a FRESH listing at act time; a pack
+    /// removed between the menu and the choice simply misses, with a
+    /// status line, never imports the wrong one silently (names are
+    /// re-checked).
+    ImportPack(u8),
 }
 
 /// One offer in the current step.
@@ -114,7 +128,27 @@ pub enum Ask {
     SongKeyRootPick(studio_core::GroupId),
     /// …then which scale (carries song and root).
     SongKeyScale(studio_core::GroupId, u8),
+    /// Which song to set a tempo for…
+    SongForTempo,
+    /// …then which BPM (carries the chosen song) — the same shape as
+    /// the key's root/scale walk, one step shorter.
+    SongTempoPick(studio_core::GroupId),
+    /// Which shared pack to import — enumerated from the cache, the one
+    /// candidate list that reads the filesystem rather than the project
+    /// (the shelf IS a directory; pretending otherwise would just move
+    /// the read somewhere less visible).
+    SharedPack,
 }
+
+/// The BPMs the tempo step offers. A curated ladder, not a free-text
+/// field: the palette is choices matched by typing, and typing "140"
+/// against this list IS entering a BPM — while staying resolvable by
+/// voice and never needing a numeric parser with its empty/garbage
+/// cases. Spans the genres the rack ships kits for (70 half-time trap
+/// through 174 DnB); an in-between tempo is one `SetGroupTempo` op away
+/// for a future numeric entry, on the same op this path already uses.
+pub const TEMPO_LADDER: [u16; 16] =
+    [60, 70, 75, 80, 85, 90, 95, 100, 110, 120, 128, 130, 140, 150, 160, 174];
 
 fn db(gain: f32, delta_db: i8) -> f32 {
     (gain * 10f32.powf(delta_db as f32 / 20.0)).clamp(0.0, 8.0)
@@ -131,6 +165,10 @@ pub fn root() -> Vec<Choice> {
         c("set project key", None, Then::Ask(Ask::KeyRoot)),
         c("switch song", None, Then::Ask(Ask::SwitchSong)),
         c("set song key", None, Then::Ask(Ask::SongForKey)),
+        c("set song tempo", None, Then::Ask(Ask::SongForTempo)),
+        c("share pattern with other projects", None,
+          Then::Do(Act::Shell(ShellVerb::SharePattern))),
+        c("import shared pattern", None, Then::Ask(Ask::SharedPack)),
         c("voice vocabulary (genre words)", None, Then::Ask(Ask::VoiceVocab)),
         c("toggle out-of-key dimming", None,
           Then::Do(Act::Shell(ShellVerb::ToggleKeyGuide))),
@@ -164,6 +202,14 @@ pub fn root() -> Vec<Choice> {
         c("save archive…", None, Then::Do(Act::Shell(ShellVerb::ArchiveDialog))),
         c("export…", None, Then::Do(Act::Shell(ShellVerb::ExportDialog))),
         c("settings…", None, Then::Do(Act::Shell(ShellVerb::Settings))),
+        c("workspace: edit (arrange & trim)", Some("C-1"),
+          Then::Do(Act::Shell(ShellVerb::Workspace(0)))),
+        c("workspace: beat (rack & samples)", Some("C-2"),
+          Then::Do(Act::Shell(ShellVerb::Workspace(1)))),
+        c("workspace: mix (faders)", Some("C-3"),
+          Then::Do(Act::Shell(ShellVerb::Workspace(2)))),
+        c("workspace: perform (workbench)", Some("C-4"),
+          Then::Do(Act::Shell(ShellVerb::Workspace(3)))),
         c("toggle workbench layout", None, Then::Do(Act::Shell(ShellVerb::ToggleWorkbench))),
         c("toggle library sidebar", None, Then::Do(Act::Shell(ShellVerb::ToggleLibrary))),
         c("go to timeline", None, Then::Do(Act::Panel(studio_egui::touch::Panel::Timeline))),
@@ -200,6 +246,41 @@ pub fn candidates(ask: Ask, project: &Project) -> Vec<Choice> {
             // once a song has been picked.
             out.push(plain("whole project".into(),
                 Then::Do(Act::Shell(ShellVerb::SwitchSong(None)))));
+            out
+        }
+        Ask::SharedPack => {
+            let shelf = crate::pattern_pack::list(&crate::pattern_pack::cache_dir());
+            if shelf.is_empty() {
+                return vec![plain("(nothing shared yet — 'share pattern' \
+                                   publishes the one you're on)".into(),
+                    Then::Do(Act::Shell(ShellVerb::ImportPack(u8::MAX))))];
+            }
+            shelf.into_iter().enumerate()
+                .map(|(i, (name, _))| plain(name,
+                    Then::Do(Act::Shell(ShellVerb::ImportPack(i as u8)))))
+                .collect()
+        }
+        Ask::SongForTempo => project.groups.iter()
+            .map(|(id, g)| plain(
+                match &g.tempo {
+                    // Show the song's current tempo the way the key step
+                    // shows its key — the list doubles as a readout.
+                    Some(t) => format!("{} ({:.0} bpm)", g.name, t.bpm_at(studio_core::Ticks::ZERO)),
+                    None => g.name.clone(),
+                },
+                Then::Ask(Ask::SongTempoPick(*id))))
+            .collect(),
+        Ask::SongTempoPick(song) => {
+            let mut out: Vec<Choice> = TEMPO_LADDER.iter()
+                .map(|bpm| plain(format!("{bpm} bpm"), Then::Do(Act::Ops(vec![
+                    Op::SetGroupTempo { id: song,
+                        tempo: Some(studio_core::TempoMap::constant(*bpm as f32)) }]))))
+                .collect();
+            // The way back out: a song whose tempo override should go away
+            // again. `None` here means "no opinion", the same meaning the
+            // key's None carries — never "wrong".
+            out.push(plain("clear (follow the project)".into(),
+                Then::Do(Act::Ops(vec![Op::SetGroupTempo { id: song, tempo: None }]))));
             out
         }
         Ask::SongForKey => project.groups.iter()
@@ -459,6 +540,39 @@ mod tests {
         let p = project();
         let act = Palette::resolve(&p, &["switch song", "whole project"]).expect("resolves");
         assert_eq!(act, Act::Shell(ShellVerb::SwitchSong(None)));
+    }
+
+
+    /// C12-14f's palette wiring: "set song tempo" mirrors "set song key"'s
+    /// walk (one step shorter — song, then BPM), lands on Op::SetGroupTempo
+    /// with a constant TempoMap, and offers the way OUT (clear -> None) the
+    /// same way switch-song always offers "whole project".
+    #[test]
+    fn set_song_tempo_walks_song_then_bpm_and_clears() {
+        let p = project_with_groups();
+        let act = Palette::resolve(&p, &["set song tempo", "track 1", "140"])
+            .expect("resolves");
+        assert_eq!(act, Act::Ops(vec![Op::SetGroupTempo {
+            id: studio_core::GroupId(1),
+            tempo: Some(studio_core::TempoMap::constant(140.0)) }]));
+        // Never the project-wide tempo — same discipline as the key test.
+        let clear = Palette::resolve(&p, &["set song tempo", "track 1", "clear"])
+            .expect("resolves");
+        assert_eq!(clear, Act::Ops(vec![Op::SetGroupTempo {
+            id: studio_core::GroupId(1), tempo: None }]),
+            "clear means no opinion, the meaning None already has");
+    }
+
+    /// The workspaces resolve by name and carry the same index the C-1..C-4
+    /// chord reaches — the palette teaching the shortcut, as its hints
+    /// column promises.
+    #[test]
+    fn workspaces_resolve_by_room_name() {
+        let p = project();
+        assert_eq!(Palette::resolve(&p, &["workspace beat"]).expect("resolves"),
+                   Act::Shell(ShellVerb::Workspace(1)));
+        assert_eq!(Palette::resolve(&p, &["workspace mix"]).expect("resolves"),
+                   Act::Shell(ShellVerb::Workspace(2)));
     }
 
     #[test]

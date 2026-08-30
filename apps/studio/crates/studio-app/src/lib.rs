@@ -32,6 +32,9 @@ pub mod project_dir;
 pub mod viewport;
 pub mod voice;
 pub mod workspace;
+pub mod rebinds;
+pub mod scroll_edge;
+pub mod pattern_pack;
 pub mod rack_panel;
 
 /// Everything the running editor holds.
@@ -151,6 +154,19 @@ pub struct Studio {
     pub trim_side: studio_egui::TrimSide,
     /// Set by the panel's bounce button; the shell performs it.
     pub pending_bounce: bool,
+    /// What this device's person is called in presence packets — per device
+    /// (it rides the workspace sidecar), because the same account on a phone
+    /// and a desktop may legitimately want "kes (phone)" vs "kes". Empty
+    /// means "site N", never an error.
+    pub display_name: String,
+    /// Monotonic stamp for outgoing presence, so a reordered packet cannot
+    /// resurrect a stale playhead on a peer — the receiving side's `seq`
+    /// check is only as good as the sender's discipline here.
+    presence_seq: u64,
+    /// What we last shipped, compared by content to decide whether anything
+    /// worth announcing changed.
+    last_presence: Option<studio_collab::Presence>,
+    last_presence_ms: i64,
 }
 
 impl Studio {
@@ -197,6 +213,10 @@ impl Studio {
             octave: 0,
             trim_side: studio_egui::TrimSide::default(),
             pending_bounce: false,
+            display_name: String::new(),
+            presence_seq: 0,
+            last_presence: None,
+            last_presence_ms: i64::MIN / 2,
         }
     }
 
@@ -510,6 +530,60 @@ impl Studio {
         Ok(s)
     }
 
+    /// The outgoing half of presence. [`Studio::integrate_packet`] has merged
+    /// peers' whereabouts since the wire existed, but nothing ever SENT ours —
+    /// two connected shells each drew an empty room, and the timeline's
+    /// peer-playhead rendering was dead code between real instances. The shell
+    /// calls this once per frame with the wall clock; it returns a packet when
+    /// where-we-are changed (rate-limited so a scrub is ~10 packets a second,
+    /// not sixty) or when the heartbeat is due, and `None` the rest of the
+    /// time. The heartbeat matters independently of change: presence is the
+    /// only sign of life the wire carries (there is no join packet), so a
+    /// reader parked on one frame must still beat inside the sweep's
+    /// `LIVENESS_MS` window or be swept as a ghost by every peer.
+    pub fn presence_beat(&mut self, now_ms: i64) -> Option<studio_collab::wire::Packet> {
+        const MIN_GAP_MS: i64 = 100;
+        // Three beats per liveness window — one lost packet must not read
+        // as a departure.
+        const HEARTBEAT_MS: i64 = studio_collab::session::LIVENESS_MS / 3;
+        // Compare BEFORE building: this runs every frame, and the idle
+        // path — almost every frame — must not clone the selection and
+        // format a name just to throw them away.
+        let playhead = self.playhead();
+        // The track being worked in, derived from the selection rather
+        // than tracked separately: the first selected clip's home is
+        // where a collision would happen.
+        let active_track = self.selection.first().and_then(|id|
+            self.session.doc.project.clips.get(id).map(|c| c.track));
+        let changed = match &self.last_presence {
+            None => true,
+            Some(last) => last.playhead != playhead
+                || last.selection != self.selection
+                || last.active_track != active_track
+                || (self.display_name.is_empty() != last.name.starts_with("site "))
+                || (!self.display_name.is_empty() && last.name != self.display_name),
+        };
+        let due = now_ms - self.last_presence_ms >= HEARTBEAT_MS;
+        if !(due || (changed && now_ms - self.last_presence_ms >= MIN_GAP_MS)) {
+            return None;
+        }
+        let name = if self.display_name.is_empty() {
+            format!("site {}", self.session.doc.site.0)
+        } else { self.display_name.clone() };
+        let cur = studio_collab::Presence {
+            site: self.session.doc.site,
+            name,
+            playhead,
+            selection: self.selection.clone(),
+            active_track,
+            seq: self.presence_seq + 1,
+        };
+        self.presence_seq += 1;
+        self.last_presence = Some(cur.clone());
+        self.last_presence_ms = now_ms;
+        Some(studio_collab::wire::Packet::Presence(cur))
+    }
+
     /// Everything local since the last drain, for any carrier to ship.
     pub fn drain_outbox(&mut self) -> Vec<studio_collab::wire::Packet> {
         std::mem::take(&mut self.outbox)
@@ -641,7 +715,7 @@ impl Studio {
 
     /// Feed one packet from a peer. Returns any reply packets (a `Hello`
     /// earns a catch-up; assets earn their fetch steps; the rest is silent).
-    pub fn integrate_packet(&mut self, p: studio_collab::wire::Packet)
+    pub fn integrate_packet(&mut self, p: studio_collab::wire::Packet, now_ms: i64)
         -> Vec<studio_collab::wire::Packet>
     {
         use studio_collab::wire::Packet;
@@ -739,7 +813,12 @@ impl Studio {
                 Vec::new()
             }
             Packet::Presence(pr) => {
-                self.session.doc.presence(pr);
+                // Through the SESSION, not the doc: `Session::presence` is
+                // the doc merge PLUS the sign-of-life accounting the sweep
+                // reads. Routing around it (as this arm originally did) is
+                // exactly how "a peer who is actively scrubbing gets swept
+                // for silence" — its own doc-comment's warning.
+                self.session.presence(pr, now_ms);
                 Vec::new()
             }
             Packet::Hello { since, .. } => {
@@ -1173,6 +1252,186 @@ impl Studio {
         Some(id)
     }
 
+    /// Land a VIDEO on the timeline: the C12-6a join, finally legal to
+    /// make because `studio_video::frame_rgb` + the viewport can decode
+    /// and display a frame (the gate that section set). The source is the
+    /// video FILE — `has_video: true`, length from the probe (a video may
+    /// outlast its own audio) — and the clip lands on a video track at the
+    /// playhead. Where `import_clip` REFUSES when no audio track has room,
+    /// this CREATES a video track when none has room: §6's own words are
+    /// "give the timeline a video track to put it on", video tracks are
+    /// scarce where audio tracks are plentiful, and the AddTrack is an
+    /// ordinary undoable op either way. The audio half, when the container
+    /// has one, is the caller's to decode (ffmpeg lives in the shell's
+    /// world); passing `audio_rate`/`audio_channels` here keeps this
+    /// method headless and testable without a subprocess.
+    pub fn import_video_clip(
+        &mut self,
+        name: &str,
+        path: &str,
+        len: Ticks,
+        audio: Option<(u32, u16)>,
+    ) -> Option<studio_core::SourceId> {
+        if len <= Ticks::ZERO {
+            self.status = format!("'{name}' has no duration — probe failed?");
+            return None;
+        }
+        let at = self.playhead();
+        let end = Ticks(at.0 + len.0);
+        let project = &self.session.doc.project;
+        let track = project.tracks.iter()
+            .filter(|t| t.kind == studio_core::TrackKind::Video)
+            .find(|t| !project.clips.values()
+                .any(|c| c.track == t.id && c.pos < end && c.end() > at))
+            .map(|t| t.id);
+        let track = match track {
+            Some(t) => t,
+            None => {
+                let tid = studio_core::TrackId(
+                    project.tracks.iter().map(|t| t.id.0).max().unwrap_or(0) + 1);
+                let n = project.tracks.iter()
+                    .filter(|t| t.kind == studio_core::TrackKind::Video).count() + 1;
+                self.edit(studio_core::Op::AddTrack {
+                    track: studio_core::Track {
+                        id: tid, kind: studio_core::TrackKind::Video,
+                        name: format!("V{n}"), muted: false, locked: false,
+                        gain: 1.0, route: None },
+                    at: 0, // video on top: the timeline's own drawing convention
+                }, "video track");
+                tid
+            }
+        };
+        let (sample_rate, channels) = audio.unwrap_or((48_000, 0));
+        let project = &self.session.doc.project;
+        let id = studio_core::SourceId(
+            project.sources.keys().map(|s| s.0).max().unwrap_or(0) + 1);
+        let clip = studio_core::ClipId(
+            project.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1);
+        self.edit(studio_core::Op::AddSource {
+            source: studio_core::Source {
+                id, path: path.into(), len,
+                sample_rate, channels,
+                has_video: true,
+            },
+        }, "imported");
+        self.edit(studio_core::Op::AddClip {
+            clip: studio_core::Clip {
+                id: clip, source: id, track,
+                pos: at, src_in: Ticks::ZERO, len,
+                gain: 1.0, effects: Vec::new(),
+            },
+        }, "imported");
+        self.status = format!("imported '{name}' — picture on the video track");
+        Some(id)
+    }
+
+
+    /// Pack one rack pattern for sharing: the pattern, the channels it
+    /// fires, and — for `Sampler` channels — the sample FILES read back
+    /// from each source's path (the compact representation IS the file,
+    /// `import_audio`'s own rule). A missing file refuses the whole pack:
+    /// a loop that ships without its kick is worse than no loop.
+    pub fn export_pattern_pack(&self, pattern_ix: usize)
+        -> Result<pattern_pack::PatternPack, String>
+    {
+        let p = self.rack.patterns.get(pattern_ix)
+            .ok_or_else(|| "no such pattern".to_string())?;
+        let mut media_meta = Vec::new();
+        let mut media = Vec::new();
+        for ch in &self.rack.channels {
+            if let studio_live::SynthKind::Sampler { source } = ch.kind {
+                if media_meta.iter().any(|(id, _)| *id == source.0) { continue; }
+                let src = self.session.doc.project.sources.get(&source)
+                    .ok_or_else(|| format!("channel '{}' references a source the \
+                                            project no longer has", ch.name))?;
+                let bytes = std::fs::read(&src.path)
+                    .map_err(|e| format!("'{}': {e} — the pack would ship without \
+                                          its sample", src.path))?;
+                let hint = std::path::Path::new(&src.path).file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "sample".into());
+                media_meta.push((source.0, hint));
+                media.push(bytes);
+            }
+        }
+        Ok(pattern_pack::PatternPack {
+            meta: pattern_pack::PackMeta {
+                name: if p.name.is_empty() {
+                    format!("pattern {}", pattern_ix + 1)
+                } else { p.name.clone() },
+                tempo_bpm: self.rack.tempo_bpm,
+                swing: self.rack.swing,
+                channels: self.rack.channels.clone(),
+                pattern: pattern_pack::PatternFlat::from_pattern(p),
+                media: media_meta,
+            },
+            media,
+        })
+    }
+
+    /// Drop a pack's loop into THIS project: fresh sources minted through
+    /// ordinary `AddSource` ops (so peers converge and undo works),
+    /// `Sampler` channels rewritten to them, channels appended, and the
+    /// pattern's rows/mods/rolls SHIFTED by the existing channel count —
+    /// they are indexed by position, and an off-by-one here plays the hat
+    /// pattern on the kick. Returns the decoded audio + raw bytes per new
+    /// source for the shell to land in peaks/audio and register as assets.
+    /// Tempo/swing are deliberately NOT adopted: an import is "this loop,
+    /// in my session", not "my session, at their tempo".
+    pub fn import_pattern_pack(&mut self, pack: pattern_pack::PatternPack)
+        -> Result<Vec<(studio_core::SourceId, studio_audio::SourceAudio, Vec<u8>)>, String>
+    {
+        let mut remap: std::collections::BTreeMap<u64, studio_core::SourceId> =
+            Default::default();
+        let mut landed = Vec::new();
+        for ((old, hint), raw) in pack.meta.media.iter().zip(&pack.media) {
+            let ext = std::path::Path::new(hint).extension()
+                .and_then(|e| e.to_str());
+            let audio = studio_media::decode_bytes(raw.clone(), ext)
+                .map_err(|e| format!("'{hint}': {e}"))?;
+            let id = studio_core::SourceId(
+                self.session.doc.project.sources.keys()
+                    .map(|s| s.0).max().unwrap_or(0) + 1);
+            self.edit(studio_core::Op::AddSource {
+                source: studio_core::Source {
+                    id, path: hint.clone(),
+                    len: Ticks::from_samples(audio.frames() as i64, audio.sample_rate),
+                    sample_rate: audio.sample_rate,
+                    channels: audio.channels.len() as u16,
+                    has_video: false,
+                },
+            }, "pack sample");
+            remap.insert(*old, id);
+            landed.push((id, audio, raw.clone()));
+        }
+        let base = self.rack.channels.len();
+        for ch in &pack.meta.channels {
+            let mut ch = ch.clone();
+            if let studio_live::SynthKind::Sampler { source } = &mut ch.kind {
+                *source = *remap.get(&source.0)
+                    .ok_or_else(|| format!("channel '{}' references media the \
+                                            pack does not carry", ch.name))?;
+            }
+            self.rack.channels.push(ch);
+        }
+        let mut p = pack.meta.pattern.into_pattern();
+        p.rows = {
+            let mut rows = vec![0u64; base];
+            rows.extend(p.rows);
+            rows
+        };
+        p.mods = p.mods.into_iter()
+            .map(|((ch, st), m)| ((ch + base, st), m)).collect();
+        p.rolls = p.rolls.into_iter()
+            .map(|(ch, n)| (ch + base, n)).collect();
+        let name = p.name.clone();
+        self.rack.patterns.push(p);
+        self.current_pattern = self.rack.patterns.len() - 1;
+        self.loop_dirty = true;
+        self.status = format!("imported '{name}' — {} new channels", pack.meta.channels.len());
+        Ok(landed)
+    }
+
     /// Render the current pattern's loop at `rate` — what the audition sink
     /// plays and what a bounce stores. One function so they cannot drift.
     pub fn render_loop(
@@ -1275,6 +1534,204 @@ impl Studio {
 mod tests {
     use super::*;
     use studio_egui::keys::Key;
+
+
+    /// The presence beat: the SENDING half. The receive path (integrate ->
+    /// session -> doc -> timeline ghost playheads) existed for a long time
+    /// with nothing on the other end — this pins down the contract that
+    /// makes it live: first call sends, silence is cheap, change is fast
+    /// (but rate-limited), and the heartbeat always lands inside the sweep
+    /// window even when nothing moves.
+    #[test]
+    fn presence_beat_sends_changes_and_heartbeats_but_not_every_frame() {
+        let mut s = Studio::demo();
+        // First call: always sends — peers know we exist.
+        let first = s.presence_beat(10_000).expect("first beat sends");
+        let pr = match first {
+            studio_collab::wire::Packet::Presence(pr) => pr,
+            other => panic!("expected Presence, got {other:?}"),
+        };
+        assert_eq!(pr.site, s.session.doc.site);
+        assert_eq!(pr.name, format!("site {}", s.session.doc.site.0),
+                   "empty display_name falls back, never sends an empty string");
+        assert_eq!(pr.seq, 1);
+
+        // Nothing changed, heartbeat not due: an idle shell is near-silent.
+        assert!(s.presence_beat(10_016).is_none(), "16ms later, idle: no packet");
+
+        // The playhead moved right after a send: news, but rate-limited —
+        // the gap counts from the LAST SEND, so a scrub is ~10 pkt/s, not 60.
+        s.transport.set_position(studio_core::Ticks::from_seconds(3.0));
+        assert!(s.presence_beat(10_050).is_none(),
+                "changed but only 50ms since the last send: held");
+        let moved = s.presence_beat(10_120).expect("past the gap: the move ships");
+        match moved {
+            studio_collab::wire::Packet::Presence(pr) => {
+                assert_eq!(pr.playhead, studio_core::Ticks::from_seconds(3.0));
+                assert_eq!(pr.seq, 2, "seq is monotonic");
+            }
+            other => panic!("expected Presence, got {other:?}"),
+        }
+
+        // Idle again — but the heartbeat must still beat inside LIVENESS_MS,
+        // or every peer sweeps us as a ghost while we sit and listen.
+        let hb = studio_collab::session::LIVENESS_MS / 3;
+        assert!(s.presence_beat(10_120 + hb - 1).is_none());
+        assert!(s.presence_beat(10_120 + hb).is_some(), "heartbeat due: sends unchanged state");
+        assert!(hb * 2 < studio_collab::session::LIVENESS_MS,
+                "two consecutive lost heartbeats still leave a beat inside the window");
+    }
+
+    /// Selection changes are presence too — the warning edge peers draw
+    /// around a clip someone else is inside is only as fresh as this.
+    #[test]
+    fn presence_beat_announces_selection_and_derived_track() {
+        let mut s = Studio::demo();
+        s.presence_beat(0);
+        let (clip, track) = {
+            let (id, c) = s.session.doc.project.clips.iter().next()
+                .expect("demo project has clips");
+            (*id, c.track)
+        };
+        s.selection = vec![clip];
+        match s.presence_beat(1_000) {
+            Some(studio_collab::wire::Packet::Presence(pr)) => {
+                assert_eq!(pr.selection, vec![clip]);
+                assert_eq!(pr.active_track, Some(track),
+                           "active track derives from the first selected clip");
+            }
+            other => panic!("selection change must ship: {other:?}"),
+        }
+    }
+
+
+    /// C12-6a's join, headless: a video import carries has_video: true and
+    /// lands on a video track — creating one when none has room, because
+    /// §6's words are "give the timeline a video track to put it on" and
+    /// AddTrack is an ordinary undoable op.
+
+    /// The pack round trip through a real Studio: export from one, import
+    /// into another with a busy rack, and the loop plays on ITS channels —
+    /// rows, mods and rolls all shifted by the importing rack's channel
+    /// count, sources minted fresh through ops.
+    #[test]
+    fn a_pattern_pack_survives_the_project_border_with_indices_intact() {
+        // Exporter: trap kit + a sampler channel whose file exists on disk.
+        let dir = std::env::temp_dir()
+            .join(format!("stpack-io-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("clap.wav");
+        // A tiny valid WAV: studio_media must decode it on import.
+        let mut w = Vec::new();
+        let (rate, frames): (u32, u32) = (48_000, 8);
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + frames * 2).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes());   // PCM
+        w.extend_from_slice(&1u16.to_le_bytes());   // mono
+        w.extend_from_slice(&rate.to_le_bytes());
+        w.extend_from_slice(&(rate * 2).to_le_bytes());
+        w.extend_from_slice(&2u16.to_le_bytes());
+        w.extend_from_slice(&16u16.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(frames * 2).to_le_bytes());
+        for i in 0..frames { w.extend_from_slice(&((i as i16) * 100).to_le_bytes()); }
+        std::fs::write(&wav, &w).unwrap();
+
+        let mut a = Studio::demo();
+        let sid = studio_core::SourceId(
+            a.session.doc.project.sources.keys().map(|s| s.0).max().unwrap_or(0) + 1);
+        a.edit(studio_core::Op::AddSource { source: studio_core::Source {
+            id: sid, path: wav.display().to_string(),
+            len: studio_core::Ticks::from_samples(frames as i64, rate),
+            sample_rate: rate, channels: 1, has_video: false } }, "s");
+        a.rack.channels.push(studio_live::Channel {
+            name: "clap".into(),
+            kind: studio_live::SynthKind::Sampler { source: sid },
+            gain: 1.0, pan: 0.0, muted: false, choke_group: None });
+        let clap_ix = a.rack.channels.len() - 1;
+        let pat_ix = a.rack.patterns.len() - 1;
+        {
+            let p = &mut a.rack.patterns[pat_ix];
+            while p.rows.len() <= clap_ix { p.rows.push(0); }
+            p.rows[clap_ix] = 0b1010;
+            p.mods.insert((clap_ix, 1), studio_live::StepMod {
+                vel: 0.4, ..Default::default() });
+        }
+        let pack = a.export_pattern_pack(pat_ix).expect("exports");
+        assert_eq!(pack.media.len(), 1, "one sampler, one media entry");
+
+        // Importer: a different project whose rack already has channels —
+        // the shift everything below must survive.
+        let mut b = Studio::demo();
+        let base = b.rack.channels.len();
+        let landed = b.import_pattern_pack(
+            pattern_pack::PatternPack::decode(&pack.encode()).unwrap())
+            .expect("imports");
+        assert_eq!(landed.len(), 1);
+        let new_sid = landed[0].0;
+        assert!(b.session.doc.project.sources.contains_key(&new_sid),
+                "the source arrived as an ordinary op");
+        let p = b.rack.patterns.last().unwrap();
+        assert_eq!(p.rows.len(), base + pack.meta.channels.len());
+        assert!(p.rows[..base].iter().all(|r| *r == 0),
+                "the importing rack's own channels stay silent in the new pattern");
+        assert_eq!(p.rows[base + clap_ix], 0b1010,
+                   "the clap fires on the CLAP's shifted row");
+        assert_eq!(p.mods.get(&(base + clap_ix, 1)).map(|m| m.vel), Some(0.4),
+                   "mods shifted with their channel");
+        match b.rack.channels[base + clap_ix].kind {
+            studio_live::SynthKind::Sampler { source } =>
+                assert_eq!(source, new_sid, "the sampler points at the MINTED source"),
+            ref k => panic!("expected a sampler, got {k:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_video_import_keeps_its_picture_and_finds_or_makes_a_video_track() {
+        // Studio::demo() may or may not ship a video track; build bare.
+        let mut s = Studio::new(
+            studio_core::Project { name: "mv".into(), ..Default::default() },
+            SiteId(1), Team::from_contacts("solo", &["sc-local".into()]));
+        let len = studio_core::Ticks::from_seconds(12.0);
+        let id = s.import_video_clip("clip", "shoot/a.mp4", len, Some((48_000, 2)))
+            .expect("imports");
+        let (src_has_video, src_len, clip_track, video_tracks) = {
+            let p = &s.session.doc.project;
+            let src = &p.sources[&id];
+            let clip = p.clips.values().find(|c| c.source == id).expect("a clip landed");
+            (src.has_video, src.len, clip.track,
+             p.tracks.iter().filter(|t| t.kind == studio_core::TrackKind::Video).count())
+        };
+        assert!(src_has_video, "the whole point of C12-6a");
+        assert_eq!(src_len, len, "length from the probe, not the audio");
+        assert_eq!(s.session.doc.project.tracks.iter()
+                   .find(|t| t.id == clip_track).unwrap().kind,
+                   studio_core::TrackKind::Video,
+                   "picture goes on a video track, not an audio one");
+        assert_eq!(video_tracks, 1, "no video track existed, so exactly one was made");
+
+        // A second import at the same playhead: V1 is busy, so a SECOND
+        // video track appears rather than a refusal — video tracks are
+        // scarce where audio tracks are plentiful, and a music video with
+        // an overlay is two pictures at once on purpose.
+        let id2 = s.import_video_clip("overlay", "shoot/b.mp4",
+            studio_core::Ticks::from_seconds(3.0), None).expect("imports");
+        let clip2_track = s.session.doc.project.clips.values()
+            .find(|c| c.source == id2).unwrap().track;
+        assert_ne!(clip2_track, clip_track, "V1 had no room at the playhead");
+        assert_eq!(s.session.doc.project.tracks.iter()
+                   .filter(|t| t.kind == studio_core::TrackKind::Video).count(), 2);
+        // A soundless container (audio: None) still imports — its audio
+        // half is silence, its picture is the point.
+        assert_eq!(s.session.doc.project.sources[&id2].channels, 0);
+        // And the whole thing is ops: undo (through the keymap, the same
+        // door a person uses) removes the overlay clip again.
+        s.key(studio_egui::keys::Key::c('u'));
+        assert!(!s.session.doc.project.clips.values().any(|c| c.source == id2));
+    }
 
     #[test]
     fn each_song_remembers_its_own_camera() {
@@ -1440,6 +1897,21 @@ pub struct App {
     take_from: studio_core::Ticks,
     settings_open: bool,
     library_open: bool,
+    /// Pressed→effective key translations, applied to raw typed input
+    /// only (see the module docs for why the palette's keys bypass it).
+    rebinds: rebinds::Rebinds,
+    /// The settings popup is waiting for the next typed key to bind to
+    /// this action's default char. Consumes exactly one keypress.
+    rebind_capture: Option<char>,
+    /// Calibrated piano zones for playing mode; empty = tracker layout.
+    zones: studio_egui::playkeys::Zones,
+    /// The zone calibration walk, when running. Typed keys land on the
+    /// current note; Enter advances; closing Settings saves and stops.
+    piano_cal: Option<studio_egui::playkeys::Calibration>,
+    /// Pages-mode over-scroll navigation — the detent between panels on a
+    /// screen too narrow for tabs. Fed only from the CENTRAL panel's
+    /// scroll report, only when the nav actually chose Pages.
+    panel_nav: studio_egui::touch::PanelNav,
     /// The export dialog's plan while it is open, plus its last refusal —
     /// shown inline so a bad plan is a message, not a closed window.
     export_dialog: Option<export::Plan>,
@@ -1522,6 +1994,7 @@ impl Default for App {
             pinned: ws.pinned.iter().map(std::path::PathBuf::from).collect(),
             demoted: ws.demoted.iter().map(std::path::PathBuf::from).collect(),
         };
+        studio.display_name = ws.display_name.clone();
         studio.status = match load_note {
             Some(e) => format!("{e} — started fresh (Ctrl+S will overwrite!)"),
             None => format!("{} — audition: {}", studio.status, sink.describe()),
@@ -1565,7 +2038,11 @@ impl Default for App {
               find_ui: None,
               mic: capture::open_capture(),
               take_from: studio_core::Ticks::ZERO,
-              settings_open: false, library_open: true,
+              settings_open: false, library_open: ws.library_open,
+              rebinds: rebinds::Rebinds::decode(&ws.rebinds), rebind_capture: None,
+              panel_nav: Default::default(),
+              zones: studio_egui::playkeys::Zones::decode(&ws.piano_zones),
+              piano_cal: None,
               archive_ui: None,
               side_slot: match ws.side_slot.as_str() {
                   "off" => SideSlot::Off,
@@ -1613,10 +2090,48 @@ impl eframe::App for App {
                 None => Some(palette::Palette::open()),
             };
         }
+        // C-1..C-4: the workspaces. One keypress per room, the kdenlive
+        // habit; the palette lists them with these hints so the shortcut
+        // teaches itself.
+        for (i, key) in [egui::Key::Num1, egui::Key::Num2,
+                         egui::Key::Num3, egui::Key::Num4].iter().enumerate() {
+            if ctx.input_mut(|inp| inp.consume_key(egui::Modifiers::COMMAND, *key)) {
+                self.apply_layout(i);
+            }
+        }
         // While the palette is open it owns the keyboard — typing 'd' is a
         // search, not a delete.
         let typed: Vec<char> = if self.palette.is_some() { Vec::new() } else { typed };
+        // A running piano calibration eats every typed key: each one joins
+        // the current note's region. Enter advances the note; closing
+        // Settings (below) saves and stops.
+        let typed: Vec<char> = if let Some(cal) = &mut self.piano_cal {
+            for ch in &typed { cal.press(*ch); }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                cal.advance();
+            }
+            self.studio.status = format!("calibrating: press key(s) for {}, \
+                                          Enter for the next note", cal.note_name());
+            Vec::new()
+        } else { typed };
+        // A pending rebind capture eats exactly one key — the next thing
+        // typed IS the answer to "press the new key", not an edit.
+        let typed: Vec<char> = if let Some(target) = self.rebind_capture {
+            if let Some(ch) = typed.first() {
+                self.rebinds.set(*ch, target);
+                self.rebind_capture = None;
+                self.studio.status = if *ch == target {
+                    format!("{target:?} back to default")
+                } else {
+                    format!("{ch:?} now does what {target:?} did")
+                };
+            }
+            Vec::new()
+        } else { typed };
         for ch in typed {
+            // Rebinds translate RAW input only, before the intercepted keys
+            // and the keymap alike see it — one table, both consumers.
+            let ch = self.rebinds.resolve(ch);
             // The alignment keys, intercepted before the Helix keymap —
             // they need `self.audio` (the keymap cannot) and their chars
             // are pinned unbound in the keymap by test. Every one of them
@@ -1663,11 +2178,46 @@ impl eframe::App for App {
         }
 
         let colors = uikit_egui::palette_colors("midnight");
+        // Whether the top bar chose Pages this frame — read by the central
+        // panel below to gate over-scroll navigation. A local, not a field:
+        // it is one frame's fact, recomputed from real width every time.
+        let mut pages_mode = false;
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                for p in Panel::ALL {
-                    if ui.add(egui::Button::selectable(self.studio.panel == p, p.label())).clicked() {
-                        self.studio.panel = p;
+                // Tabs when the labels actually fit, a compact picker when
+                // they don't — decided from a WIDTH FIT via responsive_nav,
+                // not a device-class guess (its module doc explains why the
+                // guess is wrong in both directions). The reserve keeps the
+                // fit honest: the transport half of this bar needs room too,
+                // and "the tabs fit" while play/timecode wrap would be a
+                // lie about the same width.
+                const BAR_RESERVE: f32 = 260.0;
+                let fit = uikit_egui::responsive_nav::choose(
+                    (ui.available_width() - BAR_RESERVE).max(0.0),
+                    Panel::ALL.len(),
+                    uikit_egui::responsive_nav::DEFAULT_MIN_TAB_WIDTH);
+                pages_mode = fit == uikit_egui::responsive_nav::NavLayout::Pages;
+                match fit {
+                    uikit_egui::responsive_nav::NavLayout::Tabs => {
+                        for p in Panel::ALL {
+                            if ui.add(egui::Button::selectable(self.studio.panel == p, p.label())).clicked() {
+                                self.studio.panel = p;
+                            }
+                        }
+                    }
+                    uikit_egui::responsive_nav::NavLayout::Pages => {
+                        // One panel at a time on a screen this narrow; the
+                        // picker is the route between them. (The swipe layer
+                        // — snapclone's over-scroll detents — is the named
+                        // next step; the picker is the floor, so no panel is
+                        // ever unreachable. ambient-learner's lesson.)
+                        egui::ComboBox::from_id_salt("panel-pick")
+                            .selected_text(self.studio.panel.label())
+                            .show_ui(ui, |ui| {
+                                for p in Panel::ALL {
+                                    ui.selectable_value(&mut self.studio.panel, p, p.label());
+                                }
+                            });
                     }
                 }
                 ui.separator();
@@ -1790,6 +2340,10 @@ impl eframe::App for App {
                             .map(|p| p.display().to_string()).collect(),
                         demoted: self.library_prefs.demoted.iter()
                             .map(|p| p.display().to_string()).collect(),
+                        library_open: self.library_open,
+                        display_name: self.studio.display_name.clone(),
+                        rebinds: self.rebinds.encode(),
+                        piano_zones: self.zones.encode(),
                     });
                     // The directory must exist (and be ours) BEFORE the
                     // file is written: a save into a fresh project root
@@ -1888,6 +2442,78 @@ impl eframe::App for App {
             let mut open = true;
             egui::Window::new("Settings").open(&mut open).resizable(false)
                 .collapsible(false).show(ctx, |ui| {
+                    ui.label("keys — press rebind, then the new key:");
+                    // The actions worth offering: the everyday editing verbs.
+                    // Each row names the DEFAULT char; what currently reaches
+                    // it is read from the table, so a swap shows truthfully
+                    // on both rows. Not every keymap action — the point is
+                    // the keys people's hands disagree about, not a full
+                    // keymap editor (that stays a non-goal; see rebinds.rs).
+                    const REBINDABLE: [(&str, char); 8] = [
+                        ("delete selection", 'd'), ("split at playhead", 's'),
+                        ("yank", 'y'), ("paste", 'p'),
+                        ("undo", 'u'), ("redo", 'U'),
+                        ("align clips", 'A'), ("quantize clips", 'Q'),
+                    ];
+                    for (label, def) in REBINDABLE {
+                        ui.horizontal(|ui| {
+                            let now = self.rebinds.keys_for(def);
+                            let shown = if now.is_empty() { "(unbound!)".to_string() }
+                                else { now.iter().map(|c| format!("{c}"))
+                                          .collect::<Vec<_>>().join(" ") };
+                            let capturing = self.rebind_capture == Some(def);
+                            if ui.add(egui::Button::selectable(capturing,
+                                    if capturing { "press a key…" } else { "rebind" }))
+                                .clicked() {
+                                self.rebind_capture =
+                                    if capturing { None } else { Some(def) };
+                            }
+                            ui.monospace(shown);
+                            ui.label(label);
+                        });
+                    }
+                    if !self.rebinds.is_empty() && ui.button("reset all keys").clicked() {
+                        self.rebinds = rebinds::Rebinds::default();
+                        self.rebind_capture = None;
+                    }
+                    ui.colored_label(egui::Color32::GRAY,
+                        "raw keys only — the palette and its hints keep the defaults. \
+                         Saved per device with the workspace.");
+                    ui.separator();
+                    ui.label("piano keys — calibrate playing mode to YOUR hands:");
+                    ui.horizontal(|ui| {
+                        match &self.piano_cal {
+                            None => {
+                                if ui.button("calibrate").clicked() {
+                                    self.piano_cal = Some(Default::default());
+                                }
+                                ui.label(if self.zones.is_empty() {
+                                    "tracker layout (uncalibrated)".to_string()
+                                } else { "calibrated".to_string() });
+                                if !self.zones.is_empty() && ui.button("reset").clicked() {
+                                    self.zones = Default::default();
+                                }
+                            }
+                            Some(cal) => {
+                                ui.label(format!("press every key that should mean \
+                                                  {}, then Enter", cal.note_name()));
+                                if ui.button("done").clicked() {
+                                    if let Some(cal) = self.piano_cal.take() {
+                                        self.zones = cal.zones;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    ui.colored_label(egui::Color32::GRAY,
+                        "several keys can share one note — wide regions like real \
+                         piano-key spacing. Uncalibrated keys keep the tracker rows.");
+                    ui.separator();
+                    ui.label("your name, as peers see it beside your playhead:");
+                    let hint = format!("site {}", self.studio.session.doc.site.0);
+                    ui.add(egui::TextEdit::singleline(&mut self.studio.display_name)
+                        .hint_text(hint));
+                    ui.separator();
                     ui.label("bounce fidelity — what library-bound renders cost on THIS device:");
                     let all = morph_pad::BounceFormat::ALL;
                     let mut ix = all.iter().position(|f| *f == self.bounce_format).unwrap_or(1);
@@ -1900,7 +2526,13 @@ impl eframe::App for App {
                          Saved per device with the workspace — a phone and a desktop \
                          answer this differently on purpose.");
                 });
-            if !open { self.settings_open = false; }
+            if !open {
+                self.settings_open = false;
+                self.rebind_capture = None;
+                // Closing mid-calibration keeps what was walked so far —
+                // a half-calibration plays (zones first, layout fallback).
+                if let Some(cal) = self.piano_cal.take() { self.zones = cal.zones; }
+            }
         }
         if let Some((bus, bus_name)) = self.studio.mix_pass_request.take() {
             // Measure the ACTUAL mixdown — the thing being mastered, not a
@@ -2013,7 +2645,8 @@ impl eframe::App for App {
             }).unwrap_or(0);
             for c in pressed {
                 if let Some(note) = studio_egui::playkeys::play_note(
-                    c, self.studio.octave, &studio_egui::keys::Key::c(c), &*self.analog)
+                    c, self.studio.octave, &studio_egui::keys::Key::c(c), &*self.analog,
+                    &self.zones)
                 {
                     self.studio.play_note_at(note, column);
                 }
@@ -2046,13 +2679,29 @@ impl eframe::App for App {
                     }
                 }
             }
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64).unwrap_or(0);
             for p in carrier.poll() {
-                for reply in self.studio.integrate_packet(p) {
+                for reply in self.studio.integrate_packet(p, now_ms) {
                     carrier.send(reply);
                 }
             }
             for p in self.studio.drain_outbox() {
                 carrier.send(p);
+            }
+            // Our own presence: the sending half of what integrate_packet
+            // merges. Rate-limited and heartbeat'd inside; called every
+            // frame, sends when it should.
+            if let Some(p) = self.studio.presence_beat(now_ms) {
+                carrier.send(p);
+            }
+            // And the silence sweep — members time out with an announcement,
+            // presence-only ghosts are pruned quietly.
+            for ev in self.studio.session.sweep(now_ms) {
+                if let studio_collab::session::Event::TimedOut(site) = ev {
+                    self.studio.status = format!("site {} timed out", site.0);
+                }
             }
             // Packets arrive between frames; a connected shell keeps frames
             // coming so a peer's edit shows without waiting for a local one.
@@ -2483,6 +3132,34 @@ impl eframe::App for App {
             };
             let name = path.file_stem().and_then(|s| s.to_str())
                 .unwrap_or("sample").to_owned();
+            // Video takes the ffmpeg door, BEFORE decode_bytes — symphonia
+            // cannot open an mp4, and the old flow's silent has_video:false
+            // (C12-6a's finding) began exactly here. To the rack, a video
+            // is its audio (refusing a video's audio to a sampler would be
+            // the tool overruling the musician — library.rs's own words);
+            // to the timeline it is a picture on the video track.
+            if !to_rack && library::is_video_path(&path) {
+                match studio_video::probe(&path) {
+                    Ok(pr) => {
+                        let audio = studio_video::extract_audio(&path).ok().flatten();
+                        let meta = audio.as_ref()
+                            .map(|a| (a.sample_rate, a.channels.len() as u16));
+                        if let Some(id) = self.studio.import_video_clip(
+                            &name, &path.display().to_string(), pr.duration, meta) {
+                            if let Some(a) = audio {
+                                self.peaks.insert(id, studio_audio::Peaks::build(&a, 256, 256));
+                                self.audio.insert(id, a);
+                            }
+                            if let Ok(raw) = std::fs::read(&path) {
+                                self.studio.register_asset(id, &raw);
+                            }
+                        }
+                    }
+                    Err(e) => self.studio.status =
+                        format!("'{name}': {e} (is ffmpeg installed?)"),
+                }
+                return;
+            }
             match std::fs::read(&path) {
                 Ok(raw) => {
                     let hint = path.extension().and_then(|e| e.to_str());
@@ -2536,11 +3213,11 @@ impl eframe::App for App {
                         SideSlot::Viewport => viewport::show(
                             ui, &self.studio.session.doc.project, self.studio.playhead(),
                             &base, &mut self.frame_cache, &colors),
-                        SideSlot::Mixer => mixer_panel::show(ui, &mut self.studio, &colors),
-                        SideSlot::Rack => rack_panel::show(
-                            ui, &mut self.studio, &colors, playhead_col),
-                        SideSlot::Program => program_panel::show(
-                            ui, &mut self.studio, &colors, playhead_col),
+                        SideSlot::Mixer => { mixer_panel::show(ui, &mut self.studio, &colors); }
+                        SideSlot::Rack => { rack_panel::show(
+                            ui, &mut self.studio, &colors, playhead_col); }
+                        SideSlot::Program => { program_panel::show(
+                            ui, &mut self.studio, &colors, playhead_col); }
                         SideSlot::Off => {}
                     }
                 });
@@ -2565,23 +3242,29 @@ impl eframe::App for App {
                     });
                     self.studio.panel = tab;
                     match tab {
-                        Panel::Rack => rack_panel::show(ui, &mut self.studio, &colors, playhead_col),
-                        Panel::Program => program_panel::show(ui, &mut self.studio, &colors, playhead_col),
-                        Panel::Mixer => mixer_panel::show(ui, &mut self.studio, &colors),
+                        Panel::Rack => { rack_panel::show(ui, &mut self.studio, &colors, playhead_col); }
+                        Panel::Program => { program_panel::show(ui, &mut self.studio, &colors, playhead_col); }
+                        Panel::Mixer => { mixer_panel::show(ui, &mut self.studio, &colors); }
                         Panel::Timeline => {}
                     }
                 });
         }
         egui::CentralPanel::default().show(ctx, |ui| {
+            // The central panel's scroll report, when the panel has one.
+            // Pages-mode over-scroll navigation reads ONLY this — the
+            // side-slot and workbench copies of the same panels discard
+            // theirs, because paging away from a slot would be paging away
+            // from the wrong thing.
+            let mut edge: Option<scroll_edge::ScrollReport> = None;
             match if self.studio.combined { Panel::Timeline } else { self.studio.panel } {
                 Panel::Rack => {
-                    rack_panel::show(ui, &mut self.studio, &colors, playhead_col);
+                    edge = Some(rack_panel::show(ui, &mut self.studio, &colors, playhead_col));
                 }
                 Panel::Mixer => {
-                    mixer_panel::show(ui, &mut self.studio, &colors);
+                    edge = Some(mixer_panel::show(ui, &mut self.studio, &colors));
                 }
                 Panel::Program => {
-                    program_panel::show(ui, &mut self.studio, &colors, playhead_col);
+                    edge = Some(program_panel::show(ui, &mut self.studio, &colors, playhead_col));
                 }
                 Panel::Timeline => {
                     // The inspector sits above the arrangement rather than
@@ -2608,12 +3291,19 @@ impl eframe::App for App {
                         Some(id) => song_views.entry(id).or_default(),
                         None => view,
                     };
+                    // The musical ruler follows the SONG being shown; the
+                    // whole-project view keeps the clock (see timeline()'s
+                    // param docs for why that stays undecided).
+                    let song_tempo = active_song
+                        .and_then(|id| session.doc.project.groups.get(&id))
+                        .and_then(|g| g.tempo.as_ref());
                     let tr = studio_egui::timeline(ui, &session.doc,
                                                    view,
                                                    &colors, ph, &sel, &self.peaks,
                                                    *trim_side,
                                                    closed_groups,
-                                                   mode, input_mode, &pending);
+                                                   mode, input_mode, &pending,
+                                                   song_tempo);
                     if let Some(t) = tr.sought {
                         // Scrub. The transport owns position, so this is a
                         // seek and not a model edit — moving the playhead
@@ -2736,7 +3426,28 @@ impl eframe::App for App {
                     }
                 }
             }
-        });
+        
+            // ── Pages-mode over-scroll navigation ────────────────────────
+            // Only when the top bar actually chose Pages (real width, this
+            // frame), and only from the central panel's own report. The
+            // classify() rule that MOVED always wins is what makes normal
+            // scrolling structurally unable to page; the timeline is
+            // excluded (it owns both axes) by simply never reporting.
+            if pages_mode {
+                match edge {
+                    Some(e) if e.moved => self.panel_nav.still_scrolling(),
+                    Some(e) if e.overscroll != 0.0 => {
+                        let now_ms = ctx.input(|i| i.time) * 1000.0;
+                        if let Some(p) = self.panel_nav.on_overscroll(
+                            self.studio.panel, e.overscroll, now_ms) {
+                            self.studio.panel = p;
+                            self.studio.status = format!("{}", p.label());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+});
     }
 }
 
@@ -3073,6 +3784,40 @@ impl App {
                     self.export_dialog = Some(Default::default());
                 }
                 palette::ShellVerb::Settings => { self.settings_open = true; }
+                palette::ShellVerb::Workspace(ix) => self.apply_layout(ix as usize),
+                palette::ShellVerb::SharePattern => {
+                    match self.studio.export_pattern_pack(self.studio.current_pattern)
+                        .and_then(|pack| pattern_pack::publish(
+                            &pack, &pattern_pack::cache_dir())
+                            .map_err(|e| e.to_string())) {
+                        Ok(path) => self.studio.status =
+                            format!("shared — other projects see it now ({})",
+                                    path.display()),
+                        Err(e) => self.studio.status = format!("share refused: {e}"),
+                    }
+                }
+                palette::ShellVerb::ImportPack(i) => {
+                    let shelf = pattern_pack::list(&pattern_pack::cache_dir());
+                    match shelf.get(i as usize) {
+                        None => self.studio.status =
+                            "that pack is gone from the shelf".into(),
+                        Some((_, path)) => {
+                            match std::fs::read(path).ok()
+                                .and_then(|b| pattern_pack::PatternPack::decode(&b))
+                                .ok_or_else(|| "unreadable pack".to_string())
+                                .and_then(|p| self.studio.import_pattern_pack(p)) {
+                                Ok(landed) => for (id, audio, raw) in landed {
+                                    self.peaks.insert(id,
+                                        studio_audio::Peaks::build(&audio, 256, 256));
+                                    self.audio.insert(id, audio);
+                                    self.studio.register_asset(id, &raw);
+                                },
+                                Err(e) => self.studio.status =
+                                    format!("import refused: {e}"),
+                            }
+                        }
+                    }
+                }
                 palette::ShellVerb::ToggleWorkbench => {
                     self.studio.combined = !self.studio.combined;
                 }
@@ -3098,6 +3843,25 @@ impl App {
     /// IT STARTED — recording then behaves like every other edit: one op,
     /// undoable, shareable, archivable. Its asset is stored FLAC-encoded,
     /// so a phone session's takes do not cost three times what they need.
+    /// Put the shell in one of the named rooms — a preset writes only the
+    /// layout fields it owns (see `workspace::LAYOUTS`' docs for why
+    /// presets beat a dock here), through the same vocabulary the sidecar
+    /// stores, so what C-1 does and what a saved sidecar restores can
+    /// never drift apart.
+    fn apply_layout(&mut self, ix: usize) {
+        let Some(l) = workspace::LAYOUTS.get(ix) else { return };
+        if let Some(p) = studio_egui::touch::Panel::ALL.iter()
+            .find(|p| p.label() == l.panel) { self.studio.panel = *p; }
+        self.studio.combined = l.combined;
+        self.side_slot = match l.side_slot {
+            "viewport" => SideSlot::Viewport, "rack" => SideSlot::Rack,
+            "program" => SideSlot::Program, "mixer" => SideSlot::Mixer,
+            _ => SideSlot::Off,
+        };
+        self.library_open = l.library_open;
+        self.studio.status = format!("workspace: {}", l.name);
+    }
+
     fn toggle_take(&mut self) {
         if self.mic.recording() {
             let Some(take) = self.mic.stop() else {
@@ -3440,6 +4204,14 @@ impl App {
                             .on_disabled_hover_text("select clips on the timeline first");
                     });
                     ui.selectable_value(&mut plan.scope, export::Scope::RackLoop, "rack loop");
+                    // The album: one file per song, timeline order. Greyed
+                    // rather than hidden with no songs — a control that
+                    // vanishes teaches nothing about why.
+                    let has_songs = !self.studio.session.doc.project.groups.is_empty();
+                    ui.add_enabled_ui(has_songs, |ui| {
+                        ui.selectable_value(&mut plan.scope, export::Scope::EachSong, "each song")
+                            .on_disabled_hover_text("group clips into songs first");
+                    });
                 });
                 ui.checkbox(&mut plan.stems,
                     if plan.scope == export::Scope::RackLoop { "stems — one file per channel" }
@@ -3994,7 +4766,7 @@ mod collab_tests {
 
     fn pipe(from: &mut Studio, to: &mut Studio) {
         for p in from.drain_outbox() {
-            to.integrate_packet(p);
+            to.integrate_packet(p, 0);
         }
     }
 
@@ -4065,10 +4837,10 @@ mod collab_tests {
         a.drain_outbox(); // lost in transit — B heard none of it
 
         let replies = a.integrate_packet(
-            studio_collab::wire::Packet::Hello { site: SiteId(2), since: 0 });
+            studio_collab::wire::Packet::Hello { site: SiteId(2), since: 0 }, 0);
         assert!(!replies.is_empty(), "a Hello is answered");
         for p in replies {
-            b.integrate_packet(p);
+            b.integrate_packet(p, 0);
         }
         assert_eq!(b.session.doc.project, a.session.doc.project, "B caught up on the project");
         assert_eq!(b.rack, a.rack, "and on the rack");
@@ -4088,9 +4860,9 @@ mod collab_tests {
         let mut c = Studio::new(
             Project { name: a.session.doc.project.name.clone(), ..Default::default() },
             SiteId(3), Team::from_contacts("trio", &["sc-c".into()]));
-        c.integrate_packet(a.session.broadcast());
+        c.integrate_packet(a.session.broadcast(), 0);
         if let Some(rack) = a.session.rack_broadcast() {
-            c.integrate_packet(rack);
+            c.integrate_packet(rack, 0);
         }
         assert_eq!(c.session.doc.project, a.session.doc.project, "C holds the project");
         assert_eq!(c.rack, a.rack, "and the rack");
@@ -4107,8 +4879,8 @@ mod collab_tests {
         b.sync_rack_if_changed();
         let from_a = a.drain_outbox();
         let from_b = b.drain_outbox();
-        for p in from_a { b.integrate_packet(p); }
-        for p in from_b { a.integrate_packet(p); }
+        for p in from_a { b.integrate_packet(p, 0); }
+        for p in from_b { a.integrate_packet(p, 0); }
         assert_eq!(a.rack, b.rack, "one rack, agreed without a referee");
         assert!(a.rack.swing == 0.10 || a.rack.swing == 0.40);
     }
@@ -4128,17 +4900,17 @@ mod asset_transfer_tests {
             let mut to_a: Vec<_> = b.drain_outbox();
             while let Some(p) = to_b.pop() {
                 quiet = false;
-                to_a.extend(b.integrate_packet(p));
+                to_a.extend(b.integrate_packet(p, 0));
             }
             while let Some(p) = to_a.pop() {
                 quiet = false;
-                to_b.extend(a.integrate_packet(p));
+                to_b.extend(a.integrate_packet(p, 0));
             }
             while let Some(p) = to_b.pop() {
-                to_a.extend(b.integrate_packet(p));
+                to_a.extend(b.integrate_packet(p, 0));
             }
             for p in to_a {
-                a.integrate_packet(p);
+                a.integrate_packet(p, 0);
             }
             if quiet && a.outbox.is_empty() && b.outbox.is_empty() {
                 break;
@@ -4192,12 +4964,12 @@ mod asset_transfer_tests {
         // A's chunk replies to B IN REVERSE ORDER.
         let mut to_b = a.drain_outbox();
         let mut req = Vec::new();
-        for p in to_b.drain(..) { req.extend(b.integrate_packet(p)); }
+        for p in to_b.drain(..) { req.extend(b.integrate_packet(p, 0)); }
         let mut chunks = Vec::new();
-        for p in req { chunks.extend(a.integrate_packet(p)); }
+        for p in req { chunks.extend(a.integrate_packet(p, 0)); }
         assert!(chunks.len() >= 2, "big enough to have several chunks: {}", chunks.len());
         chunks.reverse();
-        for p in chunks { b.integrate_packet(p); }
+        for p in chunks { b.integrate_packet(p, 0); }
         assert!(b.pending_assets.is_empty(), "assembled despite the order");
         assert!(b.manifests.contains_key(&src), "and B can now serve it onward");
         assert!(b.status.contains("undecodable"), "the media failure was said: {:?}", b.status);
@@ -4210,9 +4982,9 @@ mod asset_transfer_tests {
         let id = studio_collab::assets::hash(&real);
         b.integrate_packet(studio_collab::wire::Packet::Chunk {
             id, bytes: vec![8u8; 20_000], // wrong content for that id
-        });
+        }, 0);
         assert!(!b.chunk_store.contains_key(&id), "a lying chunk never enters the store");
-        b.integrate_packet(studio_collab::wire::Packet::Chunk { id, bytes: real });
+        b.integrate_packet(studio_collab::wire::Packet::Chunk { id, bytes: real }, 0);
         assert!(b.chunk_store.contains_key(&id), "the honest one does");
     }
 
@@ -4232,7 +5004,7 @@ mod asset_transfer_tests {
             sample_rate: 48_000, channels: 1, has_video: false } }, "seeded");
         a.register_asset(src_a, &sample);
         let mut replies = Vec::new();
-        for p in a.drain_outbox() { replies.extend(b.integrate_packet(p)); }
+        for p in a.drain_outbox() { replies.extend(b.integrate_packet(p, 0)); }
         assert!(replies.iter().all(|p| !matches!(p,
             studio_collab::wire::Packet::ChunkRequest { .. })),
             "no chunks were requested for bytes already held");
@@ -4259,7 +5031,7 @@ mod tcp_carrier_tests {
             }
         }
         for p in c.poll() {
-            for r in s.integrate_packet(p) {
+            for r in s.integrate_packet(p, 0) {
                 c.send(r);
             }
         }
@@ -4527,7 +5299,8 @@ mod playing_mode_tests {
     fn a_played_note_lands_in_the_pattern_as_a_tuned_step() {
         let mut s = Studio::demo();
         s.selected_channel = 0; // the 808
-        let note = play_note('d', 0, &Key::c('d'), &NullAnalog).expect("E natural");
+        let note = play_note('d', 0, &Key::c('d'), &NullAnalog,
+            &studio_egui::playkeys::Zones::default()).expect("E natural");
         s.play_note_at(note, 4);
         let p = &s.rack.patterns[s.current_pattern];
         assert!(p.is_set(0, 4), "the step is on");

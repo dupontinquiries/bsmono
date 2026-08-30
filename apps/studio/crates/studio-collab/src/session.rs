@@ -95,6 +95,13 @@ pub struct Session {
     /// Sites that have left or been swept, kept so a late packet from them is
     /// recognised as stale rather than treated as a rejoin.
     departed: BTreeMap<SiteId, i64>,
+    /// When each site was last HEARD, member or not. The wire has no join
+    /// packet — presence is the only sign of life an ad-hoc peer ever sends —
+    /// so a site that merged into `doc.peers` without ever joining the roster
+    /// would otherwise leave a playhead on everyone's timeline forever. This
+    /// map is what lets [`Session::sweep`] prune those ghosts on the same
+    /// clock members are swept by.
+    heard: BTreeMap<SiteId, i64>,
 }
 
 /// What changed, for the UI to announce.
@@ -112,6 +119,7 @@ impl Session {
         Session {
             team, project_name: project.into(), doc,
             members: BTreeMap::new(), departed: BTreeMap::new(),
+            heard: BTreeMap::new(),
         }
     }
 
@@ -163,6 +171,9 @@ impl Session {
         let site = p.site;
         self.doc.presence(p);
         self.touch(site, now_ms);
+        // Heard from, whether or not they ever joined the roster — this is
+        // what sweep prunes ghost playheads by.
+        self.heard.insert(site, now_ms);
     }
 
     /// Remove anyone who has gone quiet. A peer whose laptop shut mid-edit never
@@ -173,12 +184,27 @@ impl Session {
             .filter(|m| now_ms - m.last_seen_ms > LIVENESS_MS)
             .map(|m| m.site)
             .collect();
-        gone.into_iter().map(|s| {
+        let out: Vec<Event> = gone.into_iter().map(|s| {
             self.members.remove(&s);
             self.departed.insert(s, now_ms);
             self.doc.peers.remove(&s);
+            self.heard.remove(&s);
             Event::TimedOut(s)
-        }).collect()
+        }).collect();
+        // Ghosts: sites whose presence was merged but who never joined the
+        // roster. They announced themselves only through presence, so silence
+        // on that channel is the only leave they will ever send. Pruned
+        // without an Event — announcing the departure of someone the UI never
+        // announced the arrival of would read as noise.
+        let ghosts: Vec<SiteId> = self.heard.iter()
+            .filter(|(s, t)| !self.members.contains_key(s) && now_ms - **t > LIVENESS_MS)
+            .map(|(s, _)| *s)
+            .collect();
+        for s in ghosts {
+            self.heard.remove(&s);
+            self.doc.peers.remove(&s);
+        }
+        out
     }
 
     /// Everything a peer starting from NOTHING needs, in one packet.
@@ -461,5 +487,36 @@ mod tests {
 
         assert_eq!(newcomer.project, s.doc.project, "project still reconstructs correctly");
         assert_eq!(newcomer.rack.as_ref().map(|r| &r.rack), Some(&rack), "and the rack must reach the newcomer too, not just the project");
+    }
+
+    /// A peer who never joined the roster but sent presence — the only kind
+    /// of peer the current wire can produce, since it has no join packet —
+    /// must be swept off `doc.peers` on the same silence clock members are.
+    /// Before `heard` existed their playhead was drawn forever.
+    #[test]
+    fn ghost_presence_is_pruned_by_sweep() {
+        let team = Team::from_contacts("duo", &["sc-a".into(), "sc-b".into()]);
+        let doc = Doc::new(SiteId(1), crate::Project { name: "p".into(), ..Default::default() });
+        let mut s = Session::open(team, "p", doc);
+        s.presence(crate::Presence {
+            site: SiteId(9), name: "drifter".into(),
+            playhead: crate::Ticks::ZERO, selection: vec![],
+            active_track: None, seq: 1,
+        }, 1_000);
+        assert!(s.doc.peers.contains_key(&SiteId(9)), "presence merged");
+        // Heard recently: survives a sweep.
+        assert!(s.sweep(1_000 + LIVENESS_MS).is_empty());
+        assert!(s.doc.peers.contains_key(&SiteId(9)), "not yet silent long enough");
+        // One ms past the liveness window: gone, and silently (no event —
+        // nobody was ever told they arrived).
+        assert!(s.sweep(1_001 + LIVENESS_MS).is_empty());
+        assert!(!s.doc.peers.contains_key(&SiteId(9)), "ghost pruned");
+        // A later packet from them simply re-merges — silence is not a ban.
+        s.presence(crate::Presence {
+            site: SiteId(9), name: "drifter".into(),
+            playhead: crate::Ticks::ZERO, selection: vec![],
+            active_track: None, seq: 2,
+        }, 200_000);
+        assert!(s.doc.peers.contains_key(&SiteId(9)));
     }
 }
