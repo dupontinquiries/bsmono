@@ -59,6 +59,7 @@ mod stream;
 mod hazard;
 mod hive;
 mod hud;
+mod holomap;
 mod hotbar;
 mod hydro;
 mod idle;
@@ -1205,6 +1206,10 @@ fn main() {
     if argv.iter().any(|a| a == "--gear") {
         // the bearer's sheet, the ship's vault, the clone gallery
         gearsim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--holo") {
+        holomap::run(&argv);
         return;
     }
     if argv.iter().any(|a| a == "--fleet") {
