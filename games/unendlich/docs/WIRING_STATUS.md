@@ -12182,3 +12182,22 @@ from the surface-target probe height sl+10; Phase-2 CPU per-cell y vs my per-cel
 each site's exact y next). Verification honesty: no soak this round, but the probe panel exercised the full
 production TerrainGenerator GPU path (4 seeds × 64 chunks through the new binding) without error; fullgame check
 clean; biome_loader 11/0. Next: per-site climate-y audit, then promote the probe to a gate on the clean seeds.
+
+## r612 — TREE-GATE CLIMATE-Y FIX + the last structural asymmetry, fully specified
+The r611 residual audit's first finding is fixed: the shader's tree substrate gate fitted the registry with the
+DECISION's classification climate (sampled at the sea_level+10 probe height), while the CPU's gate fits at the
+column's ACTUAL surface_y (pick_surface_block(biome, wx, surface_y, wz)). Altitude moves climate enough to flip fits
+on hills. The gate now recomputes temp/humid at d.surface_y. MEASURED: tree-mass ratios 0.719→0.921 (seed 424242) and
+1.491→1.369 (90210); terrain diffs unchanged (12,061 / 9,507 — the gate doesn't touch terrain), clean seeds stay
+clean. spv rebuilt (ERROR-grep discipline per r610).
+THE LAST STRUCTURAL ASYMMETRY, now fully specified from reading biome_at_3d: the CPU classifier is not
+determine_biome+veto — per r177 "the registry owns the LAND climate biomes": legacy_verdict decides water/shore
+(topography), but LAND columns are re-fit against the REGISTRY and mapped through each def's _legacy_enum to a Biome;
+the r192 biome-free-base veto then applies (with a documented Skylands/deep-valley bugfix in the same block). The
+shader's veto'd biome_at_2d runs only determine_biome+veto — no registry step — so tree profiles/densities and
+legacy-branch surface picks classify differently wherever the registry fit disagrees with the raw climate tree.
+PORT DESIGN (next item, all pieces in place): bake each def's legacy Biome id into the table's UNUSED blocks[].z slot
+(sentinel for themed/none — BiomeDef already has the legacy_enum→Biome mapping fn), then mirror the full
+verdict→registry-land-fit→veto chain in the shader's veto'd classifier at the tree/surface sites, sampling climate at
+the right per-site y (surface_y for trees — now already plumbed). Expect this to close most of the remaining ~10-12k
+terrain diffs (legacy surface branch) and the tree-mass skews together.

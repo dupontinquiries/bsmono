@@ -1068,7 +1068,15 @@ TreeDecision compute_tree_decision(
     // CPU requires aligns the DENSITY of trees even though their
     // POSITIONS remain split by design (u32 vs u64 origin hashes).
     {
-        uint sb = pick_surface_block_gpu(d.surface_y, humidity, temperature, biome);
+        // r612: the CPU's gate fits the registry with climate sampled at
+        // the column's ACTUAL surface_y (pick_surface_block(biome, wx,
+        // surface_y, wz)), not at the classification probe height
+        // (sea_level+10) this function's temperature/humidity params were
+        // computed at. Altitude moves the climate enough to flip fits on
+        // hills — recompute at surface_y to match.
+        float gt = model_temperature(float(wx_origin), float(d.surface_y), float(wz_origin), world_seed);
+        float gh = model_humidity(float(wx_origin), float(d.surface_y), float(wz_origin), world_seed);
+        uint sb = pick_surface_block_gpu(d.surface_y, gh, gt, biome);
         if (sb != BLOCK_GRASS && sb != BLOCK_MOSS) return d;
     }
 
