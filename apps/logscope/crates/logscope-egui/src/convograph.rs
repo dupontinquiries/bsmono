@@ -498,8 +498,26 @@ pub fn keywords(text: &str) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
     for w in text.split(|c: char| !c.is_alphanumeric()) {
+        // LENGTH CHECK BEFORE LOWERCASING. `to_lowercase` allocates, and
+        // most tokens in a transcript are punctuation fragments and short
+        // words that fail this test — so the old order allocated a String
+        // for every one of them and threw it away. Case folding cannot
+        // change a byte length below 3 into one above it for the ASCII
+        // this filter is about, and a multi-byte char is already ≥ 2
+        // bytes, so this rejects nothing the old order kept.
+        if w.len() < 3 {
+            continue;
+        }
         let w = w.to_lowercase();
-        if w.len() >= 3 && !STOP.contains(&w.as_str()) && seen.insert(w.clone()) { out.push(w); }
+        // `seen.insert(w.clone())` cloned on every word that reached it,
+        // INCLUDING REPEATS — the clone was built, handed to `insert`,
+        // found to be a duplicate, and dropped. Repeats are the common
+        // case in a transcript, so checking membership first turns one
+        // clone per occurrence into one per distinct word.
+        if !STOP.contains(&w.as_str()) && !seen.contains(&w) {
+            seen.insert(w.clone());
+            out.push(w);
+        }
     }
     out
 }

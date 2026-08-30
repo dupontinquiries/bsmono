@@ -2939,3 +2939,37 @@ Decisions:
 - **C12-51b — `route_persona` is selected and not yet USED.** The prompt
   builder must prepend it. Same shape as `route_ceiling` in §50: chosen,
   stored, not yet consumed.
+
+## 52. Perf: logscope's context cards rebuilt themselves every frame
+
+Hunted the chat draw path. The floating context cards (freshest code
+block, salient keywords) recomputed from scratch on EVERY FRAME:
+
+  - scan back through the whole transcript calling `verdict::extract_code`
+    on each message until one has a code block;
+  - join the last four messages into a new String;
+  - run `convograph::keywords` over it.
+
+`keywords` allocated a lowercase String PER WORD and cloned each one
+into a set. On four turns of chat that is thousands of short-lived
+allocations sixty times a second, producing the same two cards until the
+transcript changes.
+
+Cached on `(msgs.len(), last_msg.len())`. The count catches a new turn;
+the LENGTH catches a streaming reply growing in place — the case a count
+alone would miss, and exactly when this panel most needs to update.
+
+Also fixed `keywords` itself, since it has other callers:
+  - the `len() < 3` filter now runs BEFORE `to_lowercase`. Most tokens in
+    a transcript are punctuation fragments and short words that fail it,
+    so the old order allocated a String for each and discarded it. Safe
+    because case folding cannot lift an ASCII byte length from below 3 to
+    above it, and a multi-byte char is already ≥2 bytes.
+  - `seen.insert(w.clone())` cloned on every word that reached it,
+    including repeats — built, handed to `insert`, found duplicate,
+    dropped. Repeats are the common case, so a `contains` check first
+    turns one clone per occurrence into one per distinct word.
+
+I got that second comment backwards on the first pass ("once per kept
+word rather than once per unique word" — those are the same thing) and
+corrected it. The saving is over REPEATS, not over uniques.

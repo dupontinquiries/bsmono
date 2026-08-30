@@ -1358,6 +1358,12 @@ pub struct Chat {
     /// to a worker. Prepended by the prompt builder; `None` means the
     /// plain engine.
     route_persona: Option<String>,
+    /// Cached context-card contents. See the draw site: this block
+    /// re-scanned the transcript and re-extracted keywords on every
+    /// frame.
+    ctx_card_key: Option<(usize, usize)>,
+    ctx_card_code: Option<String>,
+    ctx_card_kws: Vec<String>,
     /// The liaison model's phrasing of the HUD, when one has produced a line. Empty = show the raw
     /// observation instead, which cannot be wrong because it is copied from the engine.
     hud_narration: String,
@@ -1487,6 +1493,7 @@ impl Default for Chat {
             route_ceiling: None,
             workers: crate::workerroster::WorkerRoster::new(),
             route_persona: None,
+            ctx_card_key: None, ctx_card_code: None, ctx_card_kws: Vec::new(),
             show_metrics: false, metrics_base: Default::default(), metrics_wall_ns: 0, metrics_tokens: 0, metrics_start: None,
             vault: autosave_path().and_then(|p| p.parent().map(|d| d.join("vault")))
                 .and_then(|d| crate::vault::Vault::open(d).ok()),
@@ -7882,11 +7889,37 @@ if let Some(msg) = self.error_banner.clone() {
                 // floating context cards — the freshest code block, the loaded file, and salient
                 // keywords, kept next to the chat regardless of which subpage is open.
                 {
-                    let code = self.msgs.iter().rev()
-                        .map(|m| crate::verdict::extract_code(m.text()))
-                        .find(|c| !c.trim().is_empty());
-                    let kw_src: String = self.msgs.iter().rev().take(4).map(|m| m.text()).collect::<Vec<_>>().join(" ");
-                    let kws: Vec<String> = crate::convograph::keywords(&kw_src).into_iter().take(6).collect();
+                    // CACHED. This block ran EVERY FRAME: scanning back
+                    // through the transcript calling `extract_code` on
+                    // each message until one had a code block, then
+                    // joining the last four messages into a String and
+                    // running `keywords` over it — which lowercases a
+                    // String per word and clones each unique one. On four
+                    // turns of chat that is thousands of allocations,
+                    // sixty times a second, to produce the same two cards
+                    // until the transcript changes.
+                    //
+                    // Keyed on message COUNT plus the length of the last
+                    // message: the count catches a new turn, and the
+                    // length catches a streaming reply growing in place,
+                    // which is the case a count alone would miss and is
+                    // exactly when this panel most needs to update.
+                    let ctx_key = (
+                        self.msgs.len(),
+                        self.msgs.last().map(|m| m.text().len()).unwrap_or(0),
+                    );
+                    if self.ctx_card_key != Some(ctx_key) {
+                        self.ctx_card_code = self.msgs.iter().rev()
+                            .map(|m| crate::verdict::extract_code(m.text()))
+                            .find(|c| !c.trim().is_empty());
+                        let kw_src: String = self.msgs.iter().rev().take(4)
+                            .map(|m| m.text()).collect::<Vec<_>>().join(" ");
+                        self.ctx_card_kws = crate::convograph::keywords(&kw_src)
+                            .into_iter().take(6).collect();
+                        self.ctx_card_key = Some(ctx_key);
+                    }
+                    let code = self.ctx_card_code.clone();
+                    let kws: Vec<String> = self.ctx_card_kws.clone();
                     let has_file = !doc.name.is_empty();
                     if code.is_some() || has_file || !kws.is_empty() {
                         egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
