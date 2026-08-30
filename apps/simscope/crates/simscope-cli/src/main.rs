@@ -10,7 +10,23 @@ const CASES: [&str; 6] = ["case9", "case14", "case30", "case57", "case118", "cas
 
 fn main() {
     materials();
-    let root = std::env::args().nth(1).unwrap_or_else(|| "fixtures".into());
+    // FIXTURES BY ABSOLUTE PATH, not by working directory.
+    //
+    // The default was the relative "fixtures", so L0 only passed when the
+    // binary was run from apps/simscope. Installed on a device, or run
+    // from a fleet build, every case failed with "No such file or
+    // directory" — and the report said FAIL, which reads as a physics
+    // failure rather than a missing file. The solver was never
+    // exercised.
+    //
+    // `CARGO_MANIFEST_DIR` is baked at compile time and is what the
+    // crate's own tests already use (`case.rs`, `flow.rs`), so this
+    // makes the CLI agree with them instead of depending on where it was
+    // launched. An explicit argument still wins, for a fixture set that
+    // has moved.
+    let root = std::env::args().nth(1).unwrap_or_else(|| {
+        format!("{}/../../fixtures", env!("CARGO_MANIFEST_DIR"))
+    });
     println!("simscope — L0 power flow against pandapower\n");
     println!(
         "  {:<9} {:>5} {:>5} {:>5} {:>6} {:>11} {:>11} {:>6}",

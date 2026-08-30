@@ -4181,3 +4181,36 @@ if you want wgpu, pin if you never did.
   this sandbox cannot test at all. If gitmind still dies with the same
   error, the wgpu path is being taken for a reason I have not found and
   the limits clamp is then the right fix after all.
+
+## 77. simscope L0 was a missing-file error reported as a physics failure
+
+The run on build 123 showed all five levels working except L0, which
+printed six times:
+
+    could not read fixtures/case9.json: No such file or directory
+
+The fixtures exist, at `apps/simscope/fixtures/`. The CLI defaulted to
+the RELATIVE path `"fixtures"`, so L0 only passed when the binary was
+launched from `apps/simscope` — installed on a device, or run from a
+fleet build, every case failed and the report said **L0: FAIL**.
+
+That last part is what makes it worth a commit rather than a shrug. A
+line reading `L0: FAIL` under a power-flow header reads as a solver
+problem. The solver was never run.
+
+Fixed to `CARGO_MANIFEST_DIR`, baked at compile time — which is what
+`case.rs` and `flow.rs` already use for their own tests, so the CLI now
+agrees with the crate's tests instead of depending on where it was
+launched. An explicit argument still wins.
+
+VERIFIED, both ways: from `apps/simscope` all six cases converge with
+observed order 1.72–2.77 (quadratic, which is the diagnostic that the
+analytic Jacobian is right), and from `/tmp` the binary now prints
+**L0: PASS** where it previously failed.
+
+Worth noting what the rest of the run already showed: L1 field solve
+0.06–0.12% against analytic coax, L2 board cross-sections within the
+lid-vs-open-geometry gap Hammerstad predicts, L3 EUV imaging with
+coherent contrast exactly zero below cutoff, and the mask thermal
+distortion closing the L3 × mechanics loop. The physics was fine; a
+relative path was not.
