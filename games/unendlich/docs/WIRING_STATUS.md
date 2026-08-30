@@ -12105,3 +12105,21 @@ terrain diffs 11,242 (~0.5%, all material-class: cpu=Stone gpu=Dirt/Gravel/Sand 
 named follow-up), tree cells 52 with 100% diff (GPU perforation/branches by design + possible spawn drift;
 too few cells to separate — widen the tree sample in the follow-up). All prior parity numbers remain void per r606.
 Gates: lib subset 9/0, fullgame clean, spv rebuilt (assets path = the ONLY spv, load order verified in r607 hunt).
+
+## r608 — SUBSURFACE-STRATA PARITY: analysis round (no fix yet — fork structure mapped, writer unidentified)
+Chased the r607 residual (11,242 material-class diffs; deep-origin CPU histogram Stone 15021 / Gravel 3072 / Sand 1024
+vs GPU Stone 14092 / id3 3734 / id12 1295 / id16 285). MAPPED: CPU surface materials = biomes.rs::surface_block
+(Ocean→Sand — the 1024 = exactly one 32×32 seabed layer) + pick_subsurface_block → biome-def REGISTRY
+(assets/biomes/unendlich/*.json — NO def declares subsurface_block today, so the registry always falls through to
+legacy_subsurface_block: Desert/Beach→Sand, canyons→RedSandstone, else Dirt). GPU = surface_block_type (mirrors the
+Rust table incl. Ocean→Sand) + a CLIMATE-ONLY subsurface_block_type — structurally different from the CPU's
+registry+legacy chain. UNIDENTIFIED: the writer of the CPU's 3-layer Gravel band (3072 = exactly 3 layers) — it is NOT
+cpu_generator, biomes.rs, the registry defs, or aquatic_materials (that classifier is pure and UNWIRED — comments in
+sea_level.rs/coral.rs reference it aspirationally). Candidate suspects for next session: a phase module
+(beach_band/alluvial_fan/aquifer_coupling) reached from generate_chunk indirectly, or Chunk::from_blocks-adjacent
+conversion. IMPORTANT interpretation fork left open: if GPU id3=Gravel and id12=Sand (ids unverified this round —
+check blocks.rs first thing), the GPU already HAS a gravel/sand pass and the divergence is boundary-placement drift
+(counts 3734 vs 3072, 1295 vs 1024), i.e. much smaller than a missing pass; the fix would then be threshold alignment,
+not a port. NEXT: verify ids, find the gravel writer via targeted instrumentation (per-block-id first-write phase
+logging in a debug build), then align. Honest state: r607's macro-world fix stands (altimetry exact); strata parity is
+open with the search space narrowed to one unidentified writer.
