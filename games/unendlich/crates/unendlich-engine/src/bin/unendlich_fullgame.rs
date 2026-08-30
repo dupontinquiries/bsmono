@@ -2882,7 +2882,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // title screen through the SAME one-click spree path the UI uses, so
     // headless soaks run IN-WORLD (physics, creatures, streaming). Fires
     // once, after boot settles.
-    let fg_autoplay: bool = std::env::var("UNENDLICH_AUTOPLAY").map(|v| v == "1").unwrap_or(false);
+    // "1" = create a world AND walk; "walk" = walk only once InGame (the
+    // JOINER's mode in dual-process soaks — its world comes from the host).
+    let fg_autoplay_raw = std::env::var("UNENDLICH_AUTOPLAY").unwrap_or_default();
+    let fg_autoplay: bool = fg_autoplay_raw == "1";
+    let fg_autoplay_walk: bool = fg_autoplay || fg_autoplay_raw == "walk";
     // 0 = idle, 1 = wizard requested (waiting for the panel to show it),
     // 2 = spree armed. Two stages because the panel reflects the app ONE
     // frame late and the spree self-cancels when the panel lags (each frame
@@ -3049,6 +3053,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // right after the launch handler, alongside clock adoption.
     let mut lan_joinsync_backlog: Vec<unendlich_engine::sim::net::join_sync::ChunkEditRecord> = Vec::new();
     let mut lan_joinsync_retry_ms: u64 = 0;
+    let mut lan_keepalive_ms: u64 = 0;
     let lan_local_ip: Option<[u8; 4]> = if lan_beacon.is_some() {
         let ip = unendlich_engine::sim::lan_discovery::local_lan_ipv4();
         match ip {
@@ -7094,7 +7099,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // creature encounters all run under real motion instead of a
         // statue-at-spawn. Injected at the SAME seam keyboard input lands, so
         // everything downstream is the player path, not a parallel one.
-        if fg_autoplay && matches!(fg_app.state(), unendlich_engine::sim::game_flow::AppState::InGame)
+        if fg_autoplay_walk
+            && matches!(fg_app.state(), unendlich_engine::sim::game_flow::AppState::InGame)
             && !game_paused
         {
             move_local.x += 1.0; // forward
@@ -14569,6 +14575,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                                 let pos =
                                                     [s.x.to_f32(), s.y.to_f32(), s.z.to_f32()];
                                                 let yaw = s.yaw as f32 / 10000.0;
+                                                if !lan_remote_last_seen.contains_key(&s.id) {
+                                                    // r603: one-shot per peer — the observable
+                                                    // proof entity replication is flowing (soaks
+                                                    // and device tests grep for this).
+                                                    log::info!(
+                                                        "[lan-mp] first entity state from peer {} at ({:.1}, {:.1}, {:.1})",
+                                                        s.id, pos[0], pos[1], pos[2]
+                                                    );
+                                                }
                                                 lan_remote_last_seen.insert(s.id, now_ms);
                                                 match lan_remote_creatures.get_mut(&s.id) {
                                                     Some(cr) => {
@@ -14790,6 +14805,26 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     // the upstream host when WE joined someone, else every peer in the
                     // host table (the old code addressed exactly one peer, so with two
                     // joiners the second silently starved the first of our updates).
+                    // r603 (found by the dual-motion soak): while the joined
+                    // world LOADS (seconds-long frames under a cold cache),
+                    // the InGame-gated replication below sends NOTHING, the
+                    // host prunes us at PEER_TIMEOUT, and our post-load
+                    // entity states arrive from an unknown address — dropped
+                    // forever. Keepalive: while we have an upstream but are
+                    // not yet InGame, re-send JOIN every 2 s; the host treats
+                    // it as a rejoin (cheap re-Accept), and our duplicate-
+                    // Accept guard makes the reply a no-op.
+                    if let Some(up) = lan_peer_addr {
+                        if fg_app.state() != AppState::InGame
+                            && now_ms.saturating_sub(lan_keepalive_ms) >= 2000
+                        {
+                            lan_keepalive_ms = now_ms;
+                            let join = LanJoin::Join { name: active_character.name.clone() }.encode();
+                            let mut dg = vec![CH_HANDSHAKE];
+                            dg.extend_from_slice(&join);
+                            let _ = sock.send_to(&dg, std::net::SocketAddr::V4(up));
+                        }
+                    }
                     if fg_app.state() == AppState::InGame {
                         let out_targets: Vec<std::net::SocketAddrV4> = match lan_peer_addr {
                             Some(up) => vec![up],

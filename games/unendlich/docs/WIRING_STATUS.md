@@ -11992,3 +11992,19 @@ join-sync 7 records / 17 batches from the host → joiner applies 758 then 602 e
 waiting" shrinking). Zero panics both sides. Residue: records for chunks beyond the joiner's render distance sit in
 the backlog until the player walks there — arguably correct; revisit if backlogs ever grow large (persist-on-carry
 would be the deep fix).
+
+## r603 — DUAL-MOTION SOAK: walk mode, the loading-phase keepalive, and one OPEN item
+UNENDLICH_AUTOPLAY=walk: movement-only mode for JOINER processes (their world comes from the host). One-shot
+"[lan-mp] first entity state from peer N" logs at the receive path — the greppable proof entity replication flows, for
+soaks and device tests alike. FIXED (found by this soak): the joiner's replication is InGame-gated, so during its
+seconds-long world load it heartbeats NOTHING, the host pruned it at PEER_TIMEOUT, and post-load states from a
+now-unknown address were dropped forever — a real mid-session dropout for any slow-loading joiner. Fix: while an
+upstream is set but not yet InGame, re-send Join every 2 s; the host's idempotent rejoin re-Accepts (verified: "admitted
+… (rejoined)" cadence, ZERO prunes) and the joiner's duplicate-Accept guard eats the replies.
+VERIFIED: host→joiner entity flow live ("first entity state from peer 9878 at (4.1, 65.1, 14.9)" — the host's avatar
+at a plausible world position; the one-shot re-fires under lavapipe because the joiner's own prune runs between its
+seconds-long frames — cosmetic, frames are 16 ms on hardware).
+OPEN: joiner→host entity states do NOT arrive (host log shows no first-entity line). Eliminated so far: SnapshotGate is
+per-entity (multi-sender safe), receive() is stateless (no session key), the host table stays alive (keepalive), the
+joiner's send path is correctly gated and addressed. Remaining suspects: silent send_to failure (errors are swallowed
+joiner-side), or host-side drain order. Next: temp send-error logs + a host-side raw CH_ENTITY per-sender counter.
