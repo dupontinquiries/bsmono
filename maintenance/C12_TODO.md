@@ -3543,6 +3543,29 @@ say these were designed together as a set.
   designed. I have not built it: choosing which of twelve tools a person
   reaches for first, and in what order, is a design question and I would
   be guessing.
-- **C12-66b — `encode`, `remote`, `similarity` are core, not cockpit**,
-  and may be a different case (library API for a consumer that has not
-  been written). Not separated yet.
+- **C12-66b — examined. `remote` was the same shape as `reroll` was:**
+  a well-specified trait (`RemoteTarget`: missing / put_chunk /
+  get_chunk / put_ref / list_refs) with ZERO implementations anywhere in
+  the tree. `BACKUP_SYNC.md` describes the whole backup and sync design
+  as if it works, and it could not, because nothing could hold bytes.
+
+  **Written: `remote_folder::FolderTarget`.** A plain directory, chosen
+  as the first target because `Protection::Plain` already names it as
+  the intended cheapest case, it covers the requested-backup-folder
+  feature the doc leads with, and — unlike a peer or a cloud — its error
+  paths are testable HERE rather than shipped unrun. Eight tests.
+
+  Three decisions worth keeping:
+  - Chunks sharded by first byte. A flat directory of a hundred thousand
+    files is slow to stat everywhere that matters and unusable in a file
+    manager.
+  - Writes go temp-then-rename, with the temp in the SAME directory so
+    the rename is atomic. A backup is exactly what gets read after a
+    crash, and a half-written chunk that hashes wrong is worse than an
+    absent one — the absent one is re-pushed, the corrupt one is
+    trusted.
+  - A ref name is used as a FILENAME, so `../` is rejected rather than
+    sanitised. Silently rewriting means the ref a caller stored is not
+    the one it can read back.
+
+  `encode` and `similarity` are still unexamined.

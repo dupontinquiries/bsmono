@@ -33,6 +33,8 @@ pub mod store;
 pub mod checkpoint;
 pub mod backend;
 pub mod remote;
+/// The first `RemoteTarget`: a plain backup directory.
+pub mod remote_folder;
 pub mod compose;
 pub mod query;
 pub mod review;
