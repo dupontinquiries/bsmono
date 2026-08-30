@@ -270,6 +270,258 @@ pub fn plan(reply: &str) -> (Vec<Block>, Vec<String>) {
     (all, prose)
 }
 
+/// Typing a block out in PIECES, rather than all at once.
+///
+/// ## Why this exists
+///
+/// `plan` decides WHICH fragments are offerable. This decides how much
+/// of one arrives per keystroke, which is the other half of "build with
+/// blocks or go back to typing at any time".
+///
+/// All-or-nothing acceptance is the thing that makes AI completion feel
+/// like a gamble: a 12-line block is right for 9 lines and wrong for 3,
+/// and taking it means deleting 3 lines afterwards — the manual cleanup
+/// this whole effort is about. Taking it a piece at a time means the
+/// wrong part is simply never typed.
+///
+/// ## The unit
+///
+/// A "bit" is a word plus the punctuation and whitespace attached to it,
+/// so accepting one lands `foo(` or `x);\n` rather than a bare `foo`
+/// that leaves the caret in the wrong place. Code is not prose: the
+/// delimiters are where the meaning is, and a word-only unit would make
+/// a person type every bracket themselves — which is most of the
+/// keystrokes.
+///
+/// A LINE is the coarser unit, for when the next line is obviously right
+/// and picking through it word by word is just slower.
+pub struct Typeout {
+    text: String,
+    /// How much has been typed out. A byte offset into `text`.
+    at: usize,
+}
+
+impl Typeout {
+    pub fn new(text: impl Into<String>) -> Typeout {
+        Typeout { text: text.into(), at: 0 }
+    }
+
+    /// What is left to type.
+    pub fn rest(&self) -> &str {
+        &self.text[self.at.min(self.text.len())..]
+    }
+
+    /// Nothing left — the block has been fully accepted.
+    pub fn done(&self) -> bool {
+        self.rest().is_empty()
+    }
+
+    /// Take the next bit: leading whitespace, one word, and the
+    /// punctuation that follows it.
+    ///
+    /// Returns `None` when finished, so a caller can fall through to the
+    /// next block rather than pressing a key that does nothing.
+    pub fn next_bit(&mut self) -> Option<&str> {
+        let rest = self.rest();
+        if rest.is_empty() {
+            return None;
+        }
+        // CHAR INDICES, not bytes. A reply's comments routinely contain
+        // `→`, `—` or an accented name, and a byte-wise scan can leave `i`
+        // mid-character — at which point slicing `self.text[..at + i]`
+        // panics. In a completion path that panic is a lost editor, and
+        // it would only ever fire on the replies with prose in them.
+        let mut i = 0usize; // byte offset into `rest`, always on a boundary
+        let mut chars = rest.char_indices().peekable();
+        // Leading whitespace comes WITH the bit rather than as its own
+        // step: a keystroke that only inserts a space looks like nothing
+        // happened, and two presses to place one token is the friction
+        // this is meant to remove.
+        while let Some(&(off, c)) = chars.peek() {
+            if !c.is_whitespace() {
+                break;
+            }
+            chars.next();
+            i = off + c.len_utf8();
+            // Stop AT a newline. Crossing a line break silently is how
+            // you end up several lines into code you have not read.
+            if c == '\n' {
+                let taken = &self.text[self.at..self.at + i];
+                self.at += i;
+                return Some(taken);
+            }
+        }
+        // The word, if there is one. Written with the bounds check
+        // FIRST and one condition per line: the compact spelling
+        // (`i < len && alnum || i < len && underscore`) relies on `&&`
+        // binding tighter than `||`, which is correct and is exactly the
+        // kind of line that gets "simplified" into an out-of-bounds
+        // index later.
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        while let Some(&(off, c)) = chars.peek() {
+            if !is_word(c) {
+                break;
+            }
+            chars.next();
+            i = off + c.len_utf8();
+        }
+        // Then the punctuation run. ONE loop, not two: whether a word was
+        // found or not, the next thing to absorb is the same — trailing
+        // `(` after a word so the caret lands inside the parens, or a
+        // bare `});` as a single press when there was no word at all.
+        while let Some(&(off, c)) = chars.peek() {
+            if is_word(c) || c.is_whitespace() {
+                break;
+            }
+            chars.next();
+            i = off + c.len_utf8();
+        }
+        let taken = &self.text[self.at..self.at + i];
+        self.at += i;
+        Some(taken)
+    }
+
+    /// Take the rest of the current line, including its newline.
+    pub fn next_line(&mut self) -> Option<&str> {
+        let rest = self.rest();
+        if rest.is_empty() {
+            return None;
+        }
+        let end = rest.find('\n').map(|i| i + 1).unwrap_or(rest.len());
+        let taken = &self.text[self.at..self.at + end];
+        self.at += end;
+        Some(taken)
+    }
+
+    /// Take everything that is left.
+    pub fn rest_of_it(&mut self) -> Option<&str> {
+        if self.done() {
+            return None;
+        }
+        let taken = &self.text[self.at..];
+        self.at = self.text.len();
+        Some(taken)
+    }
+}
+
+#[cfg(test)]
+mod typeout_tests {
+    use super::*;
+
+    fn drain_bits(t: &mut Typeout) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(b) = t.next_bit() {
+            out.push(b.to_string());
+        }
+        out
+    }
+
+    #[test]
+    fn a_bit_carries_its_punctuation() {
+        // Code is not prose. A word-only unit would make a person type
+        // every bracket themselves, which is most of the keystrokes.
+        let mut t = Typeout::new("let x = foo(a, b);");
+        let bits = drain_bits(&mut t);
+        assert_eq!(bits, vec!["let", " x", " =", " foo(", " a,", " b);"], "{bits:?}");
+        assert!(t.done());
+    }
+
+    #[test]
+    fn a_bit_never_crosses_a_line_break() {
+        // Crossing one silently is how you end up several lines into code
+        // you have not read.
+        let mut t = Typeout::new("first();
+second();");
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(t.next_bit().unwrap().to_string());
+        }
+        assert_eq!(seen, vec!["first(", ")", ";"], "{seen:?}");
+        assert_eq!(t.next_bit(), Some("\n"), "the break is its own step");
+    }
+
+    #[test]
+    fn the_pieces_reassemble_into_exactly_the_original() {
+        // The property that matters most: building a block bit by bit
+        // must produce the same text as accepting it whole, or the two
+        // paths disagree and one of them is silently wrong.
+        for src in [
+            "let x = foo(a, b);",
+            "fn f() {
+    let a = 1;
+}
+",
+            "  indented(); // trailing comment
+",
+            "a.b.c().d;",
+            "",
+        ] {
+            let mut t = Typeout::new(src);
+            let joined: String = drain_bits(&mut t).concat();
+            assert_eq!(joined, src, "bits did not reassemble for {src:?}");
+        }
+    }
+
+    #[test]
+    fn a_line_at_a_time_also_reassembles() {
+        let src = "one();
+two();
+three()";
+        let mut t = Typeout::new(src);
+        let mut out = String::new();
+        while let Some(l) = t.next_line() {
+            out.push_str(l);
+        }
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn mixing_granularities_is_safe() {
+        // A person takes a bit, then decides the rest of the line is
+        // fine, then takes the remainder. Nothing may be dropped or
+        // duplicated across that switch.
+        let src = "let total = a + b;
+println!(\"{total}\");
+";
+        let mut t = Typeout::new(src);
+        let mut out = String::new();
+        out.push_str(t.next_bit().unwrap());
+        out.push_str(t.next_line().unwrap());
+        out.push_str(t.rest_of_it().unwrap());
+        assert_eq!(out, src);
+        assert!(t.done());
+        assert_eq!(t.next_bit(), None, "finished means finished");
+    }
+
+    #[test]
+    fn non_ascii_in_a_reply_does_not_split_a_character() {
+        // Model replies routinely carry `→`, `—` or accented names in
+        // comments. A byte-wise scan can leave the offset mid-character,
+        // and slicing there PANICS — a lost editor, on exactly the
+        // replies that contain prose.
+        for src in [
+            "let x = 1; // maps a → b\n",
+            "let café = \"naïve\";",
+            "// — an em dash —\nnext();",
+        ] {
+            let mut t = Typeout::new(src);
+            let joined: String = drain_bits(&mut t).concat();
+            assert_eq!(joined, src, "did not reassemble: {src:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_block_is_finished_immediately() {
+        // So a caller can fall through to the next block rather than
+        // binding a key that does nothing.
+        let mut t = Typeout::new("");
+        assert!(t.done());
+        assert_eq!(t.next_bit(), None);
+        assert_eq!(t.next_line(), None);
+        assert_eq!(t.rest_of_it(), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

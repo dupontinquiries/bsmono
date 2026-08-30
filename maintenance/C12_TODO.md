@@ -2714,3 +2714,48 @@ hole is documented by something executable rather than a comment.
   scale. bo-suite's remaining ones (`dialogs::visible`,
   `settings_page::problems`, `sources::visible`) are dialog- and
   settings-sized, where a per-frame Vec is not worth caching against.
+
+## 47. Multipass typeout: building a block a bit at a time
+
+§36 decided WHICH fragments are offerable. This is the other half of the
+brief — "hit tab to build with blocks from the AI or hit ESC to go back
+to typing at any time" — which needs a unit smaller than a whole block.
+
+All-or-nothing acceptance is what makes AI completion feel like a
+gamble: a 12-line block is right for 9 lines and wrong for 3, and taking
+it means deleting 3 afterwards. That IS the manual cleanup this effort
+is about. Taking it a piece at a time means the wrong part is never
+typed at all.
+
+`multipass::Typeout` holds a block and hands it over in pieces:
+  - `next_bit` — a word plus its attached punctuation, so `foo(` arrives
+    as one press and the caret lands inside the parens. Code is not
+    prose: a word-only unit would leave a person typing every bracket,
+    which is most of the keystrokes.
+  - `next_line` — for when the next line is obviously right and picking
+    through it word by word is just slower.
+  - `rest_of_it` — take the remainder.
+
+A bit NEVER crosses a newline. Crossing one silently is how you end up
+several lines into code you have not read.
+
+The test that matters is that the pieces reassemble into exactly the
+original, across all three granularities and mixed between them — if
+building a block bit by bit differs from accepting it whole, one of the
+two paths is silently wrong.
+
+TWO BUGS FIXED IN MY OWN FIRST DRAFT, both worth naming:
+  - The word scan was `i < len && alnum || i < len && underscore`,
+    relying on `&&` binding tighter than `||`. Correct, and exactly the
+    line someone later "simplifies" into an out-of-bounds index.
+    Rewritten with one condition per line.
+  - It scanned BYTES. A reply's comments routinely contain `→`, `—` or
+    an accented name, and a byte offset can land mid-character — where
+    slicing PANICS. In a completion path that is a lost editor, and it
+    would only ever fire on replies containing prose, which is most of
+    them. Now char-indexed, with a test over `→`, `café` and em dashes.
+
+- **C12-47a — NOT COMPILED and NOT WIRED to keys.** `Typeout` is pure
+  and tested; nothing constructs one yet. The key routing (Tab for a
+  bit, a modifier for a line, ESC to stop) belongs with the §36 menu
+  wiring, which is also unbuilt.
