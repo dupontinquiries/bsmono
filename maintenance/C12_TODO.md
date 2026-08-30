@@ -163,6 +163,29 @@ decode/asset side; nothing wires them into `library.rs`'s add-flow yet.
   and display a frame, or it just moves the silent drop one layer
   later. That is §13's av1/fao-codec item, which is the real blocker
   and is still not started.
+  **CLOSED — and the gate above was already open when this was
+  written.** Checked per CLAUDE.md §5 (code over docs): `viewport.rs` +
+  `studio_video::frame_rgb` decode and display the frame under the
+  playhead (ffmpeg seek, half-second cache) — the exact condition this
+  section set. So the join landed: `Studio::import_video_clip`
+  (headless, tested) puts the source in with `has_video: true`, length
+  from the PROBE (a video may outlast its own audio), and the clip on a
+  video track — CREATING one when none has room, where `import_clip`
+  refuses, because video tracks are scarce, an overlay is two pictures
+  at once on purpose, and §6's own words were "give the timeline a
+  video track to put it on"; AddTrack is an undoable op either way. The
+  shell's ToTimeline door branches on `library::is_video_path` BEFORE
+  `decode_bytes` (symphonia cannot open an mp4 — the silent
+  has_video:false began exactly there), probes, extracts the audio half
+  when the container has one (soundless imports still land: the picture
+  is the point), and registers the raw file as the asset peers fetch.
+  ffmpeg absent → a status line naming it, no import. To the RACK a
+  video still goes through its audio, unchanged — refusing a video's
+  audio to a sampler would be the tool overruling the musician.
+  §13's av1/fao-codec NATIVE decode remains open and is now purely a
+  performance/dependency upgrade (subprocess-per-frame → real decoder),
+  no longer gating correctness. C12-14c (the song↔video association)
+  is next in line now that a video can actually exist on the timeline.
 
 ## 7. aperture / aperture-view: a semantic-navigation and marker system
 

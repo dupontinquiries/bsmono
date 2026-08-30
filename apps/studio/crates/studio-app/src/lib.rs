@@ -1251,6 +1251,79 @@ impl Studio {
         Some(id)
     }
 
+    /// Land a VIDEO on the timeline: the C12-6a join, finally legal to
+    /// make because `studio_video::frame_rgb` + the viewport can decode
+    /// and display a frame (the gate that section set). The source is the
+    /// video FILE — `has_video: true`, length from the probe (a video may
+    /// outlast its own audio) — and the clip lands on a video track at the
+    /// playhead. Where `import_clip` REFUSES when no audio track has room,
+    /// this CREATES a video track when none has room: §6's own words are
+    /// "give the timeline a video track to put it on", video tracks are
+    /// scarce where audio tracks are plentiful, and the AddTrack is an
+    /// ordinary undoable op either way. The audio half, when the container
+    /// has one, is the caller's to decode (ffmpeg lives in the shell's
+    /// world); passing `audio_rate`/`audio_channels` here keeps this
+    /// method headless and testable without a subprocess.
+    pub fn import_video_clip(
+        &mut self,
+        name: &str,
+        path: &str,
+        len: Ticks,
+        audio: Option<(u32, u16)>,
+    ) -> Option<studio_core::SourceId> {
+        if len <= Ticks::ZERO {
+            self.status = format!("'{name}' has no duration — probe failed?");
+            return None;
+        }
+        let at = self.playhead();
+        let end = Ticks(at.0 + len.0);
+        let project = &self.session.doc.project;
+        let track = project.tracks.iter()
+            .filter(|t| t.kind == studio_core::TrackKind::Video)
+            .find(|t| !project.clips.values()
+                .any(|c| c.track == t.id && c.pos < end && c.end() > at))
+            .map(|t| t.id);
+        let track = match track {
+            Some(t) => t,
+            None => {
+                let tid = studio_core::TrackId(
+                    project.tracks.iter().map(|t| t.id.0).max().unwrap_or(0) + 1);
+                let n = project.tracks.iter()
+                    .filter(|t| t.kind == studio_core::TrackKind::Video).count() + 1;
+                self.edit(studio_core::Op::AddTrack {
+                    track: studio_core::Track {
+                        id: tid, kind: studio_core::TrackKind::Video,
+                        name: format!("V{n}"), muted: false, locked: false,
+                        gain: 1.0, route: None },
+                    at: 0, // video on top: the timeline's own drawing convention
+                }, "video track");
+                tid
+            }
+        };
+        let (sample_rate, channels) = audio.unwrap_or((48_000, 0));
+        let project = &self.session.doc.project;
+        let id = studio_core::SourceId(
+            project.sources.keys().map(|s| s.0).max().unwrap_or(0) + 1);
+        let clip = studio_core::ClipId(
+            project.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1);
+        self.edit(studio_core::Op::AddSource {
+            source: studio_core::Source {
+                id, path: path.into(), len,
+                sample_rate, channels,
+                has_video: true,
+            },
+        }, "imported");
+        self.edit(studio_core::Op::AddClip {
+            clip: studio_core::Clip {
+                id: clip, source: id, track,
+                pos: at, src_in: Ticks::ZERO, len,
+                gain: 1.0, effects: Vec::new(),
+            },
+        }, "imported");
+        self.status = format!("imported '{name}' — picture on the video track");
+        Some(id)
+    }
+
     /// Render the current pattern's loop at `rate` — what the audition sink
     /// plays and what a bounce stores. One function so they cannot drift.
     pub fn render_loop(
@@ -1421,6 +1494,55 @@ mod tests {
             }
             other => panic!("selection change must ship: {other:?}"),
         }
+    }
+
+
+    /// C12-6a's join, headless: a video import carries has_video: true and
+    /// lands on a video track — creating one when none has room, because
+    /// §6's words are "give the timeline a video track to put it on" and
+    /// AddTrack is an ordinary undoable op.
+    #[test]
+    fn a_video_import_keeps_its_picture_and_finds_or_makes_a_video_track() {
+        // Studio::demo() may or may not ship a video track; build bare.
+        let mut s = Studio::new(
+            studio_core::Project { name: "mv".into(), ..Default::default() },
+            SiteId(1), Team::from_contacts("solo", &["sc-local".into()]));
+        let len = studio_core::Ticks::from_seconds(12.0);
+        let id = s.import_video_clip("clip", "shoot/a.mp4", len, Some((48_000, 2)))
+            .expect("imports");
+        let (src_has_video, src_len, clip_track, video_tracks) = {
+            let p = &s.session.doc.project;
+            let src = &p.sources[&id];
+            let clip = p.clips.values().find(|c| c.source == id).expect("a clip landed");
+            (src.has_video, src.len, clip.track,
+             p.tracks.iter().filter(|t| t.kind == studio_core::TrackKind::Video).count())
+        };
+        assert!(src_has_video, "the whole point of C12-6a");
+        assert_eq!(src_len, len, "length from the probe, not the audio");
+        assert_eq!(s.session.doc.project.tracks.iter()
+                   .find(|t| t.id == clip_track).unwrap().kind,
+                   studio_core::TrackKind::Video,
+                   "picture goes on a video track, not an audio one");
+        assert_eq!(video_tracks, 1, "no video track existed, so exactly one was made");
+
+        // A second import at the same playhead: V1 is busy, so a SECOND
+        // video track appears rather than a refusal — video tracks are
+        // scarce where audio tracks are plentiful, and a music video with
+        // an overlay is two pictures at once on purpose.
+        let id2 = s.import_video_clip("overlay", "shoot/b.mp4",
+            studio_core::Ticks::from_seconds(3.0), None).expect("imports");
+        let clip2_track = s.session.doc.project.clips.values()
+            .find(|c| c.source == id2).unwrap().track;
+        assert_ne!(clip2_track, clip_track, "V1 had no room at the playhead");
+        assert_eq!(s.session.doc.project.tracks.iter()
+                   .filter(|t| t.kind == studio_core::TrackKind::Video).count(), 2);
+        // A soundless container (audio: None) still imports — its audio
+        // half is silence, its picture is the point.
+        assert_eq!(s.session.doc.project.sources[&id2].channels, 0);
+        // And the whole thing is ops: undo (through the keymap, the same
+        // door a person uses) removes the overlay clip again.
+        s.key(studio_egui::keys::Key::c('u'));
+        assert!(!s.session.doc.project.clips.values().any(|c| c.source == id2));
     }
 
     #[test]
@@ -2766,6 +2888,34 @@ impl eframe::App for App {
             };
             let name = path.file_stem().and_then(|s| s.to_str())
                 .unwrap_or("sample").to_owned();
+            // Video takes the ffmpeg door, BEFORE decode_bytes — symphonia
+            // cannot open an mp4, and the old flow's silent has_video:false
+            // (C12-6a's finding) began exactly here. To the rack, a video
+            // is its audio (refusing a video's audio to a sampler would be
+            // the tool overruling the musician — library.rs's own words);
+            // to the timeline it is a picture on the video track.
+            if !to_rack && library::is_video_path(&path) {
+                match studio_video::probe(&path) {
+                    Ok(pr) => {
+                        let audio = studio_video::extract_audio(&path).ok().flatten();
+                        let meta = audio.as_ref()
+                            .map(|a| (a.sample_rate, a.channels.len() as u16));
+                        if let Some(id) = self.studio.import_video_clip(
+                            &name, &path.display().to_string(), pr.duration, meta) {
+                            if let Some(a) = audio {
+                                self.peaks.insert(id, studio_audio::Peaks::build(&a, 256, 256));
+                                self.audio.insert(id, a);
+                            }
+                            if let Ok(raw) = std::fs::read(&path) {
+                                self.studio.register_asset(id, &raw);
+                            }
+                        }
+                    }
+                    Err(e) => self.studio.status =
+                        format!("'{name}': {e} (is ffmpeg installed?)"),
+                }
+                return;
+            }
             match std::fs::read(&path) {
                 Ok(raw) => {
                     let hint = path.extension().and_then(|e| e.to_str());

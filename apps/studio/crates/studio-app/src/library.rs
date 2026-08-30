@@ -81,6 +81,13 @@ pub struct DirListing {
     pub files: Vec<LibraryEntry>,
 }
 
+/// Is this a video file, by extension — the same classification the
+/// sidebar lists by, exposed so the import door and the listing can
+/// never disagree about what a path is.
+pub fn is_video_path(p: &Path) -> bool {
+    matches!(media_of(p), Some(Media::Video))
+}
+
 fn media_of(p: &Path) -> Option<Media> {
     let e = p.extension().and_then(|e| e.to_str())?;
     if AUDIO_EXTS.iter().any(|a| e.eq_ignore_ascii_case(a)) { return Some(Media::Audio); }
