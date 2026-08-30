@@ -3606,4 +3606,31 @@ guessed twice.
   and deciding whether near-duplicates are a second list or a merged one
   — a UI question, and the page already has an exact-match layout that
   assumes groups rather than pairs.
-- **C12-67b — `encode` is the last unexamined module** of the twelve.
+- **C12-67b — DONE. `encode` was the THIRD plan-without-a-runner** in
+  this crate, after `remote` (backup trait, no target) and `reroll`
+  (plan, no ssh adapter). It builds the ffmpeg argv, tracks segments,
+  decides what needs re-encoding and manages a retry queue — and
+  `ffmpeg` appears NOWHERE else in the tree, so MEDIA.md's "ffmpeg +
+  queue + hooks" was queue and hooks.
+
+  `encode_run` runs both argvs and feeds pass/fail into
+  `EncodeQueue::mark`, so the retry logic that already existed finally
+  gets exercised. Policy stays in `encode`: which segments, which CRF,
+  how many attempts.
+
+  Validate is a SEPARATE step because `encode` designed it that way and
+  the reason holds — ffmpeg can exit 0 having written a file that does
+  not decode, and marking those passed drops them from the retry list.
+  A corrupt encode would then be indistinguishable from a good one until
+  someone plays it.
+
+  Corrected mid-edit: I assumed `next_job` pops. It does not — it flips
+  a Queued job to Encoding, so termination depends on `mark` moving it
+  out. That makes calling `mark` on the FAILURE branch load-bearing, not
+  merely tidy: skipping it leaves the job in Encoding forever, silently
+  gone from a queue whose retry logic looks like it ran.
+
+  **All twelve of gitmind's uncalled modules are now examined.** Three
+  were missing executors (written), one was near-duplicate scanning with
+  no path to the UI (written), and eight are the cockpit diagnostics
+  toolkit that wants one page (§66a, still open).

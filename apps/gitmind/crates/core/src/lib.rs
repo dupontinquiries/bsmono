@@ -35,6 +35,8 @@ pub mod backend;
 pub mod remote;
 /// The first `RemoteTarget`: a plain backup directory.
 pub mod remote_folder;
+/// The executor for `encode`: actually runs ffmpeg.
+pub mod encode_run;
 pub mod compose;
 pub mod query;
 pub mod review;
