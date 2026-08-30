@@ -2472,3 +2472,37 @@ failed.
   The narrow fix meanwhile: make those two arms report like the others
   instead of claiming to have handled them. A comment that says a thing
   is handled is worse than no arm at all.
+
+## 41. Bughunt: a button that did nothing
+
+Grepped the egui apps for `=> {}` arms on command/action enums — the
+shape that has been a real bug three times this week. Most were
+justified and said so (bo-suite's `Action::Reload` explains that a local
+source has nothing to re-fetch). One was not.
+
+**snapclone `Action::ImportVCard => {}`** — bare, no comment. `friends.rs`
+draws a "📥 Import vCard" button, raises the action, and `lib.rs`
+discarded it. A button a person can press, that looks like every other
+working button, and does nothing at all.
+
+That is worse than a missing feature: a missing one is visible, while a
+present one that silently declines teaches people the app is unreliable
+and gives them no way to tell whether the file was rejected, held no
+contacts, or was never read.
+
+PORTED the parse (`vcard.rs`) from `src/core/VCardIO.cpp` rather than
+inventing one — same field set (`FN`, `N` as fallback, `NOTE`,
+`X-SNAPCLONE-ID`), because the two halves read each other's exports and
+a parser that disagreed about which field wins would round-trip a
+contact into a different one.
+
+Edge cases that are the point rather than decoration: RFC 6350 line
+FOLDING (phone exports wrap constantly; ignoring it truncates every long
+value and looks like random data loss), one bad card not costing the
+other 199, and a truncated file reporting the loss instead of inventing
+a contact from half of one.
+
+- **C41a — the file picker and the store are still missing.** The action
+  now REPORTS what it would import ("N read, M skipped — no store yet")
+  instead of doing nothing. Deliberately not stubbed further: a fake
+  success is the failure being fixed, one layer up.

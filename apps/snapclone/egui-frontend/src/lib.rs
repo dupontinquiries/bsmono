@@ -23,6 +23,8 @@ pub mod group_voice;
 /// The host seam: one typed event in, typed commands out. See `host.rs` —
 /// this is the call site the ~35 tested-but-unreached entry points lacked.
 pub mod host;
+/// Reading .vcf files, so the Import button does something.
+pub mod vcard;
 pub mod settings_page;
 pub mod settings_store;
 /// The Network tab's seven STUN servers and the bitmask they persist as.
@@ -170,6 +172,14 @@ pub struct Snapclone {
     /// frames — a page-local scene forgets on every repaint, which
     /// presents as focus jumping rather than as a missing scene.
     pub a11y: uikit_egui::a11y::A11yScene,
+    /// vCard text waiting to be imported, set by a host that can read a
+    /// file. `None` until a file picker exists — which is why the import
+    /// action reports what is missing rather than failing silently.
+    pub pending_vcard_text: Option<String>,
+    /// What the last import attempt did, shown to the person. A count of
+    /// what was read and what was skipped, because "3 imported, 1
+    /// skipped" is actionable and a silent difference is not.
+    pub import_report: Option<String>,
     pub group_voice: crate::group_voice::GroupVoice,
     pub picker: crate::contacts::Picker,
     pub conversation: crate::conversation::Conversation,
@@ -569,6 +579,8 @@ impl Snapclone {
             // blank every launch is the same lie as one that never saved.
             settings: crate::settings_page::SettingsPage::new(crate::settings_store::load()),
             a11y: uikit_egui::a11y::A11yScene::new(),
+            pending_vcard_text: None,
+            import_report: None,
             group_voice: Default::default(),
             picker: Default::default(),
             cards: Default::default(),
@@ -1424,7 +1436,32 @@ impl Snapclone {
                 }
                 _ => {}
             },
-            Action::ImportVCard => {}
+            Action::ImportVCard => {
+                // WAS `=> {}`: a button a person can press, that looks
+                // like every other working button, and did nothing at
+                // all. Worse than a missing feature — a missing one is
+                // visible, while a present one that silently declines
+                // teaches people the app is unreliable, and they cannot
+                // tell whether the file was rejected, held no contacts,
+                // or was never read.
+                //
+                // The PARSE is ported (`vcard`, matching the Qt
+                // `VCardIO`'s field set so the two halves agree about
+                // each other's exports). What is still missing is the
+                // file dialog and the store write, so this reports what
+                // it would have imported rather than pretending to have
+                // done it.
+                self.import_report = Some(match &self.pending_vcard_text {
+                    Some(text) => {
+                        let (found, skipped) = crate::vcard::parse(text);
+                        format!(
+                            "vCard: {} contact(s) read, {skipped} skipped — no store yet",
+                            found.len()
+                        )
+                    }
+                    None => "vCard import needs a file picker — not wired yet".to_string(),
+                });
+            }
         }
     }
 
