@@ -3269,3 +3269,38 @@ of one SMITE map: decisively profitable — the regime the thesis was
 always about. Mover layers remain the lever to grow the per-take
 saving beyond 14% (actor regions still dominate the citing residual)
 and to let donor takes cite without repurchasing their own actors.
+
+### Mover-patch MVP: prices the static-patch approximation (same session)
+
+--patch-movers <thr>: regions persistently deviating from the cited
+canonical are the take's staged content; the take's own plate is
+built encoder-side, those regions spliced into the canonical, and
+only the patch travels (quasi-static splice at frame-0 motion —
+valid for the locked-set regime; general motion needs per-frame
+layer compositing, the full design). Patch bytes print separately
+and are NOT in total_bytes — honest totals below include them.
+
+Threshold matters: at thr=10, HALF the frame flags as mover — the
+detector conflates actors with the cross-take grain-decorrelation
+floor. thr=16 → 31% of regions, thr=24 → 21.5%.
+
+Measured, w1 (the donor take with the excellent self-model), dz20:
+  self:                707.8 KB @ 37.58
+  cited-plain:         883.6 KB @ 36.38
+  cited+patch thr16:   980.3 KB @ 37.41  (794.2 + 186.1 patch)
+  cited+patch thr24:   943.0 KB @ 37.15  (814.9 + 128.1 patch)
+
+Verdict: the patch is a real RD improvement to the CITED branch
+(+1.03 dB for +97 KB over cited-plain at thr16) but does NOT beat
+self-coding for a take with a good self-model, for two priced
+reasons: (1) scattered patch regions zstd ~35% worse per pixel than
+the same content inside a coherent whole plate; (2) the cited
+background still carries the grain-decorrelation residual outside
+patches. The per-take routing law stands unmodified: cite when the
+canonical beats your self-model, self-code otherwise; the patch
+raises the cited branch's ceiling and will matter most where
+self-plates are expensive (busy takes) or canonicals are engine-
+exact (no grain decorrelation). The full mover-layer design —
+movers as objects with their own motion, composited per frame —
+remains the named construction; this MVP measured its static
+approximation.

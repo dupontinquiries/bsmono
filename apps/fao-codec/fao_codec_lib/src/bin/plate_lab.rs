@@ -144,6 +144,96 @@ fn main() {
             ext = aligned;
         }
         let m2 = plate::motions_against_plate(&frames, &ext);
+        // --patch-movers <sad/px thr>: the mover-layer MVP. Regions that
+        // PERSISTENTLY deviate from the canonical are this take's staged
+        // content (fusion voted the actors out of the canonical — the
+        // donor-take asymmetry: it was repurchasing its own actors as
+        // residual). Detect them, build the take's own plate, splice
+        // those regions in, and transmit only the patch. Splice is at
+        // frame-0 motion (quasi-static assumption — valid for the
+        // locked-set citation regime this targets; general motion needs
+        // per-frame layer compositing, the full mover-layer design).
+        let ext = if let Some(thr_s) = arg_val(&args, "--patch-movers") {
+            let thr: f32 = thr_s.parse().unwrap_or(10.0);
+            const REGION: usize = 16;
+            let (fw, fh) = (frames[0].w, frames[0].h);
+            let (gw, gh) = (fw / REGION, fh / REGION);
+            let mut dev = vec![0f32; gw * gh];
+            let mut nsamp = 0u32;
+            let mut fi = 0;
+            while fi < frames.len() {
+                let pred = plate::predict_frame(&ext, &m2[fi], fw, fh);
+                for gy in 0..gh {
+                    for gx in 0..gw {
+                        let (rx, ry) = (gx * REGION, gy * REGION);
+                        let mut sad = 0u32;
+                        for dy in 0..REGION {
+                            for dx in 0..REGION {
+                                let a = pred.y[(ry + dy) * fw + rx + dx] as i32;
+                                let b = frames[fi].y[(ry + dy) * fw + rx + dx] as i32;
+                                sad += (a - b).unsigned_abs();
+                            }
+                        }
+                        dev[gy * gw + gx] += sad as f32 / (REGION * REGION) as f32;
+                    }
+                }
+                nsamp += 1;
+                fi += 4;
+            }
+            let mover: Vec<bool> = dev.iter().map(|d| d / nsamp as f32 > thr).collect();
+            let n_mover = mover.iter().filter(|&&m| m).count();
+            let self_plate = plate::build_plate(&frames, &m2);
+            let mut hybrid = ext.clone();
+            let m0 = &m2[0];
+            let mut patch: Vec<u8> = Vec::new();
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    if !mover[gy * gw + gx] {
+                        continue;
+                    }
+                    for dy in 0..REGION {
+                        for dx in 0..REGION {
+                            let (fx, fy) = ((gx * REGION + dx) as f32, (gy * REGION + dy) as f32);
+                            let sx = (fx - m0.dx - self_plate.ox).round() as isize;
+                            let sy = (fy - m0.dy - self_plate.oy).round() as isize;
+                            let hx = (fx - m0.dx - hybrid.ox).round() as isize;
+                            let hy = (fy - m0.dy - hybrid.oy).round() as isize;
+                            if sx >= 0 && sy >= 0 && (sx as usize) < self_plate.w && (sy as usize) < self_plate.h
+                                && hx >= 0 && hy >= 0 && (hx as usize) < hybrid.w && (hy as usize) < hybrid.h
+                            {
+                                let v = self_plate.y[sy as usize * self_plate.w + sx as usize];
+                                hybrid.y[hy as usize * hybrid.w + hx as usize] = v;
+                                patch.push(v);
+                                // chroma at half res
+                                if dx % 2 == 0 && dy % 2 == 0 {
+                                    let (scx, scy) = (sx as usize / 2, sy as usize / 2);
+                                    let (hcx, hcy) = (hx as usize / 2, hy as usize / 2);
+                                    let cw_s = self_plate.w / 2;
+                                    let cw_h = hybrid.w / 2;
+                                    let cu = self_plate.u[scy * cw_s + scx];
+                                    let cv = self_plate.v[scy * cw_s + scx];
+                                    hybrid.u[hcy * cw_h + hcx] = cu;
+                                    hybrid.v[hcy * cw_h + hcx] = cv;
+                                    patch.push(cu);
+                                    patch.push(cv);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let patch_bytes = zstd::encode_all(patch.as_slice(), 19).map(|c| c.len()).unwrap_or(patch.len())
+                + (gw * gh + 7) / 8;
+            println!(
+                "mover_patch: {} of {} regions ({:.1}%), patch_bytes {}",
+                n_mover, gw * gh,
+                100.0 * n_mover as f32 / (gw * gh) as f32,
+                patch_bytes
+            );
+            hybrid
+        } else {
+            ext
+        };
         (ext, m2, true)
     } else {
         (plate::build_plate(&frames, &motions), motions, false)
