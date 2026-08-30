@@ -3182,3 +3182,44 @@ token stream is appending to.
 - **C12-58b — `blind` is always false**, so `diverged()` still works but
   the "held back as a control" state can never display. That needs the
   fan to model blindness, which is a design change rather than wiring.
+
+## 59. The debate feature is four modules deep and one entry short
+
+Followed `voiceconfirm` (uncalled, §40a) to find its host, and turned up
+a whole chain rather than one gap.
+
+    debatepanel     — the strip.        WIRED this session (§58).
+    voiceconfirm    — confirm an interjection before it acts. UNCALLED.
+    panelvoice      — `triage`, `Share`, blindness. Lives in the
+                      `logscope` crate, complete, with tests. UNCALLED
+                      from the egui side.
+    coordinator.rs  — names the problem in a test comment:
+                      "They were built (panelmode, panelvoice,
+                      deliberate) and never given an entry, which is why
+                      the debate panel could not be found in the menu."
+
+So somebody already diagnosed this and wrote it into a test that passes,
+which is the most durable place to leave a finding and also the least
+likely to be read.
+
+Three things follow:
+
+  - `logscope-egui` ALREADY depends on the `logscope` crate —
+    `liaisonhud` imports `logscope::liaison::Statement`. So reaching
+    `panelvoice` is an import, not a dependency change. The chain is
+    shorter than it looks.
+  - §58's `blind: false` is not a gap in the fan so much as a
+    consequence of this one: `panelvoice` models blindness and nothing
+    on the egui side calls it.
+  - `voiceconfirm` cannot be usefully hosted before `panelvoice` is,
+    because its whole point is showing WHO an interjection will reach,
+    and `Reach` is decided by `panelvoice::Share`.
+
+- **C12-59a — NOT built, deliberately.** The remaining work is a voice
+  ingest path feeding `triage`, and this sandbox cannot exercise voice
+  input at all. Building it blind would produce the thing this session
+  keeps finding: another complete module with no caller, added to a
+  chain that already has three.
+
+  The honest next step is one entry point — the menu item
+  `coordinator.rs` says is missing — not another layer.
