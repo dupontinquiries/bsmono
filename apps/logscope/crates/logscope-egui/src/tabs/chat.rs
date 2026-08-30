@@ -1343,6 +1343,13 @@ pub struct Chat {
     expanded_msgs: std::collections::HashSet<usize>,
     /// Running backend account shown under the newest message while a reply is generating.
     hud: crate::liaisonhud::Hud,
+    /// The strongest thing the reply in flight may assert.
+    ///
+    /// Set by the routing matrix when a generation starts. Held so the
+    /// reply can be recorded at its real epistemic kind rather than
+    /// being assumed to be fact — which is what happened when every turn
+    /// went to one model with one set of permissions.
+    route_ceiling: Option<crate::liaison::Epistemic>,
     /// The liaison model's phrasing of the HUD, when one has produced a line. Empty = show the raw
     /// observation instead, which cannot be wrong because it is copied from the engine.
     hud_narration: String,
@@ -1469,6 +1476,7 @@ impl Default for Chat {
             watch_full: String::new(), watch_gist: None,
             expanded_msgs: Default::default(),
             hud: crate::liaisonhud::Hud::new(8), hud_narration: String::new(),
+            route_ceiling: None,
             show_metrics: false, metrics_base: Default::default(), metrics_wall_ns: 0, metrics_tokens: 0, metrics_start: None,
             vault: autosave_path().and_then(|p| p.parent().map(|d| d.join("vault")))
                 .and_then(|d| crate::vault::Vault::open(d).ok()),
@@ -2869,6 +2877,49 @@ reply is framed differently from the turn that produced it.");
     }
 
     fn start_generation(&mut self, qt: String, parent: Option<usize>, infer: &Inference, doc: &crate::analysis::Doc) {
+        // ROUTE THE PROMPT before generating.
+        //
+        // Every turn used to go to the same model with the same
+        // permissions, which is why `liaison`'s epistemic discipline
+        // applied to nothing: the HUD was fed engine telemetry and never
+        // a statement carrying a kind. The matrix decides destination and
+        // CEILING; the ceiling is what stops a model asserting the
+        // runtime's own facts.
+        let route = crate::promptroute::route(
+            crate::promptroute::classify(&qt),
+            crate::promptroute::Available {
+                // `detected_template()` is Some only after a successful
+                // load — the worker publishes it and 255 means nothing
+                // loaded. Using it rather than a cached per-tab flag for
+                // the same reason the prompt builder does: a tab created
+                // after the load would otherwise think no model exists.
+                engine: infer.detected_template().is_some(),
+                // No roster yet — `workergen` has no caller, so no route
+                // can reach a worker. Stated as a field rather than
+                // hidden in the matrix so it flips to true in one place
+                // when the roster lands.
+                workers: false,
+                runtime: true,
+            },
+        );
+        // The operator's own words, recorded as what they are. This is
+        // the statement kind the HUD never got: it only ever saw
+        // telemetry, so nothing on screen distinguished "you said this"
+        // from "the engine measured this".
+        self.hud.observe(qt.chars().take(80).collect::<String>(), "operator");
+        if route.dest == crate::promptroute::Dest::Nowhere {
+            // Refuse rather than answer. A question about the run with
+            // nothing able to answer it must not fall through to a model
+            // that will answer anyway — that is the failure the matrix
+            // exists to make unreachable, and it is worth the same
+            // handling here as in the table.
+            self.note = "nothing loaded can answer that — load a model, or ask about the run once \
+                         a run has happened"
+                .to_string();
+            return;
+        }
+        self.route_ceiling = Some(route.ceiling);
+
         // fresh reply → fresh stepwise accounting
         self.step_last_paused = 0; self.step_continues = 0; self.step_pending_continue = false; self.step_arm_continue = false;
         if !self.msgs.is_empty() {

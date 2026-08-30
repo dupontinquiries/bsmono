@@ -2849,3 +2849,46 @@ Decisions worth keeping:
 - **C12-49b — `workergen` still has no caller.** `Dest::Worker` now
   names a destination for it, which is the first half; the roster and
   the corpus source are the second.
+
+## 50. Routing wired into the chat send path — and two liaisons, not one
+
+`promptroute::route` now runs in `Chat::start_generation`, which every
+plain chat turn passes through. Destination and ceiling are decided
+before generating; `Dest::Nowhere` REFUSES with a note rather than
+falling through to a model, which is the whole point of the matrix.
+
+`engine:` reads `infer.detected_template().is_some()` rather than a
+cached per-tab flag. Same reasoning the prompt builder already
+documents: the worker publishes the template on every successful load,
+and a tab created after the load would otherwise believe no model
+exists.
+
+The operator's own words are now recorded to the HUD tagged "operator" —
+the first non-telemetry statement it has ever received. Before this it
+only ever saw "N GPU submits" and "N fills, N GiB moved", so nothing on
+screen distinguished "you said this" from "the engine measured this".
+
+**FOUND: there are TWO liaison modules, and they are not duplicates.**
+
+    logscope-egui/src/liaison.rs  (450 lines)  — Epistemic, Statement{kind,text}
+    logscope/src/liaison.rs       (467 lines)  — ModelStatus, Statement{text,grounds}
+
+The egui one tracks WHAT KIND of knowledge a claim is (operator /
+organization / inference / unknown / known-empty). The crate one tracks
+WHAT A CLAIM RESTS ON (branch and event ids; empty grounds means the
+claim is about absence). `liaisonhud` imports the CRATE one, so the HUD
+stores grounds and has no field for kind.
+
+These are complementary, not redundant — a claim has both a kind and a
+basis — but nothing bridges them, which is why `route_ceiling` cannot
+currently be recorded alongside a HUD line.
+
+- **C12-50a — the reply is not yet recorded at its ceiling.**
+  `route_ceiling` is stored and unused. Recording it needs the bridge
+  above: either the HUD's Statement grows a `kind`, or the two liaisons
+  merge. Merging is the larger and probably correct answer, and is not a
+  thing to start at the end of a session.
+- **C12-50b — `workers: false` is hardcoded** in the routing call, so no
+  route can reach `Dest::Worker` yet. Written as an explicit field
+  rather than hidden inside the matrix so it flips in ONE place when the
+  roster lands.
