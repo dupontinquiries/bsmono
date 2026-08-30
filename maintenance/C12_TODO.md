@@ -3223,3 +3223,39 @@ Three things follow:
 
   The honest next step is one entry point — the menu item
   `coordinator.rs` says is missing — not another layer.
+
+## 60. unhosted_check was crate-blind — 35 gitmind findings, 7-of-8 wrong
+
+Pointed the checker at gitmind and it reported 35 uncalled modules.
+Hand-checked the first eight before acting, as the rule now is, and
+seven were FALSE POSITIVES: `core::checks` is called from `cli`,
+`varcache` has 25 cross-crate references, `appcatalog` 22.
+
+The cause: `audit` scanned only the `src/` beside each crate root, so
+every module of a LIBRARY crate looked uncalled — its callers live in a
+different crate by construction. gitmind is five crates (core, cli,
+cockpit, gui, gui-egui), which is why it showed the fault so clearly and
+the single-crate egui frontends never did.
+
+Fixed to scan the whole checked tree. gitmind 35 -> 13.
+
+RE-RAN the earlier findings, since a tool fix is exactly what should
+make me re-examine conclusions already drawn:
+  - voiceterm 0, snapclone 0 — unchanged.
+  - blackstar-rs 12 uncalled / 24 cli-only — §33's conclusion holds.
+  - logscope-egui 12 -> 8. So FOUR of the twelve I hand-checked in §40a
+    were cross-crate after all. The two I examined closely and acted on
+    — `picking` (deleted, superseded by `scenepick`) and `chat_layout`
+    (wired) — were both in the surviving eight, so no wrong action was
+    taken. But my sentence "all twelve confirmed real" was wrong, and
+    the hand-check I was relying on used the same crate-blind grep the
+    tool did.
+
+That last point is the lesson. I verified the tool's output with a
+method that shared the tool's blind spot, then reported the agreement as
+confirmation. Checking by hand only helps when the hand-check differs
+from the machine.
+
+- **C12-60a — logscope's remaining 8 and gitmind's 13 are unexamined**
+  at the new scope. Same rule: hand-check with a WHOLE-TREE grep before
+  claiming anything about them.

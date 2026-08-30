@@ -61,11 +61,33 @@ def crate_roots(root: Path):
             yield p
 
 
+# The whole checked tree, so cross-crate callers are visible. Set by
+# main(); None keeps the old single-crate behaviour.
+_TREE_ROOT = None
+
+
 def audit(rs: Path):
     text = rs.read_text(errors="replace")
     src = rs.parent
     mods = MOD_RE.findall(text)
+    # SIBLINGS ACROSS THE WHOLE CHECKED TREE, not just this crate.
+    #
+    # Scanning only the `src/` beside the crate root reports every module
+    # of a LIBRARY crate as uncalled, because its callers live in a
+    # different crate. Run against gitmind that was 35 findings, and of
+    # the first eight I checked by hand seven were false positives:
+    # `core::checks` is called from `cli`, `varcache` has 25 cross-crate
+    # references.
+    #
+    # A checker wrong about most of what it reports teaches people to
+    # ignore it, which is worse than not having it — the same lesson as
+    # the alias fix, one scope up.
     siblings = [p for p in src.rglob("*.rs") if p != rs]
+    if _TREE_ROOT is not None:
+        siblings = [
+            p for p in _TREE_ROOT.rglob("*.rs")
+            if p != rs and "/target/" not in str(p)
+        ]
     out = []
     for m in mods:
         mod_file = src / f"{m}.rs"
@@ -120,6 +142,8 @@ def audit(rs: Path):
 
 def main(argv) -> int:
     root = Path(argv[1] if len(argv) > 1 else ".")
+    global _TREE_ROOT
+    _TREE_ROOT = root
     findings = []
     for rs in crate_roots(root):
         for m, kind, tested, path in audit(rs):
