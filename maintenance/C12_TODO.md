@@ -3215,11 +3215,30 @@ Three things follow:
     because its whole point is showing WHO an interjection will reach,
     and `Reach` is decided by `panelvoice::Share`.
 
-- **C12-59a — NOT built, deliberately.** The remaining work is a voice
-  ingest path feeding `triage`, and this sandbox cannot exercise voice
-  input at all. Building it blind would produce the thing this session
-  keeps finding: another complete module with no caller, added to a
-  chain that already has three.
+- **C12-59a — I WAS WRONG about what is missing.** I said the remaining
+  work was "a voice ingest path feeding triage". The ingest path already
+  exists and is running:
+
+      mic → whisper_pool → voice::poll_passes() → voice_session::poll()
+          → transcriber → utterances
+
+  `VOICE_BASE.md` documents it, `voice_session.rs` drains it, and
+  `tabs/chat.rs` owns a live `VoiceSession` and pumps it every frame.
+
+  So the gap is ONE HOP, not a pipeline: finished utterances reach
+  `VoiceTick.utterances` and nothing turns them into `panelvoice::Ask`s
+  for `triage`. Everything upstream and downstream of that hop is built.
+
+  **Why I got it wrong, which matters more than the correction:** I
+  reasoned from "this sandbox cannot exercise voice" to "the voice path
+  must be unbuilt". Those are different claims. Not being able to RUN
+  something is not evidence about whether it EXISTS, and I had a
+  `VOICE_BASE.md` in the app root the whole time saying it does.
+
+  The operator's question — whether repeated "keep working" plus the Qt
+  predecessors would carry these chains to completion — has a concrete
+  answer here: yes, and the reference material was already in-tree. The
+  limit was mine, not the sandbox's.
 
   The honest next step is one entry point — the menu item
   `coordinator.rs` says is missing — not another layer.
