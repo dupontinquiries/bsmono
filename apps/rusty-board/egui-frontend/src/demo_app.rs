@@ -14,6 +14,11 @@ use crate::{apply_theme, keyboard_ui, Board};
 use uikit_egui::Adaptive;
 
 struct Feel {
+    /// The accessibility scene widgets register with. Held here rather
+    /// than built per frame because `A11yScene` remembers focus BY ID
+    /// between frames; a per-frame scene forgets, which presents as
+    /// focus jumping rather than as a missing scene.
+    a11y: uikit_egui::a11y::A11yScene,
     board: Board,
     /// The minimized tray, the microterm and dictation — three ported surfaces
     /// the demo could not reach. A keyboard that cannot minimise, cannot show
@@ -88,6 +93,7 @@ struct Feel {
 impl Feel {
     pub fn new() -> Feel {
         Feel {
+            a11y: uikit_egui::a11y::A11yScene::new(),
             trail_style: TrailStyle::Solid,
             board: Board::new(),
             real: RealBoard::new(),
@@ -274,7 +280,14 @@ impl eframe::App for Feel {
                 }
                 ui.separator();
                 let mut dbg = trail_debug_styling();
-                if ui.checkbox(&mut dbg, "trail shows gesture category").changed() {
+                // `note` returns the Response, so it composes with the
+                // `.changed()` this call site already depends on —
+                // `semantic_toggle` would have returned a bool and forced
+                // the surrounding logic to be rewritten to gain a11y.
+                if uikit_egui::a11y::note(
+                    &mut self.a11y, egui::Id::new("rusty_board.trail_debug").value(),
+                    "trail shows gesture category", dbg,
+                    ui.checkbox(&mut dbg, "trail shows gesture category")).changed() {
                     set_trail_debug_styling(dbg);
                 }
                 if dbg {

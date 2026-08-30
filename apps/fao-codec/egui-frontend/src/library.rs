@@ -122,6 +122,9 @@ impl State {
 }
 
 pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
+    // Borrow split: `st` below takes `&mut app.library`, so the scene has
+    // to be lifted out first. Fourth app to need this exact line.
+    let a11y = &mut app.a11y;
     let st = &mut app.library;
     st.poll_bench();
     ui.heading("🔗 FAO Web Library");
@@ -140,7 +143,14 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
             .on_hover_text("Stop using the library; encoder/decoder go standalone").clicked() { st.detach(); }
     });
     let writable_before = st.writable;
-    ui.checkbox(&mut st.writable, "Writable (this encode adds new canonicals)")
+    // Registered through `note` rather than drawn by `semantic_toggle`,
+    // because that hover text is the only place the read-only/contributing
+    // distinction is explained — and a toggle that grows a curated library
+    // is exactly the one a person wants explained before they flip it.
+    uikit_egui::a11y::note(
+        a11y, egui::Id::new("fao.library.writable").value(),
+        "Writable (this encode adds new canonicals)", st.writable,
+        ui.checkbox(&mut st.writable, "Writable (this encode adds new canonicals)"))
         .on_hover_text("Off = read-only (curated lib safety). On = this encode contributes its canonicals, growing the library for future encodes.");
     if st.writable != writable_before { st.refresh_status(); }
     ui.add_space(6.0);

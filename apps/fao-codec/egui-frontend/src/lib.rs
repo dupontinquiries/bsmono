@@ -27,6 +27,13 @@ pub enum Tab {
 }
 
 pub struct App {
+    /// The accessibility scene widgets register with.
+    ///
+    /// Parity reported `a11y=0` for this app. Held on `App` rather than
+    /// built per frame because `A11yScene` remembers focus BY ID between
+    /// frames — a per-frame scene forgets, which presents as focus
+    /// jumping rather than as a missing scene.
+    pub a11y: uikit_egui::a11y::A11yScene,
     pub tab: Tab,
     pub prefs: settings_kit::Prefs,
     pub lab: lab::State,
@@ -39,7 +46,7 @@ impl Default for App {
     fn default() -> Self {
         let mut prefs = settings_kit::Prefs::default();
         prefs.palette = "system".to_string();
-        App { tab: Tab::Lab, prefs, lab: lab::State::default(), seq: seq_page::SeqState::default(), library: library::State::default(), player: player::State::default() }
+        App { a11y: uikit_egui::a11y::A11yScene::new(), tab: Tab::Lab, prefs, lab: lab::State::default(), seq: seq_page::SeqState::default(), library: library::State::default(), player: player::State::default() }
     }
 }
 
