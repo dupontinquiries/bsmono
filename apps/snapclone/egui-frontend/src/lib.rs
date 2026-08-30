@@ -165,6 +165,11 @@ pub struct Snapclone {
     pub inbox: crate::inbox::Inbox,
     pub composer: crate::composer::Composer,
     pub settings: crate::settings_page::SettingsPage,
+    /// The accessibility scene the settings toggles register with.
+    /// Held here rather than in the page so focus survives between
+    /// frames — a page-local scene forgets on every repaint, which
+    /// presents as focus jumping rather than as a missing scene.
+    pub a11y: uikit_egui::a11y::A11yScene,
     pub group_voice: crate::group_voice::GroupVoice,
     pub picker: crate::contacts::Picker,
     pub conversation: crate::conversation::Conversation,
@@ -563,6 +568,7 @@ impl Snapclone {
             // Load from disk rather than defaults: a settings page that starts
             // blank every launch is the same lie as one that never saved.
             settings: crate::settings_page::SettingsPage::new(crate::settings_store::load()),
+            a11y: uikit_egui::a11y::A11yScene::new(),
             group_voice: Default::default(),
             picker: Default::default(),
             cards: Default::default(),
@@ -2907,7 +2913,7 @@ impl Snapclone {
         // structs holding a startup timeout would disagree the first time
         // one of them was saved and the other was not.
         crate::settings_page::settings_ui(ui, &mut self.settings,
-                                          &mut self.camera_policy, c);
+                                          &mut self.camera_policy, c, &mut self.a11y);
         // Persist. The io error is SHOWN rather than swallowed — a Save that
         // silently fails is the same lie as one that never wrote, and a
         // read-only config dir is a real thing on locked-down devices.

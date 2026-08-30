@@ -496,9 +496,22 @@ impl SettingsPage {
 }
 
 /// Draw the page body for the current tab.
+/// The settings page. `a11y` is the scene every toggle registers with.
+///
+/// The parity audit reported `a11y=0` for this app — the registry has
+/// existed since bot-arena adopted it and nothing here fed it. A
+/// settings page is the worst place for that: it is where someone
+/// configuring assistive input has to be able to work, and its 25
+/// toggles are the easiest case the registry handles.
+///
+/// Ids are derived from the FIELD NAME, not the position, because
+/// `A11yScene` keeps focus across frames by id — a position-derived id
+/// would move focus to a different control whenever a section above it
+/// grew, and this page has tabs that change length.
 pub fn settings_ui(ui: &mut egui::Ui, page: &mut SettingsPage,
                    policy: &mut crate::camera_policy::CameraPolicy,
-                   colors: &uikit_egui::PaletteColors) {
+                   colors: &uikit_egui::PaletteColors,
+                   a11y: &mut uikit_egui::a11y::A11yScene) {
     let dirty = page.dirty_tabs();
     ui.horizontal(|ui| {
         for t in Tab::ALL {
@@ -512,11 +525,11 @@ pub fn settings_ui(ui: &mut egui::Ui, page: &mut SettingsPage,
     let tab = page.tab;
     let c = &mut page.current;
     match tab {
-        Tab::General => general_ui(ui, &mut c.general, colors),
-        Tab::Camera => camera_ui(ui, &mut c.camera, policy, colors),
-        Tab::Network => network_ui(ui, &mut c.network, colors),
-        Tab::Storage => storage_ui(ui, &mut c.storage, colors),
-        Tab::About => about_ui(ui, &mut c.about, colors),
+        Tab::General => general_ui(ui, &mut c.general, colors, a11y),
+        Tab::Camera => camera_ui(ui, &mut c.camera, policy, colors, a11y),
+        Tab::Network => network_ui(ui, &mut c.network, colors, a11y),
+        Tab::Storage => storage_ui(ui, &mut c.storage, colors, a11y),
+        Tab::About => about_ui(ui, &mut c.about, colors, a11y),
     }
     let problems = page.problems();
     if !problems.is_empty() {
@@ -546,7 +559,7 @@ fn heading(ui: &mut egui::Ui, text: &str, colors: &uikit_egui::PaletteColors) {
     ui.label(egui::RichText::new(text.to_uppercase()).small().strong().color(colors.text_weak));
 }
 
-fn general_ui(ui: &mut egui::Ui, g: &mut General, colors: &uikit_egui::PaletteColors) {
+fn general_ui(ui: &mut egui::Ui, g: &mut General, colors: &uikit_egui::PaletteColors, a11y: &mut uikit_egui::a11y::A11yScene) {
     heading(ui, "Identity", colors);
     ui.text_edit_singleline(&mut g.display_name);
 
@@ -570,26 +583,44 @@ fn general_ui(ui: &mut egui::Ui, g: &mut General, colors: &uikit_egui::PaletteCo
                 }
             });
     }
-    ui.checkbox(&mut g.unified_nav, "unified bottom navigation");
-    ui.checkbox(&mut g.scroll_invert_trackpad, "reverse scroll-to-navigate (trackpad)");
-    ui.checkbox(&mut g.scroll_invert_mouse, "reverse scroll-to-navigate (mouse wheel)");
-    ui.checkbox(&mut g.scroll_invert_touch, "reverse scroll-to-navigate (touch drag)");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.unified_nav").value(),
+        "unified bottom navigation", &mut g.unified_nav);
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.scroll_invert_trackpad").value(),
+        "reverse scroll-to-navigate (trackpad)", &mut g.scroll_invert_trackpad);
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.scroll_invert_mouse").value(),
+        "reverse scroll-to-navigate (mouse wheel)", &mut g.scroll_invert_mouse);
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.scroll_invert_touch").value(),
+        "reverse scroll-to-navigate (touch drag)", &mut g.scroll_invert_touch);
 
     heading(ui, "Calls", colors);
-    ui.checkbox(&mut g.long_calls, "enable long calls");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.long_calls").value(),
+        "enable long calls", &mut g.long_calls);
     ui.label(egui::RichText::new(if g.long_calls {
         "calls stay open until you end them"
     } else {
         "calls auto-close after long silences"
     }).small().color(colors.text_weak));
-    ui.checkbox(&mut g.proximity_screensaver, "proximity screensaver");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.proximity_screensaver").value(),
+        "proximity screensaver", &mut g.proximity_screensaver);
 
     heading(ui, "Privacy", colors);
-    ui.checkbox(&mut g.read_receipts, "send read receipts");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.read_receipts").value(),
+        "send read receipts", &mut g.read_receipts);
     ui.checkbox(&mut g.share_location,
                 "share location with contacts when I tap the location button");
-    ui.checkbox(&mut g.share_photo_location, "attach my location to every photo snap I send");
-    ui.checkbox(&mut g.record_audio, "record audio with video snaps");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.share_photo_location").value(),
+        "attach my location to every photo snap I send", &mut g.share_photo_location);
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.record_audio").value(),
+        "record audio with video snaps", &mut g.record_audio);
     ui.horizontal(|ui| {
         ui.label("manual position");
         ui.add(egui::TextEdit::singleline(&mut g.manual_lat).desired_width(80.0).hint_text("lat"));
@@ -598,17 +629,25 @@ fn general_ui(ui: &mut egui::Ui, g: &mut General, colors: &uikit_egui::PaletteCo
 
     heading(ui, "Sounds", colors);
     ui.add(egui::Slider::new(&mut g.ringtone_gain, 0..=200).suffix("%").text("ringtone gain"));
-    ui.checkbox(&mut g.ringtone_muted, "mute ringtone");
-    ui.checkbox(&mut g.mic_pipeline_off, "turn off microphone (app-wide)");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.ringtone_muted").value(),
+        "mute ringtone", &mut g.ringtone_muted);
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.mic_pipeline_off").value(),
+        "turn off microphone (app-wide)", &mut g.mic_pipeline_off);
 }
 
 fn camera_ui(ui: &mut egui::Ui, c: &mut Camera,
              policy: &mut crate::camera_policy::CameraPolicy,
-             colors: &uikit_egui::PaletteColors) {
+             colors: &uikit_egui::PaletteColors, a11y: &mut uikit_egui::a11y::A11yScene) {
     heading(ui, "Camera", colors);
     ui.text_edit_singleline(&mut c.device);
-    ui.checkbox(&mut c.mirror_front, "mirror the front camera");
-    ui.checkbox(&mut c.shutter_sound, "shutter sound");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.mirror_front").value(),
+        "mirror the front camera", &mut c.mirror_front);
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.shutter_sound").value(),
+        "shutter sound", &mut c.shutter_sound);
     combo(ui, "rear camera backend", &mut c.rear_backend, CameraBackend::ALL);
     combo(ui, "front camera backend", &mut c.front_backend, CameraBackend::ALL);
 
@@ -644,14 +683,20 @@ fn camera_ui(ui: &mut egui::Ui, c: &mut Camera,
                                        "only when speech is detected"));
 
     heading(ui, "Face library", colors);
-    ui.checkbox(&mut c.face_library, "recognise faces on this device");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.face_library").value(),
+        "recognise faces on this device", &mut c.face_library);
 }
 
-fn network_ui(ui: &mut egui::Ui, n: &mut Network, colors: &uikit_egui::PaletteColors) {
+fn network_ui(ui: &mut egui::Ui, n: &mut Network, colors: &uikit_egui::PaletteColors, a11y: &mut uikit_egui::a11y::A11yScene) {
     heading(ui, "Peer discovery", colors);
     combo_indexed(ui, "backend", &mut n.discovery_backend, DiscoveryBackend::ALL);
-    ui.checkbox(&mut n.jami_enabled, "enable Jami backend");
-    ui.checkbox(&mut n.upnp, "enable UPnP / NAT-PMP");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.jami_enabled").value(),
+        "enable Jami backend", &mut n.jami_enabled);
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.upnp").value(),
+        "enable UPnP / NAT-PMP", &mut n.upnp);
 
     heading(ui, "STUN", colors);
     ui.label(egui::RichText::new(
@@ -697,7 +742,9 @@ fn network_ui(ui: &mut egui::Ui, n: &mut Network, colors: &uikit_egui::PaletteCo
 
     heading(ui, "Crypto", colors);
     combo_indexed(ui, "backend", &mut n.crypto_backend, CryptoBackend::ALL);
-    ui.checkbox(&mut n.require_encryption, "require encryption");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.require_encryption").value(),
+        "require encryption", &mut n.require_encryption);
 
     heading(ui, "Ports", colors);
     ui.add(egui::DragValue::new(&mut n.listen_port).range(1..=65535).prefix("listen "));
@@ -705,9 +752,11 @@ fn network_ui(ui: &mut egui::Ui, n: &mut Network, colors: &uikit_egui::PaletteCo
     ui.add(egui::DragValue::new(&mut n.gossip_port).range(1..=65535).prefix("gossip "));
 }
 
-fn storage_ui(ui: &mut egui::Ui, s: &mut Storage, colors: &uikit_egui::PaletteColors) {
+fn storage_ui(ui: &mut egui::Ui, s: &mut Storage, colors: &uikit_egui::PaletteColors, a11y: &mut uikit_egui::a11y::A11yScene) {
     heading(ui, "Retention", colors);
-    ui.checkbox(&mut s.keep_everything, "never auto-delete snaps (power user)");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.keep_everything").value(),
+        "never auto-delete snaps (power user)", &mut s.keep_everything);
     // Greyed rather than hidden: a control that disappears looks like a bug,
     // and the point is to show that the day count is being overridden.
     ui.add_enabled(!s.keep_everything,
@@ -722,23 +771,37 @@ fn storage_ui(ui: &mut egui::Ui, s: &mut Storage, colors: &uikit_egui::PaletteCo
     });
 
     heading(ui, "Ambient", colors);
-    ui.checkbox(&mut s.ambient_enabled, "ambient background effects");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.ambient_enabled").value(),
+        "ambient background effects", &mut s.ambient_enabled);
 }
 
-fn about_ui(ui: &mut egui::Ui, a: &mut About, colors: &uikit_egui::PaletteColors) {
+fn about_ui(ui: &mut egui::Ui, a: &mut About, colors: &uikit_egui::PaletteColors, a11y: &mut uikit_egui::a11y::A11yScene) {
     ui.label(format!("snapclone {}", env!("CARGO_PKG_VERSION")));
 
     heading(ui, "Diagnostics", colors);
-    ui.checkbox(&mut a.debug_trace, "verbose tracing");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.debug_trace").value(),
+        "verbose tracing", &mut a.debug_trace);
 
     heading(ui, "Debug & FSM tuning", colors);
-    ui.checkbox(&mut a.no_fsm_tuning, "disable FSM / per-peer routing tuning");
-    ui.checkbox(&mut a.no_monitoring_blocking, "FSM validators log but never reject");
-    ui.checkbox(&mut a.verbose_fsm, "verbose FSM transition logging");
-    ui.checkbox(&mut a.mobile_display_debug, "mobile display debug (vkb, modals, dialogs)");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.no_fsm_tuning").value(),
+        "disable FSM / per-peer routing tuning", &mut a.no_fsm_tuning);
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.no_monitoring_blocking").value(),
+        "FSM validators log but never reject", &mut a.no_monitoring_blocking);
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.verbose_fsm").value(),
+        "verbose FSM transition logging", &mut a.verbose_fsm);
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.mobile_display_debug").value(),
+        "mobile display debug (vkb, modals, dialogs)", &mut a.mobile_display_debug);
 
     heading(ui, "Beta testers", colors);
-    ui.checkbox(&mut a.micro_dht_enabled, "use local micro-DHT instead of the real DHT");
+    uikit_egui::a11y::semantic_toggle(
+        ui, a11y, egui::Id::new("snapclone.settings.micro_dht_enabled").value(),
+        "use local micro-DHT instead of the real DHT", &mut a.micro_dht_enabled);
     ui.add_enabled(a.micro_dht_enabled,
         egui::TextEdit::singleline(&mut a.micro_dht_host).hint_text("127.0.0.1:4544"));
     ui.label(egui::RichText::new(if a.micro_dht_enabled {
