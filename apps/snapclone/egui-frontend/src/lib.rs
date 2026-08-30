@@ -22,6 +22,10 @@ pub mod outbox;
 pub mod group_voice;
 pub mod settings_page;
 pub mod settings_store;
+/// The Network tab's seven STUN servers and the bitmask they persist as.
+pub mod stun_servers;
+/// The Network tab's relay dropdown and the preset/custom URL resolution.
+pub mod relay_preset;
 pub mod inbox;
 pub mod unified_nav;
 pub mod friends;
@@ -2881,7 +2885,13 @@ impl Snapclone {
         // The five real tab bodies from settings_page.rs, not one row of
         // background styles. The background picker stays as an appearance
         // control, but it is no longer the whole page.
-        crate::settings_page::settings_ui(ui, &mut self.settings, c);
+        // The camera policy is passed THROUGH rather than mirrored into
+        // Settings: the Tuning spin boxes edit it in place, matching Qt
+        // reading and writing CameraPolicyStore::instance() directly. Two
+        // structs holding a startup timeout would disagree the first time
+        // one of them was saved and the other was not.
+        crate::settings_page::settings_ui(ui, &mut self.settings,
+                                          &mut self.camera_policy, c);
         // Persist. The io error is SHOWN rather than swallowed — a Save that
         // silently fails is the same lie as one that never wrote, and a
         // read-only config dir is a real thing on locked-down devices.

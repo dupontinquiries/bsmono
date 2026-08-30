@@ -4,8 +4,8 @@
   "surfaces": 46,
   "covered": 46,
   "pct": 100,
-  "wired": 32,
-  "wired_pct": 70,
+  "wired": 33,
+  "wired_pct": 72,
   "live": 46,
   "live_pct": 100,
   "stranded": [],
@@ -50,8 +50,8 @@
    null
   ],
   "kit": {
-   "a11y": 0,
-   "nav": 0,
+   "a11y": 1,
+   "nav": 1,
    "adaptive": 0,
    "gesture": 1
   }
@@ -216,8 +216,8 @@
   ],
   "kit": {
    "a11y": 0,
-   "nav": 0,
-   "adaptive": 0,
+   "nav": 1,
+   "adaptive": 1,
    "gesture": 0
   }
  },
@@ -271,7 +271,7 @@
   "kit": {
    "a11y": 0,
    "nav": 0,
-   "adaptive": 2,
+   "adaptive": 3,
    "gesture": 0
   }
  }
