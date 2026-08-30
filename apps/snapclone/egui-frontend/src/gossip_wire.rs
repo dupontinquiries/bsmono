@@ -69,6 +69,16 @@ pub struct Announce {
     /// Unix ms, as the sender reports it.
     pub ts: u64,
     pub peers: Vec<PeerRecord>,
+    /// The sender's Ed25519 verifying key, when the datagram carried one.
+    /// `None` for a Qt sender, which does not sign.
+    pub public: Option<[u8; 32]>,
+    /// Set by [`decode`] only: the signature checked out AND the sender's
+    /// sc-ID is the fingerprint of the key that made it.
+    ///
+    /// Not a field a caller fills in. It is `false` on anything constructed by
+    /// hand, which is the safe direction — the one way to get `true` is to have
+    /// been decoded from bytes that verified.
+    pub verified: bool,
 }
 
 impl Announce {
@@ -84,9 +94,20 @@ impl Announce {
             host: self.host.clone(),
             port: self.port,
             last_seen_ms: self.ts,
-            verified: false,
+            verified: self.verified,
         }
     }
+}
+
+fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
+
+fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    if s.len() != N * 2 { return None; }
+    let mut out = [0u8; N];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------- encoding
@@ -130,6 +151,31 @@ pub fn encode(a: &Announce) -> Result<Vec<u8>, Reject> {
         s.push_str(&format!(",\"port\":{},\"ts\":{}}}", p.port, p.last_seen_ms));
     }
     s.push_str("]}");
+    if s.len() > MAX_DATAGRAM_BYTES { return Err(Reject::TooLarge); }
+    Ok(s.into_bytes())
+}
+
+/// Sign an announcement and emit the datagram peers actually see.
+///
+/// The signed bytes are exactly what [`encode`] produces — the message WITHOUT
+/// `pk` and `sig` — and the two fields are appended after. That makes the
+/// signing input a function of the parsed value rather than of where a field
+/// happened to sit in the text, so a verifier re-derives it by re-encoding what
+/// it parsed instead of trying to snip a suffix off the bytes it received.
+///
+/// It also means the whole message is covered, `peers` included. An unsigned
+/// sample would let anyone rewrite who a node claims to know, and third-hand
+/// entries are how a peer learns about a peer it has never heard broadcast.
+///
+/// `pk` and `sig` are ADDITIVE to Qt's schema. serde ignores unknown fields, so
+/// a Qt receiver still reads these datagrams; it simply will not check them.
+pub fn encode_signed(a: &Announce, secret: &[u8; 32], public: &[u8; 32])
+    -> Result<Vec<u8>, Reject> {
+    let body = encode(a)?;
+    let sig = crypto_kit::sign(secret, &body);
+    let mut s = String::from_utf8(body).map_err(|_| Reject::FieldTooLong)?;
+    s.pop(); // the closing brace
+    s.push_str(&format!(",\"pk\":\"{}\",\"sig\":\"{}\"}}", hex(public), hex(&sig)));
     if s.len() > MAX_DATAGRAM_BYTES { return Err(Reject::TooLarge); }
     Ok(s.into_bytes())
 }
@@ -368,7 +414,28 @@ pub fn decode(data: &[u8]) -> Result<Announce, Malformed> {
             if peers.len() == MAX_GOSSIP_PEERS { break; }
         }
     }
-    Ok(Announce { id, host, port: port as u16, ts, peers })
+    let mut a = Announce { id, host, port: port as u16, ts, peers,
+                           public: None, verified: false };
+
+    // Verification, and note the ORDER. The fingerprint check comes with the
+    // signature check, not instead of it: a valid signature over a message
+    // claiming someone else's sc-ID is exactly the impersonation the binding
+    // exists to stop, and checking only the signature would wave it through.
+    let (Some(pk_hex), Some(sig_hex)) = (
+        v.get("pk").and_then(Json::as_str),
+        v.get("sig").and_then(Json::as_str),
+    ) else { return Ok(a) };
+    let (Some(pk), Some(sig)) = (unhex::<32>(pk_hex), unhex::<64>(sig_hex))
+        else { return Ok(a) };
+    a.public = Some(pk);
+    if crate::identity::fingerprint(&pk) != a.id { return Ok(a); }
+    // Re-encode what we parsed to get the bytes that were signed. Sound only
+    // because decode->encode round-trips exactly, which
+    // `an_announcement_round_trips` pins; if that ever stops holding, every
+    // signature stops verifying and this is why.
+    let Ok(body) = encode(&a) else { return Ok(a) };
+    a.verified = crypto_kit::verify(&pk, &body, &sig);
+    Ok(a)
 }
 
 // ---------------------------------------------------------------- the socket
@@ -424,7 +491,21 @@ impl GossipSocket {
         out
     }
 
-    /// Send one announcement to one address.
+    /// Send one SIGNED announcement.
+    ///
+    /// The signing variant is the one the app uses; `send_to` stays for tests
+    /// and for anything deliberately emitting the Qt-compatible unsigned form.
+    /// Keeping both is not indecision: an unsigned announcement is refused by
+    /// every correctly-configured receiver, so the choice has to be explicit at
+    /// the call site rather than implied by whether a key happened to be around.
+    pub fn send_signed_to(&self, a: &Announce, secret: &[u8; 32], public: &[u8; 32],
+                          to: std::net::SocketAddr) -> std::io::Result<usize> {
+        let bytes = encode_signed(a, secret, public).map_err(|_| std::io::Error::new(
+            std::io::ErrorKind::InvalidInput, "announcement exceeds the datagram cap"))?;
+        self.sock.send_to(&bytes, to)
+    }
+
+    /// Send one unsigned announcement to one address.
     pub fn send_to(&self, a: &Announce, to: std::net::SocketAddr) -> std::io::Result<usize> {
         let bytes = encode(a).map_err(|_| std::io::Error::new(
             std::io::ErrorKind::InvalidInput, "announcement exceeds the datagram cap"))?;
@@ -443,7 +524,17 @@ mod tests {
                 id: "sc-aabbccdd".into(), host: "192.168.1.6".into(), port: 9876,
                 last_seen_ms: 1_699_999_999_000, verified: false,
             }],
+            public: None, verified: false,
         }
+    }
+
+    /// An announcement whose id really is its key's fingerprint, which is the
+    /// only kind that can verify.
+    fn keyed() -> (Announce, crate::identity::Identity) {
+        let id = crate::identity::create().expect("entropy");
+        let mut a = announce();
+        a.id = id.sc_id.clone();
+        (a, id)
     }
 
     #[test]
@@ -477,13 +568,88 @@ mod tests {
     }
 
     #[test]
+    fn a_signed_announcement_verifies_and_is_admitted() {
+        // The whole point. This is what `a_decoded_record_is_unsigned_and_
+        // therefore_refused` was waiting for.
+        let (a, id) = keyed();
+        let bytes = encode_signed(&a, &id.secret, &id.public).unwrap();
+        let got = decode(&bytes).unwrap();
+        assert!(got.verified, "a signature we just made did not verify");
+        assert_eq!(got.public, Some(id.public));
+        assert_eq!(crate::gossip::accept(&got.sender_record(), bytes.len(), "sc-00000000"),
+                   Ok(()));
+    }
+
+    #[test]
+    fn a_signature_over_someone_elses_sc_id_is_refused() {
+        // THE attack the fingerprint binding exists for, and the reason the
+        // order in `decode` matters: this signature is perfectly valid. An
+        // impersonator generates their own keypair, puts the victim's sc-ID in
+        // the id field, and signs with theirs. Checking only the signature
+        // waves it straight through.
+        let (mut a, attacker) = keyed();
+        a.id = "sc-deadbeef".into();
+        let bytes = encode_signed(&a, &attacker.secret, &attacker.public).unwrap();
+        let got = decode(&bytes).unwrap();
+        assert!(!got.verified, "an impersonated sc-ID was admitted");
+        assert!(crypto_kit::verify(&attacker.public, &encode(&got).unwrap(),
+                                   &unhex::<64>(&hex(&crypto_kit::sign(
+                                       &attacker.secret, &encode(&got).unwrap()))).unwrap()),
+                "the signature itself really is valid — that is the point");
+    }
+
+    #[test]
+    fn a_tampered_field_breaks_the_signature() {
+        // Including inside `peers`, which is why the signed bytes are the whole
+        // message rather than the header. An unsigned sample lets anyone
+        // rewrite who a node claims to know, and third-hand entries are how a
+        // peer learns about one it never heard broadcast.
+        let (a, id) = keyed();
+        let good = encode_signed(&a, &id.secret, &id.public).unwrap();
+        assert!(decode(&good).unwrap().verified);
+
+        for (from, to) in [("\"port\":9876", "\"port\":9999"),
+                           ("sc-aabbccdd", "sc-11223344"),
+                           ("192.168.1.6", "192.168.9.9")] {
+            let s = String::from_utf8(good.clone()).unwrap().replacen(from, to, 1);
+            assert!(!decode(s.as_bytes()).unwrap().verified,
+                    "tampering with {from} still verified");
+        }
+    }
+
+    #[test]
+    fn a_garbage_signature_is_unverified_rather_than_unreadable() {
+        // A malformed signature must not cost the whole datagram: the sender's
+        // host and port are still useful, they are just not authenticated.
+        // Failing the parse would let one bad byte deny a peer's discovery.
+        let (a, id) = keyed();
+        let good = String::from_utf8(encode_signed(&a, &id.secret, &id.public).unwrap()).unwrap();
+        for bad in ["\"sig\":\"00\"", "\"sig\":\"zz\"", "\"pk\":\"beef\""] {
+            let key = &bad[..bad.find(':').unwrap()];
+            let start = good.find(key).unwrap();
+            let end = good[start..].find(',').map(|i| start + i).unwrap_or(good.len() - 1);
+            let s = format!("{}{}{}", &good[..start], bad, &good[end..]);
+            let got = decode(s.as_bytes()).expect("a bad signature made the message unreadable");
+            assert!(!got.verified, "{bad} verified");
+        }
+    }
+
+    #[test]
+    fn an_unsigned_qt_datagram_still_parses_and_is_simply_not_verified() {
+        // Interop in the direction that matters: a Qt peer sends no pk or sig.
+        // We must read it — host and port are real information — and must not
+        // pretend it was authenticated.
+        let d = decode(br#"{"id":"sc-32a51661","host":"10.0.0.1","port":9876,"ts":1}"#).unwrap();
+        assert!(!d.verified);
+        assert_eq!(d.public, None);
+    }
+
+    #[test]
     fn a_decoded_record_is_unsigned_and_therefore_refused() {
-        // THE GAP, pinned so it cannot be closed by accident. This wire format
-        // carries no signature and gossip::accept refuses anything unverified,
-        // so a real datagram from a real peer does not currently make them
-        // appear online. Setting verified at the decoder would make presence
-        // work and would be the exact lie the flag exists to prevent — one host
-        // announcing itself as every peer. Delete this test when signing lands.
+        // What remains of the gap. Signing landed, so a datagram from THIS app
+        // now verifies — but an UNSIGNED one (a Qt peer, or an attacker who
+        // simply omits the fields) is still refused by gossip::accept, and that
+        // refusal is the security property, not a bug to route around.
         let rec = decode(&encode(&announce()).unwrap()).unwrap().sender_record();
         assert!(!rec.verified);
         assert_eq!(crate::gossip::accept(&rec, 200, "sc-00000000"),

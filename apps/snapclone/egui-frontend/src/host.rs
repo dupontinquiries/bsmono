@@ -558,9 +558,10 @@ mod tests {
         // three failed loudly.
         let mut s = app();
         assert_eq!(s.local_id, "");
-        s.apply(HostEvent::IdentityLoaded(identity::Loaded::Existing(
-            identity::Identity { sc_id: "sc-0123abcd".into() })));
-        assert_eq!(s.local_id, "sc-0123abcd");
+        let id = identity::create().expect("entropy");
+        let want = id.sc_id.clone();
+        s.apply(HostEvent::IdentityLoaded(identity::Loaded::Existing(id)));
+        assert_eq!(s.local_id, want);
     }
 
     #[test]

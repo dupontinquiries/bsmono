@@ -43,10 +43,63 @@
 pub const FILE: &str = "identity.conf";
 
 /// Everything durable about this installation's own identity.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct Identity {
-    /// `sc-` followed by eight lowercase hex digits.
+    /// `sc-` followed by eight lowercase hex digits. **Derived from
+    /// [`public`](Self::public)** — see [`fingerprint`].
     pub sc_id: String,
+    /// Ed25519 verifying key. Travels in every announcement.
+    pub public: [u8; 32],
+    /// Ed25519 signing key. Never leaves this machine.
+    pub secret: [u8; 32],
+}
+
+/// Redacted by hand rather than derived, so a stray `{:?}` in a log line
+/// cannot print a signing key. The derive was there before the struct had a
+/// secret in it; leaving it would have been the kind of change nothing
+/// notices.
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field("sc_id", &self.sc_id)
+            .field("public", &hex(&self.public))
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The sc-ID a public key implies: `sc-` and the first four bytes, in hex.
+///
+/// **Why derive it at all.** Signing alone proves "some key signed this". It
+/// does not prove that key owns `sc-32a51661` — an impersonator generates their
+/// own keypair, puts your sc-ID in the `id` field, signs with theirs, and it
+/// verifies. Binding the id to the key closes that, and it is why the previous
+/// commit's random sc-IDs are regenerated on upgrade.
+///
+/// **And why that is not enough.** Four bytes is thirty-two bits, fixed by the
+/// format Qt defined. Grinding a keypair whose fingerprint matches a chosen
+/// sc-ID is about 2^32 work, which is minutes. So the sc-ID is a convenience
+/// handle, not a cryptographic identity: the full public key in the datagram is
+/// what verification uses. Pinning a peer's key on first contact is what makes
+/// grinding useless against someone you have already met, and that is the next
+/// piece — `contact_book` is where the pin belongs, and it does not have one
+/// yet. Until it does, treat a first sighting as unauthenticated.
+pub fn fingerprint(public: &[u8; 32]) -> String {
+    format!("sc-{}", hex(&public[..4]))
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    let s = s.trim();
+    if s.len() != N * 2 { return None; }
+    let mut out = [0u8; N];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Eleven characters: `sc-` and eight hex digits.
@@ -58,19 +111,20 @@ pub fn is_valid(s: &str) -> bool {
     s.len() == 11 && s.starts_with("sc-") && s[3..].chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// A fresh sc-ID.
+/// A fresh identity: a keypair, and the sc-ID its public half implies.
 ///
-/// Returns `None` rather than falling back to a clock- or pid-derived value
-/// when the entropy source is unavailable. A degraded id would look completely
-/// normal, be reproducible across two devices that booted alike, and the
-/// consequence — two installations claiming the same identity, each dropping
-/// the other's gossip as its own — would surface as "the other phone never
-/// appears" with nothing anywhere pointing back here. Refusing is legible;
-/// guessing is not.
-pub fn generate_sc_id() -> Option<String> {
-    let mut b = [0u8; 4];
-    read_urandom(&mut b)?;
-    Some(format!("sc-{:02x}{:02x}{:02x}{:02x}", b[0], b[1], b[2], b[3]))
+/// Returns `None` rather than a plausible-looking fallback when the OS has no
+/// entropy. `crypto_kit::ed25519_keypair` uses `OsRng`, which PANICS in that
+/// case, so `/dev/urandom` is probed first and a broken machine gets a reported
+/// failure instead of a crash on the first frame. A degraded identity would be
+/// worse than either: reproducible across two devices that booted alike, and
+/// the consequence — two installations each dropping the other's gossip as its
+/// own — surfaces as "the other phone never appears" with nothing pointing back
+/// here.
+pub fn create() -> Option<Identity> {
+    read_urandom(&mut [0u8; 1])?;
+    let (secret, public) = crypto_kit::ed25519_keypair();
+    Some(Identity { sc_id: fingerprint(&public), public, secret: *secret })
 }
 
 fn read_urandom(buf: &mut [u8]) -> Option<()> {
@@ -84,12 +138,15 @@ fn read_urandom(buf: &mut [u8]) -> Option<()> {
 /// because someone will open this file.
 pub fn render(id: &Identity) -> String {
     format!(
-        "# snapclone identity. Changing sc_id makes this a different device to\n\
-         # everyone who has already added you — they will not recognise the new\n\
-         # one and you will not appear in their list.\n\
+        "# snapclone identity. SECRET — this file contains a signing key.\n\
+         # sc_id is derived from public; editing either alone makes the file\n\
+         # invalid and a fresh identity is minted, which makes this a different\n\
+         # device to everyone who has already added you.\n\
          [identity]\n\
-         sc_id = {}\n",
-        id.sc_id
+         sc_id = {}\n\
+         public = {}\n\
+         secret = {}\n",
+        id.sc_id, hex(&id.public), hex(&id.secret)
     )
 }
 
@@ -99,7 +156,16 @@ pub fn render(id: &Identity) -> String {
 pub fn parse(text: &str) -> Option<Identity> {
     let ini = config_kit::Ini::parse(text);
     let raw = ini.get("identity", "sc_id")?.trim().to_ascii_lowercase();
-    if is_valid(&raw) { Some(Identity { sc_id: raw }) } else { None }
+    if !is_valid(&raw) { return None; }
+    let public: [u8; 32] = unhex(ini.get("identity", "public")?)?;
+    let secret: [u8; 32] = unhex(ini.get("identity", "secret")?)?;
+    // The binding is re-checked on every load, not just at creation. A file
+    // where sc_id and public disagree is either hand-edited or half-written,
+    // and honouring the stored sc_id would announce an id this key cannot
+    // claim — every peer would refuse us, with the failure appearing on their
+    // side rather than ours.
+    if fingerprint(&public) != raw { return None; }
+    Some(Identity { sc_id: raw, public, secret })
 }
 
 /// What happened when the app asked who it is.
@@ -135,14 +201,32 @@ pub fn load_or_create() -> Loaded {
     if let Some(id) = config_kit::load(crate::settings_store::APP, FILE).as_deref().and_then(parse) {
         return Loaded::Existing(id);
     }
-    match generate_sc_id() {
-        Some(sc_id) => {
-            let id = Identity { sc_id };
-            let _ = config_kit::save(crate::settings_store::APP, FILE, &render(&id));
+    match create() {
+        Some(id) => {
+            if config_kit::save(crate::settings_store::APP, FILE, &render(&id)).is_ok() {
+                // 0600 AFTER the write, because the file has to exist first.
+                // A signing key under the default 0644 is readable by every
+                // other account on a shared machine, and config-kit has no
+                // reason to know some of its callers write secrets.
+                restrict(&config_kit::config_dir(crate::settings_store::APP).join(FILE));
+            }
             Loaded::Created(id)
         }
         None => Loaded::Unavailable,
     }
+}
+
+/// Owner-only. Best effort: a filesystem that cannot express it (a FAT card, a
+/// bind mount) is not a reason to refuse to run, but it IS a reason the caller
+/// might want to warn, so the result is returned rather than dropped.
+pub fn restrict(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).is_ok();
+    }
+    #[allow(unreachable_code)]
+    { let _ = path; false }
 }
 
 #[cfg(test)]
@@ -151,11 +235,42 @@ mod tests {
 
     #[test]
     fn a_generated_id_has_the_shape_the_format_promises() {
-        let id = generate_sc_id().expect("/dev/urandom is the platform interface here");
-        assert!(is_valid(&id), "{id}");
-        assert_eq!(id.len(), 11);
-        assert!(id[3..].chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
-                "generation emits one spelling: {id}");
+        let id = create().expect("/dev/urandom is the platform interface here");
+        assert!(is_valid(&id.sc_id), "{}", id.sc_id);
+        assert_eq!(id.sc_id.len(), 11);
+        assert!(id.sc_id[3..].chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                "generation emits one spelling: {}", id.sc_id);
+    }
+
+    #[test]
+    fn the_id_is_the_keys_fingerprint_and_not_an_independent_random() {
+        // The whole reason signing is worth anything. Without this binding an
+        // impersonator generates their own keypair, puts your sc-ID in the id
+        // field, signs with theirs, and it verifies.
+        let id = create().unwrap();
+        assert_eq!(id.sc_id, fingerprint(&id.public));
+        assert_eq!(id.sc_id, format!("sc-{:02x}{:02x}{:02x}{:02x}",
+                                     id.public[0], id.public[1], id.public[2], id.public[3]));
+    }
+
+    #[test]
+    fn the_keypair_actually_signs_and_verifies() {
+        let id = create().unwrap();
+        let sig = crypto_kit::sign(&id.secret, b"hello");
+        assert!(crypto_kit::verify(&id.public, b"hello", &sig));
+        assert!(!crypto_kit::verify(&id.public, b"hellp", &sig), "a changed message verifies");
+        let other = create().unwrap();
+        assert!(!crypto_kit::verify(&other.public, b"hello", &sig), "anyone's key verifies");
+    }
+
+    #[test]
+    fn a_secret_key_does_not_appear_in_debug_output() {
+        // The derive was there before the struct had a secret in it. A stray
+        // {:?} in a log line is how a signing key ends up in a bug report.
+        let id = create().unwrap();
+        let shown = format!("{id:?}");
+        assert!(shown.contains("redacted"), "{shown}");
+        assert!(!shown.contains(&super::hex(&id.secret)), "the key is in the output");
     }
 
     #[test]
@@ -164,7 +279,7 @@ mod tests {
         // the thing that matters: if generation and the QR parser ever
         // disagree, the symptom is a code that cannot be scanned, and neither
         // module's own tests would notice.
-        let id = generate_sc_id().unwrap();
+        let id = create().unwrap().sc_id;
         let parsed = crate::qr::parse_payload(&id).expect("the scanner rejected our own id");
         assert_eq!(parsed.sc_id, id);
         // and through the URI form, which is what my_code_ui actually renders
@@ -177,8 +292,8 @@ mod tests {
         // Weak as a randomness test and not trying to be one. It catches the
         // specific failure that matters: a generator that returns a constant,
         // which would make every installation the same device.
-        let a = generate_sc_id().unwrap();
-        let b = generate_sc_id().unwrap();
+        let a = create().unwrap().sc_id;
+        let b = create().unwrap().sc_id;
         assert_ne!(a, b);
     }
 
@@ -193,9 +308,22 @@ mod tests {
     }
 
     #[test]
-    fn an_id_round_trips_through_the_file() {
-        let id = Identity { sc_id: "sc-deadbeef".into() };
+    fn an_identity_round_trips_through_the_file_keys_and_all() {
+        let id = create().unwrap();
         assert_eq!(parse(&render(&id)), Some(id));
+    }
+
+    #[test]
+    fn a_file_whose_id_and_key_disagree_is_refused() {
+        // Hand-edited, or half-written. Honouring the stored sc_id would
+        // announce an id this key cannot claim: every peer refuses us, and the
+        // failure appears on their side rather than ours.
+        let id = create().unwrap();
+        let good = render(&id);
+        let bad = good.replace(&id.sc_id, "sc-00000000");
+        assert_eq!(parse(&bad), None);
+        // and a truncated key is refused rather than zero-padded
+        assert_eq!(parse(&good.replace(&super::hex(&id.public), "abcd")), None);
     }
 
     #[test]
@@ -208,14 +336,19 @@ mod tests {
         assert_eq!(parse("[identity]\nsc_id = \n"), None);
         assert_eq!(parse("[identity]\nsc_id = not-an-id\n"), None);
         assert_eq!(parse("[identity]\nsc_id = sc-0123abcg\n"), None);
+        // and a valid id with no key at all — which is exactly what the
+        // previous commit wrote, so this is the upgrade path: the old file is
+        // unreadable and a fresh keyed identity is minted.
+        assert_eq!(parse("[identity]\nsc_id = sc-0123abcd\n"), None);
     }
 
     #[test]
     fn an_uppercase_id_on_disk_is_accepted_and_normalised() {
         // Hand-edited, or copied from a printed code. Rejecting it would mint a
         // second identity for someone who thought they were restoring one.
-        let got = parse("[identity]\nsc_id = SC-DEADBEEF\n");
-        assert_eq!(got, Some(Identity { sc_id: "sc-deadbeef".into() }));
+        let id = create().unwrap();
+        let shouty = render(&id).replace(&id.sc_id, &id.sc_id.to_ascii_uppercase());
+        assert_eq!(parse(&shouty), Some(id));
     }
 
     #[test]
@@ -223,7 +356,7 @@ mod tests {
         // The empty string was the bug. A caller that unwraps this into
         // local_id must not be handed "" dressed up as an answer.
         assert_eq!(Loaded::Unavailable.sc_id(), None);
-        assert_eq!(Loaded::Created(Identity { sc_id: "sc-00000001".into() }).sc_id(),
-                   Some("sc-00000001"));
+        let id = create().unwrap();
+        assert_eq!(Loaded::Created(id.clone()).sc_id(), Some(id.sc_id.as_str()));
     }
 }

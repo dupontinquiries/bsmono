@@ -21,6 +21,10 @@ struct App {
     gossip: Option<snapclone_egui::gossip_wire::GossipSocket>,
     /// When we last announced ourselves, in wall-clock seconds.
     last_announce: i64,
+    /// Kept because announcing requires the signing key, and the key must not
+    /// travel through `Snapclone` — the app holds `local_id`, which is public,
+    /// and has no business holding a secret it never needs.
+    identity: Option<snapclone_egui::identity::Identity>,
     /// The unsigned-gossip warning is printed once. A per-datagram log line
     /// at three seconds times every peer on the subnet buries everything
     /// else, and the message is the same every time.
@@ -44,8 +48,14 @@ impl App {
         // drawn from it and a fresh install's first act is usually to show it.
         let id = snapclone_egui::identity::load_or_create();
         if let snapclone_egui::identity::Loaded::Created(ref i) = id {
-            eprintln!("snapclone: new identity {} (config: identity.conf)", i.sc_id);
+            eprintln!("snapclone: new identity {} — identity.conf holds a signing key, \
+                       keep it", i.sc_id);
         }
+        let keys = match &id {
+            snapclone_egui::identity::Loaded::Existing(i)
+            | snapclone_egui::identity::Loaded::Created(i) => Some(i.clone()),
+            snapclone_egui::identity::Loaded::Unavailable => None,
+        };
         let cmds = snap.apply(HostEvent::IdentityLoaded(id));
         Self::report(cmds);
 
@@ -66,7 +76,8 @@ impl App {
                 None
             }
         };
-        Self { snap, focused: true, gossip, last_announce: 0, warned_unsigned: false }
+        Self { snap, focused: true, gossip, last_announce: 0, warned_unsigned: false,
+               identity: keys }
     }
 
     /// Drain the discovery socket into the app, and announce ourselves on the
@@ -104,7 +115,11 @@ impl App {
         // shouting at; slower and peers prune you before you say anything.
         let due = now_secs - self.last_announce
             >= (snapclone_egui::gossip::TICK_MS / 1000).max(1) as i64;
-        if !due || self.snap.local_id.is_empty() { return; }
+        // No key, no announcement. Broadcasting unsigned would be traffic every
+        // correctly-configured peer refuses, which reads as a flaky network
+        // rather than as a missing identity.
+        let Some(keys) = self.identity.clone() else { return };
+        if !due { return; }
         self.last_announce = now_secs;
         let a = snapclone_egui::gossip_wire::Announce {
             id: self.snap.local_id.clone(),
@@ -116,12 +131,16 @@ impl App {
             port: self.snap.settings.current.network.listen_port,
             ts: now_secs.max(0) as u64 * 1000,
             peers: Vec::new(),
+            // Filled by the signer, not here — `verified` is only ever true on
+            // something that came off the wire and checked out.
+            public: None,
+            verified: false,
         };
         let to = format!("255.255.255.255:{}",
                          self.snap.settings.current.network.gossip_port);
         if let Ok(addr) = to.parse() {
             if let Some(s) = self.gossip.as_ref() {
-                if let Err(e) = s.send_to(&a, addr) {
+                if let Err(e) = s.send_signed_to(&a, &keys.secret, &keys.public, addr) {
                     eprintln!("snapclone: could not announce: {e}");
                 }
             }
@@ -157,9 +176,9 @@ impl App {
                 HostCommand::GossipAdmitted(false) => {
                     if !self.warned_unsigned {
                         self.warned_unsigned = true;
-                        eprintln!("snapclone: gossip received but refused — the datagram \
-                                   format carries no signature and unverified records are \
-                                   not admitted. Peers will not appear online.");
+                        eprintln!("snapclone: gossip refused — unsigned, or the sender's \
+                                   sc-ID is not its key's fingerprint. Qt peers do not sign \
+                                   and will not appear online.");
                     }
                 }
                 HostCommand::GossipAdmitted(true) => {}
