@@ -3231,3 +3231,13 @@ the residual bulk and shrink nothing via fusion). But the direction
 is now right, monotonic in take count, and the lineage mechanic —
 takes refining a shared canonical they then cite — is measured
 working for the first time.
+
+CORRECTION to the pair arithmetic above: the fused canonical file
+measured 554 KB (the −19% figure used a 446 KB estimate written
+before the file size was read). Actual: cited pair 452+433+554 =
+1,439 KB vs self-coded 1,645 KB → −12.5% across two takes. The
+canonical is larger than either single-take plate because the fused
+bounds span both takes' motion envelopes (2046px wide vs 1920-ish) —
+tightening fused bounds to the intersection-plus-margin is a known
+easy win on top. Amortization per additional take unchanged in
+structure.
