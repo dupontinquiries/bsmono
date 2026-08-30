@@ -195,6 +195,52 @@ fn main() {
         );
         return;
     }
+    if args.iter().any(|a| a == "--track") {
+        // Whole-scene readiness probe: run the real FeatureTrackPass over
+        // the GOP and report the statistics pose estimation lives on —
+        // per-frame survivors, survival rate across each step, track
+        // lifetime distribution, and spatial coverage of LONG tracks
+        // (>=8 frames; short tracks can't constrain a pose chain).
+        use fao_codec::v8_reconstruction_codec::FeatureTrackPass;
+        let (w, h) = (frames[0].w, frames[0].h);
+        let mut pass = FeatureTrackPass::default();
+        let mut prev: Option<&Vec<u8>> = None;
+        let mut lifetimes: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut long_track_cells: Vec<bool> = vec![false; ((w + 63) / 64) * ((h + 63) / 64)];
+        let cw = (w + 63) / 64;
+        let mut per_frame: Vec<usize> = Vec::new();
+        for (i, f) in frames.iter().enumerate() {
+            let feats = pass.process(&f.y, prev.map(|v| v.as_slice()), w, h, i as u32);
+            per_frame.push(feats.len());
+            for sf in &feats {
+                let e = lifetimes.entry(sf.feature_id).or_insert(0);
+                *e += 1;
+                if *e >= 8 {
+                    let cx = (sf.screen_x as usize).min(w - 1) / 64;
+                    let cy = (sf.screen_y as usize).min(h - 1) / 64;
+                    long_track_cells[cy * cw + cx] = true;
+                }
+            }
+            prev = Some(&f.y);
+        }
+        let n = frames.len();
+        let mut lt: Vec<u32> = lifetimes.values().copied().collect();
+        lt.sort_unstable();
+        let long_cov = long_track_cells.iter().filter(|&&c| c).count() as f32 / long_track_cells.len() as f32;
+        println!(
+            "tracks: total {} | lifetime median {} p90 {} max {} | frames>=8: {}",
+            lt.len(),
+            lt.get(lt.len() / 2).copied().unwrap_or(0),
+            lt.get(lt.len() * 9 / 10).copied().unwrap_or(0),
+            lt.last().copied().unwrap_or(0),
+            lt.iter().filter(|&&v| v >= 8).count()
+        );
+        println!(
+            "per-frame survivors: first {} mid {} last {} | long-track coverage {:.2}",
+            per_frame[0], per_frame[n / 2], per_frame[n - 1], long_cov
+        );
+        return;
+    }
     if args.iter().any(|a| a == "--features") {
         // Detection probe: FAST keypoints on first + mid frame, with
         // spatial coverage = fraction of 64px cells holding ≥1 keypoint.

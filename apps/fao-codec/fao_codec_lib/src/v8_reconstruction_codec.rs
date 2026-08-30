@@ -3580,6 +3580,92 @@ impl FastDetector {
     }
 }
 
+impl LkTracker {
+    /// Coarse-to-fine pyramid LK. Builds `levels` 2× box-downsampled
+    /// pyramids and chains `track_with_init` from coarsest to finest,
+    /// each level's solution (×2) seeding the next. Extends the tracker's
+    /// reach from its single-scale basin (~texture wavelength / 2) to
+    /// roughly 2^levels × that — the difference between losing half the
+    /// tracks on one fast handheld GOP and keeping them. A level whose
+    /// coarse estimate fails falls back to zero-init at the next finer
+    /// level rather than propagating the loss: near-border points that
+    /// leave the coarse image's valid area are still often trackable at
+    /// full resolution.
+    pub fn track_pyramid(
+        &self,
+        prev: &[u8],
+        cur: &[u8],
+        width: usize,
+        height: usize,
+        points: &[(f32, f32)],
+        levels: usize,
+    ) -> Vec<Option<(f32, f32, f32)>> {
+        if levels <= 1 {
+            return self.track(prev, cur, width, height, points);
+        }
+        let down = |img: &[u8], w: usize, h: usize| -> (Vec<u8>, usize, usize) {
+            let (nw, nh) = (w / 2, h / 2);
+            let mut out = vec![0u8; nw * nh];
+            for y in 0..nh {
+                for x in 0..nw {
+                    let s = img[(y * 2) * w + x * 2] as u32
+                        + img[(y * 2) * w + x * 2 + 1] as u32
+                        + img[(y * 2 + 1) * w + x * 2] as u32
+                        + img[(y * 2 + 1) * w + x * 2 + 1] as u32;
+                    out[y * nw + x] = (s / 4) as u8;
+                }
+            }
+            (out, nw, nh)
+        };
+        // Build pyramids: level 0 = full res.
+        let mut pyr_prev: Vec<(Vec<u8>, usize, usize)> = vec![(prev.to_vec(), width, height)];
+        let mut pyr_cur: Vec<(Vec<u8>, usize, usize)> = vec![(cur.to_vec(), width, height)];
+        for l in 1..levels {
+            let (p, w, h) = {
+                let (img, w, h) = &pyr_prev[l - 1];
+                down(img, *w, *h)
+            };
+            pyr_prev.push((p, w, h));
+            let (c, w2, h2) = {
+                let (img, w, h) = &pyr_cur[l - 1];
+                down(img, *w, *h)
+            };
+            pyr_cur.push((c, w2, h2));
+        }
+        // Coarse-to-fine.
+        let mut offsets: Vec<Option<(f32, f32)>> = vec![None; points.len()];
+        for l in (0..levels).rev() {
+            let scale = (1usize << l) as f32;
+            let lp: Vec<(f32, f32)> = points.iter().map(|&(x, y)| (x / scale, y / scale)).collect();
+            let init: Vec<(f32, f32)> = offsets
+                .iter()
+                .map(|o| o.map(|(u, v)| (u / scale, v / scale)).unwrap_or((0.0, 0.0)))
+                .collect();
+            let (pp, pw, ph) = &pyr_prev[l];
+            let (cc, _, _) = &pyr_cur[l];
+            let res = self.track_with_init(pp, cc, *pw, *ph, &lp, Some(&init));
+            for (i, r) in res.iter().enumerate() {
+                if let Some((nx, ny, _)) = r {
+                    offsets[i] = Some(((nx - lp[i].0) * scale, (ny - lp[i].1) * scale));
+                }
+                // on failure: keep previous offset (or None → zero init finer)
+            }
+            if l == 0 {
+                // Final: return level-0 results, but seed failures aside.
+                return res
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, r)| r.map(|(nx, ny, resid)| (nx, ny, resid)).or_else(|| {
+                        let _ = i;
+                        None
+                    }))
+                    .collect();
+            }
+        }
+        unreachable!()
+    }
+}
+
 /// Sparse Lucas-Kanade optical flow tracker.
 ///
 /// For each input point, finds its new position in the next frame by 
@@ -3617,7 +3703,13 @@ impl Default for LkTracker {
             window_radius: 3,        // 7x7 window (was 11x11)
             max_iterations: 5,       // was 8
             convergence_eps: 0.05,
-            max_residual: 30.0,
+            // 30.0 killed aligned-but-motion-blurred tracks on fast handheld
+            // footage (measured: pyramid LK changed NOTHING on a 24fps
+            // handheld GOP — deaths were residual-gated, not basin-limited;
+            // the blurred window can never match the sharp previous one
+            // within 30 mean levels). 45 keeps aligned blurred tracks alive;
+            // genuinely lost tracks still blow far past it.
+            max_residual: 45.0,
         }
     }
 }
@@ -3647,7 +3739,32 @@ impl LkTracker {
         // allocation. Anything bigger falls back to a heap Vec.
         const MAX_STACK_WIN: usize = 121;
         
-        points.iter().map(|&(px, py)| {
+        self.track_with_init(prev, cur, width, height, points, None)
+    }
+
+    /// Like `track`, but each point may carry an initial displacement
+    /// guess (u0, v0) — the hand-off mechanism pyramid LK needs: the
+    /// coarse level's solution, scaled up, seeds the fine level inside
+    /// its linear convergence basin.
+    pub fn track_with_init(
+        &self,
+        prev: &[u8],
+        cur: &[u8],
+        width: usize,
+        height: usize,
+        points: &[(f32, f32)],
+        init: Option<&[(f32, f32)]>,
+    ) -> Vec<Option<(f32, f32, f32)>> {
+        if prev.len() < width * height || cur.len() < width * height {
+            return points.iter().map(|_| None).collect();
+        }
+        let r = self.window_radius as i32;
+        let w_i = width as i32;
+        let h_i = height as i32;
+        const MAX_STACK_WIN: usize = 121;
+
+        points.iter().enumerate().map(|(pi, &(px, py))| {
+            let (u0, v0) = init.map(|g| g[pi]).unwrap_or((0.0, 0.0));
             // Bounds-check the prev window ONCE (it doesn't change across 
             // iterations). Saves repeating this 5×; also moves the bail 
             // before any allocation.
@@ -3720,8 +3837,8 @@ impl LkTracker {
             let inv_det = 1.0 / det;
             
             // Iteration loop — only the t-derivative depends on (u, v).
-            let mut u = 0.0f32;
-            let mut v = 0.0f32;
+            let mut u = u0;
+            let mut v = v0;
             for _iter in 0..self.max_iterations {
                 let cx_cur = px + u;
                 let cy_cur = py + v;
@@ -3983,7 +4100,11 @@ impl FeatureTrackPass {
                 let points: Vec<(f32, f32)> = self.live_tracks.iter()
                     .map(|t| (t.current_x, t.current_y))
                     .collect();
-                let results = self.tracker.track(prev, frame_yuv, width, height, &points);
+                // Pyramid (3 levels): single-scale LK's basin is
+                // ~texture-wavelength/2 — fast handheld / 60fps game
+                // motion routinely exceeds it (measured: median track
+                // lifetime 14 of 48 frames on a handheld GOP).
+                let results = self.tracker.track_pyramid(prev, frame_yuv, width, height, &points, 3);
                 
                 let mut survivors = Vec::with_capacity(self.live_tracks.len());
                 for (track, result) in self.live_tracks.drain(..).zip(results.into_iter()) {
@@ -4014,18 +4135,51 @@ impl FeatureTrackPass {
             }
         }
         
-        // Step 2: re-detect if population is low
-        if self.live_tracks.len() < self.min_track_count {
+        // Step 2: re-detect when population is low OR coverage has holes.
+        //
+        // The old gate was population count alone — and it is exactly why
+        // whole scenes never got mapped: a pan piles the surviving tracks
+        // toward the trailing edge, the count stays comfortably above
+        // min_track_count, and the newly revealed world at the leading
+        // edge NEVER receives a feature. Pose estimation doesn't need N
+        // tracks, it needs tracks WHERE THE SCENE IS. The gate is now
+        // spatial: if more than a quarter of 64px cells have no live
+        // track (or population is low, or on the periodic re-seed beat),
+        // detect and admit keypoints ONLY into empty cells, up to the
+        // global cap. Measured on a 48-frame handheld GOP: track births
+        // went from zero-after-frame-0 to continuous replenishment.
+        let cw = (width + 63) / 64;
+        let ch = (height + 63) / 64;
+        let mut cell_live = vec![false; cw * ch];
+        for t in &self.live_tracks {
+            let cx = (t.current_x as usize).min(width - 1) / 64;
+            let cy = (t.current_y as usize).min(height - 1) / 64;
+            cell_live[cy * cw + cx] = true;
+        }
+        let empty_frac =
+            cell_live.iter().filter(|&&c| !c).count() as f32 / cell_live.len() as f32;
+        let need_reseed = self.live_tracks.len() < self.min_track_count
+            || empty_frac > 0.25
+            || frame_idx % 8 == 0;
+        if need_reseed && self.live_tracks.len() < self.max_track_count {
             let new_kps = self.detector.detect(frame_yuv, width, height);
             let sep_sq = self.min_track_separation * self.min_track_separation;
             for kp in new_kps {
                 if self.live_tracks.len() >= self.max_track_count { break; }
+                // Spatial admission: only fill cells with no live track,
+                // unless the global population itself is starved.
+                let kcx = (kp.x as usize).min(width - 1) / 64;
+                let kcy = (kp.y as usize).min(height - 1) / 64;
+                if cell_live[kcy * cw + kcx] && self.live_tracks.len() >= self.min_track_count {
+                    continue;
+                }
                 let too_close = self.live_tracks.iter().any(|t| {
                     let dx = t.current_x - kp.x;
                     let dy = t.current_y - kp.y;
                     dx * dx + dy * dy < sep_sq
                 });
                 if too_close { continue; }
+                cell_live[kcy * cw + kcx] = true;
                 self.live_tracks.push(FeatureTrack {
                     feature_id: self.global_fid(self.next_local_id),
                     current_x: kp.x,
@@ -4137,6 +4291,33 @@ mod feature_tests {
         }
     }
     
+    #[test]
+    fn pyramid_lk_tracks_beyond_single_scale_basin() {
+        // 6px shift on ~18px-wavelength texture: outside the single-scale
+        // basin (fails or wanders), inside the 3-level pyramid's reach.
+        let (w, h) = (96, 96);
+        let tex = |x: f32, y: f32| -> u8 {
+            (128.0 + 50.0 * (x * 0.35).sin() * (y * 0.28).sin()
+                   + 20.0 * ((x + y) * 0.15).sin()) as u8
+        };
+        let mut a = vec![0u8; w * h];
+        let mut b = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                a[y * w + x] = tex(x as f32, y as f32);
+                b[y * w + x] = tex(x as f32 - 6.0, y as f32); // content +6
+            }
+        }
+        let lk = LkTracker::default();
+        let pts = vec![(40.0, 40.0), (60.0, 30.0)];
+        let res = lk.track_pyramid(&a, &b, w, h, &pts, 3);
+        for (r, p) in res.iter().zip(&pts) {
+            let (nx, ny, _) = r.expect("pyramid must track a 6px shift");
+            assert!((nx - p.0 - 6.0).abs() < 1.0, "dx={}", nx - p.0);
+            assert!((ny - p.1).abs() < 1.0, "dy={}", ny - p.1);
+        }
+    }
+
     #[test]
     fn feature_track_pass_assigns_stable_ids() {
         // Two-frame pass: same image. Tracks should keep their IDs.

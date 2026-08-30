@@ -2700,3 +2700,36 @@ distribution matches deployment exactly, which no transcoded film
 source can offer. restore.rs stands as the baseline such a model must
 beat and the harness (--restore-exp: held-out PSNR + detection
 coverage deltas) is the evaluation it plugs into.
+
+### Track-chain probes + three tracking fixes (same session)
+
+plate_lab --track runs the real FeatureTrackPass over a GOP and reports
+what pose estimation actually eats: per-frame survivors, lifetime
+distribution, and spatial coverage of ≥8-frame tracks.
+
+Found and fixed, in causal order:
+1. **No track was ever born after frame 0** — re-detection gated on
+   population count alone, so any 100+ features anywhere satisfied it
+   while newly revealed world got nothing. This is a structural cause of
+   "fragments, never whole maps": a panning camera only ever mapped its
+   first view. Gate is now spatial (reseed when >25% of 64px cells lack
+   a live track, on a periodic beat, or when starved; admission fills
+   empty cells first). Births went zero → continuous on all GOPs.
+2. **Pyramid LK** (track_with_init + track_pyramid, 3 levels, own basin
+   test: tracks a 6px shift single-scale cannot). Measured honestly: it
+   changed NOTHING on the handheld GOP — byte-identical stats — which
+   localized the real killer one link down:
+3. **The residual gate (30.0) was executing aligned tracks for the
+   crime of motion blur**: pyramid finds the alignment, the blurred
+   window can't match the sharp previous one within 30 mean levels, the
+   track dies anyway. Widened to 45 with the finding recorded in-code.
+
+Where the chain stands (48-frame GOPs, ≥8-frame tracks / their 64px
+coverage): shotB 413 / 0.61, smiteB 408 / 0.66, shotA 473 / 0.87 —
+with continuous replenishment. The remaining shotA median lifetime of
+16 is bimodal and physical (violent pan phases blur content beyond
+recognition; the long-lived cohort is what pose uses). Known next
+items: HUD/world track segmentation for game broadcasts (screen-locked
+tracks are poison for rigid-world pose — likely most of smiteB's
+long-lived cohort), then actually running TriangulatePass on these
+tracks.
