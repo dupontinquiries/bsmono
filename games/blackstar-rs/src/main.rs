@@ -667,6 +667,19 @@ struct Chassis {
     boss: bool,
     /// jets fly instead of driving: never grounded, lift and nose thrust
     flight: bool,
+    /// hoverers/hovertanks ride a cushion instead of driving on wheels —
+    /// same `chassis_traits::Traits` source as `flight`, so a chassis
+    /// fleet.json calls "hoverer" or "hovertank" is actually simulated
+    /// as one rather than falling entirely on the untuned geometry
+    /// detector in `locomotion::decide` to notice a skirt. Before this
+    /// field existed, `flight` correctly read the category trait
+    /// (`traits.flies()`) but hover had no equivalent — `set_car_model`
+    /// only ever declared Hover for the five hand-authored hovercars
+    /// (`Model::hover.is_some()`), so every category-labelled hoverer
+    /// or hovertank added since depended entirely on the geometry
+    /// heuristic correctly reading its skirt, which its own doc comment
+    /// admits is "reasoned from shapes, not fitted to a labelled set".
+    floats: bool,
 }
 
 struct CarModels {
@@ -1791,6 +1804,10 @@ fn main() {
                 .map(|c| crate::chassis_traits::Traits::from_category(c))
                 .unwrap_or_else(crate::chassis_traits::Traits::default);
             let flight = traits.flies() || bot.starts_with("jet_");
+            // same reasoning as `flight` above, for the mirror-image gap:
+            // `floats() == self.hover >= 0.5` is fleet.json's own
+            // "hoverer"/"hovertank" category speaking, not a guess.
+            let floats = traits.floats();
             let label = bot.trim_start_matches("jet_").to_string();
             let cid = cars.chassis.len();
             let mut strip = Vec::new();
@@ -1891,6 +1908,7 @@ fn main() {
                     .map(|t| t.contains("\"boss\": true") || t.contains("\"boss\":true"))
                     .unwrap_or(false),
                 flight,
+                floats,
             });
         }
     }
@@ -2533,6 +2551,14 @@ impl Game {
                 // three states now, not two. ball_cam is kept in step so the
                 // HUD and the save file, which both predate the enum, still
                 // mean what they meant.
+                // MID-FOLD THE DIRECTOR OWNS THE CAMERA. Cycling here would
+                // stomp `Cinematic`, and `end_cinematic` would then hand
+                // control back to whatever the player just picked instead of
+                // where they actually were — so the key is a no-op for the
+                // ~1.3s the fold shot is running.
+                if self.cam.in_cinematic() {
+                    return;
+                }
                 // the chassis decides whether a gunner seat exists at all
                 let guns = self.gun_mounts();
                 self.cam.gun_seat = guns.seat();
@@ -2669,6 +2695,25 @@ impl Game {
         self.loco_mode = {
             let mdl = &self.cars.models[m];
             let declared = if mdl.hover.is_some() {
+                Some(locomotion::Mode::Hover)
+            } else if self
+                .cars
+                .xform
+                .get(&m)
+                .and_then(|(ci, _)| self.cars.chassis.get(*ci))
+                .map(|c| c.floats)
+                .unwrap_or(false)
+            {
+                // THE MIRROR OF THE FLIGHT CHECK BELOW. Only the five
+                // hand-authored hovercars ever set `Model::hover` at load,
+                // so every category-labelled hoverer/hovertank added since
+                // depended entirely on `measured` below correctly reading
+                // its skirt — the same gap `flight` already had and fixed
+                // by reading `chassis.flight`. `cushion_for` builds a real,
+                // reasonably-tuned `Hover` on the fly from the body's own
+                // dimensions, the same as the geometry path would have, so
+                // this is not a worse hover — it is the same one, just
+                // guaranteed instead of gambled on shape-matching.
                 Some(locomotion::Mode::Hover)
             } else if self
                 .cars
@@ -2815,6 +2860,53 @@ impl Game {
             .or_else(|| content::chassis("standard"))
             .map(|c| c.xform_dur)
             .unwrap_or(1.0)
+    }
+
+    /// Degrees of spin `content::CHASSIS` says this fold carries. Same
+    /// lookup as `chassis_fold_mul`, and the same gap: authored per body
+    /// shape since the state machine landed, never read by anything until
+    /// now — the cinematic camera's arc uses it so a whippy raptor fold
+    /// visibly turns faster under the lens than a juggernaut's does,
+    /// instead of the camera swinging the same arc for both.
+    fn chassis_fold_spin(&self) -> f32 {
+        let name = self.cars.names[self.cars.active].to_ascii_lowercase();
+        content::CHASSIS
+            .iter()
+            .find(|c| name.contains(c.id))
+            .or_else(|| content::chassis("standard"))
+            .map(|c| c.fold_spin)
+            .unwrap_or(220.0)
+    }
+
+    /// The active model's own liveliest colour, for the fold's spark burst.
+    /// There is no single "accent" field on `Model` — colour lives per prim
+    /// — so this picks the most saturated body prim rather than guessing at
+    /// a convention that isn't there. Falls back to a generic warm spark for
+    /// a body that turns out to be all greys and blacks (a stock racer,
+    /// most tanks), so the burst is never garish on a car it doesn't suit.
+    fn fold_spark_color(&self) -> [f32; 4] {
+        const FALLBACK: [f32; 4] = [1.0, 0.85, 0.45, 1.0];
+        let Some(m) = self.cars.models.get(self.cars.active) else { return FALLBACK };
+        let mut best: Option<(f32, [f32; 4])> = None;
+        for p in &m.prims {
+            if p.tag != model::Tag::Body {
+                continue; // tyres and hubs are deliberately neutral
+            }
+            let [r, g, b, _] = p.color;
+            let mx = r.max(g).max(b);
+            let mn = r.min(g).min(b);
+            let sat = if mx > 0.02 { (mx - mn) / mx } else { 0.0 };
+            // saturation carries the "this is the accent" signal; brightness
+            // breaks ties so a dim accent doesn't beat a punchy one
+            let score = sat * (0.4 + 0.6 * mx);
+            if best.map_or(true, |(s, _)| score > s) {
+                best = Some((score, p.color));
+            }
+        }
+        match best {
+            Some((sat, c)) if sat > 0.12 => [c[0], c[1], c[2], 1.0],
+            _ => FALLBACK,
+        }
     }
 
     /// Load the active chassis' strip vertices so the fold can blend.
@@ -3029,7 +3121,7 @@ impl Game {
         }
     }
 
-    /// Step the running fold    /// Step the running fold, swapping the body when the strip index changes.
+    /// Step the running fold, swapping the body when the strip index changes.
     fn advance_xform(&mut self, dt: f32) {
         // THE FOLD MUST RENDER ITS LAST FRAME.
         //
@@ -3049,11 +3141,46 @@ impl Game {
         // clamped to the endpoint by then, so this is the exact final pose
         // and not an extrapolation.
         let was_folding = self.xf.state == xform::State::Transforming;
+        let t_before = self.xf.eased();
         self.xf.update(dt);
-        if self.xf.state != xform::State::Transforming && !was_folding {
+        let now_folding = self.xf.state == xform::State::Transforming;
+
+        // THE FOLD SHOT. Take the camera on the frame the fold starts, hand
+        // it back on the frame it ends — `end_cinematic` is safe to call
+        // even when no cinematic is running, so this doesn't need its own
+        // "was it mine to give back" bookkeeping.
+        if now_folding && !was_folding {
+            self.cam.start_cinematic(self.car.pos.x + self.car.pos.z, self.chassis_fold_spin());
+            self.fx.ring_burst(self.car.pos, self.fold_spark_color(), false);
+            self.cam.add_shake(0.25);
+            self.snd.fire(Sfx::XformFold(self.xf.folding_to_robot()));
+        }
+        if !now_folding && was_folding {
+            self.cam.end_cinematic();
+            self.fx.ring_burst(self.car.pos, self.fold_spark_color(), true);
+            self.fx.dust(self.car.pos, self.world.normal(self.car.pos), 6.0);
+            self.cam.add_shake(0.55);
+            self.snd.fire(Sfx::XformSnap);
+        }
+        if !now_folding && !was_folding {
             return;
         }
         let t = self.xf.eased();
+        // SNAP DETECTION. `Profile::ease` already carries the personality —
+        // Combat's hard stop and Anger's overshoot both show up as a jump in
+        // `t` larger than a steady blend would produce over one frame. Spike
+        // the shake and punch the lens in proportional to how sharp that
+        // jump is, rather than re-deriving the same beats from `Profile`
+        // itself and risking the two disagreeing.
+        if dt > 1e-5 {
+            let rate = ((t - t_before).abs() / dt - 1.0 / xform::BLEND_SEC).max(0.0);
+            if rate > 0.15 {
+                let energy = (rate * 0.9).min(1.0);
+                self.cam.add_shake(energy * 0.35);
+                self.cam.fov_punch = self.cam.fov_punch.max(energy * 9.0);
+            }
+        }
+        self.cam.fov_punch *= (1.0 - 6.0 * dt).max(0.0);
         let Some(&(cid, _)) = self.cars.xform.get(&self.cars.active) else { return };
 
         // BLENDED PATH: rewrite the displayed model's meshes each frame, so
@@ -5919,7 +6046,8 @@ impl Game {
             }
             self.fx.update(dt);
             let rear = self.held_mouse.contains(&MouseButton::Middle);
-            self.cam.update(&self.car, &self.ball, &self.world, &self.cfg.cam, self.car.flipping(), rear, dt);
+            let fold_t = (self.xf.state == xform::State::Transforming).then(|| self.xf.eased());
+            self.cam.update(&self.car, &self.ball, &self.world, &self.cfg.cam, self.car.flipping(), rear, dt, fold_t);
 
             // client: the host's ball is the real one
             if self.net.role == net::Role::Client {
@@ -5998,7 +6126,8 @@ impl Game {
                 let nm = self.world.route_names.get(ri).cloned().unwrap_or_default();
                 self.toastf(&format!("FLOODWATER! {} IS FILLING", nm));
             }
-                self.cam.update(&self.car, &self.ball, &self.world, &self.cfg.cam, false, false, dt);
+                let fold_t = (self.xf.state == xform::State::Transforming).then(|| self.xf.eased());
+                self.cam.update(&self.car, &self.ball, &self.world, &self.cfg.cam, false, false, dt, fold_t);
             }
         }
 
