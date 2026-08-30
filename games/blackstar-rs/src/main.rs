@@ -57,6 +57,7 @@ mod replay;
 mod academy;
 mod stream;
 mod hazard;
+mod helmai;
 mod hive;
 mod hud;
 mod holomap;
@@ -1206,6 +1207,10 @@ fn main() {
     if argv.iter().any(|a| a == "--gear") {
         // the bearer's sheet, the ship's vault, the clone gallery
         gearsim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--helm") {
+        helmai::run(&argv);
         return;
     }
     if argv.iter().any(|a| a == "--holo") {
