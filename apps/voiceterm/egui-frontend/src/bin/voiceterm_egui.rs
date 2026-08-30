@@ -550,6 +550,15 @@ struct VoicetermApp {
     tabbar_scroll_to: Option<f32>,
     /// The QML toast, ported: fire-and-forget status pill above the bottom chrome.
     toasts: uikit_egui::toast::Toasts,
+    /// The shell, when one could be started.
+    ///
+    /// `Option` rather than required: a spawn failure should degrade to
+    /// the local-echo behaviour this app has always had, not stop it
+    /// launching. A terminal that will not open because it could not
+    /// find a shell is worse than one that opens and says so.
+    pty: Option<voiceterm_egui::pty_host::PtyHost>,
+    /// One-shot latch so "shell exited" is said once, not every frame.
+    pty_ended_noted: bool,
     /// The QML settingsPopup's launcher half — four doors plus voice
     /// activation and theme. Preferences live in `app.prefs`.
     launcher: uikit_egui::quick_launcher::LauncherState,
@@ -2991,8 +3000,54 @@ impl eframe::App for VoicetermApp {
             // a second. The high-water mark is what makes this idempotent.
             if self.session.pty_out.len() > self.session.pty_echoed {
                 let fresh = self.session.pty_out[self.session.pty_echoed..].to_vec();
-                self.feed_pty(&fresh);
+                match &self.pty {
+                    // A REAL SHELL: send the keys, and let its output be
+                    // the echo. Feeding the grid ourselves as well would
+                    // double every character, because the shell echoes
+                    // what it receives — the local echo below exists only
+                    // for the case where nothing is listening.
+                    Some(host) => {
+                        if let Err(e) = host.write(&fresh) {
+                            self.toasts.warning(format!("shell: {e}"), ui.input(|i| i.time));
+                        }
+                    }
+                    // No shell (spawn failed, or a platform without one):
+                    // echo locally so typing is at least visible, which
+                    // is what this branch has always done.
+                    None => self.feed_pty(&fresh),
+                }
                 self.session.pty_echoed = self.session.pty_out.len();
+            }
+
+            // KEEP THE SHELL'S IDEA OF THE SIZE IN STEP with the grid,
+            // or every full-screen program draws for the wrong terminal —
+            // vim in an 80x24 world inside a 200x50 window. `resize`
+            // skips no-ops itself, so calling it per frame is cheap and
+            // means nothing has to track when the window changed.
+            if let Some(host) = &mut self.pty {
+                host.resize(
+                    self.session.grid.cols.min(u16::MAX as usize) as u16,
+                    self.session.grid.rows.min(u16::MAX as usize) as u16,
+                );
+            }
+
+            // WHAT THE SHELL SAID. Drained every frame and fed to the same
+            // parser the local echo uses, so there is one path into the
+            // grid rather than two that can disagree about cursor state.
+            if let Some(host) = &self.pty {
+                let out = host.drain();
+                if !out.is_empty() {
+                    self.feed_pty(&out);
+                }
+                if host.ended() {
+                    // Say so once. A terminal whose shell has exited but
+                    // still accepts keystrokes is the confusing state
+                    // this avoids.
+                    if !self.pty_ended_noted {
+                        self.pty_ended_noted = true;
+                        self.toasts.info("shell exited", ui.input(|i| i.time));
+                    }
+                }
             }
             // The demo has no PTY to write to. Rather than dropping the bytes
             // again, they are kept on the app where a host can drain them, and
@@ -3442,6 +3497,18 @@ fn main() -> eframe::Result<()> {
                 blocks: blocks,
                 tabbar_scroll_to: None,
                 toasts: uikit_egui::toast::Toasts::new(),
+                // 80x24 is a placeholder: the first frame calls
+                // `resize` with the real grid size, and starting at the
+                // conventional default means a shell that prints a banner
+                // before then wraps sensibly rather than at zero columns.
+                pty: match voiceterm_egui::pty_host::PtyHost::spawn(80, 24) {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        eprintln!("[voiceterm] no shell: {e} — falling back to local echo");
+                        None
+                    }
+                },
+                pty_ended_noted: false,
                 launcher: uikit_egui::quick_launcher::LauncherState::default(),
                 a11y: uikit_egui::a11y::A11yScene::new(),
                 view: CentralView::Terminal,

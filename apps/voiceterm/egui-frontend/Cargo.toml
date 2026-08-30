@@ -51,6 +51,9 @@ config-kit = { path = "../../../shared/config-kit" }
 peer-handshake = { path = "../../../shared/peer-handshake" }
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+# The terminal needs an actual shell: pty_host spawns one. Same crate
+# and version the Qt side uses, so behaviour cannot diverge between them.
+portable-pty = "0.8"
 # GestureLayer's adapter needs the model crate behind it. Added so the
 # workspace can be swiped between tabs on a phone — the vertical rail keeps
 # the screen space, and the gesture is how you move without reaching for it.

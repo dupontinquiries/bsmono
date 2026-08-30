@@ -54,6 +54,8 @@ pub mod phonetic_store;
 pub mod voice_prefix;
 pub mod workspaces_view;
 pub mod pty_input;
+/// The other half of the terminal: a real shell on a real pty.
+pub mod pty_host;
 pub mod table_view;
 pub mod row_render;
 pub mod docingest;

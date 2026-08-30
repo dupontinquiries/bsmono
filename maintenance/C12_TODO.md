@@ -2200,3 +2200,44 @@ Decisions worth keeping:
   alternatives until they look at the menu. Showing the chosen block
   inline and the others below is right for now; whether the ghost should
   cycle with the keys is a real question and not obviously yes.
+
+## 37. voiceterm-egui had no shell at all
+
+Operator: "mostly still don't see keys appearing in terminal and can't
+run commands". Traced it, and this was not a bug in the input path —
+every piece of the input path is correct and complete.
+
+`pty_input::drain_egui` encodes keystrokes properly (arrows, Ctrl-C,
+Backspace, Alt word motions). `Session::pty_out` collects them. A
+previous fix even corrected this loop for THROWING THE BYTES AWAY, and
+its comment says so at length. `term_grid` parses VT/ANSI and draws it.
+
+What did not exist anywhere in the crate was a PROCESS. No `openpty`, no
+`CommandBuilder`, no spawn, and no `portable-pty` dependency — while the
+Qt side has all of it in `pty_term.rs`. The bytes were encoded perfectly
+and written into a `Vec<u8>` nothing read; nothing ever wrote bytes
+back. The comment at the echo site said it plainly — "the demo has no
+PTY to write to" — and that had stopped reading as a gap.
+
+So the symptom was not one bug. It was the absence of the component that
+would make either half work, behind a UI complete enough to look like it
+should.
+
+`pty_host` is that component: spawn `$SHELL -l` with TERM=xterm-256color,
+one reader thread appending to a shared buffer, a writer that FLUSHES
+every time (a keystroke sitting in a buffer is indistinguishable from
+one that was ignored), resize that skips no-ops (a SIGWINCH every frame
+makes full-screen programs redraw forever), and EOF-based exit detection
+rather than polling `try_wait`.
+
+Wired: keys go to the shell instead of the local echo when one exists,
+its output feeds the SAME parser the echo used, and the grid size is
+pushed to the pty each frame.
+
+- **C12-37a — NOT COMPILED.** Written under "don't do long tests or
+  compiles". The two end-to-end tests are `#[ignore]`d because they
+  spawn a real shell.
+- **C12-37b — local echo is now a FALLBACK, not the normal path.** With
+  a shell attached the echo is skipped, because the shell echoes what it
+  receives and doing both doubles every character. If the operator sees
+  doubled characters, that branch is the place to look.
