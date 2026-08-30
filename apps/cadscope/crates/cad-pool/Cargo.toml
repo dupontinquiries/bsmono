@@ -1,0 +1,11 @@
+[package]
+name = "cad-pool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Asset pools: manifests, budgets, dedupe and per-game injection. Plans by default; nothing moves without an explicit apply."
+
+[dependencies]
+cad-ref.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -3919,3 +3919,44 @@ day.
 - **C73a — test failures NOT yet examined.** 10 crates failing,
   including beatspace at 12 — the largest and not one I have touched
   recently.
+
+## 74. CADscope found, and grafted
+
+The operator sent the bundles §72 asked for. CADscope existed; the refs
+were simply not in this clone.
+
+**What arrived:** a base bundle (`e71cc7c3`, 398 MB) plus a 40-commit
+incremental, together a 793-commit history. It is a FORK of this
+monorepo, not a separate project — same `apps/`, `games/`, `shared/`
+layout, diverged before aperture, dialer, hatch, snapshot-cam, studio
+and tadpole existed here.
+
+**Two apps, not one.** `apps/cadscope` (touch-first parametric CAD,
+analytic SDFs as modeling truth, meshes as viewing truth) and
+`apps/simscope` (its simulation sibling — the recent commits are
+cohesive-zone fracture, J-integral path independence, homogenization).
+68 Rust files between them.
+
+**Grafted rather than merged.** The two histories share no base, so a
+merge is not available; both apps are self-contained — every path
+dependency is an internal crate under their own tree — so copying the
+directories is complete rather than a partial import.
+
+**And now in the fleet catalog**, which was the original ask.
+Deliberately as CUSTOM entries, not names in the simple list: neither is
+a package at `apps/<name>`. Each is a WORKSPACE whose runnable crate
+sits under `crates/` (`cadscope-egui` producing bin `cadscope`,
+`simscope-cli` producing bin `simscope`). A bare name would have built
+nothing and failed on every device with "no such package" — the exact
+phantom-entry failure I refused to ship in §72 when the source was
+missing. Same refusal, opposite outcome, because this time the source
+exists.
+
+- **C74a — NOT COMPILED.** The apps built in their own fork against
+  their own lockfile; nothing here has resolved them against this tree's
+  dependency set yet.
+- **C74b — the histories stay separate.** 793 commits of CADscope
+  lineage live in the bundles, not in `main`. Grafting the working tree
+  keeps the code without pretending the two histories were ever one, and
+  `BRANCH_INDEX.md`'s claim that the corpus is "derived, not upstream"
+  still holds.

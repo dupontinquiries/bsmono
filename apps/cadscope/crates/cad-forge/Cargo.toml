@@ -1,0 +1,12 @@
+[package]
+name = "cad-forge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The forge-pattern op document (.cadf): names not IDs, ops as a sequence, per-op error tolerance, round-trip export."
+
+[dependencies]
+cad-kernel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+glam.workspace = true

@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+
+[workspace.dependencies]
+# Deliberately thin. The numeric core is hand-written because the whole point of
+# this workspace is that we control precision and reduction order; a linear-algebra
+# dependency that reassociates sums would silently break reproducibility.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sim-mat = { path = "crates/sim-mat" }
+sim-num = { path = "crates/sim-num" }
+sim-power = { path = "crates/sim-power" }
+sim-field = { path = "crates/sim-field" }
+sim-pcb = { path = "crates/sim-pcb" }
+sim-litho = { path = "crates/sim-litho" }
+
+[profile.dev]
+opt-level = 2          # numeric kernels at opt 0 are unusable; same lesson as cadscope
+debug = "line-tables-only"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+# NO fast-math equivalent. Reassociation would break both reproducibility and the
+# compensated-summation kernels, whose correctness depends on operations NOT being
+# algebraically simplified.

@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+
+[workspace.dependencies]
+# Geometry math — pinned to skydribble's glam so the ported code keeps its exact semantics
+# (normalize_or etc). Bump in lockstep with the engine port, never casually.
+glam = "0.28"
+bytemuck = { version = "1", features = ["derive"] }
+# The monorepo egui tier (UI_STRATEGY.md) — 0.34, here on the *wgpu* backend: eframe 0.34
+# pins wgpu ^29, the same major logscope's gpu-gemm locks (29.0.3). One wgpu for render + inference.
+egui = "0.34"
+eframe = { version = "0.34", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+egui-wgpu = "0.34"
+wgpu = "29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+cad-kernel = { path = "crates/cad-kernel" }
+cad-forge = { path = "crates/cad-forge" }
+cad-view = { path = "crates/cad-view" }
+cad-motion = { path = "crates/cad-motion" }
+cad-ref = { path = "crates/cad-ref" }
+cad-nifty = { path = "crates/cad-nifty" }
+cad-liaison = { path = "crates/cad-liaison" }
+cad-tex = { path = "crates/cad-tex" }
+cad-pool = { path = "crates/cad-pool" }
+cad-net = { path = "crates/cad-net" }
+
+[profile.dev]
+opt-level = 2                 # skydribble's lesson: geometry at opt 0 is unusable
+debug = "line-tables-only"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# Dependencies compile at opt 0 in dev: wgpu-core/naga at opt 2 exceed any sane inner-loop budget,
+# and dep runtime speed only matters in --release (which is untouched). cad-* crates stay at opt 2.
+[profile.dev.package."*"]
+opt-level = 0
+debug = false

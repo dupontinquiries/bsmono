@@ -1,0 +1,9 @@
+[package]
+name = "sim-litho"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Level 3: EUV aerial imaging by Fourier optics. Partially coherent Abbe summation, f32-safe and GPU-shaped."
+
+[dependencies]
+sim-num.workspace = true

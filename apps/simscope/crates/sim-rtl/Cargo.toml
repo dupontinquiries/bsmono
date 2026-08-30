@@ -1,0 +1,8 @@
+[package]
+name = "sim-rtl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Level 4: RTL/logic evaluation. Bit-exact, no floating point, CPU-bound."
+
+[dependencies]

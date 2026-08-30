@@ -1,0 +1,12 @@
+[package]
+name = "cad-tex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The texturing system: tileable procedural materials, triplanar mapping from the SDF, and export in the engine's <name>/norm_/spec_ convention."
+
+[dependencies]
+cad-kernel.workspace = true
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true

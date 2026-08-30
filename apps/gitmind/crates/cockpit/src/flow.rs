@@ -1088,6 +1088,31 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     let all: Vec<&str> = coding.iter().chain(&media).chain(&music).chain(&work).copied().collect();
     // bsettings: crate `bigsilicon-settings` at apps/settings-app, GUI bin needs the `gui` feature.
     // Its path/features differ from the simple apps/<name> convention, so it's a custom entry.
+    // cadscope / simscope: grafted from a fork of this monorepo (C12-74).
+    // CUSTOM entries, because neither is a package at `apps/<name>` the
+    // way the simple list assumes — each is a WORKSPACE whose runnable
+    // crate sits under `crates/`. Listing the bare name would build
+    // nothing and fail on every device with a confusing "no such
+    // package", which is the phantom-entry failure I refused to ship
+    // when the source was missing.
+    let cadscope = || crate::suite::SuiteApp {
+        name: "cadscope".into(),
+        path: "apps/cadscope/crates/cadscope-egui".into(),
+        features: vec![],
+        no_default: false,
+        target: String::new(),
+        run_flags: String::new(),
+        bin_name: Some("cadscope".into()),
+    };
+    let simscope = || crate::suite::SuiteApp {
+        name: "simscope".into(),
+        path: "apps/simscope/crates/simscope-cli".into(),
+        features: vec![],
+        no_default: false,
+        target: String::new(),
+        run_flags: String::new(),
+        bin_name: Some("simscope".into()),
+    };
     let bsettings = || crate::suite::SuiteApp {
         name: "bsettings".into(),
         path: "apps/settings-app".into(),
@@ -1159,9 +1184,20 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     all_group.apps.push(bsettings());
     all_group.apps.push(beatspace());
     all_group.apps.push(studio());
+    all_group.apps.push(cadscope());
+    all_group.apps.push(simscope());
     all_group.apps.push(unendlich());
     vec![
-        group("coding", "Development & analysis tools", &coding),
+        {
+            // cadscope and simscope join here rather than via the simple
+            // list, for the same reason beatspace does below: the list
+            // expects a package at `apps/<name>` and these are
+            // workspaces whose runnable crate is one level down.
+            let mut c = group("coding", "Development & analysis tools", &coding);
+            c.apps.push(cadscope());
+            c.apps.push(simscope());
+            c
+        },
         media_group,
         {
             // beatspace joins its group here rather than via the simple list,
