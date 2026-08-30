@@ -25,6 +25,9 @@
 //     require an explicit force flag AND pass safety checks first.
 
 pub mod advisor;
+pub mod assist;
+pub mod catalog;
+pub mod syncdiff;
 pub mod cleanup;
 pub mod cloneop;
 pub mod deltahostile;
