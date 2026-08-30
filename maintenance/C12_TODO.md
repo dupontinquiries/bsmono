@@ -2694,6 +2694,23 @@ hole is documented by something executable rather than a comment.
   app currently replaces `albums` after the first load, so the gap is
   theoretical today. Whoever wires catalogue reload must call it; the
   test names the consequence.
-- **C12-46b — `visible_artists` was not examined.** It sits beside
-  `visible_albums` and is called the same way. Likely the same shape,
-  not confirmed.
+- **C12-46b — CONFIRMED and fixed.** `visible_artists` was the same
+  shape: cloned and re-sorted per frame, with the same allocating
+  `to_lowercase()` comparator in `sort_artists`.
+
+  Two things it had that the album path did not:
+  - The **Top arm was also a per-frame clone with no sort to blame** —
+    `artists_top.clone()` allocated a fresh Vec sixty times a second for
+    a list that only changes on reload. The cache covers both arms.
+  - `then` on the TrackCount tiebreak evaluated the name comparison
+    EAGERLY, so the expensive half ran even when the counts had already
+    decided the order — which is most of the time. Now `then_with`.
+
+  Key carries both source lengths (`pager.items` and `artists_top`),
+  since the two arms read different lists.
+
+  Also swept for the same shape elsewhere: no other app has a
+  `fn(&self) -> Vec<_>` accessor called from a draw path at library
+  scale. bo-suite's remaining ones (`dialogs::visible`,
+  `settings_page::problems`, `sources::visible`) are dialog- and
+  settings-sized, where a per-frame Vec is not worth caching against.

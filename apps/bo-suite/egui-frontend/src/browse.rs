@@ -288,11 +288,19 @@ pub fn top_albums(all: &[Album], limit: usize) -> Vec<Album> {
 
 /// Order artists as `artists_with_counts_page_sorted` does.
 pub fn sort_artists(artists: &mut [Artist], sort: ArtistSort) {
+    // `cmp_fold`, not `to_lowercase()` — same reasoning as `sort_albums`:
+    // two String allocations per comparison inside an O(n log n) sort, on
+    // a list a draw path re-sorts. See `cmp_fold`.
+    //
+    // `then_with` rather than `then` on the tiebreak: `then` evaluates
+    // its argument eagerly, so the name comparison ran even when the
+    // track counts already decided the order — which is most of the
+    // time, and was the more expensive half of the two.
     match sort {
-        ArtistSort::Name => artists.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        ArtistSort::Name => artists.sort_by(|a, b| cmp_fold(&a.name, &b.name)),
         // Most tracks first, name for a stable tiebreak ("n DESC, a.norm").
         ArtistSort::TrackCount => artists.sort_by(|a, b| {
-            b.track_count.cmp(&a.track_count).then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            b.track_count.cmp(&a.track_count).then_with(|| cmp_fold(&a.name, &b.name))
         }),
     }
 }
@@ -604,6 +612,11 @@ pub struct Browse {
     /// re-clone and re-sort the whole library every frame.
     albums_cache: Vec<Album>,
     albums_cache_key: Option<(Mode, AlbumSort, usize)>,
+    artists_cache: Vec<Artist>,
+    /// Both lengths, because the two arms read different sources — a Top
+    /// list that grows while the Alpha page count holds steady is a real
+    /// reload and the key has to see it.
+    artists_cache_key: Option<(Mode, ArtistSort, usize, usize)>,
     /// TOP artists: unpaginated, capped at 50.
     pub artists_top: Vec<Artist>,
     /// A→Z artists: the paged accumulator.
@@ -675,17 +688,35 @@ impl Browse {
         self.albums_cache_key = None;
     }
 
+    /// Drop both cached orders. What a catalogue reload should call.
+    pub fn invalidate(&mut self) {
+        self.albums_cache_key = None;
+        self.artists_cache_key = None;
+    }
+
     /// The artists the list draws. TOP is the capped ranked list; A→Z is the
     /// accumulator, re-sorted by the chip.
-    pub fn visible_artists(&self) -> Vec<Artist> {
-        match self.artist_mode {
-            Mode::Top => self.artists_top.clone(),
-            Mode::Alpha => {
-                let mut v = self.pager.items.clone();
-                sort_artists(&mut v, self.artist_sort);
-                v
-            }
+    /// Cached for the same reason as [`Browse::visible_albums`]: the
+    /// caller is a draw path, and this cloned and re-sorted the artist
+    /// list every frame to produce an unchanged answer.
+    ///
+    /// Note the Top arm was ALSO a per-frame clone, with no sort to blame
+    /// — `artists_top.clone()` allocated a fresh Vec sixty times a second
+    /// for a list that only changes on reload. Caching covers both arms.
+    pub fn visible_artists(&mut self) -> &[Artist] {
+        let key = (self.artist_mode, self.artist_sort, self.pager.items.len(), self.artists_top.len());
+        if self.artists_cache_key != Some(key) {
+            self.artists_cache = match self.artist_mode {
+                Mode::Top => self.artists_top.clone(),
+                Mode::Alpha => {
+                    let mut v = self.pager.items.clone();
+                    sort_artists(&mut v, self.artist_sort);
+                    v
+                }
+            };
+            self.artists_cache_key = Some(key);
         }
+        &self.artists_cache
     }
 
     pub fn open_album(&mut self, key: AlbumKey, tracks: &[BrowseTrack]) {
@@ -1199,6 +1230,34 @@ mod tests {
         // And the same call twice is stable.
         let first = b.visible_albums().to_vec();
         assert_eq!(b.visible_albums(), &first[..]);
+    }
+
+    #[test]
+    fn the_artist_cache_tracks_both_of_its_source_lists() {
+        // The two arms read different sources — `artists_top` for Top and
+        // `pager.items` for Alpha — so the key carries BOTH lengths. A
+        // Top list that grows while the Alpha page count holds steady is
+        // a real reload, and a key watching one length would miss it.
+        let mut b = Browse::default();
+        b.artist_mode = Mode::Top;
+        b.artists_top = vec![Artist { name: "one".into(), ..Default::default() }];
+        assert_eq!(b.visible_artists().len(), 1);
+
+        b.artists_top.push(Artist { name: "two".into(), ..Default::default() });
+        assert_eq!(b.visible_artists().len(), 2, "the Top length is part of the key");
+    }
+
+    #[test]
+    fn artists_sort_case_insensitively_without_allocating() {
+        // Same ordering as the `to_lowercase()` version it replaced —
+        // that is the property that matters, since a faster comparison
+        // that sorted differently would be a behaviour change.
+        let mut v = vec![
+            Artist { name: "beta".into(), ..Default::default() },
+            Artist { name: "Alpha".into(), ..Default::default() },
+        ];
+        sort_artists(&mut v, ArtistSort::Name);
+        assert_eq!(v[0].name, "Alpha");
     }
 
     #[test]
