@@ -55,11 +55,25 @@ use glam::Vec3;
 
 use crate::xform::Morph;
 
-/// Samples per fold. Posecode uses 12 Hz over a clip of arbitrary
-/// length; a fold is `xform::BLEND_SEC` (1.3s), so 24 samples is about
-/// 18 Hz — finer than posecode's, because a fold is short and dense
-/// with motion where a squat is long and smooth.
-pub const SAMPLES: usize = 24;
+/// Samples per fold.
+///
+/// This was 24 (about 18 Hz over `xform::BLEND_SEC`'s 1.3s), reasoned by
+/// analogy to posecode's 12 Hz over a human motion clip. That analogy is
+/// the bug: posecode samples a clip meant to be judged as a clip. A fold
+/// is judged frame by frame, at whatever the game renders at — 60 Hz,
+/// commonly — and 18 Hz is nearly 3.5x coarser than that. Measured
+/// directly (`examples/sample_density_check.rs`): a chassis's worst
+/// per-vertex speed came out at a constant 4.54 units/s across sample
+/// counts from 24 to 384 — proof the vertex moves smoothly and the
+/// "pop" `audit` reported at 24 samples was the sampler seeing one big
+/// coarse step of ordinary motion, not a discontinuity. A discontinuity
+/// would have shown RISING implied velocity as the sampling got finer
+/// around it, not a flat line.
+///
+/// 120 covers real playback with margin across the chassis-duration
+/// range `dur_mul` allows (0.8x-1.35x of 1.3s): even the slowest fold,
+/// 1.75s, samples faster than 60 Hz (1.75 / 119 ≈ 68 Hz).
+pub const SAMPLES: usize = 120;
 
 /// How deeply two prim AABBs may overlap before it counts, as a
 /// fraction of the smaller prim's shortest axis. Not zero: prims that
@@ -452,6 +466,34 @@ mod tests {
         assert!(
             after.worst_pop > 0.0,
             "compaction moved vertices but the audit measured none of it"
+        );
+    }
+
+    /// A regression for the sampling-rate bug SAMPLES's own doc comment
+    /// now explains: fast-but-smooth motion, sampled too coarsely, reads
+    /// as a "pop" that isn't there. A single vertex travelling at a
+    /// constant, ordinary speed across the whole fold — no acceleration,
+    /// no direction change, nothing a player could perceive as a
+    /// discontinuity — must not trigger `Fault::Pop` at whatever `SAMPLES`
+    /// is, or the sampling is still too coarse for real playback.
+    #[test]
+    fn constant_velocity_motion_does_not_read_as_a_pop() {
+        let speed = 4.5; // units/sec, in the range measured on a real chassis
+        let travel = speed * crate::xform::BLEND_SEC;
+        let radius = 0.3;
+        let a = vec![cube(0.0, 0.0, 0.0, radius)];
+        let b = vec![cube(travel, 0.0, 0.0, radius)];
+        let idx = vec![vec![0u32, 1, 2]];
+        let mut m = Morph::build(vec![a, b], idx).unwrap();
+        // pop_tol_for's own formula (foldsim.rs): a quarter of the body's
+        // shortest half-extent. A fixed lenient tolerance would pass at
+        // ANY sample count and prove nothing about SAMPLES specifically.
+        let tol = radius * 0.25;
+        let r = audit(&mut m, tol);
+        assert!(
+            !r.faults.iter().any(|f| matches!(f, Fault::Pop { .. })),
+            "smooth constant-speed motion ({speed} u/s) read as a pop at SAMPLES={SAMPLES}: {:?}",
+            r.faults.iter().map(|f| f.line()).collect::<Vec<_>>()
         );
     }
 }
