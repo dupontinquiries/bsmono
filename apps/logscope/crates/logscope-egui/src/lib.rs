@@ -94,6 +94,8 @@ pub mod voice_lang;
 #[allow(dead_code)] pub mod liaisonhud;
 /// Which model answers a prompt, and what its reply may assert.
 pub mod promptroute;
+/// The generated personas a prompt can be routed to.
+pub mod workerroster;
 #[allow(dead_code)] pub mod metricspanel;
 #[allow(dead_code)] pub mod bracecheck;
 #[allow(dead_code)] pub mod contextsrc;

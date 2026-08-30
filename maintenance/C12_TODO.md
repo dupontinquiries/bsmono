@@ -2892,3 +2892,50 @@ currently be recorded alongside a HUD line.
   route can reach `Dest::Worker` yet. Written as an explicit field
   rather than hidden inside the matrix so it flips in ONE place when the
   roster lands.
+
+## 51. workergen finally has a caller
+
+`workerroster::WorkerRoster` is the piece between `workergen` (builds
+personas, 400 lines of tests, no caller) and `promptroute::Dest::Worker`
+(a destination nothing could reach, because the routing call hardcoded
+`workers: false`).
+
+It holds generated workers, picks one per prompt, and answers "are there
+any" so the matrix can route. The chat tab now passes
+`workers: !self.workers.is_empty()`, and a `Dest::Worker` route selects
+`system_prompt(&qt)` — without that last step the route would name a
+destination and change nothing about the request.
+
+**NOT the same as `logscope_fan::roster::Roster`**, and the name
+collision is worth recording:
+  - `logscope_fan`'s holds `WorkerSpec`: an operational CONTRACT — which
+    paths a worker may edit, which tools it may call, how success is
+    checked.
+  - this holds `workergen::Worker`: a PERSONA — stance, habits,
+    refusals.
+
+A worker eventually wants both, but merging them would make the
+operational contract depend on a corpus of book fragments.
+
+Decisions:
+  - `pick` is deterministic on the prompt text, not random and not
+    round-robin. Asking the same question twice must reach the same
+    worker, or a person comparing two answers cannot tell a worker
+    changing its mind from the roster handing them a different worker.
+  - Seeds are kept parallel to workers so a roster rebuilds exactly. A
+    roster that reshuffles personalities between sessions makes every
+    answer unattributable.
+  - `fill` returning FEWER than asked is normal, not an error:
+    `generate` rejects incoherent combinations, and retrying rejected
+    seeds would hide how often the corpus contradicts itself — which is
+    the signal that the corpus needs work.
+  - `pick` on an empty roster returns None rather than dividing by zero.
+    Empty is the normal startup state, not an edge case.
+
+- **C12-51a — no corpus source yet.** The roster is empty until someone
+  supplies `Corpus { roles, manners, actions, taboos }`, so
+  `Dest::Worker` is reachable but unreached in practice. The corpus is a
+  content question (which book fragments) rather than a code one.
+- **C12-51b — `route_persona` is selected and not yet USED.** The prompt
+  builder must prepend it. Same shape as `route_ceiling` in §50: chosen,
+  stored, not yet consumed.

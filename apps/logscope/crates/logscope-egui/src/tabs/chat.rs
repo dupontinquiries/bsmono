@@ -1350,6 +1350,14 @@ pub struct Chat {
     /// being assumed to be fact — which is what happened when every turn
     /// went to one model with one set of permissions.
     route_ceiling: Option<crate::liaison::Epistemic>,
+    /// Generated personas. Empty until a corpus is supplied, which is
+    /// why `promptroute` treats an empty roster as "no workers" rather
+    /// than as an error — a fresh install has none and must still chat.
+    workers: crate::workerroster::WorkerRoster,
+    /// The persona prompt for the reply in flight, when this turn routed
+    /// to a worker. Prepended by the prompt builder; `None` means the
+    /// plain engine.
+    route_persona: Option<String>,
     /// The liaison model's phrasing of the HUD, when one has produced a line. Empty = show the raw
     /// observation instead, which cannot be wrong because it is copied from the engine.
     hud_narration: String,
@@ -1477,6 +1485,8 @@ impl Default for Chat {
             expanded_msgs: Default::default(),
             hud: crate::liaisonhud::Hud::new(8), hud_narration: String::new(),
             route_ceiling: None,
+            workers: crate::workerroster::WorkerRoster::new(),
+            route_persona: None,
             show_metrics: false, metrics_base: Default::default(), metrics_wall_ns: 0, metrics_tokens: 0, metrics_start: None,
             vault: autosave_path().and_then(|p| p.parent().map(|d| d.join("vault")))
                 .and_then(|d| crate::vault::Vault::open(d).ok()),
@@ -2894,11 +2904,11 @@ reply is framed differently from the turn that produced it.");
                 // the same reason the prompt builder does: a tab created
                 // after the load would otherwise think no model exists.
                 engine: infer.detected_template().is_some(),
-                // No roster yet — `workergen` has no caller, so no route
-                // can reach a worker. Stated as a field rather than
-                // hidden in the matrix so it flips to true in one place
-                // when the roster lands.
-                workers: false,
+                // The roster landed, so this is live: a Judgement prompt
+                // now reaches a generated persona when one exists, and
+                // falls back to the plain engine when the roster is
+                // empty — which it is until someone supplies a corpus.
+                workers: !self.workers.is_empty(),
                 runtime: true,
             },
         );
@@ -2919,6 +2929,18 @@ reply is framed differently from the turn that produced it.");
             return;
         }
         self.route_ceiling = Some(route.ceiling);
+        // THE PERSONA, when the prompt routed to one. Without this the
+        // route would name a destination and change nothing about the
+        // request — a worker that is chosen and never spoken through.
+        //
+        // `system_prompt` returns None on an empty roster, so this is
+        // also the fallback: no persona means the prompt goes to the
+        // engine plain, which is what `Dest::Engine` would have done.
+        self.route_persona = if route.dest == crate::promptroute::Dest::Worker {
+            self.workers.system_prompt(&qt)
+        } else {
+            None
+        };
 
         // fresh reply → fresh stepwise accounting
         self.step_last_paused = 0; self.step_continues = 0; self.step_pending_continue = false; self.step_arm_continue = false;
