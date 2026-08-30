@@ -2611,6 +2611,7 @@ name = "snapclone-egui"
 version = "0.1.0"
 dependencies = [
  "config-kit",
+ "crypto-kit",
  "device-kit",
  "eframe",
  "egui",

@@ -8,32 +8,156 @@
 
 use eframe::egui;
 use snapclone_egui::host::{HostCommand, HostEvent};
-use snapclone_egui::{Peer, Snapclone};
+use snapclone_egui::Snapclone;
 use uikit_egui::Adaptive;
 
 struct App {
     snap: Snapclone,
     /// Last reported focus, so the change is sent once rather than every frame.
     focused: bool,
+    /// The discovery socket, or None when the port was unavailable. Absent
+    /// rather than fatal: an app that refuses to start because something else
+    /// holds 9877 is worse than one that runs without discovery and says so.
+    gossip: Option<snapclone_egui::gossip_wire::GossipSocket>,
+    /// When we last announced ourselves, in wall-clock seconds.
+    last_announce: i64,
+    /// Kept because announcing requires the signing key, and the key must not
+    /// travel through `Snapclone` — the app holds `local_id`, which is public,
+    /// and has no business holding a secret it never needs.
+    identity: Option<snapclone_egui::identity::Identity>,
+    /// The unsigned-gossip warning is printed once. A per-datagram log line
+    /// at three seconds times every peer on the subnet buries everything
+    /// else, and the message is the same every time.
+    warned_unsigned: bool,
 }
 
 impl App {
     fn new() -> Self {
-        // Placeholder roster. Real peers arrive as `HostEvent::GossipHeard`
-        // once there is something listening on the subnet — see the note in
-        // `handle` about what this binary can and cannot yet produce.
-        let peers = vec![
-            Peer { name: "kitchen-tablet".into(), online: true },
-            Peer { name: "studio-mbp".into(), online: true },
-            Peer { name: "porch-cam".into(), online: false },
-        ];
-        let mut snap = Snapclone::new(peers);
+        // NO PLACEHOLDER ROSTER. kitchen-tablet, studio-mbp and porch-cam were
+        // the three names this binary invented on every launch, and they were
+        // most of why the app read as a demo: the roster was furniture, and a
+        // contact you actually added disappeared when you quit.
+        //
+        // The list now starts empty and is filled from disk. Empty is the
+        // correct first-run state and the Friends page already has an empty
+        // view that names the ports to open — which is real help, unlike three
+        // devices that do not exist.
+        let mut snap = Snapclone::new(Vec::new());
+
+        // Identity before contacts, because the QR code the user shows is
+        // drawn from it and a fresh install's first act is usually to show it.
+        let id = snapclone_egui::identity::load_or_create();
+        if let snapclone_egui::identity::Loaded::Created(ref i) = id {
+            eprintln!("snapclone: new identity {} — identity.conf holds a signing key, \
+                       keep it", i.sc_id);
+        }
+        let keys = match &id {
+            snapclone_egui::identity::Loaded::Existing(i)
+            | snapclone_egui::identity::Loaded::Created(i) => Some(i.clone()),
+            snapclone_egui::identity::Loaded::Unavailable => None,
+        };
+        let cmds = snap.apply(HostEvent::IdentityLoaded(id));
+        Self::report(cmds);
+
+        let book = snapclone_egui::contact_book::load();
+        let cmds = snap.apply(HostEvent::ContactsLoaded(Box::new(book)));
+        Self::report(cmds);
+
         // Settings off disk, through the seam rather than by assignment: the
         // event sets `current` AND the saved baseline, so a freshly loaded
         // config does not come up reporting unsaved changes with the Save
         // button lit.
         snap.apply(HostEvent::SettingsLoaded(Box::new(snapclone_egui::settings_store::load())));
-        Self { snap, focused: true }
+        let port = snap.settings.current.network.gossip_port;
+        let gossip = match snapclone_egui::gossip_wire::GossipSocket::bind(port) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("snapclone: no discovery — could not bind UDP {port}: {e}");
+                None
+            }
+        };
+        if let Some(g) = gossip.as_ref() {
+            if !g.joined_group() {
+                // Worth its own line: discovery will look broken and the cause
+                // is the interface, not the app.
+                eprintln!("snapclone: could not join the discovery multicast group — \
+                           peers on this network will not be found");
+            }
+        }
+        Self { snap, focused: true, gossip, last_announce: 0, warned_unsigned: false,
+               identity: keys }
+    }
+
+    /// Drain the discovery socket into the app, and announce ourselves on the
+    /// tick the protocol asks for.
+    ///
+    /// On the frame loop rather than a thread. The socket is non-blocking and
+    /// the drain is capped, so an idle network costs a syscall and a busy one
+    /// cannot run past the frame that called it — and the whole path stays in
+    /// one place you can step through, which a channel out of a background
+    /// thread would not be.
+    fn pump_gossip(&mut self, now_secs: i64) {
+        let Some(sock) = self.gossip.as_mut() else { return };
+
+        // Capped per frame; leftovers wait in the kernel buffer.
+        for (from, decoded) in sock.poll(8) {
+            match decoded {
+                Ok(a) => {
+                    let len = a.peers.len();
+                    let cmds = self.snap.apply(HostEvent::GossipHeard {
+                        // The address the packet CAME from, when the sender did
+                        // not name one. Without this the record's host is empty,
+                        // parse_dotted_quad declines it, and a peer that
+                        // verified perfectly is still not dialable.
+                        record: a.sender_record_from(from.ip()),
+                        // The admission check wants the datagram size and we
+                        // have already consumed the bytes, so this is the
+                        // encoded length of what we understood. It is an
+                        // approximation and the cap it feeds was already
+                        // enforced by the socket's own buffer.
+                        datagram_len: len,
+                        public: a.public,
+                    });
+                    self.handle(cmds);
+                }
+                Err(e) => eprintln!("snapclone: unreadable gossip from {from}: {e:?}"),
+            }
+        }
+
+        // TICK_MS is the protocol's rate. Announcing faster is a subnet you are
+        // shouting at; slower and peers prune you before you say anything.
+        let due = now_secs - self.last_announce
+            >= (snapclone_egui::gossip::TICK_MS / 1000).max(1) as i64;
+        // No key, no announcement. Broadcasting unsigned would be traffic every
+        // correctly-configured peer refuses, which reads as a flaky network
+        // rather than as a missing identity.
+        let Some(keys) = self.identity.clone() else { return };
+        if !due { return; }
+        self.last_announce = now_secs;
+        let a = snapclone_egui::gossip_wire::Announce {
+            id: self.snap.local_id.clone(),
+            // The address a peer should dial us back on. Left empty rather than
+            // guessed: picking one of several interfaces here would tell peers
+            // to come back on the wrong one, and the receiver can see the UDP
+            // source address, which is the one that actually worked.
+            host: String::new(),
+            port: self.snap.settings.current.network.listen_port,
+            ts: now_secs.max(0) as u64 * 1000,
+            peers: Vec::new(),
+            // Filled by the signer, not here — `verified` is only ever true on
+            // something that came off the wire and checked out.
+            public: None,
+            verified: false,
+        };
+        let to = snapclone_egui::gossip_wire::GossipSocket::group_addr(
+            self.snap.settings.current.network.gossip_port);
+        if let Ok(addr) = to.parse() {
+            if let Some(s) = self.gossip.as_ref() {
+                if let Err(e) = s.send_signed_to(&a, &keys.secret, &keys.public, addr) {
+                    eprintln!("snapclone: could not announce: {e}");
+                }
+            }
+        }
     }
 
     /// What the app asked the world to do.
@@ -46,25 +170,70 @@ impl App {
     fn handle(&mut self, cmds: Vec<HostCommand>) {
         for c in cmds {
             match c {
-                // NOT app-internal after all, despite what this comment
-                // used to claim. `MarkViewed`'s own doc says "mark as
-                // seen IN STORAGE" and `MarkExpired`'s says "storage does
-                // different things with each" — so these are the two
-                // commands that most need a store, and they were the two
-                // being silently discarded while everything else was
-                // reported.
+                // REAL, not a debug sink. This is the whole point of the
+                // exercise: a contact scanned or renamed now reaches the disk,
+                // so it is still there next launch. A write failure is
+                // reported rather than swallowed — a silent one means the user
+                // adds someone twice and never learns why.
+                HostCommand::SaveContacts(book) => {
+                    if let Err(e) = snapclone_egui::contact_book::store(&book) {
+                        eprintln!("snapclone: could not save contacts: {e}");
+                    }
+                }
+                // Every gossip record is currently refused, and the reason is
+                // in gossip_wire's header: this wire format carries no
+                // signature and `gossip::accept` will not admit an unverified
+                // record. Reported at a low volume rather than silently, so the
+                // gap is visible in a log instead of presenting as "discovery
+                // does not work".
+                HostCommand::GossipAdmitted(false) => {
+                    if !self.warned_unsigned {
+                        self.warned_unsigned = true;
+                        eprintln!("snapclone: gossip refused — unsigned, or the sender's \
+                                   sc-ID is not its key's fingerprint. Qt peers do not sign \
+                                   and will not appear online.");
+                    }
+                }
+                HostCommand::GossipAdmitted(true) => {}
+                HostCommand::PeerKeyChanged(id) => {
+                    eprintln!("snapclone: {id} is signing with a different key than the one \
+                               on file. They may have reinstalled — or someone is \
+                               impersonating them. Refused; delete and re-add the contact \
+                               if you know it was a reinstall.");
+                }
+                HostCommand::IdentityUnavailable => {
+                    eprintln!("snapclone: no identity — /dev/urandom was unreadable. \
+                               Nobody can add this device and the QR code will be blank.");
+                }
+                // NOT app-internal, despite what this comment used to say —
+                // and re-applied here after the merge, because the incoming
+                // branch predates the fix and reintroduced it.
                 //
-                // The in-memory state exists and is tested (`snaps.rs`),
-                // so today a snap is viewed until restart and unviewed
-                // afterwards. Until there is a persistence layer they
-                // report like the rest: a comment claiming something is
-                // handled is worse than no arm at all, because it stops
-                // anyone looking.
+                // `MarkViewed`'s own doc says "mark as seen IN STORAGE" and
+                // `MarkExpired`'s says "storage does different things with
+                // each". So these are the two commands that most need a
+                // store, and they were the two being silently discarded while
+                // everything around them is now persisted for real.
+                //
+                // The rest of this match got a disk in this very merge, which
+                // makes the gap sharper rather than softer: viewed state is
+                // still in memory only, so a snap is viewed until restart and
+                // unviewed afterwards.
                 other @ (HostCommand::MarkViewed(_) | HostCommand::MarkExpired(_)) => {
                     eprintln!("snapclone: {other:?} — no store yet, viewed state is in-memory only");
                 }
                 other => eprintln!("snapclone: unhandled host command: {other:?}"),
             }
+        }
+    }
+
+    /// `handle` before there is a `self` to handle with. Start-up events can
+    /// produce commands too — a first-run identity is exactly when something
+    /// might need saying — and dropping them silently would be the same class
+    /// of bug the drain exists to prevent.
+    fn report(cmds: Vec<HostCommand>) {
+        for c in cmds {
+            eprintln!("snapclone: startup: {c:?}");
         }
     }
 }
@@ -85,6 +254,11 @@ impl eframe::App for App {
             .unwrap_or(0);
         let cmds = self.snap.apply(HostEvent::Tick { now_secs });
         self.handle(cmds);
+        self.pump_gossip(now_secs);
+
+        // Discovery is time-driven, not input-driven, so the frame has to come
+        // round on its own or an idle window never polls the socket.
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
 
         let focused = ctx.input(|i| i.focused);
         if focused != self.focused {

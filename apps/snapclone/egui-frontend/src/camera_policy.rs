@@ -437,6 +437,20 @@ mod tests {
         h.record("cam0", probe(Health::Broken, 0, Facing::Rear, 0));
         h.record("cam0", probe(Health::Working, 50, Facing::Rear, 10));
         assert_eq!(h.status("cam0"), Health::Working);
-        assert_eq!(h.stale_ids(&["cam0".into()], 0).len(), 0);
+        // Asked at `now = 10`, the moment of the probe — not at 0.
+        //
+        // The original passed `0`, which is BEFORE the probe it just
+        // recorded at `at_ms = 10`. That reads as a result from the
+        // future, and since this branch was written `is_stale` treats a
+        // future timestamp as stale on purpose: a clock stepping back
+        // used to make the age negative, never exceed the window, and
+        // leave that camera fresh forever — never reprobed for the life
+        // of the process.
+        //
+        // So the test was asserting the old bug's behaviour by accident.
+        // The property it means to check — a fresh probe is not stale —
+        // is unchanged, and now it asks at a time that can actually
+        // exist.
+        assert_eq!(h.stale_ids(&["cam0".into()], 10).len(), 0);
     }
 }

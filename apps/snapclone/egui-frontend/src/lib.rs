@@ -22,6 +22,12 @@ pub mod outbox;
 pub mod group_voice;
 /// The host seam: one typed event in, typed commands out. See `host.rs` —
 /// this is the call site the ~35 tested-but-unreached entry points lacked.
+/// Who this installation is, kept across restarts.
+pub mod identity;
+/// The gossip datagram format and the UDP socket that carries it.
+pub mod gossip_wire;
+/// Contacts that survive a restart, with the port the scanner found.
+pub mod contact_book;
 pub mod host;
 /// Reading .vcf files, so the Import button does something.
 pub mod vcard;
@@ -144,6 +150,17 @@ pub struct Snapclone {
     /// the view should display what it is TOLD, not compute a second answer
     /// that could disagree with the one the handshake uses.
     pub local_id: String,
+    /// The durable address book. Beside `peers` rather than merged into it —
+    /// see `contact_book` for why, and for the test that keeps the two in step.
+    pub contact_book: crate::contact_book::ContactBook,
+    /// Contacts whose announcement was signed by a key that is not the one on
+    /// file. Drained as a command: this is a security event, not a log line.
+    pub key_conflicts: Vec<String>,
+    /// The book changed and has not been written. Drained as a command rather
+    /// than written from here: the app has no business owning a file handle,
+    /// and a save that happens inside apply_friends cannot be batched or
+    /// deferred by a host that knows better.
+    pub contacts_dirty: bool,
     /// Latest-frame-wins slot between the capture thread and the paint.
     pub frames: crate::frame_pump::FrameSlot,
     /// The uploaded texture, kept across frames so an unchanged frame is not
@@ -565,6 +582,9 @@ impl Snapclone {
             shutter_note: String::new(),
             feed_note: String::new(),
             local_id: String::new(),
+            contact_book: Default::default(),
+            key_conflicts: Vec::new(),
+            contacts_dirty: false,
             frames: Default::default(),
             cam_texture: None,
             last_frame_ms: None,
@@ -788,9 +808,36 @@ impl Snapclone {
     /// check is the whole security boundary for discovery: gossip arrives from
     /// ANYONE on the subnet, so a record that skips it can claim to be any
     /// peer.
-    pub fn on_gossip(&mut self, rec: crate::gossip::PeerRecord, datagram_len: usize) -> bool {
+    pub fn on_gossip(&mut self, rec: crate::gossip::PeerRecord, datagram_len: usize,
+                     public: Option<[u8; 32]>) -> bool {
         if crate::gossip::accept(&rec, datagram_len, &self.local_id).is_err() {
             return false;
+        }
+        // THE PIN, checked before anything is believed. `accept` proves the
+        // datagram was signed by the key whose fingerprint is its sc-ID; it
+        // cannot know whether that is the SAME key this contact used yesterday.
+        // Four bytes of fingerprint is ~2^32 to grind, so without this the
+        // signature only stops the laziest impersonation.
+        //
+        // Taken as a parameter rather than read off the record because
+        // PeerRecord is the view's currency and sixteen literals construct one;
+        // the key is something this call learned, not something the view keeps.
+        if let Some(pk) = public {
+            match self.contact_book.pin(&rec.id, pk) {
+                crate::contact_book::Pin::First => self.contacts_dirty = true,
+                crate::contact_book::Pin::Same | crate::contact_book::Pin::Unknown => {}
+                crate::contact_book::Pin::Changed => {
+                    // Refused AND surfaced. A reinstall and a collision look
+                    // identical from here: dropping silently makes a legitimate
+                    // reinstall look like a broken network, and accepting
+                    // silently makes the pin worthless. The user has to decide,
+                    // so the event has to reach them.
+                    if !self.key_conflicts.contains(&rec.id) {
+                        self.key_conflicts.push(rec.id.clone());
+                    }
+                    return false;
+                }
+            }
         }
         // A discovered device becomes a peer row only if the user does not
         // already have one. Discovery ADDS reachability information; it does
@@ -810,10 +857,21 @@ impl Snapclone {
             self.note_peer_addr(&id, ip, rec.port, rec.last_seen_ms);
         }
         self.view.observe(rec);
-        if !self.peers.iter().any(|p| p.name == id) {
-            self.peers.push(Peer { name: id, online: true });
-            self.sync_roster();
+        // PRESENCE, which was the asymmetry that made discovery useless. This
+        // used to add a row for an unknown peer and do NOTHING for a known one,
+        // while `tick_gossip` happily set `online = false` on prune — so a
+        // contact loaded from the address book could go offline and could never
+        // come back. Every saved contact was permanently grey no matter how
+        // loudly it was broadcasting.
+        //
+        // The comment above about discovery not replacing a contact still
+        // holds: this changes reachability, not the name or the identity. That
+        // is precisely what discovery is FOR.
+        match self.peers.iter_mut().find(|p| p.name == id) {
+            Some(p) => p.online = true,
+            None => self.peers.push(Peer { name: id, online: true }),
         }
+        self.sync_roster();
         true
     }
 
@@ -1337,6 +1395,10 @@ impl Snapclone {
         // peer_session was written to prevent — and re-adding them later would
         // resume a sequence they have no memory of.
         self.sessions.forget(&id);
+        // The book too, or the contact returns on the next launch — a delete
+        // that survives until you quit is the most confusing kind of not
+        // working, because it looks like it worked.
+        if self.contact_book.remove(&id) { self.contacts_dirty = true; }
         self.peers.retain(|p| p.name != id);
         self.cards.close(id);
         self.sync_roster();
@@ -1372,6 +1434,21 @@ impl Snapclone {
                 if !self.peers.iter().any(|e| e.name == name) {
                     self.peers.push(Peer { name: name.clone(), online: false });
                 }
+                // THE PORT, which was being dropped here. `AddPeer` has carried
+                // one since the QR parser was written — a bare sc-ID means
+                // 9876, an explicit one overrides — and this function read
+                // `p.host` and never looked at `p.port`, so both forms produced
+                // identical state and all that care was wasted one call later.
+                //
+                // Only a real sc-ID goes in the book: the manual field accepts
+                // a hostname too, and a book keyed by "192.168.1.5" cannot be
+                // matched against a peer that later announces itself by id.
+                // Those rows still appear — they just are not durable yet,
+                // which is the honest state rather than a silent half-record.
+                if crate::identity::is_valid(&name)
+                    && self.contact_book.upsert(&name, p.port, self.now_secs.max(0) as u64 * 1000) {
+                    self.contacts_dirty = true;
+                }
                 self.sync_roster();
             }
             // A LOCAL nickname: it renames the row, not the peer. The other
@@ -1384,6 +1461,7 @@ impl Snapclone {
                 // for this contact, so it is refused rather than applied — the
                 // row would become unidentifiable and unfindable.
                 if !to.is_empty() {
+                    if self.contact_book.rename(&id, &to) { self.contacts_dirty = true; }
                     if let Some(p) = self.peers.iter_mut().find(|p| p.name == id) {
                         p.name = to;
                     }
@@ -2878,6 +2956,55 @@ impl Snapclone {
             if ui.button("Scan code").clicked() { self.open_qr_scan(true); }
             if ui.button("Enter code").clicked() { self.open_qr_scan(false); }
         });
+
+        // WHAT DISCOVERY FOUND, and what the app makes of it. Two gaps this
+        // closes, both of which left real state with no way to see or act on
+        // it:
+        //
+        // 1. A peer found by gossip appears as a row and is NOT in the address
+        //    book, so it is gone on restart and there was no way to keep it.
+        //    Discovery deliberately does not auto-save strangers — an address
+        //    book that fills itself from the subnet is not an address book —
+        //    but "I see them, keep them" had no button.
+        // 2. A refused key change reached stderr and nowhere else. On a phone
+        //    that is the same as nowhere.
+        let mut keep: Option<(String, u16)> = None;
+        for p in &self.peers {
+            match self.contact_book.get(&p.name) {
+                // `entry`, not `c` — the palette is already `c` in this
+                // function and shadowing it here produced three field errors
+                // that read as the Contact type being wrong.
+                Some(entry) => {
+                    let t = entry.trust();
+                    let col = match t {
+                        crate::contact_book::Trust::Conflict => c.danger,
+                        _ => c.text_weak,
+                    };
+                    ui.colored_label(col, format!("{}  ·  {}", entry.label(), t.label()));
+                }
+                None => {
+                    // Only a real sc-ID can be saved: the book is keyed by id,
+                    // and a row named after a hostname has nothing to store.
+                    if !crate::identity::is_valid(&p.name) { continue; }
+                    ui.horizontal(|ui| {
+                        ui.colored_label(c.text_weak, format!("{}  ·  discovered", p.name));
+                        if ui.button("Keep").clicked() {
+                            let port = self.view.peers().iter()
+                                .find(|r| r.id == p.name)
+                                .map(|r| r.port)
+                                .unwrap_or(crate::qr::DEFAULT_PORT);
+                            keep = Some((p.name.clone(), port));
+                        }
+                    });
+                }
+            }
+        }
+        // Applied after the loop: `keep` exists because the buttons are drawn
+        // while `self.peers` is borrowed, and adding a contact mutates it.
+        if let Some((id, port)) = keep {
+            self.apply_friends(crate::friends::Action::Add(
+                crate::friends::AddPeer { host: id, port }));
+        }
         if let Some(a) = crate::friends::friends_ui(
             ui, &self.roster, &mut self.cards, &mut self.add_form, c) {
             self.apply_friends(a);
@@ -4822,7 +4949,7 @@ mod dial_wiring_tests {
         s.on_gossip(crate::gossip::PeerRecord {
             id: id.into(), host: host.into(), port,
             last_seen_ms: 0, verified: true,
-        }, 100);
+        }, 100, None);
     }
 
     #[test]
@@ -4913,7 +5040,7 @@ mod gossip_wiring_tests {
         let mut s = Snapclone::new(vec![]);
         let mut r = rec("sc-a", 0);
         r.verified = false;
-        assert!(!s.on_gossip(r, 100));
+        assert!(!s.on_gossip(r, 100, None));
         assert!(s.peers.is_empty());
     }
 
@@ -4921,14 +5048,14 @@ mod gossip_wiring_tests {
     fn our_own_echo_does_not_add_us_to_our_own_roster() {
         let mut s = Snapclone::new(vec![]);
         s.local_id = "sc-me".into();
-        assert!(!s.on_gossip(rec("sc-me", 0), 100));
+        assert!(!s.on_gossip(rec("sc-me", 0), 100, None));
         assert!(s.peers.is_empty());
     }
 
     #[test]
     fn a_discovered_device_becomes_a_peer() {
         let mut s = Snapclone::new(vec![]);
-        assert!(s.on_gossip(rec("sc-a", 0), 100));
+        assert!(s.on_gossip(rec("sc-a", 0), 100, None));
         assert_eq!(s.peers.len(), 1);
         assert!(s.peers[0].online);
     }
@@ -4938,7 +5065,7 @@ mod gossip_wiring_tests {
         // Discovery ADDS reachability; it does not get to add a second row for
         // somebody already in the list.
         let mut s = Snapclone::new(vec![Peer { name: "sc-a".into(), online: false }]);
-        s.on_gossip(rec("sc-a", 0), 100);
+        s.on_gossip(rec("sc-a", 0), 100, None);
         assert_eq!(s.peers.len(), 1);
     }
 
@@ -4948,7 +5075,7 @@ mod gossip_wiring_tests {
         // gossiping may be asleep, and deleting the row would lose a contact
         // the user added deliberately.
         let mut s = Snapclone::new(vec![]);
-        s.on_gossip(rec("sc-a", 0), 100);
+        s.on_gossip(rec("sc-a", 0), 100, None);
         s.tick_gossip(crate::gossip::FAILURE_MS + crate::gossip::PRUNE_MS);
         assert_eq!(s.peers.len(), 1, "the contact was deleted, not just marked");
         assert!(!s.peers[0].online);
@@ -4961,7 +5088,7 @@ mod gossip_wiring_tests {
         // minutes and FAILURE_MS is 15 seconds.
         let mut s = Snapclone::new(vec![]);
         let precise = 7 * 60_000 + 1234;
-        s.on_gossip(rec("sc-a", precise), 100);
+        s.on_gossip(rec("sc-a", precise), 100, None);
         assert_eq!(s.view.peers()[0].last_seen_ms, precise,
                    "the live view must keep millisecond precision");
         let stored = s.view_for_storage();
@@ -4976,7 +5103,7 @@ mod gossip_wiring_tests {
         let mut s = Snapclone::new(vec![]);
         for t in [1u64, 299_999, 300_000, 300_001, 899_999] {
             s = Snapclone::new(vec![]);
-            s.on_gossip(rec("sc-a", t), 100);
+            s.on_gossip(rec("sc-a", t), 100, None);
             let got = s.view_for_storage()[0].last_seen_ms;
             assert!(got <= t, "{t} bucketed forward to {got}");
         }
@@ -5293,7 +5420,7 @@ mod gossip_wiring_tests {
         // peer is 100+ seconds stale the moment it is heard from.
         let mut s = Snapclone::new(vec![]);
         let now = 7 * 60_000 + 1234;
-        s.on_gossip(rec("sc-a", now), 100);
+        s.on_gossip(rec("sc-a", now), 100, None);
         assert!(s.view.peers()[0].is_alive(now), "a peer just heard from is dead");
     }
 
@@ -5302,7 +5429,7 @@ mod gossip_wiring_tests {
         // Per-frame pruning walks the peer list sixty times a second to do
         // nothing.
         let mut s = Snapclone::new(vec![]);
-        s.on_gossip(rec("sc-a", 0), 100);
+        s.on_gossip(rec("sc-a", 0), 100, None);
         s.tick_gossip(crate::gossip::PRUNE_MS - 1);
         assert!(s.peers[0].online, "pruned before the interval elapsed");
     }
