@@ -116,6 +116,21 @@ fn main() {
         t0.elapsed().as_secs_f32()
     );
 
+    // --fuse-with <other.y4m>: build the canonical from THIS GOP plus
+    // another take, pooled trimmed-median (canonical fusion / lineage
+    // refinement). Combine with --save-plate to store the fused set
+    // canonical.
+    if let Some(other) = arg_val(&args, "--fuse-with") {
+        let (frames2, _) = read_y4m(&other);
+        let motions2 = plate::estimate_motions(&frames2);
+        let fused = plate::build_plate_fused(&[(&frames[..], &motions[..]), (&frames2[..], &motions2[..])]);
+        eprintln!("fused canonical: {}x{} from {} + {} frames", fused.w, fused.h, frames.len(), frames2.len());
+        if let Some(sp) = arg_val(&args, "--save-plate") {
+            plate::save_plate(&fused, &sp).unwrap_or_else(|e| die(&format!("save_plate: {e}")));
+            println!("fused canonical saved to {sp}");
+            return;
+        }
+    }
     let t1 = std::time::Instant::now();
     // --use-plate <path>: CITE a stored canonical plate instead of
     // building+transmitting one. Motions get re-based by a phase-corr

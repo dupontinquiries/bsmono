@@ -815,6 +815,133 @@ fn copy_region_mc(dst: &mut Yuv420, prev: &Yuv420, rx: usize, ry: usize, mv: (i8
 /// Byte attribution is by final-SAD energy share of the GOP residual —
 /// approximate (bytes aren't exactly ∝ SAD at a fixed dead-zone) but
 /// honest about ranking which missing factor costs most.
+/// Fuse a canonical plate from MULTIPLE takes of the same set.
+///
+/// The citation experiment measured the mismatch: two takes of the
+/// "same set" share only ~8% of regions at plate-predictor level,
+/// because actors rest in different places and a single-take median
+/// bakes them into the canonical. Pooling samples from several takes
+/// (each take's frames motion-compensated into take-0's frame-0
+/// coordinates, with a cross-take phase-corr offset per take) lets
+/// the per-pixel median see PAST any one take's actors: a pixel an
+/// actor occupies for all of take 1 is background for take 2, and
+/// the pooled median recovers the SET. This is the lineage mechanic
+/// in its first working form — every take refines the canonical.
+///
+/// The median itself is the trimming: with T takes of N frames each,
+/// an actor must occupy a pixel in more than half of ALL pooled
+/// samples to survive into the canonical.
+pub fn build_plate_fused(takes: &[(&[Yuv420], &[PlateMotion])]) -> Plate {
+    use crate::phase_correlation::PhaseCorrelationPass;
+    assert!(!takes.is_empty());
+    let (fw, fh) = (takes[0].0[0].w, takes[0].0[0].h);
+    // Cross-take offsets: align each take's frame 0 to take 0's frame 0.
+    //
+    // NOT raw phase correlation — with different actor positions in the
+    // two takes, the correlation peak can latch onto actor-to-actor
+    // correspondence and return a large bogus shift (measured: a locked
+    // store set produced a 2226px-wide fused plate from exactly this,
+    // and the misregistered samples POISONED the median instead of
+    // healing it). Robust version: variance-gated block matching on a
+    // grid, take the MEDIAN block displacement — actors are the
+    // minority of blocks, background the majority, and the median
+    // votes with the background.
+    let _ = PhaseCorrelationPass::new(64); // keep the import obviously used
+    let mut offs: Vec<(f32, f32)> = vec![(0.0, 0.0)];
+    for (frames, _) in takes.iter().skip(1) {
+        let (ref_y, cur_y) = (&takes[0].0[0].y, &frames[0].y);
+        let mut dxs: Vec<f32> = Vec::new();
+        let mut dys: Vec<f32> = Vec::new();
+        let step = 64usize;
+        let mut y = step;
+        while y + REGION + step < fh {
+            let mut x = step;
+            while x + REGION + step < fw {
+                let mut mean = 0u32;
+                for dy in 0..REGION {
+                    for dx in 0..REGION {
+                        mean += cur_y[(y + dy) * fw + x + dx] as u32;
+                    }
+                }
+                mean /= (REGION * REGION) as u32;
+                let mut var = 0u64;
+                for dy in 0..REGION {
+                    for dx in 0..REGION {
+                        let d = cur_y[(y + dy) * fw + x + dx] as i64 - mean as i64;
+                        var += (d * d) as u64;
+                    }
+                }
+                if var / (REGION * REGION) as u64 >= 64 {
+                    let (mv, sad) = search_mv(ref_y, fw, fh, cur_y, x, y);
+                    if sad < (REGION * REGION * 12) as u32 {
+                        // search_mv returns half-pel units of cur->ref block
+                        // offset; the take offset convention below matches
+                        // motion dx (content shift), so negate.
+                        dxs.push(-(mv.0 as f32) * 0.5);
+                        dys.push(-(mv.1 as f32) * 0.5);
+                    }
+                }
+                x += step;
+            }
+            y += step;
+        }
+        if dxs.len() >= 8 {
+            dxs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            dys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            offs.push((dxs[dxs.len() / 2], dys[dys.len() / 2]));
+        } else {
+            offs.push((0.0, 0.0));
+        }
+    }
+    // Plate bounds over ALL takes in take-0 frame-0 coords.
+    let (mut minx, mut miny, mut maxx, mut maxy) = (0.0f32, 0.0f32, fw as f32, fh as f32);
+    for ((_, motions), &(ox, oy)) in takes.iter().zip(&offs) {
+        for m in *motions {
+            minx = minx.min(-(m.dx + ox));
+            miny = miny.min(-(m.dy + oy));
+            maxx = maxx.max(-(m.dx + ox) + fw as f32);
+            maxy = maxy.max(-(m.dy + oy) + fh as f32);
+        }
+    }
+    let pw = ((maxx - minx).ceil() as usize + 1) & !1usize;
+    let ph = ((maxy - miny).ceil() as usize + 1) & !1usize;
+    let median_plane = |get: &dyn Fn(&Yuv420) -> &Vec<u8>, sub: usize| -> Vec<u8> {
+        let (pw, ph) = (pw / sub, ph / sub);
+        let (fw, fh) = (fw / sub, fh / sub);
+        let mut plane = vec![0u8; pw * ph];
+        let mut samples: Vec<u8> = Vec::new();
+        for py in 0..ph {
+            for px in 0..pw {
+                samples.clear();
+                for ((frames, motions), &(tox, toy)) in takes.iter().zip(&offs) {
+                    for (f, m) in frames.iter().zip(*motions) {
+                        let fx = px as f32 + (minx + m.dx + tox) / sub as f32;
+                        let fy = py as f32 + (miny + m.dy + toy) / sub as f32;
+                        let (fx, fy) = (fx.round() as isize, fy.round() as isize);
+                        if fx >= 0 && fy >= 0 && (fx as usize) < fw && (fy as usize) < fh {
+                            samples.push(get(f)[fy as usize * fw + fx as usize]);
+                        }
+                    }
+                }
+                if !samples.is_empty() {
+                    samples.sort_unstable();
+                    plane[py * pw + px] = samples[samples.len() / 2];
+                }
+            }
+        }
+        plane
+    };
+    Plate {
+        w: pw,
+        h: ph,
+        ox: minx,
+        oy: miny,
+        y: median_plane(&|f| &f.y, 1),
+        u: median_plane(&|f| &f.u, 2),
+        v: median_plane(&|f| &f.v, 2),
+    }
+}
+
 /// Serialize a plate: [w:u32][h:u32][ox:f32][oy:f32][y][u][v], zstd.
 /// A stored plate is the 2D-native CANONICAL: the first infrastructure
 /// of the library-citation department. A GOP encoded with --use-plate

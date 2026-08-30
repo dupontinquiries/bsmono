@@ -3196,3 +3196,38 @@ and movers are coded per-take. This also matches the engine framing:
 an engine's scene is assets + actors, never a fused frame. The
 affine-citation machinery stays in-tree, correct and waiting for
 geometrically-differing pairs (handheld retakes, game camera orbits).
+
+### Canonical fusion works — after robust registration (same session)
+
+build_plate_fused: pool samples from multiple takes (each take's
+frames motion-compensated into take-0 coordinates + a cross-take
+offset), per-pixel median over the pooled set. The median IS the
+trimming: an actor must occupy a pixel in more than half of ALL
+pooled samples to survive into the canonical — where take 1's actor
+rests, take 2's background votes them out.
+
+First attempt poisoned itself: cross-take registration by raw phase
+correlation latched onto actor-to-actor correspondence (different
+resting positions) and returned a bogus shift; the misregistered
+samples blurred the median (fused plate ballooned to 2226px wide on a
+LOCKED set, citation gained only +0.34 dB). Fix: variance-gated block
+matching on a grid, MEDIAN block displacement — actors are the
+minority of blocks, so the median votes with the background.
+
+Measured, w2 citing the robust-fused canonical at dz32:
+  single-take canonical:  481 KB @ 33.22 dB, prev-mode share 0.919
+  fused canonical:        433 KB @ 34.94 dB, prev-mode share 0.766
+Bytes −10% AND +1.72 dB simultaneously; the canonical serves ~3× the
+regions. And w1 cites the same canonical at 452 KB (mode 0.688) —
+ONE canonical, BOTH takes.
+
+Pair arithmetic including canonical transmission once (fused file
+446 KB): cited pair 452+433+446 = 1,331 KB vs self-coded pair
+708+937 = 1,645 KB → −19% across two takes, with the canonical
+amortizing further on every additional take. Quality tier honesty:
+cited sits at ~34–35 dB vs self's 37.2 at this dz; the matched-
+quality crossover still needs the mover-layer step (actor regions are
+the residual bulk and shrink nothing via fusion). But the direction
+is now right, monotonic in take count, and the lineage mechanic —
+takes refining a shared canonical they then cite — is measured
+working for the first time.
