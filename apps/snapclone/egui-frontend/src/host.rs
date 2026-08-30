@@ -1,0 +1,516 @@
+//! host — the missing call site, expressed as data.
+//!
+//! `Snapclone` has around ninety-five public methods. The deployable binary
+//! called **two** of them (`apply_settings` and `ui`) and constructed the app
+//! with three hardcoded peers, so `answer_call`, `voice_frame`, `qr_frame`,
+//! `on_gossip`, `classify_nat`, `peer_learned` and roughly thirty more were
+//! ported, tested, and never once reached in a running process. `wiring_check`
+//! calls that class "tested but never called in production" and it is the
+//! whole gap between this port and the Qt app: not missing code, missing
+//! wiring.
+//!
+//! ## Why an enum and not a trait
+//!
+//! A `Host` trait with `poll()`/`execute()` would be the reflex, and it would
+//! be a layer for a future that may not come — one real implementation, one
+//! fake, and an abstraction boundary drawn before anything varied. What
+//! actually varies is the TRANSPORT: on a phone the events arrive from a
+//! capture thread, a UDP socket and an audio callback; in a test they arrive
+//! from a `Vec`. Both want the same thing — a value they can hand to the app
+//! from wherever they happen to be running — and that is an enum, not a trait.
+//!
+//! So this module adds no policy and no indirection. [`HostEvent`] is one
+//! variant per thing the world can tell the app, [`HostCommand`] is one
+//! variant per thing the app wants done about it, and
+//! [`Snapclone::apply`](crate::Snapclone::apply) is the match that connects
+//! them to the methods that already exist. Every arm is a call that was
+//! previously written by nobody.
+//!
+//! ## apply() drains, deliberately
+//!
+//! Several results the app wants are not returns from the method that caused
+//! them — they are flags set on `Snapclone` during the UI frame
+//! (`export_requested`, `shutter_pressed`, `snaps_saved`, `dictated`). A host
+//! that has to remember to read a dozen public fields AND clear them will
+//! eventually forget one, and a forgotten flag is either an export that never
+//! runs or one that runs on every frame forever. So `apply` ends by draining
+//! them into the same command list. One call, nothing to remember.
+//!
+//! [`Snapclone::drain_commands`](crate::Snapclone::drain_commands) is public
+//! because a host that ran a UI frame with no event still needs to collect what
+//! the frame requested — but note that `apply` already calls it, so calling
+//! both for one event yields the second an empty list rather than duplicates.
+//!
+//! ## What is NOT here, and why the list matters more than the code
+//!
+//! Events exist only for entry points that the WORLD drives. The ones a finger
+//! drives — `answer_call`, `open_qr_scan`, `begin_swipe`/`end_swipe`,
+//! `apply_menu`, `close_video`, `open_snap_menu` — are equally unreached, and
+//! an event for them would be this module pretending to fix a problem that
+//! lives in `ui()`. They need a button, not a channel.
+//!
+//! And a caution about measurement: once `apply` exists, `wiring_check` counts
+//! every method it dispatches to as "called in production", because it is —
+//! from `apply`. That is only true reachability to the extent that `apply`
+//! itself is reached with that variant. The binary today can genuinely produce
+//! `SettingsLoaded`, `CamerasFound`, `Tick`, `KeyboardChanged` and
+//! `WindowFocus`; the rest wait on a capture thread, a socket and an audio
+//! device that do not exist yet. Do not read a green wiring column as a
+//! working voice call.
+
+use crate::{
+    ambient_inbox, ambient_palette, camera_select, frame_pump, gaze, gossip, keyboard_inset,
+    nat_punch, settings_page, snap_export, voice_bridge, voice_send, Snapclone,
+};
+
+/// Something the world is telling the app.
+///
+/// One variant per outside cause, named for the cause rather than for the
+/// method it happens to call — a variant called `NoteCameraWorked` would tie
+/// the wire format to an internal name, and the point of the seam is that the
+/// two can move apart.
+#[derive(Debug, Clone)]
+pub enum HostEvent {
+    /// Wall clock advanced. Carries seconds because that is what the app's
+    /// relative-time rendering uses, and is deliberately NOT a general
+    /// per-frame tick: `ui()` already advances gossip, sends, posture, help and
+    /// touch feedback every frame, and a second caller doing the same would
+    /// double their rates.
+    Tick { now_secs: i64 },
+
+    /// Settings came off disk. Replaces the page's contents AND its
+    /// last-saved baseline, so a freshly loaded config is not immediately
+    /// "unsaved".
+    SettingsLoaded(Box<settings_page::Settings>),
+
+    /// Auto-login succeeded, or the login form was satisfied.
+    LoggedIn,
+
+    /// The devices this machine offers, from a probe.
+    CamerasFound(Vec<camera_select::Device>),
+    /// A capture actually delivered frames. Feeds the health record that
+    /// decides which camera to open next time.
+    CameraWorked { id: String, now_ms: i64 },
+    /// A frame arrived from the capture thread.
+    CameraFrame(frame_pump::RawFrame),
+    /// A QR payload was decoded from the viewfinder or pasted in.
+    QrPayload(String),
+    /// Average colour of the scene, for the ambient palette.
+    AmbientPixels { pixels: Vec<ambient_palette::Rgb>, side: u32 },
+
+    /// A discovery record arrived on the subnet. `datagram_len` is carried
+    /// because the app's own admission check uses it — gossip arrives from
+    /// anyone, and an oversized record is one of the things that gets refused.
+    GossipHeard { record: gossip::PeerRecord, datagram_len: usize },
+    /// Presence changed for a known peer.
+    PeerPresence { id: String, online: bool },
+    /// A peer's address was observed, for hole punching.
+    PeerAddr { id: String, ip: [u8; 4], port: u16, now_ms: u64 },
+    /// A peer acknowledged holding a payload, so the next frame can skip the
+    /// body.
+    PeerHasPayload { peer: String, hash: String },
+    /// A peer announced the highest wire version it speaks.
+    WireOffered { peer: String, theirs_max: u8 },
+    /// Two STUN responses from the SAME local socket. Both are required
+    /// together because the classification is a comparison, and one probe
+    /// yields Unknown.
+    NatProbed { local_port: u16, a: nat_punch::Reflexive, b: nat_punch::Reflexive },
+    /// Punch addresses older than the window should go.
+    ExpirePunchAddrs { now_ms: u64 },
+
+    /// The voice transport came up or went down.
+    VoiceLink(bool),
+    /// A voice payload arrived from a peer.
+    VoiceReceived { sender: String, payload: Vec<u8> },
+    /// The mic produced a frame interval; ask the sender whether anything may
+    /// leave.
+    MicFrame,
+    /// A packet is ready to go out to everyone in the call.
+    VoiceOutbound(voice_bridge::Packet),
+    /// A decoded frame for the play-out cushion.
+    DecodedAudio(Vec<f32>),
+    /// The audio device reports how much it still holds; answer with what to
+    /// write.
+    SinkDepth(usize),
+    /// Measured speaking level for a participant, and for the room's own
+    /// speaker meter.
+    SpeakerLevel { peer: String, level: f32 },
+
+    /// Snaps arrived. `focused` is the window's own state and travels with the
+    /// event rather than being read from the app, because whether to notify is
+    /// a question about the moment the snaps landed.
+    SnapsArrived { from: Vec<String>, focused: bool },
+    /// A send was acknowledged.
+    SnapDelivered(String),
+    /// Someone asked to connect.
+    ConnectionRequest { id: u64, peer: String, at: i64 },
+    /// The host finished (or failed) an export it was asked to run.
+    ExportFinished(snap_export::Outcome),
+    /// A DHT lookup produced a value.
+    DhtValue(Vec<u8>),
+    /// A DHT lookup finished. The bool command reports whether this was the
+    /// first completion — a second `done` on the same lookup is a
+    /// use-after-free in the C++ original and is counted rather than obeyed.
+    DhtDone,
+
+    /// The on-screen keyboard moved. A rectangle in screen coordinates, not a
+    /// height — see `keyboard_inset` for why the difference is load-bearing.
+    KeyboardChanged(keyboard_inset::Rect),
+    /// Window focus changed.
+    WindowFocus(bool),
+    /// A gaze sample from the face pipeline.
+    Gaze { sample: gaze::GazeSample, dt_ms: f32 },
+    /// The face pipeline lost the subject.
+    GazeLost,
+}
+
+/// Something the app wants the world to do.
+///
+/// Returned rather than performed, for the same reason the events are data:
+/// the app has no business knowing whether "export" means a zip, an rsync or a
+/// test double.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostCommand {
+    /// Capture a frame — the shutter was pressed.
+    CaptureSnap,
+    /// Run the export the user asked for.
+    ExportSnaps,
+    /// Retry the sends that failed.
+    RetryFailedSends,
+    /// Write these snaps out; the user chose to keep them.
+    KeepSnap(String),
+    /// Mark as seen in storage.
+    MarkViewed(String),
+    /// The view window elapsed. Distinct from `MarkViewed`: one is "did they
+    /// see it", the other is "is the window over", and storage does different
+    /// things with each.
+    MarkExpired(String),
+    /// Put dictated text into a field.
+    ApplyDictation { field: String, text: String },
+    /// Write these frames to the audio device.
+    PlayAudio(Vec<Vec<f32>>),
+    /// Send these payloads, one per peer.
+    SendVoice(Vec<(String, Vec<u8>)>),
+    /// What the transmit half decided about this mic interval.
+    VoiceEmit(voice_send::Emit),
+    /// Show a notification. Only produced when the app decided one is
+    /// warranted — an unfocused window and at least one sender.
+    Notify(uikit_egui::notify::Rendered),
+    /// Discovery admitted (true) or refused (false) a gossip record. Surfaced
+    /// because a refused record is a security event worth logging, and the
+    /// return value of `on_gossip` was otherwise dropped on the floor.
+    GossipAdmitted(bool),
+    /// The NAT classification succeeded (true) or the two probes disagreed
+    /// about their local port (false).
+    NatClassified(bool),
+    /// A QR payload latched onto an open scanner.
+    QrLatched(bool),
+    /// A DHT lookup completed for the first time (true), or `done` arrived
+    /// twice for the same lookup (false) — which the C++ original treats as a
+    /// use-after-free, so it is surfaced rather than swallowed.
+    DhtFinished(bool),
+}
+
+impl Snapclone {
+    /// Apply one event from the world, and collect everything the app wants
+    /// done as a result — including whatever the UI frame requested before it.
+    ///
+    /// This is the only function a host needs to call. See the module header
+    /// for why it drains rather than leaving that to the caller.
+    pub fn apply(&mut self, ev: HostEvent) -> Vec<HostCommand> {
+        let mut out = Vec::new();
+        match ev {
+            HostEvent::Tick { now_secs } => {
+                self.now_secs = now_secs;
+                // The five-minute arming window for the proximity screensaver.
+                // Its own tick because it depends on when voice last arrived,
+                // not on frame time.
+                self.refresh_posture_arming(now_secs);
+            }
+            HostEvent::SettingsLoaded(s) => {
+                // Both halves: a load that set only `current` would leave the
+                // page reporting unsaved changes against a default it never
+                // showed, and the Save button lit on a fresh start.
+                self.settings = settings_page::SettingsPage::new(*s);
+            }
+            HostEvent::LoggedIn => self.login_succeeded(),
+
+            HostEvent::CamerasFound(list) => self.cameras = list,
+            HostEvent::CameraWorked { id, now_ms } => self.note_camera_worked(&id, now_ms),
+            HostEvent::CameraFrame(f) => self.frames.offer(f),
+            HostEvent::QrPayload(p) => out.push(HostCommand::QrLatched(self.qr_frame(&p))),
+            HostEvent::AmbientPixels { pixels, side } => self.sample_ambient(&pixels, side),
+
+            HostEvent::GossipHeard { record, datagram_len } => {
+                out.push(HostCommand::GossipAdmitted(self.on_gossip(record, datagram_len)));
+            }
+            HostEvent::PeerPresence { id, online } => {
+                self.roster.mark_online(&id, online);
+            }
+            HostEvent::PeerAddr { id, ip, port, now_ms } => {
+                self.note_peer_addr(&id, ip, port, now_ms)
+            }
+            HostEvent::PeerHasPayload { peer, hash } => self.peer_learned(&peer, &hash),
+            HostEvent::WireOffered { peer, theirs_max } => {
+                self.negotiate_wire(&peer, theirs_max);
+            }
+            HostEvent::NatProbed { local_port, a, b } => {
+                out.push(HostCommand::NatClassified(self.classify_nat(local_port, &a, &b)));
+            }
+            HostEvent::ExpirePunchAddrs { now_ms } => { self.punch.expire(now_ms); }
+
+            HostEvent::VoiceLink(on) => self.voice_bridge.set_connected(on),
+            HostEvent::VoiceReceived { sender, payload } => {
+                // The return carries the routed packet; the app has already
+                // applied any floor change to the coordinator by the time it
+                // comes back, so there is nothing for the host to do with it.
+                let _ = self.voice_receive(&sender, &payload);
+                // Arriving voice is what arms the proximity screensaver's
+                // window, and the posture engine is told separately from the
+                // codec path on purpose: one is about audio, the other about
+                // whether the phone is at an ear.
+                self.last_voice_at = Some(self.now_secs);
+            }
+            HostEvent::MicFrame => out.push(HostCommand::VoiceEmit(self.voice_frame())),
+            HostEvent::VoiceOutbound(p) => out.push(HostCommand::SendVoice(self.voice_send(&p))),
+            HostEvent::DecodedAudio(frame) => self.sink_push(frame),
+            HostEvent::SinkDepth(depth) => {
+                let frames = self.sink_tick(depth);
+                if !frames.is_empty() { out.push(HostCommand::PlayAudio(frames)); }
+            }
+            HostEvent::SpeakerLevel { peer, level } => {
+                self.group_voice.set_level(&peer, level);
+                self.voice_room.set_speaker_level(level);
+            }
+
+            HostEvent::SnapsArrived { from, focused } => {
+                if let Some(n) = self.on_snaps_arrived(&from, focused) {
+                    out.push(HostCommand::Notify(n));
+                }
+                // Wake the screensaver whether or not a notification was sent:
+                // a snap that arrives while the phone is face-down is exactly
+                // when the screen should come back.
+                self.posture.notify_snap_arrived();
+            }
+            HostEvent::SnapDelivered(id) => { self.outbox.mark_delivered(&id); }
+            HostEvent::ConnectionRequest { id, peer, at } => {
+                self.inbox.connection_request(id, &peer, at)
+            }
+            HostEvent::ExportFinished(o) => self.export_finished(o),
+            HostEvent::DhtValue(v) => self.dht_lookup.on_value(v),
+            HostEvent::DhtDone => {
+                out.push(HostCommand::DhtFinished(self.dht_lookup.on_done()));
+            }
+
+            HostEvent::KeyboardChanged(r) => { self.on_keyboard(r); }
+            HostEvent::WindowFocus(_) => {
+                // Focus is carried on SnapsArrived, where the decision is
+                // actually made. Accepted as an event anyway so a host can
+                // report it in one place rather than caching it to attach
+                // later — and so this arm is the one obvious place to hang
+                // focus-dependent behaviour when there is some.
+            }
+            HostEvent::Gaze { sample, dt_ms } => self.feed_gaze(sample, dt_ms),
+            HostEvent::GazeLost => self.gaze_lost(),
+        }
+        out.extend(self.drain_commands());
+        out
+    }
+
+    /// Collect what the UI frame asked for, clearing it as it goes.
+    ///
+    /// `apply` already calls this, so a host using `apply` does not need it —
+    /// calling both for one event gives the second an empty list rather than a
+    /// duplicate. It is public for a host that ran a frame with no event to
+    /// deliver.
+    ///
+    /// Order is fixed and capture comes first: a frame in which the user hit
+    /// the shutter and then asked to export should capture before the export
+    /// runs, or the new snap misses the archive it was clearly meant to be in.
+    pub fn drain_commands(&mut self) -> Vec<HostCommand> {
+        let mut out = Vec::new();
+        if std::mem::take(&mut self.shutter_pressed) { out.push(HostCommand::CaptureSnap); }
+        for id in std::mem::take(&mut self.snaps_saved) { out.push(HostCommand::KeepSnap(id)); }
+        for id in std::mem::take(&mut self.snaps_viewed) { out.push(HostCommand::MarkViewed(id)); }
+        for id in std::mem::take(&mut self.snaps_expired) { out.push(HostCommand::MarkExpired(id)); }
+        for (field, text) in std::mem::take(&mut self.dictated) {
+            out.push(HostCommand::ApplyDictation { field, text });
+        }
+        if std::mem::take(&mut self.export_requested) { out.push(HostCommand::ExportSnaps); }
+        if std::mem::take(&mut self.retry_requested) { out.push(HostCommand::RetryFailedSends); }
+        out
+    }
+}
+
+/// The outcome of an ambient-inbox arrival, re-exported so a host does not
+/// have to name the module to match on what `apply` did.
+pub use ambient_inbox::Outcome as AmbientOutcome;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Peer;
+
+    fn app() -> Snapclone {
+        Snapclone::new(vec![
+            Peer { name: "kitchen".into(), online: false },
+            Peer { name: "studio".into(), online: true },
+        ])
+    }
+
+    #[test]
+    fn a_tick_reaches_the_clock_and_the_posture_arming() {
+        // refresh_posture_arming was one of the ~35 methods nothing called. If
+        // this arm is ever dropped, the proximity screensaver stops arming and
+        // no other test in the crate notices, because every posture test drives
+        // the engine directly.
+        let mut s = app();
+        s.apply(HostEvent::Tick { now_secs: 1_700_000_000 });
+        assert_eq!(s.now_secs, 1_700_000_000);
+    }
+
+    #[test]
+    fn loading_settings_replaces_the_baseline_and_not_only_the_values() {
+        // A load that set `current` alone leaves the page reporting unsaved
+        // changes against a default it never showed — Save lit on a fresh
+        // start, which trains people to press it.
+        let mut s = app();
+        let mut cfg = settings_page::Settings::default();
+        cfg.network.listen_port = 5555;
+        s.apply(HostEvent::SettingsLoaded(Box::new(cfg)));
+        assert_eq!(s.settings.current.network.listen_port, 5555);
+        assert!(!s.settings.is_dirty(), "a freshly loaded config is not unsaved work");
+    }
+
+    #[test]
+    fn login_dismisses_the_overlay() {
+        let mut s = Snapclone::new_with_login(vec![], false);
+        assert!(s.login_visible, "no auto-login, so the overlay is up");
+        s.apply(HostEvent::LoggedIn);
+        assert!(!s.login_visible);
+    }
+
+    #[test]
+    fn presence_reaches_the_roster_rather_than_a_second_list() {
+        let mut s = app();
+        s.apply(HostEvent::PeerPresence { id: "kitchen".into(), online: true });
+        assert!(s.roster.rows().iter().any(|r| r.id == "kitchen" && r.online),
+                "presence did not reach the roster");
+    }
+
+    #[test]
+    fn a_qr_payload_only_latches_onto_an_open_scanner() {
+        let mut s = app();
+        // Nothing open: the payload is reported as not latched rather than
+        // silently building a contact from a code nobody asked to scan.
+        let out = s.apply(HostEvent::QrPayload("snapclone://sc-deadbeef:9000".into()));
+        assert!(out.contains(&HostCommand::QrLatched(false)));
+        s.open_qr_scan(true);
+        let out = s.apply(HostEvent::QrPayload("snapclone://sc-deadbeef:9000".into()));
+        assert!(out.contains(&HostCommand::QrLatched(true)), "{out:?}");
+    }
+
+    #[test]
+    fn a_gossip_record_is_admitted_or_refused_and_the_answer_is_not_dropped() {
+        // `on_gossip` returns the admission decision and every previous caller
+        // — there were none — would have thrown it away. A refused record is a
+        // security event: gossip arrives from anyone on the subnet.
+        let mut s = app();
+        let rec = crate::gossip::PeerRecord {
+            id: "studio".into(), host: "10.0.0.9".into(), port: 9876,
+            last_seen_ms: 1_000, verified: true,
+        };
+        let out = s.apply(HostEvent::GossipHeard { record: rec, datagram_len: 64 });
+        assert!(out.iter().any(|c| matches!(c, HostCommand::GossipAdmitted(_))),
+                "the decision was dropped: {out:?}");
+    }
+
+    #[test]
+    fn arriving_voice_arms_the_screensaver_window() {
+        // The posture engine's arming window keys off when voice last arrived,
+        // and nothing was setting that — so the flip to gated talk could never
+        // fire in a running app however long the call went on.
+        let mut s = app();
+        s.apply(HostEvent::Tick { now_secs: 5_000 });
+        assert_eq!(s.last_voice_at, None);
+        s.apply(HostEvent::VoiceReceived { sender: "studio".into(), payload: vec![0u8; 8] });
+        assert_eq!(s.last_voice_at, Some(5_000));
+    }
+
+    #[test]
+    fn an_empty_sink_tick_produces_no_command_rather_than_an_empty_one() {
+        // A PlayAudio carrying nothing would have the host write zero frames
+        // to the device every tick, which is a wakeup for no reason at fifty
+        // hertz for the length of a call.
+        let mut s = app();
+        let out = s.apply(HostEvent::SinkDepth(9_999));
+        assert!(!out.iter().any(|c| matches!(c, HostCommand::PlayAudio(_))), "{out:?}");
+    }
+
+    #[test]
+    fn snaps_arriving_while_the_window_is_focused_do_not_notify() {
+        // An app that notifies about something already on screen is one people
+        // mute, and then the real notification is gone too.
+        let mut s = app();
+        s.notify_enabled = true;
+        let from = vec!["studio".to_string()];
+        let out = s.apply(HostEvent::SnapsArrived { from: from.clone(), focused: true });
+        assert!(!out.iter().any(|c| matches!(c, HostCommand::Notify(_))), "{out:?}");
+        let out = s.apply(HostEvent::SnapsArrived { from, focused: false });
+        assert!(out.iter().any(|c| matches!(c, HostCommand::Notify(_))), "{out:?}");
+    }
+
+    #[test]
+    fn the_ui_frames_requests_come_back_through_apply_without_a_second_call() {
+        // The whole reason apply drains: a host that has to remember to read a
+        // dozen public fields will forget one, and a forgotten flag is either
+        // an export that never runs or one that runs every frame forever.
+        let mut s = app();
+        s.shutter_pressed = true;
+        s.export_requested = true;
+        s.snaps_saved.push("snap-1".into());
+        let out = s.apply(HostEvent::Tick { now_secs: 1 });
+        assert!(out.contains(&HostCommand::CaptureSnap));
+        assert!(out.contains(&HostCommand::ExportSnaps));
+        assert!(out.contains(&HostCommand::KeepSnap("snap-1".into())));
+    }
+
+    #[test]
+    fn capture_is_ordered_before_export_within_one_frame() {
+        // A frame in which the user hit the shutter and then asked to export
+        // should capture first, or the new snap misses the archive it was
+        // obviously meant to be in.
+        let mut s = app();
+        s.shutter_pressed = true;
+        s.export_requested = true;
+        let out = s.drain_commands();
+        let cap = out.iter().position(|c| *c == HostCommand::CaptureSnap).unwrap();
+        let exp = out.iter().position(|c| *c == HostCommand::ExportSnaps).unwrap();
+        assert!(cap < exp, "{out:?}");
+    }
+
+    #[test]
+    fn a_drained_request_does_not_come_back_a_second_time() {
+        // The failure this prevents is an export that runs on every frame for
+        // the life of the process.
+        let mut s = app();
+        s.export_requested = true;
+        assert!(!s.drain_commands().is_empty());
+        assert!(s.drain_commands().is_empty(), "the flag was not cleared");
+        // and apply agrees, rather than having its own copy of the logic
+        s.retry_requested = true;
+        assert!(s.apply(HostEvent::Tick { now_secs: 2 })
+                 .contains(&HostCommand::RetryFailedSends));
+        assert!(s.apply(HostEvent::Tick { now_secs: 3 })
+                 .iter().all(|c| *c != HostCommand::RetryFailedSends));
+    }
+
+    #[test]
+    fn an_event_with_nothing_to_report_yields_no_commands() {
+        // Otherwise every host loop spins on a list it has to filter, and the
+        // no-op case is the common one.
+        let mut s = app();
+        assert!(s.apply(HostEvent::WindowFocus(true)).is_empty());
+        assert!(s.apply(HostEvent::GazeLost).is_empty());
+    }
+}

@@ -20,6 +20,9 @@ pub mod conversation;
 pub mod composer;
 pub mod outbox;
 pub mod group_voice;
+/// The host seam: one typed event in, typed commands out. See `host.rs` —
+/// this is the call site the ~35 tested-but-unreached entry points lacked.
+pub mod host;
 pub mod settings_page;
 pub mod settings_store;
 /// The Network tab's seven STUN servers and the bitmask they persist as.
