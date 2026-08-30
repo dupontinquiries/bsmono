@@ -316,12 +316,21 @@ fn main() {
         };
         let (mut terrain_diff, mut tree_diff, mut tree_cells) = (0u64, 0u64, 0u64);
         let mut first_terrain: Option<(ChunkCoord, usize, BlockId, BlockId)> = None;
+        // r610: classify tree diffs by (cpu, gpu) pair. The shader diverges
+        // from the CPU BY DESIGN in exactly two ways — edge perforation
+        // (CPU leaves → GPU air) and branch logs (CPU air → GPU log) — so
+        // those two pairs are the "designed" bucket; every other pair is
+        // REAL drift (spawn/species/shape mismatch) and gates the mirror.
+        let mut pair_hist: std::collections::HashMap<(BlockId, BlockId), u64> = Default::default();
         for ((coord, cc), gc) in coords.iter().zip(cpu_chunks.iter()).zip(gpu_chunks.iter()) {
             for i in 0..cc.blocks.len() {
                 let (a, b) = (cc.blocks[i], gc.blocks[i]);
                 if is_tree(a) || is_tree(b) {
                     tree_cells += 1;
-                    if a != b { tree_diff += 1; }
+                    if a != b {
+                        tree_diff += 1;
+                        *pair_hist.entry((a, b)).or_default() += 1;
+                    }
                 } else if a != b {
                     terrain_diff += 1;
                     if first_terrain.is_none() {
@@ -330,6 +339,46 @@ fn main() {
                 }
             }
         }
+        let designed: u64 = pair_hist
+            .iter()
+            .filter(|(&(a, b), _)| {
+                (matches!(a, BlockId::OakLeaves | BlockId::BirchLeaves) && b == BlockId::Air)
+                    || (a == BlockId::Air && matches!(b, BlockId::OakLog | BlockId::BirchLog))
+            })
+            .map(|(_, n)| *n)
+            .sum();
+        let drift = tree_diff - designed;
+        let mut pairs: Vec<_> = pair_hist.into_iter().collect();
+        pairs.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        pairs.truncate(8);
+        println!("  tree diff pairs (cpu→gpu): {pairs:?}");
+        println!("  tree diffs: designed(perforation+branches)={designed} positional-drift={drift}");
+        // r610: positional tree parity is OUT OF SCOPE BY DESIGN — the
+        // shader's tree-origin hashes are documented u32 rewrites of the
+        // CPU's u64 hashes ("GPU-canonical strategy"), so the two backends
+        // spawn trees at different columns on purpose. The meaningful
+        // invariant is tree MASS: per-run totals within a tolerance says
+        // density/profile/form logic agrees even where positions differ.
+        let cpu_tree_total: u64 = cpu_chunks
+            .iter()
+            .flat_map(|c| c.blocks.iter())
+            .filter(|b| is_tree(**b))
+            .count() as u64;
+        let gpu_tree_total: u64 = gpu_chunks
+            .iter()
+            .flat_map(|c| c.blocks.iter())
+            .filter(|b| is_tree(**b))
+            .count() as u64;
+        let mass_ratio = if cpu_tree_total > 0 {
+            gpu_tree_total as f64 / cpu_tree_total as f64
+        } else if gpu_tree_total == 0 {
+            1.0
+        } else {
+            f64::INFINITY
+        };
+        println!(
+            "  tree mass: cpu={cpu_tree_total} gpu={gpu_tree_total} ratio={mass_ratio:.3}"
+        );
         let ratio = if tree_cells > 0 { tree_diff as f64 / tree_cells as f64 } else { 0.0 };
         println!(
             "worldgen-parity: {} chunks | terrain diffs {} | tree cells {} | tree diffs {} ({:.1}%)",

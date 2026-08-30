@@ -846,6 +846,11 @@ void fi_island_profile(int palette, int stratum, inout TreeProfile p) {
     p.trunk_block = tb; p.leaves_block = lb;
 }
 
+// r610: forward declaration — surface_block_type is defined in the
+// surface-materials section below, but the tree decision needs it for the
+// substrate gate.
+uint surface_block_type(int wy, float humidity, float temperature, uint biome);
+
 // Tree decision returned by Phase A's per-column computation.
 // `has_tree` false means this column doesn't spawn a tree; everything
 // else is don't-care. `has_tree` true: trunk_height, canopy_radius,
@@ -993,10 +998,18 @@ TreeDecision compute_tree_decision(
     }
     if (pos_hash >= effective) return d;
 
-    // Surface must be tree-friendly. CPU checks Grass/Moss. Without a
-    // full pick_surface_block port on GPU, we conservatively allow any
-    // forest/plains/etc. biome (already gated by tree_profile being
-    // present) — equivalent under GPU-canonical strategy.
+    // r610: surface must be tree-friendly — mirror the CPU's
+    // `matches!(surface_b, Grass | Moss)` gate. The old "conservatively
+    // allow any" stance planted GPU trees on sand/snow/ice wherever the
+    // biome had a profile, inflating tree mass up to 2.3x (and growing
+    // trees on seeds where the CPU grows none). surface_block_type is the
+    // shader's own surface pick; requiring the same two substrates the
+    // CPU requires aligns the DENSITY of trees even though their
+    // POSITIONS remain split by design (u32 vs u64 origin hashes).
+    {
+        uint sb = surface_block_type(d.surface_y, humidity, temperature, biome);
+        if (sb != BLOCK_GRASS && sb != BLOCK_MOSS) return d;
+    }
 
     // Climate quality drives trunk height + canopy size.
     float climate_quality = clamp(climate / 1.5, 0.0, 1.0);

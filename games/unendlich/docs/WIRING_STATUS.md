@@ -12142,3 +12142,20 @@ warts included); (b) JUDGE-THE-LEAK-A-BUG — gate best_fit to the world's names
 overworld), which is cleaner but CHANGES EXISTING CPU WORLDS (seabed gravel shells become dirt) and therefore needs a
 world-version gate + the operator's explicit sign-off. No code changed this round beyond the probe's gravel locator;
 r607's macro fix stands, the strata residual is now fully explained rather than mysterious.
+
+## r610 — TREE-PARITY VERDICT: positional split is by design; the MASS gap is the r609 leak again (now known to suppress CPU trees)
+Instrumented the parity probe with a (cpu→gpu) diff-pair histogram + a tree-MASS metric. VERDICTS: (1) POSITIONAL tree
+parity is out of scope BY EXISTING DESIGN — the shader's tree-origin hashes are documented u32 rewrites of the CPU's
+u64 hashes ("GPU-canonical strategy"), so backends spawn trees at different columns on purpose; the honest metric is
+mass. (2) The MASS gap (gpu/cpu ratio 1.14 at seed 424242, 2.28 at 90210, and cpu=0/gpu=697 at 31415926) is NOT the
+designed perforation/branch extras: it is the r609 REGISTRY LEAK from the other side — CPU pick_surface_block's
+climate best_fit hands whole climate bands ARENA surface blocks (tuff/slate/basalt), which fail the CPU's
+Grass/Moss tree-substrate check, so the CPU grows NO TREES there while the registry-less GPU plants normally. So the
+leak is not just cosmetic strata: OPERATOR SHOULD KNOW their existing CPU overworlds likely contain arena-material
+surface patches and correspondingly TREELESS BANDS wherever arena defs win the climate fit. (3) LANDED this round: the
+shader's tree decision now mirrors the CPU's substrate gate (surface_block_type must be GRASS/MOSS; forward-decl
+added) — correct and kept, but ineffective until the surface SOURCE matches; the registry-table upload (r609 fix path
+(a)) closes strata AND tree-mass in one stroke, and is now clearly the next implementation item. spv rebuilt; mass
+numbers re-verified unchanged post-gate (expected, per the analysis). GLSL gotcha recorded: use-before-declaration
+needs a prototype — the first "clean" spv rebuild had silently FAILED compile ("SPIR-V is not generated") while the
+stale artifact kept running; always grep validator output for ERROR, not just exit status.
