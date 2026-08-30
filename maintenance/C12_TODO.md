@@ -1837,9 +1837,28 @@ of those pin failures that would each be invisible in a happy-path test:
   have passed against the non-streaming server too, which is the trap
   here.
 
-  STILL TO DO: the client side (`DaemonBackend::generate` reads whole
-  bodies today and needs to decode chunks as they arrive), then
-  logscope-egui's `Daemon` backend variant. gpu-gemm 1255/1255.
+  CLIENT DONE (`6ceb59c4`). Not cosmetic: the server grew a streaming
+  endpoint while `DaemonBackend` still read whole bodies, so enabling
+  streaming would have delivered HEX LENGTH PREFIXES inside the
+  completion text — not a crash, a completion containing "1a" and stray
+  CRLFs, which gets blamed on the model rather than the transport.
+  Decided by the `Transfer-Encoding` header rather than by sniffing,
+  since a completion can legitimately start with a hex-looking line. A
+  truncated body is an ERROR, not a short answer.
+
+  The decoder is duplicated rather than imported, on purpose: the
+  default build does not link gpu-gemm at all (the point of the `gpu`
+  feature), and pulling a GPU engine into an editor to parse eight lines
+  of framing is the wrong trade. A test under `--features gpu` pins the
+  two equal across six inputs, so it cannot drift — duplication WITH a
+  proof of equivalence, which is a different thing from duplication.
+  19/19 without the feature, 20/20 with. gpu-gemm 1255/1255.
+
+  STILL TO DO: `Backend::generate` returns `String`, so tokens are
+  reassembled before the caller sees them — invisible for aperture's
+  short completions, not for logscope's chat. A streaming variant of the
+  trait is what C12-31a needs next, then logscope-egui's `Daemon`
+  backend variant.
 
 **Note on scope:** this is where the daemon's value is largest AND where
 its UX cost is most visible, which is why the streaming question has to
