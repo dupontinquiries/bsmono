@@ -4214,3 +4214,81 @@ lid-vs-open-geometry gap Hammerstad predicts, L3 EUV imaging with
 coherent contrast exactly zero below cutoff, and the mask thermal
 distortion closing the L3 × mechanics loop. The physics was fine; a
 relative path was not.
+
+## 78. snapclone settings: the combos were unchangeable, and why
+
+Operator: gossip LAN peer discovery and the crypto backend "are
+unchangeable in the settings menu".
+
+**Cause: an egui id collision.** `combo` used
+`ComboBox::from_label(label)`, which derives the widget id FROM THE
+LABEL — and this page had two controls both labelled `"backend"`
+(discovery at line 693, crypto at 744). They shared one id, so the popup
+state belonged to whichever drew last and a click on the first opened
+and immediately closed.
+
+Two fixes, because the two problems are different:
+  - `combo` now uses `from_id_salt(type_name::<T>())`. The salt is the
+    VALUE TYPE, not the label, so two controls over different enums can
+    never collide however they are labelled — a future rename cannot
+    reintroduce this.
+  - The labels are now "discovery" and "crypto". Even with the ids
+    fixed, two rows saying "backend" do not tell a person which backend.
+
+A test greps the file for duplicate `combo_indexed` labels. It FAILED
+when written, which is how I know it tests the real thing rather than
+the fixed thing.
+
+**On the backends themselves:**
+  - `CryptoBackend::Rust` ("AES-256-GCM + X25519, production") is real:
+    `rust/snapclone-crypto` depends on `aes-gcm` and `x25519-dalek`, and
+    the comment says the X25519 ECDH is used in a HYBRID with a
+    post-quantum secret. So enabling it is now a matter of selecting it,
+    which the collision prevented.
+  - `DiscoveryBackend::Jami` has NO Rust crate behind it —
+    `rust/` has presence, wire, mailbox, but nothing DHT. The C DHT the
+    operator mentions is the Qt side's.
+
+- **C78a — the DHT wiring is a real gap, not a locked control.**
+  Selecting "Jami DHT" now works and has nothing to reach. The honest
+  next step is a `snapclone-dht` crate behind the same seam
+  `snapclone-presence` uses for gossip — not another settings change.
+
+## 79. Spacebar in a text field started playback — a shared arbitration gap
+
+Operator: in studio, space pressed inside an input field pauses
+playback, and it is unclear whether that belongs in the kit or the app.
+
+**It belongs in the kit, and the app cannot see the answer.**
+`Studio::key` takes a toolkit-neutral `Key` — deliberately, so the
+keymap is testable without egui — and by the time a keystroke reaches
+it, the fact that a `TextEdit` had focus is gone. Fixing it inside the
+app would mean threading a "was something focused" flag through every
+call site, duplicating information egui already has.
+
+`uikit_egui::typing_guard` is one function asked at the egui boundary.
+
+The cause in studio was a comment describing the intent exactly, and the
+intent being wrong: *"Keys first, so a shortcut is never eaten by a
+widget holding focus."* True for most widgets, and precisely backwards
+for the one whose job IS to eat keys. "Never eaten" and "typing works"
+cannot both hold.
+
+Two details that decide whether the fix is any good:
+  - **Modified keys still fire while typing.** Ctrl-Space is not text —
+    no field inserts it — so blocking every key would break the
+    shortcuts specifically designed to work during editing. Studio's C-p
+    keeps working in a rename box.
+  - **Shift alone does NOT count as a modifier.** Shift-A is "A". Getting
+    that wrong would let Shift-Space toggle the transport mid-word: the
+    same bug with a rarer trigger and a much longer hunt.
+
+`Event::Text` is by definition unmodified text, which is what makes the
+studio fix a clean split: that stream goes entirely to the field when
+one is focused, and the modified-chord path underneath is untouched.
+
+- **C79a — the other apps are exposed and NOT fixed.** aperture binds a
+  whole modal keymap, voiceterm binds `f`, bo-suite pages on arrows. The
+  guard exists for them; none of them calls it yet.
+- **C79b — studio-app did not compile HERE**, but the failure is
+  `wayland-protocols`, a known sandbox gap. No errors in our code.

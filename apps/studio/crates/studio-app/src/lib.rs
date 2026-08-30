@@ -2070,11 +2070,30 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
-        // Keys first, so a shortcut is never eaten by a widget holding focus.
-        let typed: Vec<char> = ctx.input(|i| i.events.iter().flat_map(|e| match e {
-            egui::Event::Text(t) => t.chars().collect::<Vec<_>>(),
-            _ => Vec::new(),
-        }).collect());
+        // Keys first, so a shortcut is never eaten by a widget holding
+        // focus — EXCEPT a text field, which is the one widget whose
+        // whole job is to eat them.
+        //
+        // Reading `Event::Text` unconditionally is why space typed into a
+        // track name also started the transport: the field inserted the
+        // character AND this loop turned it into a shortcut. The old
+        // comment describes the intent exactly, and the intent is wrong
+        // for text — "never eaten" and "typing works" cannot both hold.
+        //
+        // `Event::Text` is BY DEFINITION unmodified text (a chord never
+        // arrives this way, which the C-p handler below already relies
+        // on), so when a field is taking input this stream belongs
+        // entirely to it. The modified-chord path underneath is
+        // unaffected and still fires while typing, which is what makes
+        // Ctrl-P keep working in a rename box.
+        let typed: Vec<char> = if uikit_egui::typing_guard::text_has_focus(ctx) {
+            Vec::new()
+        } else {
+            ctx.input(|i| i.events.iter().flat_map(|e| match e {
+                egui::Event::Text(t) => t.chars().collect::<Vec<_>>(),
+                _ => Vec::new(),
+            }).collect())
+        };
         // C-p, read from the key events rather than the text stream: a
         // modified chord never arrives as Event::Text. Consumed here so no
         // widget with focus can eat it.

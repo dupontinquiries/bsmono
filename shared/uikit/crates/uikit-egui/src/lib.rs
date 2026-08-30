@@ -93,6 +93,8 @@ pub mod split_pane;
 pub mod toggle_grid;
 pub mod theme_bridge;
 pub mod tokens;
+/// Who owns a keystroke: a focused text field, or an app shortcut.
+pub mod typing_guard;
 
 pub use a11y::{Action as A11yAction, A11yScene, Outcome as A11yOutcome, Role, Semantics};
 pub use adaptive::{Adaptive, DeviceClass, SafeArea};

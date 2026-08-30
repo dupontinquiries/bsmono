@@ -690,7 +690,7 @@ fn camera_ui(ui: &mut egui::Ui, c: &mut Camera,
 
 fn network_ui(ui: &mut egui::Ui, n: &mut Network, colors: &uikit_egui::PaletteColors, a11y: &mut uikit_egui::a11y::A11yScene) {
     heading(ui, "Peer discovery", colors);
-    combo_indexed(ui, "backend", &mut n.discovery_backend, DiscoveryBackend::ALL);
+    combo_indexed(ui, "discovery", &mut n.discovery_backend, DiscoveryBackend::ALL);
     uikit_egui::a11y::semantic_toggle(
         ui, a11y, egui::Id::new("snapclone.settings.jami_enabled").value(),
         "enable Jami backend", &mut n.jami_enabled);
@@ -741,7 +741,7 @@ fn network_ui(ui: &mut egui::Ui, n: &mut Network, colors: &uikit_egui::PaletteCo
     }
 
     heading(ui, "Crypto", colors);
-    combo_indexed(ui, "backend", &mut n.crypto_backend, CryptoBackend::ALL);
+    combo_indexed(ui, "crypto", &mut n.crypto_backend, CryptoBackend::ALL);
     uikit_egui::a11y::semantic_toggle(
         ui, a11y, egui::Id::new("snapclone.settings.require_encryption").value(),
         "require encryption", &mut n.require_encryption);
@@ -817,8 +817,25 @@ fn about_ui(ui: &mut egui::Ui, a: &mut About, colors: &uikit_egui::PaletteColors
 fn combo<T>(ui: &mut egui::Ui, label: &str, value: &mut T, all: &'static [T]) -> bool
 where T: Copy + PartialEq + Labelled {
     let before = *value;
-    egui::ComboBox::from_label(label).selected_text(value.text()).show_ui(ui, |ui| {
-        for v in all { ui.selectable_value(value, *v, v.text()); }
+    // `from_id_salt` + a manual label, NOT `from_label`.
+    //
+    // `ComboBox::from_label` derives its widget id FROM THE LABEL, so two
+    // combos with the same label share one id. This page has exactly
+    // that: discovery backend and crypto backend are both labelled
+    // "backend". They collided, and the symptom is that neither could be
+    // changed — the popup state belongs to whichever drew last, so a
+    // click on the first opens and immediately closes.
+    //
+    // The salt is the VALUE TYPE's name rather than the label, so two
+    // controls over different enums can never collide however they are
+    // labelled — a rename cannot reintroduce this.
+    ui.horizontal(|ui| {
+        ui.label(label);
+        egui::ComboBox::from_id_salt(std::any::type_name::<T>())
+            .selected_text(value.text())
+            .show_ui(ui, |ui| {
+                for v in all { ui.selectable_value(value, *v, v.text()); }
+            });
     });
     before != *value
 }
@@ -840,6 +857,29 @@ impl Labelled for CryptoBackend { fn text(&self) -> &'static str { self.label() 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_two_combos_on_a_page_share_a_label() {
+        // `ComboBox::from_label` derives its id from the label, and this
+        // page had TWO controls labelled "backend" — discovery and
+        // crypto. They shared an id, so neither could be changed: the
+        // popup belongs to whichever drew last.
+        //
+        // `combo` now salts by the value TYPE, which makes a label
+        // collision harmless. This test guards the label anyway, because
+        // a duplicate label is still a UI bug — two rows saying
+        // "backend" do not tell a person which backend.
+        let src = include_str!("settings_page.rs");
+        let mut labels: Vec<&str> = src
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("combo_indexed(ui, \""))
+            .filter_map(|r| r.split('"').next())
+            .collect();
+        let before = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), before, "two combos share a label: {labels:?}");
+    }
 
     #[test]
     fn the_tab_indices_match_the_qt_contract() {
