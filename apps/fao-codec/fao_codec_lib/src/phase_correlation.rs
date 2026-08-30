@@ -183,16 +183,35 @@ impl PhaseCorrelationPass {
         let mut peak_val = -f32::INFINITY;
         let mut peak_x = 0usize;
         let mut peak_y = 0usize;
-        let mut second_peak = -f32::INFINITY;
         for y in 0..ws {
             for x in 0..ws {
                 let v = cur_window[y * ws + x].re;
                 if v > peak_val {
-                    second_peak = peak_val;
                     peak_val = v;
                     peak_x = x;
                     peak_y = y;
-                } else if v > second_peak {
+                }
+            }
+        }
+        // Second peak EXCLUDING the main peak's own 5×5 neighborhood
+        // (with wraparound). A sharp correlation peak has tall immediate
+        // shoulders; counting a shoulder as the "second peak" collapsed
+        // confidence to ~0 precisely when the estimate was most reliable
+        // (static scenes: peak at (0,0), neighbor nearly as tall). The
+        // ratio is meant to measure AMBIGUITY between candidate shifts,
+        // so rival candidates must be outside the peak's own footprint.
+        let mut second_peak = -f32::INFINITY;
+        for y in 0..ws {
+            for x in 0..ws {
+                let ddx = (x as i32 - peak_x as i32).rem_euclid(ws as i32);
+                let ddy = (y as i32 - peak_y as i32).rem_euclid(ws as i32);
+                let ddx = ddx.min(ws as i32 - ddx);
+                let ddy = ddy.min(ws as i32 - ddy);
+                if ddx <= 2 && ddy <= 2 {
+                    continue;
+                }
+                let v = cur_window[y * ws + x].re;
+                if v > second_peak {
                     second_peak = v;
                 }
             }

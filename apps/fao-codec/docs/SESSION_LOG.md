@@ -2573,3 +2573,37 @@ low quality (dz32: 15.1 KB/f @ 37.6) the open-loop anchor penalty
 the transform gain — the classic MCTF-vs-closed-loop tradeoff. A
 hierarchical (bidirectional) group structure would recover most of the
 anchor penalty; noted, not built.
+
+### v11.6 — SR plate + phase-correlation confidence fix (same session)
+
+phase_correlation confidence was structurally broken for its best case:
+the second-peak scan never excluded the main peak's own shoulders, so a
+sharp single peak (static scene, peak at (0,0), neighbor nearly as
+tall) reported confidence ≈ 0 exactly when the estimate was most
+reliable. Now excludes a 5×5 wrapped neighborhood. shotB min pairwise
+confidence: 0.00 → 0.81. v8 gates on this too — its camera seeding was
+being spuriously distrusted on static content.
+
+v11.6 build_plate_sr: multi-frame super-resolution plate at S=2 —
+frame pixels splat as world point-samples at their sub-pixel phase,
+per-cell two-pass robust mean (±12 band), holes fall back to the S=1
+median plate; predict_frame_sr samples it back. Synthetic test with
+beyond-Nyquist stripes and 0.37/0.23 px-per-frame drift: SR predicts
+held-out views ≥1.3× better (falsifiable, passing). Real footage,
+prediction-only luma PSNR: shotA (handheld) +1.21 dB, shotB +0.41 dB —
+the "locked" shot has real sub-pixel gate weave the fixed confidence
+now trusts. Honest bound: shotA's base prediction is 14.8 dB — the
+translation-only camera model, not resolution, is the binding
+constraint on handheld/parallax content. The fence-slit lever is real
+but its payoff is gated behind pose.
+
+v8 pose reconnaissance for next session: headless-callable pieces
+survive — CameraPose, LkTracker::track, FeatureTrackPass (stable-ID
+tracks), TriangulatePass + run_triangulation + annotate_with_depth,
+MeshIntegrator (needs source YUV since the vertex-color fix),
+SceneMesh, and resolve_library_ref for cross-video sharing. 6 known
+failing tests in library/feature paths (documented in README) are the
+debt to clear before trusting it on real GOPs. The stairs-on-Anakin
+result came from this stack; pointing it at strong-geometry synthetic
+content (the SMITE arena) with the now-fixed confidence gate is the
+planned 3D step.

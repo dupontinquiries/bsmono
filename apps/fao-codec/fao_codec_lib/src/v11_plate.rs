@@ -1443,3 +1443,194 @@ pub fn encode_gop_t3d(
         prev_mode_share: if prev_share_n > 0 { (prev_share_acc / prev_share_n as f64) as f32 } else { 0.0 },
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// v11.6 — super-resolved plate ("fence-slit" accumulation).
+//
+// Sub-pixel camera motion makes every frame a point-sampling of the
+// world at a different phase. Accumulating those samples on a grid
+// FINER than the frame recovers detail no single frame contains —
+// multi-frame super-resolution, the formal version of seeing through a
+// picket fence by running past it. On upscaled/transcoded sources this
+// is "understanding what the content should be": the SR plate can
+// sharpen past the upscaler's blur because the blur kernel's phase
+// varies with the sub-pixel offset.
+//
+// Requirements this module is honest about: it only pays where the
+// motion field actually has sub-pixel DIVERSITY (a locked-off tripod
+// shot puts every sample at the same phase — S=1 and S=2 plates are
+// then identical by construction), and it needs the sub-pixel motion
+// estimates to be trustworthy (hence the phase-correlation confidence
+// fix that landed with it).
+//
+// Robustness: per-cell two-pass mean (mean, then re-mean over samples
+// within ±REJECT_BAND of it) instead of the exact median — the S=2
+// grid has 4× the cells and per-cell sample lists would not fit;
+// movers land far outside the band and are rejected the same way in
+// the common case. Cells no frame ever sampled fall back to bilinear
+// upsampling of the robust S=1 plate.
+// ═══════════════════════════════════════════════════════════════════
+
+const SR_REJECT_BAND: f32 = 12.0;
+
+/// Luma-only SR plate at integer scale `s` (chroma stays on the S=1
+/// plate — the detail this exists to recover is luma).
+pub struct SrPlate {
+    pub s: usize,
+    pub w: usize,
+    pub h: usize,
+    pub y: Vec<u8>,
+    pub base: Plate,
+}
+
+pub fn build_plate_sr(frames: &[Yuv420], motions: &[PlateMotion], s: usize) -> SrPlate {
+    let base = build_plate(frames, motions);
+    let (pw, ph) = (base.w * s, base.h * s);
+    let fw = frames[0].w;
+    let fh = frames[0].h;
+
+    let mut sum = vec![0.0f32; pw * ph];
+    let mut cnt = vec![0u16; pw * ph];
+    let splat = |sum: &mut [f32], cnt: &mut [u16], frames: &[Yuv420], pass2: Option<(&[f32], &[u16])>| {
+        for (f, m) in frames.iter().zip(motions) {
+            for fy in 0..fh {
+                for fx in 0..fw {
+                    // World (frame-0) coordinate of this sample, on the SR grid.
+                    let wx = (fx as f32 - m.dx - base.ox) * s as f32;
+                    let wy = (fy as f32 - m.dy - base.oy) * s as f32;
+                    let cx = wx.round() as i32;
+                    let cy = wy.round() as i32;
+                    if cx < 0 || cy < 0 || cx as usize >= pw || cy as usize >= ph {
+                        continue;
+                    }
+                    let ci = cy as usize * pw + cx as usize;
+                    let v = f.y[fy * fw + fx] as f32;
+                    if let Some((m1, c1)) = pass2 {
+                        if c1[ci] > 0 {
+                            let mean1 = m1[ci] / c1[ci] as f32;
+                            if (v - mean1).abs() > SR_REJECT_BAND {
+                                continue;
+                            }
+                        }
+                    }
+                    sum[ci] += v;
+                    cnt[ci] += 1;
+                }
+            }
+        }
+    };
+    splat(&mut sum, &mut cnt, frames, None);
+    let (sum1, cnt1) = (sum.clone(), cnt.clone());
+    for v in sum.iter_mut() {
+        *v = 0.0;
+    }
+    for v in cnt.iter_mut() {
+        *v = 0;
+    }
+    splat(&mut sum, &mut cnt, frames, Some((&sum1, &cnt1)));
+
+    let mut y = vec![0u8; pw * ph];
+    for py in 0..ph {
+        for px in 0..pw {
+            let ci = py * pw + px;
+            y[ci] = if cnt[ci] > 0 {
+                (sum[ci] / cnt[ci] as f32).round().clamp(0.0, 255.0) as u8
+            } else {
+                // Hole: no frame sampled this phase — fall back to the
+                // robust S=1 plate, bilinearly.
+                bilinear(&base.y, base.w, base.h, px as f32 / s as f32, py as f32 / s as f32)
+            };
+        }
+    }
+    SrPlate { s, w: pw, h: ph, y, base }
+}
+
+/// Predict a frame from the SR plate (luma) + base plate (chroma).
+pub fn predict_frame_sr(sp: &SrPlate, m: &PlateMotion, fw: usize, fh: usize) -> Yuv420 {
+    let mut out = predict_frame(&sp.base, m, fw, fh);
+    let s = sp.s as f32;
+    for fy in 0..fh {
+        for fx in 0..fw {
+            let px = (fx as f32 - m.dx - sp.base.ox) * s;
+            let py = (fy as f32 - m.dy - sp.base.oy) * s;
+            out.y[fy * fw + fx] = bilinear(&sp.y, sp.w, sp.h, px, py);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests_sr {
+    use super::*;
+
+    /// Frames are bilinear point-samplings of a hi-res world at varied
+    /// sub-pixel offsets. The S=2 plate must predict held-out views
+    /// clearly better than the S=1 plate — the fence-slit effect.
+    #[test]
+    fn sr_plate_beats_base_plate_given_subpixel_diversity() {
+        let s = 2usize;
+        let (fw, fh) = (64, 48);
+        let (ww, wh) = (fw * s + 16, fh * s + 16);
+        // Hi-res world with detail at the SR scale: diagonal stripes of
+        // wavelength ~3 SR px (≈1.5 frame px — beyond one frame's Nyquist).
+        let world: Vec<f32> = (0..ww * wh)
+            .map(|i| {
+                let (x, y) = (i % ww, i / ww);
+                128.0 + 60.0 * (((x + 2 * y) as f32) * (2.0 * std::f32::consts::PI / 6.0)).sin()
+            })
+            .collect();
+        let sample_world = |wx: f32, wy: f32| -> f32 {
+            let x0 = wx.floor().max(0.0) as usize;
+            let y0 = wy.floor().max(0.0) as usize;
+            let x1 = (x0 + 1).min(ww - 1);
+            let y1 = (y0 + 1).min(wh - 1);
+            let tx = wx - x0 as f32;
+            let ty = wy - y0 as f32;
+            let top = world[y0 * ww + x0] * (1.0 - tx) + world[y0 * ww + x1] * tx;
+            let bot = world[y1 * ww + x0] * (1.0 - tx) + world[y1 * ww + x1] * tx;
+            top * (1.0 - ty) + bot * ty
+        };
+        // 16 frames drifting by irrational-ish sub-pixel steps.
+        let mut frames = Vec::new();
+        let mut motions = Vec::new();
+        for t in 0..16 {
+            let dx = -(t as f32) * 0.37; // frame-space drift
+            let dy = -(t as f32) * 0.23;
+            let mut f = Yuv420::new(fw, fh);
+            for fy in 0..fh {
+                for fx in 0..fw {
+                    // frame pixel shows world coord (fx - dx) on the S grid
+                    let wx = (fx as f32 - dx) * s as f32 + 4.0;
+                    let wy = (fy as f32 - dy) * s as f32 + 4.0;
+                    f.y[fy * fw + fx] = sample_world(wx, wy).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+            for p in f.u.iter_mut() {
+                *p = 128;
+            }
+            for p in f.v.iter_mut() {
+                *p = 128;
+            }
+            frames.push(f);
+            motions.push(PlateMotion { dx, dy, confidence: 1.0 });
+        }
+        let sp = build_plate_sr(&frames, &motions, s);
+        let base_err = |pred: &Yuv420, f: &Yuv420| -> f64 {
+            let mut e = 0.0f64;
+            for i in 0..fw * fh {
+                e += (pred.y[i] as f64 - f.y[i] as f64).abs();
+            }
+            e / (fw * fh) as f64
+        };
+        let mut e_base = 0.0;
+        let mut e_sr = 0.0;
+        for (f, m) in frames.iter().zip(&motions) {
+            e_base += base_err(&predict_frame(&sp.base, m, fw, fh), f);
+            e_sr += base_err(&predict_frame_sr(&sp, m, fw, fh), f);
+        }
+        assert!(
+            e_sr * 1.3 < e_base,
+            "SR plate should predict sub-pixel-diverse views ≥1.3x better: base {e_base:.2} sr {e_sr:.2}"
+        );
+    }
+}

@@ -136,7 +136,45 @@ fn main() {
     );
 
     let t2 = std::time::Instant::now();
-    if args.iter().any(|a| a == "--t3d") {
+    if args.iter().any(|a| a == "--sr") {
+        // Fence-slit experiment: prediction quality of the S=2
+        // super-resolved plate vs the S=1 plate, then residual bytes
+        // against the SR prediction. Luma PSNR computed directly.
+        let sp = plate::build_plate_sr(&frames, &motions, 2);
+        let psnr = |pred: &plate::Yuv420, f: &plate::Yuv420| -> f64 {
+            let mut mse = 0.0f64;
+            for i in 0..pred.y.len() {
+                let d = pred.y[i] as f64 - f.y[i] as f64;
+                mse += d * d;
+            }
+            mse /= pred.y.len() as f64;
+            10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10()
+        };
+        let (mut p_base, mut p_sr) = (0.0f64, 0.0f64);
+        for (f, m) in frames.iter().zip(&motions) {
+            p_base += psnr(&plate::predict_frame(&sp.base, m, f.w, f.h), f);
+            p_sr += psnr(&plate::predict_frame_sr(&sp, m, f.w, f.h), f);
+        }
+        let n = frames.len() as f64;
+        println!("prediction_luma_psnr base {:.2} sr {:.2}  (delta {:+.2} dB)", p_base / n, p_sr / n, (p_sr - p_base) / n);
+        let mut recs = Vec::with_capacity(frames.len());
+        let mut res_total = 0usize;
+        for (f, m) in frames.iter().zip(&motions) {
+            let pred = plate::predict_frame_sr(&sp, m, f.w, f.h);
+            let p444 = plate::interleave_444(&pred);
+            let t444 = plate::interleave_444(f);
+            match fao_codec::residual::encode(&p444, &t444, f.w, f.h, &opts) {
+                Some(tr) => {
+                    res_total += tr.len();
+                    let r = fao_codec::residual::apply(p444, &tr, f.w, f.h);
+                    recs.push(plate::deinterleave_420(&r, f.w, f.h));
+                }
+                None => recs.push(pred),
+            }
+        }
+        println!("residual_total {}  marginal_per_frame {}", res_total, res_total / frames.len());
+        write_y4m(&args[1], &header, &recs);
+    } else if args.iter().any(|a| a == "--t3d") {
         let dz: f32 = arg_val(&args, "--dz").and_then(|v| v.parse().ok()).unwrap_or(0.0);
         let rep = plate::encode_gop_t3d(&frames, &motions, &pl, dz, opts.skip_threshold);
         let n = frames.len();
