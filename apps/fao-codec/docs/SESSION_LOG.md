@@ -3389,3 +3389,11 @@ Full-suite ladder update:
 The rate gap is 38.3× at +0.36 dB over the AV1 anchor. The rest of
 the entropy estimate (adaptive rANS with per-band context models —
 the real 1.5–2×) remains the largest single uncollected item.
+
+CORRECTION: the band-major suite aggregate measured 36.35 MB (36.8×),
+not the 37.90 estimated in the entry above (written in the same
+command block before the aggregate printed — same mistake as the
+fused-canonical arithmetic, same fix: numbers go in the log AFTER
+they print). Ladder end state: 36.35 MB @ 33.69 dB / 0.934 = 36.8×
+the AV1 anchor at +0.36 dB, from 46.5× at −2.00 dB at ladder start —
+−21% bytes and +2.36 dB across the session's constructions.
