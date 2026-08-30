@@ -3040,3 +3040,44 @@ no block-map or motion-vector interop between coders exists because
 the streams never interleave. Per-block hybrid is phase 2, only if a
 measurement shows per-shot routing leaving significant money on the
 table.
+
+### Residual ledger: naming the unsolved factors (same session)
+
+User's objection accepted and adopted: "hard motion" is a mislabel for
+UNSOLVED motion. Game footage is emitted by a finite state machine —
+no hard motion exists in it by construction — and real-world motion
+obeys gravity, air, and light transport: indirect filters a generative
+model knows to want and a pixel model pays for as residual forever.
+
+residual_ledger (v11_plate.rs, plate_lab --ledger) runs v3's exact
+prediction loop and attributes every region-frame: SKIP (<8 SAD/px),
+TRACKED-CHANGED (8–24: aligned but changed — blur/lighting/grain),
+UNSOLVED (≥24: movers/parallax/reveals — nothing in the model
+explains it). Byte attribution by energy share (approximate, stated).
+
+Measured, worst shot (74 KB/f @ 27 dB):
+  regions:  skip 84.6% | tracked-changed 13.2% | unsolved 2.2%
+  energy:   skip 54.9% | tracked-changed 27.8% | unsolved 17.3%
+  unsolved cells sweep 92.3% of the frame over the GOP (the actor).
+Control (locked store): 89.8% of energy in skip class. Game: 81.7%.
+
+THE FINDING: unsolved motion is NOT the cost center — 17% of energy.
+The majority is a DIFFUSE FLOOR paid everywhere on aligned content:
+exactly the user's invisible filters. Follow-up null: v4 grain-split
+on the worst shot saves nothing (8.68 vs 8.72 MB) — at dz32 the
+dead-zone already ate synthesizable grain, so the surviving floor is
+STRUCTURED: sub-pixel misalignment ghosting (integer-pel MC on
+drifting footage ≈ ½px edge error, everywhere, every frame), motion
+blur (deterministic given velocity; we pay per frame), and lighting
+flutter (global, indirect). An engine pays none of these.
+
+Constructions ranked by measured bytes:
+  1. Sub-pixel MC + sub-pel plate warp (attacks the 55% floor)
+  2. Mover layers — object plates for the 2.2%-of-regions actor that
+     sweeps the frame (attacks the 17% + kills its footprint growth)
+  3. Velocity-conditioned blur rendering ("air")
+  4. Global exposure/gain term ("light sources")
+SMITE endgame restated: the library's canonicals converge on the game
+tree's emission alphabet; with engine-derived canonicals (unendlich
+renders) the codec ships state-like parameters. No hard motion —
+only factors not yet moved from residual to model.

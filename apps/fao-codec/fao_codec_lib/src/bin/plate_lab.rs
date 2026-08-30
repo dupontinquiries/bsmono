@@ -195,6 +195,10 @@ fn main() {
         );
         return;
     }
+    if args.iter().any(|a| a == "--ledger") {
+        println!("{}", fao_codec::v11_plate::residual_ledger(&frames));
+        return;
+    }
     if args.iter().any(|a| a == "--triangulate") {
         // First whole-scene geometry attempt with the unblocked inputs:
         // track (spatially reseeded, pyramid, blur-tolerant) → classify

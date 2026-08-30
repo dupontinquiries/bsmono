@@ -728,6 +728,77 @@ fn copy_region_mc(dst: &mut Yuv420, prev: &Yuv420, rx: usize, ry: usize, mv: (i8
     }
 }
 
+/// # Residual ledger: where do the bytes actually go?
+///
+/// "Hard motion" is a mislabel — it names UNSOLVED motion. Game footage
+/// is emitted by a finite state machine (there is no hard motion in it,
+/// by construction), and real-world footage obeys gravity, air, and
+/// light transport — indirect filters a generative model knows to want
+/// and a pixel model pays for as residual every frame. This probe runs
+/// v3's exact prediction loop and attributes each region-frame to:
+///
+///   SKIP            final SAD < 8/px   — the model already owns it
+///   TRACKED-CHANGED 8..24/px           — alignment succeeded, pixels
+///                    changed anyway: motion blur, lighting, grain.
+///                    The "air and light" bucket: deterministic given
+///                    state (velocity, exposure) but invisible to
+///                    appearance modeling.
+///   UNSOLVED        ≥ 24/px            — no predictor in the model
+///                    explains the region: movers, parallax,
+///                    occlusion reveals. The "missing dynamics" bucket.
+///
+/// Byte attribution is by final-SAD energy share of the GOP residual —
+/// approximate (bytes aren't exactly ∝ SAD at a fixed dead-zone) but
+/// honest about ranking which missing factor costs most.
+pub fn residual_ledger(frames: &[Yuv420]) -> String {
+    let (fw, fh) = (frames[0].w, frames[0].h);
+    let motions = estimate_motions(frames);
+    let plate = build_plate(frames, &motions);
+    let (gw, gh) = (fw / REGION, fh / REGION);
+    let mut cls_count = [0u64; 3];
+    let mut cls_energy = [0f64; 3];
+    let mut unsolved_cells: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (fi, (f, m)) in frames.iter().zip(&motions).enumerate() {
+        if fi == 0 {
+            continue;
+        }
+        let plate_pred = predict_frame(&plate, m, fw, fh);
+        let prev = &frames[fi - 1]; // open-loop ledger: attribution, not coding
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let (rx, ry) = (gx * REGION, gy * REGION);
+                let sad_plate =
+                    sad_region(&plate_pred.y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry);
+                let (_mv, sad_prev) = search_mv(&prev.y, fw, fh, &f.y, rx, ry);
+                let fin = sad_plate.min(sad_prev) as f64;
+                let per_px = fin / (REGION * REGION) as f64;
+                let c = if per_px < 8.0 {
+                    0
+                } else if per_px < 24.0 {
+                    1
+                } else {
+                    unsolved_cells.insert(gy * gw + gx);
+                    2
+                };
+                cls_count[c] += 1;
+                cls_energy[c] += fin;
+            }
+        }
+    }
+    let tot_c: u64 = cls_count.iter().sum();
+    let tot_e: f64 = cls_energy.iter().sum::<f64>().max(1.0);
+    format!(
+        "regions: skip {:.1}% tracked-changed {:.1}% unsolved {:.1}% | residual-energy share: skip {:.1}% tracked-changed {:.1}% unsolved {:.1}% | unsolved-cell footprint {:.1}% of frame",
+        100.0 * cls_count[0] as f64 / tot_c as f64,
+        100.0 * cls_count[1] as f64 / tot_c as f64,
+        100.0 * cls_count[2] as f64 / tot_c as f64,
+        100.0 * cls_energy[0] / tot_e,
+        100.0 * cls_energy[1] / tot_e,
+        100.0 * cls_energy[2] / tot_e,
+        100.0 * unsolved_cells.len() as f64 / (gw * gh) as f64,
+    )
+}
+
 pub fn encode_gop_v3(
     frames: &[Yuv420],
     motions: &[PlateMotion],
