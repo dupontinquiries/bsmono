@@ -12,6 +12,7 @@
 //! collaborative editor whose collaboration is invisible is just an editor with
 //! a surprising undo history.
 
+pub mod beatgrid;
 pub mod touch;
 pub mod keys;
 pub mod playkeys;
@@ -342,6 +343,15 @@ pub fn timeline(
     mode: keys::Mode,
     input_mode: playkeys::InputMode,
     pending: &str,
+    // The active song's tempo map, when the timeline is showing a song
+    // that has one. `Some` switches the ruler from clock time to the
+    // musical grid — bars and beats WHERE THE MAP PUTS THEM, spacing
+    // stretching through every tempo change (`beatgrid`'s tests pin the
+    // arithmetic). `None` keeps the seconds ruler: the whole-project view
+    // has no single musical truth until the project/rack tempo
+    // relationship is decided (C12-14e territory), and a wrong grid is
+    // worse than a clock.
+    tempo: Option<&studio_core::TempoMap>,
 ) -> TimelineResponse {
     // Closed compositions: which clips are folded away, and each fold's
     // hull. Computed FIRST so drawing (skip members, draw the block) and
@@ -373,23 +383,47 @@ pub fn timeline(
     painter.rect_filled(rect, 0.0, colors.bg_base);
 
     // ── ruler ──────────────────────────────────────────────────────────────
-    // Tick spacing is chosen so labels never collide: step up through a 1/2/5
-    // sequence until one second's worth of pixels clears the label width.
-    let mut step_s = 1.0f32;
-    while step_s * view.px_per_sec < 64.0 {
-        step_s *= if (step_s.log10().fract() - 0.0).abs() < 0.01 { 2.0 } else { 2.5 };
-    }
-    let first = (view.scroll.to_seconds() / step_s as f64).floor() as i64;
-    for i in 0..256 {
-        let s = (first + i) as f32 * step_s;
-        let x = view.time_to_x(Ticks::from_seconds(s as f64), origin.x);
-        if x > rect.max.x { break; }
-        if x < origin.x + view.gutter { continue; }
-        painter.line_segment([Pos2::new(x, origin.y + RULER_H - 6.0), Pos2::new(x, origin.y + RULER_H)],
-                             Stroke::new(1.0_f32, colors.border));
-        painter.text(Pos2::new(x + 3.0, origin.y + 3.0), Align2::LEFT_TOP,
-                     format_timecode(Ticks::from_seconds(s as f64)),
-                     FontId::monospace(10.0), colors.text_weak);
+    if let Some(map) = tempo {
+        // Musical ruler: bars labelled, beats as texture, positions from
+        // the map. The visible span in ticks, from the same camera the
+        // clips draw with, so grid and clips can never disagree.
+        let from = view.scroll.max(Ticks::ZERO);
+        let to = view.x_to_time(rect.max.x, origin.x);
+        for t in beatgrid::beat_grid(map, from, to, view.px_per_sec, 4, 12.0) {
+            let x = view.time_to_x(t.at, origin.x);
+            if x < origin.x + view.gutter || x > rect.max.x { continue; }
+            let (h, stroke_w) = match t.weight {
+                beatgrid::Weight::Bar => (10.0, 1.2_f32),
+                beatgrid::Weight::Beat => (5.0, 1.0_f32),
+            };
+            painter.line_segment(
+                [Pos2::new(x, origin.y + RULER_H - h), Pos2::new(x, origin.y + RULER_H)],
+                Stroke::new(stroke_w, colors.border));
+            if let Some(bar) = t.bar {
+                painter.text(Pos2::new(x + 3.0, origin.y + 3.0), Align2::LEFT_TOP,
+                             format!("{bar}"), FontId::monospace(10.0), colors.text_weak);
+            }
+        }
+    } else {
+        // Clock ruler. Tick spacing is chosen so labels never collide: step
+        // up through a 1/2/5 sequence until one second's worth of pixels
+        // clears the label width.
+        let mut step_s = 1.0f32;
+        while step_s * view.px_per_sec < 64.0 {
+            step_s *= if (step_s.log10().fract() - 0.0).abs() < 0.01 { 2.0 } else { 2.5 };
+        }
+        let first = (view.scroll.to_seconds() / step_s as f64).floor() as i64;
+        for i in 0..256 {
+            let s = (first + i) as f32 * step_s;
+            let x = view.time_to_x(Ticks::from_seconds(s as f64), origin.x);
+            if x > rect.max.x { break; }
+            if x < origin.x + view.gutter { continue; }
+            painter.line_segment([Pos2::new(x, origin.y + RULER_H - 6.0), Pos2::new(x, origin.y + RULER_H)],
+                                 Stroke::new(1.0_f32, colors.border));
+            painter.text(Pos2::new(x + 3.0, origin.y + 3.0), Align2::LEFT_TOP,
+                         format_timecode(Ticks::from_seconds(s as f64)),
+                         FontId::monospace(10.0), colors.text_weak);
+        }
     }
 
     // ── tracks + clips ─────────────────────────────────────────────────────

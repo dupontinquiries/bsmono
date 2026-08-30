@@ -472,11 +472,19 @@ What's still needed, roughly in dependency order:
   song's video") that doesn't depend on decode actually working yet.
 - **C12-14f — the four pieces still genuinely untouched, named
   explicitly so "the tempo work" doesn't read as more done than it is:**
-  - **Grid rendering.** Non-uniform tick markers on screen, following
-    `TempoMap`'s detents instead of a fixed spacing — "something unique
-    in the code," per the original framing, and a separate
-    rendering-layer task now that the model underneath it is trustworthy
-    (tested), not before.
+  - **Grid rendering — closed (see `studio-egui::beatgrid`).** The
+    ruler follows the map: `beat_grid()` is the pure layer (positions
+    from `beat_to_tick`, so non-uniform spacing falls out of the map
+    rather than being an effect; density ladder beats→bars→strided bars
+    keyed off the FASTEST visible section; 512-tick hostile-input cap;
+    4 tests incl. spacing across a 120→150 change and stride anchoring
+    at bar 1). `timeline()` takes `Option<&TempoMap>`: `Some` draws the
+    musical ruler (bars labelled 1-based, beats as texture), `None`
+    keeps the clock — and the shell passes the ACTIVE SONG's map only,
+    because the whole-project view has no single musical truth until
+    the project/rack tempo relationship is decided (C12-14e). TempoMap's
+    own docs already name the cursor-variant optimization if per-frame
+    beat_to_tick ever shows up; capped tick counts keep it moot today.
   - **Clip-stretching/alignment DSP.** Explicitly still hard, explicitly
     NOT "stretch every clip to the workspace tempo" — that's the
     antipattern `TempoMap` was designed around, not toward.
@@ -531,12 +539,18 @@ Three things this queue's studio sections implied but never listed:
   untouched — that tree's divergence is SNAPCLONE_TWO_TREES.md's thread,
   not this one. studio-egui gained `touch::PanelNav` (detent→neighbour
   panel, clamped never wrapped, tested) as the DECISION layer only.
-  STILL OPEN: shell wiring — the shell owns the scrollbars, so it must
-  decide per-panel when the inner view is at its limit before feeding
-  deltas; wiring it blind risks panels jumping during normal scrolling,
-  worse than absent. Needs a session that can run the app, or at least
-  per-panel scroll-ownership reasoning (timeline pans both axes; mixer
-  and rack scroll vertically).
+  STILL OPEN: shell wiring — and the per-panel scroll-ownership survey
+  is now DONE, so the next session starts from facts: rack_panel and
+  program_panel are `ScrollArea::both()`, mixer_panel is horizontal (the
+  routing map) + vertical (faders), timeline pans both axes itself. No
+  panel leaves an axis free, so the wiring needs each panel's show() to
+  return its ScrollArea at-limit state (offset vs content size) for the
+  shell to gate `PanelNav::on_overscroll` / `still_scrolling` on — three
+  signature changes — plus confirmation of whether egui 0.34 leaves
+  at-limit scroll deltas readable in ctx.input after a ScrollArea eats
+  what it can, which needs a running display to verify. Wiring it blind
+  was considered twice and rejected twice; panels jumping during normal
+  scrolling is worse than the picker-only floor that already works.
 - **Perf (`42c2cb2d`):** library sidebar's per-frame DirListing clones
   removed (ensure+borrow, arrange over refs); presence_beat compares
   before building. Both were every-frame paths; neither was measured

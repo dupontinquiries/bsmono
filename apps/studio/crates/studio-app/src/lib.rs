@@ -2880,12 +2880,19 @@ impl eframe::App for App {
                         Some(id) => song_views.entry(id).or_default(),
                         None => view,
                     };
+                    // The musical ruler follows the SONG being shown; the
+                    // whole-project view keeps the clock (see timeline()'s
+                    // param docs for why that stays undecided).
+                    let song_tempo = active_song
+                        .and_then(|id| session.doc.project.groups.get(&id))
+                        .and_then(|g| g.tempo.as_ref());
                     let tr = studio_egui::timeline(ui, &session.doc,
                                                    view,
                                                    &colors, ph, &sel, &self.peaks,
                                                    *trim_side,
                                                    closed_groups,
-                                                   mode, input_mode, &pending);
+                                                   mode, input_mode, &pending,
+                                                   song_tempo);
                     if let Some(t) = tr.sought {
                         // Scrub. The transport owns position, so this is a
                         // seek and not a model edit — moving the playhead
