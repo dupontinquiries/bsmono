@@ -3569,3 +3569,41 @@ say these were designed together as a set.
     the one it can read back.
 
   `encode` and `similarity` are still unexamined.
+
+## 67. similarity had no caller and the dupes page could only find exact matches
+
+Last two of gitmind's twelve. `similarity` computes near-duplicate
+overlap from chunk manifests — "track these files with 99% matching",
+for a JPEG re-saved by an editor or a losslessly retranscoded photo —
+and nothing called it.
+
+The gap is visible in the UI: gitmind-egui HAS a dupes page, and its
+scan calls `flow::duplicates_all`, which groups by an identity KEY. That
+finds files that are the same file. The near-duplicate case the
+`similarity` header describes had no path to the screen at all.
+
+**Added `flow::near_duplicates(store, threshold, max_blobs)`**, in the
+layer the page already calls rather than in the page, so the CLI can use
+it too.
+
+Three decisions:
+  - O(n²) over blob pairs, deliberately. The alternative is an index
+    over chunk membership, which is right at a scale this store has not
+    reached — building it first would optimise a feature nobody has used
+    yet.
+  - `max_blobs` TRUNCATES rather than refusing. A partial answer over
+    the first N is useful; a scan that declines on a large store stops
+    working exactly when it starts mattering.
+  - Sorted most-similar-first. The pairs a person acts on go to the top,
+    and store order buries them.
+
+Also caught mid-edit: I wrote `store::Store` from memory and the type is
+`ChunkStore` — confirmed against the CLI's own import rather than
+guessed twice.
+
+- **C12-67a — the dupes page does not call it yet.** The scan button
+  still runs `duplicates_all` only. Wiring it means a threshold control
+  and deciding whether near-duplicates are a second list or a merged one
+  — a UI question, and the page already has an exact-match layout that
+  assumes groups rather than pairs.
+- **C12-67b — `encode` is the last unexamined module** of the twelve.

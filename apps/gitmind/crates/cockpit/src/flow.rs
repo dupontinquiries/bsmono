@@ -429,6 +429,54 @@ pub fn discover_scoped(roots: &[String]) -> Vec<Repo> {
 }
 
 /// Duplicate projects across the configured scan roots ($HOME + any added drives).
+/// Near-duplicate blobs, by shared chunks rather than by identity.
+///
+/// `duplicates_all` groups by an identity KEY, so it finds files that are
+/// the same file. This finds files that are ALMOST the same one — a JPEG
+/// re-saved by an editor, a losslessly retranscoded photo — which share
+/// most of their content-defined chunks without matching byte for byte.
+///
+/// `gitmind_core::similarity` has done this arithmetic since it was
+/// written and nothing called it, so the dupes page could only ever
+/// offer exact matches. The 99%-matching feature its own header
+/// describes was unreachable.
+///
+/// O(n²) over blob pairs, deliberately. The alternative is an index over
+/// chunk membership, which is the right answer at a scale this store has
+/// not reached — and building it first would be optimising a feature
+/// nobody has used yet. The cap makes the cost bounded and visible
+/// rather than surprising.
+pub fn near_duplicates(
+    store: &gitmind_core::store::ChunkStore,
+    threshold: f64,
+    max_blobs: usize,
+) -> Result<Vec<(String, String, f64)>, String> {
+    let blobs = store.list_blobs()?;
+    // Truncated rather than refused: a partial answer over the first N
+    // blobs is useful, and a scan that declines on a large store is a
+    // feature that stops working exactly when it starts mattering.
+    let blobs: Vec<_> = blobs.into_iter().take(max_blobs).collect();
+    let mut out = Vec::new();
+    for (i, (oid_a, ma)) in blobs.iter().enumerate() {
+        for (oid_b, mb) in blobs.iter().skip(i + 1) {
+            // Skip identical blobs: the same oid twice is not a near
+            // duplicate, it is the same object, and `duplicates_all`
+            // already reports that case.
+            if oid_a == oid_b {
+                continue;
+            }
+            let s = gitmind_core::similarity::manifest_similarity(ma, mb);
+            if s >= threshold {
+                out.push((format!("{oid_a:?}"), format!("{oid_b:?}"), s));
+            }
+        }
+    }
+    // Most similar first: the pairs a person acts on are at the top, and
+    // a list ordered by store position buries them.
+    out.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(out)
+}
+
 pub fn duplicates_all() -> Vec<crate::identity::DupGroup> {
     let roots = crate::places::scan_roots();
     let entries = discover_scoped(&roots).into_iter().map(|r| (r.path, r.key, r.name)).collect();
