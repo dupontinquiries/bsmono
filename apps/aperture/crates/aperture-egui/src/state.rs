@@ -840,11 +840,41 @@ impl AppState {
                 self.engine_status = EngineStatus::Failed("no model selected".into());
                 return;
             }
-            match aperture_engine::LocalEngine::load(self.engine_cfg.clone()) {
-                Ok(e) => {
-                    let d = e.describe();
+            // DAEMON FIRST, then our own copy. A shared daemon holds one
+            // set of weights for every app on the machine — 7.2 GiB and
+            // ~86 seconds, paid once instead of per app. Loading our own
+            // when one is already running is the situation the daemon
+            // exists to avoid.
+            //
+            // The fallback is not an error path: an editor whose
+            // completions stop because a background service is not
+            // running would be worse than no daemon at all, since the
+            // failure is invisible and looks like the editor's fault. So
+            // `resolve` takes the first that CONSTRUCTS and carries on.
+            use aperture_engine::{daemon, Reach};
+            let cfg = self.engine_cfg.clone();
+            let outcome = aperture_engine::resolve(
+                &[Reach::Daemon, Reach::InProcess],
+                || {
+                    daemon::DaemonBackend::probe(daemon::socket_path())
+                        .map(|b| std::sync::Arc::new(b) as std::sync::Arc<dyn aperture_engine::Backend>)
+                },
+                || {
+                    aperture_engine::LocalEngine::load(cfg.clone())
+                        .map(|e| e.handle())
+                },
+            );
+            match outcome {
+                Ok((e, reach)) => {
+                    // Say WHICH, because "why is this fast today" and
+                    // "why did my model selection do nothing" have the
+                    // same answer and it is this.
+                    let via = match reach {
+                        Reach::Daemon => " via daemon",
+                        Reach::InProcess => "",
+                    };
+                    self.engine_status = EngineStatus::Ready(format!("{}{via}", e.describe()));
                     self.engine_backend = Some(e.handle());
-                    self.engine_status = EngineStatus::Ready(d);
                 }
                 Err(e) => {
                     self.engine_backend = None;
@@ -1849,7 +1879,11 @@ impl AppState {
                 // `f` is the route palette, not find-char: this editor's
                 // useful "go somewhere" verb already exists and giving the
                 // best key the weaker meaning would be the worse trade.
-                self.open_palette(crate::palette_ui::Mode::GoToRoute);
+                // The same method Ctrl+G uses. `f` is bound to routing
+                // rather than find-char on purpose (see helix::resolve),
+                // and it must reach the identical entry point or the two
+                // keys would drift into two behaviours.
+                self.open_go_to_route();
             }
             Act::CycleCompletionSpeed => {
                 let next = helix::next_debounce(self.debounce.idle_ms);
