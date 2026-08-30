@@ -305,6 +305,14 @@ impl App {
         matches!(self.menu.world_ready(), AppEvent::BeginPlay)
     }
 
+    /// r603: a launch that bypassed the title menu (LAN join adopting the
+    /// host's world). Moves MainMenu → Loading so the follow-up
+    /// `enter_game()` completes Loading → InGame exactly like the create
+    /// path. Idempotent elsewhere.
+    pub fn begin_external_launch(&mut self) {
+        let _ = self.menu.begin_external_load();
+    }
+
     /// Tick the gameplay services that the CURRENT PHASE whitelists. In `Menu` and
     /// `Paused` the gameplay layer is blacklisted — services are frozen and this
     /// returns an empty frame (this is the "the menu blacklists gameplay" idea,

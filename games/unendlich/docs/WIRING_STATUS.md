@@ -12008,3 +12008,24 @@ OPEN: joiner→host entity states do NOT arrive (host log shows no first-entity 
 per-entity (multi-sender safe), receive() is stateless (no session key), the host table stays alive (keepalive), the
 joiner's send path is correctly gated and addressed. Remaining suspects: silent send_to failure (errors are swallowed
 joiner-side), or host-side drain order. Next: temp send-error logs + a host-side raw CH_ENTITY per-sender counter.
+
+## r603 — THE JOINER NEVER LEFT MainMenu: the FSM edge the join path was missing, found by the dual-motion soak
+Symptom chain from the capstone soak (joiner walking, host walking): host→joiner entity states flowed; joiner→host
+NEVER arrived. Eliminated in order: seal/receive (pure codec + per-entity newest-wins gate — multi-sender safe),
+SnapshotGate keying (per entity id), lan_peer_addr lifecycle (never cleared), one OOM-killed-host false alarm (a
+"Killed" tail line invalidated a whole take — check process lifetimes before code), and finally the state heartbeat
+told the truth: 48/48 frames `state=MainMenu` on a joiner whose world was fully loaded and running. ROOT CAUSE: the
+LAN-join synthetic launch (fg_pending_load → AppStep::Launch) rebuilt the world and called enter_game(), but
+enter_game() (WorldReady) only transitions from Loading — and nothing had ever moved the FSM out of MainMenu, so it
+no-opped forever. Fallout beyond entity sends: walk-mode inert (InGame gate), the Loading keepalive re-joining every
+2 s for the entire session, and the title overlay logic still considering the menu open over a joined world.
+FIX, three layers deep with the architecture (not a bin hack): GameFlow::begin_external_load (MainMenu → Loading,
+same edge as StartNewGame, idempotent elsewhere — a duplicate Accept must not bounce the FSM; unit-tested),
+MenuController + App wrappers, and the bin's synthetic-launch branch drives it before the launch step. Supporting
+work this round: UNENDLICH_AUTOPLAY=walk (joiner mode: walk once InGame, no create), one-shot SENT/first-received
+entity logs both sides (permanent — device tests grep for these), Loading-phase JOIN keepalive (lan_keepalive_ms:
+without it a slow-loading joiner is pruned at PEER_TIMEOUT and its post-load states arrive from an unknown address).
+CAPSTONE VERIFIED (take 4): host logs "first entity state from peer 4294967296"; joiner heartbeats 5×MainMenu →
+32×InGame; keepalive rejoins 2 total, quiescing 3 s before InGame; zero panics both sides. BIDIRECTIONAL entity
+replication + join-sync + clock adoption all live in one soak. Cosmetic residue: the joiner re-logs "first entity"
+after prune gaps between seconds-long lavapipe frames — a software-rasterizer artifact, not a device behavior.

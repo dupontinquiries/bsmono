@@ -222,6 +222,12 @@ impl MenuController {
     pub fn world_ready(&mut self) -> AppEvent {
         self.flow.apply(AppCmd::WorldReady)
     }
+    /// r603: a launch that bypassed the title menu (LAN join adopting the
+    /// host's world) — MainMenu → Loading, so the follow-up `world_ready`
+    /// completes Loading → InGame like the create path. Idempotent elsewhere.
+    pub fn begin_external_load(&mut self) -> AppEvent {
+        self.flow.begin_external_load()
+    }
     /// Leave the world, back to the title menu.
     pub fn quit_to_menu(&mut self) -> AppEvent {
         self.wizard = None;

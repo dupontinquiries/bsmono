@@ -13938,7 +13938,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // proved the launch flow live (one rebuild call per create) and
             // shows at a glance whether a soak is in-world or stuck.
             let ap_now_ms = start.elapsed().as_millis() as u64;
-            if fg_autoplay && ap_now_ms > 2500 && ap_now_ms.saturating_sub(fg_autoplay_dbg_ms) >= 1000 {
+            if fg_autoplay_walk && ap_now_ms > 2500 && ap_now_ms.saturating_sub(fg_autoplay_dbg_ms) >= 1000 {
                 fg_autoplay_dbg_ms = ap_now_ms;
                 log::info!(
                     "[autoplay-dbg] screen={:?} state={:?} spree={} wizard_open={} at_confirm={} menu_open={}",
@@ -14126,6 +14126,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     multiplayer: false,
                 };
                 step = AppStep::Launch(LaunchPlan::StartLocal(init));
+                // r603 (the dual-motion soak's find): this synthetic launch
+                // used to leave the app FSM in MainMenu forever — enter_game()
+                // below no-ops outside Loading, so the joiner never reached
+                // InGame: no outbound entity states, walk-mode inert, the
+                // Loading keepalive re-joining every 2 s for the whole
+                // session, and the title overlay drawn over the joined world.
+                // Drive the same MainMenu → Loading edge the menu path takes.
+                fg_app.begin_external_launch();
             }
 
             if in_dbg != "None" {
@@ -14567,6 +14575,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                         None => {}
                                     },
                                     CH_ENTITY => {
+                                        // r603-inv: raw arrival, BEFORE the gate — tells
+                                        // packets-arriving apart from gate-rejecting.
+                                        if let Some(a) = src4 {
+                                            static RAW_ONCE: std::sync::Once = std::sync::Once::new();
+                                            RAW_ONCE.call_once(|| {
+                                                log::info!("[lan-mp] first raw CH_ENTITY datagram from {a} ({} bytes)", payload.len());
+                                            });
+                                        }
                                         if let Some(states) = receive(&mut lan_gate, payload) {
                                             for s in &states {
                                                 if s.id == lan_my_eid {
@@ -14850,7 +14866,20 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 let mut dg = vec![CH_ENTITY];
                                 dg.extend_from_slice(&bytes);
                                 for t in &out_targets {
-                                    let _ = sock.send_to(&dg, std::net::SocketAddr::V4(*t));
+                                    // r603-inv: send errors were swallowed — the open
+                                    // joiner→host investigation needs them visible.
+                                    {
+                                        static SEND_ONCE: std::sync::Once = std::sync::Once::new();
+                                        SEND_ONCE.call_once(|| {
+                                            log::info!("[lan-mp] first entity state SENT to {t} (id {lan_my_eid})");
+                                        });
+                                    }
+                                    if let Err(e) = sock.send_to(&dg, std::net::SocketAddr::V4(*t)) {
+                                        static SEND_ERR_ONCE: std::sync::Once = std::sync::Once::new();
+                                        SEND_ERR_ONCE.call_once(|| {
+                                            log::warn!("[lan-mp] entity send_to {t} failed: {e}");
+                                        });
+                                    }
                                 }
                             }
 
