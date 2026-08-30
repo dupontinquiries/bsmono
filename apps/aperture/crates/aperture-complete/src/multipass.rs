@@ -16,9 +16,10 @@
 //!     // ... (rest of the code remains the same)
 //!     }
 //!     fn main() { ... }
-//! ```
+//!     ```
 //!     The provided code snippet appears to be a part of an application
 //!     written in Rust, using various libraries such as `egui`...
+//! ```
 //!
 //! Four different kinds of wrong are mixed into one string: a
 //! HALLUCINATED construct (`egui::Panel { title = ... }` is not egui's
@@ -118,7 +119,52 @@ pub fn split_fences(reply: &str) -> (Vec<String>, Vec<String>) {
         }
         return (code, prose);
     }
-    let mut in_code = false;
+    // START INSIDE A FENCE when the reply OPENS with a closing one.
+    //
+    // A model continuing a code block often replies with bare code and
+    // then a ``` to close it — the operator's real reply does exactly
+    // that. Starting outside meant the leading code was classified as
+    // PROSE, so the elision inside it was never examined and the whole
+    // reply came back as one un-offerable paragraph.
+    //
+    // Detected by counting: an ODD number of fences means the reply is
+    // unbalanced, and a reply that ends outside code must therefore have
+    // begun inside it. Cheaper and more robust than guessing from the
+    // first line's shape, which would misread a prose reply that happens
+    // to start with an indented sentence.
+    // The reply BEGINS inside a fence when its first fence line is a
+    // CLOSING one — i.e. there is non-blank text before it and that text
+    // is not itself introduced by a fence.
+    //
+    // Counting parity is not enough: "here you go:\n```rust\nlet x = 1;"
+    // is also odd, and there the leading text really is prose. The
+    // difference is whether anything precedes the first fence, which is
+    // exactly what distinguishes "continued code, now closing" from
+    // "prose, now opening".
+    // The distinguishing mark is the INFO STRING. An opening fence
+    // usually carries a language (```rust); a closing one is bare.
+    //
+    // Combined with "is there text before it", that separates the two
+    // real shapes:
+    //   "here you go:\n```rust\n…"   → prose, then an OPENING fence
+    //   "    if x {\n…\n```\nprose"   → code already running, then a
+    //                                  CLOSING one
+    // Text-before-fence alone is not enough (the first case has it too),
+    // and a bare-fence check alone is not enough (a reply can legitimately
+    // open with a bare ```). Both together is what the operator's real
+    // reply needed.
+    let first_fence = reply
+        .lines()
+        .position(|l| l.trim_start().starts_with("```"));
+    let mut in_code = match first_fence {
+        Some(i) => {
+            let bare = reply.lines().nth(i)
+                .map(|l| l.trim().trim_start_matches('`').trim().is_empty())
+                .unwrap_or(false);
+            bare && reply.lines().take(i).any(|l| !l.trim().is_empty())
+        }
+        None => false,
+    };
     let mut buf = String::new();
     for line in reply.lines() {
         if line.trim_start().starts_with("```") {
@@ -422,7 +468,15 @@ mod typeout_tests {
         // every bracket themselves, which is most of the keystrokes.
         let mut t = Typeout::new("let x = foo(a, b);");
         let bits = drain_bits(&mut t);
-        assert_eq!(bits, vec!["let", " x", " =", " foo(", " a,", " b);"], "{bits:?}");
+        // `"a,"` has NO leading space, and that is correct: the previous
+        // bit ended at `foo(`, and there is no whitespace between `(`
+        // and `a` to carry. My expectation had one because I wrote the
+        // list by eye rather than by the rule.
+        //
+        // The rule the implementation follows — leading whitespace joins
+        // the bit that comes after it — is what the reassembly test
+        // actually pins, and that one passes.
+        assert_eq!(bits, vec!["let", " x", " =", " foo(", "a,", " b);"], "{bits:?}");
         assert!(t.done());
     }
 
@@ -433,11 +487,19 @@ mod typeout_tests {
         let mut t = Typeout::new("first();
 second();");
         let mut seen = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..2 {
             seen.push(t.next_bit().unwrap().to_string());
         }
-        assert_eq!(seen, vec!["first(", ")", ";"], "{seen:?}");
-        assert_eq!(t.next_bit(), Some("\n"), "the break is its own step");
+        // `first();` is ONE bit: the word is taken, then the punctuation
+        // run absorbs `();` in a single pass. My expectation split it
+        // into three, which would have been the behaviour if punctuation
+        // were taken one character at a time — and that is the thing the
+        // design explicitly rejects, because `});` arriving as three
+        // presses is the friction this removes.
+        //
+        // The newline is still its own step, which is the property this
+        // test exists for.
+        assert_eq!(seen, vec!["first();", "\n"], "{seen:?}");
     }
 
     #[test]

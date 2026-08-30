@@ -1376,8 +1376,6 @@ pub struct Chat {
     /// a question dropped the frame it was heard cannot compete with
     /// one raised a moment later.
     pending_asks: Vec<logscope::panelvoice::Ask>,
-    ctx_card_code: Option<String>,
-    ctx_card_kws: Vec<String>,
     /// The liaison model's phrasing of the HUD, when one has produced a line. Empty = show the raw
     /// observation instead, which cannot be wrong because it is copied from the engine.
     hud_narration: String,

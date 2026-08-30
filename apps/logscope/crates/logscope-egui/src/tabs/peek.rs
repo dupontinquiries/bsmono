@@ -13,7 +13,7 @@ pub struct Peek {
     /// frame because it accumulates state across frames — a tap is a
     /// press AND a release, and a per-frame recogniser can never see the
     /// second half of one.
-    touch: touchkit::Recognizer,
+    touch: touchkit::GestureRecognizer,
     /// (document line index, screen rect) for each row drawn last frame.
     /// Feeds gesture hit-testing; see the draw loop for why it is not
     /// cached.
@@ -25,7 +25,7 @@ impl Default for Peek {
             syntax: true,
             collapse: false,
             goto_top: false,
-            touch: touchkit::Recognizer::new(touchkit::Config::default()),
+            touch: touchkit::GestureRecognizer::new(touchkit::Config::default()),
             row_rects: Vec::new(),
         }
     }

@@ -812,7 +812,10 @@ pub fn browse_ui(ui: &mut egui::Ui, b: &mut Browse,
                     }
                 });
             }
-            let rows = b.visible_albums();
+            // Cloned for the same reason as `visible_artists` below: the
+            // slice borrows `b`, and the draw reads other fields of `b`
+            // while it is alive. The cache still saves the sort.
+            let rows = b.visible_albums().to_vec();
             if rows.is_empty() {
                 ui.colored_label(c.text_weak,
                     if !b.loaded { "catalogue not opened" } else { albums_empty_text(b.album_mode) });
@@ -868,7 +871,16 @@ pub fn browse_ui(ui: &mut egui::Ui, b: &mut Browse,
                     }
                 });
             }
-            let rows = b.visible_artists();
+            // Cloned, not borrowed. `visible_artists` returns a slice out
+            // of `b`, and the draw below reads `b.pager.loading` and
+            // `b.artist_mode` while the rows are still alive (E0503).
+            //
+            // The clone is of the CACHED vector, so the expensive part —
+            // the per-frame re-sort this cache was added to remove — is
+            // still gone. What is left is one Vec copy of the visible
+            // page, which is what the function did every frame before
+            // caching anyway.
+            let rows = b.visible_artists().to_vec();
             if rows.is_empty() && !b.pager.loading {
                 ui.colored_label(c.text_weak,
                     if !b.loaded { "catalogue not opened" } else { artists_empty_text(b.artist_mode) });
