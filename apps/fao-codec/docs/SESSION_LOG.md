@@ -2896,3 +2896,38 @@ MeshIntegrator (dense contract) fed from these sparse anchors.
 
 fao-codec-lib: 82 passed / 0 failed. At session start: 66 / 7 with the
 test binary having been uncompilable until 2026-08-19.
+
+### First live cross-video library run (same session)
+
+plate_lab --lib-add/--lib-match: sparse reconstructions become
+canonical webs (SceneMesh from triangulated points + sampled colors,
+WebSignature::from_mesh) and query signatures score against every
+stored web — the codec's asymptotic dedupe claim exercised end-to-end
+for the first time, on a library that (as of the manifest fix) actually
+keeps its webs.
+
+Setup: three sets from the bloopers (train-car, store, desert burial)
+added; queried with a DISJOINT 2s window of the store shot (same set,
+different take content) and with the desert GOP itself.
+
+Results: self-match 1.000 exactly (deterministic pipeline sanity).
+Same-set ranking CORRECT in every configuration — store-take2's best
+match is store-take1 — but the margin is not threshold-grade:
+
+  scale-sensitive (before): same-set 0.486, wrong sets 0.294/0.349
+  scale-invariant  (after): same-set 0.609, wrong sets 0.523/0.469
+
+signature_similarity is now scale-invariant (eigenvalue fractions,
+unit-norm extents): monocular webs carry no absolute scale — units are
+each run's own camera travel — so cross-take comparison of absolute
+spectra was comparing an unobservable; alignment recovers scale later
+where it belongs. Suite stays 82/0.
+
+Honest limit, measured: ~100-point sparse PCA signatures are dominated
+by WHICH features happened to track in a given take, not by scene
+identity — the signature was designed for dense v8 meshes (10⁴–10⁵
+verts) where shape statistics stabilize. Threshold-grade cross-take
+matching needs either dense geometry under the signature (densify +
+MeshIntegrator over the sparse anchors — the planned construction) or
+appearance terms (vertex-color histograms exist in the mesh; adding
+them to WebSignature is a wire-format change to take deliberately).

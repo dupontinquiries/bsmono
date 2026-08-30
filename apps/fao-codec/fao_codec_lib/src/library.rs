@@ -860,11 +860,23 @@ pub fn signature_similarity(a: &WebSignature, b: &WebSignature) -> f32 {
     // (say 0.5), bail early without computing the other scores. Saves 
     // ~70% of the comparison cost on the typical "definitely doesn't 
     // match" path that find_match exercises most.
+    // SCALE NORMALIZATION: monocular reconstructions carry no absolute
+    // scale — each web's units are its own camera-motion magnitude, so
+    // two takes of the SAME room from windows with different camera
+    // travel produce eigenvalues/extents off by an arbitrary factor.
+    // Measured on real cross-take data before this change: same-set
+    // similarity 0.486 (well under any usable threshold) while a
+    // different set scored 0.335 — correct ranking, unusable margin.
+    // Comparing SHAPE (eigenvalue fractions, unit-norm extents) removes
+    // the unobservable; absolute scale is recovered later by
+    // compute_alignment_transform, where it belongs.
     let eig_score = {
+        let sa: f32 = a.eigenvalues.iter().map(|e| e.abs()).sum::<f32>().max(1e-6);
+        let sb: f32 = b.eigenvalues.iter().map(|e| e.abs()).sum::<f32>().max(1e-6);
         let mut acc = 0.0f32;
         for i in 0..3 {
-            let ea = a.eigenvalues[i].max(1e-6);
-            let eb = b.eigenvalues[i].max(1e-6);
+            let ea = (a.eigenvalues[i] / sa).max(1e-6);
+            let eb = (b.eigenvalues[i] / sb).max(1e-6);
             let r = (ea / eb).ln().abs();
             acc += (-r).exp();  // 1.0 if equal, decays with log distance
         }
@@ -880,10 +892,12 @@ pub fn signature_similarity(a: &WebSignature, b: &WebSignature) -> f32 {
     
     // Extent ratio — sorted descending so they're directly comparable.
     let ext_score = {
+        let na: f32 = a.extent.iter().map(|e| e * e).sum::<f32>().sqrt().max(1e-6);
+        let nb: f32 = b.extent.iter().map(|e| e * e).sum::<f32>().sqrt().max(1e-6);
         let mut acc = 0.0f32;
         for i in 0..3 {
-            let ea = a.extent[i].max(1e-6);
-            let eb = b.extent[i].max(1e-6);
+            let ea = (a.extent[i] / na).max(1e-6);
+            let eb = (b.extent[i] / nb).max(1e-6);
             let ratio = ea.min(eb) / ea.max(eb);
             acc += ratio;
         }

@@ -516,6 +516,62 @@ fn main() {
             mean_rep,
             mean_base
         );
+        // Cross-shot library experiment: --lib-add <dir> --name <label>
+        // adds this GOP's sparse reconstruction as a canonical web;
+        // --lib-match <dir> prints the similarity of this GOP's signature
+        // against every stored web. Together they run the codec's core
+        // asymptotic claim — same scene from different takes/angles
+        // should match, different sets should not — live, for the first
+        // time with a manifest that actually persists its first entry.
+        let build_mesh = |pts: &[fao_codec::v8_reconstruction_codec::TriangulatedFeature]| {
+            use fao_codec::v8_reconstruction_codec::SceneMesh;
+            let mut mesh = SceneMesh::default();
+            for p in pts {
+                let Some(&(fi, sx, sy)) = color_at.get(&p.feature_id) else { continue };
+                let f = &frames[fi as usize];
+                let xi = (sx as usize).min(w - 1);
+                let yi = (sy as usize).min(h - 1);
+                let yv = f.y[yi * w + xi] as f32;
+                let uv = f.u[(yi / 2) * (w / 2) + xi / 2] as f32 - 128.0;
+                let vv = f.v[(yi / 2) * (w / 2) + xi / 2] as f32 - 128.0;
+                let r = (yv + 1.402 * vv) / 255.0;
+                let g = (yv - 0.344 * uv - 0.714 * vv) / 255.0;
+                let b = (yv + 1.772 * uv) / 255.0;
+                mesh.vertices.push(p.world_pos);
+                mesh.vertex_colors.push([r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)]);
+            }
+            mesh
+        };
+        if let Some(libdir) = arg_val(&args, "--lib-add") {
+            use fao_codec::library::Library;
+            use fao_codec::v8_reconstruction_codec::WebSignature;
+            let name = arg_val(&args, "--name").unwrap_or_else(|| args[0].clone());
+            let mesh = build_mesh(&pts);
+            let sig = WebSignature::from_mesh(&mesh);
+            let dir = std::path::PathBuf::from(&libdir);
+            if !dir.join("manifest.json").exists() {
+                Library::init(&dir).unwrap_or_else(|e| die(&format!("lib init: {e}")));
+            }
+            let mut lib = Library::open_writable(&dir).unwrap_or_else(|e| die(&format!("lib open: {e}")));
+            match lib.add_web(sig, &mesh, &poses, &name, 0, frames.len() as u32) {
+                Ok(uuid) => println!("lib-add: {} as {} ({} verts)", name, uuid, mesh.vertices.len()),
+                Err(e) => println!("lib-add REJECTED: {} ({} verts): {}", name, mesh.vertices.len(), e),
+            }
+        }
+        if let Some(libdir) = arg_val(&args, "--lib-match") {
+            use fao_codec::library::{signature_similarity, Library};
+            use fao_codec::v8_reconstruction_codec::WebSignature;
+            let mesh = build_mesh(&pts);
+            let sig = WebSignature::from_mesh(&mesh);
+            let lib = Library::open(std::path::Path::new(&libdir)).unwrap_or_else(|e| die(&format!("lib open: {e}")));
+            for stub in &lib.manifest.webs {
+                println!(
+                    "lib-match: vs {} ({}) similarity {:.3}",
+                    stub.source_video, &stub.uuid[..8.min(stub.uuid.len())], 
+                    signature_similarity(&stub.signature, &sig)
+                );
+            }
+        }
         if let Some(ply_path) = arg_val(&args, "--export-ply") {
             // Colored sparse cloud, ASCII PLY: position from triangulation,
             // color sampled from the source frame at the point's last raw
