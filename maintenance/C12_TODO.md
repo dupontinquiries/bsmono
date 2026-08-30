@@ -2052,11 +2052,24 @@ missing.
   written, which is a fair argument for the split existing — the
   distinction only helps if the numbers are then read.
 
-  The six logscope ones are NOT missing work either, but for a third
-  reason: the tabs exist as `src/tabs/{bloc,cargo,code,modify,rotate,
-  sources}.rs` and the Qt class names appear nowhere, not even in a doc
-  comment. So `absent` means "this tool cannot find it", not "it is not
-  there" — a fourth category the split still does not capture. `ambient-learner`'s `EguiLib` is now RESOLVED: it was
+  The six logscope ones are NOT missing work either, and my diagnosis of
+  them was half wrong: they are not Qt ports at all. The "originals" are
+  RUST — `crates/logscope/src/ui/{bloc,cargo,code,modify,rotation,
+  sources}_tab.rs` — so this is a Rust-to-Rust port between two crates
+  in one app. Four of the six already cited their origin FILE ("Ports
+  `ui/bloc_tab.rs`") and none named the TYPE, which is what the audit
+  matches on: the citation was half-written everywhere.
+
+  RESOLVED (`89db8456`) by naming the type in each: "Ports
+  `ui/bloc_tab.rs`'s `BlocTab`". That renames no code — C12-35a's rule
+  holds — it states which type the module ports, which four of the files
+  were already trying to say. Each original was verified to exist first,
+  including `rotate.rs` -> `rotation_tab.rs`, where the names differ and
+  a guessed citation would have been wrong.
+
+  **The fleet now reports ZERO ABSENT surfaces.** Every remaining
+  sub-100% `code` score is the doc-only house style. The column is
+  finally meaningful: the next entry to appear in it will be real. `ambient-learner`'s `EguiLib` is now RESOLVED: it was
   `src/egui_lib.rs`, a feature-gate shim whose own header says "the
   module is empty unless the feature is on" — not a screen. It
   CamelCased into a phantom surface. The file now carries
