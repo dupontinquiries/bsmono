@@ -3163,3 +3163,36 @@ Named levers, in order, all with tools already in-tree:
 At the low-quality tier (~33 dB) citation already wins today (481 vs
 ~600+ KB), which matters for the game-content regime where the
 canonical will eventually be engine-exact and ΔR → grain floor.
+
+### Citation ΔR hunted to ground: three nulls and a verdict (same session)
+
+Lever 1, affine-aligned citation (align_plate_affine: variance-gated
+32px block matching vs the plate's prediction → robust 6-DOF fit →
+one-time plate warp, +24 wire bytes): the fitted transform on the
+store takes is IDENTITY (scale 1.0004, −0.2px) — the takes are
+already geometrically aligned; bytes/PSNR unchanged. The machinery is
+correct and ready for pairs that DO differ geometrically; this pair
+doesn't.
+
+Lever 3, grain-band citation (v4 band split on the cited path):
+WORSE bytes (2.46 vs 2.19 MB at dz12) — consistent with the earlier
+finding that this pre-compressed source's grain is not cleanly
+separable noise.
+
+The diagnostic that settles it — mode share: the cited encode routes
+91.9% of regions to prev-MC vs 54.5% self-coded. The encoder USES the
+cross-take canonical for ~8% of regions. ΔR is CONTENT: blooper takes
+of the "same set" differ in actor resting positions, shadows, and
+props across most of the frame, and frame-level plates entangle set
+with movers. The mode decision correctly routes around the mismatch
+(same graceful-degradation path as the wrong-canonical control).
+
+VERDICT, honestly reordered roadmap: mover-layer separation is a
+PREREQUISITE for citation, not a sibling lever. The canonical must
+model the SET alone (background plate with movers excised via the
+mover mask — the classification machinery exists) before another
+take can profitably cite it; citation then applies to true background
+and movers are coded per-take. This also matches the engine framing:
+an engine's scene is assets + actors, never a fused frame. The
+affine-citation machinery stays in-tree, correct and waiting for
+geometrically-differing pairs (handheld retakes, game camera orbits).

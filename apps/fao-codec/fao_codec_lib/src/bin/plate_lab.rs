@@ -122,7 +122,12 @@ fn main() {
     // alignment of frame 0 against the plate (8 wire bytes). This is
     // the library-citation bridge in its 2D-native form.
     let (pl, motions, cited) = if let Some(pp) = arg_val(&args, "--use-plate") {
-        let ext = plate::load_plate(&pp).unwrap_or_else(|e| die(&format!("load_plate: {e}")));
+        let mut ext = plate::load_plate(&pp).unwrap_or_else(|e| die(&format!("load_plate: {e}")));
+        if args.iter().any(|a| a == "--align-affine") {
+            let (aligned, a) = plate::align_plate_affine(&ext, &frames[0]);
+            eprintln!("cited plate affine-aligned: [{:.4} {:.4} {:.2}; {:.4} {:.4} {:.2}]", a[0], a[1], a[2], a[3], a[4], a[5]);
+            ext = aligned;
+        }
         let m2 = plate::motions_against_plate(&frames, &ext);
         (ext, m2, true)
     } else {

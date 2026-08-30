@@ -61,6 +61,7 @@ pub struct PlateMotion {
 
 /// The web: a background plate the size of the union of all warped frame
 /// footprints (for a static camera, exactly the frame size).
+#[derive(Clone)]
 pub struct Plate {
     pub w: usize,
     pub h: usize,
@@ -852,6 +853,86 @@ pub fn load_plate(path: &str) -> std::io::Result<Plate> {
         u: raw[16 + ysz..16 + ysz + csz].to_vec(),
         v: raw[16 + ysz + csz..16 + ysz + 2 * csz].to_vec(),
     })
+}
+
+/// Affine-align a cited plate to this GOP's frame 0. The citation
+/// experiment priced translation-only alignment: the cross-take
+/// mismatch residual exceeded the plate bytes saved at matched
+/// quality, and takes differ by more than translation (zoom, slight
+/// rotation, framing drift). Correspondences come from block matching
+/// frame 0 against the plate's zero-motion prediction on a 32px grid
+/// (variance-gated); the robust 6-DOF fit is global_motion::fit; the
+/// plate is then warped ONCE so every downstream step is unchanged.
+/// Wire cost: 6 f32 = 24 bytes on top of the reference.
+pub fn align_plate_affine(plate: &Plate, frame0: &Yuv420) -> (Plate, crate::global_motion::Affine) {
+    use crate::global_motion as gm;
+    let (fw, fh) = (frame0.w, frame0.h);
+    let zero = PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 };
+    let pred0 = predict_frame(plate, &zero, fw, fh);
+    // Block correspondences: pred0-view coords -> frame coords.
+    let mut pairs: Vec<(f32, f32, f32, f32)> = Vec::new();
+    let step = 32usize;
+    let mut y = step;
+    while y + REGION + step < fh {
+        let mut x = step;
+        while x + REGION + step < fw {
+            // Variance gate: flat blocks match anywhere.
+            let mut mean = 0u32;
+            for dy in 0..REGION {
+                for dx in 0..REGION {
+                    mean += frame0.y[(y + dy) * fw + x + dx] as u32;
+                }
+            }
+            mean /= (REGION * REGION) as u32;
+            let mut var = 0u64;
+            for dy in 0..REGION {
+                for dx in 0..REGION {
+                    let d = frame0.y[(y + dy) * fw + x + dx] as i64 - mean as i64;
+                    var += (d * d) as u64;
+                }
+            }
+            if var / (REGION * REGION) as u64 >= 64 {
+                let (mv, sad) = search_mv(&pred0.y, fw, fh, &frame0.y, x, y);
+                // half-pel units -> px; reject poor matches.
+                if sad < (REGION * REGION * 12) as u32 {
+                    let (mx, my) = (mv.0 as f32 * 0.5, mv.1 as f32 * 0.5);
+                    let (cx, cy) = (x as f32 + REGION as f32 / 2.0, y as f32 + REGION as f32 / 2.0);
+                    pairs.push((cx + mx, cy + my, cx, cy));
+                }
+            }
+            x += step;
+        }
+        y += step;
+    }
+    let a = match gm::fit(&pairs) {
+        Some(m) => m,
+        None => return (plate.clone(), gm::IDENTITY),
+    };
+    let a_inv = match gm::invert(&a) {
+        Some(m) => m,
+        None => return (plate.clone(), gm::IDENTITY),
+    };
+    // Warp: new_plate(q) = plate(A_inv(q + O) - O), O = (ox, oy).
+    let mut out = plate.clone();
+    let (pw, ph) = (plate.w, plate.h);
+    for qy in 0..ph {
+        for qx in 0..pw {
+            let (fx, fy) = (qx as f32 + plate.ox, qy as f32 + plate.oy);
+            let (sx, sy) = gm::apply(&a_inv, fx, fy);
+            out.y[qy * pw + qx] = bilinear(&plate.y, pw, ph, sx - plate.ox, sy - plate.oy);
+        }
+    }
+    let (cw2, ch2) = (pw / 2, ph / 2);
+    for qy in 0..ch2 {
+        for qx in 0..cw2 {
+            let (fx, fy) = (qx as f32 * 2.0 + plate.ox, qy as f32 * 2.0 + plate.oy);
+            let (sx, sy) = gm::apply(&a_inv, fx, fy);
+            let (px, py) = ((sx - plate.ox) * 0.5, (sy - plate.oy) * 0.5);
+            out.u[qy * cw2 + qx] = bilinear(&plate.u, cw2, ch2, px, py);
+            out.v[qy * cw2 + qx] = bilinear(&plate.v, cw2, ch2, px, py);
+        }
+    }
+    (out, a)
 }
 
 /// Motions for a GOP against an EXTERNAL (cited) plate: align frame 0
