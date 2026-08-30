@@ -494,20 +494,36 @@ different, hardcoded set**: `g_champion_kind` is 0-5 — `Cryotek`,
 the Rust 19-boss table by name (`jhiaxus_omega`, "Devastator Jhiaxus")
 at all.
 
-**So the real picture**: `raidcon.rs`'s 19-boss table (now the JSON
-file) is newer, richer, Rust-side-only content — genuinely well
-authored, but currently disconnected from the C engine's actual,
-already-shipping champion-spawn mechanism, not just missing a lookup
-table to wire it up. The two systems don't even have the same roster
-size or names. Before doing ANY more work on "which chassis a boss
-looks like," the real open question is architectural: is `blackstar-rs`
-meant to fully replace the C engine's raid system (in which case the
-19-boss table needs its own spawn logic built from scratch, since there
-is nothing to hook into), or does the 19-boss content eventually need
-to reconcile with the 5-6 existing C-engine champions (in which case
-much of `raidcon.rs`'s roster is speculative/future content, not a
-near-term integration target)? That's a real product decision, not
-something I should guess at by picking one and building toward it.
+**Correction to what I wrote here two turns ago**, found by checking
+`git log` for how recently `games/blackstar` was touched. I framed the
+boss-roster split as an open product decision ("does the Rust content
+need to reconcile with the C engine's champions"). That framing was
+premature: there's a deliberate, recorded commit from the day before
+this session (`19885fc3`, "games: say plainly that blackstar and
+blackstar-rs are unrelated") stating explicitly, in both projects'
+READMEs, that they are **separate, unrelated projects — "no code in
+common," "neither is a port of the other."** If that's the current,
+authoritative position, there is no reconciliation decision pending;
+it's already been decided, and decided the way I should have assumed
+rather than framed as open.
+
+That said, a real tension is worth flagging rather than silently
+accepting the cleaner story: `raidcon.rs`'s own code comment on `Mech`
+explicitly claims the opposite — "Codes match the C engine's
+`raid_enc_t.mech` (0..3) so the two implementations stay comparable" —
+and I found an actual `raid_enc_t` struct in
+`games/blackstar/engine_src/exengine/raid_plan.h` with the exact same
+field layout (`x, z, kind, mech, min_units`) that prompted this whole
+investigation. That's not a coincidental shared theme; it's a matching
+data shape. My best guess, and it is a guess: the Rust module's shape
+was modeled on the C engine's at some point as a design reference, the
+comment documenting that never got updated, and "no code in common" is
+accurate in the sense that matters (no shared crate, no build
+dependency, no runtime interop) even though the historical provenance
+still shows through in that one comment. Not confident enough in that
+reconciliation to state it as fact — recording both the official
+position and the contradicting code comment side by side is more
+honest than picking one.
 
 One more thing worth distinguishing precisely, since it's easy to
 conflate: not every "the C engine does X" comment in this codebase
