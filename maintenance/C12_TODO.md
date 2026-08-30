@@ -3451,3 +3451,36 @@ Three decisions:
   models that choice and `voiceconfirm` exists to show the operator
   which it will be, so the remaining work is those two rather than more
   plumbing.
+
+## 65. The reroll run button exists
+
+`ssh_runner` (§62a) gave the fleet page the adapter its label said was
+missing, so the label is gone and a button is there.
+
+`reroll::run(&plan, &mut runner, &mut on_event)` on a worker thread,
+streaming into the task log. Every `Event` variant is logged, including
+`StepStarted` — which is emitted BEFORE the work precisely so a step
+that hangs shows as the thing that hung, and dropping it would waste
+that design.
+
+The runner's own log is appended AFTER the events, because it carries
+the build output. That is where a compile error actually appears, and
+without it a run ends on "install failed" with nothing to act on.
+
+Credentials: a fleet user (required — every step needs somewhere to log
+in) and a password that is only used for FIRST enrolment. Empty password
+means "keys already installed", which is the normal case after run one,
+so the run is not gated on it. Masked in the field and never written
+anywhere; `setup_key` consumes it and nothing else wants it.
+
+A borrow split was needed — `st` is `&mut app.fleet` and the run needs
+`app.task`, so the credential values are copied out before `app.task` is
+touched. Same shape as the a11y scene split in the chat tab, third time
+this pattern has come up.
+
+- **C12-65a — the whole path is now UNTESTED END TO END rather than
+  unbuilt.** Plan → button → runner → ssh. The first thing to check is
+  build/install failure attribution (§62a): a compile error will be
+  reported against the install step and confined to one device, where
+  `execute`'s rules say it should skip that app on every device sharing
+  the triple.

@@ -43,6 +43,17 @@ pub struct State {
     pub picker: crate::device_picker::Picker,
     /// What the last scan changed, shown so the list does not mutate silently.
     pub last_changes: Vec<cockpit::roster::Change>,
+    /// The account the fleet logs in as. Every reroll step needs it, so a
+    /// run is gated on it rather than defaulting to the local username —
+    /// a deploy that silently used the wrong account would half-succeed.
+    pub reroll_user: String,
+    /// Password for FIRST enrolment only. Empty means "keys are already
+    /// installed", which is the normal case after the first run and is
+    /// why this is not required.
+    ///
+    /// Held in memory for the run and never written: `setup_key`
+    /// consumes it and nothing else wants it.
+    pub reroll_password: String,
     /// Apps to push in a reroll. Empty is a legitimate state and the plan says
     /// so rather than pretending to have work.
     pub reroll_apps: Vec<String>,
@@ -208,12 +219,84 @@ fn reroll_ui(app: &mut App, ui: &mut egui::Ui) {
             });
         }
     } else if !plan.steps.is_empty() {
-        // No dead button: the executor needs a Runner over ssh/cargo/scp and
-        // that is not wired yet. Saying so is better than a control that does
-        // nothing when pressed.
+        // THE BUTTON, at last. `ssh_runner::SshRunner` is the adapter the
+        // label used to say was missing.
+        //
+        // Gated on a user and at least one device: `execute` walks the
+        // plan and every step needs somewhere to log in, so a run with
+        // neither would fail once per step with the same message.
+        ui.horizontal(|ui| {
+            ui.label("fleet user");
+            ui.text_edit_singleline(&mut st.reroll_user);
+            ui.label("password");
+            // `password(true)` so it is not shouldered off a screen. It
+            // is only needed for FIRST enrolment — after that the key is
+            // installed and this stays empty, which is why the run is
+            // not gated on it.
+            ui.add(egui::TextEdit::singleline(&mut st.reroll_password)
+                .password(true).desired_width(120.0));
+        });
         ui.label(egui::RichText::new(
-            "run: not wired yet — needs the ssh/cargo runner")
+            "password is used once to install the key, then never stored")
             .weak().small());
+        // Values copied out of `st` before `app.task` is touched: `st` is
+        // `&mut app.fleet`, and reaching for another field of `app` while
+        // it lives is a borrow conflict. Same split the chat tab needed
+        // for its a11y scene.
+        let user = st.reroll_user.trim().to_string();
+        let pw = st.reroll_password.clone();
+        let can_run = !app.task.is_running()
+            && !user.is_empty()
+            && !devices.is_empty();
+        let n = plan.steps.len();
+        if ui
+            .add_enabled(can_run, egui::Button::new(format!("Run reroll · {n} steps")))
+            .clicked()
+        {
+            // (id, host, triple) triples, owned: the run takes minutes on
+            // a worker thread and must not hold the UI's roster.
+            let devs: Vec<(String, String, String)> = devices
+                .iter()
+                .map(|d| (d.id.clone(), d.host.clone(), d.triple.clone()))
+                .collect();
+            let plan_owned = plan.clone();
+            let (user, pw) = (user.clone(), pw.clone());
+            app.task.run_logged(move |sink| {
+                let cred = if pw.trim().is_empty() {
+                    crate::ssh_runner::Credential::KeyAlreadyInstalled
+                } else {
+                    crate::ssh_runner::Credential::Password(pw)
+                };
+                let mut r = crate::ssh_runner::SshRunner::new(&user, devs, cred);
+                let report = {
+                    let mut on = |e: reroll::Event| match e {
+                        reroll::Event::Started { steps } => sink.push(&format!("── {steps} steps ──")),
+                        // StepStarted is emitted BEFORE the work, so a
+                        // step that hangs shows as the thing that hung.
+                        // Logging it is the whole reason it exists.
+                        reroll::Event::StepStarted(s) => sink.push(&format!("· {s:?}")),
+                        reroll::Event::StepDone(s) => sink.push(&format!("✓ {s:?}")),
+                        reroll::Event::StepFailed { step, error } =>
+                            sink.push(&format!("✗ {step:?} — {error}")),
+                        reroll::Event::StepSkipped { step, because } =>
+                            sink.push(&format!("– {step:?} (skipped: {because})")),
+                        reroll::Event::Finished => sink.push("── done ──"),
+                    };
+                    reroll::run(&plan_owned, &mut r, &mut on)
+                };
+                // The runner's own log AFTER the events: it carries the
+                // build output, which is where a compile error actually
+                // appears. Dropping it would leave "install failed" with
+                // nothing to act on.
+                for l in &r.log { sink.push(l); }
+                format!("reroll finished — {} device(s) reported", report.devices.len())
+            });
+        }
+        if !can_run && !app.task.is_running() {
+            ui.label(egui::RichText::new(
+                "set a fleet user and enrol at least one device to run")
+                .weak().small());
+        }
         let _ = runview::RunView::with_devices(&[]);
     }
 }
