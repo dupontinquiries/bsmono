@@ -1,5 +1,5 @@
 //! Code tab — syntax-aware code view with AI block actions. Ports
-//! `ui/code_tab.rs` (tree-sitter bloc detection + Ollama actions). Each action
+//! `ui/code_tab.rs`'s `CodeTab` (tree-sitter bloc detection + Ollama actions). Each action
 //! composes a focused prompt for the selected block and copies it to the clipboard,
 //! ready to paste into the Chat tab (or any model).
 use crate::theme;

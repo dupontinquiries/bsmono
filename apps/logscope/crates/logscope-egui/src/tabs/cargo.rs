@@ -7,6 +7,7 @@
 //!
 //! Discipline: the check runs on a worker thread streaming parsed `Diag`s over a channel (the UI never
 //! blocks on cargo); the JSON→Diag mapping is a pure fn with a unit test.
+//! Ports `ui/cargo_tab.rs`'s `CargoTab`.
 use crate::model::{model_combo, ModelState};
 use crate::theme;
 use egui::{Color32, RichText};

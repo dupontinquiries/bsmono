@@ -1,5 +1,5 @@
 //! Sources tab — presets, a command runner, a live filter, and a log input
-//! that loads into the shared Doc (feeding Peek/Tokens/Blocks). Ports `ui/sources_tab.rs`.
+//! that loads into the shared Doc (feeding Peek/Tokens/Blocks). Ports `ui/sources_tab.rs`'s `SourcesTab`.
 use crate::analysis::Doc;
 use crate::filepicker::{FilePicker, Outcome};
 use crate::theme;

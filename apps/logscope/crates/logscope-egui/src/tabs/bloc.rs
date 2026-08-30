@@ -1,5 +1,5 @@
 //! Bloc tab — the bloc engine's AST-scored regions, an editor, and AI
-//! suggestions. Ports `ui/bloc_tab.rs`.
+//! suggestions. Ports `ui/bloc_tab.rs`'s `BlocTab`.
 use crate::model::{model_combo, ModelState};
 use crate::theme;
 use egui::{Color32, RichText};

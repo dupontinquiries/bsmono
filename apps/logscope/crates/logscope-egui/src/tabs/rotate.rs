@@ -1,5 +1,5 @@
 //! Rotate tab — rotation/compression options that generate a logrotate config,
-//! with save targets and apply buttons. Ports `ui/rotation_tab.rs`.
+//! with save targets and apply buttons. Ports `ui/rotation_tab.rs`'s `RotationTab`.
 use crate::theme;
 use egui::RichText;
 

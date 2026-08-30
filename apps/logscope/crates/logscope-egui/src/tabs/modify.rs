@@ -1,5 +1,5 @@
 //! Modify tab — clipboard-history driven edit/transform pipeline with a
-//! Replace/Append/Patch paste mode. Ports `ui/modify_tab.rs`.
+//! Replace/Append/Patch paste mode. Ports `ui/modify_tab.rs`'s `ModifyTab`.
 use crate::theme;
 use egui::RichText;
 
