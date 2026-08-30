@@ -22,6 +22,10 @@ pub mod outbox;
 pub mod group_voice;
 /// The host seam: one typed event in, typed commands out. See `host.rs` —
 /// this is the call site the ~35 tested-but-unreached entry points lacked.
+/// Who this installation is, kept across restarts.
+pub mod identity;
+/// Contacts that survive a restart, with the port the scanner found.
+pub mod contact_book;
 pub mod host;
 pub mod settings_page;
 pub mod settings_store;
@@ -142,6 +146,14 @@ pub struct Snapclone {
     /// the view should display what it is TOLD, not compute a second answer
     /// that could disagree with the one the handshake uses.
     pub local_id: String,
+    /// The durable address book. Beside `peers` rather than merged into it —
+    /// see `contact_book` for why, and for the test that keeps the two in step.
+    pub contact_book: crate::contact_book::ContactBook,
+    /// The book changed and has not been written. Drained as a command rather
+    /// than written from here: the app has no business owning a file handle,
+    /// and a save that happens inside apply_friends cannot be batched or
+    /// deferred by a host that knows better.
+    pub contacts_dirty: bool,
     /// Latest-frame-wins slot between the capture thread and the paint.
     pub frames: crate::frame_pump::FrameSlot,
     /// The uploaded texture, kept across frames so an unchanged frame is not
@@ -550,6 +562,8 @@ impl Snapclone {
             shutter_note: String::new(),
             feed_note: String::new(),
             local_id: String::new(),
+            contact_book: Default::default(),
+            contacts_dirty: false,
             frames: Default::default(),
             cam_texture: None,
             last_frame_ms: None,
@@ -1319,6 +1333,10 @@ impl Snapclone {
         // peer_session was written to prevent — and re-adding them later would
         // resume a sequence they have no memory of.
         self.sessions.forget(&id);
+        // The book too, or the contact returns on the next launch — a delete
+        // that survives until you quit is the most confusing kind of not
+        // working, because it looks like it worked.
+        if self.contact_book.remove(&id) { self.contacts_dirty = true; }
         self.peers.retain(|p| p.name != id);
         self.cards.close(id);
         self.sync_roster();
@@ -1354,6 +1372,21 @@ impl Snapclone {
                 if !self.peers.iter().any(|e| e.name == name) {
                     self.peers.push(Peer { name: name.clone(), online: false });
                 }
+                // THE PORT, which was being dropped here. `AddPeer` has carried
+                // one since the QR parser was written — a bare sc-ID means
+                // 9876, an explicit one overrides — and this function read
+                // `p.host` and never looked at `p.port`, so both forms produced
+                // identical state and all that care was wasted one call later.
+                //
+                // Only a real sc-ID goes in the book: the manual field accepts
+                // a hostname too, and a book keyed by "192.168.1.5" cannot be
+                // matched against a peer that later announces itself by id.
+                // Those rows still appear — they just are not durable yet,
+                // which is the honest state rather than a silent half-record.
+                if crate::identity::is_valid(&name)
+                    && self.contact_book.upsert(&name, p.port, self.now_secs.max(0) as u64 * 1000) {
+                    self.contacts_dirty = true;
+                }
                 self.sync_roster();
             }
             // A LOCAL nickname: it renames the row, not the peer. The other
@@ -1366,6 +1399,7 @@ impl Snapclone {
                 // for this contact, so it is refused rather than applied — the
                 // row would become unidentifiable and unfindable.
                 if !to.is_empty() {
+                    if self.contact_book.rename(&id, &to) { self.contacts_dirty = true; }
                     if let Some(p) = self.peers.iter_mut().find(|p| p.name == id) {
                         p.name = to;
                     }

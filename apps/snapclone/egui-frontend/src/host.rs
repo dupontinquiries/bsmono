@@ -59,8 +59,9 @@
 //! working voice call.
 
 use crate::{
-    ambient_inbox, ambient_palette, camera_select, frame_pump, gaze, gossip, keyboard_inset,
-    nat_punch, settings_page, snap_export, voice_bridge, voice_send, Snapclone,
+    ambient_inbox, ambient_palette, camera_select, contact_book, frame_pump, gaze, gossip,
+    identity, keyboard_inset, nat_punch, settings_page, snap_export, voice_bridge, voice_send,
+    Snapclone,
 };
 
 /// Something the world is telling the app.
@@ -85,6 +86,19 @@ pub enum HostEvent {
 
     /// Auto-login succeeded, or the login form was satisfied.
     LoggedIn,
+
+    /// Who this installation is, read from disk or freshly minted.
+    ///
+    /// Carries the whole `Loaded` rather than a bare String because
+    /// `Unavailable` is a real outcome the app must not paper over: `local_id`
+    /// was the empty string for the entire life of this port, and an empty id
+    /// draws an empty QR code, fails to filter your own gossip, and goes on
+    /// the wire as a blank sender — all without an error.
+    IdentityLoaded(identity::Loaded),
+
+    /// The address book, off disk. Replaces both the book and the display rows,
+    /// so the roster is what was saved rather than what was hardcoded.
+    ContactsLoaded(Box<contact_book::ContactBook>),
 
     /// The devices this machine offers, from a probe.
     CamerasFound(Vec<camera_select::Device>),
@@ -205,6 +219,14 @@ pub enum HostCommand {
     NatClassified(bool),
     /// A QR payload latched onto an open scanner.
     QrLatched(bool),
+    /// Write the address book out; it changed. Carries the book rather than
+    /// signalling "go read the app's field", so a host can write it from
+    /// another thread without borrowing the app.
+    SaveContacts(Box<contact_book::ContactBook>),
+    /// No identity could be established. The app runs, but nobody can add this
+    /// device, and the QR code it shows is empty — the host should say so
+    /// rather than let that be discovered socially.
+    IdentityUnavailable,
     /// A DHT lookup completed for the first time (true), or `done` arrived
     /// twice for the same lookup (false) — which the C++ original treats as a
     /// use-after-free, so it is surfaced rather than swallowed.
@@ -234,6 +256,26 @@ impl Snapclone {
                 self.settings = settings_page::SettingsPage::new(*s);
             }
             HostEvent::LoggedIn => self.login_succeeded(),
+            HostEvent::IdentityLoaded(loaded) => {
+                match loaded.sc_id() {
+                    Some(id) => self.local_id = id.to_string(),
+                    // Left empty deliberately and reported, rather than
+                    // substituted. Everything downstream already behaves badly
+                    // with an empty id; the difference is that the host now
+                    // knows and can say so instead of the user finding out when
+                    // nobody can add them.
+                    None => out.push(HostCommand::IdentityUnavailable),
+                }
+            }
+            HostEvent::ContactsLoaded(book) => {
+                self.peers = book.to_peers();
+                self.contact_book = *book;
+                self.sync_roster();
+                // Loading is not a change: writing the file straight back on
+                // every launch would rewrite it for nothing and lose the
+                // ability to tell a real edit from a start-up.
+                self.contacts_dirty = false;
+            }
 
             HostEvent::CamerasFound(list) => self.cameras = list,
             HostEvent::CameraWorked { id, now_ms } => self.note_camera_worked(&id, now_ms),
@@ -335,6 +377,9 @@ impl Snapclone {
         for id in std::mem::take(&mut self.snaps_expired) { out.push(HostCommand::MarkExpired(id)); }
         for (field, text) in std::mem::take(&mut self.dictated) {
             out.push(HostCommand::ApplyDictation { field, text });
+        }
+        if std::mem::take(&mut self.contacts_dirty) {
+            out.push(HostCommand::SaveContacts(Box::new(self.contact_book.clone())));
         }
         if std::mem::take(&mut self.export_requested) { out.push(HostCommand::ExportSnaps); }
         if std::mem::take(&mut self.retry_requested) { out.push(HostCommand::RetryFailedSends); }
@@ -503,6 +548,117 @@ mod tests {
                  .contains(&HostCommand::RetryFailedSends));
         assert!(s.apply(HostEvent::Tick { now_secs: 3 })
                  .iter().all(|c| *c != HostCommand::RetryFailedSends));
+    }
+
+    #[test]
+    fn loading_an_identity_fills_the_id_that_was_empty_for_the_whole_port() {
+        // local_id was String::new() at construction and nothing ever set it,
+        // so my_code_ui drew a QR for the empty string, the self-gossip filter
+        // never matched, and the handshake carried a blank sender. None of the
+        // three failed loudly.
+        let mut s = app();
+        assert_eq!(s.local_id, "");
+        s.apply(HostEvent::IdentityLoaded(identity::Loaded::Existing(
+            identity::Identity { sc_id: "sc-0123abcd".into() })));
+        assert_eq!(s.local_id, "sc-0123abcd");
+    }
+
+    #[test]
+    fn no_identity_is_reported_rather_than_faked() {
+        // The app still runs — refusing to start over identity would be worse —
+        // but the host has to be told, or the user discovers it socially when
+        // someone tries to scan a blank code.
+        let mut s = app();
+        let out = s.apply(HostEvent::IdentityLoaded(identity::Loaded::Unavailable));
+        assert!(out.contains(&HostCommand::IdentityUnavailable));
+        assert_eq!(s.local_id, "", "and nothing plausible was substituted");
+    }
+
+    #[test]
+    fn loaded_contacts_become_the_roster_and_do_not_look_like_an_edit() {
+        // Marking the book dirty on load would rewrite the file on every
+        // launch and destroy the app's ability to tell a real change from a
+        // start-up.
+        let mut s = app();
+        let mut book = contact_book::ContactBook::default();
+        book.upsert("sc-aabbccdd", 9000, 1_000);
+        let out = s.apply(HostEvent::ContactsLoaded(Box::new(book)));
+        assert_eq!(s.contact_book.len(), 1);
+        assert!(s.peers.iter().any(|p| p.name == "sc-aabbccdd"),
+                "the display rows were not rebuilt: {:?}",
+                s.peers.iter().map(|p| &p.name).collect::<Vec<_>>());
+        assert!(!out.iter().any(|c| matches!(c, HostCommand::SaveContacts(_))),
+                "loading wrote the file back: {out:?}");
+    }
+
+    #[test]
+    fn adding_a_contact_reaches_both_the_book_and_the_display_row() {
+        // The parallel-state risk contact_book's header admits to. apply_friends
+        // is the only writer of either and this is what fails if a change
+        // updates one and forgets the other.
+        let mut s = app();
+        s.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "sc-aabbccdd".into(), port: 9000 }));
+        assert!(s.peers.iter().any(|p| p.name == "sc-aabbccdd"), "no display row");
+        assert_eq!(s.contact_book.get("sc-aabbccdd").map(|c| c.port), Some(9000),
+                   "not in the book, so it vanishes on restart");
+    }
+
+    #[test]
+    fn a_scanned_contact_produces_a_save_and_keeps_its_port() {
+        // End to end for the thing that made the app a demo: scan a code, and
+        // the contact is still there next launch. The port travelling with it
+        // is the second half — apply_friends used to read AddPeer.host and
+        // ignore AddPeer.port entirely.
+        let mut s = app();
+        s.open_qr_scan(true);
+        // The commands come back from `apply`, which drains as part of its
+        // contract — draining again afterwards yields nothing, which is what
+        // the first version of this test did and why it failed.
+        let out = s.apply(HostEvent::QrPayload("snapclone://sc-aabbccdd:9000".into()));
+        assert!(out.contains(&HostCommand::QrLatched(true)));
+        // Latching is not applying. The scanner holds the success state for
+        // SUCCESS_HOLD_MS so the user can see WHICH code was read before the
+        // dialog closes, and `tick` is what turns that into a contact. I wrote
+        // this test expecting the save on the latch and it was the test that
+        // was wrong: reporting "added" before the confirmation the user is
+        // being shown has finished would make the hold a lie.
+        for _ in 0..10 { s.tick(0.1); }
+        let out = s.drain_commands();
+        let saved = out.iter().find_map(|c| match c {
+            HostCommand::SaveContacts(b) => Some(b.clone()), _ => None });
+        let saved = saved.expect(&format!("a scan produced no save: {out:?}"));
+        assert_eq!(saved.get("sc-aabbccdd").map(|c| c.port), Some(9000));
+    }
+
+    #[test]
+    fn a_manual_host_that_is_not_an_sc_id_still_shows_but_is_not_booked() {
+        // The manual field accepts a hostname, and a book keyed by
+        // "192.168.1.5" could never be matched against a peer that later
+        // announces itself by id. The row appearing without being durable is
+        // the honest state; a half-record keyed by an address is not.
+        let mut s = app();
+        s.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "192.168.1.5".into(), port: 9876 }));
+        assert!(s.peers.iter().any(|p| p.name == "192.168.1.5"));
+        assert!(s.contact_book.is_empty());
+        assert!(s.drain_commands().is_empty(), "and no pointless write");
+    }
+
+    #[test]
+    fn deleting_a_contact_writes_the_book_so_it_stays_deleted() {
+        // A delete that survives until you quit is the most confusing kind of
+        // not working, because it looks like it worked.
+        let mut s = app();
+        s.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "sc-aabbccdd".into(), port: 9876 }));
+        let _ = s.drain_commands();
+        s.confirm_delete("sc-aabbccdd");
+        let out = s.drain_commands();
+        let saved = out.iter().find_map(|c| match c {
+            HostCommand::SaveContacts(b) => Some(b.clone()), _ => None })
+            .expect(&format!("a delete produced no save: {out:?}"));
+        assert!(saved.is_empty());
     }
 
     #[test]

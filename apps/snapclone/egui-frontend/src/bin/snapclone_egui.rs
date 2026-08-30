@@ -8,7 +8,7 @@
 
 use eframe::egui;
 use snapclone_egui::host::{HostCommand, HostEvent};
-use snapclone_egui::{Peer, Snapclone};
+use snapclone_egui::Snapclone;
 use uikit_egui::Adaptive;
 
 struct App {
@@ -19,15 +19,30 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        // Placeholder roster. Real peers arrive as `HostEvent::GossipHeard`
-        // once there is something listening on the subnet — see the note in
-        // `handle` about what this binary can and cannot yet produce.
-        let peers = vec![
-            Peer { name: "kitchen-tablet".into(), online: true },
-            Peer { name: "studio-mbp".into(), online: true },
-            Peer { name: "porch-cam".into(), online: false },
-        ];
-        let mut snap = Snapclone::new(peers);
+        // NO PLACEHOLDER ROSTER. kitchen-tablet, studio-mbp and porch-cam were
+        // the three names this binary invented on every launch, and they were
+        // most of why the app read as a demo: the roster was furniture, and a
+        // contact you actually added disappeared when you quit.
+        //
+        // The list now starts empty and is filled from disk. Empty is the
+        // correct first-run state and the Friends page already has an empty
+        // view that names the ports to open — which is real help, unlike three
+        // devices that do not exist.
+        let mut snap = Snapclone::new(Vec::new());
+
+        // Identity before contacts, because the QR code the user shows is
+        // drawn from it and a fresh install's first act is usually to show it.
+        let id = snapclone_egui::identity::load_or_create();
+        if let snapclone_egui::identity::Loaded::Created(ref i) = id {
+            eprintln!("snapclone: new identity {} (config: identity.conf)", i.sc_id);
+        }
+        let cmds = snap.apply(HostEvent::IdentityLoaded(id));
+        Self::report(cmds);
+
+        let book = snapclone_egui::contact_book::load();
+        let cmds = snap.apply(HostEvent::ContactsLoaded(Box::new(book)));
+        Self::report(cmds);
+
         // Settings off disk, through the seam rather than by assignment: the
         // event sets `current` AND the saved baseline, so a freshly loaded
         // config does not come up reporting unsaved changes with the Save
@@ -46,11 +61,35 @@ impl App {
     fn handle(&mut self, cmds: Vec<HostCommand>) {
         for c in cmds {
             match c {
+                // REAL, not a debug sink. This is the whole point of the
+                // exercise: a contact scanned or renamed now reaches the disk,
+                // so it is still there next launch. A write failure is
+                // reported rather than swallowed — a silent one means the user
+                // adds someone twice and never learns why.
+                HostCommand::SaveContacts(book) => {
+                    if let Err(e) = snapclone_egui::contact_book::store(&book) {
+                        eprintln!("snapclone: could not save contacts: {e}");
+                    }
+                }
+                HostCommand::IdentityUnavailable => {
+                    eprintln!("snapclone: no identity — /dev/urandom was unreadable. \
+                               Nobody can add this device and the QR code will be blank.");
+                }
                 // These two the app can answer for itself: they are bookkeeping
                 // about what the user already saw, not work for a backend.
                 HostCommand::MarkViewed(_) | HostCommand::MarkExpired(_) => {}
                 other => eprintln!("snapclone: unhandled host command: {other:?}"),
             }
+        }
+    }
+
+    /// `handle` before there is a `self` to handle with. Start-up events can
+    /// produce commands too — a first-run identity is exactly when something
+    /// might need saying — and dropping them silently would be the same class
+    /// of bug the drain exists to prevent.
+    fn report(cmds: Vec<HostCommand>) {
+        for c in cmds {
+            eprintln!("snapclone: startup: {c:?}");
         }
     }
 }
