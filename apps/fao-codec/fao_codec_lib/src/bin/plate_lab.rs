@@ -135,6 +135,66 @@ fn main() {
         opts.skip_threshold, opts.saliency_boost, opts.dead_zone, opts.skip_block_rle, opts.dc_prediction, opts.channel_deinterleave
     );
 
+    if let Some(degpath) = arg_val(&args, "--restore-exp") {
+        // Learned-restoration experiment. args[0] = clean y4m, --restore-exp
+        // <degraded y4m>. Train buckets on the FIRST half of the pairs,
+        // evaluate on the held-out second half: luma PSNR before/after
+        // restoration, plus FAST keypoints+coverage on degraded vs restored
+        // (does restoration un-starve detection?).
+        let (deg_frames, _) = read_y4m(&degpath);
+        if deg_frames.len() != frames.len() {
+            die("clean/degraded frame count mismatch");
+        }
+        let (w, h) = (frames[0].w, frames[0].h);
+        let half = frames.len() / 2;
+        let pairs: Vec<(&[u8], &[u8])> = deg_frames[..half]
+            .iter()
+            .zip(&frames[..half])
+            .map(|(d, c)| (d.y.as_slice(), c.y.as_slice()))
+            .collect();
+        let t = std::time::Instant::now();
+        let model = fao_codec::restore::train(&pairs, w, h, 3);
+        eprintln!("train: {:.1}s on {} pairs (stride 3)", t.elapsed().as_secs_f32(), half);
+        let psnr = |a: &[u8], b: &[u8]| -> f64 {
+            let mut mse = 0.0f64;
+            for i in 0..a.len() {
+                let d = a[i] as f64 - b[i] as f64;
+                mse += d * d;
+            }
+            mse /= a.len() as f64;
+            10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10()
+        };
+        let (mut p_deg, mut p_res) = (0.0f64, 0.0f64);
+        use fao_codec::v8_reconstruction_codec::FastDetector;
+        let det = FastDetector { max_keypoints: 5000, ..FastDetector::default() };
+        let coverage = |y: &[u8]| -> (usize, f32) {
+            let kps = det.detect(y, w, h);
+            let (cw, ch) = ((w + 63) / 64, (h + 63) / 64);
+            let mut cells = vec![false; cw * ch];
+            for k in &kps {
+                cells[(k.y as usize / 64) * cw + (k.x as usize / 64)] = true;
+            }
+            (kps.len(), cells.iter().filter(|&&c| c).count() as f32 / cells.len() as f32)
+        };
+        let mut det_stats = (0usize, 0.0f32, 0usize, 0.0f32);
+        for (i, (d, c)) in deg_frames[half..].iter().zip(&frames[half..]).enumerate() {
+            let restored = fao_codec::restore::apply(&model, &d.y, w, h);
+            p_deg += psnr(&d.y, &c.y);
+            p_res += psnr(&restored, &c.y);
+            if i == 0 {
+                let (n0, c0) = coverage(&d.y);
+                let (n1, c1) = coverage(&restored);
+                det_stats = (n0, c0, n1, c1);
+            }
+        }
+        let n = (frames.len() - half) as f64;
+        println!("heldout_luma_psnr degraded {:.2} restored {:.2} (delta {:+.2} dB)", p_deg / n, p_res / n, (p_res - p_deg) / n);
+        println!(
+            "detection first-heldout: degraded n {} cov {:.2} | restored n {} cov {:.2}",
+            det_stats.0, det_stats.1, det_stats.2, det_stats.3
+        );
+        return;
+    }
     if args.iter().any(|a| a == "--features") {
         // Detection probe: FAST keypoints on first + mid frame, with
         // spatial coverage = fraction of 64px cells holding ≥1 keypoint.

@@ -2670,3 +2670,33 @@ replicate. The principled successor is lookahead RD (charge plate-mode's
 persistent error across future frames), not a better proxy. SAD stays
 by measurement; region_codable_cost kept #[allow(dead_code)] as the
 experiment record.
+
+### Learned restoration — linear baseline measured at zero (same session)
+
+restore.rs: RAISR-style learned restoration — pixels bucketed by local
+gradient orientation × strength (12 buckets), per-bucket 5×5+bias
+filters solved EXACTLY by ridge least squares from (degraded, clean)
+pairs. Deterministic, CPU-fast, held-out-tested. Synthetic sanity: it
+recovers >40% of a 3×3 box blur's error on unseen frames (unit test).
+
+Real AV1 artifacts: nothing. shotB@crf50 +0.01 dB, shotB@crf63
++0.02 dB, smiteB@crf55 −0.02 dB on held-out halves; detection
+coverage unchanged. Two causes, both instructive:
+  1. On grainy film the "clean" reference is itself noisy — the optimal
+     linear predictor of grain from smoothed input is ~identity; the
+     regression is ill-posed exactly as predicted ("noisy input is just
+     as much of a problem").
+  2. AV1's in-loop deblock/CDEF/loop-restoration already perform
+     near-optimal linear-class restoration at decode; the surviving
+     artifacts are the non-linear residue by construction.
+
+Conclusion, measured not assumed: artifact→pattern recovery requires a
+non-linear model. The in-tree path is beatspace's candle training
+stack (hand-built layers, checkpointing, wgpu_train) on the Asahi
+Mesa/Vulkan target, with unendlich's engine as the ground-truth
+generator for game content — render clean frames, degrade with the
+real codec chain (downscale→upscale→encode), and the training
+distribution matches deployment exactly, which no transcoded film
+source can offer. restore.rs stands as the baseline such a model must
+beat and the harness (--restore-exp: held-out PSNR + detection
+coverage deltas) is the evaluation it plugs into.
