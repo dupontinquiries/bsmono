@@ -51,6 +51,17 @@ struct Feel {
     /// to end at a local String — so an embedder had nothing to read. Ported,
     /// 19 tests, and reached by nothing until now.
     service: crate::keyboard_service::KeyboardService,
+    /// Where committed text goes. `Preview` on a desktop checkout, the
+    /// input-method backend on device.
+    ///
+    /// The service has always QUEUED commits (`take_pending`) and
+    /// nothing drained the queue outside its own tests — so every tap,
+    /// swipe and dictation result went into a Vec nobody read, and the
+    /// only visible effect was the preview string below. That is what
+    /// made this a demo rather than a keyboard.
+    sink: Box<dyn crate::sink::Sink>,
+    /// The last failure from the sink, shown in the status line.
+    sink_error: Option<String>,
     /// How many commits the service has emitted. Shown in the demo so the
     /// integration is VISIBLE — a silent pass-through is indistinguishable
     /// from one that is not wired at all, which is how this module came to be
@@ -117,6 +128,8 @@ impl Feel {
             // this session is listed explicitly.
             dict: Default::default(),
             service: Default::default(),
+            sink: crate::sink::detect(),
+            sink_error: None,
             committed: 0,
             ngram: Default::default(),
             clear_hold: Default::default(),
@@ -137,17 +150,54 @@ impl eframe::App for Feel {
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 
     #[allow(deprecated)]
+    /// Send text to the sink and mirror it in the preview.
+    ///
+    /// ONE place, so a key path added later cannot quietly skip the sink
+    /// the way the direct `self.typed.push_str` calls did. The preview
+    /// is a mirror of what was sent, never the destination.
+    fn emit_text(&mut self, text: &str) {
+        if let Err(e) = self.sink.commit_text(text) {
+            self.sink_error = Some(e);
+        }
+        self.typed.push_str(text);
+    }
+
+    /// Send a non-character key by keysym name, and mirror its effect.
+    fn emit_key(&mut self, keysym: &str) {
+        if let Err(e) = self.sink.press_keysym(keysym) {
+            self.sink_error = Some(e);
+        }
+        match keysym {
+            "BackSpace" => {
+                self.typed.pop();
+            }
+            "Return" => self.typed.push('\n'),
+            "Tab" => self.typed.push('\t'),
+            _ => {}
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_theme(ctx);
         // Drain the service queue once per frame. Without this `pending` grows
         // for the life of the process — a queue with no reader is a leak, and
         // the model cannot know whether a host exists to read it.
         //
-        // In a real embedding these become `TextCommitted` signals; here they
-        // are counted, which is enough to prove the wiring end to end rather
-        // than only up to the commit.
+        // The drained text now GOES SOMEWHERE. It used to be `for _ in
+        // ...`: counted and dropped, which proved the wiring only as far
+        // as the commit and no further. On a desktop the sink is a
+        // preview; on device it is the input-method backend, and the same
+        // line does both because the app holds a `dyn Sink` and does not
+        // know which it has.
         let dt_ms = ctx.input(|i| i.stable_dt) * 1000.0;
-        for _ in self.service.take_pending() {
+        for text in self.service.take_pending() {
+            if let Err(e) = self.sink.commit_text(&text) {
+                // Said out loud rather than swallowed: a keyboard that
+                // silently stops typing is indistinguishable from one
+                // whose keys are not registering, and that ambiguity is
+                // exactly what made this hard to diagnose from outside.
+                self.sink_error = Some(e);
+            }
             self.committed += 1;
             // Start on the DRAIN rather than at each commit site: one flash per
             // frame however many words landed, and every commit path gets it
@@ -303,6 +353,23 @@ impl eframe::App for Feel {
                 // pass-through is indistinguishable from one that is not wired
                 // — which is exactly how this module sat unreached with 19
                 // passing tests.
+                // WHERE THE TEXT IS GOING. Shown always, not only after a
+                // commit: "typing into this window" and "typing into the
+                // focused app" look identical from outside, and that
+                // ambiguity is why a keyboard that typed nowhere read as
+                // a working demo for so long.
+                ui.label(
+                    egui::RichText::new(match &self.sink_error {
+                        Some(e) => format!("sink error: {e}"),
+                        None => self.sink.describe(),
+                    })
+                    .size(10.0)
+                    .color(if self.sink_error.is_some() {
+                        ui.visuals().error_fg_color
+                    } else {
+                        ui.visuals().weak_text_color()
+                    }),
+                );
                 if self.committed > 0 {
                     // Flashed brighter for COMMIT_MS after each commit.
                     // commit_opacity returns >1 while running, which
@@ -597,19 +664,33 @@ impl eframe::App for Feel {
                         // the board's state machine (shift/symbols absorbed), act on the rest
                         let render = self.real.render();
                         if let Some(e) = keyboard_ui(ui, &render, &adaptive, self.board.palette()) {
+                            // THROUGH THE SINK, not straight into the
+                            // preview string. These wrote to `self.typed`
+                            // directly, which is the same bug as the
+                            // commit queue one layer in: on device the
+                            // letters would type and BackSpace and Return
+                            // would do nothing, because only the text
+                            // path had a destination.
+                            //
+                            // `self.typed` is still updated, but as a
+                            // MIRROR of what was sent rather than as the
+                            // destination — so the on-screen preview and
+                            // the focused window cannot disagree.
                             match self.real.press(&e) {
-                                Some(Press::Text(t)) => self.typed.push_str(&t),
-                                Some(Press::Backspace) => { self.typed.pop(); }
-                                Some(Press::Return) => self.typed.push('\n'),
+                                Some(Press::Text(t)) => {
+                                    self.emit_text(&t);
+                                }
+                                Some(Press::Backspace) => self.emit_key("BackSpace"),
+                                Some(Press::Return) => self.emit_key("Return"),
                                 Some(Press::Voice) | None => {}
                                 Some(_) => {}
                             }
                         }
                     } else if let Some(e) = keyboard_ui(ui, self.board.current(), &adaptive, self.board.palette()) {
                         if e == "\u{8}" {
-                            self.typed.pop();
+                            self.emit_key("BackSpace");
                         } else {
-                            self.typed.push_str(&e);
+                            self.emit_text(&e);
                         }
                     }
                     // ── swipe typing over whichever board is showing ──────────────────

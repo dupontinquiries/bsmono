@@ -2241,3 +2241,53 @@ pushed to the pty each frame.
   a shell attached the echo is skipped, because the shell echoes what it
   receives and doing both doubles every character. If the operator sees
   doubled characters, that branch is the place to look.
+
+## 38. rusty-board typed into itself
+
+Operator: "turned into a demo rather than a keyboard that happens to
+have testability on desktop, and needs to work in KDE Plasma Mobile on
+the Fairphone."
+
+Traced it. `KeyboardService::commit_text` queues onto `pending`;
+`take_pending` drains it; and NOTHING outside the service's own tests
+called `take_pending` for its content. `demo_app`'s frame loop did
+`for _ in self.service.take_pending() { self.committed += 1; }` — the
+text discarded, the count kept. So every tap, swipe word and dictation
+result was routed correctly into a Vec nobody read, and the only visible
+effect was a preview string drawn in the app's own window.
+
+A faithful simulation of typing, into itself.
+
+WHAT WAS ALREADY THERE: nearly all of it.
+`rusty_board::compositor::virtual_keyboard` has a `VirtualKeyboard`
+trait (`commit_text`, `press_keysym`, `backend_name`), backend
+DETECTION, and implementations over `zwp_input_method_v2` /
+`zwp_virtual_keyboard_v1`. The egui front-end simply did not depend on
+that crate and never reached for it.
+
+`sink::Sink` is the join: `Preview` for desktop and tests, `SystemSink`
+over the existing backend behind a new `wayland` feature. The front-end
+holds a `dyn Sink` and does not know which it has, which keeps it
+buildable standalone (its stated promise) AND testable without a
+compositor.
+
+Two decisions:
+  - `Preview` APPLIES editing keys rather than only recording them. A
+    backspace that visibly did nothing in the demo would hide a real bug
+    in key routing.
+  - The status line now says WHERE TEXT IS GOING, always. "Typing into
+    this window" and "typing into the focused app" looked identical from
+    outside, and that ambiguity is most of why this went unnoticed.
+
+- **C12-38a — NOT COMPILED**, per instruction. The `wayland` feature
+  path especially: it references `Detected::detect().build()` from the
+  parent crate and has never been built once.
+- **C12-38b — FIXED in the same pass.** Writing up 38a surfaced a
+  second instance one layer in: Backspace and Return wrote to
+  `self.typed` directly rather than going through `press_keysym`, so on
+  device letters would type and editing keys would do nothing. Both key
+  paths now go through `emit_text`/`emit_key` — ONE place each, so a key
+  path added later cannot quietly skip the sink the way these did. The
+  preview string is now a MIRROR of what was sent rather than the
+  destination, which is what stops it and the focused window
+  disagreeing.

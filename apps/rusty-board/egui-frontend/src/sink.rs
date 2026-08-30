@@ -1,0 +1,185 @@
+//! sink — where a keypress actually goes.
+//!
+//! ## The demo/keyboard gap
+//!
+//! `KeyboardService::commit_text` pushes onto a `pending` queue and
+//! `take_pending` drains it. Nothing in the front-end called
+//! `take_pending` — only its own tests did. So every tap, swipe word and
+//! dictation result was routed correctly into a `Vec<String>` that was
+//! never read, and the only visible effect was `self.typed`, a preview
+//! string drawn inside the app's own window.
+//!
+//! That is what made this "a demo rather than a keyboard": it is a
+//! faithful simulation of typing, into itself. On a desktop that is
+//! testable and useful; on a Fairphone under Plasma Mobile it is a
+//! keyboard that types nowhere.
+//!
+//! ## What was already there
+//!
+//! Nearly everything. `rusty_board::compositor::virtual_keyboard` has a
+//! `VirtualKeyboard` trait with `commit_text` / `press_keysym`, backend
+//! DETECTION (`detect()`), and a Wayland implementation speaking
+//! `zwp_input_method_v2` / `zwp_virtual_keyboard_v1`. The egui front-end
+//! simply never reached for it — it is a separate crate that this one
+//! does not depend on.
+//!
+//! ## Why a trait here rather than depending on that crate
+//!
+//! Because the front-end's own description promises it stays "buildable
+//! on its own", and a hard dependency on the Wayland stack would break
+//! that — including on this developer machine, where there is no
+//! compositor to talk to.
+//!
+//! So: a two-line trait the front-end owns, a [`Preview`] implementation
+//! for desktop and tests, and a real one constructed on device. The
+//! keyboard drives a `dyn Sink` and does not know which it has, which is
+//! also what makes the typing path testable without a compositor.
+
+/// Where committed text and synthetic keys go.
+pub trait Sink {
+    /// Literal text: a tap on `a`, a swiped word, a dictation result.
+    fn commit_text(&mut self, text: &str) -> Result<(), String>;
+
+    /// A non-character key by X keysym name: `BackSpace`, `Return`,
+    /// `Tab`, `Left`. Named rather than numbered because that is what
+    /// the Wayland backend already takes, and inventing a second
+    /// spelling would mean a translation table to keep in step.
+    fn press_keysym(&mut self, name: &str) -> Result<(), String>;
+
+    /// For the status line, so a person can tell a keyboard that is
+    /// typing into the world from one typing into itself. That
+    /// distinction was invisible before, which is most of why this went
+    /// unnoticed.
+    fn describe(&self) -> String;
+}
+
+/// The desktop/test sink: remembers everything, sends nothing.
+///
+/// This is what the demo was doing implicitly. Made EXPLICIT so it has a
+/// name, shows up in the status line, and cannot be mistaken for the
+/// real thing.
+#[derive(Default, Debug)]
+pub struct Preview {
+    pub text: String,
+    pub keys: Vec<String>,
+}
+
+impl Sink for Preview {
+    fn commit_text(&mut self, text: &str) -> Result<(), String> {
+        self.text.push_str(text);
+        Ok(())
+    }
+
+    fn press_keysym(&mut self, name: &str) -> Result<(), String> {
+        // Applied to the preview too, so what the box shows matches what
+        // a real sink would have produced. A backspace that visibly did
+        // nothing in the demo would have hidden a real bug in the key
+        // routing.
+        match name {
+            "BackSpace" => {
+                self.text.pop();
+            }
+            "Return" => self.text.push('\n'),
+            "Tab" => self.text.push('\t'),
+            "space" => self.text.push(' '),
+            _ => {}
+        }
+        self.keys.push(name.to_string());
+        Ok(())
+    }
+
+    fn describe(&self) -> String {
+        "preview (typing into this window, not the system)".into()
+    }
+}
+
+/// Choose a sink.
+///
+/// Returns [`Preview`] when there is no compositor to talk to, which is
+/// the desktop-development case and must stay working — the front-end's
+/// whole reason for existing separately is that it builds and runs
+/// without the Wayland stack.
+///
+/// The real path is behind the `wayland` feature and constructed by
+/// [`crate::sink::system`], so a build without it cannot silently
+/// produce a keyboard that appears to type and does not.
+pub fn detect() -> Box<dyn Sink> {
+    #[cfg(feature = "wayland")]
+    {
+        match system() {
+            Ok(s) => return s,
+            Err(e) => {
+                // Loud, once, on stderr: a keyboard that quietly falls
+                // back to typing into itself is exactly the failure this
+                // module exists to end.
+                eprintln!("[rusty-board] no input-method backend ({e}) — preview only");
+            }
+        }
+    }
+    Box::new(Preview::default())
+}
+
+/// The real sink, on a Wayland session with an input-method protocol.
+#[cfg(feature = "wayland")]
+pub fn system() -> Result<Box<dyn Sink>, String> {
+    let vk = rusty_board::compositor::virtual_keyboard::Detected::detect().build();
+    Ok(Box::new(SystemSink { vk }))
+}
+
+#[cfg(feature = "wayland")]
+struct SystemSink {
+    vk: Box<dyn rusty_board::compositor::virtual_keyboard::VirtualKeyboard>,
+}
+
+#[cfg(feature = "wayland")]
+impl Sink for SystemSink {
+    fn commit_text(&mut self, text: &str) -> Result<(), String> {
+        self.vk.commit_text(text).map_err(|e| e.to_string())
+    }
+    fn press_keysym(&mut self, name: &str) -> Result<(), String> {
+        self.vk.press_keysym(name).map_err(|e| e.to_string())
+    }
+    fn describe(&self) -> String {
+        format!("{} (typing into the focused window)", self.vk.backend_name())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_preview_applies_editing_keys_not_just_text() {
+        // A backspace that visibly does nothing in the demo would hide a
+        // real bug in the key routing — the preview has to behave like
+        // the thing it stands in for.
+        let mut p = Preview::default();
+        p.commit_text("hel").unwrap();
+        p.commit_text("lop").unwrap();
+        p.press_keysym("BackSpace").unwrap();
+        assert_eq!(p.text, "hello");
+        p.press_keysym("space").unwrap();
+        p.commit_text("world").unwrap();
+        assert_eq!(p.text, "hello world");
+    }
+
+    #[test]
+    fn the_preview_says_it_is_a_preview() {
+        // The distinction between typing into the world and typing into
+        // this window was invisible, which is most of why the gap went
+        // unnoticed for so long.
+        let p = Preview::default();
+        assert!(p.describe().contains("not the system"), "{}", p.describe());
+    }
+
+    #[test]
+    fn keysyms_are_recorded_even_when_the_preview_ignores_them() {
+        // An unhandled keysym must still be observable, or a test cannot
+        // tell "routed and ignored" from "never routed" — which is the
+        // exact confusion this whole module is about.
+        let mut p = Preview::default();
+        p.press_keysym("Left").unwrap();
+        assert_eq!(p.keys, vec!["Left".to_string()]);
+        assert!(p.text.is_empty());
+    }
+}

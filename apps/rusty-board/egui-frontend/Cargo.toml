@@ -15,6 +15,12 @@ required-features = ["app"]
 
 [features]
 default = ["app"]
+# THE REAL KEYBOARD. Off by default so the front-end keeps its promise of
+# being buildable on its own — a desktop checkout with no compositor must
+# still compile and run, which is what makes this testable at all. On
+# device (Plasma Mobile, Fairphone) this is the feature that turns taps
+# into input for the FOCUSED window rather than for a preview box.
+wayland = ["dep:rusty-board"]
 # Dictation. Off by default because whisper-rs pulls a native build and a model
 # file; the keyboard is fully usable without it, and a phone build that cannot
 # compile is worse than one that cannot dictate.
@@ -25,6 +31,9 @@ voice = ["dep:whisper-rs", "dep:cpal", "dep:audio-kit"]
 app = ["dep:eframe"]
 
 [dependencies]
+# Only under `wayland`: this is the crate holding the zwp_input_method_v2 /
+# zwp_virtual_keyboard_v1 backends and their detection.
+rusty-board = { path = "..", optional = true, default-features = false }
 # Mic-level peak metering used by the MOUNTED voice/recorder.rs — a dep the
 # GTK crate declares and this crate must too, or the shared file dangles
 # (the c11 mount-path lesson, dependency flavour).
