@@ -3241,3 +3241,31 @@ bounds span both takes' motion envelopes (2046px wide vs 1920-ish) —
 tightening fused bounds to the intersection-plus-margin is a known
 easy win on top. Amortization per additional take unchanged in
 structure.
+
+### Matched-quality crossover: achieved, and take-conditional (same session)
+
+Sweep of the fused-canonical citation to self-coding's quality:
+
+  w2 cited (dz20): 802.5 KB @ 37.06 dB vs self 937.4 KB @ 37.19
+    → −14.4% bytes at matched quality (−0.13 dB). FIRST matched-
+    quality citation win in real bytes.
+  w1 cited (dz20): 883.6 KB @ 36.38 vs self 707.8 KB @ 37.58
+    → citing LOSES for w1, on both axes.
+
+The asymmetry is the mover problem seen from the donor side: fusion
+voted w1's actors OUT of the canonical (that was the point), so w1
+must now pay for its own staged content as residual — content its
+self-plate carried for free. w2 gains because its window is busier
+and its self-plate correspondingly worse; the canonical hands it
+clean background it never had.
+
+Measured design law: CITATION PROFIT IS TAKE-CONDITIONAL. The
+encoder routes per take — cite when the canonical beats the take's
+own background model, self-code otherwise (the per-shot hybrid
+routing principle, one level down). Canonical break-even: ~554 KB /
+~135 KB saved per citing take ≈ 4 citing takes; every take after is
+profit. Two takes of bloopers: not yet profitable. Hundreds of takes
+of one SMITE map: decisively profitable — the regime the thesis was
+always about. Mover layers remain the lever to grow the per-take
+saving beyond 14% (actor regions still dominate the citing residual)
+and to let donor takes cite without repurchasing their own actors.
