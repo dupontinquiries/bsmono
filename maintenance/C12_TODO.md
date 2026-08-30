@@ -1782,7 +1782,25 @@ daemon if one is listening" belongs — it already answers "which backend
 should this be" and is consulted by both the load and the chat path, so
 they cannot disagree.
 
-**C12-31a — not built, and one wrinkle to decide first.** `Backend::
+**C12-31a — CLOSED. The daemon is selected, used, and streams.**
+`BackendKind::Daemon` exists, `preferred_reachable()` picks it when a
+socket answers and falls back to the compiled-in backend otherwise, and
+the worker uses that at startup. Both directions are tested: no daemon
+falls back (the property that makes this safe to add at all), and a
+live one wins (or the memory saving silently never happens, which is the
+failure that looks like success).
+
+Probed ONCE at worker startup rather than per request: a daemon
+appearing mid-session should not move the model out from under a chat
+that already loaded one, and a daemon vanishing is noticed where it
+matters — the generate call fails and says so. `preferred_reachable` is
+kept SEPARATE from the pure `preferred()` because it touches the
+filesystem, and a pure-looking function that connects to a socket is a
+trap the moment someone calls it in a draw path.
+
+logscope-egui 1053/1053.
+
+**The original entry, for the reasoning it records:** `Backend::
 generate` takes `on_token: &mut dyn FnMut(&str) -> bool` and streams.
 The daemon's HTTP endpoint returns the whole reply. So a naive Daemon
 backend would call `on_token` once with everything, and the difference

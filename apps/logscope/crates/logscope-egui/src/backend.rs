@@ -36,7 +36,7 @@ pub trait Backend {
     fn template(&self) -> TemplateKind { TemplateKind::Plain }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BackendKind { LlamaCpp, Wgpu, Daemon }
 impl BackendKind {
     pub const ALL: [BackendKind; 3] = [BackendKind::LlamaCpp, BackendKind::Wgpu, BackendKind::Daemon];
@@ -48,6 +48,31 @@ impl BackendKind {
     /// this so the chat talks to the backend that actually holds the loaded model.
     pub fn preferred() -> Self {
         if llm_backend::is_available() { BackendKind::LlamaCpp } else { BackendKind::Wgpu }
+    }
+
+    /// What to start with, PREFERRING a daemon that is actually running.
+    ///
+    /// Kept separate from `preferred()` rather than folded into it,
+    /// because this one touches the filesystem. `preferred()` is pure
+    /// and callable anywhere; a version that connected to a socket would
+    /// be a trap the moment someone called it in a draw path.
+    ///
+    /// Probed ONCE, at worker startup. Not cached with a TTL and not
+    /// re-probed per request: a daemon appearing mid-session should not
+    /// silently move the model out from under a chat that already loaded
+    /// one, and a daemon vanishing is handled where it is noticed — the
+    /// generate call fails and says so.
+    ///
+    /// The fallback is the point. An app whose model stops loading
+    /// because a background service is not running would be worse than
+    /// one with no daemon: the failure is invisible and looks like the
+    /// app's fault. So this is an ordering, not a switch.
+    pub fn preferred_reachable() -> Self {
+        if std::os::unix::net::UnixStream::connect(daemon_socket_path()).is_ok() {
+            BackendKind::Daemon
+        } else {
+            BackendKind::preferred()
+        }
     }
 }
 
@@ -2763,9 +2788,20 @@ static TEMPLATE_NOTE_DONE: AtomicBool = AtomicBool::new(false);
 fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>, template_out: Arc<std::sync::atomic::AtomicU8>) {
     // Default to the backend that's actually compiled in (llama.cpp if available),
     // so the header Load and the chat tab operate on the same, working backend.
-    let mut kind = BackendKind::preferred();
+    // A live daemon wins: one copy of the weights for every app on the
+    // machine instead of 7.2 GiB and ~86 s each. Falls back to the
+    // compiled-in backend when none is listening, which is the ordinary
+    // case and must stay silent-fast rather than an error path.
+    let mut kind = BackendKind::preferred_reachable();
     let mut backend = make(kind);
     crate::diag!("worker: default backend = {} ({})", kind.label(), backend.name());
+    if kind == BackendKind::Daemon {
+        // Say so plainly. "Why is startup instant today" and "why did my
+        // model selection do nothing" have the same answer and it is
+        // this, and a person should not have to read the source to find
+        // out that another process holds their model.
+        crate::diag!("worker: using the shared daemon — this process holds no weights");
+    }
     let mut params = GenParams::default();
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
@@ -3218,6 +3254,45 @@ mod daemon_tests {
         L.get_or_init(|| std::sync::Mutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn no_daemon_falls_back_rather_than_failing() {
+        // THE PROPERTY THAT MAKES THE DAEMON SAFE TO ADD. An app whose
+        // model stops loading because a background service is not
+        // running would be worse than one with no daemon at all: the
+        // failure is invisible and looks like the app's fault.
+        let _serial = env_lock();
+        let prev = std::env::var("XDG_RUNTIME_DIR").ok();
+        std::env::set_var("XDG_RUNTIME_DIR", "/nonexistent-daemon-dir");
+        assert_eq!(BackendKind::preferred_reachable(), BackendKind::preferred(),
+                   "no daemon should fall back to the compiled-in backend");
+        assert_ne!(BackendKind::preferred_reachable(), BackendKind::Daemon);
+        match prev { Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                     None => std::env::remove_var("XDG_RUNTIME_DIR") }
+    }
+
+    #[test]
+    fn a_live_daemon_wins() {
+        // The other half: if the ordering were not honoured the memory
+        // saving would silently never happen, which is the failure that
+        // looks like success.
+        let _serial = env_lock();
+        let prev = std::env::var("XDG_RUNTIME_DIR").ok();
+        let dir = std::env::temp_dir().join(format!("lg-daemon-pick-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("logscope-engine.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || { while listener.accept().is_ok() {} });
+
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        assert_eq!(BackendKind::preferred_reachable(), BackendKind::Daemon,
+                   "a listening daemon was not preferred");
+
+        match prev { Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+                     None => std::env::remove_var("XDG_RUNTIME_DIR") }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
