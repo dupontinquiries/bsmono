@@ -32,6 +32,7 @@ mod foldaudit;
 mod foldsim;
 mod font;
 mod foothold;
+mod fleet;
 mod fx;
 mod gamepad;
 mod gyro;
@@ -1204,6 +1205,10 @@ fn main() {
     if argv.iter().any(|a| a == "--gear") {
         // the bearer's sheet, the ship's vault, the clone gallery
         gearsim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--fleet") {
+        fleet::run(&argv);
         return;
     }
     if argv.iter().any(|a| a == "--fold") {
