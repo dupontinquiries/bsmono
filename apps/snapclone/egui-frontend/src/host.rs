@@ -663,6 +663,43 @@ mod tests {
     }
 
     #[test]
+    fn a_verified_record_brings_a_saved_contact_online_and_a_prune_takes_it_back_off() {
+        // THE asymmetry that made discovery pointless. on_gossip added a row
+        // for an unknown peer and did nothing at all for a known one, while
+        // tick_gossip happily set online=false on prune — so a contact loaded
+        // from the address book was permanently grey however loudly it was
+        // broadcasting, and the Connect button never meant anything.
+        let mut s = Snapclone::new(vec![]);
+        let id = identity::create().expect("entropy");
+        let mut book = contact_book::ContactBook::default();
+        book.upsert(&id.sc_id, 9876, 1_000);
+        s.apply(HostEvent::ContactsLoaded(Box::new(book)));
+        assert!(s.peers.iter().all(|p| !p.online), "loaded contacts start offline");
+
+        // Through the wire, not by hand: a record with verified set by fiat
+        // would prove nothing about whether a real datagram can do this.
+        let a = crate::gossip_wire::Announce {
+            id: id.sc_id.clone(), host: "10.0.0.7".into(), port: 9876, ts: 5_000,
+            peers: Vec::new(), public: None, verified: false,
+        };
+        let bytes = crate::gossip_wire::encode_signed(&a, &id.secret, &id.public).unwrap();
+        let heard = crate::gossip_wire::decode(&bytes).unwrap();
+        assert!(heard.verified);
+
+        let out = s.apply(HostEvent::GossipHeard {
+            record: heard.sender_record(), datagram_len: bytes.len() });
+        assert!(out.contains(&HostCommand::GossipAdmitted(true)), "{out:?}");
+        assert!(s.peers.iter().any(|p| p.name == id.sc_id && p.online),
+                "an admitted record did not bring the contact online");
+        assert_eq!(s.peers.len(), 1, "and it did not add a duplicate row");
+
+        // ...and it goes back off when the peer stops talking. Marked offline,
+        // not removed: a device that stopped gossiping may just be asleep.
+        s.tick_gossip(5_000 + crate::gossip::FAILURE_MS + crate::gossip::PRUNE_MS + 1);
+        assert!(s.peers.iter().all(|p| !p.online), "a pruned peer stayed green");
+    }
+
+    #[test]
     fn an_event_with_nothing_to_report_yields_no_commands() {
         // Otherwise every host loop spins on a list it has to filter, and the
         // no-op case is the common one.

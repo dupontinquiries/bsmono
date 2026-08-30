@@ -88,6 +88,29 @@ impl Announce {
     /// signature — see the module header. This is the one place a caller might
     /// be tempted to set it, so it is a function rather than a struct literal
     /// at four call sites.
+    /// The sender's record, with the address the datagram actually arrived
+    /// from substituted when the announcement did not name one.
+    ///
+    /// A sender cannot reliably know which of its own interfaces a peer can
+    /// reach, so this app announces an empty `host` rather than guessing — and
+    /// the receiver already holds the answer, because the UDP source address is
+    /// where the packet demonstrably came from.
+    ///
+    /// The source address is NOT covered by the signature, and that is the
+    /// right way round: it is the transport's own observation, which makes it
+    /// trustworthy for "where do I dial this peer" and worthless for "who is
+    /// this peer". Identity comes from the signed id and key; reachability
+    /// comes from here. A declared dotted-quad host wins when there is one,
+    /// because a peer behind a router may legitimately know a better address
+    /// for itself than the one its packets appear to come from.
+    pub fn sender_record_from(&self, src: std::net::IpAddr) -> PeerRecord {
+        let mut rec = self.sender_record();
+        if rec.host.is_empty() {
+            rec.host = src.to_string();
+        }
+        rec
+    }
+
     pub fn sender_record(&self) -> PeerRecord {
         PeerRecord {
             id: self.id.clone(),
@@ -449,18 +472,53 @@ pub fn decode(data: &[u8]) -> Result<Announce, Malformed> {
 /// here except a channel to get the datagrams back out of.
 pub struct GossipSocket {
     sock: std::net::UdpSocket,
+    joined: bool,
     /// Reused across polls. A 4 KiB allocation per datagram, several times a
     /// second, for the life of the process is a lot of nothing.
     buf: Vec<u8>,
 }
 
 impl GossipSocket {
-    /// Bind on all interfaces at `port` and allow broadcast.
+    /// Bind on all interfaces at `port` and join the discovery group.
+    ///
+    /// MULTICAST, not the limited broadcast this first used.
+    /// `gossip::MULTICAST_GROUP` — 224.0.0.251 — has been sitting in the
+    /// constants unused since the module was written, and it is the right
+    /// answer: 255.255.255.255 is link-local-only, is dropped by plenty of
+    /// consumer APs, and is delivered to every host on the segment whether or
+    /// not it runs this app. Broadcast stays enabled because
+    /// [`send_to`](Self::send_to) can still address one, but the group is what
+    /// the app announces to.
+    ///
+    /// Joining is best effort. A machine with no multicast-capable interface up
+    /// yet — a phone with wifi still associating — must still get a socket it
+    /// can receive unicast replies on, so a failed join is reported rather than
+    /// fatal.
+    ///
+    /// **Two instances on one host cannot both bind this port.** std's
+    /// UdpSocket exposes no SO_REUSEADDR/SO_REUSEPORT, so testing two copies on
+    /// one machine needs different ports (the Network tab has the field) or the
+    /// socket2 crate, which is not a dependency. Multicast loopback is left ON
+    /// for exactly that reason: with different ports, two local instances do
+    /// find each other.
     pub fn bind(port: u16) -> std::io::Result<GossipSocket> {
         let sock = std::net::UdpSocket::bind(("0.0.0.0", port))?;
         sock.set_nonblocking(true)?;
         sock.set_broadcast(true)?;
-        Ok(GossipSocket { sock, buf: vec![0u8; MAX_DATAGRAM_BYTES] })
+        let joined = crate::gossip::MULTICAST_GROUP.parse::<std::net::Ipv4Addr>().ok()
+            .map(|g| sock.join_multicast_v4(&g, &std::net::Ipv4Addr::UNSPECIFIED).is_ok())
+            .unwrap_or(false);
+        Ok(GossipSocket { sock, buf: vec![0u8; MAX_DATAGRAM_BYTES], joined })
+    }
+
+    /// Did the multicast join succeed? False means this socket only sees
+    /// unicast, which is worth surfacing: discovery will look broken and the
+    /// cause is the interface, not the app.
+    pub fn joined_group(&self) -> bool { self.joined }
+
+    /// Where an announcement should go.
+    pub fn group_addr(port: u16) -> String {
+        format!("{}:{port}", crate::gossip::MULTICAST_GROUP)
     }
 
     /// The port actually bound. Differs from the requested one when 0 was
@@ -769,6 +827,38 @@ mod tests {
         let (from, decoded) = &got[0];
         assert_eq!(from.ip().to_string(), "127.0.0.1");
         assert_eq!(decoded.as_ref().unwrap(), &announce());
+    }
+
+    #[test]
+    fn an_empty_host_is_filled_from_where_the_packet_came_from() {
+        // A sender cannot know which of its interfaces a peer can reach, so it
+        // announces nothing and the receiver supplies the answer it already
+        // has. Without this the record's host is empty, parse_dotted_quad
+        // declines it, and a peer that verified perfectly is still not
+        // dialable — which is indistinguishable from discovery not working.
+        let mut a = announce();
+        a.host = String::new();
+        let src: std::net::IpAddr = "10.0.0.7".parse().unwrap();
+        assert_eq!(a.sender_record_from(src).host, "10.0.0.7");
+    }
+
+    #[test]
+    fn a_declared_address_beats_the_source_address() {
+        // A peer behind a router may legitimately know a better address for
+        // itself than the one its packets appear to come from, so a stated
+        // host is not overridden.
+        let a = announce(); // host: 192.168.1.5
+        let src: std::net::IpAddr = "10.0.0.7".parse().unwrap();
+        assert_eq!(a.sender_record_from(src).host, "192.168.1.5");
+    }
+
+    #[test]
+    fn the_group_address_is_the_constant_the_module_already_had() {
+        // 224.0.0.251 sat unused in gossip.rs since the module was written
+        // while this sent to 255.255.255.255, which is link-local-only and is
+        // dropped by plenty of consumer APs.
+        assert_eq!(GossipSocket::group_addr(9877), "224.0.0.251:9877");
+        assert_eq!(crate::gossip::MULTICAST_GROUP, "224.0.0.251");
     }
 
     #[test]

@@ -808,10 +808,21 @@ impl Snapclone {
             self.note_peer_addr(&id, ip, rec.port, rec.last_seen_ms);
         }
         self.view.observe(rec);
-        if !self.peers.iter().any(|p| p.name == id) {
-            self.peers.push(Peer { name: id, online: true });
-            self.sync_roster();
+        // PRESENCE, which was the asymmetry that made discovery useless. This
+        // used to add a row for an unknown peer and do NOTHING for a known one,
+        // while `tick_gossip` happily set `online = false` on prune — so a
+        // contact loaded from the address book could go offline and could never
+        // come back. Every saved contact was permanently grey no matter how
+        // loudly it was broadcasting.
+        //
+        // The comment above about discovery not replacing a contact still
+        // holds: this changes reachability, not the name or the identity. That
+        // is precisely what discovery is FOR.
+        match self.peers.iter_mut().find(|p| p.name == id) {
+            Some(p) => p.online = true,
+            None => self.peers.push(Peer { name: id, online: true }),
         }
+        self.sync_roster();
         true
     }
 

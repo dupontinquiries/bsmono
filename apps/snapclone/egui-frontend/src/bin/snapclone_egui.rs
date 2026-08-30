@@ -76,6 +76,14 @@ impl App {
                 None
             }
         };
+        if let Some(g) = gossip.as_ref() {
+            if !g.joined_group() {
+                // Worth its own line: discovery will look broken and the cause
+                // is the interface, not the app.
+                eprintln!("snapclone: could not join the discovery multicast group — \
+                           peers on this network will not be found");
+            }
+        }
         Self { snap, focused: true, gossip, last_announce: 0, warned_unsigned: false,
                identity: keys }
     }
@@ -97,7 +105,11 @@ impl App {
                 Ok(a) => {
                     let len = a.peers.len();
                     let cmds = self.snap.apply(HostEvent::GossipHeard {
-                        record: a.sender_record(),
+                        // The address the packet CAME from, when the sender did
+                        // not name one. Without this the record's host is empty,
+                        // parse_dotted_quad declines it, and a peer that
+                        // verified perfectly is still not dialable.
+                        record: a.sender_record_from(from.ip()),
                         // The admission check wants the datagram size and we
                         // have already consumed the bytes, so this is the
                         // encoded length of what we understood. It is an
@@ -136,8 +148,8 @@ impl App {
             public: None,
             verified: false,
         };
-        let to = format!("255.255.255.255:{}",
-                         self.snap.settings.current.network.gossip_port);
+        let to = snapclone_egui::gossip_wire::GossipSocket::group_addr(
+            self.snap.settings.current.network.gossip_port);
         if let Ok(addr) = to.parse() {
             if let Some(s) = self.gossip.as_ref() {
                 if let Err(e) = s.send_signed_to(&a, &keys.secret, &keys.public, addr) {
