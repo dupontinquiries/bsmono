@@ -523,6 +523,22 @@ bosses above, where the two systems are meant to stay comparable
 which category any other cross-engine reference falls into before
 assuming a gap needs closing.
 
+Checked the remaining 16 files in this codebase that reference the C
+engine (`anim.rs`, `archive.rs`, `archsim.rs`, `brain.rs`, `clinch.rs`,
+`clones.rs`, `codex.rs`, `content.rs`, `hazard.rs`, `hive.rs`,
+`patrol.rs`, `perception.rs`, `raidforge.rs`, `raidrun.rs`, `sun.rs`,
+`tuner.rs`) at the comment level, not line by line. All read as a third
+category, distinct from both cases above: straightforward, deliberate
+**ports** — `patrol.rs`'s own doc comment says "ported from `game.c`'s
+`patrol_update`," `sun.rs` and `content.rs` both cite "the C engine's
+numbers" as the values being carried over faithfully. None show the
+specific anomaly that prompted the raid-boss investigation (a materially
+richer, non-overlapping Rust-side system next to a sparser C one) — they
+read as coherent ports, not divergences. Not verifying each one's exact
+fidelity against the C source individually; that would be checking for
+a problem with no specific lead, which is a different kind of activity
+than the investigation above, which followed an actual anomaly.
+
 **Not implemented at all:** anything that exempts a boss from the
 standard vehicle<->robot fold. Every chassis, boss or not, goes through
 the same `xform`/`Morph` pipeline today — "not always transformable in
