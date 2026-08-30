@@ -3758,3 +3758,43 @@ command is indistinguishable from a broken phone.
   They are genuinely lower-stakes than `join`: image chunking, cache
   decisions, and a crate index, none of which block a workflow the way
   first contact does.
+
+## 70. Fleet-wide unhosted sweep, with the corrected checker
+
+First sweep since the tool learned about aliases (§40) and crate
+boundaries (§60). 142 uncalled modules across eleven apps:
+
+    logscope   75    snapclone  19    bo-suite   12    voiceterm 12
+    studio      8    gitmind     7    ambient-l   3    fao-codec  2
+    rusty-board 2    aperture    1    dialer      1
+
+That number is a starting point, not a defect count — this session has
+found the same list contains superseded work to delete, unfinished work
+to wire, speculative design the app never adopted, and library API for
+consumers not yet written. Four piles, one grep.
+
+Hand-checked the two smallest, since a whole-app grep is the check that
+differs from the tool:
+
+**`aperture-core::multicursor` — real, and bigger than a wiring.** A
+complete multi-cursor model: `Cursors` over `Vec<Selection>`, `primary()`,
+`insert_edits` that sorts edits back-to-front so earlier offsets stay
+valid after a fan-out, `merge_overlaps`. Tested. The editor holds a
+single `Selection` and there are **92 sites** touching `.sel` across
+editor.rs and state.rs.
+
+Not converted. That is not a wiring job — it is changing the editor's
+core data model through 92 call sites without being able to run the
+editor, and a subtle error there corrupts a buffer rather than failing
+loudly. The honest first step is `Cursors::single()` as the editor's
+field with `.primary()` at every read site, which is mechanical but
+still wants a compile and a person driving it.
+
+**`dialer-core::irc` — uncalled, unexamined.** Confirmed no references
+outside itself; not read yet.
+
+- **C70a — logscope's 75 dwarf everything else** and are unswept at this
+  scope. gpu-gemm alone contributed ten in an earlier partial look
+  (`cpudecode`, `flash_qblock`, `kvbudget`, `ragged`, `recover`…), which
+  are likely the library-API pile rather than gaps — a kernel crate has
+  public entry points by design.
