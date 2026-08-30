@@ -12260,3 +12260,21 @@ GPU's climate y to the scanned surface (the decision already scans it — reorde
 d.surface_y) or documenting a model-lapse quirk. State shipped: tree site at r612 form (best measured), all
 instruments in-tree, panel numbers unchanged from r613's best (0/610/10.8k/1.7k terrain; 1.000/1.369/0.921/1.000
 mass).
+
+## r616 — LAPSE THEORY MEASURED DEAD; the puzzle escapes CPU-side reproduction — shader decision-export instrument specified
+The r615 measurement ran: over 15,302 TemperateForest columns at seed 424242, mean climate_tree_factor at the three
+candidate heights is scan=1.007, surface_target=1.008, sl+10=1.000 — the model's climate barely lapses with y at
+these altitudes. The climate-input theory is DEAD, and r615's reinterpretation of the r612 balance as "two errors
+cancelling" is RETRACTED (the climate-y term is a no-op; the 0.921 ratio stands on its own merits again).
+PUZZLE STATUS, stated plainly: every CPU-side reproduction of the r613 tree-site pipeline comes out CPU-equal —
+classifier transliteration exact (r614, with its shelf-scan caveat), id tables exact, hash tail fair, factor formula
+identical, factor inputs y-insensitive (this round) — yet the LIVE shader under that form plants 2.5x in
+TemperateForest. The divergence is inside the running GLSL in a way the f64-model-backed transliterations don't
+capture. Plausible residual classes: f32 GLSL noise vs f64 model noise flipping registry fits ASYMMETRICALLY across a
+determine_biome/best_fit threshold at scale; the biome_at_3d_gpu shelf scan (the one indirectly-pinned piece)
+misbehaving on land seeds; or a decision-pipeline interaction invisible to per-function analysis.
+THE INSTRUMENT THAT ENDS THE THEORIZING (next session, one build): a shader DEBUG-EXPORT mode — pc flag that makes
+Phase A write each column's decision internals (biome id, effective_density x1e4 as uint, accepted bit) into the
+block buffer's first words for one chunk; the probe reads them back and diffs against the CPU's per-column values.
+Whatever disagrees first IS the bug, no theories required. State shipped: unchanged from r613's best (tree site r612
+form; panel 0/610/10.8k/1.7k terrain, 1.000/1.369/0.921/1.000 mass); the lapse instrument stays in the probe.

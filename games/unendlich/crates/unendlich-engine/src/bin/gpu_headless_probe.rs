@@ -406,6 +406,44 @@ fn main() {
                     if tb { e.1 += 1; }
                 }
             }
+            // r616: the lapse measurement — average climate_tree_factor
+            // inputs at the three candidate heights over TF columns.
+            {
+                let (mut n, mut f_scan, mut f_target, mut f_sl10) = (0u32, 0f64, 0f64, 0f64);
+                let ctf = |t: f64, h: f64| -> f64 {
+                    if t > 0.75 && h < 0.25 { return 0.0; }
+                    let td = t - 0.5;
+                    ((1.0 - 1.4 * td * td).max(0.2)) * (0.3 + h * 1.2)
+                };
+                for ((coord, cc), _gc) in coords.iter().zip(cpu_chunks.iter()).zip(gpu_chunks.iter()) {
+                    for i in (0..cc.blocks.len()).step_by(97) {
+                        let wx = coord.x * cs as i32 + (i % cs) as i32;
+                        let wz = coord.z * cs as i32 + ((i / cs) % cs) as i32;
+                        let sy = match wg.surface_y_at(wx, wz, -64, 256) {
+                            Some(y) => y,
+                            None => continue,
+                        };
+                        let bs = wg.biome_at_3d(wx, sy, wz);
+                        if format!("{:?}", bs.biome) != "TemperateForest" { continue; }
+                        n += 1;
+                        f_scan += ctf(bs.temperature, bs.humidity);
+                        let stgt = wg.model().surface_target(wx as f64, wz as f64, 0.0);
+                        let tt = wg.model().temperature(wx as f64, stgt, wz as f64, 0.0);
+                        let th = wg.model().humidity(wx as f64, stgt, wz as f64, 0.0);
+                        f_target += ctf(tt, th);
+                        let sl10 = wg.model().sea_level(wx as f64, wz as f64, 0.0) + 10.0;
+                        let t2 = wg.model().temperature(wx as f64, sl10, wz as f64, 0.0);
+                        let h2 = wg.model().humidity(wx as f64, sl10, wz as f64, 0.0);
+                        f_sl10 += ctf(t2, h2);
+                    }
+                }
+                if n > 0 {
+                    println!(
+                        "  TF climate factors (n={n}): scan={:.3} target={:.3} sl10={:.3}",
+                        f_scan / n as f64, f_target / n as f64, f_sl10 / n as f64
+                    );
+                }
+            }
             let mut v: Vec<_> = hist.into_iter().collect();
             v.sort_by_key(|(_, (c, g))| std::cmp::Reverse(*c.max(g)));
             v.truncate(6);
