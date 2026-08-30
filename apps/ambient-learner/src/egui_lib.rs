@@ -83,6 +83,7 @@ pub struct LiveState {
 pub const EASE_RATE: f32 = 4.0;
 
 impl LiveState {
+
     pub fn new(snapshot: LiveSnapshot) -> LiveState {
         LiveState { shown: snapshot.temperature, shown_conf: snapshot.confidence, snapshot }
     }

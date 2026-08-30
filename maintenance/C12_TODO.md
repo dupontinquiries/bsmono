@@ -3007,3 +3007,40 @@ Reporting them as equivalent findings would inflate the work.
   query once outside the loop and compare with a case-insensitive
   `contains`, which Rust has no std method for. Worth doing when the
   picker gets a caller, not before.
+
+## 54. Perf: ambient-learner never let the phone sleep
+
+A different cost class from the allocation hunts: unconditional
+repaints. On a desktop they waste cycles; on a phone they hold the GPU
+awake in a pocket.
+
+`main.rs` ended every frame with an unconditional
+`request_repaint_after(33ms)` — a 30fps wake-up for the life of the
+process, on EVERY page, including ones with nothing moving on them.
+
+The redundancy is what gives it away. The live page already requests its
+own repaints from `dot.live` twenty lines above, and THAT call site
+documents the rule the timer broke: "the dot breathes only while
+something is reporting, so it is driven from the readings rather than
+from a timer."
+
+Now gated on `self.live.animating()`.
+
+**`animating()` already existed** — I wrote a duplicate before checking
+and removed it. The original is better than mine: it uses a 0.01
+threshold where I had guessed 0.05, and its doc names the failure the
+gate must avoid ("without it the animation stops whenever the pointer
+does, which looks like a freeze"). Second time this week that grepping
+before writing would have saved the work, and the same lesson as the
+`liaison` and `Roster` name collisions: check what exists before adding
+a sibling.
+
+The threshold matters more than it looks. `shown` approaches its target
+asymptotically and never compares equal, so an exact test would never
+stop asking for frames — the same bug wearing a different hat.
+
+- **C12-54a — the other repaint sites are NOT swept.** bo-suite has
+  five, hatch two, and several look gated already
+  (`if s.reveal() < 1.0 || s.halo() > 0.0`). `all_tracks.rs:247` and
+  `lib.rs:1199` are unconditional and unexamined; 1199 claims "the
+  stroke lives — it advances every frame", which may be honest.

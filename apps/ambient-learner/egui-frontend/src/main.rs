@@ -152,9 +152,24 @@ impl eframe::App for App {
                 }
             }
         });
-        // The live view eases toward its target, so it needs frames even when
-        // nothing is being touched.
-        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        // ONLY WHILE SOMETHING IS ANIMATING. This was unconditional at
+        // 33 ms — a 30fps wake-up for the life of the process, on EVERY
+        // page, including ones with nothing moving on them. On a phone
+        // that is the difference between an app that sleeps when idle and
+        // one that holds the GPU awake in a pocket.
+        //
+        // The redundancy is what gives it away: the live page already
+        // requests its own repaints from `dot.live` a few lines up, and
+        // that call site documents the rule this one broke — "the dot
+        // breathes only while something is reporting, so it is driven
+        // from the readings rather than from a timer".
+        //
+        // So the timer here was covering the OTHER easing: `self.live`'s
+        // own approach toward its target. Gated on that instead, which
+        // means a settled view stops asking for frames.
+        if self.live.animating() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
     }
 }
 
