@@ -118,6 +118,10 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
     }
 
     let mut g = Generator::new(&cfg, &dev)?;
+    // What `g` is currently shaped for. Tracked rather than re-derived,
+    // because after a rebuild the config no longer describes it.
+    let mut cur_frames = cfg.time_frames;
+    let mut cur_latent = cfg.latent;
     // try to load the newest checkpoint
     let latest = cfg.ckpt_dir.join("gen_latest.safetensors");
     if latest.exists() {
@@ -156,8 +160,53 @@ fn gen_loop(cfg: Config, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>) -> R
         };
 
         if let Some(path) = weights_req {
-            match load_generator(&mut g, &path, &dev) {
-                Ok(()) => shared.lock().unwrap().loaded_label = path.display().to_string(),
+            // ADOPT THE CHECKPOINT'S OWN GEOMETRY. `g` was built from the
+            // running config, so a checkpoint trained at a different
+            // `time_frames` could not load into it at all — the failure
+            // was `shape mismatch in set, lhs: [8192, 128], rhs: [81920,
+            // 128]`, printed once per frame, naming neither the setting
+            // nor the fix. 8192 is 64 frames (the config default), 81920
+            // is 640 (what that checkpoint was trained with).
+            //
+            // The file states its own shape — `g.fc.w` is
+            // `[g_filters * h0 * w0, latent]` — so the generator is
+            // REBUILT to match rather than the person being asked for a
+            // hint. A hint field would be a second place to be wrong
+            // about something the file already knows.
+            match candle_core::safetensors::load(&path, &dev)
+                .map_err(|e| e.to_string())
+                .and_then(|m| {
+                    match crate::model::checkpoint_shape(&m, cfg.g_filters, cfg.n_mels) {
+                        Some(sh) if sh.time_frames != cur_frames || sh.latent != cur_latent => {
+                            let mut c2 = cfg.clone();
+                            c2.time_frames = sh.time_frames;
+                            c2.latent = sh.latent;
+                            let mut ng = Generator::new(&c2, &dev).map_err(|e| e.to_string())?;
+                            ng.load_state(&m).map_err(|e| e.to_string())?;
+                            eprintln!(
+                                "[gui] checkpoint is {} frames / latent {} — rebuilt to match \
+                                 (was {cur_frames}/{cur_latent})",
+                                sh.time_frames, sh.latent
+                            );
+                            Ok((ng, sh.time_frames, sh.latent))
+                        }
+                        // Same geometry, or a file that does not decompose:
+                        // load into the generator we have and let candle
+                        // report it if the shapes really disagree.
+                        _ => {
+                            let mut ng = Generator::new(&cfg, &dev).map_err(|e| e.to_string())?;
+                            ng.load_state(&m).map_err(|e| e.to_string())?;
+                            Ok((ng, cur_frames, cur_latent))
+                        }
+                    }
+                }) {
+                Ok((ng, frames, lat)) => {
+                    g = ng;
+                    cur_frames = frames;
+                    cur_latent = lat;
+                    let mut s = shared.lock().unwrap();
+                    s.loaded_label = format!("{} ({frames}f)", path.display());
+                }
                 Err(e) => eprintln!("[gui] load weights {path:?}: {e}"),
             }
         }

@@ -842,51 +842,45 @@ pub fn save_discriminator(d: &Discriminator, path: &std::path::Path) -> Result<(
     candle_core::safetensors::save(&m, path)
 }
 
+/// What geometry a checkpoint was trained with, read from the checkpoint.
+///
+/// `g.fc.w` is `[g_filters * h0 * w0, latent]`, and `h0`/`w0` are
+/// `n_mels/16` and `time_frames/16`. So the file states its own shape and
+/// nothing has to be guessed or configured — which is why this reads the
+/// checkpoint rather than adding a GUI field for a hint. A hint is a
+/// second place to be wrong, and the answer is already in the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CkptShape {
+    pub latent: usize,
+    pub time_frames: usize,
+}
+
+/// Recover it, given the `g_filters` and `n_mels` the caller will build
+/// with. Returns `None` when `g.fc.w` is absent or does not decompose —
+/// in which case candle's own error is the honest thing to show, because
+/// the file is not the shape this function assumes.
+pub fn checkpoint_shape(
+    m: &std::collections::HashMap<String, candle_core::Tensor>,
+    g_filters: usize,
+    n_mels: usize,
+) -> Option<CkptShape> {
+    let t = m.get("g.fc.w")?;
+    let dims = t.dims();
+    let (rows, latent) = (*dims.first()?, *dims.get(1)?);
+    let h0 = n_mels / 16;
+    let per_frame_block = g_filters.checked_mul(h0)?;
+    if per_frame_block == 0 || rows % per_frame_block != 0 {
+        return None;
+    }
+    let w0 = rows / per_frame_block;
+    Some(CkptShape { latent, time_frames: w0 * 16 })
+}
+
 pub fn load_generator(g: &mut Generator, path: &std::path::Path, dev: &Device) -> Result<()> {
     let m = candle_core::safetensors::load(path, dev)?;
-    // SAY WHAT THE MISMATCH MEANS. A checkpoint carries the geometry it was
-    // TRAINED with; the running config decides the geometry the generator was
-    // BUILT with. When they differ, candle reports a raw tensor shape error —
-    //
-    //   shape mismatch in set, lhs: [8192, 128], rhs: [81920, 128]
-    //
-    // — which names neither the setting that is wrong nor the value to set,
-    // and repeated once per frame it says nothing new eight times. Those two
-    // numbers are `time_frames * latent`: 8192 is 64 frames, 81920 is 640.
-    // The config default is 64 and the checkpoint was trained at 640, so the
-    // fix is a config change and the error should say so.
-    if let Some(want) = checkpoint_time_frames(&m, g.latent) {
-        if want != g.time_frames {
-            return Err(candle_core::Error::Msg(format!(
-                "checkpoint was trained with time_frames = {want}, this generator is built \
-                 for {have}. Set `time_frames = {want}` in the config (or load a checkpoint \
-                 trained at {have}) — the weights are fine, the geometry does not match.",
-                have = g.time_frames,
-            )));
-        }
-    }
     g.load_state(&m)
 }
 
-/// Recover the `time_frames` a checkpoint was trained with, from the first
-/// projection's row count. Returns `None` when the tensor is absent or the
-/// row count is not a whole number of frames — in which case the raw
-/// candle error is still the honest thing to show, since the shape does not
-/// decompose the way this function assumes.
-fn checkpoint_time_frames(
-    m: &std::collections::HashMap<String, candle_core::Tensor>,
-    latent: usize,
-) -> Option<usize> {
-    if latent == 0 {
-        return None;
-    }
-    let t = m.get("proj.weight").or_else(|| m.get("g.proj.weight"))?;
-    let rows = t.dims().first().copied()?;
-    if rows % latent != 0 {
-        return None;
-    }
-    Some(rows / latent)
-}
 
 pub fn load_discriminator(d: &mut Discriminator, path: &std::path::Path, dev: &Device) -> Result<()> {
     let m = candle_core::safetensors::load(path, dev)?;
@@ -954,6 +948,54 @@ pub fn load_discriminator(d: &mut Discriminator, path: &std::path::Path, dev: &D
 // rayon's, which defaults to every core, so nothing is capping it; and matmul
 // does take Parallelism::Rayon. The fc layer and the discriminator (whose convs
 // are all conv2d) are on the fast paths already.
+
+#[cfg(test)]
+mod ckpt_shape_tests {
+    use super::*;
+    use candle_core::{DType, Device, Tensor};
+
+    fn fc(rows: usize, latent: usize) -> std::collections::HashMap<String, Tensor> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "g.fc.w".to_string(),
+            Tensor::zeros((rows, latent), DType::F32, &Device::Cpu).unwrap(),
+        );
+        m
+    }
+
+    #[test]
+    fn the_real_640_frame_checkpoint_reports_640_frames() {
+        // The actual numbers from checkpoints-epoch337-640frames:
+        // g.fc.w is [81920, 128], trained at g_filters 256, n_mels 128.
+        // 81920 = 256 * (128/16) * (640/16) = 256 * 8 * 40.
+        let got = checkpoint_shape(&fc(81920, 128), 256, 128);
+        assert_eq!(got, Some(CkptShape { latent: 128, time_frames: 640 }));
+    }
+
+    #[test]
+    fn the_config_default_reports_its_own_64_frames() {
+        // The other half of the mismatch the GUI kept printing: 8192 is
+        // 64 frames, which is what the default config builds.
+        let got = checkpoint_shape(&fc(8192, 128), 256, 128);
+        assert_eq!(got, Some(CkptShape { latent: 128, time_frames: 64 }));
+    }
+
+    #[test]
+    fn a_file_that_does_not_decompose_returns_none() {
+        // Better to hand back None and let candle report the real shape
+        // error than to invent a frame count from a row count that is not
+        // a whole number of frames — a confidently wrong rebuild is
+        // harder to debug than an honest mismatch.
+        assert_eq!(checkpoint_shape(&fc(81921, 128), 256, 128), None);
+        assert!(checkpoint_shape(&std::collections::HashMap::new(), 256, 128).is_none());
+    }
+
+    #[test]
+    fn zero_filters_or_mels_is_not_a_divide_by_zero() {
+        assert_eq!(checkpoint_shape(&fc(81920, 128), 0, 128), None);
+        assert_eq!(checkpoint_shape(&fc(81920, 128), 256, 0), None);
+    }
+}
 
 #[cfg(test)]
 mod tests {
