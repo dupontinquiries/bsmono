@@ -88,6 +88,7 @@ pub fn run() -> i32 {
         "merge" => cmd_native_merge(rest),
         "spread" => cmd_spread(rest),
         "repack" => cmd_repack(rest),
+        "migrate" => cmd_migrate(rest),
         "var" => cmd_var(rest),
         "app" => cmd_app(rest),
         "check" => cmd_check(rest),
@@ -645,6 +646,77 @@ fn label_for(kind: &str, idx: usize, oid: &str, rref: &str) -> String {
         "oid" => oid[..oid.len().min(8)].to_string(),
         "branch" => rref.to_string(),
         _ => format!("head{:02}", idx + 1),
+    }
+}
+
+/// `gin migrate` — move delta-hostile files out of git's object store and
+/// into the chunk store. Plan by default; `--apply` executes; `--untrack`
+/// additionally `git rm --cached`s each file and shields it in .gitignore.
+/// `--restore <path>` writes a migrated file's exact bytes back; `--list`
+/// prints the migration record. History is never rewritten here.
+fn cmd_migrate(rest: &[String]) -> i32 {
+    use gitmind_core::migrate;
+    let repo = match open_repo() { Ok(r) => r, Err(e) => return err(&e) };
+
+    if flag(rest, "--list") {
+        return match migrate::migrated(repo.root()) {
+            Ok(entries) => {
+                for e in entries {
+                    println!("{}  {:>12}  {}", &e.blob_oid[..12], e.size, e.path);
+                }
+                0
+            }
+            Err(e) => err(&e),
+        };
+    }
+    if let Some(path) = opt(rest, "--restore") {
+        let store = match open_store(&repo) { Ok(s) => s, Err(e) => return err(&e) };
+        return match migrate::restore_file(repo.root(), &store, path, None) {
+            Ok(n) => { println!("restored {path} ({n} bytes)"); 0 }
+            Err(e) => err(&e),
+        };
+    }
+
+    let mut cfg = migrate::MigrateConfig::defaults();
+    cfg.untrack = flag(rest, "--untrack");
+    if let Some(ms) = opt(rest, "--min-size") {
+        match ms.parse::<u64>() {
+            Ok(v) => cfg.min_size = v,
+            Err(_) => return err("--min-size takes bytes"),
+        }
+    }
+    let plan = match migrate::scan(&repo, &cfg) { Ok(p) => p, Err(e) => return err(&e) };
+    if plan.candidates.is_empty() {
+        println!("no delta-hostile tracked files ≥ {} bytes — nothing to migrate", cfg.min_size);
+        return 0;
+    }
+    for c in &plan.candidates {
+        let why = match &c.reason {
+            migrate::Reason::CompressedFormat(e) => format!(".{e} (compressed format)"),
+            migrate::Reason::HighEntropy(b) => format!("entropy {b:.2} b/B"),
+        };
+        println!("{:>12}  {:<26} {}", c.size, why, c.path);
+    }
+    println!("{} file(s), {} bytes total", plan.candidates.len(), plan.total_bytes);
+
+    if !flag(rest, "--apply") {
+        println!("plan only — re-run with --apply (add --untrack to stop git tracking them)");
+        return 0;
+    }
+    let store = match open_store(&repo) { Ok(s) => s, Err(e) => return err(&e) };
+    match migrate::apply(&repo, &store, &plan, &cfg) {
+        Ok(r) => {
+            let pct = if r.bytes_ingested > 0 {
+                100.0 * r.bytes_stored as f64 / r.bytes_ingested as f64
+            } else { 0.0 };
+            println!(
+                "migrated {} file(s): {} bytes in, {} new bytes stored ({pct:.0}% — dedup + raw/zstd), {} untracked",
+                r.files, r.bytes_ingested, r.bytes_stored, r.untracked
+            );
+            println!("record: .gitmind/migrated.jsonl  (restore any file with `gin migrate --restore <path>`)");
+            0
+        }
+        Err(e) => err(&e),
     }
 }
 
@@ -1272,6 +1344,8 @@ fn print_help(prog: &str) {
     println!("  spread <path> [--last N|--revs a,b|--branches] [--into dir] [--tree]");
     println!("                              lay several versions side by side ({{head01}}--file) for native viewers");
     println!("  repack [--min-gain 0.05]    cross-file delta-compress the store (storage only, oids unchanged)");
+    println!("  migrate [--apply] [--untrack] [--min-size N] [--restore <path>] [--list]");
+    println!("                              move delta-hostile files (media/archives/high-entropy) into the chunk store");
     println!("  var stash [dir] [--name N] [--pin] | restore <name> [--into dir] | list | pin/unpin <name>");
     println!("                              system-wide dedup cache for build artifacts (target/, node_modules)");
     println!("  app install <name> <bin> | build <name> [commit] | use <name> <label> | list | log | run | desktop | remove");
