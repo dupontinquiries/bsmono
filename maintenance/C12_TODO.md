@@ -3831,3 +3831,54 @@ in §60 and right afterwards.
 - **C71a — the fleet total is now stale.** §70's 142 was measured before
   this fix; snapclone alone drops 9. Worth re-running before treating
   any of those counts as a workload.
+
+## 72. Where CADscope went
+
+Asked to add CADscope to the gitmind fleet and the monorepo. Traced it
+first, and the answer is that **it was never in the monorepo to lose**.
+
+What the history says:
+
+  - `git log --diff-filter=A -- "*cadscope*"` returns NOTHING. No
+    CADscope source file was ever added to this tree.
+  - `BRANCH_INDEX.md` lists `import/cadscope` as "three docs + the
+    corpus refs", and `corpus/cadscope-main` as "the CADscope reference
+    corpus, 760 commits". Both are listed under **Preserved refs
+    (nothing lost)**.
+  - Those refs are GONE from this clone: `git branch -a` shows only
+    `main` and `origin/main`. So the preservation the doc promised did
+    not survive whatever produced this working copy.
+  - `apps/cadscope/IMPORT_NOTE.md`, referenced by the index, does not
+    exist either — it lived on the missing `import/cadscope` branch.
+
+And a decision, in `b1a13ca3`:
+
+    the CADscope corpus was built ON logscope using the bundle as an
+    egui-kit reference — derived, not upstream. Neither needs merging
+    into main, and both stay as refs so the lineage survives without
+    pretending it is pending work.
+
+So CADscope is a 760-commit fork of logscope that was deliberately kept
+OUT of main as a reference corpus.
+
+**What I did NOT do, and why:** adding a `cadscope` entry to
+`flow::store_groups` would put a name in the fleet catalog with no
+`apps/cadscope` behind it. Every other entry there resolves to a real
+directory — `ops::resolve_app_dir` discovers apps/ or games/ at build
+time — so a phantom entry produces a build target that fails on every
+fleet run, for every device, with a confusing error about a missing
+crate. That is worse than its absence.
+
+**What is actually needed** is the source, which is not in this clone:
+  - the `corpus/cadscope-main` bundle, or
+  - the `import/cadscope` branch (three docs + refs), or
+  - any CADscope working tree the operator still has.
+
+Given any of those, adding it is mechanical: a directory under `apps/`,
+one string in the `coding` group, and the fleet picks it up.
+
+- **C72a — the vanished refs are worth checking on the operator's own
+  clone.** `BRANCH_INDEX.md` promises they exist; here they do not. If
+  they are gone everywhere, the 760-commit history the index calls
+  "almost certainly skydribble's real development history" is gone with
+  them, and that is a bigger loss than the app.
