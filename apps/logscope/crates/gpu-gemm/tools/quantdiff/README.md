@@ -90,3 +90,28 @@ is a bounds check and a `try_into().unwrap()` panic path per element, and a loop
 does not vectorise. `chunks_exact` gives the compiler a known-width window and no failure path.
 
     f16  14.45 -> 8.92 ms      f32  5.19 -> 3.98 ms
+
+## Third pass: the per-token matvec, and what did NOT work
+
+`dot_q4_k` runs per token per row, so it matters far more than anything at load time. Measured with
+`dotbench` (512 rows x k=4096, 20 reps): **2.40 Gmac/s**.
+
+Two hypotheses, both tested, one wrong:
+
+  * The loop-invariant `if half == 0` inside the 32-wide inner loop. The disassembly showed a mixed
+    loop (18 vector vs 25 scalar instructions). Unswitching it into two straight-line loops:
+    2.40 -> 2.98 Gmac/s. Real, but small.
+  * Baseline x86-64 being SSE2, so the `u8 x i8 -> i32` widening has no `pmaddubsw`. **Wrong.**
+    Rebuilt with `-C target-cpu=native` (avx2 + fma + ssse3): 2.66 vs 2.67 Gmac/s — no difference
+    at all. The loop is not width-limited, so an AVX2 dispatch would have bought nothing and the
+    obvious next move was the wrong one.
+
+A measurement bug of mine, worth recording: the first version of `dotbench` filled blocks with
+random bytes, which makes the f16 `d`/`dmin` inf or NaN. NaN arithmetic can be an order of magnitude
+slower, so that benchmark was partly measuring the FPU's exception path. Blocks now carry finite
+scales. It happened not to change the conclusion here, which is luck rather than method.
+
+Where the remaining gap is has not been established. At ~1 MAC/cycle the loop is running at scalar
+throughput while the data sits in L2, so it is neither bandwidth- nor width-bound — the cost is
+somewhere in the per-group overhead (128 groups per row, each with its own scale unpack and setup).
+That is the next thing to measure, and it needs a profiler rather than another guess.

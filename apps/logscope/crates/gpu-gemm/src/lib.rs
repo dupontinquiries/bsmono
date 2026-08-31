@@ -5292,12 +5292,14 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                                 let (d1, mm1) = (d * sc1 as f32, dmin * m1 as f32);
                                 let (d2, mm2) = (d * sc2 as f32, dmin * m2 as f32);
                                 for half in 0..2 {
-                                    for l in 0..32 {
-                                        let nib = if half == 0 { (q[qoff + l] & 0xF) as f32 }
-                                                  else { (q[qoff + l] >> 4) as f32 };
-                                        let (dd, mm) = if half == 0 { (d1, mm1) } else { (d2, mm2) };
-                                        grp[l] = dd.mul_add(nib, -mm);
-                                    }
+                                    // Same FMA dispatch as the dequantiser: on baseline x86-64
+                                    // `mul_add` is a call into compiler_builtins' `fmaf`, measured
+                                    // 8x. The value expression itself must not change — a single
+                                    // ULP here crosses a quantisation boundary in the re-quantiser
+                                    // below (gate-q4k: 297430 differing words).
+                                    let (dd, mm) = if half == 0 { (d1, mm1) } else { (d2, mm2) };
+                                    let nibs: &[u8; 32] = q[qoff..qoff + 32].try_into().unwrap();
+                                    crate::fmapath::q4k_group(&mut grp, nibs, half == 0, dd, mm);
                                     let amax = grp.iter().fold(0f32, |a, &v| a.max(v.abs()));
                                     // MULTIPLY BY THE RECIPROCAL, exactly as quantize_q8_resident
                                     // does. amax / 127.0 differs from amax * (1/127.0) by one ULP,

@@ -70,6 +70,34 @@ pub fn with_fma<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Expand one 32-nibble Q4_K group to floats, under hardware FMA where available.
+///
+/// Shared by the dequantiser's transcode path so the FMA dispatch is written once. `low` selects
+/// the low nibble half; `dd`/`mm` are the group's already-scaled multiplier and min.
+#[inline(always)]
+fn q4k_group_core(out: &mut [f32; 32], nibs: &[u8; 32], low: bool, dd: f32, mm: f32) {
+    if low {
+        for (o, &n) in out.iter_mut().zip(nibs.iter()) { *o = dd.mul_add((n & 0xF) as f32, -mm); }
+    } else {
+        for (o, &n) in out.iter_mut().zip(nibs.iter()) { *o = dd.mul_add((n >> 4) as f32, -mm); }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma")]
+unsafe fn q4k_group_fma(out: &mut [f32; 32], nibs: &[u8; 32], low: bool, dd: f32, mm: f32) {
+    q4k_group_core(out, nibs, low, dd, mm)
+}
+
+pub fn q4k_group(out: &mut [f32; 32], nibs: &[u8; 32], low: bool, dd: f32, mm: f32) {
+    #[cfg(target_arch = "x86_64")]
+    if has_fma() {
+        // SAFETY: guarded by the runtime detection this line performs.
+        return unsafe { q4k_group_fma(out, nibs, low, dd, mm) };
+    }
+    q4k_group_core(out, nibs, low, dd, mm)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +139,26 @@ mod tests {
         assert_eq!(unfused, 0.0, "the unfused form cancels");
         assert_ne!(fused, 0.0, "the fused form keeps the low bits — that is the whole point");
         assert_ne!(fused.to_bits(), unfused.to_bits());
+    }
+
+    /// The shared group expander must produce exactly what the inline `mul_add` did — this is the
+    /// path whose one-ULP differences gate-q4k measured as 297430 differing words.
+    #[test]
+    fn the_group_expander_is_bit_identical_to_the_inline_form() {
+        let nibs: [u8; 32] = std::array::from_fn(|i| (i * 37 % 251) as u8);
+        let (dd, mm) = (0.0234567f32, 0.789f32);
+        for low in [true, false] {
+            let mut want = [0f32; 32];
+            for (i, w) in want.iter_mut().enumerate() {
+                let n = if low { nibs[i] & 0xF } else { nibs[i] >> 4 };
+                *w = dd.mul_add(n as f32, -mm);
+            }
+            let mut got = [0f32; 32];
+            super::q4k_group(&mut got, &nibs, low, dd, mm);
+            assert_eq!(want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                       got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                       "low={low}: the dispatched expander changed a value");
+        }
     }
 
     #[test]
