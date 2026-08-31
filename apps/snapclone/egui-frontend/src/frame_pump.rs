@@ -475,3 +475,91 @@ mod tests {
         assert_eq!(latency_ms(&f, 900), 0, "a backwards clock must not underflow");
     }
 }
+
+// ── writing a frame out ─────────────────────────────────────────────────────
+
+/// Encode a frame as binary PPM (P6).
+///
+/// This lived in the binary, untested. A malformed header or a miscounted
+/// pixel run means every saved snap is a file nothing will open, and the
+/// person finds out when they try to look at one — long after the moment
+/// they were trying to keep.
+///
+/// PPM because it needs no encoder: a JPEG or PNG writer is a dependency
+/// and a decision about quality, and this is the fallback path for a
+/// device with no camera stack to speak of. It is large and it is
+/// universally readable, which is the right trade for "save what we just
+/// captured".
+///
+/// A frame with no pixels yields a VALID, empty-bodied PPM rather than
+/// nothing — `width`/`height` still describe what the camera claimed, and
+/// a zero-byte file would be indistinguishable from a failed write.
+pub fn ppm_bytes(f: &RawFrame) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20 + (f.width as usize * f.height as usize * 3));
+    out.extend_from_slice(format!("P6\n{} {}\n255\n", f.width, f.height).as_bytes());
+    // RGBA to RGB: PPM has no alpha, and the camera's is opaque anyway.
+    for px in f.rgba.chunks_exact(4) {
+        out.extend_from_slice(&px[..3]);
+    }
+    out
+}
+
+#[cfg(test)]
+mod ppm_tests {
+    use super::*;
+
+    fn frame(w: u32, h: u32) -> RawFrame {
+        let mut px = Vec::new();
+        for i in 0..(w * h) {
+            // A recognisable pattern, so a channel swap shows up as wrong
+            // colours rather than as "some bytes".
+            px.extend_from_slice(&[(i % 251) as u8, 7, 200, 255]);
+        }
+        RawFrame {
+            width: w, height: h, captured_ms: 0, seq: 0,
+            rgba: px.into(),
+        }
+    }
+
+    #[test]
+    fn the_header_and_the_body_agree_about_the_size() {
+        // A header promising more pixels than follow is the failure that
+        // makes a viewer show a truncated image or refuse the file.
+        let f = frame(4, 3);
+        let b = ppm_bytes(&f);
+        let header = b"P6\n4 3\n255\n";
+        assert!(b.starts_with(header), "{:?}", &b[..12.min(b.len())]);
+        assert_eq!(b.len() - header.len(), 4 * 3 * 3, "body is the wrong length");
+    }
+
+    #[test]
+    fn alpha_is_dropped_and_the_channels_keep_their_order() {
+        // Writing BGR would produce a file that opens perfectly and looks
+        // wrong, which is worse than one that fails.
+        let f = frame(1, 1);
+        let b = ppm_bytes(&f);
+        assert_eq!(&b[b.len() - 3..], &[0, 7, 200], "channels reordered");
+    }
+
+    #[test]
+    fn a_frame_with_no_pixels_is_still_a_valid_file() {
+        // A zero-byte file is indistinguishable from a failed write. The
+        // header still says what the camera claimed.
+        let f = RawFrame { width: 2, height: 2, captured_ms: 0, seq: 0,
+                           rgba: Vec::new().into() };
+        let b = ppm_bytes(&f);
+        assert!(b.starts_with(b"P6\n2 2\n255\n"));
+        assert_eq!(b.len(), 11);
+    }
+
+    #[test]
+    fn a_trailing_partial_pixel_is_dropped_rather_than_padded() {
+        // `chunks_exact` leaves a remainder. Emitting it would put one or
+        // two stray bytes after the last pixel and push the body past what
+        // the header promised.
+        let f = RawFrame { width: 1, height: 1, captured_ms: 0, seq: 0,
+                           rgba: vec![1, 2, 3, 4, 9, 9].into() };
+        let b = ppm_bytes(&f);
+        assert_eq!(b.len(), b"P6\n1 1\n255\n".len() + 3);
+    }
+}

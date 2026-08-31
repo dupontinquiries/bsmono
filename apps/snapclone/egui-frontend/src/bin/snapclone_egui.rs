@@ -720,7 +720,7 @@ impl App {
                             // what the local file holds. A second encoding
                             // path is a second thing that can differ subtly
                             // from the photo you looked at.
-                            self.last_snap = Some(ppm_bytes(&f));
+                            self.last_snap = Some(snapclone_egui::frame_pump::ppm_bytes(&f));
                             save_ppm(&f)
                         }
                         Some(_) => Err("the frame arrived torn".to_string()),
@@ -907,16 +907,6 @@ impl App {
 /// Write one frame as binary PPM under the app's data dir, named by wall
 /// clock so a burst of presses cannot overwrite each other within a second
 /// (the millisecond field sees to that).
-fn ppm_bytes(f: &snapclone_egui::frame_pump::RawFrame) -> Vec<u8> {
-    let mut out = Vec::with_capacity(20 + (f.width * f.height * 3) as usize);
-    out.extend_from_slice(format!("P6\n{} {}\n255\n", f.width, f.height).as_bytes());
-    // RGBA to RGB: PPM has no alpha, and the camera's alpha is opaque anyway.
-    for px in f.rgba.chunks_exact(4) {
-        out.extend_from_slice(&px[..3]);
-    }
-    out
-}
-
 fn save_ppm(f: &snapclone_egui::frame_pump::RawFrame) -> Result<String, String> {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -924,7 +914,7 @@ fn save_ppm(f: &snapclone_egui::frame_pump::RawFrame) -> Result<String, String> 
     let dir = config_kit::data_dir("snapclone").join("snaps");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join(format!("snap-{ms}.ppm"));
-    std::fs::write(&path, ppm_bytes(f)).map_err(|e| format!("{}: {e}", path.display()))?;
+    std::fs::write(&path, snapclone_egui::frame_pump::ppm_bytes(f)).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path.display().to_string())
 }
 
