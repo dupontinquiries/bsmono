@@ -1282,6 +1282,13 @@ pub struct AgentConfig {
     /// to the workspace it builds; `run_agent_cfg` takes a caller-built workspace and leaves it alone.
     pub model_label: String,
     pub model_params: Option<u64>,
+    /// The worker's STANCE, from `coordinator::plan()` — how this branch should approach its unit,
+    /// as distinct from the tool protocol every branch shares. Empty for an ordinary run.
+    ///
+    /// It exists because the planner produces a system prompt per worker and there was nowhere to
+    /// put it: a runner that dropped it would fan out the work and discard the only thing that made
+    /// the branches different from each other.
+    pub persona: String,
 }
 
 impl Default for AgentConfig {
@@ -1307,6 +1314,7 @@ impl Default for AgentConfig {
             keep_recent_turns: 3,
             model_label: String::new(),
             model_params: None,
+            persona: String::new(),
         }
     }
 }
@@ -1924,6 +1932,10 @@ you. Favor code that compiles over clever code that might not; when you see erro
         format!("\n\n{}", crate::hectormode::HECTOR_MODE_GUIDE)
     } else { String::new() };
     // Turn-0 context: the workspace tree + shared crew docs, so no model starts blind.
+    // The planner's stance for THIS branch, ahead of the workspace overview so the worker reads how
+    // to approach its unit before it reads the repository it will approach.
+    let persona_note = if cfg.persona.trim().is_empty() { String::new() }
+        else { format!("\n\nHOW TO APPROACH THIS UNIT:\n{}", cfg.persona.trim()) };
     let ctx_note = if cfg.context.is_empty() { String::new() }
         else { format!("\n\nWORKSPACE OVERVIEW (you can read any of these with the tools above):\n{}", cfg.context) };
     let patch_note = if cfg.prefer_patches {
@@ -2006,7 +2018,7 @@ Rules:
 - After each tool call you will see its result, then decide the next step.
 - When the task is finished and verified, reply with the single line: {DONE_MARKER}
 
-Emit one or a few tool calls per turn, then wait for results.{patch_note}{verify_note}{doc_note}{hector_note}{ctx_note}"
+Emit one or a few tool calls per turn, then wait for results.{patch_note}{verify_note}{doc_note}{hector_note}{persona_note}{ctx_note}"
     )
 }
 
@@ -2758,9 +2770,23 @@ impl AgentFan {
     /// a branch's unified diff for the review pass (in production: `git -C <dir> diff <base>`; in tests: a
     /// canned string). Nothing is submitted yet; call `next` to get the first branch to run.
     pub fn new(specs: Vec<(PathBuf, String, String)>, cfg: &AgentConfig, diff_fn: Box<dyn Fn(&Path) -> String>) -> Self {
-        let task = specs.first().map(|(_, t, _)| t.clone()).unwrap_or_default();
-        let branches = specs.into_iter().map(|(dir, task, label)| {
-            let (run, first) = AgentRun::start(dir, &task, cfg.clone());
+        let planned = specs.into_iter().map(|(d, t, l)| (d, t, l, String::new())).collect();
+        Self::planned(planned, cfg, diff_fn)
+    }
+
+    /// A fan whose branches each carry their own PERSONA — the per-worker stance from
+    /// `coordinator::plan()`. `new` is this with every persona empty.
+    ///
+    /// Per-branch config rather than one shared cfg, because the planner's whole output is that the
+    /// branches differ: a fan built from a plan and then run with one identical prompt is a fan that
+    /// discarded the plan.
+    pub fn planned(specs: Vec<(PathBuf, String, String, String)>, cfg: &AgentConfig,
+                   diff_fn: Box<dyn Fn(&Path) -> String>) -> Self {
+        let task = specs.first().map(|(_, t, _, _)| t.clone()).unwrap_or_default();
+        let branches = specs.into_iter().map(|(dir, task, label, persona)| {
+            let mut c = cfg.clone();
+            c.persona = persona;
+            let (run, first) = AgentRun::start(dir, &task, c);
             AgentBranch { run, state: BranchState::Ready(first), label, verdict: None }
         }).collect();
         Self { branches, cursor: 0, in_flight: Vec::new(), width: 1, phase: Phase::Running, task, cfg: cfg.clone(), diff_fn }
@@ -5023,5 +5049,46 @@ mod long_horizon_tests {
         let r = ws.apply(&tools[0]);
         assert!(r.ok && r.output.contains("PATCH SUMMARY"), "{}", r.output);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    // ── the planner, consumed ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_planned_fan_gives_each_branch_its_own_persona() {
+        let d = tmp("fanpersona");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        let specs = vec![
+            (d.clone(), "unit a".to_string(), "src/a.rs".to_string(), "think like a parser author".to_string()),
+            (d.clone(), "unit b".to_string(), "src/b.rs".to_string(), "think like a test writer".to_string()),
+        ];
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, ..Default::default() };
+        let fan = AgentFan::planned(specs, &cfg, Box::new(|_| String::new()));
+        assert_eq!(fan.len(), 2);
+        // The personas must reach the branches' prompts — a fan built from a plan and then run with
+        // one identical prompt has discarded the plan.
+        let p0 = system_prompt("unit a", &AgentConfig { persona: "think like a parser author".into(), ..cfg.clone() });
+        assert!(p0.contains("HOW TO APPROACH THIS UNIT"));
+        assert!(p0.contains("think like a parser author"));
+        let plain = system_prompt("unit a", &cfg);
+        assert!(!plain.contains("HOW TO APPROACH THIS UNIT"), "an ordinary run gets no persona block");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// End to end through the real modules: plan text → parsed steps → subtasks → worker prompts,
+    /// with each worker told about its siblings. This is the path that was broken by one absent
+    /// input, not by a missing runner.
+    #[test]
+    fn a_parsed_plan_becomes_sibling_aware_worker_prompts() {
+        let plan = parse_plan("```plan\n1. rewrite src/parse.rs\n2. rewrite src/emit.rs\n```");
+        assert_eq!(plan.steps.len(), 2);
+        let steps: Vec<String> = plan.steps.iter().map(|s| s.text.clone()).collect();
+        let task = crate::planrun::task_from_steps("make it build", &steps, "shared: struct Ast");
+        let (bs, _) = crate::planrun::branches(logscope_fan::coordinator::Mode::Coordinator, &task, 4);
+        assert_eq!(bs.len(), 2, "two plan steps, two workers");
+        assert_eq!(bs[0].label, "src/parse.rs");
+        assert!(bs[0].goal.contains("src/emit.rs"), "worker 1 knows about worker 2: {}", bs[0].goal);
+        assert!(bs[1].goal.contains("src/parse.rs"), "and the reverse");
+        assert!(bs[0].goal.contains("struct Ast"), "shared context reaches both");
     }
 }

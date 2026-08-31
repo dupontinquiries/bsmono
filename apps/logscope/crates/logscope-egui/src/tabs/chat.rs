@@ -3392,15 +3392,51 @@ which file you read.\n\n",
             self.note = format!(":{label} — the model is busy (:stop to cancel)");
         } else {
             let base_goal = self.msgs.iter().rev().find(|m| m.role == Role::User).map(|m| m.text().to_string()).unwrap_or_else(|| task.clone());
-            let goals = crate::workspace_exec::seed_agent_branches(&task, &base_goal, 4);
-            let goals = if goals.is_empty() { vec![task.clone()] } else { goals };
+
+            // BRANCHES FROM THE PLANNER, when there is a plan to work from.
+            //
+            // `coordinator::plan()` has never been consumed, and the reason was one missing input:
+            // it fans out over `Task.subtasks` and nothing produced subtasks, so it always degraded
+            // to the single worker every caller already had. The plan the model wrote — parsed on
+            // turn one, its steps carrying the files they name — is that input. Using it means the
+            // same plan the operator read both fans the work out and decides afterwards whether it
+            // was done.
+            //
+            // Falls back to the reaction seeder when there is no plan yet: a fan asked for before
+            // any run has planned anything still has to do something sensible.
+            let plan_steps: Vec<String> = self.agent_plan.iter().map(|(t, _)| t.clone())
+                .filter(|t| !t.trim().is_empty()).collect();
+            let planned = if plan_steps.len() >= 2 {
+                let t = crate::planrun::task_from_steps(&base_goal, &plan_steps, &self.agent_context());
+                let (bs, dropped) = crate::planrun::branches(self.coord_mode, &t, 4);
+                let runs = crate::planrun::run_count(self.coord_mode, &t, 4);
+                if dropped > 0 || runs > bs.len() {
+                    // best_of multiplies invisibly and the cap truncates invisibly; say both before
+                    // spending the time rather than after.
+                    self.note = format!("{label}: {} branch(es){}{} — planned from {} plan step(s)",
+                        bs.len(),
+                        if dropped > 0 { format!(", {dropped} dropped over the cap") } else { String::new() },
+                        if runs > bs.len() { format!(", {runs} model runs with best-of") } else { String::new() },
+                        plan_steps.len());
+                }
+                bs
+            } else { Vec::new() };
+
+            let goals: Vec<(String, String, String)> = if !planned.is_empty() {
+                planned.into_iter().map(|b| (b.goal, b.label, b.system)).collect()
+            } else {
+                let seeded = crate::workspace_exec::seed_agent_branches(&task, &base_goal, 4);
+                let seeded = if seeded.is_empty() { vec![task.clone()] } else { seeded };
+                seeded.into_iter().enumerate()
+                    .map(|(i, g)| (g, format!("branch {}", i + 1), String::new())).collect()
+            };
             let session = self.gitmind_session.as_ref().unwrap();
             let mount = match crate::mount::detect(&session.project) { Ok(m) => m, Err(e) => { self.note = format!(":{label} — {e}"); return; } };
             let fan_root = std::env::temp_dir().join("logscope-fan");
             let mut specs = Vec::new();
-            for (i, goal) in goals.iter().enumerate() {
+            for (i, (goal, blabel, persona)) in goals.iter().enumerate() {
                 match crate::mount::isolate(&mount, &fan_root.join(format!("branch{i}"))) {
-                    Ok(ws) => specs.push((ws.dir.clone(), goal.clone(), format!("branch {}", i + 1))),
+                    Ok(ws) => specs.push((ws.dir.clone(), goal.clone(), blabel.clone(), persona.clone())),
                     Err(e) => { self.note = format!(":{label} — isolate failed: {e}"); return; }
                 }
             }
@@ -3410,7 +3446,7 @@ which file you read.\n\n",
                     .map(|o| String::from_utf8_lossy(&o.stdout).chars().take(8000).collect())
                     .unwrap_or_default()
             });
-            let mut fan = crate::workspace_exec::AgentFan::new(specs, &cfg, diff_fn);
+            let mut fan = crate::workspace_exec::AgentFan::planned(specs, &cfg, diff_fn);
             self.agent_candidates.clear();
             self.agent_task = task.clone();
             self.fan_is_docs = doc_fan;
@@ -8177,7 +8213,7 @@ if let Some(msg) = self.error_banner.clone() {
                                 ui.add_space(6.0);
                             }
                             ui.separator();
-                            ui.label(RichText::new("Coordinator modes fan one task out to parallel workers over the same loaded model — no extra models needed. The per-mode line above says what each one changes today; `coordinator::plan()` builds a full worker plan for every mode and no runner consumes it yet, which is the single gap behind most of them.").color(theme::FAINT()).small());
+                            ui.label(RichText::new("Coordinator modes fan one task out to parallel workers over the same loaded model — no extra models needed. The per-mode line above says what each one changes today. `coordinator::plan()` now drives the fan: the steps of the plan your model wrote become the units it splits the work into, so a fan is only as good as the plan above it — and the same steps decide afterwards which ones were actually done.").color(theme::FAINT()).small());
                             // Replicator is the exception to that sentence and says so where the
                             // sentence is, rather than leaving the operator to discover that one
                             // entry behaves differently from the other seven.

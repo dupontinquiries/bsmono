@@ -193,6 +193,7 @@ pub use logscope_fan::coordinator; // gui gate was vestigial: zero gui refs (fan
 #[allow(dead_code)] pub mod workspace_exec; // pure (std-only agent loop over an isolated tmp workspace) → not gui-gated
 pub mod phase_guide; // engmode's Fsm wired to the agent loop: observation → signal, phase → prompt (StatefulGuide)
 pub mod plancheck;   // is a plan step actually DONE? decided from what the run wrote, not from turns elapsing
+pub mod planrun;     // plan steps → coordinator subtasks → runnable branches (the planner's missing caller)
 pub mod workergen; // corpus-recombined workers plus a hand-tuned legendary roster
 pub mod matrix;  // rows a message falls through, columns it can take, a director at each branch
 pub mod liaison; // operator-said vs organization-knows; the narrow protocol from the design note
