@@ -2792,6 +2792,16 @@ impl Game {
         // measured on the way here: the hull's extents and wheel radius
         // from the model, treads from `turret`, wheels/thrusters and the
         // mode from `locomotion`. One more step, no new measurement.
+        //
+        // TRAITS RIDE ALONGSIDE THE GEOMETRY, same source as the
+        // compaction-style lookup elsewhere in this file
+        // (`bot_categories` -> `Traits::from_category`) — a tank's high
+        // traction and a racer's low one used to make zero difference to
+        // actual handling (flagged in TODO.md as dead data); this is
+        // that wiring.
+        let traits = self.bot_categories.get(self.cars.names[m])
+            .map(|c| crate::chassis_traits::Traits::from_category(c))
+            .unwrap_or_default();
         self.car.hand = driveline::derive(driveline::Shape {
             half_len: self.car.half_len,
             half_w: self.car.half_w,
@@ -2802,6 +2812,8 @@ impl Game {
             hovering: self.car.hover.is_some(),
             flying: self.car.flight,
             thrusters: self.loco_mode.thrusters,
+            traction: traits.traction,
+            mass_bias: traits.mass_bias,
         });
         let h = self.car.hand;
         self.toastf(&format!(

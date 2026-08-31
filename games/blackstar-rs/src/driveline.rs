@@ -70,6 +70,46 @@ pub struct Shape {
     pub hovering: bool,
     pub flying: bool,
     pub thrusters: usize,
+    /// From `chassis_traits::Traits::traction` (0..1). NOT the same
+    /// thing as the local `traction` variable the wheeled branch below
+    /// derives from contact-patch count — that one is real geometry,
+    /// this one is the category label's opinion, and they are blended
+    /// rather than one replacing the other. 0.6 (the same neutral value
+    /// `Traits::default()` returns for an uncategorised chassis) is a
+    /// no-op: `apply_traits` maps 0.6 to a 1.0 multiplier exactly, so a
+    /// chassis nobody's given a category to still drives exactly as it
+    /// did before this field existed.
+    pub traction: f32,
+    /// From `chassis_traits::Traits::mass_bias` (0..1, 0.5 = centred).
+    /// Applied as a small penalty to `turn`: a mass concentrated toward
+    /// either end has more yaw inertia than one centred, so it resists
+    /// changing its heading more — same physical direction as square-
+    /// cube's effect on `accel`, just for rotation instead of
+    /// translation. 0.5 is a no-op.
+    pub mass_bias: f32,
+}
+
+/// Blend the category-label traits into an already-derived `Handling`,
+/// after the branch-specific physics above has set its own baseline —
+/// this rides ON TOP of that the same way the whole module rides on top
+/// of `CarCfg` (see the module doc), not instead of it. Called at every
+/// return point in `derive` rather than restructured into one, since
+/// each branch (aircraft/hover/tracked/wheeled) returns early with its
+/// own physics and there is no single common tail to hook instead.
+///
+/// GUESSED, same as everything else this file labels as taste rather
+/// than physics: the *existence* of a traction->grip and mass_bias->turn
+/// relationship is defensible from first principles (more contact
+/// commitment should grip more; more yaw inertia should turn slower),
+/// but the exact multiplier magnitudes (0.5 and 0.15 below) are a
+/// first-pass guess sized to be noticeable without being able to
+/// override what the branch-specific geometry already decided, not a
+/// number checked against how any specific chassis should feel.
+fn apply_traits(out: &mut Handling, s: &Shape) {
+    let traction_mul = 1.0 + (s.traction.clamp(0.0, 1.0) - 0.6) * 0.5;
+    out.grip = (out.grip * traction_mul).clamp(0.25, 2.2);
+    let bias_dev = (s.mass_bias.clamp(0.0, 1.0) - 0.5).abs() * 2.0;
+    out.turn = (out.turn * (1.0 - bias_dev * 0.15)).clamp(0.35, 1.6);
 }
 
 /// Multipliers applied over the player's `CarCfg`. 1.0 is "the car the
@@ -229,6 +269,7 @@ pub fn derive(s: Shape) -> Handling {
         // wing loading again, inverted: big wings, big g
         out.grip = (1.3 - fast * 0.35).clamp(0.6, 1.3);
         out.why = "aircraft: wing loading, thrust-to-weight, aspect ratio";
+        apply_traits(&mut out, &s);
         return out;
     }
 
@@ -243,6 +284,7 @@ pub fn derive(s: Shape) -> Handling {
         out.grip = 0.35;
         out.turn = 0.75;
         out.why = "cushion: no patch to grip, none to drag either";
+        apply_traits(&mut out, &s);
         return out;
     }
 
@@ -258,6 +300,7 @@ pub fn derive(s: Shape) -> Handling {
         // is never graceful
         out.turn = 0.85;
         out.why = "treads: one long patch, all grip and no top end";
+        apply_traits(&mut out, &s);
         return out;
     }
 
@@ -283,6 +326,7 @@ pub fn derive(s: Shape) -> Handling {
     } else {
         "wheels: gearing and patches"
     };
+    apply_traits(&mut out, &s);
     out
 }
 
@@ -301,6 +345,8 @@ mod tests {
             hovering: false,
             flying: false,
             thrusters: 0,
+            traction: 0.6,
+            mass_bias: 0.5,
         }
     }
 
@@ -377,6 +423,8 @@ mod tests {
             hovering: false,
             flying: true,
             thrusters: 2,
+            traction: 0.6,
+            mass_bias: 0.5,
         };
         let mut wing = dart;
         wing.half_w = 6.0; // same fuselage, big span
@@ -403,11 +451,69 @@ mod tests {
             hovering: false,
             flying: true,
             thrusters: 1,
+            traction: 0.6,
+            mass_bias: 0.5,
         };
         let mut four = one;
         four.thrusters = 4;
         let (a, b) = (derive(one), derive(four));
         assert!(b.twr > a.twr * 3.0, "nozzle count did not reach thrust");
         assert!(b.accel > a.accel, "more thrust did not accelerate harder");
+    }
+
+    #[test]
+    fn neutral_traits_are_a_no_op() {
+        // 0.6/0.5 are Traits::default()'s own values, for an
+        // uncategorised chassis -- these must reproduce the exact
+        // pre-trait-wiring numbers, or every chassis without a fleet.json
+        // category silently changes handling the moment this lands.
+        let mut baseline = car();
+        baseline.traction = 0.6;
+        baseline.mass_bias = 0.5;
+        let mut untouched = car();
+        untouched.traction = 0.6;
+        untouched.mass_bias = 0.5;
+        let (a, b) = (derive(baseline), derive(untouched));
+        assert_eq!(a.grip, b.grip);
+        assert_eq!(a.turn, b.turn);
+        // and specifically: matches what the reference car scored before
+        // traits existed (the_reference_car_is_left_alone's own bound)
+        assert!((a.grip - 1.0).abs() < 0.15, "neutral traction moved grip: {}", a.grip);
+        assert!((a.turn - 1.0).abs() < 0.25, "neutral mass_bias moved turn: {}", a.turn);
+    }
+
+    #[test]
+    fn high_traction_grips_more_low_traction_grips_less() {
+        let mut high = car();
+        high.traction = 0.95; // chassis_traits.rs's own tank figure
+        let mut low = car();
+        low.traction = 0.20; // chassis_traits.rs's own hoverer figure
+        let (h, l) = (derive(high), derive(low));
+        assert!(h.grip > l.grip, "higher traction did not grip more: {} vs {}", h.grip, l.grip);
+        // and it rides ON TOP of the geometry-derived grip rather than
+        // replacing it: a wheeled chassis with more contact patches
+        // should still out-grip one with fewer, at the same traction
+        let mut six_wheels = car();
+        six_wheels.wheels = 6;
+        six_wheels.traction = 0.6;
+        let four_wheels_same_traction = car();
+        assert!(
+            derive(six_wheels).grip > derive(four_wheels_same_traction).grip,
+            "traction wiring swallowed the geometry term"
+        );
+    }
+
+    #[test]
+    fn mass_bias_off_centre_costs_some_turn() {
+        let centred = car(); // 0.5, no-op
+        let mut nose_heavy = car();
+        nose_heavy.mass_bias = 0.9;
+        let mut tail_heavy = car();
+        tail_heavy.mass_bias = 0.1;
+        let (c, n, t) = (derive(centred), derive(nose_heavy), derive(tail_heavy));
+        assert!(n.turn < c.turn, "nose-heavy did not cost any turn: {} vs {}", n.turn, c.turn);
+        assert!(t.turn < c.turn, "tail-heavy did not cost any turn: {} vs {}", t.turn, c.turn);
+        // symmetric: equally off-centre either way costs the same
+        assert!((n.turn - t.turn).abs() < 1e-4, "bias direction should not matter, only distance from centre");
     }
 }
