@@ -6654,11 +6654,11 @@ impl Game {
 
         for &(pos, big) in &ev.pad_hits {
             self.fx.pad_sparkle(pos, big);
-            self.snd.fire(if big { Sfx::PadBig } else { Sfx::PadSmall });
+            self.fire_at(if big { Sfx::PadBig } else { Sfx::PadSmall }, pos, 1.0);
         }
         for &(pos, n, sp) in ev.bounces.iter().take(3) {
             self.fx.dust(pos - n * physics::BALL_R * 0.9, n, sp);
-            self.snd.fire(Sfx::Bounce(sp));
+            self.fire_at(Sfx::Bounce(sp), pos, 1.0);
         }
         // ---- style analyzer: name what just happened ----
         {
@@ -6695,9 +6695,9 @@ impl Game {
             }
         }
 
-        for &(_, sp) in ev.touches.iter().take(1) {
+        for &(tp, sp) in ev.touches.iter().take(1) {
             if sp > 0.7 {
-                self.snd.fire(Sfx::Touch(sp));
+                self.fire_at(Sfx::Touch(sp), tp, 1.0);
             }
         }
         if ev.jumped {
@@ -6840,7 +6840,7 @@ impl Game {
             }
         }
         if let Some(p) = ev.flip_reset {
-            self.snd.fire(Sfx::CarRing);
+            self.fire_at(Sfx::CarRing, p, 1.0);
             self.fx.pad_sparkle(p, false);
             self.toastf("FLIP RESET");
         }
@@ -7082,8 +7082,46 @@ impl Game {
         hud::draw_hotbar(ui, aspect, &self.hotbar);
     }
 
+    /// Fire a sound that happened AT A PLACE in the world.
+    ///
+    /// The listener is the camera, not the car: you hear from where you are
+    /// looking from, which is what makes a chase camera's audio agree with
+    /// its picture. Occlusion is marched against the world SDF, so a shot
+    /// on the far side of a hull arrives muffled instead of arriving clean.
+    ///
+    /// Falls back to a centred cue when the mixer drops the emitter (out of
+    /// range, or budgeted out) — dropping the SOUND would be wrong for the
+    /// one-shots that are also gameplay feedback.
+    fn fire_at(&self, sfx: sound::Sfx, pos: Vec3, volume: f32) {
+        let cam = self.cam.pos;
+        let fwd = (self.cam.look - cam).normalize_or_zero();
+        let right = fwd.cross(self.cam.up).normalize_or_zero();
+        let listener = mixer::Listener {
+            pos: cam.to_array(),
+            forward: fwd.to_array(),
+            right: right.to_array(),
+        };
+        let mut e = mixer::Emitter::shot(0, pos.to_array(), volume);
+        // Occlusion is the expensive part (an SDF march per cue), so it is
+        // only paid for cues far enough away to plausibly have something in
+        // between — a bounce at your feet cannot be behind a wall.
+        let d = (pos - cam).length();
+        if d > 6.0 {
+            let steps = (d * 0.5).clamp(8.0, 48.0) as u32;
+            e.occluded_by =
+                mixer::occlusion_march(cam.to_array(), pos.to_array(), steps, |p| {
+                    self.world.sdf(Vec3::from_array(p))
+                });
+        }
+        match mixer::mix(&listener, &[e], 1).first() {
+            Some(v) => self.snd.fire_cue(sound::Cue::at(sfx, v)),
+            None => self.snd.fire(sfx),
+        }
+    }
+
     /// Floating name tags over remote cars.
     fn peer_tags(&self, ui: &mut Vec<UiVert>, vp: Mat4, aspect: f32) {
+
         if !self.net.online() {
             return;
         }

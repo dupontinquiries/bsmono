@@ -27,10 +27,43 @@ pub enum Sfx {
     XformSnap,
 }
 
+/// A sound event plus where it landed in the mix.
+///
+/// The MIXING happens on the game thread, in `mixer` — pure, tested, and
+/// checkable in a sandbox with no audio device. What crosses to the audio
+/// thread is the ANSWER: two channel gains and a filter cutoff. That keeps
+/// the callback dumb (no world queries, no allocation, no distance math on
+/// the realtime thread) and keeps the part that can be wrong in the part
+/// that can be tested.
+#[derive(Clone, Copy, Debug)]
+pub struct Cue {
+    pub sfx: Sfx,
+    pub gain_l: f32,
+    pub gain_r: f32,
+    /// One-pole cutoff in Hz; 20 kHz means "open", i.e. no filtering.
+    pub cutoff_hz: f32,
+}
+
+impl Cue {
+    /// Centred, unfiltered, full gain — the right answer for anything
+    /// attached to the listener: your own engine, your own jump, the UI.
+    pub fn centred(sfx: Sfx) -> Cue {
+        // equal-power centre, so a centred cue and a panned one at the same
+        // distance carry the same power rather than the centre being louder
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        Cue { sfx, gain_l: c, gain_r: c, cutoff_hz: 20_000.0 }
+    }
+
+    /// From a mixed voice — position, occlusion and all.
+    pub fn at(sfx: Sfx, v: &crate::mixer::Voice) -> Cue {
+        Cue { sfx, gain_l: v.gain_l, gain_r: v.gain_r, cutoff_hz: v.cutoff_hz }
+    }
+}
+
 // ======================================================================
 #[cfg(feature = "audio")]
 mod imp {
-    use super::Sfx;
+    use super::{Cue, Sfx};
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::mpsc::{channel, Receiver, Sender};
@@ -62,7 +95,7 @@ mod imp {
     pub struct Sound {
         _stream: Option<cpal::Stream>,
         params: Arc<Params>,
-        tx: Sender<Sfx>,
+        tx: Sender<Cue>,
         pub volume: f32,
         pub music_on: bool,
     }
@@ -80,7 +113,7 @@ mod imp {
                 master: AtomicU32::new(if muted { 0.0f32 } else { volume }.to_bits()),
                 music: AtomicBool::new(music_on),
             });
-            let (tx, rx) = channel::<Sfx>();
+            let (tx, rx) = channel::<Cue>();
             let stream = if muted { None } else { build_stream(params.clone(), rx) };
             if !muted && stream.is_none() {
                 eprintln!("audio: no output device / unsupported format — running silent");
@@ -115,12 +148,40 @@ mod imp {
             self.params.music.store(on, Ordering::Relaxed);
         }
 
+        /// A non-positional cue: your own body, your own UI. Centred.
         pub fn fire(&self, s: Sfx) {
-            let _ = self.tx.send(s);
+            let _ = self.tx.send(Cue::centred(s));
+        }
+
+        /// A cue that happened SOMEWHERE — already mixed by `mixer`.
+        pub fn fire_cue(&self, c: Cue) {
+            let _ = self.tx.send(c);
         }
     }
 
-    fn build_stream(params: Arc<Params>, rx: Receiver<Sfx>) -> Option<cpal::Stream> {
+    /// Lay a stereo pair into however many channels the device actually has.
+    ///
+    /// MONO DEVICES MUST NOT LOSE THE RIGHT CHANNEL. A 1-channel device (and
+    /// they exist — some Bluetooth headsets, some phone speakers) would
+    /// otherwise be handed `l` only, which silently deletes everything panned
+    /// hard right. Downmix instead. Beyond two channels the extra outputs
+    /// (centre, LFE, surrounds) are left silent rather than fed a copy: a
+    /// duplicate in the surrounds collapses the image the pan just created.
+    fn write_frame<T: Copy>(frame: &mut [T], l: f32, r: f32, conv: impl Fn(f32) -> T) {
+        match frame.len() {
+            0 => {}
+            1 => frame[0] = conv((l + r) * std::f32::consts::FRAC_1_SQRT_2),
+            _ => {
+                frame[0] = conv(l);
+                frame[1] = conv(r);
+                for out in frame.iter_mut().skip(2) {
+                    *out = conv(0.0);
+                }
+            }
+        }
+    }
+
+    fn build_stream(params: Arc<Params>, rx: Receiver<Cue>) -> Option<cpal::Stream> {
         let host = cpal::default_host();
         let device = host.default_output_device()?;
         let cfg = device.default_output_config().ok()?;
@@ -134,10 +195,8 @@ mod imp {
                     &cfg.into(),
                     move |data: &mut [f32], _| {
                         for frame in data.chunks_mut(ch) {
-                            let s = synth.sample();
-                            for out in frame.iter_mut() {
-                                *out = s;
-                            }
+                            let (l, r) = synth.sample();
+                            write_frame(frame, l, r, |v| v);
                         }
                     },
                     err,
@@ -149,10 +208,8 @@ mod imp {
                     &cfg.into(),
                     move |data: &mut [i16], _| {
                         for frame in data.chunks_mut(ch) {
-                            let s = (synth.sample().clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-                            for out in frame.iter_mut() {
-                                *out = s;
-                            }
+                            let (l, r) = synth.sample();
+                            write_frame(frame, l, r, |v| (v.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
                         }
                     },
                     err,
@@ -164,11 +221,10 @@ mod imp {
                     &cfg.into(),
                     move |data: &mut [u16], _| {
                         for frame in data.chunks_mut(ch) {
-                            let s = synth.sample().clamp(-1.0, 1.0);
-                            let v = ((s * 0.5 + 0.5) * u16::MAX as f32) as u16;
-                            for out in frame.iter_mut() {
-                                *out = v;
-                            }
+                            let (l, r) = synth.sample();
+                            write_frame(frame, l, r, |v| {
+                                ((v.clamp(-1.0, 1.0) * 0.5 + 0.5) * u16::MAX as f32) as u16
+                            });
                         }
                     },
                     err,
@@ -191,12 +247,40 @@ mod imp {
         noise: f32,  // 0 = pure tone, 1 = pure noise
         phase: f32,
         second: f32, // extra partial mix (adds sparkle to chimes)
+        // ---- placement, from the Cue that spawned it -------------------
+        // Per-voice rather than per-frame: a chime fired while you were
+        // facing it should FINISH where it started, not swing across the
+        // stereo field because the camera turned during its tail.
+        gain_l: f32,
+        gain_r: f32,
+        /// one-pole coefficient for the muffle filter; 1.0 = open
+        lp_k: f32,
+        lp: f32,
+    }
+
+    impl Voice {
+        /// A voice with no placement yet. `Synth::spawn` stamps the live
+        /// cue's gains onto it — every literal in `handle` describes the
+        /// SOUND, and nothing in there should have to know about panning.
+        fn unplaced() -> Voice {
+            Voice {
+                t: 0.0, dur: 0.0, f0: 0.0, f1: 0.0, amp: 0.0, noise: 0.0,
+                phase: 0.0, second: 0.0,
+                gain_l: std::f32::consts::FRAC_1_SQRT_2,
+                gain_r: std::f32::consts::FRAC_1_SQRT_2,
+                lp_k: 1.0, lp: 0.0,
+            }
+        }
     }
 
     struct Synth {
         sr: f32,
+        /// placement of the cue currently being handled; `spawn` reads it
+        cue_l: f32,
+        cue_r: f32,
+        cue_k: f32,
         params: Arc<Params>,
-        rx: Receiver<Sfx>,
+        rx: Receiver<Cue>,
         voices: Vec<Voice>,
         // continuous layers
         eng_phase: f32,
@@ -219,7 +303,7 @@ mod imp {
     }
 
     impl Synth {
-        fn new(sr: f32, params: Arc<Params>, rx: Receiver<Sfx>) -> Synth {
+        fn new(sr: f32, params: Arc<Params>, rx: Receiver<Cue>) -> Synth {
             Synth {
                 sr,
                 params,
@@ -241,6 +325,9 @@ mod imp {
                 pad_phase: [0.0; 3],
                 g_music: 0.0,
                 poll: 0,
+                cue_l: std::f32::consts::FRAC_1_SQRT_2,
+                cue_r: std::f32::consts::FRAC_1_SQRT_2,
+                cue_k: 1.0,
             }
         }
 
@@ -254,56 +341,79 @@ mod imp {
             (x as f32 / u32::MAX as f32) * 2.0 - 1.0
         }
 
-        fn spawn(&mut self, v: Voice) {
+        fn spawn(&mut self, mut v: Voice) {
             if self.voices.len() < 32 {
+                // The cue being handled decides where this voice sits. Stamped
+                // once, at spawn, and never revisited: a chime fired while you
+                // faced it should finish where it started rather than sweep
+                // across the field because the camera turned during its tail.
+                v.gain_l = self.cue_l;
+                v.gain_r = self.cue_r;
+                v.lp_k = self.cue_k;
+                v.lp = 0.0;
                 self.voices.push(v);
             }
         }
 
-        fn handle(&mut self, s: Sfx) {
+        /// One-pole low-pass coefficient for a cutoff in Hz.
+        /// At/above Nyquist the filter is open and this is exactly 1.0, so an
+        /// unoccluded cue costs nothing and cannot tint the sound.
+        fn lp_coeff(&self, cutoff_hz: f32) -> f32 {
+            if !cutoff_hz.is_finite() || cutoff_hz >= self.sr * 0.5 {
+                return 1.0;
+            }
+            let k = 1.0 - (-std::f32::consts::TAU * cutoff_hz / self.sr).exp();
+            k.clamp(0.0, 1.0)
+        }
+
+        fn handle(&mut self, c: Cue) {
+            self.cue_l = if c.gain_l.is_finite() { c.gain_l.clamp(0.0, 4.0) } else { 0.0 };
+            self.cue_r = if c.gain_r.is_finite() { c.gain_r.clamp(0.0, 4.0) } else { 0.0 };
+            self.cue_k = self.lp_coeff(c.cutoff_hz);
+            let s = c.sfx;
             match s {
                 Sfx::Bounce(sp) => {
                     let a = (sp / 18.0).clamp(0.05, 1.0);
-                    self.spawn(Voice { t: 0.0, dur: 0.22 + a * 0.1, f0: 150.0 + a * 90.0, f1: 80.0, amp: 0.5 * a, noise: 0.12, phase: 0.0, second: 0.3 });
+                    self.spawn(Voice { t: 0.0, dur: 0.22 + a * 0.1, f0: 150.0 + a * 90.0, f1: 80.0, amp: 0.5 * a, noise: 0.12, phase: 0.0, second: 0.3, ..Voice::unplaced() });
                 }
                 Sfx::Touch(sp) => {
                     let a = (sp / 14.0).clamp(0.06, 1.0);
-                    self.spawn(Voice { t: 0.0, dur: 0.09, f0: 95.0, f1: 60.0, amp: 0.42 * a, noise: 0.45, phase: 0.0, second: 0.0 });
+                    self.spawn(Voice { t: 0.0, dur: 0.09, f0: 95.0, f1: 60.0, amp: 0.42 * a, noise: 0.45, phase: 0.0, second: 0.0, ..Voice::unplaced() });
                 }
                 Sfx::Chime(combo) => {
                     let lift = 1.0 + 0.059 * combo.min(9) as f32; // pitch climbs with the combo
-                    self.spawn(Voice { t: 0.0, dur: 0.55, f0: 690.0 * lift, f1: 690.0 * lift, amp: 0.30, noise: 0.0, phase: 0.0, second: 0.55 });
-                    self.spawn(Voice { t: 0.0, dur: 0.75, f0: 1035.0 * lift, f1: 1035.0 * lift, amp: 0.22, noise: 0.0, phase: 0.0, second: 0.4 });
+                    self.spawn(Voice { t: 0.0, dur: 0.55, f0: 690.0 * lift, f1: 690.0 * lift, amp: 0.30, noise: 0.0, phase: 0.0, second: 0.55, ..Voice::unplaced() });
+                    self.spawn(Voice { t: 0.0, dur: 0.75, f0: 1035.0 * lift, f1: 1035.0 * lift, amp: 0.22, noise: 0.0, phase: 0.0, second: 0.4, ..Voice::unplaced() });
                 }
                 Sfx::CarRing => {
-                    self.spawn(Voice { t: 0.0, dur: 0.3, f0: 520.0, f1: 640.0, amp: 0.14, noise: 0.05, phase: 0.0, second: 0.3 });
+                    self.spawn(Voice { t: 0.0, dur: 0.3, f0: 520.0, f1: 640.0, amp: 0.14, noise: 0.05, phase: 0.0, second: 0.3, ..Voice::unplaced() });
                 }
                 Sfx::PadSmall => {
-                    self.spawn(Voice { t: 0.0, dur: 0.1, f0: 900.0, f1: 1150.0, amp: 0.16, noise: 0.0, phase: 0.0, second: 0.2 });
+                    self.spawn(Voice { t: 0.0, dur: 0.1, f0: 900.0, f1: 1150.0, amp: 0.16, noise: 0.0, phase: 0.0, second: 0.2, ..Voice::unplaced() });
                 }
                 Sfx::PadBig => {
-                    self.spawn(Voice { t: 0.0, dur: 0.4, f0: 320.0, f1: 980.0, amp: 0.26, noise: 0.0, phase: 0.0, second: 0.35 });
+                    self.spawn(Voice { t: 0.0, dur: 0.4, f0: 320.0, f1: 980.0, amp: 0.26, noise: 0.0, phase: 0.0, second: 0.35, ..Voice::unplaced() });
                 }
                 Sfx::Jump => {
-                    self.spawn(Voice { t: 0.0, dur: 0.13, f0: 220.0, f1: 130.0, amp: 0.2, noise: 0.5, phase: 0.0, second: 0.0 });
+                    self.spawn(Voice { t: 0.0, dur: 0.13, f0: 220.0, f1: 130.0, amp: 0.2, noise: 0.5, phase: 0.0, second: 0.0, ..Voice::unplaced() });
                 }
                 Sfx::Dodge => {
-                    self.spawn(Voice { t: 0.0, dur: 0.18, f0: 420.0, f1: 120.0, amp: 0.24, noise: 0.75, phase: 0.0, second: 0.0 });
+                    self.spawn(Voice { t: 0.0, dur: 0.18, f0: 420.0, f1: 120.0, amp: 0.24, noise: 0.75, phase: 0.0, second: 0.0, ..Voice::unplaced() });
                 }
                 Sfx::Horn => {
                     for (f, det) in [(174.6, 0.0), (176.1, 0.2), (87.3, 0.1)] {
-                        self.spawn(Voice { t: 0.0, dur: 0.85, f0: f + det, f1: f * 0.97, amp: 0.30, noise: 0.10, phase: 0.0, second: 0.65 });
+                        self.spawn(Voice { t: 0.0, dur: 0.85, f0: f + det, f1: f * 0.97, amp: 0.30, noise: 0.10, phase: 0.0, second: 0.65, ..Voice::unplaced() });
                     }
                 }
                 Sfx::Goal => {
                     for (f, amp, dur) in [(523.25, 0.26, 1.0), (659.25, 0.20, 0.9), (783.99, 0.18, 1.2), (130.8, 0.22, 0.6)] {
-                        self.spawn(Voice { t: 0.0, dur, f0: f, f1: f, amp, noise: 0.0, phase: 0.0, second: 0.5 });
+                        self.spawn(Voice { t: 0.0, dur, f0: f, f1: f, amp, noise: 0.0, phase: 0.0, second: 0.5, ..Voice::unplaced() });
                     }
                 }
                 Sfx::Land(sp) => {
                     let a = (sp / 12.0).clamp(0.0, 1.0);
                     if a > 0.08 {
-                        self.spawn(Voice { t: 0.0, dur: 0.14, f0: 70.0, f1: 45.0, amp: 0.5 * a, noise: 0.6, phase: 0.0, second: 0.0 });
+                        self.spawn(Voice { t: 0.0, dur: 0.14, f0: 70.0, f1: 45.0, amp: 0.5 * a, noise: 0.6, phase: 0.0, second: 0.0, ..Voice::unplaced() });
                     }
                 }
                 Sfx::XformFold(to_robot) => {
@@ -314,7 +424,7 @@ mod imp {
                     // the vehicle — the ear gets which way it's folding
                     // before the eye finishes the shot.
                     let (f0, f1) = if to_robot { (110.0, 360.0) } else { (360.0, 110.0) };
-                    self.spawn(Voice { t: 0.0, dur: 1.15, f0, f1, amp: 0.22, noise: 0.35, phase: 0.0, second: 0.5 });
+                    self.spawn(Voice { t: 0.0, dur: 1.15, f0, f1, amp: 0.22, noise: 0.35, phase: 0.0, second: 0.5, ..Voice::unplaced() });
                     self.spawn(Voice {
                         t: 0.0,
                         dur: 1.05,
@@ -324,18 +434,25 @@ mod imp {
                         noise: 0.25,
                         phase: 0.31,
                         second: 0.0,
+                        ..Voice::unplaced()
                     });
                 }
                 Sfx::XformSnap => {
                     // the landing beat: a bright metallic transient over a
                     // short low thump, fired the frame the fold finishes
-                    self.spawn(Voice { t: 0.0, dur: 0.16, f0: 1500.0, f1: 220.0, amp: 0.45, noise: 0.55, phase: 0.0, second: 0.0 });
-                    self.spawn(Voice { t: 0.0, dur: 0.28, f0: 95.0, f1: 55.0, amp: 0.35, noise: 0.2, phase: 0.0, second: 0.0 });
+                    self.spawn(Voice { t: 0.0, dur: 0.16, f0: 1500.0, f1: 220.0, amp: 0.45, noise: 0.55, phase: 0.0, second: 0.0, ..Voice::unplaced() });
+                    self.spawn(Voice { t: 0.0, dur: 0.28, f0: 95.0, f1: 55.0, amp: 0.35, noise: 0.2, phase: 0.0, second: 0.0, ..Voice::unplaced() });
                 }
             }
         }
 
         fn music_step(&mut self) {
+            // The score is not IN the world: reset placement to centred and
+            // open, or the pad inherits the pan and muffle of whichever shot
+            // happened to be the last cue handled.
+            self.cue_l = std::f32::consts::FRAC_1_SQRT_2;
+            self.cue_r = std::f32::consts::FRAC_1_SQRT_2;
+            self.cue_k = 1.0;
             // gentle pentatonic pluck, wandering by xorshift, resting often
             let scale = [0.0f32, 3.0, 5.0, 7.0, 10.0, 12.0, 15.0, 17.0];
             self.step = self.step.wrapping_add(1);
@@ -354,16 +471,22 @@ mod imp {
             let base = 220.0 * (2.0f32).powf(deg / 12.0);
             // proximity leans the plucks in; tension adds a high shimmer;
             // a mob adds war-drum weight. (The adaptive-audio seam in action.)
-            self.spawn(Voice { t: 0.0, dur: 0.9, f0: base, f1: base, amp: 0.085 * (1.0 + prox * 0.5), noise: 0.0, phase: 0.0, second: 0.25 });
+            self.spawn(Voice { t: 0.0, dur: 0.9, f0: base, f1: base, amp: 0.085 * (1.0 + prox * 0.5), noise: 0.0, phase: 0.0, second: 0.25, ..Voice::unplaced() });
             if tension > 0.4 && (x >> 16) % 3 == 0 {
-                self.spawn(Voice { t: 0.0, dur: 0.5, f0: base * 3.0, f1: base * 3.0, amp: 0.05 * tension, noise: 0.0, phase: 0.0, second: 0.6 });
+                self.spawn(Voice { t: 0.0, dur: 0.5, f0: base * 3.0, f1: base * 3.0, amp: 0.05 * tension, noise: 0.0, phase: 0.0, second: 0.6, ..Voice::unplaced() });
             }
             if self.step % 8 == 0 || (swarm > 0.3 && self.step % 4 == 0) {
-                self.spawn(Voice { t: 0.0, dur: 2.4, f0: 110.0, f1: 110.0, amp: 0.05 + swarm * 0.05, noise: swarm * 0.15, phase: 0.0, second: 0.2 });
+                self.spawn(Voice { t: 0.0, dur: 2.4, f0: 110.0, f1: 110.0, amp: 0.05 + swarm * 0.05, noise: swarm * 0.15, phase: 0.0, second: 0.2, ..Voice::unplaced() });
             }
         }
 
-        fn sample(&mut self) -> f32 {
+        /// One stereo frame.
+        ///
+        /// The continuous layers — engine, wind, boost, slide, the pad — stay
+        /// CENTRED on purpose: they are your own machine and your own head,
+        /// not things in the world, and panning them would make the cockpit
+        /// swim. Only one-shot voices carry placement.
+        fn sample(&mut self) -> (f32, f32) {
             // poll control messages every 64 samples
             self.poll = self.poll.wrapping_add(1);
             if self.poll & 63 == 0 {
@@ -388,7 +511,8 @@ mod imp {
             self.g_music += ((music_on as u32 as f32) - self.g_music) * k;
 
             let dt = 1.0 / self.sr;
-            let mut out = 0.0;
+            let mut out = 0.0;              // centred bus (engine/wind/music)
+            let (mut vl, mut vr) = (0.0f32, 0.0f32); // placed one-shots
 
             // ---- engine: two detuned saws through a one-pole low pass ----
             let f0 = 42.0 + self.g_engine * 118.0;
@@ -449,13 +573,19 @@ mod imp {
                     self.noise_state = x;
                     (x as f32 / u32::MAX as f32) * 2.0 - 1.0
                 };
-                out += (tone * (1.0 - v.noise) + nz * v.noise) * env * v.amp;
+                let raw = (tone * (1.0 - v.noise) + nz * v.noise) * env * v.amp;
+                // muffle: one-pole low-pass, open (k=1) when unoccluded
+                v.lp += (raw - v.lp) * v.lp_k;
+                let sig = v.lp;
+                vl += sig * v.gain_l;
+                vr += sig * v.gain_r;
                 i += 1;
             }
 
-            // soft clip
-            let s = out * master;
-            s / (1.0 + s.abs() * 0.6)
+            // centred bus + placed voices, soft-clipped per channel
+            let c = out * std::f32::consts::FRAC_1_SQRT_2;
+            let clip = |x: f32| { let s = x * master; s / (1.0 + s.abs() * 0.6) };
+            (clip(c + vl), clip(c + vr))
         }
     }
 }
@@ -463,7 +593,7 @@ mod imp {
 // ======================================================================
 #[cfg(not(feature = "audio"))]
 mod imp {
-    use super::Sfx;
+    use super::{Cue, Sfx};
 
     /// Silent stand-in with the same surface as the real thing.
     pub struct Sound {
@@ -484,7 +614,46 @@ mod imp {
             self.music_on = on;
         }
         pub fn fire(&self, _s: Sfx) {}
+        pub fn fire_cue(&self, _c: Cue) {}
     }
 }
 
 pub use imp::Sound;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_centred_cue_carries_the_same_power_as_a_panned_one() {
+        // If centred cues were (1.0, 1.0) they would be 3 dB louder than
+        // anything the mixer places, and every UI blip would duck the world.
+        let c = Cue::centred(Sfx::Jump);
+        let p = c.gain_l * c.gain_l + c.gain_r * c.gain_r;
+        assert!((p - 1.0).abs() < 1e-5, "centred power {p} != 1.0");
+        assert_eq!(c.cutoff_hz, 20_000.0, "a centred cue must not be filtered");
+    }
+
+    #[test]
+    fn a_cue_carries_the_mixers_placement_through_unchanged() {
+        // The seam: mixer decides, sound.rs applies. A Cue that quietly
+        // dropped the pan or the cutoff would leave the mixer's tests green
+        // and the game still mono — the exact failure this test exists for.
+        let l = crate::mixer::Listener {
+            pos: [0.0; 3],
+            forward: [0.0, 0.0, 1.0],
+            right: [1.0, 0.0, 0.0],
+        };
+        let mut e = crate::mixer::Emitter::shot(0, [20.0, 0.0, 4.0], 1.0);
+        e.occluded_by = 1.5;
+        let v = crate::mixer::mix(&l, &[e], 1);
+        let v = v.first().expect("the emitter was audible");
+        let c = Cue::at(Sfx::Bounce(4.0), v);
+        assert_eq!(c.gain_l, v.gain_l);
+        assert_eq!(c.gain_r, v.gain_r);
+        assert_eq!(c.cutoff_hz, v.cutoff_hz);
+        // and it really is placed: hard-ish right, and muffled
+        assert!(c.gain_r > c.gain_l * 1.5, "a source on the right did not pan right");
+        assert!(c.cutoff_hz < 20_000.0, "an occluded source was not muffled");
+    }
+}
