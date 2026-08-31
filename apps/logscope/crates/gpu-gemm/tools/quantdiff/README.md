@@ -71,3 +71,22 @@ arithmetic, same bits, one instruction.
 
 aarch64 was never affected: FMA is baseline in ARMv8, so `mul_add` already lowers to `fmla`. This
 was a desktop-x86 tax on a project that benchmarks on ARM.
+
+## Second pass: the scalar paths
+
+`f16_to_f32` is on every tensor a model loads — every norm weight, every F16 tensor, and every
+K-quant block scale. It had a data-dependent `while` loop to normalise subnormals plus three
+branches, so it neither pipelined nor vectorised. Replaced with the shift-and-scale trick
+(XNNPACK's `fp16_ieee_to_fp32_value`): 7.71 ms -> 2.68 ms over 5.24M values.
+
+That function has history — the subnormal-f16 bug in FIELD_NOTES decoded subnormal halves 4x small
+and produced word salad from Llama-3.2-1B while SmolLM2 stayed coherent on the same engine. So the
+replacement is verified EXHAUSTIVELY against the old implementation: all 65536 inputs, bit for bit,
+NaN payloads included. That takes milliseconds; there is no reason to sample a function with a
+16-bit domain.
+
+The F32 and F16 dispatch arms then became the bottleneck: `(0..n).map(|i| ... data[i * k ..] ...)`
+is a bounds check and a `try_into().unwrap()` panic path per element, and a loop with a panic in it
+does not vectorise. `chunks_exact` gives the compiler a known-width window and no failure path.
+
+    f16  14.45 -> 8.92 ms      f32  5.19 -> 3.98 ms
