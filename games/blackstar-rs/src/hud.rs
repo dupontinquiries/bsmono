@@ -531,9 +531,16 @@ pub const BIND_TOP: f32 = 0.76;
 pub const BIND_ROW_H: f32 = 0.062; // finger-sized; the list scrolls instead
 pub const MAPS_TOP: f32 = 0.70;
 pub fn maps_row_h() -> f32 {
-    // fixed: the map list scrolls rather than squeezing 30 rooms onto one page
-    0.058
+    // fixed: the map list scrolls rather than squeezing 30 rooms onto one page.
+    // 0.062, not 0.058: at 0.058 a 0.0574 glyph clears by 1%, about a third of
+    // a pixel at 1080p, and the list reads as a block rather than as rows.
+    // This was missed by the row-pitch table one commit ago because it is a
+    // FUNCTION and the table only walked constants — the same value, the same
+    // bug, hidden by a different shape.
+    MAPS_ROW_H
 }
+
+pub const MAPS_ROW_H: f32 = 0.062;
 
 /// The replay banner: what the game decided you just did.
 pub fn replay_banner(ui: &mut Vec<UiVert>, a: f32, title: &str, t: f32, total: f32) {
@@ -720,7 +727,7 @@ pub fn catalog_menu(
         }
         rows.push((false, i));
     }
-    let row_h = if wide { 0.052 } else { 0.046 };
+    let row_h = if wide { CAT_ROW_H } else { CAT_ROW_H_TALL };
     let top = if wide { 0.72 } else { 0.26 };
     // through the shared helper: this was the one panel with its own copy of
     // the formula, so it also missed `vis_rows`'s floor — a layout that ever
@@ -869,8 +876,20 @@ pub const GARAGE_TOP_TALL: f32 = 0.22;
 /// catalogue rows: the same numbers the drawing uses, so hit-testing agrees
 pub const CAT_TOP: f32 = 0.72;
 pub const CAT_TOP_TALL: f32 = 0.26;
-pub const CAT_ROW_H: f32 = 0.052;
-pub const CAT_ROW_H_TALL: f32 = 0.046;
+/// 0.062, was 0.052. `catalog_menu` draws rows at `T_BODY * ui_k(a)`, and
+/// `ui_k` clamps to 1.0 for any aspect at or above 1.70 — so at 16:9 a 0.0574
+/// glyph was being drawn in a 0.052 row and the rows OVERLAPPED, on every
+/// normal widescreen display, on the screen you pick a chassis from.
+///
+/// It survived the row-pitch sweep twice: the constants were not in the
+/// clearance table, and `catalog_menu` did not even use them — it repeated
+/// `0.052` and `0.046` as literals, so the constants here and the draw agreed
+/// only by coincidence, which is what the comment above about hit-testing was
+/// relying on.
+pub const CAT_ROW_H: f32 = 0.062;
+/// The narrow layout has less height, but a row that cannot hold its own text
+/// is not denser, it is unreadable. The list scrolls.
+pub const CAT_ROW_H_TALL: f32 = 0.062;
 pub const GARAGE_ROW_H: f32 = 0.082;
 
 /// The trials list: name, what it asks, which map, and your best.
@@ -1721,6 +1740,10 @@ mod tests {
             ("CONTROLS", BIND_ROW_H),
             ("TRIALS", TRIALS_ROW_H),
             ("ACADEMY", ACADEMY_ROW_H),
+            // via `maps_row_h()`, which is why it escaped the first sweep
+            ("MAPS", MAPS_ROW_H),
+            ("CATALOGUE", CAT_ROW_H),
+            ("CATALOGUE (narrow)", CAT_ROW_H_TALL),
         ] {
             assert!(
                 glyph < row_h,
@@ -1757,6 +1780,62 @@ mod tests {
     /// outside it.
     ///
     /// Escape is the first key a playtester presses.
+    /// THE TABLE HAS TO KNOW ABOUT EVERY ROW PITCH, or it is a table of the
+    /// ones somebody remembered.
+    ///
+    /// `maps_row_h()` sat at 0.058 through the sweep that fixed CONTROLS and
+    /// TRIALS, because it is a function returning a literal and the sweep
+    /// walked `pub const ... ROW_H` declarations. Same value, same bug, a
+    /// different shape. So this scans for the shape instead of trusting the
+    /// list, and fails when a pitch exists that the table above does not
+    /// name.
+    #[test]
+    fn no_row_pitch_escapes_the_clearance_table() {
+        let src = include_str!("hud.rs");
+        // needle assembled at runtime: a literal `ROW_H` in this test would
+        // match itself, which cost two attempts when the same scan pattern
+        // was added for Model::settle
+        let needle = format!("{}_H: f32 = 0.0", "ROW");
+        let mut found: Vec<String> = Vec::new();
+        for line in src.lines() {
+            if let Some(i) = line.find(&needle) {
+                let name: String = line[..i + 3]
+                    .rsplit(' ')
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches(':')
+                    .to_string();
+                found.push(name);
+            }
+        }
+        assert!(found.len() >= 5, "the scan found only {found:?} — it has stopped matching");
+
+        // AND THE DRAW MUST USE THEM. `catalog_menu` repeated `0.052` and
+        // `0.046` as literals while the constants sat beside it claiming to be
+        // "the same numbers the drawing uses" — they agreed by coincidence,
+        // and that duplication is why a row pitch smaller than its own glyph
+        // survived two sweeps. A constant nothing reads is a comment.
+        let body = &src[src.find("pub fn catalog_menu").unwrap_or(0)..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        assert!(
+            body.contains("CAT_ROW_H"),
+            "catalog_menu no longer uses CAT_ROW_H — it is back to a literal"
+        );
+        for stale in [format!("{{ 0.0{}2 }}", 5), format!("{{ 0.0{}6 }}", 4)] {
+            assert!(!body.contains(&stale), "catalog_menu has a literal row pitch: {stale}");
+        }
+        let tabled = [
+            "TW_ROW_H", "DECK_ROW_H", "BIND_ROW_H", "TRIALS_ROW_H", "ACADEMY_ROW_H",
+            "MAPS_ROW_H", "CAT_ROW_H", "CAT_ROW_H_TALL", "GARAGE_ROW_H",
+        ];
+        for f in &found {
+            assert!(
+                tabled.iter().any(|t| f.contains(t) || t.contains(f.as_str())),
+                "{f} is a row pitch the clearance table does not check"
+            );
+        }
+    }
+
     #[test]
     fn the_pause_screen_keeps_its_text_inside_its_panel() {
         let save = Save::default();

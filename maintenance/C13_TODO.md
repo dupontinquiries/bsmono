@@ -398,6 +398,16 @@ hand-placed screens still share the bug class:
   either, so the list read as a block. Both raised to 0.062.
   `ui_k` clamps at 1.0, so these are worst-case margins.
 
+  **A REAL OVERLAP WAS FOUND ON THE CHASSIS CATALOGUE.** `catalog_menu`
+  draws at `T_BODY * ui_k(a)`, and `ui_k` clamps to 1.0 for any aspect at
+  or above 1.70 — so at 16:9 a 0.0574 glyph sat in a 0.052 row and the
+  rows overlapped, on every normal widescreen display, on the screen you
+  pick a bot from. Raised to 0.062. It survived two sweeps because the
+  constants were not in the table AND `catalog_menu` did not use them —
+  it repeated the literals, so `CAT_ROW_H` and the draw agreed only by
+  coincidence. `no_row_pitch_escapes_the_clearance_table` now scans for
+  both: an untabled pitch, and a draw that has gone back to a literal.
+
   What is still unmeasured is the screens that are NOT uniform lists —
   the pause overlay, the garage and the map picker place labels at
   hand-chosen coordinates, which is where the rasteriser is the right
