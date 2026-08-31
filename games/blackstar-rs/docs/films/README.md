@@ -53,6 +53,25 @@ silent; then Billy's Sun Gun, which requires a human call on the final shot —
 but as an artificial solar event that lights the whole battlefield and shows its
 true scale for the first time.
 
+## Also here
+
+| file | status |
+|---|---|
+| `SCREENPLAY_INVENTORY.md` | **stale** — predates the 5–6 rewrite; still useful for Films 1–4 and 7–9 |
+| `SCREENPLAY_TO_GAME_INTEGRATION.md` | **a proposal** — its pipeline is sound, two of its claims about the code are not true |
+
+Each carries a status header saying exactly which parts to distrust.
+
+## One character the newest canon introduces and the game has never heard of
+
+**Meridian.** She speaks in both Films 5 and 6 — the sensor and tactical
+voice, and the one who says "Billy. This is it. You have one shot before
+their formation adapts." She has no `codex.rs` entry and no `content.rs`
+troop. Morpher, Billy, Aiden and Rodimus all do.
+
+That is the clearest single piece of work these documents imply: the current
+screenplays introduce a named character the shipped game cannot refer to.
+
 ## Provenance, and what is still missing
 
 Both files were extracted from a session transcript
@@ -65,6 +84,8 @@ Not recovered, and known to exist somewhere:
 
 * the other eleven screenplays, including the `renamed_screenplays/`
   set (name changes only, original stories intact)
+* **`src/saga.rs`** — the integration doc calls it the single source of truth
+  for the nine films and says it is already created. It is not in this tree.
 * `CANON_DISCREPANCY_NOTE.md`, which tracked exactly this supersession
 * the superseded `FILM_05_EMBER_DEEP` / `FILM_06_CONVERGENCE`, deliberately
   kept rather than deleted in case anything in them is still wanted
