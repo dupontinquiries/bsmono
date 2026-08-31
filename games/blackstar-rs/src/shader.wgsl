@@ -961,11 +961,47 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
             let fres = pow(1.0 - max(dot(n, v), 0.0), 4.0);
             f0 = mix(0.10, 0.72, fres);
         }
-        // low-spec objects trade the full reflection march for a sky-tinted
-        // sheen: visually a whisper, computationally half the glass bill
-        let cheap_refl = !is_terrain && f0 < 0.14;
-        let fres = f0 + (1.0 - f0) * pow(1.0 - max(dot(n, v), 0.0), 5.0);
-        let amount = clamp(fres, 0.0, 0.85) * step(0.06, f0);
+        // ROUGHNESS CAPS THE GRAZING FRESNEL, AND WETNESS IS THE ROUGHNESS.
+        //
+        // Schlick's `f0 + (1-f0)(1-cos)^5` drives EVERY surface to a perfect
+        // mirror at grazing incidence. True of smooth surfaces, false of
+        // rough ones: microfacets on a dry, broken surface scatter the
+        // grazing lobe instead of returning it, so the peak never lands.
+        //
+        // Terrain paid the whole price. `f0` for terrain was the map's
+        // WETNESS — 0.08 on MEADOW, a dry field — and the grazing term still
+        // took it to the 0.85 ceiling, because the exponent does not care
+        // what the surface is made of. A chase camera looks along the ground
+        // almost exclusively, so nearly every ground pixel was 85%
+        // reflection; and a large flat plane at a grazing angle has a huge
+        // screen-space spread in the reflected direction, so the curvature
+        // denoise below distrusted the trace and fell back to `sky_color`.
+        // The ground became the sky. That is the pale, horizon-less wash in
+        // the first live recording — and it also had every dry map paying
+        // for a full reflection march it could not benefit from.
+        //
+        // The confusion underneath was using ONE number for two physical
+        // quantities. Base reflectance at normal incidence and smoothness are
+        // independent: water's f0 is about 0.02, and what makes it a mirror
+        // at grazing is that it is SMOOTH, not that f0 is high. So:
+        //   f0      — dielectric, small, creeps up slightly with wetness
+        //   ceiling — the wetness itself: how close to a mirror it may get
+        // A dry meadow stays a meadow at every angle; OBSERVATORY's wet stone
+        // (0.50), LIGHTHOUSE's (0.40) and CRYPT's damp (0.30) still shine.
+        var ceiling = 1.0;
+        var reflective = f0 >= 0.06;
+        if (is_terrain) {
+            f0 = 0.02 + G.rt.w * 0.10;
+            ceiling = max(G.rt.w, f0);
+            // Below this a ground is dry: no visible sky in it, and no
+            // reason to spend a march finding that out. This is the terrain
+            // half of the 240 fps problem — dry maps stop tracing entirely.
+            reflective = G.rt.w >= 0.25;
+        }
+        let cheap_refl = f0 < 0.14 && (!is_terrain || ceiling < 0.30);
+        let fres = f0 + (ceiling - f0) * pow(1.0 - max(dot(n, v), 0.0), 5.0);
+        var amount = clamp(fres, 0.0, 0.85);
+        if (!reflective) { amount = 0.0; }
         if (amount > 0.03) {
             var rr = reflect(-v, n);
             if (glassy) {

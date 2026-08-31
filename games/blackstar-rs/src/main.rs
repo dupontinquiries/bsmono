@@ -86,6 +86,7 @@ mod mixer;
 mod model;
 mod net;
 mod online_screen;
+mod optics;
 mod physics;
 mod powers;
 mod platform;
