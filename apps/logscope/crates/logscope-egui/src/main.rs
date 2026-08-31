@@ -19,8 +19,12 @@ fn main() -> eframe::Result {
         "logscope",
         options,
         Box::new(|cc| {
-            match std::env::var("LOGSCOPE_THEME").ok()
-                .and_then(|name| logscope_egui::roomtheme::spaces().into_iter()
+            // PRECEDENCE: the env var overrides the saved space, which overrides the built-in
+            // default. An explicit LOGSCOPE_THEME on the command line is a deliberate one-off and
+            // must not be quietly outranked by a preference file — nor should it overwrite it.
+            let want = std::env::var("LOGSCOPE_THEME").ok()
+                .or_else(|| logscope_egui::prefs::load().space);
+            match want.and_then(|name| logscope_egui::roomtheme::spaces().into_iter()
                     .find(|p| p.name.eq_ignore_ascii_case(&name)))
             {
                 Some(p) => theme::install_palette(&cc.egui_ctx, p),

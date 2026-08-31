@@ -117,6 +117,7 @@ pub use logscope_fan::cmdpalette;
 #[cfg(feature = "gui")] pub mod model;
 #[cfg(feature = "gui")] pub mod theme;
 #[cfg(feature = "gui")] pub mod roomtheme;
+#[cfg(feature = "gui")] pub mod prefs;      // the few choices that must survive a restart (via config-kit)
 #[cfg(feature = "gui")] pub mod navkeys;    // freecam movement keys by keyboard layout (QWERTY WASD / Dvorak .oeu)
 #[cfg(feature = "gui")] pub mod nodetint;   // graph node colours derived from the space, audited for distinguishability  // chrome DERIVED from the room you are standing in, with a legibility audit over all 16
 #[cfg(feature = "gui")] pub mod ui;

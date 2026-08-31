@@ -1410,6 +1410,9 @@ pub struct Chat {
 }
 impl Default for Chat {
     fn default() -> Self {
+        // Read once, here. Loading per-field would stat the config file several times per
+        // construction for no benefit.
+        let saved_prefs = crate::prefs::load();
         Self {
             a11y: uikit_egui::a11y::A11yScene::new(),
             stamp_model: None,
@@ -1418,8 +1421,10 @@ impl Default for Chat {
             context: LONG_HORIZON.into(),
             threading: true, show_context: false, attach_log: true, fix_mode: false,
             right_page: RightPage::Prompting, coord_mode: crate::coordinator::Mode::Barebones,
-            profiles_manual: Vec::new(),
-            nav_layout: crate::navkeys::NavLayout::default(),
+            // PERSISTED CHOICES, restored here rather than defaulted. A Dvorak user re-selecting
+            // their layout every launch is the accessibility bug returning in a slower form.
+            profiles_manual: saved_prefs.profiles.clone(),
+            nav_layout: saved_prefs.nav_layout,
             // Open-ended until the operator says otherwise.
             work_limit: None,
             verify_job: None,
@@ -3352,6 +3357,19 @@ which file you read.\n\n",
     /// Start a single agent run over the loaded workspace (shared by `:agent` and the plain-message
     /// auto-route when a workspace is loaded). Assumes idle-ness was checked by the caller's flow;
     /// re-checks defensively and notes instead of colliding.
+    /// Write the persisted choices back.
+    ///
+    /// Called from the pickers rather than every frame: this touches the filesystem, and a UI that
+    /// writes a config file at 60 Hz is a UI that will be blamed for disk wear. The space is read
+    /// from the live theme rather than stored twice, so the file cannot disagree with the screen.
+    fn persist_prefs(&self) {
+        let mut p = crate::prefs::load();   // keep unknown keys another build may own
+        p.nav_layout = self.nav_layout;
+        p.profiles = self.profiles_manual.clone();
+        p.space = Some(theme::active().name.to_string());
+        crate::prefs::save(&p);
+    }
+
     fn start_agent_task(&mut self, task: String, via: &str) {
         if task.is_empty() { self.note = format!("{via} needs a task"); return; }
         if self.gitmind_session.is_none() {
@@ -8263,6 +8281,7 @@ if let Some(msg) = self.error_banner.clone() {
                                 if ui.selectable_label(on, RichText::new(l.label())
                                     .color(if on { theme::CYAN() } else { theme::INK() })).clicked() {
                                     self.nav_layout = l;
+                                    self.persist_prefs();
                                 }
                                 ui.label(RichText::new(l.hint()).color(theme::DIM()).small());
                                 ui.add_space(3.0);
@@ -8275,6 +8294,7 @@ if let Some(msg) = self.error_banner.clone() {
                             if ui.selectable_label(auto, RichText::new("Autopilot")
                                 .color(if auto { theme::CYAN() } else { theme::INK() }).strong()).clicked() {
                                 self.profiles_manual.clear();
+                                self.persist_prefs();
                             }
                             ui.label(RichText::new("Chooses the posture from the task: a shader bug gets the GPU role's rule for verification, a slow path gets the optimizer's. Anything unrecognised gets the native-fullstack default, which is what a third of your turns — \"keep working\" — actually ask for.")
                                 .color(theme::DIM()).small());
@@ -8288,6 +8308,7 @@ if let Some(msg) = self.error_banner.clone() {
                                     // wins a shared rule, which is what `compose` resolves by.
                                     if on { self.profiles_manual.retain(|x| *x != id); }
                                     else { self.profiles_manual.push(id); }
+                                    self.persist_prefs();
                                 }
                                 ui.label(RichText::new(p.when).color(theme::DIM()).small());
                                 ui.label(RichText::new(format!("source: {}", p.source))

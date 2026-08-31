@@ -480,6 +480,11 @@ impl eframe::App for LogscopeApp {
                         for p in crate::roomtheme::spaces() {
                             if ui.selectable_label(cur.name == p.name, p.name).clicked() {
                                 theme::install_palette(ui.ctx(), p);
+                                // Remember the room. A mind palace whose whole premise is that a
+                                // place becomes familiar cannot reset to the default every morning.
+                                let mut pr = crate::prefs::load();
+                                pr.space = Some(p.name.to_string());
+                                crate::prefs::save(&pr);
                             }
                         }
                     });
