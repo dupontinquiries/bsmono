@@ -4674,3 +4674,41 @@ Two tests, one per property. 1427/1427.
   all become each other's nearest neighbours.
 
   1431/1431.
+
+## 85. The bootstrap list was computed and never used
+
+I closed §84c saying a first real run would want a bootstrap peer.
+`NodeHost::bootstrap` had no caller — and it turned out the data already
+existed too.
+
+`dht_bootstrap.rs` holds the server table, with the IPs dated
+(`IPS_VERIFIED = "2026-04"`) because a hardcoded IP that nobody dated is
+a fact with an unknown expiry. `Snapclone::bootstrap_addresses(dns_working,
+web_ports_only)` orders them for the network you are on. Both were
+written, and **the only callers were tests.**
+
+So the node would have spawned with an empty routing table and returned
+empty from every lookup, forever, looking exactly like "nobody is
+online".
+
+Now fed to `NodeHost::bootstrap` at spawn.
+
+Four decisions:
+  - **`dns_working = true`, `web_ports_only = false`.** Those are the
+    ordinary network, and `ordered_for` already puts the fallbacks
+    after the standard port — so a hostile network costs a few failed
+    sends rather than a wrong list. Detecting which network we are on is
+    a separate job, and guessing it here would be a second, worse copy
+    of it.
+  - **A resolution failure skips that entry**, not the list. The list
+    exists precisely so one dead server is not the end of it.
+  - **Each bootstrap peer's id is derived from its ADDRESS**, since its
+    real node id is unknown until it answers. Without that they would
+    collide in the routing table; the id is corrected when the peer
+    replies.
+  - A test asserts the list is non-empty in all four network
+    combinations. The hostile case matters most: it is where a filter
+    could reduce the list to nothing and produce a node that cannot
+    start.
+
+1432/1432.

@@ -1213,7 +1213,41 @@ impl Snapclone {
             match snapclone_presence::node_host::NodeHost::spawn(
                 id, "0.0.0.0:0".parse().expect("a literal bind address"))
             {
-                Ok(h) => self.dht = Some(h),
+                Ok(h) => {
+                    // BOOTSTRAP IMMEDIATELY, or the node is a routing
+                    // table with nothing in it and every lookup returns
+                    // empty forever. `bootstrap_addresses` has produced
+                    // this list since it was written and only tests
+                    // called it.
+                    //
+                    // `dns_working` is assumed true and `web_ports_only`
+                    // false: those are the ordinary network, and
+                    // `ordered_for` already puts the fallbacks after the
+                    // standard port, so a hostile network costs a few
+                    // failed sends rather than a wrong list. Detecting
+                    // which network we are on is a separate job and
+                    // guessing it here would be a second, worse copy of
+                    // it.
+                    for addr in self.bootstrap_addresses(true, false) {
+                        // Resolution can fail — a hostname with no DNS,
+                        // an IPv6-only network. Skipped rather than
+                        // fatal: the list exists precisely so one dead
+                        // entry is not the end of it.
+                        if let Ok(mut it) = std::net::ToSocketAddrs::to_socket_addrs(&addr) {
+                            if let Some(sa) = it.next() {
+                                // The peer's real node id is unknown
+                                // until it answers. Derived from its
+                                // address so two bootstrap servers do
+                                // not collide in the routing table —
+                                // the id is corrected when the node
+                                // actually replies.
+                                let id = crate::identity::dht_node_id(&addr);
+                                h.bootstrap(sa, id);
+                            }
+                        }
+                    }
+                    self.dht = Some(h);
+                }
                 Err(e) => {
                     // Said once. A bind failure is permanent for this
                     // run — a port conflict or a sandbox with no
@@ -5178,6 +5212,19 @@ mod gossip_wiring_tests {
     }
 
     #[test]
+    fn the_bootstrap_list_is_never_empty() {
+        // A node with no bootstrap addresses is a routing table with
+        // nothing in it, and every lookup returns empty forever. The
+        // hostile-network variant matters most: it is the case where a
+        // naive filter could reduce the list to nothing.
+        let s = Snapclone::new(vec![]);
+        for (dns, web) in [(true, false), (false, false), (true, true), (false, true)] {
+            assert!(!s.bootstrap_addresses(dns, web).is_empty(),
+                    "empty list for dns={dns} web_only={web}");
+        }
+    }
+
+    #[test]
     fn the_discovery_setting_is_actually_read() {
         // It was written, persisted, and read by NOTHING — choosing
         // "Jami DHT" changed a stored byte and no behaviour. This test
@@ -5773,6 +5820,10 @@ mod gossip_wiring_tests {
     #[test]
     fn bootstrap_falls_back_to_ip_and_can_restrict_to_web_ports() {
         let app = Snapclone::new_with_login(vec![], false);
+        // The list is no longer test-only: `tick_dht` feeds it to
+        // `NodeHost::bootstrap` on spawn. It was computed and unused for
+        // as long as it existed, so this note is here to stop it going
+        // back to that.
         let with_dns = app.bootstrap_addresses(true, false);
         let no_dns = app.bootstrap_addresses(false, false);
         assert!(!with_dns.is_empty());
