@@ -2,6 +2,11 @@
 //!
 //! ## Read off the reference
 //!
+//!
+//! (The reference images are GENERATED design studies, not captures of this app. They are a
+//! legitimate source of intent — the operator chose them to say what the interface should feel like
+//! — and they are not evidence about behaviour. Nothing visible in one should be read as something
+//! this program did; see the correction at the top of `nodelabel`.)
 //! Every node card in the mansion-garden and atlantis references carries a TYPE above its content —
 //! ROOT PROMPT, HYPOTHESES, EVIDENCE, CORRELATED, INSIGHTS, CONCLUSION — and the content line
 //! underneath. Our labels are the content line alone. The type is what makes a graph readable at a

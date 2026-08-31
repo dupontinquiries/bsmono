@@ -1,16 +1,28 @@
 //! nodelabel — what a node's label says, and which labels get to be drawn.
 //!
-//! ## Read off a screenshot of the running app, not the art references
+//! ## Both defects are in the code, which is where the evidence should have come from
 //!
-//! The Mistfall capture shows the two defects plainly. Labels are cut mid-word — "create a rust
-//! crate th", "rust use std::colle", "4. Phow do you add an w" — and neighbouring labels sit on top
-//! of each other, so a cluster of turns reads as one smear of text.
+//! A CORRECTION WORTH KEEPING, because the reasoning was wrong even though the fix was right. I
+//! first justified this module from one of the "reference images", believing it to be a screenshot
+//! of the running app, and quoted its text as observed output — "create a rust crate th", "rust use
+//! std::colle", "4. Phow do you add an w". Those are not real strings. That image was generated,
+//! and garbled text is exactly what generation produces; the operator had to tell me. Quoting a
+//! picture of a program as if it were the program is the same one-step-removed evidence this
+//! codebase keeps getting caught by, and I was the one holding it.
 //!
-//! Neither is a rendering problem. The first is `preview.chars().take(16)`, a hard character cut.
-//! The second is a declutter rule that measures the wrong thing: the existing pass dims a label when
-//! a NEARER PEARL overlaps it on screen, which is about the node bodies. Two labels at similar depth
-//! never trigger it, stay equally bright, and their TEXT overlaps — which is exactly the case in the
-//! capture.
+//! The defects are real anyway, and here is the actual evidence, which is checkable forever:
+//!
+//! * `chat.rs` cut labels with `preview.chars().take(16)` — a hard character slice with no word
+//!   boundary. Read it in the source, not off a picture.
+//! * The declutter measures the wrong thing. The existing pass dims a label when a NEARER PEARL
+//!   overlaps it on screen (`r2.3 < q.3 - 0.1`, then a fixed 78px radius around the node body).
+//!   Two labels at similar depth fail that test, stay equally bright, and their TEXT overlaps. The
+//!   pass is still there and still correct for what it does — occlusion by a node in front — which
+//!   is why this module handles the other case rather than replacing it.
+//!
+//! The third thing this found — the declutter was keeping the FARTHEST label of every cluster,
+//! because I had the depth sign backwards — came from realistic test fixtures and has nothing to do
+//! with any image.
 //!
 //! ## Both halves are pure
 //!
@@ -42,9 +54,9 @@ pub fn elide_words(preview: &str, max_chars: usize) -> String {
     let budget = max_chars.saturating_sub(1).max(1);
     let cut: String = flat.chars().take(budget).collect();
     // Honour the word boundary whenever what remains is still a readable phrase. The first
-    // threshold here was half the budget, and it produced `rust use std::colle…` from
-    // "rust use std::collections::HashMap" — which is the exact string in the screenshot that
-    // started this. A long code token is precisely the case where backing up matters most:
+    // threshold here was half the budget, and on "rust use std::collections::HashMap" it left the
+    // boundary too early and sliced the token. A long code token is precisely the case where
+    // backing up matters most:
     // "rust use…" says what the turn was about and "std::colle" says nothing at all.
     //
     // Six characters is the floor. Below that the label carries less than the ellipsis costs, and
@@ -145,13 +157,13 @@ mod tests {
         assert_eq!(elide_words("exactly ten", 11), "exactly ten");
     }
 
-    /// The defect from the screenshot, by example.
+    /// The `take(16)` defect, by example. These inputs are constructed to exercise the boundary
+    /// rule, not transcribed from anywhere.
     #[test]
     fn labels_are_cut_on_words_not_mid_word() {
         // "create a rust crate th" is what the 16-char cut produced.
         assert_eq!(elide_words("create a rust crate that parses gguf", 22), "create a rust crate…");
-        // The screenshot's other one: a long code token backs up to the last real word rather than
-        // being sliced into "std::colle".
+        // A long code token backs up to the last real word rather than being sliced mid-identifier.
         assert_eq!(elide_words("rust use std::collections::HashMap", 20), "rust use…");
         assert_eq!(elide_words("4. How do you add another node", 20), "4. How do you add…");
         for (text, max) in [("create a rust crate that parses gguf", 22),
@@ -211,7 +223,8 @@ mod tests {
         assert_eq!(v.len(), 3);
     }
 
-    /// The screenshot case: several turns close together, labels on top of each other.
+    /// Several turns close together, labels on top of each other — the case the pearl-radius pass
+    /// in `chat.rs` cannot see, because those labels are at similar depth.
     #[test]
     fn a_crowded_cluster_keeps_the_nearest_and_drops_the_rest() {
         let cluster: Vec<LabelBox> = (0..5)

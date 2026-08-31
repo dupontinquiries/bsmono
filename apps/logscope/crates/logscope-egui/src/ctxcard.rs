@@ -2,6 +2,11 @@
 //!
 //! ## What the references show and ours did not
 //!
+//!
+//! (The reference images are GENERATED design studies, not captures of this app. They are a
+//! legitimate source of intent — the operator chose them to say what the interface should feel like
+//! — and they are not evidence about behaviour. Nothing visible in one should be read as something
+//! this program did; see the correction at the top of `nodelabel`.)
 //! Every context card in the atlantis and mansion-garden references carries a size-and-age line
 //! ("12.4 KB · Modified 2h ago") and a relevance figure in the corner (0.98, 0.86). Ours showed the
 //! file name, an excerpt and some keyword chips — nothing about how big the file is, and nothing
