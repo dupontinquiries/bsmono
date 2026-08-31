@@ -773,6 +773,9 @@ pub mod dht_join;
 
 pub mod shader_from_image;
 pub mod viewmodel;
+pub mod voxel_model;
+pub mod wendigo;
+pub mod sabretooth;
 pub mod precipitation;
 pub mod particles;   // r263 merge: pooled particle system (PARTICLES worker, 8 tests)
 pub mod mob_bands;   // r263 merge: band-aware mob tick decision (T-MOBS worker, 6 tests)
