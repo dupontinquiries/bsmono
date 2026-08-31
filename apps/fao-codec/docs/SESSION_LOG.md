@@ -4261,3 +4261,86 @@ once at ref_frame and reused. Event-driven RE-capture (emit a new
 sprite only when tracking error says the object changed) is the
 natural next construction and is what would lift the rigid-sprite
 limit that the scene-editing work ran into. Not built.
+
+## New material: Minecraft speedrun 4K60 (2026-08-31)
+
+User-supplied: speedrunner_test.mkv (3840x2160@60, 67s, AV1 source at
+~23 Mbps) + speedrunner_test_av1.mkv anchor (16.9 MB video-only,
+4204 B/frame average). Test GOP: 48 frames from t=20s.
+
+This is the first material that satisfies the preconditions the last
+two sessions named as MISSING. It is engine-rendered (no film grain —
+the residue that dominated the bloopers), it repeats content exactly
+(voxel blocks, HUD glyphs), it has a real first-person 3D camera, and
+it carries a static HUD. Every open question had been deferred to
+"needs engine content"; this is that content.
+
+### The long-range dictionary: 10.7% STRONG, against 0.2-0.7% on film
+
+The landmark-fingerprint probe, unchanged, at the SAME 16x16
+granularity that measured a null on film and game-broadcast footage:
+
+                        long-range beats local | STRONG (>512 SAD) | mean SAD saved
+  bloopers shotB                        12.1%  |             0.3%  |   ~130-240
+  SMITE broadcast                     3.1-4.2% |          0.2-0.3% |   ~130-240
+  MINECRAFT 4K                          24.7%  |            10.7%  |         1515
+1.49M regions probed, 36,592 distinct fingerprints — a ~40x dedup
+ratio in fingerprint space. STRONG is 15-50x the film rate and the
+margin per win is 6-10x larger, which is what decides whether a ~4-byte
+long-range reference pays.
+
+The earlier verdict was "the idea transfers cleanly and the machinery
+works; the REDUNDANCY ISN'T THERE at 16x16 on this material", and the
+recorded next step was to go finer (4x4/8x8) and exact-match. That
+step is NOT needed first: the redundancy is there at 16x16 on engine
+content, so the construction to build is the coder-side reference
+(dictionary index + 4-byte reference in the mode decision), measured
+on this clip, before any granularity work.
+
+### Parallax exists here — and the pose model's missing axis is now visible
+
+  correspondences within 2px of the pair affine:
+    bloopers w1 / shot4  88%   (no parallax; a global affine IS the frame)
+    SMITE                66%
+    MINECRAFT            43%   <- 57% genuinely non-affine
+Median per-pair motion 12.6px, camera span 103px, and depth spread
+p10 1389 / median 7847 / p90 41009 — real depth structure, against the
+bloopers' flat 1132-1877.
+
+But triangulation still keeps only 24 of 798, and the REJECTION
+PROFILE INVERTED, which is the diagnostic payload:
+  bloopers shot4: reproj 191, behind-camera 4,   no-baseline 0
+  MINECRAFT:      reproj 154, behind-camera 293, no-baseline 327
+41% of candidates find no usable baseline and 37% triangulate BEHIND
+the camera. That is the signature of the pose model's missing degree
+of freedom: it is translation-only in x/y with z pinned to 0, while
+first-person game movement is dominated by FORWARD translation.
+Forward motion produces radial expansion, which phase correlation
+reads as near-zero shift (hence no baseline), and intersecting radial
+flow against an x/y-only baseline puts points behind the camera. So
+the 3D branch's next construction is now evidenced rather than
+guessed: a z/dolly term in the pose model, recovered from radial flow
+divergence rather than from phase correlation.
+Also logged: pose-vs-tracks reports cumulative pose +33.3px and
+cumulative track +33.3px — SAME sign, where w1 and shot 4 both gave
+opposite signs. Equal magnitude with inverted sign is suspicious and
+unexplained; flagged, not chased.
+
+### Rate vs the AV1 anchor on this GOP
+
+  v11.3 dz32:  9,996,224 B @ 31.742 dB / SSIM 0.9353
+  AV1 anchor:    305,744 B @ 32.198 dB / SSIM 0.9336
+32.7x larger at -0.46 dB — WORSE than the bloopers' 18.6x, and the
+byte split says why: residual 7.56 MB of 10 MB (76%), prev_mode_share
+0.641 against w1's 0.857. At 12.6 px/frame median motion and 67 px
+peak shift, a translation-only plate stops predicting and the coder
+falls back to paying for pixels.
+
+One genuine positive in that row: v11 WINS ON SSIM (0.9353 vs 0.9336)
+while losing 0.46 dB of PSNR. Flat voxel surfaces and hard block edges
+are exactly what a DCT dead zone preserves structurally and what PSNR
+under-credits. Worth a matched-SSIM comparison rather than only
+matched-PSNR on this content.
+Caveat carried over from SMITE and still applying: the anchor is an
+AV1 re-encode of AV1 source, which flatters AV1 (it recodes its own
+artifacts cheaply).
