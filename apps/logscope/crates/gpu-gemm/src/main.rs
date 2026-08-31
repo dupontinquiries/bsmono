@@ -5659,6 +5659,34 @@ still pass, which is why this one exists."
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--profile-hybrid-dispatch") {
+        // PER-TOKEN DISPATCH PROFILE of the hybrid decode — the measure-first tool for dispatch
+        // reduction. Timings on this adapter are meaningless; dispatch COUNTS are the
+        // hardware-independent cost model (Asahi decode is dispatch-bound per the bind-group
+        // cache work). Three warm tokens build every pipeline; the fourth token's histogram
+        // delta is one steady-state token, printed per shader, sorted.
+        std::env::set_var("LOGSCOPE_DISPATCH_HIST", "1");
+        std::env::set_var("LOGSCOPE_TRY_UNSUPPORTED_ARCH", "1");
+        let gpu = Gpu::new();
+        eprintln!("profile-hybrid-dispatch: adapter = {}", gpu.adapter_name);
+        let m = gpu.load_gguf(&write_gguf_qwen35moe_hybrid(1, None)).expect("hybrid load");
+        let c = gpu.new_cache_for(&m, 8);
+        for (p, t) in [1u32, 5, 9].iter().enumerate() { let _ = gpu.decode_step(&m, &c, *t, p); }
+        let before: std::collections::HashMap<usize, u64> = gpu_kernels::dispatch_histogram().into_iter().collect();
+        let _ = gpu.decode_step(&m, &c, 2, 3);
+        let mut delta: Vec<(String, u64)> = gpu_kernels::dispatch_histogram().into_iter()
+            .map(|(id, n)| {
+                let d = n - before.get(&id).copied().unwrap_or(0);
+                (gpu_kernels::shader_label(id).unwrap_or_else(|| format!("{id:#x}")), d)
+            })
+            .filter(|(_, d)| *d > 0)
+            .collect();
+        delta.sort_by(|a, b| b.1.cmp(&a.1));
+        let total: u64 = delta.iter().map(|(_, d)| d).sum();
+        println!("one steady-state token of the 2-layer hybrid (blk.0 DeltaNet, blk.1 gated-attn MoE+shexp): {total} dispatches");
+        for (l, d) in &delta { println!("  {d:>3}  {l}"); }
+        return;
+    }
     if args.iter().any(|a| a == "--gate-gemma4-altv") {
         // Gemma 4's V handling: the ALWAYS-ON weightless per-head V norm, and V sourced from the
         // raw k projection on blocks without attn_v. The proof is the TWIN equality documented on

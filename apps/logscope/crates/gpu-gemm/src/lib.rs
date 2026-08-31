@@ -11759,6 +11759,11 @@ loader assumes. Other families that ship a fused qkv are still unverified");
                     // V-from-K blocks fuse [q|k] only: there is no v projection, and the decode
                     // path derives V from the k slice.
                     if !block_v_from_k { v.extend_from_slice(&fetch(&format!("blk.{i}.attn_v.weight"))?); }
+                    // Gated blocks fuse the GATE rows too — [q|k|v|gate] — so the fused decode
+                    // emits the gate in the SAME norm+matvec instead of paying a second rmsnorm
+                    // plus a second matvec per layer per token (measured: 2 of ~17 dispatches on
+                    // a full-attention layer; ~24/token on a real Qwen3.6's 12 full layers).
+                    if let Some((_, gh)) = &q_gate { v.extend_from_slice(gh); }
                     v
                 };
                 // FUSED QKV is one contiguous tensor, so it transcodes directly when the source is
@@ -11784,7 +11789,11 @@ loader assumes. Other families that ship a fused qkv are still unverified");
                                 std::sync::atomic::Ordering::Relaxed);
                             l
                         }
-                        None => self.make_lin(&qkv, attn_dim + 2 * kv, d, q, q4_mode),
+                        // Row count follows the CONTENT: +ad gate rows on gated blocks, -kv v
+                        // rows on V-from-K ones. Declaring the classic width here while the
+                        // concat carried more was exactly the bug the gated cross-check caught
+                        // (9.55e-3): the gate slice read past the projection's real output.
+                        None => self.make_lin(&qkv, qkv.len() / d, d, q, q4_mode),
                     }
                 };
                 if has_qkv_bias {
@@ -15937,11 +15946,12 @@ sequence.");
             Some((k2, v2, l2)) => self.decode_attention_mh(&q, &k2, &v2, l2, ad, n_heads, n_kv_heads),
             None => self.decode_attention_mh(&q, kc, vc, pos + 1, ad, n_heads, n_kv_heads),
         };
-        // Gated attention: this fused path has no standalone n1 (the norm folds into the qkv
-        // matvec), so the gate projection uses the SAME fused norm+apply — one extra dispatch
-        // on gated layers only, still no separate rmsnorm.
+        // Gated attention: the gate rows ride IN the fused [q|k|v|gate] projection (loader
+        // concat), so the gate here is a buffer slice of `qkv` — zero extra norm, zero extra
+        // matvec. The unfused path still projects through attn_out_gate; their agreement is
+        // pinned by the gate's cross-check, which is what lets this fusion be trusted.
         let attn = match &w.attn_out_gate {
-            Some(gl) => { let gv = gl.norm_apply(self, x, &w.g1, d, eps, 1); self.sigmoid_mul_t(&attn, &gv) }
+            Some(_) => { let gv = self.slice_cols(&qkv, ad + 2 * kv, ad); self.sigmoid_mul_t(&attn, &gv) }
             None => attn,
         };
         let x2 = w.wo.apply_add(self, &attn, 1, x);
