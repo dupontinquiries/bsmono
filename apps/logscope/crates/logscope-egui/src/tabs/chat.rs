@@ -385,6 +385,34 @@ fn glass_frame() -> egui::Frame {
 /// minute ago.
 struct Msg { role: Role, variants: Vec<String>, cur: usize, born: std::time::Instant, at: u64, editing: bool, edit_buf: String, think_open: bool, parent: Option<usize>, model: Option<String> }
 
+/// How long ago a turn happened, for the list — `3s ago`, `12m ago`, `2h ago`.
+///
+/// WHICH CLOCK, AND WHY IT MATTERS. `Msg` carries two: `born`, a monotonic `Instant`, and `at`,
+/// unix seconds. `born` is the obvious choice and is wrong for the case that matters — it cannot
+/// survive a save, so on a reopened conversation every turn is stamped at load time and a
+/// three-day-old exchange reads as seconds old. A relative time that confidently lies about an
+/// archived session is worse than no relative time.
+///
+/// So the wall clock wins when it exists, `born` covers the live session, and a turn from before
+/// `at` was recorded gets NOTHING rather than a guess. That last case is real: the field was added
+/// later and older saves carry `0`.
+///
+/// `now` is passed in rather than read here so the boundaries are testable.
+fn turn_age(at: u64, born: std::time::Instant, now_unix: u64) -> Option<String> {
+    let d = if at > 0 {
+        // A clock that has moved backwards (NTP step, a save from a machine set ahead) would
+        // underflow into a nonsense duration; saturating_sub reports "0s" instead.
+        std::time::Duration::from_secs(now_unix.saturating_sub(at))
+    } else if born.elapsed() >= std::time::Duration::from_secs(1) {
+        // No wall clock recorded. Only trust `born` once it has measured something: a freshly
+        // loaded old message has an elapsed of ~0, which is exactly the lie above.
+        born.elapsed()
+    } else {
+        return None;
+    };
+    Some(format!("{} ago", logscope_fan::sessiontime::compact(d)))
+}
+
 /// `YYYY-MM-DD HH:MM UTC` from unix seconds, without pulling a date crate into
 /// a frontend that has none.
 ///
@@ -1135,6 +1163,11 @@ pub struct Chat {
     show_context: bool, // right sidebar open/closed
     right_page: RightPage, // active sidebar subpage
     coord_mode: crate::coordinator::Mode, // prompting mode (barebones / coordinator / aggressive)
+    /// Hand-picked engineering profiles. Empty = autopilot (`engprofile::suggest` from the task).
+    profiles_manual: Vec<crate::engprofile::ProfileId>,
+    /// Which key cluster flies the freecam. Personalisation and accessibility: egui reports logical
+    /// keys, so a non-QWERTY layout gets no movement at all from a hardcoded WASD.
+    nav_layout: crate::navkeys::NavLayout,
 
     /// A duration the operator asked for, and when they asked.
     ///
@@ -1405,6 +1438,9 @@ pub struct Chat {
 }
 impl Default for Chat {
     fn default() -> Self {
+        // Read once, here. Loading per-field would stat the config file several times per
+        // construction for no benefit.
+        let saved_prefs = crate::prefs::load();
         Self {
             a11y: uikit_egui::a11y::A11yScene::new(),
             stamp_model: None,
@@ -1413,6 +1449,10 @@ impl Default for Chat {
             context: LONG_HORIZON.into(),
             threading: true, show_context: false, attach_log: true, fix_mode: false,
             right_page: RightPage::Prompting, coord_mode: crate::coordinator::Mode::Barebones,
+            // PERSISTED CHOICES, restored here rather than defaulted. A Dvorak user re-selecting
+            // their layout every launch is the accessibility bug returning in a slower form.
+            profiles_manual: saved_prefs.profiles.clone(),
+            nav_layout: saved_prefs.nav_layout,
             // Open-ended until the operator says otherwise.
             work_limit: None,
             verify_job: None,
@@ -1664,7 +1704,11 @@ impl Chat {
                             if let Some(r) = self.agent_run.as_ref() {
                                 self.agent_files = r.events().to_vec();
                                 self.agent_plan = r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect();
-                                self.note = format!("agent: turn {} · {} file(s)…", r.turns(), r.events().len());
+                                let ph = r.phase().map(|p| format!(" · phase: {p}")).unwrap_or_default();
+                                // Compaction is invisible otherwise, and "the model forgot what it
+                                // read" is exactly the symptom it produces — so it is said out loud.
+                                let cmp = match r.compacted_turns() { 0 => String::new(), n => format!(" · {n} turn(s) compacted") };
+                                self.note = format!("agent: turn {} · {} file(s){ph}{cmp}…", r.turns(), r.events().len());
                             }
                             self.agent_pending_submit = Some(prompt);
                         }
@@ -2195,8 +2239,8 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
             crate::workspace_exec::FileEvent { path: "src/fix_patch.rs".into(), change: crate::workspace_exec::FileChange::Created, bytes: 512 },
         ];
         self.agent_candidates = vec![
-            crate::workspace_exec::BranchSummary { index: 0, label: "conservative patch".into(), files: 2, verified: true, finished: true, approved: Some(true), review_notes: "clean, minimal diff".into(), root: std::path::PathBuf::new() },
-            crate::workspace_exec::BranchSummary { index: 1, label: "broader refactor".into(), files: 5, verified: false, finished: true, approved: None, review_notes: "touches more than asked".into(), root: std::path::PathBuf::new() },
+            crate::workspace_exec::BranchSummary { index: 0, label: "conservative patch".into(), files: 2, verified: true, finished: true, approved: Some(true), doing: crate::runcard::Doing::Finished, review_notes: "clean, minimal diff".into(), root: std::path::PathBuf::new() },
+            crate::workspace_exec::BranchSummary { index: 1, label: "broader refactor".into(), files: 5, verified: false, finished: true, approved: None, doing: crate::runcard::Doing::Finished, review_notes: "touches more than asked".into(), root: std::path::PathBuf::new() },
         ];
     }
 
@@ -3147,21 +3191,36 @@ reply is framed differently from the turn that produced it.");
 
     /// Finalize a non-blocking agent run: snapshot the workspace, surface the outcome, clear the driver.
     fn finish_agent_run(&mut self, stop: crate::workspace_exec::Stop) {
-        let (files, plan, verified, turns, had_verifier) = match self.agent_run.take() {
-            Some(r) => (r.events().to_vec(), r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect::<Vec<_>>(), r.verified(), r.turns(), r.had_verifier()),
+        let (files, plan, plan_summary, verified, turns, had_verifier, phase, patterns, compacted) = match self.agent_run.take() {
+            Some(r) => (r.events().to_vec(), r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect::<Vec<_>>(), r.plan().summary(), r.verified(), r.turns(), r.had_verifier(), r.phase(), r.pattern_report(), r.compacted_turns()),
             None => return,
         };
         self.agent_files = files;
         self.agent_plan = plan;
         let touched = self.agent_files.len();
-        let done = self.agent_plan.iter().filter(|(_, d)| *d).count();
-        let total = self.agent_plan.len();
         let stopdesc = match &stop {
             crate::workspace_exec::Stop::Done => "done".to_string(),
             crate::workspace_exec::Stop::StepLimit => format!("hit step limit ({turns} turns)"),
+            // Two different halts share Stop::Stalled and deserve different words: the loop guard
+            // caught REPETITION; the phase machine's Blocked is counted evidence that the error
+            // count stopped falling — the run should change approach, not just retry.
+            crate::workspace_exec::Stop::Stalled if phase == Some("blocked") =>
+                format!("blocked — the error count stopped falling ({turns} turns; change approach)"),
             crate::workspace_exec::Stop::Stalled => format!("stopped — model was looping ({turns} turns)"),
             crate::workspace_exec::Stop::ModelError(e) => format!("model error: {e}"),
         };
+        // Durable per-repo learning: the pattern report ("survey + checked: reduced errors 3/4
+        // times") lands as a shared doc, which `collect_shared_docs` injects into EVERY later run
+        // over this workspace — observed fact from this repo, not advice. Written before the
+        // snapshot so the snapshot carries it.
+        if !patterns.is_empty() {
+            if let Some(s) = self.gitmind_session.as_ref() {
+                let dir = s.work_dir().join(".logscope").join("docs");
+                let _ = std::fs::create_dir_all(&dir);
+                let body = format!("# phase patterns — what moved the error count on this repo\n\n{}\n", patterns.join("\n"));
+                let _ = std::fs::write(dir.join("phase-patterns.md"), body);
+            }
+        }
         let snap = self.gitmind_session.as_ref()
             .and_then(|s| crate::mount::snapshot(&s.ws, &format!("agent: {}", self.agent_task)).ok())
             .unwrap_or(false);
@@ -3170,7 +3229,13 @@ reply is framed differently from the turn that produced it.");
         // because it is the reason someone stops looking.
         let vnote = crate::workspace_exec::VerifyBadge::of(verified, had_verifier).label();
         let snap_note = if snap { " · snapshotted" } else { "" };
-        self.note = format!("agent: {stopdesc} · plan {done}/{total} · {touched} file(s){vnote}{snap_note} · :reapply to land");
+        let phase_note = phase.map(|p| format!(" · phase: {p}")).unwrap_or_default();
+        let cmp_note = match compacted { 0 => String::new(), n => format!(" · {n} turn(s) compacted") };
+        // "plan 3/3" used to appear after three read-only turns, because the plan advanced per turn
+        // rather than per write. The summary reports verified / pending / unverifiable apart, so a
+        // step nobody can check never reads as a step that was done.
+        let plan_note = if self.agent_plan.is_empty() { String::new() } else { format!(" · plan {plan_summary}") };
+        self.note = format!("agent: {stopdesc}{plan_note} · {touched} file(s){vnote}{phase_note}{cmp_note}{snap_note} · :reapply to land");
     }
 
     /// Launch a fan of agent branches with `cfg`, seeding goals from `task`. Shared by :fan-agent and :docs.
@@ -3320,6 +3385,19 @@ which file you read.\n\n",
     /// Start a single agent run over the loaded workspace (shared by `:agent` and the plain-message
     /// auto-route when a workspace is loaded). Assumes idle-ness was checked by the caller's flow;
     /// re-checks defensively and notes instead of colliding.
+    /// Write the persisted choices back.
+    ///
+    /// Called from the pickers rather than every frame: this touches the filesystem, and a UI that
+    /// writes a config file at 60 Hz is a UI that will be blamed for disk wear. The space is read
+    /// from the live theme rather than stored twice, so the file cannot disagree with the screen.
+    fn persist_prefs(&self) {
+        let mut p = crate::prefs::load();   // keep unknown keys another build may own
+        p.nav_layout = self.nav_layout;
+        p.profiles = self.profiles_manual.clone();
+        p.space = Some(theme::active().name.to_string());
+        crate::prefs::save(&p);
+    }
+
     fn start_agent_task(&mut self, task: String, via: &str) {
         if task.is_empty() { self.note = format!("{via} needs a task"); return; }
         if self.gitmind_session.is_none() {
@@ -3330,18 +3408,57 @@ which file you read.\n\n",
         let work_dir = self.gitmind_session.as_ref().unwrap().work_dir().to_path_buf();
         let mut cfg = crate::workspace_exec::AgentConfig::default();
         cfg.context = self.agent_context();
+        // Size the run's budgets to the model actually loaded. Without this the workspace resolves
+        // to Mid for everything — the harness's "unknown" — so a 1B drowns in reads it cannot hold
+        // and a large model gets a transcript bound far below what its window could carry.
+        cfg.model_label = self.model_label();
+        // The mode picker records the intent; this is where the intent takes effect. StatefulGuide
+        // arms engmode's phase machine (evidence-decided position, claim-gating, stall→blocked) and
+        // green-state checkpoints — the long-horizon posture for a big `.gitmind` tree.
+        if self.coord_mode == crate::coordinator::Mode::StatefulGuide {
+            cfg.stateful_guide = true;
+            cfg.checkpoint_on_green = true;
+            // PROOF FOLLOWS FROM THE MODE'S OWN PREMISE. StatefulGuide exists because a model
+            // saying TASK_COMPLETE is not evidence; a green suite is the same claim one level down,
+            // since it cannot tell a change that fixed something from a change that did nothing.
+            // The mode that refuses the first should refuse the second. Costs one extra suite run,
+            // once, at the claim — which for an unattended long-horizon run is nothing against
+            // landing work that changed no observable behaviour.
+            cfg.require_proof = true;
+        }
+        // AUTOPILOT: the working discipline follows the task. A shader bug gets the GPU profile's
+        // rule for verification (diff against a reference) rather than the generic one; anything
+        // unrecognised gets the base posture, which is the measured default for this operator.
+        // A manual selection, when one has been made, wins over the suggestion.
+        cfg.profiles = if self.profiles_manual.is_empty() {
+            crate::engprofile::suggest(&task)
+        } else { self.profiles_manual.clone() };
+        let profile_names: Vec<&str> = cfg.profiles.iter().map(|p| p.profile().name).collect();
         let (run, first) = crate::workspace_exec::AgentRun::start(work_dir, &task, cfg);
+        let guided = run.phase().is_some();
         self.agent_run = Some(run);
         self.agent_task = task.clone();
         self.agent_pending_submit = Some(first);
         self.agent_files.clear();
         self.agent_plan.clear();
-        self.note = format!("agent started: {task} — surveying the workspace…");
+        // Name the posture in the status line. An autopilot that silently changes how the model
+        // works is one the operator cannot correct — the whole reason the mode picker states what
+        // each mode actually does.
+        let posture = profile_names.join(" + ");
+        self.note = if guided {
+            format!("agent started (stateful guide, {posture}): {task} — phase: survey")
+        } else {
+            format!("agent started ({posture}): {task} — surveying the workspace…")
+        };
     }
 
     fn start_fan(&mut self, task: &str, cfg: crate::workspace_exec::AgentConfig, doc_fan: bool, label: &str) {
         let mut cfg = cfg;
         if cfg.context.is_empty() { cfg.context = self.agent_context(); } // every branch starts sighted
+        // …and every branch sized to the model actually loaded. `start_agent_task` got this and the
+        // fan did not, so fan branches were still resolving to the harness's "unknown" Mid class for
+        // their read chunks, git entries and transcript bound.
+        if cfg.model_label.is_empty() { cfg.model_label = self.model_label(); }
         let task = task.trim().to_string();
         if task.is_empty() {
             self.note = format!(":{label} needs a task");
@@ -3351,15 +3468,48 @@ which file you read.\n\n",
             self.note = format!(":{label} — the model is busy (:stop to cancel)");
         } else {
             let base_goal = self.msgs.iter().rev().find(|m| m.role == Role::User).map(|m| m.text().to_string()).unwrap_or_else(|| task.clone());
-            let goals = crate::workspace_exec::seed_agent_branches(&task, &base_goal, 4);
-            let goals = if goals.is_empty() { vec![task.clone()] } else { goals };
+
+            // BRANCHES FROM THE PLANNER, when there is a plan to work from.
+            //
+            // `coordinator::plan()` has never been consumed, and the reason was one missing input:
+            // it fans out over `Task.subtasks` and nothing produced subtasks, so it always degraded
+            // to the single worker every caller already had. The plan the model wrote — parsed on
+            // turn one, its steps carrying the files they name — is that input. Using it means the
+            // same plan the operator read both fans the work out and decides afterwards whether it
+            // was done.
+            //
+            // Falls back to the reaction seeder when there is no plan yet: a fan asked for before
+            // any run has planned anything still has to do something sensible.
+            let plan_steps: Vec<String> = self.agent_plan.iter().map(|(t, _)| t.clone())
+                .filter(|t| !t.trim().is_empty()).collect();
+            let planned = if plan_steps.len() >= 2 {
+                let t = crate::planrun::task_from_steps(&base_goal, &plan_steps, &self.agent_context());
+                // A budget on total RUNS, not units: aggressive costs three runs per unit, and the
+                // count below is the branch list itself, so it cannot describe work that will not
+                // happen (an earlier version reported `units * best_of` while running `units`).
+                let (bs, dropped) = crate::planrun::branches(self.coord_mode, &t, 6);
+                if dropped > 0 {
+                    self.note = format!("{label}: {} run(s) from {} plan step(s), {dropped} step(s) over the budget",
+                        bs.len(), plan_steps.len());
+                }
+                bs
+            } else { Vec::new() };
+
+            let goals: Vec<(String, String, String)> = if !planned.is_empty() {
+                planned.into_iter().map(|b| (b.goal, b.label, b.system)).collect()
+            } else {
+                let seeded = crate::workspace_exec::seed_agent_branches(&task, &base_goal, 4);
+                let seeded = if seeded.is_empty() { vec![task.clone()] } else { seeded };
+                seeded.into_iter().enumerate()
+                    .map(|(i, g)| (g, format!("branch {}", i + 1), String::new())).collect()
+            };
             let session = self.gitmind_session.as_ref().unwrap();
             let mount = match crate::mount::detect(&session.project) { Ok(m) => m, Err(e) => { self.note = format!(":{label} — {e}"); return; } };
             let fan_root = std::env::temp_dir().join("logscope-fan");
             let mut specs = Vec::new();
-            for (i, goal) in goals.iter().enumerate() {
+            for (i, (goal, blabel, persona)) in goals.iter().enumerate() {
                 match crate::mount::isolate(&mount, &fan_root.join(format!("branch{i}"))) {
-                    Ok(ws) => specs.push((ws.dir.clone(), goal.clone(), format!("branch {}", i + 1))),
+                    Ok(ws) => specs.push((ws.dir.clone(), goal.clone(), blabel.clone(), persona.clone())),
                     Err(e) => { self.note = format!(":{label} — isolate failed: {e}"); return; }
                 }
             }
@@ -3369,7 +3519,7 @@ which file you read.\n\n",
                     .map(|o| String::from_utf8_lossy(&o.stdout).chars().take(8000).collect())
                     .unwrap_or_default()
             });
-            let mut fan = crate::workspace_exec::AgentFan::new(specs, &cfg, diff_fn);
+            let mut fan = crate::workspace_exec::AgentFan::planned(specs, &cfg, diff_fn);
             self.agent_candidates.clear();
             self.agent_task = task.clone();
             self.fan_is_docs = doc_fan;
@@ -3964,6 +4114,19 @@ which file you read.\n\n",
                 }
                 bear
             };
+            // PER-BRANCH SHAPE, in the same fork order as `bear` above — wing i is placed by
+            // bear[i] and typed by shape[i], so the two must be taken in one order. Both are
+            // ascending fork id: `bear` walks `for f in 0..n` and so does `branchshape::analyze`.
+            let shape = {
+                let parents: Vec<Option<usize>> = g.nodes.iter().map(|nd| nd.parent).collect();
+                let toks: Vec<usize> = g.nodes.iter().map(|nd| nd.tokens).collect();
+                let pruned: Vec<bool> = g.nodes.iter().map(|nd| nd.pruned).collect();
+                let backs: Vec<bool> = g.nodes.iter().map(|nd| nd.looks_back).collect();
+                let v = crate::branchshape::analyze(&parents, &toks, &pruned, &backs);
+                let mut arr = [crate::branchshape::BranchShape::EMPTY; 6];
+                for (i, s) in v.into_iter().take(6).enumerate() { arr[i] = s; }
+                arr
+            };
             let color_salience = chat_color_salience(self.msgs.iter().map(|m| m.text()));
             // procedural TREE character (Forest), seed-derived so each conversation grows a distinct wood, with a
             // light branchiness influence on the fork factor
@@ -3978,15 +4141,16 @@ which file you read.\n\n",
                 nodes: n as u32, branches, segments: segs.len() as u32, seed,
                 ext_x: ext_x.ceil() as u32, ext_z: ext_z.ceil() as u32, bear,
                 color_salience, tree_size, tree_height, tree_girth, tree_branch, branch_spread, prop_density,
+                shape,
             });
         }
         let mut seg_of = vec![0usize; n];
         for (si, &(a, b)) in segs.iter().enumerate() { for id in a..=b.min(n.saturating_sub(1)) { seg_of[id] = si; } }
-        let palette = [
-            egui::Color32::from_rgb(0x6e, 0xc6, 0xff), egui::Color32::from_rgb(0x8b, 0xe0, 0x9b),
-            egui::Color32::from_rgb(0xe6, 0xb4, 0x5c), egui::Color32::from_rgb(0xc9, 0x8f, 0xff),
-            egui::Color32::from_rgb(0xff, 0x9b, 0x8a), egui::Color32::from_rgb(0x5c, 0xd6, 0xc4),
-        ];
+        // SEGMENT COLOURS COME FROM THE ROOM. These were six fixed hues, identical in every space —
+        // and the graph is the centre of the screen, so it was the most visible thing that did not
+        // belong to the room it sat in. `nodetint` anchors them on the space's own accent and audits
+        // every space for pair separation and contrast against its background.
+        let palette = crate::nodetint::segments(&theme::active());
         let max_tok = g.nodes.iter().map(|nd| nd.tokens).max().unwrap_or(1).max(1) as f32;
 
         // (The 2D control bar was removed — Overview/Tour/Freecam/Prune/Unprune are physical dock buttons now.)
@@ -4076,9 +4240,13 @@ which file you read.\n\n",
             }
         }
 
-        // FREECAM: free-flight through the scene. WASD move along the look basis, Q/E down/up, drag looks (above),
-        // Shift boosts. Moving the target translates the eye with it (dist held), so you fly wherever you look.
-        // Gated on hovering the canvas so WASD never leaks into the composer; repaints continuously to poll keys.
+        // FREECAM: free-flight through the scene. The movement cluster comes from `navkeys` and
+        // follows the selected keyboard layout — WASD + Q/E on QWERTY, `.oeu` + `,`/`p` on Dvorak —
+        // with arrow keys always live in both. egui reports LOGICAL keys, so a Dvorak typist
+        // pressing the physical W position sends `Comma` and, before this, simply did not move.
+        // Drag looks (above), Shift boosts. Moving the target translates the eye with it (dist
+        // held), so you fly wherever you look. Gated on hovering the canvas so the keys never leak
+        // into the composer; repaints continuously to poll them.
         if self.freecam {
             use crate::spatial::Vec3 as V3;
             if resp.hovered() || resp.dragged() {
@@ -4087,13 +4255,11 @@ which file you read.\n\n",
                     let (cp, sp) = (self.orbit.pitch.cos(), self.orbit.pitch.sin());
                     let fwd = V3::new(cp * sy, -sp, -cp * cy);   // eye→target look direction (fly where you look)
                     let right = V3::new(cy, 0.0, sy);            // horizontal strafe
+                    let (f, s, lift) = crate::navkeys::axes(self.nav_layout, |k| i.key_down(k));
                     let mut mv = V3::new(0.0, 0.0, 0.0);
-                    if i.key_down(egui::Key::W) { mv.x += fwd.x; mv.y += fwd.y; mv.z += fwd.z; }
-                    if i.key_down(egui::Key::S) { mv.x -= fwd.x; mv.y -= fwd.y; mv.z -= fwd.z; }
-                    if i.key_down(egui::Key::D) { mv.x += right.x; mv.z += right.z; }
-                    if i.key_down(egui::Key::A) { mv.x -= right.x; mv.z -= right.z; }
-                    if i.key_down(egui::Key::E) { mv.y += 1.0; }
-                    if i.key_down(egui::Key::Q) { mv.y -= 1.0; }
+                    mv.x += fwd.x * f + right.x * s;
+                    mv.y += fwd.y * f + lift;
+                    mv.z += fwd.z * f + right.z * s;
                     (mv, i.stable_dt.min(0.05), i.modifiers.shift)
                 });
                 if mv.x != 0.0 || mv.y != 0.0 || mv.z != 0.0 {
@@ -4687,7 +4853,73 @@ which file you read.\n\n",
                 let up = crate::spatial::Vec3::new(syaw * sp, cp, -cyaw * sp);
                 let toward_cam = crate::spatial::Vec3::new(-(cp * syaw), sp, cp * cyaw); // -viewDir → toward eye
                 let scroll = (t * 0.12).sin() * 0.06; // gentle teleprompter drift
+                // WHICH LABELS GET DRAWN, decided on the label BOXES rather than the pearl bodies.
+                // The dimming pass below is about occlusion by a nearer node; it cannot see two
+                // labels of similar depth sitting side by side, which is how a cluster of turns
+                // ends up as one smear of overlapping text. `nodelabel::visible` keeps the nearest
+                // and drops what would collide with it.
+                const LABEL_CHARS: usize = 22;
+                // WHAT EACH NODE IS, above what it says — the information architecture of the
+                // reference cards, whose every plaque carries a type over its content line. Derived
+                // from the graph (pruned, root, fork, loopback, artifact) rather than from the
+                // reference's own vocabulary, which belongs to a worked example rather than to this
+                // data; see `noderole`. The common case is left untagged.
+                let node_roles = crate::noderole::roles(&g);
+                let label_of = |id: usize| -> String {
+                    match (g.nodes.iter().position(|nd| nd.id == id), g.nodes.iter().find(|nd| nd.id == id)) {
+                        (Some(i), Some(nd)) => crate::noderole::line(
+                            node_roles.get(i).copied().unwrap_or(crate::noderole::Role::Reply),
+                            &nd.preview, LABEL_CHARS),
+                        _ => String::new(),
+                    }
+                };
+                // LABELS RING THE CLUSTER rather than sitting on it — what the references actually
+                // do, and the better answer to crowding than hiding the losers: a label you cannot
+                // see is a turn you cannot read. Pushed radially from the graph's own centroid,
+                // which is the direction with room in it. The declutter below then runs on these
+                // moved positions and has far less to resolve.
+                // IN WORLD SPACE, not screen space. Pushing the screen anchor would decide
+                // visibility from boxes at one place while `label_cells` drew the text at another —
+                // a declutter measuring positions the labels do not occupy, which is the same
+                // one-step-removed mistake as auditing a palette that never renders. Offsetting the
+                // world point and projecting THAT keeps the box and the glyphs on the same spot.
+                const LABEL_PUSH_WORLD: f32 = 0.55;
+                // ONE CELL SIZE. `label_cells` lays 5x7 cells of this size and `px_extents` derives
+                // the collision box from it, so the number was written twice — once for the glyphs
+                // and once for the box. Change either and the declutter measures a rectangle the
+                // text does not occupy, silently. That is the two-copies-of-one-value defect this
+                // tree has shipped four times; it does not get a fifth.
+                const LABEL_CELL: f32 = 0.034;
+                // `spatial::centroid` already means this. I hand-rolled the x/z mean here and
+                // dupscan named it; that is the third copy of an existing helper this session.
+                let world_mid = crate::spatial::centroid(&pos);
+                // The rule lives in `nodelabel::outward` so the label text and its connector line
+                // read the SAME function and cannot disagree about where the label is. Inlining it
+                // here left the module's own copy with no callers — dead code written in the commit
+                // that fixed the previous mistake.
+                let label_pos = |id: usize| crate::nodelabel::outward(pos[id], world_mid, LABEL_PUSH_WORLD);
+                let anchor = |q: &(usize, f32, f32, f32)| -> (f32, f32) {
+                    view_cam.project(label_pos(q.0), cx, cy, scale)
+                        .map(|(sx, sy, _)| (sx, sy)).unwrap_or((q.1, q.2))
+                };
+                let show: std::collections::HashSet<usize> = {
+                    let placed: Vec<crate::nodelabel::LabelBox> = proj.iter().filter_map(|q| {
+                        let _nd = g.nodes.iter().find(|nd| nd.id == q.0)?;
+                        let chars = label_of(q.0).chars().count();
+                        // EXTENTS FROM THIS LABEL'S OWN DEPTH, using the same `scale` the projection
+                        // above used. The previous version passed a flat 7px advance, which asserts
+                        // a label ten metres away is as wide on screen as one at arm's length —
+                        // over-suppressing far labels and under-suppressing near ones, the two cases
+                        // the declutter exists to get right. LABEL_CELL is `label_cells`' own cell
+                        // size at this call site.
+                        let (w, h) = crate::nodelabel::px_extents(chars, LABEL_CELL, scale, q.3);
+                        let (ax, ay) = anchor(q);
+                        Some(crate::nodelabel::LabelBox { id: q.0, x: ax, y: ay, depth: q.3, w, h })
+                    }).collect();
+                    crate::nodelabel::visible(placed).into_iter().collect()
+                };
                 for q in &proj {
+                    if !show.contains(&q.0) { continue; }
                     let near = ((maxd - q.3) / span).clamp(0.0, 1.0);
                     let mut lit = ((near - 0.80) / 0.18).clamp(0.0, 1.0); // resolves only when very close
                     if lit < 0.05 { continue; }
@@ -4703,10 +4935,23 @@ which file you read.\n\n",
                     lit /= 1.0 + 1.5 * occ;
                     if lit < 0.05 { continue; }
                     if let Some(nd) = g.nodes.iter().find(|nd| nd.id == q.0) {
-                        let label: String = nd.preview.chars().take(16).collect();
-                        if label.trim().is_empty() { continue; }
-                        for cell in m3::label_cells(pos[q.0], right, up, toward_cam, label.trim(),
-                                                    0.034, t, theme::CYAN(), lit, scroll, tanim, m3::SceneLight::Uniform, 0) {
+                        // Word-safe, and prefixed with what the node IS when that is worth saying.
+                        let _ = nd;
+                        let label = label_of(q.0);
+                        if label.is_empty() { continue; }
+                        // A CONNECTOR, because the label no longer sits on its node. Pushing them
+                        // outward without a line leaves text floating with nothing tying it to the
+                        // turn it describes — the references always draw the leader. `m3::tube`
+                        // already exists for this; a second line primitive would have been the
+                        // fourth duplication this session.
+                        {
+                            let (a, b) = (pos[q.0], label_pos(q.0));
+                            let mut lead = m3::tube(a, b, 0.012, 4, theme::lerp_col(theme::CYAN(), theme::PANEL(), 0.45));
+                            lead.overlay = 1.0;
+                            graph.push(lead);
+                        }
+                        for cell in m3::label_cells(label_pos(q.0), right, up, toward_cam, &label,
+                                                    LABEL_CELL, t, theme::CYAN(), lit, scroll, tanim, m3::SceneLight::Uniform, 0) {
                             graph.push(cell);
                         }
                     }
@@ -6042,7 +6287,9 @@ which file you read.\n\n",
                 if label_fade > 0.02 {
                     let base = if t < 0.2 { theme::INK() } else { theme::DIM() };
                     p.text(egui::pos2(sx + radius + 5.0, sy), egui::Align2::LEFT_CENTER,
-                        format!("{}t · {}", nd.tokens, nd.preview.chars().take(22).collect::<String>()),
+                        // Same word-safe elision as the scene labels — a 2D list has more room for
+                        // the text but no more excuse for cutting it mid-word.
+                        format!("{}t · {}", nd.tokens, crate::nodelabel::elide_words(&nd.preview, 22)),
                         egui::FontId::proportional(11.0), base.gamma_multiply(label_fade));
                 }
             }
@@ -7978,7 +8225,24 @@ if let Some(msg) = self.error_banner.clone() {
                             ui.label(RichText::new("CONTEXT CARDS").color(theme::DIM()).small().strong());
                             if has_file {
                                 ui.add_space(3.0);
-                                ui.label(RichText::new(format!("📄 {}", doc.name)).color(theme::CYAN()).small());
+                                // NAME, SIZE, AND WHY IT IS HERE — the three facts the reference
+                                // cards carry and ours did not. The figure on the right is a COUNT
+                                // rendered as a ratio, always shown with its denominator: a bare
+                                // 0.67 in the panel whose job is explaining the context would read
+                                // as a model's confidence, and this is something a reader can check
+                                // by opening the file.
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("📄 {}", doc.name)).color(theme::CYAN()).small());
+                                    if let Some((_, hit, total)) = crate::ctxcard::topic_match(&doc.lines, &kws) {
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(RichText::new(crate::ctxcard::match_label(hit, total))
+                                                .color(if hit * 2 >= total { theme::AMBER() } else { theme::DIM() })
+                                                .small().monospace());
+                                        });
+                                    }
+                                });
+                                ui.label(RichText::new(crate::ctxcard::size_line(&doc.lines, doc.placeholder))
+                                    .color(theme::FAINT()).small());
                             }
                             if let Some(code) = &code {
                                 ui.add_space(4.0);
@@ -8037,6 +8301,93 @@ if let Some(msg) = self.error_banner.clone() {
                             }
                         }
                         RightPage::Context => {
+                            // SYSTEM STATUS, from real signals. The reference corner carries a dot
+                            // and "All systems operational"; hardcoding that would be a lie on
+                            // every fresh start — no model, the bundled sample standing in for the
+                            // operator's data, no project mounted — and a permanently-green light
+                            // asserts the things beside it are fine until the reader stops
+                            // checking them. See `sysstatus`; every signal there can veto.
+                            {
+                                let sig = crate::sysstatus::Signals {
+                                    model_loaded,
+                                    sample_doc: doc.placeholder,
+                                    project_mounted: self.gitmind_session.is_some(),
+                                    run_blocked: self.agent_run.as_ref()
+                                        .map(|r| r.phase() == Some("blocked")).unwrap_or(false),
+                                    // The backend is compiled in or it is not; `preferred()` already
+                                    // falls back, so reaching here means something is usable.
+                                    backend_ready: true,
+                                };
+                                let (level, msg) = crate::sysstatus::assess(&sig);
+                                let col = match level {
+                                    crate::sysstatus::Readiness::Ready => theme::GREEN(),
+                                    crate::sysstatus::Readiness::Degraded => theme::AMBER(),
+                                    crate::sysstatus::Readiness::NotReady => theme::RED(),
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("●").color(col).small());
+                                    ui.label(RichText::new(level.label()).color(col).small().strong());
+                                    ui.label(RichText::new(msg).color(theme::DIM()).small());
+                                });
+                                ui.add_space(theme::PAD_XS as f32);
+                            }
+                            // ACTIVE THREAD, pinned above everything else on this page. The status
+                            // line already says what the last turn did, and is overwritten by the
+                            // next one — for an unattended run left going for an hour, "what is it
+                            // doing and how long has it been" needs a fixed place to be answered.
+                            // Rows rather than a sentence: see `runcard`.
+                            if let Some(card) = self.agent_run.as_ref().map(|r| r.run_state()) {
+                                egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8),
+                                    inner_margin: egui::Margin::same(theme::PAD_SM),
+                                    outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() },
+                                    stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new("ACTIVE THREAD").color(theme::DIM()).small().strong());
+                                    for (label, value) in crate::runcard::rows(&card) {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(label).color(theme::FAINT()).small());
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(RichText::new(value).color(theme::INK()).small());
+                                            });
+                                        });
+                                    }
+                                });
+                                // The elapsed row ticks; without this it only advances when
+                                // something else asks for a frame.
+                                ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+                            }
+                            // ACTIVITY — one row per fan branch, WHILE it runs. The fan reported
+                            // itself only in `finish_agent_fan`, so a fan mid-flight was a single
+                            // status sentence and nothing else; which branch held the one worker,
+                            // and which were queued behind it, was not visible anywhere.
+                            let fan_rows: Vec<(String, crate::runcard::Doing, usize, bool, Option<bool>)> =
+                                self.agent_fan.as_ref().map(|f| f.summaries().into_iter()
+                                    .map(|b| (b.label, b.doing, b.files, b.verified, b.approved))
+                                    .collect()).unwrap_or_default();
+                            if !fan_rows.is_empty() {
+                                egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8),
+                                    inner_margin: egui::Margin::same(theme::PAD_SM),
+                                    outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() },
+                                    stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new("ACTIVITY").color(theme::DIM()).small().strong());
+                                    for (label, doing, detail) in crate::runcard::branch_rows(&fan_rows) {
+                                        ui.horizontal(|ui| {
+                                            // The branch holding the single worker is the one thing
+                                            // worth picking out of the list.
+                                            let hot = doing == "generating" || doing == "reviewing";
+                                            ui.label(RichText::new(label)
+                                                .color(if hot { theme::CYAN() } else { theme::INK() }).small());
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(RichText::new(doing)
+                                                    .color(if hot { theme::AMBER() } else { theme::FAINT() }).small());
+                                            });
+                                        });
+                                        ui.label(RichText::new(detail).color(theme::FAINT()).small());
+                                        ui.add_space(2.0);
+                                    }
+                                });
+                            }
                             // The physical PARAMS panel (dials + backend/persona/model selectors, in the
                             // spatial scene) is now the primary place for these controls. When it's active
                             // don't duplicate them here — a slider changed in two places at once is a bug
@@ -8136,7 +8487,61 @@ if let Some(msg) = self.error_banner.clone() {
                                 ui.add_space(6.0);
                             }
                             ui.separator();
-                            ui.label(RichText::new("Coordinator modes fan one task out to parallel workers over the same loaded model — no extra models needed. The per-mode line above says what each one changes today; `coordinator::plan()` builds a full worker plan for every mode and no runner consumes it yet, which is the single gap behind most of them.").color(theme::FAINT()).small());
+                            // ── MOVEMENT KEYS ────────────────────────────────────────────────
+                            ui.label(RichText::new("FREECAM KEYS").color(theme::FAINT()).small());
+                            for l in crate::navkeys::NavLayout::all() {
+                                let on = self.nav_layout == l;
+                                if ui.selectable_label(on, RichText::new(l.label())
+                                    .color(if on { theme::CYAN() } else { theme::INK() })).clicked() {
+                                    self.nav_layout = l;
+                                    self.persist_prefs();
+                                }
+                                ui.label(RichText::new(l.hint()).color(theme::DIM()).small());
+                                ui.add_space(3.0);
+                            }
+                            ui.add_space(4.0);
+                            ui.separator();
+                            // ── ENGINEERING PROFILES ─────────────────────────────────────────
+                            ui.label(RichText::new("WORKING DISCIPLINE").color(theme::FAINT()).small());
+                            let auto = self.profiles_manual.is_empty();
+                            if ui.selectable_label(auto, RichText::new("Autopilot")
+                                .color(if auto { theme::CYAN() } else { theme::INK() }).strong()).clicked() {
+                                self.profiles_manual.clear();
+                                self.persist_prefs();
+                            }
+                            ui.label(RichText::new("Chooses the posture from the task: a shader bug gets the GPU role's rule for verification, a slow path gets the optimizer's. Anything unrecognised gets the native-fullstack default, which is what a third of your turns — \"keep working\" — actually ask for.")
+                                .color(theme::DIM()).small());
+                            ui.add_space(4.0);
+                            for id in crate::engprofile::ProfileId::all() {
+                                let p = id.profile();
+                                let on = self.profiles_manual.contains(&id);
+                                if ui.selectable_label(on, RichText::new(p.name)
+                                    .color(if on { theme::CYAN() } else { theme::INK() })).clicked() {
+                                    // Order of selection is order of PRECEDENCE — the first picked
+                                    // wins a shared rule, which is what `compose` resolves by.
+                                    if on { self.profiles_manual.retain(|x| *x != id); }
+                                    else { self.profiles_manual.push(id); }
+                                    self.persist_prefs();
+                                }
+                                ui.label(RichText::new(p.when).color(theme::DIM()).small());
+                                ui.label(RichText::new(format!("source: {}", p.source))
+                                    .color(theme::FAINT()).small().italics());
+                                ui.add_space(4.0);
+                            }
+                            if !self.profiles_manual.is_empty() {
+                                // What the merge costs, stated before a run rather than discovered:
+                                // two profiles with a rule for the same thing means one is dropped.
+                                let b = crate::engprofile::compose(&self.profiles_manual, 6000);
+                                let mut note = format!("{} profile(s), {} bytes of prompt",
+                                    self.profiles_manual.len(), b.text.len());
+                                if !b.dropped.is_empty() {
+                                    note.push_str(&format!("; {} overlapping rule(s) resolved in favour of the earlier pick", b.dropped.len()));
+                                }
+                                if b.trimmed > 0 { note.push_str(&format!("; {} trimmed to fit", b.trimmed)); }
+                                ui.label(RichText::new(note).color(theme::CYAN()).small());
+                            }
+                            ui.separator();
+                            ui.label(RichText::new("Coordinator modes fan one task out to parallel workers over the same loaded model — no extra models needed. The per-mode line above says what each one changes today. `coordinator::plan()` now drives the fan: the steps of the plan your model wrote become the units it splits the work into, so a fan is only as good as the plan above it — and the same steps decide afterwards which ones were actually done.").color(theme::FAINT()).small());
                             // Replicator is the exception to that sentence and says so where the
                             // sentence is, rather than leaving the operator to discover that one
                             // entry behaves differently from the other seven.
@@ -8551,9 +8956,28 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
             if self.input.trim().is_empty() {
                 let sugg = self.suggestions(doc);
                 if !sugg.is_empty() {
+                    // KEYS ON THE CHIPS, as the reference panels print them beside every quick
+                    // action. Positional rather than per-action: these chips are generated from the
+                    // conversation, so binding a key to "Summarize" would bind it to nothing
+                    // whenever the last reply contained code. See `chords`.
+                    let picked = ui.input_mut(|i| {
+                        let mods = i.modifiers;
+                        (0..crate::chords::MAX_INDEXED.min(sugg.len())).find(|&n| {
+                            crate::chords::digit_for(n)
+                                .map(|k| crate::chords::fires(n, mods, k) && i.consume_key(egui::Modifiers::COMMAND, k))
+                                .unwrap_or(false)
+                        })
+                    });
+                    if let Some(n) = picked {
+                        if let Some(s) = sugg.get(n) { self.input = s.clone(); }
+                    }
                     ui.horizontal_wrapped(|ui| {
-                        for s in &sugg {
-                            if theme::carved_button_tinted(ui, s, theme::accent()).clicked() {
+                        for (n, s) in sugg.iter().enumerate() {
+                            let face = match crate::chords::chord_text(n) {
+                                Some(c) if n < crate::chords::MAX_INDEXED => format!("{s}  {c}"),
+                                _ => s.clone(),
+                            };
+                            if theme::carved_button_tinted(ui, &face, theme::accent()).clicked() {
                                 self.input = s.clone();
                             }
                         }
@@ -9065,6 +9489,18 @@ dense briefing that replaces them as the working context, then carry on with roo
                                 // header: role · branch pager · controls
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(who).color(c).small().strong());
+                                    // WHEN, beside WHO. Both clocks were already on `Msg` — `born`
+                                    // with a doc comment saying it exists to measure "3s ago" — and
+                                    // neither reached the screen: the only timestamps in the app
+                                    // were in the exported transcript. See `turn_age` for which
+                                    // clock is trusted and why a reopened session gets nothing
+                                    // rather than a fabricated one.
+                                    let now_unix = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs()).unwrap_or(0);
+                                    if let Some(age) = turn_age(m.at, m.born, now_unix) {
+                                        ui.label(RichText::new(age).color(theme::FAINT()).small());
+                                    }
                                     // node id — highlighted so it can be referenced in :mergectx (git-style prefix)
                                     ui.label(RichText::new(crate::vimmode::short_id(i)).monospace().small().color(theme::md_run_violet()))
                                         .on_hover_text("node id — reference it in :mergectx (a unique prefix works, e.g. :mergectx a9j,3df)");
@@ -10127,4 +10563,43 @@ mod stamp_persistence_tests {
         assert!(c.transcript().contains("1 hour later"));
     }
 
+
+
+    // ── when a turn happened ─────────────────────────────────────────────────────────────────────
+
+    /// The wall clock is trusted when it exists, because it is the only one that survives a save.
+    #[test]
+    fn a_recorded_time_is_measured_against_the_wall_clock() {
+        let born = std::time::Instant::now();
+        assert_eq!(super::turn_age(1000, born, 1003).as_deref(), Some("3s ago"));
+        assert_eq!(super::turn_age(1000, born, 1000 + 12 * 60).as_deref(), Some("12m ago"));
+        assert_eq!(super::turn_age(1000, born, 1000 + 2 * 3600).as_deref(), Some("2h ago"));
+    }
+
+    /// THE CASE THAT MADE THIS WORTH GETTING RIGHT. `born` is a monotonic `Instant` and cannot
+    /// survive a save, so on a reopened conversation every turn is stamped at load time. Trusting
+    /// it would report a three-day-old exchange as seconds old — a relative time that lies
+    /// confidently about an archive is worse than none.
+    #[test]
+    fn a_reopened_conversation_is_dated_from_the_saved_time_not_from_load() {
+        let just_loaded = std::time::Instant::now();      // elapsed ~0, as after a reload
+        let three_days = 3 * 24 * 3600;
+        let age = super::turn_age(1_000_000, just_loaded, 1_000_000 + three_days);
+        assert_eq!(age.as_deref(), Some("3d ago"), "the freshly-made Instant must not win");
+    }
+
+    /// A save from before the field existed carries 0. Nothing is the honest answer there.
+    #[test]
+    fn a_turn_with_no_recorded_time_shows_nothing_rather_than_a_guess() {
+        let just_loaded = std::time::Instant::now();
+        assert_eq!(super::turn_age(0, just_loaded, 1_000_000), None);
+    }
+
+    /// A clock that moved backwards — an NTP step, or a transcript saved on a machine set ahead —
+    /// must not underflow into a nonsense duration.
+    #[test]
+    fn a_backwards_clock_reports_zero_rather_than_a_century() {
+        let born = std::time::Instant::now();
+        assert_eq!(super::turn_age(2_000, born, 1_000).as_deref(), Some("0s ago"));
+    }
 }

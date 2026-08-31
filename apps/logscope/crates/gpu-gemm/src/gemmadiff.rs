@@ -605,6 +605,43 @@ mod tests {
         assert_eq!(s.kv_bytes_per_token(), (25 * 2048 + 5 * 1024) * 2 * 4);
     }
 
+    /// THE SAME NUMBER IS COMPUTED IN FOUR PLACES IN THIS CRATE, and two of them are live: this
+    /// per-layer sum, and `ctxwin::kv_bytes_per_token`'s uniform-layer product (which `Model::
+    /// kv_bytes_per_token` calls, and which feeds `plan_ctx` — so it decides the context window an
+    /// operator actually gets).
+    ///
+    /// They are not redundant: Gemma varies KV width per layer, so this one generalises the other.
+    /// But a generalisation and its special case MUST agree where the special case applies, and
+    /// nothing tied them together. Two copies of one predicate drifting is a defect this engine has
+    /// already had twice — the `contains("error")` classifier and the tool-name whitelist — so the
+    /// tie is asserted rather than assumed.
+    #[test]
+    fn the_per_layer_kv_sum_agrees_with_the_uniform_formula() {
+        // A shape with no sliding/full split: every layer identical, which is the case
+        // `ctxwin::kv_bytes_per_token` assumes.
+        let mut s = shape_26b();
+        s.head_dim_full = 256; s.n_kv_full = 8;   // == the swa values, so all layers match
+        s.swa_period = 6;
+        for il in 0..s.n_layer {
+            assert_eq!(s.kv_width(il), 256 * 8, "layer {il} is not uniform; the premise is wrong");
+        }
+        assert_eq!(
+            s.kv_bytes_per_token(),
+            crate::ctxwin::kv_bytes_per_token(s.n_layer as usize, 8, 256, 4),
+            "the per-layer sum and the uniform product disagree on a uniform model",
+        );
+    }
+
+    /// And where the layers are NOT uniform the two must differ — otherwise the test above is
+    /// passing for the trivial reason that one of them ignores its inputs.
+    #[test]
+    fn the_two_formulas_differ_where_the_layers_do() {
+        let s = shape_26b();   // 25 sliding at 2048, 5 full at 1024
+        let uniform_guess = crate::ctxwin::kv_bytes_per_token(s.n_layer as usize, 8, 256, 4);
+        assert_ne!(s.kv_bytes_per_token(), uniform_guess,
+                   "a mixed-width model should not match the uniform formula");
+    }
+
     #[test]
     fn validation_names_the_field_that_is_wrong() {
         let mut s = shape_26b();

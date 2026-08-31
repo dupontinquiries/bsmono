@@ -83,9 +83,21 @@ pub fn dequant_iq2_s(raw: &[u8], n: usize) -> Result<Vec<f32>, String> {
     for b in 0..blocks {
         let p = b * IQ2_S_BLOCK;
         let d = f16(raw[p], raw[p + 1]);
+        // BLOCK LAYOUT, from ggml-common.h: `{ ggml_half d; uint8_t qs[QK_K/4]; uint8_t qh[QK_K/32];
+        // uint8_t scales[QK_K/32]; }` — and `dequantize_row_iq2_s` reads the sign bytes as
+        // `signs = qs + QK_K/8`, i.e. from the SECOND HALF OF qs. So the byte order is
+        //     d(2) | qs[32] | signs[32] | qh(8) | scales(8)
+        // and not the qh-before-signs order the field declarations suggest.
+        //
+        // This module had qh at 34 and signs at 42, reading the first eight SIGN bytes as qh and
+        // then eight bytes of qh as signs. Found by differential against llama.cpp's own
+        // dequantizer on identical bytes: 186 of the first 256 weights disagreed, off by both sign
+        // and magnitude. It survives casual inspection because both fields are opaque bit-packed
+        // bytes — a wrong one produces plausible-looking numbers, not a crash, and IQ2_S models
+        // just decode as noise-flavoured garbage.
         let qs = &raw[p + 2..p + 34];
-        let qh = &raw[p + 34..p + 42];
-        let signs = &raw[p + 42..p + 74];
+        let signs = &raw[p + 34..p + 66];
+        let qh = &raw[p + 66..p + 74];
         let scales = &raw[p + 74..p + 82];
         for ib32 in 0..8 {
             // TWO scales per 32 weights, low nibble then high — where IQ2_XXS has one per group.
@@ -137,7 +149,11 @@ mod tests {
         assert_eq!(IQ2S_GRID.len(), 1024);
         let mut raw = vec![0u8; IQ2_S_BLOCK];
         raw[0] = 0x00; raw[1] = 0x3C;
-        raw[34] = 0b11;                                  // qh sub-block 0, l=0 -> +3<<8
+        // qh lives at 66, AFTER the 32 sign bytes — not at 34, which this test used to poke while
+        // believing it was qh. It was setting a sign byte, and passed anyway because the assertion
+        // it makes happens to hold when the grid index is 0 and the sign is positive. Corrected
+        // alongside the layout fix; see `iq2_s_matches_the_llama_cpp_reference_vector`.
+        raw[66] = 0b11;                                  // qh sub-block 0, l=0 -> +3<<8
         let v = dequant_iq2_s(&raw, 256).unwrap();
         let expect = IQ2S_GRID[3 << 8].to_le_bytes();
         assert_eq!(v[0], 0.125 * expect[0] as f32, "the qh bits must reach index 768");
@@ -396,4 +412,35 @@ mod iq3xxs_properties {
         assert_eq!(v[16], 3.5 * 0.25 * g[0] as f32, "second half takes the HIGH nibble");
     }
 
+
+    /// REFERENCE VECTOR from llama.cpp's own `dequantize_row_iq2_s`, on these exact bytes.
+    ///
+    /// This block layout was wrong in this file until a differential run against that function
+    /// disagreed on 186 of the first 256 weights. `qh` and `signs` were swapped: ggml-common.h
+    /// declares `{ d; qs[QK_K/4]; qh[QK_K/32]; scales[QK_K/32]; }`, which reads as qh-then-signs,
+    /// but the dequantizer takes `signs = qs + QK_K/8` — from the SECOND HALF OF qs. The real byte
+    /// order is d | qs[32] | signs[32] | qh[8] | scales[8].
+    ///
+    /// Pinned as numbers rather than as a re-derivation of the layout, because the layout is
+    /// exactly the thing that was misread once already.
+    #[test]
+    fn iq2_s_matches_the_llama_cpp_reference_vector() {
+        const RAW: [u8; IQ2_S_BLOCK] = [
+        225, 59, 3, 46, 17, 42, 50, 181, 121, 8, 15, 8, 177, 247, 237, 76,
+        46, 93, 58, 7, 249, 127, 33, 238, 35, 45, 23, 138, 32, 154, 246, 181,
+        136, 127, 102, 232, 9, 36, 2, 170, 73, 242, 193, 85, 27, 39, 254, 83,
+        38, 110, 73, 13, 177, 56, 72, 156, 232, 20, 213, 141, 20, 90, 139, 79,
+        153, 79, 237, 21, 197, 178, 253, 174, 239, 243, 23, 241, 87, 225, 224, 151,
+        140, 63,
+        ];
+        const EXPECT: [f32; 16] = [
+            14.77295, -46.16547, -79.4046, 46.16547, 46.16547, -14.77295, -46.16547, 14.77295,
+            14.77295, 79.4046, 46.16547, -79.4046, 14.77295, -79.4046, -79.4046, -46.16547,
+        ];
+        let got = dequant_iq2_s(&RAW, 256).unwrap();
+        for (i, (&e, &g)) in EXPECT.iter().zip(got.iter()).enumerate() {
+            assert!((e - g).abs() <= 1e-3 * e.abs().max(1.0),
+                    "weight {i}: reference {e}, got {g} - the block layout has drifted again");
+        }
+    }
 }

@@ -198,10 +198,14 @@ pub fn dot_q4_k(raw: &[u8], act_q: &[(f32, [i8; 32])], act_sum: &[f32]) -> f32 {
                 // Same slicing discipline as Q8_0: a fixed-size view proves the length once instead of
                 // a bounds check per nibble.
                 let nibs: &[u8; 32] = qs[qoff..qoff + 32].try_into().unwrap();
+                // UNSWITCHED. `half` is loop-invariant, but with the test inside the body the
+                // compiler emitted a mixed scalar/SIMD loop (18 vector vs 25 scalar instructions in
+                // the disassembly). Two straight-line loops give it 32 identical lanes to widen.
                 let mut acc = 0i32;
-                for l in 0..32 {
-                    let nib = if half == 0 { nibs[l] & 0xF } else { nibs[l] >> 4 };
-                    acc += (nib as i32) * (qa[l] as i32);
+                if half == 0 {
+                    for (&n, &a) in nibs.iter().zip(qa.iter()) { acc += ((n & 0xF) as i32) * (a as i32); }
+                } else {
+                    for (&n, &a) in nibs.iter().zip(qa.iter()) { acc += ((n >> 4) as i32) * (a as i32); }
                 }
                 // d*sc*sum(nib*a) - dmin*m*sum(a): the min term uses the activation sum, which does not
                 // depend on the weights and is therefore hoisted out of every row.

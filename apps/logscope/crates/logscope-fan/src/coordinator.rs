@@ -114,9 +114,9 @@ round shows whether your hint drove the conclusion or the question did.",
             Mode::Replicator =>
                 "Live. Selecting it opens the replicator UI: N columns over one workspace, one KV cache each, steerable mid-run.",
             Mode::Aggressive =>
-                "Partly live. Switches the chat to the fan-out view, and plan() gives it best-of-3 per unit — but no runner consumes that plan yet, so the extra runs do not happen.",
+                "Live once a plan exists. Switches the chat to the fan-out view and runs plan()'s workers as fan branches, best-of-3 per unit — the run count is reported before it starts, since best-of multiplies invisibly.",
             Mode::Coordinator =>
-                "Planned, not run. plan() decomposes the goal into one worker prompt per subtask with shared context; nothing executes the result yet.",
+                "Live once a plan exists. The steps of the plan the model wrote become the subtasks plan() fans out over: one branch per step, each told what its siblings are writing, each with its own stance. Without a plan (two steps or more) it degrades to a single worker, which is what every mode did before.",
             Mode::LongHorizon =>
                 "Advisory only. Its one real effect today is that it cannot interrupt — can_interrupt() is false, so a run in this mode will not stop to ask.",
             Mode::ThinkerLiaison =>
@@ -124,7 +124,7 @@ round shows whether your hint drove the conclusion or the question did.",
             Mode::LiaisonDebate =>
                 "Planned, not run. is_panel() is true and the panel prompts exist; nothing spawns the debaters.",
             Mode::StatefulGuide =>
-                "Partly live. The phase machine in engmode is real and tested — survey → plan → patch → check → diagnose, with the phase decided by compiler output — but the loop that drives it from a chat turn is not wired.",
+                "Live for workspace runs. With a project loaded, the agent loop drives engmode's phase machine — survey → plan → patch → check → diagnose — with the phase decided by COUNTED checker output. A TASK_COMPLETE without a clean check is rejected and counted; a stalled error count blocks the run instead of burning the budget; each green check commits a scratch checkpoint; and the check runs in the touched crate's own Cargo root, so a monorepo without a root Cargo.toml still verifies. It also requires PROOF rather than green: at the completion claim the suite is run, the run's work reverted, the suite run again, and the claim refused unless some test changed status — so a change no test can see cannot finish the run. That costs one extra suite run per completion claim.",
         }
     }
 
@@ -135,7 +135,7 @@ round shows whether your hint drove the conclusion or the question did.",
     /// chosen rather than in a footnote under eight of them.
     pub fn has_effect(self) -> bool {
         matches!(self, Mode::Barebones | Mode::Replicator | Mode::Aggressive
-                     | Mode::LongHorizon | Mode::StatefulGuide)
+                     | Mode::LongHorizon | Mode::StatefulGuide | Mode::Coordinator)
     }
 
     /// Does this mode run a debating panel?

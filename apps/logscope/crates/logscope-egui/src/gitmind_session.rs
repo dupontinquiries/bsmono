@@ -81,6 +81,49 @@ pub fn load_gitmind(project: &Path, session: &str, tmp_root: &Path) -> Result<Se
     Ok(Session { project: project.to_path_buf(), name: session.to_string(), ws })
 }
 
+/// Do two files differ, without holding either one in memory.
+///
+/// The previous form was `std::fs::read(a) != std::fs::read(b)` — both files allocated in full, for
+/// every file in the tree, to answer a yes/no. That is the same failure that took the backend out
+/// through the agent's read tools, in the path that decides what gets committed to the REAL project:
+/// one large file anywhere in a `.gitmind` workspace and `:reapply` dies instead of landing the
+/// session's work.
+///
+/// Length first (a mismatch is the common case and costs a stat), then a streamed chunk compare that
+/// stops at the first difference. Peak memory is two buffers regardless of file size, and an
+/// unreadable file is reported as "differs" so it is offered for review rather than silently
+/// dropped from the reapply.
+fn files_differ(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else { return true };
+    if ma.len() != mb.len() { return true; }
+    let (Ok(fa), Ok(fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else { return true };
+    let (mut ra, mut rb) = (std::io::BufReader::new(fa), std::io::BufReader::new(fb));
+    let (mut ba, mut bb) = ([0u8; 32 * 1024], [0u8; 32 * 1024]);
+    loop {
+        let na = match read_full(&mut ra, &mut ba) { Ok(n) => n, Err(_) => return true };
+        let nb = match read_full(&mut rb, &mut bb) { Ok(n) => n, Err(_) => return true };
+        if na != nb { return true; }
+        if na == 0 { return false; }
+        if ba[..na] != bb[..nb] { return true; }
+    }
+}
+
+/// Fill `buf` as far as the reader allows. `Read::read` may return a short count without being at
+/// EOF, and comparing short reads position-by-position would report two identical files as
+/// differing the moment the two readers chunked differently.
+fn read_full(r: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
+}
+
 /// Relative paths of files that were added or modified in the work copy vs the project. (Deletions
 /// aren't reapplied — a session adds/edits; removing files stays an explicit, separate action.)
 pub fn changed_files(work_dir: &Path, project: &Path) -> Vec<String> {
@@ -93,16 +136,16 @@ pub fn changed_files(work_dir: &Path, project: &Path) -> Vec<String> {
             if name == ".git" || name == "target" {
                 continue;
             }
-            if p.is_dir() {
+            // symlink_metadata, not is_dir: a symlink to an ancestor makes this walk descend
+            // forever, and a symlink to a device file makes the compare below read from it.
+            let Ok(md) = std::fs::symlink_metadata(&p) else { continue };
+            if md.file_type().is_symlink() { continue; }
+            if md.is_dir() {
                 walk(&p, work_root, project, out);
             } else if let Ok(rel) = p.strip_prefix(work_root) {
                 let rels = rel.to_string_lossy().replace('\\', "/");
                 let orig = project.join(&rels);
-                let differs = match (std::fs::read(&p), std::fs::read(&orig)) {
-                    (Ok(a), Ok(b)) => a != b,
-                    (Ok(_), Err(_)) => true, // new file
-                    _ => false,
-                };
+                let differs = if orig.exists() { files_differ(&p, &orig) } else { true };
                 if differs {
                     out.push(rels);
                 }
@@ -263,6 +306,86 @@ mod tests {
         assert_eq!(after.parse::<u32>().unwrap(), before.parse::<u32>().unwrap() + 1, "exactly one new commit");
         assert!(git(&proj, &["log", "-1", "--pretty=%s"]).unwrap().contains("logscope session: add-greeting"));
         assert!(std::fs::read_to_string(proj.join("src/lib.rs")).unwrap().contains("println!"), "edit landed in the project");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+
+    #[cfg(target_os = "linux")]
+    fn peak_rss_kib() -> u64 {
+        std::fs::read_to_string("/proc/self/status").ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM:")).map(str::to_string))
+            .and_then(|l| l.split_whitespace().nth(1).and_then(|n| n.parse().ok()))
+            .unwrap_or(0)
+    }
+
+    fn big(path: &Path, mib: usize, tail: &str) {
+        use std::io::Write;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        let line = "// sixty-four bytes of perfectly ordinary source text right here\n";
+        for _ in 0..(mib * (1024 * 1024) / line.len()) { f.write_all(line.as_bytes()).unwrap(); }
+        f.write_all(tail.as_bytes()).unwrap();
+        f.flush().unwrap();
+    }
+
+    /// `:reapply` compares every file in the workspace against the project to decide what to commit.
+    /// It used to do that with `fs::read(a) != fs::read(b)` — both files allocated in full — in the
+    /// path that writes to the user's REAL project. One large file and the reapply dies instead of
+    /// landing the session's work.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn comparing_large_files_does_not_allocate_them() {
+        let base = std::env::temp_dir().join(format!("gm-cmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (proj, work) = (base.join("proj"), base.join("work"));
+        // Same size, differing only at the very end — the worst case: length cannot reject it, and
+        // the streamed compare has to read all the way through.
+        big(&proj.join("src/huge.rs"), 128, "// original tail\n");
+        big(&work.join("src/huge.rs"), 128, "// modified tail\n");
+        let before = peak_rss_kib();
+        let changed = changed_files(&work, &proj);
+        let after = peak_rss_kib();
+        assert_eq!(changed, vec!["src/huge.rs".to_string()], "the difference is still found");
+        let grew_mib = after.saturating_sub(before) / 1024;
+        assert!(grew_mib < 16, "comparing two 128 MiB files grew peak RSS by {grew_mib} MiB");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn identical_large_files_are_not_reported_as_changed() {
+        let base = std::env::temp_dir().join(format!("gm-same-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (proj, work) = (base.join("proj"), base.join("work"));
+        // Big enough to span many chunk boundaries: a short read handled wrong reports these as
+        // differing, which would make reapply commit every unchanged file in the tree.
+        big(&proj.join("src/same.rs"), 4, "// tail\n");
+        big(&work.join("src/same.rs"), 4, "// tail\n");
+        assert!(changed_files(&work, &proj).is_empty(), "identical files must not be reported changed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_length_difference_is_caught_without_reading_content() {
+        let base = std::env::temp_dir().join(format!("gm-len-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (proj, work) = (base.join("proj"), base.join("work"));
+        write(&proj.join("a.txt"), "same length!!");
+        write(&work.join("a.txt"), "same length!!x");
+        assert_eq!(changed_files(&work, &proj), vec!["a.txt".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_symlink_does_not_send_the_walk_into_a_loop() {
+        let base = std::env::temp_dir().join(format!("gm-sym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (proj, work) = (base.join("proj"), base.join("work"));
+        write(&work.join("real.txt"), "content");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::os::unix::fs::symlink(&work, work.join("loop")).unwrap();
+        assert_eq!(changed_files(&work, &proj), vec!["real.txt".to_string()],
+                   "the walk terminates and still finds the real file");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

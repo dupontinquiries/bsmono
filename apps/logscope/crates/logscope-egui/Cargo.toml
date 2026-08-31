@@ -11,6 +11,11 @@ libc = "0.2"  # fabric daemon: signals (SIGTERM) + double-fork
 repo-map = { path = "../../../../shared/repo-map" }
 # the egui-free orchestration core (fan-out, dispatch, verdicts, command language)
 logscope-fan = { path = "../logscope-fan" }
+# XDG paths + INI, already used by hatch and settingsd — see src/prefs.rs.
+config-kit = { path = "../../../../shared/config-kit" }
+# aperture's completion-reply classifier (zero deps): the tested elision/stub detector
+# the agent write guard uses. See workspace_exec::classify_write.
+aperture-complete = { path = "../../../aperture/crates/aperture-complete" }
 png = "0.18"
 # glow-only backend (eframe default pulls wgpu, whose default limits exceed the
 # Asahi driver's max_color_attachments=5). glow sidesteps it.

@@ -33,7 +33,7 @@ pub mod enginestrip;
 #[allow(dead_code)] pub mod fabric;
 pub mod genguard;
 pub mod patchmode; // unified-diff patch mode: model edits via diffs instead of full-file rewrites
-pub mod hectormode; // working-discipline prompt block distilled from an observed engineering corpus
+pub mod engprofile; // composable engineering autopilot profiles (hardware/native/gpu/optimizer/planner)
 pub use logscope_fan::consensus;
 pub use logscope_fan::vimmode;
 pub use logscope_fan::treeexport;
@@ -116,6 +116,16 @@ pub use logscope_fan::cmdpalette;
 #[cfg(feature = "gui")] pub mod app;
 #[cfg(feature = "gui")] pub mod model;
 #[cfg(feature = "gui")] pub mod theme;
+#[cfg(feature = "gui")] pub mod roomtheme;
+#[cfg(feature = "gui")] pub mod prefs;      // the few choices that must survive a restart (via config-kit)
+#[cfg(feature = "gui")] pub mod sysstatus;  // the status light, derived from real signals — every one can veto
+#[cfg(feature = "gui")] pub mod runcard;    // the ACTIVE THREAD card: what the run is doing, as label/value rows
+#[cfg(feature = "gui")] pub mod chords;     // keyboard chords for the quick-action chips, with the collision rules as tests
+#[cfg(feature = "gui")] pub mod ctxcard;    // context-card facts: size line and a topic-match figure with its denominator
+#[cfg(feature = "gui")] pub mod noderole;   // what a node IS (root/fork/pruned/artifact…), for the label above its text
+#[cfg(feature = "gui")] pub mod nodelabel;  // node label text (word-safe elision) and which labels get drawn
+#[cfg(feature = "gui")] pub mod navkeys;    // freecam movement keys by keyboard layout (QWERTY WASD / Dvorak .oeu)
+#[cfg(feature = "gui")] pub mod nodetint;   // graph node colours derived from the space, audited for distinguishability  // chrome DERIVED from the room you are standing in, with a legibility audit over all 16
 #[cfg(feature = "gui")] pub mod ui;
 #[cfg(feature = "gui")] pub mod wizard;
 #[cfg(all(feature = "gui", feature = "gpu-scene"))] pub mod scene_preview;
@@ -191,6 +201,11 @@ pub use logscope_fan::coordinator; // gui gate was vestigial: zero gui refs (fan
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod interject;
 #[allow(dead_code)] pub mod mount; // pure (git/workspace, no egui) + imported by lean modules → not gui-gated
 #[allow(dead_code)] pub mod workspace_exec; // pure (std-only agent loop over an isolated tmp workspace) → not gui-gated
+pub mod phase_guide; // engmode's Fsm wired to the agent loop: observation → signal, phase → prompt (StatefulGuide)
+pub mod plancheck;   // is a plan step actually DONE? decided from what the run wrote, not from turns elapsing
+pub mod planrun;     // plan steps → coordinator subtasks → runnable branches (the planner's missing caller)
+pub mod branchshape; // per-branch conversation shape (depth/len/tokens/loop/pruned) — what the mind palace's rooms are built from
+pub mod oracle;      // is a change CORRECT? test-status delta, vacuous-test detection, differential port checking
 pub mod workergen; // corpus-recombined workers plus a hand-tuned legendary roster
 pub mod matrix;  // rows a message falls through, columns it can take, a director at each branch
 pub mod liaison; // operator-said vs organization-knows; the narrow protocol from the design note

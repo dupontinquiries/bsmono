@@ -73,9 +73,9 @@ impl eframe::App for ScenePreview {
                     egui::ComboBox::from_id_salt("scene-combo")
                         .selected_text(cur)
                         .show_ui(ui, |ui| {
-                            for p in crate::theme::PALETTES.iter() {
+                            for p in crate::roomtheme::spaces() {
                                 if ui.selectable_label(p.name == cur, p.name).clicked() {
-                                    crate::theme::install_palette(ui.ctx(), *p);
+                                    crate::theme::install_palette(ui.ctx(), p);
                                 }
                             }
                         });

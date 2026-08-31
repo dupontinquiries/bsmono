@@ -25,18 +25,28 @@ pub struct Palette {
     pub bad: Rgb,      // error
 }
 
-/// Relative luminance per WCAG 2.1 (sRGB linearized).
-fn luminance(c: Rgb) -> f32 {
+/// Relative luminance per WCAG 2.1 (sRGB linearized), on raw channels.
+///
+/// Channel-based rather than `Rgb`-based so the ONE implementation serves both callers: this module
+/// works in `Rgb`, `roomtheme` works in `egui::Color32`, and before this each had its own copy of
+/// the same arithmetic. That is the defect this repo's `dupscan` ratchet exists to catch, and it
+/// caught mine — `contrast` in both `palette` and `roomtheme` — after I had spent the session
+/// pointing at other people's duplicated predicates.
+pub fn luminance_rgb(r: u8, g: u8, b: u8) -> f32 {
     let lin = |v: u8| { let s = v as f32 / 255.0; if s <= 0.03928 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) } };
-    0.2126 * lin(c.0) + 0.7152 * lin(c.1) + 0.0722 * lin(c.2)
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
 }
 
-/// WCAG contrast ratio between two colors (1.0 … 21.0). ≥4.5 = AA for normal text, ≥3.0 = AA large.
-pub fn contrast(a: Rgb, b: Rgb) -> f32 {
-    let (la, lb) = (luminance(a), luminance(b));
+/// WCAG contrast ratio from two luminances (1.0 … 21.0). ≥4.5 = AA for normal text, ≥3.0 = AA large.
+pub fn contrast_lum(la: f32, lb: f32) -> f32 {
     let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
     (hi + 0.05) / (lo + 0.05)
 }
+
+fn luminance(c: Rgb) -> f32 { luminance_rgb(c.0, c.1, c.2) }
+
+/// WCAG contrast ratio between two colors (1.0 … 21.0).
+pub fn contrast(a: Rgb, b: Rgb) -> f32 { contrast_lum(luminance(a), luminance(b)) }
 
 /// The current app look, as a Palette (matches the existing theme:: consts).
 pub fn midnight() -> Palette {

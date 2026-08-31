@@ -56,6 +56,10 @@ pub enum Tool {
     /// models, bodies above that) and sanitized: refs and messages in a repo
     /// you did not write are attacker-controlled text.
     GitLog { n: usize, path: String },
+    /// DRY RUN a proposed section against a file: classify it into blocks and report what each one
+    /// would do. Writes nothing. The answer to "I have a chunk of code, is it safe to land and where
+    /// does it go" — see `Workspace::propose`.
+    Propose { path: String, content: String },
     /// PATCH an existing file: replace exactly ONE occurrence of a verbatim `find` anchor with
     /// `replace`. The context-economy primitive: big models re-emitting whole files is what fills the
     /// window and drags tok/s; an anchored edit is a few dozen tokens and — unlike unified diffs,
@@ -70,7 +74,41 @@ pub enum Tool {
     Doc { name: String, content: String },
 }
 
+/// Every tool name the runtime actually honours, canonical.
+///
+/// There are three places that must agree on this list — the `Tool` enum (what `apply` executes),
+/// the system prompt's menu (what a model is told it may call), and `queen::WorkerSpec::validate`'s
+/// whitelist (what a generated worker is permitted). They had drifted apart in both directions:
+/// `git_log` was implemented, budgeted through read_harness, and MISSING from the prompt, so no
+/// model was ever told it existed; meanwhile the only tool-name list the queen validated against
+/// was a test constant reading `["read_file","read_range","list","log","edit","run_tests"]` — three
+/// of which are not tools (`list_dir`, `git_log`, `run` are), so a worker spec naming real tools was
+/// REJECTED and one naming imaginary tools passed.
+///
+/// One list, and a test that fails if the enum grows a variant that is not in it.
+pub const RUNTIME_TOOLS: &[&str] = &[
+    "write_file", "edit", "read_file", "read_range", "list_dir", "search", "run", "git_log", "doc",
+    "propose",
+];
+
 impl Tool {
+    /// The wire name of this tool — the string a model puts in `"tool"`. Exhaustive over the enum,
+    /// so a new variant cannot be added without deciding its name here.
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            Tool::WriteFile { .. } => "write_file",
+            Tool::ReadFile { .. } => "read_file",
+            Tool::ListDir { .. } => "list_dir",
+            Tool::Run { .. } => "run",
+            Tool::Search { .. } => "search",
+            Tool::ReadRange { .. } => "read_range",
+            Tool::GitLog { .. } => "git_log",
+            Tool::Propose { .. } => "propose",
+            Tool::Edit { .. } => "edit",
+            Tool::Doc { .. } => "doc",
+        }
+    }
+
     /// A one-line human summary for the transcript / activity HUD.
     pub fn summary(&self) -> String {
         match self {
@@ -78,6 +116,7 @@ impl Tool {
             Tool::ReadFile { path } => format!("read {path}"),
             Tool::ListDir { path } => format!("ls {}", if path.is_empty() { "." } else { path }),
             Tool::GitLog { n, path } => if path.is_empty() { format!("git log -n {n}") } else { format!("git log -n {n} -- {path}") },
+            Tool::Propose { path, content } => format!("propose {} ({} B, dry run)", path, content.len()),
             Tool::Run { argv } => format!("run {}", argv.join(" ")),
             Tool::Search { pattern, path } => format!("search /{}/ in {}", pattern, if path.is_empty() { "." } else { path }),
             Tool::ReadRange { path, start, end } => format!("read {path}:{start}-{end}"),
@@ -132,6 +171,10 @@ pub struct Workspace {
     /// resolves to Mid — the budget that neither drowns a small model nor
     /// starves a large one — so a caller that never sets it still works.
     model_label: String,
+    /// The most recent green checkpoint this workspace committed, if any — the state a blocked run
+    /// is restored to. Kept here rather than on the driver because the workspace is what knows its
+    /// own git history, and both drivers share it.
+    last_green: Option<String>,
     /// The engine's tensor-derived parameter count, when known. Preferred over
     /// the label: filenames lie (a re-quantized 1B named "-7B-" is a real
     /// thing), tensor sizes cannot.
@@ -166,6 +209,7 @@ impl Workspace {
             rust_src: std::cell::OnceCell::new(),
             model_label: String::new(),
             model_params: None,
+            last_green: None,
         }
     }
 
@@ -174,9 +218,33 @@ impl Workspace {
         self.allow = bins.iter().map(|s| s.to_string()).collect();
         self
     }
+    /// ADD to the allowlist rather than replacing it.
+    ///
+    /// The allowlist exists to constrain what the MODEL can run. A verify command is the operator's
+    /// configuration, not the model's choice, and before this it was gated by the same list — so a
+    /// project whose suite is `make test`, `pytest`, `just check` or a shell script got
+    /// "command not allowed" as its check output on every single turn, forever, with the run
+    /// unable to finish because the gate can never go green. The same structural shape as running
+    /// `cargo check` where there is no Cargo.toml.
+    pub fn allow_also<I: IntoIterator<Item = S>, S: Into<String>>(mut self, bins: I) -> Self {
+        for b in bins {
+            let b = b.into();
+            // basename, matching how `run` gates: a configured `/usr/bin/make` must allow `make`.
+            let base = Path::new(&b).file_name().and_then(|s| s.to_str()).unwrap_or(&b).to_string();
+            self.allow.insert(base);
+        }
+        self
+    }
+
     pub fn with_timeout(mut self, d: Duration) -> Self { self.timeout = d; self }
 
     pub fn root(&self) -> &Path { &self.root }
+
+    /// The model class this workspace's budgets are sized for. Resolved from the engine's parameter
+    /// count when known, else the model label.
+    pub fn model_class(&self) -> crate::read_harness::ModelClass {
+        crate::read_harness::ModelClass::resolve(self.model_params, &self.model_label)
+    }
     pub fn events(&self) -> &[FileEvent] { &self.events }
     /// Drain the file-event feed (the GUI polls this each frame, then clears it).
     pub fn take_events(&mut self) -> Vec<FileEvent> { std::mem::take(&mut self.events) }
@@ -215,6 +283,7 @@ impl Workspace {
             Tool::ReadFile { path } => self.read_file(path),
             Tool::ListDir { path } => self.list_dir(path),
             Tool::GitLog { n, path } => self.git_log(*n, path),
+            Tool::Propose { path, content } => self.propose(path, content),
             Tool::Run { argv } => self.run(argv),
             Tool::Search { pattern, path } => self.search(pattern, path),
             Tool::ReadRange { path, start, end } => self.read_range(path, *start, *end),
@@ -329,33 +398,62 @@ impl Workspace {
             match self.resolve_read(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) }
         };
         let mut hits = Vec::new();
-        fn walk(dir: &Path, root: &Path, pat: &str, hits: &mut Vec<String>, cap: usize) {
+        let mut skipped_big = 0usize;
+        let mut skipped_bin = 0usize;
+        // THE WORST OFFENDER, PRE-FIX. This walked the whole workspace calling read_to_string on
+        // EVERY file — every vendored blob, every generated bundle, every `.gguf` model sitting in
+        // the tree — to grep for a symbol. One multi-GB file anywhere under the root and the process
+        // died, with nothing in the report naming a file. Now: size-capped, binary-skipped, and
+        // streamed a line at a time, so peak memory is one line regardless of what is in the tree.
+        fn walk(dir: &Path, root: &Path, pat: &str, hits: &mut Vec<String>, cap: usize,
+                skipped_big: &mut usize, skipped_bin: &mut usize) {
+            use std::io::BufRead;
             if hits.len() >= cap { return; }
             let Ok(rd) = std::fs::read_dir(dir) else { return };
             for e in rd.flatten() {
                 if hits.len() >= cap { return; }
                 let p = e.path();
                 let name = e.file_name().to_string_lossy().into_owned();
-                if name == ".git" || name == "target" { continue; }
-                if p.is_dir() { walk(&p, root, pat, hits, cap); }
-                else if let Ok(text) = std::fs::read_to_string(&p) {
-                    let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().into_owned();
-                    for (i, line) in text.lines().enumerate() {
-                        if line.contains(pat) {
-                            hits.push(format!("{}:{}: {}", rel, i + 1, line.trim()));
-                            if hits.len() >= cap { return; }
-                        }
+                // Directories that are never the answer and are always enormous. `target` and
+                // `.git` were already here; the rest are the same class of mistake found the hard way.
+                if matches!(name.as_str(), ".git" | "target" | "node_modules" | ".cargo" | "build-dir" | ".venv" | "__pycache__") { continue; }
+                // `symlink_metadata`, not `is_dir`: a symlink pointing at a parent turns this walk
+                // into an infinite descent, and a symlink to /dev/zero turns a read into an OOM.
+                let Ok(md) = std::fs::symlink_metadata(&p) else { continue };
+                if md.file_type().is_symlink() { continue; }
+                if md.is_dir() { walk(&p, root, pat, hits, cap, skipped_big, skipped_bin); continue; }
+                if md.len() > SEARCH_FILE_MAX { *skipped_big += 1; continue; }
+                let Ok(f) = std::fs::File::open(&p) else { continue };
+                let mut rdr = std::io::BufReader::new(f);
+                let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().into_owned();
+                let mut line = Vec::new();
+                let mut n = 0usize;
+                loop {
+                    line.clear();
+                    match rdr.read_until(b'\n', &mut line) { Ok(0) => break, Ok(_) => {}, Err(_) => break }
+                    if n == 0 && looks_binary(&line) { *skipped_bin += 1; break; }
+                    n += 1;
+                    let text = String::from_utf8_lossy(&line);
+                    if text.contains(pat) {
+                        let t = text.trim();
+                        // One hit is one LINE, and a minified bundle's line is the whole file.
+                        let shown: String = t.chars().take(300).collect();
+                        hits.push(format!("{rel}:{n}: {shown}"));
+                        if hits.len() >= cap { return; }
                     }
                 }
             }
         }
-        walk(&base, &self.root, pattern, &mut hits, 200);
-        ToolResult::ok(if hits.is_empty() { format!("no matches for /{pattern}/") } else { hits.join("\n") })
+        walk(&base, &self.root, pattern, &mut hits, 200, &mut skipped_big, &mut skipped_bin);
+        let mut note = String::new();
+        if skipped_big > 0 { note.push_str(&format!("\n[{skipped_big} file(s) over {} MiB skipped]", SEARCH_FILE_MAX / (1024 * 1024))); }
+        if skipped_bin > 0 { note.push_str(&format!("\n[{skipped_bin} binary file(s) skipped]")); }
+        ToolResult::ok(if hits.is_empty() { format!("no matches for /{pattern}/{note}") } else { format!("{}{note}", hits.join("\n")) })
     }
 
     fn read_range(&self, rel: &str, start: usize, end: usize) -> ToolResult {
+        use std::io::BufRead;
         let abs = match self.resolve_read(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
-        let text = match std::fs::read_to_string(&abs) { Ok(s) => s, Err(e) => return ToolResult::err(format!("read {rel}: {e}")) };
         let (start, end) = (start.max(1), end.max(start));
         // CLAMPED TO THE CLASS. A 1B that asks for lines 1..4000 gets what it
         // can actually use and is TOLD where it stopped, so its next call is a
@@ -366,11 +464,36 @@ impl Workspace {
             crate::read_harness::ModelClass::resolve(self.model_params, &self.model_label));
         let requested = end - start + 1;
         let end = if requested > b.chunk_lines { start + b.chunk_lines - 1 } else { end };
-        let total = text.lines().count();
-        let out: String = text.lines().enumerate()
-            .filter(|(i, _)| *i + 1 >= start && *i + 1 <= end)
-            .map(|(i, l)| format!("{}: {}", i + 1, l))
-            .collect::<Vec<_>>().join("\n");
+
+        // STREAMED, one line at a time. Reading a 400 MB file into a String to return 60 lines of it
+        // is the memory profile that took the backend out; a BufReader holds one line plus the
+        // wanted slice, whatever the file's size. The pass also counts the total, so the
+        // continuation hint stays exact without a second read.
+        let f = match std::fs::File::open(&abs) { Ok(f) => f, Err(e) => return ToolResult::err(format!("read {rel}: {e}")) };
+        let mut rdr = std::io::BufReader::new(f);
+        let mut out = String::new();
+        let mut total = 0usize;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match rdr.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => return ToolResult::err(format!("read {rel}: {e}")),
+            }
+            if looks_binary(&line) {
+                return ToolResult::err(format!("read {rel}: binary file — not read."));
+            }
+            total += 1;
+            if total >= start && total <= end {
+                let text = String::from_utf8_lossy(&line);
+                out.push_str(&format!("{total}: {}\n", text.trim_end_matches(['\n', '\r'])));
+            }
+            // Past the window AND past the point where the total still matters for the hint: a
+            // bounded scan beats an exact count on a file with millions of lines.
+            if total > end && total > start + b.chunk_lines + 100_000 { break; }
+        }
+        let out = out.trim_end_matches('\n').to_string();
         if out.is_empty() {
             return ToolResult::err(format!("{rel}: no lines in {start}..{end} (the file has {total})"));
         }
@@ -428,6 +551,12 @@ Continue with read_range {rel} {} {}]",
         if rel.starts_with('~') { return ToolResult::err(format!("{rel}: library roots (~std/~deps) are READ-ONLY")); }
         let abs = match self.sandbox_path(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
         let existed = abs.exists();
+        // BEFORE THE WRITE, NOT AFTER. A refusal the model can act on is worth far more than a
+        // diagnosis after the file is already gone.
+        let prev_bytes = if existed { std::fs::metadata(&abs).ok().map(|m| m.len()) } else { None };
+        if let WriteVerdict::Refuse(why) = classify_write(rel, contents, prev_bytes) {
+            return ToolResult::err(why);
+        }
         if let Some(parent) = abs.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 return ToolResult::err(format!("mkdir {rel}: {e}"));
@@ -453,6 +582,18 @@ Continue with read_range {rel} {} {}]",
         let abs = match self.sandbox_path(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
         if find.is_empty() {
             return ToolResult::err(format!("edit {rel}: empty find anchor — copy the exact text to replace"));
+        }
+        // An anchored edit must hold the whole file — it rewrites it — so this is the one read that
+        // cannot be streamed. Guard the size instead: an 8 MiB source file is pathological, and
+        // refusing with a reason beats an allocation that takes the process down mid-run.
+        const EDIT_FILE_MAX: u64 = 8 * 1024 * 1024;
+        if let Ok(md) = std::fs::metadata(&abs) {
+            if md.len() > EDIT_FILE_MAX {
+                return ToolResult::err(format!(
+                    "edit {rel}: {} bytes exceeds the {} MiB edit limit — an anchored edit rewrites the \
+whole file. Split it, or write the replacement with write_file if you truly mean to replace it.",
+                    md.len(), EDIT_FILE_MAX / (1024 * 1024)));
+            }
         }
         let text = match std::fs::read_to_string(&abs) {
             Ok(s) => s,
@@ -482,11 +623,22 @@ Continue with read_range {rel} {} {}]",
 
     fn read_file(&self, rel: &str) -> ToolResult {
         let abs = match self.resolve_read(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
-        match std::fs::read_to_string(&abs) {
-            Ok(s) => {
-                let capped: String = s.chars().take(self.max_output).collect();
-                let note = if capped.len() < s.len() { "\n…(truncated)" } else { "" };
-                ToolResult::ok(format!("{capped}{note}"))
+        // Bounded at the source — see `read_capped`. The size is reported when the file is bigger
+        // than the cap so the model knows a range read is the way to see the rest, rather than
+        // re-issuing the same read and getting the same prefix.
+        let size = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+        match read_capped(&abs, self.max_output) {
+            Ok((text, truncated)) => {
+                if looks_binary(text.as_bytes()) {
+                    return ToolResult::err(format!(
+                        "read {rel}: binary file ({size} bytes) — not read. Text tools cannot use it."));
+                }
+                let note = if truncated {
+                    let lines = text.lines().count();
+                    format!("\n…(truncated at {} of {size} bytes, about {lines} lines — use read_range \
+to continue from line {})", self.max_output, lines + 1)
+                } else { String::new() };
+                ToolResult::ok(format!("{text}{note}"))
             }
             Err(e) => ToolResult::err(format!("read {rel}: {e}")),
         }
@@ -495,21 +647,196 @@ Continue with read_range {rel} {} {}]",
     /// Commit history as a fenced, budgeted evidence block. The class comes
     /// from the run's configured model label, so the same tool gives a 1B
     /// eight subjects and a large model eighty with bodies.
+    /// The gitmind checkpoint sessions present in this repo, newest ref first.
+    ///
+    /// A gitmind timeline is not a separate database — it is `refs/checkpoints/<session>`, ordinary
+    /// git refs holding snapshot commits (see gitmind-core's CheckpointEngine, which writes them
+    /// with plain porcelain). So reading gitmind history costs a `for-each-ref` and no dependency
+    /// on gitmind at all.
+    pub fn gitmind_sessions(&self) -> Vec<String> {
+        let out = Command::new("git")
+            .args(["-C", &self.root.display().to_string(), "for-each-ref",
+                   "--format=%(refname)", "--sort=-committerdate", "refs/checkpoints/"])
+            .stdin(Stdio::null()).output();
+        match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines().map(str::to_string).filter(|l| !l.is_empty()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// DRY RUN a proposed section: classify it, say what each block would do, write nothing.
+    ///
+    /// ## Why a dry run is worth a tool call
+    ///
+    /// A model with a chunk of code has two bad options today. `write_file` risks the whole file on
+    /// a reply that may contain an elision (refused by `classify_write`, but only after the model
+    /// has spent the tokens emitting it), and `edit` needs a verbatim anchor the model may not have
+    /// read yet. Both fail late. This fails early and cheaply: hand over the section, get back a
+    /// PATCH SUMMARY — one line per block saying what it is, whether it is safe to land, whether it
+    /// is ALREADY in the file, and the anchor to use — then land the good blocks with `edit`.
+    ///
+    /// The classification is aperture's `multipass`, the same pass its editor uses to decide what a
+    /// completion may insert; the block keys are its home-row keys, so a block can be referred to by
+    /// name in the following turn. What is added here is the part that needs the repository: is this
+    /// block already present, and if not, where does it go.
+    fn propose(&self, rel: &str, content: &str) -> ToolResult {
+        use aperture_complete::multipass;
+        if content.trim().is_empty() {
+            return ToolResult::err("propose: empty content — send the section you want to land");
+        }
+        let abs = match self.resolve_read(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
+        // Bounded like every other read on this path; a proposal against a file too big to hold is
+        // a proposal that should be an anchored edit anyway.
+        let (existing, truncated) = read_capped(&abs, self.max_output).unwrap_or_default();
+        let file_known = abs.is_file() && !truncated;
+
+        let (mut blocks, prose) = multipass::plan(content);
+        multipass::assign_keys(&mut blocks);
+        if blocks.is_empty() && prose.is_empty() {
+            return ToolResult::err("propose: nothing to land — the content produced no blocks");
+        }
+
+        let mut out = format!("PATCH SUMMARY for {rel} (dry run — NOTHING was written)\n");
+        let mut landable = 0usize;
+        for b in &blocks {
+            let key = b.key.map(|c| c.to_string()).unwrap_or_else(|| "-".into());
+            let lines = b.text.lines().count();
+            let kind = match b.kind {
+                multipass::Kind::Code => "code",
+                multipass::Kind::Elision => "ELISION — would delete what it stands for",
+                multipass::Kind::Stub => "STUB — compiles to nothing",
+                multipass::Kind::Prose => "prose — comment only",
+            };
+            let mut note = String::new();
+            if b.kind.insertable() {
+                // ALREADY PRESENT is the finding that saves the most work: a model re-proposing code
+                // it already landed is the commonest wasted turn in a long run, and it is invisible
+                // without checking the file.
+                let present = file_known && block_present(&existing, &b.text);
+                if present {
+                    note.push_str(" — ALREADY IN THE FILE, nothing to do");
+                } else {
+                    landable += 1;
+                    note.push_str(&match anchor_for(&existing, &b.text) {
+                        Some(a) if file_known => format!(" — land with: edit {rel}, find {a:?}"),
+                        _ if !abs.exists() => " — file does not exist; write_file it".to_string(),
+                        _ => " — no obvious anchor; read the file and choose one".to_string(),
+                    });
+                }
+            }
+            out.push_str(&format!("  [{key}] {kind}, {lines} line(s): {}{note}\n", b.hint));
+        }
+        for p in prose.iter().take(3) {
+            let one: String = p.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect();
+            if !one.is_empty() { out.push_str(&format!("  (model commentary, not code) {one}\n")); }
+        }
+        out.push_str(&format!("{landable} block(s) worth landing. Nothing has been written — \
+use `edit` (or `write_file` for a new file) to land the ones you want.\n"));
+        ToolResult::ok(out)
+    }
+
+    /// Run the suite, revert the run's changes, run it again, restore. Returns
+    /// `(after, before_reverted)` test results for `oracle::vacuous` / `oracle::delta`.
+    ///
+    /// THE INVERSE-PATCH CHECK, automated. A test that passes with the change and also without it
+    /// does not test the change; a change whose suite is byte-identical before and after is
+    /// unproven. Both facts need the tree in two states, and the scratch is a git worktree, so the
+    /// second state is a `stash` away — no second copy of the repo, no model, no reviewer.
+    ///
+    /// `base` is the commit the comparison reverts to (the session baseline or the last green
+    /// checkpoint). The working tree is restored before returning even when the second run fails;
+    /// leaving the agent's workspace reverted would silently destroy the change it was verifying,
+    /// which is a far worse outcome than an unanswered question.
+    pub fn inverse_patch_check(&self, test_cmd: &[String], rel_dir: &str, base: &str)
+        -> Option<(String, String)> {
+        let git = |args: &[&str]| -> Option<String> {
+            let out = Command::new("git").args(args).current_dir(&self.root)
+                .stdin(Stdio::null()).output().ok()?;
+            if out.status.success() { Some(String::from_utf8_lossy(&out.stdout).trim().to_string()) } else { None }
+        };
+        // NO WORKTREE, NO PROOF. This must be an explicit check rather than a side effect of some
+        // git command failing later: the previous version relied on `stash push` erroring out, and
+        // when the stash was made conditional that fallback silently became "run the suite twice on
+        // an unreverted tree and conclude the change proved nothing" — which rejects every claim in
+        // any workspace without git. Caught by the fallback test, not by reading.
+        if git(&["rev-parse", "--is-inside-work-tree"]).as_deref() != Some("true") { return None; }
+
+        // ORDER MATTERS AND IS EASY TO GET WRONG: `after` is the suite ON THE CHANGE, so it runs
+        // before anything is reverted. The first draft of this stashed first and then measured
+        // `after`, which would have compared the reverted tree against itself and called every
+        // change vacuous.
+        let after = self.run_at(test_cmd, rel_dir).output;
+
+        // STASH ONLY IF THERE IS SOMETHING TO STASH. With `checkpoint_on_green` the run's work is in
+        // COMMITS, not in the working tree, so `stash push` has nothing to take — and the blind
+        // push/pop pair then failed on the pop and reported the agent's work as lost in the stash
+        // when it was never there. Found by the StatefulGuide test, which turns checkpoints on.
+        //
+        // Reverting to `base` handles both cases uniformly: it is behind the checkpoints as well as
+        // the working tree, so "the tree without this run's work" is the same operation either way.
+        let dirty = git(&["status", "--porcelain", "-uall"]).map(|s| !s.is_empty()).unwrap_or(false);
+        if dirty {
+            git(&["stash", "push", "-u", "-q", "-m", "logscope: inverse-patch check"])?;
+        }
+        // From here to the restore there is no `?`: an early return would leave the agent's work in
+        // the stash and the tree reverted, which is worse than any answer this function could give.
+        let _ = git(&["checkout", "-q", base, "--", "."]);
+        let reverted = self.run_at(test_cmd, rel_dir).output;
+        // Always restore, whatever happened above.
+        let _ = git(&["checkout", "-q", "HEAD", "--", "."]);
+        let popped = !dirty || git(&["stash", "pop", "-q"]).is_some();
+        if !popped {
+            // A failed pop means the agent's work is sitting in the stash rather than the tree.
+            // Say so loudly: this is the one outcome worse than not running the check.
+            crate::diag!("wgpu-engine: inverse-patch check could not restore the workspace — the \
+change is in `git stash` (run `git stash pop` in {})", self.root.display());
+            return None;
+        }
+        Some((after, reverted))
+    }
+
     fn git_log(&self, n: usize, path: &str) -> ToolResult {
         let b = crate::read_harness::budget(
             crate::read_harness::ModelClass::resolve(self.model_params, &self.model_label));
         let want = n.min(b.git_entries).max(1);
         let commits = crate::read_harness::read_git_log_path(&self.root, want, path);
-        if commits.is_empty() {
+
+        // GITMIND HISTORY, alongside git's. On a `.gitmind` project the checkpoint timeline is a
+        // second, finer-grained record of what this repository has been doing — often the more
+        // useful one, because a checkpoint is a working state rather than a curated commit. It is
+        // appended rather than merged: the two have different meanings and collapsing them into one
+        // list would let a model cite a mid-session snapshot as if it were released history.
+        let mut gm = String::new();
+        let sessions = self.gitmind_sessions();
+        if !sessions.is_empty() {
+            // A fraction of the entry budget: this is context on top of the git history above, and
+            // the checkpoint labels are short.
+            let per = (b.git_entries / 4).max(3);
+            for r in sessions.iter().take(3) {
+                let cps = crate::read_harness::read_git_log_ref(&self.root, per, path, r);
+                if cps.is_empty() { continue; }
+                let name = r.rsplit('/').next().unwrap_or(r);
+                gm.push_str(&crate::read_harness::git_history_block(
+                    &cps, &b, &format!("{} @ gitmind checkpoints/{name}", self.root.display())));
+            }
+        }
+
+        if commits.is_empty() && gm.is_empty() {
             return ToolResult::err(if path.is_empty() {
                 "no git history here (not a worktree, or git is unavailable)".to_string()
             } else {
                 format!("no history for {path} (unknown path, or not a worktree)")
             });
         }
-        let prov = if path.is_empty() { format!("{} @ HEAD", self.root.display()) }
-                   else { format!("{} @ HEAD -- {path}", self.root.display()) };
-        ToolResult::ok(crate::read_harness::git_history_block(&commits, &b, &prov))
+        let mut out = String::new();
+        if !commits.is_empty() {
+            let prov = if path.is_empty() { format!("{} @ HEAD", self.root.display()) }
+                       else { format!("{} @ HEAD -- {path}", self.root.display()) };
+            out.push_str(&crate::read_harness::git_history_block(&commits, &b, &prov));
+        }
+        out.push_str(&gm);
+        ToolResult::ok(out)
     }
 
     fn list_dir(&self, rel: &str) -> ToolResult {
@@ -529,6 +856,23 @@ Continue with read_range {rel} {} {}]",
     }
 
     fn run(&self, argv: &[String]) -> ToolResult {
+        self.run_at(argv, "")
+    }
+
+    /// Run an allowlisted command with its cwd at `rel_dir` INSIDE the workspace ("" = root). The
+    /// same gates as `run` — allowlist, no shell, timeout, output cap — plus containment on the
+    /// directory itself: a cwd outside the root would let a check command read a tree the sandbox
+    /// never granted. Used by the verifier when the workspace root is not a Cargo root (a `.gitmind`
+    /// monorepo): the check must run where the edited crate's Cargo.toml is, not where the mirror is.
+    pub fn run_at(&self, argv: &[String], rel_dir: &str) -> ToolResult {
+        let cwd = if rel_dir.is_empty() || rel_dir == "." {
+            self.root.clone()
+        } else {
+            match self.sandbox_path(rel_dir) { Ok(p) => p, Err(e) => return ToolResult::err(e) }
+        };
+        if !cwd.is_dir() {
+            return ToolResult::err(format!("run: {rel_dir} is not a directory in this workspace"));
+        }
         let Some(bin) = argv.first() else { return ToolResult::err("empty command") };
         let base = Path::new(bin).file_name().and_then(|s| s.to_str()).unwrap_or(bin);
         if !self.allow.contains(base) {
@@ -536,7 +880,7 @@ Continue with read_range {rel} {} {}]",
         }
         let start = Instant::now();
         let mut cmd = Command::new(bin);
-        cmd.args(&argv[1..]).current_dir(&self.root)
+        cmd.args(&argv[1..]).current_dir(&cwd)
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => return ToolResult::err(format!("spawn {base}: {e}")) };
 
@@ -577,6 +921,98 @@ Continue with read_range {rel} {} {}]",
     fn allowlist_str(&self) -> String {
         self.allow.iter().cloned().collect::<Vec<_>>().join(", ")
     }
+
+    /// Commit everything currently in the workspace as a restore point, returning the short hash.
+    /// Long-horizon insurance: when a later patch regresses a green state, the run (or the operator)
+    /// can diff/reset against the last checkpoint instead of the session baseline. Best-effort by
+    /// design — a workspace that is not a git worktree, or has nothing to commit, returns None and
+    /// the run proceeds; a checkpoint is an aid, never a gate.
+    pub fn git_checkpoint(&mut self, message: &str) -> Option<String> {
+        let git = |args: &[&str]| -> Option<String> {
+            let out = Command::new("git").args(args).current_dir(&self.root)
+                .stdin(Stdio::null()).output().ok()?;
+            if out.status.success() { Some(String::from_utf8_lossy(&out.stdout).trim().to_string()) } else { None }
+        };
+        git(&["add", "-A"])?;
+        // `commit` fails when there is nothing staged — exactly the "no new work since the last
+        // checkpoint" case, and the ? turns it into a clean None.
+        git(&["-c", "user.email=agent@logscope", "-c", "user.name=logscope-agent",
+              "commit", "-q", "-m", message])?;
+        let hash = git(&["rev-parse", "--short", "HEAD"])?;
+        self.last_green = Some(hash.clone());
+        Some(hash)
+    }
+
+    /// The most recent green checkpoint, if this run has produced one.
+    pub fn last_green(&self) -> Option<&str> { self.last_green.as_deref() }
+
+    /// Restore the working tree to a checkpoint WITHOUT losing the state being abandoned.
+    ///
+    /// A blocked run's tree does not compile — that is what blocked means — and the session's whole
+    /// product is whatever `reapply` copies out of it, so ending on the broken tree means landing
+    /// broken code on the real project. This puts the last green tree back.
+    ///
+    /// The state being abandoned is the most informative artifact the run produced, so it is
+    /// committed and TAGGED first, then the branch is reset to the checkpoint. The tag is what makes
+    /// the reset safe to state plainly: the abandoned commit is reachable by name, not merely
+    /// surviving in the reflog until it expires.
+    ///
+    /// A plain `checkout <green> -- .` was tried first and is wrong: it restores the paths present
+    /// in the checkpoint and leaves behind every file the broken attempt ADDED, so the tree ends up
+    /// as neither state. The test caught it.
+    ///
+    /// Returns the tag holding the abandoned state.
+    pub fn restore_to(&self, checkpoint: &str) -> Option<String> {
+        let git = |args: &[&str]| -> Option<String> {
+            let out = Command::new("git").args(args).current_dir(&self.root)
+                .stdin(Stdio::null()).output().ok()?;
+            if out.status.success() { Some(String::from_utf8_lossy(&out.stdout).trim().to_string()) } else { None }
+        };
+        git(&["add", "-A"])?;
+        git(&["-c", "user.email=agent@logscope", "-c", "user.name=logscope-agent",
+              "commit", "-q", "--allow-empty", "-m",
+              "agent: state at block (kept for inspection, not green)"])?;
+        let abandoned = git(&["rev-parse", "--short", "HEAD"])?;
+        let tag = format!("logscope-blocked-{abandoned}");
+        git(&["tag", "-f", &tag])?;
+        git(&["reset", "--hard", "-q", checkpoint])?;
+        Some(tag)
+    }
+}
+
+/// The Cargo roots a check should run in, given the workspace-relative files a run touched: the
+/// NEAREST enclosing directory with a `Cargo.toml`, per file, deduped and capped. A `.gitmind`
+/// project like the monorepo has NO root Cargo.toml — `cargo check` at the mirror root fails with
+/// "could not find Cargo.toml", a structural failure the model cannot patch, and `gate_done_on_verify`
+/// then makes every run unfinishable. Running in the touched crate's own directory instead both
+/// fixes that and scopes the check: cargo resolves the crate's enclosing workspace itself.
+///
+/// Returns workspace-relative dirs ("" = the root). Falls back to [""] when no touched file sits
+/// under a Cargo root, which preserves today's behavior for plain single-crate workspaces. The
+/// second element is how many roots were DROPPED by the cap — a run that sprayed across more crates
+/// than one turn can afford to check must say so rather than quietly checking a subset.
+pub fn resolve_check_roots_capped<'a>(root: &Path, touched: impl IntoIterator<Item = &'a str>, cap: usize) -> (Vec<String>, usize) {
+    let mut roots: BTreeSet<String> = BTreeSet::new();
+    for rel in touched {
+        let mut dir = Path::new(rel).parent().unwrap_or_else(|| Path::new(""));
+        loop {
+            if root.join(dir).join("Cargo.toml").is_file() {
+                roots.insert(dir.to_string_lossy().replace('\\', "/"));
+                break;
+            }
+            match dir.parent() {
+                Some(p) => dir = p,
+                None => break,
+            }
+        }
+    }
+    if roots.is_empty() {
+        return (vec![String::new()], 0);
+    }
+    let total = roots.len();
+    let kept: Vec<String> = roots.into_iter().take(cap.max(1)).collect();
+    let dropped = total - kept.len();
+    (kept, dropped)
 }
 
 fn truncate(s: &mut String, cap: usize) {
@@ -593,6 +1029,248 @@ fn default_allow() -> BTreeSet<String> {
      "ls", "cat", "head", "tail", "grep", "rg", "find", "wc",
      "git", "echo", "true", "test"]
         .iter().map(|s| s.to_string()).collect()
+}
+
+// ── the destructive-write guard ──────────────────────────────────────────────────────────────────
+
+/// What a proposed whole-file write actually is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriteVerdict {
+    /// Write it.
+    Ok,
+    /// Refuse, and tell the model exactly what is wrong with the content.
+    Refuse(String),
+}
+
+/// Judge a `write_file` before it lands, using aperture's tested reply classifier.
+///
+/// THE FAILURE THIS EXISTS FOR. A model asked to modify a 600-line file frequently returns the part
+/// it changed plus `// ... rest of the code remains the same`. As a suggestion in an editor that is
+/// reasonable shorthand. As a `write_file` it is a deletion: the file becomes the fragment, and the
+/// "rest of the code" the comment promises is gone. Worse, it often still COMPILES — a deleted
+/// helper that nothing in the remaining fragment calls leaves a green check — so the verify gate
+/// waves it through and the phase machine reaches Done on a truncated file. That combination, a
+/// destructive edit that passes its own check, is the one failure a long-horizon run must not have.
+///
+/// `aperture_complete::multipass` already detects these and is tested there; this is the policy
+/// layer over it, kept here because the POLICY is logscope's (refuse vs. suggest) while the
+/// DETECTION is aperture's.
+///
+/// Deliberately not applied to `edit`: an anchored find→replace is scoped by construction — an
+/// elision inside one replaces that region and nothing else — and it is the shape the loop should
+/// be pushing models toward anyway.
+pub fn classify_write(path: &str, contents: &str, existed_bytes: Option<u64>) -> WriteVerdict {
+    use aperture_complete::multipass;
+    // Only whole-file writes over EXISTING content can destroy anything. A new file containing an
+    // ellipsis comment is merely a bad new file, and refusing it would block legitimate scaffolding.
+    let Some(prev) = existed_bytes else { return WriteVerdict::Ok };
+
+    let elisions: Vec<&str> = contents.lines()
+        .filter(|l| multipass::is_elision(l))
+        .take(3)
+        .collect();
+    if !elisions.is_empty() {
+        return WriteVerdict::Refuse(format!(
+            "write {path}: REFUSED — this rewrites an existing {prev}-byte file and contains an \
+elision marker: {:?}. A `write_file` is not a diff: everything the marker stands in for would be \
+DELETED. Either emit the file in full, or — better — use `edit` with a verbatim anchor to change \
+just the region you mean.", elisions));
+    }
+    // A rewrite that collapses a substantial file to a stub is the same deletion wearing a
+    // different hat. The ratio matters, not the absolute size: a 40-byte file legitimately becomes
+    // a 20-byte one, while 60 KB becoming 300 bytes is a file being thrown away.
+    let now = contents.len() as u64;
+    if prev >= 2048 && now * 8 < prev {
+        return WriteVerdict::Refuse(format!(
+            "write {path}: REFUSED — this replaces {prev} bytes with {now}, dropping over 87% of the \
+file. If that is genuinely intended, write it with `edit` anchored on what you are removing, so the \
+deletion is explicit rather than a side effect of a short reply."));
+    }
+    if multipass::is_stub(contents) && prev >= 512 {
+        return WriteVerdict::Refuse(format!(
+            "write {path}: REFUSED — the replacement for this {prev}-byte file is a stub \
+(`todo!()`/`unimplemented!()`/an elided body). Write the real implementation, or leave the file \
+alone and say what is blocking you."));
+    }
+    WriteVerdict::Ok
+}
+
+
+
+// ── bounded reading: the difference between a big repo and an OOM ───────────────────────────────
+
+/// Bytes a single `search` will read from one file before giving up on it. A source file is
+/// kilobytes; anything past this is a vendored blob, a generated bundle, or a model weight, and
+/// reading it to grep for a symbol costs the whole file in RAM for no hits worth having.
+const SEARCH_FILE_MAX: u64 = 2 * 1024 * 1024;
+
+/// How much of a file is sniffed to decide whether it is text.
+const BINARY_SNIFF: usize = 8 * 1024;
+
+/// Read at most `cap` bytes of a file, allocating at most `cap`+1 bytes — never the file's size.
+///
+/// THIS IS THE MEMORY FIX. `read_to_string(path)` allocates the whole file, and the old `read_file`
+/// then did `.chars().take(cap).collect()` on top of it, so peak was 2× file size to return 64 KB.
+/// A `.gguf` or a vendored bundle in the tree therefore took the process out, and the report was a
+/// backend crash rather than anything naming a file. `Read::take` bounds the allocation at the
+/// source: the rest of the file is never in memory at all.
+///
+/// Returns (text, truncated). Invalid UTF-8 is replaced rather than erroring — a truncating read
+/// lands mid-codepoint routinely, and failing the whole read for that would be worse than a `�`.
+fn read_capped(path: &Path, cap: usize) -> std::io::Result<(String, bool)> {
+    use std::io::Read;
+    let f = std::fs::File::open(path)?;
+    let mut buf = Vec::with_capacity(cap.min(64 * 1024) + 1);
+    // cap+1 so a file of exactly `cap` bytes is not reported as truncated.
+    f.take(cap as u64 + 1).read_to_end(&mut buf)?;
+    let truncated = buf.len() > cap;
+    buf.truncate(cap);
+    Ok((String::from_utf8_lossy(&buf).into_owned(), truncated))
+}
+
+/// Is a proposed block already in the file, ignoring indentation and blank-line differences?
+///
+/// Whitespace-insensitive on purpose: a model re-emitting a function it already wrote almost never
+/// reproduces the exact indentation, and reporting "not present" for that sends it to re-land code
+/// that is already there — the wasted turn this check exists to prevent.
+fn block_present(existing: &str, block: &str) -> bool {
+    let norm = |s: &str| -> String {
+        s.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n")
+    };
+    let (h, n) = (norm(existing), norm(block));
+    !n.is_empty() && h.contains(&n)
+}
+
+/// A unique verbatim anchor near where a block would go: the last line of the file's existing text
+/// that the block's own first meaningful line suggests it follows.
+///
+/// Best-effort and honest about it — returns None rather than guessing when nothing is unique. A
+/// wrong anchor is worse than no anchor: `edit` refuses a non-unique one, but a unique-and-wrong one
+/// lands the change in the wrong place.
+fn anchor_for(existing: &str, block: &str) -> Option<String> {
+    let first = block.lines().map(str::trim).find(|l| !l.is_empty())?;
+    // The word most likely to identify the region: the longest identifier-ish token in the block's
+    // opening line (a function name, a type name).
+    let key = first.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| w.len() >= 4)
+        .max_by_key(|w| w.len())?;
+    let hits: Vec<&str> = existing.lines().filter(|l| l.contains(key)).collect();
+    if hits.len() == 1 { Some(hits[0].trim_end().to_string()) } else { None }
+}
+
+/// Is this content binary? A NUL byte in the first few KB is the same heuristic grep uses, and it
+/// is the one that matters here: a text scan of a binary produces garbage lines that then travel
+/// into the model's context as if they were code.
+fn looks_binary(head: &[u8]) -> bool {
+    head.iter().take(BINARY_SNIFF).any(|&b| b == 0)
+}
+
+// ── transcript compaction: the bound that lets a run outlive its context window ─────────────────
+
+
+
+/// The turn separator `step_turn` appends. Compaction splits on it, so it is one constant rather
+/// than a literal in two places.
+pub const TURN_MARK: &str = "\n\nASSISTANT:\n";
+
+/// Transcript byte budget by model class. Deliberately much smaller than the model's real window:
+/// the prompt is not the only thing in it (the reply and the KV headroom are), and a transcript
+/// that fills the window is a transcript whose middle gets elided by the ENGINE, silently and at
+/// whatever byte boundary it lands on. Bounding it here means the elision is chosen — head and
+/// recent turns kept, middle replaced by a digest — rather than suffered.
+pub fn transcript_budget(class: crate::read_harness::ModelClass) -> usize {
+    match class {
+        crate::read_harness::ModelClass::Small => 24 * 1024,
+        crate::read_harness::ModelClass::Mid => 96 * 1024,
+        crate::read_harness::ModelClass::Large => 320 * 1024,
+        crate::read_harness::ModelClass::Sota => 1200 * 1024,
+    }
+}
+
+/// Compact an over-budget transcript: keep the head (system prompt — the task, the repo tree, the
+/// tool protocol) and the last `keep_recent` turns verbatim, and replace everything between them
+/// with `digest`.
+///
+/// WHAT IS KEPT IS THE POINT. The head holds the task; drop it and the run forgets what it is
+/// doing. The recent turns hold the live working set — the last check's errors, the file just read
+/// — and a model that loses those repeats the work that produced them. The middle is where the
+/// redundancy is: whole files read four turns ago, superseded compiler dumps, tool results already
+/// acted on. That is what the digest replaces, and the digest carries the durable facts (files
+/// touched, check history, phase) so nothing load-bearing is merely forgotten.
+///
+/// Returns None when there is nothing to do — under budget, no turn boundary found (the head is
+/// never cut), too few turns to elide any, or a rewrite that would not actually be smaller.
+///
+/// `keep_recent` is a CEILING, not a promise. Two kept turns that are 5 KB each cannot fit an 8 KB
+/// budget, so the window shrinks — 3, then 2, then 1 — until the result fits. If even the head plus
+/// one turn exceeds the budget, that is not something transcript compaction can fix (one tool
+/// observation is larger than the entire budget; the read budget or the model class is the wrong
+/// one) and the smallest available form is returned rather than a pretence of success.
+pub fn compact_transcript(prompt: &str, max_bytes: usize, keep_recent: usize, digest: &str) -> Option<(String, usize)> {
+    if max_bytes == 0 || prompt.len() <= max_bytes { return None; }
+    let head_end = prompt.find(TURN_MARK)?;
+    let head = &prompt[..head_end];
+    let turns: Vec<&str> = prompt[head_end..].split(TURN_MARK).skip(1).collect();
+    if turns.len() <= keep_recent { return None; }
+
+    let render = |keep: usize| -> (String, usize) {
+        let elided = turns.len() - keep;
+        let mut out = String::new();
+        out.push_str(head);
+        out.push_str(&format!(
+            "\n\n[CONTEXT COMPACTED: {elided} earlier turn(s) replaced by this summary to stay inside the \
+window. The work they describe HAPPENED — treat the summary as fact, and re-read a file rather than \
+assuming its old contents are still in view.]\n{digest}\n"));
+        for t in &turns[elided..] {
+            out.push_str(TURN_MARK);
+            out.push_str(t);
+        }
+        (out, elided)
+    };
+
+    let mut best = render(keep_recent.max(1));
+    for keep in (1..keep_recent.max(1)).rev() {
+        if best.0.len() <= max_bytes { break; }
+        best = render(keep);
+    }
+    if best.0.len() >= prompt.len() { return None; }
+    Some(best)
+}
+
+/// The durable facts a compaction must not lose: what the run has touched, what the checks said,
+/// and where the phase machine places it. Built from state the loop already holds — nothing here is
+/// a model's account of its own work.
+pub fn run_digest(ws: &Workspace, plan: &Plan, guide: Option<&crate::phase_guide::Guide>) -> String {
+    let mut s = String::from("SUMMARY OF THE ELIDED TURNS (facts, not narration):\n");
+    let mut paths: Vec<&str> = ws.events().iter().map(|e| e.path.as_str()).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    if paths.is_empty() {
+        s.push_str("  files written: none yet\n");
+    } else {
+        let shown: Vec<&str> = paths.iter().take(30).copied().collect();
+        s.push_str(&format!("  files written ({}): {}{}\n", paths.len(), shown.join(", "),
+                            if paths.len() > shown.len() { ", …" } else { "" }));
+    }
+    if !plan.is_empty() {
+        // The honest three-way summary, not a collapsed ratio. This text goes into the model's own
+        // context as fact when turns are elided, so an unverified step must not read as a done one.
+        s.push_str(&format!("  plan: {}\n", plan.summary()));
+        for st in plan.steps.iter().take(9) {
+            let mark = if st.done { "x" } else if st.unverifiable { "?" } else { " " };
+            let ev = st.evidence.as_deref().map(|e| format!("  (wrote {e})")).unwrap_or_default();
+            s.push_str(&format!("    [{mark}] {}{ev}\n", st.text));
+        }
+    }
+    if let Some(g) = guide {
+        s.push_str(&format!("  phase: {}\n", g.phase_label()));
+        let pats = g.pattern_report();
+        if !pats.is_empty() {
+            s.push_str("  what has moved the error count on this repo:\n");
+            for p in pats.iter().take(5) { s.push_str(&format!("    {p}\n")); }
+        }
+    }
+    s
 }
 
 // ── agent configuration: plan-then-act (2), verify-as-you-go (1), read policy (4) ────────────────
@@ -627,12 +1305,10 @@ pub struct AgentConfig {
     /// Doc mode: teach the agent the document-organization convention (front-matter + section tree +
     /// generated index) so its docs stay organized and, in a fan, merge cleanly across branches.
     pub doc_mode: bool,
-    /// HectorMode: fold in the working-discipline block (find the oracle,
-    /// observe before building, verify by measuring output rather than exit
-    /// status, name the layer before editing, report dead ends, never write
-    /// unverified work in the past tense). Distilled from a 472-hour observed
-    /// engineering corpus rather than from taste; see `hectormode.rs`. Costs
-    /// ~450 tokens of prompt (`HECTOR_MODE_BRIEF` is ~120 for small windows).
+    /// LEGACY: the single working-discipline block, now `engprofile::HARDWARE`.
+    ///
+    /// Kept because callers set it, and it maps to `[ProfileId::Hardware]` when `profiles` is empty.
+    /// Prefer `profiles`, which composes several roles and sizes itself to the model class.
     pub hector_mode: bool,
     /// Patch-first editing (context economy for big models): instruct the model to modify EXISTING
     /// files with the `edit` tool (anchored find→replace) rather than re-emitting whole files.
@@ -649,6 +1325,57 @@ pub struct AgentConfig {
     /// shared docs earlier workers wrote (`collect_shared_docs`). Turn 0 should never be blind —
     /// a model that can't see the repo asks the user about it instead of exploring it.
     pub context: String,
+    /// StatefulGuide: drive the run through engmode's phase machine (survey → plan → patch → check
+    /// → diagnose), with the phase decided by counted checker output rather than the model's
+    /// narrative. Adds evidence-gated completion (a TASK_COMPLETE without a clean check is rejected
+    /// and said so), a stall detector that stops the run when the error count stops falling, and a
+    /// per-turn phase instruction in the prompt. This is the wiring `coordinator::Mode::StatefulGuide`
+    /// used to describe as missing.
+    pub stateful_guide: bool,
+    /// Commit the workspace as a restore point each time verification comes back green. A
+    /// long-horizon run's later mistake can then be diffed/reset against the last green state rather
+    /// than the session baseline. Best-effort: a non-git workspace simply never checkpoints.
+    pub checkpoint_on_green: bool,
+    /// Transcript byte budget before compaction (see `compact_transcript`). 0 = derive from the
+    /// workspace's model class, which is what every caller should want; a non-zero value is an
+    /// explicit override. There is no "unbounded" setting on purpose: the append-only prompt WILL
+    /// exceed any window on a long run, and the choice is only ever between choosing what to elide
+    /// and letting the engine drop the middle of the prompt.
+    pub max_prompt_bytes: usize,
+    /// Turns kept verbatim at the tail when compacting: the live working set (the last check's
+    /// errors, the file just read). Below 2 a model loses the observation it is mid-way through
+    /// acting on, so the value is floored at 2 where it is used.
+    pub keep_recent_turns: usize,
+    /// The model this run is driving, for sizing every budget that depends on the class: read
+    /// chunks, git entries, and the transcript bound. Empty label + None params resolve to Mid,
+    /// which is the harness's deliberate "unknown" — but a 1B run sized as Mid drowns and a 70B run
+    /// sized as Mid is starved, so a caller that KNOWS should say. `AgentRun::start` applies these
+    /// to the workspace it builds; `run_agent_cfg` takes a caller-built workspace and leaves it alone.
+    pub model_label: String,
+    pub model_params: Option<u64>,
+    /// The worker's STANCE, from `coordinator::plan()` — how this branch should approach its unit,
+    /// as distinct from the tool protocol every branch shares. Empty for an ordinary run.
+    ///
+    /// It exists because the planner produces a system prompt per worker and there was nowhere to
+    /// put it: a runner that dropped it would fan out the work and discard the only thing that made
+    /// the branches different from each other.
+    pub persona: String,
+    /// Require PROOF, not just a green suite, before a completion claim is accepted.
+    ///
+    /// A green suite after a change is consistent with three different worlds: the change fixed
+    /// something a test caught, the change did nothing and the suite was already green, or the
+    /// change broke something nothing covers. `oracle` can tell the first from the second by
+    /// reverting the work and re-running — see `Workspace::inverse_patch_check`. Costs one extra
+    /// suite run, ONCE, at the moment the claim is made.
+    pub require_proof: bool,
+    /// Extra binaries the run may execute, on top of the built-in allowlist. The verify command's
+    /// own binary is added automatically; this is for anything else a project's checks need.
+    pub extra_allow: Vec<String>,
+    /// Engineering autopilot profiles, in order of PRECEDENCE — see `engprofile`. Empty = none.
+    ///
+    /// Supersedes `hector_mode`, which is the single Hardware profile and is still honoured: a run
+    /// setting the old bool gets `[Hardware]` unless it named profiles explicitly.
+    pub profiles: Vec<crate::engprofile::ProfileId>,
 }
 
 impl Default for AgentConfig {
@@ -668,6 +1395,16 @@ impl Default for AgentConfig {
             prefer_patches: true,
             digest_verify: true,
             context: String::new(),
+            stateful_guide: false,
+            checkpoint_on_green: false,
+            max_prompt_bytes: 0, // derive from the model class
+            keep_recent_turns: 3,
+            model_label: String::new(),
+            model_params: None,
+            persona: String::new(),
+            require_proof: false,
+            extra_allow: Vec::new(),
+            profiles: Vec::new(),
         }
     }
 }
@@ -688,7 +1425,17 @@ impl AgentConfig {
 /// A parsed plan step (2): the visible checklist the model commits to before acting. `done` is flipped as
 /// the run progresses so the UI can tick it off.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PlanStep { pub text: String, pub done: bool }
+pub struct PlanStep {
+    pub text: String,
+    /// Verified done: a file this step NAMES was written or edited. See `plancheck` for why this is
+    /// not "a turn happened".
+    pub done: bool,
+    /// The write that satisfied it, for the HUD and the digest — a completion nobody can point at
+    /// is the thing this replaced.
+    pub evidence: Option<String>,
+    /// Names no file, so no write can confirm it. Reported apart from pending rather than folded in.
+    pub unverifiable: bool,
+}
 
 /// The plan the model emits up front. Empty if it dove straight into tool calls.
 #[derive(Clone, Debug, Default)]
@@ -696,8 +1443,38 @@ pub struct Plan { pub steps: Vec<PlanStep> }
 impl Plan {
     pub fn is_empty(&self) -> bool { self.steps.is_empty() }
     pub fn progress(&self) -> (usize, usize) { (self.steps.iter().filter(|s| s.done).count(), self.steps.len()) }
-    /// Mark the first not-yet-done step done (called once per completed action batch).
-    pub fn advance(&mut self) { if let Some(s) = self.steps.iter_mut().find(|s| !s.done) { s.done = true; } }
+
+    /// Re-decide every step against the paths this run has WRITTEN.
+    ///
+    /// Replaces `advance()`, which marked the next step done whenever a turn made any tool call —
+    /// so three read-only turns closed a three-step plan. Recomputed from the whole write feed
+    /// rather than accumulated, so it cannot drift: a step is done iff a write matching it exists.
+    pub fn recheck(&mut self, written: &[String]) {
+        for s in &mut self.steps {
+            match crate::plancheck::state_of(&s.text, written) {
+                crate::plancheck::StepState::Done => {
+                    s.done = true;
+                    s.unverifiable = false;
+                    if s.evidence.is_none() {
+                        s.evidence = crate::plancheck::step_targets(&s.text).into_iter()
+                            .find_map(|t| written.iter().find(|w| crate::plancheck::target_matches(&t, w)).cloned());
+                    }
+                }
+                crate::plancheck::StepState::Pending => { s.done = false; s.unverifiable = false; }
+                crate::plancheck::StepState::Unverifiable => { s.done = false; s.unverifiable = true; }
+            }
+        }
+    }
+
+    /// done / pending / unverifiable, for the HUD and the compaction digest.
+    pub fn summary(&self) -> String {
+        let states: Vec<_> = self.steps.iter().map(|s| {
+            if s.done { crate::plancheck::StepState::Done }
+            else if s.unverifiable { crate::plancheck::StepState::Unverifiable }
+            else { crate::plancheck::StepState::Pending }
+        }).collect();
+        crate::plancheck::summarize(&states)
+    }
 }
 
 /// Parse a plan from the model's turn: a fenced ```plan block, or a leading numbered/bulleted list. Each
@@ -757,14 +1534,14 @@ pub fn parse_plan(text: &str) -> Plan {
     let steps: Vec<PlanStep> = head.lines()
         .map(|l| l.trim())
         .filter(|l| is_list_item(l))
-        .map(|l| PlanStep { text: strip_marker(l), done: false })
+        .map(|l| PlanStep { text: strip_marker(l), done: false, evidence: None, unverifiable: false })
         .collect();
     Plan { steps }
 }
 
 fn lines_to_steps(block: &str) -> Vec<PlanStep> {
     block.lines().map(|l| l.trim()).filter(|l| !l.is_empty())
-        .map(|l| PlanStep { text: strip_marker(l), done: false }).collect()
+        .map(|l| PlanStep { text: strip_marker(l), done: false, evidence: None, unverifiable: false }).collect()
 }
 /// Drop lines inside a nested fenced block.
 ///
@@ -967,6 +1744,10 @@ fn parse_one(block: &str) -> Option<Tool> {
             path: json_str(block, "path").unwrap_or_default(),
         }),
         "list_dir" => Some(Tool::ListDir { path: json_str(block, "path").unwrap_or_default() }),
+        "propose" | "dry_run" => Some(Tool::Propose {
+            path: json_str(block, "path")?,
+            content: json_str(block, "content").or_else(|| json_str(block, "contents"))?,
+        }),
         "doc" | "share_doc" | "write_doc" => Some(Tool::Doc {
             name: json_str(block, "name")?,
             content: json_str(block, "content").or_else(|| json_str(block, "contents"))?,
@@ -1171,8 +1952,14 @@ pub fn collect_shared_docs(root: &std::path::Path, budget: usize) -> String {
         // Another worker's document is CONTENT, not instruction: neutralize defangs tool-call
         // syntax inside it, so worker A cannot make worker B run something by writing it into a
         // shared doc — the fan's own channel is the easiest injection path it has.
-        let body = crate::taint::neutralize(&std::fs::read_to_string(&f).unwrap_or_default());
-        let take = (budget - s.len()).min(body.len());
+        // Bounded read: a shared doc is written by another agent run, so its size is not something
+        // this process controls — a worker that dumped a whole file into one would otherwise be
+        // read entirely into memory just to slice `budget` bytes off it. Reads one byte more than
+        // the remaining budget so the truncation note below stays accurate.
+        let room = budget.saturating_sub(s.len());
+        let raw = read_capped(&f, room + 1).map(|(t, _)| t).unwrap_or_default();
+        let body = crate::taint::neutralize(&raw);
+        let take = room.min(body.len());
         // cut on a char boundary
         let mut cut = take; while cut < body.len() && !body.is_char_boundary(cut) { cut += 1; }
         s.push_str(&format!("### shared doc: {name}\n{}\n\n", &body[..cut.min(body.len())]));
@@ -1231,10 +2018,26 @@ you. Favor code that compiles over clever code that might not; when you see erro
     let doc_note = if cfg.doc_mode { format!("\n\n{}", crate::docorg::DOC_ORG_GUIDE) } else { String::new() };
     // Working discipline. Placed with the other mode blocks so prompt order
     // stays stable across runs (a moving prompt invalidates KV reuse).
-    let hector_note = if cfg.hector_mode {
-        format!("\n\n{}", crate::hectormode::HECTOR_MODE_GUIDE)
-    } else { String::new() };
+    // WORKING DISCIPLINE. `profiles` supersedes the single `hector_mode` bool, which maps to the
+    // Hardware profile so existing callers keep exactly what they had. The byte budget comes from
+    // the model class: a 1B spending 3 KB of a 2k window on discipline has no window left for code.
+    let hector_note = {
+        let mut ids = cfg.profiles.clone();
+        if ids.is_empty() && cfg.hector_mode { ids.push(crate::engprofile::ProfileId::Hardware); }
+        if ids.is_empty() { String::new() } else {
+            let budget = match crate::read_harness::ModelClass::resolve(cfg.model_params, &cfg.model_label) {
+                crate::read_harness::ModelClass::Small => 900,
+                crate::read_harness::ModelClass::Mid => 2200,
+                _ => 6000,
+            };
+            format!("\n\n{}", crate::engprofile::compose(&ids, budget).text)
+        }
+    };
     // Turn-0 context: the workspace tree + shared crew docs, so no model starts blind.
+    // The planner's stance for THIS branch, ahead of the workspace overview so the worker reads how
+    // to approach its unit before it reads the repository it will approach.
+    let persona_note = if cfg.persona.trim().is_empty() { String::new() }
+        else { format!("\n\nHOW TO APPROACH THIS UNIT:\n{}", cfg.persona.trim()) };
     let ctx_note = if cfg.context.is_empty() { String::new() }
         else { format!("\n\nWORKSPACE OVERVIEW (you can read any of these with the tools above):\n{}", cfg.context) };
     let patch_note = if cfg.prefer_patches {
@@ -1272,6 +2075,8 @@ Available tools (one JSON object per block):
 {read_tools}
 - list_dir    {{ \"tool\":\"list_dir\", \"path\":\"<rel path or empty for root>\" }}
 - run         {{ \"tool\":\"run\", \"argv\":[\"cargo\",\"test\"] }}
+- git_log     {{ \"tool\":\"git_log\", \"n\":<count>, \"path\":\"<rel path or empty>\" }}  (what this repo RECENTLY DID — see below)
+- propose     {{ \"tool\":\"propose\", \"path\":\"<rel path>\", \"content\":\"<a section of code>\" }}  (DRY RUN — writes nothing, see below)
 - doc         {{ \"tool\":\"doc\", \"name\":\"survey\", \"content\":\"<markdown>\" }}  (SHARED crew doc — every worker's next prompt includes it)
 
 THE CODE IS RIGHT THERE — LOOK AT IT. This workspace is a real repository (overview below). Every
@@ -1284,6 +2089,23 @@ turns are reconnaissance — list_dir, read the README / Cargo.toml, search the 
 and once you understand the lay of the land, write a `doc` named \"survey\" (module map, where the
 task's concepts live, the pattern to follow) so later workers inherit what you learned instead of
 re-crawling. Then make the change, and let the automatic verification tell you if it compiles.
+
+CHECK A SECTION BEFORE YOU LAND IT. `propose` takes a chunk of code you are considering and writes
+NOTHING; it returns a patch summary — one line per block saying whether the block is real code, an
+elision, or a stub, whether it is ALREADY IN THE FILE (the commonest wasted turn is re-landing code
+you already wrote), and the anchor to use. Use it when you have a section but have not read enough
+of the file to write a confident `edit` anchor, and when a change spans several separate pieces: the
+summary lets you land the good blocks and drop the rest, instead of betting the whole file on one
+write_file. Then land what you kept with `edit`.
+
+HISTORY IS EVIDENCE A FILE READ CANNOT GIVE YOU. `git_log` answers questions the current source
+cannot: why a field exists, which change broke something, what convention this module follows, and
+whether the odd thing you are about to change was deliberate. Scope it with `path` to ask about one file
+({{ \"tool\":\"git_log\", \"n\":10, \"path\":\"src/lib.rs\" }}) — that is far cheaper and far more pointed
+than reading the whole file's history. Reach for it BEFORE changing code you did not write, and
+before concluding that something odd is a mistake. On a `.gitmind` project the same call also returns
+the CHECKPOINT timeline — mid-session working states, finer-grained than commits — reported
+separately, because a checkpoint is a moment someone saved, not a change anyone committed to.
 
 LIBRARY SOURCE IS READABLE TOO — the same read tools accept two READ-ONLY virtual roots:
   ~deps/<crate>/…   a dependency's source exactly as cargo fetched it (list_dir {{ \"path\":\"~deps\" }} lists them)
@@ -1298,7 +2120,7 @@ Rules:
 - After each tool call you will see its result, then decide the next step.
 - When the task is finished and verified, reply with the single line: {DONE_MARKER}
 
-Emit one or a few tool calls per turn, then wait for results.{patch_note}{verify_note}{doc_note}{hector_note}{ctx_note}"
+Emit one or a few tool calls per turn, then wait for results.{patch_note}{verify_note}{doc_note}{hector_note}{persona_note}{ctx_note}"
     )
 }
 
@@ -1323,6 +2145,7 @@ fn step_turn(
     text: &str, prompt: &mut String, ws: &mut Workspace, cfg: &AgentConfig,
     plan: &mut Plan, verified: &mut bool, step: usize, guard: &mut crate::repetition::LoopGuard,
     ladder: &mut crate::line_calls::RefusalLadder,
+    mut guide: Option<&mut crate::phase_guide::Guide>,
 ) -> (Vec<(Tool, ToolResult)>, Option<Stop>) {
     // AUTHORISE BEFORE PARSING. Everything below reads `text` for tool calls, so the gate must run
     // first or a quoted call is already through. With ToolGate::Open this is a pass-through, which
@@ -1334,9 +2157,15 @@ fn step_turn(
     prompt.push_str("\n\nASSISTANT:\n");
     prompt.push_str(text);
 
+    // Whether THIS turn produced the plan — the phase machine's `Planned` evidence. Distinct from
+    // `plan.is_empty()` afterwards, which cannot tell a fresh plan from one three turns old.
+    let mut plan_steps_new: Option<usize> = None;
     if plan.is_empty() {
         let p = parse_plan(text);
-        if !p.is_empty() { *plan = p; }
+        if !p.is_empty() {
+            plan_steps_new = Some(p.steps.len());
+            *plan = p;
+        }
     }
 
     // REPORT THE BLOCKS WE THREW AWAY. c4-801 built this diagnosis and wired it to nothing, so a
@@ -1439,8 +2268,66 @@ the model attempted a call and it was discarded, which is not the same as the mo
         }
     }
 
-    // Done handling — gated on verification (6).
+    // Done handling — gated on verification (6). With the phase guide on, the CLAIM is a signal and
+    // the machine renders the verdict: a claim the last counted check supports ends the run with the
+    // evidence callout; an unsupported one is rejected in words the model sees (and counted, so the
+    // callout later names how often it overreached). The plain `verified` gate below stays for
+    // unguided runs.
     if text.contains(DONE_MARKER) && tools.is_empty() {
+        // PROOF BEFORE THE CLAIM IS EVEN CONSIDERED. The verify gate answers "is the suite green",
+        // which does not distinguish a change that fixed something from a change that did nothing.
+        // This runs the suite, reverts the run's work, runs it again, and restores — once, here, at
+        // the only moment the answer matters.
+        //
+        // A claim the tests cannot see is rejected with the reason and the run continues; the model
+        // is told what would count, which is the difference between a gate and a wall.
+        if cfg.require_proof && !cfg.verify_cmd.is_empty() {
+            let touched: Vec<String> = ws.events().iter().map(|e| e.path.clone()).collect();
+            let (roots, _) = resolve_check_roots_capped(ws.root(), touched.iter().map(|s| s.as_str()), 1);
+            let root = roots.first().cloned().unwrap_or_default();
+            match ws.inverse_patch_check(&cfg.verify_cmd, &root, "logscope-base") {
+                Some((after, reverted)) => {
+                    let a = crate::oracle::parse_test_results(&after);
+                    let r = crate::oracle::parse_test_results(&reverted);
+                    // `reverted` is the BEFORE state: the delta is what the change did to it.
+                    let d = crate::oracle::delta(&r, &a);
+                    let vac = crate::oracle::vacuous(&a, &r, &r);
+                    match crate::oracle::judge(&d, &vac) {
+                        crate::oracle::Evidence::Proven(why) => {
+                            prompt.push_str(&format!("\n\n(PROOF: {why})\n"));
+                        }
+                        crate::oracle::Evidence::Regressed(why) | crate::oracle::Evidence::Unproven(why) => {
+                            prompt.push_str(&format!(
+                                "\n\n(NOT ACCEPTED — the change is unproven. {why}\n\
+The suite was run with your work and again with it reverted. To finish, make a test change status: \
+add one that fails without your change, or fix one that is currently failing. If the work genuinely \
+cannot be covered by a test, say so explicitly and why.)\n"));
+                            return (Vec::new(), None);
+                        }
+                    }
+                }
+                // The check could not run (not a worktree, or the restore failed and said so). Fall
+                // through to the ordinary gate rather than blocking a run on missing infrastructure.
+                None => {}
+            }
+        }
+        if let Some(g) = guide.as_deref_mut() {
+            let obs = crate::phase_guide::TurnObs { claims_done: true, ..Default::default() };
+            return match g.observe(&obs) {
+                crate::phase_guide::Verdict::Done(c) => {
+                    prompt.push_str(&format!("\n\n{c}\n"));
+                    (Vec::new(), Some(Stop::Done))
+                }
+                crate::phase_guide::Verdict::Blocked(c) => {
+                    prompt.push_str(&format!("\n\n{c}\n"));
+                    (Vec::new(), Some(Stop::Stalled))
+                }
+                crate::phase_guide::Verdict::Continue => {
+                    prompt.push_str(&g.prompt());
+                    (Vec::new(), None)
+                }
+            };
+        }
         if !cfg.gate_done_on_verify || *verified {
             return (Vec::new(), Some(Stop::Done));
         } else {
@@ -1451,6 +2338,9 @@ the model attempted a call and it was discarded, which is not the same as the mo
 
     if tools.is_empty() {
         prompt.push_str("\n\n(No tool call parsed. Emit a ```tool block, or reply TASK_COMPLETE.)\n");
+        if let Some(g) = guide.as_deref_mut() {
+            prompt.push_str(&g.prompt());
+        }
         return (Vec::new(), None);
     }
 
@@ -1468,19 +2358,122 @@ the model attempted a call and it was discarded, which is not the same as the mo
     prompt.push_str(&observation(&results));
 
     // Verify-as-you-go (1): don't verify on the final step (the model can't act on it).
+    //
+    // The check runs in the NEAREST CARGO ROOT(S) of the files this run touched, not blindly at the
+    // workspace root: a `.gitmind` project like the monorepo has no root Cargo.toml, and a check
+    // that structurally cannot pass ("could not find Cargo.toml") plus `gate_done_on_verify` is a
+    // run that structurally cannot finish. For a plain single-crate workspace the resolution is ""
+    // — today's behavior exactly.
+    let mut check_obs: Option<(usize, usize, usize)> = None;
     if wrote_verifiable && !cfg.verify_cmd.is_empty() && step + 1 < cfg.max_steps {
-        let vres = ws.apply(&Tool::Run { argv: cfg.verify_cmd.clone() });
-        *verified = vres.ok;
-        let body = if cfg.digest_verify { digest_check_output(&vres.output, 6) } else { vres.output.clone() };
+        let touched: Vec<String> = ws.events().iter()
+            .filter(|e| cfg.verify_exts.iter().any(|x| e.path.rsplit('.').next() == Some(x.as_str())))
+            .map(|e| e.path.clone())
+            .collect();
+        let (roots, dropped) = resolve_check_roots_capped(ws.root(), touched.iter().map(|s| s.as_str()), 3);
+        let mut all_ok = true;
+        let (mut errs, mut warns, mut tfails) = (0usize, 0usize, 0usize);
+        let mut body = String::new();
+        for r in &roots {
+            let vres = ws.run_at(&cfg.verify_cmd, r);
+            let (e, w, f) = check_counts(&vres.output, vres.ok);
+            errs += e; warns += w; tfails += f;
+            all_ok &= vres.ok;
+            let digest = if cfg.digest_verify { digest_check_output(&vres.output, 6) } else { vres.output.clone() };
+            if !r.is_empty() {
+                body.push_str(&format!("[in {r}/]\n"));
+            }
+            body.push_str(&digest);
+            body.push('\n');
+        }
+        *verified = all_ok;
+        let where_note = match roots.as_slice() {
+            [r] if r.is_empty() => String::new(),
+            _ => format!(" in {}", roots.iter().map(|r| if r.is_empty() { "." } else { r.as_str() })
+                                        .collect::<Vec<_>>().join(", ")),
+        };
         prompt.push_str(&format!(
-            "\n\nAUTOMATIC VERIFICATION ({}): {}\n{}\n",
+            "\n\nAUTOMATIC VERIFICATION ({}{}): {}\n{}",
             cfg.verify_cmd.join(" "),
-            if vres.ok { "PASSED" } else { "FAILED — fix these before continuing" },
+            where_note,
+            if all_ok { "PASSED" } else { "FAILED — fix these before continuing" },
             body,
         ));
+        if dropped > 0 {
+            // Saying it is not a formality. `verified` is what gates TASK_COMPLETE, and a run that
+            // edited five crates while checking three is not verified — reporting the gap AND
+            // withholding the flag is the difference between a bound and a blind spot.
+            *verified = false;
+            prompt.push_str(&format!(
+                "\n(NOT CHECKED: {dropped} further crate(s) were edited this run and exceed the \
+per-turn check budget. Narrow the work to fewer crates, or check them explicitly with a run tool \
+call — this run cannot be marked complete until they are green.)\n"));
+        }
+        // The phase machine sees the same fact. `Signal::Checked` has no "unchecked" field, and the
+        // only property that matters here is that the state is NOT clean — so an unchecked crate is
+        // counted as one outstanding error each. That keeps Done unreachable while a crate this run
+        // edited has never been compiled, and since stall detection compares counts turn to turn, a
+        // constant offset shifts the numbers without breaking the trend.
+        check_obs = Some((errs + dropped, warns, tfails));
+        // Checkpoint-on-green: a long-horizon run's restore point. Committed in the SCRATCH repo, so
+        // it never touches the real project; reapply diffs files, not history, and is unaffected.
+        if all_ok && cfg.checkpoint_on_green {
+            if let Some(h) = ws.git_checkpoint(&format!("agent checkpoint: `{}` green", cfg.verify_cmd.join(" "))) {
+                prompt.push_str(&format!("(checkpoint {h} committed — this green state is a restore point)\n"));
+            }
+        }
     }
 
-    plan.advance();
+    // Plan progress from EVIDENCE: every path this run has written, matched against what each step
+    // names. Recomputed rather than advanced — see Plan::recheck.
+    {
+        let written: Vec<String> = ws.events().iter().map(|e| e.path.clone()).collect();
+        plan.recheck(&written);
+    }
+
+    // Feed the phase machine what this turn OBSERVABLY did, and let it place the run. Blocked here
+    // is the stall detector firing: `stall_limit` consecutive counted checks without the error count
+    // falling — the evidence-backed "this approach is not working" that a bare step budget cannot say.
+    if let Some(g) = guide.as_deref_mut() {
+        let reads = results.iter().filter(|(t, r)| r.ok && matches!(t,
+            Tool::ReadFile { .. } | Tool::ListDir { .. } | Tool::Search { .. }
+            | Tool::ReadRange { .. } | Tool::GitLog { .. })).count();
+        let writes_ok = results.iter().filter(|(t, r)| r.ok && matches!(t,
+            Tool::WriteFile { .. } | Tool::Edit { .. })).count();
+        let failed: Vec<&ToolResult> = results.iter()
+            .filter(|(t, r)| !r.ok && matches!(t, Tool::WriteFile { .. } | Tool::Edit { .. }))
+            .map(|(_, r)| r).collect();
+        let obs = crate::phase_guide::TurnObs {
+            reads,
+            plan_steps: plan_steps_new,
+            writes_ok,
+            writes_failed: failed.len(),
+            first_write_failure: failed.first().map(|r| r.output.chars().take(200).collect()),
+            check: check_obs,
+            claims_done: false,
+        };
+        match g.observe(&obs) {
+            crate::phase_guide::Verdict::Blocked(c) => {
+                prompt.push_str(&format!("\n\n{c}\n"));
+                // The run's PRODUCT is whatever `reapply` copies out of this tree, and a blocked
+                // tree does not compile. Put the last green state back rather than letting the
+                // session land its own failed attempt on the real project. The abandoned state is
+                // committed first, so the diagnosis is not thrown away to make the tree tidy.
+                if let Some(green) = ws.last_green().map(str::to_string) {
+                    if let Some(tag) = ws.restore_to(&green) {
+                        prompt.push_str(&format!(
+                            "(workspace restored to green checkpoint {green}; the blocked state is \
+kept at tag {tag} for inspection)\n"));
+                    }
+                }
+                return (results, Some(Stop::Stalled));
+            }
+            // Done cannot come back here (it requires the claim, handled above); Continue injects
+            // the position so the next turn knows where it stands.
+            _ => prompt.push_str(&g.prompt()),
+        }
+    }
+
     (results, None)
 }
 
@@ -1490,21 +2483,58 @@ the model attempted a call and it was discarded, which is not the same as the mo
 /// the model can't spend on code. This is the deterministic core of the check-summarizer pipeline;
 /// output that doesn't look like rustc diagnostics falls back to a plain truncation so non-cargo
 /// verify commands still surface something useful.
+/// Classify one line of checker output: `Some(true)` = an error headline, `Some(false)` = a warning
+/// headline, `None` = neither. ONE classifier, shared by the digest and by `check_counts` — the
+/// c6 `contains("error")` bug (a `Compiling thiserror` line counted as an error) is exactly what two
+/// implementations of this drift into.
+fn rustc_headline(t: &str) -> Option<bool> {
+    let t = t.trim_start();
+    if t.starts_with("error[") { return Some(true); }
+    if t.starts_with("error:") {
+        // rustc's roll-up lines aren't diagnostics of their own.
+        if t.starts_with("error: aborting") || t.starts_with("error: could not compile") { return None; }
+        return Some(true);
+    }
+    if t.starts_with("warning:") && !t.contains("generated") && !t.contains("warning emitted") {
+        return Some(false);
+    }
+    None
+}
+
+/// Count a checker's output as EVIDENCE: (errors, warnings, tests_failed). This is what feeds
+/// `engmode::Signal::Checked`, so the numbers must be honest in both directions:
+///   * rustc-shaped output is counted by the same headline classifier the digest uses;
+///   * libtest's `test result: FAILED. 3 passed; 2 failed; …` lines contribute their failure count;
+///   * output that matches NEITHER shape but came from a failing command floors errors at 1 — a
+///     check that exits non-zero must never read as clean just because its failure text is unfamiliar
+///     (that floor is what stops "could not find Cargo.toml" reaching Done).
+pub fn check_counts(raw: &str, cmd_ok: bool) -> (usize, usize, usize) {
+    let (mut errors, mut warnings, mut tests_failed) = (0usize, 0usize, 0usize);
+    for line in raw.lines() {
+        match rustc_headline(line) {
+            Some(true) => errors += 1,
+            Some(false) => warnings += 1,
+            None => {}
+        }
+        // `test result: ok. 12 passed; 0 failed; …` / `test result: FAILED. 3 passed; 2 failed; …`
+        let t = line.trim_start();
+        if t.starts_with("test result:") {
+            if let Some(seg) = t.split(';').find(|s| s.trim_end().ends_with("failed")) {
+                if let Some(n) = seg.trim().split_whitespace().next().and_then(|w| w.parse::<usize>().ok()) {
+                    tests_failed += n;
+                }
+            }
+        }
+    }
+    if !cmd_ok && errors == 0 && tests_failed == 0 {
+        errors = 1; // unfamiliar failure text is still a failure
+    }
+    (errors, warnings, tests_failed)
+}
+
 pub fn digest_check_output(raw: &str, max_items: usize) -> String {
     let lines: Vec<&str> = raw.lines().collect();
-    let is_headline = |t: &str| -> Option<bool> {
-        let t = t.trim_start();
-        if t.starts_with("error[") { return Some(true); }
-        if t.starts_with("error:") {
-            // rustc's roll-up lines aren't diagnostics of their own.
-            if t.starts_with("error: aborting") || t.starts_with("error: could not compile") { return None; }
-            return Some(true);
-        }
-        if t.starts_with("warning:") && !t.contains("generated") && !t.contains("warning emitted") {
-            return Some(false);
-        }
-        None
-    };
+    let is_headline = rustc_headline;
     let (mut errors, mut warnings) = (0usize, 0usize);
     let mut items: Vec<String> = Vec::new();
     let mut first_detail: Vec<String> = Vec::new();
@@ -1550,6 +2580,25 @@ pub fn digest_check_output(raw: &str, max_items: usize) -> String {
     out
 }
 
+/// Bound the transcript if it has outgrown its budget. Called by both drivers after a turn that
+/// CONTINUES the run — a finished run's prompt is never submitted again, so compacting it would be
+/// work nobody reads. Returns the number of turns elided, for the log.
+fn maybe_compact(
+    prompt: &mut String, ws: &Workspace, cfg: &AgentConfig, plan: &Plan,
+    guide: Option<&crate::phase_guide::Guide>,
+) -> usize {
+    let budget = if cfg.max_prompt_bytes > 0 { cfg.max_prompt_bytes } else { transcript_budget(ws.model_class()) };
+    let before = prompt.len();
+    let digest = run_digest(ws, plan, guide);
+    if let Some((next, elided)) = compact_transcript(prompt, budget, cfg.keep_recent_turns.max(2), &digest) {
+        crate::diag!("wgpu-engine: agent transcript compacted {} B → {} B ({} turn(s) elided, budget {})",
+                     before, next.len(), elided, budget);
+        *prompt = next;
+        return elided;
+    }
+    0
+}
+
 /// Back-compat: run with defaults but an explicit step budget.
 pub fn run_agent(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, max_steps: usize) -> Session {
     run_agent_cfg(llm, ws, task, &AgentConfig { max_steps, ..Default::default() })
@@ -1560,6 +2609,12 @@ pub fn run_agent(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, max_steps: u
 /// driver that shares the same `step_turn` body.
 pub fn run_agent_cfg(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, cfg: &AgentConfig) -> Session {
     let mut prompt = system_prompt(task, cfg);
+    let mut guide = if cfg.stateful_guide { Some(crate::phase_guide::Guide::new()) } else { None };
+    if let Some(g) = &guide {
+        // Turn 0 opens IN a phase — Survey's "do not write code yet" only disciplines the run if
+        // the model sees it before its first reply, not after.
+        prompt.push_str(&g.prompt());
+    }
     let mut turns = Vec::new();
     let mut plan = Plan::default();
     // TWO MEANINGS ON ONE BOOLEAN. This starts true when no verify command is configured, which is
@@ -1578,11 +2633,12 @@ pub fn run_agent_cfg(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, cfg: &Ag
             Ok(t) => t,
             Err(e) => return Session { turns, stop: Stop::ModelError(e), files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier },
         };
-        let (results, stop) = step_turn(&text, &mut prompt, ws, cfg, &mut plan, &mut verified, step, &mut guard, &mut ladder);
+        let (results, stop) = step_turn(&text, &mut prompt, ws, cfg, &mut plan, &mut verified, step, &mut guard, &mut ladder, guide.as_mut());
         turns.push(Turn { model_text: text, results });
         if let Some(stop) = stop {
             return Session { turns, stop, files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier };
         }
+        maybe_compact(&mut prompt, ws, cfg, &plan, guide.as_ref());
     }
 
     Session { turns, stop: Stop::StepLimit, files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier }
@@ -1619,6 +2675,15 @@ pub struct AgentRun {
     turns: usize,
     guard: crate::repetition::LoopGuard,
     ladder: crate::line_calls::RefusalLadder,
+    /// StatefulGuide's phase machine, when `cfg.stateful_guide` — the run's evidence-decided position.
+    guide: Option<crate::phase_guide::Guide>,
+    /// Turns elided by transcript compaction so far. Surfaced so "the model forgot" has an answer
+    /// other than a guess.
+    compacted: usize,
+    /// What was asked, and when. Neither was kept: the task went into the prompt and was gone, so
+    /// nothing could answer "what is this run doing" without reading the transcript back.
+    task: String,
+    started: std::time::Instant,
 }
 
 impl AgentRun {
@@ -1626,15 +2691,31 @@ impl AgentRun {
     pub fn start(work_dir: impl Into<std::path::PathBuf>, task: &str, cfg: AgentConfig) -> (Self, String) {
         // Captured before cfg moves into the run: a run with no verifier must not read as passed.
         let had_verifier = !cfg.verify_cmd.is_empty();
-        let prompt = system_prompt(task, &cfg);
+        let mut prompt = system_prompt(task, &cfg);
+        let guide = if cfg.stateful_guide { Some(crate::phase_guide::Guide::new()) } else { None };
+        if let Some(g) = &guide {
+            // Turn 0 opens IN a phase — see run_agent_cfg for why the first prompt carries it.
+            prompt.push_str(&g.prompt());
+        }
         let verified = cfg.verify_cmd.is_empty();
+        let ws = Workspace::new(work_dir)
+            .with_model_label(cfg.model_label.clone())
+            .with_model_params(cfg.model_params)
+            // The configured verify command is allowed to run: it comes from the operator, and
+            // gating it on the model's allowlist made any non-cargo suite structurally unverifiable.
+            .allow_also(cfg.verify_cmd.first().cloned())
+            .allow_also(cfg.extra_allow.clone());
         let run = Self {
-            ws: Workspace::new(work_dir), prompt: prompt.clone(), reply: String::new(),
+            ws, prompt: prompt.clone(), reply: String::new(),
             plan: Plan::default(), verified, step: 0, turns: 0, cfg,
             guard: crate::repetition::LoopGuard::default(),
             ladder: crate::line_calls::RefusalLadder::new(4),
             // Mirrors the Session field: a run with no verifier must not read as one that passed.
             had_verifier,
+            guide,
+            compacted: 0,
+            task: task.to_string(),
+            started: std::time::Instant::now(),
         };
         (run, prompt)
     }
@@ -1651,12 +2732,44 @@ impl AgentRun {
     /// The worker finished a turn: process the accumulated reply and decide the next action.
     pub fn on_done(&mut self) -> AgentStep {
         let text = std::mem::take(&mut self.reply);
-        let (_results, stop) = step_turn(&text, &mut self.prompt, &mut self.ws, &self.cfg, &mut self.plan, &mut self.verified, self.step, &mut self.guard, &mut self.ladder);
+        let (_results, stop) = step_turn(&text, &mut self.prompt, &mut self.ws, &self.cfg, &mut self.plan, &mut self.verified, self.step, &mut self.guard, &mut self.ladder, self.guide.as_mut());
         self.turns += 1;
         self.step += 1;
         if let Some(stop) = stop { return AgentStep::Finished(stop); }
         if self.step >= self.cfg.max_steps { return AgentStep::Finished(Stop::StepLimit); }
+        // Bound the transcript before it is submitted again — this is the only place the growing
+        // prompt leaves the driver, so it is the only place the bound has to hold.
+        self.compacted += maybe_compact(&mut self.prompt, &self.ws, &self.cfg, &self.plan, self.guide.as_ref());
         AgentStep::Submit(self.prompt.clone())
+    }
+
+    /// Where the phase machine places the run right now ("survey", "diagnose", …), when the run is
+    /// guided. None = plain (unguided) run. For the HUD: the phase is the one-word answer to "what
+    /// is it doing", which token streams do not give.
+    pub fn phase(&self) -> Option<&'static str> {
+        self.guide.as_ref().map(|g| g.phase_label())
+    }
+
+    /// How many turns transcript compaction has elided from this run's prompt.
+    pub fn compacted_turns(&self) -> usize { self.compacted }
+
+    /// Current transcript size in bytes — what the bound acts on.
+    pub fn prompt_len(&self) -> usize { self.prompt.len() }
+
+    /// The transcript so far, read-only. For tests and for the operator's "show me what the model
+    /// is actually seeing" view — the observations are where a check's failure is visible.
+    pub fn prompt_snapshot(&self) -> &str { &self.prompt }
+
+    /// The last green checkpoint committed in the scratch, if any.
+    pub fn last_green(&self) -> Option<&str> { self.ws.last_green() }
+
+    /// The model class this run's budgets are sized to.
+    pub fn model_class(&self) -> crate::read_harness::ModelClass { self.ws.model_class() }
+
+    /// What actually moved the error count on this run, as counted lines (guided runs only; empty
+    /// until enough transitions accumulate).
+    pub fn pattern_report(&self) -> Vec<String> {
+        self.guide.as_ref().map(|g| g.pattern_report()).unwrap_or_default()
     }
 
     /// The worker reported an error mid-turn.
@@ -1669,6 +2782,34 @@ impl AgentRun {
 
     pub fn events(&self) -> &[FileEvent] { self.ws.events() }
     pub fn plan(&self) -> &Plan { &self.plan }
+
+    /// A snapshot of what this run is doing, for the ACTIVE THREAD card — see `runcard`.
+    ///
+    /// `run_state` rather than `card`: `theme::card` already exists and draws a framed panel, so a
+    /// second `card` that returns data instead of drawing anything is two different ideas one word
+    /// apart. `dupscan` named the collision before it shipped. The method also reads better for
+    /// what it is — it names the thing returned, not the one consumer that happens to want it.
+    ///
+    /// A plain-data struct rather than a formatted string, so the card's rules (blocked outranks
+    /// progress, an unbounded run shows a count not a ratio) are tested without starting a run.
+    pub fn run_state(&self) -> crate::runcard::RunState {
+        let (done, total) = self.plan.progress();
+        crate::runcard::RunState {
+            task: self.task.clone(),
+            phase: self.phase(),
+            turns: self.turns,
+            max_turns: self.cfg.max_steps,
+            compacted: self.compacted,
+            plan_done: done,
+            plan_total: total,
+            verified: self.verified,
+            // "blocked" is the phase machine's own label, not a separate flag — asking the Guide
+            // for a boolean it does not have would be inventing a second source of truth for the
+            // same fact.
+            blocked: self.phase() == Some("blocked"),
+            elapsed_secs: self.started.elapsed().as_secs(),
+        }
+    }
     pub fn verified(&self) -> bool { self.verified }
     /// Was a verify command configured at all?
     ///
@@ -1771,6 +2912,10 @@ pub struct BranchSummary {
     pub verified: bool,
     pub finished: bool,
     pub approved: Option<bool>, // depth-model review verdict (None until reviewed)
+    /// What this branch is doing right now. The fan already knew — `in_flight` names the branch
+    /// holding the single worker — and never reported it, so a fan mid-run looked identical
+    /// whether a branch was generating, queued, or done.
+    pub doing: crate::runcard::Doing,
     pub review_notes: String,
     pub root: PathBuf,
 }
@@ -1813,9 +2958,23 @@ impl AgentFan {
     /// a branch's unified diff for the review pass (in production: `git -C <dir> diff <base>`; in tests: a
     /// canned string). Nothing is submitted yet; call `next` to get the first branch to run.
     pub fn new(specs: Vec<(PathBuf, String, String)>, cfg: &AgentConfig, diff_fn: Box<dyn Fn(&Path) -> String>) -> Self {
-        let task = specs.first().map(|(_, t, _)| t.clone()).unwrap_or_default();
-        let branches = specs.into_iter().map(|(dir, task, label)| {
-            let (run, first) = AgentRun::start(dir, &task, cfg.clone());
+        let planned = specs.into_iter().map(|(d, t, l)| (d, t, l, String::new())).collect();
+        Self::planned(planned, cfg, diff_fn)
+    }
+
+    /// A fan whose branches each carry their own PERSONA — the per-worker stance from
+    /// `coordinator::plan()`. `new` is this with every persona empty.
+    ///
+    /// Per-branch config rather than one shared cfg, because the planner's whole output is that the
+    /// branches differ: a fan built from a plan and then run with one identical prompt is a fan that
+    /// discarded the plan.
+    pub fn planned(specs: Vec<(PathBuf, String, String, String)>, cfg: &AgentConfig,
+                   diff_fn: Box<dyn Fn(&Path) -> String>) -> Self {
+        let task = specs.first().map(|(_, t, _, _)| t.clone()).unwrap_or_default();
+        let branches = specs.into_iter().map(|(dir, task, label, persona)| {
+            let mut c = cfg.clone();
+            c.persona = persona;
+            let (run, first) = AgentRun::start(dir, &task, c);
             AgentBranch { run, state: BranchState::Ready(first), label, verdict: None }
         }).collect();
         Self { branches, cursor: 0, in_flight: Vec::new(), width: 1, phase: Phase::Running, task, cfg: cfg.clone(), diff_fn }
@@ -2046,6 +3205,18 @@ impl AgentFan {
             verified: b.run.verified(),
             finished: matches!(b.state, BranchState::Finished(_)),
             approved: b.verdict.as_ref().map(|v| v.approve),
+            doing: {
+                let holding = self.in_flight.iter().find(|f| f.branch == i);
+                match (holding, matches!(b.state, BranchState::Finished(_))) {
+                    (Some(f), _) if f.review => crate::runcard::Doing::Reviewing,
+                    (Some(_), _) => crate::runcard::Doing::Generating,
+                    // A finished branch can still be picked up for the review pass, which is why
+                    // in_flight is checked first: "finished" is about the agent loop, not about
+                    // whether the fan is done with it.
+                    (None, true) => crate::runcard::Doing::Finished,
+                    (None, false) => crate::runcard::Doing::Waiting,
+                }
+            },
             review_notes: b.verdict.as_ref().map(|v| v.notes.clone()).unwrap_or_default(),
             root: b.run.root().to_path_buf(),
         }).collect()
@@ -2111,8 +3282,11 @@ pub fn scan_docs(root: &Path) -> Vec<(String, String)> {
             let p = e.path();
             if p.is_dir() { walk(&p, root, out); }
             else if p.extension().and_then(|s| s.to_str()) == Some("md") {
-                if let Ok(text) = std::fs::read_to_string(&p) {
+                // Bounded: a generated or vendored .md can be enormous, and this walk pulls every
+                // one of them into memory at once.
+                if let Ok((text, truncated)) = read_capped(&p, 1024 * 1024) {
                     let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+                    let text = if truncated { format!("{text}\n\n<!-- truncated at 1 MiB -->\n") } else { text };
                     out.push((rel, text));
                 }
             }
@@ -2428,7 +3602,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         // model emitting PLAIN tool calls, which is the thing under test. Under the default gate
         // those calls are stripped and the tests fail — correctly. Stated per fixture so a reader
         // sees an opt-out rather than a default that happens to be permissive.
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new(), ..Default::default() };
         let s = run_agent_cfg(&mut llm, &mut ws, "make a hello world", &cfg);
         assert_eq!(s.stop, Stop::Done);
         assert_eq!(s.files.len(), 1);
@@ -2448,7 +3622,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let (d0, d1) = (base.join("b0"), base.join("b1"));
         std::fs::create_dir_all(&d0).unwrap();
         std::fs::create_dir_all(&d1).unwrap();
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new(), ..Default::default() };
         // diff_fn returns a per-branch canned diff (no git needed in the test)
         let diff_fn = Box::new(|root: &Path| format!("diff for {}", root.display()));
         let mut fan = AgentFan::new(vec![
@@ -2497,7 +3671,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let base = tmp("fanadd");
         std::fs::create_dir_all(base.join("b0")).unwrap();
         std::fs::create_dir_all(base.join("b1")).unwrap();
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new(), ..Default::default() };
         let mut fan = AgentFan::new(vec![(base.join("b0"), "A".into(), "one".into())], &cfg, Box::new(|_| String::new()));
         // first branch starts running
         let s0 = fan.next();
@@ -2516,7 +3690,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let base = tmp("adopt");
         std::fs::create_dir_all(base.join("orig")).unwrap();
         std::fs::create_dir_all(base.join("react")).unwrap();
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new(), ..Default::default() };
         // a single run in progress, with a queued next prompt
         let (run, first) = AgentRun::start(base.join("orig"), "build a thing", cfg.clone());
         let mut fan = AgentFan::adopt(run, Some(first), "build a thing", "original", &cfg, Box::new(|_| String::new()));
@@ -2611,14 +3785,20 @@ error: could not compile `demo` (lib) due to 3 previous errors
         assert!(p.contains("```tool\n"), "the bare fence is not taught either");
     }
 
+    /// The contract this checked is still real — the legacy bool must put a working-discipline
+    /// block in the prompt with its oracle rule intact — but the text moved from `hectormode`'s flat
+    /// string to `engprofile::HARDWARE`, so the literals it asserted are gone. Re-pointed rather
+    /// than deleted: a test removed during a refactor is coverage silently lost.
     #[test]
     fn hector_mode_prompt_carries_the_discipline() {
         let cfg = AgentConfig { hector_mode: true, ..AgentConfig::default() };
         let p = system_prompt("do a thing", &cfg);
-        assert!(p.contains("HectorMode"), "mode block must reach the prompt");
-        assert!(p.contains("FIND THE ORACLE"), "rule 1 must survive formatting");
+        assert!(p.contains("WORKING DISCIPLINE"), "mode block must reach the prompt");
+        assert!(p.contains("Hardware / reverse engineering"), "and name which discipline it is");
+        assert!(p.to_lowercase().contains("find the working implementation"),
+                "rule 1 must survive the move");
         let off = system_prompt("do a thing", &AgentConfig::default());
-        assert!(!off.contains("HectorMode"), "must be off by default");
+        assert!(!off.contains("WORKING DISCIPLINE"), "must be off by default");
     }
 
     #[test]
@@ -2639,7 +3819,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
                 Ok("I'll write it.\n```tool\n{\"tool\":\"write_file\",\"path\":\"x.txt\",\"contents\":\"same\"}\n```".into())
             }
         }
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 30, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 30, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new(), ..Default::default() };
         let s = run_agent_cfg(&mut Repeater, &mut ws, "task", &cfg);
         assert_eq!(s.stop, Stop::Stalled, "a repeating agent is aborted as a bad actor");
         assert!(s.turns.len() < 30, "aborted well before the step limit ({} turns)", s.turns.len());
@@ -2649,7 +3829,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
     fn async_driver_matches_sync_behavior() {
         // Drive AgentRun by hand with scripted completed replies (no worker), asserting it writes the file,
         // captures the plan, and finishes — the same state machine the sync loop uses.
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new(), ..Default::default() };
         let (mut run, first) = AgentRun::start(tmp("async"), "make a lib", cfg);
         assert!(first.contains("PLAN")); // prompt asks for a plan
         let replies = [
@@ -2679,9 +3859,19 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let numbered = "1. first\n2. second\n```tool\n{...}\n```\n3. not-a-plan-step";
         let p2 = parse_plan(numbered);
         assert_eq!(p2.steps.len(), 2);
-        // plan progress
-        let mut p3 = p2; p3.advance();
-        assert_eq!(p3.progress(), (1, 2));
+        // Plan progress is now decided by EVIDENCE (see Plan::recheck), so this asserts the new
+        // contract: a step whose named file was written is done, one whose file was not is not, and
+        // a step naming no file at all is neither — it is unverifiable.
+        let mut p3 = parse_plan("1. rewrite src/first.rs\n2. rewrite src/second.rs\n3. think about it");
+        p3.recheck(&["src/first.rs".to_string()]);
+        assert_eq!(p3.progress(), (1, 3));
+        assert_eq!(p3.steps[0].evidence.as_deref(), Some("src/first.rs"));
+        assert!(!p3.steps[1].done && !p3.steps[1].unverifiable, "named but unwritten = pending");
+        assert!(p3.steps[2].unverifiable, "names no file, so no write can confirm it");
+        assert_eq!(p3.summary(), "1/3 verified, 1 pending, 1 unverifiable");
+        // and it is a RECHECK, not an accumulation: withdraw the evidence and the step reopens
+        p3.recheck(&[]);
+        assert_eq!(p3.progress(), (0, 3));
     }
 
     #[test]
@@ -2690,7 +3880,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let mut ws = Workspace::new(tmp("gate"));
         struct ClaimsDone;
         impl Llm for ClaimsDone { fn generate(&mut self, _p: &str) -> Result<String, String> { Ok(format!("{DONE_MARKER}")) } }
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 3, verify_cmd: vec!["cargo".into(), "check".into()], verify_exts: vec!["rs".into()], gate_done_on_verify: true, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 3, verify_cmd: vec!["cargo".into(), "check".into()], verify_exts: vec!["rs".into()], gate_done_on_verify: true, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new(), ..Default::default() };
         let s = run_agent_cfg(&mut ClaimsDone, &mut ws, "task", &cfg);
         // verified never became true (nothing verifiable ran) ⇒ done rejected ⇒ step limit
         assert_eq!(s.stop, Stop::StepLimit);
@@ -3187,5 +4377,1342 @@ mod read_budget_tests {
                 "path scoping leaked an unrelated commit:\n{}", just_a.output);
         assert!(just_a.output.contains("-- a.rs"), "provenance must name the scope");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+}
+
+/// The long-horizon wiring: counted evidence, project-rooted verification, green checkpoints, and
+/// the phase machine driving a run. Its own module because these need the scripted-model fixture,
+/// and the fixture in `mod tests` is private to it — one duplicated 8-line stub beats making the
+/// 700-line test module the home for everything that wants a fake LLM.
+#[cfg(test)]
+mod long_horizon_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A model whose turns are a script: the whole loop with no GPU. (Mirrors `mod tests`'s.)
+    struct Scripted { turns: Vec<String>, i: usize }
+    impl Llm for Scripted {
+        fn generate(&mut self, _prompt: &str) -> Result<String, String> {
+            let t = self.turns.get(self.i).cloned().unwrap_or_else(|| DONE_MARKER.into());
+            self.i += 1;
+            Ok(t)
+        }
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("wsx-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn check_counts_reads_rustc_libtest_and_floors_unfamiliar_failures() {
+        let rustc = "\
+   Compiling thiserror v2.0.12\nerror[E0308]: mismatched types\n --> src/a.rs:4:5\nwarning: unused variable: `x`\nerror: aborting due to 1 previous error\n";
+        assert_eq!(check_counts(rustc, false), (1, 1, 0), "roll-up lines are not diagnostics; `Compiling thiserror` is not an error");
+        let libtest = "running 5 tests\ntest a ... ok\ntest result: FAILED. 3 passed; 2 failed; 0 ignored\n";
+        assert_eq!(check_counts(libtest, false), (0, 0, 2));
+        assert_eq!(check_counts("test result: ok. 12 passed; 0 failed; 0 ignored\n", true), (0, 0, 0));
+        // A failing command with unfamiliar text must never read as clean — this is the
+        // "could not find Cargo.toml" case reaching the phase machine.
+        assert_eq!(check_counts("$ cargo check\nexit: 101\nsomething unfamiliar\n", false), (1, 0, 0));
+        // …and the same text from a SUCCEEDING command stays clean (echo, formatters).
+        assert_eq!(check_counts("something unfamiliar\n", true), (0, 0, 0));
+    }
+
+    #[test]
+    fn check_roots_resolve_to_the_nearest_cargo_toml_and_fall_back_to_root() {
+        let d = tmp("roots");
+        std::fs::create_dir_all(d.join("apps/one/src")).unwrap();
+        std::fs::create_dir_all(d.join("apps/two/src")).unwrap();
+        std::fs::write(d.join("apps/one/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(d.join("apps/two/Cargo.toml"), "[package]\n").unwrap();
+        // monorepo shape: NO root Cargo.toml
+        assert_eq!(resolve_check_roots_capped(&d, ["apps/one/src/lib.rs"], 3).0, vec!["apps/one".to_string()]);
+        assert_eq!(
+            resolve_check_roots_capped(&d, ["apps/one/src/lib.rs", "apps/one/src/x.rs", "apps/two/src/lib.rs"], 3).0,
+            vec!["apps/one".to_string(), "apps/two".to_string()],
+            "deduped, one root per touched crate"
+        );
+        // a touched file under no Cargo root falls back to the workspace root — today's behavior
+        assert_eq!(resolve_check_roots_capped(&d, ["README.md"], 3).0, vec![String::new()]);
+        // single-crate shape: the resolution is the root itself
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(resolve_check_roots_capped(&d, ["src/lib.rs"], 3).0, vec![String::new()]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_at_executes_in_the_subdir_and_refuses_escapes() {
+        let d = tmp("runat");
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub/local.txt"), "from the subdir\n").unwrap();
+        let ws = Workspace::new(&d);
+        let ok = ws.run_at(&["cat".into(), "local.txt".into()], "sub");
+        assert!(ok.ok && ok.output.contains("from the subdir"), "{}", ok.output);
+        assert!(!ws.run_at(&["cat".into(), "x".into()], "../outside").ok, "cwd must stay inside the workspace");
+        assert!(!ws.run_at(&["cat".into(), "x".into()], "sub/missing").ok, "a non-directory cwd is an error, not a panic");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The gitmind-monorepo case end to end: the workspace root has NO Cargo.toml, the model edits a
+    /// crate underneath, and verification runs in that crate's root rather than failing structurally
+    /// at the mirror root. The check command is `cat Cargo.toml` — it can ONLY succeed with its cwd
+    /// in apps/demo, so `s.verified` is direct evidence of WHERE the check ran: under the old
+    /// root-cwd behavior it fails, done-gating rejects the claim, and this test cannot pass.
+    #[test]
+    fn verification_runs_in_the_touched_crates_root_not_the_workspace_root() {
+        let d = tmp("gm-verify");
+        std::fs::create_dir_all(d.join("apps/demo/src")).unwrap();
+        std::fs::write(d.join("apps/demo/Cargo.toml"), "[package]\nname=\"demo\"\nversion=\"0.0.0\"\nedition=\"2021\"\n").unwrap();
+        let mut ws = Workspace::new(&d);
+        let mut llm = Scripted { i: 0, turns: vec![
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"apps/demo/src/lib.rs\",\"contents\":\"pub fn f() {}\\n\"}\n```".into(),
+            format!("Done. {DONE_MARKER}"),
+        ]};
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6,
+            verify_cmd: vec!["cat".into(), "Cargo.toml".into()], verify_exts: vec!["rs".into()],
+            gate_done_on_verify: true, prefer_patches: false, digest_verify: false,
+            ..Default::default() };
+        let s = run_agent_cfg(&mut llm, &mut ws, "add f()", &cfg);
+        assert_eq!(s.stop, Stop::Done);
+        assert!(s.verified, "the check found apps/demo/Cargo.toml from its own cwd");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Drive an `AgentRun` (the production non-blocking driver) through a script, returning the
+    /// stop plus the run itself so a test can read the PHASE. `run_agent_cfg` cannot answer "why did
+    /// it stop": both the repetition guard and the phase machine's Blocked surface as `Stop::Stalled`,
+    /// which is how the first version of the stall test below passed with the guide switched off.
+    fn drive(ws_dir: &Path, task: &str, cfg: AgentConfig, script: &[String]) -> (Stop, AgentRun) {
+        let (mut run, _first) = AgentRun::start(ws_dir, task, cfg);
+        for turn in script {
+            run.on_token(turn);
+            if let AgentStep::Finished(stop) = run.on_done() {
+                return (stop, run);
+            }
+        }
+        // Script exhausted without a stop: keep feeding the done marker until the run ends, bounded.
+        for _ in 0..24 {
+            run.on_token(DONE_MARKER);
+            if let AgentStep::Finished(stop) = run.on_done() {
+                return (stop, run);
+            }
+        }
+        panic!("run never finished");
+    }
+
+    fn write_call(path: &str, n: usize) -> String {
+        format!("```tool\n{{\"tool\":\"write_file\",\"path\":\"{path}\",\"contents\":\"// attempt {n}\\n\"}}\n```")
+    }
+
+    /// The stall detector: consecutive checks with the error count pinned reach Blocked. Asserted on
+    /// the PHASE, not on `Stop::Stalled` — the repetition guard produces that same stop, so the stop
+    /// alone proves nothing about the phase machine (verified by switching `stateful_guide` off: the
+    /// stop is unchanged, the phase is not).
+    #[test]
+    fn a_guided_run_blocks_when_the_error_count_never_falls() {
+        let d = tmp("gm-stall");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        // Distinct paths and distinct bodies so the repetition/churn guards have nothing to fire on:
+        // what ends this run must be the counted evidence, not textual repetition.
+        let script: Vec<String> = (1..=6).map(|n| write_call(&format!("s{n}.rs"), n)).collect();
+        // `test` with no args exits 1 with empty output → check_counts floors it at 1 error, every time.
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 20,
+            verify_cmd: vec!["test".into()], verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: false, stateful_guide: true,
+            ..Default::default() };
+        let (stop, run) = drive(&d, "fix the build", cfg, &script);
+        assert_eq!(run.phase(), Some("blocked"), "the phase machine halted this run");
+        assert_eq!(stop, Stop::Stalled);
+        assert!(run.turns() < 20, "blocked well before the budget: {} turns", run.turns());
+        assert!(!run.verified());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The same script under an UNGUIDED run: it does not reach blocked, and does not stop early on
+    /// evidence — the contrast that shows the previous test is measuring the phase machine.
+    #[test]
+    fn the_same_stalling_script_is_not_blocked_without_the_guide() {
+        let d = tmp("gm-stall-off");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        let script: Vec<String> = (1..=6).map(|n| write_call(&format!("s{n}.rs"), n)).collect();
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 20,
+            verify_cmd: vec!["test".into()], verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: false, stateful_guide: false,
+            ..Default::default() };
+        let (_stop, run) = drive(&d, "fix the build", cfg, &script);
+        assert_eq!(run.phase(), None, "no phase machine on an unguided run");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The disciplined path end to end: survey → plan → patch → green check → claim → Done, landing
+    /// in the `done` phase with a checkpoint committed at the green state.
+    #[test]
+    fn a_guided_run_finishes_on_evidence_and_checkpoints_the_green_state() {
+        let d = tmp("gm-guided");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git").args(args).current_dir(&d)
+                .output().unwrap().status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "baseline"]);
+        let script = vec![
+            // survey: read-only
+            "```tool\n{\"tool\":\"list_dir\",\"path\":\"\"}\n```".to_string(),
+            // plan, then the single patch
+            "```plan\n1. add lib.rs\n```\n```tool\n{\"tool\":\"write_file\",\"path\":\"src/lib.rs\",\"contents\":\"pub fn f() {}\\n\"}\n```".to_string(),
+            format!("The task is covered. {DONE_MARKER}"),
+        ];
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 8,
+            verify_cmd: vec!["echo".into(), "green".into()], verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: false,
+            stateful_guide: true, checkpoint_on_green: true,
+            ..Default::default() };
+        let (stop, run) = drive(&d, "add f()", cfg, &script);
+        assert_eq!(stop, Stop::Done, "the claim is supported by the green check");
+        assert_eq!(run.phase(), Some("done"));
+        assert!(run.verified());
+        let count = std::process::Command::new("git").args(["rev-list", "--count", "HEAD"])
+            .current_dir(&d).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "2",
+                   "exactly one checkpoint commit on top of the baseline");
+        let msg = std::process::Command::new("git").args(["log", "-1", "--pretty=%s"])
+            .current_dir(&d).output().unwrap();
+        assert!(String::from_utf8_lossy(&msg.stdout).contains("agent checkpoint"),
+                "{}", String::from_utf8_lossy(&msg.stdout));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A claim the check contradicts is rejected AND counted: the run continues in `diagnose`, and
+    /// when it does finish, the callout names the overreach. The counting is the part the plain
+    /// done-gate cannot do — it rejects the claim and forgets it happened.
+    #[test]
+    fn a_guided_run_rejects_a_done_claim_the_check_contradicts_and_counts_it() {
+        let d = tmp("gm-claim");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        let script = vec![
+            // a patch whose check FAILS (`test` exits 1)…
+            write_call("src/a.rs", 1),
+            // …then a bare claim: rejected, and the run continues in diagnose
+            format!("All good! {DONE_MARKER}"),
+        ];
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6,
+            verify_cmd: vec!["test".into()], verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: false, stateful_guide: true,
+            ..Default::default() };
+        let (mut run, _first) = AgentRun::start(&d, "fix it", cfg, );
+        for turn in &script {
+            run.on_token(turn);
+            assert!(matches!(run.on_done(), AgentStep::Submit(_)),
+                    "neither turn may end the run: {:?}", run.phase());
+        }
+        assert_eq!(run.phase(), Some("diagnose"), "an unsupported claim routes to diagnose");
+        assert!(!run.verified());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    // ── transcript compaction ────────────────────────────────────────────────────────────────────
+
+    fn fake_prompt(head: &str, turns: usize, per_turn: usize) -> String {
+        let mut s = head.to_string();
+        for i in 0..turns {
+            s.push_str(TURN_MARK);
+            s.push_str(&format!("turn {i} "));
+            s.push_str(&"x".repeat(per_turn));
+        }
+        s
+    }
+
+    #[test]
+    fn compaction_keeps_the_head_and_the_recent_turns_and_elides_the_middle() {
+        let head = "SYSTEM: the task is to fix the build. REPO TREE: src/lib.rs";
+        let p = fake_prompt(head, 10, 500);
+        let (out, elided) = compact_transcript(&p, 2000, 3, "SUMMARY: wrote a.rs, 2 errors")
+            .expect("over budget with 10 turns — must compact");
+        assert_eq!(elided, 7);
+        assert!(out.starts_with(head), "the task and the tree are never cut");
+        assert!(out.contains("SUMMARY: wrote a.rs"), "the digest replaces the middle");
+        assert!(out.contains("turn 9") && out.contains("turn 7"), "recent turns kept verbatim");
+        assert!(!out.contains("turn 5"), "the middle is gone");
+        assert!(out.len() < p.len());
+        assert_eq!(out.matches(TURN_MARK).count(), 3, "exactly keep_recent turn markers remain");
+    }
+
+    #[test]
+    fn compaction_declines_when_it_would_not_help_or_would_cut_the_working_set() {
+        let head = "SYSTEM: task";
+        // under budget
+        assert!(compact_transcript(&fake_prompt(head, 10, 10), 100_000, 3, "d").is_none());
+        // too few turns to elide any without eating the keep-window
+        assert!(compact_transcript(&fake_prompt(head, 3, 5000), 100, 3, "d").is_none());
+        // no turn boundary at all: the head is never cut
+        assert!(compact_transcript("just a system prompt, very long", 4, 3, "d").is_none());
+        // a digest bigger than what it replaces must not "compact" the prompt upward
+        let p = fake_prompt(head, 5, 20);
+        let huge = "D".repeat(100_000);
+        assert!(compact_transcript(&p, 10, 2, &huge).is_none());
+    }
+
+    #[test]
+    fn the_compaction_marker_tells_the_model_the_work_actually_happened() {
+        let p = fake_prompt("SYS", 8, 400);
+        let (out, _) = compact_transcript(&p, 1000, 2, "SUMMARY").unwrap();
+        assert!(out.contains("CONTEXT COMPACTED"));
+        assert!(out.contains("HAPPENED"), "an elided turn is not an undone turn");
+        assert!(out.contains("re-read a file"), "and stale contents must not be assumed live");
+    }
+
+    #[test]
+    fn the_digest_carries_the_durable_facts() {
+        let d = tmp("digest");
+        let mut ws = Workspace::new(&d);
+        ws.apply(&Tool::WriteFile { path: "src/a.rs".into(), contents: "//a\n".into() });
+        ws.apply(&Tool::WriteFile { path: "src/b.rs".into(), contents: "//b\n".into() });
+        let mut plan = Plan { steps: vec![
+            PlanStep { text: "edit a".into(), done: true, evidence: Some("src/a.rs".into()), unverifiable: false },
+            PlanStep { text: "edit b".into(), done: false, evidence: None, unverifiable: false },
+        ]};
+        let mut g = crate::phase_guide::Guide::new();
+        g.observe(&crate::phase_guide::TurnObs { writes_ok: 1, check: Some((3, 0, 0)), ..Default::default() });
+        let text = run_digest(&ws, &plan, Some(&g));
+        assert!(text.contains("src/a.rs") && text.contains("src/b.rs"), "{text}");
+        assert!(text.contains("1/2"), "plan progress survives compaction: {text}");
+        assert!(text.contains("phase: diagnose"), "{text}");
+        plan.steps.clear();
+        assert!(run_digest(&ws, &plan, None).contains("files written (2)"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// End to end through the real driver. The property that matters is not a hard byte ceiling —
+    /// one 5 KB file read can exceed a small budget on its own — but that the transcript stops
+    /// GROWING WITH TURN COUNT. An append-only prompt is linear in turns and overflows any window on
+    /// a long run; a compacted one is flat. So: run the same script at two lengths and compare.
+    #[test]
+    fn compaction_makes_the_transcript_flat_in_turn_count() {
+        let build = |tag: &str, turns: usize, cfg: AgentConfig| -> (usize, usize) {
+            let d = tmp(tag);
+            std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+            std::fs::create_dir_all(d.join("src")).unwrap();
+            // DISTINCT files per turn: an identical read every turn is caught by the repetition
+            // guard, which aborts the run long before the transcript can grow — the first version of
+            // this test measured that abort and reported "the budget never bit".
+            for i in 0..turns {
+                std::fs::write(d.join(format!("src/f{i}.rs")), format!("// filler {i}\n").repeat(400)).unwrap();
+            }
+            let script: Vec<String> = (0..turns)
+                .map(|i| format!("```tool\n{{\"tool\":\"read_file\",\"path\":\"src/f{i}.rs\"}}\n```"))
+                .collect();
+            let (_stop, run) = drive(&d, "read the tree", cfg, &script);
+            let out = (run.prompt_len(), run.compacted_turns());
+            let _ = std::fs::remove_dir_all(&d);
+            out
+        };
+        let tight = || AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 40,
+            verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false,
+            prefer_patches: false, digest_verify: false,
+            max_prompt_bytes: 8 * 1024, keep_recent_turns: 2, ..Default::default() };
+        let loose = || AgentConfig { max_prompt_bytes: 8 * 1024 * 1024, ..tight() };
+
+        let (short_len, short_elided) = build("gm-cmp-6", 6, tight());
+        let (long_len, long_elided) = build("gm-cmp-18", 18, tight());
+        assert!(short_elided > 0 && long_elided > short_elided, "the budget bit, and bit more on the longer run");
+        assert!(long_len < short_len * 3 / 2,
+                "bounded transcript grew with turn count: {short_len} B at 6 turns → {long_len} B at 18");
+
+        // Contrast: unbounded, the same script is linear in turns.
+        let (u_short, u_elided) = build("gm-cmp-off-6", 6, loose());
+        let (u_long, _) = build("gm-cmp-off-18", 18, loose());
+        assert_eq!(u_elided, 0, "the loose budget must not compact");
+        assert!(u_long > u_short * 2,
+                "the unbounded run really is linear: {u_short} B at 6 turns → {u_long} B at 18");
+        assert!(u_long > long_len * 2, "and compaction is what separates them");
+    }
+
+    #[test]
+    fn an_unchecked_crate_is_reported_and_blocks_completion() {
+        let d = tmp("gm-cap");
+        for c in ["one", "two", "three", "four"] {
+            std::fs::create_dir_all(d.join(format!("apps/{c}/src"))).unwrap();
+            std::fs::write(d.join(format!("apps/{c}/Cargo.toml")), "[package]\n").unwrap();
+        }
+        let touched: Vec<String> = ["one", "two", "three", "four"].iter()
+            .map(|c| format!("apps/{c}/src/lib.rs")).collect();
+        let (roots, dropped) = resolve_check_roots_capped(&d, touched.iter().map(|s| s.as_str()), 3);
+        assert_eq!(roots.len(), 3);
+        assert_eq!(dropped, 1, "the cap must report what it dropped, not swallow it");
+        let (all, none_dropped) = resolve_check_roots_capped(&d, touched.iter().map(|s| s.as_str()), 8);
+        assert_eq!(all.len(), 4);
+        assert_eq!(none_dropped, 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    /// A run that goes green, then breaks itself, then stalls: the tree it leaves behind must be the
+    /// GREEN one, not the broken attempt — otherwise `reapply` lands the failed attempt on the real
+    /// project. The abandoned state stays reachable in history.
+    #[test]
+    fn a_blocked_run_leaves_the_green_tree_not_the_broken_one() {
+        let d = tmp("gm-restore");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        let git = |args: &[&str]| -> String {
+            let o = std::process::Command::new("git").args(args).current_dir(&d).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "baseline"]);
+
+        // `grep -q ok src/state.rs` is the check: green exactly while that file says "ok". Turn 1
+        // writes it (green → checkpoint); turn 2 OVERWRITES it with "broken", which is a real
+        // regression rather than merely a new file; the rest are attempts that never touch it, so
+        // the error count never falls and the machine blocks.
+        let mut script = vec![
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"src/state.rs\",\"contents\":\"// ok\\n\"}\n```".to_string(),
+            // "// bad", not "// broken": `grep -q ok` matches br-OK-en, so the obvious word for a
+            // broken state keeps this check green. The fixture was silently passing on that.
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"src/state.rs\",\"contents\":\"// bad\\n\"}\n```".to_string(),
+        ];
+        for i in 0..6 {
+            script.push(format!("```tool\n{{\"tool\":\"write_file\",\"path\":\"src/try{i}.rs\",\"contents\":\"// try {i}\\n\"}}\n```"));
+        }
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 30,
+            verify_cmd: vec!["grep".into(), "-q".into(), "ok".into(), "src/state.rs".into()],
+            verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: false,
+            stateful_guide: true, checkpoint_on_green: true, ..Default::default() };
+        let (stop, run) = drive(&d, "make it green then break it", cfg, &script);
+        assert_eq!(stop, Stop::Stalled);
+        assert_eq!(run.phase(), Some("blocked"));
+        let green = run.last_green().expect("a green checkpoint was taken").to_string();
+
+        // The tree left behind is the green one…
+        assert_eq!(std::fs::read_to_string(d.join("src/state.rs")).unwrap(), "// ok\n",
+                   "the regression was rolled back");
+        assert!(!d.join("src/try0.rs").exists(), "the failed attempts are not in the working tree");
+        // …and the abandoned state is reachable BY NAME, not merely surviving in the reflog.
+        let tags = git(&["tag", "-l", "logscope-blocked-*"]);
+        let tag = tags.lines().next().expect("the blocked state is tagged").to_string();
+        let files = git(&["ls-tree", "-r", "--name-only", &tag]);
+        assert!(files.contains("src/try0.rs"), "the abandoned attempts are inspectable: {files}");
+        assert!(git(&["show", &format!("{tag}:src/state.rs")]).contains("bad"),
+                "and the regression itself is preserved for diagnosis");
+        assert!(green.len() >= 7);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn restore_is_a_no_op_story_when_there_was_never_a_green_state() {
+        // Nothing to restore to: the run still ends blocked, and nothing pretends otherwise.
+        let d = tmp("gm-nogreen");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        let script: Vec<String> = (0..6)
+            .map(|i| format!("```tool\n{{\"tool\":\"write_file\",\"path\":\"s{i}.rs\",\"contents\":\"// {i}\\n\"}}\n```"))
+            .collect();
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 20,
+            verify_cmd: vec!["test".into()], verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: false,
+            stateful_guide: true, checkpoint_on_green: true, ..Default::default() };
+        let (stop, run) = drive(&d, "never green", cfg, &script);
+        assert_eq!(stop, Stop::Stalled);
+        assert_eq!(run.last_green(), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    // ── bounded reading: measured, because "uses less memory" is otherwise just a claim ──────────
+
+    /// Peak resident set size in KiB (`VmHWM`), the kernel's own high-water mark. It never
+    /// decreases, which is exactly what is wanted here: a transient 256 MB allocation that is freed
+    /// before the assertion still shows up, so this cannot be fooled by the allocator returning
+    /// memory promptly.
+    #[cfg(target_os = "linux")]
+    fn peak_rss_kib() -> u64 {
+        std::fs::read_to_string("/proc/self/status").ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM:")).map(str::to_string))
+            .and_then(|l| l.split_whitespace().nth(1).and_then(|n| n.parse().ok()))
+            .unwrap_or(0)
+    }
+
+    /// Write a file of `mib` MiB of plausible source text.
+    fn big_file(path: &Path, mib: usize) {
+        use std::io::Write;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        let line = "// a line of source text that is about sixty-four bytes long ok\n";
+        let per_mib = (1024 * 1024) / line.len();
+        for _ in 0..(mib * per_mib) { f.write_all(line.as_bytes()).unwrap(); }
+        f.flush().unwrap();
+    }
+
+    /// The fix, measured. Reading a 256 MiB file used to allocate the whole thing (plus a second
+    /// copy for the char-truncate) to return 64 KiB of it. Peak RSS must now be a rounding error
+    /// against the file's size.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reading_a_huge_file_does_not_allocate_it() {
+        let d = tmp("bigread");
+        let f = d.join("src/huge.rs");
+        big_file(&f, 256);
+        let mut ws = Workspace::new(&d);
+        let before = peak_rss_kib();
+        let r = ws.apply(&Tool::ReadFile { path: "src/huge.rs".into() });
+        let after = peak_rss_kib();
+        assert!(r.ok, "{}", r.output);
+        assert!(r.output.len() < 200 * 1024, "output is capped: {} B", r.output.len());
+        assert!(r.output.contains("truncated at"), "and says so: {}", &r.output[r.output.len().saturating_sub(200)..]);
+        let grew_mib = (after.saturating_sub(before)) / 1024;
+        assert!(grew_mib < 16, "reading a 256 MiB file grew peak RSS by {grew_mib} MiB");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Same for a range read, which had the same whole-file allocation to return sixty lines.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_range_read_of_a_huge_file_does_not_allocate_it() {
+        let d = tmp("bigrange");
+        big_file(&d.join("src/huge.rs"), 256);
+        let mut ws = Workspace::new(&d);
+        let before = peak_rss_kib();
+        let r = ws.apply(&Tool::ReadRange { path: "src/huge.rs".into(), start: 10, end: 40 });
+        let after = peak_rss_kib();
+        assert!(r.ok, "{}", r.output);
+        assert!(r.output.contains("10: //") && r.output.contains("40: //"), "{}", r.output);
+        let grew_mib = (after.saturating_sub(before)) / 1024;
+        assert!(grew_mib < 16, "a 31-line range read of a 256 MiB file grew peak RSS by {grew_mib} MiB");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Search was the worst of the three: read_to_string on EVERY file in the tree. One large blob
+    /// anywhere under the root took the process out.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn search_skips_the_blob_instead_of_inhaling_it() {
+        let d = tmp("bigsearch");
+        big_file(&d.join("src/huge.rs"), 256);
+        std::fs::write(d.join("src/small.rs"), "fn find_me() {}\n").unwrap();
+        // a binary that must not be scanned or reported as source
+        std::fs::write(d.join("src/weights.bin"), [0u8, 1, 2, 3].repeat(4096)).unwrap();
+        let mut ws = Workspace::new(&d);
+        let before = peak_rss_kib();
+        let r = ws.apply(&Tool::Search { pattern: "find_me".into(), path: String::new() });
+        let after = peak_rss_kib();
+        assert!(r.ok, "{}", r.output);
+        assert!(r.output.contains("src/small.rs:1"), "the small file is still searched: {}", r.output);
+        assert!(r.output.contains("over 2 MiB skipped"), "the blob is skipped and said so: {}", r.output);
+        assert!(r.output.contains("binary file(s) skipped"), "{}", r.output);
+        let grew_mib = (after.saturating_sub(before)) / 1024;
+        assert!(grew_mib < 16, "searching past a 256 MiB blob grew peak RSS by {grew_mib} MiB");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_binary_file_is_refused_rather_than_turned_into_garbage_context() {
+        let d = tmp("binread");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("src/blob.bin"), [0u8, 159, 146, 150].repeat(64)).unwrap();
+        let mut ws = Workspace::new(&d);
+        let r = ws.apply(&Tool::ReadFile { path: "src/blob.bin".into() });
+        assert!(!r.ok && r.output.contains("binary"), "{}", r.output);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A symlink loop used to make `search` descend forever. `symlink_metadata` is what stops it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn search_does_not_follow_symlinks_into_a_loop() {
+        let d = tmp("symloop");
+        std::fs::create_dir_all(d.join("a")).unwrap();
+        std::fs::write(d.join("a/x.rs"), "fn target() {}\n").unwrap();
+        std::os::unix::fs::symlink(&d, d.join("a/loop")).unwrap();
+        let mut ws = Workspace::new(&d);
+        let r = ws.apply(&Tool::Search { pattern: "target".into(), path: String::new() });
+        assert!(r.ok && r.output.contains("a/x.rs:1"), "{}", r.output);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn read_capped_allocates_the_cap_not_the_file() {
+        let d = tmp("capped");
+        std::fs::write(d.join("f.txt"), "x".repeat(10_000)).unwrap();
+        let (t, trunc) = read_capped(&d.join("f.txt"), 100).unwrap();
+        assert_eq!(t.len(), 100);
+        assert!(trunc);
+        // exactly at the cap is NOT truncated
+        std::fs::write(d.join("g.txt"), "y".repeat(100)).unwrap();
+        let (t2, trunc2) = read_capped(&d.join("g.txt"), 100).unwrap();
+        assert_eq!(t2.len(), 100);
+        assert!(!trunc2, "a file of exactly cap bytes must not claim truncation");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    // ── the destructive-write guard (aperture's classifier, logscope's policy) ───────────────────
+
+    #[test]
+    fn an_elided_rewrite_of_an_existing_file_is_refused() {
+        let d = tmp("elide");
+        let real = "fn a() {}\nfn b() {}\nfn c() {}\n".repeat(40);
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("src/lib.rs"), &real).unwrap();
+        let mut ws = Workspace::new(&d);
+        let r = ws.apply(&Tool::WriteFile {
+            path: "src/lib.rs".into(),
+            contents: "fn a() { println!(\"new\"); }\n// ... rest of the code remains the same\n".into(),
+        });
+        assert!(!r.ok, "an elided whole-file write must not land");
+        assert!(r.output.contains("elision marker"), "{}", r.output);
+        assert!(r.output.contains("use `edit`"), "the refusal names the way forward: {}", r.output);
+        assert_eq!(std::fs::read_to_string(d.join("src/lib.rs")).unwrap(), real, "the file is untouched");
+        assert!(ws.events().is_empty(), "a refused write is not a file event");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_collapsing_rewrite_is_refused_but_an_honest_shrink_is_not() {
+        let d = tmp("collapse");
+        std::fs::write(d.join("big.rs"), "x".repeat(60_000)).unwrap();
+        let mut ws = Workspace::new(&d);
+        let r = ws.apply(&Tool::WriteFile { path: "big.rs".into(), contents: "fn main() {}\n".into() });
+        assert!(!r.ok && r.output.contains("dropping over"), "{}", r.output);
+        // A modest shrink is ordinary editing and must go through.
+        let ok = ws.apply(&Tool::WriteFile { path: "big.rs".into(), contents: "x".repeat(40_000) });
+        assert!(ok.ok, "{}", ok.output);
+        // And a small file may legitimately shrink to almost nothing.
+        std::fs::write(d.join("tiny.rs"), "fn f() { 1 }\n").unwrap();
+        let tiny = ws.apply(&Tool::WriteFile { path: "tiny.rs".into(), contents: "\n".into() });
+        assert!(tiny.ok, "the ratio rule must not fire on small files: {}", tiny.output);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_new_file_may_contain_anything_and_edits_are_not_guarded() {
+        let d = tmp("newfile");
+        let mut ws = Workspace::new(&d);
+        // scaffolding a NEW file with an ellipsis comment destroys nothing
+        let r = ws.apply(&Tool::WriteFile {
+            path: "notes.md".into(),
+            contents: "# plan\n// ... rest of the code remains the same\n".into(),
+        });
+        assert!(r.ok, "a new file cannot be a destructive rewrite: {}", r.output);
+        // an anchored edit is scoped by construction, so the same text is allowed there
+        std::fs::write(d.join("code.rs"), "fn a() {}\nMARK\nfn c() {}\n").unwrap();
+        let e = ws.apply(&Tool::Edit {
+            path: "code.rs".into(),
+            find: "MARK".into(),
+            replace: "// ... rest of the code remains the same".into(),
+        });
+        assert!(e.ok, "edit is scoped and stays unguarded: {}", e.output);
+        assert!(std::fs::read_to_string(d.join("code.rs")).unwrap().contains("fn c()"),
+                "and it really did only touch the anchor");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The reason this guard exists rather than trusting the verify gate: an elided rewrite often
+    /// still COMPILES, so the check goes green over a truncated file and the phase machine reaches
+    /// Done. Here the "checker" passes on any file at all; only the write guard stops the deletion.
+    #[test]
+    fn a_deletion_that_would_have_passed_its_own_check_is_stopped_at_the_write() {
+        let d = tmp("silent-del");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        let real = "pub fn keep_me() {}\n".repeat(200);
+        std::fs::write(d.join("src/lib.rs"), &real).unwrap();
+        let script = vec![
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"src/lib.rs\",\"contents\":\"pub fn keep_me() {}\\n// ... rest of the code remains the same\\n\"}\n```".to_string(),
+        ];
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 4,
+            verify_cmd: vec!["true".into()], verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: false, ..Default::default() };
+        let (_stop, _run) = drive(&d, "tidy lib.rs", cfg, &script);
+        assert_eq!(std::fs::read_to_string(d.join("src/lib.rs")).unwrap(), real,
+                   "the always-green checker would have blessed the truncation; the write guard is what stopped it");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    // ── the tool surface: prompt, runtime and worker whitelist must name the same tools ──────────
+
+    #[test]
+    fn every_runtime_tool_is_named_in_the_canonical_list() {
+        // One instance of each variant. Exhaustive by construction: `wire_name` matches on the enum,
+        // so a new variant forces a name, and this asserts the name reached RUNTIME_TOOLS.
+        let all = [
+            Tool::WriteFile { path: "p".into(), contents: String::new() },
+            Tool::ReadFile { path: "p".into() },
+            Tool::ListDir { path: String::new() },
+            Tool::Run { argv: vec!["true".into()] },
+            Tool::Search { pattern: "x".into(), path: String::new() },
+            Tool::ReadRange { path: "p".into(), start: 1, end: 2 },
+            Tool::GitLog { n: 1, path: String::new() },
+            Tool::Edit { path: "p".into(), find: "a".into(), replace: "b".into() },
+            Tool::Doc { name: "d".into(), content: String::new() },
+            Tool::Propose { path: "p".into(), content: "fn x() {}".into() },
+        ];
+        for t in &all {
+            assert!(RUNTIME_TOOLS.contains(&t.wire_name()),
+                    "{} is executable but not in RUNTIME_TOOLS", t.wire_name());
+        }
+        assert_eq!(all.len(), RUNTIME_TOOLS.len(), "RUNTIME_TOOLS names a tool the runtime does not have");
+    }
+
+    /// The bug this catches: a tool that is implemented and never taught. `git_log` was exactly that
+    /// — executable, budgeted, and absent from the menu, so no model could call it.
+    #[test]
+    fn every_runtime_tool_is_taught_in_the_system_prompt() {
+        let cfg = AgentConfig::default();
+        let p = system_prompt("do a thing", &cfg);
+        for t in RUNTIME_TOOLS {
+            assert!(p.contains(&format!("\"tool\":\"{t}\"")) || p.contains(&format!("\"tool\": \"{t}\"")),
+                    "the prompt never tells the model that `{t}` exists");
+        }
+        // And the worker preset teaches them too — a worker that is not told about a tool is a
+        // worker that will ask the user instead of using it.
+        let w = system_prompt("do a thing", &AgentConfig::worker());
+        for t in RUNTIME_TOOLS {
+            assert!(w.contains(&format!("\"tool\":\"{t}\"")) || w.contains(&format!("\"tool\": \"{t}\"")),
+                    "the WORKER prompt never tells the model that `{t}` exists");
+        }
+    }
+
+    /// The worker whitelist lives in logscope-fan (the dependency runs that way), so the two lists
+    /// are copies. This is what stops them drifting — and drift here is not cosmetic: a mismatch
+    /// means a generated worker is either denied a tool the runtime has, or granted one it does not.
+    #[test]
+    fn the_worker_whitelist_names_exactly_the_runtime_tools() {
+        assert_eq!(RUNTIME_TOOLS, logscope_fan::queen::RUNTIME_TOOLS,
+                   "workspace_exec and queen disagree about what tools exist");
+    }
+
+    #[test]
+    fn the_prompt_says_what_history_is_for_not_just_that_it_exists() {
+        let p = system_prompt("t", &AgentConfig::default());
+        assert!(p.contains("HISTORY IS EVIDENCE"), "history needs a reason, or it goes unused");
+        assert!(p.contains("checkpoint"), "gitmind's timeline is part of the pathway now");
+    }
+
+    /// gitmind's checkpoint timeline is `refs/checkpoints/<session>` — ordinary refs — so the agent
+    /// can read it with the same tool and no gitmind dependency.
+    #[test]
+    fn git_log_reports_gitmind_checkpoints_alongside_commits() {
+        let d = tmp("gmhist");
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git").args(args).current_dir(&d).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(d.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "a real commit"]);
+        // a checkpoint ref, exactly as gitmind-core's CheckpointEngine writes them
+        std::fs::write(d.join("a.rs"), "fn a() { 1 }\n").unwrap();
+        git(&["add", "-A"]);
+        let cp = git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit-tree", "-p", "HEAD",
+                       "-m", "checkpoint: mid-session state", &git(&["write-tree"])]);
+        git(&["update-ref", "refs/checkpoints/session-one", &cp]);
+
+        let mut ws = Workspace::new(&d);
+        assert_eq!(ws.gitmind_sessions(), vec!["refs/checkpoints/session-one".to_string()]);
+        let r = ws.apply(&Tool::GitLog { n: 5, path: String::new() });
+        assert!(r.ok, "{}", r.output);
+        assert!(r.output.contains("a real commit"), "git history still reported: {}", r.output);
+        assert!(r.output.contains("checkpoint: mid-session state"), "gitmind history reported: {}", r.output);
+        assert!(r.output.contains("gitmind checkpoints/session-one"),
+                "and labelled as checkpoints, not passed off as commits: {}", r.output);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_repo_without_gitmind_reports_only_git_history() {
+        let d = tmp("nogm");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&d).output().unwrap();
+        };
+        git(&["init", "-q"]);
+        std::fs::write(d.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "only commit"]);
+        let mut ws = Workspace::new(&d);
+        assert!(ws.gitmind_sessions().is_empty());
+        let r = ws.apply(&Tool::GitLog { n: 5, path: String::new() });
+        assert!(r.ok && r.output.contains("only commit") && !r.output.contains("checkpoints/"), "{}", r.output);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    /// EXPOSING THE BUG before fixing it: `advance()` marks the next plan step done at the end of
+    /// any turn that made tool calls, including a turn that only READ files. A five-step plan
+    /// therefore reports 5/5 after five reads and zero edits — and that number is what the HUD
+    /// shows and what the compaction digest records as fact.
+    #[test]
+    fn plan_progress_must_not_count_a_read_only_turn_as_a_completed_step() {
+        let d = tmp("planlie");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        for f in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(d.join("src").join(f), "// x\n").unwrap();
+        }
+        let mut script = vec![
+            "```plan\n1. rewrite src/a.rs\n2. rewrite src/b.rs\n3. rewrite src/c.rs\n```\n```tool\n{\"tool\":\"list_dir\",\"path\":\"src\"}\n```".to_string(),
+        ];
+        for f in ["a.rs", "b.rs", "c.rs"] {
+            script.push(format!("```tool\n{{\"tool\":\"read_file\",\"path\":\"src/{f}\"}}\n```"));
+        }
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6,
+            verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false,
+            prefer_patches: false, digest_verify: false, ..Default::default() };
+        let (_stop, run) = drive(&d, "rewrite three files", cfg, &script);
+        let (done, total) = run.plan().progress();
+        assert_eq!(total, 3);
+        assert_eq!(done, 0,
+                   "nothing was written, so no plan step is done — reported {done}/{total}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    // ── propose: section-level dry run returning a patch summary ─────────────────────────────────
+
+    #[test]
+    fn propose_writes_nothing_and_names_what_each_block_is() {
+        let d = tmp("propose");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        let before = "pub fn existing() {\n    let x = 1;\n}\n";
+        std::fs::write(d.join("src/lib.rs"), before).unwrap();
+        let mut ws = Workspace::new(&d);
+        let r = ws.apply(&Tool::Propose {
+            path: "src/lib.rs".into(),
+            content: "pub fn brand_new() {\n    let y = 2;\n}\n\n// ... rest of the code remains the same\n".into(),
+        });
+        assert!(r.ok, "{}", r.output);
+        assert!(r.output.contains("NOTHING was written"));
+        assert!(r.output.contains("ELISION"), "the dangerous block is named as such: {}", r.output);
+        assert!(r.output.to_lowercase().contains("code"), "{}", r.output);
+        assert_eq!(std::fs::read_to_string(d.join("src/lib.rs")).unwrap(), before, "a dry run writes nothing");
+        assert!(ws.events().is_empty(), "and produces no file events");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The finding that saves the most turns in a long run: a model re-proposing code it already
+    /// landed. Invisible without checking the file, and it costs a whole turn every time.
+    #[test]
+    fn propose_reports_a_block_that_is_already_in_the_file() {
+        let d = tmp("propose-dup");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("src/lib.rs"),
+            "pub fn already_here(a: u32) -> u32 {\n    a + 1\n}\n").unwrap();
+        let mut ws = Workspace::new(&d);
+        // re-proposed with DIFFERENT indentation — the realistic case, which an exact-match check
+        // would report as absent and send the model off to re-land it.
+        let r = ws.apply(&Tool::Propose {
+            path: "src/lib.rs".into(),
+            content: "pub fn already_here(a: u32) -> u32 {\n        a + 1\n}\n".into(),
+        });
+        assert!(r.ok, "{}", r.output);
+        assert!(r.output.contains("ALREADY IN THE FILE"), "{}", r.output);
+        assert!(r.output.contains("0 block(s) worth landing"), "{}", r.output);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn propose_suggests_an_anchor_only_when_it_is_unique() {
+        // unique identifier → an anchor the model can paste into `edit`
+        let existing = "fn alpha() {}\nfn beta_unique_name() {}\nfn gamma() {}\n";
+        let a = anchor_for(existing, "fn beta_unique_name() { let z = 3; }");
+        assert_eq!(a.as_deref(), Some("fn beta_unique_name() {}"));
+        // ambiguous → None, because a unique-and-wrong anchor lands the change in the wrong place
+        let dupe = "fn same_name() {}\nfn same_name() {}\n";
+        assert_eq!(anchor_for(dupe, "fn same_name() { 1 }"), None);
+        // nothing related in the file → None
+        assert_eq!(anchor_for("fn alpha() {}\n", "fn totally_unrelated() {}"), None);
+    }
+
+    #[test]
+    fn block_presence_ignores_indentation_but_not_content() {
+        assert!(block_present("fn a() {\n    1\n}\n", "fn a() {\n1\n}"));
+        assert!(block_present("fn a() {\n    1\n}\n", "fn a() {\n        1\n}"));
+        assert!(!block_present("fn a() {\n    1\n}\n", "fn a() {\n    2\n}"));
+        assert!(!block_present("fn a() {}\n", ""), "empty is not present");
+    }
+
+    #[test]
+    fn propose_is_reachable_from_a_model_turn() {
+        // The whole path: JSON on the wire → parsed → executed → summary back.
+        let d = tmp("propose-wire");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("src/lib.rs"), "pub fn keep() {}\n").unwrap();
+        let (tools, rejected) = parse_tools_reported(
+            "```tool\n{\"tool\":\"propose\",\"path\":\"src/lib.rs\",\"content\":\"pub fn added() {}\\n\"}\n```");
+        assert!(rejected.is_empty(), "{rejected:?}");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].wire_name(), "propose");
+        let mut ws = Workspace::new(&d);
+        let r = ws.apply(&tools[0]);
+        assert!(r.ok && r.output.contains("PATCH SUMMARY"), "{}", r.output);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    // ── the planner, consumed ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_planned_fan_gives_each_branch_its_own_persona() {
+        let d = tmp("fanpersona");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        let specs = vec![
+            (d.clone(), "unit a".to_string(), "src/a.rs".to_string(), "think like a parser author".to_string()),
+            (d.clone(), "unit b".to_string(), "src/b.rs".to_string(), "think like a test writer".to_string()),
+        ];
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, ..Default::default() };
+        let fan = AgentFan::planned(specs, &cfg, Box::new(|_| String::new()));
+        assert_eq!(fan.len(), 2);
+        // The personas must reach the branches' prompts — a fan built from a plan and then run with
+        // one identical prompt has discarded the plan.
+        let p0 = system_prompt("unit a", &AgentConfig { persona: "think like a parser author".into(), ..cfg.clone() });
+        assert!(p0.contains("HOW TO APPROACH THIS UNIT"));
+        assert!(p0.contains("think like a parser author"));
+        let plain = system_prompt("unit a", &cfg);
+        assert!(!plain.contains("HOW TO APPROACH THIS UNIT"), "an ordinary run gets no persona block");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// End to end through the real modules: plan text → parsed steps → subtasks → worker prompts,
+    /// with each worker told about its siblings. This is the path that was broken by one absent
+    /// input, not by a missing runner.
+    #[test]
+    fn a_parsed_plan_becomes_sibling_aware_worker_prompts() {
+        let plan = parse_plan("```plan\n1. rewrite src/parse.rs\n2. rewrite src/emit.rs\n```");
+        assert_eq!(plan.steps.len(), 2);
+        let steps: Vec<String> = plan.steps.iter().map(|s| s.text.clone()).collect();
+        let task = crate::planrun::task_from_steps("make it build", &steps, "shared: struct Ast");
+        let (bs, _) = crate::planrun::branches(logscope_fan::coordinator::Mode::Coordinator, &task, 4);
+        assert_eq!(bs.len(), 2, "two plan steps, two workers");
+        assert_eq!(bs[0].label, "src/parse.rs");
+        assert!(bs[0].goal.contains("src/emit.rs"), "worker 1 knows about worker 2: {}", bs[0].goal);
+        assert!(bs[1].goal.contains("src/parse.rs"), "and the reverse");
+        assert!(bs[0].goal.contains("struct Ast"), "shared context reaches both");
+    }
+
+
+    // ── the pieces together: a sloppy model against the whole guarded loop ────────────────────────
+
+    /// EVERY PIECE THIS SESSION ADDED IS TESTED ALONE. Nothing tested them INTERACTING, and they
+    /// interact on the failure path specifically: a refused destructive write feeds the refusal
+    /// ladder, which feeds the loop guard, which feeds the phase machine's stall detector, which
+    /// triggers the green restore, which decides what `reapply` would land. A deadlock or a false
+    /// "done" anywhere in that chain is invisible to the unit tests.
+    ///
+    /// The model here misbehaves the way the field reports in this file describe real small models
+    /// misbehaving — prose inside the fence (the 1B case at the refusal-ladder comment), a nonce-less
+    /// call (the "22 of 22 rejected" case), an elided whole-file rewrite, a completion claim with a
+    /// red check, and a repeat of an already-refused write. What is asserted is not that it succeeds
+    /// — it should not — but that the run reaches a DEFENSIBLE end: bounded turns, the real file
+    /// intact, no false plan progress, and a stop the operator can act on.
+    #[test]
+    fn a_sloppy_model_run_ends_in_a_defensible_state() {
+        let d = tmp("sloppy");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        let real = "pub fn load() {}\npub fn save() {}\npub fn keep_me() {}\n".repeat(30);
+        std::fs::write(d.join("src/lib.rs"), &real).unwrap();
+
+        let script = vec![
+            // A plan naming two real files — so plan progress has something to be wrong about.
+            "```plan\n1. rewrite src/lib.rs\n2. add src/extra.rs\n```".to_string(),
+            // Prose inside the fence: the parser refuses it, and the run must NOT read as a model
+            // that emitted nothing (that conflation is what the field report was).
+            "```tool\nI will now rewrite the library file for you.\n```".to_string(),
+            // A call with no nonce: inert under the default gate. Complying perfectly with the wrong
+            // instructions is exactly the 22-of-22 case.
+            "```tool\n{\"tool\":\"read_file\",\"path\":\"src/lib.rs\"}\n```".to_string(),
+            // The destructive rewrite, twice — the second is a model that did not read its refusal.
+            format!("```tool nonce=\"{{N}}\"\n{{\"tool\":\"write_file\",\"path\":\"src/lib.rs\",\"contents\":\"pub fn load() {{}}\\n// ... rest of the code remains the same\\n\"}}\n```"),
+            format!("```tool nonce=\"{{N}}\"\n{{\"tool\":\"write_file\",\"path\":\"src/lib.rs\",\"contents\":\"pub fn load() {{}}\\n// ... the rest is unchanged\\n\"}}\n```"),
+            // Claiming completion with nothing green.
+            format!("Everything is working now. {DONE_MARKER}"),
+        ];
+
+        let cfg = AgentConfig { max_steps: 12,
+            verify_cmd: vec!["test".into()], verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: true,
+            stateful_guide: true, checkpoint_on_green: true,
+            ..Default::default() };
+        // The real gate, not ToolGate::Open: the nonce behaviour is part of what is under test.
+        let nonce = match &cfg.gate { crate::taint::ToolGate::Required(n) => n.as_str().to_string(), _ => unreachable!() };
+        let script: Vec<String> = script.into_iter().map(|t| t.replace("{N}", &nonce)).collect();
+
+        let (stop, run) = drive(&d, "tidy up the library", cfg, &script);
+
+        // 1. It ended, within budget, without panicking.
+        assert!(run.turns() <= 12, "ran away: {} turns", run.turns());
+        assert_ne!(stop, Stop::Done, "nothing was ever green; Done would be the worst outcome");
+
+        // 2. The real file survived every attempt on it.
+        assert_eq!(std::fs::read_to_string(d.join("src/lib.rs")).unwrap(), real,
+                   "an elided rewrite reached the disk");
+
+        // 3. No false plan progress. Step 1 named src/lib.rs and nothing legitimately wrote it;
+        //    step 2 named src/extra.rs and nothing created it.
+        let (done, total) = run.plan().progress();
+        assert_eq!(total, 2, "the plan parsed");
+        assert_eq!(done, 0, "reported {done}/{total} done having written nothing");
+
+        // 4. The phase machine is somewhere honest — never `done`.
+        let phase = run.phase().expect("a guided run has a phase");
+        assert_ne!(phase, "done", "the phase machine accepted a claim with a red check");
+
+        // 5. Nothing false was recorded as verified.
+        assert!(!run.verified());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The same shape, but the model recovers: it takes the refusal's advice and uses an anchored
+    /// edit. The guarded loop must let good work through — a guard that blocks the bad path and also
+    /// the good one is just a broken loop.
+    #[test]
+    fn the_same_guards_let_a_corrected_model_finish() {
+        let d = tmp("recovers");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("src/lib.rs"), "pub fn load() {}\npub fn save() {}\n").unwrap();
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 10,
+            verify_cmd: vec!["true".into()], verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: false,
+            stateful_guide: true, checkpoint_on_green: true, ..Default::default() };
+        let script = vec![
+            "```plan\n1. change src/lib.rs\n```".to_string(),
+            // refused: elided rewrite
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"src/lib.rs\",\"contents\":\"pub fn load() {}\\n// ... rest unchanged\\n\"}\n```".to_string(),
+            // corrected: an anchored edit, which is what the refusal told it to do
+            "```tool\n{\"tool\":\"edit\",\"path\":\"src/lib.rs\",\"find\":\"pub fn load() {}\",\"replace\":\"pub fn load() { let _ = 1; }\"}\n```".to_string(),
+            format!("Done. {DONE_MARKER}"),
+        ];
+        let (stop, run) = drive(&d, "change load()", cfg, &script);
+        assert_eq!(stop, Stop::Done, "a corrected model must be able to finish");
+        let text = std::fs::read_to_string(d.join("src/lib.rs")).unwrap();
+        assert!(text.contains("let _ = 1;"), "the anchored edit landed: {text}");
+        assert!(text.contains("pub fn save() {}"), "and it did not eat the rest of the file");
+        let (done, total) = run.plan().progress();
+        assert_eq!((done, total), (1, 1), "the plan step is verified by the write that satisfied it");
+        assert!(run.verified());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    /// A fan branch must be sized to the model that will run it. `AgentRun::start` applies
+    /// `cfg.model_label` to the workspace it builds, so a fan that leaves the field empty gets Mid
+    /// for every budget — the harness's explicit "unknown" — regardless of what is loaded.
+    #[test]
+    fn a_planned_fan_branch_is_sized_to_its_model() {
+        let d = tmp("fanclass");
+        let cfg_small = AgentConfig { model_label: "Llama-3.2-1B-Instruct-Q4_K_M.gguf".into(), ..Default::default() };
+        let cfg_big = AgentConfig { model_label: "Qwen3-30B-A3B-Q4.gguf".into(), ..Default::default() };
+        let (small, _) = AgentRun::start(&d, "t", cfg_small);
+        let (big, _) = AgentRun::start(&d, "t", cfg_big);
+        // The transcript bound is the class made visible: a 1B must not be handed a 30B's budget.
+        assert!(transcript_budget(small.model_class()) < transcript_budget(big.model_class()),
+                "the label is not reaching the branch's workspace");
+        // And an unlabelled run is Mid — the documented unknown, not an accident.
+        let (blind, _) = AgentRun::start(&d, "t", AgentConfig::default());
+        assert_eq!(blind.model_class(), crate::read_harness::ModelClass::Mid);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    // ── the oracle: is the change CORRECT, not merely green ──────────────────────────────────────
+
+    /// The inverse-patch check against a real git worktree: the change is measured, reverted,
+    /// measured again, and restored. This is the automated form of the sabotage step — the one that
+    /// caught several wrong tests by hand this session.
+    #[test]
+    fn the_inverse_patch_check_measures_both_trees_and_restores_the_work() {
+        let d = tmp("inverse");
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git").args(args).current_dir(&d).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        // `grep -q FIXED marker.txt` stands in for the suite: it passes only with the change.
+        std::fs::write(d.join("marker.txt"), "BROKEN\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+
+        // the agent's change, uncommitted, exactly as a run leaves it
+        std::fs::write(d.join("marker.txt"), "FIXED\n").unwrap();
+        std::fs::write(d.join("added.txt"), "new file\n").unwrap();
+
+        let ws = Workspace::new(&d);
+        let cmd = vec!["grep".into(), "-q".into(), "FIXED".into(), "marker.txt".into()];
+        let (after, reverted) = ws.inverse_patch_check(&cmd, "", &base).expect("check ran");
+        assert!(after.contains("exit: 0"), "the suite passes WITH the change: {after}");
+        assert!(!reverted.contains("exit: 0"), "and fails without it: {reverted}");
+
+        // The work is back — including the untracked file, which a plain `stash` would have left behind.
+        assert_eq!(std::fs::read_to_string(d.join("marker.txt")).unwrap(), "FIXED\n",
+                   "the change was not restored — the agent's work would be lost");
+        assert!(d.join("added.txt").is_file(), "untracked additions must survive the check too");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A change the suite cannot see: both runs identical, so the verdict is Unproven rather than
+    /// the green tick the old gate would have given.
+    #[test]
+    fn a_change_the_suite_cannot_see_is_reported_unproven() {
+        let d = tmp("unproven");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&d).output().unwrap();
+        };
+        git(&["init", "-q"]);
+        std::fs::write(d.join("marker.txt"), "OK\n").unwrap();
+        std::fs::write(d.join("untested.txt"), "before\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "base"]);
+        let base = String::from_utf8_lossy(
+            &std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&d)
+                .output().unwrap().stdout).trim().to_string();
+
+        // edit a file the "suite" never looks at
+        std::fs::write(d.join("untested.txt"), "after\n").unwrap();
+
+        let ws = Workspace::new(&d);
+        let cmd = vec!["grep".into(), "-q".into(), "OK".into(), "marker.txt".into()];
+        let (after, reverted) = ws.inverse_patch_check(&cmd, "", &base).unwrap();
+        assert!(after.contains("exit: 0") && reverted.contains("exit: 0"),
+                "green either way — which is exactly the case the old gate called success");
+        // Through the oracle: identical suites, so no test changed status.
+        let d_after = crate::oracle::parse_test_results(&after);
+        let d_rev = crate::oracle::parse_test_results(&reverted);
+        let delta = crate::oracle::delta(&d_rev, &d_after);
+        assert!(delta.is_empty());
+        match crate::oracle::judge(&delta, &[]) {
+            crate::oracle::Evidence::Unproven(_) => {}
+            other => panic!("expected Unproven, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    // ── engineering profiles in the prompt ───────────────────────────────────────────────────────
+
+    #[test]
+    fn the_old_hector_bool_still_gets_the_hardware_profile() {
+        let cfg = AgentConfig { hector_mode: true, ..Default::default() };
+        let p = system_prompt("t", &cfg);
+        assert!(p.contains("WORKING DISCIPLINE"), "the old flag produced nothing");
+        let oracle = crate::engprofile::HARDWARE.practices.iter()
+            .find(|x| x.tag == crate::engprofile::Tag::Oracle).unwrap().headline;
+        assert!(p.contains(oracle), "hector_mode did not map to the Hardware profile");
+        // and off is still off
+        assert!(!system_prompt("t", &AgentConfig::default()).contains("WORKING DISCIPLINE"));
+    }
+
+    #[test]
+    fn explicit_profiles_win_over_the_legacy_bool_and_compose() {
+        use crate::engprofile::ProfileId;
+        let cfg = AgentConfig {
+            hector_mode: true, // must be ignored when profiles are named
+            profiles: vec![ProfileId::Optimizer, ProfileId::Gpu],
+            model_label: "Qwen3-30B-A3B-Q4.gguf".into(),
+            ..Default::default() };
+        let p = system_prompt("t", &cfg);
+        assert!(p.contains("Optimizer") && p.contains("GPU"), "both names should head the block");
+        assert!(!p.contains("Hardware / reverse engineering"), "the legacy bool leaked through");
+        // the composed brief, not two concatenated ones: one rule per tag
+        let m = crate::engprofile::OPTIMIZER.practices.iter()
+            .find(|x| x.tag == crate::engprofile::Tag::Measurement).unwrap().headline;
+        assert_eq!(p.matches(m).count(), 1);
+    }
+
+    /// A small model must not spend its window on discipline. The budget is class-derived, so this
+    /// is the same "size the run to the model" rule the reads and the transcript already follow.
+    #[test]
+    fn a_small_model_gets_a_shorter_discipline_block() {
+        use crate::engprofile::ProfileId;
+        let mk = |label: &str| {
+            let cfg = AgentConfig { profiles: ProfileId::all().to_vec(),
+                model_label: label.into(), ..Default::default() };
+            system_prompt("t", &cfg).len()
+        };
+        let small = mk("Llama-3.2-1B-Instruct-Q4_K_M.gguf");
+        let big = mk("Qwen3-30B-A3B-Q4.gguf");
+        assert!(small < big, "1B got the same discipline block as a 30B: {small} vs {big}");
+        // but it still gets the load-bearing instructions
+        let cfg = AgentConfig { profiles: ProfileId::all().to_vec(),
+            model_label: "Llama-3.2-1B-Instruct-Q4_K_M.gguf".into(), ..Default::default() };
+        let p = system_prompt("t", &cfg);
+        assert!(p.contains("Choose the next work yourself"), "the tight brief lost a rank-1 habit");
+    }
+
+
+    // ── proof before completion ──────────────────────────────────────────────────────────────────
+
+    /// Build a scratch git repo with a libtest-shaped "suite" whose result depends on a marker file,
+    /// so a run's change can genuinely flip a test from failing to passing.
+    fn proof_repo(tag: &str) -> std::path::PathBuf {
+        let d = tmp(tag);
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        // The "suite": prints libtest lines, ok when marker.txt says FIXED.
+        std::fs::write(d.join("suite.sh"),
+            "#!/bin/sh\nif grep -q FIXED marker.txt 2>/dev/null; then\n\
+echo 'test the_thing ... ok'\nelse\necho 'test the_thing ... FAILED'\nfi\necho 'test unrelated ... ok'\n").unwrap();
+        std::fs::write(d.join("marker.txt"), "BROKEN\n").unwrap();
+        for args in [vec!["init", "-q"],
+                     vec!["-c", "user.email=t@t", "-c", "user.name=t", "add", "-A"]] {
+            std::process::Command::new("git").args(&args).current_dir(&d).output().unwrap();
+        }
+        std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "base"])
+            .current_dir(&d).output().unwrap();
+        std::process::Command::new("git").args(["tag", "logscope-base"])
+            .current_dir(&d).output().unwrap();
+        d
+    }
+
+    fn proof_cfg() -> AgentConfig {
+        AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6,
+            verify_cmd: vec!["sh".into(), "suite.sh".into()], verify_exts: vec!["txt".into()],
+            gate_done_on_verify: false, prefer_patches: false, digest_verify: false,
+            require_proof: true, ..Default::default() }
+    }
+
+    /// A change that flips a test red→green is PROVEN, and the claim is accepted.
+    #[test]
+    fn a_change_a_test_can_see_is_accepted() {
+        let d = proof_repo("proof-yes");
+        let mut cfg = proof_cfg();
+        cfg.extra_allow.push("sh".into());
+        let script = vec![
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"marker.txt\",\"contents\":\"FIXED\\n\"}\n```".to_string(),
+            format!("Done. {DONE_MARKER}"),
+        ];
+        let (stop, _run) = drive(&d, "fix the thing", cfg, &script);
+        assert_eq!(stop, Stop::Done, "a red→green test is exactly the evidence this asks for");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A change the suite cannot see is REJECTED, however green the suite is — and the model is told
+    /// what would count rather than merely refused.
+    #[test]
+    fn a_change_no_test_can_see_is_rejected_with_the_reason() {
+        let d = proof_repo("proof-no");
+        // start already green, so the suite passes with and without the change
+        std::fs::write(d.join("marker.txt"), "FIXED\n").unwrap();
+        for args in [vec!["add", "-A"], vec!["-c", "user.email=t@t", "-c", "user.name=t",
+                                             "commit", "-q", "-m", "green"]] {
+            std::process::Command::new("git").args(&args).current_dir(&d).output().unwrap();
+        }
+        std::process::Command::new("git").args(["tag", "-f", "logscope-base"])
+            .current_dir(&d).output().unwrap();
+        let mut cfg = proof_cfg();
+        cfg.extra_allow.push("sh".into());
+        let script = vec![
+            // edits a file no test looks at
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"notes.txt\",\"contents\":\"whatever\\n\"}\n```".to_string(),
+            format!("All done. {DONE_MARKER}"),
+        ];
+        let (stop, _run) = drive(&d, "tidy up", cfg, &script);
+        assert_ne!(stop, Stop::Done,
+                   "the suite is green both ways — that is not evidence the change did anything");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Infrastructure missing must not block a run: a workspace that is not a git worktree cannot be
+    /// reverted, and refusing every claim there would make the flag unusable rather than strict.
+    #[test]
+    fn a_workspace_without_git_falls_back_instead_of_blocking() {
+        let d = tmp("proof-nogit");
+        std::fs::write(d.join("marker.txt"), "FIXED\n").unwrap();
+        std::fs::write(d.join("suite.sh"), "#!/bin/sh\necho 'test t ... ok'\n").unwrap();
+        let mut cfg = proof_cfg();
+        cfg.extra_allow.push("sh".into());
+        let script = vec![
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"a.txt\",\"contents\":\"x\\n\"}\n```".to_string(),
+            format!("Done. {DONE_MARKER}"),
+        ];
+        let (stop, _run) = drive(&d, "do a thing", cfg, &script);
+        assert_eq!(stop, Stop::Done, "no worktree, no proof possible — fall through, do not wall off");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    /// A project whose suite is not `cargo` must still be able to run it.
+    ///
+    /// The allowlist exists to constrain what the MODEL runs; a verify command is the operator's
+    /// configuration and was gated by the same list, so `make test`, `pytest`, `just check` or a
+    /// shell script produced "command not allowed" as the check output on every turn — a gate that
+    /// can never go green, which with done-gating on is a run that can never finish.
+    ///
+    /// Asserted on the OBSERVATION text rather than on the stop reason, because the previous test
+    /// for this passed with the allowance sabotaged: it happened to name the same binary in
+    /// `extra_allow`, so it never exercised the auto-allowance at all.
+    #[test]
+    fn a_non_cargo_verify_command_is_permitted_to_run() {
+        let d = tmp("nonrust-verify");
+        std::fs::write(d.join("suite.sh"), "#!/bin/sh\necho 'test t ... ok'\n").unwrap();
+        // `sh` is NOT in the default allowlist and NOT in extra_allow — only the verify command's
+        // own binary, added automatically.
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 4,
+            verify_cmd: vec!["sh".into(), "suite.sh".into()], verify_exts: vec!["rs".into()],
+            gate_done_on_verify: false, prefer_patches: false, digest_verify: false,
+            ..Default::default() };
+        assert!(!default_allow().contains("sh"), "premise: sh is not allowed by default");
+        let (mut run, _first) = AgentRun::start(&d, "t", cfg);
+        run.on_token("```tool\n{\"tool\":\"write_file\",\"path\":\"a.rs\",\"contents\":\"//x\\n\"}\n```");
+        let _ = run.on_done();
+        let seen = run.prompt_snapshot();
+        assert!(seen.contains("AUTOMATIC VERIFICATION"), "the check did not run at all");
+        assert!(!seen.contains("command not allowed"),
+                "the operator's own verify command was refused by the model's allowlist:\n{}",
+                &seen[seen.len().saturating_sub(400)..]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    /// The phase machine and the proof gate are the same argument at two levels, so selecting the
+    /// mode must switch on both. A StatefulGuide run that accepts a change no test can see has the
+    /// discipline in its name and not in its behaviour.
+    #[test]
+    fn the_stateful_guide_mode_demands_proof_not_merely_green() {
+        let d = proof_repo("guide-proof");
+        // Already green: the suite passes with and without whatever the run does.
+        std::fs::write(d.join("marker.txt"), "FIXED\n").unwrap();
+        for args in [vec!["add", "-A"], vec!["-c", "user.email=t@t", "-c", "user.name=t",
+                                             "commit", "-q", "-m", "green"]] {
+            std::process::Command::new("git").args(&args).current_dir(&d).output().unwrap();
+        }
+        std::process::Command::new("git").args(["tag", "-f", "logscope-base"])
+            .current_dir(&d).output().unwrap();
+
+        let script = vec![
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"notes.txt\",\"contents\":\"x\\n\"}\n```".to_string(),
+            format!("Done. {DONE_MARKER}"),
+        ];
+        // The config StatefulGuide produces: guide on, checkpoints on, proof required.
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 5,
+            verify_cmd: vec!["sh".into(), "suite.sh".into()], verify_exts: vec!["txt".into()],
+            prefer_patches: false, digest_verify: false,
+            stateful_guide: true, checkpoint_on_green: true, require_proof: true,
+            ..Default::default() };
+        let (stop, run) = drive(&d, "tidy up", cfg, &script);
+        assert_ne!(stop, Stop::Done, "green both ways is not proof, whatever the phase says");
+        // The PHASE is legitimately "done" here and that is not a contradiction: engmode's Done
+        // means the counted check is clean, which it is. The run still does not finish, because
+        // completion needs a claim the evidence CONFIRMS and the proof gate found the evidence
+        // shows nothing changed. Two different questions — "is it green" and "did this run do
+        // anything" — and the second is the one the gate answers. My first version of this test
+        // asserted the phase was not done and was simply wrong about my own state machine.
+        assert_eq!(run.phase(), Some("done"), "the checker is green; that is what the phase reports");
+        assert!(run.prompt_snapshot().contains("NOT ACCEPTED"),
+                "the refusal must reach the model, with the reason");
+        assert!(run.prompt_snapshot().contains("fails without your change"),
+                "and must say what would count — a gate with no stated way through is a wall");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

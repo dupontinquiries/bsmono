@@ -237,6 +237,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "aperture-complete"
+version = "0.1.0"
+
+[[package]]
 name = "arboard"
 version = "3.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -921,6 +925,10 @@ checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
 ]
+
+[[package]]
+name = "config-kit"
+version = "0.1.0"
 
 [[package]]
 name = "const-oid"
@@ -2892,10 +2900,12 @@ dependencies = [
 name = "logscope-egui"
 version = "0.1.0"
 dependencies = [
+ "aperture-complete",
  "async-std",
  "audiomix-kit",
  "chrono",
  "cli-kit",
+ "config-kit",
  "cpal",
  "eframe",
  "egui",

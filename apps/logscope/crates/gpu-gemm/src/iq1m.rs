@@ -58,22 +58,33 @@ pub fn dequant_iq1_m(raw: &[u8], n: usize) -> Result<Vec<f32>, String> {
         let qs = &raw[p..p + 32];
         let qh = &raw[p + 32..p + 48];
         let sc = &raw[p + 48..p + 56];
-        // The block scale is assembled from bits scattered across the eight scale bytes — the same
-        // "borrow the high bits from elsewhere" pattern as Q4_K and IQ4_XS, and the same place a
-        // port breaks.
-        // The block scale's sixteen bits are the TOP NIBBLES of scales[0], [2], [4] and [6].
+        // THE SCALE BYTES ARE READ AS FOUR u16s, and both scales come out of them. Getting this
+        // from the field names alone is not possible; it is
+        //     scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000)
+        // in ggml-quants.c, over `const uint16_t * sc = (const uint16_t *)x[i].scales`.
+        let sc16 = |j: usize| u16::from_le_bytes([sc[2 * j], sc[2 * j + 1]]);
+        // BLOCK SCALE: the top nibble of each of the four u16s — i.e. the top nibbles of scale
+        // BYTES 1, 3, 5, 7, the ODD ones.
         //
-        // My first version shifted those bytes by 12, which is always zero for a u8 — the scale came
-        // out as f16(0) and every weight decoded to zero times something. A test that only checked
-        // "does not panic" would have passed it, which is why the delta-sign test exists.
-        let hi = ((sc[0] >> 4) as u16)
-               | (((sc[2] >> 4) as u16) << 4)
-               | (((sc[4] >> 4) as u16) << 8)
-               | (((sc[6] >> 4) as u16) << 12);
+        // This module used bytes 0, 2, 4, 6. Every IQ1_M tensor therefore decoded with an f16 built
+        // from unrelated bits: not zero, not noise, just a plausible wrong number scaling the whole
+        // block. Found by differential against llama.cpp's dequantizer on identical bytes.
+        let hi = (sc16(0) >> 12)
+               | ((sc16(1) >> 8) & 0x00F0)
+               | ((sc16(2) >> 4) & 0x0F00)
+               | (sc16(3) & 0xF000);
         let d = f16((hi & 0xFF) as u8, (hi >> 8) as u8);
         for ib in 0..16 {
-            // FOUR 4-bit scales per 8 sub-blocks: sub-block ib takes nibble ib/2 of byte ib/4.
-            let s = ((sc[ib / 4] >> (4 * ((ib / 2) % 2))) & 0xF) as f32;
+            // SUB-BLOCK SCALES are 3-BIT, not 4-bit, and there are TWO per 32 weights: within u16
+            // `sc16(ib32/2)`, at bit `6*(ib32%2)` for the first 16 weights and `+3` for the second
+            // 16. This loop walks 16-weight groups, so `ib32 = ib/2` and `half = ib%2` picks which
+            // of the pair applies.
+            //
+            // Reading them as 4-bit nibbles (what this did) takes three real bits plus one bit
+            // belonging to the neighbouring scale, so roughly half the sub-blocks came out at
+            // double their intended scale — an error that leaves the model running and merely bad.
+            let (ib32, half) = (ib / 2, ib % 2);
+            let s = ((sc16(ib32 / 2) >> (6 * (ib32 % 2) + 3 * half)) & 0x7) as f32;
             let dl = d * (2.0 * s + 1.0);
             for k in 0..2 {
                 let idx_lo = qs[ib * 2 + k] as usize;
@@ -125,7 +136,12 @@ mod tests {
         // Using IQ1_S's spacing gives half the block the wrong offset sign — a small error on every
         // weight, which reads as a slightly worse model rather than as a bug.
         let mut raw = vec![0u8; IQ1_M_BLOCK];
-        raw[48] = 0x11;                       // a non-zero scale so the output is not all zero
+        // A NON-ZERO BLOCK SCALE now needs the ODD scale bytes: d is assembled from the top nibbles
+        // of scales[1], [3], [5], [7] (= raw 49/51/53/55). Setting raw[48] — what this test did —
+        // contributes nothing to d, so with the layout corrected the whole block decoded to zero
+        // and the assertion became vacuously false. 0xC0 at 53 and 0x30 at 55 give d = 1.0.
+        raw[53] = 0xC0; raw[55] = 0x30;       // d = f16(0x3C00) = 1.0
+        raw[48] = 0x01;                       // sub-block 0 first-half 3-bit scale = 1 -> dl = 3
         raw[32] = 0b1000_0000;                // sub-block 0, k=1 delta sign SET
         let v = dequant_iq1_m(&raw, 256).unwrap();
         // Weights 0..8 (k=0) and 8..16 (k=1) must differ in sign of their offset.
@@ -136,5 +152,36 @@ mod tests {
     fn WRONG_lengths_are_refused() {
         assert!(dequant_iq1_m(&[0u8; 4], 256).is_err());
         assert!(dequant_iq1_m(&[0u8; IQ1_M_BLOCK], 300).is_err());
+    }
+
+    /// REFERENCE VECTOR from llama.cpp's own `dequantize_row_iq1_m`, on these exact bytes.
+    ///
+    /// Two scale bugs lived here until a differential run found them. The 16-bit block scale is
+    /// built from the top nibbles of the ODD scale bytes (1,3,5,7) - llama.cpp reads `scales` as
+    /// four u16s and takes the top nibble of each - and this file used the even ones. And the
+    /// sub-block scales are 3-BIT fields, two per 32 weights at bit offsets 6*(i%2) and +3,
+    /// where this file read 4-bit nibbles and so took one bit belonging to the neighbouring scale.
+    ///
+    /// Neither produces a crash or a zero: both give plausible wrong numbers, which is why an
+    /// IQ1_M model would have run and merely been bad.
+    #[test]
+    fn iq1_m_matches_the_llama_cpp_reference_vector() {
+        const RAW: [u8; IQ1_M_BLOCK] = [
+        225, 59, 3, 46, 17, 42, 50, 181, 121, 8, 15, 8, 177, 247, 237, 76,
+        46, 93, 58, 7, 249, 127, 33, 238, 35, 45, 23, 138, 32, 154, 246, 181,
+        136, 127, 102, 232, 9, 36, 2, 170, 73, 242, 193, 85, 27, 39, 254, 83,
+        38, 110, 73, 13, 177, 56, 72, 156,
+        ];
+        const EXPECT: [f32; 16] = [
+            0.0125387907, -0.00975239277, 0.00139319897, 0.0125387907,
+            0.00139319897, 0.0125387907, 0.00139319897, 0.0125387907,
+            0.00139319897, -0.00975239277, 0.00139319897, 0.00139319897,
+            -0.00975239277, 0.0125387907, 0.0125387907, 0.0125387907,
+        ];
+        let got = dequant_iq1_m(&RAW, 256).unwrap();
+        for (i, (&e, &g)) in EXPECT.iter().zip(got.iter()).enumerate() {
+            assert!((e - g).abs() <= 1e-6 * e.abs().max(1e-3),
+                    "weight {i}: reference {e}, got {g} - a scale field has drifted again");
+        }
     }
 }

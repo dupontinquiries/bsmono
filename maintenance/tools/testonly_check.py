@@ -14,6 +14,26 @@ ever simulated, no component owning a socket, and finally
 three tests and nothing else. unhosted_check saw none of them, because
 every one lived in a module that was reachable.
 
+## RUN IT AT THE WIDEST SCOPE THAT COMPILES TOGETHER
+
+A caller in another crate is still a caller. Scanning one crate at a time
+reports every cross-crate call as absent, and the numbers are not close:
+logscope's four crates scanned separately give 22 findings; scanned
+together they give 9. Thirteen of those 22 are live functions, and
+someone tidying from the per-crate list would delete working code —
+`engmode::from_traces` is called by logscope-egui's `phase_guide` and
+looks dead when logscope-fan is scanned alone.
+
+That mattered because the tool used to be too slow to run any other way:
+the file READ was cached and the `#[cfg(test)]` span scan was not, so
+`test_spans` ran once per (candidate function x file) and the cost was
+quadratic in the tree. Caching it took the four-crate run from
+"not in seven minutes" to under five. The cost was quietly deciding the
+scope, and the scope was deciding the answer.
+
+    python3 testonly_check.py apps/logscope/crates      # yes
+    python3 testonly_check.py apps/logscope/crates/foo  # only to triage one crate
+
 ## What it reports, and what it deliberately does not
 
 Reported: `pub fn` in a non-test module, referenced by name only inside
@@ -84,6 +104,17 @@ def audit(root: Path, lib_ok):
     # One pass to read everything: these trees are large and re-reading a
     # file per candidate turned a 20s run into minutes.
     text = {p: p.read_text(errors="replace") for p in rs}
+    # ...and one pass to find the test blocks, for the same reason one level in.
+    #
+    # The read was cached and the SPAN SCAN was not: `test_spans(other)` ran once per
+    # (candidate function x file), each time re-scanning a whole file for `#[cfg(test)]`
+    # and brace-matching it. That is quadratic in the tree, which is why this tool was
+    # only ever run one crate at a time -- and running it per crate is what makes it
+    # report cross-crate callers as absent. `engmode::from_traces` is called by
+    # logscope-egui's phase_guide and shows up TEST-ONLY when logscope-fan is scanned
+    # alone. The cost was quietly deciding the scope, and the scope was deciding the
+    # answer.
+    spans_of = {p: test_spans(t) for p, t in text.items()}
     findings = []
 
     for p in rs:
@@ -93,7 +124,7 @@ def audit(root: Path, lib_ok):
         if any(str(p).startswith(str(root / d)) for d in lib_ok):
             continue
         body = text[p]
-        spans = test_spans(body)
+        spans = spans_of[p]
         for m in PUB_FN.finditer(body):
             name = m.group(1)
             if name in EXEMPT or in_span(m.start(), spans):
@@ -104,7 +135,7 @@ def audit(root: Path, lib_ok):
             for q, other in text.items():
                 if hosted:
                     break
-                ospans = test_spans(other) if q != p else spans
+                ospans = spans_of[q]
                 for c in call.finditer(other):
                     # The definition itself is not a call.
                     if q == p and abs(c.start() - m.end()) < 4:
