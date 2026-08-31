@@ -2615,6 +2615,15 @@ impl Game {
             }
             Action::FlipVis => self.flip_vis = !self.flip_vis,
             Action::Transform => self.transform(),
+            Action::FlightMode => {
+                if self.car.flight {
+                    self.car.flight_submode = self.car.flight_submode.cycle();
+                    self.car.recompute_hand();
+                    self.toastf(&format!("FLIGHT MODE: {}", self.car.flight_submode.label()));
+                }
+                // silently does nothing outside flight -- same as PitchUp/
+                // PitchDown, a player who never flies never hits this branch
+            }
             Action::Fire => self.fire_weapon(),
             Action::CycleForm => {
                 if self.wep.watch.cycle() {
@@ -2802,7 +2811,7 @@ impl Game {
         let traits = self.bot_categories.get(self.cars.names[m])
             .map(|c| crate::chassis_traits::Traits::from_category(c))
             .unwrap_or_default();
-        self.car.hand = driveline::derive(driveline::Shape {
+        self.car.hand_base = driveline::derive(driveline::Shape {
             half_len: self.car.half_len,
             half_w: self.car.half_w,
             half_h: self.car.half_h,
@@ -2815,6 +2824,11 @@ impl Game {
             traction: traits.traction,
             mass_bias: traits.mass_bias,
         });
+        // a chassis switch always lands in FastFly (== hand_base
+        // unmultiplied) rather than carrying over whatever sub-mode the
+        // PREVIOUS flying chassis happened to be in
+        self.car.flight_submode = physics::FlightSubMode::default();
+        self.car.recompute_hand();
         let h = self.car.hand;
         self.toastf(&format!(
             "{}: {:?} — {} · {:.1} t, accel x{:.2} top x{:.2} grip x{:.2}{}",

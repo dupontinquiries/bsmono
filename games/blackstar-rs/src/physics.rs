@@ -40,6 +40,62 @@ pub struct Controls {
     pub powerslide: bool,
 }
 
+/// FLIGHT SUB-MODE. Proposed as "single-tap Transform cycles VTOL/hover
+/// vs. fast-fly/autoboost" — implemented on a DEDICATED key instead
+/// (`Action::FlightMode`), not `Action::Transform`, because a flying
+/// chassis can already fold vehicle<->robot through Transform today,
+/// and giving the same button a second meaning risks silently
+/// swallowing a real fold request. That precedence question is exactly
+/// what the original proposal flagged as needing a decision before
+/// implementation; this sidesteps it rather than guessing an answer.
+///
+/// `FastFly` is the default so a chassis nobody's toggled this on
+/// drives exactly as flight always has — this is new, additive
+/// behavior, not a retune of the existing feel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FlightSubMode {
+    /// low speed, high control authority — navigation, precision,
+    /// threading terrain, dogfighting maneuvers
+    Vtol,
+    /// high speed, committed trajectory — today's unmodified flight feel
+    #[default]
+    FastFly,
+}
+
+impl FlightSubMode {
+    pub fn cycle(self) -> FlightSubMode {
+        match self {
+            FlightSubMode::Vtol => FlightSubMode::FastFly,
+            FlightSubMode::FastFly => FlightSubMode::Vtol,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            FlightSubMode::Vtol => "VTOL",
+            FlightSubMode::FastFly => "FAST FLY",
+        }
+    }
+    /// Multipliers over the chassis' own `driveline`-derived Handling —
+    /// rides on top of it exactly the way `driveline` itself rides on
+    /// top of `CarCfg` (see that module's doc). FastFly is 1.0/1.0: a
+    /// no-op, so the default mode reproduces today's flight exactly.
+    ///
+    /// NOT IMPLEMENTED: the proposal's boost-reserve half ("regenerates
+    /// continuously or doesn't deplete... needs its own reserve concept
+    /// for flight, not reuse of Hover::base_tank"). That's a genuinely
+    /// separate resource system, not a multiplier, and inventing its
+    /// numbers here would be a guess with nothing to check it against —
+    /// left for whoever picks this up with an actual sense of what the
+    /// reserve should feel like to manage.
+    fn multipliers(self) -> (f32, f32) {
+        // (top_speed_mul, turn_mul)
+        match self {
+            FlightSubMode::Vtol => (0.55, 1.6),
+            FlightSubMode::FastFly => (1.0, 1.0),
+        }
+    }
+}
+
 pub struct Car {
     pub pos: Vec3,
     pub vel: Vec3,
@@ -81,11 +137,19 @@ pub struct Car {
     /// grounded — which is precisely the state the aerial control block
     /// already handles. Setting this is most of what "flying" means here.
     pub flight: bool,
+    /// Which flight sub-mode is active (see `FlightSubMode`). Read only
+    /// when `flight` is true; a ground vehicle ignores it entirely.
+    pub flight_submode: FlightSubMode,
     /// WHAT THIS PARTICULAR HULL IS LIKE (`driveline`). Multipliers over
     /// the player's `CarCfg`, so tuning stays the player's and character
     /// stays the vehicle's. `Default` is all 1.0 — a chassis nobody
     /// measured drives exactly as it did before this existed.
     pub hand: crate::driveline::Handling,
+    /// `hand` BEFORE `flight_submode`'s multipliers, so toggling the
+    /// sub-mode is a pure function of this and never compounds (toggle
+    /// twice, get back exactly what you started with) and never needs
+    /// re-deriving from geometry just to flip a flight mode.
+    pub hand_base: crate::driveline::Handling,
     /// how this hull stays up. None means the flat legacy behaviour.
     pub lift: Option<crate::lift::Lift>,
     /// local atmosphere, 0 = vacuum. A wing and a rotor both need it.
@@ -231,7 +295,9 @@ impl Car {
             drive: crate::model::Drive::Combustion,
             hover: None,
             flight: false,
+            flight_submode: FlightSubMode::default(),
             hand: crate::driveline::Handling::default(),
+            hand_base: crate::driveline::Handling::default(),
             lift: None,
             air: 1.0,
             robot: false,
@@ -266,6 +332,24 @@ impl Car {
     }
     pub fn forward(&self) -> Vec3 {
         self.rot * Vec3::NEG_Z
+    }
+    /// Apply `hand_base` and the current `flight_submode` together into
+    /// `hand`, the value physics actually reads. Call this any time
+    /// EITHER changes — after `driveline::derive` sets a new `hand_base`
+    /// on a chassis switch, or after `flight_submode` is cycled — rather
+    /// than mutating `hand` directly, so the two never drift apart and
+    /// toggling the sub-mode twice always returns exactly to baseline.
+    pub fn recompute_hand(&mut self) {
+        let (top_mul, turn_mul) = if self.flight {
+            self.flight_submode.multipliers()
+        } else {
+            (1.0, 1.0)
+        };
+        self.hand = crate::driveline::Handling {
+            top_speed: self.hand_base.top_speed * top_mul,
+            turn: self.hand_base.turn * turn_mul,
+            ..self.hand_base
+        };
     }
     pub fn up(&self) -> Vec3 {
         self.rot * Vec3::Y
@@ -2523,5 +2607,60 @@ mod seating_tests {
         // why it reads as SINKING rather than as spawning wrong: past the
         // smaller threshold the old guard fires and yanks the body up
         assert_eq!(buried_by(0.5, ANALOG_HALF_H, ANALOG_RIDE_H, false), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod flight_submode_tests {
+    use super::*;
+
+    #[test]
+    fn fast_fly_is_the_default_and_a_no_op() {
+        assert_eq!(FlightSubMode::default(), FlightSubMode::FastFly);
+        let (top, turn) = FlightSubMode::FastFly.multipliers();
+        assert_eq!((top, turn), (1.0, 1.0));
+    }
+
+    #[test]
+    fn cycling_is_a_two_state_toggle_that_returns_to_start() {
+        let m = FlightSubMode::FastFly;
+        assert_eq!(m.cycle(), FlightSubMode::Vtol);
+        assert_eq!(m.cycle().cycle(), FlightSubMode::FastFly);
+    }
+
+    #[test]
+    fn recompute_hand_is_a_pure_function_of_base_and_submode() {
+        let mut car = Car::new();
+        car.flight = true;
+        car.hand_base = crate::driveline::Handling { top_speed: 1.2, turn: 0.9, ..Default::default() };
+        car.recompute_hand();
+        assert_eq!(car.hand.top_speed, 1.2, "FastFly must not scale top_speed");
+        assert_eq!(car.hand.turn, 0.9, "FastFly must not scale turn");
+
+        car.flight_submode = car.flight_submode.cycle(); // -> Vtol
+        car.recompute_hand();
+        assert!(car.hand.top_speed < car.hand_base.top_speed, "VTOL should be slower");
+        assert!(car.hand.turn > car.hand_base.turn, "VTOL should turn tighter");
+
+        // toggling back reproduces the exact original numbers -- no drift,
+        // no compounding, because recompute_hand always derives from
+        // hand_base rather than mutating hand in place
+        car.flight_submode = car.flight_submode.cycle(); // -> FastFly
+        car.recompute_hand();
+        assert_eq!(car.hand.top_speed, 1.2);
+        assert_eq!(car.hand.turn, 0.9);
+    }
+
+    #[test]
+    fn ground_vehicles_ignore_flight_submode_entirely() {
+        // a non-flying car left in Vtol (e.g. after switching from a jet)
+        // must not have its handling touched by it
+        let mut car = Car::new();
+        car.flight = false;
+        car.flight_submode = FlightSubMode::Vtol;
+        car.hand_base = crate::driveline::Handling { top_speed: 1.0, turn: 1.0, ..Default::default() };
+        car.recompute_hand();
+        assert_eq!(car.hand.top_speed, 1.0);
+        assert_eq!(car.hand.turn, 1.0);
     }
 }

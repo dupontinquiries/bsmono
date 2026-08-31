@@ -50,9 +50,14 @@ pub enum Action {
     PitchDown,
     /// FLIGHT MODE ONLY: pitch the nose up independent of throttle.
     PitchUp,
+    /// FLIGHT MODE ONLY: cycle between VTOL and fast-fly sub-modes (see
+    /// `physics::FlightSubMode`). A dedicated key rather than reusing
+    /// `Transform` -- a flying chassis can already fold vehicle<->robot
+    /// through Transform, and this needs to not conflict with that.
+    FlightMode,
 }
 
-pub const ACTIONS: [Action; 28] = [
+pub const ACTIONS: [Action; 29] = [
     Action::Forward,
     Action::Reverse,
     Action::SteerL,
@@ -81,6 +86,7 @@ pub const ACTIONS: [Action; 28] = [
     Action::Grapple,
     Action::PitchDown,
     Action::PitchUp,
+    Action::FlightMode,
 ];
 
 impl Action {
@@ -114,6 +120,7 @@ impl Action {
             Action::Grapple => "RAID: GRAPPLE TO NODE",
             Action::PitchDown => "FLIGHT: NOSE DOWN",
             Action::PitchUp => "FLIGHT: NOSE UP",
+            Action::FlightMode => "FLIGHT: CYCLE VTOL/FAST-FLY",
         }
     }
     pub fn id(self) -> &'static str {
@@ -146,6 +153,7 @@ impl Action {
             Action::Grapple => "grapple",
             Action::PitchDown => "pitch_down",
             Action::PitchUp => "pitch_up",
+            Action::FlightMode => "flight_mode",
         }
     }
     pub fn from_id(s: &str) -> Option<Action> {
@@ -408,6 +416,7 @@ impl Bindings {
             // shell_handles_itself` below would have caught.
             (PitchDown, vec![ch("k")]),
             (PitchUp, vec![ch("i")]),
+            (FlightMode, vec![ch("l")]),
         ];
         Bindings { map: m }
     }
