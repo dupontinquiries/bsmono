@@ -5566,3 +5566,48 @@ Two things worth carrying beyond this filter:
 Default is now FAO_DEBLOCK_MODE=fixed. The adaptive modes stay
 reachable for re-testing when a perceptual metric better than MS-SSIM
 is available, but they are recorded as measured losses, not options.
+
+### Re-adjudicating the headline claim under MS-SSIM: the win SHRINKS from 32% to ~5%, and nearly inverts
+
+The MS-SSIM entry ended by noting that other results in this log were
+decided by PSNR/SSIM and might not survive a metric matched to the
+artifact. The biggest is the procedural-ground claim — the only content
+on which this codec beats AV1 — so it was re-run first.
+
+At MATCHED PSNR, which is how it was originally reported:
+  v11 procedural   58,556 B @ 40.046 dB   MS-SSIM 0.97692
+  AV1 p2 crf43     85,805 B @ 40.174 dB   MS-SSIM 0.98712
+Equal PSNR, and AV1 is a full point of MS-SSIM ahead. v11 also blocks
+harder (P=16 1.514 vs 0.935). So "32% smaller at matched quality" was
+32% smaller at matched PSNR and LOWER perceptual quality — the same
+error the deblock work had just been caught making.
+
+Re-measured on the MS-SSIM axis, with the deblocker on (fixed s2,
+which is now the default and helps here: 0.97692 -> 0.98050 for +0.8%
+bytes):
+  v11 procedural + deblock   59,036 B   MS-SSIM 0.98050
+  AV1 p2 crf50               54,396 B   MS-SSIM 0.97730
+  AV1 p2 crf47               66,179 B   MS-SSIM 0.98210
+v11 sits BETWEEN crf50 and crf47, closer to crf47. Interpolating on
+MS-SSIM, the AV1 point equal to v11 costs about 62 KB against v11's
+59 KB — v11 is roughly 5% smaller, not 32%.
+
+VERDICT: the win survives, barely, and only with deblocking on. The
+honest statement is now "v11 is approximately at parity with AV1 on
+procedural-surface content, perhaps ~5% ahead", not "32% ahead". Every
+earlier framing of this result in this log should be read with that
+correction, including the one that said the claim had SURVIVED the
+preset and GOP-length corrections — it survived those, and then did not
+survive the metric.
+
+What actually held up under all three corrections:
+  * the DIRECTION is real and repeatable — a world model beats a pixel
+    coder on content where motion compensation cannot reach, and the
+    wrong-camera control (209,449 B, no better than no model) says the
+    win is the camera being right;
+  * the magnitude was inflated roughly 6x by a metric that does not
+    charge for the artifact this codec produces most.
+The gap between those two sentences is the whole lesson of the last
+four entries: the codec's real deficit is not rate, it is that it
+degrades in a way PSNR does not price, so every rate comparison made
+against PSNR has been flattering it.

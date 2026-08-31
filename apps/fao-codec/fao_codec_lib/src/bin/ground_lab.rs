@@ -292,6 +292,23 @@ fn main() {
         psnr(&frames, &rproc.recon)
     );
 
+    // Dump the procedural-canonical reconstruction so the headline
+    // claim can be adjudicated by a metric other than the one it was
+    // matched on. Every AV1 comparison in this project was PSNR-matched,
+    // and MS-SSIM has already overturned one PSNR ranking.
+    if let Some(out) = args.get(2) {
+        use std::io::Write;
+        let mut fh = std::fs::File::create(out).expect("create recon y4m");
+        writeln!(fh, "YUV4MPEG2 W{W} H{H} F60:1 Ip A1:1 C420mpeg2").unwrap();
+        for fr in &rproc.recon {
+            fh.write_all(b"FRAME\n").unwrap();
+            fh.write_all(&fr.y).unwrap();
+            fh.write_all(&fr.u).unwrap();
+            fh.write_all(&fr.v).unwrap();
+        }
+        eprintln!("wrote recon {out}");
+    }
+
     // Branch 4: control — the right function, the WRONG camera path.
     // Catches a provider that helps for the wrong reason.
     let mut wrong = |fi: usize| {
