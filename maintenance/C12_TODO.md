@@ -4,6 +4,58 @@ Same convention as `C9_TODO.md` / `C10_TODO.md` / `C11_TODO.md`: every item
 says how far it actually got. None of those files are superseded; C11-2a was
 edited in place this session because it turned out not to be a real finding.
 
+## Session summary: §50–§105
+
+Entries are written as the work happens, so this is a map rather than a
+second account. What that session was mostly ABOUT, since the entry list
+does not show it:
+
+**A single failure shape, found ~15 times.** A component built
+carefully, tested, and never called — or called and never read. The
+instances: logscope's `promptroute`/`workergen`/`debatepanel`, gitmind's
+`remote`/`encode`/`reroll` (all three plan-with-no-runner), snapclone's
+camera enumeration, discovery and crypto settings, `send_state::ack`,
+bo-suite's scene loading, studio's `perform` and `library::classify`,
+rusty-board's cardinal layout data, blackstar's `menu_rows` clamp.
+
+Two tools were built to find it and both were WRONG at first:
+`unhosted_check` reported 35 gitmind modules of which 7 of the first 8
+were false (crate-blind, then FFI-blind); `testonly_check` was written
+after and is right on the first run at single digits per app. §60 and
+§71 are the corrections; §86 is the tool that came out of it.
+
+**Corrections to my own work, in order.** §60 (I verified a tool with a
+method sharing its blind spot), §63 (claimed a voice path was unbuilt
+when a design doc named every piece), §73 and §99 (eleven then seven
+compile errors from code written under "don't compile"), §95b (a
+heuristic I added the day before was shadowing a real schema field),
+§104 (grew nothing — the reported "hull too small" was inverted
+normals), §105 (overwrote an existing `gravity.rs`; `cat >` does not
+refuse where `create_file` does).
+
+**Merges taken:** snapclone identity/gossip, studio-live + gesture-kit,
+blackstar-rs fold audit and gameplay, logscope model support (MLA,
+DeltaNet, gemma4, Qwen3.5), fao-codec v11, CADscope + simscope grafted
+as 39 replayed commits.
+
+**Still uncommitted:** the unendlich items/creatures merge is STAGED and
+waiting on a decision — `voxelize_boxes` sizes dims `ceil(size/cell)+1`
+to match a JS tool, and the `+1` slab's cell centres always fall outside
+the box, so two of its own tests fail. My read is the dims are wrong and
+the tests are right; it is a behaviour change to code ported
+deliberately, so it is the operator's call.
+
+**Biggest open threads**, by how much they block:
+  - C104b/C104c — blackstar ship summon/follow, and the QWERTY/Dvorak
+    control-scheme analysis. Both asked for and not started.
+  - C105a — spin gravity exists as a model with no room, fixture or
+    input.
+  - C87a — photosync has core, cv and fingerprint and no frontend.
+  - C70a — logscope's 75 uncalled modules, unswept at the corrected
+    scope.
+  - C90a/C90b — studio's pattern library section, and the record arm
+    that would drive `perform`.
+
 The c12 session installed the offline 1.96.0 toolchain, merged two bundles
 (c9-006g studio, c5blackstar-008 blackstar-rs), and corrected two pieces of
 inherited sandbox lore. What follows is what it found and did not close.
