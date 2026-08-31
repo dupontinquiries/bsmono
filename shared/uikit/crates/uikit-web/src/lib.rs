@@ -11,6 +11,36 @@
 //! inline tags (b/strong, i/em, code, a) with HTML entities — enough for command output, docs,
 //! and HTML mail. Unknown tags degrade to their text content rather than breaking.
 
+//! ## Why there is no layout tree, and what would change that
+//!
+//! `qml_gen`'s `layout_detect` classifies an element as Column, Row,
+//! RowWrap, Grid or Inline from its tag, style and classes, and emits a
+//! matching QML container. Nothing equivalent exists here, and the display
+//! list is deliberately FLAT — blocks in document order, no nesting.
+//!
+//! That is a decision, not an omission. Side-by-side layout on a real page
+//! is overwhelmingly chrome: a nav rail, a sidebar of related links, a
+//! footer of four columns. This engine renders into a terminal app's pane,
+//! on a phone as often as a desktop, for someone who asked to READ
+//! something — and linearising chrome is what a reader mode does on
+//! purpose. Reproducing a three-column footer in a 380-pixel pane would be
+//! faithful and useless.
+//!
+//! Two things would change the answer, and neither is true yet:
+//!
+//! * **Content that only makes sense side by side.** A table is the main
+//!   one and it has its own block kind rather than a general layout tree,
+//!   because that is the case that actually varies. A diff view or a
+//!   two-column comparison would be the next.
+//! * **A pane wide enough to matter.** On a desktop with the browser pane
+//!   at half a screen, a card grid linearised into forty stacked blocks is
+//!   worse than a grid. That is a real complaint and it needs measurement
+//!   before it needs a tree.
+//!
+//! Written down because "add nesting to `Block`" is a small diff that
+//! would look like progress, and it would commit every consumer to a
+//! recursive walk in order to serve a case nobody has demonstrated.
+
 pub mod doc;
 
 /// Inline text styling (flattened from nested inline tags).
@@ -34,7 +64,19 @@ pub struct Inline {
 pub enum BlockKind {
     Paragraph,
     Heading(u8),
-    ListItem,
+    /// A list item, with where it sits.
+    ///
+    /// `<ul>` and `<ol>` were not handled at all: every item was a bullet
+    /// at the left margin, so an ordered list lost its numbers and a nested
+    /// one lost the nesting. On the documentation and manual pages this
+    /// engine mostly renders, a numbered list of steps IS the content —
+    /// "do 3 before 4" is not recoverable from a column of dots.
+    ListItem {
+        /// 0 for a top-level item. Clamped at [`MAX_LIST_DEPTH`].
+        depth: u8,
+        /// The number to show, for an ordered list. `None` is a bullet.
+        ordinal: Option<u32>,
+    },
     Code,
     Quote,
     Rule,
@@ -119,6 +161,15 @@ pub struct Element<'a> {
 /// FRAME, so an unbounded one is a page that gets slower the longer it is,
 /// forever, rather than a slow load.
 pub const MAX_BLOCKS: usize = 2_000;
+
+/// How far a list is indented before the indent stops growing.
+///
+/// Deeper nesting than this is real in generated documentation and is
+/// almost always a page using lists as a layout device. Indenting to match
+/// would push the text off the right of a phone; clamping keeps it
+/// readable and loses only the visual distinction between level six and
+/// level nine, which nobody was reading anyway.
+pub const MAX_LIST_DEPTH: u8 = 5;
 
 /// How to parse.
 ///
@@ -312,7 +363,10 @@ fn is_block(tag: &str) -> Option<BlockKind> {
         "h4" => Some(BlockKind::Heading(4)),
         "h5" => Some(BlockKind::Heading(5)),
         "h6" => Some(BlockKind::Heading(6)),
-        "li" => Some(BlockKind::ListItem),
+        // `li` is resolved by the parser, which knows the list stack — a
+        // tag-to-kind table cannot know how deep it is or what number it
+        // has. Named here so the tag is still recognised as a block.
+        "li" => Some(BlockKind::ListItem { depth: 0, ordinal: None }),
         "pre" => Some(BlockKind::Code),
         "blockquote" => Some(BlockKind::Quote),
         _ => None,
@@ -359,6 +413,11 @@ pub fn parse_html_with(html: &str, opts: &ParseOptions<'_>) -> RichDoc {
     /// and they are rare enough — and pathological enough as a layout
     /// device — that the inner one flattening into the outer cell is the
     /// better failure than the code to handle it.
+    /// The open `<ul>`/`<ol>` elements: (ordered, next number). A stack
+    /// rather than a depth counter because an ordered list nested inside a
+    /// bullet list has to keep counting from where it was when the inner
+    /// one closes.
+    let mut lists: Vec<(bool, u32)> = Vec::new();
     let mut table: Option<Block> = None;
     let mut row: Option<Vec<Cell>> = None;
     let mut cell: Option<Cell> = None;
@@ -447,6 +506,31 @@ pub fn parse_html_with(html: &str, opts: &ParseOptions<'_>) -> RichDoc {
                         _ => {}
                     }
                 }
+                if name == "ul" || name == "ol" {
+                    // A list START flushes: text before it belongs to the
+                    // paragraph above, not to the first item.
+                    flush(&mut cur, &mut blocks, &mut dropped);
+                    // `start` is honoured — a page that continues a list
+                    // after an interruption renders "5." and means it.
+                    let start = attrs.iter().find(|(k, _)| k == "start")
+                        .and_then(|(_, v)| v.trim().parse::<u32>().ok())
+                        .unwrap_or(1);
+                    lists.push((name == "ol", start));
+                    continue;
+                }
+                if name == "li" {
+                    flush(&mut cur, &mut blocks, &mut dropped);
+                    // An `li` outside any list is malformed and common.
+                    // Treated as a top-level bullet rather than dropped,
+                    // because the text is content either way.
+                    let depth = lists.len().saturating_sub(1).min(MAX_LIST_DEPTH as usize) as u8;
+                    let ordinal = match lists.last_mut() {
+                        Some((true, n)) => { let v = *n; *n += 1; Some(v) }
+                        _ => None,
+                    };
+                    cur = Some(Block::new(BlockKind::ListItem { depth, ordinal }, vec![]));
+                    continue;
+                }
                 if name == "hr" {
                     flush(&mut cur, &mut blocks, &mut dropped);
                     blocks.push(Block::new(BlockKind::Rule, vec![]));
@@ -507,6 +591,11 @@ pub fn parse_html_with(html: &str, opts: &ParseOptions<'_>) -> RichDoc {
                         _ if is_block(&name).is_some() => continue,
                         _ => {}
                     }
+                }
+                if name == "ul" || name == "ol" {
+                    flush(&mut cur, &mut blocks, &mut dropped);
+                    lists.pop();
+                    continue;
                 }
                 if is_block(&name).is_some() || name == "hr" {
                     flush(&mut cur, &mut blocks, &mut dropped);
@@ -612,10 +701,24 @@ pub fn render(ui: &mut egui::Ui, doc: &RichDoc,
             _ => {}
         }
         let quote = block.kind == BlockKind::Quote;
-        let bullet = block.kind == BlockKind::ListItem;
+        let list = match block.kind {
+            BlockKind::ListItem { depth, ordinal } => Some((depth, ordinal)),
+            _ => None,
+        };
         ui.horizontal_wrapped(|ui| {
-            if bullet {
-                ui.label(egui::RichText::new("• ").color(colors.text_weak));
+            if let Some((depth, ordinal)) = list {
+                // Indent by depth, then the marker. `add_space` rather than
+                // padding the marker string: a monospace-padded bullet
+                // misaligns the moment the font is not monospace, which is
+                // every font this renderer uses.
+                if depth > 0 {
+                    ui.add_space(f32::from(depth) * 14.0);
+                }
+                let marker = match ordinal {
+                    Some(n) => format!("{n}. "),
+                    None => "• ".to_string(),
+                };
+                ui.label(egui::RichText::new(marker).color(colors.text_weak));
             }
             if quote {
                 ui.label(egui::RichText::new("▏").color(colors.accent_soft));
@@ -708,6 +811,90 @@ fn table_ui(ui: &mut egui::Ui, block: &Block, has_header: bool,
             block.rows.len() + block.rows_dropped)).small().color(colors.text_weak));
     }
     followed
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+
+    fn items(html: &str) -> Vec<(u8, Option<u32>, String)> {
+        parse_html(html).blocks.iter().filter_map(|b| match b.kind {
+            BlockKind::ListItem { depth, ordinal } => Some((
+                depth, ordinal,
+                b.inlines.iter().map(|i| i.text.as_str()).collect::<String>())),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn an_ordered_list_keeps_its_numbers() {
+        // "do 3 before 4" is not recoverable from a column of dots, and on
+        // the documentation pages this engine renders, a numbered list of
+        // steps IS the content.
+        assert_eq!(items("<ol><li>first</li><li>second</li><li>third</li></ol>"), vec![
+            (0, Some(1), "first".to_string()),
+            (0, Some(2), "second".to_string()),
+            (0, Some(3), "third".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn a_start_attribute_is_honoured() {
+        // A page continuing a list after an interruption renders "5." and
+        // means it.
+        assert_eq!(items("<ol start=\"5\"><li>five</li><li>six</li></ol>"),
+                   vec![(0, Some(5), "five".to_string()), (0, Some(6), "six".to_string())]);
+    }
+
+    #[test]
+    fn nesting_indents_and_the_outer_list_resumes_its_count() {
+        // A stack, not a counter: an inner list must not renumber the outer
+        // one when it closes.
+        let got = items("<ol><li>one</li><ul><li>bullet</li></ul><li>two</li></ol>");
+        assert_eq!(got, vec![
+            (0, Some(1), "one".to_string()),
+            (1, None, "bullet".to_string()),
+            (0, Some(2), "two".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn a_bullet_list_inside_an_ordered_one_does_not_inherit_numbers() {
+        let got = items("<ol><li>step</li><ol><li>sub</li></ol></ol>");
+        assert_eq!(got, vec![
+            (0, Some(1), "step".to_string()),
+            (1, Some(1), "sub".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn indentation_stops_growing_rather_than_running_off_the_screen() {
+        // Deeper nesting is real in generated docs and is almost always a
+        // page using lists as a layout device. Matching it would push the
+        // text off the right of a phone.
+        let mut html = String::new();
+        for _ in 0..12 { html.push_str("<ul>"); }
+        html.push_str("<li>deep</li>");
+        for _ in 0..12 { html.push_str("</ul>"); }
+        let got = items(&html);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, MAX_LIST_DEPTH, "the indent was not clamped");
+    }
+
+    #[test]
+    fn an_item_outside_any_list_is_a_bullet_rather_than_lost() {
+        // Malformed and common. The text is content either way.
+        assert_eq!(items("<li>orphan</li>"), vec![(0, None, "orphan".to_string())]);
+    }
+
+    #[test]
+    fn text_before_a_list_stays_in_its_own_paragraph() {
+        // Without the flush at the list start it joins the first item.
+        let doc = parse_html("<p>intro</p><ul><li>one</li></ul>");
+        assert_eq!(doc.blocks.len(), 2);
+        assert_eq!(doc.blocks[0].kind, BlockKind::Paragraph);
+        assert_eq!(doc.blocks[0].inlines[0].text, "intro");
+    }
 }
 
 #[cfg(test)]
@@ -925,7 +1112,8 @@ mod tests {
     fn list_items_and_rule() {
         let doc = parse_html("<ul><li>one</li><li>two</li></ul><hr>");
         let kinds: Vec<_> = doc.blocks.iter().map(|b| b.kind.clone()).collect();
-        assert_eq!(kinds, vec![BlockKind::ListItem, BlockKind::ListItem, BlockKind::Rule]);
+        let bullet = BlockKind::ListItem { depth: 0, ordinal: None };
+        assert_eq!(kinds, vec![bullet.clone(), bullet, BlockKind::Rule]);
     }
 
     #[test]
