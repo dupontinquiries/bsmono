@@ -30,6 +30,25 @@ Paramount/Hasbro, and earlier drafts of every one of the thirteen original
 screenplay files used them. The two files here were checked clean by direct
 grep, and anything added beside them should be.
 
+## The Unicron material is a reference, not a claim
+
+The Unicron thread is fan-made homage. It is not a claim on the official film,
+and the vocabulary rule above applies to it exactly as to everything else — the
+homage is carried by structure and by what the story does with the idea, not by
+borrowed names.
+
+That matters for Films 7–9 specifically, which are **held rather than pending**.
+The operator has not worked on their content in two decades and it wants real
+deliberation, not a writing sprint; filling them in from their titles would be
+inventing the least-decided part of the saga. The one settled constraint is
+ORDER: Convergence can only slot in after the Unicron payoff has actually been
+delivered, which lands in the Doomsday trilogy.
+`saga::order_respected` enforces that, and
+`saga::join_tests::convergence_cannot_ship_before_the_debt_it_is_downstream_of`
+exercises it against synthetic inputs — because with Films 7–9 unwritten the
+rule is vacuous against live data and would otherwise pass while measuring
+nothing.
+
 ## What is here
 
 | file | status |

@@ -302,8 +302,34 @@ pub static FILM_06_PHOTON: FilmEntry = FilmEntry {
 // ============================================================================
 // TRILOGY THREE: CONVERGENCE ERA (Films 7–9)
 // ============================================================================
-// NOTE: These are framework-level. The screenplay archive contains treatments,
-// but the full act structure needs to be written out in the separate screenplay files.
+// FRAMEWORK-LEVEL, AND HELD ON PURPOSE — not a backlog item.
+//
+// Films 7-9 have no missions in `content::MISSIONS` and no screenplays in
+// `docs/films/`. That is the largest gap between this file and the game, and
+// `join_tests::the_convergence_trilogy_has_no_game_under_it` asserts it as the
+// current state rather than letting it be discovered by counting rows.
+//
+// It is NOT an oversight, and the distinction matters to whoever picks this
+// up. Two things the operator has said about this trilogy:
+//
+// * **The content has not been thought about in two decades** and wants real
+//   deliberation, not a writing sprint. Treat the entries below as placeholders
+//   for a decision, not as a treatment awaiting expansion. Filling them in from
+//   the titles would be inventing the least-decided part of the saga.
+//
+// * **The only structural constraint that is settled is ORDER.** These films
+//   can only slot in after the Unicron payoff has actually been delivered —
+//   the thing Transformers fans were promised and did not get. Films 1-3 are
+//   where that lands (Unicron beneath Earth; `Stratum::Blackstar` is its
+//   buried evidence). So Convergence is downstream of a debt being paid, and
+//   writing it before that reads as a sequel to something that has not
+//   happened yet.
+//
+// One more thing that belongs beside those entries rather than in a licence
+// file: the Unicron material here is a REFERENCE, fan-made. It is not a claim
+// on the official film, and the vocabulary rules in `docs/films/README.md`
+// apply to it as much as to anything else — this universe's own words, with
+// the homage carried by structure rather than by borrowed names.
 
 pub static FILM_07_RESTORATION: FilmEntry = FilmEntry {
     number: 7,
@@ -761,6 +787,25 @@ pub fn playable(film_number: u32) -> bool {
     !missions_for(film_number).is_empty()
 }
 
+/// Is the saga's one settled ordering constraint respected?
+///
+/// Films 7-9 can only slot in after the Unicron payoff has been delivered —
+/// the thing fans were promised and did not get — which lands in the Doomsday
+/// trilogy, with Ascension between. So Convergence having content while an
+/// earlier trilogy does not is a sequel to something that has not happened.
+///
+/// Takes the predicate rather than calling `playable` directly, because today
+/// the rule is VACUOUS: Films 7-9 have no missions, so an implication written
+/// against live data can never fire and its test would pass while measuring
+/// nothing. Passing the predicate in is what lets both branches be exercised.
+pub fn order_respected(is_playable: impl Fn(u32) -> bool) -> bool {
+    let convergence = (7..=9).any(&is_playable);
+    if !convergence {
+        return true;
+    }
+    (1..=6).all(&is_playable)
+}
+
 /// Films with no game under them.
 pub fn unplayed() -> Vec<u32> {
     all_films().iter().map(|f| f.number).filter(|n| !playable(*n)).collect()
@@ -813,6 +858,49 @@ mod join_tests {
         for n in 1..=6u32 {
             assert!(playable(n), "film {n} lost its missions");
         }
+    }
+
+    #[test]
+    fn convergence_cannot_ship_before_the_debt_it_is_downstream_of() {
+        // THE ONE SETTLED CONSTRAINT on Films 7-9, made enforceable. They can
+        // only slot in after the Unicron payoff has actually been delivered —
+        // the thing fans were promised and did not get — and that lands in the
+        // Doomsday trilogy. A Convergence mission shipping while Films 1-3 are
+        // incomplete would be a sequel to something that has not happened.
+        //
+        // Written as an implication rather than a flat assertion so it stays
+        // true when Films 7-9 ARE written: it only bites if Convergence gets
+        // content while its predicate is unpaid.
+        // the live tree respects it
+        assert!(order_respected(playable), "the shipped mission table breaks the saga order");
+
+        // AND THE RULE CAN FAIL, which the live check cannot show today:
+        // Films 7-9 have no missions, so the implication never fires and a
+        // test written only against live data would pass while measuring
+        // nothing. Synthetic predicates exercise both branches.
+        let nothing = |_: u32| false;
+        assert!(order_respected(nothing), "an empty saga should not violate an ordering rule");
+
+        let convergence_only = |n: u32| (7..=9).contains(&n);
+        assert!(
+            !order_respected(convergence_only),
+            "Convergence shipping alone was accepted — the rule is not enforcing anything"
+        );
+
+        let skips_ascension = |n: u32| (1..=3).contains(&n) || (7..=9).contains(&n);
+        assert!(
+            !order_respected(skips_ascension),
+            "Convergence was accepted while the Ascension trilogy is unwritten"
+        );
+
+        let everything = |_: u32| true;
+        assert!(order_respected(everything), "a complete saga was rejected");
+
+        // one film of Convergence is enough to require the predecessors
+        let one_film = |n: u32| (1..=6).contains(&n) || n == 8;
+        assert!(order_respected(one_film), "a complete run-up plus Film 8 was rejected");
+        let one_film_early = |n: u32| n == 8;
+        assert!(!order_respected(one_film_early), "Film 8 alone was accepted");
     }
 
     #[test]
