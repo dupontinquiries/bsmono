@@ -2109,6 +2109,13 @@ fn main() {
         // &mut out of `game` at once; `upload_ship_hull` is a method, so
         // disjoint-field borrows handle it and the swap can go.
         game.upload_ship_hull();
+        // A REAL MODEL OVER THE PROCEDURAL SHELL. The interior's own SDF
+        // collision (hull box minus carved rooms) is untouched by this —
+        // see `Aboard::exterior`'s own doc comment — this only swaps what
+        // gets DRAWN for the outer skin. Picked from the catalog's own
+        // `category: "spaceship"` chassis; a big troop-transport shape
+        // fits "mobile fortress" better than a small courier or fighter.
+        game.aboard.load_exterior(&mut game.gpu, &bots_dir, "spaceship_warpzone_aka_military_troop_ship");
         // PARK IT AT THE SAME PLACE THE DRAW CALL PUTS IT. Two transforms for
         // one object is how a hull you can see and a hull you can hit end up
         // in different places, so both read `ground_lift` — and this is the
@@ -7487,6 +7494,7 @@ impl Game {
         self.aboard.ship.unseal(); // a ship at rest has its doors open
         self.repark();
         self.aboard.hull_slot = None; // force a fresh upload at the new size
+        self.aboard.cells_slot = None;
         self.upload_ship_hull();
         self.step_outside();
         self.toastf(&format!(
@@ -7557,12 +7565,15 @@ impl Game {
         // cheapest thing that notices.
         if doors_now != self.door_mask {
             self.door_mask = doors_now;
-            if let (Some(slot), Some((_, ship))) =
-                (self.aboard.hull_slot, self.world.parked.as_ref())
+            if let (Some(cells_slot), Some((_, ship))) =
+                (self.aboard.cells_slot, self.world.parked.as_ref())
             {
-                let m = aboard::hull_mesh(ship);
-                self.gpu.replace_mesh(slot, &m);
+                let m = aboard::hull_cells_mesh(ship);
+                self.gpu.replace_mesh(cells_slot, &m);
             }
+            // the hull SKIN doesn't change shape when a door opens (only
+            // the cell/link boundary boxes do — the outer silhouette is
+            // fixed by `hull_half`), so it isn't re-uploaded here.
         }
 
         // and the camera: pull the boom in while the player is inside, or it
@@ -7664,16 +7675,58 @@ impl Game {
         // from it would show a hull that disagrees with the one you collide
         // with — the exact "see it here, hit it there" failure the lift
         // shares a function to avoid.
-        if let (Some(slot), Some((origin, _))) =
+        //
+        // TWO DRAW CALLS, TWO COLOURS, not one merged mesh in one flat
+        // colour. Before this split the outer hull skin and the internal
+        // room/corridor boundary boxes shared a single push() and a
+        // single untextured colour — indistinguishable from "a cluster of
+        // grey boxes," which is exactly what it read as. A darker,
+        // slightly blued structural tone for the skin and a warmer,
+        // lighter one for the room framing gives a viewer at least two
+        // things to tell apart; real materials/texturing are a further
+        // step this doesn't attempt.
+        if let Some(m) = self.aboard.exterior.as_ref() {
+            // A REAL MODEL, drawn prim-by-prim with its own real textures
+            // and colours, in place of the procedural skin push below —
+            // this is the whole point of `Aboard::exterior`: something
+            // that reads as a ship rather than as a shape. Collision is
+            // still the procedural hull box (see `exterior`'s own doc
+            // comment), so this loop only ever runs if the model loaded;
+            // on any failure `exterior` stays `None` and the procedural
+            // skin (further down) draws instead, so there is always
+            // SOMETHING there.
+            if let Some((origin, _)) = self.world.parked.as_ref() {
+                let base = Mat4::from_translation(*origin);
+                for prim in &m.prims {
+                    push(&mut objs, prim.mesh_id, prim.tex_id, base, prim.color, [0.0, 0.0, 0.0, 0.0]);
+                }
+            }
+        } else if let (Some(skin_slot), Some((origin, _))) =
             (self.aboard.hull_slot, self.world.parked.as_ref())
+        {
+            // FALLBACK: the procedural loft, only when no real model is
+            // loaded. Same two-colour split as before this pass — see
+            // the comment above `cells_slot`'s own draw call below.
+            let lift = Mat4::from_translation(*origin);
+            push(
+                &mut objs,
+                skin_slot,
+                None,
+                lift,
+                [0.30, 0.33, 0.38, 1.0],
+                [0.35, 0.0, 0.25, 0.0],
+            );
+        }
+        if let (Some(cells_slot), Some((origin, _))) =
+            (self.aboard.cells_slot, self.world.parked.as_ref())
         {
             let lift = Mat4::from_translation(*origin);
             push(
                 &mut objs,
-                slot,
+                cells_slot,
                 None,
                 lift,
-                [0.62, 0.66, 0.72, 1.0],
+                [0.78, 0.80, 0.74, 1.0],
                 [0.35, 0.0, 0.25, 0.0],
             );
         }

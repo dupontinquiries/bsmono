@@ -41,13 +41,40 @@ use glam::Vec3;
 pub struct Aboard {
     pub ship: Interior,
     pub pos: Vec3,
-    /// the renderer slot the hull mesh was uploaded to, once it has been
+    /// the renderer slot the hull SKIN mesh was uploaded to (the outer
+    /// lofted shell — see `hull_skin_mesh`), once it has been
     ///
     /// `None` until something asks. Uploading a mesh needs a GPU and this
     /// module is used headlessly by tests and drivers, so the geometry is
     /// built on demand rather than at construction.
     pub hull_slot: Option<usize>,
-    /// the room last occupied — corridors keep the previous one, so a console
+    /// the renderer slot for the room/corridor BOUNDARY boxes (see
+    /// `hull_cells_mesh`) — kept as a SEPARATE mesh and draw call from
+    /// the hull skin, and given its own colour, rather than merged into
+    /// one undifferentiated shape. Before this split, the skin and the
+    /// boundary boxes shared one flat colour and no texture, which reads
+    /// as "a cluster of grey boxes" rather than as a ship with rooms in
+    /// it — two colours is the cheapest thing that gives a viewer any
+    /// way to tell the hull shell from the structure inside it.
+    pub cells_slot: Option<usize>,
+    /// A REAL, TEXTURED SHIP MODEL drawn over the procedural hull skin,
+    /// instead of it, when one has been loaded (`load_exterior`). The
+    /// procedural loft in `hull_skin_mesh` is silhouette-correct but
+    /// untextured and reads as a plain shape; this asks one of the
+    /// catalog's own `category: "spaceship"` chassis (real geometry,
+    /// real materials, the same loader every car and bot already goes
+    /// through) to stand in for it instead. `None` until `load_exterior`
+    /// is called — headless tests and drivers never touch this.
+    ///
+    /// COLLISION IS UNCHANGED. The exterior model is decoration only —
+    /// `world::sdf` still collides against `Interior::sdf_local` (the
+    /// hull box minus the carved rooms), the same solid-shell-with-
+    /// carved-voids model as before. Sizing the model to roughly match
+    /// `hull_half` keeps the two from disagreeing badly, but they are
+    /// still two separate approximations of the same ship, not one
+    /// shared source the way the procedural skin was.
+    pub exterior: Option<crate::model::Model>,
+    /// room last occupied — corridors keep the previous one, so a console
     /// does not blink off while you walk through a doorway
     pub room: &'static str,
 }
@@ -137,7 +164,7 @@ impl Aboard {
             ship.step_doors(1.0 / 60.0);
         }
         let pos = ship.stand_in("bridge").unwrap_or(Vec3::ZERO);
-        Aboard { ship, pos, room: "bridge", hull_slot: None }
+        Aboard { ship, pos, room: "bridge", hull_slot: None, cells_slot: None, exterior: None }
     }
 
     /// Try to move. Refused if the destination is not walkable — a sealed
@@ -250,71 +277,69 @@ pub fn ground_lift(ship: &Interior) -> f32 {
 /// have a tunnel drawn through it, and the mesh then agrees with
 /// `reachable_from` about what is passable — two answers to the same question
 /// that could otherwise disagree.
-pub fn hull_mesh(ship: &Interior) -> crate::meshgen::MeshData {
-    use crate::meshgen::{bake, cbox, merge, MeshData};
-    use glam::Quat;
-
+/// The outer hull SKIN — a real lofted ship silhouette, not a box.
+///
+/// `world::sdf` collides the parked ship with `Interior::sdf_local`, which
+/// is the OUTER HULL BOX minus the rooms — so the solid is the shell, and
+/// the rooms are the holes in it. Same `hull_half` the SDF uses, so
+/// silhouette and solid come from one number.
+pub fn hull_skin_mesh(ship: &Interior) -> crate::meshgen::MeshData {
+    use crate::meshgen::MeshData;
     let mut out = MeshData::new();
-    // THE HULL ITSELF, which was never drawn.
-    //
-    // `world::sdf` collides the parked ship with `Interior::sdf_local`, which
-    // is the OUTER HULL BOX minus the rooms — so the solid is the shell, and
-    // the rooms are the holes in it. This mesh drew only the rooms and links,
-    // i.e. exactly the empty space, and nothing at all where the collision
-    // actually is. On screen that reads as a small cluster of boxes you
-    // bounce off well before reaching, because you are hitting a hull nobody
-    // rendered: the render was a SUBSET of the collision and the two had no
-    // shared source.
-    //
-    // Same `hull_half` the SDF uses, so silhouette and solid come from one
-    // number. The rooms stay in the mesh below — they are inside an opaque
-    // hull now, which is what an interior is, and they are what you see once
-    // you are through a door.
-    {
-        // LOFT THE SKIN THROUGH THE SAME PROFILE THE COLLIDER MARCHES.
-        // Rings of a superellipse at each station, quads between them, and
-        // caps at the tips — so the silhouette IS the collider rather than
-        // a second opinion about it.
-        use crate::hullform::{ring, STATIONS};
-        let prof = ship.profile();
-        const SEG: usize = 16;
-        let mut rings: Vec<Vec<Vec3>> = Vec::with_capacity(STATIONS);
-        for i in 0..STATIONS {
-            let z = -prof.half_z + 2.0 * prof.half_z * (i as f32 / (STATIONS - 1) as f32);
-            let (a, b) = prof.at(z);
-            rings.push(ring(a, b, SEG).into_iter().map(|(x, y)| Vec3::new(x, y, z)).collect());
+    // LOFT THE SKIN THROUGH THE SAME PROFILE THE COLLIDER MARCHES.
+    // Rings of a superellipse at each station, quads between them, and
+    // caps at the tips — so the silhouette IS the collider rather than
+    // a second opinion about it.
+    use crate::hullform::{ring, STATIONS};
+    let prof = ship.profile();
+    const SEG: usize = 16;
+    let mut rings: Vec<Vec<Vec3>> = Vec::with_capacity(STATIONS);
+    for i in 0..STATIONS {
+        let z = -prof.half_z + 2.0 * prof.half_z * (i as f32 / (STATIONS - 1) as f32);
+        let (a, b) = prof.at(z);
+        rings.push(ring(a, b, SEG).into_iter().map(|(x, y)| Vec3::new(x, y, z)).collect());
+    }
+    let mut tri = |p0: Vec3, p1: Vec3, p2: Vec3| {
+        let n = (p1 - p0).cross(p2 - p0).normalize_or(Vec3::Y);
+        for p in [p0, p1, p2] {
+            out.verts.push(crate::meshgen::Vertex {
+                pos: p.to_array(),
+                nrm: n.to_array(),
+                uv: [0.0, 0.0],
+            });
         }
-        let mut tri = |p0: Vec3, p1: Vec3, p2: Vec3| {
-            let n = (p1 - p0).cross(p2 - p0).normalize_or(Vec3::Y);
-            for p in [p0, p1, p2] {
-                out.verts.push(crate::meshgen::Vertex {
-                    pos: p.to_array(),
-                    nrm: n.to_array(),
-                    uv: [0.0, 0.0],
-                });
-            }
-        };
-        for i in 0..STATIONS - 1 {
-            for k in 0..SEG {
-                let k2 = (k + 1) % SEG;
-                let (a, b, c, d) = (rings[i][k], rings[i][k2], rings[i + 1][k2], rings[i + 1][k]);
-                tri(a, b, c);
-                tri(a, c, d);
-            }
+    };
+    for i in 0..STATIONS - 1 {
+        for k in 0..SEG {
+            let k2 = (k + 1) % SEG;
+            let (a, b, c, d) = (rings[i][k], rings[i][k2], rings[i + 1][k2], rings[i + 1][k]);
+            tri(a, b, c);
+            tri(a, c, d);
         }
-        // caps: a fan to the tip centre at each end
-        for (idx, sign) in [(0usize, -1.0f32), (STATIONS - 1, 1.0)] {
-            let tip = Vec3::new(0.0, 0.0, sign * prof.half_z);
-            for k in 0..SEG {
-                let k2 = (k + 1) % SEG;
-                if sign < 0.0 {
-                    tri(tip, rings[idx][k2], rings[idx][k]);
-                } else {
-                    tri(tip, rings[idx][k], rings[idx][k2]);
-                }
+    }
+    // caps: a fan to the tip centre at each end
+    for (idx, sign) in [(0usize, -1.0f32), (STATIONS - 1, 1.0)] {
+        let tip = Vec3::new(0.0, 0.0, sign * prof.half_z);
+        for k in 0..SEG {
+            let k2 = (k + 1) % SEG;
+            if sign < 0.0 {
+                tri(tip, rings[idx][k2], rings[idx][k]);
+            } else {
+                tri(tip, rings[idx][k], rings[idx][k2]);
             }
         }
     }
+    out
+}
+
+/// The room/corridor BOUNDARY boxes — thin edge frames marking where each
+/// room and passable link sits, drawn as a SEPARATE mesh (and given its
+/// own colour by the caller) from `hull_skin_mesh` so the two read as
+/// two different things rather than one undifferentiated cluster.
+pub fn hull_cells_mesh(ship: &Interior) -> crate::meshgen::MeshData {
+    use crate::meshgen::{bake, cbox, merge, MeshData};
+    use glam::Quat;
+    let mut out = MeshData::new();
     for c in &ship.cells {
         let mut b = cbox(0.06);
         bake(&mut b, c.half * 2.0, Quat::IDENTITY, c.centre);
@@ -342,6 +367,15 @@ pub fn hull_mesh(ship: &Interior) -> crate::meshgen::MeshData {
     out
 }
 
+/// Both meshes at once, for a caller that wants the whole hull and does
+/// not care about the split (kept for anything that only needs to know
+/// "does this look right", like the offline `--aboard` driver).
+pub fn hull_mesh(ship: &Interior) -> crate::meshgen::MeshData {
+    let mut out = hull_skin_mesh(ship);
+    crate::meshgen::merge(&mut out, &hull_cells_mesh(ship));
+    out
+}
+
 impl Aboard {
     /// Upload the hull and remember where it went.
     ///
@@ -360,17 +394,67 @@ impl Aboard {
     /// Re-uploads when the doors have moved, because a sealed corridor is not
     /// drawn and the mesh has to agree with what you can walk through. Cheap:
     /// a thousand triangles.
+    /// Upload the hull and remember where it went — now TWO meshes/slots
+    /// (skin, cells; see their own doc comments), not one merged blob.
     pub fn upload_hull(&mut self, gpu: &mut crate::render::Gpu) -> usize {
-        let m = hull_mesh(&self.ship);
+        let skin = hull_skin_mesh(&self.ship);
+        let cells = hull_cells_mesh(&self.ship);
+        match self.cells_slot {
+            Some(i) => gpu.replace_mesh(i, &cells),
+            None => self.cells_slot = Some(gpu.add_mesh(&cells)),
+        }
         match self.hull_slot {
             Some(i) => {
-                gpu.replace_mesh(i, &m);
+                gpu.replace_mesh(i, &skin);
                 i
             }
             None => {
-                let i = gpu.add_mesh(&m);
+                let i = gpu.add_mesh(&skin);
                 self.hull_slot = Some(i);
                 i
+            }
+        }
+    }
+
+    /// Load a real, textured ship model from the catalog to stand in for
+    /// the procedural hull skin — same loader (`model::load`) every car
+    /// and bot chassis already goes through, sized so its long axis
+    /// matches this ship's own `hull_half.z * 2.0` (the same length the
+    /// procedural loft and the SDF collision both already use, so the
+    /// three at least agree on scale even though the model's own
+    /// proportions won't match the box-ish interior exactly).
+    ///
+    /// `bots_dir/name/f00` is the VEHICLE pose of a fold strip — every
+    /// chassis in this catalog, spaceship-category included, ships one
+    /// (`foldview`'s own convention) even when folding it into a robot
+    /// makes no sense for a ship. f00 is a real, complete, textured
+    /// model on its own; nothing here touches the fold.
+    ///
+    /// Silently leaves `exterior` as `None` on any load failure (missing
+    /// directory, bad glTF) rather than panicking — a cosmetic upgrade
+    /// failing should not take the ship down with it, same reasoning
+    /// `declared_orientation` and friends use elsewhere in this codebase
+    /// for a bad sidecar.
+    pub fn load_exterior(&mut self, gpu: &mut crate::render::Gpu, bots_dir: &std::path::Path, name: &str) {
+        let dir = bots_dir.join(name).join("f00");
+        if !dir.is_dir() {
+            eprintln!("[ship] exterior model {name:?} has no f00 pose at {dir:?} — keeping the procedural hull");
+            return;
+        }
+        let target_len = (self.ship.hull_half.z * 2.0).max(0.5);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::model::load(&dir, gpu, target_len)
+        }));
+        match result {
+            Ok(m) => {
+                eprintln!(
+                    "[ship] exterior model {name:?} loaded: {:.1}x{:.1}x{:.1} m, {} prims",
+                    m.half_len * 2.0, m.half_w * 2.0, m.half_h * 2.0, m.prims.len()
+                );
+                self.exterior = Some(m);
+            }
+            Err(_) => {
+                eprintln!("[ship] exterior model {name:?} failed to load — keeping the procedural hull");
             }
         }
     }
@@ -954,3 +1038,21 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod exterior_smoke_test {
+    #[test]
+    fn the_chosen_exterior_asset_loads_headlessly() {
+        // Not a GPU test (model::load needs a real Gpu to upload
+        // textures/meshes to, which this sandbox doesn't have) -- this
+        // only proves the raw geometry parses without panicking, the
+        // same headless check `load_exterior`'s own catch_unwind exists
+        // to survive if it fails at runtime instead.
+        let dir = std::path::Path::new("assets/bots/spaceship_warpzone_aka_military_troop_ship/f00");
+        if !dir.exists() {
+            return; // asset tree not present in this checkout/build context
+        }
+        let (raws, _) = crate::model::load_raw(dir, 1.32);
+        assert!(!raws.is_empty(), "the exterior asset loaded zero prims");
+    }
+}
