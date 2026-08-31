@@ -18,6 +18,8 @@ use studio_live::transport::Transport;
 pub mod archive;
 pub mod audition;
 pub mod capture;
+/// Playing a synth, and getting a pattern back.
+pub mod perform;
 pub mod export;
 pub mod clip_inspector;
 pub mod find;

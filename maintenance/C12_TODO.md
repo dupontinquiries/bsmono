@@ -4976,3 +4976,59 @@ composition and less than a label; `dhash` drops because
 `duplicate_groups` does exact-duplicate work separately anyway.
 
 34/34.
+
+## 90. studio: playing a synth now produces a pattern
+
+Asked for three things: a patterns section in the library sidebar, MIDI
+recording into the timeline that becomes editable patterns, and the
+skydribble Wooting integration where it is relevant.
+
+**Surveyed first, and most of it already existed.** `midi::parse` turns
+wire bytes into messages and is pure. `studio_live::Pattern` has a piano
+roll — `rolls: BTreeMap<usize, Vec<Note>>` — with velocity and slide per
+note. `analog-kit` is the Wooting layer, already shared. The library
+sidebar has a `Focus` enum deciding what a search ranks first.
+
+**What was missing is the arrow.** Nothing turned notes a person PLAYED
+into a pattern. A synth could be played and the performance evaporated.
+
+`studio_app::perform` — named that because `capture` is already the
+microphone, and two things that both "record" should not share a name.
+
+Decisions:
+  - **Round to nearest, not down.** A note struck two milliseconds early
+    is a note on the beat; flooring puts it a whole step earlier, which
+    is audibly wrong in a way that being slightly late is not.
+  - **A note shorter than a step still gets length 1.** `Note::len`
+    documents `>= 1` and a zero-length note does not sound — a staccato
+    stab is short, not absent.
+  - **Notes past the pattern's end are KEPT.** Pattern hides a note at
+    or past `steps` rather than deleting it, so lengthening brings it
+    back; discarding on capture would break that round-trip at the one
+    moment the data cannot be recovered.
+  - **Still-held notes are closed on `finish`, not dropped.** Stopping
+    with a chord ringing is ordinary, and dropping them would lose the
+    last thing played, reliably, every time.
+  - **A retrigger without a note-off closes the first note** rather than
+    abandoning it. Real hardware drops messages.
+
+**Velocity goes on the NOTE, not in `mods`** — and this was a correction.
+I wrote it into `mods` first, then found `Note` carries its own `vel`.
+`mods` is keyed by (channel, STEP), so two notes of a chord share a key
+there and would overwrite each other's velocity. A chord with one voice
+leaning is the ordinary case, not an edge one. Tested.
+
+**The Wooting connection, precisely:** `analog-kit` reports how far a key
+is pressed, so a non-velocity-sensitive keyboard becomes one that is —
+and that depth is the same 0..1 a MIDI velocity normalises to. Which is
+why `perform` takes a velocity rather than a source: by the time a note
+arrives, analog and MIDI are the same note.
+
+184/184.
+
+- **C90a — the library's Patterns section is not built.** `Focus` is
+  where it goes (a fourth variant beside Timeline, Rack, Program), and
+  its `rank` decides what a search surfaces there.
+- **C90b — nothing calls `perform` yet.** The transport needs a record
+  arm that opens a `Take`, feeds it from `midi::poll` and the analog
+  depth, and calls `record_into` on stop.
