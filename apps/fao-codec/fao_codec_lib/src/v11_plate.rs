@@ -1304,20 +1304,42 @@ pub fn encode_gop_v3_forced(
     // dead zone as the frames keeps the plate's fidelity matched to
     // what the residual coder can actually exploit; best-of against
     // raw zstd keeps it safe when the transform loses (tiny plates).
-    // RETUNED 8 -> 4. The original ratio was swept on the film suite
-    // scored by PSNR, and PSNR does not charge for what a coarser plate
-    // actually costs. Re-swept on two clips with MS-SSIM:
-    //   film w1   div4 465,286 B @ 0.97712 | div8 490,100 @ 0.97695
-    //             | div16 516,641 @ 0.97694
-    //     -> div4 is STRICTLY BETTER: -5.1% bytes AND +0.00017.
-    //   blackstar div4 326,691 B @ 0.98993 | div8 337,810 @ 0.99013
-    //     -> div4 is a TRADE, -3.3% bytes for -0.00020, priced at
-    //        55,595 KB per MS-SSIM point against that clip's own
-    //        dead-zone ladder — i.e. a BETTER exchange than raising dz.
-    // Strictly better on one clip and a better-than-ladder trade on the
-    // other, so 4 replaces 8. div16 is worse on both axes on film and
-    // is not a candidate. FAO_PLATE_DZ_DIV still overrides.
-    const PLATE_DZ_DIV: f32 = 4.0;
+    // RETUNED 8 -> 2, after a first retune to 4 that was too timid
+    // because 4 sat at the EDGE of the grid I had tested on film.
+    // Completing the grid changed the answer, and the full picture is
+    // worth keeping because the two clips disagree in an informative
+    // way. All points MS-SSIM at dz32, priced against each clip's own
+    // dead-zone ladder (~27,000 KB per MS-SSIM point):
+    //
+    //   film w1                        blackstar (game)
+    //     div1  444,448  0.97721         div1  297,076  0.98651
+    //     div2  449,872  0.97721         div2  303,877  0.98872
+    //     div3  457,969  0.97714         div4  326,691  0.98993
+    //     div4  465,286  0.97712         div8  337,810  0.99013
+    //     div8  490,100  0.97695
+    //     div16 516,641  0.97694
+    //
+    // On FILM every ratio below 8 is STRICTLY BETTER than 8 — fewer
+    // bytes AND higher MS-SSIM — and it saturates at 2: div1 and div2
+    // score identically (0.97721) and div1 only saves a further 5 KB.
+    // The original premise, that a reference surface needs a FINER dead
+    // zone than the frames because its errors propagate, is simply
+    // false here: the extra plate fidelity was never reaching the
+    // output, because the frames' own dead zone discards it. That is
+    // the same mechanism the half-res-plate negative found on the
+    // spatial axis, now confirmed on the amplitude axis in the
+    // profitable direction.
+    //
+    // On GAME content the premise IS true — quality falls monotonically
+    // as the plate coarsens — but the exchange rate decides it: div2
+    // costs 24,066 KB per MS-SSIM point against a ladder at ~27,000, so
+    // it is still marginally cheaper than buying the same bytes by
+    // raising dz. div1 is NOT (11,252 KB/pt, well under the ladder), so
+    // 2 is the crossover and 1 overshoots on this content.
+    //
+    // 2 is therefore the point that is at-or-better than the ladder on
+    // both clips. FAO_PLATE_DZ_DIV still overrides.
+    const PLATE_DZ_DIV: f32 = 2.0;
     let mut plate_coded = plate.clone();
     // ── SPECTRALLY-MATCHED PLATE RESOLUTION (FAO_PLATE_HALF).
     //

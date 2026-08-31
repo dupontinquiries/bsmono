@@ -5744,3 +5744,49 @@ common shape is not carelessness in the original tuning — every one of
 those sweeps was real work — it is that a constant tuned on one clip
 with one metric encodes that clip and that metric, and neither fact is
 visible in the constant afterwards.
+
+### PLATE_DZ_DIV, completed: 8 -> 2, and the "references need finer quantisation" premise is false on film
+
+The previous entry retuned 8 -> 4 on a three-point grid (4, 8, 16). 4
+was the LOWEST point tested, i.e. the winner sat at the edge of the
+grid — which is not a knee, it is a direction. Completing it changed
+the answer.
+
+  film w1 (dz32)                 blackstar game (dz32)
+    div1  444,448  0.97721         div1  297,076  0.98651
+    div2  449,872  0.97721         div2  303,877  0.98872
+    div3  457,969  0.97714         div4  326,691  0.98993
+    div4  465,286  0.97712         div8  337,810  0.99013
+    div8  490,100  0.97695
+    div16 516,641  0.97694
+
+On FILM every ratio below 8 is STRICTLY BETTER than 8 — fewer bytes AND
+higher MS-SSIM — and it saturates at 2 (div1 and div2 score identically
+at 0.97721, div1 saving only 5 KB more). So the plate had been coded
+four times finer than it needed to be, for 45 KB of pure waste per GOP.
+
+The premise in the original comment is FALSE on this content: "the
+plate is a REFERENCE, so its errors propagate, so it gets a finer dead
+zone than the frames." The extra fidelity never reached the output,
+because the frames' own dead zone discards it. That is exactly the
+mechanism the half-res-plate negative found on the SPATIAL axis
+("a cheaper reference is only cheap if the residual coder will fix it")
+— the same fact read in the profitable direction on the AMPLITUDE axis.
+Two entries in this log drew opposite conclusions from one mechanism
+because one was scored by PSNR and one by MS-SSIM.
+
+On GAME content the premise holds — MS-SSIM falls monotonically as the
+plate coarsens — so the choice is an exchange rate, not a domination:
+div2 costs 24,066 KB per MS-SSIM point against that clip's ladder at
+~27,000 (still cheaper than raising dz), while div1 costs 11,252 and is
+clearly worse than the ladder. 2 is the crossover.
+
+2 is the only point at-or-better than the ladder on both clips, so it
+is the default. Verified byte-identical to explicit FAO_PLATE_DZ_DIV=2
+(449,872 B on w1); suite 97/0.
+
+Process note, and it is the reason this entry exists as a correction
+rather than a footnote: a sweep whose winner is at the edge of the grid
+has not found an optimum, and I committed one anyway an hour ago. The
+check is mechanical — if the best point is the first or last tried,
+extend the grid — and it costs one more measurement.
