@@ -816,8 +816,13 @@ impl App {
                             }
                             continue;
                         };
+                        // REAL sequence and ack, from this peer's session.
+                        // Both were hardcoded to 0 here while `next_seq`
+                        // and `take_ack` sat tested and uncalled — the
+                        // fields were on the wire carrying nothing.
+                        let (seq, ack) = self.snap.frame_ids(&who);
                         let frame = snapclone_egui::snap_wire::SnapFrame::announce(
-                            0, 0, &me, &name, snapclone_egui::snaps::Media::Image,
+                            seq, ack, &me, &name, snapclone_egui::snaps::Media::Image,
                             now_s, 0, bytes.clone());
                         let results = self.send_results.clone();
                         self.sending.push(std::thread::spawn(move || {

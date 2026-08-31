@@ -1099,6 +1099,25 @@ impl Snapclone {
         self.sessions.entry(peer).learn(hash);
     }
 
+
+    /// The sequence and acknowledgement for the next frame to a peer.
+    ///
+    /// `next_seq` and `take_ack` were written, tested, and called by
+    /// nothing: every snap this app sent went out with `seq: 0, ack: 0`
+    /// hardcoded at the send site. The fields were on the wire and carried
+    /// no information, so a receiver could not tell two snaps apart by
+    /// sequence, could not spot a duplicate, and learned nothing about
+    /// what the sender had received.
+    ///
+    /// Taken TOGETHER, in one call, because they belong to the same frame:
+    /// fetching the sequence and the ack separately leaves a window where
+    /// another send can interleave and pair this frame's sequence with the
+    /// next one's ack.
+    pub fn frame_ids(&mut self, peer: &str) -> (u64, u64) {
+        let s = self.sessions.entry(peer);
+        (s.next_seq(), s.take_ack())
+    }
+
     /// Classify our NAT from two STUN responses.
     ///
     /// Both probes must have left the SAME socket, and the source is explicit
@@ -6974,5 +6993,64 @@ mod call_and_qr_wiring_tests {
         // open_qr_scan, and the state that call produces survives a frame.
         // That a finger can reach it is verified by reading the code, not by
         // this test.
+    }
+}
+
+#[cfg(test)]
+mod frame_id_tests {
+    use super::*;
+
+    fn app() -> Snapclone { Snapclone::new(Vec::new()) }
+
+    #[test]
+    fn each_frame_to_a_peer_gets_a_new_sequence() {
+        // Every snap went out as seq 0, so a receiver could not tell two
+        // apart or spot a re-send.
+        let mut a = app();
+        let (s1, _) = a.frame_ids("sc-1");
+        let (s2, _) = a.frame_ids("sc-1");
+        assert!(s2 > s1, "{s1} then {s2}");
+    }
+
+    #[test]
+    fn sequences_are_per_peer_and_do_not_leak_between_them() {
+        // A shared counter tells peer B that it missed everything sent to
+        // peer A, and a receiver counting gaps would ask for re-sends of
+        // frames addressed to somebody else.
+        let mut a = app();
+        a.frame_ids("sc-1");
+        a.frame_ids("sc-1");
+        let (first_to_b, _) = a.frame_ids("sc-2");
+        assert_eq!(first_to_b, 1, "peer B started at {first_to_b}");
+    }
+
+    #[test]
+    fn the_ack_reports_the_highest_sequence_seen_from_that_peer() {
+        let mut a = app();
+        a.sessions.entry("sc-1").observe_seq(7);
+        assert_eq!(a.frame_ids("sc-1").1, 7);
+    }
+
+    #[test]
+    fn a_late_low_sequence_does_not_move_the_ack_backwards() {
+        // Reordering is normal. An ack that went backwards would make the
+        // peer re-send everything after it — a retry storm caused by the
+        // network being ordinary.
+        let mut a = app();
+        a.sessions.entry("sc-1").observe_seq(9);
+        a.sessions.entry("sc-1").observe_seq(4);
+        assert_eq!(a.frame_ids("sc-1").1, 9);
+    }
+
+    #[test]
+    fn forgetting_a_peer_restarts_its_numbering() {
+        // `forget` clears the session, and a stale sequence surviving it
+        // would have the peer waiting for frames from a conversation that
+        // is over.
+        let mut a = app();
+        a.frame_ids("sc-1");
+        a.frame_ids("sc-1");
+        a.sessions.forget("sc-1");
+        assert_eq!(a.frame_ids("sc-1").0, 1);
     }
 }

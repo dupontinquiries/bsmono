@@ -385,6 +385,13 @@ impl Snapclone {
                 self.snap_state_dirty = false;
             }
             HostEvent::SnapArrived { from, frame } => {
+                // THE SEQUENCE IS OBSERVED. `observe_seq` was written,
+                // tested and never called, so the ack this device sends
+                // back carried nothing and a peer had no way to learn what
+                // had arrived. Advancing only — reordered frames are
+                // normal, and letting a late low sequence move the ack
+                // backwards makes the peer re-send everything after it.
+                self.sessions.entry(&from).observe_seq(frame.header.seq);
                 let row = frame.to_feed_entry(&from);
                 // The finished set is consulted for a SINGLE arrival too,
                 // not only at a bulk feed load. A peer that re-sends a snap
