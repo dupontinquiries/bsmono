@@ -227,6 +227,64 @@ pub fn fs_results_ui(
     opened
 }
 
+/// Driven through real frames — same unclickable-row bug as the rest.
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    use crate::frame_probe::Probe;
+
+    fn done() -> Search {
+        Search {
+            state: State::Done {
+                query: "needle".into(),
+                hits: vec![
+                    Hit { path: "src/lib.rs".into(), line: 12,
+                          matched: "let needle = 1;".into() },
+                    Hit { path: "src/main.rs".into(), line: 90,
+                          matched: "// needle again".into() },
+                ],
+                selected: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn clicking_a_hit_opens_that_file_and_line() {
+        // path:line is the whole product of a file search; a row that
+        // cannot be clicked makes the panel a read-only list of places you
+        // then have to type out by hand.
+        let p = Probe::default();
+        let c = p.colors();
+        let hit = p.click_text("src/main.rs", |ui| fs_results_ui(ui, &done(), &c, 400.0));
+        let hit = hit.expect("clicking a hit opened nothing");
+        assert_eq!(hit.path, "src/main.rs");
+        assert_eq!(hit.line, 90);
+    }
+
+    #[test]
+    fn an_idle_search_takes_no_space_at_all() {
+        // `occupies_space` exists so the panel costs no terminal rows when
+        // nothing is being searched for. Asserted on what was DRAWN,
+        // because that is the claim.
+        let p = Probe::default();
+        let c = p.colors();
+        let (d, out) = p.frame(|ui| fs_results_ui(ui, &Search { state: State::Idle }, &c, 400.0));
+        assert!(out.is_none());
+        assert!(d.texts.is_empty(), "an idle search drew {:?}", d.texts);
+    }
+
+    #[test]
+    fn a_running_search_says_so_rather_than_looking_empty() {
+        // Shown with no hits yet, deliberately: a blank panel during a
+        // search is indistinguishable from a search that found nothing.
+        let p = Probe::default();
+        let c = p.colors();
+        let (d, _) = p.frame(|ui| fs_results_ui(
+            ui, &Search { state: State::Searching { query: "needle".into() } }, &c, 400.0));
+        assert!(d.has("searching"), "{:?}", d.texts);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

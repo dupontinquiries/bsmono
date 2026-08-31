@@ -204,6 +204,50 @@ pub fn bar_ui(ui: &mut egui::Ui, bar: &BottomBar, open: &mut Option<String>,
     chosen
 }
 
+/// Driven through real frames — `archive_ui` had the unclickable-row bug.
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    use crate::frame_probe::Probe;
+
+    fn pages() -> Vec<ArchivedPage> {
+        vec![
+            ArchivedPage { url: "https://a.test/one".into(), title: "First page".into(),
+                           domain: "a.test".into(), archived_at: "2025-03-04".into(),
+                           key_points: Vec::new(), text_snippet: "one".into(),
+                           html_size: 10 },
+            ArchivedPage { url: "https://b.test/two".into(), title: "Second page".into(),
+                           domain: "b.test".into(), archived_at: "2025-03-05".into(),
+                           key_points: Vec::new(), text_snippet: "two".into(),
+                           html_size: 20 },
+        ]
+    }
+
+    #[test]
+    fn clicking_an_archived_page_opens_its_url() {
+        // The only thing this browser is for. It listed pages correctly and
+        // opening one did nothing.
+        let p = Probe::default();
+        let c = p.colors();
+        let mut v = ArchiveView::default();
+        let ps = pages();
+        let opened = p.click_text("Second page", |ui| archive_ui(ui, &mut v, &ps, &c));
+        assert_eq!(opened.as_deref(), Some("https://b.test/two"));
+    }
+
+    #[test]
+    fn a_query_narrows_what_is_drawn_to_the_matches() {
+        let p = Probe::default();
+        let c = p.colors();
+        let ps = pages();
+        let mut v = ArchiveView::default();
+        v.query = "second".into();
+        let (d, _) = p.frame(|ui| archive_ui(ui, &mut v, &ps, &c));
+        assert!(d.has("Second page"), "{:?}", d.texts);
+        assert!(!d.has("First page"), "the filter drew a non-match: {:?}", d.texts);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

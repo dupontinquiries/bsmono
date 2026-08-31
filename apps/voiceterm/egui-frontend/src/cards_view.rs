@@ -158,6 +158,56 @@ pub fn deck_ui(ui: &mut egui::Ui, d: &mut Deck,
     opened
 }
 
+/// Driven through real frames — `deck_ui` had the unclickable-row bug.
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    use crate::frame_probe::Probe;
+
+    fn deck() -> Deck {
+        let mut d = Deck::default();
+        d.set_cards(vec![
+            Card { title: "Intro".into(), body: "Some prose.".into(),
+                   kind: CardKind::Prose,
+                   source: CardSource { url: "https://x/1".into(),
+                                        paragraph_id: String::new() } },
+            Card { title: "fn main".into(), body: "fn main() {}".into(),
+                   kind: CardKind::Code,
+                   source: CardSource { url: String::new(),
+                                        paragraph_id: String::new() } },
+        ]);
+        d
+    }
+
+    #[test]
+    fn clicking_a_card_opens_it_and_selects_it() {
+        // Selection is what the merge button and the preview act on, so a
+        // card that cannot be clicked disables both without appearing to.
+        let p = Probe::default();
+        let c = p.colors();
+        let mut d = deck();
+        let opened = p.click_text("Intro", |ui| deck_ui(ui, &mut d, &c));
+        assert_eq!(opened.as_deref(), Some("Intro"));
+        assert!(d.selected().is_some(), "the click opened a card it did not select");
+    }
+
+    #[test]
+    fn hiding_code_removes_those_cards_from_what_is_drawn() {
+        // A filter is only real if it changes the paint. Asserted on the
+        // frame rather than on `visible()`, which was already tested and
+        // already passing while the list was unclickable.
+        let p = Probe::default();
+        let c = p.colors();
+        let mut d = deck();
+        let (before, _) = p.frame(|ui| deck_ui(ui, &mut d, &c));
+        assert!(before.has("fn main"), "{:?}", before.texts);
+        d.hide_code = true;
+        let (after, _) = p.frame(|ui| deck_ui(ui, &mut d, &c));
+        assert!(!after.has("fn main"), "hidden code was drawn anyway: {:?}", after.texts);
+        assert!(after.has("Intro"), "hiding code hid everything");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
