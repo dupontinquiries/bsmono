@@ -16,6 +16,8 @@ struct App {
     player: bo_suite_egui::playback::Player,
     /// Said once per failure, not per frame.
     last_note: String,
+    /// The real library: a scan of this machine's music directory.
+    catalog: bo_suite_egui::music_scan::FsCatalog,
 }
 
 impl App {
@@ -30,10 +32,37 @@ impl App {
             Scene { name: "Focus".into() },
             Scene { name: "Evening Wind-down".into() },
         ];
+        // THE LIBRARY, from disk. `CatalogSource` had two implementations
+        // and both were test fakes, so this frontend had never shown a real
+        // one — and the tracks it did show had no files behind them.
+        let catalog = bo_suite_egui::music_scan::FsCatalog::discover();
+        let mut controller = Controller::new(devices, scenes);
+        if catalog.is_empty() {
+            eprintln!("bo-suite: no music found — looked in $XDG_MUSIC_DIR, ~/Music, ~/music");
+        } else {
+            eprintln!("bo-suite: {} track(s) from {}", catalog.len(),
+                      catalog.root.as_ref().map(|r| r.display().to_string())
+                          .unwrap_or_default());
+            // The first page, so the list is not empty before anyone
+            // scrolls. `answer_tracks_from` needs a pending request; asking
+            // for offset 0 is that request.
+            controller.pending_tracks =
+                Some(bo_suite_egui::all_tracks::TracksAction::Load { offset: 0 });
+            controller.answer_tracks_from(&catalog);
+            // The id-to-file map the transport resolves through. Built from
+            // the same scan the rows came from, so a row and its file
+            // cannot disagree.
+            let paths = (0..catalog.len() as i64)
+                .filter_map(|i| catalog.path_of(i)
+                    .map(|p| (i, p.display().to_string())))
+                .collect();
+            controller.set_track_paths(paths);
+        }
         Self {
-            controller: Controller::new(devices, scenes),
+            controller,
             player: bo_suite_egui::playback::Player::new(),
             last_note: String::new(),
+            catalog,
         }
     }
 }
@@ -96,6 +125,10 @@ impl eframe::App for App {
             let adaptive = Adaptive::detect(ctx);
             self.controller.ui(ui, &adaptive);
         });
+        // Pages the list asks for, answered from the scan.
+        if self.controller.pending_tracks.is_some() {
+            self.controller.answer_tracks_from(&self.catalog);
+        }
         self.pump_playback();
     }
 }

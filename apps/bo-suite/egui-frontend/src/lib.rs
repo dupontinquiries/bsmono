@@ -18,6 +18,7 @@ pub mod dial;
 pub mod channel;
 pub mod tags;
 pub mod outputs;
+pub mod music_scan;
 pub mod playback;
 pub mod sources;
 pub mod fileproc;
@@ -389,6 +390,10 @@ pub struct Controller {
     /// to something on disk; empty until then, and empty is honest — see
     /// `now_playing_url`.
     pub track_url: String,
+    /// (track id, file path), from whatever catalogue the host installed.
+    /// Empty until it does, which is why `request_play` refuses rather
+    /// than guessing.
+    pub track_paths: Vec<(i64, String)>,
     /// The rating the user last set; the host applies it and echoes back
     /// through `confirm_rating`. Same shape as `pending_route` — this view
     /// owns no library.
@@ -509,6 +514,7 @@ impl Controller {
             pending_playback: None,
             audio_sink: crate::playback::Sink::Default,
             track_url: String::new(),
+            track_paths: Vec::new(),
             pending_source: None,
             pending_rating: None,
             active_device_url: String::new(),
@@ -610,6 +616,13 @@ impl Controller {
                     self.transport.artist = t.artist_text();
                     self.transport.playing = true;
                 }
+                // AND ACTUALLY PLAY IT. This arm set four labels and
+                // `playing = true`, so pressing play on a row changed the
+                // header and made no sound. The path comes from the
+                // resolver the host installed; with none, `request_play`
+                // says so rather than starting a player with an empty
+                // argument.
+                self.request_play(id);
             }
             TracksAction::Enqueue(id) => {
                 if let Some(t) = self.all_tracks.tracks().iter().find(|t| t.id == id) {
@@ -1669,6 +1682,37 @@ impl Controller {
         }
     }
 
+    /// Ask the host to play a track id.
+    ///
+    /// The id is resolved through `track_paths`, which the host fills from
+    /// whatever catalogue it has. Unresolved is REPORTED, not attempted: a
+    /// player handed an empty path fails with "no such file", which reads
+    /// as a broken player rather than as the missing catalogue it is.
+    pub fn request_play(&mut self, id: i64) {
+        match self.track_paths.iter().find(|(k, _)| *k == id) {
+            Some((_, path)) => {
+                self.track_url = path.clone();
+                self.pending_playback = Some(crate::playback::Request::Play {
+                    url: path.clone(),
+                    sink: self.audio_sink.clone(),
+                });
+            }
+            None => {
+                self.transport.playing = false;
+                self.toast.show("no file for that track");
+            }
+        }
+    }
+
+    /// Tell the view where the files are.
+    ///
+    /// A flat list rather than a map: a page is at most a few hundred rows,
+    /// a linear scan over that is nothing, and a `Vec` keeps the controller
+    /// `Clone` and comparable — which its tests rely on.
+    pub fn set_track_paths(&mut self, paths: Vec<(i64, String)>) {
+        self.track_paths = paths;
+    }
+
     /// What to play. The queue's head, or the current track.
     ///
     /// A stub in the sense that this app has no resolver from a track id to
@@ -2270,10 +2314,23 @@ mod tests {
         c.answer_tracks_from(&FakeCatalog);
         assert_eq!(c.all_tracks.tracks().len(), 200);
 
-        // Play resolves from the visible row; the transport picks it up.
+        // Play resolves from the visible row; the transport picks up the
+        // text. It does NOT show as playing, because this catalogue has no
+        // files behind it — see `request_play`. Showing "playing" over
+        // silence is the failure that made the play button a picture in
+        // the first place.
         c.tracks_action(crate::all_tracks::TracksAction::Play(5));
         assert_eq!(c.transport.title, "T5");
+        assert!(!c.transport.playing, "playing with no file behind the row");
+
+        // With a path, the same action plays and asks the host for it.
+        c.set_track_paths(vec![(5, "/music/T5.flac".into())]);
+        c.tracks_action(crate::all_tracks::TracksAction::Play(5));
         assert!(c.transport.playing);
+        assert!(matches!(c.pending_playback,
+                         Some(crate::playback::Request::Play { ref url, .. })
+                         if url == "/music/T5.flac"),
+                "{:?}", c.pending_playback);
 
         // Enqueue lands in the queue with the row's text.
         c.tracks_action(crate::all_tracks::TracksAction::Enqueue(7));
