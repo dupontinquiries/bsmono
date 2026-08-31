@@ -3467,3 +3467,24 @@ revert (both shots now byte-identical to the recorded baseline).
 Suite 84/0 including a new direct rANS-split roundtrip test (whose
 first version wrongly asserted sub-threshold blocks survive — they
 are skip-RLE'd to zero by design; the test was wrong, not the codec).
+
+### DC-intra mode: strict whole-video dominance (same session)
+
+Mode 2: predict a region as the mean of its already-composed top/left
+borders. Raster order makes it greedily decodable (neighbors are
+FINAL when a region decides; the inline recon rebuilds the identical
+composite); it costs 1 flag bit and zero motion bytes; the gate
+requires beating the winning temporal predictor by 96 L1 so grain
+noise can't dither into it. Targets the ledger's unsolved bucket —
+reveals and washed-out content both temporal predictors miss.
+
+Measured (numbers logged after printing):
+  shot 9: 4,432,674 → 4,171,368 (−5.9%) AND +0.05 dB AND +0.010 SSIM.
+  shotB : −0.6% bytes at −0.025 dB (inside the gate's noise).
+  Full suite (docs/full_v11_dz32_intra.csv):
+    rANS  : 33.89 MB @ 33.69 / 0.934   (34.3×)
+    +intra: 32.07 MB @ 33.80 / 0.940   (32.4×, +0.47 dB over AV1)
+  → −5.4% bytes AND +0.11 dB AND +0.006 SSIM: strict dominance over
+  the entire 45 s from one flag bit per region.
+
+Session ladder to date: 46.5× @ −2.00 dB → 32.4× @ +0.47 dB.

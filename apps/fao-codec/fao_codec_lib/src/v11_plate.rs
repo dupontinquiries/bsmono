@@ -1265,6 +1265,83 @@ pub fn encode_gop_v3(
                         prev_regions += 1;
                         copy_region_mc(&mut comp, &prev, rx, ry, mv);
                     }
+                    // ── DC intra (mode 2): predict the region as the mean
+                    // of its already-composed top/left borders. Raster
+                    // order makes this decodable greedily — neighbors
+                    // above and left are FINAL when this region decides
+                    // (the inline recon rebuilds the identical composite).
+                    // Targets the ledger's unsolved bucket: reveals and
+                    // washed-out content where both temporal predictors
+                    // miss; costs 1 flag bit + zero motion bytes. Gate
+                    // beats the winning temporal predictor by a margin so
+                    // grain noise can't dither into it.
+                    if gx > 0 || gy > 0 {
+                        let mut sum = 0u32;
+                        let mut n = 0u32;
+                        if ry > 0 {
+                            for dx in 0..REGION {
+                                sum += comp.y[(ry - 1) * fw + rx + dx] as u32;
+                                n += 1;
+                            }
+                        }
+                        if rx > 0 {
+                            for dy in 0..REGION {
+                                sum += comp.y[(ry + dy) * fw + rx - 1] as u32;
+                                n += 1;
+                            }
+                        }
+                        let dc = (sum / n.max(1)) as u8;
+                        let mut sad_intra = 0u32;
+                        for dy in 0..REGION {
+                            for dx in 0..REGION {
+                                sad_intra +=
+                                    (f.y[(ry + dy) * fw + rx + dx] as i32 - dc as i32).unsigned_abs();
+                            }
+                        }
+                        let best_temporal = sad_plate.min(sad_prev);
+                        if sad_intra + 96 < best_temporal {
+                            if modes[gy * gw + gx] == 1 {
+                                // un-choose prev: retract its mv
+                                mvs.pop();
+                                prev_regions -= 1;
+                            }
+                            modes[gy * gw + gx] = 2;
+                            for dy in 0..REGION {
+                                for dx in 0..REGION {
+                                    comp.y[(ry + dy) * fw + rx + dx] = dc;
+                                }
+                            }
+                            // chroma DC from the chroma planes' own borders
+                            let cw = fw / 2;
+                            let (crx, cry) = (rx / 2, ry / 2);
+                            let cr = REGION / 2;
+                            for (plane_i, is_u) in [(0usize, true), (1usize, false)] {
+                                let _ = plane_i;
+                                let plane: &mut Vec<u8> =
+                                    if is_u { &mut comp.u } else { &mut comp.v };
+                                let mut cs = 0u32;
+                                let mut cn = 0u32;
+                                if cry > 0 {
+                                    for dx in 0..cr {
+                                        cs += plane[(cry - 1) * cw + crx + dx] as u32;
+                                        cn += 1;
+                                    }
+                                }
+                                if crx > 0 {
+                                    for dy in 0..cr {
+                                        cs += plane[(cry + dy) * cw + crx - 1] as u32;
+                                        cn += 1;
+                                    }
+                                }
+                                let cdc = if cn > 0 { (cs / cn) as u8 } else { 128 };
+                                for dy in 0..cr {
+                                    for dx in 0..cr {
+                                        plane[(cry + dy) * cw + crx + dx] = cdc;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             prev_share_acc += prev_regions as f64 / (gw * gh) as f64;
@@ -1396,6 +1473,16 @@ pub fn encode_gop_v3(
         }
         side.extend_from_slice(&nz_bits);
         side.extend_from_slice(&mv_deltas);
+        // intra flag bitmap: mode==2 regions (bitmap-1 shows them as
+        // plate; this flag overrides). Inline recon shares the pass, so
+        // side layout only needs consistent byte accounting.
+        let mut intra_flags = vec![0u8; (gw * gh + 7) / 8];
+        for (gi, &m) in modes.iter().enumerate() {
+            if m == 2 {
+                intra_flags[gi / 8] |= 1 << (gi % 8);
+            }
+        }
+        side.extend_from_slice(&intra_flags);
         side.extend_from_slice(&gain_flags);
         side.extend_from_slice(&gain_vals);
         let mode_bytes = zstd::encode_all(side.as_slice(), 19).map(|c| c.len()).unwrap_or(side.len());
