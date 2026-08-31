@@ -151,8 +151,11 @@ impl VoiceBar {
         let speaking = level >= TALK_GATE;
         if speaking && (level > self.talker_level || self.talker.trim().is_empty()
                         || self.talker == who) {
-            self.talker = who.to_string();
-            self.talker_is_self = is_self;
+            // THROUGH `set_talker`, not around it. Writing the pair here
+            // would be a second place that decides what the label says,
+            // and the two would drift the first time one of them gains a
+            // rule the other does not.
+            self.set_talker(who, is_self);
             self.talker_level = level;
             self.talker_hold_ms = TALK_HOLD_MS;
             return;
@@ -163,16 +166,14 @@ impl VoiceBar {
             self.talker_level = 0.0;
             self.talker_hold_ms -= dt_ms.max(0.0);
             if self.talker_hold_ms <= 0.0 {
-                self.talker.clear();
-                self.talker_is_self = false;
+                self.set_talker("", false);
             }
         }
     }
 
     /// Nobody is on the call any more.
     pub fn clear_talker(&mut self) {
-        self.talker.clear();
-        self.talker_is_self = false;
+        self.set_talker("", false);
         self.talker_level = 0.0;
         self.talker_hold_ms = 0.0;
     }
