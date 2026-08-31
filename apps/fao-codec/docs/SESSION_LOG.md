@@ -5042,3 +5042,75 @@ canonical type has to widen from "mesh" to "mesh OR parameterised
 surface", i.e. the engine hands over a SHADER IDENTITY plus parameters
 and the decoder evaluates it. That is a wire-format decision to take
 deliberately, and this measurement is the argument for taking it.
+
+### Real game capture: soldier/early-fps, headless, engine-derived canonical
+
+User's correction: "can't run a wgpu game" is not "can't get game
+data". Survey of the fleet found games/soldier (early-fps) is
+SOFTWARE-RENDERED by default with no native deps — a painter's-
+algorithm renderer whose render() returns an egui::Mesh of 2D
+triangles. It builds and runs headless here.
+
+apps/fao-codec/fao_engine_capture: generates a level with the game's
+OWN procgen (152x152 cells, 553 meshes, 32 rooms), walks an FpsCam
+through it, renders with the game's OWN renderer, rasterises the
+triangles, and hands the codec both the frames and the game's meshes +
+exact camera as a canonical. Deliberately a separate crate in its OWN
+workspace so neither side depends on the other — a game must not link a
+video codec to be recordable, and the codec's builds must not have to
+resolve a game's egui graph.
+
+This removes the standing objection to engine_lab and ground_lab: those
+worlds were authored by me, so they could have been authored to be
+modellable. This one was not.
+
+Circularity caught for the THIRD time and fixed the same way. First run
+gave 99.000 dB at 2,904 B because the canonical render was literally
+the footage. The realistic split is the one a real integration would
+use anyway, and the same split the 2D mover layer already makes: the
+CANONICAL IS THE MAP, actors are per-take. Footage now renders
+level.meshes PLUS five moving actor boxes (built with the game's own
+Mesh3 primitive, through the same renderer) and an exposure drift; the
+canonical stays map-only.
+
+Measured, 48 frames, 640x384, dz32:
+
+  v11 2D plate               249,091 B @ 31.851 dB  (plate 19,948 B)
+  v11 no model               207,336 B @ 31.767 dB
+  v11 ENGINE canonical        42,186 B @ 39.746 dB  (24 B + 24 B/frame)
+  control, WRONG camera      212,766 B @ 31.626 dB
+  AV1 crf40                   38,562 B @ 48.154 dB
+  AV1 crf50                   28,647 B @ 44.142 dB
+  AV1 crf58                   20,150 B @ 40.321 dB
+
+The engine canonical is 5.9x smaller than the codec's own 2D plate
+branch AND 7.9 dB better — the two branches separate as decisively as
+they did on procedural ground. The 2D plate is again WORSE THAN NO
+MODEL AT ALL (249,091 vs 207,336): a translation-warped median cannot
+follow a first-person walk through 3D geometry, and its 20 KB is pure
+overhead. The wrong-camera control (212,766 @ 31.626) confirms the win
+is the camera being right, not the extra predictor.
+
+BUT AV1 WINS HERE, and that is the honest headline. At ~40 dB AV1
+crf58 is 20,150 B against v11's 42,186 — AV1 is 2.1x SMALLER at
+slightly better quality. This is the opposite of the procedural-ground
+result (where v11 won by 23%) and the difference between the two cases
+is the whole lesson: soldier's flat-shaded geometry is CHEAP for a
+conventional coder — large uniform faces, few edges, exactly what large
+transform blocks and good intra prediction eat for almost nothing —
+while fBm noise under perspective motion is the most expensive thing
+you can hand one. The model-based coder wins where pixel statistics are
+hostile and loses where they are friendly, and "engine-rendered" does
+not predict which; the SPECTRUM does. That is the same narrowing the
+dictionary probe forced earlier (blackstar 0.0% STRONG vs Minecraft
+10.7%), now confirmed on the rate axis.
+
+Honest weakness of this capture, recorded at the site: the rasteriser
+is flat-shaded barycentric fill and does not sample the game's texture
+atlas, so the picture carries the game's geometry and lighting but not
+its texture detail. That biases AGAINST the canonical (less
+high-frequency content makes prev-MC and AV1 both look better), so the
+5.9x/7.9 dB margin over the 2D plate is a lower bound — but it also
+means the AV1 comparison above is measured on content missing exactly
+the high-frequency texture that would have favoured v11. Sampling the
+atlas is the next step before treating the AV1 row as final.

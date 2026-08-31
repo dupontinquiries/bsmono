@@ -1,0 +1,25 @@
+# Standalone workspace ON PURPOSE. Adding this to the fao-codec
+# workspace would make every codec build resolve a game crate (and its
+# egui/eframe graph), which is exactly the coupling this crate exists to
+# avoid. Build it explicitly when you want an engine measurement.
+[workspace]
+
+[package]
+name = "fao-engine-capture"
+version = "0.1.0"
+edition = "2021"
+description = "Capture footage AND the world model from a real in-repo game, so the codec's engine-derived path can be measured on something nobody authored for it."
+
+[dependencies]
+# Both halves of the seam. This crate exists SO THAT neither of them
+# depends on the other: a game must not link a video codec to be
+# recordable, and the codec must not track a game's types.
+fao-codec-lib = { path = "../fao_codec_lib" }
+# soldier/early-fps is software-rendered by default with no native deps
+# — the one game in the fleet that runs headless, which is why it is the
+# first engine wired up rather than the most interesting one.
+early-fps = { path = "../../../games/soldier" }
+egui = "0.34"
+
+[profile.release]
+opt-level = 3
