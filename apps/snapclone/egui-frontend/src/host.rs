@@ -60,8 +60,8 @@
 
 use crate::{
     ambient_inbox, ambient_palette, camera_select, contact_book, frame_pump, gaze, gossip,
-    identity, keyboard_inset, nat_punch, settings_page, snap_export, snap_state, snaps,
-    voice_bridge, voice_send, Snapclone,
+    identity, keyboard_inset, nat_punch, settings_page, snap_export, snap_state, snap_wire,
+    snaps, voice_bridge, voice_send, Snapclone,
 };
 
 /// Something the world is telling the app.
@@ -104,6 +104,11 @@ pub enum HostEvent {
     /// anything can populate the feed — a snap filtered after it has been
     /// shown has already been shown.
     SnapStateLoaded(Box<snap_state::SnapState>),
+    /// A snap arrived from a peer, already attributed by the transport.
+    /// `from` is the AUTHENTICATED sender — the connection's, not the
+    /// frame's claim — because the two can differ and only one of them was
+    /// established by anything.
+    SnapArrived { from: String, frame: Box<snap_wire::SnapFrame> },
     /// Snaps the host received and wants displayed. Filtered against the
     /// finished set on the way in, which is the one place that filter can
     /// live without every producer having to remember it.
@@ -184,6 +189,11 @@ pub enum HostEvent {
     /// a question about the moment the snaps landed.
     SnapsArrived { from: Vec<String>, focused: bool },
     /// A send was acknowledged.
+    /// A send did not get there. Distinct from never having tried: the row
+    /// the sender watches must be able to reach Failed, or a send that
+    /// broke is indistinguishable from one still in flight and the retry
+    /// button never lights.
+    SnapSendFailed { id: String, now_ms: u64 },
     /// A snap reached its recipient.
     ///
     /// Carries `now_ms` like `CameraWorked` and `PeerAddr` do, because
@@ -268,6 +278,14 @@ pub enum HostCommand {
     NatClassified(bool),
     /// A QR payload latched onto an open scanner.
     QrLatched(bool),
+    /// Send the most recent capture to these people.
+    ///
+    /// WHO, not what. The app chose the recipients; the host knows which
+    /// bytes the last shutter press produced and how to put them on a
+    /// socket. Passing the payload through the app would mean the
+    /// controller holding a photo in memory for no reason other than to
+    /// hand it straight back.
+    SendSnap { to: Vec<String> },
     /// Write the finished-snap set out; it changed. Carries the value for
     /// the same reason `SaveContacts` does — a host writing from another
     /// thread must not have to borrow the app.
@@ -353,6 +371,22 @@ impl Snapclone {
                 // the file straight back on every launch, which is a disk
                 // write and a chance to truncate it for no reason at all.
                 self.snap_state_dirty = false;
+            }
+            HostEvent::SnapArrived { from, frame } => {
+                let row = frame.to_feed_entry(&from);
+                // The finished set is consulted for a SINGLE arrival too,
+                // not only at a bulk feed load. A peer that re-sends a snap
+                // you already viewed must not put it back — and re-sending
+                // is the ordinary consequence of a retry, not an attack.
+                if !self.snap_state.is_finished(&row.id) {
+                    let mut rows = self.feed.entries().to_vec();
+                    if !rows.iter().any(|e| e.id == row.id) {
+                        // Newest first, matching what the inbox supplies —
+                        // `set_entries` renders the order it is given.
+                        rows.insert(0, row);
+                        self.feed.set_entries(rows);
+                    }
+                }
             }
             HostEvent::SnapsForFeed(entries) => {
                 self.feed.set_entries(self.snap_state.filter_unfinished(entries));
@@ -440,6 +474,11 @@ impl Snapclone {
                 // when the screen should come back.
                 self.posture.notify_snap_arrived();
             }
+            HostEvent::SnapSendFailed { id, now_ms } => {
+                for r in self.sends.rows_mut() {
+                    if r.id == id { r.failed(now_ms); }
+                }
+            }
             HostEvent::SnapDelivered { id, now_ms } => {
                 // BOTH outboxes, and the two are not redundant — see the
                 // note on `Snapclone::sends`. `crate::outbox` owns a
@@ -502,6 +541,10 @@ impl Snapclone {
         }
         for id in std::mem::take(&mut self.key_conflicts) {
             out.push(HostCommand::PeerKeyChanged(id));
+        }
+        let to = std::mem::take(&mut self.send_requested);
+        if !to.is_empty() {
+            out.push(HostCommand::SendSnap { to });
         }
         if std::mem::take(&mut self.snap_state_dirty) {
             out.push(HostCommand::SaveSnapState(Box::new(self.snap_state.clone())));
@@ -754,6 +797,66 @@ mod tests {
         assert_eq!(s.standing_of("sc-11223344"),
                    Standing::Discovered { port: crate::qr::DEFAULT_PORT });
         assert_eq!(s.standing_of("192.168.1.5"), Standing::Plain);
+    }
+
+    #[test]
+    fn an_arriving_snap_reaches_the_feed_once() {
+        // The app has never received a snap. This is the arm that makes one
+        // appear — and the same snap arriving twice (a retry, which is
+        // ordinary) must not appear twice.
+        let mut s = app();
+        let frame = crate::snap_wire::SnapFrame::announce(
+            1, 0, "sc-aabbccdd", "kit", crate::snaps::Media::Image, 1_700_000_000, 5,
+            b"a photo".to_vec());
+        for _ in 0..2 {
+            s.apply(HostEvent::SnapArrived {
+                from: "sc-aabbccdd".into(), frame: Box::new(frame.clone()) });
+        }
+        assert_eq!(s.feed.count(), 1, "a re-delivered snap appeared twice");
+        assert_eq!(s.feed.entries()[0].sender_name, "kit");
+    }
+
+    #[test]
+    fn a_snap_already_viewed_is_not_put_back_by_a_re_send() {
+        // The finished set is consulted for a single arrival too, not only
+        // at a bulk feed load. Otherwise a sender's retry undoes the one
+        // promise this app makes.
+        let mut s = app();
+        let frame = crate::snap_wire::SnapFrame::announce(
+            1, 0, "sc-aabbccdd", "kit", crate::snaps::Media::Image, 0, 5,
+            b"a photo".to_vec());
+        let id = crate::snap_wire::content_id("sc-aabbccdd", b"a photo");
+        s.snap_state.mark(&id, crate::snap_state::Mark::Viewed, 1_000);
+        s.apply(HostEvent::SnapArrived {
+            from: "sc-aabbccdd".into(), frame: Box::new(frame) });
+        assert_eq!(s.feed.count(), 0, "a viewed snap came back on a re-send");
+    }
+
+    #[test]
+    fn pressing_send_asks_the_host_to_send_rather_than_only_drawing_a_row() {
+        // The button drew a progress row for a transfer that never started,
+        // and the row aged out looking like a timeout.
+        let mut s = app();
+        s.send_requested = vec!["sc-aabbccdd".into()];
+        let out = s.drain_commands();
+        assert!(out.iter().any(|c| matches!(c,
+            HostCommand::SendSnap { to } if to == &vec!["sc-aabbccdd".to_string()])),
+            "{out:?}");
+        // Drained, not repeated: a flag left set would re-send the photo
+        // every frame for the rest of the session.
+        assert!(!s.drain_commands().iter().any(|c| matches!(c, HostCommand::SendSnap { .. })));
+    }
+
+    #[test]
+    fn a_send_row_can_reach_failed_and_not_only_age_out() {
+        // Both terminal states, or a broken send is indistinguishable from
+        // one still in flight and the retry button never lights.
+        let mut s = app();
+        s.sends.push("sc-aabbccdd", 1_000);
+        s.apply(HostEvent::SnapSendFailed { id: "sc-aabbccdd".into(), now_ms: 2_000 });
+        assert!(s.sends.rows().iter().any(|r| r.state.can_retry()),
+                "no row reached Failed: {:?}",
+                s.sends.rows().iter().map(|r| r.state).collect::<Vec<_>>());
     }
 
     #[test]

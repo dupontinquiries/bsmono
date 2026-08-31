@@ -12,7 +12,7 @@ use snapclone_egui::capture;
 use snapclone_egui::host::{HostCommand, HostEvent};
 use snapclone_egui::Snapclone;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use uikit_egui::Adaptive;
 
 /// The capture engine's host-side half: the thread that runs `capture::run`,
@@ -153,7 +153,21 @@ impl VoiceRig {
 
 struct App {
     snap: Snapclone,
+    /// Accepts inbound snaps for the life of the process, unlike the camera
+    /// and voice rigs which come up with a page or a call. A snap arriving
+    /// while you are on the Friends page is the ordinary case, and a
+    /// listener that only ran on the Inbox page would drop it.
+    snaps_in: Option<snapclone_egui::snap_transport::Listener>,
     voice: VoiceRig,
+    /// The bytes of the last shutter press, kept so Send has something to
+    /// send. Held by the HOST and not by the app: the controller has no
+    /// business carrying a photo in memory purely to hand it back.
+    last_snap: Option<Vec<u8>>,
+    /// Sends running on worker threads. A dial can take the full timeout
+    /// and must never run on the frame loop.
+    sending: Vec<std::thread::JoinHandle<()>>,
+    /// Results from those threads.
+    send_results: Arc<Mutex<Vec<(String, Result<(), String>)>>>,
     rig: CaptureRig,
     /// The plan is printed once per start, not per frame: the pipeline
     /// strings are the debuggable artifact, and a log that repeats them at
@@ -249,7 +263,24 @@ impl App {
                            peers on this network will not be found");
             }
         }
-        Self { snap, voice: VoiceRig::idle(), rig: CaptureRig::idle(),
+        // The snap listener, on the configured listen port — the same one
+        // announced in gossip, so a peer that heard us knows where to dial.
+        let listen = snap.settings.current.network.listen_port;
+        let snaps_in = match snapclone_egui::snap_transport::Listener::start(listen) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                // Not fatal, and worth its own line: outbound snaps still
+                // work, so the symptom is one-directional and would
+                // otherwise look like the other person ignoring you.
+                eprintln!("snapclone: not accepting snaps — could not listen on TCP \
+                           {listen}: {e}");
+                None
+            }
+        };
+
+        Self { snap, snaps_in, last_snap: None, sending: Vec::new(),
+               send_results: Arc::new(Mutex::new(Vec::new())),
+               voice: VoiceRig::idle(), rig: CaptureRig::idle(),
                plan_logged: false, focused: true,
                gossip, last_announce: 0, warned_unsigned: false, identity: keys }
     }
@@ -534,6 +565,92 @@ impl App {
         }
     }
 
+    /// Deliver whatever the snap listener accepted.
+    ///
+    /// Attribution happens HERE rather than on the listener thread, because
+    /// it needs the peer list and that thread must not borrow the app.
+    fn pump_snaps(&mut self) {
+        let Some(l) = self.snaps_in.as_ref() else { return };
+        let arrivals = l.inbox.drain();
+        if let Some(e) = l.inbox.take_error() {
+            eprintln!("snapclone: snap listener: {e}");
+        }
+        if arrivals.is_empty() {
+            return;
+        }
+        // Known addresses, from the same punch table gossip fills.
+        let known: Vec<(String, snapclone_egui::punch_addrs::PeerAddr)> =
+            self.snap.contact_book.iter()
+                .filter_map(|c| self.snap.punch.get(&c.sc_id).map(|a| (c.sc_id.clone(), a)))
+                .collect();
+
+        let mut senders: Vec<String> = Vec::new();
+        for a in arrivals {
+            use snapclone_egui::snap_transport::Sender;
+            match snapclone_egui::snap_transport::resolve_sender(a.from, &known) {
+                Sender::Known(id) => {
+                    if !senders.contains(&id) { senders.push(id.clone()); }
+                    let cmds = self.snap.apply(HostEvent::SnapArrived {
+                        from: id, frame: Box::new(a.frame) });
+                    self.handle(cmds);
+                }
+                // Refused, not guessed — see snap_transport's header. Said
+                // out loud because from the sender's side this looks like
+                // delivery, and the two people involved need some way to
+                // find out it did not happen.
+                Sender::Ambiguous(ids) => eprintln!(
+                    "snapclone: a snap from {} could be any of {ids:?} — refused, because \
+                     an inbound TCP port cannot tell them apart", a.from),
+                Sender::Unknown => eprintln!(
+                    "snapclone: a snap from {} was refused — not a known contact, or their \
+                     address has expired", a.from),
+            }
+        }
+        if !senders.is_empty() {
+            // The notification decision is the app's: it knows whether the
+            // window is focused and whether it has already said something.
+            let cmds = self.snap.apply(HostEvent::SnapsArrived {
+                from: senders, focused: self.focused });
+            self.handle(cmds);
+        }
+    }
+
+    /// Collect what the send threads finished with.
+    ///
+    /// The row the sender watches must be able to reach BOTH terminal
+    /// states. Before this only delivery existed as an outcome, so a send
+    /// that broke looked identical to one still in flight and simply aged
+    /// out — which reads as a timeout whatever actually happened.
+    fn pump_sends(&mut self) {
+        self.sending.retain(|t| !t.is_finished());
+        let done = self.send_results.lock().map(|mut r| std::mem::take(&mut *r))
+            .unwrap_or_default();
+        if done.is_empty() { return; }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64).unwrap_or(0);
+        for (who, out) in done {
+            match out {
+                Ok(()) => {
+                    // Handed to the socket, which is not the same as seen —
+                    // there is no receipt on the wire yet. Marked delivered
+                    // because "left this device" is the strongest claim this
+                    // build can make, and saying nothing would leave the row
+                    // pending forever.
+                    let cmds = self.snap.apply(HostEvent::SnapDelivered {
+                        id: who.clone(), now_ms });
+                    self.handle(cmds);
+                }
+                Err(e) => {
+                    eprintln!("snapclone: snap to {who} failed: {e}");
+                    let cmds = self.snap.apply(HostEvent::SnapSendFailed {
+                        id: who.clone(), now_ms });
+                    self.handle(cmds);
+                }
+            }
+        }
+    }
+
     /// What the app asked the world to do.
     ///
     /// Deliberately a debug sink and labelled as one. Capture, export and
@@ -562,7 +679,15 @@ impl App {
                 // findable the moment it exists.
                 HostCommand::CaptureSnap => {
                     let outcome = match self.rig.shared.peek_frame() {
-                        Some(f) if f.pixels_plausible() => save_ppm(&f),
+                        Some(f) if f.pixels_plausible() => {
+                            // Kept for Send, in the same format written to
+                            // disk, so what a peer receives is byte for byte
+                            // what the local file holds. A second encoding
+                            // path is a second thing that can differ subtly
+                            // from the photo you looked at.
+                            self.last_snap = Some(ppm_bytes(&f));
+                            save_ppm(&f)
+                        }
                         Some(_) => Err("the frame arrived torn".to_string()),
                         None => Err("no live frame".to_string()),
                     };
@@ -623,6 +748,37 @@ impl App {
                     if matches!(emit, snapclone_egui::voice_send::Emit::NoEncoder) {
                         eprintln!("snapclone: transmitting with no encoder — \
                                    nothing will leave this device");
+                    }
+                }
+                // THE SEND. Off the frame loop, one thread per recipient: a
+                // dial to a phone that is asleep costs the whole timeout,
+                // and doing that inline would freeze the UI for twenty
+                // seconds per person.
+                HostCommand::SendSnap { to } => {
+                    let Some(bytes) = self.last_snap.clone() else {
+                        eprintln!("snapclone: nothing to send — take a photo first");
+                        continue;
+                    };
+                    let me = self.snap.local_id.clone();
+                    let name = self.snap.settings.current.general.display_name.clone();
+                    let now_s = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64).unwrap_or(0);
+                    for who in to {
+                        let Some(addr) = self.snap.punch.get(&who) else {
+                            if let Ok(mut r) = self.send_results.lock() {
+                                r.push((who.clone(), Err("no known address".into())));
+                            }
+                            continue;
+                        };
+                        let frame = snapclone_egui::snap_wire::SnapFrame::announce(
+                            0, 0, &me, &name, snapclone_egui::snaps::Media::Image,
+                            now_s, 0, bytes.clone());
+                        let results = self.send_results.clone();
+                        self.sending.push(std::thread::spawn(move || {
+                            let out = snapclone_egui::snap_transport::send_snap(addr, &frame);
+                            if let Ok(mut r) = results.lock() { r.push((who, out)); }
+                        }));
                     }
                 }
                 HostCommand::SaveContacts(book) => {
@@ -716,6 +872,16 @@ impl App {
 /// Write one frame as binary PPM under the app's data dir, named by wall
 /// clock so a burst of presses cannot overwrite each other within a second
 /// (the millisecond field sees to that).
+fn ppm_bytes(f: &snapclone_egui::frame_pump::RawFrame) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20 + (f.width * f.height * 3) as usize);
+    out.extend_from_slice(format!("P6\n{} {}\n255\n", f.width, f.height).as_bytes());
+    // RGBA to RGB: PPM has no alpha, and the camera's alpha is opaque anyway.
+    for px in f.rgba.chunks_exact(4) {
+        out.extend_from_slice(&px[..3]);
+    }
+    out
+}
+
 fn save_ppm(f: &snapclone_egui::frame_pump::RawFrame) -> Result<String, String> {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -723,13 +889,7 @@ fn save_ppm(f: &snapclone_egui::frame_pump::RawFrame) -> Result<String, String> 
     let dir = config_kit::data_dir("snapclone").join("snaps");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join(format!("snap-{ms}.ppm"));
-    let mut out = Vec::with_capacity(20 + (f.width * f.height * 3) as usize);
-    out.extend_from_slice(format!("P6\n{} {}\n255\n", f.width, f.height).as_bytes());
-    // RGBA to RGB: PPM has no alpha, and the camera's alpha is opaque anyway.
-    for px in f.rgba.chunks_exact(4) {
-        out.extend_from_slice(&px[..3]);
-    }
-    std::fs::write(&path, out).map_err(|e| format!("{}: {e}", path.display()))?;
+    std::fs::write(&path, ppm_bytes(f)).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path.display().to_string())
 }
 
@@ -752,6 +912,8 @@ impl eframe::App for App {
         self.pump_gossip(now_secs);
         self.pump_capture();
         self.pump_voice();
+        self.pump_snaps();
+        self.pump_sends();
 
         // Discovery is time-driven, not input-driven, so the frame has to
         // come round on its own or an idle window never polls the socket —

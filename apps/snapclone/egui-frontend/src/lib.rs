@@ -91,6 +91,8 @@ pub mod snap_expiry;
 pub mod store_privacy;
 pub mod snap_export;
 pub mod snap_state;
+pub mod snap_transport;
+pub mod snap_wire;
 pub mod tab_bar;
 pub mod thumbnails;
 pub mod trace_channels;
@@ -229,6 +231,10 @@ pub struct Snapclone {
     /// this controller has no general message channel, and the two that do
     /// exist (`shutter_note`, `feed_note`) belong to other pages.
     pub call_note: String,
+    /// Recipients the user pressed Send for, drained by the seam. A flag
+    /// rather than a direct call because the send happens on a socket the
+    /// UI frame must not block on.
+    pub send_requested: Vec<String>,
     /// The unified bottom bar (Qt UnifiedNavBar): page arrows, sub-tab segments, underline
     /// morph, page dots. Owns the page + sub-tab state; `nav` mirrors the page for swipe.
     pub bar: UnifiedNav,
@@ -808,6 +814,7 @@ impl Snapclone {
             conversation: Default::default(),
             conversation_peer: String::new(),
             call_note: String::new(),
+            send_requested: Vec::new(),
             bar: UnifiedNav::new(),
             login_visible: !auto_logged_in,
             nav: Nav::new(PAGES.len()),
@@ -3282,6 +3289,11 @@ impl Snapclone {
                     // failed or the whole thing sent.
                     self.sends.push(&format!("{who}:{now}"), now);
                 }
+                // AND ACTUALLY SEND. The rows above are what the sender
+                // WATCHES; until now they were the whole of it, so the
+                // button drew a progress row for a transfer that never
+                // started and the row aged out looking like a timeout.
+                self.send_requested = chosen.clone();
             }
         }
         // Failures surface without being hunted for. needs_attention exists

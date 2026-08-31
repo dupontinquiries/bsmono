@@ -160,6 +160,12 @@ pub struct Outbox {
 
 impl Outbox {
     pub fn rows(&self) -> &[SendRow] { &self.rows }
+    /// Mutable, so a host can mark one Failed. Kept beside `rows` rather
+    /// than exposing a `fail(id)` helper because `SendRow` already owns the
+    /// transition and its rules (a terminal row does not go back to
+    /// Pending); a second path to the same state is a second place for
+    /// those rules to be forgotten.
+    pub fn rows_mut(&mut self) -> &mut [SendRow] { &mut self.rows }
     pub fn len(&self) -> usize { self.rows.len() }
     pub fn is_empty(&self) -> bool { self.rows.is_empty() }
 
