@@ -88,6 +88,39 @@ pub enum SynthKind {
     Sine { hz: f32 },
     /// A one-shot sample from a project source (the classic drum rack channel).
     Sampler { source: studio_core::SourceId },
+    /// A SoundFont instrument: `bank:preset` out of an `.sf2` file.
+    ///
+    /// Racked like any other channel, so a pattern step plays a note on
+    /// it exactly as it plays one on `Sub` — which is the point. An sf2
+    /// is a multi-sampled instrument, and a pattern builder that can
+    /// only reach one-shots and synthesised voices cannot write a piano
+    /// part.
+    ///
+    /// DESCRIBED, not linked, the same way `Beatspace` is: the file path
+    /// and the program number are project data, and rendering needs an
+    /// sf2 engine this crate does not depend on. A host that has one
+    /// registers a `Synth` and gets audio; a host without one gets
+    /// silence and a project that still opens, edits and saves.
+    ///
+    /// That matters more here than for Beatspace. A soundfont lives on
+    /// the operator's disk and travels badly — the project must survive
+    /// opening on a machine where the file is missing, and it does,
+    /// because nothing in the pattern depends on the sf2 being loadable.
+    Sf2 {
+        /// Where the file was when it was racked. Absolute: a soundfont
+        /// is usually outside the project and a relative path would
+        /// break the moment the project moved.
+        path: std::path::PathBuf,
+        /// General MIDI bank. 0 for melodic, 128 for percussion — the
+        /// convention every sf2 follows.
+        bank: u16,
+        /// Program (patch) within the bank, 0..=127.
+        preset: u8,
+        /// Semitone offset from the pattern's note, like `Sub::note`.
+        /// Kept HERE rather than baked into the pattern so the same
+        /// pattern can drive two channels an octave apart.
+        transpose: i8,
+    },
     /// `apps/beatspace`: a GAN walking a latent space. `z` is the position; a
     /// pattern step can move it, so latent drift becomes automation instead of
     /// a live-only gesture. Rendered by the host when beatspace is present.
@@ -579,6 +612,16 @@ impl Synth for BuiltinSynth<'_> {
                         }
                     }
                 }
+            }
+            SynthKind::Sf2 { .. } => {
+                // Silence, for the same reason as Beatspace below: no sf2
+                // engine is linked here. The distinction that matters is
+                // that this silence is a MISSING RENDERER, not a missing
+                // instrument — the channel, its transpose and every step
+                // written against it are intact, so a project opened on
+                // a machine without the soundfont still edits and saves
+                // without losing the part.
+                out.fill(0.0);
             }
             SynthKind::Beatspace { .. } => {
                 // Silence, deliberately and audibly harmless: this build has no

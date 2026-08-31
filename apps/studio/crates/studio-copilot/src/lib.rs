@@ -434,6 +434,19 @@ pub fn change_song_key(rack: &studio_live::Rack, from: studio_fx::retune::Scale,
             studio_live::SynthKind::Sine { hz } => {
                 *hz *= 2f32.powf(delta as f32 / 12.0);
             }
+            // TRANSPOSED, because a soundfont is a melodic instrument.
+            // A key change that moved the 808 and the sine and left the
+            // piano behind would put the song out of tune with itself,
+            // which is the one outcome this function exists to prevent.
+            //
+            // Bank 128 is General MIDI percussion and is NOT transposed,
+            // for the same reason the drum channels below are not: a kit
+            // is not in the key, and shifting it renumbers which drum
+            // each note plays.
+            studio_live::SynthKind::Sf2 { transpose, bank, .. } if *bank != 128 => {
+                *transpose = transpose.saturating_add(delta as i8);
+            }
+            studio_live::SynthKind::Sf2 { .. } => {}
             studio_live::SynthKind::Sampler { .. } | studio_live::SynthKind::Beatspace { .. } => {}
             // Deliberately NOT transposed: a kit is not in the key. Moving a
             // song from C to F should carry the 808 and the melodic channels
@@ -464,6 +477,46 @@ pub fn change_song_key_proposal(rack: &studio_live::Rack, from: studio_fx::retun
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_key_change_carries_a_melodic_soundfont_and_leaves_a_drum_bank() {
+        // A key change that moved the 808 and the sine and left the
+        // piano behind would put the song out of tune with itself.
+        // Bank 128 is GM percussion — transposing it renumbers which
+        // drum each note plays, which is not a key change at all.
+        use studio_live::SynthKind;
+        let piano = SynthKind::Sf2 {
+            path: "/p.sf2".into(), bank: 0, preset: 0, transpose: 0,
+        };
+        let kit = SynthKind::Sf2 {
+            path: "/k.sf2".into(), bank: 128, preset: 0, transpose: 0,
+        };
+        use studio_live::Channel;
+        let ch = |name: &str, kind| Channel {
+            name: name.into(), kind, gain: 1.0, pan: 0.0,
+            muted: false, choke_group: None,
+        };
+        let rack = studio_live::Rack {
+            channels: vec![ch("piano", piano), ch("kit", kit)],
+            patterns: vec![studio_live::Pattern::new("p", 16, 2)],
+            tempo_bpm: 120.0, swing: 0.0,
+        };
+
+        use studio_fx::retune::{Mode, Scale};
+        let c = Scale { root: 0, mode: Mode::Minor };
+        let f = Scale { root: 5, mode: Mode::Minor };
+        let out = change_song_key(&rack, c, f);
+
+        match &out.channels[0].kind {
+            SynthKind::Sf2 { transpose, .. } => assert_eq!(*transpose, 5),
+            k => panic!("{k:?}"),
+        }
+        match &out.channels[1].kind {
+            SynthKind::Sf2 { transpose, .. } =>
+                assert_eq!(*transpose, 0, "a percussion bank must not transpose"),
+            k => panic!("{k:?}"),
+        }
+    }
     use super::*;
 
     fn low_mid_buildup_signal(n: usize) -> Vec<f32> {

@@ -5629,3 +5629,51 @@ broken feature rather than an unused one.
   timeline as a plain audio clip; nothing reads the "150 BPM" in the
   name to set its tempo or snap its length to bars, which is what would
   make placing one actually good.
+
+## 101. studio: SF2 instruments rack into the pattern builder
+
+`SynthKind::Sf2 { path, bank, preset, transpose }` — a soundfont
+instrument racked like any other channel, so a pattern step plays a note
+on it exactly as it plays one on `Sub`. That is the point: a pattern
+builder that reaches only one-shots and synthesised voices cannot write
+a piano part.
+
+**DESCRIBED, not linked**, following `Beatspace`'s precedent — the path
+and program number are project data, and rendering needs an sf2 engine
+this crate does not depend on. A host with one registers a `Synth` and
+gets audio; a host without one gets silence and a project that still
+opens, edits and saves.
+
+**That matters more here than for Beatspace.** A soundfont lives on the
+operator's disk and travels badly, so the project has to survive opening
+on a machine where the file is missing — and it does, because nothing in
+the pattern depends on the sf2 being loadable. The silence is a MISSING
+RENDERER, not a missing instrument.
+
+Three decisions the compiler forced, each worth having:
+
+  - **The collab wire needed an arm**, which is the question "what does a
+    collaborator without this soundfont receive?" The answer is: the
+    channel, with the sender's path. They get silence and every note
+    written on it. Refusing to sync a channel whose file they lack would
+    DELETE a part from their copy of a shared project, which is worse.
+  - **`change_song_key` needed an arm**, which is "is a soundfont in the
+    key?" A melodic one is, and transposes. **Bank 128 is GM percussion
+    and does not** — transposing a kit renumbers which drum each note
+    plays, which is not a key change at all. Same rule the drum channels
+    already follow.
+  - **`transpose` lives on the CHANNEL**, not baked into the pattern, so
+    one pattern can drive two sf2 channels an octave apart.
+
+A test covers `transpose` at -128..127 through the u8 it travels in: a
+lost sign drops an octave-down channel an octave UP, which is audible
+and would look like a synth bug rather than a wire bug.
+
+studio-live 192/192, studio-collab 77/77, studio-copilot 34/34,
+studio-app 71/71.
+
+- **C101a — nothing racks one from the UI yet.** The kind, the wire and
+  the key handling exist; the library has no "rack this .sf2" action and
+  `is_loop`-style detection for `.sf2` files is not written.
+- **C101b — no renderer.** Silence until a host registers an sf2 engine,
+  which is a dependency decision rather than a wiring one.

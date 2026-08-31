@@ -529,6 +529,23 @@ fn put_synthkind(o: &mut Vec<u8>, k: &SynthKind) {
             put_f32(o, *drive);
             put_f32(o, *decay_ms);
         }
+        SynthKind::Sf2 { path, bank, preset, transpose } => {
+            put_u8(o, 5);
+            // The PATH crosses the wire, and it is a path on the SENDER's
+            // machine. That is deliberate rather than an oversight: a
+            // collaborator who has the same soundfont at the same place
+            // gets the instrument, and one who does not gets a channel
+            // that renders silent and still carries every note written
+            // on it.
+            //
+            // The alternative — refusing to sync a channel whose file
+            // the receiver lacks — would delete a part from their copy
+            // of a shared project, which is worse than silence.
+            put_str(o, &path.to_string_lossy());
+            put_u16(o, *bank);
+            put_u8(o, *preset);
+            put_u8(o, *transpose as u8);
+        }
         SynthKind::Drum { voice, tone, decay_ms, tune } => {
             put_u8(o, 4);
             put_u8(o, drum_voice_tag(*voice));
@@ -556,6 +573,12 @@ fn get_synthkind(r: &mut R) -> Option<SynthKind> {
     Some(match r.u8()? {
         0 => SynthKind::Sine { hz: r.f32()? },
         1 => SynthKind::Sampler { source: SourceId(r.u64()?) },
+        5 => SynthKind::Sf2 {
+            path: std::path::PathBuf::from(r.str()?),
+            bank: r.u16()?,
+            preset: r.u8()?,
+            transpose: r.u8()? as i8,
+        },
         2 => {
             let z = [r.f32()?, r.f32()?, r.f32()?];
             SynthKind::Beatspace { z, crossfade: r.f32()? }
@@ -899,6 +922,35 @@ impl super::Doc {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_sf2_channel_round_trips_on_the_wire() {
+        // A collaborator who lacks the soundfont must still receive the
+        // CHANNEL — silence is recoverable, a missing part is not.
+        let k = SynthKind::Sf2 {
+            path: std::path::PathBuf::from("/home/x/piano.sf2"),
+            bank: 0, preset: 42, transpose: -12,
+        };
+        let mut o = Vec::new();
+        put_synthkind(&mut o, &k);
+        let mut r = R::new(&o);
+        assert_eq!(get_synthkind(&mut r), Some(k));
+    }
+
+    #[test]
+    fn a_negative_transpose_survives_the_byte_it_travels_in() {
+        // `transpose` is i8 and goes over as u8. A sign lost here drops
+        // an octave-down channel an octave UP, which is audible and
+        // would look like a synth bug rather than a wire bug.
+        for t in [-12i8, -1, 0, 1, 127, -128] {
+            let k = SynthKind::Sf2 {
+                path: "/p.sf2".into(), bank: 128, preset: 0, transpose: t,
+            };
+            let mut o = Vec::new();
+            put_synthkind(&mut o, &k);
+            assert_eq!(get_synthkind(&mut R::new(&o)), Some(k), "transpose {t}");
+        }
+    }
     use super::*;
     use crate::Doc;
     use studio_core::Project;
