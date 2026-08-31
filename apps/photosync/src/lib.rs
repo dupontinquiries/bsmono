@@ -45,6 +45,8 @@
 
 /// Cheap, explainable measurements that produce tags from pixels.
 pub mod cv;
+/// Two-hash scene fingerprints, ported from snapclone's LandmarkHash.
+pub mod fingerprint;
 
 /// A greyscale image: row-major, `w * h` bytes.
 pub struct Gray<'a> {
@@ -185,6 +187,10 @@ pub struct Entry {
     /// Lowercase, deduplicated, sorted. Sorted so two entries with the
     /// same tags compare equal regardless of insertion order.
     pub tags: Vec<String>,
+    /// Blur + edge hashes: "is this the same SCENE", where `dhash`
+    /// answers "is this the same PICTURE". Ported from snapclone's
+    /// LandmarkHash — see `fingerprint` for why one hash would not do.
+    pub fingerprint: crate::fingerprint::Fingerprint,
     /// Which version of the scanner produced this.
     ///
     /// Fotema's idea, and the reason it is worth copying: when a
@@ -222,6 +228,7 @@ impl Entry {
         Entry {
             path: path.to_string(),
             dhash: dhash(img),
+            fingerprint: crate::fingerprint::Fingerprint::of(img),
             ascii: ascii(img, ASCII_W, ASCII_H),
             tags: t,
             scan_version: SCAN_VERSION,
@@ -248,11 +255,18 @@ pub struct Weights {
     pub tags: f32,
     pub ascii: f32,
     pub dhash: f32,
+    /// Scene agreement from the two-hash fingerprint.
+    pub scene: f32,
 }
 
 impl Default for Weights {
     fn default() -> Self {
-        Weights { tags: 0.5, ascii: 0.35, dhash: 0.15 }
+        // `scene` sits between tags and ascii: it knows more than
+        // composition and less than a label. `dhash` drops to 0.10
+        // because the fingerprint now covers "same picture" better than
+        // it did — dhash's remaining job is exact-duplicate detection,
+        // which `duplicate_groups` does separately anyway.
+        Weights { tags: 0.45, ascii: 0.20, dhash: 0.10, scene: 0.25 }
     }
 }
 
@@ -296,10 +310,18 @@ pub fn tag_similarity(a: &[String], b: &[String]) -> f32 {
 /// Overall similarity, 0..1.
 pub fn similarity(a: &Entry, b: &Entry, w: Weights) -> f32 {
     let d = 1.0 - (hamming(a.dhash, b.dhash) as f32 / 64.0);
+    // Scene agreement, from the two-hash fingerprint. Contributed as a
+    // RANK (0..3 over 3) rather than a bit distance, because the whole
+    // point of the pair is that either hash alone is sufficient
+    // evidence — averaging their distances would let a strong blur
+    // match be dragged down by an edge hash that legitimately
+    // disagrees, which is the dusk case the second hash exists for.
+    let scene = crate::fingerprint::compare(&a.fingerprint, &b.fingerprint).rank() as f32 / 3.0;
     let s = w.tags * tag_similarity(&a.tags, &b.tags)
         + w.ascii * ascii_similarity(&a.ascii, &b.ascii)
-        + w.dhash * d;
-    let total = w.tags + w.ascii + w.dhash;
+        + w.dhash * d
+        + w.scene * scene;
+    let total = w.tags + w.ascii + w.dhash + w.scene;
     if total <= 0.0 { 0.0 } else { (s / total).clamp(0.0, 1.0) }
 }
 
@@ -571,9 +593,9 @@ mod tests {
         let b = entry("b", &px, 16, 16, &["y"]);
         for w in [
             Weights::default(),
-            Weights { tags: 1.0, ascii: 0.0, dhash: 0.0 },
-            Weights { tags: 0.0, ascii: 0.0, dhash: 1.0 },
-            Weights { tags: 0.0, ascii: 0.0, dhash: 0.0 },
+            Weights { tags: 1.0, ascii: 0.0, dhash: 0.0, scene: 0.0 },
+            Weights { tags: 0.0, ascii: 0.0, dhash: 1.0, scene: 0.0 },
+            Weights { tags: 0.0, ascii: 0.0, dhash: 0.0, scene: 0.0 },
         ] {
             let s = similarity(&a, &b, w);
             assert!((0.0..=1.0).contains(&s), "{s} for {w:?}");

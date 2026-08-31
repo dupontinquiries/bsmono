@@ -4924,3 +4924,55 @@ why two photos matched.
   require the geometry channels this analysis rules out.
 - **C88b — a real semantic embedding needs a model trained on
   PHOTOGRAPHS.** That is a download, not a port from unendlich.
+
+## 89. snapclone's LandmarkHash is exactly what photosync needed
+
+Asked whether snapclone-qt's landmark feature could help. It is the best
+answer of the three matcher questions this session — better than
+unendlich's upscaler (§88, no: trained on G-buffer geometry a photo does
+not have) because it was designed for PHOTOGRAPHS from the start.
+
+**What it is.** Two hashes, twelve bytes total, built so an attacker
+scraping a DHT cannot reconstruct a face:
+  - **blur hash** — heavy blur, then an 8x8 average hash. Destroys text,
+    faces and micro-texture; keeps silhouette and mass. *Same place,
+    roughly same angle.*
+  - **edge hash** — blur FIRST, then Sobel onto an 8x4 grid. Discards
+    colour and brightness entirely, keeps line geometry. *Same alleyway,
+    different day* — the case a blur hash misses when the light changed.
+
+**Why it beats photosync's dHash for search.** `dhash` answers "is this
+the same PICTURE". These answer "is this the same SCENE", which is what
+"find people dancing like this" is actually asking.
+
+**What I found on the way.** The Rust side (`landmark_hash.rs`) has the
+COMPARISON — thresholds, the `Match` enum, ranking — and does not
+compute a hash at all. The algorithms live in C++
+(`src/core/LandmarkHash.cpp`) and the Rust half receives fingerprints
+from Qt. So the port had somewhere to start and something real to do.
+
+Ported into `photosync::fingerprint`. Kept: the algorithm, the working
+sizes (32x32 blur, 64x64 Sobel — Sobel needs the bigger canvas or the
+threshold collapses to noise), blur-before-Sobel, three box passes
+instead of a 49-tap Gaussian, and snapclone's THRESHOLDS. The thresholds
+especially: they were chosen against real photographs of real places,
+and re-tuning them here against synthetic test images would be worse
+evidence.
+
+Changed: `Gray` instead of `QImage`, and the edge threshold is relative
+to the image's own mean rather than absolute — an absolute one makes
+every low-contrast photo hash to zero and then match every other
+low-contrast photo.
+
+**Contributed to `similarity` as a RANK, not a distance.** The pair's
+whole argument is that either hash alone is sufficient evidence, so
+averaging their bit distances would let a strong blur match be dragged
+down by an edge hash that legitimately disagrees — which is the dusk
+case the second hash was added for.
+
+Default weights now tags 0.45, scene 0.25, ascii 0.20, dhash 0.10.
+`scene` sits between tags and ascii because it knows more than
+composition and less than a label; `dhash` drops because
+`duplicate_groups` does exact-duplicate work separately anyway.
+
+34/34.
