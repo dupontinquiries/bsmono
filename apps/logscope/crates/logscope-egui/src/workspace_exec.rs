@@ -2912,6 +2912,10 @@ pub struct BranchSummary {
     pub verified: bool,
     pub finished: bool,
     pub approved: Option<bool>, // depth-model review verdict (None until reviewed)
+    /// What this branch is doing right now. The fan already knew — `in_flight` names the branch
+    /// holding the single worker — and never reported it, so a fan mid-run looked identical
+    /// whether a branch was generating, queued, or done.
+    pub doing: crate::runcard::Doing,
     pub review_notes: String,
     pub root: PathBuf,
 }
@@ -3201,6 +3205,18 @@ impl AgentFan {
             verified: b.run.verified(),
             finished: matches!(b.state, BranchState::Finished(_)),
             approved: b.verdict.as_ref().map(|v| v.approve),
+            doing: {
+                let holding = self.in_flight.iter().find(|f| f.branch == i);
+                match (holding, matches!(b.state, BranchState::Finished(_))) {
+                    (Some(f), _) if f.review => crate::runcard::Doing::Reviewing,
+                    (Some(_), _) => crate::runcard::Doing::Generating,
+                    // A finished branch can still be picked up for the review pass, which is why
+                    // in_flight is checked first: "finished" is about the agent loop, not about
+                    // whether the fan is done with it.
+                    (None, true) => crate::runcard::Doing::Finished,
+                    (None, false) => crate::runcard::Doing::Waiting,
+                }
+            },
             review_notes: b.verdict.as_ref().map(|v| v.notes.clone()).unwrap_or_default(),
             root: b.run.root().to_path_buf(),
         }).collect()

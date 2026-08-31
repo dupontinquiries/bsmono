@@ -2239,8 +2239,8 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
             crate::workspace_exec::FileEvent { path: "src/fix_patch.rs".into(), change: crate::workspace_exec::FileChange::Created, bytes: 512 },
         ];
         self.agent_candidates = vec![
-            crate::workspace_exec::BranchSummary { index: 0, label: "conservative patch".into(), files: 2, verified: true, finished: true, approved: Some(true), review_notes: "clean, minimal diff".into(), root: std::path::PathBuf::new() },
-            crate::workspace_exec::BranchSummary { index: 1, label: "broader refactor".into(), files: 5, verified: false, finished: true, approved: None, review_notes: "touches more than asked".into(), root: std::path::PathBuf::new() },
+            crate::workspace_exec::BranchSummary { index: 0, label: "conservative patch".into(), files: 2, verified: true, finished: true, approved: Some(true), doing: crate::runcard::Doing::Finished, review_notes: "clean, minimal diff".into(), root: std::path::PathBuf::new() },
+            crate::workspace_exec::BranchSummary { index: 1, label: "broader refactor".into(), files: 5, verified: false, finished: true, approved: None, doing: crate::runcard::Doing::Finished, review_notes: "touches more than asked".into(), root: std::path::PathBuf::new() },
         ];
     }
 
@@ -8285,6 +8285,38 @@ if let Some(msg) = self.error_banner.clone() {
                                 // The elapsed row ticks; without this it only advances when
                                 // something else asks for a frame.
                                 ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+                            }
+                            // ACTIVITY — one row per fan branch, WHILE it runs. The fan reported
+                            // itself only in `finish_agent_fan`, so a fan mid-flight was a single
+                            // status sentence and nothing else; which branch held the one worker,
+                            // and which were queued behind it, was not visible anywhere.
+                            let fan_rows: Vec<(String, crate::runcard::Doing, usize, bool, Option<bool>)> =
+                                self.agent_fan.as_ref().map(|f| f.summaries().into_iter()
+                                    .map(|b| (b.label, b.doing, b.files, b.verified, b.approved))
+                                    .collect()).unwrap_or_default();
+                            if !fan_rows.is_empty() {
+                                egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8),
+                                    inner_margin: egui::Margin::same(theme::PAD_SM),
+                                    outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() },
+                                    stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new("ACTIVITY").color(theme::DIM()).small().strong());
+                                    for (label, doing, detail) in crate::runcard::branch_rows(&fan_rows) {
+                                        ui.horizontal(|ui| {
+                                            // The branch holding the single worker is the one thing
+                                            // worth picking out of the list.
+                                            let hot = doing == "generating" || doing == "reviewing";
+                                            ui.label(RichText::new(label)
+                                                .color(if hot { theme::CYAN() } else { theme::INK() }).small());
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(RichText::new(doing)
+                                                    .color(if hot { theme::AMBER() } else { theme::FAINT() }).small());
+                                            });
+                                        });
+                                        ui.label(RichText::new(detail).color(theme::FAINT()).small());
+                                        ui.add_space(2.0);
+                                    }
+                                });
                             }
                             // The physical PARAMS panel (dials + backend/persona/model selectors, in the
                             // spatial scene) is now the primary place for these controls. When it's active

@@ -71,6 +71,58 @@ pub fn rows(s: &RunState) -> Vec<(&'static str, String)> {
     out
 }
 
+/// What one fan branch is doing RIGHT NOW.
+///
+/// The reference's ACTIVITY panel gives every worker a line saying what it is up to — "Analyzing
+/// logs", "Processing traces". Those are its worked example's words; the honest version here is the
+/// branch's actual scheduler state, which the fan already knows and never showed. A branch was
+/// legible only as `finished` plus a file count, so a fan mid-run looked the same whether a branch
+/// was generating, queued behind the single worker, or already done.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Doing {
+    /// Holding the inference worker, producing an agent turn.
+    Generating,
+    /// Holding the worker for its review pass over its own diff.
+    Reviewing,
+    /// Ready, waiting its turn. There is ONE local model, so "parallel" means round-robin and most
+    /// branches are here most of the time — saying so is the point.
+    Waiting,
+    /// Agent loop over, review not started or not applicable.
+    Finished,
+}
+
+impl Doing {
+    pub fn label(self) -> &'static str {
+        match self {
+            Doing::Generating => "generating",
+            Doing::Reviewing => "reviewing",
+            Doing::Waiting => "waiting for the worker",
+            Doing::Finished => "finished",
+        }
+    }
+    /// Whether this branch currently holds the single inference worker. At most one can.
+    pub fn holds_worker(self) -> bool { matches!(self, Doing::Generating | Doing::Reviewing) }
+}
+
+/// One row per branch: label, what it is doing, and what it has produced.
+///
+/// `(label, doing, detail)`. The detail is deliberately last and deliberately short — a review's
+/// notes can run to paragraphs and do not belong in a status list.
+pub fn branch_rows(rows: &[(String, Doing, usize, bool, Option<bool>)]) -> Vec<(String, String, String)> {
+    rows.iter().map(|(label, doing, files, verified, approved)| {
+        let mut detail = format!("{files} file(s)");
+        if *verified { detail.push_str(" · verified"); }
+        // A review verdict outranks the file count: a branch that touched nine files and was
+        // rejected is rejected, and reading the nine first is reading it backwards.
+        match approved {
+            Some(true) => detail = format!("approved · {detail}"),
+            Some(false) => detail = format!("revise · {detail}"),
+            None => {}
+        }
+        (elide_task(label, 28), doing.label().to_string(), detail)
+    }).collect()
+}
+
 /// A task line for a narrow card: one line, cut on a word.
 ///
 /// Reuses `nodelabel::elide_words` rather than repeating the rule. Three functions named `elide`
@@ -159,6 +211,45 @@ mod tests {
         assert!(long.starts_with(out.trim_end_matches('…')), "{out:?} is not a prefix");
         assert_eq!(elide_task("   ", 40), "(no task)");
         assert_eq!(elide_task("", 40), "(no task)");
+    }
+
+    #[test]
+    fn a_branch_row_says_what_the_branch_is_doing() {
+        let r = branch_rows(&[("planrun.rs #1".into(), Doing::Generating, 3, false, None)]);
+        assert_eq!(r[0].0, "planrun.rs #1");
+        assert_eq!(r[0].1, "generating");
+        assert_eq!(r[0].2, "3 file(s)");
+    }
+
+    /// One local model means round-robin, so most branches are waiting most of the time. Saying
+    /// "waiting for the worker" rather than leaving them blank is the honest description of a fan.
+    #[test]
+    fn waiting_is_a_state_worth_naming() {
+        assert_eq!(Doing::Waiting.label(), "waiting for the worker");
+        assert!(!Doing::Waiting.holds_worker() && !Doing::Finished.holds_worker());
+        assert!(Doing::Generating.holds_worker() && Doing::Reviewing.holds_worker());
+    }
+
+    /// A branch that touched nine files and was rejected is rejected. Reading the nine first is
+    /// reading it backwards.
+    #[test]
+    fn a_review_verdict_outranks_the_file_count() {
+        let r = branch_rows(&[("a".into(), Doing::Finished, 9, true, Some(false))]);
+        assert!(r[0].2.starts_with("revise"), "{}", r[0].2);
+        let ok = branch_rows(&[("a".into(), Doing::Finished, 1, true, Some(true))]);
+        assert!(ok[0].2.starts_with("approved"), "{}", ok[0].2);
+        let none = branch_rows(&[("a".into(), Doing::Finished, 1, true, None)]);
+        assert!(none[0].2.starts_with("1 file"), "unreviewed must not imply a verdict: {}", none[0].2);
+    }
+
+    #[test]
+    fn a_long_branch_label_is_cut_and_no_field_is_blank() {
+        let r = branch_rows(&[("a-very-long-branch-label-that-will-not-fit-in-the-column".into(),
+                               Doing::Waiting, 0, false, None)]);
+        assert!(r[0].0.chars().count() <= 28, "{:?}", r[0].0);
+        for (i, f) in [&r[0].0, &r[0].1, &r[0].2].iter().enumerate() {
+            assert!(!f.trim().is_empty(), "field {i} blank");
+        }
     }
 
     /// Every row must carry a value; a card with a blank beside a label reads as broken rather than
