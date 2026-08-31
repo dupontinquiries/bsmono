@@ -4868,3 +4868,63 @@ blackstar-rs is in games/, so its canonical could be built from engine
 assets and its camera pose read from the game rather than inferred.
 That is the only configuration in which the citation thesis has not
 yet been given a fair test.
+
+### The thesis with inverse rendering REMOVED: it holds
+
+Every citation failure so far had a different proximate cause (grain
+decorrelation, no parallax, missing pose axis, no phase-corr peak,
+viewpoint-locked 2D plate) and one shared confound: the canonical and
+the poses were RECOVERED FROM PIXELS, so a negative could never
+separate "the thesis is wrong" from "reconstruction is hard".
+
+bin/engine_lab removes the confound. A synthetic arena is rendered
+through the codec's own rasterizer to make the footage; the SAME mesh
+and poses are then handed to the encoder as a canonical — the
+engine-derived configuration blackstar-rs could actually supply from
+replay::Frame plus its assets. No triangulation, no phase correlation,
+no pose estimation anywhere in the path. Two GOPs far apart on a
+camera orbit, so GOP B's camera stands where GOP A never did — the
+exact condition under which the 2D plate was measured to fail.
+
+FIRST VERSION WAS CIRCULAR and is recorded as such: it rendered the
+footage from the same mesh at the same poses and reported 99.0 dB at
+1,176 B — bit-exact, because the prediction WAS the source. That
+measures only that rendering is deterministic. Real footage differs
+from any static canonical in two ways, so both are now injected into
+the FOOTAGE ONLY: a dynamic object the canonical cannot contain (a
+moving ball, standing for actors/projectiles/particles) and a
+per-frame photometric drift (standing for dynamic lighting and
+post-processing — the thing that historically defeated cross-take
+citation on film).
+
+Measured, GOP B, dz32, 640x384, 24 frames:
+
+  B self-coded, own 2D plate       128,856 B @ 39.940 dB
+  B citing the engine canonical     88,854 B @ 45.442 dB
+  same, canonical NOT amortised     90,438 B  (mesh_pack 1,608 B)
+  control, canonical at WRONG poses 156,252 B @ 37.368 dB
+
+-31% BYTES AND +5.5 dB SIMULTANEOUSLY. Not a rate trade — strictly
+better on both axes, which no 2D citation experiment has ever produced
+on any real clip. The wrong-pose control is the guard that makes it
+meaningful: the same canonical rendered at the WRONG poses is 21%
+WORSE than self-coding, so the win comes from correct geometry and
+pose, not from having any extra predictor.
+
+Amortisation is almost irrelevant here, and that is itself a result:
+paying the canonical's full mesh_pack cost (1,608 B) instead of a
+24-byte reference moves the total by 1.8%. A geometry canonical is
+CHEAP — the 2D plate it replaces cost 1,634 B for one viewpoint, while
+the mesh serves every viewpoint. The library's value is not that the
+canonical is expensive and must be shared; it is that the canonical
+generalises across viewpoints and a plate does not.
+
+VERDICT: the marginal-cost thesis is correct given a correct world
+model, and every measured failure in this codec is an INVERSE
+RENDERING failure, not a coding one. That reframes the roadmap: work
+on triangulation, pose recovery and densification is not a
+prerequisite to be got through before the interesting part — it IS the
+whole remaining problem. And the one configuration that skips it
+entirely (an engine handing over its own assets and camera, which
+blackstar-rs in this repo could do) is now measured to be worth
+-31% bytes at +5.5 dB.
