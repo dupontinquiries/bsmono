@@ -220,6 +220,94 @@ pub fn film(n: u8) -> Option<&'static Film> {
 
 #[cfg(test)]
 mod tests {
+
+    /// THE FAILURE THIS FIELD EXISTS FOR.
+    ///
+    /// A character the briefing prose talks about, who is never present in any
+    /// mission, is a vendor with a backstory — Destiny's three legends standing
+    /// in the Tower while the player did the work. If a name is worth putting
+    /// in a cutscene slide, it should appear ON SCREEN somewhere in the saga.
+    #[test]
+    fn every_character_the_prose_names_is_present_somewhere() {
+        let on_screen: std::collections::HashSet<&str> = MISSIONS
+            .iter()
+            .flat_map(|m| m.cast.iter())
+            .filter(|(_, p)| p.on_screen())
+            .map(|(id, _)| *id)
+            .collect();
+        assert!(!on_screen.is_empty(), "no mission has a cast; this test proves nothing");
+
+        // names the cutscene prose actually uses, and the codex id they map to
+        let spoken = [
+            ("prime", "optimus"),
+            ("megatron", "megatron"),
+            ("rodimus", "rodimus"),
+            ("aiden", "aiden"),
+        ];
+        for (word, id) in spoken {
+            let said = MISSIONS.iter().any(|m| {
+                m.intro.iter().chain(m.outro.iter()).any(|l| l.contains(word))
+            });
+            if said {
+                assert!(
+                    on_screen.contains(id),
+                    "the prose says '{word}' but {id} is never on screen in any mission — \
+                     that is a character with lore and no presence"
+                );
+            }
+        }
+    }
+
+    /// A character who is only ever one thing is a costume or a vendor. The
+    /// point of the axis is that the SAME character moves along it.
+    #[test]
+    fn the_leads_appear_in_more_than_one_capacity() {
+        let modes = |id: &str| -> std::collections::HashSet<&'static str> {
+            MISSIONS
+                .iter()
+                .flat_map(|m| m.cast.iter())
+                .filter(|(c, _)| *c == id)
+                .map(|(_, p)| p.label())
+                .collect()
+        };
+        for id in ["optimus"] {
+            let m = modes(id);
+            assert!(
+                m.len() >= 2,
+                "{id} is only ever {:?} — a character in one register is a costume",
+                m
+            );
+        }
+        // and the team-up specifically: you play one and watch the other go
+        let truce = MISSIONS.iter().find(|m| m.id == "the_ashen_truce").expect("truce");
+        let deep = MISSIONS.iter().find(|m| m.id == "beneath_the_pacific").expect("pacific");
+        assert!(
+            truce.cast.contains(&("optimus", Presence::Playable)),
+            "the airlock meeting is not played as Prime"
+        );
+        assert!(
+            deep.cast.contains(&("megatron", Presence::Seen)),
+            "Megatron planting himself under the plates is not SEEN — being told he did it \
+             is the thing this field exists to prevent"
+        );
+    }
+
+    #[test]
+    fn cast_ids_are_real_characters() {
+        // Keyed by codex id so a name is something the game can talk about
+        // rather than a string nobody can look up.
+        let src = include_str!("codex.rs");
+        for m in MISSIONS {
+            for (id, _) in m.cast {
+                assert!(
+                    src.contains(&format!("id: \"{id}\"")),
+                    "mission {} casts '{id}', which has no codex entry",
+                    m.id
+                );
+            }
+        }
+    }
+
     use super::*;
     use crate::patrol;
 
@@ -395,6 +483,40 @@ pub enum Objective {
     Protect,
 }
 
+/// How present a named character is in a mission. The point is the SPREAD:
+/// a character who is only ever `Playable` is a costume, and one who is only
+/// ever `Named` is a vendor with a backstory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presence {
+    /// You are them for this mission.
+    Playable,
+    /// Fights alongside you, under their own control.
+    Ally,
+    /// Present and can be engaged with — a console, a conversation, a hand-off.
+    Interactable,
+    /// On screen, doing something, not addressable. The one that was missing:
+    /// seeing Megatron leave is not the same as being told he left.
+    Seen,
+    /// Referred to in the briefing, not present.
+    Named,
+}
+
+impl Presence {
+    pub fn label(self) -> &'static str {
+        match self {
+            Presence::Playable => "playable",
+            Presence::Ally => "ally",
+            Presence::Interactable => "interactable",
+            Presence::Seen => "seen",
+            Presence::Named => "named",
+        }
+    }
+    /// Is the character actually in the activity, rather than referenced?
+    pub fn on_screen(self) -> bool {
+        !matches!(self, Presence::Named)
+    }
+}
+
 pub struct Mission {
     pub order: u8,
     pub id: &'static str,
@@ -408,6 +530,19 @@ pub struct Mission {
     pub objective: Objective,
     /// the troop that leads the opposition, if one does
     pub champion: Option<&'static str>,
+    /// WHO IS THERE, and in what capacity.
+    ///
+    /// `champion` says who opposes you and there was nothing that said who is
+    /// PRESENT WITH you — so a mission whose prose turns on Prime meeting an
+    /// old enemy at an airlock had no way to record that Prime is in it. That
+    /// is the failure Destiny spent two expansions correcting: three named
+    /// legends with enormous lore who stood still in a social space while the
+    /// player did everything, until Forsaken put one of them in the mission
+    /// and killed him there.
+    ///
+    /// Keyed by `codex.rs` id, so a name here is a character the game can
+    /// already talk about rather than a string.
+    pub cast: &'static [(&'static str, Presence)],
     pub beat: &'static str,
     /// cutscene slides, the C engine's format: shown over a dim backdrop
     /// before and after the mission, advanced or skipped. All ORIGINAL
@@ -420,6 +555,7 @@ pub const MISSIONS: &[Mission] = &[
     // ============ TRILOGY ONE — disaster, war, sacrifice ============
     Mission { order: 1, id: "the_pluto_line", film: 1, dest: "pluto", site: "the outer containment line",
         objective: Objective::Eliminate, champion: Some("hoarfrost_sentinel"),
+        cast: &[("optimus", Presence::Ally)],
         beat: "hold the outer containment line; Cryotek attacks",
         intro: &[
             "the system's edge. an old soldier in an older suit walks the wall he helped build.",
@@ -432,6 +568,7 @@ pub const MISSIONS: &[Mission] = &[
         ] },
     Mission { order: 2, id: "the_scavenger_king", film: 1, dest: "outer_rim", site: "the Kuiper drift",
         objective: Objective::Eliminate, champion: Some("blackstar_raider"),
+        cast: &[],
         beat: "Blackstar, the Kuiper warlord",
         intro: &[
             "the frontier is full of cybertron's scattered children -- and their king.",
@@ -444,6 +581,7 @@ pub const MISSIONS: &[Mission] = &[
         ] },
     Mission { order: 3, id: "the_red_extraction", film: 1, dest: "mars", site: "the extraction rig",
         objective: Objective::Breach, champion: None,
+        cast: &[],
         beat: "tear the Mars extraction rig apart; the shard is already gone",
         intro: &[
             "a rig nobody registered has been coring the mantle for months. the crews are gone.",
@@ -456,6 +594,7 @@ pub const MISSIONS: &[Mission] = &[
         ] },
     Mission { order: 4, id: "the_beach_opens", film: 1, dest: "earth", site: "the beach",
         objective: Objective::Protect, champion: None,
+        cast: &[("aiden", Presence::Seen)],
         beat: "Earth's shore tears open; get the civilians clear",
         intro: &[
             "the mars shard came down hollow. los angeles felt it arrive before it landed.",
@@ -468,6 +607,7 @@ pub const MISSIONS: &[Mission] = &[
         ] },
     Mission { order: 5, id: "what_jhiaxus_grew", film: 2, dest: "earth", site: "the vault",
         objective: Objective::Eliminate, champion: None,
+        cast: &[("jhiaxus", Presence::Seen)],
         beat: "the architect of the Corrupted",
         intro: &[
             "the architect meant to study the corruption. to catalogue it. to KEEP it.",
@@ -480,6 +620,7 @@ pub const MISSIONS: &[Mission] = &[
         ] },
     Mission { order: 6, id: "the_mantle_dive", film: 2, dest: "earth", site: "the foundry",
         objective: Objective::Control, champion: None,
+        cast: &[],
         beat: "Hot Rod becomes Rodimus",
         intro: &[
             "down the ruptured mantle: living-metal corridors, energon rivers, cathedral dark.",
@@ -492,6 +633,7 @@ pub const MISSIONS: &[Mission] = &[
         ] },
     Mission { order: 7, id: "the_drowned_approach", film: 2, dest: "earth", site: "the trench",
         objective: Objective::Survive, champion: None,
+        cast: &[("rodimus", Presence::Playable), ("optimus", Presence::Named)],
         beat: "hold the descent as the Corrupted converge on the wound",
         intro: &[
             "rodimus leads now, and hates how the word sounds. prime recovers in the fleet above.",
@@ -504,6 +646,7 @@ pub const MISSIONS: &[Mission] = &[
         ] },
     Mission { order: 8, id: "the_ashen_truce", film: 3, dest: "shield_edge", site: "the picket line",
         objective: Objective::Control, champion: None,
+        cast: &[("optimus", Presence::Playable), ("megatron", Presence::Interactable)],
         beat: "Megatron comes back through the shield; the line has to decide",
         intro: &[
             "a decepticon signature crosses the shield, transponder open, weapons cold.",
@@ -516,6 +659,7 @@ pub const MISSIONS: &[Mission] = &[
         ] },
     Mission { order: 9, id: "beneath_the_pacific", film: 3, dest: "cybertron", site: "the gravity well",
         objective: Objective::Eliminate, champion: None,
+        cast: &[("optimus", Presence::Playable), ("megatron", Presence::Seen)],
         beat: "Unicron; the truce; the gravity well",
         intro: &[
             "megatron came back changed. harder. quieter. 'the devourer eats decepticons too.'",
@@ -529,6 +673,7 @@ pub const MISSIONS: &[Mission] = &[
     // ============ TRILOGY TWO — the inversion: wonder, scale, light ============
     Mission { order: 10, id: "the_far_gate", film: 4, dest: "uncharted", site: "the dig",
         objective: Objective::Eliminate, champion: Some("hijack_swarmer"),
+        cast: &[("rodimus", Presence::Playable), ("the_morpher", Presence::Ally)],
         beat: "the bridge's first jump; the Hijacks were already testing the boundary",
         intro: &[
             "the bridge did not ask where you wanted to go. it took you where the signal was.",
@@ -541,6 +686,7 @@ pub const MISSIONS: &[Mission] = &[
         ] },
     Mission { order: 11, id: "the_vault_of_ice", film: 4, dest: "glaciem", site: "the archive",
         objective: Objective::Protect, champion: Some("hoarfrost_sentinel"),
+        cast: &[("the_morpher", Presence::Interactable)],
         beat: "defend the memory of the dead; Cryotek's line are mourners",
         intro: &[
             "glaciem keeps the first war in clear ice: every fallen name, every frame, preserved.",
@@ -553,6 +699,7 @@ pub const MISSIONS: &[Mission] = &[
         ] },
     Mission { order: 12, id: "the_tide_forges", film: 5, dest: "io", site: "the forge line",
         objective: Objective::Survive, champion: None,
+        cast: &[("billy_the_fire_clone", Presence::Ally)],
         beat: "Billy routes the flare; hold the forge line while he drinks it",
         intro: &[
             "io's forges never cool; the magma-clone fires have burned since before the war.",
@@ -565,6 +712,7 @@ pub const MISSIONS: &[Mission] = &[
         ] },
     Mission { order: 13, id: "the_tithe_road", film: 5, dest: "titan", site: "the tithe-engine",
         objective: Objective::Breach, champion: None,
+        cast: &[("billy_the_fire_clone", Presence::Seen)],
         beat: "break the tithe-engine over the only world where fuel falls as rain",
         intro: &[
             "titan: the only world where fuel falls as rain, and blackstar taxes every drop.",
@@ -577,6 +725,7 @@ pub const MISSIONS: &[Mission] = &[
         ] },
     Mission { order: 14, id: "the_ashes_court", film: 6, dest: "outer_rim", site: "the dreadnought",
         objective: Objective::Breach, champion: Some("blackstar_raider"),
+        cast: &[("the_morpher", Presence::Interactable)],
         beat: "board the king's own ship; take the court from the throne room",
         intro: &[
             "the second jump drops you ON HIS DECK. blackstar's flagship, under way.",
@@ -591,6 +740,7 @@ pub const MISSIONS: &[Mission] = &[
         ] },
     Mission { order: 15, id: "the_heart_of_the_god_machine", film: 6, dest: "cybertron", site: "the spark chamber",
         objective: Objective::Eliminate, champion: None,
+        cast: &[("rodimus", Presence::Playable), ("photon", Presence::Seen)],
         beat: "everyone comes; Rodimus goes in alone",
         intro: &[
             "everyone comes: the fleet, the clans, the mourners, the perfected. even the ashes' king.",

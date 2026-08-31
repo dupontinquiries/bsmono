@@ -610,13 +610,24 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
                         Some(k) => format!("{} ({film}, rec {rec}) +{}", m.id, k.id),
                         None => format!("{} ({film}, rec {rec})", m.id),
                     };
+                    // WHO IS IN IT. The row said what the mission is and who
+                    // opposes you, never who is present with you — so a beat
+                    // that turns on playing as Prime and watching Megatron go
+                    // read as an anonymous errand until you were in it.
+                    let cast: Vec<String> = m
+                        .cast
+                        .iter()
+                        .filter(|(_, p)| p.on_screen())
+                        .map(|(id, p)| format!("{id} {}", p.label()))
+                        .collect();
                     let r = Row::action(m.id, &label);
+                    let who = if cast.is_empty() { String::new() } else { format!("  |  {}", cast.join(", ")) };
                     rows.push(if have < rec {
                         r.hint("LOW ENERGON: this will hurt")
                     } else if let Some(k) = teaches.first() {
-                        r.hint(leak(format!("{}  |  {}", m.beat, k.note)))
+                        r.hint(leak(format!("{}  |  {}{who}", m.beat, k.note)))
                     } else {
-                        r.hint(m.beat)
+                        r.hint(leak(format!("{}{who}", m.beat)))
                     });
                     // what the player can already do, so the funnel is visible
                     let known = curriculum::known_after(m).len();
