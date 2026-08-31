@@ -115,9 +115,12 @@ impl App {
             }
         }
         if self.player.shared.take_ended() {
-            // A track that finished is not a track that was stopped — only
-            // this advances anything, or pausing would skip.
-            self.controller.transport.pause();
+            // A track that finished is not a track that was stopped — the
+            // player distinguishes them precisely so this can advance
+            // without pausing skipping a track. The view decides WHAT is
+            // next (repeat mode, queue head); this only reports that the
+            // last one is over.
+            self.controller.on_track_ended();
         }
         if !self.last_note.is_empty() {
             eprintln!("bo-suite: {}", std::mem::take(&mut self.last_note));

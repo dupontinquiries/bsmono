@@ -1141,6 +1141,48 @@ impl Controller {
         // has one and NowPlaying does not — it carries display strings, since
         // line-in and radio have no track to name.
         self.now_playing_id = Some(e.track_id);
+        // AND ASK FOR THE SOUND. Every path that starts a track goes
+        // through here — the queue head, an album's first track, a tapped
+        // row — so this is the one place it has to be requested. It was
+        // missing, which is why "play album" queued, showed a title and
+        // played nothing.
+        self.request_play(e.track_id);
+    }
+
+    /// A track finished on its own. Decide what plays next.
+    ///
+    /// Called ONLY for a natural end. A stop is not an end — the player
+    /// distinguishes them for exactly this reason, because advancing on a
+    /// pause means pressing pause skips a track.
+    pub fn on_track_ended(&mut self) {
+        use crate::transport::Repeat;
+        match self.transport.repeat {
+            // Repeat one replays the SAME track rather than consuming the
+            // queue. Popping the head here would empty the queue one track
+            // per repeat, which is the mode quietly destroying the thing it
+            // is looping inside.
+            Repeat::One => {
+                if let Some(id) = self.now_playing_id {
+                    self.transport.report(0.0);
+                    self.request_play(id);
+                    return;
+                }
+            }
+            Repeat::Off | Repeat::All => {}
+        }
+        match self.queue.advance() {
+            Some(next) => {
+                self.transport.report(0.0);
+                self.start_playing(&next);
+            }
+            None => {
+                // Nothing queued. Stopped rather than left "playing" over
+                // silence, which is the state this app kept showing before
+                // there was any audio at all.
+                self.transport.playing = false;
+                self.now_playing.playing = false;
+            }
+        }
     }
 
     fn play_browse_track(&mut self, id: i64) {
@@ -1788,6 +1830,94 @@ impl Controller {
 /// to paint. Both are needed: the previous silhouettes passed every data
 /// test there was, because there were none, and the primitives that drew
 /// them lived in a function no test ever ran.
+#[cfg(test)]
+mod queue_advance_tests {
+    use super::*;
+    use crate::transport::Repeat;
+
+    fn app() -> Controller {
+        let mut c = Controller::new(vec![], vec![]);
+        c.set_track_paths(vec![
+            (1, "/m/one.flac".into()), (2, "/m/two.flac".into()), (3, "/m/three.flac".into()),
+        ]);
+        c
+    }
+
+    fn played(c: &mut Controller) -> Option<String> {
+        match c.pending_playback.take() {
+            Some(crate::playback::Request::Play { url, .. }) => Some(url),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_finished_track_plays_the_next_one() {
+        // `Queue::advance` is documented as "pop the head, when a track
+        // finishes on its own" and had no caller, so a finished track
+        // simply stopped — an album played its first track and went quiet.
+        let mut c = app();
+        c.queue.add_all(&[(1, "One".into(), "A".into()), (2, "Two".into(), "A".into())]);
+        let first = c.queue.advance().unwrap();
+        c.start_playing(&first);
+        assert_eq!(played(&mut c).as_deref(), Some("/m/one.flac"));
+
+        c.on_track_ended();
+        assert_eq!(c.transport.title, "Two");
+        assert_eq!(played(&mut c).as_deref(), Some("/m/two.flac"));
+        assert!(c.transport.playing);
+    }
+
+    #[test]
+    fn repeat_one_replays_without_eating_the_queue() {
+        // Popping the head under Repeat::One empties the queue one track
+        // per repeat — the mode quietly destroying the thing it loops
+        // inside.
+        let mut c = app();
+        c.queue.add_all(&[(1, "One".into(), "A".into()), (2, "Two".into(), "A".into())]);
+        let first = c.queue.advance().unwrap();
+        c.start_playing(&first);
+        played(&mut c);
+        c.transport.repeat = Repeat::One;
+
+        let queued_before = c.queue.len();
+        c.on_track_ended();
+        assert_eq!(played(&mut c).as_deref(), Some("/m/one.flac"), "it did not replay");
+        assert_eq!(c.queue.len(), queued_before, "repeat-one consumed the queue");
+    }
+
+    #[test]
+    fn the_end_of_the_queue_stops_rather_than_claiming_to_play() {
+        // "Playing" over silence is the state this app showed before there
+        // was any audio at all; the end of a queue must not put it back.
+        let mut c = app();
+        c.queue.add_all(&[(1, "One".into(), "A".into())]);
+        let first = c.queue.advance().unwrap();
+        c.start_playing(&first);
+        played(&mut c);
+        c.on_track_ended();
+        assert!(!c.transport.playing, "the queue ran out and it still says playing");
+        assert!(!c.now_playing.playing);
+        assert_eq!(played(&mut c), None, "it asked for a track that does not exist");
+    }
+
+    #[test]
+    fn the_position_resets_between_tracks() {
+        // Without this the bar starts the next track wherever the last one
+        // ended, until the player's first status line corrects it — a
+        // second of the handle in the wrong place on every track change.
+        let mut c = app();
+        c.queue.add_all(&[(1, "One".into(), "A".into()), (2, "Two".into(), "A".into())]);
+        let first = c.queue.advance().unwrap();
+        c.start_playing(&first);
+        c.transport.duration = 200.0;
+        c.transport.report(150.0);
+        assert!(c.transport.position() > 100.0);
+        c.on_track_ended();
+        assert!(c.transport.position() < 1.0, "the bar carried over: {}",
+                c.transport.position());
+    }
+}
+
 #[cfg(test)]
 mod motion_tests {
     use super::*;
