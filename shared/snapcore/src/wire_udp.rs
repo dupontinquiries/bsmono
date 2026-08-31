@@ -218,11 +218,27 @@ impl WireUdpTransport {
     }
 }
 
-fn contacts_of(reply: &Msg, now: u64) -> Vec<Contact> {
+/// The contacts a reply teaches us about — INCLUDING the responder itself.
+///
+/// Including it is what corrects a guessed node id. A bootstrap entry is
+/// added from a hostname before anyone has spoken to it, so its id is
+/// invented — `snapclone-presence` derives one from the address and its
+/// comment says "the id is corrected when the node actually replies".
+/// Nothing was doing the correcting: the routing table kept the invented
+/// id, which puts the busiest node in the network in the wrong bucket, so
+/// lookups route away from the one peer that knows everybody.
+///
+/// A reply's `from` is that node's real id, at the address we just reached
+/// it on. Returning it as a contact is how the routing table learns —
+/// `lookup_nodes` inserts everything a reply returns.
+fn contacts_of(reply: &Msg, responder: SocketAddr, now: u64) -> Vec<Contact> {
     match reply {
-        Msg::Reply { nodes, .. } => nodes.iter()
-            .map(|(h, a)| Contact::new(crate::wire::from_hash(h), from_wire_addr(a), now))
-            .collect(),
+        Msg::Reply { from, nodes, .. } => {
+            let mut out = vec![Contact::new(crate::wire::from_hash(from), responder, now)];
+            out.extend(nodes.iter()
+                .map(|(h, a)| Contact::new(crate::wire::from_hash(h), from_wire_addr(a), now)));
+            out
+        }
         _ => Vec::new(),
     }
 }
@@ -235,7 +251,7 @@ impl Transport for WireUdpTransport {
             // this method no `now`, and the routing table stamps a contact
             // when it inserts one. Inventing a timestamp here would be a
             // second, wronger clock.
-            Some(reply) => contacts_of(&reply, 0),
+            Some(reply) => contacts_of(&reply, to.addr, 0),
             None => Vec::new(),
         }
     }
@@ -243,16 +259,21 @@ impl Transport for WireUdpTransport {
     fn find_value(&self, _from: &Contact, to: &Contact, key: &Key) -> FindValue {
         let (tid, msg) = self.query(Query::Get, key, None);
         match self.round_trip(to, tid, &msg) {
-            Some(Msg::Reply { values, nodes, .. }) => {
+            Some(Msg::Reply { values, nodes, from, .. }) => {
                 // Values WIN over nodes when both are present, which the
                 // reference permits in one reply. A caller that took the
                 // nodes would keep walking toward a key whose value it was
                 // just handed.
                 if values.is_empty() {
-                    FindValue::Closest(nodes.iter()
+                    // The responder leads here too, same reasoning as
+                    // `contacts_of` — a `get` is just as much a chance to
+                    // learn who we are actually talking to as a `find`.
+                    let mut out = vec![Contact::new(crate::wire::from_hash(&from),
+                                                    to.addr, 0)];
+                    out.extend(nodes.iter()
                         .map(|(h, a)| Contact::new(crate::wire::from_hash(h),
-                                                   from_wire_addr(a), 0))
-                        .collect())
+                                                   from_wire_addr(a), 0)));
+                    FindValue::Closest(out)
                 } else {
                     FindValue::Values(values.into_iter().map(|v| v.data).collect())
                 }
@@ -351,8 +372,13 @@ mod tests {
         let sent = h.join().unwrap().expect("nothing decodable arrived");
         assert!(matches!(sent, Msg::Query { query: Query::Find, .. }),
                 "the wrong query kind went out: {sent:?}");
-        assert_eq!(got.len(), 1, "the reply's nodes were lost");
-        assert_eq!(got[0].addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4)), 4222));
+        // Two: the responder itself (with its REAL id, at the address we
+        // reached it on) followed by the node it named.
+        assert_eq!(got.len(), 2, "the reply's contacts were lost: {got:?}");
+        assert_eq!(got[0].addr, addr, "the responder is not first");
+        assert_eq!(got[0].id, crate::wire::from_hash(&peer_id),
+                   "the responder's real id was not learned");
+        assert_eq!(got[1].addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4)), 4222));
     }
 
     #[test]
@@ -422,6 +448,32 @@ mod tests {
         assert!(t.find_node(&contact(addr), &contact(addr), &id(2)).is_empty(),
                 "a stale reply was accepted as this query's answer");
         h.join().unwrap();
+    }
+
+    #[test]
+    fn a_guessed_bootstrap_id_is_corrected_by_the_first_reply() {
+        // A bootstrap entry is added from a hostname before anyone has
+        // spoken to it, so its id is invented. `snapclone-presence` derives
+        // one from the address and its comment says the id is "corrected
+        // when the node actually replies" — and nothing was doing the
+        // correcting. An invented id puts the busiest node in the network
+        // in the wrong bucket, so lookups route away from the one peer that
+        // knows everybody.
+        let real = dht_kit::InfoHash([0x5a; 20]);
+        let (addr, h) = responder(move |q| match q {
+            Msg::Query { tid, .. } => Some(Msg::Reply {
+                tid, from: real, nodes: vec![], values: vec![], token: 0 }),
+            _ => None,
+        });
+        let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
+        // The contact we dial carries a WRONG id, as a bootstrap entry does.
+        let guessed = Contact::new(id(200), addr, 0);
+        let got = t.find_node(&guessed, &guessed, &id(2));
+        h.join().unwrap();
+        assert_eq!(got.len(), 1, "a reply with no nodes taught us nothing: {got:?}");
+        assert_eq!(got[0].id, crate::wire::from_hash(&real));
+        assert_ne!(got[0].id, id(200), "the guessed id survived the correction");
+        assert_eq!(got[0].addr, addr);
     }
 
     #[test]
@@ -535,7 +587,7 @@ mod tests {
         let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
         let got = t.find_node(&contact(addr), &contact(addr), &id(2));
         h.join().unwrap();
-        assert_eq!(got.len(), 1, "the stray datagram ate the reply");
+        assert_eq!(got.len(), 2, "the stray datagram ate the reply");
     }
 
     #[test]
