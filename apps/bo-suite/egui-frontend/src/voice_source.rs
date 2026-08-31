@@ -14,10 +14,19 @@
 //! needs is the OUTPUT, and a line of text on a pipe is the cheapest
 //! interface that any of them can produce:
 //!
-//! * `voiceterm --listen --print-phrases`
-//! * a whisper wrapper script
-//! * `cat /run/user/1000/voice.fifo` for something already running
+//! * `cat /run/user/1000/bo-voice.fifo` — anything already recognising
+//!   writes a line into the fifo and this app acts on it. Works today,
+//!   with `mkfifo` and no other moving parts.
+//! * a wrapper around a streaming recogniser
 //! * `echo pause` while testing, which is how the tests here work
+//!
+//! NOT `voiceterm --print-phrases`, which the first version of this
+//! module offered as the headline example. I went and checked: voiceterm
+//! has no such mode. Its recognition sits behind the `voice` feature
+//! inside a Qt binary whose outputs are its own UI and D-Bus. Naming an
+//! invocation that does not exist is worse than naming none — it sends
+//! someone hunting for a flag for twenty minutes. What voiceterm would
+//! need is a headless mode printing each final transcript to stdout.
 //!
 //! Empty by default: nothing is spawned until the person names a command.
 //! That matters more than usual here — this is the switch that decides

@@ -327,7 +327,20 @@ pub fn render(p: &VoicePrefs) -> String {
              # act_on_uncertain: act on \"play <something>\" and \"search …\" \
              without confirming\n\
              # prefix: require phrases to start with this word (blank for none)\n\
-             # recognizer: a command printing one phrase per line (blank: none)\n\
+             #\n\
+             # RECOGNISER CONTRACT: a command that prints ONE PHRASE PER LINE\n\
+             # on stdout, unbuffered, for as long as it runs. Nothing else is\n\
+             # assumed — no exit code, no protocol, no handshake. Blank means\n\
+             # none, and none means nothing is spawned.\n\
+             #\n\
+             # An example needing no extra software:\n\
+             #   mkfifo -m 600 /run/user/$UID/bo-voice.fifo\n\
+             #   recognizer = cat /run/user/1000/bo-voice.fifo\n\
+             # then have anything write a line into that fifo.\n\
+             #\n\
+             # Phrases over 120 characters are ignored: a command is a few\n\
+             # words, and a sentence means something is transcribing the room\n\
+             # rather than talking to the speaker.\n\
              enabled = {}\nact_on_uncertain = {}\nprefix = {}\nrecognizer = {}\n",
             p.enabled, p.act_on_uncertain, p.prefix, p.recognizer)
 }
@@ -508,6 +521,22 @@ mod tests {
         let old = parse_prefs("enabled = true\nfuture_thing = 3\nprefix = bo\n");
         assert!(old.enabled);
         assert_eq!(old.prefix, "bo");
+    }
+
+    #[test]
+    fn the_config_file_states_the_contract_and_an_example_that_works() {
+        // The first version of this pointed at `voiceterm --print-phrases`,
+        // a flag that does not exist. A hint that sends someone hunting is
+        // worse than no hint, so the file carries the contract and an
+        // example needing nothing but `mkfifo` — and this test keeps the
+        // two from drifting apart.
+        let text = render(&VoicePrefs::default());
+        assert!(text.contains("ONE PHRASE PER"), "the contract is not stated");
+        assert!(text.contains("mkfifo"), "no example that works today");
+        assert!(!text.contains("--print-phrases"), "the invented flag came back");
+        // The length rule is enforced in `voice_source`; saying it here is
+        // how someone debugging a silent room finds out why.
+        assert!(text.contains("120"), "the length limit is undocumented");
     }
 
     #[test]
