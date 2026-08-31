@@ -1135,6 +1135,8 @@ pub struct Chat {
     show_context: bool, // right sidebar open/closed
     right_page: RightPage, // active sidebar subpage
     coord_mode: crate::coordinator::Mode, // prompting mode (barebones / coordinator / aggressive)
+    /// Hand-picked engineering profiles. Empty = autopilot (`engprofile::suggest` from the task).
+    profiles_manual: Vec<crate::engprofile::ProfileId>,
 
     /// A duration the operator asked for, and when they asked.
     ///
@@ -1413,6 +1415,7 @@ impl Default for Chat {
             context: LONG_HORIZON.into(),
             threading: true, show_context: false, attach_log: true, fix_mode: false,
             right_page: RightPage::Prompting, coord_mode: crate::coordinator::Mode::Barebones,
+            profiles_manual: Vec::new(),
             // Open-ended until the operator says otherwise.
             work_limit: None,
             verify_job: None,
@@ -3366,6 +3369,14 @@ which file you read.\n\n",
             cfg.stateful_guide = true;
             cfg.checkpoint_on_green = true;
         }
+        // AUTOPILOT: the working discipline follows the task. A shader bug gets the GPU profile's
+        // rule for verification (diff against a reference) rather than the generic one; anything
+        // unrecognised gets the base posture, which is the measured default for this operator.
+        // A manual selection, when one has been made, wins over the suggestion.
+        cfg.profiles = if self.profiles_manual.is_empty() {
+            crate::engprofile::suggest(&task)
+        } else { self.profiles_manual.clone() };
+        let profile_names: Vec<&str> = cfg.profiles.iter().map(|p| p.profile().name).collect();
         let (run, first) = crate::workspace_exec::AgentRun::start(work_dir, &task, cfg);
         let guided = run.phase().is_some();
         self.agent_run = Some(run);
@@ -3373,10 +3384,14 @@ which file you read.\n\n",
         self.agent_pending_submit = Some(first);
         self.agent_files.clear();
         self.agent_plan.clear();
+        // Name the posture in the status line. An autopilot that silently changes how the model
+        // works is one the operator cannot correct — the whole reason the mode picker states what
+        // each mode actually does.
+        let posture = profile_names.join(" + ");
         self.note = if guided {
-            format!("agent started (stateful guide): {task} — phase: survey")
+            format!("agent started (stateful guide, {posture}): {task} — phase: survey")
         } else {
-            format!("agent started: {task} — surveying the workspace…")
+            format!("agent started ({posture}): {task} — surveying the workspace…")
         };
     }
 
@@ -8226,6 +8241,44 @@ if let Some(msg) = self.error_banner.clone() {
                                     .color(if live { theme::DIM() } else { theme::FAINT() })
                                     .small().italics());
                                 ui.add_space(6.0);
+                            }
+                            ui.separator();
+                            // ── ENGINEERING PROFILES ─────────────────────────────────────────
+                            ui.label(RichText::new("WORKING DISCIPLINE").color(theme::FAINT()).small());
+                            let auto = self.profiles_manual.is_empty();
+                            if ui.selectable_label(auto, RichText::new("Autopilot")
+                                .color(if auto { theme::CYAN() } else { theme::INK() }).strong()).clicked() {
+                                self.profiles_manual.clear();
+                            }
+                            ui.label(RichText::new("Chooses the posture from the task: a shader bug gets the GPU role's rule for verification, a slow path gets the optimizer's. Anything unrecognised gets the native-fullstack default, which is what a third of your turns — \"keep working\" — actually ask for.")
+                                .color(theme::DIM()).small());
+                            ui.add_space(4.0);
+                            for id in crate::engprofile::ProfileId::all() {
+                                let p = id.profile();
+                                let on = self.profiles_manual.contains(&id);
+                                if ui.selectable_label(on, RichText::new(p.name)
+                                    .color(if on { theme::CYAN() } else { theme::INK() })).clicked() {
+                                    // Order of selection is order of PRECEDENCE — the first picked
+                                    // wins a shared rule, which is what `compose` resolves by.
+                                    if on { self.profiles_manual.retain(|x| *x != id); }
+                                    else { self.profiles_manual.push(id); }
+                                }
+                                ui.label(RichText::new(p.when).color(theme::DIM()).small());
+                                ui.label(RichText::new(format!("source: {}", p.source))
+                                    .color(theme::FAINT()).small().italics());
+                                ui.add_space(4.0);
+                            }
+                            if !self.profiles_manual.is_empty() {
+                                // What the merge costs, stated before a run rather than discovered:
+                                // two profiles with a rule for the same thing means one is dropped.
+                                let b = crate::engprofile::compose(&self.profiles_manual, 6000);
+                                let mut note = format!("{} profile(s), {} bytes of prompt",
+                                    self.profiles_manual.len(), b.text.len());
+                                if !b.dropped.is_empty() {
+                                    note.push_str(&format!("; {} overlapping rule(s) resolved in favour of the earlier pick", b.dropped.len()));
+                                }
+                                if b.trimmed > 0 { note.push_str(&format!("; {} trimmed to fit", b.trimmed)); }
+                                ui.label(RichText::new(note).color(theme::CYAN()).small());
                             }
                             ui.separator();
                             ui.label(RichText::new("Coordinator modes fan one task out to parallel workers over the same loaded model — no extra models needed. The per-mode line above says what each one changes today. `coordinator::plan()` now drives the fan: the steps of the plan your model wrote become the units it splits the work into, so a fan is only as good as the plan above it — and the same steps decide afterwards which ones were actually done.").color(theme::FAINT()).small());

@@ -406,6 +406,54 @@ happen in and what counts as evidence.\n", names.join(" + "));
     Brief { text, dropped, trimmed }
 }
 
+// ── autopilot: which profiles a task calls for ──────────────────────────────────────────────────
+
+/// Signals that a task wants a given role, matched against the lowercased request.
+///
+/// Keyword evidence in the same shape as `taskclass::classify`, and conservative for the same
+/// reason: a profile that fires on a weak signal replaces the sensible default with a specialist
+/// posture for a task that is not that speciality.
+const SIGNALS: &[(ProfileId, &[&str])] = &[
+    (ProfileId::Gpu, &["shader", "wgsl", "kernel", "gpu", "quant", "dequant", "matvec", "simd",
+                       "f16", "tensor", "cuda", "vulkan", "compute pass"]),
+    (ProfileId::Optimizer, &["slow", "faster", "speed up", "perf", "performance", "optimi",
+                             "latency", "throughput", "memory usage", "allocat", "profil",
+                             "benchmark", "bottleneck", "regress"]),
+    (ProfileId::Hardware, &["reverse", "undocumented", "protocol", "firmware", "register",
+                            "driver", "hardware", "binary format", "wire format", "decompil",
+                            "no documentation", "black box"]),
+    (ProfileId::Planner, &["design", "plan ", "explore", "options", "brainstorm", "architecture",
+                           "proposal", "sketch", "rfc", "what should", "how should we",
+                           "don't wire", "do not wire"]),
+];
+
+/// Choose profiles for a task. The autopilot's actual decision.
+///
+/// Always returns at least one, and the fallback is [`ProfileId::NativeFullstack`] — measured, not
+/// chosen: a third of this operator's turns give no direction at all, so "the default posture" is
+/// the single most-used thing here and must be what an unrecognised task gets.
+///
+/// Order is precedence, and the specialist leads. A task about shader performance should get the
+/// GPU profile's rule for verification (diff against a reference implementation) rather than the
+/// generic one, and `compose` resolves that by taking the first profile's practice per tag.
+pub fn suggest(task: &str) -> Vec<ProfileId> {
+    let t = task.to_ascii_lowercase();
+    let mut hits: Vec<(usize, ProfileId)> = SIGNALS.iter()
+        .filter_map(|(id, words)| {
+            let n = words.iter().filter(|w| t.contains(**w)).count();
+            if n > 0 { Some((n, *id)) } else { None }
+        })
+        .collect();
+    // Strongest signal first; ties broken by the declaration order above so the result is stable.
+    hits.sort_by(|a, b| b.0.cmp(&a.0));
+    // At most two specialists. Three role-postures at once is a prompt arguing with itself about
+    // what the job is, and the tag merge would be dropping more than it keeps.
+    let mut out: Vec<ProfileId> = hits.into_iter().take(2).map(|(_, id)| id).collect();
+    // The base posture always comes last: it supplies whatever the specialists did not tag.
+    if !out.contains(&ProfileId::NativeFullstack) { out.push(ProfileId::NativeFullstack); }
+    out
+}
+
 /// The whole-corpus default: everything, at a generous budget.
 pub fn compose_all(budget: usize) -> Brief { compose(&ProfileId::all(), budget) }
 
@@ -503,6 +551,58 @@ rules in conflict, inside a single profile", p.name, pr.tag);
                 assert!(b.text.contains(pr.headline), "{:?} lost '{}'", id, pr.headline);
             }
         }
+    }
+
+    #[test]
+    fn the_autopilot_picks_the_specialist_and_keeps_the_base() {
+        let cases: [(&str, ProfileId); 4] = [
+            ("the wgsl shader dequant kernel disagrees with the CPU", ProfileId::Gpu),
+            ("dequantisation is too slow, speed up the matvec", ProfileId::Gpu), // gpu outscores perf here
+            ("this endpoint has terrible latency, profile it", ProfileId::Optimizer),
+            ("reverse engineer the undocumented wire format", ProfileId::Hardware),
+        ];
+        for (task, want) in cases {
+            let got = suggest(task);
+            assert_eq!(got[0], want, "'{task}' -> {got:?}");
+            assert_eq!(*got.last().unwrap(), ProfileId::NativeFullstack,
+                       "'{task}': the base posture must always be the fallback layer");
+        }
+    }
+
+    /// The measured default. A third of this operator's turns carry no direction, so an
+    /// unrecognised task must land on the base posture rather than on nothing or on a specialist.
+    #[test]
+    fn an_unrecognised_task_gets_the_base_posture_alone() {
+        for t in ["keep working", "continue", "", "add more blocks", "finish that thing"] {
+            assert_eq!(suggest(t), vec![ProfileId::NativeFullstack], "'{t}'");
+        }
+    }
+
+    #[test]
+    fn the_autopilot_never_stacks_more_than_two_specialists() {
+        // every signal at once: still bounded, because three role-postures is a prompt arguing with
+        // itself about what the job is.
+        let kitchen_sink = "design a faster gpu shader kernel for the undocumented firmware protocol and optimise its latency, exploring options";
+        let got = suggest(kitchen_sink);
+        assert!(got.len() <= 3, "{got:?}");
+        assert_eq!(*got.last().unwrap(), ProfileId::NativeFullstack);
+        // and the composition of whatever it picked is still one rule per tag
+        let b = compose(&got, 100_000);
+        for id in &got {
+            for pr in id.profile().practices {
+                assert!(b.text.matches(pr.headline).count() <= 1);
+            }
+        }
+    }
+
+    #[test]
+    fn suggested_profiles_compose_without_losing_the_specialist_lead() {
+        // The specialist leads, so its rule for a shared tag wins over the generic one.
+        let got = suggest("the shader kernel produces wrong numbers");
+        assert_eq!(got[0], ProfileId::Gpu);
+        let b = compose(&got, 100_000);
+        let gpu_oracle = GPU.practices.iter().find(|p| p.tag == Tag::Oracle).unwrap().headline;
+        assert!(b.text.contains(gpu_oracle), "the specialist's oracle rule should lead");
     }
 
     #[test]
