@@ -695,6 +695,68 @@ mod tests {
     }
 
     #[test]
+    fn the_message_and_call_buttons_do_something() {
+        // Both were `_ => {}` behind buttons drawn exactly like the two that
+        // worked. This is what fails if either falls back through again.
+        let mut s = app();
+        s.local_id = "sc-11111111".into();
+        s.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "sc-aabbccdd".into(), port: 9876 }));
+
+        s.apply_friends(crate::friends::Action::Invoke(
+            "sc-aabbccdd".into(), "message".into()));
+        assert_eq!(s.conversation_peer, "sc-aabbccdd", "Message opened nothing");
+
+        s.apply_friends(crate::friends::Action::Invoke(
+            "sc-aabbccdd".into(), "call".into()));
+        assert!(s.group_voice.joined, "Call did not enter the room");
+        assert!(s.group_voice.participants.iter().any(|p| p.id == "sc-aabbccdd"),
+                "the person being called is not in the call");
+        // No address is known, so the note says so NOW rather than after
+        // thirty seconds of silence the user reads as a broken microphone.
+        assert!(s.call_note.contains("no known address"), "{}", s.call_note);
+
+        // With an address, the same action reports a call being placed.
+        s.note_peer_addr("sc-aabbccdd", [10, 0, 0, 3], 9876, 1_000);
+        s.apply_friends(crate::friends::Action::Invoke(
+            "sc-aabbccdd".into(), "call".into()));
+        assert_eq!(s.call_note, "calling sc-aabbccdd");
+    }
+
+    #[test]
+    fn calling_twice_does_not_duplicate_anyone_in_the_room() {
+        let mut s = app();
+        s.local_id = "sc-11111111".into();
+        s.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "sc-aabbccdd".into(), port: 9876 }));
+        for _ in 0..3 {
+            s.apply_friends(crate::friends::Action::Invoke(
+                "sc-aabbccdd".into(), "call".into()));
+        }
+        let n = s.group_voice.participants.iter()
+            .filter(|p| p.id == "sc-aabbccdd").count();
+        assert_eq!(n, 1, "three taps put them in the room {n} times");
+        assert_eq!(s.group_voice.participants.iter().filter(|p| p.is_self).count(), 1,
+                   "and we joined ourselves more than once");
+    }
+
+    #[test]
+    fn a_device_with_no_identity_refuses_the_call_rather_than_half_placing_it() {
+        // `group_voice::leave` releases the floor through `me()`, so a room
+        // we are not a participant of cannot be left cleanly — and the far
+        // end would get packets from a sender it cannot name. Gossip already
+        // refuses to announce without a key; this is the same rule.
+        let mut s = app();
+        assert!(s.local_id.is_empty(), "the fixture is supposed to have no identity");
+        s.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "sc-aabbccdd".into(), port: 9876 }));
+        s.apply_friends(crate::friends::Action::Invoke(
+            "sc-aabbccdd".into(), "call".into()));
+        assert!(!s.group_voice.joined, "we entered a call as nobody");
+        assert!(s.call_note.contains("no identity"), "{}", s.call_note);
+    }
+
+    #[test]
     fn the_dht_only_asks_about_contacts_the_lan_cannot_see() {
         // Gossip is better evidence than a DHT record — signed, and it means
         // they are on this subnet right now. Asking the DHT about someone

@@ -224,6 +224,10 @@ pub struct Snapclone {
     /// Who the open conversation is with. The Conversation model holds the
     /// ITEMS; which peer they belong to is the shell's business.
     pub conversation_peer: String,
+    /// What the last call attempt amounted to. A field rather than a toast:
+    /// this controller has no general message channel, and the two that do
+    /// exist (`shutter_note`, `feed_note`) belong to other pages.
+    pub call_note: String,
     /// The unified bottom bar (Qt UnifiedNavBar): page arrows, sub-tab segments, underline
     /// morph, page dots. Owns the page + sub-tab state; `nav` mirrors the page for swipe.
     pub bar: UnifiedNav,
@@ -793,6 +797,7 @@ impl Snapclone {
             wayfinder_snaps: Vec::new(),
             conversation: Default::default(),
             conversation_peer: String::new(),
+            call_note: String::new(),
             bar: UnifiedNav::new(),
             login_visible: !auto_logged_in,
             nav: Nav::new(PAGES.len()),
@@ -1771,6 +1776,67 @@ impl Snapclone {
                         // ask_delete returning a bool.
                         self.confirm_delete(&id);
                     }
+                }
+                // MESSAGE AND CALL WERE `_ => {}`. Two buttons on every
+                // contact card, drawn exactly like the two that work, doing
+                // nothing at all — worse than absent, because a missing
+                // button is visible and a dead one teaches people the app is
+                // unreliable.
+                "message" => {
+                    // The same landing the snap feed's hold gesture already
+                    // uses, so a conversation opens one way rather than two
+                    // that could drift.
+                    self.conversation_peer = id.clone();
+                }
+                "call" => {
+                    // Placing a call is: be in the room, and have the other
+                    // person in it. They are added optimistically — they
+                    // have not accepted, and there is no invite protocol on
+                    // the wire yet — which is what lets the host bring the
+                    // audio path up and start sending.
+                    //
+                    // Said plainly rather than dressed up as a ringing
+                    // state: this app cannot make their phone ring yet, and
+                    // a spinner claiming otherwise would be a lie with a
+                    // progress indicator on it.
+                    let me = self.local_id.clone();
+                    if me.is_empty() {
+                        // No identity, no call. Refused rather than half
+                        // done: `group_voice::leave` releases the floor
+                        // through `me()`, so a room we are not in cannot be
+                        // left cleanly, and the far end would receive
+                        // packets from a sender it cannot name. The same
+                        // rule gossip already follows — no key, no
+                        // announcement.
+                        self.call_note =
+                            "this device has no identity yet, so it cannot place a call"
+                            .to_string();
+                        return;
+                    }
+                    let mut people = self.group_voice.participants.clone();
+                    if !people.iter().any(|p| p.is_self) {
+                        people.push(crate::group_voice::Participant {
+                            id: me, name: "you".into(), is_self: true });
+                    }
+                    if !people.iter().any(|p| p.id == id) {
+                        let name = self.contact_book.get(&id)
+                            .map(|c| c.label().to_string())
+                            .unwrap_or_else(|| id.clone());
+                        people.push(crate::group_voice::Participant {
+                            id: id.clone(), name, is_self: false });
+                    }
+                    self.group_voice.set_participants(people);
+                    self.group_voice.join();
+                    self.call_note = match self.punch.get(&id) {
+                        Some(_) => format!("calling {id}"),
+                        // The honest version of a call that cannot work: no
+                        // current address means nothing we send arrives.
+                        // Better said now than after thirty seconds of
+                        // silence that reads as their microphone.
+                        None => format!(
+                            "{id} has no known address - they must be seen on this \
+                             network, or found via DHT, before a call can reach them"),
+                    };
                 }
                 "edit" => {
                     self.editor_id = id.clone();
@@ -3213,10 +3279,17 @@ impl Snapclone {
         }
         // Join / leave lives here because Friends is where the people are; the
         // rest of the voice controls are on the bar itself once a session is up.
+        if !self.call_note.is_empty() {
+            // Where the call was placed from, so the answer is where the
+            // question was — a note on another page is a note nobody reads.
+            ui.colored_label(
+                if self.call_note.contains("no known address") { c.warning } else { c.text_weak },
+                &self.call_note);
+        }
         ui.horizontal(|ui| {
             let joined = self.group_voice.joined;
             if ui.selectable_label(joined, if joined { "leave channel" } else { "join channel" })
-                .clicked() { self.toggle_voice(); }
+                .clicked() { self.toggle_voice(); self.call_note.clear(); }
             if joined && ui.selectable_label(self.group_voice.muted, "mute").clicked() {
                 self.group_voice.muted = !self.group_voice.muted;
             }
