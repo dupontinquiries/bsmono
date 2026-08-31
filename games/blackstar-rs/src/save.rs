@@ -89,7 +89,7 @@ impl Default for Save {
             element: crate::weapons::Element::None,
             from: None,
         };
-        let lightsaber = crate::gear::Item::Weapon {
+        let placeholder_blade = crate::gear::Item::Weapon {
             verb: crate::weapons::Verb::Thrust,
             element: crate::weapons::Element::Fire,
             from: None,
@@ -105,7 +105,7 @@ impl Default for Save {
             from: None,
         };
         let starter_bag =
-            [&firstedge, &lightsaber, &ashpulse].iter().map(|it| it.code()).collect::<Vec<_>>().join(",");
+            [&firstedge, &placeholder_blade, &ashpulse].iter().map(|it| it.code()).collect::<Vec<_>>().join(",");
         // RACKED ON THE BAR TOO, not just in the bag — so pressing 1/2/3
         // does something the moment a new save loads, rather than
         // requiring a trip to the Armory first to find out the hotbar
@@ -114,7 +114,7 @@ impl Default for Save {
         // format from_line() actually expects.
         let mut starter = crate::hotbar::Hotbar::default();
         let _ = starter.assign(0, firstedge);
-        let _ = starter.assign(1, lightsaber);
+        let _ = starter.assign(1, placeholder_blade);
         let _ = starter.assign(2, ashpulse);
         Save {
             total_rings: 0,
@@ -320,15 +320,15 @@ mod tests {
         assert!(hb.slot(0).is_some(), "hotbar slot 1 is empty on a new save");
         assert!(hb.slot(1).is_some(), "hotbar slot 2 is empty on a new save");
         assert!(hb.slot(2).is_some(), "hotbar slot 3 is empty on a new save");
-        // and specifically: the lightsaber the person asked for is
+        // and specifically: the placeholder_blade the person asked for is
         // actually reachable, not just "some item"
-        let has_lightsaber = (0..crate::hotbar::SLOTS).any(|i| {
+        let has_placeholder_blade = (0..crate::hotbar::SLOTS).any(|i| {
             matches!(
                 hb.slot(i).map(|s| &s.item),
                 Some(crate::gear::Item::Weapon { verb: crate::weapons::Verb::Thrust, element: crate::weapons::Element::Fire, .. })
             )
         });
-        assert!(has_lightsaber, "the lightsaber isn't in the starter hotbar");
+        assert!(has_placeholder_blade, "the placeholder_blade isn't in the starter hotbar");
     }
 
     /// A `Save` with every field set to something distinctive, so a field

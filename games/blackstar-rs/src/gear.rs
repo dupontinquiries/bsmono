@@ -461,19 +461,38 @@ pub const WEAPONS: [WeaponSpec; 7] = [
         asset: "imported_caiman_rail_slasher_3d_model_stylized_weapon",
     },
     // PLACEHOLDER VISUAL, real weapon otherwise. No genuinely
-    // lightsaber-shaped asset exists anywhere in this catalog (checked:
-    // no "saber"/"energy_sword"/"energy_blade" match in the imported
-    // tree, and the two "blade"/"longsword" hits elsewhere are a flyer
-    // and a spaceship name, not a handheld weapon model). Borrows
-    // RAILFANG's stylized-weapon asset rather than one of the two
-    // real-world swords, since a sci-fi-stylized silhouette is the
-    // closer visual family for an energy blade even without a distinct
-    // model — the two will render identically until a real lightsaber
-    // asset is imported. Fire (not Electric/Rock/None, the three other
-    // melee elements already in this table) so it's mechanically
-    // distinct even while it looks the same as RAILFANG.
+    // energy-blade-shaped asset existed in this catalog when this entry
+    // was first added; one has now been converted (see
+    // assets/weapons/) but is not yet wired to a live held-weapon
+    // renderer, so this still points at RAILFANG's stylized asset.
+    // Fire (not Electric/Rock/None, the three other melee elements
+    // already in this table) so it's mechanically distinct even while
+    // it looks the same as RAILFANG.
+    //
+    // NAMING IS DELIBERATELY GENERIC FOR NOW. Several of the newly-
+    // converted source files are literally named after real franchise
+    // characters (a fan-asset library, like the rest of this catalog's
+    // provenance) — kept as internal provenance only, never shown to
+    // the player, same house rule as every other entry in this table.
+    // Two real in-game names were tried and dropped here before landing
+    // on a placeholder: "LIGHTSABER" (this entry's first name) is an
+    // outright trademark; "ENERGONEDGE" borrows Transformers' own
+    // "Energon" term, which this project already avoids putting in a
+    // player-visible name for exactly this reason (see the
+    // Cybertronian/raid-boss naming elsewhere, which is inherited
+    // scope, not a precedent to add to on purpose). Rather than pick a
+    // third name and risk the same mistake, the person asked to keep
+    // this generic until they've checked their own design notes —
+    // "PLACEHOLDER_BLADE" is that placeholder, not a finished name.
+    //
+    // MECHANICS ARE A PLACEHOLDER TOO. Verb::Thrust/Element::Fire is a
+    // plain reuse of the existing melee shape; the person who asked for
+    // this said they may want something more erratic later (of a piece
+    // with a glowing, unstable blade rather than a plain sword swing) —
+    // not implemented here, since "erratic" is a real design decision
+    // with numbers nobody's specified yet, not a wiring job.
     WeaponSpec {
-        name: "LIGHTSABER",
+        name: "PLACEHOLDER_BLADE",
         verb: Verb::Thrust,
         element: Element::Fire,
         side: Side::Right,

@@ -1056,3 +1056,21 @@ mod exterior_smoke_test {
         assert!(!raws.is_empty(), "the exterior asset loaded zero prims");
     }
 }
+
+#[cfg(test)]
+mod placeholder_blade_smoke_test {
+    #[test]
+    fn the_converted_placeholder_blade_loads_headlessly() {
+        // Converted from a person-supplied .iqm via the real foldview
+        // --gltf export path (games/blackstar/rust/foldview), the same
+        // tool every other chassis in assets/bots/ went through. Proves
+        // the specific converted file parses through this game's own
+        // loader, not just that the general mechanism compiles.
+        let dir = std::path::Path::new("assets/weapons/placeholder_blade");
+        if !dir.exists() {
+            return;
+        }
+        let (raws, _) = crate::model::load_raw(dir, 1.32);
+        assert!(!raws.is_empty(), "the placeholder blade model loaded zero prims");
+    }
+}
