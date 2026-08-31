@@ -3488,3 +3488,23 @@ Measured (numbers logged after printing):
   the entire 45 s from one flag bit per region.
 
 Session ladder to date: 46.5× @ −2.00 dB → 32.4× @ +0.47 dB.
+
+### Planar intra (mode 3, same session)
+
+HEVC-style plane from the same top/left borders (horizontal interp
+toward the top-right sample, vertical toward the bottom-left,
+averaged) — DC's gradient-shaped sibling for smooth shading where a
+constant leaves a ramp in the residual. One extra bit per intra
+region choosing DC vs planar. Borrow-checker required buffering the
+plane before mutating the composite; behavior identical.
+
+Measured (after printing): shot 9 −2.0% AND +0.05 dB (strict
+dominance again); shotB +0.1% bytes for +0.044 dB. Full suite
+(docs/full_v11_dz32_planar.csv):
+  DC-intra: 32.07 MB @ 33.80 / 0.940   (32.4×)
+  +planar : 31.58 MB @ 33.90 / 0.941   (31.9×, +0.57 dB over AV1)
+→ −1.5% bytes AND +0.10 dB across the whole 45 s.
+
+Session ladder: 46.5× @ −2.00 dB → 31.9× @ +0.57 dB. The intra
+family (DC + planar) has now delivered −6.8% bytes and +0.21 dB
+combined — the ledger's unsolved bucket paying out as predicted.

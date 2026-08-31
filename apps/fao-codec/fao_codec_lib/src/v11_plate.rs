@@ -1298,6 +1298,52 @@ pub fn encode_gop_v3(
                                     (f.y[(ry + dy) * fw + rx + dx] as i32 - dc as i32).unsigned_abs();
                             }
                         }
+                        // Planar candidate: HEVC-style plane from the same
+                        // borders (horizontal interp toward the top-right
+                        // sample, vertical toward the bottom-left, then
+                        // averaged) — DC's gradient-shaped sibling for
+                        // smooth shading where a constant leaves a ramp in
+                        // the residual. Falls back to DC values on missing
+                        // borders. One extra bit per intra region.
+                        let planar_at = |x: usize, y: usize| -> i32 {
+                            let top = |i: usize| -> i32 {
+                                if ry > 0 {
+                                    comp.y[(ry - 1) * fw + rx + i.min(REGION - 1)] as i32
+                                } else {
+                                    dc as i32
+                                }
+                            };
+                            let left = |i: usize| -> i32 {
+                                if rx > 0 {
+                                    comp.y[(ry + i.min(REGION - 1)) * fw + rx - 1] as i32
+                                } else {
+                                    dc as i32
+                                }
+                            };
+                            let tr = top(REGION - 1);
+                            let bl = left(REGION - 1);
+                            let h = left(y) * (REGION - 1 - x) as i32 + tr * (x as i32 + 1);
+                            let v = top(x) * (REGION - 1 - y) as i32 + bl * (y as i32 + 1);
+                            ((h + v + REGION as i32) / (2 * REGION as i32)).clamp(0, 255)
+                        };
+                        let mut sad_planar = 0u32;
+                        for dy in 0..REGION {
+                            for dx in 0..REGION {
+                                sad_planar += (f.y[(ry + dy) * fw + rx + dx] as i32
+                                    - planar_at(dx, dy))
+                                .unsigned_abs();
+                            }
+                        }
+                        let use_planar = sad_planar < sad_intra;
+                        let mut plane_buf = [0u8; REGION * REGION];
+                        if use_planar {
+                            for dy in 0..REGION {
+                                for dx in 0..REGION {
+                                    plane_buf[dy * REGION + dx] = planar_at(dx, dy) as u8;
+                                }
+                            }
+                        }
+                        let sad_intra = sad_intra.min(sad_planar);
                         let best_temporal = sad_plate.min(sad_prev);
                         if sad_intra + 96 < best_temporal {
                             if modes[gy * gw + gx] == 1 {
@@ -1305,10 +1351,14 @@ pub fn encode_gop_v3(
                                 mvs.pop();
                                 prev_regions -= 1;
                             }
-                            modes[gy * gw + gx] = 2;
+                            modes[gy * gw + gx] = if use_planar { 3 } else { 2 };
                             for dy in 0..REGION {
                                 for dx in 0..REGION {
-                                    comp.y[(ry + dy) * fw + rx + dx] = dc;
+                                    comp.y[(ry + dy) * fw + rx + dx] = if use_planar {
+                                        plane_buf[dy * REGION + dx]
+                                    } else {
+                                        dc
+                                    };
                                 }
                             }
                             // chroma DC from the chroma planes' own borders
@@ -1477,12 +1527,22 @@ pub fn encode_gop_v3(
         // plate; this flag overrides). Inline recon shares the pass, so
         // side layout only needs consistent byte accounting.
         let mut intra_flags = vec![0u8; (gw * gh + 7) / 8];
+        let mut planar_bits: Vec<u8> = Vec::new();
+        let mut nb = 0usize;
         for (gi, &m) in modes.iter().enumerate() {
-            if m == 2 {
+            if m >= 2 {
                 intra_flags[gi / 8] |= 1 << (gi % 8);
+                if nb % 8 == 0 {
+                    planar_bits.push(0);
+                }
+                if m == 3 {
+                    *planar_bits.last_mut().unwrap() |= 1 << (nb % 8);
+                }
+                nb += 1;
             }
         }
         side.extend_from_slice(&intra_flags);
+        side.extend_from_slice(&planar_bits);
         side.extend_from_slice(&gain_flags);
         side.extend_from_slice(&gain_vals);
         let mode_bytes = zstd::encode_all(side.as_slice(), 19).map(|c| c.len()).unwrap_or(side.len());
