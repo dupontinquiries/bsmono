@@ -272,6 +272,159 @@ fn build_roamer(kind: unendlich_engine::item::CreatureKind, pos: [f32; 3], wseed
 }
 
 
+/// Apply a creative-hotbar-slot pick (from a UI click, scroll, or number
+/// key) to gameplay state. Sources the item from `renderer.creative_hotbar`
+/// — creative's REAL, on-screen hotbar (any ItemKind, including weapons) —
+/// rather than the legacy `PLACE_PALETTE` hardcoded 9-block array, which is
+/// what "the invisible list" in the bug report actually was: scrolling used
+/// to walk PLACE_PALETTE regardless of what the visible hotbar UI showed, so
+/// the two could show completely different things. Publishes the pick as
+/// `creative_place_item` (making it the held/used item via the r487 sync)
+/// and keeps `selected_block` in sync when the slot holds a `Block`, for the
+/// handful of older call sites that still read `selected_block` directly.
+fn apply_creative_hotbar_slot(
+    renderer: &mut WorldRenderer,
+    selected_block: &mut BlockId,
+    idx: usize,
+) {
+    let picked = renderer.creative_hotbar.get(idx).copied().flatten();
+    renderer.creative_place_item = picked;
+    if let Some(unendlich_engine::item::ItemKind::Block(b)) = picked {
+        *selected_block = b;
+    }
+}
+
+// r-weapon-fix: the single source of truth for "is there actually a
+// placeable block in hand right now" — used to gate right-click placement so
+// holding a weapon (or anything non-block) can't place a stale leftover
+// block. Previously both placement call sites used `selected_block` directly,
+// which in CREATIVE mode only ever changes when a Block is picked (so it
+// silently kept its last value while holding a weapon — "blocks stay
+// placeable that shouldn't be" from the bug report), and in SURVIVAL mode
+// was numeric-coincidence-matched against the selected slot's real item and
+// likewise left stale on no match. This recomputes fresh from the actual
+// source of truth each call: `creative_place_item` in creative, the real
+// inventory slot in survival.
+fn held_placeable_block(
+    survival_mode: bool,
+    creative_place_item: Option<unendlich_engine::item::ItemKind>,
+    app: &unendlich_engine::app::App,
+    selected_palette_idx: usize,
+) -> Option<unendlich_engine::world::blocks::BlockId> {
+    use unendlich_engine::world::blocks::BlockId;
+    if !survival_mode {
+        match creative_place_item {
+            Some(unendlich_engine::item::ItemKind::Block(b)) => Some(b),
+            // Holding a weapon/tool/egg/ingot (or nothing picked yet) —
+            // nothing to place.
+            _ => None,
+        }
+    } else {
+        app.inventory().slot(selected_palette_idx).and_then(|stack| {
+            BlockId::ALL.iter().copied().find(|b| *b as u32 == stack.item.0)
+        })
+    }
+}
+
+// r-weapon-fix: element_idx (the legendary-weapon system's own 0..6 element
+// table — see LegendarySpec::element_name: Wood/Water/Air/Dust/Fire/Storm) has
+// no pre-existing mapping onto sim::elemental::Element (Earth/Dust/Fire/
+// Lightning/Air/Water/Wood — a DIFFERENT set, and item.rs's own doc comment
+// is explicit that the two are "deliberately not coupled"). This bin needs
+// *some* Element to hand to sim::combat::Attack for a weapon hit, so this is
+// a presentation-layer choice (not a library-level coupling): map by nearest
+// concept, using Lightning for Storm since Element has no Storm variant.
+fn legendary_element_to_combat_element(element_idx: u8) -> unendlich_engine::sim::elemental::Element {
+    use unendlich_engine::sim::elemental::Element;
+    match element_idx % 6 {
+        0 => Element::Wood,
+        1 => Element::Water,
+        2 => Element::Air,
+        3 => Element::Dust,
+        4 => Element::Fire,
+        _ => Element::Lightning, // Storm
+    }
+}
+
+/// r-weapon-fix: build the real per-weapon `Weapon` stat-block (base_damage,
+/// swing_time, reach, crit_chance/mult — see `sim::legendary_weapon`) for
+/// whatever is currently equipped, so melee combat actually differs by
+/// weapon instead of every hit being an identical fixed Earth/12 regardless
+/// of what's in hand. Two fidelity tiers, by design, not by oversight:
+///
+/// - CREATIVE: `creative_place_item` already carries the FULL `ItemKind` —
+///   no data lost. If it's `Legendary(spec)`, `spec.weapon()` reconstructs
+///   the exact forged stats, element, and ability (e.g. a Storm blade's
+///   Lightning Arc) with full fidelity, immediately, no further plumbing
+///   needed.
+/// - SURVIVAL: the real `Inventory` only stores a bare `ItemId(u32)` — see
+///   `sim::legendary_loot`'s own doc comment, which explicitly frames
+///   preserving a forged weapon's full identity through the inventory as a
+///   separate, not-yet-built "inventory half" of the legendary-weapon
+///   feature (only the "loot half," deciding whether/what drops, exists so
+///   far, and isn't wired to any live game event yet either). Until that
+///   lands, this reconstructs a fixed default-tier, neutral-element
+///   instance of whatever CLASS the id resolves to (via
+///   `weapon_class_for_id`) — real, class-differentiated stats (a dagger
+///   swings fast and light, a greatsword slow and heavy) without pretending
+///   to have per-instance data survival doesn't actually have yet. The seed
+///   is a fixed constant, not random, so re-equipping the same class always
+///   gives identical stats within a session.
+///
+/// Returns `None` for bare hands, a block, or anything that isn't
+/// recognized as a weapon — callers should fall back to unarmed behavior.
+fn equipped_weapon(
+    survival_mode: bool,
+    creative_place_item: Option<unendlich_engine::item::ItemKind>,
+    hand_item: Option<unendlich_engine::items::ItemId>,
+    app: &unendlich_engine::app::App,
+    selected_palette_idx: usize,
+) -> Option<unendlich_engine::sim::legendary_weapon::Weapon> {
+    if !survival_mode {
+        return match creative_place_item {
+            Some(unendlich_engine::item::ItemKind::Legendary(spec)) => Some(spec.weapon()),
+            _ => None,
+        };
+    }
+    // r-weapon-fix: full fidelity first — if the currently-selected slot's
+    // real stack carries a forged instance (see `ItemStack::weapon_instance`),
+    // use it exactly. Only fall back to the class-only default for older/
+    // plainer weapon-class items with no instance data attached.
+    if let Some(stack) = app.inventory().slot(selected_palette_idx) {
+        if let Some(spec) = stack.weapon_instance {
+            return Some(spec.weapon());
+        }
+    }
+    let class = unendlich_engine::sim::viewmodel::weapon_class_for_id(hand_item?.0)?;
+    const DEFAULT_INSTANCE_SEED: u64 = 0xC1A5_5EED;
+    Some(unendlich_engine::sim::legendary_weapon::forge(DEFAULT_INSTANCE_SEED, class, 0, 0))
+}
+
+/// r-swing: f32 (0..1) counterpart to `LegendarySpec::display_color`'s u8
+/// palette, for render call sites (hero_forge's held-item box) that work in
+/// float color space rather than u8. Same element table, same tier brighten
+/// curve, just a different numeric range — kept as a separate small function
+/// rather than converting `display_color`'s u8 output, so there's no lossy
+/// u8->f32->u8 round trip for a value that's already float everywhere it's
+/// consumed here.
+fn legendary_element_color(element_idx: u8, tier: u8) -> [f32; 3] {
+    let base: [f32; 3] = match element_idx % 6 {
+        0 => [0.38, 0.78, 0.38],  // Wood — green
+        1 => [0.31, 0.59, 0.90],  // Water — blue
+        2 => [0.78, 0.90, 1.00],  // Air — pale sky
+        3 => [0.71, 0.59, 0.43],  // Dust — tan
+        4 => [0.90, 0.43, 0.24],  // Fire — orange
+        _ => [0.71, 0.47, 0.94],  // Storm — violet
+    };
+    let boost = (tier as f32 * 0.04).min(0.22);
+    [
+        (base[0] + boost).min(1.0),
+        (base[1] + boost).min(1.0),
+        (base[2] + boost).min(1.0),
+    ]
+}
+
+
 // r124: survival-mode hand-item semantics at the use (right-mouse) event.
 // Returns Some(block) if a place should proceed (consuming happened), None if
 // the event was consumed by eating or denied for lack of items.
@@ -1214,6 +1367,30 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         }
     };
 
+    // r-weapon-fix: TEMPORARY test hook, not a real loot/crafting system —
+    // `sim::legendary_loot` already has a tested, pure "should a legendary
+    // drop, and what" decision core (r330-swords), but nothing in the live
+    // game calls it yet (no creature-kill or chest-loot integration exists).
+    // Designing that drop economy (rates, which creatures/chests, tuning)
+    // is a separate task with real balance implications. This just grants
+    // one real, full-fidelity forged weapon on start so the new
+    // `ItemStack::weapon_instance` path (element/tier/seed preserved
+    // through the inventory, not collapsed to a bare class id) is actually
+    // reachable and testable in survival tonight. Opt-in, same pattern as
+    // `UNENDLICH_COMBAT_MODS`/`UNENDLICH_LIGHTNING_ARC` above.
+    if std::env::var("UNENDLICH_DEBUG_WEAPON").map(|v| v == "1").unwrap_or(false) {
+        use unendlich_engine::item::LegendarySpec;
+        use unendlich_engine::sim::legendary_weapon::WeaponClass;
+        use unendlich_engine::items::{ItemId, ItemStack};
+        let spec = LegendarySpec { seed: 0x7EA1_F1DE, class: WeaponClass::Blade, element_idx: 5, tier: 2 };
+        let id = ItemId(unendlich_engine::sim::viewmodel::weapon_id_for_class(spec.class));
+        fg_app.inventory_mut().set(0, Some(ItemStack::new_weapon(id, 1, spec)));
+        log::info!(
+            "[debug] UNENDLICH_DEBUG_WEAPON granted a {} {} (tier {}) in hotbar slot 1",
+            spec.element_name(), spec.class_name(), spec.tier
+        );
+    }
+
     // Entity registry + a few test mobs near spawn so mob rendering is visible.
     // These sit on the surface (spawn_pos.y is camera height = surface + 4) a few
     // blocks in front of the player. Eventually mobs come from the ambient
@@ -1244,6 +1421,61 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // spawn); ROAMER_CAP bounds the per-frame entity bake.
     let mut spawn_streamer = unendlich_engine::world::spawn_streaming::SpawnStreamer::new(3);
     let mut roamers: Vec<Roamer> = Vec::new();
+    // r-wendigo/r-sabretooth: debug test spawns, same opt-in-env-var pattern as
+    // UNENDLICH_DEBUG_WEAPON. Real gate/mode logic (sim::wendigo, sim::sabretooth)
+    // drives these — NOT a scripted demo — but tracked by a fixed roamer index
+    // rather than a stable ID (this engine's roamers have none), so this is
+    // debug-only: if the tracked roamer dies/despawns before you've tested it,
+    // the index could theoretically be reused by something else. Spawned first,
+    // before any other roamer, specifically so they land at indices 0 and 1 and
+    // that risk stays negligible for a single test session.
+    let wendigo_variant = match std::env::var("UNENDLICH_SPAWN_WENDIGO").ok().as_deref() {
+        Some("vine") => Some(unendlich_engine::sim::wendigo::Variant::Vine),
+        Some("quicksand") => Some(unendlich_engine::sim::wendigo::Variant::Quicksand),
+        Some("stonefall") => Some(unendlich_engine::sim::wendigo::Variant::Stonefall),
+        Some(_) => Some(unendlich_engine::sim::wendigo::Variant::Vine), // any other value = default
+        None => None,
+    };
+    let sabretooth_variant = match std::env::var("UNENDLICH_SPAWN_SABRETOOTH").ok().as_deref() {
+        Some("fire") => Some(unendlich_engine::sim::sabretooth::Variant::Fire),
+        Some(_) => Some(unendlich_engine::sim::sabretooth::Variant::Base),
+        None => None,
+    };
+    let mut wendigo_debug: Option<(usize, unendlich_engine::sim::wendigo::Variant, unendlich_engine::sim::wendigo::Mode, u16, bool)> = None;
+    let mut sabretooth_debug: Option<(usize, unendlich_engine::sim::sabretooth::Variant, unendlich_engine::sim::sabretooth::Mode, u16)> = None;
+    if let Some(variant) = wendigo_variant {
+        let spawn_at = [spawn_pos.x + 6.0, spawn_pos.y - 4.0, spawn_pos.z + 6.0];
+        let mut r = build_roamer(unendlich_engine::item::CreatureKind::Fauna, spawn_at, (spawn_pos.x as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ 0xBEEF);
+        r.hp = 22; // low-health per the design doc, even for the Wendigo family
+        r.creature.tint = match variant {
+            unendlich_engine::sim::wendigo::Variant::Vine => [0.35, 0.85, 0.30],
+            unendlich_engine::sim::wendigo::Variant::Quicksand => [0.80, 0.65, 0.35],
+            unendlich_engine::sim::wendigo::Variant::Stonefall => [0.55, 0.55, 0.58],
+        };
+        roamers.push(r);
+        let idx = roamers.len() - 1;
+        wendigo_debug = Some((idx, variant, unendlich_engine::sim::wendigo::Mode::Dormant, 0, false));
+        log::info!(
+            "[wendigo] debug spawn: {:?} variant at ({:.0},{:.0},{:.0}) — set UNENDLICH_SPAWN_WENDIGO=vine|quicksand|stonefall",
+            variant, spawn_at[0], spawn_at[1], spawn_at[2]
+        );
+    }
+    if let Some(variant) = sabretooth_variant {
+        let spawn_at = [spawn_pos.x - 6.0, spawn_pos.y - 4.0, spawn_pos.z - 6.0];
+        let mut r = build_roamer(unendlich_engine::item::CreatureKind::Fauna, spawn_at, (spawn_pos.z as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ 0x5A6E);
+        r.hp = 18; // "fast, low-health" per the design doc
+        r.creature.tint = match variant {
+            unendlich_engine::sim::sabretooth::Variant::Base => [0.85, 0.55, 0.30],
+            unendlich_engine::sim::sabretooth::Variant::Fire => [0.95, 0.35, 0.15],
+        };
+        roamers.push(r);
+        let idx = roamers.len() - 1;
+        sabretooth_debug = Some((idx, variant, unendlich_engine::sim::sabretooth::Mode::Prowl, 0));
+        log::info!(
+            "[sabretooth] debug spawn: {:?} variant at ({:.0},{:.0},{:.0}) — set UNENDLICH_SPAWN_SABRETOOTH=1|fire",
+            variant, spawn_at[0], spawn_at[1], spawn_at[2]
+        );
+    }
     let mut last_stream_chunk: Option<(i32, i32)> = None;
     // Player position last frame, for estimating how fast (and thus how loudly)
     // the player is moving — what creatures hear.
@@ -1681,6 +1913,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // -----------------------------------------------------------------------
     let mut body: Option<PhysicsBody> = None;
     let mut last_block_action = Instant::now();
+    // r-wendigo: real tool-dependent mining speed for BlockId::Vine, per
+    // sim::wendigo::vine_mine_seconds — the game has no general timed-mining
+    // system (breaking is instant-per-click, gated only by the fixed
+    // BLOCK_ACTION_COOLDOWN_MS below), so this is scoped to vine specifically
+    // rather than a blanket change. Tracks which cell the player has been
+    // continuously aiming a break at and since when; a different cell (or
+    // letting go) resets the clock, same feel as a real "hold to mine".
+    let mut vine_mining_progress: Option<([i32; 3], Instant)> = None;
     /// Cooldown between place/break actions, to avoid breaking 60 blocks per
     /// second when the user holds the mouse button.
     const BLOCK_ACTION_COOLDOWN_MS: u128 = 200;
@@ -3320,7 +3560,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     (-3.0, 0.0, BlockId::Dirt),
                     (0.0, 3.0, BlockId::Grass),
                 ] {
-                    let stack = ItemStack { item: ItemId(block as u32), count: 1 };
+                    let stack = ItemStack { item: ItemId(block as u32), count: 1, weapon_instance: None };
                     fg_app.drops_mut().spawn(
                         stack,
                         [px as f32 + dx, sy as f32 + 1.0, pz as f32 + dz],
@@ -3462,12 +3702,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // selects it. Only valid hotbar slots; the scroll/key handlers below push
         // the reverse direction, so the two stay in sync without fighting.
         if renderer.creative_selected != selected_palette_idx
-            && renderer.creative_selected < PLACE_PALETTE.len()
+            && renderer.creative_selected < renderer.creative_hotbar.len().max(PLACE_PALETTE.len())
         {
             selected_palette_idx = renderer.creative_selected;
-            selected_block = PLACE_PALETTE[selected_palette_idx];
             fg_app.inventory_mut().set_selected(selected_palette_idx);
             if survival_mode {
+                selected_block = PLACE_PALETTE[selected_palette_idx % PLACE_PALETTE.len()];
                 hand_item = fg_app.inventory().slot(selected_palette_idx).map(|s| s.item);
                 if let Some(stack) = fg_app.inventory().slot(selected_palette_idx) {
                     if let Some(b) = unendlich_engine::world::blocks::BlockId::ALL
@@ -3478,6 +3718,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         selected_block = b;
                     }
                 }
+            } else {
+                // r-weapon-fix: creative reads the REAL on-screen hotbar
+                // (creative_hotbar), not PLACE_PALETTE — see
+                // apply_creative_hotbar_slot's doc comment.
+                apply_creative_hotbar_slot(&mut renderer, &mut selected_block, selected_palette_idx);
             }
         }
         // r657: in creative, place the EXACT item the inventory UI shows. The
@@ -3601,17 +3846,21 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
             scroll_accum = 0.0;
         }
-        // r122: scroll wheel cycles the hotbar / place palette (swipe-scroll on
-        // touchpads lands here too). One step per wheel notch, wraps at the ends.
+        // r122: scroll wheel cycles the hotbar (swipe-scroll on touchpads lands
+        // here too). One step per wheel notch, wraps at the ends. Survival
+        // cycles the real inventory's hotbar (9 slots); creative cycles the
+        // real on-screen creative_hotbar (10 slots) — see
+        // apply_creative_hotbar_slot's doc comment for why creative no longer
+        // uses PLACE_PALETTE here.
         while scroll_accum.abs() >= 1.0 && mouse_captured && !ui_scroll_target && !timebend.active {
             let step: i32 = if scroll_accum > 0.0 { -1 } else { 1 }; // scroll up = previous
             scroll_accum -= scroll_accum.signum();
-            let n = PLACE_PALETTE.len() as i32;
+            let n = if survival_mode { PLACE_PALETTE.len() } else { renderer.creative_hotbar.len() } as i32;
             selected_palette_idx =
                 (((selected_palette_idx as i32 + step) % n + n) % n) as usize;
-            selected_block = PLACE_PALETTE[selected_palette_idx];
             fg_app.inventory_mut().set_selected(selected_palette_idx);
             if survival_mode {
+                selected_block = PLACE_PALETTE[selected_palette_idx];
                 // r125: in survival the hand holds the INVENTORY slot's item,
                 // not the creative palette.
                 hand_item = fg_app.inventory().slot(selected_palette_idx).map(|s| s.item);
@@ -3624,6 +3873,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         selected_block = b;
                     }
                 }
+            } else {
+                apply_creative_hotbar_slot(&mut renderer, &mut selected_block, selected_palette_idx);
             }
             log::info!("[hotbar] scroll -> slot {} ({:?})", selected_palette_idx + 1, selected_block);
             // r554: make the selection VISIBLE — drive the hotbar UI highlight (the
@@ -3634,12 +3885,30 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // first-person viewmodel actually renders in CREATIVE too. Previously
         // hand_item was only assigned inside survival-gated branches, so the
         // default (creative) game had an empty hand and drew no viewmodel.
+        //
+        // r-weapon-fix: creative's branch used to derive hand_item by
+        // reinterpreting `selected_block` (a BlockId) as a raw ItemId
+        // (`selected_block as u32`) — which can only ever encode a block.
+        // The creative panel's `creative_place_item` already carries the
+        // FULL picked ItemKind (weapons, tools, eggs — confirmed by its type
+        // and the panel's click handlers), but nothing downstream of the
+        // r657 sync above consumed anything except the `Block` variant, so
+        // picking a weapon from the creative catalog silently vanished
+        // before it could become the held/used item. Route creative's
+        // hand_item through the picked ItemKind directly (via
+        // ItemKind::to_item_id, the documented numeric-id convention) so
+        // any catalog pick — not just blocks — actually gets held.
+        //
+        // Every creative selection path (panel click, G/V cycle, scroll,
+        // number keys, ALT+home-row) now writes through
+        // apply_creative_hotbar_slot / the r657 sync, so creative_place_item
+        // is authoritative INCLUDING when it's None (an empty hotbar slot —
+        // that should mean empty hands, not a stale leftover block). No
+        // selected_block fallback needed anymore.
         hand_item = if survival_mode {
             fg_app.inventory().slot(selected_palette_idx).map(|s| s.item)
-        } else if (selected_block as u32) != 0 {
-            Some(unendlich_engine::items::ItemId(selected_block as u32))
         } else {
-            None
+            renderer.creative_place_item.map(|kind| unendlich_engine::items::ItemId(kind.to_item_id()))
         };
         // r509: keep the equipped-weapon durability tracker in sync with what's held —
         // (re)initialise to full when a different forged weapon becomes the hand item, clear
@@ -4191,6 +4460,123 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // every animation by 1.3s, jerking the camera/gait on top of the low FPS.
         // Was `dt_ms/1000` (unclamped); now the clamped `dt`. Identical below 100ms.
         let frame_dt_s = dt;
+        // r-wendigo/r-sabretooth: debug creature AI tick — real gate/target
+        // logic (sim::wendigo, sim::sabretooth), independent of the roamer
+        // ai_budget/catch-up system elsewhere in this loop, kept separate so
+        // this test wiring can't perturb that system's behavior for other
+        // mobs. Runs every frame regardless of input state (these creatures
+        // act on their own, not on player clicks).
+        if let Some((idx, variant, mode, release_timer, trapped)) = wendigo_debug {
+            if idx < roamers.len() {
+                let p = roamers[idx].creature.body.position;
+                let plr = local_player.view.position;
+                let (dx, dz) = (plr.x - p[0], plr.z - p[2]);
+                let dist = (dx * dx + dz * dz).sqrt();
+                let clim = unendlich_engine::sim::biome_climate::climate_at(0, p[0], p[2], p[1]);
+                let phase = sky_state.day_phase();
+                let is_night = phase > 0.55 && phase < 0.95;
+                let gate = unendlich_engine::sim::wendigo::GateReading {
+                    surface_temp_c: clim.temperature_c as i32,
+                    surface_light: 40, // r-wendigo: no direct per-cell light query wired here yet;
+                    // conservatively treated as dim (favors testability over a stricter gate).
+                    is_night,
+                };
+                // r-wendigo: "warmth" stand-in — real player hunger/vitality
+                // integration is a separate task (see wendigo.rs's doc note);
+                // for THIS debug wiring, being within trigger range at all
+                // counts as "cold enough to be worth hunting" so the ability
+                // is actually reachable to test without needing to also wire
+                // a full player-warmth read.
+                let target = if dist < 20.0 {
+                    Some(unendlich_engine::sim::wendigo::TargetState {
+                        warmth: 0,
+                        distance: unendlich_engine::sim::fixed::Vec3::ZERO,
+                    })
+                } else {
+                    None
+                };
+                let next = unendlich_engine::sim::wendigo::advance(mode, gate, target, release_timer);
+                if next != mode {
+                    log::info!("[wendigo] {:?} {:?} -> {:?} (dist {:.1}, {:.0}C, night={})",
+                        variant, mode, next, dist, clim.temperature_c, is_night);
+                }
+                let next_release = if target.is_some() {
+                    unendlich_engine::sim::wendigo::RELEASE_GRACE_TICKS
+                } else {
+                    release_timer.saturating_sub(1)
+                };
+                // r-wendigo: VINE TRAP — real blocks, placed once per stalk-lock
+                // (not every frame) once close enough to actually threaten the
+                // player. Quicksand/Stonefall variants log their (not-yet-
+                // block-based) trigger instead of placing anything, since their
+                // effects are documented stand-ins (see wendigo.rs doc notes).
+                let mut next_trapped = trapped;
+                if next == unendlich_engine::sim::wendigo::Mode::Stalking && !trapped && dist < 3.0 {
+                    match variant {
+                        unendlich_engine::sim::wendigo::Variant::Vine => {
+                            let feet = [plr.x.floor() as i32, (plr.y - player_eye_height).floor() as i32, plr.z.floor() as i32];
+                            let mut placed = 0;
+                            for pos in unendlich_engine::sim::wendigo::vine_trap_positions(feet) {
+                                let [vx, vy, vz] = pos;
+                                if chunk_manager.block_at(vx, vy, vz) == BlockId::Air
+                                    && chunk_manager.set_block(vx, vy, vz, BlockId::Vine)
+                                {
+                                    placed += 1;
+                                }
+                            }
+                            log::info!("[wendigo] VINE TRAP sprung — {} vine block(s) placed around ({},{},{}); mine free (bring an axe)", placed, feet[0], feet[1], feet[2]);
+                            water_dirty = true;
+                        }
+                        unendlich_engine::sim::wendigo::Variant::Quicksand => {
+                            log::info!("[wendigo] quicksand trigger in range — affliction application not yet wired to the player (see wendigo.rs doc note)");
+                        }
+                        unendlich_engine::sim::wendigo::Variant::Stonefall => {
+                            if let Some(drop) = unendlich_engine::sim::wendigo::stonefall_targets(
+                                [plr.x.floor() as i32, (plr.y - player_eye_height).floor() as i32, plr.z.floor() as i32], 3,
+                            ) {
+                                log::info!("[wendigo] STONEFALL — would deal {} damage, stagger {} ticks at {:?} (player damage-taking not yet wired — see below)", drop.damage, drop.stagger_ticks, drop.land_at);
+                            }
+                        }
+                    }
+                    next_trapped = true;
+                } else if next != unendlich_engine::sim::wendigo::Mode::Stalking {
+                    next_trapped = false; // reset once it disengages, so a later re-stalk can trap again
+                }
+                wendigo_debug = Some((idx, variant, next, next_release, next_trapped));
+            }
+        }
+        if let Some((idx, variant, mode, ticks_in_mode)) = sabretooth_debug {
+            if idx < roamers.len() {
+                let p = roamers[idx].creature.body.position;
+                let plr = local_player.view.position;
+                let (dx, dz) = (plr.x - p[0], plr.z - p[2]);
+                let dist = (dx * dx + dz * dz).sqrt() as i32;
+                let inputs = unendlich_engine::sim::sabretooth::Inputs {
+                    target_distance: Some(dist),
+                    took_damage_last_tick: false,
+                };
+                let next = unendlich_engine::sim::sabretooth::advance(variant, mode, ticks_in_mode, inputs);
+                if next != mode {
+                    log::info!("[sabretooth] {:?} {:?} -> {:?} (dist {})", variant, mode, next, dist);
+                }
+                let next_ticks = if next == mode { ticks_in_mode + 1 } else { 0 };
+                // r-sabretooth: real motion on the committed actions — a visible
+                // lunge/dash toward the player — so this is testable by feel, not
+                // just log lines. Damage-to-player is NOT wired (no general
+                // "mob damages player" pipeline exists yet in survival — flagged
+                // honestly rather than guessed at); the creature still visibly
+                // commits to the attack.
+                if matches!(next, unendlich_engine::sim::sabretooth::Mode::Pounce
+                    | unendlich_engine::sim::sabretooth::Mode::FireRush) && dist > 0
+                {
+                    let speed = if next == unendlich_engine::sim::sabretooth::Mode::FireRush { 14.0 } else { 9.0 };
+                    let inv = 1.0 / (dist as f32).max(1.0);
+                    roamers[idx].creature.body.velocity[0] = dx * inv * speed;
+                    roamers[idx].creature.body.velocity[2] = dz * inv * speed;
+                }
+                sabretooth_debug = Some((idx, variant, next, next_ticks));
+            }
+        }
         // POSITION WATCHDOG (found by the first headless lavapipe soak: the
         // player's position went non-finite, its chunk coord collapsed to
         // i32::MIN, and the eviction membership check crashed on i32
@@ -4534,6 +4920,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         unendlich_engine::items::ItemStack {
                             item: unendlich_engine::items::ItemId(MEAT_ITEM),
                             count: 1,
+                            weapon_instance: None,
                         },
                         [p[0], p[1] + 0.4, p[2]],
                         [0.0, 1.0, 0.0],
@@ -6547,6 +6934,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                             unendlich_engine::items::ItemStack {
                                                 item: unendlich_engine::items::ItemId(id as u32),
                                                 count: count as u16,
+                                                weapon_instance: None,
                                             },
                                             [p[0] + a.cos() * 0.3, p[1] + 0.6, p[2] + a.sin() * 0.3],
                                             [a.cos() * 1.4, 2.0, a.sin() * 1.4],
@@ -6582,8 +6970,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 const INGOT_BASE: u32 = 1000;
                 let ing = |b: BlockId, n: u16| (id(b), n);
                 let metal = |idx: u32, n: u16| (ItemId(INGOT_BASE + idx), n);
-                let out = |item: u32, count: u16| ItemStack { item: ItemId(item), count };
-                let out_b = |b: BlockId, count: u16| ItemStack { item: id(b), count };
+                let out = |item: u32, count: u16| ItemStack { item: ItemId(item), count, weapon_instance: None };
+                let out_b = |b: BlockId, count: u16| ItemStack { item: id(b), count, weapon_instance: None };
                 // r552: a real survival crafting tree — smelting, building stock, the
                 // forged WEAPONS (gather→smelt→forge→fight loop) and cooking. Weapon
                 // ids 4000..4007 = Dagger/Blade/Greatsword/Axe/Greataxe/Spear/Staff/
@@ -9264,6 +9652,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         unendlich_engine::items::ItemStack {
                             item: unendlich_engine::items::ItemId(MEAT_ITEM),
                             count: 1,
+                            weapon_instance: None,
                         },
                         [p[0], p[1] + 0.4, p[2]],
                         [0.0, 1.2, 0.0],
@@ -9441,11 +9830,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 if !renderer.ui_wants_keyboard
                     && bindings.is_action_just_pressed(*action, &input)
                 {
-                    selected_block = PLACE_PALETTE[i];
                     selected_palette_idx = i; // r122: keep scroll cursor in sync
                     renderer.creative_selected = i; // r554: move the hotbar UI highlight
                     fg_app.inventory_mut().set_selected(i); // r120: hotbar cursor follows
                     if survival_mode {
+                        selected_block = PLACE_PALETTE[i];
                         hand_item = fg_app.inventory().slot(i).map(|s| s.item);
                         if let Some(stack) = fg_app.inventory().slot(i) {
                             if let Some(b) = unendlich_engine::world::blocks::BlockId::ALL
@@ -9456,6 +9845,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 selected_block = b; // r125: hand = inventory item
                             }
                         }
+                    } else {
+                        // r-weapon-fix: creative reads the REAL on-screen hotbar
+                        // (creative_hotbar), not PLACE_PALETTE.
+                        apply_creative_hotbar_slot(&mut renderer, &mut selected_block, i);
                     }
                     log::info!("Selected place block: {:?}", selected_block);
                 }
@@ -9472,11 +9865,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 ];
                 for (slot, &kc) in HOMEROW_KEYS.iter().enumerate() {
                     if slot < PLACE_PALETTE.len() && input.is_key_just_pressed(kc) {
-                        selected_block = PLACE_PALETTE[slot];
                         selected_palette_idx = slot;
                         renderer.creative_selected = slot;
                         fg_app.inventory_mut().set_selected(slot);
                         if survival_mode {
+                            selected_block = PLACE_PALETTE[slot];
                             hand_item = fg_app.inventory().slot(slot).map(|s| s.item);
                             if let Some(stack) = fg_app.inventory().slot(slot) {
                                 if let Some(b) = BlockId::ALL
@@ -9487,6 +9880,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     selected_block = b;
                                 }
                             }
+                        } else {
+                            // r-weapon-fix: creative reads the REAL on-screen
+                            // hotbar (creative_hotbar), not PLACE_PALETTE.
+                            apply_creative_hotbar_slot(&mut renderer, &mut selected_block, slot);
                         }
                         log::info!("[hotbar] alt+home-row -> slot {}", slot + 1);
                         break;
@@ -9655,6 +10052,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // through the REAL sim::combat::resolve (no shield/armor, fresh
                 // affliction set), so the elemental pipeline is live.
                 let mut creature_hit = click_fed_creature; // feeding consumed the click
+                // r-weapon-fix: build the real weapon stat-block ONCE per swing
+                // (needed for both the hit-detection reach below and the damage/
+                // crit resolution after) instead of every hit using a fixed
+                // reach/damage/crit regardless of what's equipped.
+                let weapon = equipped_weapon(survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx);
+                let attack_reach = weapon.as_ref().map_or(1.2, |w| w.reach);
                 if break_allowed && !click_fed_creature {
                     let eye = local_player.view.position;
                     let dir = cam_forward;
@@ -9663,7 +10066,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         let p = r.creature.body.position;
                         let to = glm::vec3(p[0] - eye.x, p[1] - eye.y, p[2] - eye.z);
                         let along = glm::dot(&to, &dir);
-                        if !(0.5..=4.0).contains(&along) {
+                        if !(0.5..=attack_reach.max(0.5 + 0.01)).contains(&along) {
                             continue;
                         }
                         let closest = eye + dir * along;
@@ -9676,14 +10079,36 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         }
                     }
                     if let Some((ri, _)) = best {
-                        let attack = unendlich_engine::sim::combat::Attack {
-                            element: unendlich_engine::sim::elemental::Element::Earth,
-                            magnitude: 12,
-                            affliction_ticks: 0,
+                        // r-weapon-fix: was a fixed `{ element: Earth, magnitude: 12 }`
+                        // regardless of what was equipped, so every attack — bare
+                        // hands, dagger, or greatsword — dealt identical damage.
+                        // See `equipped_weapon`'s doc comment for the two fidelity
+                        // tiers (full spec in creative, class-only default in
+                        // survival until the inventory carries per-instance data).
+                        let attack = match &weapon {
+                            Some(w) => unendlich_engine::sim::combat::Attack {
+                                element: legendary_element_to_combat_element(w.element_idx),
+                                magnitude: w.base_damage.round().max(1.0) as u16,
+                                affliction_ticks: 0,
+                            },
+                            // Bare-fist fallback — deliberately weaker than any
+                            // forged weapon's damage range (4..45 across classes/
+                            // tiers), so equipping something is felt as an upgrade.
+                            None => unendlich_engine::sim::combat::Attack {
+                                element: unendlich_engine::sim::elemental::Element::Earth,
+                                magnitude: 4,
+                                affliction_ticks: 0,
+                            },
                         };
                         let mut aff = unendlich_engine::sim::affliction::Afflicted::new();
                         let hit = unendlich_engine::sim::combat::resolve(&attack, None, None, &mut aff);
                         // r268: crit + armor modifiers (off by default → flat damage).
+                        // r-weapon-fix: crit chance/multiplier now come from the
+                        // equipped weapon's own archetype (a dagger crits far more
+                        // often than a greataxe) instead of a fixed 0.2/1.8 for
+                        // every weapon and bare hands alike.
+                        let (crit_chance, crit_mult) = weapon.as_ref()
+                            .map_or((0.2, 1.8), |w| (w.crit_chance, w.crit_mult));
                         let dmg_dealt: i32 = if combat_mods_enabled {
                             let raw = hit.health_damage as f32;
                             // deterministic crit roll from frame + target identity
@@ -9691,7 +10116,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 .wrapping_mul(0x9E37_79B9)
                                 .wrapping_add(ri as u64);
                             let roll = ((roll_seed >> 40) & 0xFFFF) as f32 / 65535.0;
-                            let crit_dmg = unendlich_engine::sim::crit_roll::crit(roll, 0.2, 1.8);
+                            let crit_dmg = unendlich_engine::sim::crit_roll::crit(roll, crit_chance, crit_mult);
                             // natural armor from body mass (bigger = tougher hide)
                             let armor = (roamers[ri].creature.mass * 2.0).clamp(0.0, 30.0);
                             let mitig = unendlich_engine::sim::damage_after_armor::mitigated(
@@ -9857,6 +10282,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     unendlich_engine::items::ItemStack {
                                         item: unendlich_engine::items::ItemId(3000 + elem as u32),
                                         count,
+                                        weapon_instance: None,
                                     },
                                     [p[0], p[1] + 1.0, p[2]],
                                     [0.4, 2.4, -0.3],
@@ -9878,6 +10304,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 unendlich_engine::items::ItemStack {
                                     item: unendlich_engine::items::ItemId(MEAT_ITEM),
                                     count: meat_n,
+                                    weapon_instance: None,
                                 },
                                 [p[0], p[1] + 0.6, p[2]],
                                 [0.0, 2.0, 0.0],
@@ -9895,6 +10322,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     unendlich_engine::items::ItemStack {
                                         item: unendlich_engine::items::ItemId(999),
                                         count: 1,
+                                        weapon_instance: None,
                                     },
                                     [p[0] + 0.3, p[1] + 0.7, p[2]],
                                     [0.5, 2.2, 0.2],
@@ -9909,9 +10337,34 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     }
                 }
                 if break_allowed && !creature_hit {
-                    // Break: replace hit block with air.
+                    // r-wendigo: vine cells need real continuous mining time
+                    // (tool-dependent, see vine_mine_seconds) before they
+                    // actually break — everything else keeps the existing
+                    // instant-on-click behavior unchanged.
+                    let vine_ready = if hit_block_id == BlockId::Vine {
+                        let tool = hand_item.and_then(|h| unendlich_engine::sim::viewmodel::weapon_class_for_id(h.0));
+                        let need = unendlich_engine::sim::wendigo::vine_mine_seconds(tool);
+                        match vine_mining_progress {
+                            Some((pos, started)) if pos == hit_cell => {
+                                if started.elapsed().as_secs_f32() >= need {
+                                    vine_mining_progress = None;
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            _ => {
+                                vine_mining_progress = Some((hit_cell, Instant::now()));
+                                false
+                            }
+                        }
+                    } else {
+                        vine_mining_progress = None;
+                        true
+                    };
+                // Break: replace hit block with air.
                     let [x, y, z] = hit_cell;
-                    if chunk_manager.set_block(x, y, z, BlockId::Air) {
+                    if vine_ready && chunk_manager.set_block(x, y, z, BlockId::Air) {
                         log::info!("Broke {:?} at ({},{},{})", hit_block_id, x, y, z);
                         // r512: SEEDS FROM GRASS — breaking wild ground cover sometimes yields a
                         // vegetable, so a survival player can find their first crop and start a
@@ -9928,6 +10381,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     unendlich_engine::items::ItemStack {
                                         item: unendlich_engine::items::ItemId(veg as u32),
                                         count: 1,
+                                        weapon_instance: None,
                                     },
                                     [x as f32 + 0.5, y as f32 + 0.4, z as f32 + 0.5],
                                     [0.0, 1.4, 0.0],
@@ -9947,6 +10401,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     unendlich_engine::items::ItemStack {
                                         item: unendlich_engine::items::ItemId(BlockId::Sprout as u32),
                                         count: 1,
+                                        weapon_instance: None,
                                     },
                                     [x as f32 + 0.5, y as f32 + 0.4, z as f32 + 0.5],
                                     [0.0, 1.4, 0.0],
@@ -9965,6 +10420,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     unendlich_engine::items::ItemStack {
                                         item: unendlich_engine::items::ItemId(APPLE_ITEM),
                                         count: 1,
+                                        weapon_instance: None,
                                     },
                                     [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5],
                                     [0.0, 1.2, 0.0],
@@ -10006,6 +10462,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     unendlich_engine::items::ItemStack {
                                         item: unendlich_engine::items::ItemId(seed as u32),
                                         count: 1,
+                                        weapon_instance: None,
                                     },
                                     [x as f32 + 0.5, y as f32 + 0.4, z as f32 + 0.5],
                                     [0.0, 1.5, 0.0],
@@ -10048,6 +10505,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     unendlich_engine::items::ItemStack {
                                         item: unendlich_engine::items::ItemId(cell.block as u32),
                                         count: 1,
+                                        weapon_instance: None,
                                     },
                                     [x as f32 + 0.5, y as f32 + 0.4, z as f32 + 0.5],
                                     [a.cos() * 1.2, 1.6, a.sin() * 1.2],
@@ -10106,6 +10564,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                                     3000 + i as u32,
                                                 ),
                                                 count,
+                                                weapon_instance: None,
                                             },
                                             [x as f32 + 0.5, y as f32 + 0.6, z as f32 + 0.5],
                                             [0.3, 2.2, -0.2],
@@ -10217,6 +10676,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     let stack = unendlich_engine::items::ItemStack {
                                         item: unendlich_engine::items::ItemId(dropped as u32),
                                         count: 1,
+                                        weapon_instance: None,
                                     };
                                     fg_app.drops_mut().spawn(
                                         stack,
@@ -10282,17 +10742,22 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             // accidentally aims at their own feet.
                             // No-op.
                         } else if !click_fed_creature {
-                            let go = if !survival_mode {
-                                Some(selected_block)
-                            } else if matches!(selected_block, BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout)
-                                && matches!(chunk_manager.block_at(x, y - 1, z), BlockId::Grass | BlockId::Dirt)
-                                && fg_app.inventory().count(unendlich_engine::items::ItemId(selected_block as u32)) > 0
-                            {
-                                // r512: PLANT on tilled soil — consume one and place it (registered below).
-                                let _ = fg_app.inventory_mut().remove_item(unendlich_engine::items::ItemId(selected_block as u32), 1);
-                                Some(selected_block)
-                            } else {
-                                survival_use_item(&mut fg_app, selected_block, hand_item)
+                            let go = match held_placeable_block(
+                                survival_mode, renderer.creative_place_item, &fg_app, selected_palette_idx,
+                            ) {
+                                None => None, // holding a weapon/tool/egg — nothing to place
+                                Some(b) if !survival_mode => Some(b),
+                                Some(b)
+                                    if matches!(b, BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout)
+                                    && matches!(chunk_manager.block_at(x, y - 1, z), BlockId::Grass | BlockId::Dirt)
+                                    && fg_app.inventory().count(unendlich_engine::items::ItemId(b as u32)) > 0
+                                =>
+                                {
+                                    // r512: PLANT on tilled soil — consume one and place it (registered below).
+                                    let _ = fg_app.inventory_mut().remove_item(unendlich_engine::items::ItemId(b as u32), 1);
+                                    Some(b)
+                                }
+                                Some(b) => survival_use_item(&mut fg_app, b, hand_item),
                             };
                             if let Some(blk) = go {
                                 if chunk_manager.set_block(x, y, z, blk) {
@@ -10423,18 +10888,23 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             }
                         }
                     } else if !click_fed_creature {
-                        let go = if !survival_mode {
-                                Some(selected_block)
-                            } else if matches!(selected_block, BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout)
+                        let go = match held_placeable_block(
+                            survival_mode, renderer.creative_place_item, &fg_app, selected_palette_idx,
+                        ) {
+                            None => None, // holding a weapon/tool/egg — nothing to place
+                            Some(b) if !survival_mode => Some(b),
+                            Some(b)
+                                if matches!(b, BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout)
                                 && matches!(chunk_manager.block_at(x, y - 1, z), BlockId::Grass | BlockId::Dirt)
-                                && fg_app.inventory().count(unendlich_engine::items::ItemId(selected_block as u32)) > 0
+                                && fg_app.inventory().count(unendlich_engine::items::ItemId(b as u32)) > 0
+                            =>
                             {
                                 // r512: PLANT on tilled soil — consume one and place it (registered below).
-                                let _ = fg_app.inventory_mut().remove_item(unendlich_engine::items::ItemId(selected_block as u32), 1);
-                                Some(selected_block)
-                            } else {
-                                survival_use_item(&mut fg_app, selected_block, hand_item)
-                            };
+                                let _ = fg_app.inventory_mut().remove_item(unendlich_engine::items::ItemId(b as u32), 1);
+                                Some(b)
+                            }
+                            Some(b) => survival_use_item(&mut fg_app, b, hand_item),
+                        };
                         if let Some(blk) = go {
                             if chunk_manager.set_block(x, y, z, blk) {
                                 log::info!("Placed {:?} at ({},{},{}) on {:?} face", blk, x, y, z, hit_face);
@@ -11246,6 +11716,27 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         } else {
                             None
                         };
+                        // v-seam: fetch loaded face-neighbors so the CPU
+                        // greedy mesher (used when lod == Near) can cull
+                        // boundary faces against them. `get_chunk` is a
+                        // cheap Arc clone off the DashMap; a `None` slot
+                        // (neighbor not loaded) falls back to the
+                        // pre-existing Air-at-edge behavior, so this can
+                        // never punch a hole at the edge of loaded terrain.
+                        let neighbors = unendlich_engine::render::mesher::NeighborChunks {
+                            neg_x: chunk_manager.get_chunk(
+                                unendlich_engine::world::chunk::ChunkCoord::new(coord.x - 1, coord.y, coord.z)),
+                            pos_x: chunk_manager.get_chunk(
+                                unendlich_engine::world::chunk::ChunkCoord::new(coord.x + 1, coord.y, coord.z)),
+                            neg_y: chunk_manager.get_chunk(
+                                unendlich_engine::world::chunk::ChunkCoord::new(coord.x, coord.y - 1, coord.z)),
+                            pos_y: chunk_manager.get_chunk(
+                                unendlich_engine::world::chunk::ChunkCoord::new(coord.x, coord.y + 1, coord.z)),
+                            neg_z: chunk_manager.get_chunk(
+                                unendlich_engine::world::chunk::ChunkCoord::new(coord.x, coord.y, coord.z - 1)),
+                            pos_z: chunk_manager.get_chunk(
+                                unendlich_engine::world::chunk::ChunkCoord::new(coord.x, coord.y, coord.z + 1)),
+                        };
                         let req = MeshRequest {
                             coord,
                             epoch: chunk_manager.world_epoch(), // r195: stamp at submit
@@ -11263,6 +11754,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             // worker uses this; in other modes the
                             // field is ignored.
                             octree: chunk_manager.octree(coord),
+                            neighbors,
                         };
 
                         // v0.24.32-pool-prewarm: in mode 2, ensure
@@ -12320,17 +12812,26 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         }
                         // (walk_phase + walk_amp are passed to the hero rig, which
                         // derives the limb swing / bob / twist itself.)
-                        // r545: equipped-item colour for the hero's hand (simple
-                        // category map; None = empty-handed) + a continuous anim clock
-                        // for idle breathing.
-                        let held_color = hand_item.map(|h| match h.0 {
-                            4000..=4007 => [0.72, 0.74, 0.80], // forged weapon — steel
-                            1000 => [0.85, 0.72, 0.30],        // gold ingot
-                            1001 => [0.78, 0.78, 0.82],        // iron ingot
-                            2000 => [0.75, 0.30, 0.28],        // raw meat
-                            2001 => [0.62, 0.40, 0.26],        // cooked meat
-                            _ => [0.55, 0.45, 0.35],           // generic held item
-                        });
+                        // r545/r-swing: equipped-item colour for the hero's hand. Weapons
+                        // now use the REAL element-tinted colour (LegendarySpec::
+                        // display_color's Wood/Water/Air/Dust/Fire/Storm palette, via
+                        // equipped_weapon — the same reconstruction combat uses), instead
+                        // of a flat "steel grey" for every weapon regardless of element;
+                        // a Fire dagger and a Storm dagger now visibly differ in the
+                        // third-person hand, not just in the inventory icon and damage.
+                        let held_color = if let Some(w) = equipped_weapon(
+                            survival_mode, renderer.creative_place_item, hand_item, &fg_app, selected_palette_idx,
+                        ) {
+                            Some(legendary_element_color(w.element_idx, w.tier))
+                        } else {
+                            hand_item.map(|h| match h.0 {
+                                1000 => [0.85, 0.72, 0.30],        // gold ingot
+                                1001 => [0.78, 0.78, 0.82],        // iron ingot
+                                2000 => [0.75, 0.30, 0.28],        // raw meat
+                                2001 => [0.62, 0.40, 0.26],        // cooked meat
+                                _ => [0.55, 0.45, 0.35],           // generic held item
+                            })
+                        };
                         // r570: airborne/landing pose drive. Ease `hero_airborne01` toward
                         // 1 while off the ground (body=None ⇒ creative flight ⇒ also airborne),
                         // and decay the landing crouch pulse over ~¼ s. vertical_vel comes from
@@ -12373,6 +12874,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             land_crouch: hero_land_crouch,
                             flight01: hero_flight01,
                             bank: hero_bank,
+                            // r-swing: reuse the SAME timer/shape driving the first-
+                            // person viewmodel's swing overlay a few hundred lines
+                            // below, so the hero's arm and the held item in first
+                            // person move through the exact same arc in lockstep.
+                            swing01: if swing_timer > 0.0 {
+                                let prog = 1.0 - (swing_timer / SWING_DURATION).clamp(0.0, 1.0);
+                                (prog * std::f32::consts::PI).sin()
+                            } else {
+                                0.0
+                            },
                         };
                         unendlich_engine::hero_forge::build(
                             kind,
