@@ -5490,8 +5490,35 @@ bo-mux 271/271, bo-suite-egui 416/416.
 
   416/416.
 
-- **C97b — `status` is still uncalled.** It is what would make
-  `scene_playing` a REPORT rather than a guess: right now the flag
-  records what this UI asked for, and a scene started from the CLI or
-  stopped by the daemon would leave it wrong. Polling it needs a
-  cadence decision — every frame is a socket connect per frame.
+- **C97b — DONE. `poll_daemon`, every two seconds.**
+
+  `status` returns exactly the two fields the UI was guessing at —
+  `loaded` and `playing` — so the daemon's answer now WINS over the
+  local flag. That is the point: it knows, and this UI was guessing.
+
+  **Two seconds, and the number has a reason.** `control::send` opens a
+  UNIX SOCKET per call, so per-frame polling is sixty connects a second
+  for a value that changes when somebody presses a button. Two seconds
+  is slower than a person notices on an ambience track and cheap enough
+  to leave running.
+
+  Three details:
+  - **A failed poll is silent** but clears `scene_playing`. A daemon
+    that is not running is not an error worth showing every two seconds
+    — the scene buttons already report failures when a person actually
+    presses one, which is when they are asking. And nothing is playing
+    if nothing is running.
+  - **A null `loaded` CLEARS the name; an absent key does not.** Null is
+    a real answer ("nothing is loaded"); a missing field is a daemon
+    that stopped reporting, which is not the same claim.
+  - **`is_null()` rather than matching `serde_json::Value`**, so the
+    frontend does not take serde_json as a direct dependency for one
+    pattern.
+
+  Three tests, driven with a frame-sized dt and asserting the
+  ACCUMULATOR — the call itself needs a daemon, but the throttle is the
+  load-bearing part and is testable without one. One of them pins that
+  the clock RESETS: without it the throttle works exactly once and then
+  fires every frame forever.
+
+  419/419.

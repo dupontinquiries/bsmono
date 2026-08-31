@@ -437,6 +437,8 @@ pub struct Controller {
     /// one button for both would make stopping the music stop the
     /// ambience.
     pub scene_playing: bool,
+    /// Seconds since the last status poll.
+    pub status_age: f32,
     pub settings: crate::settings_page::SettingsPage,
     pub sinks: crate::settings_page::SinkPicker,
     pub now: crate::chrome::NowPlaying,
@@ -461,7 +463,7 @@ pub struct Controller {
 impl Controller {
     pub fn new(devices: Vec<Device>, scenes: Vec<Scene>) -> Self {
         Controller { nav: uikit_egui::nav::Nav::new(VIEWS.len()), scene_loaded: None,
-            scene_seq: 0, scene_playing: false,
+            scene_seq: 0, scene_playing: false, status_age: 0.0,
             strip: uikit_egui::segmented_tabs::TabStrip::new(&VIEWS),
             devices, scenes, active_scene: 0,
             breath: uikit_egui::motion::Breath::new(2200.0, 0.35, 1.0),
@@ -666,6 +668,7 @@ impl Controller {
             // that changes height.
             let dt = ui.input(|i| i.stable_dt);
             self.safety.tick(dt);
+            self.poll_daemon(dt);
             // The playback position, interpolated between network reports. Its
             // own doc: "advance the local clock between reports, so the bar
             // moves smoothly rather than stuttering one packet at a time" —
@@ -990,6 +993,60 @@ impl Controller {
         ids.iter().filter_map(|id| self.browse_tracks.iter().find(|t| t.id == *id))
             .map(|t| (t.id, t.title.clone(), t.primary_artist.clone()))
             .collect()
+    }
+
+    /// How often to ask the daemon what it is doing.
+    ///
+    /// Two seconds. `control::send` opens a UNIX SOCKET per call, so
+    /// per-frame polling is sixty connects a second for a value that
+    /// changes when somebody presses a button. Two seconds is slower
+    /// than a person can notice for an ambience track and cheap enough
+    /// to leave running.
+    const STATUS_EVERY_S: f32 = 2.0;
+
+    /// Ask the daemon what is actually loaded and playing.
+    ///
+    /// This is what turns `scene_playing` from a GUESS into a REPORT.
+    /// Before it, the flag recorded what this UI had asked for — so a
+    /// scene started from the CLI, or stopped by the daemon itself,
+    /// left the indicator wrong with no way to notice.
+    fn poll_daemon(&mut self, dt: f32) {
+        self.status_age += dt;
+        if self.status_age < Self::STATUS_EVERY_S {
+            return;
+        }
+        self.status_age = 0.0;
+        self.scene_seq += 1;
+        let Ok(v) = bo_mux::control::status(self.scene_seq) else {
+            // A daemon that is not running is not an error to show every
+            // two seconds. The scene controls already report a failure
+            // when a person actually presses one, which is when they are
+            // asking. `scene_playing` is cleared because nothing is
+            // playing if nothing is running.
+            self.scene_playing = false;
+            return;
+        };
+        // The daemon's answer WINS over the local flag. That is the
+        // whole point: it knows, and this UI was guessing.
+        if let Some(p) = v.get("playing").and_then(|x| x.as_bool()) {
+            self.scene_playing = p;
+        }
+        // `loaded` is null when nothing is loaded, which is a real
+        // ANSWER and not a missing field — so a null clears the name
+        // rather than leaving a stale one on screen.
+        //
+        // Distinguished by `is_null` rather than matching
+        // `serde_json::Value`, so this crate does not need serde_json as
+        // a direct dependency for one pattern. An ABSENT key is left
+        // alone: a daemon that stopped reporting a field is not a daemon
+        // saying "nothing is loaded".
+        if let Some(l) = v.get("loaded") {
+            if l.is_null() {
+                self.scene_loaded = None;
+            } else if let Some(n) = l.as_str() {
+                self.scene_loaded = Some(n.to_string());
+            }
+        }
     }
 
     /// Reflect a queue entry as the thing now playing.
@@ -1587,6 +1644,43 @@ mod tests {
         // is a `pub` helper in a crate whose panics land in draw paths.
         assert_eq!(page(0, 1, 0), 0);
         assert_eq!(page(5, -1, 0), 0);
+    }
+
+    #[test]
+    fn the_status_poll_is_throttled_not_per_frame() {
+        // `control::send` opens a unix socket per call, so a per-frame
+        // poll is sixty connects a second for a value that changes when
+        // somebody presses a button.
+        //
+        // Driven with a frame-sized dt and asserted on the ACCUMULATOR,
+        // because the call itself needs a daemon: at 60fps the age must
+        // still be climbing after ten frames rather than resetting.
+        let mut c = Controller::new(Vec::new(), Vec::new());
+        for _ in 0..10 {
+            c.poll_daemon(1.0 / 60.0);
+        }
+        assert!(c.status_age > 0.0, "the poll fired every frame");
+        assert!(c.status_age < Controller::STATUS_EVERY_S);
+    }
+
+    #[test]
+    fn a_poll_past_the_interval_resets_the_clock() {
+        // Without the reset the poll fires every frame forever after the
+        // first interval elapses — the throttle would work once.
+        let mut c = Controller::new(Vec::new(), Vec::new());
+        c.poll_daemon(Controller::STATUS_EVERY_S + 1.0);
+        assert_eq!(c.status_age, 0.0);
+    }
+
+    #[test]
+    fn no_daemon_means_nothing_is_playing() {
+        // There is no daemon in a test run, so this exercises the real
+        // path: a failed status must not leave a stale "playing" on
+        // screen.
+        let mut c = Controller::new(Vec::new(), Vec::new());
+        c.scene_playing = true;
+        c.poll_daemon(Controller::STATUS_EVERY_S + 1.0);
+        assert!(!c.scene_playing);
     }
 
     #[test]
