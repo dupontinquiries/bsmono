@@ -257,6 +257,69 @@ impl Assignment {
     }
 }
 
+/// Assign speakers to positions.
+///
+/// The rules above are what make this worth drawing: every one of them is
+/// a mistake that otherwise reaches your ears instead of the screen. The
+/// panel shows the layout it adds up to, and the problems, as you go —
+/// not on commit, because a validation that only appears when you press
+/// the button is one you meet after deciding you were finished.
+///
+/// Returns true when something changed, so a caller can persist once
+/// rather than every frame.
+pub fn assign_ui(ui: &mut egui::Ui, a: &mut Assignment,
+                 speakers: &[(String, String)],
+                 c: &uikit_egui::PaletteColors) -> bool {
+    let mut changed = false;
+    if speakers.is_empty() {
+        ui.colored_label(c.text_weak, "no speakers — pair one on the Connect page");
+        return false;
+    }
+    for (id, label) in speakers {
+        ui.horizontal(|ui| {
+            ui.label(label);
+            let cur = a.channel_of(id);
+            // "off" FIRST and always available: a speaker you cannot take
+            // out of the arrangement is one you have to clear the whole
+            // room to remove.
+            if ui.selectable_label(cur.is_none(), "off").clicked() && cur.is_some() {
+                a.remove(id);
+                changed = true;
+            }
+            for ch in [Channel::Stereo, Channel::FrontLeft, Channel::FrontRight,
+                       Channel::FrontCenter, Channel::Lfe,
+                       Channel::RearLeft, Channel::RearRight] {
+                if ui.selectable_label(cur == Some(ch), ch.label()).clicked()
+                    && cur != Some(ch) {
+                    a.place(id, label, ch);
+                    changed = true;
+                }
+            }
+        });
+    }
+
+    ui.separator();
+    let problems = a.problems();
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(a.layout().label()).strong());
+        // The count, so the label can be checked against the rows above
+        // before committing — the same reason the combine button names
+        // its number.
+        ui.colored_label(c.text_weak, format!("· {} speaker(s)", a.speakers.len()));
+    });
+    for p in &problems {
+        // Colour by severity, because they are not the same: one refuses
+        // to route and one is a note. Showing both the same way makes the
+        // note look fatal and the fault look optional.
+        let fatal = matches!(p, Problem::Unpaired(_) | Problem::Empty);
+        ui.colored_label(if fatal { c.warning } else { c.text_weak }, p.message());
+    }
+    if a.routable() {
+        ui.colored_label(c.text_weak, "ready");
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +443,78 @@ pub fn sink_of(a: &Assignment) -> Option<crate::playback::Sink> {
             .collect(),
         channel_map: a.channel_map(),
     })
+}
+
+/// The panel, through real frames.
+///
+/// The rules are tested above as data. These check that a person can SEE
+/// them — a validation nobody is shown is a validation that does not
+/// exist, which is most of what this module is for.
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    fn speakers() -> Vec<(String, String)> {
+        vec![("l".into(), "Living Room".into()), ("k".into(), "Kitchen".into())]
+    }
+
+    fn draw(a: &mut Assignment, sp: &[(String, String)]) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let c = uikit_egui::palette_colors("amber");
+        let out = ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                                                        egui::vec2(500.0, 700.0))),
+            ..Default::default()
+        }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| { assign_ui(ui, a, sp, &c); });
+        });
+        out.shapes.iter().filter_map(|s| match &s.shape {
+            egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn a_half_assigned_pair_says_what_will_be_missing() {
+        // Not "invalid configuration" — which speaker, and what it will
+        // sound like.
+        let mut a = Assignment::default();
+        a.place("l", "Living Room", Channel::FrontLeft);
+        let texts = draw(&mut a, &speakers());
+        let joined = texts.join(" | ");
+        assert!(joined.contains("front right"), "{joined}");
+        assert!(joined.contains("missing"), "{joined}");
+        assert!(!joined.contains("ready"), "an unroutable room said it was ready");
+    }
+
+    #[test]
+    fn a_valid_room_says_so_and_names_its_layout() {
+        let mut a = Assignment::default();
+        a.place("l", "Living Room", Channel::FrontLeft);
+        a.place("k", "Kitchen", Channel::FrontRight);
+        let joined = draw(&mut a, &speakers()).join(" | ");
+        assert!(joined.contains("ready"), "{joined}");
+        assert!(joined.contains("stereo"), "the layout is not named: {joined}");
+    }
+
+    #[test]
+    fn every_speaker_can_be_taken_out_again() {
+        // A speaker you cannot remove means clearing the whole room to
+        // change your mind about one of them.
+        let mut a = Assignment::default();
+        a.place("l", "Living Room", Channel::FrontLeft);
+        let joined = draw(&mut a, &speakers()).join(" | ");
+        assert!(joined.contains("off"), "no way to unassign: {joined}");
+    }
+
+    #[test]
+    fn with_no_speakers_it_points_at_where_pairing_happens() {
+        // An empty panel with no explanation reads as broken; the user
+        // cannot pair from here.
+        let mut a = Assignment::default();
+        let joined = draw(&mut a, &[]).join(" | ");
+        assert!(joined.contains("Connect"), "{joined}");
+    }
 }
 
 #[cfg(test)]

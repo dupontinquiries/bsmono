@@ -362,6 +362,10 @@ pub struct Controller {
     /// after `apply_settings` gets it too — a device that appears mid-
     /// session would otherwise animate at full speed under reduce-motion.
     pub motion_scale: f32,
+    /// Which speaker is which, for surround. Held beside the picker rather
+    /// than inside it: the picker answers "which speakers", and this
+    /// answers "where they are" — one survives a change to the other.
+    pub surround: crate::surround::Assignment,
     /// The volume the dial last reported, waiting for the host to debounce and
     /// push. `None` once it has been sent.
     pub pending_volume: Option<f32>,
@@ -509,6 +513,7 @@ impl Controller {
             watermark: crate::dial_watermark::DialWatermark::default(),
             silhouettes: Vec::new(),
             motion_scale: 1.0,
+            surround: Default::default(),
             pending_volume: None,
             tags: Vec::new(),
             tag_editor: Default::default(),
@@ -846,6 +851,30 @@ impl Controller {
             self.active_device_url = url;
         }
         ui.separator();
+        // SURROUND, beside the combine control rather than instead of it.
+        // They are different things — combine duplicates a stream, surround
+        // splits one — and a single toggle between them would make picking
+        // "several speakers" mean two incompatible things depending on a
+        // mode the person set earlier.
+        if self.sinks.open {
+            ui.separator();
+            ui.label(egui::RichText::new("surround").strong());
+            let speakers: Vec<(String, String)> = self.sinks.devices.iter()
+                .map(|d| (d.mac.clone(), d.label().to_string())).collect();
+            crate::surround::assign_ui(ui, &mut self.surround, &speakers, c);
+            // Enabled only when the assignment would actually route: the
+            // rules refuse a setup that drops half the mix, and a button
+            // that accepts one and fails later is the validation arriving
+            // after the decision.
+            let ok = self.surround.routable();
+            if ui.add_enabled(ok, egui::Button::new("Use this arrangement")).clicked() {
+                if let Some(sink) = crate::surround::sink_of(&self.surround) {
+                    self.audio_sink = sink;
+                    self.pending_playback = Some(crate::playback::Request::ReleaseRoute);
+                    self.toast.show("surround set");
+                }
+            }
+        }
         // Output routing: which speaker, or which speakers. Committed through
         // the existing SinkPicker, which now knows about drivers.
         if self.sinks.open {
@@ -1831,6 +1860,55 @@ impl Controller {
 /// to paint. Both are needed: the previous silhouettes passed every data
 /// test there was, because there were none, and the primitives that drew
 /// them lived in a function no test ever ran.
+#[cfg(test)]
+mod surround_route_tests {
+    use super::*;
+    use crate::surround::Channel;
+
+    fn app() -> Controller {
+        Controller::new(vec![], vec![])
+    }
+
+    #[test]
+    fn a_committed_arrangement_becomes_the_audio_sink() {
+        let mut c = app();
+        c.surround.place("l", "Left", Channel::FrontLeft);
+        c.surround.place("r", "Right", Channel::FrontRight);
+        let sink = crate::surround::sink_of(&c.surround).expect("a valid pair did not route");
+        c.audio_sink = sink;
+        assert!(matches!(c.audio_sink, crate::playback::Sink::Surround { .. }));
+    }
+
+    #[test]
+    fn a_half_assigned_room_cannot_be_committed_at_all() {
+        // The button is disabled on exactly this condition, and the model
+        // refuses independently — two guards, because a UI that enables it
+        // and a router that accepts it are different mistakes.
+        let mut c = app();
+        c.surround.place("l", "Left", Channel::FrontLeft);
+        assert!(!c.surround.routable());
+        assert_eq!(crate::surround::sink_of(&c.surround), None);
+    }
+
+    #[test]
+    fn surround_and_combine_are_separate_choices_not_a_mode() {
+        // Combine duplicates a stream, surround splits one. A single
+        // toggle would make "several speakers" mean two incompatible
+        // things depending on a mode set earlier.
+        let mut c = app();
+        c.set_audio_route(&crate::settings_page::Route::MultiRoom(
+            vec!["a".into(), "b".into()]));
+        assert!(matches!(c.audio_sink, crate::playback::Sink::Many(_)));
+        c.surround.place("a", "A", Channel::FrontLeft);
+        c.surround.place("b", "B", Channel::FrontRight);
+        // The assignment exists alongside; committing it is a separate act.
+        assert!(matches!(c.audio_sink, crate::playback::Sink::Many(_)),
+                "assigning positions silently changed the route");
+        c.audio_sink = crate::surround::sink_of(&c.surround).unwrap();
+        assert!(matches!(c.audio_sink, crate::playback::Sink::Surround { .. }));
+    }
+}
+
 #[cfg(test)]
 mod queue_advance_tests {
     use super::*;
