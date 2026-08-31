@@ -1275,12 +1275,10 @@ pub struct AgentConfig {
     /// Doc mode: teach the agent the document-organization convention (front-matter + section tree +
     /// generated index) so its docs stay organized and, in a fan, merge cleanly across branches.
     pub doc_mode: bool,
-    /// HectorMode: fold in the working-discipline block (find the oracle,
-    /// observe before building, verify by measuring output rather than exit
-    /// status, name the layer before editing, report dead ends, never write
-    /// unverified work in the past tense). Distilled from a 472-hour observed
-    /// engineering corpus rather than from taste; see `hectormode.rs`. Costs
-    /// ~450 tokens of prompt (`HECTOR_MODE_BRIEF` is ~120 for small windows).
+    /// LEGACY: the single working-discipline block, now `engprofile::HARDWARE`.
+    ///
+    /// Kept because callers set it, and it maps to `[ProfileId::Hardware]` when `profiles` is empty.
+    /// Prefer `profiles`, which composes several roles and sizes itself to the model class.
     pub hector_mode: bool,
     /// Patch-first editing (context economy for big models): instruct the model to modify EXISTING
     /// files with the `edit` tool (anchored find→replace) rather than re-emitting whole files.
@@ -1332,6 +1330,11 @@ pub struct AgentConfig {
     /// put it: a runner that dropped it would fan out the work and discard the only thing that made
     /// the branches different from each other.
     pub persona: String,
+    /// Engineering autopilot profiles, in order of PRECEDENCE — see `engprofile`. Empty = none.
+    ///
+    /// Supersedes `hector_mode`, which is the single Hardware profile and is still honoured: a run
+    /// setting the old bool gets `[Hardware]` unless it named profiles explicitly.
+    pub profiles: Vec<crate::engprofile::ProfileId>,
 }
 
 impl Default for AgentConfig {
@@ -1358,6 +1361,7 @@ impl Default for AgentConfig {
             model_label: String::new(),
             model_params: None,
             persona: String::new(),
+            profiles: Vec::new(),
         }
     }
 }
@@ -1971,9 +1975,21 @@ you. Favor code that compiles over clever code that might not; when you see erro
     let doc_note = if cfg.doc_mode { format!("\n\n{}", crate::docorg::DOC_ORG_GUIDE) } else { String::new() };
     // Working discipline. Placed with the other mode blocks so prompt order
     // stays stable across runs (a moving prompt invalidates KV reuse).
-    let hector_note = if cfg.hector_mode {
-        format!("\n\n{}", crate::hectormode::HECTOR_MODE_GUIDE)
-    } else { String::new() };
+    // WORKING DISCIPLINE. `profiles` supersedes the single `hector_mode` bool, which maps to the
+    // Hardware profile so existing callers keep exactly what they had. The byte budget comes from
+    // the model class: a 1B spending 3 KB of a 2k window on discipline has no window left for code.
+    let hector_note = {
+        let mut ids = cfg.profiles.clone();
+        if ids.is_empty() && cfg.hector_mode { ids.push(crate::engprofile::ProfileId::Hardware); }
+        if ids.is_empty() { String::new() } else {
+            let budget = match crate::read_harness::ModelClass::resolve(cfg.model_params, &cfg.model_label) {
+                crate::read_harness::ModelClass::Small => 900,
+                crate::read_harness::ModelClass::Mid => 2200,
+                _ => 6000,
+            };
+            format!("\n\n{}", crate::engprofile::compose(&ids, budget).text)
+        }
+    };
     // Turn-0 context: the workspace tree + shared crew docs, so no model starts blind.
     // The planner's stance for THIS branch, ahead of the workspace overview so the worker reads how
     // to approach its unit before it reads the repository it will approach.
@@ -3631,14 +3647,20 @@ error: could not compile `demo` (lib) due to 3 previous errors
         assert!(p.contains("```tool\n"), "the bare fence is not taught either");
     }
 
+    /// The contract this checked is still real — the legacy bool must put a working-discipline
+    /// block in the prompt with its oracle rule intact — but the text moved from `hectormode`'s flat
+    /// string to `engprofile::HARDWARE`, so the literals it asserted are gone. Re-pointed rather
+    /// than deleted: a test removed during a refactor is coverage silently lost.
     #[test]
     fn hector_mode_prompt_carries_the_discipline() {
         let cfg = AgentConfig { hector_mode: true, ..AgentConfig::default() };
         let p = system_prompt("do a thing", &cfg);
-        assert!(p.contains("HectorMode"), "mode block must reach the prompt");
-        assert!(p.contains("FIND THE ORACLE"), "rule 1 must survive formatting");
+        assert!(p.contains("WORKING DISCIPLINE"), "mode block must reach the prompt");
+        assert!(p.contains("Hardware / reverse engineering"), "and name which discipline it is");
+        assert!(p.to_lowercase().contains("find the working implementation"),
+                "rule 1 must survive the move");
         let off = system_prompt("do a thing", &AgentConfig::default());
-        assert!(!off.contains("HectorMode"), "must be off by default");
+        assert!(!off.contains("WORKING DISCIPLINE"), "must be off by default");
     }
 
     #[test]
@@ -5336,5 +5358,57 @@ mod long_horizon_tests {
             other => panic!("expected Unproven, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    // ── engineering profiles in the prompt ───────────────────────────────────────────────────────
+
+    #[test]
+    fn the_old_hector_bool_still_gets_the_hardware_profile() {
+        let cfg = AgentConfig { hector_mode: true, ..Default::default() };
+        let p = system_prompt("t", &cfg);
+        assert!(p.contains("WORKING DISCIPLINE"), "the old flag produced nothing");
+        let oracle = crate::engprofile::HARDWARE.practices.iter()
+            .find(|x| x.tag == crate::engprofile::Tag::Oracle).unwrap().headline;
+        assert!(p.contains(oracle), "hector_mode did not map to the Hardware profile");
+        // and off is still off
+        assert!(!system_prompt("t", &AgentConfig::default()).contains("WORKING DISCIPLINE"));
+    }
+
+    #[test]
+    fn explicit_profiles_win_over_the_legacy_bool_and_compose() {
+        use crate::engprofile::ProfileId;
+        let cfg = AgentConfig {
+            hector_mode: true, // must be ignored when profiles are named
+            profiles: vec![ProfileId::Optimizer, ProfileId::Gpu],
+            model_label: "Qwen3-30B-A3B-Q4.gguf".into(),
+            ..Default::default() };
+        let p = system_prompt("t", &cfg);
+        assert!(p.contains("Optimizer") && p.contains("GPU"), "both names should head the block");
+        assert!(!p.contains("Hardware / reverse engineering"), "the legacy bool leaked through");
+        // the composed brief, not two concatenated ones: one rule per tag
+        let m = crate::engprofile::OPTIMIZER.practices.iter()
+            .find(|x| x.tag == crate::engprofile::Tag::Measurement).unwrap().headline;
+        assert_eq!(p.matches(m).count(), 1);
+    }
+
+    /// A small model must not spend its window on discipline. The budget is class-derived, so this
+    /// is the same "size the run to the model" rule the reads and the transcript already follow.
+    #[test]
+    fn a_small_model_gets_a_shorter_discipline_block() {
+        use crate::engprofile::ProfileId;
+        let mk = |label: &str| {
+            let cfg = AgentConfig { profiles: ProfileId::all().to_vec(),
+                model_label: label.into(), ..Default::default() };
+            system_prompt("t", &cfg).len()
+        };
+        let small = mk("Llama-3.2-1B-Instruct-Q4_K_M.gguf");
+        let big = mk("Qwen3-30B-A3B-Q4.gguf");
+        assert!(small < big, "1B got the same discipline block as a 30B: {small} vs {big}");
+        // but it still gets the load-bearing instructions
+        let cfg = AgentConfig { profiles: ProfileId::all().to_vec(),
+            model_label: "Llama-3.2-1B-Instruct-Q4_K_M.gguf".into(), ..Default::default() };
+        let p = system_prompt("t", &cfg);
+        assert!(p.contains("Choose the next work yourself"), "the tight brief lost a rank-1 habit");
     }
 }
