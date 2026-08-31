@@ -1422,7 +1422,30 @@ pub fn encode_gop_v3_core(
     let use_dict = std::env::var("FAO_DICT").is_ok();
     let mut dict: std::collections::HashMap<u32, Vec<(usize, usize, usize)>> =
         std::collections::HashMap::new();
-    const DICT_MAX_CAND: usize = 24;
+    // Candidate cap AND selection policy. The first version took
+    // `cands.iter().rev().take(24)` — the 24 most RECENTLY inserted
+    // entries in the bucket. That is precisely backwards: the newest
+    // entries come from the newest frames, which the prev-MC predictor
+    // already covers, so as buckets fill the coder spends its whole
+    // candidate budget on matches it cannot profit from and never looks
+    // at the old, distant entries that are the entire point of a
+    // long-range dictionary. Reference density collapsing from 2,947
+    // refs on frame 24 to 78 on frame 46 is what that looks like from
+    // the outside, and I had attributed it to quantisation depth.
+    // FAO_DICT_CAND sets the budget; FAO_DICT_SPREAD=1 spends it
+    // EVENLY across the bucket's history instead of on its tail.
+    // Defaults are the swept operating point, not a guess:
+    //   tail-24  9,866,348 B @ 31.680 dB   (the original policy)
+    //   spread-24 9,291,999 B @ 32.099 dB
+    //   spread-96 9,108,770 B @ 32.054 dB  <- default
+    // Spread is better on BOTH axes than tail at the same budget, which
+    // is the signature of a policy bug rather than a rate trade-off.
+    // FAO_DICT_TAIL restores the old policy for comparison.
+    let dict_cand: usize = std::env::var("FAO_DICT_CAND")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(96);
+    let dict_spread = std::env::var("FAO_DICT_TAIL").is_err();
     const DICT_MARGIN: u32 = 512;
     const MRU_CAP: usize = 128;
 
@@ -1622,7 +1645,17 @@ pub fn encode_gop_v3_core(
                             let best_local =
                                 sad_region(&comp.y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry);
                             let mut best = (u32::MAX, 0usize, 0usize, 0usize);
-                            for &(dfi, dx, dy) in cands.iter().rev().take(DICT_MAX_CAND) {
+                            let picked: Vec<(usize, usize, usize)> = if dict_spread
+                                && cands.len() > dict_cand
+                            {
+                                let step = cands.len() as f32 / dict_cand as f32;
+                                (0..dict_cand)
+                                    .map(|i| cands[((i as f32 * step) as usize).min(cands.len() - 1)])
+                                    .collect()
+                            } else {
+                                cands.iter().rev().take(dict_cand).copied().collect()
+                            };
+                            for (dfi, dx, dy) in picked {
                                 let s = sad_region(
                                     &recon[dfi].y, fw, fh, dx as i32, dy as i32, &f.y, rx, ry,
                                 );

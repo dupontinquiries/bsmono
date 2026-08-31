@@ -4433,3 +4433,52 @@ as the GOP progresses its entries are increasingly quantised copies of
 quantised copies, and matches fall below DICT_MARGIN. The remaining
 named lever (run-coding one reference across adjacent regions) attacks
 count, not price, and the count is what is collapsing.
+
+### The reference-density decay was MY BUG, not the material — mode 4 now pays
+
+Last entry blamed the decay (2,947 refs on frame 24 -> 78 on frame 46)
+on the dictionary being built from recon at dz32, "quantised copies of
+quantised copies", and named a finer dictionary recon as the fix.
+THAT FIX IS NOT DECODABLE and the diagnosis was wrong. Not decodable
+because the decoder only holds the real recon; a finer one would have
+to be transmitted, which is the cost the dictionary exists to avoid.
+Wrong because the actual mechanism was in my own candidate selection:
+
+    cands.iter().rev().take(24)
+
+takes the 24 most RECENTLY INSERTED entries in the bucket. The newest
+entries come from the newest frames — exactly the content prev-MC
+already predicts — so as buckets fill, the entire candidate budget is
+spent on matches that cannot profit, and the old distant entries that
+are the whole point of a long-range dictionary are never examined.
+Density collapsing across the GOP is what that looks like from
+outside, which is why it read as a material property.
+
+Fix: spend the budget EVENLY across the bucket's history (stride
+sample) instead of on its tail. Minecraft 4K GOP, dz32:
+
+  no dictionary        9,996,224 B @ 31.742 dB / SSIM 0.9353
+  dict, tail-24        9,866,348 B @ 31.680 dB / SSIM 0.9331  (-1.3%)
+  dict, spread-24      9,291,999 B @ 32.099 dB / SSIM 0.9356  (-7.0%)
+  dict, spread-96      9,108,770 B @ 32.054 dB / SSIM 0.9361  (-8.9%)
+
+Spread-24 beats tail-24 on BOTH axes at an identical candidate budget
+and identical wire format — the signature of a policy bug, not a rate
+trade-off. Against no dictionary, spread-96 is -8.9% bytes AND
++0.31 dB AND +0.0008 SSIM: mode 4 is now a strict win on this content
+rather than the marginal 1.3% the first version measured. Residual
+7,559,715 -> 6,375,363 (-15.7%) for +297 KB of side info.
+
+Defaults changed to spread/96 (FAO_DICT_TAIL restores the old policy).
+Still behind FAO_DICT.
+
+Standing against the AV1 anchor on this GOP: 9,108,770 B @ 32.054 dB /
+0.9361 vs 305,744 B @ 32.198 dB / 0.9336. 29.8x at -0.14 dB, and v11
+still leads on SSIM. Was 32.7x at -0.46 dB before mode 4.
+
+Process note worth keeping: two entropy-coding attempts on the
+references (delta, MRU) both lost, and the thing that actually paid
+was fixing WHICH candidates get examined. The byte split pointed at
+price (5-byte references, +246 KB of side info) and the real problem
+was count — and count was collapsing for a reason no byte-accounting
+would ever show, only the density instrumentation did.
