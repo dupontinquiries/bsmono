@@ -8089,8 +8089,12 @@ impl Game {
         // steer and the gun goes where you are aiming. Yaw only, about the
         // RING rather than the turret's mass (`turret::find`) — a gun that
         // pivots on its own centroid swings its breech through the hull.
-        // Elevation is deliberately absent: pitching a turret needs the
-        // mantlet's own axis, which is a second detection and not this one.
+        // Elevation is still not wired in HERE: `turret::find` now detects
+        // a barrel prim and a horizontal elevation axis/pivot
+        // (`Fittings::barrel`/`elevation_axis`/`elevation_pivot`), but
+        // driving that from a real aim pitch — and picking sane
+        // elevation/depression limits — is gameplay-feel work that needs
+        // a controller in someone's hands, not a blind addition here.
         let turret_q = if active.fittings.has_turret() {
             // where the EYE is looking, taken from the camera's own
             // geometry rather than a euler it does not keep: the vector

@@ -52,6 +52,21 @@ pub struct Fittings {
     /// in that gap: their wheels are not at tidy corners with a shared
     /// radius, so nothing was tagged and nothing turned.
     pub rollers: Vec<(usize, Vec3)>,
+    /// the turret prim read as the barrel/mantlet — long and thin
+    /// relative to the rest of the turret assembly. `None` when the
+    /// turret has no single prim shaped like a gun (a rounded cupola
+    /// with no protruding barrel, for instance).
+    pub barrel: Option<usize>,
+    /// where the barrel meets the turret body — the mantlet axis point,
+    /// taken as the barrel's own endpoint nearest the ring rather than
+    /// its centroid, so elevating about it pitches the muzzle and not
+    /// the breech through the turret roof.
+    pub elevation_pivot: Vec3,
+    /// the horizontal axis to pitch the barrel about: perpendicular to
+    /// both world-up and the barrel's own root-to-tip direction, so a
+    /// positive rotation about it raises the muzzle regardless of which
+    /// way the turret is currently yawed.
+    pub elevation_axis: Vec3,
 }
 
 impl Fittings {
@@ -61,15 +76,20 @@ impl Fittings {
     pub fn tracked(&self) -> bool {
         self.treads.len() >= 2
     }
+    /// A turret that can pitch its gun, not just yaw the whole assembly.
+    pub fn has_elevation(&self) -> bool {
+        self.barrel.is_some()
+    }
     pub fn report(&self) -> String {
         format!(
-            "fittings: {} turret prims (ring {:.2},{:.2},{:.2}), {} tread prims{}",
+            "fittings: {} turret prims (ring {:.2},{:.2},{:.2}), {} tread prims{}{}",
             self.turret.len(),
             self.ring.x,
             self.ring.y,
             self.ring.z,
             self.treads.len(),
-            if self.tracked() { " — tracked" } else { "" }
+            if self.tracked() { " — tracked" } else { "" },
+            if self.has_elevation() { " — elevating" } else { "" }
         )
     }
 }
@@ -89,6 +109,11 @@ const TREAD_LONG: f32 = 0.55;
 const TREAD_LOW: f32 = 0.10;
 /// ...and is at least this far off the centreline.
 const TREAD_OUT: f32 = 0.25;
+/// A barrel is long relative to its OWN other two axes, not the hull's —
+/// this compares a candidate prim's longest extent to its second-longest.
+/// A turret roof or cupola is roughly as wide as it is deep and fails
+/// this outright; a gun tube is several times longer than it is thick.
+const BARREL_ASPECT: f32 = 1.8;
 
 /// Measure a hull. `prims` is each prim's points in MODEL space, already
 /// oriented (Y up, -Z forward) — the frame everything downstream assumes.
@@ -247,6 +272,69 @@ pub fn find(prims: &[&[Vec3]]) -> Fittings {
         // makes a long gun swing its breech through the hull.
         out.ring = Vec3::new(c.x, lo.y + half.y * 0.9, c.z);
     }
+
+    // THE BARREL: whichever turret prim is shaped like a gun rather than
+    // a body — long and thin relative to its own other two axes, not
+    // relative to the hull. `COMPACT` already keeps genuinely wide things
+    // (the turret roof, a cupola) out of contention on its own, so this
+    // only has to ask each candidate's OWN aspect ratio, the same way
+    // `orphanish` in `skeleton.rs` asks a group's shape rather than the
+    // body's. The most elongated qualifying prim wins; a turret with
+    // nothing shaped like a barrel (a rounded MG cupola, say) correctly
+    // reports `barrel: None` rather than guessing.
+    if !out.turret.is_empty() {
+        let mut best: Option<(usize, f32)> = None;
+        for &i in &out.turret {
+            let p = prims[i];
+            if p.len() < 6 {
+                continue;
+            }
+            let (mut plo, mut phi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for v in p.iter() {
+                plo = plo.min(*v);
+                phi = phi.max(*v);
+            }
+            let e = phi - plo;
+            let longest = e.max_element().max(1e-5);
+            let second = {
+                let mut vals = [e.x, e.y, e.z];
+                vals.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                vals[1].max(1e-5)
+            };
+            let aspect = longest / second;
+            if aspect < BARREL_ASPECT {
+                continue;
+            }
+            if best.map(|(_, a)| aspect > a).unwrap_or(true) {
+                best = Some((i, aspect));
+            }
+        }
+        if let Some((i, _)) = best {
+            let p = prims[i];
+            // ROOT is the barrel's own point nearest the ring — where it
+            // meets the mantlet — not its centroid, which sits halfway
+            // down the tube. TIP is the point farthest from that root,
+            // the muzzle end. Same root/tip shape as `skeleton::Limb`,
+            // for the same reason: a pivot at the joint, not the middle.
+            let root = p.iter().copied().min_by(|a, b| {
+                (*a - out.ring).length_squared().partial_cmp(&(*b - out.ring).length_squared()).unwrap_or(std::cmp::Ordering::Equal)
+            }).unwrap_or(out.ring);
+            let tip = p.iter().copied().max_by(|a, b| {
+                (*a - root).length_squared().partial_cmp(&(*b - root).length_squared()).unwrap_or(std::cmp::Ordering::Equal)
+            }).unwrap_or(root);
+            let aim = tip - root;
+            // the axis to pitch about: horizontal, perpendicular to the
+            // barrel's own current heading, so raising the muzzle stays
+            // correct no matter which way the turret is yawed. Falls
+            // back to X for the (degenerate) case of a dead-vertical
+            // barrel, where up x aim is zero.
+            let axis = Vec3::Y.cross(aim);
+            out.elevation_axis = if axis.length_squared() > 1e-8 { axis.normalize() } else { Vec3::X };
+            out.elevation_pivot = root;
+            out.barrel = Some(i);
+        }
+    }
+
     // treads come in pairs; one is a running board
     if out.treads.len() == 1 {
         out.treads.clear();
@@ -317,6 +405,39 @@ mod tests {
             f.report()
         );
         assert!(!f.turret.contains(&0), "the hull was swept into the turret: {}", f.report());
+    }
+
+    #[test]
+    fn the_barrel_is_found_among_the_turret_and_gets_a_horizontal_elevation_axis() {
+        let mut t = tank();
+        // same shape as `the_whole_turret_follows_the_barrel`: a wide low
+        // turret body plus a long thin barrel protruding forward
+        t.push(slab(Vec3::new(0.0, 0.55, -0.2), Vec3::new(0.8, 0.18, 0.9), 300));
+        t.push(slab(Vec3::new(0.0, 0.8, 1.1), Vec3::new(0.07, 0.07, 1.3), 120));
+        let refs: Vec<&[Vec3]> = t.iter().map(|v| v.as_slice()).collect();
+        let f = find(&refs);
+        assert!(f.has_elevation(), "no barrel found on a turret that has one: {}", f.report());
+        assert_eq!(f.barrel, Some(5), "wrong prim called the barrel: {}", f.report());
+        // pitching about a vertical or forward-pointing axis would swing
+        // the muzzle sideways, not up; the axis has to be mostly
+        // horizontal and mostly across the hull (X-ish), not along it
+        assert!(f.elevation_axis.y.abs() < 0.3, "the elevation axis is not horizontal: {:?}", f.elevation_axis);
+        assert!(f.elevation_axis.x.abs() > 0.7, "the elevation axis does not run across the hull: {:?}", f.elevation_axis);
+        // the pivot is where the barrel meets the mantlet (near the
+        // turret body), not out at the muzzle or buried at the ring
+        assert!(f.elevation_pivot.z < 1.1, "the pivot drifted out to the muzzle: {:?}", f.elevation_pivot);
+    }
+
+    #[test]
+    fn a_turret_with_no_barrel_shaped_prim_reports_no_elevation() {
+        // a rounded cupola with no protruding gun tube: nothing here is
+        // shaped like a barrel, so this should not guess one
+        let t = tank();
+        let refs: Vec<&[Vec3]> = t.iter().map(|v| v.as_slice()).collect();
+        let f = find(&refs);
+        assert!(f.has_turret(), "{}", f.report());
+        assert!(!f.has_elevation(), "a barrel was found where there is none: {}", f.report());
+        assert_eq!(f.barrel, None);
     }
 
     #[test]
