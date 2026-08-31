@@ -343,6 +343,16 @@ pub fn hull_cells_mesh(ship: &Interior) -> crate::meshgen::MeshData {
     for c in &ship.cells {
         let mut b = cbox(0.06);
         bake(&mut b, c.half * 2.0, Quat::IDENTITY, c.centre);
+        // CARVED, not extruded. `cbox` builds a solid, so every room was
+        // drawn as a block with its faces pointing OUT — which reads as
+        // the rooms sticking through the hull rather than being hollowed
+        // into it, because from outside that is exactly what a solid box
+        // at that position looks like.
+        //
+        // The hull was never too small: `Profile::fit` grows the skin to
+        // contain the cells and there is a test asserting it. The boxes
+        // were facing the wrong way.
+        crate::meshgen::flip_inward(&mut b);
         merge(&mut out, &b);
     }
     for l in &ship.links {

@@ -62,11 +62,32 @@ impl ItemId {
 pub struct ItemStack {
     pub item: ItemId,
     pub count: u16,
+    /// r-weapon-fix: full per-instance identity for a forged legendary
+    /// weapon (element/tier/seed), preserved through the inventory instead
+    /// of collapsing to `item`'s bare class-only numeric id the moment it's
+    /// picked up. `None` for every ordinary item (blocks, ingots, food) and
+    /// for a weapon-class item with no richer data available (e.g. reached
+    /// through a path that only ever had the class, not a real forged
+    /// instance). See `equipped_weapon` in `bin/unendlich_fullgame.rs` for
+    /// how this is consumed, and `sim::legendary_loot`'s doc comment for why
+    /// this was the missing "inventory half" of the legendary-weapon
+    /// feature — the "loot half" (deciding whether/what drops) already
+    /// existed but had nowhere to actually put a real instance.
+    pub weapon_instance: Option<crate::item::LegendarySpec>,
 }
 
 impl ItemStack {
     pub const fn new(item: ItemId, count: u16) -> ItemStack {
-        ItemStack { item, count }
+        ItemStack { item, count, weapon_instance: None }
+    }
+
+    /// A stack carrying a real forged weapon instance — full element/tier/
+    /// seed fidelity preserved. `item` should still be the class's
+    /// convention id (`viewmodel::weapon_id_for_class`) so every other
+    /// system that only knows about bare `ItemId`s keeps working; this is
+    /// additive richness, not a replacement identity.
+    pub const fn new_weapon(item: ItemId, count: u16, instance: crate::item::LegendarySpec) -> ItemStack {
+        ItemStack { item, count, weapon_instance: Some(instance) }
     }
 }
 

@@ -136,6 +136,15 @@ pub struct MeshRequest {
     /// chunk (same fallback policy as sparse mode when records would
     /// overflow).
     pub octree: Option<Arc<crate::world::octree::OctreeArray>>,
+    /// v-seam: loaded face-neighbor chunks at submission time, used by the
+    /// CPU greedy mesher (Near LOD only) to cull boundary faces against a
+    /// solid neighbor instead of always treating the chunk edge as air. A
+    /// slot left `None` (neighbor not loaded, or the submitter didn't
+    /// populate this field) falls back to the pre-existing Air-at-edge
+    /// behavior — see `NeighborChunks` and `mesh_chunk_greedy_with_neighbors`
+    /// in `render::mesher`. `NeighborChunks::none()` (the `Default`) is
+    /// byte-identical to every `MeshRequest` built before this field existed.
+    pub neighbors: crate::render::mesher::NeighborChunks,
 }
 
 /// Result delivered back to the render thread.
@@ -553,8 +562,7 @@ fn worker_loop(
     octree_gpu_request_tx: Option<Sender<OctreeGpuMeshRequest>>,
 ) {
     use crate::render::mesher::{
-        mesh_chunk_with_sky, mesh_chunk_with_sky_and_model,
-        mesh_chunk_with_sky_model_and_tick, mesh_chunk_downsampled,
+        mesh_chunk_downsampled,
         mesh_chunk_far_virtual,
     };
     use crate::world::lod::LodLevel;
@@ -786,12 +794,15 @@ fn worker_loop(
         let mesh = if req.lod == LodLevel::Near {
             match (&req.world_model, req.current_tick) {
                 (Some(model), Some(tick)) => {
-                    mesh_chunk_with_sky_model_and_tick(&req.chunk, &req.sky, model, tick)
+                    crate::render::mesher::mesh_chunk_greedy_with_neighbors(
+                        &req.chunk, &req.neighbors, Some(&req.sky), Some(model), Some(tick))
                 }
                 (Some(model), None) => {
-                    mesh_chunk_with_sky_and_model(&req.chunk, &req.sky, model)
+                    crate::render::mesher::mesh_chunk_greedy_with_neighbors(
+                        &req.chunk, &req.neighbors, Some(&req.sky), Some(model), None)
                 }
-                (None, _) => mesh_chunk_with_sky(&req.chunk, &req.sky),
+                (None, _) => crate::render::mesher::mesh_chunk_greedy_with_neighbors(
+                    &req.chunk, &req.neighbors, Some(&req.sky), None, None),
             }
         } else if is_virtual_eligible {
             let factor = lod_settings.factor_for(req.lod);
@@ -1410,6 +1421,7 @@ mod tests {
             lod: LodLevel::Near,
             generator: None,
             octree: None,
+            neighbors: crate::render::mesher::NeighborChunks::none(),
         });
         assert!(accepted);
 
@@ -1445,6 +1457,7 @@ mod tests {
                 lod: LodLevel::Near,
                 generator: None,
                 octree: None,
+                neighbors: crate::render::mesher::NeighborChunks::none(),
             }));
         }
 
@@ -1478,6 +1491,7 @@ mod tests {
                 lod: LodLevel::Near,
                 generator: None,
                 octree: None,
+                neighbors: crate::render::mesher::NeighborChunks::none(),
             }) {
                 accepted += 1;
             } else {
@@ -1536,6 +1550,7 @@ mod tests {
             lod,
             generator: None,
             octree: None,
+            neighbors: crate::render::mesher::NeighborChunks::none(),
         };
 
         assert!(pool.submit(mk_req(LodLevel::Near, ChunkCoord::new(0, 0, 0))));
@@ -1595,6 +1610,7 @@ mod tests {
             lod: LodLevel::Far,
             generator: None,
             octree: None,
+            neighbors: crate::render::mesher::NeighborChunks::none(),
         }));
 
         // Second: generator present → virtual path → samples real
@@ -1611,6 +1627,7 @@ mod tests {
             lod: LodLevel::Far,
             generator: Some(Arc::clone(&generator)),
             octree: None,
+            neighbors: crate::render::mesher::NeighborChunks::none(),
         }));
 
         let mut results = Vec::new();
@@ -1662,6 +1679,7 @@ mod tests {
             lod: LodLevel::Near,
             generator: Some(generator),
             octree: None,
+            neighbors: crate::render::mesher::NeighborChunks::none(),
         }));
 
         let mut got = Vec::new();
@@ -1726,6 +1744,7 @@ mod tests {
                 lod: LodLevel::Near,
                 generator: None,
                 octree: None,
+                neighbors: crate::render::mesher::NeighborChunks::none(),
             });
             if accepted {
                 submitted += 1;

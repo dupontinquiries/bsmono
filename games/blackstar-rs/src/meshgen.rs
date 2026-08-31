@@ -323,6 +323,29 @@ pub fn tube_open(seg: u32) -> MeshData {
 /// A CHAMFERED BOX. The procedural cars were built from hard-edged boxes,
 /// which is what made them read as blocks rather than vehicles: a real body
 /// catches a highlight along every edge. `bevel` is in unit-box space.
+/// Turn a solid into a cavity: flip every normal and reverse every
+/// winding.
+///
+/// A room CARVED into a hull and a room EXTRUDED out of one are the same
+/// box — the difference is which side of its walls you are meant to see.
+/// `cbox` builds a solid, so the ship's rooms were drawn as blocks
+/// sticking through the skin rather than as spaces hollowed inside it.
+///
+/// Both halves are needed and they fix different things. Flipping the
+/// NORMALS makes the walls light as an interior — lit from inside rather
+/// than shaded as if the sun were behind them. Reversing the WINDING
+/// makes back-face culling keep the far wall and drop the near one, so
+/// you can see in. Doing only one gives either a black room or a box
+/// you cannot see into.
+pub fn flip_inward(m: &mut MeshData) {
+    for v in m.verts.iter_mut() {
+        v.nrm = [-v.nrm[0], -v.nrm[1], -v.nrm[2]];
+    }
+    for t in m.idx.chunks_exact_mut(3) {
+        t.swap(1, 2);
+    }
+}
+
 pub fn cbox(bevel: f32) -> MeshData {
     let b = bevel.clamp(0.02, 0.45);
     let i = 1.0 - b;
@@ -888,4 +911,35 @@ pub fn terrain<F: Fn(f32, f32) -> f32>(radius: f32, n: u32, h: F) -> MeshData {
         }
     }
     m
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn flipping_inward_reverses_both_normals_and_winding() {
+        // Both halves matter and they fix different things. Normals
+        // decide whether the walls light as an interior; winding decides
+        // whether back-face culling keeps the far wall or the near one.
+        // Doing only one gives either a black room or a box you cannot
+        // see into — and from outside both look like "the rooms are
+        // wrong", which is how this went unnoticed.
+        let mut m = super::cbox(0.06);
+        let n0 = m.verts[0].nrm;
+        let t0 = [m.idx[0], m.idx[1], m.idx[2]];
+        super::flip_inward(&mut m);
+        assert_eq!(m.verts[0].nrm, [-n0[0], -n0[1], -n0[2]]);
+        assert_eq!([m.idx[0], m.idx[1], m.idx[2]], [t0[0], t0[2], t0[1]]);
+    }
+
+    #[test]
+    fn flipping_twice_is_the_original() {
+        // The cheap check that this is a real inversion rather than a
+        // rearrangement that merely looks different.
+        let a = super::cbox(0.06);
+        let mut b = super::cbox(0.06);
+        super::flip_inward(&mut b);
+        super::flip_inward(&mut b);
+        assert_eq!(a.idx, b.idx);
+        assert!(a.verts.iter().zip(&b.verts).all(|(x, y)| x.nrm == y.nrm));
+    }
 }

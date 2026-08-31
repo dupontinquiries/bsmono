@@ -47,7 +47,7 @@ const S_PROC_POW: u64 = 0x7D0C_9100_0006_0006;
 // ---------------------------------------------------------------------------
 
 /// Weapon class archetype.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WeaponClass {
     Dagger,
     Blade,

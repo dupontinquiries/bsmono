@@ -174,7 +174,7 @@ impl ToolKind {
 /// which is exactly `legendary_weapon::forge(seed, class, element_idx, tier)`.
 /// `element_idx` is interpreted mod 6 (Wood/Water/Air/Dust/Fire/Storm), matching
 /// `forge`'s own element→proc mapping; `tier` is the (uncapped) weapon tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LegendarySpec {
     pub seed: u64,
     pub class: WeaponClass,
@@ -390,6 +390,50 @@ pub fn block_role(b: BlockId) -> crate::sim::item_category::BlockRole {
 }
 
 impl ItemKind {
+    /// The raw numeric `ItemId` this kind becomes once it enters the
+    /// inventory's flat `u32` id space — the inverse of [`item_display`]'s
+    /// documented convention (`0..256` block, `1000+idx` ingot, `4000+idx`
+    /// legendary weapon by class). This is the missing link that let a
+    /// creative-panel pick (any `ItemKind`, weapons included) actually
+    /// become the held/used item: previously the game loop derived the held
+    /// item from `selected_block: BlockId` alone, which can never represent
+    /// a weapon, so picking one from the creative catalog was silently
+    /// dropped before it reached the player's hand.
+    ///
+    /// **Lossy by design, matching the existing convention** — not a new
+    /// loss introduced here. The real player `Inventory` already stores
+    /// items as bare `ItemId(u32)` (see `items::inventory`), and the
+    /// convention only ever tracked a legendary weapon's *class* (8 values),
+    /// never its `element_idx`/`tier`/`seed`; `weapon_class_for_id` and
+    /// `items::default_palette`'s `4000..4007` entries already assume this.
+    /// So `Legendary(spec).to_item_id()` intentionally collapses to
+    /// `4000 + class index` — same simplification a forged weapon already
+    /// goes through the moment it's dropped into a hotbar slot today.
+    ///
+    /// `Tool` and `SpawnEgg` have no id range in the documented convention
+    /// yet (`item_display` never claims one for them either) — mapped to
+    /// `ItemKind::UNMAPPED_ID`, a sentinel picked to land in `item_display`'s
+    /// generic "Item" fallback rather than colliding with a real range.
+    pub fn to_item_id(self) -> u32 {
+        match self {
+            ItemKind::Block(b) => b as u32,
+            ItemKind::Ingot(m) => {
+                1000 + MetalKind::ALL.iter().position(|&x| x == m).unwrap_or(0) as u32
+            }
+            ItemKind::Legendary(spec) => {
+                4000 + WeaponClass::ALL.iter().position(|&c| c == spec.class).unwrap_or(0) as u32
+            }
+            ItemKind::Tool(..) | ItemKind::SpawnEgg(..) => Self::UNMAPPED_ID,
+        }
+    }
+
+    /// Sentinel returned by `to_item_id` for kinds with no established id
+    /// range (`Tool`, `SpawnEgg`). Outside every real range (`0..256`,
+    /// `1000..1003`, `2000..2002`, `4000..4008`), so `item_display` resolves
+    /// it to the generic "Item" fallback rather than misreporting a real
+    /// item.
+    pub const UNMAPPED_ID: u32 = 999_999;
+
     /// The `ItemFacet` this item belongs to — the bridge into the categorized
     /// creative menu (`sim::item_category` / `sim::creative_items`). This was the
     /// missing link: the classification (`facet → category`) existed, but nothing
@@ -403,6 +447,7 @@ impl ItemKind {
             ItemKind::Tool(..) => ItemFacet::Tool,
             ItemKind::Legendary(_) => ItemFacet::Legendary,
         }
+
     }
 }
 
@@ -591,6 +636,71 @@ mod tests {
         assert!(eggs.iter().all(|e| e.is_spawn_egg()));
         assert!(eggs.contains(&ItemKind::SpawnEgg(CreatureKind::Dragon)));
         assert!(eggs.contains(&ItemKind::SpawnEgg(CreatureKind::Lauscher)));
+    }
+
+    // ----- ItemKind::to_item_id (creative-panel-pick -> held/used item) -----
+
+    #[test]
+    fn to_item_id_block_matches_discriminant_and_round_trips_through_item_display() {
+        for b in unendlich_engine_blockid_all_for_test() {
+            if b == BlockId::Air { continue; }
+            let id = ItemKind::Block(b).to_item_id();
+            assert_eq!(id, b as u32);
+            let disp = item_display(id);
+            assert_eq!(disp.name, format!("{b:?}"),
+                "Block({b:?}).to_item_id() must resolve back to itself via item_display");
+        }
+    }
+
+    #[test]
+    fn to_item_id_ingot_lands_in_the_1000_range_and_resolves_correctly() {
+        for m in MetalKind::ALL {
+            let id = ItemKind::Ingot(m).to_item_id();
+            assert!((1000..1000 + MetalKind::ALL.len() as u32).contains(&id));
+            let disp = item_display(id);
+            assert_eq!(disp.name, format!("{} Ingot", m.name()));
+        }
+    }
+
+    #[test]
+    fn to_item_id_legendary_lands_in_the_4000_range_by_class() {
+        use crate::sim::legendary_weapon::WeaponClass;
+        for (i, &class) in WeaponClass::ALL.iter().enumerate() {
+            let spec = LegendarySpec { seed: 42, class, element_idx: 0, tier: 0 };
+            let id = ItemKind::Legendary(spec).to_item_id();
+            assert_eq!(id, 4000 + i as u32,
+                "class {:?} should map to a stable, distinct id in 4000..4008", class);
+            let disp = item_display(id);
+            assert_eq!(disp.name, "Weapon");
+        }
+        // Different element/tier/seed, same class -> same id (documented lossy
+        // collapse, matching the existing `weapon_class_for_id` convention).
+        let a = ItemKind::Legendary(LegendarySpec { seed: 1, class: WeaponClass::Wand, element_idx: 0, tier: 0 });
+        let b = ItemKind::Legendary(LegendarySpec { seed: 999, class: WeaponClass::Wand, element_idx: 5, tier: 3 });
+        assert_eq!(a.to_item_id(), b.to_item_id());
+    }
+
+    #[test]
+    fn to_item_id_tool_and_egg_use_the_unmapped_sentinel_not_a_real_range() {
+        use crate::sim::legendary_weapon::WeaponClass;
+        let _ = WeaponClass::Dagger; // keep import used if reordered
+        let tool_id = ItemKind::Tool(ToolKind::Pickaxe, MetalKind::Iron).to_item_id();
+        let egg_id = ItemKind::SpawnEgg(CreatureKind::Dragon).to_item_id();
+        assert_eq!(tool_id, ItemKind::UNMAPPED_ID);
+        assert_eq!(egg_id, ItemKind::UNMAPPED_ID);
+        // The sentinel must not fall inside any real range.
+        assert!(!(0..256).contains(&ItemKind::UNMAPPED_ID));
+        assert!(!(1000..1000 + MetalKind::ALL.len() as u32).contains(&ItemKind::UNMAPPED_ID));
+        assert!(!(4000..4008).contains(&ItemKind::UNMAPPED_ID));
+        // And it should resolve to the generic fallback, not misreport as a
+        // real item.
+        assert_eq!(item_display(ItemKind::UNMAPPED_ID).name, "Item");
+    }
+
+    fn unendlich_engine_blockid_all_for_test() -> Vec<BlockId> {
+        // A representative sample rather than every BlockId — keeps the test
+        // fast while still covering the low/high ends and Air's neighbours.
+        BlockId::ALL.iter().copied().collect()
     }
 
     #[test]

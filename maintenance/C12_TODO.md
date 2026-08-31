@@ -5763,3 +5763,46 @@ command. Five decisions:
 
 Verified all three: reports with fake targets, correct units, and prints
 nothing on a clean tree.
+
+## 104. blackstar: the rooms were facing the wrong way, not too big
+
+Operator: ship rooms meant to be carved into the interior show up
+extruding, so the hull needs to be bigger and the detection improved.
+
+**The hull was never too small.** `Profile::fit` GROWS the skin to
+contain the cells, and `hullform.rs` already has a test asserting every
+room is inside the hull it was fitted to — which passes.
+
+`hull_cells_mesh` builds each room with `cbox`, which is a SOLID: faces
+pointing out. From outside, a solid box at a room's position is exactly
+what a room poking through the skin looks like. The geometry was right
+and the facing was wrong.
+
+`meshgen::flip_inward` inverts both halves, and both are needed for
+different reasons:
+  - **Normals** decide whether the walls light as an interior or shade
+    as if the sun were behind them.
+  - **Winding** decides whether back-face culling keeps the far wall or
+    the near one — i.e. whether you can see in at all.
+
+Doing only one gives either a black room or a box you cannot see into,
+and from outside both read as "the rooms are wrong", which is how this
+survived.
+
+Two tests, in a `mod tests` meshgen did not have: the flip reverses both,
+and flipping twice is the original (a real inversion, not a
+rearrangement that looks different).
+
+1306/1306.
+
+- **C104a — hull size and "detection" NOT changed**, deliberately. Both
+  were the operator's diagnosis of a symptom whose cause was elsewhere;
+  growing the hull would have hidden the facing bug behind a bigger ship
+  and left the rooms still inside-out.
+- **C104b — ship summon/follow NOT built.** Asked for in the same
+  message: a button to call the ship, follow unless damaged, and a
+  summon override. That is a real behaviour (a follow state machine with
+  a damage interrupt), not a wiring, and it wants its own pass.
+- **C104c — the control-scheme analysis is NOT done.** QWERTY vs Dvorak,
+  mouse side buttons, PgUp/PgDn, `,.oeu` for centred Dvorak. Worth doing
+  properly against the existing bind table rather than guessed at.
