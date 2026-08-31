@@ -136,18 +136,22 @@ setup_cache() {
     # An explicit CARGO_TARGET_DIR from the caller always wins: somebody
     # who has already pointed this somewhere knows more than this script.
     if [ -n "${CARGO_TARGET_DIR:-}" ]; then
-        echo "cache: $CARGO_TARGET_DIR (from the environment)"
+        echo "cache: $CARGO_TARGET_DIR (from the environment, left alone)"
         return
     fi
 
-    if [ "${RAMCACHE:-0}" != "1" ]; then
-        # The shared-cache half, which is free and helps regardless.
-        # Outside the iteration tree ON PURPOSE — a cache inside
-        # `.../157/` is a cache that dies with the iteration, which is
-        # the thing costing 40 GB a run.
-        export CARGO_TARGET_DIR="${FLEET_CACHE:-$HOME/.cache/fleet-build/target}"
+    local disk="${FLEET_CACHE:-$HOME/.cache/fleet-build/target}"
+
+    # RAMCACHE=0 is the opt-out. AUTO is the default: try RAM, fall back
+    # to the shared disk cache when it does not fit. That is safe to
+    # default ON only because the size check below refuses rather than
+    # overflowing into swap — an auto-enable without it would be the
+    # script deciding to page a build onto the SSD, which is the exact
+    # thing it is meant to avoid.
+    if [ "${RAMCACHE:-auto}" = "0" ]; then
+        export CARGO_TARGET_DIR="$disk"
         mkdir -p "$CARGO_TARGET_DIR"
-        echo "cache: $CARGO_TARGET_DIR (shared on disk; RAMCACHE=1 for tmpfs)"
+        echo "cache: shared on disk at $CARGO_TARGET_DIR (RAMCACHE=0)"
         return
     fi
 
@@ -159,19 +163,23 @@ setup_cache() {
     avail_kb=$(df -k /dev/shm 2>/dev/null | awk 'NR==2 {print $4}')
     local need_kb=$(( ${FLEET_RAMCACHE_GB:-45} * 1024 * 1024 ))
     if [ -z "$avail_kb" ] || [ "$avail_kb" -lt "$need_kb" ]; then
-        # REFUSED, loudly, and the build still runs on disk. Falling
-        # through to a too-small tmpfs is how a machine ends up swapping
-        # mid-build and blaming cargo.
-        echo "RAMCACHE: /dev/shm has $(( ${avail_kb:-0} / 1024 / 1024 )) GiB free," \
-             "want $(( need_kb / 1024 / 1024 )) — staying on disk." >&2
-        echo "  (raise it with: sudo mount -o remount,size=48G /dev/shm)" >&2
-        export CARGO_TARGET_DIR="${FLEET_CACHE:-$HOME/.cache/fleet-build/target}"
+        # Falls back rather than failing. Overflowing a too-small tmpfs
+        # does not error — the kernel pages to swap, on the SSD, in small
+        # random writes that are worse for the drive than the sequential
+        # ones this exists to avoid.
+        export CARGO_TARGET_DIR="$disk"
         mkdir -p "$CARGO_TARGET_DIR"
+        echo "cache: shared on disk at $CARGO_TARGET_DIR"
+        echo "  RAM cache off: /dev/shm has $(( ${avail_kb:-0} / 1024 / 1024 )) GiB," \
+             "needs $(( need_kb / 1024 / 1024 )). tmpfs is swap-backed, so a" \
+             "tight fit would page to the SSD."
+        echo "  To use RAM: sudo mount -o remount,size=48G /dev/shm"
         return
     fi
     mkdir -p "$mnt"
     export CARGO_TARGET_DIR="$mnt"
-    echo "cache: $mnt (tmpfs, $(( avail_kb / 1024 / 1024 )) GiB free)"
+    echo "cache: RAM at $mnt ($(( avail_kb / 1024 / 1024 )) GiB free) — no SSD writes"
+    echo "  Cleared on reboot, so the first run after one is cold. RAMCACHE=0 for disk."
 }
 setup_cache
 

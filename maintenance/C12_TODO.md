@@ -5711,8 +5711,21 @@ remount command.
 `/dev/shm` rather than a new mount: the distro already provides it, so
 this needs no root and no fstab entry.
 
-Default OFF. A 16 GB machine should not start swapping because a script
-decided RAM was free.
+**Now AUTO by default**, on the operator's ask: try RAM, fall back to
+the shared disk cache when it does not fit, and say which and why in one
+or two lines.
+
+Auto-enable is only safe BECAUSE the size check refuses rather than
+overflowing. Without it, a default-on ramdisk would be the script
+deciding to page a build onto the SSD — the exact thing it exists to
+avoid. `RAMCACHE=0` is the opt-out.
+
+Each path says what a person needs to know and nothing else:
+  - RAM: how much is free, that there are no SSD writes, and that it is
+    cleared on reboot so the first run after one is cold.
+  - Disk fallback: how much `/dev/shm` has versus what is needed, that
+    tmpfs is swap-backed so a tight fit would page to the SSD anyway,
+    and the remount command.
 
 Tested all three paths here: default picks the shared dir, an explicit
 `CARGO_TARGET_DIR` wins over both, and `RAMCACHE=1` correctly refused —
