@@ -4887,16 +4887,11 @@ which file you read.\n\n",
                 // `spatial::centroid` already means this. I hand-rolled the x/z mean here and
                 // dupscan named it; that is the third copy of an existing helper this session.
                 let world_mid = crate::spatial::centroid(&pos);
-                let label_pos = |id: usize| -> crate::spatial::Vec3 {
-                    let p = pos[id];
-                    // Radial in the ground plane only: pushing vertically would lift labels off
-                    // their own nodes without gaining any room, since the graph spreads in x/z.
-                    let (dx, dz) = (p.x - world_mid.x, p.z - world_mid.z);
-                    let len = (dx * dx + dz * dz).sqrt();
-                    if !len.is_finite() || len < 1e-3 { return p; }
-                    crate::spatial::Vec3::new(p.x + dx / len * LABEL_PUSH_WORLD, p.y,
-                                              p.z + dz / len * LABEL_PUSH_WORLD)
-                };
+                // The rule lives in `nodelabel::outward` so the label text and its connector line
+                // read the SAME function and cannot disagree about where the label is. Inlining it
+                // here left the module's own copy with no callers — dead code written in the commit
+                // that fixed the previous mistake.
+                let label_pos = |id: usize| crate::nodelabel::outward(pos[id], world_mid, LABEL_PUSH_WORLD);
                 let anchor = |q: &(usize, f32, f32, f32)| -> (f32, f32) {
                     view_cam.project(label_pos(q.0), cx, cy, scale)
                         .map(|(sx, sy, _)| (sx, sy)).unwrap_or((q.1, q.2))
@@ -4939,6 +4934,17 @@ which file you read.\n\n",
                         let _ = nd;
                         let label = label_of(q.0);
                         if label.is_empty() { continue; }
+                        // A CONNECTOR, because the label no longer sits on its node. Pushing them
+                        // outward without a line leaves text floating with nothing tying it to the
+                        // turn it describes — the references always draw the leader. `m3::tube`
+                        // already exists for this; a second line primitive would have been the
+                        // fourth duplication this session.
+                        {
+                            let (a, b) = (pos[q.0], label_pos(q.0));
+                            let mut lead = m3::tube(a, b, 0.012, 4, theme::lerp_col(theme::CYAN(), theme::PANEL(), 0.45));
+                            lead.overlay = 1.0;
+                            graph.push(lead);
+                        }
                         for cell in m3::label_cells(label_pos(q.0), right, up, toward_cam, &label,
                                                     0.034, t, theme::CYAN(), lit, scroll, tanim, m3::SceneLight::Uniform, 0) {
                             graph.push(cell);

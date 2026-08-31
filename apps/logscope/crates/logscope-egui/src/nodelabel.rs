@@ -29,6 +29,7 @@
 //! `elide` is a string function and `visible` takes projected positions. Neither needs a frame, a
 //! GPU or a scene, so the crowding cases that are hard to eyeball — a tight cluster, a tie in depth,
 //! a label wider than the gap — are unit tests rather than something to squint at.
+use crate::spatial::Vec3;
 
 /// Trim a turn preview to a label: single-spaced, cut on a WORD boundary, ellipsis when cut.
 ///
@@ -121,27 +122,34 @@ pub fn px_extents(chars: usize, cell: f32, view_scale: f32, depth: f32) -> (f32,
 /// of the nodes and is what the caller passes in — a second one here, over screen pairs instead of
 /// `Vec3`s, is the duplication `dupscan` has now caught me at three times in one session.)
 ///
-/// Push a label's anchor OUTWARD from the cluster centre, so it sits beside the graph rather than
-/// on it.
+/// Where a label sits: pushed OUTWARD from the cluster centre, in the ground plane.
 ///
-/// This is what the references actually do and what I had been solving the other way round. Their
-/// cards ring the node cluster with a short connector to each node; nothing is drawn on top of
-/// anything, and nothing has to be hidden to achieve it. `visible` below hides the losers of a
-/// collision, which works and costs information — a label you cannot see is a turn you cannot read.
-/// Moving them apart first means fewer collisions to resolve at all.
+/// This is what the references do — their cards ring the node cluster with a short connector to
+/// each node, so nothing is drawn on top of anything and nothing has to be hidden. `visible` below
+/// still resolves what remains crowded, but as a fallback rather than the whole strategy: a label
+/// you cannot see is a turn you cannot read.
 ///
-/// The offset is radial from the centroid because that is the direction with room in it: a graph
-/// drawn around a centre has its empty space outside, and pushing along any fixed axis would crowd
-/// one side while leaving the other bare.
+/// Radial because that is the direction with room. A graph drawn around a centre has its empty
+/// space outside, and any fixed axis would crowd one side while leaving the other bare. Ground
+/// plane only because the graph spreads in x/z — lifting a label vertically moves it off its node
+/// without gaining any.
 ///
-/// A node AT the centroid has no outward direction — the vector is zero and normalising it would
-/// produce NaN, which is the failure that reaches `Color32` arithmetic and panics a frame later.
-/// Those keep their own position; one label in the middle is not a crowding problem.
-pub fn outward(node: (f32, f32), centroid: (f32, f32), push: f32) -> (f32, f32) {
-    let (dx, dy) = (node.0 - centroid.0, node.1 - centroid.1);
-    let len = (dx * dx + dy * dy).sqrt();
+/// ONE FUNCTION, TWO READERS. The label text and its connector line both call this, so they cannot
+/// disagree about where the label is. It took being wrong twice to arrive here: the first version
+/// pushed the SCREEN anchor, which meant the declutter measured boxes at one place while the glyphs
+/// drew at another, and the second left this as a 2D helper with no callers at all after the world
+/// version was inlined into the caller — dead code I wrote in the commit that fixed the first
+/// mistake.
+///
+/// A node AT the centroid has no outward direction. Normalising a zero vector gives NaN, and a NaN
+/// position reaches `Color32` arithmetic and panics a frame later — the projection loop already
+/// carries a guard against exactly that. Those keep their own position; one label in the middle is
+/// not a crowding problem.
+pub fn outward(node: Vec3, centre: Vec3, push: f32) -> Vec3 {
+    let (dx, dz) = (node.x - centre.x, node.z - centre.z);
+    let len = (dx * dx + dz * dz).sqrt();
     if !len.is_finite() || len < 1e-3 { return node; }
-    (node.0 + dx / len * push, node.1 + dy / len * push)
+    Vec3::new(node.x + dx / len * push, node.y, node.z + dz / len * push)
 }
 
 /// Which labels to draw, nearest first, dropping any whose box would overlap one already kept.
@@ -334,26 +342,38 @@ mod tests {
 
     #[test]
     fn a_label_is_pushed_away_from_the_middle() {
-        let c = (100.0, 100.0);
-        // due right of centre → pushed further right, same row
-        let r = outward((150.0, 100.0), c, 20.0);
-        assert!((r.0 - 170.0).abs() < 0.01 && (r.1 - 100.0).abs() < 0.01, "{r:?}");
-        // diagonal keeps its direction and gains exactly `push` in length
-        let d = outward((130.0, 140.0), c, 25.0);
-        let before = ((30.0f32).hypot(40.0), 0.0);
-        let after = (d.0 - c.0).hypot(d.1 - c.1);
-        assert!((after - (before.0 + 25.0)).abs() < 0.01, "{after} vs {}", before.0 + 25.0);
+        let c = Vec3::new(10.0, 2.0, 10.0);
+        // due +x of centre → pushed further +x, same z
+        let r = outward(Vec3::new(15.0, 2.0, 10.0), c, 2.0);
+        assert!((r.x - 17.0).abs() < 0.001 && (r.z - 10.0).abs() < 0.001, "{r:?}");
+        // diagonal keeps its direction and gains exactly `push` in ground-plane length
+        let n = Vec3::new(13.0, 2.0, 14.0);
+        let d = outward(n, c, 2.5);
+        let before = (n.x - c.x).hypot(n.z - c.z);
+        let after = (d.x - c.x).hypot(d.z - c.z);
+        assert!((after - (before + 2.5)).abs() < 0.001, "{after} vs {}", before + 2.5);
     }
 
-    /// The centre has no outward direction. Normalising a zero vector gives NaN, and a NaN screen
-    /// position is the failure that reaches Color32 arithmetic and panics a frame later — the
-    /// projection loop already carries a guard against exactly that.
+    /// GROUND PLANE ONLY. The graph spreads in x/z, so lifting a label vertically moves it off its
+    /// node without gaining any room.
+    #[test]
+    fn the_push_never_changes_the_height() {
+        let c = Vec3::new(0.0, 0.0, 0.0);
+        for n in [Vec3::new(3.0, 7.5, 4.0), Vec3::new(-2.0, -1.0, 0.5), Vec3::new(0.0, 9.0, 6.0)] {
+            assert_eq!(outward(n, c, 1.0).y, n.y, "{n:?} changed height");
+        }
+    }
+
+    /// The centre has no outward direction. Normalising a zero vector gives NaN, and a NaN position
+    /// reaches Color32 arithmetic and panics a frame later — the projection loop already carries a
+    /// guard against exactly that.
     #[test]
     fn a_node_at_the_centre_keeps_its_position_rather_than_becoming_nan() {
-        let c = (100.0, 100.0);
-        assert_eq!(outward(c, c, 30.0), c);
-        let almost = outward((100.0, 100.0002), c, 30.0);
-        assert!(almost.0.is_finite() && almost.1.is_finite(), "{almost:?}");
+        let c = Vec3::new(10.0, 2.0, 10.0);
+        let same = outward(c, c, 3.0);
+        assert!((same.x - c.x).abs() < 1e-6 && (same.z - c.z).abs() < 1e-6);
+        let almost = outward(Vec3::new(10.0, 2.0, 10.00002), c, 3.0);
+        assert!(almost.x.is_finite() && almost.y.is_finite() && almost.z.is_finite(), "{almost:?}");
     }
 
     /// The point of pushing outward: a cluster that collides on the nodes stops colliding once the
@@ -378,7 +398,8 @@ mod tests {
         assert!(kept_packed < 5, "premise: the packed ring must actually collide, kept {kept_packed}");
 
         let spread: Vec<LabelBox> = (0..5).map(|i| {
-            let (x, y) = outward(at(i), c, 90.0);
+            let w = outward(Vec3::new(at(i).0, 0.0, at(i).1), Vec3::new(c.0, 0.0, c.1), 90.0);
+            let (x, y) = (w.x, w.z);
             let (w, h) = px_extents(10, 0.034, 900.0, 40.0);
             LabelBox { id: i, x, y, depth: 40.0, w, h }
         }).collect();
