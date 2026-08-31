@@ -770,6 +770,17 @@ impl TryFrom<u8> for BlockId {
             65 => Ok(BlockId::Bookshelf),
             66 => Ok(BlockId::Pumpkin),
             80 => Ok(BlockId::SnowBlock),
+            81 => Ok(BlockId::MossyCobblestone),
+            82 => Ok(BlockId::PolishedStone),
+            83 => Ok(BlockId::SmoothSandstone),
+            84 => Ok(BlockId::Terracotta),
+            85 => Ok(BlockId::ChiseledStoneBricks),
+            86 => Ok(BlockId::DarkOakPlanks),
+            87 => Ok(BlockId::PolishedBasalt),
+            88 => Ok(BlockId::Carrot),
+            89 => Ok(BlockId::Potato),
+            90 => Ok(BlockId::Cabbage),
+            91 => Ok(BlockId::Sprout),
             92 => Ok(BlockId::Selenite),
             93 => Ok(BlockId::Gypsum),
             94 => Ok(BlockId::Dolomite),
@@ -878,6 +889,32 @@ mod tests {
     fn from_id_str_case_insensitive() {
         assert_eq!(BlockId::from_id_str("LIMESTONE"), Some(BlockId::Limestone));
         assert_eq!(BlockId::from_id_str("Marble"), Some(BlockId::Marble));
+    }
+
+    #[test]
+    fn try_from_u8_covers_every_blockid_in_all() {
+        // Regression test for a real gap found by auditing: TryFrom<u8> was
+        // manually maintained and 11 consecutive variants (discriminants
+        // 81..=91 — MossyCobblestone through Sprout, including the Carrot/
+        // Potato/Cabbage/Sprout crops) were simply never added to the match,
+        // so `BlockId::try_from` silently returned Err for real, placeable
+        // blocks. Production callers that treat Err as "unknown -> Air"
+        // (octree.rs, gpu_generator.rs, gpu_chunk_pool_vk.rs, surface_run.rs)
+        // would silently render/save these blocks as empty air; storage.rs
+        // (save-game loading) and the network Place commands in both bin
+        // targets would silently drop them entirely.
+        //
+        // This test walks every variant in `BlockId::ALL` and requires
+        // `try_from(variant as u8)` to round-trip — so any future variant
+        // added to the enum without a matching TryFrom arm fails CI
+        // immediately instead of silently misbehaving in a released build.
+        for b in BlockId::ALL {
+            let raw = b as u8;
+            let recovered = BlockId::try_from(raw);
+            assert_eq!(recovered, Ok(b),
+                "BlockId::{b:?} (id {raw}) does not round-trip through TryFrom<u8> — \
+                 it will silently disappear (treated as Air) or fail to load/save/network");
+        }
     }
 
     #[test]
