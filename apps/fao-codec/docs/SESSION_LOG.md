@@ -5187,3 +5187,64 @@ quantised — so a filter can be strength-modulated per edge instead of
 guessing, which is what AV1's own filter does. It is also purely a
 decoder-side operation on the reconstruction, so it costs no wire bytes
 and cannot lose rate.
+
+### Can the codec TELL which representation content wants? A cheap statistic ranks all five clips correctly
+
+User's architecture: the codec needs (1) to detect and label objects
+and (2) to know how each stores best — which will sometimes be
+AV1-shaped. Part (2) is testable right now, because the corpus already
+has five clips with measured v11-vs-AV1 outcomes. If "the spectrum
+decides, not the provenance" is a real law rather than a story fitted
+after the fact, a statistic computed BEFORE encoding should separate
+them.
+
+bin/spectral_probe, two axes from quantities the encoder already
+touches:
+  * HF FRACTION — share of 4x4 DCT energy above DC and the two lowest
+    AC terms. Low on flat shading and gradients (what a conventional
+    coder gets nearly free), high on noise and texture.
+  * TEMPORAL — mean |difference| after the best whole-frame integer
+    shift, normalised by the frame's own spatial activity. Low when
+    motion compensation works, high when it cannot.
+
+Measured, against the outcomes already in this log:
+
+  clip        HF     temporal   hf*tc   measured outcome
+  ground     0.496     5.589     2.77   v11 WINS by 23%
+  soldier    0.347     4.694     1.63   AV1 2.1x smaller
+  w1 film    0.169     2.276     0.38   AV1 ~18x
+  SMITE      0.323     0.905     0.29   AV1 ~15x
+  blackstar  0.344     0.232     0.08   AV1 43x
+
+THE PRODUCT ORDERS ALL FIVE EXACTLY AS THE RATE MEASUREMENTS DID,
+including the two that provenance gets wrong: soldier and blackstar are
+both engine-rendered and sit at opposite ends (1.63 vs 0.08), while
+soldier and ground are both engine-rendered and sit adjacent across the
+crossover. w1 and SMITE are within noise of each other on the statistic
+and were within noise of each other on rate.
+
+My first threshold guess (hf>0.55 AND tc>0.45, two independent gates)
+classified NOTHING as MODEL and was simply wrong — the axes are not
+independent gates, they multiply. That is not a tuning detail: it says
+the quantity that matters is how much high-frequency content the coder
+must transcribe PER UNIT of what motion compensation can save, which is
+exactly the mechanism argued for the ground clip (a static pattern
+under perspective motion has high HF that MC cannot reach).
+
+Stated honestly: n=5, one GOP each, and the crossover is BRACKETED in
+[1.63, 2.77] rather than located. The bin reports "uncertain" inside
+that interval rather than pretending to decide. What it is good for
+today is ORDERING, and ordering is what a router needs first.
+
+Where this leaves the user's two-part architecture:
+  (2) "know how each stores best" — a cheap pre-encode statistic that
+      ranks correctly now exists. The next step is per-REGION rather
+      than per-clip, since the same clip mixes flat sky with textured
+      ground, and routing is only interesting at the granularity where
+      content actually varies.
+  (1) "detect and label objects" — the mover layer already detects
+      objects and the scene protocol already gives them stable ids and
+      an editable graph. What is missing is LABELS with semantics, and
+      the honest note is that nothing in this codec can produce them
+      from pixels; they come either from a vision model or from the
+      engine, and the engine path is the one already measured to work.
