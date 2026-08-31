@@ -1273,6 +1273,20 @@ pub fn encode_gop_v3(
     plate: &Plate,
     opts: &ResidualOpts,
 ) -> PlateEncodeReportV2 {
+    encode_gop_v3_forced(frames, motions, plate, opts, None).0
+}
+
+/// v3 with an optional FORCE-PLATE map (`force[frame][region]`) and a
+/// per-frame per-region leftover-error trace returned alongside the
+/// report. Both exist for the lookahead pass in
+/// [`encode_gop_v3_lookahead`]; `None` reproduces plain v3 exactly.
+pub fn encode_gop_v3_forced(
+    frames: &[Yuv420],
+    motions: &[PlateMotion],
+    plate: &Plate,
+    opts: &ResidualOpts,
+    force_plate: Option<&Vec<Vec<bool>>>,
+) -> (PlateEncodeReportV2, Vec<Vec<u32>>) {
 
     let fw = frames[0].w;
     let fh = frames[0].h;
@@ -1351,6 +1365,7 @@ pub fn encode_gop_v3(
     let mut out_frames = Vec::with_capacity(frames.len());
     let mut recon: Vec<Yuv420> = Vec::with_capacity(frames.len());
     let mut prev_share_acc = 0.0f64;
+    let mut leftover_trace: Vec<Vec<u32>> = Vec::with_capacity(frames.len());
 
     for (fi, (f, m)) in frames.iter().zip(motions).enumerate() {
         let plate_pred = predict_frame(plate, m, fw, fh);
@@ -1389,7 +1404,10 @@ pub fn encode_gop_v3(
                     // to plate mode costs more residual than the side
                     // info saved. The side-info share is a symptom of
                     // how cheap everything else got, not of waste.
-                    if sad_prev + 64 < sad_plate {
+                    let forced = force_plate
+                        .map(|m| m[fi][gy * gw + gx])
+                        .unwrap_or(false);
+                    if !forced && sad_prev + 64 < sad_plate {
                         if std::env::var("FAO_MV_DEBUG").is_ok() {
                             let sat = MV_RANGE * 4; // qpel units at the clamp
                             if (mv.0 as i32).abs() >= sat - 4 || (mv.1 as i32).abs() >= sat - 4 {
@@ -1756,16 +1774,29 @@ pub fn encode_gop_v3(
             None => (0, composite),
         };
         out_frames.push(FrameCost { mode_bytes, residual_bytes });
+        {
+            let mut row = vec![0u32; gw * gh];
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    row[gy * gw + gx] = sad_region(
+                        &rec.y, fw, fh,
+                        (gx * REGION) as i32, (gy * REGION) as i32,
+                        &f.y, gx * REGION, gy * REGION,
+                    );
+                }
+            }
+            leftover_trace.push(row);
+        }
         recon.push(rec);
     }
     let denom = (frames.len().saturating_sub(1)).max(1) as f64;
-    PlateEncodeReportV2 {
+    (PlateEncodeReportV2 {
         plate_bytes,
         motion_bytes: frames.len() * 8,
         frames: out_frames,
         recon,
         prev_mode_share: (prev_share_acc / denom) as f32,
-    }
+    }, leftover_trace)
 }
 
 #[cfg(test)]
@@ -1965,6 +1996,87 @@ pub fn synth_grain(f: &mut Yuv420, sigma: f32, rho: f32, seed: u64) {
 /// v11.4 = v3's mode machinery + the grain split. `band` in luma levels
 /// (0 disables, reproducing v3 exactly); grain is re-synthesized onto the
 /// reconstruction so the output is displayable as-is.
+/// Two-pass lookahead RD, the construction four single-frame proxies
+/// failed to replace (region_codable_cost, rotating refresh, and the
+/// present-state drift anchor all lost; see SESSION_LOG).
+///
+/// What makes this different is HINDSIGHT. Pass 1 encodes normally and
+/// records, per region per frame, the leftover error SAD(recon,source).
+/// A prev-mode chain that ends badly is then visible as a whole, and —
+/// critically — the refresh is placed at the chain's START, before the
+/// error was paid for, rather than at the frame where drift was
+/// finally noticed. A present-state rule can only ever react late;
+/// that late reaction is exactly why the drift anchor measured null.
+///
+/// Pass 2 re-encodes with those regions forced to plate mode. Both
+/// passes are scored with J = SSE + λ·bytes (λ = dz²/3, the same
+/// multiplier the per-take router uses) and the better one is
+/// returned, so the lookahead can never lose more than encode time.
+pub fn encode_gop_v3_lookahead(
+    frames: &[Yuv420],
+    motions: &[PlateMotion],
+    plate: &Plate,
+    opts: &ResidualOpts,
+    chain_thresh: u32,
+) -> PlateEncodeReportV2 {
+    let (rep1, trace) = encode_gop_v3_forced(frames, motions, plate, opts, None);
+    if frames.is_empty() || trace.is_empty() {
+        return rep1;
+    }
+    let n_reg = trace[0].len();
+    let nf = trace.len();
+    // Find chains: consecutive frames where a region's leftover stays
+    // above the threshold. Force plate at the FIRST frame of each such
+    // chain (and only there — one refresh pays down the whole chain).
+    let mut force = vec![vec![false; n_reg]; nf];
+    let mut forced_count = 0usize;
+    for r in 0..n_reg {
+        let mut fi = 1usize;
+        while fi < nf {
+            if trace[fi][r] > chain_thresh {
+                let start = fi;
+                let mut worst = 0u32;
+                while fi < nf && trace[fi][r] > chain_thresh {
+                    worst = worst.max(trace[fi][r]);
+                    fi += 1;
+                }
+                // Only chains that both persist and hurt are worth a
+                // refresh: a single bad frame is cheaper to absorb in
+                // residual than to re-anchor.
+                if fi - start >= 3 && worst > chain_thresh * 2 {
+                    force[start][r] = true;
+                    forced_count += 1;
+                }
+            } else {
+                fi += 1;
+            }
+        }
+    }
+    if forced_count == 0 {
+        return rep1;
+    }
+    let (rep2, _) = encode_gop_v3_forced(frames, motions, plate, opts, Some(&force));
+    let cost = |rep: &PlateEncodeReportV2| -> f64 {
+        let mut sse = 0.0f64;
+        for (rc, f) in rep.recon.iter().zip(frames) {
+            for (a, b) in rc.y.iter().zip(&f.y) {
+                let d = *a as f64 - *b as f64;
+                sse += d * d;
+            }
+        }
+        let bytes = rep.plate_bytes
+            + rep.motion_bytes
+            + rep.frames.iter().map(|c| c.residual_bytes + c.mode_bytes).sum::<usize>();
+        let lambda = (opts.dead_zone as f64).powi(2) / 3.0;
+        sse + lambda * bytes as f64
+    };
+    let (j1, j2) = (cost(&rep1), cost(&rep2));
+    if std::env::var("FAO_LOOKAHEAD_DEBUG").is_ok() {
+        eprintln!("lookahead: {forced_count} refreshes forced, J {j1:.4e} -> {j2:.4e}");
+    }
+    if j2 < j1 { rep2 } else { rep1 }
+}
+
 pub fn encode_gop_v4(
     frames: &[Yuv420],
     motions: &[PlateMotion],

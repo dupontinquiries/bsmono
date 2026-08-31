@@ -3693,3 +3693,38 @@ already near their compressed floor.
 Side info is now understood as priced-correctly rather than wasteful;
 the remaining lever on it is fewer prev-mode regions through better
 prediction (lookahead RD, mover layers), not cheaper flags.
+
+### True lookahead RD (two-pass, hindsight): implemented, and it LOSES
+
+The construction four single-frame proxies were supposed to be
+approximating. Pass 1 encodes normally while recording per-region
+per-frame leftover error; chains of persistent high leftover are
+identified WITH HINDSIGHT; pass 2 re-encodes forcing a plate refresh
+at each chain's START (not where drift was noticed — that lateness
+was the diagnosed flaw in the drift-anchor null); both passes scored
+J = SSE + λ·bytes, better one returned, so it can only cost encode
+time.
+
+Measured (FAO_LOOKAHEAD_DEBUG prints the J comparison directly):
+  shotB thr1024: 648 refreshes,  J 9.5961e8 → 9.7352e8  (worse)
+  shotB thr512 : 2833 refreshes, J 9.5961e8 → 9.9656e8  (worse)
+  shot9 thr2048: 2163 refreshes, J 2.0449e10 → 2.0493e10 (worse)
+  shot9 thr4096: no chains qualify (pass 1 returned unchanged)
+Every configuration lost, and monotonically in the number of forced
+refreshes. Guard did its job: output byte-identical to plain v3 in
+all four runs.
+
+The verdict is now well-supported rather than suspected: the SAD
+decision is not a proxy for something better — forcing plate mode on
+a persistently-erring region costs more (a full plate-vs-source
+residual, on regions that are hard precisely because the plate
+doesn't fit them) than the drift it prevents. Persistent leftover
+marks regions the PLATE can't code either, not regions that would
+benefit from re-anchoring. Five attempts, one conclusion: on this
+material the mode decision is at its optimum; the remaining lever is
+better PREDICTORS (mover layers), not better mode selection.
+
+Kept: encode_gop_v3_forced (force-plate map + leftover trace) and
+encode_gop_v3_lookahead behind --lookahead, since the machinery is
+the natural harness for per-region trial encodes later. Default path
+unchanged and byte-exact.

@@ -1010,7 +1010,10 @@ end_header
         let rep = if args.iter().any(|a| a == "--v2") {
             plate::encode_gop_v2(&frames, &motions, &pl, &opts)
         } else {
-            if do_route {
+            if let Some(ls) = arg_val(&args, "--lookahead") {
+                let thr: u32 = ls.parse().unwrap_or(1024);
+                plate::encode_gop_v3_lookahead(&frames, &motions, &pl, &opts, thr)
+            } else if do_route {
                 // Branch A: self (own motions + own plate).
                 let m_self = if args.iter().any(|a| a == "--static") {
                     vec![plate::PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 }; frames.len()]
