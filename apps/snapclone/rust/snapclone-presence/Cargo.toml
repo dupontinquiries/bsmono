@@ -20,6 +20,10 @@ dht-kit = { path = "../../../../shared/dht-kit" }
 snapcore = { path = "../../../../shared/snapcore", features = ["wire"] }
 snapclone-identity = { path = "../snapclone-identity" }
 anyhow  = "1"
+# SHA-1, because that is what OpenDHT's InfoHash::get is (gnutls picks SHA1
+# for a 20-byte digest) and the DHT key has to be the same number on both
+# sides or the two halves publish to different places forever.
+sha1 = "0.10"
 rand    = "0.8"
 chrono  = { version = "0.4", features = ["serde"] }
 serde   = { version = "1", features = ["derive"] }

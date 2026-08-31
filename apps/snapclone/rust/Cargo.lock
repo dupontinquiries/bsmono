@@ -2883,6 +2883,7 @@ dependencies = [
  "dht-kit",
  "rand 0.8.6",
  "serde",
+ "sha1",
  "snapclone-identity",
  "snapcore",
 ]
