@@ -5114,3 +5114,76 @@ high-frequency content makes prev-MC and AV1 both look better), so the
 means the AV1 comparison above is measured on content missing exactly
 the high-frequency texture that would have favoured v11. Sampling the
 atlas is the next step before treating the AV1 row as final.
+
+### Blocking measured: AV1 barely blocks at all, and v11 IS THE BLOCKY ONE
+
+User's report: AV1 gets blocky to the point of unbearability below
+~500 kbps / crf 45-61. Every AV1 comparison in this codebase has been
+PSNR-anchored, and PSNR is close to blind to exactly that artifact — a
+picture can stay close in mean-square terms while acquiring hard steps
+on the transform grid — so the claim was worth measuring rather than
+accepting or dismissing.
+
+bin/blockiness: for each candidate grid period P, the ratio of mean
+|first difference| ACROSS positions that are multiples of P to the mean
+everywhere else, luma, averaged over frames. 1.000 = no grid structure;
+higher = harder steps on that grid. Per-period rather than one number,
+because AV1 picks among block sizes and the signature lands on whichever
+dominates. It measures ONE artifact and belongs beside PSNR, not
+instead of it.
+
+Procedural ground (48f):
+  file          P=4    P=8   P=16   P=32   P=64
+  source       1.011  0.989  0.951  1.080  0.874
+  AV1 crf35    1.014  0.994  0.958  1.100  0.881
+  AV1 crf45    1.002  0.985  0.955  1.093  0.850
+  AV1 crf55    1.007  1.009  1.010  1.157  0.952
+  v11 dz32     2.686  3.188  4.642  4.251  4.025
+
+blackstar real footage (48f):
+  source       0.885  0.905  0.917  1.023  1.415
+  AV1 crf45    0.889  0.916  0.930  1.037  1.421
+  AV1 crf55    0.884  0.912  0.926  1.036  1.418
+  AV1 crf61    0.894  0.935  0.959  1.066  1.440
+  v11 dz32     1.179  1.251  1.419  1.473  1.869
+
+TWO FINDINGS, and the second one is about this codec, not AV1.
+
+1. The claim does not reproduce on this material. AV1 at crf61 tracks
+   the SOURCE's own grid statistics to within a few percent — its
+   deblocking filter, CDEF and loop restoration are doing exactly the
+   job they exist for. Visual check on a crf61 crop agrees: the
+   degradation is smearing and colour bleed on the high-detail robot,
+   not tiling. The user's experience is real but is likely from
+   encoders or settings that skip those post-filters (hardware
+   encoders, or `-svtav1-params` that disable them), or from content
+   with large flat gradients where banding reads as blocking. Worth
+   re-testing against the actual encoder they see it on.
+
+2. v11 IS THE BLOCKY CODEC, badly, and no metric used all session
+   showed it. 4.64x at P=16 on the ground clip — and P=16 is exactly
+   REGION, this codec's mode-decision granularity — with 2.7-4.0x at
+   the 4x4 transform grid. On real footage 1.42x at P=16 against AV1's
+   0.93x. v11 has NO deblocking filter, no CDEF, no loop restoration:
+   every region boundary where the mode decision switched predictor,
+   and every 4x4 block edge where the dead zone quantised differently,
+   ships its step straight to the viewer.
+
+This changes how to read every matched-PSNR comparison in this session.
+When v11 "matched AV1 at equal PSNR" it was doing so while carrying
+2-5x the grid discontinuity, so those comparisons FLATTERED v11, not
+AV1 — the opposite of the bias I assumed when I noted PSNR
+under-credits v11's SSIM wins on flat synthetic content. The
+procedural-ground result (v11 -23% bytes at +0.8 dB vs AV1) is the one
+that most needs re-reading: v11 wins there on rate while blocking 4.6x
+harder, so at matched PERCEPTUAL quality the margin is smaller and may
+be gone.
+
+Named next construction, and it is now the highest-value one for
+picture quality: a deblocking filter. The information needed is already
+in the encoder — the mode map says exactly where predictor boundaries
+are, and the per-block scale bytes say how hard each block was
+quantised — so a filter can be strength-modulated per edge instead of
+guessing, which is what AV1's own filter does. It is also purely a
+decoder-side operation on the reconstruction, so it costs no wire bytes
+and cannot lose rate.
