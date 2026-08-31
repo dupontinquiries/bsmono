@@ -138,6 +138,11 @@ pub struct RichDoc {
     pub blocks_dropped: usize,
     /// Elements the caller's filter removed.
     pub filtered: usize,
+    /// Runs that were merged into their neighbour once the run budget ran
+    /// out. The TEXT is all still here — what was given up is the styling,
+    /// which is the right thing to lose: a page that stops being bold is
+    /// readable, and a page that stops halfway is not.
+    pub runs_merged: usize,
 }
 
 /// One element, as a filter sees it.
@@ -162,6 +167,23 @@ pub struct Element<'a> {
 /// forever, rather than a slow load.
 pub const MAX_BLOCKS: usize = 2_000;
 
+/// The most styled runs a document may produce.
+///
+/// MEASURED, after finding that `MAX_BLOCKS` bounds the wrong thing. On
+/// this machine, rendering a phone-width viewport:
+///
+/// * a real page, 571 blocks — 2.1ms a frame
+/// * a synthetic page at the block cap, 2,000 blocks — 3.1ms
+/// * 100 blocks carrying 20,000 inline runs — **36.8ms**
+///
+/// A twentieth of the block count and twelve times the cost, past the
+/// frame budget here and hopeless on a phone. The expense is per RUN,
+/// because each one is a separate `ui.label` egui has to lay out — and
+/// real pages are full of spans, so this is not a synthetic worry.
+///
+/// 6,000 leaves the measured real pages untouched by a wide margin.
+pub const MAX_RUNS: usize = 6_000;
+
 /// How far a list is indented before the indent stops growing.
 ///
 /// Deeper nesting than this is real in generated documentation and is
@@ -182,13 +204,15 @@ pub const MAX_LIST_DEPTH: u8 = 5;
 /// the list.
 pub struct ParseOptions<'a> {
     pub max_blocks: usize,
+    /// See [`MAX_RUNS`]. Runs past this merge into their neighbour.
+    pub max_runs: usize,
     /// Return true to drop the element AND its subtree.
     pub skip_element: Option<&'a dyn Fn(Element<'_>) -> bool>,
 }
 
 impl Default for ParseOptions<'_> {
     fn default() -> Self {
-        ParseOptions { max_blocks: MAX_BLOCKS, skip_element: None }
+        ParseOptions { max_blocks: MAX_BLOCKS, max_runs: MAX_RUNS, skip_element: None }
     }
 }
 
@@ -431,6 +455,8 @@ pub fn parse_html_with(html: &str, opts: &ParseOptions<'_>) -> RichDoc {
     let toks = tokenize(html);
     let mut dropped = 0usize;
     let mut filtered = 0usize;
+    let mut runs = 0usize;
+    let mut runs_merged = 0usize;
     /// Depth of the filtered element we are inside, like `noise_depth`: a
     /// filter that dropped the open tag and not the subtree would leave the
     /// advertisement's text in the document with its wrapper gone, which is
@@ -689,7 +715,21 @@ pub fn parse_html_with(html: &str, opts: &ParseOptions<'_>) -> RichDoc {
                 if let Some(b) = cur.as_mut() {
                     let text = if preserve { text } else { collapse_ws(&text) };
                     if !text.is_empty() {
-                        b.inlines.push(Inline { text, style: style.clone() });
+                        // Past the budget, the text joins the previous run
+                        // instead of starting a new one. It keeps every
+                        // character and stops paying per run — see
+                        // MAX_RUNS for the measurements that made this
+                        // necessary.
+                        match b.inlines.last_mut() {
+                            Some(prev) if runs >= opts.max_runs => {
+                                prev.text.push_str(&text);
+                                runs_merged += 1;
+                            }
+                            _ => {
+                                b.inlines.push(Inline { text, style: style.clone() });
+                                runs += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -702,7 +742,7 @@ pub fn parse_html_with(html: &str, opts: &ParseOptions<'_>) -> RichDoc {
     if let Some(t) = table.take() {
         if !t.rows.is_empty() { blocks.push(t); }
     }
-    RichDoc { blocks, blocks_dropped: dropped, filtered }
+    RichDoc { blocks, blocks_dropped: dropped, filtered, runs_merged }
 }
 
 fn collapse_ws(s: &str) -> String {
@@ -1292,5 +1332,59 @@ mod real_page_tests {
     fn code_keeps_its_leading_space_because_indentation_is_the_content() {
         let d = parse_html("<pre>    indented\n</pre>");
         assert!(d.text().starts_with("    "), "{:?}", d.text());
+    }
+}
+
+#[cfg(test)]
+mod run_budget_tests {
+    use super::*;
+
+    fn heavily_styled(blocks: usize, runs_each: usize) -> String {
+        let runs: String = (0..runs_each).map(|j| format!("<b>w{j}</b> ")).collect();
+        (0..blocks).map(|_| format!("<p>{runs}</p>")).collect()
+    }
+
+    #[test]
+    fn a_page_of_many_runs_is_bounded_and_keeps_all_its_text() {
+        // The finding that made this exist: 100 blocks carrying 20,000
+        // runs rendered in 36.8ms a frame, against 3.1ms for a page at the
+        // BLOCK cap. The budget was counting the wrong thing.
+        let html = heavily_styled(100, 200);
+        let d = parse_html(&html);
+        let runs: usize = d.blocks.iter().map(|b| b.inlines.len()).sum();
+        // The budget PLUS one per block: a block with no runs has no
+        // text, so the first run of each is always kept and only the
+        // second onwards can merge. Still bounded, and worth stating —
+        // my first assertion was tighter than the design and failed at
+        // 6,070.
+        assert!(runs <= MAX_RUNS + d.blocks.len(), "{runs} runs got through");
+        assert!(d.runs_merged > 0, "nothing was merged on a 20,000-run page");
+
+        // Every word survives — the styling is what was given up. A page
+        // that stops being bold is readable; one that stops halfway is not.
+        let text = d.text();
+        assert!(text.contains("w0"), "the first word is missing");
+        assert!(text.contains("w199"), "the last word of a block is missing");
+        assert_eq!(d.blocks.len(), 100, "blocks were dropped instead of runs merged");
+    }
+
+    #[test]
+    fn an_ordinary_page_is_nowhere_near_the_run_budget() {
+        // 6,000 was chosen against real pages — github.com at 197 blocks
+        // and pypi.org at 571 — and a limit that ordinary pages hit is a
+        // limit that removes styling from everything.
+        let d = parse_html(&heavily_styled(50, 20));
+        assert_eq!(d.runs_merged, 0, "an ordinary page lost its styling");
+    }
+
+    #[test]
+    fn the_merge_joins_text_rather_than_dropping_or_gluing_it() {
+        // Merging must not lose the spaces between runs, or the tail of a
+        // long page reads as one welded word.
+        let d = parse_html_with("<p><b>a</b> <b>b</b> <b>c</b></p>",
+                                &ParseOptions { max_runs: 1, ..Default::default() });
+        let joined: String = d.blocks[0].inlines.iter().map(|i| i.text.as_str()).collect();
+        assert!(joined.contains('a') && joined.contains('c'), "{joined:?}");
+        assert!(joined.contains(' '), "the runs were welded together: {joined:?}");
     }
 }

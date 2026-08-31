@@ -74,7 +74,7 @@ fn parse_with(html: &str, mode: FilterMode, max_blocks: usize) -> uikit_web::Ric
         ad_filter::should_filter(e.tag, e.id, e.class, e.src, mode)
     };
     uikit_web::parse_html_with(html, &uikit_web::ParseOptions {
-        max_blocks, skip_element: Some(&skip) })
+        max_blocks, skip_element: Some(&skip), ..Default::default() })
 }
 
 pub fn parse_page(html: &str, mode: FilterMode) -> uikit_web::RichDoc {
