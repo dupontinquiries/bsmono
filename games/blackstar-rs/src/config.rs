@@ -111,6 +111,23 @@ pub struct FlipCfg {
 /// Narrative framing. See `archive::RECEIVED` — how much of the history the
 /// game hands the player already believing.
 pub struct StoryCfg {
+    /// THE MASTER SHIP. Successor to the C engine's "unlock the codex"
+    /// setting, which did not survive the port because the codex is no longer
+    /// gated at all — `codex.rs` decided "annotate, never gate", and a test
+    /// stops anyone adding visibility state back.
+    ///
+    /// What DOES need an unlock is the ship. Three progression gates now sit
+    /// between a new save and most of the game: the Wardeck opens after
+    /// Film 1, the space bridge after Film 2, and each destination after a
+    /// mission has reached it. That is right for a player and useless for
+    /// anyone testing the far end of the map.
+    ///
+    /// With this on, the ship jumps anywhere. It is a SAVE FLAG rather than a
+    /// launch argument on purpose: a tester toggles it mid-session without
+    /// restarting, and the save carries the fact that it was on — a build
+    /// that quietly ignored its own gates would produce bug reports nobody
+    /// can reproduce.
+    pub debug_ship: bool,
     /// MYSTERY ANCHOR, 0 = nothing is known, 1 = the whole received account
     /// is on the table (including the parts of it that are false).
     pub anchor: f32,
@@ -188,7 +205,7 @@ impl Default for Config {
             // about the player; treating the deep strata as known throws the
             // game away. The midpoint is the only defensible default, and it
             // is a default rather than a decision: the dial is the answer.
-            story: StoryCfg { anchor: 0.45, case_cap: crate::tradecraft::CASE_CAP as f32, possible_at: 2.0, high_at: 3.0, era: 0.0 },
+            story: StoryCfg { debug_ship: false, anchor: 0.45, case_cap: crate::tradecraft::CASE_CAP as f32, possible_at: 2.0, high_at: 3.0, era: 0.0 },
             preset: 0,
         }
     }
@@ -250,6 +267,7 @@ impl Config {
         w("car_boost_regen", self.car.boost_regen);
         w("car_boost_max", self.car.boost_max);
         w("car_boost_unl", self.car.unlimited_boost as u8 as f32);
+        w("story_debug_ship", self.story.debug_ship as u8 as f32);
         w("car_jump", self.car.jump);
         w("car_analog", self.car.analog as u8 as f32);
         w("car_analog_soft", self.car.analog_soft);
@@ -321,6 +339,7 @@ impl Config {
             "car_boost_regen" => self.car.boost_regen = v.clamp(0.0, 50.0),
             "car_boost_max" => self.car.boost_max = v.clamp(0.3, 2.5),
             "car_boost_unl" => self.car.unlimited_boost = b,
+            "story_debug_ship" => self.story.debug_ship = b,
             "car_jump" => self.car.jump = v.clamp(0.5, 2.2),
             "car_analog" => self.car.analog = b,
             "car_analog_soft" => self.car.analog_soft = v.clamp(0.0, 0.8),

@@ -28,8 +28,18 @@ knows it when you read one. A named subset works too
 (`BLACKSTAR_PLAYTEST=the_pluto_line,the_beach_opens`), and a typo is
 reported rather than silently doing nothing.
 
-Why it is needed: this session added three progression gates, and two of
-them sit in front of the thing most worth testing.
+Or, in-game and without a restart: **SETTINGS → MASTER SHIP (JUMP
+ANYWHERE)**. A save flag rather than a launch argument, so a tester
+toggles it mid-session and the save records that it was on. Every gate
+defers to `Shipboard::unrestricted`, one method, so turning it on does
+not leave the tester hitting the next gate they had not thought about.
+
+The two are for different jobs: the env var is for a scripted or
+one-shot launch, the setting is for a tester already in the game who has
+just hit a wall.
+
+Why either is needed: this session added three progression gates, and
+two of them sit in front of the thing most worth testing.
 
 | gate | opens after | film |
 |---|---|---|

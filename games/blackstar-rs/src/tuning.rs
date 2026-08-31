@@ -241,6 +241,7 @@ pub static NOT_A_FEEL_KNOB: &[(&str, &str)] = &[
     ("ray_quality", "hardware"),
     ("rays", "hardware"),
     ("screen_door", "hardware"),
+    ("story_debug_ship", "the master ship: a testing override, not a feel knob — it removes progression gates rather than changing how anything plays"),
     ("preset", "display only; records the last mutator preset picked"),
     ("filmic", "a grade the player picks"),
     ("exposure", "a grade the player picks"),

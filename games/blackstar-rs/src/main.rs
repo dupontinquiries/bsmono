@@ -430,6 +430,11 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             // already believing" was reachable only by hand-editing a save.
             // Describing something as a menu setting does not put it in a menu.
             ("WHAT YOU ALREADY BELIEVE", Header),
+            // THE MASTER SHIP. Named for what it does rather than "debug",
+            // because a tester reads the row and has to know what turning it
+            // on means: every progression gate stops applying, and the save
+            // is no longer a normal one.
+            ("MASTER SHIP (JUMP ANYWHERE)", Toggle { get: |c| c.story.debug_ship, set: |c, v| c.story.debug_ship = v }),
             ("MYSTERY ANCHOR", Slider { get: |c| c.story.anchor, set: |c, v| c.story.anchor = v, min: 0.0, max: 1.0, step: 0.05, def: 0.45, fmt: 0 }),
             ("CAMPAIGN (0 PRESENT / 1 ARCHIVE)", Slider { get: |c| c.story.era, set: |c, v| c.story.era = v, min: 0.0, max: 1.0, step: 1.0, def: 0.0, fmt: 1 }),
             ("HOW THE MAP FIRMS UP", Header),

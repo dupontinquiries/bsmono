@@ -213,9 +213,21 @@ pub struct Shipboard {
     pub anchor: f32,
     /// how fast the map firms up (see provenance::Ladder, cfg arch_*)
     pub ladder: Ladder,
+    /// THE MASTER SHIP — cfg `story_debug_ship`. Every progression gate
+    /// defers to it, so a tester reaches the far end of the map without
+    /// playing to it.
+    pub debug_ship: bool,
 }
 
 impl Shipboard {
+    /// Does the master ship apply? ONE method, consulted by every gate, so
+    /// there is exactly one place the override lives — a second way to bypass
+    /// a gate is a second thing to keep in sync with the gates, and this
+    /// codebase already learned that lesson from having two fold durations.
+    pub fn unrestricted(&self) -> bool {
+        self.debug_ship
+    }
+
     pub fn load() -> Shipboard {
         let (sv, _, cfg) = save::load();
         // the unlock is applied to the LOADED log, never written back — see
@@ -226,6 +238,7 @@ impl Shipboard {
         }
         Shipboard {
             anchor: cfg.story.anchor,
+            debug_ship: cfg.story.debug_ship,
             ladder: Ladder::from_cfg(&cfg),
             camp,
             raids: RaidLog::from_line(&sv.wardens),
@@ -439,6 +452,9 @@ fn fly_the_drop(
 /// mission, `warden:<id>` a raid clear — so the starmap and the archaeology
 /// map cannot disagree about where you have been.
 fn gate_open_for(dest: &str, sb: &Shipboard) -> bool {
+    if sb.unrestricted() {
+        return true;
+    }
     // the first two are always open; the rest follow the missions that reach
     // them, which is what `content::MISSIONS` already encodes
     if matches!(dest, "earth" | "outer_rim") {
@@ -903,7 +919,7 @@ pub fn apply(st: Station, ev: &Event, sb: &mut Shipboard, week: u64) -> Option<O
             // the cooperative endgame as its second experience — the ladder
             // has never had an opinion about that, because its job is
             // ordering signals, not readiness.
-            if !crate::raidcon::unlocked(&sb.camp) {
+            if !sb.unrestricted() && !crate::raidcon::unlocked(&sb.camp) {
                 return Some(Order::Did(crate::raidcon::locked_note()));
             }
             // THE LADDER GATES. `next_up` is the lowest-tier unrecovered
@@ -1841,6 +1857,7 @@ mod tests {
             dig: Dig::default(),
             anchor: 0.45,
             ladder: Ladder::default(),
+            debug_ship: false,
         }
     }
 
@@ -2037,6 +2054,33 @@ mod tests {
         // and the split is real in both directions
         assert!(!beyond_sol("earth") && !beyond_sol("pluto"), "Sol is not in Sol");
         assert!(beyond_sol("cybertron") && beyond_sol("glaciem"), "the bridge worlds are in Sol");
+    }
+
+    #[test]
+    fn the_master_ship_opens_every_gate_at_once() {
+        // One override, three gates. The point of `unrestricted` being a
+        // single method is that a tester who turns it on does not then hit
+        // the NEXT gate they had not thought about — which is exactly what
+        // would happen if each gate carried its own escape hatch.
+        let mut sb = board();
+        assert!(!sb.unrestricted(), "the master ship is on by default");
+        // fresh save: everything shut
+        assert!(!gate_open_for("cybertron", &sb), "precondition");
+        let next = sb.raids.next_up().expect("a ladder").id;
+        assert!(
+            matches!(apply(Station::Wardeck, &Event::Pressed(next), &mut sb, 4), Some(Order::Did(_))),
+            "precondition: the Wardeck should be shut"
+        );
+
+        sb.debug_ship = true;
+        assert!(gate_open_for("cybertron", &sb), "an extra-solar world stayed shut");
+        assert!(gate_open_for("trappist1e", &sb), "an exoworld stayed shut");
+        assert!(gate_open_for("earth", &sb), "the master ship closed Sol");
+        assert_eq!(
+            apply(Station::Wardeck, &Event::Pressed(next), &mut sb, 4),
+            Some(Order::Raid(next)),
+            "the Wardeck stayed shut for the master ship"
+        );
     }
 
     #[test]
