@@ -587,6 +587,8 @@ pub struct Snapclone {
     /// the release clears the lock in the same frame the layer reports the
     /// jump — which turned two pages per swipe.
     pub swipe_claimed: bool,
+    /// This touch has already gone back one level.
+    pub back_armed: bool,
     /// Accent and background derived from the photos in the inbox, so the app
     /// takes on the colour of what is in it. `None` until enough pixels have
     /// been sampled, and `None` is a real answer — see `ambient()`.
@@ -787,6 +789,7 @@ impl Snapclone {
             touch_origin: None,
             swipe_settle: None,
             swipe_claimed: false,
+            back_armed: false,
             ambient: None,
             // Written here rather than in HelpManual::default(): the widget is
             // generic over its sections, and this app's manual living inside it
@@ -2052,6 +2055,11 @@ impl Snapclone {
     /// Returns 0.0 when nothing is happening, which is the common case and
     /// costs one pointer read.
     pub fn tick_page_swipe(&mut self, ui: &Ui, surface: egui::Rect, dt_ms: f32) -> f32 {
+        /// How wide the left-edge strip is for a back swipe. Wide enough to
+        /// hit without looking, narrow enough that it is not most of the
+        /// screen — the same order as the system gesture area on Android
+        /// and iOS, which is what people's thumbs are already trained on.
+        const EDGE_BACK_WIDTH: f32 = 32.0;
         use crate::swipe_physics::Intent;
         let t_ms = ui.input(|i| i.time) as f32 * 1000.0;
         let (down, pos) = ui.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos()));
@@ -2063,13 +2071,35 @@ impl Snapclone {
                 match self.axis_lock.feed(dx, dy) {
                     Intent::Undecided | Intent::Scroll => {}
                     Intent::Page => {
+                        // EDGE-SWIPE BACK. On a subpage there is nowhere to
+                        // page to — `swipe_page` refuses, correctly — and
+                        // the gesture people try is a rightward drag from
+                        // the left edge, which everywhere else on a phone
+                        // means back. Without it the only way out of a
+                        // subpage is a button, and on a large screen that
+                        // button is at the far corner from the thumb.
+                        //
+                        // Anchored to the left EDGE rather than allowed
+                        // anywhere: a rightward drag in the middle of a
+                        // detail view is a scroll or a selection far more
+                        // often than a back, and stealing it would make
+                        // content undraggable.
+                        if self.nav.can_go_back() {
+                            if origin.x - surface.left() <= EDGE_BACK_WIDTH
+                                && dx >= crate::swipe_physics::AXIS_SLOP
+                                && !self.modal.blocks_input()
+                                && !self.back_armed
+                            {
+                                self.back_armed = true;
+                                self.nav.back();
+                            }
+                            return 0.0;
+                        }
                         // Begun at the ORIGIN, not at the point where the
                         // lock decided: starting here would drop the first
                         // twelve pixels of travel, so the page would jump
                         // by that much the moment it took over.
-                        if self.swipe.is_none() && !self.modal.blocks_input()
-                            && !self.nav.can_go_back()
-                        {
+                        if self.swipe.is_none() && !self.modal.blocks_input() {
                             self.begin_swipe(origin.x, surface.width(), t_ms);
                             self.swipe_settle = None;
                         }
@@ -2103,6 +2133,10 @@ impl Snapclone {
             }
             self.touch_origin = None;
             self.axis_lock.release();
+            // One back per touch. Without this, holding past the threshold
+            // pops a level every frame and a deep stack unwinds in a
+            // tenth of a second.
+            self.back_armed = false;
         }
 
         if let Some(sw) = self.swipe.as_ref() {
@@ -4408,6 +4442,65 @@ mod tests {
         assert!(mid < -50.0, "the page did not follow the finger: {mid}");
         frame(&mut app, vec![at(60.0), release(60.0)]);
         assert_eq!(app.nav.page(), 1, "a drag most of the way across turned nothing");
+    }
+
+    #[test]
+    fn a_swipe_from_the_left_edge_goes_back_out_of_a_subpage() {
+        // On a subpage there is nowhere to page to, so the gesture people
+        // try is the one that means back everywhere else on a phone. Without
+        // it the only way out is a button in the far corner from the thumb.
+        use egui::{Context, Event, PointerButton, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let mut frame = |app: &mut Snapclone, events: Vec<Event>| {
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen),
+                                       ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        };
+        let mv = |x: f32| Event::PointerMoved(Pos2::new(x, 400.0));
+        let btn = |x: f32, pressed: bool| Event::PointerButton {
+            pos: Pos2::new(x, 400.0), button: PointerButton::Primary,
+            pressed, modifiers: Default::default() };
+
+        app.nav.push_subpage(1);
+        assert!(app.nav.can_go_back());
+        frame(&mut app, vec![mv(8.0), btn(8.0, true)]);
+        frame(&mut app, vec![mv(90.0)]);
+        assert!(!app.nav.can_go_back(), "the edge swipe did not go back");
+        let page_before = app.nav.page();
+        // Still dragging: one back per touch, or a deep stack unwinds in a
+        // tenth of a second and the page turns underneath it.
+        frame(&mut app, vec![mv(300.0)]);
+        frame(&mut app, vec![mv(360.0), btn(360.0, false)]);
+        assert_eq!(app.nav.page(), page_before,
+                   "the same touch also turned the page");
+    }
+
+    #[test]
+    fn a_rightward_drag_in_the_middle_of_a_subpage_is_not_a_back() {
+        // A rightward drag away from the edge is a scroll or a selection far
+        // more often than a back. Stealing it makes content undraggable.
+        use egui::{Context, Event, PointerButton, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let mut frame = |app: &mut Snapclone, events: Vec<Event>| {
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen),
+                                       ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        };
+        app.nav.push_subpage(1);
+        frame(&mut app, vec![Event::PointerMoved(Pos2::new(200.0, 400.0)),
+            Event::PointerButton { pos: Pos2::new(200.0, 400.0),
+                button: PointerButton::Primary, pressed: true,
+                modifiers: Default::default() }]);
+        frame(&mut app, vec![Event::PointerMoved(Pos2::new(340.0, 400.0))]);
+        assert!(app.nav.can_go_back(), "a mid-screen drag went back");
     }
 
     #[test]
