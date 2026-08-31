@@ -357,6 +357,10 @@ pub struct Controller {
     /// list changes length. A per-row struct because the halo is per-row
     /// state — one shared badge would bloom every row on any change.
     pub silhouettes: Vec<crate::product_silhouette::ProductSilhouette>,
+    /// The animation scale from settings, remembered so a badge created
+    /// after `apply_settings` gets it too — a device that appears mid-
+    /// session would otherwise animate at full speed under reduce-motion.
+    pub motion_scale: f32,
     /// The volume the dial last reported, waiting for the host to debounce and
     /// push. `None` once it has been sent.
     pub pending_volume: Option<f32>,
@@ -503,6 +507,7 @@ impl Controller {
             dial: crate::dial::VolumeDial::new(0.0),
             watermark: crate::dial_watermark::DialWatermark::default(),
             silhouettes: Vec::new(),
+            motion_scale: 1.0,
             pending_volume: None,
             tags: Vec::new(),
             tag_editor: Default::default(),
@@ -595,7 +600,37 @@ impl Controller {
     pub fn apply_settings(&mut self, ctx: &egui::Context, prefs: &settings_kit::Prefs) {
         uikit_egui::apply_prefs(ctx, prefs);
         *self.gesture.config_mut() = prefs.gesture_config(320.0);
+        // THE ACCENT CHANGED, so the badges bloom once. `accent_changed`
+        // is what the halo is FOR — the module calls it "a marker, not a
+        // flourish" — and it had no caller, so switching palette repainted
+        // every outline in a new colour with nothing to draw the eye to
+        // the change.
+        //
+        // Guarded on the palette actually differing: called
+        // unconditionally this fires every frame, and a halo that never
+        // stops is the throb the module's two-phase envelope exists to
+        // avoid.
+        if self.palette != prefs.palette {
+            for s in self.silhouettes.iter_mut() {
+                s.accent_changed();
+            }
+        }
         self.palette = prefs.palette.clone();
+        // REDUCE MOTION REACHES THE BADGES. `set_motion_scale` existed with
+        // no caller, so the silhouettes animated at full speed under a
+        // setting whose whole point is that they should not — and a
+        // reduce-motion preference that some of the app ignores is worse
+        // than one it does not offer, because the person has no way to
+        // tell which parts obeyed.
+        //
+        // `time_scale` is the kit's own number: Snappy 0.5, Smooth 1.0,
+        // Reduced near-instant. Reading it here rather than inventing a
+        // second scale keeps the badge animating like everything else the
+        // kit draws.
+        self.motion_scale = prefs.gesture.animation.time_scale();
+        for s in self.silhouettes.iter_mut() {
+            s.set_motion_scale(self.motion_scale);
+        }
     }
 
     /// Render the controller.
@@ -849,8 +884,16 @@ impl Controller {
         // A badge per row. The shape is parsed from the device name each
         // frame; set_shape only blooms the halo when it actually changed, so a
         // list refresh cannot flash every badge — the module's own guard.
+        let before = self.silhouettes.len();
         self.silhouettes.resize_with(self.devices.len(),
             crate::product_silhouette::ProductSilhouette::default);
+        // Newly created badges inherit the setting. Applying it only in
+        // `apply_settings` leaves a device that appeared afterwards
+        // animating at full speed, which is the half-obeyed reduce-motion
+        // the field exists to prevent.
+        for s in self.silhouettes.iter_mut().skip(before) {
+            s.set_motion_scale(self.motion_scale);
+        }
         let dt_ms = ui.input(|i| i.stable_dt).min(0.1) * 1000.0;
         for (i, d) in self.devices.iter_mut().enumerate() {
             ui.horizontal(|ui| {
@@ -1745,6 +1788,89 @@ impl Controller {
 /// to paint. Both are needed: the previous silhouettes passed every data
 /// test there was, because there were none, and the primitives that drew
 /// them lived in a function no test ever ran.
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+
+    fn app() -> Controller {
+        let mut c = Controller::new(
+            vec![Device { name: "Beosound A1".into(), volume: 30, playing: false }],
+            vec![]);
+        c.silhouettes.push(crate::product_silhouette::ProductSilhouette::default());
+        c
+    }
+
+    fn prefs(style: settings_kit::AnimationStyle, palette: &str) -> settings_kit::Prefs {
+        let mut p = settings_kit::Prefs::default();
+        p.gesture.animation = style;
+        p.palette = palette.to_string();
+        p
+    }
+
+    #[test]
+    fn reduce_motion_reaches_the_badges() {
+        // A reduce-motion setting that some of the app ignores is worse
+        // than one it does not offer: the person cannot tell which parts
+        // obeyed. `set_motion_scale` had no caller at all.
+        let ctx = egui::Context::default();
+        let mut c = app();
+        c.apply_settings(&ctx, &prefs(settings_kit::AnimationStyle::Reduced, "amber"));
+        assert!(c.motion_scale < 1.0, "reduced motion left the scale at {}", c.motion_scale);
+
+        // A badge created afterwards gets it too — a device that appears
+        // mid-session would otherwise animate at full speed.
+        c.devices.push(Device { name: "Beosound Level".into(), volume: 10, playing: false });
+        let before = c.silhouettes.len();
+        c.silhouettes.resize_with(c.devices.len(),
+            crate::product_silhouette::ProductSilhouette::default);
+        for s in c.silhouettes.iter_mut().skip(before) { s.set_motion_scale(c.motion_scale); }
+        // Reduced means the reveal finishes in a fraction of a smooth one.
+        let mut fast = c.silhouettes.pop().unwrap();
+        let mut slow = crate::product_silhouette::ProductSilhouette::default();
+        fast.tick(60.0);
+        slow.tick(60.0);
+        assert!(fast.reveal() > slow.reveal(),
+                "reduced {} was not quicker than smooth {}", fast.reveal(), slow.reveal());
+    }
+
+    #[test]
+    fn changing_the_palette_blooms_the_badges_once() {
+        // The halo is "a marker, not a flourish" — it exists to say the
+        // accent moved. Without the call, switching palette repainted
+        // every outline in a new colour with nothing to draw the eye.
+        let ctx = egui::Context::default();
+        let mut c = app();
+        c.apply_settings(&ctx, &prefs(settings_kit::AnimationStyle::Smooth, "amber"));
+        // Ticked in frames, not one huge dt: the envelope advances per
+        // call, so a single enormous step leaves it part way through — a
+        // detail worth reproducing here because the app ticks per frame
+        // too.
+        for _ in 0..400 { for s in c.silhouettes.iter_mut() { s.tick(16.0); } }
+        assert_eq!(c.silhouettes[0].halo(), 0.0, "settled before the change");
+
+        c.apply_settings(&ctx, &prefs(settings_kit::AnimationStyle::Smooth, "midnight"));
+        // `bloom` ARMS the envelope; the halo rises on the next tick. The
+        // immediate signal is that the badge has work to do — asserting
+        // the halo before a frame has run tests the clock, not the change.
+        assert!(c.silhouettes[0].is_animating(), "the accent change did not arm a bloom");
+        for s in c.silhouettes.iter_mut() { s.tick(16.0); }
+        assert!(c.silhouettes[0].halo() > 0.0, "the armed bloom never rose");
+    }
+
+    #[test]
+    fn re_applying_the_same_palette_does_not_re_bloom() {
+        // Called unconditionally this fires every frame, and a halo that
+        // never stops is the throb the two-phase envelope exists to avoid.
+        let ctx = egui::Context::default();
+        let mut c = app();
+        c.apply_settings(&ctx, &prefs(settings_kit::AnimationStyle::Smooth, "amber"));
+        for _ in 0..400 { for s in c.silhouettes.iter_mut() { s.tick(16.0); } }
+        c.apply_settings(&ctx, &prefs(settings_kit::AnimationStyle::Smooth, "amber"));
+        for s in c.silhouettes.iter_mut() { s.tick(16.0); }
+        assert_eq!(c.silhouettes[0].halo(), 0.0, "an unchanged palette bloomed anyway");
+    }
+}
+
 #[cfg(test)]
 mod silhouette_frame_tests {
     use super::*;
