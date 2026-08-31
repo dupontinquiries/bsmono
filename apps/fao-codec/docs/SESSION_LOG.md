@@ -5299,3 +5299,64 @@ now made three times — the fixed MV rate charge, the fixed DICT_MARGIN,
 and the fixed admission gate. The strength wants to come off the same
 spectral statistic spectral_probe computes, which is the next
 construction and ties the two together.
+
+### Where AV1's bytes actually go — and a METHODOLOGY ERROR in every anchor this session
+
+User's question: AV1 grows linearly and holds a bitrate target in the
+hundreds of kbps; if FAO were valid we should see a codec drop far
+below that, so is AV1's size real information or ffmpeg averaging and
+keyframing?
+
+Measured on the 100s blackstar source (6,000 frames, 9.47 MB):
+  mean 1,578 B/frame
+  19 keyframes at a fixed 321-frame interval = 1.49 MB = 15.7% of bytes
+  mean keyframe 78,161 B vs mean inter 1,335 B — a keyframe is 59x
+  per-second bytes: min 36 KB, median 88 KB, max 199 KB, stdev/mean 0.41
+Not averaging. The rate varies 5.5x second to second and tracks
+content, which is CRF-like behaviour, and keyframes are a minority of
+the bill.
+
+Keyframe cadence, same 240 frames at crf45:
+  g=48   401,810 B @ 47.240 dB
+  g=240  273,532 B @ 47.406 dB   <- 32% SMALLER and slightly better
+  g=1000 273,532 B @ 47.406 dB   (only 240 frames, so identical)
+
+MY OWN ERROR, and it runs through this whole session: every SVT-AV1
+anchor I built used `-g 48` to match v11's GOP length. That handicaps
+AV1 by ~32% on this content. The comparison is defensible as a
+STRUCTURAL one — v11 rebuilds a plate every 48 frames, so denying AV1
+cross-GOP prediction is like-for-like — but it is NOT the "would you
+ship this" comparison, and I reported the numbers without stating which
+one they were. Every AV1 column in this log should be read as up to
+~32% larger than a delivery encode would be, which makes v11's
+position WORSE than reported, not better. The one result that survives
+comfortably is the procedural-ground win (v11 -23%), since 32% the
+other way would erase it — that result now needs re-running at g=240
+before it can be quoted.
+
+CBR is also not waste: -b:v 400k on 240 frames produced 190,776 B
+@ 45.45 dB — 381 kbps against a 400 kbps target, i.e. the encoder
+hitting what it was told, at lower quality than the CRF encode. A
+constant bitrate is a constraint the user chose, not padding.
+
+WHY WE DO NOT SEE AN ELITE CODEC DROP BELOW THIS — the decomposition
+that actually answers it:
+  * A world model replaces the KEYFRAME function. On a well-configured
+    stream keyframes are ~16% of bytes, so "the plate is a better
+    keyframe" has a hard ceiling of ~16% no matter how good the model
+    is. That is the entire structural saving available from
+    amortisation, and it matches the earlier finding that GOP-length
+    amortisation is not differential (AV1's keyframe amortises too).
+  * The other ~84% is PER-FRAME NOVELTY: actors moving, camera moving,
+    lighting changing. A static canonical does not predict any of it;
+    only a better INTER predictor does.
+  * So FAO's real claim was never "cheaper keyframes". It is that a
+    world model predicts INTER frames better than motion compensation
+    does. engine_lab measured that this can be true (-31% total with a
+    correct canonical) and spectral_probe measured WHEN (high HF that
+    MC cannot reach). On content where MC works, the ceiling is 16% and
+    AV1 already spends those bits well.
+That is the honest answer to "shouldn't we see it drop below": on most
+content there is no room below, because the bits are not keyframe
+overhead — they are novelty, and novelty is exactly what a static model
+cannot amortise.
