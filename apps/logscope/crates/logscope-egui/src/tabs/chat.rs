@@ -1665,7 +1665,10 @@ impl Chat {
                                 self.agent_files = r.events().to_vec();
                                 self.agent_plan = r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect();
                                 let ph = r.phase().map(|p| format!(" · phase: {p}")).unwrap_or_default();
-                                self.note = format!("agent: turn {} · {} file(s){ph}…", r.turns(), r.events().len());
+                                // Compaction is invisible otherwise, and "the model forgot what it
+                                // read" is exactly the symptom it produces — so it is said out loud.
+                                let cmp = match r.compacted_turns() { 0 => String::new(), n => format!(" · {n} turn(s) compacted") };
+                                self.note = format!("agent: turn {} · {} file(s){ph}{cmp}…", r.turns(), r.events().len());
                             }
                             self.agent_pending_submit = Some(prompt);
                         }
@@ -3148,8 +3151,8 @@ reply is framed differently from the turn that produced it.");
 
     /// Finalize a non-blocking agent run: snapshot the workspace, surface the outcome, clear the driver.
     fn finish_agent_run(&mut self, stop: crate::workspace_exec::Stop) {
-        let (files, plan, verified, turns, had_verifier, phase, patterns) = match self.agent_run.take() {
-            Some(r) => (r.events().to_vec(), r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect::<Vec<_>>(), r.verified(), r.turns(), r.had_verifier(), r.phase(), r.pattern_report()),
+        let (files, plan, verified, turns, had_verifier, phase, patterns, compacted) = match self.agent_run.take() {
+            Some(r) => (r.events().to_vec(), r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect::<Vec<_>>(), r.verified(), r.turns(), r.had_verifier(), r.phase(), r.pattern_report(), r.compacted_turns()),
             None => return,
         };
         self.agent_files = files;
@@ -3189,7 +3192,8 @@ reply is framed differently from the turn that produced it.");
         let vnote = crate::workspace_exec::VerifyBadge::of(verified, had_verifier).label();
         let snap_note = if snap { " · snapshotted" } else { "" };
         let phase_note = phase.map(|p| format!(" · phase: {p}")).unwrap_or_default();
-        self.note = format!("agent: {stopdesc} · plan {done}/{total} · {touched} file(s){vnote}{phase_note}{snap_note} · :reapply to land");
+        let cmp_note = match compacted { 0 => String::new(), n => format!(" · {n} turn(s) compacted") };
+        self.note = format!("agent: {stopdesc} · plan {done}/{total} · {touched} file(s){vnote}{phase_note}{cmp_note}{snap_note} · :reapply to land");
     }
 
     /// Launch a fan of agent branches with `cfg`, seeding goals from `task`. Shared by :fan-agent and :docs.
@@ -3349,6 +3353,10 @@ which file you read.\n\n",
         let work_dir = self.gitmind_session.as_ref().unwrap().work_dir().to_path_buf();
         let mut cfg = crate::workspace_exec::AgentConfig::default();
         cfg.context = self.agent_context();
+        // Size the run's budgets to the model actually loaded. Without this the workspace resolves
+        // to Mid for everything — the harness's "unknown" — so a 1B drowns in reads it cannot hold
+        // and a large model gets a transcript bound far below what its window could carry.
+        cfg.model_label = self.model_label();
         // The mode picker records the intent; this is where the intent takes effect. StatefulGuide
         // arms engmode's phase machine (evidence-decided position, claim-gating, stall→blocked) and
         // green-state checkpoints — the long-horizon posture for a big `.gitmind` tree.

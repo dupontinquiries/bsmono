@@ -177,6 +177,12 @@ impl Workspace {
     pub fn with_timeout(mut self, d: Duration) -> Self { self.timeout = d; self }
 
     pub fn root(&self) -> &Path { &self.root }
+
+    /// The model class this workspace's budgets are sized for. Resolved from the engine's parameter
+    /// count when known, else the model label.
+    pub fn model_class(&self) -> crate::read_harness::ModelClass {
+        crate::read_harness::ModelClass::resolve(self.model_params, &self.model_label)
+    }
     pub fn events(&self) -> &[FileEvent] { &self.events }
     /// Drain the file-event feed (the GUI polls this each frame, then clears it).
     pub fn take_events(&mut self) -> Vec<FileEvent> { std::mem::take(&mut self.events) }
@@ -623,8 +629,10 @@ Continue with read_range {rel} {} {}]",
 /// fixes that and scopes the check: cargo resolves the crate's enclosing workspace itself.
 ///
 /// Returns workspace-relative dirs ("" = the root). Falls back to [""] when no touched file sits
-/// under a Cargo root, which preserves today's behavior for plain single-crate workspaces.
-pub fn resolve_check_roots<'a>(root: &Path, touched: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+/// under a Cargo root, which preserves today's behavior for plain single-crate workspaces. The
+/// second element is how many roots were DROPPED by the cap — a run that sprayed across more crates
+/// than one turn can afford to check must say so rather than quietly checking a subset.
+pub fn resolve_check_roots_capped<'a>(root: &Path, touched: impl IntoIterator<Item = &'a str>, cap: usize) -> (Vec<String>, usize) {
     let mut roots: BTreeSet<String> = BTreeSet::new();
     for rel in touched {
         let mut dir = Path::new(rel).parent().unwrap_or_else(|| Path::new(""));
@@ -640,12 +648,17 @@ pub fn resolve_check_roots<'a>(root: &Path, touched: impl IntoIterator<Item = &'
         }
     }
     if roots.is_empty() {
-        vec![String::new()]
-    } else {
-        // Cap the fan-out: a run that somehow touched files across many crates gets its three most
-        // significant roots (BTreeSet order = stable), and the observation says so.
-        roots.into_iter().take(3).collect()
+        return (vec![String::new()], 0);
     }
+    let total = roots.len();
+    let kept: Vec<String> = roots.into_iter().take(cap.max(1)).collect();
+    let dropped = total - kept.len();
+    (kept, dropped)
+}
+
+/// `resolve_check_roots_capped` at the default cap of 3, keeping only the roots.
+pub fn resolve_check_roots<'a>(root: &Path, touched: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    resolve_check_roots_capped(root, touched, 3).0
 }
 
 fn truncate(s: &mut String, cap: usize) {
@@ -662,6 +675,109 @@ fn default_allow() -> BTreeSet<String> {
      "ls", "cat", "head", "tail", "grep", "rg", "find", "wc",
      "git", "echo", "true", "test"]
         .iter().map(|s| s.to_string()).collect()
+}
+
+// ── transcript compaction: the bound that lets a run outlive its context window ─────────────────
+
+/// The turn separator `step_turn` appends. Compaction splits on it, so it is one constant rather
+/// than a literal in two places.
+pub const TURN_MARK: &str = "\n\nASSISTANT:\n";
+
+/// Transcript byte budget by model class. Deliberately much smaller than the model's real window:
+/// the prompt is not the only thing in it (the reply and the KV headroom are), and a transcript
+/// that fills the window is a transcript whose middle gets elided by the ENGINE, silently and at
+/// whatever byte boundary it lands on. Bounding it here means the elision is chosen — head and
+/// recent turns kept, middle replaced by a digest — rather than suffered.
+pub fn transcript_budget(class: crate::read_harness::ModelClass) -> usize {
+    match class {
+        crate::read_harness::ModelClass::Small => 24 * 1024,
+        crate::read_harness::ModelClass::Mid => 96 * 1024,
+        crate::read_harness::ModelClass::Large => 320 * 1024,
+        crate::read_harness::ModelClass::Sota => 1200 * 1024,
+    }
+}
+
+/// Compact an over-budget transcript: keep the head (system prompt — the task, the repo tree, the
+/// tool protocol) and the last `keep_recent` turns verbatim, and replace everything between them
+/// with `digest`.
+///
+/// WHAT IS KEPT IS THE POINT. The head holds the task; drop it and the run forgets what it is
+/// doing. The recent turns hold the live working set — the last check's errors, the file just read
+/// — and a model that loses those repeats the work that produced them. The middle is where the
+/// redundancy is: whole files read four turns ago, superseded compiler dumps, tool results already
+/// acted on. That is what the digest replaces, and the digest carries the durable facts (files
+/// touched, check history, phase) so nothing load-bearing is merely forgotten.
+///
+/// Returns None when there is nothing to do — under budget, no turn boundary found (the head is
+/// never cut), too few turns to elide any, or a rewrite that would not actually be smaller.
+///
+/// `keep_recent` is a CEILING, not a promise. Two kept turns that are 5 KB each cannot fit an 8 KB
+/// budget, so the window shrinks — 3, then 2, then 1 — until the result fits. If even the head plus
+/// one turn exceeds the budget, that is not something transcript compaction can fix (one tool
+/// observation is larger than the entire budget; the read budget or the model class is the wrong
+/// one) and the smallest available form is returned rather than a pretence of success.
+pub fn compact_transcript(prompt: &str, max_bytes: usize, keep_recent: usize, digest: &str) -> Option<(String, usize)> {
+    if max_bytes == 0 || prompt.len() <= max_bytes { return None; }
+    let head_end = prompt.find(TURN_MARK)?;
+    let head = &prompt[..head_end];
+    let turns: Vec<&str> = prompt[head_end..].split(TURN_MARK).skip(1).collect();
+    if turns.len() <= keep_recent { return None; }
+
+    let render = |keep: usize| -> (String, usize) {
+        let elided = turns.len() - keep;
+        let mut out = String::new();
+        out.push_str(head);
+        out.push_str(&format!(
+            "\n\n[CONTEXT COMPACTED: {elided} earlier turn(s) replaced by this summary to stay inside the \
+window. The work they describe HAPPENED — treat the summary as fact, and re-read a file rather than \
+assuming its old contents are still in view.]\n{digest}\n"));
+        for t in &turns[elided..] {
+            out.push_str(TURN_MARK);
+            out.push_str(t);
+        }
+        (out, elided)
+    };
+
+    let mut best = render(keep_recent.max(1));
+    for keep in (1..keep_recent.max(1)).rev() {
+        if best.0.len() <= max_bytes { break; }
+        best = render(keep);
+    }
+    if best.0.len() >= prompt.len() { return None; }
+    Some(best)
+}
+
+/// The durable facts a compaction must not lose: what the run has touched, what the checks said,
+/// and where the phase machine places it. Built from state the loop already holds — nothing here is
+/// a model's account of its own work.
+pub fn run_digest(ws: &Workspace, plan: &Plan, guide: Option<&crate::phase_guide::Guide>) -> String {
+    let mut s = String::from("SUMMARY OF THE ELIDED TURNS (facts, not narration):\n");
+    let mut paths: Vec<&str> = ws.events().iter().map(|e| e.path.as_str()).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    if paths.is_empty() {
+        s.push_str("  files written: none yet\n");
+    } else {
+        let shown: Vec<&str> = paths.iter().take(30).copied().collect();
+        s.push_str(&format!("  files written ({}): {}{}\n", paths.len(), shown.join(", "),
+                            if paths.len() > shown.len() { ", …" } else { "" }));
+    }
+    let (done, total) = plan.progress();
+    if total > 0 {
+        s.push_str(&format!("  plan: {done}/{total} step(s) marked done\n"));
+        for st in plan.steps.iter().take(9) {
+            s.push_str(&format!("    [{}] {}\n", if st.done { "x" } else { " " }, st.text));
+        }
+    }
+    if let Some(g) = guide {
+        s.push_str(&format!("  phase: {}\n", g.phase_label()));
+        let pats = g.pattern_report();
+        if !pats.is_empty() {
+            s.push_str("  what has moved the error count on this repo:\n");
+            for p in pats.iter().take(5) { s.push_str(&format!("    {p}\n")); }
+        }
+    }
+    s
 }
 
 // ── agent configuration: plan-then-act (2), verify-as-you-go (1), read policy (4) ────────────────
@@ -729,6 +845,23 @@ pub struct AgentConfig {
     /// long-horizon run's later mistake can then be diffed/reset against the last green state rather
     /// than the session baseline. Best-effort: a non-git workspace simply never checkpoints.
     pub checkpoint_on_green: bool,
+    /// Transcript byte budget before compaction (see `compact_transcript`). 0 = derive from the
+    /// workspace's model class, which is what every caller should want; a non-zero value is an
+    /// explicit override. There is no "unbounded" setting on purpose: the append-only prompt WILL
+    /// exceed any window on a long run, and the choice is only ever between choosing what to elide
+    /// and letting the engine drop the middle of the prompt.
+    pub max_prompt_bytes: usize,
+    /// Turns kept verbatim at the tail when compacting: the live working set (the last check's
+    /// errors, the file just read). Below 2 a model loses the observation it is mid-way through
+    /// acting on, so the value is floored at 2 where it is used.
+    pub keep_recent_turns: usize,
+    /// The model this run is driving, for sizing every budget that depends on the class: read
+    /// chunks, git entries, and the transcript bound. Empty label + None params resolve to Mid,
+    /// which is the harness's deliberate "unknown" — but a 1B run sized as Mid drowns and a 70B run
+    /// sized as Mid is starved, so a caller that KNOWS should say. `AgentRun::start` applies these
+    /// to the workspace it builds; `run_agent_cfg` takes a caller-built workspace and leaves it alone.
+    pub model_label: String,
+    pub model_params: Option<u64>,
 }
 
 impl Default for AgentConfig {
@@ -750,6 +883,10 @@ impl Default for AgentConfig {
             context: String::new(),
             stateful_guide: false,
             checkpoint_on_green: false,
+            max_prompt_bytes: 0, // derive from the model class
+            keep_recent_turns: 3,
+            model_label: String::new(),
+            model_params: None,
         }
     }
 }
@@ -1593,7 +1730,7 @@ the model attempted a call and it was discarded, which is not the same as the mo
             .filter(|e| cfg.verify_exts.iter().any(|x| e.path.rsplit('.').next() == Some(x.as_str())))
             .map(|e| e.path.clone())
             .collect();
-        let roots = resolve_check_roots(ws.root(), touched.iter().map(|s| s.as_str()));
+        let (roots, dropped) = resolve_check_roots_capped(ws.root(), touched.iter().map(|s| s.as_str()), 3);
         let mut all_ok = true;
         let (mut errs, mut warns, mut tfails) = (0usize, 0usize, 0usize);
         let mut body = String::new();
@@ -1622,7 +1759,22 @@ the model attempted a call and it was discarded, which is not the same as the mo
             if all_ok { "PASSED" } else { "FAILED — fix these before continuing" },
             body,
         ));
-        check_obs = Some((errs, warns, tfails));
+        if dropped > 0 {
+            // Saying it is not a formality. `verified` is what gates TASK_COMPLETE, and a run that
+            // edited five crates while checking three is not verified — reporting the gap AND
+            // withholding the flag is the difference between a bound and a blind spot.
+            *verified = false;
+            prompt.push_str(&format!(
+                "\n(NOT CHECKED: {dropped} further crate(s) were edited this run and exceed the \
+per-turn check budget. Narrow the work to fewer crates, or check them explicitly with a run tool \
+call — this run cannot be marked complete until they are green.)\n"));
+        }
+        // The phase machine sees the same fact. `Signal::Checked` has no "unchecked" field, and the
+        // only property that matters here is that the state is NOT clean — so an unchecked crate is
+        // counted as one outstanding error each. That keeps Done unreachable while a crate this run
+        // edited has never been compiled, and since stall detection compares counts turn to turn, a
+        // constant offset shifts the numbers without breaking the trend.
+        check_obs = Some((errs + dropped, warns, tfails));
         // Checkpoint-on-green: a long-horizon run's restore point. Committed in the SCRATCH repo, so
         // it never touches the real project; reapply diffs files, not history, and is unaffected.
         if all_ok && cfg.checkpoint_on_green {
@@ -1772,6 +1924,25 @@ pub fn digest_check_output(raw: &str, max_items: usize) -> String {
     out
 }
 
+/// Bound the transcript if it has outgrown its budget. Called by both drivers after a turn that
+/// CONTINUES the run — a finished run's prompt is never submitted again, so compacting it would be
+/// work nobody reads. Returns the number of turns elided, for the log.
+fn maybe_compact(
+    prompt: &mut String, ws: &Workspace, cfg: &AgentConfig, plan: &Plan,
+    guide: Option<&crate::phase_guide::Guide>,
+) -> usize {
+    let budget = if cfg.max_prompt_bytes > 0 { cfg.max_prompt_bytes } else { transcript_budget(ws.model_class()) };
+    let before = prompt.len();
+    let digest = run_digest(ws, plan, guide);
+    if let Some((next, elided)) = compact_transcript(prompt, budget, cfg.keep_recent_turns.max(2), &digest) {
+        crate::diag!("wgpu-engine: agent transcript compacted {} B → {} B ({} turn(s) elided, budget {})",
+                     before, next.len(), elided, budget);
+        *prompt = next;
+        return elided;
+    }
+    0
+}
+
 /// Back-compat: run with defaults but an explicit step budget.
 pub fn run_agent(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, max_steps: usize) -> Session {
     run_agent_cfg(llm, ws, task, &AgentConfig { max_steps, ..Default::default() })
@@ -1811,6 +1982,7 @@ pub fn run_agent_cfg(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, cfg: &Ag
         if let Some(stop) = stop {
             return Session { turns, stop, files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier };
         }
+        maybe_compact(&mut prompt, ws, cfg, &plan, guide.as_ref());
     }
 
     Session { turns, stop: Stop::StepLimit, files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier }
@@ -1849,6 +2021,9 @@ pub struct AgentRun {
     ladder: crate::line_calls::RefusalLadder,
     /// StatefulGuide's phase machine, when `cfg.stateful_guide` — the run's evidence-decided position.
     guide: Option<crate::phase_guide::Guide>,
+    /// Turns elided by transcript compaction so far. Surfaced so "the model forgot" has an answer
+    /// other than a guess.
+    compacted: usize,
 }
 
 impl AgentRun {
@@ -1863,14 +2038,18 @@ impl AgentRun {
             prompt.push_str(&g.prompt());
         }
         let verified = cfg.verify_cmd.is_empty();
+        let ws = Workspace::new(work_dir)
+            .with_model_label(cfg.model_label.clone())
+            .with_model_params(cfg.model_params);
         let run = Self {
-            ws: Workspace::new(work_dir), prompt: prompt.clone(), reply: String::new(),
+            ws, prompt: prompt.clone(), reply: String::new(),
             plan: Plan::default(), verified, step: 0, turns: 0, cfg,
             guard: crate::repetition::LoopGuard::default(),
             ladder: crate::line_calls::RefusalLadder::new(4),
             // Mirrors the Session field: a run with no verifier must not read as one that passed.
             had_verifier,
             guide,
+            compacted: 0,
         };
         (run, prompt)
     }
@@ -1892,6 +2071,9 @@ impl AgentRun {
         self.step += 1;
         if let Some(stop) = stop { return AgentStep::Finished(stop); }
         if self.step >= self.cfg.max_steps { return AgentStep::Finished(Stop::StepLimit); }
+        // Bound the transcript before it is submitted again — this is the only place the growing
+        // prompt leaves the driver, so it is the only place the bound has to hold.
+        self.compacted += maybe_compact(&mut self.prompt, &self.ws, &self.cfg, &self.plan, self.guide.as_ref());
         AgentStep::Submit(self.prompt.clone())
     }
 
@@ -1901,6 +2083,12 @@ impl AgentRun {
     pub fn phase(&self) -> Option<&'static str> {
         self.guide.as_ref().map(|g| g.phase_label())
     }
+
+    /// How many turns transcript compaction has elided from this run's prompt.
+    pub fn compacted_turns(&self) -> usize { self.compacted }
+
+    /// Current transcript size in bytes — what the bound acts on.
+    pub fn prompt_len(&self) -> usize { self.prompt.len() }
 
     /// What actually moved the error count on this run, as counted lines (guided runs only; empty
     /// until enough transitions accumulate).
@@ -3671,6 +3859,142 @@ mod long_horizon_tests {
         }
         assert_eq!(run.phase(), Some("diagnose"), "an unsupported claim routes to diagnose");
         assert!(!run.verified());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    // ── transcript compaction ────────────────────────────────────────────────────────────────────
+
+    fn fake_prompt(head: &str, turns: usize, per_turn: usize) -> String {
+        let mut s = head.to_string();
+        for i in 0..turns {
+            s.push_str(TURN_MARK);
+            s.push_str(&format!("turn {i} "));
+            s.push_str(&"x".repeat(per_turn));
+        }
+        s
+    }
+
+    #[test]
+    fn compaction_keeps_the_head_and_the_recent_turns_and_elides_the_middle() {
+        let head = "SYSTEM: the task is to fix the build. REPO TREE: src/lib.rs";
+        let p = fake_prompt(head, 10, 500);
+        let (out, elided) = compact_transcript(&p, 2000, 3, "SUMMARY: wrote a.rs, 2 errors")
+            .expect("over budget with 10 turns — must compact");
+        assert_eq!(elided, 7);
+        assert!(out.starts_with(head), "the task and the tree are never cut");
+        assert!(out.contains("SUMMARY: wrote a.rs"), "the digest replaces the middle");
+        assert!(out.contains("turn 9") && out.contains("turn 7"), "recent turns kept verbatim");
+        assert!(!out.contains("turn 5"), "the middle is gone");
+        assert!(out.len() < p.len());
+        assert_eq!(out.matches(TURN_MARK).count(), 3, "exactly keep_recent turn markers remain");
+    }
+
+    #[test]
+    fn compaction_declines_when_it_would_not_help_or_would_cut_the_working_set() {
+        let head = "SYSTEM: task";
+        // under budget
+        assert!(compact_transcript(&fake_prompt(head, 10, 10), 100_000, 3, "d").is_none());
+        // too few turns to elide any without eating the keep-window
+        assert!(compact_transcript(&fake_prompt(head, 3, 5000), 100, 3, "d").is_none());
+        // no turn boundary at all: the head is never cut
+        assert!(compact_transcript("just a system prompt, very long", 4, 3, "d").is_none());
+        // a digest bigger than what it replaces must not "compact" the prompt upward
+        let p = fake_prompt(head, 5, 20);
+        let huge = "D".repeat(100_000);
+        assert!(compact_transcript(&p, 10, 2, &huge).is_none());
+    }
+
+    #[test]
+    fn the_compaction_marker_tells_the_model_the_work_actually_happened() {
+        let p = fake_prompt("SYS", 8, 400);
+        let (out, _) = compact_transcript(&p, 1000, 2, "SUMMARY").unwrap();
+        assert!(out.contains("CONTEXT COMPACTED"));
+        assert!(out.contains("HAPPENED"), "an elided turn is not an undone turn");
+        assert!(out.contains("re-read a file"), "and stale contents must not be assumed live");
+    }
+
+    #[test]
+    fn the_digest_carries_the_durable_facts() {
+        let d = tmp("digest");
+        let mut ws = Workspace::new(&d);
+        ws.apply(&Tool::WriteFile { path: "src/a.rs".into(), contents: "//a\n".into() });
+        ws.apply(&Tool::WriteFile { path: "src/b.rs".into(), contents: "//b\n".into() });
+        let mut plan = Plan { steps: vec![
+            PlanStep { text: "edit a".into(), done: true },
+            PlanStep { text: "edit b".into(), done: false },
+        ]};
+        let mut g = crate::phase_guide::Guide::new();
+        g.observe(&crate::phase_guide::TurnObs { writes_ok: 1, check: Some((3, 0, 0)), ..Default::default() });
+        let text = run_digest(&ws, &plan, Some(&g));
+        assert!(text.contains("src/a.rs") && text.contains("src/b.rs"), "{text}");
+        assert!(text.contains("1/2"), "plan progress survives compaction: {text}");
+        assert!(text.contains("phase: diagnose"), "{text}");
+        plan.steps.clear();
+        assert!(run_digest(&ws, &plan, None).contains("files written (2)"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// End to end through the real driver. The property that matters is not a hard byte ceiling —
+    /// one 5 KB file read can exceed a small budget on its own — but that the transcript stops
+    /// GROWING WITH TURN COUNT. An append-only prompt is linear in turns and overflows any window on
+    /// a long run; a compacted one is flat. So: run the same script at two lengths and compare.
+    #[test]
+    fn compaction_makes_the_transcript_flat_in_turn_count() {
+        let build = |tag: &str, turns: usize, cfg: AgentConfig| -> (usize, usize) {
+            let d = tmp(tag);
+            std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+            std::fs::create_dir_all(d.join("src")).unwrap();
+            // DISTINCT files per turn: an identical read every turn is caught by the repetition
+            // guard, which aborts the run long before the transcript can grow — the first version of
+            // this test measured that abort and reported "the budget never bit".
+            for i in 0..turns {
+                std::fs::write(d.join(format!("src/f{i}.rs")), format!("// filler {i}\n").repeat(400)).unwrap();
+            }
+            let script: Vec<String> = (0..turns)
+                .map(|i| format!("```tool\n{{\"tool\":\"read_file\",\"path\":\"src/f{i}.rs\"}}\n```"))
+                .collect();
+            let (_stop, run) = drive(&d, "read the tree", cfg, &script);
+            let out = (run.prompt_len(), run.compacted_turns());
+            let _ = std::fs::remove_dir_all(&d);
+            out
+        };
+        let tight = || AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 40,
+            verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false,
+            prefer_patches: false, digest_verify: false,
+            max_prompt_bytes: 8 * 1024, keep_recent_turns: 2, ..Default::default() };
+        let loose = || AgentConfig { max_prompt_bytes: 8 * 1024 * 1024, ..tight() };
+
+        let (short_len, short_elided) = build("gm-cmp-6", 6, tight());
+        let (long_len, long_elided) = build("gm-cmp-18", 18, tight());
+        assert!(short_elided > 0 && long_elided > short_elided, "the budget bit, and bit more on the longer run");
+        assert!(long_len < short_len * 3 / 2,
+                "bounded transcript grew with turn count: {short_len} B at 6 turns → {long_len} B at 18");
+
+        // Contrast: unbounded, the same script is linear in turns.
+        let (u_short, u_elided) = build("gm-cmp-off-6", 6, loose());
+        let (u_long, _) = build("gm-cmp-off-18", 18, loose());
+        assert_eq!(u_elided, 0, "the loose budget must not compact");
+        assert!(u_long > u_short * 2,
+                "the unbounded run really is linear: {u_short} B at 6 turns → {u_long} B at 18");
+        assert!(u_long > long_len * 2, "and compaction is what separates them");
+    }
+
+    #[test]
+    fn an_unchecked_crate_is_reported_and_blocks_completion() {
+        let d = tmp("gm-cap");
+        for c in ["one", "two", "three", "four"] {
+            std::fs::create_dir_all(d.join(format!("apps/{c}/src"))).unwrap();
+            std::fs::write(d.join(format!("apps/{c}/Cargo.toml")), "[package]\n").unwrap();
+        }
+        let touched: Vec<String> = ["one", "two", "three", "four"].iter()
+            .map(|c| format!("apps/{c}/src/lib.rs")).collect();
+        let (roots, dropped) = resolve_check_roots_capped(&d, touched.iter().map(|s| s.as_str()), 3);
+        assert_eq!(roots.len(), 3);
+        assert_eq!(dropped, 1, "the cap must report what it dropped, not swallow it");
+        let (all, none_dropped) = resolve_check_roots_capped(&d, touched.iter().map(|s| s.as_str()), 8);
+        assert_eq!(all.len(), 4);
+        assert_eq!(none_dropped, 0);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
