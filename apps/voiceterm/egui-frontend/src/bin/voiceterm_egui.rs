@@ -546,6 +546,9 @@ struct VoicetermApp {
     /// Command blocks (QML blocksDrawer): tracked from what the demo feeds; the
     /// left-edge drawer shows when `surfaces` says `Surface::Blocks`.
     blocks: uikit_term::blocks::BlockTracker,
+    /// Typed bytes not yet terminated by Enter, so a command can be
+    /// recorded when the line completes rather than a character at a time.
+    line_buf: Vec<u8>,
     /// One-shot scroll target for the tab bar ("N more" pill taps apply next frame).
     tabbar_scroll_to: Option<f32>,
     /// The QML toast, ported: fire-and-forget status pill above the bottom chrome.
@@ -2985,6 +2988,50 @@ impl eframe::App for VoicetermApp {
                 // through one path rather than two that can disagree.
                 if !out.bytes.is_empty() {
                     self.session.pty_out.extend_from_slice(&out.bytes);
+                    // THE BLOCK TRACKER, FED FROM WHAT WAS ACTUALLY TYPED.
+                    // Until now it was filled once at startup from a
+                    // hardcoded demo script — `ls --color`, an echo, a fake
+                    // exit code — and never touched again. Everything
+                    // reading it was reading that script: the blocks
+                    // drawer, recall, the memory poll's count, and the
+                    // bottom bar's quick-launch list.
+                    self.line_buf.extend_from_slice(&out.bytes);
+                    // A carriage return is what a terminal sends for Enter;
+                    // a newline is accepted too so a paste behaves.
+                    while let Some(i) = self.line_buf.iter()
+                        .position(|b| *b == b'\r' || *b == b'\n')
+                    {
+                        let line: Vec<u8> = self.line_buf.drain(..=i).collect();
+                        let cmd = String::from_utf8_lossy(&line[..line.len() - 1])
+                            .trim().to_string();
+                        // Control bytes in the middle of a line mean this was
+                        // editing, not a command — an arrow key or a Ctrl-C
+                        // leaves an escape sequence in the buffer, and
+                        // recording that as a command fills the history with
+                        // garbage nobody can re-run.
+                        if !cmd.is_empty() && !cmd.bytes().any(|b| b < 0x20) {
+                            // `start_row`, not a timestamp: the kit's
+                            // tracker stamps its own time and wants the
+                            // grid row the command was entered on, which is
+                            // where the block starts in the scrollback.
+                            let row = self.session.grid.cursor().1;
+                            self.blocks.submit_command(&cmd, row);
+                        }
+                    }
+                    // Backspace edits the pending line rather than leaving a
+                    // 0x7f in it, or the control-byte guard above throws away
+                    // every command that was corrected while typing.
+                    while let Some(i) = self.line_buf.iter().position(|b| *b == 0x7f) {
+                        self.line_buf.remove(i);
+                        if i > 0 { self.line_buf.remove(i - 1); }
+                    }
+                    // Bounded: a pathological paste with no newline in it
+                    // must not grow this without limit.
+                    const LINE_CAP: usize = 8 * 1024;
+                    if self.line_buf.len() > LINE_CAP {
+                        let drop = self.line_buf.len() - LINE_CAP;
+                        self.line_buf.drain(..drop);
+                    }
                 }
                 // `out.snap_to_bottom` is deliberately not consumed. This view
                 // draws a fixed grid with no scrollback, so it is always
@@ -3162,6 +3209,20 @@ impl eframe::App for VoicetermApp {
             let drained = self.pty.as_ref().map(|h| (h.drain(), h.ended()));
             if let Some((out, ended)) = drained {
                 if !out.is_empty() {
+                    // The tracker sees the SHELL'S OUTPUT too, line by line.
+                    // `feed_line` closes the open block when it recognises a
+                    // prompt, which is what gives a block an end without the
+                    // shell reporting an exit code — and the method had no
+                    // caller, so no block opened here would ever have
+                    // closed.
+                    let text = String::from_utf8_lossy(&out).into_owned();
+                    for line in text.split_inclusive(['\n', '\r']) {
+                        let clean = line.trim_end_matches(['\n', '\r']);
+                        // Nothing to feed for a bare line ending; feeding it
+                        // would append a blank line to every block for each
+                        // CRLF pair.
+                        if !clean.is_empty() { self.blocks.feed_line(clean); }
+                    }
                     self.feed_pty(&out);
                 }
                 if ended {
@@ -3563,19 +3624,25 @@ fn main() -> eframe::Result<()> {
     };
     // realistic content, not a toy script — to actually surface rendering gotchas (colors,
     // wrapping, unicode) rather than just confirming an empty prompt renders.
-    // track the demo session as command blocks too, so the blocks drawer has content
+    // NO DEMO BLOCKS. The tracker used to be seeded here with a hardcoded
+    // script — an `ls --color`, an echo, a fake exit code — and then never
+    // touched again, so everything reading it was reading that script: the
+    // blocks drawer, recall, the memory poll's count, and the bottom bar's
+    // quick-launch list. It is fed from real typing and real shell output
+    // now (see the key drain and the pty drain), which means it starts
+    // empty. Empty is the correct state before anyone has run anything, and
+    // the drawer already has a view for it.
+    //
+    // The grid below still gets its sample output. That is a different
+    // thing and worth keeping: it exercises colour, wrapping and multibyte
+    // rendering on the first frame, which is the point of a demo, and it
+    // does not pretend to be history.
     let mut blocks = uikit_term::blocks::BlockTracker::new();
     blocks.set_cwd("/home/kessler/proj");
     app.terminal.feed("$ ls --color\r\n");
-    blocks.submit_command("ls --color", 0);
     app.terminal.feed("\x1b[1;34mCargo.toml\x1b[0m  \x1b[1;32mbuild.sh\x1b[0m  \x1b[1;34msrc\x1b[0m  \x1b[1;31mold.bak\x1b[0m\r\n");
-    blocks.append_output("\x1b[1;34mCargo.toml\x1b[0m  \x1b[1;32mbuild.sh\x1b[0m  src  old.bak\n");
-    blocks.note_exit_code(0);
     app.terminal.feed("$ echo \"a very long line that should wrap across more than one terminal row so we can see how wrapping and the cursor position interact once it spills over\"\r\n");
     app.terminal.feed("a very long line that should wrap across more than one terminal row so we can see how wrapping and the cursor position interact once it spills over\r\n");
-    blocks.submit_command("echo \"a very long line ...\"", 2);
-    blocks.append_output("a very long line that should wrap across more than one terminal row\n");
-    blocks.finish(Some(0));
     app.terminal.feed("$ echo café 🚀 你好\r\n"); // multibyte + emoji + CJK, straight in the source
     app.terminal.feed("café 🚀 你好\r\n");
     app.terminal.feed("$ ");
@@ -3680,7 +3747,8 @@ fn main() -> eframe::Result<()> {
 
                 theme: boot_theme,
                 theme_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-theme-menu").columns(3).hold(0.35).item_size(64.0),
-                blocks: blocks,
+                blocks,
+                line_buf: Vec::new(),
                 tabbar_scroll_to: None,
                 toasts: uikit_egui::toast::Toasts::new(),
                 // 80x24 is a placeholder: the first frame calls

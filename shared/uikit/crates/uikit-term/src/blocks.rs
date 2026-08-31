@@ -130,6 +130,31 @@ impl BlockTracker {
         }
     }
 
+    /// Feed one line of shell output, closing the block when the line is a
+    /// prompt. Returns true when it closed one, so a caller can avoid
+    /// rendering the prompt inside the output it terminated.
+    ///
+    /// **This is what gives a block an end.** `finish` exists and needs
+    /// somebody to notice the command is over; a shell reports an exit code
+    /// only if it has been configured to, and most have not. Without a
+    /// prompt heuristic every block stays open forever, so the next command
+    /// closes the previous one with an unknown status and the output of two
+    /// commands runs together.
+    ///
+    /// Ported from voiceterm's own `blocks.rs`, which had this and whose
+    /// copy of the tracker the app does not use — the method sat on the
+    /// dead-API list for exactly that reason. Living here means the tracker
+    /// that IS used can close a block.
+    pub fn feed_line(&mut self, line: &str) -> bool {
+        if self.capturing && looks_like_prompt(line) {
+            self.finish(None);
+            return true;
+        }
+        self.append_output(line);
+        self.append_output("\n");
+        false
+    }
+
     /// Mark the current block complete (next prompt detected).
     pub fn finish(&mut self, exit_code: Option<i32>) {
         if !self.capturing {
@@ -235,6 +260,69 @@ fn strip_ansi(s: &str) -> String {
         }
     }
     out
+}
+
+/// The longest line still considered a prompt.
+///
+/// A prompt is short. Without a cap, any output line ending in `>` — a
+/// diff, an XML dump, a quoted email — closes the block, and the command's
+/// remaining output lands in the next one.
+pub const MAX_PROMPT_LEN: usize = 200;
+
+/// Does this line look like a shell prompt?
+///
+/// Deliberately a heuristic over the LAST character rather than a regex
+/// over prompt formats: people set `PS1` to anything, and a pattern that
+/// tried to enumerate them would match fewer real prompts than this does,
+/// while looking more precise.
+pub fn looks_like_prompt(line: &str) -> bool {
+    let t = line.trim_end();
+    if t.is_empty() || t.len() > MAX_PROMPT_LEN {
+        return false;
+    }
+    matches!(t.chars().last(), Some('$') | Some('#') | Some('>') | Some('❯'))
+}
+
+#[cfg(test)]
+mod feed_tests {
+    use super::*;
+
+    #[test]
+    fn a_prompt_closes_the_block_and_output_before_it_belongs_to_it() {
+        let mut t = BlockTracker::new();
+        t.submit_command("ls", 0);
+        assert!(!t.feed_line("Cargo.toml  src"));
+        assert!(t.feed_line("user@host:~$"), "the prompt did not close the block");
+        let b = t.blocks.last().expect("a block");
+        assert!(b.output.contains("Cargo.toml"));
+        assert!(!b.output.contains("user@host"),
+                "the prompt was recorded as output of the command it ended");
+        // Closed: output after it belongs to nobody rather than to `ls`.
+        t.feed_line("stray");
+        assert!(!t.blocks.last().unwrap().output.contains("stray"));
+    }
+
+    #[test]
+    fn a_long_line_ending_in_an_angle_bracket_is_not_a_prompt() {
+        // A diff, an XML dump, a quoted email. Without the length cap each
+        // of these ends the block and the rest of the output lands in the
+        // next one.
+        let xml = format!("<{}>", "a".repeat(MAX_PROMPT_LEN));
+        assert!(!looks_like_prompt(&xml));
+        assert!(looks_like_prompt("$"));
+        assert!(looks_like_prompt("~/proj ❯"));
+        assert!(!looks_like_prompt(""), "a blank line is not a prompt");
+        assert!(!looks_like_prompt("total 48"));
+    }
+
+    #[test]
+    fn feeding_with_nothing_open_does_not_invent_a_block() {
+        // Output before any command — a shell banner, a motd — must not
+        // become a block with no command in it.
+        let mut t = BlockTracker::new();
+        assert!(!t.feed_line("Welcome to Ubuntu"));
+        assert!(t.blocks.is_empty(), "output with no command opened a block");
+    }
 }
 
 #[cfg(test)]
