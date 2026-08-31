@@ -67,6 +67,13 @@ pub struct HudInfo<'a> {
     pub map_name: &'a str,
     pub online: Option<(usize, &'a str)>, // (player count, status/toast)
     pub scores: Option<(u32, u32)>,       // sparta scoreboard: (blue, orange)
+    /// MASTER ACCESS is on: this save has every progression gate disabled.
+    ///
+    /// Drawn because the flag persists and nothing else says so. A tester
+    /// sends a screenshot or a recording, and without a marker in the frame
+    /// neither of you can tell whether the bug came from a state a player can
+    /// actually reach. The stderr line at launch does not survive a video.
+    pub debug_access: bool,
 }
 
 fn quad(ui: &mut Vec<UiVert>, x0: f32, y0: f32, x1: f32, y1: f32, c: [f32; 4]) {
@@ -1241,6 +1248,13 @@ pub fn hud(ui: &mut Vec<UiVert>, info: &HudInfo, world: &World, car: &Car, ball:
     // refresh rate while drops are non-zero, the renderer is abandoning
     // frames rather than the GPU being slow — a distinction the old counter
     // hid completely by counting loop iterations.
+    // MASTER ACCESS BANNER. Top-centre under the scoreboard band, always
+    // drawn, never pulsed: this is not an alert, it is a watermark that has to
+    // survive being screenshotted. Dim enough to ignore while playing, legible
+    // enough to read back off a recording.
+    if info.debug_access {
+        label_c(ui, 0.755, 0.0058, a, [1.0, 0.55, 0.2, 0.75], "MASTER ACCESS — GATES OFF");
+    }
     let fps = format!("{:>3.0} FPS", info.fps);
     label(ui, 0.985 - font::width(&fps, 0.011, a), 0.98, 0.011, a, DIM, &fps);
     if info.frame_drops > 0 {
@@ -1656,6 +1670,61 @@ mod tests {
                 ui_layout::Cmd::Text { x, y, size, text, .. } => raster(*x, *y, *size, a, text),
             })
             .collect()
+    }
+
+    /// A watermark that only draws sometimes, and must not collide when it
+    /// does. Both halves matter: absent on a normal save (or it is noise), and
+    /// present AND legible on a debug one (or a tester's recording cannot be
+    /// told apart from a player's).
+    #[test]
+    fn the_master_access_watermark_appears_only_when_it_should() {
+        let a = 16.0 / 9.0;
+        let draw = |on: bool| -> Vec<UiVert> {
+            let mut v = Vec::new();
+            if on {
+                label_c(&mut v, 0.755, 0.0058, a, [1.0, 0.55, 0.2, 0.75], "MASTER ACCESS — GATES OFF");
+            }
+            v
+        };
+        assert!(draw(false).is_empty(), "a normal save drew the watermark");
+        let on = draw(true);
+        assert!(!on.is_empty(), "master access drew nothing");
+
+        // it sits clear of the scoreboard plate (0.906..0.985) and of the
+        // combo bar (0.815..0.823), which is the band it was slotted between
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for p in &on {
+            lo = lo.min(p.pos[1]);
+            hi = hi.max(p.pos[1]);
+        }
+        assert!(hi < 0.815, "the watermark overlaps the combo bar (top {hi:.3})");
+        assert!(lo > 0.70, "the watermark drifted into the play area (bottom {lo:.3})");
+        // and it is legible rather than a smear: real glyph height
+        assert!(hi - lo > 0.02, "the watermark is too small to read back: {:.3}", hi - lo);
+
+        // AND THE CALL SITE. The block above re-draws the label itself, so it
+        // would pass even if `hud` never drew one — the same
+        // correct-function-nobody-calls trap this session has hit five times.
+        // Needles assembled at runtime so the scan cannot match its own source.
+        let src = include_str!("hud.rs");
+        let guard = format!("if info.{} {{", "debug_access");
+        assert!(src.contains(&guard), "hud() no longer checks debug_access");
+        let text = format!("MASTER ACCESS {} GATES OFF", "—");
+        assert_eq!(
+            src.matches(&text).count(),
+            2,
+            "expected the banner string once in hud() and once in this test"
+        );
+
+        // and main.rs must feed the flag rather than a constant. Pinning it to
+        // `true` would watermark every player's screen; pinning it to `false`
+        // would watermark nobody's, and neither shows up in a HUD test.
+        let m = include_str!("main.rs");
+        let wired = format!("debug_access: self.cfg.{}.debug_ship,", "story");
+        assert!(m.contains(&wired), "main.rs no longer feeds debug_access from the config");
+        for bad in ["debug_access: true,", "debug_access: false,"] {
+            assert!(!m.contains(bad), "debug_access is hardcoded: {bad}");
+        }
     }
 
     #[test]

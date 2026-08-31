@@ -37,7 +37,13 @@ fresh save owns nothing, so a tester with every gate open walks into
 empty rooms. The kit is a bag-sized spread (six weapons across six
 elements, plus mods) offered as a PRESS rather than applied
 automatically, so a tester with real progress does not lose their bag by
-turning a debug flag on. A save flag rather than a launch argument, so a tester
+turning a debug flag on.
+
+While master access is on the HUD carries a dim **MASTER ACCESS — GATES
+OFF** watermark under the scoreboard band. It is there so a tester's
+screenshot or recording says which state it came from: the stderr line
+at launch does not survive a video, and a bug from a save with every
+gate disabled is not the same bug. A save flag rather than a launch argument, so a tester
 toggles it mid-session and the save records that it was on. Every gate
 defers to `Shipboard::unrestricted`, one method, so turning it on does
 not leave the tester hitting the next gate they had not thought about.

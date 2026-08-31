@@ -7089,6 +7089,7 @@ impl Game {
                 None
             },
             scores: if matches!(self.game_mode, 1 | 3..=7) { Some((self.scores[0], self.scores[1])) } else { None },
+            debug_access: self.cfg.story.debug_ship,
             minimap: self.save.minimap,
             air_roll: !self.car.on_ground && self.roll_mix_s > 0.5,
             map_name: self.style().name,
