@@ -299,6 +299,10 @@ impl App {
     /// way to SEE that the request reached the boundary — which is exactly
     /// what could not be observed while nothing drained these at all.
     fn handle(&mut self, cmds: Vec<HostCommand>) {
+        // Events a command handler wants to send back. Collected rather than
+        // applied inline: `apply` drains, and calling it from inside a drain
+        // would run the drain again half way through this loop.
+        let mut pending: Vec<HostEvent> = Vec::new();
         for c in cmds {
             match c {
                 // REAL, not a debug sink. This is the whole point of the
@@ -314,16 +318,21 @@ impl App {
                 // image tool opens it. The path is printed so the photo is
                 // findable the moment it exists.
                 HostCommand::CaptureSnap => {
-                    match self.rig.shared.peek_frame() {
-                        Some(f) if f.pixels_plausible() => {
-                            match save_ppm(&f) {
-                                Ok(path) => eprintln!("snapclone: snap saved: {path}"),
-                                Err(e) => eprintln!("snapclone: snap NOT saved: {e}"),
-                            }
-                        }
-                        _ => eprintln!("snapclone: shutter pressed with no live frame — \
-                                        nothing to save"),
+                    let outcome = match self.rig.shared.peek_frame() {
+                        Some(f) if f.pixels_plausible() => save_ppm(&f),
+                        Some(_) => Err("the frame arrived torn".to_string()),
+                        None => Err("no live frame".to_string()),
+                    };
+                    match &outcome {
+                        Ok(path) => eprintln!("snapclone: snap saved: {path}"),
+                        Err(e) => eprintln!("snapclone: snap NOT saved: {e}"),
                     }
+                    // Back through the seam, not just to stderr: the person
+                    // who pressed the shutter is looking at the camera page.
+                    // Queued rather than applied inline — `handle` is called
+                    // FROM a drain, and re-entering `apply` here would drain
+                    // a second time mid-iteration.
+                    pending.push(HostEvent::SnapSaved(outcome));
                 }
                 HostCommand::SaveContacts(book) => {
                     if let Err(e) = snapclone_egui::contact_book::store(&book) {
@@ -373,6 +382,16 @@ impl App {
                     eprintln!("snapclone: {other:?} — no store yet, viewed state is in-memory only");
                 }
                 other => eprintln!("snapclone: unhandled host command: {other:?}"),
+            }
+        }
+        // Feed back what the handlers produced. Bounded by construction —
+        // nothing in this list produces a command that produces another
+        // event — but recursion through `handle` would not be, so the reply
+        // goes through `apply` and its commands are reported, not re-run.
+        for ev in pending {
+            let cmds = self.snap.apply(ev);
+            for c in cmds {
+                eprintln!("snapclone: after a reply event: {c:?}");
             }
         }
     }

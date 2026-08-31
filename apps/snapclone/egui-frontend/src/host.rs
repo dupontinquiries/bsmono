@@ -177,6 +177,11 @@ pub enum HostEvent {
     ConnectionRequest { id: u64, peer: String, at: i64 },
     /// The host finished (or failed) an export it was asked to run.
     ExportFinished(snap_export::Outcome),
+    /// The host acted on `CaptureSnap`: the file it wrote, or why it could
+    /// not. Routed to the shutter note rather than to stderr — the person who
+    /// pressed the shutter is looking at the camera page, and a photo that
+    /// silently did not save is the failure they find out about last.
+    SnapSaved(Result<String, String>),
     /// A DHT lookup produced a value.
     DhtValue(Vec<u8>),
     /// A DHT lookup finished. The bool command reports whether this was the
@@ -311,6 +316,16 @@ impl Snapclone {
             HostEvent::CameraWorked { id, now_ms } => self.note_camera_worked(&id, now_ms),
             HostEvent::CameraFrame(f) => self.frames.offer(f),
             HostEvent::CaptureStatus(st) => self.capture_status = st,
+            HostEvent::SnapSaved(r) => {
+                self.shutter_note = match r {
+                    // The basename, not the path: a phone's data dir is
+                    // sixty characters of XDG and the filename is the part
+                    // that identifies the shot. The host prints the full
+                    // path for anyone who needs it.
+                    Ok(path) => format!("saved {}", path.rsplit('/').next().unwrap_or(&path)),
+                    Err(why) => format!("not saved — {why}"),
+                };
+            }
             HostEvent::QrPayload(p) => out.push(HostCommand::QrLatched(self.qr_frame(&p))),
             HostEvent::AmbientPixels { pixels, side } => self.sample_ambient(&pixels, side),
 
@@ -677,6 +692,20 @@ mod tests {
         assert_eq!(s.standing_of("sc-11223344"),
                    Standing::Discovered { port: crate::qr::DEFAULT_PORT });
         assert_eq!(s.standing_of("192.168.1.5"), Standing::Plain);
+    }
+
+    #[test]
+    fn the_shutter_says_whether_the_photo_was_saved() {
+        // The failure this closes: `CaptureSnap` was answered on stderr, and
+        // the person who pressed the shutter is looking at the camera page.
+        // A photo that silently did not save is the one they find out about
+        // last — usually when it is not there later.
+        let mut s = app();
+        s.apply(HostEvent::SnapSaved(Ok("/home/u/.local/share/snapclone/snaps/snap-42.ppm".into())));
+        assert_eq!(s.shutter_note, "saved snap-42.ppm",
+                   "the note shows the filename, not sixty characters of XDG path");
+        s.apply(HostEvent::SnapSaved(Err("no live frame".into())));
+        assert_eq!(s.shutter_note, "not saved — no live frame");
     }
 
     #[test]
