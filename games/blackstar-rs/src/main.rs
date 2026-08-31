@@ -49,6 +49,7 @@ mod palevector;
 mod parity;
 mod patrol;
 mod escalation;
+mod enemy;
 mod perception;
 mod trials;
 mod trainwatch;
