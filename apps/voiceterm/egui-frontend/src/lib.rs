@@ -24,6 +24,7 @@ pub mod command_search;
 pub mod corpus_tape;
 pub mod acoustic_cache;
 pub mod mail_selector;
+pub mod mail_rfc822;
 pub mod token_log;
 pub mod connections_graph;
 pub mod summary_queue;

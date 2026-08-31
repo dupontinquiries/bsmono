@@ -597,6 +597,11 @@ struct VoicetermApp {
     /// the inbox list draws Message rows, so both live here and are set
     /// together.
     mail_messages: Vec<voiceterm_egui::mail_view::Message>,
+    /// How many blocks had been scanned for mail last time. The scan walks
+    /// closed blocks and parses the email-shaped ones; re-parsing every
+    /// block every frame would re-read the whole session's output at frame
+    /// rate for a list that changes when a command finishes.
+    mail_scanned_blocks: usize,
     /// The open message id on the Mail view, if any.
     mail_open: Option<String>,
     /// The command audit chain: every submitted line hashed into a tamper-
@@ -830,6 +835,55 @@ impl VoicetermApp {
 }
 
 impl VoicetermApp {
+    /// Harvest email-shaped command output into the mail view.
+    ///
+    /// `MailView::set_messages` had no caller and `mail_messages` was
+    /// `Vec::new()` for the life of the process, so the inbox, the thread
+    /// list and the message pane were correct renderings of nothing. The
+    /// Proton bridge is the intended source and is not reachable from a
+    /// widget crate — `mail_proton` drags the HTTP and scraper stack, which
+    /// the frontend's own header already records as the reason it is not
+    /// mounted.
+    ///
+    /// The terminal is the source that is reachable. `BlockKind::Email`
+    /// has classified `mail`, `mutt -e display` and `cat ~/Maildir/…`
+    /// output since it was written, with nothing downstream of it.
+    ///
+    /// CLOSED blocks only: an open one is still receiving output, and
+    /// parsing a half-arrived message shows a mail with no body that never
+    /// updates.
+    fn harvest_mail_from_blocks(&mut self) {
+        let blocks = &self.blocks.blocks;
+        if blocks.len() == self.mail_scanned_blocks {
+            return;
+        }
+        self.mail_scanned_blocks = blocks.len();
+        let mut found = Vec::new();
+        for b in blocks.iter() {
+            // `duration_ms` is the kit's "this block has ended" — `finish`
+            // is the only thing that sets it, and it is None while the
+            // command is still running. Checked rather than assumed,
+            // because a half-arrived message shows as a mail with no body
+            // that never fills in.
+            if b.duration_ms.is_none() {
+                continue;
+            }
+            if !voiceterm_egui::blocks::looks_like_email(b.output.trim_start()) {
+                continue;
+            }
+            found.extend(voiceterm_egui::mail_rfc822::messages_from_text(
+                &format!("block:{}", b.id), &b.output));
+        }
+        // Rebuilt wholesale rather than appended to: a block's output can
+        // still change after it closes (a late write), and appending would
+        // leave the earlier parse of the same block beside the new one.
+        // Cheap — the scan only runs when the block count moved.
+        if found != self.mail_messages {
+            self.mail_messages = found;
+            self.mail.set_messages(&self.mail_messages);
+        }
+    }
+
     /// Draw the phone bottom bar and act on what it produces.
     ///
     /// The BUTTONS are built fresh each frame from live state rather than
@@ -2032,6 +2086,9 @@ impl eframe::App for VoicetermApp {
             self.draw_bottom_bar(ctx);
         }
 
+        // Mail read in the terminal becomes mail in the mail view.
+        self.harvest_mail_from_blocks();
+
         egui::CentralPanel::default().show(ctx, |ui| {
             // SAFE AREA. Nothing in the fleet applied these until now — the
             // field existed, the setter existed, and no app read either, so
@@ -2116,7 +2173,24 @@ impl eframe::App for VoicetermApp {
                                 .weak().size(11.0));
                         }
                         if let Some(conv) = voiceterm_egui::mail_view::list_ui(ui, &mut self.mail, &c) {
-                            self.toasts.info(format!("opened {conv}"), ui.input(|i| i.time));
+                            // OPENING A THREAD READS IT. `mark_thread_read`
+                            // had no caller, so the unread count and the
+                            // bold rows survived opening the mail — the
+                            // one thing a reader must not do.
+                            //
+                            // It returns the message ids that changed, for
+                            // a backend to push a seen flag to. Nothing
+                            // here has one yet: mail harvested from a
+                            // terminal is already read, so the list is
+                            // empty in practice and the toast says what
+                            // happened rather than pretending otherwise.
+                            let changed = self.mail.mark_thread_read(&conv);
+                            let msg = if changed.is_empty() {
+                                format!("opened {conv}")
+                            } else {
+                                format!("opened {conv} — {} marked read", changed.len())
+                            };
+                            self.toasts.info(msg, ui.input(|i| i.time));
                         }
                         ui.separator();
                         // The inbox proper (mail_panes, ported): rows over the
@@ -3772,6 +3846,7 @@ fn main() -> eframe::Result<()> {
                 graph: Default::default(),
                 archive: Default::default(),
                 mail_messages: Vec::new(),
+                mail_scanned_blocks: 0,
                 mail_open: None,
                 audit: Default::default(),
                 audit_lines: Vec::new(),
