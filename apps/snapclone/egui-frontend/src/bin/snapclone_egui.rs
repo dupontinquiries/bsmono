@@ -686,17 +686,32 @@ impl App {
         }
     }
 
-    /// What the app asked the world to do.
+    /// Carry out what the app asked the world to do.
     ///
-    /// Deliberately a debug sink and labelled as one. Capture, export and
-    /// retry all need a camera pipeline, an archiver and a socket that this
-    /// binary does not have yet; printing is not a stand-in for them, it is a
-    /// way to SEE that the request reached the boundary — which is exactly
-    /// what could not be observed while nothing drained these at all.
+    /// **This doc used to say the opposite**, and had for some time: that
+    /// the handler was "deliberately a debug sink", that capture and
+    /// sending needed a pipeline and a socket "this binary does not have
+    /// yet", and that printing was a way to see requests reach the
+    /// boundary. All of that was true when it was written and none of it
+    /// is now — the shutter writes a file, contacts reach the disk, snaps
+    /// go out over TCP, voice frames reach a socket.
+    ///
+    /// A stale doc is worse than a missing one: a reader looking for why
+    /// their snap did not save would have found a paragraph telling them
+    /// it never could. Corrected here rather than deleted, because the
+    /// fact that it drifted is worth knowing — it drifted one arm at a
+    /// time, each commit truthfully describing what it added and none of
+    /// them looking up.
+    ///
+    /// What is still only reported: `IdentityUnavailable`, which has
+    /// nowhere to go but a log until there is a UI for it, and
+    /// `MarkViewed`/`MarkExpired`, which the store handles and this does
+    /// not need to echo.
+    ///
+    /// Events a handler wants to send back are COLLECTED, not applied
+    /// inline: `apply` drains, and calling it from inside a drain would
+    /// run the drain again half way through the loop.
     fn handle(&mut self, cmds: Vec<HostCommand>) {
-        // Events a command handler wants to send back. Collected rather than
-        // applied inline: `apply` drains, and calling it from inside a drain
-        // would run the drain again half way through this loop.
         let mut pending: Vec<HostEvent> = Vec::new();
         for c in cmds {
             match c {
