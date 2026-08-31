@@ -709,6 +709,291 @@ pub fn fold_pack(sk: &Skeleton, prims: &[&[Vec3]], slack: f32, up: Vec3) -> Vec<
     out
 }
 
+// ------------------------------------------------------------- limb roles --
+//
+// WHAT `anim::Pose` HAS BEEN COMPUTING FOR.
+//
+// `Pose` produces `leg_l`, `leg_r`, `arm_l`, `arm_r` every frame and its own
+// comment says nobody consumes them: *"the bodies are pose strips, not rigs —
+// but they are what a rigged bot would be driven by."* The reason is that
+// `skeletonize` finds appendages and names them nothing: a limb is a bag of
+// prims with a root, a tip and a reach, so "swing the left leg" has no
+// address to send the rotation to.
+//
+// The shapes are already the evidence. What is missing is the inference from
+// shape to role, and it is a small extension of a decomposition that exists
+// rather than a new system. Given the canonical frame (Y up, -Z forward, so
+// +X is the body's right), a limb's ROOT relative to the core says which it
+// is: hanging below the core is a leg, reaching outboard near the top is an
+// arm, and the sign of its x picks the side.
+//
+// This is a measurement, so it can be wrong, and being wrong here means a
+// walk cycle driving the wrong part. `Other` is therefore the default and
+// the classifier is deliberately reluctant: a limb that is not clearly one
+// thing gets no channel and keeps whatever the fold gives it.
+
+/// Which animation channel a limb answers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimbRole {
+    LegL,
+    LegR,
+    ArmL,
+    ArmR,
+    /// A wing, a nacelle, a gun, a tail — real geometry with no channel in
+    /// `anim::Pose`. Not a failure: most of a jet is this.
+    Other,
+}
+
+impl LimbRole {
+    pub fn label(self) -> &'static str {
+        match self {
+            LimbRole::LegL => "leg.l",
+            LimbRole::LegR => "leg.r",
+            LimbRole::ArmL => "arm.l",
+            LimbRole::ArmR => "arm.r",
+            LimbRole::Other => "other",
+        }
+    }
+    pub fn is_leg(self) -> bool {
+        matches!(self, LimbRole::LegL | LimbRole::LegR)
+    }
+    pub fn is_arm(self) -> bool {
+        matches!(self, LimbRole::ArmL | LimbRole::ArmR)
+    }
+    /// The swing this role takes from a pose, in radians. The one place the
+    /// four channels are addressed, so a renderer cannot pair them up wrong.
+    pub fn swing(self, pose: &crate::anim::Pose) -> f32 {
+        match self {
+            LimbRole::LegL => pose.leg_l,
+            LimbRole::LegR => pose.leg_r,
+            LimbRole::ArmL => pose.arm_l,
+            LimbRole::ArmR => pose.arm_r,
+            LimbRole::Other => 0.0,
+        }
+    }
+}
+
+/// How far below the core's centre a root must sit, as a fraction of the
+/// core's own half-height, before it counts as hanging underneath.
+const LEG_DROP: f32 = 0.30;
+/// How far out from the centreline, as a fraction of the core's half-width,
+/// before a root counts as outboard rather than part of the trunk.
+const ARM_OUT: f32 = 0.55;
+/// A root this close to the centreline has no side. Fraction of half-width.
+const SIDE_DEAD: f32 = 0.12;
+
+/// Name each limb, in the same order as `Skeleton::limbs`.
+///
+/// Measured against the CORE, not the whole body: a body's overall bounding
+/// box includes the limbs being classified, so using it would let a long leg
+/// move the reference that decides whether it is a leg.
+pub fn limb_roles(sk: &Skeleton) -> Vec<LimbRole> {
+    let c = sk.core_centre;
+    let h = sk.core_half;
+    let hy = h.y.max(1e-4);
+    let hx = h.x.max(1e-4);
+    let mut roles: Vec<LimbRole> = Vec::with_capacity(sk.limbs.len());
+    for l in &sk.limbs {
+        let dy = (l.root.y - c.y) / hy;
+        let dx = (l.root.x - c.x) / hx;
+        let side_known = dx.abs() >= SIDE_DEAD;
+        let right = dx > 0.0;
+        let role = if dy <= -LEG_DROP && side_known {
+            // hangs below the trunk: a leg, and it is the leg on the side
+            // its root sits on
+            if right { LimbRole::LegR } else { LimbRole::LegL }
+        } else if dx.abs() >= ARM_OUT && side_known {
+            // reaches out from the trunk without hanging below it: an arm.
+            //
+            // ORDERING IS THE GUARD, not a second condition. This branch used
+            // to also test `dy > -LEG_DROP`, which can never be false here —
+            // the leg arm above has already taken everything below the line.
+            // A redundant condition reads like a check that is happening, and
+            // the car test passed against its removal, which is how it was
+            // found: the pass was guaranteed by the branch order, not by the
+            // clause. A wide-track car's wheels ARE outboard enough to match
+            // `ARM_OUT`; what stops them being arms is that they hang low and
+            // the leg branch claims them first.
+            if right { LimbRole::ArmR } else { LimbRole::ArmL }
+        } else {
+            LimbRole::Other
+        };
+        roles.push(role);
+    }
+    roles
+}
+
+/// `limb_roles`, with unpaired limbs demoted to `Other`.
+///
+/// A walk cycle is a pair of legs in counter-phase. One leg is not half a
+/// walk — it is a misclassification, or a body that does not walk, and
+/// swinging it alone reads as a twitch rather than a stride. Same for arms.
+/// Called instead of `limb_roles` wherever the roles will actually DRIVE
+/// something; the raw version stays for diagnostics, which want to see the
+/// unpaired call rather than have it hidden.
+pub fn limb_roles_paired(sk: &Skeleton) -> Vec<LimbRole> {
+    let mut roles = limb_roles(sk);
+    let count = |r: LimbRole, v: &[LimbRole]| v.iter().filter(|x| **x == r).count();
+    for (a, b) in [(LimbRole::LegL, LimbRole::LegR), (LimbRole::ArmL, LimbRole::ArmR)] {
+        if count(a, &roles) == 0 || count(b, &roles) == 0 {
+            for r in roles.iter_mut() {
+                if *r == a || *r == b {
+                    *r = LimbRole::Other;
+                }
+            }
+        }
+    }
+    roles
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+
+    /// A box of points, so a synthetic body is readable as geometry rather
+    /// than as a wall of coordinates.
+    fn slab(c: Vec3, half: Vec3, n: usize) -> Vec<Vec3> {
+        (0..n)
+            .map(|i| {
+                let t = i as f32 * 2.399;
+                let u = (i as f32 / n as f32) * 2.0 - 1.0;
+                c + Vec3::new(t.cos() * half.x, u * half.y, t.sin() * half.z)
+            })
+            .collect()
+    }
+
+    /// torso + two legs below + two arms outboard, in the canonical frame
+    /// (Y up, -Z forward, +X the body's right).
+    fn humanoid() -> Vec<Vec<Vec3>> {
+        vec![
+            slab(Vec3::new(0.0, 1.6, 0.0), Vec3::new(0.45, 0.55, 0.30), 400), // torso
+            slab(Vec3::new(-0.25, 0.5, 0.0), Vec3::new(0.14, 0.55, 0.14), 90), // left leg
+            slab(Vec3::new(0.25, 0.5, 0.0), Vec3::new(0.14, 0.55, 0.14), 90),  // right leg
+            slab(Vec3::new(-0.72, 1.7, 0.0), Vec3::new(0.12, 0.45, 0.12), 80), // left arm
+            slab(Vec3::new(0.72, 1.7, 0.0), Vec3::new(0.12, 0.45, 0.12), 80),  // right arm
+        ]
+    }
+
+    fn roles_of(prims: &[Vec<Vec3>]) -> (Skeleton, Vec<LimbRole>) {
+        let refs: Vec<&[Vec3]> = prims.iter().map(|v| v.as_slice()).collect();
+        let sk = skeletonize(&refs);
+        let roles = limb_roles_paired(&sk);
+        (sk, roles)
+    }
+
+    #[test]
+    fn a_humanoid_gets_two_legs_and_two_arms_on_the_right_sides() {
+        let body = humanoid();
+        let (sk, roles) = roles_of(&body);
+        assert!(sk.limbs.len() >= 4, "the skeleton found {} limbs: {}", sk.limbs.len(), sk.report());
+        let has = |r: LimbRole| roles.contains(&r);
+        assert!(has(LimbRole::LegL) && has(LimbRole::LegR), "legs not found: {roles:?}");
+        assert!(has(LimbRole::ArmL) && has(LimbRole::ArmR), "arms not found: {roles:?}");
+        // and the sides are not swapped: +X is the body's right
+        for (l, r) in sk.limbs.iter().zip(&roles) {
+            match r {
+                LimbRole::LegR | LimbRole::ArmR => {
+                    assert!(l.root.x > sk.core_centre.x, "{} rooted on the left", r.label())
+                }
+                LimbRole::LegL | LimbRole::ArmL => {
+                    assert!(l.root.x < sk.core_centre.x, "{} rooted on the right", r.label())
+                }
+                LimbRole::Other => {}
+            }
+        }
+    }
+
+    #[test]
+    fn a_car_gets_no_arms() {
+        // four wheels under a body. Every appendage hangs below the core, so
+        // the arm rule must not fire — a car waving is the failure this
+        // guards, and it is the shape most of the roster actually is.
+        let mut prims = vec![slab(Vec3::new(0.0, 0.8, 0.0), Vec3::new(0.9, 0.35, 2.0), 500)];
+        for (x, z) in [(-0.8f32, 1.4f32), (0.8, 1.4), (-0.8, -1.4), (0.8, -1.4)] {
+            prims.push(slab(Vec3::new(x, 0.3, z), Vec3::new(0.16, 0.30, 0.30), 70));
+        }
+        let (sk, roles) = roles_of(&prims);
+        // THE TEST MUST EXERCISE THE ARM RULE, not miss it. These wheels sit
+        // outboard past ARM_OUT, so they reach the arm branch's width test
+        // and are rejected only because the leg branch claimed them first.
+        // Without this assertion the test passes on any fixture whose
+        // appendages are simply too narrow to be arms — which is what it was
+        // doing when a regression removing the guard went unnoticed.
+        let hx = sk.core_half.x.max(1e-4);
+        let outboard = sk
+            .limbs
+            .iter()
+            .filter(|l| ((l.root.x - sk.core_centre.x) / hx).abs() >= ARM_OUT)
+            .count();
+        assert!(
+            outboard >= 2,
+            "the fixture's wheels are not outboard enough to test the arm rule ({outboard} of {})",
+            sk.limbs.len()
+        );
+        assert!(
+            !roles.iter().any(|r| r.is_arm()),
+            "a car was given arms: {roles:?}"
+        );
+    }
+
+    #[test]
+    fn an_unpaired_limb_is_demoted_rather_than_swung_alone() {
+        // CLAUDE.md §5c — the complement. One leg is not half a walk; it is a
+        // misclassification, and swinging it alone reads as a twitch. The raw
+        // classifier may still call it a leg; the paired one must not.
+        let prims = vec![
+            slab(Vec3::new(0.0, 1.6, 0.0), Vec3::new(0.45, 0.55, 0.30), 400),
+            slab(Vec3::new(-0.25, 0.5, 0.0), Vec3::new(0.14, 0.55, 0.14), 90),
+        ];
+        let refs: Vec<&[Vec3]> = prims.iter().map(|v| v.as_slice()).collect();
+        let sk = skeletonize(&refs);
+        let paired = limb_roles_paired(&sk);
+        assert!(
+            !paired.iter().any(|r| r.is_leg()),
+            "a lone leg survived pairing: {paired:?}"
+        );
+    }
+
+    #[test]
+    fn every_role_addresses_a_distinct_pose_channel() {
+        // The binding is the point of the whole module: four roles, four
+        // channels, no two reading the same one. A copy-paste that made both
+        // arms read arm_l would pass any test that only checks a limb moved.
+        let pose = crate::anim::Pose {
+            leg_l: 0.11,
+            leg_r: 0.22,
+            arm_l: 0.33,
+            arm_r: 0.44,
+            ..Default::default()
+        };
+        let got = [
+            LimbRole::LegL.swing(&pose),
+            LimbRole::LegR.swing(&pose),
+            LimbRole::ArmL.swing(&pose),
+            LimbRole::ArmR.swing(&pose),
+        ];
+        assert_eq!(got, [0.11, 0.22, 0.33, 0.44], "a role read the wrong channel");
+        assert_eq!(LimbRole::Other.swing(&pose), 0.0, "Other must take no channel");
+        // distinctness, stated as its own assertion so a future edit that
+        // aliases two channels fails here rather than somewhere visual
+        for i in 0..got.len() {
+            for j in (i + 1)..got.len() {
+                assert_ne!(got[i], got[j], "roles {i} and {j} share a channel");
+            }
+        }
+    }
+
+    #[test]
+    fn a_body_with_no_limbs_names_nothing_and_does_not_panic() {
+        let one = vec![slab(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0), 200)];
+        let refs: Vec<&[Vec3]> = one.iter().map(|v| v.as_slice()).collect();
+        let sk = skeletonize(&refs);
+        let roles = limb_roles_paired(&sk);
+        assert_eq!(roles.len(), sk.limbs.len(), "roles and limbs disagree in length");
+        assert!(!roles.iter().any(|r| r.is_leg() || r.is_arm()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
