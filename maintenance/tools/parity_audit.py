@@ -241,9 +241,22 @@ def kit_use(pdirs):
     that means something is the comparison: how many files hand-roll pointer
     deltas while these sit unused.
     """
+    # Patterns match USE, not just a path prefix. An app that takes
+    # `&Adaptive` as a parameter — which is the recommended shape, since
+    # it keeps the detection out of every draw function — never writes
+    # `adaptive::` at all. bo-suite reported adaptive=0 while calling
+    # `is_compact()` and `min_touch_target`, so the audit was measuring
+    # spelling rather than adoption.
+    #
+    # Same for nav: `Nav` arriving as a parameter or a field is the
+    # normal case.
     hits = {}
-    for key, pat in (("a11y", r"a11y::"), ("nav", r"nav::Nav|uikit_egui::nav"),
-                     ("adaptive", r"adaptive::"), ("gesture", r"GestureLayer|gesture_layer")):
+    for key, pat in (
+        ("a11y", r"a11y::|A11yScene|semantic_toggle"),
+        ("nav", r"nav::Nav|uikit_egui::nav|\bNav\b"),
+        ("adaptive", r"adaptive::|\bAdaptive\b|is_compact|min_touch_target|DeviceClass"),
+        ("gesture", r"GestureLayer|gesture_layer|touchkit::|Recognizer"),
+    ):
         n = 0
         for pd in pdirs:
             for root, dirs, files in os.walk(pd):

@@ -62,6 +62,12 @@ pub enum LocationAction {
 /// The page.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LocationsPage {
+    /// Semantics for the screen reader.
+    ///
+    /// On the PAGE, not built per frame: a scene rebuilt each frame
+    /// forgets which element had focus, which reads as the cursor
+    /// jumping away while you are trying to use it.
+    pub a11y: uikit_egui::a11y::A11yScene,
     locations: Vec<Location>,
     /// The add form's text, empty when closed.
     pub new_name: String,
@@ -144,6 +150,10 @@ impl LocationsPage {
 pub fn locations_ui(ui: &mut egui::Ui, p: &mut LocationsPage,
                     c: &uikit_egui::PaletteColors) -> Option<LocationAction> {
     let mut act = None;
+    // Borrow split: `a11y` is taken before `p` is used mutably below.
+    // Fourth time this pattern has been needed this week — a scene on
+    // the same struct as the data it describes always wants it.
+    let a11y = &mut p.a11y;
     ui.label(egui::RichText::new("Current location").small().color(c.text_weak));
     ui.heading(p.header());
     ui.separator();
@@ -157,7 +167,15 @@ pub fn locations_ui(ui: &mut egui::Ui, p: &mut LocationsPage,
                 ui.horizontal(|ui| {
                     ui.label(l.glyph());
                     ui.vertical(|ui| {
-                        if ui.add(egui::Button::new(&l.name).frame(false)).clicked() {
+                        // Ids are derived from the LOCATION id, not the
+                        // loop index: removing a row shifts every index
+                        // after it, and a positional id would move focus
+                        // onto a different place than the one it was on.
+                        let resp = uikit_egui::a11y::note_button(
+                            a11y, l.id as u64 * 2,
+                            &format!("select {}", l.name),
+                            ui.add(egui::Button::new(&l.name).frame(false)));
+                        if resp.clicked() {
                             act = p.choose(l.id);
                         }
                         // The coordinate line is dimmer: it is context, and a
@@ -166,7 +184,14 @@ pub fn locations_ui(ui: &mut egui::Ui, p: &mut LocationsPage,
                             egui::RichText::new(l.coord_text()).small());
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("✕").clicked() { act = p.remove(l.id); }
+                        // "✕" tells a screen reader nothing, and it is
+                        // the DESTRUCTIVE control on the row — the one
+                        // where guessing wrong costs a saved place.
+                        let resp = uikit_egui::a11y::note_button(
+                            a11y, l.id as u64 * 2 + 1,
+                            &format!("remove {}", l.name),
+                            ui.button("✕"));
+                        if resp.clicked() { act = p.remove(l.id); }
                     });
                 });
             }

@@ -5136,3 +5136,53 @@ never finishes fails with a message instead of hanging CI.
 - **C92a — no editing UI.** The model, the rules and the wiring exist;
   nothing lets a person reorder the list on screen yet, and nothing
   persists it.
+
+## 93. The parity audit was measuring spelling, not adoption
+
+Ran the audit to find what still needs porting faithfully. Surfaces are
+100% named and live across all ten apps — but the kit-adoption table
+showed several at `adaptive=0` and `nav=0`, which did not match what the
+code does.
+
+**It was matching `adaptive::` as a path prefix.** An app that takes
+`&Adaptive` as a PARAMETER — which is the recommended shape, since it
+keeps device detection out of every draw function — never writes that
+string at all. bo-suite reported `adaptive=0` while calling
+`is_compact()` and `min_touch_target` on the value it was handed.
+
+Widened to match USE: `Adaptive`, `is_compact`, `min_touch_target`,
+`DeviceClass`; `Nav` as a bare type; `touchkit::` and `Recognizer` for
+gesture; `A11yScene` and `semantic_toggle` for a11y.
+
+    before                          after
+    bo-suite    adaptive=0          adaptive=2
+    rusty-board adaptive=1 gest=1   adaptive=3 gest=2
+    snapclone   adaptive=0 gest=1   adaptive=3 gest=2
+    logscope    adaptive=3 gest=0   adaptive=5 gest=6
+
+Adoption was much higher than reported, which matters because a metric
+that under-reports adoption makes the kit look unused and invites
+somebody to stop maintaining it.
+
+**One gap survived the correction and was real.** ambient-learner has
+`a11y=0`, and its port genuinely uses palette, motion and adaptive
+without ever building a scene. Its locations page has buttons including
+a bare `✕` — the DESTRUCTIVE control on each row, and the one whose
+label tells a screen reader nothing.
+
+Wired: `A11yScene` on the page, `note_button` on select and remove.
+
+  - **The scene lives on the PAGE**, not built per frame — a scene
+    rebuilt each frame forgets which element had focus, which reads as
+    the cursor jumping away while you are using it.
+  - **Ids derive from the LOCATION id, not the loop index.** Removing a
+    row shifts every index after it, so a positional id would move focus
+    onto a different place than the one it was on.
+  - Labels are "select {name}" and "remove {name}" rather than the
+    glyph.
+
+Did not compile here: ambient-learner needs `gdk-pixbuf-sys`, a known
+sandbox gap. No errors in the edited file.
+
+- **C93a — krapper is a11y=0 nav=0 adaptive=0 gesture=0** and is the
+  only app at all zeros. Unexamined.
