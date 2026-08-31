@@ -93,10 +93,63 @@ environment the artifact does not ship*.
   near-black and 8-bit quantisation eats the hue, so this is art
   direction on maps nobody in this session has seen. `MIN_STOPS = 0.8`
   is a regression floor, not a target.
-- **C13-2e — darks vs curiosity.** The operator wants deliberate darks
-  balanced against exploration and mystery, with horror and grit in the
-  lore. **The film lore was never read.** Tuning against it beats
-  guessing; ask for the pointer.
+- **C13-2e — darks vs curiosity. THE LORE HAS NOW BEEN READ**, and it
+  answers this more directly than expected. Source: the
+  `transformers_blackstar` archive (a small git repo; two Feb-2026
+  commits, most files staged-uncommitted, and an UNTRACKED `addendum/`
+  holding v2 and v3 of "The Black Archives... Watch Bearer", 2026-08-21.
+  v3 supersedes v2 and is the newest material anywhere in it).
+
+  The palette is specified as a three-way contrast, not a mood:
+
+  | | Earth | Pluto | Proto-Earth |
+  |---|---|---|---|
+  | | Warm | Cold | Molten |
+  | | Gold | Blue | Red |
+  | | Life | Void | Birth |
+  | | Noise | Silence | Pressure |
+
+  Pluto is "blue-white lighting, no warmth", explicitly set against "LA
+  warmth, gold sunsets". So the darks-vs-curiosity balance is a per-map
+  register the way `MapStyle` already works, and the value-structure
+  audit (`valuestruct.rs`) is the tool for holding each map to its
+  column. Note OBSERVATORY — now the default — is the Pluto column
+  almost exactly.
+
+  Tone for the dread half: "Unicron. Not villain. Event. Cosmic
+  inevitability." And for the curiosity half, the Blackstar relic
+  "doesn't scream weapon, it whispers: *you knew*."
+
+- **C13-2g — the raid projector IS the Blackstar Relic.** §6's three.js
+  reference and the relic are the same object. The lore specifies it as
+  a "star alignment projection / orbital prediction engine /
+  gravitational anomaly visualizer... possibly Cybertronian dark-energy
+  lensing tech". That is a functional spec for the console, not just a
+  look: it predicts, it does not merely display. Build it as an
+  instrument that shows where things WILL be.
+
+- **C13-2h — the archaeology layer is already ahead of the archive.**
+  Checked rather than assumed: v3's "historical strata" (Layers 0-5,
+  discovered out of order) is implemented faithfully in
+  `archive.rs::Stratum`, down to the out-of-order intent. Every named
+  Layer 3/4 entity exists in the tree — Voltage, Dragon Pulse, the
+  kinetic operative, Asteri, Witwicky. The one exception is
+  **`Grimoire`: 0 hits anywhere.** v3 proposes it as the player's ship's
+  name ("You could make the player's ship the Grimoire"), which is a
+  suggestion rather than a correction, so it is left for the operator to
+  accept or decline rather than named unilaterally.
+
+  v3 also adds a thread with no counterpart in code: **source
+  archaeology as a second layer** — the repo being open means the
+  dependency graph, disabled content and commit history can themselves
+  carry history a player digs through. Nothing in the tree does this.
+
+- **C13-2i — WHICH corrections?** The operator described this archive as
+  "a bit stale because there are some corrections in the docs". The
+  staleness that IS verifiable is internal: v3 over v2, and the August
+  addendum over the February trunk. If there are corrections in a
+  *newer* doc set that never reached this archive, they have not been
+  seen here — ask before treating anything above as current.
 - **C13-2f — exengine's unported shaders.** Named by the operator as
   still missing from the C original. Never enumerated. Someone should
   diff the two shader sets and list what is actually absent.
