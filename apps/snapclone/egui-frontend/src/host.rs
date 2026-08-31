@@ -60,8 +60,8 @@
 
 use crate::{
     ambient_inbox, ambient_palette, camera_select, contact_book, frame_pump, gaze, gossip,
-    identity, keyboard_inset, nat_punch, settings_page, snap_export, voice_bridge, voice_send,
-    Snapclone,
+    identity, keyboard_inset, nat_punch, settings_page, snap_export, snap_state, snaps,
+    voice_bridge, voice_send, Snapclone,
 };
 
 /// Something the world is telling the app.
@@ -99,6 +99,15 @@ pub enum HostEvent {
     /// The address book, off disk. Replaces both the book and the display rows,
     /// so the roster is what was saved rather than what was hardcoded.
     ContactsLoaded(Box<contact_book::ContactBook>),
+
+    /// Which snaps are already finished, off disk. Sent at start-up, before
+    /// anything can populate the feed — a snap filtered after it has been
+    /// shown has already been shown.
+    SnapStateLoaded(Box<snap_state::SnapState>),
+    /// Snaps the host received and wants displayed. Filtered against the
+    /// finished set on the way in, which is the one place that filter can
+    /// live without every producer having to remember it.
+    SnapsForFeed(Vec<snaps::FeedEntry>),
 
     /// The devices this machine offers, from a probe.
     CamerasFound(Vec<camera_select::Device>),
@@ -241,6 +250,10 @@ pub enum HostCommand {
     NatClassified(bool),
     /// A QR payload latched onto an open scanner.
     QrLatched(bool),
+    /// Write the finished-snap set out; it changed. Carries the value for
+    /// the same reason `SaveContacts` does — a host writing from another
+    /// thread must not have to borrow the app.
+    SaveSnapState(Box<snap_state::SnapState>),
     /// Write the address book out; it changed. Carries the book rather than
     /// signalling "go read the app's field", so a host can write it from
     /// another thread without borrowing the app.
@@ -316,6 +329,16 @@ impl Snapclone {
             HostEvent::CameraWorked { id, now_ms } => self.note_camera_worked(&id, now_ms),
             HostEvent::CameraFrame(f) => self.frames.offer(f),
             HostEvent::CaptureStatus(st) => self.capture_status = st,
+            HostEvent::SnapStateLoaded(st) => {
+                self.snap_state = *st;
+                // Loading is not a change. Marking it dirty here would write
+                // the file straight back on every launch, which is a disk
+                // write and a chance to truncate it for no reason at all.
+                self.snap_state_dirty = false;
+            }
+            HostEvent::SnapsForFeed(entries) => {
+                self.feed.set_entries(self.snap_state.filter_unfinished(entries));
+            }
             HostEvent::SnapSaved(r) => {
                 self.shutter_note = match r {
                     // The basename, not the path: a phone's data dir is
@@ -443,6 +466,9 @@ impl Snapclone {
         }
         for id in std::mem::take(&mut self.key_conflicts) {
             out.push(HostCommand::PeerKeyChanged(id));
+        }
+        if std::mem::take(&mut self.snap_state_dirty) {
+            out.push(HostCommand::SaveSnapState(Box::new(self.snap_state.clone())));
         }
         if std::mem::take(&mut self.contacts_dirty) {
             out.push(HostCommand::SaveContacts(Box::new(self.contact_book.clone())));
@@ -692,6 +718,49 @@ mod tests {
         assert_eq!(s.standing_of("sc-11223344"),
                    Standing::Discovered { port: crate::qr::DEFAULT_PORT });
         assert_eq!(s.standing_of("192.168.1.5"), Standing::Plain);
+    }
+
+    #[test]
+    fn a_viewed_snap_is_not_offered_again_after_a_restart() {
+        // End to end through the seam for the last command that had no
+        // store. Before this, a snap was viewed until you quit and unviewed
+        // afterwards — and the sender believes it is gone.
+        let mut s = app();
+        let feed = vec![
+            crate::snaps::FeedEntry { id: "snap-1".into(), sender_name: "kit".into(),
+                sent_at: 0, media: crate::snaps::Media::Image, thumb_path: String::new() },
+            crate::snaps::FeedEntry { id: "snap-2".into(), sender_name: "kit".into(),
+                sent_at: 0, media: crate::snaps::Media::Image, thumb_path: String::new() },
+        ];
+        s.apply(HostEvent::SnapsForFeed(feed.clone()));
+        assert_eq!(s.feed.count(), 2, "a fresh install shows both");
+
+        s.snaps_viewed.push("snap-1".into());
+        s.snap_state.mark("snap-1", crate::snap_state::Mark::Viewed, 1_000);
+        s.snap_state_dirty = true;
+        let out = s.drain_commands();
+        let saved = out.iter().find_map(|c| match c {
+            HostCommand::SaveSnapState(st) => Some(st.clone()), _ => None });
+        let saved = saved.expect(&format!("the mark never reached a save: {out:?}"));
+
+        // Next launch: the state comes off disk and the same feed arrives.
+        let mut next = app();
+        next.apply(HostEvent::SnapStateLoaded(saved));
+        next.apply(HostEvent::SnapsForFeed(feed));
+        assert_eq!(next.feed.count(), 1, "the viewed snap came back");
+        assert_eq!(next.feed.entries()[0].id, "snap-2");
+    }
+
+    #[test]
+    fn loading_the_snap_state_does_not_ask_to_write_it_back() {
+        // A launch that rewrites the file it just read is a disk write and a
+        // chance to truncate it, for nothing.
+        let mut s = app();
+        let mut st = crate::snap_state::SnapState::default();
+        st.mark("snap-1", crate::snap_state::Mark::Viewed, 1);
+        let out = s.apply(HostEvent::SnapStateLoaded(Box::new(st)));
+        assert!(!out.iter().any(|c| matches!(c, HostCommand::SaveSnapState(_))),
+                "loading wrote the file back: {out:?}");
     }
 
     #[test]

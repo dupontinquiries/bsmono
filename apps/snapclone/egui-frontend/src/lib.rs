@@ -90,6 +90,7 @@ pub mod sink_cushion;
 pub mod snap_expiry;
 pub mod store_privacy;
 pub mod snap_export;
+pub mod snap_state;
 pub mod tab_bar;
 pub mod thumbnails;
 pub mod trace_channels;
@@ -252,6 +253,13 @@ pub struct Snapclone {
     pub modal: crate::modal::ModalSurface,
     /// The sealed feed of unopened snaps (Qt SnapFeedWidget).
     pub feed: crate::snaps::SnapFeed,
+    /// Which snaps are already finished, across restarts. Consulted before
+    /// anything is put in the feed — see `snap_state` for why a snap coming
+    /// back after a restart is the promise failing in the direction that
+    /// matters.
+    pub snap_state: crate::snap_state::SnapState,
+    /// The state changed and owes a write.
+    pub snap_state_dirty: bool,
     /// The ephemeral viewer. Holds the only decrypted bytes in the app, and
     /// wipes them on close.
     pub viewer: crate::snaps::Viewer,
@@ -635,6 +643,8 @@ impl Snapclone {
             add_form: Default::default(),
             modal: Default::default(),
             feed: Default::default(),
+            snap_state: Default::default(),
+            snap_state_dirty: false,
             viewer: Default::default(),
             feed_press: Default::default(),
             snaps_viewed: Vec::new(),
@@ -2376,9 +2386,22 @@ impl Snapclone {
             // are u64s, and inventing a conversion here to make the types line
             // up would mark the wrong row.
             V::Viewed(id) => {
+                // Recorded here as well as queued: the queue is the host's
+                // to-do list and this is the app's own memory of it. Without
+                // the second, a viewed snap that the host has not written
+                // yet is still unviewed as far as the next feed load is
+                // concerned.
+                if self.snap_state.mark(&id, crate::snap_state::Mark::Viewed,
+                                        self.now_secs.max(0) as u64 * 1000) {
+                    self.snap_state_dirty = true;
+                }
                 if !self.snaps_viewed.contains(&id) { self.snaps_viewed.push(id); }
             }
             V::Expired(id) => {
+                if self.snap_state.mark(&id, crate::snap_state::Mark::Expired,
+                                        self.now_secs.max(0) as u64 * 1000) {
+                    self.snap_state_dirty = true;
+                }
                 if !self.snaps_expired.contains(&id) { self.snaps_expired.push(id.clone()); }
                 self.modal.dismiss(&format!("snap:{id}"));
             }

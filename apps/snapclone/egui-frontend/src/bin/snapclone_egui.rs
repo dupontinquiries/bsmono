@@ -209,6 +209,14 @@ impl App {
         let cmds = snap.apply(HostEvent::ContactsLoaded(Box::new(book)));
         Self::report(cmds);
 
+        // BEFORE anything can populate the feed. A snap filtered after it
+        // has been shown has already been shown, and this store exists
+        // because a viewed snap coming back is the promise failing in the
+        // direction the sender cares about.
+        let st = snapclone_egui::snap_state::load();
+        let cmds = snap.apply(HostEvent::SnapStateLoaded(Box::new(st)));
+        Self::report(cmds);
+
         // Settings off disk, through the seam rather than by assignment: the
         // event sets `current` AND the saved baseline, so a freshly loaded
         // config does not come up reporting unsaved changes with the Save
@@ -620,8 +628,23 @@ impl App {
                 // makes the gap sharper rather than softer: viewed state is
                 // still in memory only, so a snap is viewed until restart and
                 // unviewed afterwards.
-                other @ (HostCommand::MarkViewed(_) | HostCommand::MarkExpired(_)) => {
-                    eprintln!("snapclone: {other:?} — no store yet, viewed state is in-memory only");
+                // The store exists now. These two are no longer the
+                // odd ones out: the app records the mark itself and emits
+                // `SaveSnapState`, so all this arm owes is silence — a log
+                // line per viewed snap would be noise about the normal case.
+                //
+                // They stay as distinct commands rather than being folded
+                // into the save, because a future host has different work
+                // for each: a read receipt to send for Viewed, a file to
+                // delete for Expired.
+                HostCommand::MarkViewed(_) | HostCommand::MarkExpired(_) => {}
+                HostCommand::SaveSnapState(st) => {
+                    if let Err(e) = snapclone_egui::snap_state::store(&st) {
+                        // Loud, because the failure mode is a snap coming
+                        // back after a restart and nobody knowing why.
+                        eprintln!("snapclone: could not save snap state: {e} — \
+                                   viewed snaps may reappear after a restart");
+                    }
                 }
                 other => eprintln!("snapclone: unhandled host command: {other:?}"),
             }
