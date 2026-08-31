@@ -5522,3 +5522,42 @@ bo-mux 271/271, bo-suite-egui 416/416.
   fires every frame forever.
 
   419/419.
+
+## 98. blackstar: the settings/quit bar was never removed, only pushed off-screen
+
+Operator: the menu's bottom bar for settings vs quit disappears after
+the weapon hotbar is toggled.
+
+**It was still there, below the edge.** `Menu::view` is a hardcoded 12,
+set in `Menu::new` where no screen is in scope, and `ui::menu_rows`
+marched that many rows down from `a.y1` with nothing checking `a.y0`. On
+a short window — or with the hotbar taking a strip off the bottom — the
+last rows were drawn past the edge.
+
+That is why it reads as "disappears after toggling": nothing removed the
+bar, the available height shrank and the list did not notice.
+
+Fixed by clamping `menu_rows` at the bottom edge, and adding
+`rows_that_fit` so a caller can size a view to the screen instead of
+guessing 12.
+
+Two decisions:
+  - **`menu_hit` walks the same list**, so a row that stops being drawn
+    also stops being clickable. Clamping only the draw would leave an
+    invisible row that still responds to a tap — worse than the original
+    bug, because the original at least did nothing.
+  - **`draw_menu` does NOT mutate `view`.** It takes `&Menu`, and a draw
+    function that edits its model makes a value depend on how often the
+    frame ran. The seam is marked with a comment instead; the scroll
+    clamp in `menu.rs` is the right place for it.
+
+Three tests: rows stay above the bottom edge with `view` forced to 30, a
+short screen fits fewer than a tall one, and a point below the last
+drawn row is not hit-tested.
+
+1304/1304, up from 1301.
+
+- **C98a — `Menu::view` is still 12.** The DRAW is now safe, so the bug
+  is fixed, but `visible()` still yields up to 12 rows and that is what
+  scrolling ranges over. Sizing it from the screen needs a caller that
+  has both, which `draw_menu` deliberately is not.

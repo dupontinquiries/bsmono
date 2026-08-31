@@ -356,6 +356,22 @@ pub fn menu_rows(
     let mut out = Vec::new();
     let mut y = a.y1 - row_h * 2.0;
     for (i, _) in m.visible() {
+        // STOP AT THE BOTTOM EDGE.
+        //
+        // `Menu::view` is 12 — a guess made where no screen is in
+        // scope — and this marched that many rows down from the top
+        // whether or not they fitted. On a short window, or with the
+        // weapon hotbar taking a strip off the bottom, the last rows
+        // were drawn off-screen: the reported symptom is the
+        // settings/quit bar "disappearing" after toggling the hotbar,
+        // and it was never removed, only pushed past the edge.
+        //
+        // `menu_hit` walks the same list, so a row that stops being
+        // drawn also stops being clickable — the two cannot disagree
+        // about a row that is not here.
+        if y - row_h * 0.15 < a.y0 {
+            break;
+        }
         out.push((
             i,
             Rect { x0: a.x0, y0: y - row_h * 0.15, x1: a.x1, y1: y + row_h * 0.85 },
@@ -363,6 +379,24 @@ pub fn menu_rows(
         y -= row_h;
     }
     out
+}
+
+/// How many rows actually fit, for `Menu::view`.
+///
+/// The count `menu_rows` would place. Exposed so the menu can size its
+/// window to the screen instead of guessing 12 — a guess that is right
+/// on a desktop and wrong on a phone, and wrong by exactly the amount
+/// that hides the bottom of the list.
+pub fn rows_that_fit(s: &Screen, size: f32) -> usize {
+    let a = s.area();
+    let row_h = size * 2.4;
+    let mut n = 0;
+    let mut y = a.y1 - row_h * 2.0;
+    while y - row_h * 0.15 >= a.y0 {
+        n += 1;
+        y -= row_h;
+    }
+    n
 }
 
 /// Which row is under the cursor, if any. NDC in, row index out.
@@ -440,6 +474,54 @@ pub fn menu_cmds(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn menu_rows_never_run_past_the_bottom_edge() {
+        // The reported bug: the settings/quit bar "disappears" after the
+        // weapon hotbar is toggled. It was never removed — `Menu::view`
+        // is a hardcoded 12 and the layout marched that many rows down
+        // from the top regardless of whether they fitted, so the last
+        // ones were drawn below the screen.
+        let s = Screen::new(2.0);
+        let a = s.area();
+        // One `&'static` id for every row: `Row::action` requires it,
+        // and these rows differ only in how many there are.
+        let mut m = crate::menu::Menu::new("settings",
+            (0..30).map(|i| crate::menu::Row::action("row", &format!("R{i}"))).collect());
+        m.view = 30;
+        for (_, r) in menu_rows(&s, &m, 0.05) {
+            assert!(r.y0 >= a.y0, "row at {} is below the edge {}", r.y0, a.y0);
+        }
+    }
+
+    #[test]
+    fn a_short_screen_fits_fewer_rows_than_a_tall_one() {
+        // The property that makes the clamp meaningful rather than a
+        // constant: a phone in landscape, or a window with a hotbar
+        // strip taken off it, has room for fewer.
+        let tall = rows_that_fit(&Screen::new(1.0), 0.05);
+        let wide = rows_that_fit(&Screen::new(3.0), 0.05);
+        assert!(tall > 0 && wide > 0);
+        assert!(tall >= wide, "tall {tall} should fit at least as many as wide {wide}");
+    }
+
+    #[test]
+    fn what_is_drawn_is_what_can_be_clicked() {
+        // `menu_hit` walks the same list, so a row that stops being
+        // drawn also stops being clickable. A clamp in only one of the
+        // two would leave an invisible row that still responds.
+        let s = Screen::new(2.0);
+        // One `&'static` id for every row: `Row::action` requires it,
+        // and these rows differ only in how many there are.
+        let mut m = crate::menu::Menu::new("settings",
+            (0..30).map(|i| crate::menu::Row::action("row", &format!("R{i}"))).collect());
+        m.view = 30;
+        let drawn = menu_rows(&s, &m, 0.05);
+        let last = drawn.last().expect("some rows fit");
+        let below = last.1.y0 - 0.01;
+        assert!(menu_hit(&s, &m, 0.05, (0.0, below)).is_none(),
+                "a point below the last drawn row was still hit-tested");
+    }
     use super::*;
 
     const W: [f32; 4] = [1.0, 1.0, 1.0, 1.0];

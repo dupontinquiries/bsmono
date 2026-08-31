@@ -293,6 +293,16 @@ pub fn draw_deck(ui: &mut Vec<UiVert>, a: f32, v: &crate::deck::DeckView) {
 pub fn draw_menu(ui: &mut Vec<UiVert>, a: f32, m: &crate::menu::Menu) {
     quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.55]);
     let scr = ui_layout::Screen::new(a);
+    // The menu's `view` is a hardcoded 12, set where no screen is in
+    // scope. `menu_rows` now clamps to the bottom edge, so the rows past
+    // the edge are no longer DRAWN — but `view` still decides which rows
+    // `visible()` yields, and therefore what scrolling can reach.
+    //
+    // Not mutated here: `draw_menu` takes `&Menu`, and a draw function
+    // that edits its model is how a value ends up depending on how often
+    // the frame ran. The scroll clamp in `menu.rs` is the right place;
+    // this comment marks the seam.
+    let _fits = ui_layout::rows_that_fit(&scr, T_BODY);
     let cmds = ui_layout::menu_cmds(&scr, m, T_BODY, PAPER, DIM, [0.27, 0.45, 0.66, 0.55]);
     draw_cmds(ui, a, &cmds);
 }
