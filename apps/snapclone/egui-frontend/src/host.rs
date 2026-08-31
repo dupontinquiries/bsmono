@@ -520,8 +520,15 @@ impl Snapclone {
                 for r in self.sends.rows_mut() {
                     if r.id == id { r.failed(now_ms); }
                 }
+                // THE ADDRESS IS NOTED, not just the send. Without this a
+                // cached address that no longer answers is retried
+                // forever, and every attempt costs the person a timeout.
+                if let Some(a) = self.punch.get(&id) {
+                    self.addr_health.failed(&id, a, now_ms as i64);
+                }
             }
             HostEvent::SnapDelivered { id, now_ms } => {
+                self.addr_health.worked(&id, now_ms as i64);
                 // BOTH outboxes, and the two are not redundant — see the
                 // note on `Snapclone::sends`. `crate::outbox` owns a
                 // snap's lifetime in storage; `send_state::Outbox` owns
@@ -1322,5 +1329,48 @@ mod tests {
         let mut s = app();
         assert!(s.apply(HostEvent::WindowFocus(true)).is_empty());
         assert!(s.apply(HostEvent::GazeLost).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod addr_health_host_tests {
+    use super::*;
+
+    fn app() -> Snapclone { Snapclone::new(Vec::new()) }
+
+    #[test]
+    fn repeated_send_failures_take_an_address_out_of_use() {
+        // The end-to-end version of the rule: the events the host already
+        // emits are what drive it, so nothing extra has to remember.
+        let mut a = app();
+        a.punch.set("sc-1", crate::punch_addrs::PeerAddr::new([10, 0, 0, 9], 9876), 0);
+        assert!(a.addr_health.usable("sc-1", 0));
+        for _ in 0..crate::store_privacy::ADDR_FAIL_THRESHOLD {
+            a.apply(HostEvent::SnapSendFailed { id: "sc-1".into(), now_ms: 0 });
+        }
+        assert!(!a.addr_health.usable("sc-1", 0),
+                "{} failures recorded", a.addr_health.failures("sc-1"));
+    }
+
+    #[test]
+    fn a_delivery_puts_it_back_in_use() {
+        let mut a = app();
+        a.punch.set("sc-1", crate::punch_addrs::PeerAddr::new([10, 0, 0, 9], 9876), 0);
+        for _ in 0..9 {
+            a.apply(HostEvent::SnapSendFailed { id: "sc-1".into(), now_ms: 0 });
+        }
+        a.apply(HostEvent::SnapDelivered { id: "sc-1".into(), now_ms: 1_000 });
+        assert!(a.addr_health.usable("sc-1", 1_000));
+    }
+
+    #[test]
+    fn a_failure_with_no_known_address_records_nothing() {
+        // "No known address" is a different problem from "this address
+        // does not answer", and counting it as the second would blacklist
+        // a peer whose address was simply never learned.
+        let mut a = app();
+        a.apply(HostEvent::SnapSendFailed { id: "sc-unknown".into(), now_ms: 0 });
+        assert_eq!(a.addr_health.failures("sc-unknown"), 0);
+        assert!(a.addr_health.usable("sc-unknown", 0));
     }
 }

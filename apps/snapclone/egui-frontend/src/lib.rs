@@ -419,6 +419,11 @@ pub struct Snapclone {
     /// for every ever-connected peer" — and "a checklist grows a hole every
     /// time somebody adds a map". My version map was that shape starting over.
     pub sessions: crate::peer_session::Sessions,
+    /// Whether each peer's cached address is still worth trying. Beside
+    /// `punch` rather than inside it: an address is replaced wholesale by
+    /// gossip or the DHT, and a record living on the value would be reset
+    /// by the refresh that handed back the same wrong address.
+    pub addr_health: crate::punch_addrs::AddrHealth,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The page strip. Equal segments, an underline and badges — the ported
@@ -723,6 +728,7 @@ impl Snapclone {
             nat: None,
             keyboard: Default::default(),
             sessions: Default::default(),
+            addr_health: Default::default(),
             shake: uikit_egui::glove::ShakeCommands::with(vec![
                 uikit_egui::glove::ShakeBinding {
                     dir: uikit_egui::glove::Orient::RightUp,

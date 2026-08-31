@@ -810,6 +810,18 @@ impl App {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs() as i64).unwrap_or(0);
                     for who in to {
+                        // AN ADDRESS KNOWN WRONG IS NOT TRIED. Five
+                        // failures or an hour stale and the cached one is
+                        // skipped, so the person waits for a refusal
+                        // instead of a timeout — and the peer falls to
+                        // whatever finds it next, gossip or the DHT.
+                        if !self.snap.addr_health.usable(&who, now_s * 1000) {
+                            if let Ok(mut r) = self.send_results.lock() {
+                                r.push((who.clone(),
+                                        Err("last known address keeps failing".into())));
+                            }
+                            continue;
+                        }
                         let Some(addr) = self.snap.punch.get(&who) else {
                             if let Ok(mut r) = self.send_results.lock() {
                                 r.push((who.clone(), Err("no known address".into())));
