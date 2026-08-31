@@ -5426,3 +5426,46 @@ bo-mux 266/266, bo-suite-egui 416/416.
   bo-mux 269/269, bo-suite-egui 416/416.
 - **C96b — `save_to_file` is still uncalled.** Nothing in the port edits
   a scene, so there is nothing to save. Honest, and left.
+
+## 97. The daemon client was a second copy of a schema that already existed
+
+Went to add more commands and found the client I wrote one commit ago
+was doing it the wrong way.
+
+`bo_mux::api` already has `Command` — a serde enum with
+`#[serde(tag = "cmd", rename_all = "snake_case")]` — and `Request` is
+`{ id, #[serde(flatten)] cmd }`. **The daemon deserialises into it.** My
+`call(id, "load_scene", json!({...}))` was hand-building the same wire
+format from strings: a second encoding of a live schema, free to drift,
+and only checkable at run time against a running daemon.
+
+The Qt bridge does the same thing, which is presumably where I got it.
+
+Now `send(id, api::Command)`. A command the daemon does not have is a
+COMPILE error rather than a silent no-op. Replies parse as
+`api::Response`, so `ok`/`data`/`error` are read the way the daemon
+writes them instead of by poking at field names.
+
+Two details that came out of using the real types:
+  - **`ok` with no `data` is a success.** `Response::ok_empty` is a real
+    constructor, so an absent payload is "done, nothing to report" —
+    treating it as an error would make every `Stop` and `LeaveSession`
+    look broken.
+  - A round-trip test asserts the flattened tag is literally
+    `"cmd":"load_scene"`, which is the byte the daemon matches on. That
+    is checkable here; a hand-built object was only checkable on
+    somebody's machine.
+
+Added `list_scenes`, `status`, `play`, `stop` beside `load_scene` — the
+commands the Qt bridge has and this port did not.
+
+`control::list_scenes` and `soundscape_config::scene_names` both exist
+deliberately: the directory listing works with no daemon running, and
+the daemon's own list reflects what it has actually loaded, including
+presets it bootstrapped that are not on disk yet.
+
+bo-mux 271/271, bo-suite-egui 416/416.
+
+- **C97a — the four new commands have no UI.** Transport (play/stop) is
+  the obvious next one, and it needs the Devices page rather than
+  Soundscape.
