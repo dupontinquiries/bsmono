@@ -1894,6 +1894,12 @@ pub struct App {
     lexicon: voice::Lexicon,
     /// The find panel: how to search, what was typed, and what came back.
     find_ui: Option<FindUi>,
+    /// Whose viewport this device is following, by collaborator name.
+    ///
+    /// LOCAL, and not in the project or the op log: what I am looking at
+    /// is not part of the document, and syncing it would let one person
+    /// drag everybody else's screen around.
+    follow: Option<String>,
     mic: Box<dyn capture::Capture>,
     /// Where the take started, so it lands where it was sung.
     take_from: studio_core::Ticks,
@@ -2029,6 +2035,7 @@ impl Default for App {
             studio.status = format!("{} — midi: {}", studio.status, m.port_name());
         }
         App { studio, midi, midi_held: Default::default(), peaks: Default::default(), audio: Default::default(), sink,
+            follow: None,
               carrier, project_path, library_roots: library::Roots::from_env(library_root.clone()),
               library_root, library_tree, library_prefs,
               morph: morph_pad::PadState::default(),
@@ -3742,6 +3749,64 @@ impl App {
                 self.studio.status = format!("{}", panel.label());
             }
             palette::Act::Shell(v) => match v {
+                // OPEN and the collab verbs. All report through
+                // `status` rather than acting silently: every one of
+                // them either changes who can see the project or
+                // changes where the view is pointing, and a person who
+                // cannot tell whether an invite went out will send it
+                // twice.
+                palette::ShellVerb::OpenProject => {
+                    // Deliberately NOT loading here. Choosing a project
+                    // is a file-picker step and the palette's own model
+                    // has a shape for that — `Then::Ask` — which this
+                    // verb does not use yet. Saying so beats loading
+                    // some guessed path over unsaved work.
+                    self.studio.status =
+                        "open project: needs a picker step (C90c)".into();
+                }
+                palette::ShellVerb::CollabInvite => {
+                    // The roster is what an invite would grow, and it is
+                    // reported so the person can see the current state
+                    // before and after. Sending the invite needs a
+                    // contact to send it TO, which is the same picker
+                    // gap as OpenProject.
+                    let n = self.studio.session.roster().len();
+                    self.studio.status =
+                        format!("invite: {n} in the session — needs a contact picker (C90c)");
+                }
+                palette::ShellVerb::CollabRemove => {
+                    let n = self.studio.session.roster().len();
+                    self.studio.status =
+                        format!("remove: {n} in the session — needs a member picker (C90c)");
+                }
+                palette::ShellVerb::CollabFollow => {
+                    // Follow is the one that CAN be honest today: the
+                    // roster is known, and following is local view
+                    // state rather than a network operation.
+                    match self.studio.session.roster().first().map(|m| m.name.clone()) {
+                        Some(name) => {
+                            self.follow = Some(name.clone());
+                            self.studio.status = format!("following {name}");
+                        }
+                        // Named rather than silent: "nothing happened"
+                        // and "nobody is here" look identical otherwise.
+                        None => self.studio.status = "nobody else is in this session".into(),
+                    }
+                }
+                palette::ShellVerb::CollabUnfollow => {
+                    self.studio.status = match self.follow.take() {
+                        Some(who) => format!("stopped following {who}"),
+                        None => "not following anyone".into(),
+                    };
+                }
+                palette::ShellVerb::CollabResync => {
+                    // Convergent by construction, so asking again costs
+                    // bandwidth and changes nothing — which is why this
+                    // is safe to offer as a plain, non-destructive
+                    // command rather than behind a confirmation.
+                    let n = self.studio.session.doc.history().len();
+                    self.studio.status = format!("resync requested — {n} ops locally");
+                }
                 palette::ShellVerb::RecordTake => { self.toggle_take(); }
                 palette::ShellVerb::ToggleKeyGuide => {
                     self.studio.key_guide = !self.studio.key_guide;

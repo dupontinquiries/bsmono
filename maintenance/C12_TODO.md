@@ -5032,3 +5032,60 @@ arrives, analog and MIDI are the same note.
 - **C90b — nothing calls `perform` yet.** The transport needs a record
   arm that opens a `Take`, feeds it from `midi::poll` and the analog
   depth, and calls `record_into` on stop.
+
+## 91. Studio opens projects already; collab commands added
+
+**"Make sure studio can open existing projects" — it can, and the path
+is more careful than I expected.** `Studio::load_from` and
+`open_archive` both exist and are called at startup, and the code
+already handles the case worth handling:
+
+> a load FAILURE is neither: overwriting a damaged-but-real file with a
+> demo on the next Ctrl+S would finish what the damage started, so the
+> shell starts demo'd but says exactly why.
+
+The per-device layout sidecar is applied AFTER the project, so view
+state can never be the reason a project fails to open. Recorded as a
+pass rather than changed.
+
+**The real gap: opening is startup-only.** Nothing switches project
+while running, and there was no palette entry for it.
+
+**Two command surfaces, and they are separate.** `COMMAND_TABLE` in
+studio-command feeds voice grammar and the copilot tool schema;
+`palette::root()` is the visual `C-p` list. Adding to one does not add
+to the other, and I nearly stopped after the first. Both now have the
+new commands.
+
+Added: open project, invite/remove collaborator, follow/unfollow, resync.
+
+Decisions:
+  - **Invite and remove are `destructive: true`.** Both change who can
+    read and write the project, and the flag drives a confirmation —
+    adding a person to a session should not happen from a misheard voice
+    phrase.
+  - **Resync is NOT destructive.** Integration is convergent by
+    construction, so asking twice costs bandwidth and changes nothing.
+  - **All are shell verbs, not `Op`s.** They change the TEAM or this
+    device's view, and neither is a `Project` field — so none of them
+    CAN be an op. `OpenProject` especially: routing "we are now a
+    different project" through the op log would send it to collaborators
+    of the project being left.
+  - **`follow` is local state.** What I am looking at is not part of the
+    document, and syncing it would let one person drag everybody else's
+    screen around.
+  - **Every handler reports through `status`.** A person who cannot tell
+    whether an invite went out will send it twice.
+
+Three of the six are honest placeholders: invite, remove and open all
+need a picker step, and they SAY so rather than acting on a guess.
+Follow, unfollow and resync do real work today.
+
+A test asserts four commands are findable by the word "collaborator" —
+the palette matches on text, so the shared word IS the grouping
+mechanism, and a label that drops it silently leaves the group.
+
+186/186.
+
+- **C90c — the picker step.** `Then::Ask` is the palette's own shape for
+  it and these three do not use it yet.

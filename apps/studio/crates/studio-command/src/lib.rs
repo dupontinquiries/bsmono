@@ -151,6 +151,21 @@ pub fn mute_track(id: TrackId, muted: bool, locked: bool) -> Command {
 /// missing-match compile error, not a silent grammar gap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandKind {
+    /// Open a different project. Distinct from the startup path, which
+    /// can only load whatever it was launched with.
+    ProjectOpen,
+    /// Collaboration. These edit the TEAM, not the document — a member
+    /// list is not a `Project` field, so none of them can be an `Op`.
+    /// That is why they are their own group rather than Edit variants.
+    CollabInvite,
+    CollabRemove,
+    /// Follow a collaborator's viewport. Local only: what I am looking
+    /// at is not part of the project, and syncing it would let one
+    /// person drag everyone else's screen around.
+    CollabFollow,
+    CollabUnfollow,
+    /// Ask for the full op log again.
+    CollabResync,
     EditAddTrack,
     EditRemoveTrack,
     EditSetTrackFlags,
@@ -231,6 +246,12 @@ impl CommandKind {
         CommandKind::EnginePreviewVoice,
         CommandKind::EngineStopPreview,
         CommandKind::RackReplace,
+        CommandKind::ProjectOpen,
+        CommandKind::CollabInvite,
+        CommandKind::CollabRemove,
+        CommandKind::CollabFollow,
+        CommandKind::CollabUnfollow,
+        CommandKind::CollabResync,
     ];
 }
 
@@ -249,6 +270,19 @@ pub struct CommandSpec {
 /// read this — neither hand-maintains a separate list, which is the
 /// mechanism that keeps coverage from drifting as commands are added.
 pub static COMMAND_TABLE: &[CommandSpec] = &[
+    CommandSpec { kind: CommandKind::ProjectOpen, name: "open project", phrases: &["open a project", "open the project", "switch project"], destructive: false },
+    // `destructive: true` on invite and remove: both change who can read
+    // and write the project. The flag drives a confirmation, and adding
+    // a person to a session is exactly the kind of thing that should not
+    // happen from a misheard voice phrase.
+    CommandSpec { kind: CommandKind::CollabInvite, name: "invite collaborator", phrases: &["invite", "add a collaborator", "share this project"], destructive: true },
+    CommandSpec { kind: CommandKind::CollabRemove, name: "remove collaborator", phrases: &["remove the collaborator", "kick"], destructive: true },
+    CommandSpec { kind: CommandKind::CollabFollow, name: "follow collaborator", phrases: &["follow", "jump to where they are"], destructive: false },
+    CommandSpec { kind: CommandKind::CollabUnfollow, name: "stop following", phrases: &["stop following", "unfollow"], destructive: false },
+    // Not destructive: a resync REQUESTS the log and integrates it.
+    // Integration is convergent by construction, so asking twice costs
+    // bandwidth and changes nothing.
+    CommandSpec { kind: CommandKind::CollabResync, name: "resync with collaborators", phrases: &["resync", "re-sync the session"], destructive: false },
     CommandSpec { kind: CommandKind::EditAddTrack, name: "add track", phrases: &["add a track", "new track"], destructive: false },
     CommandSpec { kind: CommandKind::EditRemoveTrack, name: "remove track", phrases: &["remove this track", "delete the track"], destructive: true },
     CommandSpec { kind: CommandKind::EditSetTrackFlags, name: "set track flags", phrases: &["mute the", "unmute the", "lock the track"], destructive: false },

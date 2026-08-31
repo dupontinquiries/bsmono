@@ -41,6 +41,23 @@ pub enum Act {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellVerb {
+    /// Open a different project. A SHELL verb, not an `Op`: replacing
+    /// the document is not an edit TO the document, and routing it
+    /// through the op log would try to send "we are now a different
+    /// project" to collaborators of the project being left.
+    OpenProject,
+    /// Collaboration. All shell verbs for the same reason — they change
+    /// the TEAM or this device's view, and neither is a `Project` field,
+    /// so none of them can be an `Op`.
+    CollabInvite,
+    CollabRemove,
+    /// Follow a collaborator's viewport. Local only: what I am looking
+    /// at is not part of the project, and syncing it would let one
+    /// person drag everybody else's screen around.
+    CollabFollow,
+    CollabUnfollow,
+    /// Ask peers for the full op log again.
+    CollabResync,
     RecordTake,
     /// Show or hide the out-of-key dimming in the piano roll.
     ToggleKeyGuide,
@@ -175,6 +192,21 @@ pub fn root() -> Vec<Choice> {
         // Markers: the one request both the FL Studio and kdenlive
         // communities make in the same words.
         c("drop a marker here", None, Then::Do(Act::Shell(ShellVerb::MarkerHere))),
+        c("open project", Some("switch to another project"),
+          Then::Do(Act::Shell(ShellVerb::OpenProject))),
+        // Collaboration. Grouped together and named with "collaborator"
+        // in each label so a fuzzy search for that word finds the whole
+        // group — the palette matches on text, so the shared word IS the
+        // grouping mechanism.
+        c("invite collaborator", Some("share this project"),
+          Then::Do(Act::Shell(ShellVerb::CollabInvite))),
+        c("remove collaborator", None, Then::Do(Act::Shell(ShellVerb::CollabRemove))),
+        c("follow collaborator", Some("jump to where they are editing"),
+          Then::Do(Act::Shell(ShellVerb::CollabFollow))),
+        c("stop following collaborator", None,
+          Then::Do(Act::Shell(ShellVerb::CollabUnfollow))),
+        c("resync with collaborators", Some("re-request the op log"),
+          Then::Do(Act::Shell(ShellVerb::CollabResync))),
         c("find in the timeline", None, Then::Ask(Ask::FindHow)),
         c("jump to marker", None, Then::Ask(Ask::JumpMarker)),
         c("delete all markers", None, Then::Do(Act::Ops(vec![Op::ClearMarkers]))),
@@ -456,6 +488,26 @@ impl Palette {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_collab_commands_are_all_findable_by_one_word() {
+        // The palette matches on text, so the shared word IS the
+        // grouping mechanism — there is no category field. If a label
+        // ever drops "collaborator", that command silently leaves the
+        // group and nobody notices until they cannot find it.
+        // Bound: `filter` borrows the slice, so a temporary would not
+        // outlive the call.
+        let r = root();
+        let found = filter(&r, "collaborator");
+        assert!(found.len() >= 4, "only found {}: {:?}", found.len(),
+                found.iter().map(|c| &c.label).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn opening_a_project_is_reachable_from_the_palette() {
+        let r = root();
+        assert!(!filter(&r, "open project").is_empty());
+    }
     use super::*;
     use studio_core::{Bus, Track, TrackKind};
 
