@@ -173,12 +173,28 @@ index_choice! {
 }
 
 index_choice! {
-    /// `crypto/backend`. Index 0 is the placeholder Qt shipped for development;
-    /// the label says so, because a crypto backend whose weakness is only in a
-    /// changelog is a crypto backend people leave on.
+    /// `crypto/backend`. A QT-ERA CHOICE THAT NO LONGER EXISTS.
+    ///
+    /// Index 0 was the placeholder Qt shipped for development. This app
+    /// has no such path: `host.rs` and `snapclone_egui.rs` call
+    /// `gossip_wire::encode_signed` unconditionally, which is
+    /// `crypto-kit` — ed25519 signatures, AES-256-GCM, X25519. There is
+    /// no code here that could do HMAC-SHA256 if it were selected.
+    ///
+    /// The variant is KEPT rather than deleted, because
+    /// `settings_store` persists this key by INDEX and a Qt-written
+    /// prefs file containing `crypto_backend = 0` must still load. It
+    /// now says what selecting it actually does, which is nothing.
+    ///
+    /// This is the opposite failure from the usual dead setting: not a
+    /// control that does nothing while looking live, but one that
+    /// offered to make the app LESS SAFE and could not. A person reading
+    /// "production" and selecting it would conclude they had changed
+    /// something, and a person leaving it on "dev only" would think they
+    /// were unprotected. Both were wrong.
     CryptoBackend {
-        Placeholder => "Qt HMAC-SHA256 (placeholder — dev only)",
-        Rust        => "Rust AES-256-GCM + X25519 (production)",
+        Placeholder => "legacy Qt setting — ignored, this build always uses Rust crypto",
+        Rust        => "Rust ed25519 + AES-256-GCM + X25519 (always on)",
     }
 }
 
@@ -857,6 +873,23 @@ impl Labelled for CryptoBackend { fn text(&self) -> &'static str { self.label() 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nothing_branches_on_the_crypto_backend_setting() {
+        // The setting is a Qt-era artifact: this build signs with
+        // crypto-kit unconditionally and has no HMAC path to fall back
+        // to. If a `match` on CryptoBackend ever appears outside this
+        // file, either a weaker path was added or the labels went back
+        // to lying — both worth stopping at review time.
+        //
+        // Checked by grep rather than by types because the thing being
+        // asserted is an ABSENCE, and absence has no signature.
+        for f in ["lib.rs", "host.rs", "gossip_wire.rs"] {
+            let src = std::fs::read_to_string(format!("src/{f}")).unwrap_or_default();
+            assert!(!src.contains("CryptoBackend"),
+                    "{f} branches on CryptoBackend — see the enum's doc");
+        }
+    }
 
     #[test]
     fn no_two_combos_on_a_page_share_a_label() {

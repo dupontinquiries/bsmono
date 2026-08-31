@@ -4560,11 +4560,37 @@ Two details:
 
 Two tests, one per property. 1427/1427.
 
-- **C84a — `crypto_backend` still has no reader.** Same shape, and the
-  stakes are higher: the label says "Qt HMAC-SHA256 (placeholder — dev
-  only)" versus "Rust AES-256-GCM + X25519 (production)", so a person
-  can select production crypto and get whatever the code does anyway.
-  Worth fixing before anything ships.
+- **C84a — DONE, and the fix was the OPPOSITE of adding a reader.**
+  I expected to wire this like the discovery setting. Read the crypto
+  path first: `host.rs` and `snapclone_egui.rs` call
+  `gossip_wire::encode_signed` UNCONDITIONALLY, which is `crypto-kit` —
+  ed25519, AES-256-GCM, X25519. There is no HMAC path in this build.
+
+  So the setting could not be honoured: selecting "placeholder" would
+  have had to make the app LESS SAFE, and nothing exists to do it with.
+  Wiring a reader would have meant WRITING a weak crypto path to satisfy
+  a menu, which is the worst possible reason to add one.
+
+  Relabelled instead:
+    Placeholder → "legacy Qt setting — ignored, this build always uses
+                   Rust crypto"
+    Rust        → "Rust ed25519 + AES-256-GCM + X25519 (always on)"
+
+  The variant is KEPT, not deleted: `settings_store` persists this key
+  by INDEX, so a Qt-era prefs file with `crypto_backend = 0` must still
+  load.
+
+  Both old labels misled in opposite directions — someone selecting
+  "production" would think they had changed something, and someone
+  leaving "dev only" would think they were unprotected. Neither was
+  true.
+
+  A test greps `lib.rs`, `host.rs` and `gossip_wire.rs` for
+  `CryptoBackend` and fails if it appears. The assertion is an ABSENCE,
+  which has no type signature — if a branch on this setting ever shows
+  up, either a weaker path was added or the labels went back to lying.
+
+  1428/1428.
 - **C84b — the DHT half is enabled but unreached.** `discovery_enabled()
   .1` is now honest and nothing consumes it yet;
   `snapclone_presence::dht::{publish,resolve}` is what it should call.
