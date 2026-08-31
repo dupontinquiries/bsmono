@@ -68,30 +68,50 @@ pub fn dequant_q5_k(raw: &[u8], n: usize) -> Result<Vec<f32>, String> {
     let mut out = vec![0.0f32; n];
     for b in 0..blocks {
         let p = b * Q5_K_BLOCK;
-        let d = f16(raw[p], raw[p + 1]);
-        let dmin = f16(raw[p + 2], raw[p + 3]);
-        let scales = &raw[p + 4..p + 16];
-        let qh = &raw[p + 16..p + 48];
-        let qs = &raw[p + 48..p + 176];
-        let mut o = b * 256;
-        for g in 0..4 {
-            // Two sub-blocks per 64-weight group, low nibbles then high — and the FIFTH bit comes
-            // from qh, one bit per weight, indexed by the group rather than the sub-block.
-            let (sc1, m1) = scale_min_k4(g * 2, scales);
-            let (sc2, m2) = scale_min_k4(g * 2 + 1, scales);
-            let (d1, mm1) = (d * sc1 as f32, dmin * m1 as f32);
-            let (d2, mm2) = (d * sc2 as f32, dmin * m2 as f32);
-            for l in 0..32 {
-                let qsb = qs[g * 32 + l];
-                let hi_lo = ((qh[l] >> (g * 2)) & 1) << 4;
-                let hi_hi = ((qh[l] >> (g * 2 + 1)) & 1) << 4;
-                out[o + l] = d1.mul_add(((qsb & 0xF) | hi_lo) as f32, -mm1);
-                out[o + 32 + l] = d2.mul_add(((qsb >> 4) | hi_hi) as f32, -mm2);
-            }
-            o += 64;
-        }
+        q5k_block(&mut out[b * 256..b * 256 + 256], &raw[p..p + Q5_K_BLOCK]);
     }
     Ok(out)
+}
+
+/// One Q5_K super-block. Split out for the same reason as Q4_K's: `mul_add` is a call into
+/// compiler_builtins' `fmaf` on baseline x86-64, and `#[target_feature]` only reaches a body it can
+/// inline. Measured 12x slower than llama.cpp's scalar C before this — the worst of the three.
+#[inline(always)]
+fn q5k_block_core(out: &mut [f32], blk: &[u8]) {
+    let d = f16(blk[0], blk[1]);
+    let dmin = f16(blk[2], blk[3]);
+    let scales = &blk[4..16];
+    let qh = &blk[16..48];
+    let qs = &blk[48..176];
+    for g in 0..4 {
+        // Two sub-blocks per 64-weight group, low nibbles then high — and the FIFTH bit comes
+        // from qh, one bit per weight, indexed by the group rather than the sub-block.
+        let (sc1, m1) = scale_min_k4(g * 2, scales);
+        let (sc2, m2) = scale_min_k4(g * 2 + 1, scales);
+        let (d1, mm1) = (d * sc1 as f32, dmin * m1 as f32);
+        let (d2, mm2) = (d * sc2 as f32, dmin * m2 as f32);
+        let q = &qs[g * 32..g * 32 + 32];
+        let (lo, hi) = out[g * 64..g * 64 + 64].split_at_mut(32);
+        for (((o1, o2), &qsb), &qhb) in lo.iter_mut().zip(hi.iter_mut()).zip(q.iter()).zip(qh.iter()) {
+            let hi_lo = ((qhb >> (g * 2)) & 1) << 4;
+            let hi_hi = ((qhb >> (g * 2 + 1)) & 1) << 4;
+            *o1 = d1.mul_add(((qsb & 0xF) | hi_lo) as f32, -mm1);
+            *o2 = d2.mul_add(((qsb >> 4) | hi_hi) as f32, -mm2);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma")]
+unsafe fn q5k_block_fma(out: &mut [f32], blk: &[u8]) { q5k_block_core(out, blk) }
+
+fn q5k_block(out: &mut [f32], blk: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::fmapath::has_fma() {
+        // SAFETY: guarded by the runtime detection this line performs.
+        return unsafe { q5k_block_fma(out, blk) };
+    }
+    q5k_block_core(out, blk)
 }
 
 /// Q2_K: 256 weights in 84 bytes — 16 scale bytes, 64 quant bytes, d, dmin.
@@ -107,34 +127,51 @@ pub fn dequant_q2_k(raw: &[u8], n: usize) -> Result<Vec<f32>, String> {
     let mut out = vec![0.0f32; n];
     for b in 0..blocks {
         let p = b * Q2_K_BLOCK;
-        // d and dmin sit at the END here, unlike Q4_K and Q5_K where they lead. Assuming the Q4_K
-        // layout reads scales as a float and produces garbage that still has the right length.
-        let scales = &raw[p..p + 16];
-        let qs = &raw[p + 16..p + 80];
-        let d = f16(raw[p + 80], raw[p + 81]);
-        let dmin = f16(raw[p + 82], raw[p + 83]);
-        let mut o = b * 256;
-        let mut is = 0usize;
-        for g in 0..2 {
-            for shift in [0u32, 2, 4, 6] {
-                let sc = scales[is];
-                let dl = d * (sc & 0xF) as f32;
-                let ml = dmin * (sc >> 4) as f32;
-                for l in 0..16 {
-                    out[o + l] = dl.mul_add(((qs[g * 32 + l] >> shift) & 3) as f32, -ml);
-                }
-                let sc = scales[is + 1];
-                let dl = d * (sc & 0xF) as f32;
-                let ml = dmin * (sc >> 4) as f32;
-                for l in 0..16 {
-                    out[o + 16 + l] = dl.mul_add(((qs[g * 32 + 16 + l] >> shift) & 3) as f32, -ml);
-                }
-                is += 2;
-                o += 32;
-            }
-        }
+        q2k_block(&mut out[b * 256..b * 256 + 256], &raw[p..p + Q2_K_BLOCK]);
     }
     Ok(out)
+}
+
+/// One Q2_K super-block, split out for the FMA dispatch (see `q4k_block_core`).
+#[inline(always)]
+fn q2k_block_core(out: &mut [f32], blk: &[u8]) {
+    // d and dmin sit at the END here, unlike Q4_K and Q5_K where they lead. Assuming the Q4_K
+    // layout reads scales as a float and produces garbage that still has the right length.
+    let scales = &blk[0..16];
+    let qs = &blk[16..80];
+    let d = f16(blk[80], blk[81]);
+    let dmin = f16(blk[82], blk[83]);
+    let mut o = 0usize;
+    let mut is = 0usize;
+    for g in 0..2 {
+        for shift in [0u32, 2, 4, 6] {
+            for half in 0..2 {
+                let sc = scales[is + half];
+                let dl = d * (sc & 0xF) as f32;
+                let ml = dmin * (sc >> 4) as f32;
+                let q = &qs[g * 32 + half * 16..g * 32 + half * 16 + 16];
+                let y = &mut out[o + half * 16..o + half * 16 + 16];
+                for (dst, &qb) in y.iter_mut().zip(q.iter()) {
+                    *dst = dl.mul_add(((qb >> shift) & 3) as f32, -ml);
+                }
+            }
+            is += 2;
+            o += 32;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma")]
+unsafe fn q2k_block_fma(out: &mut [f32], blk: &[u8]) { q2k_block_core(out, blk) }
+
+fn q2k_block(out: &mut [f32], blk: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::fmapath::has_fma() {
+        // SAFETY: guarded by the runtime detection this line performs.
+        return unsafe { q2k_block_fma(out, blk) };
+    }
+    q2k_block_core(out, blk)
 }
 
 #[cfg(test)]

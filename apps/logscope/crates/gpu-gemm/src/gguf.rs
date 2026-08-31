@@ -783,6 +783,51 @@ where F: Fn(&mut [f32], &[u8]) + Sync {
     });
 }
 
+/// One Q4_K super-block. Split out of the match arm so the FMA-enabled wrapper below can INLINE it:
+/// `#[target_feature]` applies to the body it annotates, and a closure called through a generic is
+/// a separate item that does not inherit the feature. The first attempt wrapped the loop in a
+/// `with_fma(|| ...)` closure and emitted no `vfmadd` at all — the disassembly said so before the
+/// benchmark did.
+#[inline(always)]
+fn q4k_block_core(y: &mut [f32], blk: &[u8]) {
+    let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+    let dmin = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+    let scales = &blk[4..16];
+    let qs = &blk[16..144];
+    for j in 0..4 {
+        let is = j * 2;
+        let (sc1, m1) = get_scale_min_k4(is, scales);
+        let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+        let (d1, mm1) = (d * sc1 as f32, dmin * m1 as f32);
+        let (d2, mm2) = (d * sc2 as f32, dmin * m2 as f32);
+        // MUL_ADD IS DELIBERATE — see the note in the Q4_K arm: the shader contracts this into an
+        // FMA and cannot be stopped, so the CPU reference must round once too or it disagrees with
+        // the GPU by an ULP that the re-quantizer turns into hundreds of thousands of differing
+        // words. What is NOT deliberate is that on baseline x86-64 `mul_add` is a call into
+        // compiler_builtins' `fmaf`. Hence the dispatch below.
+        let q = &qs[j * 32..j * 32 + 32];
+        let (lo, hi) = y[j * 64..j * 64 + 64].split_at_mut(32);
+        for ((o1, o2), &qb) in lo.iter_mut().zip(hi.iter_mut()).zip(q.iter()) {
+            *o1 = d1.mul_add((qb & 0xF) as f32, -mm1);
+            *o2 = d2.mul_add((qb >> 4) as f32, -mm2);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma")]
+unsafe fn q4k_block_fma(y: &mut [f32], blk: &[u8]) { q4k_block_core(y, blk) }
+
+/// Dispatch ONCE PER SUPER-BLOCK (256 weights), not per element.
+fn q4k_block(y: &mut [f32], blk: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::fmapath::has_fma() {
+        // SAFETY: guarded by the runtime detection this line performs.
+        return unsafe { q4k_block_fma(y, blk) };
+    }
+    q4k_block_core(y, blk)
+}
+
 pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, String> {
     match ggml_type {
         0 => Ok((0..n).map(|i| f32::from_le_bytes(data[i * 4..i * 4 + 4].try_into().unwrap())).collect()),
@@ -879,38 +924,7 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
             if n % 256 != 0 { return Err("q4_k element count not a multiple of 256".into()); }
             if data.len() < n / 256 * 144 { return Err("q4_k data truncated".into()); }
             let mut out = vec![0f32; n];
-            par_blocks(&mut out, &data[..n / 256 * 144], 256, 144, |y, blk| {
-                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
-                let dmin = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
-                let scales = &blk[4..16];
-                let qs = &blk[16..144];
-                let (mut is, mut qoff, mut yoff) = (0usize, 0usize, 0usize);
-                for _ in 0..4 {
-                    let (sc1, m1) = get_scale_min_k4(is, scales);
-                    let (sc2, m2) = get_scale_min_k4(is + 1, scales);
-                    let (d1, mm1) = (d * sc1 as f32, dmin * m1 as f32);
-                    let (d2, mm2) = (d * sc2 as f32, dmin * m2 as f32);
-                    for l in 0..32 {
-                        // MUL_ADD, to match what the GPU cannot be stopped from doing.
-                        //
-                        // The shader binds `dsc` and `dm` to named values, and it does NOT help: WGSL
-                        // `let` names a value, it is not a rounding barrier, and the compiler still
-                        // contracts `dsc * nib - dm` into an FMA. There is no no_fma pragma to reach
-                        // for, so the GPU rounds once here whatever the source looks like.
-                        //
-                        // gate-q4k measured the consequence: 0.31525478 against 0.31525475, one ULP,
-                        // on 57 of 112 block scales — and because this value feeds `round(v / scale)`
-                        // in the re-quantizer, an ULP crosses quantization boundaries and became
-                        // 297430 differing words on the large tensor.
-                        //
-                        // So the reference matches the hardware rather than the other way round. This
-                        // is MORE accurate, not less: one rounding instead of two.
-                        y[yoff + l] = d1.mul_add((qs[qoff + l] & 0xF) as f32, -mm1);
-                        y[yoff + 32 + l] = d2.mul_add((qs[qoff + l] >> 4) as f32, -mm2);
-                    }
-                    qoff += 32; yoff += 64; is += 2;
-                }
-            });
+            par_blocks(&mut out, &data[..n / 256 * 144], 256, 144, q4k_block);
             Ok(out)
         }
         // IQ1_M IS NOT IQ1_S WITH A DIFFERENT BLOCK SIZE. Both are ~1.6-1.75 bpw codebook

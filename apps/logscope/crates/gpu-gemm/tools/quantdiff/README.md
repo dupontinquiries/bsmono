@@ -45,3 +45,29 @@ and the dequantizer disagree, and the dequantizer is the truth.
 The fixes are pinned in-tree by `iq2_s_matches_the_llama_cpp_reference_vector`
 and `iq1_m_matches_the_llama_cpp_reference_vector`, as numbers rather than as a
 re-derivation of the layout, because the layout is what was misread.
+
+## Performance, same harness
+
+`qref.c` also times (`qref <type> <n> <reps>` prints ms to stderr). Comparing scalar C against this
+crate on 20 x 262144 elements, before any change:
+
+    q4_k  llama.cpp 2.28 ms   ours 20.6 ms   9.0x
+    q5_k            1.68            20.5    12.2x
+    q2_k            7.55            20.6     2.7x
+    q6_k            6.01             6.00    1.0x   <- already at parity
+
+Exactly the three formats that use `f32::mul_add`, and only those. On baseline
+`x86_64-unknown-linux-gnu` FMA is not in the target feature set, so `mul_add` does not lower to an
+instruction — it lowers to an indirect call into `compiler_builtins`' `fmaf`, per element, which
+also makes the loop unvectorisable. Isolated: 25.38 ms vs 3.13 ms for the same loop written with
+`d * q - m`.
+
+The `mul_add` is deliberate and had to stay (the shader contracts to an FMA and the CPU reference
+must round once to agree with it — see the note in the Q4_K arm). The fix is `src/fmapath.rs`:
+detect FMA once, run the block loop inside a `#[target_feature(enable = "fma")]` function. Same
+arithmetic, same bits, one instruction.
+
+    q4_k 20.6 -> 3.06 ms   q5_k 20.5 -> 3.36   q2_k 20.6 -> 5.49
+
+aarch64 was never affected: FMA is baseline in ARMv8, so `mul_add` already lowers to `fmla`. This
+was a desktop-x86 tax on a project that benchmarks on ARM.

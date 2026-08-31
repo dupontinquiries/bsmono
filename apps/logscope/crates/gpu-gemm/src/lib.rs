@@ -28,6 +28,7 @@ pub mod flash_qblock;
 pub mod jsonmask; // byte-level JSON grammar constraint for structured decoding
 pub mod pool_class;
 pub mod gguf;
+pub mod fmapath;   // hardware-FMA dispatch: mul_add is a libm CALL on baseline x86-64 (measured 8x)
 pub mod cpumatvec;
 pub mod cpupool;
 pub mod cpuattn;
