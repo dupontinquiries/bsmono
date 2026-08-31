@@ -23,6 +23,11 @@ struct App {
     page: Page,
     history: history::History,
     places: locations::LocationsPage,
+    /// Screen-reader semantics. On the app, not the page: `A11yScene`
+    /// derives only `Default` and `LocationsPage` is
+    /// `Debug + Clone + PartialEq`. It must outlive the frame either
+    /// way — a scene rebuilt each frame forgets which element had focus.
+    a11y: uikit_egui::a11y::A11yScene,
     /// Weather-sharing to snapclone contacts. Empty contact list rather than
     /// invented names: a demo with no snapclone connection has no contacts,
     /// which is the true state, matching this app's own convention elsewhere
@@ -148,7 +153,8 @@ impl eframe::App for App {
                     // perform it against. Applying it locally would show a
                     // place that was never saved, which is the failure the
                     // page's own tests forbid.
-                    let _ = locations::locations_ui(ui, &mut self.places, &self.colors);
+                    let _ = locations::locations_ui(
+                        ui, &mut self.places, &self.colors, &mut self.a11y);
                 }
             }
         });
@@ -198,6 +204,7 @@ fn main() -> eframe::Result<()> {
             // Empty, like the history: the page says "no saved locations, tap +
             // to add one", which is true, rather than inventing places.
             places: locations::LocationsPage::default(),
+            a11y: Default::default(),
             // Empty: this demo has no live snapclone connection to source
             // contacts from, so the share row honestly shows "no contacts
             // yet" rather than a fabricated list.

@@ -62,12 +62,6 @@ pub enum LocationAction {
 /// The page.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LocationsPage {
-    /// Semantics for the screen reader.
-    ///
-    /// On the PAGE, not built per frame: a scene rebuilt each frame
-    /// forgets which element had focus, which reads as the cursor
-    /// jumping away while you are trying to use it.
-    pub a11y: uikit_egui::a11y::A11yScene,
     locations: Vec<Location>,
     /// The add form's text, empty when closed.
     pub new_name: String,
@@ -148,12 +142,18 @@ impl LocationsPage {
 
 /// Draw the page. Returns an action for the host to perform.
 pub fn locations_ui(ui: &mut egui::Ui, p: &mut LocationsPage,
-                    c: &uikit_egui::PaletteColors) -> Option<LocationAction> {
+                    c: &uikit_egui::PaletteColors,
+                    // The scene is passed IN rather than living on the
+                    // page, because `A11yScene` derives only `Default`
+                    // and `LocationsPage` is `Debug + Clone + PartialEq`
+                    // — putting it on the page cost the page all three.
+                    //
+                    // It still has to outlive the frame (a scene rebuilt
+                    // each frame forgets which element had focus), so the
+                    // shell owns it: same lifetime, no derive conflict.
+                    a11y: &mut uikit_egui::a11y::A11yScene)
+                    -> Option<LocationAction> {
     let mut act = None;
-    // Borrow split: `a11y` is taken before `p` is used mutably below.
-    // Fourth time this pattern has been needed this week — a scene on
-    // the same struct as the data it describes always wants it.
-    let a11y = &mut p.a11y;
     ui.label(egui::RichText::new("Current location").small().color(c.text_weak));
     ui.heading(p.header());
     ui.separator();

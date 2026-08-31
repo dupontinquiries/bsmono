@@ -34,6 +34,14 @@ pub struct Shell {
     pub dot: super::live::BreathingDot,
     pub history: super::history::History,
     pub locations: super::locations::LocationsPage,
+    /// Screen-reader semantics, owned by the SHELL.
+    ///
+    /// Here rather than on a page because `A11yScene` derives only
+    /// `Default` and the pages are `Debug + Clone + PartialEq`. It still
+    /// outlives the frame, which is the property that matters — a scene
+    /// rebuilt each frame forgets which element had focus, and that
+    /// reads as the cursor jumping away mid-use.
+    pub a11y: uikit_egui::a11y::A11yScene,
     pub map: super::map::MapPage,
     pub model: super::model::ModelPage,
     pub sync: super::sync::SyncPage,
@@ -134,7 +142,8 @@ impl Shell {
                 // Dropping it with `let _ =` would compile and would make
                 // every button on the page dead — the same class of bug this
                 // whole file exists to fix, one level down.
-                if let Some(a) = super::locations::locations_ui(ui, &mut self.locations, colors) {
+                if let Some(a) = super::locations::locations_ui(
+                    ui, &mut self.locations, colors, &mut self.a11y) {
                     self.pending.push(a);
                 }
             }
@@ -232,6 +241,7 @@ mod tests {
 impl Default for Shell {
     fn default() -> Self {
         Shell {
+            a11y: Default::default(),
             router: Router::default(),
             live: Default::default(),
             dot: Default::default(),

@@ -5561,3 +5561,28 @@ drawn row is not hit-tested.
   is fixed, but `visible()` still yields up to 12 rows and that is what
   scrolling ranges over. Sizing it from the screen needs a caller that
   has both, which `draw_menu` deliberately is not.
+
+## 99. Build 157: ambient-learner broken by my own a11y change
+
+**59 builds ok, 5889 tests passing.** Two breaks.
+
+**ambient-learner — mine, from §93.** I put an `A11yScene` field on
+`LocationsPage`, which derives `Debug + Clone + Default + PartialEq`.
+`A11yScene` derives only `Default`, so the page lost all three others
+and seven errors followed.
+
+Fixed by moving the scene to the SHELL and passing `&mut` into
+`locations_ui`. It still outlives the frame, which is the property that
+mattered — a scene rebuilt each frame forgets which element had focus —
+and the page keeps its derives. Two callers needed updating; the second
+was in `main.rs` and only the compiler found it.
+
+Worth naming the mistake precisely: I checked that the FILE compiled and
+the sandbox could not link the crate, so "no errors in the edited file"
+was true and insufficient. A field added to a derived struct is a change
+to every derive on it, and that is not visible in the file being edited.
+
+**rusty-board — not ours.** `gtk4-layer-shell-sys` build script fails,
+a missing system library on the build host.
+
+ambient-learner-egui 151/151.
