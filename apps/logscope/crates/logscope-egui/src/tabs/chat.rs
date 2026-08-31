@@ -8151,7 +8151,24 @@ if let Some(msg) = self.error_banner.clone() {
                             ui.label(RichText::new("CONTEXT CARDS").color(theme::DIM()).small().strong());
                             if has_file {
                                 ui.add_space(3.0);
-                                ui.label(RichText::new(format!("📄 {}", doc.name)).color(theme::CYAN()).small());
+                                // NAME, SIZE, AND WHY IT IS HERE — the three facts the reference
+                                // cards carry and ours did not. The figure on the right is a COUNT
+                                // rendered as a ratio, always shown with its denominator: a bare
+                                // 0.67 in the panel whose job is explaining the context would read
+                                // as a model's confidence, and this is something a reader can check
+                                // by opening the file.
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("📄 {}", doc.name)).color(theme::CYAN()).small());
+                                    if let Some((_, hit, total)) = crate::ctxcard::topic_match(&doc.lines, &kws) {
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(RichText::new(crate::ctxcard::match_label(hit, total))
+                                                .color(if hit * 2 >= total { theme::AMBER() } else { theme::DIM() })
+                                                .small().monospace());
+                                        });
+                                    }
+                                });
+                                ui.label(RichText::new(crate::ctxcard::size_line(&doc.lines, doc.placeholder))
+                                    .color(theme::FAINT()).small());
                             }
                             if let Some(code) = &code {
                                 ui.add_space(4.0);
