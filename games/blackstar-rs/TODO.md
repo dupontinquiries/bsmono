@@ -15,6 +15,23 @@ from the shipped binary, same category as the pre-existing 335.
 
 ## Fixed and verified this session
 
+- **The HUD's text metric never matched the font** (`6d9475d2`): font.rs
+  draws glyphs 7 font-pixels tall / 6 wide per char; ui.rs claimed 2.4
+  tall / 1.15 wide, and the hand-placed in-game HUD was authored to the
+  2.4 assumption — first live recording showed the stat card, bottom
+  stack, hotbar digits and weapon readout all drawn through each other.
+  ui.rs metrics now come from font.rs; the card and bottom stack are
+  panels; 7 new tests rasterize emitted text through `font::text` and
+  assert containment/non-overlap (3 written first and failing on the old
+  code, 4 break-checked against targeted regressions). NOT verified on an
+  actual screen — no display here.
+  - **Found, not fixed:** the hand-placed menu screens with hit-test
+    mirrors in main.rs (pause/garage/tweaks/academy/maps: `row_pair` at
+    `T_BODY * k` on pitches authored for the 2.4 metric) share the bug
+    class; and an active trial/lesson banner and the combo readout can
+    still coexist at top-centre. Both want the panel migration, not
+    another round of hand-retuned literals.
+
 - **Fold cinematics** (`camera.rs`, `sound.rs`, `main.rs::advance_xform`):
   director's-camera mode (`CamMode::Cinematic`) during a fold, arc speed
   tied to `content::Chassis::fold_spin` (previously dead data), servo-sweep
