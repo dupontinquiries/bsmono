@@ -5248,3 +5248,54 @@ Where this leaves the user's two-part architecture:
       the honest note is that nothing in this codec can produce them
       from pixels; they come either from a vision model or from the
       engine, and the engine path is the one already measured to work.
+
+### In-loop deblocking: the artifact PSNR hid, now measured and fixed
+
+Built off the blockiness finding (v11 at 4.64x the off-grid gradient on
+the REGION grid where AV1 sits at ~0.95x). Filters both grids the codec
+makes steps on — REGION boundaries where the mode decision may have
+switched predictor, and the 4x4 transform grid where the dead zone may
+have quantised neighbours differently — with strength taken from the
+MODE MAP rather than a global knob: an edge whose two sides chose
+different predictors is filtered harder. Same reasoning as AV1's
+boundary strength, and free here because the mode map is in hand. The
+artifact/edge test is the standard one (only smooth when the step
+ACROSS the boundary is large relative to variation on either SIDE), so
+real edges survive. IN-LOOP: the filtered frame becomes the prev-MC
+reference.
+
+Procedural ground, dz32:
+  strength   bytes     PSNR     SSIM     P=4    P=8   P=16   P=32
+  off      227,533   31.536   0.8656   2.686  3.188  4.642  4.251
+  1        227,517   31.614            2.101  2.506  3.554  3.370
+  2        227,899   31.652   0.8715   1.286  1.479  1.909  1.901
+  4        229,486   31.532            0.720  1.185  2.087  2.049
+
+Strength 2: +0.12 dB, +0.006 SSIM, blockiness on the REGION grid cut
+59% (4.64 -> 1.91), for +0.16% bytes. Strength 4 is past the knee —
+PSNR turns back down and P=4 falls to 0.72, i.e. it has smoothed BELOW
+the source's own grid statistics, which is over-filtering by
+definition.
+
+blackstar real footage, dz32:
+  off  332,841 B @ 35.619 / 0.9750   P=16 1.419
+  s1   331,432 B @ 35.616 / 0.9750   P=16 1.341
+  s2   337,810 B @ 35.591 / 0.9749   P=16 1.219
+Real footage wants a GENTLER setting than synthetic: s1 costs nothing
+(bytes actually fall 0.4%, the in-loop gain) and removes some blocking,
+while s2 costs 1.5% bytes for more artifact reduction and slightly
+worse PSNR. That is the expected shape — this clip started at 1.42x,
+not 4.64x, so there is far less artificial step to remove and more real
+detail to lose.
+
+Honest reading: this is a PICTURE-QUALITY fix, not a rate win. The
+in-loop byte saving is real but tiny (0.4% at s1 on blackstar,
+0.007% on ground); the payoff is that the codec stops shipping steps
+the metrics never charged it for. Kept behind FAO_DEBLOCK=<strength>
+with no default, because the right strength is clearly
+content-dependent (2 on synthetic, 1 on film-like) and picking one
+number would be exactly the fixed-threshold mistake this session has
+now made three times — the fixed MV rate charge, the fixed DICT_MARGIN,
+and the fixed admission gate. The strength wants to come off the same
+spectral statistic spectral_probe computes, which is the next
+construction and ties the two together.

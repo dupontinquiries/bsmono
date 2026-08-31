@@ -1600,6 +1600,111 @@ pub fn encode_gop_routed(
     if jw <= jo { (with, true) } else { (without, false) }
 }
 
+/// In-loop deblocking.
+///
+/// Measured need, not a guess: `bin/blockiness` put v11 at 4.64x the
+/// off-grid gradient on the REGION grid (procedural ground) and 1.42x
+/// on real footage, against AV1 sitting at ~0.95x — i.e. AV1's own
+/// deblock/CDEF/loop-restoration track the SOURCE's grid statistics
+/// while v11 ships every step straight to the viewer. PSNR and SSIM
+/// both missed it for the whole project, which is why every
+/// matched-PSNR comparison flattered this codec.
+///
+/// Two grids get filtered because the codec makes steps on both:
+/// REGION boundaries, where the mode decision may have switched
+/// predictor between neighbours, and the 4x4 transform grid, where the
+/// dead zone may have quantised neighbours differently.
+///
+/// The filter is strength-modulated by information the encoder already
+/// has rather than by a global knob. A REGION edge whose two sides
+/// chose DIFFERENT predictors is the most likely to carry an artificial
+/// step and is filtered harder; an edge inside one predictor's territory
+/// is filtered gently. That is the same reasoning AV1's filter uses
+/// (boundary strength from mode/reference difference) and it is free
+/// here because the mode map is already in hand.
+///
+/// The artifact/edge test is the standard one and it is what stops the
+/// filter destroying real detail: only smooth when the step ACROSS the
+/// boundary is large relative to the variation on either SIDE of it. A
+/// real edge has large variation on both; a blocking step is flat, step,
+/// flat.
+///
+/// IN-LOOP, not cosmetic: the filtered frame becomes the prev-MC
+/// reference, so a cleaner reference should also cost fewer residual
+/// bytes. That is the claim to measure, not assume.
+fn deblock(f: &mut Yuv420, modes: &[u8], gw: usize, gh: usize, dz: f32, strength: i32) {
+    let (w, h) = (f.w, f.h);
+    // Thresholds scale with the dead zone: a coarser quantiser makes
+    // bigger steps, and a step the quantiser could not have produced is
+    // real content that must survive.
+    let step_thr = (dz * 0.75).clamp(4.0, 48.0) as i32;
+    let flat_thr = (dz * 0.375).clamp(2.0, 24.0) as i32;
+    let src = f.y.clone();
+    let strength_at = |ga: usize, gb: usize| -> i32 {
+        if modes.get(ga) != modes.get(gb) { 2 } else { 1 }
+    };
+    // Vertical edges (filter across columns).
+    let mut x = 4usize;
+    while x < w {
+        let on_region = x % REGION == 0;
+        for y in 0..h {
+            let (p1, p0) = (src[y * w + x - 2] as i32, src[y * w + x - 1] as i32);
+            let (q0, q1) = (src[y * w + x] as i32, src[y * w + x + 1.min(w - 1 - x)] as i32);
+            let step = (q0 - p0).abs();
+            if step >= step_thr || step == 0 {
+                continue; // real edge, or nothing to do
+            }
+            if (p1 - p0).abs() > flat_thr || (q1 - q0).abs() > flat_thr {
+                continue; // textured either side — not a blocking step
+            }
+            let gx = (x / REGION).min(gw - 1);
+            let gy = (y / REGION).min(gh - 1);
+            let st = if on_region && gx > 0 {
+                strength_at(gy * gw + gx - 1, gy * gw + gx)
+            } else {
+                1
+            };
+            // Shift the two boundary samples toward each other by a
+            // fraction set by strength. Deliberately narrow (2 taps a
+            // side) — a wide filter on a 4x4 grid would blur more than
+            // it repairs.
+            let d = (q0 - p0) * st * strength / 8;
+            f.y[y * w + x - 1] = (p0 + d).clamp(0, 255) as u8;
+            f.y[y * w + x] = (q0 - d).clamp(0, 255) as u8;
+        }
+        x += 4;
+    }
+    // Horizontal edges (filter across rows).
+    let src = f.y.clone();
+    let mut y = 4usize;
+    while y < h {
+        let on_region = y % REGION == 0;
+        for x in 0..w {
+            let (p1, p0) = (src[(y - 2) * w + x] as i32, src[(y - 1) * w + x] as i32);
+            let q0 = src[y * w + x] as i32;
+            let q1 = src[(y + 1).min(h - 1) * w + x] as i32;
+            let step = (q0 - p0).abs();
+            if step >= step_thr || step == 0 {
+                continue;
+            }
+            if (p1 - p0).abs() > flat_thr || (q1 - q0).abs() > flat_thr {
+                continue;
+            }
+            let gx = (x / REGION).min(gw - 1);
+            let gy = (y / REGION).min(gh - 1);
+            let st = if on_region && gy > 0 {
+                strength_at((gy - 1) * gw + gx, gy * gw + gx)
+            } else {
+                1
+            };
+            let d = (q0 - p0) * st * strength / 8;
+            f.y[(y - 1) * w + x] = (p0 + d).clamp(0, 255) as u8;
+            f.y[y * w + x] = (q0 - d).clamp(0, 255) as u8;
+        }
+        y += 4;
+    }
+}
+
 pub fn encode_gop_v3_core(
     frames: &[Yuv420],
     pred_for: &mut dyn FnMut(usize) -> Yuv420,
@@ -2261,6 +2366,11 @@ pub fn encode_gop_v3_core(
                 }
             }
             leftover_trace.push(row);
+        }
+        let mut rec = rec;
+        if let Ok(v) = std::env::var("FAO_DEBLOCK") {
+            let strength: i32 = v.parse().unwrap_or(1);
+            deblock(&mut rec, &modes, gw, gh, opts.dead_zone, strength);
         }
         recon.push(rec);
         // Index frame fi-1 now that fi is done: at the NEXT iteration's
