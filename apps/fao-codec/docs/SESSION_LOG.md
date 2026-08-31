@@ -6012,3 +6012,55 @@ predictor is sitting in plain sight — motion confidence 0.11 vs 0.81
 and 0.89 separates the three shots perfectly — but one clean separation
 on three shots is a hypothesis, and this session has now been burned
 four times by constants fitted to that little evidence.
+
+### Frame bounds: a silent 1080p bug the whole test corpus hid
+
+User asked what happens at the bounds of a video and whether anything
+there is blowing up the numbers. It is, and the corpus had been hiding
+it by coincidence.
+
+gw and gh are fw/REGION and fh/REGION, which TRUNCATE. Any remainder
+strip on the right or bottom therefore never gets a mode decision, a
+motion vector or a gain correction — it silently takes the raw model
+prediction and the residual coder pays for the whole difference.
+Nothing crashes, which is exactly why it survived.
+
+Every clip used in this project is divisible by 16 by luck: 1920x800
+(the bloopers crop), 1536x864 (blackstar), 3840x2160 (Minecraft),
+640x384 (the synthetic labs), 1280x720. **1920x1080 is not** —
+1080/16 = 67.5 — so eight rows of every 1080p frame were coded that
+way, on the most common video size there is. The SMITE clip is 1080p
+and every SMITE measurement in this log carries it.
+
+Measured, SMITE 32 frames at dz32:
+  1920x1080 (8 rows uncovered)   2,187,422 B
+  1920x1072 (exact multiple)     2,100,682 B
+  -> 86,740 B for 8 rows = 0.177 B/px, against 0.032 B/px for
+     properly-coded content. FIVE AND A HALF TIMES the per-pixel cost,
+     4% of the file for 0.74% of the pixels.
+
+Fixed by replicate-padding to a multiple of REGION on the way in and
+cropping the reconstruction on the way out, rather than by teaching
+every region loop to clamp. The padding is a copy of the edge row, so
+it predicts near-perfectly and costs almost nothing, and a wrapper
+cannot introduce bounds bugs into the mode decision — which would be a
+worse failure than the one being fixed. Divisible sizes take a
+zero-cost early exit, verified by the suite staying 97/0 and by the
+divisible-size measurements in this log being unchanged.
+
+After the fix, same clip: 2,165,467 B @ MS-SSIM 0.95383 against
+2,187,422 @ 0.95324 — 1.0% fewer bytes AND higher quality, output
+verified still 1920x1080. Smaller than the 4% the strip was costing,
+because the padded rows now participate in mode decisions and add a
+little side info of their own; the net is what matters and it is
+strictly positive.
+
+The general point is the one the user's question implies: an encoder's
+edge handling is invisible in aggregate numbers and only shows up when
+someone asks what happens at the boundary. Worth checking the same way:
+sad_region and search_mv clamp their REFERENCE coordinates to the frame
+(so an MV pointing off-frame reads replicated edge pixels rather than
+failing), intra DC/planar fall back when the top or left border is
+missing, and the deblock filter skips the first 4 columns and rows.
+Those are all deliberate and were verified by reading; the region-grid
+truncation was not deliberate and was found only by measuring.

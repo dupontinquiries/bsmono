@@ -1924,6 +1924,47 @@ fn deblock(f: &mut Yuv420, src_true: &Yuv420, modes: &[u8], gw: usize, gh: usize
     }
 }
 
+/// Replicate-pad a frame up to the next multiple of REGION.
+fn pad_to_region(f: &Yuv420, pw: usize, ph: usize) -> Yuv420 {
+    if f.w == pw && f.h == ph {
+        return f.clone();
+    }
+    let mut o = Yuv420::new(pw, ph);
+    for y in 0..ph {
+        let sy = y.min(f.h - 1);
+        for x in 0..pw {
+            o.y[y * pw + x] = f.y[sy * f.w + x.min(f.w - 1)];
+        }
+    }
+    let (cw, ch) = (pw / 2, ph / 2);
+    let (sw, sh) = (f.w / 2, f.h / 2);
+    for y in 0..ch {
+        let sy = y.min(sh - 1);
+        for x in 0..cw {
+            let sx = x.min(sw - 1);
+            o.u[y * cw + x] = f.u[sy * sw + sx];
+            o.v[y * cw + x] = f.v[sy * sw + sx];
+        }
+    }
+    o
+}
+
+fn crop_from_pad(f: &Yuv420, w: usize, h: usize) -> Yuv420 {
+    if f.w == w && f.h == h {
+        return f.clone();
+    }
+    let mut o = Yuv420::new(w, h);
+    for y in 0..h {
+        o.y[y * w..y * w + w].copy_from_slice(&f.y[y * f.w..y * f.w + w]);
+    }
+    let (cw, fcw) = (w / 2, f.w / 2);
+    for y in 0..h / 2 {
+        o.u[y * cw..y * cw + cw].copy_from_slice(&f.u[y * fcw..y * fcw + cw]);
+        o.v[y * cw..y * cw + cw].copy_from_slice(&f.v[y * fcw..y * fcw + cw]);
+    }
+    o
+}
+
 pub fn encode_gop_v3_core(
     frames: &[Yuv420],
     pred_for: &mut dyn FnMut(usize) -> Yuv420,
@@ -1932,6 +1973,42 @@ pub fn encode_gop_v3_core(
     opts: &ResidualOpts,
     force_plate: Option<&Vec<Vec<bool>>>,
 ) -> (PlateEncodeReportV2, Vec<Vec<u32>>) {
+    // FRAME DIMENSIONS THAT ARE NOT A MULTIPLE OF REGION.
+    //
+    // gw/gh are fw/REGION and fh/REGION, which TRUNCATE, so any
+    // remainder strip on the right or bottom never gets a mode
+    // decision, a motion vector or a gain correction — it silently
+    // takes the raw model prediction and the residual coder pays for
+    // the difference. Nothing crashes, which is why this survived: the
+    // whole test corpus (1920x800, 1536x864, 3840x2160, 640x384) is
+    // divisible by 16 by luck.
+    //
+    // 1920x1080 IS NOT. 1080/16 = 67.5, so eight rows of every 1080p
+    // frame were coded that way, and it is the most common video size
+    // there is. Measured on the SMITE clip (32 frames): the full frame
+    // costs 2,187,422 B against 2,100,682 B for the same clip cropped
+    // to 1920x1072 — 86,740 bytes for 8 rows, i.e. 0.177 B/px against
+    // 0.032 B/px for properly-coded content. FIVE AND A HALF TIMES the
+    // cost per pixel, 4% of the file for 0.74% of the pixels.
+    //
+    // Fixed by replicate-padding up to a multiple of REGION on the way
+    // in and cropping the reconstruction on the way out, rather than
+    // by teaching every region loop to clamp. The padding is a copy of
+    // the edge row, so it predicts perfectly and costs almost nothing,
+    // and the approach cannot introduce bounds bugs into the mode
+    // decision — which is the failure mode that would be worse than the
+    // one being fixed.
+    let (ow, oh) = (frames[0].w, frames[0].h);
+    let pw = ow.div_ceil(REGION) * REGION;
+    let ph = oh.div_ceil(REGION) * REGION;
+    if pw != ow || ph != oh {
+        let padded: Vec<Yuv420> = frames.iter().map(|f| pad_to_region(f, pw, ph)).collect();
+        let mut wrapped = |fi: usize| pad_to_region(&pred_for(fi), pw, ph);
+        let (mut rep, trace) =
+            encode_gop_v3_core(&padded, &mut wrapped, model_bytes, motion_bytes, opts, force_plate);
+        rep.recon = rep.recon.iter().map(|f| crop_from_pad(f, ow, oh)).collect();
+        return (rep, trace);
+    }
     let fw = frames[0].w;
     let fh = frames[0].h;
     let (gw, gh) = (fw / REGION, fh / REGION);
