@@ -162,67 +162,24 @@ impl VoicetermApp {
     fn connections_nodes(&self)
         -> (Vec<voiceterm_egui::connections_graph::Node>,
             Vec<voiceterm_egui::connections_graph::Edge>) {
+        // The mapping and every decision in it — which node kinds are
+        // produced, which are deliberately not, which edges the data can
+        // honestly support — moved to `connections_graph::build`, where
+        // they can be tested. Seventy lines of reasoning in a binary is
+        // seventy lines nobody can check.
         use voiceterm_egui::connections_graph as cg;
-        let mut nodes = Vec::new();
-        for b in self.browser.bookmarks.all() {
-            nodes.push(cg::Node {
-                id: cg::node_id(cg::NodeKind::Page, &b.url),
-                kind: cg::NodeKind::Page,
-                title: b.title.clone(),
-                subtitle: b.url.clone(),
-                // preview() truncates on a word boundary, so a long title does
-                // not end mid-word in the graph. Built from the title because a
-                // bookmark is all the app stored — an empty preview would be
-                // honest but leaves the node unreadable at a glance.
-                preview: cg::preview(&b.title),
-                // No tags: the app records none for a bookmark, and inventing
-                // one ("web", "saved") would be a facet nobody can filter on
-                // meaningfully.
-                tags: Vec::new(),
-            });
-        }
-        for t in &self.mail.threads {
-            nodes.push(cg::Node {
-                id: cg::node_id(cg::NodeKind::ChatThread, &t.conversation_id),
-                kind: cg::NodeKind::ChatThread,
-                title: t.subject.clone(),
-                subtitle: t.participants.join(", "),
-                preview: cg::preview(&t.subject),
-                tags: Vec::new(),
-            });
-        }
-
-        // SameDomain is the one edge this data can honestly produce: two
-        // bookmarks on one host are related, weakly. The others need a link
-        // the app does not record — a recording tagged with the page it was
-        // captured on, a chat that cites a URL — so producing them would be
-        // asserting a connection nobody established.
-        let mut edges = Vec::new();
-        let pages: Vec<(&str, String)> = self.browser.bookmarks.all().iter()
-            .map(|b| (b.url.as_str(), host_of(&b.url)))
+        let pages: Vec<cg::PageIn> = self.browser.bookmarks.all().iter()
+            .map(|b| cg::PageIn { url: b.url.clone(), title: b.title.clone() })
             .collect();
-        for (i, (ua, ha)) in pages.iter().enumerate() {
-            for (ub, hb) in pages.iter().skip(i + 1) {
-                if !ha.is_empty() && ha == hb {
-                    edges.push(cg::Edge {
-                        from: cg::node_id(cg::NodeKind::Page, ua),
-                        to: cg::node_id(cg::NodeKind::Page, ub),
-                        reason: cg::EdgeReason::SameDomain,
-                    });
-                }
-            }
-        }
-        (nodes, cg::prune(edges))
+        let threads: Vec<cg::ThreadIn> = self.mail.threads.iter()
+            .map(|t| cg::ThreadIn {
+                conversation_id: t.conversation_id.clone(),
+                subject: t.subject.clone(),
+                participants: t.participants.clone(),
+            })
+            .collect();
+        cg::build(&pages, &threads)
     }
-}
-
-/// The host part of a URL, or empty when there is not one.
-///
-/// Deliberately not a URL parser: this only needs the authority, and pulling in
-/// a crate to find one `/` would be the tail wagging the dog.
-fn host_of(url: &str) -> String {
-    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    rest.split('/').next().unwrap_or("").to_lowercase()
 }
 
 /// How many files a snapshot of `root` would capture.
@@ -884,12 +841,12 @@ impl VoicetermApp {
     /// terminal — and showing it twice would make the inbox wrong precisely
     /// for the person using both halves of this app.
     fn rebuild_mail(&mut self) {
-        let mut all = self.mail_from_disk.clone();
-        for m in &self.mail_messages {
-            if !all.iter().any(|x| x.id == m.id) {
-                all.push(m.clone());
-            }
-        }
+        // The rule lives in `mail_store::merge`. It was here, and the test
+        // for it copied the loop instead of calling it — proving that a
+        // reimplementation worked, which is the one thing a test cannot
+        // usefully prove.
+        let all = voiceterm_egui::mail_store::merge(
+            &self.mail_from_disk, &self.mail_messages);
         self.mail.set_messages(&all);
     }
 

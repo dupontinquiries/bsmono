@@ -315,3 +315,151 @@ mod tests {
         assert_eq!(preview("one\n\ntwo   three\t"), "one two three");
     }
 }
+
+// ── building a graph from what this app holds ───────────────────────────────
+
+/// One bookmark, as the graph needs it.
+///
+/// A pair rather than the browser's own type: this module should not
+/// depend on the bookmark store to know that a bookmark is a title and a
+/// url, and a caller with a different source can use it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageIn {
+    pub url: String,
+    pub title: String,
+}
+
+/// One mail thread, likewise.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadIn {
+    pub conversation_id: String,
+    pub subject: String,
+    pub participants: Vec<String>,
+}
+
+/// The host part of a URL, or empty when there is not one.
+///
+/// Deliberately not a URL parser: this needs the authority, and pulling in
+/// a crate to find one `/` would be the tail wagging the dog.
+pub fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    rest.split('/').next().unwrap_or("").to_lowercase()
+}
+
+/// Build the graph.
+///
+/// This was seventy lines inside the binary, where nothing could reach it.
+/// The decisions in it are the interesting part and none of them were
+/// checkable: which node kinds are produced, which are deliberately NOT,
+/// and which edges the data can honestly support.
+pub fn build(pages: &[PageIn], threads: &[ThreadIn]) -> (Vec<Node>, Vec<Edge>) {
+    let mut nodes = Vec::new();
+    for b in pages {
+        nodes.push(Node {
+            id: node_id(NodeKind::Page, &b.url),
+            kind: NodeKind::Page,
+            title: b.title.clone(),
+            subtitle: b.url.clone(),
+            // `preview` truncates on a word boundary, so a long title does
+            // not end mid-word. Built from the title because a bookmark is
+            // all the app stored — an empty preview would be honest and
+            // leaves the node unreadable at a glance.
+            preview: preview(&b.title),
+            // No tags: the app records none, and inventing one ("web",
+            // "saved") would be a facet nobody can filter on meaningfully.
+            tags: Vec::new(),
+        });
+    }
+    for t in threads {
+        nodes.push(Node {
+            id: node_id(NodeKind::ChatThread, &t.conversation_id),
+            kind: NodeKind::ChatThread,
+            title: t.subject.clone(),
+            subtitle: t.participants.join(", "),
+            preview: preview(&t.subject),
+            tags: Vec::new(),
+        });
+    }
+
+    // SameDomain is the one edge this data can honestly produce: two
+    // bookmarks on one host are related, weakly. The others need a link
+    // the app does not record — a recording tagged with the page it was
+    // captured on, a chat citing a URL — so producing them would be
+    // asserting a connection nobody established.
+    let mut edges = Vec::new();
+    let hosts: Vec<(&str, String)> = pages.iter()
+        .map(|b| (b.url.as_str(), host_of(&b.url)))
+        .collect();
+    for (i, (ua, ha)) in hosts.iter().enumerate() {
+        for (ub, hb) in hosts.iter().skip(i + 1) {
+            if !ha.is_empty() && ha == hb {
+                edges.push(Edge {
+                    from: node_id(NodeKind::Page, ua),
+                    to: node_id(NodeKind::Page, ub),
+                    reason: EdgeReason::SameDomain,
+                });
+            }
+        }
+    }
+    (nodes, prune(edges))
+}
+
+#[cfg(test)]
+mod build_tests {
+    use super::*;
+
+    fn page(url: &str, title: &str) -> PageIn {
+        PageIn { url: url.into(), title: title.into() }
+    }
+
+    #[test]
+    fn two_bookmarks_on_one_host_are_joined_and_others_are_not() {
+        let (nodes, edges) = build(&[
+            page("https://a.test/one", "One"),
+            page("https://a.test/two", "Two"),
+            page("https://b.test/three", "Three"),
+        ], &[]);
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(edges.len(), 1, "{edges:?}");
+        assert_eq!(edges[0].reason, EdgeReason::SameDomain);
+    }
+
+    #[test]
+    fn a_url_with_no_host_joins_nothing() {
+        // Two `file:///…` bookmarks are not "the same site". An empty host
+        // matching an empty host would join every local file to every
+        // other one.
+        let (_, edges) = build(&[page("notaurl", "A"), page("alsonot", "B")], &[]);
+        assert!(edges.is_empty(), "{edges:?}");
+    }
+
+    #[test]
+    fn the_host_is_compared_without_case_or_scheme() {
+        assert_eq!(host_of("HTTPS://Example.COM/x"), "example.com");
+        assert_eq!(host_of("example.com/x"), "example.com");
+        let (_, edges) = build(&[page("https://A.test/1", "a"),
+                                 page("http://a.TEST/2", "b")], &[]);
+        assert_eq!(edges.len(), 1, "case or scheme split one host in two");
+    }
+
+    #[test]
+    fn mail_threads_become_nodes_but_never_edges() {
+        // The app records no link between a thread and anything else.
+        // Producing one would assert a connection nobody established.
+        let (nodes, edges) = build(&[], &[ThreadIn {
+            conversation_id: "c1".into(),
+            subject: "Engines".into(),
+            participants: vec!["Ada".into(), "Bo".into()],
+        }]);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].kind, NodeKind::ChatThread);
+        assert_eq!(nodes[0].subtitle, "Ada, Bo");
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn nothing_in_yields_nothing_out() {
+        let (nodes, edges) = build(&[], &[]);
+        assert!(nodes.is_empty() && edges.is_empty());
+    }
+}

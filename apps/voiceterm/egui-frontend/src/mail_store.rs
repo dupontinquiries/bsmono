@@ -308,10 +308,8 @@ body
         assert_eq!(from_disk[0].id, from_term[0].id,
                    "the Message-ID is what makes de-duplication possible");
 
-        let mut all = from_disk.clone();
-        for m in &from_term {
-            if !all.iter().any(|x| x.id == m.id) { all.push(m.clone()); }
-        }
+        // Through the real function now, not a copy of its loop.
+        let all = merge(&from_disk, &from_term);
         let mut view = crate::mail_view::MailView::default();
         view.set_messages(&all);
         assert_eq!(view.visible().len(), 1, "the same mail appeared twice");
@@ -346,5 +344,81 @@ body
         if std::env::var("HOME").is_ok() {
             assert!(c.first().is_some_and(|p| p.ends_with("Maildir")), "{c:?}");
         }
+    }
+}
+
+/// Combine mail from disk with mail harvested from the terminal.
+///
+/// This lived in the binary, and the test for it in `mail_store` COPIED
+/// the loop rather than calling it — so the test proved that a
+/// reimplementation of the rule worked, which is the one thing it could
+/// not usefully prove. A rule with two implementations has two
+/// behaviours the first time either is edited.
+///
+/// Disk first, then anything from the terminal not already there.
+/// De-duplicated by Message-ID, because `cat`-ing a file that is also in
+/// the Maildir is the ordinary way to read mail in a terminal — showing
+/// it twice makes the inbox wrong precisely for the person using both
+/// halves of the app.
+pub fn merge(from_disk: &[Message], from_terminal: &[Message]) -> Vec<Message> {
+    let mut all = from_disk.to_vec();
+    for m in from_terminal {
+        if !all.iter().any(|x| x.id == m.id) {
+            all.push(m.clone());
+        }
+    }
+    all
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn msg(id: &str, subject: &str) -> Message {
+        Message {
+            id: id.into(),
+            conversation_id: id.into(),
+            subject: subject.into(),
+            unread: false,
+            sender: None,
+            time: 0,
+            num_attachments: 0,
+            is_encrypted: 0,
+        }
+    }
+
+    #[test]
+    fn the_same_mail_from_both_sources_appears_once() {
+        let disk = vec![msg("<a@x>", "One")];
+        let term = vec![msg("<a@x>", "One"), msg("<b@x>", "Two")];
+        let all = merge(&disk, &term);
+        assert_eq!(all.len(), 2, "{:?}", all.iter().map(|m| &m.id).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn disk_wins_on_a_collision() {
+        // The version on disk has been parsed from the whole file; the
+        // terminal's came from whatever was printed, which may be a
+        // fragment. Keeping the disk copy is keeping the more complete one.
+        let disk = vec![msg("<a@x>", "Full subject")];
+        let term = vec![msg("<a@x>", "trunc")];
+        assert_eq!(merge(&disk, &term)[0].subject, "Full subject");
+    }
+
+    #[test]
+    fn terminal_mail_with_no_counterpart_is_kept() {
+        let all = merge(&[], &[msg("<t@x>", "From a cat")]);
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn order_is_disk_then_terminal_and_stable() {
+        // The list is shown in this order before any sort, and a merge
+        // that reshuffled would move rows under the reader on every
+        // rescan.
+        let disk = vec![msg("<1@x>", "a"), msg("<2@x>", "b")];
+        let term = vec![msg("<3@x>", "c")];
+        let ids: Vec<String> = merge(&disk, &term).into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec!["<1@x>".to_string(), "<2@x>".into(), "<3@x>".into()]);
     }
 }
