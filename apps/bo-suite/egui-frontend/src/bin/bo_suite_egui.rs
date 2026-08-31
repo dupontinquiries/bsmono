@@ -116,7 +116,7 @@ impl App {
     /// Carry out whatever the view asked for, and report back what the
     /// player did.
     fn pump_playback(&mut self) {
-        use bo_suite_egui::playback::{plan, Request, State, DEFAULT_PLAYER};
+        use bo_suite_egui::playback::{plan, Request, State};
         if let Some(req) = self.controller.pending_playback.take() {
             match req {
                 Request::Play { url, sink } => {
@@ -129,7 +129,16 @@ impl App {
                             "no track resolved — the library has titles, not files yet".into();
                         self.controller.transport.pause();
                     } else {
-                        let p = plan(DEFAULT_PLAYER, &url, &sink);
+                        // Whatever is installed, not whatever I assumed.
+                        // mpv was hardcoded and is not always present.
+                        let Some(player) = bo_suite_egui::playback::discover_player()
+                        else {
+                            self.last_note = "no player found — install mpv, ffplay \
+                                              or paplay".into();
+                            self.controller.transport.pause();
+                            return;
+                        };
+                        let p = plan(player, &url, &sink);
                         for c in &p.setup { eprintln!("bo-suite: {c}"); }
                         eprintln!("bo-suite: {}", p.play);
                         self.player.start(&p);

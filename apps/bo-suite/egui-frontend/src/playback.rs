@@ -104,6 +104,82 @@ impl Sink {
     }
 }
 
+/// The players this app knows how to drive, best first.
+///
+/// mpv leads because it is the only one of these that will print a status
+/// line in a format we choose, which is what feeds the progress bar. The
+/// others play and report nothing, which is a working player and a bar
+/// that does not move — a real degradation, and better than refusing to
+/// play at all.
+///
+/// This list exists because mpv is NOT always installed. I assumed it was
+/// and hardcoded it; this sandbox has `ffplay` and no mpv, which is how I
+/// found out.
+pub const KNOWN_PLAYERS: &[(&str, &str)] = &[
+    ("mpv", DEFAULT_PLAYER),
+    ("ffplay", "ffplay -nodisp -autoexit -loglevel error"),
+    ("paplay", "paplay"),
+];
+
+/// The first known player present on PATH.
+///
+/// `None` when there is none — reported rather than guessed, because a
+/// command that does not exist fails with "No such file or directory" and
+/// reads as a missing TRACK rather than a missing player.
+pub fn discover_player() -> Option<&'static str> {
+    let path = std::env::var_os("PATH")?;
+    for (bin, cmd) in KNOWN_PLAYERS {
+        if std::env::split_paths(&path).any(|d| d.join(bin).is_file()) {
+            return Some(cmd);
+        }
+    }
+    None
+}
+
+/// A track that ends sooner than this did not play.
+///
+/// Real music is minutes long and even a skipped one takes a moment to
+/// open. A "finished" track that lasted a quarter of a second is a player
+/// that failed and said so on stderr — or, on `ffplay` with no sound card,
+/// failed and said so while exiting zero.
+pub const MIN_PLAYED: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The line of stderr worth showing, if any.
+///
+/// NOT the last line, which is what I used first and which real output
+/// showed to be the least useful: `ffplay` with no sound card ends with
+/// "Failed to open file 'x' or configure filtergraph", blaming the file,
+/// while the actual cause — "audio open failed" — is the line before, and
+/// above that sit eight lines of ALSA configuration noise.
+///
+/// So: the first line that names a known cause, then the last non-ALSA
+/// line, then nothing.
+pub fn complaint(stderr: &str) -> Option<String> {
+    const CAUSES: &[&str] = &[
+        "audio open failed", "cannot open", "no such file", "permission denied",
+        "invalid data", "device or resource busy", "connection refused",
+        "unable to open", "failed to open audio",
+    ];
+    // ALSA's chatter is excluded from the whole search, not just from the
+    // fallback. Its lines contain "No such file or directory" — a phrase
+    // that is on the cause list for good reasons — so scanning them first
+    // returns a configuration message about a missing card node instead of
+    // "audio open failed". My first version did exactly that, against the
+    // real transcript, in the test below.
+    let lines: Vec<&str> = stderr.lines().map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("ALSA lib"))
+        .collect();
+    for l in &lines {
+        let low = l.to_lowercase();
+        if CAUSES.iter().any(|c| low.contains(c)) {
+            return Some((*l).to_string());
+        }
+    }
+    // ALSA prints its whole config search on any failure; none of it is
+    // the answer and all of it is longer than the answer.
+    lines.last().map(|l| (*l).to_string())
+}
+
 /// The default player command. `--no-video` because a music file with
 /// cover art embedded otherwise opens a window.
 pub const DEFAULT_PLAYER: &str = concat!(
@@ -355,6 +431,7 @@ impl Player {
             let out = child.stdout.take();
             if let Ok(mut g) = holder.lock() { *g = Some(child); }
             shared.set(State::Playing { url });
+            let started = std::time::Instant::now();
 
             // The status reader, on its own thread. On the wait thread it
             // would block the exit check between lines, and mpv prints a
@@ -413,19 +490,27 @@ impl Player {
                 // would make pause skip a track.
                 return;
             }
-            match status {
-                Some(s) if s.success() => {
+            let mut msg = String::new();
+            if let Some(mut e) = err {
+                use std::io::Read;
+                let _ = e.read_to_string(&mut msg);
+            }
+            // AN EXIT CODE IS NOT ENOUGH, and this is not theoretical: run
+            // `ffplay` on a machine with no sound card and it prints
+            // "audio open failed" and exits ZERO. Trusting the code alone
+            // meant a failed track counted as a finished one — so a device
+            // with no audio would skip an entire album at full speed while
+            // reporting each track as played.
+            let too_quick = started.elapsed() < MIN_PLAYED;
+            let failed_code = matches!(status, Some(s) if !s.success()) || status.is_none();
+            match (failed_code, too_quick, complaint(&msg)) {
+                (false, false, None) => {
                     shared.ended.store(true, Ordering::Relaxed);
                     shared.set(State::Idle);
                 }
-                Some(_) | None => {
-                    let mut msg = String::new();
-                    if let Some(mut e) = err {
-                        use std::io::Read;
-                        let _ = e.read_to_string(&mut msg);
-                    }
-                    let last = msg.trim().lines().last().unwrap_or("player exited").to_string();
-                    shared.set(State::Failed(last));
+                (_, _, why) => {
+                    shared.set(State::Failed(why.unwrap_or_else(
+                        || "the player stopped without playing anything".into())));
                 }
             }
         }));
@@ -636,7 +721,10 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_track_that_finishes_reports_an_end_the_queue_can_act_on() {
-        let sh = fake_player("ok", "exit 0");
+        // Long enough to have been a track. An instant exit is now
+        // treated as a failure — see MIN_PLAYED — and a fake that returns
+        // immediately would be asserting the old, wrong behaviour.
+        let sh = fake_player("ok", "sleep 0.4; exit 0");
         let mut p = Player::new();
         p.start_with(&plan("mpv", "/a.flac", &Sink::Default), &sh.display().to_string());
         for _ in 0..200 {
@@ -665,6 +753,64 @@ mod tests {
             other => panic!("expected a failure with its reason, got {other:?}"),
         }
         assert!(!p.shared.take_ended(), "a failed track advanced the queue");
+    }
+
+    #[test]
+    fn the_useful_line_is_picked_out_of_a_real_players_complaint() {
+        // Captured from `ffplay` on a machine with no sound card. The LAST
+        // line blames the file and is wrong; the cause is above it, under
+        // eight lines of ALSA configuration noise. I used the last line
+        // first, which is how this was found.
+        let real = "\
+ALSA lib confmisc.c:855:(parse_card) cannot find card '0'
+ALSA lib conf.c:5204:(_snd_config_evaluate) function snd_func_card_inum returned error: No such file or directory
+ALSA lib pcm.c:2721:(snd_pcm_open_noupdate) Unknown PCM default
+No more combinations to try, audio open failed
+Failed to open file '/tmp/tone.wav' or configure filtergraph";
+        let c = complaint(real).expect("no complaint found");
+        assert!(c.contains("audio open failed"), "picked the wrong line: {c}");
+        assert!(!c.starts_with("ALSA lib"), "picked ALSA noise: {c}");
+    }
+
+    #[test]
+    fn nothing_on_stderr_yields_no_complaint() {
+        assert_eq!(complaint(""), None);
+        assert_eq!(complaint("   \n \n"), None);
+    }
+
+    #[test]
+    fn only_alsa_noise_still_yields_something_rather_than_nothing() {
+        // A player that printed only configuration chatter and died still
+        // needs to say something, or the UI reports a failure with no
+        // reason at all.
+        let c = complaint("ALSA lib a\nALSA lib b");
+        assert!(c.is_none(), "ALSA noise was offered as the reason: {c:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_player_that_fails_while_exiting_zero_is_not_a_finished_track() {
+        // THE REASON MIN_PLAYED EXISTS, and it is not hypothetical:
+        // `ffplay` with no sound card prints "audio open failed" and exits
+        // ZERO. Counted as a finished track, a device with no audio skips
+        // an entire album at full speed while reporting each one played.
+        let sh = fake_player("liar", "echo 'audio open failed' >&2; exit 0");
+        let mut p = Player::new();
+        p.start_with(&plan("mpv", "/a.flac", &Sink::Default), &sh.display().to_string());
+        let mut state = None;
+        for _ in 0..200 {
+            if let Some(s) = p.shared.take_state() {
+                if matches!(s, State::Failed(_)) { state = Some(s); break; }
+            }
+            if !p.is_running() && state.is_none() {
+                state = p.shared.take_state();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(matches!(state, Some(State::Failed(_))),
+                "a zero exit after no playback was accepted: {state:?}");
+        assert!(!p.shared.take_ended(), "the queue was advanced by a failure");
     }
 
     #[test]
@@ -746,5 +892,31 @@ mod seam_tests {
         // the cost is a latency penalty nobody would think to look for.
         assert_eq!(sink_of(&Route::MultiRoom(vec!["AA".into()])), Sink::One("AA".into()));
         assert_eq!(sink_of(&Route::MultiRoom(vec![])), Sink::Default);
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn a_player_is_found_when_one_is_installed() {
+        // This sandbox has ffplay and no mpv, which is how the hardcoded
+        // default was found to be an assumption.
+        match discover_player() {
+            Some(cmd) => assert!(KNOWN_PLAYERS.iter().any(|(_, c)| *c == cmd),
+                                 "an unknown command: {cmd}"),
+            None => {} // A machine with none is a real case; see the caller.
+        }
+    }
+
+    #[test]
+    fn mpv_is_preferred_because_it_is_the_one_that_reports_position() {
+        // The others play and report nothing: a working player and a bar
+        // that does not move. Order is the whole content of the list.
+        assert_eq!(KNOWN_PLAYERS[0].0, "mpv");
+        assert!(KNOWN_PLAYERS[0].1.contains(STATUS_PREFIX));
+        assert!(!KNOWN_PLAYERS[1].1.contains(STATUS_PREFIX),
+                "a player that cannot report position claims to");
     }
 }
