@@ -5647,3 +5647,58 @@ clip and each later measured wrong on a second. The procedure that
 caught them all was the same: sweep on content the constant was not
 derived from, and score with something that charges for the failure
 mode in question.
+
+### REGION=16 swept for the first time — the inherited constant is right, and REGION=8 is strictly wrong
+
+Applying the procedure that caught the other three fixed constants:
+sweep on content it was not derived from, score with a metric that
+charges for the failure mode. REGION sets mode granularity, the MV
+field, gain/offset, the dictionary fingerprint, mover masks and the
+deblock grid, and side info was 22% of blackstar's bytes and 57% of a
+quiet film shot's — so it is the largest untested constant in the
+codec. It is a compile-time const, so each point is a rebuild.
+
+  bloopers w1 (film), dz32, deblocked
+    REGION=8    834,191 B  MS-SSIM 0.97227   (mode+mv 618,452)
+    REGION=16   490,100 B          0.97695   (mode+mv 286,042)
+    REGION=32   388,250 B          0.96733   (mode+mv 146,182)
+  blackstar (game), dz32, deblocked
+    REGION=8    480,316 B  MS-SSIM 0.98623
+    REGION=16   337,810 B          0.99013
+    REGION=32   338,722 B          0.98756
+
+REGION=8 IS STRICTLY DOMINATED on both clips: it costs 70% more bytes
+on film and 42% more on the game while scoring WORSE on both. Finer
+mode granularity does not buy better prediction here — it buys a mode
+flag and a motion vector per 8x8 block, and the side info triples
+(286 KB -> 618 KB on film) faster than the residual falls (169.9 KB ->
+143.6 KB). That is a clean, one-directional result and it retires the
+"smaller regions would adapt better" intuition.
+
+REGION=32 is the interesting one, and it is a REAL trade rather than a
+domination: on film it saves 20.8% of bytes for -0.0096 MS-SSIM.
+Priced against the codec's OWN dead-zone ladder on the same clip and
+the same metric:
+
+  R16 dz40   -61.9 KB  -0.00229  =  27,022 KB per MS-SSIM point
+  R16 dz48   -88.7 KB  -0.00423  =  20,981 KB per MS-SSIM point
+  R32 dz32  -101.8 KB  -0.00962  =  10,587 KB per MS-SSIM point
+
+REGION=32 buys its bytes at HALF the exchange rate the dead zone
+offers. Anyone wanting that many bytes off should raise dz, not coarsen
+the region grid — and on blackstar REGION=32 is not even a trade, it is
+strictly worse (+0.3% bytes, -0.0026 MS-SSIM).
+
+VERDICT: REGION=16 survives, and unlike the other three constants it
+survives on both clips and on the right metric. Recorded because a
+negative sweep is worth as much as a positive one — this constant can
+now be left alone with evidence instead of by inheritance. Restored to
+16 and verified byte-identical to the pre-sweep baseline (490,100 B on
+w1); suite 97/0.
+
+Remaining inherited constants still unswept by this procedure:
+PLATE_DZ_DIV (swept on blackstar only, survived), the mover detection
+threshold, DICT_MAX_CAND/spread, and the 4x4 transform size itself —
+which is the one REGION=8's failure most implicates, since the side
+info explosion came from per-region flags rather than from the
+transform.
