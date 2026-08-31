@@ -4042,6 +4042,19 @@ which file you read.\n\n",
                 }
                 bear
             };
+            // PER-BRANCH SHAPE, in the same fork order as `bear` above — wing i is placed by
+            // bear[i] and typed by shape[i], so the two must be taken in one order. Both are
+            // ascending fork id: `bear` walks `for f in 0..n` and so does `branchshape::analyze`.
+            let shape = {
+                let parents: Vec<Option<usize>> = g.nodes.iter().map(|nd| nd.parent).collect();
+                let toks: Vec<usize> = g.nodes.iter().map(|nd| nd.tokens).collect();
+                let pruned: Vec<bool> = g.nodes.iter().map(|nd| nd.pruned).collect();
+                let backs: Vec<bool> = g.nodes.iter().map(|nd| nd.looks_back).collect();
+                let v = crate::branchshape::analyze(&parents, &toks, &pruned, &backs);
+                let mut arr = [crate::branchshape::BranchShape::EMPTY; 6];
+                for (i, s) in v.into_iter().take(6).enumerate() { arr[i] = s; }
+                arr
+            };
             let color_salience = chat_color_salience(self.msgs.iter().map(|m| m.text()));
             // procedural TREE character (Forest), seed-derived so each conversation grows a distinct wood, with a
             // light branchiness influence on the fork factor
@@ -4056,6 +4069,7 @@ which file you read.\n\n",
                 nodes: n as u32, branches, segments: segs.len() as u32, seed,
                 ext_x: ext_x.ceil() as u32, ext_z: ext_z.ceil() as u32, bear,
                 color_salience, tree_size, tree_height, tree_girth, tree_branch, branch_spread, prop_density,
+                shape,
             });
         }
         let mut seg_of = vec![0usize; n];

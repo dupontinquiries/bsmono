@@ -2486,12 +2486,19 @@ pub struct Region {
 
 /// Plan one region per door from the conversation params.
 ///
-/// SHAPE SOURCE (the seam): real per-branch graph shape — is-loop / depth / length / token-mass /
-/// is-pruned — is not yet plumbed from the graph into `EnvParams` (that lands when the per-branch
-/// descriptor is wired through `chat.rs`, deliberately untouched here while perf work is inbound).
-/// Until then the type is derived DETERMINISTICALLY from `(seed, branch index)` so it is stable
-/// per conversation (same convo → same palace, brain-sticky) and the mix stays varied. Swap the
-/// body of `kind_for` for the real branch shape when the descriptor arrives — nothing else changes.
+/// SHAPE SOURCE: the real per-branch graph shape, via `EnvParams::shape` — one `BranchShape`
+/// (depth / length / token-mass / loops / pruned) per fork, in the same order as `bear`, computed by
+/// `branchshape::analyze` and filled in by `chat.rs`.
+///
+/// This used to be a hash of `(seed, branch index)`, with a note saying the real shape would land
+/// later. That was stable per conversation, which hid it well — the same chat always built the same
+/// palace, so it felt meaningful. It was not: a branch that looped back and a branch that ran deep
+/// got whichever rooms their index hashed to. For a memory palace that is the one thing that cannot
+/// be fake, because the whole claim is that place encodes content; rooms from noise teach the
+/// opposite habit.
+///
+/// A scene with no graph behind it (demo scenes, tests) still gets the old seeded mix — see
+/// `kind_for` — so those keep a varied palace instead of five identical terraces.
 fn region_plan(pr: &EnvParams, doors: usize, r_hall: f32) -> Vec<Region> {
     use std::f32::consts::TAU;
     let rnd = |k: u32| -> f32 {
@@ -2499,16 +2506,33 @@ fn region_plan(pr: &EnvParams, doors: usize, r_hall: f32) -> Vec<Region> {
         h ^= h >> 15; h = h.wrapping_mul(0x2C1B_3C6D); h ^= h >> 13;
         (h & 0xFFFF) as f32 / 65535.0
     };
-    // type mix derived from the per-branch shape stand-in (see doc above)
+    // THE REAL BRANCH SHAPE, when the graph supplied one.
+    //
+    // The order here matters and is the subtle failure to avoid: `shape[i]` and `bear[i]` are both
+    // in ascending fork id, so wing i is placed where branch i actually peels off AND typed by what
+    // branch i actually is. Using one order for placement and another for character would be worse
+    // than the hash it replaces — it would look meaningful and be wrong.
+    //
+    // The order of the tests below is the priority: a pruned dead end is a sealed cave whatever else
+    // it is, a loop is a rotunda before it is anything else, and only then does size decide.
     let kind_for = |i: u32| -> RegionType {
-        // a per-branch shape signature; replace with real {is_loop, depth, len, tokens, pruned}
-        let shape = ((pr.seed ^ i.wrapping_mul(0x68E3_1DA4)).rotate_left(i % 13 + 1)) % 100;
-        match shape {
-            0..=14  => RegionType::SealedCave, // ~15% pruned/dead ends
-            15..=39 => RegionType::Rotunda,    // loops
-            40..=63 => RegionType::Terrace,    // long tangents
-            64..=83 => RegionType::Stairs,     // deep threads
-            _       => RegionType::Chamber,    // token-heavy
+        let sh = pr.shape.get(i as usize).copied().unwrap_or(crate::branchshape::BranchShape::EMPTY);
+        if sh.is_some() {
+            if sh.pruned { return RegionType::SealedCave; }   // the branch was cut out of context
+            if sh.loops { return RegionType::Rotunda; }        // it came back to something earlier
+            if sh.heavy() { return RegionType::Chamber; }      // token mass wants a big room
+            if sh.deep() { return RegionType::Stairs; }        // it went down rather than out
+            return RegionType::Terrace;                        // a wide, light tangent
+        }
+        // No shape supplied (a scene rendered without a live graph — the demo scenes, the tests):
+        // keep the old seeded mix so those still show a varied palace rather than five terraces.
+        let h = ((pr.seed ^ i.wrapping_mul(0x68E3_1DA4)).rotate_left(i % 13 + 1)) % 100;
+        match h {
+            0..=14  => RegionType::SealedCave,
+            15..=39 => RegionType::Rotunda,
+            40..=63 => RegionType::Terrace,
+            64..=83 => RegionType::Stairs,
+            _       => RegionType::Chamber,
         }
     };
     let mut out = Vec::with_capacity(doors);
@@ -2530,10 +2554,24 @@ fn region_plan(pr: &EnvParams, doors: usize, r_hall: f32) -> Vec<Region> {
             a.rem_euclid(TAU)
         };
         let kind = kind_for(d);
-        let scale = match kind {
-            RegionType::Chamber => 1.25 + 0.35 * rnd(d * 3 + 1), // token-heavy → larger
-            RegionType::SealedCave => 0.8,
-            _ => 0.95 + 0.3 * rnd(d * 3 + 2),
+        // SIZE FROM MASS when the graph supplied it: a wing's volume is the one property a person
+        // reads without thinking, so it should track how much conversation is behind that door
+        // rather than a hash. Bounded so a runaway branch cannot produce a wing that swallows the
+        // hall — 3000 tokens is already "big room".
+        let sh = pr.shape.get(d as usize).copied().unwrap_or(crate::branchshape::BranchShape::EMPTY);
+        let scale = if sh.is_some() {
+            let mass = (sh.tokens64 as f32 / 48.0).clamp(0.0, 1.0); // 0..~3000 tokens
+            match kind {
+                RegionType::SealedCave => 0.72 + 0.16 * mass, // dead ends stay small even when long
+                RegionType::Chamber => 1.15 + 0.45 * mass,
+                _ => 0.9 + 0.5 * mass,
+            }
+        } else {
+            match kind {
+                RegionType::Chamber => 1.25 + 0.35 * rnd(d * 3 + 1),
+                RegionType::SealedCave => 0.8,
+                _ => 0.95 + 0.3 * rnd(d * 3 + 2),
+            }
         };
         // sit the wing in the outer ring, clear of the perimeter wall, under the enclosing dome
         let dist = r_hall + 6.5 + scale * 3.2;
@@ -6010,9 +6048,13 @@ pub struct EnvParams { pub nodes: u32, pub branches: u32, pub segments: u32, pub
     /// and the per-node branching factor (children per fork). Seed-derived per conversation so each wood differs.
     pub tree_size: f32, pub tree_height: f32, pub tree_girth: f32, pub tree_branch: u32, pub branch_spread: f32,
     /// Street-scene prop density (Alley): scales benches, puddles, cracks, wires, bikes per conversation.
-    pub prop_density: f32 }
-impl Default for EnvParams { fn default() -> Self { Self { nodes: 40, branches: 3, segments: 5, seed: 0x51A7_C0DE, ext_x: 18, ext_z: 14, bear: [0; 6], color_salience: 0.0, tree_size: 1.0, tree_height: 1.0, tree_girth: 1.0, tree_branch: 3, branch_spread: 0.6, prop_density: 1.0 } } }
-thread_local! { static ENV_PARAMS: std::cell::Cell<EnvParams> = const { std::cell::Cell::new(EnvParams { nodes: 40, branches: 3, segments: 5, seed: 0x51A7_C0DE, ext_x: 18, ext_z: 14, bear: [0; 6], color_salience: 0.0, tree_size: 1.0, tree_height: 1.0, tree_girth: 1.0, tree_branch: 3, branch_spread: 0.6, prop_density: 1.0 }) }; }
+    pub prop_density: f32,
+    /// PER-BRANCH SHAPE, parallel to `bear` — the same fork order, so wing i is placed by `bear[i]`
+    /// and typed by `shape[i]`. Default (all zero) means "not supplied", and `region_plan` falls
+    /// back to its old seeded mix rather than typing every wing as an empty branch.
+    pub shape: [crate::branchshape::BranchShape; 6] }
+impl Default for EnvParams { fn default() -> Self { Self { nodes: 40, branches: 3, segments: 5, seed: 0x51A7_C0DE, ext_x: 18, ext_z: 14, bear: [0; 6], color_salience: 0.0, tree_size: 1.0, tree_height: 1.0, tree_girth: 1.0, tree_branch: 3, branch_spread: 0.6, prop_density: 1.0, shape: [crate::branchshape::BranchShape::EMPTY; 6] } } }
+thread_local! { static ENV_PARAMS: std::cell::Cell<EnvParams> = const { std::cell::Cell::new(EnvParams { nodes: 40, branches: 3, segments: 5, seed: 0x51A7_C0DE, ext_x: 18, ext_z: 14, bear: [0; 6], color_salience: 0.0, tree_size: 1.0, tree_height: 1.0, tree_girth: 1.0, tree_branch: 3, branch_spread: 0.6, prop_density: 1.0, shape: [crate::branchshape::BranchShape::EMPTY; 6] }) }; }
 /// Feed the live conversation's shape to the environment generator (call before `with_env`/`render_env`).
 pub fn set_env_params(p: EnvParams) { ENV_PARAMS.with(|c| c.set(p)); }
 pub fn env_params() -> EnvParams { ENV_PARAMS.with(|c| c.get()) }
@@ -6037,6 +6079,16 @@ impl EnvParams {
             ext_z: q(self.ext_z, 4),
             bear,
             color_salience: (self.color_salience * 10.0).round() / 10.0,
+            // SHAPE MUST BE BUCKETED TOO, or the world rebuilds on every streamed token: `tokens64`
+            // climbs continuously as a branch generates, and `..self` would carry each increment
+            // straight into the cache key. The bits that pick the ROOM TYPE (pruned, loops, and the
+            // heavy/deep thresholds) are preserved exactly — a wing must change character the moment
+            // its branch does — while the mass that only scales it is bucketed to ~512 tokens.
+            shape: {
+                let mut sh = self.shape;
+                for s in &mut sh { s.tokens64 = (s.tokens64 / 8) * 8; }
+                sh
+            },
             ..self
         }
     }
@@ -6954,3 +7006,92 @@ mod landmark_overlay_tests {
         assert!(ruin < whole, "{ruin} vs {whole}");
     }
 }
+
+/// The mind palace's rooms come from the conversation, not from a hash. These pin the mapping and,
+/// more importantly, the ORDER — `bear[i]` places wing i and `shape[i]` types it, and a mismatch
+/// would look meaningful while being wrong, which is worse than the hash this replaced.
+#[cfg(test)]
+mod region_shape_tests {
+    use super::*;
+    use crate::branchshape::BranchShape;
+
+    fn params(shapes: &[BranchShape]) -> EnvParams {
+        let mut p = EnvParams { seed: 0xABCD_1234, ..Default::default() };
+        for (i, s) in shapes.iter().take(6).enumerate() { p.shape[i] = *s; }
+        p
+    }
+    fn sh(depth: u8, len: u8, tokens64: u16, loops: bool, pruned: bool) -> BranchShape {
+        BranchShape { depth, len, tokens64, loops, pruned }
+    }
+
+    #[test]
+    fn each_branch_shape_picks_the_room_that_matches_it() {
+        let shapes = [
+            sh(2, 3, 1, false, true),    // pruned  → sealed cave
+            sh(2, 3, 1, true, false),    // loops   → rotunda
+            sh(2, 3, 40, false, false),  // heavy   → chamber
+            sh(6, 7, 2, false, false),   // deep    → stairs
+            sh(1, 5, 2, false, false),   // wide    → terrace
+        ];
+        let plan = region_plan(&params(&shapes), 5, 20.0);
+        let kinds: Vec<RegionType> = plan.iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, vec![RegionType::SealedCave, RegionType::Rotunda, RegionType::Chamber,
+                               RegionType::Stairs, RegionType::Terrace]);
+    }
+
+    #[test]
+    fn a_pruned_branch_is_a_dead_end_whatever_else_it_is() {
+        // heavy AND looping AND deep, but cut from context: the sealed cave wins.
+        let plan = region_plan(&params(&[sh(9, 40, 200, true, true)]), 1, 20.0);
+        assert_eq!(plan[0].kind, RegionType::SealedCave);
+        assert!(plan[0].scale < 1.0, "and a dead end stays small even when it was long");
+    }
+
+    #[test]
+    fn a_heavier_branch_gets_a_bigger_room() {
+        let light = region_plan(&params(&[sh(2, 3, 1, false, false)]), 1, 20.0);
+        let heavy = region_plan(&params(&[sh(2, 3, 60, false, false)]), 1, 20.0);
+        assert!(heavy[0].scale > light[0].scale * 1.2,
+                "mass should be legible as volume: {} vs {}", light[0].scale, heavy[0].scale);
+    }
+
+    /// The load-bearing invariant: wing i's PLACEMENT and its CHARACTER must describe the same branch.
+    #[test]
+    fn placement_and_character_index_the_same_branch() {
+        let mut p = params(&[
+            sh(2, 3, 1, false, true),   // branch 0: pruned
+            sh(2, 3, 40, false, false), // branch 1: heavy
+        ]);
+        // distinct bearings, in the same fork order the shapes are in
+        p.bear[0] = 1 + (0.10_f32 * 65534.0) as u16;
+        p.bear[1] = 1 + (0.60_f32 * 65534.0) as u16;
+        let plan = region_plan(&p, 2, 20.0);
+        use std::f32::consts::TAU;
+        assert_eq!(plan[0].kind, RegionType::SealedCave);
+        assert!((plan[0].angle - 0.10 * TAU).abs() < 0.5, "wing 0 is where branch 0 peels off");
+        assert_eq!(plan[1].kind, RegionType::Chamber);
+        assert!((plan[1].angle - 0.60 * TAU).abs() < 0.5, "wing 1 is where branch 1 peels off");
+    }
+
+    /// A scene with no graph behind it keeps the old varied mix rather than five identical rooms.
+    #[test]
+    fn a_scene_without_a_graph_still_gets_a_varied_palace() {
+        let plan = region_plan(&EnvParams { seed: 0x1234_5678, ..Default::default() }, 6, 20.0);
+        let kinds: std::collections::HashSet<RegionType> = plan.iter().map(|r| r.kind).collect();
+        assert!(kinds.len() >= 3, "demo scenes must not degrade to one room type: {kinds:?}");
+    }
+
+    /// A growing branch must not rebuild the world every token, but must change its ROOM the moment
+    /// its character changes.
+    #[test]
+    fn the_cache_key_buckets_mass_but_not_character() {
+        let a = params(&[sh(2, 3, 100, false, false)]).quantized();
+        let b = params(&[sh(2, 3, 103, false, false)]).quantized();
+        assert_eq!(a.shape[0], b.shape[0], "three more tokens must not rebuild the palace");
+        let pruned = params(&[sh(2, 3, 100, false, true)]).quantized();
+        assert_ne!(a.shape[0], pruned.shape[0], "pruning a branch must re-type its wing at once");
+        let looped = params(&[sh(2, 3, 100, true, false)]).quantized();
+        assert_ne!(a.shape[0], looped.shape[0]);
+    }
+}
+
