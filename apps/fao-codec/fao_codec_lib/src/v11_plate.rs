@@ -2166,6 +2166,7 @@ pub fn build_movers(
     let mut per_sprite_dec: Vec<Yuv420> = Vec::with_capacity(raw_sprites.len());
     let mut per_sprite_total = 0usize;
     let mut per_sprite_zstd_total = 0usize;
+    let mut per_sprite_costs: Vec<usize> = Vec::new();
     for sp in &raw_sprites {
         let (bw, bh) = (sp.w, sp.h);
         let mut raw = Vec::with_capacity(sp.y.len() * 3);
@@ -2187,47 +2188,44 @@ pub fn build_movers(
             _ => (zstd_len, sp.clone()),
         };
         per_sprite_total += b;
+        per_sprite_costs.push(b);
         per_sprite_zstd_total += zstd_len;
         per_sprite_dec.push(d);
     }
-    let (atlas_dec, atlas_bytes, n_uniq) = pack_sprite_atlas(&raw_sprites, opts);
-    // +2 B/mover slot index is the atlas's own side cost.
-    let atlas_total = atlas_bytes + raw_sprites.len() * 2;
-    let use_atlas = atlas_total < per_sprite_total;
-    if std::env::var("FAO_MOVER_DEBUG").is_ok() {
-        eprintln!(
-            "sprite pack: per-sprite {} B (raw-zstd sum {}) | atlas {} B (+{} slots, {} unique of {}) -> {}",
-            per_sprite_total,
-            per_sprite_zstd_total,
-            atlas_bytes,
-            raw_sprites.len() * 2,
-            n_uniq,
-            raw_sprites.len(),
-            if use_atlas { "ATLAS" } else { "PER-SPRITE" }
-        );
-    }
-    let decoded = if use_atlas { atlas_dec } else { per_sprite_dec };
-    let chosen_total = if use_atlas { atlas_total } else { per_sprite_total };
-    // The set cost is a SET cost now, so it is charged once on the
-    // first mover rather than split by a fiction of per-sprite shares.
-    for (i, ((bx, by, bw, bh, ref_frame, mask), sprite)) in
-        geom.into_iter().zip(decoded.into_iter()).enumerate()
-    {
-        let rf = &frames[ref_frame];
-        let cw_cells = bw / REGION;
-        let sprite_bytes = if i == 0 { chosen_total } else { 0 };
-        // Track: coarse (step 4, ±32) then fine (step 1, ±3) around the
-        // previous frame's position; hidden when the best masked SAD
-        // exceeds 3x the reference frame's own score floor.
-        let ref_score = sprite_sad(&sprite, &mask, cw_cells, rf, bx as i32, by as i32);
+    // Pass 2: track every candidate on its own decoded sprite, then ADMIT
+    // per mover before anything is packed.
+    //
+    // Why per-mover admission and not just the global J-guard: the guard
+    // is all-or-nothing, so one sprite that pays for itself can drag in
+    // twenty that don't, and one that doesn't can't be dropped without
+    // losing the whole layer. The suite made that concrete — shot 16
+    // WINS 21.9% with two movers while shot 13 LOSES with twenty-two, and
+    // shot 11 (10 frames) loses 16.3% because a sprite simply cannot
+    // amortize over ten frames. Mover count doesn't predict the win;
+    // GOP length x reuse does, and that is exactly what an admission
+    // test measures directly instead of proxying with a fixed threshold.
+    //
+    // The test is the same J the guard uses, scoped to one object:
+    // admit iff the SSE the paste removes over the frames it is visible
+    // exceeds lambda x (its own coded bytes + its 2 B/frame track).
+    // Cost uses the per-sprite independent size, which is an upper bound
+    // on its marginal cost inside the atlas — so admission is
+    // conservative by construction, never optimistic.
+    let mut cand_tracks: Vec<Vec<Option<(i16, i16)>>> = Vec::with_capacity(geom.len());
+    for (gi, (bx, by, _bw, bh, ref_frame, mask)) in geom.iter().enumerate() {
+        let _ = bh;
+        let sprite = &per_sprite_dec[gi];
+        let cw_cells = sprite.w / REGION;
+        let rf = &frames[*ref_frame];
+        let ref_score = sprite_sad(sprite, mask, cw_cells, rf, *bx as i32, *by as i32);
         let masked_px = mask.iter().filter(|&&m| m).count() * REGION * REGION;
         let miss = (ref_score.max(1)) * 3 + 6 * masked_px as u64;
         let mut track = Vec::with_capacity(frames.len());
-        let (mut px, mut py) = (bx as i32, by as i32);
+        let (mut px, mut py) = (*bx as i32, *by as i32);
         for f in frames {
             let (mut bestp, mut bests) = ((px, py), u64::MAX);
             let mut probe = |x: i32, y: i32, bests: &mut u64, bestp: &mut (i32, i32)| {
-                let s = sprite_sad(&sprite, &mask, cw_cells, f, x, y);
+                let s = sprite_sad(sprite, mask, cw_cells, f, x, y);
                 if s < *bests {
                     *bests = s;
                     *bestp = (x, y);
@@ -2250,14 +2248,140 @@ pub fn build_movers(
             }
             if bests > miss {
                 track.push(None);
-                track_raw.push(0x80); // hidden marker
-                track_raw.push(0);
             } else {
                 px = bestp.0;
                 py = bestp.1;
                 track.push(Some((px as i16, py as i16)));
-                track_raw.push((px - bx as i32).clamp(-127, 127) as i8 as u8);
-                track_raw.push((py - by as i32).clamp(-127, 127) as i8 as u8);
+            }
+        }
+        cand_tracks.push(track);
+    }
+    // SSE gain per mover: one pass over frames, plate prediction computed
+    // once per frame and shared across candidates.
+    //
+    // CORRECTION, measured: scoring the sprite against the PLATE alone
+    // overstates it. The mode decision picks the best of plate and
+    // prev-MC per region, so a mover the plate misses but the previous
+    // frame carries is already nearly free — the sprite's apparent gain
+    // is redundant with a predictor the codec has anyway. Shot 11 is the
+    // case that exposed it: 3 of 3 movers admitted against the plate,
+    // 59 KB of sprites, and the shot stayed a 16.3% loss. Gain is now
+    // scored against min(plate, previous frame), using the previous
+    // frame at zero motion as a cheap stand-in for prev-MC. That
+    // stand-in UNDERSTATES prev (a real search only does better), so
+    // admission stays optimistic rather than conservative here — the
+    // honest bound to keep in mind when reading a marginal admit.
+    let (fw, fh) = (frames[0].w, frames[0].h);
+    let mut gain = vec![0.0f64; geom.len()];
+    for (fi, f) in frames.iter().enumerate() {
+        let pred = predict_frame(plate, &motions[fi], fw, fh);
+        let prev = if fi > 0 { Some(&frames[fi - 1]) } else { None };
+        for gi in 0..geom.len() {
+            let Some((px, py)) = cand_tracks[gi][fi] else { continue };
+            let (bw, mask) = (per_sprite_dec[gi].w, &geom[gi].5);
+            let cw_cells = bw / REGION;
+            let sprite = &per_sprite_dec[gi];
+            let mut g = 0.0f64;
+            for cy in 0..(sprite.h / REGION) {
+                for cx in 0..cw_cells {
+                    if !mask[cy * cw_cells + cx] {
+                        continue;
+                    }
+                    for ly in 0..REGION {
+                        let sy = py as i32 + (cy * REGION + ly) as i32;
+                        if sy < 0 || sy >= fh as i32 {
+                            continue;
+                        }
+                        for lx in 0..REGION {
+                            let sx = px as i32 + (cx * REGION + lx) as i32;
+                            if sx < 0 || sx >= fw as i32 {
+                                continue;
+                            }
+                            let pi = sy as usize * fw + sx as usize;
+                            let t = f.y[pi] as f64;
+                            let p0 = pred.y[pi] as f64;
+                            let mut e0 = (p0 - t) * (p0 - t);
+                            if let Some(pv) = prev {
+                                let pp = pv.y[pi] as f64;
+                                let ep = (pp - t) * (pp - t);
+                                if ep < e0 {
+                                    e0 = ep;
+                                }
+                            }
+                            let p1 = sprite.y[(cy * REGION + ly) * bw + cx * REGION + lx] as f64;
+                            g += e0 - (p1 - t) * (p1 - t);
+                        }
+                    }
+                }
+            }
+            gain[gi] += g;
+        }
+    }
+    let lambda = (opts.dead_zone as f64).powi(2) / 3.0;
+    let mut keep: Vec<usize> = Vec::new();
+    for gi in 0..geom.len() {
+        let cost = per_sprite_costs[gi] + 2 * frames.len() + 10 + (geom[gi].5.len() + 7) / 8;
+        if gain[gi] > lambda * cost as f64 {
+            keep.push(gi);
+        }
+    }
+    if std::env::var("FAO_MOVER_DEBUG").is_ok() {
+        eprintln!(
+            "mover admission: {} of {} admitted (lambda {:.0})",
+            keep.len(),
+            geom.len(),
+            lambda
+        );
+    }
+    if keep.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let kept_raw: Vec<Yuv420> = keep.iter().map(|&i| raw_sprites[i].clone()).collect();
+    let kept_per_sprite_total: usize = keep.iter().map(|&i| per_sprite_costs[i]).sum();
+    let (atlas_dec, atlas_bytes, n_uniq) = pack_sprite_atlas(&kept_raw, opts);
+    // +2 B/mover slot index is the atlas's own side cost.
+    let atlas_total = atlas_bytes + kept_raw.len() * 2;
+    let use_atlas = atlas_total < kept_per_sprite_total;
+    if std::env::var("FAO_MOVER_DEBUG").is_ok() {
+        eprintln!(
+            "sprite pack: per-sprite {} B (raw-zstd sum {}) | atlas {} B (+{} slots, {} unique of {}) -> {}",
+            kept_per_sprite_total,
+            per_sprite_zstd_total,
+            atlas_bytes,
+            kept_raw.len() * 2,
+            n_uniq,
+            kept_raw.len(),
+            if use_atlas { "ATLAS" } else { "PER-SPRITE" }
+        );
+    }
+    let decoded: Vec<Yuv420> = if use_atlas {
+        atlas_dec
+    } else {
+        keep.iter().map(|&i| per_sprite_dec[i].clone()).collect()
+    };
+    let chosen_total = if use_atlas { atlas_total } else { kept_per_sprite_total };
+    // The set cost is a SET cost now, so it is charged once on the
+    // first mover rather than split by a fiction of per-sprite shares.
+    let kept_geom: Vec<_> = keep.iter().map(|&i| geom[i].clone()).collect();
+    let kept_tracks: Vec<_> = keep.iter().map(|&i| cand_tracks[i].clone()).collect();
+    for (i, (((bx, by, bw, bh, ref_frame, mask), sprite), track)) in kept_geom
+        .into_iter()
+        .zip(decoded.into_iter())
+        .zip(kept_tracks.into_iter())
+        .enumerate()
+    {
+        let _ = bh;
+        let sprite_bytes = if i == 0 { chosen_total } else { 0 };
+        for t in &track {
+            match t {
+                None => {
+                    track_raw.push(0x80);
+                    track_raw.push(0);
+                }
+                Some((px, py)) => {
+                    track_raw.push((*px as i32 - bx as i32).clamp(-127, 127) as i8 as u8);
+                    track_raw.push((*py as i32 - by as i32).clamp(-127, 127) as i8 as u8);
+                }
             }
         }
         movers.push(Mover { bx, by, bw, bh, ref_frame, mask, sprite, sprite_bytes, track });
