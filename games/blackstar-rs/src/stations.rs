@@ -218,10 +218,16 @@ pub struct Shipboard {
 impl Shipboard {
     pub fn load() -> Shipboard {
         let (sv, _, cfg) = save::load();
+        // the unlock is applied to the LOADED log, never written back — see
+        // `CampaignLog::apply_playtest_unlock`
+        let mut camp = CampaignLog::from_line(&sv.missions);
+        if let Some(note) = camp.apply_playtest_unlock() {
+            eprintln!("{note}");
+        }
         Shipboard {
             anchor: cfg.story.anchor,
             ladder: Ladder::from_cfg(&cfg),
-            camp: CampaignLog::from_line(&sv.missions),
+            camp,
             raids: RaidLog::from_line(&sv.wardens),
             nf: NightfallLog::from_line(&sv.nightfalls),
             chi: Chi::from_line(&sv.chi),

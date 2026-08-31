@@ -14,6 +14,33 @@ under BOTH `--no-default-features` and `--features audio`.
 
 ---
 
+## 0a. GETTING A PLAYTESTER INTO A RAID
+
+```sh
+BLACKSTAR_PLAYTEST=all ./skydribble
+```
+
+Clears every mission at load. Applied to the loaded log and NEVER written
+back, so a tester's real progress survives. It prints
+`PLAYTEST UNLOCK ACTIVE` on stderr on purpose — a silent cheat produces bug
+reports from a state no player can reach, and neither the tester nor you
+knows it when you read one. A named subset works too
+(`BLACKSTAR_PLAYTEST=the_pluto_line,the_beach_opens`), and a typo is
+reported rather than silently doing nothing.
+
+Why it is needed: this session added three progression gates, and two of
+them sit in front of the thing most worth testing.
+
+| gate | opens after | film |
+|---|---|---|
+| the Wardeck (raids) | `the_beach_opens` | 1 |
+| the space bridge (leaving Sol) | `what_jhiaxus_grew` | 2 |
+| the far worlds | `the_far_gate` | 4 |
+
+The forge and echo rows sit OUTSIDE all of them by design — solo practice
+content is the on-ramp to the thing being gated, so it must not be gated
+too. A tester with no unlock can still forge and fly echoes.
+
 ## 0. READ THIS FIRST: nothing here was seen or heard
 
 There is no GPU and no audio device in this sandbox. Every visual and
@@ -24,6 +51,33 @@ every frame looks like.
 **The single highest-value next action is a new screen recording**, on
 the same chassis and a couple of maps, so the Fresnel and value-structure
 changes can be judged. Until then they are hypotheses with tests attached.
+
+## 0b. WHAT THE PLAYTESTER WILL ACTUALLY MEET, and what to ask them
+
+Shipped this session and worth watching in a session, in rough order of
+how likely it is to be visibly wrong:
+
+* **The frame looks different.** Ground reflections were turning terrain
+  into sky at grazing angles; the default map moved from MEADOW (0.58
+  stops of value separation, the flattest of 36) to OBSERVATORY (4.16).
+  Both are unverified — no GPU here. First question to a tester: does the
+  ground read as ground.
+* **Audio is stereo and occluded** for ball bounces, car-ball touches,
+  boost pads and flip resets. Never heard. Ask whether anything sounds
+  like it is coming from inside a wall.
+* **The HUD was rasterising ~3x taller than its layout claimed** and is
+  rebuilt. The in-game HUD is fixed; the hand-placed menus (pause,
+  garage, tweaks, academy, maps) are NOT and share the bug class.
+* **Bots stood up wrong** because `settle` asked a car-shaped heuristic
+  about a robot. Fixed. The other two reported symptoms — falling
+  through the floor, fractured parts protruding — are measured
+  (`stance.rs`) but NOT fixed.
+* **The sortie list now names its film and its cast**, so a mission says
+  "you play this one as Prime" before you launch it.
+
+Do NOT ask a tester about: Films 7-9 (held on purpose, see 2j), the
+mocap/swing work (no phone has touched it), settlements or planet
+palettes (derivations with no geometry or renderer behind them).
 
 ## 1. The fast loop cannot see the audio module — fix this early
 

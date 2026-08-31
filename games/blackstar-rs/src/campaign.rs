@@ -529,6 +529,47 @@ impl CampaignLog {
         self.cleared.sort_by_key(|c| MISSIONS.iter().position(|x| x.id == *c));
         true
     }
+    /// PLAYTEST UNLOCK, and it is deliberately loud.
+    ///
+    /// The Wardeck opens after Film 1 and the space bridge after Film 2, which
+    /// is right for a player and wrong for someone you handed a build to and
+    /// asked "how do the raids feel". Four missions of campaign before the
+    /// thing under test is a barrier to the feedback, not to a spoiler.
+    ///
+    /// `BLACKSTAR_PLAYTEST=all` clears every mission; a comma-separated list
+    /// clears exactly those. Applied at load, so it never touches the save
+    /// file — a tester's real progress is not overwritten by the unlock.
+    ///
+    /// It returns whether it fired so the caller can SAY SO. A silent cheat is
+    /// how you get a bug report from a state no player can reach: the tester
+    /// does not know they are ahead, and neither do you when you read it.
+    pub fn apply_playtest_unlock(&mut self) -> Option<String> {
+        let raw = std::env::var("BLACKSTAR_PLAYTEST").ok()?;
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let before = self.cleared.len();
+        if raw.eq_ignore_ascii_case("all") {
+            for m in crate::content::MISSIONS {
+                self.record(m.id);
+            }
+        } else {
+            for id in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                // only real missions: a typo should not silently do nothing
+                match crate::content::MISSIONS.iter().find(|m| m.id == id) {
+                    Some(m) => { self.record(m.id); }
+                    None => return Some(format!("PLAYTEST: '{id}' is not a mission")),
+                }
+            }
+        }
+        Some(format!(
+            "PLAYTEST UNLOCK ACTIVE — {} missions cleared ({} added). Not a normal save.",
+            self.cleared.len(),
+            self.cleared.len() - before
+        ))
+    }
+
     pub fn is_cleared(&self, id: &str) -> bool {
         self.cleared.contains(&id)
     }
@@ -582,6 +623,55 @@ impl CampaignLog {
 
 #[cfg(test)]
 mod tests {
+
+    /// The unlock is for playtesters, so its failure modes are the ones that
+    /// waste a playtester's session: silently doing nothing, or silently doing
+    /// too much. Env vars are process-global, so these run under one test to
+    /// avoid racing each other.
+    #[test]
+    fn the_playtest_unlock_is_off_by_default_and_loud_when_on() {
+        // OFF unless asked. A cheat that defaults on is a cheat that ships.
+        std::env::remove_var("BLACKSTAR_PLAYTEST");
+        let mut a = CampaignLog::default();
+        assert!(a.apply_playtest_unlock().is_none(), "the unlock fired unasked");
+        assert!(!a.is_cleared("the_beach_opens"));
+
+        // an empty value is not a request
+        std::env::set_var("BLACKSTAR_PLAYTEST", "  ");
+        let mut b = CampaignLog::default();
+        assert!(b.apply_playtest_unlock().is_none(), "an empty value unlocked the game");
+
+        // `all` opens everything AND says so — silence here is how a bug
+        // report arrives from a state no player can reach
+        std::env::set_var("BLACKSTAR_PLAYTEST", "all");
+        let mut c = CampaignLog::default();
+        let note = c.apply_playtest_unlock().expect("all must report");
+        assert!(note.contains("PLAYTEST"), "the unlock was quiet: {note}");
+        assert!(c.is_cleared("the_beach_opens"), "the Wardeck is still shut");
+        assert!(c.is_cleared("what_jhiaxus_grew"), "the bridge is still dark");
+        assert_eq!(
+            c.cleared.len(),
+            crate::content::MISSIONS.len(),
+            "all did not clear all"
+        );
+
+        // a named subset clears exactly those
+        std::env::set_var("BLACKSTAR_PLAYTEST", "the_pluto_line, the_beach_opens");
+        let mut d = CampaignLog::default();
+        assert!(d.apply_playtest_unlock().is_some());
+        assert!(d.is_cleared("the_beach_opens") && d.is_cleared("the_pluto_line"));
+        assert!(!d.is_cleared("what_jhiaxus_grew"), "a subset cleared more than asked");
+
+        // a typo is reported rather than silently doing nothing — the failure
+        // that costs a playtester an evening wondering why nothing opened
+        std::env::set_var("BLACKSTAR_PLAYTEST", "the_beach_opnes");
+        let mut e = CampaignLog::default();
+        let note = e.apply_playtest_unlock().expect("a typo must report");
+        assert!(note.contains("not a mission"), "a typo passed silently: {note}");
+
+        std::env::remove_var("BLACKSTAR_PLAYTEST");
+    }
+
     use super::*;
 
     #[test]
