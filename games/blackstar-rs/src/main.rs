@@ -90,6 +90,7 @@ mod online_screen;
 mod optics;
 mod physics;
 mod powers;
+mod planetlook;
 mod platform;
 mod posture;
 mod procars;
