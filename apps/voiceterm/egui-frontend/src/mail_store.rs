@@ -139,6 +139,10 @@ pub fn load(path: &Path) -> Vec<Message> {
     match classify(path) {
         Kind::Maildir => {
             let mut out = Vec::new();
+            // The ids each message claims, collected alongside so threads
+            // can be merged once the whole directory is read. One file at
+            // a time cannot know that two of them belong together.
+            let mut chains: Vec<Vec<String>> = Vec::new();
             for f in maildir_files(path) {
                 let Ok(text) = std::fs::read_to_string(&f) else { continue };
                 // The file name is the origin, so two messages that both
@@ -152,9 +156,15 @@ pub fn load(path: &Path) -> Vec<Message> {
                 // only what FOLLOWS one, so the headers were dropped and
                 // what survived was the quoted tail with no subject and no
                 // sender. Quoted mail is full of such lines.
+                chains.push({
+                    let mut ids = crate::mail_rfc822::thread_ids(&text);
+                    if ids.is_empty() { ids.push(origin.clone()); }
+                    ids
+                });
                 out.push(crate::mail_rfc822::message_from_text(&origin, &text));
                 if out.len() >= MAX_MESSAGES { break; }
             }
+            crate::mail_rfc822::regroup(&mut out, &chains);
             out
         }
         Kind::Mbox => {

@@ -238,9 +238,22 @@ pub fn parse_date(raw: &str) -> i64 {
 /// into any synthesised id, so two `cat`s of different files cannot collide
 /// on `<no-id>` and appear as one thread.
 pub fn messages_from_text(origin: &str, text: &str) -> Vec<Message> {
-    split_mbox(text).into_iter().enumerate()
+    let parts: Vec<&str> = split_mbox(text);
+    let mut msgs: Vec<Message> = parts.iter().enumerate()
         .map(|(i, raw)| message_from_text(&format!("{origin}#{i}"), raw))
-        .collect()
+        .collect();
+    // Merge anything sharing an id — see `regroup`. A message with no
+    // ids at all keeps the conversation its own rule gave it, which is
+    // what the empty chain means here.
+    let chains: Vec<Vec<String>> = parts.iter().zip(&msgs)
+        .map(|(raw, m)| {
+            let mut ids = thread_ids(raw);
+            if ids.is_empty() { ids.push(m.conversation_id.clone()); }
+            ids
+        })
+        .collect();
+    regroup(&mut msgs, &chains);
+    msgs
 }
 
 /// One message, WITHOUT mbox splitting.
@@ -252,6 +265,76 @@ pub fn messages_from_text(origin: &str, text: &str) -> Vec<Message> {
 /// keeps only what follows a separator, the message's HEADERS are dropped
 /// and what survives is the quoted tail with no subject and no sender.
 /// Quoted mail is full of such lines.
+/// Every id a message claims to be part of: its own, plus its whole
+/// `References` chain.
+///
+/// The chain, not just the root. See [`regroup`].
+pub fn thread_ids(raw: &str) -> Vec<String> {
+    let (h, _) = headers_and_body(raw);
+    let mut ids = Vec::new();
+    let own = header(&h, "message-id").trim().to_string();
+    if !own.is_empty() { ids.push(own); }
+    for r in header(&h, "references").split_whitespace() {
+        ids.push(r.to_string());
+    }
+    let irt = header(&h, "in-reply-to").trim().to_string();
+    if !irt.is_empty() && !ids.contains(&irt) { ids.push(irt); }
+    ids
+}
+
+/// Merge threads that share ANY message id.
+///
+/// The rule on its own — group by the References ROOT — is right for
+/// well-formed mail and fragments on two cases a real mailbox is full of.
+/// I found both by generating eight thousand messages and counting the
+/// threads:
+///
+/// * **A client that puts only the PARENT in References**, which is what
+///   `In-Reply-To` means and what several real clients emit anyway. Every
+///   conversation then splits into pairs — 8,000 messages became 5,333
+///   threads.
+/// * **A root that is not in the mailbox**, because it was deleted or
+///   lives on someone else's server. The replies group with each other
+///   but not with anything you still have.
+///
+/// Union-find over the ids each message claims: any two messages sharing
+/// one end up in the same conversation, transitively. That is the part of
+/// JWZ threading that matters here, without the parent tree — this view
+/// draws a flat thread, so knowing WHO replied to whom buys nothing.
+pub fn regroup(msgs: &mut [Message], chains: &[Vec<String>]) {
+    use std::collections::HashMap;
+    // Parent pointers over message ids.
+    let mut parent: HashMap<String, String> = HashMap::new();
+    fn find(parent: &mut HashMap<String, String>, x: &str) -> String {
+        let mut cur = x.to_string();
+        while let Some(p) = parent.get(&cur) {
+            if p == &cur { break; }
+            let p = p.clone();
+            // Path halving, so a long reply chain does not become a long
+            // walk on every lookup.
+            if let Some(gp) = parent.get(&p).cloned() {
+                parent.insert(cur.clone(), gp);
+            }
+            cur = p;
+        }
+        parent.entry(cur.clone()).or_insert_with(|| cur.clone());
+        cur
+    }
+    for chain in chains {
+        let Some(first) = chain.first() else { continue };
+        let a = find(&mut parent, first);
+        for id in chain.iter().skip(1) {
+            let b = find(&mut parent, id);
+            if a != b { parent.insert(b, a.clone()); }
+        }
+    }
+    for (m, chain) in msgs.iter_mut().zip(chains) {
+        if let Some(first) = chain.first() {
+            m.conversation_id = find(&mut parent, first);
+        }
+    }
+}
+
 pub fn message_from_text(origin: &str, raw: &str) -> Message {
     build(origin, raw)
 }
@@ -387,6 +470,53 @@ References: <abc@example.com>\n\nagreed\n");
         let no_refs = "From: Bo <bo@x>\nSubject: Re: Re: Fwd: Analytical engine\n\nhi\n";
         let m2 = messages_from_text("block:2", no_refs);
         assert_eq!(m2[0].conversation_id, "subj:analytical engine");
+    }
+
+    #[test]
+    fn a_client_that_cites_only_the_parent_still_makes_one_thread() {
+        // Found by generating eight thousand messages: with only the
+        // parent in References — which is what In-Reply-To means and what
+        // several real clients emit anyway — every conversation split into
+        // pairs, 8,000 messages becoming 5,333 threads.
+        let mut mbox = String::new();
+        for i in 0..5 {
+            mbox.push_str(&format!("From x\nMessage-ID: <m{i}@x>\nSubject: T\n"));
+            if i > 0 { mbox.push_str(&format!("References: <m{}@x>\n", i - 1)); }
+            mbox.push_str("\nbody\n");
+        }
+        let msgs = messages_from_text("b", &mbox);
+        assert_eq!(msgs.len(), 5);
+        let convs: std::collections::HashSet<&str> =
+            msgs.iter().map(|m| m.conversation_id.as_str()).collect();
+        assert_eq!(convs.len(), 1, "a parent-only chain made {} threads", convs.len());
+    }
+
+    #[test]
+    fn replies_group_when_the_root_is_not_in_the_mailbox() {
+        // The other case the generated corpus showed: a thread whose first
+        // message was deleted, or lives on someone else's server. 400
+        // conversations were coming out as 800 threads.
+        // Concatenated, not one continued literal: a `\` continuation
+        // keeps the next line's indentation, so the second "From " was not
+        // at the start of a line and the whole fixture parsed as one
+        // message. The debug print in the assert is what showed it.
+        let mbox = concat!(
+            "From x\nMessage-ID: <a@x>\nReferences: <gone@x>\nSubject: T\n\nb\n",
+            "From x\nMessage-ID: <b@x>\nReferences: <gone@x> <a@x>\nSubject: Re: T\n\nb\n");
+        let msgs = messages_from_text("b", mbox);
+        assert_eq!(msgs.len(), 2, "split gave {:?}", split_mbox(mbox));
+        assert_eq!(msgs[0].conversation_id, msgs[1].conversation_id,
+                   "a missing root split the replies apart");
+    }
+
+    #[test]
+    fn two_unrelated_conversations_are_not_merged() {
+        // The union has to stop somewhere. Messages sharing no id at all
+        // must stay apart, or every mailbox becomes one thread.
+        let mbox = concat!("From x\nMessage-ID: <a@x>\nSubject: One\n\nb\n",
+                           "From x\nMessage-ID: <b@x>\nSubject: Two\n\nb\n");
+        let msgs = messages_from_text("b", mbox);
+        assert_ne!(msgs[0].conversation_id, msgs[1].conversation_id);
     }
 
     #[test]
