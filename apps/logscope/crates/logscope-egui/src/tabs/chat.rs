@@ -4825,7 +4825,24 @@ which file you read.\n\n",
                 let up = crate::spatial::Vec3::new(syaw * sp, cp, -cyaw * sp);
                 let toward_cam = crate::spatial::Vec3::new(-(cp * syaw), sp, cp * cyaw); // -viewDir → toward eye
                 let scroll = (t * 0.12).sin() * 0.06; // gentle teleprompter drift
+                // WHICH LABELS GET DRAWN, decided on the label BOXES rather than the pearl bodies.
+                // The dimming pass below is about occlusion by a nearer node; it cannot see two
+                // labels of similar depth sitting side by side, which is how a cluster of turns
+                // ends up as one smear of overlapping text. `nodelabel::visible` keeps the nearest
+                // and drops what would collide with it.
+                const LABEL_CHARS: usize = 22;
+                let show: std::collections::HashSet<usize> = {
+                    let placed: Vec<crate::nodelabel::Placed> = proj.iter().filter_map(|q| {
+                        let nd = g.nodes.iter().find(|nd| nd.id == q.0)?;
+                        let chars = crate::nodelabel::elide(&nd.preview, LABEL_CHARS).chars().count();
+                        Some(crate::nodelabel::Placed { id: q.0, x: q.1, y: q.2, depth: q.3, chars })
+                    }).collect();
+                    // Cell size in px at this scale: label_cells lays 5x7 cells at 0.034 world
+                    // units, which projects to roughly a 7px advance and a 14px line here.
+                    crate::nodelabel::visible(placed, 7.0, 14.0).into_iter().collect()
+                };
                 for q in &proj {
+                    if !show.contains(&q.0) { continue; }
                     let near = ((maxd - q.3) / span).clamp(0.0, 1.0);
                     let mut lit = ((near - 0.80) / 0.18).clamp(0.0, 1.0); // resolves only when very close
                     if lit < 0.05 { continue; }
@@ -4841,9 +4858,11 @@ which file you read.\n\n",
                     lit /= 1.0 + 1.5 * occ;
                     if lit < 0.05 { continue; }
                     if let Some(nd) = g.nodes.iter().find(|nd| nd.id == q.0) {
-                        let label: String = nd.preview.chars().take(16).collect();
-                        if label.trim().is_empty() { continue; }
-                        for cell in m3::label_cells(pos[q.0], right, up, toward_cam, label.trim(),
+                        // Word-safe rather than a hard character cut: "create a rust crate…" instead
+                        // of "create a rust crate th".
+                        let label = crate::nodelabel::elide(&nd.preview, LABEL_CHARS);
+                        if label.is_empty() { continue; }
+                        for cell in m3::label_cells(pos[q.0], right, up, toward_cam, &label,
                                                     0.034, t, theme::CYAN(), lit, scroll, tanim, m3::SceneLight::Uniform, 0) {
                             graph.push(cell);
                         }
@@ -6180,7 +6199,9 @@ which file you read.\n\n",
                 if label_fade > 0.02 {
                     let base = if t < 0.2 { theme::INK() } else { theme::DIM() };
                     p.text(egui::pos2(sx + radius + 5.0, sy), egui::Align2::LEFT_CENTER,
-                        format!("{}t · {}", nd.tokens, nd.preview.chars().take(22).collect::<String>()),
+                        // Same word-safe elision as the scene labels — a 2D list has more room for
+                        // the text but no more excuse for cutting it mid-word.
+                        format!("{}t · {}", nd.tokens, crate::nodelabel::elide(&nd.preview, 22)),
                         egui::FontId::proportional(11.0), base.gamma_multiply(label_fade));
                 }
             }
