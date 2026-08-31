@@ -97,6 +97,65 @@ pub fn entry(id: &str) -> Option<&'static Castable> {
     CASTABLE.iter().find(|c| c.id == id)
 }
 
+/// How a cast member is BILLED to one particular player.
+///
+/// The insight this exists for: a player who has not met someone should not be
+/// lied to about who is standing next to them. Substituting an anonymous
+/// stand-in — "a Fire Clone" — is a lie that a friend on voice chat will
+/// immediately contradict, and the player then learns the game misled them.
+/// `???` does not lie. It says there is something here you do not know yet,
+/// which is true, and it hands the spoiler decision to the table instead of
+/// taking it: ask your friends or do not, and either is a choice you made.
+///
+/// It also turns the gate from a WALL into a FUNNEL. A casual player who is
+/// six missions behind can raid with their group, meet an unnamed someone who
+/// fights beside them, and go looking for which mission that was. Locking them
+/// out teaches nothing; redacting teaches them there is something to find.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Billing {
+    /// What this player sees on the label and in dialogue.
+    pub label: &'static str,
+    /// Do they know who it is? False means the name is redacted for them and
+    /// nobody else — the same raid, the same character, a different label.
+    pub known: bool,
+    pub presence: Presence,
+}
+
+/// The label shown to a player who has not met this character.
+pub const REDACTED: &'static str = "???";
+
+/// Bill a cast member for one viewer.
+///
+/// PER-VIEWER, not per-lobby. Nobody is excluded from a raid because of where
+/// they are in the story — the seventh friend joins whatever is running — and
+/// nobody is spoiled either, because identity resolves against THEIR campaign
+/// log rather than the host's. Same encounter, same fight, same loot; one
+/// player sees "billy" and another sees "???".
+///
+/// This works only while a forged cast is flavour: every ceiling in `CASTABLE`
+/// is Ally, Interactable or Seen, never Playable, so no build, damage number
+/// or objective depends on who is standing there. The day a character becomes
+/// mechanically necessary — a door only the Morpher opens — redaction stops
+/// being safe and that raid has to gate the lobby instead. Keeping forged
+/// casts flavour-only is what keeps this available.
+pub fn billing(id: &str, log: &CampaignLog) -> Option<Billing> {
+    let c = entry(id)?;
+    // written out is still written out: redaction cannot resurrect anyone,
+    // because a player who HAS seen the plates close would be shown a
+    // contradiction rather than a mystery
+    if let Some(out) = c.written_out_by {
+        if log.is_cleared(out) {
+            return None;
+        }
+    }
+    let known = log.is_cleared(c.introduced_by);
+    Some(Billing {
+        label: if known { c.id } else { REDACTED },
+        known,
+        presence: c.ceiling,
+    })
+}
+
 /// May a generated raid cast this character for this player, and how strongly?
 ///
 /// `None` means no. A `Some(p)` is the CEILING, not an instruction — the
@@ -211,6 +270,77 @@ mod tests {
         assert_eq!(got[0].0, "optimus");
         assert!(admit(&["the_morpher"], &late).is_empty(), "unmet character admitted");
         assert!(admit(&[], &late).is_empty());
+    }
+
+    #[test]
+    fn an_unmet_character_is_redacted_not_replaced() {
+        // The distinction that matters. A stand-in ("a Fire Clone") is a lie a
+        // friend on voice chat contradicts in one sentence; `???` is true and
+        // hands the spoiler decision to the table.
+        let fresh = log(&[]);
+        let b = billing("billy_the_fire_clone", &fresh).expect("present, just unknown");
+        assert_eq!(b.label, REDACTED, "an unmet character was named");
+        assert!(!b.known);
+        assert_eq!(b.presence, Presence::Ally, "redaction changed what they DO");
+
+        let met = log(&["the_tide_forges"]);
+        let b2 = billing("billy_the_fire_clone", &met).expect("met");
+        assert_eq!(b2.label, "billy_the_fire_clone");
+        assert!(b2.known);
+        assert_eq!(b2.presence, b.presence, "meeting them changed the encounter");
+    }
+
+    #[test]
+    fn the_same_raid_bills_two_players_differently() {
+        // Per-viewer, not per-lobby: nobody is excluded and nobody is spoiled.
+        // The seventh friend joins whatever is running.
+        let behind = log(&[]);
+        let ahead = log(&["the_tide_forges"]);
+        let a = billing("billy_the_fire_clone", &behind).expect("a");
+        let b = billing("billy_the_fire_clone", &ahead).expect("b");
+        assert_ne!(a.label, b.label, "both players see the same label");
+        assert_eq!(a.presence, b.presence, "the encounter differs between players");
+    }
+
+    #[test]
+    fn redaction_cannot_resurrect_someone_the_campaign_closed() {
+        // The one case where hiding the name is wrong. A player who has seen
+        // the plates close would be shown a contradiction rather than a
+        // mystery, so written-out still means absent — for everyone.
+        let after = log(&["the_ashen_truce", "beneath_the_pacific"]);
+        assert_eq!(billing("megatron", &after), None, "the dead were redacted back in");
+        // and before that, an unmet player sees the mystery rather than nothing
+        let early = log(&[]);
+        let m = billing("megatron", &early).expect("present in the window");
+        assert_eq!(m.label, REDACTED);
+    }
+
+    #[test]
+    fn billing_and_castable_agree_about_who_is_absent() {
+        // Two functions answering adjacent questions. `castable` is the strict
+        // gate (may a forge PLAN this), `billing` is the per-viewer view (what
+        // does this player SEE). They must never disagree about someone being
+        // written out, or a raid plans a character the viewer cannot be shown.
+        for c in CASTABLE {
+            for l in [
+                log(&[]),
+                log(&["the_pluto_line"]),
+                log(&["the_ashen_truce"]),
+                log(&["the_ashen_truce", "beneath_the_pacific"]),
+                log(&["the_pluto_line", "the_far_gate", "the_tide_forges"]),
+            ] {
+                let gone_strict = castable(c.id, &l).is_none() && {
+                    // distinguish "not yet met" from "written out"
+                    c.written_out_by.map(|o| l.is_cleared(o)).unwrap_or(false)
+                };
+                let gone_view = billing(c.id, &l).is_none();
+                assert_eq!(
+                    gone_strict, gone_view,
+                    "{} disagrees between castable and billing",
+                    c.id
+                );
+            }
+        }
     }
 
     #[test]

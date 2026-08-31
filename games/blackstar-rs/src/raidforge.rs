@@ -265,6 +265,18 @@ pub fn render(e: &EchoRaid) -> String {
 ///
 /// Returns (ready, held). `held` carries the reason so the console can say
 /// "waiting on someone you have not met" rather than hiding the raid.
+///
+/// PARTLY SUPERSEDED, and worth knowing before reaching for it. `casting::
+/// billing` redacts an unmet character to `???` per viewer instead of
+/// excluding them, which is the better answer for MULTIPLAYER: nobody is
+/// locked out of a raid their friends are running, and nobody is spoiled,
+/// because identity resolves against each player's own log. A held raid is a
+/// player who cannot play; a redacted one is a player with a question.
+///
+/// This is kept for the SOLO case and as the strict option — a player who
+/// wants their own forge output to follow their own pace, and a host who
+/// genuinely wants a lobby gated. `partition` takes the log as a parameter, so
+/// strict, per-viewer and open are one call apart rather than three designs.
 pub fn catalog_split(log: &crate::campaign::CampaignLog) -> (Vec<EchoRaid>, Vec<(EchoRaid, String)>) {
     partition(catalog(), log)
 }

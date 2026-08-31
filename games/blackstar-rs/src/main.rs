@@ -7557,11 +7557,23 @@ impl Game {
                 self.arena_map(a);
                 self.close_deck();
                 match cast.first() {
-                    Some((id, p)) => self.toastf(&format!(
-                        "the echo answers — {} — {id} is {}",
-                        r.boss.name,
-                        p.label()
-                    )),
+                    // BILLED, not named. A player who has not met this
+                    // character sees `???` — true, rather than a stand-in
+                    // that a friend on voice chat contradicts in one
+                    // sentence. The spoiler decision belongs to the table.
+                    Some((id, p)) => {
+                        let shown = self
+                            .deck
+                            .as_ref()
+                            .and_then(|d| casting::billing(id, d.campaign()))
+                            .map(|b| b.label)
+                            .unwrap_or(casting::REDACTED);
+                        self.toastf(&format!(
+                            "the echo answers — {} — {shown} is {}",
+                            r.boss.name,
+                            p.label()
+                        ))
+                    }
                     None => self.toastf(&format!("the echo answers — {}", r.boss.name)),
                 }
                 self.sortie = None;
