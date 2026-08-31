@@ -5249,3 +5249,42 @@ first is the gesture's idiom, and clamping would make the last view feel
 stuck.
 
 416/416.
+
+## 95. rusty-board: the 11 gestures reached nothing
+
+Looked for what stops rusty-board being a good cardinal swipe keyboard.
+`cardinal_gesture` is complete and careful — tap, eight cardinals, a
+hairpin for capitals, CW/CCW rotations — and `lib.rs` dispatches every
+variant with comments explaining each.
+
+**And no layout carried any cardinal data.** `grep -c cardinal` over
+every JSON in `resources/layouts/` returns 0. So ten of the eleven
+gestures fell through to the tap letter, on every key, in every layout.
+The classifier had nothing to classify against.
+
+**The data was already in the file.** Every key has `extended` — `e`
+carries `["3","é","è","ê","ë"]` — and the loader turned it into the
+hold-and-pick popup and nothing else. Only the PLACEMENT was missing.
+
+`assign_cardinals` derives it:
+  - **N, S, E, W before the diagonals.** The four true cardinals are the
+    swipes a thumb makes reliably without looking; a diagonal on a phone
+    key is a smaller target. So the variants a layout author listed
+    FIRST — the likeliest — get the easiest gestures.
+  - **A leading single digit goes to CW rotation, not a swipe.** `q` has
+    `["1"]`: that is its numpad digit, which is where the GTK layout
+    puts it and where `Key::rotate_cw` already expects it. A north swipe
+    spent on `1` would waste the best gesture on a character the
+    rotation already reaches, and push the accents onto diagonals.
+  - **A key with no variants gets no cardinals.** A swipe emitting a
+    character the layout never mentioned is worse than one that does
+    nothing.
+  - **Extras stay in `variants`.** Eight directions, and a key can have
+    twelve — the hold popup is the slow path to all of them, and this
+    adds a fast path to the common ones rather than replacing it.
+
+239/239.
+
+- **C95a — nothing SHOWS the cardinals.** A key that can emit `é` on a
+  north swipe and does not say so is a feature nobody discovers. The
+  GTK build draws variant hints on the keycap; this port does not yet.

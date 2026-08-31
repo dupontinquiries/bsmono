@@ -138,6 +138,49 @@ fn key_text(k: &KeyDef, shift: Shift) -> String {
 }
 
 /// Project a layout + shift state onto the render [`crate::Layout`] `keyboard_ui` draws: text
+/// Place a key's variants on cardinal directions.
+///
+/// ## Why this order
+///
+/// `CARDINAL_ORDER` is N, S, E, W first, then the diagonals. The four
+/// true cardinals are the swipes a thumb makes reliably without
+/// looking; a diagonal on a phone key is a smaller target and easier to
+/// misjudge, so the FIRST variants — the ones a layout author listed
+/// first, and therefore the likeliest — get the easiest gestures.
+///
+/// ## Why a digit goes to CW rotation instead
+///
+/// A leading digit in `extended` is the key's numpad digit — `q` has
+/// `["1"]`, `w` has `["2"]`. Those belong on the clockwise rotation,
+/// which is where the GTK layout puts them and where `Key::rotate_cw`
+/// already expects them. Putting `1` on a north swipe would spend the
+/// best gesture on a character the rotation already reaches, and leave
+/// the accents on diagonals.
+///
+/// ## Nothing is invented
+///
+/// A key with no variants gets no cardinals. More variants than
+/// directions: the extras stay in `variants` for the hold popup, which
+/// is what that popup is for — this adds a fast path to the common
+/// ones, it does not replace the slow path to all of them.
+fn assign_cardinals(key: &mut crate::Key) {
+    use uikit_egui::slide_menu::Dir8;
+    const CARDINAL_ORDER: [Dir8; 8] = [
+        Dir8::N, Dir8::S, Dir8::E, Dir8::W,
+        Dir8::NE, Dir8::NW, Dir8::SE, Dir8::SW,
+    ];
+    let mut rest = key.variants.iter();
+    let first = key.variants.first().cloned();
+    // A single-character digit leading the list is the numpad digit.
+    if let Some(d) = first.filter(|v| v.len() == 1 && v.chars().all(|c| c.is_ascii_digit())) {
+        key.rotate_cw = Some(d);
+        rest.next();
+    }
+    for (dir, v) in CARDINAL_ORDER.iter().zip(rest) {
+        key.cardinal.push((*dir, v.clone()));
+    }
+}
+
 /// keys relabel/emit per shift (the GTK view relabels under shift); `extended` (or
 /// `extended_shifted` while shifted) becomes the hold-variants popup; action keys carry their
 /// reserved token and show their file label.
@@ -163,6 +206,17 @@ pub fn to_render(file: &LayoutFile, shift: Shift) -> crate::Layout {
                     } else {
                         k.extended.clone()
                     };
+                    // CARDINAL DIRECTIONS, from the variants that are
+                    // already there.
+                    //
+                    // The 11-gesture classifier has been complete since
+                    // it was written and NO layout carries cardinal
+                    // data, so ten of the eleven gestures reached
+                    // nothing — every swipe fell through to the tap
+                    // letter. The data to fix that was already in the
+                    // file as `extended`; only the placement was
+                    // missing.
+                    assign_cardinals(&mut key);
                     key
                 })
                 .collect();
@@ -242,6 +296,70 @@ impl Default for RealBoard {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_letter_with_accents_reaches_them_by_swipe() {
+        // `e` carries ["3","é","è","ê","ë"]. Before this, all four
+        // accents were reachable only by hold-and-pick, and ten of the
+        // eleven gestures did nothing on every key in every layout.
+        let l = super::to_render(&super::parse(super::QWERTY_JSON).expect("qwerty parses"),
+                              Default::default());
+        let e = l.rows.iter().flat_map(|r| &r.keys)
+            .find(|k| k.emit == "e").expect("a key for e");
+        assert!(!e.cardinal.is_empty(), "no cardinals on e");
+        let reachable: Vec<&str> = e.cardinal.iter().map(|(_, s)| s.as_str()).collect();
+        assert!(reachable.contains(&"é"), "{reachable:?}");
+    }
+
+    #[test]
+    fn the_numpad_digit_goes_to_rotation_not_a_swipe() {
+        // `q` has ["1"]: that is its numpad digit, and CW rotation is
+        // where the GTK layout puts it. Spending a north swipe on it
+        // would waste the best gesture on a character the rotation
+        // already reaches.
+        let l = super::to_render(&super::parse(super::QWERTY_JSON).expect("qwerty parses"),
+                              Default::default());
+        let q = l.rows.iter().flat_map(|r| &r.keys)
+            .find(|k| k.emit == "q").expect("a key for q");
+        assert_eq!(q.rotate_cw.as_deref(), Some("1"));
+        assert!(q.cardinal.is_empty(), "the digit should not also be a swipe: {:?}", q.cardinal);
+    }
+
+    #[test]
+    fn the_easiest_directions_are_used_first() {
+        // N/S/E/W are the swipes a thumb makes reliably without looking;
+        // a diagonal is a smaller target. The variants a layout author
+        // listed first are the likeliest, so they get the easiest
+        // gestures.
+        use uikit_egui::slide_menu::Dir8;
+        let mut k = crate::Key::new("x");
+        k.variants = vec!["a".into(), "b".into(), "c".into()];
+        super::assign_cardinals(&mut k);
+        let dirs: Vec<Dir8> = k.cardinal.iter().map(|(d, _)| *d).collect();
+        assert_eq!(dirs, vec![Dir8::N, Dir8::S, Dir8::E]);
+    }
+
+    #[test]
+    fn a_key_with_no_variants_gets_no_cardinals() {
+        // Nothing is invented. A swipe that emits a character the layout
+        // never mentioned is worse than a swipe that does nothing.
+        let mut k = crate::Key::new("x");
+        super::assign_cardinals(&mut k);
+        assert!(k.cardinal.is_empty());
+        assert!(k.rotate_cw.is_none());
+    }
+
+    #[test]
+    fn extra_variants_stay_available_on_hold() {
+        // Eight directions, and a key can have more. The hold popup is
+        // the slow path to all of them; this adds a fast path to the
+        // common ones rather than replacing it.
+        let mut k = crate::Key::new("x");
+        k.variants = (0..12).map(|i| format!("v{i}")).collect();
+        super::assign_cardinals(&mut k);
+        assert_eq!(k.cardinal.len(), 8, "more than eight directions used");
+        assert_eq!(k.variants.len(), 12, "the hold popup lost its list");
+    }
     use super::*;
 
     #[test]
