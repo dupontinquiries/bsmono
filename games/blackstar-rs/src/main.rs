@@ -957,6 +957,11 @@ struct Game {
     combo_t: f32,
     air_t: f32,
     air_link: f32,
+    /// throttle for the CLIMB toast, same shape as the C engine's
+    /// `g_climb_msg_cd` — `ev.climbing` fires every physics step while
+    /// climbing (dozens of times a second), so this is what keeps the
+    /// toast from spamming rather than physics gating it itself.
+    climb_msg_cd: f32,
 }
 
 /// Impulse (delta-v, m/s) to hp damage. ONE conversion for everything the
@@ -2100,6 +2105,7 @@ fn main() {
         combo_t: 0.0,
         air_t: 0.0,
         air_link: 0.0,
+        climb_msg_cd: 0.0,
     };
 
     // Upload the ship's hull once. `Aboard::upload_hull` needs `&mut Gpu`, so
@@ -6844,6 +6850,19 @@ impl Game {
                     self.grime.add_dust(sections::Section::LegR, amount);
                 }
             }
+        }
+
+        // WALL-CLIMB FEEDBACK, throttled the same way the C engine
+        // throttles its own "CLIMB"/"MANTLE" hud message
+        // (`g_climb_msg_cd`) -- `ev.climbing` fires every physics step
+        // while climbing, so gating goes here rather than in physics.
+        self.climb_msg_cd = (self.climb_msg_cd - dt).max(0.0);
+        if ev.mantled {
+            self.toastf("MANTLE");
+            self.climb_msg_cd = 1.2;
+        } else if ev.climbing && self.climb_msg_cd <= 0.0 {
+            self.toastf("CLIMB");
+            self.climb_msg_cd = 1.5;
         }
 
         // air-dribble timer: ball airborne, kept alive by aerial touches

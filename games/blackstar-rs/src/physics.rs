@@ -11,7 +11,7 @@
 //! and **flip resets**: touch anything with your wheels while airborne and
 //! the flip comes back, RL-style, which is the whole air-dribble endgame.
 
-use glam::{Quat, Vec3};
+use glam::{Quat, Vec2, Vec3};
 
 use crate::config::Config;
 use crate::world::World;
@@ -210,6 +210,20 @@ pub struct Car {
     /// proposal's name describes the intended character-expression use
     /// case, not a restriction enforced here.
     pub weapon_pop: f32,
+    /// WALL CLIMB, ported from the C engine's `g_climb_budget`
+    /// (games/blackstar/engine_src/game.c) — seconds of climbing left,
+    /// refilling to a fixed ceiling on landing rather than regenerating
+    /// over time, so it can't be farmed by standing still. Robot-only
+    /// (a vehicle doesn't climb walls); see `step_car`'s own climb
+    /// block for where this is spent.
+    pub climb_budget: f32,
+    /// 0..1, how deep into a climb stroke the body is — the same shape
+    /// of cosmetic, phase-driven channel `weapon_pop` is, for a caller
+    /// (a future rig-aware renderer, `anim::Gait::Climb`) to read.
+    /// Ported concept from `g_climbing`/`g_climb_ph`'s arm-over-arm
+    /// alternation, simplified to a single 0..1 "climbing at all" flag
+    /// here — the phase itself belongs to `anim.rs`, not physics.
+    pub climbing: f32,
     /// WHAT THIS PARTICULAR HULL IS LIKE (`driveline`). Multipliers over
     /// the player's `CarCfg`, so tuning stays the player's and character
     /// stays the vehicle's. `Default` is all 1.0 — a chassis nobody
@@ -369,6 +383,8 @@ impl Car {
             tracked: false,
             siege_mode: TankSiegeMode::default(),
             weapon_pop: 0.0,
+            climb_budget: 4.0, // matches the C engine's initial full budget
+            climbing: 0.0,
             hand: crate::driveline::Handling::default(),
             hand_base: crate::driveline::Handling::default(),
             lift: None,
@@ -661,6 +677,15 @@ pub struct StepEvents {
     pub ball_bounce: Option<(Vec3, f32)>, // world-contact point + impact speed
     pub flip_reset: Option<Vec3>,               // underside contact restored the flip
     pub landed: Option<f32>,                    // car landing impact speed
+    /// wall-climb started or continued THIS step — the caller (main.rs)
+    /// only needs to know "am I climbing right now" to show a cue, same
+    /// as the C engine's throttled "CLIMB" hud message; the throttling
+    /// itself belongs to the caller, not physics.
+    pub climbing: bool,
+    /// a mantle (vaulting over a reached ledge) started this step —
+    /// fired once per mantle, not held down like `climbing`, mirroring
+    /// the C engine's one-shot "MANTLE" message.
+    pub mantled: bool,
 }
 
 pub fn step(
@@ -1533,6 +1558,61 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
                 car.jump_hold = 0.0;
             }
             car.jump_hold -= dt;
+        }
+
+        // ---- ROBOT: WALL CLIMB, on foot, held Jump toward a wall -------
+        //
+        // Ported from the C engine's wall-climb (games/blackstar/engine_src
+        // /game.c, the block around `player_wall_ahead`), adapted to this
+        // engine's SDF world query (`World::wall_ahead`) instead of a
+        // discrete collision-box list. Same shape: a limited budget that
+        // refills to a ceiling on landing (not regenerating over time, so
+        // it can't be farmed by standing still), a wall probed along the
+        // body's own forward direction, and two outcomes depending on how
+        // close the crest already is — mantle over a ledge within reach,
+        // or scale the face if it isn't.
+        //
+        // Gated the same way the C code gates it: robot only (a vehicle
+        // doesn't climb walls), airborne (grounded means there's nothing
+        // to climb), not flying (a jet already has vertical thrust; this
+        // is for bodies that would otherwise just fall), budget left, and
+        // the jump key held rather than tapped — matching the C engine's
+        // `ex_keybind_down` (continuous), not `_pressed` (edge).
+        if car.on_ground {
+            car.climb_budget = 4.0; // full refill on landing, not regeneration
+        }
+        car.climbing *= (-8.0 * dt).exp(); // decays once you stop climbing
+        if car.robot && !car.flight && !car.on_ground && car.climb_budget > 0.0 && c.jump_held {
+            let fwd = car.forward();
+            let dir_h = Vec2::new(fwd.x, fwd.z).normalize_or(Vec2::ZERO);
+            if dir_h.length_squared() > 1e-6 {
+                if let Some(wtop) = world.wall_ahead(car.pos, dir_h, 0.5, 3.0) {
+                    // grip: 0.80 on the loosest surface this engine tracks
+                    // up to 1.0 on solid footing -- same shape as the C
+                    // engine's ice-vs-metal grip term, but this world has
+                    // no per-surface friction sample at an arbitrary wall
+                    // point the way the ground query does, so it's a flat
+                    // 1.0 here rather than a guessed substitute.
+                    let grip = 1.0;
+                    if car.pos.y > wtop - 0.55 {
+                        // MANTLE: the crest is within reach -- vault up and
+                        // forward over the lip rather than hugging the face,
+                        // which is what leaves a body stuck at the top,
+                        // never mounting.
+                        car.vel.y = 7.0;
+                        car.vel.x = fwd.x * 8.5;
+                        car.vel.z = fwd.z * 8.5;
+                        ev.mantled = true;
+                    } else {
+                        car.vel.y = 8.8 * grip;
+                        car.vel.x = car.vel.x * 0.4 + fwd.x * 2.2;
+                        car.vel.z = car.vel.z * 0.4 + fwd.z * 2.2;
+                        car.climbing = 1.0;
+                        ev.climbing = true;
+                    }
+                    car.climb_budget -= dt;
+                }
+            }
         }
 
         // ---- ROBOT: the flip becomes a thruster-fed second jump ----------
@@ -2577,6 +2657,56 @@ mod reset_tests {
             step_car_only(&mut bot, &ball, &world, &not_aiming, &cfg, 1.0 / 120.0);
         }
         assert!(bot.weapon_pop < 0.1, "did not decay back toward retracted: {}", bot.weapon_pop);
+    }
+
+    #[test]
+    fn a_robot_holding_jump_at_a_climbable_wall_climbs_it() {
+        // real, solid geometry (a short parked ship, same fixture shape
+        // world::wall_ahead_tests uses), not a synthetic SDF -- this
+        // drives the actual step_car_only() loop the shell calls.
+        let mut world = World::generate(7, crate::world::style(0), 0.19, 1.0);
+        let a = crate::aboard::Aboard::new(6.0);
+        let origin = Vec3::new(0.0, crate::aboard::ground_lift(&a.ship), 0.0);
+        world.park(origin, a.ship.clone());
+        let half = a.ship.hull_half;
+
+        let cfg = Config::default();
+        let ball = Ball::new();
+        let mut bot = bot_shaped();
+        bot.robot = true;
+        bot.flight = false;
+        bot.on_ground = false; // airborne: climbing only fires off the ground
+        bot.climb_budget = 4.0;
+        // just outside the wall, low enough to be well under the crest
+        // (mantle range is the top 0.55 m; this stays clear of it so the
+        // test exercises the CLIMB branch, not the mantle one)
+        bot.pos = origin + Vec3::new(half.x + 0.3, -half.y * 0.8, 0.0);
+        // facing -X, into the wall
+        bot.rot = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        assert!(
+            (bot.forward().x - (-1.0)).abs() < 0.01,
+            "fixture didn't face the wall: forward = {:?}",
+            bot.forward()
+        );
+
+        let climbing = Controls { jump_held: true, ..Default::default() };
+        let budget_before = bot.climb_budget;
+        let mut ever_climbed = false;
+        let mut ev_climbing_ever_fired = false;
+        for _ in 0..30 {
+            let mut scratch = StepEvents::default();
+            step_car(&mut bot, &ball, &world, &climbing, &cfg, 1.0 / 120.0, &mut scratch);
+            if bot.climbing > 0.5 {
+                ever_climbed = true;
+            }
+            if scratch.climbing {
+                ev_climbing_ever_fired = true;
+            }
+        }
+        assert!(ever_climbed, "never entered the climbing state at a real wall");
+        assert!(ev_climbing_ever_fired, "StepEvents::climbing never fired -- the toast in main.rs would never show");
+        assert!(bot.vel.y > 0.0, "climbing should push the body upward: vel.y = {}", bot.vel.y);
+        assert!(bot.climb_budget < budget_before, "climb budget did not drain");
     }
 
     #[test]

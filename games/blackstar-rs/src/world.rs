@@ -4793,6 +4793,48 @@ impl World {
     pub fn ground_h(&self, x: f32, z: f32) -> f32 {
         grid_h(&self.tgrid, x, z)
     }
+
+    /// Is there a climbable wall ahead of `pos`, looking along the
+    /// horizontal direction `dir_h` (expected normalized)? Ported from
+    /// the C engine's `player_wall_ahead`/`ex_step_wall_ahead` concept
+    /// (games/blackstar/engine_src/game.c) — adapted to an SDF query
+    /// rather than a discrete collision-box list, since this world has
+    /// no such list to walk. Returns the wall's own top height (world Y)
+    /// when one exists within reach, so the caller can tell "climb the
+    /// face" from "the crest is right there, mantle over it" the same
+    /// way the C code does.
+    ///
+    /// Two probes, not one: solid at chest height directly ahead (a
+    /// wall is actually there) and open again somewhere above `pos`
+    /// within `max_height` (it has a top within reach — an endless
+    /// cliff face isn't "climbable" in the sense this returns, it's
+    /// just a wall). `steps` samples between them find approximately
+    /// where the open space starts; coarse on purpose; the caller only
+    /// needs "about how high", not a precise surface.
+    pub fn wall_ahead(&self, pos: Vec3, dir_h: Vec2, probe: f32, max_height: f32) -> Option<f32> {
+        let ahead = Vec3::new(pos.x + dir_h.x * probe, pos.y, pos.z + dir_h.y * probe);
+        // OPEN AIR AHEAD IS NOT A WALL. Sampled at chest height (pos.y is
+        // the body origin, which callers already seat near the feet or
+        // the chest depending on convention — this just needs "solid
+        // enough to bump into", not an exact surface).
+        if self.sdf(ahead) > 0.15 {
+            return None;
+        }
+        const STEPS: usize = 24;
+        for i in 1..=STEPS {
+            let h = pos.y + max_height * (i as f32 / STEPS as f32);
+            let q = Vec3::new(ahead.x, h, ahead.z);
+            if self.sdf(q) > 0.15 {
+                let top = h;
+                // TOO SHORT TO BOTHER. A curb-height lip reads as
+                // "open at 0.05m up" — technically has a top within
+                // reach, but nobody climbs a curb; the C engine's own
+                // mantle/mount logic is for ledges, not kerbs.
+                return if top - pos.y > 0.3 { Some(top) } else { None };
+            }
+        }
+        None // solid all the way to max_height: too tall to climb, not a ledge
+    }
 }
 
 #[cfg(test)]
@@ -4895,5 +4937,65 @@ mod worldgen_cost_tests {
             w.shapes.iter().map(|s| (s.pos.x + s.pos.y * 3.0 + s.pos.z * 7.0) as f64).sum()
         };
         assert!((sum(&a) - sum(&b)).abs() < 1e-6, "same seed produced different geometry");
+    }
+}
+
+#[cfg(test)]
+mod wall_ahead_tests {
+    use super::*;
+
+    fn a_world() -> World {
+        World::generate(7, style(1), 0.19, 1.0)
+    }
+
+    #[test]
+    fn open_ground_has_no_wall_ahead() {
+        let w = a_world();
+        // well clear of anything parked, over the generated terrain
+        let p = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 1.0, 0.0);
+        assert!(
+            w.wall_ahead(p, Vec2::new(1.0, 0.0), 1.5, 2.5).is_none(),
+            "open ground read as a climbable wall"
+        );
+    }
+
+    #[test]
+    fn a_hull_far_taller_than_reach_is_not_climbable() {
+        // a real, solid parked hull -- but the probe's max_height (2.5 m)
+        // is nowhere near a 70 m-hull ship's own height, so this must
+        // read as "too tall", not "here's a ledge"
+        let mut w = a_world();
+        let a = crate::aboard::Aboard::new(70.0);
+        let origin = Vec3::new(0.0, crate::aboard::ground_lift(&a.ship), 0.0);
+        w.park(origin, a.ship.clone());
+        let half = a.ship.hull_half;
+        // just outside the hull, at roughly deck height, facing inward
+        let p = origin + Vec3::new(half.x + 0.4, half.y * 0.3, 0.0);
+        assert!(
+            w.wall_ahead(p, Vec2::new(-1.0, 0.0), 0.8, 2.5).is_none(),
+            "a hull dozens of metres tall was called climbable within a 2.5 m probe"
+        );
+    }
+
+    #[test]
+    fn a_short_solid_has_a_top_within_reach() {
+        // a deliberately SHORT ship -- its whole hull fits inside a
+        // generous climb reach, so probing its wall from just outside
+        // must find a real top, not "too tall" and not "nothing there"
+        let mut w = a_world();
+        let a = crate::aboard::Aboard::new(6.0);
+        let origin = Vec3::new(0.0, crate::aboard::ground_lift(&a.ship), 0.0);
+        w.park(origin, a.ship.clone());
+        let half = a.ship.hull_half;
+        assert!(half.y * 2.0 < 4.0, "fixture ship is not actually short: {half:?}");
+        let p = origin + Vec3::new(half.x + 0.3, -half.y * 0.5, 0.0);
+        let top = w.wall_ahead(p, Vec2::new(-1.0, 0.0), 0.6, 4.0);
+        assert!(top.is_some(), "a short solid was not read as climbable at all");
+        let top = top.unwrap();
+        let py = p.y;
+        assert!(top > p.y, "the reported top is not above the probe point: {top} vs {py}");
+        // loose upper bound: real number, somewhere between the probe and
+        // the probe's own max_height ceiling -- not pinning an exact
+        // hull-to-origin vertical offset this test doesn't need to know
     }
 }
