@@ -249,6 +249,7 @@ fn nav_here(menu: u8) -> usize {
     match menu {
         5 => 4,       // VIDEO
         8 => 1,       // STORY lives under SETUP
+        9 => 1,       // DEBUG lives under SETUP
         3 | 4 | 7 => 1, // CAR SETUP / FLIPS / MOTION live under SETUP
         _ => 1,
     }
@@ -307,6 +308,7 @@ pub fn sphere_visible(planes: &[[f32; 4]; 6], c: Vec3, r: f32) -> bool {
 
 fn menu_title(menu: u8) -> &'static str {
     match menu {
+        9 => "DEBUG",
         8 => "STORY",
         7 => "MOTION / GYRO",
         6 => "GAME MODES",
@@ -423,6 +425,22 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("EVERY BOT IS IN BALLCHASE MODE. GOOD LUCK.", Header),
             ("BACK", Back),
         ],
+        // ============ DEBUG — testing overrides, not feel ============
+        // Its own screen rather than a row inside STORY, because everything
+        // here changes what a save IS rather than how it plays, and a tester
+        // needs one place to look. Kept deliberately small: a debug menu that
+        // accumulates becomes a menu nobody reads.
+        9 => vec![
+            ("MASTER ACCESS", Header),
+            // ONE SWITCH. Every progression gate defers to
+            // `Shipboard::unrestricted`, so this opens the Wardeck, the space
+            // bridge and every destination at once — a tester who turns it on
+            // does not then hit the next gate they had not thought about.
+            // The ship itself is always parked (`repark` is unconditional), so
+            // what this unlocks is everything the ship can REACH: raids, the
+            // far worlds, and the consoles behind them.
+            ("MASTER ACCESS (ALL GATES OPEN)", Toggle { get: |c| c.story.debug_ship, set: |c, v| c.story.debug_ship = v }),
+        ],
         8 => vec![
             // THE DIALS THE FICTION EXPOSES. `--tune` has carried these since
             // they landed and the menu never did, so a knob documented as
@@ -430,11 +448,6 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             // already believing" was reachable only by hand-editing a save.
             // Describing something as a menu setting does not put it in a menu.
             ("WHAT YOU ALREADY BELIEVE", Header),
-            // THE MASTER SHIP. Named for what it does rather than "debug",
-            // because a tester reads the row and has to know what turning it
-            // on means: every progression gate stops applying, and the save
-            // is no longer a normal one.
-            ("MASTER SHIP (JUMP ANYWHERE)", Toggle { get: |c| c.story.debug_ship, set: |c, v| c.story.debug_ship = v }),
             ("MYSTERY ANCHOR", Slider { get: |c| c.story.anchor, set: |c, v| c.story.anchor = v, min: 0.0, max: 1.0, step: 0.05, def: 0.45, fmt: 0 }),
             ("CAMPAIGN (0 PRESENT / 1 ARCHIVE)", Slider { get: |c| c.story.era, set: |c, v| c.story.era = v, min: 0.0, max: 1.0, step: 1.0, def: 0.0, fmt: 1 }),
             ("HOW THE MAP FIRMS UP", Header),
@@ -469,6 +482,7 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("FLIPS", Link(4)),
             ("VIDEO", Link(5)),
             ("STORY", Link(8)),
+            ("DEBUG", Link(9)),
             ("BACK", Back),
         ],
     }
@@ -8790,7 +8804,11 @@ mod tweak_reach_tests {
         // a menu nothing links to is a page nobody can open; the STORY menu
         // was one keystroke from being exactly that
         let reach = reachable_menus();
-        for m in 1u8..=8 {
+        // 1..=9, not 1..=8. The bound was a literal and adding DEBUG as menu
+        // 9 left it silently unchecked — a reachability test that stops one
+        // short of the newest menu is exactly the menu most likely to be
+        // unreachable, because it is the one just added.
+        for m in 1u8..=9 {
             assert!(
                 reach.contains(&m),
                 "settings menu {m} ({}) cannot be reached from the root",
