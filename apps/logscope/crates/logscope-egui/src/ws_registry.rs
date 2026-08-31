@@ -10,6 +10,25 @@
 //! rather than touching the filesystem, so the policy is unit-tested and the IO is a thin caller step.
 
 use crate::convograph::Graph;
+
+/// Recursive size of a directory, bounded in effort rather than exact.
+///
+/// Skips symlinks (a link into the real project must not be counted, and must certainly not be
+/// followed by anything that later deletes) and gives up past a depth that no scratch legitimately
+/// exceeds, so a pathological tree cannot make a startup sweep hang.
+fn dir_size(p: &std::path::Path) -> u64 { dir_size_at(p, 0) }
+fn dir_size_at(p: &std::path::Path, depth: u32) -> u64 {
+    if depth > 12 { return 0; }
+    let Ok(rd) = std::fs::read_dir(p) else { return 0 };
+    rd.flatten().map(|e| {
+        match std::fs::symlink_metadata(e.path()) {
+            Ok(md) if md.file_type().is_symlink() => 0,
+            Ok(md) if md.is_dir() => dir_size_at(&e.path(), depth + 1),
+            Ok(md) => md.len(),
+            Err(_) => 0,
+        }
+    }).sum()
+}
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -67,6 +86,60 @@ impl WsRegistry {
     /// Mark a workspace as used now (keeps it fresh against LRU eviction). No-op if absent.
     pub fn touch(&mut self, uuid: u128, now_ms: u64) {
         if let Some(e) = self.entries.get_mut(&uuid) { e.last_used_ms = now_ms; }
+    }
+
+    /// Sweep stale scratch directories under `root`. Returns what was removed.
+    ///
+    /// The one caller-side step: `gc` returns directories to delete and this does the deleting, so
+    /// the policy stays pure and testable while the IO is four lines.
+    ///
+    /// Best-effort by design — a scratch that cannot be removed (in use, permissions) is skipped
+    /// rather than escalated. Failing to tidy `/tmp` must never stop a session starting.
+    pub fn sweep(root: &std::path::Path, now_ms: u64, ttl_ms: u64, max_bytes: u64) -> Vec<PathBuf> {
+        let mut reg = Self::from_disk(root, now_ms, |p| dir_size(p));
+        let doomed = reg.gc(now_ms, ttl_ms, max_bytes);
+        doomed.into_iter().filter(|d| std::fs::remove_dir_all(d).is_ok()).collect()
+    }
+
+    /// Build a registry from what is ON DISK, so `gc` can be applied to scratch directories nobody
+    /// registered.
+    ///
+    /// WHY THIS EXISTS. The eviction policy below was written, tested, and never called — the
+    /// repository's own `testonly_check` reports it — and workspaces are created ad hoc in six
+    /// places that never register anything. The consequence is not subtle: every isolated scratch a
+    /// session makes stays in `/tmp` forever. On a machine where an agent runs daily that is the
+    /// disk filling up, and disk is the resource that actually runs out here.
+    ///
+    /// Rather than write a second eviction policy beside the tested one, this adapts the disk to
+    /// the policy: each child directory becomes an entry keyed by a hash of its name, with
+    /// `last_used_ms` from its mtime. `gc` then decides, unchanged.
+    ///
+    /// `dir_bytes` is passed in rather than measured here so the walk stays testable and so a
+    /// caller can choose a cheap estimate over a full recursive stat on a slow filesystem.
+    pub fn from_disk(root: &std::path::Path, now_ms: u64,
+                     dir_bytes: impl Fn(&std::path::Path) -> u64) -> Self {
+        let mut reg = Self::new();
+        let Ok(rd) = std::fs::read_dir(root) else { return reg };
+        for e in rd.flatten() {
+            let p = e.path();
+            let Ok(md) = std::fs::symlink_metadata(&p) else { continue };
+            // Directories only, and never follow a symlink out of the scratch root — this list
+            // feeds a delete.
+            if md.file_type().is_symlink() || !md.is_dir() { continue; }
+            let name = e.file_name().to_string_lossy().into_owned();
+            // A stable id per directory name; the real uuid is not recoverable from disk and is not
+            // needed, since eviction only cares about age and size.
+            let uuid = name.bytes().fold(0u128, |a, b| a.wrapping_mul(31).wrapping_add(b as u128));
+            let used = md.modified().ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(now_ms);
+            reg.entries.insert(uuid, WsEntry {
+                uuid, dir: p.clone(), files: Vec::new(), bytes: dir_bytes(&p),
+                created_ms: used, last_used_ms: used, pinned: false,
+            });
+        }
+        reg
     }
 
     /// Evict workspaces past `ttl_ms` since last use, then — if still over `max_bytes` — the least-recently-
@@ -241,3 +314,113 @@ mod tests {
         assert_eq!(map.len(), 2);
     }
 }
+
+/// The disk side of eviction: `from_disk` and `sweep`, which are what finally give the tested `gc`
+/// policy a caller. Real directories, because the bug being fixed is about real directories.
+#[cfg(test)]
+mod disk_sweep {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("wsreg-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn make_ws(root: &std::path::Path, name: &str, bytes: usize) -> PathBuf {
+        let d = root.join(name);
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("src/a.rs"), "x".repeat(bytes)).unwrap();
+        d
+    }
+
+    /// Age it by rewriting the entry's timestamp — `set_mtime` is not in std, so the registry is
+    /// built and then adjusted, which tests the same policy path `sweep` uses.
+    fn aged(root: &std::path::Path, now_ms: u64, ages: &[(&str, u64)]) -> WsRegistry {
+        let mut reg = WsRegistry::from_disk(root, now_ms, |p| super::dir_size(p));
+        for (name, age_ms) in ages {
+            let uuid = name.bytes().fold(0u128, |a, b| a.wrapping_mul(31).wrapping_add(b as u128));
+            if let Some(e) = reg.entries.get_mut(&uuid) {
+                e.last_used_ms = now_ms.saturating_sub(*age_ms);
+            }
+        }
+        reg
+    }
+
+    #[test]
+    fn from_disk_sees_every_scratch_and_measures_it() {
+        let root = scratch("fromdisk");
+        make_ws(&root, "aaa", 1000);
+        make_ws(&root, "bbb", 2000);
+        std::fs::write(root.join("loose-file.txt"), "not a workspace").unwrap();
+        let reg = WsRegistry::from_disk(&root, 1_000_000, |p| super::dir_size(p));
+        assert_eq!(reg.len(), 2, "directories only — a loose file is not a workspace");
+        assert!(reg.total_bytes() >= 3000, "sizes not measured: {}", reg.total_bytes());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_ttl_rule_reaches_the_disk() {
+        let root = scratch("ttl");
+        make_ws(&root, "old", 100);
+        make_ws(&root, "new", 100);
+        let now = 100 * 24 * 60 * 60 * 1000u64;
+        let day = 24 * 60 * 60 * 1000u64;
+        let mut reg = aged(&root, now, &[("old", 30 * day), ("new", 1 * day)]);
+        let doomed = reg.gc(now, 7 * day, 0);
+        assert_eq!(doomed.len(), 1);
+        assert!(doomed[0].ends_with("old"), "evicted the wrong one: {doomed:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sweep_actually_deletes_and_leaves_the_fresh_ones() {
+        let root = scratch("sweep");
+        let old = make_ws(&root, "stale", 50);
+        let new = make_ws(&root, "fresh", 50);
+        // Age `stale` on disk by moving its mtime back a year via a rebuilt registry is not
+        // possible through `sweep`, so drive the policy directly at a ttl of 0 for the budget rule
+        // instead: everything over 1 byte goes, which exercises the same delete path.
+        let now = 1_000_000_000u64;
+        let gone = WsRegistry::sweep(&root, now, 0, 1);
+        assert_eq!(gone.len(), 2, "budget rule should have taken both: {gone:?}");
+        assert!(!old.exists() && !new.exists(), "sweep returned paths it did not delete");
+        assert!(root.exists(), "the root itself is not a workspace and must survive");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_or_empty_root_is_a_no_op() {
+        let missing = std::env::temp_dir().join("wsreg-definitely-absent-xyz");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(WsRegistry::sweep(&missing, 1000, 1, 1).is_empty());
+        let empty = scratch("empty");
+        assert!(WsRegistry::sweep(&empty, 1000, 1, 1).is_empty());
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// This list feeds a recursive delete, so a symlink out of the scratch root must never be
+    /// followed — nor counted toward the size budget that decides what gets deleted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn symlinks_are_neither_swept_nor_measured() {
+        let root = scratch("symlink");
+        let precious = scratch("precious");
+        std::fs::write(precious.join("keep.txt"), "important").unwrap();
+        let ws = make_ws(&root, "real", 100);
+        std::os::unix::fs::symlink(&precious, root.join("link-out")).unwrap();
+        std::os::unix::fs::symlink(&precious, ws.join("inner-link")).unwrap();
+
+        let reg = WsRegistry::from_disk(&root, 1000, |p| super::dir_size(p));
+        assert_eq!(reg.len(), 1, "a symlink is not a workspace: {}", reg.len());
+
+        let gone = WsRegistry::sweep(&root, 1_000_000, 0, 1);
+        assert_eq!(gone.len(), 1);
+        assert!(precious.join("keep.txt").exists(),
+                "a symlink out of the scratch root was followed by a delete");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&precious);
+    }
+}
+

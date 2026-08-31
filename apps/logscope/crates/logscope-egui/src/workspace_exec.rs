@@ -1015,11 +1015,6 @@ pub fn resolve_check_roots_capped<'a>(root: &Path, touched: impl IntoIterator<It
     (kept, dropped)
 }
 
-/// `resolve_check_roots_capped` at the default cap of 3, keeping only the roots.
-pub fn resolve_check_roots<'a>(root: &Path, touched: impl IntoIterator<Item = &'a str>) -> Vec<String> {
-    resolve_check_roots_capped(root, touched, 3).0
-}
-
 fn truncate(s: &mut String, cap: usize) {
     if s.len() > cap {
         s.truncate(cap);
@@ -4385,17 +4380,17 @@ mod long_horizon_tests {
         std::fs::write(d.join("apps/one/Cargo.toml"), "[package]\n").unwrap();
         std::fs::write(d.join("apps/two/Cargo.toml"), "[package]\n").unwrap();
         // monorepo shape: NO root Cargo.toml
-        assert_eq!(resolve_check_roots(&d, ["apps/one/src/lib.rs"]), vec!["apps/one".to_string()]);
+        assert_eq!(resolve_check_roots_capped(&d, ["apps/one/src/lib.rs"], 3).0, vec!["apps/one".to_string()]);
         assert_eq!(
-            resolve_check_roots(&d, ["apps/one/src/lib.rs", "apps/one/src/x.rs", "apps/two/src/lib.rs"]),
+            resolve_check_roots_capped(&d, ["apps/one/src/lib.rs", "apps/one/src/x.rs", "apps/two/src/lib.rs"], 3).0,
             vec!["apps/one".to_string(), "apps/two".to_string()],
             "deduped, one root per touched crate"
         );
         // a touched file under no Cargo root falls back to the workspace root — today's behavior
-        assert_eq!(resolve_check_roots(&d, ["README.md"]), vec![String::new()]);
+        assert_eq!(resolve_check_roots_capped(&d, ["README.md"], 3).0, vec![String::new()]);
         // single-crate shape: the resolution is the root itself
         std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
-        assert_eq!(resolve_check_roots(&d, ["src/lib.rs"]), vec![String::new()]);
+        assert_eq!(resolve_check_roots_capped(&d, ["src/lib.rs"], 3).0, vec![String::new()]);
         let _ = std::fs::remove_dir_all(&d);
     }
 
