@@ -13,6 +13,18 @@
 # them, so the signal is real and unreadable, and one more changes nothing
 # anybody notices.
 #
+# SEE ALSO, AND USE IT FIRST: `maintenance/tools/unhosted_check.py`, which
+# predates this script and which I failed to look for before writing it. It
+# answers the more valuable question — which whole MODULES nothing calls —
+# and on this crate reports 20 uncalled and 23 subcommand-only, naming four
+# modules added in the same session that produced this file. A crate with
+# green tests and no call site reads as finished; that is the expensive case
+# and unhosted_check is what finds it.
+#
+# What this adds is the ratchet, not the report: a per-file count that FAILS
+# when it grows. Different question, kept because the failing-on-growth part
+# caught its own author three times.
+#
 # So this does not try to fix the 330. It RATCHETS them: per-file counts
 # against a committed baseline, failing only when a file gets worse. Adding
 # dead code becomes a visible act; removing it is rewarded with a smaller

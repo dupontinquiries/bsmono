@@ -130,6 +130,30 @@ environment the artifact does not ship*.
   330 were real and unreadable, so one more changed nothing anybody
   noticed.
 
+- **C13-1d — `tools/deadweight` PARTLY DUPLICATES A TOOL THAT WAS
+  ALREADY HERE, and I did not look.** `maintenance/tools/unhosted_check.py`
+  predates this session and does the same job better at the granularity
+  that matters. Its own docstring names the exact defect and the exact
+  offenders:
+
+  > Four independent sessions in one week shipped the same defect: logic
+  > that was written, tested, and never reached from the running program.
+  > … blackstar-rs: helmai and holomap, reachable only as CLI subcommands
+
+  Run it: `python3 maintenance/tools/unhosted_check.py games/blackstar-rs`.
+  It reports **20 uncalled modules, 23 subcommand-only**, and names four
+  of mine directly — `combo`, `footing`, `settlement`, `stance`, each
+  `[tested]`. That is C13-1c confirmed by something I did not write.
+
+  **Use `unhosted_check` first.** It answers "which whole modules does
+  nothing call", which is the expensive case — a crate with green tests
+  and no call site reads as finished in every summary anyone writes.
+  `tools/deadweight` answers a narrower question, "did any file get more
+  unreached SYMBOLS than last time", and its value is that it is a
+  ratchet rather than a report: it fired on its own author three times
+  in one session, including on a test-only constant I had shipped in the
+  binary. Keep both, reach for the Python one first.
+
 - **C13-1c — I MADE THIS WORSE, MEASURABLY.** The four largest
   dead-code files in the tree are all modules added in this session:
   `saga.rs` 25, `settlement.rs` 16, `swing.rs` 11, `combo.rs` 11 — 63
