@@ -124,8 +124,24 @@ const UNCHECKABLE: &[&str] = &[
     "improved", "properly", "correctly", "as appropriate", "makes sense",
 ];
 
+/// The tool names the workspace runtime actually honours.
+///
+/// Duplicated here rather than imported because the dependency runs the other way — `logscope-egui`
+/// depends on this crate, not the reverse — so the list cannot be shared by reference. It is kept
+/// honest by `logscope_egui::workspace_exec`'s parity test, which fails if the two ever disagree;
+/// a copy with a test beating on it is better than an inverted dependency for nine strings.
+///
+/// Before this existed, the ONLY list `validate` was ever called with was a test constant reading
+/// `["read_file","read_range","list","log","edit","run_tests"]`. Three of those are not tools —
+/// the runtime has `list_dir`, `git_log` and `run` — so a worker spec naming the real tools was
+/// rejected as UnknownTool while one naming imaginary tools validated clean.
+pub const RUNTIME_TOOLS: &[&str] = &[
+    "write_file", "edit", "read_file", "read_range", "list_dir", "search", "run", "git_log", "doc",
+];
+
 impl WorkerSpec {
-    /// Check a spec against the runtime that would run it.
+    /// Check a spec against the runtime that would run it. Pass [`RUNTIME_TOOLS`] unless you are
+    /// deliberately validating against a restricted surface.
     pub fn validate(&self, known_tools: &[&str]) -> Result<(), SpecError> {
         if self.name.trim().is_empty() { return Err(SpecError::MissingField("name")); }
         let ok_name = self.name.len() >= 2 && self.name.len() <= 40
@@ -311,7 +327,9 @@ fn lower_first(s: &str) -> String {
 mod tests {
     use super::*;
 
-    const TOOLS: &[&str] = &["read_file", "read_range", "list", "log", "edit", "run_tests"];
+    // The real runtime list, not an invented one — see RUNTIME_TOOLS' note on what the invented
+    // one was doing to every spec that named a tool the runtime actually has.
+    const TOOLS: &[&str] = RUNTIME_TOOLS;
 
     fn spec_text() -> &'static str {
         "\
@@ -325,7 +343,7 @@ Context:
 Tools:
 - read_file
 - edit
-- run_tests
+- run
 Constraints:
 - do not change the rendering backend
 - preserve the existing public API
@@ -342,7 +360,7 @@ Persistence: persistent
         assert_eq!(s.name, "rust-ratatui-coder");
         assert_eq!(s.owns, vec!["crates/ui/src/render.rs"]);
         assert_eq!(s.context.len(), 2);
-        assert_eq!(s.tools, vec!["read_file", "edit", "run_tests"]);
+        assert_eq!(s.tools, vec!["read_file", "edit", "run"]);
         assert_eq!(s.constraints.len(), 2);
         assert_eq!(s.success.len(), 2);
         assert_eq!(s.persistence, Persistence::Persistent);
@@ -354,8 +372,8 @@ Persistence: persistent
     #[test]
     fn inline_lists_are_accepted() {
         let s = WorkerSpec::parse(
-            "Name: a-b\nPurpose: Do one thing.\nTools: read_file, list\nSuccess: tests pass\n").unwrap();
-        assert_eq!(s.tools, vec!["read_file", "list"]);
+            "Name: a-b\nPurpose: Do one thing.\nTools: read_file, list_dir\nSuccess: tests pass\n").unwrap();
+        assert_eq!(s.tools, vec!["read_file", "list_dir"]);
         assert_eq!(s.success, vec!["tests pass"]);
     }
 

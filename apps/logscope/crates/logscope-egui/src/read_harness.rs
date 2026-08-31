@@ -575,9 +575,19 @@ pub fn read_git_log(root: &std::path::Path, n: usize) -> Vec<Commit> {
 /// passed after `--`, so a file named like a flag (or like an option
 /// injection: `--upload-pack=…`) is a pathspec and nothing else.
 pub fn read_git_log_path(root: &std::path::Path, n: usize, path: &str) -> Vec<Commit> {
+    read_git_log_ref(root, n, path, "HEAD")
+}
+
+/// The same reader against an arbitrary REF rather than HEAD.
+///
+/// This is what makes gitmind's history readable: a gitmind checkpoint timeline is not a separate
+/// database, it is `refs/checkpoints/<session>` — ordinary git refs holding snapshot commits. So
+/// "read the gitmind history" needs no gitmind dependency and no second parser, only the ability to
+/// point this at a ref. See `Workspace::gitmind_sessions`.
+pub fn read_git_log_ref(root: &std::path::Path, n: usize, path: &str, git_ref: &str) -> Vec<Commit> {
     let root_s = root.display().to_string();
     let n_s = n.to_string();
-    let mut args: Vec<&str> = vec!["-C", &root_s, "log", GIT_LOG_FORMAT, "-n", &n_s];
+    let mut args: Vec<&str> = vec!["-C", &root_s, "log", GIT_LOG_FORMAT, "-n", &n_s, git_ref];
     if !path.trim().is_empty() {
         args.push("--");
         args.push(path);

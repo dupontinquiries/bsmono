@@ -70,7 +70,39 @@ pub enum Tool {
     Doc { name: String, content: String },
 }
 
+/// Every tool name the runtime actually honours, canonical.
+///
+/// There are three places that must agree on this list — the `Tool` enum (what `apply` executes),
+/// the system prompt's menu (what a model is told it may call), and `queen::WorkerSpec::validate`'s
+/// whitelist (what a generated worker is permitted). They had drifted apart in both directions:
+/// `git_log` was implemented, budgeted through read_harness, and MISSING from the prompt, so no
+/// model was ever told it existed; meanwhile the only tool-name list the queen validated against
+/// was a test constant reading `["read_file","read_range","list","log","edit","run_tests"]` — three
+/// of which are not tools (`list_dir`, `git_log`, `run` are), so a worker spec naming real tools was
+/// REJECTED and one naming imaginary tools passed.
+///
+/// One list, and a test that fails if the enum grows a variant that is not in it.
+pub const RUNTIME_TOOLS: &[&str] = &[
+    "write_file", "edit", "read_file", "read_range", "list_dir", "search", "run", "git_log", "doc",
+];
+
 impl Tool {
+    /// The wire name of this tool — the string a model puts in `"tool"`. Exhaustive over the enum,
+    /// so a new variant cannot be added without deciding its name here.
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            Tool::WriteFile { .. } => "write_file",
+            Tool::ReadFile { .. } => "read_file",
+            Tool::ListDir { .. } => "list_dir",
+            Tool::Run { .. } => "run",
+            Tool::Search { .. } => "search",
+            Tool::ReadRange { .. } => "read_range",
+            Tool::GitLog { .. } => "git_log",
+            Tool::Edit { .. } => "edit",
+            Tool::Doc { .. } => "doc",
+        }
+    }
+
     /// A one-line human summary for the transcript / activity HUD.
     pub fn summary(&self) -> String {
         match self {
@@ -589,21 +621,65 @@ to continue from line {})", self.max_output, lines + 1)
     /// Commit history as a fenced, budgeted evidence block. The class comes
     /// from the run's configured model label, so the same tool gives a 1B
     /// eight subjects and a large model eighty with bodies.
+    /// The gitmind checkpoint sessions present in this repo, newest ref first.
+    ///
+    /// A gitmind timeline is not a separate database — it is `refs/checkpoints/<session>`, ordinary
+    /// git refs holding snapshot commits (see gitmind-core's CheckpointEngine, which writes them
+    /// with plain porcelain). So reading gitmind history costs a `for-each-ref` and no dependency
+    /// on gitmind at all.
+    pub fn gitmind_sessions(&self) -> Vec<String> {
+        let out = Command::new("git")
+            .args(["-C", &self.root.display().to_string(), "for-each-ref",
+                   "--format=%(refname)", "--sort=-committerdate", "refs/checkpoints/"])
+            .stdin(Stdio::null()).output();
+        match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines().map(str::to_string).filter(|l| !l.is_empty()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
     fn git_log(&self, n: usize, path: &str) -> ToolResult {
         let b = crate::read_harness::budget(
             crate::read_harness::ModelClass::resolve(self.model_params, &self.model_label));
         let want = n.min(b.git_entries).max(1);
         let commits = crate::read_harness::read_git_log_path(&self.root, want, path);
-        if commits.is_empty() {
+
+        // GITMIND HISTORY, alongside git's. On a `.gitmind` project the checkpoint timeline is a
+        // second, finer-grained record of what this repository has been doing — often the more
+        // useful one, because a checkpoint is a working state rather than a curated commit. It is
+        // appended rather than merged: the two have different meanings and collapsing them into one
+        // list would let a model cite a mid-session snapshot as if it were released history.
+        let mut gm = String::new();
+        let sessions = self.gitmind_sessions();
+        if !sessions.is_empty() {
+            // A fraction of the entry budget: this is context on top of the git history above, and
+            // the checkpoint labels are short.
+            let per = (b.git_entries / 4).max(3);
+            for r in sessions.iter().take(3) {
+                let cps = crate::read_harness::read_git_log_ref(&self.root, per, path, r);
+                if cps.is_empty() { continue; }
+                let name = r.rsplit('/').next().unwrap_or(r);
+                gm.push_str(&crate::read_harness::git_history_block(
+                    &cps, &b, &format!("{} @ gitmind checkpoints/{name}", self.root.display())));
+            }
+        }
+
+        if commits.is_empty() && gm.is_empty() {
             return ToolResult::err(if path.is_empty() {
                 "no git history here (not a worktree, or git is unavailable)".to_string()
             } else {
                 format!("no history for {path} (unknown path, or not a worktree)")
             });
         }
-        let prov = if path.is_empty() { format!("{} @ HEAD", self.root.display()) }
-                   else { format!("{} @ HEAD -- {path}", self.root.display()) };
-        ToolResult::ok(crate::read_harness::git_history_block(&commits, &b, &prov))
+        let mut out = String::new();
+        if !commits.is_empty() {
+            let prov = if path.is_empty() { format!("{} @ HEAD", self.root.display()) }
+                       else { format!("{} @ HEAD -- {path}", self.root.display()) };
+            out.push_str(&crate::read_harness::git_history_block(&commits, &b, &prov));
+        }
+        out.push_str(&gm);
+        ToolResult::ok(out)
     }
 
     fn list_dir(&self, rel: &str) -> ToolResult {
@@ -1729,6 +1805,7 @@ Available tools (one JSON object per block):
 {read_tools}
 - list_dir    {{ \"tool\":\"list_dir\", \"path\":\"<rel path or empty for root>\" }}
 - run         {{ \"tool\":\"run\", \"argv\":[\"cargo\",\"test\"] }}
+- git_log     {{ \"tool\":\"git_log\", \"n\":<count>, \"path\":\"<rel path or empty>\" }}  (what this repo RECENTLY DID — see below)
 - doc         {{ \"tool\":\"doc\", \"name\":\"survey\", \"content\":\"<markdown>\" }}  (SHARED crew doc — every worker's next prompt includes it)
 
 THE CODE IS RIGHT THERE — LOOK AT IT. This workspace is a real repository (overview below). Every
@@ -1741,6 +1818,15 @@ turns are reconnaissance — list_dir, read the README / Cargo.toml, search the 
 and once you understand the lay of the land, write a `doc` named \"survey\" (module map, where the
 task's concepts live, the pattern to follow) so later workers inherit what you learned instead of
 re-crawling. Then make the change, and let the automatic verification tell you if it compiles.
+
+HISTORY IS EVIDENCE A FILE READ CANNOT GIVE YOU. `git_log` answers questions the current source
+cannot: why a field exists, which change broke something, what convention this module follows, and
+whether the odd thing you are about to change was deliberate. Scope it with `path` to ask about one file
+({{ \"tool\":\"git_log\", \"n\":10, \"path\":\"src/lib.rs\" }}) — that is far cheaper and far more pointed
+than reading the whole file's history. Reach for it BEFORE changing code you did not write, and
+before concluding that something odd is a mistake. On a `.gitmind` project the same call also returns
+the CHECKPOINT timeline — mid-session working states, finer-grained than commits — reported
+separately, because a checkpoint is a moment someone saved, not a change anyone committed to.
 
 LIBRARY SOURCE IS READABLE TOO — the same read tools accept two READ-ONLY virtual roots:
   ~deps/<crate>/…   a dependency's source exactly as cargo fetched it (list_dir {{ \"path\":\"~deps\" }} lists them)
@@ -4534,6 +4620,115 @@ mod long_horizon_tests {
         let (_stop, _run) = drive(&d, "tidy lib.rs", cfg, &script);
         assert_eq!(std::fs::read_to_string(d.join("src/lib.rs")).unwrap(), real,
                    "the always-green checker would have blessed the truncation; the write guard is what stopped it");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    // ── the tool surface: prompt, runtime and worker whitelist must name the same tools ──────────
+
+    #[test]
+    fn every_runtime_tool_is_named_in_the_canonical_list() {
+        // One instance of each variant. Exhaustive by construction: `wire_name` matches on the enum,
+        // so a new variant forces a name, and this asserts the name reached RUNTIME_TOOLS.
+        let all = [
+            Tool::WriteFile { path: "p".into(), contents: String::new() },
+            Tool::ReadFile { path: "p".into() },
+            Tool::ListDir { path: String::new() },
+            Tool::Run { argv: vec!["true".into()] },
+            Tool::Search { pattern: "x".into(), path: String::new() },
+            Tool::ReadRange { path: "p".into(), start: 1, end: 2 },
+            Tool::GitLog { n: 1, path: String::new() },
+            Tool::Edit { path: "p".into(), find: "a".into(), replace: "b".into() },
+            Tool::Doc { name: "d".into(), content: String::new() },
+        ];
+        for t in &all {
+            assert!(RUNTIME_TOOLS.contains(&t.wire_name()),
+                    "{} is executable but not in RUNTIME_TOOLS", t.wire_name());
+        }
+        assert_eq!(all.len(), RUNTIME_TOOLS.len(), "RUNTIME_TOOLS names a tool the runtime does not have");
+    }
+
+    /// The bug this catches: a tool that is implemented and never taught. `git_log` was exactly that
+    /// — executable, budgeted, and absent from the menu, so no model could call it.
+    #[test]
+    fn every_runtime_tool_is_taught_in_the_system_prompt() {
+        let cfg = AgentConfig::default();
+        let p = system_prompt("do a thing", &cfg);
+        for t in RUNTIME_TOOLS {
+            assert!(p.contains(&format!("\"tool\":\"{t}\"")) || p.contains(&format!("\"tool\": \"{t}\"")),
+                    "the prompt never tells the model that `{t}` exists");
+        }
+        // And the worker preset teaches them too — a worker that is not told about a tool is a
+        // worker that will ask the user instead of using it.
+        let w = system_prompt("do a thing", &AgentConfig::worker());
+        for t in RUNTIME_TOOLS {
+            assert!(w.contains(&format!("\"tool\":\"{t}\"")) || w.contains(&format!("\"tool\": \"{t}\"")),
+                    "the WORKER prompt never tells the model that `{t}` exists");
+        }
+    }
+
+    /// The worker whitelist lives in logscope-fan (the dependency runs that way), so the two lists
+    /// are copies. This is what stops them drifting — and drift here is not cosmetic: a mismatch
+    /// means a generated worker is either denied a tool the runtime has, or granted one it does not.
+    #[test]
+    fn the_worker_whitelist_names_exactly_the_runtime_tools() {
+        assert_eq!(RUNTIME_TOOLS, logscope_fan::queen::RUNTIME_TOOLS,
+                   "workspace_exec and queen disagree about what tools exist");
+    }
+
+    #[test]
+    fn the_prompt_says_what_history_is_for_not_just_that_it_exists() {
+        let p = system_prompt("t", &AgentConfig::default());
+        assert!(p.contains("HISTORY IS EVIDENCE"), "history needs a reason, or it goes unused");
+        assert!(p.contains("checkpoint"), "gitmind's timeline is part of the pathway now");
+    }
+
+    /// gitmind's checkpoint timeline is `refs/checkpoints/<session>` — ordinary refs — so the agent
+    /// can read it with the same tool and no gitmind dependency.
+    #[test]
+    fn git_log_reports_gitmind_checkpoints_alongside_commits() {
+        let d = tmp("gmhist");
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git").args(args).current_dir(&d).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(d.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "a real commit"]);
+        // a checkpoint ref, exactly as gitmind-core's CheckpointEngine writes them
+        std::fs::write(d.join("a.rs"), "fn a() { 1 }\n").unwrap();
+        git(&["add", "-A"]);
+        let cp = git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit-tree", "-p", "HEAD",
+                       "-m", "checkpoint: mid-session state", &git(&["write-tree"])]);
+        git(&["update-ref", "refs/checkpoints/session-one", &cp]);
+
+        let mut ws = Workspace::new(&d);
+        assert_eq!(ws.gitmind_sessions(), vec!["refs/checkpoints/session-one".to_string()]);
+        let r = ws.apply(&Tool::GitLog { n: 5, path: String::new() });
+        assert!(r.ok, "{}", r.output);
+        assert!(r.output.contains("a real commit"), "git history still reported: {}", r.output);
+        assert!(r.output.contains("checkpoint: mid-session state"), "gitmind history reported: {}", r.output);
+        assert!(r.output.contains("gitmind checkpoints/session-one"),
+                "and labelled as checkpoints, not passed off as commits: {}", r.output);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_repo_without_gitmind_reports_only_git_history() {
+        let d = tmp("nogm");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&d).output().unwrap();
+        };
+        git(&["init", "-q"]);
+        std::fs::write(d.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "only commit"]);
+        let mut ws = Workspace::new(&d);
+        assert!(ws.gitmind_sessions().is_empty());
+        let r = ws.apply(&Tool::GitLog { n: 5, path: String::new() });
+        assert!(r.ok && r.output.contains("only commit") && !r.output.contains("checkpoints/"), "{}", r.output);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
