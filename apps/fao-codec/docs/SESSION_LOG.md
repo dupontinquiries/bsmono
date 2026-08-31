@@ -5515,3 +5515,54 @@ perceptual metric: either build/obtain libvmaf, or make a deliberate
 policy decision that a fixed amount of blockiness reduction is worth a
 stated amount of PSNR, and write that trade down as a choice rather
 than discovering it as a measurement.
+
+### MS-SSIM settles the deblock question — and every adaptive rule I built LOSES to filtering uniformly
+
+libvmaf is not in this ffmpeg, so bin/msssim implements MS-SSIM (Wang,
+Simoncelli & Bovik 2003) with the published window, constants and
+five scale weights. Chosen precisely because it is not mine: inventing
+a metric to settle an argument about my own filter would be circular.
+It penalises errors that survive downsampling — which is what a step on
+a 16-pixel grid does — while discounting high-frequency noise a
+single-scale SSIM fixates on. Sanity-checked: identical input scores
+exactly 1.00000.
+
+  procedural ground        MS-SSIM
+    off (no deblock)       0.88716
+    FIXED strength 2       0.89591   <- best
+    qerr strength 2        0.89438
+    texture strength 2     0.88966
+
+  blackstar real footage   MS-SSIM
+    off                    0.98987
+    FIXED strength 2       0.99013   <- best
+    texture strength 2     0.99000
+    qerr strength 2        0.98995
+
+FIXED WINS ON BOTH CLIPS. Both adaptive rules — the texture one and the
+quantisation-error one built to replace it — are worse than simply
+filtering everything at uniform strength, and one of them (texture) is
+barely better than not filtering at all on the synthetic clip.
+
+This overturns the previous entry's reading. PSNR and SSIM had ranked
+texture FIRST on blackstar (35.681 dB / 0.97506, the best single-scale
+numbers of any setting), which is what made the split look real and
+unresolvable. At multiple scales that ranking inverts: texture's
+damping preserves exactly the grid steps that survive downsampling,
+and single-scale metrics could not see it.
+
+Two things worth carrying beyond this filter:
+  * The region-level adaptivity was NET NEGATIVE. Two plausible,
+    mechanism-backed rules both lost to a constant. Being principled
+    about where to apply effort is not the same as being right, and I
+    built the second rule (qerr) specifically to fix the first without
+    ever testing whether adaptivity itself was helping.
+  * The metric chose the outcome. Three sessions of deblock work looked
+    unresolvable under PSNR/SSIM/blockiness and resolved cleanly in one
+    measurement under a metric matched to the artifact. Before
+    concluding that a design question is genuinely undecidable, check
+    whether the instrument is.
+
+Default is now FAO_DEBLOCK_MODE=fixed. The adaptive modes stay
+reachable for re-testing when a perceptual metric better than MS-SSIM
+is available, but they are recorded as measured losses, not options.

@@ -1735,7 +1735,14 @@ fn deblock(f: &mut Yuv420, src_true: &Yuv420, modes: &[u8], gw: usize, gh: usize
             qerr[gy * gw + gx] = (acc / n.max(1) as f64) as f32;
         }
     }
-    let mode = std::env::var("FAO_DEBLOCK_MODE").unwrap_or_else(|_| "qerr".into());
+    // DEFAULT: fixed. MS-SSIM adjudicated the three rules and picked
+    // it on BOTH clips (ground 0.89591 vs qerr 0.89438, texture 0.88966,
+    // off 0.88716; blackstar 0.99013 vs texture 0.99000, qerr 0.98995,
+    // off 0.98987). Every adaptive rule I built was WORSE than filtering
+    // uniformly — the region-level cleverness was a net loss, and only a
+    // multi-scale metric showed it, because PSNR/SSIM had ranked texture
+    // first on blackstar.
+    let mode = std::env::var("FAO_DEBLOCK_MODE").unwrap_or_else(|_| "fixed".into());
     let region_scale = |gi: usize| -> f32 {
         match mode.as_str() {
             "fixed" => 1.0,
