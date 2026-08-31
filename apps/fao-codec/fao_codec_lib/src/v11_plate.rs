@@ -2318,11 +2318,53 @@ pub fn build_movers(
         }
     }
     let lambda = (opts.dead_zone as f64).powi(2) / 3.0;
+    // ADMISSION STRICTNESS, and why it is not 1.0 by default.
+    //
+    // Measured on the full 19-shot suite: `gain > lambda * cost` is
+    // 3.84% WORSE IN J than admitting everything, and worse on 10 of the
+    // 11 shots it changed (shot 13 +15.2%, shot 19 +14.6%). It looked
+    // like a win only because I read bytes alone — it saved 0.855 MB and
+    // paid 0.23 dB for them, which is a far worse exchange rate than the
+    // codec's own dead-zone ladder gives.
+    //
+    // The bug is an apples-to-oranges comparison, and it biases one way.
+    // A true J gain is (SSE removed) + lambda * (BYTES saved), but the
+    // benefit side above counts only the SSE term. A better predictor
+    // also shrinks the residual for every frame the mover is visible and
+    // lets its cells choose plate-mode instead of prev-mode, dropping
+    // ~2 MV bytes each — both strictly positive, both omitted. So the
+    // test systematically over-rejects, exactly as the suite showed.
+    //
+    // Estimating the omitted term properly needs a rate model the lab
+    // does not have. `strictness` is the honest stand-in: it scales the
+    // cost side to stand for the benefit the test cannot see, and it is
+    // SWEPT, not guessed. FAO_MOVER_ADMIT sets it; the default is
+    // recorded below from the sweep.
+    // DEFAULT: OFF (admit every candidate), because that is what
+    // measured best. Even strictness 0 — admit anything with positive
+    // gain against min(plate, prev) — is not neutral: it still rejects
+    // movers the previous frame already predicts, and on shot 13 that
+    // costs 15% in J (862,935 B @ 34.340 dB against the unfiltered
+    // 963,979 @ 35.267, which is a much better point on the hull). The
+    // machinery, the per-mover gain measurement and the knob all stay,
+    // because the term the test cannot see — residual and MV bytes
+    // saved — is small exactly where prediction is already good (film,
+    // where prev-MC is strong) and large where it is not (engine
+    // content with hard cuts between reused assets). This is a negative
+    // ON THIS MATERIAL, not a dead construction.
+    let strictness: Option<f64> = std::env::var("FAO_MOVER_ADMIT")
+        .ok()
+        .and_then(|v| v.parse().ok());
     let mut keep: Vec<usize> = Vec::new();
     for gi in 0..geom.len() {
         let cost = per_sprite_costs[gi] + 2 * frames.len() + 10 + (geom[gi].5.len() + 7) / 8;
-        if gain[gi] > lambda * cost as f64 {
-            keep.push(gi);
+        match strictness {
+            None => keep.push(gi),
+            Some(k) => {
+                if gain[gi] > k * lambda * cost as f64 {
+                    keep.push(gi);
+                }
+            }
         }
     }
     if std::env::var("FAO_MOVER_DEBUG").is_ok() {

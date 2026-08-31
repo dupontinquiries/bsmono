@@ -4095,3 +4095,57 @@ of its correspondences are genuinely non-affine, and it triangulates
 tracking. Parallax-bearing material is the precondition for evaluating
 the 3D path at all — the honest next step is a camera-orbit or
 engine-rendered source, not more work on the bloopers.
+
+### Per-mover RD admission: built, measured, and DEFAULTED OFF
+
+The suite said mover COUNT does not predict the win (shot 16 wins
+21.9% with 2 movers, shot 13 loses with 22), so the fixed detection
+threshold is the wrong control and the global J-guard is all-or-
+nothing: one sprite that pays for itself drags in twenty that don't.
+Built a per-candidate admission test on the same J the guard uses,
+scoped to one object — admit iff the SSE its paste removes over the
+frames it is visible exceeds lambda x (its coded bytes + 2 B/frame
+track + mask + bbox), cost taken from the per-sprite independent size
+(an upper bound on marginal cost inside the atlas).
+
+Two corrections during the build, the second fatal to the default:
+
+1. Scoring gain against the PLATE alone overstates it — the mode
+   decision already picks the best of plate and prev-MC, so a mover
+   the previous frame carries is nearly free and the sprite's gain is
+   redundant. Rescored against min(plate, prev-at-zero-MV). This is
+   what turned shots 4 and 13 from byte-losses into byte-wins.
+
+2. THE MEASUREMENT I ALMOST MIS-READ. On bytes, admission looked like
+   a clear win: 19-shot total 18.356 -> 17.501 MB, 14 wins / 2 losses
+   / 3 byte-exact ties, shot 3 -19.1%, shot 16 -20.8%. In J it is
+   3.84% WORSE, and worse on 10 of the 11 shots it changed (shot 13
+   +15.2%, shot 19 +14.6%). It bought 0.855 MB with 0.23 dB — an
+   exchange rate far below what the codec's own dead-zone ladder gives
+   (~19.6 MB/dB measured). Bytes alone is not a verdict.
+
+Mechanism of the failure, and it biases one way: a true J gain is
+(SSE removed) + lambda x (BYTES saved), and the test counts only the
+SSE term. A better predictor also shrinks the residual on every
+visible frame and lets its cells choose plate-mode over prev-mode
+(~2 MV bytes each) — both strictly positive, both omitted. The test
+therefore systematically OVER-REJECTS, exactly as measured. Even
+strictness 0 (admit anything with positive gain) is not neutral,
+because it still rejects movers prev already predicts: shot 13 at
+k=0 is 862,935 B @ 34.340 against the unfiltered 966,384 @ 35.535.
+
+DEFAULT: admission OFF (admit all). The gain measurement, the
+per-mover machinery and the FAO_MOVER_ADMIT knob stay, because the
+omitted term is small exactly where prev-MC is strong (film) and
+large where it is not (engine content, hard cuts between reused
+assets) — a negative ON THIS MATERIAL, not a dead construction.
+Estimating the omitted term needs a rate model the lab does not have;
+the alternative is guarding admission with a second full encode,
+which doubles encode time for a decision worth ~4%.
+
+Side effect kept: tracking now runs on per-sprite decodes BEFORE
+packing, which slightly improved shot 13 (963,979 @ 35.267 ->
+966,384 @ 35.535, +0.27 dB for +0.25% bytes).
+
+Suite CSVs: docs/full_v5_dz40.csv (no admission, the default) and
+docs/full_v5_admission_dz40.csv (admission on, the negative).
