@@ -5621,6 +5621,7 @@ impl Game {
             jump_pressed: false,
             jump_depth: self.axis_raw(Action::Jump).max(0.01),
             powerslide: slide_a > 0.35,
+            aiming: self.action_down(Action::Fire) || self.action_down(Action::AutoTarget),
         }
     }
 
@@ -8342,6 +8343,33 @@ impl Game {
                     base * Mat4::from_translation(p)
                         * Mat4::from_quat(*eq)
                         * Mat4::from_translation(-p)
+                }
+                _ => base,
+            };
+            // WEAPON POP-OUT (cosmetic transform-lite): telescope the
+            // barrel outward along its own root->tip axis while aiming/
+            // firing, composed innermost of all (right after elevation,
+            // before it) so it extends in the tube's own rest direction
+            // and rides along with whatever elevation/yaw is already
+            // applied to the rest of the assembly. Character expression,
+            // not a mechanical system -- no new detection, no new
+            // resource, no new keybinding; reuses the barrel this
+            // session already built for elevation and ties to the
+            // player already aiming or firing (`Car::weapon_pop`).
+            let base = match active.fittings.barrel {
+                Some(bi) if bi == pi && self.car.weapon_pop > 1e-4 => {
+                    let root = active.fittings.elevation_pivot;
+                    let reach = active.fittings.barrel_tip - root;
+                    let len = reach.length();
+                    let dir = if len > 1e-5 { reach / len } else { Vec3::NEG_Z };
+                    // extend by up to a third of the barrel's own length
+                    // -- enough to read as a real motion, not so much
+                    // the muzzle detaches from its own mount visually.
+                    // Not a number checked against how any specific
+                    // chassis' barrel should look extending, same
+                    // first-pass-guess caveat as this session's other
+                    // new magnitudes.
+                    base * Mat4::from_translation(dir * len * 0.33 * self.car.weapon_pop)
                 }
                 _ => base,
             };

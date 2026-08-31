@@ -38,6 +38,11 @@ pub struct Controls {
     pub jump_pressed: bool,
     pub jump_depth: f32, // wooting analog on the jump key: 1.0 = digital
     pub powerslide: bool,
+    /// aiming or firing -- drives the weapon pop-out cosmetic (see
+    /// `Car::weapon_pop`), not a gameplay-affecting input. Named for
+    /// what it MEANS rather than which key it came from, since two
+    /// different actions (Fire, AutoTarget) both count.
+    pub aiming: bool,
 }
 
 /// FLIGHT SUB-MODE. Proposed as "single-tap Transform cycles VTOL/hover
@@ -196,6 +201,15 @@ pub struct Car {
     /// Which siege sub-mode is active (see `TankSiegeMode`). Read only
     /// when `tracked` is true.
     pub siege_mode: TankSiegeMode,
+    /// 0..1, smoothed toward 1 while `Controls::aiming` is true and back
+    /// toward 0 otherwise (same exponential-approach shape as
+    /// `steer_vis`). Purely cosmetic -- the racer weapon pop-out
+    /// proposal, read by the draw path to extend the detected barrel
+    /// prim (if any) along its own aim axis. Works on any chassis with
+    /// a `turret::Fittings::barrel`, not just tanks -- "racer" in the
+    /// proposal's name describes the intended character-expression use
+    /// case, not a restriction enforced here.
+    pub weapon_pop: f32,
     /// WHAT THIS PARTICULAR HULL IS LIKE (`driveline`). Multipliers over
     /// the player's `CarCfg`, so tuning stays the player's and character
     /// stays the vehicle's. `Default` is all 1.0 — a chassis nobody
@@ -354,6 +368,7 @@ impl Car {
             flight_submode: FlightSubMode::default(),
             tracked: false,
             siege_mode: TankSiegeMode::default(),
+            weapon_pop: 0.0,
             hand: crate::driveline::Handling::default(),
             hand_base: crate::driveline::Handling::default(),
             lift: None,
@@ -971,6 +986,12 @@ fn crossed(ring: &crate::world::Ring, a: Vec3, b: Vec3) -> bool {
 
 // ---------------------------------------------------------------- car ----
 fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Config, dt: f32, ev: &mut StepEvents) {
+    // WEAPON POP-OUT, cosmetic only: smoothed toward `c.aiming`, same
+    // exponential-approach shape `steer_vis` uses elsewhere in this
+    // function, run unconditionally up front so it applies the same way
+    // whether the car is grounded, hovering, or flying.
+    let pop_target = if c.aiming { 1.0 } else { 0.0 };
+    car.weapon_pop += (pop_target - car.weapon_pop) * (1.0 - (-10.0 * dt).exp());
     // ---- THE CUSHION ----
     // A wheeled car is held ON the surface; a hovercar is held ABOVE it by a
     // spring along the surface normal, damped so it settles rather than
@@ -2485,6 +2506,28 @@ mod reset_tests {
                  use Car::stand_h"
             );
         }
+    }
+
+    #[test]
+    fn weapon_pop_ramps_toward_aiming_and_decays_when_not() {
+        let world = World::generate(7, crate::world::style(0), 0.19, 1.0);
+        let cfg = Config::default();
+        let ball = Ball::new();
+        let mut bot = bot_shaped();
+        bot.reset(&world);
+        assert_eq!(bot.weapon_pop, 0.0, "should start retracted");
+
+        let aiming = Controls { aiming: true, ..Default::default() };
+        for _ in 0..60 {
+            step_car_only(&mut bot, &ball, &world, &aiming, &cfg, 1.0 / 120.0);
+        }
+        assert!(bot.weapon_pop > 0.9, "did not ramp toward extended: {}", bot.weapon_pop);
+
+        let not_aiming = Controls { aiming: false, ..Default::default() };
+        for _ in 0..60 {
+            step_car_only(&mut bot, &ball, &world, &not_aiming, &cfg, 1.0 / 120.0);
+        }
+        assert!(bot.weapon_pop < 0.1, "did not decay back toward retracted: {}", bot.weapon_pop);
     }
 
     #[test]

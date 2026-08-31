@@ -62,6 +62,12 @@ pub struct Fittings {
     /// its centroid, so elevating about it pitches the muzzle and not
     /// the breech through the turret roof.
     pub elevation_pivot: Vec3,
+    /// the muzzle end — the barrel's own point farthest from
+    /// `elevation_pivot`. Exposed alongside it (rather than making a
+    /// caller re-walk the prim) for anything that needs the barrel's own
+    /// length or aim direction, not just its pivot — a pop-out/extend
+    /// effect telescoping along the tube's own axis, say.
+    pub barrel_tip: Vec3,
     /// the horizontal axis to pitch the barrel about: perpendicular to
     /// both world-up and the barrel's own root-to-tip direction, so a
     /// positive rotation about it raises the muzzle regardless of which
@@ -336,6 +342,7 @@ pub fn find(prims: &[&[Vec3]]) -> Fittings {
             let axis = aim.cross(Vec3::Y);
             out.elevation_axis = if axis.length_squared() > 1e-8 { axis.normalize() } else { Vec3::X };
             out.elevation_pivot = root;
+            out.barrel_tip = tip;
             out.barrel = Some(i);
         }
     }
@@ -431,6 +438,12 @@ mod tests {
         // the pivot is where the barrel meets the mantlet (near the
         // turret body), not out at the muzzle or buried at the ring
         assert!(f.elevation_pivot.z < 1.1, "the pivot drifted out to the muzzle: {:?}", f.elevation_pivot);
+        // and the tip is genuinely farther from the pivot than the
+        // pivot is from itself -- a real length, in the direction the
+        // barrel actually protrudes (away from the turret body, +Z here)
+        let reach = (f.barrel_tip - f.elevation_pivot).length();
+        assert!(reach > 0.5, "barrel_tip is not meaningfully far from elevation_pivot: reach={reach}");
+        assert!(f.barrel_tip.z > f.elevation_pivot.z, "the tip should be further from the hull than the pivot: {:?} vs {:?}", f.barrel_tip, f.elevation_pivot);
     }
 
     #[test]
