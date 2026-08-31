@@ -3151,15 +3151,13 @@ reply is framed differently from the turn that produced it.");
 
     /// Finalize a non-blocking agent run: snapshot the workspace, surface the outcome, clear the driver.
     fn finish_agent_run(&mut self, stop: crate::workspace_exec::Stop) {
-        let (files, plan, verified, turns, had_verifier, phase, patterns, compacted) = match self.agent_run.take() {
-            Some(r) => (r.events().to_vec(), r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect::<Vec<_>>(), r.verified(), r.turns(), r.had_verifier(), r.phase(), r.pattern_report(), r.compacted_turns()),
+        let (files, plan, plan_summary, verified, turns, had_verifier, phase, patterns, compacted) = match self.agent_run.take() {
+            Some(r) => (r.events().to_vec(), r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect::<Vec<_>>(), r.plan().summary(), r.verified(), r.turns(), r.had_verifier(), r.phase(), r.pattern_report(), r.compacted_turns()),
             None => return,
         };
         self.agent_files = files;
         self.agent_plan = plan;
         let touched = self.agent_files.len();
-        let done = self.agent_plan.iter().filter(|(_, d)| *d).count();
-        let total = self.agent_plan.len();
         let stopdesc = match &stop {
             crate::workspace_exec::Stop::Done => "done".to_string(),
             crate::workspace_exec::Stop::StepLimit => format!("hit step limit ({turns} turns)"),
@@ -3193,7 +3191,11 @@ reply is framed differently from the turn that produced it.");
         let snap_note = if snap { " · snapshotted" } else { "" };
         let phase_note = phase.map(|p| format!(" · phase: {p}")).unwrap_or_default();
         let cmp_note = match compacted { 0 => String::new(), n => format!(" · {n} turn(s) compacted") };
-        self.note = format!("agent: {stopdesc} · plan {done}/{total} · {touched} file(s){vnote}{phase_note}{cmp_note}{snap_note} · :reapply to land");
+        // "plan 3/3" used to appear after three read-only turns, because the plan advanced per turn
+        // rather than per write. The summary reports verified / pending / unverifiable apart, so a
+        // step nobody can check never reads as a step that was done.
+        let plan_note = if self.agent_plan.is_empty() { String::new() } else { format!(" · plan {plan_summary}") };
+        self.note = format!("agent: {stopdesc}{plan_note} · {touched} file(s){vnote}{phase_note}{cmp_note}{snap_note} · :reapply to land");
     }
 
     /// Launch a fan of agent branches with `cfg`, seeding goals from `task`. Shared by :fan-agent and :docs.

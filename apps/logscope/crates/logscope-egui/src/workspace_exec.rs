@@ -1070,11 +1070,14 @@ pub fn run_digest(ws: &Workspace, plan: &Plan, guide: Option<&crate::phase_guide
         s.push_str(&format!("  files written ({}): {}{}\n", paths.len(), shown.join(", "),
                             if paths.len() > shown.len() { ", …" } else { "" }));
     }
-    let (done, total) = plan.progress();
-    if total > 0 {
-        s.push_str(&format!("  plan: {done}/{total} step(s) marked done\n"));
+    if !plan.is_empty() {
+        // The honest three-way summary, not a collapsed ratio. This text goes into the model's own
+        // context as fact when turns are elided, so an unverified step must not read as a done one.
+        s.push_str(&format!("  plan: {}\n", plan.summary()));
         for st in plan.steps.iter().take(9) {
-            s.push_str(&format!("    [{}] {}\n", if st.done { "x" } else { " " }, st.text));
+            let mark = if st.done { "x" } else if st.unverifiable { "?" } else { " " };
+            let ev = st.evidence.as_deref().map(|e| format!("  (wrote {e})")).unwrap_or_default();
+            s.push_str(&format!("    [{mark}] {}{ev}\n", st.text));
         }
     }
     if let Some(g) = guide {
@@ -1215,7 +1218,17 @@ impl AgentConfig {
 /// A parsed plan step (2): the visible checklist the model commits to before acting. `done` is flipped as
 /// the run progresses so the UI can tick it off.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PlanStep { pub text: String, pub done: bool }
+pub struct PlanStep {
+    pub text: String,
+    /// Verified done: a file this step NAMES was written or edited. See `plancheck` for why this is
+    /// not "a turn happened".
+    pub done: bool,
+    /// The write that satisfied it, for the HUD and the digest — a completion nobody can point at
+    /// is the thing this replaced.
+    pub evidence: Option<String>,
+    /// Names no file, so no write can confirm it. Reported apart from pending rather than folded in.
+    pub unverifiable: bool,
+}
 
 /// The plan the model emits up front. Empty if it dove straight into tool calls.
 #[derive(Clone, Debug, Default)]
@@ -1223,8 +1236,38 @@ pub struct Plan { pub steps: Vec<PlanStep> }
 impl Plan {
     pub fn is_empty(&self) -> bool { self.steps.is_empty() }
     pub fn progress(&self) -> (usize, usize) { (self.steps.iter().filter(|s| s.done).count(), self.steps.len()) }
-    /// Mark the first not-yet-done step done (called once per completed action batch).
-    pub fn advance(&mut self) { if let Some(s) = self.steps.iter_mut().find(|s| !s.done) { s.done = true; } }
+
+    /// Re-decide every step against the paths this run has WRITTEN.
+    ///
+    /// Replaces `advance()`, which marked the next step done whenever a turn made any tool call —
+    /// so three read-only turns closed a three-step plan. Recomputed from the whole write feed
+    /// rather than accumulated, so it cannot drift: a step is done iff a write matching it exists.
+    pub fn recheck(&mut self, written: &[String]) {
+        for s in &mut self.steps {
+            match crate::plancheck::state_of(&s.text, written) {
+                crate::plancheck::StepState::Done => {
+                    s.done = true;
+                    s.unverifiable = false;
+                    if s.evidence.is_none() {
+                        s.evidence = crate::plancheck::step_targets(&s.text).into_iter()
+                            .find_map(|t| written.iter().find(|w| crate::plancheck::target_matches(&t, w)).cloned());
+                    }
+                }
+                crate::plancheck::StepState::Pending => { s.done = false; s.unverifiable = false; }
+                crate::plancheck::StepState::Unverifiable => { s.done = false; s.unverifiable = true; }
+            }
+        }
+    }
+
+    /// done / pending / unverifiable, for the HUD and the compaction digest.
+    pub fn summary(&self) -> String {
+        let states: Vec<_> = self.steps.iter().map(|s| {
+            if s.done { crate::plancheck::StepState::Done }
+            else if s.unverifiable { crate::plancheck::StepState::Unverifiable }
+            else { crate::plancheck::StepState::Pending }
+        }).collect();
+        crate::plancheck::summarize(&states)
+    }
 }
 
 /// Parse a plan from the model's turn: a fenced ```plan block, or a leading numbered/bulleted list. Each
@@ -1284,14 +1327,14 @@ pub fn parse_plan(text: &str) -> Plan {
     let steps: Vec<PlanStep> = head.lines()
         .map(|l| l.trim())
         .filter(|l| is_list_item(l))
-        .map(|l| PlanStep { text: strip_marker(l), done: false })
+        .map(|l| PlanStep { text: strip_marker(l), done: false, evidence: None, unverifiable: false })
         .collect();
     Plan { steps }
 }
 
 fn lines_to_steps(block: &str) -> Vec<PlanStep> {
     block.lines().map(|l| l.trim()).filter(|l| !l.is_empty())
-        .map(|l| PlanStep { text: strip_marker(l), done: false }).collect()
+        .map(|l| PlanStep { text: strip_marker(l), done: false, evidence: None, unverifiable: false }).collect()
 }
 /// Drop lines inside a nested fenced block.
 ///
@@ -2108,7 +2151,12 @@ call — this run cannot be marked complete until they are green.)\n"));
         }
     }
 
-    plan.advance();
+    // Plan progress from EVIDENCE: every path this run has written, matched against what each step
+    // names. Recomputed rather than advanced — see Plan::recheck.
+    {
+        let written: Vec<String> = ws.events().iter().map(|e| e.path.clone()).collect();
+        plan.recheck(&written);
+    }
 
     // Feed the phase machine what this turn OBSERVABLY did, and let it place the run. Blocked here
     // is the stall detector firing: `stall_limit` consecutive counted checks without the error count
@@ -3457,9 +3505,19 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let numbered = "1. first\n2. second\n```tool\n{...}\n```\n3. not-a-plan-step";
         let p2 = parse_plan(numbered);
         assert_eq!(p2.steps.len(), 2);
-        // plan progress
-        let mut p3 = p2; p3.advance();
-        assert_eq!(p3.progress(), (1, 2));
+        // Plan progress is now decided by EVIDENCE (see Plan::recheck), so this asserts the new
+        // contract: a step whose named file was written is done, one whose file was not is not, and
+        // a step naming no file at all is neither — it is unverifiable.
+        let mut p3 = parse_plan("1. rewrite src/first.rs\n2. rewrite src/second.rs\n3. think about it");
+        p3.recheck(&["src/first.rs".to_string()]);
+        assert_eq!(p3.progress(), (1, 3));
+        assert_eq!(p3.steps[0].evidence.as_deref(), Some("src/first.rs"));
+        assert!(!p3.steps[1].done && !p3.steps[1].unverifiable, "named but unwritten = pending");
+        assert!(p3.steps[2].unverifiable, "names no file, so no write can confirm it");
+        assert_eq!(p3.summary(), "1/3 verified, 1 pending, 1 unverifiable");
+        // and it is a RECHECK, not an accumulation: withdraw the evidence and the step reopens
+        p3.recheck(&[]);
+        assert_eq!(p3.progress(), (0, 3));
     }
 
     #[test]
@@ -4262,8 +4320,8 @@ mod long_horizon_tests {
         ws.apply(&Tool::WriteFile { path: "src/a.rs".into(), contents: "//a\n".into() });
         ws.apply(&Tool::WriteFile { path: "src/b.rs".into(), contents: "//b\n".into() });
         let mut plan = Plan { steps: vec![
-            PlanStep { text: "edit a".into(), done: true },
-            PlanStep { text: "edit b".into(), done: false },
+            PlanStep { text: "edit a".into(), done: true, evidence: Some("src/a.rs".into()), unverifiable: false },
+            PlanStep { text: "edit b".into(), done: false, evidence: None, unverifiable: false },
         ]};
         let mut g = crate::phase_guide::Guide::new();
         g.observe(&crate::phase_guide::TurnObs { writes_ok: 1, check: Some((3, 0, 0)), ..Default::default() });
@@ -4729,6 +4787,36 @@ mod long_horizon_tests {
         assert!(ws.gitmind_sessions().is_empty());
         let r = ws.apply(&Tool::GitLog { n: 5, path: String::new() });
         assert!(r.ok && r.output.contains("only commit") && !r.output.contains("checkpoints/"), "{}", r.output);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    /// EXPOSING THE BUG before fixing it: `advance()` marks the next plan step done at the end of
+    /// any turn that made tool calls, including a turn that only READ files. A five-step plan
+    /// therefore reports 5/5 after five reads and zero edits — and that number is what the HUD
+    /// shows and what the compaction digest records as fact.
+    #[test]
+    fn plan_progress_must_not_count_a_read_only_turn_as_a_completed_step() {
+        let d = tmp("planlie");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        for f in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(d.join("src").join(f), "// x\n").unwrap();
+        }
+        let mut script = vec![
+            "```plan\n1. rewrite src/a.rs\n2. rewrite src/b.rs\n3. rewrite src/c.rs\n```\n```tool\n{\"tool\":\"list_dir\",\"path\":\"src\"}\n```".to_string(),
+        ];
+        for f in ["a.rs", "b.rs", "c.rs"] {
+            script.push(format!("```tool\n{{\"tool\":\"read_file\",\"path\":\"src/{f}\"}}\n```"));
+        }
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6,
+            verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false,
+            prefer_patches: false, digest_verify: false, ..Default::default() };
+        let (_stop, run) = drive(&d, "rewrite three files", cfg, &script);
+        let (done, total) = run.plan().progress();
+        assert_eq!(total, 3);
+        assert_eq!(done, 0,
+                   "nothing was written, so no plan step is done — reported {done}/{total}");
         let _ = std::fs::remove_dir_all(&d);
     }
 }
