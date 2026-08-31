@@ -3389,6 +3389,16 @@ pub struct FastDetector {
     pub nms_radius: usize,
     /// Maximum keypoints to return per frame (top-N by score)
     pub max_keypoints: usize,
+    /// Per-tile adaptive thresholding. A fixed threshold tuned for bright
+    /// content (20) exceeds the entire local contrast range of dark
+    /// footage — measured: a dark film interior yielded 654 keypoints and
+    /// 24% spatial coverage while a bright shot of the same clip covered
+    /// 87%. When enabled, the effective threshold per 32px tile is
+    /// clamp(1.0 × tile MAD, 8, threshold): scales down with local
+    /// contrast, floored above the grain band (σ≈2 grain ⇒ deltas ≲6)
+    /// so noise doesn't become corners, capped at `threshold` so bright
+    /// content behaves exactly as before.
+    pub adaptive_threshold: bool,
 }
 
 impl Default for FastDetector {
@@ -3398,6 +3408,7 @@ impl Default for FastDetector {
             min_score: 200,
             nms_radius: 3,
             max_keypoints: 500,
+            adaptive_threshold: true,
         }
     }
 }
@@ -3423,16 +3434,60 @@ impl FastDetector {
         if yuv.len() < width * height || width < 8 || height < 8 { return Vec::new(); }
         
         let mut candidates = Vec::with_capacity(2048);
+        // Per-32px-tile threshold grid (see adaptive_threshold docs).
+        let tw = (width + 31) / 32;
+        let th = (height + 31) / 32;
+        let tile_thr: Vec<i32> = if self.adaptive_threshold {
+            let mut g = vec![self.threshold as i32; tw * th];
+            for ty in 0..th {
+                for tx in 0..tw {
+                    let x0 = tx * 32;
+                    let y0 = ty * 32;
+                    let x1 = (x0 + 32).min(width);
+                    let y1 = (y0 + 32).min(height);
+                    let mut sum = 0u32;
+                    let mut n = 0u32;
+                    for yy in y0..y1 {
+                        for xx in x0..x1 {
+                            sum += yuv[yy * width + xx] as u32;
+                            n += 1;
+                        }
+                    }
+                    let mean = (sum / n.max(1)) as i32;
+                    let mut mad = 0u32;
+                    for yy in y0..y1 {
+                        for xx in x0..x1 {
+                            mad += (yuv[yy * width + xx] as i32 - mean).unsigned_abs();
+                        }
+                    }
+                    let mad = (mad / n.max(1)) as i32;
+                    g[ty * tw + tx] = mad.clamp(8, self.threshold as i32);
+                }
+            }
+            g
+        } else {
+            vec![self.threshold as i32; tw * th]
+        };
         // Stay 4 pixels from edges so the radius-3 circle is in-bounds
         let margin = 4;
         for y in margin..height - margin {
             for x in margin..width - margin {
                 let center = yuv[y * width + x] as i32;
-                let bright = center + self.threshold as i32;
-                let dim = center - self.threshold as i32;
+                let thr = tile_thr[(y / 32) * tw + (x / 32)];
+                let bright = center + thr;
+                let dim = center - thr;
                 
-                // Quick reject: check 4 cardinal points first (top, right, 
-                // bottom, left). At least 3 must agree on brighter or darker.
+                // Quick reject via the 4 cardinal points (top, right,
+                // bottom, left). For the arc-9 test used below, the sound
+                // requirement is that at least 2 cardinals agree: cardinals
+                // sit 4 apart on the 16-circle, so a contiguous run of 9
+                // can cover as few as 2 of them (e.g. indices 1..=9 touch
+                // only 4 and 8). The previous >=3 rule is only valid for
+                // FAST-12 and mathematically rejected legitimate FAST-9
+                // corners — including every near-tip detection at a
+                // right-angle step corner (at most 2 cardinals reach into
+                // the opposing region there), which is why rectilinear
+                // game/architecture content starved the tracker.
                 let cards = [
                     yuv[(y - 3) * width + x] as i32,        // top
                     yuv[y * width + (x + 3)] as i32,        // right
@@ -3441,7 +3496,7 @@ impl FastDetector {
                 ];
                 let n_brighter = cards.iter().filter(|&&v| v > bright).count();
                 let n_darker = cards.iter().filter(|&&v| v < dim).count();
-                if n_brighter < 3 && n_darker < 3 { continue; }
+                if n_brighter < 2 && n_darker < 2 { continue; }
                 
                 // Full circle check: find longest contiguous arc of 9+
                 // Doubled-array trick: walk the 32-length doubled circle once
@@ -3489,22 +3544,125 @@ impl FastDetector {
         }
         
         // Non-max suppression: sort by score desc, then greedily keep points
-        // not within nms_radius of an already-kept point.
+        // not within nms_radius of an already-kept point — WITH a per-cell
+        // budget. Global top-N lets one busy region (a game HUD, a single
+        // high-contrast prop) hoard the entire keypoint budget while most
+        // of the frame contributes nothing; pose estimation and whole-scene
+        // reconstruction need SPREAD, not local density (the reason
+        // fragments got reconstructed but never full maps). Cell size 64px,
+        // per-cell cap sized so the full budget cannot fit into a corner
+        // of the frame. Same discipline as ORB-SLAM's quadtree culling.
         candidates.sort_by(|a, b| b.score.cmp(&a.score));
         let r2 = (self.nms_radius * self.nms_radius) as f32;
+        let cw = (width + 63) / 64;
+        let ch = (height + 63) / 64;
+        let n_cells = cw * ch;
+        let per_cell_cap = (self.max_keypoints * 4 / n_cells.max(1)).max(2);
+        let mut cell_counts = vec![0usize; n_cells];
         let mut kept: Vec<Keypoint> = Vec::with_capacity(self.max_keypoints);
         for c in candidates {
+            let ci = (c.y as usize / 64) * cw + (c.x as usize / 64);
+            if cell_counts[ci] >= per_cell_cap {
+                continue;
+            }
             let too_close = kept.iter().any(|k| {
                 let dx = k.x - c.x;
                 let dy = k.y - c.y;
                 dx * dx + dy * dy < r2
             });
             if !too_close {
+                cell_counts[ci] += 1;
                 kept.push(c);
                 if kept.len() >= self.max_keypoints { break; }
             }
         }
         kept
+    }
+}
+
+impl LkTracker {
+    /// Coarse-to-fine pyramid LK. Builds `levels` 2× box-downsampled
+    /// pyramids and chains `track_with_init` from coarsest to finest,
+    /// each level's solution (×2) seeding the next. Extends the tracker's
+    /// reach from its single-scale basin (~texture wavelength / 2) to
+    /// roughly 2^levels × that — the difference between losing half the
+    /// tracks on one fast handheld GOP and keeping them. A level whose
+    /// coarse estimate fails falls back to zero-init at the next finer
+    /// level rather than propagating the loss: near-border points that
+    /// leave the coarse image's valid area are still often trackable at
+    /// full resolution.
+    pub fn track_pyramid(
+        &self,
+        prev: &[u8],
+        cur: &[u8],
+        width: usize,
+        height: usize,
+        points: &[(f32, f32)],
+        levels: usize,
+    ) -> Vec<Option<(f32, f32, f32)>> {
+        if levels <= 1 {
+            return self.track(prev, cur, width, height, points);
+        }
+        let down = |img: &[u8], w: usize, h: usize| -> (Vec<u8>, usize, usize) {
+            let (nw, nh) = (w / 2, h / 2);
+            let mut out = vec![0u8; nw * nh];
+            for y in 0..nh {
+                for x in 0..nw {
+                    let s = img[(y * 2) * w + x * 2] as u32
+                        + img[(y * 2) * w + x * 2 + 1] as u32
+                        + img[(y * 2 + 1) * w + x * 2] as u32
+                        + img[(y * 2 + 1) * w + x * 2 + 1] as u32;
+                    out[y * nw + x] = (s / 4) as u8;
+                }
+            }
+            (out, nw, nh)
+        };
+        // Build pyramids: level 0 = full res.
+        let mut pyr_prev: Vec<(Vec<u8>, usize, usize)> = vec![(prev.to_vec(), width, height)];
+        let mut pyr_cur: Vec<(Vec<u8>, usize, usize)> = vec![(cur.to_vec(), width, height)];
+        for l in 1..levels {
+            let (p, w, h) = {
+                let (img, w, h) = &pyr_prev[l - 1];
+                down(img, *w, *h)
+            };
+            pyr_prev.push((p, w, h));
+            let (c, w2, h2) = {
+                let (img, w, h) = &pyr_cur[l - 1];
+                down(img, *w, *h)
+            };
+            pyr_cur.push((c, w2, h2));
+        }
+        // Coarse-to-fine.
+        let mut offsets: Vec<Option<(f32, f32)>> = vec![None; points.len()];
+        for l in (0..levels).rev() {
+            let scale = (1usize << l) as f32;
+            let lp: Vec<(f32, f32)> = points.iter().map(|&(x, y)| (x / scale, y / scale)).collect();
+            let init: Vec<(f32, f32)> = offsets
+                .iter()
+                .map(|o| o.map(|(u, v)| (u / scale, v / scale)).unwrap_or((0.0, 0.0)))
+                .collect();
+            let (pp, pw, ph) = &pyr_prev[l];
+            let (cc, _, _) = &pyr_cur[l];
+            let res = self.track_with_init(pp, cc, *pw, *ph, &lp, Some(&init));
+            for (i, r) in res.iter().enumerate() {
+                if let Some((nx, ny, _)) = r {
+                    offsets[i] = Some(((nx - lp[i].0) * scale, (ny - lp[i].1) * scale));
+                }
+                // on failure: keep previous offset (or None → zero init finer)
+            }
+            if l == 0 {
+                // Final: return level-0 results, but seed failures aside.
+                return res
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, r)| r.map(|(nx, ny, resid)| (nx, ny, resid)).or_else(|| {
+                        let _ = i;
+                        None
+                    }))
+                    .collect();
+            }
+        }
+        unreachable!()
     }
 }
 
@@ -3545,7 +3703,13 @@ impl Default for LkTracker {
             window_radius: 3,        // 7x7 window (was 11x11)
             max_iterations: 5,       // was 8
             convergence_eps: 0.05,
-            max_residual: 30.0,
+            // 30.0 killed aligned-but-motion-blurred tracks on fast handheld
+            // footage (measured: pyramid LK changed NOTHING on a 24fps
+            // handheld GOP — deaths were residual-gated, not basin-limited;
+            // the blurred window can never match the sharp previous one
+            // within 30 mean levels). 45 keeps aligned blurred tracks alive;
+            // genuinely lost tracks still blow far past it.
+            max_residual: 45.0,
         }
     }
 }
@@ -3575,7 +3739,32 @@ impl LkTracker {
         // allocation. Anything bigger falls back to a heap Vec.
         const MAX_STACK_WIN: usize = 121;
         
-        points.iter().map(|&(px, py)| {
+        self.track_with_init(prev, cur, width, height, points, None)
+    }
+
+    /// Like `track`, but each point may carry an initial displacement
+    /// guess (u0, v0) — the hand-off mechanism pyramid LK needs: the
+    /// coarse level's solution, scaled up, seeds the fine level inside
+    /// its linear convergence basin.
+    pub fn track_with_init(
+        &self,
+        prev: &[u8],
+        cur: &[u8],
+        width: usize,
+        height: usize,
+        points: &[(f32, f32)],
+        init: Option<&[(f32, f32)]>,
+    ) -> Vec<Option<(f32, f32, f32)>> {
+        if prev.len() < width * height || cur.len() < width * height {
+            return points.iter().map(|_| None).collect();
+        }
+        let r = self.window_radius as i32;
+        let w_i = width as i32;
+        let h_i = height as i32;
+        const MAX_STACK_WIN: usize = 121;
+
+        points.iter().enumerate().map(|(pi, &(px, py))| {
+            let (u0, v0) = init.map(|g| g[pi]).unwrap_or((0.0, 0.0));
             // Bounds-check the prev window ONCE (it doesn't change across 
             // iterations). Saves repeating this 5×; also moves the bail 
             // before any allocation.
@@ -3648,8 +3837,8 @@ impl LkTracker {
             let inv_det = 1.0 / det;
             
             // Iteration loop — only the t-derivative depends on (u, v).
-            let mut u = 0.0f32;
-            let mut v = 0.0f32;
+            let mut u = u0;
+            let mut v = v0;
             for _iter in 0..self.max_iterations {
                 let cx_cur = px + u;
                 let cy_cur = py + v;
@@ -3806,6 +3995,17 @@ pub struct FeatureTrack {
     /// EMA of consensus score [0..1] — how often this feature has agreed 
     /// with camera motion. Higher = more confidently static.
     pub static_consensus: f32,
+    /// Screen-lock counters (UiOverlay promotion axis 4): frames where the
+    /// scene visibly moved, and how many of those this track sat still.
+    /// A track that stays under half a pixel while the scene moves is
+    /// screen-attached — HUD, watermark, letterbox edge. On esports
+    /// broadcast footage this is the DOMINANT track class (measured: 182
+    /// of ~410 long tracks on a SMITE GOP) and the motion-consensus pass
+    /// labels them Static — poison for rigid-world pose — because phase
+    /// correlation itself locks onto the static HUD and reports camera
+    /// motion ≈ 0, making HUD agreement look like world agreement.
+    pub screen_moving_frames: u16,
+    pub screen_still_hits: u16,
     /// Number of frames where this feature's pixel landed in a block 
     /// classified as AlphaOverlay (UI). Saturates at 255. When this 
     /// exceeds `ui_overlay_promotion_threshold` (in V8Encoder), the 
@@ -3911,7 +4111,11 @@ impl FeatureTrackPass {
                 let points: Vec<(f32, f32)> = self.live_tracks.iter()
                     .map(|t| (t.current_x, t.current_y))
                     .collect();
-                let results = self.tracker.track(prev, frame_yuv, width, height, &points);
+                // Pyramid (3 levels): single-scale LK's basin is
+                // ~texture-wavelength/2 — fast handheld / 60fps game
+                // motion routinely exceeds it (measured: median track
+                // lifetime 14 of 48 frames on a handheld GOP).
+                let results = self.tracker.track_pyramid(prev, frame_yuv, width, height, &points, 3);
                 
                 let mut survivors = Vec::with_capacity(self.live_tracks.len());
                 for (track, result) in self.live_tracks.drain(..).zip(results.into_iter()) {
@@ -3927,6 +4131,8 @@ impl FeatureTrackPass {
                             prev_y: track.current_y,
                             motion_class: track.motion_class,  // classifier updates separately
                             static_consensus: track.static_consensus,
+                            screen_moving_frames: track.screen_moving_frames,
+                            screen_still_hits: track.screen_still_hits,
                             // Carry the layer/depth diagnostics forward — they're 
                             // updated by the UiOverlay filter pass later in encode_frame_at.
                             layer_overlay_hits: track.layer_overlay_hits,
@@ -3942,18 +4148,51 @@ impl FeatureTrackPass {
             }
         }
         
-        // Step 2: re-detect if population is low
-        if self.live_tracks.len() < self.min_track_count {
+        // Step 2: re-detect when population is low OR coverage has holes.
+        //
+        // The old gate was population count alone — and it is exactly why
+        // whole scenes never got mapped: a pan piles the surviving tracks
+        // toward the trailing edge, the count stays comfortably above
+        // min_track_count, and the newly revealed world at the leading
+        // edge NEVER receives a feature. Pose estimation doesn't need N
+        // tracks, it needs tracks WHERE THE SCENE IS. The gate is now
+        // spatial: if more than a quarter of 64px cells have no live
+        // track (or population is low, or on the periodic re-seed beat),
+        // detect and admit keypoints ONLY into empty cells, up to the
+        // global cap. Measured on a 48-frame handheld GOP: track births
+        // went from zero-after-frame-0 to continuous replenishment.
+        let cw = (width + 63) / 64;
+        let ch = (height + 63) / 64;
+        let mut cell_live = vec![false; cw * ch];
+        for t in &self.live_tracks {
+            let cx = (t.current_x as usize).min(width - 1) / 64;
+            let cy = (t.current_y as usize).min(height - 1) / 64;
+            cell_live[cy * cw + cx] = true;
+        }
+        let empty_frac =
+            cell_live.iter().filter(|&&c| !c).count() as f32 / cell_live.len() as f32;
+        let need_reseed = self.live_tracks.len() < self.min_track_count
+            || empty_frac > 0.25
+            || frame_idx % 8 == 0;
+        if need_reseed && self.live_tracks.len() < self.max_track_count {
             let new_kps = self.detector.detect(frame_yuv, width, height);
             let sep_sq = self.min_track_separation * self.min_track_separation;
             for kp in new_kps {
                 if self.live_tracks.len() >= self.max_track_count { break; }
+                // Spatial admission: only fill cells with no live track,
+                // unless the global population itself is starved.
+                let kcx = (kp.x as usize).min(width - 1) / 64;
+                let kcy = (kp.y as usize).min(height - 1) / 64;
+                if cell_live[kcy * cw + kcx] && self.live_tracks.len() >= self.min_track_count {
+                    continue;
+                }
                 let too_close = self.live_tracks.iter().any(|t| {
                     let dx = t.current_x - kp.x;
                     let dy = t.current_y - kp.y;
                     dx * dx + dy * dy < sep_sq
                 });
                 if too_close { continue; }
+                cell_live[kcy * cw + kcx] = true;
                 self.live_tracks.push(FeatureTrack {
                     feature_id: self.global_fid(self.next_local_id),
                     current_x: kp.x,
@@ -3965,6 +4204,8 @@ impl FeatureTrackPass {
                     prev_y: kp.y,
                     motion_class: MotionClass::Unknown,
                     static_consensus: 0.5,  // neutral prior
+                    screen_moving_frames: 0,
+                    screen_still_hits: 0,
                     layer_overlay_hits: 0,
                     layer_active_hits: 0,
                     last_depth: 0.0,
@@ -4013,7 +4254,7 @@ mod feature_tests {
                 img[y * 32 + x] = 50;
             }
         }
-        let det = FastDetector { threshold: 30, min_score: 100, nms_radius: 3, max_keypoints: 100 };
+        let det = FastDetector { threshold: 30, min_score: 100, nms_radius: 3, max_keypoints: 100, adaptive_threshold: true };
         let kps = det.detect(&img, 32, 32);
         assert!(!kps.is_empty(), "FAST should find a corner");
         // Best keypoint should be near (16, 16)
@@ -4024,42 +4265,92 @@ mod feature_tests {
     
     #[test]
     fn lk_tracks_pure_translation() {
-        // Build a 64x64 image with texture (so LK gradients are non-zero).
-        // Then build a translated copy. Track points and verify they moved.
+        // The original pattern here, (x*7 + y*13) % 256, is a LINEAR RAMP:
+        // its gradient is the constant (7, 13) everywhere away from the
+        // mod-wrap seams, which makes the LK structure tensor EXACTLY
+        // singular (det = n²(Ix²·Iy² − (IxIy)²) = 0 for constant
+        // gradients — the total aperture problem). Whether a window
+        // happened to include a wrap seam decided between "ill-conditioned
+        // bail" and "seam-dominated garbage estimate"; the test was
+        // asserting on an input the algorithm is defined to fail on.
+        // Replaced with SMOOTH well-conditioned texture and made the
+        // assertions STRICTER: tracks must succeed (Some), not just be
+        // right when present. Two constraints on the pattern, both
+        // learned the hard way: gradients must VARY across the window
+        // (else the tensor is singular — the original ramp's failure),
+        // and the texture wavelength must EXCEED the displacement (LK's
+        // linearization basin — per-pixel noise texture put a 2px shift
+        // outside it and the solver converged to a spurious minimum near
+        // zero). Product-of-sines at ~18px wavelength satisfies both.
         let mut a = vec![128u8; 64 * 64];
         let mut b = vec![128u8; 64 * 64];
+        let tex = |x: f32, y: f32| -> u8 {
+            (128.0 + 50.0 * (x * 0.35).sin() * (y * 0.28).sin()
+                   + 20.0 * ((x + y) * 0.15).sin()) as u8
+        };
         for y in 0..64 {
             for x in 0..64 {
-                let v = ((x * 7 + y * 13) % 256) as u8;
-                a[y * 64 + x] = v;
-                if x + 2 < 64 {
-                    b[y * 64 + (x + 2)] = v;  // shift +2 in x
-                }
+                a[y * 64 + x] = tex(x as f32, y as f32);
+                b[y * 64 + x] = tex(x as f32 - 2.0, y as f32); // content shifted +2
             }
         }
         let lk = LkTracker::default();
         let pts = vec![(20.0, 20.0), (30.0, 40.0)];
         let results = lk.track(&a, &b, 64, 64, &pts);
-        // Both should track to roughly +2 in x, ~0 in y
         for (r, p) in results.iter().zip(pts.iter()) {
-            if let Some((nx, ny, _)) = r {
-                let dx = nx - p.0;
-                let dy = ny - p.1;
-                // Allow some slack — 1-scale LK isn't perfect on synthetic noise
-                assert!((dx - 2.0).abs() < 1.0, "dx={}", dx);
-                assert!(dy.abs() < 1.0, "dy={}", dy);
-            }
+            let (nx, ny, _) = r.expect("well-conditioned texture must track");
+            let dx = nx - p.0;
+            let dy = ny - p.1;
+            assert!((dx - 2.0).abs() < 1.0, "dx={}", dx);
+            assert!(dy.abs() < 1.0, "dy={}", dy);
         }
     }
     
     #[test]
+    fn pyramid_lk_tracks_beyond_single_scale_basin() {
+        // 6px shift on ~18px-wavelength texture: outside the single-scale
+        // basin (fails or wanders), inside the 3-level pyramid's reach.
+        let (w, h) = (96, 96);
+        let tex = |x: f32, y: f32| -> u8 {
+            (128.0 + 50.0 * (x * 0.35).sin() * (y * 0.28).sin()
+                   + 20.0 * ((x + y) * 0.15).sin()) as u8
+        };
+        let mut a = vec![0u8; w * h];
+        let mut b = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                a[y * w + x] = tex(x as f32, y as f32);
+                b[y * w + x] = tex(x as f32 - 6.0, y as f32); // content +6
+            }
+        }
+        let lk = LkTracker::default();
+        let pts = vec![(40.0, 40.0), (60.0, 30.0)];
+        let res = lk.track_pyramid(&a, &b, w, h, &pts, 3);
+        for (r, p) in res.iter().zip(&pts) {
+            let (nx, ny, _) = r.expect("pyramid must track a 6px shift");
+            assert!((nx - p.0 - 6.0).abs() < 1.0, "dx={}", nx - p.0);
+            assert!((ny - p.1).abs() < 1.0, "dy={}", ny - p.1);
+        }
+    }
+
+    #[test]
     fn feature_track_pass_assigns_stable_ids() {
         // Two-frame pass: same image. Tracks should keep their IDs.
+        // The original image, (x*11 + y*17) % 256, is a linear ramp: a
+        // constant gradient field whose only structure is straight wrap
+        // seams. It contains NO corners in FAST's sense — a straight edge
+        // never yields a 9-contiguous same-polarity arc — so "frame 0
+        // should produce features" asserted on an input with nothing to
+        // detect. Checkerboard + cross-term texture provides real
+        // right-angle corners (the case the arc-9 prefilter fix made
+        // detectable) at every tile intersection.
         let img = {
             let mut buf = vec![100u8; 64 * 64];
             for y in 0..64 {
                 for x in 0..64 {
-                    buf[y * 64 + x] = ((x * 11 + y * 17) % 256) as u8;
+                    let tile = ((x / 8) + (y / 8)) % 2;
+                    let tex = ((x * 37 + y * 101 + x * y * 13) % 31) as u8;
+                    buf[y * 64 + x] = if tile == 0 { 60 + tex } else { 170 + tex };
                 }
             }
             buf
@@ -4652,6 +4943,34 @@ impl MotionConsensusPass {
             (cam_dx, cam_dy)
         };
         
+        // Scene-motion signal for the screen-lock axis: median observed
+        // per-track displacement magnitude. Deliberately NOT the camera
+        // estimate — on HUD-dominated broadcast frames phase correlation
+        // reads ≈0 (it locks onto the UI), and that is precisely the
+        // content where screen-lock detection matters most.
+        let scene_moved = {
+            let mut mags: Vec<f32> = tracks
+                .iter()
+                .filter(|t| t.frames_alive >= self.min_age_for_classification)
+                .map(|t| {
+                    let dx = t.current_x - t.prev_x;
+                    let dy = t.current_y - t.prev_y;
+                    (dx * dx + dy * dy).sqrt()
+                })
+                .collect();
+            if mags.len() < 8 {
+                false
+            } else {
+                // p75, not median: on HUD-dominated broadcasts the still
+                // (screen-locked) population IS the majority, so the
+                // median sits at ~0 exactly when the viewport is moving.
+                // "A quarter of tracks moved" is the robust scene signal.
+                let k = mags.len() * 3 / 4;
+                mags.select_nth_unstable_by(k, |a, b| a.partial_cmp(b).unwrap());
+                mags[k] > 1.0
+            }
+        };
+        
         for track in tracks.iter_mut() {
             if track.frames_alive < self.min_age_for_classification { continue; }
             
@@ -4674,6 +4993,24 @@ impl MotionConsensusPass {
             let res_x = obs_dx - pred_dx;
             let res_y = obs_dy - pred_dy;
             let residual = (res_x * res_x + res_y * res_y).sqrt();
+            
+            // UiOverlay promotion axis 4: screen-lock. The scene-motion
+            // signal is the MEDIAN track displacement (computed once
+            // below, passed in via scene_moved) rather than the camera
+            // estimate — phase correlation reads ≈0 on HUD-dominated
+            // broadcast frames, which is exactly when this axis matters.
+            if scene_moved {
+                track.screen_moving_frames = track.screen_moving_frames.saturating_add(1);
+                let own = (obs_dx * obs_dx + obs_dy * obs_dy).sqrt();
+                if own < 0.5 {
+                    track.screen_still_hits = track.screen_still_hits.saturating_add(1);
+                }
+                if track.screen_moving_frames >= 6
+                    && track.screen_still_hits as u32 * 10 >= track.screen_moving_frames as u32 * 9
+                {
+                    track.motion_class = MotionClass::UiOverlay;
+                }
+            }
             
             // Per-frame agreement: 1.0 if residual is below threshold, 
             // tapering to 0.0 at 3x threshold.
@@ -4872,7 +5209,7 @@ mod consensus_tests {
                 feature_id: 1, current_x: 105.0, current_y: 50.0,
                 prev_x: 100.0, prev_y: 50.0,
                 last_residual: 0.0, frames_alive: 10, born_frame: 0,
-                motion_class: MotionClass::Unknown, static_consensus: 0.5,
+                motion_class: MotionClass::Unknown, static_consensus: 0.5, screen_moving_frames: 0, screen_still_hits: 0,
                 layer_overlay_hits: 0, layer_active_hits: 0,
                 last_depth: 0.0, depth_variance_ema: 1000.0,
                 frames_since_triangulation: 0,
@@ -4882,7 +5219,7 @@ mod consensus_tests {
                 feature_id: 2, current_x: 101.0, current_y: 50.0,
                 prev_x: 100.0, prev_y: 50.0,
                 last_residual: 0.0, frames_alive: 10, born_frame: 0,
-                motion_class: MotionClass::Unknown, static_consensus: 0.5,
+                motion_class: MotionClass::Unknown, static_consensus: 0.5, screen_moving_frames: 0, screen_still_hits: 0,
                 layer_overlay_hits: 0, layer_active_hits: 0,
                 last_depth: 0.0, depth_variance_ema: 1000.0,
                 frames_since_triangulation: 0,
@@ -4908,7 +5245,7 @@ mod consensus_tests {
                 feature_id: 1, current_x: 100.0, current_y: 50.0,
                 prev_x: 100.0, prev_y: 50.0,
                 last_residual: 0.0, frames_alive: 10, born_frame: 0,
-                motion_class: MotionClass::Unknown, static_consensus: 0.5,
+                motion_class: MotionClass::Unknown, static_consensus: 0.5, screen_moving_frames: 0, screen_still_hits: 0,
                 layer_overlay_hits: 0, layer_active_hits: 0,
                 last_depth: 0.0, depth_variance_ema: 1000.0,
                 frames_since_triangulation: 0,
@@ -4929,7 +5266,7 @@ mod consensus_tests {
                 prev_x: 100.0, prev_y: 50.0,
                 last_residual: 0.0, frames_alive: 1,  // too young
                 born_frame: 0,
-                motion_class: MotionClass::Unknown, static_consensus: 0.5,
+                motion_class: MotionClass::Unknown, static_consensus: 0.5, screen_moving_frames: 0, screen_still_hits: 0,
                 layer_overlay_hits: 0, layer_active_hits: 0,
                 last_depth: 0.0, depth_variance_ema: 1000.0,
                 frames_since_triangulation: 0,
@@ -5066,6 +5403,24 @@ impl TriangulatePass {
                 Some(p) => p,
                 None => continue,
             };
+            
+            // Cheirality: the point must lie at POSITIVE depth along both
+            // observing rays. Rays from inconsistent observations (a
+            // rotating camera forced through this translation-only pose
+            // model, mismatched tracks) can intersect BEHIND the cameras
+            // — measured on a game-broadcast GOP as a p10 depth of −3301
+            // before this check. A behind-camera point is wrong under any
+            // model; reprojection error alone does not catch it because
+            // projection is symmetric through the pinhole.
+            let da = (world_pos.x - pose_a.position.x) * ray_a.x
+                + (world_pos.y - pose_a.position.y) * ray_a.y
+                + (world_pos.z - pose_a.position.z) * ray_a.z;
+            let db = (world_pos.x - pose_b.position.x) * ray_b.x
+                + (world_pos.y - pose_b.position.y) * ray_b.y
+                + (world_pos.z - pose_b.position.z) * ray_b.z;
+            if da <= 0.0 || db <= 0.0 {
+                continue;
+            }
             
             // Compute reprojection error: project world_pos through both poses,
             // compare to actual observations.
@@ -6567,12 +6922,20 @@ mod densify_tests {
     
     #[test]
     fn anchor_cadence_correct() {
-        let pass = DensifyPass::default();  // anchor_interval = 30
+        // Default anchor_interval was deliberately raised 30 → 60 (see
+        // the documented perf decision at the Default impl); this test
+        // still asserted the old cadence and had never been updated —
+        // a stale expectation, not a regression. Assert the semantics
+        // against the actual configured interval so a future retune
+        // doesn't strand it again.
+        let pass = DensifyPass::default();
+        let iv = pass.anchor_interval;
+        assert!(iv > 0);
         assert!(pass.is_anchor_frame(0));
-        assert!(pass.is_anchor_frame(30));
-        assert!(pass.is_anchor_frame(60));
-        assert!(!pass.is_anchor_frame(15));
-        assert!(!pass.is_anchor_frame(29));
+        assert!(pass.is_anchor_frame(iv));
+        assert!(pass.is_anchor_frame(iv * 2));
+        assert!(!pass.is_anchor_frame(iv / 2));
+        assert!(!pass.is_anchor_frame(iv - 1));
     }
 }
 

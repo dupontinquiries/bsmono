@@ -1,0 +1,17 @@
+[package]
+name = "drivemind-core"
+version = "0.1.0"
+edition = "2021"
+description = "Headless disk & data health engine: device enumeration (lsblk), SMART via smartctl JSON (with the USB-NVMe bridge retry ladder), BLAKE3 integrity manifests, cleanup scanning, delta-hostility analysis for gitmind migration, and video re-encode candidates for av1tuner. Every subsystem reports through one Event stream so frontends render the actual loop, not a summary."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# The whole system boundary is JSON (lsblk --json, smartctl --json=c), so
+# serde_json is the one real dependency. blake3 for integrity manifests —
+# same hash family as gitmind's chunk store, SIMD on x86 and NEON on aarch64.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+
+[dev-dependencies]
+tempfile = "3"

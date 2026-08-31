@@ -138,6 +138,11 @@ pub mod phase_correlation;
 // v10 strategy orchestrator (Phase C scaffold). Stub today; real 
 // dispatch lands when main.rs switches over from the parallel race.
 pub mod v10;
+pub mod v11_plate;
+pub mod restore;
+pub mod global_motion;
+pub mod two_view;
+pub mod rans;
 
 /// CPU rasterizer that turns v8 mesh + camera pose into rendered RGB. 
 /// Used by V8Decoder::decode_frame to produce playable frames.

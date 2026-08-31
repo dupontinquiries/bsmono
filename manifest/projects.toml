@@ -132,7 +132,28 @@ daemon = false
 flatpak = "tbd"
 runtime = "tbd"
 targets = ["desktop"]
-notes = "git-graph tool (gin); peek dedup DONE — GUI consumes tools/peek lib; marked broken upstream"
+notes = "git-graph tool (gin); peek dedup DONE — GUI consumes tools/peek lib; marked broken upstream. Store now has a third chunk encoding ('R' raw, entropy-gated) for incompressible content, and `gin migrate` moves delta-hostile files (media/models/archives) out of git and into the chunk store, reversibly (.gitmind/migrated.jsonl + --restore)."
+
+[apps.drivemind]
+path = "apps/drivemind"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop"]
+notes = "disk & data health (dvm): SMART incl. USB-NVMe bridge -d ladder (sat/sntjmicron/sntasmedia/sntrealtek), BLAKE3 integrity manifests, cleanup + duplicate finder, delta-hostile git scan (feeds `gin migrate`), video re-encode triage (writes av1tuner batch files), safety-checked dd/ddrescue clone plans, cross-signal advisor. Pure core behind one SysRunner seam (fixture-tested, no root or real disks needed in CI); default-members build core+cli only."
+
+[apps.drivemind-egui]
+path = "apps/drivemind/crates/gui-egui"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"          # pure egui/glow (wayland/x11), same convention as logscope
+targets = ["desktop"]
+primary = true            # the only drivemind GUI; core+cli are UI-less
+notes = "egui shell on shared/uikit (Night palette): device rail, per-device SMART verdicts, verify/cleanup/videos/advise tabs, and a live log_view of the engine's Event stream — the same loop `dvm` prints to stderr. One worker thread + two mpsc channels; no async runtime. `cargo build --release -p drivemind-egui` produces the deployable bin (`app` feature default-on)."
 
 [apps.aperture]
 path = "apps/aperture"

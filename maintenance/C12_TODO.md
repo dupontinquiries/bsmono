@@ -5304,3 +5304,54 @@ hold-and-pick popup and nothing else. Only the PLACEMENT was missing.
 - **C95a — nothing SHOWS the cardinals.** A key that can emit `é` on a
   north swipe and does not say so is a feature nobody discovers. The
   GTK build draws variant hints on the keycap; this port does not yet.
+
+## 2026-08-30 — drivemind (new app) + gitmind store 'R' encoding + gin migrate
+
+- **apps/drivemind** landed: disk & data health, gitmind's shape (headless
+  core → `dvm` CLI → opt-in egui shell on shared/uikit). Everything
+  system-touching goes through one dyn-compatible `SysRunner` seam
+  (HostRunner shells out; FixtureRunner replays canned outputs and errors
+  on any un-fixtured command), all progress through one `Event` sink —
+  which is why the whole SMART/lsblk surface is testable on a container
+  with only virtio disks. 19 core tests. Modules: device (lsblk JSON →
+  attach classification incl. UsbBridge), smart (`--json=c` + the
+  `-d auto→sat→sntjmicron→sntasmedia→sntrealtek` bridge ladder, every
+  rung an Exec/Note event; verdict rules for NVMe critical-warning bits,
+  percentage_used, spare, ATA 5/187/197/198, 199-CRC-means-cable),
+  integrity (BLAKE3 JSONL manifests; read errors kept distinct from
+  content drift — the former is the disk-health signal), cleanup
+  (suggests, never deletes), deltahostile (ext class OR 3-window sampled
+  entropy on tracked files; emits the `gin migrate` command), video
+  (ffprobe triage → av1tuner batch file; stream→format bit_rate fallback
+  for mkv), cloneop (dd/ddrescue plans; blockers unforceable, mounted
+  source = warning only), advisor (cross-signal: USB bridge + attr-199 +
+  verify read errors → "swap the cable first").
+- Verified live in-session: `dvm gitscan` on this monorepo itself flags
+  the blackstar/unendlich media and caught `bots.pack` by entropy (7.97
+  b/B, no telltale extension); `dvm verify` caught injected corruption.
+- **gitmind store**: third chunk encoding `'R'` (raw) — entropy gate
+  (first 4 KiB > 7.9 b/B skips zstd entirely) + compress-and-compare
+  (never store larger than raw+1). Incompressible chunks previously paid
+  zstd frame overhead + CPU on both ends for nothing. decode_chunk gained
+  the one-line arm; repack unchanged and still green. Compat is one-way
+  same as 'D': new readers open old stores; old binaries can't read
+  stores that contain 'R' chunks.
+- **gin migrate**: plan-by-default scan of tracked delta-hostile files →
+  `--apply` ingests into the chunk store + appends
+  `.gitmind/migrated.jsonl`; `--untrack` additionally
+  `git rm --cached`s + .gitignore-shields; `--restore <path>` writes
+  exact bytes back (verified byte-identical live); `--list` prints the
+  record. History deliberately never rewritten — that's filter-repo's
+  job, explicitly not this one's. gitmind-core: 71 unit + 40 integration
+  green.
+- Open: drivemind-egui first compile (eframe tree) exceeded the session
+  exec ceiling twice; code written to dialer-egui conventions but the
+  build had not completed when this note was written — see the session
+  wrap for exact status. PaletteColors field names in the shell
+  (ok/warn/err/muted/accent) were read from uikit-egui source, not
+  guessed, but the egui 0.34 `ctx.copy_text` call is the likeliest
+  churn point if the build objects.
+  RESOLVED same session: all 13 errors were PaletteColors field names
+  (real names: success/warning/danger/text_weak), plus this fleet's
+  eframe requiring `ui` alongside `update` (matched dialer-egui's stub).
+  drivemind-egui now builds with the app feature and headless.

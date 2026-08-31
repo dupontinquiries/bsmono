@@ -62,6 +62,7 @@ pub mod native;
 pub mod varcache;
 pub mod binpin;
 pub mod checks;
+pub mod migrate;
 
 // Re-exports for the common path so frontends import one place.
 pub use backend::{RepoBackend, GitCli, RepoStatus};

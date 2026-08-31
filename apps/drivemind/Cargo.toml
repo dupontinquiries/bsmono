@@ -1,0 +1,18 @@
+# drivemind — disk & data health for the fleet: SMART (incl. NVMe-over-USB
+# bridges), file-integrity manifests, cleanup + migration advice that hands
+# off to av1tuner (video re-encode) and gitmind (delta-hostile repos).
+#
+# Same shape as gitmind: pure core, thin CLI, opt-in egui shell. The GUI is
+# kept out of default-members so `cargo build` in a headless sandbox never
+# needs eframe's windowing stack.
+
+[workspace]
+members = ["crates/core", "crates/cli", "crates/gui-egui"]
+default-members = ["crates/core", "crates/cli"]
+resolver = "2"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"

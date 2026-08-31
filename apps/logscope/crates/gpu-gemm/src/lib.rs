@@ -25,6 +25,7 @@ use std::collections::HashMap;
 
 pub mod reverse; // search-based inversion: which token preceded a suffix (c11 experiment)
 pub mod flash_qblock;
+pub mod jsonmask; // byte-level JSON grammar constraint for structured decoding
 pub mod pool_class;
 pub mod gguf;
 pub mod cpumatvec;
