@@ -493,6 +493,12 @@ Continue with read_range {rel} {} {}]",
         if rel.starts_with('~') { return ToolResult::err(format!("{rel}: library roots (~std/~deps) are READ-ONLY")); }
         let abs = match self.sandbox_path(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
         let existed = abs.exists();
+        // BEFORE THE WRITE, NOT AFTER. A refusal the model can act on is worth far more than a
+        // diagnosis after the file is already gone.
+        let prev_bytes = if existed { std::fs::metadata(&abs).ok().map(|m| m.len()) } else { None };
+        if let WriteVerdict::Refuse(why) = classify_write(rel, contents, prev_bytes) {
+            return ToolResult::err(why);
+        }
         if let Some(parent) = abs.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 return ToolResult::err(format!("mkdir {rel}: {e}"));
@@ -796,6 +802,72 @@ fn default_allow() -> BTreeSet<String> {
      "git", "echo", "true", "test"]
         .iter().map(|s| s.to_string()).collect()
 }
+
+// ── the destructive-write guard ──────────────────────────────────────────────────────────────────
+
+/// What a proposed whole-file write actually is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriteVerdict {
+    /// Write it.
+    Ok,
+    /// Refuse, and tell the model exactly what is wrong with the content.
+    Refuse(String),
+}
+
+/// Judge a `write_file` before it lands, using aperture's tested reply classifier.
+///
+/// THE FAILURE THIS EXISTS FOR. A model asked to modify a 600-line file frequently returns the part
+/// it changed plus `// ... rest of the code remains the same`. As a suggestion in an editor that is
+/// reasonable shorthand. As a `write_file` it is a deletion: the file becomes the fragment, and the
+/// "rest of the code" the comment promises is gone. Worse, it often still COMPILES — a deleted
+/// helper that nothing in the remaining fragment calls leaves a green check — so the verify gate
+/// waves it through and the phase machine reaches Done on a truncated file. That combination, a
+/// destructive edit that passes its own check, is the one failure a long-horizon run must not have.
+///
+/// `aperture_complete::multipass` already detects these and is tested there; this is the policy
+/// layer over it, kept here because the POLICY is logscope's (refuse vs. suggest) while the
+/// DETECTION is aperture's.
+///
+/// Deliberately not applied to `edit`: an anchored find→replace is scoped by construction — an
+/// elision inside one replaces that region and nothing else — and it is the shape the loop should
+/// be pushing models toward anyway.
+pub fn classify_write(path: &str, contents: &str, existed_bytes: Option<u64>) -> WriteVerdict {
+    use aperture_complete::multipass;
+    // Only whole-file writes over EXISTING content can destroy anything. A new file containing an
+    // ellipsis comment is merely a bad new file, and refusing it would block legitimate scaffolding.
+    let Some(prev) = existed_bytes else { return WriteVerdict::Ok };
+
+    let elisions: Vec<&str> = contents.lines()
+        .filter(|l| multipass::is_elision(l))
+        .take(3)
+        .collect();
+    if !elisions.is_empty() {
+        return WriteVerdict::Refuse(format!(
+            "write {path}: REFUSED — this rewrites an existing {prev}-byte file and contains an \
+elision marker: {:?}. A `write_file` is not a diff: everything the marker stands in for would be \
+DELETED. Either emit the file in full, or — better — use `edit` with a verbatim anchor to change \
+just the region you mean.", elisions));
+    }
+    // A rewrite that collapses a substantial file to a stub is the same deletion wearing a
+    // different hat. The ratio matters, not the absolute size: a 40-byte file legitimately becomes
+    // a 20-byte one, while 60 KB becoming 300 bytes is a file being thrown away.
+    let now = contents.len() as u64;
+    if prev >= 2048 && now * 8 < prev {
+        return WriteVerdict::Refuse(format!(
+            "write {path}: REFUSED — this replaces {prev} bytes with {now}, dropping over 87% of the \
+file. If that is genuinely intended, write it with `edit` anchored on what you are removing, so the \
+deletion is explicit rather than a side effect of a short reply."));
+    }
+    if multipass::is_stub(contents) && prev >= 512 {
+        return WriteVerdict::Refuse(format!(
+            "write {path}: REFUSED — the replacement for this {prev}-byte file is a stub \
+(`todo!()`/`unimplemented!()`/an elided body). Write the real implementation, or leave the file \
+alone and say what is blocking you."));
+    }
+    WriteVerdict::Ok
+}
+
+
 
 // ── bounded reading: the difference between a big repo and an OOM ───────────────────────────────
 
@@ -4378,6 +4450,90 @@ mod long_horizon_tests {
         let (t2, trunc2) = read_capped(&d.join("g.txt"), 100).unwrap();
         assert_eq!(t2.len(), 100);
         assert!(!trunc2, "a file of exactly cap bytes must not claim truncation");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    // ── the destructive-write guard (aperture's classifier, logscope's policy) ───────────────────
+
+    #[test]
+    fn an_elided_rewrite_of_an_existing_file_is_refused() {
+        let d = tmp("elide");
+        let real = "fn a() {}\nfn b() {}\nfn c() {}\n".repeat(40);
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("src/lib.rs"), &real).unwrap();
+        let mut ws = Workspace::new(&d);
+        let r = ws.apply(&Tool::WriteFile {
+            path: "src/lib.rs".into(),
+            contents: "fn a() { println!(\"new\"); }\n// ... rest of the code remains the same\n".into(),
+        });
+        assert!(!r.ok, "an elided whole-file write must not land");
+        assert!(r.output.contains("elision marker"), "{}", r.output);
+        assert!(r.output.contains("use `edit`"), "the refusal names the way forward: {}", r.output);
+        assert_eq!(std::fs::read_to_string(d.join("src/lib.rs")).unwrap(), real, "the file is untouched");
+        assert!(ws.events().is_empty(), "a refused write is not a file event");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_collapsing_rewrite_is_refused_but_an_honest_shrink_is_not() {
+        let d = tmp("collapse");
+        std::fs::write(d.join("big.rs"), "x".repeat(60_000)).unwrap();
+        let mut ws = Workspace::new(&d);
+        let r = ws.apply(&Tool::WriteFile { path: "big.rs".into(), contents: "fn main() {}\n".into() });
+        assert!(!r.ok && r.output.contains("dropping over"), "{}", r.output);
+        // A modest shrink is ordinary editing and must go through.
+        let ok = ws.apply(&Tool::WriteFile { path: "big.rs".into(), contents: "x".repeat(40_000) });
+        assert!(ok.ok, "{}", ok.output);
+        // And a small file may legitimately shrink to almost nothing.
+        std::fs::write(d.join("tiny.rs"), "fn f() { 1 }\n").unwrap();
+        let tiny = ws.apply(&Tool::WriteFile { path: "tiny.rs".into(), contents: "\n".into() });
+        assert!(tiny.ok, "the ratio rule must not fire on small files: {}", tiny.output);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_new_file_may_contain_anything_and_edits_are_not_guarded() {
+        let d = tmp("newfile");
+        let mut ws = Workspace::new(&d);
+        // scaffolding a NEW file with an ellipsis comment destroys nothing
+        let r = ws.apply(&Tool::WriteFile {
+            path: "notes.md".into(),
+            contents: "# plan\n// ... rest of the code remains the same\n".into(),
+        });
+        assert!(r.ok, "a new file cannot be a destructive rewrite: {}", r.output);
+        // an anchored edit is scoped by construction, so the same text is allowed there
+        std::fs::write(d.join("code.rs"), "fn a() {}\nMARK\nfn c() {}\n").unwrap();
+        let e = ws.apply(&Tool::Edit {
+            path: "code.rs".into(),
+            find: "MARK".into(),
+            replace: "// ... rest of the code remains the same".into(),
+        });
+        assert!(e.ok, "edit is scoped and stays unguarded: {}", e.output);
+        assert!(std::fs::read_to_string(d.join("code.rs")).unwrap().contains("fn c()"),
+                "and it really did only touch the anchor");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The reason this guard exists rather than trusting the verify gate: an elided rewrite often
+    /// still COMPILES, so the check goes green over a truncated file and the phase machine reaches
+    /// Done. Here the "checker" passes on any file at all; only the write guard stops the deletion.
+    #[test]
+    fn a_deletion_that_would_have_passed_its_own_check_is_stopped_at_the_write() {
+        let d = tmp("silent-del");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        let real = "pub fn keep_me() {}\n".repeat(200);
+        std::fs::write(d.join("src/lib.rs"), &real).unwrap();
+        let script = vec![
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"src/lib.rs\",\"contents\":\"pub fn keep_me() {}\\n// ... rest of the code remains the same\\n\"}\n```".to_string(),
+        ];
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 4,
+            verify_cmd: vec!["true".into()], verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: false, ..Default::default() };
+        let (_stop, _run) = drive(&d, "tidy lib.rs", cfg, &script);
+        assert_eq!(std::fs::read_to_string(d.join("src/lib.rs")).unwrap(), real,
+                   "the always-green checker would have blessed the truncation; the write guard is what stopped it");
         let _ = std::fs::remove_dir_all(&d);
     }
 }
