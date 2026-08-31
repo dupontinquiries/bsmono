@@ -189,6 +189,50 @@ from the shipped binary, same category as the pre-existing 335.
   currently reads as plausibly real rather than a non-biped false
   positive; worth tracing with `trace_compact` the same way `starlord`
   was.
+
+  **Traced all three, as invited above, plus re-ran the full
+  `--sweep-all`.** All three now report **zero** crotch hits — this
+  entry is stale, not current. (Checked whether this was because
+  `silhouette_audit` only audits the robot pose, in case a different
+  pose would still show something: confirmed that's its documented,
+  deliberate scope, not an oversight in how I ran it — `foldaudit.rs`
+  covers fold motion separately, this tool is specifically about the
+  settled result.) Current `--sweep-all` totals: 14 chassis with crotch
+  clutter, 12 with unexplained overhang, of 254 checked — a different
+  set than either number previously recorded in this file, so treat
+  both older counts as superseded rather than trying to reconcile them
+  against this one.
+
+  **What the sweep surfaced instead, and it is a real, reproducible
+  live bug in the checker, not settled the way the file above implies:**
+  `boat_mistral_class_lhd` — the exact chassis that motivated the
+  straddle/compact sanity guard in the first place — still reports 35
+  crotch hits today, essentially unchanged from the 34 the guard was
+  written against. Traced why the guard doesn't catch it (temporary
+  `eprintln!`s at the `leg_idxs`/`straddles`/`compact` computation,
+  reverted before committing anything): `leg_idxs.len()` is 4, same as
+  before, and `straddles` is `true`, also as before — the guard's actual
+  discriminator, `compact`, requires `leg_span_z / body_len_z < 0.4`,
+  and this boat's four misclassified struts measure **0.26** — well
+  inside the "real leg" side of that threshold, not outside it. The
+  guard was written against a keel/hull strut that ran nearly the
+  full hull length (the doc comment's own words: "inflated
+  `leg_hi.z - leg_lo.z` to nearly the hull's own length"); this boat's
+  struts are shorter and happen to fall compact enough to pass, even
+  though they are the same category of misclassification (hull
+  detail tagged `Kind::Leg` by `partdetect::classify`, not an actual
+  leg). Span-based compactness doesn't generalize to catch it — the
+  guard narrowed the false-positive window without closing it, and the
+  root cause is still in `partdetect::classify`'s Leg tagging, not in
+  this corridor check at all. Not attempting a further threshold fix
+  here: this is exactly the kind of guess-a-number-and-discover-it's-
+  wrong pattern this file already warns about, on a tool this file
+  separately already flags as having "flip-flopped between two of my
+  own fix attempts" — a third attempt without a labelled set to check
+  against risks the same fate. Recording the precise repro
+  (`silhouette_audit assets/bots boat_mistral_class_lhd`, and the exact
+  numbers above) so whoever looks at `partdetect::classify`'s Leg logic
+  next doesn't have to re-derive them.
 - **`orientsim.rs`'s per-pose orientation solver has no cross-pose
   consistency check** — it evaluates each pose file of a fold strip
   completely independently, with no verification that the poses still
@@ -200,6 +244,32 @@ from the shipped binary, same category as the pre-existing 335.
   compared to the pre-write state — turning a silent regression into a
   loud one at commit time instead of requiring a manual `git stash` diff
   to find.
+
+  **Traced this all the way through before implementing it, and the
+  proposed fix turned out to already be superseded by a different
+  mitigation.** `model.rs`'s `sidecar_is_heuristic` (added in the same
+  commit that fixed the `tank_lynx_6x6` regression, `7c6d53b2`) checks
+  whether an `orient.json`'s own text contains `"heuristic"` — and
+  every tag `orientsim.rs` ever writes does: `orient_heuristic_v1`,
+  `orient_heuristic_v1_up_only`, `orient_heuristic_v1_unverified`, no
+  exceptions. `loader_frame`/`declared_orientation` both gate on
+  `!heuristic` before trusting a sidecar, so **every file `orientsim.rs`
+  can possibly write is unconditionally skipped by the real loader**,
+  which falls through to `strip_guess` (one orientation per chassis,
+  computed live from the vehicle pose) regardless of what `--commit`
+  put on disk. That means the specific failure mode this fix targets —
+  inconsistent per-pose guesses reaching the game and tumbling a fold —
+  is now structurally impossible via this path, independent of whether
+  `orientsim.rs` itself checks anything. `--commit` writing these files
+  is closer to a diagnostic log than a live config: it's write-only with
+  respect to actual gameplay today. Adding the proposed commit-time
+  `align::unify` guard would still have narrow diagnostic value (warning
+  a future maintainer if a written guess is internally inconsistent,
+  useful if the heuristic-skip in `model.rs` is ever loosened or the
+  tagging convention changes), but it is not closing a live gap the way
+  it read before this check — downgrading from "needs a fix" to
+  "optional hardening," and leaving it there rather than spending more
+  time on a guard against a scenario the loader already rules out.
 - **Only 2 of 34 tank-named chassis are detected as tracked at all**
   (`turret::find`'s `treads.len() >= 2` check). Traced to a precise,
   reproducible cause, not scattered noise: `TREAD_LOW` (0.10) checks a
@@ -564,6 +634,23 @@ or per-boss flag the fold system actually checks (a natural
 `boss` already work) plus deciding what such a boss does INSTEAD of
 folding — stay one form, or a different, non-`xform` presentation
 entirely.
+
+**The flag now exists — `main.rs`'s `Chassis::transforms` (default
+true), read from the same `chassis.json` string-match pattern as
+`boss`/`scale`.** Went with "stay one form" as the default behavior,
+not the "different, non-xform presentation" alternative: it needed no
+new asset support, is a one-line addition at the existing "this chassis
+does not transform" refusal in `transform()` (same toast a non-bot car
+already gets — there is no more to say about a boss authored to fight
+in one form than about a car that was never a bot), and leaves every
+other system keyed off `cars.xform` (the pose inspector, `chassis_scale`,
+`is_boss`, walk poses) completely untouched — the strip itself still
+exists and is still browsable, only the player-facing fold key stops
+doing anything. No existing chassis.json sets `"transforms": false` (checked
+all 252), so this is inert until a specific boss actually opts out — the
+mechanism is built, but nobody has been told which boss(es), if any,
+should use it. That's a content decision, not a code one, and belongs
+with whoever is authoring the boss roster.
 
 **The logscope/aperture/wgpu-engine vision (AI-authored raids):**
 architecturally coherent, not just aspirational — `apps/logscope`

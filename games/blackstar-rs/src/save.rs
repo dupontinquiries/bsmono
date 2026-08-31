@@ -76,6 +76,46 @@ pub struct Save {
 
 impl Default for Save {
     fn default() -> Save {
+        // STARTER GEAR. A brand-new player had an empty armed rail, an
+        // empty bag, and an empty hotbar — the Armory console (`stations.rs`,
+        // Station::Armory) is fully built and wired, but there was nothing
+        // in it to look at or arm. `gear::WEAPONS` is a real, tested
+        // catalog with nowhere it was ever reachable from during play.
+        // Seeding a few of its entries here is the one place that reaches
+        // every new save (both "no save file yet" and "the save on disk
+        // failed to parse") without touching an existing player's gear.
+        let firstedge = crate::gear::Item::Weapon {
+            verb: crate::weapons::Verb::Thrust,
+            element: crate::weapons::Element::None,
+            from: None,
+        };
+        let placeholder_blade = crate::gear::Item::Weapon {
+            verb: crate::weapons::Verb::Thrust,
+            element: crate::weapons::Element::Fire,
+            from: None,
+        };
+        let ashpulse = crate::gear::Item::Weapon {
+            verb: crate::weapons::Verb::Beam,
+            element: crate::weapons::Element::Fire,
+            from: None,
+        };
+        let longcoil = crate::gear::Item::Weapon {
+            verb: crate::weapons::Verb::Chain,
+            element: crate::weapons::Element::None,
+            from: None,
+        };
+        let starter_bag =
+            [&firstedge, &placeholder_blade, &ashpulse].iter().map(|it| it.code()).collect::<Vec<_>>().join(",");
+        // RACKED ON THE BAR TOO, not just in the bag — so pressing 1/2/3
+        // does something the moment a new save loads, rather than
+        // requiring a trip to the Armory first to find out the hotbar
+        // exists. Built through Hotbar's own assign()/line() rather than
+        // hand-written as a string, so this can't drift from whatever
+        // format from_line() actually expects.
+        let mut starter = crate::hotbar::Hotbar::default();
+        let _ = starter.assign(0, firstedge);
+        let _ = starter.assign(1, placeholder_blade);
+        let _ = starter.assign(2, ashpulse);
         Save {
             total_rings: 0,
             total_car_rings: 0,
@@ -100,15 +140,15 @@ impl Default for Save {
             nightfalls: String::new(),
             shipwear: 0.0,
             chi: String::new(),
-            armed: String::new(),
+            armed: format!("{},,", longcoil.code()), // LONGCOIL on the kinetic rail
             worn: String::new(),
             wep_mods: String::new(),
-            bag: String::new(),
+            bag: starter_bag,
             vault: String::new(),
             finds: String::new(),
             case: String::new(),
             watch: String::new(),
-            hotbar: String::new(),
+            hotbar: starter.line(),
             look: String::new(),
         }
     }
@@ -260,6 +300,37 @@ pub fn render(s: &Save, b: &Bindings, cfg: &Config) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_new_save_has_real_starter_gear_not_empty_strings() {
+        // Before this, Save::default() left armed/bag/hotbar as
+        // String::new() -- a brand-new player's Armory console had
+        // nothing to look at. This proves the seeded content actually
+        // round-trips through the REAL parsers (Gear::from_save,
+        // Hotbar::from_line), not just that the strings look non-empty.
+        let sv = Save::default();
+        assert!(!sv.armed.is_empty(), "armed rail was left empty");
+        assert!(!sv.bag.is_empty(), "starter bag was left empty");
+        assert!(!sv.hotbar.is_empty(), "starter hotbar was left empty");
+
+        let gear = crate::gear::Gear::from_save(&sv.armed, &sv.worn, &sv.bag);
+        assert!(gear.kinetic.is_some(), "kinetic rail did not parse back to an item");
+        assert_eq!(gear.bag.len(), 3, "expected 3 starter bag items, got {}", gear.bag.len());
+
+        let hb = crate::hotbar::Hotbar::from_line(&sv.hotbar);
+        assert!(hb.slot(0).is_some(), "hotbar slot 1 is empty on a new save");
+        assert!(hb.slot(1).is_some(), "hotbar slot 2 is empty on a new save");
+        assert!(hb.slot(2).is_some(), "hotbar slot 3 is empty on a new save");
+        // and specifically: the placeholder_blade the person asked for is
+        // actually reachable, not just "some item"
+        let has_placeholder_blade = (0..crate::hotbar::SLOTS).any(|i| {
+            matches!(
+                hb.slot(i).map(|s| &s.item),
+                Some(crate::gear::Item::Weapon { verb: crate::weapons::Verb::Thrust, element: crate::weapons::Element::Fire, .. })
+            )
+        });
+        assert!(has_placeholder_blade, "the placeholder_blade isn't in the starter hotbar");
+    }
+
     /// A `Save` with every field set to something distinctive, so a field
     /// dropped by either half of the trip shows up as a mismatch rather than
     /// as a default that happens to look plausible.
@@ -394,3 +465,4 @@ mod tests {
         assert!((back.story.case_cap - 9.0).abs() < 1e-3, "case_cap");
     }
 }
+

@@ -48,6 +48,9 @@ mod partdata;
 mod palevector;
 mod parity;
 mod patrol;
+mod escalation;
+mod enemy;
+mod gates;
 mod perception;
 mod trials;
 mod trainwatch;
@@ -666,6 +669,20 @@ struct Chassis {
     scale: f32,
     /// does this chassis fight as a boss
     boss: bool,
+    /// can this chassis fold vehicle<->robot at all. Defaults to true —
+    /// every ordinary bot does. A boss whose asset was never authored
+    /// with a coherent fold strip (a design choice, not a bug: not every
+    /// raid boss is "always transformable in the same sense as bots")
+    /// sets `"transforms": false` in its `chassis.json` to opt out,
+    /// mirroring how `scale`/`boss` are already per-chassis data rather
+    /// than a code change. Read by `transform()`, which refuses the fold
+    /// request with the same "does not transform" toast a non-bot car
+    /// already gets — the strip itself is untouched, so the catalogue's
+    /// pose inspector, `chassis_scale`, `is_boss`, and everything else
+    /// keyed off `cars.xform` still see every pose exactly as before;
+    /// the only change is that the player-facing fold key stops doing
+    /// anything for this chassis.
+    transforms: bool,
     /// jets fly instead of driving: never grounded, lift and nose thrust
     flight: bool,
     /// hoverers/hovertanks ride a cushion instead of driving on wheels —
@@ -943,6 +960,18 @@ struct Game {
     combo_t: f32,
     air_t: f32,
     air_link: f32,
+    /// throttle for the CLIMB toast, same shape as the C engine's
+    /// `g_climb_msg_cd` — `ev.climbing` fires every physics step while
+    /// climbing (dozens of times a second), so this is what keeps the
+    /// toast from spamming rather than physics gating it itself.
+    climb_msg_cd: f32,
+    /// WIRING DEBT from docs/PLAN.md's own Phase 0 list: "patrol -- a
+    /// game mode that calls update". Wired here for the SAFE half only
+    /// (see the tick site's own comment) -- the Surge/Hold/Onslaught
+    /// combat-event half of patrol::update's output is deliberately
+    /// left unconsumed, since surfacing "SURGE incoming" with nothing
+    /// actually spawning to fight would be worse than not showing it.
+    patrol: patrol::Patrol,
 }
 
 /// Impulse (delta-v, m/s) to hp damage. ONE conversion for everything the
@@ -1912,6 +1941,9 @@ fn main() {
                 boss: std::fs::read_to_string(bdir.join("chassis.json"))
                     .map(|t| t.contains("\"boss\": true") || t.contains("\"boss\":true"))
                     .unwrap_or(false),
+                transforms: std::fs::read_to_string(bdir.join("chassis.json"))
+                    .map(|t| !(t.contains("\"transforms\": false") || t.contains("\"transforms\":false")))
+                    .unwrap_or(true),
                 flight,
                 floats,
             });
@@ -2083,6 +2115,8 @@ fn main() {
         combo_t: 0.0,
         air_t: 0.0,
         air_link: 0.0,
+        climb_msg_cd: 0.0,
+        patrol: patrol::Patrol::default(),
     };
 
     // Upload the ship's hull once. `Aboard::upload_hull` needs `&mut Gpu`, so
@@ -2092,6 +2126,13 @@ fn main() {
         // &mut out of `game` at once; `upload_ship_hull` is a method, so
         // disjoint-field borrows handle it and the swap can go.
         game.upload_ship_hull();
+        // A REAL MODEL OVER THE PROCEDURAL SHELL. The interior's own SDF
+        // collision (hull box minus carved rooms) is untouched by this —
+        // see `Aboard::exterior`'s own doc comment — this only swaps what
+        // gets DRAWN for the outer skin. Picked from the catalog's own
+        // `category: "spaceship"` chassis; a big troop-transport shape
+        // fits "mobile fortress" better than a small courier or fighter.
+        game.aboard.load_exterior(&mut game.gpu, &bots_dir, "spaceship_warpzone_aka_military_troop_ship");
         // PARK IT AT THE SAME PLACE THE DRAW CALL PUTS IT. Two transforms for
         // one object is how a hull you can see and a hull you can hit end up
         // in different places, so both read `ground_lift` — and this is the
@@ -2598,6 +2639,22 @@ impl Game {
             }
             Action::FlipVis => self.flip_vis = !self.flip_vis,
             Action::Transform => self.transform(),
+            Action::FlightMode => {
+                if self.car.flight {
+                    self.car.flight_submode = self.car.flight_submode.cycle();
+                    self.car.recompute_hand();
+                    self.toastf(&format!("FLIGHT MODE: {}", self.car.flight_submode.label()));
+                }
+                // silently does nothing outside flight -- same as PitchUp/
+                // PitchDown, a player who never flies never hits this branch
+            }
+            Action::SiegeMode => {
+                if self.car.tracked {
+                    self.car.siege_mode = self.car.siege_mode.cycle();
+                    self.car.recompute_hand();
+                    self.toastf(&format!("TANK MODE: {}", self.car.siege_mode.label()));
+                }
+            }
             Action::Fire => self.fire_weapon(),
             Action::CycleForm => {
                 if self.wep.watch.cycle() {
@@ -2775,17 +2832,37 @@ impl Game {
         // measured on the way here: the hull's extents and wheel radius
         // from the model, treads from `turret`, wheels/thrusters and the
         // mode from `locomotion`. One more step, no new measurement.
-        self.car.hand = driveline::derive(driveline::Shape {
+        //
+        // TRAITS RIDE ALONGSIDE THE GEOMETRY, same source as the
+        // compaction-style lookup elsewhere in this file
+        // (`bot_categories` -> `Traits::from_category`) — a tank's high
+        // traction and a racer's low one used to make zero difference to
+        // actual handling (flagged in TODO.md as dead data); this is
+        // that wiring.
+        let traits = self.bot_categories.get(self.cars.names[m])
+            .map(|c| crate::chassis_traits::Traits::from_category(c))
+            .unwrap_or_default();
+        let tracked = self.cars.models[m].fittings.tracked();
+        self.car.hand_base = driveline::derive(driveline::Shape {
             half_len: self.car.half_len,
             half_w: self.car.half_w,
             half_h: self.car.half_h,
             wheel_r: self.car.wheel_r,
             wheels: self.loco_mode.wheels,
-            tracked: self.cars.models[m].fittings.tracked(),
+            tracked,
             hovering: self.car.hover.is_some(),
             flying: self.car.flight,
             thrusters: self.loco_mode.thrusters,
+            traction: traits.traction,
+            mass_bias: traits.mass_bias,
         });
+        // a chassis switch always lands in FastFly/Roll (== hand_base
+        // unmultiplied) rather than carrying over whatever sub-mode the
+        // PREVIOUS chassis happened to be in
+        self.car.flight_submode = physics::FlightSubMode::default();
+        self.car.tracked = tracked;
+        self.car.siege_mode = physics::TankSiegeMode::default();
+        self.car.recompute_hand();
         let h = self.car.hand;
         self.toastf(&format!(
             "{}: {:?} — {} · {:.1} t, accel x{:.2} top x{:.2} grip x{:.2}{}",
@@ -2831,7 +2908,15 @@ impl Game {
         if self.net.online() || self.mode != Mode::Play {
             return;
         }
-        if self.cars.xform.get(&self.cars.active).is_none() {
+        let Some(&(cid, _)) = self.cars.xform.get(&self.cars.active) else {
+            self.toastf("this chassis does not transform");
+            return;
+        };
+        if !self.cars.chassis[cid].transforms {
+            // same message a non-bot car gets: the player-facing effect
+            // (the key does nothing) is identical either way, and there
+            // is no more to say about a boss that was authored to fight
+            // in one form than there is about a car that was never a bot
             self.toastf("this chassis does not transform");
             return;
         }
@@ -3589,7 +3674,7 @@ impl Game {
         self.loco.condition(hurt, wall);
         self.loco_pose = self
             .loco
-            .update(dt, horiz, vert, self.car.on_ground, boosting);
+            .update(dt, horiz, vert, self.car.on_ground, boosting, self.car.climbing > 0.5);
         // element movement also belongs here: Air runs, Rock does not
         let _ = self.wep.move_mul();
 
@@ -5534,10 +5619,25 @@ impl Game {
             }
         }
         let steer = (steer + t_steer).clamp(-1.0, 1.0);
+        // FLIGHT MODE gets independent throttle/pitch. Ground vehicles keep
+        // fwd/rev driving BOTH (the Rocket-League aerial-trick coupling,
+        // deliberate and correct there — holding forward pitches the nose
+        // down to angle into a hit); a jet needs the two decoupled, which
+        // the shared keys structurally can't give it. `Action::PitchUp`/
+        // `PitchDown` are flight-only bindings (see their own doc comments
+        // in `input.rs`) that do nothing outside `self.car.flight`, so a
+        // player who never flies never has to learn they exist.
+        let pitch = if self.car.flight {
+            let pu = self.axis(Action::PitchUp);
+            let pd = self.axis(Action::PitchDown);
+            (pd - pu - ps.stick_y + t_air.map(|v| -v.y).unwrap_or(0.0)).clamp(-1.0, 1.0)
+        } else {
+            (rev - fwd - ps.stick_y + t_air.map(|v| -v.y).unwrap_or(0.0)).clamp(-1.0, 1.0)
+        };
         Controls {
             throttle: (fwd - rev + ps.throttle + t_thr).clamp(-1.0, 1.0),
             steer,
-            pitch: (rev - fwd - ps.stick_y + t_air.map(|v| -v.y).unwrap_or(0.0)).clamp(-1.0, 1.0),
+            pitch,
             yaw: ((-yaw_src).clamp(-1.0, 1.0) + t_air.map(|v| v.x).unwrap_or(0.0) * roll_mix).clamp(-1.0, 1.0),
             roll: ((rl - rr + roll_extra).clamp(-1.0, 1.0) + t_air.map(|v| v.x).unwrap_or(0.0) * (1.0 - roll_mix)).clamp(-1.0, 1.0),
             boost: self.action_down(Action::Boost) || t_boost,
@@ -5545,6 +5645,7 @@ impl Game {
             jump_pressed: false,
             jump_depth: self.axis_raw(Action::Jump).max(0.01),
             powerslide: slide_a > 0.35,
+            aiming: self.action_down(Action::Fire) || self.action_down(Action::AutoTarget),
         }
     }
 
@@ -6762,6 +6863,19 @@ impl Game {
             }
         }
 
+        // WALL-CLIMB FEEDBACK, throttled the same way the C engine
+        // throttles its own "CLIMB"/"MANTLE" hud message
+        // (`g_climb_msg_cd`) -- `ev.climbing` fires every physics step
+        // while climbing, so gating goes here rather than in physics.
+        self.climb_msg_cd = (self.climb_msg_cd - dt).max(0.0);
+        if ev.mantled {
+            self.toastf("MANTLE");
+            self.climb_msg_cd = 1.2;
+        } else if ev.climbing && self.climb_msg_cd <= 0.0 {
+            self.toastf("CLIMB");
+            self.climb_msg_cd = 1.5;
+        }
+
         // air-dribble timer: ball airborne, kept alive by aerial touches
         let ball_air = self.world.sdf(self.ball.pos) > self.ball.r + 0.25;
         let aerial_touch = !ev.touches.is_empty() && !self.car.on_ground && ball_air;
@@ -6788,6 +6902,7 @@ impl Game {
         self.tick_lesson(dt);
         self.tick_aboard();
         self.tick_trial(dt);
+        self.tick_patrol(dt);
         if ball_air && self.air_link > 0.0 {
             self.air_t += dt;
             self.air_link -= dt;
@@ -7287,6 +7402,11 @@ impl Game {
             self.toastf("no such destination");
             return;
         };
+        // SYNC PATROL TO WHERE YOU ACTUALLY ARE. `Patrol::bridge_to`'s own
+        // doc: "a jump is a change of world, not a fast-travel within
+        // one" -- exactly this call site, which already treats arrival
+        // the same way (fresh map, fresh medium).
+        self.patrol.bridge_to(dest);
         let style = mapsim::style_for(d);
         self.load_map(style, dest_seed(d.id));
         self.set_medium_for(d);
@@ -7410,6 +7530,7 @@ impl Game {
         self.aboard.ship.unseal(); // a ship at rest has its doors open
         self.repark();
         self.aboard.hull_slot = None; // force a fresh upload at the new size
+        self.aboard.cells_slot = None;
         self.upload_ship_hull();
         self.step_outside();
         self.toastf(&format!(
@@ -7448,6 +7569,40 @@ impl Game {
         self.cam.indoors = None;
     }
 
+    /// WIRING DEBT (docs/PLAN.md Phase 0: "patrol -- a game mode that
+    /// calls update"). `patrol::Patrol::update` returns both an ambient/
+    /// lore text drip AND a Surge/Hold/Onslaught combat-event state
+    /// machine in one `Tick` -- this consumes ONLY the text half.
+    ///
+    /// The event half is deliberately NOT surfaced: `out.started` would
+    /// mean announcing "SURGE incoming" with nothing actually spawning
+    /// to fight (this codebase's bot-spawn system isn't hooked up to
+    /// patrol's event position/quota), which reads as a broken promise
+    /// rather than a missing feature. The event state machine still
+    /// runs in the background (there's no way to call update() and get
+    /// only half its side effects) and will quietly time out and fail
+    /// on its own clock -- harmless, since nothing ever announced it in
+    /// the first place. Wiring the event half for real needs a bot
+    /// spawned at `Event::at` with a kill-credit hook into
+    /// `Patrol::credit_kill`, which is its own scoped follow-up, not
+    /// something to bolt on blind here.
+    fn tick_patrol(&mut self, dt: f32) {
+        if self.mode != Mode::Play {
+            return; // a menu/console shouldn't advance the world's own clock
+        }
+        // no day/night cycle exists yet in this engine (checked: no
+        // caller anywhere computes one) -- 0.0 (always day) is an
+        // honest stand-in, not a guess at what night should look like
+        let night = 0.0;
+        let player = [self.car.pos.x, self.car.pos.z];
+        let tick = self.patrol.update(dt, player, night);
+        if let Some(line) = tick.ambient {
+            self.toastf(line);
+        } else if let Some(line) = tick.lore {
+            self.toastf(line);
+        }
+    }
+
     fn tick_aboard(&mut self) {
         // THE DOORS HAVE NEVER MOVED. `step_doors` exists, `Door::update`
         // animates travel, `passable()` reads it — and nothing ticked the
@@ -7480,12 +7635,15 @@ impl Game {
         // cheapest thing that notices.
         if doors_now != self.door_mask {
             self.door_mask = doors_now;
-            if let (Some(slot), Some((_, ship))) =
-                (self.aboard.hull_slot, self.world.parked.as_ref())
+            if let (Some(cells_slot), Some((_, ship))) =
+                (self.aboard.cells_slot, self.world.parked.as_ref())
             {
-                let m = aboard::hull_mesh(ship);
-                self.gpu.replace_mesh(slot, &m);
+                let m = aboard::hull_cells_mesh(ship);
+                self.gpu.replace_mesh(cells_slot, &m);
             }
+            // the hull SKIN doesn't change shape when a door opens (only
+            // the cell/link boundary boxes do — the outer silhouette is
+            // fixed by `hull_half`), so it isn't re-uploaded here.
         }
 
         // and the camera: pull the boom in while the player is inside, or it
@@ -7587,16 +7745,58 @@ impl Game {
         // from it would show a hull that disagrees with the one you collide
         // with — the exact "see it here, hit it there" failure the lift
         // shares a function to avoid.
-        if let (Some(slot), Some((origin, _))) =
+        //
+        // TWO DRAW CALLS, TWO COLOURS, not one merged mesh in one flat
+        // colour. Before this split the outer hull skin and the internal
+        // room/corridor boundary boxes shared a single push() and a
+        // single untextured colour — indistinguishable from "a cluster of
+        // grey boxes," which is exactly what it read as. A darker,
+        // slightly blued structural tone for the skin and a warmer,
+        // lighter one for the room framing gives a viewer at least two
+        // things to tell apart; real materials/texturing are a further
+        // step this doesn't attempt.
+        if let Some(m) = self.aboard.exterior.as_ref() {
+            // A REAL MODEL, drawn prim-by-prim with its own real textures
+            // and colours, in place of the procedural skin push below —
+            // this is the whole point of `Aboard::exterior`: something
+            // that reads as a ship rather than as a shape. Collision is
+            // still the procedural hull box (see `exterior`'s own doc
+            // comment), so this loop only ever runs if the model loaded;
+            // on any failure `exterior` stays `None` and the procedural
+            // skin (further down) draws instead, so there is always
+            // SOMETHING there.
+            if let Some((origin, _)) = self.world.parked.as_ref() {
+                let base = Mat4::from_translation(*origin);
+                for prim in &m.prims {
+                    push(&mut objs, prim.mesh_id, prim.tex_id, base, prim.color, [0.0, 0.0, 0.0, 0.0]);
+                }
+            }
+        } else if let (Some(skin_slot), Some((origin, _))) =
             (self.aboard.hull_slot, self.world.parked.as_ref())
+        {
+            // FALLBACK: the procedural loft, only when no real model is
+            // loaded. Same two-colour split as before this pass — see
+            // the comment above `cells_slot`'s own draw call below.
+            let lift = Mat4::from_translation(*origin);
+            push(
+                &mut objs,
+                skin_slot,
+                None,
+                lift,
+                [0.30, 0.33, 0.38, 1.0],
+                [0.35, 0.0, 0.25, 0.0],
+            );
+        }
+        if let (Some(cells_slot), Some((origin, _))) =
+            (self.aboard.cells_slot, self.world.parked.as_ref())
         {
             let lift = Mat4::from_translation(*origin);
             push(
                 &mut objs,
-                slot,
+                cells_slot,
                 None,
                 lift,
-                [0.62, 0.66, 0.72, 1.0],
+                [0.78, 0.80, 0.74, 1.0],
                 [0.35, 0.0, 0.25, 0.0],
             );
         }
@@ -8089,8 +8289,6 @@ impl Game {
         // steer and the gun goes where you are aiming. Yaw only, about the
         // RING rather than the turret's mass (`turret::find`) — a gun that
         // pivots on its own centroid swings its breech through the hull.
-        // Elevation is deliberately absent: pitching a turret needs the
-        // mantlet's own axis, which is a second detection and not this one.
         let turret_q = if active.fittings.has_turret() {
             // where the EYE is looking, taken from the camera's own
             // geometry rather than a euler it does not keep: the vector
@@ -8117,6 +8315,32 @@ impl Game {
         } else {
             None
         };
+        // ELEVATION, on the one prim `turret::find` identified as the
+        // barrel, about its own detected pivot/axis rather than the
+        // ring — pitching about the ring would swing the whole turret
+        // body, not just tip the gun. Composed INSIDE the yaw above
+        // (applied to the raw prim before `turret_q`, see the order of
+        // the two match arms below): elevate the barrel in the turret's
+        // own unyawed frame first, then yaw the already-elevated barrel
+        // along with the rest of the turret.
+        //
+        // FIRST-PASS ELEVATION LIMITS, not a measured or playtested
+        // number: +20/-8 degrees is a generic real-world tank-gun range,
+        // used here as a physically-motivated default rather than an
+        // arbitrary one, since this needs a controller in someone's
+        // hands to actually tune. Expect these two constants to move.
+        const MAX_ELEVATION: f32 = 20.0 * std::f32::consts::PI / 180.0;
+        const MAX_DEPRESSION: f32 = 8.0 * std::f32::consts::PI / 180.0;
+        let elevation_q = active.fittings.barrel.map(|_| {
+            let view = self.cam.look - self.cam.pos;
+            let flat = (view.x * view.x + view.z * view.z).sqrt().max(1e-4);
+            let want_pitch = view.y.atan2(flat).clamp(-MAX_DEPRESSION, MAX_ELEVATION);
+            // `elevation_axis` is defined (turret.rs, verified by its own
+            // test) so a POSITIVE angle raises the muzzle — same sign as
+            // "looking up is a positive pitch" here, so no sign flip
+            // needed at this call site.
+            Quat::from_axis_angle(active.fittings.elevation_axis, want_pitch)
+        });
         let robot = self.xf.is_robot();
         // STAND THE DESTINATION UP WITHOUT BENDING THE JOURNEY.
         //
@@ -8226,6 +8450,49 @@ impl Game {
                     base * Mat4::from_translation(r)
                         * Mat4::from_quat(*q)
                         * Mat4::from_translation(-r)
+                }
+                _ => base,
+            };
+            // ELEVATION, on the barrel only, composed AFTER the yaw above
+            // so it ends up INNER to it (matrix chain applies right-to-
+            // left to the raw vertex): pitch the barrel about its own
+            // pivot in the turret's unyawed local frame first, then the
+            // yaw carries the already-elevated barrel around with the
+            // rest of the turret, exactly like a real mantlet riding on
+            // a rotating turret ring.
+            let base = match (&elevation_q, active.fittings.barrel) {
+                (Some(eq), Some(bi)) if bi == pi => {
+                    let p = active.fittings.elevation_pivot;
+                    base * Mat4::from_translation(p)
+                        * Mat4::from_quat(*eq)
+                        * Mat4::from_translation(-p)
+                }
+                _ => base,
+            };
+            // WEAPON POP-OUT (cosmetic transform-lite): telescope the
+            // barrel outward along its own root->tip axis while aiming/
+            // firing, composed innermost of all (right after elevation,
+            // before it) so it extends in the tube's own rest direction
+            // and rides along with whatever elevation/yaw is already
+            // applied to the rest of the assembly. Character expression,
+            // not a mechanical system -- no new detection, no new
+            // resource, no new keybinding; reuses the barrel this
+            // session already built for elevation and ties to the
+            // player already aiming or firing (`Car::weapon_pop`).
+            let base = match active.fittings.barrel {
+                Some(bi) if bi == pi && self.car.weapon_pop > 1e-4 => {
+                    let root = active.fittings.elevation_pivot;
+                    let reach = active.fittings.barrel_tip - root;
+                    let len = reach.length();
+                    let dir = if len > 1e-5 { reach / len } else { Vec3::NEG_Z };
+                    // extend by up to a third of the barrel's own length
+                    // -- enough to read as a real motion, not so much
+                    // the muzzle detaches from its own mount visually.
+                    // Not a number checked against how any specific
+                    // chassis' barrel should look extending, same
+                    // first-pass-guess caveat as this session's other
+                    // new magnitudes.
+                    base * Mat4::from_translation(dir * len * 0.33 * self.car.weapon_pop)
                 }
                 _ => base,
             };

@@ -211,12 +211,30 @@ pub fn skeletonize(prims: &[&[Vec3]]) -> Skeleton {
     // vehicle's core is often several pieces (floor, cabin, engine cover)
     // and a bot's torso nearly always is.
     let cents: Vec<Vec3> = prims.iter().map(|p| centroid(p)).collect();
+    let half_safe = half.max(Vec3::splat(1e-4));
     for (i, c) in cents.iter().enumerate() {
         if prims[i].is_empty() {
             continue;
         }
-        let d = ((*c - mid) / half.max(Vec3::splat(1e-4))).length();
-        if d < CORE_R {
+        let d = ((*c - mid) / half_safe).length();
+        if d >= CORE_R {
+            continue;
+        }
+        // CENTROID-CENTRAL IS NOT THE SAME AS SMALL. A prim can sit
+        // dead centre by that measure and still reach far in one
+        // direction — e.g. an oversized wing whose root is planted at
+        // the body's middle. Checked on `starlord`: prim 34 (an
+        // oversized Wing) passes the centroid check outright (23 of 37
+        // prims do) and becomes core, so it is never evaluated as a
+        // limb at all (`trace_compact assets/bots starlord 34`).
+        // Fix: also require the prim's FARTHEST point — not just its
+        // centroid — to sit within CORE_R, using the same threshold
+        // rather than inventing a second one. A prim that is genuinely
+        // core-sized clears this trivially (its own extent is small
+        // relative to the body); one that merely roots centrally but
+        // reaches outward does not.
+        let reaches_out = prims[i].iter().any(|p| ((*p - mid) / half_safe).length() >= CORE_R);
+        if !reaches_out {
             sk.core.push(i);
         }
     }
@@ -712,6 +730,33 @@ mod tests {
             blob(Vec3::new(3.4, 0.0, 0.0), Vec3::new(2.6, 0.08, 0.9), 220),
             blob(Vec3::new(0.0, 0.9, 2.6), Vec3::new(0.1, 0.7, 0.5), 90),
         ]
+    }
+
+    /// A wing rooted at the body's own centre — its CENTROID sits dead
+    /// central (passing the old, single-property check) but it reaches
+    /// far out along its own long axis, same shape of bug as `starlord`
+    /// prim 34.  Regression test for the "centroid-central AND still
+    /// reaching outward" gap: a fuselage-sized blob at the origin plus
+    /// one long, thin blob whose points run from the origin outward
+    /// (so its centroid is near-central even though its tip is not).
+    fn rooted_wing(len: f32, n: usize) -> Vec<Vec3> {
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / (n - 1).max(1) as f32; // 0..1 along the wing
+                Vec3::new(t * len, 0.05 * (i as f32 * 1.3).sin(), 0.05 * (i as f32 * 0.7).cos())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_centrally_rooted_prim_that_reaches_out_is_not_core() {
+        let core = blob(Vec3::ZERO, Vec3::new(0.6, 0.6, 0.6), 400);
+        let wing = rooted_wing(6.0, 200);
+        let bodies = vec![core, wing];
+        let refs: Vec<&[Vec3]> = bodies.iter().map(|v| v.as_slice()).collect();
+        let sk = skeletonize(&refs);
+        assert!(!sk.core.contains(&1), "a prim reaching far out was still classified as core: {}", sk.report());
+        assert!(sk.limbs.iter().any(|l| l.prims.contains(&1)), "the reaching prim was not detected as a limb: {}", sk.report());
     }
 
     #[test]

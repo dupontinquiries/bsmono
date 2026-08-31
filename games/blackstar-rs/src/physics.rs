@@ -11,7 +11,7 @@
 //! and **flip resets**: touch anything with your wheels while airborne and
 //! the flip comes back, RL-style, which is the whole air-dribble endgame.
 
-use glam::{Quat, Vec3};
+use glam::{Quat, Vec2, Vec3};
 
 use crate::config::Config;
 use crate::world::World;
@@ -38,6 +38,115 @@ pub struct Controls {
     pub jump_pressed: bool,
     pub jump_depth: f32, // wooting analog on the jump key: 1.0 = digital
     pub powerslide: bool,
+    /// aiming or firing -- drives the weapon pop-out cosmetic (see
+    /// `Car::weapon_pop`), not a gameplay-affecting input. Named for
+    /// what it MEANS rather than which key it came from, since two
+    /// different actions (Fire, AutoTarget) both count.
+    pub aiming: bool,
+}
+
+/// FLIGHT SUB-MODE. Proposed as "single-tap Transform cycles VTOL/hover
+/// vs. fast-fly/autoboost" — implemented on a DEDICATED key instead
+/// (`Action::FlightMode`), not `Action::Transform`, because a flying
+/// chassis can already fold vehicle<->robot through Transform today,
+/// and giving the same button a second meaning risks silently
+/// swallowing a real fold request. That precedence question is exactly
+/// what the original proposal flagged as needing a decision before
+/// implementation; this sidesteps it rather than guessing an answer.
+///
+/// `FastFly` is the default so a chassis nobody's toggled this on
+/// drives exactly as flight always has — this is new, additive
+/// behavior, not a retune of the existing feel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FlightSubMode {
+    /// low speed, high control authority — navigation, precision,
+    /// threading terrain, dogfighting maneuvers
+    Vtol,
+    /// high speed, committed trajectory — today's unmodified flight feel
+    #[default]
+    FastFly,
+}
+
+impl FlightSubMode {
+    pub fn cycle(self) -> FlightSubMode {
+        match self {
+            FlightSubMode::Vtol => FlightSubMode::FastFly,
+            FlightSubMode::FastFly => FlightSubMode::Vtol,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            FlightSubMode::Vtol => "VTOL",
+            FlightSubMode::FastFly => "FAST FLY",
+        }
+    }
+    /// Multipliers over the chassis' own `driveline`-derived Handling —
+    /// rides on top of it exactly the way `driveline` itself rides on
+    /// top of `CarCfg` (see that module's doc). FastFly is 1.0/1.0: a
+    /// no-op, so the default mode reproduces today's flight exactly.
+    ///
+    /// NOT IMPLEMENTED: the proposal's boost-reserve half ("regenerates
+    /// continuously or doesn't deplete... needs its own reserve concept
+    /// for flight, not reuse of Hover::base_tank"). That's a genuinely
+    /// separate resource system, not a multiplier, and inventing its
+    /// numbers here would be a guess with nothing to check it against —
+    /// left for whoever picks this up with an actual sense of what the
+    /// reserve should feel like to manage.
+    fn multipliers(self) -> (f32, f32) {
+        // (top_speed_mul, turn_mul)
+        match self {
+            FlightSubMode::Vtol => (0.55, 1.6),
+            FlightSubMode::FastFly => (1.0, 1.0),
+        }
+    }
+}
+
+/// TANK SIEGE/ROLL CYCLE. Same shape of proposal as `FlightSubMode`,
+/// same precedence problem with `Action::Transform` (a tank chassis can
+/// already fold vehicle<->robot through it), same resolution: its own
+/// dedicated key (`Action::SiegeMode`) rather than inserting a third
+/// state into the fold button's existing binary meaning.
+///
+/// `Roll` is the default/no-op, same reasoning as `FlightSubMode`'s
+/// `FastFly` default: nobody who never presses the new key should see
+/// any change from today's tank handling.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TankSiegeMode {
+    #[default]
+    Roll,
+    /// planted: trades mobility for grip, per the proposal's own framing
+    /// ("trade mobility for grip or damage resistance"). Damage
+    /// resistance is NOT touched here -- `Handling` has no armour/damage
+    /// field to plug into, and inventing one is a bigger step than this
+    /// pass is taking; scoped to the same accel/top_speed/grip/turn axes
+    /// `driveline` already exposes, same as everything else in this file.
+    Siege,
+}
+
+impl TankSiegeMode {
+    pub fn cycle(self) -> TankSiegeMode {
+        match self {
+            TankSiegeMode::Roll => TankSiegeMode::Siege,
+            TankSiegeMode::Siege => TankSiegeMode::Roll,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            TankSiegeMode::Roll => "ROLL",
+            TankSiegeMode::Siege => "SIEGE",
+        }
+    }
+    /// (accel_mul, top_speed_mul, grip_mul, turn_mul). Roll is all 1.0.
+    /// Siege's numbers are a first-pass guess sized to be an obvious,
+    /// noticeable trade (nearly rooted, much grippier, barely turns) --
+    /// not checked against how planting a specific tank chassis should
+    /// actually feel, same caveat as `FlightSubMode::multipliers`.
+    fn multipliers(self) -> (f32, f32, f32, f32) {
+        match self {
+            TankSiegeMode::Roll => (1.0, 1.0, 1.0, 1.0),
+            TankSiegeMode::Siege => (0.25, 0.15, 1.6, 0.3),
+        }
+    }
 }
 
 pub struct Car {
@@ -81,11 +190,49 @@ pub struct Car {
     /// grounded — which is precisely the state the aerial control block
     /// already handles. Setting this is most of what "flying" means here.
     pub flight: bool,
+    /// Which flight sub-mode is active (see `FlightSubMode`). Read only
+    /// when `flight` is true; a ground vehicle ignores it entirely.
+    pub flight_submode: FlightSubMode,
+    /// Is this a tracked (tank-like) chassis — `turret::Fittings::tracked()`
+    /// at the time `hand_base` was last derived. Kept here (rather than
+    /// re-deriving it) so `Action::SiegeMode` can gate on it the same way
+    /// `Action::FlightMode` gates on `flight`.
+    pub tracked: bool,
+    /// Which siege sub-mode is active (see `TankSiegeMode`). Read only
+    /// when `tracked` is true.
+    pub siege_mode: TankSiegeMode,
+    /// 0..1, smoothed toward 1 while `Controls::aiming` is true and back
+    /// toward 0 otherwise (same exponential-approach shape as
+    /// `steer_vis`). Purely cosmetic -- the racer weapon pop-out
+    /// proposal, read by the draw path to extend the detected barrel
+    /// prim (if any) along its own aim axis. Works on any chassis with
+    /// a `turret::Fittings::barrel`, not just tanks -- "racer" in the
+    /// proposal's name describes the intended character-expression use
+    /// case, not a restriction enforced here.
+    pub weapon_pop: f32,
+    /// WALL CLIMB, ported from the C engine's `g_climb_budget`
+    /// (games/blackstar/engine_src/game.c) — seconds of climbing left,
+    /// refilling to a fixed ceiling on landing rather than regenerating
+    /// over time, so it can't be farmed by standing still. Robot-only
+    /// (a vehicle doesn't climb walls); see `step_car`'s own climb
+    /// block for where this is spent.
+    pub climb_budget: f32,
+    /// 0..1, how deep into a climb stroke the body is — the same shape
+    /// of cosmetic, phase-driven channel `weapon_pop` is. Read by
+    /// `main.rs` (as `> 0.5`) to select `anim::Gait::Climb` in
+    /// `Locomotion::update` — the phase/pose itself lives in anim.rs,
+    /// not here; physics only says whether a climb is happening.
+    pub climbing: f32,
     /// WHAT THIS PARTICULAR HULL IS LIKE (`driveline`). Multipliers over
     /// the player's `CarCfg`, so tuning stays the player's and character
     /// stays the vehicle's. `Default` is all 1.0 — a chassis nobody
     /// measured drives exactly as it did before this existed.
     pub hand: crate::driveline::Handling,
+    /// `hand` BEFORE `flight_submode`'s multipliers, so toggling the
+    /// sub-mode is a pure function of this and never compounds (toggle
+    /// twice, get back exactly what you started with) and never needs
+    /// re-deriving from geometry just to flip a flight mode.
+    pub hand_base: crate::driveline::Handling,
     /// how this hull stays up. None means the flat legacy behaviour.
     pub lift: Option<crate::lift::Lift>,
     /// local atmosphere, 0 = vacuum. A wing and a rotor both need it.
@@ -231,7 +378,14 @@ impl Car {
             drive: crate::model::Drive::Combustion,
             hover: None,
             flight: false,
+            flight_submode: FlightSubMode::default(),
+            tracked: false,
+            siege_mode: TankSiegeMode::default(),
+            weapon_pop: 0.0,
+            climb_budget: 4.0, // matches the C engine's initial full budget
+            climbing: 0.0,
             hand: crate::driveline::Handling::default(),
+            hand_base: crate::driveline::Handling::default(),
             lift: None,
             air: 1.0,
             robot: false,
@@ -266,6 +420,35 @@ impl Car {
     }
     pub fn forward(&self) -> Vec3 {
         self.rot * Vec3::NEG_Z
+    }
+    /// Apply `hand_base`, `flight_submode` and `siege_mode` together into
+    /// `hand`, the value physics actually reads. Call this any time ANY
+    /// of the three changes, rather than mutating `hand` directly, so
+    /// they never drift apart and toggling a mode twice always returns
+    /// exactly to baseline. Flight and siege are mutually exclusive in
+    /// practice (a chassis is either flying or tracked, never both) but
+    /// both branches are written so neither assumes that if it changes.
+    pub fn recompute_hand(&mut self) {
+        let (mut accel_mul, mut top_mul, mut grip_mul, mut turn_mul) = (1.0, 1.0, 1.0, 1.0);
+        if self.flight {
+            let (t, tu) = self.flight_submode.multipliers();
+            top_mul *= t;
+            turn_mul *= tu;
+        }
+        if self.tracked {
+            let (a, t, g, tu) = self.siege_mode.multipliers();
+            accel_mul *= a;
+            top_mul *= t;
+            grip_mul *= g;
+            turn_mul *= tu;
+        }
+        self.hand = crate::driveline::Handling {
+            accel: self.hand_base.accel * accel_mul,
+            top_speed: self.hand_base.top_speed * top_mul,
+            grip: self.hand_base.grip * grip_mul,
+            turn: self.hand_base.turn * turn_mul,
+            ..self.hand_base
+        };
     }
     pub fn up(&self) -> Vec3 {
         self.rot * Vec3::Y
@@ -407,6 +590,27 @@ impl Car {
             wheel_r: self.wheel_r,
             drive: self.drive,
             hover: self.hover,
+            // FLIGHT IS ALSO THE CAR YOU CHOSE, and was missing from this
+            // list entirely -- found while wiring FlightSubMode/siege
+            // mode this session, but a real, pre-existing bug on its
+            // own: a jet reverted to grounded, non-flying physics after
+            // ANY reset (kickoff, goal, respawn, map load), same shape
+            // of bug as the hover/drivetrain one the comment above
+            // already documents. `hand`/`hand_base` carry over for the
+            // same reason `drive`/`hover` do -- a chassis nobody's
+            // re-switched-to should keep the handling it was measured
+            // to have, not silently fall back to Handling::default()
+            // (1.0 everywhere) until the next chassis switch happens to
+            // re-derive it. `tracked`/`flight_submode`/`siege_mode`
+            // carry over so an in-progress VTOL/siege toggle survives a
+            // kickoff instead of silently snapping back to the default
+            // sub-mode mid-match.
+            flight: self.flight,
+            flight_submode: self.flight_submode,
+            tracked: self.tracked,
+            siege_mode: self.siege_mode,
+            hand: self.hand,
+            hand_base: self.hand_base,
             boost: if self.hover.is_some() { 45.0 } else { 45.0 },
             pos: p,
             ..Car::new()
@@ -472,6 +676,15 @@ pub struct StepEvents {
     pub ball_bounce: Option<(Vec3, f32)>, // world-contact point + impact speed
     pub flip_reset: Option<Vec3>,               // underside contact restored the flip
     pub landed: Option<f32>,                    // car landing impact speed
+    /// wall-climb started or continued THIS step — the caller (main.rs)
+    /// only needs to know "am I climbing right now" to show a cue, same
+    /// as the C engine's throttled "CLIMB" hud message; the throttling
+    /// itself belongs to the caller, not physics.
+    pub climbing: bool,
+    /// a mantle (vaulting over a reached ledge) started this step —
+    /// fired once per mantle, not held down like `climbing`, mirroring
+    /// the C engine's one-shot "MANTLE" message.
+    pub mantled: bool,
 }
 
 pub fn step(
@@ -818,6 +1031,12 @@ fn crossed(ring: &crate::world::Ring, a: Vec3, b: Vec3) -> bool {
 
 // ---------------------------------------------------------------- car ----
 fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Config, dt: f32, ev: &mut StepEvents) {
+    // WEAPON POP-OUT, cosmetic only: smoothed toward `c.aiming`, same
+    // exponential-approach shape `steer_vis` uses elsewhere in this
+    // function, run unconditionally up front so it applies the same way
+    // whether the car is grounded, hovering, or flying.
+    let pop_target = if c.aiming { 1.0 } else { 0.0 };
+    car.weapon_pop += (pop_target - car.weapon_pop) * (1.0 - (-10.0 * dt).exp());
     // ---- THE CUSHION ----
     // A wheeled car is held ON the surface; a hovercar is held ABOVE it by a
     // spring along the surface normal, damped so it settles rather than
@@ -1338,6 +1557,61 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
                 car.jump_hold = 0.0;
             }
             car.jump_hold -= dt;
+        }
+
+        // ---- ROBOT: WALL CLIMB, on foot, held Jump toward a wall -------
+        //
+        // Ported from the C engine's wall-climb (games/blackstar/engine_src
+        // /game.c, the block around `player_wall_ahead`), adapted to this
+        // engine's SDF world query (`World::wall_ahead`) instead of a
+        // discrete collision-box list. Same shape: a limited budget that
+        // refills to a ceiling on landing (not regenerating over time, so
+        // it can't be farmed by standing still), a wall probed along the
+        // body's own forward direction, and two outcomes depending on how
+        // close the crest already is — mantle over a ledge within reach,
+        // or scale the face if it isn't.
+        //
+        // Gated the same way the C code gates it: robot only (a vehicle
+        // doesn't climb walls), airborne (grounded means there's nothing
+        // to climb), not flying (a jet already has vertical thrust; this
+        // is for bodies that would otherwise just fall), budget left, and
+        // the jump key held rather than tapped — matching the C engine's
+        // `ex_keybind_down` (continuous), not `_pressed` (edge).
+        if car.on_ground {
+            car.climb_budget = 4.0; // full refill on landing, not regeneration
+        }
+        car.climbing *= (-8.0 * dt).exp(); // decays once you stop climbing
+        if car.robot && !car.flight && !car.on_ground && car.climb_budget > 0.0 && c.jump_held {
+            let fwd = car.forward();
+            let dir_h = Vec2::new(fwd.x, fwd.z).normalize_or(Vec2::ZERO);
+            if dir_h.length_squared() > 1e-6 {
+                if let Some(wtop) = world.wall_ahead(car.pos, dir_h, 0.5, 3.0) {
+                    // grip: 0.80 on the loosest surface this engine tracks
+                    // up to 1.0 on solid footing -- same shape as the C
+                    // engine's ice-vs-metal grip term, but this world has
+                    // no per-surface friction sample at an arbitrary wall
+                    // point the way the ground query does, so it's a flat
+                    // 1.0 here rather than a guessed substitute.
+                    let grip = 1.0;
+                    if car.pos.y > wtop - 0.55 {
+                        // MANTLE: the crest is within reach -- vault up and
+                        // forward over the lip rather than hugging the face,
+                        // which is what leaves a body stuck at the top,
+                        // never mounting.
+                        car.vel.y = 7.0;
+                        car.vel.x = fwd.x * 8.5;
+                        car.vel.z = fwd.z * 8.5;
+                        ev.mantled = true;
+                    } else {
+                        car.vel.y = 8.8 * grip;
+                        car.vel.x = car.vel.x * 0.4 + fwd.x * 2.2;
+                        car.vel.z = car.vel.z * 0.4 + fwd.z * 2.2;
+                        car.climbing = 1.0;
+                        ev.climbing = true;
+                    }
+                    car.climb_budget -= dt;
+                }
+            }
         }
 
         // ---- ROBOT: the flip becomes a thruster-fed second jump ----------
@@ -2230,6 +2504,34 @@ mod reset_tests {
     // is the only thing standing between that and a frame seated underground.
 
     #[test]
+    fn a_flying_chassis_is_still_flying_after_a_reset() {
+        // real, pre-existing bug found while wiring FlightSubMode this
+        // session: `flight` was missing from reset()'s preserved-field
+        // list entirely, so a jet reverted to grounded car physics on
+        // every kickoff/goal/respawn -- same shape of bug as the
+        // hover/drivetrain one this file's own comment already
+        // documents having been fixed once before.
+        let world = World::generate(7, crate::world::style(0), 0.19, 1.0);
+        let mut car = Car::new();
+        car.flight = true;
+        car.flight_submode = FlightSubMode::Vtol;
+        car.tracked = true;
+        car.siege_mode = TankSiegeMode::Siege;
+        car.hand_base = crate::driveline::Handling { top_speed: 1.23, ..Default::default() };
+        car.recompute_hand();
+        let hand_before = car.hand;
+
+        car.reset(&world);
+
+        assert!(car.flight, "flight was silently dropped on reset");
+        assert_eq!(car.flight_submode, FlightSubMode::Vtol, "flight_submode was silently dropped on reset");
+        assert!(car.tracked, "tracked was silently dropped on reset");
+        assert_eq!(car.siege_mode, TankSiegeMode::Siege, "siege_mode was silently dropped on reset");
+        assert_eq!(car.hand_base.top_speed, 1.23, "hand_base was silently dropped on reset");
+        assert_eq!(car.hand, hand_before, "hand should be unchanged by a reset");
+    }
+
+    #[test]
     fn stand_h_prefers_ride_h_when_it_is_set() {
         let mut car = Car::new();
         car.half_h = 0.377; // the OLD, wrong number for a standing robot
@@ -2332,6 +2634,78 @@ mod reset_tests {
                  use Car::stand_h"
             );
         }
+    }
+
+    #[test]
+    fn weapon_pop_ramps_toward_aiming_and_decays_when_not() {
+        let world = World::generate(7, crate::world::style(0), 0.19, 1.0);
+        let cfg = Config::default();
+        let ball = Ball::new();
+        let mut bot = bot_shaped();
+        bot.reset(&world);
+        assert_eq!(bot.weapon_pop, 0.0, "should start retracted");
+
+        let aiming = Controls { aiming: true, ..Default::default() };
+        for _ in 0..60 {
+            step_car_only(&mut bot, &ball, &world, &aiming, &cfg, 1.0 / 120.0);
+        }
+        assert!(bot.weapon_pop > 0.9, "did not ramp toward extended: {}", bot.weapon_pop);
+
+        let not_aiming = Controls { aiming: false, ..Default::default() };
+        for _ in 0..60 {
+            step_car_only(&mut bot, &ball, &world, &not_aiming, &cfg, 1.0 / 120.0);
+        }
+        assert!(bot.weapon_pop < 0.1, "did not decay back toward retracted: {}", bot.weapon_pop);
+    }
+
+    #[test]
+    fn a_robot_holding_jump_at_a_climbable_wall_climbs_it() {
+        // real, solid geometry (a short parked ship, same fixture shape
+        // world::wall_ahead_tests uses), not a synthetic SDF -- this
+        // drives the actual step_car_only() loop the shell calls.
+        let mut world = World::generate(7, crate::world::style(0), 0.19, 1.0);
+        let a = crate::aboard::Aboard::new(6.0);
+        let origin = Vec3::new(0.0, crate::aboard::ground_lift(&a.ship), 0.0);
+        world.park(origin, a.ship.clone());
+        let half = a.ship.hull_half;
+
+        let cfg = Config::default();
+        let ball = Ball::new();
+        let mut bot = bot_shaped();
+        bot.robot = true;
+        bot.flight = false;
+        bot.on_ground = false; // airborne: climbing only fires off the ground
+        bot.climb_budget = 4.0;
+        // just outside the wall, low enough to be well under the crest
+        // (mantle range is the top 0.55 m; this stays clear of it so the
+        // test exercises the CLIMB branch, not the mantle one)
+        bot.pos = origin + Vec3::new(half.x + 0.3, -half.y * 0.8, 0.0);
+        // facing -X, into the wall
+        bot.rot = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        assert!(
+            (bot.forward().x - (-1.0)).abs() < 0.01,
+            "fixture didn't face the wall: forward = {:?}",
+            bot.forward()
+        );
+
+        let climbing = Controls { jump_held: true, ..Default::default() };
+        let budget_before = bot.climb_budget;
+        let mut ever_climbed = false;
+        let mut ev_climbing_ever_fired = false;
+        for _ in 0..30 {
+            let mut scratch = StepEvents::default();
+            step_car(&mut bot, &ball, &world, &climbing, &cfg, 1.0 / 120.0, &mut scratch);
+            if bot.climbing > 0.5 {
+                ever_climbed = true;
+            }
+            if scratch.climbing {
+                ev_climbing_ever_fired = true;
+            }
+        }
+        assert!(ever_climbed, "never entered the climbing state at a real wall");
+        assert!(ev_climbing_ever_fired, "StepEvents::climbing never fired -- the toast in main.rs would never show");
+        assert!(bot.vel.y > 0.0, "climbing should push the body upward: vel.y = {}", bot.vel.y);
+        assert!(bot.climb_budget < budget_before, "climb budget did not drain");
     }
 
     #[test]
@@ -2523,5 +2897,115 @@ mod seating_tests {
         // why it reads as SINKING rather than as spawning wrong: past the
         // smaller threshold the old guard fires and yanks the body up
         assert_eq!(buried_by(0.5, ANALOG_HALF_H, ANALOG_RIDE_H, false), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod flight_submode_tests {
+    use super::*;
+
+    #[test]
+    fn fast_fly_is_the_default_and_a_no_op() {
+        assert_eq!(FlightSubMode::default(), FlightSubMode::FastFly);
+        let (top, turn) = FlightSubMode::FastFly.multipliers();
+        assert_eq!((top, turn), (1.0, 1.0));
+    }
+
+    #[test]
+    fn cycling_is_a_two_state_toggle_that_returns_to_start() {
+        let m = FlightSubMode::FastFly;
+        assert_eq!(m.cycle(), FlightSubMode::Vtol);
+        assert_eq!(m.cycle().cycle(), FlightSubMode::FastFly);
+    }
+
+    #[test]
+    fn recompute_hand_is_a_pure_function_of_base_and_submode() {
+        let mut car = Car::new();
+        car.flight = true;
+        car.hand_base = crate::driveline::Handling { top_speed: 1.2, turn: 0.9, ..Default::default() };
+        car.recompute_hand();
+        assert_eq!(car.hand.top_speed, 1.2, "FastFly must not scale top_speed");
+        assert_eq!(car.hand.turn, 0.9, "FastFly must not scale turn");
+
+        car.flight_submode = car.flight_submode.cycle(); // -> Vtol
+        car.recompute_hand();
+        assert!(car.hand.top_speed < car.hand_base.top_speed, "VTOL should be slower");
+        assert!(car.hand.turn > car.hand_base.turn, "VTOL should turn tighter");
+
+        // toggling back reproduces the exact original numbers -- no drift,
+        // no compounding, because recompute_hand always derives from
+        // hand_base rather than mutating hand in place
+        car.flight_submode = car.flight_submode.cycle(); // -> FastFly
+        car.recompute_hand();
+        assert_eq!(car.hand.top_speed, 1.2);
+        assert_eq!(car.hand.turn, 0.9);
+    }
+
+    #[test]
+    fn ground_vehicles_ignore_flight_submode_entirely() {
+        // a non-flying car left in Vtol (e.g. after switching from a jet)
+        // must not have its handling touched by it
+        let mut car = Car::new();
+        car.flight = false;
+        car.flight_submode = FlightSubMode::Vtol;
+        car.hand_base = crate::driveline::Handling { top_speed: 1.0, turn: 1.0, ..Default::default() };
+        car.recompute_hand();
+        assert_eq!(car.hand.top_speed, 1.0);
+        assert_eq!(car.hand.turn, 1.0);
+    }
+
+    #[test]
+    fn roll_is_the_default_and_a_no_op() {
+        assert_eq!(TankSiegeMode::default(), TankSiegeMode::Roll);
+        assert_eq!(TankSiegeMode::Roll.multipliers(), (1.0, 1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn siege_trades_mobility_for_grip() {
+        let mut car = Car::new();
+        car.tracked = true;
+        car.hand_base = crate::driveline::Handling { accel: 1.0, top_speed: 1.0, grip: 1.0, turn: 1.0, ..Default::default() };
+        car.recompute_hand();
+        assert_eq!(car.hand, car.hand_base, "Roll must reproduce hand_base exactly");
+
+        car.siege_mode = car.siege_mode.cycle(); // -> Siege
+        car.recompute_hand();
+        assert!(car.hand.top_speed < car.hand_base.top_speed, "siege should be slower");
+        assert!(car.hand.accel < car.hand_base.accel, "siege should accelerate less");
+        assert!(car.hand.grip > car.hand_base.grip, "siege should grip more");
+        assert!(car.hand.turn < car.hand_base.turn, "siege should turn less");
+
+        car.siege_mode = car.siege_mode.cycle(); // back to Roll
+        car.recompute_hand();
+        assert_eq!(car.hand, car.hand_base, "cycling siege twice must return to hand_base exactly");
+    }
+
+    #[test]
+    fn untracked_vehicles_ignore_siege_mode_entirely() {
+        let mut car = Car::new();
+        car.tracked = false;
+        car.siege_mode = TankSiegeMode::Siege; // left over from a previous tank
+        car.hand_base = crate::driveline::Handling { accel: 1.0, top_speed: 1.0, grip: 1.0, turn: 1.0, ..Default::default() };
+        car.recompute_hand();
+        assert_eq!(car.hand, car.hand_base);
+    }
+
+    #[test]
+    fn flight_and_siege_compose_independently() {
+        // not a real combination in practice (a chassis is either
+        // flying or tracked), but recompute_hand must not assume that
+        let mut car = Car::new();
+        car.flight = true;
+        car.flight_submode = FlightSubMode::Vtol;
+        car.tracked = true;
+        car.siege_mode = TankSiegeMode::Siege;
+        car.hand_base = crate::driveline::Handling { accel: 1.0, top_speed: 1.0, grip: 1.0, turn: 1.0, ..Default::default() };
+        car.recompute_hand();
+        let (vtol_top, vtol_turn) = FlightSubMode::Vtol.multipliers();
+        let (siege_accel, siege_top, siege_grip, siege_turn) = TankSiegeMode::Siege.multipliers();
+        assert!((car.hand.top_speed - vtol_top * siege_top).abs() < 1e-5, "top_speed should compose both multipliers");
+        assert!((car.hand.turn - vtol_turn * siege_turn).abs() < 1e-5, "turn should compose both multipliers");
+        assert_eq!(car.hand.accel, siege_accel);
+        assert_eq!(car.hand.grip, siege_grip);
     }
 }

@@ -113,7 +113,18 @@ impl Item {
             let v = it.next()?;
             let e = it.next()?;
             let verb = *VERBS.iter().find(|x| verb_name(**x) == v)?;
-            let element = *ELEMENTS.iter().find(|x| x.name() == e)?;
+            // `ELEMENTS` (weapons.rs) is deliberately the CYCLE-ABLE set for
+            // the Watch's attunement and does not include `Element::None` —
+            // correct for that use, wrong here: a weapon with no element
+            // (FIRSTEDGE, e.g.) could never round-trip through this parser,
+            // silently dropped from any bag/hotbar/save that held one.
+            // Found by a test asserting a starter bag round-trips with all
+            // its items, not by inspection.
+            let element = if e == Element::None.name() {
+                Element::None
+            } else {
+                *ELEMENTS.iter().find(|x| x.name() == e)?
+            };
             return Some(Item::Weapon { verb, element, from: it.next().map(str::to_string) });
         }
         if let Some(name) = code.strip_prefix("m:") {
@@ -423,7 +434,7 @@ pub struct WeaponSpec {
     pub asset: &'static str,
 }
 
-pub const WEAPONS: [WeaponSpec; 6] = [
+pub const WEAPONS: [WeaponSpec; 7] = [
     // -- melee: aspect ratios 4.6:1 to 10.7:1, genuinely blade-shaped --
     WeaponSpec {
         name: "FIRSTEDGE",
@@ -446,6 +457,45 @@ pub const WEAPONS: [WeaponSpec; 6] = [
         verb: Verb::Thrust,
         element: Element::Electric,
         side: Side::Left,
+        ammo: AmmoType::Melee,
+        asset: "imported_caiman_rail_slasher_3d_model_stylized_weapon",
+    },
+    // PLACEHOLDER VISUAL, real weapon otherwise. No genuinely
+    // energy-blade-shaped asset existed in this catalog when this entry
+    // was first added; one has now been converted (see
+    // assets/weapons/) but is not yet wired to a live held-weapon
+    // renderer, so this still points at RAILFANG's stylized asset.
+    // Fire (not Electric/Rock/None, the three other melee elements
+    // already in this table) so it's mechanically distinct even while
+    // it looks the same as RAILFANG.
+    //
+    // NAMING IS DELIBERATELY GENERIC FOR NOW. Several of the newly-
+    // converted source files are literally named after real franchise
+    // characters (a fan-asset library, like the rest of this catalog's
+    // provenance) — kept as internal provenance only, never shown to
+    // the player, same house rule as every other entry in this table.
+    // Two real in-game names were tried and dropped here before landing
+    // on a placeholder: "LIGHTSABER" (this entry's first name) is an
+    // outright trademark; "ENERGONEDGE" borrows Transformers' own
+    // "Energon" term, which this project already avoids putting in a
+    // player-visible name for exactly this reason (see the
+    // Cybertronian/raid-boss naming elsewhere, which is inherited
+    // scope, not a precedent to add to on purpose). Rather than pick a
+    // third name and risk the same mistake, the person asked to keep
+    // this generic until they've checked their own design notes —
+    // "PLACEHOLDER_BLADE" is that placeholder, not a finished name.
+    //
+    // MECHANICS ARE A PLACEHOLDER TOO. Verb::Thrust/Element::Fire is a
+    // plain reuse of the existing melee shape; the person who asked for
+    // this said they may want something more erratic later (of a piece
+    // with a glowing, unstable blade rather than a plain sword swing) —
+    // not implemented here, since "erratic" is a real design decision
+    // with numbers nobody's specified yet, not a wiring job.
+    WeaponSpec {
+        name: "PLACEHOLDER_BLADE",
+        verb: Verb::Thrust,
+        element: Element::Fire,
+        side: Side::Right,
         ammo: AmmoType::Melee,
         asset: "imported_caiman_rail_slasher_3d_model_stylized_weapon",
     },
@@ -489,6 +539,18 @@ pub fn weapon_item(spec: &WeaponSpec) -> Item {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_weapon_with_no_element_round_trips() {
+        // Element::None is deliberately absent from weapons::ELEMENTS
+        // (that array is the Watch's cycle-able attunements, and "no
+        // element" isn't one), but Item::parse borrowed it anyway --
+        // silently unable to parse back any weapon carrying
+        // Element::None, e.g. FIRSTEDGE (gear::WEAPONS' own first entry).
+        let it = Item::Weapon { verb: Verb::Thrust, element: Element::None, from: None };
+        let code = it.code();
+        assert_eq!(Item::parse(&code), Some(it), "Element::None did not round-trip through code()/parse()");
+    }
     use crate::raidcon::BOSSES;
 
     #[test]
