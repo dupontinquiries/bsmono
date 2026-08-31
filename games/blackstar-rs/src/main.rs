@@ -122,6 +122,7 @@ mod raidforge;
 mod shots;
 mod skeleton;
 mod sortie;
+mod stance;
 mod stations;
 mod stealth;
 mod vault;
