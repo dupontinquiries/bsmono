@@ -3368,6 +3368,13 @@ which file you read.\n\n",
         if self.coord_mode == crate::coordinator::Mode::StatefulGuide {
             cfg.stateful_guide = true;
             cfg.checkpoint_on_green = true;
+            // PROOF FOLLOWS FROM THE MODE'S OWN PREMISE. StatefulGuide exists because a model
+            // saying TASK_COMPLETE is not evidence; a green suite is the same claim one level down,
+            // since it cannot tell a change that fixed something from a change that did nothing.
+            // The mode that refuses the first should refuse the second. Costs one extra suite run,
+            // once, at the claim — which for an unattended long-horizon run is nothing against
+            // landing work that changed no observable behaviour.
+            cfg.require_proof = true;
         }
         // AUTOPILOT: the working discipline follows the task. A shader bug gets the GPU profile's
         // rule for verification (diff against a reference) rather than the generic one; anything

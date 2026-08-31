@@ -755,20 +755,37 @@ use `edit` (or `write_file` for a new file) to land the ones you want.\n"));
                 .stdin(Stdio::null()).output().ok()?;
             if out.status.success() { Some(String::from_utf8_lossy(&out.stdout).trim().to_string()) } else { None }
         };
+        // NO WORKTREE, NO PROOF. This must be an explicit check rather than a side effect of some
+        // git command failing later: the previous version relied on `stash push` erroring out, and
+        // when the stash was made conditional that fallback silently became "run the suite twice on
+        // an unreverted tree and conclude the change proved nothing" — which rejects every claim in
+        // any workspace without git. Caught by the fallback test, not by reading.
+        if git(&["rev-parse", "--is-inside-work-tree"]).as_deref() != Some("true") { return None; }
+
         // ORDER MATTERS AND IS EASY TO GET WRONG: `after` is the suite ON THE CHANGE, so it runs
         // before anything is reverted. The first draft of this stashed first and then measured
         // `after`, which would have compared the reverted tree against itself and called every
         // change vacuous.
         let after = self.run_at(test_cmd, rel_dir).output;
-        // Stash EVERYTHING including untracked, or a change that only added files reverts to itself.
-        git(&["stash", "push", "-u", "-q", "-m", "logscope: inverse-patch check"])?;
-        // From here to the pop there is no `?`: an early return would leave the agent's work in the
-        // stash and the tree reverted, which is worse than any answer this function could give.
+
+        // STASH ONLY IF THERE IS SOMETHING TO STASH. With `checkpoint_on_green` the run's work is in
+        // COMMITS, not in the working tree, so `stash push` has nothing to take — and the blind
+        // push/pop pair then failed on the pop and reported the agent's work as lost in the stash
+        // when it was never there. Found by the StatefulGuide test, which turns checkpoints on.
+        //
+        // Reverting to `base` handles both cases uniformly: it is behind the checkpoints as well as
+        // the working tree, so "the tree without this run's work" is the same operation either way.
+        let dirty = git(&["status", "--porcelain", "-uall"]).map(|s| !s.is_empty()).unwrap_or(false);
+        if dirty {
+            git(&["stash", "push", "-u", "-q", "-m", "logscope: inverse-patch check"])?;
+        }
+        // From here to the restore there is no `?`: an early return would leave the agent's work in
+        // the stash and the tree reverted, which is worse than any answer this function could give.
         let _ = git(&["checkout", "-q", base, "--", "."]);
         let reverted = self.run_at(test_cmd, rel_dir).output;
         // Always restore, whatever happened above.
         let _ = git(&["checkout", "-q", "HEAD", "--", "."]);
-        let popped = git(&["stash", "pop", "-q"]).is_some();
+        let popped = !dirty || git(&["stash", "pop", "-q"]).is_some();
         if !popped {
             // A failed pop means the agent's work is sitting in the stash rather than the tree.
             // Say so loudly: this is the one outcome worse than not running the check.
@@ -5609,6 +5626,48 @@ echo 'test the_thing ... ok'\nelse\necho 'test the_thing ... FAILED'\nfi\necho '
         assert!(!seen.contains("command not allowed"),
                 "the operator's own verify command was refused by the model's allowlist:\n{}",
                 &seen[seen.len().saturating_sub(400)..]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    /// The phase machine and the proof gate are the same argument at two levels, so selecting the
+    /// mode must switch on both. A StatefulGuide run that accepts a change no test can see has the
+    /// discipline in its name and not in its behaviour.
+    #[test]
+    fn the_stateful_guide_mode_demands_proof_not_merely_green() {
+        let d = proof_repo("guide-proof");
+        // Already green: the suite passes with and without whatever the run does.
+        std::fs::write(d.join("marker.txt"), "FIXED\n").unwrap();
+        for args in [vec!["add", "-A"], vec!["-c", "user.email=t@t", "-c", "user.name=t",
+                                             "commit", "-q", "-m", "green"]] {
+            std::process::Command::new("git").args(&args).current_dir(&d).output().unwrap();
+        }
+        std::process::Command::new("git").args(["tag", "-f", "logscope-base"])
+            .current_dir(&d).output().unwrap();
+
+        let script = vec![
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"notes.txt\",\"contents\":\"x\\n\"}\n```".to_string(),
+            format!("Done. {DONE_MARKER}"),
+        ];
+        // The config StatefulGuide produces: guide on, checkpoints on, proof required.
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 5,
+            verify_cmd: vec!["sh".into(), "suite.sh".into()], verify_exts: vec!["txt".into()],
+            prefer_patches: false, digest_verify: false,
+            stateful_guide: true, checkpoint_on_green: true, require_proof: true,
+            ..Default::default() };
+        let (stop, run) = drive(&d, "tidy up", cfg, &script);
+        assert_ne!(stop, Stop::Done, "green both ways is not proof, whatever the phase says");
+        // The PHASE is legitimately "done" here and that is not a contradiction: engmode's Done
+        // means the counted check is clean, which it is. The run still does not finish, because
+        // completion needs a claim the evidence CONFIRMS and the proof gate found the evidence
+        // shows nothing changed. Two different questions — "is it green" and "did this run do
+        // anything" — and the second is the one the gate answers. My first version of this test
+        // asserted the phase was not done and was simply wrong about my own state machine.
+        assert_eq!(run.phase(), Some("done"), "the checker is green; that is what the phase reports");
+        assert!(run.prompt_snapshot().contains("NOT ACCEPTED"),
+                "the refusal must reach the model, with the reason");
+        assert!(run.prompt_snapshot().contains("fails without your change"),
+                "and must say what would count — a gate with no stated way through is a wall");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -124,7 +124,7 @@ round shows whether your hint drove the conclusion or the question did.",
             Mode::LiaisonDebate =>
                 "Planned, not run. is_panel() is true and the panel prompts exist; nothing spawns the debaters.",
             Mode::StatefulGuide =>
-                "Live for workspace runs. With a project loaded, the agent loop drives engmode's phase machine — survey → plan → patch → check → diagnose — with the phase decided by COUNTED checker output. A TASK_COMPLETE without a clean check is rejected and counted; a stalled error count blocks the run instead of burning the budget; each green check commits a scratch checkpoint; and the check runs in the touched crate's own Cargo root, so a monorepo without a root Cargo.toml still verifies.",
+                "Live for workspace runs. With a project loaded, the agent loop drives engmode's phase machine — survey → plan → patch → check → diagnose — with the phase decided by COUNTED checker output. A TASK_COMPLETE without a clean check is rejected and counted; a stalled error count blocks the run instead of burning the budget; each green check commits a scratch checkpoint; and the check runs in the touched crate's own Cargo root, so a monorepo without a root Cargo.toml still verifies. It also requires PROOF rather than green: at the completion claim the suite is run, the run's work reverted, the suite run again, and the claim refused unless some test changed status — so a change no test can see cannot finish the run. That costs one extra suite run per completion claim.",
         }
     }
 
