@@ -1398,11 +1398,38 @@ pub fn encode_gop_v3_core(
     let mut recon: Vec<Yuv420> = Vec::with_capacity(frames.len());
     let mut prev_share_acc = 0.0f64;
     let mut leftover_trace: Vec<Vec<u32>> = Vec::with_capacity(frames.len());
+    // ── LONG-RANGE REFERENCE MODE (mode 4), FAO_DICT=1.
+    //
+    // The probe measured this before the coder existed: on engine
+    // content 10.7% of regions have a long-range match STRONG enough
+    // (>512 SAD margin) to pay for a reference, against 0.2-0.7% on
+    // film, with 6-10x the margin per win. This is the coder side of
+    // that measurement.
+    //
+    // Decodability is the whole design constraint. The dictionary is
+    // built from RECONSTRUCTED frames only, and only from frames
+    // <= fi-2, so it never overlaps the prev-MC predictor and the
+    // decoder can rebuild it exactly from what it has already output.
+    // Entries are keyed on the RECON block's fingerprint; queries use
+    // the SOURCE block's (the encoder has it, and the key only has to
+    // shortlist — the winner is decided by true SAD against recon,
+    // which the decoder never recomputes).
+    //
+    // Wire cost: 1 flag bit + a 5-byte reference (frame delta u8, x u16,
+    // y u16) against a 256-pixel block, so the gate must clear it with
+    // room. DICT_MARGIN is the probe's own STRONG threshold rather than
+    // a tuned number — that is the level the measurement validated.
+    let use_dict = std::env::var("FAO_DICT").is_ok();
+    let mut dict: std::collections::HashMap<u32, Vec<(usize, usize, usize)>> =
+        std::collections::HashMap::new();
+    const DICT_MAX_CAND: usize = 24;
+    const DICT_MARGIN: u32 = 512;
 
     for (fi, f) in frames.iter().enumerate() {
         let plate_pred = pred_for(fi);
         let mut modes = vec![0u8; gw * gh];
         let mut mvs: Vec<(i8, i8)> = Vec::new();
+        let mut dict_refs: Vec<(u8, u16, u16)> = Vec::new();
         let composite = if fi == 0 {
             plate_pred.clone()
         } else {
@@ -1578,6 +1605,52 @@ pub fn encode_gop_v3_core(
                                 for dy in 0..cr {
                                     for dx in 0..cr {
                                         plane[(cry + dy) * cw + crx + dx] = cdc;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // ── mode 4: long-range reference into decoded history.
+                    if use_dict && fi >= 2 {
+                        let key = region_fingerprint(&f.y, fw, fh, rx, ry);
+                        if let Some(cands) = dict.get(&key) {
+                            // Compare against what this region has
+                            // ALREADY been composed to — that covers
+                            // plate, prev-MC and intra in one number,
+                            // rather than re-deriving which won.
+                            let best_local =
+                                sad_region(&comp.y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry);
+                            let mut best = (u32::MAX, 0usize, 0usize, 0usize);
+                            for &(dfi, dx, dy) in cands.iter().rev().take(DICT_MAX_CAND) {
+                                let s = sad_region(
+                                    &recon[dfi].y, fw, fh, dx as i32, dy as i32, &f.y, rx, ry,
+                                );
+                                if s < best.0 {
+                                    best = (s, dfi, dx, dy);
+                                }
+                            }
+                            if best.0 != u32::MAX && best.0 + DICT_MARGIN < best_local {
+                                if modes[gy * gw + gx] == 1 {
+                                    mvs.pop();
+                                    prev_regions -= 1;
+                                }
+                                modes[gy * gw + gx] = 4;
+                                dict_refs.push(((fi - best.1) as u8, best.2 as u16, best.3 as u16));
+                                let src = &recon[best.1];
+                                for ly in 0..REGION {
+                                    let sy = (best.3 + ly).min(fh - 1);
+                                    for lx in 0..REGION {
+                                        let sx = (best.2 + lx).min(fw - 1);
+                                        comp.y[(ry + ly) * fw + rx + lx] = src.y[sy * fw + sx];
+                                    }
+                                }
+                                let cw = fw / 2;
+                                for ly in 0..REGION / 2 {
+                                    let sy = (best.3 / 2 + ly).min(fh / 2 - 1);
+                                    for lx in 0..REGION / 2 {
+                                        let sx = (best.2 / 2 + lx).min(cw - 1);
+                                        comp.u[(ry / 2 + ly) * cw + rx / 2 + lx] = src.u[sy * cw + sx];
+                                        comp.v[(ry / 2 + ly) * cw + rx / 2 + lx] = src.v[sy * cw + sx];
                                     }
                                 }
                             }
@@ -1767,7 +1840,7 @@ pub fn encode_gop_v3_core(
         let mut planar_bits: Vec<u8> = Vec::new();
         let mut nb = 0usize;
         for (gi, &m) in modes.iter().enumerate() {
-            if m >= 2 {
+            if m == 2 || m == 3 {
                 intra_flags[gi / 8] |= 1 << (gi % 8);
                 if nb % 8 == 0 {
                     planar_bits.push(0);
@@ -1780,6 +1853,32 @@ pub fn encode_gop_v3_core(
         }
         side.extend_from_slice(&intra_flags);
         side.extend_from_slice(&planar_bits);
+        if use_dict {
+            let mut dict_flags = vec![0u8; (gw * gh + 7) / 8];
+            for (gi, &m) in modes.iter().enumerate() {
+                if m == 4 {
+                    dict_flags[gi / 8] |= 1 << (gi % 8);
+                }
+            }
+            side.extend_from_slice(&dict_flags);
+            // References stay ABSOLUTE, by measurement. Delta-coding
+            // them against the referring region's origin — the trick
+            // that won for motion vectors — LOST 6,002 bytes here, and
+            // for the reason already recorded at the gain-value site:
+            // exact repeats are LZ gold and deltas destroy them. Many
+            // regions cite the SAME source location (one tile of a
+            // repeated texture), so the absolute coordinate stream is
+            // full of byte-identical 4-byte runs that zstd matches,
+            // while the delta stream scatters them. Third time this
+            // codec has learned it; the general rule is that delta
+            // coding pays for piecewise-CONTINUOUS fields (motion) and
+            // loses for piecewise-CONSTANT ones (gains, references).
+            for (d, x, y) in &dict_refs {
+                side.push(*d);
+                side.extend_from_slice(&x.to_le_bytes());
+                side.extend_from_slice(&y.to_le_bytes());
+            }
+        }
         side.extend_from_slice(&gain_flags);
         side.extend_from_slice(&gain_vals);
         if std::env::var("FAO_SIDE_DEBUG").is_ok() {
@@ -1890,6 +1989,22 @@ pub fn encode_gop_v3_core(
             leftover_trace.push(row);
         }
         recon.push(rec);
+        // Index frame fi-1 now that fi is done: at the NEXT iteration's
+        // query (frame fi+1) the newest entry is fi-1, one frame older
+        // than the prev-MC predictor. That lag is what keeps the two
+        // predictors non-overlapping — a dictionary that could return
+        // the immediately previous frame would just be a slower,
+        // more expensive prev-MC.
+        if use_dict && fi >= 1 {
+            let di = fi - 1;
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    let (rx, ry) = (gx * REGION, gy * REGION);
+                    let k = region_fingerprint(&recon[di].y, fw, fh, rx, ry);
+                    dict.entry(k).or_default().push((di, rx, ry));
+                }
+            }
+        }
     }
     let denom = (frames.len().saturating_sub(1)).max(1) as f64;
     (PlateEncodeReportV2 {
@@ -3733,6 +3848,54 @@ mod tests_sr {
 // and 16 gradient bits (per-cell |dx|+|dy| vs cell mean — the edge
 // hash). Candidates are verified by true SAD, so the hash only has to
 // be good enough to shortlist.
+/// 16-bit coarse fingerprint of a REGION x REGION luma block: 8 blur
+/// bits + 8 edge bits over a 4x4 cell grid, each set when the cell
+/// exceeds the block's own mean. Shared by `probe_dictionary` (which
+/// measured the redundancy) and the coder's reference mode (which
+/// spends it), so the thing that was measured is the thing that ships.
+pub fn region_fingerprint(src: &[u8], w: usize, h: usize, rx: usize, ry: usize) -> u32 {
+    let mut cells = [0u32; 16];
+    let mut grads = [0u32; 16];
+    for cy in 0..4 {
+        for cx in 0..4 {
+            let (mut sum, mut g) = (0u32, 0u32);
+            for dy in 0..4 {
+                for dx in 0..4 {
+                    let (x, y) = (rx + cx * 4 + dx, ry + cy * 4 + dy);
+                    let v = src[y * w + x] as i32;
+                    sum += v as u32;
+                    let vx = src[y * w + (x + 1).min(w - 1)] as i32;
+                    let vy = src[(y + 1).min(h - 1) * w + x] as i32;
+                    g += ((vx - v).abs() + (vy - v).abs()) as u32;
+                }
+            }
+            cells[cy * 4 + cx] = sum / 16;
+            grads[cy * 4 + cx] = g / 16;
+        }
+    }
+    let cmean: u32 = cells.iter().sum::<u32>() / 16;
+    let gmean: u32 = grads.iter().sum::<u32>() / 16;
+    let mut fp = 0u32;
+    for i in 0..16 {
+        if cells[i] > cmean {
+            fp |= 1 << i;
+        }
+        if grads[i] > gmean {
+            fp |= 1 << (16 + i);
+        }
+    }
+    let mut key = 0u32;
+    for i in 0..8 {
+        if (fp >> (i * 2)) & 1 == 1 {
+            key |= 1 << i;
+        }
+        if (fp >> (16 + i * 2)) & 1 == 1 {
+            key |= 1 << (8 + i);
+        }
+    }
+    key
+}
+
 pub fn probe_dictionary(frames: &[Yuv420], plate: &Plate, motions: &[PlateMotion]) -> String {
     let (fw, fh) = (frames[0].w, frames[0].h);
     let (gw, gh) = (fw / REGION, fh / REGION);

@@ -4344,3 +4344,57 @@ matched-PSNR on this content.
 Caveat carried over from SMITE and still applying: the anchor is an
 AV1 re-encode of AV1 source, which flatters AV1 (it recodes its own
 artifacts cheaply).
+
+### Dictionary reference mode (mode 4): built, and the probe over-promised
+
+The coder side of the 10.7%-STRONG measurement. Mode 4 cites a
+REGION-sized block from decoded history: dictionary built only from
+RECONSTRUCTED frames <= fi-2 (never overlapping prev-MC, and exactly
+rebuildable by the decoder from its own output), keyed on the recon
+block's fingerprint, queried with the source block's, winner decided
+by true SAD against recon. Wire: 1 flag bit + 5 bytes (frame delta u8,
+x u16, y u16). region_fingerprint hoisted out of probe_dictionary so
+the thing measured is the thing that ships. Behind FAO_DICT.
+
+Measured, Minecraft 4K GOP at dz32:
+  dict OFF:  9,996,224 B @ 31.742 dB / SSIM 0.9353
+             (mode+mv 1,617,149 | residual 7,559,715)
+  dict ON:   9,866,348 B @ 31.680 dB / SSIM 0.9331
+             (mode+mv 1,863,632 | residual 7,183,356)
+-1.3% bytes, -0.06 dB, -0.0022 SSIM. Residual fell 376 KB (-5.0%) and
+side info rose 246 KB (+15.2%): the references very nearly cost what
+they save.
+
+The gap worth recording is probe 10.7% STRONG vs coder ~3.3% of
+regions actually firing. Three reasons, all of which make the probe an
+UPPER bound rather than a forecast:
+  1. The probe scored long-range against plate-or-prev on SOURCE. The
+     coder scores against the region's ACTUAL COMPOSITE, which already
+     includes intra, planar and gain/offset — a much stronger baseline
+     that the probe never had to beat.
+  2. The probe matched source against source. The coder must match
+     against RECON at dz32, which is quantised and blurrier, so real
+     repeats degrade below the margin.
+  3. Exact-bucket lookup with a 24-candidate cap, unchanged from the
+     probe's weaker test.
+None of these are bugs; they are the difference between measuring
+redundancy and spending it. A probe that scores against the real
+composite on recon would have predicted ~3%, and that is the shape
+future probes in this codec should take.
+
+Negative recorded at the site: delta-coding the references against the
+referring region's origin — the trick that won for motion vectors —
+LOST 6,002 bytes. Same reason as the gain-value delta experiment: many
+regions cite the SAME source location (one tile of a repeated
+texture), so the absolute stream is full of byte-identical 4-byte runs
+that zstd matches and deltas scatter. Third time in this codebase, so
+the general rule is now stated: delta coding pays for piecewise-
+CONTINUOUS fields (motion) and loses for piecewise-CONSTANT ones
+(gains, references).
+
+Named next levers, in the order the byte split argues for: the
+reference is 5 bytes against a 256-pixel block, so (a) restrict to a
+small MRU candidate list and code an INDEX instead of coordinates,
+(b) allow one reference to cover a run of adjacent regions (repeated
+textures are contiguous), (c) match against source-quality recon by
+running the dictionary at a finer dead zone than the frame.
