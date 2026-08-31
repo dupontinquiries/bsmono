@@ -13,6 +13,17 @@ from the shipped binary, same category as the pre-existing 335.
 
 ---
 
+## c13 session — see maintenance/C13_TODO.md
+
+The c13 session's findings live in `maintenance/C13_TODO.md` (repo
+convention, alongside C9–C12) rather than being appended here. Summary:
+four mechanical causes behind the "this looks like a demo" report were
+found and fixed — the HUD text metric, the terrain grazing-Fresnel that
+turned the ground into the sky, MEADOW's physically-impossible grass
+albedo, and mono audio. **None of it has been seen on a GPU or heard on
+a speaker**, and the largest remaining lever (contact shadows) is not
+started. Read C13 §0 before trusting any visual claim.
+
 ## Fixed and verified this session
 
 - **The HUD's text metric never matched the font** (`6d9475d2`): font.rs
