@@ -1632,7 +1632,7 @@ pub fn encode_gop_routed(
 /// IN-LOOP, not cosmetic: the filtered frame becomes the prev-MC
 /// reference, so a cleaner reference should also cost fewer residual
 /// bytes. That is the claim to measure, not assume.
-fn deblock(f: &mut Yuv420, modes: &[u8], gw: usize, gh: usize, dz: f32, strength: i32) {
+fn deblock(f: &mut Yuv420, src_true: &Yuv420, modes: &[u8], gw: usize, gh: usize, dz: f32, strength: i32) {
     let (w, h) = (f.w, f.h);
     // Thresholds scale with the dead zone: a coarser quantiser makes
     // bigger steps, and a step the quantiser could not have produced is
@@ -1702,13 +1702,56 @@ fn deblock(f: &mut Yuv420, modes: &[u8], gw: usize, gh: usize, dz: f32, strength
     // and which this filter does not yet read. That is the named next
     // construction; until then both behaviours stay reachable rather
     // than one being guessed as universal.
-    let adaptive = std::env::var("FAO_DEBLOCK_FIXED").is_err();
-    let region_scale = |gi: usize| -> f32 {
-        if !adaptive {
-            return 1.0;
+    // QUANTISATION-ERROR MODE (default). The texture rule above could
+    // not separate "detail to protect" from "noise whose blocking to
+    // fix" because reconstructed texture looks the same in both. The
+    // separating fact is that BLOCKING COMES FROM QUANTISATION: a step
+    // on the grid is an artifact exactly when the coder was spending
+    // few enough bits there to have produced it. So measure, per
+    // region, how far the reconstruction actually strayed from the
+    // source, normalised by the dead zone that set the expected stray.
+    //
+    // err/dz near 0 -> the region was coded nearly exactly, so any
+    //   structure in it is CONTENT and must not be touched.
+    // err/dz large  -> the region was coded coarsely, so grid steps in
+    //   it are the coder's own and are safe to filter.
+    //
+    // This is encoder-side information the filter already had access to
+    // and was not using. It costs one pass over the region.
+    let mut qerr = vec![0.0f32; gw * gh];
+    for gy in 0..gh {
+        for gx in 0..gw {
+            let (rx, ry) = (gx * REGION, gy * REGION);
+            let mut acc = 0.0f64;
+            let mut n = 0u32;
+            for ly in 0..REGION {
+                let y = (ry + ly).min(h - 1);
+                for lx in 0..REGION {
+                    let x = (rx + lx).min(w - 1);
+                    acc += (src[y * w + x] as i32 - src_true.y[y * w + x] as i32).abs() as f64;
+                    n += 1;
+                }
+            }
+            qerr[gy * gw + gx] = (acc / n.max(1) as f64) as f32;
         }
-        let t = texture.get(gi).copied().unwrap_or(1.0);
-        ((1.9 - t) / 1.4).clamp(0.15, 1.0)
+    }
+    let mode = std::env::var("FAO_DEBLOCK_MODE").unwrap_or_else(|_| "qerr".into());
+    let region_scale = |gi: usize| -> f32 {
+        match mode.as_str() {
+            "fixed" => 1.0,
+            "texture" => {
+                let t = texture.get(gi).copied().unwrap_or(1.0);
+                ((1.9 - t) / 1.4).clamp(0.15, 1.0)
+            }
+            // Normalised by dz/8: the dead zone is a coefficient-domain
+            // floor, and the pixel-domain error it produces is a
+            // fraction of it. The pivot is where a region has strayed
+            // about as much as the quantiser alone could explain.
+            _ => {
+                let e = qerr.get(gi).copied().unwrap_or(0.0);
+                (e / (dz / 8.0).max(0.5)).clamp(0.15, 1.0)
+            }
+        }
     };
     let strength_at = |ga: usize, gb: usize| -> i32 {
         if modes.get(ga) != modes.get(gb) { 2 } else { 1 }
@@ -2442,7 +2485,7 @@ pub fn encode_gop_v3_core(
         let mut rec = rec;
         if let Ok(v) = std::env::var("FAO_DEBLOCK") {
             let strength: i32 = v.parse().unwrap_or(1);
-            deblock(&mut rec, &modes, gw, gh, opts.dead_zone, strength);
+            deblock(&mut rec, f, &modes, gw, gh, opts.dead_zone, strength);
         }
         recon.push(rec);
         // Index frame fi-1 now that fi is done: at the NEXT iteration's

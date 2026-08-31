@@ -5463,3 +5463,55 @@ byte-identical to the earlier fixed measurement, 227,899 B and P16
 1.909) — because one of them is right on real footage and the other on
 synthetic, and guessing which the caller has is exactly the mistake
 this entry exists to avoid repeating.
+
+### Quantisation-error deblock strength: better than texture on synthetic, WORSE on real — the split does not resolve
+
+The named construction: blocking comes from quantisation, so measure
+per region how far the reconstruction strayed from the source,
+normalised by the dead zone, and filter hard only where the coder was
+spending few enough bits to have produced the step. Encoder-side
+information the filter already had and was not reading. Three modes now
+exist (FAO_DEBLOCK_MODE = qerr | texture | fixed).
+
+All three, strength 2, against unfiltered:
+
+  procedural ground        bytes    PSNR    SSIM    P=16
+    off                  227,533  31.536  0.8656   4.642
+    fixed                227,899  31.652  0.8715   1.909  <- best
+    texture              227,599  31.572  0.8677   3.802
+    qerr                 229,010  31.651  0.8707   2.413
+
+  blackstar real           bytes    PSNR     SSIM    P=16
+    off                  332,841  35.619  0.97502  1.419
+    fixed s2             337,810  35.591  0.97491  1.219
+    texture              333,439  35.681  0.97506  1.344  <- best PSNR/SSIM
+    qerr                 334,889  35.574  0.97484  1.300
+
+qerr beats texture on the synthetic clip decisively (blockiness 3.80 ->
+2.41 at +0.08 dB and +0.003 SSIM) and LOSES to it on real footage
+(35.574 vs 35.681 dB, lower SSIM), while fixed remains best on
+synthetic. THREE RULES, THREE DIFFERENT WINNERS, and which one wins
+also depends on which metric is weighted: on blackstar, texture wins on
+PSNR/SSIM while qerr wins on blockiness and OFF is cheapest.
+
+That is the actual finding, and it is a stopping point rather than a
+failure to try harder. The metrics available cannot settle this:
+  * PSNR and SSIM systematically reward NOT filtering, because
+    filtering moves pixels away from the source even when it removes an
+    artifact a viewer would object to;
+  * blockiness measures one artifact and would happily be gamed by
+    over-smoothing (strength 4 already drove P=4 to 0.72, BELOW the
+    source's own statistic);
+  * no combination of the two expresses the trade a viewer makes.
+libvmaf is not compiled into this ffmpeg (only vmafmotion), so the one
+metric designed for this question is unavailable here.
+
+So the honest state: the filter WORKS — every mode cuts grid
+discontinuity substantially, and the in-loop byte effect is neutral to
+slightly positive — but its strength RULE cannot be chosen on this
+evidence. Choosing one anyway would be the fixed-threshold mistake
+again, this time dressed as adaptivity. Recorded as blocked on a
+perceptual metric: either build/obtain libvmaf, or make a deliberate
+policy decision that a fixed amount of blockiness reduction is worth a
+stated amount of PSNR, and write that trade down as a choice rather
+than discovering it as a measurement.
