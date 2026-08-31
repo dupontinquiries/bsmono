@@ -98,6 +98,27 @@ def audit(rs: Path):
             and p != rs
             and "/target/" not in str(p)
         ]
+    # READ EVERY SIBLING ONCE, not once per module.
+    #
+    # `testonly_check`'s own header records this exact lesson — "re-reading a
+    # file per candidate turned a 20s run into minutes" — and this sibling tool
+    # never got the fix: the loop below re-read every file in the tree for every
+    # `mod` in the crate root, which is O(modules x files) full reads. Same bug,
+    # same shape, one tool over.
+    cache = {}
+    for s_ in siblings + [rs]:
+        try:
+            body = s_.read_text(errors="replace")
+        except OSError:
+            continue
+        lines = body.splitlines()
+        # Comment lines can never be a caller, so drop them once rather than per
+        # module. Keeping the original index lets the CLI-flag heuristic look at
+        # the real neighbours.
+        code = [(i, ln) for i, ln in enumerate(lines)
+                if not ln.lstrip().startswith(("//", "///", "//!", "*"))]
+        cache[s_] = (lines, code)
+
     out = []
     for m in mods:
         mod_file = src / f"{m}.rs"
@@ -130,22 +151,21 @@ def audit(rs: Path):
         callers = 0
         flagged_only = True
         for s in siblings + [rs]:
-            if s == mod_file:
+            if s == mod_file or s not in cache:
                 continue
-            body = s.read_text(errors="replace")
+            lines, code = cache[s]
             use_pat = ffi_pat if s.suffix != ".rs" else pat
-            hits = [
-                ln for ln in body.splitlines()
-                if use_pat.search(ln) and not ln.lstrip().startswith(("//", "///", "//!", "*"))
-            ]
+            # Carry the line INDEX with the hit. The previous form searched the
+            # hit text back with `lines.index(ln)`, which returns the FIRST line
+            # equal to that text — so two identical lines in a file had the CLI
+            # heuristic inspect the wrong one's neighbours.
+            hits = [(i, ln) for i, ln in code if use_pat.search(ln)]
             if not hits:
                 continue
             callers += len(hits)
             # Is every hit next to a CLI flag test? Cheap heuristic: look
             # at the line and the two above it.
-            lines = body.splitlines()
-            for ln in hits:
-                i = lines.index(ln)
+            for i, _ln in hits:
                 if not any(FLAGGED_RE.search(x) for x in lines[max(0, i - 3):i + 1]):
                     flagged_only = False
 
