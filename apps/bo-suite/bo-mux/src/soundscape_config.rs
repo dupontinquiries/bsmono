@@ -362,6 +362,46 @@ pub fn compile(cfg: &SoundscapeConfig) -> Result<(Soundscape, HashMap<String, Re
     }, routings))
 }
 
+/// Where scene files live.
+///
+/// The DAEMON had this as a private helper in its own binary, so the
+/// GUI had no way to agree with it — and a GUI that lists scenes from a
+/// different directory than the daemon loads them from is worse than
+/// one that lists none, because every name it shows is one that will
+/// fail to load.
+///
+/// Moved here, into the crate both sides already depend on.
+pub fn scene_dir() -> std::path::PathBuf {
+    std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("bo-mux")
+        .join("scenes")
+}
+
+/// Scene names available to load, sorted.
+///
+/// Names, not paths: the daemon's `load_scene` takes a name and resolves
+/// it itself, so handing a caller a path would invite it to bypass that
+/// and disagree about the directory again.
+///
+/// An unreadable directory is an EMPTY list, not an error. No scenes
+/// installed yet is the ordinary first-run state, and the caller already
+/// has to handle an empty list.
+pub fn scene_names() -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(scene_dir()) else { return Vec::new() };
+    let mut out: Vec<String> = rd
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.strip_suffix(".json").map(str::to_string)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// Load a config from a JSON file.
 pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<SoundscapeConfig, String> {
     let text = std::fs::read_to_string(path.as_ref())
@@ -521,6 +561,31 @@ pub fn example_forest_5_1() -> SoundscapeConfig {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_scene_directory_is_under_the_data_dir() {
+        // The daemon and the GUI must agree. This asserts the SHAPE
+        // rather than a literal path, because the path depends on
+        // XDG_DATA_HOME and HOME — pinning a literal would make the test
+        // pass only on one machine.
+        let d = super::scene_dir();
+        assert!(d.ends_with("bo-mux/scenes"), "{}", d.display());
+    }
+
+    #[test]
+    fn a_missing_scene_directory_lists_nothing_rather_than_failing() {
+        // No scenes installed is the ordinary first-run state, and the
+        // caller already handles an empty list. An error here would make
+        // a fresh install look broken.
+        let old = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", "/nonexistent-bo-mux-test");
+        let names = super::scene_names();
+        match old {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        assert!(names.is_empty(), "{names:?}");
+    }
     use super::*;
 
     #[test]

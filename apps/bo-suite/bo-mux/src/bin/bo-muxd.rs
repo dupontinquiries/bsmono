@@ -418,7 +418,10 @@ fn data_dir() -> PathBuf {
 }
 
 fn scene_dir() -> PathBuf {
-    data_dir().join("scenes")
+    // Delegates to the library, so the GUI and the daemon cannot drift
+    // apart about where scenes live. A GUI listing from one directory
+    // while the daemon loads from another shows names that fail.
+    bo_mux::soundscape_config::scene_dir()
 }
 
 /// Copy the bundled "starter" soundscape presets into the user's

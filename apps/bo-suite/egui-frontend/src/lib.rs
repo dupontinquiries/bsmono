@@ -425,6 +425,8 @@ pub struct Controller {
     pub mixer: crate::device::Mixer,
     pub profile: crate::device::Profile,
     pub soundscape: crate::soundscape::Soundscape,
+    /// Which scene preset was last loaded, for the status line.
+    pub scene_loaded: Option<String>,
     pub settings: crate::settings_page::SettingsPage,
     pub sinks: crate::settings_page::SinkPicker,
     pub now: crate::chrome::NowPlaying,
@@ -448,7 +450,7 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(devices: Vec<Device>, scenes: Vec<Scene>) -> Self {
-        Controller { nav: uikit_egui::nav::Nav::new(VIEWS.len()),
+        Controller { nav: uikit_egui::nav::Nav::new(VIEWS.len()), scene_loaded: None,
             strip: uikit_egui::segmented_tabs::TabStrip::new(&VIEWS),
             devices, scenes, active_scene: 0,
             breath: uikit_egui::motion::Breath::new(2200.0, 0.35, 1.0),
@@ -1345,6 +1347,49 @@ impl Controller {
 
     fn soundscape_view(&mut self, ui: &mut Ui, c: &PaletteColors) {
         ui.heading("Soundscape");
+        // SCENE PRESETS. The daemon's own comment says the rich config
+        // format is "what the Spaces page reads and writes" — Spaces is
+        // speaker-to-channel routing and has never touched a scene, so
+        // that comment described a page that does not exist. Nothing in
+        // this port could load one.
+        //
+        // Listed by NAME, from the same `scene_dir` the daemon resolves,
+        // now that both sides share it. Showing names from a directory
+        // the daemon does not read is worse than showing none, because
+        // every one of them fails on click.
+        let scenes = bo_mux::soundscape_config::scene_names();
+        if scenes.is_empty() {
+            // Said, not blank. "No scenes installed" and "scene loading
+            // is broken" look identical otherwise, and the first is the
+            // ordinary state on a fresh install.
+            ui.colored_label(c.text_weak, "no scenes in ~/.local/share/bo-mux/scenes");
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                for name in &scenes {
+                    if ui.button(name).clicked() {
+                        // Loaded and VALIDATED here rather than fired at
+                        // the daemon blind: `parse` is the same code the
+                        // daemon runs, so a scene that will fail there
+                        // fails here with a message beside the button
+                        // that was pressed.
+                        let path = bo_mux::soundscape_config::scene_dir()
+                            .join(format!("{name}.json"));
+                        match bo_mux::soundscape_config::load_from_file(&path) {
+                            Ok(cfg) => {
+                                self.scene_loaded = Some(name.clone());
+                                self.toast.show(&format!(
+                                    "{name}: {} layers", cfg.layers.len()));
+                            }
+                            Err(e) => self.toast.show(&format!("{name}: {e}")),
+                        }
+                    }
+                }
+            });
+            if let Some(n) = &self.scene_loaded {
+                ui.colored_label(c.text_weak, format!("loaded {n}"));
+            }
+        }
+        ui.separator();
         if crate::soundscape::soundscape_ui(ui, &mut self.soundscape, c) {
             self.toast.show("loop search started");
         }

@@ -5355,3 +5355,46 @@ hold-and-pick popup and nothing else. Only the PLACEMENT was missing.
   (real names: success/warning/danger/text_weak), plus this fleet's
   eframe requiring `ui` alongside `update` (matched dialer-egui's stub).
   drivemind-egui now builds with the app feature and headless.
+
+## 96. bo-suite: scene presets could not be loaded, and a doc comment said otherwise
+
+`testonly_check` flagged `soundscape_config::load_from_file` and
+`save_to_file` — real persistence, called by nothing.
+
+Following it turned up a stale claim rather than just a gap. The
+daemon's own comment says the rich config format is *"what the Spaces
+page reads and writes"*. **Spaces is speaker-to-channel routing and has
+never touched a scene.** The Qt build has `load_scene` in
+`mux_bridge.rs`; the egui port has nothing.
+
+**And `scene_dir()` was a private helper inside the daemon BINARY**, so
+the GUI had no way to agree with it. A GUI listing scenes from a
+different directory than the daemon loads them from is worse than one
+listing none, because every name it shows fails on click.
+
+Moved `scene_dir` into `bo-mux` — the crate both sides already depend on
+— and the daemon now delegates to it. Added `scene_names()` beside it.
+
+The Soundscape view lists the presets and loads one.
+
+Decisions:
+  - **Names, not paths.** The daemon's `load_scene` takes a name and
+    resolves it itself; handing out paths would invite a caller to
+    bypass that and disagree about the directory again.
+  - **Validated on load, not fired blind.** `parse` is the same code the
+    daemon runs, so a scene that would fail there fails HERE, with the
+    message beside the button that was pressed.
+  - **An empty list is SAID.** "No scenes installed" and "scene loading
+    is broken" look identical when a panel is simply blank, and the
+    first is the ordinary state on a fresh install.
+  - **An unreadable directory is an empty list, not an error**, for the
+    same reason.
+
+bo-mux 266/266, bo-suite-egui 416/416.
+
+- **C96a — loading does not yet TELL the daemon.** It reads and
+  validates the config and reports the layer count; the daemon still
+  needs a `load_scene` call, and this port has no daemon connection at
+  all. That is the next real piece.
+- **C96b — `save_to_file` is still uncalled.** Nothing in the port edits
+  a scene, so there is nothing to save. Honest, and left.
