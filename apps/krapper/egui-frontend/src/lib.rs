@@ -173,7 +173,11 @@ impl Writer {
 /// sweep the other apps took.
 pub fn writer_ui(ui: &mut egui::Ui, w: &mut Writer,
                  colors: &uikit_egui::PaletteColors,
-                 a11y: &mut uikit_egui::a11y::A11yScene) -> Option<String> {
+                 a11y: &mut uikit_egui::a11y::A11yScene,
+                 // Passed in rather than detected here: one detection per
+                 // frame, at the top, so every control agrees about which
+                 // device it is on.
+                 adaptive: &uikit_egui::adaptive::Adaptive) -> Option<String> {
     let mut picked = None;
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(format!("{:.0} bpm", w.vibe.bpm)).strong());
@@ -245,7 +249,16 @@ pub fn writer_ui(ui: &mut egui::Ui, w: &mut Writer,
                 // between frames — and `A11yScene` keeps focus BY ID, so
                 // focus would land on whatever moved into that slot.
                 let id = egui::Id::new(("krapper.blurb", b.as_str())).value();
-                if uikit_egui::a11y::note_button(a11y, id, &b, ui.button(&b)).clicked() {
+                // Sized to the device's minimum touch target. A
+                // suggestion you cannot reliably hit is a suggestion you
+                // stop using, and these are the app's primary control.
+                //
+                // `max` rather than a fixed size: a long blurb must stay
+                // wide enough to read, and shrinking it to a square
+                // would truncate the word being suggested.
+                let btn = egui::Button::new(&b)
+                    .min_size(egui::vec2(0.0, adaptive.min_touch_target));
+                if uikit_egui::a11y::note_button(a11y, id, &b, ui.add(btn)).clicked() {
                     picked = Some(b.clone());
                 }
             }
@@ -284,8 +297,23 @@ struct Shell {
 impl eframe::App for Shell {
     fn ui(&mut self, ui: &mut egui::Ui, _f: &mut eframe::Frame) {
         let colors = uikit_egui::palette_colors("midnight");
+        // THE ADAPTIVE LAYER. krapper asks for a 760x620 window, which
+        // is wider than a Fairphone's screen, and its suggestion
+        // buttons were default-sized — comfortably clickable with a
+        // mouse and smaller than a fingertip.
+        //
+        // The kit already knows the right numbers per device class;
+        // this app was the only one in the fleet not asking.
+        let adaptive = uikit_egui::adaptive::Adaptive::detect(ui.ctx());
         egui::CentralPanel::default().show(ui.ctx(), |ui| {
-            if let Some(b) = writer_ui(ui, &mut self.w, &colors, &mut self.a11y) {
+            // Inset for the safe area BEFORE anything draws. On a phone
+            // with a notch or a gesture bar, a control under the inset
+            // is one that cannot be tapped — and the suggestion row sits
+            // at the bottom, which is exactly where the gesture bar is.
+            let safe = adaptive.inset(ui.available_rect_before_wrap());
+            let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(safe));
+            let ui = &mut ui;
+            if let Some(b) = writer_ui(ui, &mut self.w, &colors, &mut self.a11y, &adaptive) {
                 if !self.w.lyrics.is_empty() && !self.w.lyrics.ends_with(' ') {
                     self.w.lyrics.push(' ');
                 }

@@ -5184,5 +5184,30 @@ Wired: `A11yScene` on the page, `note_button` on select and remove.
 Did not compile here: ambient-learner needs `gdk-pixbuf-sys`, a known
 sandbox gap. No errors in the edited file.
 
-- **C93a — krapper is a11y=0 nav=0 adaptive=0 gesture=0** and is the
-  only app at all zeros. Unexamined.
+- **C93a — DONE for adaptive; nav and gesture are honest zeros.**
+  krapper's a11y was actually 1 and already careful — its suggestion
+  buttons derive ids from the TEXT with a comment explaining that
+  reordering suggestions would otherwise move focus onto whatever slid
+  into the slot.
+
+  What was genuinely missing: it asked for a 760x620 window (wider than
+  a Fairphone's screen) and drew default-sized suggestion buttons —
+  comfortably clickable with a mouse, smaller than a fingertip. It was
+  the only app in the fleet not asking the kit for the numbers.
+
+  Added `Adaptive::detect` once per frame at the top, passed down so
+  every control agrees which device it is on. Two uses:
+    - **`inset` for the safe area before anything draws.** The
+      suggestion row sits at the BOTTOM, which is exactly where a
+      gesture bar is — a control under the inset cannot be tapped at
+      all.
+    - **`min_size(0, min_touch_target)` on the suggestions.** Height
+      only: a long blurb has to stay wide enough to read, and forcing a
+      square would truncate the word being suggested.
+
+  `nav=0` and `gesture=0` are CORRECT and left alone. krapper is a
+  single `CentralPanel` with no second screen to navigate to, and
+  nothing to swipe. Adding either to move a number would be the metric
+  driving the code.
+
+  17/17.
