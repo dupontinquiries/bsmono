@@ -185,6 +185,33 @@ fn softplus(x: f32) -> f32 {
 ///
 /// This is the residual-branch body only — the caller owns attn_norm and the residual add,
 /// exactly as the caller of `block_decode_*` does for dense layers.
+/// One gated delta-rule update for ONE head, in place — the exact per-head body of
+/// llama.cpp's `build_delta_net_autoregressive` (delta-net-base.cpp), including the q-scale:
+///
+///   S ← exp(gate)·S;   ŷ = S·k;   S += β(v − ŷ)⊗k;   out = S·(q/√s)
+///
+/// `gate` is the LOG-decay (≤ 0 for validated weights; exponentiated here, as the reference
+/// does `g = ggml_exp(g); s = mul(s, g)`). Decay comes FIRST: the prediction error is measured
+/// against the already-decayed state, and the output reads the state AFTER the correction.
+/// This is the seam the invariant tests bind to and the seam a GPU kernel must reproduce —
+/// `step` is this plus the projections/conv/norms around it.
+pub fn delta_rule_head_step(s_mat: &mut [f32], q: &[f32], k: &[f32], v: &[f32],
+                            gate: f32, beta: f32, out: &mut [f32]) {
+    let s = q.len();
+    assert_eq!(k.len(), s); assert_eq!(v.len(), s); assert_eq!(out.len(), s);
+    assert_eq!(s_mat.len(), s * s);
+    let qscale = 1.0 / (s as f32).sqrt();
+    let decay = gate.exp();
+    for x in s_mat.iter_mut() { *x *= decay; }
+    for row in 0..s {
+        let sr = &mut s_mat[row * s..(row + 1) * s];
+        let yhat: f32 = sr.iter().zip(k).map(|(a, b)| a * b).sum();
+        let d = beta * (v[row] - yhat);
+        for (c, x) in sr.iter_mut().enumerate() { *x += d * k[c]; }
+        out[row] = sr.iter().zip(q).map(|(a, b)| a * b * qscale).sum();
+    }
+}
+
 pub fn step(m: &DeltaNetDims, w: &DeltaNetWeights, st: &mut DeltaNetState, x: &[f32],
             eps: f32) -> Vec<f32> {
     assert_eq!(x.len(), m.d, "deltanet step: input width");
@@ -229,26 +256,18 @@ pub fn step(m: &DeltaNetDims, w: &DeltaNetWeights, st: &mut DeltaNetState, x: &[
         l2(&mut k[h * s..(h + 1) * s]);
     }
 
-    // 5. the recurrence (delta-net-base.cpp, build_delta_net_autoregressive). q pre-scaled.
-    let qscale = 1.0 / (s as f32).sqrt();
+    // 5. the recurrence — delegated per head to `delta_rule_head_step` (the module's one
+    // order-sensitive piece, kept as its own seam so the invariant tests and a future GPU
+    // kernel both bind to the SAME code `step` runs, not a copy).
     let share = h_v / h_k;
     let mut out = vec![0.0f32; m.value_dim()];
     for h in 0..h_v {
         let kh = &k[(h / share) * s..(h / share + 1) * s];
-        let qh: Vec<f32> = q[(h / share) * s..(h / share + 1) * s].iter()
-            .map(|&x| x * qscale).collect();
+        let qh = &q[(h / share) * s..(h / share + 1) * s];
         let vh = &v[h * s..(h + 1) * s];
         let sm = &mut st.s[h * s * s..(h + 1) * s * s];
-        let decay = gate[h].exp(); // ∈ (0,1] by ssm_a ≤ 0 (validated)
-        for x in sm.iter_mut() { *x *= decay; }
-        // ŷ = S·k against the decayed state; correction β(v−ŷ)⊗k; output S·q AFTER update.
-        for row in 0..s {
-            let sr = &mut sm[row * s..(row + 1) * s];
-            let yhat: f32 = sr.iter().zip(kh).map(|(a, b)| a * b).sum();
-            let d = beta[h] * (vh[row] - yhat);
-            for (c, x) in sr.iter_mut().enumerate() { *x += d * kh[c]; }
-            out[h * s + row] = sr.iter().zip(&qh).map(|(a, b)| a * b).sum();
-        }
+        let (o, _rest) = out[h * s..].split_at_mut(s);
+        delta_rule_head_step(sm, qh, kh, vh, gate[h], beta[h], o);
     }
 
     // 6. gated RMS norm per head: rmsnorm(out_h; norm) ∘ silu(z_h)   (build_norm_gated).
@@ -324,21 +343,27 @@ mod tests {
         // hand-run the recurrence core with β=1 on synthetic normalized k
         let k: Vec<f32> = { let mut k = vec![0.6f32, 0.8, 0.0, 0.0]; let n = (k.iter().map(|x| x*x).sum::<f32>()).sqrt(); for x in &mut k { *x /= n; } k };
         let v: Vec<f32> = vec![1.0, -2.0, 0.5, 3.0];
-        let decay = 0.42f32;
+        // Through the MODULE'S core, not a local copy: an earlier version of this test
+        // hand-ran the recurrence and so could never catch `step` diverging from it.
+        let q: Vec<f32> = vec![0.1, -0.4, 0.9, 0.2];
+        let gate = 0.42f32.ln(); // decay 0.42 — decisively ≠ 1, so the ORDER is discriminated:
+                                 // decay-after-correction would leave S·k = 0.42·v here
+        let mut out = vec![0.0f32; s];
         for h in 0..h_v {
             let sm = &mut st.s[h * s * s..(h + 1) * s * s];
-            for x in sm.iter_mut() { *x *= decay; }
-            for row in 0..s {
-                let sr = &mut sm[row * s..(row + 1) * s];
-                let yhat: f32 = sr.iter().zip(&k).map(|(a, b)| a * b).sum();
-                let d = 1.0 * (v[row] - yhat);
-                for (c, x) in sr.iter_mut().enumerate() { *x += d * k[c]; }
-            }
-            let sm = &st.s[h * s * s..(h + 1) * s * s];
+            delta_rule_head_step(sm, &q, &k, &v, gate, 1.0, &mut out);
             for row in 0..s {
                 let got: f32 = sm[row * s..(row + 1) * s].iter().zip(&k).map(|(a, b)| a * b).sum();
                 assert!((got - v[row]).abs() < 1e-5,
                     "head {h} row {row}: S·k = {got}, want v = {}", v[row]);
+            }
+            // and the output is the post-update state read through the scaled query
+            let qs = 1.0 / (s as f32).sqrt();
+            for row in 0..s {
+                let want: f32 = st.s[h * s * s + row * s..h * s * s + (row + 1) * s]
+                    .iter().zip(&q).map(|(a, b)| a * b * qs).sum();
+                assert!((out[row] - want).abs() < 1e-5,
+                    "head {h} row {row}: out = {}, want S·(q/√s) = {want}", out[row]);
             }
         }
     }
