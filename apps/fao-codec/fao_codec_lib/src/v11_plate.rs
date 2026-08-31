@@ -1361,14 +1361,46 @@ pub fn encode_gop_v3_forced(
         }
     };
     let plate = &plate_coded;
+    encode_gop_v3_core(
+        frames,
+        &mut |fi: usize| predict_frame(plate, &motions[fi], fw, fh),
+        plate_bytes,
+        frames.len() * 8,
+        opts,
+        force_plate,
+    )
+}
 
+/// The mode/residual core behind v3, with the WORLD MODEL abstracted to a
+/// per-frame prediction provider. The seam exists because the predictor is
+/// the one thing that actually varies across the codec's branches: the 2D
+/// warped plate ([`encode_gop_v3_forced`] — the default path, byte-exact
+/// with the pre-seam code), a 3D canonical render (`plate_lab --render3d`,
+/// the residual-vs-canonical-render bridge), and a mover-composited plate
+/// are all providers over the SAME mode decision, gain correction, side
+/// info, and DCT residual machinery. `model_bytes` is what shipping the
+/// model cost (coded plate / serialized mesh / ~24 B citation);
+/// `motion_bytes` is the per-frame model-parameter bill (8 B/frame plate
+/// motions; a pose stream for 3D). The provider MUST be decoder-visible:
+/// only decoded/deterministic inputs, never source pixels.
+pub fn encode_gop_v3_core(
+    frames: &[Yuv420],
+    pred_for: &mut dyn FnMut(usize) -> Yuv420,
+    model_bytes: usize,
+    motion_bytes: usize,
+    opts: &ResidualOpts,
+    force_plate: Option<&Vec<Vec<bool>>>,
+) -> (PlateEncodeReportV2, Vec<Vec<u32>>) {
+    let fw = frames[0].w;
+    let fh = frames[0].h;
+    let (gw, gh) = (fw / REGION, fh / REGION);
     let mut out_frames = Vec::with_capacity(frames.len());
     let mut recon: Vec<Yuv420> = Vec::with_capacity(frames.len());
     let mut prev_share_acc = 0.0f64;
     let mut leftover_trace: Vec<Vec<u32>> = Vec::with_capacity(frames.len());
 
-    for (fi, (f, m)) in frames.iter().zip(motions).enumerate() {
-        let plate_pred = predict_frame(plate, m, fw, fh);
+    for (fi, f) in frames.iter().enumerate() {
+        let plate_pred = pred_for(fi);
         let mut modes = vec![0u8; gw * gh];
         let mut mvs: Vec<(i8, i8)> = Vec::new();
         let composite = if fi == 0 {
@@ -1791,8 +1823,8 @@ pub fn encode_gop_v3_forced(
     }
     let denom = (frames.len().saturating_sub(1)).max(1) as f64;
     (PlateEncodeReportV2 {
-        plate_bytes,
-        motion_bytes: frames.len() * 8,
+        plate_bytes: model_bytes,
+        motion_bytes,
         frames: out_frames,
         recon,
         prev_mode_share: (prev_share_acc / denom) as f32,

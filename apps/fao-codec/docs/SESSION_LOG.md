@@ -3804,3 +3804,51 @@ perceptual (screen content repeats EXACTLY, and the SAD-margin test
 would then be pass/fail rather than approximate), and ideally an
 engine-rendered source with no capture noise. Probe kept behind
 --dictprobe for that experiment.
+
+## Session 2026-08-31: predictor seam, the 3D bytes bridge, mover layer
+
+### encode_gop_v3_core — the predictor-provider seam (byte-exact refactor)
+
+The v3 loop's ONLY dependency on the plate was one predict_frame call,
+so the mode decision / gain / side-info / DCT-residual machinery is now
+encode_gop_v3_core(frames, pred_for: FnMut(usize)->Yuv420, model_bytes,
+motion_bytes, opts, force). The seam isolates the one thing that
+actually varies across branches: the world model. Providers today: 2D
+warped plate (default path), 3D canonical render (--render3d), mover-
+composited plate (below). Verified byte-exact post-refactor: w1 store
+GOP (48f @ 19.102s, crop 1920:800:0:140, dz32 static) identical byte
+split (71804/384/281168/134026 = 487,382 @ 38.311 dB) and recon y4m
+byte-identical. Suite 84/0. Harness note: this session's shot cuts
+reproduce the historical suite EXACTLY (shot 4 → 893,852 @ 34.930969,
+bit-equal to full_v11_dz32_platedct_dz8.csv), so crop=1920:800:0:140
++ CSV start/frames is the canonical recipe.
+
+### --render3d: the 3D path produces BYTES for the first time
+
+The named missing construction (residual vs canonical render) exists:
+--triangulate --affine --dense --render3d renders the dense mesh at
+each frame's pose through v8's CPU rasterizer, converts full-range
+BT.601, holes -> neutral gray (mode decision routes them to prev/intra
+exactly like plate misses), and feeds encode_gop_v3_core. Accounting
+mirrors the plate: mesh serialized (verts f32x3 + colors u8x3 + idx
+u32x3, zstd-19) amortized, 12 B/frame pose, cited marginal at 24 B.
+
+Measured, dz32, vs the 2D plate on the SAME core:
+  w1 (near-locked store, 48f):
+    2D plate: 487,382 @ 38.31 dB (plate 71.8 KB; cited-marg 415.6 KB)
+    3D mesh:  656,704 @ 36.91 dB (mesh 230.1 KB; cited-marg 426.6 KB)
+  -> On the plate's home turf the render nearly TIES at cited marginal
+     (+2.6% bytes) at -1.4 dB; amortized it loses 35%. Consistent with
+     the recorded prediction that a locked-shot 3D recon reprojects to
+     what a 2D plate already gives, minus geometry risk.
+  shot 4 (strong pan, 35f):
+    2D plate: 893,852 @ 34.93 dB
+    3D mesh:  704,177 @ 33.91 dB — but triangulation COLLAPSED
+    (2 of 197 tracks, depth coverage 0.09): the "mesh" is a card, the
+    byte win is just skipping the 212 KB pan plate, and prev-MC carries
+    both branches (mode+mv+residual near-identical across branches).
+Honest verdict: the bridge stands and the accounting is real; the 3D
+path's blockers are now MEASURABLE and named — (1) triangulation
+robustness on pans (2/197 needs a root-cause), (2) cross-take pose
+alignment incl. monocular scale so a matched library canonical can be
+rendered for a DIFFERENT take (today's cited-marginal is same-take).

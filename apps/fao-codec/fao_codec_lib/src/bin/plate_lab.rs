@@ -810,6 +810,134 @@ end_header
             std::fs::write(&ply_path, header + &body).unwrap_or_else(|e| die(&format!("write {ply_path}: {e}")));
             println!("exported {} colored points -> {}", n_out, ply_path);
         }
+        // --render3d <out.y4m>: THE BRIDGE — residual-coding against the
+        // canonical's RENDER, so the 3D path produces BYTES for the first
+        // time instead of match scores. The dense mesh is the canonical
+        // (requires --dense); each frame's prediction is render_mesh at
+        // that frame's pose; the prediction feeds encode_gop_v3_core —
+        // the SAME mode decision / gain / side-info / DCT-residual
+        // machinery as the 2D plate, so "3D render vs 2D plate as the
+        // world model" is a controlled comparison. Accounting mirrors
+        // the plate: model_bytes = serialized mesh (amortized; a
+        // library-matched canonical ships as ~24 B UUID+alignment —
+        // printed as the cited marginal), motion = 12 B/frame pose.
+        // Unrasterized pixels render as neutral gray: the mode decision
+        // routes those regions to prev/intra exactly as it does for
+        // plate misses. Lab honesty: exact-black mesh output is
+        // indistinguishable from a hole under this rule (none observed
+        // on this material — film black lifts off 0 after the h264
+        // chain).
+        if let Some(out3d) = arg_val(&args, "--render3d") {
+            use fao_codec::v8_rasterizer::render_mesh;
+            let Some(mesh) = dense_mesh.as_ref() else {
+                die("--render3d requires --dense (the sparse cloud does not rasterize)");
+            };
+            // Serialized canonical: verts f32x3 + colors u8x3 + indices
+            // u32x3, zstd-19 — the wire form a library canonical would
+            // actually ship (normals are recomputable; the spatial hash
+            // is encoder state).
+            let mesh_bytes = {
+                let mut raw: Vec<u8> =
+                    Vec::with_capacity(mesh.vertices.len() * 15 + mesh.indices.len() * 4);
+                for v in &mesh.vertices {
+                    raw.extend_from_slice(&v.x.to_le_bytes());
+                    raw.extend_from_slice(&v.y.to_le_bytes());
+                    raw.extend_from_slice(&v.z.to_le_bytes());
+                }
+                for c in &mesh.vertex_colors {
+                    for ch in c {
+                        raw.push((ch * 255.0).round().clamp(0.0, 255.0) as u8);
+                    }
+                }
+                for i in &mesh.indices {
+                    raw.extend_from_slice(&i.to_le_bytes());
+                }
+                zstd::encode_all(raw.as_slice(), 19).map(|c| c.len()).unwrap_or(raw.len())
+            };
+            let t3 = std::time::Instant::now();
+            // Full-range BT.601, the exact inverse of the color sampling
+            // that built the mesh (r = (Y + 1.402 V')/255 etc.).
+            let rgb_to_yuv = |rgb: &[u8], fw: usize, fh: usize| -> plate::Yuv420 {
+                let mut f = plate::Yuv420::new(fw, fh);
+                let cw = fw / 2;
+                let mut usum = vec![0u32; cw * (fh / 2)];
+                let mut vsum = vec![0u32; cw * (fh / 2)];
+                for y in 0..fh {
+                    for x in 0..fw {
+                        let i = (y * fw + x) * 3;
+                        let (r, g, b) = (rgb[i] as f32, rgb[i + 1] as f32, rgb[i + 2] as f32);
+                        let (r, g, b) = if rgb[i] == 0 && rgb[i + 1] == 0 && rgb[i + 2] == 0 {
+                            (128.0, 128.0, 128.0) // hole -> neutral gray
+                        } else {
+                            (r, g, b)
+                        };
+                        let yv = 0.299 * r + 0.587 * g + 0.114 * b;
+                        let uv = -0.168736 * r - 0.331264 * g + 0.5 * b + 128.0;
+                        let vv = 0.5 * r - 0.418688 * g - 0.081312 * b + 128.0;
+                        f.y[y * fw + x] = yv.round().clamp(0.0, 255.0) as u8;
+                        let ci = (y / 2) * cw + x / 2;
+                        usum[ci] += uv.round().clamp(0.0, 255.0) as u32;
+                        vsum[ci] += vv.round().clamp(0.0, 255.0) as u32;
+                    }
+                }
+                for (o, s) in f.u.iter_mut().zip(&usum) {
+                    *o = (s / 4) as u8;
+                }
+                for (o, s) in f.v.iter_mut().zip(&vsum) {
+                    *o = (s / 4) as u8;
+                }
+                f
+            };
+            let gray = plate::Yuv420::new(w, h); // render-failure fallback
+            let mut n_rendered = 0usize;
+            let mut pred_for = |fi: usize| -> plate::Yuv420 {
+                match render_mesh(mesh, None, &poses[fi], w, h) {
+                    Some(rgb) => {
+                        n_rendered += 1;
+                        rgb_to_yuv(&rgb, w, h)
+                    }
+                    None => {
+                        let mut g = gray.clone();
+                        for p in g.y.iter_mut() {
+                            *p = 128;
+                        }
+                        for p in g.u.iter_mut().chain(g.v.iter_mut()) {
+                            *p = 128;
+                        }
+                        g
+                    }
+                }
+            };
+            let pose_bytes = frames.len() * 12; // f32 xyz per frame
+            let (rep, _) = plate::encode_gop_v3_core(
+                &frames, &mut pred_for, mesh_bytes, pose_bytes, &opts, None,
+            );
+            let res_total: usize = rep.frames.iter().map(|c| c.residual_bytes).sum();
+            let mode_total: usize = rep.frames.iter().map(|c| c.mode_bytes).sum();
+            let n = frames.len();
+            let total = mesh_bytes + pose_bytes + res_total + mode_total;
+            let cited = 24 + pose_bytes + res_total + mode_total;
+            eprintln!(
+                "render3d: {} / {} frames rasterized  encode {:.1}s",
+                n_rendered,
+                n,
+                t3.elapsed().as_secs_f32()
+            );
+            println!(
+                "render3d byte split: mesh {} pose {} mode+mv {} residual {}",
+                mesh_bytes, pose_bytes, mode_total, res_total
+            );
+            println!(
+                "render3d prev_mode_share {:.3} (1.0 = render never used past frame 0)",
+                rep.prev_mode_share
+            );
+            println!(
+                "render3d total_bytes {total}  amortized_per_frame {}  cited_total {cited}  cited_per_frame {}",
+                total / n,
+                cited / n
+            );
+            write_y4m(&out3d, &header, &rep.recon);
+        }
         return;
     }
     if args.iter().any(|a| a == "--track") {
