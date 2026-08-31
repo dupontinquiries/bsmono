@@ -4525,3 +4525,69 @@ finish inside a 14-minute budget, while spread-24 took 200s. Candidate
 search is O(regions x budget x 256-pixel SAD) and at 4K that is
 32,400 regions per frame — the budget is a real compute knob, not just
 a quality one, and 96 is only affordable on easier content.
+
+### provenance: tamper evidence that localises the edit
+
+Raised by the user off the back of the scene-editing work: once a
+narrative edit costs 0.9% of the file and is a track rewrite, "is this
+the video that was recorded" stops being academic.
+
+Boundary stated first, in the module docs, because it is the thing a
+"verified" badge gets wrong: this is TAMPER EVIDENCE AND PROVENANCE,
+not proof a camera saw reality. Nothing computed from pixels can
+establish that — it needs secure capture hardware attesting at the
+sensor, which is what C2PA / Content Credentials specifies. This should
+eventually carry that, not replace it.
+
+Why the obvious design is wrong: a cryptographic hash over the encoded
+file breaks on every transcode, and transcoding is the normal life of
+a video. A bitstream hash reports "tampered" for the overwhelmingly
+common innocent case, which is how brittle integrity signals get
+ignored.
+
+What FAO can do that a pixel codec cannot: the representation is
+already an object graph, so the digest is STRUCTURAL — plate, per
+sprite, per track, hashed separately — and verification LOCALISES.
+"Plate matches, all sprites match, object 7's track diverges" is a
+different statement from "hash mismatch", and it is exactly the
+signature retarget_frames leaves. Sprite and track are hashed
+separately on purpose: that is what distinguishes a RE-STAGED object
+(same appearance, new path) from a REPLACED one. Findings are an enum,
+not a bool: Identical / ObjectCountChanged / PlateChanged /
+SpritesChanged(ids) / Restaged(ids) / LikelyTranscode{bits} /
+PixelsChangedOutsideObjects{bits} / LengthChanged.
+
+THE DESIGN CORRECTION, caught by its own test: the first version
+hashed region_fingerprint over every block and called it a robust
+digest. A mild requantisation (v/4*4+1) changed it completely. The
+cause is structural, not tuning — HASHING A PERCEPTUAL FEATURE
+DESTROYS THE PROPERTY THE FEATURE HAD. A cryptographic hash is built
+so one flipped input bit changes every output bit; a perceptual
+descriptor's whole value is that a few bits flip under innocent
+processing. "Robust hash" is a contradiction unless the comparison is
+a DISTANCE over the descriptor itself. So the descriptor is published
+raw and compared by Hamming distance: 64 bits/frame (8x8 grid cells vs
+frame mean), 384 bytes for a 48-frame GOP. It is deliberately NOT
+folded into the root — doing so would make the root brittle to exactly
+the re-encoding it exists to tolerate.
+
+Second correction, recorded because it is a natural idea that does not
+work: the user's content-derived sampling pattern adds NO security. An
+attacker holding the video derives the same pattern. It is worth doing
+for EFFICIENCY (spend the sample budget on high-information regions)
+but must not be sold as making the fingerprint harder to forge.
+Unforgeability comes from one place only — signing the digest with a
+key the attacker lacks and publishing it with a trustworthy timestamp.
+
+Cost: the exact digests are over quantities the encoder already holds
+(coded plate, decoded sprites, tracks), so they are effectively free at
+encode time; the descriptor is one 8x8 mean pass per frame. blake3 was
+already a monorepo dependency (gitmind, drivemind integrity
+manifests), so no new third-party surface.
+
+Known gap, stated rather than hidden: the 4-of-64-bits transcode
+threshold is a starting point, NOT measured. It needs a real transcode
+corpus (different encoders, rates, resolutions) before anyone should
+trust it, and an 8x8 descriptor is deliberately weak at catching a
+small object moving in a large frame — the structural digests are what
+catch that case, which is the division of labour the design intends.
