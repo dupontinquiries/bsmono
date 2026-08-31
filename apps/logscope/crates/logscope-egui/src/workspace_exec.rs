@@ -529,6 +529,23 @@ Continue with read_range {rel} {} {}]",
     }
 
     fn run(&self, argv: &[String]) -> ToolResult {
+        self.run_at(argv, "")
+    }
+
+    /// Run an allowlisted command with its cwd at `rel_dir` INSIDE the workspace ("" = root). The
+    /// same gates as `run` — allowlist, no shell, timeout, output cap — plus containment on the
+    /// directory itself: a cwd outside the root would let a check command read a tree the sandbox
+    /// never granted. Used by the verifier when the workspace root is not a Cargo root (a `.gitmind`
+    /// monorepo): the check must run where the edited crate's Cargo.toml is, not where the mirror is.
+    pub fn run_at(&self, argv: &[String], rel_dir: &str) -> ToolResult {
+        let cwd = if rel_dir.is_empty() || rel_dir == "." {
+            self.root.clone()
+        } else {
+            match self.sandbox_path(rel_dir) { Ok(p) => p, Err(e) => return ToolResult::err(e) }
+        };
+        if !cwd.is_dir() {
+            return ToolResult::err(format!("run: {rel_dir} is not a directory in this workspace"));
+        }
         let Some(bin) = argv.first() else { return ToolResult::err("empty command") };
         let base = Path::new(bin).file_name().and_then(|s| s.to_str()).unwrap_or(bin);
         if !self.allow.contains(base) {
@@ -536,7 +553,7 @@ Continue with read_range {rel} {} {}]",
         }
         let start = Instant::now();
         let mut cmd = Command::new(bin);
-        cmd.args(&argv[1..]).current_dir(&self.root)
+        cmd.args(&argv[1..]).current_dir(&cwd)
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => return ToolResult::err(format!("spawn {base}: {e}")) };
 
@@ -576,6 +593,58 @@ Continue with read_range {rel} {} {}]",
 
     fn allowlist_str(&self) -> String {
         self.allow.iter().cloned().collect::<Vec<_>>().join(", ")
+    }
+
+    /// Commit everything currently in the workspace as a restore point, returning the short hash.
+    /// Long-horizon insurance: when a later patch regresses a green state, the run (or the operator)
+    /// can diff/reset against the last checkpoint instead of the session baseline. Best-effort by
+    /// design — a workspace that is not a git worktree, or has nothing to commit, returns None and
+    /// the run proceeds; a checkpoint is an aid, never a gate.
+    pub fn git_checkpoint(&self, message: &str) -> Option<String> {
+        let git = |args: &[&str]| -> Option<String> {
+            let out = Command::new("git").args(args).current_dir(&self.root)
+                .stdin(Stdio::null()).output().ok()?;
+            if out.status.success() { Some(String::from_utf8_lossy(&out.stdout).trim().to_string()) } else { None }
+        };
+        git(&["add", "-A"])?;
+        // `commit` fails when there is nothing staged — exactly the "no new work since the last
+        // checkpoint" case, and the ? turns it into a clean None.
+        git(&["-c", "user.email=agent@logscope", "-c", "user.name=logscope-agent",
+              "commit", "-q", "-m", message])?;
+        git(&["rev-parse", "--short", "HEAD"])
+    }
+}
+
+/// The Cargo roots a check should run in, given the workspace-relative files a run touched: the
+/// NEAREST enclosing directory with a `Cargo.toml`, per file, deduped and capped. A `.gitmind`
+/// project like the monorepo has NO root Cargo.toml — `cargo check` at the mirror root fails with
+/// "could not find Cargo.toml", a structural failure the model cannot patch, and `gate_done_on_verify`
+/// then makes every run unfinishable. Running in the touched crate's own directory instead both
+/// fixes that and scopes the check: cargo resolves the crate's enclosing workspace itself.
+///
+/// Returns workspace-relative dirs ("" = the root). Falls back to [""] when no touched file sits
+/// under a Cargo root, which preserves today's behavior for plain single-crate workspaces.
+pub fn resolve_check_roots<'a>(root: &Path, touched: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut roots: BTreeSet<String> = BTreeSet::new();
+    for rel in touched {
+        let mut dir = Path::new(rel).parent().unwrap_or_else(|| Path::new(""));
+        loop {
+            if root.join(dir).join("Cargo.toml").is_file() {
+                roots.insert(dir.to_string_lossy().replace('\\', "/"));
+                break;
+            }
+            match dir.parent() {
+                Some(p) => dir = p,
+                None => break,
+            }
+        }
+    }
+    if roots.is_empty() {
+        vec![String::new()]
+    } else {
+        // Cap the fan-out: a run that somehow touched files across many crates gets its three most
+        // significant roots (BTreeSet order = stable), and the observation says so.
+        roots.into_iter().take(3).collect()
     }
 }
 
@@ -649,6 +718,17 @@ pub struct AgentConfig {
     /// shared docs earlier workers wrote (`collect_shared_docs`). Turn 0 should never be blind —
     /// a model that can't see the repo asks the user about it instead of exploring it.
     pub context: String,
+    /// StatefulGuide: drive the run through engmode's phase machine (survey → plan → patch → check
+    /// → diagnose), with the phase decided by counted checker output rather than the model's
+    /// narrative. Adds evidence-gated completion (a TASK_COMPLETE without a clean check is rejected
+    /// and said so), a stall detector that stops the run when the error count stops falling, and a
+    /// per-turn phase instruction in the prompt. This is the wiring `coordinator::Mode::StatefulGuide`
+    /// used to describe as missing.
+    pub stateful_guide: bool,
+    /// Commit the workspace as a restore point each time verification comes back green. A
+    /// long-horizon run's later mistake can then be diffed/reset against the last green state rather
+    /// than the session baseline. Best-effort: a non-git workspace simply never checkpoints.
+    pub checkpoint_on_green: bool,
 }
 
 impl Default for AgentConfig {
@@ -668,6 +748,8 @@ impl Default for AgentConfig {
             prefer_patches: true,
             digest_verify: true,
             context: String::new(),
+            stateful_guide: false,
+            checkpoint_on_green: false,
         }
     }
 }
@@ -1323,6 +1405,7 @@ fn step_turn(
     text: &str, prompt: &mut String, ws: &mut Workspace, cfg: &AgentConfig,
     plan: &mut Plan, verified: &mut bool, step: usize, guard: &mut crate::repetition::LoopGuard,
     ladder: &mut crate::line_calls::RefusalLadder,
+    mut guide: Option<&mut crate::phase_guide::Guide>,
 ) -> (Vec<(Tool, ToolResult)>, Option<Stop>) {
     // AUTHORISE BEFORE PARSING. Everything below reads `text` for tool calls, so the gate must run
     // first or a quoted call is already through. With ToolGate::Open this is a pass-through, which
@@ -1334,9 +1417,15 @@ fn step_turn(
     prompt.push_str("\n\nASSISTANT:\n");
     prompt.push_str(text);
 
+    // Whether THIS turn produced the plan — the phase machine's `Planned` evidence. Distinct from
+    // `plan.is_empty()` afterwards, which cannot tell a fresh plan from one three turns old.
+    let mut plan_steps_new: Option<usize> = None;
     if plan.is_empty() {
         let p = parse_plan(text);
-        if !p.is_empty() { *plan = p; }
+        if !p.is_empty() {
+            plan_steps_new = Some(p.steps.len());
+            *plan = p;
+        }
     }
 
     // REPORT THE BLOCKS WE THREW AWAY. c4-801 built this diagnosis and wired it to nothing, so a
@@ -1439,8 +1528,29 @@ the model attempted a call and it was discarded, which is not the same as the mo
         }
     }
 
-    // Done handling — gated on verification (6).
+    // Done handling — gated on verification (6). With the phase guide on, the CLAIM is a signal and
+    // the machine renders the verdict: a claim the last counted check supports ends the run with the
+    // evidence callout; an unsupported one is rejected in words the model sees (and counted, so the
+    // callout later names how often it overreached). The plain `verified` gate below stays for
+    // unguided runs.
     if text.contains(DONE_MARKER) && tools.is_empty() {
+        if let Some(g) = guide.as_deref_mut() {
+            let obs = crate::phase_guide::TurnObs { claims_done: true, ..Default::default() };
+            return match g.observe(&obs) {
+                crate::phase_guide::Verdict::Done(c) => {
+                    prompt.push_str(&format!("\n\n{c}\n"));
+                    (Vec::new(), Some(Stop::Done))
+                }
+                crate::phase_guide::Verdict::Blocked(c) => {
+                    prompt.push_str(&format!("\n\n{c}\n"));
+                    (Vec::new(), Some(Stop::Stalled))
+                }
+                crate::phase_guide::Verdict::Continue => {
+                    prompt.push_str(&g.prompt());
+                    (Vec::new(), None)
+                }
+            };
+        }
         if !cfg.gate_done_on_verify || *verified {
             return (Vec::new(), Some(Stop::Done));
         } else {
@@ -1451,6 +1561,9 @@ the model attempted a call and it was discarded, which is not the same as the mo
 
     if tools.is_empty() {
         prompt.push_str("\n\n(No tool call parsed. Emit a ```tool block, or reply TASK_COMPLETE.)\n");
+        if let Some(g) = guide.as_deref_mut() {
+            prompt.push_str(&g.prompt());
+        }
         return (Vec::new(), None);
     }
 
@@ -1468,19 +1581,91 @@ the model attempted a call and it was discarded, which is not the same as the mo
     prompt.push_str(&observation(&results));
 
     // Verify-as-you-go (1): don't verify on the final step (the model can't act on it).
+    //
+    // The check runs in the NEAREST CARGO ROOT(S) of the files this run touched, not blindly at the
+    // workspace root: a `.gitmind` project like the monorepo has no root Cargo.toml, and a check
+    // that structurally cannot pass ("could not find Cargo.toml") plus `gate_done_on_verify` is a
+    // run that structurally cannot finish. For a plain single-crate workspace the resolution is ""
+    // — today's behavior exactly.
+    let mut check_obs: Option<(usize, usize, usize)> = None;
     if wrote_verifiable && !cfg.verify_cmd.is_empty() && step + 1 < cfg.max_steps {
-        let vres = ws.apply(&Tool::Run { argv: cfg.verify_cmd.clone() });
-        *verified = vres.ok;
-        let body = if cfg.digest_verify { digest_check_output(&vres.output, 6) } else { vres.output.clone() };
+        let touched: Vec<String> = ws.events().iter()
+            .filter(|e| cfg.verify_exts.iter().any(|x| e.path.rsplit('.').next() == Some(x.as_str())))
+            .map(|e| e.path.clone())
+            .collect();
+        let roots = resolve_check_roots(ws.root(), touched.iter().map(|s| s.as_str()));
+        let mut all_ok = true;
+        let (mut errs, mut warns, mut tfails) = (0usize, 0usize, 0usize);
+        let mut body = String::new();
+        for r in &roots {
+            let vres = ws.run_at(&cfg.verify_cmd, r);
+            let (e, w, f) = check_counts(&vres.output, vres.ok);
+            errs += e; warns += w; tfails += f;
+            all_ok &= vres.ok;
+            let digest = if cfg.digest_verify { digest_check_output(&vres.output, 6) } else { vres.output.clone() };
+            if !r.is_empty() {
+                body.push_str(&format!("[in {r}/]\n"));
+            }
+            body.push_str(&digest);
+            body.push('\n');
+        }
+        *verified = all_ok;
+        let where_note = match roots.as_slice() {
+            [r] if r.is_empty() => String::new(),
+            _ => format!(" in {}", roots.iter().map(|r| if r.is_empty() { "." } else { r.as_str() })
+                                        .collect::<Vec<_>>().join(", ")),
+        };
         prompt.push_str(&format!(
-            "\n\nAUTOMATIC VERIFICATION ({}): {}\n{}\n",
+            "\n\nAUTOMATIC VERIFICATION ({}{}): {}\n{}",
             cfg.verify_cmd.join(" "),
-            if vres.ok { "PASSED" } else { "FAILED — fix these before continuing" },
+            where_note,
+            if all_ok { "PASSED" } else { "FAILED — fix these before continuing" },
             body,
         ));
+        check_obs = Some((errs, warns, tfails));
+        // Checkpoint-on-green: a long-horizon run's restore point. Committed in the SCRATCH repo, so
+        // it never touches the real project; reapply diffs files, not history, and is unaffected.
+        if all_ok && cfg.checkpoint_on_green {
+            if let Some(h) = ws.git_checkpoint(&format!("agent checkpoint: `{}` green", cfg.verify_cmd.join(" "))) {
+                prompt.push_str(&format!("(checkpoint {h} committed — this green state is a restore point)\n"));
+            }
+        }
     }
 
     plan.advance();
+
+    // Feed the phase machine what this turn OBSERVABLY did, and let it place the run. Blocked here
+    // is the stall detector firing: `stall_limit` consecutive counted checks without the error count
+    // falling — the evidence-backed "this approach is not working" that a bare step budget cannot say.
+    if let Some(g) = guide.as_deref_mut() {
+        let reads = results.iter().filter(|(t, r)| r.ok && matches!(t,
+            Tool::ReadFile { .. } | Tool::ListDir { .. } | Tool::Search { .. }
+            | Tool::ReadRange { .. } | Tool::GitLog { .. })).count();
+        let writes_ok = results.iter().filter(|(t, r)| r.ok && matches!(t,
+            Tool::WriteFile { .. } | Tool::Edit { .. })).count();
+        let failed: Vec<&ToolResult> = results.iter()
+            .filter(|(t, r)| !r.ok && matches!(t, Tool::WriteFile { .. } | Tool::Edit { .. }))
+            .map(|(_, r)| r).collect();
+        let obs = crate::phase_guide::TurnObs {
+            reads,
+            plan_steps: plan_steps_new,
+            writes_ok,
+            writes_failed: failed.len(),
+            first_write_failure: failed.first().map(|r| r.output.chars().take(200).collect()),
+            check: check_obs,
+            claims_done: false,
+        };
+        match g.observe(&obs) {
+            crate::phase_guide::Verdict::Blocked(c) => {
+                prompt.push_str(&format!("\n\n{c}\n"));
+                return (results, Some(Stop::Stalled));
+            }
+            // Done cannot come back here (it requires the claim, handled above); Continue injects
+            // the position so the next turn knows where it stands.
+            _ => prompt.push_str(&g.prompt()),
+        }
+    }
+
     (results, None)
 }
 
@@ -1490,21 +1675,58 @@ the model attempted a call and it was discarded, which is not the same as the mo
 /// the model can't spend on code. This is the deterministic core of the check-summarizer pipeline;
 /// output that doesn't look like rustc diagnostics falls back to a plain truncation so non-cargo
 /// verify commands still surface something useful.
+/// Classify one line of checker output: `Some(true)` = an error headline, `Some(false)` = a warning
+/// headline, `None` = neither. ONE classifier, shared by the digest and by `check_counts` — the
+/// c6 `contains("error")` bug (a `Compiling thiserror` line counted as an error) is exactly what two
+/// implementations of this drift into.
+fn rustc_headline(t: &str) -> Option<bool> {
+    let t = t.trim_start();
+    if t.starts_with("error[") { return Some(true); }
+    if t.starts_with("error:") {
+        // rustc's roll-up lines aren't diagnostics of their own.
+        if t.starts_with("error: aborting") || t.starts_with("error: could not compile") { return None; }
+        return Some(true);
+    }
+    if t.starts_with("warning:") && !t.contains("generated") && !t.contains("warning emitted") {
+        return Some(false);
+    }
+    None
+}
+
+/// Count a checker's output as EVIDENCE: (errors, warnings, tests_failed). This is what feeds
+/// `engmode::Signal::Checked`, so the numbers must be honest in both directions:
+///   * rustc-shaped output is counted by the same headline classifier the digest uses;
+///   * libtest's `test result: FAILED. 3 passed; 2 failed; …` lines contribute their failure count;
+///   * output that matches NEITHER shape but came from a failing command floors errors at 1 — a
+///     check that exits non-zero must never read as clean just because its failure text is unfamiliar
+///     (that floor is what stops "could not find Cargo.toml" reaching Done).
+pub fn check_counts(raw: &str, cmd_ok: bool) -> (usize, usize, usize) {
+    let (mut errors, mut warnings, mut tests_failed) = (0usize, 0usize, 0usize);
+    for line in raw.lines() {
+        match rustc_headline(line) {
+            Some(true) => errors += 1,
+            Some(false) => warnings += 1,
+            None => {}
+        }
+        // `test result: ok. 12 passed; 0 failed; …` / `test result: FAILED. 3 passed; 2 failed; …`
+        let t = line.trim_start();
+        if t.starts_with("test result:") {
+            if let Some(seg) = t.split(';').find(|s| s.trim_end().ends_with("failed")) {
+                if let Some(n) = seg.trim().split_whitespace().next().and_then(|w| w.parse::<usize>().ok()) {
+                    tests_failed += n;
+                }
+            }
+        }
+    }
+    if !cmd_ok && errors == 0 && tests_failed == 0 {
+        errors = 1; // unfamiliar failure text is still a failure
+    }
+    (errors, warnings, tests_failed)
+}
+
 pub fn digest_check_output(raw: &str, max_items: usize) -> String {
     let lines: Vec<&str> = raw.lines().collect();
-    let is_headline = |t: &str| -> Option<bool> {
-        let t = t.trim_start();
-        if t.starts_with("error[") { return Some(true); }
-        if t.starts_with("error:") {
-            // rustc's roll-up lines aren't diagnostics of their own.
-            if t.starts_with("error: aborting") || t.starts_with("error: could not compile") { return None; }
-            return Some(true);
-        }
-        if t.starts_with("warning:") && !t.contains("generated") && !t.contains("warning emitted") {
-            return Some(false);
-        }
-        None
-    };
+    let is_headline = rustc_headline;
     let (mut errors, mut warnings) = (0usize, 0usize);
     let mut items: Vec<String> = Vec::new();
     let mut first_detail: Vec<String> = Vec::new();
@@ -1560,6 +1782,12 @@ pub fn run_agent(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, max_steps: u
 /// driver that shares the same `step_turn` body.
 pub fn run_agent_cfg(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, cfg: &AgentConfig) -> Session {
     let mut prompt = system_prompt(task, cfg);
+    let mut guide = if cfg.stateful_guide { Some(crate::phase_guide::Guide::new()) } else { None };
+    if let Some(g) = &guide {
+        // Turn 0 opens IN a phase — Survey's "do not write code yet" only disciplines the run if
+        // the model sees it before its first reply, not after.
+        prompt.push_str(&g.prompt());
+    }
     let mut turns = Vec::new();
     let mut plan = Plan::default();
     // TWO MEANINGS ON ONE BOOLEAN. This starts true when no verify command is configured, which is
@@ -1578,7 +1806,7 @@ pub fn run_agent_cfg(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, cfg: &Ag
             Ok(t) => t,
             Err(e) => return Session { turns, stop: Stop::ModelError(e), files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier },
         };
-        let (results, stop) = step_turn(&text, &mut prompt, ws, cfg, &mut plan, &mut verified, step, &mut guard, &mut ladder);
+        let (results, stop) = step_turn(&text, &mut prompt, ws, cfg, &mut plan, &mut verified, step, &mut guard, &mut ladder, guide.as_mut());
         turns.push(Turn { model_text: text, results });
         if let Some(stop) = stop {
             return Session { turns, stop, files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier };
@@ -1619,6 +1847,8 @@ pub struct AgentRun {
     turns: usize,
     guard: crate::repetition::LoopGuard,
     ladder: crate::line_calls::RefusalLadder,
+    /// StatefulGuide's phase machine, when `cfg.stateful_guide` — the run's evidence-decided position.
+    guide: Option<crate::phase_guide::Guide>,
 }
 
 impl AgentRun {
@@ -1626,7 +1856,12 @@ impl AgentRun {
     pub fn start(work_dir: impl Into<std::path::PathBuf>, task: &str, cfg: AgentConfig) -> (Self, String) {
         // Captured before cfg moves into the run: a run with no verifier must not read as passed.
         let had_verifier = !cfg.verify_cmd.is_empty();
-        let prompt = system_prompt(task, &cfg);
+        let mut prompt = system_prompt(task, &cfg);
+        let guide = if cfg.stateful_guide { Some(crate::phase_guide::Guide::new()) } else { None };
+        if let Some(g) = &guide {
+            // Turn 0 opens IN a phase — see run_agent_cfg for why the first prompt carries it.
+            prompt.push_str(&g.prompt());
+        }
         let verified = cfg.verify_cmd.is_empty();
         let run = Self {
             ws: Workspace::new(work_dir), prompt: prompt.clone(), reply: String::new(),
@@ -1635,6 +1870,7 @@ impl AgentRun {
             ladder: crate::line_calls::RefusalLadder::new(4),
             // Mirrors the Session field: a run with no verifier must not read as one that passed.
             had_verifier,
+            guide,
         };
         (run, prompt)
     }
@@ -1651,12 +1887,25 @@ impl AgentRun {
     /// The worker finished a turn: process the accumulated reply and decide the next action.
     pub fn on_done(&mut self) -> AgentStep {
         let text = std::mem::take(&mut self.reply);
-        let (_results, stop) = step_turn(&text, &mut self.prompt, &mut self.ws, &self.cfg, &mut self.plan, &mut self.verified, self.step, &mut self.guard, &mut self.ladder);
+        let (_results, stop) = step_turn(&text, &mut self.prompt, &mut self.ws, &self.cfg, &mut self.plan, &mut self.verified, self.step, &mut self.guard, &mut self.ladder, self.guide.as_mut());
         self.turns += 1;
         self.step += 1;
         if let Some(stop) = stop { return AgentStep::Finished(stop); }
         if self.step >= self.cfg.max_steps { return AgentStep::Finished(Stop::StepLimit); }
         AgentStep::Submit(self.prompt.clone())
+    }
+
+    /// Where the phase machine places the run right now ("survey", "diagnose", …), when the run is
+    /// guided. None = plain (unguided) run. For the HUD: the phase is the one-word answer to "what
+    /// is it doing", which token streams do not give.
+    pub fn phase(&self) -> Option<&'static str> {
+        self.guide.as_ref().map(|g| g.phase_label())
+    }
+
+    /// What actually moved the error count on this run, as counted lines (guided runs only; empty
+    /// until enough transitions accumulate).
+    pub fn pattern_report(&self) -> Vec<String> {
+        self.guide.as_ref().map(|g| g.pattern_report()).unwrap_or_default()
     }
 
     /// The worker reported an error mid-turn.
@@ -2428,7 +2677,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         // model emitting PLAIN tool calls, which is the thing under test. Under the default gate
         // those calls are stripped and the tests fail — correctly. Stated per fixture so a reader
         // sees an opt-out rather than a default that happens to be permissive.
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new(), ..Default::default() };
         let s = run_agent_cfg(&mut llm, &mut ws, "make a hello world", &cfg);
         assert_eq!(s.stop, Stop::Done);
         assert_eq!(s.files.len(), 1);
@@ -2448,7 +2697,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let (d0, d1) = (base.join("b0"), base.join("b1"));
         std::fs::create_dir_all(&d0).unwrap();
         std::fs::create_dir_all(&d1).unwrap();
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new(), ..Default::default() };
         // diff_fn returns a per-branch canned diff (no git needed in the test)
         let diff_fn = Box::new(|root: &Path| format!("diff for {}", root.display()));
         let mut fan = AgentFan::new(vec![
@@ -2497,7 +2746,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let base = tmp("fanadd");
         std::fs::create_dir_all(base.join("b0")).unwrap();
         std::fs::create_dir_all(base.join("b1")).unwrap();
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new(), ..Default::default() };
         let mut fan = AgentFan::new(vec![(base.join("b0"), "A".into(), "one".into())], &cfg, Box::new(|_| String::new()));
         // first branch starts running
         let s0 = fan.next();
@@ -2516,7 +2765,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let base = tmp("adopt");
         std::fs::create_dir_all(base.join("orig")).unwrap();
         std::fs::create_dir_all(base.join("react")).unwrap();
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new(), ..Default::default() };
         // a single run in progress, with a queued next prompt
         let (run, first) = AgentRun::start(base.join("orig"), "build a thing", cfg.clone());
         let mut fan = AgentFan::adopt(run, Some(first), "build a thing", "original", &cfg, Box::new(|_| String::new()));
@@ -2639,7 +2888,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
                 Ok("I'll write it.\n```tool\n{\"tool\":\"write_file\",\"path\":\"x.txt\",\"contents\":\"same\"}\n```".into())
             }
         }
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 30, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 30, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new(), ..Default::default() };
         let s = run_agent_cfg(&mut Repeater, &mut ws, "task", &cfg);
         assert_eq!(s.stop, Stop::Stalled, "a repeating agent is aborted as a bad actor");
         assert!(s.turns.len() < 30, "aborted well before the step limit ({} turns)", s.turns.len());
@@ -2649,7 +2898,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
     fn async_driver_matches_sync_behavior() {
         // Drive AgentRun by hand with scripted completed replies (no worker), asserting it writes the file,
         // captures the plan, and finishes — the same state machine the sync loop uses.
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new(), ..Default::default() };
         let (mut run, first) = AgentRun::start(tmp("async"), "make a lib", cfg);
         assert!(first.contains("PLAN")); // prompt asks for a plan
         let replies = [
@@ -2690,7 +2939,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let mut ws = Workspace::new(tmp("gate"));
         struct ClaimsDone;
         impl Llm for ClaimsDone { fn generate(&mut self, _p: &str) -> Result<String, String> { Ok(format!("{DONE_MARKER}")) } }
-        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 3, verify_cmd: vec!["cargo".into(), "check".into()], verify_exts: vec!["rs".into()], gate_done_on_verify: true, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, audit_log: None, max_steps: 3, verify_cmd: vec!["cargo".into(), "check".into()], verify_exts: vec!["rs".into()], gate_done_on_verify: true, read_policy: ReadPolicy::Full, doc_mode: false, hector_mode: false, prefer_patches: false, digest_verify: false, context: String::new(), ..Default::default() };
         let s = run_agent_cfg(&mut ClaimsDone, &mut ws, "task", &cfg);
         // verified never became true (nothing verifiable ran) ⇒ done rejected ⇒ step limit
         assert_eq!(s.stop, Stop::StepLimit);
@@ -3187,5 +3436,241 @@ mod read_budget_tests {
                 "path scoping leaked an unrelated commit:\n{}", just_a.output);
         assert!(just_a.output.contains("-- a.rs"), "provenance must name the scope");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+}
+
+/// The long-horizon wiring: counted evidence, project-rooted verification, green checkpoints, and
+/// the phase machine driving a run. Its own module because these need the scripted-model fixture,
+/// and the fixture in `mod tests` is private to it — one duplicated 8-line stub beats making the
+/// 700-line test module the home for everything that wants a fake LLM.
+#[cfg(test)]
+mod long_horizon_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A model whose turns are a script: the whole loop with no GPU. (Mirrors `mod tests`'s.)
+    struct Scripted { turns: Vec<String>, i: usize }
+    impl Llm for Scripted {
+        fn generate(&mut self, _prompt: &str) -> Result<String, String> {
+            let t = self.turns.get(self.i).cloned().unwrap_or_else(|| DONE_MARKER.into());
+            self.i += 1;
+            Ok(t)
+        }
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("wsx-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn check_counts_reads_rustc_libtest_and_floors_unfamiliar_failures() {
+        let rustc = "\
+   Compiling thiserror v2.0.12\nerror[E0308]: mismatched types\n --> src/a.rs:4:5\nwarning: unused variable: `x`\nerror: aborting due to 1 previous error\n";
+        assert_eq!(check_counts(rustc, false), (1, 1, 0), "roll-up lines are not diagnostics; `Compiling thiserror` is not an error");
+        let libtest = "running 5 tests\ntest a ... ok\ntest result: FAILED. 3 passed; 2 failed; 0 ignored\n";
+        assert_eq!(check_counts(libtest, false), (0, 0, 2));
+        assert_eq!(check_counts("test result: ok. 12 passed; 0 failed; 0 ignored\n", true), (0, 0, 0));
+        // A failing command with unfamiliar text must never read as clean — this is the
+        // "could not find Cargo.toml" case reaching the phase machine.
+        assert_eq!(check_counts("$ cargo check\nexit: 101\nsomething unfamiliar\n", false), (1, 0, 0));
+        // …and the same text from a SUCCEEDING command stays clean (echo, formatters).
+        assert_eq!(check_counts("something unfamiliar\n", true), (0, 0, 0));
+    }
+
+    #[test]
+    fn check_roots_resolve_to_the_nearest_cargo_toml_and_fall_back_to_root() {
+        let d = tmp("roots");
+        std::fs::create_dir_all(d.join("apps/one/src")).unwrap();
+        std::fs::create_dir_all(d.join("apps/two/src")).unwrap();
+        std::fs::write(d.join("apps/one/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(d.join("apps/two/Cargo.toml"), "[package]\n").unwrap();
+        // monorepo shape: NO root Cargo.toml
+        assert_eq!(resolve_check_roots(&d, ["apps/one/src/lib.rs"]), vec!["apps/one".to_string()]);
+        assert_eq!(
+            resolve_check_roots(&d, ["apps/one/src/lib.rs", "apps/one/src/x.rs", "apps/two/src/lib.rs"]),
+            vec!["apps/one".to_string(), "apps/two".to_string()],
+            "deduped, one root per touched crate"
+        );
+        // a touched file under no Cargo root falls back to the workspace root — today's behavior
+        assert_eq!(resolve_check_roots(&d, ["README.md"]), vec![String::new()]);
+        // single-crate shape: the resolution is the root itself
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(resolve_check_roots(&d, ["src/lib.rs"]), vec![String::new()]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn run_at_executes_in_the_subdir_and_refuses_escapes() {
+        let d = tmp("runat");
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub/local.txt"), "from the subdir\n").unwrap();
+        let ws = Workspace::new(&d);
+        let ok = ws.run_at(&["cat".into(), "local.txt".into()], "sub");
+        assert!(ok.ok && ok.output.contains("from the subdir"), "{}", ok.output);
+        assert!(!ws.run_at(&["cat".into(), "x".into()], "../outside").ok, "cwd must stay inside the workspace");
+        assert!(!ws.run_at(&["cat".into(), "x".into()], "sub/missing").ok, "a non-directory cwd is an error, not a panic");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The gitmind-monorepo case end to end: the workspace root has NO Cargo.toml, the model edits a
+    /// crate underneath, and verification runs in that crate's root rather than failing structurally
+    /// at the mirror root. The check command is `cat Cargo.toml` — it can ONLY succeed with its cwd
+    /// in apps/demo, so `s.verified` is direct evidence of WHERE the check ran: under the old
+    /// root-cwd behavior it fails, done-gating rejects the claim, and this test cannot pass.
+    #[test]
+    fn verification_runs_in_the_touched_crates_root_not_the_workspace_root() {
+        let d = tmp("gm-verify");
+        std::fs::create_dir_all(d.join("apps/demo/src")).unwrap();
+        std::fs::write(d.join("apps/demo/Cargo.toml"), "[package]\nname=\"demo\"\nversion=\"0.0.0\"\nedition=\"2021\"\n").unwrap();
+        let mut ws = Workspace::new(&d);
+        let mut llm = Scripted { i: 0, turns: vec![
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"apps/demo/src/lib.rs\",\"contents\":\"pub fn f() {}\\n\"}\n```".into(),
+            format!("Done. {DONE_MARKER}"),
+        ]};
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6,
+            verify_cmd: vec!["cat".into(), "Cargo.toml".into()], verify_exts: vec!["rs".into()],
+            gate_done_on_verify: true, prefer_patches: false, digest_verify: false,
+            ..Default::default() };
+        let s = run_agent_cfg(&mut llm, &mut ws, "add f()", &cfg);
+        assert_eq!(s.stop, Stop::Done);
+        assert!(s.verified, "the check found apps/demo/Cargo.toml from its own cwd");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Drive an `AgentRun` (the production non-blocking driver) through a script, returning the
+    /// stop plus the run itself so a test can read the PHASE. `run_agent_cfg` cannot answer "why did
+    /// it stop": both the repetition guard and the phase machine's Blocked surface as `Stop::Stalled`,
+    /// which is how the first version of the stall test below passed with the guide switched off.
+    fn drive(ws_dir: &Path, task: &str, cfg: AgentConfig, script: &[String]) -> (Stop, AgentRun) {
+        let (mut run, _first) = AgentRun::start(ws_dir, task, cfg);
+        for turn in script {
+            run.on_token(turn);
+            if let AgentStep::Finished(stop) = run.on_done() {
+                return (stop, run);
+            }
+        }
+        // Script exhausted without a stop: keep feeding the done marker until the run ends, bounded.
+        for _ in 0..24 {
+            run.on_token(DONE_MARKER);
+            if let AgentStep::Finished(stop) = run.on_done() {
+                return (stop, run);
+            }
+        }
+        panic!("run never finished");
+    }
+
+    fn write_call(path: &str, n: usize) -> String {
+        format!("```tool\n{{\"tool\":\"write_file\",\"path\":\"{path}\",\"contents\":\"// attempt {n}\\n\"}}\n```")
+    }
+
+    /// The stall detector: consecutive checks with the error count pinned reach Blocked. Asserted on
+    /// the PHASE, not on `Stop::Stalled` — the repetition guard produces that same stop, so the stop
+    /// alone proves nothing about the phase machine (verified by switching `stateful_guide` off: the
+    /// stop is unchanged, the phase is not).
+    #[test]
+    fn a_guided_run_blocks_when_the_error_count_never_falls() {
+        let d = tmp("gm-stall");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        // Distinct paths and distinct bodies so the repetition/churn guards have nothing to fire on:
+        // what ends this run must be the counted evidence, not textual repetition.
+        let script: Vec<String> = (1..=6).map(|n| write_call(&format!("s{n}.rs"), n)).collect();
+        // `test` with no args exits 1 with empty output → check_counts floors it at 1 error, every time.
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 20,
+            verify_cmd: vec!["test".into()], verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: false, stateful_guide: true,
+            ..Default::default() };
+        let (stop, run) = drive(&d, "fix the build", cfg, &script);
+        assert_eq!(run.phase(), Some("blocked"), "the phase machine halted this run");
+        assert_eq!(stop, Stop::Stalled);
+        assert!(run.turns() < 20, "blocked well before the budget: {} turns", run.turns());
+        assert!(!run.verified());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The same script under an UNGUIDED run: it does not reach blocked, and does not stop early on
+    /// evidence — the contrast that shows the previous test is measuring the phase machine.
+    #[test]
+    fn the_same_stalling_script_is_not_blocked_without_the_guide() {
+        let d = tmp("gm-stall-off");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        let script: Vec<String> = (1..=6).map(|n| write_call(&format!("s{n}.rs"), n)).collect();
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 20,
+            verify_cmd: vec!["test".into()], verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: false, stateful_guide: false,
+            ..Default::default() };
+        let (_stop, run) = drive(&d, "fix the build", cfg, &script);
+        assert_eq!(run.phase(), None, "no phase machine on an unguided run");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The disciplined path end to end: survey → plan → patch → green check → claim → Done, landing
+    /// in the `done` phase with a checkpoint committed at the green state.
+    #[test]
+    fn a_guided_run_finishes_on_evidence_and_checkpoints_the_green_state() {
+        let d = tmp("gm-guided");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git").args(args).current_dir(&d)
+                .output().unwrap().status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "baseline"]);
+        let script = vec![
+            // survey: read-only
+            "```tool\n{\"tool\":\"list_dir\",\"path\":\"\"}\n```".to_string(),
+            // plan, then the single patch
+            "```plan\n1. add lib.rs\n```\n```tool\n{\"tool\":\"write_file\",\"path\":\"src/lib.rs\",\"contents\":\"pub fn f() {}\\n\"}\n```".to_string(),
+            format!("The task is covered. {DONE_MARKER}"),
+        ];
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 8,
+            verify_cmd: vec!["echo".into(), "green".into()], verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: false,
+            stateful_guide: true, checkpoint_on_green: true,
+            ..Default::default() };
+        let (stop, run) = drive(&d, "add f()", cfg, &script);
+        assert_eq!(stop, Stop::Done, "the claim is supported by the green check");
+        assert_eq!(run.phase(), Some("done"));
+        assert!(run.verified());
+        let count = std::process::Command::new("git").args(["rev-list", "--count", "HEAD"])
+            .current_dir(&d).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "2",
+                   "exactly one checkpoint commit on top of the baseline");
+        let msg = std::process::Command::new("git").args(["log", "-1", "--pretty=%s"])
+            .current_dir(&d).output().unwrap();
+        assert!(String::from_utf8_lossy(&msg.stdout).contains("agent checkpoint"),
+                "{}", String::from_utf8_lossy(&msg.stdout));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A claim the check contradicts is rejected AND counted: the run continues in `diagnose`, and
+    /// when it does finish, the callout names the overreach. The counting is the part the plain
+    /// done-gate cannot do — it rejects the claim and forgets it happened.
+    #[test]
+    fn a_guided_run_rejects_a_done_claim_the_check_contradicts_and_counts_it() {
+        let d = tmp("gm-claim");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        let script = vec![
+            // a patch whose check FAILS (`test` exits 1)…
+            write_call("src/a.rs", 1),
+            // …then a bare claim: rejected, and the run continues in diagnose
+            format!("All good! {DONE_MARKER}"),
+        ];
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6,
+            verify_cmd: vec!["test".into()], verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: false, stateful_guide: true,
+            ..Default::default() };
+        let (mut run, _first) = AgentRun::start(&d, "fix it", cfg, );
+        for turn in &script {
+            run.on_token(turn);
+            assert!(matches!(run.on_done(), AgentStep::Submit(_)),
+                    "neither turn may end the run: {:?}", run.phase());
+        }
+        assert_eq!(run.phase(), Some("diagnose"), "an unsupported claim routes to diagnose");
+        assert!(!run.verified());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

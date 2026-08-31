@@ -124,7 +124,7 @@ round shows whether your hint drove the conclusion or the question did.",
             Mode::LiaisonDebate =>
                 "Planned, not run. is_panel() is true and the panel prompts exist; nothing spawns the debaters.",
             Mode::StatefulGuide =>
-                "Partly live. The phase machine in engmode is real and tested — survey → plan → patch → check → diagnose, with the phase decided by compiler output — but the loop that drives it from a chat turn is not wired.",
+                "Live for workspace runs. With a project loaded, the agent loop drives engmode's phase machine — survey → plan → patch → check → diagnose — with the phase decided by COUNTED checker output. A TASK_COMPLETE without a clean check is rejected and counted; a stalled error count blocks the run instead of burning the budget; each green check commits a scratch checkpoint; and the check runs in the touched crate's own Cargo root, so a monorepo without a root Cargo.toml still verifies.",
         }
     }
 

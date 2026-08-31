@@ -1664,7 +1664,8 @@ impl Chat {
                             if let Some(r) = self.agent_run.as_ref() {
                                 self.agent_files = r.events().to_vec();
                                 self.agent_plan = r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect();
-                                self.note = format!("agent: turn {} · {} file(s)…", r.turns(), r.events().len());
+                                let ph = r.phase().map(|p| format!(" · phase: {p}")).unwrap_or_default();
+                                self.note = format!("agent: turn {} · {} file(s){ph}…", r.turns(), r.events().len());
                             }
                             self.agent_pending_submit = Some(prompt);
                         }
@@ -3147,8 +3148,8 @@ reply is framed differently from the turn that produced it.");
 
     /// Finalize a non-blocking agent run: snapshot the workspace, surface the outcome, clear the driver.
     fn finish_agent_run(&mut self, stop: crate::workspace_exec::Stop) {
-        let (files, plan, verified, turns, had_verifier) = match self.agent_run.take() {
-            Some(r) => (r.events().to_vec(), r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect::<Vec<_>>(), r.verified(), r.turns(), r.had_verifier()),
+        let (files, plan, verified, turns, had_verifier, phase, patterns) = match self.agent_run.take() {
+            Some(r) => (r.events().to_vec(), r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect::<Vec<_>>(), r.verified(), r.turns(), r.had_verifier(), r.phase(), r.pattern_report()),
             None => return,
         };
         self.agent_files = files;
@@ -3159,9 +3160,26 @@ reply is framed differently from the turn that produced it.");
         let stopdesc = match &stop {
             crate::workspace_exec::Stop::Done => "done".to_string(),
             crate::workspace_exec::Stop::StepLimit => format!("hit step limit ({turns} turns)"),
+            // Two different halts share Stop::Stalled and deserve different words: the loop guard
+            // caught REPETITION; the phase machine's Blocked is counted evidence that the error
+            // count stopped falling — the run should change approach, not just retry.
+            crate::workspace_exec::Stop::Stalled if phase == Some("blocked") =>
+                format!("blocked — the error count stopped falling ({turns} turns; change approach)"),
             crate::workspace_exec::Stop::Stalled => format!("stopped — model was looping ({turns} turns)"),
             crate::workspace_exec::Stop::ModelError(e) => format!("model error: {e}"),
         };
+        // Durable per-repo learning: the pattern report ("survey + checked: reduced errors 3/4
+        // times") lands as a shared doc, which `collect_shared_docs` injects into EVERY later run
+        // over this workspace — observed fact from this repo, not advice. Written before the
+        // snapshot so the snapshot carries it.
+        if !patterns.is_empty() {
+            if let Some(s) = self.gitmind_session.as_ref() {
+                let dir = s.work_dir().join(".logscope").join("docs");
+                let _ = std::fs::create_dir_all(&dir);
+                let body = format!("# phase patterns — what moved the error count on this repo\n\n{}\n", patterns.join("\n"));
+                let _ = std::fs::write(dir.join("phase-patterns.md"), body);
+            }
+        }
         let snap = self.gitmind_session.as_ref()
             .and_then(|s| crate::mount::snapshot(&s.ws, &format!("agent: {}", self.agent_task)).ok())
             .unwrap_or(false);
@@ -3170,7 +3188,8 @@ reply is framed differently from the turn that produced it.");
         // because it is the reason someone stops looking.
         let vnote = crate::workspace_exec::VerifyBadge::of(verified, had_verifier).label();
         let snap_note = if snap { " · snapshotted" } else { "" };
-        self.note = format!("agent: {stopdesc} · plan {done}/{total} · {touched} file(s){vnote}{snap_note} · :reapply to land");
+        let phase_note = phase.map(|p| format!(" · phase: {p}")).unwrap_or_default();
+        self.note = format!("agent: {stopdesc} · plan {done}/{total} · {touched} file(s){vnote}{phase_note}{snap_note} · :reapply to land");
     }
 
     /// Launch a fan of agent branches with `cfg`, seeding goals from `task`. Shared by :fan-agent and :docs.
@@ -3330,13 +3349,25 @@ which file you read.\n\n",
         let work_dir = self.gitmind_session.as_ref().unwrap().work_dir().to_path_buf();
         let mut cfg = crate::workspace_exec::AgentConfig::default();
         cfg.context = self.agent_context();
+        // The mode picker records the intent; this is where the intent takes effect. StatefulGuide
+        // arms engmode's phase machine (evidence-decided position, claim-gating, stall→blocked) and
+        // green-state checkpoints — the long-horizon posture for a big `.gitmind` tree.
+        if self.coord_mode == crate::coordinator::Mode::StatefulGuide {
+            cfg.stateful_guide = true;
+            cfg.checkpoint_on_green = true;
+        }
         let (run, first) = crate::workspace_exec::AgentRun::start(work_dir, &task, cfg);
+        let guided = run.phase().is_some();
         self.agent_run = Some(run);
         self.agent_task = task.clone();
         self.agent_pending_submit = Some(first);
         self.agent_files.clear();
         self.agent_plan.clear();
-        self.note = format!("agent started: {task} — surveying the workspace…");
+        self.note = if guided {
+            format!("agent started (stateful guide): {task} — phase: survey")
+        } else {
+            format!("agent started: {task} — surveying the workspace…")
+        };
     }
 
     fn start_fan(&mut self, task: &str, cfg: crate::workspace_exec::AgentConfig, doc_fan: bool, label: &str) {
