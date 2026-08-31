@@ -4286,9 +4286,36 @@ the fixed thing.
     parsing network bytes, where the length field is exactly what a
     hostile peer lies about.
 
-- **C78b — presence is still not wired to the engine.** The socket
-  exists and `announce_record`'s output has nowhere to go yet. That is
-  now a call site rather than a component.
+- **C78b — DONE. `snapclone_presence::dht`.** The arrow between the
+  pieces and nothing more: `publish` derives the key, finds the k
+  closest peers and stores to them; `resolve` looks the key up and
+  parses what comes back. No records are defined there and no protocol
+  is invented — if it grows either, it is in the wrong place.
+
+  Four decisions:
+  - **The key is a COPY of the InfoHash, not a re-hash.** Both are
+    20 bytes. Re-hashing would make the bridge's key differ from the one
+    `announce_record` documents, so a peer using dht-kit's vocabulary and
+    a peer using this bridge would publish the same person to two keys
+    and never meet. A `const` assertion pins the lengths so a future
+    change is a compile error rather than a silent partition.
+  - **Publishing with no peers returns 0, not an error.** A node that
+    just started legitimately knows nobody, and `store` is
+    fire-and-forget over UDP anyway — the count is "asked", not
+    "stored".
+  - **A malformed record is skipped, not fatal.** Anyone can store
+    anything under any key in a DHT; one bad value must not hide the
+    real answer beside it.
+  - **`resolve` returns `None` rather than `Some(vec![])`.** "Found
+    nothing" and "found an empty answer" mean the same thing, and two
+    spellings invites a bug at every call site.
+
+  Four wrong guesses, caught by compiling: `Value.bytes` is `.data`,
+  `Params` has no `alpha` (k is the concurrency), `Presence::parse` is
+  `from_value` and takes a `Value` rather than bytes, and
+  `RoutingTable::touch` is `saw(id, addr, now)`.
+
+  17/17.
 
 ## 79. Spacebar in a text field started playback — a shared arbitration gap
 

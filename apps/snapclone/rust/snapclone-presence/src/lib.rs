@@ -19,6 +19,9 @@
 //! different one later without the records changing — and it is why the
 //! dependency is `dht-kit` (types) rather than an engine.
 
+/// The caller `lib.rs` deliberately did not have: publish and resolve
+/// presence over snapcore's engine.
+pub mod dht;
 pub mod gossip;
 pub mod identity;
 pub mod presence;

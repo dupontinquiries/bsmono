@@ -2884,6 +2884,7 @@ dependencies = [
  "rand 0.8.6",
  "serde",
  "snapclone-identity",
+ "snapcore",
 ]
 
 [[package]]

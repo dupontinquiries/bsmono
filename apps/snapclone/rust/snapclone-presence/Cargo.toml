@@ -11,6 +11,9 @@ path = "src/lib.rs"
 # The protocol types only — InfoHash, Value, HASH_LEN. Not an engine: this crate
 # builds records and keys, and something else puts them on a socket.
 dht-kit = { path = "../../../../shared/dht-kit" }
+# The engine behind `dht.rs`. dht-kit stays the TYPES dependency; this is
+# the one that drives a lookup.
+snapcore = { path = "../../../../shared/snapcore" }
 snapclone-identity = { path = "../snapclone-identity" }
 anyhow  = "1"
 rand    = "0.8"
