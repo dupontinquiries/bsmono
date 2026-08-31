@@ -2767,6 +2767,11 @@ pub struct BlockWeights {
     /// Gated DeltaNet mixer for this layer (hybrid Qwen3.5/3.6): host-side dims + f32 weights,
     /// consumed by the CPU-routed `block_decode_deltanet`. None = not a recurrent layer.
     pub deltanet: Option<Box<crate::deltanet::DeltaNetLayerHost>>,
+    /// Gated attention output (Qwen3.5/3.6 full-attention layers): the per-head gate projection
+    /// de-interleaved out of the double-width attn_q at load. Applied as attn ∘ sigmoid(gate(n1))
+    /// between attention and wo — by block_decode and block_decode_fused; every other block fn
+    /// refuses a gated layer by name (refuse_attn_gate_where_unapplied).
+    pub attn_out_gate: Option<Lin>,
     /// GELU-gated FFN instead of SiLU-gated (Gemma). Per block so a mixed model would still work.
     pub geglu: bool,
     /// Gemma applies a norm to each sublayer's OUTPUT, before the residual add — distinct from the
@@ -7369,6 +7374,13 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let out = self.alloc(a.rows, a.cols); let dims = [a.len() as u32, 0, 0, 0];
         self.dispatch(ADD, &[a, b], &out, bytemuck::cast_slice(&dims), wg1(a.len() as u32)); out
     }
+    /// Elementwise gated multiply: `out = a ∘ sigmoid(b)`. The gated-attention output apply
+    /// (Qwen3.5/3.6 full-attention layers: attention output × sigmoid of the per-head gate the
+    /// checkpoint interleaves into its double-width q projection).
+    pub fn sigmoid_mul_t(&self, a: &Tensor, b: &Tensor) -> Tensor {
+        let out = self.alloc(a.rows, a.cols); let dims = [a.len() as u32, 0, 0, 0];
+        self.dispatch(SIGMOID_MUL, &[a, b], &out, bytemuck::cast_slice(&dims), wg1(a.len() as u32)); out
+    }
     /// AdaLN-Zero modulation: `x*(1+scale)+shift`, `scale`/`shift` a [1,cols] row broadcast over every
     /// row of `x`. `scale`/`shift` come from a small MLP over the timestep+conditioning embedding.
     pub fn dit_modulate(&self, x: &Tensor, scale: &Tensor, shift: &Tensor) -> Tensor {
@@ -7569,6 +7581,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         // batch/prefill path yet (MLA is compress-append per position; recurrent state is
         // sequential by definition), and neither ever will silently.
         Self::refuse_mla_or_deltanet_on_dense_block(w, "block_forward");
+        Self::refuse_attn_gate_where_unapplied(w, "block_forward");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -9105,6 +9118,15 @@ struct D { n:u32,_a:u32,_b:u32,_c:u32 };
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} o[i]=a[i]+b[i]; }"#;
 
+const SIGMOID_MUL: &str = r#"
+struct D { n:u32,_a:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> b: array<f32>;
+@group(0)@binding(2) var<storage,read_write> o: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} o[i]=a[i]*(1.0/(1.0+exp(-b[i]))); }"#;
+
 const ADD_BIAS: &str = r#"
 struct D { n:u32,c:u32,_b:u32,_d:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
@@ -9858,6 +9880,9 @@ impl Model {
     /// Nonzero means decode routes those layers through the CPU-routed block_decode_deltanet and
     /// the cache MUST come from new_cache_for; used by --gate-deltanet-load.
     pub fn deltanet_layers(&self) -> usize { self.layers.iter().filter(|b| b.deltanet.is_some()).count() }
+    /// How many blocks carry a gated attention output (per-head sigmoid gate split out of a
+    /// double-width q projection at load). Used by --gate-deltanet-load.
+    pub fn gated_attn_layers(&self) -> usize { self.layers.iter().filter(|b| b.attn_out_gate.is_some()).count() }
 
     /// Fingerprint a few GPU-resident weights (LOGSCOPE_WEIGHT_CHECK=1): downloads small tensors and
     /// prints first values + abs-sums. The same GGUF must produce IDENTICAL lines on every machine —
@@ -11414,6 +11439,24 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
             // Fused Q||K||V projection [d+2kv, d] (mirrors the wgate_up fusion): concatenate the q/k/v
             // weight ROWS then quantize — per-row quant of the concatenation is identical to quantizing
             // each separately (proven bit-exact by --gate-qkv). The bias concatenates the same way.
+            // GATED ATTENTION (Qwen3.5/3.6 full-attention layers): attn_q at exactly DOUBLE the
+            // attention width means the output gate is interleaved per head — split it here, once,
+            // and every downstream path sees a standard-width q plus a separate gate projection.
+            // Shape-driven, like the MLA and DeltaNet sniffs: the tensor decides, not the arch name.
+            let q_gate: Option<(Vec<f32>, Vec<f32>)> = if !block_is_mla && !block_is_deltanet {
+                match g.tensor(&format!("blk.{i}.attn_q.weight")) {
+                    Some(t) if t.dims.iter().skip(1).product::<u64>() as usize == 2 * attn_dim => {
+                        if has_qkv_bias {
+                            return Err(format!("blk.{i} ships a gated (double-width) attn_q AND a \
+q bias — splitting the bias needs the same per-head de-interleave and no known checkpoint does \
+this; refusing rather than guessing which half the bias belongs to"));
+                        }
+                        let full = fetch(&format!("blk.{i}.attn_q.weight"))?;
+                        Some(crate::qkvsplit::deinterleave_q_gate(&full, n_heads, head_dim, d))
+                    }
+                    _ => None,
+                }
+            } else { None };
             let wqkv = if block_is_mla || block_is_deltanet { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) } else {
                 // DIVERGENCE GUARD: `block_is_mla` routes MLA blocks to placeholders above, so
                 // reaching the dense fusion with MLA tensors present means the sniff and this check
@@ -11483,6 +11526,12 @@ The file is not corrupt; this loader does not recognise its attention layout",
                     let name = format!("blk.{i}.attn_qkv.weight");
                     let t = g.tensor(&name).ok_or_else(|| format!("blk.{i}: neither attn_q nor attn_qkv"))?;
                     let rows = t.dims.last().copied().unwrap_or(0).max(t.dims.first().copied().unwrap_or(0));
+                    if rows as usize == 2 * attn_dim + 2 * kv {
+                        return Err(format!("blk.{i}.attn_qkv has {rows} rows = DOUBLE q + k + v — \
+a fused qkv with the gated-attention q‖gate interleave. The split-tensor form (double-width \
+attn_q) is handled; this fused form is not, and slicing it at standard offsets would read gate \
+values as k. Re-convert with split q/k/v, or teach the loader this layout"));
+                    }
                     if rows != want_rows {
                         return Err(format!("blk.{i}.attn_qkv has {rows} rows but this model needs \
 {want_rows} (attn_dim {attn_dim} + 2 x kv {kv}). A fused qkv with the wrong row count is a DIFFERENT \
@@ -11494,7 +11543,10 @@ BailingMoe2 converter: a plain contiguous split [n_head*hd, n_kv*hd, n_kv*hd], w
 loader assumes. Other families that ship a fused qkv are still unverified");
                     fetch(&name)?
                 } else {
-                    let mut v = fetch(&format!("blk.{i}.attn_q.weight"))?;
+                    // Gated blocks: the fused projection gets the DE-INTERLEAVED q half — the gate
+                    // is not part of qkv, it multiplies the attention OUTPUT.
+                    let mut v = match &q_gate { Some((qh, _)) => qh.clone(),
+                                               None => fetch(&format!("blk.{i}.attn_q.weight"))? };
                     v.extend_from_slice(&fetch(&format!("blk.{i}.attn_k.weight"))?);
                     v.extend_from_slice(&fetch(&format!("blk.{i}.attn_v.weight"))?);
                     v
@@ -11538,6 +11590,7 @@ loader assumes. Other families that ship a fused qkv are still unverified");
                 // but its input width is n_head*v_head_mla, not attn_dim — lin() would misread it at
                 // the declared dims. The real output projection loads as `mla.o` by its own shape.
                 wq: if block_is_mla || block_is_deltanet { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+                    else if let Some((qh, _)) = &q_gate { self.make_lin(qh, attn_dim, d, q, q4_mode) }
                     else { lin(&format!("blk.{i}.attn_q.weight"), attn_dim, d, q)?.with_bias(bq) },
                 wk: if block_is_mla || block_is_deltanet { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
                     else { lin(&format!("blk.{i}.attn_k.weight"), kv, d, q)?.with_bias(bk) },
@@ -11545,6 +11598,7 @@ loader assumes. Other families that ship a fused qkv are still unverified");
                     else { lin(&format!("blk.{i}.attn_v.weight"), kv, d, q)?.with_bias(bv) },
                 wo: if block_is_mla || block_is_deltanet { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
                     else { lin(&format!("blk.{i}.attn_output.weight"), d, attn_dim, q)? },
+                attn_out_gate: q_gate.as_ref().map(|(_, gh)| self.make_lin(gh, attn_dim, d, q, q4_mode)),
                 g2: self.upload(&gemma_norm(&fetch(&format!("blk.{i}.ffn_norm.weight"))
                     .or_else(|_| fetch(&format!("blk.{i}.post_attention_norm.weight")))?, &acfg), 1, d),
                 // gate and up fused into one [2h, d] projection: a single matmul emits
@@ -12082,9 +12136,22 @@ scale {} ({}), shared {}, weight applied to {}",
                 // TWO SPELLINGS: gemma writes post_attention_norm, GLM writes attn_post_norm — and
                 // GLM's is REQUIRED by its reference graph, so missing it silently drops a norm from
                 // every layer. Found by reading glm4-moe.cpp ahead of the cross-engine oracle run.
-                post_attn: fetch(&format!("blk.{i}.post_attention_norm.weight"))
-                    .or_else(|_| fetch(&format!("blk.{i}.attn_post_norm.weight"))).ok()
-                    .map(|v| self.upload(&gemma_norm(&v, &acfg), 1, d)),
+                //
+                // ONE NAME, TWO PLACEMENTS — the block below disambiguates. In gemma-family files
+                // post_attention_norm is a norm on the attention OUTPUT (this field), and the FFN
+                // pre-norm ships separately as ffn_norm. In qwen35moe (and any family converted the
+                // same way) the SAME NAME is the FFN pre-norm — there is no ffn_norm tensor, the
+                // reference graph norms the FFN input with it, and g2's or_else above already took
+                // it. Loading it HERE too applied it twice on the unfused decode path and zero
+                // extra times on the fused one — a 1.7e-3 systematic fused-vs-unfused divergence
+                // that the --gate-deltanet-load cross-check caught on its first run. The rule: the
+                // name is only a post-attention norm when the block ALSO ships an ffn_norm;
+                // otherwise it IS the ffn norm and this field stays None.
+                post_attn: if g.tensor(&format!("blk.{i}.ffn_norm.weight")).is_some() {
+                    fetch(&format!("blk.{i}.post_attention_norm.weight"))
+                        .or_else(|_| fetch(&format!("blk.{i}.attn_post_norm.weight"))).ok()
+                        .map(|v| self.upload(&gemma_norm(&v, &acfg), 1, d))
+                } else { None },
                 post_ffn: fetch(&format!("blk.{i}.post_ffw_norm.weight")).ok()
                     .map(|v| self.upload(&gemma_norm(&v, &acfg), 1, d)),
                 // MLA projections, when present. Loaded as f32 (not quantized): these are the small
@@ -12611,7 +12678,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
             let (wq, wk, wv) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let (wo, wgate_up, wdown) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let g2 = self.read_tensor(&mut r)?;
-            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None });
+            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None });
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -14991,6 +15058,7 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
     /// token's k/v row into the cache, attend the cache (dequant on the fly).
     fn block_decode_q8(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_q8");
+        Self::refuse_attn_gate_where_unapplied(w, "block_decode_q8");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -15015,6 +15083,7 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
     /// as before. Bit-exact to block_decode_q8 (the fusion never changes the values being quantized).
     fn block_decode_q8_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_q8_fused");
+        Self::refuse_attn_gate_where_unapplied(w, "block_decode_q8_fused");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -15168,6 +15237,18 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
     /// A panic is not the nice option; it is the only one that is not silent. These fns return
     /// `Tensor`, not `Result`, and the alternative to stopping here is returning the nonsense.
     #[inline]
+    /// The gated-attention analogue of the MLA/DeltaNet backstop, at FIELD granularity: paths
+    /// that apply the gate don't call this; paths that don't apply it refuse a gated layer by
+    /// name. An ungated pass over a gated layer is not an error state the numerics would reveal —
+    /// it is plausibly-shaped output at the wrong magnitude per head, the archfeat failure class.
+    fn refuse_attn_gate_where_unapplied(w: &BlockWeights, block_fn: &str) {
+        if w.attn_out_gate.is_some() {
+            panic!("{block_fn}: this layer's attention output is GATED (per-head sigmoid gate \
+from the double-width q projection) and this path does not apply the gate. block_decode and \
+block_decode_fused do — route through decode_step_full, or teach this path the gate.");
+        }
+    }
+
     fn refuse_mla_or_deltanet_on_dense_block(w: &BlockWeights, block_fn: &str) {
         if w.deltanet.is_some() {
             panic!("{block_fn}: this layer is Gated DeltaNet (recurrent) and this is a \
@@ -15322,6 +15403,13 @@ like a bad model rather than a wiring bug.");
             Some((k2, v2, l2)) => self.decode_attention_mh(&q, &k2, &v2, l2, ad, n_heads, n_kv_heads),
             None => self.decode_attention_mh(&q, kc, vc, pos + 1, ad, n_heads, n_kv_heads),
         };
+        // Gated attention (Qwen3.5/3.6): attn ∘ sigmoid(gate(n1)) BEFORE wo — qwen35moe.cpp's
+        // attn_pregate → gate_sigmoid → attn_gated ordering, per head because the gate projection
+        // rows were de-interleaved per head at load.
+        let attn = match &w.attn_out_gate {
+            Some(gl) => { let gv = gl.apply(self, &n1, 1); self.sigmoid_mul_t(&attn, &gv) }
+            None => attn,
+        };
         // Gemma normalizes the attention OUTPUT before the residual add (post_attention_norm), which is
         // a different operation from the pre-attention norm already applied to the input.
         let x2 = match &w.post_attn {
@@ -15345,6 +15433,7 @@ like a bad model rather than a wiring bug.");
             kc: &Tensor, vc: &Tensor, warm: Option<(&Tensor, &Tensor, &Tensor, &Tensor)>, warm_len: usize,
             pos: usize, hot_start: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_staged");
+        Self::refuse_attn_gate_where_unapplied(w, "block_decode_staged");
         let base = if w.nope { 0.0 } else { base };
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
@@ -15377,6 +15466,7 @@ like a bad model rather than a wiring bug.");
             kc: &Tensor, vc: &Tensor, warm_blocks: &[(&Tensor, &Tensor, &Tensor, &Tensor, usize)], warm_len: usize,
             pos: usize, hot_start: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_staged_multi");
+        Self::refuse_attn_gate_where_unapplied(w, "block_decode_staged_multi");
         let base = if w.nope { 0.0 } else { base };
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
@@ -15493,6 +15583,13 @@ like a bad model rather than a wiring bug.");
             Some((k2, v2, l2)) => self.decode_attention_mh(&q, &k2, &v2, l2, ad, n_heads, n_kv_heads),
             None => self.decode_attention_mh(&q, kc, vc, pos + 1, ad, n_heads, n_kv_heads),
         };
+        // Gated attention: this fused path has no standalone n1 (the norm folds into the qkv
+        // matvec), so the gate projection uses the SAME fused norm+apply — one extra dispatch
+        // on gated layers only, still no separate rmsnorm.
+        let attn = match &w.attn_out_gate {
+            Some(gl) => { let gv = gl.norm_apply(self, x, &w.g1, d, eps, 1); self.sigmoid_mul_t(&attn, &gv) }
+            None => attn,
+        };
         let x2 = w.wo.apply_add(self, &attn, 1, x);
         self.ffn_apply(w, &x2, 1, d, eps)
     }
@@ -15513,6 +15610,7 @@ like a bad model rather than a wiring bug.");
     /// the special case `slot == rope_pos`, `attend_len == rope_pos+1`.
     fn block_decode_at(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, rope_pos: usize, slot: usize, attend_len: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_at");
+        Self::refuse_attn_gate_where_unapplied(w, "block_decode_at");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -15534,6 +15632,7 @@ like a bad model rather than a wiring bug.");
     /// block_decode_fused but K/V are written at physical `slot` and attention spans `attend_len`.
     fn block_decode_at_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, rope_pos: usize, slot: usize, attend_len: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_at_fused");
+        Self::refuse_attn_gate_where_unapplied(w, "block_decode_at_fused");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.

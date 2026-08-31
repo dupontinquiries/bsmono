@@ -405,10 +405,9 @@ fn write_gguf_deepseek2_mla() -> Vec<u8> {
 /// attn_gate + the ssm_* set), blk.1 is plain attention with QK-Norm. Dense FFN on both — the
 /// MoE side of the family is proven by its own gates and would only pad this one.
 ///
-/// What the real family has that this fixture deliberately does NOT: gated attention on full
-/// layers (double-width q with interleaved per-head [q|gate], sigmoid on the attention output)
-/// and IMRoPE sections — both named as gaps in archfeat, so the registry refuses the real
-/// checkpoint for the RIGHT remaining reasons.
+/// blk.1's attn_q ships DOUBLE-WIDTH with the per-head [q|gate] interleave (gated attention,
+/// the real full-layer shape); what the fixture still deliberately omits is IMRoPE sections and
+/// the MoE side — named in archfeat / proven by other gates respectively.
 fn write_gguf_qwen35moe_hybrid() -> Vec<u8> {
     let (d, vocab, h) = (64usize, 32usize, 128usize);
     let (heads, kvh, hd) = (4usize, 2usize, 16usize);          // blk.1 attention
@@ -442,9 +441,10 @@ fn write_gguf_qwen35moe_hybrid() -> Vec<u8> {
     push("blk.0.ffn_gate.weight".into(), mat(h, d), mk(31, h * d));
     push("blk.0.ffn_up.weight".into(), mat(h, d), mk(32, h * d));
     push("blk.0.ffn_down.weight".into(), mat(d, h), mk(33, d * h));
-    // blk.1 — plain attention with QK-Norm (qwen3 shape)
+    // blk.1 — GATED attention with QK-Norm: attn_q ships DOUBLE-WIDTH with the per-head
+    // [q‖gate] interleave, exactly the qwen35moe full-attention shape.
     push("blk.1.attn_norm.weight".into(), v1(d), vec![1.0; d]);
-    push("blk.1.attn_q.weight".into(), mat(heads * hd, d), mk(41, heads * hd * d));
+    push("blk.1.attn_q.weight".into(), mat(heads * hd * 2, d), mk(41, heads * hd * 2 * d));
     push("blk.1.attn_k.weight".into(), mat(kvh * hd, d), mk(42, kvh * hd * d));
     push("blk.1.attn_v.weight".into(), mat(kvh * hd, d), mk(43, kvh * hd * d));
     push("blk.1.attn_output.weight".into(), mat(d, heads * hd), mk(44, d * heads * hd));
@@ -5580,6 +5580,8 @@ still pass, which is why this one exists."
             Ok(m) => {
                 ck("hybrid gguf loads", true);
                 ck("exactly blk.0 carries the DeltaNet mixer", m.deltanet_layers() == 1);
+                ck("blk.1's double-width q was split: the attention output is GATED",
+                   m.gated_attn_layers() == 1);
                 let c = gpu.new_cache_for(&m, 8); // attaches the per-layer recurrent states
                 let mut finite = true;
                 let mut logits_by_tok: Vec<Vec<f32>> = Vec::new();
@@ -5597,6 +5599,44 @@ still pass, which is why this one exists."
                 let base = &logits_by_tok[1];
                 let diff = alt.iter().zip(base).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
                 ck("logits are input-sensitive through the recurrent state", diff > 1e-6);
+                // CROSS-CHECK the two gate implementations against each other: the unfused path
+                // computes the gate from an explicit n1 (block_decode), the fused path folds the
+                // norm into the gate matvec (block_decode_fused's norm_apply). They share no gate
+                // code, so agreement here discriminates a wrong gate in either — a missing or
+                // mis-normed sigmoid shifts whole heads, far outside fp reordering noise.
+                {
+                    // On the F32 load: under the quantized loader the two routes quantize the
+                    // gate's input activation at different points (apply(n1) vs norm_apply), a
+                    // legitimate ~1e-3 difference that would drown the signal. f32 removes it, so
+                    // any residual disagreement IS gate math. (Measured: quantized 1.78e-3, f32
+                    // below 1e-5 — which is also what located the quantization explanation.)
+                    let mf = gpu.load_gguf(&bytes).expect("f32 load for the cross-check");
+                    let m = &mf;
+                    std::env::set_var("LOGSCOPE_FUSED_QKV", "0");
+                    let ca = gpu.new_cache_for(&m, 8);
+                    let mut all_a: Vec<Vec<f32>> = Vec::new();
+                    for (p, t) in [1u32, 5, 9].iter().enumerate() { all_a.push(gpu.decode_step(m, &ca, *t, p)); }
+                    std::env::set_var("LOGSCOPE_FUSED_QKV", "1");
+                    let cb = gpu.new_cache_for(&m, 8);
+                    let mut all_b: Vec<Vec<f32>> = Vec::new();
+                    for (p, t) in [1u32, 5, 9].iter().enumerate() { all_b.push(gpu.decode_step(m, &cb, *t, p)); }
+                    for (i, (x, y)) in all_a.iter().zip(&all_b).enumerate() {
+                        let dm = x.iter().zip(y).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                        eprintln!("cross-check token {i}: max |Δ| = {dm:.2e}");
+                    }
+                    let la = all_a.pop().unwrap(); let lb = all_b.pop().unwrap();
+                    // CONTROL: same env, fresh cache, decode again — any la/lc difference is
+                    // run-to-run nondeterminism, not a fused-vs-unfused property.
+                    std::env::set_var("LOGSCOPE_FUSED_QKV", "0");
+                    let cc = gpu.new_cache_for(&m, 8);
+                    let mut lc = Vec::new();
+                    for (p, t) in [1u32, 5, 9].iter().enumerate() { lc = gpu.decode_step(m, &cc, *t, p); }
+                    std::env::remove_var("LOGSCOPE_FUSED_QKV");
+                    let cmax = la.iter().zip(&lc).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    eprintln!("cross-check control: same-env repeat max |Δ| = {cmax:.2e}; la[0..4]={:?}", &la[..4]);
+                    let dmax = la.iter().zip(&lb).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    ck(&format!("fused and unfused GATED paths agree (max |Δ| = {dmax:.2e})"), dmax < 1e-4);
+                }
                 // Seek refusal: the recurrent state is at pos 2 in c2; asking for pos 5 must
                 // panic with the sequential-positions message, not silently continue.
                 let seek = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -6174,7 +6214,7 @@ still pass, which is why this one exists."
         wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)), wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
         g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
         q_norm: None, k_norm: None, // llama-shape test block (no QK-Norm)
-        nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None,
+        nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None,
         moe: None, // dense test block — the MoE path has its own validation
     };
     let xt = gpu.upload(&x, bt, bd);
@@ -6192,7 +6232,7 @@ still pass, which is why this one exists."
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: true, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
+            q_norm: None, k_norm: None, nope: true, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
         };
         let got = gpu.download(&gpu.block_forward(&bw_nope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // Roped baseline at the SAME (consistent) shape — the sanity term: nope must actually differ.
@@ -6203,7 +6243,7 @@ still pass, which is why this one exists."
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
+            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
         };
         let roped = gpu.download(&gpu.block_forward(&bw_rope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // CPU: cpu_block minus the rope step

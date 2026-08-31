@@ -107,6 +107,7 @@ pub enum Feature {
     GatedDeltaNet,
     GatedAttentionOutput,
     MRopeSections,
+    GatedSharedExpert,
     /// Dense (shared) FFN and the routed MoE run as PARALLEL branches off attn_out — each with its
     /// own pre/post norms — summed, post-normed once, then added to the residual (Gemma 4 MoE).
     /// Sequential wiring runs and produces plausible text, which is the failure mode worth a flag.
@@ -160,6 +161,7 @@ impl Feature {
             Feature::GatedDeltaNet => "Gated DeltaNet recurrent layers (delta-rule state + conv, no KV cache)",
             Feature::GatedAttentionOutput => "gated attention (per-head q‖gate interleaved in a double-width q projection; attention output × sigmoid(gate))",
             Feature::MRopeSections => "multi-section rope (IMRoPE: rope.dimension_sections split across position channels)",
+            Feature::GatedSharedExpert => "shared expert with its OWN sigmoid gate (ffn_gate_inp_shexp scales the shared expert's output per token)",
             Feature::TwinFfnParallelResidual => "dense + MoE FFN as parallel branches with one joining post-norm",
             Feature::RouterInputNormScale => "router input: weightless rms of attn_out times a learned scale vector",
             Feature::PerExpertOutputScale => "learned per-expert output scale vector",
@@ -288,8 +290,18 @@ impl Feature {
             // qwen35moe.cpp: create_tensor_qkv with n_embd_head*n_head*2 (q and its output gate
             // interleaved per head), attention output multiplied by sigmoid(gate); and
             // ggml_rope_multi with sections. Neither is read or applied here yet.
-            Feature::GatedAttentionOutput => false,
+            // Implemented shape-driven: a double-width attn_q is de-interleaved per head at load
+            // (qkvsplit::deinterleave_q_gate, unit-tested), the gate half becomes attn_out_gate,
+            // and block_decode + block_decode_fused apply attn ∘ sigmoid(gate) before wo — proven
+            // EQUAL to each other at 3.6e-7 by --gate-deltanet-load's fused-vs-unfused cross-check
+            // (which also caught the post_attention_norm double-load on its first run). Every
+            // other block fn refuses a gated layer by name (refuse_attn_gate_where_unapplied).
+            Feature::GatedAttentionOutput => true,
             Feature::MRopeSections => false,
+            // The loader reads ffn_{gate,up,down}_shexp but NOT ffn_gate_inp_shexp — the shared
+            // expert's own gate. qwen35moe.cpp multiplies the shared expert output by
+            // sigmoid(ffn_gate_inp_shexp(x)); adding it ungated is quietly wrong output.
+            Feature::GatedSharedExpert => false,
             Feature::TwinFfnParallelResidual => false, // block forward runs ONE ffn branch
             Feature::RouterInputNormScale => false,    // router reads the branch's normed input
             Feature::PerExpertOutputScale => false,    // ffn_down_exps.scale is not read
@@ -330,13 +342,19 @@ real DeepSeek/GLM checkpoint — the first such load is the test"),
 block_decode_deltanet (correct-first, like the MoE and MLA bootstraps); deltanet.rs is the \
 tested core. Sequential positions only — recurrent state cannot seek, so trie/fleet prefix \
 reuse is refused for hybrids"),
-            Feature::GatedAttentionOutput => Some("STRUCTURAL for every full-attention layer of the \
-Qwen3.5/3.6 hybrids: q ships double-width with the gate interleaved PER HEAD, so a loader that \
-reads it as plain q gets q entangled with gate values — wrong shapes at best, fluent nonsense at \
-worst. Split + sigmoid-multiply is small; it is simply not built yet"),
+            Feature::GatedAttentionOutput => Some("wired: the double-width q is split per head at \
+load and decode applies attn * sigmoid(gate) before wo (block_decode and _fused, cross-checked \
+against each other; other paths refuse gated layers by name). Never run on a real checkpoint"),
             Feature::MRopeSections => Some("IMRoPE: position is split across rope sections \
-(rope.dimension_sections). Applying plain NEOX rope instead mis-rotates every full-attention \
-layer — quietly worse output, the archfeat failure class"),
+(rope.dimension_sections — REQUIRED metadata for qwen35moe, so every converted file carries it). \
+For pure-text input with all position components equal, M-RoPE is claimed equivalent to plain 1D \
+rope (Qwen2-VL paper) — but the ggml kernel is not vendored here, so the per-dim frequency \
+mapping of GGML_ROPE_TYPE_IMROPE is UNVERIFIED; check ggml-cpu's rope against ours on a shared \
+input before treating NEOX as sufficient, and do not flip this flag on the equivalence argument \
+alone"),
+            Feature::GatedSharedExpert => Some("the shared expert path adds its output UNGATED; \
+qwen35moe scales it by sigmoid(ffn_gate_inp_shexp(x)) first. One small projection + the existing \
+sigmoid_mul_t — unbuilt, and unexercised by the dense-FFN fixture, so it stays a named gap"),
             Feature::AltAttnValueFromKey => Some("STRUCTURAL for the affected layers: without it the \
 loader refuses on the missing attn_v; faking V=K without the weightless norm runs and is wrong"),
             Feature::TwinFfnParallelResidual => Some("sequential wiring produces plausible text — the \
@@ -410,7 +428,7 @@ pub fn required(arch: &str, variant: u32) -> Vec<Feature> {
         // blocker and its report points at the CPU oracle.
         "qwen35moe" | "qwen36moe" | "qwen3_5moe" | "qwen3next" =>
             vec![Feature::QkNormPreRope, Feature::SharedExpert, Feature::GatedDeltaNet,
-                 Feature::GatedAttentionOutput, Feature::MRopeSections],
+                 Feature::GatedAttentionOutput, Feature::MRopeSections, Feature::GatedSharedExpert],
         // deepseek2/3 covers GLM-4.7-Flash, which ships the split 3-D projections. Listed so the
         // refusal names the real blocker rather than blaming the MLA forward, which is implemented.
         "deepseek2" | "deepseek3" => vec![Feature::Mla, Feature::SharedExpert,

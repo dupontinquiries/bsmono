@@ -640,3 +640,45 @@ mod qwen35_regression {
         assert_eq!(sp.q_rows(), sp.k_rows() * 2);
     }
 }
+
+/// Qwen3.5/3.6 gated attention ships q DOUBLE-WIDTH with the output gate interleaved PER HEAD:
+/// head h occupies rows [h·2hd, (h+1)·2hd) of attn_q — the first hd rows are the q head, the
+/// next hd its gate (qwen35moe.cpp views Qcur_full at stride 2·hd with offsets 0 and hd, then
+/// multiplies the attention output by sigmoid(gate)). Reading such a tensor as plain q entangles
+/// every head with gate values — wrong at attn_dim, fluent nonsense if force-shaped. This splits
+/// it into the contiguous [n_heads·hd, d] q and gate matrices the standard paths expect.
+pub fn deinterleave_q_gate(w: &[f32], n_heads: usize, hd: usize, d: usize) -> (Vec<f32>, Vec<f32>) {
+    assert_eq!(w.len(), n_heads * 2 * hd * d, "gated q: rows must be exactly 2*n_heads*hd");
+    let (mut q, mut g) = (Vec::with_capacity(n_heads * hd * d), Vec::with_capacity(n_heads * hd * d));
+    for h in 0..n_heads {
+        let base = h * 2 * hd * d;
+        q.extend_from_slice(&w[base..base + hd * d]);
+        g.extend_from_slice(&w[base + hd * d..base + 2 * hd * d]);
+    }
+    (q, g)
+}
+
+#[cfg(test)]
+mod gated_q {
+    /// Rows tagged head*100 + slot, gate rows +50: the split must put slots [0,hd) of every
+    /// head in q and [hd,2hd) in gate, in head order — an off-by-one or a blockwise (non-
+    /// interleaved) split scrambles the tags.
+    #[test]
+    fn the_per_head_interleave_splits_exactly() {
+        let (nh, hd, d) = (3usize, 2usize, 4usize);
+        let mut w = Vec::new();
+        for h in 0..nh {
+            for r in 0..hd { w.extend(std::iter::repeat((h * 100 + r) as f32).take(d)); }
+            for r in 0..hd { w.extend(std::iter::repeat((h * 100 + 50 + r) as f32).take(d)); }
+        }
+        let (q, g) = super::deinterleave_q_gate(&w, nh, hd, d);
+        assert_eq!(q.len(), nh * hd * d);
+        assert_eq!(g.len(), nh * hd * d);
+        for h in 0..nh {
+            for r in 0..hd {
+                assert_eq!(q[(h * hd + r) * d], (h * 100 + r) as f32, "q head {h} row {r}");
+                assert_eq!(g[(h * hd + r) * d], (h * 100 + 50 + r) as f32, "gate head {h} row {r}");
+            }
+        }
+    }
+}

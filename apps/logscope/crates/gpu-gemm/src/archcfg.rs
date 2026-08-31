@@ -137,10 +137,12 @@ tensor dump, which is why the earlier family guess was wrong. The recurrent laye
 per-block sniff on ssm_* tensors, weights into deltanet::DeltaNetLayerHost, per-layer states from \
 new_cache_for, decode through the CPU-routed block_decode_deltanet (the same deltanet.rs code the \
 invariant tests bind; --gate-deltanet-load proves load + decode + the seek refusal). Sequential \
-positions only — recurrent state cannot seek, so trie/fleet prefix reuse is refused. What still \
-blocks the REAL checkpoint: full-attention layers are GATED (per-head q‖gate interleaved, sigmoid \
-on the attention output) with IMRoPE sections — both named unimplemented in archfeat — and \
-`supported` flips only when a real checkpoint produces coherent text. The MoE side is fine: 256 \
+positions only — recurrent state cannot seek, so trie/fleet prefix reuse is refused. Gated attention is wired \
+too (double-width q split per head at load; attn * sigmoid(gate) before wo, the two decode paths \
+cross-checked against each other — which caught the post_attention_norm double-load). What still \
+blocks the REAL checkpoint: IMRoPE sections and the shared expert's own gate \
+(ffn_gate_inp_shexp), both named in archfeat — and `supported` flips only when a real checkpoint \
+produces coherent text. The MoE side is fine: 256 \
 experts, shared expert with its own gate, Q4_K/MXFP4 slice since c4-784/c4-805",
             ..for_arch("qwen3moe")
         },
