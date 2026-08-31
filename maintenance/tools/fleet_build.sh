@@ -425,6 +425,53 @@ else
     ( cd "$LOGDIR" && tar czf "$ZIP" --exclude='*.tar.gz' . ) && echo && echo "logs + summary: $ZIP"
 fi
 
+# ── Stale per-app caches ─────────────────────────────────────────────
+#
+# Before the shared cache, every app wrote to its own `apps/*/target`.
+# Those directories do not disappear when the script stops using them —
+# they sit there holding the 40 GB that prompted the change, and nothing
+# would ever mention them again.
+#
+# A newcomer cloning this has no reason to know they exist, which is the
+# actual argument for printing it: a stale cache is invisible, costs
+# real disk, and is safe to delete. Reported, never removed — this
+# script builds things, and a build script that deletes directories is
+# one nobody trusts with a typo in a path.
+stale_caches() {
+    local root="${1:-.}" total=0 found=()
+    # `-prune` so it does not descend INTO a target directory: they
+    # contain thousands of files and a nested `target/` inside one is
+    # not a separate cache.
+    while IFS= read -r d; do
+        # Skip whatever this run actually used, if it happens to live in
+        # the tree — telling somebody to delete their live cache would
+        # be a slow rebuild caused by our own advice.
+        [ "$(readlink -f "$d")" = "$(readlink -f "${CARGO_TARGET_DIR:-/nonexistent}")" ] && continue
+        local kb; kb=$(du -sk "$d" 2>/dev/null | awk '{print $1}')
+        [ -z "$kb" ] && continue
+        total=$(( total + kb ))
+        found+=("$d")
+    done < <(find "$root" -maxdepth 4 -type d -name target -prune 2>/dev/null)
+
+    [ ${#found[@]} -eq 0 ] && return
+    echo
+    # MiB below a gigabyte. "0 GiB" for a real 300 MB of files reads as
+    # "nothing here" and the line may as well not print.
+    local size
+    if [ "$total" -ge 1048576 ]; then
+        size="$(( total / 1048576 )) GiB"
+    else
+        size="$(( total / 1024 )) MiB"
+    fi
+    echo "stale per-app caches: ${#found[@]} directories, $size"
+    echo "  These predate the shared cache and nothing writes to them now."
+    # The command is printed rather than run, and printed in full so it
+    # can be read before it is pasted.
+    echo "  rm -rf $(printf '%s ' "${found[@]:0:3}")$([ ${#found[@]} -gt 3 ] && echo '...')"
+    echo "  or all of them:  find $root -maxdepth 4 -type d -name target -prune -exec rm -rf {} +"
+}
+stale_caches "$(dirname "$0")/../.."
+
 # Non-zero for a build break OR a test break: a script that only fails on
 # compilation teaches people that green means working, which is the belief
 # this whole file exists to correct.

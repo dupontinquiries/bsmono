@@ -5734,3 +5734,32 @@ this sandbox has 2 GiB in `/dev/shm`.
 - **C102a — `CARGO_PROFILE_DEV_DEBUG=0` was already set**, which is the
   other big artifact reducer and was already right. Worth recording as a
   pass rather than re-discovering it.
+
+## 103. fleet_build: say where the old caches are
+
+The shared cache stops WRITING to `apps/*/target`, and does nothing
+about the ones already there — they sit holding the 40 GB that prompted
+the change, and nothing would ever mention them again.
+
+A newcomer cloning this has no reason to know they exist. That is the
+argument for printing it: a stale cache is invisible, costs real disk,
+and is safe to delete.
+
+`stale_caches` runs at the end and reports count, total size, and the
+command. Five decisions:
+  - **Reported, never removed.** This script builds things; a build
+    script that deletes directories is one nobody trusts with a typo in
+    a path.
+  - **The active cache is skipped**, if it happens to live in the tree.
+    Telling somebody to delete their live cache would be a slow rebuild
+    caused by our own advice.
+  - **`-prune`**, so `find` does not descend INTO a target directory —
+    thousands of files, and a nested `target/` inside one is not a
+    separate cache.
+  - **MiB below a gigabyte.** The first version printed "0 GiB" for 3 MB
+    of files, which reads as "nothing here" and may as well not print.
+  - **Silent when there is nothing.** A cleanup notice that appears
+    every run with nothing to clean is one people stop reading.
+
+Verified all three: reports with fake targets, correct units, and prints
+nothing on a clean tree.
