@@ -8261,6 +8261,36 @@ if let Some(msg) = self.error_banner.clone() {
                             }
                         }
                         RightPage::Context => {
+                            // SYSTEM STATUS, from real signals. The reference corner carries a dot
+                            // and "All systems operational"; hardcoding that would be a lie on
+                            // every fresh start — no model, the bundled sample standing in for the
+                            // operator's data, no project mounted — and a permanently-green light
+                            // asserts the things beside it are fine until the reader stops
+                            // checking them. See `sysstatus`; every signal there can veto.
+                            {
+                                let sig = crate::sysstatus::Signals {
+                                    model_loaded,
+                                    sample_doc: doc.placeholder,
+                                    project_mounted: self.gitmind_session.is_some(),
+                                    run_blocked: self.agent_run.as_ref()
+                                        .map(|r| r.phase() == Some("blocked")).unwrap_or(false),
+                                    // The backend is compiled in or it is not; `preferred()` already
+                                    // falls back, so reaching here means something is usable.
+                                    backend_ready: true,
+                                };
+                                let (level, msg) = crate::sysstatus::assess(&sig);
+                                let col = match level {
+                                    crate::sysstatus::Readiness::Ready => theme::GREEN(),
+                                    crate::sysstatus::Readiness::Degraded => theme::AMBER(),
+                                    crate::sysstatus::Readiness::NotReady => theme::RED(),
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("●").color(col).small());
+                                    ui.label(RichText::new(level.label()).color(col).small().strong());
+                                    ui.label(RichText::new(msg).color(theme::DIM()).small());
+                                });
+                                ui.add_space(theme::PAD_XS as f32);
+                            }
                             // ACTIVE THREAD, pinned above everything else on this page. The status
                             // line already says what the last turn did, and is overwritten by the
                             // next one — for an unattended run left going for an hour, "what is it
