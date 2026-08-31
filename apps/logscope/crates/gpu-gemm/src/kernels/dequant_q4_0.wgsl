@@ -1,4 +1,4 @@
-
+// DEQUANT_Q4_0
 struct D { nw:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> q: array<u32>;
 @group(0)@binding(1) var<storage,read> s: array<f32>;

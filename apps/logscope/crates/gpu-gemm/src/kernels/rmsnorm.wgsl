@@ -1,4 +1,4 @@
-
+// RMSNORM
 struct D { rows:u32,cols:u32,eps:f32,_p:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> wt: array<f32>;

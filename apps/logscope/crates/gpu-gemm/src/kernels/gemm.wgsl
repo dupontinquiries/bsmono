@@ -1,4 +1,4 @@
-
+// GEMM
 struct D { m:u32,n:u32,k:u32,_p:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> b: array<f32>;

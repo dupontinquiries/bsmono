@@ -1,3 +1,4 @@
+// MOE_DOWN_COMBINE_Q8
 struct D { d:u32,k:u32,kb:u32,gx:u32,slots:u32,_r:u32,_x:u32,_p:u32 };
 @group(0)@binding(0) var<storage,read> hmid: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;

@@ -1,4 +1,4 @@
-
+// DECODE_ATTN_FLASH_P2
 struct D { hd:u32,nch:u32,nh:u32,_a:u32 };
 @group(0)@binding(0) var<storage,read> part: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<f32>;

@@ -1,4 +1,4 @@
-
+// UNPATCHIFY
 struct D { h:u32,w:u32,c:u32,psz:u32 };
 @group(0)@binding(0) var<storage,read> tok: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<f32>;

@@ -1,4 +1,4 @@
-
+// RMSNORM_MATVEC_Q8
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,eps:u32,_a:u32,_b:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;      // raw (un-normed) input row [k]
 @group(0)@binding(1) var<storage,read> nw: array<f32>;     // RMSNorm weight [k]

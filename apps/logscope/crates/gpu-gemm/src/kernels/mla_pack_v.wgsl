@@ -1,4 +1,4 @@
-
+// MLA_PACK_V
 struct D { t:u32, nh:u32, qk_nope:u32, qk_rope:u32, v_head:u32, _a:u32, _b:u32, _c:u32 };
 @group(0)@binding(0) var<storage,read> rec: array<f32>;
 @group(0)@binding(1) var<storage,read_write> vout: array<f32>;

@@ -1,4 +1,4 @@
-
+// ATTENTION
 struct D { t:u32,d:u32,causal:u32,_p:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> k: array<f32>;

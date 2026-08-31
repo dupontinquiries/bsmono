@@ -1,4 +1,3 @@
-
 // `start` is the first KV row to attend to — sliding-window attention for a single query position is a
 // contiguous range, so it is a loop bound rather than a mask. Passed as an offset instead of binding a
 // sub-view because the q8 cache keeps ONE SCALE PER ROW in a separate tensor, and a view into that would

@@ -1,4 +1,4 @@
-
+// DIT_MODULATE
 struct D { rows:u32,cols:u32,_a:u32,_b:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> scale: array<f32>;

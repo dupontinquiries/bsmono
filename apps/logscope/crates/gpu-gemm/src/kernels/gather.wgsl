@@ -1,3 +1,4 @@
+// GATHER
 struct D { n:u32,d:u32,id_off:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> table: array<f32>;
 @group(0)@binding(1) var<storage,read> ids: array<u32>;

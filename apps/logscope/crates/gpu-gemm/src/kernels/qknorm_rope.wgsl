@@ -1,4 +1,4 @@
-
+// QKNORM_ROPE
 struct D { nq:u32,nk:u32,hd:u32,base:f32,pos:u32,neox:u32,eps:f32,msc:f32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> qn: array<f32>;

@@ -1,4 +1,4 @@
-
+// SAMPLE_AT
 struct D { n:u32, out_slot:u32, top_k:u32, rlast:u32,
            temp:u32, top_p:u32, min_p:u32, penalty:u32,
            seeded:u32, rcap:u32, kids:u32, abs_step:u32,
