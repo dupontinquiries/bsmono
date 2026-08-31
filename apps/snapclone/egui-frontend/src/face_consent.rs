@@ -61,6 +61,17 @@ impl Provenance {
         matches!(self, Provenance::SelfCapture | Provenance::ReceivedFromContact)
     }
 
+    /// Why `may_store` answered the way it did, in the user's terms.
+    ///
+    /// Test-only for now, and that is honest rather than dead: the
+    /// consent SWITCH is live in settings, but no detector runs behind
+    /// it yet, so there is no refusal to explain. The moment a crop is
+    /// actually refused this is the sentence to show — a privacy gate
+    /// that silently drops a face teaches people it is broken, not that
+    /// it is protecting someone.
+    ///
+    /// Kept beside `may_store` deliberately: a reason living far from
+    /// the decision it explains is how the two stop agreeing.
     pub fn why(self) -> &'static str {
         match self {
             Provenance::SelfCapture => "your own face",

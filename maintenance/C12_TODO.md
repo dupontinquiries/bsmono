@@ -4752,8 +4752,31 @@ variant had no timestamp before.
 
 1432/1432.
 
-- **C86a — the other four findings are unexamined**: `why`
-  (face_consent), `fit` (gaze), `dim` (posture), `seq` (voice_send).
-- **C86b — the checker has not been run on the rest of the fleet.**
-  On this evidence it is worth doing, but the false-positive rate needs
-  checking per app before any of it is acted on.
+- **C86a — examined.** `dim` and `seq` are one-line accessors, which is
+  a shape the checker will always report and is rarely worth acting on.
+  `gaze::fit` is a least-squares calibration solver with no caller.
+
+  `face_consent::why` is the interesting one, and it is HONEST rather
+  than dead. The consent switch is live and reachable in settings, and
+  `may_store_face` combines it with provenance — but no face detector
+  runs behind any of it, so there is no refusal to explain yet.
+  Documented in place: the moment a crop is actually refused, `why` is
+  the sentence to show, because a privacy gate that silently drops a
+  face teaches people it is broken rather than that it is protecting
+  someone.
+
+- **C86b — swept, and the rate is low.** voiceterm 0, bo-suite 0,
+  studio 1, gitmind 1, logscope-egui 4, snapclone-egui 5. A checker that
+  reports single digits per app is one people will read; the contrast
+  with `unhosted_check`'s first run (35 findings on gitmind, 7 of 8
+  false) is the whole difference.
+
+  gitmind's is worth following up: `fastboot::newest_matching` picks the
+  newest image matching a suffix, documents why it compares timestamps
+  as strings, and has no caller — so the flashing flow selects images
+  some other way, and one of the two is wrong.
+
+- **C86c — `may_store_face` is test-only too and the checker MISSED
+  it.** It is a method on `Snapclone` in `lib.rs`, and the name appears
+  in the same file inside a doc comment, which the caller scan counts as
+  a use. Worth fixing: doc comments should not count as callers.
