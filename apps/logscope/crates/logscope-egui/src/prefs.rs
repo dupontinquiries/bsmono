@@ -156,15 +156,23 @@ mod tests {
     /// is read before a window exists to show an error in.
     #[test]
     fn malformed_input_degrades_instead_of_panicking() {
-        for text in ["nav_layout =\n", "nav_layout = colemak\n", "profiles = ,,,\n",
+        for text in ["nav_layout =\n", "nav_layout = bepo\n", "profiles = ,,,\n",
                      "profiles = gpu,nonsense,optimizer\n", "[weird]\nnav_layout = dvorak\n",
                      "not an ini at all\n\x00\n", "space =\n"] {
             let p = parse(text);
             let _ = render(&p);
-            assert!(p.nav_layout == NavLayout::Qwerty || p.nav_layout == NavLayout::DvorakCentered);
+            // Membership, not an enumeration. This listed the two layouts that existed when it was
+            // written and failed the moment three more were added — correctly, but a test that has
+            // to be edited every time the set grows is a test that will eventually be edited
+            // carelessly.
+            assert!(NavLayout::all().contains(&p.nav_layout), "{:?}", p.nav_layout);
         }
         // an unknown layout name falls back rather than being invented
-        assert_eq!(parse("nav_layout = colemak\n").nav_layout, NavLayout::Qwerty);
+        assert_eq!(parse("nav_layout = bepo\n").nav_layout, NavLayout::Qwerty);
+        // …and every layout that IS offered round-trips through the file
+        for l in NavLayout::all() {
+            assert_eq!(parse(&format!("nav_layout = {}\n", l.key())).nav_layout, l);
+        }
         // unknown profile keys are dropped, known ones kept, order preserved
         assert_eq!(parse("profiles = gpu,nonsense,optimizer\n").profiles,
                    vec![ProfileId::Gpu, ProfileId::Optimizer]);
