@@ -487,6 +487,41 @@ mod endpoint_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// ONE FOLD DURATION, AND IT IS PER-CHASSIS.
+    ///
+    /// `main.rs` carried a second constant, `XFORM_DUR = 0.9`, unused, beside
+    /// this module's `BLEND_SEC = 1.3`. Its doc said per-chassis timing was
+    /// impossible — "nothing carries that across the glTF strip, so the engine
+    /// uses one duration for every bot until it does" — which had stopped
+    /// being true: `chassis_fold_mul` feeds `content::CHASSIS::xform_dur` into
+    /// `dur_mul`, so a juggernaut already folds slower than a raptor.
+    ///
+    /// A stale constant that contradicts the live path is worse than dead
+    /// code, because the number is plausible and someone will eventually use
+    /// it. It was deleted; this asserts the thing that made it wrong, so the
+    /// deletion cannot be quietly undone.
+    #[test]
+    fn fold_duration_varies_by_chassis() {
+        use crate::content::CHASSIS;
+        assert!(CHASSIS.len() >= 3, "the chassis table shrank to {}", CHASSIS.len());
+        let durs: Vec<f32> = CHASSIS.iter().map(|c| c.xform_dur).collect();
+        let lo = durs.iter().cloned().fold(f32::MAX, f32::min);
+        let hi = durs.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(
+            hi > lo * 1.2,
+            "every chassis folds at nearly the same rate ({lo:.2}..{hi:.2}) — \
+             dur_mul is doing nothing and a flat constant would be equivalent"
+        );
+        // foldaudit.rs documents the range these multipliers may take
+        assert!(lo >= 0.7 && hi <= 1.4, "xform_dur left its documented 0.8-1.35 band: {lo}..{hi}");
+        // the baseline chassis is the unit, or "multiplier" means nothing
+        let std = crate::content::chassis("standard").expect("a standard chassis");
+        assert!((std.xform_dur - 1.0).abs() < 1e-6, "standard is not 1.0x");
+        // and the real duration is BLEND_SEC scaled by it, with no other source
+        assert!((BLEND_SEC * std.xform_dur - BLEND_SEC).abs() < 1e-6);
+    }
+
     use super::*;
 
     #[test]

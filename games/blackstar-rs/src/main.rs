@@ -2396,11 +2396,6 @@ fn main() {
         .unwrap();
 }
 
-/// How long a vehicle<->robot fold takes. Blackstar's own `xform_dur` is
-/// per-chassis in `content/chassis.json`; nothing carries that across the
-/// glTF strip, so the engine uses one duration for every bot until it does.
-const XFORM_DUR: f32 = 0.9;
-
 /// Which model's dimensions describe the body as it is CURRENTLY POSED.
 ///
 /// Not always the displayed one. A smooth fold keeps `cars.active` pinned to

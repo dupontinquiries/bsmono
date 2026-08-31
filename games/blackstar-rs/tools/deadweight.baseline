@@ -42,7 +42,7 @@ src/interior.rs 2
 src/lift.rs 1
 src/loadout.rs 4
 src/loot.rs 3
-src/main.rs 2
+src/main.rs 1
 src/menu.rs 5
 src/menufx.rs 2
 src/optics.rs 4
