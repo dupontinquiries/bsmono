@@ -111,7 +111,6 @@ impl LibraryTab {
 /// an opacity reveal, and the accent halo blooming behind a change.
 fn silhouette_paint(ui: &Ui, s: &crate::product_silhouette::ProductSilhouette,
                     rect: egui::Rect, c: &PaletteColors) {
-    use crate::product_silhouette::Shape;
     let p = ui.painter().with_clip_rect(rect);
     let a = (s.reveal() * 255.0) as u8;
     let line = egui::Color32::from_rgba_unmultiplied(
@@ -121,31 +120,31 @@ fn silhouette_paint(ui: &Ui, s: &crate::product_silhouette::ProductSilhouette,
         p.circle_filled(rect.center(), rect.width() * 0.62,
             egui::Color32::from_rgba_unmultiplied(c.accent.r(), c.accent.g(), c.accent.b(), ha));
     }
-    let strokes = s.shape().strokes();
-    let (w0, w1) = (strokes[0], strokes.get(1).copied().unwrap_or(strokes[0]));
-    let cx = rect.center();
-    match s.shape() {
-        Shape::Disc => {
-            p.circle_stroke(cx, rect.width() * 0.38, egui::Stroke::new(w0, line));
-            p.circle_stroke(cx, rect.width() * 0.16, egui::Stroke::new(w1, line));
+    // THE PRODUCT OUTLINE, walked from data.
+    //
+    // This used to be four hand-drawn primitives — Disc was two concentric
+    // circles, Cube a rectangle with a dot — and at badge size they were
+    // indistinguishable from each other and from a loading spinner. The
+    // shapes are point lists in a unit box now (`Shape::outline`), so the
+    // geometry is reviewable, testable, and the same at every size the
+    // badge is drawn at.
+    //
+    // Inset so a 1.2px stroke centred on the boundary is not half clipped;
+    // `with_clip_rect` above would take the outer half of it otherwise.
+    let inset = rect.shrink(1.5);
+    let at = |(x, y): (f32, f32)| egui::pos2(
+        inset.left() + x * inset.width(),
+        inset.top() + y * inset.height());
+    for sp in s.shape().outline() {
+        let mut pts: Vec<egui::Pos2> = sp.pts.iter().map(|q| at(*q)).collect();
+        if sp.closed {
+            if let Some(first) = pts.first().copied() { pts.push(first); }
         }
-        Shape::Bar => {
-            let r = egui::Rect::from_center_size(cx, egui::vec2(rect.width() * 0.82, rect.height() * 0.3));
-            p.rect_stroke(r, 4.0, egui::Stroke::new(w0, line), egui::StrokeKind::Inside);
-            p.line_segment([r.left_center() + egui::vec2(3.0, 0.0), r.right_center() - egui::vec2(3.0, 0.0)],
-                egui::Stroke::new(w1, line));
-        }
-        Shape::Tower => {
-            let r = egui::Rect::from_center_size(cx, egui::vec2(rect.width() * 0.34, rect.height() * 0.84));
-            p.rect_stroke(r, 3.0, egui::Stroke::new(w0, line), egui::StrokeKind::Inside);
-            p.line_segment([r.center_top() + egui::vec2(0.0, 4.0), r.center_bottom() - egui::vec2(0.0, 4.0)],
-                egui::Stroke::new(w1, line));
-        }
-        Shape::Cube => {
-            let r = egui::Rect::from_center_size(cx, egui::vec2(rect.width() * 0.6, rect.height() * 0.6));
-            p.rect_stroke(r, 3.0, egui::Stroke::new(w0, line), egui::StrokeKind::Inside);
-            p.circle_stroke(cx, rect.width() * 0.14, egui::Stroke::new(w1, line));
-        }
+        // One polyline per subpath rather than a segment per pair: egui
+        // joins the corners of a polyline, and a shape drawn as loose
+        // segments has a visible notch at every vertex — which on a
+        // 16-point outline is the whole outline.
+        p.add(egui::Shape::line(pts, egui::Stroke::new(sp.weight, line)));
     }
 }
 
@@ -1693,6 +1692,73 @@ impl Controller {
         }
         self.audio_sink = next;
         self.pending_playback = Some(crate::playback::Request::ReleaseRoute);
+    }
+}
+
+/// The badge, through a real frame.
+///
+/// The outline tests measure the DATA; this measures what egui was asked
+/// to paint. Both are needed: the previous silhouettes passed every data
+/// test there was, because there were none, and the primitives that drew
+/// them lived in a function no test ever ran.
+#[cfg(test)]
+mod silhouette_frame_tests {
+    use super::*;
+    use crate::product_silhouette::{ProductSilhouette, Shape};
+
+    /// Draw one badge and count the line shapes and their widths.
+    fn painted(shape: Shape) -> (usize, Vec<f32>) {
+        let ctx = egui::Context::default();
+        let mut s = ProductSilhouette::new(shape);
+        // Past the reveal, or the strokes are drawn transparent and the
+        // test measures an animation rather than an outline.
+        s.tick(10_000.0);
+        let colors = uikit_egui::palette_colors("amber");
+        let out = ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                                                        egui::vec2(200.0, 200.0))),
+            ..Default::default()
+        }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0),
+                                                     egui::vec2(48.0, 48.0));
+                silhouette_paint(ui, &s, rect, &colors);
+            });
+        });
+        let mut widths = Vec::new();
+        let mut n = 0;
+        for cs in out.shapes.iter() {
+            if let egui::epaint::Shape::Path(ps) = &cs.shape {
+                n += 1;
+                widths.push(ps.stroke.width);
+            }
+        }
+        (n, widths)
+    }
+
+    #[test]
+    fn every_product_paints_its_whole_outline() {
+        // One path per subpath. A shape that paints fewer than it has is
+        // one the renderer is silently dropping part of.
+        for shape in [Shape::Disc, Shape::Bar, Shape::Tower, Shape::Cube] {
+            let (n, _) = painted(shape);
+            assert_eq!(n, shape.outline().len(),
+                       "{shape:?} painted {n} of {} subpaths",
+                       shape.outline().len());
+        }
+    }
+
+    #[test]
+    fn nothing_reaches_the_screen_heavier_than_the_design_allows() {
+        // The data test pins the outline; this pins what egui was actually
+        // handed, which is where a renderer that scaled a stroke by the
+        // badge size would show up.
+        for shape in [Shape::Disc, Shape::Bar, Shape::Tower, Shape::Cube] {
+            let (_, widths) = painted(shape);
+            for w in widths {
+                assert!(w <= 1.2, "{shape:?} painted a {w}px line");
+            }
+        }
     }
 }
 
