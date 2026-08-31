@@ -695,6 +695,26 @@ mod tests {
     }
 
     #[test]
+    fn a_learned_address_is_what_makes_a_peer_dialable() {
+        // `PunchAddrs` was empty for the whole life of this port — nothing
+        // called `note_peer_addr`, so no hole punch had a target and voice
+        // had nowhere to send. This is the arm the binary now feeds from
+        // ADMITTED gossip.
+        let mut s = app();
+        assert!(s.punch.is_empty(), "nothing should be known before any gossip");
+        s.apply(HostEvent::PeerAddr {
+            id: "sc-aabbccdd".into(), ip: [10, 0, 0, 7], port: 9876, now_ms: 1_000 });
+        let a = s.punch.get("sc-aabbccdd").expect("the address was not recorded");
+        assert_eq!((a.ip, a.port), ([10, 0, 0, 7], 9876));
+
+        // And it does not last forever: a peer that moved networks must stop
+        // authorising an ex-neighbour's address for voice admission.
+        s.apply(HostEvent::ExpirePunchAddrs { now_ms: 1_000 + 60 * 60 * 1000 });
+        assert!(s.punch.get("sc-aabbccdd").is_none(),
+                "an hour-old address is still being offered as current");
+    }
+
+    #[test]
     fn the_shutter_says_whether_the_photo_was_saved() {
         // The failure this closes: `CaptureSnap` was answered on stderr, and
         // the person who pressed the shutter is looking at the camera page.

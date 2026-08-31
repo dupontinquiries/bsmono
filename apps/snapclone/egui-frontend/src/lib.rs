@@ -13,6 +13,7 @@ use uikit_egui::{Adaptive, BgStyle, GestureLayer, LiveBackground, Nav, PaletteCo
 pub mod camera;
 pub mod debounce;
 pub mod confirm;
+pub mod audio;
 pub mod camera_source;
 pub mod capture;
 pub mod peer_source;
@@ -92,6 +93,7 @@ pub mod tab_bar;
 pub mod thumbnails;
 pub mod trace_channels;
 pub mod voice_bridge;
+pub mod voice_wire;
 pub mod wire_v3;
 pub mod touch_feedback;
 pub mod requests;

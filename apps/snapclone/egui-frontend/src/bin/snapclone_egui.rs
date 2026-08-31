@@ -7,6 +7,7 @@
 //! Run:  cargo run --bin snapclone-egui --features app   (from apps/snapclone/egui-frontend)
 
 use eframe::egui;
+use snapclone_egui::audio;
 use snapclone_egui::capture;
 use snapclone_egui::host::{HostCommand, HostEvent};
 use snapclone_egui::Snapclone;
@@ -63,8 +64,96 @@ impl CaptureRig {
     }
 }
 
+/// The voice call's host half: a UDP socket, a mic thread, and a speaker.
+///
+/// Assembled and torn down with the CALL, not with the process. A mic
+/// process running while nobody is in a call is a recording light on some
+/// hardware and a wakeup on all of it, and "we hold the mic open the whole
+/// time but promise not to listen" is not a property a user can check.
+struct VoiceRig {
+    sock: Option<snapclone_egui::voice_wire::VoiceSocket>,
+    peers: snapclone_egui::voice_wire::Peers,
+    mic: Arc<audio::MicShared>,
+    mic_stop: Arc<AtomicBool>,
+    mic_child: Option<audio::Child>,
+    mic_thread: Option<std::thread::JoinHandle<()>>,
+    speaker: Option<audio::Speaker>,
+    speaker_child: Option<audio::Child>,
+    /// Wall-clock of the last `SinkDepth`, so the tick runs at the cushion's
+    /// rate rather than the frame rate — a 120 Hz display must not ask the
+    /// play-out layer for audio twice per frame.
+    last_sink_tick: std::time::Instant,
+    /// Said once per call, not per frame.
+    warned_no_audio: bool,
+}
+
+impl VoiceRig {
+    fn idle() -> VoiceRig {
+        VoiceRig {
+            sock: None, peers: snapclone_egui::voice_wire::Peers::new(),
+            mic: audio::MicShared::new(), mic_stop: Arc::new(AtomicBool::new(false)),
+            mic_child: None, mic_thread: None, speaker: None, speaker_child: None,
+            last_sink_tick: std::time::Instant::now(), warned_no_audio: false,
+        }
+    }
+
+    fn live(&self) -> bool { self.sock.is_some() }
+
+    /// Bring up the socket and both devices. A missing audio tool is NOT
+    /// fatal to the call: the socket still carries the other direction, and
+    /// a call where you can hear but not speak beats no call plus a
+    /// traceback.
+    fn start(&mut self, port: u16, frame_ms: u32, record_cmd: &str, play_cmd: &str)
+             -> Vec<String> {
+        let mut notes = Vec::new();
+        match snapclone_egui::voice_wire::VoiceSocket::bind(port) {
+            Ok(s) => self.sock = Some(s),
+            Err(e) => {
+                notes.push(format!("no voice socket on UDP {port}: {e}"));
+                return notes;
+            }
+        }
+        self.mic_stop = Arc::new(AtomicBool::new(false));
+        self.mic = audio::MicShared::new();
+        match audio::spawn(record_cmd, audio::Direction::Record) {
+            Ok((pipe, child)) => {
+                self.mic_child = Some(child);
+                let (shared, stop) = (self.mic.clone(), self.mic_stop.clone());
+                self.mic_thread = Some(std::thread::spawn(move || {
+                    audio::run_mic(pipe, frame_ms, &shared, &stop);
+                }));
+            }
+            Err(e) => notes.push(format!("no microphone: {e}")),
+        }
+        match audio::spawn(play_cmd, audio::Direction::Play) {
+            Ok((pipe, child)) => {
+                self.speaker_child = Some(child);
+                self.speaker = Some(audio::Speaker::new(pipe, frame_ms));
+            }
+            Err(e) => notes.push(format!("no speaker: {e}")),
+        }
+        notes
+    }
+
+    /// Both halves of the stop contract for each child, then reap.
+    fn stop(&mut self) {
+        self.mic_stop.store(true, Ordering::Relaxed);
+        if let Some(c) = self.mic_child.take() { c.stop(); c.reap(); }
+        if let Some(t) = self.mic_thread.take() { let _ = t.join(); }
+        // The speaker holds the child's stdin; dropping it is what lets a
+        // well-behaved tool finish and exit rather than being killed
+        // mid-buffer.
+        self.speaker = None;
+        if let Some(c) = self.speaker_child.take() { c.stop(); c.reap(); }
+        self.sock = None;
+        self.peers = snapclone_egui::voice_wire::Peers::new();
+        self.warned_no_audio = false;
+    }
+}
+
 struct App {
     snap: Snapclone,
+    voice: VoiceRig,
     rig: CaptureRig,
     /// The plan is printed once per start, not per frame: the pipeline
     /// strings are the debuggable artifact, and a log that repeats them at
@@ -152,7 +241,8 @@ impl App {
                            peers on this network will not be found");
             }
         }
-        Self { snap, rig: CaptureRig::idle(), plan_logged: false, focused: true,
+        Self { snap, voice: VoiceRig::idle(), rig: CaptureRig::idle(),
+               plan_logged: false, focused: true,
                gossip, last_announce: 0, warned_unsigned: false, identity: keys }
     }
 
@@ -186,7 +276,35 @@ impl App {
                         datagram_len: len,
                         public: a.public,
                     });
+                    let admitted = cmds.iter()
+                        .any(|c| matches!(c, HostCommand::GossipAdmitted(true)));
                     self.handle(cmds);
+                    // THE PUNCH ADDRESS, which nothing was learning. `punch`,
+                    // `heard` and every dial path hang off `note_peer_addr`
+                    // and no caller existed, so `PunchAddrs` was empty for
+                    // the whole life of the port — no hole punch had an
+                    // address to punch to, and voice had nowhere to send.
+                    //
+                    // Only for an ADMITTED record: `gossip::accept` is the
+                    // signature check, and learning an address from a
+                    // refused datagram would let anyone on the subnet
+                    // redirect a peer's traffic by announcing as them.
+                    if admitted {
+                        if let std::net::IpAddr::V4(v4) = from.ip() {
+                            // The port the sender NAMED, not the source port
+                            // its gossip came from: gossip is multicast from
+                            // an ephemeral port and the listen port is where
+                            // it wants to be reached. Falling back to the
+                            // source port would send voice to a socket
+                            // nobody is reading.
+                            let port = if a.port != 0 { a.port } else { from.port() };
+                            let cmds = self.snap.apply(HostEvent::PeerAddr {
+                                id: a.id.clone(), ip: v4.octets(), port,
+                                now_ms: now_secs.max(0) as u64 * 1000,
+                            });
+                            self.handle(cmds);
+                        }
+                    }
                 }
                 Err(e) => eprintln!("snapclone: unreadable gossip from {from}: {e:?}"),
             }
@@ -202,6 +320,13 @@ impl App {
         let Some(keys) = self.identity.clone() else { return };
         if !due { return; }
         self.last_announce = now_secs;
+        // Stale addresses go on the same tick. `purge_stale` existed with no
+        // caller, so an address learned once was authoritative forever —
+        // including for voice admission, where a peer who moved networks
+        // would keep an ex-neighbour's address authorised.
+        let cmds = self.snap.apply(HostEvent::ExpirePunchAddrs {
+            now_ms: now_secs.max(0) as u64 * 1000 });
+        self.handle(cmds);
         let a = snapclone_egui::gossip_wire::Announce {
             id: self.snap.local_id.clone(),
             // The address a peer should dial us back on. Left empty rather than
@@ -291,6 +416,85 @@ impl App {
         }
     }
 
+    /// Bring the voice path up and down with the call, and pump it.
+    fn pump_voice(&mut self) {
+        let joined = self.snap.group_voice.joined;
+        let frame_ms = self.snap.sink_latency.frame_ms;
+        if joined && !self.voice.live() {
+            let port = self.snap.settings.current.network.listen_port;
+            for n in self.voice.start(port, frame_ms,
+                                      &audio::default_record_cmd(),
+                                      &audio::default_play_cmd()) {
+                eprintln!("snapclone: {n}");
+            }
+            if self.voice.live() {
+                let cmds = self.snap.apply(HostEvent::VoiceLink(true));
+                self.handle(cmds);
+            }
+        } else if !joined && self.voice.live() {
+            self.voice.stop();
+            let cmds = self.snap.apply(HostEvent::VoiceLink(false));
+            self.handle(cmds);
+        }
+        if !self.voice.live() { return; }
+
+        // WHO IS IN THE CALL, and where. Rebuilt each frame from the app's
+        // own participant list crossed with the punch addresses gossip
+        // learned — replaced wholesale rather than patched, so someone who
+        // left cannot linger as an authorised sender.
+        let entries: Vec<(String, snapclone_egui::punch_addrs::PeerAddr)> =
+            self.snap.group_voice.participants.iter()
+                .filter(|p| !p.is_self)
+                .filter_map(|p| self.snap.punch.get(&p.id).map(|a| (p.id.clone(), a)))
+                .collect();
+        self.voice.peers.set(entries);
+
+        // MIC → the app's transmit gate → the wire. `voice_frame` is what
+        // decides whether anything may leave; a rig that sent every mic
+        // frame would transmit for the length of the call.
+        let frames = self.voice.mic.take(4);
+        for _ in 0..frames.len() {
+            let cmds = self.snap.apply(HostEvent::MicFrame);
+            self.handle(cmds);
+        }
+        if let Some(why) = self.voice.mic.take_error() {
+            eprintln!("snapclone: microphone stopped: {why}");
+        }
+
+        // WIRE → the app. The sender's identity is the source address, which
+        // is the transport's job to establish — see voice_wire's header on
+        // why that is both required and currently weak.
+        let (inbound, refused) = {
+            let peers = &self.voice.peers;
+            match self.voice.sock.as_mut() {
+                Some(s) => s.poll(peers, 16),
+                None => (Vec::new(), Vec::new()),
+            }
+        };
+        for (sender, payload) in inbound {
+            let cmds = self.snap.apply(HostEvent::VoiceReceived { sender, payload });
+            self.handle(cmds);
+        }
+        if !refused.is_empty() && !self.voice.warned_no_audio {
+            self.voice.warned_no_audio = true;
+            eprintln!("snapclone: voice datagrams refused — sender not a known call \
+                       peer, or its punch address expired ({} so far)",
+                      self.voice.sock.as_ref().map(|s| s.refused_unknown).unwrap_or(0));
+        }
+
+        // THE PLAY-OUT TICK, at the cushion's rate rather than the frame
+        // rate: a 120 Hz display must not ask the play-out layer for audio
+        // twice per frame.
+        let due = self.voice.last_sink_tick.elapsed()
+            >= std::time::Duration::from_millis(u64::from(self.snap.sink_tick_ms()));
+        if due {
+            self.voice.last_sink_tick = std::time::Instant::now();
+            let depth = self.voice.speaker.as_ref().map(|s| s.depth()).unwrap_or(0);
+            let cmds = self.snap.apply(HostEvent::SinkDepth(depth));
+            self.handle(cmds);
+        }
+    }
+
     /// What the app asked the world to do.
     ///
     /// Deliberately a debug sink and labelled as one. Capture, export and
@@ -333,6 +537,44 @@ impl App {
                     // FROM a drain, and re-entering `apply` here would drain
                     // a second time mid-iteration.
                     pending.push(HostEvent::SnapSaved(outcome));
+                }
+                // VOICE OUT. `voice_send` already envelopes one payload per
+                // peer; this is the socket that was missing under it.
+                HostCommand::SendVoice(per_peer) => {
+                    if let Some(s) = self.voice.sock.as_ref() {
+                        let unreachable = s.send_all(&self.voice.peers, &per_peer);
+                        for id in unreachable {
+                            // Worth a line each: a participant with no
+                            // current address hears everyone and is heard by
+                            // nobody, which presents as THEIR microphone
+                            // being broken.
+                            eprintln!("snapclone: {id} has no reachable address — \
+                                       they will not hear this call");
+                        }
+                    }
+                }
+                // AUDIO OUT. A write failure ends the device, not the call:
+                // the socket half still works and the other person can still
+                // be heard by everyone else.
+                HostCommand::PlayAudio(frames) => {
+                    let failed = match self.voice.speaker.as_mut() {
+                        Some(sp) => sp.play(&frames).err(),
+                        None => None,
+                    };
+                    if let Some(e) = failed {
+                        eprintln!("snapclone: speaker stopped: {e}");
+                        self.voice.speaker = None;
+                        if let Some(c) = self.voice.speaker_child.take() { c.stop(); c.reap(); }
+                    }
+                }
+                // The transmit gate's verdict for this mic interval. Gated
+                // is the normal case and says nothing; the other two are
+                // states a silent call needs explained.
+                HostCommand::VoiceEmit(emit) => {
+                    if matches!(emit, snapclone_egui::voice_send::Emit::NoEncoder) {
+                        eprintln!("snapclone: transmitting with no encoder — \
+                                   nothing will leave this device");
+                    }
                 }
                 HostCommand::SaveContacts(book) => {
                     if let Err(e) = snapclone_egui::contact_book::store(&book) {
@@ -445,6 +687,7 @@ impl eframe::App for App {
         self.handle(cmds);
         self.pump_gossip(now_secs);
         self.pump_capture();
+        self.pump_voice();
 
         // Discovery is time-driven, not input-driven, so the frame has to
         // come round on its own or an idle window never polls the socket —

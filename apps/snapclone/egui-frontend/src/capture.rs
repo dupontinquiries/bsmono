@@ -176,8 +176,20 @@ pub trait FrameStream: Send {
 ///   and the spin would warm a phone for nothing.
 /// * A stream that dies AFTER producing frames restarts the whole plan
 ///   (after `retry_pause`) — the camera that worked may come back, and the
-///   device list order still encodes preference. Bounded by the stop flag,
-///   which is the host saying the page went away.
+///   device list order still encodes preference.
+/// * That restart is BOUNDED by [`MAX_RESTARTS`]. It was bounded only by the
+///   stop flag, which is the host saying the page went away — and a camera
+///   that delivers one frame and dies, over and over, is the shape of a
+///   failing USB link or an ISP another app keeps taking. Unbounded, that is
+///   a process-spawn loop for as long as the page is open, on a phone. After
+///   the bound the run ends `Exhausted` with the reasons, and the person can
+///   leave the page and come back to try again — a deliberate act, rather
+///   than the app deciding to keep hammering the hardware on its own.
+/// How many times a working-then-dying camera is re-opened before the run
+/// gives up. Small on purpose: three failures in a row is not a transient
+/// glitch, and the cost of being wrong is one page revisit.
+pub const MAX_RESTARTS: u32 = 3;
+
 pub fn run(
     plan: &[SourceCandidate],
     width: u32,
@@ -190,6 +202,7 @@ pub fn run(
     let frame_len = (width as usize) * (height as usize) * 4;
     let t0 = Instant::now();
     let mut seq: u64 = 0;
+    let mut restarts: u32 = 0;
     loop {
         let mut log: Vec<String> = Vec::new();
         let mut any_frames_this_pass = false;
@@ -241,12 +254,20 @@ pub fn run(
                 break;
             }
         }
-        if stop.load(Ordering::Relaxed) || !any_frames_this_pass {
-            shared.set_status(if stop.load(Ordering::Relaxed) {
-                Status::Idle
-            } else {
-                Status::Exhausted { log }
-            });
+        if stop.load(Ordering::Relaxed) {
+            shared.set_status(Status::Idle);
+            return;
+        }
+        if !any_frames_this_pass {
+            shared.set_status(Status::Exhausted { log });
+            return;
+        }
+        restarts += 1;
+        if restarts >= MAX_RESTARTS {
+            log.push(format!(
+                "gave up after {restarts} restarts — the camera keeps dying after \
+                 opening; leave the page and come back to try again"));
+            shared.set_status(Status::Exhausted { log });
             return;
         }
         std::thread::sleep(retry_pause);
@@ -546,19 +567,12 @@ mod tests {
         //
         // 4x2 RGBA = 32 bytes/frame. The script writes 2.5 frames — the
         // torn half must not surface as a frame — then names its exit.
-        // One good round, then refusal. `run`'s retry policy restarts a plan
-        // whose stream DID produce frames — the camera may come back — so a
-        // stand-in that succeeds every round keeps the loop alive forever.
-        // That is the policy working, not a test bug, but the test has to
-        // terminate: the sentinel makes the second round fail.
-        let sentinel = std::env::temp_dir().join(format!(
-            "snapclone-capture-sentinel-{}", std::process::id()));
-        let _ = std::fs::remove_file(&sentinel);
-        let body = format!(
-            "if [ -e {s} ]; then echo 'second round refused' >&2; exit 1; fi; \
-             touch {s}; head -c 80 /dev/zero | tr '\\0' 'A'; \
-             echo 'lens fell off' >&2; exit 3", s = sentinel.display());
-        let launcher = fake_launcher("frames", &body);
+        // The stand-in succeeds every round, which is what a flapping camera
+        // looks like: opens, delivers, dies. MAX_RESTARTS is what makes this
+        // terminate — before it existed this test needed a sentinel file to
+        // stop the loop, and the sentinel was hiding the real defect.
+        let launcher = fake_launcher("frames",
+            "head -c 80 /dev/zero | tr '\\0' 'A'; echo 'lens fell off' >&2; exit 3");
         let shared = Shared::new();
         let stop = AtomicBool::new(false);
         let plan = vec![cand("stand-in")];
@@ -567,20 +581,46 @@ mod tests {
             &shared, &stop, Duration::ZERO);
 
         let f = shared.take_frame().expect("two whole frames crossed the pipe");
-        assert_eq!(f.seq, 2, "the torn third frame must not count");
+        // Two whole frames per round, and `seq` counts across restarts —
+        // deliberately, since gap detection needs it monotonic for the life
+        // of the run rather than per pipeline. Anything but an exact
+        // multiple of two means the torn 16 bytes were delivered as a frame.
+        assert_eq!(f.seq, 2 * u64::from(MAX_RESTARTS),
+                   "the torn third frame of some round was counted");
         assert!(f.pixels_plausible());
         assert!(f.rgba.iter().all(|b| *b == b'A'));
-        // The status log is rebuilt each pass, so it carries the SECOND
-        // round's refusal — the right content for a one-line status, since
-        // the freshest failure is the actionable one.
         match shared.take_status() {
             Some(Status::Exhausted { log }) => {
-                assert!(log[0].contains("second round refused"),
+                assert!(log.iter().any(|l| l.contains("lens fell off")),
                         "stderr did not become the reason: {log:?}");
+                assert!(log.iter().any(|l| l.contains("after 2 frames")),
+                        "the torn third frame must not count: {log:?}");
+                assert!(log.last().unwrap().contains("gave up after"),
+                        "the give-up is not explained: {log:?}");
             }
-            other => panic!("expected Exhausted after the refused retry, got {other:?}"),
+            other => panic!("expected Exhausted after the restart bound, got {other:?}"),
         }
-        let _ = std::fs::remove_file(&sentinel);
+    }
+
+    #[test]
+    fn a_camera_that_flaps_is_given_up_on_rather_than_hammered() {
+        // Opens, delivers one frame, dies — the shape of a failing USB link
+        // or an ISP another app keeps taking. Unbounded this is a
+        // process-spawn loop for as long as the page is open.
+        let shared = Shared::new();
+        let stop = AtomicBool::new(false);
+        let plan = vec![cand("flapping")];
+        let mut opens = 0u32;
+        run(&plan, 2, 2,
+            |_| {
+                opens += 1;
+                Ok(Box::new(Scripted { frames: 1, death: "died again", fill: 3 })
+                    as Box<dyn FrameStream>)
+            },
+            &shared, &stop, Duration::ZERO);
+        assert_eq!(opens, MAX_RESTARTS,
+                   "the plan was re-opened {opens} times against a bound of {MAX_RESTARTS}");
+        assert!(matches!(shared.take_status(), Some(Status::Exhausted { .. })));
     }
 
     #[test]
