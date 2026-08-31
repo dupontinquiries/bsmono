@@ -17,6 +17,7 @@ mod botpack;
 mod bots;
 mod roster;
 mod sections;
+mod settlement;
 mod camera;
 mod chassis_traits;
 mod chord;
