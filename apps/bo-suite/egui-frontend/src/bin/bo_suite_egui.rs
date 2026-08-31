@@ -10,6 +10,12 @@ use uikit_egui::Adaptive;
 
 struct App {
     controller: Controller,
+    /// The audio host. The controller returns REQUESTS; this performs them,
+    /// which is what keeps the view constructible and testable with no
+    /// process table — see `playback::Request`.
+    player: bo_suite_egui::playback::Player,
+    /// Said once per failure, not per frame.
+    last_note: String,
 }
 
 impl App {
@@ -24,7 +30,58 @@ impl App {
             Scene { name: "Focus".into() },
             Scene { name: "Evening Wind-down".into() },
         ];
-        Self { controller: Controller::new(devices, scenes) }
+        Self {
+            controller: Controller::new(devices, scenes),
+            player: bo_suite_egui::playback::Player::new(),
+            last_note: String::new(),
+        }
+    }
+}
+
+impl App {
+    /// Carry out whatever the view asked for, and report back what the
+    /// player did.
+    fn pump_playback(&mut self) {
+        use bo_suite_egui::playback::{plan, Request, State, DEFAULT_PLAYER};
+        if let Some(req) = self.controller.pending_playback.take() {
+            match req {
+                Request::Play { url, sink } => {
+                    if url.trim().is_empty() {
+                        // NOT attempted. Handing an empty path to a player
+                        // gets "no such file", which reads as a broken
+                        // player rather than as the missing catalogue it
+                        // actually is.
+                        self.last_note =
+                            "no track resolved — the library has titles, not files yet".into();
+                        self.controller.transport.pause();
+                    } else {
+                        let p = plan(DEFAULT_PLAYER, &url, &sink);
+                        for c in &p.setup { eprintln!("bo-suite: {c}"); }
+                        eprintln!("bo-suite: {}", p.play);
+                        self.player.start(&p);
+                    }
+                }
+                Request::Stop => self.player.stop_now(),
+                Request::ReleaseRoute => self.player.release_route("sh"),
+            }
+        }
+        if let Some(state) = self.player.shared.take_state() {
+            if let State::Failed(why) = state {
+                // The player's own words. "Playback failed" tells nobody
+                // anything; "Failed to open audio device" tells them
+                // everything.
+                self.last_note = why;
+                self.controller.transport.pause();
+            }
+        }
+        if self.player.shared.take_ended() {
+            // A track that finished is not a track that was stopped — only
+            // this advances anything, or pausing would skip.
+            self.controller.transport.pause();
+        }
+        if !self.last_note.is_empty() {
+            eprintln!("bo-suite: {}", std::mem::take(&mut self.last_note));
+        }
     }
 }
 
@@ -39,6 +96,7 @@ impl eframe::App for App {
             let adaptive = Adaptive::detect(ctx);
             self.controller.ui(ui, &adaptive);
         });
+        self.pump_playback();
     }
 }
 

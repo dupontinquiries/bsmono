@@ -18,6 +18,7 @@ pub mod dial;
 pub mod channel;
 pub mod tags;
 pub mod outputs;
+pub mod playback;
 pub mod sources;
 pub mod fileproc;
 pub mod shell_bits;
@@ -377,6 +378,18 @@ pub struct Controller {
     pub device_selector: crate::outputs::DeviceSelector,
     /// The route the user last committed; the host applies it.
     pub pending_route: Option<crate::settings_page::Route>,
+    /// What the host should do about audio, drained like the other pending
+    /// fields. A COMMAND rather than a `Player` on the controller: this
+    /// view is built and tested without a process table, and putting a
+    /// child process on it would end that.
+    pub pending_playback: Option<crate::playback::Request>,
+    /// The route audio is currently going to, so a track change does not
+    /// rebuild a combine sink that has not changed.
+    pub audio_sink: crate::playback::Sink,
+    /// The file the transport would play. Set by whatever resolves a track
+    /// to something on disk; empty until then, and empty is honest — see
+    /// `now_playing_url`.
+    pub track_url: String,
     /// The rating the user last set; the host applies it and echoes back
     /// through `confirm_rating`. Same shape as `pending_route` — this view
     /// owns no library.
@@ -494,6 +507,9 @@ impl Controller {
             open_tag: None,
             device_selector: Default::default(),
             pending_route: None,
+            pending_playback: None,
+            audio_sink: crate::playback::Sink::Default,
+            track_url: String::new(),
             pending_source: None,
             pending_rating: None,
             active_device_url: String::new(),
@@ -788,6 +804,12 @@ impl Controller {
             if ui.add_enabled(self.sinks.can_combine(),
                 egui::Button::new(self.sinks.combine_label())).clicked() {
                 self.pending_route = self.sinks.route();
+                // Audio follows the picker in the same act. Leaving them to
+                // be connected by the host is how the UI ends up showing a
+                // route the sound is not going to.
+                if let Some(r) = self.pending_route.clone() {
+                    self.set_audio_route(&r);
+                }
             }
         }
         // INPUT SOURCES, beside the output routing they belong with. sources_ui
@@ -1629,7 +1651,91 @@ impl Controller {
         // The engine's own gates decide in Auto; this only says which mode.
         crate::anc::anc_chip(ui, &mut self.anc, &mut self.a11y, c);
         if self.now.active() { ui.label(self.now.line()); }
+        // THE PLAY BUTTON NOW MAKES A SOUND. `transport_ui` has always
+        // flipped `playing` and returned a seek target, and nothing in the
+        // tree opened an audio device — so the control was a picture of a
+        // transport. The request is queued for the host to perform; see
+        // `playback::Request` on why this view does not own a process.
+        let was_playing = self.transport.playing;
         crate::transport::transport_ui(ui, &mut self.transport, c);
+        if self.transport.playing != was_playing {
+            self.pending_playback = Some(if self.transport.playing {
+                crate::playback::Request::Play {
+                    url: self.now_playing_url(),
+                    sink: self.audio_sink.clone(),
+                }
+            } else {
+                crate::playback::Request::Stop
+            });
+        }
+    }
+
+    /// What to play. The queue's head, or the current track.
+    ///
+    /// A stub in the sense that this app has no resolver from a track id to
+    /// a file yet — the library holds titles and tags, not paths. Named and
+    /// EMPTY rather than fabricated: an invented path makes the player fail
+    /// with "no such file", which reads as a broken player rather than as a
+    /// missing catalogue.
+    pub fn now_playing_url(&self) -> String {
+        self.track_url.clone()
+    }
+
+    /// Point playback at a route, releasing the previous one's resources.
+    ///
+    /// Called when the picker commits, not per track: a combine sink torn
+    /// down between two tracks on the same speakers is a gap of silence and
+    /// a rebuild for nothing.
+    pub fn set_audio_route(&mut self, route: &crate::settings_page::Route) {
+        let next = crate::playback::sink_of(route);
+        if next == self.audio_sink {
+            return;
+        }
+        self.audio_sink = next;
+        self.pending_playback = Some(crate::playback::Request::ReleaseRoute);
+    }
+}
+
+#[cfg(test)]
+mod playback_seam_tests {
+    use super::*;
+    use crate::playback::{Request, Sink};
+    use crate::settings_page::Route;
+
+    fn app() -> Controller {
+        Controller::new(vec![Device { name: "Living Room".into(), volume: 50,
+                                      playing: false }], vec![])
+    }
+
+    #[test]
+    fn committing_a_route_points_audio_at_it_in_the_same_act() {
+        // Leaving the picker and the audio to be connected by the host is
+        // how the UI ends up showing a route the sound is not going to.
+        let mut c = app();
+        c.set_audio_route(&Route::MultiRoom(vec!["AA".into(), "BB".into()]));
+        assert_eq!(c.audio_sink, Sink::Many(vec!["AA".into(), "BB".into()]));
+        assert_eq!(c.pending_playback, Some(Request::ReleaseRoute),
+                   "the previous route's resources were never given up");
+    }
+
+    #[test]
+    fn re_committing_the_same_route_does_not_rebuild_the_sink() {
+        // A combine sink torn down and rebuilt between two tracks on the
+        // same speakers is a gap of silence for nothing.
+        let mut c = app();
+        c.set_audio_route(&Route::Bluetooth("AA".into()));
+        c.pending_playback = None;
+        c.set_audio_route(&Route::Bluetooth("AA".into()));
+        assert_eq!(c.pending_playback, None, "an unchanged route asked for a rebuild");
+    }
+
+    #[test]
+    fn nothing_is_requested_until_something_actually_changes() {
+        // The request field is drained by the host; a view that sets it
+        // every frame makes the host restart the track sixty times a
+        // second.
+        let c = app();
+        assert_eq!(c.pending_playback, None);
     }
 }
 
