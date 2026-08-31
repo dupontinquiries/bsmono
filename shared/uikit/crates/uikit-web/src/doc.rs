@@ -540,6 +540,41 @@ pub enum PageAction {
     OpenIsland { tag: String, src: String },
 }
 
+/// What the caller wants from a render pass beyond drawing it.
+///
+/// The reason this exists is cold-glove mode. Steering a page by tilting
+/// the phone needs two things a plain draw cannot give: a LIST of what can
+/// be aimed at, with where each thing is on screen, and a way to activate
+/// one WITHOUT a pointer. `a11y::A11yScene` already collects the first for
+/// voice control and `glove::Ratchet` already turns tilt into steps between
+/// them — what was missing is that a rendered page registered nothing, so
+/// glove mode over a web page had nothing to snap to.
+///
+/// Registering here rather than in the app is what makes it work for every
+/// page: the renderer is the only thing that knows where a link ended up.
+#[derive(Default)]
+pub struct PageUi<'a> {
+    /// Collects every actionable node's rect and role. Feed
+    /// `scene.glove_targets()` to glove mode; the ids are `NodeId.0`.
+    pub a11y: Option<&'a mut uikit_egui::a11y::A11yScene>,
+    /// Activate this node this frame, as though it had been clicked.
+    ///
+    /// A separate input rather than a synthesised pointer event: a fake
+    /// click has to land somewhere, and "somewhere" is exactly what a
+    /// person who cannot aim does not have. This addresses the node by
+    /// identity instead.
+    pub activate: Option<NodeId>,
+}
+
+/// Draw a page, and collect what glove mode needs to steer it.
+pub fn render_page_with(ui: &mut egui::Ui, page: &Page, state: &mut FormState,
+                        colors: &uikit_egui::PaletteColors,
+                        io: &mut PageUi<'_>) -> Option<PageAction> {
+    let mut act = None;
+    node_ui(ui, page, &page.root, state, colors, &mut act, None, io);
+    act
+}
+
 /// Draw a page.
 ///
 /// `doc.rs` has had the page model — a tree with forms, fields, images and
@@ -555,18 +590,41 @@ pub enum PageAction {
 /// content.
 pub fn render_page(ui: &mut egui::Ui, page: &Page, state: &mut FormState,
                    colors: &uikit_egui::PaletteColors) -> Option<PageAction> {
-    let mut act = None;
-    node_ui(ui, page, &page.root, state, colors, &mut act, None);
-    act
+    render_page_with(ui, page, state, colors, &mut PageUi::default())
+}
+
+/// Register an actionable node with the a11y scene, so glove mode and voice
+/// can both reach it. One call, so a widget cannot be drawn and forgotten.
+fn note(io: &mut PageUi<'_>, id: NodeId, role: uikit_egui::a11y::Role,
+        label: &str, rect: egui::Rect) {
+    if let Some(scene) = io.a11y.as_deref_mut() {
+        scene.add(u64::from(id.0), uikit_egui::a11y::Semantics::new(role, label),
+                  Some(rect));
+    }
+}
+
+/// Was this node asked to activate this frame?
+///
+/// Taken, not peeked: an activation that stayed set would fire again every
+/// frame, which for a submit button is the same form posted sixty times a
+/// second.
+fn activated(io: &mut PageUi<'_>, id: NodeId) -> bool {
+    if io.activate == Some(id) {
+        io.activate = None;
+        true
+    } else {
+        false
+    }
 }
 
 /// The form a node is inside, so a submit button knows what to submit.
 ///
 /// Threaded down rather than looked up: a `find_parent` walk per button is
 /// O(n) per frame per button, and the information is free on the way in.
+#[allow(clippy::too_many_arguments)]
 fn node_ui(ui: &mut egui::Ui, page: &Page, node: &Node, state: &mut FormState,
            colors: &uikit_egui::PaletteColors, act: &mut Option<PageAction>,
-           form: Option<NodeId>) {
+           form: Option<NodeId>, io: &mut PageUi<'_>) {
     match &node.kind {
         Kind::Text(t) => {
             if t.trim().is_empty() { return; }
@@ -577,8 +635,11 @@ fn node_ui(ui: &mut egui::Ui, page: &Page, node: &Node, state: &mut FormState,
             match &node.style.link {
                 Some(href) => {
                     let r = ui.link(rt.color(colors.accent));
+                    note(io, node.id, uikit_egui::a11y::Role::Link, t, r.rect);
                     let r = if href.trim().is_empty() { r } else { r.on_hover_text(href) };
-                    if r.clicked() { *act = Some(PageAction::Follow(href.clone())); }
+                    if r.clicked() || activated(io, node.id) {
+                        *act = Some(PageAction::Follow(href.clone()));
+                    }
                 }
                 None => { ui.label(rt.color(colors.text)); }
             }
@@ -607,19 +668,21 @@ fn node_ui(ui: &mut egui::Ui, page: &Page, node: &Node, state: &mut FormState,
         Kind::Island { tag, src } => {
             let label = format!("[{tag}]{}", if src.is_empty() { String::new() }
                                              else { format!(" {src}") });
-            if ui.button(egui::RichText::new(label).small()).clicked() {
+            let r = ui.button(egui::RichText::new(&label).small());
+            note(io, node.id, uikit_egui::a11y::Role::Button, &label, r.rect);
+            if r.clicked() || activated(io, node.id) {
                 *act = Some(PageAction::OpenIsland { tag: tag.clone(), src: src.clone() });
             }
         }
 
         Kind::Field { name, kind } => {
-            field_ui(ui, page, node, name, kind, state, colors, act, form);
+            field_ui(ui, page, node, name, kind, state, colors, act, form, io);
         }
 
         Kind::Form { .. } => {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 for c in &node.children {
-                    node_ui(ui, page, c, state, colors, act, Some(node.id));
+                    node_ui(ui, page, c, state, colors, act, Some(node.id), io);
                 }
             });
         }
@@ -631,7 +694,7 @@ fn node_ui(ui: &mut egui::Ui, page: &Page, node: &Node, state: &mut FormState,
                     for cell in &row.children {
                         ui.horizontal_wrapped(|ui| {
                             for c in &cell.children {
-                                node_ui(ui, page, c, state, colors, act, form);
+                                node_ui(ui, page, c, state, colors, act, form, io);
                             }
                         });
                     }
@@ -645,7 +708,7 @@ fn node_ui(ui: &mut egui::Ui, page: &Page, node: &Node, state: &mut FormState,
         Kind::Row | Kind::Cell => {
             ui.horizontal_wrapped(|ui| {
                 for c in &node.children {
-                    node_ui(ui, page, c, state, colors, act, form);
+                    node_ui(ui, page, c, state, colors, act, form, io);
                 }
             });
         }
@@ -663,7 +726,7 @@ fn node_ui(ui: &mut egui::Ui, page: &Page, node: &Node, state: &mut FormState,
                     if let Kind::Text(t) = &c.kind {
                         ui.label(egui::RichText::new(t).size(size).strong().color(colors.text));
                     } else {
-                        node_ui(ui, page, c, state, colors, act, form);
+                        node_ui(ui, page, c, state, colors, act, form, io);
                     }
                 }
             });
@@ -673,7 +736,7 @@ fn node_ui(ui: &mut egui::Ui, page: &Page, node: &Node, state: &mut FormState,
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("• ").color(colors.text_weak));
                 for c in &node.children {
-                    node_ui(ui, page, c, state, colors, act, form);
+                    node_ui(ui, page, c, state, colors, act, form, io);
                 }
             });
         }
@@ -682,7 +745,7 @@ fn node_ui(ui: &mut egui::Ui, page: &Page, node: &Node, state: &mut FormState,
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("▏").color(colors.accent_soft));
                 for c in &node.children {
-                    node_ui(ui, page, c, state, colors, act, form);
+                    node_ui(ui, page, c, state, colors, act, form, io);
                 }
             });
         }
@@ -694,7 +757,7 @@ fn node_ui(ui: &mut egui::Ui, page: &Page, node: &Node, state: &mut FormState,
                         ui.label(egui::RichText::new(t).monospace()
                             .background_color(colors.bg_raised).color(colors.text));
                     } else {
-                        node_ui(ui, page, c, state, colors, act, form);
+                        node_ui(ui, page, c, state, colors, act, form, io);
                     }
                 }
             });
@@ -706,12 +769,12 @@ fn node_ui(ui: &mut egui::Ui, page: &Page, node: &Node, state: &mut FormState,
             // on one line.
             if node.kind == Kind::Body {
                 for c in &node.children {
-                    node_ui(ui, page, c, state, colors, act, form);
+                    node_ui(ui, page, c, state, colors, act, form, io);
                 }
             } else {
                 ui.horizontal_wrapped(|ui| {
                     for c in &node.children {
-                        node_ui(ui, page, c, state, colors, act, form);
+                        node_ui(ui, page, c, state, colors, act, form, io);
                     }
                 });
             }
@@ -722,7 +785,7 @@ fn node_ui(ui: &mut egui::Ui, page: &Page, node: &Node, state: &mut FormState,
 #[allow(clippy::too_many_arguments)]
 fn field_ui(ui: &mut egui::Ui, page: &Page, node: &Node, name: &str, kind: &FieldKind,
             state: &mut FormState, colors: &uikit_egui::PaletteColors,
-            act: &mut Option<PageAction>, form: Option<NodeId>) {
+            act: &mut Option<PageAction>, form: Option<NodeId>, io: &mut PageUi<'_>) {
     match kind {
         // NOT DRAWN, and that is the whole point of the variant. A hidden
         // field still submits — `submit` collects it — and drawing it would
@@ -736,24 +799,42 @@ fn field_ui(ui: &mut egui::Ui, page: &Page, node: &Node, name: &str, kind: &Fiel
                 .hint_text(placeholder.as_str())
                 .password(pw)
                 .desired_width(180.0);
-            if ui.add(edit).changed() {
+            let r = ui.add(edit);
+            note(io, node.id, uikit_egui::a11y::Role::TextField, placeholder, r.rect);
+            // Activating a FIELD focuses it; there is nothing to press. A
+            // glove-mode user still needs the keyboard (or voice) to fill
+            // it, and focusing is the part aiming was in the way of.
+            if activated(io, node.id) { r.request_focus(); }
+            if r.changed() {
                 state.set(node.id, v);
             }
         }
 
         FieldKind::TextArea => {
             let mut v = state.value(page, node.id);
-            if ui.add(egui::TextEdit::multiline(&mut v).desired_rows(3)).changed() {
+            let r = ui.add(egui::TextEdit::multiline(&mut v).desired_rows(3));
+            note(io, node.id, uikit_egui::a11y::Role::TextField, name, r.rect);
+            if activated(io, node.id) { r.request_focus(); }
+            if r.changed() {
                 state.set(node.id, v);
             }
         }
 
         FieldKind::Checkbox => {
             let mut c = state.checked(node.id);
+            // Toggled by activation as well as by a tap: a checkbox is the
+            // control a gloved hand is least able to hit and most likely to
+            // need — consent boxes gate everything.
+            if activated(io, node.id) {
+                c = !c;
+                state.set_checked(node.id, c);
+            }
             // The label is the field's name when it has one: an unlabelled
             // checkbox is a box you cannot know the meaning of, and the
             // name is the only description the markup gives us here.
-            if ui.checkbox(&mut c, name).changed() {
+            let r = ui.checkbox(&mut c, name);
+            note(io, node.id, uikit_egui::a11y::Role::Toggle, name, r.rect);
+            if r.changed() {
                 state.set_checked(node.id, c);
             }
         }
@@ -773,7 +854,9 @@ fn field_ui(ui: &mut egui::Ui, page: &Page, node: &Node, name: &str, kind: &Fiel
 
         FieldKind::Submit { label } => {
             let text = if label.trim().is_empty() { "Submit" } else { label.as_str() };
-            if ui.button(text).clicked() {
+            let r = ui.button(text);
+            note(io, node.id, uikit_egui::a11y::Role::Button, text, r.rect);
+            if r.clicked() || activated(io, node.id) {
                 // Only inside a form. A submit button outside one submits
                 // nothing, which is what a browser does — and inventing a
                 // target would post the page's fields somewhere nobody

@@ -286,6 +286,128 @@ mod tests {
             assert_eq!(act, Some(PageAction::Follow("/next".into())));
         }
 
+        /// COLD-GLOVE MODE OVER A WEB PAGE.
+        ///
+        /// The accessibility case this exists for: someone outdoors in
+        /// gloves who cannot aim at a link. Every piece was already here —
+        /// `glove::Ratchet` turns tilt into steps, `a11y::A11yScene`
+        /// collects targets, `Cursor::step` moves between them — and a
+        /// rendered page registered NOTHING, so there was nothing to steer
+        /// to. These tests are the proof that the chain now closes.
+        mod glove {
+            use super::*;
+            use uikit_egui::a11y::A11yScene;
+            use uikit_web::doc::PageUi;
+
+            const PAGE: &str = "<p><a href=\"/one\">first link</a></p>\
+                <p><a href=\"/two\">second link</a></p>\
+                <form action=\"/go\"><input type=\"checkbox\" name=\"agree\">\
+                <input type=\"submit\" value=\"Continue\"></form>";
+
+            /// Render once and hand back what glove mode can aim at.
+            fn targets(p: &Probe, page: &uikit_web::doc::Page, st: &mut uikit_web::doc::FormState)
+                -> Vec<uikit_egui::glove::Target> {
+                let c = p.colors();
+                let mut scene = A11yScene::new();
+                scene.begin_frame();
+                let mut io = PageUi { a11y: Some(&mut scene), activate: None };
+                p.frame(|ui| uikit_web::doc::render_page_with(ui, page, st, &c, &mut io));
+                scene.glove_targets()
+            }
+
+            #[test]
+            fn a_rendered_page_offers_its_actionable_parts_as_glove_targets() {
+                // Links, the checkbox and the submit — and NOT the prose,
+                // because a cursor that snaps to paragraphs is a cursor
+                // that never reaches the link between them.
+                let p = Probe::default();
+                let page = uikit_web::doc::parse_page(PAGE);
+                let mut st = uikit_web::doc::FormState::default();
+                let ts = targets(&p, &page, &mut st);
+                let labels: Vec<&str> = ts.iter().map(|t| t.label.as_str()).collect();
+                assert!(labels.contains(&"first link"), "{labels:?}");
+                assert!(labels.contains(&"second link"), "{labels:?}");
+                assert!(labels.contains(&"Continue"), "{labels:?}");
+                assert_eq!(ts.len(), 4, "expected 2 links, a checkbox and a submit: {labels:?}");
+                // Every target has somewhere to be, or the cursor cannot
+                // travel to it.
+                assert!(ts.iter().all(|t| t.at.1 > 0.0), "a target has no position: {ts:?}");
+            }
+
+            #[test]
+            fn stepping_the_cursor_walks_the_page_and_activating_follows_the_link() {
+                // The whole gesture, without a pointer: step to a target,
+                // activate it by id, get the navigation.
+                let p = Probe::default();
+                let c = p.colors();
+                let page = uikit_web::doc::parse_page(PAGE);
+                let mut st = uikit_web::doc::FormState::default();
+                let ts = targets(&p, &page, &mut st);
+
+                let mut cur = uikit_egui::glove::GloveCursor::default();
+                let first = cur.step(&ts, 1).expect("nothing to step to");
+                let second = cur.step(&ts, 1).expect("the cursor did not move on");
+                assert_ne!(first, second, "stepping stayed on the same target");
+
+                // Activate whatever is snapped, by identity — a fake click
+                // has to land somewhere, and "somewhere" is what a person
+                // who cannot aim does not have.
+                let id: u32 = second.parse().expect("target ids are node ids");
+                let mut scene = A11yScene::new();
+                scene.begin_frame();
+                let mut io = PageUi {
+                    a11y: Some(&mut scene),
+                    activate: Some(uikit_web::doc::NodeId(id)),
+                };
+                let (_, act) = p.frame(|ui|
+                    uikit_web::doc::render_page_with(ui, &page, &mut st, &c, &mut io));
+                assert!(matches!(act, Some(uikit_web::doc::PageAction::Follow(_))),
+                        "activating a snapped link produced {act:?}");
+            }
+
+            #[test]
+            fn activating_a_checkbox_toggles_it_without_a_tap() {
+                // The control a gloved hand is least able to hit and most
+                // likely to need: consent boxes gate everything.
+                let p = Probe::default();
+                let c = p.colors();
+                let page = uikit_web::doc::parse_page(PAGE);
+                let mut st = uikit_web::doc::FormState::default();
+                let cb = page.fields.iter().copied()
+                    .find(|id| matches!(page.root.find(*id).map(|n| &n.kind),
+                        Some(uikit_web::doc::Kind::Field {
+                            kind: uikit_web::doc::FieldKind::Checkbox, .. })))
+                    .expect("no checkbox");
+                assert!(!st.checked(cb));
+                let mut io = PageUi { a11y: None, activate: Some(cb) };
+                p.frame(|ui| uikit_web::doc::render_page_with(ui, &page, &mut st, &c, &mut io));
+                assert!(st.checked(cb), "activation did not toggle the box");
+            }
+
+            #[test]
+            fn an_activation_fires_once_and_not_every_frame() {
+                // Left set, a submit button posts the same form sixty times
+                // a second. The request is consumed when it is used.
+                let p = Probe::default();
+                let c = p.colors();
+                let page = uikit_web::doc::parse_page(PAGE);
+                let mut st = uikit_web::doc::FormState::default();
+                let cb = page.fields.iter().copied()
+                    .find(|id| matches!(page.root.find(*id).map(|n| &n.kind),
+                        Some(uikit_web::doc::Kind::Field {
+                            kind: uikit_web::doc::FieldKind::Checkbox, .. })))
+                    .unwrap();
+                let mut io = PageUi { a11y: None, activate: Some(cb) };
+                p.frame(|ui| uikit_web::doc::render_page_with(ui, &page, &mut st, &c, &mut io));
+                assert!(st.checked(cb));
+                assert_eq!(io.activate, None, "the request was not consumed");
+                // A second pass with the same (now-cleared) io must not
+                // toggle it back.
+                p.frame(|ui| uikit_web::doc::render_page_with(ui, &page, &mut st, &c, &mut io));
+                assert!(st.checked(cb), "the box toggled twice from one request");
+            }
+        }
+
         #[test]
         fn a_submit_button_outside_a_form_posts_nothing() {
             // What a browser does. Inventing a target would send the page's
