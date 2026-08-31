@@ -5878,3 +5878,44 @@ it is uniformly likely to be anywhere on the curve.
 Constants scoreboard, now six deep: MV rate charge, DICT_MARGIN, mover
 admission gate, PLATE_DZ_DIV, prev gate and intra gate all measured
 wrong; REGION=16 and deblock-strength-2 the only survivors.
+
+### GAIN_GATE swept: it SURVIVES, and the exchange-rate framing is why
+
+Last constant in the default encode path never measured. The L1 win a
+region's gain/offset correction must clear to be worth ~2 wire bytes.
+
+  film w1 (dz32, MS-SSIM)          blackstar (dz32)
+     48  615,594  0.97888            128  318,506  0.98912
+     96  564,694  0.97887            192  305,617  0.98883
+    128  500,790  0.97857            256  302,300  0.98863
+    192  442,053  0.97746
+    256  423,478  0.97612
+    384  408,666  0.97420
+    768  401,875  0.97075
+
+Read as raw quality this says LOWER IS BETTER — gate 96 scores 0.97887
+against 192's 0.97746 on film. That reading is wrong, and it is the
+same mistake as the original PSNR-matched AV1 comparisons: it ignores
+what the bytes could have bought elsewhere. Gate 96 costs 28% more
+bytes for quality available far more cheaply through the quantiser.
+
+Priced as MARGINAL exchange rate against each clip's own dead-zone
+ladder, the picture is unambiguous and identical on both:
+  film       96->128  213,013 KB/pt raise | 128->192 52,916 raise
+             192->256  13,862 KB/pt STOP
+  blackstar  128->192  44,445 KB/pt raise | 192->256 16,585 STOP
+The gate crosses its clip's ladder rate between 192 and 256 on BOTH
+clips. That is a stronger result than "192 scores best": it means 192
+sits where a byte spent on gain correction stops beating a byte spent
+through the quantiser, and the crossover is a property of the tool
+rather than of one clip.
+
+So GAIN_GATE=192 is the only hand-written constant in this codec to
+survive its sweep. Provenance is now recorded at the site, as it is for
+the six that did not.
+
+That closes the default encode path: every constant in it —
+REGION, PLATE_DZ_DIV, prev gate, intra gate, GAIN_GATE, deblock
+strength and mode — has now been swept on at least two content types
+with a metric matched to the artifact, and each carries its numbers in
+a comment. Two survived, five moved.

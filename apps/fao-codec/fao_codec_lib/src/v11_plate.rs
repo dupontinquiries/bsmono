@@ -1265,6 +1265,32 @@ pub fn residual_ledger(frames: &[Yuv420]) -> String {
     )
 }
 
+// SWEPT AND SURVIVES — the only hand-written constant in this codec to
+// do so. The L1 improvement a region's gain/offset correction must
+// clear to be worth its ~2 wire bytes.
+//
+// Both clips (MS-SSIM at dz32) put the crossover at exactly this value.
+// Marginal exchange rate between adjacent gate settings, against each
+// clip's own dead-zone ladder:
+//   film w1 (ladder 27,022 KB per MS-SSIM point)
+//      96 -> 128  213,013 KB/pt  raise: saves bytes far more cheaply
+//     128 -> 192   52,916 KB/pt  raise
+//     192 -> 256   13,862 KB/pt  STOP: now giving up quality too cheaply
+//   blackstar (ladder 24,066)
+//     128 -> 192   44,445 KB/pt  raise
+//     192 -> 256   16,585 KB/pt  STOP
+//
+// The gate crosses its clip's ladder rate between 192 and 256 on BOTH,
+// which is a stronger result than "192 scores best" — it means the
+// value sits where spending a byte on gain correction stops beating
+// spending it through the quantiser, and that crossover is a property
+// of the tool rather than of one clip.
+//
+// Reading the raw numbers alone would have moved it the wrong way:
+// gate 96 scores 0.97887 against 192's 0.97746 on film, so a
+// quality-only comparison says lower is better — while costing 28% more
+// bytes for quality obtainable far cheaper elsewhere. FAO_GAIN_GATE
+// overrides.
 const GAIN_GATE: i64 = 192;
 
 pub fn encode_gop_v3(
@@ -1928,6 +1954,13 @@ pub fn encode_gop_v3_core(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(48);
+    // GAIN_GATE: the L1 improvement a region's gain/offset correction
+    // must clear to be worth its ~2 wire bytes. Last constant in the
+    // default encode path never swept.
+    let gain_gate: i64 = std::env::var("FAO_GAIN_GATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(GAIN_GATE);
     let use_dict = std::env::var("FAO_DICT").is_ok();
     let mut dict: std::collections::HashMap<u32, Vec<(usize, usize, usize)>> =
         std::collections::HashMap::new();
@@ -2274,7 +2307,7 @@ pub fn encode_gop_v3_core(
                         e_cor += ((a * pv + b).clamp(0.0, 255.0) - av).abs() as i64;
                     }
                 }
-                if e_cor + GAIN_GATE >= e_raw {
+                if e_cor + gain_gate >= e_raw {
                     continue;
                 }
                 let gi = gy * gw + gx;
