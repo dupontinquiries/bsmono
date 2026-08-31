@@ -50,6 +50,7 @@ mod parity;
 mod patrol;
 mod escalation;
 mod enemy;
+mod gates;
 mod perception;
 mod trials;
 mod trainwatch;
