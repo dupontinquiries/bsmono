@@ -3584,3 +3584,48 @@ rate than the dz knob); 384 overshoots (−0.46 dB). Full suite at 192
 deliberately — the codec's entire remaining gap is rate, and this
 buys it at ~44 MB/dB suite-wide. Session ladder:
 46.5× @ −2.00 dB → 28.9× @ +0.64 dB.
+
+### The plate was never quantized — DCT-coded plate + 3-median MV predictor
+
+Two findings from the byte-split diagnostic, in order of size.
+
+1. MV predictor: the mean-of-two (left, top) replaced by a true
+   3-neighbour median (left, top, top-right) with absent neighbours
+   contributing NOTHING rather than a spurious zero (a zero-filled
+   mean biases every edge region's delta). Bit-identical
+   reconstruction, −0.14% shotB / −0.25% shot 9. Free.
+   (Investigation started from a wrong hypothesis — a zero-MV flag to
+   avoid paying 2 bytes for stationary regions — which the encoder
+   already had as the nz bitmap. 38% of shotB's prev-mode MVs are
+   exactly zero and already cost 1 bit each; the 186 KB is real
+   motion.)
+
+2. THE PLATE WAS THE ONE SURFACE NEVER QUANTIZED: raw zstd'd pixels,
+   33% of the hard shot and 42% of the quiet one, paying full entropy
+   for grain the dead zone discards everywhere else. Now coded
+   through the same residual path as every frame (predicted from flat
+   gray), best-of against raw zstd.
+
+   The first version reported a 15× plate shrink at BIT-IDENTICAL
+   PSNR — impossible, and the tell: it counted the coded size while
+   still predicting from the UNQUANTIZED plate. Accounting fiction
+   the decoder could never reproduce. Fixed by adopting the decoded
+   plate as the actual reference; all numbers below are post-fix.
+
+   Plate dead zone swept on the FULL SUITE (three complete 19-shot
+   runs, CSVs in docs/):
+     raw plate  : 28.61 MB @ 33.97 / 0.942  (28.9×, +0.64 dB)
+     plate dz/4 : 20.38 MB @ 33.43 / 0.937  (20.6×, +0.10 dB) 15.4 MB/dB
+     plate dz/8 : 20.92 MB @ 33.58 / 0.938  (21.2×, +0.25 dB) 19.6 MB/dB
+     plate dz/16: 21.79 MB @ 33.62 / 0.939  (22.0×, +0.29 dB) 19.8 MB/dB
+   CHOSEN dz/8: the knee — near-best exchange rate, and the cheapest
+   point still holding a quality lead over the AV1 anchor. −26.9%
+   bytes for −0.39 dB against the raw-plate generation; the largest
+   single rate move of the session.
+
+   Structural bonus beyond this clip: the plate is also the CITATION
+   currency. A canonical that costs 7× less to transmit moves the
+   library break-even from ~4 citing takes toward ~1–2, which is the
+   economics the whole 3D/library arc depends on.
+
+Session ladder: 46.5× @ −2.00 dB → 21.2× @ +0.25 dB.

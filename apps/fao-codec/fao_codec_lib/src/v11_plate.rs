@@ -1231,7 +1231,72 @@ pub fn encode_gop_v3(
     plate_raw.extend_from_slice(&plate.y);
     plate_raw.extend_from_slice(&plate.u);
     plate_raw.extend_from_slice(&plate.v);
-    let plate_bytes = zstd::encode_all(plate_raw.as_slice(), 19).map(|c| c.len()).unwrap_or(plate_raw.len());
+    // The plate ships DCT-coded through the same residual path as
+    // every frame, predicted from flat gray — not as raw zstd'd
+    // pixels. The byte-split diagnostic made the anomaly obvious: the
+    // plate was 33% of the hard shot and 42% of the quiet one while
+    // being the ONE surface never quantized, so it was paying full
+    // entropy for grain the dead zone discards everywhere else. Same
+    // dead zone as the frames keeps the plate's fidelity matched to
+    // what the residual coder can actually exploit; best-of against
+    // raw zstd keeps it safe when the transform loses (tiny plates).
+    const PLATE_DZ_DIV: f32 = 8.0;
+    let mut plate_coded = plate.clone();
+    let plate_bytes = {
+        let zstd_len = zstd::encode_all(plate_raw.as_slice(), 19)
+            .map(|c| c.len())
+            .unwrap_or(plate_raw.len());
+        let gray = vec![128u8; plate.w * plate.h * 3];
+        let mut plate444 = Vec::with_capacity(plate.w * plate.h * 3);
+        for y in 0..plate.h {
+            for x in 0..plate.w {
+                plate444.push(plate.y[y * plate.w + x]);
+                plate444.push(plate.u[(y / 2) * (plate.w / 2) + x / 2]);
+                plate444.push(plate.v[(y / 2) * (plate.w / 2) + x / 2]);
+            }
+        }
+        // The plate is a REFERENCE, not an output frame: every future
+        // frame predicts from it, so its errors propagate while a
+        // frame's errors die with the frame. It therefore gets a
+        // FINER dead zone than the frames. Ratio swept on the FULL
+        // SUITE (dz/4, dz/8, dz/16 — each a complete 19-shot run):
+        //   dz/4 : 20.38 MB @ 33.43  (15.4 MB traded per dB lost)
+        //   dz/8 : 20.92 MB @ 33.58  (19.6 MB per dB)  <- chosen
+        //   dz/16: 21.79 MB @ 33.62  (19.8 MB per dB, but +0.9 MB
+        //          for +0.04 dB over dz/8 — past the knee)
+        // dz/8 sits at the knee: nearly the best exchange rate and
+        // the cheapest point that still holds a quality lead over the
+        // AV1 anchor (+0.25 dB).
+        let plate_opts = ResidualOpts {
+            dead_zone: (opts.dead_zone / PLATE_DZ_DIV).max(1.0),
+            ..opts.clone()
+        };
+        match residual::encode(&gray, &plate444, plate.w, plate.h, &plate_opts) {
+            Some(t) if t.len() < zstd_len => {
+                // CRITICAL: adopt the DECODED plate. Counting the coded
+                // size while still predicting from the unquantized
+                // plate would be accounting fiction — the decoder never
+                // has those pixels. (First version did exactly that and
+                // reported a 15x plate shrink at bit-identical PSNR,
+                // which is impossible and was the tell.)
+                let dec = residual::apply(gray.clone(), &t, plate.w, plate.h);
+                for y in 0..plate.h {
+                    for x in 0..plate.w {
+                        let i = (y * plate.w + x) * 3;
+                        plate_coded.y[y * plate.w + x] = dec[i];
+                        if y % 2 == 0 && x % 2 == 0 {
+                            let ci = (y / 2) * (plate.w / 2) + x / 2;
+                            plate_coded.u[ci] = dec[i + 1];
+                            plate_coded.v[ci] = dec[i + 2];
+                        }
+                    }
+                }
+                t.len()
+            }
+            _ => zstd_len,
+        }
+    };
+    let plate = &plate_coded;
 
     let mut out_frames = Vec::with_capacity(frames.len());
     let mut recon: Vec<Yuv420> = Vec::with_capacity(frames.len());
@@ -1274,6 +1339,9 @@ pub fn encode_gop_v3(
                             } else {
                                 eprintln!("mvok");
                             }
+                        }
+                        if std::env::var("FAO_MVZ_DEBUG").is_ok() {
+                            eprintln!("{}", if mv == (0, 0) { "mvzero" } else { "mvnz" });
                         }
                         modes[gy * gw + gx] = 1;
                         mvs.push(mv);
@@ -1536,13 +1604,40 @@ pub fn encode_gop_v3(
                         continue;
                     }
                     nz[idx / 8] |= 1 << (idx % 8);
-                    // Median-of-neighbors prediction (left, top; 0 when absent).
-                    let left = if gx > 0 { grid[gi - 1].unwrap_or((0, 0)) } else { (0, 0) };
-                    let top = if gy > 0 { grid[gi - gw].unwrap_or((0, 0)) } else { (0, 0) };
-                    let pred = (
-                        ((left.0 as i32 + top.0 as i32) / 2) as i8,
-                        ((left.1 as i32 + top.1 as i32) / 2) as i8,
-                    );
+                    // Predictor: true median of three (left, top,
+                    // top-right) with fallback, replacing the mean of
+                    // (left, top). H.264/HEVC use the 3-median because a
+                    // mean is dragged by ONE outlier neighbour — at the
+                    // boundary between a panning background and a moving
+                    // subject, exactly where MVs are dense. Absent
+                    // neighbours contribute nothing rather than a
+                    // spurious zero (a zero-filled mean biases every
+                    // edge region's delta by half the real motion).
+                    let mut cand: Vec<(i8, i8)> = Vec::with_capacity(3);
+                    if gx > 0 {
+                        if let Some(v) = grid[gi - 1] { cand.push(v); }
+                    }
+                    if gy > 0 {
+                        if let Some(v) = grid[gi - gw] { cand.push(v); }
+                    }
+                    if gy > 0 && gx + 1 < gw {
+                        if let Some(v) = grid[gi - gw + 1] { cand.push(v); }
+                    }
+                    let pred = match cand.len() {
+                        0 => (0i8, 0i8),
+                        1 => cand[0],
+                        2 => (
+                            ((cand[0].0 as i32 + cand[1].0 as i32) / 2) as i8,
+                            ((cand[0].1 as i32 + cand[1].1 as i32) / 2) as i8,
+                        ),
+                        _ => {
+                            let mut xs = [cand[0].0, cand[1].0, cand[2].0];
+                            let mut ys = [cand[0].1, cand[1].1, cand[2].1];
+                            xs.sort_unstable();
+                            ys.sort_unstable();
+                            (xs[1], ys[1])
+                        }
+                    };
                     mv_deltas.push((mv.0.wrapping_sub(pred.0)) as u8);
                     mv_deltas.push((mv.1.wrapping_sub(pred.1)) as u8);
                 }
