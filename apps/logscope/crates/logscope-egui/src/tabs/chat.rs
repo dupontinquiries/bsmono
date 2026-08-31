@@ -8266,7 +8266,7 @@ if let Some(msg) = self.error_banner.clone() {
                             // next one — for an unattended run left going for an hour, "what is it
                             // doing and how long has it been" needs a fixed place to be answered.
                             // Rows rather than a sentence: see `runcard`.
-                            if let Some(card) = self.agent_run.as_ref().map(|r| r.card()) {
+                            if let Some(card) = self.agent_run.as_ref().map(|r| r.run_state()) {
                                 egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8),
                                     inner_margin: egui::Margin::same(theme::PAD_SM),
                                     outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() },

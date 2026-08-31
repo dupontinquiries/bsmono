@@ -2783,11 +2783,16 @@ impl AgentRun {
     pub fn events(&self) -> &[FileEvent] { self.ws.events() }
     pub fn plan(&self) -> &Plan { &self.plan }
 
-    /// A snapshot for the ACTIVE THREAD card — see `runcard`.
+    /// A snapshot of what this run is doing, for the ACTIVE THREAD card — see `runcard`.
+    ///
+    /// `run_state` rather than `card`: `theme::card` already exists and draws a framed panel, so a
+    /// second `card` that returns data instead of drawing anything is two different ideas one word
+    /// apart. `dupscan` named the collision before it shipped. The method also reads better for
+    /// what it is — it names the thing returned, not the one consumer that happens to want it.
     ///
     /// A plain-data struct rather than a formatted string, so the card's rules (blocked outranks
     /// progress, an unbounded run shows a count not a ratio) are tested without starting a run.
-    pub fn card(&self) -> crate::runcard::RunState {
+    pub fn run_state(&self) -> crate::runcard::RunState {
         let (done, total) = self.plan.progress();
         crate::runcard::RunState {
             task: self.task.clone(),
