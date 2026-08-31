@@ -728,6 +728,16 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
             }
         }
         Station::Hold => {
+            // MASTER ACCESS OPENS DOORS; this puts something behind them.
+            // Weapons and customisation are not gated by the campaign — they
+            // are gated by what you OWN — so a tester with every gate open
+            // still walks into an empty hold. Offered as a PRESS rather than
+            // applied automatically, because a tester with real progress must
+            // not have their bag overwritten by turning a debug flag on.
+            if sb.unrestricted() {
+                rows.push(Row::action("dbg:kit", "STOCK THE BAG (debug kit)"));
+                rows.push(Row::gap());
+            }
             rows.push(Row::heading("THE CHEST — press a slot to withdraw"));
             for (i, slot) in (0..crate::vault::SLOTS).map(|i| (i, sb.vault.peek(i))) {
                 if let Some(it) = slot {
@@ -1100,6 +1110,15 @@ pub fn apply(st: Station, ev: &Event, sb: &mut Shipboard, week: u64) -> Option<O
             })
         }
         Station::Hold => {
+            if id == "dbg:kit" {
+                if !sb.unrestricted() {
+                    return Some(Order::Did("no".into()));
+                }
+                let kit = crate::gear::debug_kit();
+                let n = kit.len();
+                sb.gear.bag = kit;
+                return Some(Order::Did(format!("{n} items in the bag — debug kit")));
+            }
             let out = if let Some(rest) = id.strip_prefix("v:") {
                 rest.parse::<usize>().ok().map(|i| {
                     let mut v = sb.vault.clone();
@@ -2054,6 +2073,52 @@ mod tests {
         // and the split is real in both directions
         assert!(!beyond_sol("earth") && !beyond_sol("pluto"), "Sol is not in Sol");
         assert!(beyond_sol("cybertron") && beyond_sol("glaciem"), "the bridge worlds are in Sol");
+    }
+
+    #[test]
+    fn the_debug_kit_appears_only_under_master_access_and_fits_the_bag() {
+        // Access without inventory is not playtestable: weapons and
+        // customisation are gated by what you OWN, not by the campaign, so a
+        // tester with every gate open still finds an empty hold.
+        let mut sb = board();
+        let plain = build(Station::Hold, &sb, 4);
+        assert!(
+            !plain.rows.iter().any(|r| r.id == "dbg:kit"),
+            "the debug kit is offered on a normal save"
+        );
+        // and pressing it anyway does nothing
+        assert!(matches!(
+            apply(Station::Hold, &Event::Pressed("dbg:kit"), &mut sb, 4),
+            Some(Order::Did(_))
+        ));
+        assert!(sb.gear.bag.is_empty(), "a normal save was stocked");
+
+        sb.debug_ship = true;
+        let armed = build(Station::Hold, &sb, 4);
+        assert!(
+            armed.rows.iter().any(|r| r.id == "dbg:kit"),
+            "master access did not offer the kit"
+        );
+        apply(Station::Hold, &Event::Pressed("dbg:kit"), &mut sb, 4);
+        assert!(!sb.gear.bag.is_empty(), "the kit did not arrive");
+        assert!(
+            sb.gear.bag.len() <= crate::gear::BAG_CAP,
+            "the kit overflows the bag ({} > {}) — the tail would be dropped silently",
+            sb.gear.bag.len(),
+            crate::gear::BAG_CAP
+        );
+        // a spread, not six of the same thing: the attunement ring needs
+        // different elements to be worth testing at all
+        let codes: std::collections::HashSet<String> =
+            sb.gear.bag.iter().map(|i| i.code()).collect();
+        assert_eq!(codes.len(), sb.gear.bag.len(), "the kit contains duplicates");
+        let weapons = sb
+            .gear
+            .bag
+            .iter()
+            .filter(|i| matches!(i, crate::gear::Item::Weapon { .. }))
+            .count();
+        assert!(weapons >= 4, "only {weapons} weapons in a weapons playtest kit");
     }
 
     #[test]

@@ -164,6 +164,38 @@ pub const BAG_CAP: usize = 9;
 /// The bearer wears a suit; the suit's slot budget is the armor rail.
 pub const BODY: Body = Body::HumanSuited;
 
+/// A REPRESENTATIVE SPREAD, for a playtester who owns nothing.
+///
+/// MASTER ACCESS opens every progression gate, and a tester then walks into
+/// empty rooms: weapons and customisation are not gated by the campaign at
+/// all, they are gated by what you OWN, and a fresh save owns nothing. Access
+/// without inventory is not playtestable.
+///
+/// So this is one weapon per delivery verb the game actually differentiates,
+/// spread across elements so the attunement ring (`Element::advantage`) has
+/// something to bite on, plus the first few mods. Exactly `BAG_CAP`, because a
+/// kit that overflows the bag silently drops its tail and the tester never
+/// learns which items they were supposed to have.
+///
+/// Deliberately NOT everything. A tester handed all thirteen verbs tries none
+/// of them properly; nine is a session's worth.
+pub fn debug_kit() -> Vec<Item> {
+    let w = |verb: Verb, element: Element| Item::Weapon { verb, element, from: None };
+    let mut kit = vec![
+        w(Verb::Beam, Element::Electric),
+        w(Verb::Flak, Element::Fire),
+        w(Verb::Pierce, Element::Ice),
+        w(Verb::Grapple, Element::Vine),
+        w(Verb::Vortex, Element::Air),
+        w(Verb::Chain, Element::Water),
+    ];
+    for m in crate::loadout::MODS.iter().take(BAG_CAP - kit.len()) {
+        kit.push(Item::Armor(m));
+    }
+    kit.truncate(BAG_CAP);
+    kit
+}
+
 impl Gear {
     pub fn from_save(armed: &str, worn: &str, bag: &str) -> Gear {
         let mut g = Gear::default();

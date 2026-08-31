@@ -28,7 +28,16 @@ knows it when you read one. A named subset works too
 (`BLACKSTAR_PLAYTEST=the_pluto_line,the_beach_opens`), and a typo is
 reported rather than silently doing nothing.
 
-Or, in-game and without a restart: **SETTINGS → DEBUG → MASTER ACCESS**. A save flag rather than a launch argument, so a tester
+Or, in-game and without a restart: **SETTINGS → DEBUG → MASTER ACCESS**.
+
+Then **THE HOLD → STOCK THE BAG**, which only appears under master
+access. Access alone is not enough: weapons and customisation are not
+gated by the campaign at all — they are gated by what you OWN, and a
+fresh save owns nothing, so a tester with every gate open walks into
+empty rooms. The kit is a bag-sized spread (six weapons across six
+elements, plus mods) offered as a PRESS rather than applied
+automatically, so a tester with real progress does not lose their bag by
+turning a debug flag on. A save flag rather than a launch argument, so a tester
 toggles it mid-session and the save records that it was on. Every gate
 defers to `Shipboard::unrestricted`, one method, so turning it on does
 not leave the tester hitting the next gate they had not thought about.
