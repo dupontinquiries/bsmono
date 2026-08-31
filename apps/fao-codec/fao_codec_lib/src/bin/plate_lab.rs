@@ -1313,6 +1313,38 @@ end_header
             if let Some(ls) = arg_val(&args, "--lookahead") {
                 let thr: u32 = ls.parse().unwrap_or(1024);
                 plate::encode_gop_v3_lookahead(&frames, &motions, &pl, &opts, thr)
+            } else if let Some(sp) = arg_val(&args, "--use-canonical3d") {
+                // The engine-derived path: geometry and camera come from
+                // a .faoscene rather than from inverse rendering. This is
+                // the configuration engine_lab measured at -31% bytes and
+                // +5.5 dB against a self-coded 2D plate.
+                let raw = std::fs::read(&sp)
+                    .unwrap_or_else(|e| die(&format!("read {sp}: {e}")));
+                let scene = fao_codec::engine_scene::read(&raw)
+                    .unwrap_or_else(|e| die(&format!("scene rejected: {e}")));
+                let (fw, fh) = (frames[0].w, frames[0].h);
+                if scene.poses.len() < frames.len() {
+                    // Warn rather than refuse: a short pose stream still
+                    // codes (missing frames fall back to prev-MC), but
+                    // silently coding half a GOP against gray would look
+                    // like the codec underperforming.
+                    eprintln!(
+                        "WARNING: scene has {} poses for {} frames; the tail will code without a canonical",
+                        scene.poses.len(),
+                        frames.len()
+                    );
+                }
+                let mut pred = |fi: usize| scene.predict(fi, fw, fh);
+                let (rep, _) = plate::encode_gop_v3_core(
+                    &frames, &mut pred, 24, frames.len() * 12, &opts, None,
+                );
+                eprintln!(
+                    "canonical3d: {} verts {} tris, {} poses | cited at 24 B + 12 B/frame pose",
+                    scene.mesh.vertices.len(),
+                    scene.mesh.indices.len() / 3,
+                    scene.poses.len()
+                );
+                rep
             } else if args.iter().any(|a| a == "--noplate") {
                 plate::encode_gop_no_plate(&frames, &opts)
             } else if args.iter().any(|a| a == "--plate-route") {

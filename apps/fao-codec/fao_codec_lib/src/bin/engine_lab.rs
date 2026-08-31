@@ -291,6 +291,21 @@ fn main() {
         wire.len()
     );
 
+    // Emit the scene file so the same canonical can drive a real encode
+    // through plate_lab --use-canonical3d, i.e. so the seam is exercised
+    // end-to-end rather than only in-process.
+    if let Some(out) = args.get(1) {
+        let scene = fao_codec::engine_scene::EngineScene {
+            width: w,
+            height: h,
+            mesh: mesh.clone(),
+            poses: poses_b.clone(),
+        };
+        let wire = fao_codec::engine_scene::write(&scene, 10);
+        std::fs::write(out, &wire).expect("write scene");
+        println!("  wrote {} ({} B) — plate_lab --use-canonical3d", out, wire.len());
+    }
+
     // Branch 4: how much of branch 2's win is just "a better predictor"
     // rather than reuse? Cite A's canonical rendered at A's poses while
     // coding B — a deliberately WRONG canonical usage, the control that

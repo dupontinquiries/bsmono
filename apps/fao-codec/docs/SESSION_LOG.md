@@ -4928,3 +4928,49 @@ whole remaining problem. And the one configuration that skips it
 entirely (an engine handing over its own assets and camera, which
 blackstar-rs in this repo could do) is now measured to be worth
 -31% bytes at +5.5 dB.
+
+### engine_scene: the seam, built as a format rather than an integration
+
+engine_lab established that a correct canonical plus correct poses is
+worth -31% bytes AND +5.5 dB, and that the same canonical at wrong
+poses is 21% WORSE than not citing at all. So the whole value sits in
+getting geometry and camera right, and an engine already knows both.
+engine_scene.rs is how it hands them over.
+
+Deliberately a FORMAT PLUS A READER, not an integration: a game should
+not link a video codec to be recordable, and a codec should not track a
+game's types. The `.faoscene` layout (FAOS magic, version, frame count,
+authoring resolution, an embedded mesh_pack blob, then 44 bytes per
+pose) is documented well enough that an engine can emit it with
+std::io::Write and nothing else. Mesh geometry reuses mesh_pack rather
+than adding a second geometry representation to keep in sync.
+
+Two conventions are stated in the docs because an engine author cannot
+infer them from the layout, and both have bitten this codebase before:
+the quaternion is [w,x,y,z] not [x,y,z,w] (the shipped v8 bug where
+every frame rendered behind the camera and silently fell back to source
+video), and focal is in PIXELS at the stated resolution, with the
+fov-to-focal conversion written out.
+
+Design decisions worth their place:
+  * malformed or FUTURE-versioned scenes are REFUSED, not guessed —
+    a v2 layout read as v1 yields plausible geometry at wrong poses,
+    which is exactly the 21%-worse case, so an error is strictly better;
+  * the provider rescales intrinsics, so one capture serves several
+    encode resolutions;
+  * out-of-range frames return neutral gray instead of panicking, and
+    plate_lab WARNS on a short pose stream rather than silently coding
+    the tail against gray (which would read as the codec
+    underperforming rather than as missing input).
+
+plate_lab --use-canonical3d <file> encodes against it, and engine_lab
+now emits one (2,688 B for the 2,048-vert arena plus 24 poses), so the
+seam is exercised end-to-end rather than only in-process.
+
+What is NOT done, stated plainly: nothing in games/blackstar-rs writes
+this file yet. The engine side needs its arena geometry and its
+per-frame camera (replay::Frame already carries car/ball state at 30 Hz
+and cinema() already derives a camera, so the pieces exist) dumped
+behind a debug path. That is a blackstar-rs change, not a codec one,
+and it is the remaining step between this seam and a real
+engine-derived measurement on real footage.

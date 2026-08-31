@@ -159,6 +159,7 @@ pub mod block_store;
 /// See `docs/LIBRARY_MODE.md` for the architectural plan and 
 /// `library.rs` for the Phase 2 scaffold (filesystem-backed catalog,
 /// WebSignature similarity matching, atomic manifest writes).
+pub mod engine_scene;
 pub mod mesh_pack;
 pub mod provenance;
 pub mod library;
