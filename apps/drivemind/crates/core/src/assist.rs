@@ -295,6 +295,105 @@ impl SuggestionBackend for OllamaBackend {
     }
 }
 
+// ── LLM backend (logscope-serve / gpu-gemm netserve) ─────────────────
+
+/// Client for the in-tree wgpu engine's HTTP server (gpu-gemm
+/// `netserve`): `POST /generate?max=N` with the PROMPT AS THE RAW BODY,
+/// auth via `X-API-Key`, reply streamed with chunked transfer encoding.
+/// Same isolation contract as [`OllamaBackend`] — the reply goes through
+/// the same strict parse into the same closed [`ToolAction`] set — but
+/// pointed at the operator's own engine, which on the target hardware
+/// (Asahi/wgpu) is the faster path and keeps the whole loop in-tree.
+pub struct LogscopeBackend {
+    pub host: String,
+    pub key: String,
+    pub max_tokens: usize,
+    pub timeout: std::time::Duration,
+    pub rejected: Vec<String>,
+}
+
+impl LogscopeBackend {
+    pub fn new(host: &str, key: &str) -> Self {
+        Self {
+            host: host.into(),
+            key: key.into(),
+            max_tokens: 1024,
+            timeout: std::time::Duration::from_secs(120),
+            rejected: Vec::new(),
+        }
+    }
+}
+
+/// Decode an HTTP/1.1 chunked-transfer body. Pure; tolerant of chunk
+/// extensions; stops at the terminal 0-chunk or end of input (a
+/// generation cut off mid-stream still yields its prefix, which the
+/// JSON-array extraction upstream may still salvage).
+pub fn dechunk(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < body.len() {
+        // size line up to CRLF
+        let Some(nl) = body[i..].windows(2).position(|w| w == b"\r\n") else {
+            break;
+        };
+        let line = &body[i..i + nl];
+        let hex = line.split(|&b| b == b';').next().unwrap_or(line);
+        let Ok(sz) = usize::from_str_radix(String::from_utf8_lossy(hex).trim(), 16) else {
+            break;
+        };
+        i += nl + 2;
+        if sz == 0 {
+            break;
+        }
+        let end = (i + sz).min(body.len());
+        out.extend_from_slice(&body[i..end]);
+        i = end + 2; // skip trailing CRLF
+    }
+    out
+}
+
+impl SuggestionBackend for LogscopeBackend {
+    fn suggest(
+        &mut self,
+        desyncs: &[DesyncReport],
+        dups: &[DupGroup],
+    ) -> Result<Vec<Suggestion>, String> {
+        let prompt = OllamaBackend::build_prompt(desyncs, dups);
+        let req = format!(
+            "POST /generate?max={} HTTP/1.1\r\nHost: {}\r\nX-API-Key: {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            self.max_tokens,
+            self.host,
+            self.key,
+            prompt.len(),
+            prompt
+        );
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(&self.host)
+            .map_err(|e| format!("connect {}: {e}", self.host))?;
+        stream.set_read_timeout(Some(self.timeout)).ok();
+        stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).map_err(|e| e.to_string())?;
+        let head_end = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|i| i + 4)
+            .unwrap_or(0);
+        let head = String::from_utf8_lossy(&raw[..head_end]).to_lowercase();
+        if head.contains(" 401 ") {
+            return Err("logscope-serve rejected the API key".into());
+        }
+        let body = &raw[head_end..];
+        let text_bytes = if head.contains("transfer-encoding: chunked") {
+            dechunk(body)
+        } else {
+            body.to_vec()
+        };
+        let text = String::from_utf8_lossy(&text_bytes);
+        Ok(OllamaBackend::parse_reply(&text, &mut self.rejected))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +424,15 @@ mod tests {
         assert_eq!(hyg, 1, "differing files trigger a VerifyPair");
         // largest gap first among side-a quick wins
         assert!(s[0].human.contains("f0.pdf"));
+    }
+
+    #[test]
+    fn dechunk_reassembles_and_tolerates_truncation() {
+        let body = b"5\r\nhello\r\n7;ext=1\r\n, world\r\n0\r\n\r\n";
+        assert_eq!(dechunk(body), b"hello, world");
+        // truncated mid-stream: prefix survives
+        let cut = b"5\r\nhello\r\n7\r\n, wo";
+        assert_eq!(dechunk(cut), b"hello, wo");
     }
 
     #[test]

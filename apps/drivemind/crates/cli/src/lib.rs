@@ -675,7 +675,7 @@ fn cmd_desync(rest: &[String]) -> i32 {
 
 fn cmd_suggest(rest: &[String]) -> i32 {
     let (Some(ka), Some(kb)) = (rest.first(), rest.get(1)) else {
-        return err("usage: dvm suggest <key-a> <key-b> [--ollama host:port model] [--store DIR]");
+        return err("usage: dvm suggest <key-a> <key-b> [--logscope host:port key | --ollama host:port model] [--store DIR]");
     };
     let store = store_dir(rest);
     let (a, b) = match (catalog::load(&store, ka), catalog::load(&store, kb)) {
@@ -685,7 +685,23 @@ fn cmd_suggest(rest: &[String]) -> i32 {
     let reps = syncdiff::desync(&a, &b);
     let refs: Vec<&catalog::Catalog> = [&a, &b].to_vec();
     let dups = syncdiff::duplicates(&refs);
-    let suggestions = if let Some(pos) = rest.iter().position(|x| x == "--ollama") {
+    let suggestions = if let Some(pos) = rest.iter().position(|x| x == "--logscope") {
+        // The in-tree wgpu engine (gpu-gemm netserve) — the fast path on
+        // the operator's own hardware. Usage: --logscope host:port key
+        let (Some(host), Some(key)) = (rest.get(pos + 1), rest.get(pos + 2)) else {
+            return err("--logscope needs <host:port> <api-key>");
+        };
+        let mut lb = assist::LogscopeBackend::new(host, key);
+        match assist::SuggestionBackend::suggest(&mut lb, &reps, &dups) {
+            Ok(s) => {
+                for r in &lb.rejected {
+                    eprintln!("REJECTED (model proposed something outside the tool set): {r}");
+                }
+                s
+            }
+            Err(e) => return err(&format!("logscope-serve: {e} (rule backend works offline: drop --logscope)")),
+        }
+    } else if let Some(pos) = rest.iter().position(|x| x == "--ollama") {
         let (Some(host), Some(model)) = (rest.get(pos + 1), rest.get(pos + 2)) else {
             return err("--ollama needs <host:port> <model>");
         };

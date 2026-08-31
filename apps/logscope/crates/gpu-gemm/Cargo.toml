@@ -52,3 +52,6 @@ zerocopy = ["dep:ash", "wgpu/vulkan"]
 # sparse residency: one giant buffer backed by physical blocks via vkQueueBindSparse (the arena's
 # architectural replacement). Gated like zerocopy — pure planner is always on; the binder needs this.
 sparse = ["dep:ash", "wgpu/vulkan"]
+
+[dev-dependencies]
+serde_json = "1"  # independent oracle for jsonmask tests only
