@@ -155,6 +155,11 @@ pub struct DeltaNetState {
     /// [h_v × s × s] head-major; head h's matrix is row-major [S_v rows × S_k cols]:
     /// `s[h*s*s + row*s + col]`, o = S·q contracts over col.
     pub s: Vec<f32>,
+    /// Tokens consumed. A recurrent state cannot SEEK: the decode path asserts its `pos`
+    /// equals this before stepping, which is what turns a trie/fleet prefix-reuse attempt
+    /// on a hybrid model into a named error instead of silently continuing from the wrong
+    /// prefix. `step` increments it.
+    pub next_pos: usize,
 }
 
 impl DeltaNetState {
@@ -162,8 +167,17 @@ impl DeltaNetState {
         DeltaNetState {
             ring: vec![0.0; m.conv_dim() * (m.d_conv - 1)],
             s: vec![0.0; m.state_elems()],
+            next_pos: 0,
         }
     }
+}
+
+/// One layer's dims + host weights, as the loader hands them to the decode path. Weights stay
+/// host-side f32 on purpose: the mixer is CPU-routed (correct-first) and the unit-tested `step`
+/// is the exact code decode runs — a GPU kernel later replaces the call, checked against it.
+pub struct DeltaNetLayerHost {
+    pub dims: DeltaNetDims,
+    pub w: DeltaNetWeights,
 }
 
 fn matvec(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
@@ -280,6 +294,7 @@ pub fn step(m: &DeltaNetDims, w: &DeltaNetWeights, st: &mut DeltaNetState, x: &[
     }
 
     // 7. output projection back to model width.
+    st.next_pos += 1;
     matvec(&w.wout, &out, m.d, m.value_dim())
 }
 

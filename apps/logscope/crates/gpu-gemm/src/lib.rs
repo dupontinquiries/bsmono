@@ -2764,6 +2764,9 @@ pub struct BlockWeights {
     /// means the compressed-latent attention path can run for this layer; the GPU forward it feeds is
     /// already validated against the CPU reference by --gate-mla.
     pub mla: Option<crate::mla::MlaWeightsT>,
+    /// Gated DeltaNet mixer for this layer (hybrid Qwen3.5/3.6): host-side dims + f32 weights,
+    /// consumed by the CPU-routed `block_decode_deltanet`. None = not a recurrent layer.
+    pub deltanet: Option<Box<crate::deltanet::DeltaNetLayerHost>>,
     /// GELU-gated FFN instead of SiLU-gated (Gemma). Per block so a mixed model would still work.
     pub geglu: bool,
     /// Gemma applies a norm to each sublayer's OUTPUT, before the residual add — distinct from the
@@ -7561,6 +7564,11 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// One Llama-style transformer block, fully resident (weights uploaded once,
     /// no intermediate leaves the GPU). `n_heads` splits `d` into attention heads.
     pub fn block_forward(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, t: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        // The PREFILL analogue of the decode-side backstop: model_forward reaches here for every
+        // layer, so an MLA or DeltaNet layer would compute over placeholder q/k/v — neither has a
+        // batch/prefill path yet (MLA is compress-append per position; recurrent state is
+        // sequential by definition), and neither ever will silently.
+        Self::refuse_mla_or_deltanet_on_dense_block(w, "block_forward");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -9846,6 +9854,10 @@ impl Model {
     /// layers decode through block_decode_mla; used by --gate-mla-load to assert the per-block
     /// routing engaged rather than inferring it from the model-level config alone.
     pub fn mla_layers(&self) -> usize { self.layers.iter().filter(|b| b.mla.is_some()).count() }
+    /// How many blocks carry a Gated DeltaNet mixer (recurrent layers of a Qwen3.5/3.6 hybrid).
+    /// Nonzero means decode routes those layers through the CPU-routed block_decode_deltanet and
+    /// the cache MUST come from new_cache_for; used by --gate-deltanet-load.
+    pub fn deltanet_layers(&self) -> usize { self.layers.iter().filter(|b| b.deltanet.is_some()).count() }
 
     /// Fingerprint a few GPU-resident weights (LOGSCOPE_WEIGHT_CHECK=1): downloads small tensors and
     /// prints first values + abs-sums. The same GGUF must produce IDENTICAL lines on every machine —
@@ -10151,18 +10163,22 @@ tensors (block count {} from metadata key '{}.block_count', {} from tensor names
                         nb, acfg.prefix, gguf::block_count_from_tensors(&g));
                 }
             }
-            if ssm > 0 && std::env::var("LOGSCOPE_TRY_RECURRENT").is_err() {
-                let qkv_rows = g.tensor("blk.0.attn_qkv.weight")
-                    .and_then(|t| t.dims.first().copied()).unwrap_or(0);
-                return Err(format!(
-                    "{ssm} of {tot} blocks carry ssm_* tensors — this is a HYBRID RECURRENT model \
-(Gated DeltaNet), not a transformer with an unusual shape. A DeltaNet block reuses the attention \
-projection NAMES for its own q/k/v, so blk.0.attn_qkv here is a {qkv_rows}-row in-projection for the \
-recurrent state, and reading it as a fused attention qkv is what produces the row-count error further \
-down. This engine has no recurrent forward pass, so those {ssm} blocks have nowhere to run — and \
-LOGSCOPE_TRY_UNSUPPORTED_ARCH cannot help, because it trades an unverified SHAPE for possibly-wrong \
-output and here there is no output to be wrong about. LOGSCOPE_TRY_RECURRENT=1 forces it anyway if \
-you want the tensor dump."));
+            if ssm > 0 {
+                // This block used to REFUSE here ("this engine has no recurrent forward pass...").
+                // That stopped being true when block_decode_deltanet landed: recurrent blocks now
+                // load their ssm_* set and decode through the CPU-routed mixer, per-block by tensor
+                // presence, and --gate-deltanet-load proves load + decode + the seek refusal on a
+                // synthetic hybrid. What remains gating a real Qwen3.5/3.6 is the ARCH flag
+                // (supported=false until a real checkpoint runs — LOGSCOPE_TRY_UNSUPPORTED_ARCH is
+                // that door) plus the named full-attention gaps: gated attention (interleaved
+                // per-head q‖gate, sigmoid on the attention output) and IMRoPE sections.
+                static SAID_DN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID_DN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("loader: {ssm} of {tot} block(s) are Gated DeltaNet — the recurrent \
+mixer is CPU-routed (correct-first; one download+upload per recurrent layer per token). Decode \
+positions must be sequential per cache: recurrent state cannot seek, so trie/fleet prefix reuse \
+is refused for this model.");
+                }
             }
         }
         let has_mla_tensors = g.tensor("blk.0.attn_kv_a_mqa.weight").is_some()
@@ -11375,6 +11391,12 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
             // whenever `w.mla` and the latent cache are present, and every dense block fn refuses an
             // MLA layer as a backstop (every_dense_block_refuses_an_mla_layer).
             // DeepSeek-V2-Lite (q_lora_rank=0) ships a REAL attn_q and takes the standard path.
+            // Per-block Gated DeltaNet sniff (Qwen3.5/3.6 hybrids): ssm_* tensors are the
+            // signature — attn_qkv being present says nothing, because a recurrent layer REUSES
+            // that name for its fused q‖k‖v‖(z) projection at DeltaNet dimensions, and reading it
+            // as a transformer's qkv is exactly the fluent-nonsense failure the row check catches.
+            let block_is_deltanet = g.tensor(&format!("blk.{i}.ssm_a")).is_some()
+                || g.tensor(&format!("blk.{i}.ssm_conv1d.weight")).is_some();
             let block_is_mla = g.tensor(&format!("blk.{i}.attn_q.weight")).is_none()
                 && (g.tensor(&format!("blk.{i}.attn_q_a.weight")).is_some()
                     || g.tensor(&format!("blk.{i}.attn_q_a_proj.weight")).is_some()
@@ -11392,7 +11414,7 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
             // Fused Q||K||V projection [d+2kv, d] (mirrors the wgate_up fusion): concatenate the q/k/v
             // weight ROWS then quantize — per-row quant of the concatenation is identical to quantizing
             // each separately (proven bit-exact by --gate-qkv). The bias concatenates the same way.
-            let wqkv = if block_is_mla { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) } else {
+            let wqkv = if block_is_mla || block_is_deltanet { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) } else {
                 // DIVERGENCE GUARD: `block_is_mla` routes MLA blocks to placeholders above, so
                 // reaching the dense fusion with MLA tensors present means the sniff and this check
                 // disagree (e.g. a file shipping BOTH attn_q and attn_q_a). Refuse rather than fuse:
@@ -11515,13 +11537,13 @@ loader assumes. Other families that ship a fused qkv are still unverified");
                 // MLA blocks: placeholders for all four. attn_output DOES exist on MLA checkpoints,
                 // but its input width is n_head*v_head_mla, not attn_dim — lin() would misread it at
                 // the declared dims. The real output projection loads as `mla.o` by its own shape.
-                wq: if block_is_mla { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+                wq: if block_is_mla || block_is_deltanet { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
                     else { lin(&format!("blk.{i}.attn_q.weight"), attn_dim, d, q)?.with_bias(bq) },
-                wk: if block_is_mla { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+                wk: if block_is_mla || block_is_deltanet { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
                     else { lin(&format!("blk.{i}.attn_k.weight"), kv, d, q)?.with_bias(bk) },
-                wv: if block_is_mla { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+                wv: if block_is_mla || block_is_deltanet { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
                     else { lin(&format!("blk.{i}.attn_v.weight"), kv, d, q)?.with_bias(bv) },
-                wo: if block_is_mla { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+                wo: if block_is_mla || block_is_deltanet { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
                     else { lin(&format!("blk.{i}.attn_output.weight"), d, attn_dim, q)? },
                 g2: self.upload(&gemma_norm(&fetch(&format!("blk.{i}.ffn_norm.weight"))
                     .or_else(|_| fetch(&format!("blk.{i}.post_attention_norm.weight")))?, &acfg), 1, d),
@@ -12023,10 +12045,10 @@ scale {} ({}), shared {}, weight applied to {}",
                         } }))
                 } else { None },
                 // Qwen3/3.5 per-head QK-Norm ([head_dim] each), applied before RoPE in the block forward.
-                q_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_q_norm.weight"))?, 1, head_dim)) }
+                q_norm: if has_qk_norm && !block_is_deltanet { Some(self.upload(&fetch(&format!("blk.{i}.attn_q_norm.weight"))?, 1, head_dim)) }
                         else if is_llama4 && !(nope_step > 0 && (i + 1) % nope_step == 0) { Some(self.upload(&vec![1.0f32; head_dim], 1, head_dim)) }
                         else { None },
-                k_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_k_norm.weight"))?, 1, head_dim)) }
+                k_norm: if has_qk_norm && !block_is_deltanet { Some(self.upload(&fetch(&format!("blk.{i}.attn_k_norm.weight"))?, 1, head_dim)) }
                         else if is_llama4 && !(nope_step > 0 && (i + 1) % nope_step == 0) { Some(self.upload(&vec![1.0f32; head_dim], 1, head_dim)) }
                         else { None },
                 nope: nope_step > 0 && (i + 1) % nope_step == 0,
@@ -12069,6 +12091,33 @@ scale {} ({}), shared {}, weight applied to {}",
                 // low-rank factors, and quantizing them is a separate question from quantizing the big
                 // weight matrices. GLM-5.2 (glm-dsa) names the reconstructed dims *_mla; both spellings
                 // of the tensor names are accepted so one loader covers DeepSeek-V3 and GLM.
+                // Gated DeltaNet weight set. fetch()'s missing-tensor error already NAMES the
+                // absent tensor, so an incomplete set fails precisely (unlike MLA, whose optional
+                // assembly needed the post-push check below). validate() then cross-checks every
+                // shape against the ssm.* metadata before anything is trusted.
+                deltanet: if block_is_deltanet {
+                    let dn_dims = crate::deltanet::DeltaNetDims {
+                        d,
+                        s: g.get_u32(&format!("{pfx}.ssm.state_size")).unwrap_or(0) as usize,
+                        h_k: g.get_u32(&format!("{pfx}.ssm.group_count")).unwrap_or(0) as usize,
+                        h_v: g.get_u32(&format!("{pfx}.ssm.time_step_rank")).unwrap_or(0) as usize,
+                        d_conv: g.get_u32(&format!("{pfx}.ssm.conv_kernel")).unwrap_or(0) as usize,
+                    };
+                    dn_dims.validate().map_err(|e| format!("blk.{i} is Gated DeltaNet (ssm_* tensors present) but the {pfx}.ssm.* metadata is unusable: {e}"))?;
+                    let dw = crate::deltanet::DeltaNetWeights {
+                        wqkv: fetch(&format!("blk.{i}.attn_qkv.weight"))?,
+                        wz: fetch(&format!("blk.{i}.attn_gate.weight"))?,
+                        conv: fetch(&format!("blk.{i}.ssm_conv1d.weight"))?,
+                        dt_bias: fetch(&format!("blk.{i}.ssm_dt.bias"))?,
+                        a: fetch(&format!("blk.{i}.ssm_a"))?,
+                        wbeta: fetch(&format!("blk.{i}.ssm_beta.weight"))?,
+                        walpha: fetch(&format!("blk.{i}.ssm_alpha.weight"))?,
+                        norm: fetch(&format!("blk.{i}.ssm_norm.weight"))?,
+                        wout: fetch(&format!("blk.{i}.ssm_out.weight"))?,
+                    };
+                    dw.validate(&dn_dims).map_err(|e| format!("blk.{i} Gated DeltaNet weights refused: {e}"))?;
+                    Some(Box::new(crate::deltanet::DeltaNetLayerHost { dims: dn_dims, w: dw }))
+                } else { None },
                 mla: {
                     let t = |a: &str, b: &str| -> Option<String> {
                         let na = format!("blk.{i}.{a}.weight");
@@ -12562,7 +12611,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
             let (wq, wk, wv) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let (wo, wgate_up, wdown) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let g2 = self.read_tensor(&mut r)?;
-            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None });
+            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None });
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -12680,6 +12729,8 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
         // position), so refuse HERE with the reason rather than 200 lines in with a slice index.
         assert!(m.mla_layers() == 0,
             "model_forward_trace has no MLA path ({} of {} layers are MLA; the trace's dense math would read placeholder weights). Probe MLA models with decode_step — --probe already does — or build the MLA prefill first.", m.mla_layers(), m.n_layers);
+        assert!(m.deltanet_layers() == 0,
+            "model_forward_trace has no recurrent path ({} of {} layers are Gated DeltaNet; the trace's dense math would read placeholder weights). Probe hybrids with decode_step, which routes per layer.", m.deltanet_layers(), m.n_layers);
         let t = ids.len();
         let stat = |v: &[f32]| -> f32 {
             let row = &v[(t - 1) * m.d..t * m.d];
@@ -13439,6 +13490,11 @@ pub struct KvCache {
     /// them: a checkpoint may mix MLA and standard attention layers, and the per-layer routing decides
     /// which is used. For a non-MLA model this is None and nothing about the standard path changes.
     pub mla: Option<crate::mla::MlaCache>,
+    /// Per-layer Gated DeltaNet recurrent states (hybrid Qwen3.5/3.6), allocated by
+    /// `new_cache_for` only when the model has recurrent layers; `None` slots are the
+    /// full-attention layers. Mutex because decode takes &KvCache while the CPU-routed
+    /// mixer must mutate — one uncontended lock per recurrent layer per token.
+    pub deltanet: Option<Vec<Option<std::sync::Mutex<crate::deltanet::DeltaNetState>>>>,
 }
 
 /// int8-quantized KV cache: K/V stored per-row as packed int8 (4x smaller than f32)
@@ -14156,7 +14212,7 @@ impl Gpu {
     pub fn new_cache(&self, n_layers: usize, max_seq: usize, d: usize) -> KvCache {
         KvCache { k: (0..n_layers).map(|_| self.alloc(max_seq, d)).collect(),
                   v: (0..n_layers).map(|_| self.alloc(max_seq, d)).collect(),
-                  mla: None }
+                  mla: None, deltanet: None }
     }
     /// A cache for `m`, adding the compressed MLA side when the model needs it.
     ///
@@ -14196,6 +14252,13 @@ impl Gpu {
             let dm = self.mla_dims(cfg, m.d, m.n_heads, m.base, m.eps);
             c.mla = Some(self.mla_new_cache(m.n_layers, max_seq, &dm));
         }
+        // Gated DeltaNet states: one per recurrent layer, none for full-attention layers.
+        // Zero states are the correct start (empty conv history, empty memory), and the
+        // per-state next_pos guard is what refuses a seek on a recurrent sequence.
+        let dn: Vec<Option<std::sync::Mutex<crate::deltanet::DeltaNetState>>> = m.layers.iter()
+            .map(|b| b.deltanet.as_ref().map(|dl| std::sync::Mutex::new(
+                crate::deltanet::DeltaNetState::new(&dl.dims)))).collect();
+        if dn.iter().any(|x| x.is_some()) { c.deltanet = Some(dn); }
         c
     }
 
@@ -14856,7 +14919,7 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
     }
     /// Promote an int8 prefix cache (first `len` rows) back to f32 for seeding (lossy).
     pub fn promote_cache(&self, q: &QKvCache, len: usize, kv_dim: usize) -> KvCache {
-        let mut c = KvCache { k: vec![], v: vec![], mla: None };
+        let mut c = KvCache { k: vec![], v: vec![], mla: None, deltanet: None };
         for li in 0..q.kq.len() {
             c.k.push(self.dequant_rows(&q.kq[li], &q.ks[li], len, kv_dim));
             c.v.push(self.dequant_rows(&q.vq[li], &q.vs[li], len, kv_dim));
@@ -14927,7 +14990,7 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
     /// One decode block using the int8 KV cache: compute q/k/v (f32), quantize this
     /// token's k/v row into the cache, attend the cache (dequant on the fly).
     fn block_decode_q8(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
-        Self::refuse_mla_on_dense_block(w, "block_decode_q8");
+        Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_q8");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -14951,7 +15014,7 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
     /// matmul, q/k/v sliced from the packed output, then K and V quantized into the int8 cache exactly
     /// as before. Bit-exact to block_decode_q8 (the fusion never changes the values being quantized).
     fn block_decode_q8_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
-        Self::refuse_mla_on_dense_block(w, "block_decode_q8_fused");
+        Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_q8_fused");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -15105,7 +15168,14 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
     /// A panic is not the nice option; it is the only one that is not silent. These fns return
     /// `Tensor`, not `Result`, and the alternative to stopping here is returning the nonsense.
     #[inline]
-    fn refuse_mla_on_dense_block(w: &BlockWeights, block_fn: &str) {
+    fn refuse_mla_or_deltanet_on_dense_block(w: &BlockWeights, block_fn: &str) {
+        if w.deltanet.is_some() {
+            panic!("{block_fn}: this layer is Gated DeltaNet (recurrent) and this is a \
+dense-attention block, which would read placeholder q/k/v weights — a correctly-shaped tensor of \
+nonsense. Route recurrent layers to block_decode_deltanet with a new_cache_for cache, as \
+decode_step_full does. The staged/q8/fleet decode paths do not carry recurrent state and cannot \
+serve hybrid models; this refusal is what keeps that a named error instead of fluent garbage.");
+        }
         if w.mla.is_some() {
             panic!("{block_fn}: this layer carries MLA projections (attn_q_a / attn_kv_a_mqa) and \
 this is a dense-attention block, which would read w.wq/w.wk/w.wv — weights an MLA layer does not \
@@ -15134,6 +15204,29 @@ like a bad model rather than a wiring bug.");
         self.mla_compress_append(&n1, mw, dm, cache, layer, pos);
         let attn = self.mla_attention_step_gpu(&n1, mw, dm, &cache.latent[layer], &cache.rot[layer], pos);
         let x2 = self.add_t(x, &attn);
+        self.ffn_apply(w, &x2, 1, d, eps)
+    }
+
+    /// One Gated DeltaNet block: pre-norm → CPU mixer → residual → the shared FFN path.
+    ///
+    /// CPU-ROUTED ON PURPOSE — the same correct-first bootstrap MoE and MLA used. The normed
+    /// activation comes down, `deltanet::step` runs conv/gates/recurrence on the host — the SAME
+    /// code the module's invariant tests bind, not a transcription of it — and the mixer output
+    /// goes back up for the residual and FFN (`ffn_apply`, so MoE/dense/shared-expert all work
+    /// unchanged). One download+upload per recurrent layer per token; a GPU kernel replaces the
+    /// round-trip only once it can be CHECKED against this path.
+    pub fn block_decode_deltanet(&self, w: &BlockWeights, dl: &crate::deltanet::DeltaNetLayerHost,
+                                 st: &std::sync::Mutex<crate::deltanet::DeltaNetState>,
+                                 x: &Tensor, pos: usize, d: usize, eps: f32) -> Tensor {
+        let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
+        let xh = self.download(&n1);
+        let mut state = st.lock().unwrap();
+        assert!(state.next_pos == pos,
+            "Gated DeltaNet layers are RECURRENT: this state is at position {} but decode asked for position {pos}. Recurrent state cannot seek — positions must be consumed sequentially from 0 per cache, so trie/fleet prefix reuse cannot serve hybrid models. Build a fresh new_cache_for per sequence.", state.next_pos);
+        let y = crate::deltanet::step(&dl.dims, &dl.w, &mut state, &xh, eps);
+        drop(state);
+        let t = self.upload(&y, 1, d);
+        let x2 = self.add_t(x, &t);
         self.ffn_apply(w, &x2, 1, d, eps)
     }
 
@@ -15204,7 +15297,7 @@ like a bad model rather than a wiring bug.");
     }
 
     fn block_decode(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
-        Self::refuse_mla_on_dense_block(w, "block_decode");
+        Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -15251,7 +15344,7 @@ like a bad model rather than a wiring bug.");
     fn block_decode_staged(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor,
             kc: &Tensor, vc: &Tensor, warm: Option<(&Tensor, &Tensor, &Tensor, &Tensor)>, warm_len: usize,
             pos: usize, hot_start: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
-        Self::refuse_mla_on_dense_block(w, "block_decode_staged");
+        Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_staged");
         let base = if w.nope { 0.0 } else { base };
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
@@ -15283,7 +15376,7 @@ like a bad model rather than a wiring bug.");
     fn block_decode_staged_multi(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor,
             kc: &Tensor, vc: &Tensor, warm_blocks: &[(&Tensor, &Tensor, &Tensor, &Tensor, usize)], warm_len: usize,
             pos: usize, hot_start: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
-        Self::refuse_mla_on_dense_block(w, "block_decode_staged_multi");
+        Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_staged_multi");
         let base = if w.nope { 0.0 } else { base };
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
@@ -15356,7 +15449,7 @@ like a bad model rather than a wiring bug.");
     /// so it's bit-exact to roping them separately), v is copied straight into the V-cache row.
     /// Bit-exact to block_decode (--gate-qkv); saves 2 projection + 1 RoPE dispatch/layer.
     fn block_decode_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
-        Self::refuse_mla_on_dense_block(w, "block_decode_fused");
+        Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_fused");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -15419,7 +15512,7 @@ like a bad model rather than a wiring bug.");
     /// so a ring buffer can overwrite an evicted slot with no shifting. `block_decode` is
     /// the special case `slot == rope_pos`, `attend_len == rope_pos+1`.
     fn block_decode_at(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, rope_pos: usize, slot: usize, attend_len: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
-        Self::refuse_mla_on_dense_block(w, "block_decode_at");
+        Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_at");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -15440,7 +15533,7 @@ like a bad model rather than a wiring bug.");
     /// Fused-QKV counterpart of block_decode_at (streaming/ring f32 KV cache). Same as
     /// block_decode_fused but K/V are written at physical `slot` and attention spans `attend_len`.
     fn block_decode_at_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, rope_pos: usize, slot: usize, attend_len: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
-        Self::refuse_mla_on_dense_block(w, "block_decode_at_fused");
+        Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_at_fused");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -15554,14 +15647,22 @@ like a bad model rather than a wiring bug.");
             let (w, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
             // Per-LAYER routing, not per-model: a checkpoint may mix MLA and standard attention, and a
             // layer takes the MLA path only when it has both the projections and a cache to write into.
-            x = match (&w.mla, &c.mla, &m.mla) {
+            // Gated DeltaNet first: the layer's weights say what it IS; the cache must then have
+            // a state slot, and not having one means a raw new_cache() on a hybrid model — refuse
+            // by name rather than reaching the dense arms below on placeholder weights.
+            x = if let Some(dl) = &w.deltanet {
+                let st = c.deltanet.as_ref().and_then(|v| v[li].as_ref()).unwrap_or_else(|| panic!(
+                    "layer {li} is Gated DeltaNet but this cache has no recurrent state slot — \
+built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get per-layer states"));
+                self.block_decode_deltanet(w, dl, st, &x, pos, m.d, m.eps)
+            } else { match (&w.mla, &c.mla, &m.mla) {
                 (Some(mw), Some(mc), Some(cfg)) => {
                     let dm = self.mla_dims(cfg, m.d, m.n_heads, m.base, m.eps);
                     self.block_decode_mla(w, mw, &dm, &x, mc, li, pos, m.d, m.eps)
                 }
                 _ if fused => self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
                 _ => self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
-            };
+            } };
             // Capture first: this layer's UNSTEERED output is what a probe may legitimately learn
             // from. See the ordering note on this function.
             if let Some((spec, out)) = cap.as_mut() {
@@ -16200,14 +16301,22 @@ like a bad model rather than a wiring bug.");
             let (w, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
             // Per-LAYER routing, not per-model: a checkpoint may mix MLA and standard attention, and a
             // layer takes the MLA path only when it has both the projections and a cache to write into.
-            x = match (&w.mla, &c.mla, &m.mla) {
+            // Gated DeltaNet first: the layer's weights say what it IS; the cache must then have
+            // a state slot, and not having one means a raw new_cache() on a hybrid model — refuse
+            // by name rather than reaching the dense arms below on placeholder weights.
+            x = if let Some(dl) = &w.deltanet {
+                let st = c.deltanet.as_ref().and_then(|v| v[li].as_ref()).unwrap_or_else(|| panic!(
+                    "layer {li} is Gated DeltaNet but this cache has no recurrent state slot — \
+built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get per-layer states"));
+                self.block_decode_deltanet(w, dl, st, &x, pos, m.d, m.eps)
+            } else { match (&w.mla, &c.mla, &m.mla) {
                 (Some(mw), Some(mc), Some(cfg)) => {
                     let dm = self.mla_dims(cfg, m.d, m.n_heads, m.base, m.eps);
                     self.block_decode_mla(w, mw, &dm, &x, mc, li, pos, m.d, m.eps)
                 }
                 _ if fused => self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
                 _ => self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
-            };
+            } };
             if flush != 0 && (li + 1) % flush == 0 && li + 1 < m.n_layers {
                 // FENCED flush: submit, WAIT for completion (so x is valid + scratch is done), release
                 // retained bind-groups, re-open the frame. The wait is what makes recycling safe.

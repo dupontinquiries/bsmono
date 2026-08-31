@@ -401,6 +401,98 @@ fn write_gguf_deepseek2_mla() -> Vec<u8> {
     b
 }
 
+/// Synthetic 2-layer qwen35moe HYBRID: blk.0 is Gated DeltaNet (attn_qkv at DeltaNet dims +
+/// attn_gate + the ssm_* set), blk.1 is plain attention with QK-Norm. Dense FFN on both — the
+/// MoE side of the family is proven by its own gates and would only pad this one.
+///
+/// What the real family has that this fixture deliberately does NOT: gated attention on full
+/// layers (double-width q with interleaved per-head [q|gate], sigmoid on the attention output)
+/// and IMRoPE sections — both named as gaps in archfeat, so the registry refuses the real
+/// checkpoint for the RIGHT remaining reasons.
+fn write_gguf_qwen35moe_hybrid() -> Vec<u8> {
+    let (d, vocab, h) = (64usize, 32usize, 128usize);
+    let (heads, kvh, hd) = (4usize, 2usize, 16usize);          // blk.1 attention
+    let (sst, hk, hv, dconv) = (8usize, 2usize, 4usize, 4usize); // blk.0 deltanet
+    let (key_dim, value_dim) = (hk * sst, hv * sst);
+    let conv_dim = 2 * key_dim + value_dim;
+    let mk = |seed: u32, n: usize| -> Vec<f32> {
+        let mut v = Vec::with_capacity(n); let mut x = seed | 1;
+        for _ in 0..n { x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push(((x >> 9) as f32 / (1u32 << 23) as f32 - 1.0) * 0.05); }
+        v };
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let f32t = |w: &[f32]| (0u32, bytemuck::cast_slice::<f32, u8>(w).to_vec());
+    let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+    let mut push = |name: String, dims: Vec<u64>, w: Vec<f32>| {
+        let (t, by) = f32t(&w); ts.push((name, dims, t, by)); };
+    push("token_embd.weight".into(), mat(vocab, d), mk(11, vocab * d));
+    // blk.0 — Gated DeltaNet
+    push("blk.0.attn_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("blk.0.attn_qkv.weight".into(), mat(conv_dim, d), mk(21, conv_dim * d));
+    push("blk.0.attn_gate.weight".into(), mat(value_dim, d), mk(22, value_dim * d));
+    push("blk.0.ssm_conv1d.weight".into(), vec![dconv as u64, conv_dim as u64], mk(23, conv_dim * dconv));
+    push("blk.0.ssm_dt.bias".into(), v1(hv), vec![0.1; hv]);
+    push("blk.0.ssm_a".into(), v1(hv), vec![-0.7; hv]);   // stores −exp(A_log): MUST be ≤ 0
+    push("blk.0.ssm_beta.weight".into(), mat(hv, d), mk(24, hv * d));
+    push("blk.0.ssm_alpha.weight".into(), mat(hv, d), mk(25, hv * d));
+    push("blk.0.ssm_norm.weight".into(), v1(sst), vec![1.0; sst]);
+    push("blk.0.ssm_out.weight".into(), mat(d, value_dim), mk(26, d * value_dim));
+    push("blk.0.post_attention_norm.weight".into(), v1(d), vec![1.0; d]); // the family's pre-FFN norm name
+    push("blk.0.ffn_gate.weight".into(), mat(h, d), mk(31, h * d));
+    push("blk.0.ffn_up.weight".into(), mat(h, d), mk(32, h * d));
+    push("blk.0.ffn_down.weight".into(), mat(d, h), mk(33, d * h));
+    // blk.1 — plain attention with QK-Norm (qwen3 shape)
+    push("blk.1.attn_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("blk.1.attn_q.weight".into(), mat(heads * hd, d), mk(41, heads * hd * d));
+    push("blk.1.attn_k.weight".into(), mat(kvh * hd, d), mk(42, kvh * hd * d));
+    push("blk.1.attn_v.weight".into(), mat(kvh * hd, d), mk(43, kvh * hd * d));
+    push("blk.1.attn_output.weight".into(), mat(d, heads * hd), mk(44, d * heads * hd));
+    push("blk.1.attn_q_norm.weight".into(), v1(hd), vec![1.0; hd]);
+    push("blk.1.attn_k_norm.weight".into(), v1(hd), vec![1.0; hd]);
+    push("blk.1.post_attention_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("blk.1.ffn_gate.weight".into(), mat(h, d), mk(51, h * d));
+    push("blk.1.ffn_up.weight".into(), mat(h, d), mk(52, h * d));
+    push("blk.1.ffn_down.weight".into(), mat(d, h), mk(53, d * h));
+    push("output_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("output.weight".into(), mat(vocab, d), mk(61, vocab * d));
+
+    let mut offs = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, _, by) in &ts { offs.push(off); off = align32(off + by.len() as u64); }
+    let mut b = Vec::new();
+    let sput = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 13);
+    sput(&mut b, "general.architecture"); u32b(&mut b, 8); sput(&mut b, "qwen35moe");
+    sput(&mut b, "qwen35moe.block_count"); u32b(&mut b, 4); u32b(&mut b, 2);
+    sput(&mut b, "qwen35moe.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, heads as u32);
+    sput(&mut b, "qwen35moe.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, kvh as u32);
+    sput(&mut b, "qwen35moe.embedding_length"); u32b(&mut b, 4); u32b(&mut b, d as u32);
+    sput(&mut b, "qwen35moe.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, h as u32);
+    sput(&mut b, "qwen35moe.vocab_size"); u32b(&mut b, 4); u32b(&mut b, vocab as u32);
+    sput(&mut b, "qwen35moe.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, 10000.0);
+    sput(&mut b, "qwen35moe.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, 1e-5);
+    sput(&mut b, "qwen35moe.ssm.conv_kernel"); u32b(&mut b, 4); u32b(&mut b, dconv as u32);
+    sput(&mut b, "qwen35moe.ssm.state_size"); u32b(&mut b, 4); u32b(&mut b, sst as u32);
+    sput(&mut b, "qwen35moe.ssm.group_count"); u32b(&mut b, 4); u32b(&mut b, hk as u32);
+    sput(&mut b, "qwen35moe.ssm.time_step_rank"); u32b(&mut b, 4); u32b(&mut b, hv as u32);
+    for (i, (name, dims, ty, _)) in ts.iter().enumerate() {
+        sput(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, *ty); u64b(&mut b, offs[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, _, by)) in ts.iter().enumerate() {
+        while (b.len() as u64) < data_off + offs[i] { b.push(0); }
+        b.extend_from_slice(by);
+    }
+    b
+}
+
 /// Serialize a HostModel as a q8_0 GGUF (weights as q8_0 type-8; norms/embed/biases f32). For
 /// --gate-q8direct, to exercise the loader's direct q8_0 → resident path end-to-end.
 fn write_gguf_q8_0(m: &HostModel) -> Vec<u8> {
@@ -1307,10 +1399,10 @@ fn main() {
         let (rmn, rmx) = rf.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
         let all_ones = rf.iter().all(|&x| (x - 1.0).abs() < 1e-6);
         eprintln!("rope_factors: len={} range=[{rmn:.4},{rmx:.4}] all_ones={all_ones}", rf.len());
-        if m.mla_layers() > 0 {
-            eprintln!("per-block trace SKIPPED: {} of {} layers are MLA and the trace's dense math \
-has no MLA path (decode-only for now). The decode probes above are the MLA-model signal.",
-                m.mla_layers(), m.n_layers);
+        if m.mla_layers() > 0 || m.deltanet_layers() > 0 {
+            eprintln!("per-block trace SKIPPED: {} of {} layers are MLA and {} are Gated DeltaNet; \
+the trace's dense math has a path for neither (decode-only for now). The decode probes above are \
+the signal for these models.", m.mla_layers(), m.n_layers, m.deltanet_layers());
             return;
         }
         eprintln!("per-block sub-step trace, ids={probe_ids:?} (n1/n2 = post-norm input scale; attn_out/ffn_out = each block's contribution):");
@@ -5468,6 +5560,54 @@ still pass, which is why this one exists."
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-deltanet-load") {
+        // The hybrid load + decode gate: a qwen35moe checkpoint whose blk.0 is Gated DeltaNet
+        // and blk.1 plain attention must load (recurrent set to the CPU-routed mixer, dense
+        // fields to placeholders), decode finite and input-sensitive logits through BOTH layer
+        // kinds, and REFUSE a position seek on the recurrent state. The recurrence math itself
+        // is covered by deltanet.rs's tests; THIS gate is the loader routing + cache + decode
+        // wiring around it.
+        //
+        // qwen35moe stays declared-unsupported (synthetics never flip the flag), so the env
+        // opt-in is set for this single-purpose process, exactly like --gate-mla-load.
+        std::env::set_var("LOGSCOPE_TRY_UNSUPPORTED_ARCH", "1");
+        let gpu = Gpu::new();
+        eprintln!("gate-deltanet-load: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let bytes = write_gguf_qwen35moe_hybrid();
+        match gpu.load_gguf_quantized(&bytes) {
+            Err(e) => ck(&format!("hybrid gguf loads — {e}"), false),
+            Ok(m) => {
+                ck("hybrid gguf loads", true);
+                ck("exactly blk.0 carries the DeltaNet mixer", m.deltanet_layers() == 1);
+                let c = gpu.new_cache_for(&m, 8); // attaches the per-layer recurrent states
+                let mut finite = true;
+                let mut logits_by_tok: Vec<Vec<f32>> = Vec::new();
+                for (p, t) in [1u32, 5, 9, 2].iter().enumerate() {
+                    let logits = gpu.decode_step(&m, &c, *t, p);
+                    finite &= logits.iter().all(|x| x.is_finite());
+                    logits_by_tok.push(logits);
+                }
+                ck("4-token decode through DeltaNet + attention layers is finite", finite);
+                // Input sensitivity ACROSS a fresh cache: same first token, different second —
+                // the recurrent state must make position 2 differ.
+                let c2 = gpu.new_cache_for(&m, 8);
+                let _ = gpu.decode_step(&m, &c2, 1, 0);
+                let alt = gpu.decode_step(&m, &c2, 7, 1);
+                let base = &logits_by_tok[1];
+                let diff = alt.iter().zip(base).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                ck("logits are input-sensitive through the recurrent state", diff > 1e-6);
+                // Seek refusal: the recurrent state is at pos 2 in c2; asking for pos 5 must
+                // panic with the sequential-positions message, not silently continue.
+                let seek = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = gpu.decode_step(&m, &c2, 3, 5);
+                }));
+                ck("a position SEEK on the recurrent state is refused", seek.is_err());
+            }
+        }
+        println!("gate-deltanet-load: {}", if ok { "hybrid DeltaNet loads + decodes \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-mla-load") {
         // Regression for the GLM-4.7-Flash load failure: a q-compressed MLA checkpoint
         // (q_lora_rank > 0) has NO blk.N.attn_q/k/v — the loader must take the MLA
@@ -5666,7 +5806,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }
@@ -6034,7 +6174,7 @@ still pass, which is why this one exists."
         wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)), wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
         g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
         q_norm: None, k_norm: None, // llama-shape test block (no QK-Norm)
-        nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None,
+        nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None,
         moe: None, // dense test block — the MoE path has its own validation
     };
     let xt = gpu.upload(&x, bt, bd);
@@ -6052,7 +6192,7 @@ still pass, which is why this one exists."
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: true, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
+            q_norm: None, k_norm: None, nope: true, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
         };
         let got = gpu.download(&gpu.block_forward(&bw_nope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // Roped baseline at the SAME (consistent) shape — the sanity term: nope must actually differ.
@@ -6063,7 +6203,7 @@ still pass, which is why this one exists."
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
+            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
         };
         let roped = gpu.download(&gpu.block_forward(&bw_rope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // CPU: cpu_block minus the rope step

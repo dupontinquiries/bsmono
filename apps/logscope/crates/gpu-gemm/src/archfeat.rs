@@ -105,6 +105,8 @@ pub enum Feature {
     /// Gated DeltaNet recurrent layers (Qwen3.5/3.6 hybrids, Qwen3-Next): a per-head decaying
     /// delta-rule state instead of a KV cache, fed by a causal depthwise conv over fused qkv.
     GatedDeltaNet,
+    GatedAttentionOutput,
+    MRopeSections,
     /// Dense (shared) FFN and the routed MoE run as PARALLEL branches off attn_out — each with its
     /// own pre/post norms — summed, post-normed once, then added to the residual (Gemma 4 MoE).
     /// Sequential wiring runs and produces plausible text, which is the failure mode worth a flag.
@@ -156,6 +158,8 @@ impl Feature {
             Feature::SparseAttentionIndexer => "sparse attention: an indexer selects top-k keys",
             Feature::AltAttnValueFromKey => "V sourced from the K projection (attn_v absent; weightless V norm)",
             Feature::GatedDeltaNet => "Gated DeltaNet recurrent layers (delta-rule state + conv, no KV cache)",
+            Feature::GatedAttentionOutput => "gated attention (per-head q‖gate interleaved in a double-width q projection; attention output × sigmoid(gate))",
+            Feature::MRopeSections => "multi-section rope (IMRoPE: rope.dimension_sections split across position channels)",
             Feature::TwinFfnParallelResidual => "dense + MoE FFN as parallel branches with one joining post-norm",
             Feature::RouterInputNormScale => "router input: weightless rms of attn_out times a learned scale vector",
             Feature::PerExpertOutputScale => "learned per-expert output scale vector",
@@ -273,7 +277,19 @@ impl Feature {
             // against; none has a GPU caller yet — the reference existing is NOT the feature
             // existing, which is exactly the distinction this table exists to hold).
             Feature::AltAttnValueFromKey => false,     // the loader requires attn_v today
-            Feature::GatedDeltaNet => false,           // CPU oracle only (deltanet.rs); no loader/decode path
+            // CPU-ROUTED and wired: the loader builds each recurrent block's DeltaNetLayerHost,
+            // new_cache_for allocates per-layer states, and decode routes those layers through
+            // block_decode_deltanet — which calls the SAME deltanet::step the invariant tests
+            // bind. --gate-deltanet-load proves load + decode + the seek refusal on a synthetic
+            // hybrid. Slow by design (one download+upload per recurrent layer per token); the GPU
+            // kernel is the speed work and checks against this path.
+            Feature::GatedDeltaNet => true,
+            // The two things a REAL Qwen3.5/3.6 full-attention layer still needs. Observed in
+            // qwen35moe.cpp: create_tensor_qkv with n_embd_head*n_head*2 (q and its output gate
+            // interleaved per head), attention output multiplied by sigmoid(gate); and
+            // ggml_rope_multi with sections. Neither is read or applied here yet.
+            Feature::GatedAttentionOutput => false,
+            Feature::MRopeSections => false,
             Feature::TwinFfnParallelResidual => false, // block forward runs ONE ffn branch
             Feature::RouterInputNormScale => false,    // router reads the branch's normed input
             Feature::PerExpertOutputScale => false,    // ffn_down_exps.scale is not read
@@ -310,11 +326,17 @@ long-context efficiency matters here. IndexShare (index_topk_freq 4 → only ~1 
 carries indexer tensors) is handled on our side: unread tensors are simply not fetched"),
             Feature::Mla => Some("wired and validated against the CPU reference, but never yet run on a \
 real DeepSeek/GLM checkpoint — the first such load is the test"),
-            Feature::GatedDeltaNet => Some("the recurrent 3-of-4 layers have NO forward path here — not \
-a slow one, none. The math is pinned by a CPU reference (src/deltanet.rs, transcribed from \
-llama.cpp's delta-net-base.cpp autoregressive path) so GPU work has an oracle; what is absent is \
-loading the ssm_* set and a decode that carries conv+state instead of KV for those layers. \
-MTP/nextn blocks are dense and non-recurrent"),
+            Feature::GatedDeltaNet => Some("recurrent layers run through the CPU-routed \
+block_decode_deltanet (correct-first, like the MoE and MLA bootstraps); deltanet.rs is the \
+tested core. Sequential positions only — recurrent state cannot seek, so trie/fleet prefix \
+reuse is refused for hybrids"),
+            Feature::GatedAttentionOutput => Some("STRUCTURAL for every full-attention layer of the \
+Qwen3.5/3.6 hybrids: q ships double-width with the gate interleaved PER HEAD, so a loader that \
+reads it as plain q gets q entangled with gate values — wrong shapes at best, fluent nonsense at \
+worst. Split + sigmoid-multiply is small; it is simply not built yet"),
+            Feature::MRopeSections => Some("IMRoPE: position is split across rope sections \
+(rope.dimension_sections). Applying plain NEOX rope instead mis-rotates every full-attention \
+layer — quietly worse output, the archfeat failure class"),
             Feature::AltAttnValueFromKey => Some("STRUCTURAL for the affected layers: without it the \
 loader refuses on the missing attn_v; faking V=K without the weightless norm runs and is wrong"),
             Feature::TwinFfnParallelResidual => Some("sequential wiring produces plausible text — the \
@@ -387,7 +409,8 @@ pub fn required(arch: &str, variant: u32) -> Vec<Feature> {
         // QkNormPreRope covers the 1-in-4 gated-attention blocks; the deltanet gap is the load
         // blocker and its report points at the CPU oracle.
         "qwen35moe" | "qwen36moe" | "qwen3_5moe" | "qwen3next" =>
-            vec![Feature::QkNormPreRope, Feature::SharedExpert, Feature::GatedDeltaNet],
+            vec![Feature::QkNormPreRope, Feature::SharedExpert, Feature::GatedDeltaNet,
+                 Feature::GatedAttentionOutput, Feature::MRopeSections],
         // deepseek2/3 covers GLM-4.7-Flash, which ships the split 3-D projections. Listed so the
         // refusal names the real blocker rather than blaming the MLA forward, which is implemented.
         "deepseek2" | "deepseek3" => vec![Feature::Mla, Feature::SharedExpert,

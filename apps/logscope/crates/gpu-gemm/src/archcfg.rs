@@ -132,15 +132,16 @@ pub fn for_arch(arch: &str) -> ArchConfig {
         "qwen35moe" | "qwen36moe" | "qwen3_5moe" => ArchConfig {
             prefix: "qwen35moe",
             supported: false, dense_supported: false,
-            note: "Qwen3.5/3.6 35B-A3B is HYBRID GATED DELTANET, not a larger Qwen3-30B-A3B — \
-observed in the operator's own tensor dump, which is why the family guess was wrong. The ssm_* \
-tensors per block are a recurrent state this engine has no path for, so those layers have no forward \
-pass at all rather than a slow one; only the ~1-in-4 gated-attention blocks are shapes we run. It \
-stays unverified end to end because nothing can run it. The MATH now has a CPU oracle: \
-src/deltanet.rs transcribes llama.cpp's delta-net-base.cpp autoregressive recurrence (decay -> \
-delta correction -> output, conv ring, gated norm) with invariant tests — GPU work checks against \
-it. The MoE side is fine: 256 experts, shared expert with its own gate, and Q4_K/MXFP4 both slice \
-since c4-784 and c4-805",
+            note: "Qwen3.5/3.6 35B-A3B is HYBRID GATED DELTANET — observed in the operator's own \
+tensor dump, which is why the earlier family guess was wrong. The recurrent layers now RUN: \
+per-block sniff on ssm_* tensors, weights into deltanet::DeltaNetLayerHost, per-layer states from \
+new_cache_for, decode through the CPU-routed block_decode_deltanet (the same deltanet.rs code the \
+invariant tests bind; --gate-deltanet-load proves load + decode + the seek refusal). Sequential \
+positions only — recurrent state cannot seek, so trie/fleet prefix reuse is refused. What still \
+blocks the REAL checkpoint: full-attention layers are GATED (per-head q‖gate interleaved, sigmoid \
+on the attention output) with IMRoPE sections — both named unimplemented in archfeat — and \
+`supported` flips only when a real checkpoint produces coherent text. The MoE side is fine: 256 \
+experts, shared expert with its own gate, Q4_K/MXFP4 slice since c4-784/c4-805",
             ..for_arch("qwen3moe")
         },
         "qwen3moe" => ArchConfig {
@@ -1041,13 +1042,13 @@ that is wrong about the engine is worse than no note at all");
             // The guard must be inside the body, not merely somewhere in the file. A signature can
             // span several lines, so scan a window past it rather than only the next line.
             let body: String = src.lines().skip(i).take(14).collect::<Vec<_>>().join("\n");
-            let want = format!("refuse_mla_on_dense_block(w, \"{name}\")");
+            let want = format!("refuse_mla_or_deltanet_on_dense_block(w, \"{name}\")");
             if !body.contains(&want) { unguarded.push(name); }
         }
         assert!(unguarded.is_empty(),
             "these dense-attention block fns would compute over an MLA layer's absent q/k/v weights \
 and return a plausible-looking tensor: {unguarded:?}. Add \
-`Self::refuse_mla_on_dense_block(w, \"<fn name>\");` as the first statement, or route the layer to \
+`Self::refuse_mla_or_deltanet_on_dense_block(w, \"<fn name>\");` as the first statement, or route the layer to \
 block_decode_mla.");
     }
 
