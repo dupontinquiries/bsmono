@@ -5360,3 +5360,56 @@ That is the honest answer to "shouldn't we see it drop below": on most
 content there is no room below, because the bits are not keyframe
 overhead — they are novelty, and novelty is exactly what a static model
 cannot amortise.
+
+### Correcting the correction: the g=48 error barely applied, and preset 6 was not the handicap either
+
+The previous entry said every AV1 anchor this session was handicapped
+~32% by `-g 48`. That over-stated it, and the check is trivial:
+
+  ground.y4m (48 frames), crf45:  g=48 -> 76,323 B
+                                  g=240 -> 76,323 B   IDENTICAL
+  keyframes in the g=48 encode of a 48-frame clip: 1
+
+A 48-frame clip encoded with g=48 contains exactly ONE keyframe, so
+g=240 changes nothing. The 32% penalty I measured was on a 240-FRAME
+clip, where g=48 forces five keyframes. Since almost every anchor in
+this log is a 48-frame GOP, the error affected almost nothing. It
+applied to the 240-frame blackstar amortisation test — which already
+used g=240 — and to nothing else. The bloopers suite used the user's
+own AV1 file rather than my encodes, so it is untouched too.
+
+Recorded because the shape of the mistake matters: I measured a real
+effect on one clip and generalised it to a corpus without checking
+whether the mechanism could even fire there. That is the same error as
+reading prev_mode_share as a value proxy, one level up.
+
+Encoder settings, asked directly: SVT-AV1 v1.7.0, preset 6 throughout.
+Preset is the other place an anchor could be weakened, so it was swept
+(ground.y4m, crf45, g=240):
+
+  preset 2  75,531 B @ 39.508 dB
+  preset 4  76,635 B @ 39.385
+  preset 6  76,323 B @ 39.247   <- used all session
+  preset 8  88,469 B @ 39.089
+
+Preset 2 buys 1% bytes and +0.26 dB over preset 6 — negligible. So the
+anchors were not meaningfully weak on that axis either; preset 8 is
+where it would have mattered.
+
+THE CLAIMED WIN SURVIVES, now against AV1's near-best settings:
+
+  v11 procedural canonical   58,556 B @ 40.046 dB
+  AV1 preset2 crf43 g240     85,805 B @ 40.174 dB / SSIM 0.9757
+  AV1 preset2 crf40 g240    102,549 B @ 41.176 dB
+At matched quality v11 is 32% SMALLER at -0.13 dB. That is a larger
+margin than the 23% first reported against preset 6, because the
+correct AV1 point at 40 dB is crf43 rather than the crf45 I originally
+compared against.
+
+And the loss on soldier survives too, also against preset 2:
+  v11 ENGINE canonical  42,186 B @ 39.746 dB
+  AV1 preset2 crf58     18,941 B @ 42.346 dB
+AV1 is 2.2x smaller AND 2.6 dB better — slightly worse for v11 than the
+preset-6 comparison said. Both verdicts stand and the split between
+them is unchanged: the model wins where MC cannot reach the content,
+loses where it can.
