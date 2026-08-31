@@ -4646,7 +4646,31 @@ Two tests, one per property. 1427/1427.
 
   5 tests over real threads and sockets, 22/22 for the crate.
 
-- **C84c — nothing constructs a `NodeHost` yet.** The frontend still has
-  no dependency on this crate. That is now genuinely one dependency and
-  one field, which is what "an arrow" actually looks like — unlike the
-  previous entry, which called a component an arrow and was wrong.
+- **C84c — DONE. The chain runs end to end.** From a settings combo to
+  a UDP socket:
+
+    DiscoveryBackend::Jami  →  discovery_enabled().1  →  tick_dht
+      →  NodeHost::spawn    →  dht::publish/resolve
+      →  snapcore lookup    →  UdpTransport
+
+  Four decisions at the app end:
+  - **Started LAZILY**, on the first tick where the operator asked for
+    it. A node binds a socket and spawns a thread; paying that for
+    someone who only uses LAN gossip is cost with no return.
+  - **Switching it off DROPS the host**, which stops the worker and
+    closes the socket. Turning a radio setting off should stop the radio
+    traffic, not merely ignore it.
+  - **It waits for the sc-ID** rather than binding under a placeholder.
+    A node that starts random and later adopts its real id has already
+    told peers the wrong thing.
+  - **A bind failure is reported once.** It is permanent for the run — a
+    port conflict, or a sandbox with no network — and retrying every
+    tick would log it forever.
+
+  `identity::dht_node_id` derives the id from the sc-ID, deterministically.
+  Three tests, and the third is the one that matters: a naive per-byte
+  hash leaves most of a 20-byte id zero for a 4-character input,
+  clustering every short id into one corner of the keyspace where they
+  all become each other's nearest neighbours.
+
+  1431/1431.

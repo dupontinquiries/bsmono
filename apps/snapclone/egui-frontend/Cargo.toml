@@ -28,6 +28,12 @@ snapclone-composer = { path = "../rust/snapclone-composer" }
 # the composer is: it ships an rlib, and its modules use crate:: paths that
 # resolve to the wrong crate under a #[path] include.
 snapclone-mailbox = { path = "../rust/snapclone-mailbox" }
+# The DHT half of discovery. `discovery_enabled().1` has been honest and
+# unconsumed since it was added; this is what consumes it.
+snapclone-presence = { path = "../rust/snapclone-presence" }
+# For `NodeId` in identity::dht_node_id. The engine itself is reached
+# through snapclone-presence; this is the type only.
+snapcore = { path = "../../../shared/snapcore" }
 # Location freshness. Its opacity/presentation/last_seen_label are view
 # functions with no view; the wayfinder was drawing arrows without asking
 # whether the position behind them was worth pointing at.

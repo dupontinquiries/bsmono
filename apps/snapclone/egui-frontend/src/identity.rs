@@ -107,6 +107,37 @@ fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
 /// Case-insensitive on input because the QR parser accepts either — a code
 /// printed in uppercase is still that person's code — but generation always
 /// emits lowercase so the file has one spelling.
+/// This device's DHT node id, derived from its sc-ID.
+///
+/// Deterministic, so a device keeps its place in the keyspace across
+/// restarts — `node_host::spawn` explains why that matters: a node that
+/// re-randomises its identity on every launch makes every other node's
+/// routing table stale.
+///
+/// The same hash the rest of the app uses for keys, not a new one. A
+/// second hashing scheme here would be a second thing to keep in step
+/// with dht-kit's key derivation, and they must agree.
+pub fn dht_node_id(sc_id: &str) -> snapcore::routing::NodeId {
+    let mut out = [0u8; 20];
+    // FNV-1a over the sc-ID, expanded across the id. Not a security
+    // boundary: a node id is a POSITION in the keyspace, and an attacker
+    // who wants a particular position can simply pick one — Kademlia's
+    // defence against that is redundancy, not id secrecy.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for (i, b) in sc_id.bytes().enumerate() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+        out[i % 20] ^= (h >> 32) as u8;
+    }
+    // A short sc-ID would otherwise leave most bytes zero, clustering
+    // every short id into the same corner of the keyspace.
+    for i in 0..20 {
+        h = h.wrapping_mul(0x1000_0000_01b3).wrapping_add(i as u64);
+        out[i] ^= (h >> 24) as u8;
+    }
+    snapcore::routing::NodeId(out)
+}
+
 pub fn is_valid(s: &str) -> bool {
     s.len() == 11 && s.starts_with("sc-") && s[3..].chars().all(|c| c.is_ascii_hexdigit())
 }
@@ -231,6 +262,30 @@ pub fn restrict(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_node_id_is_stable_across_restarts() {
+        // The whole reason it is derived rather than random: a node that
+        // re-randomises on each launch makes every other node's routing
+        // table stale.
+        assert_eq!(super::dht_node_id("sc-abcd"), super::dht_node_id("sc-abcd"));
+    }
+
+    #[test]
+    fn different_ids_land_in_different_places() {
+        assert_ne!(super::dht_node_id("sc-abcd"), super::dht_node_id("sc-abce"));
+    }
+
+    #[test]
+    fn a_short_sc_id_still_fills_the_keyspace() {
+        // A naive per-byte hash leaves most of a 20-byte id zero for a
+        // 4-character input, clustering every short id into one corner
+        // of the keyspace — where they all become each other's nearest
+        // neighbours.
+        let id = super::dht_node_id("ab");
+        let zeros = id.0.iter().filter(|b| **b == 0).count();
+        assert!(zeros < 8, "{} of 20 bytes are zero: {:?}", zeros, id.0);
+    }
     use super::*;
 
     #[test]

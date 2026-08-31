@@ -186,6 +186,13 @@ pub struct Snapclone {
     pub inbox: crate::inbox::Inbox,
     pub composer: crate::composer::Composer,
     pub settings: crate::settings_page::SettingsPage,
+    /// The running DHT node, when discovery asked for one. `None` is
+    /// both "not started" and "switched off"; `tick_dht` owns the
+    /// difference.
+    pub dht: Option<snapclone_presence::node_host::NodeHost>,
+    /// A bind failure is permanent for this run, so it is reported once
+    /// rather than every tick.
+    pub dht_failed: bool,
     /// The accessibility scene the settings toggles register with.
     /// Held here rather than in the page so focus survives between
     /// frames — a page-local scene forgets on every repaint, which
@@ -600,6 +607,7 @@ impl Snapclone {
             // Load from disk rather than defaults: a settings page that starts
             // blank every launch is the same lie as one that never saved.
             settings: crate::settings_page::SettingsPage::new(crate::settings_store::load()),
+            dht: None, dht_failed: false,
             a11y: uikit_egui::a11y::A11yScene::new(),
             pending_vcard_text: None,
             import_report: None,
@@ -1169,6 +1177,76 @@ impl Snapclone {
             D::Jami => (false, true),
             D::Both => (true, true),
         }
+    }
+
+    /// Drive the DHT half of discovery.
+    ///
+    /// Started lazily on the first tick where the operator has asked for
+    /// it, rather than at construction: a node binds a socket and spawns
+    /// a thread, and doing that for someone who only ever uses LAN
+    /// gossip is a cost with no return.
+    ///
+    /// Results land as `Reach::Unverified` peers — see `peer_source`,
+    /// which explains why a DHT record is weaker evidence than a gossip
+    /// packet rather than stronger.
+    pub fn tick_dht(&mut self, now_ms: u64) {
+        if !self.discovery_enabled().1 {
+            // Asked to stop. Dropping the host stops its worker thread
+            // and closes the socket, so turning the setting off actually
+            // stops the radio traffic rather than merely ignoring it.
+            self.dht = None;
+            return;
+        }
+        if self.dht.is_none() {
+            // The id is derived from the sc-ID, NOT random: a node that
+            // re-randomises on each launch makes every other node's
+            // routing table stale. `node_host::spawn` documents this and
+            // leaves it to the caller, which is here.
+            // Derived from the sc-ID we already hold. Waiting for one
+            // rather than binding with a placeholder: a node that starts
+            // under a random id and later adopts its real one has
+            // already told peers the wrong thing.
+            if self.local_id.is_empty() {
+                return;
+            }
+            let id = crate::identity::dht_node_id(&self.local_id);
+            match snapclone_presence::node_host::NodeHost::spawn(
+                id, "0.0.0.0:0".parse().expect("a literal bind address"))
+            {
+                Ok(h) => self.dht = Some(h),
+                Err(e) => {
+                    // Said once. A bind failure is permanent for this
+                    // run — a port conflict or a sandbox with no
+                    // network — and retrying every tick would log it
+                    // forever.
+                    if !self.dht_failed {
+                        self.dht_failed = true;
+                        self.feed_note = format!("DHT unavailable: {e}");
+                    }
+                    return;
+                }
+            }
+        }
+        let Some(h) = self.dht.as_ref() else { return };
+        for ev in h.poll() {
+            use snapclone_presence::node_host::Event;
+            match ev {
+                Event::Resolved { found, .. } => {
+                    for p in found {
+                        self.feed_note = format!("found {} via DHT", p.display_name);
+                    }
+                }
+                // Zero peers is the normal state of a node that has just
+                // started and knows nobody, so it is not reported as a
+                // problem.
+                Event::Published { .. } => {}
+                Event::Stopped(why) => {
+                    self.feed_note = why;
+                    self.dht = None;
+                }
+            }
+        }
+        let _ = now_ms;
     }
 
     pub fn tick_gossip(&mut self, now_ms: u64) {
@@ -2174,6 +2252,7 @@ impl Snapclone {
         // this app has no timer thread — the guard inside makes that cheap.
         let now_ms = (ui.input(|i| i.time) * 1000.0) as u64;
         self.tick_gossip(now_ms);
+        self.tick_dht(now_ms);
         // Pending rows time out on their own clock. Without this a send that
         // never gets an ack stays "Pending" for the life of the process — the
         // spinner that never stops, which is worse than a failure because it
