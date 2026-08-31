@@ -597,9 +597,18 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
                     // terse: the console gives ~46 characters and the tail is
                     // the informative part, so the first version lost exactly
                     // the words worth reading ("— teaches tra~")
+                    // WHICH FILM YOU ARE IN, not just which number. The row
+                    // said "f5", which is a fact the player has no way to
+                    // resolve; `saga.rs` knows it is SOLAR. Short title
+                    // because the prefix is identical on all nine and the
+                    // console has about 46 characters — the overflow test
+                    // below this module is what keeps that honest.
+                    let film = crate::saga::film(m.film as u32)
+                        .map(|f| f.short_title())
+                        .unwrap_or("");
                     let label = match teaches.first() {
-                        Some(k) => format!("{} (f{}, rec {rec}) +{}", m.id, m.film, k.id),
-                        None => format!("{} (f{}, rec {rec})", m.id, m.film),
+                        Some(k) => format!("{} ({film}, rec {rec}) +{}", m.id, k.id),
+                        None => format!("{} ({film}, rec {rec})", m.id),
                     };
                     let r = Row::action(m.id, &label);
                     rows.push(if have < rec {
@@ -1942,6 +1951,32 @@ mod tests {
         let mut sb = board();
         sb.camp.record(crate::raidcon::RAIDS_OPEN_AFTER);
         sb
+    }
+
+    #[test]
+    fn the_sortie_list_names_the_film_not_its_number() {
+        // "f5" is a fact the player has no way to resolve. Guarding the CALL
+        // SITE, not `saga::film` — testing the function and leaving the
+        // console on the old format is the failure this session has made
+        // three times (settle, LOD, well_strength).
+        let mut sb = board();
+        sb.camp.record("the_pluto_line");
+        let menu = build(Station::Bridge, &sb, 4);
+        let labels: Vec<&str> = menu.rows.iter().map(|r| r.label.as_str()).collect();
+        let joined = labels.join(" | ");
+        assert!(!joined.is_empty(), "the bridge console has no rows; this test proves nothing");
+        // at least one sortie row must carry a film TITLE
+        let titled = crate::saga::all_films()
+            .iter()
+            .any(|f| joined.contains(f.short_title()));
+        assert!(titled, "no sortie row names its film: {joined}");
+        // and the bare "(fN," form must be gone
+        for n in 1..=9 {
+            assert!(
+                !joined.contains(&format!("(f{n},")),
+                "a sortie row still shows the raw film number: {joined}"
+            );
+        }
     }
 
     #[test]

@@ -48,6 +48,17 @@ impl FilmEntry {
         format!("film_{:02}", self.number)
     }
 
+    /// The title without the franchise prefix — "SOLAR", not
+    /// "TRANSFORMERS: SOLAR". The console has about 46 characters for a
+    /// mission row and the prefix is the same on all nine, so it is the part
+    /// that carries no information where space is scarce.
+    pub fn short_title(&self) -> &'static str {
+        match self.title.split_once(": ") {
+            Some((_, tail)) => tail,
+            None => self.title,
+        }
+    }
+
     pub fn trilogy_label(&self) -> &'static str {
         match self.trilogy {
             1 => "Doomsday",
