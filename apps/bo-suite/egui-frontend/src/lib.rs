@@ -21,6 +21,7 @@ pub mod outputs;
 pub mod music_scan;
 pub mod playback;
 pub mod surround;
+pub mod voice_control;
 pub mod sources;
 pub mod fileproc;
 pub mod shell_bits;
@@ -366,6 +367,12 @@ pub struct Controller {
     /// than inside it: the picker answers "which speakers", and this
     /// answers "where they are" — one survives a change to the other.
     pub surround: crate::surround::Assignment,
+    /// Voice control settings. OFF until someone turns it on — a music
+    /// player that listens is a microphone in a living room.
+    pub voice: crate::voice_control::VoicePrefs,
+    /// A low-confidence command awaiting a yes. Free text cannot be
+    /// checked against anything, so a mishearing starts the wrong album.
+    pub voice_confirm: Option<crate::voice_control::Command>,
     /// The volume the dial last reported, waiting for the host to debounce and
     /// push. `None` once it has been sent.
     pub pending_volume: Option<f32>,
@@ -514,6 +521,8 @@ impl Controller {
             silhouettes: Vec::new(),
             motion_scale: 1.0,
             surround: Default::default(),
+            voice: crate::voice_control::load(),
+            voice_confirm: None,
             pending_volume: None,
             tags: Vec::new(),
             tag_editor: Default::default(),
@@ -851,6 +860,21 @@ impl Controller {
             self.active_device_url = url;
         }
         ui.separator();
+        // VOICE CONTROL, in settings beside the other things that change
+        // what the app does on its own. Off until asked for; the panel
+        // says what enabling it means.
+        if self.sinks.open {
+            ui.separator();
+            if crate::voice_control::voice_settings_ui(ui, &mut self.voice, c) {
+                if let Err(e) = crate::voice_control::store(&self.voice) {
+                    // Silently, a write failure means a setting that works
+                    // until restart — and for a listening switch, one that
+                    // silently turns itself back ON is the wrong direction
+                    // to fail in.
+                    self.toast.show(&format!("voice settings not saved: {e}"));
+                }
+            }
+        }
         // SURROUND, beside the combine control rather than instead of it.
         // They are different things — combine duplicates a stream, surround
         // splits one — and a single toggle between them would make picking
@@ -1177,6 +1201,118 @@ impl Controller {
         // missing, which is why "play album" queued, showed a title and
         // played nothing.
         self.request_play(e.track_id);
+    }
+
+    /// Act on something the person said.
+    ///
+    /// The whole decision — is voice on, was that a command, is it safe to
+    /// act on — lives in `voice_control::decide`, so there is ONE place
+    /// that can be wrong about whether the app is listening. A check
+    /// duplicated across handlers is one that gets missed in the fourth.
+    ///
+    /// Returns what happened, so a host can log it and a test can assert
+    /// it without reading four fields.
+    pub fn heard(&mut self, phrase: &str) -> crate::voice_control::Outcome {
+        let outcome = crate::voice_control::decide(&self.voice, phrase);
+        match &outcome {
+            crate::voice_control::Outcome::Run(cmd) => {
+                let cmd = cmd.clone();
+                self.run_voice(cmd);
+            }
+            crate::voice_control::Outcome::Confirm(cmd) => {
+                self.voice_confirm = Some(cmd.clone());
+                self.toast.show(&format!("say yes to {}", cmd.describe()));
+            }
+            crate::voice_control::Outcome::Ignored => {}
+        }
+        outcome
+    }
+
+    /// Accept or reject a pending confirmation.
+    pub fn confirm_voice(&mut self, yes: bool) {
+        let Some(cmd) = self.voice_confirm.take() else { return };
+        if yes { self.run_voice(cmd); }
+    }
+
+    /// Carry out a command that has been decided on.
+    pub fn run_voice(&mut self, cmd: crate::voice_control::Command) {
+        use crate::voice_control::Command as C;
+        use crate::transport::Repeat;
+        match cmd {
+            // Through the same paths a tap takes. A voice command that
+            // set `playing` directly would skip `start_playing` and make
+            // no sound — which is exactly the bug the tap path had.
+            C::Play => { if !self.transport.playing { self.toggle_play(); } }
+            C::Pause => { if self.transport.playing { self.toggle_play(); } }
+            C::Toggle => self.toggle_play(),
+            C::Stop => {
+                self.transport.pause();
+                self.pending_playback = Some(crate::playback::Request::Stop);
+            }
+            C::Next => self.on_track_ended(),
+            // "Previous" restarts the current track rather than reaching
+            // backwards: nothing here keeps a history of what played, and
+            // a control that silently does the wrong thing is worse than
+            // one that does the modest right thing. It is what a physical
+            // transport does on the first press too.
+            C::Previous => {
+                if let Some(id) = self.now_playing_id {
+                    self.transport.report(0.0);
+                    self.request_play(id);
+                }
+            }
+            C::Search(q) => {
+                self.search.query = q;
+                self.voice_confirm = None;
+            }
+            C::PlayNamed(q) => {
+                // Searched, not played. Free text cannot name a track
+                // exactly, and starting the first fuzzy match is how a
+                // request for one album plays another.
+                self.search.query = q;
+            }
+            C::VolumeUp => self.nudge_volume(10),
+            C::VolumeDown => self.nudge_volume(-10),
+            C::VolumeSet(n) => self.pending_volume = Some(f32::from(n)),
+            C::Mute => self.pending_volume = Some(0.0),
+            // Unmute goes to a MODEST level, not to whatever it was. The
+            // previous volume is not remembered here, and restoring a
+            // guessed loud one in a room where someone just asked for
+            // quiet is the wrong way to be wrong.
+            C::Unmute => self.pending_volume = Some(30.0),
+            C::ShuffleOn => self.transport.shuffle = true,
+            C::ShuffleOff => self.transport.shuffle = false,
+            C::RepeatOne => self.transport.repeat = Repeat::One,
+            C::RepeatAll => self.transport.repeat = Repeat::All,
+            C::RepeatOff => self.transport.repeat = Repeat::Off,
+        }
+    }
+
+    /// Start or stop, the same way the transport button does.
+    ///
+    /// Extracted from the draw path rather than duplicated: the button
+    /// flips `playing` and then queues a request, and a voice command that
+    /// set the flag directly would show as playing and make no sound —
+    /// which is exactly the bug the tap path had before it was fixed. One
+    /// function, so there is one place that can be wrong about it.
+    pub fn toggle_play(&mut self) {
+        let now_playing = !self.transport.playing;
+        self.transport.playing = now_playing;
+        self.pending_playback = Some(if now_playing {
+            crate::playback::Request::Play {
+                url: self.now_playing_url(),
+                sink: self.audio_sink.clone(),
+            }
+        } else {
+            crate::playback::Request::Stop
+        });
+    }
+
+    /// Move the volume by a step, clamped.
+    fn nudge_volume(&mut self, by: i32) {
+        let cur = self.pending_volume.unwrap_or_else(
+            || self.devices.first().map(|d| d.volume as f32).unwrap_or(50.0));
+        self.pending_volume = Some((cur + by as f32).clamp(0.0, 100.0));
     }
 
     /// A track finished on its own. Decide what plays next.
@@ -1786,14 +1922,12 @@ impl Controller {
         let was_playing = self.transport.playing;
         crate::transport::transport_ui(ui, &mut self.transport, c);
         if self.transport.playing != was_playing {
-            self.pending_playback = Some(if self.transport.playing {
-                crate::playback::Request::Play {
-                    url: self.now_playing_url(),
-                    sink: self.audio_sink.clone(),
-                }
-            } else {
-                crate::playback::Request::Stop
-            });
+            // `transport_ui` already flipped the flag, so put it back and
+            // go through `toggle_play` — the one place that pairs the flag
+            // with the request. Two places doing it is how one of them
+            // ends up showing "playing" over silence.
+            self.transport.playing = was_playing;
+            self.toggle_play();
         }
     }
 
@@ -2744,5 +2878,102 @@ mod tests {
         assert!(active < quiet, "fully active flows faster ({active} < {quiet})");
         assert!(c.watermark.blur().is_none(), "egui cannot blur; the module degrades");
         assert!(c.watermark.opacity() > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod voice_command_tests {
+    use super::*;
+    use crate::voice_control::{Command, Outcome, VoicePrefs};
+
+    fn app(enabled: bool) -> Controller {
+        let mut c = Controller::new(vec![], vec![]);
+        c.voice = VoicePrefs { enabled, ..Default::default() };
+        c.set_track_paths(vec![(1, "/m/one.flac".into()), (2, "/m/two.flac".into())]);
+        c
+    }
+
+    #[test]
+    fn nothing_is_heard_until_the_setting_is_on() {
+        // The default, and the reason it is the default.
+        let mut c = app(false);
+        assert_eq!(c.heard("pause"), Outcome::Ignored);
+        assert_eq!(c.pending_playback, None);
+    }
+
+    #[test]
+    fn play_and_pause_go_through_the_same_path_a_tap_does() {
+        // A voice command that set `playing` directly would show as
+        // playing and make no sound — the exact bug the tap path had.
+        let mut c = app(true);
+        c.queue.add_all(&[(1, "One".into(), "A".into())]);
+        let first = c.queue.advance().unwrap();
+        c.start_playing(&first);
+        c.pending_playback = None;
+
+        assert_eq!(c.heard("pause"), Outcome::Run(Command::Pause));
+        assert!(!c.transport.playing);
+        assert_eq!(c.pending_playback, Some(crate::playback::Request::Stop));
+
+        c.pending_playback = None;
+        assert_eq!(c.heard("play"), Outcome::Run(Command::Play));
+        assert!(c.transport.playing);
+        assert!(matches!(c.pending_playback, Some(crate::playback::Request::Play { .. })),
+                "resuming asked for no audio");
+    }
+
+    #[test]
+    fn a_search_asks_before_acting_and_then_runs_on_yes() {
+        // Free text cannot be checked against anything.
+        let mut c = app(true);
+        assert_eq!(c.heard("search for miles davis"),
+                   Outcome::Confirm(Command::Search("miles davis".into())));
+        assert_eq!(c.search.query, "", "it searched before being confirmed");
+        c.confirm_voice(true);
+        assert_eq!(c.search.query, "miles davis");
+    }
+
+    #[test]
+    fn saying_no_to_a_confirmation_does_nothing_and_clears_it() {
+        let mut c = app(true);
+        c.heard("play the smiths");
+        c.confirm_voice(false);
+        assert_eq!(c.search.query, "");
+        assert_eq!(c.voice_confirm, None, "the prompt outlived the answer");
+    }
+
+    #[test]
+    fn play_something_searches_rather_than_starting_a_guess() {
+        // Starting the first fuzzy match is how a request for one album
+        // plays another.
+        let mut c = app(true);
+        c.voice.act_on_uncertain = true;
+        c.heard("play the smiths");
+        assert_eq!(c.search.query, "the smiths");
+        assert_eq!(c.pending_playback, None, "it started playing a guess");
+    }
+
+    #[test]
+    fn next_advances_the_queue_the_same_way_a_finished_track_does() {
+        let mut c = app(true);
+        c.queue.add_all(&[(1, "One".into(), "A".into()), (2, "Two".into(), "A".into())]);
+        let first = c.queue.advance().unwrap();
+        c.start_playing(&first);
+        c.pending_playback = None;
+        c.heard("next");
+        assert_eq!(c.transport.title, "Two");
+    }
+
+    #[test]
+    fn volume_words_move_it_and_stay_in_range() {
+        let mut c = app(true);
+        c.heard("volume 90");
+        assert_eq!(c.pending_volume, Some(90.0));
+        c.heard("louder");
+        assert_eq!(c.pending_volume, Some(100.0), "it went past the top");
+        c.heard("mute");
+        assert_eq!(c.pending_volume, Some(0.0));
+        c.heard("quieter");
+        assert_eq!(c.pending_volume, Some(0.0), "it went below zero");
     }
 }
