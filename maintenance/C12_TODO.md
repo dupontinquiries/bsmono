@@ -5211,3 +5211,41 @@ sandbox gap. No errors in the edited file.
   driving the code.
 
   17/17.
+
+## 94. bo-suite adopts the kit's Nav — for the page level only
+
+Parity surfaces are 100% and fully accounted for (every "missing" one is
+doc-only, which the audit already separates). The remaining faithfulness
+question is kit ADOPTION, and bo-suite had 46 surfaces with `nav=0`.
+
+Its view index was a bare `usize`, and `current()` carried a comment
+admitting the problem: the bound "is enforced by the strip having been
+built from VIEWS — true today, and not a property this function can
+see." `Nav` makes it a property the type enforces.
+
+**Page level ONLY, and the reason is a real mismatch.** `Nav`'s
+subpages are `Vec<usize>` — app-defined ids. bo-suite's drill-down is
+`Detail::Album(AlbumKey)` and `Detail::Artist { id, name }`, which
+carry DATA. Moving that into `Nav` would either lose the payload or
+need a side table keyed by the subpage id, which is more machinery than
+the thing it replaces. Left in `browse`.
+
+That is worth stating rather than quietly doing half the job: the kit
+fits one level of this app's navigation and not the other, and forcing
+the second would make the port less faithful, not more.
+
+**Two corrections on the way, both from tests:**
+  - My scripted rewrite turned `c.view_idx = X;` into an unclosed
+    `go_page(X;`. Caught by the compiler.
+  - I asserted `go_page` CLAMPS an out-of-range page to the last view.
+    It IGNORES it, keeping the current page — which is the better
+    behaviour: clamping would silently move a person to Settings when a
+    bad index appeared, and staying put is the answer that does not act
+    on a value it does not trust. Test now asserts the real contract.
+
+`swipe` still uses the wrapping `page()` helper before calling
+`go_page`, deliberately: a swipe past the last view returning to the
+first is the gesture's idiom, and clamping would make the last view feel
+stuck.
+
+416/416.

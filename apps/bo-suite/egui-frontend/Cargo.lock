@@ -129,6 +129,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "audio-kit"
+version = "0.1.0"
+dependencies = [
+ "core-kit",
+]
+
+[[package]]
 name = "audiomix-kit"
 version = "0.1.0"
 
@@ -201,6 +208,9 @@ dependencies = [
 [[package]]
 name = "bo-core"
 version = "0.1.0"
+dependencies = [
+ "audio-kit",
+]
 
 [[package]]
 name = "bo-mux"
@@ -208,6 +218,7 @@ version = "0.1.0"
 dependencies = [
  "audiomix-kit",
  "mic-kit",
+ "net-kit",
  "serde",
  "serde_json",
  "signal-hook-registry",
@@ -456,6 +467,10 @@ dependencies = [
  "core-foundation",
  "libc",
 ]
+
+[[package]]
+name = "core-kit"
+version = "0.1.0"
 
 [[package]]
 name = "cpufeatures"
@@ -1621,6 +1636,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "net-kit"
+version = "0.1.0"
+dependencies = [
+ "core-kit",
 ]
 
 [[package]]

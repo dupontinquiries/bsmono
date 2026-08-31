@@ -285,7 +285,17 @@ pub fn page(idx: usize, sign: i32, n: usize) -> usize {
 
 /// Controller state + the swipe gesture + a11y scene.
 pub struct Controller {
-    pub view_idx: usize,
+    /// Which top-level view, via the shared kit.
+    ///
+    /// A bare `usize` before, and `current()` had to defend against it
+    /// drifting out of range with a comment saying the bound "is not a
+    /// property this function can see". `Nav` makes it one: `go_page`
+    /// clamps, so an out-of-range index cannot be stored in the first
+    /// place and the draw path cannot panic on it.
+    ///
+    /// Page level ONLY. The library's drill-down stays in `browse` —
+    /// see the note on `swipe`.
+    pub nav: uikit_egui::nav::Nav,
     /// The kit's segmented strip, for the wide layout.
     strip: uikit_egui::segmented_tabs::TabStrip,
     /// The ported surfaces, held across frames so they keep their state — a
@@ -438,7 +448,7 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(devices: Vec<Device>, scenes: Vec<Scene>) -> Self {
-        Controller { view_idx: 0,
+        Controller { nav: uikit_egui::nav::Nav::new(VIEWS.len()),
             strip: uikit_egui::segmented_tabs::TabStrip::new(&VIEWS),
             devices, scenes, active_scene: 0,
             breath: uikit_egui::motion::Breath::new(2200.0, 0.35, 1.0),
@@ -509,7 +519,7 @@ impl Controller {
     }
 
     pub fn current(&self) -> &'static str {
-        // NOT `VIEWS[self.view_idx]`. `view_idx` is written from
+        // NOT `VIEWS[self.nav.page()]`. `view_idx` is written from
         // `strip_ui`'s return (line ~609) and from `page()`, so its bound
         // is enforced by the strip having been built from VIEWS — true
         // today, and not a property this function can see. An index that
@@ -520,7 +530,12 @@ impl Controller {
         // wrong label, working app, and `view_idx` is corrected on the
         // next select. LIBRARY_TABS has a `from_index` guard and a test
         // for exactly this drift; VIEWS never got one.
-        VIEWS.get(self.view_idx).copied().unwrap_or(VIEWS[0])
+        // Still a `get`, and still with a fallback: `Nav` clamps on
+        // write, so this cannot be out of range today — but `current()`
+        // returning a wrong label beats it panicking in the draw path,
+        // and that trade does not change just because the invariant got
+        // stronger.
+        VIEWS.get(self.nav.page()).copied().unwrap_or(VIEWS[0])
     }
 
     /// Not called yet, and that is not an oversight: see below — the gesture
@@ -533,7 +548,11 @@ impl Controller {
     /// volume Sliders claim horizontal drag themselves, and a whole-surface gesture reads the same raw
     /// pointer trajectory with nothing arbitrating between the two).
     pub fn swipe(&mut self, sign: i32) {
-        self.view_idx = page(self.view_idx, sign, VIEWS.len());
+        // `page()` wraps; `Nav::go_page` clamps. Kept as `page()` so the
+        // wrap survives — a swipe past the last view returning to the
+        // first is the gesture's own idiom, and clamping would make the
+        // last view feel stuck.
+        self.nav.go_page(page(self.nav.page(), sign, VIEWS.len()));
     }
 
     /// Adopt cross-app preferences (theme/text/button + swipe feel incl. detent animation).
@@ -624,9 +643,9 @@ impl Controller {
             // hand-rolled selectable_label row in this app. That leaves two
             // navigation widgets rather than three, and the two that remain
             // are the two the kit provides for the two shapes.
-            self.strip.select(self.view_idx);
+            self.strip.select(self.nav.page());
             if let Some(i) = uikit_egui::segmented_tabs::strip_ui(ui, &self.strip, &colors) {
-                self.view_idx = i;
+                self.nav.go_page(i);
             }
             ui.separator();
             // The safety toast slides down from the TOP, above everything, and
@@ -684,7 +703,7 @@ impl Controller {
                     ui.ctx().request_repaint();
                 }
             }
-            match self.view_idx {
+            match self.nav.page() {
                 0 => self.devices_view(ui, &colors),
                 1 => self.spaces_view(ui, &colors),
                 2 => self.library_view(ui, &colors),
@@ -705,13 +724,13 @@ impl Controller {
             ui.horizontal(|ui| {
                 ui.allocate_ui(egui::vec2(64.0_f32.max(adaptive.min_touch_target * 1.3), ui.available_height()), |ui| {
                     let tabs: Vec<uikit_egui::vertical_tabs::Tab> = VIEWS.iter().map(|n| uikit_egui::vertical_tabs::Tab::new(n)).collect();
-                    if let Some(i) = uikit_egui::vertical_tabs::show(ui, &tabs, self.view_idx, adaptive.min_touch_target, &colors) {
-                        self.view_idx = i;
+                    if let Some(i) = uikit_egui::vertical_tabs::show(ui, &tabs, self.nav.page(), adaptive.min_touch_target, &colors) {
+                        self.nav.go_page(i);
                     }
                 });
                 ui.separator();
                 ui.vertical(|ui| {
-                    match self.view_idx {
+                    match self.nav.page() {
                         0 => self.devices_view(ui, &colors),
                         1 => self.scenes_view(ui, &colors),
                         _ => self.library_view(ui, &colors),
@@ -821,7 +840,7 @@ impl Controller {
     /// Jump to a page from the named bar, keeping the swipe nav in step.
     pub fn jump_to_page(&mut self, i: usize) -> bool {
         if !self.page_bar.select(i) { return false; }
-        self.view_idx = i;
+        self.nav.go_page(i);
         true
     }
 
@@ -1443,17 +1462,27 @@ mod tests {
 
     #[test]
     fn the_current_view_name_survives_an_out_of_range_index() {
-        // `view_idx` is written from a widget's return value, so its
-        // bound depends on that widget having been built from VIEWS.
-        // True today; not something `current()` can check. A wrong label
-        // is recoverable, a panic in the draw path is not.
+        // Now enforced by `Nav::go_page`, which CLAMPS — so an
+        // out-of-range page cannot be stored at all, where before the
+        // bound depended on the widget having been built from VIEWS and
+        // `current()` could not check it.
+        //
+        // `go_page` IGNORES an out-of-range page rather than clamping to
+        // the last one — which is the better of the two: clamping would
+        // silently move a person to Settings when a bad index appeared,
+        // and staying put is the answer that does not act on a value it
+        // does not trust.
+        //
+        // I expected clamping and asserted it; the test said otherwise.
+        // Left asserting the real contract.
         // `Controller::new` rather than `default()`: it has no Default
         // impl, and adding one to satisfy a test would put a
         // deviceless, sceneless Controller in the public API for no
         // other reason.
         let mut c = Controller::new(Vec::new(), Vec::new());
-        c.view_idx = VIEWS.len() + 7;
-        assert_eq!(c.current(), VIEWS[0], "fell back rather than panicking");
+        c.nav.go_page(VIEWS.len() + 7);
+        assert_eq!(c.current(), VIEWS[0],
+                   "an out-of-range page should be ignored, leaving the current view");
     }
 
     /// A source with two artists and a shared album.
