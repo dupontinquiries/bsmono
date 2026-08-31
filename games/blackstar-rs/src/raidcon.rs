@@ -360,6 +360,38 @@ pub const BOSSES: &[Boss] = &[
         shard: "in every timeline it remembers, the lock is in the same place." },
 ];
 
+/// THE MISSION THAT OPENS THE WARDECK.
+///
+/// Film 1's finale — Blackstar over the Los Angeles shore. Everything before
+/// it is the campaign teaching the game at its own pace, one squad and one
+/// objective at a time.
+pub const RAIDS_OPEN_AFTER: &str = "the_beach_opens";
+
+/// Are raids available at all?
+///
+/// The ladder inside the Wardeck has always gated WHICH warden you may answer
+/// — the lowest unrecovered signal, one at a time. Nothing gated whether you
+/// belong there yet, so a new save could walk to the console before Film 1
+/// was finished and open the game's cooperative endgame as its second
+/// experience.
+///
+/// That is backwards for a story that starts small. Raids are where the game
+/// hands you to other players, and the campaign through Blackstar is what
+/// gets a pilot ready for it: it is the part with a fixed squad, a written
+/// beat, and no one else depending on you.
+///
+/// Same shape as `exoworlds::unlocked`, deliberately — a mission id and a
+/// log lookup, so the two gates cannot drift into different mechanisms.
+pub fn unlocked(log: &crate::campaign::CampaignLog) -> bool {
+    log.is_cleared(RAIDS_OPEN_AFTER)
+}
+
+/// What the console says when it is still shut. Named rather than inlined so
+/// the copy is testable and lives beside the rule it explains.
+pub fn locked_note() -> String {
+    "the wardeck is dark — the ladder opens once the beach is held".to_string()
+}
+
 pub fn boss(id: &str) -> Option<&'static Boss> {
     all_bosses().iter().find(|b| b.id == id)
 }

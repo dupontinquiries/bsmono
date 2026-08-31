@@ -846,6 +846,15 @@ pub fn apply(st: Station, ev: &Event, sb: &mut Shipboard, week: u64) -> Option<O
             if id.starts_with("echo:") {
                 return Some(Order::Echo(id));
             }
+            // THE CAMPAIGN GATES FIRST. The ladder below decides WHICH
+            // warden; this decides whether the Wardeck is open at all. A save
+            // that has not finished Film 1 could previously walk in and start
+            // the cooperative endgame as its second experience — the ladder
+            // has never had an opinion about that, because its job is
+            // ordering signals, not readiness.
+            if !crate::raidcon::unlocked(&sb.camp) {
+                return Some(Order::Did(crate::raidcon::locked_note()));
+            }
             // THE LADDER GATES. `next_up` is the lowest-tier unrecovered
             // warden; everything above it is a signal you can read and not
             // yet answer, and a banked shard is not fought twice. Pressing
@@ -1920,9 +1929,65 @@ mod tests {
         }
     }
 
+    /// A board that has finished Film 1, so the Wardeck is open.
+    fn raided() -> Shipboard {
+        let mut sb = board();
+        sb.camp.record(crate::raidcon::RAIDS_OPEN_AFTER);
+        sb
+    }
+
+    #[test]
+    fn the_wardeck_is_shut_until_the_beach_is_held() {
+        // The story starts small: the campaign through Blackstar is what
+        // readies a pilot for the cooperative endgame, and before this gate a
+        // fresh save could open raids as its second experience.
+        let mut sb = board();
+        assert!(!crate::raidcon::unlocked(&sb.camp), "a fresh save is already cleared?");
+        let next = sb.raids.next_up().expect("a ladder").id;
+        match apply(Station::Wardeck, &Event::Pressed(next), &mut sb, 4) {
+            Some(Order::Did(note)) => assert!(
+                note.contains("wardeck"),
+                "the refusal does not say why: {note}"
+            ),
+            other => panic!("the Wardeck launched a raid before Film 1: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finishing_film_one_opens_it() {
+        // The complement (CLAUDE.md §5c). A gate that never opens is not a
+        // gate, and this is the exact pair the campaign one has to honour.
+        let mut sb = raided();
+        let next = sb.raids.next_up().expect("a ladder").id;
+        assert_eq!(
+            apply(Station::Wardeck, &Event::Pressed(next), &mut sb, 4),
+            Some(Order::Raid(next)),
+            "Film 1 is cleared and the ladder still will not launch"
+        );
+    }
+
+    #[test]
+    fn the_forge_and_echoes_stay_open_before_film_one() {
+        // These sit OUTSIDE the ladder's gate by design — an echo is not a
+        // signal — so they must sit outside the campaign gate too, or the
+        // new check quietly takes away the solo practice content that
+        // prepares a player for the thing being gated.
+        let mut sb = board();
+        assert!(matches!(
+            apply(Station::Wardeck, &Event::Pressed("forge:storm"), &mut sb, 4),
+            Some(Order::Forge(_))
+        ), "the forge was closed by the campaign gate");
+        assert!(matches!(
+            apply(Station::Wardeck, &Event::Pressed("echo:whatever"), &mut sb, 4),
+            Some(Order::Echo(_))
+        ), "echoes were closed by the campaign gate");
+    }
+
     #[test]
     fn the_wardeck_launches_only_the_ladders_next_signal() {
-        let mut sb = board();
+        // This tests the LADDER, so it has to get past the campaign gate
+        // first. `raided()` is `board()` with Film 1 finished.
+        let mut sb = raided();
         let next = sb.raids.next_up().expect("a fresh board has a ladder").id;
         assert_eq!(
             apply(Station::Wardeck, &Event::Pressed(next), &mut sb, 4),
@@ -1933,7 +1998,7 @@ mod tests {
         if let Some(other) = BOSSES.iter().find(|b| b.id != next) {
             assert!(
                 matches!(
-                    apply(Station::Wardeck, &Event::Pressed(other.id), &mut board(), 4),
+                    apply(Station::Wardeck, &Event::Pressed(other.id), &mut raided(), 4),
                     Some(Order::Did(_))
                 ),
                 "a signal above the ladder must be refused with a reason, not launched"
