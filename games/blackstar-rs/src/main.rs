@@ -65,6 +65,7 @@ mod hive;
 mod hud;
 mod holomap;
 mod hotbar;
+mod shipgrav;
 mod hydro;
 mod idle;
 mod input;

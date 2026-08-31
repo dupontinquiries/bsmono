@@ -5806,3 +5806,55 @@ rearrangement that looks different).
 - **C104c — the control-scheme analysis is NOT done.** QWERTY vs Dvorak,
   mouse side buttons, PgUp/PgDn, `,.oeu` for centred Dvorak. Worth doing
   properly against the existing bind table rather than guessed at.
+
+## 105. blackstar: spin gravity on a tether, and two sizes of console
+
+Zero-g / artificial gravity from a bridge console, a rotating tether,
+and robot-sized consoles with human-sized ones beside them.
+
+**`shipgrav`, not `gravity`** — and that near-miss is worth recording. I
+wrote the module as `src/gravity.rs` and OVERWROTE an existing file of
+that name (the world's attraction-to-a-body maths). Caught by the
+compiler, recovered from git, renamed. `create_file` refuses to
+overwrite; `cat >` does not, and I used the second.
+
+**Why a transformer makes this believable.** Artificial gravity without
+hand-waving has to be acceleration, and a ship not under thrust has one
+honest option: spin. A rigid hull spinning about its long axis gives
+nothing at the spine, because radius IS the equation. A transformer can
+deploy a tether — swing mass out, rotate the pair, and the radius
+becomes whatever the line is long enough to make.
+
+Decisions:
+  - **`gravity_g` is `ω²r`**, not a curve fit. The console's whole claim
+    to being believable is that it is the real equation, and there is a
+    test asserting a solved rate produces exactly 1 g.
+  - **`Deploying` is its own state.** A tether halfway out is neither
+    safe to thrust with nor giving useful gravity; showing only the
+    endpoints would let somebody burn engines mid-deploy.
+  - **A partly extended tether reports ZERO gravity.** It is swinging,
+    not spinning — a fraction would invite someone to stand up during a
+    transition.
+  - **Retracting stops the spin FIRST.** Reeling in a rotating tether
+    spins the pair up as the radius shrinks; conservation of angular
+    momentum turns a comfort feature into a centrifuge.
+  - **`safe_to_thrust` is false whenever the line is out at all**, which
+    is what stops "transform and fly" being offered at the moment it
+    would tear the ship apart.
+  - **Comfort is REPORTED, not enforced.** A crew wanting a full g from
+    a short tether can have it and feel awful; refusing would be the
+    ship overruling the person flying it, and `radius_for_comfort` says
+    what would fix it.
+
+**Two console sizes, from a ratio that already existed.**
+`aboard::HULL_HEIGHTS` makes a bot's ship 1.4 km and a person's 280 m,
+so a bot bridge genuinely has controls a human cannot reach. `consoles`
+places a primary at the hull occupant's working height and adds a
+human repeater ONLY above twice human height — a repeater on a human
+ship is furniture nobody needs.
+
+1315/1315, up from 1306.
+
+- **C105a — not wired to a room or an input.** `Fixture` has no
+  `GravityConsole` variant and nothing calls `Tether::tick`. The model
+  and its rules are here; placing it is the next pass.
