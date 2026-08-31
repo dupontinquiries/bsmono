@@ -547,7 +547,12 @@ impl eframe::App for LogscopeApp {
             let now = ui.input(|i| i.time) as f32;
             ui.horizontal_wrapped(|ui| {
                 for t in Tab::ALL {
-                    let resp = ui.selectable_value(&mut self.tab, t, t.label());
+                    // WHAT IT IS FOR, on hover. The reference nav carries a subtitle under every
+                    // item; a tab bar has no room for a second line, so the same sentence goes
+                    // where it costs nothing. Several of these names cannot be guessed — "Peek",
+                    // "Bloc", and "Rotate", which reads as a view control and configures logrotate.
+                    let resp = ui.selectable_value(&mut self.tab, t, t.label())
+                        .on_hover_text(t.purpose());
                     // carved-stone slab + (active) glowing inscription with a light sweep
                     theme::carved_tab(ui.painter(), resp.rect, now, self.tab == t, theme::AMBER());
                     let a = ui.ctx().animate_bool(resp.id, self.tab == t);
