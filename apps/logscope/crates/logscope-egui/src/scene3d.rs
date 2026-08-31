@@ -5794,6 +5794,12 @@ fn build(palette_name: &str) -> Scene {
     // ROOM-VARIETY MODE: LOGSCOPE_ROOM=<n> bypasses the themed scene and builds one of the procedural
     // "inspired rooms" so we can survey a broad range of mind-spaces to choose from.
     if let Some(idx) = std::env::var("LOGSCOPE_ROOM").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        // THE CHROME FOLLOWS THE ROOM. Before this, entering a procedural room changed the geometry
+        // and left the interface in whatever unrelated palette was active — the Observatory's blue
+        // stone behind Folding@home's neutral greys. The room's own floor, perimeter and accent are
+        // right there in the table; `roomtheme` derives a full palette from them, so one selection
+        // moves the whole interface into the space. Every one of the sixteen is contrast-audited.
+        crate::theme::set_palette(crate::roomtheme::palette_for(room_colors(idx)));
         return room_variant(idx);
     }
     // DRAGON DEBUG: an isolated close-up of the procedural sea-dragon head (frontal / 3-4 / profile) on a
@@ -5937,6 +5943,26 @@ fn debug_dump_labels(s: &Scene, theme: &str) {
 // broad without 24 bespoke builders. Select with LOGSCOPE_ROOM=<n>.
 pub const ROOM_COUNT: usize = 16;
 pub fn room_name(idx: usize) -> &'static str { ROOMS[idx % ROOMS.len()].0 }
+
+/// A room's colours, for deriving the interface chrome from the space (see `roomtheme`).
+///
+/// The room table already holds a floor, a perimeter and an accent; before this nothing outside the
+/// geometry builder could read them, so the chrome had no way to match the room and did not.
+pub fn room_colors(idx: usize) -> crate::roomtheme::RoomColors {
+    let r = &ROOMS[idx % ROOMS.len()];
+    crate::roomtheme::RoomColors {
+        name: r.0,
+        floor: r.2,
+        perimeter: r.5,
+        accent: r.8,
+        material: match r.3 {
+            x if x == M::WOOD => crate::theme::Material::Wood,
+            x if x == M::PAPER => crate::theme::Material::Paper,
+            x if x == M::MOSS => crate::theme::Material::None,
+            _ => crate::theme::Material::Stone,
+        },
+    }
+}
 
 // (name, floor 0round/1square/2nave, floor_rgb, floor_mat, perim 0none/1ring/2rows/3walls/4arcade, perim_rgb,
 //  roof 0sky/1flat/2dome/3vault, focal 0plinth/1altar/2fountain/3tree/4brazier/5obelisk/6orrery/7lectern, accent, prop 0none/1crystal/2book/3lantern/4plant/5banner)
