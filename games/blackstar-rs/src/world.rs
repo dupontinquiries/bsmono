@@ -388,6 +388,32 @@ fn smoothstep01(t: f32) -> f32 {
 }
 
 /// Bounding reach of a shape — used by the mover index and the broad phase.
+/// KUIPER's world-size buckets: giant, mid, dwarf. One table, because the
+/// gravity reference is derived FROM these — a second copy is how the
+/// reference drifts from the radii it is a reference for.
+///
+/// The `k % 6` selector weights them 1 : 2 : 3, so the field is mostly dwarfs
+/// with a few giants. Scale these to make planets and the gravity follows;
+/// that is the whole point of not writing the reference as a literal.
+pub const KUIPER_SIZES: [(f32, f32); 3] = [(26.0, 38.0), (14.0, 22.0), (7.0, 13.0)];
+
+/// The reference radius KUIPER's wells are tuned against — the field's own
+/// middle, computed from the buckets at their `k % 6` weights rather than
+/// from the rolled radii, so it does not depend on the RNG sequence and a
+/// map's layout stays bit-identical for a given seed.
+pub fn kuiper_reference_r() -> f32 {
+    let mid = |b: (f32, f32)| (b.0 + b.1) * 0.5;
+    let sample = [
+        mid(KUIPER_SIZES[0]),
+        mid(KUIPER_SIZES[1]),
+        mid(KUIPER_SIZES[1]),
+        mid(KUIPER_SIZES[2]),
+        mid(KUIPER_SIZES[2]),
+        mid(KUIPER_SIZES[2]),
+    ];
+    crate::space::reference_radius(&sample)
+}
+
 pub fn shape_reach(sdf: &Sdf) -> f32 {
     match *sdf {
         Sdf::None => 0.0,
@@ -2298,9 +2324,9 @@ impl World {
                     let rr = rng.range(60.0, 210.0) * ws;
                     // a real size spread: dwarfs, mid-worlds, and GIANTS
                     let pr = match k % 6 {
-                        0 => rng.range(26.0, 38.0), // giant
-                        1 | 2 => rng.range(14.0, 22.0),
-                        _ => rng.range(7.0, 13.0),
+                        0 => rng.range(KUIPER_SIZES[0].0, KUIPER_SIZES[0].1), // giant
+                        1 | 2 => rng.range(KUIPER_SIZES[1].0, KUIPER_SIZES[1].1),
+                        _ => rng.range(KUIPER_SIZES[2].0, KUIPER_SIZES[2].1),
                     };
                     // vertical depth: the field is a volume, not a disc
                     let cp = Vec3::new(a.cos() * rr, rng.range(22.0, 190.0), a.sin() * rr);
@@ -2310,7 +2336,7 @@ impl World {
                     // toward r^1.6 so giants feel heavy without being traps
                     // gentler than r^1.6: giants still feel heavy, but the
                     // field no longer swallows a car that drifts past
-                    let gmul = (pr / 15.0).powf(1.3).clamp(0.35, 1.6);
+                    let gmul = crate::space::well_strength(pr, kuiper_reference_r());
                     grav.push(GravNode {
                         pos: cp,
                         down: Vec3::NEG_Y,
@@ -2422,7 +2448,14 @@ impl World {
                         r: pr * 2.2,
                         tube: false,
                         inward: true,
-                        g: (pr / 15.0).powf(1.3).clamp(0.35, 1.1),
+                        // A FREE BODY KEEPS THE LOWER CEILING. This is the
+                        // drifting-rock node, not an anchored world: 1.1
+                        // rather than space::GRAV_MAX (1.6), because you are
+                        // not meant to land on one and a strong well on a
+                        // moving body swallows a car that passes it. Same
+                        // reference, deliberately different cap.
+                        g: (pr / kuiper_reference_r()).powf(crate::space::GRAV_EXP)
+                            .clamp(crate::space::GRAV_MIN, 1.1),
                         surf: true,
                         follow: Some(i),
                     });

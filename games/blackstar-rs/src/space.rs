@@ -58,6 +58,18 @@ pub const CURRENT_REACH_M: f32 = 210.0;
 pub const GRAV_REF_R: f32 = 15.0;
 pub const GRAV_EXP: f32 = 1.3;
 pub const GRAV_MIN: f32 = 0.35;
+/// The ANCHORED worlds' ceiling. `world.rs` has two, and finding that out
+/// cost a wrong "correction" here first: I read the free-body node's 1.1,
+/// concluded this constant had drifted, and changed it — before noticing the
+/// anchored worlds at 1.6 that these constants were actually transcribed
+/// from. The two populations are different on purpose: you are meant to land
+/// on an anchored world, so it may pull hard, while a free body that drifts
+/// past must not swallow you.
+///
+/// So this mirrors the anchored case, `well_strength` is now CALLED for it
+/// rather than copied, and the free-body node keeps its own lower cap with a
+/// note. A mirror is only useful while it matches, and the way to keep it
+/// matching is to delete the copy.
 pub const GRAV_MAX: f32 = 1.6;
 
 /// How large a body of radius `r` looks from `d`, in degrees.
@@ -130,6 +142,31 @@ pub fn tier_by_distance(d: f32, reach: f32) -> Tier {
 /// well.
 pub fn well_strength(r: f32, reference_r: f32) -> f32 {
     (r / reference_r.max(0.01)).powf(GRAV_EXP).clamp(GRAV_MIN, GRAV_MAX)
+}
+
+/// The reference radius a field's gravity should be tuned against: its own
+/// middle, so the tuning is a statement about relative size.
+///
+/// A CONSTANT CANNOT DO THIS JOB. `world.rs` used a literal 15.0, which sits
+/// inside today's 7-38 m spread by luck. Scale the field to planet size and
+/// every `(r / 15)^1.3` lands past the clamp, so every well becomes the
+/// maximum well and the size spread the field was built around disappears —
+/// silently, since nothing errors and the map still loads. Deriving the
+/// reference from the radii themselves is what makes a rescale survivable.
+///
+/// The median rather than the mean: one giant should not drag the reference
+/// that decides whether it is a giant.
+pub fn reference_radius(radii: &[f32]) -> f32 {
+    if radii.is_empty() {
+        return GRAV_REF_R;
+    }
+    let mut v: Vec<f32> = radii.iter().copied().filter(|r| r.is_finite() && *r > 0.0).collect();
+    if v.is_empty() {
+        return GRAV_REF_R;
+    }
+    v.sort_by(f32::total_cmp);
+    let mid = v.len() / 2;
+    if v.len() % 2 == 0 { (v[mid - 1] + v[mid]) * 0.5 } else { v[mid] }
 }
 
 /// How much variety is left in a field's wells, 0..1. One means the smallest
@@ -687,5 +724,76 @@ mod lod_wiring_tests {
             assert_eq!(tier_for(r, r), Tier::Full, "at the surface of r={r}");
             assert!(tier_for(r, r * 1.2) >= Tier::Medium, "just above r={r}");
         }
+    }
+}
+
+#[cfg(test)]
+mod gravity_wiring_tests {
+    use super::*;
+    use crate::world::{kuiper_reference_r, KUIPER_SIZES};
+
+    #[test]
+    fn the_reference_is_the_fields_middle_not_a_literal() {
+        let r = kuiper_reference_r();
+        let (lo, hi) = (KUIPER_SIZES[2].0, KUIPER_SIZES[0].1);
+        assert!(r > lo && r < hi, "reference {r} is outside the field's own range {lo}..{hi}");
+        // and it tracks the buckets: the median of the weighted midpoints
+        assert!((r - 14.0).abs() < 0.01, "reference moved to {r}");
+    }
+
+    #[test]
+    fn a_rescaled_field_keeps_its_gravity_spread() {
+        // THE PROPERTY THE HARDCODE DESTROYED, and the reason this matters
+        // for planets. Scale every world up and, with a fixed reference,
+        // every well saturates at the clamp — the size spread the field is
+        // built around vanishes, silently.
+        let mid = |b: (f32, f32)| (b.0 + b.1) * 0.5;
+        for scale in [1.0f32, 4.0, 50.0, 1000.0] {
+            let sample: Vec<f32> = [0, 1, 1, 2, 2, 2]
+                .iter()
+                .map(|i| mid(KUIPER_SIZES[*i]) * scale)
+                .collect();
+            let r = reference_radius(&sample);
+            let spread = well_spread(KUIPER_SIZES[2].0 * scale, KUIPER_SIZES[0].1 * scale, r);
+            assert!(
+                spread > 0.5,
+                "at {scale}x the field's wells collapsed to a spread of {spread:.2}"
+            );
+        }
+        // and the hardcode really does fail this, or the test proves nothing
+        let dead = well_spread(KUIPER_SIZES[2].0 * 50.0, KUIPER_SIZES[0].1 * 50.0, GRAV_REF_R);
+        assert!(
+            dead < 0.01,
+            "the fixed reference survived a 50x rescale ({dead:.2}) — this test is measuring nothing"
+        );
+    }
+
+    #[test]
+    fn todays_gravity_barely_moves() {
+        // A reference change is a gameplay change, so bound it rather than
+        // hope. 15.0 -> 14.0 makes dwarfs pull slightly harder and leaves
+        // everything that was already clamped where it was.
+        let r = kuiper_reference_r();
+        for pr in [7.0f32, 10.0, 13.0, 18.0, 22.0, 26.0, 38.0] {
+            let now = well_strength(pr, r);
+            let before = (pr / 15.0).powf(GRAV_EXP).clamp(GRAV_MIN, GRAV_MAX);
+            let delta = (now - before).abs();
+            assert!(delta < 0.12, "r={pr}: gravity moved {delta:.3} ({before:.3} -> {now:.3})");
+        }
+    }
+
+    #[test]
+    fn world_rs_calls_this_instead_of_copying_it() {
+        // The wiring, not the function — the failure this session has now hit
+        // three times. Needles assembled at runtime so the scan cannot match
+        // its own source.
+        let src = include_str!("world.rs");
+        let call = format!("crate::space::{}(pr, kuiper_reference_r())", "well_strength");
+        assert!(src.contains(&call), "world.rs no longer calls space::well_strength");
+        // BOTH copies of the literal reference must be gone — there were two,
+        // with different ceilings, and finding only one of them is what made
+        // the first pass at this wrong.
+        let stale = format!("(pr / 15.0).{}(1.3)", "powf");
+        assert!(!src.contains(&stale), "a hardcoded reference is still live in world.rs");
     }
 }
