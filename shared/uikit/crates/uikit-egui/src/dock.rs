@@ -19,6 +19,25 @@ use crate::PaletteColors;
 /// One row in a side list — a session, a nav-rail entry, a device, a file. Draws itself as a
 /// selectable, hoverable block; returns the click response so the caller decides what a click
 /// means (switch session, open a file, navigate).
+/// Make a laid-out row clickable, keyed by something stable about the row.
+///
+/// The pattern this replaces is `ui.horizontal(|ui| {…}).response
+/// .interact(Sense::click())`, which appears wherever a row is built from
+/// several widgets rather than drawn as one. It does not work: a layout
+/// response carries an auto-generated id, and re-interacting through it
+/// registers no clickable region — the rows draw correctly and simply
+/// cannot be clicked. Found by a frame-driven test in voiceterm's mail
+/// list, where opening a thread had never worked and every model test
+/// passed throughout, because none of them drew anything.
+///
+/// `key` must be stable and unique per row — a conversation id, a path, a
+/// url. NOT an index: egui remembers interaction state by id, and an
+/// index-keyed row hands the previous occupant's press state to whatever
+/// sorts into that slot after the list changes.
+pub fn row_click(ui: &mut Ui, rect: egui::Rect, key: impl std::hash::Hash) -> Response {
+    ui.interact(rect, ui.id().with(("row_click", key)), Sense::click())
+}
+
 pub fn list_row(ui: &mut Ui, label: &str, selected: bool, height: f32, c: &PaletteColors) -> Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
     let fill = if selected { c.accent_soft } else if resp.hovered() { c.bg_hover } else { c.bg_base };

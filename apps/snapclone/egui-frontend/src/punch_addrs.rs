@@ -188,6 +188,74 @@ pub fn gossip_ui(ui: &mut egui::Ui, g: &Gossip, punch: &PunchAddrs, now_ms: u64,
     }
 }
 
+// ── whether an address is still worth trying ────────────────────────────────
+
+/// A cached address's failure record, per peer.
+///
+/// `store_privacy::CachedAddr` carries the rule — an address that has
+/// failed repeatedly is known wrong, and trying it again costs a timeout
+/// the person waits through — and nothing held one, so a dead address was
+/// retried forever. The snap send path reads `PunchAddrs::get` and, on
+/// failure, recorded nothing.
+///
+/// Kept BESIDE the address map rather than inside it. An address arrives
+/// from gossip or the DHT and is replaced wholesale; a failure record
+/// attached to the value would be reset by every refresh, including the
+/// refresh that hands back the same wrong address.
+#[derive(Debug, Clone, Default)]
+pub struct AddrHealth {
+    map: std::collections::HashMap<String, crate::store_privacy::CachedAddr>,
+}
+
+impl AddrHealth {
+    /// A send to this peer failed.
+    pub fn failed(&mut self, id: &str, addr: PeerAddr, now_ms: i64) {
+        let e = self.map.entry(id.to_string()).or_insert_with(|| {
+            crate::store_privacy::CachedAddr {
+                host: format!("{}.{}.{}.{}", addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3]),
+                port: addr.port,
+                consecutive_failures: 0,
+                cached_at_ms: now_ms,
+            }
+        });
+        e.record_failure();
+    }
+
+    /// A send to this peer worked.
+    ///
+    /// Clears the record entirely rather than decrementing: a peer that was
+    /// unreachable for an hour and is now answering is not four-fifths
+    /// broken, and carrying old failures forward would abandon it again
+    /// after one more blip.
+    pub fn worked(&mut self, id: &str, now_ms: i64) {
+        if let Some(e) = self.map.get_mut(id) {
+            e.record_success(now_ms);
+        }
+    }
+
+    /// Should the cached address be used, or should the peer be looked up
+    /// again?
+    ///
+    /// Unknown peers are USABLE: never having failed is not evidence
+    /// against an address, and refusing to try one would mean no snap is
+    /// ever sent to a new contact.
+    pub fn usable(&self, id: &str, now_ms: i64) -> bool {
+        self.map.get(id).map(|e| e.is_usable(now_ms)).unwrap_or(true)
+    }
+
+    /// Forget a peer's record — for a fresh address from gossip or the DHT,
+    /// which deserves its own attempts rather than inheriting the last
+    /// one's.
+    pub fn forget(&mut self, id: &str) {
+        self.map.remove(id);
+    }
+
+    pub fn failures(&self, id: &str) -> u32 {
+        self.map.get(id).map(|e| e.consecutive_failures).unwrap_or(0)
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +420,65 @@ mod tests {
         assert_eq!(seen_label(30_000, 0), "30s ago");
         assert_eq!(seen_label(600_000, 0), "10m ago");
         assert_eq!(seen_label(7_200_000, 0), "2h ago");
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    const A: PeerAddr = PeerAddr { ip: [10, 0, 0, 9], port: 9876 };
+
+    #[test]
+    fn a_peer_never_tried_is_worth_trying() {
+        // Refusing an unknown address would mean no snap is ever sent to a
+        // new contact.
+        let h = AddrHealth::default();
+        assert!(h.usable("sc-new", 0));
+    }
+
+    #[test]
+    fn an_address_that_keeps_failing_stops_being_used() {
+        // Each retry costs a timeout the person waits through, and the
+        // address is known wrong by then.
+        let mut h = AddrHealth::default();
+        for _ in 0..crate::store_privacy::ADDR_FAIL_THRESHOLD {
+            h.failed("sc-1", A, 0);
+        }
+        assert!(!h.usable("sc-1", 0), "{} failures", h.failures("sc-1"));
+    }
+
+    #[test]
+    fn one_success_clears_the_record_rather_than_decrementing_it() {
+        // A peer unreachable for an hour and now answering is not
+        // four-fifths broken; carrying failures forward abandons it again
+        // after one more blip.
+        let mut h = AddrHealth::default();
+        for _ in 0..4 { h.failed("sc-1", A, 0); }
+        h.worked("sc-1", 1_000);
+        assert_eq!(h.failures("sc-1"), 0);
+        assert!(h.usable("sc-1", 1_000));
+    }
+
+    #[test]
+    fn a_stale_record_forces_a_lookup_even_with_no_failures() {
+        // Both conditions, because they fail differently: a stale entry
+        // may still be correct and is worth one attempt, but not forever.
+        let mut h = AddrHealth::default();
+        h.failed("sc-1", A, 0);
+        h.worked("sc-1", 0);
+        let later = crate::store_privacy::DHT_CACHE_TTL_MS + 1;
+        assert!(!h.usable("sc-1", later));
+    }
+
+    #[test]
+    fn a_fresh_address_gets_its_own_attempts() {
+        // Gossip or the DHT handing back a new address must not inherit
+        // the last one's failures — that would abandon a working address
+        // for the sins of the one it replaced.
+        let mut h = AddrHealth::default();
+        for _ in 0..9 { h.failed("sc-1", A, 0); }
+        h.forget("sc-1");
+        assert!(h.usable("sc-1", 0));
     }
 }

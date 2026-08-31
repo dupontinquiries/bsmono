@@ -63,6 +63,41 @@ pub enum Command {
     /// Added with the collapse rather than after it: a control whose only door
     /// can be closed is a control you can lose.
     ToggleSettings,
+    /// Web rendering settings — global, and for the site in front of you.
+    ///
+    /// Reached from here rather than given a permanent control, which is
+    /// the point: the defaults are what almost everyone gets, and a knob
+    /// on screen for something you touch twice a year is clutter that
+    /// costs everyone.
+    ToggleWebSettings,
+    /// Change the ad filter for the CURRENT site only.
+    ///
+    /// A separate command from opening the panel because it is the thing
+    /// people actually want: a page has eaten its own sidebar, or is
+    /// unreadable through the ads, and the answer is one setting on one
+    /// site. Making them find it in a panel is making them give up.
+    SiteFilter(FilterLevel),
+    /// Forget this site's rules and follow the globals again.
+    SiteReset,
+}
+
+/// The three filter levels, as a palette-addressable value.
+///
+/// Mirrors `ad_filter::FilterMode` rather than reusing it: the palette
+/// vocabulary is a pure list this crate builds at startup, and pulling the
+/// filter's type in here would make the command set depend on the page
+/// pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterLevel { Off, Standard, Aggressive }
+
+impl FilterLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            FilterLevel::Off => "off",
+            FilterLevel::Standard => "standard",
+            FilterLevel::Aggressive => "aggressive",
+        }
+    }
 }
 
 /// One entry in the vocabulary: what it does, what it is called, and the words
@@ -83,6 +118,26 @@ pub struct Entry {
 /// the pane menu makes the user learn two orders.
 pub fn vocabulary() -> Vec<Entry> {
     let mut v: Vec<Entry> = Vec::new();
+    // WEB SETTINGS. Keywords carry the words people actually say for this
+    // — "ads", "reader", "block" — because nobody searching a palette for
+    // relief from an advertisement types "rendering preferences".
+    v.push(Entry {
+        command: Command::ToggleWebSettings,
+        title: "Web settings".into(),
+        keywords: &["ads", "reader", "images", "page", "rendering", "filter"],
+    });
+    for lvl in [FilterLevel::Off, FilterLevel::Standard, FilterLevel::Aggressive] {
+        v.push(Entry {
+            command: Command::SiteFilter(lvl),
+            title: format!("Ad filter {} for this site", lvl.label()),
+            keywords: &["ads", "site", "block", "filter"],
+        });
+    }
+    v.push(Entry {
+        command: Command::SiteReset,
+        title: "Forget this site's web settings".into(),
+        keywords: &["ads", "site", "reset", "default"],
+    });
     for view in PaneView::ALL {
         // Web panes carry a URL the model owns; opening one blank is a
         // different command and not this one.

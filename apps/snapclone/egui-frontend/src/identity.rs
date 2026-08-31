@@ -117,6 +117,26 @@ fn unhex<const N: usize>(s: &str) -> Option<[u8; N]> {
 /// The same hash the rest of the app uses for keys, not a new one. A
 /// second hashing scheme here would be a second thing to keep in step
 /// with dht-kit's key derivation, and they must agree.
+/// The value id this device publishes its presence record under.
+///
+/// One per sc-ID, which is right BECAUSE there is now exactly one record
+/// per peer: a single value carrying every address. It was wrong while the
+/// app published one value per address — OpenDHT keys a value SET by this
+/// id, so three addresses under one id were two silent overwrites.
+///
+/// Stable across restarts on purpose. A fresh id each launch would leave
+/// the previous record live until its TTL, so a peer looking us up would
+/// find this morning's addresses beside this afternoon's with nothing to
+/// choose between them but the `#ts` stamp.
+pub fn dht_value_id(sc_id: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in sc_id.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 pub fn dht_node_id(sc_id: &str) -> snapcore::routing::NodeId {
     let mut out = [0u8; 20];
     // FNV-1a over the sc-ID, expanded across the id. Not a security

@@ -13,7 +13,9 @@ use uikit_egui::{Adaptive, BgStyle, GestureLayer, LiveBackground, Nav, PaletteCo
 pub mod camera;
 pub mod debounce;
 pub mod confirm;
+pub mod audio;
 pub mod camera_source;
+pub mod capture;
 pub mod peer_source;
 pub mod contacts;
 pub mod conversation;
@@ -66,7 +68,10 @@ pub mod camera_select;
 /// Reading the actual camera list, so the picker has something to show.
 pub mod camera_enumerate;
 pub mod chevron_confirm;
+pub mod dht_announce;
 pub mod dht_bootstrap;
+pub mod dht_envelope;
+pub mod dht_presence;
 pub mod face_consent;
 pub mod frame_pump;
 pub mod firewall_backend;
@@ -87,10 +92,14 @@ pub mod sink_cushion;
 pub mod snap_expiry;
 pub mod store_privacy;
 pub mod snap_export;
+pub mod snap_state;
+pub mod snap_transport;
+pub mod snap_wire;
 pub mod tab_bar;
 pub mod thumbnails;
 pub mod trace_channels;
 pub mod voice_bridge;
+pub mod voice_wire;
 pub mod wire_v3;
 pub mod touch_feedback;
 pub mod requests;
@@ -103,6 +112,7 @@ pub mod tile_strip;
 pub mod voice_playout;
 pub mod voice_send;
 pub mod freshness;
+pub mod glove_input;
 pub mod gaze;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
@@ -165,6 +175,11 @@ pub struct Snapclone {
     pub contacts_dirty: bool,
     /// Latest-frame-wins slot between the capture thread and the paint.
     pub frames: crate::frame_pump::FrameSlot,
+    /// Where the capture engine stands, from `HostEvent::CaptureStatus`.
+    /// App state rather than a host-side print because the person aiming the
+    /// camera is looking at the viewfinder, not at stderr — a failing
+    /// pipeline's reason belongs on the page it fails on.
+    pub capture_status: crate::capture::Status,
     /// The uploaded texture, kept across frames so an unchanged frame is not
     /// re-uploaded.
     pub cam_texture: Option<egui::TextureHandle>,
@@ -193,6 +208,9 @@ pub struct Snapclone {
     /// A bind failure is permanent for this run, so it is reported once
     /// rather than every tick.
     pub dht_failed: bool,
+    /// When to publish and who to look up. Pure policy, so the cadence is
+    /// testable without a socket — see `dht_presence`.
+    pub dht_schedule: crate::dht_presence::Schedule,
     /// The accessibility scene the settings toggles register with.
     /// Held here rather than in the page so focus survives between
     /// frames — a page-local scene forgets on every repaint, which
@@ -212,6 +230,14 @@ pub struct Snapclone {
     /// Who the open conversation is with. The Conversation model holds the
     /// ITEMS; which peer they belong to is the shell's business.
     pub conversation_peer: String,
+    /// What the last call attempt amounted to. A field rather than a toast:
+    /// this controller has no general message channel, and the two that do
+    /// exist (`shutter_note`, `feed_note`) belong to other pages.
+    pub call_note: String,
+    /// Recipients the user pressed Send for, drained by the seam. A flag
+    /// rather than a direct call because the send happens on a socket the
+    /// UI frame must not block on.
+    pub send_requested: Vec<String>,
     /// The unified bottom bar (Qt UnifiedNavBar): page arrows, sub-tab segments, underline
     /// morph, page dots. Owns the page + sub-tab state; `nav` mirrors the page for swipe.
     pub bar: UnifiedNav,
@@ -236,6 +262,13 @@ pub struct Snapclone {
     pub modal: crate::modal::ModalSurface,
     /// The sealed feed of unopened snaps (Qt SnapFeedWidget).
     pub feed: crate::snaps::SnapFeed,
+    /// Which snaps are already finished, across restarts. Consulted before
+    /// anything is put in the feed — see `snap_state` for why a snap coming
+    /// back after a restart is the promise failing in the direction that
+    /// matters.
+    pub snap_state: crate::snap_state::SnapState,
+    /// The state changed and owes a write.
+    pub snap_state_dirty: bool,
     /// The ephemeral viewer. Holds the only decrypted bytes in the app, and
     /// wipes them on close.
     pub viewer: crate::snaps::Viewer,
@@ -340,6 +373,10 @@ pub struct Snapclone {
     /// mode, because wanting the gesture and wanting a cursor are different
     /// wants.
     pub shake: uikit_egui::glove::ShakeCommands,
+    /// The accelerometer driver. Everything downstream of it — the
+    /// ratchet, `apply_shake`, `apply_glove` — was written and tested and
+    /// unreachable, because nothing in this app read a sensor.
+    pub glove_input: crate::glove_input::GloveInput,
     /// Capture timeouts and limits. The backend reads a SNAPSHOT at start:
     /// editing this mid-capture does not retune a running pipeline, matching
     /// the Qt policy's own threading rule.
@@ -382,6 +419,11 @@ pub struct Snapclone {
     /// for every ever-connected peer" — and "a checklist grows a hole every
     /// time somebody adds a map". My version map was that shape starting over.
     pub sessions: crate::peer_session::Sessions,
+    /// Whether each peer's cached address is still worth trying. Beside
+    /// `punch` rather than inside it: an address is replaced wholesale by
+    /// gossip or the DHT, and a record living on the value would be reset
+    /// by the refresh that handed back the same wrong address.
+    pub addr_health: crate::punch_addrs::AddrHealth,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The page strip. Equal segments, an underline and badges — the ported
@@ -538,6 +580,25 @@ pub struct Snapclone {
     /// nowhere" render differently — the second holds the page a pixel off
     /// centre and never springs back.
     pub swipe: Option<crate::swipe_physics::Swipe>,
+    /// Which way this touch turned out to be going. Latched for the length
+    /// of the touch — see `swipe_physics::AxisLock`.
+    pub axis_lock: crate::swipe_physics::AxisLock,
+    /// Where the finger went down, so total travel can be measured against
+    /// it. egui reports per-frame deltas; a lock fed deltas would decide on
+    /// one frame's jitter.
+    pub touch_origin: Option<egui::Pos2>,
+    /// The settling animation after a release: (from_offset, ms_left,
+    /// ms_total). The page does not snap — it continues the movement it was
+    /// given, which is what makes a turn feel like the finger caused it.
+    pub swipe_settle: Option<(f32, f32, f32)>,
+    /// The touch path handled this drag, so the gesture layer's own
+    /// `page_jump` must not act on it too. Set at release and cleared when
+    /// read: checking `axis_lock.intent()` instead does not work, because
+    /// the release clears the lock in the same frame the layer reports the
+    /// jump — which turned two pages per swipe.
+    pub swipe_claimed: bool,
+    /// This touch has already gone back one level.
+    pub back_armed: bool,
     /// Accent and background derived from the photos in the inbox, so the app
     /// takes on the colour of what is in it. `None` until enough pixels have
     /// been sampled, and `None` is a real answer — see `ambient()`.
@@ -595,6 +656,7 @@ impl Snapclone {
             key_conflicts: Vec::new(),
             contacts_dirty: false,
             frames: Default::default(),
+            capture_status: crate::capture::Status::Idle,
             cam_texture: None,
             last_frame_ms: None,
             settings_error: None,
@@ -608,6 +670,7 @@ impl Snapclone {
             // blank every launch is the same lie as one that never saved.
             settings: crate::settings_page::SettingsPage::new(crate::settings_store::load()),
             dht: None, dht_failed: false,
+            dht_schedule: Default::default(),
             a11y: uikit_egui::a11y::A11yScene::new(),
             pending_vcard_text: None,
             import_report: None,
@@ -617,6 +680,8 @@ impl Snapclone {
             add_form: Default::default(),
             modal: Default::default(),
             feed: Default::default(),
+            snap_state: Default::default(),
+            snap_state_dirty: false,
             viewer: Default::default(),
             feed_press: Default::default(),
             snaps_viewed: Vec::new(),
@@ -650,6 +715,7 @@ impl Snapclone {
             posture: Default::default(),
             last_voice_at: None,
             glove: Default::default(),
+            glove_input: Default::default(),
             voice_field: None,
             dictated: Vec::new(),
             camera_policy: Default::default(),
@@ -662,6 +728,7 @@ impl Snapclone {
             nat: None,
             keyboard: Default::default(),
             sessions: Default::default(),
+            addr_health: Default::default(),
             shake: uikit_egui::glove::ShakeCommands::with(vec![
                 uikit_egui::glove::ShakeBinding {
                     dir: uikit_egui::glove::Orient::RightUp,
@@ -730,6 +797,11 @@ impl Snapclone {
             // a default set inside the widget would be this app's navigation
             // leaking into a shared component.
             swipe: None,
+            axis_lock: Default::default(),
+            touch_origin: None,
+            swipe_settle: None,
+            swipe_claimed: false,
+            back_armed: false,
             ambient: None,
             // Written here rather than in HelpManual::default(): the widget is
             // generic over its sections, and this app's manual living inside it
@@ -779,6 +851,8 @@ impl Snapclone {
             wayfinder_snaps: Vec::new(),
             conversation: Default::default(),
             conversation_peer: String::new(),
+            call_note: String::new(),
+            send_requested: Vec::new(),
             bar: UnifiedNav::new(),
             login_visible: !auto_logged_in,
             nav: Nav::new(PAGES.len()),
@@ -1031,6 +1105,25 @@ impl Snapclone {
         self.sessions.entry(peer).learn(hash);
     }
 
+
+    /// The sequence and acknowledgement for the next frame to a peer.
+    ///
+    /// `next_seq` and `take_ack` were written, tested, and called by
+    /// nothing: every snap this app sent went out with `seq: 0, ack: 0`
+    /// hardcoded at the send site. The fields were on the wire and carried
+    /// no information, so a receiver could not tell two snaps apart by
+    /// sequence, could not spot a duplicate, and learned nothing about
+    /// what the sender had received.
+    ///
+    /// Taken TOGETHER, in one call, because they belong to the same frame:
+    /// fetching the sequence and the ack separately leaves a window where
+    /// another send can interleave and pair this frame's sequence with the
+    /// next one's ack.
+    pub fn frame_ids(&mut self, peer: &str) -> (u64, u64) {
+        let s = self.sessions.entry(peer);
+        (s.next_seq(), s.take_ack())
+    }
+
     /// Classify our NAT from two STUN responses.
     ///
     /// Both probes must have left the SAME socket, and the source is explicit
@@ -1261,13 +1354,186 @@ impl Snapclone {
                 }
             }
         }
+        // WHAT THE NODE IS FOR. `publish` and `resolve` had no caller
+        // anywhere in the tree, so this node maintained a routing table on
+        // the network's behalf and asked it nothing — every peer this app
+        // has ever found came from LAN gossip. The scheduler decides the
+        // cadence (`dht_presence`); this performs it.
+        //
+        // Candidates are contacts NOT visible on the LAN. Gossip is better
+        // evidence — signed, and it means they are on this subnet right now
+        // — so asking the DHT about someone two metres away spends traffic
+        // to learn something weaker.
+        let offline: Vec<String> = self.contact_book.iter().map(|c| c.sc_id.clone())
+            .filter(|id| !self.peers.iter().any(|p| p.name == *id && p.online))
+            .collect();
+        let plan = self.dht_schedule.tick(now_ms, &offline, true);
+        if let Some(h) = self.dht.as_ref() {
+            if plan.publish && !self.local_id.is_empty() {
+                // EVERY address, not one, and never an empty one.
+                //
+                // I first published with an empty host, reasoning that "the
+                // resolver observes the real address, the same rule gossip
+                // already follows". That is right for gossip and wrong
+                // here, and the difference is what a DHT is: a gossip
+                // datagram arrives from a source address the receiver can
+                // see, while a DHT record is stored DATA that a stranger
+                // fetches later from a third machine. Nobody observes
+                // anything, so the record said "I exist" and could not be
+                // dialled.
+                //
+                // The Qt build works over CGNAT and its header says why:
+                // announce all local IPs "so any peer on any shared subnet
+                // can reach us". Choosing one is a guess about which
+                // network the OTHER person is on, made by the machine with
+                // the least information about it.
+                //
+                // One `publish` per address, matching the C++, which puts
+                // several values under the one key. `dht_announce::newest`
+                // is the other half — it discards addresses left over from
+                // a network you have since left.
+                // ONE VALUE CARRYING EVERY ADDRESS, which is both what the
+                // Qt build does and the only thing that works.
+                //
+                // I first published one value per address. OpenDHT holds a
+                // SET per key keyed by VALUE ID, and `value_id_for` derives
+                // one id from the sc-ID alone — so three addresses were
+                // three puts with the same id, two of which overwrote the
+                // others. The multi-address announcement collapsed to
+                // whichever arrived last, silently, which is worse than the
+                // single address it replaced because it looks fixed.
+                //
+                // The payload is `dht_announce`'s plaintext inside
+                // `dht_envelope`, byte for byte what a Qt peer stores.
+                let port = self.settings.current.network.listen_port;
+                let addrs: Vec<crate::dht_announce::Addr> =
+                    crate::dht_announce::local_ipv4s().into_iter()
+                        .map(|ip| crate::dht_announce::Addr::new(&ip.to_string(), port, 0))
+                        .collect();
+                let published = if addrs.is_empty() {
+                    0
+                } else {
+                    let ann = crate::dht_announce::Announcement {
+                        user_id: self.local_id.clone(),
+                        addrs,
+                        stamp: self.now_secs.max(0),
+                    };
+                    let plain = crate::dht_announce::render(&ann);
+                    match crate::dht_envelope::random_nonce() {
+                        Some(nonce) => {
+                            let sealed = crate::dht_envelope::seal_with_nonce(
+                                &self.local_id, crate::dht_envelope::V_MULTI,
+                                nonce, plain.as_bytes());
+                            h.publish_raw(&self.local_id,
+                                          crate::identity::dht_value_id(&self.local_id),
+                                          sealed);
+                            1
+                        }
+                        // A predictable nonce with a key anyone can derive
+                        // is no scheme at all, so not publishing beats
+                        // publishing that.
+                        None => 0,
+                    }
+                };
+                if published == 0 {
+                    // Worth saying: a node that publishes nothing looks
+                    // exactly like one that published fine and was never
+                    // looked up.
+                    self.feed_note =
+                        "no local address to publish — nobody can find this device".into();
+                }
+            }
+            if let Some(id) = plan.resolve.as_ref() {
+                // Raw, because the payload is the Qt build's envelope and
+                // presence has no business decoding it — see
+                // `dht::publish_raw`.
+                h.resolve_raw(id);
+            }
+        }
+
         let Some(h) = self.dht.as_ref() else { return };
-        for ev in h.poll() {
+        let events = h.poll();
+        for ev in events {
             use snapclone_presence::node_host::Event;
             match ev {
-                Event::Resolved { found, .. } => {
-                    for p in found {
-                        self.feed_note = format!("found {} via DHT", p.display_name);
+                Event::ResolvedRaw { sc_id, values } => {
+                    self.dht_schedule.finished(&sc_id, !values.is_empty());
+                    // Unwrap, parse, then take only the FRESHEST
+                    // announcement: values live about an hour, so this
+                    // morning's record is still there this afternoon
+                    // pointing at an address that now belongs to somebody
+                    // else.
+                    let anns: Vec<crate::dht_announce::Announcement> = values.iter()
+                        .filter_map(|v| crate::dht_envelope::open(&sc_id, v).ok())
+                        .filter_map(|(_, plain)| String::from_utf8(plain).ok())
+                        .filter_map(|t| crate::dht_announce::parse(&t))
+                        .collect();
+                    // Something was stored and none of it opened: that is a
+                    // format or key mismatch, not an absent peer, and the
+                    // two need very different responses.
+                    if anns.is_empty() && !values.is_empty() {
+                        self.feed_note = format!(
+                            "{sc_id}: found {} DHT record(s) this build cannot read",
+                            values.len());
+                    }
+                    let candidates = crate::dht_announce::newest(&anns);
+                    let ours = crate::dht_announce::local_ipv4s();
+                    if let Some(best) = crate::dht_announce::best_for(&ours, &candidates) {
+                        if let Some(ip) = parse_dotted_quad(&best.host) {
+                            self.note_peer_addr(&sc_id, ip, best.punch_port, now_ms);
+                            self.feed_note = format!("{sc_id} found via DHT");
+                        }
+                    }
+                    if self.dht_schedule.silent() {
+                        self.feed_note =
+                            "the DHT has answered nothing at all — this node may not be \
+                             reaching the bootstrap network".into();
+                    }
+                }
+                Event::Resolved { sc_id, found } => {
+                    // The lookup is over whether or not it found anything —
+                    // an empty answer that never ends the lookup wedges the
+                    // rotation on one id.
+                    self.dht_schedule.finished(&sc_id, !found.is_empty());
+                    // ALL the records for this id, reduced once. Each is
+                    // one address of a multi-address announcement (the C++
+                    // publishes one value per address), so treating them as
+                    // independent findings and letting the last win would
+                    // pick by arrival order — which on a DHT is arbitrary,
+                    // and would routinely choose the public address of a
+                    // peer sitting on the same wifi.
+                    let candidates: Vec<crate::dht_announce::Addr> = found.iter()
+                        .filter(|p| p.port != 0 && !p.host.trim().is_empty())
+                        .map(|p| crate::dht_announce::Addr::new(&p.host, p.port, 0))
+                        .collect();
+                    let ours = crate::dht_announce::local_ipv4s();
+                    //
+                    // A DHT RECORD IS NOW WORTH SOMETHING. It used to set a
+                    // note and evaporate: nothing recorded the address, so a
+                    // peer found via DHT still could not be dialled and the
+                    // message read as a tease.
+                    //
+                    // Only a literal address is taken. Resolving a hostname
+                    // would need DNS on the UI thread, and `best_for`
+                    // already sorts unparseable hosts last so this only
+                    // declines when there was nothing better anyway.
+                    let mut learned = 0;
+                    if let Some(best) = crate::dht_announce::best_for(&ours, &candidates) {
+                        if let Some(ip) = parse_dotted_quad(&best.host) {
+                            self.note_peer_addr(&sc_id, ip, best.punch_port, now_ms);
+                            learned += 1;
+                        }
+                    }
+                    // A NODE THAT NEVER FINDS ANYTHING should say so. It
+                    // looks identical to one whose contacts are simply
+                    // offline, and the two need very different responses.
+                    if self.dht_schedule.silent() {
+                        self.feed_note =
+                            "the DHT has answered nothing at all — this node may not be \
+                             reaching the bootstrap network".into();
+                    }
+                    if learned > 0 {
+                        self.feed_note = format!("{sc_id} found via DHT");
                     }
                 }
                 // Zero peers is the normal state of a node that has just
@@ -1277,10 +1543,13 @@ impl Snapclone {
                 Event::Stopped(why) => {
                     self.feed_note = why;
                     self.dht = None;
+                    // The in-flight lookup died with the socket. Without
+                    // this, the next node sits out a timeout on behalf of
+                    // one that no longer exists.
+                    self.dht_schedule.reset();
                 }
             }
         }
-        let _ = now_ms;
     }
 
     pub fn tick_gossip(&mut self, now_ms: u64) {
@@ -1564,6 +1833,57 @@ impl Snapclone {
     }
 
     /// Carry out what the Friends page asked for.
+    /// What the address book makes of one roster row — the pure half of the
+    /// Friends page's badges, so the rendering above stays a lookup.
+    ///
+    /// A row whose id is not a valid sc-ID gets `Plain` even when absent
+    /// from the book: the book is keyed by id, a hostname row has nothing
+    /// to store, and offering Keep on it would write a record that can
+    /// never be matched against an announcement.
+    pub fn standing_of(&self, id: &str) -> crate::friends::Standing {
+        use crate::friends::Standing;
+        match self.contact_book.get(id) {
+            Some(entry) => {
+                let t = entry.trust();
+                Standing::Known {
+                    trust: t.label().to_string(),
+                    danger: matches!(t, crate::contact_book::Trust::Conflict),
+                }
+            }
+            None if crate::identity::is_valid(id) => Standing::Discovered {
+                port: self.view.peers().iter()
+                    .find(|r| r.id == id)
+                    .map(|r| r.port)
+                    .unwrap_or(crate::qr::DEFAULT_PORT),
+            },
+            None => Standing::Plain,
+        }
+    }
+
+    /// Everything the Friends card row needs that `friends.rs` cannot know.
+    ///
+    /// The three facts used to be three lists of the same people. Assembled
+    /// here so the mapping from this app's types (`contact_book::Trust`,
+    /// `peer_source::Reach`, the picker's selection) to the widget's
+    /// vocabulary lives in one function that can be tested without a frame.
+    ///
+    /// `reach` is matched by NAME rather than by `PeerId`, because
+    /// `peer_roster` synthesises ids by zero-padding the name — matching on
+    /// the padded bytes would work today and break the moment real keys
+    /// arrive, silently, by showing every row as unreachable.
+    pub fn row_info(&self, id: &str, reach: &[crate::peer_source::RosterPeer])
+                    -> crate::friends::RowInfo {
+        crate::friends::RowInfo {
+            standing: self.standing_of(id),
+            reach: reach.iter().find(|r| r.name == id).map(|r| match r.reach {
+                crate::peer_source::Reach::Connected => crate::friends::Reach::Connected,
+                crate::peer_source::Reach::Known => crate::friends::Reach::Known,
+                crate::peer_source::Reach::Unverified => crate::friends::Reach::Unverified,
+            }),
+            selected: self.picker.selected().iter().any(|s| s == id),
+        }
+    }
+
     pub fn apply_friends(&mut self, a: crate::friends::Action) {
         use crate::friends::Action;
         match a {
@@ -1609,6 +1929,11 @@ impl Snapclone {
                     self.sync_roster();
                 }
             }
+            // The pick toggle, kept off `Selected`: one changes what a send
+            // will do, the other changes what is on screen, and routing both
+            // through one variant made opening someone's actions silently
+            // add them to a send.
+            Action::TogglePick(id) => self.picker.toggle(&id),
             Action::Selected(id) => {
                 if let Some(i) = self.peers.iter().position(|p| p.name == id) {
                     self.nav.push_subpage(i);
@@ -1645,6 +1970,67 @@ impl Snapclone {
                         // ask_delete returning a bool.
                         self.confirm_delete(&id);
                     }
+                }
+                // MESSAGE AND CALL WERE `_ => {}`. Two buttons on every
+                // contact card, drawn exactly like the two that work, doing
+                // nothing at all — worse than absent, because a missing
+                // button is visible and a dead one teaches people the app is
+                // unreliable.
+                "message" => {
+                    // The same landing the snap feed's hold gesture already
+                    // uses, so a conversation opens one way rather than two
+                    // that could drift.
+                    self.conversation_peer = id.clone();
+                }
+                "call" => {
+                    // Placing a call is: be in the room, and have the other
+                    // person in it. They are added optimistically — they
+                    // have not accepted, and there is no invite protocol on
+                    // the wire yet — which is what lets the host bring the
+                    // audio path up and start sending.
+                    //
+                    // Said plainly rather than dressed up as a ringing
+                    // state: this app cannot make their phone ring yet, and
+                    // a spinner claiming otherwise would be a lie with a
+                    // progress indicator on it.
+                    let me = self.local_id.clone();
+                    if me.is_empty() {
+                        // No identity, no call. Refused rather than half
+                        // done: `group_voice::leave` releases the floor
+                        // through `me()`, so a room we are not in cannot be
+                        // left cleanly, and the far end would receive
+                        // packets from a sender it cannot name. The same
+                        // rule gossip already follows — no key, no
+                        // announcement.
+                        self.call_note =
+                            "this device has no identity yet, so it cannot place a call"
+                            .to_string();
+                        return;
+                    }
+                    let mut people = self.group_voice.participants.clone();
+                    if !people.iter().any(|p| p.is_self) {
+                        people.push(crate::group_voice::Participant {
+                            id: me, name: "you".into(), is_self: true });
+                    }
+                    if !people.iter().any(|p| p.id == id) {
+                        let name = self.contact_book.get(&id)
+                            .map(|c| c.label().to_string())
+                            .unwrap_or_else(|| id.clone());
+                        people.push(crate::group_voice::Participant {
+                            id: id.clone(), name, is_self: false });
+                    }
+                    self.group_voice.set_participants(people);
+                    self.group_voice.join();
+                    self.call_note = match self.punch.get(&id) {
+                        Some(_) => format!("calling {id}"),
+                        // The honest version of a call that cannot work: no
+                        // current address means nothing we send arrives.
+                        // Better said now than after thirty seconds of
+                        // silence that reads as their microphone.
+                        None => format!(
+                            "{id} has no known address - they must be seen on this \
+                             network, or found via DHT, before a call can reach them"),
+                    };
                 }
                 "edit" => {
                     self.editor_id = id.clone();
@@ -1690,6 +2076,120 @@ impl Snapclone {
 
     /// Swipe between top-level pages (unless drilled into a subpage — then swipe is off so the
     /// content can scroll/interact).
+    /// Run the live page swipe for this frame; return how far the page
+    /// content should be offset.
+    ///
+    /// Touch only, by way of the axis lock: a mouse drag across the page is
+    /// a selection or a viewfinder tap-and-hold far more often than a page
+    /// turn, and the trackpad has its own path through the gesture layer.
+    ///
+    /// Returns 0.0 when nothing is happening, which is the common case and
+    /// costs one pointer read.
+    pub fn tick_page_swipe(&mut self, ui: &Ui, surface: egui::Rect, dt_ms: f32) -> f32 {
+        /// How wide the left-edge strip is for a back swipe. Wide enough to
+        /// hit without looking, narrow enough that it is not most of the
+        /// screen — the same order as the system gesture area on Android
+        /// and iOS, which is what people's thumbs are already trained on.
+        const EDGE_BACK_WIDTH: f32 = 32.0;
+        use crate::swipe_physics::Intent;
+        let t_ms = ui.input(|i| i.time) as f32 * 1000.0;
+        let (down, pos) = ui.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos()));
+
+        if down {
+            if let Some(p) = pos {
+                let origin = *self.touch_origin.get_or_insert(p);
+                let (dx, dy) = (p.x - origin.x, p.y - origin.y);
+                match self.axis_lock.feed(dx, dy) {
+                    Intent::Undecided | Intent::Scroll => {}
+                    Intent::Page => {
+                        // EDGE-SWIPE BACK. On a subpage there is nowhere to
+                        // page to — `swipe_page` refuses, correctly — and
+                        // the gesture people try is a rightward drag from
+                        // the left edge, which everywhere else on a phone
+                        // means back. Without it the only way out of a
+                        // subpage is a button, and on a large screen that
+                        // button is at the far corner from the thumb.
+                        //
+                        // Anchored to the left EDGE rather than allowed
+                        // anywhere: a rightward drag in the middle of a
+                        // detail view is a scroll or a selection far more
+                        // often than a back, and stealing it would make
+                        // content undraggable.
+                        if self.nav.can_go_back() {
+                            if origin.x - surface.left() <= EDGE_BACK_WIDTH
+                                && dx >= crate::swipe_physics::AXIS_SLOP
+                                && !self.modal.blocks_input()
+                                && !self.back_armed
+                            {
+                                self.back_armed = true;
+                                self.nav.back();
+                            }
+                            return 0.0;
+                        }
+                        // Begun at the ORIGIN, not at the point where the
+                        // lock decided: starting here would drop the first
+                        // twelve pixels of travel, so the page would jump
+                        // by that much the moment it took over.
+                        if self.swipe.is_none() && !self.modal.blocks_input() {
+                            self.begin_swipe(origin.x, surface.width(), t_ms);
+                            self.swipe_settle = None;
+                        }
+                        if let Some(sw) = self.swipe.as_mut() {
+                            sw.update(p.x, t_ms);
+                        }
+                    }
+                }
+            }
+        } else if self.touch_origin.is_some() || self.swipe.is_some() {
+            // Release.
+            if self.swipe.is_some() {
+                self.swipe_claimed = true;
+                let from = self.swipe.as_ref().map(|s| s.offset()).unwrap_or(0.0);
+                let ms = self.swipe.as_ref().map(|s| s.settle_ms(t_ms)).unwrap_or(200.0);
+                let before = self.nav.page();
+                let tab = self.end_swipe(t_ms);
+                // `end_swipe` moves `tabs`; the page the app draws from is
+                // `nav`, and they are kept in step elsewhere by
+                // `tabs.set_current(nav.page())`. Pushing it the other way
+                // here is what makes the gesture actually turn the page —
+                // and going through `swipe_page` rather than `nav.go_page`
+                // keeps the modal guard and the peel-hint bookkeeping in
+                // one place.
+                if tab != before {
+                    self.swipe_page(if tab > before { 1 } else { -1 });
+                }
+                // Settle from wherever the finger left it, so a cancelled
+                // swipe springs back rather than vanishing.
+                self.swipe_settle = Some((from, ms, ms));
+            }
+            self.touch_origin = None;
+            self.axis_lock.release();
+            // One back per touch. Without this, holding past the threshold
+            // pops a level every frame and a deep stack unwinds in a
+            // tenth of a second.
+            self.back_armed = false;
+        }
+
+        if let Some(sw) = self.swipe.as_ref() {
+            return sw.offset();
+        }
+        if let Some((from, left, total)) = self.swipe_settle.as_mut() {
+            *left -= dt_ms;
+            if *left <= 0.0 {
+                self.swipe_settle = None;
+                return 0.0;
+            }
+            // Ease out: fast at first, slowing in. A linear settle reads as
+            // mechanical because nothing physical stops at a constant rate.
+            let progress = 1.0 - (*left / *total);
+            let eased = 1.0 - (1.0 - progress) * (1.0 - progress);
+            let off = *from * (1.0 - eased);
+            ui.ctx().request_repaint();
+            return off;
+        }
+        0.0
+    }
+
     pub fn swipe_page(&mut self, sign: i32) {
         // Counted here rather than at the gesture layer so a swipe that is
         // REFUSED — blocked by a dialog, or at the end of the pages — does not
@@ -1863,6 +2363,11 @@ impl Snapclone {
         if self.group_voice.joined {
             self.group_voice.leave();
             self.voicebar.set_on_air(false);
+            // The floor goes with the call. Left set, the bar names
+            // whoever spoke last for as long as the app is open — a label
+            // that outlives its call is a claim about a conversation that
+            // is over.
+            self.voicebar.clear_talker();
         } else {
             self.group_voice.join();
         }
@@ -1991,6 +2496,39 @@ impl Snapclone {
         let facing = if self.viewfinder.facing == crate::camera::Facing::Front {
             Facing::Front } else { Facing::Rear };
         self.camera_health.record_capture_success(id, facing, now_ms);
+    }
+
+    /// Poll the accelerometer and act on any flick it produced.
+    ///
+    /// ONE call for both consumers, because a flick is one event: the
+    /// cursor turns it into a step and the command layer matches it
+    /// against a binding. Two readers of the same sensor would be a second
+    /// source of truth about what a flick is — which is the reason
+    /// `Ratchet::feed` returns an orientation rather than a vector, and
+    /// splitting it here would undo that.
+    pub fn poll_glove(&mut self, dt_ms: f32, src: &mut dyn crate::glove_input::Accel)
+        -> Option<uikit_egui::glove::Orient> {
+        let Some((o, t, elapsed)) = self.glove_input.tick(dt_ms, src) else {
+            return None;
+        };
+        // THE CURSOR OWNS THE RATCHET. It is fed the reading and returns a
+        // Tick; the flick in that Tick is the single event both consumers
+        // take. A second ratchet in the driver — which is what I built
+        // first — would be a second opinion about what a flick is, and the
+        // two would disagree the moment their timing drifted.
+        let targets = self.a11y.glove_targets();
+        let tick = self.glove.feed(o, t, elapsed, &targets);
+        // The command layer sees every POLL, not only the flicks: a double
+        // flick is two within a window, and it needs the quiet time
+        // between them to know the window elapsed.
+        self.apply_shake(tick.flicked, elapsed);
+        if tick.escaped {
+            self.apply_glove(uikit_egui::glove::GloveAction::Escaped);
+        }
+        if let Some(id) = tick.snapped.clone() {
+            self.apply_glove(uikit_egui::glove::GloveAction::ArmField(id));
+        }
+        tick.flicked
     }
 
     /// Feed a flick to the command layer and carry out whatever it binds.
@@ -2184,9 +2722,22 @@ impl Snapclone {
             // are u64s, and inventing a conversion here to make the types line
             // up would mark the wrong row.
             V::Viewed(id) => {
+                // Recorded here as well as queued: the queue is the host's
+                // to-do list and this is the app's own memory of it. Without
+                // the second, a viewed snap that the host has not written
+                // yet is still unviewed as far as the next feed load is
+                // concerned.
+                if self.snap_state.mark(&id, crate::snap_state::Mark::Viewed,
+                                        self.now_secs.max(0) as u64 * 1000) {
+                    self.snap_state_dirty = true;
+                }
                 if !self.snaps_viewed.contains(&id) { self.snaps_viewed.push(id); }
             }
             V::Expired(id) => {
+                if self.snap_state.mark(&id, crate::snap_state::Mark::Expired,
+                                        self.now_secs.max(0) as u64 * 1000) {
+                    self.snap_state_dirty = true;
+                }
                 if !self.snaps_expired.contains(&id) { self.snaps_expired.push(id.clone()); }
                 self.modal.dismiss(&format!("snap:{id}"));
             }
@@ -2267,10 +2818,26 @@ impl Snapclone {
         // live background painted behind everything
         self.bg.paint(ui.painter(), surface, &colors);
 
-        // swipe paging (top-level only)
+        // LIVE PAGE SWIPE. `begin_swipe`/`end_swipe` and the whole of
+        // `swipe_physics` — rubber band, commit distance, velocity flick,
+        // settle timing — were written, tested, and reached from nothing.
+        // What ran instead was the gesture layer's `page_jump`, which fires
+        // once at release: the page did not follow the finger, so a swipe
+        // was a guess that either worked or did nothing, with no feedback
+        // in between. On a phone that is the difference between a control
+        // and a lottery.
+        let page_offset = self.tick_page_swipe(ui, surface, dt_ms);
+
+        // The layer still runs, for the trackpad two-finger path and the
+        // sub-page detents it also reports. Its `page_jump` is only obeyed
+        // when the touch path did not claim the gesture — both acting on
+        // one drag turns two pages.
         let frame = self.gesture.update(ui, surface, true);
+        let claimed = std::mem::take(&mut self.swipe_claimed);
         if let Some(dir) = frame.page_jump {
-            self.swipe_page(dir.sign());
+            if !claimed && self.axis_lock.intent() != crate::swipe_physics::Intent::Page {
+                self.swipe_page(dir.sign());
+            }
         }
 
         // Form factor first: every dialog opened this frame is placed by it.
@@ -2568,16 +3135,48 @@ impl Snapclone {
         if self.nav.page() != 0 {
             self.ambient_camera.stop();
         }
-        match self.nav.page() {
-            // The nav has always declared five pages — Camera, Inbox, Friends,
-            // Wayfinder, Settings — and the shell routed three of them, so two
-            // tabs led nowhere. That is most of why the app read as a demo: the
-            // chrome promised more than the body delivered.
-            0 => self.camera_page(ui, &colors),
-            1 => self.inbox_page(ui, &colors),
-            2 => self.peers_page(ui, &colors),
-            3 => self.wayfinder_page(ui, &colors),
-            _ => self.settings_page(ui, &colors),
+        // THE PAGE FOLLOWS THE FINGER. A layer with a horizontal transform
+        // rather than laying the body out at an offset: an offset layout
+        // would re-run every widget's sizing on every frame of a drag, and
+        // a transform is one matrix on shapes that are drawn anyway.
+        //
+        // Clipped to the surface so the sliding page does not paint over
+        // the tab bar and the title, which do not move with it — the chrome
+        // is the fixed thing the page slides behind.
+        let draw_pages = |app: &mut Self, ui: &mut Ui| {
+            match app.nav.page() {
+                // The nav has always declared five pages — Camera, Inbox,
+                // Friends, Wayfinder, Settings — and the shell routed three
+                // of them, so two tabs led nowhere. That is most of why the
+                // app read as a demo: the chrome promised more than the
+                // body delivered.
+                0 => app.camera_page(ui, &colors),
+                1 => app.inbox_page(ui, &colors),
+                2 => app.peers_page(ui, &colors),
+                3 => app.wayfinder_page(ui, &colors),
+                _ => app.settings_page(ui, &colors),
+            }
+        };
+        if page_offset.abs() < 0.5 {
+            // The overwhelming majority of frames. No layer, no transform,
+            // no cost — a swipe must not make the still case slower.
+            draw_pages(self, ui);
+        } else {
+            // The PARENT's order, not a chosen one. egui refuses a sublayer
+            // whose order differs from its parent's — "currently undefined
+            // behavior" in its own words — and a CentralPanel is
+            // Background, so naming Order::Middle here panicked the moment
+            // a real frame ran. Derived rather than hardcoded so it stays
+            // right if this is ever drawn inside a window.
+            let layer = egui::LayerId::new(ui.layer_id().order,
+                                           ui.id().with("swiping_page"));
+            let mut child = ui.new_child(
+                egui::UiBuilder::new().layer_id(layer).max_rect(ui.available_rect_before_wrap()));
+            draw_pages(self, &mut child);
+            ui.ctx().set_transform_layer(
+                layer, egui::emath::TSTransform::from_translation(
+                    egui::vec2(page_offset, 0.0)));
+            ui.ctx().set_sublayer(ui.layer_id(), layer);
         }
 
         // THE DIM, painted last so it covers the page rather than being
@@ -2665,7 +3264,20 @@ impl Snapclone {
                 // slow tick, so the driver's job is deciding when to spend
                 // one — not holding them.
                 self.ambient_camera.on_frame();
-                let _ = f; // the pixel upload belongs to the capture backend
+                // THE UPLOAD, once per paint — `should_upload` already gated
+                // this on a new frame existing, which is what makes 30 fps
+                // into an idle background window cost nothing. A torn frame
+                // (EOF mid-frame in the reader) is refused here rather than
+                // asserted on inside egui.
+                if f.pixels_plausible() {
+                    let img = egui::ColorImage::from_rgba_unmultiplied(
+                        [f.width as usize, f.height as usize], &f.rgba);
+                    match &mut self.cam_texture {
+                        Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                        None => self.cam_texture = Some(ui.ctx().load_texture(
+                            "viewfinder", img, egui::TextureOptions::LINEAR)),
+                    }
+                }
             }
         }
         // The camera page is on screen, so the driver may run; leaving it
@@ -2745,6 +3357,17 @@ impl Snapclone {
                 ui.colored_label(c.text_weak, "starting camera…");
             }
             _ => {}
+        }
+        // The capture engine's own words, when it has any: which pipeline is
+        // being opened, or why none worked — in GStreamer's phrasing, which
+        // is the one the user can search for. "starting camera…" above says
+        // something is happening; this says WHAT.
+        if let Some(line) = self.capture_status.line() {
+            let col = match self.capture_status {
+                crate::capture::Status::Exhausted { .. } => c.warning,
+                _ => c.text_weak,
+            };
+            ui.colored_label(col, line);
         }
         // Say WHICH camera, or that there is none. The viewfinder mirrors only
         // when device-kit says this device is front-facing.
@@ -3015,24 +3638,17 @@ impl Snapclone {
         // Connected sends now, Known queues, Unverified cannot be sent to at
         // all — and the label says which so a queued message does not look
         // like a delivered one.
-        let roster = self.peer_roster();
-        if !roster.is_empty() {
+        // THE COUNT STAYS, THE THIRD LIST GOES. This page used to render every
+        // contact three times — the reachability list, the picker's list of
+        // names, and the card — so six people filled a phone screen with
+        // eighteen rows and three different ideas of what a row looks like.
+        // Reachability and the pick checkbox are fields on the card row now
+        // (`friends::RowInfo`); what is left here is the summary, which is
+        // per-page information rather than per-person.
+        let reach_roster = self.peer_roster();
+        if !reach_roster.is_empty() {
             ui.colored_label(c.text_weak,
-                format!("{} of {} reachable now", self.sendable_peers(), roster.len()));
-            for rp in &roster {
-                let col = match rp.reach {
-                    crate::peer_source::Reach::Connected => c.success,
-                    crate::peer_source::Reach::Known => c.text,
-                    crate::peer_source::Reach::Unverified => c.text_weak,
-                };
-                ui.colored_label(col, rp.label());
-            }
-            ui.separator();
-        }
-        let ids: Vec<String> = self.peers.iter().map(|p| p.name.clone()).collect();
-        for id in ids {
-            let sel = self.picker.selected().iter().any(|s| s == &id);
-            if ui.selectable_label(sel, &id).clicked() { self.picker.toggle(&id); }
+                format!("{} of {} reachable now", self.sendable_peers(), reach_roster.len()));
         }
         // SEND, and the row that watches it. The picker could select people and
         // nothing consumed the selection — and send_state, "the row the sender
@@ -3050,6 +3666,11 @@ impl Snapclone {
                     // failed or the whole thing sent.
                     self.sends.push(&format!("{who}:{now}"), now);
                 }
+                // AND ACTUALLY SEND. The rows above are what the sender
+                // WATCHES; until now they were the whole of it, so the
+                // button drew a progress row for a transfer that never
+                // started and the row aged out looking like a timeout.
+                self.send_requested = chosen.clone();
             }
         }
         // Failures surface without being hunted for. needs_attention exists
@@ -3070,10 +3691,17 @@ impl Snapclone {
         }
         // Join / leave lives here because Friends is where the people are; the
         // rest of the voice controls are on the bar itself once a session is up.
+        if !self.call_note.is_empty() {
+            // Where the call was placed from, so the answer is where the
+            // question was — a note on another page is a note nobody reads.
+            ui.colored_label(
+                if self.call_note.contains("no known address") { c.warning } else { c.text_weak },
+                &self.call_note);
+        }
         ui.horizontal(|ui| {
             let joined = self.group_voice.joined;
             if ui.selectable_label(joined, if joined { "leave channel" } else { "join channel" })
-                .clicked() { self.toggle_voice(); }
+                .clicked() { self.toggle_voice(); self.call_note.clear(); }
             if joined && ui.selectable_label(self.group_voice.muted, "mute").clicked() {
                 self.group_voice.muted = !self.group_voice.muted;
             }
@@ -3110,45 +3738,22 @@ impl Snapclone {
         //    but "I see them, keep them" had no button.
         // 2. A refused key change reached stderr and nowhere else. On a phone
         //    that is the same as nowhere.
-        let mut keep: Option<(String, u16)> = None;
-        for p in &self.peers {
-            match self.contact_book.get(&p.name) {
-                // `entry`, not `c` — the palette is already `c` in this
-                // function and shadowing it here produced three field errors
-                // that read as the Contact type being wrong.
-                Some(entry) => {
-                    let t = entry.trust();
-                    let col = match t {
-                        crate::contact_book::Trust::Conflict => c.danger,
-                        _ => c.text_weak,
-                    };
-                    ui.colored_label(col, format!("{}  ·  {}", entry.label(), t.label()));
-                }
-                None => {
-                    // Only a real sc-ID can be saved: the book is keyed by id,
-                    // and a row named after a hostname has nothing to store.
-                    if !crate::identity::is_valid(&p.name) { continue; }
-                    ui.horizontal(|ui| {
-                        ui.colored_label(c.text_weak, format!("{}  ·  discovered", p.name));
-                        if ui.button("Keep").clicked() {
-                            let port = self.view.peers().iter()
-                                .find(|r| r.id == p.name)
-                                .map(|r| r.port)
-                                .unwrap_or(crate::qr::DEFAULT_PORT);
-                            keep = Some((p.name.clone(), port));
-                        }
-                    });
-                }
-            }
-        }
-        // Applied after the loop: `keep` exists because the buttons are drawn
-        // while `self.peers` is borrowed, and adding a contact mutates it.
-        if let Some((id, port)) = keep {
-            self.apply_friends(crate::friends::Action::Add(
-                crate::friends::AddPeer { host: id, port }));
-        }
+        // The book's verdict rides ON the card rows now (`friends::Standing`)
+        // rather than as a second plain list above them — the list this
+        // replaces was the same parallel-surface problem this file had been
+        // removing elsewhere, introduced by the commit that added it and
+        // flagged in its own summary as the first thing to fix.
+        //
+        // Precomputed rather than closed over `self`, because the widget call
+        // below needs `&mut self.cards` and a closure borrowing `self` for
+        // the book would fight it.
+        let infos: std::collections::HashMap<String, crate::friends::RowInfo> =
+            self.roster.rows().iter()
+                .map(|f| (f.id.clone(), self.row_info(&f.id, &reach_roster)))
+                .collect();
+        let info = |id: &str| infos.get(id).cloned().unwrap_or_default();
         if let Some(a) = crate::friends::friends_ui(
-            ui, &self.roster, &mut self.cards, &mut self.add_form, c) {
+            ui, &self.roster, &mut self.cards, &mut self.add_form, &info, c) {
             self.apply_friends(a);
         }
     }
@@ -3383,6 +3988,12 @@ impl Snapclone {
                 crate::voice_bridge::Packet::FloorRelease => {
                     self.group_voice.floor_release(from);
                 }
+                // The samples are not touched HERE: the caller gets the
+                // packet back and the seam turns it into `DecodeAudio`, so
+                // the codec stays in the host. What this arm must not do is
+                // what it used to — nothing at all, silently, which is why
+                // a call could connect, negotiate the floor and play no
+                // sound.
                 crate::voice_bridge::Packet::VoiceFrame(_) => {}
             }
         }
@@ -3847,6 +4458,175 @@ mod tests {
     /// composition rather than `Event::Text`, and an on-screen keyboard adds
     /// another path again. That is where to look next, and it needs a running
     /// binary rather than a test.
+    /// The Friends page draws each contact ONCE.
+    ///
+    /// The regression this pins is the one the commit that introduced it
+    /// flagged in its own summary: trust labels and Keep buttons were drawn
+    /// as a plain list ABOVE the card widget, so a contact appeared twice on
+    /// the page in two different layouts. Counting the id in the frame's
+    /// output is the only check that catches a second surface coming back —
+    /// a unit test on `standing_of` would still pass with the duplicate
+    /// list restored.
+    /// A drag across the page turns it, and the page moves while it does.
+    ///
+    /// Driven through a real egui frame rather than by calling
+    /// `tick_page_swipe` directly, because what was broken was not the
+    /// physics — `swipe_physics` was written and tested — it was that
+    /// nothing reached it. A unit test on the physics passed the whole time
+    /// the gesture did nothing.
+    #[test]
+    fn dragging_across_the_page_turns_it_and_moves_it_on_the_way() {
+        use egui::{Context, Event, PointerButton, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+
+        let mut frame = |app: &mut Snapclone, events: Vec<Event>| -> f32 {
+            let mut offset = 0.0;
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen),
+                                       ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.ui(ui, &adaptive);
+                    offset = app.swipe.as_ref().map(|s| s.offset()).unwrap_or(0.0);
+                });
+            });
+            offset
+        };
+        let at = |x: f32| Event::PointerMoved(Pos2::new(x, 400.0));
+        let press = |x: f32| Event::PointerButton {
+            pos: Pos2::new(x, 400.0), button: PointerButton::Primary,
+            pressed: true, modifiers: Default::default() };
+        let release = |x: f32| Event::PointerButton {
+            pos: Pos2::new(x, 400.0), button: PointerButton::Primary,
+            pressed: false, modifiers: Default::default() };
+
+        assert_eq!(app.nav.page(), 0);
+        frame(&mut app, vec![at(320.0), press(320.0)]);
+        // A short move is below the slop: still a tap as far as anyone knows.
+        frame(&mut app, vec![at(314.0)]);
+        assert!(app.swipe.is_none(), "the page moved on a six-pixel wobble");
+        // Now a real leftward drag — toward the NEXT page.
+        let mid = frame(&mut app, vec![at(200.0)]);
+        assert!(mid < -50.0, "the page did not follow the finger: {mid}");
+        frame(&mut app, vec![at(60.0), release(60.0)]);
+        assert_eq!(app.nav.page(), 1, "a drag most of the way across turned nothing");
+    }
+
+    #[test]
+    fn a_swipe_from_the_left_edge_goes_back_out_of_a_subpage() {
+        // On a subpage there is nowhere to page to, so the gesture people
+        // try is the one that means back everywhere else on a phone. Without
+        // it the only way out is a button in the far corner from the thumb.
+        use egui::{Context, Event, PointerButton, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let mut frame = |app: &mut Snapclone, events: Vec<Event>| {
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen),
+                                       ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        };
+        let mv = |x: f32| Event::PointerMoved(Pos2::new(x, 400.0));
+        let btn = |x: f32, pressed: bool| Event::PointerButton {
+            pos: Pos2::new(x, 400.0), button: PointerButton::Primary,
+            pressed, modifiers: Default::default() };
+
+        app.nav.push_subpage(1);
+        assert!(app.nav.can_go_back());
+        frame(&mut app, vec![mv(8.0), btn(8.0, true)]);
+        frame(&mut app, vec![mv(90.0)]);
+        assert!(!app.nav.can_go_back(), "the edge swipe did not go back");
+        let page_before = app.nav.page();
+        // Still dragging: one back per touch, or a deep stack unwinds in a
+        // tenth of a second and the page turns underneath it.
+        frame(&mut app, vec![mv(300.0)]);
+        frame(&mut app, vec![mv(360.0), btn(360.0, false)]);
+        assert_eq!(app.nav.page(), page_before,
+                   "the same touch also turned the page");
+    }
+
+    #[test]
+    fn a_rightward_drag_in_the_middle_of_a_subpage_is_not_a_back() {
+        // A rightward drag away from the edge is a scroll or a selection far
+        // more often than a back. Stealing it makes content undraggable.
+        use egui::{Context, Event, PointerButton, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let mut frame = |app: &mut Snapclone, events: Vec<Event>| {
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen),
+                                       ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        };
+        app.nav.push_subpage(1);
+        frame(&mut app, vec![Event::PointerMoved(Pos2::new(200.0, 400.0)),
+            Event::PointerButton { pos: Pos2::new(200.0, 400.0),
+                button: PointerButton::Primary, pressed: true,
+                modifiers: Default::default() }]);
+        frame(&mut app, vec![Event::PointerMoved(Pos2::new(340.0, 400.0))]);
+        assert!(app.nav.can_go_back(), "a mid-screen drag went back");
+    }
+
+    #[test]
+    fn a_vertical_drag_scrolls_and_never_steals_the_page() {
+        // The gesture people make constantly. Losing it to the pager is the
+        // error worth avoiding, and the lock latches so a late sideways
+        // swing cannot claim it back.
+        use egui::{Context, Event, PointerButton, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let mut frame = |app: &mut Snapclone, events: Vec<Event>| {
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen),
+                                       ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        };
+        let mv = |x: f32, y: f32| Event::PointerMoved(Pos2::new(x, y));
+        frame(&mut app, vec![mv(200.0, 600.0), Event::PointerButton {
+            pos: Pos2::new(200.0, 600.0), button: PointerButton::Primary,
+            pressed: true, modifiers: Default::default() }]);
+        frame(&mut app, vec![mv(206.0, 520.0)]);   // clearly vertical
+        assert!(app.swipe.is_none(), "a scroll started a page swipe");
+        frame(&mut app, vec![mv(20.0, 500.0)]);    // now swing hard sideways
+        assert!(app.swipe.is_none(), "the lock let go mid-touch");
+        assert_eq!(app.nav.page(), 0);
+    }
+
+    #[test]
+    fn a_contact_appears_once_on_the_friends_page_not_twice() {
+        use egui::{Context, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        app.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "sc-aabbccdd".into(), port: 9000 }));
+        // Friends is page 2 — by name, so a nav reorder fails here loudly
+        // rather than silently testing a different page.
+        app.nav.go_page(PAGES.iter().position(|n| *n == "Friends").unwrap());
+        let adaptive = Adaptive::default();
+        let out = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+        });
+        // Positions in the failure message, because "3 times" does not say
+        // WHICH surfaces came back and the answer is what you need next.
+        let hits: Vec<String> = out.shapes.iter().filter_map(|shape| {
+            match &shape.shape {
+                egui::epaint::Shape::Text(t) if t.galley.text().contains("sc-aabbccdd") =>
+                    Some(format!("{:?} @{:?}", t.galley.text(), t.pos)),
+                _ => None,
+            }
+        }).collect();
+        assert_eq!(hits.len(), 1,
+                   "the contact is drawn {} times — a parallel surface is back: {hits:#?}",
+                   hits.len());
+    }
+
     #[test]
     fn typing_through_the_shell_keeps_every_character() {
         use egui::{Context, Event, RawInput};
@@ -6219,5 +6999,64 @@ mod call_and_qr_wiring_tests {
         // open_qr_scan, and the state that call produces survives a frame.
         // That a finger can reach it is verified by reading the code, not by
         // this test.
+    }
+}
+
+#[cfg(test)]
+mod frame_id_tests {
+    use super::*;
+
+    fn app() -> Snapclone { Snapclone::new(Vec::new()) }
+
+    #[test]
+    fn each_frame_to_a_peer_gets_a_new_sequence() {
+        // Every snap went out as seq 0, so a receiver could not tell two
+        // apart or spot a re-send.
+        let mut a = app();
+        let (s1, _) = a.frame_ids("sc-1");
+        let (s2, _) = a.frame_ids("sc-1");
+        assert!(s2 > s1, "{s1} then {s2}");
+    }
+
+    #[test]
+    fn sequences_are_per_peer_and_do_not_leak_between_them() {
+        // A shared counter tells peer B that it missed everything sent to
+        // peer A, and a receiver counting gaps would ask for re-sends of
+        // frames addressed to somebody else.
+        let mut a = app();
+        a.frame_ids("sc-1");
+        a.frame_ids("sc-1");
+        let (first_to_b, _) = a.frame_ids("sc-2");
+        assert_eq!(first_to_b, 1, "peer B started at {first_to_b}");
+    }
+
+    #[test]
+    fn the_ack_reports_the_highest_sequence_seen_from_that_peer() {
+        let mut a = app();
+        a.sessions.entry("sc-1").observe_seq(7);
+        assert_eq!(a.frame_ids("sc-1").1, 7);
+    }
+
+    #[test]
+    fn a_late_low_sequence_does_not_move_the_ack_backwards() {
+        // Reordering is normal. An ack that went backwards would make the
+        // peer re-send everything after it — a retry storm caused by the
+        // network being ordinary.
+        let mut a = app();
+        a.sessions.entry("sc-1").observe_seq(9);
+        a.sessions.entry("sc-1").observe_seq(4);
+        assert_eq!(a.frame_ids("sc-1").1, 9);
+    }
+
+    #[test]
+    fn forgetting_a_peer_restarts_its_numbering() {
+        // `forget` clears the session, and a stale sequence surviving it
+        // would have the peer waiting for frames from a conversation that
+        // is over.
+        let mut a = app();
+        a.frame_ids("sc-1");
+        a.frame_ids("sc-1");
+        a.sessions.forget("sc-1");
+        assert_eq!(a.frame_ids("sc-1").0, 1);
     }
 }

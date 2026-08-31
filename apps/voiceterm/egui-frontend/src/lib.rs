@@ -24,6 +24,14 @@ pub mod command_search;
 pub mod corpus_tape;
 pub mod acoustic_cache;
 pub mod mail_selector;
+/// A test-only harness for driving renderers through real egui frames.
+/// Compiled out of a release build entirely — it exists because five lists
+/// in this app drew rows nobody could click and every model test passed.
+#[cfg(test)]
+pub mod frame_probe;
+pub mod mail_rfc822;
+pub mod mail_store;
+pub mod web_prefs;
 pub mod token_log;
 pub mod connections_graph;
 pub mod summary_queue;

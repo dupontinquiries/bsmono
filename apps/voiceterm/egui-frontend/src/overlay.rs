@@ -54,6 +54,11 @@ pub fn form(s: Surface) -> Form {
         Surface::Settings => Form::CenterPopup { w: 320.0, max_h: 760.0 },
         // favoritesPopup main.qml:30479 — width: Math.min(380, root.width - 32), centered
         Surface::Favorites => Form::CenterPopup { w: 380.0, max_h: 640.0 },
+        // No QML counterpart — this surface is new. A centred popup like
+        // settings, and NARROWER: it holds a handful of rows for the
+        // current site plus the globals, and a 320-wide panel of four
+        // toggles reads as a dialog rather than a page of preferences.
+        Surface::WebSettings => Form::CenterPopup { w: 340.0, max_h: 520.0 },
         // cmdSheetPanel main.qml:1543 — height: Math.min(parent.height * 0.72, 640), full width
         Surface::CmdSheet => Form::BottomSheet { max_h: 640.0, frac: 0.72 },
         // paletteDrawer main.qml:31310 — Math.min(360, root.width*0.85), RightEdge

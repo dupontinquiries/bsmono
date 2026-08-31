@@ -18,6 +18,11 @@ pub mod dial;
 pub mod channel;
 pub mod tags;
 pub mod outputs;
+pub mod music_scan;
+pub mod playback;
+pub mod surround;
+pub mod voice_control;
+pub mod voice_source;
 pub mod sources;
 pub mod fileproc;
 pub mod shell_bits;
@@ -110,7 +115,6 @@ impl LibraryTab {
 /// an opacity reveal, and the accent halo blooming behind a change.
 fn silhouette_paint(ui: &Ui, s: &crate::product_silhouette::ProductSilhouette,
                     rect: egui::Rect, c: &PaletteColors) {
-    use crate::product_silhouette::Shape;
     let p = ui.painter().with_clip_rect(rect);
     let a = (s.reveal() * 255.0) as u8;
     let line = egui::Color32::from_rgba_unmultiplied(
@@ -120,31 +124,31 @@ fn silhouette_paint(ui: &Ui, s: &crate::product_silhouette::ProductSilhouette,
         p.circle_filled(rect.center(), rect.width() * 0.62,
             egui::Color32::from_rgba_unmultiplied(c.accent.r(), c.accent.g(), c.accent.b(), ha));
     }
-    let strokes = s.shape().strokes();
-    let (w0, w1) = (strokes[0], strokes.get(1).copied().unwrap_or(strokes[0]));
-    let cx = rect.center();
-    match s.shape() {
-        Shape::Disc => {
-            p.circle_stroke(cx, rect.width() * 0.38, egui::Stroke::new(w0, line));
-            p.circle_stroke(cx, rect.width() * 0.16, egui::Stroke::new(w1, line));
+    // THE PRODUCT OUTLINE, walked from data.
+    //
+    // This used to be four hand-drawn primitives — Disc was two concentric
+    // circles, Cube a rectangle with a dot — and at badge size they were
+    // indistinguishable from each other and from a loading spinner. The
+    // shapes are point lists in a unit box now (`Shape::outline`), so the
+    // geometry is reviewable, testable, and the same at every size the
+    // badge is drawn at.
+    //
+    // Inset so a 1.2px stroke centred on the boundary is not half clipped;
+    // `with_clip_rect` above would take the outer half of it otherwise.
+    let inset = rect.shrink(1.5);
+    let at = |(x, y): (f32, f32)| egui::pos2(
+        inset.left() + x * inset.width(),
+        inset.top() + y * inset.height());
+    for sp in s.shape().outline() {
+        let mut pts: Vec<egui::Pos2> = sp.pts.iter().map(|q| at(*q)).collect();
+        if sp.closed {
+            if let Some(first) = pts.first().copied() { pts.push(first); }
         }
-        Shape::Bar => {
-            let r = egui::Rect::from_center_size(cx, egui::vec2(rect.width() * 0.82, rect.height() * 0.3));
-            p.rect_stroke(r, 4.0, egui::Stroke::new(w0, line), egui::StrokeKind::Inside);
-            p.line_segment([r.left_center() + egui::vec2(3.0, 0.0), r.right_center() - egui::vec2(3.0, 0.0)],
-                egui::Stroke::new(w1, line));
-        }
-        Shape::Tower => {
-            let r = egui::Rect::from_center_size(cx, egui::vec2(rect.width() * 0.34, rect.height() * 0.84));
-            p.rect_stroke(r, 3.0, egui::Stroke::new(w0, line), egui::StrokeKind::Inside);
-            p.line_segment([r.center_top() + egui::vec2(0.0, 4.0), r.center_bottom() - egui::vec2(0.0, 4.0)],
-                egui::Stroke::new(w1, line));
-        }
-        Shape::Cube => {
-            let r = egui::Rect::from_center_size(cx, egui::vec2(rect.width() * 0.6, rect.height() * 0.6));
-            p.rect_stroke(r, 3.0, egui::Stroke::new(w0, line), egui::StrokeKind::Inside);
-            p.circle_stroke(cx, rect.width() * 0.14, egui::Stroke::new(w1, line));
-        }
+        // One polyline per subpath rather than a segment per pair: egui
+        // joins the corners of a polyline, and a shape drawn as loose
+        // segments has a visible notch at every vertex — which on a
+        // 16-point outline is the whole outline.
+        p.add(egui::Shape::line(pts, egui::Stroke::new(sp.weight, line)));
     }
 }
 
@@ -356,6 +360,20 @@ pub struct Controller {
     /// list changes length. A per-row struct because the halo is per-row
     /// state — one shared badge would bloom every row on any change.
     pub silhouettes: Vec<crate::product_silhouette::ProductSilhouette>,
+    /// The animation scale from settings, remembered so a badge created
+    /// after `apply_settings` gets it too — a device that appears mid-
+    /// session would otherwise animate at full speed under reduce-motion.
+    pub motion_scale: f32,
+    /// Which speaker is which, for surround. Held beside the picker rather
+    /// than inside it: the picker answers "which speakers", and this
+    /// answers "where they are" — one survives a change to the other.
+    pub surround: crate::surround::Assignment,
+    /// Voice control settings. OFF until someone turns it on — a music
+    /// player that listens is a microphone in a living room.
+    pub voice: crate::voice_control::VoicePrefs,
+    /// A low-confidence command awaiting a yes. Free text cannot be
+    /// checked against anything, so a mishearing starts the wrong album.
+    pub voice_confirm: Option<crate::voice_control::Command>,
     /// The volume the dial last reported, waiting for the host to debounce and
     /// push. `None` once it has been sent.
     pub pending_volume: Option<f32>,
@@ -377,6 +395,22 @@ pub struct Controller {
     pub device_selector: crate::outputs::DeviceSelector,
     /// The route the user last committed; the host applies it.
     pub pending_route: Option<crate::settings_page::Route>,
+    /// What the host should do about audio, drained like the other pending
+    /// fields. A COMMAND rather than a `Player` on the controller: this
+    /// view is built and tested without a process table, and putting a
+    /// child process on it would end that.
+    pub pending_playback: Option<crate::playback::Request>,
+    /// The route audio is currently going to, so a track change does not
+    /// rebuild a combine sink that has not changed.
+    pub audio_sink: crate::playback::Sink,
+    /// The file the transport would play. Set by whatever resolves a track
+    /// to something on disk; empty until then, and empty is honest — see
+    /// `now_playing_url`.
+    pub track_url: String,
+    /// (track id, file path), from whatever catalogue the host installed.
+    /// Empty until it does, which is why `request_play` refuses rather
+    /// than guessing.
+    pub track_paths: Vec<(i64, String)>,
     /// The rating the user last set; the host applies it and echoes back
     /// through `confirm_rating`. Same shape as `pending_route` — this view
     /// owns no library.
@@ -486,6 +520,10 @@ impl Controller {
             dial: crate::dial::VolumeDial::new(0.0),
             watermark: crate::dial_watermark::DialWatermark::default(),
             silhouettes: Vec::new(),
+            motion_scale: 1.0,
+            surround: Default::default(),
+            voice: crate::voice_control::load(),
+            voice_confirm: None,
             pending_volume: None,
             tags: Vec::new(),
             tag_editor: Default::default(),
@@ -494,6 +532,10 @@ impl Controller {
             open_tag: None,
             device_selector: Default::default(),
             pending_route: None,
+            pending_playback: None,
+            audio_sink: crate::playback::Sink::Default,
+            track_url: String::new(),
+            track_paths: Vec::new(),
             pending_source: None,
             pending_rating: None,
             active_device_url: String::new(),
@@ -574,7 +616,37 @@ impl Controller {
     pub fn apply_settings(&mut self, ctx: &egui::Context, prefs: &settings_kit::Prefs) {
         uikit_egui::apply_prefs(ctx, prefs);
         *self.gesture.config_mut() = prefs.gesture_config(320.0);
+        // THE ACCENT CHANGED, so the badges bloom once. `accent_changed`
+        // is what the halo is FOR — the module calls it "a marker, not a
+        // flourish" — and it had no caller, so switching palette repainted
+        // every outline in a new colour with nothing to draw the eye to
+        // the change.
+        //
+        // Guarded on the palette actually differing: called
+        // unconditionally this fires every frame, and a halo that never
+        // stops is the throb the module's two-phase envelope exists to
+        // avoid.
+        if self.palette != prefs.palette {
+            for s in self.silhouettes.iter_mut() {
+                s.accent_changed();
+            }
+        }
         self.palette = prefs.palette.clone();
+        // REDUCE MOTION REACHES THE BADGES. `set_motion_scale` existed with
+        // no caller, so the silhouettes animated at full speed under a
+        // setting whose whole point is that they should not — and a
+        // reduce-motion preference that some of the app ignores is worse
+        // than one it does not offer, because the person has no way to
+        // tell which parts obeyed.
+        //
+        // `time_scale` is the kit's own number: Snappy 0.5, Smooth 1.0,
+        // Reduced near-instant. Reading it here rather than inventing a
+        // second scale keeps the badge animating like everything else the
+        // kit draws.
+        self.motion_scale = prefs.gesture.animation.time_scale();
+        for s in self.silhouettes.iter_mut() {
+            s.set_motion_scale(self.motion_scale);
+        }
     }
 
     /// Render the controller.
@@ -595,6 +667,13 @@ impl Controller {
                     self.transport.artist = t.artist_text();
                     self.transport.playing = true;
                 }
+                // AND ACTUALLY PLAY IT. This arm set four labels and
+                // `playing = true`, so pressing play on a row changed the
+                // header and made no sound. The path comes from the
+                // resolver the host installed; with none, `request_play`
+                // says so rather than starting a player with an empty
+                // argument.
+                self.request_play(id);
             }
             TracksAction::Enqueue(id) => {
                 if let Some(t) = self.all_tracks.tracks().iter().find(|t| t.id == id) {
@@ -782,12 +861,57 @@ impl Controller {
             self.active_device_url = url;
         }
         ui.separator();
+        // VOICE CONTROL, in settings beside the other things that change
+        // what the app does on its own. Off until asked for; the panel
+        // says what enabling it means.
+        if self.sinks.open {
+            ui.separator();
+            if crate::voice_control::voice_settings_ui(ui, &mut self.voice, c) {
+                if let Err(e) = crate::voice_control::store(&self.voice) {
+                    // Silently, a write failure means a setting that works
+                    // until restart — and for a listening switch, one that
+                    // silently turns itself back ON is the wrong direction
+                    // to fail in.
+                    self.toast.show(&format!("voice settings not saved: {e}"));
+                }
+            }
+        }
+        // SURROUND, beside the combine control rather than instead of it.
+        // They are different things — combine duplicates a stream, surround
+        // splits one — and a single toggle between them would make picking
+        // "several speakers" mean two incompatible things depending on a
+        // mode the person set earlier.
+        if self.sinks.open {
+            ui.separator();
+            ui.label(egui::RichText::new("surround").strong());
+            let speakers: Vec<(String, String)> = self.sinks.devices.iter()
+                .map(|d| (d.mac.clone(), d.label().to_string())).collect();
+            crate::surround::assign_ui(ui, &mut self.surround, &speakers, c);
+            // Enabled only when the assignment would actually route: the
+            // rules refuse a setup that drops half the mix, and a button
+            // that accepts one and fails later is the validation arriving
+            // after the decision.
+            let ok = self.surround.routable();
+            if ui.add_enabled(ok, egui::Button::new("Use this arrangement")).clicked() {
+                if let Some(sink) = crate::surround::sink_of(&self.surround) {
+                    self.audio_sink = sink;
+                    self.pending_playback = Some(crate::playback::Request::ReleaseRoute);
+                    self.toast.show("surround set");
+                }
+            }
+        }
         // Output routing: which speaker, or which speakers. Committed through
         // the existing SinkPicker, which now knows about drivers.
         if self.sinks.open {
             if ui.add_enabled(self.sinks.can_combine(),
                 egui::Button::new(self.sinks.combine_label())).clicked() {
                 self.pending_route = self.sinks.route();
+                // Audio follows the picker in the same act. Leaving them to
+                // be connected by the host is how the UI ends up showing a
+                // route the sound is not going to.
+                if let Some(r) = self.pending_route.clone() {
+                    self.set_audio_route(&r);
+                }
             }
         }
         // INPUT SOURCES, beside the output routing they belong with. sources_ui
@@ -815,8 +939,16 @@ impl Controller {
         // A badge per row. The shape is parsed from the device name each
         // frame; set_shape only blooms the halo when it actually changed, so a
         // list refresh cannot flash every badge — the module's own guard.
+        let before = self.silhouettes.len();
         self.silhouettes.resize_with(self.devices.len(),
             crate::product_silhouette::ProductSilhouette::default);
+        // Newly created badges inherit the setting. Applying it only in
+        // `apply_settings` leaves a device that appeared afterwards
+        // animating at full speed, which is the half-obeyed reduce-motion
+        // the field exists to prevent.
+        for s in self.silhouettes.iter_mut().skip(before) {
+            s.set_motion_scale(self.motion_scale);
+        }
         let dt_ms = ui.input(|i| i.stable_dt).min(0.1) * 1000.0;
         for (i, d) in self.devices.iter_mut().enumerate() {
             ui.horizontal(|ui| {
@@ -1064,6 +1196,160 @@ impl Controller {
         // has one and NowPlaying does not — it carries display strings, since
         // line-in and radio have no track to name.
         self.now_playing_id = Some(e.track_id);
+        // AND ASK FOR THE SOUND. Every path that starts a track goes
+        // through here — the queue head, an album's first track, a tapped
+        // row — so this is the one place it has to be requested. It was
+        // missing, which is why "play album" queued, showed a title and
+        // played nothing.
+        self.request_play(e.track_id);
+    }
+
+    /// Act on something the person said.
+    ///
+    /// The whole decision — is voice on, was that a command, is it safe to
+    /// act on — lives in `voice_control::decide`, so there is ONE place
+    /// that can be wrong about whether the app is listening. A check
+    /// duplicated across handlers is one that gets missed in the fourth.
+    ///
+    /// Returns what happened, so a host can log it and a test can assert
+    /// it without reading four fields.
+    pub fn heard(&mut self, phrase: &str) -> crate::voice_control::Outcome {
+        let outcome = crate::voice_control::decide(&self.voice, phrase);
+        match &outcome {
+            crate::voice_control::Outcome::Run(cmd) => {
+                let cmd = cmd.clone();
+                self.run_voice(cmd);
+            }
+            crate::voice_control::Outcome::Confirm(cmd) => {
+                self.voice_confirm = Some(cmd.clone());
+                self.toast.show(&format!("say yes to {}", cmd.describe()));
+            }
+            crate::voice_control::Outcome::Ignored => {}
+        }
+        outcome
+    }
+
+    /// Accept or reject a pending confirmation.
+    pub fn confirm_voice(&mut self, yes: bool) {
+        let Some(cmd) = self.voice_confirm.take() else { return };
+        if yes { self.run_voice(cmd); }
+    }
+
+    /// Carry out a command that has been decided on.
+    pub fn run_voice(&mut self, cmd: crate::voice_control::Command) {
+        use crate::voice_control::Command as C;
+        use crate::transport::Repeat;
+        match cmd {
+            // Through the same paths a tap takes. A voice command that
+            // set `playing` directly would skip `start_playing` and make
+            // no sound — which is exactly the bug the tap path had.
+            C::Play => { if !self.transport.playing { self.toggle_play(); } }
+            C::Pause => { if self.transport.playing { self.toggle_play(); } }
+            C::Toggle => self.toggle_play(),
+            C::Stop => {
+                self.transport.pause();
+                self.pending_playback = Some(crate::playback::Request::Stop);
+            }
+            C::Next => self.on_track_ended(),
+            // "Previous" restarts the current track rather than reaching
+            // backwards: nothing here keeps a history of what played, and
+            // a control that silently does the wrong thing is worse than
+            // one that does the modest right thing. It is what a physical
+            // transport does on the first press too.
+            C::Previous => {
+                if let Some(id) = self.now_playing_id {
+                    self.transport.report(0.0);
+                    self.request_play(id);
+                }
+            }
+            C::Search(q) => {
+                self.search.query = q;
+                self.voice_confirm = None;
+            }
+            C::PlayNamed(q) => {
+                // Searched, not played. Free text cannot name a track
+                // exactly, and starting the first fuzzy match is how a
+                // request for one album plays another.
+                self.search.query = q;
+            }
+            C::VolumeUp => self.nudge_volume(10),
+            C::VolumeDown => self.nudge_volume(-10),
+            C::VolumeSet(n) => self.pending_volume = Some(f32::from(n)),
+            C::Mute => self.pending_volume = Some(0.0),
+            // Unmute goes to a MODEST level, not to whatever it was. The
+            // previous volume is not remembered here, and restoring a
+            // guessed loud one in a room where someone just asked for
+            // quiet is the wrong way to be wrong.
+            C::Unmute => self.pending_volume = Some(30.0),
+            C::ShuffleOn => self.transport.shuffle = true,
+            C::ShuffleOff => self.transport.shuffle = false,
+            C::RepeatOne => self.transport.repeat = Repeat::One,
+            C::RepeatAll => self.transport.repeat = Repeat::All,
+            C::RepeatOff => self.transport.repeat = Repeat::Off,
+        }
+    }
+
+    /// Start or stop, the same way the transport button does.
+    ///
+    /// Extracted from the draw path rather than duplicated: the button
+    /// flips `playing` and then queues a request, and a voice command that
+    /// set the flag directly would show as playing and make no sound —
+    /// which is exactly the bug the tap path had before it was fixed. One
+    /// function, so there is one place that can be wrong about it.
+    pub fn toggle_play(&mut self) {
+        let now_playing = !self.transport.playing;
+        self.transport.playing = now_playing;
+        self.pending_playback = Some(if now_playing {
+            crate::playback::Request::Play {
+                url: self.now_playing_url(),
+                sink: self.audio_sink.clone(),
+            }
+        } else {
+            crate::playback::Request::Stop
+        });
+    }
+
+    /// Move the volume by a step, clamped.
+    fn nudge_volume(&mut self, by: i32) {
+        let cur = self.pending_volume.unwrap_or_else(
+            || self.devices.first().map(|d| d.volume as f32).unwrap_or(50.0));
+        self.pending_volume = Some((cur + by as f32).clamp(0.0, 100.0));
+    }
+
+    /// A track finished on its own. Decide what plays next.
+    ///
+    /// Called ONLY for a natural end. A stop is not an end — the player
+    /// distinguishes them for exactly this reason, because advancing on a
+    /// pause means pressing pause skips a track.
+    pub fn on_track_ended(&mut self) {
+        use crate::transport::Repeat;
+        match self.transport.repeat {
+            // Repeat one replays the SAME track rather than consuming the
+            // queue. Popping the head here would empty the queue one track
+            // per repeat, which is the mode quietly destroying the thing it
+            // is looping inside.
+            Repeat::One => {
+                if let Some(id) = self.now_playing_id {
+                    self.transport.report(0.0);
+                    self.request_play(id);
+                    return;
+                }
+            }
+            Repeat::Off | Repeat::All => {}
+        }
+        match self.queue.advance() {
+            Some(next) => {
+                self.transport.report(0.0);
+                self.start_playing(&next);
+            }
+            None => {
+                // Nothing queued. Stopped rather than left "playing" over
+                // silence, which is the state this app kept showing before
+                // there was any audio at all.
+                self.transport.playing = false;
+                self.now_playing.playing = false;
+            }
+        }
     }
 
     fn play_browse_track(&mut self, id: i64) {
@@ -1629,7 +1915,407 @@ impl Controller {
         // The engine's own gates decide in Auto; this only says which mode.
         crate::anc::anc_chip(ui, &mut self.anc, &mut self.a11y, c);
         if self.now.active() { ui.label(self.now.line()); }
+        // THE PLAY BUTTON NOW MAKES A SOUND. `transport_ui` has always
+        // flipped `playing` and returned a seek target, and nothing in the
+        // tree opened an audio device — so the control was a picture of a
+        // transport. The request is queued for the host to perform; see
+        // `playback::Request` on why this view does not own a process.
+        let was_playing = self.transport.playing;
         crate::transport::transport_ui(ui, &mut self.transport, c);
+        if self.transport.playing != was_playing {
+            // `transport_ui` already flipped the flag, so put it back and
+            // go through `toggle_play` — the one place that pairs the flag
+            // with the request. Two places doing it is how one of them
+            // ends up showing "playing" over silence.
+            self.transport.playing = was_playing;
+            self.toggle_play();
+        }
+    }
+
+    /// Ask the host to play a track id.
+    ///
+    /// The id is resolved through `track_paths`, which the host fills from
+    /// whatever catalogue it has. Unresolved is REPORTED, not attempted: a
+    /// player handed an empty path fails with "no such file", which reads
+    /// as a broken player rather than as the missing catalogue it is.
+    pub fn request_play(&mut self, id: i64) {
+        match self.track_paths.iter().find(|(k, _)| *k == id) {
+            Some((_, path)) => {
+                self.track_url = path.clone();
+                self.pending_playback = Some(crate::playback::Request::Play {
+                    url: path.clone(),
+                    sink: self.audio_sink.clone(),
+                });
+            }
+            None => {
+                self.transport.playing = false;
+                self.toast.show("no file for that track");
+            }
+        }
+    }
+
+    /// Tell the view where the files are.
+    ///
+    /// A flat list rather than a map: a page is at most a few hundred rows,
+    /// a linear scan over that is nothing, and a `Vec` keeps the controller
+    /// `Clone` and comparable — which its tests rely on.
+    pub fn set_track_paths(&mut self, paths: Vec<(i64, String)>) {
+        self.track_paths = paths;
+    }
+
+    /// What to play. The queue's head, or the current track.
+    ///
+    /// A stub in the sense that this app has no resolver from a track id to
+    /// a file yet — the library holds titles and tags, not paths. Named and
+    /// EMPTY rather than fabricated: an invented path makes the player fail
+    /// with "no such file", which reads as a broken player rather than as a
+    /// missing catalogue.
+    pub fn now_playing_url(&self) -> String {
+        self.track_url.clone()
+    }
+
+    /// Point playback at a route, releasing the previous one's resources.
+    ///
+    /// Called when the picker commits, not per track: a combine sink torn
+    /// down between two tracks on the same speakers is a gap of silence and
+    /// a rebuild for nothing.
+    pub fn set_audio_route(&mut self, route: &crate::settings_page::Route) {
+        let next = crate::playback::sink_of(route);
+        if next == self.audio_sink {
+            return;
+        }
+        self.audio_sink = next;
+        self.pending_playback = Some(crate::playback::Request::ReleaseRoute);
+    }
+}
+
+/// The badge, through a real frame.
+///
+/// The outline tests measure the DATA; this measures what egui was asked
+/// to paint. Both are needed: the previous silhouettes passed every data
+/// test there was, because there were none, and the primitives that drew
+/// them lived in a function no test ever ran.
+#[cfg(test)]
+mod surround_route_tests {
+    use super::*;
+    use crate::surround::Channel;
+
+    fn app() -> Controller {
+        Controller::new(vec![], vec![])
+    }
+
+    #[test]
+    fn a_committed_arrangement_becomes_the_audio_sink() {
+        let mut c = app();
+        c.surround.place("l", "Left", Channel::FrontLeft);
+        c.surround.place("r", "Right", Channel::FrontRight);
+        let sink = crate::surround::sink_of(&c.surround).expect("a valid pair did not route");
+        c.audio_sink = sink;
+        assert!(matches!(c.audio_sink, crate::playback::Sink::Surround { .. }));
+    }
+
+    #[test]
+    fn a_half_assigned_room_cannot_be_committed_at_all() {
+        // The button is disabled on exactly this condition, and the model
+        // refuses independently — two guards, because a UI that enables it
+        // and a router that accepts it are different mistakes.
+        let mut c = app();
+        c.surround.place("l", "Left", Channel::FrontLeft);
+        assert!(!c.surround.routable());
+        assert_eq!(crate::surround::sink_of(&c.surround), None);
+    }
+
+    #[test]
+    fn surround_and_combine_are_separate_choices_not_a_mode() {
+        // Combine duplicates a stream, surround splits one. A single
+        // toggle would make "several speakers" mean two incompatible
+        // things depending on a mode set earlier.
+        let mut c = app();
+        c.set_audio_route(&crate::settings_page::Route::MultiRoom(
+            vec!["a".into(), "b".into()]));
+        assert!(matches!(c.audio_sink, crate::playback::Sink::Many(_)));
+        c.surround.place("a", "A", Channel::FrontLeft);
+        c.surround.place("b", "B", Channel::FrontRight);
+        // The assignment exists alongside; committing it is a separate act.
+        assert!(matches!(c.audio_sink, crate::playback::Sink::Many(_)),
+                "assigning positions silently changed the route");
+        c.audio_sink = crate::surround::sink_of(&c.surround).unwrap();
+        assert!(matches!(c.audio_sink, crate::playback::Sink::Surround { .. }));
+    }
+}
+
+#[cfg(test)]
+mod queue_advance_tests {
+    use super::*;
+    use crate::transport::Repeat;
+
+    fn app() -> Controller {
+        let mut c = Controller::new(vec![], vec![]);
+        c.set_track_paths(vec![
+            (1, "/m/one.flac".into()), (2, "/m/two.flac".into()), (3, "/m/three.flac".into()),
+        ]);
+        c
+    }
+
+    fn played(c: &mut Controller) -> Option<String> {
+        match c.pending_playback.take() {
+            Some(crate::playback::Request::Play { url, .. }) => Some(url),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_finished_track_plays_the_next_one() {
+        // `Queue::advance` is documented as "pop the head, when a track
+        // finishes on its own" and had no caller, so a finished track
+        // simply stopped — an album played its first track and went quiet.
+        let mut c = app();
+        c.queue.add_all(&[(1, "One".into(), "A".into()), (2, "Two".into(), "A".into())]);
+        let first = c.queue.advance().unwrap();
+        c.start_playing(&first);
+        assert_eq!(played(&mut c).as_deref(), Some("/m/one.flac"));
+
+        c.on_track_ended();
+        assert_eq!(c.transport.title, "Two");
+        assert_eq!(played(&mut c).as_deref(), Some("/m/two.flac"));
+        assert!(c.transport.playing);
+    }
+
+    #[test]
+    fn repeat_one_replays_without_eating_the_queue() {
+        // Popping the head under Repeat::One empties the queue one track
+        // per repeat — the mode quietly destroying the thing it loops
+        // inside.
+        let mut c = app();
+        c.queue.add_all(&[(1, "One".into(), "A".into()), (2, "Two".into(), "A".into())]);
+        let first = c.queue.advance().unwrap();
+        c.start_playing(&first);
+        played(&mut c);
+        c.transport.repeat = Repeat::One;
+
+        let queued_before = c.queue.len();
+        c.on_track_ended();
+        assert_eq!(played(&mut c).as_deref(), Some("/m/one.flac"), "it did not replay");
+        assert_eq!(c.queue.len(), queued_before, "repeat-one consumed the queue");
+    }
+
+    #[test]
+    fn the_end_of_the_queue_stops_rather_than_claiming_to_play() {
+        // "Playing" over silence is the state this app showed before there
+        // was any audio at all; the end of a queue must not put it back.
+        let mut c = app();
+        c.queue.add_all(&[(1, "One".into(), "A".into())]);
+        let first = c.queue.advance().unwrap();
+        c.start_playing(&first);
+        played(&mut c);
+        c.on_track_ended();
+        assert!(!c.transport.playing, "the queue ran out and it still says playing");
+        assert!(!c.now_playing.playing);
+        assert_eq!(played(&mut c), None, "it asked for a track that does not exist");
+    }
+
+    #[test]
+    fn the_position_resets_between_tracks() {
+        // Without this the bar starts the next track wherever the last one
+        // ended, until the player's first status line corrects it — a
+        // second of the handle in the wrong place on every track change.
+        let mut c = app();
+        c.queue.add_all(&[(1, "One".into(), "A".into()), (2, "Two".into(), "A".into())]);
+        let first = c.queue.advance().unwrap();
+        c.start_playing(&first);
+        c.transport.duration = 200.0;
+        c.transport.report(150.0);
+        assert!(c.transport.position() > 100.0);
+        c.on_track_ended();
+        assert!(c.transport.position() < 1.0, "the bar carried over: {}",
+                c.transport.position());
+    }
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+
+    fn app() -> Controller {
+        let mut c = Controller::new(
+            vec![Device { name: "Beosound A1".into(), volume: 30, playing: false }],
+            vec![]);
+        c.silhouettes.push(crate::product_silhouette::ProductSilhouette::default());
+        c
+    }
+
+    fn prefs(style: settings_kit::AnimationStyle, palette: &str) -> settings_kit::Prefs {
+        let mut p = settings_kit::Prefs::default();
+        p.gesture.animation = style;
+        p.palette = palette.to_string();
+        p
+    }
+
+    #[test]
+    fn reduce_motion_reaches_the_badges() {
+        // A reduce-motion setting that some of the app ignores is worse
+        // than one it does not offer: the person cannot tell which parts
+        // obeyed. `set_motion_scale` had no caller at all.
+        let ctx = egui::Context::default();
+        let mut c = app();
+        c.apply_settings(&ctx, &prefs(settings_kit::AnimationStyle::Reduced, "amber"));
+        assert!(c.motion_scale < 1.0, "reduced motion left the scale at {}", c.motion_scale);
+
+        // A badge created afterwards gets it too — a device that appears
+        // mid-session would otherwise animate at full speed.
+        c.devices.push(Device { name: "Beosound Level".into(), volume: 10, playing: false });
+        let before = c.silhouettes.len();
+        c.silhouettes.resize_with(c.devices.len(),
+            crate::product_silhouette::ProductSilhouette::default);
+        for s in c.silhouettes.iter_mut().skip(before) { s.set_motion_scale(c.motion_scale); }
+        // Reduced means the reveal finishes in a fraction of a smooth one.
+        let mut fast = c.silhouettes.pop().unwrap();
+        let mut slow = crate::product_silhouette::ProductSilhouette::default();
+        fast.tick(60.0);
+        slow.tick(60.0);
+        assert!(fast.reveal() > slow.reveal(),
+                "reduced {} was not quicker than smooth {}", fast.reveal(), slow.reveal());
+    }
+
+    #[test]
+    fn changing_the_palette_blooms_the_badges_once() {
+        // The halo is "a marker, not a flourish" — it exists to say the
+        // accent moved. Without the call, switching palette repainted
+        // every outline in a new colour with nothing to draw the eye.
+        let ctx = egui::Context::default();
+        let mut c = app();
+        c.apply_settings(&ctx, &prefs(settings_kit::AnimationStyle::Smooth, "amber"));
+        // Ticked in frames, not one huge dt: the envelope advances per
+        // call, so a single enormous step leaves it part way through — a
+        // detail worth reproducing here because the app ticks per frame
+        // too.
+        for _ in 0..400 { for s in c.silhouettes.iter_mut() { s.tick(16.0); } }
+        assert_eq!(c.silhouettes[0].halo(), 0.0, "settled before the change");
+
+        c.apply_settings(&ctx, &prefs(settings_kit::AnimationStyle::Smooth, "midnight"));
+        // `bloom` ARMS the envelope; the halo rises on the next tick. The
+        // immediate signal is that the badge has work to do — asserting
+        // the halo before a frame has run tests the clock, not the change.
+        assert!(c.silhouettes[0].is_animating(), "the accent change did not arm a bloom");
+        for s in c.silhouettes.iter_mut() { s.tick(16.0); }
+        assert!(c.silhouettes[0].halo() > 0.0, "the armed bloom never rose");
+    }
+
+    #[test]
+    fn re_applying_the_same_palette_does_not_re_bloom() {
+        // Called unconditionally this fires every frame, and a halo that
+        // never stops is the throb the two-phase envelope exists to avoid.
+        let ctx = egui::Context::default();
+        let mut c = app();
+        c.apply_settings(&ctx, &prefs(settings_kit::AnimationStyle::Smooth, "amber"));
+        for _ in 0..400 { for s in c.silhouettes.iter_mut() { s.tick(16.0); } }
+        c.apply_settings(&ctx, &prefs(settings_kit::AnimationStyle::Smooth, "amber"));
+        for s in c.silhouettes.iter_mut() { s.tick(16.0); }
+        assert_eq!(c.silhouettes[0].halo(), 0.0, "an unchanged palette bloomed anyway");
+    }
+}
+
+#[cfg(test)]
+mod silhouette_frame_tests {
+    use super::*;
+    use crate::product_silhouette::{ProductSilhouette, Shape};
+
+    /// Draw one badge and count the line shapes and their widths.
+    fn painted(shape: Shape) -> (usize, Vec<f32>) {
+        let ctx = egui::Context::default();
+        let mut s = ProductSilhouette::new(shape);
+        // Past the reveal, or the strokes are drawn transparent and the
+        // test measures an animation rather than an outline.
+        s.tick(10_000.0);
+        let colors = uikit_egui::palette_colors("amber");
+        let out = ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                                                        egui::vec2(200.0, 200.0))),
+            ..Default::default()
+        }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0),
+                                                     egui::vec2(48.0, 48.0));
+                silhouette_paint(ui, &s, rect, &colors);
+            });
+        });
+        let mut widths = Vec::new();
+        let mut n = 0;
+        for cs in out.shapes.iter() {
+            if let egui::epaint::Shape::Path(ps) = &cs.shape {
+                n += 1;
+                widths.push(ps.stroke.width);
+            }
+        }
+        (n, widths)
+    }
+
+    #[test]
+    fn every_product_paints_its_whole_outline() {
+        // One path per subpath. A shape that paints fewer than it has is
+        // one the renderer is silently dropping part of.
+        for shape in [Shape::Disc, Shape::Bar, Shape::Tower, Shape::Cube] {
+            let (n, _) = painted(shape);
+            assert_eq!(n, shape.outline().len(),
+                       "{shape:?} painted {n} of {} subpaths",
+                       shape.outline().len());
+        }
+    }
+
+    #[test]
+    fn nothing_reaches_the_screen_heavier_than_the_design_allows() {
+        // The data test pins the outline; this pins what egui was actually
+        // handed, which is where a renderer that scaled a stroke by the
+        // badge size would show up.
+        for shape in [Shape::Disc, Shape::Bar, Shape::Tower, Shape::Cube] {
+            let (_, widths) = painted(shape);
+            for w in widths {
+                assert!(w <= 1.2, "{shape:?} painted a {w}px line");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod playback_seam_tests {
+    use super::*;
+    use crate::playback::{Request, Sink};
+    use crate::settings_page::Route;
+
+    fn app() -> Controller {
+        Controller::new(vec![Device { name: "Living Room".into(), volume: 50,
+                                      playing: false }], vec![])
+    }
+
+    #[test]
+    fn committing_a_route_points_audio_at_it_in_the_same_act() {
+        // Leaving the picker and the audio to be connected by the host is
+        // how the UI ends up showing a route the sound is not going to.
+        let mut c = app();
+        c.set_audio_route(&Route::MultiRoom(vec!["AA".into(), "BB".into()]));
+        assert_eq!(c.audio_sink, Sink::Many(vec!["AA".into(), "BB".into()]));
+        assert_eq!(c.pending_playback, Some(Request::ReleaseRoute),
+                   "the previous route's resources were never given up");
+    }
+
+    #[test]
+    fn re_committing_the_same_route_does_not_rebuild_the_sink() {
+        // A combine sink torn down and rebuilt between two tracks on the
+        // same speakers is a gap of silence for nothing.
+        let mut c = app();
+        c.set_audio_route(&Route::Bluetooth("AA".into()));
+        c.pending_playback = None;
+        c.set_audio_route(&Route::Bluetooth("AA".into()));
+        assert_eq!(c.pending_playback, None, "an unchanged route asked for a rebuild");
+    }
+
+    #[test]
+    fn nothing_is_requested_until_something_actually_changes() {
+        // The request field is drained by the host; a view that sets it
+        // every frame makes the host restart the track sixty times a
+        // second.
+        let c = app();
+        assert_eq!(c.pending_playback, None);
     }
 }
 
@@ -2098,10 +2784,23 @@ mod tests {
         c.answer_tracks_from(&FakeCatalog);
         assert_eq!(c.all_tracks.tracks().len(), 200);
 
-        // Play resolves from the visible row; the transport picks it up.
+        // Play resolves from the visible row; the transport picks up the
+        // text. It does NOT show as playing, because this catalogue has no
+        // files behind it — see `request_play`. Showing "playing" over
+        // silence is the failure that made the play button a picture in
+        // the first place.
         c.tracks_action(crate::all_tracks::TracksAction::Play(5));
         assert_eq!(c.transport.title, "T5");
+        assert!(!c.transport.playing, "playing with no file behind the row");
+
+        // With a path, the same action plays and asks the host for it.
+        c.set_track_paths(vec![(5, "/music/T5.flac".into())]);
+        c.tracks_action(crate::all_tracks::TracksAction::Play(5));
         assert!(c.transport.playing);
+        assert!(matches!(c.pending_playback,
+                         Some(crate::playback::Request::Play { ref url, .. })
+                         if url == "/music/T5.flac"),
+                "{:?}", c.pending_playback);
 
         // Enqueue lands in the queue with the row's text.
         c.tracks_action(crate::all_tracks::TracksAction::Enqueue(7));
@@ -2180,5 +2879,102 @@ mod tests {
         assert!(active < quiet, "fully active flows faster ({active} < {quiet})");
         assert!(c.watermark.blur().is_none(), "egui cannot blur; the module degrades");
         assert!(c.watermark.opacity() > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod voice_command_tests {
+    use super::*;
+    use crate::voice_control::{Command, Outcome, VoicePrefs};
+
+    fn app(enabled: bool) -> Controller {
+        let mut c = Controller::new(vec![], vec![]);
+        c.voice = VoicePrefs { enabled, ..Default::default() };
+        c.set_track_paths(vec![(1, "/m/one.flac".into()), (2, "/m/two.flac".into())]);
+        c
+    }
+
+    #[test]
+    fn nothing_is_heard_until_the_setting_is_on() {
+        // The default, and the reason it is the default.
+        let mut c = app(false);
+        assert_eq!(c.heard("pause"), Outcome::Ignored);
+        assert_eq!(c.pending_playback, None);
+    }
+
+    #[test]
+    fn play_and_pause_go_through_the_same_path_a_tap_does() {
+        // A voice command that set `playing` directly would show as
+        // playing and make no sound — the exact bug the tap path had.
+        let mut c = app(true);
+        c.queue.add_all(&[(1, "One".into(), "A".into())]);
+        let first = c.queue.advance().unwrap();
+        c.start_playing(&first);
+        c.pending_playback = None;
+
+        assert_eq!(c.heard("pause"), Outcome::Run(Command::Pause));
+        assert!(!c.transport.playing);
+        assert_eq!(c.pending_playback, Some(crate::playback::Request::Stop));
+
+        c.pending_playback = None;
+        assert_eq!(c.heard("play"), Outcome::Run(Command::Play));
+        assert!(c.transport.playing);
+        assert!(matches!(c.pending_playback, Some(crate::playback::Request::Play { .. })),
+                "resuming asked for no audio");
+    }
+
+    #[test]
+    fn a_search_asks_before_acting_and_then_runs_on_yes() {
+        // Free text cannot be checked against anything.
+        let mut c = app(true);
+        assert_eq!(c.heard("search for miles davis"),
+                   Outcome::Confirm(Command::Search("miles davis".into())));
+        assert_eq!(c.search.query, "", "it searched before being confirmed");
+        c.confirm_voice(true);
+        assert_eq!(c.search.query, "miles davis");
+    }
+
+    #[test]
+    fn saying_no_to_a_confirmation_does_nothing_and_clears_it() {
+        let mut c = app(true);
+        c.heard("play the smiths");
+        c.confirm_voice(false);
+        assert_eq!(c.search.query, "");
+        assert_eq!(c.voice_confirm, None, "the prompt outlived the answer");
+    }
+
+    #[test]
+    fn play_something_searches_rather_than_starting_a_guess() {
+        // Starting the first fuzzy match is how a request for one album
+        // plays another.
+        let mut c = app(true);
+        c.voice.act_on_uncertain = true;
+        c.heard("play the smiths");
+        assert_eq!(c.search.query, "the smiths");
+        assert_eq!(c.pending_playback, None, "it started playing a guess");
+    }
+
+    #[test]
+    fn next_advances_the_queue_the_same_way_a_finished_track_does() {
+        let mut c = app(true);
+        c.queue.add_all(&[(1, "One".into(), "A".into()), (2, "Two".into(), "A".into())]);
+        let first = c.queue.advance().unwrap();
+        c.start_playing(&first);
+        c.pending_playback = None;
+        c.heard("next");
+        assert_eq!(c.transport.title, "Two");
+    }
+
+    #[test]
+    fn volume_words_move_it_and_stay_in_range() {
+        let mut c = app(true);
+        c.heard("volume 90");
+        assert_eq!(c.pending_volume, Some(90.0));
+        c.heard("louder");
+        assert_eq!(c.pending_volume, Some(100.0), "it went past the top");
+        c.heard("mute");
+        assert_eq!(c.pending_volume, Some(0.0));
+        c.heard("quieter");
+        assert_eq!(c.pending_volume, Some(0.0), "it went below zero");
     }
 }

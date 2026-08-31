@@ -299,7 +299,20 @@ pub fn list_ui(ui: &mut egui::Ui, view: &mut MailView,
             }).response;
             if open { ui.painter().rect_stroke(resp.rect, 2.0,
                 egui::Stroke::new(1.0_f32, colors.accent), egui::StrokeKind::Inside); }
-            if resp.interact(egui::Sense::click()).clicked() {
+            // A FRESH INTERACTION WITH A STABLE, PER-ROW ID.
+            //
+            // This was `resp.interact(Sense::click())` on the response of
+            // `ui.horizontal(..)`. A layout response carries an
+            // auto-generated id, and re-interacting through it did not
+            // register a clickable region here at all — a frame-driven test
+            // clicking the row's own drawn position never produced a
+            // selection, so opening a thread by clicking it did nothing for
+            // the life of this port. Every model test passed throughout,
+            // because none of them drew anything.
+            //
+            // Keyed by conversation id, not index — `row_click`'s own doc
+            // says why.
+            if uikit_egui::dock::row_click(ui, resp.rect, &t.conversation_id).clicked() {
                 clicked = Some(t.conversation_id.clone());
             }
             ui.separator();
@@ -307,6 +320,173 @@ pub fn list_ui(ui: &mut egui::Ui, view: &mut MailView,
     });
     if let Some(id) = &clicked { view.select(id); }
     clicked
+}
+
+/// Tests that drive `list_ui` through a REAL egui frame.
+///
+/// Everything else in this file tests the model, and the model was never
+/// the part that was broken: `set_messages` had no caller for the life of
+/// the port, and every model test passed the whole time the list showed
+/// nothing. A renderer nobody runs is a renderer nobody has checked, and
+/// the same gap in snapclone's swipe work hid two real bugs — a panicking
+/// layer order and a double page turn — that no unit test could see.
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    use egui::{Context, Event, PointerButton, Pos2, RawInput};
+
+    fn view_with(n: usize, unread: usize) -> MailView {
+        let msgs: Vec<Message> = (0..n).map(|i| Message {
+            id: format!("m{i}"),
+            conversation_id: format!("c{i}"),
+            subject: format!("subject {i}"),
+            unread: i < unread,
+            sender: Some(Address { name: format!("sender{i}"), address: "a@b".into() }),
+            time: i as i64,
+            num_attachments: 0,
+            is_encrypted: 0,
+        }).collect();
+        let mut v = MailView::default();
+        v.set_messages(&msgs);
+        v
+    }
+
+    /// Run one frame and hand back the text shapes it drew, plus anything
+    /// `list_ui` returned.
+    fn frame(ctx: &Context, view: &mut MailView, events: Vec<Event>)
+        -> (Vec<String>, Option<String>) {
+        let colors = uikit_egui::palette_colors("voice");
+        let mut out = None;
+        let done = ctx.run(RawInput {
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0))),
+            ..Default::default()
+        }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                out = list_ui(ui, view, &colors);
+            });
+        });
+        let texts = done.shapes.iter().filter_map(|s| match &s.shape {
+            egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+            _ => None,
+        }).collect();
+        (texts, out)
+    }
+
+    /// Where a piece of drawn text ended up.
+    ///
+    /// Clicking a guessed coordinate is how a UI test passes on a layout it
+    /// never checked, or fails for a reason that has nothing to do with the
+    /// behaviour under test. Asking the frame where the row actually is
+    /// removes both.
+    fn text_pos(ctx: &Context, view: &mut MailView, needle: &str) -> Option<Pos2> {
+        let colors = uikit_egui::palette_colors("voice");
+        let done = ctx.run(RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0))),
+            ..Default::default()
+        }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| { list_ui(ui, view, &colors); });
+        });
+        done.shapes.iter().find_map(|s| match &s.shape {
+            egui::epaint::Shape::Text(t) if t.galley.text().contains(needle) => Some(t.pos),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn an_empty_view_says_so_rather_than_drawing_nothing() {
+        // A blank panel and a broken panel look identical, and for most of
+        // this port's life the list WAS blank — so the empty state is the
+        // one a person was most likely to be looking at.
+        let ctx = Context::default();
+        let mut v = MailView::default();
+        let (texts, out) = frame(&ctx, &mut v, vec![]);
+        assert!(texts.iter().any(|t| t.contains("no mail")), "{texts:?}");
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn a_query_that_matches_nothing_is_distinguishable_from_an_empty_inbox() {
+        // "no mail" when you have typed a filter is a lie about your
+        // mailbox. Different words, and the difference only exists in the
+        // renderer.
+        let ctx = Context::default();
+        let mut v = view_with(3, 0);
+        v.query = "zzz".into();
+        let (texts, _) = frame(&ctx, &mut v, vec![]);
+        assert!(texts.iter().any(|t| t.contains("nothing matches")), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("no mail")), "{texts:?}");
+    }
+
+    #[test]
+    fn every_thread_is_drawn_and_the_unread_count_with_them() {
+        let ctx = Context::default();
+        let mut v = view_with(3, 2);
+        let (texts, _) = frame(&ctx, &mut v, vec![]);
+        for i in 0..3 {
+            assert!(texts.iter().any(|t| t.contains(&format!("subject {i}"))),
+                    "subject {i} missing: {texts:?}");
+        }
+        assert!(texts.iter().any(|t| t.contains("2 unread")), "{texts:?}");
+    }
+
+    #[test]
+    fn clicking_a_row_selects_that_thread_and_returns_it() {
+        // The return value is what the caller opens a thread on. Driving it
+        // through a frame is the only way to know a click reaches it —
+        // `select` on its own would pass with no rows drawn at all.
+        let ctx = Context::default();
+        let mut v = view_with(2, 0);
+        // First frame lays the rows out; a click needs somewhere to land.
+        let (_, none) = frame(&ctx, &mut v, vec![]);
+        assert_eq!(none, None);
+
+        // Asked, not guessed — see `text_pos`.
+        let p = text_pos(&ctx, &mut v, "subject 0").expect("the row was never drawn");
+        let at = Pos2::new(p.x + 4.0, p.y + 4.0);
+        // Press and release in SEPARATE frames. egui decides a click from
+        // state that spans frames, and collapsing the whole gesture into
+        // one is a way to write a passing-looking test that never clicks.
+        let btn = |pressed: bool| Event::PointerButton {
+            pos: at, button: PointerButton::Primary, pressed,
+            modifiers: Default::default() };
+        let mut selected = None;
+        frame(&ctx, &mut v, vec![Event::PointerMoved(at)]);
+        frame(&ctx, &mut v, vec![btn(true)]);
+        for _ in 0..3 {
+            let (_, out) = frame(&ctx, &mut v, vec![btn(false)]);
+            if out.is_some() { selected = out; break; }
+        }
+        let id = selected.expect(&format!(
+            "a click at {at:?} on a row returned nothing"));
+        assert!(id.starts_with('c'), "{id}");
+        assert_eq!(v.selected.as_deref(), Some(id.as_str()),
+                   "the click returned an id the view did not select");
+    }
+
+    #[test]
+    fn a_thread_of_several_messages_shows_its_count() {
+        // The difference between one mail and a conversation, and it is
+        // drawn only when there is more than one — a "1" on every row is
+        // noise.
+        let ctx = Context::default();
+        let msgs = vec![
+            Message { id: "a".into(), conversation_id: "c".into(), subject: "topic".into(),
+                      unread: false, sender: None, time: 1, num_attachments: 0,
+                      is_encrypted: 0 },
+            Message { id: "b".into(), conversation_id: "c".into(), subject: "topic".into(),
+                      unread: false, sender: None, time: 2, num_attachments: 0,
+                      is_encrypted: 0 },
+        ];
+        let mut v = MailView::default();
+        v.set_messages(&msgs);
+        let (texts, _) = frame(&ctx, &mut v, vec![]);
+        assert!(texts.iter().any(|t| t == "2"), "no thread count drawn: {texts:?}");
+
+        let mut single = view_with(1, 0);
+        let (t2, _) = frame(&ctx, &mut single, vec![]);
+        assert!(!t2.iter().any(|t| t == "1"), "a single-message thread was labelled: {t2:?}");
+    }
 }
 
 #[cfg(test)]

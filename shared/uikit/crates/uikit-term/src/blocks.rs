@@ -42,6 +42,10 @@ pub struct CommandBlock {
 pub struct BlockTracker {
     pub blocks: Vec<CommandBlock>,
     next_id: u32,
+    /// The command just submitted, waiting to be recognised as the
+    /// shell's echo of it. Armed by `submit_command`, consumed by the
+    /// first `feed_line` after it. See there for why.
+    pending_echo: Option<String>,
     /// True while output is being captured into the last block. Public so a shell-respawn
     /// path can reset it cleanly (as the reference backend does).
     pub capturing: bool,
@@ -71,6 +75,8 @@ impl BlockTracker {
     /// attaching any pending shell-integration exit code — then opens a new capturing block.
     /// Empty/whitespace commands are ignored, as in the reference.
     pub fn submit_command(&mut self, command: &str, start_row: usize) {
+        // Armed for one line — see `feed_line`.
+        self.pending_echo = Some(command.trim().to_string());
         let cmd = command.trim();
         if cmd.is_empty() {
             return;
@@ -128,6 +134,49 @@ impl BlockTracker {
                 self.capturing = false;
             }
         }
+    }
+
+    /// Feed one line of shell output, closing the block when the line is a
+    /// prompt. Returns true when it closed one, so a caller can avoid
+    /// rendering the prompt inside the output it terminated.
+    ///
+    /// **This is what gives a block an end.** `finish` exists and needs
+    /// somebody to notice the command is over; a shell reports an exit code
+    /// only if it has been configured to, and most have not. Without a
+    /// prompt heuristic every block stays open forever, so the next command
+    /// closes the previous one with an unknown status and the output of two
+    /// commands runs together.
+    ///
+    /// Ported from voiceterm's own `blocks.rs`, which had this and whose
+    /// copy of the tracker the app does not use — the method sat on the
+    /// dead-API list for exactly that reason. Living here means the tracker
+    /// that IS used can close a block.
+    pub fn feed_line(&mut self, line: &str) -> bool {
+        // THE SHELL ECHOES WHAT YOU TYPE, and that echo comes back as
+        // output. Every block began with a copy of its own command:
+        //
+        //     cmd "echo one"  output "echo one\none\n"
+        //
+        // Invisible against a stand-in, because a fake player prints only
+        // what it is told to; found the first time a real pty was driven.
+        //
+        // Only the FIRST line after a command is eligible, and only once,
+        // so `echo echo one` keeps the "echo one" that is genuinely its
+        // output. Matched with `ends_with` as well as equality, because a
+        // prompt and the command often arrive on one line.
+        if let Some(echo) = self.pending_echo.take() {
+            let t = line.trim();
+            if t == echo || (t.ends_with(&echo) && t.len() < echo.len() + 64) {
+                return false;
+            }
+        }
+        if self.capturing && looks_like_prompt(line) {
+            self.finish(None);
+            return true;
+        }
+        self.append_output(line);
+        self.append_output("\n");
+        false
     }
 
     /// Mark the current block complete (next prompt detected).
@@ -235,6 +284,181 @@ fn strip_ansi(s: &str) -> String {
         }
     }
     out
+}
+
+/// The longest line still considered a prompt.
+///
+/// A prompt is short. Without a cap, any output line ending in `>` — a
+/// diff, an XML dump, a quoted email — closes the block, and the command's
+/// remaining output lands in the next one.
+pub const MAX_PROMPT_LEN: usize = 200;
+
+/// Does this line look like a shell prompt?
+///
+/// Deliberately a heuristic over the LAST character rather than a regex
+/// over prompt formats: people set `PS1` to anything, and a pattern that
+/// tried to enumerate them would match fewer real prompts than this does,
+/// while looking more precise.
+pub fn looks_like_prompt(line: &str) -> bool {
+    let t = line.trim_end();
+    if t.is_empty() || t.len() > MAX_PROMPT_LEN {
+        return false;
+    }
+    matches!(t.chars().last(), Some('$') | Some('#') | Some('>') | Some('❯'))
+}
+
+/// Accumulate bytes bound for a shell and yield the commands they contain.
+///
+/// A terminal sends a command one keystroke at a time, so "what command
+/// was that" is a question about a byte STREAM rather than a line — and
+/// every caller that needs it was going to reinvent the same three rules.
+/// It lives here, beside the tracker it feeds.
+#[derive(Debug, Clone, Default)]
+pub struct CommandLines {
+    buf: Vec<u8>,
+}
+
+/// A pathological paste with no line ending must not grow the buffer
+/// without limit.
+pub const LINE_CAP: usize = 8 * 1024;
+
+impl CommandLines {
+    pub fn new() -> CommandLines { CommandLines::default() }
+
+    /// Feed bytes going to the shell; return any completed commands.
+    ///
+    /// Three rules, each from something that goes wrong without it:
+    ///
+    /// * **Backspace edits the pending line** before anything reads it.
+    ///   Without this, the control-byte rule below throws away every
+    ///   command that was corrected while typing — which is most of them.
+    /// * **A line containing control bytes is not a command.** An arrow
+    ///   key or a Ctrl-C leaves an escape sequence in the buffer, and
+    ///   recording that fills the history with entries nobody can re-run.
+    /// * **`\r` and `\n` both end a line.** A terminal sends `\r` for
+    ///   Enter; a paste arrives with `\n`.
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(bytes);
+        while let Some(i) = self.buf.iter().position(|b| *b == 0x7f) {
+            self.buf.remove(i);
+            if i > 0 { self.buf.remove(i - 1); }
+        }
+        let mut out = Vec::new();
+        while let Some(i) = self.buf.iter().position(|b| *b == b'\r' || *b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=i).collect();
+            let cmd = String::from_utf8_lossy(&line[..line.len() - 1]).trim().to_string();
+            if cmd.is_empty() || cmd.bytes().any(|b| b < 0x20) {
+                continue;
+            }
+            out.push(cmd);
+        }
+        if self.buf.len() > LINE_CAP {
+            let drop = self.buf.len() - LINE_CAP;
+            self.buf.drain(..drop);
+        }
+        out
+    }
+
+    /// What has been typed but not yet entered.
+    pub fn pending(&self) -> String {
+        String::from_utf8_lossy(&self.buf).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod command_line_tests {
+    use super::*;
+
+    #[test]
+    fn a_command_is_recorded_when_the_line_ends_and_not_before() {
+        let mut c = CommandLines::new();
+        assert!(c.feed(b"ls -").is_empty(), "half a command was recorded");
+        assert!(c.feed(b"la").is_empty());
+        assert_eq!(c.feed(b"\r"), vec!["ls -la".to_string()]);
+        assert_eq!(c.pending(), "");
+    }
+
+    #[test]
+    fn a_correction_survives_rather_than_losing_the_command() {
+        // Backspace leaves 0x7f in the stream. Applied before the
+        // control-byte rule, this is `ls`; applied after, the whole command
+        // is discarded — and typing a mistake is not rare.
+        let mut c = CommandLines::new();
+        assert_eq!(c.feed(b"lxs\r"), vec!["ls".to_string()]);
+    }
+
+    #[test]
+    fn an_escape_sequence_is_not_a_command() {
+        // An arrow key mid-line. Recording it puts an entry in the history
+        // that cannot be re-run and reads as corruption.
+        let mut c = CommandLines::new();
+        assert!(c.feed(b"ls [A\r").is_empty());
+        // And the buffer is clear afterwards, so the NEXT command is not
+        // poisoned by the one that was rejected.
+        assert_eq!(c.feed(b"pwd\r"), vec!["pwd".to_string()]);
+    }
+
+    #[test]
+    fn several_commands_in_one_write_all_arrive() {
+        // A paste, or a voice command sent with its own newline.
+        let mut c = CommandLines::new();
+        assert_eq!(c.feed(b"cd /tmp\nls\n"), vec!["cd /tmp".to_string(), "ls".to_string()]);
+    }
+
+    #[test]
+    fn a_bare_enter_records_nothing() {
+        let mut c = CommandLines::new();
+        assert!(c.feed(b"\r\r  \r").is_empty());
+    }
+
+    #[test]
+    fn a_paste_with_no_line_ending_cannot_grow_the_buffer_without_limit() {
+        let mut c = CommandLines::new();
+        c.feed(&vec![b'x'; LINE_CAP * 2]);
+        assert!(c.pending().len() <= LINE_CAP, "{}", c.pending().len());
+    }
+}
+
+#[cfg(test)]
+mod feed_tests {
+    use super::*;
+
+    #[test]
+    fn a_prompt_closes_the_block_and_output_before_it_belongs_to_it() {
+        let mut t = BlockTracker::new();
+        t.submit_command("ls", 0);
+        assert!(!t.feed_line("Cargo.toml  src"));
+        assert!(t.feed_line("user@host:~$"), "the prompt did not close the block");
+        let b = t.blocks.last().expect("a block");
+        assert!(b.output.contains("Cargo.toml"));
+        assert!(!b.output.contains("user@host"),
+                "the prompt was recorded as output of the command it ended");
+        // Closed: output after it belongs to nobody rather than to `ls`.
+        t.feed_line("stray");
+        assert!(!t.blocks.last().unwrap().output.contains("stray"));
+    }
+
+    #[test]
+    fn a_long_line_ending_in_an_angle_bracket_is_not_a_prompt() {
+        // A diff, an XML dump, a quoted email. Without the length cap each
+        // of these ends the block and the rest of the output lands in the
+        // next one.
+        let xml = format!("<{}>", "a".repeat(MAX_PROMPT_LEN));
+        assert!(!looks_like_prompt(&xml));
+        assert!(looks_like_prompt("$"));
+        assert!(looks_like_prompt("~/proj ❯"));
+        assert!(!looks_like_prompt(""), "a blank line is not a prompt");
+        assert!(!looks_like_prompt("total 48"));
+    }
+
+    #[test]
+    fn feeding_with_nothing_open_does_not_invent_a_block() {
+        // Output before any command — a shell banner, a motd — must not
+        // become a block with no command in it.
+        let mut t = BlockTracker::new();
+        assert!(!t.feed_line("Welcome to Ubuntu"));
+        assert!(t.blocks.is_empty(), "output with no command opened a block");
+    }
 }
 
 #[cfg(test)]
@@ -347,5 +571,69 @@ mod tests {
         assert_eq!(t.get_block_command(1), Some("make"));
         assert!(t.get_block_output(1).unwrap().contains("line four"));
         assert_eq!(t.get_block_command(99), None);
+    }
+}
+
+#[cfg(test)]
+mod echo_tests {
+    use super::*;
+
+    #[test]
+    fn the_shells_echo_of_the_command_is_not_its_output() {
+        // Found by driving a real pty for the first time: a shell echoes
+        // what you type, so every block began with a copy of its own
+        // command — `cmd "echo one"` with `output "echo one\none\n"`. A
+        // stand-in prints only what it is told to, so nothing showed it.
+        let mut t = BlockTracker::new();
+        t.submit_command("echo one", 0);
+        t.feed_line("echo one");
+        t.feed_line("one");
+        let b = t.blocks.last().unwrap();
+        assert_eq!(b.output, "one\n", "{:?}", b.output);
+    }
+
+    #[test]
+    fn a_prompt_and_the_command_on_one_line_is_still_the_echo() {
+        // Which is how it usually arrives: the prompt is written, then
+        // the typed characters, then the newline.
+        let mut t = BlockTracker::new();
+        t.submit_command("ls", 0);
+        t.feed_line("user@host:~$ ls");
+        t.feed_line("file.txt");
+        assert_eq!(t.blocks.last().unwrap().output, "file.txt\n");
+    }
+
+    #[test]
+    fn output_that_repeats_the_command_is_kept() {
+        // `echo echo one` prints "echo one", and that is content. Only the
+        // FIRST line after a command is eligible, and only once.
+        let mut t = BlockTracker::new();
+        t.submit_command("echo echo one", 0);
+        t.feed_line("echo echo one");   // the echo
+        t.feed_line("echo one");        // the output
+        assert_eq!(t.blocks.last().unwrap().output, "echo one\n");
+    }
+
+    #[test]
+    fn a_command_with_no_echo_loses_no_output() {
+        // A shell with echo off, or output arriving before it. The guard
+        // must not eat a real first line.
+        let mut t = BlockTracker::new();
+        t.submit_command("date", 0);
+        t.feed_line("Mon Aug 31 20:00:00 UTC 2026");
+        assert!(t.blocks.last().unwrap().output.starts_with("Mon"),
+                "{:?}", t.blocks.last().unwrap().output);
+    }
+
+    #[test]
+    fn a_long_line_ending_in_the_command_text_is_not_swallowed() {
+        // The `ends_with` match is bounded, or a page of output that
+        // happens to end with the command name would vanish.
+        let mut t = BlockTracker::new();
+        t.submit_command("ls", 0);
+        let long = format!("{} ls", "x".repeat(200));
+        t.feed_line(&long);
+        assert!(t.blocks.last().unwrap().output.contains("xxx"),
+                "a long line was taken for an echo");
     }
 }

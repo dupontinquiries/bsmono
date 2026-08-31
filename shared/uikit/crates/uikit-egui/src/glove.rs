@@ -203,6 +203,78 @@ impl Orient {
     }
 }
 
+/// How much of gravity must be on an axis before that axis decides.
+///
+/// About 0.4g. Below it the phone is somewhere between two positions and
+/// the honest answer is "unknown" — a threshold near zero makes every
+/// wobble a rotation, which for a ratchet gated on returning to rest means
+/// the cursor walks on its own.
+pub const AXIS_G: f32 = 0.4;
+
+/// Above this on the Z axis the phone is lying flat rather than being held.
+///
+/// Higher than [`AXIS_G`], because face-up and face-down are REST — the
+/// state the ratchet re-arms in — and a device that re-arms while still
+/// being waved gives a second step nobody asked for.
+pub const FLAT_G: f32 = 0.75;
+
+/// Orientation and tilt from a raw accelerometer reading, in g.
+///
+/// The kit could already parse iio-sensor-proxy's D-Bus strings, and that
+/// is the only source it had. A phone without that daemon — or an app that
+/// reads `/sys/bus/iio` directly, as voiceterm does — had no way in, so
+/// glove mode could not be driven at all on those. Two apps in this fleet
+/// had two spellings of "which way up" and the shared gesture layer
+/// accepted neither.
+///
+/// Axes are the usual portrait convention: +x right, +y up the screen, +z
+/// out of the screen toward the user.
+pub fn from_accel(x: f32, y: f32, z: f32) -> (Orient, Tilt) {
+    // Flat is decided FIRST. Lying on a table the x and y components are
+    // near zero and noise decides between them, so asking "which edge is
+    // up" of a device that has no up produces a rotation per sample.
+    let tilt = if z >= FLAT_G {
+        Tilt::FaceUp
+    } else if z <= -FLAT_G {
+        Tilt::FaceDown
+    } else {
+        Tilt::Raised
+    };
+    if tilt.is_rest() {
+        // Flat: report `Normal` rather than `Unknown`, which is what
+        // iio-sensor-proxy does — a phone on a table reports an
+        // orientation, and rest is carried by the TILT.
+        //
+        // My first version returned `Unknown` here, reasoning that a flat
+        // device has no meaningful rotation. It is true and it broke the
+        // gesture: `Ratchet::feed` handles `Unknown` before it checks for
+        // arrival at rest, so a flick from a raw-accelerometer source
+        // could never complete — the return leg was swallowed. The D-Bus
+        // source never hit it because the daemon keeps reporting a
+        // rotation while flat.
+        //
+        // The concern behind `Unknown` was noise deciding the rotation
+        // sample by sample; a FIXED value answers that just as well and
+        // stays compatible with the ratchet.
+        return (Orient::Normal, tilt);
+    }
+    let orient = if y <= -AXIS_G {
+        // Gravity pulling toward the bottom of the screen means the top
+        // edge is up: the phone stood on its charging port.
+        Orient::Normal
+    } else if y >= AXIS_G {
+        Orient::BottomUp
+    } else if x <= -AXIS_G {
+        // Gravity toward the left edge means the RIGHT edge is up.
+        Orient::RightUp
+    } else if x >= AXIS_G {
+        Orient::LeftUp
+    } else {
+        Orient::Unknown
+    };
+    (orient, tilt)
+}
+
 /// The flick ratchet: one step per out-and-back, gated on timing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Ratchet {
@@ -1898,5 +1970,65 @@ mod attention_gate_tests {
         assert!(Watching::Away.blocks());
         assert!(!Watching::Unknown.blocks());
         assert!(!Watching::Looking.blocks());
+    }
+}
+
+#[cfg(test)]
+mod accel_tests {
+    use super::*;
+
+    #[test]
+    fn a_phone_flat_on_a_table_is_at_rest_and_points_nowhere() {
+        // Lying flat, x and y are near zero and noise decides between
+        // them — asking "which edge is up" of a device that has no up
+        // produces a rotation per sample, and the ratchet walks on its own.
+        // Rest is carried by the TILT; the orientation is a fixed value
+        // rather than one noise picks per sample, and `Normal` matches
+        // what iio-sensor-proxy reports for a phone on a table. Returning
+        // `Unknown` here — which I did first — breaks the ratchet: it
+        // handles unknown before it checks arrival at rest, so the return
+        // leg of every flick was swallowed.
+        assert_eq!(from_accel(0.02, -0.03, 1.0), (Orient::Normal, Tilt::FaceUp));
+        assert_eq!(from_accel(-0.01, 0.02, -1.0), (Orient::Normal, Tilt::FaceDown));
+        assert!(from_accel(0.02, -0.03, 1.0).1.is_rest());
+    }
+
+    #[test]
+    fn each_edge_up_reports_the_rotation_that_runs_the_ball_downhill() {
+        // The four rotations, matching `Orient::direction`'s own note:
+        // left-up runs the ball left, normal (stood on its port) runs it
+        // down the screen.
+        assert_eq!(from_accel(0.0, -1.0, 0.1).0, Orient::Normal);
+        assert_eq!(from_accel(0.0, 1.0, 0.1).0, Orient::BottomUp);
+        assert_eq!(from_accel(1.0, 0.0, 0.1).0, Orient::LeftUp);
+        assert_eq!(from_accel(-1.0, 0.0, 0.1).0, Orient::RightUp);
+    }
+
+    #[test]
+    fn a_reading_between_positions_is_unknown_rather_than_a_guess() {
+        // An unknown reading neither fires nor re-arms, which is the
+        // documented behaviour of the ratchet — guessing here would put a
+        // step in from a wobble.
+        let (o, t) = from_accel(0.2, -0.2, 0.3);
+        assert_eq!(o, Orient::Unknown);
+        assert_eq!(t, Tilt::Raised, "held at an angle is not rest");
+    }
+
+    #[test]
+    fn held_upright_is_not_rest_so_the_ratchet_stays_live() {
+        // Rest is flat. A phone held vertically in front of you is being
+        // USED, and treating it as rest would re-arm between every flick.
+        let (_, t) = from_accel(0.0, -1.0, 0.0);
+        assert!(!t.is_rest(), "upright was treated as resting");
+    }
+
+    #[test]
+    fn the_thresholds_are_ordered_so_flat_wins_over_a_rotation() {
+        // FLAT_G above AXIS_G on purpose: a device that re-arms while
+        // still being waved gives a second step nobody asked for.
+        assert!(FLAT_G > AXIS_G);
+        // Just past flat, with a rotation component that would otherwise
+        // register.
+        assert_eq!(from_accel(0.5, 0.0, 0.8), (Orient::Normal, Tilt::FaceUp));
     }
 }

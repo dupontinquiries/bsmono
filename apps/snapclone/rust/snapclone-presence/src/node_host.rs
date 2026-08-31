@@ -30,14 +30,28 @@
 
 use snapcore::node::Node;
 use snapcore::routing::NodeId;
-use snapcore::udp::UdpTransport;
+// THE OPENDHT-SPEAKING SOCKET, not snapcore's bespoke one.
+//
+// `snapcore::udp::UdpTransport` frames its own way — `[TAG_FIND_NODE][id]
+// [target]` — and this crate's bootstrap list is entirely Jami servers,
+// which speak OpenDHT. The node was therefore sending bytes nothing on that
+// list could answer: the routing table never filled, every lookup returned
+// empty, and an empty lookup is also what a working DHT returns for a peer
+// who is offline, so nothing above ever noticed.
+//
+// `snapcore::wire_udp` encodes with dht-kit, which this crate already
+// depended on for its TYPES. See maintenance/DHT_CONVERGENCE.md — this is
+// the convergence it argues for, applied to the path the app actually uses.
+use snapcore::wire_udp::WireUdpTransport as UdpTransport;
 use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 /// Something to do, sent to the worker.
 enum Req {
     Publish { sc_id: String, name: String, ip: String, port: u16 },
+    PublishRaw { sc_id: String, value_id: u64, payload: Vec<u8> },
     Resolve { sc_id: String },
+    ResolveRaw { sc_id: String },
     Bootstrap { addr: SocketAddr, id: NodeId },
 }
 
@@ -50,6 +64,10 @@ pub enum Event {
     /// Resolved. An empty vec means the lookup finished and found
     /// nothing, which is different from never having asked.
     Resolved { sc_id: String, found: Vec<crate::presence::Presence> },
+    /// Resolved, UNDECODED. For a caller that knows a payload format this
+    /// crate does not — see `dht::publish_raw` on why the payload stopped
+    /// being this crate's business.
+    ResolvedRaw { sc_id: String, values: Vec<Vec<u8>> },
     /// The worker stopped. Carries why, because a discovery feature that
     /// silently stops is one people conclude is "just slow".
     Stopped(String),
@@ -107,6 +125,20 @@ impl NodeHost {
                             &sc_id, &name, &ip, port, DEFAULT_TTL, now);
                         Event::Published { sc_id, peers: n }
                     }
+                    Req::PublishRaw { sc_id, value_id, payload } => {
+                        let me = me_contact(&node, id, local, now);
+                        let n = crate::dht::publish_raw(
+                            &me, &mut node.rt, &tx_udp,
+                            &sc_id, value_id, payload, DEFAULT_TTL, now);
+                        Event::Published { sc_id, peers: n }
+                    }
+                    Req::ResolveRaw { sc_id } => {
+                        let me = me_contact(&node, id, local, now);
+                        let values = crate::dht::resolve_raw(
+                            &me, &mut node.rt, &tx_udp, &sc_id, now)
+                            .unwrap_or_default();
+                        Event::ResolvedRaw { sc_id, values }
+                    }
                     Req::Resolve { sc_id } => {
                         let me = me_contact(&node, id, local, now);
                         let found = crate::dht::resolve(
@@ -145,6 +177,17 @@ impl NodeHost {
                 port,
             })
             .is_ok()
+    }
+
+    /// Publish a payload the caller built. Answered with `Published`.
+    pub fn publish_raw(&self, sc_id: &str, value_id: u64, payload: Vec<u8>) -> bool {
+        self.tx.send(Req::PublishRaw {
+            sc_id: sc_id.to_string(), value_id, payload }).is_ok()
+    }
+
+    /// Ask for the raw values under an sc-ID. Answered with `ResolvedRaw`.
+    pub fn resolve_raw(&self, sc_id: &str) -> bool {
+        self.tx.send(Req::ResolveRaw { sc_id: sc_id.to_string() }).is_ok()
     }
 
     pub fn resolve(&self, sc_id: &str) -> bool {

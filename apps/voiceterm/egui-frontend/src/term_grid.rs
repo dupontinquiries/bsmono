@@ -433,3 +433,226 @@ mod tests {
         assert_eq!(g.dirty_rows(), None);
     }
 }
+
+// ── the VT parser ───────────────────────────────────────────────────────────
+
+/// Feed terminal output into a grid.
+///
+/// `TermGrid` deliberately takes SEMANTIC operations — print, newline,
+/// sgr — and leaves escape parsing to this, so the grid can be tested
+/// without a terminal. This is the smallest parser that keeps that
+/// contract honest: printable characters, the four C0 controls that move
+/// the cursor, and the CSI sequences a shell actually emits.
+///
+/// Unknown escapes are SWALLOWED, not printed. A terminal that renders the
+/// bytes of a sequence it does not understand fills the screen with
+/// `[?2004h`, which looks like the shell is broken rather than the
+/// emulator being incomplete.
+///
+/// This lived inside the binary as `feed_pty`, which made the crate
+/// header's claim — "a portable terminal core, a screen-grid model plus a
+/// VT/ANSI parser, pure and unit-tested, with no egui or PTY in it" —
+/// true of the grid and false of the parser. It was reachable only from a
+/// method on the app, so nothing could test it and nothing else could use
+/// it. Moving it here costs nothing and makes the sentence true.
+///
+/// Stateless between calls in one respect that matters and is wrong: an
+/// escape sequence split across two reads is lost, because parsing starts
+/// fresh each time. A pty hands over whatever arrived, and a 4KB boundary
+/// falls in the middle of a colour code eventually. [`Vt`] below carries
+/// the partial sequence across calls, which is why it is a struct rather
+/// than a function.
+#[derive(Debug, Clone, Default)]
+pub struct Vt {
+    /// An escape sequence that has begun and not finished.
+    pending: String,
+}
+
+impl Vt {
+    pub fn new() -> Vt { Vt::default() }
+
+    /// Feed bytes. Text is printed, control codes and CSI sequences acted on.
+    pub fn feed(&mut self, grid: &mut TermGrid, bytes: &[u8]) {
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        // Anything left mid-sequence from last time goes in front.
+        let text = if self.pending.is_empty() {
+            text
+        } else {
+            let mut t = std::mem::take(&mut self.pending);
+            t.push_str(&text);
+            t
+        };
+        let mut it = text.chars().peekable();
+        while let Some(c) = it.next() {
+            match c {
+                '\x1b' => {
+                    // Collect the whole sequence first, so an unterminated
+                    // one can be held rather than half-applied.
+                    let mut seq = String::from('\x1b');
+                    if it.peek() == Some(&'[') {
+                        seq.push(it.next().unwrap());
+                        let mut done = false;
+                        for c2 in it.by_ref() {
+                            seq.push(c2);
+                            if c2.is_ascii_alphabetic() { done = true; break; }
+                        }
+                        if !done {
+                            // Split across reads. Held for the next call —
+                            // dropping it turns a colour code into visible
+                            // garbage on screen, which is what a 4KB
+                            // boundary through an SGR sequence produces.
+                            self.pending = seq;
+                            return;
+                        }
+                        let body = &seq[2..seq.len() - 1];
+                        let final_byte = seq.chars().last().unwrap();
+                        csi(grid, body, final_byte);
+                    } else if it.peek().is_none() {
+                        // A bare ESC at the very end: also possibly a split.
+                        self.pending = seq;
+                        return;
+                    }
+                    // Any other introducer is dropped, as before.
+                }
+                '\r' => grid.carriage_return(),
+                '\n' => grid.newline(),
+                '\t' => {
+                    // Next 8-column stop. Printing spaces rather than
+                    // moving, so erase_to_eol still clears what a tab
+                    // covered.
+                    let (x, _) = grid.cursor();
+                    for _ in 0..(8 - (x % 8)) { grid.print(' '); }
+                }
+                '\x08' => {
+                    let (x, y) = grid.cursor();
+                    grid.move_to(x.saturating_sub(1), y);
+                }
+                c if (c as u32) < 0x20 => {}   // other C0: ignored, not drawn
+                c => grid.print(c),
+            }
+        }
+    }
+}
+
+/// Apply one CSI sequence. `body` is what sits between `[` and the final byte.
+fn csi(grid: &mut TermGrid, body: &str, final_byte: char) {
+    // A private-mode sequence — `[?25l`, `[?1049h` — is addressed to the
+    // terminal, not the screen. Ignored rather than parsed as numbers,
+    // because `?25` parses as nothing and would land as a default.
+    if body.starts_with('?') {
+        return;
+    }
+    let n = |d: usize| body.split(';').next()
+        .and_then(|x| x.parse::<usize>().ok()).unwrap_or(d);
+    match final_byte {
+        'H' | 'f' => {
+            // 1-based on the wire, 0-based in the grid.
+            let mut p = body.split(';');
+            let row = p.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(1);
+            let col = p.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(1);
+            grid.move_to(col.saturating_sub(1), row.saturating_sub(1));
+        }
+        'J' => grid.clear(),
+        'K' => grid.erase_to_eol(),
+        'm' => {
+            let mut any = false;
+            for part in body.split(';') {
+                if let Ok(v) = part.parse::<u16>() { grid.sgr(v); any = true; }
+            }
+            // `[m` and `[0m` both mean reset. An empty body parsed as
+            // nothing and left the attributes on, so `ls --color` painted
+            // the rest of the screen in the last file's colour.
+            if !any { grid.sgr(0); }
+        }
+        'A' | 'B' | 'C' | 'D' => {
+            let (x, y) = grid.cursor();
+            let d = n(1).max(1);
+            let (nx, ny) = match final_byte {
+                'A' => (x, y.saturating_sub(d)),
+                'B' => (x, y + d),
+                'C' => (x + d, y),
+                _ => (x.saturating_sub(d), y),
+            };
+            grid.move_to(nx, ny);
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod vt_tests {
+    use super::*;
+
+    fn text_of(g: &TermGrid, y: usize) -> String {
+        let mut s = String::new();
+        for x in 0..g.cols { if let Some(c) = g.cell(x, y) { s.push(c.ch); } }
+        s.trim_end().to_string()
+    }
+
+    #[test]
+    fn a_sequence_split_between_two_reads_is_not_printed_as_text() {
+        // A pty hands over whatever arrived, and a 4KB boundary falls
+        // inside a colour code eventually. Parsing each read from scratch
+        // dropped the opening half and printed the rest — "31mred" on the
+        // screen. Held across calls now, which is why `Vt` is a struct.
+        let mut g = TermGrid::new(40, 4);
+        let mut vt = Vt::new();
+        vt.feed(&mut g, b"a\x1b[3");
+        vt.feed(&mut g, b"1mred");
+        assert_eq!(text_of(&g, 0), "ared", "{:?}", text_of(&g, 0));
+    }
+
+    #[test]
+    fn a_bare_reset_resets() {
+        // `[m` and `[0m` both mean reset. An empty body parsed as no
+        // numbers at all and left the attributes on, so the rest of the
+        // screen kept the last colour — which is exactly what `ls --color`
+        // ends its output with.
+        let mut g = TermGrid::new(40, 4);
+        let mut vt = Vt::new();
+        vt.feed(&mut g, b"\x1b[1;32mgreen\x1b[mplain");
+        // "green" is five cells, so "plain" starts at 5 — I miscounted
+        // and landed on 'n' the first time.
+        let plain = g.cell(5, 0).expect("a cell");
+        assert_eq!(plain.ch, 'p', "the row is {:?}", text_of(&g, 0));
+        let bold_bit = g.cell(0, 0).map(|c| c.attr).unwrap_or(0);
+        assert_ne!(bold_bit, plain.attr, "the reset did not take");
+    }
+
+    #[test]
+    fn a_private_mode_sequence_is_ignored_rather_than_misread() {
+        // `[?25l` hides the cursor and `[?1049h` switches to the alternate
+        // screen — addressed to the terminal, not the page. `?25` parses
+        // as no number, so a naive reader takes the DEFAULT and moves the
+        // cursor or clears the screen on a sequence that asked for
+        // neither.
+        let mut g = TermGrid::new(40, 4);
+        let mut vt = Vt::new();
+        vt.feed(&mut g, b"hello\x1b[?25l\x1b[?1049h world");
+        assert_eq!(text_of(&g, 0), "hello world", "{:?}", text_of(&g, 0));
+    }
+
+    #[test]
+    fn real_ls_colour_output_leaves_no_escape_text_on_screen() {
+        // Shape taken from `ls --color=always` as captured on this
+        // machine: the only sequences it emits are SGR colour codes and a
+        // bare reset.
+        let mut g = TermGrid::new(40, 4);
+        let mut vt = Vt::new();
+        vt.feed(&mut g, "\x1b[0m\x1b[01;34mdir\x1b[0m  \x1b[01;32mexe\x1b[0m\n".as_bytes());
+        let row = text_of(&g, 0);
+        assert_eq!(row, "dir  exe", "{row:?}");
+        assert!(!row.contains('['), "escape text reached the screen: {row:?}");
+    }
+
+    #[test]
+    fn a_cursor_move_of_zero_still_moves_one() {
+        // `[0A` means one row, not none — the parameter's default applies
+        // to an absent value AND to zero, per the spec. Reading it as zero
+        // makes a redrawing program overwrite its own line.
+        let mut g = TermGrid::new(20, 5);
+        let mut vt = Vt::new();
+        vt.feed(&mut g, b"\x1b[3;1Hx\x1b[0A");
+        assert_eq!(g.cursor().1, 1, "cursor row {:?}", g.cursor());
+    }
+}

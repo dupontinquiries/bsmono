@@ -751,3 +751,104 @@ mod tests {
         assert_eq!(recommend(&d).level, Level::None);
     }
 }
+
+// ── what a level asks the host to do ────────────────────────────────────────
+
+/// The plan for running one repair level.
+///
+/// This was a match inside the binary, mixed with toast calls, where none
+/// of it could be tested — and the interesting decision in it is the
+/// Assisted case, which is a promise the app cannot keep.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Plan {
+    /// The level to actually run. Differs from the one asked for when the
+    /// backend it needs is not attached.
+    pub run: Option<Level>,
+    /// What to tell the person, and how loudly.
+    pub note: Option<(Tone, String)>,
+    /// Put the document back as captured instead of running anything.
+    pub revert: bool,
+}
+
+/// How a note should be shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Info,
+    /// Something was not done, or not done as asked.
+    Warning,
+}
+
+/// Decide what to do about a requested level.
+///
+/// `chunks` is how many model-sized pieces the document makes — the caller
+/// computes it, because it owns the text.
+pub fn plan(level: Level, chunks: usize) -> Plan {
+    match level {
+        // Keeping a capture verbatim is a real choice, and for a quotation
+        // the only correct one. It runs nothing and says so.
+        Level::None => Plan {
+            run: None,
+            note: Some((Tone::Info, "kept as captured".into())),
+            revert: true,
+        },
+        Level::Tidy | Level::Structural => Plan {
+            run: Some(level), note: None, revert: false,
+        },
+        // THE PROMISE THE APP CANNOT KEEP. The assisted pass needs a
+        // logscope model this binary does not own. Running the structural
+        // pass and SAYING the AI half is unavailable is honest; silently
+        // doing something lesser under the name "AI pass" is not — the
+        // person would judge the model by output it never produced.
+        Level::Assisted => Plan {
+            run: Some(Level::Structural),
+            note: Some((Tone::Warning, format!(
+                "no local model attached — {chunks} chunk(s) ready, ran the \
+                 structural pass instead"))),
+            revert: false,
+        },
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    #[test]
+    fn keeping_it_as_captured_runs_nothing_and_says_so() {
+        let p = plan(Level::None, 0);
+        assert!(p.revert && p.run.is_none());
+        assert_eq!(p.note.as_ref().map(|(t, _)| *t), Some(Tone::Info));
+    }
+
+    #[test]
+    fn the_ordinary_passes_run_silently() {
+        // A note on every successful pass is a notification nobody reads,
+        // and the confirmation prompt already says what happened.
+        for l in [Level::Tidy, Level::Structural] {
+            let p = plan(l, 0);
+            assert_eq!(p.run, Some(l));
+            assert_eq!(p.note, None, "{l:?} announced itself");
+            assert!(!p.revert);
+        }
+    }
+
+    #[test]
+    fn the_assisted_pass_says_the_model_is_missing_rather_than_pretending() {
+        // Silently doing something lesser under the name "AI pass" makes
+        // the person judge a model by output it never produced.
+        let p = plan(Level::Assisted, 3);
+        assert_eq!(p.run, Some(Level::Structural), "it ran the level it was asked for");
+        let (tone, msg) = p.note.expect("no note on a downgraded pass");
+        assert_eq!(tone, Tone::Warning, "a downgrade was reported as information");
+        assert!(msg.contains("no local model"), "{msg}");
+        assert!(msg.contains('3'), "the chunk count is missing: {msg}");
+    }
+
+    #[test]
+    fn a_downgrade_never_reverts() {
+        // The structural result is worth keeping; reverting would throw
+        // away work the person can use because the better pass was
+        // unavailable.
+        assert!(!plan(Level::Assisted, 1).revert);
+    }
+}

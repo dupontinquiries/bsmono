@@ -91,33 +91,33 @@ impl VoicetermApp {
 
     /// Run a level and raise the confirm question.
     fn run_ingest_level(&mut self, lvl: voiceterm_egui::docingest::Level, now: f64) {
-        use voiceterm_egui::docingest::{self, Level, Verdict};
-        let verdict = match lvl {
-            Level::None => {
-                self.ingest.revert();
-                self.toasts.info("kept as captured", now);
-                return;
+        use voiceterm_egui::docingest::{self, Level, Tone, Verdict};
+        // WHAT to run and WHAT to say is `docingest::plan` — it was a match
+        // in here tangled with toast calls, and the decision worth checking
+        // is that an assisted pass without a model says so rather than
+        // quietly doing something lesser under the same name.
+        let chunks = docingest::chunk_for_model(&self.ingest.original, 4000).len();
+        let p = docingest::plan(lvl, chunks);
+        if let Some((tone, msg)) = p.note {
+            match tone {
+                Tone::Info => self.toasts.info(msg, now),
+                Tone::Warning => self.toasts.warning(msg, now),
             }
-            Level::Tidy => self.ingest.run(lvl, |s| docingest::tidy(s)),
-            Level::Structural => self.ingest.run(lvl, |s| docingest::structural(s)),
-            Level::Assisted => {
-                // THE LOGSCOPE BACKEND, in chunks. Not wired to a model here:
-                // the seam is chunk_for_model and what fills it is a logscope
-                // engine this binary does not own. Running the structural pass
-                // and SAYING the AI half is unavailable is honest; silently
-                // doing something lesser under the name "AI pass" is not.
-                let chunks = docingest::chunk_for_model(&self.ingest.original, 4000);
-                self.toasts.warning(
-                    format!("no local model attached — {} chunk(s) ready, ran the \
-                             structural pass instead", chunks.len()), now);
-                self.ingest.run(Level::Structural, |s| docingest::structural(s))
-            }
+        }
+        if p.revert {
+            self.ingest.revert();
+            return;
+        }
+        let Some(run) = p.run else { return };
+        let verdict = match run {
+            Level::Tidy => self.ingest.run(run, |s| docingest::tidy(s)),
+            _ => self.ingest.run(Level::Structural, |s| docingest::structural(s)),
         };
         match verdict {
             Verdict::Failed => {
-                // No question: there is nothing to keep. The toast reports and
-                // expires, because a failure the operator cannot act on should
-                // not need dismissing.
+                // No question: there is nothing to keep. The toast reports
+                // and expires, because a failure the operator cannot act
+                // on should not need dismissing.
                 if let Some(msg) = self.ingest.confirm_prompt() {
                     self.toasts.error(msg, now);
                 }
@@ -131,86 +131,14 @@ impl VoicetermApp {
         }
     }
 
-    /// Feed PTY bytes to the screen.
+    /// Feed terminal output into the focused pane's grid.
     ///
-    /// term_grid deliberately takes SEMANTIC operations — print, newline, sgr —
-    /// and leaves escape parsing to the caller, so it can be tested without a
-    /// terminal. This is the smallest parser that keeps that contract honest:
-    /// the printable characters, the four C0 controls that move the cursor, and
-    /// CSI sequences for the cases a shell prompt actually emits.
-    ///
-    /// Unknown escapes are SWALLOWED, not printed. A terminal that renders the
-    /// bytes of a sequence it does not understand fills the screen with
-    /// `[?2004h` — which looks like the shell is broken rather than the
-    /// emulator being incomplete.
+    /// The parsing moved to `term_grid::Vt`, where it can be tested and
+    /// where the crate header already claimed it was. What is left here is
+    /// the part that is genuinely the app's: which grid, and which
+    /// parser state goes with it.
     fn feed_pty(&mut self, bytes: &[u8]) {
-        let text = String::from_utf8_lossy(bytes).into_owned();
-        let mut it = text.chars().peekable();
-        while let Some(c) = it.next() {
-            match c {
-                '\x1b' => {
-                    if it.peek() == Some(&'[') {
-                        it.next();
-                        let mut params = String::new();
-                        let mut final_byte = None;
-                        for c2 in it.by_ref() {
-                            if c2.is_ascii_alphabetic() {
-                                final_byte = Some(c2);
-                                break;
-                            }
-                            params.push(c2);
-                        }
-                        let n = |d: usize| params.split(';').next()
-                            .and_then(|x| x.parse::<usize>().ok()).unwrap_or(d);
-                        match final_byte {
-                            Some('H') => {
-                                // 1-based on the wire, 0-based in the grid.
-                                let mut p = params.split(';');
-                                let row = p.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(1);
-                                let col = p.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(1);
-                                self.session.grid.move_to(col.saturating_sub(1), row.saturating_sub(1));
-                            }
-                            Some('J') => self.session.grid.clear(),
-                            Some('K') => self.session.grid.erase_to_eol(),
-                            Some('m') => {
-                                for part in params.split(';') {
-                                    if let Ok(v) = part.parse::<u16>() { self.session.grid.sgr(v); }
-                                }
-                                if params.is_empty() { self.session.grid.sgr(0); }
-                            }
-                            // Cursor moves. Clamped by the grid, not here.
-                            Some('A') | Some('B') | Some('C') | Some('D') => {
-                                let (x, y) = self.session.grid.cursor();
-                                let d = n(1);
-                                let (nx, ny) = match final_byte {
-                                    Some('A') => (x, y.saturating_sub(d)),
-                                    Some('B') => (x, y + d),
-                                    Some('C') => (x + d, y),
-                                    _ => (x.saturating_sub(d), y),
-                                };
-                                self.session.grid.move_to(nx, ny);
-                            }
-                            _ => {}
-                        }
-                    }
-                    // A bare ESC or an unrecognised introducer: dropped.
-                }
-                '\r' => self.session.grid.carriage_return(),
-                '\n' => self.session.grid.newline(),
-                '\t' => {
-                    // Next 8-column stop. Printing spaces rather than moving,
-                    // so erase_to_eol still clears what a tab covered.
-                    let (x, _) = self.session.grid.cursor();
-                    for _ in 0..(8 - (x % 8)) { self.session.grid.print(' '); }
-                }
-                '\x08' => {
-                    let (x, y) = self.session.grid.cursor();
-                    self.session.grid.move_to(x.saturating_sub(1), y);
-                }
-                c if (c as u32) < 0x20 => {}   // other C0: ignored, not drawn
-                c => self.session.grid.print(c),
-            }
-        }
+        self.vt.feed(&mut self.session.grid, bytes);
     }
 
     /// The connections graph over what this app actually holds.
@@ -222,67 +150,24 @@ impl VoicetermApp {
     fn connections_nodes(&self)
         -> (Vec<voiceterm_egui::connections_graph::Node>,
             Vec<voiceterm_egui::connections_graph::Edge>) {
+        // The mapping and every decision in it — which node kinds are
+        // produced, which are deliberately not, which edges the data can
+        // honestly support — moved to `connections_graph::build`, where
+        // they can be tested. Seventy lines of reasoning in a binary is
+        // seventy lines nobody can check.
         use voiceterm_egui::connections_graph as cg;
-        let mut nodes = Vec::new();
-        for b in self.browser.bookmarks.all() {
-            nodes.push(cg::Node {
-                id: cg::node_id(cg::NodeKind::Page, &b.url),
-                kind: cg::NodeKind::Page,
-                title: b.title.clone(),
-                subtitle: b.url.clone(),
-                // preview() truncates on a word boundary, so a long title does
-                // not end mid-word in the graph. Built from the title because a
-                // bookmark is all the app stored — an empty preview would be
-                // honest but leaves the node unreadable at a glance.
-                preview: cg::preview(&b.title),
-                // No tags: the app records none for a bookmark, and inventing
-                // one ("web", "saved") would be a facet nobody can filter on
-                // meaningfully.
-                tags: Vec::new(),
-            });
-        }
-        for t in &self.mail.threads {
-            nodes.push(cg::Node {
-                id: cg::node_id(cg::NodeKind::ChatThread, &t.conversation_id),
-                kind: cg::NodeKind::ChatThread,
-                title: t.subject.clone(),
-                subtitle: t.participants.join(", "),
-                preview: cg::preview(&t.subject),
-                tags: Vec::new(),
-            });
-        }
-
-        // SameDomain is the one edge this data can honestly produce: two
-        // bookmarks on one host are related, weakly. The others need a link
-        // the app does not record — a recording tagged with the page it was
-        // captured on, a chat that cites a URL — so producing them would be
-        // asserting a connection nobody established.
-        let mut edges = Vec::new();
-        let pages: Vec<(&str, String)> = self.browser.bookmarks.all().iter()
-            .map(|b| (b.url.as_str(), host_of(&b.url)))
+        let pages: Vec<cg::PageIn> = self.browser.bookmarks.all().iter()
+            .map(|b| cg::PageIn { url: b.url.clone(), title: b.title.clone() })
             .collect();
-        for (i, (ua, ha)) in pages.iter().enumerate() {
-            for (ub, hb) in pages.iter().skip(i + 1) {
-                if !ha.is_empty() && ha == hb {
-                    edges.push(cg::Edge {
-                        from: cg::node_id(cg::NodeKind::Page, ua),
-                        to: cg::node_id(cg::NodeKind::Page, ub),
-                        reason: cg::EdgeReason::SameDomain,
-                    });
-                }
-            }
-        }
-        (nodes, cg::prune(edges))
+        let threads: Vec<cg::ThreadIn> = self.mail.threads.iter()
+            .map(|t| cg::ThreadIn {
+                conversation_id: t.conversation_id.clone(),
+                subject: t.subject.clone(),
+                participants: t.participants.clone(),
+            })
+            .collect();
+        cg::build(&pages, &threads)
     }
-}
-
-/// The host part of a URL, or empty when there is not one.
-///
-/// Deliberately not a URL parser: this only needs the authority, and pulling in
-/// a crate to find one `/` would be the tail wagging the dog.
-fn host_of(url: &str) -> String {
-    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    rest.split('/').next().unwrap_or("").to_lowercase()
 }
 
 /// How many files a snapshot of `root` would capture.
@@ -546,6 +431,11 @@ struct VoicetermApp {
     /// Command blocks (QML blocksDrawer): tracked from what the demo feeds; the
     /// left-edge drawer shows when `surfaces` says `Surface::Blocks`.
     blocks: uikit_term::blocks::BlockTracker,
+    /// The escape-sequence parser's state. Held across frames because a
+    /// sequence can be split between two pty reads — see `term_grid::Vt`.
+    vt: voiceterm_egui::term_grid::Vt,
+    /// Bytes bound for the shell, split into commands as lines complete.
+    line_buf: uikit_term::blocks::CommandLines,
     /// One-shot scroll target for the tab bar ("N more" pill taps apply next frame).
     tabbar_scroll_to: Option<f32>,
     /// The QML toast, ported: fire-and-forget status pill above the bottom chrome.
@@ -594,6 +484,16 @@ struct VoicetermApp {
     /// the inbox list draws Message rows, so both live here and are set
     /// together.
     mail_messages: Vec<voiceterm_egui::mail_view::Message>,
+    /// How many blocks had been scanned for mail last time. The scan walks
+    /// closed blocks and parses the email-shaped ones; re-parsing every
+    /// block every frame would re-read the whole session's output at frame
+    /// rate for a list that changes when a command finishes.
+    mail_scanned_blocks: usize,
+    /// Mail read off disk, kept apart from the terminal-harvested set so a
+    /// rescan of one does not discard the other.
+    mail_from_disk: Vec<voiceterm_egui::mail_view::Message>,
+    /// Where that came from, for the status line and the rescan button.
+    mail_store_path: Option<std::path::PathBuf>,
     /// The open message id on the Mail view, if any.
     mail_open: Option<String>,
     /// The command audit chain: every submitted line hashed into a tamper-
@@ -713,7 +613,14 @@ struct VoicetermApp {
     palette_query: String,
     palette_sel: usize,
     workspaces_filter: String,
-    bar_state: voiceterm_egui::bars::BarState,
+    /// The last thing the bottom bar's Launch button was used to run, shown
+    /// in the terminal's status line. A field rather than a local because
+    /// the bar is drawn in its own panel, before the terminal that reports
+    /// it.
+    bar_note: String,
+    /// Global and per-site web rendering settings. Loaded once; written
+    /// when something changes, not per frame.
+    web_prefs: voiceterm_egui::web_prefs::WebPrefs,
     /// The graph's SOURCE, not a prebuilt topology.
     ///
     /// A previous pass drew `Topology::new(&[], &[])` — an empty graph, which
@@ -770,6 +677,41 @@ impl VoicetermApp {
             // working and now move the column that actually holds the tabs.
             Command::ToggleRail => { self.tabbar_open = !self.tabbar_open; }
             Command::ToggleSettings => { self.surfaces.toggle(Surface::Settings); }
+            Command::ToggleWebSettings => { self.surfaces.toggle(Surface::WebSettings); }
+            // A site rule from the palette, without opening a panel: this
+            // is what people actually want when a page has eaten its own
+            // sidebar or is unreadable through the ads.
+            Command::SiteFilter(level) => {
+                use voiceterm_egui::browser::FilterMode;
+                use voiceterm_egui::palette::FilterLevel;
+                let mode = match level {
+                    FilterLevel::Off => FilterMode::Off,
+                    FilterLevel::Standard => FilterMode::Standard,
+                    FilterLevel::Aggressive => FilterMode::Aggressive,
+                };
+                match voiceterm_egui::web_prefs::host_of(&self.browser.url) {
+                    Some(h) => {
+                        self.web_prefs.site_mut(&h).filter = Some(mode);
+                        self.save_web_prefs();
+                        self.toasts.info(format!("{h}: ads {}", level.label()), 0.0);
+                    }
+                    // Refused rather than applied globally. "For this site"
+                    // with no site is a command whose target the person
+                    // cannot see, and silently making it global is the
+                    // worst reading of it.
+                    None => self.toasts.warning("no site open", 0.0),
+                }
+            }
+            Command::SiteReset => {
+                match voiceterm_egui::web_prefs::host_of(&self.browser.url) {
+                    Some(h) => {
+                        self.web_prefs.sites.retain(|(p, _)| *p != h);
+                        self.save_web_prefs();
+                        self.toasts.info(format!("{h}: following the defaults"), 0.0);
+                    }
+                    None => self.toasts.warning("no site open", 0.0),
+                }
+            }
         }
     }
 
@@ -822,6 +764,212 @@ impl VoicetermApp {
     }
 }
 
+impl VoicetermApp {
+    /// Record any commands in bytes bound for the shell.
+    ///
+    /// The line rules live in `uikit_term::blocks::CommandLines` — they are
+    /// not app policy, they are how a byte stream becomes commands, and
+    /// they were three fiddly cases (backspace before the control-byte
+    /// check, escape sequences rejected, `\r` and `\n` both ending a line)
+    /// sitting inline in a frame loop where nothing could test them.
+    fn record_typed(&mut self, bytes: &[u8]) {
+        for cmd in self.line_buf.feed(bytes) {
+            // `start_row`: where the block begins in the scrollback. The
+            // kit's tracker stamps its own wall clock.
+            let row = self.session.grid.cursor().1;
+            self.blocks.submit_command(&cmd, row);
+        }
+    }
+
+    /// Harvest email-shaped command output into the mail view.
+    ///
+    /// `MailView::set_messages` had no caller and `mail_messages` was
+    /// `Vec::new()` for the life of the process, so the inbox, the thread
+    /// list and the message pane were correct renderings of nothing. The
+    /// Proton bridge is the intended source and is not reachable from a
+    /// widget crate — `mail_proton` drags the HTTP and scraper stack, which
+    /// the frontend's own header already records as the reason it is not
+    /// mounted.
+    ///
+    /// The terminal is the source that is reachable. `BlockKind::Email`
+    /// has classified `mail`, `mutt -e display` and `cat ~/Maildir/…`
+    /// output since it was written, with nothing downstream of it.
+    ///
+    /// CLOSED blocks only: an open one is still receiving output, and
+    /// parsing a half-arrived message shows a mail with no body that never
+    /// updates.
+    /// Read the machine's mail store, if it has one.
+    ///
+    /// Called on demand, not per frame: a Maildir scan is thousands of
+    /// `stat`s and file reads, and doing that at frame rate would stall the
+    /// UI for as long as the app is open. `discover` picks the first of
+    /// `$MAIL`, `~/Maildir`, `~/mail`, `/var/mail/$USER` that holds
+    /// anything.
+    fn rescan_mail_store(&mut self) {
+        match voiceterm_egui::mail_store::discover() {
+            Some((path, _kind)) => {
+                self.mail_from_disk = voiceterm_egui::mail_store::load(&path);
+                self.mail_store_path = Some(path);
+            }
+            None => {
+                // Cleared, not left: a store that has gone away must not
+                // keep showing its last contents as though they were live.
+                self.mail_from_disk.clear();
+                self.mail_store_path = None;
+            }
+        }
+        self.rebuild_mail();
+    }
+
+    /// Merge the two sources into the view.
+    ///
+    /// Disk first, then anything harvested from the terminal that is not
+    /// already there. De-duplicated by message id, because `cat`-ing a file
+    /// that is also in the Maildir is the ordinary way to read mail in a
+    /// terminal — and showing it twice would make the inbox wrong precisely
+    /// for the person using both halves of this app.
+    fn rebuild_mail(&mut self) {
+        // The rule lives in `mail_store::merge`. It was here, and the test
+        // for it copied the loop instead of calling it — proving that a
+        // reimplementation worked, which is the one thing a test cannot
+        // usefully prove.
+        let all = voiceterm_egui::mail_store::merge(
+            &self.mail_from_disk, &self.mail_messages);
+        self.mail.set_messages(&all);
+    }
+
+    fn harvest_mail_from_blocks(&mut self) {
+        let blocks = &self.blocks.blocks;
+        if blocks.len() == self.mail_scanned_blocks {
+            return;
+        }
+        self.mail_scanned_blocks = blocks.len();
+        let mut found = Vec::new();
+        for b in blocks.iter() {
+            // `duration_ms` is the kit's "this block has ended" — `finish`
+            // is the only thing that sets it, and it is None while the
+            // command is still running. Checked rather than assumed,
+            // because a half-arrived message shows as a mail with no body
+            // that never fills in.
+            if b.duration_ms.is_none() {
+                continue;
+            }
+            if !voiceterm_egui::blocks::looks_like_email(b.output.trim_start()) {
+                continue;
+            }
+            found.extend(voiceterm_egui::mail_rfc822::messages_from_text(
+                &format!("block:{}", b.id), &b.output));
+        }
+        // Rebuilt wholesale rather than appended to: a block's output can
+        // still change after it closes (a late write), and appending would
+        // leave the earlier parse of the same block beside the new one.
+        // Cheap — the scan only runs when the block count moved.
+        if found != self.mail_messages {
+            self.mail_messages = found;
+            self.rebuild_mail();
+        }
+    }
+
+    /// Persist the web settings, reporting a failure rather than losing it.
+    ///
+    /// Silently, a write failure means a setting that works until restart —
+    /// which is the shape of bug people spend an evening on.
+    fn save_web_prefs(&mut self) {
+        if let Err(e) = voiceterm_egui::web_prefs::store(&self.web_prefs) {
+            self.toasts.warning(format!("web settings not saved: {e}"), 0.0);
+        }
+    }
+
+    /// Draw the phone bottom bar and act on what it produces.
+    ///
+    /// The BUTTONS are built fresh each frame from live state rather than
+    /// held as a field. A bar cached beside the tab list is a second copy
+    /// of it, and the failure is the one this fleet keeps finding: the
+    /// fan-out offers a tab that was closed two minutes ago, and picking it
+    /// does nothing. `default_bar` is cheap — three vecs of short strings —
+    /// and correct by construction.
+    fn draw_bottom_bar(&mut self, ctx: &egui::Context) {
+        use voiceterm_egui::bars::{bar_ui, BarEvent};
+
+        // Tab ids are INDICES as strings, because `WsTab` has no id and the
+        // dispatch below is "go to tab N" — inventing a uuid here would mean
+        // mapping it straight back to the index at the other end.
+        let tabs: Vec<(String, String)> = self.workspace.tabs.iter().enumerate()
+            .map(|(i, t)| (i.to_string(), t.name.clone()))
+            .collect();
+        let workspaces: Vec<(String, String)> = self.sidebar.sessions.iter().enumerate()
+            .map(|(i, s)| (i.to_string(), s.name.clone()))
+            .collect();
+        // Recent commands, newest first and de-duplicated: a launcher whose
+        // top three entries are the same command run three times is a
+        // launcher with one entry.
+        let mut quick: Vec<(String, String)> = Vec::new();
+        for b in self.blocks.blocks.iter().rev() {
+            if quick.len() >= 8 { break; }
+            let c = b.command.trim();
+            if c.is_empty() || quick.iter().any(|(_, l)| l == c) { continue; }
+            quick.push((c.to_string(), c.to_string()));
+        }
+
+        let bar = voiceterm_egui::bars::bottom_bar::default_bar(&tabs, &workspaces, &quick);
+        let mut event = None;
+        egui::TopBottomPanel::bottom("voiceterm_bottom_bar").show(ctx, |ui| {
+            event = bar_ui(ui, &bar);
+        });
+
+        let Some(ev) = event else { return };
+        match ev {
+            // A tap on Tabs means "the other tab", which is what a single
+            // tap on a tab button means everywhere: the thing you were just
+            // looking at. Not tab 0 — that would make the button useless
+            // once you are on tab 0, which is where you start.
+            BarEvent::Primary(_) => {
+                let n = self.workspace.tabs.len();
+                if n > 1 {
+                    let prev = if self.workspace.active == 0 { 1 } else { self.workspace.active - 1 };
+                    self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command(
+                        format!("go to tab {}", prev + 1)));
+                }
+            }
+            BarEvent::Option { button, option } => {
+                match bar.buttons().get(button).map(|b| b.kind) {
+                    Some(voiceterm_egui::bars::BarButtonKind::Tabs) => {
+                        // Through `apply` rather than by assigning `active`:
+                        // the projection and the model are kept in step by
+                        // `sync`, and writing the field directly is how the
+                        // two drift apart.
+                        self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command(
+                            format!("go to tab {}", option + 1)));
+                    }
+                    Some(voiceterm_egui::bars::BarButtonKind::Workspaces) => {
+                        if option < self.sidebar.sessions.len() {
+                            self.sidebar.active = option;
+                        }
+                    }
+                    Some(voiceterm_egui::bars::BarButtonKind::QuickLaunch) => {
+                        // STAGED, not run. A command that executes on a
+                        // thumb-slide is one nobody can take back, and the
+                        // bar is exactly the surface a pocket press reaches.
+                        if let Some((cmd, _)) = quick.get(option) {
+                            // `stage` puts it on the input line WITHOUT a
+                            // newline — that distinction is the module's
+                            // own, and it is the whole reason this is safe
+                            // to put under a thumb.
+                            self.app.terminal.stage(cmd);
+                            self.bar_note = format!("staged: {cmd}");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Slid off the fan and let go. Nothing happens, which is the
+            // point — but the note clears, so a stale "staged:" line does
+            // not sit there implying something is armed.
+            BarEvent::Cancelled => self.bar_note.clear(),
+        }
+    }
+}
+
 impl eframe::App for VoicetermApp {
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 
@@ -865,6 +1013,26 @@ impl eframe::App for VoicetermApp {
         // FAVORITES. Read fresh each draw rather than on open: the QML
         // refreshes on open for the same reason, and "each draw" is strictly
         // fresher for the cost of parsing one small XML file.
+        // WEB SETTINGS. No permanent control opens this — the palette,
+        // the manual and voice are the three doors, which is what "out of
+        // the way until you need it" means here.
+        let web_t = overlay::openness(ctx, Surface::WebSettings,
+                                      self.surfaces.is(Surface::WebSettings));
+        if web_t > 0.0 {
+            let colors = self.colors;
+            let url = self.browser.url.clone();
+            let mut dirty = false;
+            overlay::show(ctx, Surface::WebSettings, web_t, |ui| {
+                dirty = voiceterm_egui::web_prefs::web_settings_ui(
+                    ui, &mut self.web_prefs, &url, &colors);
+            });
+            // Written on CHANGE, not per frame: the panel is open for as
+            // long as someone is reading it, and rewriting the file sixty
+            // times a second to record nothing is how a config file gets
+            // truncated by a crash at the wrong moment.
+            if dirty { self.save_web_prefs(); }
+        }
+
         let open_t = overlay::openness(ctx, Surface::Favorites, self.surfaces.is(Surface::Favorites));
         if open_t > 0.0 {
             let colors = self.colors;
@@ -1920,6 +2088,23 @@ impl eframe::App for VoicetermApp {
         // tabs (scrollable) + a default fence + system tabs".
 
 
+        // THE BOTTOM BAR, which had a model, a renderer, a gesture and no
+        // call site. `bars::bar_ui` was reached only from its own tests and
+        // `bottom_bar::default_bar` from nothing at all — so the phone's
+        // whole navigation surface, the one that gives four lists to a
+        // screen with room for one, was never drawn.
+        //
+        // COMPACT ONLY. On a desktop the sidebar, the tab strip and the
+        // rail are all on screen at once and a fan-out bar would be a
+        // fourth way to reach the same lists; on a phone none of them fit
+        // and this is the only way.
+        if adaptive.is_compact() {
+            self.draw_bottom_bar(ctx);
+        }
+
+        // Mail read in the terminal becomes mail in the mail view.
+        self.harvest_mail_from_blocks();
+
         egui::CentralPanel::default().show(ctx, |ui| {
             // SAFE AREA. Nothing in the fleet applied these until now — the
             // field existed, the setter existed, and no app read either, so
@@ -2003,8 +2188,42 @@ impl eframe::App for VoicetermApp {
                                 "{} → {} thread(s)", parts.join(", "), hits.len()))
                                 .weak().size(11.0));
                         }
+                        // WHERE THE MAIL CAME FROM, and how to look again.
+                        // An empty inbox with no explanation is
+                        // indistinguishable from a broken one, and the
+                        // difference here is usually just that this machine
+                        // keeps its mail somewhere else.
+                        ui.horizontal(|ui| {
+                            if ui.button("rescan mail").clicked() {
+                                self.rescan_mail_store();
+                            }
+                            let note = match &self.mail_store_path {
+                                Some(p) => format!("{} — {} message(s)",
+                                                   p.display(), self.mail_from_disk.len()),
+                                None => "no mail store found ($MAIL, ~/Maildir, ~/mail, \
+                                         /var/mail)".to_string(),
+                            };
+                            ui.label(egui::RichText::new(note).weak().size(11.0));
+                        });
                         if let Some(conv) = voiceterm_egui::mail_view::list_ui(ui, &mut self.mail, &c) {
-                            self.toasts.info(format!("opened {conv}"), ui.input(|i| i.time));
+                            // OPENING A THREAD READS IT. `mark_thread_read`
+                            // had no caller, so the unread count and the
+                            // bold rows survived opening the mail — the
+                            // one thing a reader must not do.
+                            //
+                            // It returns the message ids that changed, for
+                            // a backend to push a seen flag to. Nothing
+                            // here has one yet: mail harvested from a
+                            // terminal is already read, so the list is
+                            // empty in practice and the toast says what
+                            // happened rather than pretending otherwise.
+                            let changed = self.mail.mark_thread_read(&conv);
+                            let msg = if changed.is_empty() {
+                                format!("opened {conv}")
+                            } else {
+                                format!("opened {conv} — {} marked read", changed.len())
+                            };
+                            self.toasts.info(msg, ui.input(|i| i.time));
                         }
                         ui.separator();
                         // The inbox proper (mail_panes, ported): rows over the
@@ -3012,6 +3231,19 @@ impl eframe::App for VoicetermApp {
             // a second. The high-water mark is what makes this idempotent.
             if self.session.pty_out.len() > self.session.pty_echoed {
                 let fresh = self.session.pty_out[self.session.pty_echoed..].to_vec();
+                // THE BLOCK TRACKER, FED HERE AND NOWHERE ELSE.
+                //
+                // I first hooked this into the keyboard drain, which sees
+                // only what was typed. Nine other places append to
+                // `pty_out` — voice commands, the keycap row, the gesture
+                // menus, the staged command from the bottom bar — and none
+                // of them would have produced a block, so the history would
+                // have quietly recorded typing and nothing else.
+                //
+                // This is the one funnel every byte bound for the shell
+                // passes through, which is what makes it the right place:
+                // there is no way to send a command that misses it.
+                self.record_typed(&fresh);
                 match &self.pty {
                     // A REAL SHELL: send the keys, and let its output be
                     // the echo. Feeding the grid ourselves as well would
@@ -3053,6 +3285,20 @@ impl eframe::App for VoicetermApp {
             let drained = self.pty.as_ref().map(|h| (h.drain(), h.ended()));
             if let Some((out, ended)) = drained {
                 if !out.is_empty() {
+                    // The tracker sees the SHELL'S OUTPUT too, line by line.
+                    // `feed_line` closes the open block when it recognises a
+                    // prompt, which is what gives a block an end without the
+                    // shell reporting an exit code — and the method had no
+                    // caller, so no block opened here would ever have
+                    // closed.
+                    let text = String::from_utf8_lossy(&out).into_owned();
+                    for line in text.split_inclusive(['\n', '\r']) {
+                        let clean = line.trim_end_matches(['\n', '\r']);
+                        // Nothing to feed for a bare line ending; feeding it
+                        // would append a blank line to every block for each
+                        // CRLF pair.
+                        if !clean.is_empty() { self.blocks.feed_line(clean); }
+                    }
                     self.feed_pty(&out);
                 }
                 if ended {
@@ -3454,19 +3700,25 @@ fn main() -> eframe::Result<()> {
     };
     // realistic content, not a toy script — to actually surface rendering gotchas (colors,
     // wrapping, unicode) rather than just confirming an empty prompt renders.
-    // track the demo session as command blocks too, so the blocks drawer has content
+    // NO DEMO BLOCKS. The tracker used to be seeded here with a hardcoded
+    // script — an `ls --color`, an echo, a fake exit code — and then never
+    // touched again, so everything reading it was reading that script: the
+    // blocks drawer, recall, the memory poll's count, and the bottom bar's
+    // quick-launch list. It is fed from real typing and real shell output
+    // now (see the key drain and the pty drain), which means it starts
+    // empty. Empty is the correct state before anyone has run anything, and
+    // the drawer already has a view for it.
+    //
+    // The grid below still gets its sample output. That is a different
+    // thing and worth keeping: it exercises colour, wrapping and multibyte
+    // rendering on the first frame, which is the point of a demo, and it
+    // does not pretend to be history.
     let mut blocks = uikit_term::blocks::BlockTracker::new();
     blocks.set_cwd("/home/kessler/proj");
     app.terminal.feed("$ ls --color\r\n");
-    blocks.submit_command("ls --color", 0);
     app.terminal.feed("\x1b[1;34mCargo.toml\x1b[0m  \x1b[1;32mbuild.sh\x1b[0m  \x1b[1;34msrc\x1b[0m  \x1b[1;31mold.bak\x1b[0m\r\n");
-    blocks.append_output("\x1b[1;34mCargo.toml\x1b[0m  \x1b[1;32mbuild.sh\x1b[0m  src  old.bak\n");
-    blocks.note_exit_code(0);
     app.terminal.feed("$ echo \"a very long line that should wrap across more than one terminal row so we can see how wrapping and the cursor position interact once it spills over\"\r\n");
     app.terminal.feed("a very long line that should wrap across more than one terminal row so we can see how wrapping and the cursor position interact once it spills over\r\n");
-    blocks.submit_command("echo \"a very long line ...\"", 2);
-    blocks.append_output("a very long line that should wrap across more than one terminal row\n");
-    blocks.finish(Some(0));
     app.terminal.feed("$ echo café 🚀 你好\r\n"); // multibyte + emoji + CJK, straight in the source
     app.terminal.feed("café 🚀 你好\r\n");
     app.terminal.feed("$ ");
@@ -3489,7 +3741,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     },
         Box::new(move |_cc| {
-            Ok(Box::new(VoicetermApp {
+            let mut app = VoicetermApp {
                 ingest: Default::default(),
                 // Discovery once at startup, not per frame: scanning
                 // /sys/bus/iio/devices every repaint is a directory walk at 60
@@ -3524,6 +3776,16 @@ fn main() -> eframe::Result<()> {
                             include_str!("../../../docs/PANE_VOICE.md")),
                         doc("niftyplot", "niftyplot spec",
                             include_str!("../../../docs/niftyplot-spec.md")),
+                        // The third door to the web settings, after the
+                        // palette and voice. Already HTML rather than
+                        // markdown, so it goes in directly — `doc()`
+                        // converts, and converting hand-written HTML back
+                        // and forth would only lose it.
+                        voiceterm_egui::manpage_view::Doc {
+                            name: "web".into(),
+                            title: "web rendering".into(),
+                            html: voiceterm_egui::web_prefs::manual_html().to_string(),
+                        },
                     ]);
                     v
                 },
@@ -3571,7 +3833,9 @@ fn main() -> eframe::Result<()> {
 
                 theme: boot_theme,
                 theme_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-theme-menu").columns(3).hold(0.35).item_size(64.0),
-                blocks: blocks,
+                blocks,
+                line_buf: Default::default(),
+                vt: Default::default(),
                 tabbar_scroll_to: None,
                 toasts: uikit_egui::toast::Toasts::new(),
                 // 80x24 is a placeholder: the first frame calls
@@ -3595,6 +3859,9 @@ fn main() -> eframe::Result<()> {
                 graph: Default::default(),
                 archive: Default::default(),
                 mail_messages: Vec::new(),
+                mail_scanned_blocks: 0,
+                mail_from_disk: Vec::new(),
+                mail_store_path: None,
                 mail_open: None,
                 audit: Default::default(),
                 audit_lines: Vec::new(),
@@ -3638,9 +3905,17 @@ fn main() -> eframe::Result<()> {
                 palette_query: String::new(),
                 palette_sel: 0,
                 workspaces_filter: String::new(),
-                bar_state: Default::default(),
+                bar_note: String::new(),
+                web_prefs: voiceterm_egui::web_prefs::load(),
                 graph_source: String::new(),
-            }))
+            };
+            // ONE SCAN AT STARTUP, so the mail views have something the
+            // moment they are opened rather than only after the person
+            // finds the rescan button. Not repeated: a Maildir scan is
+            // thousands of stats, and mail that arrives later is what the
+            // button is for.
+            app.rescan_mail_store();
+            Ok(Box::new(app))
         }),
     )
 }

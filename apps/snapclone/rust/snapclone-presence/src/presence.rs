@@ -5,20 +5,36 @@
 
 use dht_kit::{InfoHash, Value, HASH_LEN};
 
-/// The DHT key a sc-ID publishes presence under: a stable hash of the id string. (On-device
-/// this is the identity public-key hash; here we derive it deterministically from the text so
-/// announcer and resolver agree without shared state.)
+/// The DHT key a sc-ID publishes presence under: **SHA-1 of the id string**.
+///
+/// Not a free choice. OpenDHT's `InfoHash::get` runs `crypto::hash`, which
+/// asks gnutls for a digest sized to the output — and for 20 bytes that is
+/// SHA-1. The Qt build calls `dht_infohash_get_from_string(&key, scId)` and
+/// gets exactly that. Anything else and the two halves of this app publish
+/// to and look up different keys forever, each perfectly self-consistent.
+///
+/// This WAS anything else. It was FNV-1a smeared over 20 bytes, with a
+/// comment explaining that it is deterministic "so announcer and resolver
+/// agree without shared state" — true, and the wrong requirement: the
+/// announcer and resolver that have to agree are on different machines
+/// running different builds. Self-consistency was never the hard part.
+///
+/// SHA-1 is used here as an ADDRESS, not as a security property. Its
+/// collision weakness does not matter for bucket placement, and the
+/// alternative — a stronger hash nobody else computes — is not stronger,
+/// it is unreachable.
 pub fn key_for_scid(sc_id: &str) -> InfoHash {
-    // FNV-1a spread across 20 bytes — deterministic, uniform enough for bucket placement.
-    let mut h = [0u8; HASH_LEN];
-    let mut acc: u64 = 0xcbf29ce484222325;
-    for (i, byte) in sc_id.bytes().enumerate() {
-        acc ^= byte as u64; acc = acc.wrapping_mul(0x100000001b3);
-        h[i % HASH_LEN] ^= (acc >> ((i % 8) * 8)) as u8;
-    }
-    // fold the accumulator through all bytes so short ids still fill the hash
-    for i in 0..HASH_LEN { acc = acc.wrapping_mul(0x100000001b3) ^ (i as u64); h[i] ^= (acc >> 24) as u8; }
-    InfoHash(h)
+    use sha1::{Digest, Sha1};
+    let mut h = Sha1::new();
+    h.update(sc_id.as_bytes());
+    let out = h.finalize();
+    let mut key = [0u8; HASH_LEN];
+    // SHA-1 is 20 bytes and HASH_LEN is 20, so this is a copy. Written as a
+    // bounded copy rather than a `try_into` so a future HASH_LEN change is a
+    // shorter key rather than a panic in the middle of a lookup.
+    let n = HASH_LEN.min(out.len());
+    key[..n].copy_from_slice(&out[..n]);
+    InfoHash(key)
 }
 
 /// A presence record: reflexive address + display name + punch port, serialized compactly into
@@ -56,6 +72,35 @@ impl Presence {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_key_is_the_one_opendht_computes() {
+        // The number that has to match a Qt peer, a Jami bootstrap server
+        // and anything else speaking this protocol. SHA-1("sc-abc12345"),
+        // because `InfoHash::get` asks gnutls for a 20-byte digest and
+        // gnutls answers SHA-1 for that length.
+        //
+        // Pinned as a literal rather than recomputed with the same code
+        // that produced it: a test that calls Sha1 to check Sha1 passes
+        // whatever the function does. The literal came from an INDEPENDENT
+        // implementation — `python3 -c "hashlib.sha1(b\'sc-abc12345\')"` —
+        // which is the only way it is worth anything.
+        let k = super::key_for_scid("sc-abc12345");
+        let hex: String = k.0.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "a41248613c0d47531a9c4c2314fdbc60b2ad0bc2");
+    }
+
+    #[test]
+    fn sha1_itself_matches_the_published_vector() {
+        // FIPS 180-1: SHA-1("abc"). If the digest is wrong, the key test
+        // above is only self-consistent — which is precisely the failure
+        // that made the old FNV key look fine.
+        use sha1::{Digest, Sha1};
+        let mut h = Sha1::new();
+        h.update(b"abc");
+        let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "a9993e364706816aba3e25717850c26c9cd0d89d");
+    }
+
     use super::*;
     #[test]
     fn key_is_stable_and_id_specific() {

@@ -7,12 +7,180 @@
 //! Run:  cargo run --bin snapclone-egui --features app   (from apps/snapclone/egui-frontend)
 
 use eframe::egui;
+use snapclone_egui::audio;
+use snapclone_egui::capture;
 use snapclone_egui::host::{HostCommand, HostEvent};
 use snapclone_egui::Snapclone;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use uikit_egui::Adaptive;
+
+/// The capture engine's host-side half: the thread that runs `capture::run`,
+/// and the two handles that implement the stop contract (flag + kill).
+///
+/// Start/stop is driven from `update` by `frame_pump::should_stream` — the
+/// pipeline runs while the camera page is visible in a focused window and
+/// stops when it is not, because a phone streaming its camera into a page
+/// nobody is looking at is warm for nothing. gst-launch restarts in well
+/// under a page-swipe, so the restart cost is the cheap side of that trade.
+struct CaptureRig {
+    shared: Arc<capture::Shared>,
+    stop: Arc<AtomicBool>,
+    kill: capture::KillSwitch,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CaptureRig {
+    fn idle() -> CaptureRig {
+        CaptureRig { shared: capture::Shared::new(), stop: Arc::new(AtomicBool::new(false)),
+                     kill: capture::KillSwitch::new(), thread: None }
+    }
+
+    fn running(&self) -> bool {
+        self.thread.as_ref().is_some_and(|t| !t.is_finished())
+    }
+
+    fn start(&mut self, plan: Vec<capture::SourceCandidate>, w: u32, h: u32) {
+        self.stop_now();
+        self.stop = Arc::new(AtomicBool::new(false));
+        self.shared = capture::Shared::new();
+        self.kill = capture::KillSwitch::new();
+        let (shared, stop, kill) = (self.shared.clone(), self.stop.clone(), self.kill.clone());
+        self.thread = Some(std::thread::spawn(move || {
+            let opener = capture::gst_opener(w, h, kill);
+            capture::run(&plan, w, h, opener, &shared, &stop,
+                         std::time::Duration::from_millis(500));
+        }));
+    }
+
+    /// Both halves of the stop contract, then reap the thread. The join is
+    /// bounded because the kill turns any blocked read into an EOF.
+    fn stop_now(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.kill.stop();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The voice call's host half: a UDP socket, a mic thread, and a speaker.
+///
+/// Assembled and torn down with the CALL, not with the process. A mic
+/// process running while nobody is in a call is a recording light on some
+/// hardware and a wakeup on all of it, and "we hold the mic open the whole
+/// time but promise not to listen" is not a property a user can check.
+struct VoiceRig {
+    sock: Option<snapclone_egui::voice_wire::VoiceSocket>,
+    peers: snapclone_egui::voice_wire::Peers,
+    mic: Arc<audio::MicShared>,
+    mic_stop: Arc<AtomicBool>,
+    mic_child: Option<audio::Child>,
+    mic_thread: Option<std::thread::JoinHandle<()>>,
+    speaker: Option<audio::Speaker>,
+    speaker_child: Option<audio::Child>,
+    /// Wall-clock of the last `SinkDepth`, so the tick runs at the cushion's
+    /// rate rather than the frame rate — a 120 Hz display must not ask the
+    /// play-out layer for audio twice per frame.
+    last_sink_tick: std::time::Instant,
+    /// Said once per call, not per frame.
+    warned_no_audio: bool,
+}
+
+impl VoiceRig {
+    fn idle() -> VoiceRig {
+        VoiceRig {
+            sock: None, peers: snapclone_egui::voice_wire::Peers::new(),
+            mic: audio::MicShared::new(), mic_stop: Arc::new(AtomicBool::new(false)),
+            mic_child: None, mic_thread: None, speaker: None, speaker_child: None,
+            last_sink_tick: std::time::Instant::now(), warned_no_audio: false,
+        }
+    }
+
+    fn live(&self) -> bool { self.sock.is_some() }
+
+    /// Bring up the socket and both devices. A missing audio tool is NOT
+    /// fatal to the call: the socket still carries the other direction, and
+    /// a call where you can hear but not speak beats no call plus a
+    /// traceback.
+    fn start(&mut self, port: u16, frame_ms: u32, record_cmd: &str, play_cmd: &str)
+             -> Vec<String> {
+        let mut notes = Vec::new();
+        match snapclone_egui::voice_wire::VoiceSocket::bind(port) {
+            Ok(s) => self.sock = Some(s),
+            Err(e) => {
+                notes.push(format!("no voice socket on UDP {port}: {e}"));
+                return notes;
+            }
+        }
+        self.mic_stop = Arc::new(AtomicBool::new(false));
+        self.mic = audio::MicShared::new();
+        match audio::spawn(record_cmd, audio::Direction::Record) {
+            Ok((pipe, child)) => {
+                self.mic_child = Some(child);
+                let (shared, stop) = (self.mic.clone(), self.mic_stop.clone());
+                self.mic_thread = Some(std::thread::spawn(move || {
+                    audio::run_mic(pipe, frame_ms, &shared, &stop);
+                }));
+            }
+            Err(e) => notes.push(format!("no microphone: {e}")),
+        }
+        match audio::spawn(play_cmd, audio::Direction::Play) {
+            Ok((pipe, child)) => {
+                self.speaker_child = Some(child);
+                self.speaker = Some(audio::Speaker::new(pipe, frame_ms));
+            }
+            Err(e) => notes.push(format!("no speaker: {e}")),
+        }
+        notes
+    }
+
+    /// Both halves of the stop contract for each child, then reap.
+    fn stop(&mut self) {
+        self.mic_stop.store(true, Ordering::Relaxed);
+        if let Some(c) = self.mic_child.take() { c.stop(); c.reap(); }
+        if let Some(t) = self.mic_thread.take() { let _ = t.join(); }
+        // The speaker holds the child's stdin; dropping it is what lets a
+        // well-behaved tool finish and exit rather than being killed
+        // mid-buffer.
+        self.speaker = None;
+        if let Some(c) = self.speaker_child.take() { c.stop(); c.reap(); }
+        self.sock = None;
+        self.peers = snapclone_egui::voice_wire::Peers::new();
+        self.warned_no_audio = false;
+    }
+}
 
 struct App {
     snap: Snapclone,
+    /// The accelerometer, once. `None` on a machine without one, and that
+    /// case must cost nothing per frame.
+    accel: Option<snapclone_egui::glove_input::SysfsAccel>,
+    /// Whether the probe has run. Separate from `accel.is_some()` so a
+    /// machine with no sensor is not re-probed every frame — a directory
+    /// scan of /sys at frame rate is the exact cost the discovery-once
+    /// rule exists to avoid.
+    glove_probed: bool,
+    /// Accepts inbound snaps for the life of the process, unlike the camera
+    /// and voice rigs which come up with a page or a call. A snap arriving
+    /// while you are on the Friends page is the ordinary case, and a
+    /// listener that only ran on the Inbox page would drop it.
+    snaps_in: Option<snapclone_egui::snap_transport::Listener>,
+    voice: VoiceRig,
+    /// The bytes of the last shutter press, kept so Send has something to
+    /// send. Held by the HOST and not by the app: the controller has no
+    /// business carrying a photo in memory purely to hand it back.
+    last_snap: Option<Vec<u8>>,
+    /// Sends running on worker threads. A dial can take the full timeout
+    /// and must never run on the frame loop.
+    sending: Vec<std::thread::JoinHandle<()>>,
+    /// Results from those threads.
+    send_results: Arc<Mutex<Vec<(String, Result<(), String>)>>>,
+    rig: CaptureRig,
+    /// The plan is printed once per start, not per frame: the pipeline
+    /// strings are the debuggable artifact, and a log that repeats them at
+    /// 30 Hz buries the stderr lines gst-launch itself contributes.
+    plan_logged: bool,
     /// Last reported focus, so the change is sent once rather than every frame.
     focused: bool,
     /// The discovery socket, or None when the port was unavailable. Absent
@@ -63,6 +231,14 @@ impl App {
         let cmds = snap.apply(HostEvent::ContactsLoaded(Box::new(book)));
         Self::report(cmds);
 
+        // BEFORE anything can populate the feed. A snap filtered after it
+        // has been shown has already been shown, and this store exists
+        // because a viewed snap coming back is the promise failing in the
+        // direction the sender cares about.
+        let st = snapclone_egui::snap_state::load();
+        let cmds = snap.apply(HostEvent::SnapStateLoaded(Box::new(st)));
+        Self::report(cmds);
+
         // Settings off disk, through the seam rather than by assignment: the
         // event sets `current` AND the saved baseline, so a freshly loaded
         // config does not come up reporting unsaved changes with the Save
@@ -95,8 +271,27 @@ impl App {
                            peers on this network will not be found");
             }
         }
-        Self { snap, focused: true, gossip, last_announce: 0, warned_unsigned: false,
-               identity: keys }
+        // The snap listener, on the configured listen port — the same one
+        // announced in gossip, so a peer that heard us knows where to dial.
+        let listen = snap.settings.current.network.listen_port;
+        let snaps_in = match snapclone_egui::snap_transport::Listener::start(listen) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                // Not fatal, and worth its own line: outbound snaps still
+                // work, so the symptom is one-directional and would
+                // otherwise look like the other person ignoring you.
+                eprintln!("snapclone: not accepting snaps — could not listen on TCP \
+                           {listen}: {e}");
+                None
+            }
+        };
+
+        Self { snap, snaps_in, accel: None, glove_probed: false,
+               last_snap: None, sending: Vec::new(),
+               send_results: Arc::new(Mutex::new(Vec::new())),
+               voice: VoiceRig::idle(), rig: CaptureRig::idle(),
+               plan_logged: false, focused: true,
+               gossip, last_announce: 0, warned_unsigned: false, identity: keys }
     }
 
     /// Drain the discovery socket into the app, and announce ourselves on the
@@ -107,6 +302,32 @@ impl App {
     /// cannot run past the frame that called it — and the whole path stays in
     /// one place you can step through, which a channel out of a background
     /// thread would not be.
+    /// Read the accelerometer and let glove mode act on it.
+    ///
+    /// The whole of cold-weather glove mode was already here — the cursor,
+    /// the shake bindings, `apply_glove` and `apply_shake` — and every
+    /// piece of it sat unreached because nothing in this app read a
+    /// sensor. The accessibility mode existed and could not be turned on
+    /// by moving the phone.
+    ///
+    /// Discovered ONCE, on the first frame. Walking /sys/bus/iio on every
+    /// poll is a directory scan twenty times a second for a device that
+    /// does not move between sockets — and a machine with no accelerometer
+    /// must pay nothing at all, which is what the `None` case buys.
+    fn pump_glove(&mut self, ctx: &egui::Context) {
+        if !self.glove_probed {
+            self.glove_probed = true;
+            self.accel = snapclone_egui::glove_input::SysfsAccel::discover();
+            self.snap.glove_input.enable_if_present(self.accel.is_some());
+        }
+        let Some(accel) = self.accel.as_mut() else { return };
+        let dt_ms = ctx.input(|i| i.stable_dt).min(0.25) * 1000.0;
+        if self.snap.poll_glove(dt_ms, accel).is_some() {
+            // A flick moved something, so the next frame has to draw it.
+            ctx.request_repaint();
+        }
+    }
+
     fn pump_gossip(&mut self, now_secs: i64) {
         let Some(sock) = self.gossip.as_mut() else { return };
 
@@ -129,7 +350,35 @@ impl App {
                         datagram_len: len,
                         public: a.public,
                     });
+                    let admitted = cmds.iter()
+                        .any(|c| matches!(c, HostCommand::GossipAdmitted(true)));
                     self.handle(cmds);
+                    // THE PUNCH ADDRESS, which nothing was learning. `punch`,
+                    // `heard` and every dial path hang off `note_peer_addr`
+                    // and no caller existed, so `PunchAddrs` was empty for
+                    // the whole life of the port — no hole punch had an
+                    // address to punch to, and voice had nowhere to send.
+                    //
+                    // Only for an ADMITTED record: `gossip::accept` is the
+                    // signature check, and learning an address from a
+                    // refused datagram would let anyone on the subnet
+                    // redirect a peer's traffic by announcing as them.
+                    if admitted {
+                        if let std::net::IpAddr::V4(v4) = from.ip() {
+                            // The port the sender NAMED, not the source port
+                            // its gossip came from: gossip is multicast from
+                            // an ephemeral port and the listen port is where
+                            // it wants to be reached. Falling back to the
+                            // source port would send voice to a socket
+                            // nobody is reading.
+                            let port = if a.port != 0 { a.port } else { from.port() };
+                            let cmds = self.snap.apply(HostEvent::PeerAddr {
+                                id: a.id.clone(), ip: v4.octets(), port,
+                                now_ms: now_secs.max(0) as u64 * 1000,
+                            });
+                            self.handle(cmds);
+                        }
+                    }
                 }
                 Err(e) => eprintln!("snapclone: unreadable gossip from {from}: {e:?}"),
             }
@@ -145,6 +394,13 @@ impl App {
         let Some(keys) = self.identity.clone() else { return };
         if !due { return; }
         self.last_announce = now_secs;
+        // Stale addresses go on the same tick. `purge_stale` existed with no
+        // caller, so an address learned once was authoritative forever —
+        // including for voice admission, where a peer who moved networks
+        // would keep an ex-neighbour's address authorised.
+        let cmds = self.snap.apply(HostEvent::ExpirePunchAddrs {
+            now_ms: now_secs.max(0) as u64 * 1000 });
+        self.handle(cmds);
         let a = snapclone_egui::gossip_wire::Announce {
             id: self.snap.local_id.clone(),
             // The address a peer should dial us back on. Left empty rather than
@@ -171,21 +427,432 @@ impl App {
         }
     }
 
-    /// What the app asked the world to do.
+    /// Start, stop and drain the capture engine, from the frame loop.
     ///
-    /// Deliberately a debug sink and labelled as one. Capture, export and
-    /// retry all need a camera pipeline, an archiver and a socket that this
-    /// binary does not have yet; printing is not a stand-in for them, it is a
-    /// way to SEE that the request reached the boundary — which is exactly
-    /// what could not be observed while nothing drained these at all.
+    /// On the frame loop for the same reason `pump_gossip` is: the drain is
+    /// latest-wins and non-blocking, so an idle camera costs three mutex
+    /// peeks, and the whole path is steppable in one place. Only the
+    /// blocking pipe read lives on the rig's thread, because it has to.
+    fn pump_capture(&mut self) {
+        // "Camera" by name rather than index 0, so a nav reorder cannot
+        // silently leave the pipeline gated on the wrong page.
+        let camera_page = snapclone_egui::PAGES
+            .iter().position(|n| *n == "Camera").unwrap_or(0);
+        let visible = self.snap.nav.page() == camera_page;
+        // `screen_on` is not knowable from eframe; `true` defers to focus,
+        // which a locked phone drops anyway.
+        let want = snapclone_egui::frame_pump::should_stream(visible, self.focused, true)
+            && self.snap.camera.is_some();
+
+        if want && !self.rig.running() {
+            let choice = self.snap.camera.clone().expect("gated on is_some above");
+            // No PipeWire probe yet: pw_nodes empty means a phone's libcamera
+            // nodes only enter the plan via the settings override (a node
+            // name in camera.device). The v4l2 half probes for real when the
+            // tool exists; absent tool contributes nothing, not an error.
+            let v4l2 = std::process::Command::new("v4l2-ctl").arg("--list-devices")
+                .output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
+            let plan = snapclone_egui::camera_source::pipelines_for(&choice, &[], &v4l2);
+            if !self.plan_logged {
+                self.plan_logged = true;
+                for c in &plan {
+                    eprintln!("snapclone: capture candidate [{}]: {}", c.label, c.pipeline);
+                }
+            }
+            let (w, h) = (choice.format.width, choice.format.height);
+            self.rig.start(plan, w, h);
+        } else if !want && self.rig.running() {
+            self.rig.stop_now();
+            let cmds = self.snap.apply(HostEvent::CaptureStatus(capture::Status::Idle));
+            self.handle(cmds);
+        }
+
+        // Drain, newest only. `CameraWorked` before the frame so the health
+        // record exists by the time anything reads it this tick.
+        if self.rig.shared.take_worked() {
+            if let Some(cam) = self.snap.camera.as_ref() {
+                let id = cam.device.id.clone();
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64).unwrap_or(0);
+                let cmds = self.snap.apply(HostEvent::CameraWorked { id, now_ms });
+                self.handle(cmds);
+            }
+        }
+        if let Some(st) = self.rig.shared.take_status() {
+            let cmds = self.snap.apply(HostEvent::CaptureStatus(st));
+            self.handle(cmds);
+        }
+        if let Some(f) = self.rig.shared.take_frame() {
+            let cmds = self.snap.apply(HostEvent::CameraFrame(f));
+            self.handle(cmds);
+        }
+    }
+
+    /// Bring the voice path up and down with the call, and pump it.
+    fn pump_voice(&mut self) {
+        let joined = self.snap.group_voice.joined;
+        let frame_ms = self.snap.sink_latency.frame_ms;
+        if joined && !self.voice.live() {
+            let port = self.snap.settings.current.network.listen_port;
+            for n in self.voice.start(port, frame_ms,
+                                      &audio::default_record_cmd(),
+                                      &audio::default_play_cmd()) {
+                eprintln!("snapclone: {n}");
+            }
+            if self.voice.live() {
+                let cmds = self.snap.apply(HostEvent::VoiceLink(true));
+                self.handle(cmds);
+                // RAW S16LE, NOT OPUS. There is no encoder linked here, and
+                // the honest way to say that is to send the samples as they
+                // are rather than to claim a codec. It costs ~32 kB/s per
+                // peer against Opus's ~2, which is fine on a LAN and is not
+                // fine on mobile data — swapping in a real encoder is a
+                // change to these two conversions and nothing else, which
+                // is why they are the only place bytes and samples meet.
+                let cmds = self.snap.apply(HostEvent::EncoderReady(true));
+                self.handle(cmds);
+            }
+        } else if !joined && self.voice.live() {
+            self.voice.stop();
+            let cmds = self.snap.apply(HostEvent::VoiceLink(false));
+            self.handle(cmds);
+        }
+        if !self.voice.live() { return; }
+
+        // WHO IS IN THE CALL, and where. Rebuilt each frame from the app's
+        // own participant list crossed with the punch addresses gossip
+        // learned — replaced wholesale rather than patched, so someone who
+        // left cannot linger as an authorised sender.
+        let entries: Vec<(String, snapclone_egui::punch_addrs::PeerAddr)> =
+            self.snap.group_voice.participants.iter()
+                .filter(|p| !p.is_self)
+                .filter_map(|p| self.snap.punch.get(&p.id).map(|a| (p.id.clone(), a)))
+                .collect();
+        self.voice.peers.set(entries);
+
+        // MIC → the app's transmit gate → the wire. `voice_frame` is what
+        // decides whether anything may leave; a rig that sent every mic
+        // frame would transmit for the length of the call.
+        for frame in self.voice.mic.take(4) {
+            // The LEVEL first: the meter must move even while the gate is
+            // closed, or a muted mic and a broken one look identical.
+            // RMS, not peak — peak jumps to full scale on one click and
+            // sits there, which makes a meter that is always full.
+            let rms = if frame.is_empty() {
+                0.0
+            } else {
+                (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt()
+            };
+            let cmds = self.snap.apply(HostEvent::MicActivity(rms));
+            self.handle(cmds);
+
+            // The verdict, paired with the frame it is about. Applying
+            // `MicFrame` for a batch and then sending "some" frame would
+            // desynchronise the sequence numbers from the audio.
+            let cmds = self.snap.apply(HostEvent::MicFrame);
+            let may_send = cmds.iter().any(|c| matches!(
+                c, HostCommand::VoiceEmit(snapclone_egui::voice_send::Emit::Send { .. })));
+            self.handle(cmds);
+            if may_send {
+                let payload = snapclone_egui::audio::f32_to_pcm(&frame);
+                let cmds = self.snap.apply(HostEvent::VoiceOutbound(
+                    snapclone_egui::voice_bridge::Packet::VoiceFrame(payload)));
+                self.handle(cmds);
+            }
+        }
+        if let Some(why) = self.voice.mic.take_error() {
+            eprintln!("snapclone: microphone stopped: {why}");
+        }
+
+        // WIRE → the app. The sender's identity is the source address, which
+        // is the transport's job to establish — see voice_wire's header on
+        // why that is both required and currently weak.
+        let (inbound, refused) = {
+            let peers = &self.voice.peers;
+            match self.voice.sock.as_mut() {
+                Some(s) => s.poll(peers, 16),
+                None => (Vec::new(), Vec::new()),
+            }
+        };
+        for (sender, payload) in inbound {
+            let cmds = self.snap.apply(HostEvent::VoiceReceived { sender, payload });
+            self.handle(cmds);
+        }
+        if !refused.is_empty() && !self.voice.warned_no_audio {
+            self.voice.warned_no_audio = true;
+            eprintln!("snapclone: voice datagrams refused — sender not a known call \
+                       peer, or its punch address expired ({} so far)",
+                      self.voice.sock.as_ref().map(|s| s.refused_unknown).unwrap_or(0));
+        }
+
+        // THE PLAY-OUT TICK, at the cushion's rate rather than the frame
+        // rate: a 120 Hz display must not ask the play-out layer for audio
+        // twice per frame.
+        let due = self.voice.last_sink_tick.elapsed()
+            >= std::time::Duration::from_millis(u64::from(self.snap.sink_tick_ms()));
+        if due {
+            self.voice.last_sink_tick = std::time::Instant::now();
+            let depth = self.voice.speaker.as_ref().map(|s| s.depth()).unwrap_or(0);
+            let cmds = self.snap.apply(HostEvent::SinkDepth(depth));
+            self.handle(cmds);
+        }
+    }
+
+    /// Deliver whatever the snap listener accepted.
+    ///
+    /// Attribution happens HERE rather than on the listener thread, because
+    /// it needs the peer list and that thread must not borrow the app.
+    fn pump_snaps(&mut self) {
+        let Some(l) = self.snaps_in.as_ref() else { return };
+        let arrivals = l.inbox.drain();
+        if let Some(e) = l.inbox.take_error() {
+            eprintln!("snapclone: snap listener: {e}");
+        }
+        if arrivals.is_empty() {
+            return;
+        }
+        // Known addresses, from the same punch table gossip fills.
+        let known: Vec<(String, snapclone_egui::punch_addrs::PeerAddr)> =
+            self.snap.contact_book.iter()
+                .filter_map(|c| self.snap.punch.get(&c.sc_id).map(|a| (c.sc_id.clone(), a)))
+                .collect();
+
+        let mut senders: Vec<String> = Vec::new();
+        for a in arrivals {
+            use snapclone_egui::snap_transport::Sender;
+            match snapclone_egui::snap_transport::resolve_sender(a.from, &known) {
+                Sender::Known(id) => {
+                    if !senders.contains(&id) { senders.push(id.clone()); }
+                    let cmds = self.snap.apply(HostEvent::SnapArrived {
+                        from: id, frame: Box::new(a.frame) });
+                    self.handle(cmds);
+                }
+                // Refused, not guessed — see snap_transport's header. Said
+                // out loud because from the sender's side this looks like
+                // delivery, and the two people involved need some way to
+                // find out it did not happen.
+                Sender::Ambiguous(ids) => eprintln!(
+                    "snapclone: a snap from {} could be any of {ids:?} — refused, because \
+                     an inbound TCP port cannot tell them apart", a.from),
+                Sender::Unknown => eprintln!(
+                    "snapclone: a snap from {} was refused — not a known contact, or their \
+                     address has expired", a.from),
+            }
+        }
+        if !senders.is_empty() {
+            // The notification decision is the app's: it knows whether the
+            // window is focused and whether it has already said something.
+            let cmds = self.snap.apply(HostEvent::SnapsArrived {
+                from: senders, focused: self.focused });
+            self.handle(cmds);
+        }
+    }
+
+    /// Collect what the send threads finished with.
+    ///
+    /// The row the sender watches must be able to reach BOTH terminal
+    /// states. Before this only delivery existed as an outcome, so a send
+    /// that broke looked identical to one still in flight and simply aged
+    /// out — which reads as a timeout whatever actually happened.
+    fn pump_sends(&mut self) {
+        self.sending.retain(|t| !t.is_finished());
+        let done = self.send_results.lock().map(|mut r| std::mem::take(&mut *r))
+            .unwrap_or_default();
+        if done.is_empty() { return; }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64).unwrap_or(0);
+        for (who, out) in done {
+            match out {
+                Ok(()) => {
+                    // Handed to the socket, which is not the same as seen —
+                    // there is no receipt on the wire yet. Marked delivered
+                    // because "left this device" is the strongest claim this
+                    // build can make, and saying nothing would leave the row
+                    // pending forever.
+                    let cmds = self.snap.apply(HostEvent::SnapDelivered {
+                        id: who.clone(), now_ms });
+                    self.handle(cmds);
+                }
+                Err(e) => {
+                    eprintln!("snapclone: snap to {who} failed: {e}");
+                    let cmds = self.snap.apply(HostEvent::SnapSendFailed {
+                        id: who.clone(), now_ms });
+                    self.handle(cmds);
+                }
+            }
+        }
+    }
+
+    /// Carry out what the app asked the world to do.
+    ///
+    /// **This doc used to say the opposite**, and had for some time: that
+    /// the handler was "deliberately a debug sink", that capture and
+    /// sending needed a pipeline and a socket "this binary does not have
+    /// yet", and that printing was a way to see requests reach the
+    /// boundary. All of that was true when it was written and none of it
+    /// is now — the shutter writes a file, contacts reach the disk, snaps
+    /// go out over TCP, voice frames reach a socket.
+    ///
+    /// A stale doc is worse than a missing one: a reader looking for why
+    /// their snap did not save would have found a paragraph telling them
+    /// it never could. Corrected here rather than deleted, because the
+    /// fact that it drifted is worth knowing — it drifted one arm at a
+    /// time, each commit truthfully describing what it added and none of
+    /// them looking up.
+    ///
+    /// What is still only reported: `IdentityUnavailable`, which has
+    /// nowhere to go but a log until there is a UI for it, and
+    /// `MarkViewed`/`MarkExpired`, which the store handles and this does
+    /// not need to echo.
+    ///
+    /// Events a handler wants to send back are COLLECTED, not applied
+    /// inline: `apply` drains, and calling it from inside a drain would
+    /// run the drain again half way through the loop.
     fn handle(&mut self, cmds: Vec<HostCommand>) {
+        let mut pending: Vec<HostEvent> = Vec::new();
         for c in cmds {
             match c {
-                // REAL, not a debug sink. This is the whole point of the
-                // exercise: a contact scanned or renamed now reaches the disk,
-                // so it is still there next launch. A write failure is
-                // reported rather than swallowed — a silent one means the user
-                // adds someone twice and never learns why.
+                // THE SHUTTER PRODUCES A FILE. Not the composer flow yet —
+                // that is its own thread of work — but a press that lands a
+                // viewable image on disk is the difference between a camera
+                // and a viewfinder. PPM because it is 12 bytes of header over
+                // the RGBA we already hold: no encoder dependency, and every
+                // image tool opens it. The path is printed so the photo is
+                // findable the moment it exists.
+                HostCommand::CaptureSnap => {
+                    let outcome = match self.rig.shared.peek_frame() {
+                        Some(f) if f.pixels_plausible() => {
+                            // Kept for Send, in the same format written to
+                            // disk, so what a peer receives is byte for byte
+                            // what the local file holds. A second encoding
+                            // path is a second thing that can differ subtly
+                            // from the photo you looked at.
+                            self.last_snap = Some(snapclone_egui::frame_pump::ppm_bytes(&f));
+                            save_ppm(&f)
+                        }
+                        Some(_) => Err("the frame arrived torn".to_string()),
+                        None => Err("no live frame".to_string()),
+                    };
+                    match &outcome {
+                        Ok(path) => eprintln!("snapclone: snap saved: {path}"),
+                        Err(e) => eprintln!("snapclone: snap NOT saved: {e}"),
+                    }
+                    // Back through the seam, not just to stderr: the person
+                    // who pressed the shutter is looking at the camera page.
+                    // Queued rather than applied inline — `handle` is called
+                    // FROM a drain, and re-entering `apply` here would drain
+                    // a second time mid-iteration.
+                    pending.push(HostEvent::SnapSaved(outcome));
+                }
+                // VOICE OUT. `voice_send` already envelopes one payload per
+                // peer; this is the socket that was missing under it.
+                HostCommand::SendVoice(per_peer) => {
+                    if let Some(s) = self.voice.sock.as_ref() {
+                        let unreachable = s.send_all(&self.voice.peers, &per_peer);
+                        for id in unreachable {
+                            // Worth a line each: a participant with no
+                            // current address hears everyone and is heard by
+                            // nobody, which presents as THEIR microphone
+                            // being broken.
+                            eprintln!("snapclone: {id} has no reachable address — \
+                                       they will not hear this call");
+                        }
+                    }
+                }
+                // AUDIO OUT. A write failure ends the device, not the call:
+                // the socket half still works and the other person can still
+                // be heard by everyone else.
+                // The other half of the codec seam. Raw S16LE in, samples
+                // out — matching what this host sends. A payload whose
+                // length is not a whole number of samples is refused rather
+                // than played as a half-sample of noise.
+                HostCommand::DecodeAudio(bytes) => {
+                    if bytes.len() % 2 == 0 && !bytes.is_empty() {
+                        pending.push(HostEvent::DecodedAudio(
+                            snapclone_egui::audio::pcm_to_f32(&bytes)));
+                    }
+                }
+                HostCommand::PlayAudio(frames) => {
+                    let failed = match self.voice.speaker.as_mut() {
+                        Some(sp) => sp.play(&frames).err(),
+                        None => None,
+                    };
+                    if let Some(e) = failed {
+                        eprintln!("snapclone: speaker stopped: {e}");
+                        self.voice.speaker = None;
+                        if let Some(c) = self.voice.speaker_child.take() { c.stop(); c.reap(); }
+                    }
+                }
+                // The transmit gate's verdict for this mic interval. Gated
+                // is the normal case and says nothing; the other two are
+                // states a silent call needs explained.
+                HostCommand::VoiceEmit(emit) => {
+                    if matches!(emit, snapclone_egui::voice_send::Emit::NoEncoder) {
+                        eprintln!("snapclone: transmitting with no encoder — \
+                                   nothing will leave this device");
+                    }
+                }
+                // THE SEND. Off the frame loop, one thread per recipient: a
+                // dial to a phone that is asleep costs the whole timeout,
+                // and doing that inline would freeze the UI for twenty
+                // seconds per person.
+                HostCommand::SendSnap { to } => {
+                    let Some(bytes) = self.last_snap.clone() else {
+                        eprintln!("snapclone: nothing to send — take a photo first");
+                        continue;
+                    };
+                    let me = self.snap.local_id.clone();
+                    let name = self.snap.settings.current.general.display_name.clone();
+                    let now_s = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64).unwrap_or(0);
+                    for who in to {
+                        // AN ADDRESS KNOWN WRONG IS NOT TRIED. Five
+                        // failures or an hour stale and the cached one is
+                        // skipped, so the person waits for a refusal
+                        // instead of a timeout — and the peer falls to
+                        // whatever finds it next, gossip or the DHT.
+                        if !self.snap.addr_health.usable(&who, now_s * 1000) {
+                            if let Ok(mut r) = self.send_results.lock() {
+                                r.push((who.clone(),
+                                        Err("last known address keeps failing".into())));
+                            }
+                            continue;
+                        }
+                        let Some(addr) = self.snap.punch.get(&who) else {
+                            if let Ok(mut r) = self.send_results.lock() {
+                                r.push((who.clone(), Err("no known address".into())));
+                            }
+                            continue;
+                        };
+                        // REAL sequence and ack, from this peer's session.
+                        // Both were hardcoded to 0 here while `next_seq`
+                        // and `take_ack` sat tested and uncalled — the
+                        // fields were on the wire carrying nothing.
+                        let (seq, ack) = self.snap.frame_ids(&who);
+                        let frame = snapclone_egui::snap_wire::SnapFrame::announce(
+                            seq, ack, &me, &name, snapclone_egui::snaps::Media::Image,
+                            now_s, 0, bytes.clone());
+                        let results = self.send_results.clone();
+                        self.sending.push(std::thread::spawn(move || {
+                            let out = snapclone_egui::snap_transport::send_snap(addr, &frame);
+                            if let Ok(mut r) = results.lock() { r.push((who, out)); }
+                        }));
+                    }
+                }
+                // REAL, not a debug sink: a contact scanned or renamed
+                // reaches the disk, so it is still there next launch. A
+                // write failure is REPORTED rather than swallowed — a
+                // silent one means the person adds someone twice and never
+                // learns why.
+                //
+                // (This paragraph had drifted onto the CaptureSnap arm,
+                // describing a handler thirty lines away. Moving code
+                // leaves its explanation behind unless somebody checks,
+                // which is the second time this session.)
                 HostCommand::SaveContacts(book) => {
                     if let Err(e) = snapclone_egui::contact_book::store(&book) {
                         eprintln!("snapclone: could not save contacts: {e}");
@@ -230,10 +897,35 @@ impl App {
                 // makes the gap sharper rather than softer: viewed state is
                 // still in memory only, so a snap is viewed until restart and
                 // unviewed afterwards.
-                other @ (HostCommand::MarkViewed(_) | HostCommand::MarkExpired(_)) => {
-                    eprintln!("snapclone: {other:?} — no store yet, viewed state is in-memory only");
+                // The store exists now. These two are no longer the
+                // odd ones out: the app records the mark itself and emits
+                // `SaveSnapState`, so all this arm owes is silence — a log
+                // line per viewed snap would be noise about the normal case.
+                //
+                // They stay as distinct commands rather than being folded
+                // into the save, because a future host has different work
+                // for each: a read receipt to send for Viewed, a file to
+                // delete for Expired.
+                HostCommand::MarkViewed(_) | HostCommand::MarkExpired(_) => {}
+                HostCommand::SaveSnapState(st) => {
+                    if let Err(e) = snapclone_egui::snap_state::store(&st) {
+                        // Loud, because the failure mode is a snap coming
+                        // back after a restart and nobody knowing why.
+                        eprintln!("snapclone: could not save snap state: {e} — \
+                                   viewed snaps may reappear after a restart");
+                    }
                 }
                 other => eprintln!("snapclone: unhandled host command: {other:?}"),
+            }
+        }
+        // Feed back what the handlers produced. Bounded by construction —
+        // nothing in this list produces a command that produces another
+        // event — but recursion through `handle` would not be, so the reply
+        // goes through `apply` and its commands are reported, not re-run.
+        for ev in pending {
+            let cmds = self.snap.apply(ev);
+            for c in cmds {
+                eprintln!("snapclone: after a reply event: {c:?}");
             }
         }
     }
@@ -247,6 +939,20 @@ impl App {
             eprintln!("snapclone: startup: {c:?}");
         }
     }
+}
+
+/// Write one frame as binary PPM under the app's data dir, named by wall
+/// clock so a burst of presses cannot overwrite each other within a second
+/// (the millisecond field sees to that).
+fn save_ppm(f: &snapclone_egui::frame_pump::RawFrame) -> Result<String, String> {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis()).unwrap_or(0);
+    let dir = config_kit::data_dir("snapclone").join("snaps");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = dir.join(format!("snap-{ms}.ppm"));
+    std::fs::write(&path, snapclone_egui::frame_pump::ppm_bytes(f)).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path.display().to_string())
 }
 
 impl eframe::App for App {
@@ -265,11 +971,19 @@ impl eframe::App for App {
             .unwrap_or(0);
         let cmds = self.snap.apply(HostEvent::Tick { now_secs });
         self.handle(cmds);
+        self.pump_glove(ctx);
         self.pump_gossip(now_secs);
+        self.pump_capture();
+        self.pump_voice();
+        self.pump_snaps();
+        self.pump_sends();
 
-        // Discovery is time-driven, not input-driven, so the frame has to come
-        // round on its own or an idle window never polls the socket.
-        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        // Discovery is time-driven, not input-driven, so the frame has to
+        // come round on its own or an idle window never polls the socket —
+        // and a live viewfinder needs the frame loop at frame rate, or the
+        // preview updates only when the mouse moves.
+        ctx.request_repaint_after(std::time::Duration::from_millis(
+            if self.rig.running() { 33 } else { 500 }));
 
         let focused = ctx.input(|i| i.focused);
         if focused != self.focused {

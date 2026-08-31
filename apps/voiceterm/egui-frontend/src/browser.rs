@@ -29,6 +29,69 @@ pub mod ad_filter;
 
 pub use ad_filter::{FilterMode, FilterStats};
 
+/// Parse page HTML for the shared renderer, with this app's ad filter in
+/// front of it.
+///
+/// `uikit_web` takes the filter as a CALLBACK rather than knowing about ads
+/// itself, and this is the other half of that seam. The policy — which
+/// classes and ids and iframe sources are advertising — is application
+/// knowledge that changes on a different schedule from an HTML parser, and
+/// it already exists here in `ad_filter`, mounted from the same file the Qt
+/// build uses so the two cannot disagree about what an ad is.
+/// Parse for a given URL, honouring the global and per-site settings.
+///
+/// The URL, not just a mode: which rules apply is a property of the site,
+/// and a caller that resolved the mode itself would be a second place the
+/// precedence lives — which is how a per-site override ends up working in
+/// one view and not another.
+pub fn parse_page_for(html: &str, url: &str,
+                      prefs: &crate::web_prefs::WebPrefs) -> uikit_web::RichDoc {
+    let host = crate::web_prefs::host_of(url);
+    let eff = prefs.effective(host.as_deref());
+    // Only `filter` and `max_blocks` apply here. `images` and `islands`
+    // are honoured by the PAGE renderer, which is the thing that draws
+    // them — `RichDoc` has no image or island block at all, and I wrote a
+    // retain over its prose looking for one before checking that. A
+    // setting applied where it cannot do anything is worse than one that
+    // is missing: it reads as implemented.
+    parse_with(html, eff.filter, eff.max_blocks)
+}
+
+/// The settings for a URL, for a caller that renders the PAGE model.
+pub fn page_ui_for<'a>(url: &str, prefs: &crate::web_prefs::WebPrefs)
+    -> uikit_web::doc::PageUi<'a> {
+    let eff = prefs.effective(crate::web_prefs::host_of(url).as_deref());
+    uikit_web::doc::PageUi { images: eff.images, islands: eff.islands,
+                             ..Default::default() }
+}
+
+fn parse_with(html: &str, mode: FilterMode, max_blocks: usize) -> uikit_web::RichDoc {
+    if mode == FilterMode::Off {
+        return uikit_web::parse_html_with(html, &uikit_web::ParseOptions {
+            max_blocks, ..Default::default() });
+    }
+    let skip = move |e: uikit_web::Element<'_>| {
+        ad_filter::should_filter(e.tag, e.id, e.class, e.src, mode)
+    };
+    uikit_web::parse_html_with(html, &uikit_web::ParseOptions {
+        max_blocks, skip_element: Some(&skip), ..Default::default() })
+}
+
+pub fn parse_page(html: &str, mode: FilterMode) -> uikit_web::RichDoc {
+    if mode == FilterMode::Off {
+        // No callback at all rather than one that always returns false:
+        // the parser skips the whole check, and "off" should cost nothing.
+        return uikit_web::parse_html(html);
+    }
+    let skip = move |e: uikit_web::Element<'_>| {
+        ad_filter::should_filter(e.tag, e.id, e.class, e.src, mode)
+    };
+    uikit_web::parse_html_with(html, &uikit_web::ParseOptions {
+        skip_element: Some(&skip),
+        ..Default::default()
+    })
+}
+
 /// What kind of thing was found. Mirrors `web_interact::WebWidget` without
 /// mounting it: that module pulls in `ureq` for form submission, and a view
 /// does not make network calls.
@@ -185,6 +248,45 @@ impl Browser {
         self.scanned = true;
         self.title = title.to_string();
         self.actions = actions;
+    }
+}
+
+#[cfg(test)]
+mod parse_page_tests {
+    use super::*;
+
+    const PAGE: &str = "<p>the article</p>\
+        <div class=\"ad-banner\"><p>SPONSORED</p></div>\
+        <iframe src=\"https://doubleclick.net/x\"></iframe>\
+        <p>the rest</p>";
+
+    #[test]
+    fn the_apps_ad_filter_reaches_the_shared_parser() {
+        // The seam's whole point: uikit_web knows nothing about ads, and
+        // this app's list — the same file the Qt build uses — decides.
+        let d = parse_page(PAGE, FilterMode::Standard);
+        let t = d.text();
+        assert!(t.contains("the article") && t.contains("the rest"), "{t:?}");
+        assert!(!t.contains("SPONSORED"), "the ad's text survived: {t:?}");
+        assert!(d.filtered >= 1, "nothing was reported as filtered");
+    }
+
+    #[test]
+    fn off_means_off_and_costs_nothing() {
+        // No callback at all rather than one that always says false, so the
+        // parser skips the check entirely.
+        let d = parse_page(PAGE, FilterMode::Off);
+        assert!(d.text().contains("SPONSORED"));
+        assert_eq!(d.filtered, 0);
+    }
+
+    #[test]
+    fn filtering_an_iframe_does_not_eat_what_follows_it() {
+        // An `<iframe>` is not a void tag, but pages write it self-closed
+        // and unclosed constantly. Whatever the parser does with the depth,
+        // the paragraph after it must survive.
+        let d = parse_page(PAGE, FilterMode::Standard);
+        assert!(d.text().contains("the rest"), "the page ended at the iframe: {:?}", d.text());
     }
 }
 

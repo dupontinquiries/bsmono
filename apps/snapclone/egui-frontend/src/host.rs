@@ -1,10 +1,13 @@
 //! host — the missing call site, expressed as data.
 //!
-//! `Snapclone` has around ninety-five public methods. The deployable binary
-//! called **two** of them (`apply_settings` and `ui`) and constructed the app
-//! with three hardcoded peers, so `answer_call`, `voice_frame`, `qr_frame`,
-//! `on_gossip`, `classify_nat`, `peer_learned` and roughly thirty more were
-//! ported, tested, and never once reached in a running process. `wiring_check`
+//! `Snapclone` has around ninety-five public methods. Before this module
+//! the deployable binary called **two** of them (`apply_settings` and
+//! `ui`) and constructed the app with three hardcoded peers, so
+//! `answer_call`, `voice_frame`, `qr_frame`, `on_gossip`, `classify_nat`,
+//! `peer_learned` and roughly thirty more were ported, tested, and never
+//! once reached in a running process. That is what this exists to fix, and
+//! the count is a snapshot of the problem rather than a claim about today
+//! — the list shrinks every time something here grows an arm. `wiring_check`
 //! calls that class "tested but never called in production" and it is the
 //! whole gap between this port and the Qt app: not missing code, missing
 //! wiring.
@@ -60,8 +63,8 @@
 
 use crate::{
     ambient_inbox, ambient_palette, camera_select, contact_book, frame_pump, gaze, gossip,
-    identity, keyboard_inset, nat_punch, settings_page, snap_export, voice_bridge, voice_send,
-    Snapclone,
+    identity, keyboard_inset, nat_punch, settings_page, snap_export, snap_state, snap_wire,
+    snaps, voice_bridge, voice_send, Snapclone,
 };
 
 /// Something the world is telling the app.
@@ -70,6 +73,15 @@ use crate::{
 /// method it happens to call — a variant called `NoteCameraWorked` would tie
 /// the wire format to an internal name, and the point of the seam is that the
 /// two can move apart.
+/// How much time one level report stands for, for the floor's hold timer.
+///
+/// These events carry no timestamp, and the mic pump runs at roughly 50Hz.
+/// Being slightly out only shifts how long a silent talker keeps the
+/// floor, which is a feel setting rather than a correctness one — but the
+/// number has to exist somewhere, and inventing it at each call site is
+/// how two of them end up disagreeing.
+pub const MIC_TICK_MS: f32 = 20.0;
+
 #[derive(Debug, Clone)]
 pub enum HostEvent {
     /// Wall clock advanced. Carries seconds because that is what the app's
@@ -100,6 +112,20 @@ pub enum HostEvent {
     /// so the roster is what was saved rather than what was hardcoded.
     ContactsLoaded(Box<contact_book::ContactBook>),
 
+    /// Which snaps are already finished, off disk. Sent at start-up, before
+    /// anything can populate the feed — a snap filtered after it has been
+    /// shown has already been shown.
+    SnapStateLoaded(Box<snap_state::SnapState>),
+    /// A snap arrived from a peer, already attributed by the transport.
+    /// `from` is the AUTHENTICATED sender — the connection's, not the
+    /// frame's claim — because the two can differ and only one of them was
+    /// established by anything.
+    SnapArrived { from: String, frame: Box<snap_wire::SnapFrame> },
+    /// Snaps the host received and wants displayed. Filtered against the
+    /// finished set on the way in, which is the one place that filter can
+    /// live without every producer having to remember it.
+    SnapsForFeed(Vec<snaps::FeedEntry>),
+
     /// The devices this machine offers, from a probe.
     CamerasFound(Vec<camera_select::Device>),
     /// A capture actually delivered frames. Feeds the health record that
@@ -107,6 +133,10 @@ pub enum HostEvent {
     CameraWorked { id: String, now_ms: i64 },
     /// A frame arrived from the capture thread.
     CameraFrame(frame_pump::RawFrame),
+    /// Where the capture engine stands. Edge-triggered by the host (sent on
+    /// change, not per frame), and shown on the camera page — the person
+    /// aiming the camera is looking at the viewfinder, not at stderr.
+    CaptureStatus(crate::capture::Status),
     /// A QR payload was decoded from the viewfinder or pasted in.
     QrPayload(String),
     /// Average colour of the scene, for the ambient palette.
@@ -146,6 +176,15 @@ pub enum HostEvent {
     /// The mic produced a frame interval; ask the sender whether anything may
     /// leave.
     MicFrame,
+    /// How loud that interval was, 0..1. Feeds the transmit gate's activity
+    /// score AND the on-screen meter from ONE measurement — two sources
+    /// would eventually disagree about whether you are speaking, and the
+    /// meter is how a person checks that the mic works at all.
+    MicActivity(f32),
+    /// Whether the host can turn samples into payloads. False is a real
+    /// state, not an error: with no encoder the call joins, the floor works,
+    /// and nothing leaves — silence the user cannot otherwise account for.
+    EncoderReady(bool),
     /// A packet is ready to go out to everyone in the call.
     VoiceOutbound(voice_bridge::Packet),
     /// A decoded frame for the play-out cushion.
@@ -162,6 +201,11 @@ pub enum HostEvent {
     /// a question about the moment the snaps landed.
     SnapsArrived { from: Vec<String>, focused: bool },
     /// A send was acknowledged.
+    /// A send did not get there. Distinct from never having tried: the row
+    /// the sender watches must be able to reach Failed, or a send that
+    /// broke is indistinguishable from one still in flight and the retry
+    /// button never lights.
+    SnapSendFailed { id: String, now_ms: u64 },
     /// A snap reached its recipient.
     ///
     /// Carries `now_ms` like `CameraWorked` and `PeerAddr` do, because
@@ -173,6 +217,11 @@ pub enum HostEvent {
     ConnectionRequest { id: u64, peer: String, at: i64 },
     /// The host finished (or failed) an export it was asked to run.
     ExportFinished(snap_export::Outcome),
+    /// The host acted on `CaptureSnap`: the file it wrote, or why it could
+    /// not. Routed to the shutter note rather than to stderr — the person who
+    /// pressed the shutter is looking at the camera page, and a photo that
+    /// silently did not save is the failure they find out about last.
+    SnapSaved(Result<String, String>),
     /// A DHT lookup produced a value.
     DhtValue(Vec<u8>),
     /// A DHT lookup finished. The bool command reports whether this was the
@@ -220,6 +269,15 @@ pub enum HostCommand {
     SendVoice(Vec<(String, Vec<u8>)>),
     /// What the transmit half decided about this mic interval.
     VoiceEmit(voice_send::Emit),
+    /// A voice payload arrived and was routed. Decode it and hand the
+    /// samples back as `DecodedAudio`.
+    ///
+    /// The codec belongs to the host, which is why this is a round trip
+    /// rather than the app calling a decoder: the app knows about frames of
+    /// f32 and nothing about how they were packed. Before this the decoded
+    /// packet was matched on and DROPPED — inbound audio reached the bridge
+    /// and stopped there, so a call was silent in both directions.
+    DecodeAudio(Vec<u8>),
     /// Show a notification. Only produced when the app decided one is
     /// warranted — an unfocused window and at least one sender.
     Notify(uikit_egui::notify::Rendered),
@@ -232,6 +290,18 @@ pub enum HostCommand {
     NatClassified(bool),
     /// A QR payload latched onto an open scanner.
     QrLatched(bool),
+    /// Send the most recent capture to these people.
+    ///
+    /// WHO, not what. The app chose the recipients; the host knows which
+    /// bytes the last shutter press produced and how to put them on a
+    /// socket. Passing the payload through the app would mean the
+    /// controller holding a photo in memory for no reason other than to
+    /// hand it straight back.
+    SendSnap { to: Vec<String> },
+    /// Write the finished-snap set out; it changed. Carries the value for
+    /// the same reason `SaveContacts` does — a host writing from another
+    /// thread must not have to borrow the app.
+    SaveSnapState(Box<snap_state::SnapState>),
     /// Write the address book out; it changed. Carries the book rather than
     /// signalling "go read the app's field", so a host can write it from
     /// another thread without borrowing the app.
@@ -295,9 +365,61 @@ impl Snapclone {
                 self.contacts_dirty = false;
             }
 
-            HostEvent::CamerasFound(list) => self.cameras = list,
+            HostEvent::CamerasFound(list) => {
+                self.cameras = list;
+                // The list without a choice is what kept the page on "no
+                // camera found" while the picker showed two — everything
+                // downstream (describe line, capture plan) hangs off
+                // `camera`, and nothing set it.
+                self.camera = crate::camera_source::choose_from_enumerated(
+                    &self.cameras, &self.settings.current.camera.device);
+            }
             HostEvent::CameraWorked { id, now_ms } => self.note_camera_worked(&id, now_ms),
             HostEvent::CameraFrame(f) => self.frames.offer(f),
+            HostEvent::CaptureStatus(st) => self.capture_status = st,
+            HostEvent::SnapStateLoaded(st) => {
+                self.snap_state = *st;
+                // Loading is not a change. Marking it dirty here would write
+                // the file straight back on every launch, which is a disk
+                // write and a chance to truncate it for no reason at all.
+                self.snap_state_dirty = false;
+            }
+            HostEvent::SnapArrived { from, frame } => {
+                // THE SEQUENCE IS OBSERVED. `observe_seq` was written,
+                // tested and never called, so the ack this device sends
+                // back carried nothing and a peer had no way to learn what
+                // had arrived. Advancing only — reordered frames are
+                // normal, and letting a late low sequence move the ack
+                // backwards makes the peer re-send everything after it.
+                self.sessions.entry(&from).observe_seq(frame.header.seq);
+                let row = frame.to_feed_entry(&from);
+                // The finished set is consulted for a SINGLE arrival too,
+                // not only at a bulk feed load. A peer that re-sends a snap
+                // you already viewed must not put it back — and re-sending
+                // is the ordinary consequence of a retry, not an attack.
+                if !self.snap_state.is_finished(&row.id) {
+                    let mut rows = self.feed.entries().to_vec();
+                    if !rows.iter().any(|e| e.id == row.id) {
+                        // Newest first, matching what the inbox supplies —
+                        // `set_entries` renders the order it is given.
+                        rows.insert(0, row);
+                        self.feed.set_entries(rows);
+                    }
+                }
+            }
+            HostEvent::SnapsForFeed(entries) => {
+                self.feed.set_entries(self.snap_state.filter_unfinished(entries));
+            }
+            HostEvent::SnapSaved(r) => {
+                self.shutter_note = match r {
+                    // The basename, not the path: a phone's data dir is
+                    // sixty characters of XDG and the filename is the part
+                    // that identifies the shot. The host prints the full
+                    // path for anyone who needs it.
+                    Ok(path) => format!("saved {}", path.rsplit('/').next().unwrap_or(&path)),
+                    Err(why) => format!("not saved — {why}"),
+                };
+            }
             HostEvent::QrPayload(p) => out.push(HostCommand::QrLatched(self.qr_frame(&p))),
             HostEvent::AmbientPixels { pixels, side } => self.sample_ambient(&pixels, side),
 
@@ -325,7 +447,11 @@ impl Snapclone {
                 // The return carries the routed packet; the app has already
                 // applied any floor change to the coordinator by the time it
                 // comes back, so there is nothing for the host to do with it.
-                let _ = self.voice_receive(&sender, &payload);
+                if let crate::voice_bridge::Inbound::Handled {
+                    packet: crate::voice_bridge::Packet::VoiceFrame(f), ..
+                } = self.voice_receive(&sender, &payload) {
+                    out.push(HostCommand::DecodeAudio(f));
+                }
                 // Arriving voice is what arms the proximity screensaver's
                 // window, and the posture engine is told separately from the
                 // codec path on purpose: one is about audio, the other about
@@ -333,6 +459,32 @@ impl Snapclone {
                 self.last_voice_at = Some(self.now_secs);
             }
             HostEvent::MicFrame => out.push(HostCommand::VoiceEmit(self.voice_frame())),
+            // The mic reports at the frame pump's rate, and the floor's
+            // hold is in milliseconds — so the tracker needs a step. A
+            // constant rather than a measured dt because these events
+            // carry no timestamp; being slightly out only shifts how long
+            // a silent talker keeps the floor, which is a feel setting.
+            HostEvent::MicActivity(level) => {
+                let l = level.clamp(0.0, 1.0);
+                self.sender.on_activity(l);
+                self.voicebar.set_mic_level(l);
+                // YOU ONLY HOLD THE FLOOR WHILE TRANSMITTING. The mic is
+                // live whenever the call is, so without this gate the bar
+                // says "You" for a room the other end cannot hear —
+                // which is worse than saying nothing, because it looks
+                // like confirmation that you are being heard.
+                let mine = if self.sender.is_transmitting() { l } else { 0.0 };
+                self.voicebar.note_level("You", true, mine, MIC_TICK_MS);
+            }
+            HostEvent::EncoderReady(ready) => {
+                self.sender.set_encoder_ready(ready);
+                // `note_no_encoder` reports ONCE by design — the bool is
+                // whether this is the first time — because saying it every
+                // frame at fifty hertz would bury the log it belongs in.
+                if !ready && self.sender.is_transmitting() && self.sender.note_no_encoder() {
+                    out.push(HostCommand::VoiceEmit(voice_send::Emit::NoEncoder));
+                }
+            }
             HostEvent::VoiceOutbound(p) => out.push(HostCommand::SendVoice(self.voice_send(&p))),
             HostEvent::DecodedAudio(frame) => self.sink_push(frame),
             HostEvent::SinkDepth(depth) => {
@@ -342,6 +494,17 @@ impl Snapclone {
             HostEvent::SpeakerLevel { peer, level } => {
                 self.group_voice.set_level(&peer, level);
                 self.voice_room.set_speaker_level(level);
+                // The peer's DISPLAY name, not its id: the centre line is
+                // read at arm's length by someone holding the phone, and a
+                // 52-character key there is the same as no label.
+                // The nickname when there is one, the id otherwise. A
+                // 52-character key on the centre line is the same as no
+                // label to someone holding the phone at arm's length.
+                let name = self.contact_book.get(&peer)
+                    .map(|c| c.nickname.clone())
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or_else(|| peer.clone());
+                self.voicebar.note_level(&name, false, level, MIC_TICK_MS);
             }
 
             HostEvent::SnapsArrived { from, focused } => {
@@ -353,7 +516,19 @@ impl Snapclone {
                 // when the screen should come back.
                 self.posture.notify_snap_arrived();
             }
+            HostEvent::SnapSendFailed { id, now_ms } => {
+                for r in self.sends.rows_mut() {
+                    if r.id == id { r.failed(now_ms); }
+                }
+                // THE ADDRESS IS NOTED, not just the send. Without this a
+                // cached address that no longer answers is retried
+                // forever, and every attempt costs the person a timeout.
+                if let Some(a) = self.punch.get(&id) {
+                    self.addr_health.failed(&id, a, now_ms as i64);
+                }
+            }
             HostEvent::SnapDelivered { id, now_ms } => {
+                self.addr_health.worked(&id, now_ms as i64);
                 // BOTH outboxes, and the two are not redundant — see the
                 // note on `Snapclone::sends`. `crate::outbox` owns a
                 // snap's lifetime in storage; `send_state::Outbox` owns
@@ -415,6 +590,13 @@ impl Snapclone {
         }
         for id in std::mem::take(&mut self.key_conflicts) {
             out.push(HostCommand::PeerKeyChanged(id));
+        }
+        let to = std::mem::take(&mut self.send_requested);
+        if !to.is_empty() {
+            out.push(HostCommand::SendSnap { to });
+        }
+        if std::mem::take(&mut self.snap_state_dirty) {
+            out.push(HostCommand::SaveSnapState(Box::new(self.snap_state.clone())));
         }
         if std::mem::take(&mut self.contacts_dirty) {
             out.push(HostCommand::SaveContacts(Box::new(self.contact_book.clone())));
@@ -645,6 +827,354 @@ mod tests {
     }
 
     #[test]
+    fn standing_tells_the_row_what_the_book_knows() {
+        // The badge logic behind the folded Friends cards: a booked contact
+        // shows its trust, a discovered sc-ID offers Keep with the observed
+        // port, and a hostname row offers nothing — a book keyed by id has
+        // nowhere to put "192.168.1.5".
+        use crate::friends::Standing;
+        let mut s = app();
+        s.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "sc-aabbccdd".into(), port: 9000 }));
+        match s.standing_of("sc-aabbccdd") {
+            Standing::Known { danger, .. } => assert!(!danger, "a fresh add is not a conflict"),
+            other => panic!("booked contact reads as {other:?}"),
+        }
+        // Discovered but not kept: a valid id absent from the book. With no
+        // observed address the Keep falls back to the protocol default port
+        // rather than inventing one.
+        assert_eq!(s.standing_of("sc-11223344"),
+                   Standing::Discovered { port: crate::qr::DEFAULT_PORT });
+        assert_eq!(s.standing_of("192.168.1.5"), Standing::Plain);
+    }
+
+    #[test]
+    fn an_arriving_snap_reaches_the_feed_once() {
+        // The app has never received a snap. This is the arm that makes one
+        // appear — and the same snap arriving twice (a retry, which is
+        // ordinary) must not appear twice.
+        let mut s = app();
+        let frame = crate::snap_wire::SnapFrame::announce(
+            1, 0, "sc-aabbccdd", "kit", crate::snaps::Media::Image, 1_700_000_000, 5,
+            b"a photo".to_vec());
+        for _ in 0..2 {
+            s.apply(HostEvent::SnapArrived {
+                from: "sc-aabbccdd".into(), frame: Box::new(frame.clone()) });
+        }
+        assert_eq!(s.feed.count(), 1, "a re-delivered snap appeared twice");
+        assert_eq!(s.feed.entries()[0].sender_name, "kit");
+    }
+
+    #[test]
+    fn a_snap_already_viewed_is_not_put_back_by_a_re_send() {
+        // The finished set is consulted for a single arrival too, not only
+        // at a bulk feed load. Otherwise a sender's retry undoes the one
+        // promise this app makes.
+        let mut s = app();
+        let frame = crate::snap_wire::SnapFrame::announce(
+            1, 0, "sc-aabbccdd", "kit", crate::snaps::Media::Image, 0, 5,
+            b"a photo".to_vec());
+        let id = crate::snap_wire::content_id("sc-aabbccdd", b"a photo");
+        s.snap_state.mark(&id, crate::snap_state::Mark::Viewed, 1_000);
+        s.apply(HostEvent::SnapArrived {
+            from: "sc-aabbccdd".into(), frame: Box::new(frame) });
+        assert_eq!(s.feed.count(), 0, "a viewed snap came back on a re-send");
+    }
+
+    #[test]
+    fn pressing_send_asks_the_host_to_send_rather_than_only_drawing_a_row() {
+        // The button drew a progress row for a transfer that never started,
+        // and the row aged out looking like a timeout.
+        let mut s = app();
+        s.send_requested = vec!["sc-aabbccdd".into()];
+        let out = s.drain_commands();
+        assert!(out.iter().any(|c| matches!(c,
+            HostCommand::SendSnap { to } if to == &vec!["sc-aabbccdd".to_string()])),
+            "{out:?}");
+        // Drained, not repeated: a flag left set would re-send the photo
+        // every frame for the rest of the session.
+        assert!(!s.drain_commands().iter().any(|c| matches!(c, HostCommand::SendSnap { .. })));
+    }
+
+    #[test]
+    fn a_send_row_can_reach_failed_and_not_only_age_out() {
+        // Both terminal states, or a broken send is indistinguishable from
+        // one still in flight and the retry button never lights.
+        let mut s = app();
+        s.sends.push("sc-aabbccdd", 1_000);
+        s.apply(HostEvent::SnapSendFailed { id: "sc-aabbccdd".into(), now_ms: 2_000 });
+        assert!(s.sends.rows().iter().any(|r| r.state.can_retry()),
+                "no row reached Failed: {:?}",
+                s.sends.rows().iter().map(|r| r.state).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn an_inbound_voice_frame_reaches_the_host_instead_of_being_dropped() {
+        // The arm was `Packet::VoiceFrame(_) => {}`. A call could connect,
+        // negotiate the floor, and play nothing — the payload reached the
+        // bridge and stopped there.
+        let mut s = app();
+        // The link first: `voice_bridge::inbound` refuses everything while
+        // disconnected, which is correct — a voice packet arriving before
+        // the transport is up has no session to belong to.
+        s.apply(HostEvent::VoiceLink(true));
+        let payload = crate::voice_bridge::encode(
+            &crate::voice_bridge::Packet::VoiceFrame(vec![1, 2, 3, 4]));
+        let out = s.apply(HostEvent::VoiceReceived {
+            sender: "sc-aabbccdd".into(), payload });
+        let decoded = out.iter().find_map(|c| match c {
+            HostCommand::DecodeAudio(b) => Some(b.clone()), _ => None });
+        assert_eq!(decoded, Some(vec![1, 2, 3, 4]),
+                   "the frame never left the bridge: {out:?}");
+
+        // A floor assert is NOT audio and must not become a decode request.
+        let floor = crate::voice_bridge::encode(
+            &crate::voice_bridge::Packet::FloorAssert { claim_ts: 1 });
+        let out = s.apply(HostEvent::VoiceReceived {
+            sender: "sc-aabbccdd".into(), payload: floor });
+        assert!(!out.iter().any(|c| matches!(c, HostCommand::DecodeAudio(_))), "{out:?}");
+    }
+
+    #[test]
+    fn one_measurement_drives_both_the_gate_and_the_meter() {
+        // Two sources would eventually disagree about whether you are
+        // speaking, and the meter is how a person checks the mic works.
+        let mut s = app();
+        s.apply(HostEvent::MicActivity(0.42));
+        assert!((s.sender.activity() - 0.42).abs() < 1e-6);
+        assert!((s.voicebar.mic_level() - 0.42).abs() < 1e-6,
+                "the meter did not move with the gate");
+        // Out of range is clamped, not trusted: a level above 1 would pin
+        // the meter and skew the gate's own thresholds.
+        s.apply(HostEvent::MicActivity(9.0));
+        assert!((s.sender.activity() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_missing_encoder_is_said_once_and_only_while_transmitting() {
+        // Silence with no explanation is the failure this exists to
+        // prevent; a line per frame at fifty hertz is the failure it must
+        // not become.
+        let mut s = app();
+        s.set_transmitting(true);
+        let out = s.apply(HostEvent::EncoderReady(false));
+        assert!(out.iter().any(|c| matches!(
+            c, HostCommand::VoiceEmit(crate::voice_send::Emit::NoEncoder))), "{out:?}");
+        let again = s.apply(HostEvent::EncoderReady(false));
+        assert!(!again.iter().any(|c| matches!(
+            c, HostCommand::VoiceEmit(crate::voice_send::Emit::NoEncoder))),
+            "reported twice: {again:?}");
+    }
+
+    #[test]
+    fn a_viewed_snap_is_not_offered_again_after_a_restart() {
+        // End to end through the seam for the last command that had no
+        // store. Before this, a snap was viewed until you quit and unviewed
+        // afterwards — and the sender believes it is gone.
+        let mut s = app();
+        let feed = vec![
+            crate::snaps::FeedEntry { id: "snap-1".into(), sender_name: "kit".into(),
+                sent_at: 0, media: crate::snaps::Media::Image, thumb_path: String::new() },
+            crate::snaps::FeedEntry { id: "snap-2".into(), sender_name: "kit".into(),
+                sent_at: 0, media: crate::snaps::Media::Image, thumb_path: String::new() },
+        ];
+        s.apply(HostEvent::SnapsForFeed(feed.clone()));
+        assert_eq!(s.feed.count(), 2, "a fresh install shows both");
+
+        s.snaps_viewed.push("snap-1".into());
+        s.snap_state.mark("snap-1", crate::snap_state::Mark::Viewed, 1_000);
+        s.snap_state_dirty = true;
+        let out = s.drain_commands();
+        let saved = out.iter().find_map(|c| match c {
+            HostCommand::SaveSnapState(st) => Some(st.clone()), _ => None });
+        let saved = saved.expect(&format!("the mark never reached a save: {out:?}"));
+
+        // Next launch: the state comes off disk and the same feed arrives.
+        let mut next = app();
+        next.apply(HostEvent::SnapStateLoaded(saved));
+        next.apply(HostEvent::SnapsForFeed(feed));
+        assert_eq!(next.feed.count(), 1, "the viewed snap came back");
+        assert_eq!(next.feed.entries()[0].id, "snap-2");
+    }
+
+    #[test]
+    fn loading_the_snap_state_does_not_ask_to_write_it_back() {
+        // A launch that rewrites the file it just read is a disk write and a
+        // chance to truncate it, for nothing.
+        let mut s = app();
+        let mut st = crate::snap_state::SnapState::default();
+        st.mark("snap-1", crate::snap_state::Mark::Viewed, 1);
+        let out = s.apply(HostEvent::SnapStateLoaded(Box::new(st)));
+        assert!(!out.iter().any(|c| matches!(c, HostCommand::SaveSnapState(_))),
+                "loading wrote the file back: {out:?}");
+    }
+
+    #[test]
+    fn the_message_and_call_buttons_do_something() {
+        // Both were `_ => {}` behind buttons drawn exactly like the two that
+        // worked. This is what fails if either falls back through again.
+        let mut s = app();
+        s.local_id = "sc-11111111".into();
+        s.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "sc-aabbccdd".into(), port: 9876 }));
+
+        s.apply_friends(crate::friends::Action::Invoke(
+            "sc-aabbccdd".into(), "message".into()));
+        assert_eq!(s.conversation_peer, "sc-aabbccdd", "Message opened nothing");
+
+        s.apply_friends(crate::friends::Action::Invoke(
+            "sc-aabbccdd".into(), "call".into()));
+        assert!(s.group_voice.joined, "Call did not enter the room");
+        assert!(s.group_voice.participants.iter().any(|p| p.id == "sc-aabbccdd"),
+                "the person being called is not in the call");
+        // No address is known, so the note says so NOW rather than after
+        // thirty seconds of silence the user reads as a broken microphone.
+        assert!(s.call_note.contains("no known address"), "{}", s.call_note);
+
+        // With an address, the same action reports a call being placed.
+        s.note_peer_addr("sc-aabbccdd", [10, 0, 0, 3], 9876, 1_000);
+        s.apply_friends(crate::friends::Action::Invoke(
+            "sc-aabbccdd".into(), "call".into()));
+        assert_eq!(s.call_note, "calling sc-aabbccdd");
+    }
+
+    #[test]
+    fn calling_twice_does_not_duplicate_anyone_in_the_room() {
+        let mut s = app();
+        s.local_id = "sc-11111111".into();
+        s.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "sc-aabbccdd".into(), port: 9876 }));
+        for _ in 0..3 {
+            s.apply_friends(crate::friends::Action::Invoke(
+                "sc-aabbccdd".into(), "call".into()));
+        }
+        let n = s.group_voice.participants.iter()
+            .filter(|p| p.id == "sc-aabbccdd").count();
+        assert_eq!(n, 1, "three taps put them in the room {n} times");
+        assert_eq!(s.group_voice.participants.iter().filter(|p| p.is_self).count(), 1,
+                   "and we joined ourselves more than once");
+    }
+
+    #[test]
+    fn a_device_with_no_identity_refuses_the_call_rather_than_half_placing_it() {
+        // `group_voice::leave` releases the floor through `me()`, so a room
+        // we are not a participant of cannot be left cleanly — and the far
+        // end would get packets from a sender it cannot name. Gossip already
+        // refuses to announce without a key; this is the same rule.
+        let mut s = app();
+        assert!(s.local_id.is_empty(), "the fixture is supposed to have no identity");
+        s.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "sc-aabbccdd".into(), port: 9876 }));
+        s.apply_friends(crate::friends::Action::Invoke(
+            "sc-aabbccdd".into(), "call".into()));
+        assert!(!s.group_voice.joined, "we entered a call as nobody");
+        assert!(s.call_note.contains("no identity"), "{}", s.call_note);
+    }
+
+    #[test]
+    fn the_dht_only_asks_about_contacts_the_lan_cannot_see() {
+        // Gossip is better evidence than a DHT record — signed, and it means
+        // they are on this subnet right now. Asking the DHT about someone
+        // two metres away spends traffic to learn something weaker, and on a
+        // phone that traffic is a radio wakeup.
+        let mut s = app();
+        for id in ["sc-aaaaaaaa", "sc-bbbbbbbb"] {
+            s.apply_friends(crate::friends::Action::Add(
+                crate::friends::AddPeer { host: id.into(), port: 9876 }));
+        }
+        // One of them is right here.
+        s.apply(HostEvent::PeerPresence { id: "sc-aaaaaaaa".into(), online: true });
+        for p in s.peers.iter_mut() {
+            if p.name == "sc-aaaaaaaa" { p.online = true; }
+        }
+        let offline: Vec<String> = s.contact_book.iter().map(|c| c.sc_id.clone())
+            .filter(|id| !s.peers.iter().any(|p| p.name == *id && p.online))
+            .collect();
+        assert_eq!(offline, vec!["sc-bbbbbbbb".to_string()],
+                   "the visible peer is being looked up anyway");
+    }
+
+    #[test]
+    fn a_dht_record_becomes_a_dialable_address_not_just_a_note() {
+        // It used to set `feed_note` and evaporate — nothing recorded the
+        // address, so a peer "found via DHT" still could not be reached and
+        // the message was a tease.
+        let mut s = app();
+        s.note_peer_addr("sc-aabbccdd", [203, 0, 113, 9], 9876, 5_000);
+        let a = s.punch.get("sc-aabbccdd").expect("the DHT result went nowhere");
+        assert_eq!((a.ip, a.port), ([203, 0, 113, 9], 9876));
+    }
+
+    #[test]
+    fn a_learned_address_is_what_makes_a_peer_dialable() {
+        // `PunchAddrs` was empty for the whole life of this port — nothing
+        // called `note_peer_addr`, so no hole punch had a target and voice
+        // had nowhere to send. This is the arm the binary now feeds from
+        // ADMITTED gossip.
+        let mut s = app();
+        assert!(s.punch.is_empty(), "nothing should be known before any gossip");
+        s.apply(HostEvent::PeerAddr {
+            id: "sc-aabbccdd".into(), ip: [10, 0, 0, 7], port: 9876, now_ms: 1_000 });
+        let a = s.punch.get("sc-aabbccdd").expect("the address was not recorded");
+        assert_eq!((a.ip, a.port), ([10, 0, 0, 7], 9876));
+
+        // And it does not last forever: a peer that moved networks must stop
+        // authorising an ex-neighbour's address for voice admission.
+        s.apply(HostEvent::ExpirePunchAddrs { now_ms: 1_000 + 60 * 60 * 1000 });
+        assert!(s.punch.get("sc-aabbccdd").is_none(),
+                "an hour-old address is still being offered as current");
+    }
+
+    #[test]
+    fn the_shutter_says_whether_the_photo_was_saved() {
+        // The failure this closes: `CaptureSnap` was answered on stderr, and
+        // the person who pressed the shutter is looking at the camera page.
+        // A photo that silently did not save is the one they find out about
+        // last — usually when it is not there later.
+        let mut s = app();
+        s.apply(HostEvent::SnapSaved(Ok("/home/u/.local/share/snapclone/snaps/snap-42.ppm".into())));
+        assert_eq!(s.shutter_note, "saved snap-42.ppm",
+                   "the note shows the filename, not sixty characters of XDG path");
+        s.apply(HostEvent::SnapSaved(Err("no live frame".into())));
+        assert_eq!(s.shutter_note, "not saved — no live frame");
+    }
+
+    #[test]
+    fn the_pick_toggle_is_not_the_card_toggle() {
+        // These were one action for a while and it meant opening someone's
+        // action menu silently added them to the next send. Separate
+        // variants, and this is what fails if they are merged again.
+        let mut s = app();
+        s.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "sc-aabbccdd".into(), port: 9000 }));
+        s.apply_friends(crate::friends::Action::Selected("sc-aabbccdd".into()));
+        assert!(!s.picker.selected().iter().any(|p| p == "sc-aabbccdd"),
+                "opening the card added a send recipient");
+        s.apply_friends(crate::friends::Action::TogglePick("sc-aabbccdd".into()));
+        assert!(s.picker.selected().iter().any(|p| p == "sc-aabbccdd"),
+                "the checkbox did not reach the picker");
+    }
+
+    #[test]
+    fn reach_is_matched_by_name_not_by_a_synthesised_id() {
+        // `peer_roster` zero-pads a name into a PeerId. Matching rows on
+        // those bytes works today and breaks silently — every row reading
+        // "no reach" — the moment real keys arrive.
+        let mut s = app();
+        s.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "sc-aabbccdd".into(), port: 9000 }));
+        let reach = vec![crate::peer_source::RosterPeer {
+            id: [7u8; 32],           // deliberately NOT the padded name
+            name: "sc-aabbccdd".into(),
+            reach: crate::peer_source::Reach::Connected,
+        }];
+        let info = s.row_info("sc-aabbccdd", &reach);
+        assert_eq!(info.reach, Some(crate::friends::Reach::Connected));
+        assert_eq!(s.row_info("sc-99999999", &reach).reach, None,
+                   "a row with no roster entry must not borrow another's reach");
+    }
+
+    #[test]
     fn a_scanned_contact_produces_a_save_and_keeps_its_port() {
         // End to end for the thing that made the app a demo: scan a code, and
         // the contact is still there next launch. The port travelling with it
@@ -799,5 +1329,48 @@ mod tests {
         let mut s = app();
         assert!(s.apply(HostEvent::WindowFocus(true)).is_empty());
         assert!(s.apply(HostEvent::GazeLost).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod addr_health_host_tests {
+    use super::*;
+
+    fn app() -> Snapclone { Snapclone::new(Vec::new()) }
+
+    #[test]
+    fn repeated_send_failures_take_an_address_out_of_use() {
+        // The end-to-end version of the rule: the events the host already
+        // emits are what drive it, so nothing extra has to remember.
+        let mut a = app();
+        a.punch.set("sc-1", crate::punch_addrs::PeerAddr::new([10, 0, 0, 9], 9876), 0);
+        assert!(a.addr_health.usable("sc-1", 0));
+        for _ in 0..crate::store_privacy::ADDR_FAIL_THRESHOLD {
+            a.apply(HostEvent::SnapSendFailed { id: "sc-1".into(), now_ms: 0 });
+        }
+        assert!(!a.addr_health.usable("sc-1", 0),
+                "{} failures recorded", a.addr_health.failures("sc-1"));
+    }
+
+    #[test]
+    fn a_delivery_puts_it_back_in_use() {
+        let mut a = app();
+        a.punch.set("sc-1", crate::punch_addrs::PeerAddr::new([10, 0, 0, 9], 9876), 0);
+        for _ in 0..9 {
+            a.apply(HostEvent::SnapSendFailed { id: "sc-1".into(), now_ms: 0 });
+        }
+        a.apply(HostEvent::SnapDelivered { id: "sc-1".into(), now_ms: 1_000 });
+        assert!(a.addr_health.usable("sc-1", 1_000));
+    }
+
+    #[test]
+    fn a_failure_with_no_known_address_records_nothing() {
+        // "No known address" is a different problem from "this address
+        // does not answer", and counting it as the second would blacklist
+        // a peer whose address was simply never learned.
+        let mut a = app();
+        a.apply(HostEvent::SnapSendFailed { id: "sc-unknown".into(), now_ms: 0 });
+        assert_eq!(a.addr_health.failures("sc-unknown"), 0);
+        assert!(a.addr_health.usable("sc-unknown", 0));
     }
 }

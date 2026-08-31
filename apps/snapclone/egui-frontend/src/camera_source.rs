@@ -90,6 +90,49 @@ pub fn describe(c: &CameraChoice) -> String {
     format!("{} — {}×{} @{}", c.device.name, c.format.width, c.format.height, c.format.fps)
 }
 
+/// `choose`, fed from what [`crate::camera_enumerate`] actually returns.
+///
+/// The gap this closes: `HostEvent::CamerasFound` filled `Snapclone.cameras`
+/// and NOTHING ever set `Snapclone.camera`, so the page's describe line read
+/// "no camera found" on machines whose picker listed two — the choice
+/// machinery existed and had no caller with the enumerated list in hand.
+///
+/// The two Device types differ on purpose (`camera_select` knows facing and
+/// capture groups; device-kit knows paths), so this is the one place that
+/// maps between them: an enumerated id is the `/dev` node's basename, which
+/// is exactly what a v4l2 pipeline needs back.
+///
+/// 640×480\@30 as the desired format, deliberately preview-sized: the
+/// capture host reads raw RGBA over a pipe, and at 30 fps this is ~36 MB/s —
+/// comfortable on a phone — where 1280×720 is ~110 MB/s. Until snaps are
+/// captured at a different resolution than they are previewed, the preview
+/// size is the honest one to negotiate.
+pub fn choose_from_enumerated(cameras: &[crate::camera_select::Device],
+                              prefer: &str) -> Option<CameraChoice> {
+    let devices: Vec<Device> = cameras.iter()
+        .map(|d| {
+            // Two id shapes reach this list and `source_plan` distinguishes
+            // them by prefix: `camera_enumerate` produces `/dev` basenames
+            // ("video0"), a platform backend produces PipeWire node names
+            // ("libcamera_input_2_1"). The first becomes a path so the plan
+            // builds v4l2; the second passes through untouched so the plan
+            // builds pipewiresrc. Mangling a node name into "/dev/<node>"
+            // would send a phone's camera down the desktop path.
+            let path = if d.id.starts_with("video")
+                && d.id[5..].chars().all(|c| c.is_ascii_digit())
+                && !d.id[5..].is_empty()
+            {
+                format!("/dev/{}", d.id)
+            } else {
+                d.id.clone()
+            };
+            Device::new(DeviceKind::VideoCapture, &d.id, &d.label, &path)
+        })
+        .collect();
+    let prefer = if prefer.trim().is_empty() { None } else { Some(prefer.trim()) };
+    choose(&devices, &[], &VideoFormat::new(640, 480, 30, "RGBA"), prefer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +211,36 @@ Integrated Camera: Integrated C (usb-0000:00:14.0-8):\n\
         // A black rectangle and a missing device look identical, which is the
         // placeholder failure in its original form.
         assert!(choose(&[], &[fmt(1280, 720, 30)], &fmt(1280, 720, 30), None).is_none());
+    }
+
+    #[test]
+    fn an_enumerated_list_finally_produces_a_choice() {
+        // The regression this pins: cameras enumerated, `camera` still None,
+        // page says "no camera found". The bridge maps id -> /dev path so
+        // the plan that follows can build a v4l2 pipeline from it.
+        let cams = vec![
+            crate::camera_select::Device { id: "video0".into(), label: "Integrated Camera".into(),
+                facing: crate::camera_select::Facing::Rear, capture_group: None },
+            crate::camera_select::Device { id: "video2".into(), label: "HD Pro C920".into(),
+                facing: crate::camera_select::Facing::Rear, capture_group: None },
+        ];
+        let c = choose_from_enumerated(&cams, "").expect("two cameras, no choice");
+        assert_eq!(c.device.path, "/dev/video0", "id maps to the /dev node");
+        let picked = choose_from_enumerated(&cams, "c920").expect("preference ignored");
+        assert_eq!(picked.device.path, "/dev/video2", "the saved name wins");
+        assert!(choose_from_enumerated(&[], "").is_none(), "no cameras is still None");
+
+        // A platform backend hands over PipeWire node names, not /dev
+        // basenames; those must pass through untouched so the plan builds a
+        // pipewiresrc for them rather than a v4l2 path that does not exist.
+        let phone = vec![crate::camera_select::Device {
+            id: "libcamera_input_2_1".into(), label: "Rear Camera".into(),
+            facing: crate::camera_select::Facing::Rear, capture_group: Some(1) }];
+        let c = choose_from_enumerated(&phone, "").unwrap();
+        assert_eq!(c.device.path, "libcamera_input_2_1");
+        let plan = pipelines_for(&c, &[], "");
+        assert_eq!(plan[0].kind, device_kit::source_plan::SourceKind::PipewireLibcamera,
+                   "{plan:?}");
     }
 
     #[test]

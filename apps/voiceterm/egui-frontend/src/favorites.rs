@@ -102,7 +102,7 @@ pub fn favorites_ui(
                 .color(if e.origin == Origin::Home { c.accent } else { c.text }));
             ui.label(egui::RichText::new(&e.path).monospace().small().color(c.text_weak));
         });
-        if resp.response.interact(egui::Sense::click()).clicked() {
+        if uikit_egui::dock::row_click(ui, resp.response.rect, &e.path).clicked() {
             act = Some(Action::Cd(e.path.clone()));
         }
     }
@@ -116,6 +116,49 @@ pub fn favorites_ui(
             .small().weak());
     }
     act
+}
+
+/// Driven through real frames — `favorites_ui` had the unclickable-row
+/// bug, so "the rows are there" was never the question.
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    use crate::frame_probe::Probe;
+
+    fn rows() -> Vec<Entry> {
+        vec![
+            Entry { name: "Home".into(), path: "/home/me".into(), origin: Origin::Home },
+            Entry { name: "Projects".into(), path: "/home/me/proj".into(),
+                    origin: Origin::Places },
+        ]
+    }
+
+    #[test]
+    fn clicking_a_favorite_asks_to_cd_to_its_path() {
+        // The whole purpose of the panel. It drew correctly and did nothing
+        // when clicked, which is the worst of both: it looks operational.
+        let p = Probe::default();
+        let c = p.colors();
+        let act = p.click_text("Projects", |ui| favorites_ui(ui, &rows(), &c));
+        assert_eq!(act, Some(Action::Cd("/home/me/proj".into())));
+    }
+
+    #[test]
+    fn every_favorite_is_drawn_once_with_its_path() {
+        let p = Probe::default();
+        let c = p.colors();
+        let (d, _) = p.frame(|ui| favorites_ui(ui, &rows(), &c));
+        assert_eq!(d.count("Projects"), 1, "{:?}", d.texts);
+        assert!(d.has("/home/me/proj"), "the path is what tells two 'src' apart");
+    }
+
+    #[test]
+    fn close_is_reachable_and_is_not_a_cd() {
+        let p = Probe::default();
+        let c = p.colors();
+        let act = p.click_text("close", |ui| favorites_ui(ui, &rows(), &c));
+        assert_eq!(act, Some(Action::Close));
+    }
 }
 
 #[cfg(test)]
