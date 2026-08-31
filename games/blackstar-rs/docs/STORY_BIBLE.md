@@ -12,6 +12,31 @@ so.
 A session should be able to start with "read `docs/STORY_BIBLE.md`" and nothing
 else.
 
+## The game is the medium
+
+Nine films were written and it is now unlikely any of them get made — game
+production is the tractable path and film production is not. So this is not a
+tie-in bible, and the scripts are not a production plan waiting on a green
+light. **`blackstar-rs` is where this story ships**, the screenplays are the
+most recent half-finished iteration of it, and half-finished is the expected
+state rather than a defect.
+
+Two things follow, and they sharpen the rule above rather than replace it:
+
+* **When a doc and the code disagree, the code wins.** The general rule is
+  "whichever was decided later", and for story the code is almost always the
+  later decision, because it is the only version anyone can play.
+  `content.rs` runs the missions, `archive.rs` holds the strata. A beat no
+  player can reach is a note, not canon.
+* **A thin beat is an invitation.** Where the fiction is unfinished, the game
+  is free to be the place it gets decided — and this file then gets edited to
+  match what shipped.
+
+The surviving screenplays live in [`docs/films/`](films/README.md), with their
+provenance and what is still missing recorded there. Films 5 and 6 are current;
+their predecessors were a different plot that contradicted this bible and were
+replaced.
+
 **It is machine-checked.** The fenced ```` ```canon:… ```` blocks below are
 cross-checked against the code tables by `archive::tests::the_story_bible_is_current`.
 Add a claim to `archive.rs` without listing it here and the suite fails; list
