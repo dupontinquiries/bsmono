@@ -4398,3 +4398,38 @@ small MRU candidate list and code an INDEX instead of coordinates,
 (b) allow one reference to cover a run of adjacent regions (repeated
 textures are contiguous), (c) match against source-quality recon by
 running the dictionary at a finer dead zone than the frame.
+
+### Two attempts to make the reference cheaper, both LOST to zstd
+
+The byte split said the 5-byte reference was eating mode 4's win
+(residual -376 KB, side info +246 KB), so the named next levers were
+an MRU index and run coverage. Built the first:
+
+  absolute coordinates + zstd        1,863,632 B side  <- best
+  delta vs referring region origin   1,869,634 B  (+6,002)
+  move-to-front MRU index, cap 128   1,866,150 B  (+2,518)
+
+The MRU's own instrumentation corrects the guess that motivated it.
+Exact (frame, x, y) triples repeat on only 5-15% of references per
+frame (f4 15%, f24 5%, f46 9%), so 85-95% pay a token byte ON TOP of
+the full 5-byte escape. The absolute stream IS compressible, but
+because zstd matches longer contexts than a 128-entry window sees —
+not because of short-range exact repeats. My reading of "byte-identical
+4-byte runs" was right about the compressibility and wrong about its
+range, and only the instrumented attempt could tell the difference.
+
+Standing lesson, now three-for-three in this codec (gain values,
+unified mode symbols, and both of these): zstd over a plainly-laid-out
+side stream beats hand-rolled entropy structure. The ONLY transform
+that has ever won on a side stream here is LAYOUT — band-major /
+plane-split — never re-coding. Recorded at the emission site so the
+fourth attempt reads it first.
+
+Reference density, also measured: 1,498 refs on frame 4, 2,947 on
+frame 24, 78 on frame 46, against 32,400 regions per frame — 0.2-9%,
+and decaying late in the GOP. That decay is worth chasing before any
+further entropy work: the dictionary is built from recon at dz32, so
+as the GOP progresses its entries are increasingly quantised copies of
+quantised copies, and matches fall below DICT_MARGIN. The remaining
+named lever (run-coding one reference across adjacent regions) attacks
+count, not price, and the count is what is collapsing.

@@ -1424,6 +1424,7 @@ pub fn encode_gop_v3_core(
         std::collections::HashMap::new();
     const DICT_MAX_CAND: usize = 24;
     const DICT_MARGIN: u32 = 512;
+    const MRU_CAP: usize = 128;
 
     for (fi, f) in frames.iter().enumerate() {
         let plate_pred = pred_for(fi);
@@ -1861,18 +1862,26 @@ pub fn encode_gop_v3_core(
                 }
             }
             side.extend_from_slice(&dict_flags);
-            // References stay ABSOLUTE, by measurement. Delta-coding
-            // them against the referring region's origin — the trick
-            // that won for motion vectors — LOST 6,002 bytes here, and
-            // for the reason already recorded at the gain-value site:
-            // exact repeats are LZ gold and deltas destroy them. Many
-            // regions cite the SAME source location (one tile of a
-            // repeated texture), so the absolute coordinate stream is
-            // full of byte-identical 4-byte runs that zstd matches,
-            // while the delta stream scatters them. Third time this
-            // codec has learned it; the general rule is that delta
-            // coding pays for piecewise-CONTINUOUS fields (motion) and
-            // loses for piecewise-CONSTANT ones (gains, references).
+            // References stay ABSOLUTE AND UNCODED. Two hand-rolled
+            // schemes were built and both LOST to plain coordinates
+            // through zstd:
+            //   delta vs the referring region's origin  +6,002 B
+            //   move-to-front MRU index (cap 128)       +2,518 B
+            // The MRU's own instrumentation explains the second and
+            // corrects the guess that motivated it: the exact
+            // (frame, x, y) triple repeats on only 5-15% of references
+            // per frame, so 85-95% pay a token byte on top of the full
+            // 5-byte escape. The absolute stream's compressibility is
+            // real but comes from zstd matching LONGER contexts than a
+            // 128-entry window sees, not from short-range exact repeats.
+            //
+            // Standing lesson, now three-for-three in this codec: zstd
+            // over a plainly-laid-out side stream beats hand-rolled
+            // entropy structure, and the only transform that has ever
+            // won here is LAYOUT (band-major / plane-split), never
+            // re-coding. Delta coding pays for piecewise-CONTINUOUS
+            // fields (motion) and loses for piecewise-CONSTANT ones
+            // (gains, references).
             for (d, x, y) in &dict_refs {
                 side.push(*d);
                 side.extend_from_slice(&x.to_le_bytes());
