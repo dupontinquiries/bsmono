@@ -61,6 +61,11 @@ pub const PUBLISH_EVERY_MS: u64 = crate::dht_announce::REANNOUNCE_MS;
 /// timeout of its own that reaches back here.
 pub const LOOKUP_TIMEOUT_MS: u64 = 60 * 1000;
 
+/// How many empty lookups before a node calls itself silent. Three: one is
+/// an offline contact, two is a quiet afternoon, three with nothing at all
+/// is a node that is not reaching the network.
+pub const SILENT_AFTER: u32 = 3;
+
 /// What the caller should do on this tick.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Plan {
@@ -85,6 +90,11 @@ pub struct Schedule {
     asked: Vec<(String, u64)>,
     /// The lookup currently in flight, and when it started.
     in_flight: Option<(String, u64)>,
+    /// Lookups that came back, and how many of those found anything.
+    answered: u32,
+    fruitful: u32,
+    /// Said once. A silent DHT is the failure mode this counts for.
+    reported_silent: bool,
 }
 
 impl Schedule {
@@ -146,15 +156,39 @@ impl Schedule {
         plan
     }
 
+    /// Has this node asked enough times, and heard nothing at all, that
+    /// something is wrong rather than unlucky?
+    ///
+    /// A DHT that finds nobody looks exactly like a DHT whose contacts are
+    /// all offline, and the difference matters enormously: one is a quiet
+    /// afternoon, the other is a node that cannot speak to the network it
+    /// bootstraps against. Nothing in the DHT reports the second, so it
+    /// has to be inferred, and the inference is this: several completed
+    /// lookups, none of which returned a single record.
+    ///
+    /// Reports ONCE. The condition stays true forever once it is met, and
+    /// a note re-set every lookup would sit on the page permanently.
+    pub fn silent(&mut self) -> bool {
+        if self.reported_silent || self.fruitful > 0 || self.answered < SILENT_AFTER {
+            return false;
+        }
+        self.reported_silent = true;
+        true
+    }
+
     /// A lookup came back — answered or empty, both end it.
     ///
     /// An empty result is NOT retried sooner than a found one. "Not in the
     /// DHT" is the common case for a contact who is simply offline, and
     /// retrying it faster would spend the most traffic on the peers least
     /// likely to appear.
-    pub fn finished(&mut self, sc_id: &str) {
+    pub fn finished(&mut self, sc_id: &str, found_any: bool) {
         if self.in_flight.as_ref().is_some_and(|(id, _)| id == sc_id) {
             self.in_flight = None;
+        }
+        self.answered = self.answered.saturating_add(1);
+        if found_any {
+            self.fruitful = self.fruitful.saturating_add(1);
         }
     }
 
@@ -189,7 +223,7 @@ mod tests {
         let c = ids(5);
         let first = s.tick(1_000, &c, false).resolve.expect("nothing was scheduled");
         assert_eq!(s.tick(1_100, &c, false).resolve, None, "a second went out concurrently");
-        s.finished(&first);
+        s.finished(&first, false);
         let second = s.tick(1_200, &c, false).resolve.expect("the rotation stalled");
         assert_ne!(second, first, "the same contact was asked twice in a row");
     }
@@ -203,7 +237,7 @@ mod tests {
         for _ in 0..4 {
             t += 100;
             let id = s.tick(t, &c, false).resolve.expect("the rotation stopped early");
-            s.finished(&id);
+            s.finished(&id, false);
             seen.push(id);
         }
         seen.sort();
@@ -248,10 +282,44 @@ mod tests {
         let mut s = Schedule::new();
         let c = vec!["sc-00000001".to_string()];
         let id = s.tick(0, &c, false).resolve.unwrap();
-        s.finished(&id);   // empty result: same call as a found one
+        s.finished(&id, false);   // empty result: same call as a found one
         assert_eq!(s.tick(LOOKUP_COOLDOWN_MS - 1, &c, false).resolve, None);
         assert_eq!(s.tick(LOOKUP_COOLDOWN_MS, &c, false).resolve.as_deref(),
                    Some("sc-00000001"));
+    }
+
+    #[test]
+    fn a_node_that_finds_nothing_at_all_eventually_says_so() {
+        // A DHT that finds nobody looks exactly like a DHT whose contacts
+        // are all offline. One is a quiet afternoon; the other is a node
+        // that cannot speak to the network it bootstraps against, and
+        // nothing in the DHT reports the difference.
+        let mut s = Schedule::new();
+        let c = ids(8);
+        let mut t = 0;
+        for _ in 0..SILENT_AFTER {
+            t += LOOKUP_COOLDOWN_MS;
+            let id = s.tick(t, &c, false).resolve.expect("rotation stalled");
+            assert!(!s.silent(), "called silent before enough evidence");
+            s.finished(&id, false);
+        }
+        assert!(s.silent(), "three empty lookups and still no word");
+        assert!(!s.silent(), "the warning repeats every lookup thereafter");
+    }
+
+    #[test]
+    fn one_successful_lookup_means_the_node_is_not_silent() {
+        // The point of the counter is to distinguish "nobody is online"
+        // from "we are not on the network". Finding anybody settles it.
+        let mut s = Schedule::new();
+        let c = ids(8);
+        let mut t = 0;
+        for i in 0..SILENT_AFTER {
+            t += LOOKUP_COOLDOWN_MS;
+            let id = s.tick(t, &c, false).resolve.expect("rotation stalled");
+            s.finished(&id, i == 0);
+        }
+        assert!(!s.silent(), "a node that found somebody reported itself unreachable");
     }
 
     #[test]

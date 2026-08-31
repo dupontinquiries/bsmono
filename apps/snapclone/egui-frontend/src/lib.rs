@@ -70,6 +70,7 @@ pub mod camera_enumerate;
 pub mod chevron_confirm;
 pub mod dht_announce;
 pub mod dht_bootstrap;
+pub mod dht_envelope;
 pub mod dht_presence;
 pub mod face_consent;
 pub mod frame_pump;
@@ -1365,7 +1366,7 @@ impl Snapclone {
                     // The lookup is over whether or not it found anything —
                     // an empty answer that never ends the lookup wedges the
                     // rotation on one id.
-                    self.dht_schedule.finished(&sc_id);
+                    self.dht_schedule.finished(&sc_id, !found.is_empty());
                     // ALL the records for this id, reduced once. Each is
                     // one address of a multi-address announcement (the C++
                     // publishes one value per address), so treating them as
@@ -1394,6 +1395,14 @@ impl Snapclone {
                             self.note_peer_addr(&sc_id, ip, best.punch_port, now_ms);
                             learned += 1;
                         }
+                    }
+                    // A NODE THAT NEVER FINDS ANYTHING should say so. It
+                    // looks identical to one whose contacts are simply
+                    // offline, and the two need very different responses.
+                    if self.dht_schedule.silent() {
+                        self.feed_note =
+                            "the DHT has answered nothing at all — this node may not be \
+                             reaching the bootstrap network".into();
                     }
                     if learned > 0 {
                         self.feed_note = format!("{sc_id} found via DHT");

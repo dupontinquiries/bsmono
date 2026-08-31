@@ -2651,6 +2651,7 @@ dependencies = [
  "egui",
  "peermux-core",
  "settings-kit",
+ "sha2",
  "share-kit",
  "snapclone-composer",
  "snapclone-location",

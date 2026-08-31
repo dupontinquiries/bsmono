@@ -34,6 +34,11 @@ snapclone-presence = { path = "../rust/snapclone-presence" }
 # For `NodeId` in identity::dht_node_id. The engine itself is reached
 # through snapclone-presence; this is the type only.
 snapcore = { path = "../../../shared/snapcore" }
+# SHA-256 for the DHT endpoint envelope. Already in this crate's lock as a
+# transitive dependency, so naming it directly does not move the lockfile —
+# and the Qt build's format is defined in terms of SHA-256, so matching it
+# byte for byte is not a place to substitute a different primitive.
+sha2 = "0.10"
 # Location freshness. Its opacity/presentation/last_seen_label are view
 # functions with no view; the wayfinder was drawing arrows without asking
 # whether the position behind them was worth pointing at.
