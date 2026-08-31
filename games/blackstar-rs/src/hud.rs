@@ -528,7 +528,7 @@ pub fn rows_h(n: usize) -> f32 {
     (1.44 / n.max(1) as f32).min(0.095)
 }
 pub const BIND_TOP: f32 = 0.76;
-pub const BIND_ROW_H: f32 = 0.058; // finger-sized; the list scrolls instead
+pub const BIND_ROW_H: f32 = 0.062; // finger-sized; the list scrolls instead
 pub const MAPS_TOP: f32 = 0.70;
 pub fn maps_row_h() -> f32 {
     // fixed: the map list scrolls rather than squeezing 30 rooms onto one page
@@ -861,7 +861,7 @@ pub fn garage_menu(
 /// functions, the new screens had no way to answer "which row is under the
 /// cursor" and mouse input silently did nothing on them.
 pub const LIST_TOP: f32 = 0.70;
-pub const TRIALS_ROW_H: f32 = 0.058;
+pub const TRIALS_ROW_H: f32 = 0.062;
 pub const ACADEMY_ROW_H: f32 = 0.062;
 pub const GARAGE_TOP: f32 = 0.66;
 /// the tall-window layout puts the rows lower, under the stage
@@ -1698,21 +1698,38 @@ mod tests {
     /// is what kept measuring the wrong thing.
     #[test]
     fn a_settings_row_of_text_fits_in_a_settings_row_of_space() {
+        // EVERY LIST SCREEN, not just the one a tester was sent to. Written as
+        // a table because checking them one at a time is how two got missed:
+        // CONTROLS and TRIALS were at 0.058 against a 0.0574 glyph — 1%
+        // clear, about a third of a pixel at 1080p. Not overlapping, but with
+        // no visible gap either, which reads as a block of text rather than a
+        // list. Both raised to 0.062, the pitch the other screens already use.
+        //
+        // `ui_k` clamps at 1.0, so T_BODY is the largest the text ever gets
+        // and these margins are the worst case rather than a typical one.
         let glyph = font::GH * T_BODY;
-        assert!(
-            glyph < TW_ROW_H,
-            "settings text is {glyph:.4} tall in a {TW_ROW_H:.4} row — rows overlap"
-        );
-        // and with enough margin to read as separate rows rather than a block.
-        // 8% is what it currently has; below that it is cramped even when it
-        // technically fits, which is the state the in-game HUD was in before
-        // anyone measured it.
-        assert!(
-            TW_ROW_H - glyph > TW_ROW_H * 0.05,
-            "settings rows clear by only {:.4} ({:.0}%) — legible but cramped",
-            TW_ROW_H - glyph,
-            (TW_ROW_H - glyph) / TW_ROW_H * 100.0
-        );
+        for (name, row_h) in [
+            ("SETTINGS", TW_ROW_H),
+            ("DECK", DECK_ROW_H),
+            ("CONTROLS", BIND_ROW_H),
+            ("TRIALS", TRIALS_ROW_H),
+            ("ACADEMY", ACADEMY_ROW_H),
+        ] {
+            assert!(
+                glyph < row_h,
+                "{name}: text is {glyph:.4} tall in a {row_h:.4} row — rows overlap"
+            );
+            // and with enough margin to read as separate rows rather than a
+            // block. Below this it is cramped even when it technically fits,
+            // which is the state the in-game HUD was in before anyone measured
+            // it.
+            assert!(
+                row_h - glyph > row_h * 0.05,
+                "{name}: rows clear by only {:.4} ({:.0}%) — legible but cramped",
+                row_h - glyph,
+                (row_h - glyph) / row_h * 100.0
+            );
+        }
         // the title has its own size and its own row: it must not reach the
         // first row's band either
         let title_glyph = font::GH * T_TITLE;

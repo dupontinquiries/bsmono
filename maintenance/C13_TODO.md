@@ -389,12 +389,19 @@ fade by distance, and its escalating perf safety-valve. Nothing started.
 `6d9475d2` fixed the in-game HUD and the `ui.rs` layout layer. The
 hand-placed screens still share the bug class:
 
-- **C13-7a — the SETTINGS screen is measured and fine.** Checked because
-  the playtest path sends a tester through it: `font::GH * T_BODY` is
-  0.0574 against a `TW_ROW_H` of 0.062, so a row of text fits a row of
-  space with 8% clear, and `hud::tests::a_settings_row_of_text_fits_in_a
-  _settings_row_of_space` holds it there. The remaining screens below are
-  still unmeasured.
+- **C13-7a — every LIST screen is now measured.** One table in
+  `hud::tests::a_settings_row_of_text_fits_in_a_settings_row_of_space`
+  covers settings, deck, controls, trials and academy: a row of text
+  (`font::GH * T_BODY` = 0.0574) must fit its row of space with 5% clear.
+  Two were failing that — **CONTROLS and TRIALS at 0.058, about 1% clear
+  or a third of a pixel at 1080p**. Not overlapping, but no visible gap
+  either, so the list read as a block. Both raised to 0.062.
+  `ui_k` clamps at 1.0, so these are worst-case margins.
+
+  What is still unmeasured is the screens that are NOT uniform lists —
+  the pause overlay, the garage and the map picker place labels at
+  hand-chosen coordinates, which is where the rasteriser is the right
+  tool and an inequality is not.
 
 - **C13-7a** — pause / garage / tweaks / academy / maps use `row_pair`
   at pitches authored for the wrong metric, and each has a mouse
