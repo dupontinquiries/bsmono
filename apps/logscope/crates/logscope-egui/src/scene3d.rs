@@ -5858,7 +5858,12 @@ fn build(palette_name: &str) -> Scene {
         "Yellow Brick Road" => oz(),
         "Frozen Bifrost" => bifrost(),
         "Titan's Ribcage" => titan_ribcage(),
-        _ => islands(),
+        // A procedural room, selected by name from the picker rather than by LOGSCOPE_ROOM. Checked
+        // BEFORE the fallback: otherwise every room name silently builds `islands()`.
+        other => match room_index(other) {
+            Some(i) => room_variant(i),
+            None => islands(),
+        },
     };
     // PHYSICAL UI — a scene-styled "context surface" set just outside the graph's footprint, facing it. The
     // material + stand match the world (wood board / stone tablet / glass pane / marble plaque). Start on the
@@ -5943,6 +5948,14 @@ fn debug_dump_labels(s: &Scene, theme: &str) {
 // broad without 24 bespoke builders. Select with LOGSCOPE_ROOM=<n>.
 pub const ROOM_COUNT: usize = 16;
 pub fn room_name(idx: usize) -> &'static str { ROOMS[idx % ROOMS.len()].0 }
+
+/// Look a procedural room up by name — the other half of putting rooms in the theme picker.
+///
+/// Without this the by-name scene dispatch below falls through to `islands()`, so selecting
+/// "Observatory" would have re-themed the chrome correctly and then built the WRONG ROOM. That is a
+/// worse failure than the incoherence it was meant to fix: the interface would be confidently
+/// describing a space you are not in.
+pub fn room_index(name: &str) -> Option<usize> { ROOMS.iter().position(|r| r.0 == name) }
 
 /// A room's colours, for deriving the interface chrome from the space (see `roomtheme`).
 ///

@@ -184,6 +184,28 @@ pub fn audit(room: RoomColors) -> RoomAudit {
     }
 }
 
+/// Every space the picker offers: the hand-authored palettes, then the procedural rooms.
+///
+/// One list, because the reference interface has one selector. A room and a palette are the same
+/// kind of thing from the operator's side — a place to be — and splitting them across a picker and
+/// an environment variable is why the rooms went unused.
+pub fn spaces() -> Vec<Palette> {
+    let mut v: Vec<Palette> = crate::theme::PALETTES.to_vec();
+    for i in 0..crate::scene3d::ROOM_COUNT {
+        let p = palette_for(crate::scene3d::room_colors(i));
+        // A room whose name collides with an authored palette would give the picker two entries
+        // that look identical and behave differently. The authored one wins; the room is dropped.
+        if !v.iter().any(|q| q.name == p.name) { v.push(p); }
+    }
+    v
+}
+
+/// Resolve a space by name, falling back to the first authored palette.
+pub fn by_name(name: &str) -> Palette {
+    spaces().into_iter().find(|p| p.name.eq_ignore_ascii_case(name))
+        .unwrap_or(crate::theme::PALETTES[0])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +266,44 @@ mod tests {
         assert!(luminance(dark.ink) > luminance(dark.bg), "dark room: light ink");
         assert!(luminance(pale.ink) < luminance(pale.bg), "pale room: dark ink");
         assert_eq!(dark.name, "Observatory", "the interface is labelled with where you are standing");
+    }
+
+    /// THE HAZARD THIS PAIRING CREATES. Putting rooms in the picker means a room name reaches the
+    /// scene dispatch, and that dispatch ends in `_ => islands()`. A room that re-themed the chrome
+    /// correctly and then built the generic fallback would be worse than the incoherence it
+    /// replaced: the interface would confidently describe a space you are not standing in.
+    #[test]
+    fn every_room_in_the_picker_resolves_to_its_own_room() {
+        for i in 0..scene3d::ROOM_COUNT {
+            let name = scene3d::room_name(i);
+            assert_eq!(scene3d::room_index(name), Some(i),
+                       "'{name}' is offered in the picker but the scene dispatch cannot find it");
+        }
+        // and a name that is neither a palette nor a room still resolves to something
+        assert_eq!(scene3d::room_index("Definitely Not A Room"), None);
+    }
+
+    /// One selector means one namespace. Two entries with the same label that behave differently is
+    /// the specific way a merged list goes wrong.
+    #[test]
+    fn the_space_list_has_no_duplicate_names() {
+        let all = spaces();
+        let mut names: Vec<&str> = all.iter().map(|p| p.name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "duplicate space names in the picker");
+        assert!(all.len() >= crate::theme::PALETTES.len() + 10,
+                "the rooms did not reach the list: {} entries", all.len());
+    }
+
+    #[test]
+    fn a_space_resolves_by_name_case_insensitively() {
+        assert_eq!(by_name("Observatory").name, "Observatory");
+        assert_eq!(by_name("observatory").name, "Observatory");
+        assert_eq!(by_name("Atlantis").name, "Atlantis");
+        // an unknown name falls back rather than panicking — this path is fed by an env var
+        assert_eq!(by_name("nonsense").name, crate::theme::PALETTES[0].name);
     }
 
     /// A room whose accent is nearly its own perimeter is the case that would silently produce

@@ -476,9 +476,10 @@ impl eframe::App for LogscopeApp {
                     // theme picker — live-switches the palette (Folding@home + the research-journal themes)
                     let cur = theme::active();
                     crate::ui::combo(ui, "hdr_theme", cur.name, 130.0, |ui| {
-                        for p in theme::PALETTES {
+                        // Authored palettes AND procedural rooms, one list — see `roomtheme::spaces`.
+                        for p in crate::roomtheme::spaces() {
                             if ui.selectable_label(cur.name == p.name, p.name).clicked() {
-                                theme::install_palette(ui.ctx(), *p);
+                                theme::install_palette(ui.ctx(), p);
                             }
                         }
                     });

@@ -20,7 +20,8 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             match std::env::var("LOGSCOPE_THEME").ok()
-                .and_then(|name| theme::PALETTES.iter().find(|p| p.name.eq_ignore_ascii_case(&name)).copied())
+                .and_then(|name| logscope_egui::roomtheme::spaces().into_iter()
+                    .find(|p| p.name.eq_ignore_ascii_case(&name)))
             {
                 Some(p) => theme::install_palette(&cc.egui_ctx, p),
                 None => theme::install(&cc.egui_ctx),
