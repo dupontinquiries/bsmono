@@ -33,18 +33,31 @@
 //! woke up will have its answer arrive during the NEXT query, and accepting
 //! it would attribute one peer's node list to a different target.
 //!
-//! ## What this does not do
+//! ## The write token, and where it had to live
 //!
-//! **`put` does not carry a token.** OpenDHT, like Kademlia generally,
-//! expects a `get` to hand back a token that the following `put` echoes, so
-//! a node cannot be used to spray writes at a third party it never talked
-//! to. The `Transport` trait has no place to thread one — `store` receives
-//! no prior state — so this sends zero, and a strict server may refuse the
-//! write. Threading the token means widening the trait, which touches every
-//! simulation that implements it; that is the next piece of work, and it is
-//! recorded here rather than left as a mystery when writes are refused.
+//! OpenDHT, like Kademlia generally, expects a `get` to hand back a token
+//! that the following `put` echoes, so a node cannot be used to spray
+//! writes at a third party it never talked to. A strict server refuses a
+//! `put` without one.
 //!
-//! It also does not `listen` or `refresh`. Values expire and are republished
+//! `Transport::store` receives no prior state, so the obvious fix is to
+//! widen the trait — and that touches every simulation implementing it, in
+//! five crates, to thread a value only one implementation can produce.
+//!
+//! The transport remembers it instead. Every accepted reply carries a
+//! token, and a `store` is always preceded by a lookup to the same peer
+//! (`snapclone-presence::publish` does `lookup_nodes` and then stores to
+//! each node it found) — so by the time a `put` goes out, that peer has
+//! just handed us one. The cache is keyed by ADDRESS, not node id, because
+//! the token authorises writes through a particular server rather than to a
+//! particular identity.
+//!
+//! Entries expire ([`TOKEN_TTL`]) and the map is capped, since a long
+//! session touches thousands of peers and a token from an hour ago is
+//! refused anyway — sending a stale one is the same outcome as sending
+//! none, at the cost of remembering it.
+//!
+//! What this still does not do: `listen` or `refresh`. Values expire and are republished
 //! by the caller's own schedule (`dht_presence` in the app), which is the
 //! coarser of the two mechanisms and the one that works without
 //! subscriptions.
@@ -67,9 +80,20 @@ pub const REPLY_TIMEOUT: Duration = Duration::from_millis(1_500);
 /// datagram cannot make us allocate.
 pub const MAX_DATAGRAM: usize = 8 * 1024;
 
+/// How long a write token is worth keeping. The reference rotates them on
+/// the order of minutes; past that a `put` echoing one is refused, which is
+/// the same outcome as sending none.
+pub const TOKEN_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// A ceiling on remembered tokens. A long session touches many peers, and
+/// this map must not become a record of every node ever contacted.
+pub const MAX_TOKENS: usize = 256;
+
 pub struct WireUdpTransport {
     sock: UdpSocket,
     me: NodeId,
+    /// Write tokens by peer ADDRESS — see the module note on why not by id.
+    tokens: std::sync::Mutex<std::collections::HashMap<SocketAddr, (u32, std::time::Instant)>>,
     /// Monotonic, wrapping. Only uniqueness within the timeout window
     /// matters, so wrapping is fine and a random start buys nothing here —
     /// this is not a spoofing defence, it is a "which question is this the
@@ -81,7 +105,11 @@ impl WireUdpTransport {
     pub fn bind(me: NodeId, addr: SocketAddr) -> std::io::Result<WireUdpTransport> {
         let sock = UdpSocket::bind(addr)?;
         sock.set_read_timeout(Some(REPLY_TIMEOUT))?;
-        Ok(WireUdpTransport { sock, me, tid: AtomicU32::new(1) })
+        Ok(WireUdpTransport {
+            sock, me,
+            tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            tid: AtomicU32::new(1),
+        })
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -132,12 +160,48 @@ impl WireUdpTransport {
                 // declined — but there is nothing in it for a `Transport`
                 // method to return, so it ends the wait like a timeout.
                 Msg::Error { tid: got, .. } if got == tid => return None,
-                Msg::Reply { tid: got, .. } | Msg::Push { tid: got, .. } if got == tid => {
+                Msg::Reply { tid: got, token, .. } if got == tid => {
+                    self.remember_token(from, token);
                     return Some(reply);
                 }
+                Msg::Push { tid: got, .. } if got == tid => return Some(reply),
                 // Somebody else's business, or ours from a while ago.
                 _ => continue,
             }
+        }
+    }
+
+    fn remember_token(&self, from: SocketAddr, token: u32) {
+        // Zero means the peer sent none. Storing it would evict a real one
+        // for the same address on the next reply.
+        if token == 0 {
+            return;
+        }
+        let Ok(mut m) = self.tokens.lock() else { return };
+        if m.len() >= MAX_TOKENS && !m.contains_key(&from) {
+            // Drop expired entries first; only if that frees nothing does
+            // anything current go. Evicting a live token to make room for
+            // another is how a `put` loses the authorisation it just
+            // earned.
+            let now = std::time::Instant::now();
+            m.retain(|_, (_, at)| now.duration_since(*at) < TOKEN_TTL);
+            if m.len() >= MAX_TOKENS {
+                if let Some(oldest) = m.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| *k) {
+                    m.remove(&oldest);
+                }
+            }
+        }
+        m.insert(from, (token, std::time::Instant::now()));
+    }
+
+    /// The token this peer last gave us, if it is still fresh. Zero means
+    /// "we have none" — which is what an unauthorised `put` looks like, and
+    /// the honest thing to send when there is nothing better.
+    fn token_for(&self, addr: SocketAddr) -> u32 {
+        let Ok(m) = self.tokens.lock() else { return 0 };
+        match m.get(&addr) {
+            Some((t, at)) if at.elapsed() < TOKEN_TTL => *t,
+            _ => 0,
         }
     }
 
@@ -203,7 +267,11 @@ impl Transport for WireUdpTransport {
         // holds a SET per key, and a fresh random id every hour would fill
         // it with copies of us.
         let id = fnv1a(&value);
-        let (tid, msg) = self.query(Query::Put, &key, Some(Value { id, data: value }));
+        let (tid, mut msg) = self.query(Query::Put, &key, Some(Value { id, data: value }));
+        // The token this peer handed us during the lookup that found it.
+        if let Msg::Query { token, .. } = &mut msg {
+            *token = self.token_for(to.addr);
+        }
         // Fire and forget: `store` returns nothing, so there is no way to
         // report a refusal, and see the module note on the missing token.
         let _ = self.round_trip(to, tid, &msg);
@@ -354,6 +422,85 @@ mod tests {
         assert!(t.find_node(&contact(addr), &contact(addr), &id(2)).is_empty(),
                 "a stale reply was accepted as this query's answer");
         h.join().unwrap();
+    }
+
+    #[test]
+    fn a_put_echoes_the_token_the_peer_gave_during_the_lookup() {
+        // A strict OpenDHT node refuses a write with no token. `store` gets
+        // no prior state, so the transport has to have remembered it —
+        // which it can, because a store is always preceded by a lookup to
+        // the same peer.
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let addr = sock.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let s2 = seen.clone();
+        let h = std::thread::spawn(move || {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            // 1. the find, answered with a token
+            let (n, from) = sock.recv_from(&mut buf).expect("no find");
+            let Some(Msg::Query { tid, .. }) = Msg::decode(&buf[..n]) else { panic!() };
+            let reply = Msg::Reply { tid, from: dht_kit::InfoHash([3u8; 20]),
+                nodes: vec![], values: vec![], token: 0xABCD };
+            sock.send_to(&reply.encode(), from).ok();
+            // 2. the put that follows it
+            let (n, from2) = sock.recv_from(&mut buf).expect("no put");
+            if let Some(Msg::Query { tid, token, .. }) = Msg::decode(&buf[..n]) {
+                *s2.lock().unwrap() = Some(token);
+                let ack = Msg::Reply { tid, from: dht_kit::InfoHash([3u8; 20]),
+                    nodes: vec![], values: vec![], token: 0xABCD };
+                sock.send_to(&ack.encode(), from2).ok();
+            }
+        });
+        let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let c = contact(addr);
+        t.find_node(&c, &c, &id(2));
+        t.store(&c, &c, id(2), b"record".to_vec(), 3600);
+        h.join().unwrap();
+        assert_eq!(*seen.lock().unwrap(), Some(0xABCD),
+                   "the put went out unauthorised despite a token in hand");
+    }
+
+    #[test]
+    fn a_put_to_a_peer_we_have_not_spoken_to_sends_no_token_rather_than_a_wrong_one() {
+        // Zero is what "we have none" looks like on the wire. Sending
+        // another peer's token would be worse than sending nothing: refused
+        // just the same, and indistinguishable from a bug at the far end.
+        let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let a: SocketAddr = "10.0.0.1:4222".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:4222".parse().unwrap();
+        t.remember_token(a, 0x1234);
+        assert_eq!(t.token_for(a), 0x1234);
+        assert_eq!(t.token_for(b), 0, "one peer's token was offered to another");
+    }
+
+    #[test]
+    fn a_token_of_zero_does_not_evict_a_real_one() {
+        // A peer that sends no token must not wipe the one it sent a moment
+        // ago, or every reply without one costs the write that follows.
+        let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let a: SocketAddr = "10.0.0.1:4222".parse().unwrap();
+        t.remember_token(a, 0x1234);
+        t.remember_token(a, 0);
+        assert_eq!(t.token_for(a), 0x1234);
+    }
+
+    #[test]
+    fn the_token_cache_is_bounded_and_keeps_what_is_current() {
+        // A long session touches many peers; this map must not become a
+        // record of every node ever contacted. Evicting a LIVE token to
+        // make room is how a put loses the authorisation it just earned, so
+        // the oldest goes rather than the newest.
+        let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
+        for i in 0..(MAX_TOKENS + 20) {
+            let a: SocketAddr = format!("10.0.{}.{}:4222", i / 256, i % 256).parse().unwrap();
+            t.remember_token(a, (i as u32) + 1);
+        }
+        let n = t.tokens.lock().unwrap().len();
+        assert!(n <= MAX_TOKENS, "the cache grew to {n}");
+        let newest: SocketAddr = format!("10.0.{}.{}:4222",
+            (MAX_TOKENS + 19) / 256, (MAX_TOKENS + 19) % 256).parse().unwrap();
+        assert_ne!(t.token_for(newest), 0, "the most recent token was evicted");
     }
 
     #[test]
