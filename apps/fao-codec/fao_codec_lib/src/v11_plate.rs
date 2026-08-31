@@ -1796,6 +1796,76 @@ pub fn encode_gop_v3_core(
         }
         let mode_bytes = zstd::encode_all(side.as_slice(), 19).map(|c| c.len()).unwrap_or(side.len());
 
+        // ── MOTION-ADAPTIVE RATE ALLOCATION (FAO_DZ_MOTION).
+        //
+        // Conventional allocation spends bits where distortion is high,
+        // which on this material means the motion shots. The inversion:
+        // in a LOW-motion region the residual is small and highly
+        // compressible, so buying fidelity there is cheap; in a
+        // high-motion region the residual is large, expensive, AND
+        // perceptually masked by the motion itself. So push the dead
+        // zone DOWN where the picture is still and UP where it moves.
+        //
+        // The activity measure is the PREDICTION'S OWN ERROR — SAD of
+        // the composite against the target per region — not raw frame
+        // difference. That distinction matters: a region can move a lot
+        // and still be predicted perfectly (a panning background under
+        // an accurate plate), and it should count as still, because
+        // what allocation cares about is what the region COSTS, not how
+        // fast it moves. Normalised by the frame's MEDIAN region, so the
+        // map is scale-free and one setting travels across shots.
+        //
+        // Encoder-only, no wire or decoder change (the dead zone never
+        // reaches the decoder), so this is free to try and free to drop.
+        let dz_map = {
+            let strength: f32 = std::env::var("FAO_DZ_MOTION")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0);
+            if strength == 0.0 {
+                None
+            } else {
+                let mut act = vec![0f32; gw * gh];
+                for gy in 0..gh {
+                    for gx in 0..gw {
+                        act[gy * gw + gx] = sad_region(
+                            &composite.y, fw, fh,
+                            (gx * REGION) as i32, (gy * REGION) as i32,
+                            &f.y, gx * REGION, gy * REGION,
+                        ) as f32;
+                    }
+                }
+                let mut sorted = act.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let med = sorted[sorted.len() / 2].max(1.0);
+                let (bw4, bh4) = (fw / 4, fh / 4);
+                let mut map = vec![1.0f32; bw4 * bh4];
+                for by4 in 0..bh4 {
+                    for bx4 in 0..bw4 {
+                        let gx = ((bx4 * 4) / REGION).min(gw - 1);
+                        let gy = ((by4 * 4) / REGION).min(gh - 1);
+                        let r = (act[gy * gw + gx] / med).clamp(0.25, 4.0);
+                        let v = (1.0 - strength.abs()) + strength.abs() * r;
+                        // NEGATIVE strength = coarsen-only: busy regions
+                        // get a wider dead zone, quiet ones stay at the
+                        // global setting instead of being refined. Both
+                        // halves are worth separating because they are
+                        // different claims — "motion masks error" (this
+                        // one) and "quiet detail is cheap" (the other) —
+                        // and the symmetric version measured worse than
+                        // simply raising the global dead zone.
+                        map[by4 * bw4 + bx4] = if strength < 0.0 { v.max(1.0) } else { v };
+                    }
+                }
+                Some(std::sync::Arc::new(map))
+            }
+        };
+        let frame_opts = if dz_map.is_some() {
+            ResidualOpts { dz_map, ..opts.clone() }
+        } else {
+            opts.clone()
+        };
+        let opts = &frame_opts;
         let p444 = interleave_444(&composite);
         let t444 = interleave_444(f);
         let (residual_bytes, rec) = match residual::encode(&p444, &t444, fw, fh, opts) {

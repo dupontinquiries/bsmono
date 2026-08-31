@@ -4206,3 +4206,58 @@ time for instant preview, with the residual simply skipped in edited
 regions; the re-encode above is what turns that preview into a final
 at full fidelity. Preview and commit are the same pipeline at two
 residual settings, not two systems.
+
+### Motion-adaptive rate allocation (user proposal): built, measured, OFF by default
+
+Proposal: spend residual bits where there is LESS motion, because
+residuals are cheap there, and lean on prediction where there is more.
+Built as a per-4x4-block multiplier on the dead zone (ResidualOpts
+::dz_map). Encoder-only by construction — the dead zone never reaches
+the decoder — so spatially varying allocation costs nothing on the
+wire and needs no format change. Activity is the PREDICTION'S error
+per region, not raw frame difference: a panning background under an
+accurate plate moves a lot and costs nothing, and allocation should
+care what a region COSTS, not how fast it moves.
+
+Measured on w1 (store shot, 48f, --static):
+  plain dz40                    427,043 B @ 37.921 dB
+  plain dz56                    373,650 B @ 37.066
+  plain dz64                    355,283 B @ 36.773
+  dz40 + adaptive s=0.5         346,500 B @ 36.360
+  dz40 + adaptive s=1.0         427,327 B @ 35.637   (worse on BOTH)
+Matched-quality read: interpolating the plain ladder (62.7 KB/dB
+between dz56 and dz64) to 36.360 dB gives ~329 KB, against the
+adaptive path's 346.5 KB — so adaptive allocation is roughly 5% WORSE
+than simply raising the global dead zone. s=1.0 is worse on both axes
+because refining the quiet regions costs more than coarsening the busy
+ones saves.
+
+Two findings behind the negative, the second a bug in my own
+instrumentation rather than in the idea:
+
+1. The coarsen-only variant (negative strength: widen the dead zone on
+   busy regions, leave quiet ones at the global setting) returned
+   BYTE-IDENTICAL output to the symmetric one at the same magnitude —
+   346,500 @ 36.359770 both. That can only happen if almost no block
+   fell below the multiplier's 1.0 line, which means
+2. THE NORMALISER IS WRONG. Activity is divided by the frame's MEDIAN
+   region, and under an accurate plate most regions are near-zero
+   error, so the median sits near the floor and act/med >= 1 almost
+   everywhere. The map is therefore nearly one-sided already and the
+   "spend more where it is quiet" half of the proposal was never
+   actually exercised. The measurement above is a fair test of
+   "coarsen the busy", NOT of the user's actual claim.
+
+So this is not yet a verdict on the idea. What it needs before being
+judged: a normaliser that spreads the distribution (mean, or a
+percentile pair, or rank-based), and a matched-quality sweep rather
+than a single operating point. Kept behind FAO_DZ_MOTION, default 0.0
+(off), machinery and the honest half-measurement recorded here.
+
+Worth noting for the roadmap the user sketched alongside it — "treat
+motion as keyframes, log only the ones that change something" — the
+mover layer's sprite is exactly a per-object keyframe today, captured
+once at ref_frame and reused. Event-driven RE-capture (emit a new
+sprite only when tracking error says the object changed) is the
+natural next construction and is what would lift the rigid-sprite
+limit that the scene-editing work ran into. Not built.
