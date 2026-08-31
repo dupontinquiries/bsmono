@@ -984,11 +984,61 @@ pub fn save_plate(plate: &Plate, path: &str) -> std::io::Result<()> {
     raw.extend_from_slice(&plate.u);
     raw.extend_from_slice(&plate.v);
     let z = zstd::encode_all(raw.as_slice(), 19)?;
+    // Canonicals on disk are the CITATION CURRENCY — the thing a
+    // library ships once and many takes cite — so they get the same
+    // DCT coding as in-stream plates, at the reference-grade dead
+    // zone (dz 4 = the frame default 32 / 8, the swept knee). Format:
+    // [magic "FAOP2"][w][h][ox][oy][coded payload]; falls back to the
+    // legacy raw-zstd file when the transform doesn't win, and
+    // load_plate sniffs the magic so old canonicals still load.
+    let opts = residual::ResidualOpts { dead_zone: 4.0, ..Default::default() };
+    let gray = vec![128u8; plate.w * plate.h * 3];
+    let mut p444 = Vec::with_capacity(plate.w * plate.h * 3);
+    for y in 0..plate.h {
+        for x in 0..plate.w {
+            p444.push(plate.y[y * plate.w + x]);
+            p444.push(plate.u[(y / 2) * (plate.w / 2) + x / 2]);
+            p444.push(plate.v[(y / 2) * (plate.w / 2) + x / 2]);
+        }
+    }
+    if let Some(t) = residual::encode(&gray, &p444, plate.w, plate.h, &opts) {
+        if t.len() + 21 < z.len() {
+            let mut out = Vec::with_capacity(t.len() + 21);
+            out.extend_from_slice(b"FAOP2");
+            out.extend_from_slice(&(plate.w as u32).to_le_bytes());
+            out.extend_from_slice(&(plate.h as u32).to_le_bytes());
+            out.extend_from_slice(&plate.ox.to_le_bytes());
+            out.extend_from_slice(&plate.oy.to_le_bytes());
+            out.extend_from_slice(&t);
+            return std::fs::write(path, out);
+        }
+    }
     std::fs::write(path, z)
 }
 
 pub fn load_plate(path: &str) -> std::io::Result<Plate> {
     let z = std::fs::read(path)?;
+    if z.len() > 21 && &z[..5] == b"FAOP2" {
+        let rd_u32 = |o: usize| u32::from_le_bytes([z[o], z[o + 1], z[o + 2], z[o + 3]]);
+        let rd_f32 = |o: usize| f32::from_le_bytes([z[o], z[o + 1], z[o + 2], z[o + 3]]);
+        let (w, h) = (rd_u32(5) as usize, rd_u32(9) as usize);
+        let (ox, oy) = (rd_f32(13), rd_f32(17));
+        let gray = vec![128u8; w * h * 3];
+        let dec = residual::apply(gray, &z[21..], w, h);
+        let (mut yp, mut up, mut vp) = (vec![0u8; w * h], vec![0u8; (w / 2) * (h / 2)], vec![0u8; (w / 2) * (h / 2)]);
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 3;
+                yp[y * w + x] = dec[i];
+                if y % 2 == 0 && x % 2 == 0 {
+                    let ci = (y / 2) * (w / 2) + x / 2;
+                    up[ci] = dec[i + 1];
+                    vp[ci] = dec[i + 2];
+                }
+            }
+        }
+        return Ok(Plate { w, h, ox, oy, y: yp, u: up, v: vp });
+    }
     let raw = zstd::decode_all(z.as_slice())?;
     let rd_u32 = |o: usize| u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]);
     let rd_f32 = |o: usize| f32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]);

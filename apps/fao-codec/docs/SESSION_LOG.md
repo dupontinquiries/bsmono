@@ -3629,3 +3629,37 @@ Two findings from the byte-split diagnostic, in order of size.
    economics the whole 3D/library arc depends on.
 
 Session ladder: 46.5× @ −2.00 dB → 21.2× @ +0.25 dB.
+
+### Citation economics re-measured against the cheap-plate codec — the win is GONE
+
+Canonicals on disk now use the same DCT coding as in-stream plates
+(save_plate writes "FAOP2" + coded payload at reference-grade dz 4;
+load_plate sniffs the magic, legacy raw-zstd files still load). The
+fused store canonical dropped 554,090 → 147,157 B (3.8×).
+
+Then the pair arithmetic, matched quality (cited swept dz 32/26/22,
+interpolated to each take's self-coded PSNR):
+  w1: self 496,558 @ 38.52 dB | cited ≈ 502,527  (+1.2%)
+  w2: self 568,055 @ 37.24 dB | cited ≈ 575,024  (+1.2%)
+  pair self 1,064,613 B vs cited+canonical 1,224,708 B  (+15.0%)
+→ NO break-even at any number of takes: citation now loses ~1.2% PER
+TAKE before the canonical is even counted.
+
+Why the earlier −14.4% evaporated: that measurement was taken when
+self-coding paid ~570 KB for its own raw-zstd plate. Cheap plates
+cut the self-coder's price by the same 7× they cut the canonical's,
+and the self-plate is a PERFECT fit to its own take while the shared
+canonical is not. Improving the plate codec strengthened the
+baseline more than the citation branch — the honest reading is that
+the previous citation win was substantially an artifact of an
+inefficient plate representation, not evidence for the library
+thesis on this material.
+
+What survives, precisely: citation still needs cross-take content
+that a take's own plate CANNOT supply. On locked film takes with
+grain decorrelation, that surplus is negative. The regimes where the
+thesis can still pay are unchanged but now strictly narrower —
+engine-exact canonicals (no grain, exact reuse), and libraries where
+a take sees content it never shot. Recorded as a NEGATIVE against
+this clip: the mover-layer and fusion machinery stand, the measured
+economic case on film does not.
