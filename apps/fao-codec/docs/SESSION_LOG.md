@@ -5830,3 +5830,51 @@ bytes at a metric that now charges for the artifact the codec produces,
 from two constant retunes and a filter, with no new coding tools. Both
 retuned constants had been set with PSNR, which is the whole point —
 this 6% was not bought, it was recovered from measurement error.
+
+### The mode-decision gates, swept for the first time: 64/96 -> 32/48
+
+The last two constants sitting in EVERY encode and never measured. A
+region leaves plate mode for prev-MC only if prev beats plate by more
+than prev_gate; it goes intra only if intra beats the best temporal
+predictor by more than intra_gate. Both exist so grain noise cannot
+dither a region into a mode that costs side bytes, and both values were
+written by hand.
+
+  prev gate, film w1 (dz32, MS-SSIM)
+    0    448,981  0.97724
+    32   448,036  0.97726   <- interior optimum
+    64   449,872  0.97721   (previous default)
+    128  448,883  0.97715
+    256  450,898  0.97698
+  intra gate, film w1
+    0    442,599  0.97731
+    48   440,657  0.97739   <- interior optimum
+    96   449,872  0.97721   (previous default)
+    192  465,163  0.97673
+    384  475,349  0.97612
+
+Both winners are INTERIOR — neighbours worse on each side — so the
+edge-of-grid failure that forced the PLATE_DZ_DIV correction does not
+apply here. Both are strictly better than the hand-written value on
+film: fewer bytes AND higher MS-SSIM.
+
+Cross-checked on blackstar: prev=32 is also strictly better there
+(-1.4 KB, +0.00002); intra=48 is a trade rather than a win (+1.7 KB for
++0.00011 = 15,818 KB per MS-SSIM point against that clip's ladder at
+~24,066, so it buys quality more cheaply than lowering dz would).
+
+Combined on film: 442,053 B @ 0.97746 against the previous default's
+449,872 @ 0.97721 — -1.7% bytes and +0.00025 MS-SSIM together, and both
+gates contribute (the pair beats either alone). Suite 97/0.
+
+The intra gate is the interesting one: at 96 it was suppressing intra
+so hard that raising it further cost 5.7% MORE bytes by 384, i.e. the
+gate was on the steep side of its own curve and pointed the wrong way.
+Halving it recovered 2% of the file. That the hand-written value sat
+near a steep gradient rather than in a flat basin is the argument for
+sweeping the rest: a constant nobody measured is not merely unverified,
+it is uniformly likely to be anywhere on the curve.
+
+Constants scoreboard, now six deep: MV rate charge, DICT_MARGIN, mover
+admission gate, PLATE_DZ_DIV, prev gate and intra gate all measured
+wrong; REGION=16 and deblock-strength-2 the only survivors.

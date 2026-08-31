@@ -1898,6 +1898,36 @@ pub fn encode_gop_v3_core(
     // y u16) against a 256-pixel block, so the gate must clear it with
     // room. DICT_MARGIN is the probe's own STRONG threshold rather than
     // a tuned number — that is the level the measurement validated.
+    // MODE-DECISION GATES, never swept until now. Both are in every
+    // encode: a region only leaves plate mode for prev-MC if prev beats
+    // plate by more than prev_gate, and only goes intra if intra beats
+    // the best temporal predictor by more than intra_gate. They exist
+    // so grain noise cannot dither a region into a mode that costs side
+    // bytes, and the values were written by hand rather than measured.
+    // Swept (MS-SSIM, dz32, two content types), interior winners:
+    //   prev gate,  film:  0 448,981/0.97724 | 32 448,036/0.97726
+    //                     | 64 449,872/0.97721 | 128 448,883/0.97715
+    //                     | 256 450,898/0.97698
+    //   intra gate, film:  0 442,599/0.97731 | 48 440,657/0.97739
+    //                     | 96 449,872/0.97721 | 192 465,163/0.97673
+    //                     | 384 475,349/0.97612
+    // 32 and 48 are both interior optima (the neighbours on each side
+    // are worse), and both are STRICTLY BETTER than the hand-written
+    // 64/96 on film — fewer bytes AND higher MS-SSIM.
+    //
+    // Cross-checked on blackstar, where prev=32 is also strictly better
+    // (-1.4 KB, +0.00002) and intra=48 is a TRADE rather than a win
+    // (+1.7 KB for +0.00011, i.e. 15,818 KB per MS-SSIM point against
+    // that clip's ladder at ~24,066 — buying quality more cheaply than
+    // lowering dz would, so still worth taking).
+    let prev_gate: u32 = std::env::var("FAO_PREV_GATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
+    let intra_gate: u32 = std::env::var("FAO_INTRA_GATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(48);
     let use_dict = std::env::var("FAO_DICT").is_ok();
     let mut dict: std::collections::HashMap<u32, Vec<(usize, usize, usize)>> =
         std::collections::HashMap::new();
@@ -1984,7 +2014,7 @@ pub fn encode_gop_v3_core(
                     let forced = force_plate
                         .map(|m| m[fi][gy * gw + gx])
                         .unwrap_or(false);
-                    if !forced && sad_prev + 64 < sad_plate {
+                    if !forced && sad_prev + prev_gate < sad_plate {
                         if std::env::var("FAO_MV_DEBUG").is_ok() {
                             let sat = MV_RANGE * 4; // qpel units at the clamp
                             if (mv.0 as i32).abs() >= sat - 4 || (mv.1 as i32).abs() >= sat - 4 {
@@ -2081,7 +2111,7 @@ pub fn encode_gop_v3_core(
                         }
                         let sad_intra = sad_intra.min(sad_planar);
                         let best_temporal = sad_plate.min(sad_prev);
-                        if sad_intra + 96 < best_temporal {
+                        if sad_intra + intra_gate < best_temporal {
                             if modes[gy * gw + gx] == 1 {
                                 // un-choose prev: retract its mv
                                 mvs.pop();
