@@ -8261,6 +8261,31 @@ if let Some(msg) = self.error_banner.clone() {
                             }
                         }
                         RightPage::Context => {
+                            // ACTIVE THREAD, pinned above everything else on this page. The status
+                            // line already says what the last turn did, and is overwritten by the
+                            // next one — for an unattended run left going for an hour, "what is it
+                            // doing and how long has it been" needs a fixed place to be answered.
+                            // Rows rather than a sentence: see `runcard`.
+                            if let Some(card) = self.agent_run.as_ref().map(|r| r.card()) {
+                                egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8),
+                                    inner_margin: egui::Margin::same(theme::PAD_SM),
+                                    outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() },
+                                    stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new("ACTIVE THREAD").color(theme::DIM()).small().strong());
+                                    for (label, value) in crate::runcard::rows(&card) {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(label).color(theme::FAINT()).small());
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(RichText::new(value).color(theme::INK()).small());
+                                            });
+                                        });
+                                    }
+                                });
+                                // The elapsed row ticks; without this it only advances when
+                                // something else asks for a frame.
+                                ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+                            }
                             // The physical PARAMS panel (dials + backend/persona/model selectors, in the
                             // spatial scene) is now the primary place for these controls. When it's active
                             // don't duplicate them here — a slider changed in two places at once is a bug

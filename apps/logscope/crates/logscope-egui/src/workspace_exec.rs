@@ -2680,6 +2680,10 @@ pub struct AgentRun {
     /// Turns elided by transcript compaction so far. Surfaced so "the model forgot" has an answer
     /// other than a guess.
     compacted: usize,
+    /// What was asked, and when. Neither was kept: the task went into the prompt and was gone, so
+    /// nothing could answer "what is this run doing" without reading the transcript back.
+    task: String,
+    started: std::time::Instant,
 }
 
 impl AgentRun {
@@ -2710,6 +2714,8 @@ impl AgentRun {
             had_verifier,
             guide,
             compacted: 0,
+            task: task.to_string(),
+            started: std::time::Instant::now(),
         };
         (run, prompt)
     }
@@ -2776,6 +2782,29 @@ impl AgentRun {
 
     pub fn events(&self) -> &[FileEvent] { self.ws.events() }
     pub fn plan(&self) -> &Plan { &self.plan }
+
+    /// A snapshot for the ACTIVE THREAD card — see `runcard`.
+    ///
+    /// A plain-data struct rather than a formatted string, so the card's rules (blocked outranks
+    /// progress, an unbounded run shows a count not a ratio) are tested without starting a run.
+    pub fn card(&self) -> crate::runcard::RunState {
+        let (done, total) = self.plan.progress();
+        crate::runcard::RunState {
+            task: self.task.clone(),
+            phase: self.phase(),
+            turns: self.turns,
+            max_turns: self.cfg.max_steps,
+            compacted: self.compacted,
+            plan_done: done,
+            plan_total: total,
+            verified: self.verified,
+            // "blocked" is the phase machine's own label, not a separate flag — asking the Guide
+            // for a boolean it does not have would be inventing a second source of truth for the
+            // same fact.
+            blocked: self.phase() == Some("blocked"),
+            elapsed_secs: self.started.elapsed().as_secs(),
+        }
+    }
     pub fn verified(&self) -> bool { self.verified }
     /// Was a verify command configured at all?
     ///
