@@ -4974,3 +4974,71 @@ and cinema() already derives a camera, so the pieces exist) dumped
 behind a debug path. That is a blackstar-rs change, not a codec one,
 and it is the remaining step between this seam and a real
 engine-derived measurement on real footage.
+
+### The procedural-surface case (user proposal): FAO BEATS AV1, for the first time on synthetic content
+
+User's case: a game draws its ground as a surface plus a closed-form
+pattern (value noise / fBm / a tiling function). Camera motion turns
+that into full-frame high-frequency change every frame, while the shot's
+TRUE description length is a seed, a few parameters and a camera path.
+bin/ground_lab builds exactly that: fBm value noise on the y=0 plane,
+pinhole camera translating forward and yawing, 48 frames at 640x384.
+
+Circularity caught again and fixed the same way: rendering the footage
+from the same function at the same camera gives 99 dB at 2,904 B, which
+measures only that the renderer is deterministic. The footage now
+carries props the canonical cannot know (solid markers at fixed world
+positions, projected per frame) and a photometric drift standing for
+lighting and post — both injected into the FOOTAGE ONLY.
+
+Measured, dz32, 48 frames:
+
+  v11 2D plate                227,533 B @ 29.939 dB  (plate 25,075 B)
+  v11 no model (prev-MC)      278,108 B @ 29.855 dB
+  v11 PROCEDURAL canonical     58,556 B @ 40.046 dB  (24 B model +
+                                                      24 B/frame camera)
+  control, right function
+    but WRONG camera          209,449 B @ 29.904 dB
+  AV1 crf35                   146,887 B @ 42.785 dB
+  AV1 crf45                    76,323 B @ 39.247 dB
+  AV1 crf55                    36,911 B @ 35.767 dB
+
+At matched quality (~40 dB) v11-procedural is 58,556 B against AV1
+crf45's 76,323 B at 39.25 dB — **23% FEWER BYTES AND +0.8 dB**. This is
+the first time in this codebase that FAO beats AV1 on any content at
+matched quality, and the margin is understated: the model's 24 bytes
+are charged in full with no amortisation, and the camera stream is
+charged at a lazy 24 B/frame that any real coder would delta-code to
+almost nothing.
+
+The user's intuition about the conventional coder is confirmed but the
+mechanism is worth stating precisely: AV1 does not "panic". It codes
+the noise competently and expensively, because motion compensation
+cannot help — the ground is a STATIC pattern seen through a MOVING
+perspective, so every block's content is a resampled, rescaled version
+of content that has no matching block anywhere in the previous frame.
+Near ground sweeps past, far ground barely moves, and no translational
+MV fits both.
+
+That same fact is why the codec's OWN 2D plate fails here — 227,533 B,
+barely better than having no model at all (278,108 B), and the plate is
+25 KB of pure overhead. Perspective ground motion is not a translation,
+which is the identical limitation that killed cross-GOP citation on
+blackstar. So this case does not merely favour FAO; it separates FAO's
+two branches cleanly: the 2D plate is worthless and the parameterised
+3D surface is decisive.
+
+The wrong-camera control (209,449 B @ 29.904) is what makes the win
+attributable: the right function at the wrong pose is no better than no
+model, so the value is in the camera path being correct, not in having
+a noise generator available.
+
+ARCHITECTURAL CONSEQUENCE, and this is the part that changes the
+roadmap: the canonical here is NOT A MESH. Tessellating a ground plane
+finely enough to carry pixel-rate noise needs roughly a vertex per
+pixel, which discards the entire saving. engine_scene.rs currently
+carries geometry only, so it cannot express this case at all. The
+canonical type has to widen from "mesh" to "mesh OR parameterised
+surface", i.e. the engine hands over a SHADER IDENTITY plus parameters
+and the decoder evaluates it. That is a wire-format decision to take
+deliberately, and this measurement is the argument for taking it.
