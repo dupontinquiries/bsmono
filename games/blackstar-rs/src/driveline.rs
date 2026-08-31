@@ -115,7 +115,7 @@ fn apply_traits(out: &mut Handling, s: &Shape) {
 /// Multipliers applied over the player's `CarCfg`. 1.0 is "the car the
 /// engine has always had", so a chassis nobody measured behaves exactly as
 /// it did before this module existed.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Handling {
     pub accel: f32,
     pub top_speed: f32,

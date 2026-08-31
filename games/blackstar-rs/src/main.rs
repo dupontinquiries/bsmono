@@ -2624,6 +2624,13 @@ impl Game {
                 // silently does nothing outside flight -- same as PitchUp/
                 // PitchDown, a player who never flies never hits this branch
             }
+            Action::SiegeMode => {
+                if self.car.tracked {
+                    self.car.siege_mode = self.car.siege_mode.cycle();
+                    self.car.recompute_hand();
+                    self.toastf(&format!("TANK MODE: {}", self.car.siege_mode.label()));
+                }
+            }
             Action::Fire => self.fire_weapon(),
             Action::CycleForm => {
                 if self.wep.watch.cycle() {
@@ -2811,23 +2818,26 @@ impl Game {
         let traits = self.bot_categories.get(self.cars.names[m])
             .map(|c| crate::chassis_traits::Traits::from_category(c))
             .unwrap_or_default();
+        let tracked = self.cars.models[m].fittings.tracked();
         self.car.hand_base = driveline::derive(driveline::Shape {
             half_len: self.car.half_len,
             half_w: self.car.half_w,
             half_h: self.car.half_h,
             wheel_r: self.car.wheel_r,
             wheels: self.loco_mode.wheels,
-            tracked: self.cars.models[m].fittings.tracked(),
+            tracked,
             hovering: self.car.hover.is_some(),
             flying: self.car.flight,
             thrusters: self.loco_mode.thrusters,
             traction: traits.traction,
             mass_bias: traits.mass_bias,
         });
-        // a chassis switch always lands in FastFly (== hand_base
+        // a chassis switch always lands in FastFly/Roll (== hand_base
         // unmultiplied) rather than carrying over whatever sub-mode the
-        // PREVIOUS flying chassis happened to be in
+        // PREVIOUS chassis happened to be in
         self.car.flight_submode = physics::FlightSubMode::default();
+        self.car.tracked = tracked;
+        self.car.siege_mode = physics::TankSiegeMode::default();
         self.car.recompute_hand();
         let h = self.car.hand;
         self.toastf(&format!(

@@ -96,6 +96,54 @@ impl FlightSubMode {
     }
 }
 
+/// TANK SIEGE/ROLL CYCLE. Same shape of proposal as `FlightSubMode`,
+/// same precedence problem with `Action::Transform` (a tank chassis can
+/// already fold vehicle<->robot through it), same resolution: its own
+/// dedicated key (`Action::SiegeMode`) rather than inserting a third
+/// state into the fold button's existing binary meaning.
+///
+/// `Roll` is the default/no-op, same reasoning as `FlightSubMode`'s
+/// `FastFly` default: nobody who never presses the new key should see
+/// any change from today's tank handling.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TankSiegeMode {
+    #[default]
+    Roll,
+    /// planted: trades mobility for grip, per the proposal's own framing
+    /// ("trade mobility for grip or damage resistance"). Damage
+    /// resistance is NOT touched here -- `Handling` has no armour/damage
+    /// field to plug into, and inventing one is a bigger step than this
+    /// pass is taking; scoped to the same accel/top_speed/grip/turn axes
+    /// `driveline` already exposes, same as everything else in this file.
+    Siege,
+}
+
+impl TankSiegeMode {
+    pub fn cycle(self) -> TankSiegeMode {
+        match self {
+            TankSiegeMode::Roll => TankSiegeMode::Siege,
+            TankSiegeMode::Siege => TankSiegeMode::Roll,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            TankSiegeMode::Roll => "ROLL",
+            TankSiegeMode::Siege => "SIEGE",
+        }
+    }
+    /// (accel_mul, top_speed_mul, grip_mul, turn_mul). Roll is all 1.0.
+    /// Siege's numbers are a first-pass guess sized to be an obvious,
+    /// noticeable trade (nearly rooted, much grippier, barely turns) --
+    /// not checked against how planting a specific tank chassis should
+    /// actually feel, same caveat as `FlightSubMode::multipliers`.
+    fn multipliers(self) -> (f32, f32, f32, f32) {
+        match self {
+            TankSiegeMode::Roll => (1.0, 1.0, 1.0, 1.0),
+            TankSiegeMode::Siege => (0.25, 0.15, 1.6, 0.3),
+        }
+    }
+}
+
 pub struct Car {
     pub pos: Vec3,
     pub vel: Vec3,
@@ -140,6 +188,14 @@ pub struct Car {
     /// Which flight sub-mode is active (see `FlightSubMode`). Read only
     /// when `flight` is true; a ground vehicle ignores it entirely.
     pub flight_submode: FlightSubMode,
+    /// Is this a tracked (tank-like) chassis — `turret::Fittings::tracked()`
+    /// at the time `hand_base` was last derived. Kept here (rather than
+    /// re-deriving it) so `Action::SiegeMode` can gate on it the same way
+    /// `Action::FlightMode` gates on `flight`.
+    pub tracked: bool,
+    /// Which siege sub-mode is active (see `TankSiegeMode`). Read only
+    /// when `tracked` is true.
+    pub siege_mode: TankSiegeMode,
     /// WHAT THIS PARTICULAR HULL IS LIKE (`driveline`). Multipliers over
     /// the player's `CarCfg`, so tuning stays the player's and character
     /// stays the vehicle's. `Default` is all 1.0 — a chassis nobody
@@ -296,6 +352,8 @@ impl Car {
             hover: None,
             flight: false,
             flight_submode: FlightSubMode::default(),
+            tracked: false,
+            siege_mode: TankSiegeMode::default(),
             hand: crate::driveline::Handling::default(),
             hand_base: crate::driveline::Handling::default(),
             lift: None,
@@ -333,20 +391,31 @@ impl Car {
     pub fn forward(&self) -> Vec3 {
         self.rot * Vec3::NEG_Z
     }
-    /// Apply `hand_base` and the current `flight_submode` together into
-    /// `hand`, the value physics actually reads. Call this any time
-    /// EITHER changes — after `driveline::derive` sets a new `hand_base`
-    /// on a chassis switch, or after `flight_submode` is cycled — rather
-    /// than mutating `hand` directly, so the two never drift apart and
-    /// toggling the sub-mode twice always returns exactly to baseline.
+    /// Apply `hand_base`, `flight_submode` and `siege_mode` together into
+    /// `hand`, the value physics actually reads. Call this any time ANY
+    /// of the three changes, rather than mutating `hand` directly, so
+    /// they never drift apart and toggling a mode twice always returns
+    /// exactly to baseline. Flight and siege are mutually exclusive in
+    /// practice (a chassis is either flying or tracked, never both) but
+    /// both branches are written so neither assumes that if it changes.
     pub fn recompute_hand(&mut self) {
-        let (top_mul, turn_mul) = if self.flight {
-            self.flight_submode.multipliers()
-        } else {
-            (1.0, 1.0)
-        };
+        let (mut accel_mul, mut top_mul, mut grip_mul, mut turn_mul) = (1.0, 1.0, 1.0, 1.0);
+        if self.flight {
+            let (t, tu) = self.flight_submode.multipliers();
+            top_mul *= t;
+            turn_mul *= tu;
+        }
+        if self.tracked {
+            let (a, t, g, tu) = self.siege_mode.multipliers();
+            accel_mul *= a;
+            top_mul *= t;
+            grip_mul *= g;
+            turn_mul *= tu;
+        }
         self.hand = crate::driveline::Handling {
+            accel: self.hand_base.accel * accel_mul,
             top_speed: self.hand_base.top_speed * top_mul,
+            grip: self.hand_base.grip * grip_mul,
             turn: self.hand_base.turn * turn_mul,
             ..self.hand_base
         };
@@ -2662,5 +2731,60 @@ mod flight_submode_tests {
         car.recompute_hand();
         assert_eq!(car.hand.top_speed, 1.0);
         assert_eq!(car.hand.turn, 1.0);
+    }
+
+    #[test]
+    fn roll_is_the_default_and_a_no_op() {
+        assert_eq!(TankSiegeMode::default(), TankSiegeMode::Roll);
+        assert_eq!(TankSiegeMode::Roll.multipliers(), (1.0, 1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn siege_trades_mobility_for_grip() {
+        let mut car = Car::new();
+        car.tracked = true;
+        car.hand_base = crate::driveline::Handling { accel: 1.0, top_speed: 1.0, grip: 1.0, turn: 1.0, ..Default::default() };
+        car.recompute_hand();
+        assert_eq!(car.hand, car.hand_base, "Roll must reproduce hand_base exactly");
+
+        car.siege_mode = car.siege_mode.cycle(); // -> Siege
+        car.recompute_hand();
+        assert!(car.hand.top_speed < car.hand_base.top_speed, "siege should be slower");
+        assert!(car.hand.accel < car.hand_base.accel, "siege should accelerate less");
+        assert!(car.hand.grip > car.hand_base.grip, "siege should grip more");
+        assert!(car.hand.turn < car.hand_base.turn, "siege should turn less");
+
+        car.siege_mode = car.siege_mode.cycle(); // back to Roll
+        car.recompute_hand();
+        assert_eq!(car.hand, car.hand_base, "cycling siege twice must return to hand_base exactly");
+    }
+
+    #[test]
+    fn untracked_vehicles_ignore_siege_mode_entirely() {
+        let mut car = Car::new();
+        car.tracked = false;
+        car.siege_mode = TankSiegeMode::Siege; // left over from a previous tank
+        car.hand_base = crate::driveline::Handling { accel: 1.0, top_speed: 1.0, grip: 1.0, turn: 1.0, ..Default::default() };
+        car.recompute_hand();
+        assert_eq!(car.hand, car.hand_base);
+    }
+
+    #[test]
+    fn flight_and_siege_compose_independently() {
+        // not a real combination in practice (a chassis is either
+        // flying or tracked), but recompute_hand must not assume that
+        let mut car = Car::new();
+        car.flight = true;
+        car.flight_submode = FlightSubMode::Vtol;
+        car.tracked = true;
+        car.siege_mode = TankSiegeMode::Siege;
+        car.hand_base = crate::driveline::Handling { accel: 1.0, top_speed: 1.0, grip: 1.0, turn: 1.0, ..Default::default() };
+        car.recompute_hand();
+        let (vtol_top, vtol_turn) = FlightSubMode::Vtol.multipliers();
+        let (siege_accel, siege_top, siege_grip, siege_turn) = TankSiegeMode::Siege.multipliers();
+        assert!((car.hand.top_speed - vtol_top * siege_top).abs() < 1e-5, "top_speed should compose both multipliers");
+        assert!((car.hand.turn - vtol_turn * siege_turn).abs() < 1e-5, "turn should compose both multipliers");
+        assert_eq!(car.hand.accel, siege_accel);
+        assert_eq!(car.hand.grip, siege_grip);
     }
 }

@@ -55,9 +55,14 @@ pub enum Action {
     /// `Transform` -- a flying chassis can already fold vehicle<->robot
     /// through Transform, and this needs to not conflict with that.
     FlightMode,
+    /// TRACKED CHASSIS ONLY: cycle between roll and siege sub-modes (see
+    /// `physics::TankSiegeMode`). Same reasoning as `FlightMode`: a
+    /// dedicated key rather than a third meaning stacked onto
+    /// `Transform`'s existing vehicle<->robot fold.
+    SiegeMode,
 }
 
-pub const ACTIONS: [Action; 29] = [
+pub const ACTIONS: [Action; 30] = [
     Action::Forward,
     Action::Reverse,
     Action::SteerL,
@@ -87,6 +92,7 @@ pub const ACTIONS: [Action; 29] = [
     Action::PitchDown,
     Action::PitchUp,
     Action::FlightMode,
+    Action::SiegeMode,
 ];
 
 impl Action {
@@ -121,6 +127,7 @@ impl Action {
             Action::PitchDown => "FLIGHT: NOSE DOWN",
             Action::PitchUp => "FLIGHT: NOSE UP",
             Action::FlightMode => "FLIGHT: CYCLE VTOL/FAST-FLY",
+            Action::SiegeMode => "TANK: CYCLE ROLL/SIEGE",
         }
     }
     pub fn id(self) -> &'static str {
@@ -154,6 +161,7 @@ impl Action {
             Action::PitchDown => "pitch_down",
             Action::PitchUp => "pitch_up",
             Action::FlightMode => "flight_mode",
+            Action::SiegeMode => "siege_mode",
         }
     }
     pub fn from_id(s: &str) -> Option<Action> {
@@ -417,6 +425,7 @@ impl Bindings {
             (PitchDown, vec![ch("k")]),
             (PitchUp, vec![ch("i")]),
             (FlightMode, vec![ch("l")]),
+            (SiegeMode, vec![ch("y")]),
         ];
         Bindings { map: m }
     }
