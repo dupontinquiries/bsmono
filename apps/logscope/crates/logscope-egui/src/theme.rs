@@ -359,6 +359,69 @@ impl Skin {
         }
     }
 }
+/// THE EXTRACTED COPY MUST NOT DRIFT FROM THIS ONE.
+///
+/// `uikit-egui`'s `skin.rs` says its values are "the exact ones from the original `carved()` so the
+/// two apps render identically". They are, today — all fourteen match. Nothing enforced it: the
+/// claim lived in a doc comment, which is the weakest guarantee available, and either side could
+/// have moved without the other noticing.
+///
+/// This tree has already shipped that defect three times — the rustc headline classifier duplicated
+/// between the digest and the counter, the tool-name whitelist across two crates, and `contrast` in
+/// `palette` and `roomtheme`, where the two copies had already diverged on the sRGB linearisation
+/// threshold before anyone looked. A shared primitive whose sameness is asserted in prose is the
+/// same bet with a nicer cover.
+///
+/// It also unblocks something. Adopting `uikit_egui::carved::panel` here — the obvious cohesion win,
+/// declined so far because a rendering change cannot be verified without eyes — is much safer once
+/// the constants are pinned equal: whatever else differs between the two painters, it will not be
+/// the numbers.
+#[cfg(test)]
+mod skin_parity {
+    #[test]
+    fn the_uikit_copy_matches_ours_field_for_field() {
+        let ours = super::Skin::carved();
+        let theirs = uikit_egui::skin::Skin::carved();
+        let pairs: [(&str, f32, f32); 14] = [
+            ("radius", ours.radius as f32, theirs.radius as f32),
+            ("fill_rest", ours.fill_rest as f32, theirs.fill_rest as f32),
+            ("fill_hover", ours.fill_hover as f32, theirs.fill_hover as f32),
+            ("fill_down", ours.fill_down as f32, theirs.fill_down as f32),
+            ("fill_off", ours.fill_off as f32, theirs.fill_off as f32),
+            ("accent_tint", ours.accent_tint, theirs.accent_tint),
+            ("grain_alpha", ours.grain_alpha as f32, theirs.grain_alpha as f32),
+            ("bevel_lit", ours.bevel_lit as f32, theirs.bevel_lit as f32),
+            ("bevel_shadow", ours.bevel_shadow as f32, theirs.bevel_shadow as f32),
+            ("sheen", ours.sheen, theirs.sheen),
+            ("sheen_speed", ours.sheen_speed, theirs.sheen_speed),
+            ("vein", ours.vein, theirs.vein),
+            ("engrave_shadow", ours.engrave_shadow as f32, theirs.engrave_shadow as f32),
+            ("engrave_lip", ours.engrave_lip as f32, theirs.engrave_lip as f32),
+        ];
+        let drift: Vec<String> = pairs.iter()
+            .filter(|(_, a, b)| (a - b).abs() > f32::EPSILON)
+            .map(|(n, a, b)| format!("{n}: ours {a} vs uikit {b}"))
+            .collect();
+        assert!(drift.is_empty(),
+                "the extracted skin has drifted from the one it was copied from:\n  {}",
+                drift.join("\n  "));
+    }
+
+    /// The count is pinned too. A field added to either Skin and left out of the list above is a
+    /// field nobody proved is the same — which is exactly how the pair starts drifting.
+    #[test]
+    fn neither_skin_has_gained_a_field_unnoticed() {
+        // A struct's field count is not introspectable, so this pins the next best thing: the
+        // Debug rendering, which lists every field. If either gains one, the counts diverge from 14.
+        let ours = format!("{:?}", super::Skin::carved());
+        let theirs = format!("{:?}", uikit_egui::skin::Skin::carved());
+        // Debug prints `field: value` per field, so counting colons counts fields.
+        let count = |s: &str| s.matches(':').count();
+        assert_eq!(count(&ours), 14, "logscope's Skin has {} fields, not 14", count(&ours));
+        assert_eq!(count(&theirs), 14, "uikit's Skin has {} fields, not 14", count(&theirs));
+    }
+}
+
 thread_local! { static SKIN: std::cell::Cell<Skin> = const { std::cell::Cell::new(Skin::carved()) }; }
 /// The active style tokens (layer 4). Read by the paint code; swap with `set_skin` to restyle wholesale.
 pub fn skin() -> Skin { SKIN.with(|s| s.get()) }
