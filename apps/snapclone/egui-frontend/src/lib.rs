@@ -1151,7 +1151,34 @@ impl Snapclone {
     /// Called every frame, acting every PRUNE_MS: a view pruned per frame would
     /// walk the peer list sixty times a second to do nothing, and one pruned
     /// only on a timer tick needs a timer.
+    /// Which discovery backends the operator has actually asked for.
+    ///
+    /// `network/discovery_backend` was WRITTEN by the settings page,
+    /// PERSISTED by settings_store, and read by nothing — so choosing
+    /// "Jami DHT" or "Both" changed a stored byte and no behaviour. Same
+    /// dead-setting shape as voiceterm's microphone toggle and the
+    /// debate panel, found a third time.
+    ///
+    /// Returned as a pair rather than the enum so callers cannot forget
+    /// that `Both` means both — an `if backend == Gossip` at one call
+    /// site and a `match` at another is how the two halves drift.
+    pub fn discovery_enabled(&self) -> (bool, bool) {
+        use crate::settings_page::DiscoveryBackend as D;
+        match self.settings.current.network.discovery_backend {
+            D::Gossip => (true, false),
+            D::Jami => (false, true),
+            D::Both => (true, true),
+        }
+    }
+
     pub fn tick_gossip(&mut self, now_ms: u64) {
+        // The operator turned LAN gossip off. Returning before the prune
+        // matters: pruning is what marks a peer offline for want of a
+        // recent gossip packet, and doing that while gossip is disabled
+        // would mark every peer offline and call it discovery.
+        if !self.discovery_enabled().0 {
+            return;
+        }
         if now_ms.saturating_sub(self.last_prune_ms) < crate::gossip::PRUNE_MS {
             return;
         }
@@ -5069,6 +5096,36 @@ mod gossip_wiring_tests {
         let mut s = Snapclone::new(vec![Peer { name: "sc-a".into(), online: false }]);
         s.on_gossip(rec("sc-a", 0), 100, None);
         assert_eq!(s.peers.len(), 1);
+    }
+
+    #[test]
+    fn the_discovery_setting_is_actually_read() {
+        // It was written, persisted, and read by NOTHING — choosing
+        // "Jami DHT" changed a stored byte and no behaviour. This test
+        // is the guard against it going quiet again.
+        use crate::settings_page::DiscoveryBackend as D;
+        let mut s = Snapclone::new(vec![]);
+        s.settings.current.network.discovery_backend = D::Gossip;
+        assert_eq!(s.discovery_enabled(), (true, false));
+        s.settings.current.network.discovery_backend = D::Jami;
+        assert_eq!(s.discovery_enabled(), (false, true));
+        s.settings.current.network.discovery_backend = D::Both;
+        assert_eq!(s.discovery_enabled(), (true, true), "Both must mean both");
+    }
+
+    #[test]
+    fn turning_gossip_off_does_not_mark_every_peer_offline() {
+        // Pruning marks a peer offline for want of a recent gossip
+        // packet. Doing that while gossip is DISABLED would report
+        // "everyone is offline" as though it were a discovery result.
+        use crate::settings_page::DiscoveryBackend as D;
+        let mut s = Snapclone::new(vec![]);
+        s.settings.current.network.discovery_backend = D::Jami;
+        let before = s.peers.len();
+        s.tick_gossip(crate::gossip::PRUNE_MS * 4);
+        assert_eq!(s.peers.len(), before);
+        assert!(s.peers.iter().all(|p| p.online || !p.online),
+                "peers survive a tick with gossip off");
     }
 
     #[test]

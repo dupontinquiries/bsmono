@@ -4530,3 +4530,41 @@ scripted edit across sixteen files.
 The general shape: a feature list expresses a PREFERENCE and the
 renderer field expresses a DECISION. Only the second survives someone
 else's dependency change.
+
+## 84. The discovery setting was written, persisted, and read by nothing
+
+Chasing the DHT chain to its last hop, and found the hop was not the
+only thing missing.
+
+`network/discovery_backend` is written by the settings page and
+persisted by `settings_store` — and **read by no code anywhere**.
+Choosing "Jami DHT" or "Both" changed a stored byte and no behaviour.
+`crypto_backend` is the same: written, loaded, unread.
+
+That is the third instance of this exact shape (voiceterm's microphone
+toggle §45, the debate panel §58) and it was hiding UNDER the DHT
+question. Fixing the combo collision in §78 made both controls
+selectable; it did not make either of them mean anything.
+
+`App::discovery_enabled() -> (bool, bool)` is the reader, and
+`tick_gossip` now returns early when LAN gossip is off.
+
+Two details:
+  - **Returned as a pair, not the enum.** `Both` means both, and an
+    `if backend == Gossip` at one call site with a `match` at another is
+    exactly how the two halves drift apart.
+  - **The early return is BEFORE the prune, deliberately.** Pruning is
+    what marks a peer offline for want of a recent gossip packet;
+    running it with gossip disabled would mark every peer offline and
+    present that as a discovery result.
+
+Two tests, one per property. 1427/1427.
+
+- **C84a — `crypto_backend` still has no reader.** Same shape, and the
+  stakes are higher: the label says "Qt HMAC-SHA256 (placeholder — dev
+  only)" versus "Rust AES-256-GCM + X25519 (production)", so a person
+  can select production crypto and get whatever the code does anyway.
+  Worth fixing before anything ships.
+- **C84b — the DHT half is enabled but unreached.** `discovery_enabled()
+  .1` is now honest and nothing consumes it yet;
+  `snapclone_presence::dht::{publish,resolve}` is what it should call.
