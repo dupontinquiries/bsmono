@@ -3996,3 +3996,42 @@ on 3 (shot 11 +16.3%, shot 4 +5.4%, shot 13 +0.6%), and shots 1/5/17
 reproduce v3 byte-exact (1749/297/965 — harness re-validated).
 Shots 9, 12, 16, 19 (the four largest, motion-dominated) NOT yet run,
 so there is no aggregate-vs-AV1 number for v5 yet.
+
+### Full 19-shot suite: v11.5 (movers, dz40) vs v11.3 (dz32) vs AV1
+
+All 19 shots, same harness as the historical tables (crop
+1920:800:0:140, CSV start/frames), frame-weighted MSE aggregation.
+docs/full_v5_dz40.csv.
+
+  v11.3 dz32 (recorded):  20.915 MB @ 33.58 dB
+  v11.5 dz40 (movers):    18.356 MB @ 33.195 dB   -12.2% bytes, -0.39 dB
+  AV1-150k anchor:         0.989 MB @ 33.33 dB
+
+Per shot: 12 wins, 4 losses, 3 exact ties. The ties are shots 1/5/17
+reproducing v3 byte-for-byte (1749 / 297 / 965), which re-validates
+the harness against the historical CSV every run. Biggest wins are
+the LARGE motion shots the clip total is made of — shot 16 -21.9%
+(3.35 -> 2.62 MB), shot 9 -18.9%, shot 12 -17.7%, shot 2 -16.9%,
+shot 19 -15.6%, shot 7 -12.9%. Losses: shot 11 +16.3% (10 frames —
+sprite cost can't amortize over a 10-frame GOP), shot 4 +5.4%, shot 13
++0.6%, shot 14 +0.1%.
+
+Against AV1 the honest statement is a HULL POINT, not a win: v11.5
+sits at 18.6x AV1's size at -0.13 dB, where v11.3 sat at 21.2x at
++0.25 dB. The curve moved (12% fewer bytes for 0.38 dB is a better
+exchange rate than the codec's own dz ladder gives), and the bimodal
+verdict is unchanged — the frozen/locked shots still beat AV1
+outright, the motion shots still lose by an order of magnitude.
+
+Two structural notes the per-shot column makes visible:
+1. Mover count does NOT predict the win. Shot 16 wins 21.9% with TWO
+   movers; shot 13 loses with twenty-two. What predicts it is GOP
+   length x sprite reuse: a sprite is paid once, so the win scales
+   with how many frames pay nothing for the regions it covers. Shot 11
+   (10 frames) is the clean counter-example, and it argues for a
+   length-aware detection threshold rather than a fixed thr.
+2. The J-guard picked V3 on 5 shots (1, 5, 7, 9, 17) — so those rows
+   are v3-at-dz40, and the suite's aggregate is a mixture of two
+   coders. That is the routing law working, but it means "v11.5's
+   number" is really "the router's number", which is the honest way to
+   quote it.
