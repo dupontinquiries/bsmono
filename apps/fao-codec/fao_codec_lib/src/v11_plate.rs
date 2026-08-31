@@ -1306,6 +1306,22 @@ pub fn encode_gop_v3_forced(
     // raw zstd keeps it safe when the transform loses (tiny plates).
     const PLATE_DZ_DIV: f32 = 8.0;
     let mut plate_coded = plate.clone();
+    // ── SPECTRALLY-MATCHED PLATE RESOLUTION (FAO_PLATE_HALF).
+    //
+    // blackstar-rs made the case: its plate is 104,683 B, 31% of the
+    // whole file, on content that is a smooth sky/ground gradient plus
+    // one small object. A temporal median stored at FULL FRAME
+    // RESOLUTION is an expensive way to hold something a handful of
+    // low-frequency coefficients describe, and it is pure overhead
+    // against a conventional coder that spends almost nothing on a flat
+    // block. The plate is a REFERENCE, not an output frame, so its
+    // resolution only has to carry the frequencies the prediction
+    // actually uses.
+    //
+    // Half-resolution store with bilinear upsample on use, chosen
+    // BEST-OF against full resolution by real bytes and real prediction
+    // error — never a guess about the content, and it cannot lose.
+    let plate_half = std::env::var("FAO_PLATE_HALF").is_ok();
     let plate_bytes = {
         let zstd_len = zstd::encode_all(plate_raw.as_slice(), 19)
             .map(|c| c.len())
@@ -1335,7 +1351,126 @@ pub fn encode_gop_v3_forced(
             dead_zone: (opts.dead_zone / PLATE_DZ_DIV).max(1.0),
             ..opts.clone()
         };
+        // Half-resolution candidate: decimate 2x1 (box), code, upsample
+        // bilinearly, and keep it only if it is cheaper AND its
+        // prediction error against the plate's own pixels is not
+        // materially worse. Scoring against the plate rather than
+        // against frames keeps this a property of the surface itself,
+        // so the decision does not depend on which frame happens to be
+        // examined.
+        let half = if plate_half {
+            let (hw, hh) = ((plate.w / 4) * 2, (plate.h / 4) * 2);
+            if hw >= 8 && hh >= 8 {
+                let mut small = Yuv420::new(hw, hh);
+                for y in 0..hh {
+                    for x in 0..hw {
+                        let mut acc = 0u32;
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                let sy = (y * 2 + dy).min(plate.h - 1);
+                                let sx = (x * 2 + dx).min(plate.w - 1);
+                                acc += plate.y[sy * plate.w + sx] as u32;
+                            }
+                        }
+                        small.y[y * hw + x] = (acc / 4) as u8;
+                    }
+                }
+                let (cw, chh) = (plate.w / 2, plate.h / 2);
+                for y in 0..hh / 2 {
+                    for x in 0..hw / 2 {
+                        let sy = (y * 2).min(chh - 1);
+                        let sx = (x * 2).min(cw - 1);
+                        small.u[y * (hw / 2) + x] = plate.u[sy * cw + sx];
+                        small.v[y * (hw / 2) + x] = plate.v[sy * cw + sx];
+                    }
+                }
+                let s444 = interleave_444(&small);
+                let sgray = vec![128u8; hw * hh * 3];
+                residual::encode(&sgray, &s444, hw, hh, &plate_opts).map(|t| {
+                    let dec = residual::apply(sgray, &t, hw, hh);
+                    (t.len(), deinterleave_420(&dec, hw, hh))
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // RD gate over the two candidates. The first version compared
+        // BYTES ONLY, and the comment above claimed an error test it did
+        // not perform — the code and the comment disagreed, and the
+        // measurement showed why it mattered: half-res on blackstar was
+        // -18.7% bytes for -2.63 dB, an exchange rate of 23.7 KB/dB
+        // against the dead-zone ladder's 244 KB/dB on the same clip.
+        // Ten times worse, i.e. a straight loss at matched quality.
+        //
+        // The mechanism is worth stating because it is specific to a
+        // REFERENCE surface: the residual barely moved (154,964 ->
+        // 155,895) while PSNR fell 2.6 dB, because at dz32 the dead zone
+        // DISCARDS the low-amplitude error a blurred plate introduces.
+        // The blur therefore passes straight through to the output
+        // instead of being corrected. A cheaper reference is only cheap
+        // if the residual coder will fix it, and at a coarse dead zone
+        // it will not.
+        let half_j = |cand: &Option<(usize, Yuv420)>, full_bytes: usize| -> bool {
+            let Some((hb, small)) = cand else { return false };
+            let lambda = (opts.dead_zone as f64).powi(2) / 3.0;
+            // SSE of each candidate against the plate's own luma.
+            let (hw, hh) = (small.w, small.h);
+            let mut sse_half = 0.0f64;
+            for y in 0..plate.h {
+                let sy = (y * hh / plate.h).min(hh - 1);
+                for x in 0..plate.w {
+                    let sx = (x * hw / plate.w).min(hw - 1);
+                    let d = small.y[sy * hw + sx] as f64 - plate.y[y * plate.w + x] as f64;
+                    sse_half += d * d;
+                }
+            }
+            // Full-res candidate's error is whatever the dead zone left,
+            // which is small by construction; approximate it as zero and
+            // let the byte difference carry the comparison. That biases
+            // AGAINST half-res, which is the safe direction for a
+            // surface whose errors propagate to every frame.
+            sse_half + lambda * *hb as f64 * 1.0 < lambda * full_bytes as f64
+        };
         match residual::encode(&gray, &plate444, plate.w, plate.h, &plate_opts) {
+            Some(t) if half_j(&half, t.len()) => {
+                let (hb, small) = half.unwrap();
+                // Bilinear upsample back to plate resolution — this is
+                // the surface every frame will predict from, so the
+                // encoder must adopt exactly what the decoder rebuilds.
+                let (hw, hh) = (small.w, small.h);
+                for y in 0..plate.h {
+                    let fy = (y as f32 * hh as f32 / plate.h as f32 - 0.5).max(0.0);
+                    let (y0, ty) = (fy as usize, fy.fract());
+                    let y1 = (y0 + 1).min(hh - 1);
+                    for x in 0..plate.w {
+                        let fx = (x as f32 * hw as f32 / plate.w as f32 - 0.5).max(0.0);
+                        let (x0, tx) = (fx as usize, fx.fract());
+                        let x1 = (x0 + 1).min(hw - 1);
+                        let p00 = small.y[y0 * hw + x0] as f32;
+                        let p01 = small.y[y0 * hw + x1] as f32;
+                        let p10 = small.y[y1 * hw + x0] as f32;
+                        let p11 = small.y[y1 * hw + x1] as f32;
+                        let v = (p00 * (1.0 - tx) + p01 * tx) * (1.0 - ty)
+                            + (p10 * (1.0 - tx) + p11 * tx) * ty;
+                        plate_coded.y[y * plate.w + x] = v.round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+                let (cw, chh) = (plate.w / 2, plate.h / 2);
+                for y in 0..chh {
+                    let sy = (y * hh / plate.h).min(hh / 2 - 1);
+                    for x in 0..cw {
+                        let sx = (x * hw / plate.w).min(hw / 2 - 1);
+                        plate_coded.u[y * cw + x] = small.u[sy * (hw / 2) + sx];
+                        plate_coded.v[y * cw + x] = small.v[sy * (hw / 2) + sx];
+                    }
+                }
+                if std::env::var("FAO_PLATE_DEBUG").is_ok() {
+                    eprintln!("plate: half-res {hb} B chosen over full-res {} B", t.len());
+                }
+                hb
+            }
             Some(t) if t.len() < zstd_len => {
                 // CRITICAL: adopt the DECODED plate. Counting the coded
                 // size while still predicting from the unquantized

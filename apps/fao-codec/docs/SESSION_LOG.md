@@ -4672,3 +4672,57 @@ gain) is overhead against a conventional coder's ability to spend
 almost nothing on a flat block. The plate should be coded at a
 resolution matched to its own spectral content, not at frame
 resolution — the first concrete construction this clip argues for.
+
+### --pose-from-tracks promoted to DEFAULT on five-clip evidence
+
+The phase-correlation pose track failed three DISTINCT ways across the
+corpus, and the median-of-static-tracks rebuild fixes all three. One
+fix for three unrelated-looking symptoms is what promoted it from a
+flag to the default — it means the estimator was the common cause, not
+three material properties.
+
+  bloopers w1    81 -> 98 triangulated
+  bloopers sh4    2 ->  3   (no parallax to rescue; does not hurt)
+  SMITE          27 -> 31,  mean reproj 2.17 -> 1.80 px
+  Minecraft 4K   24 -> 101, no-baseline 327 -> 71, reproj p50 50.2 -> 22.3
+  blackstar       0 -> 31,  camera span 0.0 -> 46.1 px, no-baseline 144 -> 6
+
+blackstar is the clearest case: phase correlation reported ZERO global
+motion at confidence 0.88 on near-uniform gradients, so every candidate
+died for want of a baseline; the tracks knew the camera was moving
+1.70 px/frame all along. --pose-phasecorr restores the old behaviour.
+
+### Spectrally-matched plate resolution: measured, and it LOSES
+
+blackstar's plate is 31% of its file on a smooth gradient, so a
+half-resolution plate store (box decimate, code, bilinear upsample)
+looked obviously right. Measured at dz32:
+
+  full-res plate  332,841 B @ 35.619 dB / SSIM 0.9750
+  half-res plate  270,473 B @ 32.993 dB / SSIM 0.9657
+-18.7% bytes for -2.63 dB: 23.7 KB/dB, against the SAME CLIP's
+dead-zone ladder at 244 KB/dB (dz8 1,530,493 @ 40.53 -> dz32 332,841
+@ 35.62). Ten times worse exchange rate — a straight loss at matched
+quality, and only visible because the byte saving looked good alone.
+
+The mechanism is specific to a REFERENCE surface and is the useful
+part: residual barely moved (154,964 -> 155,895) while PSNR fell
+2.6 dB, because at dz32 the dead zone DISCARDS the low-amplitude error
+a blurred plate introduces. The blur passes straight through to the
+output instead of being corrected. A cheaper reference is only cheap
+if the residual coder will fix it, and at a coarse dead zone it will
+not. This also explains the earlier PLATE_DZ_DIV result from the other
+direction: the plate gets a FINER dead zone than the frames for
+exactly this reason, and lowering its resolution is the same mistake
+in the spatial axis that a coarser plate dead zone would be in the
+amplitude axis.
+
+Process failure recorded: the first version's comment claimed the
+choice was made on "cheaper AND prediction error not materially worse"
+while the code compared BYTES ONLY. Comment and code disagreed and the
+comment was the more sensible design. Now an actual RD gate
+(SSE-against-plate + lambda x bytes, biased against half-res since a
+reference's errors propagate to every frame), which correctly declines
+half-res on blackstar — the path is now inert on the clip that
+motivated it, which is the honest outcome. Kept behind FAO_PLATE_HALF
+for content where a plate really is band-limited.

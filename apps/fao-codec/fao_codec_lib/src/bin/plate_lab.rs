@@ -718,7 +718,21 @@ fn main() {
         // Two-pass by necessity: the consensus classifier needs a motion
         // estimate to label tracks Static, so pass 1 stays phase-corr and
         // pass 2 rebuilds the pose from the tracks it labelled.
-        if args.iter().any(|a| a == "--pose-from-tracks") {
+        // DEFAULT ON as of this session, on five-clip evidence.
+        // --pose-phasecorr restores the old behaviour for comparison.
+        //
+        // The phase-correlation pose track failed three DISTINCT ways
+        // across the corpus and the median-of-static-tracks rebuild
+        // fixes all three, which is what promoted it from a flag to the
+        // default: a single fix for three unrelated-looking symptoms is
+        // evidence the estimator was the common cause.
+        //   bloopers w1   81 -> 98 triangulated
+        //   bloopers sh4    2 ->  3   (material has no parallax; nothing
+        //                              to rescue, and it does not hurt)
+        //   SMITE          27 -> 31, mean reproj 2.17 -> 1.80 px
+        //   Minecraft      24 -> 101, no-baseline 327 -> 71
+        //   blackstar       0 -> 31, camera span 0.0 -> 46.1 px
+        if !args.iter().any(|a| a == "--pose-phasecorr") {
             let nfr = frames.len();
             let mut per_frame: Vec<std::collections::HashMap<u32, (f32, f32)>> =
                 vec![std::collections::HashMap::new(); nfr];
