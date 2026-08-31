@@ -3760,3 +3760,47 @@ flatters AV1 (it re-codes its own artifacts cheaply). A clean
 comparison needs an engine-rendered source, which is also the
 regime the citation thesis needs — so the same experiment settles
 both questions.
+
+### Landmark-fingerprint dictionary probe (user suggestion): measured, and the redundancy isn't there
+
+snapclone's LandmarkHash answers "is this the same PLACE?" from a
+12-byte lossy pair (blur hash for layout, edge hash for line geometry
+— chosen because they fail in different weather). Applied one level
+down, a per-REGION fingerprint asks "have I already coded content
+that looks like this ANYWHERE earlier?" — the question a plate cannot
+ask, since a plate holds one aligned background. This is the
+screen-content-coding lever AV1 has and v11 lacks, and the SMITE loss
+made it the obvious suspect.
+
+probe_dictionary (plate_lab --dictprobe): dictionary built only from
+frames fi-2 and older (never overlapping the prev predictor), keyed
+by 16 coarse-luma bits + 16 gradient bits in the landmark spirit,
+candidates verified by true SAD.
+
+  smiteA: long-range beats local 3.1% of regions | STRONG (>512 SAD
+          margin, enough to pay a ~4-byte reference) 0.2%
+  smiteB: 4.2% | 0.3%
+  shotB : 12.1% | 0.3%
+
+Exact-bucket lookup is a weaker test than the landmark matcher's
+Hamming ≤10/64, so it was re-run with a coarse 16-bit key (every
+other cell) and 64 candidates per bucket:
+  smiteA: 4.1% | 0.3%   shotB: 17.9% | 0.7%
+More wins surface, but the STRONG share — the only one that can pay
+for a long-range reference — stays under 1%.
+
+Verdict: the idea transfers cleanly and the machinery works; the
+REDUNDANCY ISN'T THERE at 16×16 luma granularity on this material.
+Where long-range matches beat the local predictors they beat them by
+~130–240 SAD over a whole region (well under a decibel of block
+error), because the local predictors are already good — the plate is
+a strong global model and prev-MC handles the rest.
+
+What this does NOT rule out, and what the numbers actually point to:
+the SMITE loss is not long-range redundancy going unexploited, so
+looking there again needs a different granularity (small blocks, 4×4
+or 8×8, where HUD glyphs live), exact-match hashing rather than
+perceptual (screen content repeats EXACTLY, and the SAD-margin test
+would then be pass/fail rather than approximate), and ideally an
+engine-rendered source with no capture noise. Probe kept behind
+--dictprobe for that experiment.

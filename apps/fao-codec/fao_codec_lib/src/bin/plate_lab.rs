@@ -131,6 +131,12 @@ fn main() {
             return;
         }
     }
+    if args.iter().any(|a| a == "--dictprobe") {
+        let m = plate::estimate_motions(&frames);
+        let pl = plate::build_plate(&frames, &m);
+        println!("{}", plate::probe_dictionary(&frames, &pl, &m));
+        return;
+    }
     let t1 = std::time::Instant::now();
     // --use-plate <path>: CITE a stored canonical plate instead of
     // building+transmitting one. Motions get re-based by a phase-corr

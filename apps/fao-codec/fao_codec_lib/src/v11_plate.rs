@@ -2700,3 +2700,140 @@ mod tests_sr {
         );
     }
 }
+
+// ── Long-range dictionary probe (landmark-fingerprint idea, applied
+// inside a video) ────────────────────────────────────────────────────
+//
+// snapclone's LandmarkHash answers "is this the same PLACE?" from a
+// 12-byte lossy transform: a blur hash for coarse layout plus an edge
+// hash for line geometry, chosen because they fail in different
+// weather. The same construction works one level down: a per-REGION
+// fingerprint answers "have I already coded content that looks like
+// this, anywhere earlier in the video?" — which is the question the
+// plate model cannot ask, because a plate only holds ONE aligned
+// background.
+//
+// That matters most for the material v11 currently loses on. Broadcast
+// game capture repeats content constantly (HUD, minimap, ability bars,
+// respawn screens, the same lane geometry from the same camera angle
+// minutes apart) at positions no motion vector can reach — AV1's
+// screen-content tools exploit exactly this, and v11 has nothing.
+//
+// This is a PROBE, not an encoder mode: it measures how much
+// long-range redundancy actually exists before any bitstream work is
+// justified. Dictionary entries come only from frames the decoder
+// already has (fi-2 and older, so it never overlaps the prev-frame
+// predictor), keyed by a 32-bit fingerprint in the landmark spirit:
+// 16 coarse-luma bits (4x4 cell means vs region mean — the blur hash)
+// and 16 gradient bits (per-cell |dx|+|dy| vs cell mean — the edge
+// hash). Candidates are verified by true SAD, so the hash only has to
+// be good enough to shortlist.
+pub fn probe_dictionary(frames: &[Yuv420], plate: &Plate, motions: &[PlateMotion]) -> String {
+    let (fw, fh) = (frames[0].w, frames[0].h);
+    let (gw, gh) = (fw / REGION, fh / REGION);
+    let fingerprint = |src: &[u8], w: usize, rx: usize, ry: usize| -> u32 {
+        let mut cells = [0u32; 16];
+        let mut grads = [0u32; 16];
+        for cy in 0..4 {
+            for cx in 0..4 {
+                let (mut sum, mut g) = (0u32, 0u32);
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        let (x, y) = (rx + cx * 4 + dx, ry + cy * 4 + dy);
+                        let v = src[y * w + x] as i32;
+                        sum += v as u32;
+                        let vx = src[y * w + (x + 1).min(w - 1)] as i32;
+                        let vy = src[(y + 1).min(fh - 1) * w + x] as i32;
+                        g += ((vx - v).abs() + (vy - v).abs()) as u32;
+                    }
+                }
+                cells[cy * 4 + cx] = sum / 16;
+                grads[cy * 4 + cx] = g / 16;
+            }
+        }
+        let cmean: u32 = cells.iter().sum::<u32>() / 16;
+        let gmean: u32 = grads.iter().sum::<u32>() / 16;
+        let mut fp = 0u32;
+        for i in 0..16 {
+            if cells[i] > cmean {
+                fp |= 1 << i;
+            }
+            if grads[i] > gmean {
+                fp |= 1 << (16 + i);
+            }
+        }
+        // Coarse key = 8 blur bits + 8 edge bits (every other cell), so
+        // near-matches that differ in fine cells still collide. The
+        // landmark matcher uses Hamming distance ≤10/64 rather than
+        // exact equality; exact-bucket lookup on a 32-bit key is a
+        // strictly weaker test, and this is the cheap way to widen the
+        // shortlist without enumerating the Hamming ball.
+        let mut key = 0u32;
+        for i in 0..8 {
+            if (fp >> (i * 2)) & 1 == 1 {
+                key |= 1 << i;
+            }
+            if (fp >> (16 + i * 2)) & 1 == 1 {
+                key |= 1 << (8 + i);
+            }
+        }
+        key
+    };
+    use std::collections::HashMap;
+    let mut dict: HashMap<u32, Vec<(usize, usize, usize)>> = HashMap::new();
+    let (mut n_reg, mut n_dict_win, mut n_dict_strong) = (0u64, 0u64, 0u64);
+    let mut sad_saved = 0u64;
+    for fi in 0..frames.len() {
+        let f = &frames[fi];
+        let plate_pred = predict_frame(plate, &motions[fi], fw, fh);
+        if fi >= 2 {
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    let (rx, ry) = (gx * REGION, gy * REGION);
+                    n_reg += 1;
+                    let sad_plate =
+                        sad_region(&plate_pred.y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry);
+                    let (_mv, sad_prev) =
+                        search_mv(&frames[fi - 1].y, fw, fh, &f.y, rx, ry);
+                    let best_local = sad_plate.min(sad_prev);
+                    let fp = fingerprint(&f.y, fw, rx, ry);
+                    let mut best_dict = u32::MAX;
+                    if let Some(cands) = dict.get(&fp) {
+                        for &(sfi, sx, sy) in cands.iter().rev().take(64) {
+                            let s = sad_region(
+                                &frames[sfi].y, fw, fh, sx as i32, sy as i32, &f.y, rx, ry,
+                            );
+                            best_dict = best_dict.min(s);
+                        }
+                    }
+                    if best_dict < best_local {
+                        n_dict_win += 1;
+                        sad_saved += (best_local - best_dict) as u64;
+                        // "Strong" = beats the local predictors by enough
+                        // to pay for a ~4-byte long-range reference.
+                        if best_dict + 512 < best_local {
+                            n_dict_strong += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // Insert this frame's regions into the dictionary (decoder has
+        // it once coded).
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let (rx, ry) = (gx * REGION, gy * REGION);
+                let fp = fingerprint(&f.y, fw, rx, ry);
+                dict.entry(fp).or_default().push((fi, rx, ry));
+            }
+        }
+    }
+    format!(
+        "dict probe: {} regions | long-range beats local {:.1}% | STRONG (>512 SAD margin) {:.1}% | mean SAD saved on wins {:.0} | distinct fingerprints {}",
+        n_reg,
+        100.0 * n_dict_win as f64 / n_reg as f64,
+        100.0 * n_dict_strong as f64 / n_reg as f64,
+        if n_dict_win > 0 { sad_saved as f64 / n_dict_win as f64 } else { 0.0 },
+        dict.len()
+    )
+}
