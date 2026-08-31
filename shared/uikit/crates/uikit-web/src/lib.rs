@@ -89,6 +89,56 @@ impl Block {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RichDoc {
     pub blocks: Vec<Block>,
+    /// Blocks the budget refused. Counted rather than dropped silently: a
+    /// page that stops half way with no explanation reads as a broken
+    /// parser, and the number is the thing that tells a reader to open the
+    /// original.
+    pub blocks_dropped: usize,
+    /// Elements the caller's filter removed.
+    pub filtered: usize,
+}
+
+/// One element, as a filter sees it.
+///
+/// The four attributes every ad and tracking heuristic in this fleet reads.
+/// Passed as a struct rather than four arguments so adding a fifth does not
+/// change every caller's signature.
+#[derive(Debug, Clone, Copy)]
+pub struct Element<'a> {
+    pub tag: &'a str,
+    pub id: Option<&'a str>,
+    pub class: Option<&'a str>,
+    pub src: Option<&'a str>,
+}
+
+/// The most blocks a document may produce.
+///
+/// The QML generator caps at 500 nodes, and its header records what
+/// happens without a cap: one enormous page and the output is unusable.
+/// Here the cost lands differently — the display list is walked EVERY
+/// FRAME, so an unbounded one is a page that gets slower the longer it is,
+/// forever, rather than a slow load.
+pub const MAX_BLOCKS: usize = 2_000;
+
+/// How to parse.
+///
+/// The element filter is a CALLBACK rather than a mode enum, because the
+/// policy does not belong here. voiceterm's `ad_filter` knows about
+/// tracking pixels, consent walls and sticky newsletter bars; that is
+/// application knowledge and it changes on a different schedule from an
+/// HTML parser. A shared widget kit reaching into an app for it would
+/// invert the dependency; an enum here would mean the kit re-implementing
+/// the list.
+pub struct ParseOptions<'a> {
+    pub max_blocks: usize,
+    /// Return true to drop the element AND its subtree.
+    pub skip_element: Option<&'a dyn Fn(Element<'_>) -> bool>,
+}
+
+impl Default for ParseOptions<'_> {
+    fn default() -> Self {
+        ParseOptions { max_blocks: MAX_BLOCKS, skip_element: None }
+    }
 }
 
 impl RichDoc {
@@ -243,6 +293,16 @@ fn parse_attrs(s: &str) -> Vec<(String, String)> {
 
 // ── build the display list ───────────────────────────────────────────────────
 
+/// Tags with no closing tag, which therefore have no subtree.
+///
+/// Load-bearing for the filter: opening a skip depth on an `<img>` would
+/// swallow every element after it, because the close that would have ended
+/// it never comes.
+fn is_void_tag(tag: &str) -> bool {
+    matches!(tag, "img" | "br" | "hr" | "input" | "meta" | "link" | "source"
+                | "embed" | "area" | "base" | "col" | "track" | "wbr")
+}
+
 fn is_block(tag: &str) -> Option<BlockKind> {
     match tag {
         "p" | "div" => Some(BlockKind::Paragraph),
@@ -273,8 +333,20 @@ pub(crate) fn is_noise_tag(tag: &str) -> bool {
     matches!(tag, "script" | "style" | "head" | "noscript" | "svg")
 }
 
+/// Parse with the defaults: the standard block budget and no filter.
 pub fn parse_html(html: &str) -> RichDoc {
+    parse_html_with(html, &ParseOptions::default())
+}
+
+pub fn parse_html_with(html: &str, opts: &ParseOptions<'_>) -> RichDoc {
     let toks = tokenize(html);
+    let mut dropped = 0usize;
+    let mut filtered = 0usize;
+    /// Depth of the filtered element we are inside, like `noise_depth`: a
+    /// filter that dropped the open tag and not the subtree would leave the
+    /// advertisement's text in the document with its wrapper gone, which is
+    /// worse than not filtering.
+    let mut skip_depth: usize = 0;
     let mut blocks: Vec<Block> = Vec::new();
     /// While inside a noise element, text tokens are discarded. Depth-counted
     /// rather than a flag, because `<svg><style>…</style></svg>` would
@@ -291,10 +363,11 @@ pub fn parse_html(html: &str) -> RichDoc {
     let mut row: Option<Vec<Cell>> = None;
     let mut cell: Option<Cell> = None;
 
-    let flush = |cur: &mut Option<Block>, blocks: &mut Vec<Block>| {
+    let cap = opts.max_blocks;
+    let flush = |cur: &mut Option<Block>, blocks: &mut Vec<Block>, dropped: &mut usize| {
         if let Some(b) = cur.take() {
             if !b.inlines.iter().all(|i| i.text.trim().is_empty()) || b.kind == BlockKind::Rule {
-                blocks.push(b);
+                if blocks.len() < cap { blocks.push(b); } else { *dropped += 1; }
             }
         }
     };
@@ -311,10 +384,43 @@ pub fn parse_html(html: &str) -> RichDoc {
             _ if noise_depth > 0 => continue,
             _ => {}
         }
+        // THE CALLER'S FILTER, and the subtree with it. Counted by tag
+        // depth: a filter that dropped the open tag alone would leave the
+        // advertisement's text in the document with its wrapper gone.
+        if let Some(skip) = opts.skip_element {
+            match &tok {
+                Token::Open { name, attrs } => {
+                    let attr = |k: &str| attrs.iter()
+                        .find(|(a, _)| a == k).map(|(_, v)| v.as_str());
+                    if skip_depth > 0 {
+                        // Already inside a filtered element: only the depth
+                        // matters, and a self-closing tag inside it must not
+                        // push one that never closes.
+                        if !is_void_tag(name) { skip_depth += 1; }
+                        continue;
+                    }
+                    if skip(Element { tag: name, id: attr("id"), class: attr("class"),
+                                      src: attr("src") }) {
+                        filtered += 1;
+                        // A void element has no subtree to skip — an
+                        // `<img>` filter that opened a depth would swallow
+                        // the rest of the page.
+                        if !is_void_tag(name) { skip_depth = 1; }
+                        continue;
+                    }
+                }
+                Token::Close(name) if skip_depth > 0 => {
+                    if !is_void_tag(name) { skip_depth = skip_depth.saturating_sub(1); }
+                    continue;
+                }
+                _ if skip_depth > 0 => continue,
+                _ => {}
+            }
+        }
         match tok {
             Token::Open { name, attrs } => {
                 if name == "table" {
-                    flush(&mut cur, &mut blocks);
+                    flush(&mut cur, &mut blocks, &mut dropped);
                     table = Some(Block::new(BlockKind::Table { has_header: false }, vec![]));
                     continue;
                 }
@@ -342,10 +448,10 @@ pub fn parse_html(html: &str) -> RichDoc {
                     }
                 }
                 if name == "hr" {
-                    flush(&mut cur, &mut blocks);
+                    flush(&mut cur, &mut blocks, &mut dropped);
                     blocks.push(Block::new(BlockKind::Rule, vec![]));
                 } else if let Some(kind) = is_block(&name) {
-                    flush(&mut cur, &mut blocks);
+                    flush(&mut cur, &mut blocks, &mut dropped);
                     cur = Some(Block::new(kind, vec![]));
                 } else {
                     // inline styling
@@ -403,7 +509,7 @@ pub fn parse_html(html: &str) -> RichDoc {
                     }
                 }
                 if is_block(&name).is_some() || name == "hr" {
-                    flush(&mut cur, &mut blocks);
+                    flush(&mut cur, &mut blocks, &mut dropped);
                 } else if matches!(name.as_str(), "b" | "strong" | "i" | "em" | "code" | "a") {
                     if let Some(prev) = style_stack.pop() {
                         style = prev;
@@ -437,14 +543,14 @@ pub fn parse_html(html: &str) -> RichDoc {
             }
         }
     }
-    flush(&mut cur, &mut blocks);
+    flush(&mut cur, &mut blocks, &mut dropped);
     // An unclosed <table> still yields its rows. Malformed HTML is the
     // normal case, and losing a whole table to a missing </table> would be
     // the parser being right about the input and useless about the page.
     if let Some(t) = table.take() {
         if !t.rows.is_empty() { blocks.push(t); }
     }
-    RichDoc { blocks }
+    RichDoc { blocks, blocks_dropped: dropped, filtered }
 }
 
 fn collapse_ws(s: &str) -> String {
@@ -521,6 +627,14 @@ pub fn render(ui: &mut egui::Ui, doc: &RichDoc,
             }
         });
     }
+    if doc.blocks_dropped > 0 {
+        // A page that stops half way with no explanation reads as a broken
+        // parser. Saying how much is missing is what tells a reader to open
+        // the original instead of scrolling for something that is not there.
+        ui.label(egui::RichText::new(format!(
+            "{} more block(s) not shown — the page is longer than this view renders",
+            doc.blocks_dropped)).small().color(colors.text_weak));
+    }
     followed
 }
 
@@ -594,6 +708,81 @@ fn table_ui(ui: &mut egui::Ui, block: &Block, has_header: bool,
             block.rows.len() + block.rows_dropped)).small().color(colors.text_weak));
     }
     followed
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    /// A stand-in for the app's `ad_filter`: the shape of the real one
+    /// (tag, id, class, src) without its list.
+    fn skip_ads(e: Element<'_>) -> bool {
+        e.class.is_some_and(|c| c.contains("ad-"))
+            || e.id.is_some_and(|i| i == "banner")
+            || e.src.is_some_and(|s| s.contains("tracker"))
+    }
+
+    fn with_filter(html: &str) -> RichDoc {
+        parse_html_with(html, &ParseOptions {
+            skip_element: Some(&skip_ads), ..Default::default() })
+    }
+
+    #[test]
+    fn a_filtered_element_takes_its_subtree_with_it() {
+        // Dropping the wrapper alone leaves the advertisement's text in the
+        // document with nothing around it — worse than not filtering,
+        // because it reads as content.
+        let d = with_filter(
+            "<p>real</p><div class=\"ad-slot\"><p>BUY NOW</p><p>more ad</p></div><p>also real</p>");
+        assert_eq!(d.text().contains("BUY NOW"), false, "{:?}", d.text());
+        assert!(d.text().contains("real") && d.text().contains("also real"));
+        assert_eq!(d.filtered, 1);
+    }
+
+    #[test]
+    fn a_void_element_filter_does_not_swallow_the_rest_of_the_page() {
+        // The bug this guards: an `<img>` has no close tag, so opening a
+        // skip depth on one never ends and everything after it vanishes.
+        let d = with_filter("<p>before</p><img src=\"https://x/tracker.gif\"><p>after</p>");
+        assert!(d.text().contains("before"), "{:?}", d.text());
+        assert!(d.text().contains("after"), "the page ended at the tracking pixel: {:?}",
+                d.text());
+        assert_eq!(d.filtered, 1);
+    }
+
+    #[test]
+    fn nested_filtered_elements_close_at_the_right_depth() {
+        // `<div class="ad-"><div class="ad-">…</div></div>` — the inner
+        // close must not end the skip early and let the outer's tail back
+        // in.
+        let d = with_filter(
+            "<div class=\"ad-a\"><div class=\"ad-b\">inner</div>outer tail</div><p>kept</p>");
+        assert!(!d.text().contains("inner"), "{:?}", d.text());
+        assert!(!d.text().contains("outer tail"), "the inner close ended the skip: {:?}",
+                d.text());
+        assert!(d.text().contains("kept"));
+    }
+
+    #[test]
+    fn no_filter_means_no_filtering_and_no_cost() {
+        let d = parse_html("<div class=\"ad-slot\"><p>BUY NOW</p></div>");
+        assert!(d.text().contains("BUY NOW"));
+        assert_eq!(d.filtered, 0);
+    }
+
+    #[test]
+    fn the_block_budget_is_bounded_and_says_what_it_dropped() {
+        // The display list is walked EVERY FRAME, so an unbounded one is a
+        // page that stays slow rather than one that loads slowly.
+        let html: String = (0..50).map(|i| format!("<p>para {i}</p>")).collect();
+        let d = parse_html_with(&html, &ParseOptions { max_blocks: 20, ..Default::default() });
+        assert_eq!(d.blocks.len(), 20);
+        assert_eq!(d.blocks_dropped, 30);
+        // And the default is generous enough that ordinary documents are
+        // untouched, or the cap becomes the common case.
+        let d2 = parse_html(&html);
+        assert_eq!(d2.blocks_dropped, 0);
+    }
 }
 
 #[cfg(test)]
