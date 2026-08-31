@@ -1446,7 +1446,22 @@ pub fn encode_gop_v3_core(
         .and_then(|v| v.parse().ok())
         .unwrap_or(96);
     let dict_spread = std::env::var("FAO_DICT_TAIL").is_err();
-    const DICT_MARGIN: u32 = 512;
+    // Margin the long-range match must beat the local predictor by.
+    // Was a fixed 512 SAD — the probe's STRONG threshold — and that is
+    // wrong for the same reason a fixed MV rate charge was wrong: it
+    // does not scale with the operating point. A 512-SAD improvement
+    // buys a lot of residual bytes at a fine dead zone and almost none
+    // at a coarse one, while the reference costs 5 bytes either way.
+    // Measured consequence: mode 4 won 7% on one Minecraft GOP and LOST
+    // 3.3% on another, where references fired freely (+443 KB of side
+    // info) and bought only 0.8% of residual back.
+    // Now tied to the dead zone: the gate is the SAD a 5-byte reference
+    // has to earn, and the dead zone is what sets how much SAD a byte
+    // is worth. FAO_DICT_MARGIN overrides for sweeps.
+    let dict_margin: u32 = std::env::var("FAO_DICT_MARGIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| (64.0 * opts.dead_zone).max(512.0) as u32);
     const MRU_CAP: usize = 128;
 
     for (fi, f) in frames.iter().enumerate() {
@@ -1663,7 +1678,7 @@ pub fn encode_gop_v3_core(
                                     best = (s, dfi, dx, dy);
                                 }
                             }
-                            if best.0 != u32::MAX && best.0 + DICT_MARGIN < best_local {
+                            if best.0 != u32::MAX && best.0 + dict_margin < best_local {
                                 if modes[gy * gw + gx] == 1 {
                                     mvs.pop();
                                     prev_regions -= 1;

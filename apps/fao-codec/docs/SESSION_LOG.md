@@ -4482,3 +4482,46 @@ was fixing WHICH candidates get examined. The byte split pointed at
 price (5-byte references, +246 KB of side info) and the real problem
 was count — and count was collapsing for a reason no byte-accounting
 would ever show, only the density instrumentation did.
+
+### Mode 4 generality: it LOST on a second Minecraft GOP, and the fixed margin was why
+
+Validation across material, dz32, spread selection:
+
+  film w1 (48f):   487,382 @ 38.311  ->  483,147 @ 38.329   -0.9%, +0.02 dB
+  Minecraft GOP A: 9,996,224 @ 31.742 -> 9,108,770 @ 32.054  -8.9%, +0.31 dB
+  Minecraft GOP B (t=45s, 48f), spread-24:
+                  11,350,178 @ 31.685 -> 11,726,020 @ 31.909 +3.3%, +0.22 dB
+Film is a small win, so mode 4 is not material-specific harm. But GOP
+B — same clip, same game, 25 seconds later — LOST 3.3% in bytes:
+references fired freely (+443 KB side info, +20%) and bought back only
+0.8% of residual. GOP B is the harder half of the clip (prev-mode
+share 0.557 against A's 0.641).
+
+Cause: DICT_MARGIN was a fixed 512 SAD, lifted from the probe's STRONG
+threshold. That is the same mistake the MV rate-charge experiment made
+years of sessions ago — a gate that does not scale with the operating
+point. A 512-SAD improvement buys many residual bytes at a fine dead
+zone and almost none at a coarse one, while the reference costs its
+5 bytes regardless. So the gate admits references that cannot pay
+whenever the dead zone is wide or the content is hard.
+
+Margin now derives from the dead zone (64 x dz, floor 512;
+FAO_DICT_MARGIN overrides). Swept on the LOSING GOP:
+  margin  512 (=16xdz): 11,726,020 @ 31.909   +3.3% vs no dict
+  margin 2048 (=64xdz): 10,899,237 @ 31.788   -4.0% vs no dict AND
+                                              +0.10 dB
+Raising the gate turned a 3.3% loss into a 4.0% win on the same GOP
+without touching the wire format — the admitted references are simply
+the ones that can pay. Default is 64 x dz.
+
+Honest status: GOP A was measured at 16xdz and is not re-measured at
+64xdz, so the -8.9% figure is at the OLD gate; the new default may
+move it either way (fewer references, each more profitable). Two GOPs
+of one clip plus one film GOP is not a validation set. Mode 4 stays
+behind FAO_DICT.
+
+Encode cost, measured and worth stating: spread-96 on GOP B did not
+finish inside a 14-minute budget, while spread-24 took 200s. Candidate
+search is O(regions x budget x 256-pixel SAD) and at 4K that is
+32,400 regions per frame — the budget is a real compute knob, not just
+a quality one, and 96 is only affordable on easier content.
