@@ -23,6 +23,7 @@ mod chord;
 mod cling;
 mod clinch;
 mod combine;
+mod combo;
 mod config;
 mod damage;
 mod dispatch;
