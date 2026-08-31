@@ -84,8 +84,13 @@ Not recovered, and known to exist somewhere:
 
 * the other eleven screenplays, including the `renamed_screenplays/`
   set (name changes only, original stories intact)
-* **`src/saga.rs`** — the integration doc calls it the single source of truth
-  for the nine films and says it is already created. It is not in this tree.
+* ~~`src/saga.rs`~~ — **recovered.** It is in the tree now, reconciled: it had
+  never compiled (`vec![]` in a `static`), and its Films 5 and 6 were the
+  abandoned Ember Deep / Convergence plot. Films 1–4 and 7–9 still carry
+  inherited licensed vocabulary and abandoned-plot references, counted by
+  `saga::join_tests::the_inherited_contamination_is_counted_not_hidden` rather
+  than silently rewritten — renaming those characters is authoring, not
+  cleanup.
 * `CANON_DISCREPANCY_NOTE.md`, which tracked exactly this supersession
 * the superseded `FILM_05_EMBER_DEEP` / `FILM_06_CONVERGENCE`, deliberately
   kept rather than deleted in case anything in them is still wanted
