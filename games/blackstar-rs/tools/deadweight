@@ -1,0 +1,70 @@
+#!/bin/sh
+# deadweight — what is built and never called, per file, as a ratchet.
+#
+# THE PROBLEM THIS EXISTS FOR. The most common defect in this repo, by a wide
+# margin, is a component built carefully, tested, and never called. C12_TODO
+# found ~15 instances in one sweep. This session alone found four more —
+# `orient`'s debris filter, `space`'s angular LOD and rescale-safe gravity,
+# `well_strength`, `up_score` — each of which was correct, tested, and reached
+# by nothing.
+#
+# The compiler already detects it. `cargo check` emits a `never used` warning
+# for every one. The reason nobody acts on that is volume: there are 330 of
+# them, so the signal is real and unreadable, and one more changes nothing
+# anybody notices.
+#
+# So this does not try to fix the 330. It RATCHETS them: per-file counts
+# against a committed baseline, failing only when a file gets worse. Adding
+# dead code becomes a visible act; removing it is rewarded with a smaller
+# number to commit.
+#
+#   tools/deadweight          # compare against the baseline, fail on growth
+#   tools/deadweight --bless  # record the current counts as the new baseline
+#
+# Honest limits: this counts what rustc reports under
+# `--no-default-features`, which is the configuration `fastcheck` uses and
+# NOT the one players build — the `audio` module is invisible to it (see
+# C13-1a). And `#[allow(dead_code)]` hides a symbol from both rustc and this.
+set -eu
+
+here=$(cd "$(dirname "$0")" && pwd)
+base="$here/deadweight.baseline"
+cd "$here/.."
+
+counts=$(cargo check --no-default-features 2>&1 \
+    | grep -A2 "never used" \
+    | grep -oE "src/[a-z_]+\.rs" \
+    | sort | uniq -c | awk '{print $2" "$1}' | sort)
+
+if [ "${1:-}" = "--bless" ]; then
+    printf '%s\n' "$counts" > "$base"
+    echo "deadweight: baseline recorded ($(printf '%s\n' "$counts" | wc -l) files, $(printf '%s\n' "$counts" | awk '{s+=$2} END {print s}') symbols)"
+    exit 0
+fi
+
+if [ ! -f "$base" ]; then
+    echo "deadweight: no baseline; run 'tools/deadweight --bless' first" >&2
+    exit 2
+fi
+
+rc=0
+printf '%s\n' "$counts" | while read -r file n; do
+    was=$(awk -v f="$file" '$1==f {print $2}' "$base")
+    was=${was:-0}
+    if [ "$n" -gt "$was" ]; then
+        echo "deadweight: $file grew $was -> $n" >&2
+        rc=1
+    fi
+    echo "$rc" > /tmp/.deadweight_rc
+done
+rc=$(cat /tmp/.deadweight_rc 2>/dev/null || echo 0)
+rm -f /tmp/.deadweight_rc
+
+total=$(printf '%s\n' "$counts" | awk '{s+=$2} END {print s}')
+was_total=$(awk '{s+=$2} END {print s}' "$base")
+if [ "$rc" -eq 0 ]; then
+    echo "deadweight: ok — $total unreached symbols (baseline $was_total)"
+else
+    echo "deadweight: a file got worse. Wire it, delete it, or --bless with a reason." >&2
+fi
+exit "$rc"

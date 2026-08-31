@@ -46,6 +46,22 @@ environment the artifact does not ship*.
 - **C13-1b** — 345 warnings under `--no-default-features` vs 118 under
   `--features audio --tests`. Nobody has looked at why the counts differ
   that much; some of the 345 may be things that should be called.
+  **Partly answered:** 325 of them are `never used`, now counted per file
+  by `tools/deadweight` against a committed baseline. The ratchet fails
+  only when a file gets WORSE, which is the part that was missing — the
+  330 were real and unreadable, so one more changed nothing anybody
+  noticed.
+
+- **C13-1c — I MADE THIS WORSE, MEASURABLY.** The four largest
+  dead-code files in the tree are all modules added in this session:
+  `saga.rs` 25, `settlement.rs` 16, `swing.rs` 11, `combo.rs` 11 — 63
+  unreached symbols, and the top four positions. Each was written as a
+  headless core with its shell deferred, which is the right shape and
+  also exactly what "built carefully, tested, and never called" looks
+  like from the outside. The ratchet exists because the pattern was mine
+  as much as anyone's. Wiring any of them needs the thing that blocks
+  it: a screen for `settlement`, a phone for `swing`/`combo`, authored
+  claims for `saga`.
 
 ## 2. Atmosphere: what was fixed, and the much longer list that was not
 
