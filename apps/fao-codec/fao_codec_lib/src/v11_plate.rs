@@ -609,7 +609,11 @@ mod tests_v2 {
 // ═══════════════════════════════════════════════════════════════════
 
 const REGION: usize = 16;
-const MV_RANGE: i32 = 12;
+// 24 px: the saturation diagnostic on the fast-pan shot showed 4.4%
+// of prev-mode regions pinned at the old 12 px clamp — regions
+// silently taking bad prediction. Diamond descent keeps the larger
+// range cheap (a step-8 tier seeds it); ±96 quarter-pel fits i8.
+const MV_RANGE: i32 = 24;
 
 fn sad_region(a: &[u8], w: usize, h: usize, ax: i32, ay: i32, b: &[u8], bx: usize, by: usize) -> u32 {
     // SAD of REGION×REGION: a sampled at (ax,ay) (clamped), b at (bx,by).
@@ -701,7 +705,7 @@ fn search_mv(prev_y: &[u8], w: usize, h: usize, cur_y: &[u8], rx: usize, ry: usi
     let mut best_sad = sad_region(prev_y, w, h, rx as i32, ry as i32, cur_y, rx, ry);
     let mut best_cost = best_sad; // zero-MV bias is 0
     // Coarse: step-4 diamond out to MV_RANGE, then step-2, then step-1.
-    for &step in &[4i32, 2, 1] {
+    for &step in &[8i32, 4, 2, 1] {
         let mut improved = true;
         while improved {
             improved = false;
@@ -1260,6 +1264,14 @@ pub fn encode_gop_v3(
                     // persistent error across future frames), not a better
                     // single-frame proxy. Numbers in SESSION_LOG.
                     if sad_prev + 64 < sad_plate {
+                        if std::env::var("FAO_MV_DEBUG").is_ok() {
+                            let sat = MV_RANGE * 4; // qpel units at the clamp
+                            if (mv.0 as i32).abs() >= sat - 4 || (mv.1 as i32).abs() >= sat - 4 {
+                                eprintln!("mvsat");
+                            } else {
+                                eprintln!("mvok");
+                            }
+                        }
                         modes[gy * gw + gx] = 1;
                         mvs.push(mv);
                         prev_regions += 1;
@@ -1809,6 +1821,14 @@ pub fn encode_gop_v4(
                     let sad_plate = sad_region(&plate_pred.y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry);
                     let (mv, sad_prev) = search_mv(&prev.y, fw, fh, &f.y, rx, ry);
                     if sad_prev + 64 < sad_plate {
+                        if std::env::var("FAO_MV_DEBUG").is_ok() {
+                            let sat = MV_RANGE * 4; // qpel units at the clamp
+                            if (mv.0 as i32).abs() >= sat - 4 || (mv.1 as i32).abs() >= sat - 4 {
+                                eprintln!("mvsat");
+                            } else {
+                                eprintln!("mvok");
+                            }
+                        }
                         modes[gy * gw + gx] = 1;
                         mvs.push(mv);
                         prev_regions += 1;

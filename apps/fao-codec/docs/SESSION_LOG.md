@@ -3508,3 +3508,15 @@ dominance again); shotB +0.1% bytes for +0.044 dB. Full suite
 Session ladder: 46.5× @ −2.00 dB → 31.9× @ +0.57 dB. The intra
 family (DC + planar) has now delivered −6.8% bytes and +0.21 dB
 combined — the ledger's unsolved bucket paying out as predicted.
+
+### MV range 12 → 24 px (same session)
+
+Diagnostic first: 4.4% of prev-mode regions on the fast-pan shot sat
+pinned at the ±12 px clamp (28,693 of 658,861 measured) — silently
+taking bad prediction. Extended to ±24 px (±96 quarter-pel, still
+i8) with a step-8 tier seeding the diamond descent. A/B (after
+printing): shot 9 −0.5% AND +0.054 dB; shotB flat bytes AND
++0.065 dB — strictly positive on both axes on both shots. Full-suite
+headline NOT yet re-measured for this change; the standing suite
+number remains the planar generation (31.58 MB @ 33.90 / 0.941,
+31.9×) until the next full run prints.
