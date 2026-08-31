@@ -7134,3 +7134,102 @@ mod region_shape_tests {
     }
 }
 
+/// EVERY SPACE THE PICKER OFFERS MUST BUILD, and build something sane.
+///
+/// Sixteen procedural rooms joined the picker three commits ago, having previously been reachable
+/// only through `LOGSCOPE_ROOM=<n>`. That is a lot of newly-selectable geometry that nobody had a
+/// convenient way to open, and a scene is not a pure function of nothing: it reads `EnvParams`,
+/// walks the conversation shape, and computes a fit factor. A room that panics, produces no meshes,
+/// or emits a NaN vertex would be found by the first person who chose it from a list.
+///
+/// These are population tests over `roomtheme::spaces()` — the same list the picker draws from, so
+/// the coverage cannot drift from what is offered.
+#[cfg(test)]
+mod every_space_builds {
+    use super::*;
+
+    fn spaces() -> Vec<&'static str> {
+        crate::roomtheme::spaces().into_iter().map(|p| p.name).collect()
+    }
+
+    /// A NaN vertex is the failure worth naming: it does not crash the build, it propagates through
+    /// the projection into `Color32` arithmetic and panics somewhere unrelated a frame later.
+    #[test]
+    fn no_space_emits_a_non_finite_vertex() {
+        set_env_params(EnvParams { nodes: 40, branches: 3, segments: 4, seed: 11,
+                                   ext_x: 24, ext_z: 18, ..Default::default() });
+        let mut bad = Vec::new();
+        for name in spaces() {
+            let sc = build(name);
+            for (mi, m) in sc.meshes.iter().enumerate() {
+                if let Some(v) = m.verts.iter().find(|v| !v.x.is_finite() || !v.y.is_finite() || !v.z.is_finite()) {
+                    bad.push(format!("{name}: mesh {mi} has ({}, {}, {})", v.x, v.y, v.z));
+                    break;
+                }
+            }
+        }
+        set_env_params(EnvParams::default());
+        assert!(bad.is_empty(), "{} space(s) with a non-finite vertex:\n  {}", bad.len(), bad.join("\n  "));
+    }
+
+    #[test]
+    fn every_space_produces_geometry() {
+        set_env_params(EnvParams { nodes: 40, branches: 3, segments: 4, seed: 11,
+                                   ext_x: 24, ext_z: 18, ..Default::default() });
+        let mut empty = Vec::new();
+        for name in spaces() {
+            let sc = build(name);
+            let verts: usize = sc.meshes.iter().map(|m| m.verts.len()).sum();
+            if sc.meshes.is_empty() || verts < 24 {
+                empty.push(format!("{name}: {} meshes, {verts} verts", sc.meshes.len()));
+            }
+        }
+        set_env_params(EnvParams::default());
+        assert!(empty.is_empty(), "space(s) that build nothing to stand in:\n  {}", empty.join("\n  "));
+    }
+
+    /// A room whose extent runs to thousands of units puts the camera inside a speck, and one that
+    /// is a metre across puts it inside a wall. Both are silent — the scene renders, just not as
+    /// anywhere.
+    #[test]
+    fn every_space_has_a_plausible_extent() {
+        set_env_params(EnvParams { nodes: 40, branches: 3, segments: 4, seed: 11,
+                                   ext_x: 24, ext_z: 18, ..Default::default() });
+        let mut odd = Vec::new();
+        for name in spaces() {
+            let sc = build(name);
+            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+            for m in &sc.meshes {
+                for v in &m.verts {
+                    lo = lo.min(v.x.min(v.z));
+                    hi = hi.max(v.x.max(v.z));
+                }
+            }
+            let span = hi - lo;
+            if !(4.0..=4000.0).contains(&span) {
+                odd.push(format!("{name}: {span:.1} units across"));
+            }
+        }
+        set_env_params(EnvParams::default());
+        assert!(odd.is_empty(), "space(s) the camera cannot stand in:\n  {}", odd.join("\n  "));
+    }
+
+    /// The graph grows the world (`scene_fit`), and a bigger conversation must not shrink it — that
+    /// direction would put the turns outside the room they are meant to be in.
+    #[test]
+    fn a_bigger_conversation_does_not_shrink_the_world() {
+        let measure = |nodes: u32| -> f32 {
+            set_env_params(EnvParams { nodes, branches: 3, segments: 4, seed: 11,
+                                       ext_x: 24, ext_z: 18, ..Default::default() });
+            let sc = build("Atlantis");
+            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+            for m in &sc.meshes { for v in &m.verts { lo = lo.min(v.x); hi = hi.max(v.x); } }
+            hi - lo
+        };
+        let small = measure(20);
+        let large = measure(400);
+        set_env_params(EnvParams::default());
+        assert!(large >= small - 0.5, "400 turns gave a {large:.1}-unit world where 20 gave {small:.1}");
+    }
+}
+
