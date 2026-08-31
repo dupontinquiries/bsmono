@@ -18,6 +18,12 @@ struct App {
     last_note: String,
     /// The real library: a scan of this machine's music directory.
     catalog: bo_suite_egui::music_scan::FsCatalog,
+    /// The recogniser, when one is configured and voice is on.
+    voice: bo_suite_egui::voice_source::VoiceSource,
+    /// What the recogniser was last started with, so a settings change
+    /// restarts it and an unchanged one does not — respawning a process
+    /// every frame is the shape of bug that empties a battery.
+    voice_cmd: String,
 }
 
 impl App {
@@ -63,11 +69,50 @@ impl App {
             player: bo_suite_egui::playback::Player::new(),
             last_note: String::new(),
             catalog,
+            voice: bo_suite_egui::voice_source::VoiceSource::new(),
+            voice_cmd: String::new(),
         }
     }
 }
 
 impl App {
+    /// Keep the recogniser in step with the settings, and act on what it
+    /// heard.
+    ///
+    /// `Controller::heard` had no caller until now: voice control was a
+    /// complete, tested parser with no source, which is a switch that
+    /// does nothing when you turn it on — worse than a missing feature,
+    /// because the switch implies otherwise.
+    fn pump_voice(&mut self) {
+        // WANTED is both halves. Turning voice off must stop the process,
+        // not merely ignore what it says: a recogniser still running after
+        // the switch is off is a microphone nobody thinks is on.
+        let prefs = &self.controller.voice;
+        let wanted = if prefs.enabled { prefs.recognizer.trim().to_string() }
+                     else { String::new() };
+        if wanted != self.voice_cmd {
+            self.voice_cmd = wanted.clone();
+            self.voice.stop_now();
+            if !wanted.is_empty() {
+                eprintln!("bo-suite: listening with: {wanted}");
+                self.voice.start(&wanted);
+            }
+        }
+        if let Some(why) = self.voice.heard.take_failure() {
+            // Said once. A recogniser that quits because its model is
+            // missing otherwise leaves a switch reading "on" and a room
+            // where nothing happens.
+            self.last_note = why;
+        }
+        for phrase in self.voice.heard.drain() {
+            // Logged before acting, so a phrase that did nothing can be
+            // told apart from one that was never heard — the two look
+            // identical from the room.
+            eprintln!("bo-suite: heard {phrase:?}");
+            let _ = self.controller.heard(&phrase);
+        }
+    }
+
     /// Carry out whatever the view asked for, and report back what the
     /// player did.
     fn pump_playback(&mut self) {
@@ -143,6 +188,7 @@ impl eframe::App for App {
         if self.controller.pending_tracks.is_some() {
             self.controller.answer_tracks_from(&self.catalog);
         }
+        self.pump_voice();
         self.pump_playback();
     }
 }

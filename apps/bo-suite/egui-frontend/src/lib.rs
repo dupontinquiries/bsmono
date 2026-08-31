@@ -22,6 +22,7 @@ pub mod music_scan;
 pub mod playback;
 pub mod surround;
 pub mod voice_control;
+pub mod voice_source;
 pub mod sources;
 pub mod fileproc;
 pub mod shell_bits;

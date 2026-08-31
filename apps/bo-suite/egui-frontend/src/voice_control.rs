@@ -301,11 +301,20 @@ pub struct VoicePrefs {
     /// listens. It is a filter on transcripts a host already has, for a
     /// room where the television talks.
     pub prefix: String,
+    /// The command that prints phrases, one per line. Empty means none,
+    /// and none means nothing is spawned — see `voice_source`.
+    ///
+    /// A command rather than a built-in recogniser: voiceterm already owns
+    /// the whisper models, the mic pipeline and the wake gate, and a
+    /// second copy here would be a second thing to keep in step. What this
+    /// app needs is the output.
+    pub recognizer: String,
 }
 
 impl Default for VoicePrefs {
     fn default() -> Self {
-        VoicePrefs { enabled: false, act_on_uncertain: false, prefix: String::new() }
+        VoicePrefs { enabled: false, act_on_uncertain: false,
+                     prefix: String::new(), recognizer: String::new() }
     }
 }
 
@@ -318,8 +327,9 @@ pub fn render(p: &VoicePrefs) -> String {
              # act_on_uncertain: act on \"play <something>\" and \"search …\" \
              without confirming\n\
              # prefix: require phrases to start with this word (blank for none)\n\
-             enabled = {}\nact_on_uncertain = {}\nprefix = {}\n",
-            p.enabled, p.act_on_uncertain, p.prefix)
+             # recognizer: a command printing one phrase per line (blank: none)\n\
+             enabled = {}\nact_on_uncertain = {}\nprefix = {}\nrecognizer = {}\n",
+            p.enabled, p.act_on_uncertain, p.prefix, p.recognizer)
 }
 
 pub fn parse_prefs(text: &str) -> VoicePrefs {
@@ -334,6 +344,7 @@ pub fn parse_prefs(text: &str) -> VoicePrefs {
             "act_on_uncertain" =>
                 p.act_on_uncertain = matches!(v, "true" | "yes" | "on" | "1"),
             "prefix" => p.prefix = v.to_string(),
+            "recognizer" => p.recognizer = v.to_string(),
             // Unknown keys ignored: the file outlives the build that wrote
             // it, and a setting removed later must not stop the rest
             // loading.
@@ -491,7 +502,8 @@ mod tests {
 
     #[test]
     fn the_settings_file_round_trips_and_survives_an_unknown_key() {
-        let p = VoicePrefs { enabled: true, act_on_uncertain: true, prefix: "bo".into() };
+        let p = VoicePrefs { enabled: true, act_on_uncertain: true, prefix: "bo".into(),
+                             recognizer: "voiceterm --print-phrases".into() };
         assert_eq!(parse_prefs(&render(&p)), p);
         let old = parse_prefs("enabled = true\nfuture_thing = 3\nprefix = bo\n");
         assert!(old.enabled);
@@ -540,6 +552,18 @@ pub fn voice_settings_ui(ui: &mut egui::Ui, p: &mut VoicePrefs,
     ui.colored_label(c.text_weak,
         "A word every command must start with, for a room where the \
          television talks.");
+    ui.horizontal(|ui| {
+        ui.label("listen with");
+        changed |= ui.add(egui::TextEdit::singleline(&mut p.recognizer)
+                          .hint_text("nothing — no phrases will arrive")
+                          .desired_width(230.0)).changed();
+    });
+    // Named examples, because "a command that prints phrases" is an
+    // interface nobody can guess the shape of, and a blank box with no
+    // hint is a feature switched on that never does anything.
+    ui.colored_label(c.text_weak,
+        "A command printing one phrase per line — voiceterm's recogniser, \
+         or a script reading a fifo. Nothing runs until you name one.");
     changed
 }
 
