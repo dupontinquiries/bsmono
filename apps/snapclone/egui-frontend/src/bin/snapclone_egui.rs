@@ -700,11 +700,6 @@ impl App {
         let mut pending: Vec<HostEvent> = Vec::new();
         for c in cmds {
             match c {
-                // REAL, not a debug sink. This is the whole point of the
-                // exercise: a contact scanned or renamed now reaches the disk,
-                // so it is still there next launch. A write failure is
-                // reported rather than swallowed — a silent one means the user
-                // adds someone twice and never learns why.
                 // THE SHUTTER PRODUCES A FILE. Not the composer flow yet —
                 // that is its own thread of work — but a press that lands a
                 // viewable image on disk is the difference between a camera
@@ -816,6 +811,16 @@ impl App {
                         }));
                     }
                 }
+                // REAL, not a debug sink: a contact scanned or renamed
+                // reaches the disk, so it is still there next launch. A
+                // write failure is REPORTED rather than swallowed — a
+                // silent one means the person adds someone twice and never
+                // learns why.
+                //
+                // (This paragraph had drifted onto the CaptureSnap arm,
+                // describing a handler thirty lines away. Moving code
+                // leaves its explanation behind unless somebody checks,
+                // which is the second time this session.)
                 HostCommand::SaveContacts(book) => {
                     if let Err(e) = snapclone_egui::contact_book::store(&book) {
                         eprintln!("snapclone: could not save contacts: {e}");

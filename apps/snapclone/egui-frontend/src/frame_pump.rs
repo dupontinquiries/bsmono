@@ -57,7 +57,13 @@ impl RawFrame {
     /// a reader that got EOF mid-frame, a stride mismatch — must be refused
     /// at the upload, not panicked on inside egui.
     pub fn pixels_plausible(&self) -> bool {
-        self.rgba.len() == (self.width as usize) * (self.height as usize) * 4
+        // A NON-ZERO geometry, as well as a buffer matching it. Comparing
+        // lengths alone lets a 0x0 frame through — 0 == 0 — and the
+        // shutter would write an empty file and report success, leaving
+        // the person with a snap they cannot open and no reason why.
+        self.width > 0
+            && self.height > 0
+            && self.rgba.len() == (self.width as usize) * (self.height as usize) * 4
     }
 }
 
@@ -561,5 +567,33 @@ mod ppm_tests {
                            rgba: vec![1, 2, 3, 4, 9, 9].into() };
         let b = ppm_bytes(&f);
         assert_eq!(b.len(), b"P6\n1 1\n255\n".len() + 3);
+    }
+}
+
+#[cfg(test)]
+mod empty_frame_tests {
+    use super::*;
+
+    #[test]
+    fn a_frame_with_no_geometry_is_not_a_photograph() {
+        // `pixels_plausible` compares the buffer against the geometry, so
+        // a 0x0 frame with no pixels satisfies it — 0 == 0 — and the
+        // shutter would save an empty file and report success. The person
+        // gets a snap they cannot open and no reason why.
+        //
+        // Found while auditing what the shutter actually trusts, not by a
+        // failure: nothing in the app produces a 0x0 frame today, and a
+        // camera that briefly reports one is exactly the case this guard
+        // exists for.
+        let empty = RawFrame { width: 0, height: 0, captured_ms: 0, seq: 1,
+                               rgba: Vec::new().into() };
+        assert!(!empty.pixels_plausible(), "a 0x0 frame passed as a photo");
+    }
+
+    #[test]
+    fn a_real_frame_still_passes() {
+        let f = RawFrame { width: 2, height: 2, captured_ms: 0, seq: 1,
+                           rgba: std::sync::Arc::from(&[0u8; 16][..]) };
+        assert!(f.pixels_plausible());
     }
 }
