@@ -42,6 +42,18 @@ Edit these to add a project or target; the tools below read them.
   - `build/build.sh --only snapclone` — one project
   - `build/build.sh --target phone` — one target
   - `build/build.sh --run --only peek` — really build (host cargo)
+- **`maintenance/tools/fleet_build.sh`** — does every app still compile against
+  the shared crates? The apps are separate cargo workspaces, so there is no one
+  `cargo test` that covers them.
+  - **Artifacts do NOT go in `apps/*/target` any more.** One shared cache at
+    `~/.cache/fleet-build/target`, or `/dev/shm` when it fits, because each run
+    used to start from a cold per-iteration tree and write ~40 GB.
+  - The RAM cache is automatic and refuses when `/dev/shm` is too small —
+    tmpfs is swap-backed, so a tight fit would page to the SSD in small random
+    writes, which is worse than the sequential ones it avoids. `RAMCACHE=0`
+    forces disk.
+  - It prints where stale `apps/*/target` directories are and what they cost.
+    It never deletes them.
 - **`build/flatpak.sh`** — Flatpak packaging stage (stub): for each
   `flatpak != false` project, generate offline cargo sources + a manifest using
   its `runtime`, then `flatpak-builder`. Runs on a host with the flatpak tools.
@@ -57,6 +69,26 @@ Run via **`./verify.sh`** (no compiler needed):
   *candidates*, not a gate. The real peek binary at build time is the authority.
 - **drift** (`tools/drift`) — boundary-drift checker, **spec-only today**
   (playground compiles; the `cargo drift` subcommands aren't implemented).
+
+Run by hand, on one app at a time (`python3 maintenance/tools/X.py apps/foo`):
+
+- **unhosted_check** — modules nothing calls. **Trust after hand-checking**,
+  and hand-check with a WHOLE-TREE grep rather than the tool's own method.
+  It has been wrong three times, each because a caller can exist in a way it
+  could not see: aliased imports, callers in a sibling crate, and callers in
+  C++ across an FFI boundary. Its first run on gitmind reported 35 modules of
+  which 7 of the first 8 were false. All three are fixed; the lesson is that
+  a fourth kind of caller probably exists.
+- **testonly_check** — public functions whose only callers are tests. This is
+  the finer version and catches what the above misses, because the function
+  lives in a module that IS reachable. Single digits per app, and the first
+  finding hand-checked was a real bug (a delivery ack nothing called, so a
+  sent snap could only ever time out).
+
+Both answer "is this reachable", not "is this correct". A hit is a question.
+Four different answers are normal: superseded work to delete, unfinished work
+to wire, speculative design the app never adopted, and library API whose
+consumer nobody has written yet — and only reading tells you which.
 
 ## gitmind (git + gitmind side-by-side)
 
