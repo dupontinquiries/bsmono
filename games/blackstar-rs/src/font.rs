@@ -5,7 +5,7 @@
 use crate::render::UiVert;
 
 pub const CW: f32 = 6.0; // advance in pixels (5 + 1 gap)
-#[allow(dead_code)]
+pub const GH: f32 = 7.0; // glyph height in pixels (7 rows)
 pub const CH: f32 = 9.0; // line advance in pixels (7 + 2 gap)
 
 fn glyph(c: char) -> Option<[&'static str; 7]> {

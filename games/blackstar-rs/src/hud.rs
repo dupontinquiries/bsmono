@@ -146,15 +146,15 @@ pub fn draw_hotbar(ui: &mut Vec<UiVert>, a: f32, hb: &crate::hotbar::Hotbar) {
     let gap = 0.008;
     let total = cells as f32 * cw + (cells - 1) as f32 * gap;
     let x0 = -total * 0.5;
-    let y = -0.90;
-    let h = 0.062;
+    let y = HOTBAR_Y;
+    let h = HOTBAR_H;
     for i in 0..cells {
         let cx = x0 + i as f32 * (cw + gap);
         let active = i == hb.active_index();
         let filled = hb.slot(i).is_some();
         // the active cell sits slightly proud and brighter — the lift is
         // what makes the row readable at a glance without reading text
-        let lift = if active { 0.010 } else { 0.0 };
+        let lift = if active { HOTBAR_LIFT } else { 0.0 };
         let bg = if active {
             [0.10, 0.13, 0.18, 0.88]
         } else if filled {
@@ -172,11 +172,16 @@ pub fn draw_hotbar(ui: &mut Vec<UiVert>, a: f32, hb: &crate::hotbar::Hotbar) {
             quad(ui, cx, y + lift, cx + t, y + h + lift, c);
             quad(ui, cx + cw - t, y + lift, cx + cw, y + h + lift, c);
         }
-        // the slot number, always — this is what the hand actually uses
+        // the slot number, always — this is what the hand actually uses.
+        // font::text draws DOWNWARD from its y, so the number starts just
+        // under the cell's top edge; at 0.0045 the glyph is 0.0315 tall
+        // and stays inside the 0.062 cell. It used to start near the cell
+        // BOTTOM and hang 0.03 below it, which is where the recording
+        // showed every digit: under the bar, in the item name's lane.
         let num = [b'1' + i as u8];
         let s = std::str::from_utf8(&num).unwrap_or("?");
         let ncol = if filled { [0.86, 0.90, 0.96, 0.95] } else { [0.45, 0.47, 0.52, 0.70] };
-        label(ui, cx + 0.006, y + lift + 0.006, 0.0052, a, ncol, s);
+        label(ui, cx + 0.006, y + h + lift - 0.006, 0.0045, a, ncol, s);
     }
     // the active slot's name, centred under the bar
     if let Some(slot) = hb.active() {
@@ -388,14 +393,19 @@ pub fn sortie_panel(ui: &mut Vec<UiVert>, a: f32, rows: &[String]) {
         return;
     }
     let (x0, x1) = (-0.98, -0.50);
-    let top = 0.58;
-    let line = 0.034;
-    let h = line * rows.len() as f32 + 0.030;
+    // Below the stat card's tallest configuration (its panel bottom is
+    // ~0.564 fully populated); the two share the left edge.
+    let top = 0.54;
+    // The pitch is the font's line advance for the row size. It was a
+    // flat 0.034 — half a glyph — so a four-row brief drew every line
+    // through the next.
+    let line = font::CH * 0.0082;
+    let h = 0.032 + line * rows.len() as f32;
     panel(ui, a, x0, top - h, x1, top);
-    label(ui, x0 + 0.02 / a, top - 0.030, 0.0098, a, GOLD, &rows[0]);
+    label(ui, x0 + 0.02 / a, top - 0.020, 0.0098, a, GOLD, &rows[0]);
     for (i, r) in rows.iter().enumerate().skip(1) {
         let c = if r.starts_with('·') { DIM } else { PAPER };
-        label(ui, x0 + 0.02 / a, top - 0.030 - line * i as f32, 0.0082, a, c, r);
+        label(ui, x0 + 0.02 / a, top - 0.020 - line * i as f32, 0.0082, a, c, r);
     }
 }
 
@@ -547,17 +557,19 @@ pub fn trial_banner(
 ) {
     let (x0, x1) = (-0.34, 0.34);
     let y = 0.86;
-    quad(ui, x0, y - 0.075, x1, y + 0.035, [0.06, 0.07, 0.11, 0.72]);
+    quad(ui, x0, y - 0.20, x1, y + 0.035, [0.06, 0.07, 0.11, 0.72]);
     quad(ui, x0, y + 0.030, x1, y + 0.035, [GOLD[0], GOLD[1], GOLD[2], 0.8]);
-    label_c_at(ui, 0.0, y - 0.004, 0.0098, a, PAPER, name);
+    // name glyphs: y+0.022 down to y-0.0466
+    label_c_at(ui, 0.0, y + 0.022, 0.0098, a, PAPER, name);
     // the clock runs down, and reddens as it goes
     let left = (limit - t).max(0.0);
     let urgent = left < limit * 0.25;
     let col = if urgent { [1.0, 0.45, 0.35, 1.0] } else { CYAN };
     let clock = format!("{left:.1}s");
-    label_c_at(ui, 0.0, y - 0.046, 0.0088, a, col, &clock);
-    // progress
-    let by = y - 0.066;
+    // clock glyphs: y-0.058 down to y-0.1196, clear of the name above
+    label_c_at(ui, 0.0, y - 0.058, 0.0088, a, col, &clock);
+    // progress, below the clock's glyph bottom
+    let by = y - 0.132;
     quad(ui, x0 + 0.02, by, x1 - 0.02, by + 0.008, [0.20, 0.24, 0.30, 0.7]);
     let w = (x1 - 0.02) - (x0 + 0.02);
     quad(ui, x0 + 0.02, by, x0 + 0.02 + w * progress.clamp(0.0, 1.0), by + 0.008, GOLD);
@@ -572,7 +584,8 @@ pub fn trial_banner(
         tail.push_str("GHOST");
     }
     if !tail.is_empty() {
-        label_c_at(ui, 0.0, y - 0.098, 0.0068, a, DIM, &tail);
+        // tail glyphs: y-0.144 down to y-0.1916, inside the box
+        label_c_at(ui, 0.0, y - 0.144, 0.0068, a, DIM, &tail);
     }
 }
 
@@ -631,11 +644,13 @@ pub fn academy_menu(
 pub fn lesson_banner(ui: &mut Vec<UiVert>, a: f32, name: &str, hint: &str, progress: f32, learned: bool) {
     let (x0, x1) = (-0.44, 0.44);
     let y = 0.86;
-    quad(ui, x0, y - 0.088, x1, y + 0.035, [0.06, 0.07, 0.11, 0.72]);
+    quad(ui, x0, y - 0.130, x1, y + 0.035, [0.06, 0.07, 0.11, 0.72]);
     quad(ui, x0, y + 0.030, x1, y + 0.035, [GOLD[0], GOLD[1], GOLD[2], 0.8]);
-    label_c_at(ui, 0.0, y - 0.004, 0.0098, a, if learned { CYAN } else { PAPER }, name);
-    label_c_at(ui, 0.0, y - 0.040, 0.0072, a, DIM, &fit(hint, 0.84, 0.0072, a));
-    let by = y - 0.078;
+    // name glyphs: y+0.022 down to y-0.0466
+    label_c_at(ui, 0.0, y + 0.022, 0.0098, a, if learned { CYAN } else { PAPER }, name);
+    // hint glyphs: y-0.058 down to y-0.1084, clear of the name
+    label_c_at(ui, 0.0, y - 0.058, 0.0072, a, DIM, &fit(hint, 0.84, 0.0072, a));
+    let by = y - 0.120;
     quad(ui, x0 + 0.02, by, x1 - 0.02, by + 0.008, [0.20, 0.24, 0.30, 0.7]);
     let w = (x1 - 0.02) - (x0 + 0.02);
     quad(ui, x0 + 0.02, by, x0 + 0.02 + w * progress.clamp(0.0, 1.0), by + 0.008, GOLD);
@@ -1008,63 +1023,152 @@ pub fn hit_row(top: f32, row_h: f32, n: usize, y: f32) -> Option<usize> {
 }
 
 // ------------------------------------------------------------------ hud ----
+// ── in-game HUD geometry, shared between drawing and its tests ──────────
+//
+// The hotbar band: cells sit at HOTBAR_Y..HOTBAR_Y+HOTBAR_H, the active one
+// lifted by HOTBAR_LIFT, the active item's name below the cells. Everything
+// stacked bottom-centre has to stay ABOVE this band, and the constant that
+// enforces it is exported so a test can assert it instead of a human
+// noticing it in a recording.
+pub const HOTBAR_Y: f32 = -0.90;
+pub const HOTBAR_H: f32 = 0.062;
+pub const HOTBAR_LIFT: f32 = 0.010;
+/// Top of anything the hotbar draws (a lifted active cell).
+pub const HOTBAR_TOP: f32 = HOTBAR_Y + HOTBAR_H + HOTBAR_LIFT;
+/// Trailing gap on the bottom-centre panel: its content must end above the
+/// hotbar band with margin. safe-area floor is -0.972; -0.972 + 0.165 =
+/// -0.807, which clears HOTBAR_TOP (-0.828) by ~0.02.
+pub const HOTBAR_CLEARANCE: f32 = 0.165;
+
+// The centre weapon readout: name, cooldown bar, element, top to bottom.
+// One set of numbers for the draw code and the test that proves the three
+// stay disjoint (name glyphs end above the bar, element starts below it).
+pub const W_NAME_Y: f32 = -0.11;
+pub const W_NAME_PX: f32 = 0.0052;
+pub const W_BAR_Y0: f32 = -0.155;
+pub const W_BAR_H: f32 = 0.006;
+pub const W_ELEM_Y: f32 = -0.175;
+pub const W_ELEM_PX: f32 = 0.0045;
+
+/// The top-left stat card as ONE stack. These eight lines used to be
+/// hand-placed at y-coordinates ~2.4x their nominal size apart, a spacing
+/// that only works for a text metric font.rs does not have — the real
+/// glyphs are GH (7) font-pixels tall, so every line drew through the next
+/// and the card was an unreadable pile in the first live recording. As a
+/// panel the spacing comes from the same font metrics the rasterizer uses,
+/// and a test can prove the lines disjoint.
+#[allow(clippy::too_many_arguments)]
+pub fn stat_card_panel(
+    rings: u64,
+    goals: u64,
+    car_rings: u64,
+    car_line: &str,
+    map_name: &str,
+    online: Option<(usize, &str)>,
+    air_roll: bool,
+) -> ui_layout::Panel {
+    let mut p = ui_layout::Panel::new(ui_layout::Anchor::TopLeft);
+    p.gap = 0.004; // the font's own leading (CH-GH rows) does most of it
+    p = p
+        .push(ui_layout::Widget::label(&format!("RINGS {rings}"), 0.008, PAPER))
+        .push(ui_layout::Widget::label(&format!("GOALS {goals}"), 0.006, GOLD))
+        .push(ui_layout::Widget::label(&format!("CAR-THROUGHS {car_rings}"), 0.005, DIM))
+        .push(ui_layout::Widget::label(car_line, 0.0045, DIM))
+        .push(ui_layout::Widget::label(map_name, 0.0045, DIM));
+    if let Some((n, status)) = online {
+        p = p.push(ui_layout::Widget::label(&format!("ONLINE: {n} PILOTS"), 0.005, GOLD));
+        if !status.is_empty() {
+            p = p.push(ui_layout::Widget::label(status, 0.0042, DIM));
+        }
+    }
+    if air_roll {
+        p = p.push(ui_layout::Widget::label("AIR STEER = ROLL", 0.005, GOLD));
+    }
+    p
+}
+
+/// The bottom-centre readout stack — the supersonic call-out, speed, and
+/// boost — as ONE panel with a trailing gap that keeps all of it above the
+/// hotbar band. It replaces four hand-placed fragments (speed text, speed
+/// bar, boost panel, supersonic flash) that each landed somewhere in the
+/// hotbar once rasterized at real glyph size.
+///
+/// `supersonic` picks the boost bar's colour; `flash` is the blink gate for
+/// the call-out line. The line goes at the TOP of the stack: the panel is
+/// bottom-anchored, so appearing/disappearing up there grows the box upward
+/// and never moves the readouts below it.
+pub fn bottom_panel(speed: f32, boost: f32, supersonic: bool, flash: bool) -> ui_layout::Panel {
+    let boost_col = if supersonic {
+        [1.0, 0.95, 0.75, 0.95]
+    } else {
+        [0.98, 0.68, 0.12, 0.92]
+    };
+    let mut p = ui_layout::Panel::new(ui_layout::Anchor::BottomCentre);
+    p.gap = 0.006;
+    if flash {
+        p = p.push(ui_layout::Widget::label("SUPERSONIC", 0.005, GOLD));
+    }
+    p.push(ui_layout::Widget::label(&format!("{:>5.1} M/S", speed), 0.0062, PAPER))
+        .push(ui_layout::Widget::bar(
+            (speed / CAR_MAX).clamp(0.0, 1.0),
+            0.56,
+            0.008,
+            [0.55, 0.85, 1.0, 0.85],
+            [0.05, 0.05, 0.08, 0.50],
+        ))
+        .push(ui_layout::Widget::label(&format!("BOOST {boost:>3.0}"), 0.0052, INK))
+        .push(ui_layout::Widget::bar(
+            boost / 100.0,
+            0.56,
+            0.045,
+            boost_col,
+            [0.05, 0.05, 0.08, 0.62],
+        ))
+        .push(ui_layout::Widget::Gap { h: HOTBAR_CLEARANCE })
+}
+
 pub fn hud(ui: &mut Vec<UiVert>, info: &HudInfo, world: &World, car: &Car, ball: &Ball, bots: &[(Vec3, u8)]) {
     let a = info.aspect;
 
-    // ---- boost bar (bottom centre) — MIGRATED to the layout layer ----
+    // ---- bottom centre: supersonic / speed / boost, one stack ----
     //
-    // This used to be four hand-placed quads whose numbers only worked at
-    // one aspect ratio. It is now a panel: anchored, inside the safe area,
-    // and it cannot silently land on top of whatever gets added next to it.
-    // The rest of this function is still hand-placed, which is the point —
-    // the two coexist.
+    // A single panel because the recording showed what fragments do: the
+    // speed readout, the boost label and the flash each rasterized into
+    // the hotbar. The stack queues them, and the trailing gap inside
+    // `bottom_panel` keeps the whole thing above the hotbar band.
     {
         let scr = ui_layout::Screen::new(a);
-        let col = if info.supersonic {
-            [1.0, 0.95, 0.75, 0.95]
-        } else {
-            [0.98, 0.68, 0.12, 0.92]
-        };
-        let p = ui_layout::Panel::new(ui_layout::Anchor::BottomCentre)
-            .push(ui_layout::Widget::label(
-                &format!("BOOST {:>3.0}", info.boost),
-                0.015,
-                INK,
-            ))
-            .push(ui_layout::Widget::bar(
-                info.boost / 100.0,
-                0.56,
-                0.045,
-                col,
-                [0.05, 0.05, 0.08, 0.62],
-            ));
+        let flash = info.supersonic && (info.time * 6.0).sin() > -0.4;
+        let p = bottom_panel(info.speed, info.boost, info.supersonic, flash);
         draw_cmds(ui, a, &scr.emit(&p));
     }
 
-    // flip pip: shows in the air, gold while a flip is banked
+    // flip pip: shows in the air, gold while a flip is banked. Right of the
+    // bottom stack (the bars are ~0.16 NDC half-width), above the hotbar.
     if info.airborne {
         let c = if info.can_flip { GOLD } else { [0.5, 0.48, 0.45, 0.55] };
-        label(ui, 0.31, -0.906, 0.013, a, c, "FLIP");
+        label(ui, 0.31, -0.77, 0.0052, a, c, "FLIP");
     }
 
-    // speed readout above the bar
-    let sp = format!("{:>5.1} M/S", info.speed);
-    label_c(ui, -0.845, 0.018, a, PAPER, &sp);
-    let sf = (info.speed / CAR_MAX).clamp(0.0, 1.0);
-    quad(ui, -0.28, -0.965, -0.28 + 0.56 * sf, -0.958, [0.55, 0.85, 1.0, 0.85]);
-    if info.supersonic && (info.time * 6.0).sin() > -0.4 {
-        label_c(ui, -0.80, 0.014, a, GOLD, "SUPERSONIC");
+    // ---- top-left: stat card, one stack behind one glass quad ----
+    {
+        let scr = ui_layout::Screen::new(a);
+        let car_line = format!("{}  ({})", info.car_name, info.cam_label);
+        let p = stat_card_panel(
+            info.rings,
+            info.goals,
+            info.car_rings,
+            &car_line,
+            info.map_name,
+            info.online,
+            info.air_roll,
+        );
+        // The backdrop is derived from the panel's own bounds, so it grows
+        // with the online lines instead of a hand-maintained card_h sum.
+        let b = scr.bounds(&p);
+        quad(ui, b.x0 - 0.012 / a, b.y0 - 0.012, b.x1 + 0.012 / a, b.y1 + 0.010, [0.045, 0.045, 0.095, 0.45]);
+        draw_cmds(ui, a, &scr.emit(&p));
     }
-
-    // ---- top-left: stat card ----
-    let card_h = 0.185
-        + if info.online.is_some() { 0.055 } else { 0.0 }
-        + if info.air_roll { 0.028 } else { 0.0 };
-    quad(ui, -1.0, 0.995 - card_h, -0.46, 0.995, [0.045, 0.045, 0.095, 0.45]);
-    label(ui, -0.975, 0.975, 0.017, a, PAPER, &format!("RINGS {}", info.rings));
-    label(ui, -0.975, 0.942, 0.013, a, GOLD, &format!("GOALS {}", info.goals));
-    label(ui, -0.975, 0.913, 0.011, a, DIM, &format!("CAR-THROUGHS {}", info.car_rings));
-    label(ui, -0.975, 0.888, 0.010, a, DIM, &format!("{}  ({})", info.car_name, info.cam_label));
     // FIRST-PERSON RETICLE. From the head there is no body on screen to aim
     // relative to, so the frame needs a centre. Four ticks around a gap
     // rather than a dot: it reads at any background brightness and does not
@@ -1085,47 +1189,39 @@ pub fn hud(ui: &mut Vec<UiVert>, info: &HudInfo, world: &World, car: &Car, ball:
     if let Some(w) = info.weapon {
         let ready = w.cool_frac <= 0.0;
         let c = if ready { GOLD } else { DIM };
-        label_c(ui, -0.11, 0.011, a, c, w.name);
+        label_c(ui, W_NAME_Y, W_NAME_PX, a, c, w.name);
         if !ready {
             let bw = 0.09;
             let bx = -bw * 0.5;
-            let by = -0.128;
-            quad(ui, bx, by, bx + bw, by + 0.006, [0.2, 0.2, 0.24, 0.5]);
-            quad(ui, bx, by, bx + bw * (1.0 - w.cool_frac), by + 0.006, CYAN);
+            quad(ui, bx, W_BAR_Y0, bx + bw, W_BAR_Y0 + W_BAR_H, [0.2, 0.2, 0.24, 0.5]);
+            quad(ui, bx, W_BAR_Y0, bx + bw * (1.0 - w.cool_frac), W_BAR_Y0 + W_BAR_H, CYAN);
         }
         // ATTUNEMENT. Below the form name rather than beside it — the
         // form is what fires, the element is what it's worth against
         // whatever you're aimed at (`Element::advantage`, now live
         // against raid wardens too). Dimmed to DIM while attuning since
         // that window genuinely fights with no bonus at all — the label
-        // should read as a warning, not a status.
+        // should read as a warning, not a status. Glyphs start below the
+        // cooldown bar; a test proves the three pieces disjoint.
         let ec = if w.attuning { DIM } else { CYAN };
-        label_c(ui, -0.148, 0.0085, a, ec, w.element);
+        label_c(ui, W_ELEM_Y, W_ELEM_PX, a, ec, w.element);
     }
     // WOUNDED. Above the reticle rather than below it, clear of the
     // weapon readout — this is about the body, not the trigger. Pulses
     // rather than sitting solid so it reads as urgent without being a
-    // constant distraction while it's true for a while.
+    // constant distraction while it's true for a while. Glyph bottom
+    // lands at 0.0386, above the reticle's top tick (0.0219).
     if info.wounded && (info.time * 4.0).sin() > -0.3 {
-        label_c(ui, 0.058, 0.011, a, WARN, "DAMAGED — TAKE COVER");
-    }
-    label(ui, -0.975, 0.864, 0.010, a, DIM, info.map_name);
-    let mut y = 0.838;
-    if let Some((n, status)) = &info.online {
-        label(ui, -0.975, y, 0.010, a, GOLD, &format!("ONLINE: {n} PILOTS"));
-        y -= 0.026;
-        if !status.is_empty() {
-            label(ui, -0.975, y, 0.009, a, DIM, status);
-        }
-        y -= 0.028;
-    }
-    if info.air_roll {
-        label(ui, -0.975, y, 0.010, a, GOLD, "AIR STEER = ROLL");
+        label_c(ui, 0.075, 0.0052, a, WARN, "DAMAGED — TAKE COVER");
     }
 
     // ---- sparta scoreboard: BLUE n - m ORANGE across the top ----
     if let Some((b, o)) = info.scores {
-        let px = 0.016;
+        // px 0.0085: glyphs 0.0595 tall, drawn at 0.976 they end at
+        // 0.9165 — inside the plate (0.906..0.985). The old 0.016 put
+        // 0.112-tall glyphs through the plate's bottom and into the
+        // combo banner's slot.
+        let px = 0.0085;
         let bl = format!("BLUE {b}");
         let or = format!("{o} ORANGE");
         let dash = "  -  ";
@@ -1133,11 +1229,11 @@ pub fn hud(ui: &mut Vec<UiVert>, info: &HudInfo, world: &World, car: &Car, ball:
         let x0 = -w * 0.5;
         quad(ui, x0 - 0.03 / a, 0.906, x0 + w + 0.03 / a, 0.985, [0.070, 0.086, 0.110, 0.85]);
         let mut x = x0;
-        label(ui, x, 0.93, px, a, [0.45, 0.65, 1.0, 1.0], &bl);
+        label(ui, x, 0.976, px, a, [0.45, 0.65, 1.0, 1.0], &bl);
         x += font::width(&bl, px, a);
-        label(ui, x, 0.93, px, a, DIM, dash);
+        label(ui, x, 0.976, px, a, DIM, dash);
         x += font::width(dash, px, a);
-        label(ui, x, 0.93, px, a, [1.0, 0.55, 0.2, 1.0], &or);
+        label(ui, x, 0.976, px, a, [1.0, 0.55, 0.2, 1.0], &or);
     }
 
     // ---- top-right: fps, and dropped frames when there are any ----
@@ -1148,23 +1244,27 @@ pub fn hud(ui: &mut Vec<UiVert>, info: &HudInfo, world: &World, car: &Car, ball:
     let fps = format!("{:>3.0} FPS", info.fps);
     label(ui, 0.985 - font::width(&fps, 0.011, a), 0.98, 0.011, a, DIM, &fps);
     if info.frame_drops > 0 {
+        // The FPS glyphs (7 * 0.011) descend to 0.903; this line starts
+        // below them instead of through their middle.
         let d = format!("{} DROPPED", info.frame_drops);
-        label(ui, 0.985 - font::width(&d, 0.009, a), 0.955, 0.009, a, [1.0, 0.55, 0.35, 1.0], &d);
+        label(ui, 0.985 - font::width(&d, 0.007, a), 0.888, 0.007, a, [1.0, 0.55, 0.35, 1.0], &d);
     }
 
-    // ---- combo banner ----
+    // ---- combo banner: below the scoreboard plate, bar below the text ----
     if info.combo >= 2 && info.combo_left > 0.0 {
-        let pulse = 0.020 + 0.004 * (info.time * 9.0).sin().max(0.0);
-        label_c(ui, 0.93, pulse, a, GOLD, &format!("COMBO X{}", info.combo));
+        let pulse = 0.0060 + 0.0012 * (info.time * 9.0).sin().max(0.0);
+        // at max pulse the glyphs descend from 0.88 to 0.8296, above the
+        // window bar at 0.815..0.823
+        label_c(ui, 0.88, pulse, a, GOLD, &format!("COMBO X{}", info.combo));
         let w = 0.16;
-        quad(ui, -w, 0.845, -w + 2.0 * w * info.combo_left, 0.855, GOLD);
+        quad(ui, -w, 0.815, -w + 2.0 * w * info.combo_left, 0.823, GOLD);
     }
 
-    // ---- air-dribble timer ----
+    // ---- air-dribble timer: below the combo bar (0.815) ----
     if info.air_t > 0.25 {
         let s = format!("AIR {:>4.1}S", info.air_t);
         let c = if info.air_t > info.best_air && info.best_air > 0.5 { GOLD } else { PAPER };
-        label_c(ui, 0.80, 0.016, a, c, &s);
+        label_c(ui, 0.80, 0.007, a, c, &s);
     }
 
     if info.minimap {
@@ -1526,4 +1626,118 @@ pub fn splash(ui: &mut Vec<UiVert>, a: f32, t: f32, map_name: &str) {
     }
     label_c(ui, -0.30, 0.010, a, DIM, "G MAPS    O ONLINE");
     label_c(ui, -0.44, 0.0085, a, DIM, "V1.101    ESC QUITS FROM THIS SCREEN");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rasterize one label the way the renderer will (shadow pass included,
+    /// since `label` draws it offset and it extends the ink's box) and
+    /// return the bounding box of every vertex.
+    fn raster(x: f32, y: f32, px: f32, a: f32, s: &str) -> ui_layout::Rect {
+        let mut v: Vec<UiVert> = Vec::new();
+        label(&mut v, x, y, px, a, [1.0; 4], s);
+        let mut r = ui_layout::Rect { x0: f32::MAX, y0: f32::MAX, x1: f32::MIN, y1: f32::MIN };
+        for p in &v {
+            r.x0 = r.x0.min(p.pos[0]);
+            r.y0 = r.y0.min(p.pos[1]);
+            r.x1 = r.x1.max(p.pos[0]);
+            r.y1 = r.y1.max(p.pos[1]);
+        }
+        r
+    }
+
+    /// Boxes for every Cmd a panel emits, text rasterized for real.
+    fn cmd_boxes(cmds: &[ui_layout::Cmd], a: f32) -> Vec<ui_layout::Rect> {
+        cmds.iter()
+            .map(|c| match c {
+                ui_layout::Cmd::Quad { r, .. } => *r,
+                ui_layout::Cmd::Text { x, y, size, text, .. } => raster(*x, *y, *size, a, text),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_stat_card_lines_rasterize_disjoint_and_inside_their_backdrop() {
+        // The first live recording, top-left: eight lines drawn through
+        // each other. The card is a panel now, so this asserts the panel's
+        // OUTPUT — real glyph boxes — not its self-reported metrics.
+        let a = 16.0 / 9.0;
+        let scr = ui_layout::Screen::new(a);
+        let p = stat_card_panel(
+            12,
+            3,
+            4,
+            "VORPAL BLADE PALOMINO  (CHASE CAM)",
+            "HALO ZEO",
+            Some((1, "A CONTAINER SHIP CROSSES THE BAY, RUNNING DARK")),
+            true,
+        );
+        let b = scr.bounds(&p);
+        let boxes = cmd_boxes(&scr.emit(&p), a);
+        assert!(boxes.len() >= 8, "the fully-populated card should draw 8 lines, drew {}", boxes.len());
+        for (i, r) in boxes.iter().enumerate() {
+            assert!(b.contains_rect(r), "line {i} {r:?} escapes the card bounds {b:?}");
+            for (j, q) in boxes.iter().enumerate().skip(i + 1) {
+                assert!(!r.overlaps(q), "card line {i} {r:?} overlaps line {j} {q:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_bottom_stack_stays_above_the_hotbar_band() {
+        // The recording's bottom centre: BOOST 100 and the speed readout
+        // across the hotbar cells. Everything the panel emits — including
+        // the supersonic flash, its tallest configuration — must end above
+        // the hotbar's lifted-cell top.
+        let a = 16.0 / 9.0;
+        let scr = ui_layout::Screen::new(a);
+        let p = bottom_panel(43.2, 100.0, true, true);
+        let boxes = cmd_boxes(&scr.emit(&p), a);
+        assert!(boxes.len() >= 4, "speed text+bar and boost text+bar at minimum, drew {}", boxes.len());
+        for r in &boxes {
+            assert!(
+                r.y0 >= HOTBAR_TOP,
+                "bottom-stack box {r:?} reaches into the hotbar band (top {HOTBAR_TOP})"
+            );
+        }
+        // and the two stacked panels of the in-game HUD never collide
+        let card = stat_card_panel(0, 0, 0, "X (CHASE CAM)", "MAP", Some((1, "S")), true);
+        let (_, clashes) = scr.emit_all(&[card, bottom_panel(0.0, 0.0, false, false)]);
+        assert!(clashes.is_empty(), "hud panels collide: {clashes:?}");
+    }
+
+    #[test]
+    fn the_weapon_readout_pieces_are_disjoint_top_to_bottom() {
+        // Name glyphs end above the cooldown bar; the element line starts
+        // below it. The recording showed the name and element drawn through
+        // each other ("PHOTON" over "ATTUNING").
+        let a = 16.0 / 9.0;
+        let name = raster(-0.2, W_NAME_Y, W_NAME_PX, a, "PHOTON");
+        let elem = raster(-0.2, W_ELEM_Y, W_ELEM_PX, a, "ATTUNING");
+        let bar_top = W_BAR_Y0 + W_BAR_H;
+        assert!(name.y0 > bar_top, "name glyphs ({}) reach the cooldown bar ({bar_top})", name.y0);
+        assert!(elem.y1 < W_BAR_Y0, "element glyphs ({}) reach the cooldown bar ({W_BAR_Y0})", elem.y1);
+        assert!(!name.overlaps(&elem), "name {name:?} overlaps element {elem:?}");
+    }
+
+    #[test]
+    fn hotbar_ink_stays_inside_the_hotbar_band() {
+        // Slot numbers used to start near the cell bottom and hang 0.03
+        // below the bar — the recording shows every digit under its box.
+        // With no active item there is no name line, so every vertex the
+        // hotbar emits (cells, outline, digits) must lie inside the band.
+        let hb = crate::hotbar::Hotbar::from_line("");
+        let mut v: Vec<UiVert> = Vec::new();
+        draw_hotbar(&mut v, 16.0 / 9.0, &hb);
+        assert!(!v.is_empty(), "an empty hotbar still draws its nine slots");
+        for p in &v {
+            assert!(
+                p.pos[1] >= HOTBAR_Y - 1e-5 && p.pos[1] <= HOTBAR_TOP + 1e-5,
+                "hotbar vertex at y {} is outside the band [{HOTBAR_Y}, {HOTBAR_TOP}]",
+                p.pos[1]
+            );
+        }
+    }
 }

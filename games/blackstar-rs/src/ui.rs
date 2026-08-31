@@ -147,18 +147,29 @@ impl Widget {
     /// Height in screen-height units.
     pub fn height(&self) -> f32 {
         match self {
-            // text is drawn from its baseline; the box is ~2.4x the nominal
-            Widget::Label { size, .. } => size * 2.4,
+            // A label's box is the font's own line advance: GH rows of
+            // glyph plus the built-in leading, exactly what font::text
+            // will emit plus the gap the face was designed with. This
+            // used to claim `size * 2.4` — a number with no counterpart
+            // anywhere in font.rs — and everything the layer promised
+            // (stacking, anchoring, emit_all's clash report) was
+            // measured against that fiction while the real glyphs drew
+            // 7x the nominal size and landed on the hotbar.
+            Widget::Label { size, .. } => size * crate::font::CH,
             Widget::Bar { h, .. } => *h,
             Widget::Pips { size, .. } => *size,
             Widget::Gap { h } => *h,
         }
     }
-    /// Width in screen-height units. Text is estimated, which is fine: it is
-    /// used for right-alignment and collision, not for kerning.
+    /// Width in screen-height units. Text width is exact, not estimated:
+    /// font.rs advances a fixed CW pixels per char, so the layer can know
+    /// it precisely — and must, because right-alignment and panel
+    /// collision both consume this number.
     pub fn width(&self) -> f32 {
         match self {
-            Widget::Label { text, size, .. } => text.chars().count() as f32 * size * 1.15,
+            Widget::Label { text, size, .. } => {
+                text.chars().count() as f32 * size * crate::font::CW
+            }
             Widget::Bar { w, .. } => *w,
             Widget::Pips { n, size, gap, .. } => *n as f32 * (size + gap) - gap,
             Widget::Gap { .. } => 0.0,
@@ -266,9 +277,14 @@ impl Screen {
             };
             match w {
                 Widget::Label { text, size, color } => {
+                    // font::text draws DOWNWARD from y. The box is CH rows
+                    // tall and the glyph GH; starting one leading row below
+                    // the top centres the glyph in its own advance and, by
+                    // construction, keeps the raster inside the box:
+                    // top - size - GH*size >= bottom because CH = GH + 2.
                     out.push(Cmd::Text {
                         x: x0,
-                        y: bottom + hh * 0.25,
+                        y: top - *size,
                         size: *size,
                         color: *color,
                         text: text.clone(),
@@ -352,7 +368,10 @@ pub fn menu_rows(
     size: f32,
 ) -> Vec<(usize, Rect)> {
     let a = s.area();
-    let row_h = size * 2.4;
+    // The pitch is the font's line advance — the same number Widget::Label
+    // claims and font::text draws. It was `size * 2.4`, which packed rows
+    // three glyph-heights deep into each other on every migrated menu.
+    let row_h = size * crate::font::CH;
     let mut out = Vec::new();
     let mut y = a.y1 - row_h * 2.0;
     for (i, _) in m.visible() {
@@ -389,7 +408,7 @@ pub fn menu_rows(
 /// that hides the bottom of the list.
 pub fn rows_that_fit(s: &Screen, size: f32) -> usize {
     let a = s.area();
-    let row_h = size * 2.4;
+    let row_h = size * crate::font::CH;
     let mut n = 0;
     let mut y = a.y1 - row_h * 2.0;
     while y - row_h * 0.15 >= a.y0 {
@@ -436,10 +455,13 @@ pub fn menu_cmds(
 ) -> Vec<Cmd> {
     use crate::menu::Item;
     let a = s.area();
-    let row_h = size * 2.4;
+    let row_h = size * crate::font::CH;
+    // The title's glyphs descend 1.3 * GH * size from its y; starting just
+    // under the top edge keeps them clear of the first row, whose rect top
+    // is at a.y1 - 2*row_h + 0.85*row_h.
     let mut out = vec![Cmd::Text {
         x: a.x0,
-        y: a.y1 - row_h,
+        y: a.y1 - size * 0.5,
         size: size * 1.3,
         color: fg,
         text: m.title.clone(),
@@ -454,26 +476,136 @@ pub fn menu_cmds(
         // I not press this" is better answered than avoided
         let c = if row.enabled { fg } else { dim };
         let indent = if matches!(row.item, Item::Heading) { 0.0 } else { size * 1.2 / s.aspect };
-        let ty = r.y0 + row_h * 0.3;
+        // one leading row below the rect top: glyphs then end GH*size
+        // lower, still inside the rect (its height is CH*size)
+        let ty = r.y1 - size;
         out.push(Cmd::Text { x: a.x0 + indent, y: ty, size, color: c, text: row.label.clone() });
 
         let v = row.item.value();
         if !v.is_empty() {
-            let w = v.chars().count() as f32 * size * 1.15 / s.aspect;
+            let w = v.chars().count() as f32 * size * crate::font::CW / s.aspect;
             out.push(Cmd::Text { x: a.x1 - w, y: ty, size, color: c, text: v });
         }
     }
 
     // the hint for the selected row, pinned to the bottom, so it never
-    // reflows the list as the cursor moves
+    // reflows the list as the cursor moves. Drawn UPWARD from the edge:
+    // its glyphs descend GH * (0.85*size), so its y sits that far above
+    // the safe-area floor — at y = a.y0 it rendered mostly off-screen.
     if let Some(h) = m.selected().and_then(|r| r.hint) {
-        out.push(Cmd::Text { x: a.x0, y: a.y0, size: size * 0.85, color: dim, text: h.into() });
+        let hs = size * 0.85;
+        out.push(Cmd::Text {
+            x: a.x0,
+            y: a.y0 + hs * crate::font::GH,
+            size: hs,
+            color: dim,
+            text: h.into(),
+        });
     }
     out
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// Rasterize every Cmd this module emits through the SAME primitives the
+    /// renderer uses (font::text for Text, the rect itself for Quad), and
+    /// return one bounding box per command. This is the bridge the original
+    /// tests lacked: they measured the layer against its own Widget metrics,
+    /// which is how a label claiming to be size*2.4 tall while font.rs draws
+    /// it size*7.0 tall passed every overlap check while covering the hotbar
+    /// on screen. A box from THIS function is what a player actually sees.
+    fn raster_boxes(cmds: &[super::Cmd], aspect: f32) -> Vec<super::Rect> {
+        cmds.iter()
+            .map(|c| match c {
+                super::Cmd::Quad { r, .. } => *r,
+                super::Cmd::Text { x, y, size, color, text } => {
+                    let mut v = Vec::new();
+                    crate::font::text(&mut v, *x, *y, *size, aspect, *color, text);
+                    let mut r = super::Rect { x0: f32::MAX, y0: f32::MAX, x1: f32::MIN, y1: f32::MIN };
+                    for p in &v {
+                        r.x0 = r.x0.min(p.pos[0]);
+                        r.y0 = r.y0.min(p.pos[1]);
+                        r.x1 = r.x1.max(p.pos[0]);
+                        r.y1 = r.y1.max(p.pos[1]);
+                    }
+                    r
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_labels_rasterized_glyphs_stay_inside_its_claimed_box() {
+        // The property the whole layout layer rests on: the box a widget
+        // CLAIMS (which is what anchoring, stacking and collision all use)
+        // must contain the pixels font.rs actually EMITS for it. When the
+        // claim is smaller than the raster, every guarantee above it —
+        // "a stack queues instead of overlapping", emit_all's clash report —
+        // is measuring a fiction.
+        let s = super::Screen::new(16.0 / 9.0);
+        let p = super::Panel::new(super::Anchor::TopLeft)
+            .push(super::Widget::label("BOOST 100", 0.015, [1.0; 4]));
+        let claimed = s.bounds(&p);
+        let cmds = s.emit(&p);
+        for r in raster_boxes(&cmds, s.aspect) {
+            assert!(
+                claimed.contains_rect(&r),
+                "raster {r:?} escapes the claimed panel box {claimed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_stacked_labels_do_not_overlap_when_rasterized() {
+        // The concrete on-screen failure from the first live recording:
+        // consecutive lines of the top-left stat card drawn through each
+        // other. The stack test that existed asserted quads only; text was
+        // never rasterized, so line spacing was never actually measured.
+        let s = super::Screen::new(16.0 / 9.0);
+        let p = super::Panel::new(super::Anchor::TopLeft)
+            .push(super::Widget::label("RINGS 0", 0.008, [1.0; 4]))
+            .push(super::Widget::label("GOALS 0", 0.006, [1.0; 4]))
+            .push(super::Widget::label("CAR-THROUGHS 0", 0.005, [1.0; 4]));
+        let boxes = raster_boxes(&s.emit(&p), s.aspect);
+        for i in 0..boxes.len() {
+            for j in (i + 1)..boxes.len() {
+                assert!(
+                    !boxes[i].overlaps(&boxes[j]),
+                    "line {i} {:?} overlaps line {j} {:?}",
+                    boxes[i],
+                    boxes[j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn menu_row_text_rasterizes_inside_its_hit_rect() {
+        // menu_cmds and menu_hit share menu_rows' rects by construction —
+        // but the TEXT drawn for a row also has to live inside that rect,
+        // or rows read through each other exactly like the stat card did.
+        let s = super::Screen::new(16.0 / 9.0);
+        let m = crate::menu::Menu::new(
+            "T",
+            (0..4).map(|i| crate::menu::Row::action("row", &format!("ROW {i}"))).collect(),
+        );
+        let rows = super::menu_rows(&s, &m, 0.0082);
+        let cmds = super::menu_cmds(&s, &m, 0.0082, [1.0; 4], [0.5; 4], [0.2, 0.2, 0.2, 0.5]);
+        // pair each row's label Cmd with its rect: labels come out in row
+        // order after the title
+        let texts: Vec<&super::Cmd> =
+            cmds.iter().filter(|c| matches!(c, super::Cmd::Text { .. })).collect();
+        for (k, (_, rect)) in rows.iter().enumerate() {
+            let label = texts[k + 1]; // texts[0] is the title
+            let b = raster_boxes(std::slice::from_ref(&label.clone()), s.aspect);
+            assert!(
+                rect.contains_rect(&b[0]),
+                "row {k} text {:?} escapes its hit rect {rect:?}",
+                b[0]
+            );
+        }
+    }
 
     #[test]
     fn menu_rows_never_run_past_the_bottom_edge() {
