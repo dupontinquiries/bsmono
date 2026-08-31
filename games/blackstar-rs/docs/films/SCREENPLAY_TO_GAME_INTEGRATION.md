@@ -14,6 +14,19 @@
 > `Stratum::Convergence` to `archive.rs`, which today ships exactly the six
 > strata Layer 0–5. Adding them is a real proposal, not a description.
 >
+> **Step 1 is wrong and would break the archaeology layer.** It says to add
+> `Stratum::Ascension = 6` and `Stratum::Convergence = 7`. `Stratum` is
+> ARCHAEOLOGICAL DEPTH, not narrative time — its own doc says it "numbers them
+> from the present downward", it derives `Ord`, and `from_u8` clamps to 5. The
+> films run forward, so Film 9 is the *latest* event in the saga; filing it as
+> Layer 7 would sort the newest thing in the game as older than the Machine
+> layer, and every comparison on that enum would be wrong in a way no type
+> catches. The relationship is the other way round: the films are how the
+> player digs, and the deep strata are what they UNCOVER.
+> `saga::evidence_stratum` does that mapping, and
+> `saga::stratum_tests::the_strata_enum_still_has_exactly_six_layers` fails if
+> anyone follows Step 1.
+>
 > What it is good for, and it is genuinely good: the pipeline it lays out —
 > screenplay beat → Claim → Findings → codex link, with tests catching
 > orphans — is the right shape and matches how `archive.rs` already works.

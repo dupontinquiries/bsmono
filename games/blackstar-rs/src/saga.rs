@@ -902,3 +902,107 @@ mod join_tests {
         }
     }
 }
+
+// ------------------------------------------------- films and the strata ----
+//
+// TWO AXES THAT LOOK LIKE ONE, AND A PROPOSAL THAT CONFLATES THEM.
+//
+// `SCREENPLAY_TO_GAME_INTEGRATION.md`, Step 1, says to add
+// `Stratum::Ascension = 6` and `Stratum::Convergence = 7` to `archive.rs` so
+// each trilogy gets its own layer. That is the wrong shape, and following it
+// would break an ordering the archaeology layer depends on.
+//
+// `Stratum` is ARCHAEOLOGICAL DEPTH. Its own doc: "numbers them from the
+// present downward — Layer 0 is what the player thinks the universe is on the
+// first evening, Layer 5 is the part nobody has finished understanding." It
+// derives `Ord`, and `from_u8` clamps to 5. Depth increases with the number.
+//
+// The films are NARRATIVE TIME, running forward. Film 9 is the LATEST thing
+// that happens. Filing it as Layer 7 would place the newest event in the saga
+// deeper than the Machine layer — older than the thing nobody understands —
+// and every comparison on that enum would then be wrong in a way no type
+// catches.
+//
+// The relationship is the other way round: the films are how the player digs.
+// The deep strata are what the films UNCOVER. So a film's evidence sits near
+// the surface, and what it reveals sits far below it.
+
+/// Where a film's own evidence sits once it is buried — not what the film
+/// uncovers, which is deeper by definition.
+pub fn evidence_stratum(film_number: u32) -> crate::archive::Stratum {
+    use crate::archive::Stratum;
+    match film_number {
+        // the Blackstar event itself: a god in the Earth, and the first time
+        // the two histories touched
+        1 => Stratum::Blackstar,
+        // everything after it is this generation's own history
+        2..=3 => Stratum::Recent,
+        // and the Ascension and Convergence eras are the player's present
+        _ => Stratum::Present,
+    }
+}
+
+#[cfg(test)]
+mod stratum_tests {
+    use super::*;
+    use crate::archive::Stratum;
+
+    #[test]
+    fn no_film_is_filed_deeper_than_the_event_that_started_it() {
+        // The guard against the integration doc's Step 1. Everything below
+        // Blackstar — the Black Archive, the Asteri, the Machine layer —
+        // predates the saga entirely and is what the films UNCOVER. A film
+        // filed down there would sort as older than its own backstory.
+        for f in all_films() {
+            let s = evidence_stratum(f.number);
+            assert!(
+                s <= Stratum::Blackstar,
+                "film {} is filed at {:?}, deeper than the event that started the saga",
+                f.number,
+                s
+            );
+        }
+        // and the deep layers stay strictly below every film
+        for deep in [Stratum::BlackArchive, Stratum::Asteri, Stratum::Machine] {
+            for f in all_films() {
+                assert!(
+                    evidence_stratum(f.number) < deep,
+                    "film {} reaches the {deep:?} layer, which predates the saga",
+                    f.number
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn later_films_are_never_deeper_than_earlier_ones() {
+        // Narrative time runs forward; depth runs backward. The two must not
+        // cross, or "recent" and "deep" swap meaning somewhere in the middle
+        // of the saga and nothing warns you.
+        let mut prev = Stratum::Machine;
+        for f in all_films() {
+            let s = evidence_stratum(f.number);
+            assert!(
+                s <= prev,
+                "film {} ({:?}) is deeper than film {} ({:?})",
+                f.number,
+                s,
+                f.number - 1,
+                prev
+            );
+            prev = s;
+        }
+        // and the ends are what they should be
+        assert_eq!(evidence_stratum(1), Stratum::Blackstar);
+        assert_eq!(evidence_stratum(9), Stratum::Present);
+    }
+
+    #[test]
+    fn the_strata_enum_still_has_exactly_six_layers() {
+        // If someone follows the integration doc and adds Ascension and
+        // Convergence, this fails first and points at the reasoning above
+        // rather than at a subtly wrong ordering discovered much later.
+        assert_eq!(Stratum::all().len(), 6, "a stratum was added; see the note above this test");
+        assert_eq!(Stratum::from_u8(200), Stratum::Machine, "from_u8 no longer clamps to the deepest");
+    }
+}
