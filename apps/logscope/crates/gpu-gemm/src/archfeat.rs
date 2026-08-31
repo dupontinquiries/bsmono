@@ -352,10 +352,11 @@ long-context efficiency matters here. IndexShare (index_topk_freq 4 → only ~1 
 carries indexer tensors) is handled on our side: unread tensors are simply not fetched"),
             Feature::Mla => Some("wired and validated against the CPU reference, but never yet run on a \
 real DeepSeek/GLM checkpoint — the first such load is the test"),
-            Feature::GatedDeltaNet => Some("recurrent layers run through the CPU-routed \
-block_decode_deltanet (correct-first, like the MoE and MLA bootstraps); deltanet.rs is the \
-tested core. Sequential positions only — recurrent state cannot seek, so trie/fleet prefix \
-reuse is refused for hybrids"),
+            Feature::GatedDeltaNet => Some("GPU-RESIDENT by default: one stacked projection \
+(qkv‖z‖β‖α) + DELTANET_CONV + DELTANET_STEP + wout — five dispatches, zero host round-trips; \
+the CPU oracle (deltanet.rs) remains behind LOGSCOPE_DELTANET_CPU=1 and the gate cross-checks \
+logits AND final state (ring bit-equal, S at 7e-9) plus the sync-count delta. Sequential \
+positions only — recurrent state cannot seek, so trie/fleet prefix reuse is refused"),
             Feature::GatedAttentionOutput => Some("wired: the double-width q is split per head at \
 load and decode applies attn * sigmoid(gate) before wo (block_decode and _fused, cross-checked \
 against each other; other paths refuse gated layers by name). Never run on a real checkpoint"),

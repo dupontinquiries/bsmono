@@ -146,8 +146,10 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             note: "Qwen3.5/3.6 35B-A3B is HYBRID GATED DELTANET — observed in the operator's own \
 tensor dump, which is why the earlier family guess was wrong. The recurrent layers now RUN: \
 per-block sniff on ssm_* tensors, weights into deltanet::DeltaNetLayerHost, per-layer states from \
-new_cache_for, decode through the CPU-routed block_decode_deltanet (the same deltanet.rs code the \
-invariant tests bind; --gate-deltanet-load proves load + decode + the seek refusal). Sequential \
+new_cache_for, decode GPU-RESIDENT by default (stacked projection + DELTANET_CONV/STEP kernels, \
+zero host round-trips — the sync class Asahi measurements put at ~90% of decode wall; \
+LOGSCOPE_DELTANET_CPU=1 keeps the deltanet.rs oracle for A/B, and --gate-deltanet-load \
+cross-checks logits, final state, and the download-submit count). Sequential \
 positions only — recurrent state cannot seek, so trie/fleet prefix reuse is refused. Gated attention is wired \
 too (double-width q split per head at load; attn * sigmoid(gate) before wo, the two decode paths \
 cross-checked against each other — which caught the post_attention_norm double-load). The shared expert's own gate \

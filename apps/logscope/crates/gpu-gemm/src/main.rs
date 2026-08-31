@@ -5813,6 +5813,61 @@ still pass, which is why this one exists."
                     let dmax = la.iter().zip(&lb).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
                     ck(&format!("fused and unfused GATED paths agree (max |Δ| = {dmax:.2e})"), dmax < 1e-4);
                 }
+                // GPU vs CPU DELTANET: the GPU path (stacked projection + DELTANET_CONV +
+                // DELTANET_STEP, zero host round-trips) against the CPU oracle it transcribes —
+                // logits per token AND the final recurrent state (ring + S), on the f32 load so
+                // activation-quantization differences don't mask kernel bugs. The state compare
+                // is the localizer: logits agreeing with state drifting would mean compensating
+                // errors; state agreeing pins any logits gap outside the mixer.
+                {
+                    let mf = gpu.load_gguf(&bytes).expect("f32 load for deltanet gpu/cpu");
+                    let toks = [1u32, 5, 9, 2];
+                    let cg = gpu.new_cache_for(&mf, 8);
+                    let mut lg_g: Vec<Vec<f32>> = Vec::new();
+                    for (p, t) in toks.iter().enumerate() { lg_g.push(gpu.decode_step(&mf, &cg, *t, p)); }
+                    std::env::set_var("LOGSCOPE_DELTANET_CPU", "1");
+                    let cc = gpu.new_cache_for(&mf, 8);
+                    let mut lg_c: Vec<Vec<f32>> = Vec::new();
+                    for (p, t) in toks.iter().enumerate() { lg_c.push(gpu.decode_step(&mf, &cc, *t, p)); }
+                    std::env::remove_var("LOGSCOPE_DELTANET_CPU");
+                    let dmax = lg_g.iter().flatten().zip(lg_c.iter().flatten())
+                        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    ck(&format!("GPU DeltaNet matches the CPU oracle over 4 tokens (max |\u{394}| = {dmax:.2e})"), dmax < 1e-4);
+                    let sg = cg.deltanet_gpu.as_ref().unwrap()[0].as_ref().unwrap();
+                    let sc = cc.deltanet.as_ref().unwrap()[0].as_ref().unwrap().lock().unwrap();
+                    let ring_g = gpu.download(&sg.ring);
+                    let s_g = gpu.download(&sg.s);
+                    let dr = ring_g.iter().zip(&sc.ring).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    let ds = s_g.iter().zip(&sc.s).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    ck(&format!("final recurrent STATE matches (ring |\u{394}| = {dr:.2e}, S |\u{394}| = {ds:.2e})"),
+                       dr < 1e-4 && ds < 1e-4);
+                }
+                // THE TOK/SEC CLAIM, AS A COUNTER: the CPU-routed mixer pays a mid-decode
+                // download per recurrent layer per token (each one a queue-draining submit+poll —
+                // the sync class the Asahi MoE-v1 measurements put at ~90% of decode wall time).
+                // The GPU path must pay ZERO beyond the one logits readback per token. Counted,
+                // not asserted from theory: 4 tokens × 1 recurrent layer ⇒ CPU ≥ 8 download-
+                // submits (mixer + logits each token), GPU exactly 4.
+                {
+                    let mf = gpu.load_gguf(&bytes).expect("f32 load for the sync count");
+                    let toks = [1u32, 5, 9, 2];
+                    let cg = gpu.new_cache_for(&mf, 8);
+                    let s0 = gpu_kernels::SubmitCauseSnapshot::now();
+                    for (p, t) in toks.iter().enumerate() { let _ = gpu.decode_step(&mf, &cg, *t, p); }
+                    let gpu_dl = gpu_kernels::SubmitCauseSnapshot::now().downloads_since(&s0);
+                    std::env::set_var("LOGSCOPE_DELTANET_CPU", "1");
+                    let cc = gpu.new_cache_for(&mf, 8);
+                    let s1 = gpu_kernels::SubmitCauseSnapshot::now();
+                    for (p, t) in toks.iter().enumerate() { let _ = gpu.decode_step(&mf, &cc, *t, p); }
+                    let cpu_dl = gpu_kernels::SubmitCauseSnapshot::now().downloads_since(&s1);
+                    std::env::remove_var("LOGSCOPE_DELTANET_CPU");
+                    // Exactly the 4 mixer downloads (1 recurrent layer x 4 tokens) must vanish. The
+                    // residual 2/token on the GPU path is ONE logical readback — the logits —
+                    // tallied at both the frame-flush and staging-copy sites; the relative
+                    // assertion is immune to that accounting.
+                    ck(&format!("GPU DeltaNet removes the per-layer sync ({gpu_dl} download-submits vs {cpu_dl} CPU-routed over 4 tokens)"),
+                       gpu_dl + 4 == cpu_dl);
+                }
                 // GATED SHARED EXPERT, algebraically: an all-zero gate makes sigmoid(0) = 0.5
                 // exactly for every token, and halving a linear map's output equals halving its
                 // weights (0.5 is a power of two, so the fp rounding commutes row by row). So
@@ -6413,7 +6468,7 @@ still pass, which is why this one exists."
         wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)), wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
         g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
         q_norm: None, k_norm: None, // llama-shape test block (no QK-Norm)
-        nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, out_scale: None, v_norm: None, v_from_k: false, geglu: false, post_attn: None, post_ffn: None, rope_base: None,
+        nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, deltanet_gpu: None, attn_out_gate: None, out_scale: None, v_norm: None, v_from_k: false, geglu: false, post_attn: None, post_ffn: None, rope_base: None,
         moe: None, // dense test block — the MoE path has its own validation
     };
     let xt = gpu.upload(&x, bt, bd);
@@ -6431,7 +6486,7 @@ still pass, which is why this one exists."
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: true, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, out_scale: None, v_norm: None, v_from_k: false, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
+            q_norm: None, k_norm: None, nope: true, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, deltanet_gpu: None, attn_out_gate: None, out_scale: None, v_norm: None, v_from_k: false, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
         };
         let got = gpu.download(&gpu.block_forward(&bw_nope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // Roped baseline at the SAME (consistent) shape — the sanity term: nope must actually differ.
@@ -6442,7 +6497,7 @@ still pass, which is why this one exists."
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, out_scale: None, v_norm: None, v_from_k: false, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
+            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, deltanet_gpu: None, attn_out_gate: None, out_scale: None, v_norm: None, v_from_k: false, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
         };
         let roped = gpu.download(&gpu.block_forward(&bw_rope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // CPU: cpu_block minus the rope step

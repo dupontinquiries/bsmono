@@ -1902,8 +1902,13 @@ impl Gpu {
     /// Get (or build once and cache) the bind-group layout + compute pipeline for a
     /// kernel with `n` read-only storage inputs (then one read_write output, one
     /// uniform). Keyed by the shader constant's address — our kernels are `&'static`.
-    fn pipeline(&self, shader: &str, n: u32) -> Pipe {
-        let key = (shader.as_ptr() as usize, n);
+    fn pipeline(&self, shader: &str, n: u32) -> Pipe { self.pipeline_rw(shader, n, n) }
+    /// Like `pipeline`, but input bindings [rw_from..n) are READ_WRITE — for kernels that
+    /// advance persistent state in place (the DeltaNet conv ring and S matrices). rw_from == n
+    /// is the classic all-read-only layout; the key encodes rw_from so the two layouts of one
+    /// shader cache separately.
+    fn pipeline_rw(&self, shader: &str, n: u32, rw_from: u32) -> Pipe {
+        let key = (shader.as_ptr() as usize, n | (rw_from << 16));
 
         // Label under the PIPELINE pointer — the identity mark_dispatch records — using the shader
         // source, which is only in scope here. c4-835 registered under the SOURCE pointer instead,
@@ -1920,7 +1925,7 @@ impl Gpu {
         let store = |b, ro| wgpu::BindGroupLayoutEntry { binding: b, visibility: wgpu::ShaderStages::COMPUTE, count: None,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: ro }, has_dynamic_offset: false, min_binding_size: None } };
         let mut bgl_entries = Vec::new();
-        for i in 0..n { bgl_entries.push(store(i, true)); }
+        for i in 0..n { bgl_entries.push(store(i, i < rw_from)); }
         bgl_entries.push(store(n, false));
         bgl_entries.push(wgpu::BindGroupLayoutEntry { binding: n + 1, visibility: wgpu::ShaderStages::COMPUTE, count: None,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None } });
@@ -2767,6 +2772,10 @@ pub struct BlockWeights {
     /// Gated DeltaNet mixer for this layer (hybrid Qwen3.5/3.6): host-side dims + f32 weights,
     /// consumed by the CPU-routed `block_decode_deltanet`. None = not a recurrent layer.
     pub deltanet: Option<Box<crate::deltanet::DeltaNetLayerHost>>,
+    /// GPU-resident twin of `deltanet` (built whenever deltanet is). The decode dispatch
+    /// prefers this path; LOGSCOPE_DELTANET_CPU=1 forces the CPU oracle for A/B, and the
+    /// gate cross-checks the two.
+    pub deltanet_gpu: Option<Box<DeltaNetGpuWeights>>,
     /// Gated attention output (Qwen3.5/3.6 full-attention layers): the per-head gate projection
     /// de-interleaved out of the double-width attn_q at load. Applied as attn ∘ sigmoid(gate(n1))
     /// between attention and wo — by block_decode and block_decode_fused; every other block fn
@@ -2802,6 +2811,27 @@ pub struct BlockWeights {
     pub moe: Option<Box<MoeLayer>>,
 }
 /// One MoE FFN layer: route(d → n_expert logits) → top-k → per-expert SwiGLU FFN → weighted sum.
+/// GPU-resident weights for one Gated DeltaNet layer — the tok/sec form of the CPU oracle.
+/// ONE stacked projection replaces four (qkv‖z‖betaL‖alphaL row-concat, one matvec dispatch),
+/// then DELTANET_CONV + DELTANET_STEP + the wout Lin: five dispatches, ZERO host round-trips,
+/// where the CPU route paid a download AND an upload per recurrent layer per token — the same
+/// sync class the MoE v1 router readback showed eating ~90% of decode wall time on Asahi.
+pub struct DeltaNetGpuWeights {
+    pub w_all: Lin,        // [cd+vd+2hv, d]
+    pub wout: Lin,         // [d, vd]
+    pub conv_params: Tensor, // [cd*d_conv | dt_bias(hv) | a(hv)]
+    pub norm: Tensor,      // [s]
+}
+
+/// GPU-resident recurrent state of one layer for one sequence, plus the host-side position
+/// guard (asserting sequential decode costs a readback if the counter lives on the GPU; an
+/// AtomicUsize here keeps the seek refusal exact and free).
+pub struct DeltaNetGpuState {
+    pub ring: Tensor,      // [cd*(d_conv-1)]
+    pub s: Tensor,         // [hv*s*s]
+    pub next_pos: std::sync::atomic::AtomicUsize,
+}
+
 pub struct MoeLayer {
     pub router: Lin,                 // [n_expert, d] F32 — precision matters for routing
     /// Per-expert FUSED gate||up projection [2ff, d] — same fusion as the dense wgate_up (one matmul emits
@@ -4377,6 +4407,15 @@ make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
                 dims.chunks(4).take(8).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<_>>());
         }
         let pipe = self.pipeline(shader, inputs.len() as u32);
+        self.dispatch_with(&pipe, inputs, out, dims, wg);
+    }
+    /// `dispatch` with input bindings [rw_from..] read_write (see pipeline_rw). The wg-limit
+    /// guard lives in `dispatch`; state-advancing kernels are dispatched with explicit small
+    /// grids (one workgroup per head), so the flat-grid spill concern does not arise here —
+    /// asserted anyway to keep the invariant visible.
+    fn dispatch_rw(&self, shader: &str, inputs: &[&Tensor], rw_from: u32, out: &Tensor, dims: &[u8], wg: (u32, u32, u32)) {
+        assert!(wg.0 <= 65535 && wg.1 <= 65535 && wg.2 <= 65535, "dispatch_rw grid {wg:?} exceeds the per-dimension limit");
+        let pipe = self.pipeline_rw(shader, inputs.len() as u32, rw_from);
         self.dispatch_with(&pipe, inputs, out, dims, wg);
     }
     /// Record a dispatch against an already-resolved pipeline. Split out so specialized pipelines (the
@@ -9170,6 +9209,107 @@ struct D { n:u32,_a:u32,_b:u32,_c:u32 };
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} o[i]=a[i]+b[i]; }"#;
 
+/// Gated DeltaNet, GPU stage 1: causal depthwise conv over the mixed qkv channels (ring
+/// advanced in place) + SiLU, plus the per-head gate activations. Faithful transcription of
+/// deltanet.rs step() phases 2-3 — the CPU module is the oracle this is checked against.
+/// P layout: [qkv(cd) | z(vd) | betaL(hv) | alphaL(hv)]  (the stacked projection's output)
+/// C layout: [taps(cd*dconv) | dt_bias(hv) | a(hv)]
+/// G layout: [conv_silu(cd) | beta_sigmoid(hv) | gate_pre_exp(hv)]
+const DELTANET_CONV: &str = r#"
+struct D { cd:u32, dconv:u32, hv:u32, vd:u32 };
+@group(0)@binding(0) var<storage,read> p: array<f32>;
+@group(0)@binding(1) var<storage,read> c: array<f32>;
+@group(0)@binding(2) var<storage,read_write> ring: array<f32>;
+@group(0)@binding(3) var<storage,read_write> g: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+fn softplus(x: f32) -> f32 { return max(x, 0.0) + log(1.0 + exp(-abs(x))); }
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+  let i = gid.y * nwg.x * 64u + gid.x;
+  if (i < d.cd) {
+    let hist = d.dconv - 1u;
+    let rb = i * hist;
+    var acc = 0.0;
+    for (var t = 0u; t < hist; t = t + 1u) { acc = acc + c[i * d.dconv + t] * ring[rb + t]; }
+    acc = acc + c[i * d.dconv + hist] * p[i];
+    for (var t = 0u; t + 1u < hist; t = t + 1u) { ring[rb + t] = ring[rb + t + 1u]; }
+    ring[rb + hist - 1u] = p[i];
+    g[i] = acc / (1.0 + exp(-acc));
+  } else if (i < d.cd + d.hv) {
+    let j = i - d.cd;
+    let b = p[d.cd + d.vd + j];
+    g[d.cd + j] = 1.0 / (1.0 + exp(-b));
+  } else if (i < d.cd + 2u * d.hv) {
+    let j = i - d.cd - d.hv;
+    let al = p[d.cd + d.vd + d.hv + j];
+    let dt = c[d.cd * d.dconv + j];
+    let av = c[d.cd * d.dconv + d.hv + j];
+    g[d.cd + d.hv + j] = softplus(al + dt) * av;
+  }
+}"#;
+
+/// Gated DeltaNet, GPU stage 2: per-v-head delta-rule recurrence + gated RMS norm — one
+/// WORKGROUP per head, rows strided across 64 threads (each row of S is thread-private).
+/// Transcribes delta_rule_head_step + step() phases 4-6 exactly, including l2's max(eps),
+/// the decay-BEFORE-correction ordering, and rms = sqrt(mean+eps).
+const DELTANET_STEP: &str = r#"
+struct D { s:u32, share:u32, kd:u32, cd:u32, hv:u32, eps:u32, _a:u32, _b:u32 };
+@group(0)@binding(0) var<storage,read> g: array<f32>;
+@group(0)@binding(1) var<storage,read> p: array<f32>;
+@group(0)@binding(2) var<storage,read> nrm: array<f32>;
+@group(0)@binding(3) var<storage,read_write> st: array<f32>;
+@group(0)@binding(4) var<storage,read_write> o: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> qn: f32;
+var<workgroup> kn: f32;
+var<workgroup> decay: f32;
+var<workgroup> beta: f32;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let h = wid.x;
+  let s = d.s;
+  let eps = bitcast<f32>(d.eps);
+  let sh = h / d.share;
+  let qb = sh * s;
+  let kb = d.kd + sh * s;
+  let vb = 2u * d.kd + h * s;
+  if (lid.x == 0u) {
+    var qs = 0.0; var ks = 0.0;
+    for (var i = 0u; i < s; i = i + 1u) { qs = qs + g[qb + i] * g[qb + i]; ks = ks + g[kb + i] * g[kb + i]; }
+    qn = max(sqrt(qs), eps);
+    kn = max(sqrt(ks), eps);
+    decay = exp(g[d.cd + d.hv + h]);
+    beta = g[d.cd + h];
+  }
+  workgroupBarrier();
+  let qscale = 1.0 / sqrt(f32(s));
+  for (var r = lid.x; r < s; r = r + 64u) {
+    let rb = h * s * s + r * s;
+    var yhat = 0.0;
+    for (var cc = 0u; cc < s; cc = cc + 1u) {
+      st[rb + cc] = st[rb + cc] * decay;
+      yhat = yhat + st[rb + cc] * (g[kb + cc] / kn);
+    }
+    let dd = beta * (g[vb + r] - yhat);
+    var ov = 0.0;
+    for (var cc = 0u; cc < s; cc = cc + 1u) {
+      st[rb + cc] = st[rb + cc] + dd * (g[kb + cc] / kn);
+      ov = ov + st[rb + cc] * (g[qb + cc] / qn) * qscale;
+    }
+    o[h * s + r] = ov;
+  }
+  workgroupBarrier();
+  if (lid.x == 0u) {
+    var ss = 0.0;
+    for (var i = 0u; i < s; i = i + 1u) { ss = ss + o[h * s + i] * o[h * s + i]; }
+    let rms = sqrt(ss / f32(s) + eps);
+    for (var i = 0u; i < s; i = i + 1u) {
+      let zv = p[d.cd + h * s + i];
+      o[h * s + i] = o[h * s + i] / rms * nrm[i] * (zv / (1.0 + exp(-zv)));
+    }
+  }
+}"#;
+
 const SIGMOID_MUL: &str = r#"
 struct D { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
@@ -12282,6 +12422,33 @@ scale {} ({}), shared {}, weight applied to {}",
                     dw.validate(&dn_dims).map_err(|e| format!("blk.{i} Gated DeltaNet weights refused: {e}"))?;
                     Some(Box::new(crate::deltanet::DeltaNetLayerHost { dims: dn_dims, w: dw }))
                 } else { None },
+                deltanet_gpu: if block_is_deltanet {
+                    // Rebuilt from the freshly-fetched host set: fetch() is cheap for these and
+                    // the two paths must load from the SAME bytes for the cross-check to bind.
+                    let dn_dims = crate::deltanet::DeltaNetDims {
+                        d,
+                        s: g.get_u32(&format!("{pfx}.ssm.state_size")).unwrap_or(0) as usize,
+                        h_k: g.get_u32(&format!("{pfx}.ssm.group_count")).unwrap_or(0) as usize,
+                        h_v: g.get_u32(&format!("{pfx}.ssm.time_step_rank")).unwrap_or(0) as usize,
+                        d_conv: g.get_u32(&format!("{pfx}.ssm.conv_kernel")).unwrap_or(0) as usize,
+                    };
+                    let (cd, vd, hv) = (dn_dims.conv_dim(), dn_dims.value_dim(), dn_dims.h_v);
+                    let mut all = fetch(&format!("blk.{i}.attn_qkv.weight"))?;
+                    all.extend_from_slice(&fetch(&format!("blk.{i}.attn_gate.weight"))?);
+                    all.extend_from_slice(&fetch(&format!("blk.{i}.ssm_beta.weight"))?);
+                    all.extend_from_slice(&fetch(&format!("blk.{i}.ssm_alpha.weight"))?);
+                    let w_all = self.make_lin(&all, cd + vd + 2 * hv, d, q, q4_mode);
+                    drop(all);
+                    let mut cp = fetch(&format!("blk.{i}.ssm_conv1d.weight"))?;
+                    cp.extend_from_slice(&fetch(&format!("blk.{i}.ssm_dt.bias"))?);
+                    cp.extend_from_slice(&fetch(&format!("blk.{i}.ssm_a"))?);
+                    Some(Box::new(DeltaNetGpuWeights {
+                        w_all,
+                        wout: self.make_lin(&fetch(&format!("blk.{i}.ssm_out.weight"))?, d, vd, q, q4_mode),
+                        conv_params: self.upload(&cp, 1, cd * dn_dims.d_conv + 2 * hv),
+                        norm: self.upload(&fetch(&format!("blk.{i}.ssm_norm.weight"))?, 1, dn_dims.s),
+                    }))
+                } else { None },
                 mla: {
                     let t = |a: &str, b: &str| -> Option<String> {
                         let na = format!("blk.{i}.{a}.weight");
@@ -12775,7 +12942,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
             let (wq, wk, wv) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let (wo, wgate_up, wdown) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let g2 = self.read_tensor(&mut r)?;
-            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, out_scale: None, v_norm: None, v_from_k: false, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None });
+            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, deltanet_gpu: None, attn_out_gate: None, out_scale: None, v_norm: None, v_from_k: false, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None });
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -13659,6 +13826,10 @@ pub struct KvCache {
     /// full-attention layers. Mutex because decode takes &KvCache while the CPU-routed
     /// mixer must mutate — one uncontended lock per recurrent layer per token.
     pub deltanet: Option<Vec<Option<std::sync::Mutex<crate::deltanet::DeltaNetState>>>>,
+    /// GPU-resident recurrent states, allocated alongside the host ones. Both exist so the
+    /// A/B toggle and the cross-check can run against one cache ALLOCATION policy; only the
+    /// path actually decoded through advances (they are separate sequences otherwise).
+    pub deltanet_gpu: Option<Vec<Option<DeltaNetGpuState>>>,
 }
 
 /// int8-quantized KV cache: K/V stored per-row as packed int8 (4x smaller than f32)
@@ -14376,7 +14547,7 @@ impl Gpu {
     pub fn new_cache(&self, n_layers: usize, max_seq: usize, d: usize) -> KvCache {
         KvCache { k: (0..n_layers).map(|_| self.alloc(max_seq, d)).collect(),
                   v: (0..n_layers).map(|_| self.alloc(max_seq, d)).collect(),
-                  mla: None, deltanet: None }
+                  mla: None, deltanet: None, deltanet_gpu: None }
     }
     /// A cache for `m`, adding the compressed MLA side when the model needs it.
     ///
@@ -14423,6 +14594,16 @@ impl Gpu {
             .map(|b| b.deltanet.as_ref().map(|dl| std::sync::Mutex::new(
                 crate::deltanet::DeltaNetState::new(&dl.dims)))).collect();
         if dn.iter().any(|x| x.is_some()) { c.deltanet = Some(dn); }
+        let dng: Vec<Option<DeltaNetGpuState>> = m.layers.iter()
+            .map(|b| b.deltanet.as_ref().map(|dl| {
+                let md = &dl.dims;
+                DeltaNetGpuState {
+                    ring: self.upload(&vec![0.0f32; md.conv_dim() * (md.d_conv - 1)], 1, md.conv_dim() * (md.d_conv - 1)),
+                    s: self.upload(&vec![0.0f32; md.state_elems()], 1, md.state_elems()),
+                    next_pos: std::sync::atomic::AtomicUsize::new(0),
+                }
+            })).collect();
+        if dng.iter().any(|x| x.is_some()) { c.deltanet_gpu = Some(dng); }
         c
     }
 
@@ -15092,7 +15273,7 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
     }
     /// Promote an int8 prefix cache (first `len` rows) back to f32 for seeding (lossy).
     pub fn promote_cache(&self, q: &QKvCache, len: usize, kv_dim: usize) -> KvCache {
-        let mut c = KvCache { k: vec![], v: vec![], mla: None, deltanet: None };
+        let mut c = KvCache { k: vec![], v: vec![], mla: None, deltanet: None, deltanet_gpu: None };
         for li in 0..q.kq.len() {
             c.k.push(self.dequant_rows(&q.kq[li], &q.ks[li], len, kv_dim));
             c.v.push(self.dequant_rows(&q.vq[li], &q.vs[li], len, kv_dim));
@@ -15414,6 +15595,38 @@ like a bad model rather than a wiring bug.");
     /// goes back up for the residual and FFN (`ffn_apply`, so MoE/dense/shared-expert all work
     /// unchanged). One download+upload per recurrent layer per token; a GPU kernel replaces the
     /// round-trip only once it can be CHECKED against this path.
+    /// One Gated DeltaNet block, GPU-RESIDENT: rmsnorm → ONE stacked projection matvec →
+    /// DELTANET_CONV → DELTANET_STEP → wout → residual → shared FFN. Five dispatches, ZERO
+    /// host round-trips — the CPU route below pays a download + upload per recurrent layer
+    /// per token, the sync class the Asahi MoE-v1 measurements showed dominating decode.
+    /// Checked against the CPU oracle by --gate-deltanet-load (logits AND final state).
+    pub fn block_decode_deltanet_gpu(&self, w: &BlockWeights, dl: &crate::deltanet::DeltaNetLayerHost,
+                                     dg: &DeltaNetGpuWeights, st: &DeltaNetGpuState,
+                                     x: &Tensor, pos: usize, d: usize, eps: f32) -> Tensor {
+        let md = &dl.dims;
+        let np = st.next_pos.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(np == pos,
+            "Gated DeltaNet layers are RECURRENT: this state is at position {np} but decode asked \
+for position {pos}. Recurrent state cannot seek — positions must be consumed sequentially from 0 \
+per cache, so trie/fleet prefix reuse cannot serve hybrid models. Build a fresh new_cache_for per \
+sequence.");
+        st.next_pos.store(pos + 1, std::sync::atomic::Ordering::Relaxed);
+        let (cd, vd, hv, ss) = (md.conv_dim(), md.value_dim(), md.h_v, md.s);
+        let proj = dg.w_all.norm_apply(self, x, &w.g1, d, eps, 1);   // [1, cd+vd+2hv]
+        let gbuf = self.alloc(1, cd + 2 * hv);
+        let dims = [cd as u32, md.d_conv as u32, hv as u32, vd as u32];
+        self.dispatch_rw(DELTANET_CONV, &[&proj, &dg.conv_params, &st.ring], 2, &gbuf,
+                      bytemuck::cast_slice(&dims), wg1((cd + 2 * hv) as u32));
+        let mix = self.alloc(1, vd);
+        let dims2 = [ss as u32, (hv / md.h_k) as u32, md.key_dim() as u32, cd as u32,
+                     hv as u32, eps.to_bits(), 0, 0];
+        self.dispatch_rw(DELTANET_STEP, &[&gbuf, &proj, &dg.norm, &st.s], 3, &mix,
+                      bytemuck::cast_slice(&dims2), (hv as u32, 1, 1));
+        let y = dg.wout.apply(self, &mix, 1);
+        let x2 = self.add_t(x, &y);
+        self.ffn_apply(w, &x2, 1, d, eps)
+    }
+
     pub fn block_decode_deltanet(&self, w: &BlockWeights, dl: &crate::deltanet::DeltaNetLayerHost,
                                  st: &std::sync::Mutex<crate::deltanet::DeltaNetState>,
                                  x: &Tensor, pos: usize, d: usize, eps: f32) -> Tensor {
@@ -15891,10 +16104,18 @@ like a bad model rather than a wiring bug.");
             // a state slot, and not having one means a raw new_cache() on a hybrid model — refuse
             // by name rather than reaching the dense arms below on placeholder weights.
             x = if let Some(dl) = &w.deltanet {
+                // GPU-resident by default (zero host round-trips); LOGSCOPE_DELTANET_CPU=1
+                // forces the oracle for A/B — the gate cross-checks the two.
+                let force_cpu = std::env::var("LOGSCOPE_DELTANET_CPU").as_deref() == Ok("1");
+                if let (Some(dg), Some(sg), false) = (&w.deltanet_gpu,
+                        c.deltanet_gpu.as_ref().and_then(|v| v[li].as_ref()), force_cpu) {
+                    self.block_decode_deltanet_gpu(w, dl, dg, sg, &x, pos, m.d, m.eps)
+                } else {
                 let st = c.deltanet.as_ref().and_then(|v| v[li].as_ref()).unwrap_or_else(|| panic!(
                     "layer {li} is Gated DeltaNet but this cache has no recurrent state slot — \
 built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get per-layer states"));
                 self.block_decode_deltanet(w, dl, st, &x, pos, m.d, m.eps)
+                }
             } else { match (&w.mla, &c.mla, &m.mla) {
                 (Some(mw), Some(mc), Some(cfg)) => {
                     let dm = self.mla_dims(cfg, m.d, m.n_heads, m.base, m.eps);
@@ -16549,10 +16770,18 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
             // a state slot, and not having one means a raw new_cache() on a hybrid model — refuse
             // by name rather than reaching the dense arms below on placeholder weights.
             x = if let Some(dl) = &w.deltanet {
+                // GPU-resident by default (zero host round-trips); LOGSCOPE_DELTANET_CPU=1
+                // forces the oracle for A/B — the gate cross-checks the two.
+                let force_cpu = std::env::var("LOGSCOPE_DELTANET_CPU").as_deref() == Ok("1");
+                if let (Some(dg), Some(sg), false) = (&w.deltanet_gpu,
+                        c.deltanet_gpu.as_ref().and_then(|v| v[li].as_ref()), force_cpu) {
+                    self.block_decode_deltanet_gpu(w, dl, dg, sg, &x, pos, m.d, m.eps)
+                } else {
                 let st = c.deltanet.as_ref().and_then(|v| v[li].as_ref()).unwrap_or_else(|| panic!(
                     "layer {li} is Gated DeltaNet but this cache has no recurrent state slot — \
 built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get per-layer states"));
                 self.block_decode_deltanet(w, dl, st, &x, pos, m.d, m.eps)
+                }
             } else { match (&w.mla, &c.mla, &m.mla) {
                 (Some(mw), Some(mc), Some(cfg)) => {
                     let dm = self.mla_dims(cfg, m.d, m.n_heads, m.base, m.eps);
