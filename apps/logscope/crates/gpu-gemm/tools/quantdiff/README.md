@@ -1,0 +1,47 @@
+# quantdiff — differential dequantization against llama.cpp
+
+The same bytes through llama.cpp's `dequantize_row_*` and through this crate's
+`gguf::dequantize`. Any divergence is a bug in one of them, and the reference is
+authoritative: llama.cpp's dequantizer is what produced every GGUF file in
+existence.
+
+This is the cheapest strong oracle available for quant work. A dequantizer is a
+pure function of bytes, so it needs no model, no weights and no judgement —
+random bytes are a valid input, and the two implementations must agree on all of
+them.
+
+## Running it
+
+    # 1. reference, from a llama.cpp checkout
+    cd <llama.cpp>/ggml/src
+    gcc -O1 -I. -I../include -Icpu -o /tmp/qref <this dir>/qref.c ggml-quants.c -lm
+
+    # 2. ours: a bin crate depending on gpu-gemm, with qdiff_main.rs as its main
+    # 3. sweep
+    sh sweep.sh
+
+## What it found
+
+Run against llama.cpp master, twelve types, four seeds:
+
+  * **IQ2_S** — `qh` and `signs` swapped. ggml-common.h declares
+    `{ d; qs[QK_K/4]; qh[QK_K/32]; scales[QK_K/32]; }`, which reads as
+    qh-then-signs, but `dequantize_row_iq2_s` takes `signs = qs + QK_K/8` — out
+    of the SECOND HALF of qs. Real order: `d | qs[32] | signs[32] | qh[8] |
+    scales[8]`. 186 of the first 256 weights were wrong in both sign and
+    magnitude.
+  * **IQ1_M** — two scale bugs. The 16-bit block scale comes from the top
+    nibbles of the ODD scale bytes (llama.cpp reads `scales` as four u16s and
+    takes the top nibble of each); this crate used the even ones. And the
+    sub-block scales are 3-bit fields, two per 32 weights at bit offsets
+    `6*(i%2)` and `+3`; this crate read 4-bit nibbles, taking one bit belonging
+    to the neighbouring scale.
+
+Both produce plausible wrong numbers rather than crashes or zeros, which is why
+they survived: a model in either format loads, runs, and is merely bad. Neither
+is reachable by reading the struct definition — in both cases the declaration
+and the dequantizer disagree, and the dequantizer is the truth.
+
+The fixes are pinned in-tree by `iq2_s_matches_the_llama_cpp_reference_vector`
+and `iq1_m_matches_the_llama_cpp_reference_vector`, as numbers rather than as a
+re-derivation of the layout, because the layout is what was misread.
