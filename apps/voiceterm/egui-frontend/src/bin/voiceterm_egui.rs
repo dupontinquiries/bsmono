@@ -601,6 +601,11 @@ struct VoicetermApp {
     /// block every frame would re-read the whole session's output at frame
     /// rate for a list that changes when a command finishes.
     mail_scanned_blocks: usize,
+    /// Mail read off disk, kept apart from the terminal-harvested set so a
+    /// rescan of one does not discard the other.
+    mail_from_disk: Vec<voiceterm_egui::mail_view::Message>,
+    /// Where that came from, for the status line and the rescan button.
+    mail_store_path: Option<std::path::PathBuf>,
     /// The open message id on the Mail view, if any.
     mail_open: Option<String>,
     /// The command audit chain: every submitted line hashed into a tamper-
@@ -867,6 +872,46 @@ impl VoicetermApp {
     /// CLOSED blocks only: an open one is still receiving output, and
     /// parsing a half-arrived message shows a mail with no body that never
     /// updates.
+    /// Read the machine's mail store, if it has one.
+    ///
+    /// Called on demand, not per frame: a Maildir scan is thousands of
+    /// `stat`s and file reads, and doing that at frame rate would stall the
+    /// UI for as long as the app is open. `discover` picks the first of
+    /// `$MAIL`, `~/Maildir`, `~/mail`, `/var/mail/$USER` that holds
+    /// anything.
+    fn rescan_mail_store(&mut self) {
+        match voiceterm_egui::mail_store::discover() {
+            Some((path, _kind)) => {
+                self.mail_from_disk = voiceterm_egui::mail_store::load(&path);
+                self.mail_store_path = Some(path);
+            }
+            None => {
+                // Cleared, not left: a store that has gone away must not
+                // keep showing its last contents as though they were live.
+                self.mail_from_disk.clear();
+                self.mail_store_path = None;
+            }
+        }
+        self.rebuild_mail();
+    }
+
+    /// Merge the two sources into the view.
+    ///
+    /// Disk first, then anything harvested from the terminal that is not
+    /// already there. De-duplicated by message id, because `cat`-ing a file
+    /// that is also in the Maildir is the ordinary way to read mail in a
+    /// terminal — and showing it twice would make the inbox wrong precisely
+    /// for the person using both halves of this app.
+    fn rebuild_mail(&mut self) {
+        let mut all = self.mail_from_disk.clone();
+        for m in &self.mail_messages {
+            if !all.iter().any(|x| x.id == m.id) {
+                all.push(m.clone());
+            }
+        }
+        self.mail.set_messages(&all);
+    }
+
     fn harvest_mail_from_blocks(&mut self) {
         let blocks = &self.blocks.blocks;
         if blocks.len() == self.mail_scanned_blocks {
@@ -895,7 +940,7 @@ impl VoicetermApp {
         // Cheap — the scan only runs when the block count moved.
         if found != self.mail_messages {
             self.mail_messages = found;
-            self.mail.set_messages(&self.mail_messages);
+            self.rebuild_mail();
         }
     }
 
@@ -2187,6 +2232,23 @@ impl eframe::App for VoicetermApp {
                                 "{} → {} thread(s)", parts.join(", "), hits.len()))
                                 .weak().size(11.0));
                         }
+                        // WHERE THE MAIL CAME FROM, and how to look again.
+                        // An empty inbox with no explanation is
+                        // indistinguishable from a broken one, and the
+                        // difference here is usually just that this machine
+                        // keeps its mail somewhere else.
+                        ui.horizontal(|ui| {
+                            if ui.button("rescan mail").clicked() {
+                                self.rescan_mail_store();
+                            }
+                            let note = match &self.mail_store_path {
+                                Some(p) => format!("{} — {} message(s)",
+                                                   p.display(), self.mail_from_disk.len()),
+                                None => "no mail store found ($MAIL, ~/Maildir, ~/mail, \
+                                         /var/mail)".to_string(),
+                            };
+                            ui.label(egui::RichText::new(note).weak().size(11.0));
+                        });
                         if let Some(conv) = voiceterm_egui::mail_view::list_ui(ui, &mut self.mail, &c) {
                             // OPENING A THREAD READS IT. `mark_thread_read`
                             // had no caller, so the unread count and the
@@ -3723,7 +3785,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     },
         Box::new(move |_cc| {
-            Ok(Box::new(VoicetermApp {
+            let mut app = VoicetermApp {
                 ingest: Default::default(),
                 // Discovery once at startup, not per frame: scanning
                 // /sys/bus/iio/devices every repaint is a directory walk at 60
@@ -3831,6 +3893,8 @@ fn main() -> eframe::Result<()> {
                 archive: Default::default(),
                 mail_messages: Vec::new(),
                 mail_scanned_blocks: 0,
+                mail_from_disk: Vec::new(),
+                mail_store_path: None,
                 mail_open: None,
                 audit: Default::default(),
                 audit_lines: Vec::new(),
@@ -3876,7 +3940,14 @@ fn main() -> eframe::Result<()> {
                 workspaces_filter: String::new(),
                 bar_note: String::new(),
                 graph_source: String::new(),
-            }))
+            };
+            // ONE SCAN AT STARTUP, so the mail views have something the
+            // moment they are opened rather than only after the person
+            // finds the rescan button. Not repeated: a Maildir scan is
+            // thousands of stats, and mail that arrives later is what the
+            // button is for.
+            app.rescan_mail_store();
+            Ok(Box::new(app))
         }),
     )
 }

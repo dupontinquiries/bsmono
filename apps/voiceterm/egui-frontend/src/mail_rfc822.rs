@@ -238,10 +238,29 @@ pub fn parse_date(raw: &str) -> i64 {
 /// into any synthesised id, so two `cat`s of different files cannot collide
 /// on `<no-id>` and appear as one thread.
 pub fn messages_from_text(origin: &str, text: &str) -> Vec<Message> {
-    split_mbox(text).into_iter().enumerate().map(|(i, raw)| {
+    split_mbox(text).into_iter().enumerate()
+        .map(|(i, raw)| message_from_text(&format!("{origin}#{i}"), raw))
+        .collect()
+}
+
+/// One message, WITHOUT mbox splitting.
+///
+/// The entry point for a format that already knows where a message ends —
+/// Maildir, where one file is one message. Going through
+/// [`messages_from_text`] there is not merely wasteful, it is wrong: a body
+/// line beginning `From ` is treated as a separator, and since `split_mbox`
+/// keeps only what follows a separator, the message's HEADERS are dropped
+/// and what survives is the quoted tail with no subject and no sender.
+/// Quoted mail is full of such lines.
+pub fn message_from_text(origin: &str, raw: &str) -> Message {
+    build(origin, raw)
+}
+
+fn build(origin: &str, raw: &str) -> Message {
+    {
         let p = parse_message(raw);
         let id = if p.message_id.is_empty() {
-            format!("{origin}#{i}")
+            origin.to_string()
         } else {
             p.message_id.clone()
         };
@@ -283,7 +302,7 @@ pub fn messages_from_text(origin: &str, text: &str) -> Vec<Message> {
             num_attachments: 0,
             is_encrypted: 0,
         }
-    }).collect()
+    }
 }
 
 /// `Re: Fwd: Re: thing` → `thing`.
