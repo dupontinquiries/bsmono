@@ -546,12 +546,18 @@ pub struct HeroPose {
     /// r573: signed bank angle (radians) for flight turns — the body rolls into the
     /// turn so changing heading reads as a banked arc. Only applied while flying.
     pub bank: f32,
+    /// r-swing: additive arm-swing arc amount, 0 = no swing. Callers reuse the SAME
+    /// timer that already drives the first-person viewmodel's attack overlay
+    /// (`swing_timer`/`SWING_DURATION` in the bin) and pass through the identical
+    /// `(prog * PI).sin()` arc shape, so the third-person body and the first-person
+    /// hand swing in perfect sync for free — no separate combat-animation clock.
+    pub swing01: f32,
 }
 
 impl Default for HeroPose {
     fn default() -> Self {
         HeroPose { yaw: 0.0, gaze_pitch: 0.0, walk_phase: 0.0, walk_amp: 0.0, anim_t: 0.0, held_color: None,
-            airborne: 0.0, vertical_vel: 0.0, land_crouch: 0.0, flight01: 0.0, bank: 0.0 }
+            airborne: 0.0, vertical_vel: 0.0, land_crouch: 0.0, flight01: 0.0, bank: 0.0, swing01: 0.0 }
     }
 }
 
@@ -727,6 +733,21 @@ pub fn build(
         rot[HIPR][0] = lerp(rot[HIPR][0], -0.22);
         rot[KNL][0] = lerp(rot[KNL][0], 0.0);
         rot[KNR][0] = lerp(rot[KNR][0], 0.0);
+    }
+
+    // r-swing: ATTACK SWING overlay — a right-arm chop, additive on top of
+    // whatever the walk/flight rig already computed (mirrors how airborne/
+    // land_crouch/flight01 all layer above). `swing01` is already the shaped
+    // arc amount (see HeroPose::swing01 doc), so no easing/shape logic here —
+    // just apply it. The held item (built below at HAR) rides the arm, so it
+    // visibly swings with the hand rather than staying static while the body
+    // moves around it.
+    let swing = pose.swing01.clamp(0.0, 1.0);
+    if swing > 0.001 {
+        rot[SHR][0] -= 1.6 * swing;   // chop forward/down
+        rot[SHR][2] -= 0.30 * swing;  // pull slightly across the body
+        rot[ELR][0] -= 0.90 * swing;  // elbow follows through
+        rot[CHEST][1] += 0.15 * swing; // torso twists into the swing
     }
 
     let base_y = 0.0; // feet auto-grounded at finalize
