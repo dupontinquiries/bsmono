@@ -3520,3 +3520,31 @@ printing): shot 9 −0.5% AND +0.054 dB; shotB flat bytes AND
 headline NOT yet re-measured for this change; the standing suite
 number remains the planar generation (31.58 MB @ 33.90 / 0.941,
 31.9×) until the next full run prints.
+
+### Drift-anchored mode decision: third principled attempt, third loss (same session)
+
+The idea: the leftover error SAD(recon, source) per region after each
+frame IS the exact accumulated drift state (the encoder is its own
+decoder), so re-anchor a region to the plate deterministically when
+measured drift exceeds a threshold — replacing the grain-dither
+accident with measurement. Implementation found its own bug first:
+the drifted branch was written as an algebraic identity of the plain
+rule (35,988 drifted flags, ZERO decision flips — the instrument
+caught it). Corrected to a raised prev margin and measured:
+  thr 768, margin 256: shotB +0.2% bytes AND −0.02 dB (worse both axes)
+  thr 2048           : +0.05% / +0.002 dB (statistical zero)
+Verdict: joins region_codable_cost and rotating refresh in the
+recorded negatives. The SAD dither's accidental refresh remains
+unbeaten by every deterministic replacement tried; whatever finally
+beats it must price the FUTURE cost of each choice (true lookahead
+with trial encodes), not re-derive refresh from present-frame state.
+All drift machinery reverted; both A/B shots verified BYTE-EXACT
+against the range24 baselines after revert.
+
+Process failures this stretch, on the record:
+1. python replace() without count=1 applied patches to v2, v3, AND v4
+   (three functions share decision-loop shape); two repair cycles.
+2. The binary was rebuilt while a full-suite run was live — the suite
+   invokes the binary per shot, so the run mixed generations and its
+   output was DISCARDED (full_v11_CONTAMINATED_discard.csv kept as
+   the artifact). Rule adopted: no rebuilds while a suite runs.

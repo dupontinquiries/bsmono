@@ -1263,7 +1263,8 @@ pub fn encode_gop_v3(
                     // replacement is lookahead RD (charging plate-mode's
                     // persistent error across future frames), not a better
                     // single-frame proxy. Numbers in SESSION_LOG.
-                    if sad_prev + 64 < sad_plate {
+                    
+                        if sad_prev + 64 < sad_plate {
                         if std::env::var("FAO_MV_DEBUG").is_ok() {
                             let sat = MV_RANGE * 4; // qpel units at the clamp
                             if (mv.0 as i32).abs() >= sat - 4 || (mv.1 as i32).abs() >= sat - 4 {
