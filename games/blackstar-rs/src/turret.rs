@@ -327,8 +327,13 @@ pub fn find(prims: &[&[Vec3]]) -> Fittings {
             // barrel's own current heading, so raising the muzzle stays
             // correct no matter which way the turret is yawed. Falls
             // back to X for the (degenerate) case of a dead-vertical
-            // barrel, where up x aim is zero.
-            let axis = Vec3::Y.cross(aim);
+            // barrel, where up x aim is zero. Cross order chosen so a
+            // POSITIVE rotation about this axis raises the muzzle —
+            // verified empirically (`the_elevation_axis_sign_raises_the_muzzle`
+            // below), not derived by hand, since a sign error here is
+            // easy to get backwards and hard to notice from the numbers
+            // alone.
+            let axis = aim.cross(Vec3::Y);
             out.elevation_axis = if axis.length_squared() > 1e-8 { axis.normalize() } else { Vec3::X };
             out.elevation_pivot = root;
             out.barrel = Some(i);
@@ -484,5 +489,18 @@ mod tests {
         let refs: Vec<&[Vec3]> = all.iter().map(|v| v.as_slice()).collect();
         let f = find(&refs);
         assert!(!f.has_turret(), "roof clutter was called a turret: {}", f.report());
+    }
+
+    #[test]
+    fn the_elevation_axis_sign_raises_the_muzzle() {
+        // a POSITIVE rotation about `elevation_axis` must raise the
+        // muzzle (increase tip.y), for any caller driving elevation
+        // from an aim pitch to be able to just use the sign of the
+        // desired pitch directly, without having to remember which
+        // way this particular cross product came out.
+        let aim = Vec3::new(0.0, 0.0, -1.0); // pointing forward, level
+        let axis = aim.cross(Vec3::Y).normalize();
+        let raised = (glam::Quat::from_axis_angle(axis, 0.1) * aim).y;
+        assert!(raised > 0.0, "a positive rotation lowered the muzzle instead: tip.y = {raised}");
     }
 }

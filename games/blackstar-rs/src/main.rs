@@ -8114,12 +8114,6 @@ impl Game {
         // steer and the gun goes where you are aiming. Yaw only, about the
         // RING rather than the turret's mass (`turret::find`) — a gun that
         // pivots on its own centroid swings its breech through the hull.
-        // Elevation is still not wired in HERE: `turret::find` now detects
-        // a barrel prim and a horizontal elevation axis/pivot
-        // (`Fittings::barrel`/`elevation_axis`/`elevation_pivot`), but
-        // driving that from a real aim pitch — and picking sane
-        // elevation/depression limits — is gameplay-feel work that needs
-        // a controller in someone's hands, not a blind addition here.
         let turret_q = if active.fittings.has_turret() {
             // where the EYE is looking, taken from the camera's own
             // geometry rather than a euler it does not keep: the vector
@@ -8146,6 +8140,32 @@ impl Game {
         } else {
             None
         };
+        // ELEVATION, on the one prim `turret::find` identified as the
+        // barrel, about its own detected pivot/axis rather than the
+        // ring — pitching about the ring would swing the whole turret
+        // body, not just tip the gun. Composed INSIDE the yaw above
+        // (applied to the raw prim before `turret_q`, see the order of
+        // the two match arms below): elevate the barrel in the turret's
+        // own unyawed frame first, then yaw the already-elevated barrel
+        // along with the rest of the turret.
+        //
+        // FIRST-PASS ELEVATION LIMITS, not a measured or playtested
+        // number: +20/-8 degrees is a generic real-world tank-gun range,
+        // used here as a physically-motivated default rather than an
+        // arbitrary one, since this needs a controller in someone's
+        // hands to actually tune. Expect these two constants to move.
+        const MAX_ELEVATION: f32 = 20.0 * std::f32::consts::PI / 180.0;
+        const MAX_DEPRESSION: f32 = 8.0 * std::f32::consts::PI / 180.0;
+        let elevation_q = active.fittings.barrel.map(|_| {
+            let view = self.cam.look - self.cam.pos;
+            let flat = (view.x * view.x + view.z * view.z).sqrt().max(1e-4);
+            let want_pitch = view.y.atan2(flat).clamp(-MAX_DEPRESSION, MAX_ELEVATION);
+            // `elevation_axis` is defined (turret.rs, verified by its own
+            // test) so a POSITIVE angle raises the muzzle — same sign as
+            // "looking up is a positive pitch" here, so no sign flip
+            // needed at this call site.
+            Quat::from_axis_angle(active.fittings.elevation_axis, want_pitch)
+        });
         let robot = self.xf.is_robot();
         // STAND THE DESTINATION UP WITHOUT BENDING THE JOURNEY.
         //
@@ -8255,6 +8275,22 @@ impl Game {
                     base * Mat4::from_translation(r)
                         * Mat4::from_quat(*q)
                         * Mat4::from_translation(-r)
+                }
+                _ => base,
+            };
+            // ELEVATION, on the barrel only, composed AFTER the yaw above
+            // so it ends up INNER to it (matrix chain applies right-to-
+            // left to the raw vertex): pitch the barrel about its own
+            // pivot in the turret's unyawed local frame first, then the
+            // yaw carries the already-elevated barrel around with the
+            // rest of the turret, exactly like a real mantlet riding on
+            // a rotating turret ring.
+            let base = match (&elevation_q, active.fittings.barrel) {
+                (Some(eq), Some(bi)) if bi == pi => {
+                    let p = active.fittings.elevation_pivot;
+                    base * Mat4::from_translation(p)
+                        * Mat4::from_quat(*eq)
+                        * Mat4::from_translation(-p)
                 }
                 _ => base,
             };
