@@ -70,6 +70,15 @@ use crate::{
 /// method it happens to call — a variant called `NoteCameraWorked` would tie
 /// the wire format to an internal name, and the point of the seam is that the
 /// two can move apart.
+/// How much time one level report stands for, for the floor's hold timer.
+///
+/// These events carry no timestamp, and the mic pump runs at roughly 50Hz.
+/// Being slightly out only shifts how long a silent talker keeps the
+/// floor, which is a feel setting rather than a correctness one — but the
+/// number has to exist somewhere, and inventing it at each call site is
+/// how two of them end up disagreeing.
+pub const MIC_TICK_MS: f32 = 20.0;
+
 #[derive(Debug, Clone)]
 pub enum HostEvent {
     /// Wall clock advanced. Carries seconds because that is what the app's
@@ -440,10 +449,22 @@ impl Snapclone {
                 self.last_voice_at = Some(self.now_secs);
             }
             HostEvent::MicFrame => out.push(HostCommand::VoiceEmit(self.voice_frame())),
+            // The mic reports at the frame pump's rate, and the floor's
+            // hold is in milliseconds — so the tracker needs a step. A
+            // constant rather than a measured dt because these events
+            // carry no timestamp; being slightly out only shifts how long
+            // a silent talker keeps the floor, which is a feel setting.
             HostEvent::MicActivity(level) => {
                 let l = level.clamp(0.0, 1.0);
                 self.sender.on_activity(l);
                 self.voicebar.set_mic_level(l);
+                // YOU ONLY HOLD THE FLOOR WHILE TRANSMITTING. The mic is
+                // live whenever the call is, so without this gate the bar
+                // says "You" for a room the other end cannot hear —
+                // which is worse than saying nothing, because it looks
+                // like confirmation that you are being heard.
+                let mine = if self.sender.is_transmitting() { l } else { 0.0 };
+                self.voicebar.note_level("You", true, mine, MIC_TICK_MS);
             }
             HostEvent::EncoderReady(ready) => {
                 self.sender.set_encoder_ready(ready);
@@ -463,6 +484,17 @@ impl Snapclone {
             HostEvent::SpeakerLevel { peer, level } => {
                 self.group_voice.set_level(&peer, level);
                 self.voice_room.set_speaker_level(level);
+                // The peer's DISPLAY name, not its id: the centre line is
+                // read at arm's length by someone holding the phone, and a
+                // 52-character key there is the same as no label.
+                // The nickname when there is one, the id otherwise. A
+                // 52-character key on the centre line is the same as no
+                // label to someone holding the phone at arm's length.
+                let name = self.contact_book.get(&peer)
+                    .map(|c| c.nickname.clone())
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or_else(|| peer.clone());
+                self.voicebar.note_level(&name, false, level, MIC_TICK_MS);
             }
 
             HostEvent::SnapsArrived { from, focused } => {

@@ -45,6 +45,21 @@ pub const LEVEL_EASE: f32 = 0.25;
 pub const PULSE_STEP: f32 = 0.12;
 /// `FrequentButton::kGrandScale` — the talk button in push-to-talk, where you
 /// hold it constantly.
+/// Above this level a stream counts as speech.
+///
+/// Not zero: a live mic in a quiet room sits around 0.02–0.05, and a
+/// threshold at zero makes the floor look permanently taken by whoever
+/// happens to be breathing.
+pub const TALK_GATE: f32 = 0.12;
+
+/// How long a talker keeps the floor after dropping below the gate.
+///
+/// Speech has gaps in it — between words, and at every comma. Releasing
+/// the floor the instant the level dips makes the label flicker between a
+/// name and "Floor open" several times a sentence, which is unreadable
+/// and reads as a connection problem.
+pub const TALK_HOLD_MS: f32 = 700.0;
+
 pub const GRAND_SCALE: f32 = 1.50;
 /// `kComfortableScale` — present but not the focus, in the auto modes.
 pub const COMFORTABLE_SCALE: f32 = 1.25;
@@ -87,6 +102,10 @@ pub struct VoiceBar {
     /// Who holds the floor. Empty means the floor is open.
     talker: String,
     talker_is_self: bool,
+    /// The holder's last level, so a louder speaker can take the floor.
+    talker_level: f32,
+    /// Time left before a silent holder gives it up. See `TALK_HOLD_MS`.
+    talker_hold_ms: f32,
     mic_level: f32,
     display_level: f32,
     on_air: bool,
@@ -103,6 +122,7 @@ pub struct VoiceBar {
 impl Default for VoiceBar {
     fn default() -> Self {
         VoiceBar { security: Security::default(), talker: String::new(), talker_is_self: false,
+                   talker_level: 0.0, talker_hold_ms: 0.0,
                    mic_level: 0.0, display_level: 0.0, on_air: false, ptt_down: false,
                    latched: false, press_y: 0.0, talk_scale: GRAND_SCALE,
                    breath: uikit_egui::motion::Breath::new(1000.0, 0.0, 1.0) }
@@ -114,6 +134,47 @@ impl VoiceBar {
         VoiceBar { talk_scale: GRAND_SCALE,
                    breath: uikit_egui::motion::Breath::new(1000.0, 0.0, 1.0),
                    ..Default::default() }
+    }
+
+    /// Who has the floor, from the levels arriving.
+    ///
+    /// `set_talker` existed with no caller, so the centre line said "Floor
+    /// open" for an entire call however much anyone was speaking. The
+    /// levels were already arriving — `MicActivity` for your own mic,
+    /// `SpeakerLevel` per peer — and nothing turned them into a name.
+    ///
+    /// LOUDEST WINS, and ties keep the current holder. Two people talking
+    /// at once is the ordinary case in a group call, and a rule that
+    /// switched on every sample would strobe between them; keeping the
+    /// holder means the label changes when someone actually takes over.
+    pub fn note_level(&mut self, who: &str, is_self: bool, level: f32, dt_ms: f32) {
+        let speaking = level >= TALK_GATE;
+        if speaking && (level > self.talker_level || self.talker.trim().is_empty()
+                        || self.talker == who) {
+            self.talker = who.to_string();
+            self.talker_is_self = is_self;
+            self.talker_level = level;
+            self.talker_hold_ms = TALK_HOLD_MS;
+            return;
+        }
+        // Not louder than the holder. If this IS the holder and it went
+        // quiet, start the hold running rather than releasing at once.
+        if self.talker == who && !speaking {
+            self.talker_level = 0.0;
+            self.talker_hold_ms -= dt_ms.max(0.0);
+            if self.talker_hold_ms <= 0.0 {
+                self.talker.clear();
+                self.talker_is_self = false;
+            }
+        }
+    }
+
+    /// Nobody is on the call any more.
+    pub fn clear_talker(&mut self) {
+        self.talker.clear();
+        self.talker_is_self = false;
+        self.talker_level = 0.0;
+        self.talker_hold_ms = 0.0;
     }
 
     /// `setTalker`. `is_self` styles it as "You".
@@ -465,5 +526,73 @@ mod tests {
             let p = b.pulse();
             assert!((0.0..=1.0).contains(&p), "pulse out of range: {p}");
         }
+    }
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::*;
+
+    fn bar() -> VoiceBar { VoiceBar::new() }
+
+    #[test]
+    fn a_quiet_room_leaves_the_floor_open() {
+        // A live mic idles around 0.02–0.05. A gate at zero makes the
+        // floor look permanently taken by whoever is breathing.
+        let mut b = bar();
+        b.note_level("You", true, 0.04, 20.0);
+        assert!(b.floor_open(), "{}", b.talker_label());
+        assert_eq!(b.talker_label(), "Floor open");
+    }
+
+    #[test]
+    fn speaking_takes_the_floor_and_your_own_voice_reads_as_you() {
+        let mut b = bar();
+        b.note_level("You", true, 0.6, 20.0);
+        assert_eq!(b.talker_label(), "You");
+        assert!(!b.floor_open());
+    }
+
+    #[test]
+    fn a_gap_between_words_does_not_release_the_floor() {
+        // Speech has gaps at every comma. Releasing on the first dip makes
+        // the label flicker several times a sentence, which reads as a
+        // connection problem.
+        let mut b = bar();
+        b.note_level("Ada", false, 0.5, 20.0);
+        for _ in 0..10 { b.note_level("Ada", false, 0.01, 20.0); }  // 200ms quiet
+        assert_eq!(b.talker_label(), "Ada", "a pause released the floor");
+        b.note_level("Ada", false, 0.5, 20.0);
+        assert_eq!(b.talker_label(), "Ada");
+    }
+
+    #[test]
+    fn the_floor_opens_once_the_hold_runs_out() {
+        let mut b = bar();
+        b.note_level("Ada", false, 0.5, 20.0);
+        for _ in 0..((TALK_HOLD_MS / 20.0) as usize + 2) {
+            b.note_level("Ada", false, 0.0, 20.0);
+        }
+        assert!(b.floor_open(), "still says {}", b.talker_label());
+    }
+
+    #[test]
+    fn a_louder_speaker_takes_over_and_a_quieter_one_does_not() {
+        // Two people at once is ordinary in a group call. Switching on
+        // every sample would strobe between them; the loudest holds it.
+        let mut b = bar();
+        b.note_level("Ada", false, 0.6, 20.0);
+        b.note_level("Bo", false, 0.3, 20.0);
+        assert_eq!(b.talker_label(), "Ada", "a quieter speaker took the floor");
+        b.note_level("Bo", false, 0.9, 20.0);
+        assert_eq!(b.talker_label(), "Bo");
+    }
+
+    #[test]
+    fn leaving_the_call_clears_the_floor() {
+        let mut b = bar();
+        b.note_level("Ada", false, 0.8, 20.0);
+        b.clear_talker();
+        assert!(b.floor_open());
     }
 }

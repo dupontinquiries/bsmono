@@ -2338,6 +2338,11 @@ impl Snapclone {
         if self.group_voice.joined {
             self.group_voice.leave();
             self.voicebar.set_on_air(false);
+            // The floor goes with the call. Left set, the bar names
+            // whoever spoke last for as long as the app is open — a label
+            // that outlives its call is a claim about a conversation that
+            // is over.
+            self.voicebar.clear_talker();
         } else {
             self.group_voice.join();
         }
