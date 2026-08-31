@@ -70,31 +70,62 @@ pub struct LabelBox {
     pub id: usize,
     pub x: f32,
     pub y: f32,
+    /// Distance in front of the camera: SMALLER IS NEARER.
+    ///
+    /// This is `spatial::Camera::project`'s third return, `dist - z2`, and the sign caught me out.
+    /// I sorted it descending on the assumption that larger meant closer, which is backwards, and
+    /// the fixtures hid it because they used 1.0 and 0.2 as priority scores rather than distances.
+    /// Giving them real world depths turned two passing tests red and named the bug — the declutter
+    /// had been keeping the FARTHEST label of every cluster.
     pub depth: f32,
-    /// Characters the label will occupy, after `elide`.
-    pub chars: usize,
+    /// The label's own pixel extents.
+    ///
+    /// PIXELS, NOT A CHARACTER COUNT. The first version took `chars` and multiplied by a global
+    /// `char_px`, which quietly asserts that a label ten metres away is as wide on screen as one at
+    /// arm's length. It is not: these labels are 3D cell text and the projection is
+    /// `scale / depth`, so a far label is narrower in exactly the proportion the constant ignored.
+    /// The effect was a declutter that over-suppressed distant labels and under-suppressed near
+    /// ones — the two cases it exists to get right.
+    ///
+    /// The caller knows the projection and computes these; see `px_extents`.
+    pub w: f32,
+    pub h: f32,
+}
+
+/// Screen extents of a cell-text label, from the same projection that placed it.
+///
+/// `mesh3d::label_cells` advances `6.0 * cell` world units per character and stands `7.0 * cell`
+/// tall; `spatial::Camera::project` scales world to screen by `view_scale / depth`. Those are the
+/// two facts, multiplied — not an estimate.
+pub fn px_extents(chars: usize, cell: f32, view_scale: f32, depth: f32) -> (f32, f32) {
+    // A label at or behind the camera plane has no meaningful extent; `project` already refuses
+    // those, and this keeps the arithmetic finite if one ever arrives.
+    if depth <= 0.1 || !depth.is_finite() { return (0.0, 0.0); }
+    let per_px = view_scale / depth;
+    (chars as f32 * 6.0 * cell * per_px, 7.0 * cell * per_px)
 }
 
 /// Which labels to draw, nearest first, dropping any whose box would overlap one already kept.
 ///
 /// Greedy by depth, which is the right priority here: the label you are closest to is the one you
-/// are looking at. Ties are broken by id so the choice is stable frame to frame — a declutter that
-/// flickers between two equally-close labels is worse than either choice.
+/// are looking at. Nearest means the SMALLEST depth — see the field's note. Ties are broken by id so
+/// the choice is stable frame to frame; a declutter that flickers between two equally-close labels
+/// is worse than either choice.
 ///
 /// Boxes are the label's own extent, not a fixed radius around the node. That is the correction:
 /// the existing pass used a 78px circle around the PEARL, which is blind to a long label beside a
 /// short one.
-pub fn visible(mut placed: Vec<LabelBox>, char_px: f32, line_px: f32) -> Vec<usize> {
-    placed.sort_by(|a, b| b.depth.partial_cmp(&a.depth).unwrap_or(std::cmp::Ordering::Equal)
+pub fn visible(mut placed: Vec<LabelBox>) -> Vec<usize> {
+    // Nearest first: ASCENDING depth, because depth is distance in front of the camera.
+    placed.sort_by(|a, b| a.depth.partial_cmp(&b.depth).unwrap_or(std::cmp::Ordering::Equal)
         .then(a.id.cmp(&b.id)));
     let mut kept: Vec<(f32, f32, f32, f32)> = Vec::new(); // x0,y0,x1,y1
     let mut out = Vec::new();
     for p in placed {
-        if p.chars == 0 { continue; }
-        let w = p.chars as f32 * char_px;
+        if p.w <= 0.0 || p.h <= 0.0 { continue; }
         // The label is drawn centred on the node, so the box straddles it.
-        let (x0, x1) = (p.x - w * 0.5, p.x + w * 0.5);
-        let (y0, y1) = (p.y - line_px * 0.5, p.y + line_px * 0.5);
+        let (x0, x1) = (p.x - p.w * 0.5, p.x + p.w * 0.5);
+        let (y0, y1) = (p.y - p.h * 0.5, p.y + p.h * 0.5);
         let clash = kept.iter().any(|&(a0, b0, a1, b1)| x0 < a1 && a0 < x1 && y0 < b1 && b0 < y1);
         if !clash {
             kept.push((x0, y0, x1, y1));
@@ -162,14 +193,21 @@ mod tests {
         assert!(!elide_words("a b c d e f g h i j", 12).contains(" …"));
     }
 
+    /// A box sized as the real projection would size it, so the tests exercise the same arithmetic
+    /// the caller uses rather than a stand-in.
     fn p(id: usize, x: f32, y: f32, depth: f32, chars: usize) -> LabelBox {
-        LabelBox { id, x, y, depth, chars }
+        let (w, h) = px_extents(chars, 0.034, 900.0, depth);
+        LabelBox { id, x, y, depth, w, h }
     }
 
     #[test]
     fn far_apart_labels_all_survive() {
-        let v = visible(vec![p(0, 0.0, 0.0, 1.0, 10), p(1, 500.0, 0.0, 0.9, 10),
-                             p(2, 0.0, 300.0, 0.8, 10)], 7.0, 14.0);
+        // Depths are WORLD UNITS now, not priority scores — the fixtures below used 1.0/0.9/0.5,
+        // which under the real projection is a label a metre from the camera and three thousand
+        // pixels wide. The tests failed on that and were right to: a fixture that cannot occur is
+        // not evidence about a function that now does real arithmetic.
+        let v = visible(vec![p(0, 0.0, 0.0, 20.0, 10), p(1, 500.0, 0.0, 19.0, 10),
+                             p(2, 0.0, 300.0, 18.0, 10)]);
         assert_eq!(v.len(), 3);
     }
 
@@ -177,9 +215,10 @@ mod tests {
     #[test]
     fn a_crowded_cluster_keeps_the_nearest_and_drops_the_rest() {
         let cluster: Vec<LabelBox> = (0..5)
-            .map(|i| p(i, 100.0 + i as f32 * 6.0, 200.0 + i as f32 * 2.0, 1.0 - i as f32 * 0.1, 16))
+            // id 0 is nearest (smallest depth), so it is the one that must survive
+            .map(|i| p(i, 100.0 + i as f32 * 6.0, 200.0 + i as f32 * 2.0, 20.0 + i as f32, 16))
             .collect();
-        let v = visible(cluster, 7.0, 14.0);
+        let v = visible(cluster);
         assert_eq!(v, vec![0], "only the nearest of a stacked cluster should be drawn");
     }
 
@@ -187,19 +226,19 @@ mod tests {
     /// looking at.
     #[test]
     fn the_nearer_label_wins_a_collision_whatever_the_input_order() {
-        let a = p(7, 100.0, 100.0, 0.2, 12);   // far
-        let b = p(3, 104.0, 100.0, 0.9, 12);   // near
-        assert_eq!(visible(vec![a, b], 7.0, 14.0), vec![3]);
-        assert_eq!(visible(vec![b, a], 7.0, 14.0), vec![3]);
+        let a = p(7, 100.0, 100.0, 60.0, 12);  // far (large depth)
+        let b = p(3, 104.0, 100.0, 20.0, 12);  // near (small depth)
+        assert_eq!(visible(vec![a, b]), vec![3]);
+        assert_eq!(visible(vec![b, a]), vec![3]);
     }
 
     /// A declutter that flickers between two equally-close labels is worse than either choice.
     #[test]
     fn a_depth_tie_is_broken_stably() {
-        let a = p(9, 100.0, 100.0, 0.5, 12);
-        let b = p(4, 103.0, 100.0, 0.5, 12);
-        assert_eq!(visible(vec![a, b], 7.0, 14.0), vec![4], "lower id wins a tie");
-        assert_eq!(visible(vec![b, a], 7.0, 14.0), vec![4], "and does so regardless of order");
+        let a = p(9, 100.0, 100.0, 25.0, 12);
+        let b = p(4, 103.0, 100.0, 25.0, 12);
+        assert_eq!(visible(vec![a, b]), vec![4], "lower id wins a tie");
+        assert_eq!(visible(vec![b, a]), vec![4], "and does so regardless of order");
     }
 
     /// The correction over the old rule: width matters. A long label and a short one at the same
@@ -207,20 +246,54 @@ mod tests {
     #[test]
     fn label_width_decides_the_collision_not_a_fixed_radius() {
         let gap = 60.0;
-        let short = vec![p(0, 0.0, 0.0, 1.0, 4), p(1, gap, 0.0, 0.9, 4)];
-        let long = vec![p(0, 0.0, 0.0, 1.0, 20), p(1, gap, 0.0, 0.9, 20)];
-        assert_eq!(visible(short, 7.0, 14.0).len(), 2, "short labels fit side by side");
-        assert_eq!(visible(long, 7.0, 14.0).len(), 1, "wide ones at the same gap do not");
+        let short = vec![p(0, 0.0, 0.0, 20.0, 4), p(1, gap, 0.0, 19.0, 4)];
+        let long = vec![p(0, 0.0, 0.0, 20.0, 20), p(1, gap, 0.0, 19.0, 20)];
+        assert_eq!(visible(short).len(), 2, "short labels fit side by side");
+        assert_eq!(visible(long).len(), 1, "wide ones at the same gap do not");
     }
 
     #[test]
     fn an_empty_label_takes_no_space_and_is_not_drawn() {
-        let v = visible(vec![p(0, 0.0, 0.0, 1.0, 0), p(1, 2.0, 0.0, 0.5, 8)], 7.0, 14.0);
+        let v = visible(vec![p(0, 0.0, 0.0, 1.0, 0), p(1, 2.0, 0.0, 25.0, 8)]);
         assert_eq!(v, vec![1], "a node with nothing to say must not block its neighbour");
+    }
+
+    /// THE BUG THE CHARACTER-COUNT VERSION HAD. Perspective is the whole reason these boxes cannot
+    /// share a width: the same text at twice the distance covers half the screen.
+    #[test]
+    fn a_far_label_occupies_less_screen_than_a_near_one() {
+        let (near_w, near_h) = px_extents(16, 0.034, 900.0, 5.0);
+        let (far_w, far_h) = px_extents(16, 0.034, 900.0, 20.0);
+        assert!((near_w / far_w - 4.0).abs() < 0.01, "4x the depth should be 1/4 the width");
+        assert!(near_h > far_h);
+        // and the extents are the projection's own arithmetic, not an estimate
+        assert!((near_w - 16.0 * 6.0 * 0.034 * 900.0 / 5.0).abs() < 0.01);
+    }
+
+    /// Two labels the old constant would have called colliding do not, once the far one is measured
+    /// at its real size — which is the over-suppression that version caused.
+    #[test]
+    fn distance_can_resolve_a_collision_the_flat_measure_would_report() {
+        // Same text, same screen gap; one of them is far away and therefore small.
+        let near = p(0, 0.0, 0.0, 30.0, 18);      // ~110px wide
+        let far = p(1, 80.0, 0.0, 120.0, 18);     // same text, four times further, ~28px
+        assert_eq!(visible(vec![near, far]).len(), 2, "the far label is narrow and clears the gap");
+        // bring it to the same depth and the identical screen gap now collides
+        let both_near = vec![p(0, 0.0, 0.0, 30.0, 18), p(1, 80.0, 0.0, 30.0, 18)];
+        assert_eq!(visible(both_near).len(), 1);
+    }
+
+    #[test]
+    fn a_label_at_the_camera_plane_has_no_extent_and_is_skipped() {
+        assert_eq!(px_extents(10, 0.034, 900.0, 0.0), (0.0, 0.0));
+        assert_eq!(px_extents(10, 0.034, 900.0, f32::NAN), (0.0, 0.0));
+        let v = visible(vec![LabelBox { id: 0, x: 0.0, y: 0.0, depth: 0.05, w: 0.0, h: 0.0 },
+                             p(1, 0.0, 0.0, 25.0, 8)]);
+        assert_eq!(v, vec![1]);
     }
 
     #[test]
     fn nothing_placed_is_nothing_drawn() {
-        assert!(visible(Vec::new(), 7.0, 14.0).is_empty());
+        assert!(visible(Vec::new()).is_empty());
     }
 }

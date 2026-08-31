@@ -4877,11 +4877,17 @@ which file you read.\n\n",
                     let placed: Vec<crate::nodelabel::LabelBox> = proj.iter().filter_map(|q| {
                         let _nd = g.nodes.iter().find(|nd| nd.id == q.0)?;
                         let chars = label_of(q.0).chars().count();
-                        Some(crate::nodelabel::LabelBox { id: q.0, x: q.1, y: q.2, depth: q.3, chars })
+                        // EXTENTS FROM THIS LABEL'S OWN DEPTH, using the same `scale` the projection
+                        // above used. The previous version passed a flat 7px advance, which asserts
+                        // a label ten metres away is as wide on screen as one at arm's length —
+                        // over-suppressing far labels and under-suppressing near ones, the two cases
+                        // the declutter exists to get right. LABEL_CELL is `label_cells`' own cell
+                        // size at this call site.
+                        const LABEL_CELL: f32 = 0.034;
+                        let (w, h) = crate::nodelabel::px_extents(chars, LABEL_CELL, scale, q.3);
+                        Some(crate::nodelabel::LabelBox { id: q.0, x: q.1, y: q.2, depth: q.3, w, h })
                     }).collect();
-                    // Cell size in px at this scale: label_cells lays 5x7 cells at 0.034 world
-                    // units, which projects to roughly a 7px advance and a 14px line here.
-                    crate::nodelabel::visible(placed, 7.0, 14.0).into_iter().collect()
+                    crate::nodelabel::visible(placed).into_iter().collect()
                 };
                 for q in &proj {
                     if !show.contains(&q.0) { continue; }
