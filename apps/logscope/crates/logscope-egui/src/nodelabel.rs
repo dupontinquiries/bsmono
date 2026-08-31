@@ -117,6 +117,33 @@ pub fn px_extents(chars: usize, cell: f32, view_scale: f32, depth: f32) -> (f32,
     (chars as f32 * 6.0 * cell * per_px, 7.0 * cell * per_px)
 }
 
+/// (There is no `centroid` in this module. `spatial::centroid` already computes the mean position
+/// of the nodes and is what the caller passes in — a second one here, over screen pairs instead of
+/// `Vec3`s, is the duplication `dupscan` has now caught me at three times in one session.)
+///
+/// Push a label's anchor OUTWARD from the cluster centre, so it sits beside the graph rather than
+/// on it.
+///
+/// This is what the references actually do and what I had been solving the other way round. Their
+/// cards ring the node cluster with a short connector to each node; nothing is drawn on top of
+/// anything, and nothing has to be hidden to achieve it. `visible` below hides the losers of a
+/// collision, which works and costs information — a label you cannot see is a turn you cannot read.
+/// Moving them apart first means fewer collisions to resolve at all.
+///
+/// The offset is radial from the centroid because that is the direction with room in it: a graph
+/// drawn around a centre has its empty space outside, and pushing along any fixed axis would crowd
+/// one side while leaving the other bare.
+///
+/// A node AT the centroid has no outward direction — the vector is zero and normalising it would
+/// produce NaN, which is the failure that reaches `Color32` arithmetic and panics a frame later.
+/// Those keep their own position; one label in the middle is not a crowding problem.
+pub fn outward(node: (f32, f32), centroid: (f32, f32), push: f32) -> (f32, f32) {
+    let (dx, dy) = (node.0 - centroid.0, node.1 - centroid.1);
+    let len = (dx * dx + dy * dy).sqrt();
+    if !len.is_finite() || len < 1e-3 { return node; }
+    (node.0 + dx / len * push, node.1 + dy / len * push)
+}
+
 /// Which labels to draw, nearest first, dropping any whose box would overlap one already kept.
 ///
 /// Greedy by depth, which is the right priority here: the label you are closest to is the one you
@@ -303,6 +330,62 @@ mod tests {
         let v = visible(vec![LabelBox { id: 0, x: 0.0, y: 0.0, depth: 0.05, w: 0.0, h: 0.0 },
                              p(1, 0.0, 0.0, 25.0, 8)]);
         assert_eq!(v, vec![1]);
+    }
+
+    #[test]
+    fn a_label_is_pushed_away_from_the_middle() {
+        let c = (100.0, 100.0);
+        // due right of centre → pushed further right, same row
+        let r = outward((150.0, 100.0), c, 20.0);
+        assert!((r.0 - 170.0).abs() < 0.01 && (r.1 - 100.0).abs() < 0.01, "{r:?}");
+        // diagonal keeps its direction and gains exactly `push` in length
+        let d = outward((130.0, 140.0), c, 25.0);
+        let before = ((30.0f32).hypot(40.0), 0.0);
+        let after = (d.0 - c.0).hypot(d.1 - c.1);
+        assert!((after - (before.0 + 25.0)).abs() < 0.01, "{after} vs {}", before.0 + 25.0);
+    }
+
+    /// The centre has no outward direction. Normalising a zero vector gives NaN, and a NaN screen
+    /// position is the failure that reaches Color32 arithmetic and panics a frame later — the
+    /// projection loop already carries a guard against exactly that.
+    #[test]
+    fn a_node_at_the_centre_keeps_its_position_rather_than_becoming_nan() {
+        let c = (100.0, 100.0);
+        assert_eq!(outward(c, c, 30.0), c);
+        let almost = outward((100.0, 100.0002), c, 30.0);
+        assert!(almost.0.is_finite() && almost.1.is_finite(), "{almost:?}");
+    }
+
+    /// The point of pushing outward: a cluster that collides on the nodes stops colliding once the
+    /// labels ring it, so nothing has to be hidden.
+    #[test]
+    fn pushing_outward_resolves_collisions_that_hiding_would_have_cost_information() {
+        // Five nodes in a TIGHT ring, all at the same depth. The radius matters and the first
+        // version of this fixture got it wrong: at 26px the labels are 46px wide but only 5px
+        // tall, so the ring separated them vertically and nothing collided — the test passed the
+        // packed case and proved nothing. 6px puts them genuinely on top of each other.
+        let c = (300.0, 300.0);
+        let at = |i: usize| {
+            let a = i as f32 * std::f32::consts::TAU / 5.0;
+            (c.0 + a.cos() * 6.0, c.1 + a.sin() * 6.0)
+        };
+        let packed: Vec<LabelBox> = (0..5).map(|i| {
+            let (x, y) = at(i);
+            let (w, h) = px_extents(10, 0.034, 900.0, 40.0);
+            LabelBox { id: i, x, y, depth: 40.0, w, h }
+        }).collect();
+        let kept_packed = visible(packed).len();
+        assert!(kept_packed < 5, "premise: the packed ring must actually collide, kept {kept_packed}");
+
+        let spread: Vec<LabelBox> = (0..5).map(|i| {
+            let (x, y) = outward(at(i), c, 90.0);
+            let (w, h) = px_extents(10, 0.034, 900.0, 40.0);
+            LabelBox { id: i, x, y, depth: 40.0, w, h }
+        }).collect();
+        let kept_spread = visible(spread).len();
+
+        assert!(kept_spread > kept_packed,
+                "pushing outward should keep more labels: {kept_spread} vs {kept_packed}");
     }
 
     #[test]

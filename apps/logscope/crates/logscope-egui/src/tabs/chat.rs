@@ -4873,6 +4873,34 @@ which file you read.\n\n",
                         _ => String::new(),
                     }
                 };
+                // LABELS RING THE CLUSTER rather than sitting on it — what the references actually
+                // do, and the better answer to crowding than hiding the losers: a label you cannot
+                // see is a turn you cannot read. Pushed radially from the graph's own centroid,
+                // which is the direction with room in it. The declutter below then runs on these
+                // moved positions and has far less to resolve.
+                // IN WORLD SPACE, not screen space. Pushing the screen anchor would decide
+                // visibility from boxes at one place while `label_cells` drew the text at another —
+                // a declutter measuring positions the labels do not occupy, which is the same
+                // one-step-removed mistake as auditing a palette that never renders. Offsetting the
+                // world point and projecting THAT keeps the box and the glyphs on the same spot.
+                const LABEL_PUSH_WORLD: f32 = 0.55;
+                // `spatial::centroid` already means this. I hand-rolled the x/z mean here and
+                // dupscan named it; that is the third copy of an existing helper this session.
+                let world_mid = crate::spatial::centroid(&pos);
+                let label_pos = |id: usize| -> crate::spatial::Vec3 {
+                    let p = pos[id];
+                    // Radial in the ground plane only: pushing vertically would lift labels off
+                    // their own nodes without gaining any room, since the graph spreads in x/z.
+                    let (dx, dz) = (p.x - world_mid.x, p.z - world_mid.z);
+                    let len = (dx * dx + dz * dz).sqrt();
+                    if !len.is_finite() || len < 1e-3 { return p; }
+                    crate::spatial::Vec3::new(p.x + dx / len * LABEL_PUSH_WORLD, p.y,
+                                              p.z + dz / len * LABEL_PUSH_WORLD)
+                };
+                let anchor = |q: &(usize, f32, f32, f32)| -> (f32, f32) {
+                    view_cam.project(label_pos(q.0), cx, cy, scale)
+                        .map(|(sx, sy, _)| (sx, sy)).unwrap_or((q.1, q.2))
+                };
                 let show: std::collections::HashSet<usize> = {
                     let placed: Vec<crate::nodelabel::LabelBox> = proj.iter().filter_map(|q| {
                         let _nd = g.nodes.iter().find(|nd| nd.id == q.0)?;
@@ -4885,7 +4913,8 @@ which file you read.\n\n",
                         // size at this call site.
                         const LABEL_CELL: f32 = 0.034;
                         let (w, h) = crate::nodelabel::px_extents(chars, LABEL_CELL, scale, q.3);
-                        Some(crate::nodelabel::LabelBox { id: q.0, x: q.1, y: q.2, depth: q.3, w, h })
+                        let (ax, ay) = anchor(q);
+                        Some(crate::nodelabel::LabelBox { id: q.0, x: ax, y: ay, depth: q.3, w, h })
                     }).collect();
                     crate::nodelabel::visible(placed).into_iter().collect()
                 };
@@ -4910,7 +4939,7 @@ which file you read.\n\n",
                         let _ = nd;
                         let label = label_of(q.0);
                         if label.is_empty() { continue; }
-                        for cell in m3::label_cells(pos[q.0], right, up, toward_cam, &label,
+                        for cell in m3::label_cells(label_pos(q.0), right, up, toward_cam, &label,
                                                     0.034, t, theme::CYAN(), lit, scroll, tanim, m3::SceneLight::Uniform, 0) {
                             graph.push(cell);
                         }
