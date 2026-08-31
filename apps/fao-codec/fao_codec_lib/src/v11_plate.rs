@@ -2490,8 +2490,27 @@ pub fn encode_gop_v3_core(
             leftover_trace.push(row);
         }
         let mut rec = rec;
-        if let Ok(v) = std::env::var("FAO_DEBLOCK") {
-            let strength: i32 = v.parse().unwrap_or(1);
+        // ON BY DEFAULT at strength 2, and this is the first default in
+        // the v11 line set with (a) evidence from three content types
+        // and (b) a metric matched to the artifact being fixed.
+        // MS-SSIM, deblock off -> strength 2:
+        //   procedural ground  0.88716 -> 0.89591   (+0.16% bytes)
+        //   blackstar (game)   0.98987 -> 0.99013   (+1.5%)
+        //   bloopers (film)    0.97625 -> 0.97695   (+0.56%)
+        // Grid discontinuity falls hard in the same runs — film P=16
+        // 2.860 -> 1.993, ground 4.642 -> 1.909 — toward the SOURCE's
+        // own statistic rather than past it, which is the check that
+        // separates repair from over-smoothing.
+        //
+        // Turned on rather than left opt-in because the artifact it
+        // removes is the one PSNR does not price, and this codec was
+        // measured shipping 2-5x AV1's grid discontinuity while
+        // reporting competitive PSNR. FAO_DEBLOCK=0 disables it.
+        let strength: i32 = std::env::var("FAO_DEBLOCK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        if strength > 0 {
             deblock(&mut rec, f, &modes, gw, gh, opts.dead_zone, strength);
         }
         recon.push(rec);

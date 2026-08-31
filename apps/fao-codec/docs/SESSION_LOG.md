@@ -5611,3 +5611,39 @@ The gap between those two sentences is the whole lesson of the last
 four entries: the codec's real deficit is not rate, it is that it
 degrades in a way PSNR does not price, so every rate comparison made
 against PSNR has been flattering it.
+
+### Deblocking turned ON by default — the first default set with the right metric and three content types
+
+MS-SSIM, deblock off -> strength 2 (fixed mode):
+  procedural ground   0.88716 -> 0.89591   bytes +0.16%
+  blackstar (game)    0.98987 -> 0.99013   bytes +1.5%
+  bloopers w1 (film)  0.97625 -> 0.97695   bytes +0.56%
+Grid discontinuity in the same runs, against each SOURCE's own figure:
+  film    source P=16 1.123 | off 2.860 -> deblocked 1.993
+  ground  source P=16 0.951 | off 4.642 -> deblocked 1.909
+Both move TOWARD the source statistic and stop short of it, which is
+the check that separates repair from over-smoothing (strength 4
+overshot to 0.72 on ground, below the source, and was rejected for it).
+
+Turned on rather than left opt-in because the artifact it removes is
+precisely the one PSNR does not price, and this codec was measured
+shipping 2-5x AV1's grid discontinuity while reporting competitive
+PSNR. Every rate comparison in this project was made in that state.
+FAO_DEBLOCK=0 disables; verified byte-identical to the pre-deblock
+baseline (487,382 B on w1), and the default verified byte-identical to
+an explicit FAO_DEBLOCK=2 (490,100 B).
+
+Worth stating plainly what this default is and is not. It is a
+PICTURE-QUALITY change that costs 0.2-1.5% of the bytes; it is not a
+rate improvement and does not move this codec's standing against AV1
+except on the procedural clip, where it is what keeps the win alive
+(0.97692 -> 0.98050 MS-SSIM, turning a lost comparison into a ~5% one).
+
+This is also the first default set in the v11 line with evidence from
+three content types AND a metric matched to the artifact. The three
+previous fixed constants in this codec — the MV rate charge,
+DICT_MARGIN, and the mover admission gate — were each set from one
+clip and each later measured wrong on a second. The procedure that
+caught them all was the same: sweep on content the constant was not
+derived from, and score with something that charges for the failure
+mode in question.
