@@ -4616,7 +4616,37 @@ Two tests, one per property. 1427/1427.
   at all. The temptation when wiring a new discovery source is to treat
   it as authoritative because it was hard to build.
 
-  The remaining work is a node host — the shape `pty_host` and
-  `PtyHost` have in voiceterm: something that owns the socket, the
-  routing table and the loop, and hands the app results. Recorded as
-  the next real component rather than pretended to be plumbing.
+  **DONE: `snapclone_presence::node_host::NodeHost`.** Spawn, poll,
+  drop — the same shape as voiceterm's `PtyHost`, which is what the
+  entry above predicted it would need to be.
+
+  **A thread and two channels, not a call.** A lookup makes several UDP
+  round trips in sequence at 600 ms each; a phone with two unreachable
+  peers in its table spends over a second, and a UI thread that blocks
+  for a second has dropped sixty frames and reads as a freeze. Requests
+  go down, events come up, the app never waits.
+
+  Four decisions:
+  - **The worker blocks on `recv`, it does not poll.** An idle DHT that
+    burns a core is a battery bug, and this runs on a phone.
+  - **`poll` DRAINS.** A frame producing three results should show
+    three; one-per-frame would trickle a burst of discoveries in over
+    three frames for no reason.
+  - **A dropped host stops the worker** rather than finishing work
+    nobody will read — checked on both the receive and the send side.
+  - **`Stopped` is emitted once, not per frame.** `poll` is called every
+    frame, so a permanent error repeated there would bury the log at
+    sixty lines a second.
+  - **The node id should be derived from the sc-ID, not random.** A node
+    that re-randomises on each launch makes every other node's routing
+    table stale. Documented on `spawn`; the caller supplies it.
+
+  It deliberately does NOT judge results: `peer_source::Reach` already
+  says a DHT hit is `Unverified`, and that belongs there.
+
+  5 tests over real threads and sockets, 22/22 for the crate.
+
+- **C84c — nothing constructs a `NodeHost` yet.** The frontend still has
+  no dependency on this crate. That is now genuinely one dependency and
+  one field, which is what "an arrow" actually looks like — unlike the
+  previous entry, which called a component an arrow and was wrong.

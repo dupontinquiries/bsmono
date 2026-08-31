@@ -22,6 +22,8 @@
 /// The caller `lib.rs` deliberately did not have: publish and resolve
 /// presence over snapcore's engine.
 pub mod dht;
+/// A running DHT node: owns the socket, the table and the thread.
+pub mod node_host;
 pub mod gossip;
 pub mod identity;
 pub mod presence;
