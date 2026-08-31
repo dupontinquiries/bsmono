@@ -1299,6 +1299,75 @@ end_header
             if let Some(ls) = arg_val(&args, "--lookahead") {
                 let thr: u32 = ls.parse().unwrap_or(1024);
                 plate::encode_gop_v3_lookahead(&frames, &motions, &pl, &opts, thr)
+            } else if let Some(sp) = arg_val(&args, "--scene-export") {
+                // Emit the GOP's object graph and stop. This is the file
+                // an editor — a person, or a model told "make the fight
+                // turn out differently" — rewrites and hands back via
+                // --scene-apply.
+                let thr: u32 = arg_val(&args, "--movers")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(16);
+                let mut scene = String::new();
+                let (_r, movers) = plate::encode_gop_v5_edited(
+                    &frames, &motions, &pl, &opts, thr, None, Some(&mut scene),
+                );
+                std::fs::write(&sp, &scene)
+                    .unwrap_or_else(|e| die(&format!("write {sp}: {e}")));
+                let risky = movers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| plate::mover_hole_risk(m) > 0.5)
+                    .map(|(i, m)| format!("{i} ({:.0}%)", 100.0 * plate::mover_hole_risk(m)))
+                    .collect::<Vec<_>>();
+                println!("scene: {} movers -> {}", movers.len(), sp);
+                if !risky.is_empty() {
+                    // Naming these up front is the difference between an
+                    // editor that refuses and one that smears: these
+                    // objects barely move, so the plate holds no clean
+                    // background behind them to reveal.
+                    println!(
+                        "  disocclusion risk >50% (moving these will expose plate that was never observed): {}",
+                        risky.join(", ")
+                    );
+                }
+                return;
+            } else if let Some(ap) = arg_val(&args, "--scene-apply") {
+                let thr: u32 = arg_val(&args, "--movers")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(16);
+                let js = std::fs::read_to_string(&ap)
+                    .unwrap_or_else(|e| die(&format!("read {ap}: {e}")));
+                // Count movers by re-deriving the scene, so the edited
+                // file is validated against the CURRENT detection rather
+                // than trusting its own header.
+                let mut base = String::new();
+                let (_r, movers) = plate::encode_gop_v5_edited(
+                    &frames, &motions, &pl, &opts, thr, None, Some(&mut base),
+                );
+                let tracks = plate::apply_scene_json(&js, movers.len(), frames.len())
+                    .unwrap_or_else(|e| die(&format!("scene rejected: {e}")));
+                let mut changed = 0usize;
+                for (m, t) in movers.iter().zip(&tracks) {
+                    if &m.track != t {
+                        changed += 1;
+                    }
+                }
+                // Retarget FIRST: the residual codes against the source,
+                // so editing only the predictor lets the codec correct
+                // the edit away (measured: 108 dB against the unedited
+                // encode — a perfect no-op). The edited scene has to
+                // become the new target.
+                let retargeted =
+                    plate::retarget_frames(&frames, &motions, &pl, &movers, &tracks);
+                let ((rep, nm, sprites, track, _picked), _) = plate::encode_gop_v5_edited(
+                    &retargeted, &motions, &pl, &opts, thr, Some(&tracks), None,
+                );
+                eprintln!(
+                    "scene applied: {} of {} mover tracks changed | sprites {} B track {} B",
+                    changed, nm, sprites, track
+                );
+                mover_model_bytes = sprites;
+                rep
             } else if let Some(ms) = arg_val(&args, "--movers") {
                 // v11.5 mover layer: plate models the SET, movers travel
                 // as one-time sprites + 2 B/frame tracks, J-guarded

@@ -1847,6 +1847,7 @@ pub fn encode_gop_v3_core(
 // lookahead harness, it can only cost encode time, never bytes.
 // ═══════════════════════════════════════════════════════════════════
 
+#[derive(Clone)]
 pub struct Mover {
     /// Bounding box in PIXELS at the reference frame, REGION-aligned.
     pub bx: usize,
@@ -2476,8 +2477,59 @@ pub fn encode_gop_v5(
     opts: &ResidualOpts,
     thr: u32,
 ) -> (PlateEncodeReportV2, usize, usize, usize, bool) {
+    encode_gop_v5_edited(frames, motions, plate, opts, thr, None, None).0
+}
+
+/// v5 with an optional SCENE EDIT and an optional scene-export sink.
+///
+/// `edit` replaces each mover's track — the resolver half of the scene
+/// protocol. Two things make the edited path structurally different
+/// from plain encoding, and both are deliberate:
+///
+///  * The J-guard is BYPASSED when an edit is present. The guard exists
+///    to answer "is the mover layer worth its bytes for reproducing this
+///    video", and an edited scene is not trying to reproduce the video —
+///    falling back to v3 would silently discard the edit and hand back
+///    the original, the worst possible failure for this feature.
+///  * The residual is coded against the EDITED composite, so it carries
+///    the difference from what the viewer will actually see. Reusing the
+///    original residual is what would make a naive "overwrite and
+///    stitch" smear: that residual encodes the difference from the
+///    ORIGINAL prediction and is wrong everywhere the scene changed.
+pub fn encode_gop_v5_edited(
+    frames: &[Yuv420],
+    motions: &[PlateMotion],
+    plate: &Plate,
+    opts: &ResidualOpts,
+    thr: u32,
+    edit: Option<&[Vec<Option<(i16, i16)>>]>,
+    scene_out: Option<&mut String>,
+) -> ((PlateEncodeReportV2, usize, usize, usize, bool), Vec<Mover>) {
     let (rep3, _) = encode_gop_v3_forced(frames, motions, plate, opts, None);
-    let (movers, track_bytes) = build_movers(frames, motions, plate, opts, thr);
+    let (mut movers, track_bytes) = build_movers(frames, motions, plate, opts, thr);
+    if let Some(sink) = scene_out {
+        *sink = scene_to_json(&movers, frames.len(), frames[0].w, frames[0].h);
+    }
+    let edited = edit.is_some();
+    if let Some(e) = edit {
+        for (m, t) in movers.iter_mut().zip(e) {
+            m.track = t.clone();
+        }
+    }
+    let r = encode_gop_v5_inner(frames, motions, plate, opts, rep3, movers.clone(), track_bytes, edited);
+    (r, movers)
+}
+
+fn encode_gop_v5_inner(
+    frames: &[Yuv420],
+    motions: &[PlateMotion],
+    plate: &Plate,
+    opts: &ResidualOpts,
+    rep3: PlateEncodeReportV2,
+    movers: Vec<Mover>,
+    track_bytes: usize,
+    edited: bool,
+) -> (PlateEncodeReportV2, usize, usize, usize, bool) {
     if movers.is_empty() {
         return (rep3, 0, 0, 0, false);
     }
@@ -2574,7 +2626,7 @@ pub fn encode_gop_v5(
             j3, bytes(&rep3), j5, bytes(&rep5), movers.len(), mover_model, track_bytes
         );
     }
-    if j5 < j3 {
+    if j5 < j3 || edited {
         (rep5, movers.len(), mover_model, track_bytes, true)
     } else {
         (rep3, movers.len(), mover_model, track_bytes, false)
@@ -3719,4 +3771,357 @@ pub fn probe_dictionary(frames: &[Yuv420], plate: &Plate, motions: &[PlateMotion
         if n_dict_win > 0 { sad_saved as f64 / n_dict_win as f64 } else { 0.0 },
         dict.len()
     )
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SCENE PROTOCOL — the mover layer as an editable object graph.
+//
+// The v11.5 mover layer already IS an asset pool with per-frame
+// placement: each object is a sprite transmitted once plus a
+// 2-byte/frame position track. That makes narrative editing a
+// data edit rather than a pixel synthesis problem — moving an actor is
+// rewriting a track, and the sprite it re-pastes is the same sprite the
+// decoder already holds.
+//
+// This module is the PROTOCOL half of that, deliberately separated from
+// any transport. `scene_to_json` emits the object graph; `apply_scene_json`
+// reads a possibly-edited graph back and returns new tracks. An LLM is
+// one producer of that JSON; a human with a text editor is another, and
+// the second is what the tests use — the protocol must be exercisable
+// with no model in the loop, or its failures and the model's failures
+// become indistinguishable.
+//
+// WHAT THIS CANNOT DO, stated up front because the schema makes it look
+// more capable than it is:
+//   * Disocclusion. Move an object and you reveal plate underneath. The
+//     plate is a temporal median, so it holds real background wherever
+//     the object moved during the GOP — and holds nothing where it
+//     stood still the whole time. `hole_risk` per mover reports which
+//     case each object is in, measured, so an editor can refuse or warn
+//     instead of producing a smear.
+//   * Shadows and contact lighting are baked into the sprite. A moved
+//     object carries its old shadow.
+//   * Non-rigid change. The sprite is one rigid cutout; a fight landing
+//     differently needs poses that were never photographed. Re-timing,
+//     re-positioning and re-ordering are in scope; new articulation is
+//     not, and no resolver can fake it from this representation.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Per-mover disocclusion risk: the fraction of the object's masked
+/// cells for which the plate holds real background rather than the
+/// object itself. Computed as the share of frames in which the object
+/// is somewhere OTHER than the cell in question — the plate's median
+/// keeps background at a pixel only when the object vacates it in more
+/// than half the frames, which is exactly this quantity thresholded.
+pub fn mover_hole_risk(m: &Mover) -> f32 {
+    let seen: Vec<(i16, i16)> = m.track.iter().filter_map(|t| *t).collect();
+    if seen.len() < 2 {
+        return 1.0;
+    }
+    let (bw, bh) = (m.bw as f32, m.bh as f32);
+    let mut vacated = 0usize;
+    for (i, a) in seen.iter().enumerate() {
+        // A frame vacates the reference footprint if the object has
+        // moved more than its own extent away from where it started.
+        let dx = (a.0 as f32 - m.bx as f32).abs() / bw;
+        let dy = (a.1 as f32 - m.by as f32).abs() / bh;
+        if dx.max(dy) >= 1.0 {
+            vacated += 1;
+        }
+        let _ = i;
+    }
+    // Risk is high when the object rarely vacates: the plate then has
+    // no clean background to reveal.
+    1.0 - (vacated as f32 / seen.len() as f32)
+}
+
+/// Emit the GOP's object graph as JSON.
+pub fn scene_to_json(movers: &[Mover], n_frames: usize, fw: usize, fh: usize) -> String {
+    let mut s = String::new();
+    s.push_str("{\n");
+    s.push_str(&format!(
+        "  \"frames\": {}, \"width\": {}, \"height\": {},\n",
+        n_frames, fw, fh
+    ));
+    s.push_str("  \"movers\": [\n");
+    for (i, m) in movers.iter().enumerate() {
+        let cells = m.mask.iter().filter(|&&b| b).count();
+        let visible = m.track.iter().filter(|t| t.is_some()).count();
+        s.push_str(&format!(
+            "    {{ \"id\": {}, \"bbox\": [{}, {}, {}, {}], \"ref_frame\": {}, \"cells\": {}, \"visible_frames\": {}, \"hole_risk\": {:.2},\n      \"track\": [",
+            i, m.bx, m.by, m.bw, m.bh, m.ref_frame, cells, visible, mover_hole_risk(m)
+        ));
+        for (t, p) in m.track.iter().enumerate() {
+            if t > 0 {
+                s.push_str(", ");
+            }
+            match p {
+                Some((x, y)) => s.push_str(&format!("[{}, {}]", x, y)),
+                None => s.push_str("null"),
+            }
+        }
+        s.push_str("] }");
+        if i + 1 < movers.len() {
+            s.push(',');
+        }
+        s.push('\n');
+    }
+    s.push_str("  ]\n}\n");
+    s
+}
+
+/// Read an edited object graph and return one track per mover id.
+///
+/// Deliberately strict, because the producer may be a language model:
+/// a track must exist for every mover, be exactly `n_frames` long, and
+/// contain only `null` or `[x, y]` integer pairs. Anything else is an
+/// error naming the mover, not a silent partial application — a scene
+/// that half-applies is worse than one that refuses.
+pub fn apply_scene_json(
+    json: &str,
+    n_movers: usize,
+    n_frames: usize,
+) -> Result<Vec<Vec<Option<(i16, i16)>>>, String> {
+    let mut out: Vec<Option<Vec<Option<(i16, i16)>>>> = vec![None; n_movers];
+    let b = json.as_bytes();
+    let mut i = 0usize;
+    // Walk "id": N ... "track": [ ... ] pairs in order of appearance.
+    while let Some(idp) = json[i..].find("\"id\"") {
+        let idp = i + idp + 4;
+        let colon = json[idp..].find(':').ok_or("malformed: \"id\" without ':'")? + idp + 1;
+        let mut j = colon;
+        while j < b.len() && (b[j] as char).is_whitespace() {
+            j += 1;
+        }
+        let ns = j;
+        while j < b.len() && (b[j] as char).is_ascii_digit() {
+            j += 1;
+        }
+        let id: usize = json[ns..j].parse().map_err(|_| "malformed mover id".to_string())?;
+        if id >= n_movers {
+            return Err(format!("mover id {id} out of range (scene has {n_movers})"));
+        }
+        let tp = json[j..]
+            .find("\"track\"")
+            .ok_or_else(|| format!("mover {id}: no \"track\""))?
+            + j;
+        let open = json[tp..].find('[').ok_or_else(|| format!("mover {id}: track not an array"))? + tp;
+        let close = json[open..]
+            .find(']')
+            .map(|_| {
+                // Find the ']' that closes the OUTER array: scan with depth.
+                let mut d = 0i32;
+                let mut k = open;
+                while k < b.len() {
+                    if b[k] == b'[' {
+                        d += 1;
+                    } else if b[k] == b']' {
+                        d -= 1;
+                        if d == 0 {
+                            return k;
+                        }
+                    }
+                    k += 1;
+                }
+                b.len()
+            })
+            .ok_or_else(|| format!("mover {id}: unterminated track"))?;
+        if close >= b.len() {
+            return Err(format!("mover {id}: unterminated track array"));
+        }
+        let body = &json[open + 1..close];
+        let mut track: Vec<Option<(i16, i16)>> = Vec::with_capacity(n_frames);
+        let mut k = 0usize;
+        let bb = body.as_bytes();
+        while k < bb.len() {
+            let c = bb[k] as char;
+            if c.is_whitespace() || c == ',' {
+                k += 1;
+                continue;
+            }
+            if body[k..].starts_with("null") {
+                track.push(None);
+                k += 4;
+                continue;
+            }
+            if c != '[' {
+                return Err(format!("mover {id}: expected [x, y] or null at offset {k}"));
+            }
+            let e = body[k..]
+                .find(']')
+                .ok_or_else(|| format!("mover {id}: unterminated pair"))?
+                + k;
+            let nums: Vec<&str> = body[k + 1..e].split(',').map(|t| t.trim()).collect();
+            if nums.len() != 2 {
+                return Err(format!("mover {id}: pair needs exactly 2 numbers"));
+            }
+            let x: i32 = nums[0]
+                .parse::<f64>()
+                .map_err(|_| format!("mover {id}: bad x '{}'", nums[0]))? as i32;
+            let y: i32 = nums[1]
+                .parse::<f64>()
+                .map_err(|_| format!("mover {id}: bad y '{}'", nums[1]))? as i32;
+            track.push(Some((x.clamp(-32768, 32767) as i16, y.clamp(-32768, 32767) as i16)));
+            k = e + 1;
+        }
+        if track.len() != n_frames {
+            return Err(format!(
+                "mover {id}: track has {} entries, GOP has {n_frames} frames",
+                track.len()
+            ));
+        }
+        out[id] = Some(track);
+        i = close;
+    }
+    let mut res = Vec::with_capacity(n_movers);
+    for (id, t) in out.into_iter().enumerate() {
+        res.push(t.ok_or_else(|| format!("scene omits mover {id}"))?);
+    }
+    Ok(res)
+}
+
+/// Build the RETARGETED frames an edited scene implies.
+///
+/// The measurement that forced this function into existence: editing
+/// only the predictor changes nothing. The residual is coded against
+/// the SOURCE, so it faithfully corrects any prediction back toward the
+/// original video — a scene edit applied to the composite alone came
+/// back at 108 dB against the unedited encode, i.e. the codec undid it.
+/// An editor that changes what the viewer sees has to change the
+/// TARGET, not the prediction.
+///
+/// Per frame, for every mover whose track changed:
+///   1. paint the plate over its ORIGINAL footprint — this is the
+///      disocclusion step, and it is why `mover_hole_risk` exists: the
+///      plate holds real background only where the object actually
+///      vacated during the GOP;
+///   2. paste its sprite at the NEW position.
+/// Everything else keeps the original pixels, so unedited regions still
+/// code against real source and keep their fidelity.
+pub fn retarget_frames(
+    frames: &[Yuv420],
+    motions: &[PlateMotion],
+    plate: &Plate,
+    movers: &[Mover],
+    edits: &[Vec<Option<(i16, i16)>>],
+) -> Vec<Yuv420> {
+    let (fw, fh) = (frames[0].w, frames[0].h);
+    let mut out = Vec::with_capacity(frames.len());
+    for (fi, f) in frames.iter().enumerate() {
+        let mut t = f.clone();
+        let mut pred: Option<Yuv420> = None;
+        for (mi, m) in movers.iter().enumerate() {
+            let new_t = edits.get(mi).and_then(|e| e.get(fi).copied()).flatten();
+            let old_t = m.track[fi];
+            if new_t == old_t {
+                continue;
+            }
+            let p = pred.get_or_insert_with(|| predict_frame(plate, &motions[fi], fw, fh));
+            // 1. erase from the old position using the plate.
+            if let Some((ox, oy)) = old_t {
+                let cw_cells = m.bw / REGION;
+                for cy in 0..(m.bh / REGION) {
+                    for cx in 0..cw_cells {
+                        if !m.mask[cy * cw_cells + cx] {
+                            continue;
+                        }
+                        for ly in 0..REGION {
+                            let sy = oy as i32 + (cy * REGION + ly) as i32;
+                            if sy < 0 || sy >= fh as i32 {
+                                continue;
+                            }
+                            for lx in 0..REGION {
+                                let sx = ox as i32 + (cx * REGION + lx) as i32;
+                                if sx < 0 || sx >= fw as i32 {
+                                    continue;
+                                }
+                                let i = sy as usize * fw + sx as usize;
+                                t.y[i] = p.y[i];
+                                let ci = (sy as usize / 2) * (fw / 2) + sx as usize / 2;
+                                t.u[ci] = p.u[ci];
+                                t.v[ci] = p.v[ci];
+                            }
+                        }
+                    }
+                }
+            }
+            // 2. paste at the new position.
+            if let Some((nx, ny)) = new_t {
+                paste_sprite(&mut t, m, nx as i32, ny as i32);
+            }
+        }
+        out.push(t);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests_scene {
+    use super::*;
+
+    fn dummy(n: usize, frames: usize) -> Vec<Mover> {
+        (0..n)
+            .map(|i| Mover {
+                bx: 32 * i,
+                by: 16,
+                bw: 32,
+                bh: 32,
+                ref_frame: 0,
+                mask: vec![true; 4],
+                sprite: Yuv420::new(32, 32),
+                sprite_bytes: 0,
+                track: (0..frames)
+                    .map(|t| Some(((32 * i + t) as i16, 16i16)))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Emit -> parse must be the identity. The protocol is the contract
+    /// between the codec and anything editing it, so a round-trip that
+    /// silently reshapes tracks would corrupt every edit downstream.
+    #[test]
+    fn scene_json_roundtrips() {
+        let movers = dummy(3, 12);
+        let js = scene_to_json(&movers, 12, 1920, 800);
+        let got = apply_scene_json(&js, 3, 12).expect("roundtrip must parse");
+        for (m, t) in movers.iter().zip(&got) {
+            assert_eq!(&m.track, t);
+        }
+    }
+
+    /// An edited track applies, including hiding an object outright —
+    /// "remove him from the shot" has to be expressible.
+    #[test]
+    fn edited_track_applies_including_hide() {
+        let movers = dummy(2, 6);
+        let js = scene_to_json(&movers, 6, 1920, 800);
+        // Shift mover 1 down 100px; hide it for the last two frames.
+        let edited = js.replace(
+            "\"track\": [[32, 16], [33, 16], [34, 16], [35, 16], [36, 16], [37, 16]]",
+            "\"track\": [[32, 116], [33, 116], [34, 116], [35, 116], null, null]",
+        );
+        assert_ne!(edited, js, "test's own edit must have matched");
+        let got = apply_scene_json(&edited, 2, 6).unwrap();
+        assert_eq!(got[1][0], Some((32, 116)));
+        assert_eq!(got[1][4], None);
+        assert_eq!(got[0], movers[0].track, "unedited mover must be untouched");
+    }
+
+    /// Malformed input from a generative producer must FAIL LOUDLY and
+    /// name the mover, never half-apply.
+    #[test]
+    fn malformed_scenes_are_rejected_by_name() {
+        let js = scene_to_json(&dummy(2, 6), 6, 1920, 800);
+        // Wrong length.
+        let short = js.replace(", [37, 16]]", "]");
+        let e = apply_scene_json(&short, 2, 6).unwrap_err();
+        assert!(e.contains("mover 1") && e.contains("5 entries"), "got: {e}");
+        // Out-of-range id.
+        let bad = js.replace("\"id\": 1", "\"id\": 9");
+        assert!(apply_scene_json(&bad, 2, 6).unwrap_err().contains("out of range"));
+        // Missing mover.
+        let one = scene_to_json(&dummy(1, 6), 6, 1920, 800);
+        assert!(apply_scene_json(&one, 2, 6).unwrap_err().contains("omits mover 1"));
+    }
 }

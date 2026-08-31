@@ -4149,3 +4149,60 @@ packing, which slightly improved shot 13 (963,979 @ 35.267 ->
 
 Suite CSVs: docs/full_v5_dz40.csv (no admission, the default) and
 docs/full_v5_admission_dz40.csv (admission on, the negative).
+
+### Scene protocol + resolver: narrative editing on the mover layer
+
+User's question: transcode to .fao, open a chatbox, "make the fight
+turn out differently", have a model emit structured data, resolve it
+back to video. The mover layer turns out to be exactly the substrate —
+each object is ALREADY a sprite sent once plus a 2 B/frame position
+track, so a narrative edit is a data edit, not pixel synthesis.
+
+Built the PROTOCOL half, deliberately separate from any transport:
+scene_to_json emits the object graph (id, bbox, ref_frame, cells,
+visible_frames, hole_risk, track); apply_scene_json reads a possibly-
+edited graph back. An LLM is one producer of that JSON and a person
+with a text editor is another — the tests use the second, because a
+protocol only exercisable through a model makes protocol bugs and model
+bugs indistinguishable. Parsing is strict and names the offending
+mover: wrong track length, out-of-range id and omitted movers all
+refuse rather than half-apply.
+
+THE FINDING THAT MATTERS, and it would have sunk a naive design:
+editing the PREDICTOR changes nothing. The residual is coded against
+the source, so it faithfully corrects any altered prediction back
+toward the original video — the first end-to-end edit came back at
+108 dB against the unedited encode, a perfect no-op. The codec undid
+the edit. An editor has to change the TARGET.
+
+retarget_frames does that, per frame and per changed mover: paint the
+plate over the object's ORIGINAL footprint (disocclusion), then paste
+its sprite at the new position, leaving every other pixel as real
+source so unedited regions keep their fidelity. Re-measured on w1:
+48.0 dB against the unedited encode — the picture genuinely changed —
+at 469,704 B against 465,706, so THE EDIT COST 0.9% OF THE FILE. That
+is the property that makes this worth building: the sprite is already
+on the wire, so re-staging it costs a track and a local residual.
+
+Disocclusion is the real limiter and is now measured rather than
+discovered at render time. mover_hole_risk reports the fraction of
+frames an object FAILS to vacate its own footprint; the plate's median
+only holds clean background where the object did vacate. On w1, 13 of
+32 movers exceed 50% risk (several at 100% — they never move), and
+--scene-export names them so an editor can refuse instead of smear.
+The edit above deliberately targeted a 0.10-risk object.
+
+Honest limits, all structural to this representation and none fixable
+by a better model: shadows and contact lighting are baked into the
+sprite, so a moved object carries its old shadow; the sprite is one
+rigid cutout, so re-timing, re-positioning and re-ordering are in
+scope but new articulation is not — a punch landing differently needs
+poses never photographed. The 3D branch is where articulation would
+come from, and this clip has no parallax to build it (recorded above).
+
+Realtime forking vs stitch, answered by the above: because the decode
+is composite-based, an edited track can be re-composited at DECODE
+time for instant preview, with the residual simply skipped in edited
+regions; the re-encode above is what turns that preview into a final
+at full fidelity. Preview and commit are the same pipeline at two
+residual settings, not two systems.
