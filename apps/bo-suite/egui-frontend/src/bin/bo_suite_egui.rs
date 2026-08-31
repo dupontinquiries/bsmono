@@ -94,6 +94,17 @@ impl App {
                 Request::ReleaseRoute => self.player.release_route("sh"),
             }
         }
+        // THE PLAYER'S CLOCK INTO THE BAR. `Transport::report` is the sync
+        // point between them and had no caller, so the bar extrapolated
+        // from zero forever and `duration` was never set — `fraction()`
+        // was permanently 0 and the handle never moved.
+        //
+        // The local `tick` still runs between reports: mpv prints about
+        // once a second, and a bar that only moved then would stutter.
+        if let Some((pos, dur)) = self.player.shared.take_progress() {
+            self.controller.transport.duration = dur;
+            self.controller.transport.report(pos);
+        }
         if let Some(state) = self.player.shared.take_state() {
             if let State::Failed(why) = state {
                 // The player's own words. "Playback failed" tells nobody

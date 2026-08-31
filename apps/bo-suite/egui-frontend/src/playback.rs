@@ -81,7 +81,45 @@ impl Sink {
 
 /// The default player command. `--no-video` because a music file with
 /// cover art embedded otherwise opens a window.
-pub const DEFAULT_PLAYER: &str = "mpv --no-video --really-quiet";
+pub const DEFAULT_PLAYER: &str = concat!(
+    "mpv --no-video --really-quiet ",
+    // THE POSITION, on stdout, in a format this app defined.
+    //
+    // `Transport::report` is the sync point between the player's clock and
+    // the progress bar, and nothing called it: the bar extrapolated from
+    // zero forever and `duration` was never set, so `fraction()` was
+    // permanently 0 and the handle never moved.
+    //
+    // mpv will print a status line of our choosing, so the channel costs
+    // no IPC socket and no second connection — the process we already
+    // spawned tells us on the pipe we already have. A prefix nothing else
+    // emits, so a player that ignores the flag simply reports nothing
+    // rather than having its ordinary chatter misread as a timestamp.
+    // The prefix is spelled out here because `concat!` takes literals
+    // only; `STATUS_PREFIX` below is the same string and a test holds the
+    // two together, so a change to one that misses the other fails here
+    // rather than as a progress bar that silently stops moving.
+    "--term-status-msg='BOPOS ${=time-pos} ${=duration}'");
+
+/// The marker a status line starts with.
+pub const STATUS_PREFIX: &str = "BOPOS";
+
+/// Parse one status line into (position, duration), both seconds.
+///
+/// Anything else is `None`, including a line that starts with the prefix
+/// and does not carry two numbers: mpv prints `${=duration}` literally for
+/// a stream that has none, and reading that as a length would put the
+/// handle at the far end of a bar with no end.
+pub fn parse_status(line: &str) -> Option<(f64, f64)> {
+    let rest = line.trim().strip_prefix(STATUS_PREFIX)?;
+    let mut it = rest.split_whitespace();
+    let pos: f64 = it.next()?.parse().ok()?;
+    let dur: f64 = it.next()?.parse().ok()?;
+    if !pos.is_finite() || !dur.is_finite() || pos < 0.0 || dur <= 0.0 {
+        return None;
+    }
+    Some((pos, dur))
+}
 
 /// The commands to run for one track.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +193,10 @@ pub enum State {
 #[derive(Default)]
 pub struct Shared {
     state: Mutex<Option<State>>,
+    /// The player's own clock: (position, duration). Latest wins — a
+    /// backlog of timestamps is worse than the newest one, since every
+    /// older entry is a position the track has already passed.
+    progress: Mutex<Option<(f64, f64)>>,
     /// The track finished on its own, as opposed to being stopped. Only
     /// this should advance the queue — a track stopped because the user
     /// pressed pause must not skip to the next one.
@@ -169,6 +211,11 @@ impl Shared {
     /// frame.
     pub fn take_state(&self) -> Option<State> {
         self.state.lock().ok()?.take()
+    }
+    /// The newest position the player reported, if it has since the last
+    /// call.
+    pub fn take_progress(&self) -> Option<(f64, f64)> {
+        self.progress.lock().ok()?.take()
     }
     pub fn take_ended(&self) -> bool {
         self.ended.swap(false, Ordering::Relaxed)
@@ -229,7 +276,7 @@ impl Player {
             let spawned = std::process::Command::new(&launcher)
                 .arg("-c").arg(format!("exec {cmd}"))
                 .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn();
             let mut child = match spawned {
@@ -237,8 +284,37 @@ impl Player {
                 Err(e) => { shared.set(State::Failed(format!("could not start: {e}"))); return; }
             };
             let err = child.stderr.take();
+            let out = child.stdout.take();
             if let Ok(mut g) = holder.lock() { *g = Some(child); }
             shared.set(State::Playing { url });
+
+            // The status reader, on its own thread. On the wait thread it
+            // would block the exit check between lines, and mpv prints a
+            // status line about once a second — so a track would be up to
+            // a second late noticing it had ended.
+            let reader = out.map(|o| {
+                let shared = shared.clone();
+                std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    // Status lines end with a carriage return, not a
+                    // newline: mpv redraws one line in place. Splitting on
+                    // '\n' would yield the whole session as one line at
+                    // the end, which is a progress bar that jumps from 0
+                    // to done.
+                    let mut buf = Vec::new();
+                    let mut r = std::io::BufReader::new(o);
+                    while let Ok(n) = r.read_until(b'\r', &mut buf) {
+                        if n == 0 { break; }
+                        let line = String::from_utf8_lossy(&buf).into_owned();
+                        buf.clear();
+                        for part in line.split(['\n', '\r']) {
+                            if let Some(p) = parse_status(part) {
+                                if let Ok(mut g) = shared.progress.lock() { *g = Some(p); }
+                            }
+                        }
+                    }
+                })
+            });
 
             // Wait on the child OUTSIDE the mutex: holding it across a wait
             // means `stop_now` blocks until the track ends, which is a UI
@@ -256,6 +332,13 @@ impl Player {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             };
             if let Ok(mut g) = holder.lock() { let _ = g.take(); }
+            // Joined, not detached: a detached reader holding a `Shared`
+            // would keep writing positions into a player that has been
+            // replaced. This returns promptly because the pipe closes when
+            // the child goes — which is only true because the command is
+            // built with `exec`, so the process we kill is the one holding
+            // the pipe rather than a shell wrapping it.
+            if let Some(t) = reader { let _ = t.join(); }
 
             if stop.load(Ordering::Relaxed) {
                 // Stopped on purpose. NOT an end: advancing the queue here
@@ -377,6 +460,54 @@ mod tests {
     }
 
     #[test]
+    fn a_status_line_parses_and_anything_else_does_not() {
+        assert_eq!(parse_status("BOPOS 12.5 240.0"), Some((12.5, 240.0)));
+        assert_eq!(parse_status("  BOPOS 0 1  "), Some((0.0, 1.0)));
+        // mpv prints the placeholder literally for a stream with no
+        // length. Reading that as a duration puts the handle at the far
+        // end of a bar with no end.
+        assert_eq!(parse_status("BOPOS 3.0 ${=duration}"), None);
+        assert_eq!(parse_status("BOPOS 3.0 0"), None, "a zero-length track");
+        assert_eq!(parse_status("AV: 00:00:03 / 00:04:00"), None);
+        assert_eq!(parse_status(""), None);
+    }
+
+    #[test]
+    fn the_prefix_in_the_command_is_the_prefix_the_parser_looks_for() {
+        // `concat!` takes literals, so the command spells it out while the
+        // parser uses the constant. A change to one that misses the other
+        // is a progress bar that silently stops moving, which is a hard
+        // thing to attribute later.
+        assert!(DEFAULT_PLAYER.contains(STATUS_PREFIX),
+                "the player command does not emit {STATUS_PREFIX}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_players_clock_reaches_the_app() {
+        // `Transport::report` is the sync point and had no caller: the bar
+        // extrapolated from zero forever and `duration` was never set, so
+        // the handle never moved.
+        //
+        // Carriage returns, not newlines — mpv redraws one line in place,
+        // and a reader splitting on '\n' gets the whole session at once
+        // at the end.
+        let sh = fake_player("status",
+            "printf 'BOPOS 1.0 200.0\rBOPOS 2.0 200.0\r'; exit 0");
+        let mut p = Player::new();
+        p.start_with(&plan("mpv", "/a.flac", &Sink::Default), &sh.display().to_string());
+        let mut got = None;
+        for _ in 0..200 {
+            if let Some(v) = p.shared.take_progress() { got = Some(v); }
+            if !p.is_running() && got.is_some() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (pos, dur) = got.expect("no position ever reached the app");
+        assert_eq!(dur, 200.0);
+        assert!(pos >= 1.0, "the position was never updated: {pos}");
+    }
+
+    #[test]
     #[cfg(unix)]
     fn a_track_that_finishes_reports_an_end_the_queue_can_act_on() {
         let sh = fake_player("ok", "exit 0");
@@ -414,7 +545,14 @@ mod tests {
     #[cfg(unix)]
     fn stopping_is_not_ending_so_pause_does_not_skip_a_track() {
         // The distinction the whole `ended` flag exists for.
-        let sh = fake_player("long", "sleep 30");
+        // `exec`, mirroring the real command. Without it the stand-in
+        // stays alive as sleep's parent, the kill takes the wrapper and
+        // not the sleeper, and the sleeper keeps the stdout pipe open —
+        // which held the status reader for the full thirty seconds when I
+        // first wrote this. That is exactly why `start_with` builds
+        // `exec <player>`: the process we kill has to be the one holding
+        // the pipe.
+        let sh = fake_player("long", "exec sleep 30");
         let mut p = Player::new();
         p.start_with(&plan("mpv", "/a.flac", &Sink::Default), &sh.display().to_string());
         std::thread::sleep(std::time::Duration::from_millis(60));
