@@ -5559,10 +5559,25 @@ impl Game {
             }
         }
         let steer = (steer + t_steer).clamp(-1.0, 1.0);
+        // FLIGHT MODE gets independent throttle/pitch. Ground vehicles keep
+        // fwd/rev driving BOTH (the Rocket-League aerial-trick coupling,
+        // deliberate and correct there — holding forward pitches the nose
+        // down to angle into a hit); a jet needs the two decoupled, which
+        // the shared keys structurally can't give it. `Action::PitchUp`/
+        // `PitchDown` are flight-only bindings (see their own doc comments
+        // in `input.rs`) that do nothing outside `self.car.flight`, so a
+        // player who never flies never has to learn they exist.
+        let pitch = if self.car.flight {
+            let pu = self.axis(Action::PitchUp);
+            let pd = self.axis(Action::PitchDown);
+            (pd - pu - ps.stick_y + t_air.map(|v| -v.y).unwrap_or(0.0)).clamp(-1.0, 1.0)
+        } else {
+            (rev - fwd - ps.stick_y + t_air.map(|v| -v.y).unwrap_or(0.0)).clamp(-1.0, 1.0)
+        };
         Controls {
             throttle: (fwd - rev + ps.throttle + t_thr).clamp(-1.0, 1.0),
             steer,
-            pitch: (rev - fwd - ps.stick_y + t_air.map(|v| -v.y).unwrap_or(0.0)).clamp(-1.0, 1.0),
+            pitch,
             yaw: ((-yaw_src).clamp(-1.0, 1.0) + t_air.map(|v| v.x).unwrap_or(0.0) * roll_mix).clamp(-1.0, 1.0),
             roll: ((rl - rr + roll_extra).clamp(-1.0, 1.0) + t_air.map(|v| v.x).unwrap_or(0.0) * (1.0 - roll_mix)).clamp(-1.0, 1.0),
             boost: self.action_down(Action::Boost) || t_boost,
