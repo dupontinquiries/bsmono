@@ -56,6 +56,10 @@ pub enum Tool {
     /// models, bodies above that) and sanitized: refs and messages in a repo
     /// you did not write are attacker-controlled text.
     GitLog { n: usize, path: String },
+    /// DRY RUN a proposed section against a file: classify it into blocks and report what each one
+    /// would do. Writes nothing. The answer to "I have a chunk of code, is it safe to land and where
+    /// does it go" — see `Workspace::propose`.
+    Propose { path: String, content: String },
     /// PATCH an existing file: replace exactly ONE occurrence of a verbatim `find` anchor with
     /// `replace`. The context-economy primitive: big models re-emitting whole files is what fills the
     /// window and drags tok/s; an anchored edit is a few dozen tokens and — unlike unified diffs,
@@ -84,6 +88,7 @@ pub enum Tool {
 /// One list, and a test that fails if the enum grows a variant that is not in it.
 pub const RUNTIME_TOOLS: &[&str] = &[
     "write_file", "edit", "read_file", "read_range", "list_dir", "search", "run", "git_log", "doc",
+    "propose",
 ];
 
 impl Tool {
@@ -98,6 +103,7 @@ impl Tool {
             Tool::Search { .. } => "search",
             Tool::ReadRange { .. } => "read_range",
             Tool::GitLog { .. } => "git_log",
+            Tool::Propose { .. } => "propose",
             Tool::Edit { .. } => "edit",
             Tool::Doc { .. } => "doc",
         }
@@ -110,6 +116,7 @@ impl Tool {
             Tool::ReadFile { path } => format!("read {path}"),
             Tool::ListDir { path } => format!("ls {}", if path.is_empty() { "." } else { path }),
             Tool::GitLog { n, path } => if path.is_empty() { format!("git log -n {n}") } else { format!("git log -n {n} -- {path}") },
+            Tool::Propose { path, content } => format!("propose {} ({} B, dry run)", path, content.len()),
             Tool::Run { argv } => format!("run {}", argv.join(" ")),
             Tool::Search { pattern, path } => format!("search /{}/ in {}", pattern, if path.is_empty() { "." } else { path }),
             Tool::ReadRange { path, start, end } => format!("read {path}:{start}-{end}"),
@@ -258,6 +265,7 @@ impl Workspace {
             Tool::ReadFile { path } => self.read_file(path),
             Tool::ListDir { path } => self.list_dir(path),
             Tool::GitLog { n, path } => self.git_log(*n, path),
+            Tool::Propose { path, content } => self.propose(path, content),
             Tool::Run { argv } => self.run(argv),
             Tool::Search { pattern, path } => self.search(pattern, path),
             Tool::ReadRange { path, start, end } => self.read_range(path, *start, *end),
@@ -639,6 +647,77 @@ to continue from line {})", self.max_output, lines + 1)
         }
     }
 
+    /// DRY RUN a proposed section: classify it, say what each block would do, write nothing.
+    ///
+    /// ## Why a dry run is worth a tool call
+    ///
+    /// A model with a chunk of code has two bad options today. `write_file` risks the whole file on
+    /// a reply that may contain an elision (refused by `classify_write`, but only after the model
+    /// has spent the tokens emitting it), and `edit` needs a verbatim anchor the model may not have
+    /// read yet. Both fail late. This fails early and cheaply: hand over the section, get back a
+    /// PATCH SUMMARY — one line per block saying what it is, whether it is safe to land, whether it
+    /// is ALREADY in the file, and the anchor to use — then land the good blocks with `edit`.
+    ///
+    /// The classification is aperture's `multipass`, the same pass its editor uses to decide what a
+    /// completion may insert; the block keys are its home-row keys, so a block can be referred to by
+    /// name in the following turn. What is added here is the part that needs the repository: is this
+    /// block already present, and if not, where does it go.
+    fn propose(&self, rel: &str, content: &str) -> ToolResult {
+        use aperture_complete::multipass;
+        if content.trim().is_empty() {
+            return ToolResult::err("propose: empty content — send the section you want to land");
+        }
+        let abs = match self.resolve_read(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
+        // Bounded like every other read on this path; a proposal against a file too big to hold is
+        // a proposal that should be an anchored edit anyway.
+        let (existing, truncated) = read_capped(&abs, self.max_output).unwrap_or_default();
+        let file_known = abs.is_file() && !truncated;
+
+        let (mut blocks, prose) = multipass::plan(content);
+        multipass::assign_keys(&mut blocks);
+        if blocks.is_empty() && prose.is_empty() {
+            return ToolResult::err("propose: nothing to land — the content produced no blocks");
+        }
+
+        let mut out = format!("PATCH SUMMARY for {rel} (dry run — NOTHING was written)\n");
+        let mut landable = 0usize;
+        for b in &blocks {
+            let key = b.key.map(|c| c.to_string()).unwrap_or_else(|| "-".into());
+            let lines = b.text.lines().count();
+            let kind = match b.kind {
+                multipass::Kind::Code => "code",
+                multipass::Kind::Elision => "ELISION — would delete what it stands for",
+                multipass::Kind::Stub => "STUB — compiles to nothing",
+                multipass::Kind::Prose => "prose — comment only",
+            };
+            let mut note = String::new();
+            if b.kind.insertable() {
+                // ALREADY PRESENT is the finding that saves the most work: a model re-proposing code
+                // it already landed is the commonest wasted turn in a long run, and it is invisible
+                // without checking the file.
+                let present = file_known && block_present(&existing, &b.text);
+                if present {
+                    note.push_str(" — ALREADY IN THE FILE, nothing to do");
+                } else {
+                    landable += 1;
+                    note.push_str(&match anchor_for(&existing, &b.text) {
+                        Some(a) if file_known => format!(" — land with: edit {rel}, find {a:?}"),
+                        _ if !abs.exists() => " — file does not exist; write_file it".to_string(),
+                        _ => " — no obvious anchor; read the file and choose one".to_string(),
+                    });
+                }
+            }
+            out.push_str(&format!("  [{key}] {kind}, {lines} line(s): {}{note}\n", b.hint));
+        }
+        for p in prose.iter().take(3) {
+            let one: String = p.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect();
+            if !one.is_empty() { out.push_str(&format!("  (model commentary, not code) {one}\n")); }
+        }
+        out.push_str(&format!("{landable} block(s) worth landing. Nothing has been written — \
+use `edit` (or `write_file` for a new file) to land the ones you want.\n"));
+        ToolResult::ok(out)
+    }
+
     fn git_log(&self, n: usize, path: &str) -> ToolResult {
         let b = crate::read_harness::budget(
             crate::read_harness::ModelClass::resolve(self.model_params, &self.model_label));
@@ -974,6 +1053,36 @@ fn read_capped(path: &Path, cap: usize) -> std::io::Result<(String, bool)> {
     let truncated = buf.len() > cap;
     buf.truncate(cap);
     Ok((String::from_utf8_lossy(&buf).into_owned(), truncated))
+}
+
+/// Is a proposed block already in the file, ignoring indentation and blank-line differences?
+///
+/// Whitespace-insensitive on purpose: a model re-emitting a function it already wrote almost never
+/// reproduces the exact indentation, and reporting "not present" for that sends it to re-land code
+/// that is already there — the wasted turn this check exists to prevent.
+fn block_present(existing: &str, block: &str) -> bool {
+    let norm = |s: &str| -> String {
+        s.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n")
+    };
+    let (h, n) = (norm(existing), norm(block));
+    !n.is_empty() && h.contains(&n)
+}
+
+/// A unique verbatim anchor near where a block would go: the last line of the file's existing text
+/// that the block's own first meaningful line suggests it follows.
+///
+/// Best-effort and honest about it — returns None rather than guessing when nothing is unique. A
+/// wrong anchor is worse than no anchor: `edit` refuses a non-unique one, but a unique-and-wrong one
+/// lands the change in the wrong place.
+fn anchor_for(existing: &str, block: &str) -> Option<String> {
+    let first = block.lines().map(str::trim).find(|l| !l.is_empty())?;
+    // The word most likely to identify the region: the longest identifier-ish token in the block's
+    // opening line (a function name, a type name).
+    let key = first.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| w.len() >= 4)
+        .max_by_key(|w| w.len())?;
+    let hits: Vec<&str> = existing.lines().filter(|l| l.contains(key)).collect();
+    if hits.len() == 1 { Some(hits[0].trim_end().to_string()) } else { None }
 }
 
 /// Is this content binary? A NUL byte in the first few KB is the same heuristic grep uses, and it
@@ -1537,6 +1646,10 @@ fn parse_one(block: &str) -> Option<Tool> {
             path: json_str(block, "path").unwrap_or_default(),
         }),
         "list_dir" => Some(Tool::ListDir { path: json_str(block, "path").unwrap_or_default() }),
+        "propose" | "dry_run" => Some(Tool::Propose {
+            path: json_str(block, "path")?,
+            content: json_str(block, "content").or_else(|| json_str(block, "contents"))?,
+        }),
         "doc" | "share_doc" | "write_doc" => Some(Tool::Doc {
             name: json_str(block, "name")?,
             content: json_str(block, "content").or_else(|| json_str(block, "contents"))?,
@@ -1849,6 +1962,7 @@ Available tools (one JSON object per block):
 - list_dir    {{ \"tool\":\"list_dir\", \"path\":\"<rel path or empty for root>\" }}
 - run         {{ \"tool\":\"run\", \"argv\":[\"cargo\",\"test\"] }}
 - git_log     {{ \"tool\":\"git_log\", \"n\":<count>, \"path\":\"<rel path or empty>\" }}  (what this repo RECENTLY DID — see below)
+- propose     {{ \"tool\":\"propose\", \"path\":\"<rel path>\", \"content\":\"<a section of code>\" }}  (DRY RUN — writes nothing, see below)
 - doc         {{ \"tool\":\"doc\", \"name\":\"survey\", \"content\":\"<markdown>\" }}  (SHARED crew doc — every worker's next prompt includes it)
 
 THE CODE IS RIGHT THERE — LOOK AT IT. This workspace is a real repository (overview below). Every
@@ -1861,6 +1975,14 @@ turns are reconnaissance — list_dir, read the README / Cargo.toml, search the 
 and once you understand the lay of the land, write a `doc` named \"survey\" (module map, where the
 task's concepts live, the pattern to follow) so later workers inherit what you learned instead of
 re-crawling. Then make the change, and let the automatic verification tell you if it compiles.
+
+CHECK A SECTION BEFORE YOU LAND IT. `propose` takes a chunk of code you are considering and writes
+NOTHING; it returns a patch summary — one line per block saying whether the block is real code, an
+elision, or a stub, whether it is ALREADY IN THE FILE (the commonest wasted turn is re-landing code
+you already wrote), and the anchor to use. Use it when you have a section but have not read enough
+of the file to write a confident `edit` anchor, and when a change spans several separate pieces: the
+summary lets you land the good blocks and drop the rest, instead of betting the whole file on one
+write_file. Then land what you kept with `edit`.
 
 HISTORY IS EVIDENCE A FILE READ CANNOT GIVE YOU. `git_log` answers questions the current source
 cannot: why a field exists, which change broke something, what convention this module follows, and
@@ -4698,6 +4820,7 @@ mod long_horizon_tests {
             Tool::GitLog { n: 1, path: String::new() },
             Tool::Edit { path: "p".into(), find: "a".into(), replace: "b".into() },
             Tool::Doc { name: "d".into(), content: String::new() },
+            Tool::Propose { path: "p".into(), content: "fn x() {}".into() },
         ];
         for t in &all {
             assert!(RUNTIME_TOOLS.contains(&t.wire_name()),
@@ -4817,6 +4940,88 @@ mod long_horizon_tests {
         assert_eq!(total, 3);
         assert_eq!(done, 0,
                    "nothing was written, so no plan step is done — reported {done}/{total}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    // ── propose: section-level dry run returning a patch summary ─────────────────────────────────
+
+    #[test]
+    fn propose_writes_nothing_and_names_what_each_block_is() {
+        let d = tmp("propose");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        let before = "pub fn existing() {\n    let x = 1;\n}\n";
+        std::fs::write(d.join("src/lib.rs"), before).unwrap();
+        let mut ws = Workspace::new(&d);
+        let r = ws.apply(&Tool::Propose {
+            path: "src/lib.rs".into(),
+            content: "pub fn brand_new() {\n    let y = 2;\n}\n\n// ... rest of the code remains the same\n".into(),
+        });
+        assert!(r.ok, "{}", r.output);
+        assert!(r.output.contains("NOTHING was written"));
+        assert!(r.output.contains("ELISION"), "the dangerous block is named as such: {}", r.output);
+        assert!(r.output.to_lowercase().contains("code"), "{}", r.output);
+        assert_eq!(std::fs::read_to_string(d.join("src/lib.rs")).unwrap(), before, "a dry run writes nothing");
+        assert!(ws.events().is_empty(), "and produces no file events");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The finding that saves the most turns in a long run: a model re-proposing code it already
+    /// landed. Invisible without checking the file, and it costs a whole turn every time.
+    #[test]
+    fn propose_reports_a_block_that_is_already_in_the_file() {
+        let d = tmp("propose-dup");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("src/lib.rs"),
+            "pub fn already_here(a: u32) -> u32 {\n    a + 1\n}\n").unwrap();
+        let mut ws = Workspace::new(&d);
+        // re-proposed with DIFFERENT indentation — the realistic case, which an exact-match check
+        // would report as absent and send the model off to re-land it.
+        let r = ws.apply(&Tool::Propose {
+            path: "src/lib.rs".into(),
+            content: "pub fn already_here(a: u32) -> u32 {\n        a + 1\n}\n".into(),
+        });
+        assert!(r.ok, "{}", r.output);
+        assert!(r.output.contains("ALREADY IN THE FILE"), "{}", r.output);
+        assert!(r.output.contains("0 block(s) worth landing"), "{}", r.output);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn propose_suggests_an_anchor_only_when_it_is_unique() {
+        // unique identifier → an anchor the model can paste into `edit`
+        let existing = "fn alpha() {}\nfn beta_unique_name() {}\nfn gamma() {}\n";
+        let a = anchor_for(existing, "fn beta_unique_name() { let z = 3; }");
+        assert_eq!(a.as_deref(), Some("fn beta_unique_name() {}"));
+        // ambiguous → None, because a unique-and-wrong anchor lands the change in the wrong place
+        let dupe = "fn same_name() {}\nfn same_name() {}\n";
+        assert_eq!(anchor_for(dupe, "fn same_name() { 1 }"), None);
+        // nothing related in the file → None
+        assert_eq!(anchor_for("fn alpha() {}\n", "fn totally_unrelated() {}"), None);
+    }
+
+    #[test]
+    fn block_presence_ignores_indentation_but_not_content() {
+        assert!(block_present("fn a() {\n    1\n}\n", "fn a() {\n1\n}"));
+        assert!(block_present("fn a() {\n    1\n}\n", "fn a() {\n        1\n}"));
+        assert!(!block_present("fn a() {\n    1\n}\n", "fn a() {\n    2\n}"));
+        assert!(!block_present("fn a() {}\n", ""), "empty is not present");
+    }
+
+    #[test]
+    fn propose_is_reachable_from_a_model_turn() {
+        // The whole path: JSON on the wire → parsed → executed → summary back.
+        let d = tmp("propose-wire");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("src/lib.rs"), "pub fn keep() {}\n").unwrap();
+        let (tools, rejected) = parse_tools_reported(
+            "```tool\n{\"tool\":\"propose\",\"path\":\"src/lib.rs\",\"content\":\"pub fn added() {}\\n\"}\n```");
+        assert!(rejected.is_empty(), "{rejected:?}");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].wire_name(), "propose");
+        let mut ws = Workspace::new(&d);
+        let r = ws.apply(&tools[0]);
+        assert!(r.ok && r.output.contains("PATCH SUMMARY"), "{}", r.output);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
