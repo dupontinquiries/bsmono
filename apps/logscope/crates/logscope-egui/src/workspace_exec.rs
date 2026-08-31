@@ -340,33 +340,62 @@ impl Workspace {
             match self.resolve_read(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) }
         };
         let mut hits = Vec::new();
-        fn walk(dir: &Path, root: &Path, pat: &str, hits: &mut Vec<String>, cap: usize) {
+        let mut skipped_big = 0usize;
+        let mut skipped_bin = 0usize;
+        // THE WORST OFFENDER, PRE-FIX. This walked the whole workspace calling read_to_string on
+        // EVERY file — every vendored blob, every generated bundle, every `.gguf` model sitting in
+        // the tree — to grep for a symbol. One multi-GB file anywhere under the root and the process
+        // died, with nothing in the report naming a file. Now: size-capped, binary-skipped, and
+        // streamed a line at a time, so peak memory is one line regardless of what is in the tree.
+        fn walk(dir: &Path, root: &Path, pat: &str, hits: &mut Vec<String>, cap: usize,
+                skipped_big: &mut usize, skipped_bin: &mut usize) {
+            use std::io::BufRead;
             if hits.len() >= cap { return; }
             let Ok(rd) = std::fs::read_dir(dir) else { return };
             for e in rd.flatten() {
                 if hits.len() >= cap { return; }
                 let p = e.path();
                 let name = e.file_name().to_string_lossy().into_owned();
-                if name == ".git" || name == "target" { continue; }
-                if p.is_dir() { walk(&p, root, pat, hits, cap); }
-                else if let Ok(text) = std::fs::read_to_string(&p) {
-                    let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().into_owned();
-                    for (i, line) in text.lines().enumerate() {
-                        if line.contains(pat) {
-                            hits.push(format!("{}:{}: {}", rel, i + 1, line.trim()));
-                            if hits.len() >= cap { return; }
-                        }
+                // Directories that are never the answer and are always enormous. `target` and
+                // `.git` were already here; the rest are the same class of mistake found the hard way.
+                if matches!(name.as_str(), ".git" | "target" | "node_modules" | ".cargo" | "build-dir" | ".venv" | "__pycache__") { continue; }
+                // `symlink_metadata`, not `is_dir`: a symlink pointing at a parent turns this walk
+                // into an infinite descent, and a symlink to /dev/zero turns a read into an OOM.
+                let Ok(md) = std::fs::symlink_metadata(&p) else { continue };
+                if md.file_type().is_symlink() { continue; }
+                if md.is_dir() { walk(&p, root, pat, hits, cap, skipped_big, skipped_bin); continue; }
+                if md.len() > SEARCH_FILE_MAX { *skipped_big += 1; continue; }
+                let Ok(f) = std::fs::File::open(&p) else { continue };
+                let mut rdr = std::io::BufReader::new(f);
+                let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().into_owned();
+                let mut line = Vec::new();
+                let mut n = 0usize;
+                loop {
+                    line.clear();
+                    match rdr.read_until(b'\n', &mut line) { Ok(0) => break, Ok(_) => {}, Err(_) => break }
+                    if n == 0 && looks_binary(&line) { *skipped_bin += 1; break; }
+                    n += 1;
+                    let text = String::from_utf8_lossy(&line);
+                    if text.contains(pat) {
+                        let t = text.trim();
+                        // One hit is one LINE, and a minified bundle's line is the whole file.
+                        let shown: String = t.chars().take(300).collect();
+                        hits.push(format!("{rel}:{n}: {shown}"));
+                        if hits.len() >= cap { return; }
                     }
                 }
             }
         }
-        walk(&base, &self.root, pattern, &mut hits, 200);
-        ToolResult::ok(if hits.is_empty() { format!("no matches for /{pattern}/") } else { hits.join("\n") })
+        walk(&base, &self.root, pattern, &mut hits, 200, &mut skipped_big, &mut skipped_bin);
+        let mut note = String::new();
+        if skipped_big > 0 { note.push_str(&format!("\n[{skipped_big} file(s) over {} MiB skipped]", SEARCH_FILE_MAX / (1024 * 1024))); }
+        if skipped_bin > 0 { note.push_str(&format!("\n[{skipped_bin} binary file(s) skipped]")); }
+        ToolResult::ok(if hits.is_empty() { format!("no matches for /{pattern}/{note}") } else { format!("{}{note}", hits.join("\n")) })
     }
 
     fn read_range(&self, rel: &str, start: usize, end: usize) -> ToolResult {
+        use std::io::BufRead;
         let abs = match self.resolve_read(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
-        let text = match std::fs::read_to_string(&abs) { Ok(s) => s, Err(e) => return ToolResult::err(format!("read {rel}: {e}")) };
         let (start, end) = (start.max(1), end.max(start));
         // CLAMPED TO THE CLASS. A 1B that asks for lines 1..4000 gets what it
         // can actually use and is TOLD where it stopped, so its next call is a
@@ -377,11 +406,36 @@ impl Workspace {
             crate::read_harness::ModelClass::resolve(self.model_params, &self.model_label));
         let requested = end - start + 1;
         let end = if requested > b.chunk_lines { start + b.chunk_lines - 1 } else { end };
-        let total = text.lines().count();
-        let out: String = text.lines().enumerate()
-            .filter(|(i, _)| *i + 1 >= start && *i + 1 <= end)
-            .map(|(i, l)| format!("{}: {}", i + 1, l))
-            .collect::<Vec<_>>().join("\n");
+
+        // STREAMED, one line at a time. Reading a 400 MB file into a String to return 60 lines of it
+        // is the memory profile that took the backend out; a BufReader holds one line plus the
+        // wanted slice, whatever the file's size. The pass also counts the total, so the
+        // continuation hint stays exact without a second read.
+        let f = match std::fs::File::open(&abs) { Ok(f) => f, Err(e) => return ToolResult::err(format!("read {rel}: {e}")) };
+        let mut rdr = std::io::BufReader::new(f);
+        let mut out = String::new();
+        let mut total = 0usize;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match rdr.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => return ToolResult::err(format!("read {rel}: {e}")),
+            }
+            if looks_binary(&line) {
+                return ToolResult::err(format!("read {rel}: binary file — not read."));
+            }
+            total += 1;
+            if total >= start && total <= end {
+                let text = String::from_utf8_lossy(&line);
+                out.push_str(&format!("{total}: {}\n", text.trim_end_matches(['\n', '\r'])));
+            }
+            // Past the window AND past the point where the total still matters for the hint: a
+            // bounded scan beats an exact count on a file with millions of lines.
+            if total > end && total > start + b.chunk_lines + 100_000 { break; }
+        }
+        let out = out.trim_end_matches('\n').to_string();
         if out.is_empty() {
             return ToolResult::err(format!("{rel}: no lines in {start}..{end} (the file has {total})"));
         }
@@ -465,6 +519,18 @@ Continue with read_range {rel} {} {}]",
         if find.is_empty() {
             return ToolResult::err(format!("edit {rel}: empty find anchor — copy the exact text to replace"));
         }
+        // An anchored edit must hold the whole file — it rewrites it — so this is the one read that
+        // cannot be streamed. Guard the size instead: an 8 MiB source file is pathological, and
+        // refusing with a reason beats an allocation that takes the process down mid-run.
+        const EDIT_FILE_MAX: u64 = 8 * 1024 * 1024;
+        if let Ok(md) = std::fs::metadata(&abs) {
+            if md.len() > EDIT_FILE_MAX {
+                return ToolResult::err(format!(
+                    "edit {rel}: {} bytes exceeds the {} MiB edit limit — an anchored edit rewrites the \
+whole file. Split it, or write the replacement with write_file if you truly mean to replace it.",
+                    md.len(), EDIT_FILE_MAX / (1024 * 1024)));
+            }
+        }
         let text = match std::fs::read_to_string(&abs) {
             Ok(s) => s,
             Err(e) => return ToolResult::err(format!(
@@ -493,11 +559,22 @@ Continue with read_range {rel} {} {}]",
 
     fn read_file(&self, rel: &str) -> ToolResult {
         let abs = match self.resolve_read(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
-        match std::fs::read_to_string(&abs) {
-            Ok(s) => {
-                let capped: String = s.chars().take(self.max_output).collect();
-                let note = if capped.len() < s.len() { "\n…(truncated)" } else { "" };
-                ToolResult::ok(format!("{capped}{note}"))
+        // Bounded at the source — see `read_capped`. The size is reported when the file is bigger
+        // than the cap so the model knows a range read is the way to see the rest, rather than
+        // re-issuing the same read and getting the same prefix.
+        let size = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+        match read_capped(&abs, self.max_output) {
+            Ok((text, truncated)) => {
+                if looks_binary(text.as_bytes()) {
+                    return ToolResult::err(format!(
+                        "read {rel}: binary file ({size} bytes) — not read. Text tools cannot use it."));
+                }
+                let note = if truncated {
+                    let lines = text.lines().count();
+                    format!("\n…(truncated at {} of {size} bytes, about {lines} lines — use read_range \
+to continue from line {})", self.max_output, lines + 1)
+                } else { String::new() };
+                ToolResult::ok(format!("{text}{note}"))
             }
             Err(e) => ToolResult::err(format!("read {rel}: {e}")),
         }
@@ -720,7 +797,47 @@ fn default_allow() -> BTreeSet<String> {
         .iter().map(|s| s.to_string()).collect()
 }
 
+// ── bounded reading: the difference between a big repo and an OOM ───────────────────────────────
+
+/// Bytes a single `search` will read from one file before giving up on it. A source file is
+/// kilobytes; anything past this is a vendored blob, a generated bundle, or a model weight, and
+/// reading it to grep for a symbol costs the whole file in RAM for no hits worth having.
+const SEARCH_FILE_MAX: u64 = 2 * 1024 * 1024;
+
+/// How much of a file is sniffed to decide whether it is text.
+const BINARY_SNIFF: usize = 8 * 1024;
+
+/// Read at most `cap` bytes of a file, allocating at most `cap`+1 bytes — never the file's size.
+///
+/// THIS IS THE MEMORY FIX. `read_to_string(path)` allocates the whole file, and the old `read_file`
+/// then did `.chars().take(cap).collect()` on top of it, so peak was 2× file size to return 64 KB.
+/// A `.gguf` or a vendored bundle in the tree therefore took the process out, and the report was a
+/// backend crash rather than anything naming a file. `Read::take` bounds the allocation at the
+/// source: the rest of the file is never in memory at all.
+///
+/// Returns (text, truncated). Invalid UTF-8 is replaced rather than erroring — a truncating read
+/// lands mid-codepoint routinely, and failing the whole read for that would be worse than a `�`.
+fn read_capped(path: &Path, cap: usize) -> std::io::Result<(String, bool)> {
+    use std::io::Read;
+    let f = std::fs::File::open(path)?;
+    let mut buf = Vec::with_capacity(cap.min(64 * 1024) + 1);
+    // cap+1 so a file of exactly `cap` bytes is not reported as truncated.
+    f.take(cap as u64 + 1).read_to_end(&mut buf)?;
+    let truncated = buf.len() > cap;
+    buf.truncate(cap);
+    Ok((String::from_utf8_lossy(&buf).into_owned(), truncated))
+}
+
+/// Is this content binary? A NUL byte in the first few KB is the same heuristic grep uses, and it
+/// is the one that matters here: a text scan of a binary produces garbage lines that then travel
+/// into the model's context as if they were code.
+fn looks_binary(head: &[u8]) -> bool {
+    head.iter().take(BINARY_SNIFF).any(|&b| b == 0)
+}
+
 // ── transcript compaction: the bound that lets a run outlive its context window ─────────────────
+
+
 
 /// The turn separator `step_turn` appends. Compaction splits on it, so it is one constant rather
 /// than a literal in two places.
@@ -1433,8 +1550,14 @@ pub fn collect_shared_docs(root: &std::path::Path, budget: usize) -> String {
         // Another worker's document is CONTENT, not instruction: neutralize defangs tool-call
         // syntax inside it, so worker A cannot make worker B run something by writing it into a
         // shared doc — the fan's own channel is the easiest injection path it has.
-        let body = crate::taint::neutralize(&std::fs::read_to_string(&f).unwrap_or_default());
-        let take = (budget - s.len()).min(body.len());
+        // Bounded read: a shared doc is written by another agent run, so its size is not something
+        // this process controls — a worker that dumped a whole file into one would otherwise be
+        // read entirely into memory just to slice `budget` bytes off it. Reads one byte more than
+        // the remaining budget so the truncation note below stays accurate.
+        let room = budget.saturating_sub(s.len());
+        let raw = read_capped(&f, room + 1).map(|(t, _)| t).unwrap_or_default();
+        let body = crate::taint::neutralize(&raw);
+        let take = room.min(body.len());
         // cut on a char boundary
         let mut cut = take; while cut < body.len() && !body.is_char_boundary(cut) { cut += 1; }
         s.push_str(&format!("### shared doc: {name}\n{}\n\n", &body[..cut.min(body.len())]));
@@ -2605,8 +2728,11 @@ pub fn scan_docs(root: &Path) -> Vec<(String, String)> {
             let p = e.path();
             if p.is_dir() { walk(&p, root, out); }
             else if p.extension().and_then(|s| s.to_str()) == Some("md") {
-                if let Ok(text) = std::fs::read_to_string(&p) {
+                // Bounded: a generated or vendored .md can be enormous, and this walk pulls every
+                // one of them into memory at once.
+                if let Ok((text, truncated)) = read_capped(&p, 1024 * 1024) {
                     let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+                    let text = if truncated { format!("{text}\n\n<!-- truncated at 1 MiB -->\n") } else { text };
                     out.push((rel, text));
                 }
             }
@@ -4125,6 +4251,133 @@ mod long_horizon_tests {
         let (stop, run) = drive(&d, "never green", cfg, &script);
         assert_eq!(stop, Stop::Stalled);
         assert_eq!(run.last_green(), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    // ── bounded reading: measured, because "uses less memory" is otherwise just a claim ──────────
+
+    /// Peak resident set size in KiB (`VmHWM`), the kernel's own high-water mark. It never
+    /// decreases, which is exactly what is wanted here: a transient 256 MB allocation that is freed
+    /// before the assertion still shows up, so this cannot be fooled by the allocator returning
+    /// memory promptly.
+    #[cfg(target_os = "linux")]
+    fn peak_rss_kib() -> u64 {
+        std::fs::read_to_string("/proc/self/status").ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM:")).map(str::to_string))
+            .and_then(|l| l.split_whitespace().nth(1).and_then(|n| n.parse().ok()))
+            .unwrap_or(0)
+    }
+
+    /// Write a file of `mib` MiB of plausible source text.
+    fn big_file(path: &Path, mib: usize) {
+        use std::io::Write;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        let line = "// a line of source text that is about sixty-four bytes long ok\n";
+        let per_mib = (1024 * 1024) / line.len();
+        for _ in 0..(mib * per_mib) { f.write_all(line.as_bytes()).unwrap(); }
+        f.flush().unwrap();
+    }
+
+    /// The fix, measured. Reading a 256 MiB file used to allocate the whole thing (plus a second
+    /// copy for the char-truncate) to return 64 KiB of it. Peak RSS must now be a rounding error
+    /// against the file's size.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reading_a_huge_file_does_not_allocate_it() {
+        let d = tmp("bigread");
+        let f = d.join("src/huge.rs");
+        big_file(&f, 256);
+        let mut ws = Workspace::new(&d);
+        let before = peak_rss_kib();
+        let r = ws.apply(&Tool::ReadFile { path: "src/huge.rs".into() });
+        let after = peak_rss_kib();
+        assert!(r.ok, "{}", r.output);
+        assert!(r.output.len() < 200 * 1024, "output is capped: {} B", r.output.len());
+        assert!(r.output.contains("truncated at"), "and says so: {}", &r.output[r.output.len().saturating_sub(200)..]);
+        let grew_mib = (after.saturating_sub(before)) / 1024;
+        assert!(grew_mib < 16, "reading a 256 MiB file grew peak RSS by {grew_mib} MiB");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Same for a range read, which had the same whole-file allocation to return sixty lines.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_range_read_of_a_huge_file_does_not_allocate_it() {
+        let d = tmp("bigrange");
+        big_file(&d.join("src/huge.rs"), 256);
+        let mut ws = Workspace::new(&d);
+        let before = peak_rss_kib();
+        let r = ws.apply(&Tool::ReadRange { path: "src/huge.rs".into(), start: 10, end: 40 });
+        let after = peak_rss_kib();
+        assert!(r.ok, "{}", r.output);
+        assert!(r.output.contains("10: //") && r.output.contains("40: //"), "{}", r.output);
+        let grew_mib = (after.saturating_sub(before)) / 1024;
+        assert!(grew_mib < 16, "a 31-line range read of a 256 MiB file grew peak RSS by {grew_mib} MiB");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Search was the worst of the three: read_to_string on EVERY file in the tree. One large blob
+    /// anywhere under the root took the process out.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn search_skips_the_blob_instead_of_inhaling_it() {
+        let d = tmp("bigsearch");
+        big_file(&d.join("src/huge.rs"), 256);
+        std::fs::write(d.join("src/small.rs"), "fn find_me() {}\n").unwrap();
+        // a binary that must not be scanned or reported as source
+        std::fs::write(d.join("src/weights.bin"), [0u8, 1, 2, 3].repeat(4096)).unwrap();
+        let mut ws = Workspace::new(&d);
+        let before = peak_rss_kib();
+        let r = ws.apply(&Tool::Search { pattern: "find_me".into(), path: String::new() });
+        let after = peak_rss_kib();
+        assert!(r.ok, "{}", r.output);
+        assert!(r.output.contains("src/small.rs:1"), "the small file is still searched: {}", r.output);
+        assert!(r.output.contains("over 2 MiB skipped"), "the blob is skipped and said so: {}", r.output);
+        assert!(r.output.contains("binary file(s) skipped"), "{}", r.output);
+        let grew_mib = (after.saturating_sub(before)) / 1024;
+        assert!(grew_mib < 16, "searching past a 256 MiB blob grew peak RSS by {grew_mib} MiB");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_binary_file_is_refused_rather_than_turned_into_garbage_context() {
+        let d = tmp("binread");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("src/blob.bin"), [0u8, 159, 146, 150].repeat(64)).unwrap();
+        let mut ws = Workspace::new(&d);
+        let r = ws.apply(&Tool::ReadFile { path: "src/blob.bin".into() });
+        assert!(!r.ok && r.output.contains("binary"), "{}", r.output);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A symlink loop used to make `search` descend forever. `symlink_metadata` is what stops it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn search_does_not_follow_symlinks_into_a_loop() {
+        let d = tmp("symloop");
+        std::fs::create_dir_all(d.join("a")).unwrap();
+        std::fs::write(d.join("a/x.rs"), "fn target() {}\n").unwrap();
+        std::os::unix::fs::symlink(&d, d.join("a/loop")).unwrap();
+        let mut ws = Workspace::new(&d);
+        let r = ws.apply(&Tool::Search { pattern: "target".into(), path: String::new() });
+        assert!(r.ok && r.output.contains("a/x.rs:1"), "{}", r.output);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn read_capped_allocates_the_cap_not_the_file() {
+        let d = tmp("capped");
+        std::fs::write(d.join("f.txt"), "x".repeat(10_000)).unwrap();
+        let (t, trunc) = read_capped(&d.join("f.txt"), 100).unwrap();
+        assert_eq!(t.len(), 100);
+        assert!(trunc);
+        // exactly at the cap is NOT truncated
+        std::fs::write(d.join("g.txt"), "y".repeat(100)).unwrap();
+        let (t2, trunc2) = read_capped(&d.join("g.txt"), 100).unwrap();
+        assert_eq!(t2.len(), 100);
+        assert!(!trunc2, "a file of exactly cap bytes must not claim truncation");
         let _ = std::fs::remove_dir_all(&d);
     }
 }
