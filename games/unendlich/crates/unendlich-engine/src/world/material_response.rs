@@ -47,7 +47,7 @@ use crate::world::blocks::BlockId;
 /// Local environmental sample at a block position. Computed once per
 /// visible face and consumed by `MaterialResponse`. Values are
 /// normalised so each is roughly in [0, 1].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct EnvironmentSample {
     /// Air temperature, [0=cold, 0.5=temperate, 1=hot].
     pub temperature: f32,

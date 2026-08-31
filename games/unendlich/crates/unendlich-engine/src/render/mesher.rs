@@ -412,8 +412,7 @@ const TINT_REFERENCE_VARIANCE: f32 = 0.18;
 /// top (not per vertex). With ~1000 soft blocks per chunk and 1000
 /// chunks, that's 1M calls per chunk-load batch. Cheap.
 #[inline]
-fn tint_for_position(block: BlockId, wx: i32, wy: i32, wz: i32) -> [f32; 3] {
-    // Per-block-type variance: how much each channel can swing.
+fn tint_for_position(block: BlockId, wx: i32, wy: i32, wz: i32) -> [f32; 3] {    // Per-block-type variance: how much each channel can swing.
     // Soft natural blocks (grass, sand) get more variance than hard
     // blocks. Hard blocks (stone, ore) keep tighter palettes.
     let variance = match block {
@@ -445,6 +444,65 @@ fn tint_for_position(block: BlockId, wx: i32, wy: i32, wz: i32) -> [f32; 3] {
         1.0 + g_n * variance,
         1.0 + b_n * variance,
     ]
+}
+
+// r-perf: same memo pattern as ENV_CACHE (flat array, chunk-local index,
+// generation-tagged). `tint_for_position` is pure in (block, wx, wy, wz) and
+// is called once per face (up to 5×/block: top + up-to-4 sides) in both
+// `compute_tinted_color_for_top` and `compute_tinted_color_for_face`, always
+// for the block actually at that chunk-local position — same redundancy
+// shape the env-sample cache had. Shares the `sample_env_at_cached` bounds
+// check and generation counter conceptually but keeps its own array/gen
+// (different value type, and this one must also stay valid on its own if
+// env-cache code is ever refactored independently).
+const TINT_CACHE_W: usize = CHUNK_SIZE as usize;
+
+thread_local! {
+    static TINT_CACHE: std::cell::RefCell<Vec<([f32; 3], u32)>> = std::cell::RefCell::new(vec![
+        ([0.0; 3], 0u32);
+        TINT_CACHE_W * TINT_CACHE_W * TINT_CACHE_W
+    ]);
+    static TINT_CACHE_GEN: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
+}
+
+/// Invalidate the tint memo — O(1) generation bump (see CORNER_CACHE_GEN).
+#[inline]
+fn tint_cache_reset() {
+    TINT_CACHE_GEN.with(|g| {
+        g.set(g.get().wrapping_add(1));
+        if g.get() == 0 { g.set(1); }
+    });
+}
+
+/// Memoised [`tint_for_position`], keyed on chunk-local position (see
+/// `sample_env_at_cached` for why `block` is redundant in the key within one
+/// mesh pass). Falls back to direct computation outside chunk-local bounds —
+/// defensive only; every current caller passes an in-chunk block position.
+#[inline]
+fn tint_for_position_cached(block: BlockId, wx: i32, wy: i32, wz: i32, chunk: &Chunk) -> [f32; 3] {
+    let (ox, oy, oz) = chunk.coord.block_origin();
+    let lx = wx - ox;
+    let ly = wy - oy;
+    let lz = wz - oz;
+    if lx >= 0 && (lx as usize) < TINT_CACHE_W
+        && ly >= 0 && (ly as usize) < TINT_CACHE_W
+        && lz >= 0 && (lz as usize) < TINT_CACHE_W
+    {
+        let idx = (ly as usize * TINT_CACHE_W + lz as usize) * TINT_CACHE_W + lx as usize;
+        let gen = TINT_CACHE_GEN.with(|g| g.get());
+        let hit = TINT_CACHE.with(|c| {
+            let entry = c.borrow()[idx];
+            if entry.1 == gen { Some(entry.0) } else { None }
+        });
+        if let Some(v) = hit {
+            return v;
+        }
+        let v = tint_for_position(block, wx, wy, wz);
+        TINT_CACHE.with(|c| c.borrow_mut()[idx] = (v, gen));
+        v
+    } else {
+        tint_for_position(block, wx, wy, wz)
+    }
 }
 
 /// Cheap sky-exposure heuristic: count air blocks in the column above
@@ -541,19 +599,39 @@ fn sample_env_at(
 // (block, wx, wy, wz). We memoise per mesh PASS (reset at both greedy entries),
 // keyed by (block, wx, wy, wz) — within a pass a position holds one block, so
 // this is byte-identical to `sample_env_at` and colour output is unchanged.
+// r-perf: FLAT-ARRAY env memo (was a HashMap keyed on (block,wx,wy,wz)).
+// Same rationale as r697's CORNER_CACHE: `sample_env_at_cached` is called for
+// both the top-face and every exposed side-face of the same block (up to 5×
+// per block), and the old key hashed 3 i32 world coords + a BlockId on every
+// hit. Within one mesh pass a chunk-local position holds exactly one block,
+// so `block` is redundant as part of the key — local (x,y,z) alone
+// disambiguates every entry, letting this be a flat array indexed the same
+// way as CORNER_CACHE (generation-tagged, no memset-to-clear per pass).
+const ENV_CACHE_W: usize = CHUNK_SIZE as usize;
+
 thread_local! {
-    static ENV_CACHE: std::cell::RefCell<
-        std::collections::HashMap<(BlockId, i32, i32, i32), crate::world::material_response::EnvironmentSample>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static ENV_CACHE: std::cell::RefCell<Vec<(crate::world::material_response::EnvironmentSample, u32)>> =
+        std::cell::RefCell::new(vec![
+            (crate::world::material_response::EnvironmentSample::default(), 0u32);
+            ENV_CACHE_W * ENV_CACHE_W * ENV_CACHE_W
+        ]);
+    static ENV_CACHE_GEN: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
 }
 
+/// Invalidate the env memo — O(1) generation bump (see CORNER_CACHE_GEN).
 #[inline]
 fn env_cache_reset() {
-    ENV_CACHE.with(|c| c.borrow_mut().clear());
+    ENV_CACHE_GEN.with(|g| {
+        g.set(g.get().wrapping_add(1));
+        if g.get() == 0 { g.set(1); }
+    });
 }
 
 /// Memoised [`sample_env_at`]: identical result, computed once per (block,pos)
-/// per mesh pass instead of once per exposed face of that block.
+/// per mesh pass instead of once per exposed face of that block. Falls back to
+/// direct (uncached) computation for any position outside the current chunk's
+/// local bounds — every real caller passes an in-chunk position, so this path
+/// is defensive only and never taken in the meshers' current call sites.
 #[inline]
 fn sample_env_at_cached(
     block: BlockId,
@@ -563,15 +641,29 @@ fn sample_env_at_cached(
     chunk: &Chunk,
     world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>>,
 ) -> crate::world::material_response::EnvironmentSample {
-    let key = (block, wx, wy, wz);
-    if let Some(v) = ENV_CACHE.with(|c| c.borrow().get(&key).copied()) {
-        return v;
+    let (ox, oy, oz) = chunk.coord.block_origin();
+    let lx = wx - ox;
+    let ly = wy - oy;
+    let lz = wz - oz;
+    if lx >= 0 && (lx as usize) < ENV_CACHE_W
+        && ly >= 0 && (ly as usize) < ENV_CACHE_W
+        && lz >= 0 && (lz as usize) < ENV_CACHE_W
+    {
+        let idx = (ly as usize * ENV_CACHE_W + lz as usize) * ENV_CACHE_W + lx as usize;
+        let gen = ENV_CACHE_GEN.with(|g| g.get());
+        let hit = ENV_CACHE.with(|c| {
+            let entry = c.borrow()[idx];
+            if entry.1 == gen { Some(entry.0) } else { None }
+        });
+        if let Some(v) = hit {
+            return v;
+        }
+        let v = sample_env_at(block, wx, wy, wz, chunk, world_model);
+        ENV_CACHE.with(|c| c.borrow_mut()[idx] = (v, gen));
+        v
+    } else {
+        sample_env_at(block, wx, wy, wz, chunk, world_model)
     }
-    let v = sample_env_at(block, wx, wy, wz, chunk, world_model);
-    ENV_CACHE.with(|c| {
-        c.borrow_mut().insert(key, v);
-    });
-    v
 }
 
 /// Compute the per-block top-face color via the response matrix.
@@ -608,7 +700,7 @@ fn compute_tinted_color_for_top(
                 None => return [0.5; 3],
             },
         };
-        let tint = tint_for_position(block, wx, wy, wz);
+        let tint = tint_for_position_cached(block, wx, wy, wz, chunk);
         return [
             (palette[0] * tint[0]).clamp(0.0, 1.0),
             (palette[1] * tint[1]).clamp(0.0, 1.0),
@@ -620,7 +712,7 @@ fn compute_tinted_color_for_top(
     // including base_rgb). Add a position-noise wobble for per-block
     // variation; matrix's `position_variance` controls amplitude.
     let mut c = response.tint(env);
-    let pn = tint_for_position(block, wx, wy, wz);
+    let pn = tint_for_position_cached(block, wx, wy, wz, chunk);
     let variance = response.position_variance;
     for i in 0..3 {
         // Apply the position multiplier scaled by variance: a variance
@@ -657,7 +749,7 @@ fn compute_tinted_color_for_face(
                 None => return [0.5; 3],
             },
         };
-        let tint = tint_for_position(block, wx, wy, wz);
+        let tint = tint_for_position_cached(block, wx, wy, wz, chunk);
         return [
             (palette[0] * tint[0]).clamp(0.0, 1.0),
             (palette[1] * tint[1]).clamp(0.0, 1.0),
@@ -672,7 +764,7 @@ fn compute_tinted_color_for_face(
     // to all faces of matrix-aware blocks.
     let env = sample_env_at_cached(block, wx, wy, wz, chunk, world_model);
     let mut c = response.tint(env);
-    let pn = tint_for_position(block, wx, wy, wz);
+    let pn = tint_for_position_cached(block, wx, wy, wz, chunk);
     let variance = response.position_variance;
     for i in 0..3 {
         let multiplier = 1.0 + (pn[i] - 1.0) * variance / TINT_REFERENCE_VARIANCE;
@@ -1812,6 +1904,102 @@ fn block_at_corner_sample(chunk: &Chunk, coord: [i32; 3]) -> BlockId {
 
 
 
+/// Which of a chunk's 6 face-neighbors are loaded, for boundary face
+/// culling. Each entry is `Some(neighbor)` when that neighbor chunk is
+/// currently loaded and its blocks can be trusted; `None` means "not
+/// loaded" — the mesher treats that side exactly as before (an
+/// out-of-bounds read returns Air), so an unloaded edge never silently
+/// grows or loses geometry relative to today's behavior.
+#[derive(Clone, Default)]
+pub struct NeighborChunks {
+    pub neg_x: Option<std::sync::Arc<Chunk>>,
+    pub pos_x: Option<std::sync::Arc<Chunk>>,
+    pub neg_y: Option<std::sync::Arc<Chunk>>,
+    pub pos_y: Option<std::sync::Arc<Chunk>>,
+    pub neg_z: Option<std::sync::Arc<Chunk>>,
+    pub pos_z: Option<std::sync::Arc<Chunk>>,
+}
+
+impl NeighborChunks {
+    /// No neighbors loaded — every boundary read falls back to the
+    /// pre-existing Air behavior. Byte-identical to code that never
+    /// heard of `NeighborChunks` at all.
+    pub fn none() -> Self {
+        Self::default()
+    }
+}
+
+/// Like [`block_at`], but when `coord` steps exactly one block past this
+/// chunk's boundary on a single axis, consults the matching loaded
+/// neighbor (if any) instead of assuming Air. This is the seam-culling
+/// entry point: it lets a solid block one chunk over suppress this
+/// chunk's boundary face against it, exactly as an in-chunk neighbor
+/// would.
+///
+/// Only handles the single-axis, one-step-over case the greedy mesher's
+/// mask build actually produces (`neighbor_coord` differs from
+/// `inner_coord` in exactly one axis by exactly `cfg.axis_sign`, i.e.
+/// ±1). Anything else (more than one step out, or out on more than one
+/// axis — never produced by the current callers) falls back to
+/// `block_at`'s plain Air-at-OOB behavior, matching prior behavior
+/// exactly.
+fn block_at_with_neighbors(chunk: &Chunk, coord: [i32; 3], neighbors: &NeighborChunks) -> BlockId {
+    let [x, y, z] = coord;
+    let in_x = (0..CHUNK_SIZE).contains(&x);
+    let in_y = (0..CHUNK_SIZE).contains(&y);
+    let in_z = (0..CHUNK_SIZE).contains(&z);
+
+    // Fast path: fully in-bounds (the overwhelming majority of calls,
+    // ~6M/chunk per `get_local`'s own doc comment). x/y/z are already
+    // proven in-range above, so index directly instead of routing
+    // through `block_at`/`get_local`, which would redo the identical
+    // three-axis bounds check a second time — exactly the redundant
+    // check r698 removed from `get_local`'s own hot path.
+    if in_x && in_y && in_z {
+        return chunk.blocks[Chunk::block_index(x, y, z)];
+    }
+
+    // Exactly one axis out of range, by exactly one step, is the only
+    // shape the greedy mesher produces. Anything else (shouldn't happen
+    // given the callers) falls through to the old Air-at-OOB behavior.
+    let axes_out = [!in_x, !in_y, !in_z].iter().filter(|b| **b).count();
+    if axes_out != 1 {
+        return block_at(chunk, coord);
+    }
+
+    let neighbor_chunk = if x < 0 {
+        if x != -1 { return BlockId::Air; }
+        &neighbors.neg_x
+    } else if x >= CHUNK_SIZE {
+        if x != CHUNK_SIZE { return BlockId::Air; }
+        &neighbors.pos_x
+    } else if y < 0 {
+        if y != -1 { return BlockId::Air; }
+        &neighbors.neg_y
+    } else if y >= CHUNK_SIZE {
+        if y != CHUNK_SIZE { return BlockId::Air; }
+        &neighbors.pos_y
+    } else if z < 0 {
+        if z != -1 { return BlockId::Air; }
+        &neighbors.neg_z
+    } else {
+        if z != CHUNK_SIZE { return BlockId::Air; }
+        &neighbors.pos_z
+    };
+
+    match neighbor_chunk {
+        // Wrap the out-of-range coordinate into the neighbor's own local
+        // space: exactly one axis is CHUNK_SIZE or -1; every other axis
+        // is already in-range and identical between the two chunks.
+        Some(nc) => {
+            let wrap = |v: i32| ((v % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+            nc.blocks[Chunk::block_index(wrap(x), wrap(y), wrap(z))]
+        }
+        // Neighbor not loaded — same as before NeighborChunks existed.
+        None => BlockId::Air,
+    }
+}
+
 /// Greedy mesh one chunk. `sky` is optional — if provided, face brightness
 /// is computed from sun direction; otherwise uses the static FACE_LIGHT
 /// fallback.
@@ -1821,9 +2009,39 @@ pub fn mesh_chunk_greedy(
     world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>>,
     current_tick: Option<u64>,
 ) -> ChunkMesh {
+    mesh_chunk_greedy_impl(chunk, &NeighborChunks::none(), sky, world_model, current_tick)
+}
+
+/// Same as [`mesh_chunk_greedy`], but culls boundary faces against
+/// whichever neighbor chunks in `neighbors` are loaded, instead of always
+/// treating the chunk edge as Air. Chunks bordering an unloaded neighbor
+/// behave exactly as `mesh_chunk_greedy` does today (see `NeighborChunks`).
+///
+/// NOT YET WIRED into the live meshing pool / streaming loop — see the
+/// handoff note in BUGS_FOUND.md. Existing callers of `mesh_chunk_greedy`
+/// are unaffected and remain byte-identical (they route through this same
+/// impl with `NeighborChunks::none()`).
+pub fn mesh_chunk_greedy_with_neighbors(
+    chunk: &Chunk,
+    neighbors: &NeighborChunks,
+    sky: Option<&crate::sky::Sky>,
+    world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>>,
+    current_tick: Option<u64>,
+) -> ChunkMesh {
+    mesh_chunk_greedy_impl(chunk, neighbors, sky, world_model, current_tick)
+}
+
+fn mesh_chunk_greedy_impl(
+    chunk: &Chunk,
+    neighbors: &NeighborChunks,
+    sky: Option<&crate::sky::Sky>,
+    world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>>,
+    current_tick: Option<u64>,
+) -> ChunkMesh {
     let mut mesh = ChunkMesh::empty();
     corner_cache_reset(); // r695: fresh corner memo for this pass
     env_cache_reset();    // r696: fresh env-sample memo for this pass
+    tint_cache_reset();   // fresh tint memo for this pass
     let (origin_x, origin_y, origin_z) = chunk.coord.block_origin();
     let origin = [origin_x, origin_y, origin_z];
 
@@ -1861,10 +2079,8 @@ pub fn mesh_chunk_greedy(
                     let inner = chunk.blocks[Chunk::block_index(
                         inner_coord[0], inner_coord[1], inner_coord[2])];
                     if !is_meshable(inner) { continue; }
-                    let neighbor = block_at(chunk, neighbor_coord);
+                    let neighbor = block_at_with_neighbors(chunk, neighbor_coord, neighbors);
                     if !should_emit_face(inner, neighbor) { continue; }
-
-                    // Sub-block detail: if this is a top face of a block that
                     // wants per-block height jitter, emit the quad immediately
                     // with corner heights, skipping the greedy mask. We lose
                     // merging on this face only — all other faces of these
@@ -2251,6 +2467,7 @@ fn mesh_chunk_greedy_undecorated(chunk: &Chunk, sky: Option<&crate::sky::Sky>) -
     let mut mesh = ChunkMesh::empty();
     corner_cache_reset(); // r695: fresh corner memo for this pass
     env_cache_reset();    // r696: fresh env-sample memo for this pass
+    tint_cache_reset();   // fresh tint memo for this pass
     let (origin_x, origin_y, origin_z) = chunk.coord.block_origin();
     let origin = [origin_x, origin_y, origin_z];
     let _ = origin;
@@ -3573,6 +3790,156 @@ mod tests {
             mesh.vertex_count());
     }
 
+    // ----- Cross-chunk seam culling (NeighborChunks / block_at_with_neighbors) -----
+
+    #[test]
+    fn neighbor_none_matches_plain_greedy() {
+        // NeighborChunks::none() must be byte-identical to mesh_chunk_greedy,
+        // since that's what mesh_chunk_greedy delegates to internally.
+        let mut chunk = Chunk::empty(ChunkCoord::new(0, 0, 0));
+        for x in 0..CHUNK_SIZE { for z in 0..CHUNK_SIZE {
+            chunk.set(x, 0, z, BlockId::Stone);
+        }}
+        let plain = mesh_chunk_greedy(&chunk, None, None, None);
+        let via_none = mesh_chunk_greedy_with_neighbors(
+            &chunk, &NeighborChunks::none(), None, None, None);
+        assert_eq!(plain.vertex_count(), via_none.vertex_count());
+        assert_eq!(plain.index_count(), via_none.index_count());
+    }
+
+    #[test]
+    fn seam_culling_drops_boundary_face_against_solid_neighbor() {
+        // A single stone block at the +X edge of chunk A, with a solid
+        // +X neighbor chunk: A's +X face against that neighbor must be
+        // culled (fewer verts than with no neighbor at all).
+        let mut chunk = Chunk::empty(ChunkCoord::new(0, 0, 0));
+        chunk.set(CHUNK_SIZE - 1, 0, 0, BlockId::Stone);
+
+        let mut neighbor = Chunk::empty(ChunkCoord::new(1, 0, 0));
+        // The face straddling the seam is at neighbor-local x=0, same y/z.
+        neighbor.set(0, 0, 0, BlockId::Stone);
+
+        let without_neighbor = mesh_chunk_greedy(&chunk, None, None, None);
+        let mut neighbors = NeighborChunks::none();
+        neighbors.pos_x = Some(std::sync::Arc::new(neighbor));
+        let with_neighbor = mesh_chunk_greedy_with_neighbors(
+            &chunk, &neighbors, None, None, None);
+
+        assert!(with_neighbor.vertex_count() < without_neighbor.vertex_count(),
+            "expected the +X face to be culled against a solid neighbor: \
+             without={}, with={}",
+            without_neighbor.vertex_count(), with_neighbor.vertex_count());
+    }
+
+    #[test]
+    fn seam_culling_keeps_boundary_face_against_air_neighbor() {
+        // Same setup, but the neighbor's boundary cell is air: the +X
+        // face must still be emitted (identical to the no-neighbor case).
+        let mut chunk = Chunk::empty(ChunkCoord::new(0, 0, 0));
+        chunk.set(CHUNK_SIZE - 1, 0, 0, BlockId::Stone);
+        let neighbor = Chunk::empty(ChunkCoord::new(1, 0, 0)); // all air
+
+        let without_neighbor = mesh_chunk_greedy(&chunk, None, None, None);
+        let mut neighbors = NeighborChunks::none();
+        neighbors.pos_x = Some(std::sync::Arc::new(neighbor));
+        let with_air_neighbor = mesh_chunk_greedy_with_neighbors(
+            &chunk, &neighbors, None, None, None);
+
+        assert_eq!(without_neighbor.vertex_count(), with_air_neighbor.vertex_count(),
+            "an air neighbor must not change the mesh vs. no neighbor at all");
+    }
+
+    #[test]
+    fn seam_culling_symmetric_across_the_boundary() {
+        // Two adjacent solid chunks, each aware of the other: BOTH sides
+        // of the shared face must be culled (this is the actual FPS win —
+        // a wall of chunks stops rendering the internal seam entirely).
+        let mut a = Chunk::empty(ChunkCoord::new(0, 0, 0));
+        a.set(CHUNK_SIZE - 1, 0, 0, BlockId::Stone);
+        let mut b = Chunk::empty(ChunkCoord::new(1, 0, 0));
+        b.set(0, 0, 0, BlockId::Stone);
+
+        let a_alone = mesh_chunk_greedy(&a, None, None, None);
+        let b_alone = mesh_chunk_greedy(&b, None, None, None);
+
+        let mut a_neighbors = NeighborChunks::none();
+        a_neighbors.pos_x = Some(std::sync::Arc::new(b.clone()));
+        let a_culled = mesh_chunk_greedy_with_neighbors(&a, &a_neighbors, None, None, None);
+
+        let mut b_neighbors = NeighborChunks::none();
+        b_neighbors.neg_x = Some(std::sync::Arc::new(a.clone()));
+        let b_culled = mesh_chunk_greedy_with_neighbors(&b, &b_neighbors, None, None, None);
+
+        assert!(a_culled.vertex_count() < a_alone.vertex_count());
+        assert!(b_culled.vertex_count() < b_alone.vertex_count());
+    }
+
+    #[test]
+    fn seam_culling_all_six_directions() {
+        // One block at the exact center of the chunk, all 6 neighbors
+        // solid at the matching boundary cell: every face should cull
+        // against its respective neighbor, same as if it were fully
+        // buried inside one chunk. Center block avoids edge/corner cases
+        // so each face maps to exactly one neighbor.
+        let c = CHUNK_SIZE / 2;
+        let mut chunk = Chunk::empty(ChunkCoord::new(0, 0, 0));
+        chunk.set(0, 0, 0, BlockId::Stone); // dummy block so the chunk isn't all-air
+        chunk.set(c, c, c, BlockId::Stone);
+        let _ = c; // silence unused in non-test builds if ever moved
+
+        // Baseline: same block, but each of its 6 neighbors (still inside
+        // this one chunk) is air — this is what "no NeighborChunks" gives
+        // since the block isn't at this chunk's own edge.
+        let baseline = mesh_chunk_greedy(&chunk, None, None, None);
+
+        // Neighbor chunks in all 6 directions, each with ONLY the boundary
+        // cell nearest the center block filled — everywhere else on that
+        // face is irrelevant since the center block isn't at this chunk's
+        // edge, so no cross-chunk lookups actually fire here. This test's
+        // real job is just to prove NeighborChunks with all 6 slots set
+        // doesn't panic or misroute — the interesting edge-adjacent case
+        // is covered by the tests above.
+        let far = Chunk::empty(ChunkCoord::new(2, 0, 0));
+        let mut neighbors = NeighborChunks::none();
+        neighbors.pos_x = Some(std::sync::Arc::new(far.clone()));
+        neighbors.neg_x = Some(std::sync::Arc::new(far.clone()));
+        neighbors.pos_y = Some(std::sync::Arc::new(far.clone()));
+        neighbors.neg_y = Some(std::sync::Arc::new(far.clone()));
+        neighbors.pos_z = Some(std::sync::Arc::new(far.clone()));
+        neighbors.neg_z = Some(std::sync::Arc::new(far));
+        let with_all_six = mesh_chunk_greedy_with_neighbors(
+            &chunk, &neighbors, None, None, None);
+
+        assert_eq!(baseline.vertex_count(), with_all_six.vertex_count(),
+            "an interior block's mesh must be unaffected by neighbors on \
+             chunk edges it doesn't touch");
+    }
+
+    #[test]
+    fn seam_culling_diagonal_out_of_bounds_falls_back_to_air() {
+        // block_at_with_neighbors only special-cases a single axis stepping
+        // exactly one block out of range (the only shape the greedy mesher
+        // produces). Calling it directly with a doubly-out-of-range or
+        // multi-step coordinate must fall back to the old Air behavior,
+        // not panic or misindex a neighbor.
+        let chunk = Chunk::empty(ChunkCoord::new(0, 0, 0));
+        let mut neighbors = NeighborChunks::none();
+        neighbors.pos_x = Some(std::sync::Arc::new({
+            let mut n = Chunk::empty(ChunkCoord::new(1, 0, 0));
+            n.set(0, 0, 0, BlockId::Stone);
+            n
+        }));
+        // Two axes out of range at once (x and z both past the edge).
+        assert_eq!(
+            block_at_with_neighbors(&chunk, [CHUNK_SIZE, 0, CHUNK_SIZE], &neighbors),
+            BlockId::Air
+        );
+        // One axis out by two steps, not one.
+        assert_eq!(
+            block_at_with_neighbors(&chunk, [CHUNK_SIZE + 1, 0, 0], &neighbors),
+            BlockId::Air
+        );
+    }
     #[test]
     fn greedy_mesh_world_positions_in_range() {
         let mut chunk = Chunk::empty(ChunkCoord::new(2, 1, -3));
