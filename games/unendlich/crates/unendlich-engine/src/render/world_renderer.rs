@@ -1566,7 +1566,29 @@ impl WorldRenderer {
             #[cfg(feature = "ui-overlay")]
             creative_selected: 0,
             #[cfg(feature = "ui-overlay")]
-            creative_hotbar: [None; 10],
+            // r-weapon-fix: was `[None; 10]` — an empty creative hotbar meant
+            // a fresh session had NOTHING to place until you opened the
+            // inventory panel and dragged items in by hand. Now that scroll/
+            // number-keys read this array directly instead of the old
+            // PLACE_PALETTE constant (see apply_creative_hotbar_slot in
+            // unendlich_fullgame.rs), it needs the same "useful blocks
+            // immediately on launch" starter set PLACE_PALETTE used to
+            // provide, just living in the real, visible hotbar instead of a
+            // disconnected shadow copy. Slot 9 (the 10th, unreachable by the
+            // 1-9 number keys) starts empty — reachable via scroll or a
+            // panel drag, same as before this fix for that specific slot.
+            creative_hotbar: [
+                Some(crate::item::ItemKind::Block(crate::world::blocks::BlockId::Stone)),
+                Some(crate::item::ItemKind::Block(crate::world::blocks::BlockId::Dirt)),
+                Some(crate::item::ItemKind::Block(crate::world::blocks::BlockId::Cobblestone)),
+                Some(crate::item::ItemKind::Block(crate::world::blocks::BlockId::OakLog)),
+                Some(crate::item::ItemKind::Block(crate::world::blocks::BlockId::OakLeaves)),
+                Some(crate::item::ItemKind::Block(crate::world::blocks::BlockId::Sand)),
+                Some(crate::item::ItemKind::Block(crate::world::blocks::BlockId::Glass)),
+                Some(crate::item::ItemKind::Block(crate::world::blocks::BlockId::OakPlanks)),
+                Some(crate::item::ItemKind::Block(crate::world::blocks::BlockId::Water)),
+                None,
+            ],
             #[cfg(feature = "ui-overlay")]
             creative_inventory: [None; 27],
             #[cfg(feature = "ui-overlay")]
