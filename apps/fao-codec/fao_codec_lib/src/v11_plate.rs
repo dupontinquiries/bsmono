@@ -1640,6 +1640,76 @@ fn deblock(f: &mut Yuv420, modes: &[u8], gw: usize, gh: usize, dz: f32, strength
     let step_thr = (dz * 0.75).clamp(4.0, 48.0) as i32;
     let flat_thr = (dz * 0.375).clamp(2.0, 24.0) as i32;
     let src = f.y.clone();
+    // PER-REGION TEXTURE, and the reason the filter needs it: the
+    // strength sweep found 2 right on synthetic content and 1 right on
+    // real footage, so no single number fits — and shipping one anyway
+    // is the fixed-threshold mistake this codec has now made three
+    // times (MV rate charge, DICT_MARGIN, mover admission). But a clip
+    // is not uniform either: the same frame holds flat sky, where
+    // blocking is glaring and there is no detail to lose, and textured
+    // ground, where blocking is masked and real detail is at risk. So
+    // the strength is derived per region rather than per clip.
+    //
+    // The measure is a cheap stand-in for spectral_probe's HF fraction:
+    // mean |second difference| over mean |first difference|. A smooth
+    // ramp has small curvature relative to its slope; noise has large.
+    // Full 4x4 DCTs per region per frame would be the exact statistic
+    // and cost far more than the filter itself.
+    let mut texture = vec![0.0f32; gw * gh];
+    for gy in 0..gh {
+        for gx in 0..gw {
+            let (rx, ry) = (gx * REGION, gy * REGION);
+            let (mut d1, mut d2, mut n) = (0.0f64, 0.0f64, 0u32);
+            for ly in 0..REGION {
+                let y = (ry + ly).min(h - 1);
+                for lx in 1..REGION - 1 {
+                    let x = (rx + lx).min(w - 2).max(1);
+                    let a = src[y * w + x - 1] as i32;
+                    let b = src[y * w + x] as i32;
+                    let c = src[y * w + x + 1] as i32;
+                    d1 += (b - a).abs() as f64;
+                    d2 += (c - 2 * b + a).abs() as f64;
+                    n += 1;
+                }
+            }
+            let _ = n;
+            texture[gy * gw + gx] = if d1 < 1e-6 { 0.0 } else { (d2 / d1) as f32 };
+        }
+    }
+    // Map texture to a strength multiplier. Flat regions (ratio near 0)
+    // get the full requested strength; textured regions are damped
+    // toward zero. The 1.4 pivot is read off this corpus and is a
+    // BRACKET, not a tuned constant: smooth ramps measured well under
+    // 1.0 and noise well above 2.0, so anything in between is the
+    // uncertain middle and gets an interpolated strength rather than a
+    // hard decision.
+    //
+    // MEASURED SPLIT, and it contradicted the premise above on one of
+    // the two clips. On blackstar (real footage) the adaptive rule is
+    // the best setting found — 35.681 dB / 0.9751 against 35.619 /
+    // 0.9750 unfiltered and 35.591 for fixed strength 2 — because there
+    // IS real detail to protect and damping protects it. On the
+    // procedural-ground clip it is WORSE than fixed: P=16 blocking 3.80
+    // adaptive against 1.91 fixed, at lower PSNR. That clip is
+    // ENTIRELY texture, so every region damps to the floor and the
+    // artifact survives.
+    //
+    // The lesson is that reconstructed texture cannot distinguish
+    // "detail I must protect" from "noise whose blocking I must fix" —
+    // both look like high curvature. Blocking comes from QUANTISATION,
+    // so the discriminating signal is how hard each block was
+    // quantised, which the encoder holds in its per-block scale bytes
+    // and which this filter does not yet read. That is the named next
+    // construction; until then both behaviours stay reachable rather
+    // than one being guessed as universal.
+    let adaptive = std::env::var("FAO_DEBLOCK_FIXED").is_err();
+    let region_scale = |gi: usize| -> f32 {
+        if !adaptive {
+            return 1.0;
+        }
+        let t = texture.get(gi).copied().unwrap_or(1.0);
+        ((1.9 - t) / 1.4).clamp(0.15, 1.0)
+    };
     let strength_at = |ga: usize, gb: usize| -> i32 {
         if modes.get(ga) != modes.get(gb) { 2 } else { 1 }
     };
@@ -1668,7 +1738,8 @@ fn deblock(f: &mut Yuv420, modes: &[u8], gw: usize, gh: usize, dz: f32, strength
             // fraction set by strength. Deliberately narrow (2 taps a
             // side) — a wide filter on a 4x4 grid would blur more than
             // it repairs.
-            let d = (q0 - p0) * st * strength / 8;
+            let sc = region_scale(gy * gw + gx);
+            let d = (((q0 - p0) * st * strength) as f32 * sc / 8.0) as i32;
             f.y[y * w + x - 1] = (p0 + d).clamp(0, 255) as u8;
             f.y[y * w + x] = (q0 - d).clamp(0, 255) as u8;
         }
@@ -1697,7 +1768,8 @@ fn deblock(f: &mut Yuv420, modes: &[u8], gw: usize, gh: usize, dz: f32, strength
             } else {
                 1
             };
-            let d = (q0 - p0) * st * strength / 8;
+            let sc = region_scale(gy * gw + gx);
+            let d = (((q0 - p0) * st * strength) as f32 * sc / 8.0) as i32;
             f.y[(y - 1) * w + x] = (p0 + d).clamp(0, 255) as u8;
             f.y[y * w + x] = (q0 - d).clamp(0, 255) as u8;
         }

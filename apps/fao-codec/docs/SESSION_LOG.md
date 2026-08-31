@@ -5413,3 +5413,53 @@ AV1 is 2.2x smaller AND 2.6 dB better — slightly worse for v11 than the
 preset-6 comparison said. Both verdicts stand and the split between
 them is unchanged: the model wins where MC cannot reach the content,
 loses where it can.
+
+### Texture-adaptive deblock strength: right on real footage, WRONG on synthetic — and the premise was backwards
+
+The filter had no default because strength 2 measured right on
+synthetic content and 1 on real footage. Rather than pick a number
+(the fixed-threshold mistake this codec has made three times), the
+strength is now derived PER REGION from local texture — mean |second
+difference| over mean |first difference|, a cheap stand-in for
+spectral_probe's HF fraction. Premise: flat regions show blocking
+glaringly and have no detail to lose, so filter them hard; textured
+regions mask blocking and risk real detail, so damp.
+
+Measured, and the two clips disagree:
+
+  blackstar (real footage), dz32
+    off            332,841 B @ 35.619 dB / 0.97502   P16 1.419
+    fixed s1       331,432 B @ 35.616   / 0.97500    P16 1.341
+    fixed s2       337,810 B @ 35.591   / 0.97491    P16 1.219
+    ADAPTIVE s2    333,439 B @ 35.681   / 0.97506    P16 1.344
+    -> best PSNR AND best SSIM of any setting tried, for +0.2% bytes
+
+  procedural ground, dz32
+    off            227,533 B @ 31.536 / 0.8656   P16 4.642
+    fixed s2       227,899 B @ 31.652 / 0.8715   P16 1.909
+    ADAPTIVE s2    227,599 B @ 31.572 / 0.8677   P16 3.802
+    ADAPTIVE s4    227,333 B @ 31.616 / 0.8686   P16 3.117
+    -> WORSE than fixed on every axis that matters
+
+THE PREMISE IS BACKWARDS ON THE SECOND CLIP. That clip is entirely
+texture, so every region damps to the floor and the artifact survives —
+and filtering the textured regions is precisely what had helped, since
+their blocking was real error rather than protected detail. The
+adaptive rule cannot tell "detail I must protect" from "noise whose
+blocking I must fix", because reconstructed texture looks identical in
+both cases.
+
+The discriminating signal is available and I named it in the filter's
+own header without using it: blocking comes from QUANTISATION, so what
+separates the two cases is how hard each block was quantised, which the
+encoder holds in its per-block scale bytes. A block quantised coarsely
+in a flat area is an artifact; high curvature in a finely-quantised
+block is content. Reading the scale bytes is the named next
+construction.
+
+Until then both behaviours stay reachable — FAO_DEBLOCK=<strength> is
+adaptive, FAO_DEBLOCK_FIXED=1 restores uniform strength (verified
+byte-identical to the earlier fixed measurement, 227,899 B and P16
+1.909) — because one of them is right on real footage and the other on
+synthetic, and guessing which the caller has is exactly the mistake
+this entry exists to avoid repeating.
