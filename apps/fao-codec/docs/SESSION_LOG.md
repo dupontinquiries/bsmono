@@ -4818,3 +4818,53 @@ worse, because AV1's own keyframe cost amortises over the longer GOP
 as well. Amortisation is real and it is NOT differential: both coders
 get it, so it narrows the gap in absolute per-frame terms without
 changing who wins.
+
+### Cross-GOP citation on engine content: it fails, and the reason is structural
+
+The floor analysis concluded that GOP-length amortisation is NOT
+differential (AV1's keyframe amortises too), so v11's win has to come
+from a plate predicting content a keyframe cannot — i.e. reuse ACROSS
+GOPs. blackstar is the best case that has ever been available for
+testing that: engine-rendered (no grain decorrelation, which is what
+sank the film citation experiments), a fixed arena, and the same set
+recurring across 100 seconds.
+
+Canonical saved from GOP A (t=12), cited by later GOPs at dz32:
+
+  GOP B (t=40)     self  384,979 B @ 35.542 dB
+                   cited 331,885 B @ 31.160 dB
+                   -> -13.8% bytes for -4.38 dB = 12 KB/dB
+  GOP NEAR (t=12.8) self  405,701 B @ 35.581 dB
+                   cited 317,472 B @ 32.799 dB
+                   -> -21.8% bytes for -2.78 dB = 32 KB/dB
+  GOP C (t=68)     cited 572,087 B @ 32.982 dB  (worse than either)
+against blackstar's own dead-zone ladder at 244 KB/dB. Every citation
+is a 7-20x worse exchange than simply coarsening the quantiser, so
+citation LOSES at matched quality — the same verdict as film, on the
+content type that was supposed to fix it.
+
+The control is what makes this a structural finding rather than a
+tuning one. The NEAR GOP is 0.8 seconds after the canonical and cites
+almost three times better than the one 28 seconds later (32 vs
+12 KB/dB), and still loses. So citation quality decays with VIEWPOINT
+DISTANCE, and the mechanism is that a 2D plate is viewpoint-locked by
+construction: it is a translation-aligned temporal median, so it can
+only serve a camera standing roughly where the donor stood. In a game
+with a free 3D camera that condition almost never holds across GOPs.
+
+This closes the loop on the session's other findings rather than being
+a separate result. The marginal-cost thesis needs cross-GOP reuse; a
+2D plate cannot provide it because it cannot be re-rendered from a new
+viewpoint; a 3D canonical CAN, which is precisely why the 3D branch
+matters and precisely what has failed on every clip for a different
+reason (bloopers: no parallax; Minecraft: pose model missing the
+forward axis; blackstar: phase correlation finds no peak on gradients,
+now fixed by pose-from-tracks). The honest statement is that v11's 2D
+path has now been measured to its ceiling, and the remaining thesis
+value is entirely in geometry the codec cannot yet recover.
+
+The one path that sidesteps reconstruction is this repo's own game:
+blackstar-rs is in games/, so its canonical could be built from engine
+assets and its camera pose read from the game rather than inferred.
+That is the only configuration in which the citation thesis has not
+yet been given a fair test.
