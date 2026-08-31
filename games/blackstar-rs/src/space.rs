@@ -797,3 +797,48 @@ mod gravity_wiring_tests {
         assert!(!src.contains(&stale), "a hardcoded reference is still live in world.rs");
     }
 }
+
+#[cfg(test)]
+mod far_plane_tests {
+    use super::*;
+    use crate::camera::Camera;
+
+    /// The far plane must reach the far side of the field, with margin.
+    ///
+    /// NOT wired the other way round on purpose. `far_plane_for(210)` is 525
+    /// and `Camera::FAR_M` is 2600 — deliberately generous, because the other
+    /// 35 maps are not asteroid fields and clipping their scenery to 525 m
+    /// would be a visible regression to fix an invisible one. So this asserts
+    /// the RELATIONSHIP instead of imposing the value.
+    ///
+    /// What it catches is the thing that will actually happen: someone scales
+    /// the field toward planet size, the far plane stays 2600, and the far
+    /// half of the field silently clips. That failure is quiet on a desktop
+    /// with a big monitor and obvious to a player, which is the worst
+    /// combination and the reason it is worth a test at all.
+    #[test]
+    fn the_far_plane_can_see_the_whole_field() {
+        let need = far_plane_for(CURRENT_REACH_M);
+        assert!(
+            need <= Camera::FAR_M,
+            "the field reaches {CURRENT_REACH_M} m, which needs a {need:.0} m far plane, \
+             and the camera stops at {:.0} m — the far side of the field is clipped",
+            Camera::FAR_M
+        );
+    }
+
+    #[test]
+    fn scaling_the_field_up_is_what_breaks_it() {
+        // Prove the guard above can fail, or it is decoration. A field scaled
+        // to even a modest planet radius outruns a fixed far plane fast.
+        let planetary = far_plane_for(CURRENT_REACH_M * 10.0);
+        assert!(
+            planetary > Camera::FAR_M,
+            "a 10x field still fits inside the far plane ({planetary:.0} vs {:.0}) — \
+             the check above cannot fail and is measuring nothing",
+            Camera::FAR_M
+        );
+        // and the margin is a real margin, not a rounding accident
+        assert!(far_plane_for(100.0) > 100.0 * 2.0, "far_plane_for has lost its margin");
+    }
+}

@@ -154,6 +154,58 @@ environment the artifact does not ship*.
   still missing from the C original. Never enumerated. Someone should
   diff the two shader sets and list what is actually absent.
 
+## 2j. Replacing the inherited maps with planets — state of play
+
+The 36 `MapStyle`s came from skydribble and the operator has said they
+are no longer useful here (KUIPER keeps its physics, WYRMFIRE its
+lighting; both stay available in skydribble for testing). Replacing them
+with procedurally generated planets — invented systems and Sol — is the
+direction. What is built, and what is blocked:
+
+**Built.**
+- `planetlook.rs` — a planet's palette DERIVED from its physics: star
+  blackbody, Rayleigh against atmospheric pressure, published surface
+  albedos, insolation. `SOL` carries Earth's system at real numbers
+  beside `from_seed` for invented ones, the same real-beside-procedural
+  split `exoworlds.rs` already uses. Audited: a thousand random seeds
+  must all clear `valuestruct::MIN_STOPS`, which is the property a
+  generator has to hold that a hand table only had to pass once.
+- Angular LOD, wired (`d62e255a`). Was `d2 > 90²` for every shape
+  whatever its size.
+- Rescale-safe gravity, wired (`7da50dd4`). Was a literal reference that
+  silently collapses every well to the clamp at planet scale.
+
+**Blocked on a runtime, NOT on effort.**
+- **C13-2j-1 — the floor under KUIPER.** `space.rs`'s third coupled
+  change. Terrain is an always-present heightmap (`d = p.y -
+  terrain_h`), so `amp: 0.15` gives an asteroid field a near-flat
+  infinite plane. Filling the grid with a sentinel low value would make
+  both the Rust SDF and the shader skip it with no shader change — but
+  `ground_h` has **72 call sites** across spawning, camera clamps, bot
+  pathing and physics, and every one would silently do something absurd.
+  The shader's `skip_ter` is a hardcoded ray optimisation (`p.y > 17.0`),
+  not a per-style flag, and hiding a floor the physics still collides
+  with is worse than a visible one. This wants a decision about what
+  "ungrounded" means for those 72 consumers, and play-testing.
+- **C13-2j-2 — the far plane.** `far_plane_for` stays uncalled on
+  purpose: it returns 525 m for today's field against `Camera::FAR_M`'s
+  2600, and clipping the other 35 maps to 525 to fix an invisible
+  problem is a regression. A guard now asserts the RELATIONSHIP instead,
+  and fails when the field is scaled up without the far plane following.
+
+**Blocked on the operator.** Two questions, asked twice, still open:
+which KUIPER behaviour is the keeper (anchored worlds with real gravity
+wells, or the five-minute black-hole collapse), and whether Sol should
+use real orbital elements — `exoworlds.rs` establishes that a named body
+uses catalogued numbers rather than a roll, which argues yes.
+
+**Unexplained.** WYRMFIRE's frame rate. The blend-clustering hypothesis
+was measured and disproved (cluster 7, mid-table; PERPLEXUS is 19).
+Standing candidates, all unverified: `glow: 0.75`, the highest in the
+table, with five emissive-0.95 lava decks. Its `wet` is 0.22, now under
+`DRY_GROUND`, so the Fresnel fix already stopped it tracing the ground —
+re-measure before hunting further.
+
 ## 3. Performance: 60 fps on an M2 Ultra against a 240 target
 
 The terrain half is addressed (§2, dry maps stop tracing). The rest is
