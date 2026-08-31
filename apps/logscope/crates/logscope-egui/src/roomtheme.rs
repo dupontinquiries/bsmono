@@ -37,19 +37,18 @@ use egui::Color32;
 
 /// WCAG relative luminance. The sRGB gamma expansion matters: a naive `(r+g+b)/3` rates mid-blue
 /// and mid-yellow as equally bright, and the eye does not.
+///
+/// Delegates to `palette`, which had this arithmetic first. I wrote a second copy here and the
+/// repo's `dupscan` ratchet flagged it — `contrast` defined in both modules — which is the same
+/// two-copies-of-one-predicate defect I spent the session finding in other people's code. One
+/// implementation now; the two callers differ only in their colour type.
 pub fn luminance(c: Color32) -> f32 {
-    let f = |v: u8| {
-        let s = v as f32 / 255.0;
-        if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
-    };
-    0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
+    crate::palette::luminance_rgb(c.r(), c.g(), c.b())
 }
 
 /// WCAG contrast ratio, 1.0 (identical) to 21.0 (black on white).
 pub fn contrast(a: Color32, b: Color32) -> f32 {
-    let (x, y) = (luminance(a), luminance(b));
-    let (hi, lo) = if x > y { (x, y) } else { (y, x) };
-    (hi + 0.05) / (lo + 0.05)
+    crate::palette::contrast_lum(luminance(a), luminance(b))
 }
 
 /// The floor every derived palette must clear for body text against its panel.

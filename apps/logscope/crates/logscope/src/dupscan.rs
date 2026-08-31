@@ -425,7 +425,30 @@ mod live_tests {
         // fields and different semantics. The test was not run in c9 (only
         // crypto-kit tests were rerun), so the drift was invisible until c10
         // ran the full suite.
-        const CEILING: usize = 353;
+        // 379, raised from 353 for the c13 session's new logscope-egui modules:
+        // phase_guide, plancheck, planrun, oracle, engprofile, roomtheme,
+        // nodetint, navkeys, prefs, branchshape, fmapath. They add collision
+        // keys like Branch, Outcome, Profile, Tag, Verdict, all, audit,
+        // branches, from_key, cancel — short names that a new module in a tree
+        // this size can hardly avoid, and in every case checked the two types
+        // carry different fields and different semantics.
+        //
+        // ONE OF THEM WAS NOT NAME-SHARING, which is exactly what this ratchet
+        // is for. `contrast` appeared in both `palette` and `roomtheme`: the
+        // same WCAG arithmetic written twice, by me, in the same crate, during
+        // a session spent finding that defect in other people's code. The two
+        // copies had already diverged on the sRGB linearisation threshold
+        // (0.03928 against 0.04045). Unified onto `palette`'s channel-based
+        // core before this ceiling was raised — the raise covers the
+        // name-sharing, not that.
+        //
+        // The reason it went unseen for a dozen commits: this crate's suite was
+        // never run. Three of logscope's four crates were being tested each
+        // time (logscope-egui, logscope-fan, gpu-gemm) and `-p logscope` was
+        // not among them, so the ratchet fired into an empty room. The same
+        // shape as the tools' scope problem one directory over: what is not
+        // measured is not measured, however green everything else looks.
+        const CEILING: usize = 379;
         assert!(d.len() <= CEILING,
             "{} duplicate names, ceiling {CEILING}. A new one appeared — either two ideas sharing a \
 name, which is fine and wants the ceiling raised deliberately, or one idea implemented twice, which \
