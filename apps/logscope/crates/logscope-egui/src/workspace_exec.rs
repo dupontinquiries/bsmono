@@ -218,6 +218,24 @@ impl Workspace {
         self.allow = bins.iter().map(|s| s.to_string()).collect();
         self
     }
+    /// ADD to the allowlist rather than replacing it.
+    ///
+    /// The allowlist exists to constrain what the MODEL can run. A verify command is the operator's
+    /// configuration, not the model's choice, and before this it was gated by the same list — so a
+    /// project whose suite is `make test`, `pytest`, `just check` or a shell script got
+    /// "command not allowed" as its check output on every single turn, forever, with the run
+    /// unable to finish because the gate can never go green. The same structural shape as running
+    /// `cargo check` where there is no Cargo.toml.
+    pub fn allow_also<I: IntoIterator<Item = S>, S: Into<String>>(mut self, bins: I) -> Self {
+        for b in bins {
+            let b = b.into();
+            // basename, matching how `run` gates: a configured `/usr/bin/make` must allow `make`.
+            let base = Path::new(&b).file_name().and_then(|s| s.to_str()).unwrap_or(&b).to_string();
+            self.allow.insert(base);
+        }
+        self
+    }
+
     pub fn with_timeout(mut self, d: Duration) -> Self { self.timeout = d; self }
 
     pub fn root(&self) -> &Path { &self.root }
@@ -1330,6 +1348,17 @@ pub struct AgentConfig {
     /// put it: a runner that dropped it would fan out the work and discard the only thing that made
     /// the branches different from each other.
     pub persona: String,
+    /// Require PROOF, not just a green suite, before a completion claim is accepted.
+    ///
+    /// A green suite after a change is consistent with three different worlds: the change fixed
+    /// something a test caught, the change did nothing and the suite was already green, or the
+    /// change broke something nothing covers. `oracle` can tell the first from the second by
+    /// reverting the work and re-running — see `Workspace::inverse_patch_check`. Costs one extra
+    /// suite run, ONCE, at the moment the claim is made.
+    pub require_proof: bool,
+    /// Extra binaries the run may execute, on top of the built-in allowlist. The verify command's
+    /// own binary is added automatically; this is for anything else a project's checks need.
+    pub extra_allow: Vec<String>,
     /// Engineering autopilot profiles, in order of PRECEDENCE — see `engprofile`. Empty = none.
     ///
     /// Supersedes `hector_mode`, which is the single Hardware profile and is still honoured: a run
@@ -1361,6 +1390,8 @@ impl Default for AgentConfig {
             model_label: String::new(),
             model_params: None,
             persona: String::new(),
+            require_proof: false,
+            extra_allow: Vec::new(),
             profiles: Vec::new(),
         }
     }
@@ -2231,6 +2262,43 @@ the model attempted a call and it was discarded, which is not the same as the mo
     // callout later names how often it overreached). The plain `verified` gate below stays for
     // unguided runs.
     if text.contains(DONE_MARKER) && tools.is_empty() {
+        // PROOF BEFORE THE CLAIM IS EVEN CONSIDERED. The verify gate answers "is the suite green",
+        // which does not distinguish a change that fixed something from a change that did nothing.
+        // This runs the suite, reverts the run's work, runs it again, and restores — once, here, at
+        // the only moment the answer matters.
+        //
+        // A claim the tests cannot see is rejected with the reason and the run continues; the model
+        // is told what would count, which is the difference between a gate and a wall.
+        if cfg.require_proof && !cfg.verify_cmd.is_empty() {
+            let touched: Vec<String> = ws.events().iter().map(|e| e.path.clone()).collect();
+            let (roots, _) = resolve_check_roots_capped(ws.root(), touched.iter().map(|s| s.as_str()), 1);
+            let root = roots.first().cloned().unwrap_or_default();
+            match ws.inverse_patch_check(&cfg.verify_cmd, &root, "logscope-base") {
+                Some((after, reverted)) => {
+                    let a = crate::oracle::parse_test_results(&after);
+                    let r = crate::oracle::parse_test_results(&reverted);
+                    // `reverted` is the BEFORE state: the delta is what the change did to it.
+                    let d = crate::oracle::delta(&r, &a);
+                    let vac = crate::oracle::vacuous(&a, &r, &r);
+                    match crate::oracle::judge(&d, &vac) {
+                        crate::oracle::Evidence::Proven(why) => {
+                            prompt.push_str(&format!("\n\n(PROOF: {why})\n"));
+                        }
+                        crate::oracle::Evidence::Regressed(why) | crate::oracle::Evidence::Unproven(why) => {
+                            prompt.push_str(&format!(
+                                "\n\n(NOT ACCEPTED — the change is unproven. {why}\n\
+The suite was run with your work and again with it reverted. To finish, make a test change status: \
+add one that fails without your change, or fix one that is currently failing. If the work genuinely \
+cannot be covered by a test, say so explicitly and why.)\n"));
+                            return (Vec::new(), None);
+                        }
+                    }
+                }
+                // The check could not run (not a worktree, or the restore failed and said so). Fall
+                // through to the ordinary gate rather than blocking a run on missing infrastructure.
+                None => {}
+            }
+        }
         if let Some(g) = guide.as_deref_mut() {
             let obs = crate::phase_guide::TurnObs { claims_done: true, ..Default::default() };
             return match g.observe(&obs) {
@@ -2616,7 +2684,11 @@ impl AgentRun {
         let verified = cfg.verify_cmd.is_empty();
         let ws = Workspace::new(work_dir)
             .with_model_label(cfg.model_label.clone())
-            .with_model_params(cfg.model_params);
+            .with_model_params(cfg.model_params)
+            // The configured verify command is allowed to run: it comes from the operator, and
+            // gating it on the model's allowlist made any non-cargo suite structurally unverifiable.
+            .allow_also(cfg.verify_cmd.first().cloned())
+            .allow_also(cfg.extra_allow.clone());
         let run = Self {
             ws, prompt: prompt.clone(), reply: String::new(),
             plan: Plan::default(), verified, step: 0, turns: 0, cfg,
@@ -2665,6 +2737,10 @@ impl AgentRun {
 
     /// Current transcript size in bytes — what the bound acts on.
     pub fn prompt_len(&self) -> usize { self.prompt.len() }
+
+    /// The transcript so far, read-only. For tests and for the operator's "show me what the model
+    /// is actually seeing" view — the observations are where a check's failure is visible.
+    pub fn prompt_snapshot(&self) -> &str { &self.prompt }
 
     /// The last green checkpoint committed in the scratch, if any.
     pub fn last_green(&self) -> Option<&str> { self.ws.last_green() }
@@ -5410,5 +5486,129 @@ mod long_horizon_tests {
             model_label: "Llama-3.2-1B-Instruct-Q4_K_M.gguf".into(), ..Default::default() };
         let p = system_prompt("t", &cfg);
         assert!(p.contains("Choose the next work yourself"), "the tight brief lost a rank-1 habit");
+    }
+
+
+    // ── proof before completion ──────────────────────────────────────────────────────────────────
+
+    /// Build a scratch git repo with a libtest-shaped "suite" whose result depends on a marker file,
+    /// so a run's change can genuinely flip a test from failing to passing.
+    fn proof_repo(tag: &str) -> std::path::PathBuf {
+        let d = tmp(tag);
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        // The "suite": prints libtest lines, ok when marker.txt says FIXED.
+        std::fs::write(d.join("suite.sh"),
+            "#!/bin/sh\nif grep -q FIXED marker.txt 2>/dev/null; then\n\
+echo 'test the_thing ... ok'\nelse\necho 'test the_thing ... FAILED'\nfi\necho 'test unrelated ... ok'\n").unwrap();
+        std::fs::write(d.join("marker.txt"), "BROKEN\n").unwrap();
+        for args in [vec!["init", "-q"],
+                     vec!["-c", "user.email=t@t", "-c", "user.name=t", "add", "-A"]] {
+            std::process::Command::new("git").args(&args).current_dir(&d).output().unwrap();
+        }
+        std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "base"])
+            .current_dir(&d).output().unwrap();
+        std::process::Command::new("git").args(["tag", "logscope-base"])
+            .current_dir(&d).output().unwrap();
+        d
+    }
+
+    fn proof_cfg() -> AgentConfig {
+        AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 6,
+            verify_cmd: vec!["sh".into(), "suite.sh".into()], verify_exts: vec!["txt".into()],
+            gate_done_on_verify: false, prefer_patches: false, digest_verify: false,
+            require_proof: true, ..Default::default() }
+    }
+
+    /// A change that flips a test red→green is PROVEN, and the claim is accepted.
+    #[test]
+    fn a_change_a_test_can_see_is_accepted() {
+        let d = proof_repo("proof-yes");
+        let mut cfg = proof_cfg();
+        cfg.extra_allow.push("sh".into());
+        let script = vec![
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"marker.txt\",\"contents\":\"FIXED\\n\"}\n```".to_string(),
+            format!("Done. {DONE_MARKER}"),
+        ];
+        let (stop, _run) = drive(&d, "fix the thing", cfg, &script);
+        assert_eq!(stop, Stop::Done, "a red→green test is exactly the evidence this asks for");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A change the suite cannot see is REJECTED, however green the suite is — and the model is told
+    /// what would count rather than merely refused.
+    #[test]
+    fn a_change_no_test_can_see_is_rejected_with_the_reason() {
+        let d = proof_repo("proof-no");
+        // start already green, so the suite passes with and without the change
+        std::fs::write(d.join("marker.txt"), "FIXED\n").unwrap();
+        for args in [vec!["add", "-A"], vec!["-c", "user.email=t@t", "-c", "user.name=t",
+                                             "commit", "-q", "-m", "green"]] {
+            std::process::Command::new("git").args(&args).current_dir(&d).output().unwrap();
+        }
+        std::process::Command::new("git").args(["tag", "-f", "logscope-base"])
+            .current_dir(&d).output().unwrap();
+        let mut cfg = proof_cfg();
+        cfg.extra_allow.push("sh".into());
+        let script = vec![
+            // edits a file no test looks at
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"notes.txt\",\"contents\":\"whatever\\n\"}\n```".to_string(),
+            format!("All done. {DONE_MARKER}"),
+        ];
+        let (stop, _run) = drive(&d, "tidy up", cfg, &script);
+        assert_ne!(stop, Stop::Done,
+                   "the suite is green both ways — that is not evidence the change did anything");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Infrastructure missing must not block a run: a workspace that is not a git worktree cannot be
+    /// reverted, and refusing every claim there would make the flag unusable rather than strict.
+    #[test]
+    fn a_workspace_without_git_falls_back_instead_of_blocking() {
+        let d = tmp("proof-nogit");
+        std::fs::write(d.join("marker.txt"), "FIXED\n").unwrap();
+        std::fs::write(d.join("suite.sh"), "#!/bin/sh\necho 'test t ... ok'\n").unwrap();
+        let mut cfg = proof_cfg();
+        cfg.extra_allow.push("sh".into());
+        let script = vec![
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"a.txt\",\"contents\":\"x\\n\"}\n```".to_string(),
+            format!("Done. {DONE_MARKER}"),
+        ];
+        let (stop, _run) = drive(&d, "do a thing", cfg, &script);
+        assert_eq!(stop, Stop::Done, "no worktree, no proof possible — fall through, do not wall off");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    /// A project whose suite is not `cargo` must still be able to run it.
+    ///
+    /// The allowlist exists to constrain what the MODEL runs; a verify command is the operator's
+    /// configuration and was gated by the same list, so `make test`, `pytest`, `just check` or a
+    /// shell script produced "command not allowed" as the check output on every turn — a gate that
+    /// can never go green, which with done-gating on is a run that can never finish.
+    ///
+    /// Asserted on the OBSERVATION text rather than on the stop reason, because the previous test
+    /// for this passed with the allowance sabotaged: it happened to name the same binary in
+    /// `extra_allow`, so it never exercised the auto-allowance at all.
+    #[test]
+    fn a_non_cargo_verify_command_is_permitted_to_run() {
+        let d = tmp("nonrust-verify");
+        std::fs::write(d.join("suite.sh"), "#!/bin/sh\necho 'test t ... ok'\n").unwrap();
+        // `sh` is NOT in the default allowlist and NOT in extra_allow — only the verify command's
+        // own binary, added automatically.
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 4,
+            verify_cmd: vec!["sh".into(), "suite.sh".into()], verify_exts: vec!["rs".into()],
+            gate_done_on_verify: false, prefer_patches: false, digest_verify: false,
+            ..Default::default() };
+        assert!(!default_allow().contains("sh"), "premise: sh is not allowed by default");
+        let (mut run, _first) = AgentRun::start(&d, "t", cfg);
+        run.on_token("```tool\n{\"tool\":\"write_file\",\"path\":\"a.rs\",\"contents\":\"//x\\n\"}\n```");
+        let _ = run.on_done();
+        let seen = run.prompt_snapshot();
+        assert!(seen.contains("AUTOMATIC VERIFICATION"), "the check did not run at all");
+        assert!(!seen.contains("command not allowed"),
+                "the operator's own verify command was refused by the model's allowlist:\n{}",
+                &seen[seen.len().saturating_sub(400)..]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
