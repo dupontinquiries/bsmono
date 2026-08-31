@@ -48,6 +48,7 @@ mod partdata;
 mod palevector;
 mod parity;
 mod patrol;
+mod escalation;
 mod perception;
 mod trials;
 mod trainwatch;
