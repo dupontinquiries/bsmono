@@ -34,6 +34,18 @@ pub enum Reach {
     /// Known from a previous session; nothing live.
     Known,
     /// Seen on the network, never handshaken. NOT sendable.
+    ///
+    /// This is also the right landing state for a DHT hit, and the
+    /// reason is worth stating before anything wires one up: a
+    /// `snapclone_presence::dht::resolve` result is a record ANYONE
+    /// could have published under that key. It proves a claim was made,
+    /// not that the claimant holds the key — so it is exactly "seen on
+    /// the network, never handshaken", and it must not be sendable
+    /// until peermux completes a handshake.
+    ///
+    /// Gossip already lands here for the same reason. A DHT result is
+    /// weaker evidence than a LAN gossip packet, not stronger, because
+    /// the publisher need not be on the network at all.
     Unverified,
     /// A session exists.
     Connected,

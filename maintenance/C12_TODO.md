@@ -4591,6 +4591,32 @@ Two tests, one per property. 1427/1427.
   up, either a weaker path was added or the labels went back to lying.
 
   1428/1428.
-- **C84b — the DHT half is enabled but unreached.** `discovery_enabled()
-  .1` is now honest and nothing consumes it yet;
-  `snapclone_presence::dht::{publish,resolve}` is what it should call.
+- **C84b — examined, and NOT wired, with a reason.** The frontend has no
+  dependency on `snapclone-presence` or `snapcore`, so this is not one
+  call: it needs a node identity, a routing table, a bootstrap peer
+  list, and a socket loop owned by something — a real component, not an
+  arrow.
+
+  What I did instead was settle WHERE a DHT result lands, because that
+  decision is easy to get wrong later and costs security when it is.
+  `peer_source::Reach::Unverified`, documented in place:
+
+  > a `dht::resolve` result is a record ANYONE could have published
+  > under that key. It proves a claim was made, not that the claimant
+  > holds the key.
+
+  So a DHT hit is "seen on the network, never handshaken" and NOT
+  sendable until peermux completes a handshake — and `Reach::sendable`
+  already refuses `Unverified`, with the comment that queueing against
+  an unverified identity is how a message reaches whoever claims that
+  name next.
+
+  Worth being explicit that a DHT result is WEAKER evidence than a LAN
+  gossip packet, not stronger: the publisher need not be on the network
+  at all. The temptation when wiring a new discovery source is to treat
+  it as authoritative because it was hard to build.
+
+  The remaining work is a node host — the shape `pty_host` and
+  `PtyHost` have in voiceterm: something that owns the socket, the
+  routing table and the loop, and hands the app results. Recorded as
+  the next real component rather than pretended to be plumbing.
