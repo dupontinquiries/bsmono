@@ -153,6 +153,7 @@ mod style;
 mod subsea;
 mod sun;
 mod survival;
+mod swing;
 mod save;
 mod scale;
 mod ship;
