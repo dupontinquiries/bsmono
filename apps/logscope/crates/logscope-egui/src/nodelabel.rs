@@ -20,10 +20,17 @@
 
 /// Trim a turn preview to a label: single-spaced, cut on a WORD boundary, ellipsis when cut.
 ///
+/// NAMED `elide_words` because two other `elide`s already exist and neither does this:
+/// `diagreport::elide` truncates with a "[+N chars elided]" count for diagnostic values, and
+/// `debatepanel::elide` cuts from the START to keep the tail, because in a live strip the most
+/// recent words matter most. Three functions called `elide` with three different behaviours is a
+/// trap the repo's `dupscan` ratchet caught before it shipped; the fix is a name that says which
+/// one this is, not a raised ceiling.
+///
 /// Mid-word cuts are what makes the current labels read as damaged rather than abbreviated. A word
 /// boundary costs a few characters and the result is a phrase; "create a rust…" is a label and
 /// "create a rust crate th" is a mistake.
-pub fn elide(preview: &str, max_chars: usize) -> String {
+pub fn elide_words(preview: &str, max_chars: usize) -> String {
     // Collapse whitespace first: a preview carries newlines and runs of spaces from the original
     // turn, and those become gaps or line breaks in a single-line label.
     let flat: String = preview.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -51,8 +58,15 @@ pub fn elide(preview: &str, max_chars: usize) -> String {
 }
 
 /// One label's screen placement: node id, projected x/y in pixels, and depth (larger = nearer).
+///
+/// `LabelBox` rather than `Placed`, which is `hud_pack`'s. That module is the established
+/// screen-space overlap resolver here and it takes the OPPOSITE approach deliberately: HUD slabs
+/// are anchored UI that must all stay visible, so it nudges them apart and shrinks them as a last
+/// resort. A node label cannot be moved — sliding it away from its node makes it point at the wrong
+/// turn — so crowding is resolved by hiding the lower-priority label instead. Same problem space,
+/// different correct answer, and worth stating so neither looks redundant beside the other.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Placed {
+pub struct LabelBox {
     pub id: usize,
     pub x: f32,
     pub y: f32,
@@ -70,7 +84,7 @@ pub struct Placed {
 /// Boxes are the label's own extent, not a fixed radius around the node. That is the correction:
 /// the existing pass used a 78px circle around the PEARL, which is blind to a long label beside a
 /// short one.
-pub fn visible(mut placed: Vec<Placed>, char_px: f32, line_px: f32) -> Vec<usize> {
+pub fn visible(mut placed: Vec<LabelBox>, char_px: f32, line_px: f32) -> Vec<usize> {
     placed.sort_by(|a, b| b.depth.partial_cmp(&a.depth).unwrap_or(std::cmp::Ordering::Equal)
         .then(a.id.cmp(&b.id)));
     let mut kept: Vec<(f32, f32, f32, f32)> = Vec::new(); // x0,y0,x1,y1
@@ -96,23 +110,23 @@ mod tests {
 
     #[test]
     fn a_short_preview_is_left_alone() {
-        assert_eq!(elide("hello there", 24), "hello there");
-        assert_eq!(elide("exactly ten", 11), "exactly ten");
+        assert_eq!(elide_words("hello there", 24), "hello there");
+        assert_eq!(elide_words("exactly ten", 11), "exactly ten");
     }
 
     /// The defect from the screenshot, by example.
     #[test]
     fn labels_are_cut_on_words_not_mid_word() {
         // "create a rust crate th" is what the 16-char cut produced.
-        assert_eq!(elide("create a rust crate that parses gguf", 22), "create a rust crate…");
+        assert_eq!(elide_words("create a rust crate that parses gguf", 22), "create a rust crate…");
         // The screenshot's other one: a long code token backs up to the last real word rather than
         // being sliced into "std::colle".
-        assert_eq!(elide("rust use std::collections::HashMap", 20), "rust use…");
-        assert_eq!(elide("4. How do you add another node", 20), "4. How do you add…");
+        assert_eq!(elide_words("rust use std::collections::HashMap", 20), "rust use…");
+        assert_eq!(elide_words("4. How do you add another node", 20), "4. How do you add…");
         for (text, max) in [("create a rust crate that parses gguf", 22),
                             ("rust use std::collections::HashMap", 20),
                             ("why is this better than the alternative", 18)] {
-            let out = elide(text, max);
+            let out = elide_words(text, max);
             assert!(out.chars().count() <= max, "{out:?} exceeds {max}");
             let body = out.trim_end_matches('…');
             assert!(text.starts_with(body), "{out:?} is not a prefix of the original");
@@ -127,29 +141,29 @@ mod tests {
     /// cutting it.
     #[test]
     fn one_enormous_word_is_cut_rather_than_erased() {
-        let out = elide("Antidisestablishmentarianism", 12);
+        let out = elide_words("Antidisestablishmentarianism", 12);
         assert_eq!(out.chars().count(), 12);
         assert!(out.starts_with("Antidisest"), "{out}");
         // and a long word after a very short one does not collapse to two characters
-        let out2 = elide("a supercalifragilistic thing", 14);
+        let out2 = elide_words("a supercalifragilistic thing", 14);
         assert!(out2.chars().count() > 4, "backed up too far: {out2:?}");
     }
 
     #[test]
     fn whitespace_and_newlines_are_flattened() {
-        assert_eq!(elide("  hello\n\n   world  ", 30), "hello world");
-        assert_eq!(elide("\n\t \n", 30), "");
-        assert_eq!(elide("anything", 0), "");
+        assert_eq!(elide_words("  hello\n\n   world  ", 30), "hello world");
+        assert_eq!(elide_words("\n\t \n", 30), "");
+        assert_eq!(elide_words("anything", 0), "");
     }
 
     #[test]
     fn trailing_punctuation_does_not_precede_the_ellipsis() {
-        assert_eq!(elide("first thing, second thing", 16), "first thing…");
-        assert!(!elide("a b c d e f g h i j", 12).contains(" …"));
+        assert_eq!(elide_words("first thing, second thing", 16), "first thing…");
+        assert!(!elide_words("a b c d e f g h i j", 12).contains(" …"));
     }
 
-    fn p(id: usize, x: f32, y: f32, depth: f32, chars: usize) -> Placed {
-        Placed { id, x, y, depth, chars }
+    fn p(id: usize, x: f32, y: f32, depth: f32, chars: usize) -> LabelBox {
+        LabelBox { id, x, y, depth, chars }
     }
 
     #[test]
@@ -162,7 +176,7 @@ mod tests {
     /// The screenshot case: several turns close together, labels on top of each other.
     #[test]
     fn a_crowded_cluster_keeps_the_nearest_and_drops_the_rest() {
-        let cluster: Vec<Placed> = (0..5)
+        let cluster: Vec<LabelBox> = (0..5)
             .map(|i| p(i, 100.0 + i as f32 * 6.0, 200.0 + i as f32 * 2.0, 1.0 - i as f32 * 0.1, 16))
             .collect();
         let v = visible(cluster, 7.0, 14.0);

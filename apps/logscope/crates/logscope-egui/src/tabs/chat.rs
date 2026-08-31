@@ -4831,11 +4831,25 @@ which file you read.\n\n",
                 // ends up as one smear of overlapping text. `nodelabel::visible` keeps the nearest
                 // and drops what would collide with it.
                 const LABEL_CHARS: usize = 22;
+                // WHAT EACH NODE IS, above what it says — the information architecture of the
+                // reference cards, whose every plaque carries a type over its content line. Derived
+                // from the graph (pruned, root, fork, loopback, artifact) rather than from the
+                // reference's own vocabulary, which belongs to a worked example rather than to this
+                // data; see `noderole`. The common case is left untagged.
+                let node_roles = crate::noderole::roles(&g);
+                let label_of = |id: usize| -> String {
+                    match (g.nodes.iter().position(|nd| nd.id == id), g.nodes.iter().find(|nd| nd.id == id)) {
+                        (Some(i), Some(nd)) => crate::noderole::line(
+                            node_roles.get(i).copied().unwrap_or(crate::noderole::Role::Reply),
+                            &nd.preview, LABEL_CHARS),
+                        _ => String::new(),
+                    }
+                };
                 let show: std::collections::HashSet<usize> = {
-                    let placed: Vec<crate::nodelabel::Placed> = proj.iter().filter_map(|q| {
-                        let nd = g.nodes.iter().find(|nd| nd.id == q.0)?;
-                        let chars = crate::nodelabel::elide(&nd.preview, LABEL_CHARS).chars().count();
-                        Some(crate::nodelabel::Placed { id: q.0, x: q.1, y: q.2, depth: q.3, chars })
+                    let placed: Vec<crate::nodelabel::LabelBox> = proj.iter().filter_map(|q| {
+                        let _nd = g.nodes.iter().find(|nd| nd.id == q.0)?;
+                        let chars = label_of(q.0).chars().count();
+                        Some(crate::nodelabel::LabelBox { id: q.0, x: q.1, y: q.2, depth: q.3, chars })
                     }).collect();
                     // Cell size in px at this scale: label_cells lays 5x7 cells at 0.034 world
                     // units, which projects to roughly a 7px advance and a 14px line here.
@@ -4858,9 +4872,9 @@ which file you read.\n\n",
                     lit /= 1.0 + 1.5 * occ;
                     if lit < 0.05 { continue; }
                     if let Some(nd) = g.nodes.iter().find(|nd| nd.id == q.0) {
-                        // Word-safe rather than a hard character cut: "create a rust crate…" instead
-                        // of "create a rust crate th".
-                        let label = crate::nodelabel::elide(&nd.preview, LABEL_CHARS);
+                        // Word-safe, and prefixed with what the node IS when that is worth saying.
+                        let _ = nd;
+                        let label = label_of(q.0);
                         if label.is_empty() { continue; }
                         for cell in m3::label_cells(pos[q.0], right, up, toward_cam, &label,
                                                     0.034, t, theme::CYAN(), lit, scroll, tanim, m3::SceneLight::Uniform, 0) {
@@ -6201,7 +6215,7 @@ which file you read.\n\n",
                     p.text(egui::pos2(sx + radius + 5.0, sy), egui::Align2::LEFT_CENTER,
                         // Same word-safe elision as the scene labels — a 2D list has more room for
                         // the text but no more excuse for cutting it mid-word.
-                        format!("{}t · {}", nd.tokens, crate::nodelabel::elide(&nd.preview, 22)),
+                        format!("{}t · {}", nd.tokens, crate::nodelabel::elide_words(&nd.preview, 22)),
                         egui::FontId::proportional(11.0), base.gamma_multiply(label_fade));
                 }
             }
