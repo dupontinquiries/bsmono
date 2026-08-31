@@ -3728,3 +3728,35 @@ Kept: encode_gop_v3_forced (force-plate map + leftover trace) and
 encode_gop_v3_lookahead behind --lookahead, since the machinery is
 the natural harness for per-region trial encodes later. Default path
 unchanged and byte-exact.
+
+### SMITE vs AV1 measured for the FIRST time — v11 loses badly on game footage
+
+Never measured before (the SMITE GOPs were used for 3D/matching work,
+never rate-compared). AV1 anchors encoded here with libsvtav1
+(preset 6, g48) on the identical y4m the codec sees:
+
+  smiteA (48f): v11 dz32  1,235,639 B @ 30.66 dB / SSIM 0.904
+                AV1 crf30   691,574 B @ 34.43
+                AV1 crf50   256,527 B @ 34.07
+                AV1 crf63    84,860 B @ 32.63
+  smiteB (48f): v11 dz32  1,369,550 B @ 30.18 dB
+                AV1 crf40   406,632 B @ 34.12
+                AV1 crf55   203,273 B @ 33.73
+
+v11 is ~15× LARGER AND ~2 dB WORSE than AV1 at crf63 on smiteA. This
+is the reverse of the film result (Lone Ranger: 21.2× at +0.25 dB)
+and it lands on the material the thesis nominated as its home turf.
+
+Honest reading of why, from the byte split (plate 338 KB, side 390 KB,
+residual 507 KB on smiteA): broadcast SMITE has continuous camera
+motion, so the plate model — built for a static or slowly-panning set
+— fits poorly, and every construction in this session was tuned
+against film. AV1's PSNR is also remarkably flat across CRF here
+(34.4 → 34.1 from 692 KB to 257 KB), which says its tools fit this
+content extremely well: synthetic edges, flat UI, repeated HUD.
+
+Also note the anchors are re-encodes of already-AV1 material, which
+flatters AV1 (it re-codes its own artifacts cheaply). A clean
+comparison needs an engine-rendered source, which is also the
+regime the citation thesis needs — so the same experiment settles
+both questions.
