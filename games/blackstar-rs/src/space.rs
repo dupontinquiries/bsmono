@@ -61,6 +61,11 @@ pub const GRAV_MIN: f32 = 0.35;
 pub const GRAV_MAX: f32 = 1.6;
 
 /// How large a body of radius `r` looks from `d`, in degrees.
+///
+/// The `d <= r` early return is belt-and-braces rather than load-bearing:
+/// `atan` saturates at 90 degrees as `r/d` grows, so the formula already
+/// returns 180 from inside a body, and removing the clause fails no test. It
+/// stays for the `r = d = 0` case, which would otherwise be a NaN.
 pub fn angular_size_deg(r: f32, d: f32) -> f32 {
     if d <= r {
         return 180.0;
@@ -567,5 +572,120 @@ mod blend_tests {
             "shapes within smin reach of each other measured as isolated ({})",
             c.worst_cluster
         );
+    }
+}
+
+#[cfg(test)]
+mod lod_wiring_tests {
+    use super::*;
+
+    /// The whole justification for the swap, as a property: two bodies that
+    /// LOOK the same size must get the same treatment, however far away they
+    /// are. The radial rule cannot do this by construction, and that is not a
+    /// tuning complaint — it is what "one set of thresholds for every size"
+    /// means.
+    #[test]
+    fn equal_apparent_size_gets_equal_treatment() {
+        // a dwarf up close and a giant far off, both ~4 degrees across
+        let pairs = [(1.5f32, 43.0f32), (8.0, 229.0), (38.0, 1088.0)];
+        let tiers: Vec<Tier> = pairs.iter().map(|(r, d)| tier_for(*r, *d)).collect();
+        for (i, (r, d)) in pairs.iter().enumerate() {
+            let a = angular_size_deg(*r, *d);
+            assert!((a - 4.0).abs() < 0.5, "fixture {i} is {a:.2}deg, not ~4");
+        }
+        assert!(
+            tiers.windows(2).all(|w| w[0] == w[1]),
+            "same apparent size, different tiers: {tiers:?}"
+        );
+        // and the rule this replaced does NOT agree with itself here, which
+        // is the defect rather than a preference
+        let radial: Vec<Tier> =
+            pairs.iter().map(|(_, d)| tier_by_distance(*d, CURRENT_REACH_M)).collect();
+        assert!(
+            !radial.windows(2).all(|w| w[0] == w[1]),
+            "the radial rule agreed too — this test is not measuring the difference"
+        );
+    }
+
+    /// What the live change actually does, in both directions, so it is
+    /// characterised rather than assumed better. Small props coarsen SOONER
+    /// (a perf win) and large ones keep their mesh LONGER (a quality win, and
+    /// a cost).
+    #[test]
+    fn the_swap_moves_small_and_large_shapes_opposite_ways() {
+        // the live rule swaps a sphere/capsule mesh at Tier::Impostor or below
+        let coarse_at = |r: f32| -> f32 {
+            let mut d = 1.0f32;
+            while d < 5000.0 {
+                if tier_for(r, d) <= Tier::Impostor {
+                    return d;
+                }
+                d += 1.0;
+            }
+            5000.0
+        };
+        let prop = coarse_at(1.5); // foliage, rocks, orbs
+        let shell = coarse_at(8.0); // a tube section
+        // the old thresholds, for the record: 90 m for spheres/capsules,
+        // 140 m for shells, regardless of size
+        assert!(
+            prop < 90.0,
+            "a 1.5 m prop now coarsens at {prop:.0} m, no sooner than the old 90 m — \
+             the expected perf win is not there"
+        );
+        assert!(
+            shell > 140.0,
+            "an 8 m shell now coarsens at {shell:.0} m, no later than the old 140 m"
+        );
+        // AND THE COST THIS CARRIES, stated rather than discovered later: big
+        // shapes hold their full mesh several times further out than before,
+        // so a tube-dense map (PERPLEXUS is half glass by the shader's own
+        // comment) draws more geometry, not less. The angular rule is correct;
+        // whether it is FASTER on such a map is unmeasured, and there is no
+        // GPU here to measure it on.
+        assert!(shell > 140.0 * 2.0, "the shell change is smaller than expected: {shell:.0} m");
+    }
+
+    /// THE WIRING, not the function.
+    ///
+    /// The tests above call `tier_for` directly, so they stay green if
+    /// `main.rs` goes on using `d > 90.0` — and when break-checked, that is
+    /// exactly what happened. A correct-but-unreached function is this
+    /// repo's most common failure and I have now reproduced it twice in one
+    /// session, so the call site gets its own assertion.
+    ///
+    /// Needles are ASSEMBLED AT RUNTIME. A scan for a literal that also
+    /// appears in the scanning test matches itself; that cost two attempts
+    /// when the same check was added for `Model::settle`.
+    #[test]
+    fn the_renderer_actually_asks_for_the_angular_tier() {
+        let src = include_str!("main.rs");
+        let call = format!("space::{}(world::shape_reach", "tier_for");
+        assert!(
+            src.contains(&call),
+            "main.rs no longer asks space for an angular tier"
+        );
+        let gate = format!("tier <= space::Tier::{}", "Impostor");
+        assert!(src.contains(&gate), "the mesh-swap gate moved off Impostor");
+        // and the radial rule must be gone, or whichever runs is a coin flip
+        for stale in [
+            format!("d2 > 140.0 {} 140.0", "*"),
+            format!("d2 > 90.0 {} 90.0", "*"),
+        ] {
+            assert!(!src.contains(&stale), "the radial LOD rule is still live: {stale}");
+        }
+    }
+
+    #[test]
+    fn a_body_you_are_standing_on_is_never_culled() {
+        // The failure that would matter most once worlds are planet-sized:
+        // inside or at the surface, `angular_size_deg` saturates at 180 and
+        // the tier must be Full. A rule that culled the ground under the
+        // player would be catastrophic and silent.
+        for r in [7.0f32, 38.0, 400.0, 6371_000.0] {
+            assert_eq!(tier_for(r, r * 0.5), Tier::Full, "inside a body of r={r}");
+            assert_eq!(tier_for(r, r), Tier::Full, "at the surface of r={r}");
+            assert!(tier_for(r, r * 1.2) >= Tier::Medium, "just above r={r}");
+        }
     }
 }

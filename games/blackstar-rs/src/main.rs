@@ -7879,18 +7879,37 @@ impl Game {
                     continue;
                 }
             }
-            // tube LOD: far shells swap to the 10-segment mesh (same SDF)
-            // LOD: distant primitives swap to low-poly meshes. Spheres and
-            // capsules are the most-used shapes in the game (foliage, rocks,
-            // pillars, orbs) and the full-fat sphere is ~750 triangles.
-            let d2 = s.pos.distance_squared(rc.0);
-            let far = d2 > 140.0 * 140.0;
-            let vfar = d2 > 90.0 * 90.0;
-            let mesh = match (s.mesh, far, vfar) {
-                (world::M_SHELL, true, _) => world::M_SHELL_LO,
-                (world::M_SHELL_OPEN, true, _) => world::M_SHELL_OPEN_LO,
-                (world::M_SPHERE, _, true) => world::M_SPHERE_LO,
-                (world::M_CAP_TALL, _, true) => world::M_CAP_TALL_LO,
+            // LOD BY HOW BIG IT LOOKS, NOT HOW FAR IT IS.
+            //
+            // This was `d2 > 90²` / `d2 > 140²` — one set of distances for
+            // every shape, whatever its size. That is correct only when
+            // everything is the same size, and it is not: the shapes here
+            // already span an order of magnitude, and `space.rs` was written
+            // because scaling KUIPER's worlds up widens that further. A
+            // distance rule gives a giant at four hundred metres and a pebble
+            // at eighty the SAME treatment, which is backwards for both — the
+            // giant fills the screen and gets a low-poly mesh, the pebble is
+            // a speck and keeps 750 triangles.
+            //
+            // What decides how much detail something needs is the angle it
+            // subtends, `2·atan(r/d)`. `space::tier_for` is that arithmetic,
+            // tested, and until now called only by the `--space` CLI — the
+            // measurement existed and the renderer never asked it.
+            let d = s.pos.distance(rc.0);
+            let tier = space::tier_for(world::shape_reach(&s.sdf).max(0.05), d);
+            // SWAP AT IMPOSTOR, NOT LOW. `TIER_DEG` lists where each tier
+            // BEGINS, so `tier <= Low` fires below 8 degrees — which for a
+            // 1.5 m prop is 21 m, against the old rule's 90 m. That is a
+            // visible downgrade on every rock and orb in the near field, and
+            // I had it in this file before a test worked the arithmetic out.
+            // The old thresholds correspond to about 1.9 degrees, so Impostor
+            // (2.5) is the parity-preserving line.
+            let coarse = tier <= space::Tier::Impostor;
+            let mesh = match (s.mesh, coarse) {
+                (world::M_SHELL, true) => world::M_SHELL_LO,
+                (world::M_SHELL_OPEN, true) => world::M_SHELL_OPEN_LO,
+                (world::M_SPHERE, true) => world::M_SPHERE_LO,
+                (world::M_CAP_TALL, true) => world::M_CAP_TALL_LO,
                 _ => s.mesh,
             };
             // params.x flags ROUGH GLASS: tubes and junction rooms get a
