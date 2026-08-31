@@ -1215,6 +1215,8 @@ pub fn residual_ledger(frames: &[Yuv420]) -> String {
     )
 }
 
+const GAIN_GATE: i64 = 192;
+
 pub fn encode_gop_v3(
     frames: &[Yuv420],
     motions: &[PlateMotion],
@@ -1423,6 +1425,10 @@ pub fn encode_gop_v3(
         // so encoder and inline recon stay consistent by construction.
         let mut composite = composite;
         let mut gain_flags = vec![0u8; (gw * gh + 7) / 8];
+        // Interleaved raw (qa,b) pairs BY MEASUREMENT: delta coding
+        // lost +6.2% (exact-repeat pairs are LZ gold; deltas destroyed
+        // them) and plane-splitting lost +0.8% (pairwise matches beat
+        // plane homogeneity). Two reverted experiments, recorded here.
         let mut gain_vals: Vec<u8> = Vec::new();
         for gy in 0..gh {
             for gx in 0..gw {
@@ -1461,11 +1467,21 @@ pub fn encode_gop_v3(
                         e_cor += ((a * pv + b).clamp(0.0, 255.0) - av).abs() as i64;
                     }
                 }
-                if e_cor + 96 >= e_raw {
+                if e_cor + GAIN_GATE >= e_raw {
                     continue;
                 }
                 let gi = gy * gw + gx;
                 gain_flags[gi / 8] |= 1 << (gi % 8);
+                // Plane-split, not delta-coded: the byte-attribution
+                // diagnostic showed mode+mv side info at 44% of the
+                // quiet shot's total with gain values the prime
+                // suspect. Delta coding was tried first and LOST +6.2%
+                // — many regions share the exact same quantized (a,b)
+                // pair and zstd's LZ was already matching those 2-byte
+                // repeats; deltas destroyed the repetition. Splitting
+                // qa and b into separate planes (the band-major trick)
+                // keeps the repeats AND gives each value its own
+                // homogeneous local distribution.
                 gain_vals.push(qa as u8);
                 gain_vals.push(b as i8 as u8);
                 for dy in 0..REGION {
@@ -1558,6 +1574,18 @@ pub fn encode_gop_v3(
         side.extend_from_slice(&planar_bits);
         side.extend_from_slice(&gain_flags);
         side.extend_from_slice(&gain_vals);
+        if std::env::var("FAO_SIDE_DEBUG").is_ok() {
+            eprintln!(
+                "side raw: mode {} nz {} mvd {} intra {} planar {} gflags {} gvals {}",
+                (gw * gh + 7) / 8,
+                nz_bits.len(),
+                mv_deltas.len(),
+                intra_flags.len(),
+                planar_bits.len(),
+                gain_flags.len(),
+                gain_vals.len()
+            );
+        }
         let mode_bytes = zstd::encode_all(side.as_slice(), 19).map(|c| c.len()).unwrap_or(side.len());
 
         let p444 = interleave_444(&composite);

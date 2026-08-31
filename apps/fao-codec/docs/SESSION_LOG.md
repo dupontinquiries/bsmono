@@ -3558,3 +3558,29 @@ larger than the two A/B shots implied: the other pan/handheld shots
 benefited more from the unclamped search than the diagnostic shot.
 docs/full_v11_dz32_range24.csv. Session ladder:
 46.5× @ −2.00 dB → 31.2× @ +0.69 dB.
+
+### Byte attribution → gain-gate retune (same session)
+
+New diagnostic (plate_lab prints the plate/motion/mode+mv/residual
+split): on the quiet shot, MODE+MV SIDE INFO had grown to 44% of
+total bytes — larger than the plate, 3.4× the residual — and the raw
+composition showed gain values as the largest component (233 KB raw
+over 48 frames: 2.4K regions/frame buying 2-byte corrections through
+a 96-L1 gate on a locked shot).
+
+Two coding-layer fixes tried first, both measured, both reverted,
+both recorded at the emission site: delta-coding the gain values
+LOST +6.2% (regions repeat exact (a,b) pairs — LZ gold that deltas
+destroy) and plane-splitting qa/b LOST +0.8% (pairwise matches beat
+plane homogeneity). The volume, not the coding, was the problem.
+
+Gate sweep (after printing): 96→192 on shotB −15.6% at −0.15 dB, on
+shot 9 −7.3% at −0.035 dB (~880 KB/dB and ~8.5 MB/dB — far cheaper
+rate than the dz knob); 384 overshoots (−0.46 dB). Full suite at 192
+(docs/full_v11_dz32_gate192.csv):
+  gate 96 : 30.82 MB @ 34.02 / 0.943   (31.2×)
+  gate 192: 28.61 MB @ 33.97 / 0.942   (28.9×, +0.64 dB over AV1)
+→ −7.2% bytes at −0.05 dB: an operating-point trade taken
+deliberately — the codec's entire remaining gap is rate, and this
+buys it at ~44 MB/dB suite-wide. Session ladder:
+46.5× @ −2.00 dB → 28.9× @ +0.64 dB.

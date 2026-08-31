@@ -983,6 +983,10 @@ end_header
         }
         let res_total: usize = rep.frames.iter().map(|c| c.residual_bytes).sum();
         let mode_total: usize = rep.frames.iter().map(|c| c.mode_bytes).sum();
+        eprintln!(
+            "byte split: plate {} motion {} mode+mv {} residual {}",
+            rep.plate_bytes, rep.motion_bytes, mode_total, res_total
+        );
         let n = frames.len();
         let total = rep.plate_bytes + rep.motion_bytes + res_total + mode_total;
         println!("plate_bytes {}", rep.plate_bytes);
@@ -1048,6 +1052,10 @@ end_header
         };
         let res_total: usize = rep.frames.iter().map(|c| c.residual_bytes).sum();
         let mode_total: usize = rep.frames.iter().map(|c| c.mode_bytes).sum();
+        eprintln!(
+            "byte split: plate {} motion {} mode+mv {} residual {}",
+            rep.plate_bytes, rep.motion_bytes, mode_total, res_total
+        );
         let n = frames.len();
         // A cited plate travels as a reference (UUID+alignment ≈ 24
         // bytes), not as payload.
