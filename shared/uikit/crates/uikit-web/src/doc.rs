@@ -374,7 +374,12 @@ impl<'a> Parser<'a> {
             k => k,
         };
 
-        Some(Node { id, kind, style: inherit(style, &children), children })
+        // Down onto the runs BEFORE the node is built: the renderer draws
+        // `Kind::Text`, so a style that stops at the wrapper is a style
+        // nobody sees.
+        let mut children = children;
+        push_style(&style, &mut children);
+        Some(Node { id, kind, style, children })
     }
 
     fn read_tag(&mut self) -> Option<(String, HashMap<String, String>, bool, bool)> {
@@ -459,7 +464,29 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Push a parent's inline styling onto text runs, since the tree keeps styles on
 /// nodes but the renderer draws runs.
-fn inherit(style: crate::InlineStyle, _children: &[Node]) -> crate::InlineStyle { style }
+///
+/// This was a stub: it returned the style and ignored the children, with the
+/// doc comment above already describing what it was supposed to do. Nothing
+/// noticed, because nothing rendered the page model — so every `<a>`,
+/// `<b>`, `<em>` and `<code>` recorded its styling on its own node and the
+/// TEXT the renderer draws carried none of it. Links in a page were
+/// therefore unclickable, which is how it was found.
+///
+/// Merged rather than overwritten: `<a><b>text</b></a>` must be a bold
+/// link, and a child that already has a flag keeps it. A child's own href
+/// wins over an ancestor's, which is what nesting an anchor inside an
+/// anchor means in the rare cases it is not simply invalid.
+fn push_style(style: &crate::InlineStyle, children: &mut [Node]) {
+    for c in children.iter_mut() {
+        c.style.bold |= style.bold;
+        c.style.italic |= style.italic;
+        c.style.code |= style.code;
+        if c.style.link.is_none() {
+            c.style.link = style.link.clone();
+        }
+        push_style(style, &mut c.children);
+    }
+}
 
 /// `<img srcset>` prefers the last (largest) candidate, matching `best_srcset`;
 /// a plain `src` is the fallback.
@@ -491,6 +518,326 @@ pub fn visible_rows(scroll_top: f32, viewport_h: f32, row_h: f32, total: usize)
     let visible = (viewport_h / row_h).ceil() as usize + 2;
     let last = (first + visible).min(total);
     (first, last)
+}
+
+// ── rendering ───────────────────────────────────────────────────────────────
+
+/// What the reader did.
+///
+/// Returned rather than performed, for the same reason the parser does not
+/// fetch: a widget kit that navigates or posts a form is one that cannot be
+/// used by anything with a different idea about the network — and
+/// voiceterm's whole browser model is that an action is proposed, ranked
+/// and confirmed before it happens.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PageAction {
+    /// A link was followed.
+    Follow(String),
+    /// A form was submitted. Already collected — hidden fields included.
+    Submit(Submission),
+    /// An island's placeholder was activated: canvas, video, iframe.
+    /// The caller decides whether that means "open externally" or nothing.
+    OpenIsland { tag: String, src: String },
+}
+
+/// Draw a page.
+///
+/// `doc.rs` has had the page model — a tree with forms, fields, images and
+/// islands — a parser for it, `FormState` and `submit`, and NO RENDERER.
+/// One golden-corpus test walked it and nothing drew it, so the model that
+/// exists to replace web2qml has never been on screen. `RichDoc` is what
+/// actually renders today, and it cannot express a form.
+///
+/// The recursion is the point of the model, so the renderer recurses. What
+/// it does NOT do is lay out: children are stacked in document order, per
+/// this crate's recorded decision not to build a layout tree. A table is
+/// the exception, because a table is the case where side-by-side is the
+/// content.
+pub fn render_page(ui: &mut egui::Ui, page: &Page, state: &mut FormState,
+                   colors: &uikit_egui::PaletteColors) -> Option<PageAction> {
+    let mut act = None;
+    node_ui(ui, page, &page.root, state, colors, &mut act, None);
+    act
+}
+
+/// The form a node is inside, so a submit button knows what to submit.
+///
+/// Threaded down rather than looked up: a `find_parent` walk per button is
+/// O(n) per frame per button, and the information is free on the way in.
+fn node_ui(ui: &mut egui::Ui, page: &Page, node: &Node, state: &mut FormState,
+           colors: &uikit_egui::PaletteColors, act: &mut Option<PageAction>,
+           form: Option<NodeId>) {
+    match &node.kind {
+        Kind::Text(t) => {
+            if t.trim().is_empty() { return; }
+            let mut rt = egui::RichText::new(t);
+            if node.style.bold { rt = rt.strong(); }
+            if node.style.italic { rt = rt.italics(); }
+            if node.style.code { rt = rt.monospace().background_color(colors.bg_raised); }
+            match &node.style.link {
+                Some(href) => {
+                    let r = ui.link(rt.color(colors.accent));
+                    let r = if href.trim().is_empty() { r } else { r.on_hover_text(href) };
+                    if r.clicked() { *act = Some(PageAction::Follow(href.clone())); }
+                }
+                None => { ui.label(rt.color(colors.text)); }
+            }
+        }
+
+        // AN IMAGE IS ITS ALT TEXT. No decoder here and no network, so the
+        // choice is between showing the alt text and showing nothing — and
+        // alt text is frequently the only description of a chart or a
+        // diagram that the page has. An image with no alt shows its file
+        // name, which at least says something was there.
+        Kind::Image { src, alt } => {
+            let label = if !alt.trim().is_empty() {
+                format!("🖼 {alt}")
+            } else {
+                let name = src.rsplit('/').next().unwrap_or(src);
+                format!("🖼 {}", if name.is_empty() { "image" } else { name })
+            };
+            ui.label(egui::RichText::new(label).italics().color(colors.text_weak))
+                .on_hover_text(src);
+        }
+
+        // An island cannot render statically — canvas, video, iframe. A
+        // placeholder with an action, rather than a blank: the reader can
+        // see that something is there and ask for it elsewhere, which is
+        // the honest version of "this page has a video in it".
+        Kind::Island { tag, src } => {
+            let label = format!("[{tag}]{}", if src.is_empty() { String::new() }
+                                             else { format!(" {src}") });
+            if ui.button(egui::RichText::new(label).small()).clicked() {
+                *act = Some(PageAction::OpenIsland { tag: tag.clone(), src: src.clone() });
+            }
+        }
+
+        Kind::Field { name, kind } => {
+            field_ui(ui, page, node, name, kind, state, colors, act, form);
+        }
+
+        Kind::Form { .. } => {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                for c in &node.children {
+                    node_ui(ui, page, c, state, colors, act, Some(node.id));
+                }
+            });
+        }
+
+        Kind::Table => {
+            egui::Grid::new(ui.id().with(("page_table", node.id.0)))
+                .striped(true).show(ui, |ui| {
+                for row in &node.children {
+                    for cell in &row.children {
+                        ui.horizontal_wrapped(|ui| {
+                            for c in &cell.children {
+                                node_ui(ui, page, c, state, colors, act, form);
+                            }
+                        });
+                    }
+                    ui.end_row();
+                }
+            });
+        }
+        // Reached only for a malformed tree — a row or cell outside a
+        // table. Drawn inline rather than skipped, because the text in it
+        // is still content.
+        Kind::Row | Kind::Cell => {
+            ui.horizontal_wrapped(|ui| {
+                for c in &node.children {
+                    node_ui(ui, page, c, state, colors, act, form);
+                }
+            });
+        }
+
+        Kind::Rule => { ui.separator(); }
+
+        Kind::Heading(level) => {
+            let size = match level { 1 => 22.0, 2 => 19.0, 3 => 16.0, _ => 14.0 };
+            ui.horizontal_wrapped(|ui| {
+                for c in &node.children {
+                    // The heading's own size, applied to its text children
+                    // by drawing them here rather than by mutating the
+                    // tree: the model says what a thing IS, and how big it
+                    // looks is the renderer's business.
+                    if let Kind::Text(t) = &c.kind {
+                        ui.label(egui::RichText::new(t).size(size).strong().color(colors.text));
+                    } else {
+                        node_ui(ui, page, c, state, colors, act, form);
+                    }
+                }
+            });
+        }
+
+        Kind::ListItem => {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("• ").color(colors.text_weak));
+                for c in &node.children {
+                    node_ui(ui, page, c, state, colors, act, form);
+                }
+            });
+        }
+
+        Kind::Quote => {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("▏").color(colors.accent_soft));
+                for c in &node.children {
+                    node_ui(ui, page, c, state, colors, act, form);
+                }
+            });
+        }
+
+        Kind::Code => {
+            ui.horizontal_wrapped(|ui| {
+                for c in &node.children {
+                    if let Kind::Text(t) = &c.kind {
+                        ui.label(egui::RichText::new(t).monospace()
+                            .background_color(colors.bg_raised).color(colors.text));
+                    } else {
+                        node_ui(ui, page, c, state, colors, act, form);
+                    }
+                }
+            });
+        }
+
+        Kind::Body | Kind::Paragraph => {
+            // A body stacks; a paragraph wraps. The difference matters:
+            // wrapping a body would put a form and the paragraph after it
+            // on one line.
+            if node.kind == Kind::Body {
+                for c in &node.children {
+                    node_ui(ui, page, c, state, colors, act, form);
+                }
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                    for c in &node.children {
+                        node_ui(ui, page, c, state, colors, act, form);
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn field_ui(ui: &mut egui::Ui, page: &Page, node: &Node, name: &str, kind: &FieldKind,
+            state: &mut FormState, colors: &uikit_egui::PaletteColors,
+            act: &mut Option<PageAction>, form: Option<NodeId>) {
+    match kind {
+        // NOT DRAWN, and that is the whole point of the variant. A hidden
+        // field still submits — `submit` collects it — and drawing it would
+        // put a CSRF token on screen as an editable box.
+        FieldKind::Hidden { .. } => {}
+
+        FieldKind::Text { placeholder } | FieldKind::Password { placeholder } => {
+            let mut v = state.value(page, node.id);
+            let pw = matches!(kind, FieldKind::Password { .. });
+            let edit = egui::TextEdit::singleline(&mut v)
+                .hint_text(placeholder.as_str())
+                .password(pw)
+                .desired_width(180.0);
+            if ui.add(edit).changed() {
+                state.set(node.id, v);
+            }
+        }
+
+        FieldKind::TextArea => {
+            let mut v = state.value(page, node.id);
+            if ui.add(egui::TextEdit::multiline(&mut v).desired_rows(3)).changed() {
+                state.set(node.id, v);
+            }
+        }
+
+        FieldKind::Checkbox => {
+            let mut c = state.checked(node.id);
+            // The label is the field's name when it has one: an unlabelled
+            // checkbox is a box you cannot know the meaning of, and the
+            // name is the only description the markup gives us here.
+            if ui.checkbox(&mut c, name).changed() {
+                state.set_checked(node.id, c);
+            }
+        }
+
+        FieldKind::Select { options } => {
+            let cur = state.value(page, node.id);
+            egui::ComboBox::from_id_salt(("page_select", node.id.0))
+                .selected_text(cur.clone())
+                .show_ui(ui, |ui| {
+                    for o in options {
+                        if ui.selectable_label(*o == cur, o).clicked() {
+                            state.set(node.id, o.clone());
+                        }
+                    }
+                });
+        }
+
+        FieldKind::Submit { label } => {
+            let text = if label.trim().is_empty() { "Submit" } else { label.as_str() };
+            if ui.button(text).clicked() {
+                // Only inside a form. A submit button outside one submits
+                // nothing, which is what a browser does — and inventing a
+                // target would post the page's fields somewhere nobody
+                // asked for.
+                if let Some(f) = form {
+                    if let Some(sub) = submit(page, state, f) {
+                        *act = Some(PageAction::Submit(sub));
+                    }
+                }
+            }
+        }
+    }
+    let _ = colors;
+}
+
+#[cfg(test)]
+mod link_style_tests {
+    use super::*;
+
+    #[test]
+    fn the_text_inside_an_anchor_carries_the_href() {
+        // The renderer decides a link from `style.link` on the TEXT node,
+        // because that is the thing it draws. An `<a>` that records the
+        // href only on its own node produces a page whose links are
+        // unclickable, which is exactly what the frame test found.
+        let page = parse_page("<p><a href=\"/next\">onward</a></p>");
+        let mut found = None;
+        page.root.walk(&mut |n| {
+            if let Kind::Text(t) = &n.kind {
+                if t.contains("onward") { found = n.style.link.clone(); }
+            }
+        });
+        assert_eq!(found.as_deref(), Some("/next"),
+                   "the anchor's href did not reach the text it wraps");
+    }
+
+    #[test]
+    fn nested_inline_styles_all_reach_the_run() {
+        // `<a><b>text</b></a>` is a bold link, not one or the other.
+        let page = parse_page("<p><a href=\"/x\"><b>bold link</b></a></p>");
+        let mut got = None;
+        page.root.walk(&mut |n| {
+            if let Kind::Text(t) = &n.kind {
+                if t.contains("bold link") { got = Some(n.style.clone()); }
+            }
+        });
+        let st = got.expect("no text run");
+        assert!(st.bold, "the bold was lost");
+        assert_eq!(st.link.as_deref(), Some("/x"), "the href was lost");
+    }
+
+    #[test]
+    fn a_style_does_not_leak_to_a_sibling() {
+        // Push-down walks a node's OWN children. A bold span must not bold
+        // the paragraph after it.
+        let page = parse_page("<p><b>bold</b></p><p>plain</p>");
+        let mut plain_bold = None;
+        page.root.walk(&mut |n| {
+            if let Kind::Text(t) = &n.kind {
+                if t.contains("plain") { plain_bold = Some(n.style.bold); }
+            }
+        });
+        assert_eq!(plain_bold, Some(false), "styling leaked to a sibling");
+    }
 }
 
 #[cfg(test)]

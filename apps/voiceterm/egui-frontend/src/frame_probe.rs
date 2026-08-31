@@ -183,6 +183,123 @@ mod tests {
         assert_eq!(href.as_deref(), Some("#sed"));
     }
 
+    /// The page renderer, driven through frames.
+    ///
+    /// `doc.rs` carried the page model, a parser, `FormState` and `submit`
+    /// with NO renderer for the life of the port — the model that exists to
+    /// replace web2qml had never been on screen. These live here rather
+    /// than in the kit because that is where the harness is, and a
+    /// renderer's first tests should be the ones that run it.
+    mod page {
+        use super::*;
+        use uikit_web::doc::{parse_page, FieldKind, FormState, Kind, PageAction};
+
+        const LOGIN: &str = "<form action=\"/in\" method=\"post\">\
+            <input type=\"hidden\" name=\"csrf\" value=\"tok123\">\
+            <input type=\"text\" name=\"user\" placeholder=\"Username\">\
+            <input type=\"password\" name=\"pw\" placeholder=\"Password\">\
+            <input type=\"submit\" value=\"Sign in\">\
+            </form>";
+
+        #[test]
+        fn a_form_submits_what_was_typed_including_the_hidden_token() {
+            // The CSRF case this crate's own doc calls out: a hidden field
+            // is never drawn and must still submit, because a login that
+            // posts without one fails in a way that looks like a wrong
+            // password.
+            let p = Probe::default();
+            let c = p.colors();
+            let page = parse_page(LOGIN);
+            let mut st = FormState::default();
+            // Type into the username field by id — the harness clicks, it
+            // does not type, and what is under test is the submission.
+            let user = page.fields.iter().copied()
+                .find(|id| matches!(page.root.find(*id).map(|n| &n.kind),
+                    Some(Kind::Field { name, .. }) if name == "user"))
+                .expect("no username field");
+            st.set(user, "ada");
+
+            let act = p.click_text("Sign in", |ui|
+                uikit_web::doc::render_page(ui, &page, &mut st, &c));
+            match act {
+                Some(PageAction::Submit(s)) => {
+                    assert_eq!(s.action, "/in");
+                    assert!(s.query.contains("csrf=tok123"),
+                            "the hidden token did not submit: {}", s.query);
+                    assert!(s.query.contains("user=ada"), "{}", s.query);
+                }
+                other => panic!("submit produced {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_password_field_is_drawn_and_its_value_is_not() {
+            // A password echoed into the frame is a password in a
+            // screenshot. Asserted on what was PAINTED, which is the only
+            // place this can be checked.
+            let p = Probe::default();
+            let c = p.colors();
+            let page = parse_page(LOGIN);
+            let mut st = FormState::default();
+            let pw = page.fields.iter().copied()
+                .find(|id| matches!(page.root.find(*id).map(|n| &n.kind),
+                    Some(Kind::Field { kind: FieldKind::Password { .. }, .. })))
+                .expect("no password field");
+            st.set(pw, "hunter2");
+            let (d, _) = p.frame(|ui| uikit_web::doc::render_page(ui, &page, &mut st, &c));
+            assert!(!d.has("hunter2"), "the password was painted: {:?}", d.texts);
+            // Masked, not absent — the field is drawn, its value is not.
+            // (The placeholder is gone precisely BECAUSE there is a value,
+            // which is what a hint text means; my first version asserted
+            // the opposite and was wrong about egui, not about the code.)
+            assert!(d.texts.iter().any(|t| t.chars().all(|ch| ch == '•') && !t.is_empty()),
+                    "the password field drew nothing at all: {:?}", d.texts);
+        }
+
+        #[test]
+        fn a_hidden_field_is_not_drawn_as_a_box() {
+            // Drawing it would put a CSRF token on screen as an editable
+            // field, which is both wrong and an invitation.
+            let p = Probe::default();
+            let c = p.colors();
+            let page = parse_page(LOGIN);
+            let mut st = FormState::default();
+            let (d, _) = p.frame(|ui| uikit_web::doc::render_page(ui, &page, &mut st, &c));
+            assert!(!d.has("tok123"), "the hidden value was drawn: {:?}", d.texts);
+        }
+
+        #[test]
+        fn a_link_in_a_page_is_followed_and_an_image_shows_its_alt() {
+            // No decoder and no network here, so an image is its alt text
+            // — frequently the only description of a chart the page has.
+            let p = Probe::default();
+            let c = p.colors();
+            let page = parse_page(
+                "<p><a href=\"/next\">onward</a></p>\
+                 <p><img src=\"/chart.png\" alt=\"revenue by quarter\"></p>");
+            let mut st = FormState::default();
+            let (d, _) = p.frame(|ui| uikit_web::doc::render_page(ui, &page, &mut st, &c));
+            assert!(d.has("revenue by quarter"), "the alt text is missing: {:?}", d.texts);
+
+            let act = p.click_text("onward", |ui|
+                uikit_web::doc::render_page(ui, &page, &mut st, &c));
+            assert_eq!(act, Some(PageAction::Follow("/next".into())));
+        }
+
+        #[test]
+        fn a_submit_button_outside_a_form_posts_nothing() {
+            // What a browser does. Inventing a target would send the page's
+            // fields somewhere nobody asked for.
+            let p = Probe::default();
+            let c = p.colors();
+            let page = parse_page("<input type=\"submit\" value=\"Go\">");
+            let mut st = FormState::default();
+            let act = p.click_text("Go", |ui|
+                uikit_web::doc::render_page(ui, &page, &mut st, &c));
+            assert_eq!(act, None);
+        }
+    }
+
     #[test]
     fn a_click_somewhere_else_does_not_reach_it() {
         // The other half: a harness that reports a click everywhere is
