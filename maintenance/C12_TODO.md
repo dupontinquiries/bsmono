@@ -5677,3 +5677,47 @@ studio-app 71/71.
   `is_loop`-style detection for `.sf2` files is not written.
 - **C101b — no renderer.** Silence until a host registers an sf2 engine,
   which is a dependency decision rather than a wiring one.
+
+## 102. fleet_build: shared cache, and a gated ramdisk
+
+Operator: ~40 GB of artifacts per iteration, wearing the SSD; could
+`fleet_build.sh` put them in a ramdisk behind a flag?
+
+**Yes, and the flag is the second-best half of the fix.** The 40 GB is
+not because a build is large — it is because each iteration is a FRESH
+TREE. The fleet logs come from paths like
+`.../c12unified/157/apps/rusty-board/target/`, so every run starts cold
+and rewrites everything.
+
+That splits into two fixes, and only one is about the SSD:
+
+  1. **Share the cache across iterations** (`CARGO_TARGET_DIR` outside
+     the iteration tree). Turns 40 GB of cold writes into a few GB of
+     incremental ones — saves the disk AND most of the wall time. Free,
+     needs no RAM, and is now the DEFAULT.
+  2. **Put it in RAM** (`RAMCACHE=1`). Saves the remaining writes.
+
+Doing (2) without (1) is the expensive way round: a ramdisk thrown away
+every reboot still rebuilds cold, so it buys SSD life and no speed.
+
+**The size check is the whole safety of the ramdisk idea.** tmpfs is
+SWAP-BACKED — if the build outgrows it the kernel does not fail the
+write, it pages to swap, which is on the SSD, in small random writes
+that are worse for the drive than the sequential ones this was meant to
+avoid. So `RAMCACHE=1` REFUSES loudly and stays on disk when `/dev/shm`
+has less than `FLEET_RAMCACHE_GB` (45 default) free, and prints the
+remount command.
+
+`/dev/shm` rather than a new mount: the distro already provides it, so
+this needs no root and no fstab entry.
+
+Default OFF. A 16 GB machine should not start swapping because a script
+decided RAM was free.
+
+Tested all three paths here: default picks the shared dir, an explicit
+`CARGO_TARGET_DIR` wins over both, and `RAMCACHE=1` correctly refused —
+this sandbox has 2 GiB in `/dev/shm`.
+
+- **C102a — `CARGO_PROFILE_DEV_DEBUG=0` was already set**, which is the
+  other big artifact reducer and was already right. Worth recording as a
+  pass rather than re-discovering it.

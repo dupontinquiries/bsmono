@@ -102,6 +102,79 @@ start_tests() {
     TEST_PIDS+=($!)
 }
 
+# ── Where build artifacts go ─────────────────────────────────────────
+#
+# ~40 GB per iteration, and the reason is not that a build is large: it
+# is that each iteration is a FRESH TREE. The fleet logs come from
+# paths like `.../c12unified/157/apps/rusty-board/target/`, so every
+# run starts with a cold cache and rewrites everything from scratch.
+#
+# That gives two separate fixes, and they are worth keeping separate
+# because only one of them is about the SSD:
+#
+#   1. SHARE the cache across iterations (CARGO_TARGET_DIR). Turns 40 GB
+#      of cold writes into a few GB of incremental ones. Saves the disk
+#      AND most of the wall time. This is the bigger win and it does not
+#      need a ramdisk.
+#   2. Put that cache in RAM (RAMCACHE=1). Saves the remaining writes.
+#
+# Doing (2) without (1) is the expensive way round: a ramdisk that is
+# thrown away every reboot still rebuilds from cold, so it buys SSD life
+# and no speed.
+#
+# ## What RAMCACHE actually costs
+#
+# tmpfs is SWAP-BACKED. If the build outgrows the tmpfs, the kernel does
+# not fail the write — it pages to swap, which is on the SSD, in small
+# random writes that are worse for the drive than the sequential ones
+# this was meant to avoid. So the size check below is not politeness,
+# it is the whole safety of the idea.
+#
+# Default OFF. A machine with 16 GB should not silently start swapping
+# because a script decided RAM was free.
+setup_cache() {
+    # An explicit CARGO_TARGET_DIR from the caller always wins: somebody
+    # who has already pointed this somewhere knows more than this script.
+    if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+        echo "cache: $CARGO_TARGET_DIR (from the environment)"
+        return
+    fi
+
+    if [ "${RAMCACHE:-0}" != "1" ]; then
+        # The shared-cache half, which is free and helps regardless.
+        # Outside the iteration tree ON PURPOSE — a cache inside
+        # `.../157/` is a cache that dies with the iteration, which is
+        # the thing costing 40 GB a run.
+        export CARGO_TARGET_DIR="${FLEET_CACHE:-$HOME/.cache/fleet-build/target}"
+        mkdir -p "$CARGO_TARGET_DIR"
+        echo "cache: $CARGO_TARGET_DIR (shared on disk; RAMCACHE=1 for tmpfs)"
+        return
+    fi
+
+    local mnt="${FLEET_RAMDISK:-/dev/shm/fleet-build}"
+    # /dev/shm is a tmpfs the distro already mounts, so this needs no
+    # root and no fstab entry. Its default size is half of RAM, which is
+    # also the number worth checking against.
+    local avail_kb
+    avail_kb=$(df -k /dev/shm 2>/dev/null | awk 'NR==2 {print $4}')
+    local need_kb=$(( ${FLEET_RAMCACHE_GB:-45} * 1024 * 1024 ))
+    if [ -z "$avail_kb" ] || [ "$avail_kb" -lt "$need_kb" ]; then
+        # REFUSED, loudly, and the build still runs on disk. Falling
+        # through to a too-small tmpfs is how a machine ends up swapping
+        # mid-build and blaming cargo.
+        echo "RAMCACHE: /dev/shm has $(( ${avail_kb:-0} / 1024 / 1024 )) GiB free," \
+             "want $(( need_kb / 1024 / 1024 )) — staying on disk." >&2
+        echo "  (raise it with: sudo mount -o remount,size=48G /dev/shm)" >&2
+        export CARGO_TARGET_DIR="${FLEET_CACHE:-$HOME/.cache/fleet-build/target}"
+        mkdir -p "$CARGO_TARGET_DIR"
+        return
+    fi
+    mkdir -p "$mnt"
+    export CARGO_TARGET_DIR="$mnt"
+    echo "cache: $mnt (tmpfs, $(( avail_kb / 1024 / 1024 )) GiB free)"
+}
+setup_cache
+
 check() {
     local dir="$1" label="$2" mode="$3"
     # `< /dev/null` for the same reason as the test runs above. This one is in
