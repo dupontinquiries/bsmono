@@ -81,6 +81,39 @@ true scale for the first time.
 
 Each carries a status header saying exactly which parts to distrust.
 
+## The Optimus / Megatron question, measured
+
+An open creative decision, recorded so that whenever it is picked up the cost
+is known rather than guessed at. Three findings, and they make the decision
+smaller than it looks.
+
+**The team-up already exists and already ships.** Missions 8 and 9 —
+`the_ashen_truce` and `beneath_the_pacific`, both Film 3 — are exactly that
+beat, playable today. Megatron crosses the shield with his transponder open and
+his weapons cold ("the devourer eats decepticons too"); Prime meets him at the
+airlock, no speech, "two old soldiers, one war left"; and under the closing
+plates Megatron plants himself and says "go", nothing else. "They never find
+megatron. prime marks the spot anyway. the war's oldest debt, paid last."
+Whatever is decided about names, that is written and it is not at risk.
+
+**Neither is a playable or fieldable unit.** Zero `Troop` entries, nothing in
+`roster.rs`, `bots.rs`, `loadout.rs` or `census.rs`. They exist as two
+`codex.rs` entries and as prose inside mission intro/outro lines. So "renaming
+would leave them as non-playables" is not a cost of renaming — it is already
+the case, for unrelated reasons.
+
+**The rename is prose, not structure.** 25 mentions of Optimus and 15 of
+Megatron across `src/`, concentrated in `content.rs` mission text and two codex
+entries, plus 14 and 8 in `docs/`. No system depends on either name; nothing
+keys off them. `saga::join_tests::the_inherited_contamination_is_counted_not_hidden`
+already counts them, so progress on it is visible either way.
+
+What that leaves is the narrow question rather than the broad one: not whether
+independence costs the team-up, but what those two characters are called. The
+beat is structural — two enemies whose war defined an era, made small by
+something neither can fight alone, one of them paying for it — and it survives
+any names at all.
+
 ## One character the newest canon introduces and the game has never heard of
 
 **Meridian.** She speaks in both Films 5 and 6 — the sensor and tactical
