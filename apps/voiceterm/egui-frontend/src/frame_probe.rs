@@ -310,7 +310,7 @@ mod tests {
                 let c = p.colors();
                 let mut scene = A11yScene::new();
                 scene.begin_frame();
-                let mut io = PageUi { a11y: Some(&mut scene), activate: None };
+                let mut io = PageUi { a11y: Some(&mut scene), ..Default::default() };
                 p.frame(|ui| uikit_web::doc::render_page_with(ui, page, st, &c, &mut io));
                 scene.glove_targets()
             }
@@ -358,6 +358,7 @@ mod tests {
                 let mut io = PageUi {
                     a11y: Some(&mut scene),
                     activate: Some(uikit_web::doc::NodeId(id)),
+                    ..Default::default()
                 };
                 let (_, act) = p.frame(|ui|
                     uikit_web::doc::render_page_with(ui, &page, &mut st, &c, &mut io));
@@ -379,7 +380,7 @@ mod tests {
                             kind: uikit_web::doc::FieldKind::Checkbox, .. })))
                     .expect("no checkbox");
                 assert!(!st.checked(cb));
-                let mut io = PageUi { a11y: None, activate: Some(cb) };
+                let mut io = PageUi { activate: Some(cb), ..Default::default() };
                 p.frame(|ui| uikit_web::doc::render_page_with(ui, &page, &mut st, &c, &mut io));
                 assert!(st.checked(cb), "activation did not toggle the box");
             }
@@ -397,7 +398,7 @@ mod tests {
                         Some(uikit_web::doc::Kind::Field {
                             kind: uikit_web::doc::FieldKind::Checkbox, .. })))
                     .unwrap();
-                let mut io = PageUi { a11y: None, activate: Some(cb) };
+                let mut io = PageUi { activate: Some(cb), ..Default::default() };
                 p.frame(|ui| uikit_web::doc::render_page_with(ui, &page, &mut st, &c, &mut io));
                 assert!(st.checked(cb));
                 assert_eq!(io.activate, None, "the request was not consumed");

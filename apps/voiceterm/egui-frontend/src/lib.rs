@@ -31,6 +31,7 @@ pub mod mail_selector;
 pub mod frame_probe;
 pub mod mail_rfc822;
 pub mod mail_store;
+pub mod web_prefs;
 pub mod token_log;
 pub mod connections_graph;
 pub mod summary_queue;

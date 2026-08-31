@@ -47,13 +47,17 @@ pub enum Surface {
     CmdSheet,
     /// The command palette (QML paletteDrawer; rendered as a window).
     Palette,
+    /// Web rendering settings — global and per site. No permanent control
+    /// opens this: the defaults suit almost everyone, and a knob on screen
+    /// for something touched twice a year costs everyone who never does.
+    WebSettings,
 }
 
 impl Surface {
     /// Every variant, for exhaustive tests. If a surface is added, the
     /// `all_pairs_are_exclusive` test covers it by construction — but only if
     /// it is added HERE too, which `variant_count_matches_the_enum` enforces.
-    pub const ALL: [Surface; 7] = [
+    pub const ALL: [Surface; 8] = [
         Surface::Blocks,
         Surface::MissingPkg,
         Surface::Workspaces,
@@ -61,6 +65,7 @@ impl Surface {
         Surface::Favorites,
         Surface::CmdSheet,
         Surface::Palette,
+        Surface::WebSettings,
     ];
 }
 
@@ -142,7 +147,8 @@ mod tests {
                 | Surface::Settings
                 | Surface::Favorites
                 | Surface::CmdSheet
-                | Surface::Palette => {}
+                | Surface::Palette
+                | Surface::WebSettings => {}
             }
         }
         let mut sorted: Vec<_> = Surface::ALL.iter().map(|s| format!("{s:?}")).collect();
@@ -170,7 +176,12 @@ mod tests {
                 pairs += 1;
             }
         }
-        assert_eq!(pairs, 42, "7 surfaces should give 42 ordered pairs");
+        // n(n-1) ordered pairs, derived rather than written: a literal has
+        // to be edited every time a surface is added, and the edit is the
+        // part people get wrong.
+        let n = Surface::ALL.len();
+        assert_eq!(pairs, n * (n - 1), "{n} surfaces should give {} ordered pairs",
+                   n * (n - 1));
     }
 
     #[test]

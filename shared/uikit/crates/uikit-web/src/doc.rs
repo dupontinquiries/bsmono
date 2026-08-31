@@ -552,8 +552,15 @@ pub enum PageAction {
 ///
 /// Registering here rather than in the app is what makes it work for every
 /// page: the renderer is the only thing that knows where a link ended up.
-#[derive(Default)]
 pub struct PageUi<'a> {
+    /// Draw a placeholder for an image (its alt text). Off hides them.
+    ///
+    /// A rendering setting rather than a parse one, because it is the
+    /// renderer that draws a placeholder — the model keeps the image
+    /// either way, so turning this back on does not need a re-parse.
+    pub images: bool,
+    /// Draw a placeholder for canvas, video and iframe.
+    pub islands: bool,
     /// Collects every actionable node's rect and role. Feed
     /// `scene.glove_targets()` to glove mode; the ids are `NodeId.0`.
     pub a11y: Option<&'a mut uikit_egui::a11y::A11yScene>,
@@ -564,6 +571,15 @@ pub struct PageUi<'a> {
     /// person who cannot aim does not have. This addresses the node by
     /// identity instead.
     pub activate: Option<NodeId>,
+}
+
+impl Default for PageUi<'_> {
+    fn default() -> Self {
+        // Both ON: a reader who has configured nothing should see that a
+        // picture and a video are there. Hiding by default would silently
+        // remove content.
+        PageUi { images: true, islands: true, a11y: None, activate: None }
+    }
 }
 
 /// Draw a page, and collect what glove mode needs to steer it.
@@ -651,6 +667,7 @@ fn node_ui(ui: &mut egui::Ui, page: &Page, node: &Node, state: &mut FormState,
         // diagram that the page has. An image with no alt shows its file
         // name, which at least says something was there.
         Kind::Image { src, alt } => {
+            if !io.images { return; }
             let label = if !alt.trim().is_empty() {
                 format!("🖼 {alt}")
             } else {
@@ -666,6 +683,7 @@ fn node_ui(ui: &mut egui::Ui, page: &Page, node: &Node, state: &mut FormState,
         // see that something is there and ask for it elsewhere, which is
         // the honest version of "this page has a video in it".
         Kind::Island { tag, src } => {
+            if !io.islands { return; }
             let label = format!("[{tag}]{}", if src.is_empty() { String::new() }
                                              else { format!(" {src}") });
             let r = ui.button(egui::RichText::new(&label).small());

@@ -730,6 +730,9 @@ struct VoicetermApp {
     /// the bar is drawn in its own panel, before the terminal that reports
     /// it.
     bar_note: String,
+    /// Global and per-site web rendering settings. Loaded once; written
+    /// when something changes, not per frame.
+    web_prefs: voiceterm_egui::web_prefs::WebPrefs,
     /// The graph's SOURCE, not a prebuilt topology.
     ///
     /// A previous pass drew `Topology::new(&[], &[])` — an empty graph, which
@@ -786,6 +789,41 @@ impl VoicetermApp {
             // working and now move the column that actually holds the tabs.
             Command::ToggleRail => { self.tabbar_open = !self.tabbar_open; }
             Command::ToggleSettings => { self.surfaces.toggle(Surface::Settings); }
+            Command::ToggleWebSettings => { self.surfaces.toggle(Surface::WebSettings); }
+            // A site rule from the palette, without opening a panel: this
+            // is what people actually want when a page has eaten its own
+            // sidebar or is unreadable through the ads.
+            Command::SiteFilter(level) => {
+                use voiceterm_egui::browser::FilterMode;
+                use voiceterm_egui::palette::FilterLevel;
+                let mode = match level {
+                    FilterLevel::Off => FilterMode::Off,
+                    FilterLevel::Standard => FilterMode::Standard,
+                    FilterLevel::Aggressive => FilterMode::Aggressive,
+                };
+                match voiceterm_egui::web_prefs::host_of(&self.browser.url) {
+                    Some(h) => {
+                        self.web_prefs.site_mut(&h).filter = Some(mode);
+                        self.save_web_prefs();
+                        self.toasts.info(format!("{h}: ads {}", level.label()), 0.0);
+                    }
+                    // Refused rather than applied globally. "For this site"
+                    // with no site is a command whose target the person
+                    // cannot see, and silently making it global is the
+                    // worst reading of it.
+                    None => self.toasts.warning("no site open", 0.0),
+                }
+            }
+            Command::SiteReset => {
+                match voiceterm_egui::web_prefs::host_of(&self.browser.url) {
+                    Some(h) => {
+                        self.web_prefs.sites.retain(|(p, _)| *p != h);
+                        self.save_web_prefs();
+                        self.toasts.info(format!("{h}: following the defaults"), 0.0);
+                    }
+                    None => self.toasts.warning("no site open", 0.0),
+                }
+            }
         }
     }
 
@@ -944,6 +982,16 @@ impl VoicetermApp {
         }
     }
 
+    /// Persist the web settings, reporting a failure rather than losing it.
+    ///
+    /// Silently, a write failure means a setting that works until restart —
+    /// which is the shape of bug people spend an evening on.
+    fn save_web_prefs(&mut self) {
+        if let Err(e) = voiceterm_egui::web_prefs::store(&self.web_prefs) {
+            self.toasts.warning(format!("web settings not saved: {e}"), 0.0);
+        }
+    }
+
     /// Draw the phone bottom bar and act on what it produces.
     ///
     /// The BUTTONS are built fresh each frame from live state rather than
@@ -1077,6 +1125,26 @@ impl eframe::App for VoicetermApp {
         // FAVORITES. Read fresh each draw rather than on open: the QML
         // refreshes on open for the same reason, and "each draw" is strictly
         // fresher for the cost of parsing one small XML file.
+        // WEB SETTINGS. No permanent control opens this — the palette,
+        // the manual and voice are the three doors, which is what "out of
+        // the way until you need it" means here.
+        let web_t = overlay::openness(ctx, Surface::WebSettings,
+                                      self.surfaces.is(Surface::WebSettings));
+        if web_t > 0.0 {
+            let colors = self.colors;
+            let url = self.browser.url.clone();
+            let mut dirty = false;
+            overlay::show(ctx, Surface::WebSettings, web_t, |ui| {
+                dirty = voiceterm_egui::web_prefs::web_settings_ui(
+                    ui, &mut self.web_prefs, &url, &colors);
+            });
+            // Written on CHANGE, not per frame: the panel is open for as
+            // long as someone is reading it, and rewriting the file sixty
+            // times a second to record nothing is how a config file gets
+            // truncated by a crash at the wrong moment.
+            if dirty { self.save_web_prefs(); }
+        }
+
         let open_t = overlay::openness(ctx, Surface::Favorites, self.surfaces.is(Surface::Favorites));
         if open_t > 0.0 {
             let colors = self.colors;
@@ -3820,6 +3888,16 @@ fn main() -> eframe::Result<()> {
                             include_str!("../../../docs/PANE_VOICE.md")),
                         doc("niftyplot", "niftyplot spec",
                             include_str!("../../../docs/niftyplot-spec.md")),
+                        // The third door to the web settings, after the
+                        // palette and voice. Already HTML rather than
+                        // markdown, so it goes in directly — `doc()`
+                        // converts, and converting hand-written HTML back
+                        // and forth would only lose it.
+                        voiceterm_egui::manpage_view::Doc {
+                            name: "web".into(),
+                            title: "web rendering".into(),
+                            html: voiceterm_egui::web_prefs::manual_html().to_string(),
+                        },
                     ]);
                     v
                 },
@@ -3939,6 +4017,7 @@ fn main() -> eframe::Result<()> {
                 palette_sel: 0,
                 workspaces_filter: String::new(),
                 bar_note: String::new(),
+                web_prefs: voiceterm_egui::web_prefs::load(),
                 graph_source: String::new(),
             };
             // ONE SCAN AT STARTUP, so the mail views have something the
