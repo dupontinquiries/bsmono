@@ -5466,6 +5466,32 @@ presets it bootstrapped that are not on disk yet.
 
 bo-mux 271/271, bo-suite-egui 416/416.
 
-- **C97a — the four new commands have no UI.** Transport (play/stop) is
-  the obvious next one, and it needs the Devices page rather than
-  Soundscape.
+- **C97a — DONE, and the Devices page was the wrong guess.** I expected
+  transport to belong there. It does not: `transport.playing` and
+  `Device::playing` are the TRACK PLAYER, and a soundscape is a separate
+  thing the daemon runs. One play button for both would make stopping
+  the music stop the ambience.
+
+  Scene transport lives beside the scene, in Soundscape, with its own
+  `scene_playing`.
+
+  Four decisions:
+  - **Shown only once a scene is loaded.** Play with nothing loaded is a
+    button whose only outcome is an error.
+  - **No seed passed to `play`.** The daemon picks one; a fixed seed
+    would make every play of a scene identical, which defeats a
+    generative soundscape.
+  - **`scene_playing` clears on success only.** A stop the daemon
+    refused leaves it playing, and showing "stopped" over a scene that
+    is still audible is worse than showing the error.
+  - **Loading a scene clears it too.** Loading REPLACES what the daemon
+    holds, so whatever was playing is not any more — leaving the flag
+    would show "▶" over a scene swapped out from under it.
+
+  416/416.
+
+- **C97b — `status` is still uncalled.** It is what would make
+  `scene_playing` a REPORT rather than a guess: right now the flag
+  records what this UI asked for, and a scene started from the CLI or
+  stopped by the daemon would leave it wrong. Polling it needs a
+  cadence decision — every frame is a socket connect per frame.

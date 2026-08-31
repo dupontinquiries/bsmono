@@ -431,6 +431,12 @@ pub struct Controller {
     /// matches the reply BY id and a reused one could pick up the
     /// previous call's answer.
     pub scene_seq: u64,
+    /// Whether the DAEMON reports the scene playing.
+    ///
+    /// Separate from `transport.playing`, which is the track player:
+    /// one button for both would make stopping the music stop the
+    /// ambience.
+    pub scene_playing: bool,
     pub settings: crate::settings_page::SettingsPage,
     pub sinks: crate::settings_page::SinkPicker,
     pub now: crate::chrome::NowPlaying,
@@ -455,7 +461,7 @@ pub struct Controller {
 impl Controller {
     pub fn new(devices: Vec<Device>, scenes: Vec<Scene>) -> Self {
         Controller { nav: uikit_egui::nav::Nav::new(VIEWS.len()), scene_loaded: None,
-            scene_seq: 0,
+            scene_seq: 0, scene_playing: false,
             strip: uikit_egui::segmented_tabs::TabStrip::new(&VIEWS),
             devices, scenes, active_scene: 0,
             breath: uikit_egui::motion::Breath::new(2200.0, 0.35, 1.0),
@@ -1396,6 +1402,13 @@ impl Controller {
                                 match bo_mux::control::load_scene(self.scene_seq, name) {
                                     Ok(_) => {
                                         self.scene_loaded = Some(name.clone());
+                                        // Loading REPLACES what the
+                                        // daemon holds, so whatever was
+                                        // playing is not any more.
+                                        // Leaving this true would show
+                                        // "▶" over a scene that was
+                                        // swapped out from under it.
+                                        self.scene_playing = false;
                                         self.toast.show(&format!(
                                             "{name}: {} layers", cfg.layers.len()));
                                     }
@@ -1415,7 +1428,49 @@ impl Controller {
                 }
             });
             if let Some(n) = &self.scene_loaded {
-                ui.colored_label(c.text_weak, format!("loaded {n}"));
+                ui.horizontal(|ui| {
+                    ui.colored_label(c.text_weak, format!("loaded {n}"));
+                    // SCENE transport, not the music player's. The
+                    // `transport` field above drives the track player;
+                    // a soundscape is a separate thing the daemon runs,
+                    // and sharing one play button would make stopping
+                    // the music stop the ambience too.
+                    //
+                    // Shown only once a scene is loaded: play with
+                    // nothing loaded is a button whose only outcome is
+                    // an error.
+                    if ui.button("play").clicked() {
+                        self.scene_seq += 1;
+                        // No seed: the daemon picks one. Passing a fixed
+                        // seed here would make every play of a scene
+                        // identical, which defeats a generative
+                        // soundscape.
+                        match bo_mux::control::play(self.scene_seq, None) {
+                            Ok(_) => {
+                                self.scene_playing = true;
+                                self.toast.show("playing");
+                            }
+                            Err(e) => self.toast.show(&e.message()),
+                        }
+                    }
+                    if ui.button("stop").clicked() {
+                        self.scene_seq += 1;
+                        match bo_mux::control::stop(self.scene_seq) {
+                            // Cleared on success ONLY. A stop the daemon
+                            // refused leaves it playing, and showing
+                            // "stopped" over a scene that is still
+                            // audible is worse than showing the error.
+                            Ok(_) => {
+                                self.scene_playing = false;
+                                self.toast.show("stopped");
+                            }
+                            Err(e) => self.toast.show(&e.message()),
+                        }
+                    }
+                    if self.scene_playing {
+                        ui.colored_label(c.text_weak, "▶");
+                    }
+                });
             }
         }
         ui.separator();
