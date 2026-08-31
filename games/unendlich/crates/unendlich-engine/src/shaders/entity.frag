@@ -85,6 +85,38 @@ void main() {
     // Eye→fragment distance in world units (same basis as chunk.frag).
     float dist = length(ubo.camera_pos.xyz - v_world_pos);
 
+    // r-fp-nearclip: dithered "screen door" cutout for very-close entity
+    // geometry. Specifically for the player's own first-person avatar
+    // (`fp_body`) — its head/torso otherwise fills most of the screen
+    // while bobbing right in front of the camera, since nothing else in
+    // the game gets this close to the eye in first person. Mirrors
+    // chunk.frag's water dithered-transparency technique (ordered 4x4
+    // Bayer pattern, r448) rather than a smooth alpha fade: discard is
+    // order-independent for a solid mesh with overlapping body parts,
+    // where blending could show seams or wrong-order artifacts depending
+    // on draw order within the avatar itself.
+    //
+    // Fades in smoothly from NEAR_CUTOUT_START (still solid) to fully
+    // discarded at NEAR_CUTOUT_FULL, so the avatar thins out and vanishes
+    // as it approaches the eye instead of hard-popping at one distance.
+    const float NEAR_CUTOUT_START = 1.35; // world units; solid outside this
+    const float NEAR_CUTOUT_FULL  = 0.30; // world units; fully gone inside this
+    if (dist < NEAR_CUTOUT_START) {
+        float cutout = clamp(
+            (NEAR_CUTOUT_START - dist) / (NEAR_CUTOUT_START - NEAR_CUTOUT_FULL),
+            0.0, 1.0);
+        int ndx = int(gl_FragCoord.x) & 3;
+        int ndy = int(gl_FragCoord.y) & 3;
+        float nbayer[16] = float[16](
+             0.0/16.0,  8.0/16.0,  2.0/16.0, 10.0/16.0,
+            12.0/16.0,  4.0/16.0, 14.0/16.0,  6.0/16.0,
+             3.0/16.0, 11.0/16.0,  1.0/16.0,  9.0/16.0,
+            15.0/16.0,  7.0/16.0, 13.0/16.0,  5.0/16.0);
+        if (cutout > nbayer[ndy * 4 + ndx]) {
+            discard;
+        }
+    }
+
     // Screen-space froxel column UV — identical to chunk.frag.
     vec2 frag_uv = gl_FragCoord.xy / ubo.viewport_rect.xy;
 
