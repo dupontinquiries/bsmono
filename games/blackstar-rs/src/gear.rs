@@ -113,7 +113,18 @@ impl Item {
             let v = it.next()?;
             let e = it.next()?;
             let verb = *VERBS.iter().find(|x| verb_name(**x) == v)?;
-            let element = *ELEMENTS.iter().find(|x| x.name() == e)?;
+            // `ELEMENTS` (weapons.rs) is deliberately the CYCLE-ABLE set for
+            // the Watch's attunement and does not include `Element::None` —
+            // correct for that use, wrong here: a weapon with no element
+            // (FIRSTEDGE, e.g.) could never round-trip through this parser,
+            // silently dropped from any bag/hotbar/save that held one.
+            // Found by a test asserting a starter bag round-trips with all
+            // its items, not by inspection.
+            let element = if e == Element::None.name() {
+                Element::None
+            } else {
+                *ELEMENTS.iter().find(|x| x.name() == e)?
+            };
             return Some(Item::Weapon { verb, element, from: it.next().map(str::to_string) });
         }
         if let Some(name) = code.strip_prefix("m:") {
@@ -423,7 +434,7 @@ pub struct WeaponSpec {
     pub asset: &'static str,
 }
 
-pub const WEAPONS: [WeaponSpec; 6] = [
+pub const WEAPONS: [WeaponSpec; 7] = [
     // -- melee: aspect ratios 4.6:1 to 10.7:1, genuinely blade-shaped --
     WeaponSpec {
         name: "FIRSTEDGE",
@@ -446,6 +457,26 @@ pub const WEAPONS: [WeaponSpec; 6] = [
         verb: Verb::Thrust,
         element: Element::Electric,
         side: Side::Left,
+        ammo: AmmoType::Melee,
+        asset: "imported_caiman_rail_slasher_3d_model_stylized_weapon",
+    },
+    // PLACEHOLDER VISUAL, real weapon otherwise. No genuinely
+    // lightsaber-shaped asset exists anywhere in this catalog (checked:
+    // no "saber"/"energy_sword"/"energy_blade" match in the imported
+    // tree, and the two "blade"/"longsword" hits elsewhere are a flyer
+    // and a spaceship name, not a handheld weapon model). Borrows
+    // RAILFANG's stylized-weapon asset rather than one of the two
+    // real-world swords, since a sci-fi-stylized silhouette is the
+    // closer visual family for an energy blade even without a distinct
+    // model — the two will render identically until a real lightsaber
+    // asset is imported. Fire (not Electric/Rock/None, the three other
+    // melee elements already in this table) so it's mechanically
+    // distinct even while it looks the same as RAILFANG.
+    WeaponSpec {
+        name: "LIGHTSABER",
+        verb: Verb::Thrust,
+        element: Element::Fire,
+        side: Side::Right,
         ammo: AmmoType::Melee,
         asset: "imported_caiman_rail_slasher_3d_model_stylized_weapon",
     },
@@ -489,6 +520,18 @@ pub fn weapon_item(spec: &WeaponSpec) -> Item {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_weapon_with_no_element_round_trips() {
+        // Element::None is deliberately absent from weapons::ELEMENTS
+        // (that array is the Watch's cycle-able attunements, and "no
+        // element" isn't one), but Item::parse borrowed it anyway --
+        // silently unable to parse back any weapon carrying
+        // Element::None, e.g. FIRSTEDGE (gear::WEAPONS' own first entry).
+        let it = Item::Weapon { verb: Verb::Thrust, element: Element::None, from: None };
+        let code = it.code();
+        assert_eq!(Item::parse(&code), Some(it), "Element::None did not round-trip through code()/parse()");
+    }
     use crate::raidcon::BOSSES;
 
     #[test]
