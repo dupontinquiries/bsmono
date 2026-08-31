@@ -138,6 +138,26 @@ fn key_text(k: &KeyDef, shift: Shift) -> String {
 }
 
 /// Project a layout + shift state onto the render [`crate::Layout`] `keyboard_ui` draws: text
+/// Copy a layout's explicit per-direction assignments onto a key.
+///
+/// Directions the author left `None` stay empty rather than being
+/// filled from `extended`: a half-declared key is a DELIBERATE
+/// half-declaration, and topping it up would put characters on
+/// directions the author chose to leave free.
+fn apply_declared(key: &mut crate::Key, g: &board_layouts::key::KeyGestures) {
+    use uikit_egui::slide_menu::Dir8;
+    for (dir, v) in [
+        (Dir8::N, &g.n), (Dir8::NE, &g.ne), (Dir8::E, &g.e), (Dir8::SE, &g.se),
+        (Dir8::S, &g.s), (Dir8::SW, &g.sw), (Dir8::W, &g.w), (Dir8::NW, &g.nw),
+    ] {
+        if let Some(out) = v {
+            key.cardinal.push((dir, out.clone()));
+        }
+    }
+    key.rotate_cw = g.cw.clone();
+    key.rotate_ccw = g.ccw.clone();
+}
+
 /// Place a key's variants on cardinal directions.
 ///
 /// ## Why this order
@@ -216,7 +236,20 @@ pub fn to_render(file: &LayoutFile, shift: Shift) -> crate::Layout {
                     // letter. The data to fix that was already in the
                     // file as `extended`; only the placement was
                     // missing.
-                    assign_cardinals(&mut key);
+                    // DECLARED gestures win; the heuristic is the
+                    // fallback.
+                    //
+                    // `Key::gestures` is a serde field on the layout
+                    // schema and the loader never read it — so a layout
+                    // that carefully assigned é to north would have had
+                    // that silently replaced by whatever `extended`
+                    // happened to list first. The author's placement is
+                    // the answer; deriving one is what to do when there
+                    // is no answer.
+                    match &k.gestures {
+                        Some(g) => apply_declared(&mut key, g),
+                        None => assign_cardinals(&mut key),
+                    }
                     key
                 })
                 .collect();
@@ -337,6 +370,36 @@ mod tests {
         super::assign_cardinals(&mut k);
         let dirs: Vec<Dir8> = k.cardinal.iter().map(|(d, _)| *d).collect();
         assert_eq!(dirs, vec![Dir8::N, Dir8::S, Dir8::E]);
+    }
+
+    #[test]
+    fn a_declared_gesture_beats_the_derived_one() {
+        // The bug: `Key::gestures` is a serde field the loader never
+        // read, so a layout that carefully put é on north would have had
+        // it silently replaced by whatever `extended` listed first.
+        use uikit_egui::slide_menu::Dir8;
+        let mut k = crate::Key::new("e");
+        k.variants = vec!["3".into(), "é".into()];
+        let g = board_layouts::key::KeyGestures {
+            n: Some("ë".into()), ..Default::default()
+        };
+        super::apply_declared(&mut k, &g);
+        assert_eq!(k.cardinal, vec![(Dir8::N, "ë".to_string())],
+                   "the author's placement should win: {:?}", k.cardinal);
+    }
+
+    #[test]
+    fn a_half_declared_key_is_not_topped_up() {
+        // Leaving a direction empty is a decision. Filling it from
+        // `extended` would put characters on directions the author
+        // deliberately left free.
+        let mut k = crate::Key::new("e");
+        k.variants = vec!["a".into(), "b".into(), "c".into()];
+        let g = board_layouts::key::KeyGestures {
+            n: Some("x".into()), ..Default::default()
+        };
+        super::apply_declared(&mut k, &g);
+        assert_eq!(k.cardinal.len(), 1, "{:?}", k.cardinal);
     }
 
     #[test]

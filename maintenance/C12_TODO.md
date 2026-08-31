@@ -5285,6 +5285,22 @@ hold-and-pick popup and nothing else. Only the PLACEMENT was missing.
 
 239/239.
 
+- **C95b — the heuristic was shadowing a real schema field, found by
+  bughunting one commit later.** `board_layouts::key::Key` has
+  `gestures: Option<KeyGestures>` — an explicit per-direction map, with
+  `cw`/`ccw` — and `real_layout` never read it. So a layout that
+  carefully assigned é to north would have had that silently replaced by
+  whatever `extended` happened to list first.
+
+  Declared now wins; the heuristic is the fallback. A half-declared key
+  is NOT topped up from `extended`: leaving a direction empty is a
+  decision, and filling it would put characters on directions the author
+  chose to leave free.
+
+  Found via `testonly_check` on `board-layouts::builder`, whose
+  `CardinalCell` has one field per direction — which is what made me
+  look for the same shape on `Key`. 241/241.
+
 - **C95a — nothing SHOWS the cardinals.** A key that can emit `é` on a
   north swipe and does not say so is a feature nobody discovers. The
   GTK build draws variant hints on the keycap; this port does not yet.
