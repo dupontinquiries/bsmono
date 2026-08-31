@@ -283,6 +283,118 @@ pub fn looks_like_prompt(line: &str) -> bool {
     matches!(t.chars().last(), Some('$') | Some('#') | Some('>') | Some('❯'))
 }
 
+/// Accumulate bytes bound for a shell and yield the commands they contain.
+///
+/// A terminal sends a command one keystroke at a time, so "what command
+/// was that" is a question about a byte STREAM rather than a line — and
+/// every caller that needs it was going to reinvent the same three rules.
+/// It lives here, beside the tracker it feeds.
+#[derive(Debug, Clone, Default)]
+pub struct CommandLines {
+    buf: Vec<u8>,
+}
+
+/// A pathological paste with no line ending must not grow the buffer
+/// without limit.
+pub const LINE_CAP: usize = 8 * 1024;
+
+impl CommandLines {
+    pub fn new() -> CommandLines { CommandLines::default() }
+
+    /// Feed bytes going to the shell; return any completed commands.
+    ///
+    /// Three rules, each from something that goes wrong without it:
+    ///
+    /// * **Backspace edits the pending line** before anything reads it.
+    ///   Without this, the control-byte rule below throws away every
+    ///   command that was corrected while typing — which is most of them.
+    /// * **A line containing control bytes is not a command.** An arrow
+    ///   key or a Ctrl-C leaves an escape sequence in the buffer, and
+    ///   recording that fills the history with entries nobody can re-run.
+    /// * **`\r` and `\n` both end a line.** A terminal sends `\r` for
+    ///   Enter; a paste arrives with `\n`.
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(bytes);
+        while let Some(i) = self.buf.iter().position(|b| *b == 0x7f) {
+            self.buf.remove(i);
+            if i > 0 { self.buf.remove(i - 1); }
+        }
+        let mut out = Vec::new();
+        while let Some(i) = self.buf.iter().position(|b| *b == b'\r' || *b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=i).collect();
+            let cmd = String::from_utf8_lossy(&line[..line.len() - 1]).trim().to_string();
+            if cmd.is_empty() || cmd.bytes().any(|b| b < 0x20) {
+                continue;
+            }
+            out.push(cmd);
+        }
+        if self.buf.len() > LINE_CAP {
+            let drop = self.buf.len() - LINE_CAP;
+            self.buf.drain(..drop);
+        }
+        out
+    }
+
+    /// What has been typed but not yet entered.
+    pub fn pending(&self) -> String {
+        String::from_utf8_lossy(&self.buf).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod command_line_tests {
+    use super::*;
+
+    #[test]
+    fn a_command_is_recorded_when_the_line_ends_and_not_before() {
+        let mut c = CommandLines::new();
+        assert!(c.feed(b"ls -").is_empty(), "half a command was recorded");
+        assert!(c.feed(b"la").is_empty());
+        assert_eq!(c.feed(b"\r"), vec!["ls -la".to_string()]);
+        assert_eq!(c.pending(), "");
+    }
+
+    #[test]
+    fn a_correction_survives_rather_than_losing_the_command() {
+        // Backspace leaves 0x7f in the stream. Applied before the
+        // control-byte rule, this is `ls`; applied after, the whole command
+        // is discarded — and typing a mistake is not rare.
+        let mut c = CommandLines::new();
+        assert_eq!(c.feed(b"lxs\r"), vec!["ls".to_string()]);
+    }
+
+    #[test]
+    fn an_escape_sequence_is_not_a_command() {
+        // An arrow key mid-line. Recording it puts an entry in the history
+        // that cannot be re-run and reads as corruption.
+        let mut c = CommandLines::new();
+        assert!(c.feed(b"ls [A\r").is_empty());
+        // And the buffer is clear afterwards, so the NEXT command is not
+        // poisoned by the one that was rejected.
+        assert_eq!(c.feed(b"pwd\r"), vec!["pwd".to_string()]);
+    }
+
+    #[test]
+    fn several_commands_in_one_write_all_arrive() {
+        // A paste, or a voice command sent with its own newline.
+        let mut c = CommandLines::new();
+        assert_eq!(c.feed(b"cd /tmp\nls\n"), vec!["cd /tmp".to_string(), "ls".to_string()]);
+    }
+
+    #[test]
+    fn a_bare_enter_records_nothing() {
+        let mut c = CommandLines::new();
+        assert!(c.feed(b"\r\r  \r").is_empty());
+    }
+
+    #[test]
+    fn a_paste_with_no_line_ending_cannot_grow_the_buffer_without_limit() {
+        let mut c = CommandLines::new();
+        c.feed(&vec![b'x'; LINE_CAP * 2]);
+        assert!(c.pending().len() <= LINE_CAP, "{}", c.pending().len());
+    }
+}
+
 #[cfg(test)]
 mod feed_tests {
     use super::*;

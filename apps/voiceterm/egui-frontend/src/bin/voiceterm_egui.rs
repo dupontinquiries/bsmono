@@ -546,9 +546,8 @@ struct VoicetermApp {
     /// Command blocks (QML blocksDrawer): tracked from what the demo feeds; the
     /// left-edge drawer shows when `surfaces` says `Surface::Blocks`.
     blocks: uikit_term::blocks::BlockTracker,
-    /// Typed bytes not yet terminated by Enter, so a command can be
-    /// recorded when the line completes rather than a character at a time.
-    line_buf: Vec<u8>,
+    /// Bytes bound for the shell, split into commands as lines complete.
+    line_buf: uikit_term::blocks::CommandLines,
     /// One-shot scroll target for the tab bar ("N more" pill taps apply next frame).
     tabbar_scroll_to: Option<f32>,
     /// The QML toast, ported: fire-and-forget status pill above the bottom chrome.
@@ -835,6 +834,22 @@ impl VoicetermApp {
 }
 
 impl VoicetermApp {
+    /// Record any commands in bytes bound for the shell.
+    ///
+    /// The line rules live in `uikit_term::blocks::CommandLines` — they are
+    /// not app policy, they are how a byte stream becomes commands, and
+    /// they were three fiddly cases (backspace before the control-byte
+    /// check, escape sequences rejected, `\r` and `\n` both ending a line)
+    /// sitting inline in a frame loop where nothing could test them.
+    fn record_typed(&mut self, bytes: &[u8]) {
+        for cmd in self.line_buf.feed(bytes) {
+            // `start_row`: where the block begins in the scrollback. The
+            // kit's tracker stamps its own wall clock.
+            let row = self.session.grid.cursor().1;
+            self.blocks.submit_command(&cmd, row);
+        }
+    }
+
     /// Harvest email-shaped command output into the mail view.
     ///
     /// `MailView::set_messages` had no caller and `mail_messages` was
@@ -3062,50 +3077,6 @@ impl eframe::App for VoicetermApp {
                 // through one path rather than two that can disagree.
                 if !out.bytes.is_empty() {
                     self.session.pty_out.extend_from_slice(&out.bytes);
-                    // THE BLOCK TRACKER, FED FROM WHAT WAS ACTUALLY TYPED.
-                    // Until now it was filled once at startup from a
-                    // hardcoded demo script — `ls --color`, an echo, a fake
-                    // exit code — and never touched again. Everything
-                    // reading it was reading that script: the blocks
-                    // drawer, recall, the memory poll's count, and the
-                    // bottom bar's quick-launch list.
-                    self.line_buf.extend_from_slice(&out.bytes);
-                    // A carriage return is what a terminal sends for Enter;
-                    // a newline is accepted too so a paste behaves.
-                    while let Some(i) = self.line_buf.iter()
-                        .position(|b| *b == b'\r' || *b == b'\n')
-                    {
-                        let line: Vec<u8> = self.line_buf.drain(..=i).collect();
-                        let cmd = String::from_utf8_lossy(&line[..line.len() - 1])
-                            .trim().to_string();
-                        // Control bytes in the middle of a line mean this was
-                        // editing, not a command — an arrow key or a Ctrl-C
-                        // leaves an escape sequence in the buffer, and
-                        // recording that as a command fills the history with
-                        // garbage nobody can re-run.
-                        if !cmd.is_empty() && !cmd.bytes().any(|b| b < 0x20) {
-                            // `start_row`, not a timestamp: the kit's
-                            // tracker stamps its own time and wants the
-                            // grid row the command was entered on, which is
-                            // where the block starts in the scrollback.
-                            let row = self.session.grid.cursor().1;
-                            self.blocks.submit_command(&cmd, row);
-                        }
-                    }
-                    // Backspace edits the pending line rather than leaving a
-                    // 0x7f in it, or the control-byte guard above throws away
-                    // every command that was corrected while typing.
-                    while let Some(i) = self.line_buf.iter().position(|b| *b == 0x7f) {
-                        self.line_buf.remove(i);
-                        if i > 0 { self.line_buf.remove(i - 1); }
-                    }
-                    // Bounded: a pathological paste with no newline in it
-                    // must not grow this without limit.
-                    const LINE_CAP: usize = 8 * 1024;
-                    if self.line_buf.len() > LINE_CAP {
-                        let drop = self.line_buf.len() - LINE_CAP;
-                        self.line_buf.drain(..drop);
-                    }
                 }
                 // `out.snap_to_bottom` is deliberately not consumed. This view
                 // draws a fixed grid with no scrollback, so it is always
@@ -3242,6 +3213,19 @@ impl eframe::App for VoicetermApp {
             // a second. The high-water mark is what makes this idempotent.
             if self.session.pty_out.len() > self.session.pty_echoed {
                 let fresh = self.session.pty_out[self.session.pty_echoed..].to_vec();
+                // THE BLOCK TRACKER, FED HERE AND NOWHERE ELSE.
+                //
+                // I first hooked this into the keyboard drain, which sees
+                // only what was typed. Nine other places append to
+                // `pty_out` — voice commands, the keycap row, the gesture
+                // menus, the staged command from the bottom bar — and none
+                // of them would have produced a block, so the history would
+                // have quietly recorded typing and nothing else.
+                //
+                // This is the one funnel every byte bound for the shell
+                // passes through, which is what makes it the right place:
+                // there is no way to send a command that misses it.
+                self.record_typed(&fresh);
                 match &self.pty {
                     // A REAL SHELL: send the keys, and let its output be
                     // the echo. Feeding the grid ourselves as well would
@@ -3822,7 +3806,7 @@ fn main() -> eframe::Result<()> {
                 theme: boot_theme,
                 theme_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-theme-menu").columns(3).hold(0.35).item_size(64.0),
                 blocks,
-                line_buf: Vec::new(),
+                line_buf: Default::default(),
                 tabbar_scroll_to: None,
                 toasts: uikit_egui::toast::Toasts::new(),
                 // 80x24 is a placeholder: the first frame calls
