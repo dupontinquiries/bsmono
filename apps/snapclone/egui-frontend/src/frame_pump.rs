@@ -43,6 +43,22 @@ pub struct RawFrame {
     pub captured_ms: u64,
     /// Sequence from the producer, so drops can be counted rather than guessed.
     pub seq: u64,
+    /// The pixels, RGBA8, `width * height * 4` bytes. An `Arc` because the
+    /// frame travels by value through `HostEvent::CameraFrame` and is cloned
+    /// into the slot — at 30 fps a deep copy per hop is the difference
+    /// between an idle phone and a warm one. Empty is legal and means a
+    /// metadata-only frame (the pre-capture tests use it); the texture
+    /// upload checks the length rather than trusting it.
+    pub rgba: std::sync::Arc<[u8]>,
+}
+
+impl RawFrame {
+    /// Do the pixels actually describe the claimed geometry? A torn frame —
+    /// a reader that got EOF mid-frame, a stride mismatch — must be refused
+    /// at the upload, not panicked on inside egui.
+    pub fn pixels_plausible(&self) -> bool {
+        self.rgba.len() == (self.width as usize) * (self.height as usize) * 4
+    }
 }
 
 /// A frame slot: one deep, latest wins.
@@ -232,7 +248,24 @@ mod tests {
     use super::*;
 
     fn frame(seq: u64, at: u64) -> RawFrame {
-        RawFrame { width: 1280, height: 720, captured_ms: at, seq }
+        RawFrame { width: 1280, height: 720, captured_ms: at, seq,
+                   rgba: std::sync::Arc::from(&[][..]) }
+    }
+
+    #[test]
+    fn a_torn_frame_is_refused_at_the_upload_rather_than_panicking_egui() {
+        // A reader that hit EOF mid-frame hands over fewer bytes than the
+        // geometry claims. ColorImage::from_rgba_unmultiplied asserts on
+        // that, so the check has to happen before egui sees the buffer.
+        let good = RawFrame { width: 2, height: 2, captured_ms: 0, seq: 1,
+                              rgba: std::sync::Arc::from(&[0u8; 16][..]) };
+        assert!(good.pixels_plausible());
+        let torn = RawFrame { rgba: std::sync::Arc::from(&[0u8; 15][..]), ..good.clone() };
+        assert!(!torn.pixels_plausible());
+        // Metadata-only frames (the pre-capture tests) are NOT plausible
+        // pixels, and must not be: uploading an empty texture is how the
+        // viewfinder would go black instead of saying "no camera".
+        assert!(!frame(1, 0).pixels_plausible());
     }
 
     #[test]

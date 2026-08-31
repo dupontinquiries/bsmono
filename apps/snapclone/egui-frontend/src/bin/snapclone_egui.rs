@@ -7,12 +7,69 @@
 //! Run:  cargo run --bin snapclone-egui --features app   (from apps/snapclone/egui-frontend)
 
 use eframe::egui;
+use snapclone_egui::capture;
 use snapclone_egui::host::{HostCommand, HostEvent};
 use snapclone_egui::Snapclone;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use uikit_egui::Adaptive;
+
+/// The capture engine's host-side half: the thread that runs `capture::run`,
+/// and the two handles that implement the stop contract (flag + kill).
+///
+/// Start/stop is driven from `update` by `frame_pump::should_stream` — the
+/// pipeline runs while the camera page is visible in a focused window and
+/// stops when it is not, because a phone streaming its camera into a page
+/// nobody is looking at is warm for nothing. gst-launch restarts in well
+/// under a page-swipe, so the restart cost is the cheap side of that trade.
+struct CaptureRig {
+    shared: Arc<capture::Shared>,
+    stop: Arc<AtomicBool>,
+    kill: capture::KillSwitch,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CaptureRig {
+    fn idle() -> CaptureRig {
+        CaptureRig { shared: capture::Shared::new(), stop: Arc::new(AtomicBool::new(false)),
+                     kill: capture::KillSwitch::new(), thread: None }
+    }
+
+    fn running(&self) -> bool {
+        self.thread.as_ref().is_some_and(|t| !t.is_finished())
+    }
+
+    fn start(&mut self, plan: Vec<capture::SourceCandidate>, w: u32, h: u32) {
+        self.stop_now();
+        self.stop = Arc::new(AtomicBool::new(false));
+        self.shared = capture::Shared::new();
+        self.kill = capture::KillSwitch::new();
+        let (shared, stop, kill) = (self.shared.clone(), self.stop.clone(), self.kill.clone());
+        self.thread = Some(std::thread::spawn(move || {
+            let opener = capture::gst_opener(w, h, kill);
+            capture::run(&plan, w, h, opener, &shared, &stop,
+                         std::time::Duration::from_millis(500));
+        }));
+    }
+
+    /// Both halves of the stop contract, then reap the thread. The join is
+    /// bounded because the kill turns any blocked read into an EOF.
+    fn stop_now(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.kill.stop();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
 
 struct App {
     snap: Snapclone,
+    rig: CaptureRig,
+    /// The plan is printed once per start, not per frame: the pipeline
+    /// strings are the debuggable artifact, and a log that repeats them at
+    /// 30 Hz buries the stderr lines gst-launch itself contributes.
+    plan_logged: bool,
     /// Last reported focus, so the change is sent once rather than every frame.
     focused: bool,
     /// The discovery socket, or None when the port was unavailable. Absent
@@ -95,8 +152,8 @@ impl App {
                            peers on this network will not be found");
             }
         }
-        Self { snap, focused: true, gossip, last_announce: 0, warned_unsigned: false,
-               identity: keys }
+        Self { snap, rig: CaptureRig::idle(), plan_logged: false, focused: true,
+               gossip, last_announce: 0, warned_unsigned: false, identity: keys }
     }
 
     /// Drain the discovery socket into the app, and announce ourselves on the
@@ -171,6 +228,69 @@ impl App {
         }
     }
 
+    /// Start, stop and drain the capture engine, from the frame loop.
+    ///
+    /// On the frame loop for the same reason `pump_gossip` is: the drain is
+    /// latest-wins and non-blocking, so an idle camera costs three mutex
+    /// peeks, and the whole path is steppable in one place. Only the
+    /// blocking pipe read lives on the rig's thread, because it has to.
+    fn pump_capture(&mut self) {
+        // "Camera" by name rather than index 0, so a nav reorder cannot
+        // silently leave the pipeline gated on the wrong page.
+        let camera_page = snapclone_egui::PAGES
+            .iter().position(|n| *n == "Camera").unwrap_or(0);
+        let visible = self.snap.nav.page() == camera_page;
+        // `screen_on` is not knowable from eframe; `true` defers to focus,
+        // which a locked phone drops anyway.
+        let want = snapclone_egui::frame_pump::should_stream(visible, self.focused, true)
+            && self.snap.camera.is_some();
+
+        if want && !self.rig.running() {
+            let choice = self.snap.camera.clone().expect("gated on is_some above");
+            // No PipeWire probe yet: pw_nodes empty means a phone's libcamera
+            // nodes only enter the plan via the settings override (a node
+            // name in camera.device). The v4l2 half probes for real when the
+            // tool exists; absent tool contributes nothing, not an error.
+            let v4l2 = std::process::Command::new("v4l2-ctl").arg("--list-devices")
+                .output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
+            let plan = snapclone_egui::camera_source::pipelines_for(&choice, &[], &v4l2);
+            if !self.plan_logged {
+                self.plan_logged = true;
+                for c in &plan {
+                    eprintln!("snapclone: capture candidate [{}]: {}", c.label, c.pipeline);
+                }
+            }
+            let (w, h) = (choice.format.width, choice.format.height);
+            self.rig.start(plan, w, h);
+        } else if !want && self.rig.running() {
+            self.rig.stop_now();
+            let cmds = self.snap.apply(HostEvent::CaptureStatus(capture::Status::Idle));
+            self.handle(cmds);
+        }
+
+        // Drain, newest only. `CameraWorked` before the frame so the health
+        // record exists by the time anything reads it this tick.
+        if self.rig.shared.take_worked() {
+            if let Some(cam) = self.snap.camera.as_ref() {
+                let id = cam.device.id.clone();
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64).unwrap_or(0);
+                let cmds = self.snap.apply(HostEvent::CameraWorked { id, now_ms });
+                self.handle(cmds);
+            }
+        }
+        if let Some(st) = self.rig.shared.take_status() {
+            let cmds = self.snap.apply(HostEvent::CaptureStatus(st));
+            self.handle(cmds);
+        }
+        if let Some(f) = self.rig.shared.take_frame() {
+            let cmds = self.snap.apply(HostEvent::CameraFrame(f));
+            self.handle(cmds);
+        }
+    }
+
     /// What the app asked the world to do.
     ///
     /// Deliberately a debug sink and labelled as one. Capture, export and
@@ -186,6 +306,25 @@ impl App {
                 // so it is still there next launch. A write failure is
                 // reported rather than swallowed — a silent one means the user
                 // adds someone twice and never learns why.
+                // THE SHUTTER PRODUCES A FILE. Not the composer flow yet —
+                // that is its own thread of work — but a press that lands a
+                // viewable image on disk is the difference between a camera
+                // and a viewfinder. PPM because it is 12 bytes of header over
+                // the RGBA we already hold: no encoder dependency, and every
+                // image tool opens it. The path is printed so the photo is
+                // findable the moment it exists.
+                HostCommand::CaptureSnap => {
+                    match self.rig.shared.peek_frame() {
+                        Some(f) if f.pixels_plausible() => {
+                            match save_ppm(&f) {
+                                Ok(path) => eprintln!("snapclone: snap saved: {path}"),
+                                Err(e) => eprintln!("snapclone: snap NOT saved: {e}"),
+                            }
+                        }
+                        _ => eprintln!("snapclone: shutter pressed with no live frame — \
+                                        nothing to save"),
+                    }
+                }
                 HostCommand::SaveContacts(book) => {
                     if let Err(e) = snapclone_egui::contact_book::store(&book) {
                         eprintln!("snapclone: could not save contacts: {e}");
@@ -249,6 +388,26 @@ impl App {
     }
 }
 
+/// Write one frame as binary PPM under the app's data dir, named by wall
+/// clock so a burst of presses cannot overwrite each other within a second
+/// (the millisecond field sees to that).
+fn save_ppm(f: &snapclone_egui::frame_pump::RawFrame) -> Result<String, String> {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis()).unwrap_or(0);
+    let dir = config_kit::data_dir("snapclone").join("snaps");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = dir.join(format!("snap-{ms}.ppm"));
+    let mut out = Vec::with_capacity(20 + (f.width * f.height * 3) as usize);
+    out.extend_from_slice(format!("P6\n{} {}\n255\n", f.width, f.height).as_bytes());
+    // RGBA to RGB: PPM has no alpha, and the camera's alpha is opaque anyway.
+    for px in f.rgba.chunks_exact(4) {
+        out.extend_from_slice(&px[..3]);
+    }
+    std::fs::write(&path, out).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path.display().to_string())
+}
+
 impl eframe::App for App {
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -266,10 +425,14 @@ impl eframe::App for App {
         let cmds = self.snap.apply(HostEvent::Tick { now_secs });
         self.handle(cmds);
         self.pump_gossip(now_secs);
+        self.pump_capture();
 
-        // Discovery is time-driven, not input-driven, so the frame has to come
-        // round on its own or an idle window never polls the socket.
-        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        // Discovery is time-driven, not input-driven, so the frame has to
+        // come round on its own or an idle window never polls the socket —
+        // and a live viewfinder needs the frame loop at frame rate, or the
+        // preview updates only when the mouse moves.
+        ctx.request_repaint_after(std::time::Duration::from_millis(
+            if self.rig.running() { 33 } else { 500 }));
 
         let focused = ctx.input(|i| i.focused);
         if focused != self.focused {

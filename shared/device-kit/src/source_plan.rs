@@ -69,6 +69,43 @@ fn tail(flip_method: Option<&str>) -> String {
     )
 }
 
+/// Rewrite a candidate's appsink tail into an fdsink one, for a capture host
+/// that runs the pipeline as a `gst-launch-1.0` subprocess instead of linking
+/// gstreamer.
+///
+/// Lives HERE and not in the consumer because [`tail`] above is the only
+/// producer of the suffix being replaced — a consumer doing string surgery on
+/// it would break silently the day `tail` changes, while this function fails
+/// its own test in the same commit.
+///
+/// The width/height are forced (with a `videoscale` ahead of the caps) so the
+/// reader on the other end of the fd knows every frame is exactly
+/// `w * h * 4` bytes of RGBA — raw video over a pipe has no in-band framing,
+/// so a fixed size IS the framing. `None` when the pipeline does not end in
+/// the appsink tail this module wrote, which means it is not one of ours.
+pub fn to_fdsink(pipeline: &str, width: u32, height: u32) -> Option<String> {
+    // Must mirror `tail` exactly; the round-trip test holds them together.
+    let appsink = "videoconvert ! ";
+    let idx = pipeline.rfind(appsink)?;
+    if !pipeline.contains("appsink name=sink") {
+        return None;
+    }
+    let head = &pipeline[..idx];
+    // The flip element sits between videoconvert and the caps in `tail`, so
+    // carry it over rather than losing a front camera's mirror on the way
+    // from preview to capture.
+    let flip = if pipeline.contains("videoflip method=horizontal-flip") {
+        "videoflip method=horizontal-flip ! "
+    } else {
+        ""
+    };
+    Some(format!(
+        "{head}videoconvert ! {flip}videoscale ! \
+         video/x-raw,format=RGBA,width={width},height={height} ! \
+         fdsink fd=1"
+    ))
+}
+
 pub fn pipewire_pipeline(node: &str, flip: Option<&str>) -> String {
     format!("pipewiresrc target-object=\"{node}\" ! {}", tail(flip))
 }
@@ -144,6 +181,45 @@ Integrated Camera: Integrated C (usb-0000:00:14.0-8):\n\
 \n\
 Dummy video device (0x0000) (platform:v4l2loopback-000):\n\
 \t/dev/video10\n";
+
+    #[test]
+    fn every_pipeline_this_module_writes_can_be_retargeted_to_an_fd() {
+        // The round-trip that keeps `to_fdsink` honest: it does string
+        // surgery on `tail`'s output, so it must succeed on everything both
+        // builders produce — plain and flipped — or the two functions have
+        // drifted apart.
+        for p in [
+            v4l2_pipeline("/dev/video0", None),
+            v4l2_pipeline("/dev/video0", Some("horizontal-flip")),
+            pipewire_pipeline("libcamera_input_2_1", None),
+            pipewire_pipeline("libcamera_input_2_1", Some("horizontal-flip")),
+        ] {
+            let fd = to_fdsink(&p, 640, 480)
+                .unwrap_or_else(|| panic!("not retargetable: {p}"));
+            assert!(fd.contains("fdsink fd=1"), "{fd}");
+            assert!(!fd.contains("appsink"), "the appsink survived: {fd}");
+            assert!(fd.contains("width=640,height=480"),
+                    "the fd reader needs a fixed frame size: {fd}");
+            // The source half is untouched.
+            let head = p.split(" ! ").next().unwrap();
+            assert!(fd.starts_with(head), "the source was rewritten: {fd}");
+        }
+    }
+
+    #[test]
+    fn a_front_camera_keeps_its_mirror_through_the_retarget() {
+        let p = v4l2_pipeline("/dev/video2", Some("horizontal-flip"));
+        let fd = to_fdsink(&p, 320, 240).unwrap();
+        assert!(fd.contains("videoflip method=horizontal-flip"),
+                "the selfie mirror was dropped on the capture path: {fd}");
+        let plain = to_fdsink(&v4l2_pipeline("/dev/video0", None), 320, 240).unwrap();
+        assert!(!plain.contains("videoflip"), "a rear camera grew a flip: {plain}");
+    }
+
+    #[test]
+    fn a_foreign_pipeline_is_refused_rather_than_mangled() {
+        assert_eq!(to_fdsink("videotestsrc ! autovideosink", 640, 480), None);
+    }
 
     #[test]
     fn a_desktop_webcam_yields_one_v4l2_candidate_on_the_capture_node() {

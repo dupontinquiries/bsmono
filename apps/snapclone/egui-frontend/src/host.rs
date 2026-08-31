@@ -107,6 +107,10 @@ pub enum HostEvent {
     CameraWorked { id: String, now_ms: i64 },
     /// A frame arrived from the capture thread.
     CameraFrame(frame_pump::RawFrame),
+    /// Where the capture engine stands. Edge-triggered by the host (sent on
+    /// change, not per frame), and shown on the camera page — the person
+    /// aiming the camera is looking at the viewfinder, not at stderr.
+    CaptureStatus(crate::capture::Status),
     /// A QR payload was decoded from the viewfinder or pasted in.
     QrPayload(String),
     /// Average colour of the scene, for the ambient palette.
@@ -295,9 +299,18 @@ impl Snapclone {
                 self.contacts_dirty = false;
             }
 
-            HostEvent::CamerasFound(list) => self.cameras = list,
+            HostEvent::CamerasFound(list) => {
+                self.cameras = list;
+                // The list without a choice is what kept the page on "no
+                // camera found" while the picker showed two — everything
+                // downstream (describe line, capture plan) hangs off
+                // `camera`, and nothing set it.
+                self.camera = crate::camera_source::choose_from_enumerated(
+                    &self.cameras, &self.settings.current.camera.device);
+            }
             HostEvent::CameraWorked { id, now_ms } => self.note_camera_worked(&id, now_ms),
             HostEvent::CameraFrame(f) => self.frames.offer(f),
+            HostEvent::CaptureStatus(st) => self.capture_status = st,
             HostEvent::QrPayload(p) => out.push(HostCommand::QrLatched(self.qr_frame(&p))),
             HostEvent::AmbientPixels { pixels, side } => self.sample_ambient(&pixels, side),
 

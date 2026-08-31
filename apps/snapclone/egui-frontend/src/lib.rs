@@ -14,6 +14,7 @@ pub mod camera;
 pub mod debounce;
 pub mod confirm;
 pub mod camera_source;
+pub mod capture;
 pub mod peer_source;
 pub mod contacts;
 pub mod conversation;
@@ -165,6 +166,11 @@ pub struct Snapclone {
     pub contacts_dirty: bool,
     /// Latest-frame-wins slot between the capture thread and the paint.
     pub frames: crate::frame_pump::FrameSlot,
+    /// Where the capture engine stands, from `HostEvent::CaptureStatus`.
+    /// App state rather than a host-side print because the person aiming the
+    /// camera is looking at the viewfinder, not at stderr — a failing
+    /// pipeline's reason belongs on the page it fails on.
+    pub capture_status: crate::capture::Status,
     /// The uploaded texture, kept across frames so an unchanged frame is not
     /// re-uploaded.
     pub cam_texture: Option<egui::TextureHandle>,
@@ -595,6 +601,7 @@ impl Snapclone {
             key_conflicts: Vec::new(),
             contacts_dirty: false,
             frames: Default::default(),
+            capture_status: crate::capture::Status::Idle,
             cam_texture: None,
             last_frame_ms: None,
             settings_error: None,
@@ -2665,7 +2672,20 @@ impl Snapclone {
                 // slow tick, so the driver's job is deciding when to spend
                 // one — not holding them.
                 self.ambient_camera.on_frame();
-                let _ = f; // the pixel upload belongs to the capture backend
+                // THE UPLOAD, once per paint — `should_upload` already gated
+                // this on a new frame existing, which is what makes 30 fps
+                // into an idle background window cost nothing. A torn frame
+                // (EOF mid-frame in the reader) is refused here rather than
+                // asserted on inside egui.
+                if f.pixels_plausible() {
+                    let img = egui::ColorImage::from_rgba_unmultiplied(
+                        [f.width as usize, f.height as usize], &f.rgba);
+                    match &mut self.cam_texture {
+                        Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                        None => self.cam_texture = Some(ui.ctx().load_texture(
+                            "viewfinder", img, egui::TextureOptions::LINEAR)),
+                    }
+                }
             }
         }
         // The camera page is on screen, so the driver may run; leaving it
@@ -2745,6 +2765,17 @@ impl Snapclone {
                 ui.colored_label(c.text_weak, "starting camera…");
             }
             _ => {}
+        }
+        // The capture engine's own words, when it has any: which pipeline is
+        // being opened, or why none worked — in GStreamer's phrasing, which
+        // is the one the user can search for. "starting camera…" above says
+        // something is happening; this says WHAT.
+        if let Some(line) = self.capture_status.line() {
+            let col = match self.capture_status {
+                crate::capture::Status::Exhausted { .. } => c.warning,
+                _ => c.text_weak,
+            };
+            ui.colored_label(col, line);
         }
         // Say WHICH camera, or that there is none. The viewfinder mirrors only
         // when device-kit says this device is front-facing.
