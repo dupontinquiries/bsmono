@@ -4591,3 +4591,84 @@ corpus (different encoders, rates, resolutions) before anyone should
 trust it, and an 8x8 descriptor is deliberately weak at catching a
 small object moving in a large frame — the structural digests are what
 catch that case, which is the division of labour the design intends.
+
+## New material: blackstar-rs gameplay (2026-08-31)
+
+autobots-rollout--2026-08-02_21-02-50_comp.mkv, 1536x864@60, 100s, AV1
+at 760 kbps. Test GOP: 48 frames from t=12s. Footage stays OUT of the
+repo (.gitignore now excludes *.mkv/*.mp4/*.webm/*.y4m/*.ivf); the
+corpus is re-supplied per session and only measurements are committed.
+
+Notable for a reason no other clip has: THIS REPO CONTAINS THE GAME'S
+SOURCE. Every other test has required inverse rendering — recovering
+geometry and pose from pixels. Here the emitting engine is in
+games/blackstar-rs, so an engine-derived canonical (assets + camera
+pose straight from the game, no reconstruction) is buildable rather
+than hypothetical. That is the regime the citation thesis was always
+about and has never been able to test.
+
+### Engine-rendered does NOT imply dictionary-friendly — the Minecraft conclusion needed narrowing
+
+  dict probe            long-range beats local | STRONG | mean SAD saved
+  Minecraft 4K                          24.7%  |  10.7% |          1515
+  bloopers shotB                        12.1%  |   0.3% |       130-240
+  BLACKSTAR                              0.9%  |   0.0% |           130
+Zero STRONG matches, on engine content, with only 7,153 distinct
+fingerprints across 238,464 regions — i.e. EXTREMELY repetitive, and
+the dictionary still finds nothing worth citing.
+
+The resolution sharpens the thesis condition. Blackstar's repetition
+is LOW-FREQUENCY: flat-shaded geometry, large smooth sky and ground
+gradients. Flat content is precisely what the local predictors already
+get for free, so a long-range match cannot beat them — there is no
+residual left to save. Minecraft's repetition is HIGH-FREQUENCY
+(per-block textures), which local prediction does NOT get for free.
+So the condition is not "engine-rendered" but: content that is BOTH
+repetitive AND expensive under local prediction. Recorded because
+"engine content is the dictionary's home turf" was the working
+assumption and it is too coarse.
+
+### Triangulation: 0 of 144, and the pose model fails a third distinct way
+
+  motion: max |shift| 0.00px (confidence 0.88) | camera span 0.0px
+  correspondences 65% within 2px | median per-pair track motion 1.70px
+  tri census: 144 candidates -> 0 kept | no-baseline-pair 144
+Phase correlation confidently reports ZERO global motion while the
+feature tracks report 1.70 px/frame. On near-uniform gradients there
+is no correlation peak to find, so the estimator is confidently wrong
+rather than uncertain, the pose track never moves, and every candidate
+fails for want of a baseline. Three clips, three distinct failures of
+the same translation-only phase-corr pose model: bloopers = no
+parallax in the material; Minecraft = missing z/forward axis;
+blackstar = no texture for phase correlation to lock onto. The common
+factor is the ESTIMATOR, not the material, and --pose-from-tracks
+(already built, still off by default) addresses all three.
+
+### Rate, with a proper anchor
+
+The shipped file cannot be its own anchor: scoring v11 against an AV1
+file means encoding AV1 artifacts and calling the artifacts truth. So
+SVT-AV1 preset 6 g48 anchors were built from the SAME y4m:
+
+  AV1 crf40   110,558 B @ 48.03 dB / SSIM 0.9953
+  AV1 crf50    66,037 B @ 45.34 dB / 0.9926
+  AV1 crf60    35,393 B @ 42.16 dB / 0.9872
+  AV1 crf63    22,908 B @ 39.67 dB / 0.9806
+  v11.3 dz8 1,530,493 B @ 40.53 dB / 0.9865
+  v11.3 dz32   332,841 B @ 35.62 dB / 0.9750
+At matched quality (~40 dB / 0.986) v11 is 1,530,493 vs AV1 crf60's
+35,393 — 43x. This is the WORST ratio of any clip measured, and the
+byte split says why: plate 104,683, mode+mv 72,810, residual 154,964
+with prev_mode_share 0.939. The plate is 31% of the file on content
+that is a smooth gradient plus a small moving object — a temporal
+median over a gradient is an expensive way to store something a
+handful of coefficients would describe. Mover layer detected 4 objects
+and the J-guard correctly declined them.
+
+The lesson is the mirror of the dictionary one: this codec's costs are
+sized for TEXTURE, and on near-flat synthetic content every structure
+it carries (a full-resolution plate, per-region modes, per-region
+gain) is overhead against a conventional coder's ability to spend
+almost nothing on a flat block. The plate should be coded at a
+resolution matched to its own spectral content, not at frame
+resolution — the first concrete construction this clip argues for.
