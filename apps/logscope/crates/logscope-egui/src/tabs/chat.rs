@@ -1137,6 +1137,9 @@ pub struct Chat {
     coord_mode: crate::coordinator::Mode, // prompting mode (barebones / coordinator / aggressive)
     /// Hand-picked engineering profiles. Empty = autopilot (`engprofile::suggest` from the task).
     profiles_manual: Vec<crate::engprofile::ProfileId>,
+    /// Which key cluster flies the freecam. Personalisation and accessibility: egui reports logical
+    /// keys, so a non-QWERTY layout gets no movement at all from a hardcoded WASD.
+    nav_layout: crate::navkeys::NavLayout,
 
     /// A duration the operator asked for, and when they asked.
     ///
@@ -1416,6 +1419,7 @@ impl Default for Chat {
             threading: true, show_context: false, attach_log: true, fix_mode: false,
             right_page: RightPage::Prompting, coord_mode: crate::coordinator::Mode::Barebones,
             profiles_manual: Vec::new(),
+            nav_layout: crate::navkeys::NavLayout::default(),
             // Open-ended until the operator says otherwise.
             work_limit: None,
             verify_job: None,
@@ -4190,9 +4194,13 @@ which file you read.\n\n",
             }
         }
 
-        // FREECAM: free-flight through the scene. WASD move along the look basis, Q/E down/up, drag looks (above),
-        // Shift boosts. Moving the target translates the eye with it (dist held), so you fly wherever you look.
-        // Gated on hovering the canvas so WASD never leaks into the composer; repaints continuously to poll keys.
+        // FREECAM: free-flight through the scene. The movement cluster comes from `navkeys` and
+        // follows the selected keyboard layout — WASD + Q/E on QWERTY, `.oeu` + `,`/`p` on Dvorak —
+        // with arrow keys always live in both. egui reports LOGICAL keys, so a Dvorak typist
+        // pressing the physical W position sends `Comma` and, before this, simply did not move.
+        // Drag looks (above), Shift boosts. Moving the target translates the eye with it (dist
+        // held), so you fly wherever you look. Gated on hovering the canvas so the keys never leak
+        // into the composer; repaints continuously to poll them.
         if self.freecam {
             use crate::spatial::Vec3 as V3;
             if resp.hovered() || resp.dragged() {
@@ -4201,13 +4209,11 @@ which file you read.\n\n",
                     let (cp, sp) = (self.orbit.pitch.cos(), self.orbit.pitch.sin());
                     let fwd = V3::new(cp * sy, -sp, -cp * cy);   // eye→target look direction (fly where you look)
                     let right = V3::new(cy, 0.0, sy);            // horizontal strafe
+                    let (f, s, lift) = crate::navkeys::axes(self.nav_layout, |k| i.key_down(k));
                     let mut mv = V3::new(0.0, 0.0, 0.0);
-                    if i.key_down(egui::Key::W) { mv.x += fwd.x; mv.y += fwd.y; mv.z += fwd.z; }
-                    if i.key_down(egui::Key::S) { mv.x -= fwd.x; mv.y -= fwd.y; mv.z -= fwd.z; }
-                    if i.key_down(egui::Key::D) { mv.x += right.x; mv.z += right.z; }
-                    if i.key_down(egui::Key::A) { mv.x -= right.x; mv.z -= right.z; }
-                    if i.key_down(egui::Key::E) { mv.y += 1.0; }
-                    if i.key_down(egui::Key::Q) { mv.y -= 1.0; }
+                    mv.x += fwd.x * f + right.x * s;
+                    mv.y += fwd.y * f + lift;
+                    mv.z += fwd.z * f + right.z * s;
                     (mv, i.stable_dt.min(0.05), i.modifiers.shift)
                 });
                 if mv.x != 0.0 || mv.y != 0.0 || mv.z != 0.0 {
@@ -8249,6 +8255,19 @@ if let Some(msg) = self.error_banner.clone() {
                                     .small().italics());
                                 ui.add_space(6.0);
                             }
+                            ui.separator();
+                            // ── MOVEMENT KEYS ────────────────────────────────────────────────
+                            ui.label(RichText::new("FREECAM KEYS").color(theme::FAINT()).small());
+                            for l in crate::navkeys::NavLayout::all() {
+                                let on = self.nav_layout == l;
+                                if ui.selectable_label(on, RichText::new(l.label())
+                                    .color(if on { theme::CYAN() } else { theme::INK() })).clicked() {
+                                    self.nav_layout = l;
+                                }
+                                ui.label(RichText::new(l.hint()).color(theme::DIM()).small());
+                                ui.add_space(3.0);
+                            }
+                            ui.add_space(4.0);
                             ui.separator();
                             // ── ENGINEERING PROFILES ─────────────────────────────────────────
                             ui.label(RichText::new("WORKING DISCIPLINE").color(theme::FAINT()).small());
