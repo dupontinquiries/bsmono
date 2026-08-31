@@ -143,74 +143,14 @@ impl VoicetermApp {
     /// bytes of a sequence it does not understand fills the screen with
     /// `[?2004h` — which looks like the shell is broken rather than the
     /// emulator being incomplete.
+    /// Feed terminal output into the focused pane's grid.
+    ///
+    /// The parsing moved to `term_grid::Vt`, where it can be tested and
+    /// where the crate header already claimed it was. What is left here is
+    /// the part that is genuinely the app's: which grid, and which
+    /// parser state goes with it.
     fn feed_pty(&mut self, bytes: &[u8]) {
-        let text = String::from_utf8_lossy(bytes).into_owned();
-        let mut it = text.chars().peekable();
-        while let Some(c) = it.next() {
-            match c {
-                '\x1b' => {
-                    if it.peek() == Some(&'[') {
-                        it.next();
-                        let mut params = String::new();
-                        let mut final_byte = None;
-                        for c2 in it.by_ref() {
-                            if c2.is_ascii_alphabetic() {
-                                final_byte = Some(c2);
-                                break;
-                            }
-                            params.push(c2);
-                        }
-                        let n = |d: usize| params.split(';').next()
-                            .and_then(|x| x.parse::<usize>().ok()).unwrap_or(d);
-                        match final_byte {
-                            Some('H') => {
-                                // 1-based on the wire, 0-based in the grid.
-                                let mut p = params.split(';');
-                                let row = p.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(1);
-                                let col = p.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(1);
-                                self.session.grid.move_to(col.saturating_sub(1), row.saturating_sub(1));
-                            }
-                            Some('J') => self.session.grid.clear(),
-                            Some('K') => self.session.grid.erase_to_eol(),
-                            Some('m') => {
-                                for part in params.split(';') {
-                                    if let Ok(v) = part.parse::<u16>() { self.session.grid.sgr(v); }
-                                }
-                                if params.is_empty() { self.session.grid.sgr(0); }
-                            }
-                            // Cursor moves. Clamped by the grid, not here.
-                            Some('A') | Some('B') | Some('C') | Some('D') => {
-                                let (x, y) = self.session.grid.cursor();
-                                let d = n(1);
-                                let (nx, ny) = match final_byte {
-                                    Some('A') => (x, y.saturating_sub(d)),
-                                    Some('B') => (x, y + d),
-                                    Some('C') => (x + d, y),
-                                    _ => (x.saturating_sub(d), y),
-                                };
-                                self.session.grid.move_to(nx, ny);
-                            }
-                            _ => {}
-                        }
-                    }
-                    // A bare ESC or an unrecognised introducer: dropped.
-                }
-                '\r' => self.session.grid.carriage_return(),
-                '\n' => self.session.grid.newline(),
-                '\t' => {
-                    // Next 8-column stop. Printing spaces rather than moving,
-                    // so erase_to_eol still clears what a tab covered.
-                    let (x, _) = self.session.grid.cursor();
-                    for _ in 0..(8 - (x % 8)) { self.session.grid.print(' '); }
-                }
-                '\x08' => {
-                    let (x, y) = self.session.grid.cursor();
-                    self.session.grid.move_to(x.saturating_sub(1), y);
-                }
-                c if (c as u32) < 0x20 => {}   // other C0: ignored, not drawn
-                c => self.session.grid.print(c),
-            }
-        }
+        self.vt.feed(&mut self.session.grid, bytes);
     }
 
     /// The connections graph over what this app actually holds.
@@ -546,6 +486,9 @@ struct VoicetermApp {
     /// Command blocks (QML blocksDrawer): tracked from what the demo feeds; the
     /// left-edge drawer shows when `surfaces` says `Surface::Blocks`.
     blocks: uikit_term::blocks::BlockTracker,
+    /// The escape-sequence parser's state. Held across frames because a
+    /// sequence can be split between two pty reads — see `term_grid::Vt`.
+    vt: voiceterm_egui::term_grid::Vt,
     /// Bytes bound for the shell, split into commands as lines complete.
     line_buf: uikit_term::blocks::CommandLines,
     /// One-shot scroll target for the tab bar ("N more" pill taps apply next frame).
@@ -3947,6 +3890,7 @@ fn main() -> eframe::Result<()> {
                 theme_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-theme-menu").columns(3).hold(0.35).item_size(64.0),
                 blocks,
                 line_buf: Default::default(),
+                vt: Default::default(),
                 tabbar_scroll_to: None,
                 toasts: uikit_egui::toast::Toasts::new(),
                 // 80x24 is a placeholder: the first frame calls
