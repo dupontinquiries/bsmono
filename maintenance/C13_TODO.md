@@ -389,6 +389,13 @@ fade by distance, and its escalating perf safety-valve. Nothing started.
 `6d9475d2` fixed the in-game HUD and the `ui.rs` layout layer. The
 hand-placed screens still share the bug class:
 
+- **C13-7a — the SETTINGS screen is measured and fine.** Checked because
+  the playtest path sends a tester through it: `font::GH * T_BODY` is
+  0.0574 against a `TW_ROW_H` of 0.062, so a row of text fits a row of
+  space with 8% clear, and `hud::tests::a_settings_row_of_text_fits_in_a
+  _settings_row_of_space` holds it there. The remaining screens below are
+  still unmeasured.
+
 - **C13-7a** — pause / garage / tweaks / academy / maps use `row_pair`
   at pitches authored for the wrong metric, and each has a mouse
   hit-test mirror in `main.rs` that must move with it. These want the

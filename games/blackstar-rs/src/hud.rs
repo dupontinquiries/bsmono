@@ -1676,6 +1676,53 @@ mod tests {
     /// does. Both halves matter: absent on a normal save (or it is noise), and
     /// present AND legible on a debug one (or a tester's recording cannot be
     /// told apart from a player's).
+    /// THE SCREEN A TESTER IS BEING SENT TO.
+    ///
+    /// `6d9475d2` fixed the in-game HUD's text metric and explicitly left the
+    /// hand-placed menus — pause, garage, tweaks, academy, maps — sharing the
+    /// bug class. Then this session told a playtester to open SETTINGS →
+    /// DEBUG → MASTER ACCESS, which is one of those screens.
+    ///
+    /// I WROTE THIS THREE TIMES BADLY BEFORE WRITING IT SIMPLY, and the
+    /// failures are worth recording because they are all one mistake. The
+    /// first bucketed rasterized vertices into bands at
+    /// `LIST_TOP - i * TW_ROW_H` — deriving the bands from the constant under
+    /// test, so they shrank with it and the test passed against both a halved
+    /// row height and a 50% larger font. The second clustered the ink by gap
+    /// instead, which is pitch-independent but counts the section card and
+    /// cursor quads too, so `clusters >= rows` was satisfied by furniture. The
+    /// third would have been more of the same.
+    ///
+    /// The property is one inequality: a row of text must fit inside a row of
+    /// space. Rasterizing was ceremony around a comparison, and the ceremony
+    /// is what kept measuring the wrong thing.
+    #[test]
+    fn a_settings_row_of_text_fits_in_a_settings_row_of_space() {
+        let glyph = font::GH * T_BODY;
+        assert!(
+            glyph < TW_ROW_H,
+            "settings text is {glyph:.4} tall in a {TW_ROW_H:.4} row — rows overlap"
+        );
+        // and with enough margin to read as separate rows rather than a block.
+        // 8% is what it currently has; below that it is cramped even when it
+        // technically fits, which is the state the in-game HUD was in before
+        // anyone measured it.
+        assert!(
+            TW_ROW_H - glyph > TW_ROW_H * 0.05,
+            "settings rows clear by only {:.4} ({:.0}%) — legible but cramped",
+            TW_ROW_H - glyph,
+            (TW_ROW_H - glyph) / TW_ROW_H * 100.0
+        );
+        // the title has its own size and its own row: it must not reach the
+        // first row's band either
+        let title_glyph = font::GH * T_TITLE;
+        assert!(
+            0.885 - title_glyph > LIST_TOP,
+            "the title descends into the first row (title bottom {:.3}, list top {LIST_TOP:.3})",
+            0.885 - title_glyph
+        );
+    }
+
     #[test]
     fn the_master_access_watermark_appears_only_when_it_should() {
         let a = 16.0 / 9.0;
