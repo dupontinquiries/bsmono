@@ -718,6 +718,49 @@ use `edit` (or `write_file` for a new file) to land the ones you want.\n"));
         ToolResult::ok(out)
     }
 
+    /// Run the suite, revert the run's changes, run it again, restore. Returns
+    /// `(after, before_reverted)` test results for `oracle::vacuous` / `oracle::delta`.
+    ///
+    /// THE INVERSE-PATCH CHECK, automated. A test that passes with the change and also without it
+    /// does not test the change; a change whose suite is byte-identical before and after is
+    /// unproven. Both facts need the tree in two states, and the scratch is a git worktree, so the
+    /// second state is a `stash` away — no second copy of the repo, no model, no reviewer.
+    ///
+    /// `base` is the commit the comparison reverts to (the session baseline or the last green
+    /// checkpoint). The working tree is restored before returning even when the second run fails;
+    /// leaving the agent's workspace reverted would silently destroy the change it was verifying,
+    /// which is a far worse outcome than an unanswered question.
+    pub fn inverse_patch_check(&self, test_cmd: &[String], rel_dir: &str, base: &str)
+        -> Option<(String, String)> {
+        let git = |args: &[&str]| -> Option<String> {
+            let out = Command::new("git").args(args).current_dir(&self.root)
+                .stdin(Stdio::null()).output().ok()?;
+            if out.status.success() { Some(String::from_utf8_lossy(&out.stdout).trim().to_string()) } else { None }
+        };
+        // ORDER MATTERS AND IS EASY TO GET WRONG: `after` is the suite ON THE CHANGE, so it runs
+        // before anything is reverted. The first draft of this stashed first and then measured
+        // `after`, which would have compared the reverted tree against itself and called every
+        // change vacuous.
+        let after = self.run_at(test_cmd, rel_dir).output;
+        // Stash EVERYTHING including untracked, or a change that only added files reverts to itself.
+        git(&["stash", "push", "-u", "-q", "-m", "logscope: inverse-patch check"])?;
+        // From here to the pop there is no `?`: an early return would leave the agent's work in the
+        // stash and the tree reverted, which is worse than any answer this function could give.
+        let _ = git(&["checkout", "-q", base, "--", "."]);
+        let reverted = self.run_at(test_cmd, rel_dir).output;
+        // Always restore, whatever happened above.
+        let _ = git(&["checkout", "-q", "HEAD", "--", "."]);
+        let popped = git(&["stash", "pop", "-q"]).is_some();
+        if !popped {
+            // A failed pop means the agent's work is sitting in the stash rather than the tree.
+            // Say so loudly: this is the one outcome worse than not running the check.
+            crate::diag!("wgpu-engine: inverse-patch check could not restore the workspace — the \
+change is in `git stash` (run `git stash pop` in {})", self.root.display());
+            return None;
+        }
+        Some((after, reverted))
+    }
+
     fn git_log(&self, n: usize, path: &str) -> ToolResult {
         let b = crate::read_harness::budget(
             crate::read_harness::ModelClass::resolve(self.model_params, &self.model_label));
@@ -5217,6 +5260,81 @@ mod long_horizon_tests {
         // And an unlabelled run is Mid — the documented unknown, not an accident.
         let (blind, _) = AgentRun::start(&d, "t", AgentConfig::default());
         assert_eq!(blind.model_class(), crate::read_harness::ModelClass::Mid);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    // ── the oracle: is the change CORRECT, not merely green ──────────────────────────────────────
+
+    /// The inverse-patch check against a real git worktree: the change is measured, reverted,
+    /// measured again, and restored. This is the automated form of the sabotage step — the one that
+    /// caught several wrong tests by hand this session.
+    #[test]
+    fn the_inverse_patch_check_measures_both_trees_and_restores_the_work() {
+        let d = tmp("inverse");
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git").args(args).current_dir(&d).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        // `grep -q FIXED marker.txt` stands in for the suite: it passes only with the change.
+        std::fs::write(d.join("marker.txt"), "BROKEN\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+
+        // the agent's change, uncommitted, exactly as a run leaves it
+        std::fs::write(d.join("marker.txt"), "FIXED\n").unwrap();
+        std::fs::write(d.join("added.txt"), "new file\n").unwrap();
+
+        let ws = Workspace::new(&d);
+        let cmd = vec!["grep".into(), "-q".into(), "FIXED".into(), "marker.txt".into()];
+        let (after, reverted) = ws.inverse_patch_check(&cmd, "", &base).expect("check ran");
+        assert!(after.contains("exit: 0"), "the suite passes WITH the change: {after}");
+        assert!(!reverted.contains("exit: 0"), "and fails without it: {reverted}");
+
+        // The work is back — including the untracked file, which a plain `stash` would have left behind.
+        assert_eq!(std::fs::read_to_string(d.join("marker.txt")).unwrap(), "FIXED\n",
+                   "the change was not restored — the agent's work would be lost");
+        assert!(d.join("added.txt").is_file(), "untracked additions must survive the check too");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A change the suite cannot see: both runs identical, so the verdict is Unproven rather than
+    /// the green tick the old gate would have given.
+    #[test]
+    fn a_change_the_suite_cannot_see_is_reported_unproven() {
+        let d = tmp("unproven");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&d).output().unwrap();
+        };
+        git(&["init", "-q"]);
+        std::fs::write(d.join("marker.txt"), "OK\n").unwrap();
+        std::fs::write(d.join("untested.txt"), "before\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "base"]);
+        let base = String::from_utf8_lossy(
+            &std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&d)
+                .output().unwrap().stdout).trim().to_string();
+
+        // edit a file the "suite" never looks at
+        std::fs::write(d.join("untested.txt"), "after\n").unwrap();
+
+        let ws = Workspace::new(&d);
+        let cmd = vec!["grep".into(), "-q".into(), "OK".into(), "marker.txt".into()];
+        let (after, reverted) = ws.inverse_patch_check(&cmd, "", &base).unwrap();
+        assert!(after.contains("exit: 0") && reverted.contains("exit: 0"),
+                "green either way — which is exactly the case the old gate called success");
+        // Through the oracle: identical suites, so no test changed status.
+        let d_after = crate::oracle::parse_test_results(&after);
+        let d_rev = crate::oracle::parse_test_results(&reverted);
+        let delta = crate::oracle::delta(&d_rev, &d_after);
+        assert!(delta.is_empty());
+        match crate::oracle::judge(&delta, &[]) {
+            crate::oracle::Evidence::Unproven(_) => {}
+            other => panic!("expected Unproven, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 }
