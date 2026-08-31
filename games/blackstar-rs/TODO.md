@@ -565,6 +565,23 @@ or per-boss flag the fold system actually checks (a natural
 folding — stay one form, or a different, non-`xform` presentation
 entirely.
 
+**The flag now exists — `main.rs`'s `Chassis::transforms` (default
+true), read from the same `chassis.json` string-match pattern as
+`boss`/`scale`.** Went with "stay one form" as the default behavior,
+not the "different, non-xform presentation" alternative: it needed no
+new asset support, is a one-line addition at the existing "this chassis
+does not transform" refusal in `transform()` (same toast a non-bot car
+already gets — there is no more to say about a boss authored to fight
+in one form than about a car that was never a bot), and leaves every
+other system keyed off `cars.xform` (the pose inspector, `chassis_scale`,
+`is_boss`, walk poses) completely untouched — the strip itself still
+exists and is still browsable, only the player-facing fold key stops
+doing anything. No existing chassis.json sets `"transforms": false` (checked
+all 252), so this is inert until a specific boss actually opts out — the
+mechanism is built, but nobody has been told which boss(es), if any,
+should use it. That's a content decision, not a code one, and belongs
+with whoever is authoring the boss roster.
+
 **The logscope/aperture/wgpu-engine vision (AI-authored raids):**
 architecturally coherent, not just aspirational — `apps/logscope`
 (elsewhere in this monorepo) contains a real `gpu-gemm` wgpu→Vulkan

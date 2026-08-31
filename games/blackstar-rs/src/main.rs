@@ -666,6 +666,20 @@ struct Chassis {
     scale: f32,
     /// does this chassis fight as a boss
     boss: bool,
+    /// can this chassis fold vehicle<->robot at all. Defaults to true —
+    /// every ordinary bot does. A boss whose asset was never authored
+    /// with a coherent fold strip (a design choice, not a bug: not every
+    /// raid boss is "always transformable in the same sense as bots")
+    /// sets `"transforms": false` in its `chassis.json` to opt out,
+    /// mirroring how `scale`/`boss` are already per-chassis data rather
+    /// than a code change. Read by `transform()`, which refuses the fold
+    /// request with the same "does not transform" toast a non-bot car
+    /// already gets — the strip itself is untouched, so the catalogue's
+    /// pose inspector, `chassis_scale`, `is_boss`, and everything else
+    /// keyed off `cars.xform` still see every pose exactly as before;
+    /// the only change is that the player-facing fold key stops doing
+    /// anything for this chassis.
+    transforms: bool,
     /// jets fly instead of driving: never grounded, lift and nose thrust
     flight: bool,
     /// hoverers/hovertanks ride a cushion instead of driving on wheels —
@@ -1912,6 +1926,9 @@ fn main() {
                 boss: std::fs::read_to_string(bdir.join("chassis.json"))
                     .map(|t| t.contains("\"boss\": true") || t.contains("\"boss\":true"))
                     .unwrap_or(false),
+                transforms: std::fs::read_to_string(bdir.join("chassis.json"))
+                    .map(|t| !(t.contains("\"transforms\": false") || t.contains("\"transforms\":false")))
+                    .unwrap_or(true),
                 flight,
                 floats,
             });
@@ -2831,7 +2848,15 @@ impl Game {
         if self.net.online() || self.mode != Mode::Play {
             return;
         }
-        if self.cars.xform.get(&self.cars.active).is_none() {
+        let Some(&(cid, _)) = self.cars.xform.get(&self.cars.active) else {
+            self.toastf("this chassis does not transform");
+            return;
+        };
+        if !self.cars.chassis[cid].transforms {
+            // same message a non-bot car gets: the player-facing effect
+            // (the key does nothing) is identical either way, and there
+            // is no more to say about a boss that was authored to fight
+            // in one form than there is about a car that was never a bot
             self.toastf("this chassis does not transform");
             return;
         }
