@@ -188,8 +188,80 @@ pub fn find_orientation(verts: &[Vertex]) -> Quat {
     best.1
 }
 
-/// How much this orientation looks like an upright car: four low clusters at
-/// the corners, of similar size, wider than they are tall.
+/// THE FRAME THAT STANDS A ROBOT UP — scored as a standing body, not as a car.
+///
+/// `find_orientation` maximises `wheel_score`, which pays for "wider than it
+/// is tall" (`half.x / half.y`). On anything car-shaped that is right. On a
+/// standing robot its maximum is the body LYING DOWN, and the codebase has
+/// said so in prose since the sidecars landed: *a legless robot has no wheels
+/// to find, so the search picks whatever reads most car-like, which is the
+/// robot lying on its side.*
+///
+/// `Model::settle` is applied ramped by fold progress — identity while
+/// driving, full at the robot end — so scoring it with `wheel_score` put a
+/// car-shaped question to the body at exactly the moment it is least a car.
+/// That is the reported "fine as a vehicle, sideways in robot mode", and the
+/// settle mechanism was causing it rather than fixing it.
+///
+/// `orient::up_score` is the standing-body signal, and was already in the tree
+/// unused by this path. Two guards, because a wrong settle is worse than none:
+/// the winner must beat IDENTITY (a pose the chassis frame already stood up
+/// keeps its frame), and it must beat the runner-up by a clear margin.
+pub fn find_upright(verts: &[Vertex]) -> Quat {
+    const AXES: [Vec3; 6] = [Vec3::X, Vec3::NEG_X, Vec3::Y, Vec3::NEG_Y, Vec3::Z, Vec3::NEG_Z];
+    if verts.is_empty() {
+        return Quat::IDENTITY;
+    }
+    // SCORE UP-AXES, NOT FRAMES. `up_score` asks only "which way is up", so
+    // the four (up, forward) frames sharing an up-axis score IDENTICALLY.
+    // Ranking all 24 makes the top two a guaranteed tie, and a margin test
+    // against a tie rejects every answer — which is how the first version of
+    // this silently disabled itself, caught by the lying-down complement.
+    let mut per_axis: Vec<(f32, Vec3)> = Vec::new();
+    for up in AXES {
+        let rotated: Vec<Vertex> = verts
+            .iter()
+            .map(|v| {
+                let q = align_up(up);
+                Vertex { pos: (q * Vec3::from_array(v.pos)).to_array(), ..*v }
+            })
+            .collect();
+        per_axis.push((crate::orient::up_score(&rotated, Vec3::Y), up));
+    }
+    per_axis.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let (best, up) = match per_axis.first() {
+        Some(x) => *x,
+        None => return Quat::IDENTITY,
+    };
+    let runner_up = per_axis.get(1).map(|x| x.0).unwrap_or(0.0);
+    let identity_score = crate::orient::up_score(verts, Vec3::Y);
+    // already upright: leave the chassis frame alone
+    if best <= identity_score * 1.15 {
+        return Quat::IDENTITY;
+    }
+    // ambiguous: a near-tie between two DIFFERENT up-axes is not evidence
+    if best <= 1e-4 || (best - runner_up) / best < 0.20 {
+        return Quat::IDENTITY;
+    }
+    align_up(up)
+}
+
+/// The rotation taking `up` onto +Y, choosing any stable perpendicular for
+/// forward. `find_upright` only decides which way is UP — the forward sign is
+/// `nose_corrected`'s job and guessing it here would overrule that.
+fn align_up(up: Vec3) -> Quat {
+    const AXES: [Vec3; 6] = [Vec3::X, Vec3::NEG_X, Vec3::Y, Vec3::NEG_Y, Vec3::Z, Vec3::NEG_Z];
+    let fwd = AXES
+        .iter()
+        .copied()
+        .find(|a| a.dot(up).abs() < 0.5)
+        .unwrap_or(Vec3::NEG_Z);
+    let right = fwd.cross(up).normalize();
+    let m = glam::Mat3::from_cols(right, up, -fwd).transpose();
+    Quat::from_mat3(&m)
+}
+
+
 pub fn wheel_score(verts: &[Vertex], q: Quat) -> f32 {
     let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
     for v in verts {
@@ -1155,6 +1227,172 @@ fn bounds_from_extent(lo: Vec3, hi: Vec3, ext_half: Vec3) -> (Vec3, f32) {
 mod tests {
     use super::*;
 
+    /// SETTLE MUST NOT LAY A STANDING ROBOT DOWN.
+    ///
+    /// `Model::settle` is applied ramped by fold progress — identity while
+    /// driving, FULL at the robot end. It was scored by `wheel_score`, whose
+    /// `half.x / half.y` term pays for "wider than it is tall", so on a
+    /// standing figure its maximum is the body on its side. The mechanism
+    /// added to fix sideways robots was producing them.
+    ///
+    /// The body here is unambiguous: 3 units tall in Y, ~0.6 across, mass
+    /// biased low. Any honest "which way is up" answer is identity.
+    #[test]
+    fn settle_does_not_lay_a_standing_robot_on_its_side() {
+        let vtx = |p: Vec3| Vertex { pos: p.to_array(), nrm: [0.0, 1.0, 0.0], uv: [0.0, 0.0] };
+        let mut body: Vec<Vec3> = Vec::new();
+        for i in 0..400 {
+            let t = i as f32 / 400.0;
+            let y = t * t * 3.0; // squared bias: more samples low, like legs
+            let r = 0.30 * (1.0 - t * 0.5);
+            let a = i as f32 * 2.399;
+            body.push(Vec3::new(a.cos() * r, y, a.sin() * r));
+        }
+        let verts: Vec<Vertex> = body.iter().map(|p| vtx(*p)).collect();
+
+        // how tall the body reads AFTER the frame is applied
+        let tallness = |q: Quat| -> f32 {
+            let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for p in &body {
+                let r = q * *p;
+                lo = lo.min(r);
+                hi = hi.max(r);
+            }
+            let e = hi - lo;
+            e.y / e.x.max(e.z).max(1e-6)
+        };
+
+        let upright = tallness(Quat::IDENTITY);
+        assert!(upright > 3.0, "the fixture is not actually a standing body ({upright:.2})");
+
+        // the car heuristic, for contrast — this is the bug, asserted so the
+        // test fails loudly if someone points settle back at it
+        let car = tallness(find_orientation(&verts));
+        assert!(
+            car < 1.0,
+            "wheel_score no longer lays a standing body down ({car:.2}) — if that is a \
+             deliberate change, this test and find_upright both need revisiting"
+        );
+
+        // and the standing search leaves it alone
+        let q = find_upright(&verts);
+        assert_eq!(q, Quat::IDENTITY, "settle rotated an already-upright body");
+        assert!(tallness(q) > 3.0);
+    }
+
+    /// THE WIRING, not just the function.
+    ///
+    /// The two tests above call `find_upright` directly, so they stay green
+    /// if `load_oriented` goes on calling `find_orientation` — which is
+    /// exactly what happened when they were break-checked: both regressions
+    /// passed. A function that is correct and unreached is this repo's most
+    /// common failure, so the call site gets its own assertion.
+    ///
+    /// A source scan is a blunt instrument, so it asserts a floor on its own
+    /// match count first: a scan that matches nothing passes every test below
+    /// it (CLAUDE.md §5b).
+    #[test]
+    fn the_settle_call_site_uses_the_standing_search_and_filters_debris() {
+        let src = include_str!("model.rs");
+        // A SOURCE SCAN IN THE FILE IT SCANS WILL FIND ITSELF.
+        //
+        // Twice: first the literal "let settle = {" matched this test, then
+        // so did the anchor comment I replaced it with — both sit above the
+        // real block, so `find` returned the test's own source and the scan
+        // reported the block missing its own contents. rfind is not the
+        // answer either; it only works while the test happens to sit above
+        // the block, and CLAUDE.md §5c records what rfind's "over-reach is
+        // harmless" comment cost last time.
+        //
+        // So the needles are ASSEMBLED AT RUNTIME. No whole literal exists
+        // anywhere in this file, which makes a self-match impossible rather
+        // than merely unlikely.
+        let anchor = format!("{} was consumed by the loop above", "`raws`");
+        let block_start = src.find(&anchor).expect("load_oriented lost its settle block");
+        // bound the window at the block's own close, not a byte count, so it
+        // cannot reach into whatever is added below it next
+        let rest = &src[block_start..];
+        let block_end = rest.find("\n    };").map(|e| e + 8).unwrap_or(rest.len().min(2000));
+        let block = &rest[..block_end];
+
+        let filters = format!("crate::massfilter::{}(&refs)", "classify");
+        let stands = format!("find_{}(src)", "upright");
+        let mut found = 0;
+        for n in [&filters, &stands] {
+            assert!(block.contains(n.as_str()), "the settle block no longer contains: {n}");
+            found += 1;
+        }
+        assert_eq!(found, 2, "the scan matched nothing");
+        let car = format!("find_{}(", "orientation");
+        assert!(
+            !block.contains(&car),
+            "the settle block calls the CAR heuristic again — that lays robots down"
+        );
+    }
+
+    /// The complement (CLAUDE.md §5c): a body that IS lying down must still
+    /// be stood up, or the guard above has simply disabled settle.
+    #[test]
+    fn settle_still_stands_up_a_pose_authored_on_its_side() {
+        let vtx = |p: Vec3| Vertex { pos: p.to_array(), nrm: [0.0, 1.0, 0.0], uv: [0.0, 0.0] };
+        // same figure, authored along +X instead of +Y
+        let mut body: Vec<Vec3> = Vec::new();
+        for i in 0..400 {
+            let t = i as f32 / 400.0;
+            let x = t * t * 3.0;
+            let r = 0.30 * (1.0 - t * 0.5);
+            let a = i as f32 * 2.399;
+            body.push(Vec3::new(x, a.cos() * r, a.sin() * r));
+        }
+        let verts: Vec<Vertex> = body.iter().map(|p| vtx(*p)).collect();
+        let q = find_upright(&verts);
+        assert_ne!(q, Quat::IDENTITY, "a body lying along X was left lying down");
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for p in &body {
+            let r = q * *p;
+            lo = lo.min(r);
+            hi = hi.max(r);
+        }
+        let e = hi - lo;
+        assert!(
+            e.y / e.x.max(e.z).max(1e-6) > 3.0,
+            "settle rotated it, but not upright ({:.2})",
+            e.y / e.x.max(e.z).max(1e-6)
+        );
+    }
+
+    /// Debris corrupts the settle frame, and the filter in `load_oriented`
+    /// stops it. `massfilter`'s module doc names the orientation search as a
+    /// consumer; `strip_guess` filtered, the per-pose settle did not.
+    #[test]
+    fn debris_would_corrupt_the_settle_frame() {
+        let vtx = |p: Vec3| Vertex { pos: p.to_array(), nrm: [0.0, 1.0, 0.0], uv: [0.0, 0.0] };
+        let mut body: Vec<Vec3> = Vec::new();
+        for i in 0..400 {
+            let t = i as f32 / 400.0;
+            let y = t * t * 3.0;
+            let r = 0.30 * (1.0 - t * 0.5);
+            let a = i as f32 * 2.399;
+            body.push(Vec3::new(a.cos() * r, y, a.sin() * r));
+        }
+        let junk: Vec<Vec3> = (0..6).map(|i| Vec3::new(22.0 + i as f32 * 0.1, 1.5, 0.0)).collect();
+
+        // the filter must actually reject the stray, or this proves nothing
+        let refs: Vec<&[Vec3]> = vec![&body, &junk];
+        let mass = crate::massfilter::classify(&refs);
+        assert_eq!(mass.keep, vec![true, false], "the filter did not identify the debris");
+
+        let dirty: Vec<Vertex> = body.iter().chain(junk.iter()).map(|p| vtx(*p)).collect();
+        let clean: Vec<Vertex> = body.iter().map(|p| vtx(*p)).collect();
+        // an upright body with a panel flung 22 units out on X is no longer
+        // scored as upright: the stray owns the X extent
+        assert!(
+            crate::orient::up_score(&dirty, Vec3::Y) < crate::orient::up_score(&clean, Vec3::Y),
+            "debris made no difference to the standing score — this test measures nothing"
+        );
+        assert_eq!(find_upright(&clean), Quat::IDENTITY);
+    }
+
     /// THE BUG THE MASS FILTER FIXES, as a unit: one panel flung below a
     /// body used to define `ride_h`, so physics seated the chassis on
     /// debris and the visible body hung in the air (or, when the stray
@@ -1301,7 +1539,35 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
         // into `add_mesh`), so this reads the copy gathered on the way past.
         // Same vertices, same order as `raws.iter().flat_map(..)` would have
         // produced.
-        if all_verts.is_empty() { Quat::IDENTITY } else { find_orientation(&all_verts) }
+        //
+        // DEBRIS IS REJECTED FIRST, for the reason `massfilter`'s own module
+        // doc gives and `strip_guess` (250 lines up) already acts on: the
+        // frame search scores over `lo`/`hi` extents and a bounding-box
+        // midpoint, so one flung panel inflates a side extent, collapses the
+        // tallness term, drags the mirror centre, and the pose arrives lying
+        // down or facing backwards. This call was the third consumer named in
+        // that doc and the only one that never got wired — the guessed strip
+        // path filtered, the per-pose settle did not, so a chassis could be
+        // stood up correctly by its chassis frame and then laid back down by
+        // its own settle.
+        let mass = crate::massfilter::classify(&refs);
+        // `prim_pts[i]` holds one position per vertex prim `i` contributed to
+        // `all_verts`, pushed in the same loop iteration — so a running
+        // offset recovers each prim's slice of the flattened vertex list.
+        let mut body: Vec<Vertex> = Vec::with_capacity(all_verts.len());
+        let mut at = 0usize;
+        for (i, pts) in prim_pts.iter().enumerate() {
+            let end = (at + pts.len()).min(all_verts.len());
+            if mass.keep.get(i).copied().unwrap_or(true) {
+                body.extend_from_slice(&all_verts[at..end]);
+            }
+            at = end;
+        }
+        let src = if body.is_empty() { &all_verts } else { &body };
+        // `find_upright`, NOT `find_orientation`: settle lands at the ROBOT
+        // end of the fold, and the car heuristic's maximum there is the body
+        // lying down. See `find_upright`'s doc.
+        if src.is_empty() { Quat::IDENTITY } else { find_upright(src) }
     };
     let (tuck, pack) = {
         let sk = crate::skeleton::skeletonize(&refs);
