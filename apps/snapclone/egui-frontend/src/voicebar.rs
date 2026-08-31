@@ -130,6 +130,12 @@ impl VoiceBar {
 
     pub fn floor_open(&self) -> bool { self.talker.trim().is_empty() }
 
+    /// The level the meter is being driven with, clamped. Readable so a
+    /// caller can assert the gate and the meter agree — they are fed from
+    /// one measurement precisely so they cannot drift, and a private field
+    /// makes that unprovable.
+    pub fn mic_level(&self) -> f32 { self.mic_level }
+
     /// `setMicLevel`, clamped — a level above 1.0 would overrun the meter track.
     pub fn set_mic_level(&mut self, level: f32) {
         self.mic_level = level.clamp(0.0, 1.0);

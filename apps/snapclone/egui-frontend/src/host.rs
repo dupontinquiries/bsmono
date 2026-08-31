@@ -159,6 +159,15 @@ pub enum HostEvent {
     /// The mic produced a frame interval; ask the sender whether anything may
     /// leave.
     MicFrame,
+    /// How loud that interval was, 0..1. Feeds the transmit gate's activity
+    /// score AND the on-screen meter from ONE measurement — two sources
+    /// would eventually disagree about whether you are speaking, and the
+    /// meter is how a person checks that the mic works at all.
+    MicActivity(f32),
+    /// Whether the host can turn samples into payloads. False is a real
+    /// state, not an error: with no encoder the call joins, the floor works,
+    /// and nothing leaves — silence the user cannot otherwise account for.
+    EncoderReady(bool),
     /// A packet is ready to go out to everyone in the call.
     VoiceOutbound(voice_bridge::Packet),
     /// A decoded frame for the play-out cushion.
@@ -238,6 +247,15 @@ pub enum HostCommand {
     SendVoice(Vec<(String, Vec<u8>)>),
     /// What the transmit half decided about this mic interval.
     VoiceEmit(voice_send::Emit),
+    /// A voice payload arrived and was routed. Decode it and hand the
+    /// samples back as `DecodedAudio`.
+    ///
+    /// The codec belongs to the host, which is why this is a round trip
+    /// rather than the app calling a decoder: the app knows about frames of
+    /// f32 and nothing about how they were packed. Before this the decoded
+    /// packet was matched on and DROPPED — inbound audio reached the bridge
+    /// and stopped there, so a call was silent in both directions.
+    DecodeAudio(Vec<u8>),
     /// Show a notification. Only produced when the app decided one is
     /// warranted — an unfocused window and at least one sender.
     Notify(uikit_egui::notify::Rendered),
@@ -376,7 +394,11 @@ impl Snapclone {
                 // The return carries the routed packet; the app has already
                 // applied any floor change to the coordinator by the time it
                 // comes back, so there is nothing for the host to do with it.
-                let _ = self.voice_receive(&sender, &payload);
+                if let crate::voice_bridge::Inbound::Handled {
+                    packet: crate::voice_bridge::Packet::VoiceFrame(f), ..
+                } = self.voice_receive(&sender, &payload) {
+                    out.push(HostCommand::DecodeAudio(f));
+                }
                 // Arriving voice is what arms the proximity screensaver's
                 // window, and the posture engine is told separately from the
                 // codec path on purpose: one is about audio, the other about
@@ -384,6 +406,20 @@ impl Snapclone {
                 self.last_voice_at = Some(self.now_secs);
             }
             HostEvent::MicFrame => out.push(HostCommand::VoiceEmit(self.voice_frame())),
+            HostEvent::MicActivity(level) => {
+                let l = level.clamp(0.0, 1.0);
+                self.sender.on_activity(l);
+                self.voicebar.set_mic_level(l);
+            }
+            HostEvent::EncoderReady(ready) => {
+                self.sender.set_encoder_ready(ready);
+                // `note_no_encoder` reports ONCE by design — the bool is
+                // whether this is the first time — because saying it every
+                // frame at fifty hertz would bury the log it belongs in.
+                if !ready && self.sender.is_transmitting() && self.sender.note_no_encoder() {
+                    out.push(HostCommand::VoiceEmit(voice_send::Emit::NoEncoder));
+                }
+            }
             HostEvent::VoiceOutbound(p) => out.push(HostCommand::SendVoice(self.voice_send(&p))),
             HostEvent::DecodedAudio(frame) => self.sink_push(frame),
             HostEvent::SinkDepth(depth) => {
@@ -718,6 +754,64 @@ mod tests {
         assert_eq!(s.standing_of("sc-11223344"),
                    Standing::Discovered { port: crate::qr::DEFAULT_PORT });
         assert_eq!(s.standing_of("192.168.1.5"), Standing::Plain);
+    }
+
+    #[test]
+    fn an_inbound_voice_frame_reaches_the_host_instead_of_being_dropped() {
+        // The arm was `Packet::VoiceFrame(_) => {}`. A call could connect,
+        // negotiate the floor, and play nothing — the payload reached the
+        // bridge and stopped there.
+        let mut s = app();
+        // The link first: `voice_bridge::inbound` refuses everything while
+        // disconnected, which is correct — a voice packet arriving before
+        // the transport is up has no session to belong to.
+        s.apply(HostEvent::VoiceLink(true));
+        let payload = crate::voice_bridge::encode(
+            &crate::voice_bridge::Packet::VoiceFrame(vec![1, 2, 3, 4]));
+        let out = s.apply(HostEvent::VoiceReceived {
+            sender: "sc-aabbccdd".into(), payload });
+        let decoded = out.iter().find_map(|c| match c {
+            HostCommand::DecodeAudio(b) => Some(b.clone()), _ => None });
+        assert_eq!(decoded, Some(vec![1, 2, 3, 4]),
+                   "the frame never left the bridge: {out:?}");
+
+        // A floor assert is NOT audio and must not become a decode request.
+        let floor = crate::voice_bridge::encode(
+            &crate::voice_bridge::Packet::FloorAssert { claim_ts: 1 });
+        let out = s.apply(HostEvent::VoiceReceived {
+            sender: "sc-aabbccdd".into(), payload: floor });
+        assert!(!out.iter().any(|c| matches!(c, HostCommand::DecodeAudio(_))), "{out:?}");
+    }
+
+    #[test]
+    fn one_measurement_drives_both_the_gate_and_the_meter() {
+        // Two sources would eventually disagree about whether you are
+        // speaking, and the meter is how a person checks the mic works.
+        let mut s = app();
+        s.apply(HostEvent::MicActivity(0.42));
+        assert!((s.sender.activity() - 0.42).abs() < 1e-6);
+        assert!((s.voicebar.mic_level() - 0.42).abs() < 1e-6,
+                "the meter did not move with the gate");
+        // Out of range is clamped, not trusted: a level above 1 would pin
+        // the meter and skew the gate's own thresholds.
+        s.apply(HostEvent::MicActivity(9.0));
+        assert!((s.sender.activity() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_missing_encoder_is_said_once_and_only_while_transmitting() {
+        // Silence with no explanation is the failure this exists to
+        // prevent; a line per frame at fifty hertz is the failure it must
+        // not become.
+        let mut s = app();
+        s.set_transmitting(true);
+        let out = s.apply(HostEvent::EncoderReady(false));
+        assert!(out.iter().any(|c| matches!(
+            c, HostCommand::VoiceEmit(crate::voice_send::Emit::NoEncoder))), "{out:?}");
+        let again = s.apply(HostEvent::EncoderReady(false));
+        assert!(!again.iter().any(|c| matches!(
+            c, HostCommand::VoiceEmit(crate::voice_send::Emit::NoEncoder))),
+            "reported twice: {again:?}");
     }
 
     #[test]

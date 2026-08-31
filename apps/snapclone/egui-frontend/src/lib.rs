@@ -3599,6 +3599,12 @@ impl Snapclone {
                 crate::voice_bridge::Packet::FloorRelease => {
                     self.group_voice.floor_release(from);
                 }
+                // The samples are not touched HERE: the caller gets the
+                // packet back and the seam turns it into `DecodeAudio`, so
+                // the codec stays in the host. What this arm must not do is
+                // what it used to — nothing at all, silently, which is why
+                // a call could connect, negotiate the floor and play no
+                // sound.
                 crate::voice_bridge::Packet::VoiceFrame(_) => {}
             }
         }

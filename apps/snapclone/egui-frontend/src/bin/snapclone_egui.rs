@@ -438,6 +438,15 @@ impl App {
             if self.voice.live() {
                 let cmds = self.snap.apply(HostEvent::VoiceLink(true));
                 self.handle(cmds);
+                // RAW S16LE, NOT OPUS. There is no encoder linked here, and
+                // the honest way to say that is to send the samples as they
+                // are rather than to claim a codec. It costs ~32 kB/s per
+                // peer against Opus's ~2, which is fine on a LAN and is not
+                // fine on mobile data — swapping in a real encoder is a
+                // change to these two conversions and nothing else, which
+                // is why they are the only place bytes and samples meet.
+                let cmds = self.snap.apply(HostEvent::EncoderReady(true));
+                self.handle(cmds);
             }
         } else if !joined && self.voice.live() {
             self.voice.stop();
@@ -460,10 +469,32 @@ impl App {
         // MIC → the app's transmit gate → the wire. `voice_frame` is what
         // decides whether anything may leave; a rig that sent every mic
         // frame would transmit for the length of the call.
-        let frames = self.voice.mic.take(4);
-        for _ in 0..frames.len() {
-            let cmds = self.snap.apply(HostEvent::MicFrame);
+        for frame in self.voice.mic.take(4) {
+            // The LEVEL first: the meter must move even while the gate is
+            // closed, or a muted mic and a broken one look identical.
+            // RMS, not peak — peak jumps to full scale on one click and
+            // sits there, which makes a meter that is always full.
+            let rms = if frame.is_empty() {
+                0.0
+            } else {
+                (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt()
+            };
+            let cmds = self.snap.apply(HostEvent::MicActivity(rms));
             self.handle(cmds);
+
+            // The verdict, paired with the frame it is about. Applying
+            // `MicFrame` for a batch and then sending "some" frame would
+            // desynchronise the sequence numbers from the audio.
+            let cmds = self.snap.apply(HostEvent::MicFrame);
+            let may_send = cmds.iter().any(|c| matches!(
+                c, HostCommand::VoiceEmit(snapclone_egui::voice_send::Emit::Send { .. })));
+            self.handle(cmds);
+            if may_send {
+                let payload = snapclone_egui::audio::f32_to_pcm(&frame);
+                let cmds = self.snap.apply(HostEvent::VoiceOutbound(
+                    snapclone_egui::voice_bridge::Packet::VoiceFrame(payload)));
+                self.handle(cmds);
+            }
         }
         if let Some(why) = self.voice.mic.take_error() {
             eprintln!("snapclone: microphone stopped: {why}");
@@ -564,6 +595,16 @@ impl App {
                 // AUDIO OUT. A write failure ends the device, not the call:
                 // the socket half still works and the other person can still
                 // be heard by everyone else.
+                // The other half of the codec seam. Raw S16LE in, samples
+                // out — matching what this host sends. A payload whose
+                // length is not a whole number of samples is refused rather
+                // than played as a half-sample of noise.
+                HostCommand::DecodeAudio(bytes) => {
+                    if bytes.len() % 2 == 0 && !bytes.is_empty() {
+                        pending.push(HostEvent::DecodedAudio(
+                            snapclone_egui::audio::pcm_to_f32(&bytes)));
+                    }
+                }
                 HostCommand::PlayAudio(frames) => {
                     let failed = match self.voice.speaker.as_mut() {
                         Some(sp) => sp.play(&frames).err(),
