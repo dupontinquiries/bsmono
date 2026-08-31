@@ -1,10 +1,11 @@
 //! dht_presence — when to publish, and who to look up.
 //!
-//! The DHT node spawns, bootstraps and polls. It has never published
-//! anything and has never resolved anyone: `NodeHost::publish` and
+//! The DHT node spawns, bootstraps and polls. Before this module it
+//! published nothing and resolved nobody: `NodeHost::publish` and
 //! `NodeHost::resolve` had no caller in the tree, so the node maintained a
-//! routing table on behalf of the network and got nothing back for it. Every
-//! peer this app has ever found came from LAN gossip.
+//! routing table on behalf of the network and got nothing back for it, and
+//! every peer the app found came from LAN gossip. This decides when to do
+//! either.
 //!
 //! This module is the decision half, kept pure so the cadence can be tested
 //! without a socket. `tick_dht` performs what it decides.

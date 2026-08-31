@@ -1,10 +1,18 @@
 //! voice_source — the recogniser, as a process that prints lines.
 //!
 //! `Controller::heard` takes a phrase and does the right thing with it,
-//! and nothing calls it. That is the same failure this codebase keeps
-//! turning up: a complete, tested feature with no way in. A parser with no
-//! source is a setting that does nothing when you switch it on, which is
-//! worse than a missing feature because the switch implies otherwise.
+//! and until this module existed nothing called it — the same failure
+//! this codebase keeps turning up: a complete, tested feature with no way
+//! in. A parser with no source is a setting that does nothing when you
+//! switch it on, which is worse than a missing feature because the switch
+//! implies otherwise.
+//!
+//! Written in the PAST tense on purpose. A module doc that says "nothing
+//! calls this" stops being true the moment the module does its job, and a
+//! doc asserting a gap that has been closed sends the next reader looking
+//! for a bug that is not there. This session found one of those in
+//! snapclone, where a handler's summary still claimed it only printed
+//! things while it was saving files and opening sockets.
 //!
 //! ## A command that prints phrases, one per line
 //!

@@ -1,10 +1,13 @@
 //! host — the missing call site, expressed as data.
 //!
-//! `Snapclone` has around ninety-five public methods. The deployable binary
-//! called **two** of them (`apply_settings` and `ui`) and constructed the app
-//! with three hardcoded peers, so `answer_call`, `voice_frame`, `qr_frame`,
-//! `on_gossip`, `classify_nat`, `peer_learned` and roughly thirty more were
-//! ported, tested, and never once reached in a running process. `wiring_check`
+//! `Snapclone` has around ninety-five public methods. Before this module
+//! the deployable binary called **two** of them (`apply_settings` and
+//! `ui`) and constructed the app with three hardcoded peers, so
+//! `answer_call`, `voice_frame`, `qr_frame`, `on_gossip`, `classify_nat`,
+//! `peer_learned` and roughly thirty more were ported, tested, and never
+//! once reached in a running process. That is what this exists to fix, and
+//! the count is a snapshot of the problem rather than a claim about today
+//! — the list shrinks every time something here grows an arm. `wiring_check`
 //! calls that class "tested but never called in production" and it is the
 //! whole gap between this port and the Qt app: not missing code, missing
 //! wiring.

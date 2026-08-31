@@ -3,9 +3,9 @@
 //! Everything around this exists and is tested. `Transport` holds the
 //! position, the repeat mode and the pause-is-really-stop rule. `Queue`
 //! holds what plays next. `SinkPicker` produces a [`Route`] — one speaker
-//! or several. And nothing anywhere in the tree opens an audio device, so
-//! the play button has never produced a sound: the binary is 66 lines with
-//! three hardcoded rooms in it.
+//! or several. Before this module nothing in the tree opened an audio
+//! device, so the play button produced no sound: the binary was 66 lines
+//! with three hardcoded rooms in it. This is what it plays through.
 //!
 //! ## A subprocess, for the third time in this fleet and the same reasons
 //!

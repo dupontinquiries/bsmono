@@ -1,9 +1,10 @@
 //! mail_rfc822 — email-shaped text into the mail view's model.
 //!
-//! The mail views render `MailView`, and `MailView::set_messages` has never
-//! had a caller: `mail_messages` in the binary is `Vec::new()` at
-//! construction and read in two places. So the inbox, the thread list and
-//! the message pane are all correct renderings of nothing.
+//! The mail views render `MailView`, and `MailView::set_messages` had no
+//! caller: `mail_messages` in the binary was `Vec::new()` at construction
+//! and read in two places, so the inbox, the thread list and the message
+//! pane were correct renderings of nothing. This is where the messages
+//! come from.
 //!
 //! The obvious data source is the Proton bridge, and it is not available
 //! here for a reason the frontend's own header already records:

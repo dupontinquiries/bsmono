@@ -1,10 +1,11 @@
 //! snap_wire — putting `wire_v3`'s frames on a socket.
 //!
-//! `wire_v3` models the header and validates flag combinations. It has no
-//! byte encoding, so there has never been anything to write to a socket:
-//! snaps could be composed, queued, expired and exported, and no snap has
-//! ever left this device or arrived on it. The received-snap feed has a
-//! filter and a store and no delivery.
+//! `wire_v3` models the header and validates flag combinations, and has no
+//! byte encoding — so before this module there was nothing to write to a
+//! socket: snaps could be composed, queued, expired and exported, and none
+//! had ever left the device or arrived on it. The received-snap feed had a
+//! filter and a store and no delivery. This is the encoding that closes
+//! it.
 //!
 //! This is the codec and nothing else. It reads and writes over any
 //! `Read`/`Write`, so the transport above it can be TCP, a unix socket, or
