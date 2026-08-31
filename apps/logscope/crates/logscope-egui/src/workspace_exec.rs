@@ -5091,4 +5091,109 @@ mod long_horizon_tests {
         assert!(bs[1].goal.contains("src/parse.rs"), "and the reverse");
         assert!(bs[0].goal.contains("struct Ast"), "shared context reaches both");
     }
+
+
+    // ── the pieces together: a sloppy model against the whole guarded loop ────────────────────────
+
+    /// EVERY PIECE THIS SESSION ADDED IS TESTED ALONE. Nothing tested them INTERACTING, and they
+    /// interact on the failure path specifically: a refused destructive write feeds the refusal
+    /// ladder, which feeds the loop guard, which feeds the phase machine's stall detector, which
+    /// triggers the green restore, which decides what `reapply` would land. A deadlock or a false
+    /// "done" anywhere in that chain is invisible to the unit tests.
+    ///
+    /// The model here misbehaves the way the field reports in this file describe real small models
+    /// misbehaving — prose inside the fence (the 1B case at the refusal-ladder comment), a nonce-less
+    /// call (the "22 of 22 rejected" case), an elided whole-file rewrite, a completion claim with a
+    /// red check, and a repeat of an already-refused write. What is asserted is not that it succeeds
+    /// — it should not — but that the run reaches a DEFENSIBLE end: bounded turns, the real file
+    /// intact, no false plan progress, and a stop the operator can act on.
+    #[test]
+    fn a_sloppy_model_run_ends_in_a_defensible_state() {
+        let d = tmp("sloppy");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        let real = "pub fn load() {}\npub fn save() {}\npub fn keep_me() {}\n".repeat(30);
+        std::fs::write(d.join("src/lib.rs"), &real).unwrap();
+
+        let script = vec![
+            // A plan naming two real files — so plan progress has something to be wrong about.
+            "```plan\n1. rewrite src/lib.rs\n2. add src/extra.rs\n```".to_string(),
+            // Prose inside the fence: the parser refuses it, and the run must NOT read as a model
+            // that emitted nothing (that conflation is what the field report was).
+            "```tool\nI will now rewrite the library file for you.\n```".to_string(),
+            // A call with no nonce: inert under the default gate. Complying perfectly with the wrong
+            // instructions is exactly the 22-of-22 case.
+            "```tool\n{\"tool\":\"read_file\",\"path\":\"src/lib.rs\"}\n```".to_string(),
+            // The destructive rewrite, twice — the second is a model that did not read its refusal.
+            format!("```tool nonce=\"{{N}}\"\n{{\"tool\":\"write_file\",\"path\":\"src/lib.rs\",\"contents\":\"pub fn load() {{}}\\n// ... rest of the code remains the same\\n\"}}\n```"),
+            format!("```tool nonce=\"{{N}}\"\n{{\"tool\":\"write_file\",\"path\":\"src/lib.rs\",\"contents\":\"pub fn load() {{}}\\n// ... the rest is unchanged\\n\"}}\n```"),
+            // Claiming completion with nothing green.
+            format!("Everything is working now. {DONE_MARKER}"),
+        ];
+
+        let cfg = AgentConfig { max_steps: 12,
+            verify_cmd: vec!["test".into()], verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: true,
+            stateful_guide: true, checkpoint_on_green: true,
+            ..Default::default() };
+        // The real gate, not ToolGate::Open: the nonce behaviour is part of what is under test.
+        let nonce = match &cfg.gate { crate::taint::ToolGate::Required(n) => n.as_str().to_string(), _ => unreachable!() };
+        let script: Vec<String> = script.into_iter().map(|t| t.replace("{N}", &nonce)).collect();
+
+        let (stop, run) = drive(&d, "tidy up the library", cfg, &script);
+
+        // 1. It ended, within budget, without panicking.
+        assert!(run.turns() <= 12, "ran away: {} turns", run.turns());
+        assert_ne!(stop, Stop::Done, "nothing was ever green; Done would be the worst outcome");
+
+        // 2. The real file survived every attempt on it.
+        assert_eq!(std::fs::read_to_string(d.join("src/lib.rs")).unwrap(), real,
+                   "an elided rewrite reached the disk");
+
+        // 3. No false plan progress. Step 1 named src/lib.rs and nothing legitimately wrote it;
+        //    step 2 named src/extra.rs and nothing created it.
+        let (done, total) = run.plan().progress();
+        assert_eq!(total, 2, "the plan parsed");
+        assert_eq!(done, 0, "reported {done}/{total} done having written nothing");
+
+        // 4. The phase machine is somewhere honest — never `done`.
+        let phase = run.phase().expect("a guided run has a phase");
+        assert_ne!(phase, "done", "the phase machine accepted a claim with a red check");
+
+        // 5. Nothing false was recorded as verified.
+        assert!(!run.verified());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The same shape, but the model recovers: it takes the refusal's advice and uses an anchored
+    /// edit. The guarded loop must let good work through — a guard that blocks the bad path and also
+    /// the good one is just a broken loop.
+    #[test]
+    fn the_same_guards_let_a_corrected_model_finish() {
+        let d = tmp("recovers");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("src/lib.rs"), "pub fn load() {}\npub fn save() {}\n").unwrap();
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 10,
+            verify_cmd: vec!["true".into()], verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: false,
+            stateful_guide: true, checkpoint_on_green: true, ..Default::default() };
+        let script = vec![
+            "```plan\n1. change src/lib.rs\n```".to_string(),
+            // refused: elided rewrite
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"src/lib.rs\",\"contents\":\"pub fn load() {}\\n// ... rest unchanged\\n\"}\n```".to_string(),
+            // corrected: an anchored edit, which is what the refusal told it to do
+            "```tool\n{\"tool\":\"edit\",\"path\":\"src/lib.rs\",\"find\":\"pub fn load() {}\",\"replace\":\"pub fn load() { let _ = 1; }\"}\n```".to_string(),
+            format!("Done. {DONE_MARKER}"),
+        ];
+        let (stop, run) = drive(&d, "change load()", cfg, &script);
+        assert_eq!(stop, Stop::Done, "a corrected model must be able to finish");
+        let text = std::fs::read_to_string(d.join("src/lib.rs")).unwrap();
+        assert!(text.contains("let _ = 1;"), "the anchored edit landed: {text}");
+        assert!(text.contains("pub fn save() {}"), "and it did not eat the rest of the file");
+        let (done, total) = run.plan().progress();
+        assert_eq!((done, total), (1, 1), "the plan step is verified by the write that satisfied it");
+        assert!(run.verified());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
