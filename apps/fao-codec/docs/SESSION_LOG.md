@@ -3548,3 +3548,13 @@ Process failures this stretch, on the record:
    invokes the binary per shot, so the run mixed generations and its
    output was DISCARDED (full_v11_CONTAMINATED_discard.csv kept as
    the artifact). Rule adopted: no rebuilds while a suite runs.
+
+### MV range 24: suite headline (clean rerun after the contaminated one)
+
+  planar : 31.58 MB @ 33.90 / 0.941   (31.9×)
+  range24: 30.82 MB @ 34.02 / 0.943   (31.2×, +0.69 dB over AV1)
+→ −2.4% bytes AND +0.12 dB AND +0.001 SSIM — strict dominance, and
+larger than the two A/B shots implied: the other pan/handheld shots
+benefited more from the unclamped search than the diagnostic shot.
+docs/full_v11_dz32_range24.csv. Session ladder:
+46.5× @ −2.00 dB → 31.2× @ +0.69 dB.
