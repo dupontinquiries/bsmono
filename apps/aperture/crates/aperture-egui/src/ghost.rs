@@ -52,6 +52,10 @@ impl Ghost {
         generation: u64,
         current_version: u64,
         result: &Result<String, String>,
+        // The operator's binding order. Passed in rather than read from
+        // a global so this stays testable with any map, and so the editor
+        // owns the setting rather than the completion layer owning it.
+        map: &aperture_complete::keymap::KeyMap,
     ) -> Option<(Vec<aperture_complete::multipass::Block>, Vec<String>)> {
         let expected = matches!(*self, Ghost::Pending { generation: g } if g == generation);
         match result {
@@ -71,7 +75,7 @@ impl Ghost {
                 // Tab still means "take the obvious one" and nothing has
                 // to change for the common case; the rest are offered on
                 // home-row keys.
-                let (blocks, prose) = aperture_complete::multipass::plan(text);
+                let (blocks, prose) = aperture_complete::multipass::plan_with(text, map);
                 match blocks.iter().find(|b| b.kind.insertable()) {
                     Some(first) => {
                         *self = Ghost::Shown { text: first.text.clone() };
@@ -213,12 +217,12 @@ mod tests {
     fn lifecycle_pending_to_shown_gated_by_generation() {
         let mut g = Ghost::Idle;
         g.request_sent(5);
-        g.on_outcome(4, 5, &Ok("stale".into()));
+        g.on_outcome(4, 5, &Ok("stale".into()), &aperture_complete::keymap::KeyMap::new());
         assert!(g.is_pending(), "stale outcome ignored, still waiting");
-        g.on_outcome(5, 6, &Ok("late".into()));
+        g.on_outcome(5, 6, &Ok("late".into()), &aperture_complete::keymap::KeyMap::new());
         assert_eq!(g, Ghost::Idle, "right request, but the buffer moved on");
         g.request_sent(7);
-        g.on_outcome(7, 7, &Ok("println!".into()));
+        g.on_outcome(7, 7, &Ok("println!".into()), &aperture_complete::keymap::KeyMap::new());
         assert_eq!(g, Ghost::Shown { text: "println!".into() });
     }
 

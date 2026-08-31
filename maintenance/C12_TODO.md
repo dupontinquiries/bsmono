@@ -5089,3 +5089,50 @@ mechanism, and a label that drops it silently leaves the group.
 
 - **C90c — the picker step.** `Then::Ask` is the palette's own shape for
   it and these three do not use it yet.
+
+## 92. aperture: the completion key map is editable, and Tab's real behaviour surfaced
+
+**`HOME_KEYS` was a constant.** `['f','j','d','k','s','l','a',';']` is a
+sensible default and a wrong one on Dvorak, on AZERTY (no `;` on the
+home row at all), and on a split board with a different number of
+comfortable keys. Fine until it is not, and then nothing to be done.
+
+`aperture_complete::keymap::KeyMap` is the editable order, held on the
+editor as `complete_keys` and threaded through `plan_with` and
+`Ghost::on_outcome`.
+
+Decisions:
+  - **A `Vec<char>`, not a set.** The first key binds the first
+    insertable block — the one the model most likely meant — so ORDER is
+    the ergonomics. Editing is reorder-and-replace, not add-and-remove.
+  - **Reserved keys are refused BY NAME.** Binding `i` would make
+    entering insert mode accept a completion. The message says which key
+    and why, because a binding that vanishes silently reads as a broken
+    editor.
+  - **`RESERVED` is not exhaustive on purpose.** It lists the keys whose
+    loss would be confusing rather than merely inconvenient — refusing
+    every letter in the modal keymap would leave almost nothing
+    bindable, and shadowing a rare binding is a trade a person can
+    reasonably choose.
+  - **Parsing a saved map is LENIENT.** A settings file written when a
+    key was bindable must still load after it becomes reserved; refusing
+    the whole map would cost every binding because one is now invalid.
+  - **An empty map is legal** — the menu still appears, nothing is
+    bound, for someone who prefers to scroll.
+
+**Three tests failed on the way, all correctly.** They asserted Tab
+inserts the WHOLE completion and that acceptance is one undo gesture.
+Both predate the typeout work: Tab types one bit — `fn main` + `()` +
+` {}` — and each bit is its own undo group.
+
+I updated them rather than reverting, because that granularity is the
+feature: taking a suggestion a piece at a time is only useful if you can
+give back a piece at a time. The integration test now presses Tab until
+the typeout is exhausted, bounded rather than `while`, so a typeout that
+never finishes fails with a message instead of hanging CI.
+
+97 + 68 + 1 green.
+
+- **C92a — no editing UI.** The model, the rules and the wiring exist;
+  nothing lets a person reorder the list on screen yet, and nothing
+  persists it.

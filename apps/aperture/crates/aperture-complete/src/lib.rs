@@ -25,6 +25,8 @@ pub mod engine;
 /// Turn one raw model reply into blocks you can build with: comments,
 /// keyed suggestions, and nothing that deletes your file when accepted.
 pub mod multipass;
+/// Which key accepts which completion block, and editing that.
+pub mod keymap;
 pub mod kvplan;
 pub mod prefixcache;
 pub mod providers;

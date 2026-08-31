@@ -305,6 +305,19 @@ pub fn assign_keys(blocks: &mut [Block]) {
     }
 }
 
+/// The pipeline with a chosen key map.
+///
+/// `plan` is this with the default map. Separate rather than an
+/// `Option` argument because `plan` has callers and tests that should
+/// not have to say "no opinion" — and because the default IS an
+/// opinion, held in one place.
+pub fn plan_with(reply: &str, map: &crate::keymap::KeyMap) -> (Vec<Block>, Vec<String>) {
+    let (blocks, prose) = plan(reply);
+    let mut blocks = blocks;
+    crate::keymap::assign(&mut blocks, map);
+    (blocks, prose)
+}
+
 /// The whole pipeline: raw reply in, keyed menu plus prose out.
 pub fn plan(reply: &str) -> (Vec<Block>, Vec<String>) {
     let (code, prose) = split_fences(reply);

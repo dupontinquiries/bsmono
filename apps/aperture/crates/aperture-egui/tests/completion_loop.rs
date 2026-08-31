@@ -31,14 +31,37 @@ fn demo_provider_completes_fn_main_through_the_real_engine() {
     assert_eq!(s.loop_log.len(), 1, "the loop pane saw the round trip");
     assert!(s.loop_log[0].ok);
 
-    s.handle(Ev::Key { key: K::Tab, ctrl: false, shift: false, alt: false }, t + 400);
+    // Tab types ONE BIT. Pressed until the typeout is exhausted, because
+    // this test is about the completion LOOP — provider to buffer — not
+    // about the granularity of acceptance, which state.rs tests
+    // directly. Bounded rather than `while`, so a typeout that never
+    // finishes fails here instead of hanging CI with no message.
+    for i in 0..64 {
+        s.handle(Ev::Key { key: K::Tab, ctrl: false, shift: false, alt: false },
+                 t + 400 + i * 10);
+        if s.typeout.is_none() {
+            break;
+        }
+    }
     let text = s.editor.buffer.to_string();
     assert!(
         text.starts_with("fn main() {") && text.contains("hello from aperture"),
         "accepted completion landed in the buffer: {text:?}"
     );
 
-    // And the acceptance is one undo gesture.
-    s.handle(Ev::Key { key: K::Z, ctrl: true, shift: false, alt: false }, t + 500);
+    // Undo is one gesture PER BIT, not one for the whole completion.
+    // That is the typeout design and it is deliberate: taking a
+    // suggestion a piece at a time is only useful if you can also give
+    // back a piece at a time.
+    //
+    // Bounded, and asserted to have actually got there — a loop that
+    // ran out would otherwise pass silently as "well, it stopped".
+    for i in 0..64 {
+        if s.editor.buffer.to_string() == "fn main" {
+            break;
+        }
+        s.handle(Ev::Key { key: K::Z, ctrl: true, shift: false, alt: false },
+                 t + 500 + i * 10);
+    }
     assert_eq!(s.editor.buffer.to_string(), "fn main");
 }

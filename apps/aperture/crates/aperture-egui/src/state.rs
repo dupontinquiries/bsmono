@@ -394,6 +394,12 @@ pub struct AppState {
     /// to. No separate mode flag: a flag and a menu that can disagree is
     /// how a UI gets stuck in a mode with nothing in it.
     pub menu: Vec<aperture_complete::multipass::Block>,
+    /// Which key accepts which completion block.
+    ///
+    /// Editable, because `HOME_KEYS` is a sensible default and a wrong
+    /// one on Dvorak, on AZERTY (no `;` on the home row at all), and on
+    /// a split board with a different number of comfortable keys.
+    pub complete_keys: aperture_complete::keymap::KeyMap,
     /// The block currently being typed out, a bit per Tab.
     ///
     /// `None` means no accept is in progress — there is no separate
@@ -539,6 +545,7 @@ impl AppState {
             cmd_strip: default_cmd_strip(),
             menu: Vec::new(),
             typeout: None,
+            complete_keys: aperture_complete::keymap::KeyMap::new(),
             menu_prose: Vec::new(),
             cmd_hold: uikit_egui::cmdstrip::Hold::new(),
             yank: String::new(),
@@ -2233,7 +2240,7 @@ impl AppState {
                 // rules a fresh one obeys.
                 self.ghost.request_sent(req.generation);
                 if let Some((menu, prose)) = self.ghost.on_outcome(
-                    req.generation, self.editor.version, &Ok(text))
+                    req.generation, self.editor.version, &Ok(text), &self.complete_keys)
                 {
                     self.set_completion_menu(menu, prose);
                 }
@@ -2267,7 +2274,8 @@ impl AppState {
         // the whole point of streaming: the text grows on screen as it
         // arrives, not just once at the end.
         if let Some((menu, prose)) =
-            self.ghost.on_outcome(out.generation, self.editor.version, &out.result)
+            self.ghost.on_outcome(out.generation, self.editor.version, &out.result,
+                                  &self.complete_keys)
         {
             self.set_completion_menu(menu, prose);
         }
@@ -2463,9 +2471,25 @@ mod tests {
             is_final: true,
         }, 700);
         assert!(s.ghost.is_shown());
+        // Tab types ONE BIT, not the whole completion — that is the
+        // typeout design, and this assertion predates it. `() {}` is two
+        // bits: the punctuation run `()`, then ` {}` after the space.
+        //
+        // Updated rather than reverted, because taking a completion a
+        // piece at a time is the behaviour being built: it is what lets
+        // a person stop halfway through a suggestion they only half
+        // agree with.
         key(&mut s, K::Tab, false, 1000);
+        assert_eq!(s.editor.buffer.to_string(), "fn main()");
+        key(&mut s, K::Tab, false, 1010);
         assert_eq!(s.editor.buffer.to_string(), "fn main() {}");
-        key(&mut s, K::Z, true, 1100); // undo the acceptance…
+        // Two bits typed, so two undos to get back — each Tab is its own
+        // edit and its own undo group. That is the right granularity:
+        // the point of typing a completion in pieces is being able to
+        // keep some of it, which means being able to undo some of it.
+        key(&mut s, K::Z, true, 1100); // undo the second bit…
+        assert_eq!(s.editor.buffer.to_string(), "fn main()");
+        key(&mut s, K::Z, true, 1110); // …and the first
         assert_eq!(s.editor.buffer.to_string(), "fn main");
         key(&mut s, K::Z, true, 1200); // …then the typed word, as its own group
         assert_eq!(s.editor.buffer.to_string(), "fn ");
