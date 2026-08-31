@@ -410,9 +410,65 @@ pub enum Action {
     /// half of them.
     Rename(String, String),
     Selected(String),
+    /// The row's send-recipient checkbox was tapped. Distinct from
+    /// `Selected`, which is "the card was opened" — one changes what a send
+    /// will do, the other changes what is on screen, and conflating them
+    /// made opening someone's actions silently add them to a send.
+    TogglePick(String),
     /// A submenu button: (contact id, action id).
     Invoke(String, String),
     ImportVCard,
+}
+
+/// What the address book makes of a roster row, prepared by the caller.
+///
+/// This used to be a SECOND list: `lib.rs` drew trust labels and Keep
+/// buttons as plain rows ABOVE the card widget, so the same contact was
+/// rendered in two places with two layouts — the exact parallel-surface
+/// problem the session it was written in had been fixing elsewhere, and
+/// said so. The information moves into the card row it describes; the
+/// caller supplies it as a lookup because this module deliberately knows
+/// nothing about `contact_book`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Standing {
+    /// In the book: show where the trust stands. `danger` marks a key
+    /// conflict — the one state that must not render as calm grey text.
+    Known { trust: String, danger: bool },
+    /// Seen on the network, not in the book, and saveable (a real sc-ID):
+    /// offer the Keep button, carrying the port discovery observed.
+    Discovered { port: u16 },
+    /// Nothing to add: a hostname row, or a book the caller has no view of.
+    Plain,
+}
+
+/// How the row should be tinted for reachability. Three states with three
+/// meanings, kept as an enum rather than a colour so this module does not
+/// have to know the palette's field names: Connected sends now, Known
+/// queues, Unverified cannot be sent to at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach { Connected, Known, Unverified }
+
+/// Everything the caller knows about one row that this module does not.
+///
+/// One struct through one closure, because the Friends page was drawing
+/// each contact THREE times before this: the recipient picker's list, the
+/// reachability list, and the card. Same person, three layouts, three
+/// places to forget to update — and on a phone it filled the page with
+/// repeats of six people. The card row is the one surface; everything that
+/// was a parallel list is now a field here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowInfo {
+    pub standing: Standing,
+    /// `None` when the caller has no reachability view (tests, early boot).
+    pub reach: Option<Reach>,
+    /// Is this row picked as a send recipient?
+    pub selected: bool,
+}
+
+impl Default for RowInfo {
+    fn default() -> Self {
+        RowInfo { standing: Standing::Plain, reach: None, selected: false }
+    }
 }
 
 /// The actions every row offers. Delete is last and marked, so it is not
@@ -430,7 +486,8 @@ pub fn default_actions() -> Vec<CardAction> {
 
 /// The Friends page: roster of cards, then the add-peer form.
 pub fn friends_ui(ui: &mut egui::Ui, roster: &Roster, acc: &mut Accordion,
-                  form: &mut AddForm, c: &uikit_egui::PaletteColors) -> Option<Action> {
+                  form: &mut AddForm, info: &dyn Fn(&str) -> RowInfo,
+                  c: &uikit_egui::PaletteColors) -> Option<Action> {
     let mut action = None;
     let dt = ui.input(|i| i.stable_dt) * 1000.0;
     acc.tick(dt);
@@ -447,9 +504,51 @@ pub fn friends_ui(ui: &mut egui::Ui, roster: &Roster, acc: &mut Accordion,
         egui::ScrollArea::vertical().id_salt("friends_roster").show(ui, |ui| {
             for f in roster.rows() {
                 let card = acc.card(&f.id);
+                let row = info(&f.id);
                 let resp = ui.horizontal(|ui| {
-                    ui.colored_label(if f.online { c.success } else { c.text_weak }, f.dot());
+                    // The send-recipient toggle, on the row rather than in a
+                    // second list of the same people. A checkbox and not a
+                    // whole-row click: the row already means "open actions",
+                    // and one gesture cannot mean both.
+                    let mut picked = row.selected;
+                    if ui.checkbox(&mut picked, "").changed() {
+                        action = Some(Action::TogglePick(f.id.clone()));
+                    }
+                    // Reachability tints the dot, which already means
+                    // presence — the two are the same question at different
+                    // resolutions, and two separate marks invited the reading
+                    // that a green dot and an unverified peer were unrelated.
+                    let dot_col = match (f.online, row.reach) {
+                        (_, Some(Reach::Connected)) => c.success,
+                        (true, Some(Reach::Unverified)) => c.warning,
+                        (true, _) => c.success,
+                        (false, _) => c.text_weak,
+                    };
+                    ui.colored_label(dot_col, f.dot());
                     ui.colored_label(if f.online { c.text } else { c.text_weak }, &f.name);
+                    if let Some(r) = row.reach {
+                        let (txt, col) = match r {
+                            Reach::Connected => ("reachable", c.success),
+                            Reach::Known => ("queues", c.text_weak),
+                            Reach::Unverified => ("unverified", c.warning),
+                        };
+                        ui.colored_label(col, txt);
+                    }
+                    // The book's verdict, ON the row it is about.
+                    match row.standing.clone() {
+                        Standing::Known { trust, danger } => {
+                            ui.colored_label(if danger { c.danger } else { c.text_weak },
+                                             format!("· {trust}"));
+                        }
+                        Standing::Discovered { port } => {
+                            ui.colored_label(c.text_weak, "· discovered");
+                            if ui.small_button("Keep").clicked() {
+                                action = Some(Action::Add(AddPeer {
+                                    host: f.id.clone(), port }));
+                            }
+                        }
+                        Standing::Plain => {}
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.colored_label(c.text_weak, card.chevron());
                     });

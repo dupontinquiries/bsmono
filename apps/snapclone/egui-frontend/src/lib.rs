@@ -1571,6 +1571,57 @@ impl Snapclone {
     }
 
     /// Carry out what the Friends page asked for.
+    /// What the address book makes of one roster row — the pure half of the
+    /// Friends page's badges, so the rendering above stays a lookup.
+    ///
+    /// A row whose id is not a valid sc-ID gets `Plain` even when absent
+    /// from the book: the book is keyed by id, a hostname row has nothing
+    /// to store, and offering Keep on it would write a record that can
+    /// never be matched against an announcement.
+    pub fn standing_of(&self, id: &str) -> crate::friends::Standing {
+        use crate::friends::Standing;
+        match self.contact_book.get(id) {
+            Some(entry) => {
+                let t = entry.trust();
+                Standing::Known {
+                    trust: t.label().to_string(),
+                    danger: matches!(t, crate::contact_book::Trust::Conflict),
+                }
+            }
+            None if crate::identity::is_valid(id) => Standing::Discovered {
+                port: self.view.peers().iter()
+                    .find(|r| r.id == id)
+                    .map(|r| r.port)
+                    .unwrap_or(crate::qr::DEFAULT_PORT),
+            },
+            None => Standing::Plain,
+        }
+    }
+
+    /// Everything the Friends card row needs that `friends.rs` cannot know.
+    ///
+    /// The three facts used to be three lists of the same people. Assembled
+    /// here so the mapping from this app's types (`contact_book::Trust`,
+    /// `peer_source::Reach`, the picker's selection) to the widget's
+    /// vocabulary lives in one function that can be tested without a frame.
+    ///
+    /// `reach` is matched by NAME rather than by `PeerId`, because
+    /// `peer_roster` synthesises ids by zero-padding the name — matching on
+    /// the padded bytes would work today and break the moment real keys
+    /// arrive, silently, by showing every row as unreachable.
+    pub fn row_info(&self, id: &str, reach: &[crate::peer_source::RosterPeer])
+                    -> crate::friends::RowInfo {
+        crate::friends::RowInfo {
+            standing: self.standing_of(id),
+            reach: reach.iter().find(|r| r.name == id).map(|r| match r.reach {
+                crate::peer_source::Reach::Connected => crate::friends::Reach::Connected,
+                crate::peer_source::Reach::Known => crate::friends::Reach::Known,
+                crate::peer_source::Reach::Unverified => crate::friends::Reach::Unverified,
+            }),
+            selected: self.picker.selected().iter().any(|s| s == id),
+        }
+    }
+
     pub fn apply_friends(&mut self, a: crate::friends::Action) {
         use crate::friends::Action;
         match a {
@@ -1616,6 +1667,11 @@ impl Snapclone {
                     self.sync_roster();
                 }
             }
+            // The pick toggle, kept off `Selected`: one changes what a send
+            // will do, the other changes what is on screen, and routing both
+            // through one variant made opening someone's actions silently
+            // add them to a send.
+            Action::TogglePick(id) => self.picker.toggle(&id),
             Action::Selected(id) => {
                 if let Some(i) = self.peers.iter().position(|p| p.name == id) {
                     self.nav.push_subpage(i);
@@ -3046,24 +3102,17 @@ impl Snapclone {
         // Connected sends now, Known queues, Unverified cannot be sent to at
         // all — and the label says which so a queued message does not look
         // like a delivered one.
-        let roster = self.peer_roster();
-        if !roster.is_empty() {
+        // THE COUNT STAYS, THE THIRD LIST GOES. This page used to render every
+        // contact three times — the reachability list, the picker's list of
+        // names, and the card — so six people filled a phone screen with
+        // eighteen rows and three different ideas of what a row looks like.
+        // Reachability and the pick checkbox are fields on the card row now
+        // (`friends::RowInfo`); what is left here is the summary, which is
+        // per-page information rather than per-person.
+        let reach_roster = self.peer_roster();
+        if !reach_roster.is_empty() {
             ui.colored_label(c.text_weak,
-                format!("{} of {} reachable now", self.sendable_peers(), roster.len()));
-            for rp in &roster {
-                let col = match rp.reach {
-                    crate::peer_source::Reach::Connected => c.success,
-                    crate::peer_source::Reach::Known => c.text,
-                    crate::peer_source::Reach::Unverified => c.text_weak,
-                };
-                ui.colored_label(col, rp.label());
-            }
-            ui.separator();
-        }
-        let ids: Vec<String> = self.peers.iter().map(|p| p.name.clone()).collect();
-        for id in ids {
-            let sel = self.picker.selected().iter().any(|s| s == &id);
-            if ui.selectable_label(sel, &id).clicked() { self.picker.toggle(&id); }
+                format!("{} of {} reachable now", self.sendable_peers(), reach_roster.len()));
         }
         // SEND, and the row that watches it. The picker could select people and
         // nothing consumed the selection — and send_state, "the row the sender
@@ -3141,45 +3190,22 @@ impl Snapclone {
         //    but "I see them, keep them" had no button.
         // 2. A refused key change reached stderr and nowhere else. On a phone
         //    that is the same as nowhere.
-        let mut keep: Option<(String, u16)> = None;
-        for p in &self.peers {
-            match self.contact_book.get(&p.name) {
-                // `entry`, not `c` — the palette is already `c` in this
-                // function and shadowing it here produced three field errors
-                // that read as the Contact type being wrong.
-                Some(entry) => {
-                    let t = entry.trust();
-                    let col = match t {
-                        crate::contact_book::Trust::Conflict => c.danger,
-                        _ => c.text_weak,
-                    };
-                    ui.colored_label(col, format!("{}  ·  {}", entry.label(), t.label()));
-                }
-                None => {
-                    // Only a real sc-ID can be saved: the book is keyed by id,
-                    // and a row named after a hostname has nothing to store.
-                    if !crate::identity::is_valid(&p.name) { continue; }
-                    ui.horizontal(|ui| {
-                        ui.colored_label(c.text_weak, format!("{}  ·  discovered", p.name));
-                        if ui.button("Keep").clicked() {
-                            let port = self.view.peers().iter()
-                                .find(|r| r.id == p.name)
-                                .map(|r| r.port)
-                                .unwrap_or(crate::qr::DEFAULT_PORT);
-                            keep = Some((p.name.clone(), port));
-                        }
-                    });
-                }
-            }
-        }
-        // Applied after the loop: `keep` exists because the buttons are drawn
-        // while `self.peers` is borrowed, and adding a contact mutates it.
-        if let Some((id, port)) = keep {
-            self.apply_friends(crate::friends::Action::Add(
-                crate::friends::AddPeer { host: id, port }));
-        }
+        // The book's verdict rides ON the card rows now (`friends::Standing`)
+        // rather than as a second plain list above them — the list this
+        // replaces was the same parallel-surface problem this file had been
+        // removing elsewhere, introduced by the commit that added it and
+        // flagged in its own summary as the first thing to fix.
+        //
+        // Precomputed rather than closed over `self`, because the widget call
+        // below needs `&mut self.cards` and a closure borrowing `self` for
+        // the book would fight it.
+        let infos: std::collections::HashMap<String, crate::friends::RowInfo> =
+            self.roster.rows().iter()
+                .map(|f| (f.id.clone(), self.row_info(&f.id, &reach_roster)))
+                .collect();
+        let info = |id: &str| infos.get(id).cloned().unwrap_or_default();
         if let Some(a) = crate::friends::friends_ui(
-            ui, &self.roster, &mut self.cards, &mut self.add_form, c) {
+            ui, &self.roster, &mut self.cards, &mut self.add_form, &info, c) {
             self.apply_friends(a);
         }
     }
@@ -3878,6 +3904,43 @@ mod tests {
     /// composition rather than `Event::Text`, and an on-screen keyboard adds
     /// another path again. That is where to look next, and it needs a running
     /// binary rather than a test.
+    /// The Friends page draws each contact ONCE.
+    ///
+    /// The regression this pins is the one the commit that introduced it
+    /// flagged in its own summary: trust labels and Keep buttons were drawn
+    /// as a plain list ABOVE the card widget, so a contact appeared twice on
+    /// the page in two different layouts. Counting the id in the frame's
+    /// output is the only check that catches a second surface coming back —
+    /// a unit test on `standing_of` would still pass with the duplicate
+    /// list restored.
+    #[test]
+    fn a_contact_appears_once_on_the_friends_page_not_twice() {
+        use egui::{Context, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        app.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "sc-aabbccdd".into(), port: 9000 }));
+        // Friends is page 2 — by name, so a nav reorder fails here loudly
+        // rather than silently testing a different page.
+        app.nav.go_page(PAGES.iter().position(|n| *n == "Friends").unwrap());
+        let adaptive = Adaptive::default();
+        let out = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+        });
+        // Positions in the failure message, because "3 times" does not say
+        // WHICH surfaces came back and the answer is what you need next.
+        let hits: Vec<String> = out.shapes.iter().filter_map(|shape| {
+            match &shape.shape {
+                egui::epaint::Shape::Text(t) if t.galley.text().contains("sc-aabbccdd") =>
+                    Some(format!("{:?} @{:?}", t.galley.text(), t.pos)),
+                _ => None,
+            }
+        }).collect();
+        assert_eq!(hits.len(), 1,
+                   "the contact is drawn {} times — a parallel surface is back: {hits:#?}",
+                   hits.len());
+    }
+
     #[test]
     fn typing_through_the_shell_keeps_every_character() {
         use egui::{Context, Event, RawInput};

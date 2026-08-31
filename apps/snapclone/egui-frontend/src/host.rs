@@ -658,6 +658,63 @@ mod tests {
     }
 
     #[test]
+    fn standing_tells_the_row_what_the_book_knows() {
+        // The badge logic behind the folded Friends cards: a booked contact
+        // shows its trust, a discovered sc-ID offers Keep with the observed
+        // port, and a hostname row offers nothing — a book keyed by id has
+        // nowhere to put "192.168.1.5".
+        use crate::friends::Standing;
+        let mut s = app();
+        s.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "sc-aabbccdd".into(), port: 9000 }));
+        match s.standing_of("sc-aabbccdd") {
+            Standing::Known { danger, .. } => assert!(!danger, "a fresh add is not a conflict"),
+            other => panic!("booked contact reads as {other:?}"),
+        }
+        // Discovered but not kept: a valid id absent from the book. With no
+        // observed address the Keep falls back to the protocol default port
+        // rather than inventing one.
+        assert_eq!(s.standing_of("sc-11223344"),
+                   Standing::Discovered { port: crate::qr::DEFAULT_PORT });
+        assert_eq!(s.standing_of("192.168.1.5"), Standing::Plain);
+    }
+
+    #[test]
+    fn the_pick_toggle_is_not_the_card_toggle() {
+        // These were one action for a while and it meant opening someone's
+        // action menu silently added them to the next send. Separate
+        // variants, and this is what fails if they are merged again.
+        let mut s = app();
+        s.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "sc-aabbccdd".into(), port: 9000 }));
+        s.apply_friends(crate::friends::Action::Selected("sc-aabbccdd".into()));
+        assert!(!s.picker.selected().iter().any(|p| p == "sc-aabbccdd"),
+                "opening the card added a send recipient");
+        s.apply_friends(crate::friends::Action::TogglePick("sc-aabbccdd".into()));
+        assert!(s.picker.selected().iter().any(|p| p == "sc-aabbccdd"),
+                "the checkbox did not reach the picker");
+    }
+
+    #[test]
+    fn reach_is_matched_by_name_not_by_a_synthesised_id() {
+        // `peer_roster` zero-pads a name into a PeerId. Matching rows on
+        // those bytes works today and breaks silently — every row reading
+        // "no reach" — the moment real keys arrive.
+        let mut s = app();
+        s.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "sc-aabbccdd".into(), port: 9000 }));
+        let reach = vec![crate::peer_source::RosterPeer {
+            id: [7u8; 32],           // deliberately NOT the padded name
+            name: "sc-aabbccdd".into(),
+            reach: crate::peer_source::Reach::Connected,
+        }];
+        let info = s.row_info("sc-aabbccdd", &reach);
+        assert_eq!(info.reach, Some(crate::friends::Reach::Connected));
+        assert_eq!(s.row_info("sc-99999999", &reach).reach, None,
+                   "a row with no roster entry must not borrow another's reach");
+    }
+
+    #[test]
     fn a_scanned_contact_produces_a_save_and_keeps_its_port() {
         // End to end for the thing that made the app a demo: scan a code, and
         // the contact is still there next launch. The port travelling with it
