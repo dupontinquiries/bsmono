@@ -158,3 +158,94 @@ mod tests {
         }
     }
 }
+
+/// LAYOUT, MEASURED RATHER THAN ASSUMED.
+///
+/// Adding the chord to each chip face makes every chip a few characters wider, and I closed the
+/// commit that did it by saying I could not check whether they then wrap badly on a narrow window.
+/// That was avoidable: egui computes layout on the CPU, so `Context::run` with a `screen_rect`
+/// produces real rects with no GPU and no window — the pattern `uikit-egui`'s
+/// `panel_width_behaviour` already uses to keep a documented measurement honest.
+///
+/// Phone width matters here specifically. This app targets postmarketOS, PinePhone and Fairphone
+/// alongside desktop, and a chip row that overflows at 360 logical pixels is broken on the smallest
+/// screen it ships to — which is exactly the screen nobody opens while iterating.
+#[cfg(test)]
+mod layout {
+    use crate::theme;
+
+    /// Lay the chip row out at `w` logical pixels and report (used width, used height).
+    fn chip_row(w: f32, faces: &[String]) -> (f32, f32) {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 900.0)));
+        let mut used = egui::Vec2::ZERO;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                // The ROW's own rect, not the panel's. `ui.min_rect()` on a CentralPanel reports the
+                // whole available area — the first version of this measured 884px of height on a
+                // three-chip row and the assertion caught it, which is the harness proving itself
+                // before it is trusted to prove anything else.
+                let r = ui.horizontal_wrapped(|ui| {
+                    for f in faces {
+                        let _ = theme::carved_button_tinted(ui, f, theme::accent());
+                    }
+                });
+                used = r.response.rect.size();
+            });
+        });
+        (used.x, used.y)
+    }
+
+    fn faces(with_chords: bool) -> Vec<String> {
+        ["Show me the code", "Go deeper", "Summarize"].iter().enumerate()
+            .map(|(n, s)| match (with_chords, crate::chords::chord_text(n)) {
+                (true, Some(c)) => format!("{s}  {c}"),
+                _ => s.to_string(),
+            })
+            .collect()
+    }
+
+    /// The claim the last commit could not make: the chips still fit a phone.
+    #[test]
+    fn the_chip_row_does_not_overflow_a_phone_width() {
+        for w in [360.0_f32, 411.0, 480.0] {
+            let (used_w, used_h) = chip_row(w, &faces(true));
+            assert!(used_w <= w + 0.5, "chips used {used_w:.1}px of {w:.0}px available");
+            assert!(used_h > 0.0 && used_h < 400.0, "implausible row height {used_h:.1}");
+        }
+    }
+
+    /// …and that it fits because it WRAPPED, not because the buttons silently shrank. A row that
+    /// fits at 360px in one line is a row whose labels were truncated by the widget, which is the
+    /// failure this test would otherwise hide.
+    #[test]
+    fn a_narrow_window_makes_the_row_taller_rather_than_clipping_it() {
+        let (_, tall) = chip_row(360.0, &faces(true));
+        let (_, wide) = chip_row(1400.0, &faces(true));
+        assert!(tall > wide, "360px row ({tall:.1}) should be taller than 1400px ({wide:.1})");
+    }
+
+    /// The chord suffix costs width. Measuring how much, so a future change to the label format has
+    /// a number to beat rather than a feeling.
+    #[test]
+    fn the_chord_suffix_costs_a_bounded_amount_of_width() {
+        let (with, _) = chip_row(1400.0, &faces(true));
+        let (without, _) = chip_row(1400.0, &faces(false));
+        assert!(with > without, "the suffix should occupy space: {with:.1} vs {without:.1}");
+        let extra = with - without;
+        assert!(extra < 200.0, "three chords added {extra:.1}px, which is more than a chip");
+    }
+
+    /// Nine chips is the indexable maximum, and the row must survive it on a phone.
+    #[test]
+    fn the_maximum_indexed_row_still_fits() {
+        let many: Vec<String> = (0..crate::chords::MAX_INDEXED)
+            .map(|n| format!("Suggestion {n}  {}", crate::chords::chord_text(n).unwrap()))
+            .collect();
+        let (used_w, used_h) = chip_row(360.0, &many);
+        assert!(used_w <= 360.5, "nine chips overflowed: {used_w:.1}px");
+        assert!(used_h < 500.0, "nine chips took {used_h:.1}px of height, which is most of a phone");
+    }
+}
+
