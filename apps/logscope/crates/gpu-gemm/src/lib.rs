@@ -2772,6 +2772,9 @@ pub struct BlockWeights {
     /// between attention and wo — by block_decode and block_decode_fused; every other block fn
     /// refuses a gated layer by name (refuse_attn_gate_where_unapplied).
     pub attn_out_gate: Option<Lin>,
+    /// Gemma 4 per-layer output scalar (blk.N.layer_output_scale.weight, a single f32, uploaded
+    /// [1,1]): multiplies the whole layer output at the end of ffn_apply. None everywhere else.
+    pub out_scale: Option<Tensor>,
     /// GELU-gated FFN instead of SiLU-gated (Gemma). Per block so a mixed model would still work.
     pub geglu: bool,
     /// Gemma applies a norm to each sublayer's OUTPUT, before the residual add — distinct from the
@@ -6626,7 +6629,30 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// FFN half of a transformer block: norm2 → (dense SwiGLU | MoE) → residual. Dense path is the exact
     /// motif every block fn used inline (rmsnorm → wgate_up → swiglu → wdown+residual), factored so the
     /// MoE branch slots in at every call site (prefill, all decode variants, batched) identically.
+    /// The FFN half of every block — and, because every block fn TAIL-CALLS this (18 sites:
+    /// dense, fused, staged, q8, MLA, DeltaNet, prefill), the ONE place a whole-layer-output
+    /// transform can live without 18 chances to miss a path.
     fn ffn_apply(&self, w: &BlockWeights, x2: &Tensor, t: usize, d: usize, eps: f32) -> Tensor {
+        let out = self.ffn_apply_inner(w, x2, t, d, eps);
+        // Gemma 4's per-layer output scalar (blk.N.layer_output_scale, one f32): the reference
+        // multiplies the ENTIRE residual stream by it at the very end of the layer
+        // (gemma4.cpp:365 — after the FFN residual, before the next layer). In this engine the
+        // end of ffn_apply IS the end of the layer, so this wrapper is that placement. It wraps
+        // ffn_apply_inner rather than living inside it because the inner fn has three returns
+        // (MoE, the fused q8 fast path, the dense tail) and a scale on two of three is the
+        // silent archfeat failure class. None = every non-Gemma-4 layer pays nothing.
+        match &w.out_scale {
+            None => out,
+            Some(sc) => {
+                let n = (out.rows * out.cols) as u32;
+                let scaled = self.alloc(out.rows, out.cols);
+                let dims = [1u32, n, 0, 0]; // one "row": w[i/n] = w[0] broadcasts the scalar
+                self.dispatch(ROW_SCALE, &[&out, sc], &scaled, bytemuck::cast_slice(&dims), wg1(n));
+                scaled
+            }
+        }
+    }
+    fn ffn_apply_inner(&self, w: &BlockWeights, x2: &Tensor, t: usize, d: usize, eps: f32) -> Tensor {
         if let Some(m) = w.moe.as_deref() {
             let n2 = self.rmsnorm_t(x2, &w.g2, t, d, eps);
             return self.moe_ffn(m, &n2, t, d, x2);
@@ -11628,6 +11654,19 @@ loader assumes. Other families that ship a fused qkv are still unverified");
                 wo: if block_is_mla || block_is_deltanet { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
                     else { lin(&format!("blk.{i}.attn_output.weight"), d, attn_dim, q)? },
                 attn_out_gate: q_gate.as_ref().map(|(_, gh)| self.make_lin(gh, attn_dim, d, q, q4_mode)),
+                // Gemma 4's per-layer output scalar. Presence-driven like everything else; a
+                // tensor that is not exactly one element is a converter bug worth naming, not
+                // averaging into a guess.
+                out_scale: match g.tensor(&format!("blk.{i}.layer_output_scale.weight")) {
+                    None => None,
+                    Some(_) => {
+                        let v = fetch(&format!("blk.{i}.layer_output_scale.weight"))?;
+                        if v.len() != 1 {
+                            return Err(format!("blk.{i}.layer_output_scale.weight has {} elements; the reference declares {{1}} — one scalar for the whole layer output", v.len()));
+                        }
+                        Some(self.upload(&v, 1, 1))
+                    }
+                },
                 g2: self.upload(&gemma_norm(&fetch(&format!("blk.{i}.ffn_norm.weight"))
                     .or_else(|_| fetch(&format!("blk.{i}.post_attention_norm.weight")))?, &acfg), 1, d),
                 // gate and up fused into one [2h, d] projection: a single matmul emits
@@ -12717,7 +12756,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
             let (wq, wk, wv) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let (wo, wgate_up, wdown) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let g2 = self.read_tensor(&mut r)?;
-            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None });
+            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, out_scale: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None });
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);

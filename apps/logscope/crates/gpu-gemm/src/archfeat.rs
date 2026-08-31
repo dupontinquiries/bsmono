@@ -234,7 +234,11 @@ impl Feature {
             // a feature is missing refuses an architecture the engine can actually run.
             Feature::PerLayerRopeFreqs => true,
             Feature::PerLayerHeadDim => false,   // head_dim is a single model-wide value throughout
-            Feature::LayerOutputScale => false,  // the tensor is not read
+            // Wired at the ffn_apply funnel — the one tail every block fn calls (18 sites), so the
+            // scale cannot miss a path. Placement matches gemma4.cpp:365: the whole layer output,
+            // end of layer. --gate-outscale proves scale-1.0 is a BIT-EXACT no-op and scale-0.5
+            // engages, on the hybrid fixture's mixed DeltaNet + MoE paths.
+            Feature::LayerOutputScale => true,  // the tensor is not read
             // Implemented in _289: the loader now reads attn_k_b + attn_v_b and concatenates them, having
             // established from llama.cpp PR #12801 that the 3-D GGUF form is byte-identical to the 2-D
             // declaration. This flag stayed false for four commits after the code landed — the fifth
@@ -321,8 +325,10 @@ impl Feature {
 matters most on long contexts"),
             Feature::PerLayerHeadDim => Some("STRUCTURAL: head_dim is model-wide here, so a checkpoint \
 whose windowed and full layers differ cannot be laid out correctly at all"),
-            Feature::LayerOutputScale => Some("layer outputs are unscaled; the tensor is present in the \
-file and ignored"),
+            Feature::LayerOutputScale => Some("applies at the ffn_apply funnel (whole layer \
+output, end of layer, per gemma4.cpp). Loaded presence-driven from blk.N.layer_output_scale; \
+gemma4-assistant REQUIRES the tensor, base gemma4 makes it optional. Never run on a real \
+gemma4 checkpoint — PerLayerHeadDim and AltAttnValueFromKey still gate that"),
             Feature::FinalLogitSoftcap => Some("Gemma 2 only; implemented — logits_out applies it"),
             Feature::AttnLogitSoftcap => Some("Gemma 2 only; Gemma 3 and 4 default it off"),
             Feature::AttentionScaleHparam => Some("matches the 1/sqrt(head_dim) default on Gemma 3 12B \
@@ -473,7 +479,9 @@ mod tests {
         // remains is the per-layer geometry pair, the output scalars (both sets), and the four
         // Gemma-4-MoE/diffusion mechanisms.
         let g = gaps("diffusion_gemma", 128);
-        let expect = [Feature::PerLayerHeadDim, Feature::LayerOutputScale,
+        // SEVEN now, not eight: LayerOutputScale is implemented (c12-141, ffn_apply funnel) and
+        // gap lists show only what is MISSING.
+        let expect = [Feature::PerLayerHeadDim,
                       Feature::AltAttnValueFromKey, Feature::TwinFfnParallelResidual,
                       Feature::RouterInputNormScale, Feature::PerExpertOutputScale,
                       Feature::SelfConditioning, Feature::EncDecLayerScale];
@@ -601,8 +609,12 @@ mod tests {
         // the two imply completely different amounts of work.
         let r = gap_report("gemma4", 0);
         assert!(r.iter().any(|s| s.contains("STRUCTURAL")), "{r:?}");
-        assert!(r.iter().any(|s| s.contains("present in the file and ignored")),
-                "an ignored tensor should say so: {r:?}");
+        // The "present in the file and ignored" category (LayerOutputScale) left this report on
+        // c12-141 — the tensor is read and applied now (--gate-outscale). What remains for gemma4
+        // is exactly the structural pair, and BOTH must say STRUCTURAL so the report still
+        // distinguishes deep work from missing knobs.
+        assert_eq!(r.len(), 2, "PerLayerHeadDim + AltAttnValueFromKey and nothing else: {r:?}");
+        assert!(r.iter().all(|s| s.contains("STRUCTURAL")), "{r:?}");
     }
 
     #[test]
@@ -649,9 +661,10 @@ mod tests {
         // Gemma 2 needs BOTH caps and now has one: the final cap is implemented, the attention
         // cap is the single remaining gap for the architecture.
         assert_eq!(gaps("gemma2", 0), vec![Feature::AttnLogitSoftcap]);
-        // Gemma 4's remaining gaps are the structural ones, unchanged by this work.
+        // Gemma 4's remaining gaps are the structural ones — minus LayerOutputScale (c12-141).
         let g4 = gaps("gemma4", 0);
-        assert!(g4.contains(&Feature::PerLayerHeadDim) && g4.contains(&Feature::LayerOutputScale));
+        assert!(g4.contains(&Feature::PerLayerHeadDim) && g4.contains(&Feature::AltAttnValueFromKey));
+        assert!(!g4.contains(&Feature::LayerOutputScale), "implemented; gap lists show only what is missing");
         assert!(!g4.contains(&Feature::GeGluActivation), "the activation is no longer a gap for any Gemma");
     }
 
@@ -825,7 +838,11 @@ mod staleness_tests {
         assert!(!Feature::AttnLogitSoftcap.implemented(),
                 "no attention kernel caps its logits — that is the half still missing");
         assert!(!Feature::PerLayerHeadDim.implemented(), "head_dim is one model-wide value");
-        assert!(!Feature::LayerOutputScale.implemented(), "the tensor is not read");
+        // LayerOutputScale LEFT this list on c12-141: the tensor is now read (presence-driven)
+        // and applied at the ffn_apply funnel, with --gate-outscale's bit-exact 1.0 no-op as the
+        // proof. Pinned implemented so a regression is a conscious edit here, not a drift.
+        assert!(Feature::LayerOutputScale.implemented(),
+                "implemented on c12-141 (ffn_apply funnel; --gate-outscale)");
     }
 
     /// Some features are required by an ARCHITECTURE and some by a FILE, and the table only expresses

@@ -416,7 +416,11 @@ fn write_gguf_deepseek2_mla() -> Vec<u8> {
 /// equals scaling its weights by 0.5, and 0.5 is a power of two so even the fp rounding
 /// commutes. That equality is the algebraic proof the gate multiplies the right term with the
 /// right activation; 0-vs-1 differing proves the gate engages at all.
-fn write_gguf_qwen35moe_hybrid(shexp: u8) -> Vec<u8> {
+/// `out_scale`: when Some(v), every block gains a blk.N.layer_output_scale.weight = [v] —
+/// the gemma4 per-layer output scalar, grafted here because tensors decide, not arch names,
+/// and this fixture exercises the ffn_apply funnel through its richest mix of paths
+/// (DeltaNet block, gated-attention MoE block). Some(1.0) must be an exact no-op.
+fn write_gguf_qwen35moe_hybrid(shexp: u8, out_scale: Option<f32>) -> Vec<u8> {
     let (d, vocab, h) = (64usize, 32usize, 128usize);
     let (heads, kvh, hd) = (4usize, 2usize, 16usize);          // blk.1 attention
     let (sst, hk, hv, dconv) = (8usize, 2usize, 4usize, 4usize); // blk.0 deltanet
@@ -472,6 +476,10 @@ fn write_gguf_qwen35moe_hybrid(shexp: u8) -> Vec<u8> {
     push("blk.1.ffn_down_shexp.weight".into(), mat(d, sff),
          if shexp == 2 { dsh.iter().map(|v| v * 0.5).collect() } else { dsh });
     if shexp == 1 { push("blk.1.ffn_gate_inp_shexp.weight".into(), v1(d), vec![0.0; d]); }
+    if let Some(v) = out_scale {
+        push("blk.0.layer_output_scale.weight".into(), v1(1), vec![v]);
+        push("blk.1.layer_output_scale.weight".into(), v1(1), vec![v]);
+    }
     push("output_norm.weight".into(), v1(d), vec![1.0; d]);
     push("output.weight".into(), mat(vocab, d), mk(61, vocab * d));
 
@@ -5581,6 +5589,37 @@ still pass, which is why this one exists."
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-outscale") {
+        // Gemma 4's layer_output_scale, applied at the ONE funnel every block fn tail-calls
+        // (ffn_apply). Proven on the hybrid fixture so the funnel is exercised through the
+        // DeltaNet block AND the gated-attention MoE block in the same decode:
+        //   - scale 1.0 must equal NO scale BIT-EXACTLY (f32 multiply by 1.0 is exact, and the
+        //     wrapper adds no other op) — placement side-effects would break this;
+        //   - scale 0.5 must CHANGE the logits (applied to layer 0's output, it perturbs layer
+        //     1's attention nonlinearly; note the LAST layer's scale alone would be invisible —
+        //     the final rmsnorm is scale-invariant — which is why both layers carry the tensor
+        //     but the check leans on the inter-layer effect).
+        std::env::set_var("LOGSCOPE_TRY_UNSUPPORTED_ARCH", "1");
+        let gpu = Gpu::new();
+        eprintln!("gate-outscale: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let l3 = |bts: &[u8]| -> Vec<f32> {
+            let mm = gpu.load_gguf(bts).expect("outscale variant load");
+            let cc = gpu.new_cache_for(&mm, 8);
+            let mut lg = Vec::new();
+            for (p, t) in [1u32, 5, 9].iter().enumerate() { lg = gpu.decode_step(&mm, &cc, *t, p); }
+            lg
+        };
+        let base = l3(&write_gguf_qwen35moe_hybrid(1, None));
+        let one  = l3(&write_gguf_qwen35moe_hybrid(1, Some(1.0)));
+        let half = l3(&write_gguf_qwen35moe_hybrid(1, Some(0.5)));
+        let d1 = base.iter().zip(&one).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck(&format!("out_scale = 1.0 is an exact no-op (max |\u{394}| = {d1:.2e})"), d1 == 0.0);
+        let dh = base.iter().zip(&half).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck(&format!("out_scale = 0.5 changes the output (max |\u{394}| = {dh:.2e})"), dh > 1e-4);
+        println!("gate-outscale: {}", if ok { "layer_output_scale applies at the funnel \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-deltanet-load") {
         // The hybrid load + decode gate: a qwen35moe checkpoint whose blk.0 is Gated DeltaNet
         // and blk.1 plain attention must load (recurrent set to the CPU-routed mixer, dense
@@ -5595,7 +5634,7 @@ still pass, which is why this one exists."
         let gpu = Gpu::new();
         eprintln!("gate-deltanet-load: adapter = {}", gpu.adapter_name);
         let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
-        let bytes = write_gguf_qwen35moe_hybrid(1); // gated shared expert in the main flow
+        let bytes = write_gguf_qwen35moe_hybrid(1, None); // gated shared expert in the main flow
         if std::env::var("LOGSCOPE_DUMP_FIXTURE").is_ok() { std::fs::write("/tmp/hyb.gguf", &bytes).unwrap(); }
         match gpu.load_gguf_quantized(&bytes) {
             Err(e) => ck(&format!("hybrid gguf loads — {e}"), false),
@@ -5674,9 +5713,9 @@ still pass, which is why this one exists."
                         for (p, t) in [1u32, 5, 9].iter().enumerate() { lg = gpu.decode_step(&mm, &cc, *t, p); }
                         lg
                     };
-                    let (l0, l1, l2) = (l3(&write_gguf_qwen35moe_hybrid(0)),
-                                        l3(&write_gguf_qwen35moe_hybrid(1)),
-                                        l3(&write_gguf_qwen35moe_hybrid(2)));
+                    let (l0, l1, l2) = (l3(&write_gguf_qwen35moe_hybrid(0, None)),
+                                        l3(&write_gguf_qwen35moe_hybrid(1, None)),
+                                        l3(&write_gguf_qwen35moe_hybrid(2, None)));
                     let d12 = l1.iter().zip(&l2).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
                     ck(&format!("sigmoid(0)-gated shared expert equals a pre-halved one (max |Δ| = {d12:.2e})"), d12 < 1e-5);
                     let d01 = l0.iter().zip(&l1).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -5891,7 +5930,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-outscale  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }
@@ -6259,7 +6298,7 @@ still pass, which is why this one exists."
         wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)), wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
         g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
         q_norm: None, k_norm: None, // llama-shape test block (no QK-Norm)
-        nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None,
+        nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, out_scale: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None,
         moe: None, // dense test block — the MoE path has its own validation
     };
     let xt = gpu.upload(&x, bt, bd);
@@ -6277,7 +6316,7 @@ still pass, which is why this one exists."
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: true, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
+            q_norm: None, k_norm: None, nope: true, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, out_scale: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
         };
         let got = gpu.download(&gpu.block_forward(&bw_nope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // Roped baseline at the SAME (consistent) shape — the sanity term: nope must actually differ.
@@ -6288,7 +6327,7 @@ still pass, which is why this one exists."
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
+            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, out_scale: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
         };
         let roped = gpu.download(&gpu.block_forward(&bw_rope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // CPU: cpu_block minus the rope step
