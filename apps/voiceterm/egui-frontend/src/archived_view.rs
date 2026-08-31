@@ -159,7 +159,11 @@ pub fn archive_ui(ui: &mut egui::Ui, v: &mut ArchiveView, pages: &[ArchivedPage]
                     });
                 }
             }).response;
-            if resp.interact(egui::Sense::click()).clicked() { opened = Some(p.url.clone()); }
+            // Keyed by url — see `dock::row_click` on why a layout
+            // response cannot be re-interacted for a click.
+            if uikit_egui::dock::row_click(ui, resp.rect, &p.url).clicked() {
+                opened = Some(p.url.clone());
+            }
             ui.separator();
         }
     });

@@ -102,7 +102,7 @@ pub fn favorites_ui(
                 .color(if e.origin == Origin::Home { c.accent } else { c.text }));
             ui.label(egui::RichText::new(&e.path).monospace().small().color(c.text_weak));
         });
-        if resp.response.interact(egui::Sense::click()).clicked() {
+        if uikit_egui::dock::row_click(ui, resp.response.rect, &e.path).clicked() {
             act = Some(Action::Cd(e.path.clone()));
         }
     }

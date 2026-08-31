@@ -148,7 +148,7 @@ pub fn deck_ui(ui: &mut egui::Ui, d: &mut Deck,
                 ui.painter().rect_stroke(resp.rect, 2.0,
                     egui::Stroke::new(1.0_f32, colors.accent), egui::StrokeKind::Inside);
             }
-            if resp.interact(egui::Sense::click()).clicked() {
+            if uikit_egui::dock::row_click(ui, resp.rect, &c.title).clicked() {
                 d.select(c);
                 opened = Some(c.title.clone());
             }

@@ -214,7 +214,9 @@ pub fn fs_results_ui(
                                 .color(if sel { c.accent } else { c.text_weak }));
                             ui.label(egui::RichText::new(h.matched.trim()).small());
                         });
-                        if row.response.interact(egui::Sense::click()).clicked() {
+                        if uikit_egui::dock::row_click(
+                            ui, row.response.rect,
+                            (h.path.as_str(), h.line)).clicked() {
                             opened = Some(h.clone());
                         }
                     }
