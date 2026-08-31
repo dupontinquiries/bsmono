@@ -3383,6 +3383,10 @@ which file you read.\n\n",
     fn start_fan(&mut self, task: &str, cfg: crate::workspace_exec::AgentConfig, doc_fan: bool, label: &str) {
         let mut cfg = cfg;
         if cfg.context.is_empty() { cfg.context = self.agent_context(); } // every branch starts sighted
+        // …and every branch sized to the model actually loaded. `start_agent_task` got this and the
+        // fan did not, so fan branches were still resolving to the harness's "unknown" Mid class for
+        // their read chunks, git entries and transcript bound.
+        if cfg.model_label.is_empty() { cfg.model_label = self.model_label(); }
         let task = task.trim().to_string();
         if task.is_empty() {
             self.note = format!(":{label} needs a task");
@@ -3408,16 +3412,13 @@ which file you read.\n\n",
                 .filter(|t| !t.trim().is_empty()).collect();
             let planned = if plan_steps.len() >= 2 {
                 let t = crate::planrun::task_from_steps(&base_goal, &plan_steps, &self.agent_context());
-                let (bs, dropped) = crate::planrun::branches(self.coord_mode, &t, 4);
-                let runs = crate::planrun::run_count(self.coord_mode, &t, 4);
-                if dropped > 0 || runs > bs.len() {
-                    // best_of multiplies invisibly and the cap truncates invisibly; say both before
-                    // spending the time rather than after.
-                    self.note = format!("{label}: {} branch(es){}{} — planned from {} plan step(s)",
-                        bs.len(),
-                        if dropped > 0 { format!(", {dropped} dropped over the cap") } else { String::new() },
-                        if runs > bs.len() { format!(", {runs} model runs with best-of") } else { String::new() },
-                        plan_steps.len());
+                // A budget on total RUNS, not units: aggressive costs three runs per unit, and the
+                // count below is the branch list itself, so it cannot describe work that will not
+                // happen (an earlier version reported `units * best_of` while running `units`).
+                let (bs, dropped) = crate::planrun::branches(self.coord_mode, &t, 6);
+                if dropped > 0 {
+                    self.note = format!("{label}: {} run(s) from {} plan step(s), {dropped} step(s) over the budget",
+                        bs.len(), plan_steps.len());
                 }
                 bs
             } else { Vec::new() };

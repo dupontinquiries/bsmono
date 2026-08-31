@@ -31,7 +31,7 @@
 //! `coordinator::Task` and worker prompts to branch goals. The running is `AgentFan`'s, the planning
 //! is `coordinator`'s, and keeping this layer pure is what lets the mapping be tested without a GPU.
 
-use logscope_fan::coordinator::{self, Mode, Subtask, Task, WorkerPrompt};
+use logscope_fan::coordinator::{self, Mode, Subtask, Task};
 
 /// Turn parsed plan steps into a coordinator `Task`.
 ///
@@ -64,26 +64,41 @@ pub struct Branch {
     pub goal: String,
 }
 
-/// Plan the work, then hand back branches a runner can execute.
+/// Plan the work, then hand back the branches a runner should execute — INCLUDING best-of copies.
 ///
-/// `max_branches` bounds the fan: a fifteen-step plan is a legitimate plan and fifteen concurrent
-/// workspaces is not. Truncation is reported by the caller rather than hidden — the same rule as the
-/// check-root cap, learned the same way.
-pub fn branches(mode: Mode, task: &Task, max_branches: usize) -> (Vec<Branch>, usize) {
+/// `best_of` is expanded here rather than left to the runner, and that is a correction: an earlier
+/// version returned one branch per worker and separately reported `run_count` as
+/// `workers * best_of`. Nothing in `AgentFan` has ever implemented best-of, so the number shown to
+/// the operator ("12 model runs") described work that would never happen. Producing the copies here
+/// makes the reported count and the executed count the same list — they cannot drift, because
+/// there is only one of them.
+///
+/// `max_runs` is a budget on TOTAL runs, not on workers, since a run is what costs time and a
+/// workspace. Aggressive at best-of-3 with a budget of 6 therefore plans two units properly rather
+/// than six units badly. Truncation is returned, never hidden.
+pub fn branches(mode: Mode, task: &Task, max_runs: usize) -> (Vec<Branch>, usize) {
     let plan = coordinator::plan(mode, task);
-    let total = plan.workers.len();
-    let kept: Vec<Branch> = plan.workers.into_iter().take(max_branches.max(1))
-        .map(|w: WorkerPrompt| Branch { label: w.label, system: w.system, goal: w.user })
-        .collect();
-    let dropped = total.saturating_sub(kept.len());
-    (kept, dropped)
+    let best_of = plan.best_of.max(1);
+    let budget = max_runs.max(1);
+    // How many distinct units fit once each unit costs `best_of` runs.
+    let units = (budget / best_of).max(1).min(plan.workers.len());
+    let dropped_units = plan.workers.len().saturating_sub(units);
+    let mut out = Vec::new();
+    for w in plan.workers.into_iter().take(units) {
+        for i in 0..best_of {
+            // Distinct labels: the fan's review picks between attempts at the SAME unit, and two
+            // branches sharing a name make the verdict unreadable.
+            let label = if best_of == 1 { w.label.clone() } else { format!("{} #{}", w.label, i + 1) };
+            out.push(Branch { label, system: w.system.clone(), goal: w.user.clone() });
+        }
+    }
+    (out, dropped_units)
 }
 
-/// How many model runs the plan implies, counting best-of. The number an operator should see BEFORE
-/// a fan starts: `best_of` is invisible in the branch list and silently multiplies the cost.
-pub fn run_count(mode: Mode, task: &Task, max_branches: usize) -> usize {
-    let plan = coordinator::plan(mode, task);
-    plan.workers.len().min(max_branches.max(1)) * plan.best_of.max(1)
+/// How many model runs the plan implies. Equal to `branches(..).0.len()` BY CONSTRUCTION — it calls
+/// it — so the figure an operator is shown before a fan starts is the figure that will run.
+pub fn run_count(mode: Mode, task: &Task, max_runs: usize) -> usize {
+    branches(mode, task, max_runs).0.len()
 }
 
 #[cfg(test)]
@@ -138,20 +153,39 @@ mod tests {
     }
 
     #[test]
-    fn the_branch_cap_reports_what_it_dropped() {
+    fn the_branch_cap_budgets_total_runs_and_reports_dropped_units() {
         let t = task_from_steps("g", &steps(&["edit a.rs", "edit b.rs", "edit c.rs", "edit d.rs"]), "");
         let (bs, dropped) = branches(Mode::Coordinator, &t, 2);
         assert_eq!(bs.len(), 2);
         assert_eq!(dropped, 2, "a hidden truncation is the bug this avoids");
+        // Aggressive costs 3 runs per unit, so the same budget buys fewer UNITS — two units done
+        // properly beats six units the budget cannot pay for.
+        let (bs3, dropped3) = branches(Mode::Aggressive, &t, 6);
+        assert_eq!(bs3.len(), 6, "6 runs = 2 units x best-of-3");
+        assert_eq!(dropped3, 2);
     }
 
+    /// The correction this module needed: the count shown to the operator and the list actually run
+    /// must be the same thing. They were not — best_of was reported and never executed.
     #[test]
-    fn best_of_is_visible_in_the_run_count_before_anything_starts() {
+    fn best_of_produces_the_runs_it_claims() {
         let t = task_from_steps("g", &steps(&["edit a.rs", "edit b.rs"]), "");
-        assert_eq!(run_count(Mode::Coordinator, &t, 8), 2);
-        // Aggressive is best-of-3 per unit: six runs, not two. Invisible in the branch list.
-        assert_eq!(run_count(Mode::Aggressive, &t, 8), 6);
-        assert_eq!(run_count(Mode::Barebones, &t, 8), 1);
+        for mode in [Mode::Coordinator, Mode::Aggressive, Mode::Barebones] {
+            let (bs, _) = branches(mode, &t, 12);
+            assert_eq!(bs.len(), run_count(mode, &t, 12),
+                       "{mode:?}: the reported run count is not the list that runs");
+        }
+        // Aggressive really does produce three attempts at each unit, distinctly labelled.
+        let (bs, _) = branches(Mode::Aggressive, &t, 12);
+        assert_eq!(bs.len(), 6);
+        let labels: Vec<&str> = bs.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["a.rs #1", "a.rs #2", "a.rs #3", "b.rs #1", "b.rs #2", "b.rs #3"]);
+        // attempts at one unit are the same job, so they share a goal
+        assert_eq!(bs[0].goal, bs[1].goal);
+        assert_ne!(bs[0].goal, bs[3].goal);
+        // and a best-of-1 mode is not given noise suffixes
+        let (one, _) = branches(Mode::Coordinator, &t, 12);
+        assert_eq!(one[0].label, "a.rs");
     }
 
     #[test]

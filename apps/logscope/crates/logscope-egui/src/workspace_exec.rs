@@ -2610,6 +2610,9 @@ impl AgentRun {
     /// The last green checkpoint committed in the scratch, if any.
     pub fn last_green(&self) -> Option<&str> { self.ws.last_green() }
 
+    /// The model class this run's budgets are sized to.
+    pub fn model_class(&self) -> crate::read_harness::ModelClass { self.ws.model_class() }
+
     /// What actually moved the error count on this run, as counted lines (guided runs only; empty
     /// until enough transitions accumulate).
     pub fn pattern_report(&self) -> Vec<String> {
@@ -5194,6 +5197,26 @@ mod long_horizon_tests {
         let (done, total) = run.plan().progress();
         assert_eq!((done, total), (1, 1), "the plan step is verified by the write that satisfied it");
         assert!(run.verified());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    /// A fan branch must be sized to the model that will run it. `AgentRun::start` applies
+    /// `cfg.model_label` to the workspace it builds, so a fan that leaves the field empty gets Mid
+    /// for every budget — the harness's explicit "unknown" — regardless of what is loaded.
+    #[test]
+    fn a_planned_fan_branch_is_sized_to_its_model() {
+        let d = tmp("fanclass");
+        let cfg_small = AgentConfig { model_label: "Llama-3.2-1B-Instruct-Q4_K_M.gguf".into(), ..Default::default() };
+        let cfg_big = AgentConfig { model_label: "Qwen3-30B-A3B-Q4.gguf".into(), ..Default::default() };
+        let (small, _) = AgentRun::start(&d, "t", cfg_small);
+        let (big, _) = AgentRun::start(&d, "t", cfg_big);
+        // The transcript bound is the class made visible: a 1B must not be handed a 30B's budget.
+        assert!(transcript_budget(small.model_class()) < transcript_budget(big.model_class()),
+                "the label is not reaching the branch's workspace");
+        // And an unlabelled run is Mid — the documented unknown, not an accident.
+        let (blind, _) = AgentRun::start(&d, "t", AgentConfig::default());
+        assert_eq!(blind.model_class(), crate::read_harness::ModelClass::Mid);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
