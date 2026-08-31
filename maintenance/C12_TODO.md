@@ -4881,3 +4881,46 @@ a person, which is what the tags exist to stop.
   scoring function a GPU pass would parallelise; at library scale the
   O(n) scan is fine, and building the GPU version first would optimise
   something nobody has used.
+
+## 88. Can unendlich's upscaler do latent mapping for photosync? Mostly no.
+
+Asked whether the neural upscaler could analyse thumbnails to build a
+latent map of a photo library quickly. Read it before answering, and the
+answer is no for the reason that matters — but one piece IS reusable and
+it is not the piece it looks like.
+
+**Why the network does not transfer.** `neural_feat_pipeline` samples a
+**G-buffer**: normal, albedo and worldpos, re-drawn from chunk geometry,
+plus six hint rays marched through the octree. Fourteen floats per pixel,
+and *twelve of them are 3D scene data a photograph does not have*. A JPEG
+has no surface normal, no world position, and nothing to march a ray
+through. Feeding it zeros for those channels puts every photo in the same
+corner of a latent space trained on geometry — which produces confident,
+uniform, meaningless embeddings.
+
+It is also a Vulkan/ash pipeline, and photosync's stated backend is wgpu.
+That is a porting cost, not an argument, so it is the second reason and
+not the first.
+
+**What IS reusable, and it is the valuable half:** the SHAPE. A
+device-local `[N, stride]` feature buffer, a GEMM pass over it
+(`neural_gemm_pipeline`), and a trainer whose encoding must match the
+extractor exactly — the file says so: *"Encoding must match the trainer
+(B2)."* That is precisely the discipline a photo-embedding pipeline
+needs, and getting it wrong is how a library ends up with half its
+vectors from one encoding and half from another.
+
+**The honest cheap answer for photosync.** `cv::Features` and the ascii
+grid ALREADY are a latent map: 5 numbers plus 512 cells, computed on a
+thumbnail, deterministic and explainable. A 32x16 ascii grid treated as
+a 512-dimensional vector is a real embedding — a bad one semantically,
+but one that costs nothing and that a person can look at and understand
+why two photos matched.
+
+- **C88a — the right GPU step is batching what exists**, not importing a
+  network. `similarity` over N entries is a parallel reduce, and the
+  ascii grid is already a fixed-width vector per photo. That is a wgpu
+  compute pass over data photosync produces today, and it does not
+  require the geometry channels this analysis rules out.
+- **C88b — a real semantic embedding needs a model trained on
+  PHOTOGRAPHS.** That is a download, not a port from unendlich.
