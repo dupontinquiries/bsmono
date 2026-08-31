@@ -139,10 +139,11 @@ new_cache_for, decode through the CPU-routed block_decode_deltanet (the same del
 invariant tests bind; --gate-deltanet-load proves load + decode + the seek refusal). Sequential \
 positions only — recurrent state cannot seek, so trie/fleet prefix reuse is refused. Gated attention is wired \
 too (double-width q split per head at load; attn * sigmoid(gate) before wo, the two decode paths \
-cross-checked against each other — which caught the post_attention_norm double-load). What still \
-blocks the REAL checkpoint: IMRoPE sections and the shared expert's own gate \
-(ffn_gate_inp_shexp), both named in archfeat — and `supported` flips only when a real checkpoint \
-produces coherent text. The MoE side is fine: 256 \
+cross-checked against each other — which caught the post_attention_norm double-load). The shared expert's own gate \
+(ffn_gate_inp_shexp) is wired too, proven by the sigmoid(0)=0.5-vs-prehalved bit-equality in \
+--gate-deltanet-load. What still blocks the REAL checkpoint: IMRoPE sections (named in archfeat, \
+with the ggml-verification recipe in its note) — and `supported` flips only when a real \
+checkpoint produces coherent text. The MoE side is fine: 256 \
 experts, shared expert with its own gate, Q4_K/MXFP4 slice since c4-784/c4-805",
             ..for_arch("qwen3moe")
         },

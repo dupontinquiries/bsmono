@@ -2815,6 +2815,11 @@ pub struct MoeLayer {
     /// down [d, sff] (sff read from the tensor itself; shared width differs from the routed ff).
     /// None for qwen3moe. This is the GLM-5.2 / DeepSeek-path stepping stone.
     pub shared: Option<(Lin, Lin)>,
+    /// The shared expert's OWN gate (qwen35moe: ffn_gate_inp_shexp, [1, d] f32): per token,
+    /// the shared expert's output is scaled by sigmoid(w·n2) before joining the routed sum.
+    /// None (GLM/DeepSeek/Qwen2-MoE) adds the shared output unscaled — those families ship no
+    /// such tensor and their reference graphs apply none.
+    pub shared_inp_gate: Option<Lin>,
     /// STREAMING (LOGSCOPE_MOE_STREAM): when set, the routed experts are NOT all resident — cold experts'
     /// q4 bytes live host-side here and are filled into GPU slots on demand at decode. None = fully resident
     /// (unchanged path). Built by the loader only when streaming is enabled and the model is over-ceiling.
@@ -6675,7 +6680,15 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let shared = m.shared.as_ref().map(|(sgu, sdn)| {
             let gu = sgu.apply(self, n2, t);
             let hmid = self.swiglu_packed(&gu);
-            sdn.apply(self, &hmid, t)
+            let out = sdn.apply(self, &hmid, t);
+            // qwen35moe: the shared expert has its OWN sigmoid gate — one scalar per token from
+            // ffn_gate_inp_shexp scales the whole shared output (qwen35moe.cpp: ffn_shexp *
+            // sigmoid(shared_gate)). Applied INSIDE the shared closure so the issue-before-router
+            // ordering above is preserved: the gate depends only on n2, like the rest.
+            match &m.shared_inp_gate {
+                Some(gl) => { let gv = gl.apply(self, n2, t); self.sigmoid_scale_rows_t(&out, &gv) }
+                None => out,
+            }
         });
         let routed = self.moe_ffn_routed(m, n2, t, d, x2);
         match shared {
@@ -7373,6 +7386,13 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     pub fn add_t(&self, a: &Tensor, b: &Tensor) -> Tensor {
         let out = self.alloc(a.rows, a.cols); let dims = [a.len() as u32, 0, 0, 0];
         self.dispatch(ADD, &[a, b], &out, bytemuck::cast_slice(&dims), wg1(a.len() as u32)); out
+    }
+    /// Per-ROW gated scale: `out[r, :] = a[r, :] * sigmoid(b[r])`, `b` a [t, 1] column — one
+    /// scalar per token. The qwen35moe shared-expert gate: ffn_gate_inp_shexp projects each
+    /// token to one logit, and its sigmoid scales that token's whole shared-expert output.
+    pub fn sigmoid_scale_rows_t(&self, a: &Tensor, b: &Tensor) -> Tensor {
+        let out = self.alloc(a.rows, a.cols); let dims = [a.len() as u32, a.cols as u32, 0, 0];
+        self.dispatch(SIGMOID_SCALE_ROWS, &[a, b], &out, bytemuck::cast_slice(&dims), wg1(a.len() as u32)); out
     }
     /// Elementwise gated multiply: `out = a ∘ sigmoid(b)`. The gated-attention output apply
     /// (Qwen3.5/3.6 full-attention layers: attention output × sigmoid of the per-head gate the
@@ -9126,6 +9146,15 @@ struct D { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(3) var<uniform> d: D;
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} o[i]=a[i]*(1.0/(1.0+exp(-b[i]))); }"#;
+
+const SIGMOID_SCALE_ROWS: &str = r#"
+struct D { n:u32,c:u32,_b:u32,_d:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> b: array<f32>;
+@group(0)@binding(2) var<storage,read_write> o: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} o[i]=a[i]*(1.0/(1.0+exp(-b[i/d.c]))); }"#;
 
 const ADD_BIAS: &str = r#"
 struct D { n:u32,c:u32,_b:u32,_d:u32 };
@@ -11800,6 +11829,16 @@ LOGSCOPE_NO_GU_SLICE=1 restores the old path");
                         if i == 0 { eprintln!("wgpu-engine: shared-expert MoE — shexp ff={sff} on top of {n_expert} routed"); }
                         Some((sgu, sdn))
                     } else { None };
+                    // The shared expert's own gate (qwen35moe). f32 like the router: it is one
+                    // [1, d] row whose output steers a whole term, and quantizing it saves nothing.
+                    let shared_inp_gate = if g.tensor(&format!("blk.{i}.ffn_gate_inp_shexp.weight")).is_some() {
+                        if shared.is_none() {
+                            return Err(format!("blk.{i} ships ffn_gate_inp_shexp (the shared-expert \
+gate) but no ffn_{{gate,up,down}}_shexp shared expert to gate — the file is inconsistent, or a \
+converter changed the shared-expert naming"));
+                        }
+                        Some(self.make_lin(&fetch(&format!("blk.{i}.ffn_gate_inp_shexp.weight"))?, 1, d, false, false))
+                    } else { None };
                     // STREAMING store: cold experts stay host-side (already-quantized q4 bytes), hot experts
                     // pinned resident, cold ones stream into GPU slots on demand at decode (moe_ffn_v1).
                     let stream = if let Some(pin) = moe_stream_pin.filter(|_| q4_mode) {
@@ -12060,7 +12099,7 @@ scale {} ({}), shared {}, weight applied to {}",
                             eprintln!("loader: exp_probs_b selection bias PRESENT and ACTIVE — expert selection is biased (reference no-aux order); outputs differ from pre-719 runs by design");
                         }
                     }
-                    Some(Box::new(MoeLayer { sel_bias, sel_bias_host, router, gate_up, down, stacked_gu, stacked_down, shared, stream,
+                    Some(Box::new(MoeLayer { sel_bias, sel_bias_host, router, gate_up, down, stacked_gu, stacked_down, shared, shared_inp_gate, stream,
                         // SHARED EXPERT COUNT FROM METADATA. This was a literal 0, and it worked for
                         // Scout only because moe_config rescues an arch that declares
                         // `moe_shared_expert` with `.max(1)`. Correct by accident: an architecture

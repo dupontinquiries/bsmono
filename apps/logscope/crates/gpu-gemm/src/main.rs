@@ -408,10 +408,19 @@ fn write_gguf_deepseek2_mla() -> Vec<u8> {
 /// blk.1's attn_q ships DOUBLE-WIDTH with the per-head [q|gate] interleave (gated attention,
 /// the real full-layer shape); what the fixture still deliberately omits is IMRoPE sections and
 /// the MoE side — named in archfeat / proven by other gates respectively.
-fn write_gguf_qwen35moe_hybrid() -> Vec<u8> {
+/// `shexp` selects the shared-expert-gate variant of blk.1's MoE FFN:
+///   0 — shared expert UNGATED (no ffn_gate_inp_shexp tensor; the GLM/DeepSeek shape)
+///   1 — gate present, all-zero weights: sigmoid(0) = 0.5 exactly, for every token
+///   2 — NO gate, but down_shexp pre-multiplied by 0.5
+/// Variants 1 and 2 must decode BIT-CLOSE to each other: scaling a linear map's output by 0.5
+/// equals scaling its weights by 0.5, and 0.5 is a power of two so even the fp rounding
+/// commutes. That equality is the algebraic proof the gate multiplies the right term with the
+/// right activation; 0-vs-1 differing proves the gate engages at all.
+fn write_gguf_qwen35moe_hybrid(shexp: u8) -> Vec<u8> {
     let (d, vocab, h) = (64usize, 32usize, 128usize);
     let (heads, kvh, hd) = (4usize, 2usize, 16usize);          // blk.1 attention
     let (sst, hk, hv, dconv) = (8usize, 2usize, 4usize, 4usize); // blk.0 deltanet
+    let (nexp, nused, ffe, sff) = (2usize, 1usize, 32usize, 32usize); // blk.1 MoE + shared
     let (key_dim, value_dim) = (hk * sst, hv * sst);
     let conv_dim = 2 * key_dim + value_dim;
     let mk = |seed: u32, n: usize| -> Vec<f32> {
@@ -451,9 +460,18 @@ fn write_gguf_qwen35moe_hybrid() -> Vec<u8> {
     push("blk.1.attn_q_norm.weight".into(), v1(hd), vec![1.0; hd]);
     push("blk.1.attn_k_norm.weight".into(), v1(hd), vec![1.0; hd]);
     push("blk.1.post_attention_norm.weight".into(), v1(d), vec![1.0; d]);
-    push("blk.1.ffn_gate.weight".into(), mat(h, d), mk(51, h * d));
-    push("blk.1.ffn_up.weight".into(), mat(h, d), mk(52, h * d));
-    push("blk.1.ffn_down.weight".into(), mat(d, h), mk(53, d * h));
+    // blk.1 FFN is MoE + shared expert, the real family's shape (blk.0 stays dense so BOTH FFN
+    // forms ride through the hybrid decode). 3D expert dims in GGUF order [d, ff, n_expert].
+    push("blk.1.ffn_gate_inp.weight".into(), mat(nexp, d), mk(50, nexp * d));
+    push("blk.1.ffn_gate_exps.weight".into(), vec![d as u64, ffe as u64, nexp as u64], mk(51, nexp * ffe * d));
+    push("blk.1.ffn_up_exps.weight".into(), vec![d as u64, ffe as u64, nexp as u64], mk(52, nexp * ffe * d));
+    push("blk.1.ffn_down_exps.weight".into(), vec![ffe as u64, d as u64, nexp as u64], mk(53, nexp * d * ffe));
+    push("blk.1.ffn_gate_shexp.weight".into(), mat(sff, d), mk(54, sff * d));
+    push("blk.1.ffn_up_shexp.weight".into(), mat(sff, d), mk(55, sff * d));
+    let dsh = mk(56, d * sff);
+    push("blk.1.ffn_down_shexp.weight".into(), mat(d, sff),
+         if shexp == 2 { dsh.iter().map(|v| v * 0.5).collect() } else { dsh });
+    if shexp == 1 { push("blk.1.ffn_gate_inp_shexp.weight".into(), v1(d), vec![0.0; d]); }
     push("output_norm.weight".into(), v1(d), vec![1.0; d]);
     push("output.weight".into(), mat(vocab, d), mk(61, vocab * d));
 
@@ -465,7 +483,7 @@ fn write_gguf_qwen35moe_hybrid() -> Vec<u8> {
     let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
     let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
     let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
-    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 13);
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 16);
     sput(&mut b, "general.architecture"); u32b(&mut b, 8); sput(&mut b, "qwen35moe");
     sput(&mut b, "qwen35moe.block_count"); u32b(&mut b, 4); u32b(&mut b, 2);
     sput(&mut b, "qwen35moe.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, heads as u32);
@@ -479,6 +497,9 @@ fn write_gguf_qwen35moe_hybrid() -> Vec<u8> {
     sput(&mut b, "qwen35moe.ssm.state_size"); u32b(&mut b, 4); u32b(&mut b, sst as u32);
     sput(&mut b, "qwen35moe.ssm.group_count"); u32b(&mut b, 4); u32b(&mut b, hk as u32);
     sput(&mut b, "qwen35moe.ssm.time_step_rank"); u32b(&mut b, 4); u32b(&mut b, hv as u32);
+    sput(&mut b, "qwen35moe.expert_count"); u32b(&mut b, 4); u32b(&mut b, nexp as u32);
+    sput(&mut b, "qwen35moe.expert_used_count"); u32b(&mut b, 4); u32b(&mut b, nused as u32);
+    sput(&mut b, "qwen35moe.expert_feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, ffe as u32);
     for (i, (name, dims, ty, _)) in ts.iter().enumerate() {
         sput(&mut b, name); u32b(&mut b, dims.len() as u32);
         for &dd in dims { u64b(&mut b, dd); }
@@ -3450,7 +3471,7 @@ the signal for these models.", m.mla_layers(), m.n_layers, m.deltanet_layers());
         let n2t = gpu.upload(&n2v, 1, d); let x2t = gpu.upload(&xin, 1, d);
         // streaming auto-forces the v1 path (its intercept lives there); resident uses V1 too for A/B parity.
         std::env::set_var("LOGSCOPE_MOE_V1", "1");
-        let resident = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+        let resident = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
             router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
             gate_up: gus.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, 2 * ff, d))).collect(),
             down: dns.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, d, ff))).collect(),
@@ -3463,7 +3484,7 @@ the signal for these models.", m.mla_layers(), m.n_layers, m.deltanet_layers());
         // streaming layer at several pin levels: 0 (all streamed), 4 (half pinned), 8 (all pinned)
         for pin in [0usize, 4, ne] {
             let stream = gpu.build_moe_stream_from_weights(&gus, &dns, ff, d, n_used, pin);
-            let streaming = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+            let streaming = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
                 router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
                 gate_up: gus.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, 2 * ff, d))).collect(),
                 down: dns.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, d, ff))).collect(),
@@ -3534,7 +3555,7 @@ the signal for these models.", m.mla_layers(), m.n_layers, m.deltanet_layers());
             let layers: Vec<gpu_kernels::MoeLayer> = (0..2).map(|l| {
                 let mut st = gpu.build_moe_stream_ring(&gus[l], &dns[l], ff, d, n_used, 0, Some(ring));
                 st.layer = l; // cross-layer coupling key
-                gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+                gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
                     router: gpu_kernels::Lin::f32(gpu.upload(&rw[l], ne, d)),
                     gate_up: Vec::new(), down: Vec::new(),
                     stacked_gu: gpu_kernels::Lin::f32(gpu.upload(&vec![0.0f32; 32], 1, 32)),
@@ -3622,7 +3643,7 @@ the signal for these models.", m.mla_layers(), m.n_layers, m.deltanet_layers());
         let run = |repin: bool| -> (Vec<f32>, u64, u64, u64, Vec<u32>) {
             if repin { std::env::remove_var("LOGSCOPE_MOE_NOREPIN"); } else { std::env::set_var("LOGSCOPE_MOE_NOREPIN", "1"); }
             let st = gpu.build_moe_stream_ring(&gus, &dns, ff, d, n_used, pin, Some(ring));
-            let layer = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+            let layer = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
                 router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
                 gate_up: Vec::new(), down: Vec::new(),
                 stacked_gu: gpu_kernels::Lin::f32(gpu.upload(&vec![0.0f32; 32], 1, 32)),
@@ -5259,7 +5280,7 @@ reproducible in software and not a fault.", raw_diff - diff);
         let xin: Vec<f32> = (0..d).map(|i| ((i as f32) * 0.023).cos()).collect();
 
         let run = |stream: gpu_kernels::MoeStream| -> Vec<f32> {
-            let layer = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+            let layer = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
                 router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
                 gate_up: Vec::new(), down: Vec::new(),
                 stacked_gu: gpu_kernels::Lin::f32(gpu.upload(&vec![0.0f32; 32], 1, 32)),
@@ -5350,7 +5371,7 @@ reproducible in software and not a fault.", raw_diff - diff);
             // hunting a bug in correct code.
             for r in 0..d { want[r] += xin[r]; }
             // ---- GPU ----
-            let layer = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+            let layer = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
                 router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
                 gate_up: gus.iter().map(|w| gpu_kernels::Lin::f32(gpu.upload(w, 2 * ff, d))).collect(),
                 down: dns.iter().map(|w| gpu_kernels::Lin::f32(gpu.upload(w, d, ff))).collect(),
@@ -5393,7 +5414,7 @@ still pass, which is why this one exists."
 
         // Build with a SHARED expert too — Llama-4 and GLM have one, and a fusion that mishandles the
         // shared path would only show on those models.
-        let build = |shared: bool| gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+        let build = |shared: bool| gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
             router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
             gate_up: gus.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, 2 * ff, d))).collect(),
             down: dns.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, d, ff))).collect(),
@@ -5574,7 +5595,8 @@ still pass, which is why this one exists."
         let gpu = Gpu::new();
         eprintln!("gate-deltanet-load: adapter = {}", gpu.adapter_name);
         let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
-        let bytes = write_gguf_qwen35moe_hybrid();
+        let bytes = write_gguf_qwen35moe_hybrid(1); // gated shared expert in the main flow
+        if std::env::var("LOGSCOPE_DUMP_FIXTURE").is_ok() { std::fs::write("/tmp/hyb.gguf", &bytes).unwrap(); }
         match gpu.load_gguf_quantized(&bytes) {
             Err(e) => ck(&format!("hybrid gguf loads — {e}"), false),
             Ok(m) => {
@@ -5636,6 +5658,29 @@ still pass, which is why this one exists."
                     eprintln!("cross-check control: same-env repeat max |Δ| = {cmax:.2e}; la[0..4]={:?}", &la[..4]);
                     let dmax = la.iter().zip(&lb).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
                     ck(&format!("fused and unfused GATED paths agree (max |Δ| = {dmax:.2e})"), dmax < 1e-4);
+                }
+                // GATED SHARED EXPERT, algebraically: an all-zero gate makes sigmoid(0) = 0.5
+                // exactly for every token, and halving a linear map's output equals halving its
+                // weights (0.5 is a power of two, so the fp rounding commutes row by row). So
+                // variant 1 (zero gate) must match variant 2 (pre-halved down_shexp, NO gate)
+                // through the full decode — if the sigmoid ran on the wrong term, wrong input, or
+                // wrong activation, this equality breaks. Variant 0 (ungated) differing from 1
+                // proves the gate engages at all. f32 loads: quantization would break exactness.
+                {
+                    let l3 = |bts: &[u8]| -> Vec<f32> {
+                        let mm = gpu.load_gguf(bts).expect("shexp variant load");
+                        let cc = gpu.new_cache_for(&mm, 8);
+                        let mut lg = Vec::new();
+                        for (p, t) in [1u32, 5, 9].iter().enumerate() { lg = gpu.decode_step(&mm, &cc, *t, p); }
+                        lg
+                    };
+                    let (l0, l1, l2) = (l3(&write_gguf_qwen35moe_hybrid(0)),
+                                        l3(&write_gguf_qwen35moe_hybrid(1)),
+                                        l3(&write_gguf_qwen35moe_hybrid(2)));
+                    let d12 = l1.iter().zip(&l2).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    ck(&format!("sigmoid(0)-gated shared expert equals a pre-halved one (max |Δ| = {d12:.2e})"), d12 < 1e-5);
+                    let d01 = l0.iter().zip(&l1).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    ck(&format!("the shared-expert gate ENGAGES (ungated vs gated |Δ| = {d01:.2e})"), d01 > 1e-4);
                 }
                 // Seek refusal: the recurrent state is at pos 2 in c2; asking for pos 5 must
                 // panic with the sequential-positions message, not silently continue.
@@ -6475,7 +6520,7 @@ still pass, which is why this one exists."
             }
             out
         };
-        let mk_layer = |with_shared: bool| gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+        let mk_layer = |with_shared: bool| gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
             router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
             gate_up: gus.iter().map(|w| gpu_kernels::Lin::f32(gpu.upload(w, 2 * ff, d))).collect(),
             down: dns.iter().map(|w| gpu_kernels::Lin::f32(gpu.upload(w, d, ff))).collect(),
@@ -6531,7 +6576,7 @@ still pass, which is why this one exists."
         let rw = rnd(ne * d, 151);
         let gus: Vec<Vec<f32>> = (0..ne).map(|e| rnd(2 * ff * d, 160 + e)).collect();
         let dns: Vec<Vec<f32>> = (0..ne).map(|e| rnd(d * ff, 170 + e)).collect();
-        let mk_q8 = || gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+        let mk_q8 = || gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
             router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
             gate_up: gus.iter().map(|w| gpu_kernels::Lin::q8(gpu.quantize_q8_resident(w, 2 * ff, d))).collect(),
             down: dns.iter().map(|w| gpu_kernels::Lin::q8(gpu.quantize_q8_resident(w, d, ff))).collect(),
@@ -6552,7 +6597,7 @@ still pass, which is why this one exists."
         check("MoE fused-GLU kernel == unfused path (bit-identical)", e, 0.0);
 
         // same for Q4-resident (the q4-30B's actual MoE path)
-        let mk_q4 = || gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+        let mk_q4 = || gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
             router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
             gate_up: gus.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, 2 * ff, d))).collect(),
             down: dns.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, d, ff))).collect(),

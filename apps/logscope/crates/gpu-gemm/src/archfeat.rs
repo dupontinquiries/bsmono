@@ -298,10 +298,13 @@ impl Feature {
             // other block fn refuses a gated layer by name (refuse_attn_gate_where_unapplied).
             Feature::GatedAttentionOutput => true,
             Feature::MRopeSections => false,
-            // The loader reads ffn_{gate,up,down}_shexp but NOT ffn_gate_inp_shexp — the shared
-            // expert's own gate. qwen35moe.cpp multiplies the shared expert output by
-            // sigmoid(ffn_gate_inp_shexp(x)); adding it ungated is quietly wrong output.
-            Feature::GatedSharedExpert => false,
+            // Wired at the moe_ffn funnel (one apply site serves decode AND prefill): the loader
+            // reads ffn_gate_inp_shexp as a [1, d] f32 row, and the shared expert's output is
+            // scaled by sigmoid(w·n2) per token. Proven algebraically by --gate-deltanet-load: a
+            // zero gate (sigmoid = 0.5 exactly) decodes BIT-EQUAL to a twin fixture whose
+            // down_shexp is pre-halved — the fp rounding commutes because 0.5 is a power of two —
+            // and the ungated variant differs, so the gate provably engages on the right term.
+            Feature::GatedSharedExpert => true,
             Feature::TwinFfnParallelResidual => false, // block forward runs ONE ffn branch
             Feature::RouterInputNormScale => false,    // router reads the branch's normed input
             Feature::PerExpertOutputScale => false,    // ffn_down_exps.scale is not read
@@ -352,9 +355,9 @@ rope (Qwen2-VL paper) — but the ggml kernel is not vendored here, so the per-d
 mapping of GGML_ROPE_TYPE_IMROPE is UNVERIFIED; check ggml-cpu's rope against ours on a shared \
 input before treating NEOX as sufficient, and do not flip this flag on the equivalence argument \
 alone"),
-            Feature::GatedSharedExpert => Some("the shared expert path adds its output UNGATED; \
-qwen35moe scales it by sigmoid(ffn_gate_inp_shexp(x)) first. One small projection + the existing \
-sigmoid_mul_t — unbuilt, and unexercised by the dense-FFN fixture, so it stays a named gap"),
+            Feature::GatedSharedExpert => Some("wired at the single moe_ffn funnel; families \
+without the tensor (GLM/DeepSeek) add the shared output unscaled, as their references do. Never \
+run on a real checkpoint"),
             Feature::AltAttnValueFromKey => Some("STRUCTURAL for the affected layers: without it the \
 loader refuses on the missing attn_v; faking V=K without the weightless norm runs and is wrong"),
             Feature::TwinFfnParallelResidual => Some("sequential wiring produces plausible text — the \
