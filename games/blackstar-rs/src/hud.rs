@@ -419,7 +419,7 @@ pub fn sortie_panel(ui: &mut Vec<UiVert>, a: f32, rows: &[String]) {
 pub fn panel(ui: &mut Vec<UiVert>, a: f32, x0: f32, y0: f32, x1: f32, y1: f32) {
     // soldier's menu_frame: slate fill, slate-blue hairline stroke
     quad(ui, x0, y0, x1, y1, [0.070, 0.086, 0.110, 0.96]);
-    let b = 0.0035;
+    let b = PANEL_STROKE;
     let stroke = [0.27, 0.33, 0.38, 0.9];
     quad(ui, x0, y1, x1, y1 + b, stroke);
     quad(ui, x0, y0 - b, x1, y0, stroke);
@@ -1351,9 +1351,16 @@ fn minimap(ui: &mut Vec<UiVert>, a: f32, world: &World, car: &Car, ball: &Ball, 
 }
 
 // ---------------------------------------------------------------- pause ----
+/// The pause panel's half-height. Named so the test can read the SAME number
+/// the draw uses: hardcoding 0.90 in the test meant shrinking the panel under
+/// its own content passed cleanly, since both sides moved independently.
+pub const PAUSE_PANEL_Y: f32 = 0.90;
+/// The hairline `panel` strokes outside its own bounds.
+pub const PANEL_STROKE: f32 = 0.0035;
+
 pub fn pause(ui: &mut Vec<UiVert>, a: f32, save: &Save, best_air_now: f32, cur: (f32, f32), sel: usize) {
     quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.45]);
-    panel(ui, a, -0.78, -0.90, 0.78, 0.90);
+    panel(ui, a, -0.78, -PAUSE_PANEL_Y, 0.78, PAUSE_PANEL_Y);
     label_c(ui, 0.78, 0.024, a, PAPER, "PAUSED");
 
     let lines = [
@@ -1738,6 +1745,57 @@ mod tests {
             "the title descends into the first row (title bottom {:.3}, list top {LIST_TOP:.3})",
             0.885 - title_glyph
         );
+    }
+
+    /// THE NON-LIST SCREENS, where the inequality does not reach.
+    ///
+    /// `pause` places ten labels at hand-chosen coordinates inside a panel at
+    /// ±0.78 by ±0.90. There is no row pitch to compare a glyph against, so
+    /// the previous commit's table says nothing about it — this is the case
+    /// the rasteriser was built for, and the property it checks is the one the
+    /// original HUD bug violated: text that claims a box and then draws
+    /// outside it.
+    ///
+    /// Escape is the first key a playtester presses.
+    #[test]
+    fn the_pause_screen_keeps_its_text_inside_its_panel() {
+        let save = Save::default();
+        // widest and narrowest, because `ui_k` scales some of this text with
+        // aspect and a panel that fits at 16:9 can spill at 4:3
+        for a in [21.0 / 9.0, 16.0 / 9.0, 4.0 / 3.0] {
+            let mut v: Vec<UiVert> = Vec::new();
+            pause(&mut v, a, &save, 1.25, (0.0, 0.0), 0);
+            assert!(!v.is_empty(), "pause drew nothing at {a:.2}");
+
+            // The full-screen scrim is deliberately ±1.0, so measure the TEXT
+            // and furniture inside the panel by excluding it: anything at
+            // exactly the scrim corners is the scrim.
+            let inked: Vec<&UiVert> = v
+                .iter()
+                .filter(|p| p.pos[0].abs() < 0.999 && p.pos[1].abs() < 0.999)
+                .collect();
+            assert!(!inked.is_empty(), "only the scrim drew at {a:.2}");
+
+            let mut worst_y: f32 = 0.0;
+            for p in &inked {
+                worst_y = worst_y.max(p.pos[1].abs());
+            }
+            // `panel` strokes a 0.0035 hairline OUTSIDE its own bounds (see
+            // its four border quads), so the frame legitimately reaches
+            // 0.9035. My first version asserted a flat 0.90 and failed on the
+            // panel's own border — measuring the furniture, not the content,
+            // which is the same mistake the three settings attempts made.
+            //
+            // WHAT THIS COSTS, stated rather than hidden: admitting the stroke
+            // means text spilling by less than 3.5e-3 passes. It still catches
+            // the class that matters — the in-game HUD bug was text drawing
+            // THREE TIMES its claimed height — but it is not a tight bound and
+            // should not be read as one.
+            assert!(
+                worst_y <= PAUSE_PANEL_Y + PANEL_STROKE + 1e-4,
+                "pause draws to y={worst_y:.4} at aspect {a:.2}, past its ±{PAUSE_PANEL_Y} panel"
+            );
+        }
     }
 
     #[test]
