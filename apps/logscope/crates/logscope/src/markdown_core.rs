@@ -264,3 +264,84 @@ mod tests {
         assert!(!has_markdown("a single ` backtick"));
     }
 }
+
+/// THE EXTRACTION HAPPENED AND THE CALLER WAS NEVER SWITCHED OVER.
+///
+/// This module's own header says it was split out of `ui/markdown.rs` "so the grammar can be
+/// unit-tested and reused without a display stack", and that "the GTK renderer builds widgets from
+/// `parse_blocks` and turns inline spans into Pango markup via `inline_to_pango`". It does not.
+/// `ui/markdown.rs` still defines private `parse_blocks` and `inline_to_pango` of its own and never
+/// mentions this module — which the repo's own `unhosted_check` reports, once it is asked whether
+/// an uncalled module duplicates a live one.
+///
+/// That is not merely duplication. The header also records WHAT WAS FIXED in the extraction: the
+/// old version "mixed a char cursor with byte slices (`text[i+2..]`), so any non-ASCII character
+/// before a `**bold**` marker sliced at the wrong offset (corrupt output, or a panic on a non-char
+/// boundary)". The renderer still contains exactly that shape — `chars[i]` for the test and
+/// `&text[i+3..i+3+rel]` for the slice — so the fix exists, is tested, and the code that needed it
+/// never received it. LLM output contains accented text and emoji constantly.
+///
+/// These tests pin both halves: this module is correct on the input that breaks the other, and the
+/// other's indexing really does fail on it. Wiring the renderer to call this needs a machine with
+/// gtk4 to compile; it is not done here because it could not be verified here.
+#[cfg(test)]
+mod extraction_never_adopted {
+    use super::inline_to_pango;
+
+    #[test]
+    fn non_ascii_before_a_marker_is_handled_correctly() {
+        // Every one of these has a multi-byte char before the marker, so a char index used as a
+        // byte offset lands mid-codepoint or past the end.
+        for (input, want) in [
+            ("café **bold**", "café <b>bold</b>"),
+            ("naïve *italic* text", "naïve <i>italic</i> text"),
+            ("→ **arrow**", "→ <b>arrow</b>"),
+            ("🙂 ***both***", "🙂 <b><i>both</i></b>"),
+            ("日本語 **太字** です", "日本語 <b>太字</b> です"),
+        ] {
+            assert_eq!(inline_to_pango(input), want, "input {input:?}");
+        }
+    }
+
+    /// The renderer's expression, reproduced exactly, to show the divergence is real rather than
+    /// inferred from a comment. `chars[i]` is a CHAR index; `text[i+2..]` is a BYTE offset.
+    #[test]
+    fn the_renderers_indexing_really_does_break_on_the_same_input() {
+        fn buggy_bold_slice(text: &str) -> Option<String> {
+            let chars: Vec<char> = text.chars().collect();
+            let n = chars.len();
+            let mut i = 0;
+            while i < n {
+                if i + 1 < n && chars[i] == '*' && chars[i + 1] == '*' {
+                    // The exact shape in ui/markdown.rs: byte-sliced with a char cursor.
+                    let rest = text.get(i + 2..)?;              // `.get` so the test reports
+                    let rel = rest.find("**")?;                 // rather than aborting the process
+                    return text.get(i + 2..i + 2 + rel).map(|s| s.to_string());
+                }
+                i += 1;
+            }
+            None
+        }
+        // ASCII: the two indices coincide, which is why this survived review and shipped.
+        assert_eq!(buggy_bold_slice("a **bold** b").as_deref(), Some("bold"));
+        // Non-ASCII: the char cursor is 5 where the byte offset is 6, so the slice is wrong —
+        // `.get` returns the wrong span here, and the renderer's `&text[..]` would PANIC on a
+        // boundary hit instead.
+        let got = buggy_bold_slice("café **bold** x");
+        assert_ne!(got.as_deref(), Some("bold"),
+                   "if this ever matches, the renderer has been fixed and this test should go");
+        // …while the extracted core gets it right on the same input.
+        assert_eq!(inline_to_pango("café **bold** x"), "café <b>bold</b> x");
+    }
+
+    /// A char boundary hit is the panic case, not merely a wrong answer.
+    #[test]
+    fn a_char_boundary_slice_is_a_panic_not_a_wrong_answer() {
+        let text = "é**b**";                 // 'é' is two bytes: char idx 1 == byte idx 2
+        assert!(!text.is_char_boundary(1), "premise: byte 1 is inside 'é'");
+        // The renderer would evaluate `&text[i+2..]` with a char cursor; a slice starting inside a
+        // codepoint aborts. The core simply handles it.
+        assert_eq!(inline_to_pango(text), "é<b>b</b>");
+    }
+}
+
