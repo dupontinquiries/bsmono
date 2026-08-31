@@ -282,7 +282,12 @@ impl Feature {
             // Gemma 4 MoE / DiffusionGemma (gemmadiff.rs is the CPU reference each will be gated
             // against; none has a GPU caller yet — the reference existing is NOT the feature
             // existing, which is exactly the distinction this table exists to hold).
-            Feature::AltAttnValueFromKey => false,     // the loader requires attn_v today
+            // Wired shape-driven for the gemma4 family (archcfg::v_norm_weightless): V is per-head
+            // weightless-rmsnormed from EITHER source, and blocks without attn_v source it from
+            // the RAW k projection (pre-k_norm, pre-rope; gemma4.cpp:217-231). Proven BIT-EQUAL
+            // to an explicit attn_v carrying k's weights by --gate-gemma4-altv, with the fused
+            // and unfused implementations cross-checked. Non-implementing paths refuse by name.
+            Feature::AltAttnValueFromKey => true,     // the loader requires attn_v today
             // CPU-ROUTED and wired: the loader builds each recurrent block's DeltaNetLayerHost,
             // new_cache_for allocates per-layer states, and decode routes those layers through
             // block_decode_deltanet — which calls the SAME deltanet::step the invariant tests
@@ -364,8 +369,11 @@ alone"),
             Feature::GatedSharedExpert => Some("wired at the single moe_ffn funnel; families \
 without the tensor (GLM/DeepSeek) add the shared output unscaled, as their references do. Never \
 run on a real checkpoint"),
-            Feature::AltAttnValueFromKey => Some("STRUCTURAL for the affected layers: without it the \
-loader refuses on the missing attn_v; faking V=K without the weightless norm runs and is wrong"),
+            Feature::AltAttnValueFromKey => Some("wired for gemma4/diffusion_gemma prefixes; the \
+weightless V norm is ALWAYS on for the family, wv or not — gemma4.cpp norms Vcur \
+unconditionally, so implementing only the missing-wv half would be wrong for blocks that ship \
+one. block_decode + block_decode_fused implement; other paths refuse. diffusion_gemma is \
+included on lineage only — its reference is not vendored. Never run on a real checkpoint"),
             Feature::TwinFfnParallelResidual => Some("sequential wiring produces plausible text — the \
 CPU reference in gemmadiff pins the parallel join order the gate must match"),
             Feature::RouterInputNormScale => Some("routing on the branch input instead of attn_out \
@@ -479,10 +487,12 @@ mod tests {
         // remains is the per-layer geometry pair, the output scalars (both sets), and the four
         // Gemma-4-MoE/diffusion mechanisms.
         let g = gaps("diffusion_gemma", 128);
-        // SEVEN now, not eight: LayerOutputScale is implemented (c12-141, ffn_apply funnel) and
-        // gap lists show only what is MISSING.
+        // SIX now: LayerOutputScale and AltAttnValueFromKey are implemented (c12-141) and gap
+        // lists show only what is MISSING. AltAttnValueFromKey's diffusion-side caveat: the
+        // diffusion forward path does not APPLY the V norm — it refuses v-norm blocks by name —
+        // so a real diffusion_gemma still cannot run those layers; it just refuses honestly.
         let expect = [Feature::PerLayerHeadDim,
-                      Feature::AltAttnValueFromKey, Feature::TwinFfnParallelResidual,
+                      Feature::TwinFfnParallelResidual,
                       Feature::RouterInputNormScale, Feature::PerExpertOutputScale,
                       Feature::SelfConditioning, Feature::EncDecLayerScale];
         for f in expect { assert!(g.contains(&f), "{f:?} must be a named gap: {g:?}"); }
@@ -613,7 +623,7 @@ mod tests {
         // c12-141 — the tensor is read and applied now (--gate-outscale). What remains for gemma4
         // is exactly the structural pair, and BOTH must say STRUCTURAL so the report still
         // distinguishes deep work from missing knobs.
-        assert_eq!(r.len(), 2, "PerLayerHeadDim + AltAttnValueFromKey and nothing else: {r:?}");
+        assert_eq!(r.len(), 1, "PerLayerHeadDim and nothing else: {r:?}");
         assert!(r.iter().all(|s| s.contains("STRUCTURAL")), "{r:?}");
     }
 
@@ -661,10 +671,10 @@ mod tests {
         // Gemma 2 needs BOTH caps and now has one: the final cap is implemented, the attention
         // cap is the single remaining gap for the architecture.
         assert_eq!(gaps("gemma2", 0), vec![Feature::AttnLogitSoftcap]);
-        // Gemma 4's remaining gaps are the structural ones — minus LayerOutputScale (c12-141).
+        // Gemma 4 is down to ONE gap: PerLayerHeadDim, the deep one (c12-141 closed
+        // LayerOutputScale and AltAttnValueFromKey).
         let g4 = gaps("gemma4", 0);
-        assert!(g4.contains(&Feature::PerLayerHeadDim) && g4.contains(&Feature::AltAttnValueFromKey));
-        assert!(!g4.contains(&Feature::LayerOutputScale), "implemented; gap lists show only what is missing");
+        assert_eq!(g4, vec![Feature::PerLayerHeadDim], "{g4:?}");
         assert!(!g4.contains(&Feature::GeGluActivation), "the activation is no longer a gap for any Gemma");
     }
 

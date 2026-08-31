@@ -522,6 +522,76 @@ fn write_gguf_qwen35moe_hybrid(shexp: u8, out_scale: Option<f32>) -> Vec<u8> {
     b
 }
 
+/// Synthetic gemma4 pair for V-from-K: blk.0 ships attn_v (exercising the family's ALWAYS-ON
+/// weightless per-head V norm), blk.1 ships NO attn_v — V comes from the raw k projection.
+/// `twin=true` instead gives blk.1 an explicit attn_v whose weights are BYTE-IDENTICAL to its
+/// attn_k (same rng seed). Because the weightless V norm applies to either source, the twin must
+/// decode BIT-EQUAL to the no-attn_v form: v = norm(wk·n1) both ways, same kernel, same weights.
+/// That equality is the proof the alt path reads the right source at the right point (pre-k_norm,
+/// pre-rope). Norms are ZEROS where the loader gemma-folds (1+0 = neutral) and ONES where it
+/// doesn't (q/k norms); post-attention/post-ffw norms are deliberately absent so BOTH decode arms
+/// (fused and unfused) stay reachable and the cross-check compares two real implementations.
+fn write_gguf_gemma4_altv(twin: bool) -> Vec<u8> {
+    let (d, vocab, h) = (64usize, 32usize, 128usize);
+    let (heads, kvh, hd) = (4usize, 2usize, 16usize);
+    let mk = |seed: u32, n: usize| -> Vec<f32> {
+        let mut v = Vec::with_capacity(n); let mut x = seed | 1;
+        for _ in 0..n { x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push(((x >> 9) as f32 / (1u32 << 23) as f32 - 1.0) * 0.05); }
+        v };
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+    let mut push = |name: String, dims: Vec<u64>, w: Vec<f32>| {
+        ts.push((name, dims, 0u32, bytemuck::cast_slice::<f32, u8>(&w).to_vec())); };
+    push("token_embd.weight".into(), mat(vocab, d), mk(11, vocab * d));
+    for b in 0..2usize {
+        push(format!("blk.{b}.attn_norm.weight"), v1(d), vec![1e-3; d]); // gemma-folded: 1+w; nonzero so the all-zeros corruption check stays quiet
+        push(format!("blk.{b}.attn_q.weight"), mat(heads * hd, d), mk(20 + b as u32, heads * hd * d));
+        push(format!("blk.{b}.attn_k.weight"), mat(kvh * hd, d), mk(40 + b as u32, kvh * hd * d));
+        if b == 0 { push("blk.0.attn_v.weight".into(), mat(kvh * hd, d), mk(60, kvh * hd * d)); }
+        else if twin { push("blk.1.attn_v.weight".into(), mat(kvh * hd, d), mk(41, kvh * hd * d)); } // = blk.1 attn_k's seed
+        push(format!("blk.{b}.attn_output.weight"), mat(d, heads * hd), mk(80 + b as u32, d * heads * hd));
+        push(format!("blk.{b}.attn_q_norm.weight"), v1(hd), vec![1.0; hd]);
+        push(format!("blk.{b}.attn_k_norm.weight"), v1(hd), vec![1.0; hd]);
+        push(format!("blk.{b}.ffn_norm.weight"), v1(d), vec![1e-3; d]);
+        push(format!("blk.{b}.ffn_gate.weight"), mat(h, d), mk(100 + b as u32, h * d));
+        push(format!("blk.{b}.ffn_up.weight"), mat(h, d), mk(120 + b as u32, h * d));
+        push(format!("blk.{b}.ffn_down.weight"), mat(d, h), mk(140 + b as u32, d * h));
+    }
+    push("output_norm.weight".into(), v1(d), vec![1e-3; d]);
+    push("output.weight".into(), mat(vocab, d), mk(160, vocab * d));
+    let mut offs = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, _, by) in &ts { offs.push(off); off = align32(off + by.len() as u64); }
+    let mut b = Vec::new();
+    let sput = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 8);
+    sput(&mut b, "general.architecture"); u32b(&mut b, 8); sput(&mut b, "gemma4");
+    sput(&mut b, "gemma4.block_count"); u32b(&mut b, 4); u32b(&mut b, 2);
+    sput(&mut b, "gemma4.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, heads as u32);
+    sput(&mut b, "gemma4.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, kvh as u32);
+    sput(&mut b, "gemma4.embedding_length"); u32b(&mut b, 4); u32b(&mut b, d as u32);
+    sput(&mut b, "gemma4.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, h as u32);
+    sput(&mut b, "gemma4.vocab_size"); u32b(&mut b, 4); u32b(&mut b, vocab as u32);
+    sput(&mut b, "gemma4.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, 1e-5);
+    for (i, (name, dims, ty, _)) in ts.iter().enumerate() {
+        sput(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, *ty); u64b(&mut b, offs[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, _, by)) in ts.iter().enumerate() {
+        while (b.len() as u64) < data_off + offs[i] { b.push(0); }
+        b.extend_from_slice(by);
+    }
+    b
+}
+
 /// Serialize a HostModel as a q8_0 GGUF (weights as q8_0 type-8; norms/embed/biases f32). For
 /// --gate-q8direct, to exercise the loader's direct q8_0 → resident path end-to-end.
 fn write_gguf_q8_0(m: &HostModel) -> Vec<u8> {
@@ -5589,6 +5659,51 @@ still pass, which is why this one exists."
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-gemma4-altv") {
+        // Gemma 4's V handling: the ALWAYS-ON weightless per-head V norm, and V sourced from the
+        // raw k projection on blocks without attn_v. The proof is the TWIN equality documented on
+        // the fixture writer: attn_v-with-k's-weights must decode BIT-EQUAL to no-attn_v-at-all,
+        // because the family's V norm applies to either source and the source values coincide.
+        std::env::set_var("LOGSCOPE_TRY_UNSUPPORTED_ARCH", "1");
+        let gpu = Gpu::new();
+        eprintln!("gate-gemma4-altv: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let l3 = |bts: &[u8]| -> Vec<f32> {
+            let mm = gpu.load_gguf(bts).expect("gemma4 altv load");
+            let cc = gpu.new_cache_for(&mm, 8);
+            let mut lg = Vec::new();
+            for (p, t) in [1u32, 5, 9, 2].iter().enumerate() { lg = gpu.decode_step(&mm, &cc, *t, p); }
+            lg
+        };
+        match gpu.load_gguf(&write_gguf_gemma4_altv(false)) {
+            Err(e) => ck(&format!("gemma4 without blk.1 attn_v loads — {e}"), false),
+            Ok(m) => {
+                ck("gemma4 without blk.1 attn_v loads", true);
+                let c = gpu.new_cache_for(&m, 8);
+                let mut fin = true; let mut lg = Vec::new();
+                for (p, t) in [1u32, 5, 9, 2].iter().enumerate() { lg = gpu.decode_step(&m, &c, *t, p); fin &= lg.iter().all(|x| x.is_finite()); }
+                ck("4-token decode with V-from-K is finite", fin);
+                let c2 = gpu.new_cache_for(&m, 8);
+                let _ = gpu.decode_step(&m, &c2, 1, 0);
+                let alt = gpu.decode_step(&m, &c2, 7, 1);
+                ck("logits are input-sensitive", alt.iter().zip(gpu.decode_step(&m, &c2, 3, 2).iter()).any(|(a, b)| a != b));
+            }
+        }
+        let la = l3(&write_gguf_gemma4_altv(false));
+        let lt = l3(&write_gguf_gemma4_altv(true));
+        let dt = la.iter().zip(&lt).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck(&format!("V-from-K equals an explicit attn_v carrying k's weights (max |\u{394}| = {dt:.2e})"), dt == 0.0);
+        // Fused and unfused implement the V handling independently (norm_apply'd packed slice vs
+        // a bound k_raw) — their agreement is the same discriminator that caught the
+        // post_attention_norm double-load.
+        std::env::set_var("LOGSCOPE_FUSED_QKV", "0");
+        let lu = l3(&write_gguf_gemma4_altv(false));
+        std::env::remove_var("LOGSCOPE_FUSED_QKV");
+        let df = la.iter().zip(&lu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck(&format!("fused and unfused V-from-K agree (max |\u{394}| = {df:.2e})"), df < 1e-5);
+        println!("gate-gemma4-altv: {}", if ok { "V-from-K + weightless V norm \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-outscale") {
         // Gemma 4's layer_output_scale, applied at the ONE funnel every block fn tail-calls
         // (ffn_apply). Proven on the hybrid fixture so the funnel is exercised through the
@@ -5930,7 +6045,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-outscale  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-outscale  --gate-gemma4-altv  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }
@@ -6298,7 +6413,7 @@ still pass, which is why this one exists."
         wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)), wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
         g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
         q_norm: None, k_norm: None, // llama-shape test block (no QK-Norm)
-        nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, out_scale: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None,
+        nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, out_scale: None, v_norm: None, v_from_k: false, geglu: false, post_attn: None, post_ffn: None, rope_base: None,
         moe: None, // dense test block — the MoE path has its own validation
     };
     let xt = gpu.upload(&x, bt, bd);
@@ -6316,7 +6431,7 @@ still pass, which is why this one exists."
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: true, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, out_scale: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
+            q_norm: None, k_norm: None, nope: true, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, out_scale: None, v_norm: None, v_from_k: false, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
         };
         let got = gpu.download(&gpu.block_forward(&bw_nope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // Roped baseline at the SAME (consistent) shape — the sanity term: nope must actually differ.
@@ -6327,7 +6442,7 @@ still pass, which is why this one exists."
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, out_scale: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
+            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, out_scale: None, v_norm: None, v_from_k: false, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
         };
         let roped = gpu.download(&gpu.block_forward(&bw_rope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // CPU: cpu_block minus the rope step

@@ -45,6 +45,17 @@ pub struct ArchConfig {
     pub note: &'static str,           // what's required to support it (or "" when supported)
 }
 
+impl ArchConfig {
+    /// Gemma 4's V handling (gemma4.cpp:217-231): V is per-head WEIGHTLESS-rmsnormed for this
+    /// family — even when attn_v exists — and when the checkpoint ships no attn_v, V's source is
+    /// the RAW k projection (pre-k_norm, pre-rope). Keyed by prefix rather than a per-entry field
+    /// so the table stays untouched; diffusion_gemma is included on lineage (a gemma4-MoE
+    /// derivative per its own note) — its reference is NOT vendored, so that inclusion is an
+    /// assumption the forward paths never silently trust (non-implementing paths refuse v-norm
+    /// blocks by name).
+    pub fn v_norm_weightless(&self) -> bool { matches!(self.prefix, "gemma4" | "diffusion_gemma") }
+}
+
 /// Map a `general.architecture` string (None/"" → llama, since some converters omit it) to its config.
 /// Is this architecture supported, DERIVED from what archfeat says is missing?
 ///

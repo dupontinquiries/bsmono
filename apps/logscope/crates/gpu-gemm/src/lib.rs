@@ -2770,11 +2770,17 @@ pub struct BlockWeights {
     /// Gated attention output (Qwen3.5/3.6 full-attention layers): the per-head gate projection
     /// de-interleaved out of the double-width attn_q at load. Applied as attn ∘ sigmoid(gate(n1))
     /// between attention and wo — by block_decode and block_decode_fused; every other block fn
-    /// refuses a gated layer by name (refuse_attn_gate_where_unapplied).
+    /// refuses a gated layer by name (refuse_attn_variants_where_unapplied).
     pub attn_out_gate: Option<Lin>,
     /// Gemma 4 per-layer output scalar (blk.N.layer_output_scale.weight, a single f32, uploaded
     /// [1,1]): multiplies the whole layer output at the end of ffn_apply. None everywhere else.
     pub out_scale: Option<Tensor>,
+    /// Gemma 4: per-head WEIGHTLESS rmsnorm on V (all-ones weights, [head_dim]) — applied to V
+    /// from EITHER source, gemma4.cpp norms Vcur unconditionally. None everywhere else.
+    pub v_norm: Option<Tensor>,
+    /// Gemma 4 blocks that ship no attn_v: V is sourced from the RAW k projection (pre-k_norm,
+    /// pre-rope). Only ever true alongside v_norm (asserted at load).
+    pub v_from_k: bool,
     /// GELU-gated FFN instead of SiLU-gated (Gemma). Per block so a mixed model would still work.
     pub geglu: bool,
     /// Gemma applies a norm to each sublayer's OUTPUT, before the residual add — distinct from the
@@ -7627,7 +7633,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         // batch/prefill path yet (MLA is compress-append per position; recurrent state is
         // sequential by definition), and neither ever will silently.
         Self::refuse_mla_or_deltanet_on_dense_block(w, "block_forward");
-        Self::refuse_attn_gate_where_unapplied(w, "block_forward");
+        Self::refuse_attn_variants_where_unapplied(w, "block_forward");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -11477,6 +11483,13 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
             // as a transformer's qkv is exactly the fluent-nonsense failure the row check catches.
             let block_is_deltanet = g.tensor(&format!("blk.{i}.ssm_a")).is_some()
                 || g.tensor(&format!("blk.{i}.ssm_conv1d.weight")).is_some();
+            // Gemma 4 V handling: family-wide weightless V norm; per-block, a missing attn_v
+            // beside a present attn_q means V comes from the raw k projection. Outside the
+            // family a missing attn_v stays what it always was — a missing tensor, named.
+            let v_weightless = acfg.v_norm_weightless();
+            let block_v_from_k = v_weightless
+                && g.tensor(&format!("blk.{i}.attn_q.weight")).is_some()
+                && g.tensor(&format!("blk.{i}.attn_v.weight")).is_none();
             let block_is_mla = g.tensor(&format!("blk.{i}.attn_q.weight")).is_none()
                 && (g.tensor(&format!("blk.{i}.attn_q_a.weight")).is_some()
                     || g.tensor(&format!("blk.{i}.attn_q_a_proj.weight")).is_some()
@@ -11603,7 +11616,9 @@ loader assumes. Other families that ship a fused qkv are still unverified");
                     let mut v = match &q_gate { Some((qh, _)) => qh.clone(),
                                                None => fetch(&format!("blk.{i}.attn_q.weight"))? };
                     v.extend_from_slice(&fetch(&format!("blk.{i}.attn_k.weight"))?);
-                    v.extend_from_slice(&fetch(&format!("blk.{i}.attn_v.weight"))?);
+                    // V-from-K blocks fuse [q|k] only: there is no v projection, and the decode
+                    // path derives V from the k slice.
+                    if !block_v_from_k { v.extend_from_slice(&fetch(&format!("blk.{i}.attn_v.weight"))?); }
                     v
                 };
                 // FUSED QKV is one contiguous tensor, so it transcodes directly when the source is
@@ -11649,7 +11664,7 @@ loader assumes. Other families that ship a fused qkv are still unverified");
                     else { lin(&format!("blk.{i}.attn_q.weight"), attn_dim, d, q)?.with_bias(bq) },
                 wk: if block_is_mla || block_is_deltanet { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
                     else { lin(&format!("blk.{i}.attn_k.weight"), kv, d, q)?.with_bias(bk) },
-                wv: if block_is_mla || block_is_deltanet { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+                wv: if block_is_mla || block_is_deltanet || block_v_from_k { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
                     else { lin(&format!("blk.{i}.attn_v.weight"), kv, d, q)?.with_bias(bv) },
                 wo: if block_is_mla || block_is_deltanet { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
                     else { lin(&format!("blk.{i}.attn_output.weight"), d, attn_dim, q)? },
@@ -11657,6 +11672,10 @@ loader assumes. Other families that ship a fused qkv are still unverified");
                 // Gemma 4's per-layer output scalar. Presence-driven like everything else; a
                 // tensor that is not exactly one element is a converter bug worth naming, not
                 // averaging into a guess.
+                v_norm: if v_weightless && !block_is_mla && !block_is_deltanet {
+                    Some(self.upload(&vec![1.0f32; head_dim], 1, head_dim))
+                } else { None },
+                v_from_k: block_v_from_k,
                 out_scale: match g.tensor(&format!("blk.{i}.layer_output_scale.weight")) {
                     None => None,
                     Some(_) => {
@@ -12756,7 +12775,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
             let (wq, wk, wv) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let (wo, wgate_up, wdown) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let g2 = self.read_tensor(&mut r)?;
-            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, out_scale: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None });
+            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, attn_out_gate: None, out_scale: None, v_norm: None, v_from_k: false, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None });
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -14478,6 +14497,15 @@ impl Gpu {
         self.qk_norm(x, &w.kq_norm, t, width, head_dim, eps)
     }
 
+    /// Per-head rmsnorm from a REFERENCE (qk_norm consumes its input; V-from-K needs the k
+    /// projection twice). With all-ones weights this is the WEIGHTLESS norm gemma4 applies to V
+    /// (ggml_rms_norm on Vcur, no weight tensor) — same reshape trick as qk_norm.
+    fn v_norm_apply(&self, x: &Tensor, ones: &Tensor, t: usize, width: usize, head_dim: usize, eps: f32) -> Tensor {
+        let heads = width / head_dim;
+        let mut n = self.rmsnorm_t(x, ones, t * heads, head_dim, eps);
+        n.rows = t; n.cols = width;
+        n
+    }
     fn qk_norm(&self, x: Tensor, norm: &Option<Tensor>, t: usize, width: usize, head_dim: usize, eps: f32) -> Tensor {
         match norm {
             Some(w) => {
@@ -15136,7 +15164,7 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
     /// token's k/v row into the cache, attend the cache (dequant on the fly).
     fn block_decode_q8(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_q8");
-        Self::refuse_attn_gate_where_unapplied(w, "block_decode_q8");
+        Self::refuse_attn_variants_where_unapplied(w, "block_decode_q8");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -15161,7 +15189,7 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
     /// as before. Bit-exact to block_decode_q8 (the fusion never changes the values being quantized).
     fn block_decode_q8_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_q8_fused");
-        Self::refuse_attn_gate_where_unapplied(w, "block_decode_q8_fused");
+        Self::refuse_attn_variants_where_unapplied(w, "block_decode_q8_fused");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -15319,7 +15347,19 @@ path (2.88x larger resident), or keep it and use decode-only paths.");
     /// that apply the gate don't call this; paths that don't apply it refuse a gated layer by
     /// name. An ungated pass over a gated layer is not an error state the numerics would reveal —
     /// it is plausibly-shaped output at the wrong magnitude per head, the archfeat failure class.
-    fn refuse_attn_gate_where_unapplied(w: &BlockWeights, block_fn: &str) {
+    fn refuse_attn_variants_where_unapplied(w: &BlockWeights, block_fn: &str) {
+        if w.v_norm.is_some() || w.v_from_k {
+            panic!("{block_fn}: this layer's V is weightless-rmsnormed (and possibly sourced from \
+the k projection — Gemma 4) and this path writes RAW V into the cache. block_decode and \
+block_decode_fused implement it; every other path refusing is what keeps a missing V-norm a \
+named error instead of a slightly-worse model.");
+        }
+        if w.post_attn.is_some() {
+            panic!("{block_fn}: this layer norms the attention OUTPUT before the residual \
+(post_attention_norm — Gemma 2/3) and this path does not apply it. block_decode applies it, and \
+the decode dispatch routes post_attn blocks away from the fused arm for exactly this reason. A \
+dropped per-layer norm is not an error the numerics reveal — it reads as a worse model.");
+        }
         if w.attn_out_gate.is_some() {
             panic!("{block_fn}: this layer's attention output is GATED (per-head sigmoid gate \
 from the double-width q projection) and this path does not apply the gate. block_decode and \
@@ -15472,8 +15512,20 @@ like a bad model rather than a wiring bug.");
             Some(t) if w.nope && t.active_at(pos) => self.scale_query_temp(&q, t.scale(pos), ad),
             _ => q,
         };
-        let kr = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd), w, 1, kv, hd, eps);
-        let vr = w.wv.apply(self, &n1, 1);
+        // Gemma 4 V handling (gemma4.cpp:217-231): V is per-head WEIGHTLESS-rmsnormed for that
+        // family — from EITHER source — and a block without attn_v sources V from the RAW k
+        // projection (pre-k_norm, pre-rope). k is bound once and serves both; for every other
+        // family this is the same ops in the same order, bit-identically.
+        let k_raw = w.wk.apply(self, &n1, 1);
+        let vr = match &w.v_norm {
+            Some(ones) => {
+                let owned;
+                let vsrc: &Tensor = if w.v_from_k { &k_raw } else { owned = w.wv.apply(self, &n1, 1); &owned };
+                self.v_norm_apply(vsrc, ones, 1, kv, hd, eps)
+            }
+            None => w.wv.apply(self, &n1, 1),
+        };
+        let kr = self.kq_post(self.rope_mh_t(&self.qk_norm(k_raw, &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd), w, 1, kv, hd, eps);
         self.write_row(kc, &kr, pos, kv);
         self.write_row(vc, &vr, pos, kv);
         // Sliding window, when this layer has one: attend to the window instead of the whole context.
@@ -15511,7 +15563,7 @@ like a bad model rather than a wiring bug.");
             kc: &Tensor, vc: &Tensor, warm: Option<(&Tensor, &Tensor, &Tensor, &Tensor)>, warm_len: usize,
             pos: usize, hot_start: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_staged");
-        Self::refuse_attn_gate_where_unapplied(w, "block_decode_staged");
+        Self::refuse_attn_variants_where_unapplied(w, "block_decode_staged");
         let base = if w.nope { 0.0 } else { base };
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
@@ -15544,7 +15596,7 @@ like a bad model rather than a wiring bug.");
             kc: &Tensor, vc: &Tensor, warm_blocks: &[(&Tensor, &Tensor, &Tensor, &Tensor, usize)], warm_len: usize,
             pos: usize, hot_start: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_staged_multi");
-        Self::refuse_attn_gate_where_unapplied(w, "block_decode_staged_multi");
+        Self::refuse_attn_variants_where_unapplied(w, "block_decode_staged_multi");
         let base = if w.nope { 0.0 } else { base };
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
@@ -15650,7 +15702,18 @@ like a bad model rather than a wiring bug.");
             (q, self.slice_cols(&qk, ad, kv))
         };
         let _ = &kr; // k already written to cache above in both branches
-        self.copy_buf(&qkv, ((ad + kv) * 4) as u64, vc, (pos * kv * 4) as u64, (kv * 4) as u64); // v → V-cache row
+        // Gemma 4 V handling: normed (and possibly k-sourced) V goes through write_row; the raw
+        // copy_buf below is the every-other-family path. The k slice of `qkv` is the RAW
+        // projection — qknorm_rope_fused produced a NEW tensor above, so this reads pre-norm k.
+        match &w.v_norm {
+            Some(ones) => {
+                let vsrc = if w.v_from_k { self.slice_cols(&qkv, ad, kv) }
+                           else { self.slice_cols(&qkv, ad + kv, kv) };
+                let vn = self.v_norm_apply(&vsrc, ones, 1, kv, hd, eps);
+                self.write_row(vc, &vn, pos, kv);
+            }
+            None => self.copy_buf(&qkv, ((ad + kv) * 4) as u64, vc, (pos * kv * 4) as u64, (kv * 4) as u64), // v → V-cache row
+        }
         // Llama 4 iRoPE attention temperature on NoPE layers past the floor (see block_decode).
         let q = match w.attn_temp {
             Some(t) if w.nope && t.active_at(pos) => self.scale_query_temp(&q, t.scale(pos), ad),
@@ -15688,7 +15751,7 @@ like a bad model rather than a wiring bug.");
     /// the special case `slot == rope_pos`, `attend_len == rope_pos+1`.
     fn block_decode_at(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, rope_pos: usize, slot: usize, attend_len: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_at");
-        Self::refuse_attn_gate_where_unapplied(w, "block_decode_at");
+        Self::refuse_attn_variants_where_unapplied(w, "block_decode_at");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -15710,7 +15773,7 @@ like a bad model rather than a wiring bug.");
     /// block_decode_fused but K/V are written at physical `slot` and attention spans `attend_len`.
     fn block_decode_at_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, rope_pos: usize, slot: usize, attend_len: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         Self::refuse_mla_or_deltanet_on_dense_block(w, "block_decode_at_fused");
-        Self::refuse_attn_gate_where_unapplied(w, "block_decode_at_fused");
+        Self::refuse_attn_variants_where_unapplied(w, "block_decode_at_fused");
         // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
         // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
         // otherwise use.
@@ -15837,7 +15900,11 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
                     let dm = self.mla_dims(cfg, m.d, m.n_heads, m.base, m.eps);
                     self.block_decode_mla(w, mw, &dm, &x, mc, li, pos, m.d, m.eps)
                 }
-                _ if fused => self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
+                // post_attn blocks (Gemma 2/3: norm on the attention OUTPUT) go UNFUSED: the
+                // fused block has no post_attn apply, and dropping a per-layer norm is silent.
+                // GLM never lands here — its post_attention_norm is the FFN pre-norm (g2), which
+                // the ffn_norm-presence rule now files correctly, so GLM keeps the fused path.
+                _ if fused && w.post_attn.is_none() => self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
                 _ => self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
             } };
             // Capture first: this layer's UNSTEERED output is what a probe may legitimately learn
@@ -16491,7 +16558,11 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
                     let dm = self.mla_dims(cfg, m.d, m.n_heads, m.base, m.eps);
                     self.block_decode_mla(w, mw, &dm, &x, mc, li, pos, m.d, m.eps)
                 }
-                _ if fused => self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
+                // post_attn blocks (Gemma 2/3: norm on the attention OUTPUT) go UNFUSED: the
+                // fused block has no post_attn apply, and dropping a per-layer norm is silent.
+                // GLM never lands here — its post_attention_norm is the FFN pre-norm (g2), which
+                // the ffn_norm-presence rule now files correctly, so GLM keeps the fused path.
+                _ if fused && w.post_attn.is_none() => self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
                 _ => self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
             } };
             if flush != 0 && (li + 1) % flush == 0 && li + 1 < m.n_layers {
