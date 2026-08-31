@@ -43,10 +43,18 @@
 /// someone who came online is found within a coffee break.
 pub const LOOKUP_COOLDOWN_MS: u64 = 10 * 60 * 1000;
 
-/// How often to republish our own presence. Shorter than the cooldown
-/// because a stale record makes US unreachable, which is the failure the
-/// user actually notices.
-pub const PUBLISH_EVERY_MS: u64 = 5 * 60 * 1000;
+/// How often to republish our own presence.
+///
+/// 55 minutes, from the Qt build (`Timings::kDhtReannounceMs`) against a
+/// DHT value lifetime of about an hour. The margin is the point:
+/// republishing AT the TTL leaves every peer a window where the old record
+/// has expired and the new one has not propagated.
+///
+/// My first version used five minutes on the reasoning that "a stale record
+/// makes US unreachable, which is the failure the user notices". True, and
+/// it does not follow — the record lasts an hour, so five minutes is eleven
+/// times the traffic for no extra reachability, on a phone radio.
+pub const PUBLISH_EVERY_MS: u64 = crate::dht_announce::REANNOUNCE_MS;
 
 /// A lookup that has not answered in this long is presumed lost, so the
 /// scheduler is not wedged forever on one unlucky id. The DHT layer has no

@@ -68,6 +68,7 @@ pub mod camera_select;
 /// Reading the actual camera list, so the picker has something to show.
 pub mod camera_enumerate;
 pub mod chevron_confirm;
+pub mod dht_announce;
 pub mod dht_bootstrap;
 pub mod dht_presence;
 pub mod face_consent;
@@ -1313,14 +1314,42 @@ impl Snapclone {
         let plan = self.dht_schedule.tick(now_ms, &offline, true);
         if let Some(h) = self.dht.as_ref() {
             if plan.publish && !self.local_id.is_empty() {
-                // The host is left EMPTY, deliberately. This app cannot know
-                // which of its interfaces a stranger should dial, and
-                // publishing a guess writes a wrong address into a public
-                // record that outlives the guess. The port is real; the
-                // address is the resolver's own observation, the same rule
-                // gossip already follows.
-                h.publish(&self.local_id, &self.settings.current.general.display_name,
-                          "", self.settings.current.network.listen_port);
+                // EVERY address, not one, and never an empty one.
+                //
+                // I first published with an empty host, reasoning that "the
+                // resolver observes the real address, the same rule gossip
+                // already follows". That is right for gossip and wrong
+                // here, and the difference is what a DHT is: a gossip
+                // datagram arrives from a source address the receiver can
+                // see, while a DHT record is stored DATA that a stranger
+                // fetches later from a third machine. Nobody observes
+                // anything, so the record said "I exist" and could not be
+                // dialled.
+                //
+                // The Qt build works over CGNAT and its header says why:
+                // announce all local IPs "so any peer on any shared subnet
+                // can reach us". Choosing one is a guess about which
+                // network the OTHER person is on, made by the machine with
+                // the least information about it.
+                //
+                // One `publish` per address, matching the C++, which puts
+                // several values under the one key. `dht_announce::newest`
+                // is the other half — it discards addresses left over from
+                // a network you have since left.
+                let port = self.settings.current.network.listen_port;
+                let name = &self.settings.current.general.display_name;
+                let mut published = 0;
+                for ip in crate::dht_announce::local_ipv4s() {
+                    h.publish(&self.local_id, name, &ip.to_string(), port);
+                    published += 1;
+                }
+                if published == 0 {
+                    // Worth saying: a node that publishes nothing looks
+                    // exactly like one that published fine and was never
+                    // looked up.
+                    self.feed_note =
+                        "no local address to publish — nobody can find this device".into();
+                }
             }
             if let Some(id) = plan.resolve.as_ref() {
                 h.resolve(id);
@@ -1337,22 +1366,33 @@ impl Snapclone {
                     // an empty answer that never ends the lookup wedges the
                     // rotation on one id.
                     self.dht_schedule.finished(&sc_id);
+                    // ALL the records for this id, reduced once. Each is
+                    // one address of a multi-address announcement (the C++
+                    // publishes one value per address), so treating them as
+                    // independent findings and letting the last win would
+                    // pick by arrival order — which on a DHT is arbitrary,
+                    // and would routinely choose the public address of a
+                    // peer sitting on the same wifi.
+                    let candidates: Vec<crate::dht_announce::Addr> = found.iter()
+                        .filter(|p| p.port != 0 && !p.host.trim().is_empty())
+                        .map(|p| crate::dht_announce::Addr::new(&p.host, p.port, 0))
+                        .collect();
+                    let ours = crate::dht_announce::local_ipv4s();
+                    //
+                    // A DHT RECORD IS NOW WORTH SOMETHING. It used to set a
+                    // note and evaporate: nothing recorded the address, so a
+                    // peer found via DHT still could not be dialled and the
+                    // message read as a tease.
+                    //
+                    // Only a literal address is taken. Resolving a hostname
+                    // would need DNS on the UI thread, and `best_for`
+                    // already sorts unparseable hosts last so this only
+                    // declines when there was nothing better anyway.
                     let mut learned = 0;
-                    for p in found {
-                        // A DHT RECORD IS NOW WORTH SOMETHING. It used to
-                        // set a note and evaporate: nothing recorded the
-                        // address, so a peer found via DHT still could not
-                        // be dialled and the message read as a tease.
-                        //
-                        // Only a literal address is taken. A hostname would
-                        // need a resolver call on the UI thread, and the
-                        // publisher is asked not to write one (see the
-                        // publish above).
-                        if let Some(ip) = parse_dotted_quad(&p.host) {
-                            if p.port != 0 {
-                                self.note_peer_addr(&sc_id, ip, p.port, now_ms);
-                                learned += 1;
-                            }
+                    if let Some(best) = crate::dht_announce::best_for(&ours, &candidates) {
+                        if let Some(ip) = parse_dotted_quad(&best.host) {
+                            self.note_peer_addr(&sc_id, ip, best.punch_port, now_ms);
+                            learned += 1;
                         }
                     }
                     if learned > 0 {
