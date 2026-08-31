@@ -57,6 +57,21 @@ pub use bottom_bar::{BarButton, BarButtonKind, BarOption, BottomBar};
 pub use uikit_egui::cmdstrip::HOLD_SECONDS;
 
 /// The bar's live gesture state.
+///
+/// **Vestigial.** `bar_ui` below drives `uikit_egui::slide_menu::SlideMenu`
+/// instead, which implements the same two rules; nothing constructs this in
+/// production and its five methods sit on the dead-API list. It is kept for
+/// one reason: the tests underneath it are the only place in the fleet that
+/// STATES those rules as assertions — SlideMenu's own tests cover geometry,
+/// hit-testing and clamping, and none of them asserts that a tap yields the
+/// primary or that releasing outside yields a cancel.
+///
+/// So deleting it would remove coverage rather than duplication. The right
+/// close is to drive `bar_ui` through real egui frames and assert the
+/// outcomes there — the same move that caught two real bugs in snapclone's
+/// swipe work, because a state machine nobody calls can pass forever. Until
+/// that exists this stays, labelled, rather than being quietly removed or
+/// quietly left to look load-bearing.
 #[derive(Debug, Clone, Default)]
 pub struct BarState {
     /// Which button is being pressed, and for how long.

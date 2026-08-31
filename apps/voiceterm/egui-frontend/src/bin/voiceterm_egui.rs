@@ -713,7 +713,11 @@ struct VoicetermApp {
     palette_query: String,
     palette_sel: usize,
     workspaces_filter: String,
-    bar_state: voiceterm_egui::bars::BarState,
+    /// The last thing the bottom bar's Launch button was used to run, shown
+    /// in the terminal's status line. A field rather than a local because
+    /// the bar is drawn in its own panel, before the terminal that reports
+    /// it.
+    bar_note: String,
     /// The graph's SOURCE, not a prebuilt topology.
     ///
     /// A previous pass drew `Topology::new(&[], &[])` — an empty graph, which
@@ -818,6 +822,97 @@ impl VoicetermApp {
             self.surfaces.close_if(Surface::Palette);
             self.palette_query.clear();
             self.palette_sel = 0;
+        }
+    }
+}
+
+impl VoicetermApp {
+    /// Draw the phone bottom bar and act on what it produces.
+    ///
+    /// The BUTTONS are built fresh each frame from live state rather than
+    /// held as a field. A bar cached beside the tab list is a second copy
+    /// of it, and the failure is the one this fleet keeps finding: the
+    /// fan-out offers a tab that was closed two minutes ago, and picking it
+    /// does nothing. `default_bar` is cheap — three vecs of short strings —
+    /// and correct by construction.
+    fn draw_bottom_bar(&mut self, ctx: &egui::Context) {
+        use voiceterm_egui::bars::{bar_ui, BarEvent};
+
+        // Tab ids are INDICES as strings, because `WsTab` has no id and the
+        // dispatch below is "go to tab N" — inventing a uuid here would mean
+        // mapping it straight back to the index at the other end.
+        let tabs: Vec<(String, String)> = self.workspace.tabs.iter().enumerate()
+            .map(|(i, t)| (i.to_string(), t.name.clone()))
+            .collect();
+        let workspaces: Vec<(String, String)> = self.sidebar.sessions.iter().enumerate()
+            .map(|(i, s)| (i.to_string(), s.name.clone()))
+            .collect();
+        // Recent commands, newest first and de-duplicated: a launcher whose
+        // top three entries are the same command run three times is a
+        // launcher with one entry.
+        let mut quick: Vec<(String, String)> = Vec::new();
+        for b in self.blocks.blocks.iter().rev() {
+            if quick.len() >= 8 { break; }
+            let c = b.command.trim();
+            if c.is_empty() || quick.iter().any(|(_, l)| l == c) { continue; }
+            quick.push((c.to_string(), c.to_string()));
+        }
+
+        let bar = voiceterm_egui::bars::bottom_bar::default_bar(&tabs, &workspaces, &quick);
+        let mut event = None;
+        egui::TopBottomPanel::bottom("voiceterm_bottom_bar").show(ctx, |ui| {
+            event = bar_ui(ui, &bar);
+        });
+
+        let Some(ev) = event else { return };
+        match ev {
+            // A tap on Tabs means "the other tab", which is what a single
+            // tap on a tab button means everywhere: the thing you were just
+            // looking at. Not tab 0 — that would make the button useless
+            // once you are on tab 0, which is where you start.
+            BarEvent::Primary(_) => {
+                let n = self.workspace.tabs.len();
+                if n > 1 {
+                    let prev = if self.workspace.active == 0 { 1 } else { self.workspace.active - 1 };
+                    self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command(
+                        format!("go to tab {}", prev + 1)));
+                }
+            }
+            BarEvent::Option { button, option } => {
+                match bar.buttons().get(button).map(|b| b.kind) {
+                    Some(voiceterm_egui::bars::BarButtonKind::Tabs) => {
+                        // Through `apply` rather than by assigning `active`:
+                        // the projection and the model are kept in step by
+                        // `sync`, and writing the field directly is how the
+                        // two drift apart.
+                        self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command(
+                            format!("go to tab {}", option + 1)));
+                    }
+                    Some(voiceterm_egui::bars::BarButtonKind::Workspaces) => {
+                        if option < self.sidebar.sessions.len() {
+                            self.sidebar.active = option;
+                        }
+                    }
+                    Some(voiceterm_egui::bars::BarButtonKind::QuickLaunch) => {
+                        // STAGED, not run. A command that executes on a
+                        // thumb-slide is one nobody can take back, and the
+                        // bar is exactly the surface a pocket press reaches.
+                        if let Some((cmd, _)) = quick.get(option) {
+                            // `stage` puts it on the input line WITHOUT a
+                            // newline — that distinction is the module's
+                            // own, and it is the whole reason this is safe
+                            // to put under a thumb.
+                            self.app.terminal.stage(cmd);
+                            self.bar_note = format!("staged: {cmd}");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Slid off the fan and let go. Nothing happens, which is the
+            // point — but the note clears, so a stale "staged:" line does
+            // not sit there implying something is armed.
+            BarEvent::Cancelled => self.bar_note.clear(),
         }
     }
 }
@@ -1919,6 +2014,20 @@ impl eframe::App for VoicetermApp {
         // against `main.qml`'s single 168-point `vTabBar`, which hosts "work
         // tabs (scrollable) + a default fence + system tabs".
 
+
+        // THE BOTTOM BAR, which had a model, a renderer, a gesture and no
+        // call site. `bars::bar_ui` was reached only from its own tests and
+        // `bottom_bar::default_bar` from nothing at all — so the phone's
+        // whole navigation surface, the one that gives four lists to a
+        // screen with room for one, was never drawn.
+        //
+        // COMPACT ONLY. On a desktop the sidebar, the tab strip and the
+        // rail are all on screen at once and a fan-out bar would be a
+        // fourth way to reach the same lists; on a phone none of them fit
+        // and this is the only way.
+        if adaptive.is_compact() {
+            self.draw_bottom_bar(ctx);
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // SAFE AREA. Nothing in the fleet applied these until now — the
@@ -3638,7 +3747,7 @@ fn main() -> eframe::Result<()> {
                 palette_query: String::new(),
                 palette_sel: 0,
                 workspaces_filter: String::new(),
-                bar_state: Default::default(),
+                bar_note: String::new(),
                 graph_source: String::new(),
             }))
         }),
