@@ -53,6 +53,13 @@ pub fn fitted(mut m: crate::menu::Menu) -> crate::menu::Menu {
 }
 
 impl Deck {
+    /// The campaign log this console is reading. Exposed narrowly rather than
+    /// making `sb` public: the forge needs to know how far in the player is so
+    /// it does not cast someone unmet, and that is one field, not the board.
+    pub fn campaign(&self) -> &crate::campaign::CampaignLog {
+        &self.sb.camp
+    }
+
     /// Stand at a console. Refuses like the ship does if the phase says
     /// the walk is impossible.
     pub fn open(station: Station, phase: Phase, week: u64) -> Result<Deck, &'static str> {

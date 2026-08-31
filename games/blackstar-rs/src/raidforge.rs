@@ -43,6 +43,11 @@ pub struct EchoRaid {
     pub name: String,
     pub resembles: &'static Boss,
     pub phases: Vec<(String, &'static Arena, Vec<EncSpec>)>,
+    /// Whoever the model asked for, RAW — not yet checked against the
+    /// campaign. `parse` has no business knowing how far in a player is, and
+    /// the same forged raid can be legal for one save and a spoiler for
+    /// another, so admission is the caller's job via `casting::admit`.
+    pub cast_request: Vec<String>,
 }
 
 impl EchoRaid {
@@ -68,7 +73,7 @@ impl EchoRaid {
 
 /// The grounded prompt: the model gets the REAL rosters, the exact line
 /// format, and the theme — and nothing to invent but the fiction.
-pub fn prompt_for(theme: &str) -> String {
+pub fn prompt_for(theme: &str, cast: &[&str]) -> String {
     let arenas: Vec<&str> = ARENAS.iter().map(|a| a.id).collect();
     let bosses: Vec<&str> = BOSSES.iter().map(|b| b.id).collect();
     format!(
@@ -82,10 +87,26 @@ pub fn prompt_for(theme: &str) -> String {
          where x and z are integers between -95 and 95. At most one anchor per phase.\n\
          Finish with the line:\n\
          end\n\
-         Theme: {}\n",
+         Theme: {}\n{}",
         bosses.join(", "),
         arenas.join(", "),
-        theme
+        theme,
+        // WHO IT MAY CAST. Empty until the campaign has introduced someone,
+        // and the line is omitted entirely rather than sent empty — a model
+        // given "cast: " with nothing after it invents a name, and the parser
+        // would then drop it, which looks like the forge ignoring the model.
+        // `casting::admit` is still the authority; this only tells the model
+        // what is worth asking for.
+        if cast.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "You may optionally add ONE line before `end`:\n\
+                 cast <exactly one id from: {}>\n\
+                 Only add it if that character genuinely belongs in this raid.\n",
+                cast.join(", ")
+            )
+        }
     )
 }
 
@@ -107,6 +128,7 @@ pub fn parse(text: &str) -> Result<EchoRaid, String> {
     let mut resembles: &'static Boss = &BOSSES[0];
     let mut phases: Vec<(String, &'static Arena, Vec<EncSpec>)> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
+    let mut cast_request: Vec<String> = Vec::new();
     for raw in text.lines() {
         let line = raw.trim().trim_start_matches(['-', '*', '>', ' ']);
         let Some((k, rest)) = line.split_once(' ') else {
@@ -118,6 +140,16 @@ pub fn parse(text: &str) -> Result<EchoRaid, String> {
         let rest = rest.trim();
         match k.to_ascii_lowercase().as_str() {
             "signal" => name = rest.chars().take(48).collect(),
+            // A NAME THE MODEL ASKED FOR, kept unvalidated on purpose. The
+            // prompt offers a roster, but a model that ignores it and invents
+            // someone must not fail the whole raid — same leniency as an
+            // unknown mech dropping one line. `casting::admit` decides what
+            // survives, and it needs the campaign log this function lacks.
+            "cast" => {
+                if cast_request.len() < 4 {
+                    cast_request.push(rest.chars().take(40).collect());
+                }
+            }
             "resembles" => match BOSSES.iter().find(|b| b.id == rest) {
                 Some(b) => resembles = b,
                 None => dropped.push(format!("unknown warden '{rest}'")),
@@ -186,7 +218,7 @@ pub fn parse(text: &str) -> Result<EchoRaid, String> {
             format!("nothing flyable survived: {}", dropped.join("; "))
         });
     }
-    Ok(EchoRaid { name, resembles, phases })
+    Ok(EchoRaid { name, resembles, phases, cast_request })
 }
 
 /// Canonical out: the exact line format the prompt asks for, so the file
@@ -265,13 +297,13 @@ fn provider_from_env() -> Box<dyn Provider> {
 
 /// Light the forge. One worker thread, one blocking call, one answer on
 /// the channel — the frame loop polls with `try_recv` and never waits.
-pub fn forge_async(theme: String) -> mpsc::Receiver<Result<String, String>> {
+pub fn forge_async(theme: String, cast: Vec<String>) -> mpsc::Receiver<Result<String, String>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut p = provider_from_env();
         let req = CompletionRequest {
             generation: 0,
-            prefix: prompt_for(&theme),
+            prefix: prompt_for(&theme, &cast.iter().map(|s| s.as_str()).collect::<Vec<_>>()),
             suffix: String::new(),
             lang: "raid".into(),
             // No file: the forge prompts from a THEME string, not from a
@@ -287,6 +319,50 @@ pub fn forge_async(theme: String) -> mpsc::Receiver<Result<String, String>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_cast_line_survives_parsing_and_a_bad_one_does_not_kill_the_raid() {
+        // Closing the loop. The prompt offers a cast line, so the parser has
+        // to read it — telling a model it may say something and then dropping
+        // the answer is worse than never asking. Kept UNVALIDATED here: the
+        // same forged raid is legal for one save and a spoiler for another,
+        // and `parse` has no campaign log.
+        let good = "signal The Long Quiet\nresembles speakerman\n\
+                    phase unicron opening\nenc purge standard 0 0\n\
+                    cast billy_the_fire_clone\nend";
+        let r = super::parse(good).expect("a valid echo");
+        assert_eq!(r.cast_request, vec!["billy_the_fire_clone".to_string()]);
+
+        // a model that invents someone must not fail the whole raid — same
+        // leniency an unknown mech gets
+        let junk = good.replace("billy_the_fire_clone", "a_bot_that_never_was");
+        let r2 = super::parse(&junk).expect("an invented name must not refuse the raid");
+        assert_eq!(r2.cast_request, vec!["a_bot_that_never_was".to_string()]);
+        assert_eq!(r2.phases.len(), 1, "the raid lost a phase over a cast line");
+
+        // and no cast line at all is normal, not an error
+        let bare = good.replace("cast billy_the_fire_clone\n", "");
+        assert!(super::parse(&bare).expect("still valid").cast_request.is_empty());
+    }
+
+    #[test]
+    fn the_prompt_offers_only_characters_the_player_has_met() {
+        // The wiring, not the rule. `casting::castable` is tested on its own;
+        // this is the guard that the forge actually ASKS it — the failure this
+        // session has made four times is a correct function nothing calls.
+        let empty = super::prompt_for("a siege under closing weather", &[]);
+        assert!(
+            !empty.contains("cast <"),
+            "a fresh save was offered a cast line: {empty}"
+        );
+        let with = super::prompt_for("a siege", &["billy_the_fire_clone", "the_morpher"]);
+        assert!(with.contains("cast <"), "a met roster produced no cast line");
+        assert!(with.contains("billy_the_fire_clone"), "the roster is not in the prompt");
+        // the model is told it is optional, because a forced cameo every raid
+        // is what makes presence stop meaning anything
+        assert!(with.contains("optionally"), "the cast line reads as mandatory");
+    }
+
     use super::*;
 
     fn sample() -> String {

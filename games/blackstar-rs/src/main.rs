@@ -102,6 +102,7 @@ mod pulse;
 mod compact;
 mod brain;
 mod campaign;
+mod casting;
 mod census;
 mod campsim;
 mod chi;
@@ -4888,7 +4889,15 @@ impl Game {
                                 if self.forge_rx.is_some() {
                                     self.toastf("the forge is already lit — one signal at a time");
                                 } else {
-                                    self.forge_rx = Some(raidforge::forge_async(theme.clone()));
+                                    // the forge is told who it may cast — `casting::available`
+                                    // reads the campaign log, so a forged raid
+                                    // cannot pre-empt a reveal or resurrect
+                                    // someone the campaign wrote out
+                                    let cast: Vec<String> = casting::available(d.campaign())
+                                        .into_iter()
+                                        .map(|s| s.to_string())
+                                        .collect();
+                                    self.forge_rx = Some(raidforge::forge_async(theme.clone(), cast));
                                     self.toastf("forging a signal — the wardeck will chime when it resolves");
                                 }
                                 return;
@@ -7526,12 +7535,35 @@ impl Game {
             self.toastf("that echo has faded from the file");
             return;
         };
+        // WHO THE ECHO IS ALLOWED TO CARRY. The model may have asked for
+        // anyone; `casting::admit` checks each name against this save's own
+        // campaign, so the same forged raid can legally cast Megatron for a
+        // player mid-Film-3 and cast nobody for one who has seen the plates
+        // close. Parsing deliberately kept the request unvalidated because it
+        // has no idea which save it is for.
+        let asked: Vec<&'static str> = e
+            .cast_request
+            .iter()
+            .filter_map(|w| casting::entry(w).map(|c| c.id))
+            .collect();
+        let cast = self
+            .deck
+            .as_ref()
+            .map(|d| casting::admit(&asked, d.campaign()))
+            .unwrap_or_default();
         match raidflow::RaidFlow::begin_echo(e.to_plan()) {
             Ok(r) => {
                 let a = r.arena();
                 self.arena_map(a);
                 self.close_deck();
-                self.toastf(&format!("the echo answers — {}", r.boss.name));
+                match cast.first() {
+                    Some((id, p)) => self.toastf(&format!(
+                        "the echo answers — {} — {id} is {}",
+                        r.boss.name,
+                        p.label()
+                    )),
+                    None => self.toastf(&format!("the echo answers — {}", r.boss.name)),
+                }
                 self.sortie = None;
                 self.raid = Some(r);
             }
