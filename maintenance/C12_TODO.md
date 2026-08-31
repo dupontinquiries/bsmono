@@ -4,6 +4,58 @@ Same convention as `C9_TODO.md` / `C10_TODO.md` / `C11_TODO.md`: every item
 says how far it actually got. None of those files are superseded; C11-2a was
 edited in place this session because it turned out not to be a real finding.
 
+## Session summary: §50–§105
+
+Entries are written as the work happens, so this is a map rather than a
+second account. What that session was mostly ABOUT, since the entry list
+does not show it:
+
+**A single failure shape, found ~15 times.** A component built
+carefully, tested, and never called — or called and never read. The
+instances: logscope's `promptroute`/`workergen`/`debatepanel`, gitmind's
+`remote`/`encode`/`reroll` (all three plan-with-no-runner), snapclone's
+camera enumeration, discovery and crypto settings, `send_state::ack`,
+bo-suite's scene loading, studio's `perform` and `library::classify`,
+rusty-board's cardinal layout data, blackstar's `menu_rows` clamp.
+
+Two tools were built to find it and both were WRONG at first:
+`unhosted_check` reported 35 gitmind modules of which 7 of the first 8
+were false (crate-blind, then FFI-blind); `testonly_check` was written
+after and is right on the first run at single digits per app. §60 and
+§71 are the corrections; §86 is the tool that came out of it.
+
+**Corrections to my own work, in order.** §60 (I verified a tool with a
+method sharing its blind spot), §63 (claimed a voice path was unbuilt
+when a design doc named every piece), §73 and §99 (eleven then seven
+compile errors from code written under "don't compile"), §95b (a
+heuristic I added the day before was shadowing a real schema field),
+§104 (grew nothing — the reported "hull too small" was inverted
+normals), §105 (overwrote an existing `gravity.rs`; `cat >` does not
+refuse where `create_file` does).
+
+**Merges taken:** snapclone identity/gossip, studio-live + gesture-kit,
+blackstar-rs fold audit and gameplay, logscope model support (MLA,
+DeltaNet, gemma4, Qwen3.5), fao-codec v11, CADscope + simscope grafted
+as 39 replayed commits.
+
+**Still uncommitted:** the unendlich items/creatures merge is STAGED and
+waiting on a decision — `voxelize_boxes` sizes dims `ceil(size/cell)+1`
+to match a JS tool, and the `+1` slab's cell centres always fall outside
+the box, so two of its own tests fail. My read is the dims are wrong and
+the tests are right; it is a behaviour change to code ported
+deliberately, so it is the operator's call.
+
+**Biggest open threads**, by how much they block:
+  - C104b/C104c — blackstar ship summon/follow, and the QWERTY/Dvorak
+    control-scheme analysis. Both asked for and not started.
+  - C105a — spin gravity exists as a model with no room, fixture or
+    input.
+  - C87a — photosync has core, cv and fingerprint and no frontend.
+  - C70a — logscope's 75 uncalled modules, unswept at the corrected
+    scope.
+  - C90a/C90b — studio's pattern library section, and the record arm
+    that would drive `perform`.
+
 The c12 session installed the offline 1.96.0 toolchain, merged two bundles
 (c9-006g studio, c5blackstar-008 blackstar-rs), and corrected two pieces of
 inherited sandbox lore. What follows is what it found and did not close.
@@ -5806,3 +5858,55 @@ rearrangement that looks different).
 - **C104c — the control-scheme analysis is NOT done.** QWERTY vs Dvorak,
   mouse side buttons, PgUp/PgDn, `,.oeu` for centred Dvorak. Worth doing
   properly against the existing bind table rather than guessed at.
+
+## 105. blackstar: spin gravity on a tether, and two sizes of console
+
+Zero-g / artificial gravity from a bridge console, a rotating tether,
+and robot-sized consoles with human-sized ones beside them.
+
+**`shipgrav`, not `gravity`** — and that near-miss is worth recording. I
+wrote the module as `src/gravity.rs` and OVERWROTE an existing file of
+that name (the world's attraction-to-a-body maths). Caught by the
+compiler, recovered from git, renamed. `create_file` refuses to
+overwrite; `cat >` does not, and I used the second.
+
+**Why a transformer makes this believable.** Artificial gravity without
+hand-waving has to be acceleration, and a ship not under thrust has one
+honest option: spin. A rigid hull spinning about its long axis gives
+nothing at the spine, because radius IS the equation. A transformer can
+deploy a tether — swing mass out, rotate the pair, and the radius
+becomes whatever the line is long enough to make.
+
+Decisions:
+  - **`gravity_g` is `ω²r`**, not a curve fit. The console's whole claim
+    to being believable is that it is the real equation, and there is a
+    test asserting a solved rate produces exactly 1 g.
+  - **`Deploying` is its own state.** A tether halfway out is neither
+    safe to thrust with nor giving useful gravity; showing only the
+    endpoints would let somebody burn engines mid-deploy.
+  - **A partly extended tether reports ZERO gravity.** It is swinging,
+    not spinning — a fraction would invite someone to stand up during a
+    transition.
+  - **Retracting stops the spin FIRST.** Reeling in a rotating tether
+    spins the pair up as the radius shrinks; conservation of angular
+    momentum turns a comfort feature into a centrifuge.
+  - **`safe_to_thrust` is false whenever the line is out at all**, which
+    is what stops "transform and fly" being offered at the moment it
+    would tear the ship apart.
+  - **Comfort is REPORTED, not enforced.** A crew wanting a full g from
+    a short tether can have it and feel awful; refusing would be the
+    ship overruling the person flying it, and `radius_for_comfort` says
+    what would fix it.
+
+**Two console sizes, from a ratio that already existed.**
+`aboard::HULL_HEIGHTS` makes a bot's ship 1.4 km and a person's 280 m,
+so a bot bridge genuinely has controls a human cannot reach. `consoles`
+places a primary at the hull occupant's working height and adds a
+human repeater ONLY above twice human height — a repeater on a human
+ship is furniture nobody needs.
+
+1315/1315, up from 1306.
+
+- **C105a — not wired to a room or an input.** `Fixture` has no
+  `GravityConsole` variant and nothing calls `Tether::tick`. The model
+  and its rules are here; placing it is the next pass.
