@@ -181,3 +181,97 @@ mod tests {
         assert_eq!(render(&parse(&render(&p))), render(&p), "a round trip must be a fixed point");
     }
 }
+
+/// The filesystem half, which the pure tests above deliberately do not touch.
+///
+/// I nearly left this untested on the grounds that config-kit's XDG resolution is tested in its own
+/// crate — which is true and is not the same claim. What is untested there is whether THIS module
+/// reaches THAT path with the right app name and file name, and a preference file written to the
+/// wrong directory is indistinguishable from one that was never written.
+///
+/// `XDG_CONFIG_HOME` is process-global, so these run under one lock and restore it afterwards. The
+/// repo builds with `--test-threads=1` in any case, but a test that only passes because of a build
+/// flag somewhere else is a trap.
+#[cfg(test)]
+mod filesystem {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV: Mutex<()> = Mutex::new(());
+
+    fn with_temp_config<R>(tag: &str, f: impl FnOnce(&std::path::Path) -> R) -> R {
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("logscope-prefs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: serialised by the lock above; no other thread in this test binary touches it.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
+        let out = f(&dir);
+        unsafe {
+            match old { Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                        None => std::env::remove_var("XDG_CONFIG_HOME") }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    #[test]
+    fn save_writes_where_load_reads_and_the_path_is_the_xdg_one() {
+        with_temp_config("roundtrip", |dir| {
+            let p = Prefs { nav_layout: NavLayout::DvorakCentered,
+                            space: Some("Titan's Ribcage".into()),
+                            profiles: vec![ProfileId::Optimizer, ProfileId::Gpu],
+                            unknown: Default::default() };
+            save(&p);
+            // The exact path, not merely "somewhere": <XDG_CONFIG_HOME>/logscope/ui.ini
+            let expected = dir.join("logscope").join("ui.ini");
+            assert!(expected.is_file(), "nothing written to {}", expected.display());
+            // and it is the file `load` reads
+            assert_eq!(load(), p);
+            // …by content, so a coincidence of defaults cannot pass this
+            let text = std::fs::read_to_string(&expected).unwrap();
+            assert!(text.contains("nav_layout = dvorak"), "{text}");
+            assert!(text.contains("Titan's Ribcage"), "{text}");
+            assert!(text.contains("profiles = optimizer,gpu"), "order is precedence: {text}");
+        });
+    }
+
+    #[test]
+    fn loading_with_no_file_present_gives_defaults_rather_than_failing() {
+        with_temp_config("absent", |dir| {
+            assert!(!dir.join("logscope").join("ui.ini").exists());
+            assert_eq!(load(), Prefs::default());
+        });
+    }
+
+    /// A hand-edited file with a newer build's key must come back intact after this build saves.
+    #[test]
+    fn a_hand_edited_file_survives_a_save_from_this_build() {
+        with_temp_config("handedit", |dir| {
+            let d = dir.join("logscope");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("ui.ini"),
+                "# hand written\nnav_layout = dvorak\nfuture_thing = keep-me\n").unwrap();
+            let mut p = load();
+            assert_eq!(p.nav_layout, NavLayout::DvorakCentered);
+            p.space = Some("Cavern".into());
+            save(&p);
+            let text = std::fs::read_to_string(d.join("ui.ini")).unwrap();
+            assert!(text.contains("future_thing = keep-me"), "ate a key it did not own:\n{text}");
+            assert!(text.contains("Cavern"));
+        });
+    }
+
+    /// An unwritable config dir must not take the session down — a preference is not worth a panic.
+    #[test]
+    fn an_unwritable_location_is_survivable() {
+        with_temp_config("readonly", |dir| {
+            // point the app dir at a FILE, so create_dir_all cannot succeed
+            std::fs::write(dir.join("logscope"), b"not a directory").unwrap();
+            save(&Prefs::default());     // must not panic
+            assert_eq!(load(), Prefs::default()); // and reading still degrades cleanly
+        });
+    }
+}
+
