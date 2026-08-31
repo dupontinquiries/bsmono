@@ -385,6 +385,34 @@ fn glass_frame() -> egui::Frame {
 /// minute ago.
 struct Msg { role: Role, variants: Vec<String>, cur: usize, born: std::time::Instant, at: u64, editing: bool, edit_buf: String, think_open: bool, parent: Option<usize>, model: Option<String> }
 
+/// How long ago a turn happened, for the list — `3s ago`, `12m ago`, `2h ago`.
+///
+/// WHICH CLOCK, AND WHY IT MATTERS. `Msg` carries two: `born`, a monotonic `Instant`, and `at`,
+/// unix seconds. `born` is the obvious choice and is wrong for the case that matters — it cannot
+/// survive a save, so on a reopened conversation every turn is stamped at load time and a
+/// three-day-old exchange reads as seconds old. A relative time that confidently lies about an
+/// archived session is worse than no relative time.
+///
+/// So the wall clock wins when it exists, `born` covers the live session, and a turn from before
+/// `at` was recorded gets NOTHING rather than a guess. That last case is real: the field was added
+/// later and older saves carry `0`.
+///
+/// `now` is passed in rather than read here so the boundaries are testable.
+fn turn_age(at: u64, born: std::time::Instant, now_unix: u64) -> Option<String> {
+    let d = if at > 0 {
+        // A clock that has moved backwards (NTP step, a save from a machine set ahead) would
+        // underflow into a nonsense duration; saturating_sub reports "0s" instead.
+        std::time::Duration::from_secs(now_unix.saturating_sub(at))
+    } else if born.elapsed() >= std::time::Duration::from_secs(1) {
+        // No wall clock recorded. Only trust `born` once it has measured something: a freshly
+        // loaded old message has an elapsed of ~0, which is exactly the lie above.
+        born.elapsed()
+    } else {
+        return None;
+    };
+    Some(format!("{} ago", logscope_fan::sessiontime::compact(d)))
+}
+
 /// `YYYY-MM-DD HH:MM UTC` from unix seconds, without pulling a date crate into
 /// a frontend that has none.
 ///
@@ -9309,6 +9337,18 @@ dense briefing that replaces them as the working context, then carry on with roo
                                 // header: role · branch pager · controls
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(who).color(c).small().strong());
+                                    // WHEN, beside WHO. Both clocks were already on `Msg` — `born`
+                                    // with a doc comment saying it exists to measure "3s ago" — and
+                                    // neither reached the screen: the only timestamps in the app
+                                    // were in the exported transcript. See `turn_age` for which
+                                    // clock is trusted and why a reopened session gets nothing
+                                    // rather than a fabricated one.
+                                    let now_unix = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs()).unwrap_or(0);
+                                    if let Some(age) = turn_age(m.at, m.born, now_unix) {
+                                        ui.label(RichText::new(age).color(theme::FAINT()).small());
+                                    }
                                     // node id — highlighted so it can be referenced in :mergectx (git-style prefix)
                                     ui.label(RichText::new(crate::vimmode::short_id(i)).monospace().small().color(theme::md_run_violet()))
                                         .on_hover_text("node id — reference it in :mergectx (a unique prefix works, e.g. :mergectx a9j,3df)");
@@ -10371,4 +10411,43 @@ mod stamp_persistence_tests {
         assert!(c.transcript().contains("1 hour later"));
     }
 
+
+
+    // ── when a turn happened ─────────────────────────────────────────────────────────────────────
+
+    /// The wall clock is trusted when it exists, because it is the only one that survives a save.
+    #[test]
+    fn a_recorded_time_is_measured_against_the_wall_clock() {
+        let born = std::time::Instant::now();
+        assert_eq!(super::turn_age(1000, born, 1003).as_deref(), Some("3s ago"));
+        assert_eq!(super::turn_age(1000, born, 1000 + 12 * 60).as_deref(), Some("12m ago"));
+        assert_eq!(super::turn_age(1000, born, 1000 + 2 * 3600).as_deref(), Some("2h ago"));
+    }
+
+    /// THE CASE THAT MADE THIS WORTH GETTING RIGHT. `born` is a monotonic `Instant` and cannot
+    /// survive a save, so on a reopened conversation every turn is stamped at load time. Trusting
+    /// it would report a three-day-old exchange as seconds old — a relative time that lies
+    /// confidently about an archive is worse than none.
+    #[test]
+    fn a_reopened_conversation_is_dated_from_the_saved_time_not_from_load() {
+        let just_loaded = std::time::Instant::now();      // elapsed ~0, as after a reload
+        let three_days = 3 * 24 * 3600;
+        let age = super::turn_age(1_000_000, just_loaded, 1_000_000 + three_days);
+        assert_eq!(age.as_deref(), Some("3d ago"), "the freshly-made Instant must not win");
+    }
+
+    /// A save from before the field existed carries 0. Nothing is the honest answer there.
+    #[test]
+    fn a_turn_with_no_recorded_time_shows_nothing_rather_than_a_guess() {
+        let just_loaded = std::time::Instant::now();
+        assert_eq!(super::turn_age(0, just_loaded, 1_000_000), None);
+    }
+
+    /// A clock that moved backwards — an NTP step, or a transcript saved on a machine set ahead —
+    /// must not underflow into a nonsense duration.
+    #[test]
+    fn a_backwards_clock_reports_zero_rather_than_a_century() {
+        let born = std::time::Instant::now();
+        assert_eq!(super::turn_age(2_000, born, 1_000).as_deref(), Some("0s ago"));
+    }
 }

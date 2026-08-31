@@ -160,6 +160,26 @@ pub fn human(d: Duration) -> String {
     else { format!("{h} hour{} {m} minutes", if h == 1 { "" } else { "s" }) }
 }
 
+/// The same duration for a DENSE surface: `3s`, `12m`, `2h`, `4d`.
+///
+/// Beside `human` rather than in the UI crate, because one module should decide how a duration
+/// reads. They are different renderings of one idea: `human` is for something spoken or budgeted
+/// ("you have 2 hours 5 minutes"), this is for a timestamp in a list where the row is forty pixels
+/// tall and the words would not fit.
+///
+/// Rounds DOWN, always. A message written 119 seconds ago is "1m", not "2m" — a relative time that
+/// rounds up claims something happened longer ago than it did, and in a log that is the direction
+/// that misleads.
+pub fn compact(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 { return format!("{secs}s"); }
+    let mins = secs / 60;
+    if mins < 60 { return format!("{mins}m"); }
+    let hours = mins / 60;
+    if hours < 24 { return format!("{hours}h"); }
+    format!("{}d", hours / 24)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +263,47 @@ mod tests {
         let c = ctx(3600, 12, Some((3600, 1800)));
         assert_eq!(c.remaining(), Some(Duration::from_secs(1800)),
                    "asking for '30 more minutes' an hour in must mean 30 from now");
+    }
+
+    #[test]
+    fn the_compact_form_fits_a_list_row() {
+        assert_eq!(compact(Duration::from_secs(0)), "0s");
+        assert_eq!(compact(Duration::from_secs(3)), "3s");
+        assert_eq!(compact(Duration::from_secs(59)), "59s");
+        assert_eq!(compact(Duration::from_secs(60)), "1m");
+        assert_eq!(compact(Duration::from_secs(12 * 60)), "12m");
+        assert_eq!(compact(Duration::from_secs(3600)), "1h");
+        assert_eq!(compact(Duration::from_secs(2 * 3600)), "2h");
+        assert_eq!(compact(Duration::from_secs(47 * 3600)), "1d");
+        assert_eq!(compact(Duration::from_secs(30 * 24 * 3600)), "30d");
+    }
+
+    /// A relative time that rounds UP says something happened longer ago than it did, which in a
+    /// log is the direction that misleads.
+    #[test]
+    fn the_compact_form_rounds_down() {
+        assert_eq!(compact(Duration::from_secs(119)), "1m", "not 2m");
+        assert_eq!(compact(Duration::from_secs(59 * 60 + 59)), "59m", "not 1h");
+        assert_eq!(compact(Duration::from_secs(23 * 3600 + 3599)), "23h", "not 1d");
+    }
+
+    /// Both renderings answer the same question and must not disagree about which unit applies.
+    #[test]
+    fn compact_and_human_agree_about_the_unit() {
+        for secs in [0u64, 30, 89, 120, 600, 3600, 7500] {
+            let d = Duration::from_secs(secs);
+            let (c, h) = (compact(d), human(d));
+            let unit_c = c.chars().last().unwrap();
+            let word = h.split_whitespace().nth(1).unwrap_or("");
+            // `human` switches to minutes at 90s where `compact` switches at 60s — a deliberate
+            // difference (a spoken "90 seconds" is fine, a column reading "90s" is not), so agree
+            // only where both are past their own boundary.
+            if secs >= 90 || secs < 60 {
+                let expect = if word.starts_with("second") { 's' }
+                    else if word.starts_with("minute") { 'm' } else { 'h' };
+                assert_eq!(unit_c, expect, "{secs}s: compact {c:?} vs human {h:?}");
+            }
+        }
     }
 
     #[test]
