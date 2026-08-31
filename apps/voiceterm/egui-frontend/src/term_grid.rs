@@ -438,6 +438,17 @@ mod tests {
 
 /// Feed terminal output into a grid.
 ///
+/// `TermGrid` deliberately takes SEMANTIC operations — print, newline,
+/// sgr — and leaves escape parsing to this, so the grid can be tested
+/// without a terminal. This is the smallest parser that keeps that
+/// contract honest: printable characters, the four C0 controls that move
+/// the cursor, and the CSI sequences a shell actually emits.
+///
+/// Unknown escapes are SWALLOWED, not printed. A terminal that renders the
+/// bytes of a sequence it does not understand fills the screen with
+/// `[?2004h`, which looks like the shell is broken rather than the
+/// emulator being incomplete.
+///
 /// This lived inside the binary as `feed_pty`, which made the crate
 /// header's claim — "a portable terminal core, a screen-grid model plus a
 /// VT/ANSI parser, pure and unit-tested, with no egui or PTY in it" —

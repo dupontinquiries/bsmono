@@ -91,33 +91,33 @@ impl VoicetermApp {
 
     /// Run a level and raise the confirm question.
     fn run_ingest_level(&mut self, lvl: voiceterm_egui::docingest::Level, now: f64) {
-        use voiceterm_egui::docingest::{self, Level, Verdict};
-        let verdict = match lvl {
-            Level::None => {
-                self.ingest.revert();
-                self.toasts.info("kept as captured", now);
-                return;
+        use voiceterm_egui::docingest::{self, Level, Tone, Verdict};
+        // WHAT to run and WHAT to say is `docingest::plan` — it was a match
+        // in here tangled with toast calls, and the decision worth checking
+        // is that an assisted pass without a model says so rather than
+        // quietly doing something lesser under the same name.
+        let chunks = docingest::chunk_for_model(&self.ingest.original, 4000).len();
+        let p = docingest::plan(lvl, chunks);
+        if let Some((tone, msg)) = p.note {
+            match tone {
+                Tone::Info => self.toasts.info(msg, now),
+                Tone::Warning => self.toasts.warning(msg, now),
             }
-            Level::Tidy => self.ingest.run(lvl, |s| docingest::tidy(s)),
-            Level::Structural => self.ingest.run(lvl, |s| docingest::structural(s)),
-            Level::Assisted => {
-                // THE LOGSCOPE BACKEND, in chunks. Not wired to a model here:
-                // the seam is chunk_for_model and what fills it is a logscope
-                // engine this binary does not own. Running the structural pass
-                // and SAYING the AI half is unavailable is honest; silently
-                // doing something lesser under the name "AI pass" is not.
-                let chunks = docingest::chunk_for_model(&self.ingest.original, 4000);
-                self.toasts.warning(
-                    format!("no local model attached — {} chunk(s) ready, ran the \
-                             structural pass instead", chunks.len()), now);
-                self.ingest.run(Level::Structural, |s| docingest::structural(s))
-            }
+        }
+        if p.revert {
+            self.ingest.revert();
+            return;
+        }
+        let Some(run) = p.run else { return };
+        let verdict = match run {
+            Level::Tidy => self.ingest.run(run, |s| docingest::tidy(s)),
+            _ => self.ingest.run(Level::Structural, |s| docingest::structural(s)),
         };
         match verdict {
             Verdict::Failed => {
-                // No question: there is nothing to keep. The toast reports and
-                // expires, because a failure the operator cannot act on should
-                // not need dismissing.
+                // No question: there is nothing to keep. The toast reports
+                // and expires, because a failure the operator cannot act
+                // on should not need dismissing.
                 if let Some(msg) = self.ingest.confirm_prompt() {
                     self.toasts.error(msg, now);
                 }
@@ -131,18 +131,6 @@ impl VoicetermApp {
         }
     }
 
-    /// Feed PTY bytes to the screen.
-    ///
-    /// term_grid deliberately takes SEMANTIC operations — print, newline, sgr —
-    /// and leaves escape parsing to the caller, so it can be tested without a
-    /// terminal. This is the smallest parser that keeps that contract honest:
-    /// the printable characters, the four C0 controls that move the cursor, and
-    /// CSI sequences for the cases a shell prompt actually emits.
-    ///
-    /// Unknown escapes are SWALLOWED, not printed. A terminal that renders the
-    /// bytes of a sequence it does not understand fills the screen with
-    /// `[?2004h` — which looks like the shell is broken rather than the
-    /// emulator being incomplete.
     /// Feed terminal output into the focused pane's grid.
     ///
     /// The parsing moved to `term_grid::Vt`, where it can be tested and
