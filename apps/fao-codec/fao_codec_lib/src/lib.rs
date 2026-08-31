@@ -161,6 +161,7 @@ pub mod block_store;
 /// WebSignature similarity matching, atomic manifest writes).
 pub mod engine_scene;
 pub mod mesh_pack;
+pub mod msssim;
 pub mod provenance;
 pub mod library;
 

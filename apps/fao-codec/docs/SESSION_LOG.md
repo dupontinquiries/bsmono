@@ -5960,3 +5960,55 @@ State of the constant sweep, complete for the default path:
             DICT_MAX_CAND (also an edge), mover detection threshold,
             and the 4x4 transform size that REGION=8's failure
             implicated.
+
+### The plate router was scoring on SSE — fixed, and it now finds a shot where the plate is HARMFUL
+
+Diagnosing the suite's two worst shots (9 at MS-SSIM 0.907, 18 at
+0.927, against a 0.962 average) turned up something the null-hypothesis
+machinery had been built for and never caught.
+
+  bloopers shot 9  (48f) motion max |shift| 169.7px, min confidence 0.11
+    with plate    1,141,422 B  MS-SSIM 0.89747  (plate 126,218 B)
+    NO plate      1,041,582 B          0.89821
+    -> no-plate is STRICTLY BETTER: -8.7% bytes AND higher quality
+  bloopers shot 18 (33f) motion max 20.5px, confidence 0.89
+    with plate      989,711 B  MS-SSIM 0.92721  (plate 186,700 B)
+    NO plate        893,962 B          0.91743
+    -> plate wins: -9.7% bytes for -0.00978 is 9,790 KB per MS-SSIM
+       point against a ladder at ~27,000, a bad trade
+
+So on shot 9 the plate is not merely unhelpful, it is HARMFUL, and the
+cause is visible in the motion line: min confidence 0.11 with 170 px of
+shift. The plate is built by motion-compensating frames into a common
+frame, so when the motion estimate is unreliable the plate is a blur of
+misaligned content — 126 KB spent to make prediction worse.
+
+encode_gop_routed exists for exactly this and got it WRONG, picking
+PLATE, because it scored on SSE. SSE ranked the branches the other way
+by 0.9%. That is the same PSNR-domain error as the deblock rules and
+the AV1 comparisons, and it is worse here than elsewhere: a router that
+inherits the wrong metric makes confidently wrong decisions rather than
+noisy ones.
+
+Fixed by scoring the router on MS-SSIM (lifted from bin/msssim into
+src/msssim.rs so the encoder can call it; affordable because this is
+one binary choice per GOP over branches already fully encoded).
+
+The calibration took two attempts and the failure is worth recording.
+First version scaled the quality term by pixel count, which made the
+rate term dominate 100:1 and flipped the router to NO-PLATE on
+everything — accidentally right on shot 9, wrong on shot 18. The
+principled scale is the one every constant in this codec has been
+priced against: the clip's own dead-zone ladder, ~25,000,000 bytes per
+MS-SSIM point at dz32. Expressing J in BYTES as
+    J = bytes + (1 - MS-SSIM) x LADDER
+makes the comparison "would these bytes have bought more quality
+through the quantiser instead", which is what the routing question
+actually is. Both shots now route correctly.
+
+Worth noting what this does NOT yet do: --plate-route is still opt-in
+and costs a second full encode, so the suite does not use it. The cheap
+predictor is sitting in plain sight — motion confidence 0.11 vs 0.81
+and 0.89 separates the three shots perfectly — but one clean separation
+on three shots is a hypothesis, and this session has now been burned
+four times by constants fitted to that little evidence.

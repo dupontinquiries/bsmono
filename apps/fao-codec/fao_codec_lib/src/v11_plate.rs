@@ -1648,13 +1648,49 @@ pub fn encode_gop_routed(
             + rep.motion_bytes
             + rep.frames.iter().map(|c| c.residual_bytes + c.mode_bytes).sum::<usize>()
     };
-    let lambda = (opts.dead_zone as f64).powi(2) / 3.0;
-    let jw = sse(&with) + lambda * bytes(&with) as f64;
-    let jo = sse(&without) + lambda * bytes(&without) as f64;
+    // Scored on MS-SSIM, not SSE. The SSE version of this router picked
+    // PLATE on bloopers shot 9, where no-plate is STRICTLY better —
+    // 1,041,582 B @ 0.89821 against 1,141,422 B @ 0.89747, fewer bytes
+    // AND higher quality. SSE ranked them the other way by 0.9%, which
+    // is the same PSNR-domain error the deblock rules and the AV1
+    // comparisons were caught making. A router that inherits the wrong
+    // metric produces confidently wrong decisions rather than noisy
+    // ones.
+    //
+    // Cost is acceptable because this is one binary choice per GOP over
+    // branches already fully encoded. The rate term keeps its lambda
+    // shape; only the distortion term changes, converted so that MORE
+    // MS-SSIM is LESS cost.
+    let quality = |rep: &PlateEncodeReportV2| -> f64 {
+        crate::msssim::recon_score(&rep.recon, frames)
+    };
+    // Calibration, and the first version got it wrong in an instructive
+    // way: scaling the quality term by pixel count made the rate term
+    // dominate 100:1, so the router flipped to NO-PLATE on everything —
+    // right on shot 9 by luck, wrong on shot 18.
+    //
+    // The principled scale is the one every constant in this codec was
+    // priced against: the clip's own dead-zone ladder, measured at
+    // ~25,000,000 bytes per MS-SSIM point at dz32 (27.0M on film, 24.1M
+    // on game content). Expressing J in BYTES —
+    //     J = bytes + (1 - MS-SSIM) x LADDER
+    // — makes the comparison "would these bytes have bought more quality
+    // through the quantiser instead", which is the question the routing
+    // decision actually is.
+    //
+    // LADDER is dz-dependent and calibrated at dz32; a router used far
+    // from that operating point should re-measure it rather than trust
+    // this number, which is why it is named and commented rather than
+    // buried.
+    const LADDER_BYTES_PER_MSSSIM: f64 = 25_000_000.0;
+    let _ = sse;
+    let jw = bytes(&with) as f64 + (1.0 - quality(&with)) * LADDER_BYTES_PER_MSSSIM;
+    let jo = bytes(&without) as f64 + (1.0 - quality(&without)) * LADDER_BYTES_PER_MSSSIM;
     if std::env::var("FAO_ROUTE_DEBUG").is_ok() {
         eprintln!(
-            "plate route: with {:.4e} ({} B) | without {:.4e} ({} B) -> {}",
-            jw, bytes(&with), jo, bytes(&without),
+            "plate route (MS-SSIM): with {:.4e} ({} B, {:.5}) | without {:.4e} ({} B, {:.5}) -> {}",
+            jw, bytes(&with), quality(&with),
+            jo, bytes(&without), quality(&without),
             if jw <= jo { "PLATE" } else { "NO-PLATE" }
         );
     }
