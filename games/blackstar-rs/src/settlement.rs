@@ -45,6 +45,61 @@
 //! can be made true, tested, and argued with first.
 
 use crate::patrol::Faction;
+
+/// WHO BUILT IT — and the correction that this needed.
+///
+/// The first version of this module took a `patrol::Faction`, which is the
+/// SOLAR SYSTEM's four: Hijacks, Corrupted, Blackstar Clans, Coalition. That
+/// is the wrong scope for a galaxy. The authored raid roster is a universe
+/// that was populated and had a history long before Sol mattered — wardens
+/// titled "Executor of Empires", "The Frontier Marshal", "Archivist", "The
+/// Observer", one that "sings across half a galaxy", and relic text that says
+/// plainly "civilizations surrendered" and "a mobile courtroom; civilizations
+/// stood trial". Sol's factions are a local detail inside that.
+///
+/// So a builder is either one of Sol's factions or an outsider, and an
+/// outsider is described by its POSTURE — what it does to places it arrives
+/// at. Each posture below cites the authored material it comes from, because
+/// inventing a species taxonomy would be exactly the invention this module
+/// exists to avoid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Builder {
+    /// One of the solar system's own.
+    Sol(Faction),
+    Outsider(Posture),
+}
+
+/// What an outsider civilisation does where it lands. Derived from the
+/// wardens already written, not invented.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Posture {
+    /// They write it down. `Archivist`, `The Observer` — and the archive's
+    /// own "every civilisation that finds this" framing.
+    Recorders,
+    /// They arrive to judge. `Judgementor`, "a mobile courtroom;
+    /// civilizations stood trial"; `Executor of Empires`, "it did not fight
+    /// wars, it ended them".
+    Tribunal,
+    /// They take the world apart for what is in it. `The Core Piercer`, "it
+    /// drilled through moons, worlds, dwarf planets"; `Planetbreaker`.
+    Harvesters,
+    /// They build, endlessly. `The Silent Forges`, `Forge Widow`.
+    Forgeworks,
+    /// They hold a line at the edge of somewhere. `The Frontier Marshal`.
+    Marchers,
+}
+
+impl Posture {
+    pub fn label(self) -> &'static str {
+        match self {
+            Posture::Recorders => "recorders",
+            Posture::Tribunal => "tribunal",
+            Posture::Harvesters => "harvesters",
+            Posture::Forgeworks => "forgeworks",
+            Posture::Marchers => "marchers",
+        }
+    }
+}
 use crate::planetlook::{PlanetSpec, Surface};
 use crate::survival::ShelterKind;
 
@@ -200,6 +255,18 @@ fn sealed(s: ShelterKind) -> bool {
 /// and the one the codex is explicit about: they gather data, so they survey —
 /// always, everywhere. What changes between worlds is what they are pointed
 /// at, not why they came.
+pub fn purpose_for_builder(b: Builder, p: &PlanetSpec) -> Purpose {
+    match b {
+        Builder::Sol(f) => purpose_for(f, p),
+        Builder::Outsider(Posture::Recorders) => Purpose::Survey,
+        Builder::Outsider(Posture::Tribunal) => Purpose::Garrison,
+        Builder::Outsider(Posture::Harvesters) => Purpose::Extraction,
+        // a forgeworld makes things wherever it is; the world is feedstock
+        Builder::Outsider(Posture::Forgeworks) => Purpose::Extraction,
+        Builder::Outsider(Posture::Marchers) => Purpose::Waystation,
+    }
+}
+
 pub fn purpose_for(f: Faction, p: &PlanetSpec) -> Purpose {
     match f {
         Faction::Hijacks => Purpose::Survey,
@@ -223,9 +290,18 @@ pub fn purpose_for(f: Faction, p: &PlanetSpec) -> Purpose {
     }
 }
 
-/// Plan a settlement.
+/// Plan a settlement for one of Sol's factions.
 pub fn plan(f: Faction, p: &PlanetSpec) -> Settlement {
-    let purpose = purpose_for(f, p);
+    plan_for(Builder::Sol(f), p)
+}
+
+/// Plan a settlement for anyone.
+pub fn plan_for(b: Builder, p: &PlanetSpec) -> Settlement {
+    let f = match b {
+        Builder::Sol(f) => f,
+        Builder::Outsider(_) => Faction::None,
+    };
+    let purpose = purpose_for_builder(b, p);
     let shelter = shelter_for(p);
 
     // Grammar follows PURPOSE, because that is what an arrangement expresses.
@@ -373,6 +449,72 @@ mod tests {
                     s.roles.windows(2).all(|w| w[0].1 >= w[1].1),
                     "{name}/{f:?} roles are not ordered largest-first"
                 );
+            }
+        }
+    }
+
+    const POSTURES: [Posture; 5] = [
+        Posture::Recorders,
+        Posture::Tribunal,
+        Posture::Harvesters,
+        Posture::Forgeworks,
+        Posture::Marchers,
+    ];
+
+    #[test]
+    fn outsiders_build_things_sols_factions_do_not() {
+        // The correction this module needed. Sol's four are a local detail;
+        // the authored raid roster is a populated universe with its own
+        // history — "Executor of Empires", "Archivist", "civilizations stood
+        // trial". If every outsider collapsed onto a Sol faction's plan, the
+        // widening would be a type change and nothing else.
+        let e = sol("EARTH");
+        let sol_purposes: HashSet<Purpose> =
+            FACTIONS.iter().map(|f| plan(*f, &e).purpose).collect();
+        let out_purposes: HashSet<Purpose> = POSTURES
+            .iter()
+            .map(|p| plan_for(Builder::Outsider(*p), &e).purpose)
+            .collect();
+        assert!(
+            out_purposes.iter().any(|p| !sol_purposes.contains(p)),
+            "outsiders produced only purposes Sol already had: {out_purposes:?}"
+        );
+        // and they are not all the same as each other either
+        assert!(out_purposes.len() >= 3, "five postures gave {} purposes", out_purposes.len());
+    }
+
+    #[test]
+    fn the_environment_still_rules_an_outsider() {
+        // Being from outside does not exempt you from physics: an outsider on
+        // Venus still cannot pitch a camp at 92 bar. The two derivations have
+        // to compose, or the widening quietly bypassed the planet.
+        for p in POSTURES {
+            let v = plan_for(Builder::Outsider(p), &sol("VENUS"));
+            assert_eq!(v.shelter, ShelterKind::SkyCity, "{}: 92 bar ignored", p.label());
+            assert_eq!(v.grammar, Grammar::Warren, "{}: sprawled on Venus", p.label());
+            let luna = plan_for(Builder::Outsider(p), &sol("LUNA"));
+            let earth = plan_for(Builder::Outsider(p), &sol("EARTH"));
+            assert!(
+                luna.count(Role::Plant) > earth.count(Role::Plant),
+                "{}: a vacuum world planned no extra life support",
+                p.label()
+            );
+        }
+    }
+
+    #[test]
+    fn every_outsider_plan_is_still_a_place() {
+        for (name, spec) in SOL {
+            for p in POSTURES {
+                let s = plan_for(Builder::Outsider(p), spec);
+                assert!(
+                    (4..=40).contains(&s.total()),
+                    "{name}/{}: {} buildings — {}",
+                    p.label(),
+                    s.total(),
+                    s.report()
+                );
+                assert!(s.roles.len() >= 3, "{name}/{} used too few roles", p.label());
             }
         }
     }
