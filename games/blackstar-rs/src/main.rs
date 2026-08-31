@@ -56,6 +56,7 @@ mod trials;
 mod trainwatch;
 mod tuner;
 mod tuning;
+mod valuestruct;
 mod replay;
 mod academy;
 mod stream;

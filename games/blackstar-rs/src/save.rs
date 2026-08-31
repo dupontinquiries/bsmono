@@ -129,7 +129,16 @@ impl Default for Save {
             ball_cam: true,
             fullscreen: false,
             car: 0,
-            map: 0,
+            // OBSERVATORY, not MEADOW. The front door decides whether the
+            // game reads as a demo, and MEADOW measures 0.58 stops of value
+            // separation — the flattest of the 36 styles (valuestruct.rs).
+            // OBSERVATORY is 4.16: a night field under a near-black zenith,
+            // wet enough (0.50) that the ground genuinely reflects, lit by
+            // its own accents. Dark with somewhere to look, which is the
+            // register this game is aiming at.
+            // Alternative branch if that reads too cold on a real screen:
+            // FOUNDRY (1.47 stops, industrial orange) or CAVERN (3.30).
+            map: 2,
             seed: 20260726,
             name: String::new(),
             tuned_profile: 255,
