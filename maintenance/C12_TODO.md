@@ -4780,3 +4780,67 @@ variant had no timestamp before.
   it.** It is a method on `Snapclone` in `lib.rs`, and the name appears
   in the same file inside a doc comment, which the caller scan counts as
   a use. Worth fixing: doc comments should not count as callers.
+
+## 87. photosync: the headless core, and what it is honestly for
+
+Asked for photosync in gitmind plus an egui-kit frontend inspired by
+fotema, with faces, thumbnails, dedup, metadata, and an ascii + tags
+pipeline so an LLM can drive an image search ("find people dancing like
+this").
+
+`photosync` already existed as a NAME — `appcatalog.rs` lists it at
+"8.0M, Sync photos over LAN" and `preview.rs` expects a screenshot path
+for it. No code. Now it is a crate, in the fleet catalog as a simple
+media entry (a plain package, unlike cadscope and aperture which needed
+custom paths).
+
+**On fotema: it is GPL-3.0 and no code is taken from it.** What is
+borrowed is the shape of the problem and one specific idea worth
+crediting — a **scan version** stored per photo, so a metadata bug fix
+can re-scan exactly the photos the buggy version touched instead of the
+whole library.
+
+**Built: the headless core.** No egui, no wgpu, no image decoder — it
+takes greyscale pixels and returns hashes, ascii, tags and scores. Same
+split as snapshot-cam: the search RULES are testable without a display,
+a GPU, or a photo library. 15 tests, green first run.
+
+Decisions worth keeping:
+  - **dHash, not average-hash.** It compares each cell to its right
+    neighbour, so brightening a photo does not change the hash — every
+    pixel moved together and the comparisons did not. Tested.
+  - **Box averaging, not nearest-neighbour.** Nearest sampling picks one
+    pixel per cell, so the same scene at two resolutions produces
+    unrelated grids, which defeats the point of a perceptual hash.
+    Tested at 64x64 vs 32x32.
+  - **A 10-character ramp, not the classic 60.** An LLM reading this
+    needs to distinguish shapes, not reproduce a photograph, and a long
+    ramp spends resolution on tonal steps a model will not use.
+  - **32x16, wider than tall**, because cells are square and characters
+    are not — a 32x32 grid renders as a photo stretched to double
+    height.
+  - **Two untagged photos score 0.0, not 1.0.** Otherwise every untagged
+    pair tops the results in a library that is mostly untagged, which is
+    every real library.
+  - **Dedup uses ONLY the hash.** Two different photos of the same
+    wedding share every tag; merging them deletes a distinct picture,
+    and deletion is unrecoverable in a way a missed duplicate is not.
+  - **The query is excluded by PATH, not by score**, so a genuine
+    duplicate the operator wants to see is not silently dropped.
+
+**What ascii is honestly for**, stated in the module: a coarse
+edge-and-mass sketch that survives resizing and recolouring and costs
+nothing, and that an LLM can READ because it is text. It is NOT a pose
+estimator — a query built only from ascii will match a lamp shaped like
+a person, which is what the tags exist to stop.
+
+- **C87a — no frontend yet.** The egui shell, thumbnails and the face
+  pipeline are not started. The core is the part that had to be right
+  first, and it is the part that can be tested here.
+- **C87b — no CV primitives.** Faces need a detector; the tag pipeline
+  currently accepts tags rather than producing them. `Entry::scan` is
+  the seam a detector plugs into.
+- **C87c — the wgpu matcher is not written.** `similarity` is the
+  scoring function a GPU pass would parallelise; at library scale the
+  O(n) scan is fine, and building the GPU version first would optimise
+  something nobody has used.

@@ -1080,7 +1080,11 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     }
     let coding = ["gitmind", "logscope", "bot-arena"];
     // snapshot-cam is a simple entry: bare name, package == bin, no features.
-    let media = ["av1tuner", "av1tuner-m1", "snapclone", "paperbound", "snapshot-cam"];
+    // photosync joins media as a SIMPLE entry: unlike cadscope and
+    // aperture it is a plain package at apps/photosync, so
+    // `resolve_app_dir` finds it without a custom path.
+    let media = ["av1tuner", "av1tuner-m1", "snapclone", "paperbound", "snapshot-cam",
+                 "photosync"];
     // beatspace is a CUSTOM entry below (it needs run_flags), so it is not in
     // this simple list — being in both would put it in the group twice.
     let music = ["krapper", "bo-suite", "fao-codec"];

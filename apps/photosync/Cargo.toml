@@ -1,0 +1,18 @@
+[package]
+name = "photosync"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+description = "Photo library: perceptual dedup, metadata tracking, and an ascii + tag pipeline so a language model can drive an image search. Headless core; the egui shell is behind the `app` feature."
+
+[dependencies]
+# Nothing yet, deliberately. The core takes greyscale pixels and returns
+# hashes, ascii and scores — no decoder, no GPU, no display. A dependency
+# here would be one the search rules do not need and the tests would have
+# to build.
+
+[features]
+# The core is the default so `cargo test` runs headless, matching
+# snapshot-cam's split: the rules are testable without a display.
+default = []
+app = []
