@@ -33,6 +33,7 @@ mod duel;
 mod foldaudit;
 mod foldsim;
 mod font;
+mod footing;
 mod foothold;
 mod fleet;
 mod fx;

@@ -352,7 +352,10 @@ pub struct World {
     bh_cd: f32,
     drop_cd: f32,
     /// spawn template for arriving planets (KUIPER only)
-    kuiper: bool,
+    /// This world is a FIELD, not a surface: bodies with their own local
+    /// down, and open space between them. Read by `footing::below`, which is
+    /// the query that can answer "is there anything under me" in both cases.
+    pub kuiper: bool,
     /// a ship parked in the world, and where. See `park`.
     pub parked: Option<(Vec3, crate::interior::Interior)>,
     /// DROPSHOT: platform height — a ball below it scores by z sign
