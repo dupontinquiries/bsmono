@@ -4249,10 +4249,46 @@ the fixed thing.
     `rust/` has presence, wire, mailbox, but nothing DHT. The C DHT the
     operator mentions is the Qt side's.
 
-- **C78a — the DHT wiring is a real gap, not a locked control.**
-  Selecting "Jami DHT" now works and has nothing to reach. The honest
-  next step is a `snapclone-dht` crate behind the same seam
-  `snapclone-presence` uses for gossip — not another settings change.
+- **C78a — the missing piece was a SOCKET, not a crate.** I said the
+  next step was a `snapclone-dht` crate. Looked first, and three pieces
+  already existed:
+
+    shared/dht-kit    InfoHash, Value, the Msg/Query wire vocabulary.
+                      Types and a protocol, no engine.
+    shared/snapcore   lookup_value, lookup_nodes, routing table — the
+                      ENGINE, generic over a `Transport`.
+    snapclone-presence  announce_record produces the (key, value) to
+                      put. Its header says outright: "Nothing here opens
+                      a socket or drives a lookup."
+
+  Every `impl Transport` in the tree was a SIMULATION (`sim.rs`,
+  `proximity.rs`). So the DHT worked end to end over an imaginary
+  network, and `DiscoveryBackend::Jami` had nothing real to reach.
+
+  **Written: `snapcore::udp::UdpTransport`.** 7 tests, including two
+  that use real loopback sockets.
+
+  Four decisions:
+  - **Blocking with a timeout.** `Transport`'s methods return values,
+    not futures, so the trait is already synchronous; async would mean
+    changing it and every simulation, or blocking on a runtime inside a
+    sync method. The timeout is what keeps that honest — Kademlia
+    tolerates non-responders, but only if the call RETURNS so the
+    routing table can count the failure.
+  - **A timeout returns `Closest(vec![])`, never `Values(vec![])`.**
+    The latter reads as "found, and the answer is nothing", which ENDS
+    the lookup. The former lets it continue with its other candidates.
+  - **A reply from the wrong address is dropped.** UDP has no
+    connection, so any host that saw the query can answer it; accepting
+    that lets a bystander steer a lookup by racing the real peer.
+  - **A truncated contact list keeps what parsed**, and a lying length
+    prefix stops the loop rather than indexing past the buffer. Both are
+    parsing network bytes, where the length field is exactly what a
+    hostile peer lies about.
+
+- **C78b — presence is still not wired to the engine.** The socket
+  exists and `announce_record`'s output has nowhere to go yet. That is
+  now a call site rather than a component.
 
 ## 79. Spacebar in a text field started playback — a shared arbitration gap
 

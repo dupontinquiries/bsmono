@@ -47,6 +47,9 @@ pub mod schedule;
 pub mod punch;
 pub mod lookup;
 pub mod node;
+/// A `Transport` over a real UDP socket — see the module note on why
+/// every other impl in the tree is a simulation.
+pub mod udp;
 pub mod proximity;
 pub mod routing;
 pub mod sim;
