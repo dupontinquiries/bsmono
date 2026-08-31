@@ -4884,6 +4884,12 @@ which file you read.\n\n",
                 // one-step-removed mistake as auditing a palette that never renders. Offsetting the
                 // world point and projecting THAT keeps the box and the glyphs on the same spot.
                 const LABEL_PUSH_WORLD: f32 = 0.55;
+                // ONE CELL SIZE. `label_cells` lays 5x7 cells of this size and `px_extents` derives
+                // the collision box from it, so the number was written twice — once for the glyphs
+                // and once for the box. Change either and the declutter measures a rectangle the
+                // text does not occupy, silently. That is the two-copies-of-one-value defect this
+                // tree has shipped four times; it does not get a fifth.
+                const LABEL_CELL: f32 = 0.034;
                 // `spatial::centroid` already means this. I hand-rolled the x/z mean here and
                 // dupscan named it; that is the third copy of an existing helper this session.
                 let world_mid = crate::spatial::centroid(&pos);
@@ -4906,7 +4912,6 @@ which file you read.\n\n",
                         // over-suppressing far labels and under-suppressing near ones, the two cases
                         // the declutter exists to get right. LABEL_CELL is `label_cells`' own cell
                         // size at this call site.
-                        const LABEL_CELL: f32 = 0.034;
                         let (w, h) = crate::nodelabel::px_extents(chars, LABEL_CELL, scale, q.3);
                         let (ax, ay) = anchor(q);
                         Some(crate::nodelabel::LabelBox { id: q.0, x: ax, y: ay, depth: q.3, w, h })
@@ -4946,7 +4951,7 @@ which file you read.\n\n",
                             graph.push(lead);
                         }
                         for cell in m3::label_cells(label_pos(q.0), right, up, toward_cam, &label,
-                                                    0.034, t, theme::CYAN(), lit, scroll, tanim, m3::SceneLight::Uniform, 0) {
+                                                    LABEL_CELL, t, theme::CYAN(), lit, scroll, tanim, m3::SceneLight::Uniform, 0) {
                             graph.push(cell);
                         }
                     }

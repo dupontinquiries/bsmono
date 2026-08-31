@@ -124,10 +124,14 @@ pub fn px_extents(chars: usize, cell: f32, view_scale: f32, depth: f32) -> (f32,
 ///
 /// Where a label sits: pushed OUTWARD from the cluster centre, in the ground plane.
 ///
-/// This is what the references do — their cards ring the node cluster with a short connector to
-/// each node, so nothing is drawn on top of anything and nothing has to be hidden. `visible` below
-/// still resolves what remains crowded, but as a fallback rather than the whole strategy: a label
-/// you cannot see is a turn you cannot read.
+/// This is what the references do — their cards ring the node cluster with a short connector, so
+/// the node stays visible under its own label.
+///
+/// CORRECTED CLAIM. I first justified this as reducing collisions, and it does not. The probe in
+/// `pipeline` measures the survivor count at four push values across three cluster sizes and gets
+/// the same answer every time: a label is tens of pixels wide, half a world unit does not change
+/// which pairs overlap, and `visible` is still doing all of the decluttering. What the push is for
+/// is that the card sits BESIDE the node rather than covering it.
 ///
 /// Radial because that is the direction with room. A graph drawn around a centre has its empty
 /// space outside, and any fixed axis would crowd one side while leaving the other bare. Ground
@@ -414,3 +418,133 @@ mod tests {
         assert!(visible(Vec::new()).is_empty());
     }
 }
+
+/// THE PIPELINE, END TO END.
+///
+/// Four pieces cooperate to place a label — `elide_words` decides the text, `outward` decides where
+/// it sits, `px_extents` decides how big it is, `visible` decides whether it is drawn — and each is
+/// tested alone. What none of them tests is the thing they exist for: that WHAT ACTUALLY GETS DRAWN
+/// does not overlap.
+///
+/// That gap is not hypothetical. Three commits in a row on this feature each fixed something the
+/// previous one broke — a screen-space push that measured boxes the glyphs did not occupy, a
+/// depth sign that kept the farthest label, a dead helper left behind by the fix. Every one of them
+/// was a wiring fault between pieces that individually passed. This runs the pieces in the order
+/// the caller runs them and checks the result.
+#[cfg(test)]
+mod pipeline {
+    use super::*;
+
+    /// The caller's arrangement, reproduced: push outward, size by depth, then declutter.
+    fn drawn(nodes: &[(Vec3, &str)], cell: f32, view_scale: f32, push: f32, max_chars: usize)
+        -> Vec<(usize, f32, f32, f32, f32)>
+    {
+        let centre = {
+            let n = nodes.len().max(1) as f32;
+            Vec3::new(nodes.iter().map(|(p, _)| p.x).sum::<f32>() / n, 0.0,
+                      nodes.iter().map(|(p, _)| p.z).sum::<f32>() / n)
+        };
+        // A flat projection standing in for the camera: depth from z, x straight through. Enough to
+        // exercise the ordering and the arithmetic without building a Camera.
+        let boxes: Vec<LabelBox> = nodes.iter().enumerate().map(|(i, (p, text))| {
+            let at = outward(*p, centre, push);
+            let depth = 20.0 + at.z;
+            let chars = elide_words(text, max_chars).chars().count();
+            let (w, h) = px_extents(chars, cell, view_scale, depth);
+            LabelBox { id: i, x: at.x * view_scale / depth, y: at.y * view_scale / depth, depth, w, h }
+        }).collect();
+        let keep: std::collections::HashSet<usize> = visible(boxes.clone()).into_iter().collect();
+        boxes.into_iter().filter(|b| keep.contains(&b.id))
+            .map(|b| (b.id, b.x, b.y, b.w, b.h)).collect()
+    }
+
+    fn overlaps(a: &(usize, f32, f32, f32, f32), b: &(usize, f32, f32, f32, f32)) -> bool {
+        let (ax0, ax1) = (a.1 - a.3 * 0.5, a.1 + a.3 * 0.5);
+        let (bx0, bx1) = (b.1 - b.3 * 0.5, b.1 + b.3 * 0.5);
+        let (ay0, ay1) = (a.2 - a.4 * 0.5, a.2 + a.4 * 0.5);
+        let (by0, by1) = (b.2 - b.4 * 0.5, b.2 + b.4 * 0.5);
+        ax0 < bx1 && bx0 < ax1 && ay0 < by1 && by0 < ay1
+    }
+
+    /// The one property the whole thing is for.
+    #[test]
+    fn nothing_drawn_overlaps_anything_else_drawn() {
+        // A dense cluster: twenty turns within a few world units, long previews, all at once.
+        let texts: Vec<String> = (0..20).map(|i| format!("turn {i} about the retry storm in the pool")).collect();
+        let nodes: Vec<(Vec3, &str)> = (0..20).map(|i| {
+            let a = i as f32 * 0.618 * std::f32::consts::TAU;
+            (Vec3::new(a.cos() * 2.0, 0.0, a.sin() * 2.0), texts[i].as_str())
+        }).collect();
+        let out = drawn(&nodes, 0.034, 900.0, 0.55, 22);
+        assert!(!out.is_empty(), "a dense cluster should still show something");
+        for i in 0..out.len() {
+            for j in (i + 1)..out.len() {
+                assert!(!overlaps(&out[i], &out[j]),
+                        "labels {} and {} overlap: {:?} vs {:?}", out[i].0, out[j].0, out[i], out[j]);
+            }
+        }
+    }
+
+    /// Pushing outward must EARN its place in the pipeline: with the push, more labels survive the
+    /// same cluster than without it. If that ever stops being true the step is cost with no benefit.
+    /// A probe rather than an assertion: how many labels survive at each push, on a cluster the
+    /// size a real graph makes. Printed so the constant has a measurement behind it.
+    #[test]
+    fn how_much_the_push_is_worth() {
+        let texts: Vec<String> = (0..12).map(|i| format!("turn {i} about the pool")).collect();
+        for radius in [1.2_f32, 4.0, 8.0] {
+            let nodes: Vec<(Vec3, &str)> = (0..12).map(|i| {
+                let a = i as f32 * 0.618 * std::f32::consts::TAU;
+                (Vec3::new(a.cos() * radius, 0.0, a.sin() * radius), texts[i].as_str())
+            }).collect();
+            let counts: Vec<usize> = [0.0_f32, 0.55, 1.5, 3.0].iter()
+                .map(|&push| drawn(&nodes, 0.034, 900.0, push, 22).len()).collect();
+            println!("radius {radius:>4}: push 0/0.55/1.5/3.0 -> {counts:?}");
+        }
+    }
+
+    /// WHAT THE PUSH IS ACTUALLY FOR, corrected by the probe above.
+    ///
+    /// This test used to assert that pushing outward let MORE labels survive a cluster, which is
+    /// what I claimed in two commits. It failed: 1 with, 1 without. The probe explains why — the
+    /// survivor count is identical at every push value across three cluster sizes, because a label
+    /// is tens of pixels wide and half a world unit does not change which pairs overlap. `visible`
+    /// is doing all of the decluttering; the push contributes nothing to it.
+    ///
+    /// The step still earns its place, for the reason the references actually show: the card sits
+    /// BESIDE the node rather than covering it, so the node stays visible under its own label. That
+    /// is the property worth asserting, and unlike the last one it is true.
+    #[test]
+    fn a_label_no_longer_covers_the_node_it_describes() {
+        let node = Vec3::new(3.0, 0.0, 1.0);
+        let centre = Vec3::new(0.0, 0.0, 0.0);
+        let at = outward(node, centre, 0.55);
+        let moved = (at.x - node.x).hypot(at.z - node.z);
+        assert!((moved - 0.55).abs() < 1e-4, "moved {moved}, expected 0.55");
+        let before = (node.x - centre.x).hypot(node.z - centre.z);
+        let after = (at.x - centre.x).hypot(at.z - centre.z);
+        assert!(after > before, "the label moved inward: {after} vs {before}");
+    }
+
+    /// Every drawn box must be finite. A NaN reaches Color32 arithmetic and panics a frame later,
+    /// somewhere unrelated — the projection loop already carries a guard against exactly that.
+    #[test]
+    fn a_node_at_the_centre_does_not_poison_the_pipeline() {
+        let nodes: Vec<(Vec3, &str)> = vec![
+            (Vec3::new(0.0, 0.0, 0.0), "the node sitting exactly in the middle"),
+            (Vec3::new(3.0, 0.0, 0.0), "one off to the side"),
+            (Vec3::new(-3.0, 0.0, 1.0), "another"),
+        ];
+        let out = drawn(&nodes, 0.034, 900.0, 0.55, 22);
+        for b in &out {
+            assert!(b.1.is_finite() && b.2.is_finite() && b.3.is_finite() && b.4.is_finite(), "{b:?}");
+        }
+    }
+
+    /// An empty graph draws nothing rather than dividing by zero on the centroid.
+    #[test]
+    fn an_empty_graph_is_harmless() {
+        assert!(drawn(&[], 0.034, 900.0, 0.55, 22).is_empty());
+    }
+}
+
