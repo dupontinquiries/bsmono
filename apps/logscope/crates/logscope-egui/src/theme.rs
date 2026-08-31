@@ -611,6 +611,28 @@ pub fn day_night_adjust_at(p: Palette, day: f32) -> Palette {
     surf(p.panel2, &mut q.panel2, f, p.dark);
     surf(p.track_bg, &mut q.track_bg, f, p.dark);
     surf(p.line, &mut q.line, f, p.dark);
+    // ── PANEL/BACKGROUND SEPARATION, after the surfaces move ─────────────────────────────────────
+    //
+    // The text roles are repaired below, but nothing kept the panel distinguishable from the
+    // backdrop, and the day/night transform can destroy that separation two ways: dimming a light
+    // palette scales BOTH surfaces by the same factor, which pushes their contrast ratio toward 1,
+    // and lifting a dark one saturates channels unevenly.
+    //
+    // Found by auditing the palette that actually RENDERS rather than the one that is authored —
+    // the earlier audit checked `palette_for`'s output, which is not what `set_palette` installs.
+    // Four failures across the whole set, and two of them are hand-authored palettes rather than
+    // derived rooms: Hollow Jungle sat at 1.009 at night and never rose above 1.022 at any hour,
+    // meaning its panels have never been visible against its own background; Treehouse collapsed to
+    // 1.040 only after the night dim.
+    //
+    // Repaired here, once, for authored and derived palettes alike — and BEFORE the text repair
+    // below, which measures against `q.panel`.
+    if contrast_ratio(q.panel, q.bg) < 1.08 {
+        q.panel = crate::roomtheme::force_contrast(q.panel, q.bg, 1.08);
+        // keep the panel/panel2 hierarchy pointing the same way it did before the repair
+        q.panel2 = lerp_col(q.panel, q.bg, 0.35);
+    }
+
     // night also cools/warms the lamp a touch, matching the canopy sun's mood
     q.light = if p.dark { p.light } else { lerp_col(p.light, cool_tint(p.light, 0.5), (1.0 - day) * 0.6) };
 

@@ -176,6 +176,32 @@ mod tests {
         assert!(rows.len() >= 30);
     }
 
+    /// SAME CORRECTION AS ROOMTHEME'S. `segments` is called at runtime with `theme::active()`, which
+    /// is the DAY/NIGHT-ADJUSTED palette, and the audit above feeds it base palettes. Those are
+    /// different inputs: the adjustment moves `bg` (the surface these are measured against) and
+    /// repairs `amber` (the hue they are anchored on), so passing at base proves nothing about what
+    /// renders. This runs the same two checks on the palette the graph will actually be drawn over.
+    #[test]
+    fn nodes_hold_up_against_the_palette_that_actually_renders() {
+        let mut bad = Vec::new();
+        for p in all_spaces() {
+            for (label, day) in [("night", 0.0f32), ("dusk", 0.5), ("noon", 1.0)] {
+                let q = crate::theme::day_night_adjust_at(p, day);
+                let cols = segments(&q);
+                let (score, i, j) = worst_pair(&cols);
+                if score < 1.30 {
+                    bad.push(format!("{} at {label}: segments {i}/{j} at {score:.2}", p.name));
+                }
+                for (i, c) in cols.iter().enumerate() {
+                    let vs = contrast(*c, q.bg);
+                    if vs < 1.9 { bad.push(format!("{} at {label}: segment {i} vs bg {vs:.2}", p.name)); }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{} problem(s) in the rendered palette:\n  {}",
+                bad.len(), bad.join("\n  "));
+    }
+
     /// The point of deriving: two different rooms must not produce the same node colours.
     #[test]
     fn different_rooms_give_different_node_colours() {

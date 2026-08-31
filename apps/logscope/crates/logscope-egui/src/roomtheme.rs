@@ -306,6 +306,39 @@ mod tests {
         assert_eq!(by_name("nonsense").name, crate::theme::PALETTES[0].name);
     }
 
+    /// THE AUDIT WAS TESTING THE WRONG ARTIFACT, which I noticed only after writing it.
+    ///
+    /// `set_palette` does not install what `palette_for` returns — it installs
+    /// `day_night_adjust_at(p, daylight01())`. That function repairs the TEXT roles against the
+    /// panel (ink 4.5, dim 4.0, accents 4.5, status 3.0), so those survive. It does not touch
+    /// panel-versus-background: for a light palette it scales both surfaces by up to 0.42, and
+    /// scaling two luminances by the same factor pushes their contrast ratio toward 1. So the
+    /// separation I had just fixed at base could collapse at night, in the very rooms it was fixed
+    /// for.
+    ///
+    /// Auditing the base palette is auditing an intermediate. This audits what reaches the screen,
+    /// at three points across the day.
+    #[test]
+    fn panels_stay_separable_from_the_background_all_day() {
+        let mut bad = Vec::new();
+        for p in spaces() {
+            for (label, day) in [("night", 0.0f32), ("dusk", 0.5), ("noon", 1.0)] {
+                let q = crate::theme::day_night_adjust_at(p, day);
+                let sep = contrast(q.panel, q.bg);
+                if sep < 1.05 {
+                    bad.push(format!("{} at {label}: panel/bg {sep:.3}", p.name));
+                }
+                // and the text repair really does hold after adjustment
+                let ink = contrast(q.ink, q.panel);
+                if ink < 4.4 {
+                    bad.push(format!("{} at {label}: ink/panel {ink:.2}", p.name));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{} problem(s) in the palette that actually renders:\n  {}",
+                bad.len(), bad.join("\n  "));
+    }
+
     /// A room whose accent is nearly its own perimeter is the case that would silently produce
     /// invisible highlights. It has to be lifted, not passed through.
     #[test]
