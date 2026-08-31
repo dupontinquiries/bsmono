@@ -785,11 +785,28 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
             // menu size, per its own comment.
             rows.push(Row::gap());
             rows.push(Row::heading("ECHO SIGNALS — forged, not found"));
-            for e in crate::raidforge::catalog() {
+            // READY AND HELD, both shown. An echo naming someone this save has
+            // not met is not waste to be discarded — generation is the
+            // expensive part and eligibility is a cheap function of the
+            // campaign log, so it is banked and becomes flyable when the
+            // campaign catches up. Listing it greyed says that; dropping it
+            // silently would look like the forge losing work.
+            let (ready, held) = crate::raidforge::catalog_split(&sb.camp);
+            for e in ready {
                 rows.push(
                     Row::action(leak(e.id()), &format!("{:24} {} phases", e.name, e.phases.len()))
                         .hint("an echo: flyable, banks nothing"),
                 );
+            }
+            for (e, why) in held {
+                let mut r =
+                    Row::action(leak(e.id()), &format!("{:24} {} phases", e.name, e.phases.len()))
+                        .hint(leak(format!("{why} — it keeps until you have")));
+                // dim rather than hidden: "why can I not press this" is better
+                // answered than avoided, which is the rule ui.rs already uses
+                // for disabled menu rows
+                r.enabled = false;
+                rows.push(r);
             }
             rows.push(Row::action("forge:storm", "FORGE: a siege under closing weather"));
             rows.push(Row::action("forge:sky", "FORGE: a fight that lives in the air"));

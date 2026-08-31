@@ -38,7 +38,7 @@ use crate::raidcon::{Arena, Boss, Mech, ARENAS, BOSSES};
 use crate::raidgen::{strhash, EncKind, EncSpec, PhaseSpec, RaidPlan};
 
 /// A parsed echo: everything needed to rebuild a `RaidPlan` on demand.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EchoRaid {
     pub name: String,
     pub resembles: &'static Boss,
@@ -241,8 +241,63 @@ pub fn render(e: &EchoRaid) -> String {
             out.push_str(&format!("enc {mech} {kind} {:.0} {:.0}\n", s.x, s.z));
         }
     }
+    // THE CAST HAS TO SURVIVE THE FILE. `parse` reads a cast line and
+    // `render` did not write one, so every echo lost its cast the moment it
+    // was saved — the model's answer thrown away one step after being
+    // accepted. The round-trip test did not catch it because it predates the
+    // field, which is the general hazard: a test named "round trips" only
+    // covers what it was written against.
+    for id in &e.cast_request {
+        out.push_str(&format!("cast {id}\n"));
+    }
     out.push_str("end\n");
     out
+}
+
+/// Echoes split by whether this save can actually field them.
+///
+/// A forged raid that names someone the player has not met is NOT waste and
+/// must not be discarded: it is a raid that is not eligible YET. Generation is
+/// the expensive part — a model call on a worker thread — and eligibility is
+/// a cheap function of the campaign log, so the right shape is to keep
+/// everything and filter at the point of display. The same echo becomes
+/// flyable when the campaign catches up, at no further cost.
+///
+/// Returns (ready, held). `held` carries the reason so the console can say
+/// "waiting on someone you have not met" rather than hiding the raid.
+pub fn catalog_split(log: &crate::campaign::CampaignLog) -> (Vec<EchoRaid>, Vec<(EchoRaid, String)>) {
+    partition(catalog(), log)
+}
+
+/// The partition itself, over echoes already in hand.
+///
+/// Split out from `catalog_split` because that one reads a file, and a test
+/// against it can only exercise whatever happens to be on disk — so a
+/// regression that held NOTHING passed cleanly. This is the same
+/// headless-core/shell split the rest of the tree uses, applied after the
+/// break-check caught it.
+pub fn partition(
+    echoes: Vec<EchoRaid>,
+    log: &crate::campaign::CampaignLog,
+) -> (Vec<EchoRaid>, Vec<(EchoRaid, String)>) {
+    let mut ready = Vec::new();
+    let mut held = Vec::new();
+    for e in echoes {
+        let unmet: Vec<&str> = e
+            .cast_request
+            .iter()
+            .filter_map(|w| crate::casting::entry(w))
+            .filter(|c| crate::casting::castable(c.id, log).is_none())
+            .map(|c| c.id)
+            .collect();
+        if unmet.is_empty() {
+            ready.push(e);
+        } else {
+            let why = format!("held: {}", unmet.join(", "));
+            held.push((e, why));
+        }
+    }
+    (ready, held)
 }
 
 fn echoes_path() -> std::path::PathBuf {
@@ -319,6 +374,62 @@ pub fn forge_async(theme: String, cast: Vec<String>) -> mpsc::Receiver<Result<St
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_cast_survives_the_round_trip_to_file() {
+        // THE BUG THIS CAUGHT. `parse` read a cast line and `render` wrote
+        // none, so every echo lost its cast the moment it was saved — a model
+        // call thrown away one step after being accepted. The existing
+        // round-trip test did not notice because it predates the field, which
+        // is the general hazard with a test named "round trips": it covers
+        // what it was written against and nothing added later.
+        let text = "signal The Long Quiet\nresembles speakerman\n\
+                    phase unicron opening\nenc purge standard 0 0\n\
+                    cast billy_the_fire_clone\nend";
+        let a = super::parse(text).expect("valid");
+        let b = super::parse(&super::render(&a)).expect("re-parse");
+        assert_eq!(a.cast_request, b.cast_request, "the cast did not survive render");
+        assert_eq!(b.cast_request, vec!["billy_the_fire_clone".to_string()]);
+        // and the rest still round-trips, so the fix did not break the file
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.phases.len(), b.phases.len());
+    }
+
+    #[test]
+    fn an_ineligible_echo_is_held_rather_than_discarded() {
+        // Generation is the expensive part; eligibility is a cheap function of
+        // the campaign log. So a raid naming someone unmet is not waste, it is
+        // not-yet — and the compute is banked instead of spent again later.
+        use crate::campaign::CampaignLog;
+        let e = super::parse(
+            "signal Held\nresembles speakerman\nphase unicron a\n\
+             enc purge standard 0 0\ncast billy_the_fire_clone\nend",
+        )
+        .expect("valid");
+
+        // Exercise `partition` itself, not a re-implementation of its rule.
+        // The first version of this test checked the predicate by hand and
+        // stayed green when the partition was changed to hold nothing — the
+        // break-check caught it, and splitting the pure half out of the
+        // file-reading half is what made the real function testable.
+        let fresh = CampaignLog::from_line("");
+        let (ready, held) = super::partition(vec![e.clone()], &fresh);
+        assert!(ready.is_empty(), "a fresh save was offered an echo casting Billy");
+        assert_eq!(held.len(), 1, "the echo was discarded instead of held");
+        assert!(held[0].1.contains("billy"), "the hold does not say who: {}", held[0].1);
+
+        let met = CampaignLog::from_line("the_tide_forges");
+        let (ready, held) = super::partition(vec![e.clone()], &met);
+        assert_eq!(ready.len(), 1, "meeting Billy did not release the echo");
+        assert!(held.is_empty());
+
+        // an echo with no cast at all is always ready
+        let plain = super::parse(
+            "signal Plain\nresembles speakerman\nphase unicron a\nenc purge standard 0 0\nend",
+        )
+        .expect("valid");
+        assert_eq!(super::partition(vec![plain], &fresh).0.len(), 1, "a castless echo was held");
+    }
 
     #[test]
     fn a_cast_line_survives_parsing_and_a_bad_one_does_not_kill_the_raid() {
