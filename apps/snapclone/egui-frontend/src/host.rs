@@ -162,7 +162,13 @@ pub enum HostEvent {
     /// a question about the moment the snaps landed.
     SnapsArrived { from: Vec<String>, focused: bool },
     /// A send was acknowledged.
-    SnapDelivered(String),
+    /// A snap reached its recipient.
+    ///
+    /// Carries `now_ms` like `CameraWorked` and `PeerAddr` do, because
+    /// two outboxes need marking and one of them records WHEN delivery
+    /// happened. The variant had no timestamp while only the storage
+    /// outbox was updated, and that one does not need one.
+    SnapDelivered { id: String, now_ms: u64 },
     /// Someone asked to connect.
     ConnectionRequest { id: u64, peer: String, at: i64 },
     /// The host finished (or failed) an export it was asked to run.
@@ -347,7 +353,23 @@ impl Snapclone {
                 // when the screen should come back.
                 self.posture.notify_snap_arrived();
             }
-            HostEvent::SnapDelivered(id) => { self.outbox.mark_delivered(&id); }
+            HostEvent::SnapDelivered { id, now_ms } => {
+                // BOTH outboxes, and the two are not redundant — see the
+                // note on `Snapclone::sends`. `crate::outbox` owns a
+                // snap's lifetime in storage; `send_state::Outbox` owns
+                // what the SENDER SEES.
+                //
+                // Only the first was marked, so a row in `sends` could
+                // never reach delivered: it could only age out. That is
+                // the difference between "sent, confirmed" and "sent,
+                // gave up waiting", and the sender was always shown the
+                // second one.
+                //
+                // Found by `testonly_check`: `send_state::ack` was
+                // defined, documented, tested, and called by nothing.
+                self.outbox.mark_delivered(&id);
+                self.sends.ack(&id, now_ms);
+            }
             HostEvent::ConnectionRequest { id, peer, at } => {
                 self.inbox.connection_request(id, &peer, at)
             }

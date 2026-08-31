@@ -4712,3 +4712,48 @@ Four decisions:
     start.
 
 1432/1432.
+
+## 86. testonly_check, and the first bug it found
+
+Six absent callers in the DHT chain and `unhosted_check` saw none of
+them, because every one lived in a module that WAS reachable. The tool
+looks at modules; the pattern is finer than that.
+
+`maintenance/tools/testonly_check.py` reports a `pub fn` whose only
+references are inside `#[cfg(test)]` blocks. Test spans are
+brace-counted rather than regexed to end-of-file — taking everything
+after `#[cfg(test)]` would hide every function defined below a test
+module.
+
+Exemptions, learned from unhosted_check's three false-positive classes:
+`shared/` is skipped by default (a `pub fn` in a shared crate has
+callers elsewhere by design), and constructors and trait methods
+(`new`, `from`, `next`, `fmt`…) are skipped because they are called
+through a type rather than by name.
+
+**5 findings on snapclone-egui, not a flood** — which is the number that
+decides whether a checker gets used.
+
+**The first one hand-checked was a real bug.** `send_state::Outbox::ack`
+is defined, documented ("An ack for an unknown id is ignored rather than
+creating a row"), tested twice, and called by nothing.
+
+There are TWO outboxes and the app's own comment flags the collision:
+`crate::outbox` owns a snap's lifetime IN STORAGE, `send_state::Outbox`
+owns WHAT THE SENDER SEES. `HostEvent::SnapDelivered` marked only the
+first. So a row in `sends` could never reach delivered — it could only
+age out, and the sender was always shown "gave up waiting" instead of
+"confirmed".
+
+Fixed by marking both. `SnapDelivered` now carries `now_ms`, like
+`CameraWorked` and `PeerAddr` do: the sender-facing outbox records WHEN
+delivery happened and the storage one does not, which is why the
+variant had no timestamp before.
+
+1432/1432.
+
+- **C86a — the other four findings are unexamined**: `why`
+  (face_consent), `fit` (gaze), `dim` (posture), `seq` (voice_send).
+- **C86b — the checker has not been run on the rest of the fleet.**
+  On this evidence it is worth doing, but the false-positive rate needs
+  checking per app before any of it is acted on.
