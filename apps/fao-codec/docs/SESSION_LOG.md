@@ -4767,3 +4767,54 @@ against its own control rather than against AV1. Kept as a routed
 option rather than a default because it costs a second full encode and
 has never once won so far; the value is having the null available, not
 running it every time.
+
+### blackstar's rate floor: located, and it is NOT reducible by coarsening the plate
+
+Mapping the hull to find where the 43x gap lives. At dz128 the frame
+residual has collapsed to 7,054 B while the total is still 151,867:
+
+  dz32   plate 104,683 | mode+mv 72,810 | residual 154,964 | 35.62 dB
+  dz64   plate  92,048 | mode+mv 71,567 | residual  42,258 | 33.77 dB
+  dz128  plate  74,395 | mode+mv 70,034 | residual   7,054 | 31.84 dB
+
+So there is a ~144 KB FLOOR made of plate + side info that barely
+moves with the operating point, against an AV1 crf63 anchor at
+22,908 B. The residual coder is not the problem at low rates; the
+floor is.
+
+Attacked the plate half with a swept dead-zone ratio (the dz/8 default
+was measured on the FILM suite at dz32 and had never been re-examined;
+FAO_PLATE_DZ_DIV now exposes it):
+
+  div 8  332,841 B @ 35.619   (default)
+  div 4  322,931 B @ 35.001   -> 16.0 KB/dB
+  div 2  303,458 B @ 33.826   -> 16.4 KB/dB
+  div 1  298,558 B @ 31.371   ->  8.1 KB/dB
+against blackstar's OWN dead-zone ladder at 244 KB/dB. Every point is
+a 15-30x worse exchange, so dz/8 survives on content it was never
+tuned for — a negative that validates an inherited default rather
+than replacing it.
+
+Same mechanism as the half-res plate negative, now confirmed on the
+amplitude axis as well as the spatial one: a plate error is not
+corrected downstream, because the frame's own dead zone discards
+exactly the low-amplitude error a coarsened reference introduces.
+The plate must be near-lossless to be worth anything, therefore its
+cost is a HARD FLOOR, and neither spatial nor amplitude coarsening can
+move it. That is a structural statement about this codec, not a tuning
+gap.
+
+Consequence for where v11 can ever win: the floor is per-GOP, so it is
+amortisable by GOP LENGTH and by nothing else. Measured at 5x length:
+
+  blackstar  48f: 332,841 B total, 6,934 B/frame amortised @ 35.62 dB
+  blackstar 240f: 1,116,902 B total, 4,653 B/frame amortised @ 34.78 dB
+The plate barely grew (104,683 -> 99,761) across 5x the frames, which
+is the amortisation thesis working exactly as claimed. Per-frame cost
+fell 33%.
+But the anchor moved too: AV1 crf50 at g240 is 210,194 B @ 46.15 dB
+against v11's 1,116,902 B @ 34.78 — still 5.3x the bytes at 11 dB
+worse, because AV1's own keyframe cost amortises over the longer GOP
+as well. Amortisation is real and it is NOT differential: both coders
+get it, so it narrows the gap in absolute per-frame terms without
+changing who wins.

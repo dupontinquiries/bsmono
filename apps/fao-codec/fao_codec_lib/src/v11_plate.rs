@@ -1347,8 +1347,21 @@ pub fn encode_gop_v3_forced(
         // dz/8 sits at the knee: nearly the best exchange rate and
         // the cheapest point that still holds a quality lead over the
         // AV1 anchor (+0.25 dB).
+        // The dz/8 ratio was swept on the FILM suite at dz32 and is
+        // recorded above. blackstar shows its limit: at dz128 the frame
+        // residual collapses to 7,054 B while the plate still costs
+        // 74,395 B and side info 70,034 B — a 144 KB floor that barely
+        // moves with the operating point, against an AV1 anchor at
+        // 22,908 B. A FIXED ratio means the plate never coarsens with
+        // the frames, so at coarse dz it becomes the whole file. The
+        // divisor is now tunable so the ratio can be swept per content
+        // class instead of inherited from one film measurement.
+        let plate_dz_div: f32 = std::env::var("FAO_PLATE_DZ_DIV")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(PLATE_DZ_DIV);
         let plate_opts = ResidualOpts {
-            dead_zone: (opts.dead_zone / PLATE_DZ_DIV).max(1.0),
+            dead_zone: (opts.dead_zone / plate_dz_div).max(1.0),
             ..opts.clone()
         };
         // Half-resolution candidate: decimate 2x1 (box), code, upsample
