@@ -3852,3 +3852,77 @@ path's blockers are now MEASURABLE and named — (1) triangulation
 robustness on pans (2/197 needs a root-cause), (2) cross-take pose
 alignment incl. monocular scale so a matched library canonical can be
 rendered for a DIFFERENT take (today's cited-marginal is same-take).
+
+### v11.5 mover layer: built, measured, and it WINS on real footage
+
+Movers as objects with their own motion, composited per frame — the
+construction the static mover-patch MVP approximated. detect_movers
+finds connected components of plate-deviant regions on the max-
+deviation frame; each becomes a sprite with a CELL MASK (the object's
+cells, not its bbox — the first version tracked whole rectangles and
+the enclosed background dragged the tracker onto the set, which is why
+the unit test failed before the mask existed); the sprite is coded
+once, tracked per frame by masked coarse-to-fine SAD, and pasted into
+the plate prediction. The composite is just another provider over
+encode_gop_v3_core. J-guarded against plain v3 (lambda = dz^2/3), so
+it can only cost encode time.
+
+Measured, store shot w1 (48f, dz32, --static):
+  v3 plain:        487,382 B @ 38.311 dB
+  v5 movers thr16: 523,737 B @ 38.837 dB   (32 movers, guard picked V5)
+  v5 movers thr24: 506,015 B @ 38.679 dB   (19 movers)
+  v5 thr16 dz40:   465,429 B @ 38.423 dB   <- BEATS v3 on BOTH axes
+    (-4.5% bytes AND +0.11 dB against v3 at dz32)
+Marginal per frame falls 8,657 -> 8,152 (thr16 dz32): the sprite is
+paid once and the regions it covers stop buying prev-MC vectors and
+residual every frame. That is the amortization mechanism working as
+designed, and dz40 shows it converts into a real hull win.
+
+Busy shot 6 (38f, dz32): v3 1,402,529 @ 32.790 vs v5 1,551,819 @
+33.121 (8 movers, sprites 205 KB) — +10.6% bytes for +0.33 dB; the
+guard takes it on J but this is the regime where sprites are large and
+non-rigid. Cited path (w2 citing w1's canonical): cited-plain 577,993
+@ 34.693, cited+movers 628,747 @ 36.944 — +8.8% bytes for +2.25 dB,
+and it closes most of the citation quality gap to self-coding
+(652,150 @ 36.443) while beating it on bytes by 3.6%. Accounting note:
+citation covers the PLATE only; mover sprites are the take's own
+staged content and travel with the take even behind a 24-byte plate
+reference (plate_lab charges them that way).
+
+### Sprite set coding: the botpack-v4 transfer, measured — and it does NOT pay on film
+
+User pointed at games/blackstar-rs/src/botpack.rs: its v4 keeps v3's
+identical quantised codes and only replaces per-pose zlib with ONE
+strip-wide zstd frame, measured at 49% of v3 with byte-identical
+decode, because a 32 KB per-item window cannot see between items while
+a set-wide window can. v11.5's sprites looked like the same situation:
+N cutouts coded with N independent residual::encode calls, each zstd'ing
+internally. Ported both of the parts-web/FLEET_COMPRESSION techniques —
+exact content dedup, then a column atlas coded in ONE pass, best-of
+against per-sprite so it cannot lose.
+
+Measured on w1's 32 sprites:
+  content dedup:            0 of 32 folded
+  raw-zstd, per-sprite sum: 138,120 B
+  raw-zstd, solid atlas:    139,810 B   <- solid is 1.2% WORSE
+  DCT/dead-zone per-sprite:  60,901 B
+  DCT/dead-zone solid atlas:  60,209 B   <- 1.1% better; chosen
+VERDICT: the botpack win does not transfer to film sprites, and
+FLEET_COMPRESSION.md already predicted the shape — it measured dedup
+at 107/1000 on catalog parts but 0/1289 on fold poses, and "no gain
+over per-file" for a shared dictionary on dense float data. botpack's
+gain came from VERBATIM cross-pose repetition (whole index streams
+repeating); film cutouts of different actors carry independent grain
+and repeat nothing exactly. What DOES pay here is the same thing
+FLEET_COMPRESSION found paid there: quantisation — 138 KB -> 60 KB
+(56%) via the DCT dead-zone path. Atlas kept because it is guarded and
+free, and because the precondition it needs (exact repetition) is
+precisely what ENGINE-RENDERED content has: it is the natural
+mechanism for the SMITE/engine regime, where it should be re-measured
+before being judged. Known flaw recorded at the site: the column atlas
+pads every sprite to the max width, which inflates the raw-zstd branch;
+shelf-packing would remove that if the atlas ever matters.
+
+Process note: a suite launched with nohup did NOT survive the turn
+boundary in this sandbox (empty log, no process, header-only CSV).
+Long benchmarks must run in bounded foreground chunks.

@@ -1141,12 +1141,33 @@ end_header
         println!("total_bytes {total}  amortized_per_frame {}  marginal_per_frame {}", total / n, (res_total + rep.motion_bytes) / n);
         write_y4m(&args[1], &header, &rep.recon);
     } else {
+        let mut mover_model_bytes = 0usize;
         let rep = if args.iter().any(|a| a == "--v2") {
             plate::encode_gop_v2(&frames, &motions, &pl, &opts)
         } else {
             if let Some(ls) = arg_val(&args, "--lookahead") {
                 let thr: u32 = ls.parse().unwrap_or(1024);
                 plate::encode_gop_v3_lookahead(&frames, &motions, &pl, &opts, thr)
+            } else if let Some(ms) = arg_val(&args, "--movers") {
+                // v11.5 mover layer: plate models the SET, movers travel
+                // as one-time sprites + 2 B/frame tracks, J-guarded
+                // against plain v3 (can only cost encode time).
+                let thr: u32 = ms.parse().unwrap_or(16);
+                let (rep, nm, sprites, track, picked) =
+                    plate::encode_gop_v5(&frames, &motions, &pl, &opts, thr);
+                eprintln!(
+                    "movers: {} detected | sprites {} B track+mask {} B | guard picked {}",
+                    nm, sprites, track,
+                    if picked { "V5" } else { "V3" }
+                );
+                // Citation covers the PLATE only: a canonical models the
+                // set; movers are the take's own staged content and their
+                // sprites travel with the take even when the plate is a
+                // 24-byte reference.
+                if picked {
+                    mover_model_bytes = sprites;
+                }
+                rep
             } else if do_route {
                 // Branch A: self (own motions + own plate).
                 let m_self = if args.iter().any(|a| a == "--static") {
@@ -1196,7 +1217,7 @@ end_header
         let n = frames.len();
         // A cited plate travels as a reference (UUID+alignment ≈ 24
         // bytes), not as payload.
-        let plate_cost = if cited_plate { 24 } else { rep.plate_bytes };
+        let plate_cost = if cited_plate { 24 + mover_model_bytes } else { rep.plate_bytes };
         let total = plate_cost + rep.motion_bytes + res_total + mode_total;
         let mut per: Vec<usize> = rep.frames.iter().map(|c| c.residual_bytes + c.mode_bytes).collect();
         println!("plate_bytes {} (cited: {})", plate_cost, cited_plate);

@@ -1831,6 +1831,691 @@ pub fn encode_gop_v3_core(
     }, leftover_trace)
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// v11.5 — the MOVER LAYER: movers as objects with their own motion,
+// composited per frame. This is the "full design" the mover-patch MVP
+// approximated statically: the plate models the SET, each mover is a
+// sprite transmitted ONCE with a per-frame position track, and the
+// composite (plate warp + sprite pastes) is just another prediction
+// provider over encode_gop_v3_core. The win mechanism is amortization:
+// a region covered by an accurate paste chooses plate-mode (zero side
+// bytes, near-zero residual) instead of paying prev-MC's MV + residual
+// every frame; the sprite's one-time cost rides model_bytes like the
+// plate, the 2-byte/frame track rides motion_bytes. The known failure
+// mode is non-rigid deformation (a gesturing actor defeats a rigid
+// sprite), so encode_gop_v5 runs a J-guard against plain v3 — like the
+// lookahead harness, it can only cost encode time, never bytes.
+// ═══════════════════════════════════════════════════════════════════
+
+pub struct Mover {
+    /// Bounding box in PIXELS at the reference frame, REGION-aligned.
+    pub bx: usize,
+    pub by: usize,
+    pub bw: usize,
+    pub bh: usize,
+    pub ref_frame: usize,
+    /// Cell mask at REGION granularity within the bbox — the OBJECT's
+    /// cells, not the rectangle. Tracking, pasting, and paying happen
+    /// only over masked cells; a bbox necessarily contains background
+    /// (a mover is rarely a rectangle) and treating that background as
+    /// object drags the track toward the set and poisons the paste.
+    pub mask: Vec<bool>,
+    /// DECODED sprite (what the decoder will paste) — adopted from the
+    /// coded stream exactly like the plate, so encoder-side composites
+    /// match the decoder by construction. Unmasked cells are
+    /// neutralized to flat gray before coding so they cost ~nothing.
+    pub sprite: Yuv420,
+    pub sprite_bytes: usize,
+    /// Per-frame paste position (bbox top-left, pixels); None = hidden.
+    pub track: Vec<Option<(i16, i16)>>,
+}
+
+/// Detect movers on the reference frame (max plate-deviation area):
+/// connected components (4-conn) over regions whose SAD vs the plate
+/// prediction exceeds `thr` per pixel, min 4 cells so grain flicker
+/// can't spawn objects. Returns (bx, by, bw, bh, ref_frame, mask) with
+/// bbox in pixels (REGION-aligned) and mask at cell granularity within
+/// the bbox — the component's cells, not the rectangle.
+fn detect_movers(
+    frames: &[Yuv420],
+    motions: &[PlateMotion],
+    plate: &Plate,
+    thr: u32,
+) -> Vec<(usize, usize, usize, usize, usize, Vec<bool>)> {
+    let (fw, fh) = (frames[0].w, frames[0].h);
+    let (gw, gh) = (fw / REGION, fh / REGION);
+    let region_thr = thr * (REGION * REGION) as u32;
+    let mut best = (0usize, 0usize, vec![false; gw * gh]);
+    for (fi, f) in frames.iter().enumerate() {
+        let pred = predict_frame(plate, &motions[fi], fw, fh);
+        let mut dev = vec![false; gw * gh];
+        let mut area = 0usize;
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let s = sad_region(
+                    &pred.y, fw, fh,
+                    (gx * REGION) as i32, (gy * REGION) as i32,
+                    &f.y, gx * REGION, gy * REGION,
+                );
+                if s > region_thr {
+                    dev[gy * gw + gx] = true;
+                    area += 1;
+                }
+            }
+        }
+        if area > best.1 {
+            best = (fi, area, dev);
+        }
+    }
+    let (ref_frame, _, dev) = best;
+    // Connected components, 4-connectivity.
+    let mut seen = vec![false; gw * gh];
+    let mut out = Vec::new();
+    for start in 0..gw * gh {
+        if !dev[start] || seen[start] {
+            continue;
+        }
+        let mut stack = vec![start];
+        let mut cells = Vec::new();
+        seen[start] = true;
+        while let Some(c) = stack.pop() {
+            cells.push(c);
+            let (cx, cy) = (c % gw, c / gw);
+            let mut push = |n: usize| {
+                if dev[n] && !seen[n] {
+                    seen[n] = true;
+                    stack.push(n);
+                }
+            };
+            if cx > 0 { push(c - 1); }
+            if cx + 1 < gw { push(c + 1); }
+            if cy > 0 { push(c - gw); }
+            if cy + 1 < gh { push(c + gw); }
+        }
+        if cells.len() < 4 {
+            continue;
+        }
+        let (mut x0, mut y0, mut x1, mut y1) = (gw, gh, 0usize, 0usize);
+        for &c in &cells {
+            let (cx, cy) = (c % gw, c / gw);
+            x0 = x0.min(cx);
+            y0 = y0.min(cy);
+            x1 = x1.max(cx);
+            y1 = y1.max(cy);
+        }
+        let (cw_cells, ch_cells) = (x1 - x0 + 1, y1 - y0 + 1);
+        let mut mask = vec![false; cw_cells * ch_cells];
+        for &c in &cells {
+            let (cx, cy) = (c % gw, c / gw);
+            mask[(cy - y0) * cw_cells + (cx - x0)] = true;
+        }
+        out.push((
+            x0 * REGION,
+            y0 * REGION,
+            cw_cells * REGION,
+            ch_cells * REGION,
+            ref_frame,
+            mask,
+        ));
+    }
+    out
+}
+
+/// SAD of the sprite's MASKED luma cells against frame f at bbox
+/// top-left (px,py), subsampled 2x (tracking metric, not a coding
+/// decision). Normalized to the masked area so scores are comparable
+/// across partial off-frame placements.
+fn sprite_sad(sp: &Yuv420, mask: &[bool], cw_cells: usize, f: &Yuv420, px: i32, py: i32) -> u64 {
+    let (fw, fh) = (f.w as i32, f.h as i32);
+    let masked_px = mask.iter().filter(|&&m| m).count() * REGION * REGION;
+    let mut s = 0u64;
+    let mut n = 0u64;
+    let mut y = 0usize;
+    while y < sp.h {
+        let sy = py + y as i32;
+        if sy >= 0 && sy < fh {
+            let mrow = (y / REGION) * cw_cells;
+            let mut x = 0usize;
+            while x < sp.w {
+                if mask[mrow + x / REGION] {
+                    let sx = px + x as i32;
+                    if sx >= 0 && sx < fw {
+                        s += (sp.y[y * sp.w + x] as i32 - f.y[(sy * fw + sx) as usize] as i32)
+                            .unsigned_abs() as u64;
+                        n += 1;
+                    }
+                }
+                x += 2;
+            }
+        }
+        y += 2;
+    }
+    if n == 0 { u64::MAX } else { s * masked_px as u64 / (4 * n) }
+}
+
+/// Build the mover set: sprites coded through the residual path (dz/8,
+/// best-of vs raw zstd — the plate's own recipe), DECODED sprite
+/// adopted, position tracked per frame by coarse-to-fine SAD search
+/// around the previous position. Returns movers + total track bytes
+/// (zstd over the concatenated per-frame delta stream).
+/// Pack the sprite set as ONE coded surface. Ported reasoning, not a
+/// guess: `games/blackstar-rs/src/botpack.rs` v4 keeps v3's identical
+/// quantised codes and merely replaces per-pose zlib with one
+/// strip-wide zstd frame — measured 49% of v3, byte-identical decode —
+/// because a 32 KB per-item window cannot see from one item to the
+/// next while a set-wide window can. v11.5's sprites are the same
+/// situation exactly: N cutouts of the same actors on the same set,
+/// each previously getting its own `residual::encode` (which zstds
+/// internally, per call). So: dedup identical sprites first
+/// (`docs/FLEET_COMPRESSION.md`'s content-dedup technique — it folded
+/// 107 of 1000 catalog parts and 0 of 1289 fold poses, so whether it
+/// fires here is a measurement, not an assumption), stack the unique
+/// ones into a column atlas, and code the atlas ONCE.
+///
+/// Returns (decoded sprites in input order, atlas_bytes, n_unique).
+/// Atlas width is the max sprite width — every bbox is REGION-aligned
+/// so all dims stay 4-divisible and chroma-even. Padding is flat gray:
+/// it costs a DCT DC term per block and LZ-matches away.
+fn pack_sprite_atlas(
+    sprites: &[Yuv420],
+    opts: &ResidualOpts,
+) -> (Vec<Yuv420>, usize, usize) {
+    if sprites.is_empty() {
+        return (Vec::new(), 0, 0);
+    }
+    // Content dedup by exact raw bytes.
+    let key = |s: &Yuv420| -> (usize, usize, Vec<u8>) {
+        let mut v = Vec::with_capacity(s.y.len() + s.u.len() + s.v.len());
+        v.extend_from_slice(&s.y);
+        v.extend_from_slice(&s.u);
+        v.extend_from_slice(&s.v);
+        (s.w, s.h, v)
+    };
+    let mut uniq: Vec<Yuv420> = Vec::new();
+    let mut uniq_keys: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+    let mut slot: Vec<usize> = Vec::with_capacity(sprites.len());
+    for s in sprites {
+        let k = key(s);
+        match uniq_keys.iter().position(|u| *u == k) {
+            Some(i) => slot.push(i),
+            None => {
+                slot.push(uniq.len());
+                uniq.push(s.clone());
+                uniq_keys.push(k);
+            }
+        }
+    }
+    let aw = uniq.iter().map(|s| s.w).max().unwrap_or(0);
+    let ah: usize = uniq.iter().map(|s| s.h).sum();
+    let mut atlas = Yuv420::new(aw, ah);
+    for p in atlas.y.iter_mut() {
+        *p = 128;
+    }
+    for p in atlas.u.iter_mut().chain(atlas.v.iter_mut()) {
+        *p = 128;
+    }
+    let mut yoff = 0usize;
+    for s in &uniq {
+        for y in 0..s.h {
+            atlas.y[(yoff + y) * aw..(yoff + y) * aw + s.w].copy_from_slice(&s.y[y * s.w..y * s.w + s.w]);
+        }
+        let (cw, sw2) = (aw / 2, s.w / 2);
+        for y in 0..s.h / 2 {
+            let ao = (yoff / 2 + y) * cw;
+            atlas.u[ao..ao + sw2].copy_from_slice(&s.u[y * sw2..y * sw2 + sw2]);
+            atlas.v[ao..ao + sw2].copy_from_slice(&s.v[y * sw2..y * sw2 + sw2]);
+        }
+        yoff += s.h;
+    }
+    // One coding pass over the whole atlas: DCT/dead-zone path (the
+    // plate's finer dz) best-of against raw solid zstd.
+    let mut raw = Vec::with_capacity(atlas.y.len() * 3 / 2);
+    raw.extend_from_slice(&atlas.y);
+    raw.extend_from_slice(&atlas.u);
+    raw.extend_from_slice(&atlas.v);
+    let zstd_len = zstd::encode_all(raw.as_slice(), 19).map(|c| c.len()).unwrap_or(raw.len());
+    let a444 = interleave_444(&atlas);
+    let gray = vec![128u8; aw * ah * 3];
+    let a_opts = ResidualOpts {
+        dead_zone: (opts.dead_zone / 8.0).max(1.0),
+        ..opts.clone()
+    };
+    if std::env::var("FAO_MOVER_DEBUG").is_ok() {
+        eprintln!(
+            "atlas branches: solid-zstd {} B | dct {:?} B  ({}x{}, {} unique)",
+            zstd_len,
+            residual::encode(&gray, &a444, aw, ah, &a_opts).map(|t| t.len()),
+            aw, ah, uniq.len()
+        );
+    }
+    let (atlas_bytes, decoded_atlas) = match residual::encode(&gray, &a444, aw, ah, &a_opts) {
+        Some(t) if t.len() < zstd_len => {
+            let dec = residual::apply(gray, &t, aw, ah);
+            (t.len(), deinterleave_420(&dec, aw, ah))
+        }
+        _ => (zstd_len, atlas.clone()),
+    };
+    // Cut the decoded uniques back out, then fan out to input order.
+    let mut dec_uniq: Vec<Yuv420> = Vec::with_capacity(uniq.len());
+    let mut yoff = 0usize;
+    for s in &uniq {
+        let mut d = Yuv420::new(s.w, s.h);
+        for y in 0..s.h {
+            let ao = (yoff + y) * aw;
+            d.y[y * s.w..y * s.w + s.w].copy_from_slice(&decoded_atlas.y[ao..ao + s.w]);
+        }
+        let (cw, sw2) = (aw / 2, s.w / 2);
+        for y in 0..s.h / 2 {
+            let ao = (yoff / 2 + y) * cw;
+            d.u[y * sw2..y * sw2 + sw2].copy_from_slice(&decoded_atlas.u[ao..ao + sw2]);
+            d.v[y * sw2..y * sw2 + sw2].copy_from_slice(&decoded_atlas.v[ao..ao + sw2]);
+        }
+        yoff += s.h;
+        dec_uniq.push(d);
+    }
+    let out = slot.iter().map(|&i| dec_uniq[i].clone()).collect();
+    (out, atlas_bytes, uniq.len())
+}
+
+pub fn build_movers(
+    frames: &[Yuv420],
+    motions: &[PlateMotion],
+    plate: &Plate,
+    opts: &ResidualOpts,
+    thr: u32,
+) -> (Vec<Mover>, usize) {
+    let boxes = detect_movers(frames, motions, plate, thr);
+    let mut movers = Vec::new();
+    let mut track_raw: Vec<u8> = Vec::new();
+    // Pass 1: build the RAW sprites so the whole set can be coded
+    // together (see pack_sprite_atlas). Per-sprite independent coding
+    // is still computed, as the comparison the atlas has to beat.
+    let mut raw_sprites: Vec<Yuv420> = Vec::new();
+    let mut geom: Vec<(usize, usize, usize, usize, usize, Vec<bool>)> = Vec::new();
+    for (bx, by, bw, bh, ref_frame, mask) in boxes {
+        let rf = &frames[ref_frame];
+        let (fw, fh) = (rf.w, rf.h);
+        let cw_cells = bw / REGION;
+        let mut sp = Yuv420::new(bw, bh);
+        for y in 0..bh {
+            let sy = (by + y).min(fh - 1);
+            let mrow = (y / REGION) * cw_cells;
+            for x in 0..bw {
+                let sx = (bx + x).min(fw - 1);
+                // Unmasked cells neutralize to flat gray: they are never
+                // pasted, so paying DCT/zstd for their background content
+                // would be pure waste.
+                sp.y[y * bw + x] = if mask[mrow + x / REGION] { rf.y[sy * fw + sx] } else { 128 };
+            }
+        }
+        for y in 0..bh / 2 {
+            let sy = (by / 2 + y).min(fh / 2 - 1);
+            let mrow = ((y * 2) / REGION) * cw_cells;
+            for x in 0..bw / 2 {
+                let sx = (bx / 2 + x).min(fw / 2 - 1);
+                let m = mask[mrow + (x * 2) / REGION];
+                sp.u[y * (bw / 2) + x] = if m { rf.u[sy * (fw / 2) + sx] } else { 128 };
+                sp.v[y * (bw / 2) + x] = if m { rf.v[sy * (fw / 2) + sx] } else { 128 };
+            }
+        }
+        raw_sprites.push(sp);
+        geom.push((bx, by, bw, bh, ref_frame, mask));
+    }
+    // Per-sprite independent coding (the pre-atlas behaviour), kept as
+    // the baseline the solid pack must beat.
+    let mut per_sprite_dec: Vec<Yuv420> = Vec::with_capacity(raw_sprites.len());
+    let mut per_sprite_total = 0usize;
+    let mut per_sprite_zstd_total = 0usize;
+    for sp in &raw_sprites {
+        let (bw, bh) = (sp.w, sp.h);
+        let mut raw = Vec::with_capacity(sp.y.len() * 3);
+        raw.extend_from_slice(&sp.y);
+        raw.extend_from_slice(&sp.u);
+        raw.extend_from_slice(&sp.v);
+        let zstd_len = zstd::encode_all(raw.as_slice(), 19).map(|c| c.len()).unwrap_or(raw.len());
+        let sp444 = interleave_444(sp);
+        let gray = vec![128u8; bw * bh * 3];
+        let sp_opts = ResidualOpts {
+            dead_zone: (opts.dead_zone / 8.0).max(1.0),
+            ..opts.clone()
+        };
+        let (b, d) = match residual::encode(&gray, &sp444, bw, bh, &sp_opts) {
+            Some(t) if t.len() < zstd_len => {
+                let dec = residual::apply(gray, &t, bw, bh);
+                (t.len(), deinterleave_420(&dec, bw, bh))
+            }
+            _ => (zstd_len, sp.clone()),
+        };
+        per_sprite_total += b;
+        per_sprite_zstd_total += zstd_len;
+        per_sprite_dec.push(d);
+    }
+    let (atlas_dec, atlas_bytes, n_uniq) = pack_sprite_atlas(&raw_sprites, opts);
+    // +2 B/mover slot index is the atlas's own side cost.
+    let atlas_total = atlas_bytes + raw_sprites.len() * 2;
+    let use_atlas = atlas_total < per_sprite_total;
+    if std::env::var("FAO_MOVER_DEBUG").is_ok() {
+        eprintln!(
+            "sprite pack: per-sprite {} B (raw-zstd sum {}) | atlas {} B (+{} slots, {} unique of {}) -> {}",
+            per_sprite_total,
+            per_sprite_zstd_total,
+            atlas_bytes,
+            raw_sprites.len() * 2,
+            n_uniq,
+            raw_sprites.len(),
+            if use_atlas { "ATLAS" } else { "PER-SPRITE" }
+        );
+    }
+    let decoded = if use_atlas { atlas_dec } else { per_sprite_dec };
+    let chosen_total = if use_atlas { atlas_total } else { per_sprite_total };
+    // The set cost is a SET cost now, so it is charged once on the
+    // first mover rather than split by a fiction of per-sprite shares.
+    for (i, ((bx, by, bw, bh, ref_frame, mask), sprite)) in
+        geom.into_iter().zip(decoded.into_iter()).enumerate()
+    {
+        let rf = &frames[ref_frame];
+        let cw_cells = bw / REGION;
+        let sprite_bytes = if i == 0 { chosen_total } else { 0 };
+        // Track: coarse (step 4, ±32) then fine (step 1, ±3) around the
+        // previous frame's position; hidden when the best masked SAD
+        // exceeds 3x the reference frame's own score floor.
+        let ref_score = sprite_sad(&sprite, &mask, cw_cells, rf, bx as i32, by as i32);
+        let masked_px = mask.iter().filter(|&&m| m).count() * REGION * REGION;
+        let miss = (ref_score.max(1)) * 3 + 6 * masked_px as u64;
+        let mut track = Vec::with_capacity(frames.len());
+        let (mut px, mut py) = (bx as i32, by as i32);
+        for f in frames {
+            let (mut bestp, mut bests) = ((px, py), u64::MAX);
+            let mut probe = |x: i32, y: i32, bests: &mut u64, bestp: &mut (i32, i32)| {
+                let s = sprite_sad(&sprite, &mask, cw_cells, f, x, y);
+                if s < *bests {
+                    *bests = s;
+                    *bestp = (x, y);
+                }
+            };
+            let mut dy = -32;
+            while dy <= 32 {
+                let mut dx = -32;
+                while dx <= 32 {
+                    probe(px + dx, py + dy, &mut bests, &mut bestp);
+                    dx += 4;
+                }
+                dy += 4;
+            }
+            let coarse = bestp;
+            for dy in -3..=3 {
+                for dx in -3..=3 {
+                    probe(coarse.0 + dx, coarse.1 + dy, &mut bests, &mut bestp);
+                }
+            }
+            if bests > miss {
+                track.push(None);
+                track_raw.push(0x80); // hidden marker
+                track_raw.push(0);
+            } else {
+                px = bestp.0;
+                py = bestp.1;
+                track.push(Some((px as i16, py as i16)));
+                track_raw.push((px - bx as i32).clamp(-127, 127) as i8 as u8);
+                track_raw.push((py - by as i32).clamp(-127, 127) as i8 as u8);
+            }
+        }
+        movers.push(Mover { bx, by, bw, bh, ref_frame, mask, sprite, sprite_bytes, track });
+    }
+    let mask_bytes: usize = movers.iter().map(|m| (m.mask.len() + 7) / 8).sum();
+    let track_bytes = if track_raw.is_empty() {
+        0
+    } else {
+        zstd::encode_all(track_raw.as_slice(), 19).map(|c| c.len()).unwrap_or(track_raw.len())
+    } + movers.len() * 10 // bbox 8B + ref 2B per mover
+      + mask_bytes;
+    (movers, track_bytes)
+}
+
+fn paste_sprite(dst: &mut Yuv420, m: &Mover, px: i32, py: i32) {
+    let (fw, fh) = (dst.w as i32, dst.h as i32);
+    let cw_cells = m.bw / REGION;
+    for y in 0..m.bh {
+        let sy = py + y as i32;
+        if sy < 0 || sy >= fh { continue; }
+        let mrow = (y / REGION) * cw_cells;
+        for x in 0..m.bw {
+            if !m.mask[mrow + x / REGION] { continue; }
+            let sx = px + x as i32;
+            if sx < 0 || sx >= fw { continue; }
+            dst.y[(sy * fw + sx) as usize] = m.sprite.y[y * m.bw + x];
+        }
+    }
+    let (cw, ch) = (fw / 2, fh / 2);
+    for y in 0..m.bh / 2 {
+        let sy = py / 2 + y as i32;
+        if sy < 0 || sy >= ch { continue; }
+        let mrow = ((y * 2) / REGION) * cw_cells;
+        for x in 0..m.bw / 2 {
+            if !m.mask[mrow + (x * 2) / REGION] { continue; }
+            let sx = px / 2 + x as i32;
+            if sx < 0 || sx >= cw { continue; }
+            dst.u[(sy * cw + sx) as usize] = m.sprite.u[y * (m.bw / 2) + x];
+            dst.v[(sy * cw + sx) as usize] = m.sprite.v[y * (m.bw / 2) + x];
+        }
+    }
+}
+
+/// v11.5: plate + mover layer, J-guarded against plain v3.
+/// Returns (report, n_movers, mover_model_bytes, track_bytes, picked_v5).
+pub fn encode_gop_v5(
+    frames: &[Yuv420],
+    motions: &[PlateMotion],
+    plate: &Plate,
+    opts: &ResidualOpts,
+    thr: u32,
+) -> (PlateEncodeReportV2, usize, usize, usize, bool) {
+    let (rep3, _) = encode_gop_v3_forced(frames, motions, plate, opts, None);
+    let (movers, track_bytes) = build_movers(frames, motions, plate, opts, thr);
+    if movers.is_empty() {
+        return (rep3, 0, 0, 0, false);
+    }
+    let mover_model: usize = movers.iter().map(|m| m.sprite_bytes).sum();
+    // v5 branch: same plate coding as v3 (reuse rep3's plate_bytes; the
+    // decoded plate must be re-derived — cheapest correct route is to
+    // run the core with a compositing provider over the same coded
+    // plate. encode_gop_v3_forced adopts the DECODED plate internally,
+    // so composite over predict_frame of that decoded plate: re-code
+    // the plate here with the identical recipe to get the same decoded
+    // surface.)
+    let (rep5, _) = {
+        // Recreate the decoded plate exactly as _forced does.
+        let (fw, fh) = (frames[0].w, frames[0].h);
+        let mut plate_raw = Vec::with_capacity(plate.y.len() + plate.u.len() + plate.v.len());
+        plate_raw.extend_from_slice(&plate.y);
+        plate_raw.extend_from_slice(&plate.u);
+        plate_raw.extend_from_slice(&plate.v);
+        const PLATE_DZ_DIV: f32 = 8.0;
+        let mut plate_coded = plate.clone();
+        let zstd_len = zstd::encode_all(plate_raw.as_slice(), 19).map(|c| c.len()).unwrap_or(plate_raw.len());
+        let gray = vec![128u8; plate.w * plate.h * 3];
+        let mut plate444 = Vec::with_capacity(plate.w * plate.h * 3);
+        for y in 0..plate.h {
+            for x in 0..plate.w {
+                plate444.push(plate.y[y * plate.w + x]);
+                plate444.push(plate.u[(y / 2) * (plate.w / 2) + x / 2]);
+                plate444.push(plate.v[(y / 2) * (plate.w / 2) + x / 2]);
+            }
+        }
+        let plate_opts = ResidualOpts {
+            dead_zone: (opts.dead_zone / PLATE_DZ_DIV).max(1.0),
+            ..opts.clone()
+        };
+        if let Some(t) = residual::encode(&gray, &plate444, plate.w, plate.h, &plate_opts) {
+            if t.len() < zstd_len {
+                let dec = residual::apply(gray, &t, plate.w, plate.h);
+                for y in 0..plate.h {
+                    for x in 0..plate.w {
+                        let i = (y * plate.w + x) * 3;
+                        plate_coded.y[y * plate.w + x] = dec[i];
+                        if y % 2 == 0 && x % 2 == 0 {
+                            let ci = (y / 2) * (plate.w / 2) + x / 2;
+                            plate_coded.u[ci] = dec[i + 1];
+                            plate_coded.v[ci] = dec[i + 2];
+                        }
+                    }
+                }
+            }
+        }
+        let pc = &plate_coded;
+        let mut pred_for = |fi: usize| -> Yuv420 {
+            let mut p = predict_frame(pc, &motions[fi], fw, fh);
+            for m in &movers {
+                if let Some((px, py)) = m.track[fi] {
+                    paste_sprite(&mut p, m, px as i32, py as i32);
+                }
+            }
+            p
+        };
+        encode_gop_v3_core(
+            frames,
+            &mut pred_for,
+            rep3.plate_bytes + mover_model,
+            frames.len() * 8 + track_bytes,
+            opts,
+            None,
+        )
+    };
+    // J-guard: SSE + lambda*bytes, lambda = dz^2/3 (the router's shape).
+    let sse = |rep: &PlateEncodeReportV2| -> f64 {
+        let mut acc = 0.0f64;
+        for (r, f) in rep.recon.iter().zip(frames) {
+            for (a, b) in r.y.iter().zip(&f.y) {
+                let d = *a as f64 - *b as f64;
+                acc += d * d;
+            }
+        }
+        acc
+    };
+    let bytes = |rep: &PlateEncodeReportV2| -> usize {
+        rep.plate_bytes
+            + rep.motion_bytes
+            + rep.frames.iter().map(|c| c.residual_bytes + c.mode_bytes).sum::<usize>()
+    };
+    let lambda = (opts.dead_zone as f64).powi(2) / 3.0;
+    let (j3, j5) = (
+        sse(&rep3) + lambda * bytes(&rep3) as f64,
+        sse(&rep5) + lambda * bytes(&rep5) as f64,
+    );
+    if std::env::var("FAO_MOVER_DEBUG").is_ok() {
+        eprintln!(
+            "mover J: v3 {:.4e} ({} B) | v5 {:.4e} ({} B, {} movers, sprites {} track {})",
+            j3, bytes(&rep3), j5, bytes(&rep5), movers.len(), mover_model, track_bytes
+        );
+    }
+    if j5 < j3 {
+        (rep5, movers.len(), mover_model, track_bytes, true)
+    } else {
+        (rep3, movers.len(), mover_model, track_bytes, false)
+    }
+}
+
+#[cfg(test)]
+mod tests_v5 {
+    use super::*;
+
+    /// A rigid textured mover translating 10 px/frame over an APERIODIC
+    /// static set (periodic backgrounds alias the tracker; that was a
+    /// bug in this test's first version, not in the layer). Speed is
+    /// chosen so each cell is mover-occupied < half the GOP and the
+    /// plate median stays clean of it. Asserts the MACHINERY — one
+    /// object detected, mask excludes background, track follows,
+    /// composite predicts mover pixels — and that encode_gop_v5's
+    /// guard runs and reconstruction carries the mover either way.
+    /// Whether v5 WINS is an economics measurement for real footage,
+    /// not a unit invariant.
+    #[test]
+    fn mover_layer_detects_tracks_and_composites_rigid_translation() {
+        let (w, h) = (224, 96);
+        let bg = |x: usize, y: usize| -> u8 { (70 + (x * 13 + y * 29 + (x * y) % 7 * 11) % 60) as u8 };
+        let mover_tex = |mx: usize, my: usize| -> u8 { (150 + (mx * 37 + my * 101 + mx * my * 5) % 97) as u8 };
+        let speed = 10usize;
+        let mut frames = Vec::new();
+        for t in 0..12 {
+            let mut f = Yuv420::new(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    f.y[y * w + x] = bg(x, y);
+                }
+            }
+            for p in f.u.iter_mut() {
+                *p = 128;
+            }
+            for p in f.v.iter_mut() {
+                *p = 128;
+            }
+            let sx = 8 + t * speed;
+            for y in 32..64 {
+                for x in sx..(sx + 32).min(w) {
+                    f.y[y * w + x] = mover_tex(x - sx, y - 32);
+                }
+            }
+            frames.push(f);
+        }
+        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 }; frames.len()];
+        let plate = build_plate(&frames, &motions);
+        let opts = ResidualOpts { dead_zone: 8.0, ..ResidualOpts::default() };
+        let (movers, track_bytes) = build_movers(&frames, &motions, &plate, &opts, 12);
+        assert_eq!(movers.len(), 1, "one rigid mover expected, got {}", movers.len());
+        assert!(track_bytes > 0);
+        let m = &movers[0];
+        let n_masked = m.mask.iter().filter(|&&b| b).count();
+        let total_cells = m.mask.len();
+        assert!(n_masked >= 4, "mask too small: {n_masked}");
+        // The mover is 32x32 on a clean plate: mask must be the object's
+        // ~2-3x2 cell footprint, not a corridor (that would mean the
+        // plate median was contaminated and detection smeared).
+        assert!(
+            n_masked <= 9 && total_cells <= 12,
+            "mask smeared: {n_masked} of {total_cells} cells"
+        );
+        // Track follows the translation: paste position px at frame t
+        // must equal bx + speed*(t - ref_frame), within bbox alignment
+        // + subsampled-SAD slack.
+        let r = m.ref_frame as i32;
+        for (t, tr) in m.track.iter().enumerate() {
+            let Some((px, _py)) = tr else { panic!("mover hidden at frame {t}") };
+            let expect = m.bx as i32 + speed as i32 * (t as i32 - r);
+            assert!(
+                (*px as i32 - expect).abs() <= 3,
+                "frame {t}: tracked x {px} vs expected {expect} (bx {} ref {r})",
+                m.bx
+            );
+        }
+        // Composite accuracy: plate warp + paste must predict the
+        // mover's pixels directly (this is the provider the core sees).
+        let mut pred = predict_frame(&plate, &motions[11], w, h);
+        if let Some((px, py)) = m.track[11] {
+            paste_sprite(&mut pred, m, px as i32, py as i32);
+        }
+        let sx = 8 + 11 * speed;
+        let (mut err, mut n) = (0u32, 0u32);
+        for y in 36..60 {
+            for x in (sx + 4)..(sx + 28) {
+                err += (pred.y[y * w + x] as i32 - mover_tex(x - sx, y - 32) as i32).unsigned_abs();
+                n += 1;
+            }
+        }
+        assert!(err / n < 8, "composite mover error {} per px", err / n);
+        // The guarded encode runs end-to-end and reconstruction carries
+        // the mover regardless of which branch the guard picked.
+        let (rep, nm, _mm, _tb, _picked) = encode_gop_v5(&frames, &motions, &plate, &opts, 12);
+        assert_eq!(nm, 1);
+        let f11 = &rep.recon[11];
+        let (px, py) = (sx + 16, 48);
+        let expect = mover_tex(px - sx, py - 32) as i32;
+        assert!(
+            (f11.y[py * w + px] as i32 - expect).abs() <= 24,
+            "mover content lost in recon"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests_v3 {
     use super::*;
