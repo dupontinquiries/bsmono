@@ -69,6 +69,7 @@ pub mod camera_select;
 pub mod camera_enumerate;
 pub mod chevron_confirm;
 pub mod dht_bootstrap;
+pub mod dht_presence;
 pub mod face_consent;
 pub mod frame_pump;
 pub mod firewall_backend;
@@ -201,6 +202,9 @@ pub struct Snapclone {
     /// A bind failure is permanent for this run, so it is reported once
     /// rather than every tick.
     pub dht_failed: bool,
+    /// When to publish and who to look up. Pure policy, so the cadence is
+    /// testable without a socket — see `dht_presence`.
+    pub dht_schedule: crate::dht_presence::Schedule,
     /// The accessibility scene the settings toggles register with.
     /// Held here rather than in the page so focus survives between
     /// frames — a page-local scene forgets on every repaint, which
@@ -617,6 +621,7 @@ impl Snapclone {
             // blank every launch is the same lie as one that never saved.
             settings: crate::settings_page::SettingsPage::new(crate::settings_store::load()),
             dht: None, dht_failed: false,
+            dht_schedule: Default::default(),
             a11y: uikit_egui::a11y::A11yScene::new(),
             pending_vcard_text: None,
             import_report: None,
@@ -1270,13 +1275,66 @@ impl Snapclone {
                 }
             }
         }
+        // WHAT THE NODE IS FOR. `publish` and `resolve` had no caller
+        // anywhere in the tree, so this node maintained a routing table on
+        // the network's behalf and asked it nothing — every peer this app
+        // has ever found came from LAN gossip. The scheduler decides the
+        // cadence (`dht_presence`); this performs it.
+        //
+        // Candidates are contacts NOT visible on the LAN. Gossip is better
+        // evidence — signed, and it means they are on this subnet right now
+        // — so asking the DHT about someone two metres away spends traffic
+        // to learn something weaker.
+        let offline: Vec<String> = self.contact_book.iter().map(|c| c.sc_id.clone())
+            .filter(|id| !self.peers.iter().any(|p| p.name == *id && p.online))
+            .collect();
+        let plan = self.dht_schedule.tick(now_ms, &offline, true);
+        if let Some(h) = self.dht.as_ref() {
+            if plan.publish && !self.local_id.is_empty() {
+                // The host is left EMPTY, deliberately. This app cannot know
+                // which of its interfaces a stranger should dial, and
+                // publishing a guess writes a wrong address into a public
+                // record that outlives the guess. The port is real; the
+                // address is the resolver's own observation, the same rule
+                // gossip already follows.
+                h.publish(&self.local_id, &self.settings.current.general.display_name,
+                          "", self.settings.current.network.listen_port);
+            }
+            if let Some(id) = plan.resolve.as_ref() {
+                h.resolve(id);
+            }
+        }
+
         let Some(h) = self.dht.as_ref() else { return };
-        for ev in h.poll() {
+        let events = h.poll();
+        for ev in events {
             use snapclone_presence::node_host::Event;
             match ev {
-                Event::Resolved { found, .. } => {
+                Event::Resolved { sc_id, found } => {
+                    // The lookup is over whether or not it found anything —
+                    // an empty answer that never ends the lookup wedges the
+                    // rotation on one id.
+                    self.dht_schedule.finished(&sc_id);
+                    let mut learned = 0;
                     for p in found {
-                        self.feed_note = format!("found {} via DHT", p.display_name);
+                        // A DHT RECORD IS NOW WORTH SOMETHING. It used to
+                        // set a note and evaporate: nothing recorded the
+                        // address, so a peer found via DHT still could not
+                        // be dialled and the message read as a tease.
+                        //
+                        // Only a literal address is taken. A hostname would
+                        // need a resolver call on the UI thread, and the
+                        // publisher is asked not to write one (see the
+                        // publish above).
+                        if let Some(ip) = parse_dotted_quad(&p.host) {
+                            if p.port != 0 {
+                                self.note_peer_addr(&sc_id, ip, p.port, now_ms);
+                                learned += 1;
+                            }
+                        }
+                    }
+                    if learned > 0 {
+                        self.feed_note = format!("{sc_id} found via DHT");
                     }
                 }
                 // Zero peers is the normal state of a node that has just
@@ -1286,10 +1344,13 @@ impl Snapclone {
                 Event::Stopped(why) => {
                     self.feed_note = why;
                     self.dht = None;
+                    // The in-flight lookup died with the socket. Without
+                    // this, the next node sits out a timeout on behalf of
+                    // one that no longer exists.
+                    self.dht_schedule.reset();
                 }
             }
         }
-        let _ = now_ms;
     }
 
     pub fn tick_gossip(&mut self, now_ms: u64) {

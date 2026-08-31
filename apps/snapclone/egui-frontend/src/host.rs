@@ -695,6 +695,40 @@ mod tests {
     }
 
     #[test]
+    fn the_dht_only_asks_about_contacts_the_lan_cannot_see() {
+        // Gossip is better evidence than a DHT record — signed, and it means
+        // they are on this subnet right now. Asking the DHT about someone
+        // two metres away spends traffic to learn something weaker, and on a
+        // phone that traffic is a radio wakeup.
+        let mut s = app();
+        for id in ["sc-aaaaaaaa", "sc-bbbbbbbb"] {
+            s.apply_friends(crate::friends::Action::Add(
+                crate::friends::AddPeer { host: id.into(), port: 9876 }));
+        }
+        // One of them is right here.
+        s.apply(HostEvent::PeerPresence { id: "sc-aaaaaaaa".into(), online: true });
+        for p in s.peers.iter_mut() {
+            if p.name == "sc-aaaaaaaa" { p.online = true; }
+        }
+        let offline: Vec<String> = s.contact_book.iter().map(|c| c.sc_id.clone())
+            .filter(|id| !s.peers.iter().any(|p| p.name == *id && p.online))
+            .collect();
+        assert_eq!(offline, vec!["sc-bbbbbbbb".to_string()],
+                   "the visible peer is being looked up anyway");
+    }
+
+    #[test]
+    fn a_dht_record_becomes_a_dialable_address_not_just_a_note() {
+        // It used to set `feed_note` and evaporate — nothing recorded the
+        // address, so a peer "found via DHT" still could not be reached and
+        // the message was a tease.
+        let mut s = app();
+        s.note_peer_addr("sc-aabbccdd", [203, 0, 113, 9], 9876, 5_000);
+        let a = s.punch.get("sc-aabbccdd").expect("the DHT result went nowhere");
+        assert_eq!((a.ip, a.port), ([203, 0, 113, 9], 9876));
+    }
+
+    #[test]
     fn a_learned_address_is_what_makes_a_peer_dialable() {
         // `PunchAddrs` was empty for the whole life of this port — nothing
         // called `note_peer_addr`, so no hole punch had a target and voice
