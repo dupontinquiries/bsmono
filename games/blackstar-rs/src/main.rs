@@ -82,6 +82,7 @@ mod hullform;
 mod interior;
 mod menu;
 mod meshgen;
+mod mixer;
 mod model;
 mod net;
 mod online_screen;
