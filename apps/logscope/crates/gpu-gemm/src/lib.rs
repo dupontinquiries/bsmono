@@ -40,6 +40,7 @@ pub mod qkvsplit;
 pub mod expsplit;
 pub mod prefetch;
 pub mod mladims;
+pub mod deltanet; // Gated DeltaNet CPU oracle (Qwen3.5/3.6 hybrids) — see its module docs
 pub mod rolequant;
 pub mod ragged;
 pub mod steer;

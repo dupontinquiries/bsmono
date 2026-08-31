@@ -136,8 +136,11 @@ pub fn for_arch(arch: &str) -> ArchConfig {
 observed in the operator's own tensor dump, which is why the family guess was wrong. The ssm_* \
 tensors per block are a recurrent state this engine has no path for, so those layers have no forward \
 pass at all rather than a slow one; only the ~1-in-4 gated-attention blocks are shapes we run. It \
-stays unverified end to end because nothing can run it. The MoE side is fine: 256 experts, shared \
-expert with its own gate, and Q4_K/MXFP4 both slice since c4-784 and c4-805",
+stays unverified end to end because nothing can run it. The MATH now has a CPU oracle: \
+src/deltanet.rs transcribes llama.cpp's delta-net-base.cpp autoregressive recurrence (decay -> \
+delta correction -> output, conv ring, gated norm) with invariant tests — GPU work checks against \
+it. The MoE side is fine: 256 experts, shared expert with its own gate, and Q4_K/MXFP4 both slice \
+since c4-784 and c4-805",
             ..for_arch("qwen3moe")
         },
         "qwen3moe" => ArchConfig {
