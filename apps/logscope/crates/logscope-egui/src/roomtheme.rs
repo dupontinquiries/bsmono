@@ -71,7 +71,7 @@ fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
 /// runs once per theme change, not per frame. Gives up at the extreme rather than looping: if white
 /// on this surface still fails, no colour succeeds, and the audit should be told the real number
 /// instead of being handed a lie.
-fn force_contrast(c: Color32, against: Color32, target: f32) -> Color32 {
+pub(crate) fn force_contrast(c: Color32, against: Color32, target: f32) -> Color32 {
     if contrast(c, against) >= target { return c; }
     let toward = if luminance(against) > 0.18 { Color32::BLACK } else { Color32::WHITE };
     let mut best = c;

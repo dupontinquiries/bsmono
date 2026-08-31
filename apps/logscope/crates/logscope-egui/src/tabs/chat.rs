@@ -4074,11 +4074,11 @@ which file you read.\n\n",
         }
         let mut seg_of = vec![0usize; n];
         for (si, &(a, b)) in segs.iter().enumerate() { for id in a..=b.min(n.saturating_sub(1)) { seg_of[id] = si; } }
-        let palette = [
-            egui::Color32::from_rgb(0x6e, 0xc6, 0xff), egui::Color32::from_rgb(0x8b, 0xe0, 0x9b),
-            egui::Color32::from_rgb(0xe6, 0xb4, 0x5c), egui::Color32::from_rgb(0xc9, 0x8f, 0xff),
-            egui::Color32::from_rgb(0xff, 0x9b, 0x8a), egui::Color32::from_rgb(0x5c, 0xd6, 0xc4),
-        ];
+        // SEGMENT COLOURS COME FROM THE ROOM. These were six fixed hues, identical in every space —
+        // and the graph is the centre of the screen, so it was the most visible thing that did not
+        // belong to the room it sat in. `nodetint` anchors them on the space's own accent and audits
+        // every space for pair separation and contrast against its background.
+        let palette = crate::nodetint::segments(&theme::active());
         let max_tok = g.nodes.iter().map(|nd| nd.tokens).max().unwrap_or(1).max(1) as f32;
 
         // (The 2D control bar was removed — Overview/Tour/Freecam/Prune/Unprune are physical dock buttons now.)

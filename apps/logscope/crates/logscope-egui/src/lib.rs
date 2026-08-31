@@ -116,7 +116,8 @@ pub use logscope_fan::cmdpalette;
 #[cfg(feature = "gui")] pub mod app;
 #[cfg(feature = "gui")] pub mod model;
 #[cfg(feature = "gui")] pub mod theme;
-#[cfg(feature = "gui")] pub mod roomtheme;  // chrome DERIVED from the room you are standing in, with a legibility audit over all 16
+#[cfg(feature = "gui")] pub mod roomtheme;
+#[cfg(feature = "gui")] pub mod nodetint;   // graph node colours derived from the space, audited for distinguishability  // chrome DERIVED from the room you are standing in, with a legibility audit over all 16
 #[cfg(feature = "gui")] pub mod ui;
 #[cfg(feature = "gui")] pub mod wizard;
 #[cfg(all(feature = "gui", feature = "gpu-scene"))] pub mod scene_preview;
