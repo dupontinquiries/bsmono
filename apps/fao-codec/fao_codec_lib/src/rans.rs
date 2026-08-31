@@ -178,6 +178,14 @@ pub fn encode(pairs: &[(u8, u8)], n_ctx: usize) -> Option<Vec<u8>> {
             None => out.push(255), // 255 = absent context marker
         }
     }
+    if std::env::var("FAO_RANS_DEBUG").is_ok() {
+        eprintln!(
+            "rans: {} syms, {} ctxs used, table_bytes {}",
+            pairs.len(),
+            tables.iter().filter(|t| t.is_some()).count(),
+            out.len() - 1
+        );
+    }
     out.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
     // rANS encode in reverse, then reverse the byte stream.
     let mut state: u32 = RANS_L;
@@ -199,10 +207,13 @@ pub fn encode(pairs: &[(u8, u8)], n_ctx: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Decode against a caller-supplied context sequence generator: `ctx_of`
-/// is called with the symbol index and must return the same context the
-/// encoder used (both sides derive contexts from shared structure).
-pub fn decode(blob: &[u8], ctx_of: &mut dyn FnMut(usize) -> u8) -> Option<Vec<u8>> {
+/// Decode against a caller-supplied context rule: `ctx_of` is called
+/// with the symbol index AND the symbols decoded so far, and must return
+/// the same context the encoder used. The history parameter is what
+/// makes data-dependent context models (neighbor conditioning, run
+/// states) decodable: the decoder has exactly the same past the encoder
+/// had, one symbol at a time.
+pub fn decode(blob: &[u8], ctx_of: &mut dyn FnMut(usize, &[u8]) -> u8) -> Option<Vec<u8>> {
     let mut off = 0usize;
     let n_ctx = *blob.get(off)? as usize;
     off += 1;
@@ -231,7 +242,7 @@ pub fn decode(blob: &[u8], ctx_of: &mut dyn FnMut(usize) -> u8) -> Option<Vec<u8
     off += 4;
     let mut out = Vec::with_capacity(n_sym);
     for i in 0..n_sym {
-        let t = tables[ctx_of(i) as usize].as_ref()?;
+        let t = tables[ctx_of(i, &out) as usize].as_ref()?;
         let slot = state & (PROB_SCALE - 1);
         let s = t.slot_sym[slot as usize];
         let f = t.freq[s as usize] as u32;
@@ -278,7 +289,7 @@ mod tests {
         );
         let mut i_ctx = 0usize;
         let _ = i_ctx;
-        let decoded = decode(&blob, &mut |i| (i % 2) as u8).expect("decode");
+        let decoded = decode(&blob, &mut |i, _hist| (i % 2) as u8).expect("decode");
         assert_eq!(decoded.len(), pairs.len());
         for (d, (_, s)) in decoded.iter().zip(&pairs) {
             assert_eq!(d, s);

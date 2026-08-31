@@ -349,6 +349,14 @@ pub fn encode(
         .as_ref()
         .map(|r| r.len() < compressed.len())
         .unwrap_or(false);
+    if std::env::var("FAO_RANS_DEBUG").is_ok() {
+        eprintln!(
+            "select: zstd {} vs rans {:?} -> {}",
+            compressed.len(),
+            rans_candidate.as_ref().map(|r| r.len()),
+            if use_rans { "RANS" } else { "ZSTD" }
+        );
+    }
     let body: &[u8] = if use_rans {
         rans_candidate.as_deref().unwrap()
     } else {
@@ -527,6 +535,18 @@ fn pack_skip_rle_split(
                 structure.push(blocks[nonskip_start + j].1[c].pack());
             }
             for k in 0..16 {
+                // Plain per-coefficient symbols, one order-0 model per
+                // (channel-class × band-group) context. NEGATIVE RESULTS
+                // recorded from this spot, both A/B'd on real payloads:
+                // neighbor conditioning (ctx × prev==0) lost to its own
+                // doubled table cost, and (run,level) symbolization lost
+                // outright (+8% on the worst shot) — at p(zero)≈0.95 an
+                // order-0 model already codes zeros at ~0.07 bits, so
+                // the recoverable zero mass (~3 KB/frame) is smaller
+                // than heavy-tailed run symbols under 12-bit static
+                // tables cost. Static per-frame tables are near their
+                // optimum here; further entropy gains need ADAPTIVE
+                // models, which is a different construction.
                 let ctx = coef_ctx(c, k);
                 for j in 0..n_nonskip as usize {
                     pairs.push((ctx, blocks[nonskip_start + j].0[c][k] as u8));
@@ -586,27 +606,27 @@ fn unpack_split(
     true
 }
 
-/// Context sequence for the rANS decoder, derived from the structure
-/// stream alone (must match pack_skip_rle_split's emission order).
-fn ctx_sequence(structure: &[u8]) -> Vec<u8> {
-    let mut seq = Vec::new();
+/// Band layout from the structure stream: (base_ctx, n_coefs) per band
+/// per channel per segment, in emission order. Drives both the decode
+/// context machine and the symbol→coefficient expansion.
+fn band_layout(structure: &[u8]) -> Vec<(u8, usize)> {
+    let mut out = Vec::new();
     let mut off = 0usize;
     while off + 5 <= structure.len() {
         let n_nonskip = structure[off + 4] as usize;
         off += 5;
         for c in 0..3 {
-            off += n_nonskip; // this channel's params
+            off += n_nonskip;
             for k in 0..16 {
-                for _ in 0..n_nonskip {
-                    seq.push(coef_ctx(c, k));
-                }
+                out.push((coef_ctx(c, k), n_nonskip));
             }
         }
     }
-    seq
+    out
 }
 
 // ──────────────────────────────────────────────────────────────────
+// Decoder// ──────────────────────────────────────────────────────────────────
 // Decoder
 // ──────────────────────────────────────────────────────────────────
 
@@ -660,9 +680,19 @@ pub fn apply(predicted: Vec<u8>, residual_bytes: &[u8], w: usize, h: usize) -> V
         }
         match zstd::decode_all(&body[4..4 + sl]) {
             Ok(structure) => {
-                let seq = ctx_sequence(&structure);
-                match crate::rans::decode(&body[4 + sl..], &mut |i| seq[i]) {
-                    Some(coefs) if coefs.len() == seq.len() => {
+                let layout = band_layout(&structure);
+                let mut band = 0usize;
+                let mut left = layout.first().map(|b| b.1).unwrap_or(0);
+                let total: usize = layout.iter().map(|b| b.1).sum();
+                match crate::rans::decode(&body[4 + sl..], &mut |_i, _hist: &[u8]| {
+                    while left == 0 && band + 1 < layout.len() {
+                        band += 1;
+                        left = layout[band].1;
+                    }
+                    left = left.saturating_sub(1);
+                    layout.get(band).map(|b| b.0).unwrap_or(0)
+                }) {
+                    Some(coefs) if coefs.len() == total => {
                         unpack_split(&structure, &coefs, &mut blocks)
                     }
                     _ => false,
@@ -833,7 +863,65 @@ fn unpack_skip_rle(
 mod tests {
     use super::*;
     
-    /// Predicted == target → residual encodes to mostly-zero coefficients, 
+    /// The rANS split path must reproduce blocks exactly. Values planted
+    /// ABOVE the skip threshold — sub-threshold blocks are skip-RLE'd to
+    /// zero by design in both payload paths (my first version of this
+    /// test asserted otherwise and was wrong, not the codec).
+    #[test]
+    fn rans_split_roundtrip() {
+        let opts = ResidualOpts::default();
+        let mut blocks: Vec<([[i8; 16]; 3], [QuantParams; 3])> = vec![
+            (
+                [[0i8; 16]; 3],
+                [QuantParams { scale_byte: 8, saliency_boost: 0 }; 3],
+            );
+            600
+        ];
+        for (bi, b) in blocks.iter_mut().enumerate() {
+            if bi % 7 == 0 {
+                b.0[0][0] = 40 + (bi % 60) as i8;
+            }
+            if bi % 3 == 0 {
+                b.0[0][5] = 9;
+            }
+            if bi == 100 || bi == 101 {
+                b.0[1][2] = -14;
+            }
+        }
+        let (structure, pairs) = pack_skip_rle_split(&blocks, &opts);
+        let blob = crate::rans::encode(&pairs, 8).expect("rans encode");
+        let layout = band_layout(&structure);
+        let mut band = 0usize;
+        let mut left = layout.first().map(|b| b.1).unwrap_or(0);
+        let symbols = crate::rans::decode(&blob, &mut |_i, _h: &[u8]| {
+            while left == 0 && band + 1 < layout.len() {
+                band += 1;
+                left = layout[band].1;
+            }
+            left = left.saturating_sub(1);
+            layout.get(band).map(|b| b.0).unwrap_or(0)
+        })
+        .expect("rans decode");
+        let mut back = vec![
+            (
+                [[0i8; 16]; 3],
+                [QuantParams { scale_byte: 0, saliency_boost: 0 }; 3],
+            );
+            600
+        ];
+        assert!(unpack_split(&structure, &symbols, &mut back));
+        let thresh = opts.skip_threshold;
+        for (a, b) in blocks.iter().zip(&back) {
+            let skip = a.0.iter().all(|ch| ch.iter().all(|v| v.abs() <= thresh));
+            if skip {
+                assert!(b.0.iter().all(|ch| ch.iter().all(|&v| v == 0)));
+            } else {
+                assert_eq!(a.0, b.0);
+            }
+        }
+    }
+
+    /// Predicted == target    /// Predicted == target → residual encodes to mostly-zero coefficients, 
     /// applies cleanly back. PSNR effectively infinite.
     #[test]
     fn identity_residual_lossless() {

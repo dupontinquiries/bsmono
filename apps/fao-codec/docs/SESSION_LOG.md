@@ -3430,3 +3430,40 @@ richer contexts (neighbor-magnitude conditioning, zero-run symbols)
 — the last step toward the original 2–3× entropy estimate.
 
 Session ladder, whole 45 s: 46.5× @ −2.00 dB → 34.3× @ +0.36 dB.
+
+### Entropy context experiments: two measured negatives (same session)
+
+Both A/B'd on real payloads against the 8-context rANS baseline
+(worst shot 4,432,674 B), both reverted, both recorded in the code at
+the emission site:
+
+1. Neighbor conditioning (ctx × previous-block-same-band == 0, 16
+   contexts): worst shot +0.6%. The conditional distributions aren't
+   different enough after band grouping to pay for doubled table
+   serialization (~1.2–1.8 KB/frame measured at 16 ctxs).
+2. (run, level) symbolization (zero-runs as chunked run symbols, zero-
+   free literal alphabets): worst shot +8.1% — rANS lost best-of on
+   EVERY frame (total collapsed to the zstd-only number). The
+   arithmetic error was mine, upstream: at p(zero)≈0.95 an order-0
+   model already codes zeros at ~0.07 bits, so the entire recoverable
+   zero mass is ~3 KB/frame — smaller than what heavy-tailed run
+   lengths cost under 12-bit quantized static tables with per-band
+   resets.
+
+Conclusion the two negatives triangulate: static per-frame tables
+are near their optimum at 8 contexts. The remaining entropy headroom
+(toward the original 2–3× estimate) requires ADAPTIVE modeling —
+per-symbol model updates, which rANS's LIFO order makes a genuinely
+different construction (interleaved streams or two-pass) — correctly
+sized as its own project, not a knob.
+
+Process note, recorded because it cost a cycle: a `grep -cE "^error"`
+output of "2" was misread as a pattern line rather than an error
+COUNT — the revert build had failed and the A/B ran a STALE binary
+(the "13 ctxs used" debug line was the tell: impossible under the
+reverted 8-context encoder). Third stale-binary incident this
+project; the fix applied is exact-baseline verification after every
+revert (both shots now byte-identical to the recorded baseline).
+Suite 84/0 including a new direct rANS-split roundtrip test (whose
+first version wrongly asserted sub-threshold blocks survive — they
+are skip-RLE'd to zero by design; the test was wrong, not the codec).
