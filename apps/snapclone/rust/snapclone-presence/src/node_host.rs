@@ -30,7 +30,19 @@
 
 use snapcore::node::Node;
 use snapcore::routing::NodeId;
-use snapcore::udp::UdpTransport;
+// THE OPENDHT-SPEAKING SOCKET, not snapcore's bespoke one.
+//
+// `snapcore::udp::UdpTransport` frames its own way — `[TAG_FIND_NODE][id]
+// [target]` — and this crate's bootstrap list is entirely Jami servers,
+// which speak OpenDHT. The node was therefore sending bytes nothing on that
+// list could answer: the routing table never filled, every lookup returned
+// empty, and an empty lookup is also what a working DHT returns for a peer
+// who is offline, so nothing above ever noticed.
+//
+// `snapcore::wire_udp` encodes with dht-kit, which this crate already
+// depended on for its TYPES. See maintenance/DHT_CONVERGENCE.md — this is
+// the convergence it argues for, applied to the path the app actually uses.
+use snapcore::wire_udp::WireUdpTransport as UdpTransport;
 use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 

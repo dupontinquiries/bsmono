@@ -13,7 +13,11 @@ path = "src/lib.rs"
 dht-kit = { path = "../../../../shared/dht-kit" }
 # The engine behind `dht.rs`. dht-kit stays the TYPES dependency; this is
 # the one that drives a lookup.
-snapcore = { path = "../../../../shared/snapcore" }
+# `wire` on: this crate bootstraps against bootstrap.jami.net, which speaks
+# OpenDHT. snapcore's default `udp` transport has its own bespoke framing,
+# so with default features the node sends bytes those servers cannot answer
+# — the routing table never fills and every lookup returns nothing, silently.
+snapcore = { path = "../../../../shared/snapcore", features = ["wire"] }
 snapclone-identity = { path = "../snapclone-identity" }
 anyhow  = "1"
 rand    = "0.8"

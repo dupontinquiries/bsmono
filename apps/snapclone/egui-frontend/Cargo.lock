@@ -2722,6 +2722,9 @@ dependencies = [
 [[package]]
 name = "snapcore"
 version = "0.1.0"
+dependencies = [
+ "dht-kit",
+]
 
 [[package]]
 name = "spki"
