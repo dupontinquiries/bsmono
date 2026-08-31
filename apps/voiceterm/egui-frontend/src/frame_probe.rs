@@ -133,9 +133,17 @@ impl Probe {
         let (drawn, _) = self.frame(|ui| { body(ui); });
         let p = self.pos_of(&drawn, needle)
             .unwrap_or_else(|| panic!("{needle:?} was never drawn: {:?}", drawn.texts));
-        // A few pixels in from the glyph origin, which is the text's top
-        // left — the origin itself can sit on the row's boundary.
-        self.click(Pos2::new(p.x + 4.0, p.y + 4.0), body)
+        // The y is trustworthy, the x is not — see the module note. Sweep
+        // the row, left to right, and stop at the first hit.
+        let y = p.y + 4.0;
+        let mut x = 4.0;
+        while x < self.size.x {
+            if let Some(r) = self.click(Pos2::new(x, y), &mut body) {
+                return Some(r);
+            }
+            x += 6.0;
+        }
+        None
     }
 }
 
@@ -161,6 +169,18 @@ mod tests {
             if ui.button("press me").clicked() { Some(()) } else { None }
         });
         assert!(hit.is_some(), "the harness cannot click a plain button");
+    }
+
+    #[test]
+    fn a_link_in_a_rendered_document_can_be_followed() {
+        // Isolating the renderer from any view that embeds it: if this
+        // fails, a failing manpage test is about `uikit_web::render`, not
+        // about the manual.
+        let p = Probe::default();
+        let c = p.colors();
+        let doc = uikit_web::parse_html("<p>see <a href=\"#sed\">sed</a></p>");
+        let href = p.click_text("sed", |ui| uikit_web::render(ui, &doc, &c));
+        assert_eq!(href.as_deref(), Some("#sed"));
     }
 
     #[test]

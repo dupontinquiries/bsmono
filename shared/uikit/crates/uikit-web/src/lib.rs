@@ -38,13 +38,51 @@ pub enum BlockKind {
     Code,
     Quote,
     Rule,
+    /// A table, kept as rows rather than flattened into prose.
+    ///
+    /// Flattening is what the parser did with them until now, and a data
+    /// table run together into one paragraph is not degraded — it is
+    /// unreadable, and tables are where the facts on a page usually are.
+    ///
+    /// The first row is the header when the source marked it with `th`;
+    /// `has_header` says which, because a table whose first data row is
+    /// drawn as a heading misreports its own contents.
+    Table { has_header: bool },
 }
+
+/// One table cell: inline runs, like everything else.
+pub type Cell = Vec<Inline>;
+
+/// The most rows rendered from one table.
+///
+/// Ported with its reason from the QML generator, where the comment records
+/// what happened without it: a table is ONE node against the node budget
+/// but emits every row, so a multi-thousand-row table blew past the cap and
+/// produced a million lines of QML. Here it would be a display list that
+/// takes a second to walk every frame. The overflow is COUNTED and shown,
+/// not silently dropped — "showing 200 of 4,812" is information; a table
+/// that quietly stops is a wrong answer.
+pub const MAX_TABLE_ROWS: usize = 200;
 
 /// A block: a kind plus its inline runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     pub kind: BlockKind,
     pub inlines: Vec<Inline>,
+    /// Rows, for `BlockKind::Table`. Empty for every other kind — a table
+    /// is the one block whose content is two-dimensional, and giving every
+    /// block a `rows` field is cheaper than a second block type that half
+    /// the code has to know about.
+    pub rows: Vec<Vec<Cell>>,
+    /// How many rows the source had, when that is more than were kept.
+    pub rows_dropped: usize,
+}
+
+impl Block {
+    /// A block of inline runs — every kind but a table.
+    pub fn new(kind: BlockKind, inlines: Vec<Inline>) -> Block {
+        Block { kind, inlines, rows: Vec::new(), rows_dropped: 0 }
+    }
 }
 
 /// The render-ready display list. Built once from HTML; rendered many times.
@@ -245,6 +283,13 @@ pub fn parse_html(html: &str) -> RichDoc {
     let mut cur: Option<Block> = None;
     let mut style = InlineStyle::default();
     let mut style_stack: Vec<InlineStyle> = Vec::new();
+    /// The table being built, if any. A stack would let nested tables work
+    /// and they are rare enough — and pathological enough as a layout
+    /// device — that the inner one flattening into the outer cell is the
+    /// better failure than the code to handle it.
+    let mut table: Option<Block> = None;
+    let mut row: Option<Vec<Cell>> = None;
+    let mut cell: Option<Cell> = None;
 
     let flush = |cur: &mut Option<Block>, blocks: &mut Vec<Block>| {
         if let Some(b) = cur.take() {
@@ -268,12 +313,40 @@ pub fn parse_html(html: &str) -> RichDoc {
         }
         match tok {
             Token::Open { name, attrs } => {
+                if name == "table" {
+                    flush(&mut cur, &mut blocks);
+                    table = Some(Block::new(BlockKind::Table { has_header: false }, vec![]));
+                    continue;
+                }
+                if table.is_some() {
+                    match name.as_str() {
+                        "tr" => { row = Some(Vec::new()); continue; }
+                        "td" | "th" => {
+                            cell = Some(Vec::new());
+                            // A `th` anywhere marks the table as headed.
+                            // Checked per cell rather than per row because
+                            // real tables put a `th` in the first COLUMN
+                            // too, and only the first row's matters.
+                            if name == "th" && table.as_ref().is_some_and(|t| t.rows.is_empty()) {
+                                if let Some(t) = table.as_mut() {
+                                    t.kind = BlockKind::Table { has_header: true };
+                                }
+                            }
+                            continue;
+                        }
+                        // Inline styling inside a cell still applies; block
+                        // tags inside one do not start a new block, or a
+                        // `<td><p>x</p></td>` would tear the table apart.
+                        _ if is_block(&name).is_some() => continue,
+                        _ => {}
+                    }
+                }
                 if name == "hr" {
                     flush(&mut cur, &mut blocks);
-                    blocks.push(Block { kind: BlockKind::Rule, inlines: vec![] });
+                    blocks.push(Block::new(BlockKind::Rule, vec![]));
                 } else if let Some(kind) = is_block(&name) {
                     flush(&mut cur, &mut blocks);
-                    cur = Some(Block { kind, inlines: vec![] });
+                    cur = Some(Block::new(kind, vec![]));
                 } else {
                     // inline styling
                     style_stack.push(style.clone());
@@ -293,6 +366,42 @@ pub fn parse_html(html: &str) -> RichDoc {
                 }
             }
             Token::Close(name) => {
+                if table.is_some() {
+                    match name.as_str() {
+                        "td" | "th" => {
+                            if let (Some(c), Some(r)) = (cell.take(), row.as_mut()) {
+                                r.push(c);
+                            }
+                            continue;
+                        }
+                        "tr" => {
+                            if let (Some(r), Some(t)) = (row.take(), table.as_mut()) {
+                                if r.is_empty() {
+                                    continue;
+                                }
+                                if t.rows.len() < MAX_TABLE_ROWS {
+                                    t.rows.push(r);
+                                } else {
+                                    // Counted, not dropped silently — see
+                                    // MAX_TABLE_ROWS. A table that just
+                                    // stops is a wrong answer.
+                                    t.rows_dropped += 1;
+                                }
+                            }
+                            continue;
+                        }
+                        "table" => {
+                            if let Some(t) = table.take() {
+                                if !t.rows.is_empty() { blocks.push(t); }
+                            }
+                            row = None;
+                            cell = None;
+                            continue;
+                        }
+                        _ if is_block(&name).is_some() => continue,
+                        _ => {}
+                    }
+                }
                 if is_block(&name).is_some() || name == "hr" {
                     flush(&mut cur, &mut blocks);
                 } else if matches!(name.as_str(), "b" | "strong" | "i" | "em" | "code" | "a") {
@@ -302,8 +411,21 @@ pub fn parse_html(html: &str) -> RichDoc {
                 }
             }
             Token::Text(text) => {
+                // Inside a cell, text belongs to the cell. Text inside a
+                // table but OUTSIDE a cell — whitespace between tags,
+                // usually — is dropped rather than becoming a paragraph
+                // wedged between the rows.
+                if table.is_some() {
+                    if let Some(c) = cell.as_mut() {
+                        let t = collapse_ws(&text);
+                        if !t.is_empty() {
+                            c.push(Inline { text: t, style: style.clone() });
+                        }
+                    }
+                    continue;
+                }
                 if cur.is_none() {
-                    cur = Some(Block { kind: BlockKind::Paragraph, inlines: vec![] });
+                    cur = Some(Block::new(BlockKind::Paragraph, vec![]));
                 }
                 let preserve = style.code || cur.as_ref().map(|b| b.kind == BlockKind::Code).unwrap_or(false);
                 if let Some(b) = cur.as_mut() {
@@ -316,6 +438,12 @@ pub fn parse_html(html: &str) -> RichDoc {
         }
     }
     flush(&mut cur, &mut blocks);
+    // An unclosed <table> still yields its rows. Malformed HTML is the
+    // normal case, and losing a whole table to a missing </table> would be
+    // the parser being right about the input and useless about the page.
+    if let Some(t) = table.take() {
+        if !t.rows.is_empty() { blocks.push(t); }
+    }
     RichDoc { blocks }
 }
 
@@ -339,8 +467,23 @@ fn collapse_ws(s: &str) -> String {
 // ── egui render (thin; walks the prebuilt list each frame) ───────────────────
 
 /// Render a prebuilt [`RichDoc`] into egui. Cheap — no parsing here.
-pub fn render(ui: &mut egui::Ui, doc: &RichDoc, colors: &uikit_egui::PaletteColors) {
+/// Draw the document. Returns the href of a link the user followed.
+///
+/// It used to return `()`, and links were drawn in the accent colour and
+/// were not clickable — which is the worst version: they look like links,
+/// so a person taps one and nothing happens. For a module whose job is to
+/// replace the web handler, following a link is not a feature, it is the
+/// thing a page is for.
+pub fn render(ui: &mut egui::Ui, doc: &RichDoc,
+              colors: &uikit_egui::PaletteColors) -> Option<String> {
+    let mut followed = None;
     for block in &doc.blocks {
+        if let BlockKind::Table { has_header } = block.kind {
+            if let Some(h) = table_ui(ui, block, has_header, colors) {
+                followed = Some(h);
+            }
+            continue;
+        }
         match &block.kind {
             BlockKind::Rule => {
                 ui.separator();
@@ -372,20 +515,181 @@ pub fn render(ui: &mut egui::Ui, doc: &RichDoc, colors: &uikit_egui::PaletteColo
                 ui.label(egui::RichText::new("▏").color(colors.accent_soft));
             }
             for run in &block.inlines {
-                let mut rt = egui::RichText::new(&run.text);
-                if run.style.bold {
-                    rt = rt.strong();
+                if let Some(h) = inline_ui(ui, run, quote, colors) {
+                    followed = Some(h);
                 }
-                if run.style.italic {
-                    rt = rt.italics();
-                }
-                if run.style.code {
-                    rt = rt.monospace().background_color(colors.bg_raised);
-                }
-                rt = rt.color(if run.style.link.is_some() { colors.accent } else if quote { colors.text_weak } else { colors.text });
-                ui.label(rt);
             }
         });
+    }
+    followed
+}
+
+/// One styled run. A link becomes a real `ui.link`, which brings the hover
+/// cursor and the underline with it — a coloured label has neither, and
+/// both are how a person knows something is clickable before they try.
+fn inline_ui(ui: &mut egui::Ui, run: &Inline, quote: bool,
+             colors: &uikit_egui::PaletteColors) -> Option<String> {
+    let mut rt = egui::RichText::new(&run.text);
+    if run.style.bold { rt = rt.strong(); }
+    if run.style.italic { rt = rt.italics(); }
+    if run.style.code { rt = rt.monospace().background_color(colors.bg_raised); }
+    match &run.style.link {
+        Some(href) => {
+            let r = ui.link(rt.color(colors.accent));
+            // The destination on hover. A link whose text is "click here"
+            // is the common case, and the only way to know where it goes
+            // before committing is to be told.
+            let r = if href.trim().is_empty() { r } else { r.on_hover_text(href) };
+            if r.clicked() { return Some(href.clone()); }
+            None
+        }
+        None => {
+            ui.label(rt.color(if quote { colors.text_weak } else { colors.text }));
+            None
+        }
+    }
+}
+
+/// Draw a table as a grid.
+///
+/// `egui::Grid` rather than a hand-laid set of columns: it measures the
+/// widest cell per column and aligns every row to it, which is the whole
+/// reason a table is a table. Laying columns out by hand means picking
+/// widths before knowing the content.
+fn table_ui(ui: &mut egui::Ui, block: &Block, has_header: bool,
+            colors: &uikit_egui::PaletteColors) -> Option<String> {
+    let mut followed = None;
+    let id = ui.id().with(("web_table", block.rows.len(), block.rows_dropped));
+    egui::Grid::new(id).striped(true).show(ui, |ui| {
+        for (i, row) in block.rows.iter().enumerate() {
+            let header = has_header && i == 0;
+            for cell in row {
+                ui.horizontal_wrapped(|ui| {
+                    for run in cell {
+                        if header {
+                            // Bolded here rather than in the model: whether
+                            // a header LOOKS like one is the renderer's
+                            // business, and baking it into the runs would
+                            // make the plain-text projection say it too.
+                            let mut b = run.clone();
+                            b.style.bold = true;
+                            if let Some(h) = inline_ui(ui, &b, false, colors) {
+                                followed = Some(h);
+                            }
+                        } else if let Some(h) = inline_ui(ui, run, false, colors) {
+                            followed = Some(h);
+                        }
+                    }
+                });
+            }
+            ui.end_row();
+        }
+    });
+    if block.rows_dropped > 0 {
+        // Said, not hidden. A table that silently stops at 200 rows is a
+        // wrong answer; one that says how much it is not showing is a
+        // limitation the reader can work around.
+        ui.label(egui::RichText::new(format!(
+            "showing {} of {} rows", block.rows.len(),
+            block.rows.len() + block.rows_dropped)).small().color(colors.text_weak));
+    }
+    followed
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+
+    fn cells(b: &Block) -> Vec<Vec<String>> {
+        b.rows.iter().map(|r| r.iter()
+            .map(|c| c.iter().map(|i| i.text.as_str()).collect::<String>())
+            .collect()).collect()
+    }
+
+    #[test]
+    fn a_table_keeps_its_shape_instead_of_running_together() {
+        // Before this, a table flattened into one paragraph — not degraded,
+        // unreadable, and tables are where the facts on a page usually are.
+        let doc = parse_html(
+            "<table><tr><th>City</th><th>Pop</th></tr>             <tr><td>Oslo</td><td>700k</td></tr>             <tr><td>Bergen</td><td>290k</td></tr></table>");
+        assert_eq!(doc.blocks.len(), 1);
+        assert_eq!(doc.blocks[0].kind, BlockKind::Table { has_header: true });
+        assert_eq!(cells(&doc.blocks[0]), vec![
+            vec!["City".to_string(), "Pop".to_string()],
+            vec!["Oslo".to_string(), "700k".to_string()],
+            vec!["Bergen".to_string(), "290k".to_string()],
+        ]);
+    }
+
+    #[test]
+    fn a_table_with_no_th_is_not_given_a_header_row() {
+        // Drawing the first data row as a heading misreports the table's
+        // own contents.
+        let doc = parse_html("<table><tr><td>a</td><td>b</td></tr></table>");
+        assert_eq!(doc.blocks[0].kind, BlockKind::Table { has_header: false });
+    }
+
+    #[test]
+    fn a_th_in_the_first_column_does_not_make_every_row_a_header() {
+        // Real tables mark the row label with `th`. Only the first row's
+        // matters.
+        let doc = parse_html(
+            "<table><tr><td>a</td></tr><tr><th>label</th><td>v</td></tr></table>");
+        assert_eq!(doc.blocks[0].kind, BlockKind::Table { has_header: false });
+    }
+
+    #[test]
+    fn a_huge_table_is_capped_and_says_how_much_it_is_not_showing() {
+        // The QML generator's comment records what happens without the cap:
+        // one node, every row emitted, a million lines of output. Here it
+        // would be a display list walked every frame.
+        let mut html = String::from("<table>");
+        for i in 0..(MAX_TABLE_ROWS + 37) {
+            html.push_str(&format!("<tr><td>{i}</td></tr>"));
+        }
+        html.push_str("</table>");
+        let doc = parse_html(&html);
+        let t = &doc.blocks[0];
+        assert_eq!(t.rows.len(), MAX_TABLE_ROWS);
+        assert_eq!(t.rows_dropped, 37, "the overflow was dropped without a count");
+    }
+
+    #[test]
+    fn a_block_tag_inside_a_cell_does_not_tear_the_table_apart() {
+        // `<td><p>x</p></td>` is ordinary markup. Letting the `p` start a
+        // new block ends the table at the first cell.
+        let doc = parse_html(
+            "<table><tr><td><p>one</p></td><td><div>two</div></td></tr></table>");
+        assert_eq!(doc.blocks.len(), 1, "{:?}", doc.blocks.iter()
+                   .map(|b| &b.kind).collect::<Vec<_>>());
+        assert_eq!(cells(&doc.blocks[0]), vec![vec!["one".to_string(), "two".to_string()]]);
+    }
+
+    #[test]
+    fn an_unclosed_table_still_yields_its_rows() {
+        // Malformed HTML is the normal case. Losing a whole table to a
+        // missing </table> is the parser being right about the input and
+        // useless about the page.
+        let doc = parse_html("<table><tr><td>a</td></tr>");
+        assert_eq!(cells(&doc.blocks[0]), vec![vec!["a".to_string()]]);
+    }
+
+    #[test]
+    fn styling_and_links_survive_inside_a_cell() {
+        let doc = parse_html(
+            "<table><tr><td><b>bold</b></td><td><a href=\"/x\">go</a></td></tr></table>");
+        let row = &doc.blocks[0].rows[0];
+        assert!(row[0][0].style.bold);
+        assert_eq!(row[1][0].style.link.as_deref(), Some("/x"));
+    }
+
+    #[test]
+    fn text_between_the_tags_does_not_become_a_paragraph_in_the_table() {
+        // Whitespace and stray text between rows would otherwise be wedged
+        // between them as prose.
+        let doc = parse_html("<table>\n  <tr>\n    <td>a</td>\n  </tr>\n</table>");
+        assert_eq!(doc.blocks.len(), 1, "{:?}", doc.blocks.iter()
+                   .map(|b| &b.kind).collect::<Vec<_>>());
     }
 }
 

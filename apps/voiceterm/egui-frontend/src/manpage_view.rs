@@ -83,6 +83,16 @@ impl ManpageView {
     pub fn depth(&self) -> usize { self.stack.len() }
     pub fn can_go_back(&self) -> bool { self.stack.len() > 1 }
 
+    /// Is there a page by this name?
+    ///
+    /// Split out from `open` so a caller can decide BEFORE navigating —
+    /// a cross-reference to a page this machine does not have should leave
+    /// you where you are rather than being attempted and silently refused,
+    /// which reads as the link being broken twice.
+    pub fn has(&self, name: &str) -> bool {
+        self.docs.iter().any(|d| d.name == name)
+    }
+
     /// Open a document. Returns false when there is no such page.
     ///
     /// Opening the page you are already on is not a navigation: it would push a
@@ -155,7 +165,20 @@ pub fn manpage_ui(ui: &mut egui::Ui, v: &mut ManpageView,
             // browser view uses, so a manual page and a web page look alike.
             let doc = uikit_web::parse_html(&html);
             egui::ScrollArea::vertical().id_salt("manpage").show(ui, |ui| {
-                uikit_web::render(ui, &doc, c);
+                // A LINK IN A MANUAL PAGE IS A CROSS-REFERENCE. `render`
+                // returns the href now, and here that is the name of
+                // another page — following it is the whole reason a manual
+                // is hyperlinked, and it did nothing before because the
+                // renderer had nowhere to report a click.
+                //
+                // The leading '#' or '/' is stripped: manual cross-refs are
+                // written both ways, and `open` wants a bare name.
+                if let Some(href) = uikit_web::render(ui, &doc, c) {
+                    let name = href.trim_start_matches(['#', '/']).trim();
+                    if !name.is_empty() && v.has(name) {
+                        nav = Some(name.to_string());
+                    }
+                }
             });
         }
         None => {
@@ -183,6 +206,55 @@ pub fn manpage_ui(ui: &mut egui::Ui, v: &mut ManpageView,
     }
     if let Some(n) = &nav { v.open(n); }
     nav
+}
+
+/// Driven through real frames, because the thing being added is a click.
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    use crate::frame_probe::Probe;
+
+    fn view() -> ManpageView {
+        let mut v = ManpageView::default();
+        v.set_docs(vec![
+            // One link per paragraph, deliberately: `click_text` sweeps the
+            // ROW it finds the text on (see `frame_probe`'s note on egui's
+            // unreliable text x), so two links side by side would both be
+            // reachable from either name and the test would be measuring
+            // whichever came first.
+            Doc { name: "grep".into(), title: "grep".into(),
+                  html: "<p>see <a href=\"#sed\">sed</a></p>\
+                         <p>also <a href=\"#nosuch\">nosuch</a></p>".into() },
+            Doc { name: "sed".into(), title: "sed".into(),
+                  html: "<p>stream editor</p>".into() },
+        ]);
+        v.open("grep");
+        v
+    }
+
+    #[test]
+    fn following_a_cross_reference_navigates_to_that_page() {
+        // A hyperlinked manual whose links do nothing is a manual with
+        // blue words in it. The renderer had nowhere to report a click
+        // until now, so this could not have worked.
+        let p = Probe::default();
+        let c = p.colors();
+        let mut v = view();
+        let nav = p.click_text("sed", |ui| manpage_ui(ui, &mut v, &c));
+        assert_eq!(nav.as_deref(), Some("sed"));
+    }
+
+    #[test]
+    fn a_reference_to_a_page_this_machine_lacks_leaves_you_where_you_are() {
+        // Attempting it and being silently refused reads as the link being
+        // broken twice.
+        let p = Probe::default();
+        let c = p.colors();
+        let mut v = view();
+        let nav = p.click_text("nosuch", |ui| manpage_ui(ui, &mut v, &c));
+        assert_eq!(nav, None);
+        assert_eq!(v.current_name(), Some("grep"));
+    }
 }
 
 #[cfg(test)]
