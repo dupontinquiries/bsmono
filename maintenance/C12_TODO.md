@@ -5586,3 +5586,46 @@ to every derive on it, and that is not visible in the file being edited.
 a missing system library on the build host.
 
 ambient-learner-egui 151/151.
+
+## 100. studio: loops get their own library section
+
+From the screenshot — a library full of "Trap Arp Loop 2 - 150 BPM F
+Min" mixed in with one-shots, and the ask to place them on the timeline.
+
+**`SampleKind::Loop` has existed since the taxonomy was written and
+nothing in the UI used it.** `library::classify` was called by no code
+outside its own tests. So the library already knew which files were
+loops and had no way to say so.
+
+`sections()` now puts them first under `◆ loops`, before the
+folder-grouped rest. `LibraryAction::ToTimeline` already exists, so
+placing one needed nothing new — only finding it did.
+
+Three decisions:
+  - **Loops keep their folder in the label.** Every other group drops it
+    because the header says it; this header does not, and a pack name is
+    how you tell two "Arp Loop 2" apart.
+  - **`is_loop` is STRICTER than `classify`.** `classify` uses
+    `has("loop") || has("bpm")` — right for a suggestion, whose own doc
+    says a wrong guess costs one wrong suggestion, and too loose for a
+    section. Substring matching files "bpmania.wav" and everything under
+    a folder called `loops/` as loops, and a one-shot in the loops
+    section is a one-shot nobody finds again.
+  - **Only the FILENAME is examined.** A folder named "loops" describes
+    where a pack was unzipped, not what each file in it is.
+  - **The header is `◆ loops`, not `loops`**, so it cannot collide with
+    a real directory of that name.
+
+Both of those last two were caught by tests that FAILED when written —
+`bpmania.wav` and `loops/one shot.wav` both landed in the loops group on
+the first attempt.
+
+An empty loops group is omitted: a heading over nothing reads as a
+broken feature rather than an unused one.
+
+192/192.
+
+- **C100a — the section is grouping only.** A loop still arrives on the
+  timeline as a plain audio clip; nothing reads the "150 BPM" in the
+  name to set its tempo or snap its length to bars, which is what would
+  make placing one actually good.

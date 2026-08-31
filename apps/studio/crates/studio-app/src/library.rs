@@ -443,10 +443,62 @@ pub fn arrange<'a>(entries: &'a [LibraryEntry], prefs: &Prefs) -> Vec<&'a Librar
 /// deep library shows `zaytoven/808s & Kicks` ONCE with bare filenames
 /// under it, instead of repeating the folder on every row and forcing the
 /// sidebar wide enough for the longest path in the pack.
+/// Header for the loops group.
+///
+/// Not a folder name, so it cannot collide with one: every other header
+/// here is a real directory, and a loop pack that happened to live in a
+/// folder called "loops" would otherwise merge with this and stop being
+/// distinguishable from it.
+pub const LOOPS_HEADER: &str = "◆ loops";
+
+/// Is this a loop — a bar of music, not a one-shot?
+///
+/// `classify` already knows: `SampleKind::Loop` has existed since the
+/// taxonomy was written and NOTHING in the UI used it. A tempo in the
+/// name is the second signal, because a pack that writes
+/// "Trap Arp Loop 2 - 150 BPM F Min" is telling you twice and some
+/// packs only tell you once.
+///
+/// A loop is worth separating because it is the one thing here that
+/// goes on the TIMELINE rather than into the rack: a one-shot is a
+/// sampler's material, a loop is a bar you place.
+pub fn is_loop(label: &str) -> bool {
+    // TOKENS, not substrings.
+    //
+    // `classify` decides Loop with `has("loop") || has("bpm")`, which is
+    // right for a suggestion — its own doc says a wrong guess costs one
+    // wrong SUGGESTION — and too loose for a section header. Substring
+    // matching puts "bpmania.wav" and every file under a folder called
+    // "loops/" into the loops group, and a one-shot filed under loops is
+    // a one-shot nobody finds again.
+    //
+    // So this is stricter than `classify` on purpose, and only looks at
+    // the FILENAME: a folder named "loops" describes where a pack was
+    // unzipped, not what each file in it is.
+    let file = label.rsplit('/').next().unwrap_or(label).to_lowercase();
+    file.split(|c: char| !c.is_alphanumeric()).any(|t| {
+        t == "loop"
+            || t == "loops"
+            || t == "bpm"
+            || (t.ends_with("bpm") && t[..t.len() - 3].parse::<u32>().is_ok())
+    })
+}
+
 pub fn sections<'a>(entries: impl IntoIterator<Item = &'a LibraryEntry>)
     -> Vec<(String, Vec<LibraryEntry>)> {
     let mut out: Vec<(String, Vec<LibraryEntry>)> = Vec::new();
-    for e in entries {
+    // Loops FIRST, in their own group, keeping their folder in the label.
+    //
+    // They keep the folder because a loop's pack is how you tell two
+    // "Arp Loop 2" apart, and the whole reason the other groups drop it
+    // is that their header already says it — this one's does not.
+    let all: Vec<&LibraryEntry> = entries.into_iter().collect();
+    let loops: Vec<LibraryEntry> = all.iter()
+        .filter(|e| is_loop(&e.label)).map(|e| (*e).clone()).collect();
+    if !loops.is_empty() {
+        out.push((LOOPS_HEADER.to_string(), loops));
+    }
+    for e in all.into_iter().filter(|e| !is_loop(&e.label)) {
         let (dir, file) = match e.label.rsplit_once('/') {
             Some((d, f)) => (d.to_string(), f.to_string()),
             None => (String::new(), e.label.clone()),
@@ -822,6 +874,71 @@ pub fn show_tree(ui: &mut egui::Ui, roots: &Roots, state: &mut TreeState,
 
 #[cfg(test)]
 mod tests {
+
+    fn entry(label: &str) -> LibraryEntry {
+        LibraryEntry { label: label.into(), path: label.into(),
+                       media: Media::Audio, bytes: 0 }
+    }
+
+    #[test]
+    fn loops_get_their_own_section_at_the_top() {
+        // The operator's ask: loops belong somewhere they can be found
+        // and placed on the timeline, not scattered through the folder
+        // tree beside one-shots.
+        let all = vec![
+            entry("kicks/808 1.wav"),
+            entry("Arp Loops/Trap Arp Loop 2 - 150 BPM F Min.wav"),
+            entry("kicks/808 2.wav"),
+        ];
+        let out = sections(all.iter());
+        assert_eq!(out[0].0, LOOPS_HEADER, "{:?}", out.iter().map(|(h, _)| h).collect::<Vec<_>>());
+        assert_eq!(out[0].1.len(), 1);
+    }
+
+    #[test]
+    fn a_loop_keeps_its_folder_in_the_label() {
+        // Every other group drops the folder because its HEADER says it.
+        // The loops header does not, and a pack name is how you tell two
+        // "Arp Loop 2" apart.
+        let all = vec![entry("Cymatics Trap/Trap Arp Loop 2 - 150 BPM F Min.wav")];
+        let out = sections(all.iter());
+        assert!(out[0].1[0].label.contains('/'), "{:?}", out[0].1[0].label);
+    }
+
+    #[test]
+    fn a_tempo_in_the_name_marks_a_loop() {
+        // Packs say it twice — "Loop" and "150 BPM" — and some say it
+        // only once.
+        assert!(is_loop("Trap Arp 2 - 150 BPM F Min.wav"));
+        assert!(is_loop("something Loop 3.wav"));
+    }
+
+    #[test]
+    fn a_word_containing_bpm_is_not_a_loop() {
+        // Checked as a token. Otherwise "bpmania.wav" is a loop, and a
+        // one-shot in the loops section is a one-shot nobody finds.
+        assert!(!is_loop("bpmania.wav"));
+        assert!(!is_loop("kicks/808 1.wav"));
+    }
+
+    #[test]
+    fn the_loops_header_cannot_collide_with_a_folder() {
+        // A pack that lives in a folder called "loops" would otherwise
+        // merge into this group and stop being distinguishable from it.
+        let all = vec![entry("loops/one shot.wav")];
+        let out = sections(all.iter());
+        assert_ne!(out[0].0, LOOPS_HEADER);
+        assert_eq!(out[0].0, "loops");
+    }
+
+    #[test]
+    fn a_library_with_no_loops_has_no_loops_header() {
+        // An empty section is a heading over nothing, which reads as a
+        // feature that is broken rather than one you are not using.
+        let all = vec![entry("kicks/808 1.wav")];
+        let out = sections(all.iter());
+        assert!(out.iter().all(|(h, _)| h != LOOPS_HEADER), "{out:?}");
+    }
     use super::*;
 
     /// A miniature of the REAL library this feature was asked against:
