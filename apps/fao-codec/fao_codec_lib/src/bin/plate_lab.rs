@@ -832,11 +832,14 @@ end_header
             let Some(mesh) = dense_mesh.as_ref() else {
                 die("--render3d requires --dense (the sparse cloud does not rasterize)");
             };
-            // Serialized canonical: verts f32x3 + colors u8x3 + indices
-            // u32x3, zstd-19 — the wire form a library canonical would
-            // actually ship (normals are recomputable; the spatial hash
-            // is encoder state).
-            let mesh_bytes = {
+            // Serialized canonical through mesh_pack (one AABB, quantised
+            // plane-split positions, delta-coded indices). --mesh-bits
+            // sweeps the rate knob; --mesh-nocolor drops vertex colours.
+            // The naive f32 form the first bridge shipped is still
+            // measured, as the baseline the pack has to beat, and the
+            // render uses the DECODED mesh so prediction quality pays
+            // for the quantisation honestly.
+            let naive_bytes = {
                 let mut raw: Vec<u8> =
                     Vec::with_capacity(mesh.vertices.len() * 15 + mesh.indices.len() * 4);
                 for v in &mesh.vertices {
@@ -854,6 +857,25 @@ end_header
                 }
                 zstd::encode_all(raw.as_slice(), 19).map(|c| c.len()).unwrap_or(raw.len())
             };
+            let mp_opts = fao_codec::mesh_pack::MeshPackOpts {
+                pos_bits: arg_val(&args, "--mesh-bits")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(16),
+                keep_colors: !args.iter().any(|a| a == "--mesh-nocolor"),
+            };
+            let (wire, decoded_mesh) = fao_codec::mesh_pack::encode(mesh, &mp_opts);
+            let mesh_bytes = wire.len();
+            let (abs_e, frac_e) = fao_codec::mesh_pack::quant_error(mesh, &decoded_mesh);
+            println!(
+                "mesh pack: naive {} B -> packed {} B ({:.0}%) at {} bits | max vert error {:.4} ({:.2e} of diagonal)",
+                naive_bytes,
+                mesh_bytes,
+                100.0 * mesh_bytes as f32 / naive_bytes.max(1) as f32,
+                mp_opts.pos_bits,
+                abs_e,
+                frac_e
+            );
+            let mesh = &decoded_mesh;
             let t3 = std::time::Instant::now();
             // Full-range BT.601, the exact inverse of the color sampling
             // that built the mesh (r = (Y + 1.402 V')/255 etc.).

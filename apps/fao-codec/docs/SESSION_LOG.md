@@ -3926,3 +3926,73 @@ shelf-packing would remove that if the atlas ever matters.
 Process note: a suite launched with nohup did NOT survive the turn
 boundary in this sandbox (empty log, no process, header-only CSV).
 Long benchmarks must run in bounded foreground chunks.
+
+### mesh_pack: keeping the 3D world model from eating the file
+
+User's concern, and it was already the sharpest number in the bridge:
+the w1 canonical serialized to 230 KB against a 71.8 KB 2D plate, for
+WORSE prediction. Asset size — not render quality — is the 3D path's
+binding constraint, because every model byte moves the break-even take
+count that the whole amortization thesis rests on.
+
+New module fao_codec_lib/src/mesh_pack.rs: a headless mesh codec
+(bytes in, bytes out, no renderer). One AABB for the WHOLE mesh,
+quantised plane-split positions, plane-split colours, zigzag-varint
+delta indices, one zstd-19 pass. encode() returns the wire bytes AND
+the decoder's mesh; --render3d now renders from the DECODED mesh, so
+prediction quality pays for the quantisation honestly.
+
+This is the OTHER half of the blackstar lesson, and this time it
+transfers. FLEET_COMPRESSION.md measured all three parts-web
+techniques on dense float32 vertex buffers: dedup 0/1289, shared
+dictionary no gain, and 16-bit quantisation the whole win (936 MB ->
+~205 MB at 0.0008% error). The sprite atlas borrowed the solid-window
+half and failed; canonical meshes are literally the data shape those
+numbers came from, so the quantisation half was the right borrow.
+FLEET_COMPRESSION's correctness caveat carried over too and is stated
+at the site: ONE box per mesh, never per-part — per-part boxes map
+identical world positions to different integers and warp anything
+that interpolates between them (there: the fold; here: cross-anchor
+vertex fusion and any future canonical-to-canonical lineage delta).
+
+Measured on w1's dense canonical (15,127 verts / 29,030 tris), dz32,
+naive baseline = the f32+u8+u32 form the first bridge shipped:
+
+  bits  mesh B   of naive  max vert err (of diag)  total B   PSNR
+  naive 229,974   100%     0                       656,704   36.910
+  16    103,060    45%     0.027  (7.5e-6)         531,803   36.977
+  12     81,751    36%     0.435  (1.2e-4)         513,023   36.870
+  10     67,040    29%     1.754  (4.8e-4)         492,388   37.083
+   8     49,364    21%     6.977  (1.9e-3)         482,383   36.709
+  10, no vertex colours:
+        40,198    17%     1.754  (4.8e-4)         470,458   36.226
+
+Reading, in order of what matters:
+1. Lossless-ish repacking alone (16 bits, 7.5e-6 of the diagonal) cuts
+   the asset 55% and the total 19%. That is free — the naive form was
+   simply wasteful.
+2. The knee is 10 BITS, not 16: 29% of naive, and PSNR is 0.11 dB
+   BETTER than at 16 bits. Quantisation to a ~0.5 mm-equivalent grid
+   is acting as a mild regulariser on triangulation noise; the depth
+   estimates carry far more error than 10-bit position quantisation
+   adds, so spending 16 bits encodes noise precisely. Sub-8-bit is
+   past the knee (bytes still fall, quality turns).
+3. Vertex colours are 40% of the packed asset at 10 bits and buy
+   0.86 dB — the best exchange rate in the table, so KEEP them; the
+   switch exists for engine canonicals that a per-take texture
+   re-colours anyway.
+4. Against the 2D plate the gap is now 67 KB vs 71.8 KB — the 3D
+   canonical is CHEAPER THAN THE PLATE for the first time, at
+   -1.2 dB. That is the number that makes the 3D branch worth
+   continuing: the model no longer explodes the asset budget, so the
+   remaining work is prediction quality (pan triangulation, cross-take
+   pose alignment), not size.
+
+Suite chunk this session, v5 movers at dz40 vs recorded v3 at dz32
+(14 of 19 shots, docs/full_v5_dz40.csv): wins on 8 shots (shot 2
+-16.9%, shot 7 -12.9%, shot 6 -6.9%, shot 10 -6.5%, shot 8 -6.3%,
+shot 15 -5.1%, shot 3 -4.5%, shot 18 -3.4%) at -0.2..-0.4 dB, loses
+on 3 (shot 11 +16.3%, shot 4 +5.4%, shot 13 +0.6%), and shots 1/5/17
+reproduce v3 byte-exact (1749/297/965 — harness re-validated).
+Shots 9, 12, 16, 19 (the four largest, motion-dominated) NOT yet run,
+so there is no aggregate-vs-AV1 number for v5 yet.
