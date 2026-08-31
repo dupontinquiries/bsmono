@@ -4035,3 +4035,63 @@ Two structural notes the per-shot column makes visible:
    coders. That is the routing law working, but it means "v11.5's
    number" is really "the router's number", which is the honest way to
    quote it.
+
+### Pan-triangulation collapse root-caused: it is the MATERIAL, not the pipeline
+
+The 3D bridge's named blocker was "shot 4 keeps 2 of 197 tracks".
+Three diagnostics, each added because the previous one's answer was
+compatible with several causes:
+
+1. REJECTION CENSUS (FAO_TRI_DEBUG, in TriangulatePass::triangulate_all).
+   "2 of 197" says nothing about which gate fired.
+     shot 4: 191/197 die on REPROJECTION, median 48.5px vs a 4px gate;
+             behind-camera 4, no-baseline-pair 0, ray-degenerate 0.
+     w1:     330/460 on reprojection, median 14.6px.
+   Median error an order of magnitude past the threshold: not tuning.
+
+2. POSE-VS-TRACKS DESYNC. The pose track accumulates GLOBAL phase
+   correlation; the observations triangulation consumes come from the
+   feature tracker. Measured drift over the GOP:
+     shot 4: pose 126.0px vs tracks -50.6px -> worst |sum| 98.7px
+     w1:     pose -42.0px vs tracks  50.4px -> worst |sum|  8.6px
+   Phase correlation overstated shot 4's camera motion 2.5x, and shot 4
+   carries 21 detected movers — the SAME failure canonical fusion
+   already fixed one level up (raw phase-corr latches onto a large
+   moving foreground; a median votes with the background). That fix was
+   never applied to the pose track.
+   FIX BUILT: --pose-from-tracks rebuilds the pose from the median
+   displacement of static tracks (two-pass, because the consensus
+   classifier needs a motion estimate to label Static in the first
+   place; frames with <6 correspondences HOLD rather than fall back to
+   the estimator under suspicion).
+   Measured: w1 81 -> 98 points (+21%), median reproj 14.6 -> 11.0;
+   shot 4 2 -> 3, median reproj 48.5 -> 38.5; SMITE 27 -> 31, median
+   reproj 19.9 -> 16.8, mean reproj 2.17 -> 1.80px. Real, well-founded,
+   and NOT the cause.
+
+3. CORRESPONDENCE QUALITY — the clincher, and it inverted the working
+   hypothesis. A 10.7px pairwise affine RMS against 4.7px of per-pair
+   motion looked like broken tracking. It is not:
+     shot 4: 88% of correspondences within 2px of the pair affine
+     w1:     88%
+     SMITE:  66%
+   The tracks are fine; the RMS is a least-squares fit dragged by the
+   12% tail. But 88%-within-2px means A SINGLE GLOBAL AFFINE EXPLAINS
+   THE FRAME — which is the definition of no parallax. Triangulation is
+   trying to recover a depth signal that the residual (<2px, at the
+   noise floor) does not contain. That is why reprojection lands at
+   48px: with rays this close to parallel, the midpoint is arbitrary.
+
+VERDICT: on this clip the 3D branch is not blocked by tuning, pose, or
+tracking — the MATERIAL carries no usable parallax at GOP scale, so a
+2D plate is the correct model and 3D cannot beat it here by
+construction. This is the earlier prediction ("on a locked-off or
+panning shot a full 3D reconstruction reprojects to exactly what a 2D
+plate gives") confirmed from the measurement side, and it retires
+"fix pan triangulation" as a roadmap item on THIS footage.
+SMITE's 66% inlier rate is the contrast that makes the point: a third
+of its correspondences are genuinely non-affine, and it triangulates
+10x better per candidate than shot 4 (31/250 vs 3/197) despite worse
+tracking. Parallax-bearing material is the precondition for evaluating
+the 3D path at all — the honest next step is a camera-orbit or
+engine-rendered source, not more work on the bloopers.

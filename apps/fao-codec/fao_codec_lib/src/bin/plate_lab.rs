@@ -460,6 +460,74 @@ fn main() {
                 }
                 cum[t] = gm::compose(&a, &cum[t - 1]);
             }
+            // Pose-vs-tracks desync census. The pose track accumulates
+            // GLOBAL phase-correlation motion, and only when confidence
+            // clears 0.15; the observations that triangulation consumes
+            // come from the FEATURE TRACKER. If those two disagree, every
+            // reprojection is wrong by the drift between them and no
+            // threshold tuning can help — so measure the disagreement
+            // directly instead of inferring it.
+            {
+                let (mut cum_pc, mut cum_tr) = (0.0f32, 0.0f32);
+                let mut worst = 0.0f32;
+                for t in 1..nfr {
+                    let mut dx: Vec<f32> = Vec::new();
+                    for (id, &(x1, _)) in &per_frame[t] {
+                        if let Some(&(x0, _)) = per_frame[t - 1].get(id) {
+                            dx.push(x1 - x0);
+                        }
+                    }
+                    if dx.len() < 6 { continue; }
+                    dx.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let med = dx[dx.len() / 2];
+                    cum_tr += med;
+                    cum_pc += poses[t].position.x - poses[t - 1].position.x;
+                    let d = (cum_tr + cum_pc).abs();
+                    if d > worst { worst = d; }
+                }
+                println!(
+                    "pose-vs-tracks: cumulative pose dx {:.1}px, cumulative track dx {:.1}px, worst |sum| {:.1}px",
+                    cum_pc, cum_tr, worst
+                );
+            }
+            // Correspondence quality: what fraction of per-pair matches
+            // sit within 2 px of the best-fit affine, and how big is the
+            // median motion they are supposed to be explaining. An RMS
+            // that dwarfs the motion means the correspondences are noise,
+            // and NO downstream geometry stage can recover from that —
+            // this is the number that separates "bad pose" from "bad
+            // tracks".
+            {
+                let (mut inl, mut tot, mut motion_acc, mut mp) = (0usize, 0usize, 0.0f32, 0usize);
+                for t in 1..nfr {
+                    let mut pairs: Vec<(f32, f32, f32, f32)> = Vec::new();
+                    for (id, &(x1, y1)) in &per_frame[t] {
+                        if let Some(&(x0, y0)) = per_frame[t - 1].get(id) {
+                            pairs.push((x0, y0, x1, y1));
+                        }
+                    }
+                    if pairs.len() < 6 { continue; }
+                    let a = gm::fit(&pairs).unwrap_or(gm::IDENTITY);
+                    let mut mags: Vec<f32> = Vec::with_capacity(pairs.len());
+                    for &(x0, y0, x1, y1) in &pairs {
+                        let px = a[0] * x0 + a[1] * y0 + a[2];
+                        let py = a[3] * x0 + a[4] * y0 + a[5];
+                        if ((px - x1).powi(2) + (py - y1).powi(2)).sqrt() <= 2.0 { inl += 1; }
+                        tot += 1;
+                        mags.push(((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt());
+                    }
+                    mags.sort_by(|u, v| u.partial_cmp(v).unwrap());
+                    motion_acc += mags[mags.len() / 2];
+                    mp += 1;
+                }
+                if tot > 0 {
+                    println!(
+                        "correspondences: {:.0}% within 2px of the pair affine | median per-pair motion {:.2}px",
+                        100.0 * inl as f32 / tot as f32,
+                        motion_acc / mp.max(1) as f32
+                    );
+                }
+            }
             if np > 0 {
                 println!(
                     "pairwise residual RMS: translation {:.2}px affine {:.2}px | max per-pair rot {:.3}rad",
@@ -629,6 +697,67 @@ fn main() {
                 (*id, (o.frame_idx, o.screen_x, o.screen_y))
             })
             .collect();
+        // --pose-from-tracks: rebuild the pose track from the MEDIAN
+        // displacement of static feature tracks instead of global phase
+        // correlation.
+        //
+        // The census says 191 of shot 4's 197 candidates die on
+        // reprojection error at a 48 px median, and the pose-vs-tracks
+        // diagnostic says why: phase correlation reports 126 px of
+        // camera motion where the tracks that triangulation actually
+        // consumes report 50.6 px. The pose track and the observations
+        // are describing different motions, so every reprojection is
+        // wrong by their drift and no threshold can rescue it.
+        //
+        // This is the SAME failure the canonical-fusion work already
+        // diagnosed and fixed one level up: raw phase correlation
+        // latches onto a large moving foreground (shot 4 carries 21
+        // detected movers), while a MEDIAN over blocks/tracks votes with
+        // the background because actors are the minority. That fix was
+        // applied to plate registration and never to the pose track.
+        // Two-pass by necessity: the consensus classifier needs a motion
+        // estimate to label tracks Static, so pass 1 stays phase-corr and
+        // pass 2 rebuilds the pose from the tracks it labelled.
+        if args.iter().any(|a| a == "--pose-from-tracks") {
+            let nfr = frames.len();
+            let mut per_frame: Vec<std::collections::HashMap<u32, (f32, f32)>> =
+                vec![std::collections::HashMap::new(); nfr];
+            for (id, v) in &world {
+                for o in v {
+                    per_frame[o.frame_idx as usize].insert(*id, (o.screen_x, o.screen_y));
+                }
+            }
+            let (mut cx, mut cy) = (0.0f32, 0.0f32);
+            let mut n_fallback = 0usize;
+            for t in 1..nfr {
+                let (mut dx, mut dy) = (Vec::new(), Vec::new());
+                for (id, &(x1, y1)) in &per_frame[t] {
+                    if let Some(&(x0, y0)) = per_frame[t - 1].get(id) {
+                        dx.push(x1 - x0);
+                        dy.push(y1 - y0);
+                    }
+                }
+                if dx.len() >= 6 {
+                    dx.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    dy.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    // Same sign convention as the phase-corr path: content
+                    // moving right means the camera moved left.
+                    cx += -dx[dx.len() / 2];
+                    cy += -dy[dy.len() / 2];
+                } else {
+                    // Too few correspondences to trust a median: HOLD the
+                    // pose rather than fall back to phase correlation,
+                    // which is the estimator under suspicion.
+                    n_fallback += 1;
+                }
+                poses[t].position.x = cx;
+                poses[t].position.y = cy;
+            }
+            println!(
+                "pose rebuilt from static-track medians ({} frames held for <6 correspondences)",
+                n_fallback
+            );
+        }
         let cam_span = {
             let (mut minx, mut maxx, mut miny, mut maxy) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
             for p in &poses {

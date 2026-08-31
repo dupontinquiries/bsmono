@@ -5362,8 +5362,18 @@ impl TriangulatePass {
         pose_track: &[CameraPose],
     ) -> Vec<TriangulatedFeature> {
         let mut out = Vec::with_capacity(observations.len());
+        // Rejection census (FAO_TRI_DEBUG=1). Triangulation collapsing to
+        // a handful of points is the 3D path's headline failure — shot 4
+        // of the bloopers keeps 2 of 197 — and "2 of 197" says nothing
+        // about WHICH gate fired. Counting them separates an ill-posed
+        // geometry (no baseline / behind camera) from a tuning problem
+        // (reprojection threshold).
+        let dbg = std::env::var("FAO_TRI_DEBUG").is_ok();
+        let (mut r_short, mut r_nopair, mut r_rays, mut r_cheir, mut r_reproj, mut r_fewobs) =
+            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut reproj_hist: Vec<f32> = Vec::new();
         for (feature_id, obs) in observations.iter() {
-            if obs.len() < 2 { continue; }
+            if obs.len() < 2 { r_fewobs += 1; continue; }
             
             // Pick the pair with the longest baseline (best triangulation)
             let mut best_pair: Option<(usize, usize, f32)> = None;
@@ -5385,7 +5395,7 @@ impl TriangulatePass {
                 }
             }
             
-            let (i, j, baseline) = match best_pair { Some(p) => p, None => continue };
+            let (i, j, baseline) = match best_pair { Some(p) => p, None => { r_nopair += 1; if dbg { r_short += 1; } continue } };
             
             let pose_a = pose_track[obs[i].frame_idx as usize];
             let pose_b = pose_track[obs[j].frame_idx as usize];
@@ -5401,7 +5411,7 @@ impl TriangulatePass {
                 pose_b.position, ray_b,
             ) {
                 Some(p) => p,
-                None => continue,
+                None => { r_rays += 1; continue }
             };
             
             // Cheirality: the point must lie at POSITIVE depth along both
@@ -5419,6 +5429,7 @@ impl TriangulatePass {
                 + (world_pos.y - pose_b.position.y) * ray_b.y
                 + (world_pos.z - pose_b.position.z) * ray_b.z;
             if da <= 0.0 || db <= 0.0 {
+                r_cheir += 1;
                 continue;
             }
             
@@ -5430,7 +5441,8 @@ impl TriangulatePass {
             let err_b = ((rx_b - obs[j].screen_x).powi(2) + (ry_b - obs[j].screen_y).powi(2)).sqrt();
             let mean_err = (err_a + err_b) * 0.5;
             
-            if mean_err > self.max_reprojection_error { continue; }
+            if dbg { reproj_hist.push(mean_err); }
+            if mean_err > self.max_reprojection_error { r_reproj += 1; continue; }
             
             // Confidence: combines track length, baseline, and reprojection accuracy
             let track_score = (obs.len() as f32 / 10.0).min(1.0);
@@ -5448,6 +5460,21 @@ impl TriangulatePass {
                 baseline,
                 last_observed_frame,
             });
+        }
+        if dbg {
+            reproj_hist.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let pct = |f: f32| -> f32 {
+                if reproj_hist.is_empty() { return f32::NAN; }
+                reproj_hist[((reproj_hist.len() - 1) as f32 * f) as usize]
+            };
+            eprintln!(
+                "tri census: {} candidates -> {} kept | rejected: <2obs {} no-baseline-pair {} ray-degenerate {} behind-camera {} reproj>{} {} | reproj p50 {:.2} p90 {:.2} p99 {:.2}",
+                observations.len(), out.len(),
+                r_fewobs, r_nopair, r_rays, r_cheir,
+                self.max_reprojection_error, r_reproj,
+                pct(0.5), pct(0.9), pct(0.99)
+            );
+            let _ = r_short;
         }
         out
     }
