@@ -14,6 +14,9 @@
 //               audio/HTTP crates that complete it)
 
 pub mod protocol;
+/// The one client for the control socket — see the module note on why
+/// there were three copies of the path.
+pub mod control;
 pub mod peer_auth;
 pub mod drone_canceller;
 pub mod passby_canceller;

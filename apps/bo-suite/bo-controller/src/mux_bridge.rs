@@ -38,10 +38,8 @@ enum SetupMsg {
 const SHIPPING_VERSION: &str = "0.1.0";
 
 fn socket_path() -> PathBuf {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("bo-mux/control.sock")
+    // One definition, in the crate the daemon and both front-ends share.
+    bo_mux::control::socket_path()
 }
 
 fn version_stamp_path() -> PathBuf {

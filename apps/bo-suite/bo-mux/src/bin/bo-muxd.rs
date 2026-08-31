@@ -772,9 +772,12 @@ fn build_node_info() -> bo_mux::protocol::NodeInfo {
 }
 
 fn socket_path() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(DEFAULT_SOCKET_REL)
+    // Delegates to the library. The path was written out three times —
+    // here, in bo-controller's Qt bridge, and nowhere the egui port
+    // could reach — and a daemon binding one path while a client
+    // connects to another fails as "not running", which sends everyone
+    // looking at the wrong thing.
+    bo_mux::control::socket_path()
 }
 
 /// Acquire the listener: prefer a systemd-passed fd, else bind ourselves.

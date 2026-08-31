@@ -427,6 +427,10 @@ pub struct Controller {
     pub soundscape: crate::soundscape::Soundscape,
     /// Which scene preset was last loaded, for the status line.
     pub scene_loaded: Option<String>,
+    /// Request id for daemon calls. Monotonic, because `control::call`
+    /// matches the reply BY id and a reused one could pick up the
+    /// previous call's answer.
+    pub scene_seq: u64,
     pub settings: crate::settings_page::SettingsPage,
     pub sinks: crate::settings_page::SinkPicker,
     pub now: crate::chrome::NowPlaying,
@@ -451,6 +455,7 @@ pub struct Controller {
 impl Controller {
     pub fn new(devices: Vec<Device>, scenes: Vec<Scene>) -> Self {
         Controller { nav: uikit_egui::nav::Nav::new(VIEWS.len()), scene_loaded: None,
+            scene_seq: 0,
             strip: uikit_egui::segmented_tabs::TabStrip::new(&VIEWS),
             devices, scenes, active_scene: 0,
             breath: uikit_egui::motion::Breath::new(2200.0, 0.35, 1.0),
@@ -1376,9 +1381,33 @@ impl Controller {
                             .join(format!("{name}.json"));
                         match bo_mux::soundscape_config::load_from_file(&path) {
                             Ok(cfg) => {
-                                self.scene_loaded = Some(name.clone());
-                                self.toast.show(&format!(
-                                    "{name}: {} layers", cfg.layers.len()));
+                                // Validated locally, then handed to the
+                                // daemon BY NAME — it resolves against
+                                // the same scene_dir, so sending a path
+                                // would let the two disagree about what
+                                // a scene name means.
+                                //
+                                // The local parse is not redundant: it
+                                // is why a bad scene reports its actual
+                                // JSON error rather than the daemon's
+                                // "load failed", and why the layer count
+                                // is available to say.
+                                self.scene_seq += 1;
+                                match bo_mux::control::load_scene(self.scene_seq, name) {
+                                    Ok(_) => {
+                                        self.scene_loaded = Some(name.clone());
+                                        self.toast.show(&format!(
+                                            "{name}: {} layers", cfg.layers.len()));
+                                    }
+                                    // The scene is GOOD and the daemon
+                                    // could not take it — a different
+                                    // problem from a bad scene, and
+                                    // worth saying differently.
+                                    // `scene_loaded` stays unset,
+                                    // because nothing is playing it.
+                                    Err(e) => self.toast.show(&format!(
+                                        "{name} parsed, but {}", e.message())),
+                                }
                             }
                             Err(e) => self.toast.show(&format!("{name}: {e}")),
                         }

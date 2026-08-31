@@ -5392,9 +5392,37 @@ Decisions:
 
 bo-mux 266/266, bo-suite-egui 416/416.
 
-- **C96a — loading does not yet TELL the daemon.** It reads and
-  validates the config and reports the layer count; the daemon still
-  needs a `load_scene` call, and this port has no daemon connection at
-  all. That is the next real piece.
+- **C96a — DONE. `bo_mux::control` is the daemon client.**
+
+  The socket path was written out THREE times: in the daemon that binds
+  it, in bo-controller's Qt bridge that connects to it, and nowhere the
+  egui port could reach. Same shape as `scene_dir` one commit earlier,
+  failing the same way — private copies of a path that must agree, and a
+  third caller locked out. Both existing copies now delegate.
+
+  Protocol decisions, from reading what the daemon actually does:
+  - **Read until the id MATCHES**, not the first line. The daemon can
+    emit unsolicited lines, and taking the first would report a status
+    update as the result of a scene load.
+  - **An unparseable line is SKIPPED, not fatal** — one noisy line must
+    not lose an answer sitting right behind it.
+  - **Timeouts on both directions.** A GUI calls this from a frame; a
+    daemon that accepts a connection and stalls would freeze the UI for
+    as long as it liked.
+  - **`NotRunning` is its own variant**, because it is the one case a
+    person can act on. `is_running` connects rather than checking
+    `exists()`: the socket FILE outlives a crashed daemon, so a path
+    check reports a dead daemon as running.
+  - **Stream closed without a reply is `Broken`, not `Timeout`** — the
+    daemon hung up, and telling somebody to wait for something that
+    already gave up is wrong.
+
+  The scene button now validates locally AND calls the daemon. The local
+  parse is not redundant: it is why a bad scene reports its real JSON
+  error instead of the daemon's generic failure. A scene that parses but
+  the daemon refuses says so distinctly, and `scene_loaded` stays unset
+  because nothing is playing it.
+
+  bo-mux 269/269, bo-suite-egui 416/416.
 - **C96b — `save_to_file` is still uncalled.** Nothing in the port edits
   a scene, so there is nothing to save. Honest, and left.
