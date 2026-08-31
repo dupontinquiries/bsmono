@@ -250,14 +250,49 @@ fn decode_entities(s: &str) -> String {
     out
 }
 
+/// The offset of the `>` closing a tag that starts at 0, skipping any
+/// inside quoted attribute values.
+///
+/// Both quote characters, tracked separately: an unclosed `"` inside a
+/// `'...'` value is ordinary in markup carrying JavaScript, and treating
+/// them as one would swallow the rest of the document.
+fn tag_end(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut quote: Option<u8> = None;
+    for (i, c) in b.iter().enumerate() {
+        match quote {
+            Some(q) if *c == q => quote = None,
+            Some(_) => {}
+            None => match *c {
+                b'"' | b'\'' => quote = Some(*c),
+                b'>' => return Some(i),
+                _ => {}
+            },
+        }
+    }
+    // An unterminated tag: no `>` anywhere. The caller treats that as the
+    // end of the document, which is what a browser does too — better than
+    // emitting the rest of the file as text.
+    None
+}
+
 fn tokenize(html: &str) -> Vec<Token> {
     let mut toks = Vec::new();
     let bytes = html.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'<' {
-            // find the end of the tag
-            if let Some(end) = html[i..].find('>') {
+            // The end of the tag, RESPECTING QUOTED ATTRIBUTE VALUES.
+            //
+            // A plain `find('>')` ends the tag at the first angle bracket,
+            // and attribute values contain them: PyPI's search box carries
+            // `data-action="keydown@window->search-focus#focusSearchField"`,
+            // which cut the tag in half and put
+            // `search-focus#focusSearchField" data-search-focus-target=`
+            // on the page as prose. Found by parsing the real page, not by
+            // any fixture — every test HTML I had written used tidy
+            // attributes.
+            if let Some(end) = tag_end(&html[i..]) {
                 let raw = &html[i + 1..i + end];
                 i += end + 1;
                 let raw = raw.trim();
@@ -424,7 +459,35 @@ pub fn parse_html_with(html: &str, opts: &ParseOptions<'_>) -> RichDoc {
 
     let cap = opts.max_blocks;
     let flush = |cur: &mut Option<Block>, blocks: &mut Vec<Block>, dropped: &mut usize| {
-        if let Some(b) = cur.take() {
+        if let Some(mut b) = cur.take() {
+            // TRIM THE BLOCK'S EDGES, not each run.
+            //
+            // `collapse_ws` turns a run of whitespace into one space,
+            // which is right inside a paragraph and wrong at its ends: a
+            // real page's markup is indented, so almost every block came
+            // out as " Skip to content          ". Trimming per RUN would
+            // instead weld "see <b>this</b> page" into "seethispage" —
+            // the space between runs is content.
+            //
+            // Only the first and last run, and only their outer edges.
+            // Found by parsing github.com, where every block on the page
+            // had the indentation of the source in it.
+            if b.kind != BlockKind::Code {
+                // Walk IN from each end until a run has content. Trimming
+                // only the original first and last run is not enough:
+                // indented markup produces whitespace-only runs, so the
+                // padding just moves to the next one. That is what the
+                // real pages showed after my first attempt.
+                while let Some(first) = b.inlines.first_mut() {
+                    first.text = first.text.trim_start().to_string();
+                    if first.text.is_empty() { b.inlines.remove(0); } else { break; }
+                }
+                while let Some(last) = b.inlines.last_mut() {
+                    last.text = last.text.trim_end().to_string();
+                    if last.text.is_empty() { b.inlines.pop(); } else { break; }
+                }
+            }
+            let b = b;
             if !b.inlines.iter().all(|i| i.text.trim().is_empty()) || b.kind == BlockKind::Rule {
                 if blocks.len() < cap { blocks.push(b); } else { *dropped += 1; }
             }
@@ -1164,5 +1227,70 @@ mod noise_parity_tests {
         let tree = crate::doc::parse_page(html).root.text();
         assert!(!tree.contains("var x"));
         assert!(!tree.contains("color:red"));
+    }
+}
+
+#[cfg(test)]
+mod real_page_tests {
+    use super::*;
+
+    #[test]
+    fn an_angle_bracket_inside_an_attribute_does_not_end_the_tag() {
+        // Verbatim from PyPI's search box. A plain `find('>')` cut the tag
+        // in half and put `search-focus#focusSearchField" ...` on the page
+        // as prose. No fixture I had written caught it — every one used
+        // tidy attributes.
+        let html = "<p><input data-action=\"keydown@window->search-focus#focusSearchField\" \
+                    data-target=\"searchField\">Search PyPI</p>";
+        let d = parse_html(html);
+        assert!(d.text().contains("Search PyPI"), "{:?}", d.text());
+        assert!(!d.text().contains("focusSearchField"),
+                "the attribute leaked into the document: {:?}", d.text());
+    }
+
+    #[test]
+    fn a_single_quoted_attribute_is_handled_too() {
+        // Markup carrying JavaScript mixes both quote styles constantly.
+        let d = parse_html("<p><a href='/a?x=1&y=2' onclick='f(a>b)'>link</a></p>");
+        assert_eq!(d.text().trim(), "link", "{:?}", d.text());
+    }
+
+    #[test]
+    fn an_unterminated_tag_ends_the_document_rather_than_becoming_text() {
+        // What a browser does. Emitting the rest of the file as prose is
+        // the alternative, and it is worse.
+        let d = parse_html("<p>before</p><div class=\"never closed");
+        assert!(d.text().contains("before"));
+        assert!(!d.text().contains("never closed"), "{:?}", d.text());
+    }
+
+    #[test]
+    fn a_blocks_edges_are_trimmed_but_its_runs_are_not_welded() {
+        // Real markup is indented, so almost every block came out as
+        // " Skip to content          ". Trimming per RUN instead would
+        // weld "see this page" into "seethispage" — the space between
+        // runs is content.
+        let d = parse_html("<p>\n    see <b>this</b> page\n  </p>");
+        assert_eq!(d.text().trim_end(), "see this page", "{:?}", d.text());
+        let joined: String = d.blocks[0].inlines.iter()
+            .map(|i| i.text.as_str()).collect();
+        assert!(!joined.starts_with(' ') && !joined.ends_with(' '), "{joined:?}");
+    }
+
+    #[test]
+    fn whitespace_only_runs_at_the_edges_are_walked_past() {
+        // Trimming only the FIRST run is not enough: indentation makes
+        // whitespace-only runs, so the padding moves to the next one. The
+        // real pages showed exactly that after my first attempt.
+        let d = parse_html("<p> <span> </span> <b>x</b> <span> </span> </p>");
+        let joined: String = d.blocks[0].inlines.iter()
+            .map(|i| i.text.as_str()).collect();
+        assert_eq!(joined, "x", "{joined:?}");
+    }
+
+    #[test]
+    fn code_keeps_its_leading_space_because_indentation_is_the_content() {
+        let d = parse_html("<pre>    indented\n</pre>");
+        assert!(d.text().starts_with("    "), "{:?}", d.text());
     }
 }
