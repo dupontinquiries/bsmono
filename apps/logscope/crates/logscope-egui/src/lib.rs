@@ -118,6 +118,7 @@ pub use logscope_fan::cmdpalette;
 #[cfg(feature = "gui")] pub mod theme;
 #[cfg(feature = "gui")] pub mod roomtheme;
 #[cfg(feature = "gui")] pub mod prefs;      // the few choices that must survive a restart (via config-kit)
+#[cfg(feature = "gui")] pub mod chords;     // keyboard chords for the quick-action chips, with the collision rules as tests
 #[cfg(feature = "gui")] pub mod ctxcard;    // context-card facts: size line and a topic-match figure with its denominator
 #[cfg(feature = "gui")] pub mod noderole;   // what a node IS (root/fork/pruned/artifact…), for the label above its text
 #[cfg(feature = "gui")] pub mod nodelabel;  // node label text (word-safe elision) and which labels get drawn

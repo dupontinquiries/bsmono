@@ -8823,9 +8823,28 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
             if self.input.trim().is_empty() {
                 let sugg = self.suggestions(doc);
                 if !sugg.is_empty() {
+                    // KEYS ON THE CHIPS, as the reference panels print them beside every quick
+                    // action. Positional rather than per-action: these chips are generated from the
+                    // conversation, so binding a key to "Summarize" would bind it to nothing
+                    // whenever the last reply contained code. See `chords`.
+                    let picked = ui.input_mut(|i| {
+                        let mods = i.modifiers;
+                        (0..crate::chords::MAX_INDEXED.min(sugg.len())).find(|&n| {
+                            crate::chords::digit_for(n)
+                                .map(|k| crate::chords::fires(n, mods, k) && i.consume_key(egui::Modifiers::COMMAND, k))
+                                .unwrap_or(false)
+                        })
+                    });
+                    if let Some(n) = picked {
+                        if let Some(s) = sugg.get(n) { self.input = s.clone(); }
+                    }
                     ui.horizontal_wrapped(|ui| {
-                        for s in &sugg {
-                            if theme::carved_button_tinted(ui, s, theme::accent()).clicked() {
+                        for (n, s) in sugg.iter().enumerate() {
+                            let face = match crate::chords::chord_text(n) {
+                                Some(c) if n < crate::chords::MAX_INDEXED => format!("{s}  {c}"),
+                                _ => s.clone(),
+                            };
+                            if theme::carved_button_tinted(ui, &face, theme::accent()).clicked() {
                                 self.input = s.clone();
                             }
                         }
