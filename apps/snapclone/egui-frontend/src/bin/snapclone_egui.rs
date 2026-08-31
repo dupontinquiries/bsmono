@@ -153,6 +153,14 @@ impl VoiceRig {
 
 struct App {
     snap: Snapclone,
+    /// The accelerometer, once. `None` on a machine without one, and that
+    /// case must cost nothing per frame.
+    accel: Option<snapclone_egui::glove_input::SysfsAccel>,
+    /// Whether the probe has run. Separate from `accel.is_some()` so a
+    /// machine with no sensor is not re-probed every frame — a directory
+    /// scan of /sys at frame rate is the exact cost the discovery-once
+    /// rule exists to avoid.
+    glove_probed: bool,
     /// Accepts inbound snaps for the life of the process, unlike the camera
     /// and voice rigs which come up with a page or a call. A snap arriving
     /// while you are on the Friends page is the ordinary case, and a
@@ -278,7 +286,8 @@ impl App {
             }
         };
 
-        Self { snap, snaps_in, last_snap: None, sending: Vec::new(),
+        Self { snap, snaps_in, accel: None, glove_probed: false,
+               last_snap: None, sending: Vec::new(),
                send_results: Arc::new(Mutex::new(Vec::new())),
                voice: VoiceRig::idle(), rig: CaptureRig::idle(),
                plan_logged: false, focused: true,
@@ -293,6 +302,32 @@ impl App {
     /// cannot run past the frame that called it — and the whole path stays in
     /// one place you can step through, which a channel out of a background
     /// thread would not be.
+    /// Read the accelerometer and let glove mode act on it.
+    ///
+    /// The whole of cold-weather glove mode was already here — the cursor,
+    /// the shake bindings, `apply_glove` and `apply_shake` — and every
+    /// piece of it sat unreached because nothing in this app read a
+    /// sensor. The accessibility mode existed and could not be turned on
+    /// by moving the phone.
+    ///
+    /// Discovered ONCE, on the first frame. Walking /sys/bus/iio on every
+    /// poll is a directory scan twenty times a second for a device that
+    /// does not move between sockets — and a machine with no accelerometer
+    /// must pay nothing at all, which is what the `None` case buys.
+    fn pump_glove(&mut self, ctx: &egui::Context) {
+        if !self.glove_probed {
+            self.glove_probed = true;
+            self.accel = snapclone_egui::glove_input::SysfsAccel::discover();
+            self.snap.glove_input.enable_if_present(self.accel.is_some());
+        }
+        let Some(accel) = self.accel.as_mut() else { return };
+        let dt_ms = ctx.input(|i| i.stable_dt).min(0.25) * 1000.0;
+        if self.snap.poll_glove(dt_ms, accel).is_some() {
+            // A flick moved something, so the next frame has to draw it.
+            ctx.request_repaint();
+        }
+    }
+
     fn pump_gossip(&mut self, now_secs: i64) {
         let Some(sock) = self.gossip.as_mut() else { return };
 
@@ -909,6 +944,7 @@ impl eframe::App for App {
             .unwrap_or(0);
         let cmds = self.snap.apply(HostEvent::Tick { now_secs });
         self.handle(cmds);
+        self.pump_glove(ctx);
         self.pump_gossip(now_secs);
         self.pump_capture();
         self.pump_voice();

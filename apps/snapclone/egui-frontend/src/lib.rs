@@ -112,6 +112,7 @@ pub mod tile_strip;
 pub mod voice_playout;
 pub mod voice_send;
 pub mod freshness;
+pub mod glove_input;
 pub mod gaze;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
@@ -372,6 +373,10 @@ pub struct Snapclone {
     /// mode, because wanting the gesture and wanting a cursor are different
     /// wants.
     pub shake: uikit_egui::glove::ShakeCommands,
+    /// The accelerometer driver. Everything downstream of it — the
+    /// ratchet, `apply_shake`, `apply_glove` — was written and tested and
+    /// unreachable, because nothing in this app read a sensor.
+    pub glove_input: crate::glove_input::GloveInput,
     /// Capture timeouts and limits. The backend reads a SNAPSHOT at start:
     /// editing this mid-capture does not retune a running pipeline, matching
     /// the Qt policy's own threading rule.
@@ -705,6 +710,7 @@ impl Snapclone {
             posture: Default::default(),
             last_voice_at: None,
             glove: Default::default(),
+            glove_input: Default::default(),
             voice_field: None,
             dictated: Vec::new(),
             camera_policy: Default::default(),
@@ -2460,6 +2466,39 @@ impl Snapclone {
         let facing = if self.viewfinder.facing == crate::camera::Facing::Front {
             Facing::Front } else { Facing::Rear };
         self.camera_health.record_capture_success(id, facing, now_ms);
+    }
+
+    /// Poll the accelerometer and act on any flick it produced.
+    ///
+    /// ONE call for both consumers, because a flick is one event: the
+    /// cursor turns it into a step and the command layer matches it
+    /// against a binding. Two readers of the same sensor would be a second
+    /// source of truth about what a flick is — which is the reason
+    /// `Ratchet::feed` returns an orientation rather than a vector, and
+    /// splitting it here would undo that.
+    pub fn poll_glove(&mut self, dt_ms: f32, src: &mut dyn crate::glove_input::Accel)
+        -> Option<uikit_egui::glove::Orient> {
+        let Some((o, t, elapsed)) = self.glove_input.tick(dt_ms, src) else {
+            return None;
+        };
+        // THE CURSOR OWNS THE RATCHET. It is fed the reading and returns a
+        // Tick; the flick in that Tick is the single event both consumers
+        // take. A second ratchet in the driver — which is what I built
+        // first — would be a second opinion about what a flick is, and the
+        // two would disagree the moment their timing drifted.
+        let targets = self.a11y.glove_targets();
+        let tick = self.glove.feed(o, t, elapsed, &targets);
+        // The command layer sees every POLL, not only the flicks: a double
+        // flick is two within a window, and it needs the quiet time
+        // between them to know the window elapsed.
+        self.apply_shake(tick.flicked, elapsed);
+        if tick.escaped {
+            self.apply_glove(uikit_egui::glove::GloveAction::Escaped);
+        }
+        if let Some(id) = tick.snapped.clone() {
+            self.apply_glove(uikit_egui::glove::GloveAction::ArmField(id));
+        }
+        tick.flicked
     }
 
     /// Feed a flick to the command layer and carry out whatever it binds.
