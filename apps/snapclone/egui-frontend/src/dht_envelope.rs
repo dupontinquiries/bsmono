@@ -352,6 +352,41 @@ mod tests {
     }
 
     #[test]
+    fn one_record_carries_every_address_rather_than_one_each() {
+        // The bug this arrangement replaces: publishing one VALUE per
+        // address. OpenDHT keys a value set by value id, and the app
+        // derives one id from the sc-ID alone, so three addresses were
+        // three puts with the same id — two silent overwrites, and a
+        // multi-address announcement that collapsed to whichever landed
+        // last.
+        use crate::dht_announce::{newest, parse, render, Addr, Announcement};
+        let ann = Announcement {
+            user_id: ID.into(),
+            addrs: vec![Addr::new("192.168.1.42", 9876, 9876),
+                        Addr::new("10.8.0.3", 9876, 9876),
+                        Addr::new("203.0.113.9", 9876, 33445)],
+            stamp: 1_700_000_000,
+        };
+        let sealed = seal_with_nonce(ID, V_MULTI, [4u8; NONCE_BYTES],
+                                     render(&ann).as_bytes());
+        // Exactly what the resolve side does with what comes off the DHT.
+        let (_, plain) = open(ID, &sealed).expect("did not open");
+        let got = parse(&String::from_utf8(plain).unwrap()).expect("did not parse");
+        assert_eq!(newest(&[got]).len(), 3,
+                   "addresses were lost between the put and the get");
+    }
+
+    #[test]
+    fn a_record_this_build_cannot_read_is_distinguishable_from_no_record() {
+        // A format or key mismatch and an absent peer produce the same
+        // silence otherwise, and they need very different responses — one
+        // is somebody being offline, the other is the fleet split in two.
+        let foreign = vec![0x02u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+                           0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(open(ID, &foreign), Err(OpenError::BadTag));
+    }
+
+    #[test]
     fn the_whole_announcement_survives_being_wrapped_and_unwrapped() {
         // The two halves together: dht_announce's format inside this
         // envelope is the actual thing that goes into the DHT.

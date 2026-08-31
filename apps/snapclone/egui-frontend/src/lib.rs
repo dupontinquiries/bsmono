@@ -1337,13 +1337,49 @@ impl Snapclone {
                 // several values under the one key. `dht_announce::newest`
                 // is the other half — it discards addresses left over from
                 // a network you have since left.
+                // ONE VALUE CARRYING EVERY ADDRESS, which is both what the
+                // Qt build does and the only thing that works.
+                //
+                // I first published one value per address. OpenDHT holds a
+                // SET per key keyed by VALUE ID, and `value_id_for` derives
+                // one id from the sc-ID alone — so three addresses were
+                // three puts with the same id, two of which overwrote the
+                // others. The multi-address announcement collapsed to
+                // whichever arrived last, silently, which is worse than the
+                // single address it replaced because it looks fixed.
+                //
+                // The payload is `dht_announce`'s plaintext inside
+                // `dht_envelope`, byte for byte what a Qt peer stores.
                 let port = self.settings.current.network.listen_port;
-                let name = &self.settings.current.general.display_name;
-                let mut published = 0;
-                for ip in crate::dht_announce::local_ipv4s() {
-                    h.publish(&self.local_id, name, &ip.to_string(), port);
-                    published += 1;
-                }
+                let addrs: Vec<crate::dht_announce::Addr> =
+                    crate::dht_announce::local_ipv4s().into_iter()
+                        .map(|ip| crate::dht_announce::Addr::new(&ip.to_string(), port, 0))
+                        .collect();
+                let published = if addrs.is_empty() {
+                    0
+                } else {
+                    let ann = crate::dht_announce::Announcement {
+                        user_id: self.local_id.clone(),
+                        addrs,
+                        stamp: self.now_secs.max(0),
+                    };
+                    let plain = crate::dht_announce::render(&ann);
+                    match crate::dht_envelope::random_nonce() {
+                        Some(nonce) => {
+                            let sealed = crate::dht_envelope::seal_with_nonce(
+                                &self.local_id, crate::dht_envelope::V_MULTI,
+                                nonce, plain.as_bytes());
+                            h.publish_raw(&self.local_id,
+                                          crate::identity::dht_value_id(&self.local_id),
+                                          sealed);
+                            1
+                        }
+                        // A predictable nonce with a key anyone can derive
+                        // is no scheme at all, so not publishing beats
+                        // publishing that.
+                        None => 0,
+                    }
+                };
                 if published == 0 {
                     // Worth saying: a node that publishes nothing looks
                     // exactly like one that published fine and was never
@@ -1353,7 +1389,10 @@ impl Snapclone {
                 }
             }
             if let Some(id) = plan.resolve.as_ref() {
-                h.resolve(id);
+                // Raw, because the payload is the Qt build's envelope and
+                // presence has no business decoding it — see
+                // `dht::publish_raw`.
+                h.resolve_raw(id);
             }
         }
 
@@ -1362,6 +1401,40 @@ impl Snapclone {
         for ev in events {
             use snapclone_presence::node_host::Event;
             match ev {
+                Event::ResolvedRaw { sc_id, values } => {
+                    self.dht_schedule.finished(&sc_id, !values.is_empty());
+                    // Unwrap, parse, then take only the FRESHEST
+                    // announcement: values live about an hour, so this
+                    // morning's record is still there this afternoon
+                    // pointing at an address that now belongs to somebody
+                    // else.
+                    let anns: Vec<crate::dht_announce::Announcement> = values.iter()
+                        .filter_map(|v| crate::dht_envelope::open(&sc_id, v).ok())
+                        .filter_map(|(_, plain)| String::from_utf8(plain).ok())
+                        .filter_map(|t| crate::dht_announce::parse(&t))
+                        .collect();
+                    // Something was stored and none of it opened: that is a
+                    // format or key mismatch, not an absent peer, and the
+                    // two need very different responses.
+                    if anns.is_empty() && !values.is_empty() {
+                        self.feed_note = format!(
+                            "{sc_id}: found {} DHT record(s) this build cannot read",
+                            values.len());
+                    }
+                    let candidates = crate::dht_announce::newest(&anns);
+                    let ours = crate::dht_announce::local_ipv4s();
+                    if let Some(best) = crate::dht_announce::best_for(&ours, &candidates) {
+                        if let Some(ip) = parse_dotted_quad(&best.host) {
+                            self.note_peer_addr(&sc_id, ip, best.punch_port, now_ms);
+                            self.feed_note = format!("{sc_id} found via DHT");
+                        }
+                    }
+                    if self.dht_schedule.silent() {
+                        self.feed_note =
+                            "the DHT has answered nothing at all — this node may not be \
+                             reaching the bootstrap network".into();
+                    }
+                }
                 Event::Resolved { sc_id, found } => {
                     // The lookup is over whether or not it found anything —
                     // an empty answer that never ends the lookup wedges the

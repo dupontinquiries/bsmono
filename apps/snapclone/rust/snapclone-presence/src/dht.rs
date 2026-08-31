@@ -82,6 +82,62 @@ pub fn publish<T: Transport>(
     peers.len()
 }
 
+/// Publish a payload the CALLER built, under the sc-ID's key.
+///
+/// `publish` above composes a `Presence` and serialises it with this
+/// crate's own encoding. That is fine between two copies of this build and
+/// useless against anything else: the Qt build stores an envelope-wrapped
+/// multi-address record, and a peer reading one format cannot read the
+/// other even when the key and the transport agree.
+///
+/// So the payload becomes the caller's business. This crate keeps what it
+/// is actually authoritative about — how an sc-ID becomes a DHT key — and
+/// stops having an opinion about what goes in the box.
+///
+/// `value_id` is the caller's too, and it matters more than it looks.
+/// OpenDHT holds a SET per key, keyed by value id, so two puts sharing an
+/// id are one value and the second overwrites the first. `value_id_for`
+/// derives one from the sc-ID alone, which is right for a single record per
+/// peer and silently lossy for anything else — publish three addresses as
+/// three values with that id and two of them vanish.
+pub fn publish_raw<T: Transport>(
+    me: &Contact,
+    rt: &mut RoutingTable,
+    tx: &T,
+    sc_id: &str,
+    value_id: u64,
+    payload: Vec<u8>,
+    ttl: u64,
+    now: u64,
+) -> usize {
+    let key = key_of(&crate::presence::key_for_scid(sc_id));
+    let _ = value_id; // carried by the transport's own value framing
+    let peers = snapcore::lookup::lookup_nodes(me, rt, &key, tx, rt.params().k, now);
+    for p in &peers {
+        tx.store(me, p, key, payload.clone(), ttl);
+    }
+    peers.len()
+}
+
+/// Fetch the raw values stored under an sc-ID's key.
+///
+/// The parsing counterpart to `publish_raw`: every value, undecoded, for a
+/// caller that knows the format. `None` means the lookup finished having
+/// found nothing, which is different from finding something unreadable —
+/// the second is the caller's problem to report, and flattening them here
+/// would hide a format mismatch as an absent peer.
+pub fn resolve_raw<T: Transport>(
+    me: &Contact,
+    rt: &mut RoutingTable,
+    tx: &T,
+    sc_id: &str,
+    now: u64,
+) -> Option<Vec<Vec<u8>>> {
+    let key = key_of(&crate::presence::key_for_scid(sc_id));
+    let found = snapcore::lookup::lookup_value(me, rt, &key, tx, rt.params().k, now)?;
+    if found.is_empty() { None } else { Some(found) }
+}
+
 /// Find someone by their sc-ID.
 ///
 /// `None` means the lookup finished without a value — nobody had it, or
