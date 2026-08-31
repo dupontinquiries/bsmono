@@ -78,6 +78,94 @@ pub enum Commit {
 
 
 /// A gesture in progress. The page width is captured here and never re-read.
+/// How far a finger must travel before the gesture decides what it is.
+///
+/// Below this, a touch is neither a page swipe nor a scroll — it is a tap
+/// that has not lifted yet. Committing earlier makes every tap nudge the
+/// page a pixel or two, which on a phone reads as the screen being loose.
+pub const AXIS_SLOP: f32 = 12.0;
+
+/// How much more horizontal than vertical a drag must be to count as a page
+/// swipe. 1.4, not 1.0: a thumb arcs. Swiping across a phone one-handed
+/// traces a curve with real vertical travel in it, so requiring "mostly
+/// horizontal" rather than "any horizontal majority" is what stops a list
+/// from scrolling a little on every page turn.
+pub const AXIS_RATIO: f32 = 1.4;
+/// The reverse test. Deliberately NOT the reciprocal: a vertical drag with
+/// some sideways drift is the overwhelmingly common gesture in a list, so
+/// scrolling wins ties. Being wrong here costs a scroll that should have
+/// been a page turn — recoverable — where the other error steals the
+/// gesture people make constantly.
+pub const SCROLL_RATIO: f32 = 1.0;
+
+/// What a touch turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    /// Not enough travel to tell yet. Nothing may move.
+    Undecided,
+    /// A horizontal page swipe.
+    Page,
+    /// A vertical scroll. The page must keep its hands off it for the rest
+    /// of this touch, however horizontal the finger later becomes — a
+    /// gesture that changes its mind halfway is one the user cannot aim.
+    Scroll,
+}
+
+/// Decides, once per touch, whether the finger is paging or scrolling.
+///
+/// The single most important thing for a swipe-paged app that also has
+/// lists in it. Without a lock the two compete every frame: a list scrolls
+/// a little on every page turn, and a page nudges sideways on every scroll,
+/// and both look like the app is not sure what you meant.
+///
+/// LATCHING is the whole design. Once decided, the answer holds until the
+/// finger lifts.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AxisLock {
+    decided: Option<Intent>,
+    dx: f32,
+    dy: f32,
+}
+
+impl AxisLock {
+    pub fn new() -> AxisLock { AxisLock::default() }
+
+    /// Feed total travel since the touch began. Returns the current verdict.
+    pub fn feed(&mut self, dx: f32, dy: f32) -> Intent {
+        if let Some(i) = self.decided {
+            return i;
+        }
+        self.dx = dx;
+        self.dy = dy;
+        let (ax, ay) = (dx.abs(), dy.abs());
+        if ax.max(ay) < AXIS_SLOP {
+            return Intent::Undecided;
+        }
+        let i = if ax > ay * AXIS_RATIO {
+            Intent::Page
+        } else if ay > ax * SCROLL_RATIO {
+            Intent::Scroll
+        } else {
+            // Past the slop and not clearly either: a diagonal drag. Given
+            // to the scroll, for the same reason ties are — it is the
+            // gesture a list expects, and the page can be reached with a
+            // deliberate flat swipe.
+            Intent::Scroll
+        };
+        self.decided = Some(i);
+        i
+    }
+
+    pub fn intent(&self) -> Intent {
+        self.decided.unwrap_or(Intent::Undecided)
+    }
+
+    /// The finger lifted. The next touch decides afresh.
+    pub fn release(&mut self) {
+        *self = AxisLock::default();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Swipe {
     page_w: f32,
@@ -159,6 +247,52 @@ impl Swipe {
         let v = self.tracker.velocity(t_ms as f64).abs() as f32;
         // Fast (1 px/ms) → 120ms; still → 320ms.
         (320.0 - v * 200.0).clamp(120.0, 320.0)
+    }
+}
+
+#[cfg(test)]
+mod axis_tests {
+    use super::*;
+
+    #[test]
+    fn nothing_moves_until_the_finger_has_travelled_enough_to_mean_something() {
+        // Deciding earlier makes every tap nudge the page a pixel or two,
+        // which reads as the screen being loose.
+        let mut l = AxisLock::new();
+        assert_eq!(l.feed(3.0, 1.0), Intent::Undecided);
+        assert_eq!(l.feed(AXIS_SLOP - 0.1, 0.0), Intent::Undecided);
+        assert_eq!(l.feed(AXIS_SLOP + 1.0, 0.0), Intent::Page);
+    }
+
+    #[test]
+    fn a_thumb_arc_is_still_a_page_swipe() {
+        // Swiping across a phone one-handed traces a curve with real
+        // vertical travel in it. A strict "mostly horizontal" test would
+        // scroll the list a little on every page turn.
+        let mut l = AxisLock::new();
+        assert_eq!(l.feed(60.0, 18.0), Intent::Page);
+    }
+
+    #[test]
+    fn a_scroll_with_sideways_drift_stays_a_scroll() {
+        // The overwhelmingly common gesture in a list. Losing it to the
+        // pager is the error worth avoiding.
+        let mut l = AxisLock::new();
+        assert_eq!(l.feed(14.0, 40.0), Intent::Scroll);
+        let mut d = AxisLock::new();
+        assert_eq!(d.feed(30.0, 30.0), Intent::Scroll, "a diagonal went to the pager");
+    }
+
+    #[test]
+    fn the_decision_latches_until_the_finger_lifts() {
+        // A gesture that changes its mind halfway is one nobody can aim.
+        // Scroll down, then swing hard sideways: still a scroll.
+        let mut l = AxisLock::new();
+        assert_eq!(l.feed(0.0, 40.0), Intent::Scroll);
+        assert_eq!(l.feed(300.0, 40.0), Intent::Scroll, "the lock let go mid-touch");
+        l.release();
+        assert_eq!(l.intent(), Intent::Undecided);
+        assert_eq!(l.feed(40.0, 0.0), Intent::Page, "the next touch could not decide afresh");
     }
 }
 

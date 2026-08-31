@@ -570,6 +570,23 @@ pub struct Snapclone {
     /// nowhere" render differently — the second holds the page a pixel off
     /// centre and never springs back.
     pub swipe: Option<crate::swipe_physics::Swipe>,
+    /// Which way this touch turned out to be going. Latched for the length
+    /// of the touch — see `swipe_physics::AxisLock`.
+    pub axis_lock: crate::swipe_physics::AxisLock,
+    /// Where the finger went down, so total travel can be measured against
+    /// it. egui reports per-frame deltas; a lock fed deltas would decide on
+    /// one frame's jitter.
+    pub touch_origin: Option<egui::Pos2>,
+    /// The settling animation after a release: (from_offset, ms_left,
+    /// ms_total). The page does not snap — it continues the movement it was
+    /// given, which is what makes a turn feel like the finger caused it.
+    pub swipe_settle: Option<(f32, f32, f32)>,
+    /// The touch path handled this drag, so the gesture layer's own
+    /// `page_jump` must not act on it too. Set at release and cleared when
+    /// read: checking `axis_lock.intent()` instead does not work, because
+    /// the release clears the lock in the same frame the layer reports the
+    /// jump — which turned two pages per swipe.
+    pub swipe_claimed: bool,
     /// Accent and background derived from the photos in the inbox, so the app
     /// takes on the colour of what is in it. `None` until enough pixels have
     /// been sampled, and `None` is a real answer — see `ambient()`.
@@ -766,6 +783,10 @@ impl Snapclone {
             // a default set inside the widget would be this app's navigation
             // leaking into a shared component.
             swipe: None,
+            axis_lock: Default::default(),
+            touch_origin: None,
+            swipe_settle: None,
+            swipe_claimed: false,
             ambient: None,
             // Written here rather than in HelpManual::default(): the widget is
             // generic over its sections, and this app's manual living inside it
@@ -2021,6 +2042,89 @@ impl Snapclone {
 
     /// Swipe between top-level pages (unless drilled into a subpage — then swipe is off so the
     /// content can scroll/interact).
+    /// Run the live page swipe for this frame; return how far the page
+    /// content should be offset.
+    ///
+    /// Touch only, by way of the axis lock: a mouse drag across the page is
+    /// a selection or a viewfinder tap-and-hold far more often than a page
+    /// turn, and the trackpad has its own path through the gesture layer.
+    ///
+    /// Returns 0.0 when nothing is happening, which is the common case and
+    /// costs one pointer read.
+    pub fn tick_page_swipe(&mut self, ui: &Ui, surface: egui::Rect, dt_ms: f32) -> f32 {
+        use crate::swipe_physics::Intent;
+        let t_ms = ui.input(|i| i.time) as f32 * 1000.0;
+        let (down, pos) = ui.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos()));
+
+        if down {
+            if let Some(p) = pos {
+                let origin = *self.touch_origin.get_or_insert(p);
+                let (dx, dy) = (p.x - origin.x, p.y - origin.y);
+                match self.axis_lock.feed(dx, dy) {
+                    Intent::Undecided | Intent::Scroll => {}
+                    Intent::Page => {
+                        // Begun at the ORIGIN, not at the point where the
+                        // lock decided: starting here would drop the first
+                        // twelve pixels of travel, so the page would jump
+                        // by that much the moment it took over.
+                        if self.swipe.is_none() && !self.modal.blocks_input()
+                            && !self.nav.can_go_back()
+                        {
+                            self.begin_swipe(origin.x, surface.width(), t_ms);
+                            self.swipe_settle = None;
+                        }
+                        if let Some(sw) = self.swipe.as_mut() {
+                            sw.update(p.x, t_ms);
+                        }
+                    }
+                }
+            }
+        } else if self.touch_origin.is_some() || self.swipe.is_some() {
+            // Release.
+            if self.swipe.is_some() {
+                self.swipe_claimed = true;
+                let from = self.swipe.as_ref().map(|s| s.offset()).unwrap_or(0.0);
+                let ms = self.swipe.as_ref().map(|s| s.settle_ms(t_ms)).unwrap_or(200.0);
+                let before = self.nav.page();
+                let tab = self.end_swipe(t_ms);
+                // `end_swipe` moves `tabs`; the page the app draws from is
+                // `nav`, and they are kept in step elsewhere by
+                // `tabs.set_current(nav.page())`. Pushing it the other way
+                // here is what makes the gesture actually turn the page —
+                // and going through `swipe_page` rather than `nav.go_page`
+                // keeps the modal guard and the peel-hint bookkeeping in
+                // one place.
+                if tab != before {
+                    self.swipe_page(if tab > before { 1 } else { -1 });
+                }
+                // Settle from wherever the finger left it, so a cancelled
+                // swipe springs back rather than vanishing.
+                self.swipe_settle = Some((from, ms, ms));
+            }
+            self.touch_origin = None;
+            self.axis_lock.release();
+        }
+
+        if let Some(sw) = self.swipe.as_ref() {
+            return sw.offset();
+        }
+        if let Some((from, left, total)) = self.swipe_settle.as_mut() {
+            *left -= dt_ms;
+            if *left <= 0.0 {
+                self.swipe_settle = None;
+                return 0.0;
+            }
+            // Ease out: fast at first, slowing in. A linear settle reads as
+            // mechanical because nothing physical stops at a constant rate.
+            let progress = 1.0 - (*left / *total);
+            let eased = 1.0 - (1.0 - progress) * (1.0 - progress);
+            let off = *from * (1.0 - eased);
+            ui.ctx().request_repaint();
+            return off;
+        }
+        0.0
+    }
+
     pub fn swipe_page(&mut self, sign: i32) {
         // Counted here rather than at the gesture layer so a swipe that is
         // REFUSED — blocked by a dialog, or at the end of the pages — does not
@@ -2611,10 +2715,26 @@ impl Snapclone {
         // live background painted behind everything
         self.bg.paint(ui.painter(), surface, &colors);
 
-        // swipe paging (top-level only)
+        // LIVE PAGE SWIPE. `begin_swipe`/`end_swipe` and the whole of
+        // `swipe_physics` — rubber band, commit distance, velocity flick,
+        // settle timing — were written, tested, and reached from nothing.
+        // What ran instead was the gesture layer's `page_jump`, which fires
+        // once at release: the page did not follow the finger, so a swipe
+        // was a guess that either worked or did nothing, with no feedback
+        // in between. On a phone that is the difference between a control
+        // and a lottery.
+        let page_offset = self.tick_page_swipe(ui, surface, dt_ms);
+
+        // The layer still runs, for the trackpad two-finger path and the
+        // sub-page detents it also reports. Its `page_jump` is only obeyed
+        // when the touch path did not claim the gesture — both acting on
+        // one drag turns two pages.
         let frame = self.gesture.update(ui, surface, true);
+        let claimed = std::mem::take(&mut self.swipe_claimed);
         if let Some(dir) = frame.page_jump {
-            self.swipe_page(dir.sign());
+            if !claimed && self.axis_lock.intent() != crate::swipe_physics::Intent::Page {
+                self.swipe_page(dir.sign());
+            }
         }
 
         // Form factor first: every dialog opened this frame is placed by it.
@@ -2912,16 +3032,48 @@ impl Snapclone {
         if self.nav.page() != 0 {
             self.ambient_camera.stop();
         }
-        match self.nav.page() {
-            // The nav has always declared five pages — Camera, Inbox, Friends,
-            // Wayfinder, Settings — and the shell routed three of them, so two
-            // tabs led nowhere. That is most of why the app read as a demo: the
-            // chrome promised more than the body delivered.
-            0 => self.camera_page(ui, &colors),
-            1 => self.inbox_page(ui, &colors),
-            2 => self.peers_page(ui, &colors),
-            3 => self.wayfinder_page(ui, &colors),
-            _ => self.settings_page(ui, &colors),
+        // THE PAGE FOLLOWS THE FINGER. A layer with a horizontal transform
+        // rather than laying the body out at an offset: an offset layout
+        // would re-run every widget's sizing on every frame of a drag, and
+        // a transform is one matrix on shapes that are drawn anyway.
+        //
+        // Clipped to the surface so the sliding page does not paint over
+        // the tab bar and the title, which do not move with it — the chrome
+        // is the fixed thing the page slides behind.
+        let draw_pages = |app: &mut Self, ui: &mut Ui| {
+            match app.nav.page() {
+                // The nav has always declared five pages — Camera, Inbox,
+                // Friends, Wayfinder, Settings — and the shell routed three
+                // of them, so two tabs led nowhere. That is most of why the
+                // app read as a demo: the chrome promised more than the
+                // body delivered.
+                0 => app.camera_page(ui, &colors),
+                1 => app.inbox_page(ui, &colors),
+                2 => app.peers_page(ui, &colors),
+                3 => app.wayfinder_page(ui, &colors),
+                _ => app.settings_page(ui, &colors),
+            }
+        };
+        if page_offset.abs() < 0.5 {
+            // The overwhelming majority of frames. No layer, no transform,
+            // no cost — a swipe must not make the still case slower.
+            draw_pages(self, ui);
+        } else {
+            // The PARENT's order, not a chosen one. egui refuses a sublayer
+            // whose order differs from its parent's — "currently undefined
+            // behavior" in its own words — and a CentralPanel is
+            // Background, so naming Order::Middle here panicked the moment
+            // a real frame ran. Derived rather than hardcoded so it stays
+            // right if this is ever drawn inside a window.
+            let layer = egui::LayerId::new(ui.layer_id().order,
+                                           ui.id().with("swiping_page"));
+            let mut child = ui.new_child(
+                egui::UiBuilder::new().layer_id(layer).max_rect(ui.available_rect_before_wrap()));
+            draw_pages(self, &mut child);
+            ui.ctx().set_transform_layer(
+                layer, egui::emath::TSTransform::from_translation(
+                    egui::vec2(page_offset, 0.0)));
+            ui.ctx().set_sublayer(ui.layer_id(), layer);
         }
 
         // THE DIM, painted last so it covers the page rather than being
@@ -4212,6 +4364,79 @@ mod tests {
     /// output is the only check that catches a second surface coming back —
     /// a unit test on `standing_of` would still pass with the duplicate
     /// list restored.
+    /// A drag across the page turns it, and the page moves while it does.
+    ///
+    /// Driven through a real egui frame rather than by calling
+    /// `tick_page_swipe` directly, because what was broken was not the
+    /// physics — `swipe_physics` was written and tested — it was that
+    /// nothing reached it. A unit test on the physics passed the whole time
+    /// the gesture did nothing.
+    #[test]
+    fn dragging_across_the_page_turns_it_and_moves_it_on_the_way() {
+        use egui::{Context, Event, PointerButton, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+
+        let mut frame = |app: &mut Snapclone, events: Vec<Event>| -> f32 {
+            let mut offset = 0.0;
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen),
+                                       ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.ui(ui, &adaptive);
+                    offset = app.swipe.as_ref().map(|s| s.offset()).unwrap_or(0.0);
+                });
+            });
+            offset
+        };
+        let at = |x: f32| Event::PointerMoved(Pos2::new(x, 400.0));
+        let press = |x: f32| Event::PointerButton {
+            pos: Pos2::new(x, 400.0), button: PointerButton::Primary,
+            pressed: true, modifiers: Default::default() };
+        let release = |x: f32| Event::PointerButton {
+            pos: Pos2::new(x, 400.0), button: PointerButton::Primary,
+            pressed: false, modifiers: Default::default() };
+
+        assert_eq!(app.nav.page(), 0);
+        frame(&mut app, vec![at(320.0), press(320.0)]);
+        // A short move is below the slop: still a tap as far as anyone knows.
+        frame(&mut app, vec![at(314.0)]);
+        assert!(app.swipe.is_none(), "the page moved on a six-pixel wobble");
+        // Now a real leftward drag — toward the NEXT page.
+        let mid = frame(&mut app, vec![at(200.0)]);
+        assert!(mid < -50.0, "the page did not follow the finger: {mid}");
+        frame(&mut app, vec![at(60.0), release(60.0)]);
+        assert_eq!(app.nav.page(), 1, "a drag most of the way across turned nothing");
+    }
+
+    #[test]
+    fn a_vertical_drag_scrolls_and_never_steals_the_page() {
+        // The gesture people make constantly. Losing it to the pager is the
+        // error worth avoiding, and the lock latches so a late sideways
+        // swing cannot claim it back.
+        use egui::{Context, Event, PointerButton, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let mut frame = |app: &mut Snapclone, events: Vec<Event>| {
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen),
+                                       ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        };
+        let mv = |x: f32, y: f32| Event::PointerMoved(Pos2::new(x, y));
+        frame(&mut app, vec![mv(200.0, 600.0), Event::PointerButton {
+            pos: Pos2::new(200.0, 600.0), button: PointerButton::Primary,
+            pressed: true, modifiers: Default::default() }]);
+        frame(&mut app, vec![mv(206.0, 520.0)]);   // clearly vertical
+        assert!(app.swipe.is_none(), "a scroll started a page swipe");
+        frame(&mut app, vec![mv(20.0, 500.0)]);    // now swing hard sideways
+        assert!(app.swipe.is_none(), "the lock let go mid-touch");
+        assert_eq!(app.nav.page(), 0);
+    }
+
     #[test]
     fn a_contact_appears_once_on_the_friends_page_not_twice() {
         use egui::{Context, RawInput};
