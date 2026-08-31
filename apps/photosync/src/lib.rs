@@ -43,6 +43,9 @@
 //! query built only from ascii will match a lamp shaped like a person.
 //! The tags exist to stop that.
 
+/// Cheap, explainable measurements that produce tags from pixels.
+pub mod cv;
+
 /// A greyscale image: row-major, `w * h` bytes.
 pub struct Gray<'a> {
     pub w: usize,
@@ -201,6 +204,18 @@ pub const SCAN_VERSION: u32 = 1;
 impl Entry {
     pub fn scan(path: &str, img: &Gray, tags: &[&str]) -> Entry {
         let mut t: Vec<String> = tags.iter().map(|s| s.trim().to_lowercase()).collect();
+        // DERIVED TAGS, alongside whatever was written.
+        //
+        // `cv::auto_tags` produces `auto:`-prefixed names describing the
+        // IMAGE — dark, busy, centred, portrait — never its subject.
+        // Without them the tag signal, which `similarity` weights
+        // highest, only works for photos somebody labelled by hand: in a
+        // real library, approximately none of them.
+        //
+        // Prefixed rather than merged so `tag_similarity` can tell
+        // "somebody said this is a portrait of Ada" from "the frame is
+        // taller than it is wide". Same word, different evidence.
+        t.extend(cv::auto_tags_prefixed(&cv::features(img)));
         t.retain(|s| !s.is_empty());
         t.sort();
         t.dedup();
@@ -438,7 +453,15 @@ mod tests {
     fn tags_are_normalised_so_case_and_order_do_not_matter() {
         let px = ramp_img(16, 16);
         let a = entry("a", &px, 16, 16, &["Dancing", "  party ", "dancing"]);
-        assert_eq!(a.tags, vec!["dancing", "party"]);
+        // Written tags are normalised and deduplicated; derived ones are
+        // added beside them and marked. Asserting the WRITTEN set
+        // exactly, rather than the whole list, so this test keeps
+        // testing normalisation when the cv thresholds change — a test
+        // that breaks every time an unrelated threshold moves is one
+        // people stop reading.
+        let written: Vec<&String> = a.tags.iter().filter(|t| !cv::is_auto(t)).collect();
+        assert_eq!(written, vec!["dancing", "party"]);
+        assert!(a.tags.iter().any(|t| cv::is_auto(t)), "no derived tags: {:?}", a.tags);
     }
 
     #[test]
@@ -446,6 +469,26 @@ mod tests {
         // A partial compare would rank a small render above a real match
         // for no reason a reader could see.
         assert_eq!(ascii_similarity("abc", "abcdef"), 0.0);
+    }
+
+    #[test]
+    fn an_unlabelled_library_is_still_searchable() {
+        // The point of the cv pass. Before it, tag_similarity was 0.0
+        // for every pair in a library nobody had labelled — which is
+        // every real library — so the highest-weighted signal
+        // contributed nothing and search fell back to ascii alone.
+        let dark = vec![10u8; 32 * 32];
+        let bright = vec![245u8; 32 * 32];
+        let q = entry("q", &dark, 32, 32, &[]);
+        let like = entry("like", &dark, 32, 32, &[]);
+        let unlike = entry("unlike", &bright, 32, 32, &[]);
+        assert!(tag_similarity(&q.tags, &like.tags) > 0.0,
+                "no derived tags to match on: {:?}", q.tags);
+        // Bound, because `best_matches` borrows the library and a
+        // temporary array would not outlive the call.
+        let lib = [like, unlike];
+        let got = best_matches(&q, &lib, Weights::default(), 2);
+        assert_eq!(got[0].0.path, "like", "{got:?}");
     }
 
     #[test]

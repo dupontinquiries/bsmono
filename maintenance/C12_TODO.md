@@ -4837,9 +4837,46 @@ a person, which is what the tags exist to stop.
 - **C87a — no frontend yet.** The egui shell, thumbnails and the face
   pipeline are not started. The core is the part that had to be right
   first, and it is the part that can be tested here.
-- **C87b — no CV primitives.** Faces need a detector; the tag pipeline
-  currently accepts tags rather than producing them. `Entry::scan` is
-  the seam a detector plugs into.
+- **C87b — DONE for composition; faces deliberately NOT.**
+  `photosync::cv` measures brightness, contrast, edge density,
+  centrality and aspect, and turns them into tags. `Entry::scan` now
+  derives them alongside whatever was written.
+
+  The gap this closes: `tag_similarity` was 0.0 for every pair in an
+  unlabelled library — which is every real library — so the
+  highest-weighted signal contributed nothing and search fell back to
+  ascii alone. There is now a test that an unlabelled library is
+  searchable.
+
+  Decisions:
+  - **Derived tags carry an `auto:` prefix.** "Somebody said this is a
+    portrait of Ada" and "the frame is taller than it is wide" are the
+    same word and entirely different evidence.
+  - **Every name describes the IMAGE, never its subject** — dark, busy,
+    centred, portrait. Nothing here knows what a dog is, and the naming
+    is what stops `busy` being read as a claim about content.
+  - **Mass is deviation from the mean, not brightness.** A dark subject
+    on a light background has its subject in the middle and its
+    brightness at the edges; scoring brightness would call that
+    composition edge-heavy. Tested both ways round.
+  - **Thresholds are asymmetric.** Photographs cluster in the middle, so
+    a 0.5 split would tag half the library "dark" and half "bright",
+    which distinguishes nothing.
+  - **Contrast normalises by 128, not 255.** A real photograph never
+    spans the full range, so /255 leaves every score bunched near zero.
+  - **A uniform image is not "centred".** A ninth of any photo is in the
+    middle third by geometry; `UNIFORM_CENTRALITY` is the baseline and
+    the threshold is twice it.
+
+  **No face detector, and not a fake one.** A skin-tone-and-oval
+  heuristic finds faces in about the same proportion of photos as it
+  finds wooden doors. A library confidently mislabelled is worse than an
+  unlabelled one, because the mislabelling is invisible until somebody
+  searches for a person and gets furniture. Faces want a real model
+  behind the `Entry::scan` seam, and `AUTO_TAG_WEIGHT` is there for when
+  derived tags need to count for less than written ones.
+
+  26/26.
 - **C87c — the wgpu matcher is not written.** `similarity` is the
   scoring function a GPU pass would parallelise; at library scale the
   O(n) scan is fine, and building the GPU version first would optimise
