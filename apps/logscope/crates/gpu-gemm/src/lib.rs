@@ -7856,6 +7856,7 @@ prompt tokenises fine and then indexes past the embedding table.", m.embed.len()
 }
 
 const GEMM: &str = r#"
+// GEMM
 struct D { m:u32,n:u32,k:u32,_p:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> b: array<f32>;
@@ -7879,6 +7880,7 @@ fn main(@builtin(local_invocation_id) l:vec3<u32>, @builtin(workgroup_id) w:vec3
 }"#;
 
 const LINEAR: &str = r#"
+// LINEAR
 struct D { m:u32,n:u32,k:u32,_p:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> wt: array<f32>;
@@ -7917,6 +7919,7 @@ fn main(@builtin(local_invocation_id) l:vec3<u32>, @builtin(workgroup_id) w:vec3
 // setup cost > the extra reduction, which is the M4/Metal decode regime; LOGSCOPE_FUSE_NORM=0 backs
 // out to the two-dispatch path for the A/B. Output is bit-identical to RMSNORM then MATVEC_Q8_0.
 const RMSNORM_MATVEC_Q8: &str = r#"
+// RMSNORM_MATVEC_Q8
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,eps:u32,_a:u32,_b:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;      // raw (un-normed) input row [k]
 @group(0)@binding(1) var<storage,read> nw: array<f32>;     // RMSNorm weight [k]
@@ -7957,6 +7960,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 }"#;
 
 const MATVEC_Q8_0: &str = r#"
+// MATVEC_Q8_0
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
@@ -7989,6 +7993,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 // (memory-bound) weight read is amortized across the batch, like the m=1 mat-vec but for a
 // small batch (the speculative-verify block, and batched decode at small N). Reduces per row.
 const MATVEC_SMALL_Q8_0: &str = r#"
+// MATVEC_SMALL_Q8_0
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;   // [m,k]
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
@@ -8023,6 +8028,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 }"#;
 
 const LINEAR_Q8_0: &str = r#"
+// LINEAR_Q8_0
 struct D { m:u32,n:u32,k:u32,kb:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;   // [m,k] activations
 @group(0)@binding(1) var<storage,read> qw: array<u32>;  // [n,k] int8, 4 packed per u32
@@ -8054,6 +8060,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 // the naive LINEAR_Q8_0 within float tol (the a·(s·q) vs (a·s)·q association). Workgroup arrays are sized
 // for the max tile (32 → 1024); a smaller TILE just uses a corner. Dequant happens on the W-tile load.
 const LINEAR_Q8_0_TILED: &str = r#"
+// LINEAR_Q8_0_TILED
 override TILE: u32 = 16u;
 struct D { m:u32,n:u32,k:u32,kb:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;   // [m,k]
@@ -8099,6 +8106,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 // GPUs that reward register blocking, which is why it's an autotune-eligible candidate elsewhere).
 // Fixed params (no `override`) so it compiles on GL too and stays CI-validatable.
 const LINEAR_Q8_0_RB: &str = r#"
+// LINEAR_Q8_0_RB
 const BM:u32=64u; const BN:u32=64u; const BK:u32=16u;
 struct D { m:u32,n:u32,k:u32,kb:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
@@ -8153,6 +8161,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 }"#;
 
 const MATVEC_Q4: &str = r#"
+// MATVEC_Q4
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;  // [n,k] nibbles, 8 packed per u32
@@ -8189,6 +8198,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 const SWIGLU_MATVEC_Q8_0_ADD: &str = include_str!("kernels/swiglu_matvec_q8_0_add.wgsl");
 
 const MATVEC_Q8_0_ADD: &str = r#"
+// MATVEC_Q8_0_ADD
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
@@ -8218,6 +8228,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 }"#;
 
 const MATVEC_Q4_ADD: &str = r#"
+// MATVEC_Q4_ADD
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
@@ -8252,6 +8263,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 // per-term arithmetic (a*scale*qv) matches MATVEC_Q4 exactly, so each row is BIT-EXACT to the m=1 kernel.
 // This is what lets Q4-resident (half the weight bytes of int8) compound with speculative/batched decode.
 const MATVEC_SMALL_Q4: &str = r#"
+// MATVEC_SMALL_Q4
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;   // [m,k]
 @group(0)@binding(1) var<storage,read> qw: array<u32>;  // [n,k] nibbles, 8 packed per u32
@@ -8286,6 +8298,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 }"#;
 
 const LINEAR_Q4: &str = r#"
+// LINEAR_Q4
 struct D { m:u32,n:u32,k:u32,kb:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;   // [m,k] activations
 @group(0)@binding(1) var<storage,read> qw: array<u32>;  // [n,k] nibbles, 8 packed per u32
@@ -8316,6 +8329,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 // one weight row) drops by `tile`×, while every weight is still read exactly once. Per-column
 // accumulation is identical to MATVEC_Q8_0, so results are bit-identical to the untiled kernel.
 const MATVEC_Q8_0_TILED: &str = r#"
+// MATVEC_Q8_0_TILED
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
@@ -8360,6 +8374,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 // Requires k % 16 == 0 (always true for q8: k is a multiple of the 32-wide block). Same math as the others;
 // results differ only by f32 reassociation.
 const MATVEC_Q8_0_TILED_V3: &str = r#"
+// MATVEC_Q8_0_TILED_V3
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw4: array<vec4<u32>>;
@@ -8415,6 +8430,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 // V2-T16: v2 with acc/red sized for tile up to 16 (more columns share each weight-word read). Costs 4 KiB
 // workgroup memory (red[16*64]) — may lower occupancy, so it's a bench candidate vs v2@8, not a given win.
 const MATVEC_Q8_0_TILED_V2_T16: &str = r#"
+// MATVEC_Q8_0_TILED_V2_T16
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
@@ -8460,6 +8476,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 // V2-WG128: v2 with 128-thread workgroups — more threads per column split the k-reduction, exposing more
 // memory parallelism per workgroup to hide latency (at the cost of a 7-step reduction and fewer workgroups).
 const MATVEC_Q8_0_TILED_V2_WG128: &str = r#"
+// MATVEC_Q8_0_TILED_V2_WG128
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
@@ -8507,6 +8524,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 // red[tile*128] array + 7-step barrier tree. That frees shared memory and removes barriers, lifting
 // occupancy — the diagnosed decode bottleneck. Requires the SUBGROUP device feature (Gpu.subgroups).
 const MATVEC_Q8_0_TILED_V2_WG128_SG: &str = r#"
+// MATVEC_Q8_0_TILED_V2_WG128_SG
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
@@ -8564,6 +8582,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 // ~6% of memory bandwidth. Fully coalesced (64 threads → 64 consecutive words). Bit-results differ from the
 // original only by f32 reassociation (4-per-word accumulation order), far below q8 quant error.
 const MATVEC_Q8_0_TILED_V2: &str = r#"
+// MATVEC_Q8_0_TILED_V2
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
@@ -8613,6 +8632,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 }"#;
 
 const DEQUANT_Q4_0: &str = r#"
+// DEQUANT_Q4_0
 struct D { nw:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> q: array<u32>;
 @group(0)@binding(1) var<storage,read> s: array<f32>;
@@ -8640,6 +8660,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 }"#;
 
 const SOFTMAX: &str = r#"
+// SOFTMAX
 struct D { rows:u32,cols:u32,_a:u32,_b:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<f32>;
@@ -8655,6 +8676,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 }"#;
 
 const RMSNORM: &str = r#"
+// RMSNORM
 struct D { rows:u32,cols:u32,eps:f32,_p:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> wt: array<f32>;
@@ -8670,6 +8692,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 }"#;
 
 const ATTENTION: &str = r#"
+// ATTENTION
 struct D { t:u32,d:u32,causal:u32,_p:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> k: array<f32>;
@@ -8699,6 +8722,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 }"#;
 
 const ROPE: &str = r#"
+// ROPE
 struct D { t:u32,d:u32,base:f32,pos0:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<f32>;
@@ -8718,6 +8742,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 // NEOX split-half RoPE (DeepSeek/Qwen/Gemma convention): rotates dim i with i+half, unlike ROPE's
 // adjacent (2i, 2i+1) pairing. Used by the MLA forward; matches mla.rs's rope_neox reference exactly.
 const ROPE_NEOX: &str = r#"
+// ROPE_NEOX
 struct D { t:u32,d:u32,base:f32,pos0:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<f32>;
@@ -8786,6 +8811,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>){
 // (llama-graph.cpp:1870-1874). Softmax mode computes the real row softmax first: monotonicity
 // dies the moment a bias is added.
 const MOE_TOPK_BIAS: &str = r#"
+// MOE_TOPK_BIAS
 struct D { n:u32,k:u32,mode:u32,normalize:u32,scale:f32,ng:u32,tg:u32,_c2:u32 };
 @group(0)@binding(0) var<storage,read> logits: array<f32>;
 @group(0)@binding(1) var<storage,read> bias: array<f32>;
@@ -8862,6 +8888,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>){
 // experts won (no readback). `xper=1` reads a per-slot activation row (the down projection consumes
 // hmid[slot]); `xper=0` broadcasts one activation row (gate_up consumes n2). Output c[slot*n + col].
 const MOE_MATVEC_Q8: &str = r#"
+// MOE_MATVEC_Q8
 struct D { n:u32,k:u32,kb:u32,gx:u32,_slot:u32,rstride:u32,xper:u32,_p:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
@@ -8893,6 +8920,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 }"#;
 
 const MOE_MATVEC_Q4: &str = r#"
+// MOE_MATVEC_Q4
 struct D { n:u32,k:u32,kb:u32,gx:u32,_slot:u32,rstride:u32,xper:u32,_p:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
@@ -8931,6 +8959,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 // drops the intermediate buffer. `d.n` here is ff (the OUTPUT width); gate/up rows live at col and col+ff
 // of the stacked weight (row stride rstride = 2ff).
 const MOE_MATVEC_GLU_Q8: &str = r#"
+// MOE_MATVEC_GLU_Q8
 struct D { n:u32,k:u32,kb:u32,gx:u32,_slot:u32,rstride:u32,xper:u32,_p:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
@@ -8971,6 +9000,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 
 // Fused gate‖up + SwiGLU (Q4) — identical structure, 4-bit weights (nibble − 8).
 const MOE_MATVEC_GLU_Q4: &str = r#"
+// MOE_MATVEC_GLU_Q4
 struct D { n:u32,k:u32,kb:u32,gx:u32,_slot:u32,rstride:u32,xper:u32,_p:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
@@ -9016,6 +9046,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 // (weights are the f32-bitcast tail of selw), adds the residual, and writes o[col]. Bit-identical to the
 // two-step path (same reductions, same combine order s=0..slots). Removes 1 dispatch/MoE-layer + scratch.
 const MOE_DOWN_COMBINE_Q8: &str = r#"
+// MOE_DOWN_COMBINE_Q8
 struct D { d:u32,k:u32,kb:u32,gx:u32,slots:u32,_r:u32,_x:u32,_p:u32 };
 @group(0)@binding(0) var<storage,read> hmid: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
@@ -9054,6 +9085,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 
 // Fused down + combine + residual (Q4) — identical structure, 4-bit weights (nibble − 8).
 const MOE_DOWN_COMBINE_Q4: &str = r#"
+// MOE_DOWN_COMBINE_Q4
 struct D { d:u32,k:u32,kb:u32,gx:u32,slots:u32,_r:u32,_x:u32,_p:u32 };
 @group(0)@binding(0) var<storage,read> hmid: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
@@ -9090,6 +9122,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   if(tid==0u){ o[tok*d.d+col]=total; }
 }"#;
 const MOE_WSUM: &str = r#"
+// MOE_WSUM
 struct D { n:u32,k:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> src: array<f32>;
 @group(0)@binding(1) var<storage,read> selw: array<u32>;
@@ -9112,6 +9145,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 // [0,ad)=roped q, [ad,ad+kv)=roped k. Float-tolerance note: the RMS reduction order differs from the
 // standalone RMSNORM kernel → last-ulp differences, same tolerance class as the MoE v2 kernels.
 const QKNORM_ROPE: &str = r#"
+// QKNORM_ROPE
 struct D { nq:u32,nk:u32,hd:u32,base:f32,pos:u32,neox:u32,eps:f32,msc:f32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> qn: array<f32>;
@@ -9150,6 +9184,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 }"#;
 
 const GATHER_ROWS: &str = r#"
+// GATHER_ROWS
 struct D { n:u32,c:u32,_b:u32,_d:u32 };
 @group(0)@binding(0) var<storage,read> src: array<f32>;
 @group(0)@binding(1) var<storage,read> idx: array<u32>;
@@ -9161,6 +9196,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
   let r=i/d.c; let col=i%d.c; o[i]=src[idx[r]*d.c+col]; }"#;
 
 const SCATTER_ADD_W: &str = r#"
+// SCATTER_ADD_W
 struct D { n:u32,c:u32,_b:u32,_d:u32 };
 @group(0)@binding(0) var<storage,read> src: array<f32>;
 @group(0)@binding(1) var<storage,read> idx: array<u32>;
@@ -9190,6 +9226,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 const ROW_SCALE: &str = r#"
+// ROW_SCALE
 struct D { n:u32,c:u32,_b:u32,_d:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> w: array<f32>;
@@ -9201,6 +9238,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
   o[i]=x[i]*w[i/d.c]; }"#;
 
 const ADD: &str = r#"
+// ADD
 struct D { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> b: array<f32>;
@@ -9216,6 +9254,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 /// C layout: [taps(cd*dconv) | dt_bias(hv) | a(hv)]
 /// G layout: [conv_silu(cd) | beta_sigmoid(hv) | gate_pre_exp(hv)]
 const DELTANET_CONV: &str = r#"
+// DELTANET_CONV
 struct D { cd:u32, dconv:u32, hv:u32, vd:u32 };
 @group(0)@binding(0) var<storage,read> p: array<f32>;
 @group(0)@binding(1) var<storage,read> c: array<f32>;
@@ -9253,6 +9292,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
 /// Transcribes delta_rule_head_step + step() phases 4-6 exactly, including l2's max(eps),
 /// the decay-BEFORE-correction ordering, and rms = sqrt(mean+eps).
 const DELTANET_STEP: &str = r#"
+// DELTANET_STEP
 struct D { s:u32, share:u32, kd:u32, cd:u32, hv:u32, eps:u32, _a:u32, _b:u32 };
 @group(0)@binding(0) var<storage,read> g: array<f32>;
 @group(0)@binding(1) var<storage,read> p: array<f32>;
@@ -9311,6 +9351,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 }"#;
 
 const SIGMOID_MUL: &str = r#"
+// SIGMOID_MUL
 struct D { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> b: array<f32>;
@@ -9320,6 +9361,7 @@ struct D { n:u32,_a:u32,_b:u32,_c:u32 };
 fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} o[i]=a[i]*(1.0/(1.0+exp(-b[i]))); }"#;
 
 const SIGMOID_SCALE_ROWS: &str = r#"
+// SIGMOID_SCALE_ROWS
 struct D { n:u32,c:u32,_b:u32,_d:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> b: array<f32>;
@@ -9329,6 +9371,7 @@ struct D { n:u32,c:u32,_b:u32,_d:u32 };
 fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} o[i]=a[i]*(1.0/(1.0+exp(-b[i/d.c]))); }"#;
 
 const ADD_BIAS: &str = r#"
+// ADD_BIAS
 struct D { n:u32,c:u32,_b:u32,_d:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> bias: array<f32>;
@@ -9338,6 +9381,7 @@ struct D { n:u32,c:u32,_b:u32,_d:u32 };
 fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} o[i]=a[i]+bias[i%d.c]; }"#;
 
 const MUL: &str = r#"
+// MUL
 struct D { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> b: array<f32>;
@@ -9352,6 +9396,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 /// [1,cols] row derived from the timestep+conditioning embedding and broadcast over every token row —
 /// this is what replaces the usual learned-affine LayerNorm/RMSNorm gain in a DiT block.
 const DIT_MODULATE: &str = r#"
+// DIT_MODULATE
 struct D { rows:u32,cols:u32,_a:u32,_b:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> scale: array<f32>;
@@ -9367,6 +9412,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 /// AdaLN-Zero gated residual: `o[r,c] = x[r,c] + gate[c] * y[r,c]`. `gate` starts at ~0 at
 /// initialization (the "-Zero" in AdaLN-Zero) so a freshly-added DiT block starts as a no-op.
 const DIT_GATED_ADD: &str = r#"
+// DIT_GATED_ADD
 struct D { rows:u32,cols:u32,_a:u32,_b:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> y: array<f32>;
@@ -9384,6 +9430,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 /// patch's contents flattened row-major-within-patch then channel-last (matches the ViT/DiT convention
 /// so a plain linear projection turns a patch row directly into a token embedding).
 const PATCHIFY: &str = r#"
+// PATCHIFY
 struct D { h:u32,w:u32,c:u32,psz:u32 };
 @group(0)@binding(0) var<storage,read> img: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<f32>;
@@ -9401,6 +9448,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 
 /// Unpatchify: the exact inverse of `PATCHIFY` — [num_patches, patch*patch*C] tokens → [H,W,C] image.
 const UNPATCHIFY: &str = r#"
+// UNPATCHIFY
 struct D { h:u32,w:u32,c:u32,psz:u32 };
 @group(0)@binding(0) var<storage,read> tok: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<f32>;
@@ -9417,6 +9465,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 }"#;
 
 const SILU: &str = r#"
+// SILU
 struct D { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<f32>;
@@ -9432,6 +9481,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 /// (H+2*pad-K)/stride+1` (same for W); the caller computes and passes these so the shader stays a flat
 /// index walk. One invocation per output element (n,ho,wo,co).
 const CONV2D: &str = r#"
+// CONV2D
 struct D { n_batch:u32,h:u32,w:u32,cin:u32,cout:u32,k:u32,stride:u32,pad:u32,hout:u32,wout:u32,_a:u32,_b:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> wt: array<f32>;
@@ -9466,6 +9516,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 /// `gamma`/`beta`. One invocation per (n, group) — each walks the whole group's spatial×channel extent
 /// twice (stats, then write), same two-pass shape as `RMSNORM`'s per-row walk.
 const GROUP_NORM: &str = r#"
+// GROUP_NORM
 struct D { n_batch:u32,hw:u32,c:u32,groups:u32,eps:f32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> gamma: array<f32>;
@@ -9495,6 +9546,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 /// decoder's upsample stages use this (not a learned transposed-conv) — a plain repeat, followed by an
 /// ordinary `conv2d` (stride 1, pad 1) to smooth/mix, matching the SD/SDXL-family VAE decoder design.
 const UPSAMPLE2X: &str = r#"
+// UPSAMPLE2X
 struct D { n_batch:u32,h:u32,w:u32,c:u32,_a:u32,_b:u32,_c:u32,_d:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<f32>;
@@ -9512,6 +9564,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 // True LayerNorm (mean-subtract + population variance + eps), then per-channel scale `gt` and bias
 // `bt`. One row per invocation, mirroring RMSNORM's launch. Vision towers (CLIP/SigLIP/Qwen2-VL).
 const LAYERNORM: &str = r#"
+// LAYERNORM
 struct D { rows:u32,cols:u32,eps:f32,_p:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> gt: array<f32>;
@@ -9532,6 +9585,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 
 // tanh-approx GELU: 0.5x(1+tanh(√(2/π)(x+0.044715x³))).
 const GELU_TANH: &str = r#"
+// GELU_TANH
 struct D { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<f32>;
@@ -9541,6 +9595,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 
 // QuickGELU: x·sigmoid(1.702x) (OpenAI CLIP).
 const GELU_QUICK: &str = r#"
+// GELU_QUICK
 struct D { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<f32>;
@@ -9551,6 +9606,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 // Bidirectional multi-head attention — the ViT twin of ATTENTION_MH: identical layout & GQA mapping,
 // but each query attends over ALL tokens (loop j in 0..t, no causal `j<=i` bound).
 const ATTENTION_MH_FULL: &str = r#"
+// ATTENTION_MH_FULL
 struct D { t:u32,hd:u32,nh:u32,nkv:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> k: array<f32>;
@@ -9578,6 +9634,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 
 // Fused SwiGLU: silu(gate)*up in one dispatch (replaces a separate SILU + MUL).
 const SWIGLU: &str = r#"
+// SWIGLU
 struct D { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> gate: array<f32>;
 @group(0)@binding(1) var<storage,read> up: array<f32>;
@@ -9590,6 +9647,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 // wgate_up matmul output), so this reads both halves of one [t,2h] tensor and writes
 // [t,h] = silu(gate)*up — pairing with the fused gate+up projection.
 const SWIGLU_PACKED: &str = r#"
+// SWIGLU_PACKED
 struct D { n:u32,h:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> gu: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<f32>;
@@ -9600,6 +9658,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 // GeGLU-packed: gemma-family MLP gate. Same [gate|up] packed layout as SWIGLU_PACKED but the gate uses
 // tanh-approx GELU (gelu_pytorch_tanh) instead of SiLU: gelu(v)·up. The building block for Gemma2 FFN.
 const GEGLU_PACKED: &str = r#"
+// GEGLU_PACKED
 struct D { n:u32,h:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> gu: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<f32>;
@@ -9613,6 +9672,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 }"#;
 
 const GATHER: &str = r#"
+// GATHER
 struct D { n:u32,d:u32,id_off:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> table: array<f32>;
 @group(0)@binding(1) var<storage,read> ids: array<u32>;
@@ -9632,6 +9692,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 // GATHER from an int8-resident (Q8_0-style) table: dequantize ONE row selected by ids[id_off].
 // Dequant expression verbatim from MATVEC_Q8_0 (extractBits + select for AGX-safe signed bytes).
 const GATHER_Q8_AT: &str = r#"
+// GATHER_Q8_AT
 struct D { k:u32, id_off:u32, kb:u32, _c:u32 };
 @group(0)@binding(0) var<storage,read> qw: array<u32>;
 @group(0)@binding(1) var<storage,read> qs: array<f32>;
@@ -9652,6 +9713,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 // strict `>` keeps the earlier index within a thread, and the reduction prefers the smaller index on
 // equal values. Lets greedy decode pick the next token on-device — read back 4 bytes, not [vocab].
 const ARGMAX: &str = r#"
+// ARGMAX
 struct D { n:u32, out_slot:u32, _b:u32, _c:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<u32>;
@@ -9703,6 +9765,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
 // stable descending sort semantics — truncates to top_k, and replays the CPU's serial float-op
 // order for softmax/min-p/top-p/CDF. Host guarantees temperature>0 and 2 ≤ top_k ≤ 64.
 const SAMPLE_AT: &str = r#"
+// SAMPLE_AT
 struct D { n:u32, out_slot:u32, top_k:u32, rlast:u32,
            temp:u32, top_p:u32, min_p:u32, penalty:u32,
            seeded:u32, rcap:u32, kids:u32, abs_step:u32,
@@ -13121,6 +13184,7 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
 }
 
 const ROPE_MH: &str = r#"
+// ROPE_MH
 struct D { t:u32,dm:u32,base:f32,pos0:u32,hd:u32,neox:u32,msc:f32,sl:u32,rot:u32,_p1:u32,_p2:u32,_p3:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> ff: array<f32>;   // per-dim-pair freq factors (len hd/2)
@@ -13166,6 +13230,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 // from `pos[row]` instead of pos0+row. Needed for batched decode, where the N rows
 // are N different sessions at N different positions.
 const ROPE_MH_ROWS: &str = r#"
+// ROPE_MH_ROWS
 struct D { t:u32,dm:u32,base:f32,_p:u32,hd:u32,neox:u32,msc:f32,_c:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> ff: array<f32>;
@@ -13197,6 +13262,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 // K [t, nh·qk_head] (each head = [k_nope | k_rot]) and V [t, nh·v_head]. One thread per (row, head).
 // NEOX-rope the rope-part [qk_nope, qk_head) of each head of an MLA query [1, nh*qk_head] at position pos.
 const MLA_QROPE: &str = r#"
+// MLA_QROPE
 struct D { nh:u32, qk_nope:u32, qk_rope:u32, pos:u32, base:f32, _a:u32, _b:u32, _c:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<f32>;
@@ -13223,6 +13289,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 // Pack the kv_b reconstruction [t, nh·(qk_nope+v_head)] into full per-head K [t, nh·qk_head] by
 // concatenating the shared rot cache [t, qk_rope] onto each head's k_nope. One thread per (row, head).
 const MLA_PACK_K: &str = r#"
+// MLA_PACK_K
 struct D { t:u32, nh:u32, qk_nope:u32, qk_rope:u32, v_head:u32, _a:u32, _b:u32, _c:u32 };
 @group(0)@binding(0) var<storage,read> rec: array<f32>;
 @group(0)@binding(1) var<storage,read> rot: array<f32>;
@@ -13239,6 +13306,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 }"#;
 
 const MLA_PACK_V: &str = r#"
+// MLA_PACK_V
 struct D { t:u32, nh:u32, qk_nope:u32, qk_rope:u32, v_head:u32, _a:u32, _b:u32, _c:u32 };
 @group(0)@binding(0) var<storage,read> rec: array<f32>;
 @group(0)@binding(1) var<storage,read_write> vout: array<f32>;
@@ -13253,6 +13321,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 }"#;
 
 const MLA_ATTN: &str = r#"
+// MLA_ATTN
 struct D { t:u32, nh:u32, qk:u32, vh:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> k: array<f32>;
@@ -13283,6 +13352,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 // [nh]. Bit-exact to the CPU reference: same per-head ReLU-then-weight, same √hd / √nh scaling, same order
 // (heads inner, so the fp accumulation matches). This is the score that ranks keys for top-k selection.
 const DSA_INDEXER: &str = r#"
+// DSA_INDEXER
 struct D { nk:u32, nh:u32, hd:u32, _p:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;   // [nh*hd]
 @group(0)@binding(1) var<storage,read> k: array<f32>;   // [nk*hd]
@@ -13312,6 +13382,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 // dense-equivalence anchor). Each thread owns one output column c and streams the selected keys twice
 // (max, then weighted sum) so no shared memory is needed and it's bit-comparable to the CPU reference.
 const DSA_MASKED_ATTN: &str = r#"
+// DSA_MASKED_ATTN
 struct D { nk:u32, dk:u32, dv:u32, _p:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;    // [dk]
 @group(0)@binding(1) var<storage,read> k: array<f32>;    // [nk*dk]
@@ -13349,6 +13420,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 // When keep >= nk every rank < nk <= keep, so all keys select (the no-op-below-threshold case) with no
 // special branch. O(nk²) but nk is bounded by index_topk; matches the CPU set bit-for-bit incl. ties.
 const DSA_TOPK_MASK: &str = r#"
+// DSA_TOPK_MASK
 struct D { nk:u32, keep:u32, _a:u32, _b:u32 };
 @group(0)@binding(0) var<storage,read> s: array<f32>;        // [nk] scores
 @group(0)@binding(1) var<storage,read_write> mask: array<f32>; // [nk]
@@ -13367,6 +13439,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 }"#;
 
 const ATTENTION_MH: &str = r#"
+// ATTENTION_MH
 struct D { t:u32,hd:u32,nh:u32,nkv:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> k: array<f32>;
@@ -13491,6 +13564,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u
 }"#;
 
 const ATTENTION_MH_EXT: &str = r#"
+// ATTENTION_MH_EXT
 struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> kc: array<f32>;
@@ -13525,6 +13599,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 // memory, so there is no 4096-row cap. Numerics: per-chunk max + rescale reorders the summation
 // vs the monolithic kernels — same tolerance class as the other fused paths (~1e-6 rel).
 const DECODE_ATTN_FLASH_P1: &str = r#"
+// DECODE_ATTN_FLASH_P1
 struct D { l:u32,hd:u32,nh:u32,nkv:u32,chunk:u32,nch:u32,_a:u32,_b:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> kc: array<f32>;
@@ -13563,6 +13638,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 // Writing into a shared `part` buffer at a chunk offset means warm and hot partials coexist and pass-2
 // needs no changes. `coff` = the chunk index where this span's chunks start (hot span occupies [0,coff)).
 const DECODE_ATTN_FLASH_P1_Q8: &str = r#"
+// DECODE_ATTN_FLASH_P1_Q8
 struct D { l:u32,hd:u32,nh:u32,nkv:u32,chunk:u32,nch:u32,coff:u32,_b:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> kq: array<u32>;
@@ -13614,6 +13690,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 // Split-K decode attention, pass 2: one workgroup per head folds its chunks — global max M,
 // rescaled sum S = Σ sᵢ·exp(mᵢ−M), and o = Σ oᵢ·exp(mᵢ−M) / S.
 const DECODE_ATTN_FLASH_P2: &str = r#"
+// DECODE_ATTN_FLASH_P2
 struct D { hd:u32,nch:u32,nh:u32,_a:u32 };
 @group(0)@binding(0) var<storage,read> part: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<f32>;
@@ -13640,6 +13717,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 }"#;
 
 const DECODE_ATTN_MH_PAR: &str = r#"
+// DECODE_ATTN_MH_PAR
 struct D { l:u32,hd:u32,nh:u32,nkv:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> kc: array<f32>;
@@ -13672,6 +13750,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 }"#;
 
 const DECODE_ATTN_MH: &str = r#"
+// DECODE_ATTN_MH
 struct D { l:u32,hd:u32,nh:u32,nkv:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> kc: array<f32>;
@@ -13699,6 +13778,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 // ── int8 KV cache: per-row-quantized K/V (4x smaller than f32) ───────────────
 // Per-row absmax scale: scale = max|x|/127 over each row of [n,c].
 const ROW_ABSMAX: &str = r#"
+// ROW_ABSMAX
 struct D { n:u32,c:u32,_a:u32,_b:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read_write> scales: array<f32>;
@@ -13712,6 +13792,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 }"#;
 // Quantize+pack [n,c] f32 into [n,c/4] u32 (4 int8 per word) using per-row scales.
 const QUANT_PACK: &str = r#"
+// QUANT_PACK
 struct D { n:u32,c:u32,_a:u32,_b:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> scales: array<f32>;
@@ -13735,6 +13816,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 // Inverse of QUANT_PACK: unpack [n,c/4] u32 + per-row scales back to [n,c] f32. Promotes
 // a demoted (int8) prefix cache to f32. AGX-safe signed extract (extractBits + select).
 const DEQUANT_Q8_ROWS: &str = r#"
+// DEQUANT_Q8_ROWS
 struct D { n:u32,c:u32,_a:u32,_b:u32 };
 @group(0)@binding(0) var<storage,read> q: array<u32>;
 @group(0)@binding(1) var<storage,read> scales: array<f32>;
@@ -15631,8 +15713,9 @@ sequence.");
                      hv as u32, eps.to_bits(), 0, 0];
         self.dispatch_rw(DELTANET_STEP, &[&gbuf, &proj, &dg.norm, &st.s], 3, &mix,
                       bytemuck::cast_slice(&dims2), (hv as u32, 1, 1));
-        let y = dg.wout.apply(self, &mix, 1);
-        let x2 = self.add_t(x, &y);
+        // Fused matvec+residual (MATVEC_Q4_ADD / apply_add): one dispatch instead of wout-then-
+        // ADD — a per-recurrent-layer-per-token saving the named profiler made visible.
+        let x2 = dg.wout.apply_add(self, &mix, 1, x);
         self.ffn_apply(w, &x2, 1, d, eps)
     }
 
@@ -18508,6 +18591,7 @@ pub fn watchdog_prone_name(adapter: &str) -> bool {
 /// If this variant is correct where the others fail, the rule is mechanical: **no shift by a
 /// lane-varying amount; use `extractBits`.** That is a grep away in every dequantizer.
 pub const BYTE_PROBE_EXTRACT: &str = r#"
+// BYTE_PROBE_EXTRACT
 @group(0) @binding(0) var<storage, read> src: array<u32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(2) var<uniform> dims: vec4<u32>;
@@ -18524,6 +18608,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>) {
 "#;
 
 pub const BYTE_PROBE_STAGED: &str = r#"
+// BYTE_PROBE_STAGED
 @group(0) @binding(0) var<storage, read> src: array<u32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(2) var<uniform> dims: vec4<u32>;
@@ -18548,6 +18633,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>,
 "#;
 
 pub const BYTE_PROBE_VEC4: &str = r#"
+// BYTE_PROBE_VEC4
 @group(0) @binding(0) var<storage, read> src: array<vec4<u32>>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(2) var<uniform> dims: vec4<u32>;
@@ -18582,6 +18668,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>) {
 /// themselves are landing on the wrong indices, and every kernel that indexes by `global_invocation_id`
 /// is affected — which is all of them.
 pub const ID_PROBE: &str = r#"
+// ID_PROBE
 @group(0) @binding(0) var<storage, read> src: array<u32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(2) var<uniform> dims: vec4<u32>;
@@ -18709,6 +18796,7 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
 "#;
 
 pub const MATVEC_IQ1_S: &str = r#"
+// MATVEC_IQ1_S
 struct D { m:u32, n:u32, k:u32, kb:u32, gx:u32, pad0:u32, pad1:u32, pad2:u32 };
 @group(0) @binding(0) var<storage, read> a: array<f32>;      // activations [k]
 @group(0) @binding(1) var<storage, read> w: array<u32>;      // IQ1_S blocks, 50 B per 256
@@ -18790,6 +18878,7 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
 /// pattern rather than in storage reads at all — and every kernel that works, works because it does
 /// not do that.
 pub const WORD_PROBE: &str = r#"
+// WORD_PROBE
 @group(0) @binding(0) var<storage, read> src: array<u32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(2) var<uniform> dims: vec4<u32>;
@@ -18803,6 +18892,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>) {
 "#;
 
 pub const BYTE_PROBE: &str = r#"
+// BYTE_PROBE
 @group(0) @binding(0) var<storage, read> src: array<u32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(2) var<uniform> dims: vec4<u32>;
@@ -18822,6 +18912,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>) {
 "#;
 
 pub const Q6K_DEQUANT: &str = r#"
+// Q6K_DEQUANT
 struct D { n:u32, _a:u32, _b:u32, _c:u32 };
 @group(0)@binding(0) var<storage,read> src: array<u32>;
 @group(0)@binding(1) var<storage,read_write> dst: array<f32>;
@@ -18902,6 +18993,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 "#;
 
 pub const Q4K_DEQUANT: &str = r#"
+// Q4K_DEQUANT
 struct D { n:u32, grid_w:u32, _b:u32, _c:u32 };
 @group(0)@binding(0) var<storage,read> src: array<u32>;     // raw Q4_K bytes, viewed as words
 @group(0)@binding(1) var<storage,read_write> dst: array<f32>;
@@ -19034,6 +19126,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 ///
 /// Writes `slots * k` floats: slot s gets `x[j] * weight[s]`.
 pub const MOE_PRESCALE: &str = r#"
+// MOE_PRESCALE
 struct D { k:u32, slots:u32, _a:u32, _b:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> selw: array<u32>;
@@ -19054,6 +19147,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>) {
 "#;
 
 pub const Q4K_WQ_PROBE: &str = r#"
+// Q4K_WQ_PROBE
 struct D { nblk:u32, qs_off:u32, qw_base:u32, grid_w:u32 };
 @group(0)@binding(0) var<storage,read> src: array<u32>;      // raw Q4_K bytes as words
 @group(0)@binding(1) var<storage,read_write> dst: array<u32>; // qw words, then qs (bitcast f32)
@@ -19150,6 +19244,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 "#;
 
 pub const Q4K_TO_Q4: &str = r#"
+// Q4K_TO_Q4
 struct D { nblk:u32, qs_off:u32, qw_base:u32, grid_w:u32 };
 @group(0)@binding(0) var<storage,read> src: array<u32>;      // raw Q4_K bytes as words
 @group(0)@binding(1) var<storage,read_write> dst: array<u32>; // qw words, then qs (bitcast f32)
@@ -19617,6 +19712,7 @@ mod shader_drift_tests {
 // and killing that intermediate is the follow-up once a row-view helper exists.
 // Correctness oracle: `cargo run --release --bin gate-rowstats` (lavapipe-safe).
 const ROWSTATS_F32: &str = r#"
+// ROWSTATS_F32
 struct D { m:u32, n:u32 };
 @group(0)@binding(0) var<storage,read> z: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<f32>;
@@ -19691,6 +19787,7 @@ impl Gpu {
 // from the causal path. Oracle: `cargo run --release --bin gate-bidir-attn`
 // (f64 CPU reference, includes a t=2100 case crossing the 2048-row tile).
 const ATTENTION_MH_BIDIR_PAR: &str = r#"
+// ATTENTION_MH_BIDIR_PAR
 struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,nswa:u32,swaty:u32,sl:u32,bcz:u32,bco:u32,_b2:u32,_b3:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> kc: array<f32>;

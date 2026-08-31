@@ -5669,22 +5669,31 @@ still pass, which is why this one exists."
         std::env::set_var("LOGSCOPE_TRY_UNSUPPORTED_ARCH", "1");
         let gpu = Gpu::new();
         eprintln!("profile-hybrid-dispatch: adapter = {}", gpu.adapter_name);
-        let m = gpu.load_gguf(&write_gguf_qwen35moe_hybrid(1, None)).expect("hybrid load");
-        let c = gpu.new_cache_for(&m, 8);
-        for (p, t) in [1u32, 5, 9].iter().enumerate() { let _ = gpu.decode_step(&m, &c, *t, p); }
-        let before: std::collections::HashMap<usize, u64> = gpu_kernels::dispatch_histogram().into_iter().collect();
-        let _ = gpu.decode_step(&m, &c, 2, 3);
-        let mut delta: Vec<(String, u64)> = gpu_kernels::dispatch_histogram().into_iter()
-            .map(|(id, n)| {
-                let d = n - before.get(&id).copied().unwrap_or(0);
-                (gpu_kernels::shader_label(id).unwrap_or_else(|| format!("{id:#x}")), d)
-            })
-            .filter(|(_, d)| *d > 0)
-            .collect();
-        delta.sort_by(|a, b| b.1.cmp(&a.1));
-        let total: u64 = delta.iter().map(|(_, d)| d).sum();
-        println!("one steady-state token of the 2-layer hybrid (blk.0 DeltaNet, blk.1 gated-attn MoE+shexp): {total} dispatches");
-        for (l, d) in &delta { println!("  {d:>3}  {l}"); }
+        let profile = |label: &str, quantized: bool| {
+            let bytes = write_gguf_qwen35moe_hybrid(1, None);
+            let m = if quantized { gpu.load_gguf_quantized(&bytes) } else { gpu.load_gguf(&bytes) }
+                .expect("hybrid load");
+            let c = gpu.new_cache_for(&m, 8);
+            for (p, t) in [1u32, 5, 9].iter().enumerate() { let _ = gpu.decode_step(&m, &c, *t, p); }
+            let before: std::collections::HashMap<usize, u64> = gpu_kernels::dispatch_histogram().into_iter().collect();
+            let s0 = gpu_kernels::SubmitCauseSnapshot::now();
+            let _ = gpu.decode_step(&m, &c, 2, 3);
+            let dls = gpu_kernels::SubmitCauseSnapshot::now().downloads_since(&s0);
+            let mut delta: Vec<(String, u64)> = gpu_kernels::dispatch_histogram().into_iter()
+                .map(|(id, n)| {
+                    let d = n - before.get(&id).copied().unwrap_or(0);
+                    (gpu_kernels::shader_label(id).unwrap_or_else(|| format!("{id:#x}")), d)
+                })
+                .filter(|(_, d)| *d > 0)
+                .collect();
+            delta.sort_by(|a, b| b.1.cmp(&a.1));
+            let total: u64 = delta.iter().map(|(_, d)| d).sum();
+            println!("{label}: {total} dispatches, {dls} download-submits");
+            for (l, d) in &delta { println!("  {d:>3}  {l}"); }
+        };
+        println!("one steady-state token of the 2-layer hybrid (blk.0 DeltaNet, blk.1 gated-attn MoE+shexp)");
+        profile("F32 load", false);
+        profile("QUANTIZED load", true);
         return;
     }
     if args.iter().any(|a| a == "--gate-gemma4-altv") {
@@ -5889,10 +5898,13 @@ still pass, which is why this one exists."
                     for (p, t) in toks.iter().enumerate() { let _ = gpu.decode_step(&mf, &cc, *t, p); }
                     let cpu_dl = gpu_kernels::SubmitCauseSnapshot::now().downloads_since(&s1);
                     std::env::remove_var("LOGSCOPE_DELTANET_CPU");
-                    // Exactly the 4 mixer downloads (1 recurrent layer x 4 tokens) must vanish. The
-                    // residual 2/token on the GPU path is ONE logical readback — the logits —
-                    // tallied at both the frame-flush and staging-copy sites; the relative
-                    // assertion is immune to that accounting.
+                    // Exactly the 4 mixer downloads (1 recurrent layer x 4 tokens) must vanish.
+                    // CORRECTED RECORD: the residual 2/token on this F32 load is logits + the MoE
+                    // v1 ROUTER READBACK — the expert-indexed v2 kernels are quantized-only, so
+                    // f32 loads route v1. (A previous commit blamed counter double-tallying; the
+                    // named dispatch profiler showed GATHER_ROWS/SCATTER_ADD_W and settled it.)
+                    // Quantized loads run v2 and pay logits alone. The relative assertion is
+                    // immune either way.
                     ck(&format!("GPU DeltaNet removes the per-layer sync ({gpu_dl} download-submits vs {cpu_dl} CPU-routed over 4 tokens)"),
                        gpu_dl + 4 == cpu_dl);
                 }
