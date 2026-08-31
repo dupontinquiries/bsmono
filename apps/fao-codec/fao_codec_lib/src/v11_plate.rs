@@ -1381,7 +1381,15 @@ pub fn encode_gop_v3(
                     // persistent error across future frames), not a better
                     // single-frame proxy. Numbers in SESSION_LOG.
                     
-                        if sad_prev + 64 < sad_plate {
+                    // Rate-charging the MV was TRIED and LOST at every
+                    // level (SAD-equivalent charge 192/768/2048 →
+                    // +0.3%/+4.9%/+27% bytes on the quiet shot). MV
+                    // deltas are 53% of raw side info, but the vectors
+                    // are EARNING their ~2 bytes: pushing those regions
+                    // to plate mode costs more residual than the side
+                    // info saved. The side-info share is a symptom of
+                    // how cheap everything else got, not of waste.
+                    if sad_prev + 64 < sad_plate {
                         if std::env::var("FAO_MV_DEBUG").is_ok() {
                             let sat = MV_RANGE * 4; // qpel units at the clamp
                             if (mv.0 as i32).abs() >= sat - 4 || (mv.1 as i32).abs() >= sat - 4 {
@@ -1695,6 +1703,11 @@ pub fn encode_gop_v3(
             nz.truncate((n_prev_seen + 7) / 8);
             nz_bits = nz;
         }
+        // (Unified 1-byte-per-region mode/intra/gain symbols were
+        // TRIED here to expose their correlation to zstd — the
+        // band-major lesson applied to side info — and LOST +4.6%: the
+        // 8x raw-bit cost outweighs the correlation gain when the
+        // bitmaps are already this sparse. Separate bitmaps stay.)
         side.extend_from_slice(&nz_bits);
         side.extend_from_slice(&mv_deltas);
         // intra flag bitmap: mode==2 regions (bitmap-1 shows them as

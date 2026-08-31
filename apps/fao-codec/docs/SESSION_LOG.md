@@ -3663,3 +3663,33 @@ engine-exact canonicals (no grain, exact reuse), and libraries where
 a take sees content it never shot. Recorded as a NEGATIVE against
 this clip: the mover-layer and fusion machinery stand, the measured
 economic case on film does not.
+
+### Side-info attack: two more negatives, and why they're informative
+
+Post-plate-DCT attribution: mode+mv side info is now 57% of the quiet
+shot's bytes (281 KB of 497 KB), with raw composition per 48-frame
+GOP: MV deltas 234 KB (53%), mode/intra/gain bitmaps 36 KB each,
+gain values 69 KB, nz 29 KB, planar 4 KB.
+
+1. Rate-charging the MV in the mode decision (a nonzero vector costs
+   ~2 side bytes, so make regions earn it): SAD-equivalent charges of
+   192 / 768 / 2048 gave +0.3% / +4.9% / +27.2% bytes. Monotonically
+   worse. The vectors are EARNING their bytes — pushing those regions
+   to plate mode costs more residual than the side info saved. The
+   57% share is a symptom of how cheap everything else became, not of
+   waste.
+2. Unified 1-byte-per-region mode/intra/gain symbols (expose their
+   correlation to zstd — the band-major lesson applied to side info):
+   +4.6%. The 8× raw-bit cost outweighs the correlation gain at these
+   sparsities. Separate bitmaps stay.
+
+Both reverted, both recorded at their emission sites, baseline
+verified byte-exact (496,558 @ 38.521262). Note recorded during the
+revert: side-stream ORDER is load-bearing for zstd — restoring the
+components in the wrong sequence cost 81 bytes at identical
+reconstruction, which is also a reminder that these bitmaps are
+already near their compressed floor.
+
+Side info is now understood as priced-correctly rather than wasteful;
+the remaining lever on it is fewer prev-mode regions through better
+prediction (lookahead RD, mover layers), not cheaper flags.
