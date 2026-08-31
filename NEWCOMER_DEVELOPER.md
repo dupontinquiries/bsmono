@@ -84,6 +84,12 @@ Run by hand, on one app at a time (`python3 maintenance/tools/X.py apps/foo`):
   lives in a module that IS reachable. Single digits per app, and the first
   finding hand-checked was a real bug (a delivery ack nothing called, so a
   sent snap could only ever time out).
+  **Point it at `apps/<app>/crates`, not one crate.** A caller in a sibling
+  crate is still a caller: logscope's four crates scanned separately report 22
+  findings, scanned together 9, and the thirteen difference are live functions
+  that a tidy-up from the narrow list would delete. It used to be too slow to
+  run any other way — the span scan was quadratic — which is a good example of
+  a tool's cost silently choosing its scope, and the scope choosing the answer.
 
 Both answer "is this reachable", not "is this correct". A hit is a question.
 Four different answers are normal: superseded work to delete, unfinished work
