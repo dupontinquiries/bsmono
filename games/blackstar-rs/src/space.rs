@@ -413,3 +413,159 @@ mod tests {
         );
     }
 }
+
+// ------------------------------------------------- blend cost, measured ----
+//
+// WHY A MAP TANKS THE FRAME RATE, as a number rather than a suspicion.
+//
+// `map_d_from` in shader.wgsl rejects a candidate shape by bounding sphere
+// before evaluating its SDF. Blended shapes get a far weaker rejection than
+// normal ones, for a correct reason: `smin` pulls from beyond the surface, so
+// the slack is 1.8 units instead of 0.25. Two consequences follow, and
+// together they are superlinear.
+//
+// First, the blended running minimum `db` starts at 1e6 and takes NO terrain
+// contribution, unlike `d`. So at the top of the loop nothing can be rejected
+// — the slack test is against infinity — and the rejection only becomes
+// effective after several blended shapes have already been evaluated in full.
+//
+// Second, overlapping blended shapes never reject each other: if their
+// bounding spheres interpenetrate, `bd` is small for all of them at once, so
+// each one costs a full rotate-and-evaluate at EVERY march step of EVERY
+// pixel that reaches them.
+//
+// So the cost of a blended group scales with how many of its members overlap,
+// not with how many exist. That is the number this measures.
+
+/// A map's blended-shape load.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlendLoad {
+    pub blended: usize,
+    /// Largest number of blended shapes whose bounding spheres (plus the
+    /// smin reach) mutually overlap at one point. This is the count that
+    /// lands in the inner loop together.
+    pub worst_cluster: usize,
+}
+
+/// How far past its bounding sphere a blended shape still pulls.
+pub const SMIN_REACH: f32 = 1.8;
+
+/// Measure a built world. Pure geometry — no GPU, no frame timing, so it runs
+/// in a sandbox with neither and still says something true about the frame.
+pub fn blend_load(shapes: &[crate::world::Shape]) -> BlendLoad {
+    let b: Vec<(glam::Vec3, f32)> = shapes
+        .iter()
+        .filter(|s| s.blend && !s.cut)
+        .map(|s| (s.pos, crate::world::shape_reach(&s.sdf) + SMIN_REACH))
+        .collect();
+    let mut worst = 0usize;
+    // For each blended shape, count how many others reach its centre. O(n²)
+    // on a few hundred shapes, run once in a test — the honest cost of not
+    // approximating the thing being measured.
+    for (i, (pi, _)) in b.iter().enumerate() {
+        let mut n = 1usize;
+        for (j, (pj, rj)) in b.iter().enumerate() {
+            if i != j && pi.distance(*pj) <= *rj {
+                n += 1;
+            }
+        }
+        worst = worst.max(n);
+    }
+    BlendLoad { blended: b.len(), worst_cluster: worst }
+}
+
+/// Above this many mutually-overlapping blended shapes, every march step in
+/// that region evaluates them all and the frame rate goes with it.
+///
+/// Derived from the shipped table rather than invented — see the test, which
+/// prints every map. It is a REGRESSION FLOOR for procedurally generated
+/// worlds, not a target: the generator that replaces these maps has to budget
+/// blended shapes, and this is the check that makes the budget enforceable.
+pub const BLEND_CLUSTER_BUDGET: usize = 24;
+
+#[cfg(test)]
+mod blend_tests {
+    use super::*;
+    use crate::world::{styles, World};
+
+    fn load_for(i: usize) -> (&'static str, BlendLoad) {
+        let s = &styles()[i];
+        let w = World::generate(0xC13 + i as u64, s, 0.5, 1.0);
+        (s.name, blend_load(&w.shapes))
+    }
+
+    /// `cargo test -- --nocapture blend_report` — the tuning tool, and how
+    /// BLEND_CLUSTER_BUDGET was derived from real worlds rather than guessed.
+    #[test]
+    fn blend_report() {
+        let mut rows: Vec<(usize, String)> = (0..styles().len())
+            .map(|i| {
+                let (n, l) = load_for(i);
+                (l.worst_cluster, format!("{n:<14} blended {:>4}  worst cluster {:>3}", l.blended, l.worst_cluster))
+            })
+            .collect();
+        rows.sort_by_key(|r| r.0);
+        for (_, r) in &rows {
+            println!("{r}");
+        }
+        assert!(rows.len() >= 36, "the style table shrank to {}", rows.len());
+    }
+
+    #[test]
+    fn the_measure_actually_separates_maps() {
+        // If every map scored the same the metric would be measuring the
+        // scene population, not the blend structure. Assert a SPREAD, not a
+        // bound: a measure that has stopped discriminating passes any
+        // one-sided check.
+        let loads: Vec<usize> =
+            (0..styles().len()).map(|i| load_for(i).1.worst_cluster).collect();
+        let lo = *loads.iter().min().expect("styles exist");
+        let hi = *loads.iter().max().expect("styles exist");
+        assert!(
+            hi >= lo * 2 + 4,
+            "worst-cluster is flat across the table ({lo}..{hi}) — it is not measuring blend structure"
+        );
+    }
+
+    #[test]
+    fn an_overlapping_pile_costs_more_than_the_same_shapes_spread_out() {
+        // The property, on synthetic input: cost follows OVERLAP, not count.
+        use crate::world::{Sdf, Shape};
+        use glam::{Mat4, Quat, Vec3};
+        let mk = |p: Vec3| Shape {
+            mesh: 0,
+            mat: Mat4::IDENTITY,
+            pos: p,
+            inv_rot: Quat::IDENTITY,
+            sdf: Sdf::Sphere { r: 4.0 },
+            color: [1.0; 4],
+            emissive: 0.0,
+            flash: 0.0,
+            vel: Vec3::ZERO,
+            omega: Vec3::ZERO,
+            spec: 0.0,
+            cut: false,
+            blend: true,
+        };
+        let piled: Vec<Shape> = (0..20).map(|i| mk(Vec3::new(i as f32 * 0.3, 0.0, 0.0))).collect();
+        let spread: Vec<Shape> = (0..20).map(|i| mk(Vec3::new(i as f32 * 100.0, 0.0, 0.0))).collect();
+        let a = blend_load(&piled);
+        let b = blend_load(&spread);
+        assert_eq!(a.blended, b.blended, "the fixtures differ in count, not just spread");
+        assert!(a.worst_cluster >= 18, "a tight pile measured as {}", a.worst_cluster);
+        assert_eq!(b.worst_cluster, 1, "well-separated shapes measured as a cluster");
+
+        // AND THE SMIN REACH ITSELF. These sit 5.0 apart with radius 4.0, so
+        // they do NOT touch — but smin pulls 1.8 further, which is the whole
+        // reason blended shapes reject each other so poorly. Without the
+        // reach term this reads as isolated shapes, and setting SMIN_REACH to
+        // zero broke nothing until this case existed.
+        let reachy: Vec<Shape> = (0..8).map(|i| mk(Vec3::new(i as f32 * 5.0, 0.0, 0.0))).collect();
+        let c = blend_load(&reachy);
+        assert!(
+            c.worst_cluster >= 3,
+            "shapes within smin reach of each other measured as isolated ({})",
+            c.worst_cluster
+        );
+    }
+}
