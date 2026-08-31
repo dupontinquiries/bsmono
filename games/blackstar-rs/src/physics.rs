@@ -575,6 +575,27 @@ impl Car {
             wheel_r: self.wheel_r,
             drive: self.drive,
             hover: self.hover,
+            // FLIGHT IS ALSO THE CAR YOU CHOSE, and was missing from this
+            // list entirely -- found while wiring FlightSubMode/siege
+            // mode this session, but a real, pre-existing bug on its
+            // own: a jet reverted to grounded, non-flying physics after
+            // ANY reset (kickoff, goal, respawn, map load), same shape
+            // of bug as the hover/drivetrain one the comment above
+            // already documents. `hand`/`hand_base` carry over for the
+            // same reason `drive`/`hover` do -- a chassis nobody's
+            // re-switched-to should keep the handling it was measured
+            // to have, not silently fall back to Handling::default()
+            // (1.0 everywhere) until the next chassis switch happens to
+            // re-derive it. `tracked`/`flight_submode`/`siege_mode`
+            // carry over so an in-progress VTOL/siege toggle survives a
+            // kickoff instead of silently snapping back to the default
+            // sub-mode mid-match.
+            flight: self.flight,
+            flight_submode: self.flight_submode,
+            tracked: self.tracked,
+            siege_mode: self.siege_mode,
+            hand: self.hand,
+            hand_base: self.hand_base,
             boost: if self.hover.is_some() { 45.0 } else { 45.0 },
             pos: p,
             ..Car::new()
@@ -2402,6 +2423,34 @@ mod reset_tests {
     // because a negative `ride_h` is legitimate — model.rs produces one for a
     // body sitting entirely above the origin — and `> 0.0` rather than `!= 0.0`
     // is the only thing standing between that and a frame seated underground.
+
+    #[test]
+    fn a_flying_chassis_is_still_flying_after_a_reset() {
+        // real, pre-existing bug found while wiring FlightSubMode this
+        // session: `flight` was missing from reset()'s preserved-field
+        // list entirely, so a jet reverted to grounded car physics on
+        // every kickoff/goal/respawn -- same shape of bug as the
+        // hover/drivetrain one this file's own comment already
+        // documents having been fixed once before.
+        let world = World::generate(7, crate::world::style(0), 0.19, 1.0);
+        let mut car = Car::new();
+        car.flight = true;
+        car.flight_submode = FlightSubMode::Vtol;
+        car.tracked = true;
+        car.siege_mode = TankSiegeMode::Siege;
+        car.hand_base = crate::driveline::Handling { top_speed: 1.23, ..Default::default() };
+        car.recompute_hand();
+        let hand_before = car.hand;
+
+        car.reset(&world);
+
+        assert!(car.flight, "flight was silently dropped on reset");
+        assert_eq!(car.flight_submode, FlightSubMode::Vtol, "flight_submode was silently dropped on reset");
+        assert!(car.tracked, "tracked was silently dropped on reset");
+        assert_eq!(car.siege_mode, TankSiegeMode::Siege, "siege_mode was silently dropped on reset");
+        assert_eq!(car.hand_base.top_speed, 1.23, "hand_base was silently dropped on reset");
+        assert_eq!(car.hand, hand_before, "hand should be unchanged by a reset");
+    }
 
     #[test]
     fn stand_h_prefers_ride_h_when_it_is_set() {
