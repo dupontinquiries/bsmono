@@ -295,12 +295,14 @@ and below; differs only on the 27B, which uses 1/sqrt(n_embd/n_head)"),
 output down by that factor — a quietly worse model, not a broken one"),
             Feature::MlaSplit3dProjections => Some("a LOADING gap, not a maths one — the MLA forward is \
 implemented and validated; these checkpoints just store k_b and v_b separately and in 3-D"),
-            Feature::SparseAttentionIndexer => Some("glm-dsa needs sparse attention: an indexer selects top-k keys. NOT a correctness blocker — \
-llama.cpp mainline does not implement DSA either (issues #24730, #20363) and runs GLM-5.2 with a \
-DENSE fallback, and dense attention is EXACT at or below index_topk because selecting the top k \
-of k-or-fewer keys is all of them. Above that bound it is an approximation, and at a 1M context \
-it is unaffordable. The real loader blocker is IndexShare: index_topk_freq 4 means only ~1 layer \
-in 4 carries indexer tensors, which is what breaks stock llama.cpp on converted GGUFs"),
+            Feature::SparseAttentionIndexer => Some("glm-dsa needs sparse attention: an indexer selects top-k keys. NOT a correctness blocker: \
+dense attention is EXACT at or below index_topk, because selecting the top k of k-or-fewer keys \
+is all of them. Above that bound it is an approximation, and at a 1M context it is unaffordable. \
+The dense-fallback bargain was llama.cpp's too until mid-2026; its master now SHIPS DSA \
+(src/models/glm-dsa.cpp + llama-kv-cache-dsa.h: 32-head lightning indexer, per-layer \
+indexer_types, indexer tensors TENSOR_NOT_REQUIRED) — the reference to transcribe when \
+long-context efficiency matters here. IndexShare (index_topk_freq 4 → only ~1 layer in 4 \
+carries indexer tensors) is handled on our side: unread tensors are simply not fetched"),
             Feature::Mla => Some("wired and validated against the CPU reference, but never yet run on a \
 real DeepSeek/GLM checkpoint — the first such load is the test"),
             Feature::AltAttnValueFromKey => Some("STRUCTURAL for the affected layers: without it the \

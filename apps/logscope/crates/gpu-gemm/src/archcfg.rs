@@ -291,29 +291,31 @@ never on the fixture",
             arch: Arch::DeepseekV3, prefix: "glm-dsa", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: false, moe: true, moe_shared_expert: true, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: false,
             supported: false, dense_supported: false,
-            note: "GLM-5.2 (744B-A40B, 78 layers, MLA + DeepSeek Sparse Attention). NOT blocked on the \
-indexer: llama.cpp mainline does not implement DSA either (issues #24730, #20363) and runs this model \
-with a DENSE attention fallback, so the indexer costs long-context efficiency, not correctness. Two \
-things that DO block a load: IndexShare means only ~1 layer in 4 carries indexer tensors \
-(index_topk_freq 4, skip_offset 3), so a loader demanding them per-layer fails — that is precisely \
-what breaks stock llama.cpp on converted GGUFs; and IQ1_S is 201.8 GiB against 192 GB, so fitting \
-needs either the IQ3 reader or the MoE-residency lever. expert_weights_scale 2.5 and \
-expert_weights_norm are already wired. Order of work in docs/glm-5.2-arch.md",
+            note: "GLM-5.2 (744B-A40B, 78 layers, MLA + DeepSeek Sparse Attention). LOADS end to end on \
+the synthetic (gen_glmdsa.py: MLA + MoE + IndexShare + split 3-D kv_b — load + finite decode via \
+kernel-validate --probe); `supported` stays false until a REAL checkpoint produces coherent text. \
+NOT blocked on the indexer for correctness: dense attention is EXACT at or below index_topk (2048). \
+llama.cpp master (Aug 2026) now SHIPS DSA — src/models/glm-dsa.cpp + llama-kv-cache-dsa.h, lightning \
+indexer with per-layer indexer_types and TENSOR_NOT_REQUIRED indexer tensors — the reference to \
+transcribe when long-context efficiency matters. IndexShare (~1 layer in 4 carries indexer tensors) \
+is a non-issue for our loader (unread tensors are not fetched). Remaining real blocker for the full \
+model: IQ1_S is 201.8 GiB against 192 GB — the IQ3 reader or the MoE-residency lever. \
+expert_weights_scale 2.5 and expert_weights_norm are wired. Order of work in docs/glm-5.2-arch.md",
         },
         "deepseek2" | "deepseek3" | "deepseekv3" => ArchConfig {
             arch: Arch::DeepseekV3, prefix: "deepseek2", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: false, moe: true, moe_shared_expert: true, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: false,
             supported: false, dense_supported: false,
-            note: "MLA KERNELS are wired and LOADING IS NOT — the distinction this note used to blur. Present: \
-the compressed-latent cache, per-layer routing, the decode block \
-(--gate-mla-block), and BOTH kv_b layouts — the legacy fused attn_kv_b and the modern split \
-attn_k_b + attn_v_b, which GGUF stores 3-D but which are the same bytes as llama.cpp's 2-D declaration \
-(PR #12801). ABSENT: any path that loads those tensors into a Model. The loader detects MLA, derives \
-dimensions, logs, and falls through to the dense layer loop, which cannot consume \
-attn_q_a/attn_kv_a_mqa — so every MLA checkpoint fails at blk.0. \
-tools/tiny-variants/gen_glmdsa.py reproduces it in 3 layers, and note_claims::mla_loading_is_still_absent \
-fails the moment that stops being true, which is the only thing that will make anyone update this \
-line. It stays unverified end to end for the same reason: nothing has run an MLA checkpoint here",
+            note: "MLA kernels AND loading are wired. Present: the compressed-latent cache, per-layer \
+routing (decode_step_full sends any layer with `w.mla` to block_decode_mla), the decode block \
+(--gate-mla-block), BOTH kv_b layouts — legacy fused attn_kv_b and the modern split attn_k_b + \
+attn_v_b, which GGUF stores 3-D but which are the same bytes as llama.cpp's 2-D declaration \
+(PR #12801) — and per-BLOCK loading in the resident loader: MLA blocks get placeholder q/k/v and \
+the low-rank set, incomplete sets fail naming the set. --gate-mla-load proves load + 3-token \
+decode on a q-compressed synthetic (this work landed in b911a471, was LOST in a merge, and is \
+re-landed with the gate as its regression net). `supported` stays false because numerics on a \
+REAL checkpoint (GLM-4.7-Flash q4 on real hardware) remain unverified — coherent output there is \
+what flips this flag, never a synthetic",
         },
         // Dream / DiffuCoder: a Qwen2.5 backbone trained for masked diffusion rather than AR
         // continuation — same QKV-bias attention, RMSNorm and SwiGLU as "qwen2", only the
@@ -561,7 +563,8 @@ mod tests {
             let c = for_arch(name);
             assert_eq!(c.arch, Arch::DeepseekV3, "{name} should map to the MLA arch");
             assert!(c.moe && c.moe_shared_expert, "DeepSeek/GLM-DSA has routed + shared experts");
-            assert!(!c.supported, "MLA forward isn't wired yet → refuse cleanly");
+            assert!(!c.supported, "MLA loads and decodes on synthetics, but no REAL checkpoint has \
+run → stays declared-unsupported until one does (LOGSCOPE_TRY_UNSUPPORTED_ARCH is the escape)");
             assert!(c.note.contains("MLA") || c.note.contains("Latent"), "note must explain the MLA gap");
         }
         // glm4moe: standard attention (QK-norm + bias) + shared-expert MoE — supported.
@@ -706,15 +709,17 @@ mod tests {
             assert!(!(claims_unwired && mla_done),
                 "{a}'s note says MLA is unwired but archfeat reports it implemented: {n}");
         }
-        // The deepseek note has now said three different things across three commits, and the sequence is
-        // the point: "MLA isn't wired" (stale), then "the blocker is 3-D tensor layout" (true at the
-        // time), and now that BOTH layouts are read. Each revision followed a real change, and a note
-        // that lagged behind sent the reader to inspect their checkpoint for our bug.
+        // The deepseek note has now said FOUR different things across four commits, and the sequence
+        // is the point: "MLA isn't wired" (stale), then "the blocker is 3-D tensor layout" (true at
+        // the time), then "both layouts are read but LOADING is absent" (true again after a merge
+        // dropped b911a471's loader half), and now that loading is re-landed with --gate-mla-load as
+        // its net. Each revision followed a real change, and a note that lagged behind sent the
+        // reader to inspect their checkpoint for our bug.
         let n = for_arch("deepseek2").note;
         assert!(n.contains("attn_k_b") && n.contains("attn_kv_b"), "both layouts named: {n}");
         // and it must still refuse, because reading the weights is not the same as having run them
         assert!(!for_arch("deepseek2").supported);
-        assert!(n.contains("unverified end to end"), "the remaining gap has to stay stated: {n}");
+        assert!(n.contains("remain unverified"), "the remaining gap has to stay stated: {n}");
     }
 
     #[test]
@@ -977,24 +982,33 @@ mod note_claims {
     //! is the only force that reliably updates prose.
     use super::*;
 
-    /// The `glm-dsa` and `deepseek2` notes both say MLA loading is absent. When someone implements
-    /// it, this fails and points at the lines to rewrite.
+    /// The `glm-dsa` and `deepseek2` notes said MLA loading was absent — and for a stretch they
+    /// were right for the WRONG reason. b911a471 implemented per-block loading; a later merge took
+    /// the other side of both files (`git log -S "gate-mla-load"` on main finds nothing even though
+    /// the commit is an ancestor); and the structural probe that used to live here kept passing
+    /// through all of it, because it grepped for symbol names (`load_mla_layer`, `MlaLayerWeights`)
+    /// the implementation never used. A pin that greps for a GUESS about a spelling expires
+    /// silently; this one greps for the code that exists today, and its failure message says what
+    /// to do when that stops being true.
     ///
-    /// Checked structurally rather than by loading a model: the MLA detection branch ends without
-    /// handing off, so no symbol exists that would consume attn_q_a into a Model. If that changes,
-    /// the note is stale.
+    /// Inverted from `mla_loading_is_still_absent`: the per-block routing is present, and the notes
+    /// claim loading works rather than that it is absent. --gate-mla-load is the behavioural check
+    /// (load + 3-token decode on a q-compressed synthetic); this is the prose-vs-code check.
     #[test]
-    fn mla_loading_is_still_absent() {
+    fn mla_loading_exists_and_the_notes_say_so() {
         let src = include_str!("lib.rs");
-        // The branch that would exist if loading were implemented: something building layer weights
-        // from the low-rank query / latent KV pair.
-        let implemented = src.contains("fn load_mla_layer")
-            || src.contains("fn block_mla(")
-            || src.contains("MlaLayerWeights");
-        assert!(!implemented,
-            "MLA layer loading now appears to exist. Update the glm-dsa and deepseek2 notes in \
-archcfg.rs — they tell the reader it is absent, and a note that is wrong about the engine is worse \
-than no note at all.");
+        assert!(src.contains("let block_is_mla"),
+            "the per-block MLA sniff is gone from the resident loader. If it was renamed, update \
+this pin; if a merge dropped it, that is the SECOND loss of this exact work (b911a471 was the \
+first) — re-land it and run --gate-mla-load");
+        for arch in ["deepseek2", "glm-dsa"] {
+            let n = for_arch(arch).note;
+            assert!(!n.contains("LOADING IS NOT") && !n.contains("loading is absent"),
+                "{arch}'s note claims MLA loading is absent while the loader ships it — a note \
+that is wrong about the engine is worse than no note at all");
+            assert!(n.contains("gate-mla-load") || n.contains("gen_glmdsa"),
+                "{arch}'s note should point at the gate/fixture that proves the load path");
+        }
     }
 
     /// Every dense-attention block fn refuses an MLA layer instead of computing over it.

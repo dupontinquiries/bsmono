@@ -325,6 +325,82 @@ fn enc_q8_0(w: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Synthetic 1-layer deepseek2 checkpoint with q-compressed MLA (q_lora_rank > 0):
+/// attn_q_a(+norm)/attn_q_b + attn_kv_a_mqa(+norm)/attn_kv_b + attn_output, and NO
+/// attn_q/k/v — exactly the tensor shape of GLM-4.7-Flash, which the loader once
+/// refused with "missing tensor blk.0.attn_q.weight". Dims mirror --gate-mla-block
+/// (d=64, 2 heads, kv_lora=16, q_lora=32, nope=16, rope=8, v_head=16).
+///
+/// Recovered verbatim from b911a471, whose main.rs half a later merge dropped —
+/// `git log -S "gate-mla-load"` on main finds nothing even though the commit is an
+/// ancestor. The gate below is the regression net that would have caught that loss.
+fn write_gguf_deepseek2_mla() -> Vec<u8> {
+    let (d, heads, vocab, h) = (64usize, 2usize, 32usize, 128usize);
+    let (q_lora, kv_lora, nope, rope, v_head) = (32usize, 16usize, 16usize, 8usize, 16usize);
+    let qk_head = nope + rope;
+    let mk = |seed: u32, n: usize| -> Vec<f32> {
+        let mut v = Vec::with_capacity(n); let mut x = seed | 1;
+        for _ in 0..n { x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push(((x >> 9) as f32 / (1u32 << 23) as f32 - 1.0) * 0.05); }
+        v };
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let f32t = |w: &[f32]| (0u32, bytemuck::cast_slice::<f32, u8>(w).to_vec());
+    let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+    let mut push = |name: String, dims: Vec<u64>, w: Vec<f32>| {
+        let (t, by) = f32t(&w); ts.push((name, dims, t, by)); };
+    push("token_embd.weight".into(), mat(vocab, d), mk(11, vocab * d));
+    push("blk.0.attn_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("blk.0.attn_q_a.weight".into(), mat(q_lora, d), mk(21, q_lora * d));
+    push("blk.0.attn_q_a_norm.weight".into(), v1(q_lora), vec![1.0; q_lora]);
+    push("blk.0.attn_q_b.weight".into(), mat(heads * qk_head, q_lora), mk(22, heads * qk_head * q_lora));
+    push("blk.0.attn_kv_a_mqa.weight".into(), mat(kv_lora + rope, d), mk(23, (kv_lora + rope) * d));
+    push("blk.0.attn_kv_a_norm.weight".into(), v1(kv_lora), vec![1.0; kv_lora]);
+    push("blk.0.attn_kv_b.weight".into(), mat(heads * (nope + v_head), kv_lora), mk(24, heads * (nope + v_head) * kv_lora));
+    push("blk.0.attn_output.weight".into(), mat(d, heads * v_head), mk(25, d * heads * v_head));
+    push("blk.0.ffn_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("blk.0.ffn_gate.weight".into(), mat(h, d), mk(31, h * d));
+    push("blk.0.ffn_up.weight".into(), mat(h, d), mk(32, h * d));
+    push("blk.0.ffn_down.weight".into(), mat(d, h), mk(33, d * h));
+    push("output_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("output.weight".into(), mat(vocab, d), mk(41, vocab * d));
+
+    let mut offs = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, _, by) in &ts { offs.push(off); off = align32(off + by.len() as u64); }
+    let mut b = Vec::new();
+    let s = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 13);
+    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "deepseek2");
+    s(&mut b, "deepseek2.block_count"); u32b(&mut b, 4); u32b(&mut b, 1);
+    s(&mut b, "deepseek2.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, heads as u32);
+    s(&mut b, "deepseek2.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, heads as u32);
+    s(&mut b, "deepseek2.embedding_length"); u32b(&mut b, 4); u32b(&mut b, d as u32);
+    s(&mut b, "deepseek2.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, h as u32);
+    s(&mut b, "deepseek2.vocab_size"); u32b(&mut b, 4); u32b(&mut b, vocab as u32);
+    s(&mut b, "deepseek2.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, 10000.0);
+    s(&mut b, "deepseek2.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, 1e-5);
+    s(&mut b, "deepseek2.attention.kv_lora_rank"); u32b(&mut b, 4); u32b(&mut b, kv_lora as u32);
+    s(&mut b, "deepseek2.attention.q_lora_rank"); u32b(&mut b, 4); u32b(&mut b, q_lora as u32);
+    s(&mut b, "deepseek2.rope.dimension_count"); u32b(&mut b, 4); u32b(&mut b, rope as u32);
+    s(&mut b, "deepseek2.attention.key_length"); u32b(&mut b, 4); u32b(&mut b, qk_head as u32);
+    for (i, (name, dims, ty, _)) in ts.iter().enumerate() {
+        s(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, *ty); u64b(&mut b, offs[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, _, by)) in ts.iter().enumerate() {
+        while (b.len() as u64) < data_off + offs[i] { b.push(0); }
+        b.extend_from_slice(by);
+    }
+    b
+}
+
 /// Serialize a HostModel as a q8_0 GGUF (weights as q8_0 type-8; norms/embed/biases f32). For
 /// --gate-q8direct, to exercise the loader's direct q8_0 → resident path end-to-end.
 fn write_gguf_q8_0(m: &HostModel) -> Vec<u8> {
@@ -1204,7 +1280,13 @@ fn main() {
         // the same regardless of input token, the forward is ignoring its input (embedding
         // /residual/attention) rather than just being low-quality.
         for &t in &[791u32, 9822, 6342, 40, 1] {
-            let c = gpu.new_cache(m.n_layers, 2, m.kv_dim());
+            // Tiny synthetic fixtures have vocabs smaller than these ids; out-of-range panics in
+            // embed lookup say nothing about the model. Fold into range, keep ids distinct mod v.
+            let t = t % m.vocab as u32;
+            // Model-aware: attaches the MLA latent cache when the model needs it. The raw
+            // new_cache() here was the exact second-half bug --gate-mla-load's history records
+            // (c.mla=None silently drops MLA layers to the dense path).
+            let c = gpu.new_cache_for(&m, 2);
             let logits = gpu.decode_step(&m, &c, t, 0);
             let finite = logits.iter().all(|x| x.is_finite());
             let (mn, mx) = logits.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
@@ -1215,7 +1297,8 @@ fn main() {
         // collapse/explosion at layer k localizes the fault to that block with real weights.
         // If this trace looks healthy but decode_step above is washed out, the bug is in the
         // KV/decode path, not the forward math.
-        let probe_ids = [1u32, 791, 9822, 6342]; // valid for both 49k and 128k vocabs
+        let probe_ids: Vec<u32> = [1u32, 791, 9822, 6342] // valid for 49k/128k vocabs; folded for tiny fixtures
+            .iter().map(|&t| t % m.vocab as u32).collect();
         // Is the llama3 rope scaling actually loaded? Dump the factors; all-ones means the
         // `rope_freqs.weight` tensor silently fell back (e.g. a length check missed), which
         // would corrupt every layer's attention — the one structural thing the 1B has and
@@ -1224,6 +1307,12 @@ fn main() {
         let (rmn, rmx) = rf.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
         let all_ones = rf.iter().all(|&x| (x - 1.0).abs() < 1e-6);
         eprintln!("rope_factors: len={} range=[{rmn:.4},{rmx:.4}] all_ones={all_ones}", rf.len());
+        if m.mla_layers() > 0 {
+            eprintln!("per-block trace SKIPPED: {} of {} layers are MLA and the trace's dense math \
+has no MLA path (decode-only for now). The decode probes above are the MLA-model signal.",
+                m.mla_layers(), m.n_layers);
+            return;
+        }
         eprintln!("per-block sub-step trace, ids={probe_ids:?} (n1/n2 = post-norm input scale; attn_out/ffn_out = each block's contribution):");
         let logits = gpu.model_forward_trace(&m, &probe_ids, m.rope_factors());
         eprintln!("    final logits top3 = {:?}", top(&logits[logits.len() - m.vocab..], 3));
@@ -5379,6 +5468,42 @@ still pass, which is why this one exists."
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-mla-load") {
+        // Regression for the GLM-4.7-Flash load failure: a q-compressed MLA checkpoint
+        // (q_lora_rank > 0) has NO blk.N.attn_q/k/v — the loader must take the MLA
+        // tensor set instead of failing with "missing tensor blk.0.attn_q.weight".
+        // The math is covered by --gate-mla-block; THIS gate is about the loader's
+        // per-block routing and that a loaded q-compressed model actually decodes.
+        //
+        // deepseek2 is declared-unsupported (the flag flips only on a REAL checkpoint,
+        // never a synthetic — the project rule), so the arch gate would refuse this
+        // fixture. The opt-in env is exactly the escape built for that: set it for
+        // this single-purpose process. It does not leak into the suite.
+        std::env::set_var("LOGSCOPE_TRY_UNSUPPORTED_ARCH", "1");
+        let gpu = Gpu::new();
+        eprintln!("gate-mla-load: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let bytes = write_gguf_deepseek2_mla();
+        match gpu.load_gguf_quantized(&bytes) {
+            Err(e) => ck(&format!("q-compressed MLA gguf loads (was: 'missing tensor attn_q') — {e}"), false),
+            Ok(m) => {
+                ck("q-compressed MLA gguf loads", true);
+                ck("MLA config detected (q_lora=32, kv_lora=16)",
+                   m.mla.as_ref().map(|c| c.q_lora == 32 && c.kv_lora == 16).unwrap_or(false));
+                ck("blk.0 carries the MLA weight set (dense fields are placeholders)",
+                   m.mla_layers() == 1);
+                let c = gpu.new_cache_for(&m, 4);   // model-aware: attaches the MLA latent cache
+                let mut finite = true;
+                for (p, t) in [1u32, 5, 9].iter().enumerate() {
+                    let logits = gpu.decode_step(&m, &c, *t, p);
+                    finite &= logits.iter().all(|x| x.is_finite());
+                }
+                ck("3-token decode through the MLA path is finite", finite);
+            }
+        }
+        println!("gate-mla-load: {}", if ok { "q-compressed MLA loads + decodes \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-mla-block") {
         // The MLA math is already checked against mla.rs by --validate. What is NOT checked is the BLOCK:
         // norm -> compress-and-append -> attend -> residual. The ordering matters — the token must be in
@@ -5541,7 +5666,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }

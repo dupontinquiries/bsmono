@@ -9841,6 +9841,10 @@ impl Model {
     /// True if any block is a routed-MoE layer — the dispatch levers (bind-group cache, MoE fusions) only
     /// bear on MoE decode, so the magical A/B autotune skips the probe entirely on dense models.
     pub fn is_moe(&self) -> bool { self.layers.iter().any(|b| b.moe.is_some()) }
+    /// How many blocks loaded the MLA (low-rank latent attention) weight set. Nonzero means those
+    /// layers decode through block_decode_mla; used by --gate-mla-load to assert the per-block
+    /// routing engaged rather than inferring it from the model-level config alone.
+    pub fn mla_layers(&self) -> usize { self.layers.iter().filter(|b| b.mla.is_some()).count() }
 
     /// Fingerprint a few GPU-resident weights (LOGSCOPE_WEIGHT_CHECK=1): downloads small tensors and
     /// prints first values + abs-sums. The same GGUF must produce IDENTICAL lines on every machine —
@@ -10258,15 +10262,15 @@ particular checkpoint cannot be sized. Use the llama.cpp backend for it.\n{layou
             // what mla.rs expects — the shapes line up and llama.cpp's declaration says they should, but
             // no MLA checkpoint has run end to end here.
             let split_kv_b = g.tensor("blk.0.attn_k_b.weight").is_some();
-            // SAY THAT IT DID NOT ENGAGE. This block derives dimensions, logs, and ends — there is
-            // no MLA layer-loading path for it to hand off to, so the dense loop runs next and
-            // fails twenty layers later with "the MLA path did not engage", which reads as a
-            // surprise after a banner that announced MLA attention. It is not a surprise; it is
-            // this branch having nowhere to go. Refuse here, where the reason is legible, rather
-            // than describing an unbuilt path in the present tense.
+            // This banner and the block loop must agree: the loop routes any block shipping the
+            // low-rank set to the MLA loader (dense fields become placeholders) and decode routes
+            // those layers to block_decode_mla. Proven on synthetic fixtures by --gate-mla-load and
+            // gen_glmdsa.py; numerics on a REAL checkpoint remain unverified, and the split-form
+            // caveat below is exactly what a real generation would confirm or refute.
             eprintln!("wgpu-engine: MLA tensors detected ({} kv_b layout) and dimensions recovered — \
-but MLA LAYER LOADING IS NOT IMPLEMENTED. The dense path cannot consume attn_q_a/attn_kv_a_mqa, so \
-this load will fail. tools/tiny-variants/gen_glmdsa.py reproduces it in 3 layers at d=64.",
+per-block MLA loading is ACTIVE (dense q/k/v become placeholders; decode routes those layers to \
+block_decode_mla). Verified on synthetic fixtures (--gate-mla-load, gen_glmdsa.py); numerics on a \
+real checkpoint are still unverified.",
                 if split_kv_b { "SPLIT k_b+v_b" } else { "fused" });
         }
         // DERIVED, not read off the entry. archfeat can veto a declared-supported architecture — the
@@ -11361,6 +11365,20 @@ LOGSCOPE_NO_Q4_0_TRANSCODE=1 restores the old path");
 {missing:?}; treating this block as DENSE. If the model is meant to be MoE here, its expert tensors use \
 names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to see them).");
             }
+            // Per-BLOCK MLA routing, re-landed: b911a471 added exactly this and a later merge took
+            // the other side of the file (git log -S "gate-mla-load" finds nothing on main), so the
+            // resident loader went back to refusing every MLA checkpoint at the wqkv site while the
+            // docs said it loaded. An MLA block has no attn_q/attn_qkv — its attention is the
+            // low-rank set the `mla` field below loads — so the standard fields get the MoE-style
+            // tiny placeholders, never bound: decode_step_full routes a layer to block_decode_mla
+            // whenever `w.mla` and the latent cache are present, and every dense block fn refuses an
+            // MLA layer as a backstop (every_dense_block_refuses_an_mla_layer).
+            // DeepSeek-V2-Lite (q_lora_rank=0) ships a REAL attn_q and takes the standard path.
+            let block_is_mla = g.tensor(&format!("blk.{i}.attn_q.weight")).is_none()
+                && (g.tensor(&format!("blk.{i}.attn_q_a.weight")).is_some()
+                    || g.tensor(&format!("blk.{i}.attn_q_a_proj.weight")).is_some()
+                    || g.tensor(&format!("blk.{i}.attn_kv_a_mqa.weight")).is_some()
+                    || g.tensor(&format!("blk.{i}.attn_kv_a.weight")).is_some());
             // Qwen2 carries a bias on Q/K/V (llama doesn't). Fetch the f32 bias once so it can both
             // attach to the separate projections AND concatenate for the fused wqkv bias.
             let has_qkv_bias = g.tensor(&format!("blk.{i}.attn_q.bias")).is_some();
@@ -11373,16 +11391,16 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
             // Fused Q||K||V projection [d+2kv, d] (mirrors the wgate_up fusion): concatenate the q/k/v
             // weight ROWS then quantize — per-row quant of the concatenation is identical to quantizing
             // each separately (proven bit-exact by --gate-qkv). The bias concatenates the same way.
-            let wqkv = {
-                // REFUSE CLEANLY when this is an MLA checkpoint. MLA models have no `attn_q` — they
-                // have the low-rank pair attn_q_a/attn_q_b — so falling through to the dense path here
-                // reports "missing tensor blk.0.attn_q.weight", which sends the reader looking for a
-                // corrupt file. The tensor is not missing; the loader is reading the wrong architecture.
+            let wqkv = if block_is_mla { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) } else {
+                // DIVERGENCE GUARD: `block_is_mla` routes MLA blocks to placeholders above, so
+                // reaching the dense fusion with MLA tensors present means the sniff and this check
+                // disagree (e.g. a file shipping BOTH attn_q and attn_q_a). Refuse rather than fuse:
+                // a dense pass over a hybrid layout would produce plausibly-shaped nonsense.
                 if g.tensor(&format!("blk.{i}.attn_q_a.weight")).is_some()
                     || g.tensor(&format!("blk.{i}.attn_kv_a_mqa.weight")).is_some() {
-                    return Err(format!("blk.{i} is Multi-head Latent Attention (attn_q_a / attn_kv_a_mqa \
-present, attn_q absent) and the MLA path did not engage, so the dense loader ran instead. This is a \
-LOADER gap, not a bad checkpoint — see the MLA line earlier in this log for which part is missing"));
+                    return Err(format!("blk.{i} carries MLA tensors (attn_q_a / attn_kv_a_mqa) but the \
+per-block MLA sniff did not route it to the MLA loader — the two detections disagree (does the block \
+ship BOTH attn_q and the low-rank pair?). This is a LOADER bug, not a bad checkpoint"));
                 }
                 // DIAGNOSE rather than just report a name. "missing tensor blk.0.attn_q.weight" sends
                 // the reader to look for a corrupt file; the tensor is usually not missing at all, the
@@ -11493,10 +11511,17 @@ loader assumes. Other families that ship a fused qkv are still unverified");
             layers.push(BlockWeights {
                 g1: self.upload(&gemma_norm(&fetch(&format!("blk.{i}.attn_norm.weight"))?, &acfg), 1, d),
                 wqkv,
-                wq: lin(&format!("blk.{i}.attn_q.weight"), attn_dim, d, q)?.with_bias(bq),
-                wk: lin(&format!("blk.{i}.attn_k.weight"), kv, d, q)?.with_bias(bk),
-                wv: lin(&format!("blk.{i}.attn_v.weight"), kv, d, q)?.with_bias(bv),
-                wo: lin(&format!("blk.{i}.attn_output.weight"), d, attn_dim, q)?,
+                // MLA blocks: placeholders for all four. attn_output DOES exist on MLA checkpoints,
+                // but its input width is n_head*v_head_mla, not attn_dim — lin() would misread it at
+                // the declared dims. The real output projection loads as `mla.o` by its own shape.
+                wq: if block_is_mla { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+                    else { lin(&format!("blk.{i}.attn_q.weight"), attn_dim, d, q)?.with_bias(bq) },
+                wk: if block_is_mla { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+                    else { lin(&format!("blk.{i}.attn_k.weight"), kv, d, q)?.with_bias(bk) },
+                wv: if block_is_mla { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+                    else { lin(&format!("blk.{i}.attn_v.weight"), kv, d, q)?.with_bias(bv) },
+                wo: if block_is_mla { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+                    else { lin(&format!("blk.{i}.attn_output.weight"), d, attn_dim, q)? },
                 g2: self.upload(&gemma_norm(&fetch(&format!("blk.{i}.ffn_norm.weight"))
                     .or_else(|_| fetch(&format!("blk.{i}.post_attention_norm.weight")))?, &acfg), 1, d),
                 // gate and up fused into one [2h, d] projection: a single matmul emits
@@ -12171,6 +12196,36 @@ different metadata keys and disagree here; output will be degraded rather than b
                     Some(t)
                 } else { None },
             });
+            // An MLA block whose tensor set came up incomplete must fail HERE, naming the set. With
+            // placeholder q/k/v and `mla: None`, decode would refuse at runtime (the dense block
+            // fns' backstop) — loud but late, and blaming the wrong layer of the system. b911a471's
+            // rule: "incomplete MLA sets fail NAMING the set, not with a misleading missing-attn_q".
+            if block_is_mla && layers.last().map_or(false, |b| b.mla.is_none()) {
+                let has = |a: &str, alt: &str| g.tensor(&format!("blk.{i}.{a}.weight")).is_some()
+                    || g.tensor(&format!("blk.{i}.{alt}.weight")).is_some();
+                let mut missing: Vec<&str> = Vec::new();
+                for (a, alt, what) in [
+                    ("attn_q_a", "attn_q_a_proj", "attn_q_a"),
+                    ("attn_q_a_norm", "attn_q_a_layernorm", "attn_q_a_norm"),
+                    ("attn_q_b", "attn_q_b_proj", "attn_q_b"),
+                    ("attn_kv_a_mqa", "attn_kv_a", "attn_kv_a_mqa"),
+                    ("attn_kv_a_norm", "attn_kv_a_layernorm", "attn_kv_a_norm"),
+                    ("attn_output", "attn_out", "attn_output"),
+                ] { if !has(a, alt) { missing.push(what); } }
+                if !((has("attn_k_b", "attn_k_b_trans") && has("attn_v_b", "attn_v_b_proj"))
+                     || has("attn_kv_b", "attn_kv_b_proj")) {
+                    missing.push("attn_kv_b (or the split attn_k_b + attn_v_b)");
+                }
+                return Err(if missing.is_empty() {
+                    format!("blk.{i} is Multi-head Latent Attention and every tensor of the set is \
+present, yet the MLA weights did not assemble — the metadata is the suspect: \
+{}.attention.{{head_count,kv_lora_rank}} are required for the split kv_b fuse", acfg.prefix)
+                } else {
+                    format!("blk.{i} is Multi-head Latent Attention but its tensor set is INCOMPLETE — \
+missing: [{}]. Q is attn_q_a(+norm)/attn_q_b, KV is attn_kv_a_mqa(+norm) plus attn_kv_b (or split \
+attn_k_b+attn_v_b), and attn_output closes the block", missing.join(", "))
+                });
+            }
         }
         let out_norm = self.upload(&fetch("output_norm.weight")?, 1, d);
         // Llama-3.2 ties the output projection to the embedding (no `output.weight`
@@ -12275,7 +12330,7 @@ and the autotuner (decode/GEMM tiles, submit batch) does not touch it.",
             } else { None }
         };
         if let Some(m) = &mla {
-            eprintln!("wgpu-engine: MLA config detected — kv_lora={} q_lora={} qk_nope={} qk_rope={} v_head={} (latent {} vs {} per-token KV) — forward not yet wired",
+            eprintln!("wgpu-engine: MLA config detected — kv_lora={} q_lora={} qk_nope={} qk_rope={} v_head={} (latent {} vs {} per-token KV) — decode routes these layers to block_decode_mla; use new_cache_for so the latent cache is attached",
                 m.kv_lora, m.q_lora, m.qk_nope, m.qk_rope, m.v_head, m.latent_width(), n_kv_heads * head_dim);
         }
         // DSA (DeepSeek Sparse Attention) indexer config: present only when index_topk is declared AND the
@@ -12618,6 +12673,12 @@ converter that always writes the kv). A GGUF carrying the kv overrides.");
     /// and stays input-sensitive; a collapse or explosion at layer k localizes the fault.
     pub fn model_forward_trace(&self, m: &Model, ids: &[u32], ff: &Tensor) -> Vec<f32> {
         self.activate_model(m);
+        // MLA layers have placeholder q/k/v — this trace's inline dense math would slice a
+        // 32-element placeholder at attention shapes and panic with an index that names nothing.
+        // There is no MLA prefill/batch path yet (MLA is decode-only: compress-append per
+        // position), so refuse HERE with the reason rather than 200 lines in with a slice index.
+        assert!(m.mla_layers() == 0,
+            "model_forward_trace has no MLA path ({} of {} layers are MLA; the trace's dense math would read placeholder weights). Probe MLA models with decode_step — --probe already does — or build the MLA prefill first.", m.mla_layers(), m.n_layers);
         let t = ids.len();
         let stat = |v: &[f32]| -> f32 {
             let row = &v[(t - 1) * m.d..t * m.d];

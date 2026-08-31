@@ -114,3 +114,18 @@ DSA, context 1048576. Matches the metadata transcribed above.
   materially smaller, at the cost of pruned experts.
 * Two M3 Ultra 256 GB boxes run UD-Q4_K_S over llama.cpp RPC — decode there is latency-bound on the
   link, not compute-bound, which is worth knowing before treating distribution as a fix.
+
+## STATUS UPDATE 2 (c12-140+) — loading closed; upstream now ships DSA
+
+The MLA loading gap is closed: per-block routing in the resident loader, both kv_b layouts, the
+split 3-D per-head fuse, and MoE+MLA in one block — the gen_glmdsa.py fixture loads and decodes
+finite logits (--gate-mla-load, --probe). IndexShare is a non-issue for this loader (unread
+tensors are simply not fetched; the fixture puts indexer tensors on 1 of 3 layers and loads).
+
+The upstream picture moved: llama.cpp master (Aug 2026 snapshot, vendored in refs) now SHIPS a
+real DSA implementation — src/models/glm-dsa.cpp + llama-kv-cache-dsa.h, a 32-head lightning
+indexer with per-layer `indexer_types` (IndexShare handled via a per-layer full/shared flag,
+GLM-5.2's default pattern hardcoded from its config.json) and indexer tensors TENSOR_NOT_REQUIRED.
+That is the reference to transcribe if long-context efficiency ever matters here; dense fallback
+remains exact at or below index_topk (2048). Remaining real blocker for the full model is
+unchanged: 201.8 GiB of IQ1_S against a 192 GB ceiling.
