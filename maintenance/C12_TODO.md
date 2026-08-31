@@ -4287,9 +4287,31 @@ Two details that decide whether the fix is any good:
 studio fix a clean split: that stream goes entirely to the field when
 one is focused, and the modified-chord path underneath is untouched.
 
-- **C79a — the other apps are exposed and NOT fixed.** aperture binds a
-  whole modal keymap, voiceterm binds `f`, bo-suite pages on arrows. The
-  guard exists for them; none of them calls it yet.
+- **C79a — SWEPT, and the answer is that studio was the only one.**
+  I assumed three more apps were exposed. Read them instead of wiring
+  them, and each had already handled it differently:
+
+  - **aperture** routes text by an explicit `FindFocus` field —
+    `replace: Option<String>` plus `focus` says which field Text and
+    Backspace events edit. It solved the same problem with its own
+    mechanism, and adding the guard on top would give it two.
+  - **hatch** moves tile selection on arrow keys while its search field
+    has focus, and that is CORRECT for a launcher: typing a query and
+    arrowing to a result is the interaction. Applying the guard here
+    would break the feature.
+  - **rusty-board** and **snapclone** only key off Enter with an
+    explicit `has_focus()`/`lost_focus()` check, which is the same
+    arbitration done locally.
+
+  So the guard stays a one-caller module, and that is the right outcome
+  rather than a disappointing one — a shared helper wired into apps that
+  do not need it is how a codebase acquires two competing mechanisms for
+  one job.
+
+  Worth contrasting with §83's renderer sweep, done the same session:
+  there the assumption held and sixteen apps really were exposed. The
+  difference is that the renderer has ONE correct answer per app and
+  key arbitration does not.
 - **C79b — studio-app did not compile HERE**, but the failure is
   `wayland-protocols`, a known sandbox gap. No errors in our code.
 
