@@ -132,6 +132,10 @@ pub struct Workspace {
     /// resolves to Mid — the budget that neither drowns a small model nor
     /// starves a large one — so a caller that never sets it still works.
     model_label: String,
+    /// The most recent green checkpoint this workspace committed, if any — the state a blocked run
+    /// is restored to. Kept here rather than on the driver because the workspace is what knows its
+    /// own git history, and both drivers share it.
+    last_green: Option<String>,
     /// The engine's tensor-derived parameter count, when known. Preferred over
     /// the label: filenames lie (a re-quantized 1B named "-7B-" is a real
     /// thing), tensor sizes cannot.
@@ -166,6 +170,7 @@ impl Workspace {
             rust_src: std::cell::OnceCell::new(),
             model_label: String::new(),
             model_params: None,
+            last_green: None,
         }
     }
 
@@ -606,7 +611,7 @@ Continue with read_range {rel} {} {}]",
     /// can diff/reset against the last checkpoint instead of the session baseline. Best-effort by
     /// design — a workspace that is not a git worktree, or has nothing to commit, returns None and
     /// the run proceeds; a checkpoint is an aid, never a gate.
-    pub fn git_checkpoint(&self, message: &str) -> Option<String> {
+    pub fn git_checkpoint(&mut self, message: &str) -> Option<String> {
         let git = |args: &[&str]| -> Option<String> {
             let out = Command::new("git").args(args).current_dir(&self.root)
                 .stdin(Stdio::null()).output().ok()?;
@@ -617,7 +622,45 @@ Continue with read_range {rel} {} {}]",
         // checkpoint" case, and the ? turns it into a clean None.
         git(&["-c", "user.email=agent@logscope", "-c", "user.name=logscope-agent",
               "commit", "-q", "-m", message])?;
-        git(&["rev-parse", "--short", "HEAD"])
+        let hash = git(&["rev-parse", "--short", "HEAD"])?;
+        self.last_green = Some(hash.clone());
+        Some(hash)
+    }
+
+    /// The most recent green checkpoint, if this run has produced one.
+    pub fn last_green(&self) -> Option<&str> { self.last_green.as_deref() }
+
+    /// Restore the working tree to a checkpoint WITHOUT losing the state being abandoned.
+    ///
+    /// A blocked run's tree does not compile — that is what blocked means — and the session's whole
+    /// product is whatever `reapply` copies out of it, so ending on the broken tree means landing
+    /// broken code on the real project. This puts the last green tree back.
+    ///
+    /// The state being abandoned is the most informative artifact the run produced, so it is
+    /// committed and TAGGED first, then the branch is reset to the checkpoint. The tag is what makes
+    /// the reset safe to state plainly: the abandoned commit is reachable by name, not merely
+    /// surviving in the reflog until it expires.
+    ///
+    /// A plain `checkout <green> -- .` was tried first and is wrong: it restores the paths present
+    /// in the checkpoint and leaves behind every file the broken attempt ADDED, so the tree ends up
+    /// as neither state. The test caught it.
+    ///
+    /// Returns the tag holding the abandoned state.
+    pub fn restore_to(&self, checkpoint: &str) -> Option<String> {
+        let git = |args: &[&str]| -> Option<String> {
+            let out = Command::new("git").args(args).current_dir(&self.root)
+                .stdin(Stdio::null()).output().ok()?;
+            if out.status.success() { Some(String::from_utf8_lossy(&out.stdout).trim().to_string()) } else { None }
+        };
+        git(&["add", "-A"])?;
+        git(&["-c", "user.email=agent@logscope", "-c", "user.name=logscope-agent",
+              "commit", "-q", "--allow-empty", "-m",
+              "agent: state at block (kept for inspection, not green)"])?;
+        let abandoned = git(&["rev-parse", "--short", "HEAD"])?;
+        let tag = format!("logscope-blocked-{abandoned}");
+        git(&["tag", "-f", &tag])?;
+        git(&["reset", "--hard", "-q", checkpoint])?;
+        Some(tag)
     }
 }
 
@@ -1810,6 +1853,17 @@ call — this run cannot be marked complete until they are green.)\n"));
         match g.observe(&obs) {
             crate::phase_guide::Verdict::Blocked(c) => {
                 prompt.push_str(&format!("\n\n{c}\n"));
+                // The run's PRODUCT is whatever `reapply` copies out of this tree, and a blocked
+                // tree does not compile. Put the last green state back rather than letting the
+                // session land its own failed attempt on the real project. The abandoned state is
+                // committed first, so the diagnosis is not thrown away to make the tree tidy.
+                if let Some(green) = ws.last_green().map(str::to_string) {
+                    if let Some(tag) = ws.restore_to(&green) {
+                        prompt.push_str(&format!(
+                            "(workspace restored to green checkpoint {green}; the blocked state is \
+kept at tag {tag} for inspection)\n"));
+                    }
+                }
                 return (results, Some(Stop::Stalled));
             }
             // Done cannot come back here (it requires the claim, handled above); Continue injects
@@ -2089,6 +2143,9 @@ impl AgentRun {
 
     /// Current transcript size in bytes — what the bound acts on.
     pub fn prompt_len(&self) -> usize { self.prompt.len() }
+
+    /// The last green checkpoint committed in the scratch, if any.
+    pub fn last_green(&self) -> Option<&str> { self.ws.last_green() }
 
     /// What actually moved the error count on this run, as counted lines (guided runs only; empty
     /// until enough transitions accumulate).
@@ -3995,6 +4052,79 @@ mod long_horizon_tests {
         let (all, none_dropped) = resolve_check_roots_capped(&d, touched.iter().map(|s| s.as_str()), 8);
         assert_eq!(all.len(), 4);
         assert_eq!(none_dropped, 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    /// A run that goes green, then breaks itself, then stalls: the tree it leaves behind must be the
+    /// GREEN one, not the broken attempt — otherwise `reapply` lands the failed attempt on the real
+    /// project. The abandoned state stays reachable in history.
+    #[test]
+    fn a_blocked_run_leaves_the_green_tree_not_the_broken_one() {
+        let d = tmp("gm-restore");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        let git = |args: &[&str]| -> String {
+            let o = std::process::Command::new("git").args(args).current_dir(&d).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "baseline"]);
+
+        // `grep -q ok src/state.rs` is the check: green exactly while that file says "ok". Turn 1
+        // writes it (green → checkpoint); turn 2 OVERWRITES it with "broken", which is a real
+        // regression rather than merely a new file; the rest are attempts that never touch it, so
+        // the error count never falls and the machine blocks.
+        let mut script = vec![
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"src/state.rs\",\"contents\":\"// ok\\n\"}\n```".to_string(),
+            // "// bad", not "// broken": `grep -q ok` matches br-OK-en, so the obvious word for a
+            // broken state keeps this check green. The fixture was silently passing on that.
+            "```tool\n{\"tool\":\"write_file\",\"path\":\"src/state.rs\",\"contents\":\"// bad\\n\"}\n```".to_string(),
+        ];
+        for i in 0..6 {
+            script.push(format!("```tool\n{{\"tool\":\"write_file\",\"path\":\"src/try{i}.rs\",\"contents\":\"// try {i}\\n\"}}\n```"));
+        }
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 30,
+            verify_cmd: vec!["grep".into(), "-q".into(), "ok".into(), "src/state.rs".into()],
+            verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: false,
+            stateful_guide: true, checkpoint_on_green: true, ..Default::default() };
+        let (stop, run) = drive(&d, "make it green then break it", cfg, &script);
+        assert_eq!(stop, Stop::Stalled);
+        assert_eq!(run.phase(), Some("blocked"));
+        let green = run.last_green().expect("a green checkpoint was taken").to_string();
+
+        // The tree left behind is the green one…
+        assert_eq!(std::fs::read_to_string(d.join("src/state.rs")).unwrap(), "// ok\n",
+                   "the regression was rolled back");
+        assert!(!d.join("src/try0.rs").exists(), "the failed attempts are not in the working tree");
+        // …and the abandoned state is reachable BY NAME, not merely surviving in the reflog.
+        let tags = git(&["tag", "-l", "logscope-blocked-*"]);
+        let tag = tags.lines().next().expect("the blocked state is tagged").to_string();
+        let files = git(&["ls-tree", "-r", "--name-only", &tag]);
+        assert!(files.contains("src/try0.rs"), "the abandoned attempts are inspectable: {files}");
+        assert!(git(&["show", &format!("{tag}:src/state.rs")]).contains("bad"),
+                "and the regression itself is preserved for diagnosis");
+        assert!(green.len() >= 7);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn restore_is_a_no_op_story_when_there_was_never_a_green_state() {
+        // Nothing to restore to: the run still ends blocked, and nothing pretends otherwise.
+        let d = tmp("gm-nogreen");
+        std::fs::write(d.join("Cargo.toml"), "[package]\n").unwrap();
+        let script: Vec<String> = (0..6)
+            .map(|i| format!("```tool\n{{\"tool\":\"write_file\",\"path\":\"s{i}.rs\",\"contents\":\"// {i}\\n\"}}\n```"))
+            .collect();
+        let cfg = AgentConfig { gate: crate::taint::ToolGate::Open, max_steps: 20,
+            verify_cmd: vec!["test".into()], verify_exts: vec!["rs".into()],
+            prefer_patches: false, digest_verify: false,
+            stateful_guide: true, checkpoint_on_green: true, ..Default::default() };
+        let (stop, run) = drive(&d, "never green", cfg, &script);
+        assert_eq!(stop, Stop::Stalled);
+        assert_eq!(run.last_green(), None);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
