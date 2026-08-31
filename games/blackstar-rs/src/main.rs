@@ -3663,7 +3663,7 @@ impl Game {
         self.loco.condition(hurt, wall);
         self.loco_pose = self
             .loco
-            .update(dt, horiz, vert, self.car.on_ground, boosting);
+            .update(dt, horiz, vert, self.car.on_ground, boosting, self.car.climbing > 0.5);
         // element movement also belongs here: Air runs, Rock does not
         let _ = self.wep.move_mul();
 

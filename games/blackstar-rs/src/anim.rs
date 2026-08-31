@@ -40,6 +40,15 @@ pub enum Gait {
     Fall,
     /// the beat just after touchdown
     Land,
+    /// SCALING A WALL. Ported alongside `physics::Car::climbing` — see
+    /// that field's own doc comment and `World::wall_ahead`. Cyclic
+    /// (unlike Boost/Fall/Land): the arm-over-arm reach genuinely
+    /// repeats for as long as the climb continues, the same way a walk
+    /// or run does, just driven by a fixed cadence rather than ground
+    /// speed (there is no "how fast am I walking" signal while
+    /// climbing — the C engine's own `g_climb_ph` advances at a flat
+    /// rate per chassis archetype for the same reason).
+    Climb,
     /// HURT AND STILL STANDING. A damaged body drops its centre of mass:
     /// shorter stride, deeper bob, and a lean that never comes back up.
     /// Not a separate cycle — a crouch is a walk done badly, so the phase
@@ -63,11 +72,17 @@ impl Gait {
             Gait::Land => "LAND",
             Gait::Crouch => "CROUCH",
             Gait::WallHug => "HUG",
+            Gait::Climb => "CLIMB",
         }
     }
     /// Cadence multiplier on top of the Froude term. A run is not merely a
     /// fast walk, but the difference is smaller than it looks: most of the
     /// extra ground is covered by stride LENGTH.
+    ///
+    /// `Climb` returns 0.0 here like every other non-ground-speed gait —
+    /// it has its own fixed-rate phase advance in `update()` (see that
+    /// function's own comment), not this Froude-scaled one, since there
+    /// is no ground speed to scale while climbing.
     pub fn cadence(self) -> f32 {
         match self {
             Gait::Walk => 1.0,
@@ -81,7 +96,9 @@ impl Gait {
             _ => 0.0,
         }
     }
-    /// Does this gait have a cycle at all?
+    /// Does this gait have a cycle at all? `Climb` is deliberately NOT
+    /// included here even though it loops — this flag specifically means
+    /// "driven by `stride_freq(ground speed)`", which climbing isn't.
     pub fn cyclic(self) -> bool {
         matches!(self, Gait::Walk | Gait::Run | Gait::Crouch | Gait::WallHug)
     }
@@ -214,7 +231,10 @@ impl Locomotion {
     ///
     /// `speed` is horizontal ground speed, `vert` is vertical velocity
     /// (negative down), `grounded` and `boosting` are what they say.
-    pub fn update(&mut self, dt: f32, speed: f32, vert: f32, grounded: bool, boosting: bool) -> Pose {
+    /// `climbing` is `physics::Car::climbing > 0.5` — a real wall-climb
+    /// in progress, which outranks the usual airborne Fall/Boost choice
+    /// the same way a deliberate player action should.
+    pub fn update(&mut self, dt: f32, speed: f32, vert: f32, grounded: bool, boosting: bool, climbing: bool) -> Pose {
         // smooth the speed before it decides anything: a gait chosen from an
         // instantaneous value changes on collision spikes
         self.speed += (speed - self.speed) * (1.0 - (-9.0 * dt).exp());
@@ -224,7 +244,9 @@ impl Locomotion {
         }
         self.was_grounded = grounded;
 
-        let want = if boosting {
+        let want = if climbing {
+            Gait::Climb
+        } else if boosting {
             Gait::Boost
         } else if !grounded {
             if vert < -FALL_SPEED { Gait::Fall } else { Gait::Boost }
@@ -267,6 +289,15 @@ impl Locomotion {
             // not a cycle: wind up over the drop, so a long fall reads as
             // longer rather than looping
             self.phase = (self.phase + dt * 0.9).min(1.0);
+        } else if self.gait == Gait::Climb {
+            // GENUINELY LOOPS, unlike Fall/Boost/Land, but at a fixed
+            // rate rather than one scaled by ground speed (there isn't
+            // any while climbing) — a flat middle value between the C
+            // engine's own per-archetype climb_rate range (4.2 heavy ..
+            // 8.5 flyer), since this port has no equivalent per-chassis
+            // signal wired into Locomotion to pick from.
+            const CLIMB_RATE: f32 = 6.0;
+            self.phase = (self.phase + CLIMB_RATE * dt / std::f32::consts::TAU).fract();
         } else {
             self.phase = (self.phase + dt * 2.0).min(1.0);
         }
@@ -348,6 +379,27 @@ impl Locomotion {
                 arm_l: 0.0,
                 arm_r: 0.0,
             },
+            // ARM-OVER-ARM: one arm reaches while the other pulls, legs
+            // finding purchase half a stroke out of phase with the arms
+            // on the same side -- ported from the C engine's own
+            // `sinf(g_climb_ph)` alternation (`g_climbing` blends it in),
+            // simplified to a single sine per limb pair since this port
+            // has one climb phase, not a per-limb IK solve.
+            Gait::Climb => {
+                let s = p.sin();
+                Pose {
+                    bob: 0.0,
+                    lean: 0.14, // into the wall
+                    roll: 0.0,
+                    phase: self.phase,
+                    weight: self.blend,
+                    squash: 0.0,
+                    leg_l: -s * 0.35,
+                    leg_r: s * 0.35,
+                    arm_l: s * ARM_SWING_MAX,
+                    arm_r: -s * ARM_SWING_MAX,
+                }
+            }
             // the impact beat: absorb, then recover over LAND_SEC
             Gait::Land => Pose {
                 bob: -0.16 * (1.0 - self.phase),
@@ -389,9 +441,9 @@ mod tests {
         let step = |hurt: f32, wall: f32| {
             let mut l = super::Locomotion::new();
             l.condition(hurt, wall);
-            let mut pose = l.update(0.016, 4.0, 0.0, true, false);
+            let mut pose = l.update(0.016, 4.0, 0.0, true, false, false);
             for _ in 0..40 {
-                pose = l.update(0.016, 4.0, 0.0, true, false);
+                pose = l.update(0.016, 4.0, 0.0, true, false, false);
             }
             (l.gait, pose)
         };
@@ -418,11 +470,11 @@ mod tests {
     fn getting_hurt_mid_stride_does_not_reset_the_foot() {
         let mut l = super::Locomotion::new();
         for _ in 0..30 {
-            l.update(0.016, 5.0, 0.0, true, false);
+            l.update(0.016, 5.0, 0.0, true, false, false);
         }
-        let before = l.update(0.016, 5.0, 0.0, true, false).phase;
+        let before = l.update(0.016, 5.0, 0.0, true, false, false).phase;
         l.condition(0.5, 0.0);
-        let after = l.update(0.016, 5.0, 0.0, true, false).phase;
+        let after = l.update(0.016, 5.0, 0.0, true, false, false).phase;
         assert_eq!(l.gait, super::Gait::Crouch);
         assert!(
             (after - before).abs() < 0.1,
@@ -435,7 +487,7 @@ mod tests {
     fn run_for(l: &mut Locomotion, secs: f32, speed: f32, vert: f32, ground: bool, boost: bool) -> Pose {
         let mut p = Pose::default();
         for _ in 0..(secs * 60.0) as i32 {
-            p = l.update(1.0 / 60.0, speed, vert, ground, boost);
+            p = l.update(1.0 / 60.0, speed, vert, ground, boost, false);
         }
         p
     }
@@ -479,11 +531,34 @@ mod tests {
     }
 
     #[test]
+    fn climbing_outranks_falling_and_boost() {
+        let mut l = Locomotion::new();
+        // airborne and descending fast enough to be a Fall on its own --
+        // but climbing is a deliberate player action and must win anyway
+        let mut p = Pose::default();
+        for _ in 0..60 {
+            p = l.update(1.0 / 60.0, 0.0, -20.0, false, false, true);
+        }
+        assert_eq!(l.gait, Gait::Climb, "falling/boost outranked an active climb");
+        // arm-over-arm: the two arms move opposite each other, same as
+        // the legs -- a body that reaches with both arms at once isn't
+        // climbing, it's doing something else
+        assert!(p.arm_l * p.arm_r <= 0.0, "arms did not oppose each other: {} vs {}", p.arm_l, p.arm_r);
+        assert!(p.leg_l * p.leg_r <= 0.0, "legs did not oppose each other: {} vs {}", p.leg_l, p.leg_r);
+
+        // and it lets go cleanly: once climbing stops, gait selection goes
+        // back to normal on the very next update
+        let p2 = l.update(1.0 / 60.0, 0.0, -20.0, false, false, false);
+        let _ = p2;
+        assert_eq!(l.gait, Gait::Fall, "did not fall back through to Fall once climbing ended");
+    }
+
+    #[test]
     fn landing_fires_once_and_recovers() {
         let mut l = Locomotion::new();
         run_for(&mut l, 0.5, 0.0, -20.0, false, false);
         // touch down
-        let p = l.update(1.0 / 60.0, 0.0, 0.0, true, false);
+        let p = l.update(1.0 / 60.0, 0.0, 0.0, true, false, false);
         assert_eq!(l.gait, Gait::Land);
         assert!(p.squash > 0.3, "no impact absorb: {}", p.squash);
         run_for(&mut l, LAND_SEC + 0.3, 0.0, 0.0, true, false);
@@ -496,9 +571,9 @@ mod tests {
         run_for(&mut l, 2.0, 3.0, 0.0, true, false);
         let before = l.phase;
         // one step over the line
-        l.update(1.0 / 60.0, 20.0, 0.0, true, false);
+        l.update(1.0 / 60.0, 20.0, 0.0, true, false, false);
         for _ in 0..90 {
-            l.update(1.0 / 60.0, 20.0, 0.0, true, false);
+            l.update(1.0 / 60.0, 20.0, 0.0, true, false, false);
         }
         // the phase must have CONTINUED, not reset — resetting puts a foot
         // down twice in a row, which is the classic transition tell
@@ -507,7 +582,7 @@ mod tests {
         let mut l2 = Locomotion::new();
         run_for(&mut l2, 2.0, 3.0, 0.0, true, false);
         let p0 = l2.phase;
-        l2.update(1.0 / 60.0, 20.0, 0.0, true, false);
+        l2.update(1.0 / 60.0, 20.0, 0.0, true, false, false);
         assert!((l2.phase - p0).abs() < 0.2, "phase jumped on the walk->run change");
     }
 
@@ -515,7 +590,7 @@ mod tests {
     fn the_cycle_wraps_and_never_leaves_its_range() {
         let mut l = Locomotion::new();
         for _ in 0..2000 {
-            let p = l.update(1.0 / 60.0, 5.0, 0.0, true, false);
+            let p = l.update(1.0 / 60.0, 5.0, 0.0, true, false, false);
             assert!((0.0..1.0).contains(&p.phase), "phase left the cycle: {}", p.phase);
             assert!((0.0..=1.0).contains(&p.weight));
             assert!(p.bob.abs() < 0.5 && p.lean.abs() < 1.0);
@@ -532,8 +607,8 @@ mod tests {
         let mut wd = 0.0f32;
         let mut rd = 0.0f32;
         for _ in 0..120 {
-            wd = wd.min(w.update(1.0 / 60.0, 3.0, 0.0, true, false).bob);
-            rd = rd.min(r.update(1.0 / 60.0, 14.0, 0.0, true, false).bob);
+            wd = wd.min(w.update(1.0 / 60.0, 3.0, 0.0, true, false, false).bob);
+            rd = rd.min(r.update(1.0 / 60.0, 14.0, 0.0, true, false, false).bob);
         }
         assert!(rd < wd, "a run dips less than a walk ({rd} vs {wd})");
         assert!(r.pose().lean > w.pose().lean, "a run leans less than a walk");
@@ -566,7 +641,7 @@ mod tests {
     fn the_legs_are_half_a_cycle_apart_and_the_arms_oppose_them() {
         let mut l = Locomotion::new();
         run_for(&mut l, 2.0, 8.0, 0.0, true, false);
-        let p = l.update(1.0 / 60.0, 8.0, 0.0, true, false);
+        let p = l.update(1.0 / 60.0, 8.0, 0.0, true, false, false);
         // opposite legs: a bot with both legs forward is falling over
         assert!(p.leg_l * p.leg_r <= 1e-6, "legs in phase: {} {}", p.leg_l, p.leg_r);
         // arms counter the legs, at the C engine's ratio

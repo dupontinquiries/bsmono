@@ -218,11 +218,10 @@ pub struct Car {
     /// block for where this is spent.
     pub climb_budget: f32,
     /// 0..1, how deep into a climb stroke the body is — the same shape
-    /// of cosmetic, phase-driven channel `weapon_pop` is, for a caller
-    /// (a future rig-aware renderer, `anim::Gait::Climb`) to read.
-    /// Ported concept from `g_climbing`/`g_climb_ph`'s arm-over-arm
-    /// alternation, simplified to a single 0..1 "climbing at all" flag
-    /// here — the phase itself belongs to `anim.rs`, not physics.
+    /// of cosmetic, phase-driven channel `weapon_pop` is. Read by
+    /// `main.rs` (as `> 0.5`) to select `anim::Gait::Climb` in
+    /// `Locomotion::update` — the phase/pose itself lives in anim.rs,
+    /// not here; physics only says whether a climb is happening.
     pub climbing: f32,
     /// WHAT THIS PARTICULAR HULL IS LIKE (`driveline`). Multipliers over
     /// the player's `CarCfg`, so tuning stays the player's and character
