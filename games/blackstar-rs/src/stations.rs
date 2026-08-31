@@ -438,6 +438,14 @@ fn gate_open_for(dest: &str, sb: &Shipboard) -> bool {
     if matches!(dest, "earth" | "outer_rim") {
         return true;
     }
+    // THE BRIDGE GATES EVERYTHING OUTSIDE SOL. Reaching a world on a mission
+    // is not the same as being able to GO there: leaving the system needs the
+    // space bridge, and the bridge stays dark until Jhiaxus is dead. Before
+    // this, an extra-solar destination opened purely because a mission had
+    // touched it, so the reason the bridge was shut was nowhere in the game.
+    if crate::patrol::beyond_sol(dest) && !crate::patrol::bridge_powered(&sb.camp) {
+        return false;
+    }
     crate::content::MISSIONS
         .iter()
         .filter(|m| m.dest == dest)
@@ -1934,6 +1942,67 @@ mod tests {
         let mut sb = board();
         sb.camp.record(crate::raidcon::RAIDS_OPEN_AFTER);
         sb
+    }
+
+    #[test]
+    fn every_route_destination_is_classified_by_the_bridge_gate() {
+        // ANTI-DRIFT. `beyond_sol` has a catch-all arm, so a destination added
+        // later would be silently swept into "beyond" — or, if the arms were
+        // ever reordered, into "in system", which opens it without a bridge.
+        // Asserting every ROUTE id is named explicitly is what stops the gate
+        // rotting the first time someone adds a world.
+        use crate::patrol::{beyond_sol, ROUTE};
+        let named = [
+            "earth", "mars", "luna", "europa", "io", "titan", "pluto", "outer_rim",
+            "glaciem", "carrion", "helix", "cybertron", "uncharted", "shield_edge",
+            "trappist1e", "trappist1g", "proxima_b", "kepler186f",
+        ];
+        assert!(!ROUTE.is_empty(), "the route table is empty; this test proves nothing");
+        for d in ROUTE {
+            assert!(
+                named.contains(&d.id),
+                "{} is not named in beyond_sol — it falls to the catch-all",
+                d.id
+            );
+        }
+        // and the split is real in both directions
+        assert!(!beyond_sol("earth") && !beyond_sol("pluto"), "Sol is not in Sol");
+        assert!(beyond_sol("cybertron") && beyond_sol("glaciem"), "the bridge worlds are in Sol");
+    }
+
+    #[test]
+    fn the_bridge_stays_dark_until_jhiaxus_is_dead() {
+        // Reaching a world on a mission is not being able to GO there:
+        // leaving Sol needs the bridge, and the bridge was shut because an
+        // infestation was loose in the system.
+        let mut sb = board();
+        // a mission HAS reached Cybertron, which is what used to be enough
+        sb.camp.record("beneath_the_pacific");
+        assert!(!crate::patrol::bridge_powered(&sb.camp), "the bridge is already powered?");
+        assert!(
+            !gate_open_for("cybertron", &sb),
+            "an extra-solar destination opened with the bridge dark"
+        );
+        // and Sol is unaffected — the gate must not strand the player at home
+        sb.camp.record("the_red_extraction");
+        assert!(gate_open_for("mars", &sb), "the bridge gate closed an in-system world");
+        assert!(gate_open_for("earth", &sb), "Earth is behind the bridge");
+    }
+
+    #[test]
+    fn killing_jhiaxus_powers_it() {
+        // The complement: a gate that never opens is not a gate. Both halves
+        // are needed — the bridge AND a mission that reached the world.
+        let mut sb = board();
+        sb.camp.record("beneath_the_pacific");
+        sb.camp.record(crate::patrol::BRIDGE_SAFE_AFTER);
+        assert!(crate::patrol::bridge_powered(&sb.camp));
+        assert!(gate_open_for("cybertron", &sb), "Jhiaxus is dead and the bridge is still shut");
+        // the bridge alone is not a route: nothing has reached Helix
+        assert!(
+            !gate_open_for("helix", &sb),
+            "the bridge opened a world no mission has ever reached"
+        );
     }
 
     #[test]

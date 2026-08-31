@@ -77,6 +77,57 @@ pub struct Destination {
 /// the places the lore names and the engine never modelled — Europa's
 /// listening post, Io's tide-forges, Titan's fuel rain, and the clone
 /// homeworlds Glaciem, Carrion and Helix.
+/// THE MISSION THAT MAKES THE BRIDGE SAFE TO POWER ON.
+///
+/// Film 2, the vault: Jhiaxus, the architect of the Corrupted. The space
+/// bridge was never off for want of engineering — it was off because turning
+/// it on while an infestation was loose in the system would have handed that
+/// infestation a door, and because the system needed the bridge as a position
+/// to defend rather than a way out, with Blackstar's bots roaming it in
+/// answer to the pulses buried in Earth.
+///
+/// So the bridge is not gated on arriving somewhere. It is gated on the
+/// reason it was shut.
+pub const BRIDGE_SAFE_AFTER: &str = "what_jhiaxus_grew";
+
+/// Is the space bridge safe to run?
+///
+/// Distinct from `exoworlds::unlocked`, which gates the FIRST JUMP on
+/// `the_far_gate` (mission 10, Film 4). These are two stages of one system and
+/// the gap between them is deliberate: from Film 2 the bridge can be powered,
+/// and from Film 4 it has actually been used. A player who has cleared
+/// Jhiaxus but not reached the far gate is looking at a working bridge and
+/// nowhere charted to send it, which is the correct state for Films 2-4.
+pub fn bridge_powered(log: &crate::campaign::CampaignLog) -> bool {
+    log.is_cleared(BRIDGE_SAFE_AFTER)
+}
+
+/// Is this destination outside the solar system?
+///
+/// An explicit list rather than a field on `Destination`, and a test asserts
+/// every `ROUTE` id appears here — so a new destination cannot silently
+/// default to "in system" and slip past the bridge gate. A default is exactly
+/// how a gate like this rots.
+pub fn beyond_sol(id: &str) -> bool {
+    match id {
+        // Sol: Earth and its neighbours, out to the rim
+        "earth" | "mars" | "luna" | "europa" | "io" | "titan" | "pluto" | "outer_rim" => false,
+        // the clone homeworlds and Cybertron — reachable only by bridge
+        "glaciem" | "carrion" | "helix" | "cybertron" => true,
+        // the catalogued exoplanets (exoworlds.rs). Tens of light years out:
+        // beyond Sol by a margin nothing else on this list approaches.
+        "trappist1e" | "trappist1g" | "proxima_b" | "kepler186f" => true,
+        // mission-only destinations, both past the boundary by definition
+        "uncharted" | "shield_edge" => true,
+        // unknown: treat as beyond, because the failure of guessing WRONG
+        // here is a destination that opens without the bridge, and the
+        // failure of guessing RIGHT-but-strict is a destination that needs
+        // one mission cleared first. The test below means this arm should be
+        // unreachable for anything in ROUTE.
+        _ => true,
+    }
+}
+
 pub const ROUTE: &[Destination] = &[
     Destination { id: "earth", name: "EARTH", terrain: Terrain::Surface, gravity: 1.00, weather: true,
         hostiles: Faction::Corrupted,
