@@ -5790,3 +5790,43 @@ rather than a footnote: a sweep whose winner is at the edge of the grid
 has not found an optimum, and I committed one anyway an hour ago. The
 check is mechanical — if the best point is the first or last tried,
 extend the grid — and it costs one more measurement.
+
+### Full 19-shot suite re-run with current defaults, scored on MS-SSIM
+
+Everything changed since the last suite: PLATE_DZ_DIV 8 -> 2,
+deblocking on by default at strength 2, and MS-SSIM as the scoring
+metric instead of PSNR. docs/suite_current_dz32.csv.
+
+  v11.3 (recorded, dz/8 plate, no deblock)   20.915 MB
+  CURRENT (dz/2 plate, deblock on)           19.663 MB   -6.0%
+  frame-weighted MS-SSIM                      0.96186
+  per shot: 15 wins, 2 losses, 2 exact ties
+
+The two ties are shots 5 and 17 reproducing byte-for-byte (297 and, on
+shot 17, 136 B — that one IMPROVED from 965 because the plate ratio
+change shrank a 2-frame shot's plate). Losses are shot 2 (+7.1%) and
+shot 10 (+2.5%). The wins are broad rather than concentrated: shot 4
+-14.3%, shot 7 -15.4%, shot 18 -13.5%, shot 11 -12.5%, shot 8 -9.1%.
+
+Standing against the user's AV1-150k anchor, now on the same metric:
+the anchor scores MS-SSIM 0.96538 on a 96-frame window against v11's
+0.96186 frame-weighted over the whole clip. So AV1 delivers slightly
+BETTER perceptual quality at 0.989 MB against v11's 19.663 MB — the
+codec is ~20x larger at marginally worse quality on film. That is the
+same bimodal verdict the project has carried since the first suite;
+the improvements this session moved the bytes 6% and did not change
+the standing.
+
+Two honest notes on this comparison. The 0.96538 is measured on one
+96-frame window rather than the full clip (the full-clip MS-SSIM run
+was killed for memory — the metric holds five pyramid levels of f64
+per frame, and 1080 frames of 1920x800 does not fit), so it is
+indicative rather than exact. And the two figures aggregate
+differently: v11's is frame-weighted across 19 shots, the anchor's is
+one window inside shot 10.
+
+What this suite is actually good for is the RELATIVE number: 6% fewer
+bytes at a metric that now charges for the artifact the codec produces,
+from two constant retunes and a filter, with no new coding tools. Both
+retuned constants had been set with PSNR, which is the whole point —
+this 6% was not bought, it was recovered from measurement error.
