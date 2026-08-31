@@ -5702,3 +5702,45 @@ threshold, DICT_MAX_CAND/spread, and the 4x4 transform size itself —
 which is the one REGION=8's failure most implicates, since the side
 info explosion came from per-region flags rather than from the
 transform.
+
+### PLATE_DZ_DIV retuned 8 -> 4: the fourth inherited constant, and the fourth to be wrong
+
+The plate's dead-zone ratio was chosen by a full-suite sweep scored on
+PSNR, recorded at the site as "dz/8 sits at the knee, 19.6 MB per dB".
+That sweep measured the right thing with the wrong instrument: a
+coarser plate propagates its error into every frame that predicts from
+it, and the resulting damage is structural rather than mean-square,
+which is exactly the class of error PSNR under-prices.
+
+Re-swept on two content types with MS-SSIM:
+
+  bloopers w1 (film), dz32
+    div 4    465,286 B   MS-SSIM 0.97712
+    div 8    490,100 B           0.97695   (previous default)
+    div 16   516,641 B           0.97694
+  blackstar (game), dz32
+    div 2    303,877 B   MS-SSIM 0.98872
+    div 4    326,691 B           0.98993
+    div 8    337,810 B           0.99013   (previous default)
+
+On film div4 is STRICTLY BETTER — 5.1% fewer bytes AND higher MS-SSIM,
+so there is no trade to weigh. On blackstar it is a trade, 3.3% fewer
+bytes for -0.00020, and pricing it against that clip's own dead-zone
+ladder gives 55,595 KB per MS-SSIM point versus the ladder's ~27,000:
+buying those bytes through the plate ratio is TWICE as efficient as
+buying them by raising dz. Strictly better on one clip, better-than-
+ladder on the other, so 4 replaces 8. div16 loses on both axes on film
+and is not a candidate.
+
+Verified byte-identical to an explicit FAO_PLATE_DZ_DIV=4 (465,286 B on
+w1); suite 97/0; the override remains.
+
+Scoreboard for the procedure, now four constants deep. Each was set
+from a single measurement and each was wrong when re-swept on content
+it was not derived from, with a metric that charges for its failure
+mode: the MV rate charge, DICT_MARGIN, the mover admission gate, and
+now PLATE_DZ_DIV. REGION=16 is the only one that has survived. The
+common shape is not carelessness in the original tuning — every one of
+those sweeps was real work — it is that a constant tuned on one clip
+with one metric encodes that clip and that metric, and neither fact is
+visible in the constant afterwards.

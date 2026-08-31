@@ -1304,7 +1304,20 @@ pub fn encode_gop_v3_forced(
     // dead zone as the frames keeps the plate's fidelity matched to
     // what the residual coder can actually exploit; best-of against
     // raw zstd keeps it safe when the transform loses (tiny plates).
-    const PLATE_DZ_DIV: f32 = 8.0;
+    // RETUNED 8 -> 4. The original ratio was swept on the film suite
+    // scored by PSNR, and PSNR does not charge for what a coarser plate
+    // actually costs. Re-swept on two clips with MS-SSIM:
+    //   film w1   div4 465,286 B @ 0.97712 | div8 490,100 @ 0.97695
+    //             | div16 516,641 @ 0.97694
+    //     -> div4 is STRICTLY BETTER: -5.1% bytes AND +0.00017.
+    //   blackstar div4 326,691 B @ 0.98993 | div8 337,810 @ 0.99013
+    //     -> div4 is a TRADE, -3.3% bytes for -0.00020, priced at
+    //        55,595 KB per MS-SSIM point against that clip's own
+    //        dead-zone ladder — i.e. a BETTER exchange than raising dz.
+    // Strictly better on one clip and a better-than-ladder trade on the
+    // other, so 4 replaces 8. div16 is worse on both axes on film and
+    // is not a candidate. FAO_PLATE_DZ_DIV still overrides.
+    const PLATE_DZ_DIV: f32 = 4.0;
     let mut plate_coded = plate.clone();
     // ── SPECTRALLY-MATCHED PLATE RESOLUTION (FAO_PLATE_HALF).
     //
