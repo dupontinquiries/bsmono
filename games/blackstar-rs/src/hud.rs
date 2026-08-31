@@ -892,6 +892,31 @@ pub const CAT_ROW_H: f32 = 0.062;
 pub const CAT_ROW_H_TALL: f32 = 0.062;
 pub const GARAGE_ROW_H: f32 = 0.082;
 
+/// EVERY LIST ROW PITCH, in one place.
+///
+/// Read by both `a_settings_row_of_text_fits_in_a_settings_row_of_space`
+/// (which measures each against the glyph) and
+/// `no_row_pitch_escapes_the_clearance_table` (which checks nothing exists
+/// outside it). One table, so the check and the allowlist cannot drift — they
+/// did, for exactly one commit, and GARAGE_ROW_H fell straight through the
+/// gap.
+///
+/// `cfg(test)`: it is test data, and shipping it would be one more unreached
+/// symbol in a binary that already carries 314 — the ratchet caught it as
+/// exactly that.
+#[cfg(test)]
+pub const PITCHES: &[(&str, &str, f32)] = &[
+    ("SETTINGS", "TW_ROW_H", TW_ROW_H),
+    ("DECK", "DECK_ROW_H", DECK_ROW_H),
+    ("CONTROLS", "BIND_ROW_H", BIND_ROW_H),
+    ("TRIALS", "TRIALS_ROW_H", TRIALS_ROW_H),
+    ("ACADEMY", "ACADEMY_ROW_H", ACADEMY_ROW_H),
+    ("MAPS", "MAPS_ROW_H", MAPS_ROW_H),
+    ("CATALOGUE", "CAT_ROW_H", CAT_ROW_H),
+    ("CATALOGUE (narrow)", "CAT_ROW_H_TALL", CAT_ROW_H_TALL),
+    ("GARAGE", "GARAGE_ROW_H", GARAGE_ROW_H),
+];
+
 /// The trials list: name, what it asks, which map, and your best.
 pub fn trials_menu(
     ui: &mut Vec<UiVert>,
@@ -1734,17 +1759,8 @@ mod tests {
         // `ui_k` clamps at 1.0, so T_BODY is the largest the text ever gets
         // and these margins are the worst case rather than a typical one.
         let glyph = font::GH * T_BODY;
-        for (name, row_h) in [
-            ("SETTINGS", TW_ROW_H),
-            ("DECK", DECK_ROW_H),
-            ("CONTROLS", BIND_ROW_H),
-            ("TRIALS", TRIALS_ROW_H),
-            ("ACADEMY", ACADEMY_ROW_H),
-            // via `maps_row_h()`, which is why it escaped the first sweep
-            ("MAPS", MAPS_ROW_H),
-            ("CATALOGUE", CAT_ROW_H),
-            ("CATALOGUE (narrow)", CAT_ROW_H_TALL),
-        ] {
+        for (name, _, row_h) in PITCHES {
+            let row_h = *row_h;
             assert!(
                 glyph < row_h,
                 "{name}: text is {glyph:.4} tall in a {row_h:.4} row — rows overlap"
@@ -1824,13 +1840,15 @@ mod tests {
         for stale in [format!("{{ 0.0{}2 }}", 5), format!("{{ 0.0{}6 }}", 4)] {
             assert!(!body.contains(&stale), "catalog_menu has a literal row pitch: {stale}");
         }
-        let tabled = [
-            "TW_ROW_H", "DECK_ROW_H", "BIND_ROW_H", "TRIALS_ROW_H", "ACADEMY_ROW_H",
-            "MAPS_ROW_H", "CAT_ROW_H", "CAT_ROW_H_TALL", "GARAGE_ROW_H",
-        ];
+        // THE SAME TABLE the clearance test iterates. It was two lists for one
+        // commit — an allowlist here and a checked table there — and
+        // GARAGE_ROW_H immediately ended up in one and not the other:
+        // allowlisted, so the scan passed it, and unchecked, so nothing
+        // measured it. Two lists of the same thing is the bug this whole
+        // sweep has been about, and I reproduced it while fixing it.
         for f in &found {
             assert!(
-                tabled.iter().any(|t| f.contains(t) || t.contains(f.as_str())),
+                PITCHES.iter().any(|(_, t, _)| f.contains(t) || t.contains(f.as_str())),
                 "{f} is a row pitch the clearance table does not check"
             );
         }
