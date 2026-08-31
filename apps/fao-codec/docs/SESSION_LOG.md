@@ -4726,3 +4726,44 @@ reference's errors propagate to every frame), which correctly declines
 half-res on blackstar — the path is now inert on the clip that
 motivated it, which is the honest outcome. Kept behind FAO_PLATE_HALF
 for content where a plate really is band-limited.
+
+### The null hypothesis, finally run: IS the plate worth its bytes?
+
+The v11 thesis is that a transmitted world model beats per-frame
+coding. In fifteen sessions that was never tested against its own
+null, because no code path could express "this shot does not want a
+plate". encode_gop_no_plate adds it: the prediction provider returns
+flat gray, so frame 0 falls to intra and every later frame to prev-MC.
+encode_gop_routed picks between the two by the same J the citation
+router and mover guard use (--noplate, --plate-route).
+
+The motivating hypothesis was WRONG, and usefully so. blackstar's
+plate costs 104,683 B (31% of the file) while prev_mode_share is
+0.939, which reads as "94% of regions decline the plate, so it is
+overhead". Measured:
+
+  blackstar dz32   with plate  332,841 B @ 35.619 dB / SSIM 0.9750
+                   NO plate    477,768 B @ 29.564 dB / 0.9497
+                   -> +43.5% bytes AND -6.05 dB without it
+  film w1 dz32     with plate  487,382 B @ 38.311 dB
+                   NO plate    421,712 B @ 36.726 dB
+                   -> -13.5% bytes for -1.59 dB = 41 KB/dB, against
+                      w1's own dead-zone ladder at 155 KB/dB
+                      (dz40 427,043 @ 37.921 -> dz32 487,382 @ 38.311)
+Router agrees on both: J with-plate 9.79e8 vs without 1.26e9 on w1.
+
+So the plate earns its bytes on BOTH the clip where it looked most
+wasteful and on film, and prev_mode_share is a misleading indicator of
+its value. The reason is that the share counts which predictor each
+region CHOSE, while the plate's contribution is largely structural:
+it anchors frame 0 (which otherwise pays full intra) and it bounds
+drift for the prev-MC chain that the other 94% of regions ride on.
+A predictor can be decisive without being selected often — a lesson
+that applies directly to the mover layer and the dictionary, where
+the same share-based reasoning has been used to judge value.
+
+This is the first time the codec's central claim has been measured
+against its own control rather than against AV1. Kept as a routed
+option rather than a default because it costs a second full encode and
+has never once won so far; the value is having the null available, not
+running it every time.

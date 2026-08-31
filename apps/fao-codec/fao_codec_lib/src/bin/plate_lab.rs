@@ -1313,6 +1313,12 @@ end_header
             if let Some(ls) = arg_val(&args, "--lookahead") {
                 let thr: u32 = ls.parse().unwrap_or(1024);
                 plate::encode_gop_v3_lookahead(&frames, &motions, &pl, &opts, thr)
+            } else if args.iter().any(|a| a == "--noplate") {
+                plate::encode_gop_no_plate(&frames, &opts)
+            } else if args.iter().any(|a| a == "--plate-route") {
+                let (rep, chose) = plate::encode_gop_routed(&frames, &motions, &pl, &opts);
+                eprintln!("plate route -> {}", if chose { "PLATE" } else { "NO-PLATE" });
+                rep
             } else if let Some(sp) = arg_val(&args, "--scene-export") {
                 // Emit the GOP's object graph and stop. This is the file
                 // an editor — a person, or a model told "make the fight

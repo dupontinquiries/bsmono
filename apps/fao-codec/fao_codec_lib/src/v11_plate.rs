@@ -1518,6 +1518,75 @@ pub fn encode_gop_v3_forced(
 /// `motion_bytes` is the per-frame model-parameter bill (8 B/frame plate
 /// motions; a pose stream for 3D). The provider MUST be decoder-visible:
 /// only decoded/deterministic inputs, never source pixels.
+/// Encode with NO world model at all: the prediction provider returns
+/// flat gray, so frame 0 falls to intra and every later frame to
+/// prev-MC. The control the codec never had.
+///
+/// blackstar-rs forced this: its plate costs 104,683 B — 31% of the
+/// whole file — while `prev_mode_share` is 0.939, meaning 94% of
+/// regions decline to use it. Paying a third of the file for a model
+/// that six percent of regions consult is a rate-control failure, and
+/// nothing in the codec could previously express "this shot does not
+/// want a plate". The v11 thesis is that a transmitted world model
+/// beats per-frame coding; a thesis needs a null hypothesis, and this
+/// is it.
+pub fn encode_gop_no_plate(
+    frames: &[Yuv420],
+    opts: &ResidualOpts,
+) -> PlateEncodeReportV2 {
+    let (fw, fh) = (frames[0].w, frames[0].h);
+    let gray = {
+        let mut g = Yuv420::new(fw, fh);
+        for p in g.y.iter_mut() {
+            *p = 128;
+        }
+        for p in g.u.iter_mut().chain(g.v.iter_mut()) {
+            *p = 128;
+        }
+        g
+    };
+    encode_gop_v3_core(frames, &mut |_| gray.clone(), 0, 0, opts, None).0
+}
+
+/// Route between the plate branch and the no-plate branch by RD cost,
+/// the same J the citation router and the mover guard use. Returns
+/// (report, chose_plate).
+pub fn encode_gop_routed(
+    frames: &[Yuv420],
+    motions: &[PlateMotion],
+    plate: &Plate,
+    opts: &ResidualOpts,
+) -> (PlateEncodeReportV2, bool) {
+    let with = encode_gop_v3(frames, motions, plate, opts);
+    let without = encode_gop_no_plate(frames, opts);
+    let sse = |rep: &PlateEncodeReportV2| -> f64 {
+        let mut acc = 0.0f64;
+        for (r, f) in rep.recon.iter().zip(frames) {
+            for (a, b) in r.y.iter().zip(&f.y) {
+                let d = *a as f64 - *b as f64;
+                acc += d * d;
+            }
+        }
+        acc
+    };
+    let bytes = |rep: &PlateEncodeReportV2| -> usize {
+        rep.plate_bytes
+            + rep.motion_bytes
+            + rep.frames.iter().map(|c| c.residual_bytes + c.mode_bytes).sum::<usize>()
+    };
+    let lambda = (opts.dead_zone as f64).powi(2) / 3.0;
+    let jw = sse(&with) + lambda * bytes(&with) as f64;
+    let jo = sse(&without) + lambda * bytes(&without) as f64;
+    if std::env::var("FAO_ROUTE_DEBUG").is_ok() {
+        eprintln!(
+            "plate route: with {:.4e} ({} B) | without {:.4e} ({} B) -> {}",
+            jw, bytes(&with), jo, bytes(&without),
+            if jw <= jo { "PLATE" } else { "NO-PLATE" }
+        );
+    }
+    if jw <= jo { (with, true) } else { (without, false) }
+}
+
 pub fn encode_gop_v3_core(
     frames: &[Yuv420],
     pred_for: &mut dyn FnMut(usize) -> Yuv420,
