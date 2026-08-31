@@ -962,6 +962,13 @@ struct Game {
     /// climbing (dozens of times a second), so this is what keeps the
     /// toast from spamming rather than physics gating it itself.
     climb_msg_cd: f32,
+    /// WIRING DEBT from docs/PLAN.md's own Phase 0 list: "patrol -- a
+    /// game mode that calls update". Wired here for the SAFE half only
+    /// (see the tick site's own comment) -- the Surge/Hold/Onslaught
+    /// combat-event half of patrol::update's output is deliberately
+    /// left unconsumed, since surfacing "SURGE incoming" with nothing
+    /// actually spawning to fight would be worse than not showing it.
+    patrol: patrol::Patrol,
 }
 
 /// Impulse (delta-v, m/s) to hp damage. ONE conversion for everything the
@@ -2106,6 +2113,7 @@ fn main() {
         air_t: 0.0,
         air_link: 0.0,
         climb_msg_cd: 0.0,
+        patrol: patrol::Patrol::default(),
     };
 
     // Upload the ship's hull once. `Aboard::upload_hull` needs `&mut Gpu`, so
@@ -6891,6 +6899,7 @@ impl Game {
         self.tick_lesson(dt);
         self.tick_aboard();
         self.tick_trial(dt);
+        self.tick_patrol(dt);
         if ball_air && self.air_link > 0.0 {
             self.air_t += dt;
             self.air_link -= dt;
@@ -7390,6 +7399,11 @@ impl Game {
             self.toastf("no such destination");
             return;
         };
+        // SYNC PATROL TO WHERE YOU ACTUALLY ARE. `Patrol::bridge_to`'s own
+        // doc: "a jump is a change of world, not a fast-travel within
+        // one" -- exactly this call site, which already treats arrival
+        // the same way (fresh map, fresh medium).
+        self.patrol.bridge_to(dest);
         let style = mapsim::style_for(d);
         self.load_map(style, dest_seed(d.id));
         self.set_medium_for(d);
@@ -7550,6 +7564,40 @@ impl Game {
         self.world.park(at, self.aboard.ship.clone());
         self.last_room = None;
         self.cam.indoors = None;
+    }
+
+    /// WIRING DEBT (docs/PLAN.md Phase 0: "patrol -- a game mode that
+    /// calls update"). `patrol::Patrol::update` returns both an ambient/
+    /// lore text drip AND a Surge/Hold/Onslaught combat-event state
+    /// machine in one `Tick` -- this consumes ONLY the text half.
+    ///
+    /// The event half is deliberately NOT surfaced: `out.started` would
+    /// mean announcing "SURGE incoming" with nothing actually spawning
+    /// to fight (this codebase's bot-spawn system isn't hooked up to
+    /// patrol's event position/quota), which reads as a broken promise
+    /// rather than a missing feature. The event state machine still
+    /// runs in the background (there's no way to call update() and get
+    /// only half its side effects) and will quietly time out and fail
+    /// on its own clock -- harmless, since nothing ever announced it in
+    /// the first place. Wiring the event half for real needs a bot
+    /// spawned at `Event::at` with a kill-credit hook into
+    /// `Patrol::credit_kill`, which is its own scoped follow-up, not
+    /// something to bolt on blind here.
+    fn tick_patrol(&mut self, dt: f32) {
+        if self.mode != Mode::Play {
+            return; // a menu/console shouldn't advance the world's own clock
+        }
+        // no day/night cycle exists yet in this engine (checked: no
+        // caller anywhere computes one) -- 0.0 (always day) is an
+        // honest stand-in, not a guess at what night should look like
+        let night = 0.0;
+        let player = [self.car.pos.x, self.car.pos.z];
+        let tick = self.patrol.update(dt, player, night);
+        if let Some(line) = tick.ambient {
+            self.toastf(line);
+        } else if let Some(line) = tick.lore {
+            self.toastf(line);
+        }
     }
 
     fn tick_aboard(&mut self) {
