@@ -53,7 +53,17 @@ pub enum Sink {
     /// One named PulseAudio/PipeWire sink.
     One(String),
     /// Several, through a combine sink built for them.
+    ///
+    /// The SAME audio in each — multi-room, not surround. Asking for
+    /// surround by selecting several speakers is how people end up with
+    /// the left channel in the kitchen.
     Many(Vec<String>),
+    /// One stream SPLIT across speakers by position.
+    ///
+    /// (sink id, PulseAudio channel name), already validated by
+    /// `surround::Assignment` — this type carries the answer, not the
+    /// rules.
+    Surround { members: Vec<(String, String)>, channel_map: String },
 }
 
 impl Sink {
@@ -64,6 +74,21 @@ impl Sink {
     /// leaks a sink per route change because nothing knows the old name to
     /// tear it down.
     pub fn combine_name(members: &[String]) -> String {
+        Sink::derived_name("bo_room", members)
+    }
+
+    /// The virtual sink's name, prefixed by what it IS.
+    ///
+    /// A surround sink called `bo_combine_…` is a lie you meet at three in
+    /// the morning with `pactl list sinks` open — combine duplicates and
+    /// remap splits, and the name is the only thing distinguishing them
+    /// once they are loaded. My first version reused the combine name for
+    /// both and a test caught it by matching the word.
+    pub fn surround_name(members: &[String]) -> String {
+        Sink::derived_name("bo_surround", members)
+    }
+
+    fn derived_name(prefix: &str, members: &[String]) -> String {
         let mut ids: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
         // Sorted, so the same set of speakers in a different order is the
         // same sink — otherwise picking A then B and B then A leaves two.
@@ -75,7 +100,7 @@ impl Sink {
                 h = h.wrapping_mul(0x0000_0100_0000_01b3);
             }
         }
-        format!("bo_combine_{h:016x}")
+        format!("{prefix}_{h:016x}")
     }
 }
 
@@ -155,6 +180,49 @@ pub fn plan(player: &str, url: &str, sink: &Sink) -> Plan {
             play: format!("PULSE_SINK={} {player} {q}", shell_quote(name)),
             teardown: Vec::new(),
         },
+        // SURROUND. A null sink with the room's channel map, one loopback
+        // per speaker taking its own channel, and the player pointed at
+        // the null sink.
+        //
+        // Not `module-combine-sink`: combine DUPLICATES a stream to every
+        // slave, which is the multi-room case above. Splitting a
+        // multichannel stream needs a remap per destination, and the
+        // difference between the two is the whole distinction this variant
+        // exists for.
+        //
+        // MARKED UNVERIFIED, deliberately and in the code rather than only
+        // in a commit message: this module chain is written from the
+        // documentation and has never been run. The plan is a testable
+        // artifact — the commands, their order, the channel each speaker
+        // gets — and whether PulseAudio accepts these exact arguments is
+        // not something a fixture can answer.
+        Sink::Surround { members, channel_map } => {
+            let name = Sink::surround_name(
+                &members.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>());
+            let mut setup = vec![format!(
+                "pactl load-module module-null-sink sink_name={name} \
+                 channels={} channel_map={}",
+                channel_map.split(',').count(), shell_quote(channel_map))];
+            for (sink, ch) in members {
+                // `remix=no` matters: with remixing on, a speaker given
+                // one channel of a 5.1 map gets a downmix of everything
+                // instead, and the setup plays correctly-quiet mud from
+                // every corner.
+                setup.push(format!(
+                    "pactl load-module module-remap-sink sink_name={name}_{} \
+                     master={} channels=1 master_channel_map={} channel_map=mono remix=no",
+                    ch.replace('-', "_"), shell_quote(sink), shell_quote(ch)));
+            }
+            Plan {
+                setup,
+                play: format!("PULSE_SINK={name} {player} {q}"),
+                // Unloading BY NAME rather than every module of the type:
+                // `unload-module module-remap-sink` would take out any
+                // remap another application had created, which on a
+                // desktop is somebody else's headset.
+                teardown: vec![format!("pactl unload-module {name}")],
+            }
+        }
         Sink::Many(members) => {
             let combine = Sink::combine_name(members);
             let slaves = members.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(",");
@@ -432,6 +500,64 @@ mod tests {
         assert!(p.setup[0].contains("slaves='one,two'"), "{}", p.setup[0]);
         assert_eq!(p.play.matches("mpv").count(), 1, "more than one player: {}", p.play);
         assert!(!p.teardown.is_empty(), "a combine sink that is never unloaded");
+    }
+
+    #[test]
+    fn surround_splits_the_stream_instead_of_duplicating_it() {
+        // The distinction the variant exists for: combine DUPLICATES, which
+        // is multi-room. A surround setup routed through combine puts the
+        // whole mix in every corner and sounds like it is working.
+        let p = plan("mpv", "/a.flac", &Sink::Surround {
+            members: vec![("bt_l".into(), "front-left".into()),
+                          ("bt_r".into(), "front-right".into())],
+            channel_map: "front-left,front-right".into(),
+        });
+        assert!(p.setup[0].contains("module-null-sink"), "{}", p.setup[0]);
+        assert!(!p.setup.iter().any(|c| c.contains("combine")),
+                "surround was routed through a combine sink: {:#?}", p.setup);
+        assert_eq!(p.setup.len(), 3, "a null sink and one remap per speaker: {:#?}", p.setup);
+        assert_eq!(p.play.matches("mpv").count(), 1, "one player, one clock");
+    }
+
+    #[test]
+    fn each_speaker_is_remapped_to_its_own_channel_without_remixing() {
+        // With remixing on, a speaker given one channel of a 5.1 map gets
+        // a downmix of everything instead — correctly quiet mud from every
+        // corner, which is much harder to diagnose than silence.
+        let p = plan("mpv", "/a.flac", &Sink::Surround {
+            members: vec![("bt_rl".into(), "rear-left".into())],
+            channel_map: "front-left,front-right,rear-left".into(),
+        });
+        let remap = p.setup.iter().find(|c| c.contains("module-remap-sink"))
+            .expect("no remap");
+        assert!(remap.contains("master_channel_map='rear-left'"), "{remap}");
+        assert!(remap.contains("remix=no"), "{remap}");
+        assert!(p.setup[0].contains("channels=3"), "{}", p.setup[0]);
+    }
+
+    #[test]
+    fn teardown_names_the_module_rather_than_the_type() {
+        // `unload-module module-remap-sink` takes out every remap on the
+        // machine, which on a desktop is somebody else's headset.
+        let p = plan("mpv", "/a.flac", &Sink::Surround {
+            members: vec![("a".into(), "front-left".into())],
+            channel_map: "front-left".into(),
+        });
+        assert_eq!(p.teardown.len(), 1);
+        assert!(!p.teardown[0].contains("module-remap-sink"),
+                "the teardown unloads by TYPE: {}", p.teardown[0]);
+        assert!(p.teardown[0].contains("bo_surround_"), "{}", p.teardown[0]);
+    }
+
+    #[test]
+    fn a_surround_sink_is_not_named_like_a_combine_one() {
+        // The name is the only thing telling them apart in `pactl list
+        // sinks`, and combine duplicates where remap splits.
+        let s = Sink::surround_name(&["a".into(), "b".into()]);
+        let c = Sink::combine_name(&["a".into(), "b".into()]);
+        assert!(s.starts_with("bo_surround_"), "{s}");
+        assert!(c.starts_with("bo_room_"), "{c}");
+        assert_ne!(s, c, "the same speakers gave one name for two different sinks");
     }
 
     #[test]

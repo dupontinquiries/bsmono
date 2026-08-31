@@ -20,6 +20,7 @@ pub mod tags;
 pub mod outputs;
 pub mod music_scan;
 pub mod playback;
+pub mod surround;
 pub mod sources;
 pub mod fileproc;
 pub mod shell_bits;
