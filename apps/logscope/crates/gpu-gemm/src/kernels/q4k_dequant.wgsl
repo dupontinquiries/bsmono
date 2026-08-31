@@ -1,3 +1,4 @@
+// Q4K_DEQUANT
 struct D { n:u32, grid_w:u32, _b:u32, _c:u32 };
 @group(0)@binding(0) var<storage,read> src: array<u32>;     // raw Q4_K bytes, viewed as words
 @group(0)@binding(1) var<storage,read_write> dst: array<f32>;

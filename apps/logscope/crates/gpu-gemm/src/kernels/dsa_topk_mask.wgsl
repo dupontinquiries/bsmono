@@ -1,4 +1,4 @@
-
+// DSA_TOPK_MASK
 struct D { nk:u32, keep:u32, _a:u32, _b:u32 };
 @group(0)@binding(0) var<storage,read> s: array<f32>;        // [nk] scores
 @group(0)@binding(1) var<storage,read_write> mask: array<f32>; // [nk]

@@ -1,4 +1,4 @@
-
+// MATVEC_SMALL_Q4
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;   // [m,k]
 @group(0)@binding(1) var<storage,read> qw: array<u32>;  // [n,k] nibbles, 8 packed per u32

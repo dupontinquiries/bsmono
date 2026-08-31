@@ -1,4 +1,4 @@
-
+// DSA_MASKED_ATTN
 struct D { nk:u32, dk:u32, dv:u32, _p:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;    // [dk]
 @group(0)@binding(1) var<storage,read> k: array<f32>;    // [nk*dk]

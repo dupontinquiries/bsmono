@@ -1,3 +1,4 @@
+// ROPE_MH_ROWS
 struct D { t:u32,dm:u32,base:f32,_p:u32,hd:u32,neox:u32,msc:f32,_c:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> ff: array<f32>;

@@ -1,4 +1,4 @@
-
+// LINEAR_Q8_0
 struct D { m:u32,n:u32,k:u32,kb:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;   // [m,k] activations
 @group(0)@binding(1) var<storage,read> qw: array<u32>;  // [n,k] int8, 4 packed per u32

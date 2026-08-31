@@ -506,7 +506,7 @@ mod shape_check_tests {
     /// The MLA loader gap, reproduced END TO END rather than asserted.
     ///
     /// Every other statement in this tree about MLA loading is structural — a
-    /// grep over lib.rs (`archcfg::note_claims::mla_loading_is_still_absent`)
+    /// grep over lib.rs (`archcfg::note_claims::mla_loading_exists_and_the_notes_say_so`)
     /// or a comment. This drives the real thing: `Gpu::new`, then
     /// `load_gguf_opt` over a real MLA checkpoint, and pins where it stops.
     ///
@@ -881,24 +881,33 @@ branch below is not being exercised and this test is vacuous");
         assert!(g.tensor("blk.0.attn_k_b.weight").is_some(),
                 "fixture lacks the SPLIT k_b/v_b form this exercises");
 
+        // MLA LOADING NOW WORKS (the per-block routing re-landed after b911a471's version was
+        // merge-lost; --gate-mla-load and --probe on this very fixture prove load + finite
+        // decode). What this test pins is WHERE an unforced load stops today: the ARCHITECTURE
+        // gate — glm-dsa stays declared-unsupported until a real checkpoint runs, and
+        // LOGSCOPE_TRY_UNSUPPORTED_ARCH is the escape. The env is deliberately not set here:
+        // set_var leaks across the threaded suite and would flip other refusal tests.
         let gpu = crate::Gpu::new();
         let err = match gpu.load_gguf_opt(&bytes, false) {
             Ok(_) => panic!(
-                "an MLA checkpoint LOADED. That is the good outcome, and it means the loader gap closed — update archcfg's deepseek2 and glm-dsa notes, mla_loading_is_still_absent, and this test."
+                "an unforced glm-dsa load SUCCEEDED — the arch gate stopped vetoing a \
+declared-unsupported architecture. Either glm-dsa was verified on a real checkpoint (then \
+update this test to load and decode), or the gate broke (then every unverified arch just \
+started loading silently)."
             ),
             Err(e) => e,
         };
 
-        // WHERE it stops matters more than THAT it stops. Today the refusal is
-        // the architecture gate (glm-dsa: sparse attention unimplemented),
-        // which fires BEFORE the MLA layer loading would. So closing the MLA
-        // gap alone would not make this fixture load — a reader planning that
-        // work should know the arch gate is in front of it.
-        assert!(err.contains("glm-dsa") || err.contains("MLA") || err.contains("Multi-head Latent"),
-                "refused for an unrelated reason, so this no longer pins the MLA path:\n{err}");
-
-        // And the diagnostic has to name the fixture that reproduces it —
-        // that pointer is the only reason this test could be written.
+        // The refusal must be the ARCH gate, and must offer the escape hatch.
+        assert!(err.contains("glm-dsa"),
+                "refused for an unrelated reason, so this no longer pins the arch gate:\n{err}");
+        assert!(err.contains("LOGSCOPE_TRY_UNSUPPORTED_ARCH"),
+                "the refusal should name the opt-in that lets someone produce the verification \
+evidence, got:\n{err}");
+        // And it must NOT be the old loader gap resurfacing — those messages mean the per-block
+        // MLA routing regressed (again), and --gate-mla-load is the place to look.
+        assert!(!err.contains("did not route") && !err.contains("missing tensor blk.0.attn_q"),
+                "the LOADER refused before the arch gate could — the MLA routing regressed:\n{err}");
         assert!(err.len() > 80, "the refusal should explain itself, got: {err}");
     }
 

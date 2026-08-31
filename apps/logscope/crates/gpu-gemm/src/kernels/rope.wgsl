@@ -1,4 +1,4 @@
-
+// ROPE
 struct D { t:u32,d:u32,base:f32,pos0:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<f32>;

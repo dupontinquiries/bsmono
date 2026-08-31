@@ -1,3 +1,4 @@
+// ROPE_MH
 struct D { t:u32,dm:u32,base:f32,pos0:u32,hd:u32,neox:u32,msc:f32,sl:u32,rot:u32,_p1:u32,_p2:u32,_p3:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> ff: array<f32>;   // per-dim-pair freq factors (len hd/2)

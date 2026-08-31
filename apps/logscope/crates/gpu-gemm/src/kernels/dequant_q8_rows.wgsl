@@ -1,4 +1,4 @@
-
+// DEQUANT_Q8_ROWS
 struct D { n:u32,c:u32,_a:u32,_b:u32 };
 @group(0)@binding(0) var<storage,read> q: array<u32>;
 @group(0)@binding(1) var<storage,read> scales: array<f32>;

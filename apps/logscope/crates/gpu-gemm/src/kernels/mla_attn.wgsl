@@ -1,4 +1,4 @@
-
+// MLA_ATTN
 struct D { t:u32, nh:u32, qk:u32, vh:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> k: array<f32>;

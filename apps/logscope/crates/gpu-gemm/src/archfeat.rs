@@ -102,6 +102,12 @@ pub enum Feature {
     /// layers), with a WEIGHTLESS rms on V. Not "V equals cached K": K then gets its learned norm
     /// and rope, V does not — same projection, different post-processing (gemma4.cpp).
     AltAttnValueFromKey,
+    /// Gated DeltaNet recurrent layers (Qwen3.5/3.6 hybrids, Qwen3-Next): a per-head decaying
+    /// delta-rule state instead of a KV cache, fed by a causal depthwise conv over fused qkv.
+    GatedDeltaNet,
+    GatedAttentionOutput,
+    MRopeSections,
+    GatedSharedExpert,
     /// Dense (shared) FFN and the routed MoE run as PARALLEL branches off attn_out — each with its
     /// own pre/post norms — summed, post-normed once, then added to the residual (Gemma 4 MoE).
     /// Sequential wiring runs and produces plausible text, which is the failure mode worth a flag.
@@ -152,6 +158,10 @@ impl Feature {
             Feature::ExpertWeightsNorm => "routed-expert weights renormalized to sum to 1",
             Feature::SparseAttentionIndexer => "sparse attention: an indexer selects top-k keys",
             Feature::AltAttnValueFromKey => "V sourced from the K projection (attn_v absent; weightless V norm)",
+            Feature::GatedDeltaNet => "Gated DeltaNet recurrent layers (delta-rule state + conv, no KV cache)",
+            Feature::GatedAttentionOutput => "gated attention (per-head q‖gate interleaved in a double-width q projection; attention output × sigmoid(gate))",
+            Feature::MRopeSections => "multi-section rope (IMRoPE: rope.dimension_sections split across position channels)",
+            Feature::GatedSharedExpert => "shared expert with its OWN sigmoid gate (ffn_gate_inp_shexp scales the shared expert's output per token)",
             Feature::TwinFfnParallelResidual => "dense + MoE FFN as parallel branches with one joining post-norm",
             Feature::RouterInputNormScale => "router input: weightless rms of attn_out times a learned scale vector",
             Feature::PerExpertOutputScale => "learned per-expert output scale vector",
@@ -224,7 +234,11 @@ impl Feature {
             // a feature is missing refuses an architecture the engine can actually run.
             Feature::PerLayerRopeFreqs => true,
             Feature::PerLayerHeadDim => false,   // head_dim is a single model-wide value throughout
-            Feature::LayerOutputScale => false,  // the tensor is not read
+            // Wired at the ffn_apply funnel — the one tail every block fn calls (18 sites), so the
+            // scale cannot miss a path. Placement matches gemma4.cpp:365: the whole layer output,
+            // end of layer. --gate-outscale proves scale-1.0 is a BIT-EXACT no-op and scale-0.5
+            // engages, on the hybrid fixture's mixed DeltaNet + MoE paths.
+            Feature::LayerOutputScale => true,  // the tensor is not read
             // Implemented in _289: the loader now reads attn_k_b + attn_v_b and concatenates them, having
             // established from llama.cpp PR #12801 that the 3-D GGUF form is byte-identical to the 2-D
             // declaration. This flag stayed false for four commits after the code landed — the fifth
@@ -268,7 +282,38 @@ impl Feature {
             // Gemma 4 MoE / DiffusionGemma (gemmadiff.rs is the CPU reference each will be gated
             // against; none has a GPU caller yet — the reference existing is NOT the feature
             // existing, which is exactly the distinction this table exists to hold).
-            Feature::AltAttnValueFromKey => false,     // the loader requires attn_v today
+            // Wired shape-driven for the gemma4 family (archcfg::v_norm_weightless): V is per-head
+            // weightless-rmsnormed from EITHER source, and blocks without attn_v source it from
+            // the RAW k projection (pre-k_norm, pre-rope; gemma4.cpp:217-231). Proven BIT-EQUAL
+            // to an explicit attn_v carrying k's weights by --gate-gemma4-altv, with the fused
+            // and unfused implementations cross-checked. Non-implementing paths refuse by name.
+            Feature::AltAttnValueFromKey => true,     // the loader requires attn_v today
+            // CPU-ROUTED and wired: the loader builds each recurrent block's DeltaNetLayerHost,
+            // new_cache_for allocates per-layer states, and decode routes those layers through
+            // block_decode_deltanet — which calls the SAME deltanet::step the invariant tests
+            // bind. --gate-deltanet-load proves load + decode + the seek refusal on a synthetic
+            // hybrid. Slow by design (one download+upload per recurrent layer per token); the GPU
+            // kernel is the speed work and checks against this path.
+            Feature::GatedDeltaNet => true,
+            // The two things a REAL Qwen3.5/3.6 full-attention layer still needs. Observed in
+            // qwen35moe.cpp: create_tensor_qkv with n_embd_head*n_head*2 (q and its output gate
+            // interleaved per head), attention output multiplied by sigmoid(gate); and
+            // ggml_rope_multi with sections. Neither is read or applied here yet.
+            // Implemented shape-driven: a double-width attn_q is de-interleaved per head at load
+            // (qkvsplit::deinterleave_q_gate, unit-tested), the gate half becomes attn_out_gate,
+            // and block_decode + block_decode_fused apply attn ∘ sigmoid(gate) before wo — proven
+            // EQUAL to each other at 3.6e-7 by --gate-deltanet-load's fused-vs-unfused cross-check
+            // (which also caught the post_attention_norm double-load on its first run). Every
+            // other block fn refuses a gated layer by name (refuse_attn_gate_where_unapplied).
+            Feature::GatedAttentionOutput => true,
+            Feature::MRopeSections => false,
+            // Wired at the moe_ffn funnel (one apply site serves decode AND prefill): the loader
+            // reads ffn_gate_inp_shexp as a [1, d] f32 row, and the shared expert's output is
+            // scaled by sigmoid(w·n2) per token. Proven algebraically by --gate-deltanet-load: a
+            // zero gate (sigmoid = 0.5 exactly) decodes BIT-EQUAL to a twin fixture whose
+            // down_shexp is pre-halved — the fp rounding commutes because 0.5 is a power of two —
+            // and the ungated variant differs, so the gate provably engages on the right term.
+            Feature::GatedSharedExpert => true,
             Feature::TwinFfnParallelResidual => false, // block forward runs ONE ffn branch
             Feature::RouterInputNormScale => false,    // router reads the branch's normed input
             Feature::PerExpertOutputScale => false,    // ffn_down_exps.scale is not read
@@ -285,8 +330,10 @@ impl Feature {
 matters most on long contexts"),
             Feature::PerLayerHeadDim => Some("STRUCTURAL: head_dim is model-wide here, so a checkpoint \
 whose windowed and full layers differ cannot be laid out correctly at all"),
-            Feature::LayerOutputScale => Some("layer outputs are unscaled; the tensor is present in the \
-file and ignored"),
+            Feature::LayerOutputScale => Some("applies at the ffn_apply funnel (whole layer \
+output, end of layer, per gemma4.cpp). Loaded presence-driven from blk.N.layer_output_scale; \
+gemma4-assistant REQUIRES the tensor, base gemma4 makes it optional. Never run on a real \
+gemma4 checkpoint — PerLayerHeadDim and AltAttnValueFromKey still gate that"),
             Feature::FinalLogitSoftcap => Some("Gemma 2 only; implemented — logits_out applies it"),
             Feature::AttnLogitSoftcap => Some("Gemma 2 only; Gemma 3 and 4 default it off"),
             Feature::AttentionScaleHparam => Some("matches the 1/sqrt(head_dim) default on Gemma 3 12B \
@@ -295,16 +342,39 @@ and below; differs only on the 27B, which uses 1/sqrt(n_embd/n_head)"),
 output down by that factor — a quietly worse model, not a broken one"),
             Feature::MlaSplit3dProjections => Some("a LOADING gap, not a maths one — the MLA forward is \
 implemented and validated; these checkpoints just store k_b and v_b separately and in 3-D"),
-            Feature::SparseAttentionIndexer => Some("glm-dsa needs sparse attention: an indexer selects top-k keys. NOT a correctness blocker — \
-llama.cpp mainline does not implement DSA either (issues #24730, #20363) and runs GLM-5.2 with a \
-DENSE fallback, and dense attention is EXACT at or below index_topk because selecting the top k \
-of k-or-fewer keys is all of them. Above that bound it is an approximation, and at a 1M context \
-it is unaffordable. The real loader blocker is IndexShare: index_topk_freq 4 means only ~1 layer \
-in 4 carries indexer tensors, which is what breaks stock llama.cpp on converted GGUFs"),
+            Feature::SparseAttentionIndexer => Some("glm-dsa needs sparse attention: an indexer selects top-k keys. NOT a correctness blocker: \
+dense attention is EXACT at or below index_topk, because selecting the top k of k-or-fewer keys \
+is all of them. Above that bound it is an approximation, and at a 1M context it is unaffordable. \
+The dense-fallback bargain was llama.cpp's too until mid-2026; its master now SHIPS DSA \
+(src/models/glm-dsa.cpp + llama-kv-cache-dsa.h: 32-head lightning indexer, per-layer \
+indexer_types, indexer tensors TENSOR_NOT_REQUIRED) — the reference to transcribe when \
+long-context efficiency matters here. IndexShare (index_topk_freq 4 → only ~1 layer in 4 \
+carries indexer tensors) is handled on our side: unread tensors are simply not fetched"),
             Feature::Mla => Some("wired and validated against the CPU reference, but never yet run on a \
 real DeepSeek/GLM checkpoint — the first such load is the test"),
-            Feature::AltAttnValueFromKey => Some("STRUCTURAL for the affected layers: without it the \
-loader refuses on the missing attn_v; faking V=K without the weightless norm runs and is wrong"),
+            Feature::GatedDeltaNet => Some("GPU-RESIDENT by default: one stacked projection \
+(qkv‖z‖β‖α) + DELTANET_CONV + DELTANET_STEP + wout — five dispatches, zero host round-trips; \
+the CPU oracle (deltanet.rs) remains behind LOGSCOPE_DELTANET_CPU=1 and the gate cross-checks \
+logits AND final state (ring bit-equal, S at 7e-9) plus the sync-count delta. Sequential \
+positions only — recurrent state cannot seek, so trie/fleet prefix reuse is refused"),
+            Feature::GatedAttentionOutput => Some("wired: the double-width q is split per head at \
+load and decode applies attn * sigmoid(gate) before wo (block_decode and _fused, cross-checked \
+against each other; other paths refuse gated layers by name). Never run on a real checkpoint"),
+            Feature::MRopeSections => Some("IMRoPE: position is split across rope sections \
+(rope.dimension_sections — REQUIRED metadata for qwen35moe, so every converted file carries it). \
+For pure-text input with all position components equal, M-RoPE is claimed equivalent to plain 1D \
+rope (Qwen2-VL paper) — but the ggml kernel is not vendored here, so the per-dim frequency \
+mapping of GGML_ROPE_TYPE_IMROPE is UNVERIFIED; check ggml-cpu's rope against ours on a shared \
+input before treating NEOX as sufficient, and do not flip this flag on the equivalence argument \
+alone"),
+            Feature::GatedSharedExpert => Some("wired at the single moe_ffn funnel; families \
+without the tensor (GLM/DeepSeek) add the shared output unscaled, as their references do. Never \
+run on a real checkpoint"),
+            Feature::AltAttnValueFromKey => Some("wired for gemma4/diffusion_gemma prefixes; the \
+weightless V norm is ALWAYS on for the family, wv or not — gemma4.cpp norms Vcur \
+unconditionally, so implementing only the missing-wv half would be wrong for blocks that ship \
+one. block_decode + block_decode_fused implement; other paths refuse. diffusion_gemma is \
+included on lineage only — its reference is not vendored. Never run on a real checkpoint"),
             Feature::TwinFfnParallelResidual => Some("sequential wiring produces plausible text — the \
 CPU reference in gemmadiff pins the parallel join order the gate must match"),
             Feature::RouterInputNormScale => Some("routing on the branch input instead of attn_out \
@@ -346,10 +416,18 @@ pub fn required(arch: &str, variant: u32) -> Vec<Feature> {
                                      Feature::GeGluActivation, Feature::GemmaRmsNorm, Feature::EmbeddingScale, Feature::PerLayerRopeBase, Feature::AttentionScaleHparam],
         // Gemma 4 (src/models/gemma4.cpp): everything gemma3 needs, plus per-layer rope freqs, a
         // per-layer HEAD DIM (key_length_swa vs key_length) and a learned per-layer output scale.
+        // AltAttnValueFromKey is BASE gemma4, not just the diffusion variant: wv is
+        // TENSOR_NOT_REQUIRED and `Vcur = wv ? mm(wv,cur) : Kcur` — V is the raw k_proj output
+        // (then a WEIGHTLESS rms norm) while K separately gets the learned k_norm + rope.
+        // Not yet in this list because no registry Feature exists for it: gemma4.cpp's
+        // hparams.has_kv(il) — some layers REUSE an earlier layer's KV cache entirely
+        // (cross-layer KV sharing). First seen in the Aug 2026 snapshot; add the Feature the
+        // moment a gemma4 checkpoint is actually attempted.
         "gemma4" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::QkNormPreRope,
                          Feature::GeGluActivation, Feature::GemmaRmsNorm,
                          Feature::PerLayerRopeFreqs, Feature::PerLayerHeadDim, Feature::LayerOutputScale,
-                         Feature::EmbeddingScale, Feature::PerLayerRopeBase, Feature::AttentionScaleHparam],
+                         Feature::EmbeddingScale, Feature::PerLayerRopeBase, Feature::AttentionScaleHparam,
+                         Feature::AltAttnValueFromKey],
         // DiffusionGemma = the Gemma 4 26B-A4B MoE base plus the diffusion pieces. Transcribed
         // from gemma4.cpp (base) + the HF drop's configs and weight census (diffusion). The MoE
         // routing/gather machinery itself is exercised daily (qwen3moe, llada2) so it is not a
@@ -363,6 +441,12 @@ pub fn required(arch: &str, variant: u32) -> Vec<Feature> {
             Feature::AltAttnValueFromKey, Feature::TwinFfnParallelResidual,
             Feature::RouterInputNormScale, Feature::PerExpertOutputScale,
             Feature::SelfConditioning, Feature::EncDecLayerScale],
+        // Qwen3.5/3.6 hybrids (qwen35moe.cpp / qwen3next.cpp): 3-in-4 layers are Gated DeltaNet.
+        // QkNormPreRope covers the 1-in-4 gated-attention blocks; the deltanet gap is the load
+        // blocker and its report points at the CPU oracle.
+        "qwen35moe" | "qwen36moe" | "qwen3_5moe" | "qwen3next" =>
+            vec![Feature::QkNormPreRope, Feature::SharedExpert, Feature::GatedDeltaNet,
+                 Feature::GatedAttentionOutput, Feature::MRopeSections, Feature::GatedSharedExpert],
         // deepseek2/3 covers GLM-4.7-Flash, which ships the split 3-D projections. Listed so the
         // refusal names the real blocker rather than blaming the MLA forward, which is implemented.
         "deepseek2" | "deepseek3" => vec![Feature::Mla, Feature::SharedExpert,
@@ -404,8 +488,12 @@ mod tests {
         // remains is the per-layer geometry pair, the output scalars (both sets), and the four
         // Gemma-4-MoE/diffusion mechanisms.
         let g = gaps("diffusion_gemma", 128);
-        let expect = [Feature::PerLayerHeadDim, Feature::LayerOutputScale,
-                      Feature::AltAttnValueFromKey, Feature::TwinFfnParallelResidual,
+        // SIX now: LayerOutputScale and AltAttnValueFromKey are implemented (c12-141) and gap
+        // lists show only what is MISSING. AltAttnValueFromKey's diffusion-side caveat: the
+        // diffusion forward path does not APPLY the V norm — it refuses v-norm blocks by name —
+        // so a real diffusion_gemma still cannot run those layers; it just refuses honestly.
+        let expect = [Feature::PerLayerHeadDim,
+                      Feature::TwinFfnParallelResidual,
                       Feature::RouterInputNormScale, Feature::PerExpertOutputScale,
                       Feature::SelfConditioning, Feature::EncDecLayerScale];
         for f in expect { assert!(g.contains(&f), "{f:?} must be a named gap: {g:?}"); }
@@ -511,11 +599,15 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_needs_three_things_gemma3_does_not() {
+    fn gemma4_needs_four_things_gemma3_does_not() {
         let g3 = required("gemma3", 0);
         let g4 = required("gemma4", 0);
         assert!(g3.contains(&Feature::QkNormPreRope) && g4.contains(&Feature::QkNormPreRope));
-        for f in [Feature::PerLayerRopeFreqs, Feature::PerLayerHeadDim, Feature::LayerOutputScale] {
+        // The fourth is AltAttnValueFromKey, and it is BASE gemma4 per gemma4.cpp (wv is
+        // TENSOR_NOT_REQUIRED there) — previously listed only under diffusion_gemma, which
+        // would have let a base-gemma4 load fail on "missing attn_v" with no gap named.
+        for f in [Feature::PerLayerRopeFreqs, Feature::PerLayerHeadDim, Feature::LayerOutputScale,
+                  Feature::AltAttnValueFromKey] {
             assert!(!g3.contains(&f), "gemma3 does not need {f:?}");
             assert!(g4.contains(&f), "gemma4 does need {f:?}");
         }
@@ -528,8 +620,12 @@ mod tests {
         // the two imply completely different amounts of work.
         let r = gap_report("gemma4", 0);
         assert!(r.iter().any(|s| s.contains("STRUCTURAL")), "{r:?}");
-        assert!(r.iter().any(|s| s.contains("present in the file and ignored")),
-                "an ignored tensor should say so: {r:?}");
+        // The "present in the file and ignored" category (LayerOutputScale) left this report on
+        // c12-141 — the tensor is read and applied now (--gate-outscale). What remains for gemma4
+        // is exactly the structural pair, and BOTH must say STRUCTURAL so the report still
+        // distinguishes deep work from missing knobs.
+        assert_eq!(r.len(), 1, "PerLayerHeadDim and nothing else: {r:?}");
+        assert!(r.iter().all(|s| s.contains("STRUCTURAL")), "{r:?}");
     }
 
     #[test]
@@ -576,9 +672,10 @@ mod tests {
         // Gemma 2 needs BOTH caps and now has one: the final cap is implemented, the attention
         // cap is the single remaining gap for the architecture.
         assert_eq!(gaps("gemma2", 0), vec![Feature::AttnLogitSoftcap]);
-        // Gemma 4's remaining gaps are the structural ones, unchanged by this work.
+        // Gemma 4 is down to ONE gap: PerLayerHeadDim, the deep one (c12-141 closed
+        // LayerOutputScale and AltAttnValueFromKey).
         let g4 = gaps("gemma4", 0);
-        assert!(g4.contains(&Feature::PerLayerHeadDim) && g4.contains(&Feature::LayerOutputScale));
+        assert_eq!(g4, vec![Feature::PerLayerHeadDim], "{g4:?}");
         assert!(!g4.contains(&Feature::GeGluActivation), "the activation is no longer a gap for any Gemma");
     }
 
@@ -752,7 +849,11 @@ mod staleness_tests {
         assert!(!Feature::AttnLogitSoftcap.implemented(),
                 "no attention kernel caps its logits — that is the half still missing");
         assert!(!Feature::PerLayerHeadDim.implemented(), "head_dim is one model-wide value");
-        assert!(!Feature::LayerOutputScale.implemented(), "the tensor is not read");
+        // LayerOutputScale LEFT this list on c12-141: the tensor is now read (presence-driven)
+        // and applied at the ffn_apply funnel, with --gate-outscale's bit-exact 1.0 no-op as the
+        // proof. Pinned implemented so a regression is a conscious edit here, not a drift.
+        assert!(Feature::LayerOutputScale.implemented(),
+                "implemented on c12-141 (ffn_apply funnel; --gate-outscale)");
     }
 
     /// Some features are required by an ARCHITECTURE and some by a FILE, and the table only expresses

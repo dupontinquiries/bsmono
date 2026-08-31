@@ -1,4 +1,4 @@
-
+// ARGMAX
 struct D { n:u32, out_slot:u32, _b:u32, _c:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read_write> o: array<u32>;

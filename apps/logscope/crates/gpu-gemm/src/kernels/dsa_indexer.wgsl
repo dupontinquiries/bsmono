@@ -1,4 +1,4 @@
-
+// DSA_INDEXER
 struct D { nk:u32, nh:u32, hd:u32, _p:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;   // [nh*hd]
 @group(0)@binding(1) var<storage,read> k: array<f32>;   // [nk*hd]

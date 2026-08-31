@@ -1,4 +1,4 @@
-
+// GATHER_Q8_AT
 struct D { k:u32, id_off:u32, kb:u32, _c:u32 };
 @group(0)@binding(0) var<storage,read> qw: array<u32>;
 @group(0)@binding(1) var<storage,read> qs: array<f32>;

@@ -48,3 +48,16 @@ a validation error.
   the true test (arena/BO budget, MoE routing at 47 layers, MTP drop of 1).
 - Tokenizer: specials registered but im_start/im_end unset — chat template use
   should be verified against the reference implementation.
+
+## Re-landed (2026-08-31) — this work was merge-lost once
+
+The loader half of the fix above and the whole `--gate-mla-load` gate were dropped by a later
+merge: b911a471 is an ancestor of main, yet `git log -S "gate-mla-load"` on main.rs finds
+nothing, and the resident loader had gone back to refusing every MLA block at the wqkv fusion
+site. Re-landed as: a `block_is_mla` per-block sniff (placeholder q/k/v/wo; the low-rank set
+loads via the block's `mla` field, incomplete sets fail naming the set), `--gate-mla-load`
+restored verbatim plus a per-block assertion, and `note_claims::mla_loading_exists_and_the_notes_say_so`
+pinning prose to the code that exists (the old structural probe grepped for symbol names the
+implementation never used, which is how the loss went unnoticed). The glm-dsa 3-layer fixture
+(MLA + MoE + IndexShare + split 3-D kv_b) now loads and decodes finite, input-sensitive logits
+end to end (`kernel-validate --probe /tmp/tiny-glmdsa.gguf` with the opt-in env).

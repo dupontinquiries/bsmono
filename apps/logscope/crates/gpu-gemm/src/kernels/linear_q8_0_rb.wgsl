@@ -1,4 +1,4 @@
-
+// LINEAR_Q8_0_RB
 const BM:u32=64u; const BN:u32=64u; const BK:u32=16u;
 struct D { m:u32,n:u32,k:u32,kb:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;

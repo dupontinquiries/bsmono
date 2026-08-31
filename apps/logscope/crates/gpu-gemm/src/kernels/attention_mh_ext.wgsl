@@ -1,3 +1,4 @@
+// ATTENTION_MH_EXT
 struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> kc: array<f32>;

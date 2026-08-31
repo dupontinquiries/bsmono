@@ -325,6 +325,273 @@ fn enc_q8_0(w: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Synthetic 1-layer deepseek2 checkpoint with q-compressed MLA (q_lora_rank > 0):
+/// attn_q_a(+norm)/attn_q_b + attn_kv_a_mqa(+norm)/attn_kv_b + attn_output, and NO
+/// attn_q/k/v — exactly the tensor shape of GLM-4.7-Flash, which the loader once
+/// refused with "missing tensor blk.0.attn_q.weight". Dims mirror --gate-mla-block
+/// (d=64, 2 heads, kv_lora=16, q_lora=32, nope=16, rope=8, v_head=16).
+///
+/// Recovered verbatim from b911a471, whose main.rs half a later merge dropped —
+/// `git log -S "gate-mla-load"` on main finds nothing even though the commit is an
+/// ancestor. The gate below is the regression net that would have caught that loss.
+fn write_gguf_deepseek2_mla() -> Vec<u8> {
+    let (d, heads, vocab, h) = (64usize, 2usize, 32usize, 128usize);
+    let (q_lora, kv_lora, nope, rope, v_head) = (32usize, 16usize, 16usize, 8usize, 16usize);
+    let qk_head = nope + rope;
+    let mk = |seed: u32, n: usize| -> Vec<f32> {
+        let mut v = Vec::with_capacity(n); let mut x = seed | 1;
+        for _ in 0..n { x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push(((x >> 9) as f32 / (1u32 << 23) as f32 - 1.0) * 0.05); }
+        v };
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let f32t = |w: &[f32]| (0u32, bytemuck::cast_slice::<f32, u8>(w).to_vec());
+    let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+    let mut push = |name: String, dims: Vec<u64>, w: Vec<f32>| {
+        let (t, by) = f32t(&w); ts.push((name, dims, t, by)); };
+    push("token_embd.weight".into(), mat(vocab, d), mk(11, vocab * d));
+    push("blk.0.attn_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("blk.0.attn_q_a.weight".into(), mat(q_lora, d), mk(21, q_lora * d));
+    push("blk.0.attn_q_a_norm.weight".into(), v1(q_lora), vec![1.0; q_lora]);
+    push("blk.0.attn_q_b.weight".into(), mat(heads * qk_head, q_lora), mk(22, heads * qk_head * q_lora));
+    push("blk.0.attn_kv_a_mqa.weight".into(), mat(kv_lora + rope, d), mk(23, (kv_lora + rope) * d));
+    push("blk.0.attn_kv_a_norm.weight".into(), v1(kv_lora), vec![1.0; kv_lora]);
+    push("blk.0.attn_kv_b.weight".into(), mat(heads * (nope + v_head), kv_lora), mk(24, heads * (nope + v_head) * kv_lora));
+    push("blk.0.attn_output.weight".into(), mat(d, heads * v_head), mk(25, d * heads * v_head));
+    push("blk.0.ffn_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("blk.0.ffn_gate.weight".into(), mat(h, d), mk(31, h * d));
+    push("blk.0.ffn_up.weight".into(), mat(h, d), mk(32, h * d));
+    push("blk.0.ffn_down.weight".into(), mat(d, h), mk(33, d * h));
+    push("output_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("output.weight".into(), mat(vocab, d), mk(41, vocab * d));
+
+    let mut offs = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, _, by) in &ts { offs.push(off); off = align32(off + by.len() as u64); }
+    let mut b = Vec::new();
+    let s = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 13);
+    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "deepseek2");
+    s(&mut b, "deepseek2.block_count"); u32b(&mut b, 4); u32b(&mut b, 1);
+    s(&mut b, "deepseek2.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, heads as u32);
+    s(&mut b, "deepseek2.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, heads as u32);
+    s(&mut b, "deepseek2.embedding_length"); u32b(&mut b, 4); u32b(&mut b, d as u32);
+    s(&mut b, "deepseek2.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, h as u32);
+    s(&mut b, "deepseek2.vocab_size"); u32b(&mut b, 4); u32b(&mut b, vocab as u32);
+    s(&mut b, "deepseek2.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, 10000.0);
+    s(&mut b, "deepseek2.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, 1e-5);
+    s(&mut b, "deepseek2.attention.kv_lora_rank"); u32b(&mut b, 4); u32b(&mut b, kv_lora as u32);
+    s(&mut b, "deepseek2.attention.q_lora_rank"); u32b(&mut b, 4); u32b(&mut b, q_lora as u32);
+    s(&mut b, "deepseek2.rope.dimension_count"); u32b(&mut b, 4); u32b(&mut b, rope as u32);
+    s(&mut b, "deepseek2.attention.key_length"); u32b(&mut b, 4); u32b(&mut b, qk_head as u32);
+    for (i, (name, dims, ty, _)) in ts.iter().enumerate() {
+        s(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, *ty); u64b(&mut b, offs[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, _, by)) in ts.iter().enumerate() {
+        while (b.len() as u64) < data_off + offs[i] { b.push(0); }
+        b.extend_from_slice(by);
+    }
+    b
+}
+
+/// Synthetic 2-layer qwen35moe HYBRID: blk.0 is Gated DeltaNet (attn_qkv at DeltaNet dims +
+/// attn_gate + the ssm_* set), blk.1 is plain attention with QK-Norm. Dense FFN on both — the
+/// MoE side of the family is proven by its own gates and would only pad this one.
+///
+/// blk.1's attn_q ships DOUBLE-WIDTH with the per-head [q|gate] interleave (gated attention,
+/// the real full-layer shape); what the fixture still deliberately omits is IMRoPE sections and
+/// the MoE side — named in archfeat / proven by other gates respectively.
+/// `shexp` selects the shared-expert-gate variant of blk.1's MoE FFN:
+///   0 — shared expert UNGATED (no ffn_gate_inp_shexp tensor; the GLM/DeepSeek shape)
+///   1 — gate present, all-zero weights: sigmoid(0) = 0.5 exactly, for every token
+///   2 — NO gate, but down_shexp pre-multiplied by 0.5
+/// Variants 1 and 2 must decode BIT-CLOSE to each other: scaling a linear map's output by 0.5
+/// equals scaling its weights by 0.5, and 0.5 is a power of two so even the fp rounding
+/// commutes. That equality is the algebraic proof the gate multiplies the right term with the
+/// right activation; 0-vs-1 differing proves the gate engages at all.
+/// `out_scale`: when Some(v), every block gains a blk.N.layer_output_scale.weight = [v] —
+/// the gemma4 per-layer output scalar, grafted here because tensors decide, not arch names,
+/// and this fixture exercises the ffn_apply funnel through its richest mix of paths
+/// (DeltaNet block, gated-attention MoE block). Some(1.0) must be an exact no-op.
+fn write_gguf_qwen35moe_hybrid(shexp: u8, out_scale: Option<f32>) -> Vec<u8> {
+    let (d, vocab, h) = (64usize, 32usize, 128usize);
+    let (heads, kvh, hd) = (4usize, 2usize, 16usize);          // blk.1 attention
+    let (sst, hk, hv, dconv) = (8usize, 2usize, 4usize, 4usize); // blk.0 deltanet
+    let (nexp, nused, ffe, sff) = (2usize, 1usize, 32usize, 32usize); // blk.1 MoE + shared
+    let (key_dim, value_dim) = (hk * sst, hv * sst);
+    let conv_dim = 2 * key_dim + value_dim;
+    let mk = |seed: u32, n: usize| -> Vec<f32> {
+        let mut v = Vec::with_capacity(n); let mut x = seed | 1;
+        for _ in 0..n { x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push(((x >> 9) as f32 / (1u32 << 23) as f32 - 1.0) * 0.05); }
+        v };
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let f32t = |w: &[f32]| (0u32, bytemuck::cast_slice::<f32, u8>(w).to_vec());
+    let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+    let mut push = |name: String, dims: Vec<u64>, w: Vec<f32>| {
+        let (t, by) = f32t(&w); ts.push((name, dims, t, by)); };
+    push("token_embd.weight".into(), mat(vocab, d), mk(11, vocab * d));
+    // blk.0 — Gated DeltaNet
+    push("blk.0.attn_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("blk.0.attn_qkv.weight".into(), mat(conv_dim, d), mk(21, conv_dim * d));
+    push("blk.0.attn_gate.weight".into(), mat(value_dim, d), mk(22, value_dim * d));
+    push("blk.0.ssm_conv1d.weight".into(), vec![dconv as u64, conv_dim as u64], mk(23, conv_dim * dconv));
+    push("blk.0.ssm_dt.bias".into(), v1(hv), vec![0.1; hv]);
+    push("blk.0.ssm_a".into(), v1(hv), vec![-0.7; hv]);   // stores −exp(A_log): MUST be ≤ 0
+    push("blk.0.ssm_beta.weight".into(), mat(hv, d), mk(24, hv * d));
+    push("blk.0.ssm_alpha.weight".into(), mat(hv, d), mk(25, hv * d));
+    push("blk.0.ssm_norm.weight".into(), v1(sst), vec![1.0; sst]);
+    push("blk.0.ssm_out.weight".into(), mat(d, value_dim), mk(26, d * value_dim));
+    push("blk.0.post_attention_norm.weight".into(), v1(d), vec![1.0; d]); // the family's pre-FFN norm name
+    push("blk.0.ffn_gate.weight".into(), mat(h, d), mk(31, h * d));
+    push("blk.0.ffn_up.weight".into(), mat(h, d), mk(32, h * d));
+    push("blk.0.ffn_down.weight".into(), mat(d, h), mk(33, d * h));
+    // blk.1 — GATED attention with QK-Norm: attn_q ships DOUBLE-WIDTH with the per-head
+    // [q‖gate] interleave, exactly the qwen35moe full-attention shape.
+    push("blk.1.attn_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("blk.1.attn_q.weight".into(), mat(heads * hd * 2, d), mk(41, heads * hd * 2 * d));
+    push("blk.1.attn_k.weight".into(), mat(kvh * hd, d), mk(42, kvh * hd * d));
+    push("blk.1.attn_v.weight".into(), mat(kvh * hd, d), mk(43, kvh * hd * d));
+    push("blk.1.attn_output.weight".into(), mat(d, heads * hd), mk(44, d * heads * hd));
+    push("blk.1.attn_q_norm.weight".into(), v1(hd), vec![1.0; hd]);
+    push("blk.1.attn_k_norm.weight".into(), v1(hd), vec![1.0; hd]);
+    push("blk.1.post_attention_norm.weight".into(), v1(d), vec![1.0; d]);
+    // blk.1 FFN is MoE + shared expert, the real family's shape (blk.0 stays dense so BOTH FFN
+    // forms ride through the hybrid decode). 3D expert dims in GGUF order [d, ff, n_expert].
+    push("blk.1.ffn_gate_inp.weight".into(), mat(nexp, d), mk(50, nexp * d));
+    push("blk.1.ffn_gate_exps.weight".into(), vec![d as u64, ffe as u64, nexp as u64], mk(51, nexp * ffe * d));
+    push("blk.1.ffn_up_exps.weight".into(), vec![d as u64, ffe as u64, nexp as u64], mk(52, nexp * ffe * d));
+    push("blk.1.ffn_down_exps.weight".into(), vec![ffe as u64, d as u64, nexp as u64], mk(53, nexp * d * ffe));
+    push("blk.1.ffn_gate_shexp.weight".into(), mat(sff, d), mk(54, sff * d));
+    push("blk.1.ffn_up_shexp.weight".into(), mat(sff, d), mk(55, sff * d));
+    let dsh = mk(56, d * sff);
+    push("blk.1.ffn_down_shexp.weight".into(), mat(d, sff),
+         if shexp == 2 { dsh.iter().map(|v| v * 0.5).collect() } else { dsh });
+    if shexp == 1 { push("blk.1.ffn_gate_inp_shexp.weight".into(), v1(d), vec![0.0; d]); }
+    if let Some(v) = out_scale {
+        push("blk.0.layer_output_scale.weight".into(), v1(1), vec![v]);
+        push("blk.1.layer_output_scale.weight".into(), v1(1), vec![v]);
+    }
+    push("output_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("output.weight".into(), mat(vocab, d), mk(61, vocab * d));
+
+    let mut offs = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, _, by) in &ts { offs.push(off); off = align32(off + by.len() as u64); }
+    let mut b = Vec::new();
+    let sput = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 16);
+    sput(&mut b, "general.architecture"); u32b(&mut b, 8); sput(&mut b, "qwen35moe");
+    sput(&mut b, "qwen35moe.block_count"); u32b(&mut b, 4); u32b(&mut b, 2);
+    sput(&mut b, "qwen35moe.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, heads as u32);
+    sput(&mut b, "qwen35moe.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, kvh as u32);
+    sput(&mut b, "qwen35moe.embedding_length"); u32b(&mut b, 4); u32b(&mut b, d as u32);
+    sput(&mut b, "qwen35moe.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, h as u32);
+    sput(&mut b, "qwen35moe.vocab_size"); u32b(&mut b, 4); u32b(&mut b, vocab as u32);
+    sput(&mut b, "qwen35moe.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, 10000.0);
+    sput(&mut b, "qwen35moe.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, 1e-5);
+    sput(&mut b, "qwen35moe.ssm.conv_kernel"); u32b(&mut b, 4); u32b(&mut b, dconv as u32);
+    sput(&mut b, "qwen35moe.ssm.state_size"); u32b(&mut b, 4); u32b(&mut b, sst as u32);
+    sput(&mut b, "qwen35moe.ssm.group_count"); u32b(&mut b, 4); u32b(&mut b, hk as u32);
+    sput(&mut b, "qwen35moe.ssm.time_step_rank"); u32b(&mut b, 4); u32b(&mut b, hv as u32);
+    sput(&mut b, "qwen35moe.expert_count"); u32b(&mut b, 4); u32b(&mut b, nexp as u32);
+    sput(&mut b, "qwen35moe.expert_used_count"); u32b(&mut b, 4); u32b(&mut b, nused as u32);
+    sput(&mut b, "qwen35moe.expert_feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, ffe as u32);
+    for (i, (name, dims, ty, _)) in ts.iter().enumerate() {
+        sput(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, *ty); u64b(&mut b, offs[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, _, by)) in ts.iter().enumerate() {
+        while (b.len() as u64) < data_off + offs[i] { b.push(0); }
+        b.extend_from_slice(by);
+    }
+    b
+}
+
+/// Synthetic gemma4 pair for V-from-K: blk.0 ships attn_v (exercising the family's ALWAYS-ON
+/// weightless per-head V norm), blk.1 ships NO attn_v — V comes from the raw k projection.
+/// `twin=true` instead gives blk.1 an explicit attn_v whose weights are BYTE-IDENTICAL to its
+/// attn_k (same rng seed). Because the weightless V norm applies to either source, the twin must
+/// decode BIT-EQUAL to the no-attn_v form: v = norm(wk·n1) both ways, same kernel, same weights.
+/// That equality is the proof the alt path reads the right source at the right point (pre-k_norm,
+/// pre-rope). Norms are ZEROS where the loader gemma-folds (1+0 = neutral) and ONES where it
+/// doesn't (q/k norms); post-attention/post-ffw norms are deliberately absent so BOTH decode arms
+/// (fused and unfused) stay reachable and the cross-check compares two real implementations.
+fn write_gguf_gemma4_altv(twin: bool) -> Vec<u8> {
+    let (d, vocab, h) = (64usize, 32usize, 128usize);
+    let (heads, kvh, hd) = (4usize, 2usize, 16usize);
+    let mk = |seed: u32, n: usize| -> Vec<f32> {
+        let mut v = Vec::with_capacity(n); let mut x = seed | 1;
+        for _ in 0..n { x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push(((x >> 9) as f32 / (1u32 << 23) as f32 - 1.0) * 0.05); }
+        v };
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+    let mut push = |name: String, dims: Vec<u64>, w: Vec<f32>| {
+        ts.push((name, dims, 0u32, bytemuck::cast_slice::<f32, u8>(&w).to_vec())); };
+    push("token_embd.weight".into(), mat(vocab, d), mk(11, vocab * d));
+    for b in 0..2usize {
+        push(format!("blk.{b}.attn_norm.weight"), v1(d), vec![1e-3; d]); // gemma-folded: 1+w; nonzero so the all-zeros corruption check stays quiet
+        push(format!("blk.{b}.attn_q.weight"), mat(heads * hd, d), mk(20 + b as u32, heads * hd * d));
+        push(format!("blk.{b}.attn_k.weight"), mat(kvh * hd, d), mk(40 + b as u32, kvh * hd * d));
+        if b == 0 { push("blk.0.attn_v.weight".into(), mat(kvh * hd, d), mk(60, kvh * hd * d)); }
+        else if twin { push("blk.1.attn_v.weight".into(), mat(kvh * hd, d), mk(41, kvh * hd * d)); } // = blk.1 attn_k's seed
+        push(format!("blk.{b}.attn_output.weight"), mat(d, heads * hd), mk(80 + b as u32, d * heads * hd));
+        push(format!("blk.{b}.attn_q_norm.weight"), v1(hd), vec![1.0; hd]);
+        push(format!("blk.{b}.attn_k_norm.weight"), v1(hd), vec![1.0; hd]);
+        push(format!("blk.{b}.ffn_norm.weight"), v1(d), vec![1e-3; d]);
+        push(format!("blk.{b}.ffn_gate.weight"), mat(h, d), mk(100 + b as u32, h * d));
+        push(format!("blk.{b}.ffn_up.weight"), mat(h, d), mk(120 + b as u32, h * d));
+        push(format!("blk.{b}.ffn_down.weight"), mat(d, h), mk(140 + b as u32, d * h));
+    }
+    push("output_norm.weight".into(), v1(d), vec![1e-3; d]);
+    push("output.weight".into(), mat(vocab, d), mk(160, vocab * d));
+    let mut offs = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, _, by) in &ts { offs.push(off); off = align32(off + by.len() as u64); }
+    let mut b = Vec::new();
+    let sput = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 8);
+    sput(&mut b, "general.architecture"); u32b(&mut b, 8); sput(&mut b, "gemma4");
+    sput(&mut b, "gemma4.block_count"); u32b(&mut b, 4); u32b(&mut b, 2);
+    sput(&mut b, "gemma4.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, heads as u32);
+    sput(&mut b, "gemma4.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, kvh as u32);
+    sput(&mut b, "gemma4.embedding_length"); u32b(&mut b, 4); u32b(&mut b, d as u32);
+    sput(&mut b, "gemma4.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, h as u32);
+    sput(&mut b, "gemma4.vocab_size"); u32b(&mut b, 4); u32b(&mut b, vocab as u32);
+    sput(&mut b, "gemma4.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, 1e-5);
+    for (i, (name, dims, ty, _)) in ts.iter().enumerate() {
+        sput(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, *ty); u64b(&mut b, offs[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, _, by)) in ts.iter().enumerate() {
+        while (b.len() as u64) < data_off + offs[i] { b.push(0); }
+        b.extend_from_slice(by);
+    }
+    b
+}
+
 /// Serialize a HostModel as a q8_0 GGUF (weights as q8_0 type-8; norms/embed/biases f32). For
 /// --gate-q8direct, to exercise the loader's direct q8_0 → resident path end-to-end.
 fn write_gguf_q8_0(m: &HostModel) -> Vec<u8> {
@@ -1204,7 +1471,13 @@ fn main() {
         // the same regardless of input token, the forward is ignoring its input (embedding
         // /residual/attention) rather than just being low-quality.
         for &t in &[791u32, 9822, 6342, 40, 1] {
-            let c = gpu.new_cache(m.n_layers, 2, m.kv_dim());
+            // Tiny synthetic fixtures have vocabs smaller than these ids; out-of-range panics in
+            // embed lookup say nothing about the model. Fold into range, keep ids distinct mod v.
+            let t = t % m.vocab as u32;
+            // Model-aware: attaches the MLA latent cache when the model needs it. The raw
+            // new_cache() here was the exact second-half bug --gate-mla-load's history records
+            // (c.mla=None silently drops MLA layers to the dense path).
+            let c = gpu.new_cache_for(&m, 2);
             let logits = gpu.decode_step(&m, &c, t, 0);
             let finite = logits.iter().all(|x| x.is_finite());
             let (mn, mx) = logits.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
@@ -1215,7 +1488,8 @@ fn main() {
         // collapse/explosion at layer k localizes the fault to that block with real weights.
         // If this trace looks healthy but decode_step above is washed out, the bug is in the
         // KV/decode path, not the forward math.
-        let probe_ids = [1u32, 791, 9822, 6342]; // valid for both 49k and 128k vocabs
+        let probe_ids: Vec<u32> = [1u32, 791, 9822, 6342] // valid for 49k/128k vocabs; folded for tiny fixtures
+            .iter().map(|&t| t % m.vocab as u32).collect();
         // Is the llama3 rope scaling actually loaded? Dump the factors; all-ones means the
         // `rope_freqs.weight` tensor silently fell back (e.g. a length check missed), which
         // would corrupt every layer's attention — the one structural thing the 1B has and
@@ -1224,6 +1498,12 @@ fn main() {
         let (rmn, rmx) = rf.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
         let all_ones = rf.iter().all(|&x| (x - 1.0).abs() < 1e-6);
         eprintln!("rope_factors: len={} range=[{rmn:.4},{rmx:.4}] all_ones={all_ones}", rf.len());
+        if m.mla_layers() > 0 || m.deltanet_layers() > 0 {
+            eprintln!("per-block trace SKIPPED: {} of {} layers are MLA and {} are Gated DeltaNet; \
+the trace's dense math has a path for neither (decode-only for now). The decode probes above are \
+the signal for these models.", m.mla_layers(), m.n_layers, m.deltanet_layers());
+            return;
+        }
         eprintln!("per-block sub-step trace, ids={probe_ids:?} (n1/n2 = post-norm input scale; attn_out/ffn_out = each block's contribution):");
         let logits = gpu.model_forward_trace(&m, &probe_ids, m.rope_factors());
         eprintln!("    final logits top3 = {:?}", top(&logits[logits.len() - m.vocab..], 3));
@@ -3269,7 +3549,7 @@ fn main() {
         let n2t = gpu.upload(&n2v, 1, d); let x2t = gpu.upload(&xin, 1, d);
         // streaming auto-forces the v1 path (its intercept lives there); resident uses V1 too for A/B parity.
         std::env::set_var("LOGSCOPE_MOE_V1", "1");
-        let resident = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+        let resident = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
             router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
             gate_up: gus.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, 2 * ff, d))).collect(),
             down: dns.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, d, ff))).collect(),
@@ -3282,7 +3562,7 @@ fn main() {
         // streaming layer at several pin levels: 0 (all streamed), 4 (half pinned), 8 (all pinned)
         for pin in [0usize, 4, ne] {
             let stream = gpu.build_moe_stream_from_weights(&gus, &dns, ff, d, n_used, pin);
-            let streaming = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+            let streaming = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
                 router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
                 gate_up: gus.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, 2 * ff, d))).collect(),
                 down: dns.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, d, ff))).collect(),
@@ -3353,7 +3633,7 @@ fn main() {
             let layers: Vec<gpu_kernels::MoeLayer> = (0..2).map(|l| {
                 let mut st = gpu.build_moe_stream_ring(&gus[l], &dns[l], ff, d, n_used, 0, Some(ring));
                 st.layer = l; // cross-layer coupling key
-                gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+                gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
                     router: gpu_kernels::Lin::f32(gpu.upload(&rw[l], ne, d)),
                     gate_up: Vec::new(), down: Vec::new(),
                     stacked_gu: gpu_kernels::Lin::f32(gpu.upload(&vec![0.0f32; 32], 1, 32)),
@@ -3441,7 +3721,7 @@ fn main() {
         let run = |repin: bool| -> (Vec<f32>, u64, u64, u64, Vec<u32>) {
             if repin { std::env::remove_var("LOGSCOPE_MOE_NOREPIN"); } else { std::env::set_var("LOGSCOPE_MOE_NOREPIN", "1"); }
             let st = gpu.build_moe_stream_ring(&gus, &dns, ff, d, n_used, pin, Some(ring));
-            let layer = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+            let layer = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
                 router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
                 gate_up: Vec::new(), down: Vec::new(),
                 stacked_gu: gpu_kernels::Lin::f32(gpu.upload(&vec![0.0f32; 32], 1, 32)),
@@ -5078,7 +5358,7 @@ reproducible in software and not a fault.", raw_diff - diff);
         let xin: Vec<f32> = (0..d).map(|i| ((i as f32) * 0.023).cos()).collect();
 
         let run = |stream: gpu_kernels::MoeStream| -> Vec<f32> {
-            let layer = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+            let layer = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
                 router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
                 gate_up: Vec::new(), down: Vec::new(),
                 stacked_gu: gpu_kernels::Lin::f32(gpu.upload(&vec![0.0f32; 32], 1, 32)),
@@ -5169,7 +5449,7 @@ reproducible in software and not a fault.", raw_diff - diff);
             // hunting a bug in correct code.
             for r in 0..d { want[r] += xin[r]; }
             // ---- GPU ----
-            let layer = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+            let layer = gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
                 router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
                 gate_up: gus.iter().map(|w| gpu_kernels::Lin::f32(gpu.upload(w, 2 * ff, d))).collect(),
                 down: dns.iter().map(|w| gpu_kernels::Lin::f32(gpu.upload(w, d, ff))).collect(),
@@ -5212,7 +5492,7 @@ still pass, which is why this one exists."
 
         // Build with a SHARED expert too — Llama-4 and GLM have one, and a fusion that mishandles the
         // shared path would only show on those models.
-        let build = |shared: bool| gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+        let build = |shared: bool| gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
             router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
             gate_up: gus.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, 2 * ff, d))).collect(),
             down: dns.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, d, ff))).collect(),
@@ -5379,6 +5659,325 @@ still pass, which is why this one exists."
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--profile-hybrid-dispatch") {
+        // PER-TOKEN DISPATCH PROFILE of the hybrid decode — the measure-first tool for dispatch
+        // reduction. Timings on this adapter are meaningless; dispatch COUNTS are the
+        // hardware-independent cost model (Asahi decode is dispatch-bound per the bind-group
+        // cache work). Three warm tokens build every pipeline; the fourth token's histogram
+        // delta is one steady-state token, printed per shader, sorted.
+        std::env::set_var("LOGSCOPE_DISPATCH_HIST", "1");
+        std::env::set_var("LOGSCOPE_TRY_UNSUPPORTED_ARCH", "1");
+        let gpu = Gpu::new();
+        eprintln!("profile-hybrid-dispatch: adapter = {}", gpu.adapter_name);
+        let profile = |label: &str, quantized: bool| {
+            let bytes = write_gguf_qwen35moe_hybrid(1, None);
+            let m = if quantized { gpu.load_gguf_quantized(&bytes) } else { gpu.load_gguf(&bytes) }
+                .expect("hybrid load");
+            let c = gpu.new_cache_for(&m, 8);
+            for (p, t) in [1u32, 5, 9].iter().enumerate() { let _ = gpu.decode_step(&m, &c, *t, p); }
+            let before: std::collections::HashMap<usize, u64> = gpu_kernels::dispatch_histogram().into_iter().collect();
+            let s0 = gpu_kernels::SubmitCauseSnapshot::now();
+            let _ = gpu.decode_step(&m, &c, 2, 3);
+            let dls = gpu_kernels::SubmitCauseSnapshot::now().downloads_since(&s0);
+            let mut delta: Vec<(String, u64)> = gpu_kernels::dispatch_histogram().into_iter()
+                .map(|(id, n)| {
+                    let d = n - before.get(&id).copied().unwrap_or(0);
+                    (gpu_kernels::shader_label(id).unwrap_or_else(|| format!("{id:#x}")), d)
+                })
+                .filter(|(_, d)| *d > 0)
+                .collect();
+            delta.sort_by(|a, b| b.1.cmp(&a.1));
+            let total: u64 = delta.iter().map(|(_, d)| d).sum();
+            println!("{label}: {total} dispatches, {dls} download-submits");
+            for (l, d) in &delta { println!("  {d:>3}  {l}"); }
+        };
+        println!("one steady-state token of the 2-layer hybrid (blk.0 DeltaNet, blk.1 gated-attn MoE+shexp)");
+        profile("F32 load", false);
+        profile("QUANTIZED load", true);
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-gemma4-altv") {
+        // Gemma 4's V handling: the ALWAYS-ON weightless per-head V norm, and V sourced from the
+        // raw k projection on blocks without attn_v. The proof is the TWIN equality documented on
+        // the fixture writer: attn_v-with-k's-weights must decode BIT-EQUAL to no-attn_v-at-all,
+        // because the family's V norm applies to either source and the source values coincide.
+        std::env::set_var("LOGSCOPE_TRY_UNSUPPORTED_ARCH", "1");
+        let gpu = Gpu::new();
+        eprintln!("gate-gemma4-altv: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let l3 = |bts: &[u8]| -> Vec<f32> {
+            let mm = gpu.load_gguf(bts).expect("gemma4 altv load");
+            let cc = gpu.new_cache_for(&mm, 8);
+            let mut lg = Vec::new();
+            for (p, t) in [1u32, 5, 9, 2].iter().enumerate() { lg = gpu.decode_step(&mm, &cc, *t, p); }
+            lg
+        };
+        match gpu.load_gguf(&write_gguf_gemma4_altv(false)) {
+            Err(e) => ck(&format!("gemma4 without blk.1 attn_v loads — {e}"), false),
+            Ok(m) => {
+                ck("gemma4 without blk.1 attn_v loads", true);
+                let c = gpu.new_cache_for(&m, 8);
+                let mut fin = true; let mut lg = Vec::new();
+                for (p, t) in [1u32, 5, 9, 2].iter().enumerate() { lg = gpu.decode_step(&m, &c, *t, p); fin &= lg.iter().all(|x| x.is_finite()); }
+                ck("4-token decode with V-from-K is finite", fin);
+                let c2 = gpu.new_cache_for(&m, 8);
+                let _ = gpu.decode_step(&m, &c2, 1, 0);
+                let alt = gpu.decode_step(&m, &c2, 7, 1);
+                ck("logits are input-sensitive", alt.iter().zip(gpu.decode_step(&m, &c2, 3, 2).iter()).any(|(a, b)| a != b));
+            }
+        }
+        let la = l3(&write_gguf_gemma4_altv(false));
+        let lt = l3(&write_gguf_gemma4_altv(true));
+        let dt = la.iter().zip(&lt).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck(&format!("V-from-K equals an explicit attn_v carrying k's weights (max |\u{394}| = {dt:.2e})"), dt == 0.0);
+        // Fused and unfused implement the V handling independently (norm_apply'd packed slice vs
+        // a bound k_raw) — their agreement is the same discriminator that caught the
+        // post_attention_norm double-load.
+        std::env::set_var("LOGSCOPE_FUSED_QKV", "0");
+        let lu = l3(&write_gguf_gemma4_altv(false));
+        std::env::remove_var("LOGSCOPE_FUSED_QKV");
+        let df = la.iter().zip(&lu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck(&format!("fused and unfused V-from-K agree (max |\u{394}| = {df:.2e})"), df < 1e-5);
+        println!("gate-gemma4-altv: {}", if ok { "V-from-K + weightless V norm \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-outscale") {
+        // Gemma 4's layer_output_scale, applied at the ONE funnel every block fn tail-calls
+        // (ffn_apply). Proven on the hybrid fixture so the funnel is exercised through the
+        // DeltaNet block AND the gated-attention MoE block in the same decode:
+        //   - scale 1.0 must equal NO scale BIT-EXACTLY (f32 multiply by 1.0 is exact, and the
+        //     wrapper adds no other op) — placement side-effects would break this;
+        //   - scale 0.5 must CHANGE the logits (applied to layer 0's output, it perturbs layer
+        //     1's attention nonlinearly; note the LAST layer's scale alone would be invisible —
+        //     the final rmsnorm is scale-invariant — which is why both layers carry the tensor
+        //     but the check leans on the inter-layer effect).
+        std::env::set_var("LOGSCOPE_TRY_UNSUPPORTED_ARCH", "1");
+        let gpu = Gpu::new();
+        eprintln!("gate-outscale: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let l3 = |bts: &[u8]| -> Vec<f32> {
+            let mm = gpu.load_gguf(bts).expect("outscale variant load");
+            let cc = gpu.new_cache_for(&mm, 8);
+            let mut lg = Vec::new();
+            for (p, t) in [1u32, 5, 9].iter().enumerate() { lg = gpu.decode_step(&mm, &cc, *t, p); }
+            lg
+        };
+        let base = l3(&write_gguf_qwen35moe_hybrid(1, None));
+        let one  = l3(&write_gguf_qwen35moe_hybrid(1, Some(1.0)));
+        let half = l3(&write_gguf_qwen35moe_hybrid(1, Some(0.5)));
+        let d1 = base.iter().zip(&one).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck(&format!("out_scale = 1.0 is an exact no-op (max |\u{394}| = {d1:.2e})"), d1 == 0.0);
+        let dh = base.iter().zip(&half).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck(&format!("out_scale = 0.5 changes the output (max |\u{394}| = {dh:.2e})"), dh > 1e-4);
+        println!("gate-outscale: {}", if ok { "layer_output_scale applies at the funnel \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-deltanet-load") {
+        // The hybrid load + decode gate: a qwen35moe checkpoint whose blk.0 is Gated DeltaNet
+        // and blk.1 plain attention must load (recurrent set to the CPU-routed mixer, dense
+        // fields to placeholders), decode finite and input-sensitive logits through BOTH layer
+        // kinds, and REFUSE a position seek on the recurrent state. The recurrence math itself
+        // is covered by deltanet.rs's tests; THIS gate is the loader routing + cache + decode
+        // wiring around it.
+        //
+        // qwen35moe stays declared-unsupported (synthetics never flip the flag), so the env
+        // opt-in is set for this single-purpose process, exactly like --gate-mla-load.
+        std::env::set_var("LOGSCOPE_TRY_UNSUPPORTED_ARCH", "1");
+        let gpu = Gpu::new();
+        eprintln!("gate-deltanet-load: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let bytes = write_gguf_qwen35moe_hybrid(1, None); // gated shared expert in the main flow
+        if std::env::var("LOGSCOPE_DUMP_FIXTURE").is_ok() { std::fs::write("/tmp/hyb.gguf", &bytes).unwrap(); }
+        match gpu.load_gguf_quantized(&bytes) {
+            Err(e) => ck(&format!("hybrid gguf loads — {e}"), false),
+            Ok(m) => {
+                ck("hybrid gguf loads", true);
+                ck("exactly blk.0 carries the DeltaNet mixer", m.deltanet_layers() == 1);
+                ck("blk.1's double-width q was split: the attention output is GATED",
+                   m.gated_attn_layers() == 1);
+                let c = gpu.new_cache_for(&m, 8); // attaches the per-layer recurrent states
+                let mut finite = true;
+                let mut logits_by_tok: Vec<Vec<f32>> = Vec::new();
+                for (p, t) in [1u32, 5, 9, 2].iter().enumerate() {
+                    let logits = gpu.decode_step(&m, &c, *t, p);
+                    finite &= logits.iter().all(|x| x.is_finite());
+                    logits_by_tok.push(logits);
+                }
+                ck("4-token decode through DeltaNet + attention layers is finite", finite);
+                // Input sensitivity ACROSS a fresh cache: same first token, different second —
+                // the recurrent state must make position 2 differ.
+                let c2 = gpu.new_cache_for(&m, 8);
+                let _ = gpu.decode_step(&m, &c2, 1, 0);
+                let alt = gpu.decode_step(&m, &c2, 7, 1);
+                let base = &logits_by_tok[1];
+                let diff = alt.iter().zip(base).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                ck("logits are input-sensitive through the recurrent state", diff > 1e-6);
+                // CROSS-CHECK the two gate implementations against each other: the unfused path
+                // computes the gate from an explicit n1 (block_decode), the fused path folds the
+                // norm into the gate matvec (block_decode_fused's norm_apply). They share no gate
+                // code, so agreement here discriminates a wrong gate in either — a missing or
+                // mis-normed sigmoid shifts whole heads, far outside fp reordering noise.
+                {
+                    // On the F32 load: under the quantized loader the two routes quantize the
+                    // gate's input activation at different points (apply(n1) vs norm_apply), a
+                    // legitimate ~1e-3 difference that would drown the signal. f32 removes it, so
+                    // any residual disagreement IS gate math. (Measured: quantized 1.78e-3, f32
+                    // below 1e-5 — which is also what located the quantization explanation.)
+                    let mf = gpu.load_gguf(&bytes).expect("f32 load for the cross-check");
+                    let m = &mf;
+                    std::env::set_var("LOGSCOPE_FUSED_QKV", "0");
+                    let ca = gpu.new_cache_for(&m, 8);
+                    let mut all_a: Vec<Vec<f32>> = Vec::new();
+                    for (p, t) in [1u32, 5, 9].iter().enumerate() { all_a.push(gpu.decode_step(m, &ca, *t, p)); }
+                    std::env::set_var("LOGSCOPE_FUSED_QKV", "1");
+                    let cb = gpu.new_cache_for(&m, 8);
+                    let mut all_b: Vec<Vec<f32>> = Vec::new();
+                    for (p, t) in [1u32, 5, 9].iter().enumerate() { all_b.push(gpu.decode_step(m, &cb, *t, p)); }
+                    for (i, (x, y)) in all_a.iter().zip(&all_b).enumerate() {
+                        let dm = x.iter().zip(y).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                        eprintln!("cross-check token {i}: max |Δ| = {dm:.2e}");
+                    }
+                    let la = all_a.pop().unwrap(); let lb = all_b.pop().unwrap();
+                    // CONTROL: same env, fresh cache, decode again — any la/lc difference is
+                    // run-to-run nondeterminism, not a fused-vs-unfused property.
+                    std::env::set_var("LOGSCOPE_FUSED_QKV", "0");
+                    let cc = gpu.new_cache_for(&m, 8);
+                    let mut lc = Vec::new();
+                    for (p, t) in [1u32, 5, 9].iter().enumerate() { lc = gpu.decode_step(m, &cc, *t, p); }
+                    std::env::remove_var("LOGSCOPE_FUSED_QKV");
+                    let cmax = la.iter().zip(&lc).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    eprintln!("cross-check control: same-env repeat max |Δ| = {cmax:.2e}; la[0..4]={:?}", &la[..4]);
+                    let dmax = la.iter().zip(&lb).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    ck(&format!("fused and unfused GATED paths agree (max |Δ| = {dmax:.2e})"), dmax < 1e-4);
+                }
+                // GPU vs CPU DELTANET: the GPU path (stacked projection + DELTANET_CONV +
+                // DELTANET_STEP, zero host round-trips) against the CPU oracle it transcribes —
+                // logits per token AND the final recurrent state (ring + S), on the f32 load so
+                // activation-quantization differences don't mask kernel bugs. The state compare
+                // is the localizer: logits agreeing with state drifting would mean compensating
+                // errors; state agreeing pins any logits gap outside the mixer.
+                {
+                    let mf = gpu.load_gguf(&bytes).expect("f32 load for deltanet gpu/cpu");
+                    let toks = [1u32, 5, 9, 2];
+                    let cg = gpu.new_cache_for(&mf, 8);
+                    let mut lg_g: Vec<Vec<f32>> = Vec::new();
+                    for (p, t) in toks.iter().enumerate() { lg_g.push(gpu.decode_step(&mf, &cg, *t, p)); }
+                    std::env::set_var("LOGSCOPE_DELTANET_CPU", "1");
+                    let cc = gpu.new_cache_for(&mf, 8);
+                    let mut lg_c: Vec<Vec<f32>> = Vec::new();
+                    for (p, t) in toks.iter().enumerate() { lg_c.push(gpu.decode_step(&mf, &cc, *t, p)); }
+                    std::env::remove_var("LOGSCOPE_DELTANET_CPU");
+                    let dmax = lg_g.iter().flatten().zip(lg_c.iter().flatten())
+                        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    ck(&format!("GPU DeltaNet matches the CPU oracle over 4 tokens (max |\u{394}| = {dmax:.2e})"), dmax < 1e-4);
+                    let sg = cg.deltanet_gpu.as_ref().unwrap()[0].as_ref().unwrap();
+                    let sc = cc.deltanet.as_ref().unwrap()[0].as_ref().unwrap().lock().unwrap();
+                    let ring_g = gpu.download(&sg.ring);
+                    let s_g = gpu.download(&sg.s);
+                    let dr = ring_g.iter().zip(&sc.ring).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    let ds = s_g.iter().zip(&sc.s).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    ck(&format!("final recurrent STATE matches (ring |\u{394}| = {dr:.2e}, S |\u{394}| = {ds:.2e})"),
+                       dr < 1e-4 && ds < 1e-4);
+                }
+                // THE TOK/SEC CLAIM, AS A COUNTER: the CPU-routed mixer pays a mid-decode
+                // download per recurrent layer per token (each one a queue-draining submit+poll —
+                // the sync class the Asahi MoE-v1 measurements put at ~90% of decode wall time).
+                // The GPU path must pay ZERO beyond the one logits readback per token. Counted,
+                // not asserted from theory: 4 tokens × 1 recurrent layer ⇒ CPU ≥ 8 download-
+                // submits (mixer + logits each token), GPU exactly 4.
+                {
+                    let mf = gpu.load_gguf(&bytes).expect("f32 load for the sync count");
+                    let toks = [1u32, 5, 9, 2];
+                    let cg = gpu.new_cache_for(&mf, 8);
+                    let s0 = gpu_kernels::SubmitCauseSnapshot::now();
+                    for (p, t) in toks.iter().enumerate() { let _ = gpu.decode_step(&mf, &cg, *t, p); }
+                    let gpu_dl = gpu_kernels::SubmitCauseSnapshot::now().downloads_since(&s0);
+                    std::env::set_var("LOGSCOPE_DELTANET_CPU", "1");
+                    let cc = gpu.new_cache_for(&mf, 8);
+                    let s1 = gpu_kernels::SubmitCauseSnapshot::now();
+                    for (p, t) in toks.iter().enumerate() { let _ = gpu.decode_step(&mf, &cc, *t, p); }
+                    let cpu_dl = gpu_kernels::SubmitCauseSnapshot::now().downloads_since(&s1);
+                    std::env::remove_var("LOGSCOPE_DELTANET_CPU");
+                    // Exactly the 4 mixer downloads (1 recurrent layer x 4 tokens) must vanish.
+                    // CORRECTED RECORD: the residual 2/token on this F32 load is logits + the MoE
+                    // v1 ROUTER READBACK — the expert-indexed v2 kernels are quantized-only, so
+                    // f32 loads route v1. (A previous commit blamed counter double-tallying; the
+                    // named dispatch profiler showed GATHER_ROWS/SCATTER_ADD_W and settled it.)
+                    // Quantized loads run v2 and pay logits alone. The relative assertion is
+                    // immune either way.
+                    ck(&format!("GPU DeltaNet removes the per-layer sync ({gpu_dl} download-submits vs {cpu_dl} CPU-routed over 4 tokens)"),
+                       gpu_dl + 4 == cpu_dl);
+                }
+                // GATED SHARED EXPERT, algebraically: an all-zero gate makes sigmoid(0) = 0.5
+                // exactly for every token, and halving a linear map's output equals halving its
+                // weights (0.5 is a power of two, so the fp rounding commutes row by row). So
+                // variant 1 (zero gate) must match variant 2 (pre-halved down_shexp, NO gate)
+                // through the full decode — if the sigmoid ran on the wrong term, wrong input, or
+                // wrong activation, this equality breaks. Variant 0 (ungated) differing from 1
+                // proves the gate engages at all. f32 loads: quantization would break exactness.
+                {
+                    let l3 = |bts: &[u8]| -> Vec<f32> {
+                        let mm = gpu.load_gguf(bts).expect("shexp variant load");
+                        let cc = gpu.new_cache_for(&mm, 8);
+                        let mut lg = Vec::new();
+                        for (p, t) in [1u32, 5, 9].iter().enumerate() { lg = gpu.decode_step(&mm, &cc, *t, p); }
+                        lg
+                    };
+                    let (l0, l1, l2) = (l3(&write_gguf_qwen35moe_hybrid(0, None)),
+                                        l3(&write_gguf_qwen35moe_hybrid(1, None)),
+                                        l3(&write_gguf_qwen35moe_hybrid(2, None)));
+                    let d12 = l1.iter().zip(&l2).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    ck(&format!("sigmoid(0)-gated shared expert equals a pre-halved one (max |Δ| = {d12:.2e})"), d12 < 1e-5);
+                    let d01 = l0.iter().zip(&l1).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    ck(&format!("the shared-expert gate ENGAGES (ungated vs gated |Δ| = {d01:.2e})"), d01 > 1e-4);
+                }
+                // Seek refusal: the recurrent state is at pos 2 in c2; asking for pos 5 must
+                // panic with the sequential-positions message, not silently continue.
+                let seek = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = gpu.decode_step(&m, &c2, 3, 5);
+                }));
+                ck("a position SEEK on the recurrent state is refused", seek.is_err());
+            }
+        }
+        println!("gate-deltanet-load: {}", if ok { "hybrid DeltaNet loads + decodes \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-mla-load") {
+        // Regression for the GLM-4.7-Flash load failure: a q-compressed MLA checkpoint
+        // (q_lora_rank > 0) has NO blk.N.attn_q/k/v — the loader must take the MLA
+        // tensor set instead of failing with "missing tensor blk.0.attn_q.weight".
+        // The math is covered by --gate-mla-block; THIS gate is about the loader's
+        // per-block routing and that a loaded q-compressed model actually decodes.
+        //
+        // deepseek2 is declared-unsupported (the flag flips only on a REAL checkpoint,
+        // never a synthetic — the project rule), so the arch gate would refuse this
+        // fixture. The opt-in env is exactly the escape built for that: set it for
+        // this single-purpose process. It does not leak into the suite.
+        std::env::set_var("LOGSCOPE_TRY_UNSUPPORTED_ARCH", "1");
+        let gpu = Gpu::new();
+        eprintln!("gate-mla-load: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let bytes = write_gguf_deepseek2_mla();
+        match gpu.load_gguf_quantized(&bytes) {
+            Err(e) => ck(&format!("q-compressed MLA gguf loads (was: 'missing tensor attn_q') — {e}"), false),
+            Ok(m) => {
+                ck("q-compressed MLA gguf loads", true);
+                ck("MLA config detected (q_lora=32, kv_lora=16)",
+                   m.mla.as_ref().map(|c| c.q_lora == 32 && c.kv_lora == 16).unwrap_or(false));
+                ck("blk.0 carries the MLA weight set (dense fields are placeholders)",
+                   m.mla_layers() == 1);
+                let c = gpu.new_cache_for(&m, 4);   // model-aware: attaches the MLA latent cache
+                let mut finite = true;
+                for (p, t) in [1u32, 5, 9].iter().enumerate() {
+                    let logits = gpu.decode_step(&m, &c, *t, p);
+                    finite &= logits.iter().all(|x| x.is_finite());
+                }
+                ck("3-token decode through the MLA path is finite", finite);
+            }
+        }
+        println!("gate-mla-load: {}", if ok { "q-compressed MLA loads + decodes \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-mla-block") {
         // The MLA math is already checked against mla.rs by --validate. What is NOT checked is the BLOCK:
         // norm -> compress-and-append -> attend -> residual. The ordering matters — the token must be in
@@ -5541,7 +6140,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-gemmadiff  --gate-iq1s\n  --gate-iq1s-kernel  --gate-deltanet-load  --gate-outscale  --gate-gemma4-altv  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mla-load  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-spec-lookup  --gate-store\n  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-tokenizer  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }
@@ -5909,7 +6508,7 @@ still pass, which is why this one exists."
         wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)), wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
         g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
         q_norm: None, k_norm: None, // llama-shape test block (no QK-Norm)
-        nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None,
+        nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, deltanet_gpu: None, attn_out_gate: None, out_scale: None, v_norm: None, v_from_k: false, geglu: false, post_attn: None, post_ffn: None, rope_base: None,
         moe: None, // dense test block — the MoE path has its own validation
     };
     let xt = gpu.upload(&x, bt, bd);
@@ -5927,7 +6526,7 @@ still pass, which is why this one exists."
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: true, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
+            q_norm: None, k_norm: None, nope: true, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, deltanet_gpu: None, attn_out_gate: None, out_scale: None, v_norm: None, v_from_k: false, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
         };
         let got = gpu.download(&gpu.block_forward(&bw_nope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // Roped baseline at the SAME (consistent) shape — the sanity term: nope must actually differ.
@@ -5938,7 +6537,7 @@ still pass, which is why this one exists."
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
+            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, deltanet: None, deltanet_gpu: None, attn_out_gate: None, out_scale: None, v_norm: None, v_from_k: false, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
         };
         let roped = gpu.download(&gpu.block_forward(&bw_rope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // CPU: cpu_block minus the rope step
@@ -6170,7 +6769,7 @@ still pass, which is why this one exists."
             }
             out
         };
-        let mk_layer = |with_shared: bool| gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+        let mk_layer = |with_shared: bool| gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
             router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
             gate_up: gus.iter().map(|w| gpu_kernels::Lin::f32(gpu.upload(w, 2 * ff, d))).collect(),
             down: dns.iter().map(|w| gpu_kernels::Lin::f32(gpu.upload(w, d, ff))).collect(),
@@ -6226,7 +6825,7 @@ still pass, which is why this one exists."
         let rw = rnd(ne * d, 151);
         let gus: Vec<Vec<f32>> = (0..ne).map(|e| rnd(2 * ff * d, 160 + e)).collect();
         let dns: Vec<Vec<f32>> = (0..ne).map(|e| rnd(d * ff, 170 + e)).collect();
-        let mk_q8 = || gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+        let mk_q8 = || gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
             router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
             gate_up: gus.iter().map(|w| gpu_kernels::Lin::q8(gpu.quantize_q8_resident(w, 2 * ff, d))).collect(),
             down: dns.iter().map(|w| gpu_kernels::Lin::q8(gpu.quantize_q8_resident(w, d, ff))).collect(),
@@ -6247,7 +6846,7 @@ still pass, which is why this one exists."
         check("MoE fused-GLU kernel == unfused path (bit-identical)", e, 0.0);
 
         // same for Q4-resident (the q4-30B's actual MoE path)
-        let mk_q4 = || gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None,
+        let mk_q4 = || gpu_kernels::MoeLayer { sel_bias: None, sel_bias_host: None, shared_inp_gate: None,
             router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
             gate_up: gus.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, 2 * ff, d))).collect(),
             down: dns.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, d, ff))).collect(),

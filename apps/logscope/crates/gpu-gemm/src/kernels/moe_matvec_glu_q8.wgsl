@@ -1,3 +1,4 @@
+// MOE_MATVEC_GLU_Q8
 struct D { n:u32,k:u32,kb:u32,gx:u32,_slot:u32,rstride:u32,xper:u32,_p:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
