@@ -5919,3 +5919,44 @@ REGION, PLATE_DZ_DIV, prev gate, intra gate, GAIN_GATE, deblock
 strength and mode — has now been swept on at least two content types
 with a metric matched to the artifact, and each carries its numbers in
 a comment. Two survived, five moved.
+
+### Final suite with the closed constant set
+
+All 19 shots, every default-path constant now swept
+(docs/suite_final_dz32.csv):
+
+  v11.3 recorded baseline   20.915 MB
+  FINAL                     19.657 MB   (94.0%)   MS-SSIM 0.96200
+  previous run (pre-gate)   19.663 MB             MS-SSIM 0.96186
+  per shot: 15 wins, 2 losses, 2 exact ties
+
+The gate retune moved the aggregate barely at all — 6 KB of 19.7 MB —
+while raising MS-SSIM 0.00014, which is a much better description of it
+than the -1.7% measured on the single film GOP it was tuned against.
+Per shot it is 10 shots better on BOTH axes, 4 mixed, and 2 worse on
+both (shots 9 and 18, the two hardest motion shots). Shot 16 alone gave
+back 53 KB; shot 19 cost 83 KB.
+
+That per-shot spread is the honest lesson about single-clip tuning,
+including the tuning done in this session: w1 is one GOP inside shot
+10, and shot 10 is one of the four that got WORSE in bytes. A constant
+measured on w1 and cross-checked on blackstar still moved two suite
+shots the wrong way. The cross-check made the decision defensible, not
+universally right, and the aggregate held only because the wins are
+broader than the losses.
+
+Standing against the user's AV1-150k anchor is unchanged: ~20x the
+bytes at slightly lower MS-SSIM on film. Nothing in this session's
+constant work touched that verdict, and nothing was expected to — the
+6% came from measurement error in the defaults, not from a new coding
+idea.
+
+State of the constant sweep, complete for the default path:
+  moved:    PLATE_DZ_DIV 8->2, prev gate 64->32, intra gate 96->48,
+            plus deblock turned on (new tool, not a retune)
+  survived: REGION=16, GAIN_GATE=192, deblock strength 2, deblock
+            mode fixed
+  off-path, still unswept: DICT_MARGIN (edge-of-grid, uncorrected),
+            DICT_MAX_CAND (also an edge), mover detection threshold,
+            and the 4x4 transform size that REGION=8's failure
+            implicated.
