@@ -136,6 +136,52 @@ pub use uikit_gesture::{Direction, GestureConfig, Outcome, ReleaseOutcome, TwoTi
 /// select the palette and, if set, widen the minimum interactive size. (The gesture part is
 /// applied to a `GestureConfig` via `Prefs::apply_to_gesture`.) Call this after
 /// `Settings::poll()` reports a change so the whole UI reflects new prefs live.
+/// The smallest an interactive control should be, in points, for this surface.
+///
+/// Existed only as `TouchPrefs::min_target`, defaulting to 0, which meant the
+/// effective floor was egui's desktop-shaped `interact_size.y` of 24pt on
+/// every device including a phone. 24pt is a mouse target; the reported
+/// "buttons are still a bit small on mobile" is that number, not a theme
+/// problem.
+///
+/// Resolution order, most specific first:
+///
+/// 1. An explicit `min_target` from settings. A user who has set a number
+///    means it, on any device, and nothing here second-guesses them.
+/// 2. Otherwise derived from the surface. Both inputs matter and neither is
+///    sufficient alone:
+///    * `surface_pt` — the usable width in POINTS. Already scale-corrected,
+///      so a phone at 300% and a small desktop window both read as narrow,
+///      which is right: a cramped window wants bigger targets whatever is
+///      driving it.
+///    * `ppp` — the compositor's scale factor. A high one on a WIDE surface
+///      is a HiDPI desktop, which does not want phone-sized buttons; a high
+///      one on a narrow surface is a phone. Using width alone would inflate
+///      controls on a tiled desktop window; using ppp alone would inflate
+///      them on every Retina display.
+///
+/// 44pt is the touch figure both Apple's HIG (44pt) and Material (48dp)
+/// land near, and is roughly a 9mm fingertip at typical phone densities.
+pub fn touch_floor_pt(explicit_min_target: f32, surface_pt: f32, ppp: f32) -> f32 {
+    if explicit_min_target > 0.0 {
+        return explicit_min_target;
+    }
+    // A surface this narrow is being held, not pointed at.
+    let narrow = surface_pt > 0.0 && surface_pt < 600.0;
+    // Fractional scaling below 1.25 is a desktop convention; at or above it
+    // the compositor is telling us the pixels are small.
+    let dense = ppp >= 1.25;
+    if narrow && dense {
+        44.0
+    } else if narrow {
+        // Narrow but not dense: a small desktop window. Some extra room
+        // helps, but it is a pointer, so not the full touch figure.
+        32.0
+    } else {
+        24.0 // egui's default: a mouse target on a roomy surface
+    }
+}
+
 pub fn apply_prefs(ctx: &egui::Context, prefs: &settings_kit::Prefs) {
     let pid = snapclone_theme::PaletteId::from_str(&prefs.palette);
     let colors = apply_palette(ctx, snapclone_theme::palette_for(pid));
@@ -154,6 +200,15 @@ pub fn apply_prefs(ctx: &egui::Context, prefs: &settings_kit::Prefs) {
     }
     let text = prefs.touch.text_scale.max(0.5);
     let btn = prefs.touch.button_scale.max(0.5);
+    // content_rect is the usable area (excluding what sits under system
+    // bars). It is empty on the very first frame, before any layout has
+    // happened, so fall back to the raw screen rect rather than reading 0
+    // and concluding "narrow".
+    let surface_pt = {
+        let c = ctx.content_rect().width();
+        if c > 1.0 { c } else { ctx.screen_rect().width() }
+    };
+    let floor = touch_floor_pt(prefs.touch.min_target, surface_pt, ctx.pixels_per_point());
     ctx.global_style_mut(|style| {
         // text size across the app
         for (_, font) in style.text_styles.iter_mut() {
@@ -161,7 +216,11 @@ pub fn apply_prefs(ctx: &egui::Context, prefs: &settings_kit::Prefs) {
         }
         // control/button size (respect an explicit min target too)
         style.spacing.button_padding = egui::vec2(8.0 * btn, 4.0 * btn);
-        style.spacing.interact_size.y = (24.0 * btn).max(prefs.touch.min_target);
+        // The floor is derived per-surface rather than a flat 24pt — see
+        // touch_floor_pt. `button_scale` still multiplies on top, so the
+        // settings app's slider keeps working and now moves a number that
+        // already suits the device.
+        style.spacing.interact_size.y = (floor * btn).max(prefs.touch.min_target);
         // animation feel: the "snappy / smooth / heavy / reduced" picker. Scales egui's global
         // animation_time so every animate_bool() across the kit respects it (Reduced → 0 = instant).
         style.animation_time = BASE_ANIM_SECS * prefs.gesture.animation.time_scale();
@@ -373,5 +432,46 @@ the 168 requested.");
         let w = laid_out(|| egui::SidePanel::left("c").resizable(false).exact_width(168.0));
         assert!((w - 168.0).abs() < 1.0,
                 "exact_width is the documented way to pin a width and gave {w}");
+    }
+}
+
+#[cfg(test)]
+mod touch_floor_tests {
+    use super::touch_floor_pt;
+
+    #[test]
+    fn an_explicit_setting_wins_on_every_device() {
+        // Someone who typed a number means it. A phone must not override it
+        // upward, and a desktop must not override it downward.
+        assert_eq!(touch_floor_pt(60.0, 360.0, 3.0), 60.0);
+        assert_eq!(touch_floor_pt(18.0, 1920.0, 1.0), 18.0);
+    }
+
+    #[test]
+    fn a_fairphone_gets_a_real_touch_target() {
+        // The reported case: narrow surface, compositor at 200-300%.
+        assert_eq!(touch_floor_pt(0.0, 360.0, 3.0), 44.0);
+        assert_eq!(touch_floor_pt(0.0, 411.0, 2.0), 44.0);
+    }
+
+    #[test]
+    fn a_hidpi_desktop_does_not_get_phone_buttons() {
+        // The failure using ppp alone: every Retina/4k display would inflate
+        // its controls to finger size for a mouse user.
+        assert_eq!(touch_floor_pt(0.0, 1920.0, 2.0), 24.0);
+    }
+
+    #[test]
+    fn a_narrow_desktop_window_gets_a_middle_value_not_the_full_touch_size() {
+        // The failure using width alone: a tiled window on a 1x display is
+        // narrow but still driven by a pointer.
+        assert_eq!(touch_floor_pt(0.0, 420.0, 1.0), 32.0);
+    }
+
+    #[test]
+    fn an_unmeasured_surface_falls_back_to_the_desktop_default() {
+        // Width 0 means layout has not run yet; concluding "narrow" from that
+        // would flash oversized controls on the first frame of every app.
+        assert_eq!(touch_floor_pt(0.0, 0.0, 3.0), 24.0);
     }
 }
