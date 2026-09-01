@@ -2828,22 +2828,48 @@ fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>, temp
         crate::diag!("worker: using the shared daemon — this process holds no weights");
     }
     let mut params = GenParams::default();
+    // What is actually resident. `Cmd::Load` used to reload unconditionally, and
+    // the UI re-asserts its model selection on several paths (the same habit the
+    // SetBackend guard below already exists to absorb). A log of one session
+    // showed Llama-3.2-1B loaded TEN times. For a 1B the seconds are easy to miss,
+    // but every reload drops the KV prefix tree, the autotune-warmed pipelines and
+    // any prefix a long prompt had already paid for — so a workflow like
+    // `:ws <path>` then "summarize the codebase" re-prefills from scratch each
+    // turn and can never build on the previous one.
+    let mut loaded: Option<String> = None;
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
             // Only rebuild (and thus drop any loaded model) on a genuine switch. The
             // chat tab re-asserts its backend choice on first open; without this guard
             // that would silently wipe a model the user just loaded.
             Cmd::SetBackend(k) => if k != kind {
-                kind = k; backend = make(k);
+                kind = k; backend = make(k); loaded = None;
                 crate::diag!("worker: backend → {} ({})", k.label(), backend.name());
                 let _ = evt.send(Evt::Loaded(Err(format!("backend → {} ({}) — reload the model", k.label(), backend.name()))));
             },
             Cmd::SetParams(p) => { params = p; }
             Cmd::Load(path) => {
+                // ALREADY RESIDENT → acknowledge without reloading. The UI still
+                // gets Evt::Loaded(Ok), so any state waiting on it settles exactly
+                // as before; the difference is that the weights, the prefix tree
+                // and the compiled pipelines survive.
+                //
+                // Compared as the caller gave it rather than canonicalised: a
+                // stat() per Load on a path that may live on a slow mount is a
+                // worse trade than occasionally reloading when someone passes the
+                // same file by two different spellings.
+                if loaded.as_deref() == Some(path.as_str()) {
+                    let template = backend.template();
+                    template_out.store(template.to_u8(), Ordering::Relaxed);
+                    crate::diag!("worker: '{path}' is already loaded — keeping it \
+(weights, KV prefix tree and warmed pipelines survive)");
+                    let _ = evt.send(Evt::Loaded(Ok(LoadInfo { path, template })));
+                    continue;
+                }
                 crate::diag!("worker: loading '{path}' via {} backend", backend.name());
                 match backend.load(&path, &params) {
-                    Ok(()) => { let template = backend.template(); template_out.store(template.to_u8(), Ordering::Relaxed); let _ = evt.send(Evt::Loaded(Ok(LoadInfo { path, template }))); }
-                    Err(e) => { crate::diag!("worker: load failed: {e}"); let _ = evt.send(Evt::Loaded(Err(e))); }
+                    Ok(()) => { let template = backend.template(); template_out.store(template.to_u8(), Ordering::Relaxed); loaded = Some(path.clone()); let _ = evt.send(Evt::Loaded(Ok(LoadInfo { path, template }))); }
+                    Err(e) => { loaded = None; crate::diag!("worker: load failed: {e}"); let _ = evt.send(Evt::Loaded(Err(e))); }
                 }
             }
             Cmd::Generate(prompt) => {
