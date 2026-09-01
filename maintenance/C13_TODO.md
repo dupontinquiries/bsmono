@@ -1672,3 +1672,47 @@ provably identical at temp 0, and the phase-balance figure says the
 bottleneck is "nothing in flight to cover memory latency", which is what
 speculation fixes. `LOGSCOPE_PASS_FUSE` is RETRACTED and must not be
 reached for — it corrupts AR decode and changes diffusion output.
+
+
+## 52. Flags that are the only route to performance — autospec, and the rest
+
+Operator: "there are too many flags for a lot of folks. they are good but if
+it's the only way to get the performance then not so much."
+
+Landed: `gpu_kernels::autospec` decides speculative drafting from
+measurement (temperature, decode/prefill phase ratio, remembered acceptance)
+with `store::spec_accept_{get,put}` persisting the acceptance. Policy and
+store only — **the wiring is deliberately a separate change**: call
+`autospec::decide` where the decode path currently reads
+`LOGSCOPE_SPEC_DRAFT`, and feed `spec_accept_put` from the live
+`spec::Acceptance` at end of turn. Small change, observable effect, wants a
+machine that can measure it.
+
+On "maybe I have to clear my autotune cache": probably not for this — the
+autotune cache holds tile choices, and speculation was never in it. But the
+question is fair and the answer is in `store.rs`: each cache carries an
+EPOCH in its filename (`autotune-v6.tsv`, and the new `spec-accept-v1.tsv`)
+precisely so that changing a kernel invalidates its measurements without
+anyone being told to clear anything. If a cached verdict ever looks stale,
+bumping the epoch is the fix, not a manual delete.
+
+**The remaining flags worth the same treatment**, in rough order of how much
+they cost someone who never finds them:
+
+1. `LOGSCOPE_ARENA` — the run log shows it set manually. If the arena is a
+   win, it should be the default and the flag should turn it OFF.
+2. `LOGSCOPE_FAST_DECODE` — described in its own log line as "bit-identical,
+   decode-speed only". Something bit-identical and faster has no business
+   being opt-in.
+3. `LOGSCOPE_PREFILL_TILED` — same shape, wants the same measurement.
+4. `LOGSCOPE_MATVEC_SG` — subgroup matvec, auto-DISABLED on Asahi for a real
+   reason (hangs). Already a measured decision; leave it.
+5. `LOGSCOPE_PASS_FUSE` — RETRACTED, corrupts AR decode. Must stay off and
+   must never be auto-enabled. Recorded here so a future sweep does not
+   mistake it for another free win.
+
+The principle to apply, and the one autospec follows: a flag is defensible
+when it selects between outcomes that genuinely differ (sampling, precision,
+risk). A flag that only chooses between "fast" and "slow" with identical
+output is a missing default, and its existence means the fast path is off for
+everyone who did not read the source.
