@@ -1611,3 +1611,64 @@ Swept apps/ for the shape: 50 unguarded external-binary tests, 46 of them
 `unzip`, `getconf`, `sh` — left alone deliberately: the first two are POSIX
 baseline and the `unzip` one is a cross-check arguably better failing
 loudly than skipping. Not every external dependency deserves a guard.
+
+
+## 50. The 1B was never the problem — agent tool surface had three disagreeing lists
+
+From the 487deac transcript, and this closes the "is the 1B useless or is
+the harness broken" question from §39 in favour of the harness.
+
+`RUNTIME_TOOLS` advertises ten tools to the model. `diagnose()` accepted
+four. `parse_one` could build nine (no `git_log` arm, despite the enum
+variant, wire name, display form and executor all existing). Three lists,
+one checked pair. A 1B emitted 13 tool blocks in a turn and every one was
+refused for naming a tool the same prompt had offered.
+
+Fixed this session, with agreement tests in both directions
+(advertised→validates, advertised→constructible), verified by reverting the
+fix and watching them fail.
+
+**Still open from the same transcript, in priority order:**
+
+1. **Names with an inserted space** — `write_ file`, `read_ file`,
+   `git_ log`, `tool_ quoted`. Correctly-spelled `git_log` appears in the
+   same run, so this is probably the model, not our detokenizer. Cheap
+   hedge worth doing regardless: normalise whitespace inside a tool name
+   before lookup. A model that wrote `read_ file` meant `read_file` and
+   there is no tool it could be confused with.
+2. **`tool_quoted_quoted`** — something is doubling. Appears alongside
+   "prose inside the fence" rejections, so the fence language tag may be
+   being re-wrapped. Trace where `tool_quoted` is emitted.
+3. **The retry loop is not converging.** The transcript shows the same
+   malformed call repeated a dozen times with the reminder text growing
+   each round ("Reply with EXACTLY one line, nothing else"). The ladder in
+   `line_calls.rs` exists for this; it is either not escalating or the
+   escalation is not reaching the model. A loop that repeats an instruction
+   the model has already failed twice is spending context to no purpose —
+   the same finding as §21's small-model looping, from the harness side.
+4. **`edit` missing `find`** was a real schema mismatch in that run and is
+   now a required-field message rather than "unknown tool", which is at
+   least actionable by the model.
+
+## 51. Performance: the engine already knows what to do and says so
+
+The 487deac run is 12.69 tok/s on a 1B, and the log diagnoses itself
+better than a profiler would:
+
+- `roofline — 19 GB/s of 800 spec = 2% of the decode ceiling; NOT
+  bandwidth-bound ... the engine is the lever`
+- `sync 87760ms of 90710ms (GPU-sync-bound)`
+- `7800 submits (7/tok)`, `96% of submits were forced by PASS BOUNDARIES`
+- `decode is 23.6x SLOWER PER TOKEN than this model's own prefill`
+
+That last comparison is the useful one because it needs no bandwidth
+measurement. The log's own recommendation is `LOGSCOPE_SPEC_DRAFT=lookup`
+(model-free prompt-lookup drafting, identical output at temperature 0),
+and it notes it pays exactly on repetitive text — repository reading, code
+with recurring identifiers — which is precisely the `:ws` workload.
+
+Worth trying before any kernel work: it is an env var, the output is
+provably identical at temp 0, and the phase-balance figure says the
+bottleneck is "nothing in flight to cover memory latency", which is what
+speculation fixes. `LOGSCOPE_PASS_FUSE` is RETRACTED and must not be
+reached for — it corrupts AR decode and changes diffusion output.
