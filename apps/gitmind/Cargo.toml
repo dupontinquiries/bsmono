@@ -24,7 +24,6 @@ members = [
     "crates/core",
     "crates/cli",
     "crates/sim",
-    "crates/peek",
     "crates/cockpit",
     "crates/gui",
     "crates/gui-egui",
@@ -32,7 +31,11 @@ members = [
 # `cargo build` builds the whole toolbox INCLUDING the egui GUI (the primary GUI —
 # builds headless, no display needed to compile), and EXCEPT the Qt GUI (which
 # needs Qt6 present). Build the Qt fallback explicitly with `cargo build -p gitmind-gui`.
-default-members = ["crates/core", "crates/cli", "crates/sim", "crates/peek", "crates/cockpit", "crates/gui-egui"]
+# `peek` used to be a workspace member here (crates/peek) — a byte-identical
+# copy of tools/peek, which already documented itself as the intended
+# canonical home ("consumed by gitmind's GUI... Canonical home for peek").
+# The three consumers below now path-depend on tools/peek directly instead.
+default-members = ["crates/core", "crates/cli", "crates/sim", "crates/cockpit", "crates/gui-egui"]
 
 # Match the reference's size-first release profile so the shipped
 # binaries stay small. The core does the heavy lifting; LTO across the

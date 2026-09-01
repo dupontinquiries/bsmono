@@ -2465,7 +2465,6 @@ dependencies = [
  "clap",
  "globwalk",
  "memmap2",
- "tempfile",
  "thiserror 2.0.18",
 ]
 

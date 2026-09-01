@@ -25,7 +25,7 @@ cockpit = { path = "../cockpit" }
 # peek::view::read_to_string — the spec grammar (5xx, 5k, @symbol, A-B) is
 # parsed there, so the port is a viewer over an existing call rather than a
 # reimplementation of the grammar.
-peek = { path = "../peek" }
+peek = { path = "../../../../tools/peek" }
 gitmind-core = { path = "../core" }
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
 touchkit = { path = "../../../../shared/touchkit", features = ["egui"] }
