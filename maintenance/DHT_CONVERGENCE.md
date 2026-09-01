@@ -219,6 +219,20 @@ turn "shaped like" into "compatible with", then retire the older crates.
 
 ---
 
+## Step 3 done — and it found that steps 1 and 2 had been built on sand
+
+The reference builds in the sandbox (`maintenance/OPENDHT_INTEROP.md`). Run
+against it, the codec this document describes turned out not to be the
+reference's format at all: seven independent incompatibilities, any one
+fatal, listed there. dht-kit was rewritten from the packer source; `wire`
+answers in the reference's shape with real tokens (`Responder`); `refresh`
+is now implemented rather than 501; `wire` is on by default in snapcore so
+every consumer compiles it. The interop test passes, two captured
+datagrams re-encode byte-identically, and the earlier sections above should
+be read as history.
+
+---
+
 ## Hardening audit — what the reference does that we did not
 
 Audited both engines against what a public Kademlia needs operationally.
