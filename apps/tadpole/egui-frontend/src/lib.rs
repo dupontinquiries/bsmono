@@ -238,7 +238,6 @@ impl Tadpole {
         &mut self,
         bytes: &[u8],
         name: Option<&str>,
-        ocr: &dyn Ocr,
         transcriber: &dyn audio::Transcriber,
     ) -> paste::Incoming {
         let what = paste::classify(bytes, name);
@@ -694,7 +693,7 @@ mod tests {
             audio::Segment { start_ms: 0, end_ms: 1, text: "routing table basics".into(), score: 0.9 },
             audio::Segment { start_ms: 30_000, end_ms: 1, text: "more routing table talk".into(), score: 0.9 },
         ]);
-        let what = app.accept(&wav_bytes(), Some("meeting.wav"), &Fake(vec![]), &voice);
+        let what = app.accept(&wav_bytes(), Some("meeting.wav"), &voice);
         assert_eq!(what, paste::Incoming::Audio(audio::Format::Wav));
         assert_eq!(app.segments.len(), 2);
         assert!(app.overview().iter().any(|t| t.term == "routing"));
@@ -707,8 +706,7 @@ mod tests {
         let mut app = Tadpole::default();
         let what = app.accept(b"routing tables
 something else
-routing again", None,
-                              &Fake(vec![]), &NoVoice);
+routing again", None, &NoVoice);
         assert!(matches!(what, paste::Incoming::Text(_)));
         assert_eq!(app.segments.len(), 3);
         assert!(app.overview().iter().any(|t| t.term == "routing"));
@@ -722,7 +720,7 @@ routing again", None,
         app.scan(&Fake(vec![r("from the page", 0.9, 0.0, 0.0, 10.0, 10.0)]), &img());
         assert_eq!(app.regions.len(), 1);
 
-        app.accept(&wav_bytes(), None, &Fake(vec![]),
+        app.accept(&wav_bytes(), None,
                    &FakeVoice(vec![audio::Segment { start_ms: 0, end_ms: 1,
                        text: "from the tape".into(), score: 0.9 }]));
         assert!(app.regions.is_empty(), "the page went away");
@@ -735,7 +733,7 @@ routing again", None,
     #[test]
     fn a_failed_transcription_reports_the_missing_model() {
         let mut app = Tadpole::default();
-        app.accept(&wav_bytes(), None, &Fake(vec![]), &NoVoice);
+        app.accept(&wav_bytes(), None, &NoVoice);
         assert_eq!(app.last_error, Some(OcrError::NoModel));
         assert!(app.segments.is_empty());
     }
@@ -746,12 +744,12 @@ routing again", None,
         // reading — a refusal is not a reset.
         let mut app = Tadpole::default();
         app.accept(b"notes about routing
-and more routing", None, &Fake(vec![]), &NoVoice);
+and more routing", None, &NoVoice);
         assert_eq!(app.segments.len(), 2);
 
         let mut pdf = b"%PDF-1.7".to_vec();
         pdf.extend_from_slice(&[0; 16]);
-        let what = app.accept(&pdf, Some("paper.pdf"), &Fake(vec![]), &NoVoice);
+        let what = app.accept(&pdf, Some("paper.pdf"), &NoVoice);
         assert!(what.message().unwrap().contains("PNG"));
         assert_eq!(app.segments.len(), 2, "the transcript survived the refusal");
     }
@@ -802,7 +800,7 @@ and more routing", None, &Fake(vec![]), &NoVoice);
             tseg(0, 1_000, "hello there"),
             tseg(2_000, 3_000, "and back again"), // 1s pause ≥ TURN_GAP_MS
         ]);
-        app.accept(&wav_bytes(), Some("m.wav"), &Fake(vec![]), &voice);
+        app.accept(&wav_bytes(), Some("m.wav"), &voice);
         let d = app.diarised.as_ref().expect("timed audio is diarised");
         assert_eq!(d.roster().len(), 2, "the pause is a turn boundary");
         assert_eq!(d.roster()[0].label(), "Turn 1", "turns say turn, not speaker");
@@ -818,7 +816,7 @@ and more routing", None, &Fake(vec![]), &NoVoice);
     #[test]
     fn pasted_text_is_never_diarised() {
         let mut app = Tadpole::default();
-        app.accept(b"line one\nline two", None, &Fake(vec![]), &NoVoice);
+        app.accept(b"line one\nline two", None, &NoVoice);
         assert_eq!(app.segments.len(), 2);
         assert!(app.diarised.is_none(), "line-index timings are not pauses");
         assert_eq!(app.transcript(), "line one\nline two");
@@ -829,7 +827,7 @@ and more routing", None, &Fake(vec![]), &NoVoice);
     fn a_scan_clears_the_previous_transcripts_labels() {
         let mut app = Tadpole::default();
         let voice = FakeVoice(vec![tseg(0, 500, "before")]);
-        app.accept(&wav_bytes(), Some("m.wav"), &Fake(vec![]), &voice);
+        app.accept(&wav_bytes(), Some("m.wav"), &voice);
         assert!(app.diarised.is_some());
         app.scan(&Fake(vec![r("abcd", 0.9, 0.0, 0.0, 40.0, 12.0)]), &img());
         assert!(app.diarised.is_none(), "a scan replaces the document, labels included");
