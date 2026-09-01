@@ -895,6 +895,14 @@ pub struct WorldRenderer {
     /// first frame completes wait_for_fences.
     last_wait_fences_ms: f64,
 
+    /// This frame's total GPU time (sum of the "total" zone from
+    /// `gpu_timer.take_last_frame()`), in milliseconds. Populated
+    /// unconditionally alongside the existing gpu_spike-event check below
+    /// (which only fires above a 100ms threshold) so a real per-frame value
+    /// is available to callers like `sim::submit_schedule` without waiting
+    /// for a spike. 0.0 until the first frame's GPU query results land.
+    last_gpu_total_ms: f64,
+
     /// Resources awaiting deferred destruction (chunks evicted since last
     /// frame). Drained at the top of each frame.
     pending_destroy: Vec<PendingDestroy>,
@@ -1740,6 +1748,7 @@ impl WorldRenderer {
             cached_frustum: Frustum { planes: [[0.0; 4]; 6] },
             cached_frustum_key: None,
             last_wait_fences_ms: 0.0,
+            last_gpu_total_ms: 0.0,
             pending_destroy: Vec::new(),
             mesh_cache: HashMap::new(),
             mesh_cache_capacity: std::env::var("UNENDLICH_MESH_CACHE_SIZE")
@@ -2723,6 +2732,23 @@ impl WorldRenderer {
     /// initialized at 0.0 plus the dead band logic.
     pub fn last_wait_fences_ms(&self) -> f64 {
         self.last_wait_fences_ms
+    }
+
+    /// This render thread's total marked CPU time for the most recently
+    /// completed frame (sum of wait_fences/acquire/record/submit/present
+    /// zones), in milliseconds. `None` until the first frame completes.
+    /// A single-frame value, not a windowed mean — see `CpuTimer` docs.
+    pub fn last_cpu_frame_ms(&self) -> Option<f64> {
+        self.cpu_timer.last_frame_total_ms()
+    }
+
+    /// This frame's total GPU time, in milliseconds. See
+    /// `last_gpu_total_ms` field docs. 0.0 before the first frame's query
+    /// results have landed (real GPU frames are never exactly 0.0, so
+    /// callers can treat 0.0 as "not ready yet" alongside checking
+    /// `last_cpu_frame_ms().is_none()`).
+    pub fn last_gpu_frame_ms(&self) -> f64 {
+        self.last_gpu_total_ms
     }
 
     /// Format and reset the per-pass GPU timing window. Call once
@@ -5372,6 +5398,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
         // so this code path doesn't fire twice for the same frame.
         if let Some((collected_idx, per_zone_us)) = self.gpu_timer.take_last_frame() {
             if let Some(&total_us) = per_zone_us.get("total") {
+                self.last_gpu_total_ms = total_us as f64 / 1000.0;
                 if total_us > 100_000 {
                     unendlich_shared::events::record(
                         "gpu_spike",
