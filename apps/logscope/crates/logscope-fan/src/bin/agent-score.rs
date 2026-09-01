@@ -10,7 +10,7 @@
 //! a remote endpoint, or output pasted from a chat window, and the score is comparable across all
 //! three. What gets measured is whether the model ends its turn with exactly one action, whether it
 //! asks instead of assuming, and whether every entity it names was actually supplied.
-use logscope_fan::agentscore::{score, suite, Report, Violation};
+use logscope_fan::agentscore::{score, suite, Report};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

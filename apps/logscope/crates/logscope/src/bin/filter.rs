@@ -15,7 +15,6 @@ use std::path::PathBuf;
 use std::io::Write;
 
 #[cfg(unix)]
-use nix::unistd::dup2;
 
 // ── silence layer (must run before any output) ────────────────────────────────
 
