@@ -337,13 +337,23 @@ mod tests {
 
     #[test]
     fn nodes_with_tag_basic() {
+        // A UNIQUE TAG, not just unique ids. The store is one process-global
+        // Mutex<Store> and cargo runs tests on parallel threads. Unique ids
+        // isolate a test that reads BY ID; this one queries BY TAG, which
+        // crosses every id in the store — so while `add_and_get_roundtrip`
+        // held "important" on its own node and had not yet reached its
+        // `clear_all`, this saw three nodes and expected two. That is exactly
+        // how it failed in the fleet run. Not a product bug: returning every
+        // node carrying a tag is correct, and the test was asking a global
+        // question while pretending to be local.
+        let tag = "important-nodeswithtagbasic-xyz";
         let id_a = "test_user_tags_filter_a_xyz";
         let id_b = "test_user_tags_filter_b_xyz";
         clear_all(id_a); clear_all(id_b);
-        add(id_a, "important");
-        add(id_b, "important");
+        add(id_a, tag);
+        add(id_b, tag);
         add(id_b, "other");
-        let mut found = nodes_with_tag("important");
+        let mut found = nodes_with_tag(tag);
         found.sort();
         let mut expected = vec![id_a.to_string(), id_b.to_string()];
         expected.sort();
