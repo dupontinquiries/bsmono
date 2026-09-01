@@ -9486,6 +9486,7 @@ dense briefing that replaces them as the working context, then carry on with roo
                     let step_open = self.step_open.clone();
                     let mut toggle_step: Option<(usize, usize)> = None;
                     let mut swipe_variant: Option<(usize, i32)> = None;
+                    let mut over_any_message = false;
                     let mut expand_msg: Option<usize> = None;
                     let mut collapse_msg: Option<usize> = None;
                     for (i, m) in self.msgs.iter_mut().enumerate() {
@@ -9505,6 +9506,7 @@ dense briefing that replaces them as the working context, then carry on with roo
                             let d = ui.input(|i| i.pointer.delta());
                             if ui.rect_contains_pointer(ui.min_rect())
                                 && ui.input(|i| i.pointer.primary_down()) {
+                                over_any_message = true;
                                 let ax = crate::chatgesture::lock_axis(d.x, d.y);
                                 let delta = if d.x < -crate::chatgesture::AXIS_LOCK_PT { 1 }
                                             else if d.x > crate::chatgesture::AXIS_LOCK_PT { -1 }
@@ -9516,6 +9518,12 @@ dense briefing that replaces them as the working context, then carry on with roo
                                     swipe_variant = Some((i, delta));
                                 }
                             }
+                        } else if ui.input(|i| i.pointer.primary_down()) && ui.rect_contains_pointer(ui.min_rect()) {
+                            // A single-variant (or streaming) message still counts as "on a message"
+                            // for the purposes of the background swipe below — chatgesture's own
+                            // ambiguous-target failure mode (#4) is exactly a drag over a message
+                            // being read as a background gesture because nothing claimed it.
+                            over_any_message = true;
                         }
                         theme::fade(ui, a, |ui| {
                             egui::Frame { fill, corner_radius: theme::r(10),
@@ -9770,6 +9778,23 @@ dense briefing that replaces them as the working context, then carry on with roo
                     if let Some((i, d)) = swipe_variant {
                         let n = self.msgs[i].variants.len();
                         self.msgs[i].cur = (self.msgs[i].cur as i32 + d).clamp(0, n as i32 - 1) as usize;
+                    }
+                    // SWIPE ON THE BACKGROUND — chatgesture's other target. A drag that landed on no
+                    // message at all (over_any_message tracked per-row above, so this can't fire from
+                    // a pixel inside a message bubble that merely had one variant) steps between
+                    // sibling branches instead, the same "hjkl branch" the header hints at, now
+                    // reachable without the keyboard. `switch_sibling` already exists and is wired to
+                    // h/l and the graph tab; chatgesture::action's Target::Background case had no
+                    // caller until this.
+                    if !over_any_message && ui.rect_contains_pointer(ui.min_rect()) && ui.input(|i| i.pointer.primary_down()) {
+                        let d = ui.input(|i| i.pointer.delta());
+                        let ax = crate::chatgesture::lock_axis(d.x, d.y);
+                        let delta = if d.x < -crate::chatgesture::AXIS_LOCK_PT { 1 }
+                                    else if d.x > crate::chatgesture::AXIS_LOCK_PT { -1 } else { 0 };
+                        if let crate::chatgesture::Action::SwitchBranch { delta } =
+                            crate::chatgesture::action(crate::chatgesture::Target::Background, delta, ax, false, 0, 0) {
+                            self.switch_sibling(delta);
+                        }
                     }
                 });
         });
