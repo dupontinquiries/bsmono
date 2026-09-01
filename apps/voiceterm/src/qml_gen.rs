@@ -3149,15 +3149,36 @@ fn wrap_for_tier(inner: &str) -> String {
 // generate_safe_qml call. The atomic isn't strictly necessary
 // (generation is single-threaded) but is_atomic gives us clean
 // reset + increment without locking, and the perf cost is nil.
-static PARAGRAPH_COUNTER: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+// THREAD-LOCAL, not a process-wide atomic.
+//
+// This was `static AtomicUsize`, and the pairing of "reset at the start of a
+// generate, then hand out increasing ids" is only correct if one generate is
+// in flight at a time. Under the default parallel test runner it is not: one
+// test's `reset_paragraph_counter()` lands between another test's two
+// `next_paragraph_id()` calls, both come back 0, and the generated QML has
+// two elements sharing an id — which is a duplicate-id parse error in QML,
+// i.e. the exact failure the test that caught this exists to prevent.
+// (`to_qml_multiple_blockquotes_get_unique_ids`: "IDs collide: both = 0".)
+//
+// A mutex around the tests would work, but thread-local is the better answer
+// because it makes the invariant structural: a counter that belongs to one
+// generate should not be shared with an unrelated one, in tests or anywhere
+// else. Generation is single-threaded per document — it builds one string —
+// so nothing legitimate spans threads mid-generate and would notice.
+thread_local! {
+    static PARAGRAPH_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 pub fn reset_paragraph_counter() {
-    PARAGRAPH_COUNTER.store(0, std::sync::atomic::Ordering::Relaxed);
+    PARAGRAPH_COUNTER.with(|c| c.set(0));
 }
 
 pub fn next_paragraph_id() -> usize {
-    PARAGRAPH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    PARAGRAPH_COUNTER.with(|c| {
+        let n = c.get();
+        c.set(n + 1);
+        n
+    })
 }
 
 // v0.1.197 (ship 2.4.2): per-page table counter, same pattern as
@@ -3165,15 +3186,24 @@ pub fn next_paragraph_id() -> usize {
 // (`_tid: "t_<n>"`) so future ships (2.4.4 — interaction surface)
 // can route user commands to a specific table on the page. Reset
 // at the start of each generate_safe_qml call.
-static TABLE_COUNTER: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+// Thread-local for the same reason as PARAGRAPH_COUNTER above: same
+// reset-then-increment pattern, same corruption under concurrent generates.
+// It had not been caught yet only because no test happens to render two
+// tables while another test resets.
+thread_local! {
+    static TABLE_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 pub fn reset_table_counter() {
-    TABLE_COUNTER.store(0, std::sync::atomic::Ordering::Relaxed);
+    TABLE_COUNTER.with(|c| c.set(0));
 }
 
 pub fn next_table_id() -> usize {
-    TABLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    TABLE_COUNTER.with(|c| {
+        let n = c.get();
+        c.set(n + 1);
+        n
+    })
 }
 
 // v0.1.198 (ship 2.4.4): table view registry.
