@@ -29,7 +29,7 @@
 //!   only read the property.
 
 use std::collections::HashMap;
-use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::mpsc::{channel, RecvTimeoutError};
 use std::time::Duration;
 
 use zbus::blocking::fdo::ObjectManagerProxy;
@@ -38,7 +38,7 @@ use zbus::proxy::CacheProperties;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
 
 use crate::link::{ApnSetting, Command, Event, Link};
-use crate::message::{self, Payload};
+use crate::message;
 use crate::types::{CallDirection, CallInfo, CallState};
 
 const MM_SERVICE: &str = "org.freedesktop.ModemManager1";

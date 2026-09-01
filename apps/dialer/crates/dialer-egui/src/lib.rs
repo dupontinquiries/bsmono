@@ -714,7 +714,7 @@ This executes on your device."),
             self.dtmf_sent.clear();
         }
 
-        egui::TopBottomPanel::bottom("dialer-bottom")
+        egui::Panel::bottom("dialer-bottom")
             .frame(egui::Frame::new().fill(self.colors.bg_base).inner_margin(6.0))
             .show(ctx, |ui| {
                 self.status_line(ui, now);
