@@ -46,6 +46,16 @@ vk-sys = { version = "0.4", optional = true }
 # Window & input (full game build)
 glfw = { version = "0.45", features = ["vulkan"], optional = true }
 
+# T07-R27 glfw->winit migration, Approach B (see input_codes.rs's winit_conv
+# module, previously dead code with no feature to gate it): winit gives real
+# per-finger multi-touch (WindowEvent::Touch with id+phase), which GLFW
+# cannot report on Linux at all -- it only ever sees a single emulated
+# pointer from the compositor. Same version blackstar-rs (this monorepo)
+# already ships successfully. `window-winit` is a standalone alternate
+# window backend -- NOT wired into unendlich_fullgame.rs yet, additive only,
+# doesn't touch the existing `window` (glfw) path.
+winit = { version = "0.29", optional = true }
+
 # In-game UI overlay (hand-rolled egui renderer; egui 0.34 to match the kit, ash 0.37 to match the engine).
 egui = { version = "0.34", optional = true }
 unendlich-ui = { path = "../unendlich-ui", optional = true }
@@ -70,6 +80,13 @@ render-core = ["gpu"]
 # creation (vk-sys is only used at the glfw->ash surface-handle boundary) plus
 # input/keybindings. Enabling `window` restores the windowed path byte-for-byte.
 window = ["glfw", "vk-sys"]
+# T07-R27 glfw->winit migration, Approach B: alternate window backend using
+# winit instead of GLFW, for real multi-touch input (see the Cargo.toml
+# comment on the winit dependency). Additive only right now -- gates the
+# previously-dead input_codes.rs::winit_conv module (keyboard/mouse event
+# translation only; no touch handling yet, no window creation, no event loop,
+# not called from any binary). NOT a drop-in replacement for `window` yet.
+window-winit = ["winit"]
 # `render` = the render module, WITHOUT pulling glfw. Add `window` for a real
 # window, or `headless` for the offscreen target. (Was: render forced window.)
 render = ["render-core"]
