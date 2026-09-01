@@ -818,6 +818,13 @@ not a compile-time-only check like the two modules just migrated.
 
 ## 17b. apps/snapclone/camera-bridge vs system/snapclone/camera-bridge: same drift, smaller scope
 
+Noted 2026-09-01 while reusing its probe: `capture.rs::parse_camera_nodes_from_json`
+computes the backtrack window from a `search`-relative offset but slices
+`json` with it, so after the first `Video/Source` match the window for
+later nodes points at the wrong region. It worked in the field because the
+first node was the one wanted. The frontend's `camera_enumerate` scans
+structurally instead; port that back when the two crates are reconciled.
+
 A follow-up check on §17: `camera-bridge` is a small, standalone
 workspace (`[workspace]` with no members, deliberately kept out of the
 big rust/ workspace — its own Cargo.toml explains why: it drags in
@@ -954,6 +961,20 @@ This overlaps the `apps/snapclone/camera-bridge` source_plan work
 (C13_TODO §17b) — that crate already has ordered-candidate probing that
 tries libcamera pipewire nodes then v4l2 and falls through on failure.
 Whatever fix lands should reuse that, not reinvent it.
+
+**2026-09-01, partly done.** Root cause of the first three items was one
+thing: `camera_enumerate` read `/dev/video*` only and never asked PipeWire,
+while `Device::id` was documented as the PipeWire node name. On the FP5 the
+sensors are libcamera devices with no v4l2 capture node, so the list WAS
+the decoder/encoder nodes. `camera_enumerate::pipewire_devices` now runs
+`pw-dump` (the bridge's own probe) and feeds every `Video/Source` node to
+`camera_select::device_from_node`; the bridge's `virtual-cam-*` outputs
+rank first, the raw sensors follow, and the v4l2 read is the fallback for
+a machine with no session. Pinned on an FP5-shaped dump fixture. NOT yet
+verified on the phone. Still open: the picker as a dropdown (§24), and the
+640x480-on-a-4K-sensor format negotiation — `pipewiresrc` takes the
+session's default format unless the pipeline states caps, and
+`device_kit::source_plan::pipewire_pipeline` states none.
 
 ## 24. Layout/overflow bugs across apps (Fairphone AND desktop)
 
