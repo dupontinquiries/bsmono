@@ -224,7 +224,7 @@ pub fn qr_ui(ui: &mut egui::Ui, s: &mut QrScan,
         ui.separator();
         // The manual field is present in BOTH phases, not only the fallback: a
         // camera that will not focus should not stop you adding a contact.
-        ui.add(egui::TextEdit::singleline(&mut s.manual)
+        ui.add(egui::TextEdit::singleline(&mut s.manual).id_salt("qr-s_manual")
             .hint_text(MANUAL_HINT).desired_width(240.0));
         if ui.button("Add").clicked() && s.submit_manual() {
             if let Phase::Done(cc) = &s.phase { out = Some(cc.clone()); }

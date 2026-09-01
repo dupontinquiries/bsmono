@@ -2410,7 +2410,7 @@ impl eframe::App for VoicetermApp {
                         ui.separator();
                         // Parsed from the source, exactly as the Qt bin's
                         // nifty_topology does: parse, then take ids and edges.
-                        ui.add(egui::TextEdit::multiline(&mut self.graph_source)
+                        ui.add(egui::TextEdit::multiline(&mut self.graph_source).id_salt("voiceterm_egui-self_graph_source")
                                .desired_rows(3).hint_text("graph source"));
                         let doc = nifty_core::niftyplot::parse(&self.graph_source);
                         if doc.nodes.is_empty() {
@@ -2809,7 +2809,7 @@ impl eframe::App for VoicetermApp {
                         ui.separator();
                         ui.label(egui::RichText::new("captured text").weak().size(11.0));
                         let changed = ui.add(
-                            egui::TextEdit::multiline(&mut self.captured)
+                            egui::TextEdit::multiline(&mut self.captured).id_salt("voiceterm_egui-self_captured")
                                 .desired_rows(4).desired_width(f32::INFINITY)).changed();
                         if changed {
                             let src = cv::CardSource {
@@ -2942,7 +2942,7 @@ impl eframe::App for VoicetermApp {
                                 self.build.set_output(&self.build_input);
                             }
                         });
-                        ui.add(egui::TextEdit::multiline(&mut self.build_input)
+                        ui.add(egui::TextEdit::multiline(&mut self.build_input).id_salt("voiceterm_egui-self_build_input")
                                .desired_rows(3).desired_width(f32::INFINITY));
                         ui.colored_label(c.text, self.build.status());
                         ui.horizontal(|ui| {

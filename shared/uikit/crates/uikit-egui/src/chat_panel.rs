@@ -178,7 +178,7 @@ impl ChatPanel {
                 self.provider = id;
             }
             let enter =
-                ui.add(egui::TextEdit::singleline(&mut self.input).desired_width(f32::INFINITY).hint_text("Message…"))
+                ui.add(egui::TextEdit::singleline(&mut self.input).id_salt("chat_panel-self_input").desired_width(f32::INFINITY).hint_text("Message…"))
                     .lost_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let clicked = ui.add_enabled(!self.busy, egui::Button::new("Send")).clicked();

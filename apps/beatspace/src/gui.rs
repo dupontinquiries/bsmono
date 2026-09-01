@@ -477,7 +477,7 @@ impl eframe::App for App {
 
                 ui.separator();
                 ui.label("Generator weights:");
-                ui.add(egui::TextEdit::singleline(&mut self.ckpt_text).desired_width(230.0));
+                ui.add(egui::TextEdit::singleline(&mut self.ckpt_text).id_salt("gui-self_ckpt_text").desired_width(230.0));
                 if ui.button("Load weights").clicked() {
                     let p = PathBuf::from(self.ckpt_text.trim());
                     if p.exists() {
@@ -491,7 +491,7 @@ impl eframe::App for App {
 
                 ui.separator();
                 ui.label("Save current beat:");
-                ui.add(egui::TextEdit::singleline(&mut self.save_text).desired_width(230.0));
+                ui.add(egui::TextEdit::singleline(&mut self.save_text).id_salt("gui-self_save_text").desired_width(230.0));
                 if ui.button("💾  Save WAV").clicked() {
                     let p = PathBuf::from(self.save_text.trim());
                     self.shared.lock().unwrap().save_request = Some(p);
@@ -643,7 +643,7 @@ impl App {
         ui.horizontal(|ui| {
             let mut dir = self.cfg.data_dir.to_string_lossy().to_string();
             if ui.add_enabled(!running,
-                egui::TextEdit::singleline(&mut dir).desired_width(150.0)).changed()
+                egui::TextEdit::singleline(&mut dir).id_salt("gui-dir").desired_width(150.0)).changed()
             {
                 self.cfg.data_dir = dir.clone().into();
             }
@@ -732,16 +732,16 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("epochs");
             ui.add_enabled(!running,
-                egui::TextEdit::singleline(&mut self.train_epochs).desired_width(70.0));
+                egui::TextEdit::singleline(&mut self.train_epochs).id_salt("gui-self_train_epochs").desired_width(70.0));
         });
         ui.horizontal(|ui| {
             ui.label("batch");
             ui.add_enabled(!running,
-                egui::TextEdit::singleline(&mut self.train_batch).desired_width(70.0));
+                egui::TextEdit::singleline(&mut self.train_batch).id_salt("gui-self_train_batch").desired_width(70.0));
         });
         ui.horizontal(|ui| {
             ui.label("frames");
-            ui.add(egui::TextEdit::singleline(&mut self.train_time_frames).desired_width(70.0))
+            ui.add(egui::TextEdit::singleline(&mut self.train_time_frames).id_salt("gui-self_train_time_frames").desired_width(70.0))
                 .on_hover_text(
                     "Sampler duration, in mel frames: the width of one training crop and so the \
 length of one generated beat. 64 frames is about 0.74 s at the default hop and rate; 128 doubles \

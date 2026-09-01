@@ -112,7 +112,7 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
     ui.label(egui::RichText::new("format-based anchor map: the frames seek can land on without a decoded predecessor").weak().small());
     ui.horizontal(|ui| {
         ui.label(".fao:");
-        ui.add(egui::TextEdit::singleline(&mut st.path).desired_width(360.0));
+        ui.add(egui::TextEdit::singleline(&mut st.path).id_salt("player-st_path").desired_width(360.0));
         if ui.button("Open").clicked() { st.open(); }
     });
     if let Some(e) = &st.error { ui.colored_label(ui.visuals().error_fg_color, e); }

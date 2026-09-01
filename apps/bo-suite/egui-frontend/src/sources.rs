@@ -256,9 +256,9 @@ pub fn playlists_ui(ui: &mut egui::Ui, p: &mut PlaylistsPage, now: i64,
     // over the list you are adding to.
     if p.create.expanded {
         ui.group(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut p.create.name)
+            ui.add(egui::TextEdit::singleline(&mut p.create.name).id_salt("sources-p_create_name")
                 .hint_text("Playlist name").desired_width(200.0));
-            ui.add(egui::TextEdit::singleline(&mut p.create.description)
+            ui.add(egui::TextEdit::singleline(&mut p.create.description).id_salt("sources-p_create_description")
                 .hint_text("Description (optional)").desired_width(200.0));
             ui.horizontal(|ui| {
                 if ui.button("Create").clicked() {
@@ -272,7 +272,7 @@ pub fn playlists_ui(ui: &mut egui::Ui, p: &mut PlaylistsPage, now: i64,
     } else {
         ui.horizontal(|ui| {
             if ui.button("+ New playlist").clicked() { p.create.expand(); }
-            ui.add(egui::TextEdit::singleline(&mut p.filter)
+            ui.add(egui::TextEdit::singleline(&mut p.filter).id_salt("sources-p_filter")
                 .hint_text("Search playlists").desired_width(180.0));
         });
     }

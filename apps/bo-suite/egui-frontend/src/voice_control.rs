@@ -575,7 +575,7 @@ pub fn voice_settings_ui(ui: &mut egui::Ui, p: &mut VoicePrefs,
          Off, they ask first.");
     ui.horizontal(|ui| {
         ui.label("only after");
-        changed |= ui.add(egui::TextEdit::singleline(&mut p.prefix)
+        changed |= ui.add(egui::TextEdit::singleline(&mut p.prefix).id_salt("voice_control-p_prefix")
                           .hint_text("nothing").desired_width(90.0)).changed();
     });
     ui.colored_label(c.text_weak,
@@ -583,7 +583,7 @@ pub fn voice_settings_ui(ui: &mut egui::Ui, p: &mut VoicePrefs,
          television talks.");
     ui.horizontal(|ui| {
         ui.label("listen with");
-        changed |= ui.add(egui::TextEdit::singleline(&mut p.recognizer)
+        changed |= ui.add(egui::TextEdit::singleline(&mut p.recognizer).id_salt("voice_control-p_recognizer")
                           .hint_text("nothing — no phrases will arrive")
                           .desired_width(230.0)).changed();
     });

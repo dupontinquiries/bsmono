@@ -312,7 +312,7 @@ impl Wizard {
             ui.text_edit_singleline(&mut self.mx_user);
             ui.end_row();
             ui.label("Password");
-            ui.add(egui::TextEdit::singleline(&mut self.mx_password).password(true));
+            ui.add(egui::TextEdit::singleline(&mut self.mx_password).id_salt("wizard-self_mx_password").password(true));
             ui.end_row();
         });
         if !self.mx_status.is_empty() {
@@ -368,13 +368,13 @@ impl Wizard {
             );
             ui.add_space(6.0);
             ui.label("Trusted senders (one per line, e.g. matrix:@me:x.org, tel:+15551234):");
-            ui.add(egui::TextEdit::multiline(&mut self.trusted_raw).desired_rows(2).desired_width(f32::INFINITY));
+            ui.add(egui::TextEdit::multiline(&mut self.trusted_raw).id_salt("wizard-self_trusted_raw").desired_rows(2).desired_width(f32::INFINITY));
             ui.label("Auto-run prefixes for trusted senders (one per line, e.g. 'git ', 'cargo test'):");
-            ui.add(egui::TextEdit::multiline(&mut self.prefixes_raw).desired_rows(2).desired_width(f32::INFINITY));
+            ui.add(egui::TextEdit::multiline(&mut self.prefixes_raw).id_salt("wizard-self_prefixes_raw").desired_rows(2).desired_width(f32::INFINITY));
         }
         ui.add_space(6.0);
         ui.label("Folders a received 'view:' path may open (one per line; empty = deny all):");
-        ui.add(egui::TextEdit::multiline(&mut self.roots_raw).desired_rows(2).desired_width(f32::INFINITY));
+        ui.add(egui::TextEdit::multiline(&mut self.roots_raw).id_salt("wizard-self_roots_raw").desired_rows(2).desired_width(f32::INFINITY));
 
         ui.add_space(8.0);
         if ui.button("Save command policy").clicked() {

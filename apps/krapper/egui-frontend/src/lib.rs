@@ -234,7 +234,7 @@ pub fn writer_ui(ui: &mut egui::Ui, w: &mut Writer,
             .color(if left < 0 { colors.warning } else { colors.text_weak }).small());
     });
     ui.separator();
-    ui.add(egui::TextEdit::multiline(&mut w.lyrics).desired_rows(8).desired_width(f32::INFINITY));
+    ui.add(egui::TextEdit::multiline(&mut w.lyrics).id_salt("lib-w_lyrics").desired_rows(8).desired_width(f32::INFINITY));
     ui.separator();
     let fits = w.fitting_blurbs().into_iter().map(|s| s.to_string()).collect::<Vec<_>>();
     if fits.is_empty() {

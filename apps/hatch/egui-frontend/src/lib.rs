@@ -736,7 +736,7 @@ impl HatchUi {
         let edit_rect = rect.shrink2(Vec2::new(18.0, 10.0));
         let resp = ui.put(
             edit_rect,
-            egui::TextEdit::singleline(&mut self.query)
+            egui::TextEdit::singleline(&mut self.query).id_salt("lib-self_query")
                 .hint_text("Search")
                 // 0.34: frame(bool) became frame(Frame); an empty Frame is
                 // the old `false` (the pill behind us is the visual frame).

@@ -80,7 +80,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 
     // ── snapshot now ───────────────────────────────────────────────────────────────────────
     ui.horizontal(|ui| {
-        let hint = egui::TextEdit::singleline(&mut app.timeline.snap_label)
+        let hint = egui::TextEdit::singleline(&mut app.timeline.snap_label).id_salt("timeline-app_timeline_snap_label")
             .hint_text("label (e.g. \"before merge\")")
             .desired_width(220.0);
         ui.add(hint);

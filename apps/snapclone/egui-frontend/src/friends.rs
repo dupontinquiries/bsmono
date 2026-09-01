@@ -582,9 +582,9 @@ pub fn friends_ui(ui: &mut egui::Ui, roster: &Roster, acc: &mut Accordion,
     ui.separator();
     ui.colored_label(c.text_weak, "Add Peer by Address");
     ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut form.host)
+        ui.add(egui::TextEdit::singleline(&mut form.host).id_salt("friends-form_host")
             .hint_text("Host / IP  or  DHT ID (sc-...)").desired_width(180.0));
-        ui.add(egui::TextEdit::singleline(&mut form.port)
+        ui.add(egui::TextEdit::singleline(&mut form.port).id_salt("friends-form_port")
             .hint_text("Port").desired_width(56.0));
     });
     ui.horizontal(|ui| {

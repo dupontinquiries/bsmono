@@ -343,7 +343,7 @@ the live path is right")
         // not tell the difference.
         let mut shown = p.output_field().to_string();
         let hint = suggest_output(&p.input);
-        if ui.add(egui::TextEdit::singleline(&mut shown).hint_text(hint)).changed() {
+        if ui.add(egui::TextEdit::singleline(&mut shown).id_salt("fileproc-shown").hint_text(hint)).changed() {
             p.set_output(&shown);
         }
         if !p.output_field().is_empty() && ui.small_button("reset").clicked() {

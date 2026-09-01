@@ -245,7 +245,7 @@ pub fn thread_view(
 
             ui.separator();
             ui.horizontal(|ui| {
-                let te = egui::TextEdit::singleline(&mut state.compose)
+                let te = egui::TextEdit::singleline(&mut state.compose).id_salt("messages-state_compose")
                     .hint_text("Message…")
                     .desired_width(ui.available_width() - 70.0);
                 let resp = ui.add(te);

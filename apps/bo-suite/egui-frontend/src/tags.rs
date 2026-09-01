@@ -287,9 +287,9 @@ pub fn tag_editor_ui(ui: &mut egui::Ui, e: &mut TagEditor,
     ui.strong(format!("Tags — {}", e.track_title));
 
     ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(&mut e.draft_name)
+        ui.add(egui::TextEdit::singleline(&mut e.draft_name).id_salt("tags-e_draft_name")
             .hint_text("New tag").desired_width(140.0));
-        ui.add(egui::TextEdit::singleline(&mut e.draft_color)
+        ui.add(egui::TextEdit::singleline(&mut e.draft_color).id_salt("tags-e_draft_color")
             .hint_text("#colour").desired_width(70.0));
         if ui.button("Add").clicked() { act = e.create(); }
     });

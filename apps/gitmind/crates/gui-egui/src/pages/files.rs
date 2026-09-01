@@ -61,7 +61,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label("🔍");
         ui.add(
-            egui::TextEdit::singleline(&mut app.files.filter)
+            egui::TextEdit::singleline(&mut app.files.filter).id_salt("files-app_files_filter")
                 .hint_text("filter — type a few letters")
                 .desired_width(240.0),
         );

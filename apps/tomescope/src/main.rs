@@ -695,7 +695,7 @@ impl TomeApp {
 
         egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
             ui.add(
-                egui::TextEdit::multiline(&mut self.opds_xml)
+                egui::TextEdit::multiline(&mut self.opds_xml).id_salt("main-self_opds_xml")
                     .desired_rows(6)
                     .desired_width(f32::INFINITY)
                     .hint_text("<feed xmlns=\"http://www.w3.org/2005/Atom\">…</feed>"),

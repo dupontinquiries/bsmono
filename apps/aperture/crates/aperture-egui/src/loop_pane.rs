@@ -111,7 +111,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, _now_ms: 
             ui.horizontal(|ui| {
                 ui.label(RichText::new("instruction").color(colors.text_weak));
                 changed |= ui
-                    .add(egui::TextEdit::singleline(&mut cfg.instruction).desired_width(f32::INFINITY))
+                    .add(egui::TextEdit::singleline(&mut cfg.instruction).id_salt("loop_pane-cfg_instruction").desired_width(f32::INFINITY))
                     .lost_focus();
             });
         }
@@ -126,7 +126,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, _now_ms: 
                 ui.label(RichText::new("host").color(colors.text_weak));
                 changed |= ui.text_edit_singleline(&mut cfg.host).lost_focus();
                 ui.label(RichText::new("key").color(colors.text_weak));
-                changed |= ui.add(egui::TextEdit::singleline(&mut cfg.key).password(true).desired_width(120.0)).lost_focus();
+                changed |= ui.add(egui::TextEdit::singleline(&mut cfg.key).id_salt("loop_pane-cfg_key").password(true).desired_width(120.0)).lost_focus();
             });
             ui.horizontal(|ui| {
                 ui.label(RichText::new("max tokens").color(colors.text_weak));
@@ -152,7 +152,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, _now_ms: 
             });
             ui.horizontal(|ui| {
                 ui.label(RichText::new("instruction").color(colors.text_weak));
-                changed |= ui.add(egui::TextEdit::singleline(&mut cfg.instruction).desired_width(f32::INFINITY)).lost_focus();
+                changed |= ui.add(egui::TextEdit::singleline(&mut cfg.instruction).id_salt("loop_pane-cfg_instruction").desired_width(f32::INFINITY)).lost_focus();
             });
         }
         ProviderKind::Ollama => {

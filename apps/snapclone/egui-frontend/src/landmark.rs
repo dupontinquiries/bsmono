@@ -180,7 +180,7 @@ pub fn add_landmark_ui(ui: &mut egui::Ui, d: &mut AddLandmark, creator_id: &str,
     let mut out = None;
     ui.vertical(|ui| {
         ui.strong("Add landmark");
-        ui.add(egui::TextEdit::singleline(&mut d.name)
+        ui.add(egui::TextEdit::singleline(&mut d.name).id_salt("landmark-d_name")
             .hint_text("Name, e.g. My apartment").desired_width(240.0));
 
         match d.fix {

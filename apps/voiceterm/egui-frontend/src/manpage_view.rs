@@ -182,7 +182,7 @@ pub fn manpage_ui(ui: &mut egui::Ui, v: &mut ManpageView,
             });
         }
         None => {
-            ui.add(egui::TextEdit::singleline(&mut v.filter)
+            ui.add(egui::TextEdit::singleline(&mut v.filter).id_salt("manpage_view-v_filter")
                 .hint_text("Search the manual").desired_width(240.0));
             if v.is_empty() {
                 ui.colored_label(c.text_weak, "No documents available.");

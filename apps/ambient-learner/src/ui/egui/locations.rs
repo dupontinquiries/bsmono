@@ -201,7 +201,7 @@ pub fn locations_ui(ui: &mut egui::Ui, p: &mut LocationsPage,
     ui.add_space(8.0);
     if p.adding {
         ui.label("What do you call this place?");
-        let resp = ui.add(egui::TextEdit::singleline(&mut p.new_name)
+        let resp = ui.add(egui::TextEdit::singleline(&mut p.new_name).id_salt("locations-p_new_name")
             .hint_text("e.g. Office"));
         // Enter accepts, as the QML's onAccepted does — a form you can only
         // submit by aiming at a button is a form you fight on a phone.

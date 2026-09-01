@@ -73,12 +73,12 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             );
             ui.horizontal(|ui| {
                 ui.label("vendor");
-                ui.add(egui::TextEdit::singleline(&mut st.udev_vid).desired_width(70.0));
+                ui.add(egui::TextEdit::singleline(&mut st.udev_vid).id_salt("diagnostics-st_udev_vid").desired_width(70.0));
                 ui.label("product");
-                ui.add(egui::TextEdit::singleline(&mut st.udev_pid).desired_width(70.0));
+                ui.add(egui::TextEdit::singleline(&mut st.udev_pid).id_salt("diagnostics-st_udev_pid").desired_width(70.0));
             });
             ui.add(
-                egui::TextEdit::multiline(&mut st.udev_rules)
+                egui::TextEdit::multiline(&mut st.udev_rules).id_salt("diagnostics-st_udev_rules")
                     .desired_rows(4)
                     .hint_text("paste the udev rules file"),
             );
@@ -106,7 +106,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     egui::CollapsingHeader::new("2 · seen but will not flash")
         .show(ui, |ui| {
             ui.add(
-                egui::TextEdit::multiline(&mut st.fastboot_out)
+                egui::TextEdit::multiline(&mut st.fastboot_out).id_salt("diagnostics-st_fastboot_out")
                     .desired_rows(3)
                     .hint_text("paste `fastboot devices` output"),
             );
@@ -126,7 +126,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                     .small(),
             );
             ui.add(
-                egui::TextEdit::multiline(&mut st.kernel_log)
+                egui::TextEdit::multiline(&mut st.kernel_log).id_salt("diagnostics-st_kernel_log")
                     .desired_rows(6)
                     .hint_text("paste dmesg or /sys/fs/pstore contents"),
             );

@@ -639,8 +639,8 @@ fn general_ui(ui: &mut egui::Ui, g: &mut General, colors: &uikit_egui::PaletteCo
         "record audio with video snaps", &mut g.record_audio);
     ui.horizontal(|ui| {
         ui.label("manual position");
-        ui.add(egui::TextEdit::singleline(&mut g.manual_lat).desired_width(80.0).hint_text("lat"));
-        ui.add(egui::TextEdit::singleline(&mut g.manual_lon).desired_width(80.0).hint_text("lon"));
+        ui.add(egui::TextEdit::singleline(&mut g.manual_lat).id_salt("settings_page-g_manual_lat").desired_width(80.0).hint_text("lat"));
+        ui.add(egui::TextEdit::singleline(&mut g.manual_lon).id_salt("settings_page-g_manual_lon").desired_width(80.0).hint_text("lon"));
     });
 
     heading(ui, "Sounds", colors);
@@ -729,7 +729,7 @@ fn network_ui(ui: &mut egui::Ui, n: &mut Network, colors: &uikit_egui::PaletteCo
     }
     ui.horizontal(|ui| {
         ui.label("additional");
-        ui.add(egui::TextEdit::singleline(&mut n.stun_extra)
+        ui.add(egui::TextEdit::singleline(&mut n.stun_extra).id_salt("settings_page-n_stun_extra")
             .hint_text("stun.example.org:3478"));
     });
 
@@ -745,7 +745,7 @@ fn network_ui(ui: &mut egui::Ui, n: &mut Network, colors: &uikit_egui::PaletteCo
                 }
             });
         if idx == relay_preset::custom_index() {
-            ui.add(egui::TextEdit::singleline(&mut custom).hint_text("wss://relay.example.org"));
+            ui.add(egui::TextEdit::singleline(&mut custom).id_salt("settings_page-custom").hint_text("wss://relay.example.org"));
         }
         let note = relay_preset::ALL[idx.min(relay_preset::ALL.len() - 1)].note;
         if !note.is_empty() {
@@ -782,7 +782,7 @@ fn storage_ui(ui: &mut egui::Ui, s: &mut Storage, colors: &uikit_egui::PaletteCo
     ui.text_edit_singleline(&mut s.export_dir);
     ui.horizontal(|ui| {
         ui.label("auto-sync");
-        ui.add(egui::TextEdit::singleline(&mut s.auto_sync_path)
+        ui.add(egui::TextEdit::singleline(&mut s.auto_sync_path).id_salt("settings_page-s_auto_sync_path")
             .hint_text("empty = monthly prompt. Or path / rsync URL"));
     });
 
@@ -819,7 +819,7 @@ fn about_ui(ui: &mut egui::Ui, a: &mut About, colors: &uikit_egui::PaletteColors
         ui, a11y, egui::Id::new("snapclone.settings.micro_dht_enabled").value(),
         "use local micro-DHT instead of the real DHT", &mut a.micro_dht_enabled);
     ui.add_enabled(a.micro_dht_enabled,
-        egui::TextEdit::singleline(&mut a.micro_dht_host).hint_text("127.0.0.1:4544"));
+        egui::TextEdit::singleline(&mut a.micro_dht_host).id_salt("settings_page-a_micro_dht_host").hint_text("127.0.0.1:4544"));
     ui.label(egui::RichText::new(if a.micro_dht_enabled {
         "enabled — the real DHT is not contacted"
     } else {

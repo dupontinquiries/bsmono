@@ -813,7 +813,7 @@ fn field_ui(ui: &mut egui::Ui, page: &Page, node: &Node, name: &str, kind: &Fiel
         FieldKind::Text { placeholder } | FieldKind::Password { placeholder } => {
             let mut v = state.value(page, node.id);
             let pw = matches!(kind, FieldKind::Password { .. });
-            let edit = egui::TextEdit::singleline(&mut v)
+            let edit = egui::TextEdit::singleline(&mut v).id_salt(("doc-field", page, node.id))
                 .hint_text(placeholder.as_str())
                 .password(pw)
                 .desired_width(180.0);
@@ -830,7 +830,7 @@ fn field_ui(ui: &mut egui::Ui, page: &Page, node: &Node, name: &str, kind: &Fiel
 
         FieldKind::TextArea => {
             let mut v = state.value(page, node.id);
-            let r = ui.add(egui::TextEdit::multiline(&mut v).desired_rows(3));
+            let r = ui.add(egui::TextEdit::multiline(&mut v).id_salt(("doc-field", page, node.id)).desired_rows(3));
             note(io, node.id, uikit_egui::a11y::Role::TextField, name, r.rect);
             if activated(io, node.id) { r.request_focus(); }
             if r.changed() {

@@ -2539,7 +2539,7 @@ impl eframe::App for App {
                     ui.separator();
                     ui.label("your name, as peers see it beside your playhead:");
                     let hint = format!("site {}", self.studio.session.doc.site.0);
-                    ui.add(egui::TextEdit::singleline(&mut self.studio.display_name)
+                    ui.add(egui::TextEdit::singleline(&mut self.studio.display_name).id_salt("lib-self_studio_display_name")
                         .hint_text(hint));
                     ui.separator();
                     ui.label("bounce fidelity — what library-bound renders cost on THIS device:");
@@ -3750,7 +3750,7 @@ impl App {
                 if !p.path.is_empty() {
                     ui.colored_label(egui::Color32::GRAY, p.path.join(" › "));
                 }
-                let edit = ui.add(egui::TextEdit::singleline(&mut p.query)
+                let edit = ui.add(egui::TextEdit::singleline(&mut p.query).id_salt("lib-p_query")
                     .hint_text(match p.pending {
                         None => "type a command…",
                         Some(_) => "pick a target…",

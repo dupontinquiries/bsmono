@@ -1252,7 +1252,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("🔍");
             let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.search.query)
+                egui::TextEdit::singleline(&mut self.search.query).id_salt("lib-self_search_query")
                     .hint_text("find in screen…")
                     .desired_width(180.0),
             );

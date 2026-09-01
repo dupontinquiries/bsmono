@@ -164,7 +164,7 @@ fn picker_ui(ui: &mut egui::Ui, p: &mut crate::device_picker::Picker) {
             // ends up in logs.
             let pw_id = ui.id().with("pw");
             let mut pw: String = ui.data(|d| d.get_temp(pw_id).unwrap_or_default());
-            ui.add(egui::TextEdit::singleline(&mut pw).password(true).desired_width(120.0));
+            ui.add(egui::TextEdit::singleline(&mut pw).id_salt("fleet-pw").password(true).desired_width(120.0));
             ui.data_mut(|d| d.insert_temp(pw_id, pw.clone()));
             if ui.button("Install key").clicked() {
                 if let Some(ip) = p.selected_ip() {
@@ -282,7 +282,7 @@ fn reroll_ui(app: &mut App, ui: &mut egui::Ui) {
             // is only needed for FIRST enrolment — after that the key is
             // installed and this stays empty, which is why the run is
             // not gated on it.
-            ui.add(egui::TextEdit::singleline(&mut st.reroll_password)
+            ui.add(egui::TextEdit::singleline(&mut st.reroll_password).id_salt("fleet-st_reroll_password")
                 .password(true).desired_width(120.0));
         });
         ui.label(egui::RichText::new(

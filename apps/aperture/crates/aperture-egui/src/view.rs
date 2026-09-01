@@ -993,7 +993,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                         Mode::GoToRoute => "describe what you're looking for…",
                         Mode::AiEditPrompt => "instruction for the selection…",
                     };
-                    let edit = egui::TextEdit::singleline(&mut p.input)
+                    let edit = egui::TextEdit::singleline(&mut p.input).id_salt("view-p_input")
                         .hint_text(hint)
                         .font(egui::TextStyle::Monospace)
                         .desired_width(f32::INFINITY);

@@ -113,7 +113,7 @@ pub fn peek_viewer_ui(ui: &mut egui::Ui, v: &mut PeekViewer) {
     let mut reload = false;
     ui.horizontal(|ui| {
         ui.label("path");
-        if ui.add(egui::TextEdit::singleline(&mut v.path).desired_width(280.0))
+        if ui.add(egui::TextEdit::singleline(&mut v.path).id_salt("peek_viewer-v_path").desired_width(280.0))
             .lost_focus()
             && ui.input(|i| i.key_pressed(egui::Key::Enter))
         {
@@ -125,7 +125,7 @@ pub fn peek_viewer_ui(ui: &mut egui::Ui, v: &mut PeekViewer) {
         // control has.
         if ui
             .add(
-                egui::TextEdit::singleline(&mut v.spec)
+                egui::TextEdit::singleline(&mut v.spec).id_salt("peek_viewer-v_spec")
                     .hint_text("5xx / 5k / @fn / A-B")
                     .desired_width(110.0),
             )
@@ -154,7 +154,7 @@ pub fn peek_viewer_ui(ui: &mut egui::Ui, v: &mut PeekViewer) {
             // Read-only rather than a label, so the slice can be selected and
             // copied — the point of a viewer.
             ui.add(
-                egui::TextEdit::multiline(&mut text)
+                egui::TextEdit::multiline(&mut text).id_salt("peek_viewer-text")
                     .code_editor()
                     .desired_width(f32::INFINITY)
                     .interactive(false),

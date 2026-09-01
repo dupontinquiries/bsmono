@@ -238,7 +238,7 @@ pub fn table_view_ui(ui: &mut egui::Ui, v: &mut TableView,
         });
     }
 
-    let r = ui.add(egui::TextEdit::singleline(&mut v.input)
+    let r = ui.add(egui::TextEdit::singleline(&mut v.input).id_salt("table_view-v_input")
         .hint_text("sort by column 2 · hide column 3 · undo").desired_width(280.0));
     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
         submitted = Some(v.input.trim().to_string());

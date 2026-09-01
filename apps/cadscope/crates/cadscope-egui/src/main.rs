@@ -1691,7 +1691,7 @@ impl eframe::App for App {
                 ui.separator();
                 let submit = ui
                     .add(
-                        egui::TextEdit::singleline(&mut self.ref_input)
+                        egui::TextEdit::singleline(&mut self.ref_input).id_salt("main-self_ref_input")
                             .hint_text("volume of puma")
                             .desired_width(f32::INFINITY),
                     )

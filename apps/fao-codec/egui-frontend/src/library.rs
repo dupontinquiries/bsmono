@@ -134,7 +134,7 @@ pub fn ui(app: &mut crate::App, ui: &mut egui::Ui) {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.label("folder:");
-        ui.add(egui::TextEdit::singleline(&mut st.path).desired_width(320.0));
+        ui.add(egui::TextEdit::singleline(&mut st.path).id_salt("library-st_path").desired_width(320.0));
     });
     ui.horizontal(|ui| {
         if ui.button("Initialize New").on_hover_text("Create a new empty library at the folder above").clicked() { st.init_new(); }

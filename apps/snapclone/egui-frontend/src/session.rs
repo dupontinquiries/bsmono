@@ -390,7 +390,7 @@ pub fn login_ui(ui: &mut egui::Ui, l: &mut Login,
         ui.heading("SnapClone");
         ui.add_space(12.0);
 
-        let user = ui.add(egui::TextEdit::singleline(&mut l.username)
+        let user = ui.add(egui::TextEdit::singleline(&mut l.username).id_salt("session-l_username")
             .hint_text("Username").desired_width(240.0));
         // The guard matters: `l.focus` stays Username for as long as the user is
         // typing there, so an unguarded call re-requests focus every frame and
@@ -401,7 +401,7 @@ pub fn login_ui(ui: &mut egui::Ui, l: &mut Login,
             l.username_return();
         }
 
-        let pass = ui.add(egui::TextEdit::singleline(&mut l.password)
+        let pass = ui.add(egui::TextEdit::singleline(&mut l.password).id_salt("session-l_password")
             .hint_text("Password (optional)").password(true).desired_width(240.0));
         if l.focus == Field::Password && !pass.has_focus() { pass.request_focus(); }
         let pass_enter = pass.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
