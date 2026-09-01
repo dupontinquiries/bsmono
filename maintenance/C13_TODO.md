@@ -1437,3 +1437,52 @@ for anything touching recurrent state — it is 90M and fully recurrent, so
 it catches hybrid-cache bugs in seconds rather than on a 27B. Second, the
 glimmer implementation has no checkpoint to test against, so it should not
 progress past the registry/refusal stage until one exists.
+
+
+## 43. §14 settled, and it was pointing at the wrong thing
+
+bot-arena's `engine` module is **not dead**. main.rs, heroes.rs and
+inspect.rs call it throughout (`run_engine`, `cleanup_workspace_temp`,
+`all_edit_ops`, `container_count`, `load_checkpoint`). §14's "13 functions
+with zero callers" describes a SUBSET of engine.rs, and the four fleet test
+failures have nothing to do with it — so the question §14 posed ("do the
+tests exercise dead code, or is §14 wrong?") had a third answer: both
+claims were about different parts of the same file.
+
+The failures were environmental: two of the four need `python3 -m pytest`,
+which the runner does not have, so `evaluate_real` scored 0 on everything
+and the assertions read as engine bugs. Both now skip with a named reason
+(fixed this session). The other two pass locally.
+
+**Still open from §14 proper:** whether that 13-function git-diff
+version-merging subsystem is genuinely unreferenced. That is now a separate,
+smaller question than it looked, and deleting it is a normal dead-code call
+rather than something that might break the four tests.
+
+**Worth doing on the fleet box:** install pytest. Those two tests are the
+only end-to-end coverage of `evaluate_real`, so skipped is a real loss even
+though it beats a permanent red.
+
+## 44. Third instance of the shared-mutable-state race — worth a lint
+
+fao-codec's DCT basis was a `static mut` behind a check-then-set Relaxed
+`AtomicBool` (fixed this session, §32's "ARM SIMD" guess was wrong). That
+makes three this session, all invisible until something ran tests in
+parallel, all with a real consequence beyond a red test:
+
+1. board-layouts — a process-wide `CodeMode` atomic → wrong keyboard layout.
+2. voiceterm `qml_gen` — id counters reset by a concurrent test → duplicate
+   QML ids, which is a parse error in QML.
+3. fao-codec `dct` — half-initialised cosine basis → wrong transform.
+
+The shape is always the same: process-wide mutable state, no
+happens-before, and a reset/init that races. Two of the three were "fixed"
+by making the state thread-local or once-initialised rather than by locking
+the tests, which is the right direction — the invariant becomes structural.
+
+Worth a small check in `maintenance/tools`: flag `static mut`, and flag
+`AtomicBool` used as a check-then-set init guard (a `load` followed by a
+`store(true)` with writes between, on a Relaxed ordering). Both are
+mechanical to detect and neither has a legitimate use in this tree —
+`static mut` is a hard error in edition 2024 anyway, so the codebase will
+have to move regardless.
