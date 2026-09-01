@@ -3351,16 +3351,56 @@ them to", patches.len());
             crate::read_harness::ModelClass::Sota => 1200,
         };
         let tree = crate::workspace_exec::repo_tree(root, tree_cap);
+        // THE INSTRUCTION USED TO BE A LIE, and it is the likeliest reason a
+        // small model looks incapable here.
+        //
+        // This said "Its files are readable — read the file instead of reasoning
+        // from the error text alone, and say which file you read." A plain chat
+        // turn cannot read anything: the read loop lives in the AGENT path
+        // (`AgentRun`/`AgentStep`), and nothing in the chat reply path parses a
+        // read request or re-submits. So the model was told to do something
+        // impossible, given 40 file NAMES and one commit subject, and then asked
+        // to "summarize the codebase". No model summarises a repository from a
+        // truncated directory listing; a fluent one produces confident vagueness,
+        // which reads as the model being weak rather than the prompt being empty.
+        //
+        // Two changes. The instruction now describes what is actually available,
+        // and the shared docs go in — the same `collect_shared_docs` the agent
+        // path already uses. A README is what a person reads first when asked to
+        // summarise a repository, and it is the difference between names and
+        // content. Budgeted by the same class, so a 1B still gets a short block.
         let mut out = format!(
-            "A workspace is OPEN at {}. Its files are readable — when a question turns on what \
-the code actually says, read the file instead of reasoning from the error text alone, and say \
-which file you read.\n\n",
+            "A workspace is OPEN at {}. What follows is everything you have been given about \
+it — a partial file tree and any shared notes. You CANNOT open files in this conversation. \
+If answering needs a file you have not been shown, say which file and why rather than \
+guessing at its contents.\n\n",
             root.display());
         out.push_str(&crate::read_harness::fence("repository tree", &root.display().to_string(), &tree, &b, None));
+        // Content, not just names. Without this the block is a listing, and a
+        // question about what the code DOES has nothing to stand on.
+        let docs = crate::workspace_exec::collect_shared_docs(root, b.block_bytes);
+        if !docs.is_empty() {
+            out.push_str(&crate::read_harness::fence("shared notes", ".logscope/docs", &docs, &b, None));
+        }
         if let Some(c) = crate::read_harness::read_git_log(root, 1).first() {
             out.push_str(&crate::read_harness::fence(
                 "most recent commit", "git log -n 1",
                 &format!("{} {}", c.short, c.subject), &b, None));
+        }
+        // THE MISSING DIAGNOSTIC. "the model is bad" and "the prompt was a
+        // directory listing" were indistinguishable from outside; one line
+        // separates them. Reported once per distinct shape rather than per turn,
+        // so it informs without becoming noise in a long chat.
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+            let shape = (tree.lines().count() as u64) << 32 | out.len() as u64 & 0xffff_ffff;
+            if LAST.swap(shape, Ordering::Relaxed) != shape {
+                crate::diag!("workspace context: {} tree entries (cap {tree_cap}, class {:?}), \
+{} bytes of shared notes, {} bytes total in the system prompt. This is ALL the model can see of \
+the repository — a chat turn cannot open files.",
+                    tree.lines().count(), class, docs.len(), out.len());
+            }
         }
         Some(out)
     }

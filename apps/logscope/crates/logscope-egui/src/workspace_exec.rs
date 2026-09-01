@@ -1933,9 +1933,25 @@ fn version_key(v: &str) -> Vec<u64> {
 pub fn repo_tree(root: &std::path::Path, cap: usize) -> String {
     const SKIP: [&str; 7] = ["target", ".git", ".gitmind", ".logscope", "node_modules", "dist", ".cargo"];
     let mut out: Vec<String> = Vec::new();
-    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    // BREADTH-FIRST, and the change matters most exactly where the cap bites.
+    //
+    // This was a `Vec` used as a stack (`stack.pop()`), i.e. depth-first. Under a
+    // tight cap that is close to the worst possible order: a Small-class model
+    // gets 40 entries, and depth-first spends all 40 inside whichever deep
+    // subdirectory it descended into first, never reaching the sibling
+    // top-level directories that say what the repository IS. Asked to
+    // "summarize the codebase" the model was shown one leaf of one branch.
+    //
+    // Breadth-first spends the same 40 entries on the shallowest files it can
+    // find — the top-level manifests and READMEs first, then one level down.
+    // For a summary that is the useful half of the tree, and for a large cap
+    // the two orders converge because everything is included anyway. Same cost,
+    // same output when not truncated.
+    let mut queue: std::collections::VecDeque<(std::path::PathBuf, usize)> =
+        std::collections::VecDeque::new();
+    queue.push_back((root.to_path_buf(), 0usize));
     let mut truncated = false;
-    while let Some((dir, depth)) = stack.pop() {
+    while let Some((dir, depth)) = queue.pop_front() {
         if depth > 6 { continue; }
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         let mut entries: Vec<_> = rd.flatten().collect();
@@ -1945,7 +1961,7 @@ pub fn repo_tree(root: &std::path::Path, cap: usize) -> String {
             let p = e.path();
             let name = e.file_name().to_string_lossy().into_owned();
             if p.is_dir() {
-                if !SKIP.contains(&name.as_str()) && !name.starts_with('.') { stack.push((p, depth + 1)); }
+                if !SKIP.contains(&name.as_str()) && !name.starts_with('.') { queue.push_back((p, depth + 1)); }
             } else if !name.starts_with('.') {
                 if let Ok(rel) = p.strip_prefix(root) {
                     let size = e.metadata().map(|m| m.len()).unwrap_or(0);
@@ -5822,5 +5838,55 @@ echo 'test the_thing ... ok'\nelse\necho 'test the_thing ... FAILED'\nfi\necho '
         assert!(run.prompt_snapshot().contains("fails without your change"),
                 "and must say what would count — a gate with no stated way through is a wall");
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod repo_tree_order_tests {
+    use super::repo_tree;
+
+    /// Under a tight cap the tree must describe the repository, not one branch of it.
+    ///
+    /// The failure this pins: with a depth-first walk and a Small-class cap of
+    /// 40, every entry came from whichever deep subdirectory was descended into
+    /// first, so `top.md` and the other top-level files never appeared. A model
+    /// asked to summarise the codebase from that sees a leaf and nothing else.
+    #[test]
+    fn a_tight_cap_keeps_the_shallow_files_not_one_deep_branch() {
+        let d = std::env::temp_dir().join(format!("wstree-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        // A deep branch with plenty of files to exhaust a small cap...
+        let deep = d.join("a/b/c/d");
+        std::fs::create_dir_all(&deep).unwrap();
+        for i in 0..30 {
+            std::fs::write(deep.join(format!("deep{i}.rs")), "x").unwrap();
+        }
+        // ...beside the top-level files that actually describe the project.
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("README.md"), "x").unwrap();
+        std::fs::write(d.join("Cargo.toml"), "x").unwrap();
+
+        let tree = repo_tree(&d, 6);
+        let _ = std::fs::remove_dir_all(&d);
+
+        assert!(tree.contains("README.md"),
+            "a 6-entry tree that omits the README is not a description of the repo:\n{tree}");
+        assert!(tree.contains("Cargo.toml"), "{tree}");
+        assert!(tree.contains("truncated"), "a capped tree must say it was capped:\n{tree}");
+    }
+
+    #[test]
+    fn an_ample_cap_still_reaches_the_deep_files() {
+        // Breadth-first must not become "shallow only" — with room, everything
+        // is still included, which is what keeps the large-model path unchanged.
+        let d = std::env::temp_dir().join(format!("wstree-ample-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("a/b")).unwrap();
+        std::fs::write(d.join("README.md"), "x").unwrap();
+        std::fs::write(d.join("a/b/leaf.rs"), "x").unwrap();
+        let tree = repo_tree(&d, 500);
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(tree.contains("README.md") && tree.contains("leaf.rs"), "{tree}");
+        assert!(!tree.contains("truncated"), "{tree}");
     }
 }
