@@ -10,6 +10,7 @@ use logscope_egui::model::ModelState;
 use logscope_egui::tabs::chat::Chat;
 use logscope_egui::theme;
 
+use logscope_egui::diagfeed;
 use std::env;
 
 struct App { chat: Chat, model: ModelState, doc: Doc, infer: Inference }
@@ -40,6 +41,10 @@ fn main() -> eframe::Result {
             chat.debug_force_show_context(true); // force the sidebar open for this screenshot
             chat.debug_force_engine_extras(true); // also show metrics/checkpoints/history cards
             chat.debug_force_checkpoints();
+            for _ in 0..5 { diagfeed::record("template mismatch: chat markers not recognized by this tokenizer"); }
+            diagfeed::record("load failed: device error initializing backend");
+            diagfeed::record("load failed: device error initializing backend");
+            diagfeed::record("load failed: device error initializing backend");
             let page = env::var("LOGSCOPE_RIGHT_PAGE").ok().and_then(|v| v.parse::<u8>().ok()).unwrap_or(3);
             chat.debug_force_right_page(page);
             let mut doc = Doc::default();

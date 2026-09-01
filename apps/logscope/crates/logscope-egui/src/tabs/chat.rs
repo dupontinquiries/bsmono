@@ -8319,14 +8319,24 @@ if let Some(msg) = self.error_banner.clone() {
                                             crate::diagfeed::Kind::Performance => None,
                                             crate::diagfeed::Kind::Context => Some(egui::Color32::from_gray(140)),
                                         };
-                                        let line = format!("{}{}",
-                                            crate::diagfeed::shorten(&e.text, 72),
-                                            crate::diagfeed::count_suffix(e.count));
+                                        let line = crate::diagfeed::shorten(&e.text, 72);
                                         let rt = RichText::new(line).small();
                                         let rt = match col { Some(c) => rt.color(c), None => rt };
                                         // Full text on hover: shortening keeps the panel readable,
                                         // and the tail is where the engine explains itself.
-                                        ui.label(rt).on_hover_text(&e.text);
+                                        ui.horizontal(|ui| {
+                                            ui.label(rt).on_hover_text(&e.text);
+                                            // A folded line repeated itself — theme::event_pill is the
+                                            // built widget for exactly this (kind + ×count, reddens on
+                                            // spike) and had no callers; count_suffix's plain "  ×N"
+                                            // text is still what a Failure/Warning's own severity
+                                            // colour can't show (HOW OFTEN), so it becomes a pill
+                                            // instead of more inline text. Silent at 1, same as
+                                            // count_suffix always was.
+                                            if e.count > 1 {
+                                                theme::event_pill(ui, e.kind.short_label(), e.count, e.kind == crate::diagfeed::Kind::Failure);
+                                            }
+                                        });
                                     }
                                 });
                             }

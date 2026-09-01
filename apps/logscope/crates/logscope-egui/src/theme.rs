@@ -1920,7 +1920,6 @@ pub fn list_item(ui: &mut egui::Ui, selected: bool, body: impl FnOnce(&mut egui:
 }
 
 /// A small event/count pill (kind + ×count); reddens on `spike`.
-#[allow(dead_code)]
 pub fn event_pill(ui: &mut egui::Ui, kind: &str, count: usize, spike: bool) {
     let cc = if spike { RED() } else { AMBER() };
     Frame {
