@@ -39,6 +39,7 @@ fn main() -> eframe::Result {
             chat.boot_demo(false); // populates msgs (incl. a code-bearing reply) WITHOUT forcing spatial_view
             chat.debug_force_show_context(true); // force the sidebar open for this screenshot
             chat.debug_force_engine_extras(true); // also show metrics/checkpoints/history cards
+            chat.debug_force_checkpoints();
             let page = env::var("LOGSCOPE_RIGHT_PAGE").ok().and_then(|v| v.parse::<u8>().ok()).unwrap_or(3);
             chat.debug_force_right_page(page);
             let mut doc = Doc::default();

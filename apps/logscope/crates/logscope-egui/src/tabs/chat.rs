@@ -2188,6 +2188,14 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
     /// Also render for render-verification harnesses: flips on the metrics card (checkpoints/
     /// history need private struct construction this isn't worth adding just for a screenshot).
     pub fn debug_force_engine_extras(&mut self, on: bool) { self.show_metrics = on; }
+    /// Populate Checkpoints for render-verification harnesses (History needs a real on-disk Vault
+    /// — vault::commit writes content-addressed blobs — which isn't worth faking here; that card
+    /// is verified by code review + the identical theme::panel()/list_item() calls already
+    /// confirmed elsewhere, same as noted in the commit history).
+    pub fn debug_force_checkpoints(&mut self) {
+        self.checkpoints.push(Checkpoint { label: "before refactor".into(), at_unix: 0, msgs: Vec::new() });
+        self.show_checkpoints = true;
+    }
 
     pub fn boot_demo(&mut self, spatial: bool) {
         use Role::{Assistant, User};
@@ -8933,9 +8941,11 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                 theme::panel(ui, theme::CYAN(), "Checkpoints", None, |ui| {
                     egui::ScrollArea::vertical().id_salt("ckpts").max_height(140.0).show(ui, |ui| {
                         for (i, cp) in self.checkpoints.iter().enumerate().rev() {
-                            ui.horizontal(|ui| {
-                                if theme::action_button(ui, "Restore", theme::CYAN(), !streaming).clicked() { rollback = Some(i); }
-                                ui.label(RichText::new(format!("{} · {} msgs", cp.label, cp.msgs.len())).color(theme::DIM()).small());
+                            theme::list_item(ui, false, |ui| {
+                                ui.horizontal(|ui| {
+                                    if theme::action_button(ui, "Restore", theme::CYAN(), !streaming).clicked() { rollback = Some(i); }
+                                    ui.label(RichText::new(format!("{} · {} msgs", cp.label, cp.msgs.len())).color(theme::DIM()).small());
+                                });
                             });
                         }
                     });
@@ -8955,11 +8965,13 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                     theme::panel(ui, theme::CYAN(), "History", None, |ui| {
                         egui::ScrollArea::vertical().id_salt("tree").max_height(170.0).show(ui, |ui| {
                             for (id, parent, label, nfiles, msgs) in &rows {
-                                ui.horizontal(|ui| {
-                                    let here = head_now == Some(*id);
-                                    if theme::action_button(ui, if here { "● here" } else { "Return" }, theme::CYAN(), !streaming && !here).clicked() { return_to = Some(*id); }
-                                    let from = parent.map(|p| format!(" ←#{p}")).unwrap_or_else(|| " (root)".into());
-                                    ui.label(RichText::new(format!("#{id}{from}  {}  · {} msgs · {} files", label, msgs, nfiles)).color(if here { theme::CYAN() } else { theme::DIM() }).small());
+                                let here = head_now == Some(*id);
+                                theme::list_item(ui, here, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if theme::action_button(ui, if here { "● here" } else { "Return" }, theme::CYAN(), !streaming && !here).clicked() { return_to = Some(*id); }
+                                        let from = parent.map(|p| format!(" ←#{p}")).unwrap_or_else(|| " (root)".into());
+                                        ui.label(RichText::new(format!("#{id}{from}  {}  · {} msgs · {} files", label, msgs, nfiles)).color(if here { theme::CYAN() } else { theme::DIM() }).small());
+                                    });
                                 });
                             }
                         });

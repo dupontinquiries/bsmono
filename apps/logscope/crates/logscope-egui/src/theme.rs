@@ -1897,7 +1897,6 @@ pub fn stat_tile(ui: &mut egui::Ui, label: &str, value: &str, accent: Color32) {
 
 /// A run-list/sidebar item card. Idle reads as PANEL2; selected wears an amber
 /// border + warm fill; hovering fades an amber border in. Returns true on click.
-#[allow(dead_code)]
 pub fn list_item(ui: &mut egui::Ui, selected: bool, body: impl FnOnce(&mut egui::Ui)) -> bool {
     let (fill, stroke) = if selected { (lerp_col(PANEL2(), AMBER(), 0.10), AMBER()) } else { (PANEL2(), LINE()) };
     let inner = Frame {
