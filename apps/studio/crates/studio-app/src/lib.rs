@@ -3636,6 +3636,20 @@ impl App {
         }
     }
 
+    /// The width a phone-safe dialog should ask for, given the screen it has
+    /// to live on. Same formula as `logscope-egui::mobilelayout::dialog_width`
+    /// (that crate hit this exact bug first — `Window::default_width` /
+    /// `fixed_size` are desktop numbers, and on a phone-width screen they
+    /// put the window's own edges off-screen or eat almost the whole
+    /// display): never wider than the screen minus a margin on each side,
+    /// never wider than desired, never below a usable floor.
+    fn dialog_width(screen_pt: f32, desired_pt: f32) -> f32 {
+        const MARGIN_PT: f32 = 12.0;
+        const FLOOR_PT: f32 = 240.0;
+        let usable = screen_pt - 2.0 * MARGIN_PT;
+        desired_pt.min(usable).max(FLOOR_PT.min(desired_pt))
+    }
+
     /// The command palette: a query box, ranked choices, and the wizard's
     /// breadcrumb. Enter takes the top choice, arrows move, Escape backs
     /// out one step (and out of the palette at the root) — the keyboard
@@ -3650,6 +3664,7 @@ impl App {
 
         // Keys first: the list is drawn from the query, so navigation must
         // resolve before the widgets read it.
+        let mut moved = false;
         ctx.input_mut(|i| {
             if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
                 if p.pending.is_some() {
@@ -3659,9 +3674,13 @@ impl App {
                     p.selected = 0;
                 } else { close = true; }
             }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) { p.selected += 1; }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                p.selected += 1;
+                moved = true;
+            }
             if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
                 p.selected = p.selected.saturating_sub(1);
+                moved = true;
             }
         });
         let ranked = palette::filter(&choices, &p.query);
@@ -3670,8 +3689,9 @@ impl App {
             chosen = ranked.get(p.selected).map(|c| (*c).clone());
         }
 
+        let width = Self::dialog_width(ctx.content_rect().width(), 420.0);
         egui::Window::new("Command palette").open(&mut open).resizable(false)
-            .collapsible(false).default_width(420.0)
+            .collapsible(false).default_width(width)
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
             .show(ctx, |ui| {
                 if !p.path.is_empty() {
@@ -3698,6 +3718,14 @@ impl App {
                             }
                             hit
                         }).inner;
+                        // Arrows move `p.selected` above, but the scroll area
+                        // doesn't know that happened — without this, the
+                        // highlight moves past the visible rows and the user
+                        // has to reach for the mouse wheel to find it again,
+                        // which defeats the whole point of arrow navigation.
+                        if moved && i == p.selected {
+                            row.scroll_to_me(Some(egui::Align::Center));
+                        }
                         if row.clicked() { chosen = Some((*c).clone()); }
                     }
                 });
