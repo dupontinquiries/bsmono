@@ -795,3 +795,23 @@ explicitly NOT something to attempt without a dedicated session and a
 plan for verifying both call sites (whatever consumes `apps/snapclone`
 as a GUI app vs whatever consumes `system/snapclone` as a daemon) still
 work after unification.
+
+## 18. scene-kit: spatial/textsurface migrated, the rest confirmed still diverged
+
+Following up on shared/scene-kit's own lib.rs doc comment ("logscope
+still carries its own copy; it migrates here at the next scene
+co-change"): content-hashed every file and found `spatial.rs` and
+`textsurface.rs` were byte-identical between logscope-egui and
+scene-kit, with no cross-dependency on scene-kit's other modules.
+Migrated those two (commit `2d1741ca`) — logscope-egui now consumes
+`scene_kit::{spatial, textsurface}` via `pub use` instead of its own
+copies, -656 lines, verified compiling clean.
+
+Checked the other four modules scene-kit's own doc names as diverged
+(mesh3d, gpuscene, texgen, glow_scene) rather than assuming: `diff`
+against logscope-egui's copies shows 100–360 changed lines each,
+confirming they're genuinely not safe for the same mechanical swap.
+Reconciling those needs someone who can verify the visual/rendering
+result (per-vertex UVs, the inscription material, the wired `u_touch`
+response) actually still looks right in both consumers after merging —
+not a compile-time-only check like the two modules just migrated.
