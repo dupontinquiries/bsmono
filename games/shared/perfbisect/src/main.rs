@@ -432,9 +432,17 @@ fn run(args: &[String]) -> i32 {
         }
     }
 
-    // the game, under the matrix
+    // the game, under the matrix. `unendlich-fullgame` is the maintained
+    // bin (it followed the GLFW-decoupling refactor of input.rs;
+    // `unendlich-world` did not and no longer builds), so it is tried
+    // first; the older bin is the fallback for a tree where it still
+    // compiles.
     if want("game") {
-        match eng.bin("unendlich-world") {
+        let game = eng.bin("unendlich-fullgame").or_else(|| eng.bin("unendlich-world"));
+        if let Some(b) = &game {
+            rep.meta.insert("game_bin".into(), b.display().to_string());
+        }
+        match game {
             Some(b) => {
                 let dur = (seconds * 1000).to_string();
                 let warm = ((seconds * 1000) / 4).to_string();
@@ -461,7 +469,7 @@ fn run(args: &[String]) -> i32 {
                 }
             }
             None => {
-                rep.meta.insert("missing.unendlich-world".into(), "not built (cargo build --release --features render --bin unendlich-world)".into());
+                rep.meta.insert("missing.game".into(), "no unendlich-fullgame or unendlich-world in target/ (cargo build --release --features \"render window ui-overlay\" --bin unendlich-fullgame)".into());
             }
         }
     }
@@ -609,8 +617,9 @@ fn main() {
             let _ = writeln!(e, "perfbisect — bisect a cross-machine performance disparity\n");
             let _ = writeln!(e, "  perfbisect run [--engine games/unendlich] [--out host.tsv] [--seconds 12] [--only calib,probe,game] [--quick]");
             let _ = writeln!(e, "  perfbisect compare desktop.tsv phone.tsv\n");
-            let _ = writeln!(e, "build the engine's probes first: cd games/unendlich && cargo build --release --features \"render window\"");
-            let _ = writeln!(e, "  --bin unendlich-world --bin perf-probe --bin world-bench --bin mesh-bench --bin octree-bench");
+            let _ = writeln!(e, "build the engine's probes first: cd games/unendlich && cargo build --release --features \"render window ui-overlay\"");
+            let _ = writeln!(e, "  --bin unendlich-fullgame --bin perf-probe --bin world-bench --bin mesh-bench --bin octree-bench");
+            let _ = writeln!(e, "run from the MONOREPO ROOT: --manifest-path and --engine are relative to it");
             2
         }
     };

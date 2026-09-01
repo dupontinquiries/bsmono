@@ -7,11 +7,13 @@ the game under a knob matrix, fingerprints each machine, and divides.
 ```sh
 # once, per machine: build the engine's probes and the game
 cd games/unendlich
-cargo build --release --features "render window" --bin unendlich-world --bin perf-probe \
-  --bin world-bench --bin mesh-bench --bin octree-bench
-# optional, same features: --bin gpu-mesh-bench
+cargo build --release --features "render window ui-overlay" --bin unendlich-fullgame \
+  --bin perf-probe --bin world-bench --bin mesh-bench --bin octree-bench
+# optional: --bin gpu-mesh-bench. `unendlich-world` is the older game bin and
+# does not build after the input.rs refactor; the suite drives unendlich-fullgame
+# and falls back to unendlich-world only if that is what is in target/.
 
-# then, from the monorepo root, on each machine
+# then, FROM THE MONOREPO ROOT (both paths below are relative to it), on each machine
 cargo run --release --manifest-path games/shared/perfbisect/Cargo.toml -- \
   run --engine games/unendlich --out desktop.tsv          # ~18 x 12 s of game runs
 #   --quick      five variants instead of eighteen
