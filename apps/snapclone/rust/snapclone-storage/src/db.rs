@@ -7,7 +7,7 @@ use crate::snap::{Snap, SnapId};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
-use tracing::{debug, warn};
+use tracing::debug;
 
 pub struct Db {
     conn: Connection,
@@ -56,7 +56,7 @@ impl Db {
             existing.as_ref().map(|e| e.vcard_uid.as_str()).unwrap_or("").to_owned()
         } else { c.vcard_uid.clone() };
 
-        let display = if c.display_name.is_empty() { &c.id } else { &c.display_name };
+        let shown_name = if c.display_name.is_empty() { &c.id } else { &c.display_name };
         let last_seen = c.last_seen.map(|t| t.to_rfc3339()).unwrap_or_default();
 
         self.conn.execute(
@@ -65,14 +65,14 @@ impl Db {
               sc_id, vcard_uid, contact_state, last_seen_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
-                c.id, display, c.avatar_path, c.online as i64,
+                c.id, shown_name, c.avatar_path, c.online as i64,
                 nickname, notes,
                 c.id,      // sc_id = same as id
                 vcard_uid, c.state.to_int(), last_seen,
             ],
         )?;
 
-        debug!("save_contact: {} {} state={}", c.id, display, c.state.to_int());
+        debug!("save_contact: {} {} state={}", c.id, shown_name, c.state.to_int());
         Ok(())
     }
 
