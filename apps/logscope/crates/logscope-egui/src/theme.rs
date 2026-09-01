@@ -1760,9 +1760,76 @@ pub(crate) fn carved_frame(p: &egui::Painter, rect: egui::Rect, t: f32, accent: 
             }
         }
     }
+    // SPECULAR SHEEN — the thing that makes this read as a lit surface rather
+    // than an embossed print.
+    //
+    // The bevel above uses a FIXED lit edge and a fixed shadow edge, so the
+    // panel looks identically embossed from any angle and from any cursor
+    // position. Real polished stone under a lamp does not: the highlight has a
+    // place, and it moves. This adds that, and it costs no call-site changes
+    // because the pointer is reachable from the painter's own context — every
+    // carved panel in the app becomes lit at once.
+    //
+    // Drawn on the TOP band only. A highlight on all four edges reads as a glow
+    // (the panel emitting light) rather than as a specular (the panel catching
+    // it), and glow is the cheap-looking one.
+    if let Some(ptr) = p.ctx().pointer_latest_pos() {
+        // Distance to the rect, 0 when inside. `sheen`'s smoothstep falloff
+        // then does the rest — see uikit_egui::lux for why linear is wrong here.
+        let dx = (rect.left() - ptr.x).max(ptr.x - rect.right()).max(0.0);
+        let dy = (rect.top() - ptr.y).max(ptr.y - rect.bottom()).max(0.0);
+        let dist = (dx * dx + dy * dy).sqrt();
+        // Falloff generous enough that the highlight is already fading up as
+        // the pointer approaches; a sheen that switches on at the panel edge
+        // reads as a hover state, which is exactly what this is not.
+        let s = uikit_egui::lux::sheen(ptr.x - rect.left(), rect.width(), dist, 140.0);
+        if s.intensity > 0.01 {
+            // A short bright core with a longer soft shoulder, laid along the
+            // top edge. Alpha stays low — the effect should be noticed as the
+            // surface looking right, not as a visible gradient.
+            let cx = rect.left() + rect.width() * s.pos;
+            let half = (rect.width() * 0.34).clamp(28.0, 260.0);
+            let steps = 14;
+            for i in 0..steps {
+                let f = i as f32 / (steps - 1) as f32;          // 0..1 across the band
+                let off = (f * 2.0 - 1.0) * half;                // -half..half
+                let fade = 1.0 - (f * 2.0 - 1.0).abs();          // triangular
+                let a = (s.intensity * fade * fade * 26.0) as u8;
+                if a == 0 { continue; }
+                let x = cx + off;
+                if x < rect.left() || x > rect.right() { continue; }
+                p.line_segment(
+                    [egui::pos2(x, rect.top() + 1.2), egui::pos2(x, rect.top() + 4.0)],
+                    Stroke::new(2.2_f32, Color32::from_white_alpha(a)));
+            }
+        }
+    }
     // glowing runes at the corners — only on panels big enough to carry them, gently breathing
     if rect.width() > 90.0 && rect.height() > 70.0 {
         let glow = 0.45 + 0.30 * (0.5 + 0.5 * (t * 0.7).sin());
+        // GILT CORNER BRACKETS, under the runes.
+        //
+        // The reference frames set metal into the stone at each corner rather
+        // than ruling a border all the way round, and the difference is not
+        // decorative: a continuous rule reads as a drawn box, four corner
+        // pieces read as hardware fitted to a surface. `lux::bracket` sizes
+        // them off the SHORT side so a wide status bar cannot get jewellery
+        // taller than itself.
+        let bl = uikit_egui::lux::bracket(rect.width(), rect.height());
+        let inset = 5.0;
+        let gilt = Color32::from_rgba_unmultiplied(
+            accent.r(), accent.g(), accent.b(), (70.0 + 50.0 * glow) as u8);
+        let w = Stroke::new(1.3_f32, gilt);
+        for (corner, sx, sy) in [
+            (rect.left_top(),     1.0_f32,  1.0_f32),
+            (rect.right_top(),   -1.0,      1.0),
+            (rect.left_bottom(),  1.0,     -1.0),
+            (rect.right_bottom(),-1.0,     -1.0),
+        ] {
+            let o = egui::pos2(corner.x + inset * sx, corner.y + inset * sy);
+            p.line_segment([o, egui::pos2(o.x + bl * sx, o.y)], w);
+            p.line_segment([o, egui::pos2(o.x, o.y + bl * sy)], w);
+        }
         let m = 13.0;
         rune_mark(p, rect.left_top() + egui::vec2(m, m), 6.0, accent, 1, glow);
         rune_mark(p, rect.right_top() + egui::vec2(-m, m), 6.0, accent, 4, glow);

@@ -190,3 +190,26 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod integration_notes {
+    //! Properties the wiring depends on, checked here so a change to `Weight`
+    //! cannot quietly break `anim_secs_for`.
+
+    use super::*;
+
+    #[test]
+    fn the_weight_ladder_brackets_the_old_uniform_duration() {
+        // Everything used to animate at BASE_ANIM_SECS (0.15s). The point of a
+        // weight model is that the old value now sits INSIDE the range rather
+        // than being every value — light is quicker, heavy is slower. If all
+        // three landed on one side, this would just be a global speed change
+        // wearing a new name.
+        const OLD_UNIFORM: f32 = 0.15;
+        assert!(Weight::Light.secs() < OLD_UNIFORM);
+        assert!(Weight::Heavy.secs() > OLD_UNIFORM);
+        assert!((Weight::Medium.secs() - OLD_UNIFORM).abs() < 0.05,
+            "medium should stay near the value everything already had, so most \
+             surfaces feel unchanged");
+    }
+}

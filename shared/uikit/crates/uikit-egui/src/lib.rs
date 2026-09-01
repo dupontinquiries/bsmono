@@ -256,6 +256,22 @@ pub fn anim_secs(ctx: &egui::Context, base: f32) -> f32 {
     (base * scale).max(0.0)
 }
 
+/// Animation duration for a surface of this SIZE, already scaled by the user's
+/// motion preference.
+///
+/// The companion to `anim_secs` for callers that have a rect rather than a
+/// number. `anim_secs(ctx, BASE_ANIM_SECS)` gives every surface the same 150ms,
+/// and uniform durations are one of the two things that make a UI feel
+/// weightless — a toggle and a whole page settling at identical speed is not
+/// something any physical object does. `lux::Weight` classifies from area so
+/// callers cannot drift apart on what counts as heavy.
+///
+/// Still honours Reduced motion, because that setting means instant and a
+/// weight model must not smuggle animation back in.
+pub fn anim_secs_for(ctx: &egui::Context, rect: egui::Rect) -> f32 {
+    anim_secs(ctx, lux::Weight::of(rect.width() * rect.height()).secs())
+}
+
 /// Replace a colour's alpha (0..255), preserving RGB — the primitive behind translucent surfaces.
 pub fn with_alpha(c: egui::Color32, alpha: u8) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
