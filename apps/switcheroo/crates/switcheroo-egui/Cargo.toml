@@ -1,0 +1,34 @@
+[package]
+name = "switcheroo-egui"
+version = "0.1.0"
+edition = "2021"
+description = "switcheroo's egui shell: outlet list, tap-to-toggle, and a visible activity log of every radio command and reply."
+
+[[bin]]
+name = "switcheroo"
+path = "src/main.rs"
+required-features = ["app"]
+
+[dependencies]
+switcheroo-core = { path = "../switcheroo-core" }
+egui = "0.34"
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
+
+# The radio. btleplug is async (BlueZ over D-Bus on Linux), so it brings
+# tokio with it — both are confined to src/ble.rs and neither crosses the
+# Backend seam. current_thread runtime only; no work-stealing pool for one
+# serial radio.
+btleplug = { version = "0.11", optional = true }
+tokio = { version = "1", features = ["rt", "time", "macros"], optional = true }
+futures = { version = "0.3", optional = true }
+uuid = { version = "1", optional = true }
+
+[features]
+# Deployable bin, per the house convention for every -egui app.
+default = ["app", "ble"]
+app = ["dep:eframe"]
+# Real Bluetooth. Off in CI/sandbox: btleplug wants a D-Bus session and an
+# adapter, and the demo backend covers the UI without either. With this
+# off the app still builds and runs, and says so in its own status bar
+# rather than pretending an empty list means "no outlets nearby".
+ble = ["dep:btleplug", "dep:tokio", "dep:futures", "dep:uuid"]

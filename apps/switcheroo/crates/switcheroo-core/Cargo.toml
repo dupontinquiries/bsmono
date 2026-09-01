@@ -1,0 +1,7 @@
+[package]
+name = "switcheroo-core"
+version = "0.1.0"
+edition = "2021"
+description = "Headless core for switcheroo: device model, command/event protocol, and the Backend seam. No egui, no bluetooth, no async."
+
+[dependencies]

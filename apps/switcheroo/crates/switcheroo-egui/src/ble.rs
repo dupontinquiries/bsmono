@@ -1,0 +1,303 @@
+//! The real radio, behind [`switcheroo_core::Backend`].
+//!
+//! btleplug is async (it wraps BlueZ's D-Bus API on Linux). The core's
+//! Backend trait is deliberately sync and dyn-compatible, so the async
+//! lives entirely in here: one tokio runtime on one owned thread, two
+//! std mpsc channels across the boundary. The UI thread never awaits and
+//! never sees a `Future`.
+//!
+//! **State of this file, stated plainly:** discovery is real and complete.
+//! Control is real only for [`Kind::GenericGatt`]. HomeKit control is not
+//! implemented and this file does not pretend otherwise — see
+//! `Kind::unsupported_reason` and HOMEKIT.md. None of this has been run
+//! against a physical device by its author; it is written from btleplug's
+//! documented API and needs a hardware pass.
+
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::Duration;
+
+use switcheroo_core::{classify, Backend, Command, DeviceId, Event, Kind, Power};
+
+use btleplug::api::{
+    Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter, WriteType,
+};
+use btleplug::platform::Manager;
+use futures::StreamExt;
+
+/// Assigned 16-bit UUID 0x2A57 "Digital Output" inside the 0x1815
+/// Automation IO service — the characteristic the simple relay plugs
+/// expose. One byte: 0 off, 1 on.
+///
+/// This is the assigned-numbers answer, not a vendor's answer. A specific
+/// plug may well use a proprietary characteristic instead, in which case
+/// writing here fails cleanly (the characteristic is simply absent) and
+/// the row shows the error rather than silently doing nothing.
+const DIGITAL_OUTPUT: uuid::Uuid = uuid::Uuid::from_u128(0x00002a57_0000_1000_8000_00805f9b34fb);
+
+pub struct BleBackend {
+    tx: Sender<Command>,
+    rx: Receiver<Event>,
+    adapter: String,
+}
+
+impl BleBackend {
+    /// Spin up the radio thread. Returns `Err` with a human-readable reason
+    /// if there is no usable adapter — the caller falls back to the demo
+    /// backend and says so in the status bar, rather than showing an empty
+    /// list that looks like "no devices nearby".
+    pub fn start() -> Result<BleBackend, String> {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
+        let (ev_tx, ev_rx) = mpsc::channel::<Event>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<String, String>>();
+
+        std::thread::Builder::new()
+            .name("switcheroo-ble".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(format!("tokio runtime: {e}")));
+                        return;
+                    }
+                };
+                rt.block_on(radio_loop(cmd_rx, ev_tx, ready_tx));
+            })
+            .map_err(|e| format!("spawn radio thread: {e}"))?;
+
+        // Block briefly for the adapter probe only. If BlueZ is slow or
+        // absent we want to know now, at construction, not three frames
+        // into the UI.
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(adapter)) => Ok(BleBackend {
+                tx: cmd_tx,
+                rx: ev_rx,
+                adapter,
+            }),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err("bluetooth adapter did not respond within 5s".into()),
+        }
+    }
+}
+
+impl Backend for BleBackend {
+    fn submit(&mut self, cmd: Command) {
+        // A dead channel means the radio thread panicked or exited. Swallow
+        // rather than panic the UI: poll() will stop producing events and
+        // the rows go stale, which is a survivable degradation.
+        let _ = self.tx.send(cmd);
+    }
+
+    fn poll(&mut self) -> Vec<Event> {
+        self.rx.try_iter().collect()
+    }
+
+    fn describe(&self) -> String {
+        format!("btleplug · {}", self.adapter)
+    }
+}
+
+async fn radio_loop(
+    cmd_rx: Receiver<Command>,
+    ev_tx: Sender<Event>,
+    ready_tx: Sender<Result<String, String>>,
+) {
+    let manager = match Manager::new().await {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = ready_tx.send(Err(format!("bluetooth manager: {e}")));
+            return;
+        }
+    };
+    let adapters = match manager.adapters().await {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = ready_tx.send(Err(format!("list adapters: {e}")));
+            return;
+        }
+    };
+    let Some(central) = adapters.into_iter().next() else {
+        let _ = ready_tx.send(Err(
+            "no bluetooth adapter found (is the radio enabled?)".into()
+        ));
+        return;
+    };
+    let name = central
+        .adapter_info()
+        .await
+        .unwrap_or_else(|_| "adapter".into());
+    let _ = ready_tx.send(Ok(name));
+
+    let mut events = match central.events().await {
+        Ok(e) => e,
+        Err(e) => {
+            let _ = ev_tx.send(Event::Failed {
+                id: None,
+                message: format!("event stream: {e}"),
+            });
+            return;
+        }
+    };
+
+    loop {
+        // Drain UI commands without blocking the event stream.
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                Command::StartScan => {
+                    match central.start_scan(ScanFilter::default()).await {
+                        Ok(()) => {
+                            let _ = ev_tx.send(Event::ScanStarted);
+                        }
+                        Err(e) => {
+                            let _ = ev_tx.send(Event::Failed {
+                                id: None,
+                                message: format!("start scan: {e}"),
+                            });
+                        }
+                    }
+                }
+                Command::StopScan => {
+                    let _ = central.stop_scan().await;
+                    let _ = ev_tx.send(Event::ScanStopped);
+                }
+                Command::Refresh(id) => {
+                    let r = read_power(&central, &id).await;
+                    let _ = ev_tx.send(match r {
+                        Ok(p) => Event::PowerIs { id, power: p },
+                        Err(m) => Event::Failed {
+                            id: Some(id),
+                            message: m,
+                        },
+                    });
+                }
+                Command::SetPower { id, on } => {
+                    let r = write_power(&central, &id, on).await;
+                    let _ = ev_tx.send(match r {
+                        Ok(()) => Event::PowerIs {
+                            id,
+                            power: if on { Power::On } else { Power::Off },
+                        },
+                        Err(m) => Event::Failed {
+                            id: Some(id),
+                            message: m,
+                        },
+                    });
+                }
+            }
+        }
+
+        // Then take one radio event, with a timeout so command draining
+        // stays responsive even when nothing is advertising.
+        match tokio::time::timeout(Duration::from_millis(200), events.next()).await {
+            Ok(Some(CentralEvent::DeviceDiscovered(pid)))
+            | Ok(Some(CentralEvent::DeviceUpdated(pid))) => {
+                if let Ok(p) = central.peripheral(&pid).await {
+                    if let Ok(Some(props)) = p.properties().await {
+                        let uuids: Vec<String> =
+                            props.services.iter().map(|u| u.to_string()).collect();
+                        let _ = ev_tx.send(Event::Seen {
+                            id: DeviceId::new(props.address.to_string()),
+                            name: props.local_name.unwrap_or_default(),
+                            kind: classify(&uuids),
+                            rssi: props.rssi,
+                        });
+                    }
+                }
+            }
+            Ok(Some(_)) => {}
+            // Stream ended — the adapter went away (rfkill, USB unplug).
+            Ok(None) => {
+                let _ = ev_tx.send(Event::Failed {
+                    id: None,
+                    message: "bluetooth adapter disappeared".into(),
+                });
+                return;
+            }
+            Err(_) => {} // timeout: loop round and check commands again
+        }
+    }
+}
+
+/// Find a peripheral by address string. btleplug indexes by its own
+/// PeripheralId, so this is a scan of the known set rather than a lookup.
+async fn find(
+    central: &btleplug::platform::Adapter,
+    id: &DeviceId,
+) -> Result<btleplug::platform::Peripheral, String> {
+    let peers = central
+        .peripherals()
+        .await
+        .map_err(|e| format!("list peripherals: {e}"))?;
+    for p in peers {
+        if let Ok(Some(props)) = p.properties().await {
+            if props.address.to_string() == id.as_str() {
+                return Ok(p);
+            }
+        }
+    }
+    Err("device is no longer in range".into())
+}
+
+/// Connect, discover services, and refuse early if this is a HomeKit
+/// accessory. The refusal is the point: without it a HomeKit write fails
+/// with an opaque GATT error and the user has no idea their plug needs
+/// pairing that this app cannot do.
+async fn open(
+    central: &btleplug::platform::Adapter,
+    id: &DeviceId,
+) -> Result<btleplug::platform::Peripheral, String> {
+    let p = find(central, id).await?;
+    if !p.is_connected().await.unwrap_or(false) {
+        p.connect().await.map_err(|e| format!("connect: {e}"))?;
+    }
+    p.discover_services()
+        .await
+        .map_err(|e| format!("discover services: {e}"))?;
+    if let Ok(Some(props)) = p.properties().await {
+        let uuids: Vec<String> = props.services.iter().map(|u| u.to_string()).collect();
+        if classify(&uuids) == Kind::HomeKit {
+            return Err(Kind::HomeKit.unsupported_reason().unwrap().to_string());
+        }
+    }
+    Ok(p)
+}
+
+async fn write_power(
+    central: &btleplug::platform::Adapter,
+    id: &DeviceId,
+    on: bool,
+) -> Result<(), String> {
+    let p = open(central, id).await?;
+    let ch = p
+        .characteristics()
+        .into_iter()
+        .find(|c| c.uuid == DIGITAL_OUTPUT)
+        .ok_or_else(|| {
+            "no Automation IO digital-output characteristic (0x2A57) on this device".to_string()
+        })?;
+    p.write(&ch, &[u8::from(on)], WriteType::WithResponse)
+        .await
+        .map_err(|e| format!("write: {e}"))
+}
+
+async fn read_power(
+    central: &btleplug::platform::Adapter,
+    id: &DeviceId,
+) -> Result<Power, String> {
+    let p = open(central, id).await?;
+    let ch = p
+        .characteristics()
+        .into_iter()
+        .find(|c| c.uuid == DIGITAL_OUTPUT)
+        .ok_or_else(|| {
+            "no Automation IO digital-output characteristic (0x2A57) on this device".to_string()
+        })?;
+    let v = p.read(&ch).await.map_err(|e| format!("read: {e}"))?;
+    Ok(match v.first() {
+        Some(0) => Power::Off,
+        Some(_) => Power::On,
+        None => Power::Unknown,
+    })
+}

@@ -495,6 +495,18 @@ bin = "cadscope-egui"     # crates/cadscope-egui is the shell; logic lives in th
 primary = true            # egui-first from birth; no Qt/GTK surface exists to archive
 notes = "parametric CAD: forge Doc -> kernel Model -> cad-view draws the viewport through one egui_wgpu::Callback (skydribble-parity pass, Depth32Float). Was MISSING from this manifest entirely, so gitmind's app catalogue could not see or build it; added 2026-09-01 along with the wgpu device-limit clamp that fixes startup on phone GPUs (max_color_attachments 8 > 5)."
 
+[apps.switcheroo]
+path = "apps/switcheroo"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"          # pure egui/glow (wayland/x11)
+targets = ["desktop", "phone"]
+bin = "switcheroo"        # crates/switcheroo-egui
+primary = true            # egui-first from birth; no other surface exists
+notes = "Bluetooth smart-outlet remote: tap a plug to switch it. switcheroo-core is headless (device model, Command/Event protocol, dyn-compatible sync Backend seam, demo backend, 12 tests) with no egui/bluetooth/async; switcheroo-egui owns the frame loop and confines btleplug+tokio to src/ble.rs behind the `ble` feature. Discovery works for any BLE device; on/off works for plain GATT switches (Automation IO 0x1815 / digital output 0x2A57). HomeKit accessories (Wemo WSP100 and friends, service 0xFE4A) are found and identified but NOT controllable — that needs full HAP pairing and would steal the pairing from the Home app; see apps/switcheroo/HOMEKIT.md for the analysis and the better alternatives (talk to the Home hub, or use Matter). Radio code is NOT yet hardware-tested."
+
 [apps.settings-egui]
 path = "apps/settings/egui-frontend"
 kind = "cargo"
