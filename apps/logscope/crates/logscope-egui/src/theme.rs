@@ -1733,13 +1733,26 @@ pub(crate) fn carved_frame(p: &egui::Painter, rect: egui::Rect, t: f32, accent: 
         p.line_segment([q.right_top(), q.right_bottom()], Stroke::new(1.0_f32, shadow));
         p.line_segment([q.left_bottom(), q.right_bottom()], Stroke::new(1.0_f32, shadow));
     }
-    // grain along the top + bottom border bands so the frame reads as stone, not a drawn line
+    // grain along all four border bands so the frame reads as stone/wood/paper on every edge, not
+    // just top and bottom — matches the reference frames, whose borders are grained all the way
+    // round. Still confined to the band (never the interior), so the "never draws over content"
+    // invariant in this fn's doc comment stays true edge-to-edge, not just top/bottom.
     if pal.material != Material::None {
         let band = 9.0;
         let cols = (rect.width() / 18.0).clamp(6.0, 40.0) as usize;
         for ix in 0..cols {
             let fx = rect.left() + rect.width() * (ix as f32 + 0.5) / cols as f32;
             for fy in [rect.top() + band * 0.5, rect.bottom() - band * 0.5] {
+                let g = material_grain(pal.material, fx, fy);
+                let a = (g.abs() * 22.0).min(22.0) as u8;
+                let col = if g >= 0.0 { Color32::from_white_alpha(a) } else { Color32::from_black_alpha(a) };
+                p.circle_filled(egui::pos2(fx, fy), 1.1, col);
+            }
+        }
+        let rows = (rect.height() / 18.0).clamp(4.0, 40.0) as usize;
+        for iy in 0..rows {
+            let fy = rect.top() + rect.height() * (iy as f32 + 0.5) / rows as f32;
+            for fx in [rect.left() + band * 0.5, rect.right() - band * 0.5] {
                 let g = material_grain(pal.material, fx, fy);
                 let a = (g.abs() * 22.0).min(22.0) as u8;
                 let col = if g >= 0.0 { Color32::from_white_alpha(a) } else { Color32::from_black_alpha(a) };
