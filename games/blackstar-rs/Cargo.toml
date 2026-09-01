@@ -48,8 +48,8 @@ log = "0.4"
 env_logger = "0.11"
 # The fleet's control plane, vendored from the logscope-c4-273 monorepo:
 # netcode (profiles/sessions/handoff) over the snapcore DHT store.
-netcode = { path = "vendor/netcode" }
-touchkit = { path = "vendor/touchkit" }
+netcode = { path = "../shared/netcode" }
+touchkit = { path = "../../shared/touchkit" }
 cpal = { version = "0.15", optional = true }
 gilrs = { version = "0.11", optional = true }
 libloading = { version = "0.8", optional = true }
