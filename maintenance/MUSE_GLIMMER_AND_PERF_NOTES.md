@@ -256,3 +256,36 @@ concurrent wall is 31. Until that is settled, `--gate-vram` deliberately
 does not write the concurrent store — an auto-wire on the wrong quantity
 is worse than the constant, because the constant is at least known to be
 conservative.
+
+
+---
+
+# Implementation status (revised twice, both times downward)
+
+Registering the arch and checking `archfeat::implemented()` rather than
+assuming changed the estimate again. **Five things to build became three.**
+
+Already shipping, so NOT gaps: `StandardSwa` (sliding-window attention),
+`PostNorm` (the post-attn/post-FFN sandwich norms), `NoPe` (per-layer
+no-positional-encoding — the axis Llama-4 iRoPE uses, which is exactly
+how Glimmer's full-attention layers behave), `QkNormPreRope`,
+`FinalLogitSoftcap`. Most arrived with the Gemma family.
+
+Genuinely missing, now registered as gaps so the loader refuses by name:
+
+1. `SeparateAttnOutputGate` — deliberately NOT folded into the existing
+   `GatedAttentionOutput`. That one takes the gate out of a double-width
+   q (interleaved per head); Glimmer projects its own `attn_gate` from
+   the pre-attention hidden state. Same idea, different tensor, extra
+   matmul.
+2. `EmbeddingNorm` — weightless RMS on embeddings, not Gemma's ×sqrt(d).
+3. `OutputMultiplier` — the `output_multiplier` scale before the softcap.
+
+Landed alongside: `archcfg::swa_pattern()` handling both upstream
+encodings, with the 39/13 cross-check now an assertion rather than an
+observation.
+
+**Still to build for a text-only load:** the three features above, plus
+loading the per-layer `attn_gate` tensor, plus refusing image/video
+tokens (200092 / 200091) by name at tokenize time so a multimodal prompt
+fails honestly instead of splicing garbage into the text stream.
