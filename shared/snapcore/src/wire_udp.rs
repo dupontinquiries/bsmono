@@ -10,11 +10,9 @@
 //! lookup returns nothing, and no layer above notices: an empty result is
 //! also what a working DHT returns for a peer who is offline.
 //!
-//! `dht-kit` has been the OpenDHT-compatible codec the whole time, and
-//! `snapcore::wire` has been the translation between its `Msg` and this
-//! crate's handlers. What was missing is this: a `Transport` that encodes
-//! with the one and sends with the other. `DHT_CONVERGENCE.md` argues for
-//! exactly this and it had not been done on the path the app uses.
+//! This transport encodes with `dht-kit` — the codec that now matches the
+//! reference's packer key for key (see dht-kit's module doc for what the
+//! first version got wrong) — and sends with a plain blocking socket.
 //!
 //! ## Same socket discipline as `udp`, deliberately
 //!
@@ -24,7 +22,7 @@
 //! bystander racing a real peer is the same attack whatever the bytes look
 //! like.
 //!
-//! ## What is added on top: transaction ids
+//! ## Transaction ids
 //!
 //! The bespoke protocol had none, so a late reply to a previous query was
 //! indistinguishable from the answer to this one. OpenDHT carries a `tid`,
@@ -32,6 +30,17 @@
 //! more than it sounds on a phone: a query that timed out while the radio
 //! woke up will have its answer arrive during the NEXT query, and accepting
 //! it would attribute one peer's node list to a different target.
+//!
+//! ## We are a client node, and we say so
+//!
+//! Nothing reads this socket except a round trip that is waiting for its
+//! own answer, so an unsolicited query from another node is never seen, let
+//! alone answered. The reference has a flag for exactly that situation —
+//! `s: true` on every query — and a node that sees it answers us without
+//! adding us to its routing table, which is right: a peer that never answers
+//! is dead weight in anyone's table, and a phone behind carrier NAT cannot
+//! be reached unsolicited anyway. Turn it off with [`set_client`] for a
+//! node that is actually served by a responder.
 //!
 //! ## The write token, and where it had to live
 //!
@@ -52,24 +61,30 @@
 //! the token authorises writes through a particular server rather than to a
 //! particular identity.
 //!
-//! Entries expire ([`TOKEN_TTL`]) and the map is capped, since a long
-//! session touches thousands of peers and a token from an hour ago is
-//! refused anyway — sending a stale one is the same outcome as sending
-//! none, at the cost of remembering it.
+//! ## What every reply also teaches us: our own address
 //!
-//! What this still does not do: `listen` or `refresh`. Values expire and are republished
+//! A reply carries `sa`, the requester's ip as the responder saw it. That
+//! is the reference's own NAT-discovery mechanism (`onReportedAddr`) and it
+//! is how the Qt build knew what to announce for cross-network reachability
+//! without asking ipify. Kept as a vote per reported ip and read with
+//! [`public_ip`]: a majority, because one peer on the same LAN reports our
+//! private address and must not outvote the internet.
+//!
+//! What this still does not do: `listen`. Values expire and are republished
 //! by the caller's own schedule (`dht_presence` in the app), which is the
-//! coarser of the two mechanisms and the one that works without
-//! subscriptions.
+//! coarser of the two mechanisms and the one that works without an inbound
+//! path.
 
 use crate::node::{FindValue, Transport};
 use crate::routing::{Contact, NodeId};
 use crate::store::Key;
-use crate::wire::{from_wire_addr, to_hash};
-use dht_kit::{Msg, Query, Value};
-use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use crate::wire::{content_id, from_ip, from_wire_addr, to_hash};
+use dht_kit::{Msg, Query, Value, WANT4, WANT6};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// How long to wait for one reply. Matches `udp`'s reasoning: a lookup makes
 /// several of these in sequence, so this is multiplied by the contacts
@@ -89,11 +104,19 @@ pub const TOKEN_TTL: Duration = Duration::from_secs(5 * 60);
 /// this map must not become a record of every node ever contacted.
 pub const MAX_TOKENS: usize = 256;
 
+/// A ceiling on distinct reported addresses. A hostile peer can report a
+/// different one per reply; the votes are what protect the answer, and the
+/// map must not grow with the lie.
+pub const MAX_REPORTED: usize = 32;
+
 pub struct WireUdpTransport {
     sock: UdpSocket,
     me: NodeId,
+    client: AtomicBool,
     /// Write tokens by peer ADDRESS — see the module note on why not by id.
-    tokens: std::sync::Mutex<std::collections::HashMap<SocketAddr, (u32, std::time::Instant)>>,
+    tokens: Mutex<HashMap<SocketAddr, (Vec<u8>, Instant)>>,
+    /// Votes for our own public ip, from `sa`.
+    reported: Mutex<HashMap<IpAddr, u32>>,
     /// Monotonic, wrapping. Only uniqueness within the timeout window
     /// matters, so wrapping is fine and a random start buys nothing here —
     /// this is not a spoofing defence, it is a "which question is this the
@@ -107,13 +130,38 @@ impl WireUdpTransport {
         sock.set_read_timeout(Some(REPLY_TIMEOUT))?;
         Ok(WireUdpTransport {
             sock, me,
-            tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            client: AtomicBool::new(true),
+            tokens: Mutex::new(HashMap::new()),
+            reported: Mutex::new(HashMap::new()),
             tid: AtomicU32::new(1),
         })
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.sock.local_addr()
+    }
+
+    /// Whether queries carry `s: true`. On by default — see the module note.
+    pub fn set_client(&self, client: bool) {
+        self.client.store(client, Ordering::Relaxed);
+    }
+
+    /// The ip most peers say we are reaching them from, if any peer has
+    /// said. Private on a LAN, public across the internet; the caller
+    /// decides which of those it is looking at.
+    pub fn public_ip(&self) -> Option<IpAddr> {
+        let m = self.reported.lock().ok()?;
+        m.iter().max_by_key(|(_, n)| **n).map(|(ip, _)| *ip)
+    }
+
+    fn want(&self) -> u8 {
+        // Only the family this socket can reach. Contacts of the other one
+        // would fill the routing table with peers every lookup then fails
+        // against.
+        match self.sock.local_addr() {
+            Ok(a) if a.is_ipv6() => WANT6,
+            _ => WANT4,
+        }
     }
 
     fn next_tid(&self) -> u32 {
@@ -134,10 +182,10 @@ impl WireUdpTransport {
         // already timed out — and the first version of this discarded the
         // real reply whenever any of those arrived first. On a busy DHT
         // that is not an edge case, it is most lookups.
-        let deadline = std::time::Instant::now() + REPLY_TIMEOUT;
+        let deadline = Instant::now() + REPLY_TIMEOUT;
         let mut buf = [0u8; MAX_DATAGRAM];
         loop {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return None;
             }
@@ -160,21 +208,25 @@ impl WireUdpTransport {
                 // declined — but there is nothing in it for a `Transport`
                 // method to return, so it ends the wait like a timeout.
                 Msg::Error { tid: got, .. } if got == tid => return None,
-                Msg::Reply { tid: got, token, .. } if got == tid => {
+                Msg::Reply { tid: got, ref token, sa, .. } if got == tid => {
                     self.remember_token(from, token);
+                    if let Some(ip) = sa { self.note_reported(from_ip(&ip)); }
                     return Some(reply);
                 }
-                Msg::Push { tid: got, .. } if got == tid => return Some(reply),
+                // Fragments of a value too large for one datagram. Not
+                // reassembled here; the reply that announced them has
+                // already been returned or will not be.
+                Msg::Parts { .. } => continue,
                 // Somebody else's business, or ours from a while ago.
                 _ => continue,
             }
         }
     }
 
-    fn remember_token(&self, from: SocketAddr, token: u32) {
-        // Zero means the peer sent none. Storing it would evict a real one
+    fn remember_token(&self, from: SocketAddr, token: &[u8]) {
+        // Empty means the peer sent none. Storing it would evict a real one
         // for the same address on the next reply.
-        if token == 0 {
+        if token.is_empty() {
             return;
         }
         let Ok(mut m) = self.tokens.lock() else { return };
@@ -183,7 +235,7 @@ impl WireUdpTransport {
             // anything current go. Evicting a live token to make room for
             // another is how a `put` loses the authorisation it just
             // earned.
-            let now = std::time::Instant::now();
+            let now = Instant::now();
             m.retain(|_, (_, at)| now.duration_since(*at) < TOKEN_TTL);
             if m.len() >= MAX_TOKENS {
                 if let Some(oldest) = m.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| *k) {
@@ -191,29 +243,42 @@ impl WireUdpTransport {
                 }
             }
         }
-        m.insert(from, (token, std::time::Instant::now()));
+        m.insert(from, (token.to_vec(), Instant::now()));
     }
 
-    /// The token this peer last gave us, if it is still fresh. Zero means
+    fn note_reported(&self, ip: IpAddr) {
+        let Ok(mut m) = self.reported.lock() else { return };
+        if m.len() >= MAX_REPORTED && !m.contains_key(&ip) {
+            return;
+        }
+        *m.entry(ip).or_insert(0) += 1;
+    }
+
+    /// The token this peer last gave us, if it is still fresh. Empty means
     /// "we have none" — which is what an unauthorised `put` looks like, and
     /// the honest thing to send when there is nothing better.
-    fn token_for(&self, addr: SocketAddr) -> u32 {
-        let Ok(m) = self.tokens.lock() else { return 0 };
+    fn token_for(&self, addr: SocketAddr) -> Vec<u8> {
+        let Ok(m) = self.tokens.lock() else { return Vec::new() };
         match m.get(&addr) {
-            Some((t, at)) if at.elapsed() < TOKEN_TTL => *t,
-            _ => 0,
+            Some((t, at)) if at.elapsed() < TOKEN_TTL => t.clone(),
+            _ => Vec::new(),
         }
     }
 
-    fn query(&self, query: Query, target: &NodeId, value: Option<Value>) -> (u32, Msg) {
+    fn query(&self, query: Query, target: &NodeId, values: Vec<Value>, token: Vec<u8>) -> (u32, Msg) {
         let tid = self.next_tid();
+        let want = if matches!(query, Query::Find | Query::Get) { self.want() } else { 0 };
         (tid, Msg::Query {
             tid,
             from: to_hash(&self.me),
             query,
             target: to_hash(target),
-            token: 0,
-            value,
+            token,
+            values,
+            want,
+            sid: None,
+            vid: None,
+            client: self.client.load(Ordering::Relaxed),
         })
     }
 }
@@ -245,7 +310,7 @@ fn contacts_of(reply: &Msg, responder: SocketAddr, now: u64) -> Vec<Contact> {
 
 impl Transport for WireUdpTransport {
     fn find_node(&self, _from: &Contact, to: &Contact, target: &NodeId) -> Vec<Contact> {
-        let (tid, msg) = self.query(Query::Find, target, None);
+        let (tid, msg) = self.query(Query::Find, target, Vec::new(), Vec::new());
         match self.round_trip(to, tid, &msg) {
             // `last_seen` is 0 rather than a clock read: `Transport` gives
             // this method no `now`, and the routing table stamps a contact
@@ -257,9 +322,10 @@ impl Transport for WireUdpTransport {
     }
 
     fn find_value(&self, _from: &Contact, to: &Contact, key: &Key) -> FindValue {
-        let (tid, msg) = self.query(Query::Get, key, None);
+        let (tid, msg) = self.query(Query::Get, key, Vec::new(), Vec::new());
         match self.round_trip(to, tid, &msg) {
-            Some(Msg::Reply { values, nodes, from, .. }) => {
+            Some(reply @ Msg::Reply { .. }) => {
+                let Msg::Reply { values, .. } = &reply else { unreachable!() };
                 // Values WIN over nodes when both are present, which the
                 // reference permits in one reply. A caller that took the
                 // nodes would keep walking toward a key whose value it was
@@ -268,14 +334,9 @@ impl Transport for WireUdpTransport {
                     // The responder leads here too, same reasoning as
                     // `contacts_of` — a `get` is just as much a chance to
                     // learn who we are actually talking to as a `find`.
-                    let mut out = vec![Contact::new(crate::wire::from_hash(&from),
-                                                    to.addr, 0)];
-                    out.extend(nodes.iter()
-                        .map(|(h, a)| Contact::new(crate::wire::from_hash(h),
-                                                   from_wire_addr(a), 0)));
-                    FindValue::Closest(out)
+                    FindValue::Closest(contacts_of(&reply, to.addr, 0))
                 } else {
-                    FindValue::Values(values.into_iter().map(|v| v.data).collect())
+                    FindValue::Values(values.iter().map(|v| v.data.clone()).collect())
                 }
             }
             _ => FindValue::Closest(Vec::new()),
@@ -283,41 +344,35 @@ impl Transport for WireUdpTransport {
     }
 
     fn store(&self, _from: &Contact, to: &Contact, key: Key, value: Vec<u8>, _ttl: u64) {
+        if value.len() > dht_kit::MAX_VALUE_SIZE {
+            // The reference refuses it; sending it would be a timeout with
+            // extra steps.
+            return;
+        }
         // The value id is derived from the bytes so republishing the same
         // record does not accumulate duplicates under one key — OpenDHT
         // holds a SET per key, and a fresh random id every hour would fill
         // it with copies of us.
-        let id = fnv1a(&value);
-        let (tid, mut msg) = self.query(Query::Put, &key, Some(Value { id, data: value }));
+        let v = Value::new(content_id(&value), value);
         // The token this peer handed us during the lookup that found it.
-        if let Msg::Query { token, .. } = &mut msg {
-            *token = self.token_for(to.addr);
-        }
+        let token = self.token_for(to.addr);
+        let (tid, msg) = self.query(Query::Put, &key, vec![v], token);
         // Fire and forget: `store` returns nothing, so there is no way to
-        // report a refusal, and see the module note on the missing token.
+        // report a refusal; the reply is still awaited so a token in it is
+        // remembered and an error is not mistaken for the next answer.
         let _ = self.round_trip(to, tid, &msg);
     }
 
     fn ping(&self, _from: &Contact, to: &Contact) -> bool {
-        let (tid, msg) = self.query(Query::Ping, &self.me, None);
+        let (tid, msg) = self.query(Query::Ping, &NodeId([0; 20]), Vec::new(), Vec::new());
         matches!(self.round_trip(to, tid, &msg), Some(Msg::Reply { .. }))
     }
-}
-
-/// Stable value id from content. Not a security property — see `store`.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use dht_kit::{Addr, InfoHash, Ip};
 
     fn id(n: u8) -> NodeId {
         let mut b = [0u8; 20];
@@ -329,10 +384,22 @@ mod tests {
         Contact::new(id(9), addr, 0)
     }
 
-    /// A stand-in peer that decodes one query and answers it. Real sockets
-    /// on loopback, because the thing being tested is that the bytes are
-    /// the ones a foreign implementation would accept — a fake Transport
-    /// would test nothing at all here.
+    fn reply(tid: u32, from: InfoHash) -> Msg {
+        rep(tid, from, vec![], vec![], vec![], None)
+    }
+    fn rep(tid: u32, from: InfoHash, nodes: Vec<(InfoHash, Addr)>, values: Vec<Value>,
+           token: Vec<u8>, vid: Option<u64>) -> Msg {
+        Msg::Reply { tid, from, sa: Some(Ip::V4([127, 0, 0, 1])), nodes, values, token, vid }
+    }
+    fn one_node() -> Vec<(InfoHash, Addr)> {
+        vec![(InfoHash([5u8; 20]), Addr::new([10, 0, 0, 4], 4222))]
+    }
+    fn peer3() -> InfoHash { InfoHash([3u8; 20]) }
+
+    /// A peer that decodes what arrives, answers through `reply`, and hands
+    /// back what it saw. The thing under test is whether the bytes are ones
+    /// a foreign implementation would accept, so this decodes the msgpack
+    /// rather than faking a `Transport`.
     fn responder(reply: impl Fn(Msg) -> Option<Msg> + Send + 'static)
         -> (SocketAddr, std::thread::JoinHandle<Option<Msg>>) {
         let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
@@ -350,271 +417,276 @@ mod tests {
         (addr, h)
     }
 
+    fn transport() -> WireUdpTransport {
+        WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap()
+    }
+
     #[test]
     fn a_find_query_goes_out_as_opendht_msgpack_and_its_nodes_come_back() {
         // The whole point: what leaves this socket must decode as the
         // reference's format, because bootstrap.jami.net is what has to
         // read it.
-        let peer_id = dht_kit::InfoHash([3u8; 20]);
+        let peer_id = InfoHash([3u8; 20]);
         let (addr, h) = responder(move |q| match q {
-            Msg::Query { tid, query: Query::Find, .. } => Some(Msg::Reply {
-                tid,
-                from: peer_id,
-                nodes: vec![(dht_kit::InfoHash([5u8; 20]),
-                             dht_kit::Addr::new([10, 0, 0, 4], 4222))],
-                values: vec![],
-                token: 0,
-            }),
+            Msg::Query { tid, query: Query::Find, .. } =>
+                Some(rep(tid, peer_id, one_node(), vec![], vec![], None)),
             _ => None,
         });
-        let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let t = transport();
         let got = t.find_node(&contact(addr), &contact(addr), &id(2));
         let sent = h.join().unwrap().expect("nothing decodable arrived");
-        assert!(matches!(sent, Msg::Query { query: Query::Find, .. }),
-                "the wrong query kind went out: {sent:?}");
+        match sent {
+            Msg::Query { query: Query::Find, want, client, target, .. } => {
+                assert_eq!(want, WANT4, "a v4 socket asks for v4 nodes");
+                assert!(client, "we do not answer queries, and must say so");
+                assert_eq!(target, to_hash(&id(2)));
+            }
+            other => panic!("the wrong query kind went out: {other:?}"),
+        }
         // Two: the responder itself (with its REAL id, at the address we
         // reached it on) followed by the node it named.
         assert_eq!(got.len(), 2, "the reply's contacts were lost: {got:?}");
         assert_eq!(got[0].addr, addr, "the responder is not first");
-        assert_eq!(got[0].id, crate::wire::from_hash(&peer_id),
-                   "the responder's real id was not learned");
-        assert_eq!(got[1].addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 4)), 4222));
+        assert_eq!(got[0].id, crate::wire::from_hash(&peer_id), "the responder's real id was not learned");
+        assert_eq!(got[1].addr, "10.0.0.4:4222".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
     fn a_get_that_finds_a_value_returns_it_rather_than_walking_on() {
-        // The reference may put nodes AND values in one reply. A caller
-        // that took the nodes would keep walking toward a key whose value
-        // it was just handed.
         let (addr, h) = responder(|q| match q {
-            Msg::Query { tid, query: Query::Get, .. } => Some(Msg::Reply {
-                tid,
-                from: dht_kit::InfoHash([3u8; 20]),
-                nodes: vec![(dht_kit::InfoHash([5u8; 20]),
-                             dht_kit::Addr::new([10, 0, 0, 4], 4222))],
-                values: vec![Value { id: 7, data: b"presence".to_vec() }],
-                token: 0,
-            }),
+            Msg::Query { tid, query: Query::Get, .. } =>
+                Some(rep(tid, peer3(), one_node(), vec![Value::new(7, b"presence".to_vec())], vec![], None)),
             _ => None,
         });
-        let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
-        match t.find_value(&contact(addr), &contact(addr), &id(2)) {
+        let t = transport();
+        let got = t.find_value(&contact(addr), &contact(addr), &id(2));
+        assert!(matches!(h.join().unwrap(), Some(Msg::Query { query: Query::Get, .. })));
+        match got {
             FindValue::Values(v) => assert_eq!(v, vec![b"presence".to_vec()]),
-            other => panic!("a value in the reply was ignored: {other:?}"),
+            other => panic!("nodes were preferred over a value: {other:?}"),
         }
-        h.join().unwrap();
     }
 
     #[test]
-    fn a_put_carries_the_value_and_a_content_derived_id() {
-        // A fresh random id every republish would fill the key's value SET
-        // with hourly copies of us.
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let s2 = seen.clone();
-        let (addr, h) = responder(move |q| {
-            if let Msg::Query { value: Some(v), .. } = &q {
-                s2.lock().unwrap().push(v.clone());
-            }
-            None
+    fn a_put_carries_the_value_in_the_references_shape_with_a_content_id() {
+        let (addr, h) = responder(|q| match q {
+            Msg::Query { tid, query: Query::Put, values, .. } =>
+                Some(rep(tid, peer3(), vec![], vec![], vec![], values.first().map(|v| v.id))),
+            _ => None,
         });
-        let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
-        t.store(&contact(addr), &contact(addr), id(2), b"record".to_vec(), 3600);
-        h.join().unwrap();
-        let v = seen.lock().unwrap().clone();
-        assert_eq!(v.len(), 1, "the put carried no value");
-        assert_eq!(v[0].data, b"record");
-        assert_eq!(v[0].id, fnv1a(b"record"), "the id is not derived from the content");
+        let t = transport();
+        t.store(&contact(addr), &contact(addr), id(2), b"record".to_vec(), 600);
+        match h.join().unwrap() {
+            Some(Msg::Query { query: Query::Put, values, .. }) => {
+                assert_eq!(values.len(), 1);
+                assert_eq!(values[0].data, b"record");
+                assert_eq!(values[0].id, content_id(b"record"), "same bytes, same id, every republish");
+                assert_eq!(values[0].vtype, 0, "USER_DATA");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
     fn a_reply_to_a_previous_query_is_not_read_as_this_one() {
-        // On a phone this is the ordinary case, not an attack: a query that
-        // timed out while the radio woke up has its answer arrive during
-        // the NEXT query. Accepting it attributes one peer's node list to a
-        // different target.
+        // The responder answers with the WRONG tid, as a late reply to an
+        // earlier query would. It must be discarded; the lookup then times
+        // out, which is the honest outcome.
         let (addr, h) = responder(|q| match q {
-            Msg::Query { tid, .. } => Some(Msg::Reply {
-                // Deliberately the wrong transaction.
-                tid: tid.wrapping_add(1000),
-                from: dht_kit::InfoHash([3u8; 20]),
-                nodes: vec![(dht_kit::InfoHash([5u8; 20]),
-                             dht_kit::Addr::new([10, 0, 0, 4], 4222))],
-                values: vec![],
-                token: 0,
-            }),
+            Msg::Query { tid, .. } =>
+                Some(rep(tid.wrapping_add(1), peer3(), one_node(), vec![], vec![], None)),
             _ => None,
         });
-        let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
-        assert!(t.find_node(&contact(addr), &contact(addr), &id(2)).is_empty(),
-                "a stale reply was accepted as this query's answer");
+        let t = transport();
+        let got = t.find_node(&contact(addr), &contact(addr), &id(2));
         h.join().unwrap();
+        assert!(got.is_empty(), "a mismatched tid was accepted: {got:?}");
     }
 
     #[test]
     fn a_guessed_bootstrap_id_is_corrected_by_the_first_reply() {
-        // A bootstrap entry is added from a hostname before anyone has
-        // spoken to it, so its id is invented. `snapclone-presence` derives
-        // one from the address and its comment says the id is "corrected
-        // when the node actually replies" — and nothing was doing the
-        // correcting. An invented id puts the busiest node in the network
-        // in the wrong bucket, so lookups route away from the one peer that
-        // knows everybody.
-        let real = dht_kit::InfoHash([0x5a; 20]);
+        let real = InfoHash([0xAB; 20]);
         let (addr, h) = responder(move |q| match q {
-            Msg::Query { tid, .. } => Some(Msg::Reply {
-                tid, from: real, nodes: vec![], values: vec![], token: 0 }),
+            Msg::Query { tid, .. } => Some(reply(tid, real)),
             _ => None,
         });
-        let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
-        // The contact we dial carries a WRONG id, as a bootstrap entry does.
-        let guessed = Contact::new(id(200), addr, 0);
-        let got = t.find_node(&guessed, &guessed, &id(2));
+        let t = transport();
+        // The caller's guess for the responder is id(9) (see `contact`).
+        let got = t.find_node(&contact(addr), &contact(addr), &id(2));
         h.join().unwrap();
-        assert_eq!(got.len(), 1, "a reply with no nodes taught us nothing: {got:?}");
+        assert_eq!(got.len(), 1);
         assert_eq!(got[0].id, crate::wire::from_hash(&real));
-        assert_ne!(got[0].id, id(200), "the guessed id survived the correction");
         assert_eq!(got[0].addr, addr);
     }
 
     #[test]
     fn a_put_echoes_the_token_the_peer_gave_during_the_lookup() {
-        // A strict OpenDHT node refuses a write with no token. `store` gets
-        // no prior state, so the transport has to have remembered it —
-        // which it can, because a store is always preceded by a lookup to
-        // the same peer.
-        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        // The responder answers a get with a token, then checks the put
+        // that follows carries the same bytes.
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
         let addr = sock.local_addr().unwrap();
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let s2 = seen.clone();
+        let token = vec![0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4, 5, 6];
+        let tk = token.clone();
         let h = std::thread::spawn(move || {
             let mut buf = [0u8; MAX_DATAGRAM];
-            // 1. the find, answered with a token
-            let (n, from) = sock.recv_from(&mut buf).expect("no find");
+            let (n, from) = sock.recv_from(&mut buf).unwrap();
             let Some(Msg::Query { tid, .. }) = Msg::decode(&buf[..n]) else { panic!() };
-            let reply = Msg::Reply { tid, from: dht_kit::InfoHash([3u8; 20]),
-                nodes: vec![], values: vec![], token: 0xABCD };
-            sock.send_to(&reply.encode(), from).ok();
-            // 2. the put that follows it
-            let (n, from2) = sock.recv_from(&mut buf).expect("no put");
-            if let Some(Msg::Query { tid, token, .. }) = Msg::decode(&buf[..n]) {
-                *s2.lock().unwrap() = Some(token);
-                let ack = Msg::Reply { tid, from: dht_kit::InfoHash([3u8; 20]),
-                    nodes: vec![], values: vec![], token: 0xABCD };
-                sock.send_to(&ack.encode(), from2).ok();
+            sock.send_to(&rep(tid, peer3(), vec![], vec![], tk.clone(), None).encode(), from).unwrap();
+            let (n, from) = sock.recv_from(&mut buf).unwrap();
+            if let Some(Msg::Query { tid, token, query, .. }) = Msg::decode(&buf[..n]) {
+                assert_eq!(query, Query::Put);
+                sock.send_to(&reply(tid, InfoHash([3u8; 20])).encode(), from).unwrap();
+                return token;
             }
+            panic!("second datagram was not a put");
         });
-        let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
-        let c = contact(addr);
-        t.find_node(&c, &c, &id(2));
-        t.store(&c, &c, id(2), b"record".to_vec(), 3600);
-        h.join().unwrap();
-        assert_eq!(*seen.lock().unwrap(), Some(0xABCD),
-                   "the put went out unauthorised despite a token in hand");
+        let t = transport();
+        let _ = t.find_value(&contact(addr), &contact(addr), &id(2));
+        t.store(&contact(addr), &contact(addr), id(2), b"v".to_vec(), 600);
+        assert_eq!(h.join().unwrap(), token);
     }
 
     #[test]
     fn a_put_to_a_peer_we_have_not_spoken_to_sends_no_token_rather_than_a_wrong_one() {
-        // Zero is what "we have none" looks like on the wire. Sending
-        // another peer's token would be worse than sending nothing: refused
-        // just the same, and indistinguishable from a bug at the far end.
-        let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
-        let a: SocketAddr = "10.0.0.1:4222".parse().unwrap();
-        let b: SocketAddr = "10.0.0.2:4222".parse().unwrap();
-        t.remember_token(a, 0x1234);
-        assert_eq!(t.token_for(a), 0x1234);
-        assert_eq!(t.token_for(b), 0, "one peer's token was offered to another");
+        let (addr, h) = responder(|q| match q {
+            Msg::Query { tid, .. } => Some(reply(tid, InfoHash([3u8; 20]))),
+            _ => None,
+        });
+        let t = transport();
+        t.store(&contact(addr), &contact(addr), id(2), b"v".to_vec(), 600);
+        match h.join().unwrap() {
+            Some(Msg::Query { token, .. }) => assert!(token.is_empty()),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
-    fn a_token_of_zero_does_not_evict_a_real_one() {
-        // A peer that sends no token must not wipe the one it sent a moment
-        // ago, or every reply without one costs the write that follows.
-        let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
-        let a: SocketAddr = "10.0.0.1:4222".parse().unwrap();
-        t.remember_token(a, 0x1234);
-        t.remember_token(a, 0);
-        assert_eq!(t.token_for(a), 0x1234);
+    fn an_empty_token_does_not_evict_a_real_one() {
+        let t = transport();
+        let a: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        t.remember_token(a, &[1, 2, 3]);
+        t.remember_token(a, &[]);
+        assert_eq!(t.token_for(a), vec![1, 2, 3]);
     }
 
     #[test]
     fn the_token_cache_is_bounded_and_keeps_what_is_current() {
-        // A long session touches many peers; this map must not become a
-        // record of every node ever contacted. Evicting a LIVE token to
-        // make room is how a put loses the authorisation it just earned, so
-        // the oldest goes rather than the newest.
-        let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
-        for i in 0..(MAX_TOKENS + 20) {
-            let a: SocketAddr = format!("10.0.{}.{}:4222", i / 256, i % 256).parse().unwrap();
-            t.remember_token(a, (i as u32) + 1);
+        let t = transport();
+        for i in 0..(MAX_TOKENS + 10) {
+            let a: SocketAddr = format!("10.0.{}.{}:1", i / 256, i % 256).parse().unwrap();
+            t.remember_token(a, &[i as u8]);
         }
         let n = t.tokens.lock().unwrap().len();
-        assert!(n <= MAX_TOKENS, "the cache grew to {n}");
-        let newest: SocketAddr = format!("10.0.{}.{}:4222",
-            (MAX_TOKENS + 19) / 256, (MAX_TOKENS + 19) % 256).parse().unwrap();
-        assert_ne!(t.token_for(newest), 0, "the most recent token was evicted");
+        assert!(n <= MAX_TOKENS, "{n}");
+        let last: SocketAddr = format!("10.0.{}.{}:1", (MAX_TOKENS + 9) / 256, (MAX_TOKENS + 9) % 256).parse().unwrap();
+        assert!(!t.token_for(last).is_empty(), "the newest token was the one evicted");
     }
 
     #[test]
     fn a_stray_datagram_does_not_cost_the_real_reply() {
-        // One socket receives replies, unsolicited queries from other
-        // nodes, and late answers to queries that already timed out. The
-        // first version of this took the first datagram as THE answer, so
-        // any of those arriving first lost the real reply — on a busy DHT
-        // that is most lookups, not an edge case.
-        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        // Noise from the SAME address (a query it is sending us, say)
+        // arrives before the answer. The first version returned on the
+        // first datagram and lost the reply.
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
         let addr = sock.local_addr().unwrap();
-        let h = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             let mut buf = [0u8; MAX_DATAGRAM];
-            let (n, from) = sock.recv_from(&mut buf).expect("no query arrived");
-            let Some(Msg::Query { tid, .. }) = Msg::decode(&buf[..n]) else {
-                panic!("not a query")
-            };
-            // An unrelated query first — exactly what another node probing
-            // us mid-lookup looks like.
-            let noise = Msg::Query { tid: 999, from: dht_kit::InfoHash([8u8; 20]),
-                query: Query::Ping, target: dht_kit::InfoHash([0u8; 20]),
-                token: 0, value: None };
-            sock.send_to(&noise.encode(), from).ok();
-            // Then the answer.
-            let reply = Msg::Reply { tid, from: dht_kit::InfoHash([3u8; 20]),
-                nodes: vec![(dht_kit::InfoHash([5u8; 20]),
-                             dht_kit::Addr::new([10, 0, 0, 4], 4222))],
-                values: vec![], token: 0 };
-            sock.send_to(&reply.encode(), from).ok();
+            let (n, from) = sock.recv_from(&mut buf).unwrap();
+            let Some(Msg::Query { tid, .. }) = Msg::decode(&buf[..n]) else { return };
+            let noise = Msg::Query { tid: 999, from: InfoHash([8u8; 20]), query: Query::Ping,
+                                     target: InfoHash::zero(), token: vec![], values: vec![],
+                                     want: 0, sid: None, vid: None, client: false };
+            sock.send_to(&noise.encode(), from).unwrap();
+            sock.send_to(b"\xFF\xFF\xFF", from).unwrap();
+            let real = rep(tid, peer3(), one_node(), vec![], vec![], None);
+            sock.send_to(&real.encode(), from).unwrap();
         });
-        let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let t = transport();
         let got = t.find_node(&contact(addr), &contact(addr), &id(2));
-        h.join().unwrap();
-        assert_eq!(got.len(), 2, "the stray datagram ate the reply");
+        assert_eq!(got.len(), 2, "the real reply was lost behind noise: {got:?}");
     }
 
     #[test]
     fn a_reply_from_the_wrong_address_is_dropped() {
-        // UDP has no connection, so anything that saw the query can answer
-        // it; accepting that lets a bystander steer a lookup.
-        let quiet = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let dead = quiet.local_addr().unwrap();
-        drop(quiet);
-        let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
-        // Nothing is listening, so this is the timeout path — the same
-        // `None` a wrong-address reply produces, and the same handling.
-        assert!(t.find_node(&contact(dead), &contact(dead), &id(2)).is_empty());
-        assert!(!t.ping(&contact(dead), &contact(dead)));
+        let (addr, _h) = responder(|_| None);
+        let other = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let t = transport();
+        let me = t.local_addr().unwrap();
+        // A bystander answers before the real peer does (which never will).
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let m = rep(1, peer3(), one_node(), vec![], vec![], None);
+            other.send_to(&m.encode(), me).unwrap();
+        });
+        let got = t.find_node(&contact(addr), &contact(addr), &id(2));
+        assert!(got.is_empty(), "a bystander steered the lookup: {got:?}");
     }
 
     #[test]
     fn an_error_reply_counts_as_a_failure_rather_than_an_empty_success() {
-        // The peer understood and declined. There is nothing in it for a
-        // Transport method to return, and treating it as "knew nobody"
-        // would hide a server refusing our writes.
         let (addr, h) = responder(|q| match q {
-            Msg::Query { tid, .. } => Some(Msg::Error { tid, code: 401 }),
+            Msg::Query { tid, .. } => Some(Msg::Error { tid, code: 401, from: None }),
             _ => None,
         });
-        let t = WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let t = transport();
         assert!(!t.ping(&contact(addr), &contact(addr)));
         h.join().unwrap();
+    }
+
+    #[test]
+    fn a_ping_carries_no_target() {
+        let (addr, h) = responder(|q| match q {
+            Msg::Query { tid, .. } => Some(reply(tid, InfoHash([3u8; 20]))),
+            _ => None,
+        });
+        let t = transport();
+        assert!(t.ping(&contact(addr), &contact(addr)));
+        match h.join().unwrap() {
+            Some(Msg::Query { query: Query::Ping, target, want, .. }) => {
+                assert!(target.is_zero());
+                assert_eq!(want, 0, "a ping does not ask for nodes");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn our_public_ip_is_the_majority_of_what_peers_report() {
+        let t = transport();
+        for _ in 0..2 { t.note_reported("192.168.1.5".parse().unwrap()); }
+        for _ in 0..3 { t.note_reported("203.0.113.7".parse().unwrap()); }
+        assert_eq!(t.public_ip(), Some("203.0.113.7".parse().unwrap()));
+        // A liar reporting a fresh address per reply cannot grow the map.
+        for i in 0..(MAX_REPORTED + 20) {
+            t.note_reported(format!("10.9.{}.{}", i / 256, i % 256).parse().unwrap());
+        }
+        assert!(t.reported.lock().unwrap().len() <= MAX_REPORTED);
+        assert_eq!(t.public_ip(), Some("203.0.113.7".parse().unwrap()), "one vote each cannot outvote three");
+    }
+
+    #[test]
+    fn sa_in_a_reply_is_learned_as_our_address() {
+        let (addr, h) = responder(|q| match q {
+            Msg::Query { tid, .. } => Some(Msg::Reply { tid, from: peer3(), sa: Some(Ip::V4([203, 0, 113, 9])),
+                                                       nodes: vec![], values: vec![], token: vec![], vid: None }),
+            _ => None,
+        });
+        let t = transport();
+        assert!(t.public_ip().is_none());
+        t.ping(&contact(addr), &contact(addr));
+        h.join().unwrap();
+        assert_eq!(t.public_ip(), Some("203.0.113.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_value_over_the_references_limit_is_not_sent() {
+        let (addr, h) = responder(|_| None);
+        let t = transport();
+        t.store(&contact(addr), &contact(addr), id(2), vec![0; dht_kit::MAX_VALUE_SIZE + 1], 600);
+        drop(t);
+        // The responder's 5 s read times out with nothing.
+        assert!(h.join().unwrap().is_none(), "an oversize value went out");
     }
 }

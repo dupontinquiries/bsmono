@@ -9,13 +9,19 @@ description = "Pure-Rust Kademlia DHT node for the unified monorepo. Routing cor
 path = "src/lib.rs"
 
 [dependencies]
-# The OpenDHT-compatible wire, OPTIONAL. snapcore has had zero dependencies and
-# five crates rely on that; making the codec a feature keeps it true for anyone
-# who only wants the engine, while letting a real transport turn packets into
-# handler calls without a second implementation.
-dht-kit = { path = "../dht-kit", optional = true }
+# The OpenDHT-compatible wire. dht-kit has no dependencies of its own, so
+# this keeps snapcore's closure at zero third-party crates — which is what the
+# five engine-only consumers actually relied on.
+#
+# ON BY DEFAULT now, and the `wire` feature is kept only so existing
+# `features = ["wire"]` lines keep resolving. It was off by default for a
+# year, and the cost was that only one crate ever compiled the OpenDHT
+# path — which is part of how a codec that no real node could read went
+# unnoticed. A feature should name a dependency, not a capability; the
+# capability nobody builds is the one that rots.
+dht-kit = { path = "../dht-kit" }
 
 [features]
-default = []
-wire = ["dep:dht-kit"]
+default = ["wire"]
+wire = []
 
