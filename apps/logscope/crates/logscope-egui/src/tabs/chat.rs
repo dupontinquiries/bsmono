@@ -7636,7 +7636,7 @@ an empty result set: nothing was searched.");
 // Close is explicit: an error that dismisses itself on a timer is one that vanishes while
 // being read, and this text is long enough to still be reading.
 if let Some(msg) = self.error_banner.clone() {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(theme::RED().linear_multiply(0.12))
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
@@ -8122,7 +8122,7 @@ if let Some(msg) = self.error_banner.clone() {
         // Severity-then-recency, matching the Engine page's own ranking so the two never disagree,
         // and absent entirely when nothing interrupts — a banner that is usually there is furniture.
         if let Some(msg) = crate::diagfeed::banner() {
-            egui::TopBottomPanel::top("chat_diag_banner").show_inside(ui, |ui| {
+            egui::Panel::top("chat_diag_banner").show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("⚠").color(egui::Color32::from_rgb(230, 170, 80)));
                     ui.label(RichText::new(msg).small().color(egui::Color32::from_rgb(230, 170, 80)));
@@ -8168,7 +8168,7 @@ if let Some(msg) = self.error_banner.clone() {
         // instead of two panes fighting for the same 400 px.
         if self.show_context && cl.split {
             let w = (ui.available_width() * 0.38).clamp(240.0, 330.0);
-            egui::SidePanel::right("chat_right").resizable(true).default_width(w).show_inside(ui, |ui| {
+            egui::Panel::right("chat_right").resizable(true).default_size(w).show_inside(ui, |ui| {
                 ui.add_space(theme::PAD_XS as f32);
                 ui.horizontal_wrapped(|ui| {
                     if ui.selectable_label(self.right_page == RightPage::Files, RichText::new("📄 Files").small()).clicked() { self.right_page = RightPage::Files; }
@@ -9339,13 +9339,13 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
             let n = self.replicator.as_ref().map(|m| m.workers.len()).unwrap_or(1);
             match crate::replicatorlayout::split(window_w, n) {
                 crate::replicatorlayout::Split::Side { fan_pt } => {
-                    egui::SidePanel::right("replicator_fan")
+                    egui::Panel::right("replicator_fan")
                         .resizable(true)
-                        .default_width(fan_pt)
+                        .default_size(fan_pt)
                         // The clamp is the container's, not the content's: dragging the splitter
                         // can starve the log but never past its floor, and cannot widen the fan
                         // past the window.
-                        .width_range(crate::replicatorlayout::MIN_COL_PT
+                        .size_range(crate::replicatorlayout::MIN_COL_PT
                             ..=(window_w - crate::replicatorlayout::MIN_LOG_PT)
                                 .max(crate::replicatorlayout::MIN_COL_PT))
                         .show_inside(ui, |ui| {
