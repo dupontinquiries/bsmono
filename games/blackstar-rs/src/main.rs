@@ -1041,28 +1041,6 @@ fn element_glow(e: weapons::Element) -> [f32; 4] {
     }
 }
 
-/// Line of sight through the world's SDF: march from `a` to `b` in 1.5 m
-/// steps and call it blocked when the field goes solid. Coarse on
-/// purpose — a hostile deciding whether it can see you does not need
-/// sub-metre precision, and `field.rs` only asks a few times a second
-/// per foe (`field::LOS_EVERY_S`).
-fn los_march(world: &World, a: Vec3, b: Vec3) -> bool {
-    let d = b - a;
-    let len = d.length();
-    if len < 1e-3 {
-        return true;
-    }
-    let dir = d / len;
-    let mut t = 1.5;
-    while t < len - 1.0 {
-        if world.sdf(a + dir * t) < 0.15 {
-            return false;
-        }
-        t += 1.5;
-    }
-    true
-}
-
 /// Which pose a field hostile shows: a chassis from the loaded roster
 /// (deterministic per slot, never a boss, only one that folds), and the
 /// frame of its fold strip that matches the foe's form — vehicle end,
@@ -3784,9 +3762,10 @@ impl Game {
             mass: cable::CAR_MASS,
         };
         let world_g = self.world_g;
-        let world = &self.world;
+        // THROUGH THE SEAM: the field asks the host, not the tile
+        let world: &dyn worldhost::WorldHost = &self.world;
         let ground = |x: f32, z: f32| world.ground_h(x, z);
-        let los = |a: Vec3, b: Vec3| los_march(world, a, b);
+        let los = |a: Vec3, b: Vec3| world.line_of_sight(a, b);
         let ev = {
             let s = self.sortie.as_mut().unwrap();
             s.field.g = world_g;
@@ -3930,7 +3909,7 @@ impl Game {
         if !self.hostile_shots.live.is_empty() {
             let marks = [shots::Mark { pos: ppos, vel: pvel, r: self.car.half_len.max(self.car.half_h) }];
             // a fresh closure: the one above ended with the field step
-            let world = &self.world;
+            let world: &dyn worldhost::WorldHost = &self.world;
             let ground = |x: f32, z: f32| world.ground_h(x, z);
             let hits = self.hostile_shots.step(dt, self.world_g, &self.ambient, &marks, &ground);
             for h in hits {
@@ -6538,21 +6517,21 @@ impl Game {
                     // nearest plaza, facing the LZ, not at a hashed bearing
                     // in the open. Done here, before the first
                     // `tick_engage` musters anything.
-                    if s.engaged() && !self.world.plazas.is_empty() {
+                    if s.engaged() {
+                        let host: &dyn worldhost::WorldHost = &self.world;
                         let lz = s.drop.pos;
-                        if let Some(p) = self
-                            .world
-                            .plazas
+                        if let Some(p) = host
+                            .plazas()
                             .iter()
                             .min_by(|a, b| a.distance_squared(lz).total_cmp(&b.distance_squared(lz)))
                         {
-                            let gy = self.world.ground_h(p.x, p.z);
+                            let gy = host.ground_h(p.x, p.z);
                             s.field.anchor = Vec3::new(p.x, gy, p.z);
                             let to = lz - *p;
                             s.field.facing = Vec3::new(to.x, 0.0, to.z).normalize_or(Vec3::Z);
                             // and the plaza's own blocks, so the front stands behind them
-                            s.field.cover = self.world.cover.iter().filter(|c| (**c - *p).length() < 40.0).copied().collect();
-                            s.field.avoid = self.world.obstacles.clone();
+                            s.field.cover = host.cover().iter().filter(|c| (**c - *p).length() < 40.0).copied().collect();
+                            s.field.avoid = host.obstacles().to_vec();
                         }
                     }
                     // THE BODY READS THE FALL: nose down the velocity as a

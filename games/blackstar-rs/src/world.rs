@@ -5089,3 +5089,31 @@ mod wall_ahead_tests {
         // hull-to-origin vertical offset this test doesn't need to know
     }
 }
+
+
+// ------------------------------------------------------------ the seam ---
+//
+// What the game asks of this world, as `worldhost::WorldHost`. Every
+// answer is a field or a method this file already had; the trait is the
+// list of them, so a second host (unendlich's chunks) can answer the same
+// questions without the game knowing which engine it is standing on.
+impl worldhost::WorldHost for World {
+    fn ground_h(&self, x: f32, z: f32) -> f32 {
+        World::ground_h(self, x, z)
+    }
+    fn clearance(&self, p: Vec3) -> f32 {
+        self.sdf(p)
+    }
+    fn origin(&self) -> Vec3 {
+        self.origin
+    }
+    fn plazas(&self) -> &[Vec3] {
+        &self.plazas
+    }
+    fn cover(&self) -> &[Vec3] {
+        &self.cover
+    }
+    fn obstacles(&self) -> &[(Vec3, f32)] {
+        &self.obstacles
+    }
+}

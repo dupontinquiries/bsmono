@@ -1,0 +1,13 @@
+[package]
+name = "worldhost"
+version = "0.1.0"
+edition = "2021"
+description = """
+What a game needs from a world, and nothing about how the world is made.
+The seam between blackstar-rs's headless game systems (field, sortie,
+cable, district) and whichever engine hosts the world: skydribble's SDF
+tile today, unendlich's voxel chunks next. See src/lib.rs.
+"""
+
+[dependencies]
+glam = "0.28"
