@@ -4,7 +4,7 @@
 //! world render does — vertex colors carry the look, so no dedicated atlas is required.
 
 
-use egui::{Color32, Pos2, Rect, Stroke};
+use egui::{Color32, Pos2, Rect};
 use crate::math::Vec3;
 
 fn darker(c: Color32, f: f32) -> Color32 {
