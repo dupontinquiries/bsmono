@@ -75,6 +75,10 @@ pub mod segmented_tabs;
 pub mod responsive_nav;
 pub mod scroll;
 pub mod fuzzy;
+// Text inputs that cannot be built without an id — see the module docs for
+// why this is a kit concern and not a per-app one (the single-character
+// input bug, found and re-found across 68 call sites).
+pub mod text_field;
 pub mod fmt;
 pub mod glove;
 pub mod upscale;
