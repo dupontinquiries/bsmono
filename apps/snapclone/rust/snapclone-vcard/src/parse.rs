@@ -50,7 +50,7 @@ pub fn parse_vcard(input: &str) -> Result<VCard> {
                 // Fallback: extract from N: field (family;given;...)
                 let parts: Vec<&str> = value.splitn(2, ';').collect();
                 if let Some(name) = parts.first() {
-                    if !name.is_empty() { card.display_name = name.to_owned(); }
+                    if !name.is_empty() { card.display_name = name.to_string(); }
                 }
             }
             _ => {} // unknown property — ignore per RFC
