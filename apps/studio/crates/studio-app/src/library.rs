@@ -892,7 +892,12 @@ pub fn show_tree(ui: &mut egui::Ui, roots: &Roots, state: &mut TreeState,
     }
     ui.horizontal(|ui| {
         ui.label("find:");
-        ui.add(egui::TextEdit::singleline(&mut state.filter).id_salt("library-state_filter"));
+        // desired_width bounded to what is left after the label and button,
+        // rather than letting the edit ask for its content width and push the
+        // panel out — the same widening path as the empty-library label below.
+        let rest = (ui.available_width() - 34.0).max(60.0);
+        ui.add(egui::TextEdit::singleline(&mut state.filter)
+            .id_salt("library-state_filter").desired_width(rest));
         if ui.small_button("⟳").on_hover_text("rescan").clicked() { state.refresh(); }
     });
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -978,8 +983,21 @@ pub fn show_tree(ui: &mut egui::Ui, roots: &Roots, state: &mut TreeState,
         let top_empty = state.cached(root)
             .map(|l| l.dirs.is_empty() && l.files.is_empty()).unwrap_or(true);
         if top_empty {
-            ui.colored_label(c.text_weak,
-                "empty. Set STUDIO_LIBRARY or put samples in ./library");
+            // `.wrap()` explicitly, and a shorter string.
+            //
+            // A vertical-only ScrollArea does NOT constrain its content's
+            // width — there is no horizontal scrollbar to absorb overflow, so
+            // a label that reports a wide desired size propagates that width
+            // straight up into the enclosing panel. This one-line sentence is
+            // the widest thing the sidebar ever contains, and it appears
+            // exactly when the library is empty, which is precisely when the
+            // sidebar has no other content to be measured against. That is
+            // the reported "sidebar reflows way too wide", and it is why it
+            // looked intermittent: it only bites on an empty or unscanned
+            // root.
+            ui.add(egui::Label::new(
+                egui::RichText::new("Empty. Set STUDIO_LIBRARY, or put samples in ./library.")
+                    .color(c.text_weak)).wrap());
         }
         walk(ui, root, 0, state, rack, project, prefs, compact, c, &mut action);
     });

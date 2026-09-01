@@ -2885,10 +2885,19 @@ impl eframe::App for App {
             // take the whole window. The labels inside are truncated to match
             // (see library.rs) so they wrap into the chosen width rather than
             // pushing against it.
+            // The cap is RELATIVE to the surface, not a fixed 420. On a phone
+            // 420pt is most of the screen, so a sidebar allowed to reach it
+            // leaves no timeline — the panel was obeying its range and the
+            // range was wrong for the device. Measured from content_rect (the
+            // usable area, excluding what sits under the system bars), and
+            // floored so it cannot collapse to nothing on a very narrow one.
+            let surface = ctx.content_rect().width();
+            let side_max = (surface * 0.42).clamp(180.0, 420.0);
+            let side_default = side_max.min(210.0);
             egui::Panel::left("library")
                 .resizable(true)
-                .default_size(210.0)
-                .size_range(160.0..=420.0)
+                .default_size(side_default)
+                .size_range(160.0_f32.min(side_max)..=side_max)
                 .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.small_button("⟳").on_hover_text("rescan").clicked() {
