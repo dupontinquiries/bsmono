@@ -1146,6 +1146,19 @@ pub struct Chat {
     msgs: Vec<Msg>,
     input: String,
     context: String,   // system prompt — the "context" the model always sees
+    /// Memoised `planned_files` result, keyed by (workspace root, budget).
+    ///
+    /// NOT an optimisation — a correctness-of-behaviour fix for a bug I
+    /// introduced. `workspace_block` is reached from `est_prompt_tokens`, which
+    /// the composer calls to show a live token estimate, i.e. every frame. So
+    /// the planner walked the whole workspace tree and read the selected files
+    /// at 60 Hz, and its diagnostic printed once per frame — which is the
+    /// "workspace files: 51 considered…" line repeating forever in the log.
+    ///
+    /// RefCell because `workspace_block(&self)` is on the read path and making
+    /// it `&mut` would push interior mutability up through several callers for
+    /// no gain.
+    planned_cache: std::cell::RefCell<Option<(std::path::PathBuf, usize, String)>>,
     threading: bool,   // thread prior turns into the prompt, or single-shot
     /// Oldest turn currently in the model's window, remembered so it can STAY there.
     ///
@@ -1452,6 +1465,7 @@ impl Default for Chat {
             win_floor: std::cell::Cell::new(None),
             msgs: Vec::new(), input: String::new(),
             context: LONG_HORIZON.into(),
+            planned_cache: std::cell::RefCell::new(None),
             threading: true, show_context: false, attach_log: true, fix_mode: false,
             right_page: RightPage::Prompting, coord_mode: crate::coordinator::Mode::Barebones,
             // PERSISTED CHOICES, restored here rather than defaulted. A Dvorak user re-selecting
@@ -3346,6 +3360,21 @@ them to", patches.len());
     /// decide whether to open it), then lets `ctxplan::plan` spend the budget.
     /// Only the files the plan actually selects are read.
     fn planned_files(&self, root: &std::path::Path, budget_bytes: usize) -> String {
+        // Serve the memo when the inputs have not changed. See `planned_cache`:
+        // this is on a per-frame path, and walking a workspace tree plus reading
+        // the selected files at 60 Hz is what produced the endlessly repeating
+        // "workspace files: …" log line.
+        if let Some((r, b, s)) = self.planned_cache.borrow().as_ref() {
+            if r == root && *b == budget_bytes {
+                return s.clone();
+            }
+        }
+        let out = self.plan_files_uncached(root, budget_bytes);
+        *self.planned_cache.borrow_mut() = Some((root.to_path_buf(), budget_bytes, out.clone()));
+        out
+    }
+
+    fn plan_files_uncached(&self, root: &std::path::Path, budget_bytes: usize) -> String {
         use crate::ctxplan::{describes_project, plan, Budget, FileEntry};
         const SKIP_DIR: [&str; 7] =
             ["target", ".git", ".gitmind", ".logscope", "node_modules", "dist", ".cargo"];

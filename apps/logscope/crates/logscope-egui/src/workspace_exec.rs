@@ -66,6 +66,21 @@ pub enum Tool {
     /// which small models drift on (line numbers, context hashes) — either applies exactly or fails
     /// with a teachable error (0 matches = stale anchor, >1 = grow the anchor).
     Edit { path: String, find: String, replace: String },
+    /// A SIDE IDEA the model wants to keep without acting on it.
+    ///
+    /// Every other tool here changes or reads the workspace. This one changes
+    /// nothing: it appends to `.logscope/scratch/scratch.jsonl` and returns.
+    /// The point is to give a model somewhere to put the thought it would
+    /// otherwise either drop or, worse, act on — "this could be a trait", "the
+    /// caching here looks wrong", "here is a sketch of the other approach" —
+    /// so a turn tasked with one thing does not get derailed by a second.
+    ///
+    /// Append-only JSONL with a per-entry id and a `parent` link, because the
+    /// stated purpose is to build a graph over these later and pipe it
+    /// somewhere. A flat log would force that structure to be reconstructed
+    /// from timestamps; recording the link at write time costs nothing and is
+    /// the one thing that cannot be recovered afterwards.
+    Scratch { title: String, lang: String, body: String },
     /// Write a SHARED doc for the whole crew: `.logscope/docs/<name>.md` in the workspace. Every
     /// agent run and fan worker gets all shared docs injected into its prompt (see
     /// `collect_shared_docs`), so this is how one worker's reconnaissance ("here is the module map",
@@ -88,7 +103,7 @@ pub enum Tool {
 /// One list, and a test that fails if the enum grows a variant that is not in it.
 pub const RUNTIME_TOOLS: &[&str] = &[
     "write_file", "edit", "read_file", "read_range", "list_dir", "search", "run", "git_log", "doc",
-    "propose",
+    "propose", "scratch_code",
 ];
 
 impl Tool {
@@ -103,6 +118,7 @@ impl Tool {
             Tool::Search { .. } => "search",
             Tool::ReadRange { .. } => "read_range",
             Tool::GitLog { .. } => "git_log",
+            Tool::Scratch { .. } => "scratch_code",
             Tool::Propose { .. } => "propose",
             Tool::Edit { .. } => "edit",
             Tool::Doc { .. } => "doc",
@@ -116,6 +132,7 @@ impl Tool {
             Tool::ReadFile { path } => format!("read {path}"),
             Tool::ListDir { path } => format!("ls {}", if path.is_empty() { "." } else { path }),
             Tool::GitLog { n, path } => if path.is_empty() { format!("git log -n {n}") } else { format!("git log -n {n} -- {path}") },
+            Tool::Scratch { title, lang, body } => format!("scratch [{lang}] {title} ({} B)", body.len()),
             Tool::Propose { path, content } => format!("propose {} ({} B, dry run)", path, content.len()),
             Tool::Run { argv } => format!("run {}", argv.join(" ")),
             Tool::Search { pattern, path } => format!("search /{}/ in {}", pattern, if path.is_empty() { "." } else { path }),
@@ -179,6 +196,11 @@ pub struct Workspace {
     /// the label: filenames lie (a re-quantized 1B named "-7B-" is a real
     /// thing), tensor sizes cannot.
     model_params: Option<u64>,
+    /// The last `scratch_code` id written in this run, so the next one can name
+    /// its parent. The lineage edge is the one thing a later reader cannot
+    /// reconstruct — a timestamp gives order, not "this idea came out of that
+    /// one" — so it is recorded at write time.
+    scratch_last: Option<String>,
 }
 
 impl Workspace {
@@ -209,6 +231,7 @@ impl Workspace {
             rust_src: std::cell::OnceCell::new(),
             model_label: String::new(),
             model_params: None,
+            scratch_last: None,
             last_green: None,
         }
     }
@@ -289,6 +312,7 @@ impl Workspace {
             Tool::ReadRange { path, start, end } => self.read_range(path, *start, *end),
             Tool::Edit { path, find, replace } => self.edit_file(path, find, replace),
             Tool::Doc { name, content } => self.write_doc(name, content),
+            Tool::Scratch { title, lang, body } => self.scratch(title, lang, body),
         }
     }
 
@@ -534,6 +558,72 @@ Continue with read_range {rel} {} {}]",
     /// `Tool::Doc`: write a shared crew doc at `.logscope/docs/<name>.md`. Name is sanitized to a
     /// bare slug (no paths, no traversal); collisions overwrite — docs are living documents the crew
     /// keeps current, not an append-only log.
+    /// Record a side idea. Writes nothing to the workspace proper.
+    ///
+    /// Append-only JSONL at `.logscope/scratch/scratch.jsonl`, one object per
+    /// idea, with:
+    ///   * `id`     — content-addressed, so the same idea recorded twice is the
+    ///                same node rather than two. A model that circles back to a
+    ///                thought should strengthen an edge, not duplicate a vertex.
+    ///   * `parent` — the previous scratch id in this run, or null. This is the
+    ///                only field that cannot be reconstructed afterwards:
+    ///                timestamps give an order but not a LINEAGE, and "this idea
+    ///                came out of that one" is the edge the graph is for.
+    ///   * `title`, `lang`, `body`, `run`, `at`.
+    ///
+    /// JSONL rather than a single JSON document because this is appended to by
+    /// a process that may be killed mid-turn, and a truncated last line costs
+    /// one idea instead of the whole file.
+    fn scratch(&mut self, title: &str, lang: &str, body: &str) -> ToolResult {
+        let body = body.trim();
+        if body.is_empty() {
+            return ToolResult::err("scratch_code: body is empty — nothing to record");
+        }
+        // Bounded like every other block here. An idea is a sketch; a model
+        // pasting a whole file into scratch is doing something else.
+        const MAX: usize = 8 * 1024;
+        let (body, truncated) = if body.len() > MAX {
+            (&body[..MAX], true)
+        } else {
+            (body, false)
+        };
+        let dir = self.root.join(".logscope").join("scratch");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return ToolResult::err(format!("scratch_code: {e}"));
+        }
+        let id = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            body.hash(&mut h);
+            title.hash(&mut h);
+            format!("{:016x}", h.finish())
+        };
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"")
+            .replace('\n', "\\n").replace('\t', "\\t").replace('\r', "");
+        let parent = match &self.scratch_last {
+            Some(p) => format!("\"{p}\""),
+            None => "null".to_string(),
+        };
+        let line = format!(
+            "{{\"id\":\"{id}\",\"parent\":{parent},\"at\":{at},\"title\":\"{}\",\"lang\":\"{}\",\"body\":\"{}\"}}\n",
+            esc(title), esc(lang), esc(body));
+        let path = dir.join("scratch.jsonl");
+        use std::io::Write;
+        let appended = std::fs::OpenOptions::new().create(true).append(true).open(&path)
+            .and_then(|mut f| f.write_all(line.as_bytes()));
+        if let Err(e) = appended {
+            return ToolResult::err(format!("scratch_code: {e}"));
+        }
+        self.scratch_last = Some(id.clone());
+        ToolResult::ok(format!(
+            "scratch {id} recorded ({} B{}). Nothing was changed in the workspace — carry on with \
+the task.", body.len(), if truncated { ", truncated" } else { "" }))
+    }
+
     fn write_doc(&mut self, name: &str, content: &str) -> ToolResult {
         let slug: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect();
         let slug = slug.trim_matches('-').to_string();
@@ -1690,6 +1780,10 @@ fn diagnose(block: &str) -> Rejected {
         "git_log" => &[],
         "propose" | "dry_run" => &["path"],
         "doc" | "share_doc" | "write_doc" => &["name"],
+        // Only the body is required. A model with an idea and no name for it
+        // should still be able to record it — demanding a title is exactly the
+        // friction that makes a side-channel go unused.
+        "scratch_code" | "scratch" | "idea" => &["body"],
         _ => return Rejected::UnknownTool(tool),
     };
     for f in need {
@@ -1817,6 +1911,14 @@ fn parse_one(block: &str) -> Option<Tool> {
         "doc" | "share_doc" | "write_doc" => Some(Tool::Doc {
             name: json_str(block, "name")?,
             content: json_str(block, "content").or_else(|| json_str(block, "contents"))?,
+        }),
+        "scratch_code" | "scratch" | "idea" => Some(Tool::Scratch {
+            title: json_str(block, "title").or_else(|| json_str(block, "name"))
+                .unwrap_or_else(|| "untitled".into()),
+            lang: json_str(block, "lang").or_else(|| json_str(block, "language"))
+                .unwrap_or_else(|| "text".into()),
+            body: json_str(block, "body").or_else(|| json_str(block, "content"))
+                .or_else(|| json_str(block, "code"))?,
         }),
         "run" => {
             let argv = json_str_array(block, "argv")
@@ -2180,6 +2282,13 @@ Available tools (one JSON object per block):
 - git_log     {{ \"tool\":\"git_log\", \"n\":<count>, \"path\":\"<rel path or empty>\" }}  (what this repo RECENTLY DID — see below)
 - propose     {{ \"tool\":\"propose\", \"path\":\"<rel path>\", \"content\":\"<a section of code>\" }}  (DRY RUN — writes nothing, see below)
 - doc         {{ \"tool\":\"doc\", \"name\":\"survey\", \"content\":\"<markdown>\" }}  (SHARED crew doc — every worker's next prompt includes it)
+- scratch_code {{ \"tool\":\"scratch_code\", \"title\":\"<short>\", \"lang\":\"rust\", \"body\":\"<sketch>\" }}  (a SIDE IDEA — changes nothing, see below)
+
+SIDE IDEAS GO IN scratch_code, NOT IN THE TASK. If while doing the work you notice something worth
+keeping — a refactor this suggests, a bug you are not being asked to fix, a sketch of the approach
+you did NOT take — call scratch_code and carry on. It writes nothing and costs one line. It exists
+so a good thought does not have to become either a derailment or a loss: recording it is how you
+stay on the task you were given while still keeping the idea.
 
 THE CODE IS RIGHT THERE — LOOK AT IT. This workspace is a real repository (overview below). Every
 claim about it must come from tool results, never from guessing and never from asking the user: the
@@ -5239,6 +5348,7 @@ mod long_horizon_tests {
             Tool::Edit { path: "p".into(), find: "a".into(), replace: "b".into() },
             Tool::Doc { name: "d".into(), content: String::new() },
             Tool::Propose { path: "p".into(), content: "fn x() {}".into() },
+            Tool::Scratch { title: "t".into(), lang: "rust".into(), body: "idea".into() },
         ];
         for t in &all {
             assert!(RUNTIME_TOOLS.contains(&t.wire_name()),
@@ -6010,5 +6120,116 @@ mod tool_surface_agreement {
         // Models write quoted numbers about as often as bare ones.
         let q = parse_one(r#"{"tool":"git_log","n":"5"}"#).unwrap();
         assert!(matches!(q, Tool::GitLog { n: 5, .. }), "{q:?}");
+    }
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+
+    fn ws() -> (Workspace, std::path::PathBuf) {
+        let d = std::env::temp_dir().join(format!("scratch-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&d).unwrap();
+        (Workspace::new(d.clone()), d)
+    }
+
+    fn lines(root: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(root.join(".logscope/scratch/scratch.jsonl"))
+            .unwrap_or_default().lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn a_scratch_records_without_touching_the_workspace() {
+        // The whole point: somewhere to put a thought that is NOT an action.
+        // If this ever creates or edits a file it has become a write tool.
+        let (mut w, root) = ws();
+        let r = w.apply(&Tool::Scratch {
+            title: "trait idea".into(), lang: "rust".into(),
+            body: "trait Backend { fn load(&self); }".into() });
+        assert!(r.ok, "{r:?}");
+        assert!(w.take_events().is_empty(), "scratch must record no file events");
+        assert_eq!(lines(&root).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_second_idea_names_the_first_as_its_parent() {
+        // The lineage edge is the only field that cannot be reconstructed
+        // later: timestamps give an order, not "this came out of that".
+        let (mut w, root) = ws();
+        w.apply(&Tool::Scratch { title: "a".into(), lang: "text".into(), body: "first".into() });
+        w.apply(&Tool::Scratch { title: "b".into(), lang: "text".into(), body: "second".into() });
+        let l = lines(&root);
+        assert_eq!(l.len(), 2);
+        assert!(l[0].contains("\"parent\":null"), "{}", l[0]);
+        // the second must reference the first's id
+        let first_id = l[0].split("\"id\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        assert!(l[1].contains(&format!("\"parent\":\"{first_id}\"")), "{}", l[1]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_same_idea_twice_is_the_same_node() {
+        // Content-addressed so a model circling back to a thought strengthens
+        // an edge rather than duplicating a vertex — which is what makes the
+        // downstream graph meaningful rather than a transcript.
+        let (mut w, root) = ws();
+        let t = Tool::Scratch { title: "x".into(), lang: "rust".into(), body: "same".into() };
+        w.apply(&t);
+        w.apply(&t);
+        let l = lines(&root);
+        let id = |s: &String| s.split("\"id\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        assert_eq!(id(&l[0]), id(&l[1]), "identical content must yield one id");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_empty_body_is_refused_rather_than_recorded() {
+        let (mut w, root) = ws();
+        let r = w.apply(&Tool::Scratch { title: "t".into(), lang: "text".into(), body: "   ".into() });
+        assert!(!r.ok, "{r:?}");
+        assert!(lines(&root).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_body_with_quotes_and_newlines_stays_one_valid_jsonl_line() {
+        // JSONL only works if one record is one line. Code is exactly the
+        // content most likely to contain both quotes and newlines, so this is
+        // the common case rather than an edge one.
+        let (mut w, root) = ws();
+        w.apply(&Tool::Scratch {
+            title: "quote \"test\"".into(), lang: "rust".into(),
+            body: "fn f() {\n    println!(\"hi\\tthere\");\n}".into() });
+        let l = lines(&root);
+        assert_eq!(l.len(), 1, "embedded newlines must not split the record: {l:?}");
+        assert!(l[0].starts_with('{') && l[0].ends_with('}'), "{}", l[0]);
+        assert!(l[0].contains("\\n"), "newlines must be escaped, not literal: {}", l[0]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_huge_body_is_truncated_not_refused() {
+        // An idea is a sketch. Refusing would lose it; unbounded would let a
+        // model paste a file into the side channel.
+        let (mut w, root) = ws();
+        let r = w.apply(&Tool::Scratch {
+            title: "big".into(), lang: "text".into(), body: "x".repeat(64 * 1024) });
+        assert!(r.ok, "{r:?}");
+        assert!(r.output.contains("truncated"), "{}", r.output);
+        assert_eq!(lines(&root).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scratch_is_advertised_and_reachable_like_every_other_tool() {
+        assert!(RUNTIME_TOOLS.contains(&"scratch_code"));
+        // The aliases a model actually reaches for.
+        for name in ["scratch_code", "scratch", "idea"] {
+            let b = format!(r#"{{"tool":"{name}","body":"an idea"}}"#);
+            assert!(parse_one(&b).is_some(), "'{name}' must build");
+            assert!(!matches!(diagnose(&b), Rejected::UnknownTool(_)), "'{name}' must validate");
+        }
     }
 }
