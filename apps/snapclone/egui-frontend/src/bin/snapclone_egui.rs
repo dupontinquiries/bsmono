@@ -982,8 +982,23 @@ impl eframe::App for App {
         // come round on its own or an idle window never polls the socket —
         // and a live viewfinder needs the frame loop at frame rate, or the
         // preview updates only when the mouse moves.
-        ctx.request_repaint_after(std::time::Duration::from_millis(
-            if self.rig.running() { 33 } else { 500 }));
+        //
+        // A live CALL needs it at the audio frame rate: `pump_voice` takes
+        // at most four mic frames and sixteen datagrams per update, which
+        // at 500 ms wakeups is a fifth of what a 20 ms codec produces —
+        // the mic queue backs up without bound and the far end hears
+        // half-second bursts. Only the viewfinder used to raise the rate,
+        // so a call with the camera off stuttered and one with it on did
+        // not, which is the kind of correlation that sends people looking
+        // at the wrong subsystem.
+        let interval_ms: u64 = if self.voice.live() {
+            u64::from(self.snap.sink_latency.frame_ms).clamp(10, 33)
+        } else if self.rig.running() {
+            33
+        } else {
+            500
+        };
+        ctx.request_repaint_after(std::time::Duration::from_millis(interval_ms));
 
         let focused = ctx.input(|i| i.focused);
         if focused != self.focused {
