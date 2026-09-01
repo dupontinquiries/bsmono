@@ -59,6 +59,58 @@ FROM, because a number in oh survives whichever scale fix is chosen.
 was still drawn from outside. It now draws only when aboard (or when
 there is no exterior and the procedural loft needs it).
 
+## What the frame now shows (second pass, same session)
+
+The renderer is the game; these are reasoned from the draw path and the
+shader, not seen:
+
+- **Tracers.** Both shot pools flew invisible rounds — nothing drew a
+  `shots::Live`. Every live shot is now a stretched emissive sphere along
+  its velocity, element-tinted (`element_glow`), hostile rounds pulled to
+  a hot red so whose fire it is reads at a glance.
+- **Cables.** A thin box between chests, the rain-streak primitive; the
+  tow line warmer than a hostile's. `Field::cables()` is the seam.
+- **Contact shadows, cheap version (C13-2a).** A flattened dark disc on
+  `ground_h` under the player and every bot, shrinking and fading as the
+  body leaves the ground.
+- **Motion weight (C13-2c).** Hit-stop on rams, whip landings and
+  staggers (`Game::hitstop` holds the accumulator); shake proportional to
+  damage taken; the lens widens up to 9 degrees boosting at road speed
+  in vehicle form (a negative `fov_punch`).
+
+## Hardpoints — the fittings, read off the model in the loader
+
+`hardpoints.rs`. The vehicles are models with their guns, nozzles and
+canopies baked in; `tools/find-mounts.py` read some of that offline into
+a JSON the game never loaded, in a space the loader's rescale and
+re-orientation would have had to be undone against. The in-engine pass
+runs on the same oriented per-prim points `turret::find` walks, so the
+answers are in draw space. Guns (thin along Z, tip in the front half or
+on the deck, RAISED off the surface under the muzzle half — with the
+barrel's own sleeve prims excluded; the last two rules are what
+separates a barrel from a roof rail, and each was found on the roster),
+thrusters (round at the rear face, flaring aft, not on the ground line),
+a cockpit (compact, high, forward, centred), popouts on the actual top
+surface when nothing is gun-shaped, and a FORWARD HINT: nozzles opening
+at the nose with no forward gun to contradict them say the hull is
+loaded backwards.
+
+Used by: the saddle's trigger (a real muzzle, alternating a pair), the
+player's boost (one flame per nozzle, at the exit, along its aim),
+hostile vehicles' flames and fire origin, and the startup print
+(`bots: <name> ... forward hint -1.0 <- FITTINGS SAY THIS HULL IS
+BACKWARDS`).
+
+`--hardpoints` runs it over the 254 hulls in `assets/bots` headlessly and
+`--hardpoints <name>` narrates one. Where the roster stands after this
+session's iteration: 91 hulls with guns (8 of 26 tanks; 12 of 27 cars,
+which is the remaining false-positive class — curved roofs read as a gap
+under a rail), 93 with thrusters, 156 with a cockpit, 10 called
+backwards: `flyer_alphastar`, `flyer_resonator`, `flyer_wayside` among
+them — the first two have their nozzles at -Z in the oriented frame,
+which is either a wrong orientation guess in `model.rs` or a hull posed
+tail-first. Not applied to the orientation search; reported for it.
+
 ## Where the seams are
 
 - `field::Field::step(dt, &Player, ground, los) -> Vec<Event>` is the

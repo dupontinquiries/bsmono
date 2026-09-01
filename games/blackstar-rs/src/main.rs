@@ -42,6 +42,7 @@ mod footing;
 mod cable;
 mod field;
 mod grandeur;
+mod hardpoints;
 mod foothold;
 mod fleet;
 mod fx;
@@ -624,6 +625,7 @@ fn parse_args() -> Opts {
                 println!("  --aboard [len] walk the ship: rooms, consoles, sealed doors");
                 println!("  --rescale      what a real-sized robot costs, per constant");
                 println!("  --grandeur     the game's distances in body-heights against Destiny/DOTM/Interstellar");
+                println!("  --hardpoints   [name] what each hull carries: guns, thrusters, cockpit, and a forward verdict");
                 println!("  --guidance     the ball-chaser as a missile: pursuit vs PN");
                 println!("  --assemble     part families, and the pairing score");
                 println!("  --trainwatch   GAN training diagnostics: collapse and coverage");
@@ -944,6 +946,12 @@ struct Game {
     /// live projectiles — the thrown-mass and launched-charge verbs fly
     /// through `shots.rs` now instead of resolving in the trigger pull
     shots: shots::Shots,
+    /// shots fired from the saddle so far — walks the muzzle pair
+    saddle_shots: u32,
+    /// MOTION WEIGHT (C13-2c): seconds of frozen simulation left after a
+    /// heavy impact. The frame still renders; the world holds. Dark of
+    /// the Moon's hits land because the cut holds on them for a beat.
+    hitstop: f32,
     /// HOSTILE FIRE: the field's shots, in their own pool so the two sets
     /// of marks cannot be confused — the player's shots test against the
     /// bots, these test against the player. Same pool type, same physics,
@@ -1014,6 +1022,23 @@ struct Game {
 /// strike both go through it, so a railshot is worth the same wherever it
 /// lands and the number can be retuned in one place.
 const IMPULSE_TO_DAMAGE: f32 = 0.02;
+
+/// What a round of each element looks like in the air. The forms' own
+/// muzzle colours (`weapons::TABLE`) are per FORM; a shot in flight only
+/// knows its element, so this is the element's colour: the same hues,
+/// pushed hotter for an emissive tracer.
+fn element_glow(e: weapons::Element) -> [f32; 4] {
+    match e {
+        weapons::Element::Fire => [1.0, 0.55, 0.18, 0.95],
+        weapons::Element::Ice => [0.7, 0.9, 1.0, 0.95],
+        weapons::Element::Water => [0.4, 0.7, 1.0, 0.95],
+        weapons::Element::Air => [0.85, 0.95, 0.85, 0.95],
+        weapons::Element::Electric => [0.6, 0.75, 1.0, 0.95],
+        weapons::Element::Rock => [0.85, 0.72, 0.45, 0.95],
+        weapons::Element::Vine => [0.55, 0.9, 0.5, 0.95],
+        _ => [1.0, 0.96, 0.85, 0.95],
+    }
+}
 
 /// Line of sight through the world's SDF: march from `a` to `b` in 1.5 m
 /// steps and call it blocked when the field goes solid. Coarse on
@@ -1415,6 +1440,10 @@ fn main() {
     }
     if argv.iter().any(|a| a == "--grandeur") {
         grandeur::run();
+        return;
+    }
+    if argv.iter().any(|a| a == "--hardpoints") {
+        hardpoints::run(&argv);
         return;
     }
     if argv.iter().any(|a| a == "--guidance") {
@@ -2009,12 +2038,27 @@ fn main() {
                     format!("{} WALK {k}", label.to_uppercase()).into_boxed_str(),
                 ));
             }
-            println!(
-                "bots: {label} — {} poses{}{}",
-                strip.len(),
-                if walk.is_empty() { String::new() } else { format!(", {} walk", walk.len()) },
-                if flight { ", flight" } else { "" }
-            );
+            {
+                // WHAT THE HULL CARRIES, read at load: the vehicle pose's
+                // guns, thrusters and cockpit, and whether its fittings
+                // agree it is facing forward. Printed so a hull whose
+                // nozzles open at the nose is reported at startup rather
+                // than discovered when the flame comes out of the grille.
+                let hp = &cars.models[strip[0]].hardpoints;
+                println!(
+                    "bots: {label} — {} poses{}{} | {} gun{}, {} thruster{}, {}cockpit, forward hint {:+.1}{}",
+                    strip.len(),
+                    if walk.is_empty() { String::new() } else { format!(", {} walk", walk.len()) },
+                    if flight { ", flight" } else { "" },
+                    hp.guns.len(),
+                    if hp.guns.len() == 1 { "" } else { "s" },
+                    hp.thrusters.len(),
+                    if hp.thrusters.len() == 1 { "" } else { "s" },
+                    if hp.cockpit.is_some() { "" } else { "no " },
+                    hp.forward_hint,
+                    if hp.forward_hint < 0.0 { "  <- FITTINGS SAY THIS HULL IS BACKWARDS" } else { "" }
+                );
+            }
             cars.chassis.push(Chassis {
                 strip,
                 walk,
@@ -2185,6 +2229,8 @@ fn main() {
         forge_rx: None,
         shots: shots::Shots::default(),
         hostile_shots: shots::Shots::default(),
+        saddle_shots: 0,
+        hitstop: 0.0,
         ship_class: aboard::FLEET_DEFAULT,
         loco_mode: locomotion::decide(4, 0, 0, 0.0, 0.0),
         ambient: ballistics::Ambient::earthlike(),
@@ -3257,6 +3303,7 @@ impl Game {
             tuck: src.tuck.clone(),
             pack: src.pack.clone(),
             fittings: src.fittings.clone(),
+            hardpoints: src.hardpoints.clone(),
             cloud: Vec::new(),
             cloud_n: Vec::new(),
             sdf_half: Vec3::ZERO,
@@ -3363,6 +3410,15 @@ impl Game {
                 self.cam.add_shake(energy * 0.35);
                 self.cam.fov_punch = self.cam.fov_punch.max(energy * 9.0);
             }
+        }
+        // SPEED WIDENS THE LENS: boosting in vehicle form at road speed
+        // pulls the FOV out by up to 9 degrees — the punch's sign is
+        // "narrower", so a widen is a negative punch, and the same decay
+        // brings both back. Not in robot form: a walking body does not
+        // stretch the frame.
+        if !self.car.robot && self.car.boost > 0.0 && self.action_down(Action::Boost) {
+            let widen = -(self.car.vel.length() / 40.0).clamp(0.0, 1.0) * 9.0;
+            self.cam.fov_punch = self.cam.fov_punch.min(widen);
         }
         self.cam.fov_punch *= (1.0 - 6.0 * dt).max(0.0);
         let Some(&(cid, _)) = self.cars.xform.get(&self.cars.active) else { return };
@@ -3586,6 +3642,12 @@ impl Game {
         let local = (self.car.rot.inverse() * (at - self.car.pos)).clamp_length_max(1.0);
         let _ = self.body.hit(kind, local, Vec3::Y, dmg, 0.6);
         self.fx.ring_burst(at, [1.0, 0.35, 0.2, 1.0], false);
+        // MOTION WEIGHT: a hit you take shakes the lens in proportion, and
+        // a heavy one holds the frame
+        self.cam.add_shake((dmg / 45.0).clamp(0.12, 0.9));
+        if dmg >= 25.0 {
+            self.hitstop = self.hitstop.max(0.05);
+        }
         if was && !self.body.alive() {
             if let Some(s) = self.sortie.as_mut() {
                 s.player_down();
@@ -3633,7 +3695,23 @@ impl Game {
         };
         for e in ev {
             match e {
-                field::Event::Fire { from, dir, verb, element, dmg, .. } => {
+                field::Event::Fire { from, dir, verb, element, dmg, slot } => {
+                    // a hostile driving in vehicle form shoots from ITS
+                    // hull's muzzle, not from a chest it does not have
+                    let (from, dir) = match self.bots.iter().find(|b| b.brain.hostile_slot() == Some(slot)) {
+                        Some(b) if !b.car.robot => {
+                            let hp = &self.cars.models[b.model.min(self.cars.models.len() - 1)].hardpoints;
+                            match hp.muzzle(slot + self.hostile_shots.live.len()) {
+                                Some(m) => {
+                                    let at = b.car.pos + b.car.rot * m.pos;
+                                    // aim stays at the player; the mount only moves the origin
+                                    (at, (from + dir * 40.0 - at).normalize_or(dir))
+                                }
+                                None => (from, dir),
+                            }
+                        }
+                        _ => (from, dir),
+                    };
                     // a hostile beam flies as a very fast slug so one pool
                     // carries every verb; speeds are GUESSES sized to be
                     // dodgeable at range and not up close
@@ -3654,6 +3732,8 @@ impl Game {
                 field::Event::Ram { dv, dmg, .. } => {
                     self.car.vel += dv;
                     self.player_take(dmg, ppos, sections::Kind::Kinetic);
+                    self.hitstop = self.hitstop.max(0.07);
+                    self.cam.fov_punch = self.cam.fov_punch.max(6.0);
                 }
                 field::Event::Rammed { slot, dv, dmg } => {
                     if let Some(s) = self.sortie.as_mut() {
@@ -3666,6 +3746,8 @@ impl Game {
                     }
                     // you take a little of your own ram, and lose speed
                     self.car.vel *= 0.8;
+                    self.hitstop = self.hitstop.max(0.06);
+                    self.cam.add_shake(0.5);
                 }
                 field::Event::Folded { slot, .. } => {
                     if let Some(f) = self.sortie.as_ref().and_then(|s| s.field.foe(slot)) {
@@ -3685,6 +3767,8 @@ impl Game {
                         let at = f.pos() + Vec3::Y * field::CHEST_H;
                         self.fx.ring_burst(at, [1.0, 0.95, 0.6, 1.0], false);
                     }
+                    // a heavy hit that lands holds a frame or two
+                    self.hitstop = self.hitstop.max(0.04);
                 }
                 // the hostile's cable on you: drawn as a beam-ish streak
                 // each tick it holds (the fx system has no persistent line
@@ -3735,6 +3819,8 @@ impl Game {
                     }
                     if into.is_some() {
                         self.toastf("thrown INTO another — both wear it");
+                        self.hitstop = self.hitstop.max(0.08);
+                        self.cam.add_shake(0.6);
                     }
                 }
             }
@@ -3824,7 +3910,18 @@ impl Game {
         let p = self.wep.effective();
         let verb = p.verb;
         let fwd = self.car.forward();
-        let origin = self.car.pos + fwd * (self.car.half_len * 0.9) + self.car.up() * (self.car.half_h * 0.4);
+        // THE MUZZLE IS ON THE MODEL. `hardpoints::find` read the vehicle
+        // pose at load: a real barrel's tip if the hull has one, else the
+        // popout pair on the upper hull. Alternating shots walk the pair.
+        // A rear gun aims where it aims — the mount's own direction.
+        let size = self.cfg.car.size;
+        let mi = self.cars.active.min(self.cars.models.len() - 1);
+        let (origin, aim) = match self.cars.models[mi].hardpoints.muzzle(self.saddle_shots as usize) {
+            Some(m) => (self.car.pos + self.car.rot * (m.pos * size), (self.car.rot * m.aim).normalize_or(fwd)),
+            None => (self.car.pos + fwd * (self.car.half_len * 0.9) + self.car.up() * (self.car.half_h * 0.4), fwd),
+        };
+        self.saddle_shots = self.saddle_shots.wrapping_add(1);
+        let fwd = aim;
         if verb == weapons::Verb::Grapple {
             let engaged = self.sortie.as_ref().map(|s| s.engaged()).unwrap_or(false);
             if !engaged {
@@ -6278,7 +6375,14 @@ impl Game {
             self.ball.r = physics::BALL_R * self.cfg.ball.size;
             let mi = self.cars.active;
             apply_car_dims(&mut self.car, &self.cars.models[mi], self.cfg.car.size);
-            self.acc += dt;
+            // HIT-STOP: a heavy impact holds the world for a few frames.
+            // The accumulator does not fill, so no substep runs; the
+            // camera and the HUD keep drawing what is there.
+            if self.hitstop > 0.0 {
+                self.hitstop = (self.hitstop - dt).max(0.0);
+            } else {
+                self.acc += dt;
+            }
             let mut ev = StepEvents::default();
             let mut substeps = 0u32;
             while self.acc >= FIXED_DT {
@@ -8476,6 +8580,97 @@ impl Game {
             }
         }
 
+        // ---- CONTACT SHADOWS, the cheap version (C13-2a) ----
+        // Nothing in the recording touched the ground: the bot floats. The
+        // SDF shadow probe sees the RT car proxies, but a proxy is a low
+        // car-shaped box under a body that is standing up as a robot, and
+        // only the twenty nearest bots have one. A flattened dark disc at
+        // the ground under every body is the decal C13 asked for first:
+        // it sits on `ground_h`, so a body in the air leaves it behind and
+        // shrinks it — the oldest contact cue there is. Alpha, so the
+        // back-to-front sort draws it over the terrain and under the body.
+        {
+            let mut blob = |objs: &mut Vec<ObjDraw>, pos: Vec3, r: f32| {
+                let gy = self.world.ground_h(pos.x, pos.z);
+                let h = (pos.y - gy).max(0.0);
+                let fade = (1.0 - h / 6.0).clamp(0.12, 1.0);
+                let rr = r * (1.0 + h * 0.08);
+                let m = Mat4::from_translation(Vec3::new(pos.x, gy + 0.035, pos.z))
+                    * Mat4::from_scale(Vec3::new(rr, 0.028, rr * 0.92));
+                push(objs, world::M_SPHERE_LO, None, m, [0.02, 0.02, 0.03, 0.62 * fade], [0.0, 0.0, 0.0, 0.0]);
+            };
+            if self.mode == Mode::Play {
+                blob(&mut objs, rc.0, self.car.half_len * 1.15);
+            }
+            let cam = self.cam.pos;
+            for b in self.bots.iter() {
+                if b.car.pos.distance_squared(cam) > 160.0 * 160.0 {
+                    continue;
+                }
+                blob(&mut objs, b.car.pos, b.car.half_len * 1.1);
+            }
+        }
+
+        // ---- TRACERS: every live shot, both pools ----
+        // The shot pools flew invisible rounds: `shots::step` landed them
+        // and `fx` burst on impact, but nothing drew the flight. War for
+        // Cybertron's whole feel is the stream in the air; a fight where
+        // you cannot see what is coming reads as nothing happening. A
+        // stretched emissive sphere along the velocity, element-tinted;
+        // hostile rounds pulled toward a hot red so whose it is reads at a
+        // glance, the way Destiny keeps enemy fire on its own palette.
+        {
+            let mut tracer = |objs: &mut Vec<ObjDraw>, s: &shots::Live, hostile: bool| {
+                let v = s.vel;
+                let speed = v.length();
+                if speed < 1.0 {
+                    return;
+                }
+                let dir = v / speed;
+                let len = (speed * 0.035).clamp(0.35, 2.6);
+                let (rad, glow) = match s.spec.delivery {
+                    ballistics::Delivery::Blast => (0.16, 0.85),
+                    ballistics::Delivery::Beam => (0.05, 1.0),
+                    _ => (0.06, 1.0),
+                };
+                let mut c = element_glow(s.element);
+                if hostile {
+                    c = [c[0] * 0.5 + 0.5, c[1] * 0.35 + 0.08, c[2] * 0.35 + 0.12, 0.95];
+                }
+                let rot = Quat::from_rotation_arc(Vec3::Y, dir);
+                let m = Mat4::from_translation(s.pos) * Mat4::from_quat(rot) * Mat4::from_scale(Vec3::new(rad, len, rad));
+                push(objs, world::M_SPHERE_LO, None, m, c, [0.0, glow, 0.0, 0.0]);
+            };
+            for s in &self.shots.live {
+                tracer(&mut objs, s, false);
+            }
+            for s in &self.hostile_shots.live {
+                tracer(&mut objs, s, true);
+            }
+        }
+
+        // ---- CABLES, drawn ----
+        // The field's lines were a burst and a toast. A cable is a thin
+        // box between two chests, the same primitive the rain streaks
+        // use; the tow line is warmer than a hostile's so you know whose
+        // it is when both are in the frame.
+        if let Some(s) = self.sortie.as_ref() {
+            let chest = rc.0 + Vec3::Y * (self.car.half_h * 0.8);
+            for line in s.field.cables(chest) {
+                let d = line.to - line.from;
+                let len = d.length();
+                if len < 0.2 {
+                    continue;
+                }
+                let dir = d / len;
+                let rot = Quat::from_rotation_arc(Vec3::Y, dir);
+                let mid = line.from + d * 0.5;
+                let m = Mat4::from_translation(mid) * Mat4::from_quat(rot) * Mat4::from_scale(Vec3::new(0.045, len * 0.5, 0.045));
+                let c = if line.tow { [0.95, 0.82, 0.45, 1.0] } else { [0.55, 0.6, 0.7, 1.0] };
+                push(&mut objs, world::M_BOX, None, m, c, [0.0, if line.tow { 0.6 } else { 0.25 }, 0.4, 0.0]);
+            }
+        }
+
         // boost pads
         for p in &self.world.pads {
             let ready = p.timer <= 0.0;
@@ -8590,15 +8785,46 @@ impl Game {
                 1.0,
                 Some(b.tint),
                 d2 < 60.0 * 60.0, [0.0; 4],);
+            // a field hostile driving in vehicle form burns its own
+            // nozzles, the same way you do — read off ITS model
+            if b.brain.hostile_slot().is_some() && !b.car.robot && b.car.vel.length() > 2.0 {
+                let thr = &self.cars.models[b.model.min(self.cars.models.len() - 1)].hardpoints.thrusters;
+                let flick = 0.09 + ((self.time * 29.0 + bi as f32).sin() * 0.5 + 0.5) * 0.05;
+                for t in thr.iter() {
+                    let at = b.car.pos + b.car.rot * t.pos;
+                    let aim = (b.car.rot * t.aim).normalize_or(Vec3::Z);
+                    let rot = Quat::from_rotation_arc(Vec3::Y, aim);
+                    let fm = Mat4::from_translation(at + aim * flick) * Mat4::from_quat(rot) * Mat4::from_scale(Vec3::new(flick * 0.8, flick * 1.8, flick * 0.8));
+                    push(&mut objs, world::M_SPHERE, None, fm, [1.0, 0.5, 0.15, 0.85], [0.0, 1.0, 0.0, 0.0]);
+                }
+            }
         }
 
-        // local boost flame
+        // local boost flame — FROM THE THRUSTERS the hull actually has
+        // (`hardpoints::find`), one flame per nozzle at its exit, along its
+        // own aim; the tail-centre blob only when the hull has none.
         let boosting = self.car.boost > 0.0 && self.action_down(Action::Boost);
         if boosting && self.mode == Mode::Play {
-            let tail = rc.0 - (rc.1 * Vec3::NEG_Z) * (self.car.half_len + 0.12);
             let flick = 0.11 + ((self.time * 31.0).sin() * 0.5 + 0.5) * 0.07;
-            let fm = Mat4::from_translation(tail) * Mat4::from_scale(Vec3::splat(flick));
-            push(&mut objs, world::M_SPHERE, None, fm, [1.0, 0.55, 0.08, 0.9], [0.0, 1.0, 0.0, 0.0]);
+            let size = self.cfg.car.size;
+            let thr = &self.cars.models[local_model.min(self.cars.models.len() - 1)].hardpoints.thrusters;
+            // the nozzles were read off the VEHICLE pose; a robot's boost is
+            // the old tail blob until the robot pose's own fittings are read
+            if thr.is_empty() || self.car.robot {
+                let tail = rc.0 - (rc.1 * Vec3::NEG_Z) * (self.car.half_len + 0.12);
+                let fm = Mat4::from_translation(tail) * Mat4::from_scale(Vec3::splat(flick));
+                push(&mut objs, world::M_SPHERE, None, fm, [1.0, 0.55, 0.08, 0.9], [0.0, 1.0, 0.0, 0.0]);
+            } else {
+                for (k, t) in thr.iter().enumerate() {
+                    let at = rc.0 + rc.1 * (t.pos * size);
+                    let aim = (rc.1 * t.aim).normalize_or(Vec3::Z);
+                    // each nozzle on its own flicker so a pair does not pulse in step
+                    let f = flick * (0.85 + 0.15 * ((self.time * 27.0 + k as f32 * 1.7).sin() * 0.5 + 0.5));
+                    let rot = Quat::from_rotation_arc(Vec3::Y, aim);
+                    let fm = Mat4::from_translation(at + aim * (f * 1.2)) * Mat4::from_quat(rot) * Mat4::from_scale(Vec3::new(f * 0.8, f * 1.9, f * 0.8));
+                    push(&mut objs, world::M_SPHERE, None, fm, [1.0, 0.6, 0.12, 0.9], [0.0, 1.0, 0.0, 0.0]);
+                }
+            }
         }
 
         objs

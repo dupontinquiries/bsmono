@@ -518,6 +518,24 @@ impl Field {
         self.foes.clear();
     }
 
+    /// Every cable in the air right now, as segments for the renderer:
+    /// a hostile's line runs from its chest to the player's; the tow from
+    /// the player to the body on the end. `tow` says which is which.
+    pub fn cables(&self, player_chest: Vec3) -> Vec<CableLine> {
+        let mut out = Vec::new();
+        for f in &self.foes {
+            if f.cable.is_some() && f.alive() {
+                out.push(CableLine { from: f.pos() + Vec3::Y * CHEST_H, to: player_chest, tow: false });
+            }
+        }
+        if let Some((slot, _)) = &self.tow {
+            if let Some(f) = self.foes.iter().find(|x| x.slot == *slot) {
+                out.push(CableLine { from: player_chest, to: f.pos() + Vec3::Y * (CHEST_H * 0.4), tow: true });
+            }
+        }
+        out
+    }
+
     /// Is this slot on the end of the player's tow line.
     pub fn towed(&self, slot: usize) -> bool {
         self.tow.as_ref().map(|t| t.0 == slot).unwrap_or(false)
@@ -972,6 +990,15 @@ fn scatter(aim: Vec3, spread: f32, h: u64) -> Vec3 {
     let jx = hash_unit(h, 3) * 2.0 - 1.0;
     let jy = hash_unit(h, 4) * 2.0 - 1.0;
     (aim + (side * jx + upv * jy) * spread).normalize_or(aim)
+}
+
+/// A cable to draw, world space.
+#[derive(Clone, Copy, Debug)]
+pub struct CableLine {
+    pub from: Vec3,
+    pub to: Vec3,
+    /// the player's tow line (drawn warmer) rather than a hostile's
+    pub tow: bool,
 }
 
 /// The player, as the field sees them this tick.
