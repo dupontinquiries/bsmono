@@ -124,7 +124,7 @@ impl LogscopeApp {
                 "chat" => Tab::Chat, "sources" => Tab::Sources, "peek" => Tab::Peek,
                 "tokens" => Tab::Tokens, "blocks" => Tab::Blocks, "rotate" => Tab::Rotate,
                 "cargo" => Tab::Cargo, "code" => Tab::Code, "modify" => Tab::Modify,
-                "bloc" => Tab::Bloc, _ => self.tab,
+                "bloc" => Tab::Bloc, "models" => Tab::Models, _ => self.tab,
             };
             self.last_tab = self.tab;
         }

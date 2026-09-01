@@ -33,6 +33,7 @@
 #[allow(dead_code)] pub mod clusternode;
 #[allow(dead_code)] pub mod discovery;
 #[allow(dead_code)] pub mod lanwire;
+#[allow(dead_code)] pub mod lanpoll;
 #[allow(dead_code)] pub mod announce;
 #[allow(dead_code)] pub mod machineid;
 // The coordinator's own four, declared late — every one of them sat in src/
