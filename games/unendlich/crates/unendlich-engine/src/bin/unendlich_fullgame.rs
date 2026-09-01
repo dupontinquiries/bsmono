@@ -2833,6 +2833,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     if frame_pacer_enabled {
         log::info!("frame_pacer: ENABLED — driving shadow_chunk_stride from p90 frame time (UNENDLICH_FRAME_PACER=0 to disable)");
     }
+    // Known interaction, not fixed: `adaptive_rd` (above) and `frame_pacer`
+    // (below) both react to the same frame-time signal on the same 200ms
+    // cadence but don't know about each other. A sustained slow patch can
+    // trigger both in the same window — render distance shrinks AND shadow
+    // stride/lod fidelity degrade together, rather than one picking up the
+    // slack the other didn't need to take. Each recovers independently via
+    // its own hysteresis, so this should self-correct over a few frames
+    // rather than compound, but it's untested on real hardware and could
+    // read as a harsher-than-necessary quality dip on a single spike. If
+    // that's visible in practice, the fix is sequencing (e.g. only let
+    // frame_pacer degrade once adaptive_rd is already at its floor), not
+    // disabling either system.
 
     // `sim::submit_schedule` is the OTHER dead-but-tested module (see the
     // frame_pacer comment above for how that happened). Its real inputs
