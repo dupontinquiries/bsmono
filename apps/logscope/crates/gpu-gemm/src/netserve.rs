@@ -11,7 +11,7 @@
 //! encryption in-process (rustls) is the documented next step.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 

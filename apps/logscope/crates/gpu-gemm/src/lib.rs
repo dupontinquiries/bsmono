@@ -12705,7 +12705,7 @@ attn_k_b+attn_v_b), and attn_output closes the block", missing.join(", "))
         // rides the Gpu-level `rope_mscale` (multiplies the rotated output, both q and k: the ggml
         // formulation, so scores scale by mscale²). Stored per load like `rope_neox`.
         let mut rope_vals = rope_vals;
-        let mut mscale = 1.0f32;
+        let mscale: f32;
         // Trained context, for automatic window sizing. Absent stays 0 = unknown; plan_ctx treats
         // 0 as "no trained bound" rather than as a 0-token window.
         let trained_ctx = g.get_u32(&format!("{pfx}.context_length")).unwrap_or(0) as usize;
@@ -17570,7 +17570,8 @@ LOWER bound — KV and resident weights are not pooled and are covered by baseli
             //
             // 16 per layer against a measured 12.5–14.7 keeps the "generous" the old comment
             // claimed, and the floor keeps the previous value for models too small to reach it.
-            let per_tok = window_dispatches_per_token(m.n_layers);
+            // (`window_flush_plan` below recomputes this itself via
+            // `window_dispatches_per_token`; no need to compute it again here.)
             // On the conservative (Asahi/Honeykrisp) path, completion callbacks are unreliable — the submit
             // governor disables itself, leaving NO backpressure on queue depth. Batching a whole window into
             // ONE unflushed submit then hands the firmware one huge job the watchdog can kill (a decode hang

@@ -5717,7 +5717,7 @@ still pass, which is why this one exists."
             Ok(m) => {
                 ck("gemma4 without blk.1 attn_v loads", true);
                 let c = gpu.new_cache_for(&m, 8);
-                let mut fin = true; let mut lg = Vec::new();
+                let mut fin = true; let mut lg;
                 for (p, t) in [1u32, 5, 9, 2].iter().enumerate() { lg = gpu.decode_step(&m, &c, *t, p); fin &= lg.iter().all(|x| x.is_finite()); }
                 ck("4-token decode with V-from-K is finite", fin);
                 let c2 = gpu.new_cache_for(&m, 8);

@@ -69,7 +69,7 @@ grafted.");
     eprintln!("diffuse-chat: block {block}, {steps} step(s) ({:.1} token(s)/commit), tau {tau:?}, fill {fill}",
               block as f32 / steps.min(block).max(1) as f32);
 
-    let mut run = |text: &str| -> String {
+    let run = |text: &str| -> String {
         let ids = tok.encode(&frame(text, raw));
         // An empty tokenisation reaches the engine as a zero-length canvas and surfaces as
         // "Buffer with 'tensor' label binding size is zero" — a device error for what is really a

@@ -25,7 +25,7 @@
 //! Whether the search finds anything INTERESTING is the on-device
 //! experiment.
 
-use crate::{Gpu, KvCache, Model};
+use crate::{Gpu, Model};
 
 /// Log-softmax of one vocab row at index `tok`, computed CPU-side from raw
 /// logits. Public so tests recompute scores independently of `reverse_step`.
