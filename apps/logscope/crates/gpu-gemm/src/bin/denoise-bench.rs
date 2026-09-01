@@ -112,8 +112,8 @@ Pass it as the 5th argument (e.g. 151643 for a Qwen mechanism run)."
     let tok = tokenizer::Tokenizer::from_gguf(&g).ok();
     let model = gpu.load_gguf_parts(&parts, true).expect("load gguf");
     eprintln!(
-        "denoise: loaded '{arch}' ({} layers) | L={l} fill={fill} steps={steps} mask_id={mask_id} ({})",
-        model.n_layers,
+        "denoise: loaded '{arch}' ({} layers, {:.1} GB mapped) | L={l} fill={fill} steps={steps} mask_id={mask_id} ({})",
+        model.n_layers, mapped_gb,
         if mask_cli.is_some() { "CLI" } else { "from gguf metadata" }
     );
 
