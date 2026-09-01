@@ -1,0 +1,27 @@
+[package]
+name = "shellkit"
+version = "0.1.0"
+edition = "2021"
+description = """
+Shared game-shell modules extracted from skydribble/blackstar-rs: both
+games carried byte-identical copies of these 13 files (confirmed by
+content hash before extraction) with zero use-crate:: dependencies on
+anything else in either game — platform detection, touch/gyro/analog/
+gamepad input, net/stream transport helpers, and academy/trials/replay
+progression tracking. See maintenance/C13_TODO.md for the discovery.
+"""
+
+[dependencies]
+glam = "0.28"
+winit = "0.29"
+netcode = { path = "../netcode" }
+touchkit = { path = "../../../shared/touchkit" }
+gilrs = { version = "0.11", optional = true }
+libloading = { version = "0.8", optional = true }
+
+[features]
+# Forwarded from the caller's own `analog`/`gamepad` features (see the doc
+# comment on those in skydribble's/blackstar-rs's own Cargo.toml) — this
+# crate doesn't decide its own defaults, the game does.
+gamepad = ["dep:gilrs"]
+analog = ["dep:libloading"]

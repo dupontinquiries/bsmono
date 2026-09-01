@@ -1,36 +1,32 @@
 //! SKYDRIBBLE — a Rocket-League-inspired open-world air-dribble playground.
 //! Rust + wgpu 22 + winit 0.29 (the same stack as the reference repo's games).
 
-mod analog;
 mod bots;
 mod camera;
 mod config;
 mod font;
 mod fx;
-mod gamepad;
-mod gyro;
-mod custom;
 mod partcars;
-mod partdata;
-mod trials;
-mod replay;
-mod academy;
-mod stream;
 mod hud;
 mod input;
 mod meshgen;
 mod model;
-mod net;
 mod physics;
-mod platform;
 mod procars;
 mod render;
-mod style;
 mod save;
 mod sim;
 mod sound;
-mod touch;
 mod world;
+
+mod gyro;
+mod platform;
+
+// Shared with blackstar-rs — see games/shared/shellkit. These were byte-
+// identical copies in both games' own src/ before extraction; `use` at
+// crate root keeps every existing `crate::net::...`-style path working
+// unchanged everywhere else in this crate.
+use shellkit::{academy, analog, custom, gamepad, net, partdata, replay, stream, style, touch, trials};
 
 use std::collections::HashSet;
 use std::path::PathBuf;

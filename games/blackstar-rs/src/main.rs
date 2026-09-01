@@ -1,6 +1,12 @@
 //! SKYDRIBBLE — a Rocket-League-inspired open-world air-dribble playground.
 //! Rust + wgpu 22 + winit 0.29 (the same stack as the reference repo's games).
 
+// Shared with skydribble — see games/shared/shellkit. These were byte-
+// identical copies in both games' own src/ before extraction; `use` at
+// crate root keeps every existing `crate::net::...`-style path working
+// unchanged everywhere else in this crate.
+use shellkit::{academy, analog, custom, gamepad, net, partdata, replay, stream, style, touch, trials};
+
 mod align;
 mod anim;
 mod approach;
@@ -8,7 +14,6 @@ mod actuator;
 mod aboard;
 mod airlock;
 mod amalgam;
-mod analog;
 mod ballistics;
 mod bench;
 mod bigbody;
@@ -37,7 +42,6 @@ mod footing;
 mod foothold;
 mod fleet;
 mod fx;
-mod gamepad;
 mod gyro;
 mod content;
 mod crawler;
@@ -45,9 +49,7 @@ mod cybertronian;
 mod curriculum;
 mod corruption;
 mod cyber;
-mod custom;
 mod partcars;
-mod partdata;
 mod palevector;
 mod parity;
 mod patrol;
@@ -55,14 +57,10 @@ mod escalation;
 mod enemy;
 mod gates;
 mod perception;
-mod trials;
 mod trainwatch;
 mod tuner;
 mod tuning;
 mod valuestruct;
-mod replay;
-mod academy;
-mod stream;
 mod hazard;
 mod helmai;
 mod hive;
@@ -88,7 +86,6 @@ mod menu;
 mod meshgen;
 mod mixer;
 mod model;
-mod net;
 mod online_screen;
 mod optics;
 mod physics;
@@ -154,7 +151,6 @@ mod relay;
 mod render;
 mod rescale;
 mod rip;
-mod style;
 mod subsea;
 mod sun;
 mod survival;
@@ -167,7 +163,6 @@ mod sim;
 mod sound;
 mod space;
 mod terrain;
-mod touch;
 mod tradecraft;
 mod ui;
 mod weapons;

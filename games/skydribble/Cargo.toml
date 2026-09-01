@@ -10,10 +10,10 @@ default = ["audio", "analog"]
 # Build with --no-default-features for a silent binary with zero extra system deps.
 audio = ["dep:cpal"]
 # Controller support via gilrs (needs libudev-dev on Linux).
-gamepad = ["dep:gilrs"]
+gamepad = ["dep:gilrs", "shellkit/gamepad"]
 # Wooting analog keyboard input: loads the installed Wooting Analog SDK
 # runtime at launch (falls back to digital keys if it isn't there).
-analog = ["dep:libloading"]
+analog = ["dep:libloading", "shellkit/analog"]
 
 [dependencies]
 # Same proven combo as the reference repo's games (clawbound/soldier): wgpu 22 + winit 0.29.
@@ -30,6 +30,7 @@ env_logger = "0.11"
 # netcode (profiles/sessions/handoff) over the snapcore DHT store.
 netcode = { path = "../shared/netcode" }
 touchkit = { path = "../../shared/touchkit" }
+shellkit = { path = "../shared/shellkit" }
 cpal = { version = "0.15", optional = true }
 gilrs = { version = "0.11", optional = true }
 libloading = { version = "0.8", optional = true }
