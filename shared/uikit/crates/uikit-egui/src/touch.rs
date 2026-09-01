@@ -64,8 +64,10 @@ impl TouchSource {
         // the recognizer sees no contact and anything it emits on that
         // transition is dropped; the suppression lifts when the contact
         // ends, so the next touch starts clean.
+        // A container (a ScrollArea) is NOT a suppression here: pans are
+        // what this recognizer produces, and a list scrolling is a pan.
         if !touches.is_empty() && !self.suppressed
-            && crate::gesture_layer::pointer_belongs_to_a_widget(ctx)
+            && crate::gesture_layer::drag_owner(ctx, ctx.content_rect()) == crate::gesture_layer::Owner::Widget
         {
             self.suppressed = true;
         }

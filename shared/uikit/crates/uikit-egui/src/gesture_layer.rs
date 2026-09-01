@@ -89,6 +89,29 @@ impl GestureLayer {
         self.gesture.config_mut()
     }
 
+    /// Is the press a widget's rather than the page's? A container (a
+    /// ScrollArea) owns it only once the finger has moved decidedly ACROSS
+    /// the page axis — along it, the page keeps the drag and the container
+    /// applies nothing. Until the motion decides, the page proceeds; a few
+    /// pixels of progress on a drag that turns out vertical is the cost.
+    fn widget_owns(&self, ui: &Ui, surface: Rect) -> bool {
+        match drag_owner(ui.ctx(), surface) {
+            Owner::Page => false,
+            Owner::Widget => true,
+            Owner::Container => {
+                let motion = ui.input(|i| {
+                    match (i.pointer.press_origin(), i.pointer.latest_pos()) {
+                        (Some(a), Some(b)) => b - a,
+                        _ => Vec2::ZERO,
+                    }
+                });
+                let along = self.axis_of(motion).abs();
+                let across = match self.axis { Axis::Horizontal => motion.y, Axis::Vertical => motion.x }.abs();
+                across > 8.0 && across > along
+            }
+        }
+    }
+
     fn axis_of(&self, v: Vec2) -> f32 {
         match self.axis {
             Axis::Horizontal => v.x,
@@ -142,8 +165,8 @@ impl GestureLayer {
                 self.dragging = true;
                 self.drag_total = 0.0;
                 self.gesture.reset_streak();
-                self.suppressed = pointer_belongs_to_a_widget(ui.ctx());
-            } else if !self.suppressed && pointer_belongs_to_a_widget(ui.ctx()) {
+                self.suppressed = self.widget_owns(ui, surface);
+            } else if !self.suppressed && self.widget_owns(ui, surface) {
                 // A widget claimed the pointer after the press — a text
                 // selection only becomes a drag once the finger has moved.
                 // Whatever this drag accumulated was the widget's motion.
@@ -204,6 +227,20 @@ impl GestureLayer {
     }
 }
 
+/// Who owns the current press.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Owner {
+    /// Nobody has claimed it: it is the page's.
+    Page,
+    /// A widget — a text selection, a slider — owns it outright.
+    Widget,
+    /// A widget as large as the surface owns it: a ScrollArea, which claims
+    /// a drag in ANY direction once its content overflows and then applies
+    /// only its own axis. The page yields to it across the page axis and
+    /// keeps the drag along it, or every long list would eat every swipe.
+    Container,
+}
+
 /// Does the current press belong to a widget rather than to the page?
 ///
 /// Two signals, both from egui's own bookkeeping rather than from any
@@ -219,17 +256,31 @@ impl GestureLayer {
 ///   before any movement, so the page never moves even for the first few
 ///   pixels of a selection drag.
 ///
-/// `egui_wants_pointer_input` is deliberately NOT used: it is true
-/// whenever the pointer merely hovers a widget, which is always.
+/// `surface` tells a container from a control: a dragged widget whose rect
+/// covers at least half the surface is a container. `egui_wants_pointer_input`
+/// is deliberately NOT used: it is true whenever the pointer merely hovers a
+/// widget, which is always.
+pub fn drag_owner(ctx: &egui::Context, surface: Rect) -> Owner {
+    if let Some(origin) = ctx.input(|i| i.pointer.press_origin()) {
+        let in_focused = ctx.memory(|m| m.focused())
+            .and_then(|id| ctx.read_response(id))
+            .is_some_and(|r| r.rect.contains(origin));
+        if in_focused { return Owner::Widget; }
+    }
+    match ctx.dragged_id() {
+        None => Owner::Page,
+        Some(id) => {
+            let big = ctx.read_response(id)
+                .is_some_and(|r| r.rect.area() >= 0.5 * surface.area());
+            if big { Owner::Container } else { Owner::Widget }
+        }
+    }
+}
+
+/// Kept for callers that want a yes/no: containers count as widgets here.
 pub fn pointer_belongs_to_a_widget(ctx: &egui::Context) -> bool {
-    if ctx.dragged_id().is_some() {
-        return true;
-    }
-    let Some(origin) = ctx.input(|i| i.pointer.press_origin()) else { return false };
-    match ctx.memory(|m| m.focused()) {
-        Some(id) => ctx.read_response(id).is_some_and(|r| r.rect.contains(origin)),
-        None => false,
-    }
+    drag_owner(ctx, Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(f32::MAX, f32::MAX))) == Owner::Widget
+        || ctx.dragged_id().is_some()
 }
 
 fn apply_outcome(o: Outcome, frame: &mut GestureFrame) {
@@ -362,6 +413,36 @@ mod tests {
                           });
         assert!(frames.last().unwrap().page_jump.is_none(), "the slider's drag became a page jump");
         assert!(value < 0.5, "the slider itself did not receive the drag: {value}");
+    }
+
+    /// The regression the first fix would have shipped: a ScrollArea claims
+    /// a drag in ANY direction once its content overflows, so every long
+    /// list would have eaten every horizontal swipe. A container yields to
+    /// the page along the page axis.
+    #[test]
+    fn a_horizontal_swipe_over_an_overflowing_list_still_swipes() {
+        let surface = Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let ctx = Context::default();
+        let mut g = GestureLayer::horizontal_page(320.0);
+        let frames = drag(&ctx, &mut g, surface, Pos2::new(300.0, 400.0), Pos2::new(60.0, 400.0),
+                          |ui: &mut Ui| {
+                              egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                                  for i in 0..200 { ui.label(format!("row {i}")); }
+                              });
+                          });
+        assert!(frames.last().unwrap().page_jump.is_some(),
+                "a horizontal swipe over a long list did not swipe: the list took it");
+        // And a vertical drag over the same list is the list's, not the page's.
+        let ctx = Context::default();
+        let mut g = GestureLayer::horizontal_page(320.0);
+        let frames = drag(&ctx, &mut g, surface, Pos2::new(200.0, 700.0), Pos2::new(210.0, 200.0),
+                          |ui: &mut Ui| {
+                              egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                                  for i in 0..200 { ui.label(format!("row {i}")); }
+                              });
+                          });
+        assert!(frames.iter().all(|f| f.page_jump.is_none() && f.detent.is_none()),
+                "a vertical scroll of a list moved the page");
     }
 
     /// The bug: nothing detected a config change, so a value change mid-drag
