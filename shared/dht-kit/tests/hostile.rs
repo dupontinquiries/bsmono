@@ -42,15 +42,16 @@ fn valid_messages_with_one_byte_corrupted_never_panic() {
     // The dangerous shape: a packet that gets far enough into the parser to
     // reach the interesting code before going wrong. Pure noise rarely does.
     let msgs = vec![
-        Msg::Query { tid: 7, from: InfoHash::from_seed(1), query: Query::Get,
-                     target: InfoHash::from_seed(2), token: 5,
-                     value: Some(Value { id: 9, data: vec![1, 2, 3, 4] }) },
-        Msg::Reply { tid: 8, from: InfoHash::from_seed(3),
-                     nodes: vec![(InfoHash::from_seed(4), Addr::new([10, 0, 0, 1], 4222))],
-                     values: vec![Value { id: 1, data: vec![0xAB; 300] }], token: 1 },
-        Msg::Push { tid: 9, from: InfoHash::from_seed(5), target: InfoHash::from_seed(6),
-                    values: vec![Value { id: 2, data: vec![7; 70_000] }] },
-        Msg::Error { tid: 10, code: 401 },
+        Msg::Query { tid: 7, from: InfoHash::from_seed(1), query: Query::Put,
+                     target: InfoHash::from_seed(2), token: vec![5; 20],
+                     values: vec![Value::new(9, vec![1, 2, 3, 4])],
+                     want: 0, sid: None, vid: None, client: true },
+        Msg::Reply { tid: 8, from: InfoHash::from_seed(3), sa: Some(Ip::V4([1, 2, 3, 4])),
+                     nodes: vec![(InfoHash::from_seed(4), Addr::new([10, 0, 0, 1], 4222)),
+                                 (InfoHash::from_seed(5), Addr::v6([3; 16], 1))],
+                     values: vec![Value::new(1, vec![0xAB; 300])], token: vec![1], vid: None },
+        Msg::Parts { tid: 9, fragments: vec![(0, 0, vec![7; 70_000])] },
+        Msg::Error { tid: 10, code: 401, from: Some(InfoHash::from_seed(6)) },
     ];
     for m in &msgs {
         let good = m.encode();
@@ -69,7 +70,8 @@ fn every_truncation_of_a_valid_message_never_panics() {
     let m = Msg::Reply { tid: 8, from: InfoHash::from_seed(3),
                          nodes: vec![(InfoHash::from_seed(4), Addr::new([10, 0, 0, 1], 4222));
                                      8],
-                         values: vec![Value { id: 1, data: vec![0xAB; 500] }], token: 1 };
+                         values: vec![Value::new(1, vec![0xAB; 500])], token: vec![1],
+                         sa: None, vid: None };
     let good = m.encode();
     for cut in 0..good.len() {
         assert!(Msg::decode(&good[..cut]).is_none(), "a {cut}-byte prefix decoded");
@@ -162,9 +164,8 @@ fn a_value_id_at_the_u64_boundary_round_trips() {
     // two distinct values collide under one key, which is data loss rather
     // than a parse error.
     for id in [0u64, 1, u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX] {
-        let m = Msg::Push { tid: 1, from: InfoHash::from_seed(1),
-                            target: InfoHash::from_seed(2),
-                            values: vec![Value { id, data: vec![1] }] };
+        let m = Msg::Reply { tid: 1, from: InfoHash::from_seed(1), sa: None, nodes: vec![],
+                             token: vec![], vid: None, values: vec![Value::new(id, vec![1])] };
         assert_eq!(Msg::decode(&m.encode()), Some(m), "id {id}");
     }
 }
