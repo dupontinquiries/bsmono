@@ -385,13 +385,54 @@ mod gpu {
     }
 
     impl GpuBackend {
+        /// THE ENGINE WAS ALREADY SHARED; THE LOAD PATH WAS NOT.
+        ///
+        /// This crate links logscope's `gpu-gemm` by path, so every kernel-side
+        /// speedup — autotuned decode/GEMM tiles, the arena packer, the
+        /// fast-decode fusions, the bind-group cache, prompt-lookup
+        /// speculative decode — is already compiled in and driven by the same
+        /// env levers. Those needed nothing.
+        ///
+        /// The LOAD path is chosen by the caller, and this one chose the
+        /// slowest door available. Three things were being left on the floor:
+        ///
+        /// * `fs::read` pulls the whole checkpoint into ANONYMOUS memory. A
+        ///   4.7 GiB model is 4.7 GiB of unreclaimable RSS; logscope maps it
+        ///   and reports "4.6 GiB file-backed (reclaimable by the kernel under
+        ///   pressure)". `mmap_ro` lives in the shared crate, so this is a
+        ///   call, not a port.
+        /// * `load_gguf` is `load_gguf_opt(bytes, false)` — the UNQUANTIZED
+        ///   path. Weights stay wide, so decode reads roughly 4x the bytes per
+        ///   token that an int8-resident load would, on an engine whose own
+        ///   diagnostics say decode is dispatch- and sync-bound rather than
+        ///   compute-bound.
+        /// * `load_gguf_quantized_parts_static` carries the int8 -> q4 OOM
+        ///   retry for exactly the Asahi "ample RAM, cannot map it all"
+        ///   failure. Without it a model that would have fitted at q4 fails
+        ///   outright instead of shrinking.
+        ///
+        /// `_static` rather than the plain parts variant because the mapping
+        /// must outlive the loader: it is what lets tensors be VIEWED in the
+        /// file instead of copied, which is logscope's "90.3% of weights
+        /// sliced from the file directly". The leak is bounded and deliberate
+        /// — one mapping per loaded model, alive as long as the model is.
         pub fn load(cfg: EngineConfig) -> Result<Self, String> {
-            let bytes = std::fs::read(&cfg.model_path)
-                .map_err(|e| format!("read {}: {e}", cfg.model_path))?;
-            let g = gguf::parse(&bytes).map_err(|e| format!("parse gguf: {e}"))?;
+            let mm = gpu_kernels::mmap_ro(&cfg.model_path)
+                .map_err(|e| format!("mmap {}: {e}", cfg.model_path))?;
+            // Leak the MAPPING, then borrow the bytes from it. `Box::leak`
+            // yields `&'static mut Mmap`; the slice has to come from a deref
+            // of that, not from the leak directly. The type is left to
+            // inference so this crate never has to name `memmap2`, which is
+            // gpu-gemm's dependency and not one of ours.
+            let mm: &'static _ = Box::leak(Box::new(mm));
+            let bytes: &'static [u8] = &mm[..];
+            let g = gguf::parse(bytes).map_err(|e| format!("parse gguf: {e}"))?;
             let tok = Arc::new(Tokenizer::from_gguf(&g).map_err(|e| format!("tokenizer: {e}"))?);
             let gpu = Arc::new(Gpu::new());
-            let model = Arc::new(gpu.load_gguf(&bytes).map_err(|e| format!("load model: {e}"))?);
+            let model = Arc::new(
+                gpu.load_gguf_quantized_parts_static(&[bytes])
+                    .map_err(|e| format!("load model: {e}"))?,
+            );
             gpu.warm(&model);
             // Same eos resolution as logscope-serve: the GGUF's own id,
             // falling back to the llama3 end-of-turn token.
