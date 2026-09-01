@@ -545,3 +545,64 @@ which touches every `draw_*_screen` call in the match) rather than a bug,
 and out of scope for a warnings-driven pass. Left as-is; not silenced
 with `#[allow(deprecated)]` either, since that would hide the next
 person's reason to do the real migration.
+
+## 12. Correction to §10: the show/show_inside deprecation is not a rendering bug
+
+§10 (this file) characterized snapshot-cam's `.show(ui.ctx(), ...)` as
+"building a second, independently laid-out CentralPanel" — that's
+overstated. Reading egui 0.34's panel.rs closely: the root `Ui` eframe
+hands `App::ui()` and a top-level `Panel::show(ctx, ...)` call both
+target `LayerId::background()` and cooperate through Context-level rect
+bookkeeping (the same mechanism panels have always used to divide up
+screen space across multiple `.show(ctx, ...)` calls in one frame). The
+root Ui doesn't draw anything of its own in either app, so there's no
+actual conflict — this renders correctly, not corrupted.
+
+The real, narrower reason to prefer `show_inside(ui, ...)` from inside
+`ui()`: the root Ui's own `available_rect_before_wrap()`/`min_rect()` get
+recorded into pass state at the end of `run_ui_dyn` for the NEXT pass,
+and if the app never advances the root Ui's own cursor (because
+everything is drawn via ctx-based top-level panels instead), those
+values describe an empty Ui rather than the actual on-screen content.
+Plausible knock-on effects: window auto-sizing, or anything else reading
+that bookkeeping — unconfirmed, not chased further.
+
+Net: the snapshot-cam fix (`a71eca64`) is still correct and worth
+keeping — it matches eframe's own documented pattern and cannot make
+things worse. But it should have been described as a forward-looking
+correctness/API-migration fix, not "fixes a rendering bug", and that
+overclaim is why studio-app's six identical-looking `.show(ctx, ...)`
+call sites were deliberately NOT migrated the same way this session
+(`efbc3783`) — that file's `ctx` extraction is a documented, deliberate
+choice threaded through much more code than six panel calls, and the
+risk of a wider unreviewed refactor outweighs a correctness benefit that
+turned out to be smaller than first claimed.
+
+## 13. studio-fx: Halftime has a documented fade mechanism it never calls
+
+`cargo-ailite check` on apps/studio flags `Halftime::STOPPED`,
+`Halftime::FADE_FROM` and `Halftime::stop_gain` as dead code in
+`crates/studio-fx/src/playrate.rs`. Confirmed by grep, not just the
+lint: `Halftime::process()` never calls `stop_gain`, and no test
+exercises stop/fade behavior for `Halftime` (only for its sibling
+`TapeStop`, which does ramp a `rate` down to 0 and IS tested ending in
+silence).
+
+The doc comment on `STOPPED`/`FADE_FROM` is unambiguous about intent —
+"the rate at which the level begins fading toward it" — but `Halftime`'s
+`process()` doesn't have a continuous decelerating rate the way
+`TapeStop` does; it does a fixed jump-back-and-read-at-half-speed every
+window, with no notion of "rate_now" to feed `stop_gain`. Two readings:
+(a) this is copy-paste scaffolding from `TapeStop` while `Halftime` was
+being written, abandoned because the mechanics don't map, and should be
+deleted; or (b) `Halftime` is meant to eventually decelerate to a full
+stop (matching "the trap halftime" sound design more closely — a beat
+repeat that runs down rather than repeating forever) and the wiring was
+simply never finished.
+
+**Not fixed.** This is real-time audio DSP with no way to verify "does
+it still sound right" in this sandbox beyond the existing crossing-count/
+RMS-style tests, and picking (a) or (b) wrong either deletes a documented
+intentional feature or half-wires audio behavior nobody asked for and
+nothing tests. Reading whatever pre-port reference (if any) inspired the
+"trap halftime" comment, or asking whoever wrote it, would settle which.
