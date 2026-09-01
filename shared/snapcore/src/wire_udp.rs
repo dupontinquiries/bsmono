@@ -65,7 +65,7 @@
 use crate::node::{FindValue, Transport};
 use crate::routing::{Contact, NodeId};
 use crate::store::Key;
-use crate::wire::{from_wire_addr, to_hash, to_wire_addr};
+use crate::wire::{from_wire_addr, to_hash};
 use dht_kit::{Msg, Query, Value};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU32, Ordering};

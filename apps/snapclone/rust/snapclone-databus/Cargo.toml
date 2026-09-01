@@ -15,6 +15,7 @@ crate-type = ["rlib"]
 [[bin]]
 name = "snapclone-bus"
 path = "src/main.rs"
+required-features = ["bin"]
 
 [dependencies]
 anyhow     = "1"

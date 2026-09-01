@@ -4,7 +4,6 @@ use crate::result::CheckResult;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::{net::{TcpListener, UdpSocket}, time::timeout};
-use tracing::debug;
 
 /// Check 1: UDP multicast loopback — can we send to 224.0.0.251 and recv it?
 pub async fn check_udp_multicast(gossip_port: u16) -> CheckResult {
