@@ -2989,7 +2989,7 @@ fn merge_versions(a: &str, b: &str, rng: &mut impl Rng) -> String {
     let anchors = lcs_lines(&al, &bl);
     let mut out: Vec<String> = Vec::new();
     let (mut pi, mut pj) = (0usize, 0usize);
-    let mut emit_hunk = |out: &mut Vec<String>, sa: &[&str], sb: &[&str], rng: &mut dyn FnMut() -> bool| {
+    let emit_hunk = |out: &mut Vec<String>, sa: &[&str], sb: &[&str], rng: &mut dyn FnMut() -> bool| {
         if sa.is_empty() && sb.is_empty() { return; }
         if rng() { out.extend(sa.iter().map(|s| s.to_string())); }
         else { out.extend(sb.iter().map(|s| s.to_string())); }
