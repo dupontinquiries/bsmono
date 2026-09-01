@@ -39,25 +39,56 @@
 //! coefficients with no extra scaling needed.
 
 use std::f32::consts::PI;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-static mut DCT: [[f32; 8]; 8] = [[0.0; 8]; 8];
-static INIT: AtomicBool = AtomicBool::new(false);
+/// The precomputed DCT basis.
+///
+/// **Was a `static mut` behind a check-then-set `AtomicBool`, and that is a
+/// data race, not a style problem.** The old shape was:
+///
+/// ```ignore
+/// if INIT.load(Relaxed) { return; }
+/// unsafe { /* fill DCT, 64 separate writes */ }
+/// INIT.store(true, Relaxed);
+/// ```
+///
+/// Two independent failures live in that. Two threads calling `init()` at once
+/// both see `false` and both write the table while the other reads it. And even
+/// with one writer, `Relaxed` gives no happens-before: a second thread can
+/// observe `INIT == true` while some of the 64 cosine writes are still not
+/// visible to it, so it computes against a half-zero basis.
+///
+/// That is the reported fleet failure exactly — `dct_roundtrip` "in=-3,
+/// back=-1.176", `dct_simd_matches_scalar`, and `dct_dc_is_mean` all failing
+/// together, which is the signature of a shared table rather than three
+/// separate arithmetic bugs. It looked architecture-specific because the tests
+/// run in parallel and the timing differs per machine; it is not.
+///
+/// `OnceLock` gives exactly-once initialisation with the release/acquire pair
+/// that was missing, and removes the `static mut` (a hard error in edition
+/// 2024) at the same time.
+static DCT: std::sync::OnceLock<[[f32; 8]; 8]> = std::sync::OnceLock::new();
 
-/// Initialize the precomputed DCT basis. Idempotent (cheap to call repeatedly).
-pub fn init() {
-    if INIT.load(Ordering::Relaxed) { return; }
-    unsafe {
+fn basis() -> &'static [[f32; 8]; 8] {
+    DCT.get_or_init(|| {
+        let mut m = [[0.0f32; 8]; 8];
         for k in 0..8 {
             for i in 0..8 {
-                DCT[k][i] = ((2 * i + 1) as f32 * k as f32 * PI / 16.0).cos();
+                m[k][i] = ((2 * i + 1) as f32 * k as f32 * PI / 16.0).cos();
             }
             let s = if k == 0 { 1.0 / (8.0f32).sqrt() } else { (2.0 / 8.0f32).sqrt() };
-            for i in 0..8 { DCT[k][i] *= s; }
+            for i in 0..8 { m[k][i] *= s; }
         }
-    }
-    INIT.store(true, Ordering::Relaxed);
+        m
+    })
 }
+
+/// Initialize the precomputed DCT basis.
+///
+/// Kept so existing callers (and every test) still compile, but it is now only
+/// a warm-up: the basis initialises itself on first use whether or not anyone
+/// calls this. A missing `init()` used to mean silently transforming against a
+/// table of zeros; now it cannot.
+pub fn init() { let _ = basis(); }
 
 #[cfg(target_arch = "aarch64")]
 #[path = "dct_neon.rs"]
@@ -71,7 +102,7 @@ mod dct_sse;
 #[inline(always)]
 pub fn dct_fwd(b: &[f32; 64], o: &mut [f32; 64]) {
     unsafe {
-        let m = &*(&raw const DCT);
+        let m = basis();
         #[cfg(target_arch = "aarch64")]
         {
             // SAFETY: NEON is mandatory in aarch64; always available.
@@ -117,7 +148,7 @@ unsafe fn dct_fwd_scalar(b: &[f32; 64], o: &mut [f32; 64], m: &[[f32; 8]; 8]) {
 #[inline(always)]
 pub fn dct_inv(c: &[f32; 64], o: &mut [f32; 64]) {
     unsafe {
-        let m = &*(&raw const DCT);
+        let m = basis();
         #[cfg(target_arch = "aarch64")]
         {
             dct_neon::dct_inv(c, o, m);
@@ -161,6 +192,59 @@ unsafe fn dct_inv_scalar(c: &[f32; 64], o: &mut [f32; 64], m: &[[f32; 8]; 8]) {
 mod tests {
     use super::*;
     
+    /// The basis must be correct no matter how many threads race to first use.
+    ///
+    /// This is the failure the fleet hit: three DCT tests failing together, which
+    /// is the signature of one shared table rather than three arithmetic bugs.
+    /// Under the old `static mut` + Relaxed `AtomicBool`, a thread could observe
+    /// INIT==true while some of the 64 cosine writes were still invisible to it
+    /// and transform against a half-zero basis.
+    ///
+    /// It fails only sometimes by nature, so it hammers: many threads, each
+    /// doing a full round-trip immediately, with no `init()` call first — which
+    /// also pins that a missing init can no longer mean "transform against
+    /// zeros".
+    #[test]
+    fn the_basis_is_correct_under_a_thundering_herd_with_no_init_call() {
+        let bad = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut hs = Vec::new();
+        for _ in 0..16 {
+            let bad = std::sync::Arc::clone(&bad);
+            hs.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let input: [f32; 64] = std::array::from_fn(|i| (i as f32) * 0.1 - 3.0);
+                    let mut coef = [0.0f32; 64];
+                    let mut back = [0.0f32; 64];
+                    dct_fwd(&input, &mut coef);
+                    dct_inv(&coef, &mut back);
+                    for i in 0..64 {
+                        if (input[i] - back[i]).abs() >= 1e-3 {
+                            bad.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            }));
+        }
+        for h in hs { h.join().unwrap(); }
+        assert_eq!(bad.load(std::sync::atomic::Ordering::Relaxed), 0,
+            "round-trip broke under concurrent first-use — the basis is not \
+initialised exactly once with a happens-before edge");
+    }
+
+    /// A zero basis is what the race produced, so assert the table is not that.
+    /// Cheap, and it distinguishes "wrong numbers" from "no numbers", which the
+    /// original failure message could not.
+    #[test]
+    fn the_basis_is_populated_not_zeros() {
+        let m = super::basis();
+        assert!(m.iter().flatten().any(|v| *v != 0.0), "basis is all zeros");
+        // DC row is the constant 1/sqrt(8); a partially-filled table would not be.
+        let dc = 1.0f32 / (8.0f32).sqrt();
+        for i in 0..8 {
+            assert!((m[0][i] - dc).abs() < 1e-6, "DC row wrong at {i}: {}", m[0][i]);
+        }
+    }
+
     #[test]
     fn dct_roundtrip() {
         init();
@@ -205,7 +289,7 @@ mod tests {
         let mut scalar_out = [0.0f32; 64];
         dct_fwd(&input, &mut simd_out);
         unsafe {
-            let m = &*(&raw const DCT);
+            let m = basis();
             dct_fwd_scalar(&input, &mut scalar_out, m);
         }
         for i in 0..64 {
@@ -218,7 +302,7 @@ mod tests {
         let mut back_scalar = [0.0f32; 64];
         dct_inv(&simd_out, &mut back_simd);
         unsafe {
-            let m = &*(&raw const DCT);
+            let m = basis();
             dct_inv_scalar(&scalar_out, &mut back_scalar, m);
         }
         for i in 0..64 {
