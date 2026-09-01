@@ -385,7 +385,7 @@ impl GameMap {
         limit: usize,
     ) -> Vec<(i32, i32, u8)> {
         let n2 = (self.w * self.h) as usize * 2;
-        let nid = |x: i32, y: i32, s: u8| (self.idx(x, y) * 2 + s as usize);
+        let nid = |x: i32, y: i32, s: u8| self.idx(x, y) * 2 + s as usize;
         let goal = to;
         let mut best = vec![i32::MAX; n2];
         let mut came: Vec<i32> = vec![-1; n2];
