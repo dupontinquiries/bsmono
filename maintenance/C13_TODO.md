@@ -460,3 +460,88 @@ hand-placed screens still share the bug class:
   The failing tests were right; the metric was wrong. It is log₂ ratio
   now. Same shape as CLAUDE.md §5b's corollary, one level up: not a bad
   assertion, a bad quantity.
+
+## 9. rustcheck false positives, and the real bugs they were hiding a real one behind
+
+A `./verify.sh` sweep flagged four projects as PROBLEMS. Three were the
+checker, not the code — all in `resolve_mod_files()`:
+
+- Attribute lookback checked only `lines[n-2]` for `#[path]`/`#[cfg]`.
+  Every real `#[path]`-redirected mod in this tree also carries a second
+  attribute (usually `#[allow(...)]`) directly above the `mod` line, so
+  the lookback landed on that and missed the `#[path]` above it. This
+  alone was voiceterm's 10 warnings and krapper's 2.
+- Nested inline `mod outer { mod inner; }` resolved `inner` against
+  `<file>/inner.rs` instead of `<file>/outer/inner.rs` — ambient-learner's
+  `egui_lib.rs: pub mod ui { pub mod egui; }`.
+- A file that is a crate root only via Cargo.toml `[lib] path = "..."`
+  (not named main.rs/lib.rs) was still resolved as a plain submodule dir
+  — same ambient-learner file, root-gated this way specifically because
+  `required-features` is silently ignored on `[lib]`.
+
+Fixed in `b3d0e09f`, tests in `339707d7`.
+
+**The fourth, rusty-board's `mod layouts;`, was real** (`42c83d28`):
+main.rs still declared a plain `mod layouts;` pointing at a file that
+stopped existing when the layout layer moved to `crates/board-layouts`;
+lib.rs was updated at the time (`pub use board_layouts as layouts;`) and
+main.rs, a separate crate root, was not. Fixed to match. Unverified by
+compilation — no GTK4 in this sandbox.
+
+## 10. snapshot-cam: `.show(ui.ctx(), ...)` was building a second CentralPanel
+
+Not a deprecation nit. eframe 0.34 made `App::ui(&mut self, ui: &mut
+egui::Ui, ...)` the required entry point — it already hands you a `Ui`
+for the frame's content area, and eframe's own doc example draws into it
+with `CentralPanel::default().show_inside(ui, ...)`. snapshot-cam instead
+pulled the `Context` back out of that `Ui` and called the deprecated
+top-level `.show(ui.ctx(), ...)`, which builds an independently
+laid-out second CentralPanel nested inside the one eframe already gives
+you. The comment already on this code correctly diagnosed why the OLD
+shape didn't compile under eframe 0.34, but the fix that landed used the
+wrong replacement method — `.show(ctx, ...)` still typechecks (deprecated,
+not removed), so nothing forced the second half of the migration.
+Fixed to `.show_inside(ui, ...)` (`a71eca64`). Layout correctness itself
+is unverified — no display in this sandbox.
+
+## 11. tomescope: two navigation mechanisms built, neither wired — not touched
+
+`cargo-ailite check` on apps/tomescope reports `textures`, `nav` and
+`prev_screen` on `TomeApp` as never read — confirmed by grep, not just
+the lint: none of `self.textures`, `self.nav`, `.nav.` appear anywhere
+outside their own construction. `nav: Nav` (`uikit_egui::Nav`, the shared
+page+subpage state machine with `go_page`/`push_subpage`/`back`/
+`title_bar`) is constructed with `Nav::new(4)` and never called again.
+`prev_screen` is set once at init to `Screen::Library` and never read or
+reassigned. Navigation in this app is instead entirely explicit
+`self.screen = Screen::X` assignments (a handful of "Go to Library" /
+"Go to Stats" commands plus a couple of hardcoded returns to Library on
+closing the reader) — there is no "go back to whatever was open before"
+concept anywhere for `prev_screen` to serve, and no drill-down UI for
+`Nav`'s subpage stack to track.
+
+**Not fixed.** This is the C12_TODO pattern of "component built
+carefully, tested [transitively, via TomeApp's own struct], and never
+called" (§Session summary, C12_TODO.md) rather than a bug with an
+obvious mechanical fix — deleting the fields is safe compile-wise but
+guesses that the intended feature (probably: a real back button, and/or
+drill-down into flashcard decks or library shelves via `Nav`) was
+abandoned rather than just unfinished, and TextureCache in particular
+(cover-art texture caching, from `library.rs`) sitting unused suggests
+cover thumbnails may simply not be wired into the library screen yet
+rather than the whole field being vestigial. Reading `draw_library_screen`
+and `library.rs`'s `TextureCache` API against whatever the pre-egui-port
+predecessor did with cover art would settle which of the two it is;
+that reading was not done this session.
+
+`egui::CentralPanel::default().show(ctx, ...)` also appears 9 times
+across `main.rs`'s `update()` — genuinely fine, not a repeat of §10's
+bug, because `update(&mut self, ctx: &egui::Context, ...)` only ever has
+a bare `Context`, never a `Ui`, so `show_inside` isn't available to it.
+eframe still calls both `App::update` (deprecated, default no-op) and
+`App::ui` (required) every frame in that order, so this compiles and
+runs; it is technical debt (migrate the `update()` body into `ui()`,
+which touches every `draw_*_screen` call in the match) rather than a bug,
+and out of scope for a warnings-driven pass. Left as-is; not silenced
+with `#[allow(deprecated)]` either, since that would hide the next
+person's reason to do the real migration.
