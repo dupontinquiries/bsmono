@@ -1747,3 +1747,40 @@ prompt, and the answer already exists as a float.
 Also: the scratch_code graph (§ this session) wants a view, and the
 Observatory GRAPH tab is the obvious home — nodes with `parent` edges is
 exactly the shape that panel already draws.
+
+
+## 54. Physical UI: what landed, and the honest gap
+
+Landed this session: three mansion palettes (Travertine / Obsidian /
+Lattice), `uikit_egui::lux` (sheen, bracket, Weight), sheen + gilt brackets
+wired into `theme::carved_frame`, and `anim_secs_for`.
+
+**The gap I cannot close from here.** Everything above is verified as maths
+and invariants — smoothstep has no corner, brackets scale off the short side,
+heavy settles slower than light, alpha stays in range. None of that is
+evidence it LOOKS expensive. Three specific things want eyes on a screen:
+
+1. **Sheen alpha (currently max 26/255).** Deliberately low — the effect
+   should be noticed as the surface looking right, not as a visible gradient.
+   If it is invisible on a real display, raise it; if it reads as a smear,
+   the band half-width (34% of panel width) is the other knob.
+2. **Bracket inset (5pt) and stroke (1.3pt).** On a Fairphone at 300% these
+   may need to grow with the touch scale rather than staying in points —
+   `lux::bracket` scales with the PANEL, not with the display density, and
+   those are different questions.
+3. **Whether Travertine is legible outdoors.** It is the only light palette
+   and the one most likely to fail on a phone in daylight, which is also the
+   case it is most likely to be chosen for.
+
+**Next, in the order I would do it:**
+
+- Wire `anim_secs_for` at the call sites that currently pass
+  `BASE_ANIM_SECS`. The helper exists and nothing uses it yet; that is a
+  mechanical sweep and it is where the weight model actually becomes
+  perceptible.
+- Apply `carved_frame` to the panels that still lack it. The earlier sweep
+  did part of the app; the reference is consistent across every surface and
+  we are not.
+- Surface `ctxplan` relevance on the context cards (§53 item 4) — the number
+  exists, the reference shows it, and it is the one that makes the system
+  legible rather than merely prettier.
