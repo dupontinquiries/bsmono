@@ -146,8 +146,6 @@ macro_rules! clog {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn selection_parsing_off() {
         // We can't easily set env per-test deterministically with
