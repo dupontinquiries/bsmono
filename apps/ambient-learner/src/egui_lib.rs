@@ -196,27 +196,6 @@ impl LiveState {
     // rather than snapping. What it no longer does is draw.
 }
 
-/// The recent trend. Drawn from the series directly so it cannot disagree with
-/// the numbers above it.
-fn sparkline(ui: &mut egui::Ui, series: &[f32], tint: egui::Color32) {
-    let (rect, _) = ui.allocate_exact_size(
-        egui::Vec2::new(ui.available_width() * 0.8, 56.0), egui::Sense::hover());
-    if series.len() < 2 { return; }
-    let lo = series.iter().cloned().fold(f32::MAX, f32::min);
-    let hi = series.iter().cloned().fold(f32::MIN, f32::max);
-    let pts: Vec<egui::Pos2> = series.iter().enumerate().map(|(i, v)| {
-        let x = rect.min.x + rect.width() * i as f32 / (series.len() - 1).max(1) as f32;
-        let y = rect.max.y - rect.height() * norm(*v, lo, hi);
-        egui::Pos2::new(x, y)
-    }).collect();
-    for w in pts.windows(2) {
-        ui.painter().line_segment([w[0], w[1]], egui::Stroke::new(2.0_f32, tint));
-    }
-    if let Some(last) = pts.last() {
-        ui.painter().circle_filled(*last, 3.5, tint);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
