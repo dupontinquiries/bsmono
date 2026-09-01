@@ -815,3 +815,44 @@ Reconciling those needs someone who can verify the visual/rendering
 result (per-vertex UVs, the inscription material, the wired `u_touch`
 response) actually still looks right in both consumers after merging —
 not a compile-time-only check like the two modules just migrated.
+
+## 17b. apps/snapclone/camera-bridge vs system/snapclone/camera-bridge: same drift, smaller scope
+
+A follow-up check on §17: `camera-bridge` is a small, standalone
+workspace (`[workspace]` with no members, deliberately kept out of the
+big rust/ workspace — its own Cargo.toml explains why: it drags in
+gstreamer/tract-onnx that a UI crate shouldn't link). At ~4,500 lines
+across 6-7 files, `diff -rq` shows it's almost entirely identical
+between `apps/` and `system/` — except `view.rs`, where `apps/` is
+meaningfully AHEAD, not just textually different:
+
+- **Desktop-webcam fallback**: `apps/`'s version tries an ordered list
+  of camera-source candidates (libcamera pipewire nodes, then v4l2
+  devices) via a new `source_plan`/`capture` module pair, falling
+  through to the next candidate on failure. `system/`'s version still
+  builds one hardcoded pipewire pipeline string and has no fallback —
+  exactly the failure mode the newer code's comments describe fixing
+  ("the pipewire candidate fails fast on a desktop and the v4l2 one
+  behind it takes over").
+- **Phone GPU crash fix**: `apps/`'s version clamps wgpu device limits
+  to what the adapter actually supports (`device_limits`), with three
+  unit tests pinned against the specific failure it fixes
+  (`LimitsExceeded... max_color_attachments: requested 8, allowed 5` on
+  a phone GPU — the same crash the comment says logscope also hit on
+  Asahi). `system/`'s version has none of this and would hit the same
+  crash on that hardware profile.
+
+So this isn't the same "which side happened to fix bugs first"
+situation as §17 — here `apps/snapclone/camera-bridge` is unambiguously
+the more-correct, more-complete version, and `system/snapclone/
+camera-bridge` is missing two real fixes for hardware failure modes
+(not fixed independently on both sides this time). Given the standalone
+workspace's small size, this one is a much more tractable candidate for
+a future session to actually reconcile (likely: copy `apps/`'s view.rs,
+source_plan.rs, and capture.rs additions into `system/`'s copy, or — if
+`system/snapclone` still exists as a maintained target — better to
+retire it in favor of a single canonical camera-bridge referenced by
+both, same shape as the shellkit/scene-kit/peek migrations done
+earlier this session). Not attempted here: still needs someone who can
+verify camera-bridge/pipewire behavior on real hardware (a phone GPU
+and a desktop webcam) rather than compile-check alone.
