@@ -1486,3 +1486,52 @@ Worth a small check in `maintenance/tools`: flag `static mut`, and flag
 mechanical to detect and neither has a legitimate use in this tree —
 `static mut` is a hard error in edition 2024 anyway, so the codebase will
 have to move regardless.
+
+
+## 45. §44 done — the lint exists, and 5 soft findings remain
+
+`maintenance/tools/shared_state_audit.py`. Catches all three of this
+session's races by shape; `--self-test` includes the qml_gen counter
+verbatim as it was before the fix, so the tool is checked against the bug
+it exists for rather than only against invented cases.
+
+Five findings left, all the same soft class: a mutex-protected global with
+a free-function reset.
+
+- `rusty-board/src/keyboard/character_draw.rs:536` — `clear_strokes()` over
+  a global `STROKE_BUFFER`.
+- `rusty-board/src/ui/keyboard_view.rs:295` — `reset_swipe_latch()`.
+- `rusty-board/src/ui/window.rs:180`, `:353`.
+- `voiceterm/src/event_signal.rs:112`.
+
+No data race (the mutex handles that), but the logical one is real and is
+exactly what bit board-layouts: one test's reset lands inside another
+test's sequence. Each wants a judgement call rather than a sweep — for a
+GUI singleton like the stroke buffer, process-wide is arguably correct and
+the tests should serialise; for anything a test drives directly,
+thread_local makes the invariant structural. Do not batch-convert these.
+
+## 46. Remaining fleet failures after this session
+
+Closed: ambient-learner (pairing crypto), voiceterm (qml_gen race),
+fao-codec (DCT race), bot-arena (pytest missing → now skips honestly).
+
+Still open, in the order I would take them:
+
+1. **beatspace / beatspace+features** — `gemm-common 0.19.0` emitting ARM
+   fp16 asm the target does not declare. Needs a device decision: add
+   `-C target-feature=+fp16` for aarch64 only if every target device really
+   has it (the Fairphone's SC7280 does; an older ARM board may not), or pin
+   gemm. Getting it wrong gives binaries that SIGILL rather than fail to
+   build, so this wants the operator, not a guess.
+2. **gitmind** — `--doc` fails with `can't find crate for uikit_egui`
+   pointing at ordinary code, not a doctest. Both are unconditional path
+   deps, so the manifest is fine and the crate must be failing to build
+   under whatever config rustdoc uses. Unconfirmed; the cheap next step is
+   `cargo test -p gitmind-egui --doc -v` on the fleet box, reading which
+   `--extern` flags rustdoc actually passes.
+3. **studio** — three `studio-video` failures at `lib.rs:415`. Suspect a
+   missing or differently-built ffmpeg on the runner; confirm before
+   chasing, since the fao-codec lesson this session was that "three tests
+   fail together" usually means one shared cause, not three bugs.
+4. **logscope / logscope+features** — carried; §19's VT work is the blocker.
