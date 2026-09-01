@@ -609,7 +609,7 @@ fn main() {
             let _ = writeln!(e, "perfbisect — bisect a cross-machine performance disparity\n");
             let _ = writeln!(e, "  perfbisect run [--engine games/unendlich] [--out host.tsv] [--seconds 12] [--only calib,probe,game] [--quick]");
             let _ = writeln!(e, "  perfbisect compare desktop.tsv phone.tsv\n");
-            let _ = writeln!(e, "build the engine's probes first: cd games/unendlich && cargo build --release --features render");
+            let _ = writeln!(e, "build the engine's probes first: cd games/unendlich && cargo build --release --features \"render window\"");
             let _ = writeln!(e, "  --bin unendlich-world --bin perf-probe --bin world-bench --bin mesh-bench --bin octree-bench");
             2
         }

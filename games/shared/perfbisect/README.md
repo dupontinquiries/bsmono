@@ -7,8 +7,9 @@ the game under a knob matrix, fingerprints each machine, and divides.
 ```sh
 # once, per machine: build the engine's probes and the game
 cd games/unendlich
-cargo build --release --features render --bin unendlich-world --bin perf-probe \
+cargo build --release --features "render window" --bin unendlich-world --bin perf-probe \
   --bin world-bench --bin mesh-bench --bin octree-bench
+# optional, same features: --bin gpu-mesh-bench
 
 # then, from the monorepo root, on each machine
 cargo run --release --manifest-path games/shared/perfbisect/Cargo.toml -- \
