@@ -415,6 +415,28 @@ enum State {
     Ground,
     Esc,
     Csi,
+    /// Inside `ESC ]` (Operating System Command) — consuming and discarding
+    /// bytes until the terminator. Sequences in this family (window/tab
+    /// title changes, and the "semantic prompt" markers modern shells and
+    /// frameworks emit — OSC 133 for prompt/command boundaries, OSC 633 for
+    /// VS Code's shell integration, OSC 7 for the working-directory URL,
+    /// OSC 2/0 for window titles) carry no information this grid renders,
+    /// but before this state existed they were actively harmful: with only
+    /// `Esc`/`Csi` recognised, `ESC ]` fell through `Esc`'s catch-all back to
+    /// `Ground` and every byte of the OSC payload — semicolons, digits,
+    /// key=value pairs — got typed onto the screen as if it were normal
+    /// output. A bare interactive shell that sets a window title (or any
+    /// shell with prompt-integration hooks) reliably produced exactly this:
+    /// stray characters like a lone `=` appearing right after the prompt,
+    /// with no correlation to anything the test actually ran.
+    Osc,
+    /// Inside `ESC ]`, having just seen an `ESC` — one more char decides
+    /// whether this is the String Terminator (`ESC \`, ending the OSC) or
+    /// just a stray ESC inside the payload (rare, but BEL is by far the
+    /// more common terminator in practice; treated as "back into the OSC
+    /// payload" rather than as the start of a new escape, since a shell
+    /// that meant to start a fresh escape wouldn't do it mid-OSC).
+    OscEsc,
 }
 
 /// A byte/char-stream VT parser that drives a [`Grid`]. Feed it decoded text (UTF-8); it
@@ -474,7 +496,23 @@ impl Parser {
                     self.cur = None;
                     self.state = State::Csi;
                 }
+                ']' => self.state = State::Osc,
                 _ => self.state = State::Ground, // ignore non-CSI escapes for v1
+            },
+            State::Osc => match ch {
+                '\x07' => self.state = State::Ground, // BEL terminator
+                '\x1b' => self.state = State::OscEsc,
+                _ => {} // discard the OSC payload
+            },
+            State::OscEsc => match ch {
+                '\\' => self.state = State::Ground, // ST (ESC \) terminator
+                // Not actually a terminator — back into the payload. The ESC
+                // itself is discarded same as any other OSC byte; if it was
+                // meant to start something new, that's indistinguishable
+                // from OSC-internal noise without a lookahead this parser
+                // doesn't do, and BEL-terminated OSC (the common case) never
+                // reaches this arm at all.
+                _ => self.state = State::Osc,
             },
             State::Csi => {
                 match ch {
