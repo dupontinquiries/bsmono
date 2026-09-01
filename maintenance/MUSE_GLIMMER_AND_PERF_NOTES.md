@@ -214,3 +214,45 @@ Cheap, pure, no GPU:
    backwards and it produces plausible-looking garbage.
 5. Memory-property recording: whatever we record for a slab equals what
    the allocation returned, not what was requested (§37's theme).
+
+
+---
+
+# Follow-up: what the UMA lesson turned out to mean here
+
+`32120c10e` (prefer host-visible buffers on UMA devices) reads like a
+direct hit on our arena, but checking the code first changed the answer,
+so recording it rather than leaving the suggestion standing:
+
+**The arena has already tried the mapped/unmapped axis and it is not the
+discriminator.** The comments at the slab allocator record three runs at
+different slab sizes, then the unmapped fallback, and conclude: "the
+device will not hold more than ~31 GiB of buffers at once, however they
+are created." So it is not a mapping-class problem, and llama.cpp's fix
+does not transfer as stated — wgpu does not expose Vulkan memory-type
+selection the way ggml-vulkan does, so there is no equivalent knob to
+turn.
+
+What DID transfer is the sibling commit, `558e221b7`, and it transferred
+completely: record what you observed where you were recording what you
+assumed. That is now done — see the `concurrent_ceiling_gib` commit. The
+clamp prefers a stored per-adapter measurement over the compiled-in 31.0
+and prints which one it used.
+
+**The trap found while doing it, worth remembering:** there were already
+two uncalled measurement stores, and they hold DIFFERENT quantities.
+`store::vram_{get,put}` holds the single-allocation ceiling (63 GiB
+measured here); the clamp needs the concurrent ceiling (~31 GiB on the
+same machine). Wiring the obvious one into the obvious place would have
+doubled the budget and reintroduced the mid-quantisation death the
+constant exists to prevent. Both are "the vram number" in casual speech
+and they differ by 2x. A test now pins the distinction.
+
+Open question for whoever has the device: **which quantity does
+`--gate-vram` actually measure?** It inflates with slabs and keeps them,
+which sounds concurrent, but the arena comments say the probe "allocates
+and does not keep its buffers mapped", and it reported 63 where the
+concurrent wall is 31. Until that is settled, `--gate-vram` deliberately
+does not write the concurrent store — an auto-wire on the wrong quantity
+is worse than the constant, because the constant is at least known to be
+conservative.
