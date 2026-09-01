@@ -1573,3 +1573,41 @@ Both are cases where the test suite was checking the wrong property. Worth
 doing for anything that SELECTS or RANKS: run it over a real repo and read
 the output, because "it returned something" and "it returned the right
 something" look identical to an assertion that only checks the former.
+
+
+## 49. studio fleet failures were an ffmpeg CAPABILITY gap, not a missing binary
+
+My §46 guess ("missing or differently-built ffmpeg; confirm before
+chasing") was half right and the half that was wrong is the instructive
+part. A `has_ffmpeg()` guard already existed — it checked that `ffmpeg
+-version` and `ffprobe -version` succeed. The fixture encodes with libx264
+and aac, which many distribution builds omit, so the binaries answered
+happily, the guard passed, and the fixture's `.expect()` panicked. The
+failures then looked like probe/thumbnail bugs.
+
+Two fixes, both this session: the guard now queries `-encoders` for what
+the fixture actually needs, and two tests that never called the guard at
+all now do (which is why the fleet saw a handful of failures rather than a
+whole-module skip).
+
+**Verified in both directions**, which is what turned a guess into a
+diagnosis: against the real ffmpeg here all 13 pass, and against a stub
+ffmpeg reporting only mpeg4/pcm they all skip cleanly — where before the
+fix that same stub produced exactly 2 hard failures.
+
+Same class then found and fixed in studio-media (2 tests, one needing
+libvorbis).
+
+**The generalisable lesson, worth applying elsewhere:** the dangerous
+dependency is not a missing binary — that is easy to check and usually
+already checked. It is an OPTIONAL COMPONENT of a binary that is present.
+`ffmpeg` exists but cannot encode h264; `python3` exists but has no pytest
+(§43, bot-arena, same session). Both produced fleet failures that looked
+like application bugs. A guard should check the capability the test uses,
+not the command it invokes.
+
+Swept apps/ for the shape: 50 unguarded external-binary tests, 46 of them
+`git` (a hard requirement of the repo, safe). Remaining singletons —
+`unzip`, `getconf`, `sh` — left alone deliberately: the first two are POSIX
+baseline and the `unzip` one is a cross-check arguably better failing
+loudly than skipping. Not every external dependency deserves a guard.
