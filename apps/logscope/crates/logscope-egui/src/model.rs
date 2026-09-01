@@ -161,7 +161,7 @@ pub fn folder_popup(ui: &mut egui::Ui, models_dir: &mut String, native: &mut boo
     egui::popup_below_widget(ui, pid, &btn, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
         ui.set_min_width(340.0);
         ui.label(RichText::new("models folder").color(theme::DIM()).small());
-        ui.add(egui::TextEdit::singleline(models_dir)
+        ui.add(egui::TextEdit::singleline(models_dir).id_salt("model-models_dir")
             .font(egui::TextStyle::Monospace).desired_width(320.0)
             .hint_text("dir to walk for .gguf (recurses, incl. HF cache)"));
         ui.horizontal(|ui| {

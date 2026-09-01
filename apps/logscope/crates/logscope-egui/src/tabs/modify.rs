@@ -44,7 +44,7 @@ impl Modify {
             });
             c[1].label(RichText::new("Target").color(theme::DIM()).small());
             egui::ScrollArea::vertical().id_salt("mod_target").show(&mut c[1], |ui| {
-                ui.add(egui::TextEdit::multiline(&mut self.target)
+                ui.add(egui::TextEdit::multiline(&mut self.target).id_salt("modify-self_target")
                     .font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(8));
             });
         });

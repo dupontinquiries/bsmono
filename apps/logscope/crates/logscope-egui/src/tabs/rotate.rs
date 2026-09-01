@@ -32,7 +32,7 @@ impl Rotate {
     }
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("Log path").color(theme::DIM()).small());
-        ui.add(egui::TextEdit::singleline(&mut self.path).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
+        ui.add(egui::TextEdit::singleline(&mut self.path).id_salt("rotate-self_path").font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label("Keep");
@@ -54,7 +54,7 @@ impl Rotate {
         ui.label(RichText::new("Config editor").color(theme::DIM()).small());
         let mut cfg = self.config_text();
         egui::ScrollArea::vertical().max_height(220.0).id_salt("rot_cfg").show(ui, |ui| {
-            ui.add(egui::TextEdit::multiline(&mut cfg).interactive(false)
+            ui.add(egui::TextEdit::multiline(&mut cfg).id_salt("rotate-cfg").interactive(false)
                 .font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
         });
 

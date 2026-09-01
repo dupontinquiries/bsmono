@@ -311,7 +311,7 @@ impl FilePicker {
                 // ── typed path ──
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Path").color(theme::DIM()).small());
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.path_edit)
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.path_edit).id_salt("filepicker-self_path_edit")
                         .font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         let p = PathBuf::from(self.path_edit.trim()); self.navigate(p);
@@ -320,7 +320,7 @@ impl FilePicker {
                 // ── search + filters ──
                 ui.horizontal(|ui| {
                     ui.label("🔍");
-                    ui.add(egui::TextEdit::singleline(&mut self.query)
+                    ui.add(egui::TextEdit::singleline(&mut self.query).id_salt("filepicker-self_query")
                         .hint_text("search in this folder…").desired_width(280.0));
                     if !self.query.is_empty() && ui.button("✕").on_hover_text("clear").clicked() { self.query.clear(); }
                     theme::switch_row(ui, "hidden", &mut self.show_hidden, theme::AMBER());

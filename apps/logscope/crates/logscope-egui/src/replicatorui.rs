@@ -303,7 +303,7 @@ fn column(ui: &mut egui::Ui, i: usize, c: &mut ColumnView<'_>, col_w: f32,
                 .clicked() {
                 act.aim = Some(if aimed { None } else { Some(c.id) });
             }
-            let resp = ui.add(egui::TextEdit::singleline(c.assignment)
+            let resp = ui.add(egui::TextEdit::singleline(c.assignment).id_salt(("replicant-assignment", c.id))
                 .id(egui::Id::new(("replicant_assignment", c.id)))
                 .hint_text("what this one works on")
                 .desired_width(inner - 8.0));

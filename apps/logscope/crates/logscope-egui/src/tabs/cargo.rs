@@ -124,7 +124,7 @@ impl Cargo {
         // ── header: root picker + actions ────────────────────────────────────────────────────────
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Cargo root").color(theme::INK()).strong());
-            let te = ui.add(egui::TextEdit::singleline(&mut self.root)
+            let te = ui.add(egui::TextEdit::singleline(&mut self.root).id_salt("cargo-self_root")
                 .desired_width(340.0).hint_text("/path/to/your/crate-or-workspace"));
             let entered = te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui.button("Set root").clicked() || entered { self.apply_root(); }

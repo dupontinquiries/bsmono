@@ -53,7 +53,7 @@ impl Sources {
         ui.separator();
 
         ui.label("Custom command");
-        ui.add(egui::TextEdit::singleline(&mut self.cmd)
+        ui.add(egui::TextEdit::singleline(&mut self.cmd).id_salt("sources-self_cmd")
             .font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
         ui.horizontal(|ui| {
             if ui.add_enabled(!self.running, egui::Button::new("▶ Run")).clicked() { self.running = true; }
@@ -65,7 +65,7 @@ impl Sources {
         ui.add_space(6.0);
         ui.label("Log input (paste, then load into the view)");
         egui::ScrollArea::vertical().max_height(160.0).id_salt("src_in").show(ui, |ui| {
-            ui.add(egui::TextEdit::multiline(&mut self.input)
+            ui.add(egui::TextEdit::multiline(&mut self.input).id_salt("sources-self_input")
                 .font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(6));
         });
         ui.horizontal(|ui| {
@@ -96,7 +96,7 @@ impl Sources {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label("Filter:");
-            ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("pattern (blank = show all)"));
+            ui.add(egui::TextEdit::singleline(&mut self.filter).id_salt("sources-self_filter").hint_text("pattern (blank = show all)"));
             ui.checkbox(&mut self.regex, "regex");
             ui.checkbox(&mut self.invert, "invert");
         });

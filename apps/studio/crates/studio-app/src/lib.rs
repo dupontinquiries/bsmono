@@ -2872,7 +2872,24 @@ impl eframe::App for App {
 
         let mut lib_action = None;
         if self.library_open {
-            egui::Panel::left("library").default_size(210.0).show(ctx, |ui| {
+            // `resizable(true)` + an explicit `size_range` is what stops the
+            // reported "sidebar fights to grow, and snaps back wide after a
+            // resize whenever I scroll or tap". Without `resizable`, egui
+            // re-derives this panel's width from its CONTENT every frame, and
+            // the content includes a full library path (`library — /home/…`)
+            // plus the footage-root line — so any interaction that repainted
+            // shoved it back out to whatever those strings measure, discarding
+            // the drag. Marking it resizable makes egui persist the user's
+            // width in panel state instead; the range then bounds it at both
+            // ends so neither a long path nor an over-enthusiastic drag can
+            // take the whole window. The labels inside are truncated to match
+            // (see library.rs) so they wrap into the chosen width rather than
+            // pushing against it.
+            egui::Panel::left("library")
+                .resizable(true)
+                .default_size(210.0)
+                .size_range(160.0..=420.0)
+                .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.small_button("⟳").on_hover_text("rescan").clicked() {
                         self.library_tree.refresh();
@@ -3137,6 +3154,42 @@ impl eframe::App for App {
                         }
                         None => self.studio.status =
                             format!("could not decode {}", p.display()),
+                    }
+                    return;
+                }
+                library::LibraryAction::PatternToTimeline(i) => {
+                    // Bounds-checked rather than indexed: the action was
+                    // produced from last frame's rack, and the rack can have
+                    // shrunk since (a pattern deleted in the same frame the
+                    // send button was pressed). An out-of-date index is a
+                    // status line, not a panic.
+                    match self.studio.rack.patterns.get(i) {
+                        Some(pat) => {
+                            let name = if pat.name.trim().is_empty() {
+                                format!("pattern {}", i + 1)
+                            } else {
+                                pat.name.clone()
+                            };
+                            // NOT WIRED to a real timeline insert yet, and
+                            // deliberately not faked: placing a pattern needs
+                            // a decision about what a pattern IS on the
+                            // timeline (a clip referencing the rack? a bounced
+                            // audio region? a MIDI-ish region the renderer
+                            // expands?), and each answer implies a different
+                            // studio_core::Op. Guessing one here would put a
+                            // wrong shape into the undo log, which is the one
+                            // structure in this app that must not accumulate
+                            // junk. The sidebar half of the report — patterns
+                            // being invisible — is fixed; this half is
+                            // reported honestly rather than half-built.
+                            self.studio.status = format!(
+                                "\"{name}\" is in the sidebar now, but placing a pattern on the \
+                                 timeline is not implemented yet — see C13_TODO");
+                        }
+                        None => {
+                            self.studio.status =
+                                "that pattern no longer exists".into();
+                        }
                     }
                     return;
                 }

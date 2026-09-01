@@ -146,8 +146,30 @@ impl Models {
                 "Type another machine's id here to trust it. The id is a fingerprint of its key, so \
 there is nothing else to exchange.").small().color(theme::FAINT()));
             ui.horizontal_wrapped(|ui| {
+                // `id_salt` is load-bearing, not decoration. Without it egui
+                // derives this TextEdit's id from its position in the layout,
+                // and this one sits inside `horizontal_wrapped` with a
+                // `desired_width` wide enough that on a narrow screen (a
+                // Fairphone, or any desktop window at the 200-300% scale these
+                // compositors default to) the row is right at the wrap
+                // threshold. Type one character, the content measures wider,
+                // the wrap decision flips, the widget lands in a different
+                // layout slot, its auto-id changes — and egui drops keyboard
+                // focus, because focus is tracked BY id. The symptom is
+                // exactly the reported one: the field takes a single
+                // character and then ignores every key after it, which looks
+                // like a broken input rather than a layout oscillation.
+                //
+                // A stable explicit id makes focus survive any amount of
+                // reflow. `desired_width` is also cut to something that fits
+                // a narrow column so the row is not sitting on the threshold
+                // in the first place — belt and braces, since the same
+                // oscillation would still make the field jump around visibly
+                // while typing even with focus held.
                 ui.add(egui::TextEdit::singleline(&mut self.add_id)
-                    .hint_text("xxxxx-xxxxx-xxxxx-xx").desired_width(190.0));
+                    .id_salt("models-trusted-add-id")
+                    .hint_text("xxxxx-xxxxx-xxxxx-xx")
+                    .desired_width(160.0));
                 if ui.small_button("add").clicked() {
                     match logscope_fan::machineid::parse(&self.add_id) {
                         // The error is shown rather than swallowed: a mistyped id would otherwise be
@@ -248,7 +270,7 @@ there is nothing else to exchange.").small().color(theme::FAINT()));
         self.machines_ui(ui);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Models root").color(theme::FAINT()));
-            ui.add(egui::TextEdit::singleline(&mut self.root).desired_width(320.0));
+            ui.add(egui::TextEdit::singleline(&mut self.root).id_salt("models-self_root").desired_width(320.0));
             if theme::action_button(ui, "⟳ Scan", theme::CYAN(), true).clicked() { self.rescan(); }
             let can_plan = self.scanned && !self.entries.is_empty();
             if theme::action_button(ui, "Plan organize", theme::AMBER(), can_plan).clicked() { self.build_plan(); }
@@ -296,7 +318,7 @@ there is nothing else to exchange.").small().color(theme::FAINT()));
         // a filename does not determine which repository it came from.
         ui.horizontal(|ui| {
             ui.label(RichText::new("HF repo (for fetch commands)").color(theme::FAINT()));
-            ui.add(egui::TextEdit::singleline(&mut self.repo_hint)
+            ui.add(egui::TextEdit::singleline(&mut self.repo_hint).id_salt("models-self_repo_hint")
                 .hint_text("owner/repo — leave blank to print a placeholder")
                 .desired_width(280.0));
         });

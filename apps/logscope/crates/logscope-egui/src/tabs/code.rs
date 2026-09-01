@@ -54,7 +54,7 @@ impl Code {
             });
             c[1].label(RichText::new("Block").color(theme::DIM()).small());
             egui::ScrollArea::vertical().id_salt("code_view").show(&mut c[1], |ui| {
-                ui.add(egui::TextEdit::multiline(&mut self.code)
+                ui.add(egui::TextEdit::multiline(&mut self.code).id_salt("code-self_code")
                     .font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(10));
             });
         });

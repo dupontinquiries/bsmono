@@ -5694,6 +5694,14 @@ which file you read.\n\n",
                         ui.visuals_mut().text_cursor.stroke = egui::Stroke::NONE;
                         ui.visuals_mut().selection.bg_fill = egui::Color32::from_rgba_unmultiplied(0x4d, 0xd6, 0xe6, 36);
                         let resp = ui.put(band, egui::TextEdit::multiline(&mut self.input)
+                            // SAME salt at both call sites on purpose. This composer is
+                            // drawn from two places (the wide and the narrow layout), and
+                            // an auto-id would differ between them — so crossing the
+                            // responsive breakpoint mid-sentence silently dropped focus
+                            // and everything typed after it went nowhere. One stable id
+                            // makes the two branches the same widget as far as focus is
+                            // concerned.
+                            .id_salt("logscope-chat-composer")
                             .id(egui::Id::new("logscope_chat_composer"))
                             .desired_width(f32::INFINITY)
                             .frame(egui::Frame::NONE)
@@ -8446,7 +8454,7 @@ if let Some(msg) = self.error_banner.clone() {
                                     }
                                 }
                             });
-                            ui.add(egui::TextEdit::multiline(&mut self.context).desired_rows(4).desired_width(f32::INFINITY)
+                            ui.add(egui::TextEdit::multiline(&mut self.context).id_salt("chat-self_context").desired_rows(4).desired_width(f32::INFINITY)
                                 .hint_text("System prompt / persistent context for every turn…"));
                             if !phys_params_on {
                             ui.add_space(6.0);
@@ -9092,6 +9100,14 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                 ui.visuals_mut().text_cursor.stroke = egui::Stroke::NONE;
                 ui.visuals_mut().selection.bg_fill = egui::Color32::from_rgba_unmultiplied(0x4d, 0xd6, 0xe6, 36);
                 let resp = ui.put(band, egui::TextEdit::multiline(&mut self.input)
+                            // SAME salt at both call sites on purpose. This composer is
+                            // drawn from two places (the wide and the narrow layout), and
+                            // an auto-id would differ between them — so crossing the
+                            // responsive breakpoint mid-sentence silently dropped focus
+                            // and everything typed after it went nowhere. One stable id
+                            // makes the two branches the same widget as far as focus is
+                            // concerned.
+                            .id_salt("logscope-chat-composer")
                     .id(egui::Id::new("logscope_chat_composer"))
                     .desired_width(f32::INFINITY)
                     .frame(egui::Frame::NONE)

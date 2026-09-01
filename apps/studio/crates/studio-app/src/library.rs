@@ -574,6 +574,16 @@ pub enum LibraryAction {
     /// Swiped left: sink it. Toggles.
     Demote(PathBuf),
     ToNewTrackBus(PathBuf, Option<studio_core::BusId>),
+    /// Drop a pattern from the live rack onto the timeline, by index into
+    /// `Rack::patterns`.
+    ///
+    /// Every other action here carries a `PathBuf`, because until now the
+    /// sidebar only ever listed files. Patterns are not files — they live
+    /// in the rack in memory and may never be saved — which is exactly why
+    /// they were invisible in this sidebar: there was no `read_dir` that
+    /// could ever turn one up. An index rather than a name because pattern
+    /// names are user-set and not unique.
+    PatternToTimeline(usize),
 }
 
 /// The sidebar's own state: which folders are open, what has been scanned,
@@ -773,6 +783,87 @@ fn sample_row(ui: &mut egui::Ui, e: &LibraryEntry, compact: bool,
 /// Draw the sidebar: a filter box, then either search results or the lazy
 /// tree. Returns at most one action.
 #[allow(clippy::too_many_arguments)]
+/// One-line summary of what a pattern actually contains, for its row.
+///
+/// Separated from the drawing so it can be tested: a pattern row that says
+/// "16 steps" for an empty pattern and "16 steps" for a full one is no more
+/// use than no row at all.
+pub fn pattern_summary(p: &studio_live::Pattern) -> String {
+    let hits: u32 = p.rows.iter().map(|r| r.count_ones()).sum();
+    let voiced = p.rows.iter().filter(|r| **r != 0).count();
+    let notes: usize = p.rolls.values().map(|v| v.len()).sum();
+    let mut s = format!("{} steps · {hits} hits", p.steps);
+    if voiced > 0 {
+        s.push_str(&format!(" · {voiced} ch"));
+    }
+    if notes > 0 {
+        s.push_str(&format!(" · {notes} notes"));
+    }
+    if hits == 0 && notes == 0 {
+        s.push_str(" · empty");
+    }
+    s
+}
+
+/// Whether a pattern matches the sidebar's filter box. Case-insensitive on
+/// the name only — matching the summary would make "16" select everything.
+pub fn pattern_matches(p: &studio_live::Pattern, filter: &str) -> bool {
+    let f = filter.trim().to_lowercase();
+    f.is_empty() || p.name.to_lowercase().contains(&f)
+}
+
+/// The patterns group at the top of the sidebar. Returns an action when a
+/// row is dragged out or its send button is pressed.
+fn patterns_section(ui: &mut egui::Ui, rack: &studio_live::Rack, filter: &str,
+                    c: &uikit_egui::PaletteColors) -> Option<LibraryAction> {
+    let shown: Vec<(usize, &studio_live::Pattern)> = rack.patterns.iter().enumerate()
+        .filter(|(_, p)| pattern_matches(p, filter)).collect();
+    if rack.patterns.is_empty() {
+        // Say the group exists and is empty rather than hiding it. An
+        // absent group is indistinguishable from the bug this fixes.
+        ui.colored_label(c.text_weak, "patterns — none yet (make one in the rack)");
+        ui.separator();
+        return None;
+    }
+    let mut action = None;
+    egui::CollapsingHeader::new(format!("patterns ({})", rack.patterns.len()))
+        .default_open(true)
+        .show(ui, |ui| {
+            if shown.is_empty() {
+                ui.colored_label(c.text_weak, "no pattern matches the filter");
+            }
+            for (i, p) in shown {
+                let label = if p.name.trim().is_empty() {
+                    format!("pattern {}", i + 1)
+                } else {
+                    p.name.clone()
+                };
+                ui.horizontal(|ui| {
+                    // dnd_drag_source so a pattern can be dragged into the
+                    // timeline the same way a sample can, which is what was
+                    // actually asked for ("drag into the timeline").
+                    let id = egui::Id::new(("studio-pattern", i));
+                    let r = ui.dnd_drag_source(id, PatternDrag(i), |ui| {
+                        ui.label(egui::RichText::new(format!("▦ {label}")).strong());
+                    }).response;
+                    r.on_hover_text("drag onto the timeline, or press ⇥");
+                    if touch_button(ui, "⇥", "send to timeline").clicked() {
+                        action = Some(LibraryAction::PatternToTimeline(i));
+                    }
+                });
+                ui.colored_label(c.text_weak, pattern_summary(p));
+            }
+        });
+    ui.separator();
+    action
+}
+
+/// Drag payload for a pattern row. A newtype rather than a bare `usize` so
+/// egui's typed dnd cannot confuse it with some other index-shaped payload
+/// dragged from elsewhere in the app.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PatternDrag(pub usize);
+
 pub fn show_tree(ui: &mut egui::Ui, roots: &Roots, state: &mut TreeState,
                  rack: &studio_live::Rack, project: &studio_core::Project,
                  prefs: &Prefs, focus: Focus,
@@ -783,13 +874,21 @@ pub fn show_tree(ui: &mut egui::Ui, roots: &Roots, state: &mut TreeState,
     // row goes compact exactly when its full set of touch-sized buttons
     // plus a readable name no longer fits.
     let compact = wants_compact(ui.available_width());
-    ui.label(format!("library — {}", root.display()));
+    // Truncated, not wrapped: a library root is often a long absolute path,
+    // and an untruncated label measures its full width, which is what let
+    // this sidebar shove itself wider than the user's chosen size on every
+    // repaint (see the Panel::left comment in lib.rs). Hover for the full
+    // path.
+    ui.add(egui::Label::new(format!("library — {}", root.display()))
+        .truncate()).on_hover_text(root.display().to_string());
     if let Some(v) = &roots.video {
         // Said, so a search that turns up footage is not a surprise.
-        ui.colored_label(c.text_weak, match focus {
+        let line = match focus {
             Focus::Timeline => format!("+ footage: {}", v.display()),
             _ => format!("+ footage (after samples): {}", v.display()),
-        });
+        };
+        ui.add(egui::Label::new(egui::RichText::new(line).color(c.text_weak))
+            .truncate()).on_hover_text(v.display().to_string());
     }
     ui.horizontal(|ui| {
         ui.label("find:");
@@ -797,6 +896,21 @@ pub fn show_tree(ui: &mut egui::Ui, roots: &Roots, state: &mut TreeState,
         if ui.small_button("⟳").on_hover_text("rescan").clicked() { state.refresh(); }
     });
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        // Patterns FIRST, above the file tree.
+        //
+        // They were missing from this sidebar entirely, and structurally so:
+        // everything below is built from `scan_dir`/`search`, which walk the
+        // filesystem, and a pattern you just made in the rack is not on the
+        // filesystem. So no amount of rescanning could ever surface one —
+        // the reported "patterns don't show up in the library sidebar" was
+        // not a refresh bug.
+        //
+        // Above the tree rather than below because a pattern is the thing
+        // you just made and are about to place; the sample library is what
+        // you browse.
+        if let Some(a) = patterns_section(ui, rack, &state.filter, c) {
+            action = Some(a);
+        }
         if !state.filter.trim().is_empty() {
             if state.filter != state.last_filter || state.last_focus != Some(focus) {
                 // Both libraries, ordered for where you are: the timeline

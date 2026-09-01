@@ -51,7 +51,7 @@ impl Bloc {
             });
             c[1].label(RichText::new("Editor").color(theme::DIM()).small());
             egui::ScrollArea::vertical().id_salt("bloc_editor").show(&mut c[1], |ui| {
-                ui.add(egui::TextEdit::multiline(&mut self.editor)
+                ui.add(egui::TextEdit::multiline(&mut self.editor).id_salt("bloc-self_editor")
                     .font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).desired_rows(8));
             });
         });
