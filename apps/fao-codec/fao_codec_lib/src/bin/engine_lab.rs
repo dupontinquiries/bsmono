@@ -199,7 +199,7 @@ fn main() {
     let ball_at = |t: f32| -> (f32, f32, f32) {
         (300.0 * (t * 3.0).cos(), 120.0 + 90.0 * (t * 5.0).sin().abs(), 300.0 * (t * 3.0).sin())
     };
-    let mut dress = |rgb: &mut Vec<u8>, pose: &CameraPose, t: f32, fi: usize| {
+    let dress = |rgb: &mut Vec<u8>, pose: &CameraPose, t: f32, fi: usize| {
         // Project a bright sphere-ish blob at the ball's world position.
         let (bx, by, bz) = ball_at(t);
         let (dx, dy, dz) = (bx - pose.position.x, by - pose.position.y, bz - pose.position.z);
