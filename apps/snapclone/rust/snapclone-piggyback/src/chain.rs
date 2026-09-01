@@ -47,8 +47,16 @@ pub struct ChainEntry {
     pub blob_hash: [u8; 32],
 
     /// 64-byte ed25519 signature over the deterministic byte encoding
-    /// of (prev_hop_id || my_id || signed_at_ms || blob_hash).
-    pub signature: [u8; 64],
+    /// of (prev_hop_id || my_id || signed_at_ms || blob_hash), hex-encoded.
+    ///
+    /// Stored as hex rather than `[u8; 64]` because serde's built-in
+    /// array impls only cover a fixed enumerated list of lengths (up to
+    /// 32) and 64 isn't one of them — the same reason
+    /// `snapclone-mailbox::SignedMailboxEntry` stores its signature as
+    /// `sig_hex: String` rather than a raw array. Decode with
+    /// `signature_bytes()` wherever the 64-byte form is actually needed
+    /// (e.g. real ed25519 verification, once V32.32's stub is replaced).
+    pub signature: String,
 }
 
 impl ChainEntry {
@@ -71,6 +79,13 @@ impl ChainEntry {
         out[64..72].copy_from_slice(&self.signed_at_ms.to_be_bytes());
         out[72..104].copy_from_slice(&self.blob_hash);
         out
+    }
+
+    /// Decode `signature` back to the raw 64 bytes ed25519 actually
+    /// works with. Fails on malformed hex or the wrong decoded length.
+    pub fn signature_bytes(&self) -> Result<[u8; 64], ChainError> {
+        let bytes = hex::decode(&self.signature).map_err(|_| ChainError::BadSignature)?;
+        bytes.try_into().map_err(|_| ChainError::BadSignature)
     }
 }
 
@@ -173,7 +188,7 @@ impl RelayChain {
         // with snapclone-identity. Adding ad-hoc ed25519 here would
         // duplicate key-handling and risk inconsistency.
         // TODO: pk = identity::lookup(&entry.my_id)
-        //       pk.verify(&entry.signed_bytes(), &entry.signature)
+        //       pk.verify(&entry.signed_bytes(), &entry.signature_bytes()?)
         Ok(())
     }
 }
@@ -221,7 +236,7 @@ mod tests {
             my_id: [me; 32],
             signed_at_ms: ts,
             blob_hash: [blob; 32],
-            signature: [0u8; 64],
+            signature: hex::encode([0u8; 64]),
         }
     }
 
