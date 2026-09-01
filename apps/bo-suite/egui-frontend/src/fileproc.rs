@@ -31,7 +31,6 @@
 //! cannot show a REPEAT — hold `−` and the volume steps down repeatedly, and
 //! each step should flash even though there was one press.
 
-use uikit_egui::motion::ease;
 
 /// Opus bitrate bounds, in kbps, and the slider's step.
 pub const BITRATE_MIN: u32 = 32;
