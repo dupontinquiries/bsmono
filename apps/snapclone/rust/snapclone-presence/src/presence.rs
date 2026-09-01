@@ -53,7 +53,7 @@ impl Presence {
         put(&mut data, &self.display_name);
         put(&mut data, &self.host);
         data.extend_from_slice(&self.port.to_be_bytes());
-        Value { id: value_id, data }
+        Value::new(value_id, data)
     }
     pub fn from_value(v: &Value) -> Option<Presence> {
         let d = &v.data;

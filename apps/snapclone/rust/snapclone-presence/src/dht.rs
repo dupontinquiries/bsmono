@@ -173,10 +173,7 @@ pub fn resolve<T: Transport>(
         // the Value here keeps one definition of what a presence record
         // IS — the alternative is a second parser that can drift.
         .filter_map(|b| {
-            crate::presence::Presence::from_value(&crate::Value {
-                id: crate::presence::value_id_for(sc_id),
-                data: b.clone(),
-            })
+            crate::presence::Presence::from_value(&crate::Value::new(crate::presence::value_id_for(sc_id), b.clone()))
         })
         .collect();
     if parsed.is_empty() {
