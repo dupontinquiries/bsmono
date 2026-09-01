@@ -856,3 +856,134 @@ both, same shape as the shellkit/scene-kit/peek migrations done
 earlier this session). Not attempted here: still needs someone who can
 verify camera-bridge/pipewire behavior on real hardware (a phone GPU
 and a desktop webcam) rather than compile-check alone.
+
+---
+
+# Session 2026-09-01 (late): hard dedups + field-report backlog
+
+## 19. voiceterm real_pty: zsh prompt redraw garbles the grid (root cause NOT fixed)
+
+Fleet failure: `a_tab_lands_on_its_column_stop` and
+`colour_codes_from_a_real_program_leave_nothing_on_the_screen` both fail
+with a screen showing only `➜  ~ =` and no command output.
+
+Reproduced locally by pointing `$SHELL` at a themed zsh (the sandbox
+default has `$SHELL` unset, so `PtyHost::spawn` falls back to /bin/sh and
+all three tests pass — which is why this never showed up here before).
+Two things were found and fixed along the way (commit `0c012e0c`): OSC
+sequences were being typed onto the grid as literal text, and the test's
+fixed-duration sleeps were too short for a slow login shell. **Neither
+fixes this failure.**
+
+The actual cause, traced by dumping the raw pty bytes and feeding them
+through `Parser` directly: zsh's line editor draws its prompt with a
+reverse-video placeholder (`ESC[1m ESC[7m # ESC[27m ...`), a run of
+spaces to the terminal width, then `\r`-and-redraw, plus `ESC[J` / `ESC[K`
+erases and `ESC[?1h ESC= ESC[?2004h` (DECCKM + keypad-application +
+bracketed-paste). Feeding the captured 436-byte real sequence into the
+parser produces interleaved garbage — `➜/➜`, ` e`, ` t`, `~c~` across
+successive rows — i.e. the cursor ends up in the wrong place and
+subsequent output lands scattered instead of on one line. So the grid is
+mis-tracking the cursor through some combination of the erase-in-display /
+erase-in-line / carriage-return / wrap interaction, not merely printing
+stray characters.
+
+Fixing this properly means auditing `Grid`'s cursor model against a real
+VT spec for: `ESC[J`/`ESC[K` with implicit param 0, the deferred-wrap
+("phantom column") state after writing the last column, and what `\r`
+does to the pending-wrap flag. That is a genuine terminal-emulator
+correctness task with real regression risk to every app embedding
+uikit-term, and it wants its own session plus a corpus of captured real
+shell sessions as fixtures — not a quick patch. It is also very likely
+the same underlying defect as the "voiceterm panes can't be used like
+konsole" field report (§20), so it is worth doing once, properly.
+
+## 20. voiceterm-egui panes still unusable as a real terminal
+
+Standing field report, still open. Almost certainly the same root cause as
+§19 — the grid mis-tracks the cursor through a real interactive shell's
+prompt redraws, so anything beyond simple line-at-a-time output smears.
+Do §19 first; re-test this after.
+
+## 21. logscope as an agent harness: no time awareness, small models loop
+
+Field report with a captured transcript. Two distinct problems:
+
+**No time awareness.** The assistant has no notion of elapsed time or of
+the current date. Transcript shows "keep working for the next day" being
+accepted and then answered immediately, and the fan status line
+(`189 rounds left`) counting rounds rather than time. Minimum fix: inject
+the current timestamp into each turn's context and surface wall-clock
+elapsed in the fan status, so a model can at least know that time passed
+between turns.
+
+**Small models loop instead of doing work.** The transcript is a
+llama-class model asked to "rewrite smite in bevy and rust" producing
+four nearly identical "Scene Management" sections in a row, each
+restating the same non-compiling skeleton, drifting into "Beavy", and
+never touching the actual repo. The harness let it run ~10 minutes of
+that unchecked. This is not fixable by prompt alone; the harness needs
+loop detection (e.g. n-gram overlap against the previous k assistant
+turns, or a repeated-heading check) that halts the fan and reports
+"model is looping" rather than burning the round budget. Also worth
+gating: a round that produces no tool call and no file edit should not
+count as progress.
+
+## 22. gitmind-egui fleet management never connected to the Fairphones
+
+Field report: openssh-server installed via apk on the phones, screens on,
+same wifi, but the devices never appeared, so cross-compilation to them
+could not be tested at all. Nothing was verified end-to-end here — the
+discovery path, the SSH path, and the cross-compile path are all
+untested against real hardware. Needs a session with the devices in
+hand and, first, a way to see WHY discovery fails (does it broadcast? do
+the phones answer? is it mDNS, a fixed port scan, the DHT rendezvous?).
+Right now there is no diagnostic output to reason from.
+
+## 23. Camera enumeration on postmarketOS is wrong in several ways
+
+Field report from a Fairphone. All of these are separate:
+- Device names (`qcom-iris-decoder`, `qcom-iris-encoder`, `msm_*`) render
+  as a flat list that **runs off the page**; should be a dropdown.
+- The decoder/encoder nodes are not cameras at all and should be filtered
+  out of a camera picker, or at least sorted below real capture devices.
+- Default selection is wrong: it lands on `/dev/video0` and **hangs**.
+- Advertised format is 640x480 at a low frame rate on a 4K sensor, so
+  format negotiation is either not querying or picking the first entry.
+This overlaps the `apps/snapclone/camera-bridge` source_plan work
+(C13_TODO §17b) — that crate already has ordered-candidate probing that
+tries libcamera pipewire nodes then v4l2 and falls through on failure.
+Whatever fix lands should reuse that, not reinvent it.
+
+## 24. Layout/overflow bugs across apps (Fairphone AND desktop)
+
+- **Settings panels flow over the bottom navbar and over each other**
+  instead of establishing bounds and scrolling. Both platforms.
+- **logscope portrait at 300% scale overflows left and right.** 200% is
+  "a bit better". 300% is common on these compositors, so it is the case
+  to design for, not an edge case.
+- **logscope landscape: the bottom bar is cut off** — the app overflows
+  past the bottom rather than splitting content into sections that fit.
+  The suggestion in the report is good and worth following: use the
+  dashboard-metrics machinery in reverse, to turn one page that does not
+  fit into either a page of elements that do fit, or appropriately-named
+  sub-tabs.
+
+## 25. logscope Models tab: trusted-devices field takes one character
+
+Another instance of the long-standing single-letter input bug (see the
+earlier entry on this). Workaround used in the field was pasting. Also
+reported alongside it: after pasting a device key, the desktop machine
+could not chat or list models and was labelled
+`added ejz2w7sg2wmnab0e as a BUILD worker — it may see source, not
+conversation. Unverified until it announces itself with a key; raise it
+then.` So the trust/announce handshake never completed. Two bugs stacked:
+the input field, and the announce path.
+
+## 26. aperture / studio: unfinished open flows
+
+- **studio** does not use a native file picker for `.studio` files.
+- **aperture** cannot browse UP into higher-level Rust projects, and gets
+  stuck in Python once a python test script inside a Rust crate is opened
+  (the project-type detection latches and never re-evaluates).
+- **aperture** still has no tap-and-hold gesture for the command palette.
