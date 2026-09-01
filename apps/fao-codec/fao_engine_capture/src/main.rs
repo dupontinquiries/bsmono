@@ -356,6 +356,82 @@ fn main() {
         }
         rgb
     };
+    // ── --vary <stage>: footage where EXACTLY ONE image-formation
+    // stage changes over the GOP, camera held still, no actors, so the
+    // (base render, frame) difference is that stage and nothing else.
+    // Ground truth for the photometric marker bank: run the bank on
+    // every frame, and it must name the stage that was varied.
+    //   exposure  global gain 1 +- 0.08 sin
+    //   wb        per-channel gain (R up, B down)
+    //   vignette  radial falloff 1 - k r^2, k 0..0.35
+    //   fog       fog end 280 -> 120 (denser), same colour
+    //   light     sun direction swings 40 degrees
+    //   none      identical render (bank must report nothing)
+    if let Some(stage) = args.iter().position(|a| a == "--vary").and_then(|i| args.get(i + 1)) {
+        let cam0 = cams[0];
+        let base = to_yuv(&render_scene(&cam0, &[]));
+        println!("vary={stage}  (camera static, no actors; bank vs base render)");
+        for fi in 0..n {
+            let t = fi as f32 / (n.max(2) - 1) as f32;
+            let s = (t * std::f32::consts::PI).sin();
+            let mut rgb: Vec<u8> = match stage.as_str() {
+                "fog" => {
+                    let fg = Fog::new(fog.color, 55.0 - 50.0 * s, 280.0 - 240.0 * s);
+                    let mut all: Vec<early_fps::mesh::Mesh3> = level.meshes.clone();
+                    all.truncate(all.len());
+                    let m = early_fps::render::render(
+                        &all, &cam0, W as f32 / 2.0, H as f32 / 2.0, scale, &light, &fg,
+                        W as f32, H as f32, 0.0, Vec2::new(0.0, 0.0), atlas, 1, &[],
+                    );
+                    rasterise(&m)
+                }
+                "light" => {
+                    let ang = 0.7 * s;
+                    let dir = Vec3::new(-0.4 * ang.cos() - 0.3 * ang.sin(), -1.0, -0.3 * ang.cos() + 0.4 * ang.sin());
+                    let lt = Light::sun(dir, egui::Color32::from_rgb(255, 244, 224));
+                    let m = early_fps::render::render(
+                        &level.meshes, &cam0, W as f32 / 2.0, H as f32 / 2.0, scale, &lt, &fog,
+                        W as f32, H as f32, 0.0, Vec2::new(0.0, 0.0), atlas, 1, &[],
+                    );
+                    rasterise(&m)
+                }
+                _ => render_scene(&cam0, &[]),
+            };
+            match stage.as_str() {
+                "exposure" => {
+                    let g = 1.0 + 0.08 * s;
+                    for v in rgb.iter_mut() { *v = ((*v as f32) * g).round().clamp(0.0, 255.0) as u8; }
+                }
+                "wb" => {
+                    let (gr, gb) = (1.0 + 0.10 * s, 1.0 - 0.10 * s);
+                    for px in rgb.chunks_exact_mut(3) {
+                        px[0] = ((px[0] as f32) * gr).round().clamp(0.0, 255.0) as u8;
+                        px[2] = ((px[2] as f32) * gb).round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+                "vignette" => {
+                    let k = 0.35 * s;
+                    let (cx, cy) = (W as f32 / 2.0, H as f32 / 2.0);
+                    let rmax2 = cx * cx + cy * cy;
+                    for y in 0..H {
+                        for x in 0..W {
+                            let r2 = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)) / rmax2;
+                            let g = 1.0 - k * r2;
+                            let i = (y * W + x) * 3;
+                            for c in 0..3 { rgb[i + c] = ((rgb[i + c] as f32) * g).round().clamp(0.0, 255.0) as u8; }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            let f = to_yuv(&rgb);
+            let sig = fao_codec::photometric::signature(&base, &f);
+            if fi % 4 == 0 || fi == n - 1 {
+                println!("  f{fi:>2} s={s:.2} {}", sig.row());
+            }
+        }
+        return;
+    }
     let frames: Vec<plate::Yuv420> = (0..n).map(|i| to_yuv(&render_footage(i))).collect();
     let nonflat = frames[0].y.iter().filter(|&&v| v != frames[0].y[0]).count();
     eprintln!("captured {n} frames, {nonflat} non-uniform px in frame 0");

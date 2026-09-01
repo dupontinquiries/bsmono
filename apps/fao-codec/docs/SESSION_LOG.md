@@ -6285,3 +6285,75 @@ properties, camera first:
    first step: it has nothing to attach to until (1) removes the
    camera from the per-region budget and (2) gives objects a
    representation the ledger can score.
+
+### Photometric marker bank — pulling the image-formation chain apart, validated on an engine, run on film (same day)
+
+User's framing, which the day's numbers had been circling: the world
+the decoder emulates includes the camera. Fog is an entity AND a light
+AND a shader into a lens, and the trick is separating those given a
+scene. Separation is by SIGNATURE — each stage is a function of a
+different thing (global / per-channel / radius / depth / normal /
+local shift) and persists over a different span (frame / shot /
+camera / library).
+
+`photometric::signature(pred, target)`: a bank of closed-form least-
+squares fits of the difference, scored as explained variance:
+exposure (global affine on Y, robust two-pass), white balance (a
+YUV linear map per plane, vs the same gain applied about 128),
+vignette (gain quadratic in r^2), fog (blend toward one colour with
+a row-quadratic strength), lag-1 autocorrelation of what is left,
+and the fraction a +-4 px local shift removes. Cheap enough per
+frame in an encoder.
+
+Validated with `fao_engine_capture --vary <stage>`: soldier rendered
+with the camera still and exactly one stage varying. Mid-GOP frame:
+
+  varied     exp   wb   vig   fog  lag1  motion   recovered
+  none       0.00 0.00  0.00  0.00 0.00  0.00
+  exposure   1.00 0.80  1.00  0.99 0.71  0.01     a 1.078 (true 1.08)
+  wb         0.92 0.99  0.92  0.00 0.88  0.02     shared 0.01 vs wb 0.99
+  vignette   0.53 0.87  1.00  0.57 0.95  0.03     v1 -0.349 (true -0.35)
+  fog        0.54 0.86  0.56  0.92 0.92  0.03     C (129,127) vs fog (132,126)
+  light      0.00 0.07  0.01  0.05 0.79  0.00     nothing fits: structured,
+                                                  not kinematic — that IS
+                                                  the illumination marker
+
+Two lessons the table teaches. Exposure is contained in vignette and
+fog (they reduce to it), so the selector is per parameter — the
+simplest stage within a margin of the best — not the highest R^2.
+And "light" has no cheap basis without normals; it shows up as high
+lag-1 with everything else near zero, which is a usable marker for
+"this needs geometry".
+
+Two bugs of mine the validation caught before film saw them: the
+chroma R^2 was computed on the concatenated planes and scored
+"nothing explained" as 0.50, so the WB marker had never worked (a
+per-channel RGB gain is not a per-plane affine in YUV); and the plain
+least-squares gain on a misaligned predictor is biased toward 0 —
+soldier's forward-moving camera (phase correlation sees expansion as
+(0,0)) fitted a = 0.80-0.88 for a 1% exposure change. Fixed with an
+inlier refit (6 levels): the same frame now reports a 0.99 at 5%
+inliers, i.e. rejected.
+
+Same robust fit put into `WeightedPred`, where it changes the film
+result from a wash to a win on both axes and keeps SMITE's chroma:
+
+  w1     no WP 444,056/0.97731 | naive 441,967/0.97711 | robust 440,102/0.97732
+  SMITE  naive 856,910/0.95410 U 34.61 V 34.81 | robust 858,369/0.95415 U 34.61 V 34.96
+  soldier entity unchanged (exact canonical: every pixel an inlier)
+
+`bin/photo_probe` runs the bank on real footage against the previous
+frame shifted by the phase-correlation translation:
+
+  w1 (film)   exp 0.01-0.03  wb 0  vig 0.02  fog 0.02  lag1 0.3-0.6  motion 0.48-0.72
+  SMITE       exp 0.00-0.06  wb 0  vig 0.04  fog 0.03  lag1 0.0-0.6  motion 0.59-0.95
+
+Neither has a global photometric stage frame to frame. What remains
+after a global shift is structured (lag1 ~0.5) and half to nine
+tenths kinematic (local shift). So on the film clip in hand the
+stages the bank can name are absent, and the unexplained part is the
+two the bank cannot fit without geometry: local motion of objects
+and illumination on them. That is the honest answer to "cheap markers
+that pull apart any engine or the real world": yes for the global
+stages, validated; and on this film the cheap stages are not where
+the bytes are. The expensive ones are.

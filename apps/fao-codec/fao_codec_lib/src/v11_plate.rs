@@ -982,23 +982,43 @@ impl WeightedPred {
 }
 
 fn fit_plane_gain(pred: &[u8], target: &[u8]) -> (i16, i8) {
-    let n = pred.len() as f64;
-    let (mut sp, mut st, mut spp, mut spt) = (0.0f64, 0.0, 0.0, 0.0);
-    for (&p, &t) in pred.iter().zip(target) {
-        let (p, t) = (p as f64, t as f64);
-        sp += p;
-        st += t;
-        spp += p * p;
-        spt += p * t;
-    }
-    let denom = n * spp - sp * sp;
-    if denom.abs() < 1e-6 {
-        return (1024, 0);
-    }
-    let a = ((n * spt - sp * st) / denom).clamp(0.5, 2.0);
+    // Two-pass robust least squares. The plain fit is biased toward
+    // a < 1 on any predictor that is wrong in places (regression
+    // dilution): the photometric marker bank measured a = 0.80-0.88
+    // on a misaligned prev reference whose true exposure change was
+    // 1%, and the plate on film fitted a = 0.75. Refitting on the
+    // pixels within WP_INLIER levels of the first fit keeps every
+    // pixel of an exact canonical and drops the misaligned ones, so
+    // a bad reference lands on identity instead of on a contrast
+    // reduction that the dead zone then hides.
+    const WP_INLIER: f64 = 6.0;
+    let fit = |keep: &dyn Fn(usize) -> bool| -> Option<(f64, f64)> {
+        let (mut n, mut sp, mut st, mut spp, mut spt) = (0.0f64, 0.0f64, 0.0, 0.0, 0.0);
+        for (i, (&p, &t)) in pred.iter().zip(target).enumerate() {
+            if !keep(i) {
+                continue;
+            }
+            let (p, t) = (p as f64, t as f64);
+            n += 1.0;
+            sp += p;
+            st += t;
+            spp += p * p;
+            spt += p * t;
+        }
+        let denom = n * spp - sp * sp;
+        if n < 64.0 || denom.abs() < 1e-6 {
+            return None;
+        }
+        let a = (n * spt - sp * st) / denom;
+        Some((a, (st - a * sp) / n))
+    };
+    let Some((a0, b0)) = fit(&|_| true) else { return (1024, 0) };
+    let (a, b) = fit(&|i| ((target[i] as f64) - (a0 * pred[i] as f64 + b0)).abs() <= WP_INLIER)
+        .unwrap_or((a0, b0));
+    let a = a.clamp(0.5, 2.0);
     let qa = (a * 1024.0).round() as i16;
     let a = qa as f64 / 1024.0;
-    let b = ((st - a * sp) / n).round().clamp(-127.0, 127.0) as i8;
+    let b = b.round().clamp(-127.0, 127.0) as i8;
     (qa, b)
 }
 
