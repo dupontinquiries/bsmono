@@ -30,7 +30,6 @@
 //! importing rack's existing channel count — pinned by test, because an
 //! off-by-one here plays the hat pattern on the kick.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -163,6 +162,7 @@ pub fn list(dir: &Path) -> Vec<(String, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use studio_live::SynthKind;
 
     fn pack() -> PatternPack {

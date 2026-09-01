@@ -19,7 +19,7 @@
 //! that decision for the rest of the gesture. Committing once and holding is
 //! what stops a timeline from jittering between zooming and panning mid-drag.
 
-use egui::{Pos2, Vec2};
+use egui::Pos2;
 use studio_core::Ticks;
 
 /// What the recognizer decided this gesture is.
