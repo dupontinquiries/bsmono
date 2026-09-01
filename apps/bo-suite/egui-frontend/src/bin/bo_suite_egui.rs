@@ -5,6 +5,7 @@
 //! Run:  cargo run --bin bo-suite-egui --features app   (from apps/bo-suite/egui-frontend)
 
 use eframe::egui;
+use bo_suite_egui::catalog_source::CatalogSource;
 use bo_suite_egui::{Controller, Device, Scene};
 use uikit_egui::Adaptive;
 
@@ -16,14 +17,40 @@ struct App {
     player: bo_suite_egui::playback::Player,
     /// Said once per failure, not per frame.
     last_note: String,
-    /// The real library: a scan of this machine's music directory.
-    catalog: bo_suite_egui::music_scan::FsCatalog,
+    /// The real library: bo-controller's SQLite catalog, read directly
+    /// (WAL-safe, see real_catalog.rs) with writes routed to the worker
+    /// thread spawned below.
+    catalog: bo_suite_egui::real_catalog::RealCatalog,
     /// The recogniser, when one is configured and voice is on.
     voice: bo_suite_egui::voice_source::VoiceSource,
     /// What the recogniser was last started with, so a settings change
     /// restarts it and an unchanged one does not — respawning a process
     /// every frame is the shape of bug that empties a battery.
     voice_cmd: String,
+}
+
+/// Fill `track_paths` for every row currently loaded into the all-tracks
+/// page or the browse grids — the set of ids `request_play` can actually
+/// resolve. Called after any fetch from `RealCatalog`, since `CatalogSource`
+/// itself doesn't carry paths (see `real_catalog.rs`'s note on why).
+fn sync_track_paths(controller: &mut bo_suite_egui::Controller, catalog: &bo_suite_egui::real_catalog::RealCatalog) {
+    let ids: Vec<i64> = controller.all_tracks.tracks().iter().map(|t| t.id)
+        .chain(controller.browse_tracks.iter().map(|t| t.id))
+        .collect();
+    let paths: Vec<(i64, String)> = ids.into_iter()
+        .filter_map(|id| catalog.path_of(id).map(|p| (id, p)))
+        .collect();
+    if !paths.is_empty() {
+        let mut merged = controller.track_paths.clone();
+        for (id, path) in paths {
+            if let Some(slot) = merged.iter_mut().find(|(k, _)| *k == id) {
+                slot.1 = path;
+            } else {
+                merged.push((id, path));
+            }
+        }
+        controller.set_track_paths(merged);
+    }
 }
 
 impl App {
@@ -38,31 +65,56 @@ impl App {
             Scene { name: "Focus".into() },
             Scene { name: "Evening Wind-down".into() },
         ];
-        // THE LIBRARY, from disk. `CatalogSource` had two implementations
-        // and both were test fakes, so this frontend had never shown a real
-        // one — and the tracks it did show had no files behind them.
-        let catalog = bo_suite_egui::music_scan::FsCatalog::discover();
+        // THE LIBRARY, from bo-controller's own database. `CatalogSource`
+        // had two implementations and both were test fakes (a third,
+        // `FsCatalog`, guessed metadata from filenames because opening the
+        // real catalog from a second process was assumed unsafe — it
+        // isn't: the DB is WAL-mode specifically so a second reader
+        // doesn't block the writer). Ratings, tags, and everything the Qt
+        // app ever scanned now show up here unchanged.
+        let db_path = bo_suite_egui::real_catalog::db_path();
+        let music_roots = bo_suite_egui::real_catalog::music_roots();
+        let (media_cmd_tx, media_cmd_rx) = std::sync::mpsc::channel();
+        let (media_res_tx, _media_res_rx) = std::sync::mpsc::channel();
+        eprintln!("bo-suite: media db at {}, roots: {:?}", db_path.display(), music_roots);
+        {
+            let db_path = db_path.clone();
+            std::thread::spawn(move || {
+                bo_media::run_media_worker(media_cmd_rx, media_res_tx, db_path, music_roots, Vec::new());
+            });
+        }
+        let catalog = match bo_suite_egui::real_catalog::RealCatalog::open(&db_path, media_cmd_tx) {
+            Ok(c) => c,
+            Err(e) => {
+                // The worker thread above still runs and will create the
+                // database on its first write (a scan); this read handle
+                // just couldn't open it yet (e.g. parent dir missing on
+                // first launch). Retrying next frame is not implemented —
+                // like FsCatalog before it, an empty library here is
+                // reported, not silently swallowed.
+                eprintln!("bo-suite: catalog open failed: {e} — library will appear empty \
+                           until a rescan creates it");
+                // A connection to an in-memory DB always succeeds, so this
+                // never has to be an Option threaded through every view.
+                let (fallback_tx, _fallback_rx) = std::sync::mpsc::channel();
+                bo_suite_egui::real_catalog::RealCatalog::open(
+                    std::path::Path::new(":memory:"), fallback_tx)
+                    .expect("in-memory catalog always opens")
+            }
+        };
         let mut controller = Controller::new(devices, scenes);
-        if catalog.is_empty() {
-            eprintln!("bo-suite: no music found — looked in $XDG_MUSIC_DIR, ~/Music, ~/music");
+        if catalog.total() == 0 {
+            eprintln!("bo-suite: no music cataloged yet — rescan from Settings to scan \
+                       $BO_MUSIC_DIR or ~/Music");
         } else {
-            eprintln!("bo-suite: {} track(s) from {}", catalog.len(),
-                      catalog.root.as_ref().map(|r| r.display().to_string())
-                          .unwrap_or_default());
+            eprintln!("bo-suite: {} track(s) in the catalog", catalog.total());
             // The first page, so the list is not empty before anyone
             // scrolls. `answer_tracks_from` needs a pending request; asking
             // for offset 0 is that request.
             controller.pending_tracks =
                 Some(bo_suite_egui::all_tracks::TracksAction::Load { offset: 0 });
             controller.answer_tracks_from(&catalog);
-            // The id-to-file map the transport resolves through. Built from
-            // the same scan the rows came from, so a row and its file
-            // cannot disagree.
-            let paths = (0..catalog.len() as i64)
-                .filter_map(|i| catalog.path_of(i)
-                    .map(|p| (i, p.display().to_string())))
-                .collect();
-            controller.set_track_paths(paths);
+            sync_track_paths(&mut controller, &catalog);
         }
         Self {
             controller,
@@ -117,6 +169,11 @@ impl App {
     /// player did.
     fn pump_playback(&mut self) {
         use bo_suite_egui::playback::{plan, Request, State};
+        if let Some(id) = self.controller.last_played_track.take() {
+            // Persisted through the worker (play count + history), not
+            // written on this connection — see real_catalog.rs.
+            self.catalog.record_play(id);
+        }
         if let Some(req) = self.controller.pending_playback.take() {
             match req {
                 Request::Play { url, sink } => {
@@ -196,6 +253,7 @@ impl eframe::App for App {
         // Pages the list asks for, answered from the scan.
         if self.controller.pending_tracks.is_some() {
             self.controller.answer_tracks_from(&self.catalog);
+            sync_track_paths(&mut self.controller, &self.catalog);
         }
         self.pump_voice();
         self.pump_playback();

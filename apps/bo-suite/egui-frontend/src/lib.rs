@@ -19,6 +19,7 @@ pub mod channel;
 pub mod tags;
 pub mod outputs;
 pub mod music_scan;
+pub mod real_catalog;
 pub mod playback;
 pub mod surround;
 pub mod voice_control;
@@ -411,6 +412,11 @@ pub struct Controller {
     /// Empty until it does, which is why `request_play` refuses rather
     /// than guessing.
     pub track_paths: Vec<(i64, String)>,
+    /// The id most recently handed to `request_play`, for a host that
+    /// wants to record a play/rating against the real track — cleared by
+    /// the host (`take()`), not by this struct, so it survives exactly
+    /// one read and never fires twice for the same play.
+    pub last_played_track: Option<i64>,
     /// The rating the user last set; the host applies it and echoes back
     /// through `confirm_rating`. Same shape as `pending_route` — this view
     /// owns no library.
@@ -536,6 +542,7 @@ impl Controller {
             audio_sink: crate::playback::Sink::Default,
             track_url: String::new(),
             track_paths: Vec::new(),
+            last_played_track: None,
             pending_source: None,
             pending_rating: None,
             active_device_url: String::new(),
@@ -1942,6 +1949,7 @@ impl Controller {
         match self.track_paths.iter().find(|(k, _)| *k == id) {
             Some((_, path)) => {
                 self.track_url = path.clone();
+                self.last_played_track = Some(id);
                 self.pending_playback = Some(crate::playback::Request::Play {
                     url: path.clone(),
                     sink: self.audio_sink.clone(),

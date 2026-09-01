@@ -33,6 +33,13 @@ bo-mux = { path = "../bo-mux" }
 # mattering. It was marked #![allow(dead_code)], vendored from bo-mux (which no
 # longer has a copy), and referenced by nothing anywhere in the tree.
 bo-core = { path = "../bo-core" }
+# bo-controller's Qt-free media library (SQLite catalog, scanner, tag
+# read/write, playlists/queue/history) — see real_catalog.rs. Was reachable
+# only from the Qt binary; both front-ends now read/write the same database.
+bo-media = { path = "../bo-media" }
+# Named directly in real_catalog.rs (RealCatalog.conn: rusqlite::Connection) —
+# same version bo-media pins, not a second copy: cargo unifies by semver.
+rusqlite = { version = "0.31", features = ["bundled"] }
 # XDG paths + flat [section] key=value, the fleet's one path rule.
 config-kit = { path = "../../../shared/config-kit" }
 # bo-mux/protocol.rs is mounted by #[path] and derives Serialize/Deserialize;
@@ -47,5 +54,6 @@ eframe = { version = "0.34", default-features = false, features = ["glow", "wayl
 
 [dev-dependencies]
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"] }
+tempfile = "3"
 
 [workspace]
