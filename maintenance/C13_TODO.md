@@ -1535,3 +1535,41 @@ Still open, in the order I would take them:
    chasing, since the fao-codec lesson this session was that "three tests
    fail together" usually means one shared cause, not three bugs.
 4. **logscope / logscope+features** — carried; §19's VT work is the blocker.
+
+
+## 47. §41 settled — ctxplan is wired, not deleted
+
+The decision was "wire or delete, do not leave both". Wired. The planner
+was never wrong; it was missing an input. `ctxplan::describes_project`
+supplies the relevance it needed, and `workspace_block` now uses the
+planner instead of a coarse byte cap.
+
+What this does NOT do: `agent_context` still uses the class budgets. That
+is defensible — the agent path can actually read files on demand, so it
+needs a starting set rather than a considered selection — but the two
+paths now differ in how they choose, and that should be a deliberate
+choice rather than drift. Revisit if the agent path starts looking thin.
+
+Also worth noting for whoever tunes this: `describes_project` is path-shape
+only, deliberately. The obvious next signal is the user's actual question
+("summarize" vs "why does X fail") — `Section` and per-section relevance
+already exist in the planner and nothing fills them either. That is the
+same missing-input shape one level down, and the same warning applies:
+decide before building a second scorer.
+
+## 48. Verify-by-running is what caught the last two bugs
+
+Recording this because it is a pattern, not luck. Two bugs this session
+were found by running a thing against real data rather than by reading it
+or by a test passing:
+
+- The ctxplan wiring looked right and its tests passed. Running it over
+  `apps/switcheroo` showed one markdown file eating 70% of the budget.
+- The `repo_tree` depth-first order looked fine and its existing test
+  passed (that test only checked boundedness, not order). The failure only
+  appears when you ask what a 40-entry cap actually contains.
+
+Both are cases where the test suite was checking the wrong property. Worth
+doing for anything that SELECTS or RANKS: run it over a real repo and read
+the output, because "it returned something" and "it returned the right
+something" look identical to an assertion that only checks the former.
