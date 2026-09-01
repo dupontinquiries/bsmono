@@ -2,7 +2,7 @@
 //! (`empty`/`expand`/`center`/`corners`) plus the containment/overlap tests
 //! unendlich's octree/frustum code re-derives.
 
-use crate::vec::{v2, v3, Vec2, Vec3};
+use crate::vec::{v3, Vec2, Vec3};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Aabb2 {
@@ -139,6 +139,7 @@ impl Aabb3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vec::v2;
 
     #[test]
     fn empty_then_expand_is_the_point() {
