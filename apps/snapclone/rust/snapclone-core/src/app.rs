@@ -40,7 +40,6 @@ pub struct AppConfig {
 /// Thread-safe: `dispatch()` can be called from any thread.
 pub struct AppCore {
     cmd_tx: mpsc::SyncSender<AppCommand>,
-    evt_rx: mpsc::Receiver<AppEvent>,
 }
 
 impl AppCore {
@@ -55,7 +54,7 @@ impl AppCore {
         // For now this is a scaffold — the Qt AppController is the live impl.
         let _ = evt_tx; // suppress unused warning until impl is wired
 
-        (Self { cmd_tx, evt_rx }, evt_rx)
+        (Self { cmd_tx }, evt_rx)
     }
 
     /// Send a command to the core. Non-blocking; returns Err if queue is full.
