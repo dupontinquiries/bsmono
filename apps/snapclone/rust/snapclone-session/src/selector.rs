@@ -4,7 +4,7 @@
 //! Warm paths (recently successful) are tried first; negatively cached paths
 //! are skipped entirely until the negative cache expires.
 
-use snapclone_net_intel::{ReachabilityDb, bins::NetworkBin, scoring::Protocol, hints::hints_for};
+use snapclone_net_intel::{ReachabilityDb, hints::hints_for};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
@@ -51,7 +51,6 @@ impl TransportSelector {
             return choices;
         };
 
-        let bin  = NetworkBin::of(ip);
         let addr = ip.to_string();
         let hints = hints_for(db, peer_id, ip, is_cgnat);
 
@@ -75,12 +74,8 @@ impl TransportSelector {
                     choices.push(TransportChoice::DhtMailbox);
                 }
                 TraversalStrategy::Relay { relay_url } => {
-                    let url = if relay_url.is_empty() {
-                        relay_url.as_str().to_owned()
-                    } else if let Some(u) = relay_url {
-                        u.to_owned()
-                    } else { continue };
-                    choices.push(TransportChoice::Relay { relay_url: url });
+                    if relay_url.is_empty() { continue; }
+                    choices.push(TransportChoice::Relay { relay_url });
                 }
                 _ => {}
             }

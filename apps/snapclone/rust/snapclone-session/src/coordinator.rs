@@ -8,9 +8,9 @@ use crate::{
     selector::{TransportChoice, TransportSelector},
 };
 use snapclone_net_intel::{ReachabilityDb, bins::NetworkBin, scoring::Protocol};
-use snapclone_peer::{SessionPool, SessionEvent, SessionState};
+use snapclone_peer::{SessionPool, SessionEvent};
 use std::collections::HashMap;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 pub struct SessionCoordinator {
     pub pool:    SessionPool,
