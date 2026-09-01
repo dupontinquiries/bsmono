@@ -1132,7 +1132,7 @@ pub fn run(args: &[String]) {
         let mut saw_bounce = 0;
         let mut worst = 0.0f32;
         for horizon in [0.3f32, 0.6, 1.0, 1.5, 2.0] {
-            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
             let mut ball = Ball::new();
             let gy = world.ground_h(0.0, 0.0);
             // a ball on its way down and forward: the case that bounces
@@ -1208,10 +1208,9 @@ pub fn run(args: &[String]) {
         println!("{:>8} {:>8} {:>9} {:>9} {:>8}", "height", "range", "took off", "closest", "touch");
         let mut touched = 0;
         let mut flew = 0;
-        let mut near = 0;
         let mut sum_close = 0.0f32;
         for (h, range) in [(7.0f32, 12.0f32), (10.0, 18.0), (14.0, 24.0), (9.0, 30.0)] {
-            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
             let mut bots = crate::bots::spawn_match(&world, 1);
             let mut ball = Ball::new();
             let gy = world.ground_h(0.0, 0.0);
@@ -1251,9 +1250,6 @@ pub fn run(args: &[String]) {
             }
             if hit {
                 touched += 1;
-            }
-            if closest < 3.0 {
-                near += 1;
             }
             sum_close += closest;
             println!(
@@ -2876,10 +2872,9 @@ pub fn run(args: &[String]) {
         println!("{:>8} {:>8} {:>9} {:>9} {:>8}", "height", "range", "took off", "closest", "touch");
         let mut touched = 0;
         let mut flew = 0;
-        let mut near = 0;
         let mut sum_close = 0.0f32;
         for (h, range) in [(7.0f32, 12.0f32), (10.0, 18.0), (14.0, 24.0), (9.0, 30.0)] {
-            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
             let mut bots = crate::bots::spawn_match(&world, 1);
             let mut ball = Ball::new();
             let gy = world.ground_h(0.0, 0.0);
@@ -2919,9 +2914,6 @@ pub fn run(args: &[String]) {
             }
             if hit {
                 touched += 1;
-            }
-            if closest < 3.0 {
-                near += 1;
             }
             sum_close += closest;
             println!(
@@ -3548,8 +3540,8 @@ pub fn run(args: &[String]) {
             let mut best = ball.vel;
             let mut touches = 0;
             let mut flip_touches = 0;
-            let mut flipping = false;
-            let mut record = |ev: &StepEvents, ball: &Ball, best: &mut Vec3, touches: &mut i32| {
+            let mut flipping: bool;
+            let record = |ev: &StepEvents, ball: &Ball, best: &mut Vec3, touches: &mut i32| {
                 if !ev.touches.is_empty() {
                     *touches += 1;
                     *best = ball.vel; // last contact wins: that is separation
@@ -3760,7 +3752,7 @@ pub fn run(args: &[String]) {
                     while firstc < spans.len() && spans[firstc].1 <= t {
                         firstc += 1; // retired: the ray is past it
                     }
-                    for (_, i) in cand.iter() {
+                    for (_, _) in cand.iter() {
                         old += 1;
                     }
                     for (_, _, i) in spans[firstc..].iter() {
@@ -4302,7 +4294,7 @@ pub fn run(args: &[String]) {
         use crate::{frustum_planes, shape_bound, sphere_visible};
         println!("{:<13} {:>7} {:>8} {:>8} {:>8} {:>7}", "map", "shapes", "in view", "+dist", "drawn", "saved");
         let mut worst = 0.0f32;
-        let mut order_ok = true;
+        let mut order_ok: bool;
         for si in [20usize, 21, 24, 26, 30, 33, 35] {
             let w = World::generate(9, crate::world::style(si), 0.31, 1.0);
             let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 3.0, 40.0);
@@ -6005,7 +5997,7 @@ pub fn run(args: &[String]) {
                 // floor, so start just below the axis. And enter at PACE:
                 // these lines are ridden, not crawled — several are entered
                 // by launcher and none of them are climbable from a stop.
-                let si0 = 0usize;
+                let _si0 = 0usize;
                 let dir0 = (pts[1] - pts[0]).normalize_or(Vec3::Z);
                 car.pos = pts[0].lerp(pts[1], 0.12) - Vec3::Y * (start_r * 0.45);
                 let dir = dir0;
@@ -6748,7 +6740,7 @@ pub fn run(args: &[String]) {
             car.boost = h.base_tank;
             car.charge = 0.0;
             let mut t = 0.0f32;
-            let mut spent = 0.0f32;
+            let spent: f32;
             while car.boost > 0.0 && t < 10.0 {
                 physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
                 t += DT;
@@ -8782,7 +8774,7 @@ pub fn run(args: &[String]) {
         // It usually enters through a correction term rather than the
         // coefficient itself, so it is worth measuring rather than reading.
         {
-            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
             let mut ball = Ball::new();
             let gy = world.ground_h(0.0, 0.0);
             ball.pos = Vec3::new(0.0, gy + 12.0, 0.0);
@@ -9207,7 +9199,7 @@ pub fn run(args: &[String]) {
                 // "air start" means the FLIP begins mid-air at an arbitrary
                 // attitude, which is exactly the post-jump state
                 car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
-                let mut start = car.rot;
+                let start;
                 let mut c = physics::Controls::default();
                 if air {
                     // jump for a legal dodge window, then take an ARBITRARY
@@ -9479,19 +9471,7 @@ pub fn run(args: &[String]) {
             ("near/low/flat", 3.0f32, 0.6f32, 0.0f32),
             ("far/high/down", 9.0, 3.0, -14.0),
         ] {
-            // the exact target: Fairphone 5 / postmarketOS / SC7280
-        let fp5 = crate::platform::classify(
-            "Linux version 7.1.2 #1-postmarketos-qcom-sc7280 SMP PREEMPT Mon Jul 13 21:02:06 UTC",
-            "fp5-black",
-            "Fairphone 5",
-            true,
-        );
-        println!("fp5-black        : {:?}  ({})", fp5.profile, fp5.why);
-        let pc = crate::platform::classify("Linux version 6.8.0-generic #1 SMP", "workstation", "", false);
-        println!("desktop x86      : {:?}  ({})", pc.profile, pc.why);
-        let target_ok = fp5.profile == crate::platform::Profile::Handheld
-            && pc.profile == crate::platform::Profile::Desktop;
-        let mut cfg = crate::config::Config::default();
+            let mut cfg = crate::config::Config::default();
             cfg.cam.dist = dist;
             cfg.cam.height = height;
             cfg.cam.angle_deg = ang;
@@ -9511,11 +9491,32 @@ pub fn run(args: &[String]) {
         }
         return;
     }
+    if name == "platform" {
+        // Does platform::classify() actually tell a Fairphone from a
+        // desktop? This used to be pasted inside the "cam" diagnostic's
+        // loop, where it ran twice (once per camera config, for no
+        // reason), printed the same two lines both times, and never
+        // looked at its own `target_ok` result — so this check has never
+        // actually failed, because nothing was checking it.
+        let fp5 = crate::platform::classify(
+            "Linux version 7.1.2 #1-postmarketos-qcom-sc7280 SMP PREEMPT Mon Jul 13 21:02:06 UTC",
+            "fp5-black",
+            "Fairphone 5",
+            true,
+        );
+        println!("fp5-black        : {:?}  ({})", fp5.profile, fp5.why);
+        let pc = crate::platform::classify("Linux version 6.8.0-generic #1 SMP", "workstation", "", false);
+        println!("desktop x86      : {:?}  ({})", pc.profile, pc.why);
+        let target_ok = fp5.profile == crate::platform::Profile::Handheld
+            && pc.profile == crate::platform::Profile::Desktop;
+        println!("{}", if target_ok { "PLATFORM CLASSIFY: PASS" } else { "PLATFORM CLASSIFY: FAIL" });
+        return;
+    }
     if name == "jump" {
         // press-to-liftoff latency across surfaces and timings: the ground
         // jump must be as instant as the flip
         let cfg = Config::default();
-        let mut row = |label: &str, style_i: usize, presses: &[f32], drive: f32| {
+        let row = |label: &str, style_i: usize, presses: &[f32], drive: f32| {
             let world = World::generate(31, crate::world::style(style_i), 0.31, 1.0);
             let mut worst = 0.0f32;
             let mut fails = 0;
