@@ -147,10 +147,14 @@ pub fn style_for(d: &Destination) -> usize {
         // low-gravity dust
         (Material::Regolith, gr) if gr < 0.3 => 12, // PLANETARIUM
         (Material::Regolith, _) => 7,               // ZEN GARDEN
-        // sandstone and everything else: somewhere you can breathe
+        // sandstone and everything else: somewhere you can breathe — and
+        // where the campaign's Earth beats happen. The DISTRICT
+        // (`district.rs`): a boulevard, arches, spires, plazas, authored
+        // in occupant heights. MEADOW was skydribble's, and had nowhere
+        // to drive and nothing to stand next to.
         _ => {
             let _ = g;
-            0 // MEADOW
+            36 // DISTRICT
         }
     }
 }

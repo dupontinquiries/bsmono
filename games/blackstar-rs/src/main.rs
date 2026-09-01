@@ -33,6 +33,7 @@ mod combo;
 mod config;
 mod damage;
 mod dispatch;
+mod district;
 mod drop;
 mod duel;
 mod foldaudit;
@@ -3995,7 +3996,20 @@ impl Game {
         if !self.car.robot {
             return self.fire_from_the_saddle();
         }
-        let origin = self.car.pos + self.car.up() * (self.car.half_h * 0.8);
+        // THE ROBOT'S MUZZLE IS ON THE MODEL TOO: the robot pose is its own
+        // `Model` with its own `hardpoints`, so an arm cannon found there
+        // is where the shot leaves. The chest is the fallback.
+        let origin = {
+            let mi = self.cars.active.min(self.cars.models.len() - 1);
+            let hp = &self.cars.models[mi].hardpoints;
+            if hp.has_real_guns() {
+                let m = hp.muzzle(self.saddle_shots as usize).unwrap();
+                self.saddle_shots = self.saddle_shots.wrapping_add(1);
+                self.car.pos + self.car.rot * (m.pos * self.cfg.car.size)
+            } else {
+                self.car.pos + self.car.up() * (self.car.half_h * 0.8)
+            }
+        };
         // aim down the camera, not down the chassis: with free look the two
         // differ, and you shoot where you are looking
         let aim = (self.cam.look - self.cam.pos).normalize_or(self.car.forward());
@@ -6422,6 +6436,24 @@ impl Game {
                     s.update(FIXED_DT, steer, gy, &mut self.body);
                     self.car.pos = s.drop.pos;
                     self.car.vel = s.drop.vel;
+                    // TOUCHDOWN ON A DISTRICT: the wave stands in the
+                    // nearest plaza, facing the LZ, not at a hashed bearing
+                    // in the open. Done here, before the first
+                    // `tick_engage` musters anything.
+                    if s.engaged() && !self.world.plazas.is_empty() {
+                        let lz = s.drop.pos;
+                        if let Some(p) = self
+                            .world
+                            .plazas
+                            .iter()
+                            .min_by(|a, b| a.distance_squared(lz).total_cmp(&b.distance_squared(lz)))
+                        {
+                            let gy = self.world.ground_h(p.x, p.z);
+                            s.field.anchor = Vec3::new(p.x, gy, p.z);
+                            let to = lz - *p;
+                            s.field.facing = Vec3::new(to.x, 0.0, to.z).normalize_or(Vec3::Z);
+                        }
+                    }
                     // THE BODY READS THE FALL: nose down the velocity as a
                     // dart, upright over flat heading as a parachute. The
                     // car's forward is -Z in its own frame (`Car::forward`),
@@ -8807,10 +8839,11 @@ impl Game {
         if boosting && self.mode == Mode::Play {
             let flick = 0.11 + ((self.time * 31.0).sin() * 0.5 + 0.5) * 0.07;
             let size = self.cfg.car.size;
+            // each pose has its own fittings: the vehicle's nozzles at the
+            // tail, the robot's on its back or its boots, wherever the
+            // model put them. Only the tail blob when a pose has none.
             let thr = &self.cars.models[local_model.min(self.cars.models.len() - 1)].hardpoints.thrusters;
-            // the nozzles were read off the VEHICLE pose; a robot's boost is
-            // the old tail blob until the robot pose's own fittings are read
-            if thr.is_empty() || self.car.robot {
+            if thr.is_empty() {
                 let tail = rc.0 - (rc.1 * Vec3::NEG_Z) * (self.car.half_len + 0.12);
                 let fm = Mat4::from_translation(tail) * Mat4::from_scale(Vec3::splat(flick));
                 push(&mut objs, world::M_SPHERE, None, fm, [1.0, 0.55, 0.08, 0.9], [0.0, 1.0, 0.0, 0.0]);
