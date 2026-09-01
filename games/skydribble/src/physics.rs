@@ -814,7 +814,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     // jump buffering: remember a press for a beat so hitting jump a frame
     // before touchdown still hops the instant wheels touch (the "getting my
     // jump back is slow" fix — the press used to be eaten mid-air)
-    if (c.jump_pressed && car.hover.is_none()) {
+    if c.jump_pressed && car.hover.is_none() {
         car.jbuf = 0.09;
     } else {
         car.jbuf = (car.jbuf - dt).max(0.0);
@@ -1606,7 +1606,6 @@ pub fn step_ball(ball: &mut Ball, world: &World, cfg: &Config, dt: f32, ev: &mut
         ball.pos += n * (ball.r - d);
         let vn = ball.vel.dot(n);
         if vn < 0.0 {
-            let vt = ball.vel - n * vn;
             let e = (0.6 * cfg.ball.bounce * cfg.arena.bounce).clamp(0.05, 0.97);
             if vn < -0.8 {
                 if -vn > 2.0 {
@@ -1945,28 +1944,11 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
             // with. Airborne carries keep their much higher grip.
             let mu = if car.on_ground { 0.034 } else { 0.30 };
             ball.vel -= (tang * mu).clamp_length_max(if car.on_ground { 0.35 } else { 1.4 });
-            // and the hood is dished, so the ball rolls back to the middle
-            let side = car.rot * Vec3::X;
-            let off = (ball.pos - car.pos).dot(side);
-            let reach = car.half_w.max(0.25) + ball.r;
-            let hold = (1.0 - (off.abs() / reach).clamp(0.0, 1.0)).powi(2);
-            // the dish is a HINT toward the centre line, not a magnet: it
-            // only bites near the sweet spot, so a ball already sliding off
-            // keeps going
-            // the dish only whispers now: enough that a centred ball stays
-            // centred, not enough to drag a sliding one back
-            // THE DISH is what makes a dribble a skill rather than a coin
-            // flip. Near the sweet spot the hood cradles the ball firmly, so
-            // small errors self-correct and you can hold a line; past about
-            // two thirds of the way out the cradle falls away to nothing and
-            // the ball is gone. That gradient IS the balance point — uniform
-            // grip (what this was) gives you either a magnet or a marble,
-            // and neither of those is dribbling.
-            let f = (off.abs() / reach).clamp(0.0, 1.0);
-            let well = if f < 0.66 { (1.0 - f / 0.66).powi(2) } else { 0.0 };
             // NO DISH. A hood that pulls the ball back to its centre line
-            // is what made carries feel magnetic. Keeping the ball is your
-            // steering now, not the car's shape.
+            // is what made carries feel magnetic — the dish's side-to-side
+            // pull (`side`/`off`/`reach`/`hold`/`f`/`well`, computed and
+            // never applied) was removed in favor of pure fore/aft below.
+            // Keeping the ball is your steering now, not the car's shape.
             // fore/aft is deliberately looser: that axis is where you PLAY —
             // push the ball out front, boost past it, catch it up again
             let fwd = car.forward();
