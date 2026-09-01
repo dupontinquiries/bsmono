@@ -11006,18 +11006,32 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
             // call.
             let mut gpu_budget = gpu_buffer_budget_uma(budget, self.conservative_vma, self.unified);
             if self.conservative_vma {
-                let cap = (crate::memplan::ASAHI_CONCURRENT_BUFFER_GIB * (1u64 << 30) as f64) as u64;
+                // PREFER A MEASUREMENT OF THIS DEVICE over the compiled-in 31.0.
+                // `ResidencyProbe`/`probe_key` were written to make this possible
+                // and had no callers, so `kernel-validate --gate-vram` measured
+                // the ceiling and threw the answer away — every subsequent load
+                // re-derived its plan from a number taken once on someone else's
+                // M2 Ultra. Same mistake llama.cpp fixed in 558e221b7: storing
+                // what was assumed where what was observed belongs.
+                //
+                // Keyed on adapter AND slab size, because a probe at 1 GiB slabs
+                // does not answer for 2 GiB ones. Absent measurement → the
+                // constant, exactly as before, so an unprobed machine is
+                // unaffected.
+                let slab_gib = std::env::var("LOGSCOPE_ARENA_SLAB_MB").ok()
+                    .and_then(|m| m.trim().parse::<f64>().ok()).map(|mb| mb / 1024.0)
+                    .unwrap_or(2.0);
+                let (cap_gib, cap_from) =
+                    crate::memplan::concurrent_ceiling_gib(&self.adapter_name, slab_gib);
+                let cap = (cap_gib * (1u64 << 30) as f64) as u64;
                 if gpu_budget > cap {
                     eprintln!("loader: GPU budget {:.1} GiB clamped to {:.1} GiB — this driver \
 accepts a large single allocation but will not hold more than that in buffers at once. A plan above \
 it fails mid-load rather than at planning time. \
-THIS FIGURE IS A COMPILED-IN CONSTANT, not a measurement of this device: it was measured once on an \
-M2 Ultra at 1 and 2 GiB slabs, mapped and unmapped, and every Asahi machine now receives that \
-number. On different hardware it may be wrong in either direction \u{2014} `kernel-validate \
---gate-vram` measures the single-allocation ceiling on THIS device, and a load that fails part-way \
-through is the evidence that the concurrent one is lower than this.",
+Source of this figure: {}. A load that fails part-way through is the evidence that the concurrent \
+ceiling is lower than whatever is being used here.",
                         gpu_budget as f64 / (1u64 << 30) as f64,
-                        crate::memplan::ASAHI_CONCURRENT_BUFFER_GIB);
+                        cap_gib, cap_from);
                     gpu_budget = cap;
                 }
             }

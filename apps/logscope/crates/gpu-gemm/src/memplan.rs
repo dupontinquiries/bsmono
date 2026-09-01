@@ -1785,17 +1785,41 @@ mod provenance_tests {
     /// This pins the wording so the claim cannot creep back. A grep is a crude test and it is the
     /// right one here — the failure being prevented is a STRING that overstates, and nothing about
     /// the value itself changes.
+    /// SUPERSEDED IN PREMISE, KEPT IN PURPOSE. The original asserted the clamp
+    /// message must contain the literal "COMPILED-IN CONSTANT", which was right
+    /// while the figure was ALWAYS a constant. It no longer always is: the
+    /// ceiling now prefers a stored measurement of this device
+    /// (`concurrent_ceiling_gib`), so a message hardcoding "constant" would
+    /// become the overstatement in the other direction — claiming a guess where
+    /// a measurement was used.
+    ///
+    /// The thing worth pinning was never the word. It is that the message must
+    /// carry the number's PROVENANCE, whatever that provenance happens to be.
+    /// So the test now checks that the message prints a source, and that each
+    /// source `concurrent_ceiling_gib` can return describes itself honestly.
     #[test]
-    fn the_clamp_message_does_not_claim_to_have_MEASURED_this_device() {
+    fn the_clamp_message_always_names_where_its_figure_came_from() {
         let src = include_str!("lib.rs");
         let i = src.find("GPU budget {:.1} GiB clamped to").expect("clamp message moved");
         let window = &src[i..(i + 1400).min(src.len())];
-        assert!(window.contains("COMPILED-IN CONSTANT"),
-            "the clamp must say the figure is a constant, or it reads as a measurement of the \
-machine in front of the operator");
-        assert!(window.contains("measured once on an"),
-            "and it must say WHERE the number came from, since 'a constant' alone invites someone \
-to treat it as arbitrary and raise it");
+        assert!(window.contains("Source of this figure:"),
+            "the clamp must print the provenance of its ceiling — a bare number cannot be judged, \
+which is the whole failure this family of tests exists to prevent");
+        assert!(window.contains("cap_from"),
+            "and it must print the RESOLVED provenance rather than a hardcoded phrase, or it will \
+describe a constant on a machine that was actually measured");
+    }
+
+    #[test]
+    fn each_provenance_string_is_honest_about_which_kind_it_is() {
+        // The constant branch must not read as a measurement, and the measured
+        // branch must not read as a constant. Checked on the strings themselves
+        // rather than by grepping source, since these are what an operator sees.
+        let (_, why) = super::concurrent_ceiling_gib("no-such-adapter-for-this-test", 2.0);
+        assert!(why.contains("COMPILED-IN CONSTANT"), "{why}");
+        assert!(!why.to_lowercase().contains("measured on this device"), "{why}");
+        assert!(why.contains("--gate-vram"),
+            "a message that says the figure is a guess must also say how to stop guessing");
     }
 
     #[test]
@@ -2309,4 +2333,222 @@ dropped it, remove it here or every checkpoint carrying it will be silently mark
         assert!(ig < los, "the [1] scalar should not lead the list: {line}");
     }
 
+}
+
+// ── measured concurrent-buffer ceiling: persist it, then prefer it ────────────
+//
+// `ASAHI_CONCURRENT_BUFFER_GIB` is 31.0, and the engine's own advice line already
+// says out loud that it "is a CONSTANT, not a measurement ... the constant has
+// been wrong by 2.6x on this hardware". `ResidencyProbe` and `probe_key` were
+// written to replace it and had NO CALLERS — the measurement was taken and
+// thrown away, so every run re-derived the plan from the same wrong number.
+//
+// This is the same failure llama.cpp fixed in `558e221b7` ("vulkan: record actual
+// memory properties during buffer creation" — a one-liner that stopped recording
+// what was REQUESTED instead of what was RETURNED). Different layer, identical
+// mistake: a number describing an assumption is stored where a number describing
+// the device belongs.
+
+/// Where a measured CONCURRENT ceiling is kept.
+///
+/// **Deliberately not `store::vram_{get,put}`, and the difference matters.**
+/// That store holds the SINGLE-ALLOCATION ceiling — the largest one buffer the
+/// driver will hand out, which `--gate-vram` measured at 63 GiB on the M2 Ultra.
+/// The clamp here needs the CONCURRENT ceiling: how much the device will hold in
+/// buffers *at once*, which the run log puts near 31 GiB on the same machine.
+/// They differ by 2x, and feeding the single-allocation figure into this clamp
+/// would authorise a ~63 GiB resident plan that fails forty seconds into
+/// quantisation — the exact failure `ASAHI_CONCURRENT_BUFFER_GIB` was introduced
+/// to prevent. Two names for two quantities; conflating them is the bug.
+///
+/// One entry per adapter+slab key, so a probed machine never pays again and an
+/// unprobed one is unaffected.
+pub fn measured_ceiling_path() -> std::path::PathBuf {
+    let base = std::env::var("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                .join(".local/share")
+        });
+    base.join("logscope").join("vram-ceilings.txt")
+}
+
+/// One stored measurement. Deliberately a flat `key<TAB>gib` text file rather
+/// than JSON: it is read on every load, it must never fail in a way that costs a
+/// load, and a human debugging a wrong budget should be able to `cat` it and
+/// delete one line.
+pub fn save_measured_ceiling(key: &str, held_gib: f64) -> std::io::Result<()> {
+    let path = measured_ceiling_path();
+    if let Some(d) = path.parent() { std::fs::create_dir_all(d)?; }
+    let mut kept: Vec<String> = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.starts_with(&format!("{key}\t")))
+        .map(str::to_string)
+        .collect();
+    kept.push(format!("{key}\t{held_gib:.3}"));
+    std::fs::write(&path, kept.join("\n") + "\n")
+}
+
+/// Look up a stored measurement. `None` for absent, unreadable, or malformed —
+/// every one of those means "fall back to the constant", which is exactly the
+/// behaviour before this existed, so a corrupt file degrades to the status quo
+/// rather than breaking a load.
+pub fn load_measured_ceiling(key: &str) -> Option<f64> {
+    let txt = std::fs::read_to_string(measured_ceiling_path()).ok()?;
+    for line in txt.lines() {
+        let (k, v) = line.split_once('\t')?;
+        if k == key {
+            let g = v.trim().parse::<f64>().ok()?;
+            // A measurement at or below zero is not a measurement. Refusing it
+            // here means a truncated write cannot clamp a budget to nothing.
+            if g > 0.0 { return Some(g); }
+        }
+    }
+    None
+}
+
+/// The concurrent-buffer ceiling to plan against, and where it came from.
+///
+/// Returns `(gib, provenance)`. The provenance string is meant to be printed
+/// next to the number every time it is used — the whole lesson of §37 is that a
+/// figure without its source costs someone an evening deciding whether to
+/// believe it.
+pub fn concurrent_ceiling_gib(adapter: &str, slab_gib: f64) -> (f64, String) {
+    if let Ok(s) = std::env::var("LOGSCOPE_MAX_GPU_GB") {
+        if let Ok(g) = s.trim().parse::<f64>() {
+            if g > 0.0 {
+                return (g, format!("LOGSCOPE_MAX_GPU_GB={}", s.trim()));
+            }
+        }
+    }
+    let key = probe_key(adapter, slab_gib);
+    match load_measured_ceiling(&key) {
+        Some(g) => (g, format!("measured on THIS device (kernel-validate --gate-vram, {key})")),
+        None => (
+            ASAHI_CONCURRENT_BUFFER_GIB,
+            format!(
+                "COMPILED-IN CONSTANT — not measured here; run `kernel-validate --gate-vram` \
+                 to replace it (would be stored under {key})"
+            ),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod measured_ceiling_tests {
+    use super::*;
+
+    fn with_tmp_home<T>(f: impl FnOnce() -> T) -> T {
+        // Serialised: these tests mutate process-wide env, and the counter/atomic
+        // races fixed elsewhere this session are the same shape.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("logscope-ceiling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) };
+        let out = f();
+        match prev {
+            Some(p) => unsafe { std::env::set_var("XDG_DATA_HOME", p) },
+            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    #[test]
+    fn absent_measurement_falls_back_to_the_constant_and_says_so() {
+        with_tmp_home(|| {
+            let (g, why) = concurrent_ceiling_gib("Apple M2 Ultra [Vulkan]", 2.0);
+            assert_eq!(g, ASAHI_CONCURRENT_BUFFER_GIB);
+            assert!(why.contains("COMPILED-IN CONSTANT"), "{why}");
+            // The remedy must be in the message, not only in a comment.
+            assert!(why.contains("--gate-vram"), "{why}");
+        });
+    }
+
+    #[test]
+    fn a_stored_measurement_beats_the_constant() {
+        with_tmp_home(|| {
+            let key = probe_key("Apple M2 Ultra [Vulkan]", 2.0);
+            save_measured_ceiling(&key, 24.5).unwrap();
+            let (g, why) = concurrent_ceiling_gib("Apple M2 Ultra [Vulkan]", 2.0);
+            assert_eq!(g, 24.5);
+            assert!(why.contains("measured on THIS device"), "{why}");
+        });
+    }
+
+    #[test]
+    fn a_measurement_is_scoped_to_its_adapter_and_slab_size() {
+        // The reason probe_key carries both: a probe at 1 GiB slabs cannot answer
+        // for 4 GiB ones, and one machine's answer is not another's — which is
+        // precisely how the 31.0 constant came to describe every Asahi device.
+        with_tmp_home(|| {
+            save_measured_ceiling(&probe_key("Apple M2 Ultra [Vulkan]", 2.0), 24.5).unwrap();
+            assert_eq!(concurrent_ceiling_gib("Apple M2 Ultra [Vulkan]", 1.0).0,
+                       ASAHI_CONCURRENT_BUFFER_GIB, "different slab size must not reuse it");
+            assert_eq!(concurrent_ceiling_gib("Apple M4 Max [Vulkan]", 2.0).0,
+                       ASAHI_CONCURRENT_BUFFER_GIB, "different adapter must not reuse it");
+        });
+    }
+
+    #[test]
+    fn rewriting_a_key_replaces_rather_than_appends() {
+        // Otherwise a machine re-probed after a driver update reads its OLD
+        // number forever, which is the failure this whole mechanism exists to end.
+        with_tmp_home(|| {
+            let key = probe_key("dev", 2.0);
+            save_measured_ceiling(&key, 20.0).unwrap();
+            save_measured_ceiling(&key, 40.0).unwrap();
+            assert_eq!(load_measured_ceiling(&key), Some(40.0));
+            let txt = std::fs::read_to_string(measured_ceiling_path()).unwrap();
+            assert_eq!(txt.lines().filter(|l| l.starts_with("dev|")).count(), 1);
+        });
+    }
+
+    #[test]
+    fn a_corrupt_or_nonpositive_entry_degrades_to_the_constant() {
+        with_tmp_home(|| {
+            let p = measured_ceiling_path();
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "dev|slab=2.0\tnot-a-number\nother|slab=2.0\t-5\n").unwrap();
+            assert_eq!(load_measured_ceiling(&probe_key("dev", 2.0)), None);
+            assert_eq!(load_measured_ceiling(&probe_key("other", 2.0)), None);
+        });
+    }
+
+    #[test]
+    fn an_explicit_env_override_wins_over_a_measurement() {
+        with_tmp_home(|| {
+            save_measured_ceiling(&probe_key("dev", 2.0), 24.5).unwrap();
+            unsafe { std::env::set_var("LOGSCOPE_MAX_GPU_GB", "12") };
+            let (g, why) = concurrent_ceiling_gib("dev", 2.0);
+            unsafe { std::env::remove_var("LOGSCOPE_MAX_GPU_GB") };
+            assert_eq!(g, 12.0);
+            assert!(why.contains("LOGSCOPE_MAX_GPU_GB"), "{why}");
+        });
+    }
+}
+
+#[cfg(test)]
+mod ceiling_kind_tests {
+    /// The two ceilings are different quantities and must not be wired together.
+    ///
+    /// On the reporting machine `--gate-vram` measured 63 GiB (single
+    /// allocation) while the concurrent wall sits near 31. A future change that
+    /// "unifies the two stores" would clamp at 63 and reintroduce a load that
+    /// dies mid-quantisation. This pins the reasoning next to the code so that
+    /// change gets argued with rather than merged.
+    #[test]
+    fn the_concurrent_store_documents_why_it_is_not_the_single_allocation_store() {
+        let src = include_str!("memplan.rs");
+        let i = src.find("pub fn measured_ceiling_path").expect("moved");
+        let doc = &src[i.saturating_sub(1600)..i];
+        assert!(doc.contains("SINGLE-ALLOCATION"), "must name the other quantity");
+        assert!(doc.contains("CONCURRENT"), "must name its own quantity");
+        assert!(doc.contains("63") && doc.contains("31"),
+            "must carry the two real numbers that show the gap is 2x, not rounding");
+    }
 }
