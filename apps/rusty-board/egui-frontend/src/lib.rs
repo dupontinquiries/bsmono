@@ -28,6 +28,8 @@ pub mod tray;
 pub mod microterm;
 pub mod voice;
 pub mod steno;
+#[cfg(feature = "wayland")]
+pub mod wayland;
 pub mod settings;
 // config/mod.rs refers to `crate::util`, so the port re-exports it at the root.
 pub use settings::util;

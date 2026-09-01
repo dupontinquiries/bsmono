@@ -154,20 +154,10 @@ fn open_inherited_connection(fd: std::os::unix::io::RawFd) -> Result<(Connection
     let conn = Connection::from_socket(stream)
         .map_err(|e| anyhow!("failed to open Wayland connection from inherited fd {}: {}", fd, e))?;
 
-    // We need a wl_seat for input-method/virtual-keyboard creation.
-    // Walk the registry on a throwaway queue, bind the first seat.
-    let mut seat_queue: EventQueue<SeatProbe> = conn.new_event_queue();
-    let qh = seat_queue.handle();
-    let _registry = conn.display().get_registry(&qh, ());
-    let mut probe = SeatProbe { seat: None };
-    seat_queue
-        .roundtrip(&mut probe)
-        .map_err(|e| anyhow!("seat probe roundtrip failed: {}", e))?;
-
-    let seat = probe.seat.ok_or_else(|| {
+    let seat = probe_seat(&conn).map_err(|e| {
         anyhow!(
             "inherited Wayland connection didn't expose wl_seat — this \
-             socket may not be a regular Wayland connection"
+             socket may not be a regular Wayland connection ({e})"
         )
     })?;
     Ok((conn, seat))
@@ -178,6 +168,11 @@ fn open_inherited_connection(fd: std::os::unix::io::RawFd) -> Result<(Connection
 /// input-method protocols (for us). True for wlroots-style compositors;
 /// false for KWin (where input-method protocols live on a separate
 /// privileged socket).
+///
+/// Only available under `gdk-integration` — this is the GTK app's own
+/// connection-sharing convenience, not something a GTK-free consumer
+/// (egui-frontend) has a GDK display to share in the first place.
+#[cfg(feature = "gdk-integration")]
 fn share_gdk_connection(
     gdk_display: &gtk4::gdk::Display,
 ) -> Result<(Connection, WlSeat)> {
@@ -205,115 +200,69 @@ fn share_gdk_connection(
     Ok((conn, wl_seat))
 }
 
-/// Minimal registry probe used during `open_inherited_connection` to find
-/// a `wl_seat` on the inherited connection. Throwaway.
-struct SeatProbe {
-    seat: Option<WlSeat>,
+/// Strategy 3: open a brand-new connection to whatever `$WAYLAND_DISPLAY`
+/// points at, independent of any toolkit. For a process with no GDK/GTK
+/// display at all (an eframe/winit app, say) — this is the only strategy
+/// available, and it's actually the architecturally *normal* one: a
+/// separate input-method client, in its own connection, is how Maliit
+/// itself does it. The per-seat-singleton concern in this module's doc
+/// comment is about NOT fragmenting one toolkit's rendering connection
+/// from its own input-method connection; it isn't a reason a wholly
+/// separate process/binary can't be its own single input-method client.
+fn open_standalone_connection() -> Result<(Connection, WlSeat)> {
+    let conn = Connection::connect_to_env()
+        .map_err(|e| anyhow!("failed to connect to $WAYLAND_DISPLAY: {}", e))?;
+    let seat = probe_seat(&conn)?;
+    Ok((conn, seat))
 }
 
-impl Dispatch<wl_registry::WlRegistry, ()> for SeatProbe {
-    fn event(
-        state: &mut Self,
-        registry: &wl_registry::WlRegistry,
-        event: wl_registry::Event,
-        _: &(),
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-    ) {
-        if let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-        {
-            if interface == "wl_seat" && state.seat.is_none() {
-                let v = version.min(7);
-                let s: WlSeat = registry.bind(name, v, qh, ());
-                state.seat = Some(s);
-            }
-        }
-    }
+/// Walk the registry on a throwaway queue to find a `wl_seat`. Shared by
+/// the inherited-fd and standalone strategies — both need to bind their
+/// own seat since neither goes through GDK.
+fn probe_seat(conn: &Connection) -> Result<WlSeat> {
+    let mut seat_queue: EventQueue<SeatProbe> = conn.new_event_queue();
+    let qh = seat_queue.handle();
+    let _registry = conn.display().get_registry(&qh, ());
+    let mut probe = SeatProbe { seat: None };
+    seat_queue
+        .roundtrip(&mut probe)
+        .map_err(|e| anyhow!("seat probe roundtrip failed: {}", e))?;
+    probe.seat.ok_or_else(|| {
+        anyhow!("Wayland connection didn't expose wl_seat — is this a regular compositor socket?")
+    })
 }
 
-impl Dispatch<WlSeat, ()> for SeatProbe {
-    fn event(
-        _: &mut Self,
-        _: &WlSeat,
-        _: <WlSeat as Proxy>::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-
-/// Try to construct a real Wayland backend. Returns `Ok(None)` (rather
-/// than `Err`) when the prerequisites simply aren't met (X11 session,
-/// missing protocols, etc) — the caller falls back to xdotool/noop.
-/// Returns `Err` for genuine setup failures.
+/// Entry point for callers with no GDK/GTK display in the process at
+/// all — an eframe/winit build, for instance. Skips the GDK-display
+/// gate `try_new` starts with and always uses
+/// [`open_standalone_connection`]; everything past connection setup
+/// (registry walk, v1/v2 detection, virtual-keyboard + input-method
+/// object creation, the GLib dispatcher) is identical, via
+/// [`finish_setup`].
 ///
-/// ## Connection strategy
-///
-/// We try two paths depending on what the host compositor does:
-///
-/// 1. **KWin/Weston input-method**: a privileged Wayland fd is inherited
-///    via `WAYLAND_SOCKET=<fd>` (which `main.rs` captured into
-///    `compositor::im_socket`). We open a SECOND wayland-client
-///    connection on that fd. The privileged socket exposes
-///    `zwp_input_method_v2` and `zwp_virtual_keyboard_v1` (which the
-///    public socket doesn't). GDK keeps its own connection on the public
-///    socket for rendering / layer-shell — they don't conflict.
-///
-/// 2. **wlroots-style (Sway/Phosh/river)**: there's no separate
-///    privileged socket; input-method and virtual-keyboard are exposed
-///    on the same public socket GDK is using. We share GDK's connection
-///    by reaching it through `WaylandSeat::backend()`.
-///
-/// In both cases the resulting `EventQueue<AppData>` is what we use to
-/// dispatch protocol events; the only difference is whether it lives on
-/// our own connection (case 1) or GDK's (case 2).
-pub fn try_new(
+/// Still requires a running GLib main context to actually pump events —
+/// see [`install_glib_dispatcher`]'s doc. A winit/eframe app has none by
+/// default; the caller needs to drive one itself (e.g.
+/// `glib::MainContext::default().iteration(false)` once per frame) or
+/// this backend will silently never see an Activate/Deactivate event.
+pub fn try_new_standalone(
     im_callback: InputMethodActiveCallback,
     surrounding_text_callback: SurroundingTextCallback,
 ) -> Result<Option<WaylandBackend>> {
-    use gdk4_wayland::prelude::*;
+    let (conn, wl_seat) = open_standalone_connection()?;
+    finish_setup(conn, wl_seat, im_callback, surrounding_text_callback)
+}
 
-    // 1. Find a GDK Wayland display. On X11 this returns None.
-    let gdk_display = match gtk4::gdk::Display::default() {
-        Some(d) => d,
-        None => return Ok(None),
-    };
-    if gdk_display
-        .clone()
-        .downcast::<gdk4_wayland::WaylandDisplay>()
-        .is_err()
-    {
-        debug!("GDK display is not a WaylandDisplay (probably X11)");
-        return Ok(None);
-    }
-
-    // Decide which connection strategy to use based on whether main.rs
-    // captured an inherited input-method fd.
-    let inherited_fd = crate::compositor::im_socket::take_inherited_fd();
-
-    let (conn, wl_seat) = if let Some(fd) = inherited_fd {
-        info!(
-            "Wayland backend: using inherited input-method fd {} as a \
-             separate Wayland connection (the privileged socket KWin \
-             passed us). GDK keeps its public-socket connection for \
-             rendering & layer-shell.",
-            fd
-        );
-        open_inherited_connection(fd)?
-    } else {
-        info!(
-            "Wayland backend: no WAYLAND_SOCKET inherited; sharing GDK's \
-             connection (wlroots-style — input-method protocols on the \
-             public socket)."
-        );
-        share_gdk_connection(&gdk_display)?
-    };
-
+/// Steps shared by every connection strategy once we have a `Connection`
+/// + `WlSeat` in hand: build a queue, walk the registry for the
+/// input-method/virtual-keyboard globals, detect v1 vs v2, create the
+/// protocol objects, and install the GLib-driven dispatcher.
+fn finish_setup(
+    conn: Connection,
+    wl_seat: WlSeat,
+    im_callback: InputMethodActiveCallback,
+    surrounding_text_callback: SurroundingTextCallback,
+) -> Result<Option<WaylandBackend>> {
     // 2. Build a fresh event queue on whichever connection we got. This
     //    queue is independent of GDK's; events for our protocol objects
     //    get routed here, GDK's events stay with GDK.
@@ -418,6 +367,123 @@ pub fn try_new(
     install_glib_dispatcher(conn, inner.clone());
 
     Ok(Some(WaylandBackend { inner }))
+}
+
+/// Registry probe used by both `open_inherited_connection` and
+/// `open_standalone_connection` to find a `wl_seat` — throwaway queue,
+/// dropped once the roundtrip completes.
+struct SeatProbe {
+    seat: Option<WlSeat>,
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for SeatProbe {
+    fn event(
+        state: &mut Self,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
+            if interface == "wl_seat" && state.seat.is_none() {
+                let v = version.min(7);
+                let s: WlSeat = registry.bind(name, v, qh, ());
+                state.seat = Some(s);
+            }
+        }
+    }
+}
+
+impl Dispatch<WlSeat, ()> for SeatProbe {
+    fn event(
+        _: &mut Self,
+        _: &WlSeat,
+        _: <WlSeat as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+/// Try to construct a real Wayland backend. Returns `Ok(None)` (rather
+/// than `Err`) when the prerequisites simply aren't met (X11 session,
+/// missing protocols, etc) — the caller falls back to xdotool/noop.
+/// Returns `Err` for genuine setup failures.
+///
+/// ## Connection strategy
+///
+/// We try two paths depending on what the host compositor does:
+///
+/// 1. **KWin/Weston input-method**: a privileged Wayland fd is inherited
+///    via `WAYLAND_SOCKET=<fd>` (which `main.rs` captured into
+///    `compositor::im_socket`). We open a SECOND wayland-client
+///    connection on that fd. The privileged socket exposes
+///    `zwp_input_method_v2` and `zwp_virtual_keyboard_v1` (which the
+///    public socket doesn't). GDK keeps its own connection on the public
+///    socket for rendering / layer-shell — they don't conflict.
+///
+/// 2. **wlroots-style (Sway/Phosh/river)**: there's no separate
+///    privileged socket; input-method and virtual-keyboard are exposed
+///    on the same public socket GDK is using. We share GDK's connection
+///    by reaching it through `WaylandSeat::backend()`.
+///
+/// In both cases the resulting `EventQueue<AppData>` is what we use to
+/// dispatch protocol events; the only difference is whether it lives on
+/// our own connection (case 1) or GDK's (case 2).
+///
+/// GTK-app entry point — needs a live GDK display, hence
+/// `gdk-integration`. GTK-free consumers want [`try_new_standalone`].
+#[cfg(feature = "gdk-integration")]
+pub fn try_new(
+    im_callback: InputMethodActiveCallback,
+    surrounding_text_callback: SurroundingTextCallback,
+) -> Result<Option<WaylandBackend>> {
+    use gdk4_wayland::prelude::*;
+
+    // 1. Find a GDK Wayland display. On X11 this returns None.
+    let gdk_display = match gtk4::gdk::Display::default() {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    if gdk_display
+        .clone()
+        .downcast::<gdk4_wayland::WaylandDisplay>()
+        .is_err()
+    {
+        debug!("GDK display is not a WaylandDisplay (probably X11)");
+        return Ok(None);
+    }
+
+    // Decide which connection strategy to use based on whether main.rs
+    // captured an inherited input-method fd.
+    let inherited_fd = crate::im_socket::take_inherited_fd();
+
+    let (conn, wl_seat) = if let Some(fd) = inherited_fd {
+        info!(
+            "Wayland backend: using inherited input-method fd {} as a \
+             separate Wayland connection (the privileged socket KWin \
+             passed us). GDK keeps its public-socket connection for \
+             rendering & layer-shell.",
+            fd
+        );
+        open_inherited_connection(fd)?
+    } else {
+        info!(
+            "Wayland backend: no WAYLAND_SOCKET inherited; sharing GDK's \
+             connection (wlroots-style — input-method protocols on the \
+             public socket)."
+        );
+        share_gdk_connection(&gdk_display)?
+    };
+
+    finish_setup(conn, wl_seat, im_callback, surrounding_text_callback)
 }
 
 impl WaylandBackend {
@@ -812,7 +878,7 @@ impl Dispatch<ZwpInputMethodV2, ()> for AppData {
                     WEnum::Unknown(raw) => raw,
                 };
                 debug!("v2 ContentType: purpose={}", raw);
-                crate::ui::window::set_content_purpose(raw.min(255) as u8);
+                crate::content_purpose::set_content_purpose(raw.min(255) as u8);
             }
             // TextChangeCause: not yet wired.
             _ => {}
@@ -937,7 +1003,7 @@ impl Dispatch<ZwpInputMethodContextV1, ()> for AppData {
                 // WEnum<ContentPurpose>; the type asymmetry between
                 // the two paths is intentional in wayland-protocols.
                 debug!("ContentType: purpose={}", purpose);
-                crate::ui::window::set_content_purpose(purpose.min(255) as u8);
+                crate::content_purpose::set_content_purpose(purpose.min(255) as u8);
             }
             zwp_input_method_context_v1::Event::Reset
             | zwp_input_method_context_v1::Event::InvokeAction { .. }

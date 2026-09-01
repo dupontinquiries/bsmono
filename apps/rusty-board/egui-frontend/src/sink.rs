@@ -120,19 +120,22 @@ pub fn detect() -> Box<dyn Sink> {
 }
 
 /// The real sink, on a Wayland session with an input-method protocol.
+///
+/// Delegates entirely to [`crate::wayland::WaylandIntegration`], which
+/// also owns show/hide (see that module) — a bare
+/// `VirtualKeyboardBackend::detect().build()` deliberately returns an
+/// EMPTY Wayland backend with no input-method callback wired (see that
+/// function's own doc comment in `virtual_keyboard.rs`); getting the
+/// real one requires going through `wayland_backend::try_new_standalone`
+/// directly, which is what `WaylandIntegration::try_new` does.
 #[cfg(feature = "wayland")]
 pub fn system() -> Result<Box<dyn Sink>, String> {
-    let vk = rusty_board::compositor::virtual_keyboard::Detected::detect().build();
-    Ok(Box::new(SystemSink { vk }))
+    let integration = crate::wayland::WaylandIntegration::try_new()?;
+    Ok(Box::new(integration))
 }
 
 #[cfg(feature = "wayland")]
-struct SystemSink {
-    vk: Box<dyn rusty_board::compositor::virtual_keyboard::VirtualKeyboard>,
-}
-
-#[cfg(feature = "wayland")]
-impl Sink for SystemSink {
+impl Sink for crate::wayland::WaylandIntegration {
     fn commit_text(&mut self, text: &str) -> Result<(), String> {
         self.vk.commit_text(text).map_err(|e| e.to_string())
     }

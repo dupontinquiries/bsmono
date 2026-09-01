@@ -187,26 +187,14 @@ pub fn reset_surrounding_text_seen() {
 /// Latest content_purpose reported by the host's input-method
 /// protocol. Values match `zwp_input_method_v1::ContentPurpose`:
 ///   0 = Normal, 1 = Alpha, 2 = Digits, 3 = Number, 4 = Phone,
-///   5 = URL, 6 = Email, 7 = Name, 8 = Password, 9 = Date,
-///   10 = Time, 11 = DateTime, 12 = Terminal.
-/// Written by the wayland backend on ContentType events. Read by
-/// the focus-show logic so e.g. a terminal gets the full keyboard
-/// even when focus-tray mode is on (users typing commands need keys,
-/// not an arrow pad). 255 = "unknown / not reported yet".
-static CONTENT_PURPOSE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(255);
-
-/// Wayland's ContentPurpose::Terminal constant. Hoisted here so call
-/// sites don't depend on the wayland module being compiled in.
-pub const CONTENT_PURPOSE_TERMINAL: u8 = 12;
-
-pub fn set_content_purpose(purpose: u8) {
-    CONTENT_PURPOSE.store(purpose, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn content_purpose() -> u8 {
-    CONTENT_PURPOSE.load(std::sync::atomic::Ordering::Relaxed)
-}
+/// The focused field's content purpose — moved to
+/// `board_compositor::content_purpose` (it's compositor-sourced data,
+/// written by `wayland_backend`'s dispatch handlers on both protocol
+/// paths). Re-exported here so existing call sites in this module and
+/// its tests are unaffected by the move.
+pub use board_compositor::content_purpose::{
+    content_purpose, set_content_purpose, CONTENT_PURPOSE_TERMINAL,
+};
 
 /// Whether the currently-focused field should override focus-tray
 /// mode and show the full keyboard regardless.

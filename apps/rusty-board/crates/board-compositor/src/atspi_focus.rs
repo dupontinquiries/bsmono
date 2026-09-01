@@ -70,7 +70,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 
-use crate::compositor::wayland_backend::InputMethodActiveCallback;
+use crate::wayland_backend::InputMethodActiveCallback;
 
 /// How long to wait after an apparent focus-loss before actually
 /// hiding, in case focus lands on another editable field immediately
