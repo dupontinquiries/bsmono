@@ -17,6 +17,9 @@ gpu = ["wgpu", "pollster"]
 # prefer reaching primitives via this crate's re-exports.
 fao-codec-core = { path = "../fao_codec_core" }
 zstd = "0.13"
+# blake3 for provenance digests. Already in the monorepo (gitmind,
+# drivemind integrity manifests), so no new third-party surface.
+blake3 = "1"
 # rustfft for phase_correlation module (camera motion estimation, used by v8 + v10).
 # Pure Rust, no system deps, ~150KB compiled.
 rustfft = "6.2"

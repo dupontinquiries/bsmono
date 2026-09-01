@@ -63,7 +63,7 @@ use crate::transform::{dct2d_4x4, idct2d_4x4, quantize_4x4, dequantize_4x4, Quan
 /// 
 /// `from_env()` constructs an instance from environment variables for 
 /// backward compatibility with the existing toggles.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ResidualOpts {
     /// Skip-block RLE for blocks where all coefficients fit within 
     /// the threshold of zero. Big win on flat regions.
@@ -96,6 +96,12 @@ pub struct ResidualOpts {
     /// frequencies (where grain lives) are culled hardest. Encoder-only;
     /// no wire or decoder change.
     pub dead_zone: f32,
+    /// Per-4x4-block MULTIPLIER on `dead_zone`, row-major over (w/4, h/4).
+    /// Encoder-only like the dead zone itself — the decoder reads the
+    /// quantized coefficients and never needs to know how the floor was
+    /// chosen — so spatially varying rate allocation costs nothing on
+    /// the wire and needs no format change.
+    pub dz_map: Option<std::sync::Arc<Vec<f32>>>,
 }
 
 impl Default for ResidualOpts {
@@ -107,6 +113,7 @@ impl Default for ResidualOpts {
             saliency_boost: 0,
             skip_threshold: 1,
             dead_zone: 0.0,
+            dz_map: None,
         }
     }
 }
@@ -207,8 +214,14 @@ pub fn encode(
                 // frequency-shaped floor so the per-block scale is chosen
                 // from surviving signal, not from grain.
                 if opts.dead_zone > 0.0 {
+                    let local = opts
+                        .dz_map
+                        .as_ref()
+                        .and_then(|m| m.get(by * rw + bx).copied())
+                        .unwrap_or(1.0);
                     for (k, c) in buf.iter_mut().enumerate() {
                         let zone = opts.dead_zone
+                            * local
                             * crate::transform::QUANT_MATRIX_4X4[k] as f32;
                         if c.abs() < zone {
                             *c = 0.0;

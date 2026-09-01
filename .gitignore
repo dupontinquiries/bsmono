@@ -25,3 +25,14 @@ __pycache__/
 node_modules/
 *-linux-x64
 *-linux-aarch64
+
+# Test footage stays OUT of the repo. Codec work needs hundreds of MB of
+# video and git would carry every byte forever against a 500MB budget;
+# the corpus lives outside the tree and is re-supplied per session.
+# Measurements are committed as CSVs in apps/fao-codec/docs/, which is
+# what actually needs to be reproducible.
+*.mkv
+*.mp4
+*.webm
+*.y4m
+*.ivf

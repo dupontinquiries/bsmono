@@ -3804,3 +3804,2263 @@ perceptual (screen content repeats EXACTLY, and the SAD-margin test
 would then be pass/fail rather than approximate), and ideally an
 engine-rendered source with no capture noise. Probe kept behind
 --dictprobe for that experiment.
+
+## Session 2026-08-31: predictor seam, the 3D bytes bridge, mover layer
+
+### encode_gop_v3_core — the predictor-provider seam (byte-exact refactor)
+
+The v3 loop's ONLY dependency on the plate was one predict_frame call,
+so the mode decision / gain / side-info / DCT-residual machinery is now
+encode_gop_v3_core(frames, pred_for: FnMut(usize)->Yuv420, model_bytes,
+motion_bytes, opts, force). The seam isolates the one thing that
+actually varies across branches: the world model. Providers today: 2D
+warped plate (default path), 3D canonical render (--render3d), mover-
+composited plate (below). Verified byte-exact post-refactor: w1 store
+GOP (48f @ 19.102s, crop 1920:800:0:140, dz32 static) identical byte
+split (71804/384/281168/134026 = 487,382 @ 38.311 dB) and recon y4m
+byte-identical. Suite 84/0. Harness note: this session's shot cuts
+reproduce the historical suite EXACTLY (shot 4 → 893,852 @ 34.930969,
+bit-equal to full_v11_dz32_platedct_dz8.csv), so crop=1920:800:0:140
++ CSV start/frames is the canonical recipe.
+
+### --render3d: the 3D path produces BYTES for the first time
+
+The named missing construction (residual vs canonical render) exists:
+--triangulate --affine --dense --render3d renders the dense mesh at
+each frame's pose through v8's CPU rasterizer, converts full-range
+BT.601, holes -> neutral gray (mode decision routes them to prev/intra
+exactly like plate misses), and feeds encode_gop_v3_core. Accounting
+mirrors the plate: mesh serialized (verts f32x3 + colors u8x3 + idx
+u32x3, zstd-19) amortized, 12 B/frame pose, cited marginal at 24 B.
+
+Measured, dz32, vs the 2D plate on the SAME core:
+  w1 (near-locked store, 48f):
+    2D plate: 487,382 @ 38.31 dB (plate 71.8 KB; cited-marg 415.6 KB)
+    3D mesh:  656,704 @ 36.91 dB (mesh 230.1 KB; cited-marg 426.6 KB)
+  -> On the plate's home turf the render nearly TIES at cited marginal
+     (+2.6% bytes) at -1.4 dB; amortized it loses 35%. Consistent with
+     the recorded prediction that a locked-shot 3D recon reprojects to
+     what a 2D plate already gives, minus geometry risk.
+  shot 4 (strong pan, 35f):
+    2D plate: 893,852 @ 34.93 dB
+    3D mesh:  704,177 @ 33.91 dB — but triangulation COLLAPSED
+    (2 of 197 tracks, depth coverage 0.09): the "mesh" is a card, the
+    byte win is just skipping the 212 KB pan plate, and prev-MC carries
+    both branches (mode+mv+residual near-identical across branches).
+Honest verdict: the bridge stands and the accounting is real; the 3D
+path's blockers are now MEASURABLE and named — (1) triangulation
+robustness on pans (2/197 needs a root-cause), (2) cross-take pose
+alignment incl. monocular scale so a matched library canonical can be
+rendered for a DIFFERENT take (today's cited-marginal is same-take).
+
+### v11.5 mover layer: built, measured, and it WINS on real footage
+
+Movers as objects with their own motion, composited per frame — the
+construction the static mover-patch MVP approximated. detect_movers
+finds connected components of plate-deviant regions on the max-
+deviation frame; each becomes a sprite with a CELL MASK (the object's
+cells, not its bbox — the first version tracked whole rectangles and
+the enclosed background dragged the tracker onto the set, which is why
+the unit test failed before the mask existed); the sprite is coded
+once, tracked per frame by masked coarse-to-fine SAD, and pasted into
+the plate prediction. The composite is just another provider over
+encode_gop_v3_core. J-guarded against plain v3 (lambda = dz^2/3), so
+it can only cost encode time.
+
+Measured, store shot w1 (48f, dz32, --static):
+  v3 plain:        487,382 B @ 38.311 dB
+  v5 movers thr16: 523,737 B @ 38.837 dB   (32 movers, guard picked V5)
+  v5 movers thr24: 506,015 B @ 38.679 dB   (19 movers)
+  v5 thr16 dz40:   465,429 B @ 38.423 dB   <- BEATS v3 on BOTH axes
+    (-4.5% bytes AND +0.11 dB against v3 at dz32)
+Marginal per frame falls 8,657 -> 8,152 (thr16 dz32): the sprite is
+paid once and the regions it covers stop buying prev-MC vectors and
+residual every frame. That is the amortization mechanism working as
+designed, and dz40 shows it converts into a real hull win.
+
+Busy shot 6 (38f, dz32): v3 1,402,529 @ 32.790 vs v5 1,551,819 @
+33.121 (8 movers, sprites 205 KB) — +10.6% bytes for +0.33 dB; the
+guard takes it on J but this is the regime where sprites are large and
+non-rigid. Cited path (w2 citing w1's canonical): cited-plain 577,993
+@ 34.693, cited+movers 628,747 @ 36.944 — +8.8% bytes for +2.25 dB,
+and it closes most of the citation quality gap to self-coding
+(652,150 @ 36.443) while beating it on bytes by 3.6%. Accounting note:
+citation covers the PLATE only; mover sprites are the take's own
+staged content and travel with the take even behind a 24-byte plate
+reference (plate_lab charges them that way).
+
+### Sprite set coding: the botpack-v4 transfer, measured — and it does NOT pay on film
+
+User pointed at games/blackstar-rs/src/botpack.rs: its v4 keeps v3's
+identical quantised codes and only replaces per-pose zlib with ONE
+strip-wide zstd frame, measured at 49% of v3 with byte-identical
+decode, because a 32 KB per-item window cannot see between items while
+a set-wide window can. v11.5's sprites looked like the same situation:
+N cutouts coded with N independent residual::encode calls, each zstd'ing
+internally. Ported both of the parts-web/FLEET_COMPRESSION techniques —
+exact content dedup, then a column atlas coded in ONE pass, best-of
+against per-sprite so it cannot lose.
+
+Measured on w1's 32 sprites:
+  content dedup:            0 of 32 folded
+  raw-zstd, per-sprite sum: 138,120 B
+  raw-zstd, solid atlas:    139,810 B   <- solid is 1.2% WORSE
+  DCT/dead-zone per-sprite:  60,901 B
+  DCT/dead-zone solid atlas:  60,209 B   <- 1.1% better; chosen
+VERDICT: the botpack win does not transfer to film sprites, and
+FLEET_COMPRESSION.md already predicted the shape — it measured dedup
+at 107/1000 on catalog parts but 0/1289 on fold poses, and "no gain
+over per-file" for a shared dictionary on dense float data. botpack's
+gain came from VERBATIM cross-pose repetition (whole index streams
+repeating); film cutouts of different actors carry independent grain
+and repeat nothing exactly. What DOES pay here is the same thing
+FLEET_COMPRESSION found paid there: quantisation — 138 KB -> 60 KB
+(56%) via the DCT dead-zone path. Atlas kept because it is guarded and
+free, and because the precondition it needs (exact repetition) is
+precisely what ENGINE-RENDERED content has: it is the natural
+mechanism for the SMITE/engine regime, where it should be re-measured
+before being judged. Known flaw recorded at the site: the column atlas
+pads every sprite to the max width, which inflates the raw-zstd branch;
+shelf-packing would remove that if the atlas ever matters.
+
+Process note: a suite launched with nohup did NOT survive the turn
+boundary in this sandbox (empty log, no process, header-only CSV).
+Long benchmarks must run in bounded foreground chunks.
+
+### mesh_pack: keeping the 3D world model from eating the file
+
+User's concern, and it was already the sharpest number in the bridge:
+the w1 canonical serialized to 230 KB against a 71.8 KB 2D plate, for
+WORSE prediction. Asset size — not render quality — is the 3D path's
+binding constraint, because every model byte moves the break-even take
+count that the whole amortization thesis rests on.
+
+New module fao_codec_lib/src/mesh_pack.rs: a headless mesh codec
+(bytes in, bytes out, no renderer). One AABB for the WHOLE mesh,
+quantised plane-split positions, plane-split colours, zigzag-varint
+delta indices, one zstd-19 pass. encode() returns the wire bytes AND
+the decoder's mesh; --render3d now renders from the DECODED mesh, so
+prediction quality pays for the quantisation honestly.
+
+This is the OTHER half of the blackstar lesson, and this time it
+transfers. FLEET_COMPRESSION.md measured all three parts-web
+techniques on dense float32 vertex buffers: dedup 0/1289, shared
+dictionary no gain, and 16-bit quantisation the whole win (936 MB ->
+~205 MB at 0.0008% error). The sprite atlas borrowed the solid-window
+half and failed; canonical meshes are literally the data shape those
+numbers came from, so the quantisation half was the right borrow.
+FLEET_COMPRESSION's correctness caveat carried over too and is stated
+at the site: ONE box per mesh, never per-part — per-part boxes map
+identical world positions to different integers and warp anything
+that interpolates between them (there: the fold; here: cross-anchor
+vertex fusion and any future canonical-to-canonical lineage delta).
+
+Measured on w1's dense canonical (15,127 verts / 29,030 tris), dz32,
+naive baseline = the f32+u8+u32 form the first bridge shipped:
+
+  bits  mesh B   of naive  max vert err (of diag)  total B   PSNR
+  naive 229,974   100%     0                       656,704   36.910
+  16    103,060    45%     0.027  (7.5e-6)         531,803   36.977
+  12     81,751    36%     0.435  (1.2e-4)         513,023   36.870
+  10     67,040    29%     1.754  (4.8e-4)         492,388   37.083
+   8     49,364    21%     6.977  (1.9e-3)         482,383   36.709
+  10, no vertex colours:
+        40,198    17%     1.754  (4.8e-4)         470,458   36.226
+
+Reading, in order of what matters:
+1. Lossless-ish repacking alone (16 bits, 7.5e-6 of the diagonal) cuts
+   the asset 55% and the total 19%. That is free — the naive form was
+   simply wasteful.
+2. The knee is 10 BITS, not 16: 29% of naive, and PSNR is 0.11 dB
+   BETTER than at 16 bits. Quantisation to a ~0.5 mm-equivalent grid
+   is acting as a mild regulariser on triangulation noise; the depth
+   estimates carry far more error than 10-bit position quantisation
+   adds, so spending 16 bits encodes noise precisely. Sub-8-bit is
+   past the knee (bytes still fall, quality turns).
+3. Vertex colours are 40% of the packed asset at 10 bits and buy
+   0.86 dB — the best exchange rate in the table, so KEEP them; the
+   switch exists for engine canonicals that a per-take texture
+   re-colours anyway.
+4. Against the 2D plate the gap is now 67 KB vs 71.8 KB — the 3D
+   canonical is CHEAPER THAN THE PLATE for the first time, at
+   -1.2 dB. That is the number that makes the 3D branch worth
+   continuing: the model no longer explodes the asset budget, so the
+   remaining work is prediction quality (pan triangulation, cross-take
+   pose alignment), not size.
+
+Suite chunk this session, v5 movers at dz40 vs recorded v3 at dz32
+(14 of 19 shots, docs/full_v5_dz40.csv): wins on 8 shots (shot 2
+-16.9%, shot 7 -12.9%, shot 6 -6.9%, shot 10 -6.5%, shot 8 -6.3%,
+shot 15 -5.1%, shot 3 -4.5%, shot 18 -3.4%) at -0.2..-0.4 dB, loses
+on 3 (shot 11 +16.3%, shot 4 +5.4%, shot 13 +0.6%), and shots 1/5/17
+reproduce v3 byte-exact (1749/297/965 — harness re-validated).
+Shots 9, 12, 16, 19 (the four largest, motion-dominated) NOT yet run,
+so there is no aggregate-vs-AV1 number for v5 yet.
+
+### Full 19-shot suite: v11.5 (movers, dz40) vs v11.3 (dz32) vs AV1
+
+All 19 shots, same harness as the historical tables (crop
+1920:800:0:140, CSV start/frames), frame-weighted MSE aggregation.
+docs/full_v5_dz40.csv.
+
+  v11.3 dz32 (recorded):  20.915 MB @ 33.58 dB
+  v11.5 dz40 (movers):    18.356 MB @ 33.195 dB   -12.2% bytes, -0.39 dB
+  AV1-150k anchor:         0.989 MB @ 33.33 dB
+
+Per shot: 12 wins, 4 losses, 3 exact ties. The ties are shots 1/5/17
+reproducing v3 byte-for-byte (1749 / 297 / 965), which re-validates
+the harness against the historical CSV every run. Biggest wins are
+the LARGE motion shots the clip total is made of — shot 16 -21.9%
+(3.35 -> 2.62 MB), shot 9 -18.9%, shot 12 -17.7%, shot 2 -16.9%,
+shot 19 -15.6%, shot 7 -12.9%. Losses: shot 11 +16.3% (10 frames —
+sprite cost can't amortize over a 10-frame GOP), shot 4 +5.4%, shot 13
++0.6%, shot 14 +0.1%.
+
+Against AV1 the honest statement is a HULL POINT, not a win: v11.5
+sits at 18.6x AV1's size at -0.13 dB, where v11.3 sat at 21.2x at
++0.25 dB. The curve moved (12% fewer bytes for 0.38 dB is a better
+exchange rate than the codec's own dz ladder gives), and the bimodal
+verdict is unchanged — the frozen/locked shots still beat AV1
+outright, the motion shots still lose by an order of magnitude.
+
+Two structural notes the per-shot column makes visible:
+1. Mover count does NOT predict the win. Shot 16 wins 21.9% with TWO
+   movers; shot 13 loses with twenty-two. What predicts it is GOP
+   length x sprite reuse: a sprite is paid once, so the win scales
+   with how many frames pay nothing for the regions it covers. Shot 11
+   (10 frames) is the clean counter-example, and it argues for a
+   length-aware detection threshold rather than a fixed thr.
+2. The J-guard picked V3 on 5 shots (1, 5, 7, 9, 17) — so those rows
+   are v3-at-dz40, and the suite's aggregate is a mixture of two
+   coders. That is the routing law working, but it means "v11.5's
+   number" is really "the router's number", which is the honest way to
+   quote it.
+
+### Pan-triangulation collapse root-caused: it is the MATERIAL, not the pipeline
+
+The 3D bridge's named blocker was "shot 4 keeps 2 of 197 tracks".
+Three diagnostics, each added because the previous one's answer was
+compatible with several causes:
+
+1. REJECTION CENSUS (FAO_TRI_DEBUG, in TriangulatePass::triangulate_all).
+   "2 of 197" says nothing about which gate fired.
+     shot 4: 191/197 die on REPROJECTION, median 48.5px vs a 4px gate;
+             behind-camera 4, no-baseline-pair 0, ray-degenerate 0.
+     w1:     330/460 on reprojection, median 14.6px.
+   Median error an order of magnitude past the threshold: not tuning.
+
+2. POSE-VS-TRACKS DESYNC. The pose track accumulates GLOBAL phase
+   correlation; the observations triangulation consumes come from the
+   feature tracker. Measured drift over the GOP:
+     shot 4: pose 126.0px vs tracks -50.6px -> worst |sum| 98.7px
+     w1:     pose -42.0px vs tracks  50.4px -> worst |sum|  8.6px
+   Phase correlation overstated shot 4's camera motion 2.5x, and shot 4
+   carries 21 detected movers — the SAME failure canonical fusion
+   already fixed one level up (raw phase-corr latches onto a large
+   moving foreground; a median votes with the background). That fix was
+   never applied to the pose track.
+   FIX BUILT: --pose-from-tracks rebuilds the pose from the median
+   displacement of static tracks (two-pass, because the consensus
+   classifier needs a motion estimate to label Static in the first
+   place; frames with <6 correspondences HOLD rather than fall back to
+   the estimator under suspicion).
+   Measured: w1 81 -> 98 points (+21%), median reproj 14.6 -> 11.0;
+   shot 4 2 -> 3, median reproj 48.5 -> 38.5; SMITE 27 -> 31, median
+   reproj 19.9 -> 16.8, mean reproj 2.17 -> 1.80px. Real, well-founded,
+   and NOT the cause.
+
+3. CORRESPONDENCE QUALITY — the clincher, and it inverted the working
+   hypothesis. A 10.7px pairwise affine RMS against 4.7px of per-pair
+   motion looked like broken tracking. It is not:
+     shot 4: 88% of correspondences within 2px of the pair affine
+     w1:     88%
+     SMITE:  66%
+   The tracks are fine; the RMS is a least-squares fit dragged by the
+   12% tail. But 88%-within-2px means A SINGLE GLOBAL AFFINE EXPLAINS
+   THE FRAME — which is the definition of no parallax. Triangulation is
+   trying to recover a depth signal that the residual (<2px, at the
+   noise floor) does not contain. That is why reprojection lands at
+   48px: with rays this close to parallel, the midpoint is arbitrary.
+
+VERDICT: on this clip the 3D branch is not blocked by tuning, pose, or
+tracking — the MATERIAL carries no usable parallax at GOP scale, so a
+2D plate is the correct model and 3D cannot beat it here by
+construction. This is the earlier prediction ("on a locked-off or
+panning shot a full 3D reconstruction reprojects to exactly what a 2D
+plate gives") confirmed from the measurement side, and it retires
+"fix pan triangulation" as a roadmap item on THIS footage.
+SMITE's 66% inlier rate is the contrast that makes the point: a third
+of its correspondences are genuinely non-affine, and it triangulates
+10x better per candidate than shot 4 (31/250 vs 3/197) despite worse
+tracking. Parallax-bearing material is the precondition for evaluating
+the 3D path at all — the honest next step is a camera-orbit or
+engine-rendered source, not more work on the bloopers.
+
+### Per-mover RD admission: built, measured, and DEFAULTED OFF
+
+The suite said mover COUNT does not predict the win (shot 16 wins
+21.9% with 2 movers, shot 13 loses with 22), so the fixed detection
+threshold is the wrong control and the global J-guard is all-or-
+nothing: one sprite that pays for itself drags in twenty that don't.
+Built a per-candidate admission test on the same J the guard uses,
+scoped to one object — admit iff the SSE its paste removes over the
+frames it is visible exceeds lambda x (its coded bytes + 2 B/frame
+track + mask + bbox), cost taken from the per-sprite independent size
+(an upper bound on marginal cost inside the atlas).
+
+Two corrections during the build, the second fatal to the default:
+
+1. Scoring gain against the PLATE alone overstates it — the mode
+   decision already picks the best of plate and prev-MC, so a mover
+   the previous frame carries is nearly free and the sprite's gain is
+   redundant. Rescored against min(plate, prev-at-zero-MV). This is
+   what turned shots 4 and 13 from byte-losses into byte-wins.
+
+2. THE MEASUREMENT I ALMOST MIS-READ. On bytes, admission looked like
+   a clear win: 19-shot total 18.356 -> 17.501 MB, 14 wins / 2 losses
+   / 3 byte-exact ties, shot 3 -19.1%, shot 16 -20.8%. In J it is
+   3.84% WORSE, and worse on 10 of the 11 shots it changed (shot 13
+   +15.2%, shot 19 +14.6%). It bought 0.855 MB with 0.23 dB — an
+   exchange rate far below what the codec's own dead-zone ladder gives
+   (~19.6 MB/dB measured). Bytes alone is not a verdict.
+
+Mechanism of the failure, and it biases one way: a true J gain is
+(SSE removed) + lambda x (BYTES saved), and the test counts only the
+SSE term. A better predictor also shrinks the residual on every
+visible frame and lets its cells choose plate-mode over prev-mode
+(~2 MV bytes each) — both strictly positive, both omitted. The test
+therefore systematically OVER-REJECTS, exactly as measured. Even
+strictness 0 (admit anything with positive gain) is not neutral,
+because it still rejects movers prev already predicts: shot 13 at
+k=0 is 862,935 B @ 34.340 against the unfiltered 966,384 @ 35.535.
+
+DEFAULT: admission OFF (admit all). The gain measurement, the
+per-mover machinery and the FAO_MOVER_ADMIT knob stay, because the
+omitted term is small exactly where prev-MC is strong (film) and
+large where it is not (engine content, hard cuts between reused
+assets) — a negative ON THIS MATERIAL, not a dead construction.
+Estimating the omitted term needs a rate model the lab does not have;
+the alternative is guarding admission with a second full encode,
+which doubles encode time for a decision worth ~4%.
+
+Side effect kept: tracking now runs on per-sprite decodes BEFORE
+packing, which slightly improved shot 13 (963,979 @ 35.267 ->
+966,384 @ 35.535, +0.27 dB for +0.25% bytes).
+
+Suite CSVs: docs/full_v5_dz40.csv (no admission, the default) and
+docs/full_v5_admission_dz40.csv (admission on, the negative).
+
+### Scene protocol + resolver: narrative editing on the mover layer
+
+User's question: transcode to .fao, open a chatbox, "make the fight
+turn out differently", have a model emit structured data, resolve it
+back to video. The mover layer turns out to be exactly the substrate —
+each object is ALREADY a sprite sent once plus a 2 B/frame position
+track, so a narrative edit is a data edit, not pixel synthesis.
+
+Built the PROTOCOL half, deliberately separate from any transport:
+scene_to_json emits the object graph (id, bbox, ref_frame, cells,
+visible_frames, hole_risk, track); apply_scene_json reads a possibly-
+edited graph back. An LLM is one producer of that JSON and a person
+with a text editor is another — the tests use the second, because a
+protocol only exercisable through a model makes protocol bugs and model
+bugs indistinguishable. Parsing is strict and names the offending
+mover: wrong track length, out-of-range id and omitted movers all
+refuse rather than half-apply.
+
+THE FINDING THAT MATTERS, and it would have sunk a naive design:
+editing the PREDICTOR changes nothing. The residual is coded against
+the source, so it faithfully corrects any altered prediction back
+toward the original video — the first end-to-end edit came back at
+108 dB against the unedited encode, a perfect no-op. The codec undid
+the edit. An editor has to change the TARGET.
+
+retarget_frames does that, per frame and per changed mover: paint the
+plate over the object's ORIGINAL footprint (disocclusion), then paste
+its sprite at the new position, leaving every other pixel as real
+source so unedited regions keep their fidelity. Re-measured on w1:
+48.0 dB against the unedited encode — the picture genuinely changed —
+at 469,704 B against 465,706, so THE EDIT COST 0.9% OF THE FILE. That
+is the property that makes this worth building: the sprite is already
+on the wire, so re-staging it costs a track and a local residual.
+
+Disocclusion is the real limiter and is now measured rather than
+discovered at render time. mover_hole_risk reports the fraction of
+frames an object FAILS to vacate its own footprint; the plate's median
+only holds clean background where the object did vacate. On w1, 13 of
+32 movers exceed 50% risk (several at 100% — they never move), and
+--scene-export names them so an editor can refuse instead of smear.
+The edit above deliberately targeted a 0.10-risk object.
+
+Honest limits, all structural to this representation and none fixable
+by a better model: shadows and contact lighting are baked into the
+sprite, so a moved object carries its old shadow; the sprite is one
+rigid cutout, so re-timing, re-positioning and re-ordering are in
+scope but new articulation is not — a punch landing differently needs
+poses never photographed. The 3D branch is where articulation would
+come from, and this clip has no parallax to build it (recorded above).
+
+Realtime forking vs stitch, answered by the above: because the decode
+is composite-based, an edited track can be re-composited at DECODE
+time for instant preview, with the residual simply skipped in edited
+regions; the re-encode above is what turns that preview into a final
+at full fidelity. Preview and commit are the same pipeline at two
+residual settings, not two systems.
+
+### Motion-adaptive rate allocation (user proposal): built, measured, OFF by default
+
+Proposal: spend residual bits where there is LESS motion, because
+residuals are cheap there, and lean on prediction where there is more.
+Built as a per-4x4-block multiplier on the dead zone (ResidualOpts
+::dz_map). Encoder-only by construction — the dead zone never reaches
+the decoder — so spatially varying allocation costs nothing on the
+wire and needs no format change. Activity is the PREDICTION'S error
+per region, not raw frame difference: a panning background under an
+accurate plate moves a lot and costs nothing, and allocation should
+care what a region COSTS, not how fast it moves.
+
+Measured on w1 (store shot, 48f, --static):
+  plain dz40                    427,043 B @ 37.921 dB
+  plain dz56                    373,650 B @ 37.066
+  plain dz64                    355,283 B @ 36.773
+  dz40 + adaptive s=0.5         346,500 B @ 36.360
+  dz40 + adaptive s=1.0         427,327 B @ 35.637   (worse on BOTH)
+Matched-quality read: interpolating the plain ladder (62.7 KB/dB
+between dz56 and dz64) to 36.360 dB gives ~329 KB, against the
+adaptive path's 346.5 KB — so adaptive allocation is roughly 5% WORSE
+than simply raising the global dead zone. s=1.0 is worse on both axes
+because refining the quiet regions costs more than coarsening the busy
+ones saves.
+
+Two findings behind the negative, the second a bug in my own
+instrumentation rather than in the idea:
+
+1. The coarsen-only variant (negative strength: widen the dead zone on
+   busy regions, leave quiet ones at the global setting) returned
+   BYTE-IDENTICAL output to the symmetric one at the same magnitude —
+   346,500 @ 36.359770 both. That can only happen if almost no block
+   fell below the multiplier's 1.0 line, which means
+2. THE NORMALISER IS WRONG. Activity is divided by the frame's MEDIAN
+   region, and under an accurate plate most regions are near-zero
+   error, so the median sits near the floor and act/med >= 1 almost
+   everywhere. The map is therefore nearly one-sided already and the
+   "spend more where it is quiet" half of the proposal was never
+   actually exercised. The measurement above is a fair test of
+   "coarsen the busy", NOT of the user's actual claim.
+
+So this is not yet a verdict on the idea. What it needs before being
+judged: a normaliser that spreads the distribution (mean, or a
+percentile pair, or rank-based), and a matched-quality sweep rather
+than a single operating point. Kept behind FAO_DZ_MOTION, default 0.0
+(off), machinery and the honest half-measurement recorded here.
+
+Worth noting for the roadmap the user sketched alongside it — "treat
+motion as keyframes, log only the ones that change something" — the
+mover layer's sprite is exactly a per-object keyframe today, captured
+once at ref_frame and reused. Event-driven RE-capture (emit a new
+sprite only when tracking error says the object changed) is the
+natural next construction and is what would lift the rigid-sprite
+limit that the scene-editing work ran into. Not built.
+
+## New material: Minecraft speedrun 4K60 (2026-08-31)
+
+User-supplied: speedrunner_test.mkv (3840x2160@60, 67s, AV1 source at
+~23 Mbps) + speedrunner_test_av1.mkv anchor (16.9 MB video-only,
+4204 B/frame average). Test GOP: 48 frames from t=20s.
+
+This is the first material that satisfies the preconditions the last
+two sessions named as MISSING. It is engine-rendered (no film grain —
+the residue that dominated the bloopers), it repeats content exactly
+(voxel blocks, HUD glyphs), it has a real first-person 3D camera, and
+it carries a static HUD. Every open question had been deferred to
+"needs engine content"; this is that content.
+
+### The long-range dictionary: 10.7% STRONG, against 0.2-0.7% on film
+
+The landmark-fingerprint probe, unchanged, at the SAME 16x16
+granularity that measured a null on film and game-broadcast footage:
+
+                        long-range beats local | STRONG (>512 SAD) | mean SAD saved
+  bloopers shotB                        12.1%  |             0.3%  |   ~130-240
+  SMITE broadcast                     3.1-4.2% |          0.2-0.3% |   ~130-240
+  MINECRAFT 4K                          24.7%  |            10.7%  |         1515
+1.49M regions probed, 36,592 distinct fingerprints — a ~40x dedup
+ratio in fingerprint space. STRONG is 15-50x the film rate and the
+margin per win is 6-10x larger, which is what decides whether a ~4-byte
+long-range reference pays.
+
+The earlier verdict was "the idea transfers cleanly and the machinery
+works; the REDUNDANCY ISN'T THERE at 16x16 on this material", and the
+recorded next step was to go finer (4x4/8x8) and exact-match. That
+step is NOT needed first: the redundancy is there at 16x16 on engine
+content, so the construction to build is the coder-side reference
+(dictionary index + 4-byte reference in the mode decision), measured
+on this clip, before any granularity work.
+
+### Parallax exists here — and the pose model's missing axis is now visible
+
+  correspondences within 2px of the pair affine:
+    bloopers w1 / shot4  88%   (no parallax; a global affine IS the frame)
+    SMITE                66%
+    MINECRAFT            43%   <- 57% genuinely non-affine
+Median per-pair motion 12.6px, camera span 103px, and depth spread
+p10 1389 / median 7847 / p90 41009 — real depth structure, against the
+bloopers' flat 1132-1877.
+
+But triangulation still keeps only 24 of 798, and the REJECTION
+PROFILE INVERTED, which is the diagnostic payload:
+  bloopers shot4: reproj 191, behind-camera 4,   no-baseline 0
+  MINECRAFT:      reproj 154, behind-camera 293, no-baseline 327
+41% of candidates find no usable baseline and 37% triangulate BEHIND
+the camera. That is the signature of the pose model's missing degree
+of freedom: it is translation-only in x/y with z pinned to 0, while
+first-person game movement is dominated by FORWARD translation.
+Forward motion produces radial expansion, which phase correlation
+reads as near-zero shift (hence no baseline), and intersecting radial
+flow against an x/y-only baseline puts points behind the camera. So
+the 3D branch's next construction is now evidenced rather than
+guessed: a z/dolly term in the pose model, recovered from radial flow
+divergence rather than from phase correlation.
+Also logged: pose-vs-tracks reports cumulative pose +33.3px and
+cumulative track +33.3px — SAME sign, where w1 and shot 4 both gave
+opposite signs. Equal magnitude with inverted sign is suspicious and
+unexplained; flagged, not chased.
+
+### Rate vs the AV1 anchor on this GOP
+
+  v11.3 dz32:  9,996,224 B @ 31.742 dB / SSIM 0.9353
+  AV1 anchor:    305,744 B @ 32.198 dB / SSIM 0.9336
+32.7x larger at -0.46 dB — WORSE than the bloopers' 18.6x, and the
+byte split says why: residual 7.56 MB of 10 MB (76%), prev_mode_share
+0.641 against w1's 0.857. At 12.6 px/frame median motion and 67 px
+peak shift, a translation-only plate stops predicting and the coder
+falls back to paying for pixels.
+
+One genuine positive in that row: v11 WINS ON SSIM (0.9353 vs 0.9336)
+while losing 0.46 dB of PSNR. Flat voxel surfaces and hard block edges
+are exactly what a DCT dead zone preserves structurally and what PSNR
+under-credits. Worth a matched-SSIM comparison rather than only
+matched-PSNR on this content.
+Caveat carried over from SMITE and still applying: the anchor is an
+AV1 re-encode of AV1 source, which flatters AV1 (it recodes its own
+artifacts cheaply).
+
+### Dictionary reference mode (mode 4): built, and the probe over-promised
+
+The coder side of the 10.7%-STRONG measurement. Mode 4 cites a
+REGION-sized block from decoded history: dictionary built only from
+RECONSTRUCTED frames <= fi-2 (never overlapping prev-MC, and exactly
+rebuildable by the decoder from its own output), keyed on the recon
+block's fingerprint, queried with the source block's, winner decided
+by true SAD against recon. Wire: 1 flag bit + 5 bytes (frame delta u8,
+x u16, y u16). region_fingerprint hoisted out of probe_dictionary so
+the thing measured is the thing that ships. Behind FAO_DICT.
+
+Measured, Minecraft 4K GOP at dz32:
+  dict OFF:  9,996,224 B @ 31.742 dB / SSIM 0.9353
+             (mode+mv 1,617,149 | residual 7,559,715)
+  dict ON:   9,866,348 B @ 31.680 dB / SSIM 0.9331
+             (mode+mv 1,863,632 | residual 7,183,356)
+-1.3% bytes, -0.06 dB, -0.0022 SSIM. Residual fell 376 KB (-5.0%) and
+side info rose 246 KB (+15.2%): the references very nearly cost what
+they save.
+
+The gap worth recording is probe 10.7% STRONG vs coder ~3.3% of
+regions actually firing. Three reasons, all of which make the probe an
+UPPER bound rather than a forecast:
+  1. The probe scored long-range against plate-or-prev on SOURCE. The
+     coder scores against the region's ACTUAL COMPOSITE, which already
+     includes intra, planar and gain/offset — a much stronger baseline
+     that the probe never had to beat.
+  2. The probe matched source against source. The coder must match
+     against RECON at dz32, which is quantised and blurrier, so real
+     repeats degrade below the margin.
+  3. Exact-bucket lookup with a 24-candidate cap, unchanged from the
+     probe's weaker test.
+None of these are bugs; they are the difference between measuring
+redundancy and spending it. A probe that scores against the real
+composite on recon would have predicted ~3%, and that is the shape
+future probes in this codec should take.
+
+Negative recorded at the site: delta-coding the references against the
+referring region's origin — the trick that won for motion vectors —
+LOST 6,002 bytes. Same reason as the gain-value delta experiment: many
+regions cite the SAME source location (one tile of a repeated
+texture), so the absolute stream is full of byte-identical 4-byte runs
+that zstd matches and deltas scatter. Third time in this codebase, so
+the general rule is now stated: delta coding pays for piecewise-
+CONTINUOUS fields (motion) and loses for piecewise-CONSTANT ones
+(gains, references).
+
+Named next levers, in the order the byte split argues for: the
+reference is 5 bytes against a 256-pixel block, so (a) restrict to a
+small MRU candidate list and code an INDEX instead of coordinates,
+(b) allow one reference to cover a run of adjacent regions (repeated
+textures are contiguous), (c) match against source-quality recon by
+running the dictionary at a finer dead zone than the frame.
+
+### Two attempts to make the reference cheaper, both LOST to zstd
+
+The byte split said the 5-byte reference was eating mode 4's win
+(residual -376 KB, side info +246 KB), so the named next levers were
+an MRU index and run coverage. Built the first:
+
+  absolute coordinates + zstd        1,863,632 B side  <- best
+  delta vs referring region origin   1,869,634 B  (+6,002)
+  move-to-front MRU index, cap 128   1,866,150 B  (+2,518)
+
+The MRU's own instrumentation corrects the guess that motivated it.
+Exact (frame, x, y) triples repeat on only 5-15% of references per
+frame (f4 15%, f24 5%, f46 9%), so 85-95% pay a token byte ON TOP of
+the full 5-byte escape. The absolute stream IS compressible, but
+because zstd matches longer contexts than a 128-entry window sees —
+not because of short-range exact repeats. My reading of "byte-identical
+4-byte runs" was right about the compressibility and wrong about its
+range, and only the instrumented attempt could tell the difference.
+
+Standing lesson, now three-for-three in this codec (gain values,
+unified mode symbols, and both of these): zstd over a plainly-laid-out
+side stream beats hand-rolled entropy structure. The ONLY transform
+that has ever won on a side stream here is LAYOUT — band-major /
+plane-split — never re-coding. Recorded at the emission site so the
+fourth attempt reads it first.
+
+Reference density, also measured: 1,498 refs on frame 4, 2,947 on
+frame 24, 78 on frame 46, against 32,400 regions per frame — 0.2-9%,
+and decaying late in the GOP. That decay is worth chasing before any
+further entropy work: the dictionary is built from recon at dz32, so
+as the GOP progresses its entries are increasingly quantised copies of
+quantised copies, and matches fall below DICT_MARGIN. The remaining
+named lever (run-coding one reference across adjacent regions) attacks
+count, not price, and the count is what is collapsing.
+
+### The reference-density decay was MY BUG, not the material — mode 4 now pays
+
+Last entry blamed the decay (2,947 refs on frame 24 -> 78 on frame 46)
+on the dictionary being built from recon at dz32, "quantised copies of
+quantised copies", and named a finer dictionary recon as the fix.
+THAT FIX IS NOT DECODABLE and the diagnosis was wrong. Not decodable
+because the decoder only holds the real recon; a finer one would have
+to be transmitted, which is the cost the dictionary exists to avoid.
+Wrong because the actual mechanism was in my own candidate selection:
+
+    cands.iter().rev().take(24)
+
+takes the 24 most RECENTLY INSERTED entries in the bucket. The newest
+entries come from the newest frames — exactly the content prev-MC
+already predicts — so as buckets fill, the entire candidate budget is
+spent on matches that cannot profit, and the old distant entries that
+are the whole point of a long-range dictionary are never examined.
+Density collapsing across the GOP is what that looks like from
+outside, which is why it read as a material property.
+
+Fix: spend the budget EVENLY across the bucket's history (stride
+sample) instead of on its tail. Minecraft 4K GOP, dz32:
+
+  no dictionary        9,996,224 B @ 31.742 dB / SSIM 0.9353
+  dict, tail-24        9,866,348 B @ 31.680 dB / SSIM 0.9331  (-1.3%)
+  dict, spread-24      9,291,999 B @ 32.099 dB / SSIM 0.9356  (-7.0%)
+  dict, spread-96      9,108,770 B @ 32.054 dB / SSIM 0.9361  (-8.9%)
+
+Spread-24 beats tail-24 on BOTH axes at an identical candidate budget
+and identical wire format — the signature of a policy bug, not a rate
+trade-off. Against no dictionary, spread-96 is -8.9% bytes AND
++0.31 dB AND +0.0008 SSIM: mode 4 is now a strict win on this content
+rather than the marginal 1.3% the first version measured. Residual
+7,559,715 -> 6,375,363 (-15.7%) for +297 KB of side info.
+
+Defaults changed to spread/96 (FAO_DICT_TAIL restores the old policy).
+Still behind FAO_DICT.
+
+Standing against the AV1 anchor on this GOP: 9,108,770 B @ 32.054 dB /
+0.9361 vs 305,744 B @ 32.198 dB / 0.9336. 29.8x at -0.14 dB, and v11
+still leads on SSIM. Was 32.7x at -0.46 dB before mode 4.
+
+Process note worth keeping: two entropy-coding attempts on the
+references (delta, MRU) both lost, and the thing that actually paid
+was fixing WHICH candidates get examined. The byte split pointed at
+price (5-byte references, +246 KB of side info) and the real problem
+was count — and count was collapsing for a reason no byte-accounting
+would ever show, only the density instrumentation did.
+
+### Mode 4 generality: it LOST on a second Minecraft GOP, and the fixed margin was why
+
+Validation across material, dz32, spread selection:
+
+  film w1 (48f):   487,382 @ 38.311  ->  483,147 @ 38.329   -0.9%, +0.02 dB
+  Minecraft GOP A: 9,996,224 @ 31.742 -> 9,108,770 @ 32.054  -8.9%, +0.31 dB
+  Minecraft GOP B (t=45s, 48f), spread-24:
+                  11,350,178 @ 31.685 -> 11,726,020 @ 31.909 +3.3%, +0.22 dB
+Film is a small win, so mode 4 is not material-specific harm. But GOP
+B — same clip, same game, 25 seconds later — LOST 3.3% in bytes:
+references fired freely (+443 KB side info, +20%) and bought back only
+0.8% of residual. GOP B is the harder half of the clip (prev-mode
+share 0.557 against A's 0.641).
+
+Cause: DICT_MARGIN was a fixed 512 SAD, lifted from the probe's STRONG
+threshold. That is the same mistake the MV rate-charge experiment made
+years of sessions ago — a gate that does not scale with the operating
+point. A 512-SAD improvement buys many residual bytes at a fine dead
+zone and almost none at a coarse one, while the reference costs its
+5 bytes regardless. So the gate admits references that cannot pay
+whenever the dead zone is wide or the content is hard.
+
+Margin now derives from the dead zone (64 x dz, floor 512;
+FAO_DICT_MARGIN overrides). Swept on the LOSING GOP:
+  margin  512 (=16xdz): 11,726,020 @ 31.909   +3.3% vs no dict
+  margin 2048 (=64xdz): 10,899,237 @ 31.788   -4.0% vs no dict AND
+                                              +0.10 dB
+Raising the gate turned a 3.3% loss into a 4.0% win on the same GOP
+without touching the wire format — the admitted references are simply
+the ones that can pay. Default is 64 x dz.
+
+Honest status: GOP A was measured at 16xdz and is not re-measured at
+64xdz, so the -8.9% figure is at the OLD gate; the new default may
+move it either way (fewer references, each more profitable). Two GOPs
+of one clip plus one film GOP is not a validation set. Mode 4 stays
+behind FAO_DICT.
+
+Encode cost, measured and worth stating: spread-96 on GOP B did not
+finish inside a 14-minute budget, while spread-24 took 200s. Candidate
+search is O(regions x budget x 256-pixel SAD) and at 4K that is
+32,400 regions per frame — the budget is a real compute knob, not just
+a quality one, and 96 is only affordable on easier content.
+
+### provenance: tamper evidence that localises the edit
+
+Raised by the user off the back of the scene-editing work: once a
+narrative edit costs 0.9% of the file and is a track rewrite, "is this
+the video that was recorded" stops being academic.
+
+Boundary stated first, in the module docs, because it is the thing a
+"verified" badge gets wrong: this is TAMPER EVIDENCE AND PROVENANCE,
+not proof a camera saw reality. Nothing computed from pixels can
+establish that — it needs secure capture hardware attesting at the
+sensor, which is what C2PA / Content Credentials specifies. This should
+eventually carry that, not replace it.
+
+Why the obvious design is wrong: a cryptographic hash over the encoded
+file breaks on every transcode, and transcoding is the normal life of
+a video. A bitstream hash reports "tampered" for the overwhelmingly
+common innocent case, which is how brittle integrity signals get
+ignored.
+
+What FAO can do that a pixel codec cannot: the representation is
+already an object graph, so the digest is STRUCTURAL — plate, per
+sprite, per track, hashed separately — and verification LOCALISES.
+"Plate matches, all sprites match, object 7's track diverges" is a
+different statement from "hash mismatch", and it is exactly the
+signature retarget_frames leaves. Sprite and track are hashed
+separately on purpose: that is what distinguishes a RE-STAGED object
+(same appearance, new path) from a REPLACED one. Findings are an enum,
+not a bool: Identical / ObjectCountChanged / PlateChanged /
+SpritesChanged(ids) / Restaged(ids) / LikelyTranscode{bits} /
+PixelsChangedOutsideObjects{bits} / LengthChanged.
+
+THE DESIGN CORRECTION, caught by its own test: the first version
+hashed region_fingerprint over every block and called it a robust
+digest. A mild requantisation (v/4*4+1) changed it completely. The
+cause is structural, not tuning — HASHING A PERCEPTUAL FEATURE
+DESTROYS THE PROPERTY THE FEATURE HAD. A cryptographic hash is built
+so one flipped input bit changes every output bit; a perceptual
+descriptor's whole value is that a few bits flip under innocent
+processing. "Robust hash" is a contradiction unless the comparison is
+a DISTANCE over the descriptor itself. So the descriptor is published
+raw and compared by Hamming distance: 64 bits/frame (8x8 grid cells vs
+frame mean), 384 bytes for a 48-frame GOP. It is deliberately NOT
+folded into the root — doing so would make the root brittle to exactly
+the re-encoding it exists to tolerate.
+
+Second correction, recorded because it is a natural idea that does not
+work: the user's content-derived sampling pattern adds NO security. An
+attacker holding the video derives the same pattern. It is worth doing
+for EFFICIENCY (spend the sample budget on high-information regions)
+but must not be sold as making the fingerprint harder to forge.
+Unforgeability comes from one place only — signing the digest with a
+key the attacker lacks and publishing it with a trustworthy timestamp.
+
+Cost: the exact digests are over quantities the encoder already holds
+(coded plate, decoded sprites, tracks), so they are effectively free at
+encode time; the descriptor is one 8x8 mean pass per frame. blake3 was
+already a monorepo dependency (gitmind, drivemind integrity
+manifests), so no new third-party surface.
+
+Known gap, stated rather than hidden: the 4-of-64-bits transcode
+threshold is a starting point, NOT measured. It needs a real transcode
+corpus (different encoders, rates, resolutions) before anyone should
+trust it, and an 8x8 descriptor is deliberately weak at catching a
+small object moving in a large frame — the structural digests are what
+catch that case, which is the division of labour the design intends.
+
+## New material: blackstar-rs gameplay (2026-08-31)
+
+autobots-rollout--2026-08-02_21-02-50_comp.mkv, 1536x864@60, 100s, AV1
+at 760 kbps. Test GOP: 48 frames from t=12s. Footage stays OUT of the
+repo (.gitignore now excludes *.mkv/*.mp4/*.webm/*.y4m/*.ivf); the
+corpus is re-supplied per session and only measurements are committed.
+
+Notable for a reason no other clip has: THIS REPO CONTAINS THE GAME'S
+SOURCE. Every other test has required inverse rendering — recovering
+geometry and pose from pixels. Here the emitting engine is in
+games/blackstar-rs, so an engine-derived canonical (assets + camera
+pose straight from the game, no reconstruction) is buildable rather
+than hypothetical. That is the regime the citation thesis was always
+about and has never been able to test.
+
+### Engine-rendered does NOT imply dictionary-friendly — the Minecraft conclusion needed narrowing
+
+  dict probe            long-range beats local | STRONG | mean SAD saved
+  Minecraft 4K                          24.7%  |  10.7% |          1515
+  bloopers shotB                        12.1%  |   0.3% |       130-240
+  BLACKSTAR                              0.9%  |   0.0% |           130
+Zero STRONG matches, on engine content, with only 7,153 distinct
+fingerprints across 238,464 regions — i.e. EXTREMELY repetitive, and
+the dictionary still finds nothing worth citing.
+
+The resolution sharpens the thesis condition. Blackstar's repetition
+is LOW-FREQUENCY: flat-shaded geometry, large smooth sky and ground
+gradients. Flat content is precisely what the local predictors already
+get for free, so a long-range match cannot beat them — there is no
+residual left to save. Minecraft's repetition is HIGH-FREQUENCY
+(per-block textures), which local prediction does NOT get for free.
+So the condition is not "engine-rendered" but: content that is BOTH
+repetitive AND expensive under local prediction. Recorded because
+"engine content is the dictionary's home turf" was the working
+assumption and it is too coarse.
+
+### Triangulation: 0 of 144, and the pose model fails a third distinct way
+
+  motion: max |shift| 0.00px (confidence 0.88) | camera span 0.0px
+  correspondences 65% within 2px | median per-pair track motion 1.70px
+  tri census: 144 candidates -> 0 kept | no-baseline-pair 144
+Phase correlation confidently reports ZERO global motion while the
+feature tracks report 1.70 px/frame. On near-uniform gradients there
+is no correlation peak to find, so the estimator is confidently wrong
+rather than uncertain, the pose track never moves, and every candidate
+fails for want of a baseline. Three clips, three distinct failures of
+the same translation-only phase-corr pose model: bloopers = no
+parallax in the material; Minecraft = missing z/forward axis;
+blackstar = no texture for phase correlation to lock onto. The common
+factor is the ESTIMATOR, not the material, and --pose-from-tracks
+(already built, still off by default) addresses all three.
+
+### Rate, with a proper anchor
+
+The shipped file cannot be its own anchor: scoring v11 against an AV1
+file means encoding AV1 artifacts and calling the artifacts truth. So
+SVT-AV1 preset 6 g48 anchors were built from the SAME y4m:
+
+  AV1 crf40   110,558 B @ 48.03 dB / SSIM 0.9953
+  AV1 crf50    66,037 B @ 45.34 dB / 0.9926
+  AV1 crf60    35,393 B @ 42.16 dB / 0.9872
+  AV1 crf63    22,908 B @ 39.67 dB / 0.9806
+  v11.3 dz8 1,530,493 B @ 40.53 dB / 0.9865
+  v11.3 dz32   332,841 B @ 35.62 dB / 0.9750
+At matched quality (~40 dB / 0.986) v11 is 1,530,493 vs AV1 crf60's
+35,393 — 43x. This is the WORST ratio of any clip measured, and the
+byte split says why: plate 104,683, mode+mv 72,810, residual 154,964
+with prev_mode_share 0.939. The plate is 31% of the file on content
+that is a smooth gradient plus a small moving object — a temporal
+median over a gradient is an expensive way to store something a
+handful of coefficients would describe. Mover layer detected 4 objects
+and the J-guard correctly declined them.
+
+The lesson is the mirror of the dictionary one: this codec's costs are
+sized for TEXTURE, and on near-flat synthetic content every structure
+it carries (a full-resolution plate, per-region modes, per-region
+gain) is overhead against a conventional coder's ability to spend
+almost nothing on a flat block. The plate should be coded at a
+resolution matched to its own spectral content, not at frame
+resolution — the first concrete construction this clip argues for.
+
+### --pose-from-tracks promoted to DEFAULT on five-clip evidence
+
+The phase-correlation pose track failed three DISTINCT ways across the
+corpus, and the median-of-static-tracks rebuild fixes all three. One
+fix for three unrelated-looking symptoms is what promoted it from a
+flag to the default — it means the estimator was the common cause, not
+three material properties.
+
+  bloopers w1    81 -> 98 triangulated
+  bloopers sh4    2 ->  3   (no parallax to rescue; does not hurt)
+  SMITE          27 -> 31,  mean reproj 2.17 -> 1.80 px
+  Minecraft 4K   24 -> 101, no-baseline 327 -> 71, reproj p50 50.2 -> 22.3
+  blackstar       0 -> 31,  camera span 0.0 -> 46.1 px, no-baseline 144 -> 6
+
+blackstar is the clearest case: phase correlation reported ZERO global
+motion at confidence 0.88 on near-uniform gradients, so every candidate
+died for want of a baseline; the tracks knew the camera was moving
+1.70 px/frame all along. --pose-phasecorr restores the old behaviour.
+
+### Spectrally-matched plate resolution: measured, and it LOSES
+
+blackstar's plate is 31% of its file on a smooth gradient, so a
+half-resolution plate store (box decimate, code, bilinear upsample)
+looked obviously right. Measured at dz32:
+
+  full-res plate  332,841 B @ 35.619 dB / SSIM 0.9750
+  half-res plate  270,473 B @ 32.993 dB / SSIM 0.9657
+-18.7% bytes for -2.63 dB: 23.7 KB/dB, against the SAME CLIP's
+dead-zone ladder at 244 KB/dB (dz8 1,530,493 @ 40.53 -> dz32 332,841
+@ 35.62). Ten times worse exchange rate — a straight loss at matched
+quality, and only visible because the byte saving looked good alone.
+
+The mechanism is specific to a REFERENCE surface and is the useful
+part: residual barely moved (154,964 -> 155,895) while PSNR fell
+2.6 dB, because at dz32 the dead zone DISCARDS the low-amplitude error
+a blurred plate introduces. The blur passes straight through to the
+output instead of being corrected. A cheaper reference is only cheap
+if the residual coder will fix it, and at a coarse dead zone it will
+not. This also explains the earlier PLATE_DZ_DIV result from the other
+direction: the plate gets a FINER dead zone than the frames for
+exactly this reason, and lowering its resolution is the same mistake
+in the spatial axis that a coarser plate dead zone would be in the
+amplitude axis.
+
+Process failure recorded: the first version's comment claimed the
+choice was made on "cheaper AND prediction error not materially worse"
+while the code compared BYTES ONLY. Comment and code disagreed and the
+comment was the more sensible design. Now an actual RD gate
+(SSE-against-plate + lambda x bytes, biased against half-res since a
+reference's errors propagate to every frame), which correctly declines
+half-res on blackstar — the path is now inert on the clip that
+motivated it, which is the honest outcome. Kept behind FAO_PLATE_HALF
+for content where a plate really is band-limited.
+
+### The null hypothesis, finally run: IS the plate worth its bytes?
+
+The v11 thesis is that a transmitted world model beats per-frame
+coding. In fifteen sessions that was never tested against its own
+null, because no code path could express "this shot does not want a
+plate". encode_gop_no_plate adds it: the prediction provider returns
+flat gray, so frame 0 falls to intra and every later frame to prev-MC.
+encode_gop_routed picks between the two by the same J the citation
+router and mover guard use (--noplate, --plate-route).
+
+The motivating hypothesis was WRONG, and usefully so. blackstar's
+plate costs 104,683 B (31% of the file) while prev_mode_share is
+0.939, which reads as "94% of regions decline the plate, so it is
+overhead". Measured:
+
+  blackstar dz32   with plate  332,841 B @ 35.619 dB / SSIM 0.9750
+                   NO plate    477,768 B @ 29.564 dB / 0.9497
+                   -> +43.5% bytes AND -6.05 dB without it
+  film w1 dz32     with plate  487,382 B @ 38.311 dB
+                   NO plate    421,712 B @ 36.726 dB
+                   -> -13.5% bytes for -1.59 dB = 41 KB/dB, against
+                      w1's own dead-zone ladder at 155 KB/dB
+                      (dz40 427,043 @ 37.921 -> dz32 487,382 @ 38.311)
+Router agrees on both: J with-plate 9.79e8 vs without 1.26e9 on w1.
+
+So the plate earns its bytes on BOTH the clip where it looked most
+wasteful and on film, and prev_mode_share is a misleading indicator of
+its value. The reason is that the share counts which predictor each
+region CHOSE, while the plate's contribution is largely structural:
+it anchors frame 0 (which otherwise pays full intra) and it bounds
+drift for the prev-MC chain that the other 94% of regions ride on.
+A predictor can be decisive without being selected often — a lesson
+that applies directly to the mover layer and the dictionary, where
+the same share-based reasoning has been used to judge value.
+
+This is the first time the codec's central claim has been measured
+against its own control rather than against AV1. Kept as a routed
+option rather than a default because it costs a second full encode and
+has never once won so far; the value is having the null available, not
+running it every time.
+
+### blackstar's rate floor: located, and it is NOT reducible by coarsening the plate
+
+Mapping the hull to find where the 43x gap lives. At dz128 the frame
+residual has collapsed to 7,054 B while the total is still 151,867:
+
+  dz32   plate 104,683 | mode+mv 72,810 | residual 154,964 | 35.62 dB
+  dz64   plate  92,048 | mode+mv 71,567 | residual  42,258 | 33.77 dB
+  dz128  plate  74,395 | mode+mv 70,034 | residual   7,054 | 31.84 dB
+
+So there is a ~144 KB FLOOR made of plate + side info that barely
+moves with the operating point, against an AV1 crf63 anchor at
+22,908 B. The residual coder is not the problem at low rates; the
+floor is.
+
+Attacked the plate half with a swept dead-zone ratio (the dz/8 default
+was measured on the FILM suite at dz32 and had never been re-examined;
+FAO_PLATE_DZ_DIV now exposes it):
+
+  div 8  332,841 B @ 35.619   (default)
+  div 4  322,931 B @ 35.001   -> 16.0 KB/dB
+  div 2  303,458 B @ 33.826   -> 16.4 KB/dB
+  div 1  298,558 B @ 31.371   ->  8.1 KB/dB
+against blackstar's OWN dead-zone ladder at 244 KB/dB. Every point is
+a 15-30x worse exchange, so dz/8 survives on content it was never
+tuned for — a negative that validates an inherited default rather
+than replacing it.
+
+Same mechanism as the half-res plate negative, now confirmed on the
+amplitude axis as well as the spatial one: a plate error is not
+corrected downstream, because the frame's own dead zone discards
+exactly the low-amplitude error a coarsened reference introduces.
+The plate must be near-lossless to be worth anything, therefore its
+cost is a HARD FLOOR, and neither spatial nor amplitude coarsening can
+move it. That is a structural statement about this codec, not a tuning
+gap.
+
+Consequence for where v11 can ever win: the floor is per-GOP, so it is
+amortisable by GOP LENGTH and by nothing else. Measured at 5x length:
+
+  blackstar  48f: 332,841 B total, 6,934 B/frame amortised @ 35.62 dB
+  blackstar 240f: 1,116,902 B total, 4,653 B/frame amortised @ 34.78 dB
+The plate barely grew (104,683 -> 99,761) across 5x the frames, which
+is the amortisation thesis working exactly as claimed. Per-frame cost
+fell 33%.
+But the anchor moved too: AV1 crf50 at g240 is 210,194 B @ 46.15 dB
+against v11's 1,116,902 B @ 34.78 — still 5.3x the bytes at 11 dB
+worse, because AV1's own keyframe cost amortises over the longer GOP
+as well. Amortisation is real and it is NOT differential: both coders
+get it, so it narrows the gap in absolute per-frame terms without
+changing who wins.
+
+### Cross-GOP citation on engine content: it fails, and the reason is structural
+
+The floor analysis concluded that GOP-length amortisation is NOT
+differential (AV1's keyframe amortises too), so v11's win has to come
+from a plate predicting content a keyframe cannot — i.e. reuse ACROSS
+GOPs. blackstar is the best case that has ever been available for
+testing that: engine-rendered (no grain decorrelation, which is what
+sank the film citation experiments), a fixed arena, and the same set
+recurring across 100 seconds.
+
+Canonical saved from GOP A (t=12), cited by later GOPs at dz32:
+
+  GOP B (t=40)     self  384,979 B @ 35.542 dB
+                   cited 331,885 B @ 31.160 dB
+                   -> -13.8% bytes for -4.38 dB = 12 KB/dB
+  GOP NEAR (t=12.8) self  405,701 B @ 35.581 dB
+                   cited 317,472 B @ 32.799 dB
+                   -> -21.8% bytes for -2.78 dB = 32 KB/dB
+  GOP C (t=68)     cited 572,087 B @ 32.982 dB  (worse than either)
+against blackstar's own dead-zone ladder at 244 KB/dB. Every citation
+is a 7-20x worse exchange than simply coarsening the quantiser, so
+citation LOSES at matched quality — the same verdict as film, on the
+content type that was supposed to fix it.
+
+The control is what makes this a structural finding rather than a
+tuning one. The NEAR GOP is 0.8 seconds after the canonical and cites
+almost three times better than the one 28 seconds later (32 vs
+12 KB/dB), and still loses. So citation quality decays with VIEWPOINT
+DISTANCE, and the mechanism is that a 2D plate is viewpoint-locked by
+construction: it is a translation-aligned temporal median, so it can
+only serve a camera standing roughly where the donor stood. In a game
+with a free 3D camera that condition almost never holds across GOPs.
+
+This closes the loop on the session's other findings rather than being
+a separate result. The marginal-cost thesis needs cross-GOP reuse; a
+2D plate cannot provide it because it cannot be re-rendered from a new
+viewpoint; a 3D canonical CAN, which is precisely why the 3D branch
+matters and precisely what has failed on every clip for a different
+reason (bloopers: no parallax; Minecraft: pose model missing the
+forward axis; blackstar: phase correlation finds no peak on gradients,
+now fixed by pose-from-tracks). The honest statement is that v11's 2D
+path has now been measured to its ceiling, and the remaining thesis
+value is entirely in geometry the codec cannot yet recover.
+
+The one path that sidesteps reconstruction is this repo's own game:
+blackstar-rs is in games/, so its canonical could be built from engine
+assets and its camera pose read from the game rather than inferred.
+That is the only configuration in which the citation thesis has not
+yet been given a fair test.
+
+### The thesis with inverse rendering REMOVED: it holds
+
+Every citation failure so far had a different proximate cause (grain
+decorrelation, no parallax, missing pose axis, no phase-corr peak,
+viewpoint-locked 2D plate) and one shared confound: the canonical and
+the poses were RECOVERED FROM PIXELS, so a negative could never
+separate "the thesis is wrong" from "reconstruction is hard".
+
+bin/engine_lab removes the confound. A synthetic arena is rendered
+through the codec's own rasterizer to make the footage; the SAME mesh
+and poses are then handed to the encoder as a canonical — the
+engine-derived configuration blackstar-rs could actually supply from
+replay::Frame plus its assets. No triangulation, no phase correlation,
+no pose estimation anywhere in the path. Two GOPs far apart on a
+camera orbit, so GOP B's camera stands where GOP A never did — the
+exact condition under which the 2D plate was measured to fail.
+
+FIRST VERSION WAS CIRCULAR and is recorded as such: it rendered the
+footage from the same mesh at the same poses and reported 99.0 dB at
+1,176 B — bit-exact, because the prediction WAS the source. That
+measures only that rendering is deterministic. Real footage differs
+from any static canonical in two ways, so both are now injected into
+the FOOTAGE ONLY: a dynamic object the canonical cannot contain (a
+moving ball, standing for actors/projectiles/particles) and a
+per-frame photometric drift (standing for dynamic lighting and
+post-processing — the thing that historically defeated cross-take
+citation on film).
+
+Measured, GOP B, dz32, 640x384, 24 frames:
+
+  B self-coded, own 2D plate       128,856 B @ 39.940 dB
+  B citing the engine canonical     88,854 B @ 45.442 dB
+  same, canonical NOT amortised     90,438 B  (mesh_pack 1,608 B)
+  control, canonical at WRONG poses 156,252 B @ 37.368 dB
+
+-31% BYTES AND +5.5 dB SIMULTANEOUSLY. Not a rate trade — strictly
+better on both axes, which no 2D citation experiment has ever produced
+on any real clip. The wrong-pose control is the guard that makes it
+meaningful: the same canonical rendered at the WRONG poses is 21%
+WORSE than self-coding, so the win comes from correct geometry and
+pose, not from having any extra predictor.
+
+Amortisation is almost irrelevant here, and that is itself a result:
+paying the canonical's full mesh_pack cost (1,608 B) instead of a
+24-byte reference moves the total by 1.8%. A geometry canonical is
+CHEAP — the 2D plate it replaces cost 1,634 B for one viewpoint, while
+the mesh serves every viewpoint. The library's value is not that the
+canonical is expensive and must be shared; it is that the canonical
+generalises across viewpoints and a plate does not.
+
+VERDICT: the marginal-cost thesis is correct given a correct world
+model, and every measured failure in this codec is an INVERSE
+RENDERING failure, not a coding one. That reframes the roadmap: work
+on triangulation, pose recovery and densification is not a
+prerequisite to be got through before the interesting part — it IS the
+whole remaining problem. And the one configuration that skips it
+entirely (an engine handing over its own assets and camera, which
+blackstar-rs in this repo could do) is now measured to be worth
+-31% bytes at +5.5 dB.
+
+### engine_scene: the seam, built as a format rather than an integration
+
+engine_lab established that a correct canonical plus correct poses is
+worth -31% bytes AND +5.5 dB, and that the same canonical at wrong
+poses is 21% WORSE than not citing at all. So the whole value sits in
+getting geometry and camera right, and an engine already knows both.
+engine_scene.rs is how it hands them over.
+
+Deliberately a FORMAT PLUS A READER, not an integration: a game should
+not link a video codec to be recordable, and a codec should not track a
+game's types. The `.faoscene` layout (FAOS magic, version, frame count,
+authoring resolution, an embedded mesh_pack blob, then 44 bytes per
+pose) is documented well enough that an engine can emit it with
+std::io::Write and nothing else. Mesh geometry reuses mesh_pack rather
+than adding a second geometry representation to keep in sync.
+
+Two conventions are stated in the docs because an engine author cannot
+infer them from the layout, and both have bitten this codebase before:
+the quaternion is [w,x,y,z] not [x,y,z,w] (the shipped v8 bug where
+every frame rendered behind the camera and silently fell back to source
+video), and focal is in PIXELS at the stated resolution, with the
+fov-to-focal conversion written out.
+
+Design decisions worth their place:
+  * malformed or FUTURE-versioned scenes are REFUSED, not guessed —
+    a v2 layout read as v1 yields plausible geometry at wrong poses,
+    which is exactly the 21%-worse case, so an error is strictly better;
+  * the provider rescales intrinsics, so one capture serves several
+    encode resolutions;
+  * out-of-range frames return neutral gray instead of panicking, and
+    plate_lab WARNS on a short pose stream rather than silently coding
+    the tail against gray (which would read as the codec
+    underperforming rather than as missing input).
+
+plate_lab --use-canonical3d <file> encodes against it, and engine_lab
+now emits one (2,688 B for the 2,048-vert arena plus 24 poses), so the
+seam is exercised end-to-end rather than only in-process.
+
+What is NOT done, stated plainly: nothing in games/blackstar-rs writes
+this file yet. The engine side needs its arena geometry and its
+per-frame camera (replay::Frame already carries car/ball state at 30 Hz
+and cinema() already derives a camera, so the pieces exist) dumped
+behind a debug path. That is a blackstar-rs change, not a codec one,
+and it is the remaining step between this seam and a real
+engine-derived measurement on real footage.
+
+### The procedural-surface case (user proposal): FAO BEATS AV1, for the first time on synthetic content
+
+User's case: a game draws its ground as a surface plus a closed-form
+pattern (value noise / fBm / a tiling function). Camera motion turns
+that into full-frame high-frequency change every frame, while the shot's
+TRUE description length is a seed, a few parameters and a camera path.
+bin/ground_lab builds exactly that: fBm value noise on the y=0 plane,
+pinhole camera translating forward and yawing, 48 frames at 640x384.
+
+Circularity caught again and fixed the same way: rendering the footage
+from the same function at the same camera gives 99 dB at 2,904 B, which
+measures only that the renderer is deterministic. The footage now
+carries props the canonical cannot know (solid markers at fixed world
+positions, projected per frame) and a photometric drift standing for
+lighting and post — both injected into the FOOTAGE ONLY.
+
+Measured, dz32, 48 frames:
+
+  v11 2D plate                227,533 B @ 29.939 dB  (plate 25,075 B)
+  v11 no model (prev-MC)      278,108 B @ 29.855 dB
+  v11 PROCEDURAL canonical     58,556 B @ 40.046 dB  (24 B model +
+                                                      24 B/frame camera)
+  control, right function
+    but WRONG camera          209,449 B @ 29.904 dB
+  AV1 crf35                   146,887 B @ 42.785 dB
+  AV1 crf45                    76,323 B @ 39.247 dB
+  AV1 crf55                    36,911 B @ 35.767 dB
+
+At matched quality (~40 dB) v11-procedural is 58,556 B against AV1
+crf45's 76,323 B at 39.25 dB — **23% FEWER BYTES AND +0.8 dB**. This is
+the first time in this codebase that FAO beats AV1 on any content at
+matched quality, and the margin is understated: the model's 24 bytes
+are charged in full with no amortisation, and the camera stream is
+charged at a lazy 24 B/frame that any real coder would delta-code to
+almost nothing.
+
+The user's intuition about the conventional coder is confirmed but the
+mechanism is worth stating precisely: AV1 does not "panic". It codes
+the noise competently and expensively, because motion compensation
+cannot help — the ground is a STATIC pattern seen through a MOVING
+perspective, so every block's content is a resampled, rescaled version
+of content that has no matching block anywhere in the previous frame.
+Near ground sweeps past, far ground barely moves, and no translational
+MV fits both.
+
+That same fact is why the codec's OWN 2D plate fails here — 227,533 B,
+barely better than having no model at all (278,108 B), and the plate is
+25 KB of pure overhead. Perspective ground motion is not a translation,
+which is the identical limitation that killed cross-GOP citation on
+blackstar. So this case does not merely favour FAO; it separates FAO's
+two branches cleanly: the 2D plate is worthless and the parameterised
+3D surface is decisive.
+
+The wrong-camera control (209,449 B @ 29.904) is what makes the win
+attributable: the right function at the wrong pose is no better than no
+model, so the value is in the camera path being correct, not in having
+a noise generator available.
+
+ARCHITECTURAL CONSEQUENCE, and this is the part that changes the
+roadmap: the canonical here is NOT A MESH. Tessellating a ground plane
+finely enough to carry pixel-rate noise needs roughly a vertex per
+pixel, which discards the entire saving. engine_scene.rs currently
+carries geometry only, so it cannot express this case at all. The
+canonical type has to widen from "mesh" to "mesh OR parameterised
+surface", i.e. the engine hands over a SHADER IDENTITY plus parameters
+and the decoder evaluates it. That is a wire-format decision to take
+deliberately, and this measurement is the argument for taking it.
+
+### Real game capture: soldier/early-fps, headless, engine-derived canonical
+
+User's correction: "can't run a wgpu game" is not "can't get game
+data". Survey of the fleet found games/soldier (early-fps) is
+SOFTWARE-RENDERED by default with no native deps — a painter's-
+algorithm renderer whose render() returns an egui::Mesh of 2D
+triangles. It builds and runs headless here.
+
+apps/fao-codec/fao_engine_capture: generates a level with the game's
+OWN procgen (152x152 cells, 553 meshes, 32 rooms), walks an FpsCam
+through it, renders with the game's OWN renderer, rasterises the
+triangles, and hands the codec both the frames and the game's meshes +
+exact camera as a canonical. Deliberately a separate crate in its OWN
+workspace so neither side depends on the other — a game must not link a
+video codec to be recordable, and the codec's builds must not have to
+resolve a game's egui graph.
+
+This removes the standing objection to engine_lab and ground_lab: those
+worlds were authored by me, so they could have been authored to be
+modellable. This one was not.
+
+Circularity caught for the THIRD time and fixed the same way. First run
+gave 99.000 dB at 2,904 B because the canonical render was literally
+the footage. The realistic split is the one a real integration would
+use anyway, and the same split the 2D mover layer already makes: the
+CANONICAL IS THE MAP, actors are per-take. Footage now renders
+level.meshes PLUS five moving actor boxes (built with the game's own
+Mesh3 primitive, through the same renderer) and an exposure drift; the
+canonical stays map-only.
+
+Measured, 48 frames, 640x384, dz32:
+
+  v11 2D plate               249,091 B @ 31.851 dB  (plate 19,948 B)
+  v11 no model               207,336 B @ 31.767 dB
+  v11 ENGINE canonical        42,186 B @ 39.746 dB  (24 B + 24 B/frame)
+  control, WRONG camera      212,766 B @ 31.626 dB
+  AV1 crf40                   38,562 B @ 48.154 dB
+  AV1 crf50                   28,647 B @ 44.142 dB
+  AV1 crf58                   20,150 B @ 40.321 dB
+
+The engine canonical is 5.9x smaller than the codec's own 2D plate
+branch AND 7.9 dB better — the two branches separate as decisively as
+they did on procedural ground. The 2D plate is again WORSE THAN NO
+MODEL AT ALL (249,091 vs 207,336): a translation-warped median cannot
+follow a first-person walk through 3D geometry, and its 20 KB is pure
+overhead. The wrong-camera control (212,766 @ 31.626) confirms the win
+is the camera being right, not the extra predictor.
+
+BUT AV1 WINS HERE, and that is the honest headline. At ~40 dB AV1
+crf58 is 20,150 B against v11's 42,186 — AV1 is 2.1x SMALLER at
+slightly better quality. This is the opposite of the procedural-ground
+result (where v11 won by 23%) and the difference between the two cases
+is the whole lesson: soldier's flat-shaded geometry is CHEAP for a
+conventional coder — large uniform faces, few edges, exactly what large
+transform blocks and good intra prediction eat for almost nothing —
+while fBm noise under perspective motion is the most expensive thing
+you can hand one. The model-based coder wins where pixel statistics are
+hostile and loses where they are friendly, and "engine-rendered" does
+not predict which; the SPECTRUM does. That is the same narrowing the
+dictionary probe forced earlier (blackstar 0.0% STRONG vs Minecraft
+10.7%), now confirmed on the rate axis.
+
+Honest weakness of this capture, recorded at the site: the rasteriser
+is flat-shaded barycentric fill and does not sample the game's texture
+atlas, so the picture carries the game's geometry and lighting but not
+its texture detail. That biases AGAINST the canonical (less
+high-frequency content makes prev-MC and AV1 both look better), so the
+5.9x/7.9 dB margin over the 2D plate is a lower bound — but it also
+means the AV1 comparison above is measured on content missing exactly
+the high-frequency texture that would have favoured v11. Sampling the
+atlas is the next step before treating the AV1 row as final.
+
+### Blocking measured: AV1 barely blocks at all, and v11 IS THE BLOCKY ONE
+
+User's report: AV1 gets blocky to the point of unbearability below
+~500 kbps / crf 45-61. Every AV1 comparison in this codebase has been
+PSNR-anchored, and PSNR is close to blind to exactly that artifact — a
+picture can stay close in mean-square terms while acquiring hard steps
+on the transform grid — so the claim was worth measuring rather than
+accepting or dismissing.
+
+bin/blockiness: for each candidate grid period P, the ratio of mean
+|first difference| ACROSS positions that are multiples of P to the mean
+everywhere else, luma, averaged over frames. 1.000 = no grid structure;
+higher = harder steps on that grid. Per-period rather than one number,
+because AV1 picks among block sizes and the signature lands on whichever
+dominates. It measures ONE artifact and belongs beside PSNR, not
+instead of it.
+
+Procedural ground (48f):
+  file          P=4    P=8   P=16   P=32   P=64
+  source       1.011  0.989  0.951  1.080  0.874
+  AV1 crf35    1.014  0.994  0.958  1.100  0.881
+  AV1 crf45    1.002  0.985  0.955  1.093  0.850
+  AV1 crf55    1.007  1.009  1.010  1.157  0.952
+  v11 dz32     2.686  3.188  4.642  4.251  4.025
+
+blackstar real footage (48f):
+  source       0.885  0.905  0.917  1.023  1.415
+  AV1 crf45    0.889  0.916  0.930  1.037  1.421
+  AV1 crf55    0.884  0.912  0.926  1.036  1.418
+  AV1 crf61    0.894  0.935  0.959  1.066  1.440
+  v11 dz32     1.179  1.251  1.419  1.473  1.869
+
+TWO FINDINGS, and the second one is about this codec, not AV1.
+
+1. The claim does not reproduce on this material. AV1 at crf61 tracks
+   the SOURCE's own grid statistics to within a few percent — its
+   deblocking filter, CDEF and loop restoration are doing exactly the
+   job they exist for. Visual check on a crf61 crop agrees: the
+   degradation is smearing and colour bleed on the high-detail robot,
+   not tiling. The user's experience is real but is likely from
+   encoders or settings that skip those post-filters (hardware
+   encoders, or `-svtav1-params` that disable them), or from content
+   with large flat gradients where banding reads as blocking. Worth
+   re-testing against the actual encoder they see it on.
+
+2. v11 IS THE BLOCKY CODEC, badly, and no metric used all session
+   showed it. 4.64x at P=16 on the ground clip — and P=16 is exactly
+   REGION, this codec's mode-decision granularity — with 2.7-4.0x at
+   the 4x4 transform grid. On real footage 1.42x at P=16 against AV1's
+   0.93x. v11 has NO deblocking filter, no CDEF, no loop restoration:
+   every region boundary where the mode decision switched predictor,
+   and every 4x4 block edge where the dead zone quantised differently,
+   ships its step straight to the viewer.
+
+This changes how to read every matched-PSNR comparison in this session.
+When v11 "matched AV1 at equal PSNR" it was doing so while carrying
+2-5x the grid discontinuity, so those comparisons FLATTERED v11, not
+AV1 — the opposite of the bias I assumed when I noted PSNR
+under-credits v11's SSIM wins on flat synthetic content. The
+procedural-ground result (v11 -23% bytes at +0.8 dB vs AV1) is the one
+that most needs re-reading: v11 wins there on rate while blocking 4.6x
+harder, so at matched PERCEPTUAL quality the margin is smaller and may
+be gone.
+
+Named next construction, and it is now the highest-value one for
+picture quality: a deblocking filter. The information needed is already
+in the encoder — the mode map says exactly where predictor boundaries
+are, and the per-block scale bytes say how hard each block was
+quantised — so a filter can be strength-modulated per edge instead of
+guessing, which is what AV1's own filter does. It is also purely a
+decoder-side operation on the reconstruction, so it costs no wire bytes
+and cannot lose rate.
+
+### Can the codec TELL which representation content wants? A cheap statistic ranks all five clips correctly
+
+User's architecture: the codec needs (1) to detect and label objects
+and (2) to know how each stores best — which will sometimes be
+AV1-shaped. Part (2) is testable right now, because the corpus already
+has five clips with measured v11-vs-AV1 outcomes. If "the spectrum
+decides, not the provenance" is a real law rather than a story fitted
+after the fact, a statistic computed BEFORE encoding should separate
+them.
+
+bin/spectral_probe, two axes from quantities the encoder already
+touches:
+  * HF FRACTION — share of 4x4 DCT energy above DC and the two lowest
+    AC terms. Low on flat shading and gradients (what a conventional
+    coder gets nearly free), high on noise and texture.
+  * TEMPORAL — mean |difference| after the best whole-frame integer
+    shift, normalised by the frame's own spatial activity. Low when
+    motion compensation works, high when it cannot.
+
+Measured, against the outcomes already in this log:
+
+  clip        HF     temporal   hf*tc   measured outcome
+  ground     0.496     5.589     2.77   v11 WINS by 23%
+  soldier    0.347     4.694     1.63   AV1 2.1x smaller
+  w1 film    0.169     2.276     0.38   AV1 ~18x
+  SMITE      0.323     0.905     0.29   AV1 ~15x
+  blackstar  0.344     0.232     0.08   AV1 43x
+
+THE PRODUCT ORDERS ALL FIVE EXACTLY AS THE RATE MEASUREMENTS DID,
+including the two that provenance gets wrong: soldier and blackstar are
+both engine-rendered and sit at opposite ends (1.63 vs 0.08), while
+soldier and ground are both engine-rendered and sit adjacent across the
+crossover. w1 and SMITE are within noise of each other on the statistic
+and were within noise of each other on rate.
+
+My first threshold guess (hf>0.55 AND tc>0.45, two independent gates)
+classified NOTHING as MODEL and was simply wrong — the axes are not
+independent gates, they multiply. That is not a tuning detail: it says
+the quantity that matters is how much high-frequency content the coder
+must transcribe PER UNIT of what motion compensation can save, which is
+exactly the mechanism argued for the ground clip (a static pattern
+under perspective motion has high HF that MC cannot reach).
+
+Stated honestly: n=5, one GOP each, and the crossover is BRACKETED in
+[1.63, 2.77] rather than located. The bin reports "uncertain" inside
+that interval rather than pretending to decide. What it is good for
+today is ORDERING, and ordering is what a router needs first.
+
+Where this leaves the user's two-part architecture:
+  (2) "know how each stores best" — a cheap pre-encode statistic that
+      ranks correctly now exists. The next step is per-REGION rather
+      than per-clip, since the same clip mixes flat sky with textured
+      ground, and routing is only interesting at the granularity where
+      content actually varies.
+  (1) "detect and label objects" — the mover layer already detects
+      objects and the scene protocol already gives them stable ids and
+      an editable graph. What is missing is LABELS with semantics, and
+      the honest note is that nothing in this codec can produce them
+      from pixels; they come either from a vision model or from the
+      engine, and the engine path is the one already measured to work.
+
+### In-loop deblocking: the artifact PSNR hid, now measured and fixed
+
+Built off the blockiness finding (v11 at 4.64x the off-grid gradient on
+the REGION grid where AV1 sits at ~0.95x). Filters both grids the codec
+makes steps on — REGION boundaries where the mode decision may have
+switched predictor, and the 4x4 transform grid where the dead zone may
+have quantised neighbours differently — with strength taken from the
+MODE MAP rather than a global knob: an edge whose two sides chose
+different predictors is filtered harder. Same reasoning as AV1's
+boundary strength, and free here because the mode map is in hand. The
+artifact/edge test is the standard one (only smooth when the step
+ACROSS the boundary is large relative to variation on either SIDE), so
+real edges survive. IN-LOOP: the filtered frame becomes the prev-MC
+reference.
+
+Procedural ground, dz32:
+  strength   bytes     PSNR     SSIM     P=4    P=8   P=16   P=32
+  off      227,533   31.536   0.8656   2.686  3.188  4.642  4.251
+  1        227,517   31.614            2.101  2.506  3.554  3.370
+  2        227,899   31.652   0.8715   1.286  1.479  1.909  1.901
+  4        229,486   31.532            0.720  1.185  2.087  2.049
+
+Strength 2: +0.12 dB, +0.006 SSIM, blockiness on the REGION grid cut
+59% (4.64 -> 1.91), for +0.16% bytes. Strength 4 is past the knee —
+PSNR turns back down and P=4 falls to 0.72, i.e. it has smoothed BELOW
+the source's own grid statistics, which is over-filtering by
+definition.
+
+blackstar real footage, dz32:
+  off  332,841 B @ 35.619 / 0.9750   P=16 1.419
+  s1   331,432 B @ 35.616 / 0.9750   P=16 1.341
+  s2   337,810 B @ 35.591 / 0.9749   P=16 1.219
+Real footage wants a GENTLER setting than synthetic: s1 costs nothing
+(bytes actually fall 0.4%, the in-loop gain) and removes some blocking,
+while s2 costs 1.5% bytes for more artifact reduction and slightly
+worse PSNR. That is the expected shape — this clip started at 1.42x,
+not 4.64x, so there is far less artificial step to remove and more real
+detail to lose.
+
+Honest reading: this is a PICTURE-QUALITY fix, not a rate win. The
+in-loop byte saving is real but tiny (0.4% at s1 on blackstar,
+0.007% on ground); the payoff is that the codec stops shipping steps
+the metrics never charged it for. Kept behind FAO_DEBLOCK=<strength>
+with no default, because the right strength is clearly
+content-dependent (2 on synthetic, 1 on film-like) and picking one
+number would be exactly the fixed-threshold mistake this session has
+now made three times — the fixed MV rate charge, the fixed DICT_MARGIN,
+and the fixed admission gate. The strength wants to come off the same
+spectral statistic spectral_probe computes, which is the next
+construction and ties the two together.
+
+### Where AV1's bytes actually go — and a METHODOLOGY ERROR in every anchor this session
+
+User's question: AV1 grows linearly and holds a bitrate target in the
+hundreds of kbps; if FAO were valid we should see a codec drop far
+below that, so is AV1's size real information or ffmpeg averaging and
+keyframing?
+
+Measured on the 100s blackstar source (6,000 frames, 9.47 MB):
+  mean 1,578 B/frame
+  19 keyframes at a fixed 321-frame interval = 1.49 MB = 15.7% of bytes
+  mean keyframe 78,161 B vs mean inter 1,335 B — a keyframe is 59x
+  per-second bytes: min 36 KB, median 88 KB, max 199 KB, stdev/mean 0.41
+Not averaging. The rate varies 5.5x second to second and tracks
+content, which is CRF-like behaviour, and keyframes are a minority of
+the bill.
+
+Keyframe cadence, same 240 frames at crf45:
+  g=48   401,810 B @ 47.240 dB
+  g=240  273,532 B @ 47.406 dB   <- 32% SMALLER and slightly better
+  g=1000 273,532 B @ 47.406 dB   (only 240 frames, so identical)
+
+MY OWN ERROR, and it runs through this whole session: every SVT-AV1
+anchor I built used `-g 48` to match v11's GOP length. That handicaps
+AV1 by ~32% on this content. The comparison is defensible as a
+STRUCTURAL one — v11 rebuilds a plate every 48 frames, so denying AV1
+cross-GOP prediction is like-for-like — but it is NOT the "would you
+ship this" comparison, and I reported the numbers without stating which
+one they were. Every AV1 column in this log should be read as up to
+~32% larger than a delivery encode would be, which makes v11's
+position WORSE than reported, not better. The one result that survives
+comfortably is the procedural-ground win (v11 -23%), since 32% the
+other way would erase it — that result now needs re-running at g=240
+before it can be quoted.
+
+CBR is also not waste: -b:v 400k on 240 frames produced 190,776 B
+@ 45.45 dB — 381 kbps against a 400 kbps target, i.e. the encoder
+hitting what it was told, at lower quality than the CRF encode. A
+constant bitrate is a constraint the user chose, not padding.
+
+WHY WE DO NOT SEE AN ELITE CODEC DROP BELOW THIS — the decomposition
+that actually answers it:
+  * A world model replaces the KEYFRAME function. On a well-configured
+    stream keyframes are ~16% of bytes, so "the plate is a better
+    keyframe" has a hard ceiling of ~16% no matter how good the model
+    is. That is the entire structural saving available from
+    amortisation, and it matches the earlier finding that GOP-length
+    amortisation is not differential (AV1's keyframe amortises too).
+  * The other ~84% is PER-FRAME NOVELTY: actors moving, camera moving,
+    lighting changing. A static canonical does not predict any of it;
+    only a better INTER predictor does.
+  * So FAO's real claim was never "cheaper keyframes". It is that a
+    world model predicts INTER frames better than motion compensation
+    does. engine_lab measured that this can be true (-31% total with a
+    correct canonical) and spectral_probe measured WHEN (high HF that
+    MC cannot reach). On content where MC works, the ceiling is 16% and
+    AV1 already spends those bits well.
+That is the honest answer to "shouldn't we see it drop below": on most
+content there is no room below, because the bits are not keyframe
+overhead — they are novelty, and novelty is exactly what a static model
+cannot amortise.
+
+### Correcting the correction: the g=48 error barely applied, and preset 6 was not the handicap either
+
+The previous entry said every AV1 anchor this session was handicapped
+~32% by `-g 48`. That over-stated it, and the check is trivial:
+
+  ground.y4m (48 frames), crf45:  g=48 -> 76,323 B
+                                  g=240 -> 76,323 B   IDENTICAL
+  keyframes in the g=48 encode of a 48-frame clip: 1
+
+A 48-frame clip encoded with g=48 contains exactly ONE keyframe, so
+g=240 changes nothing. The 32% penalty I measured was on a 240-FRAME
+clip, where g=48 forces five keyframes. Since almost every anchor in
+this log is a 48-frame GOP, the error affected almost nothing. It
+applied to the 240-frame blackstar amortisation test — which already
+used g=240 — and to nothing else. The bloopers suite used the user's
+own AV1 file rather than my encodes, so it is untouched too.
+
+Recorded because the shape of the mistake matters: I measured a real
+effect on one clip and generalised it to a corpus without checking
+whether the mechanism could even fire there. That is the same error as
+reading prev_mode_share as a value proxy, one level up.
+
+Encoder settings, asked directly: SVT-AV1 v1.7.0, preset 6 throughout.
+Preset is the other place an anchor could be weakened, so it was swept
+(ground.y4m, crf45, g=240):
+
+  preset 2  75,531 B @ 39.508 dB
+  preset 4  76,635 B @ 39.385
+  preset 6  76,323 B @ 39.247   <- used all session
+  preset 8  88,469 B @ 39.089
+
+Preset 2 buys 1% bytes and +0.26 dB over preset 6 — negligible. So the
+anchors were not meaningfully weak on that axis either; preset 8 is
+where it would have mattered.
+
+THE CLAIMED WIN SURVIVES, now against AV1's near-best settings:
+
+  v11 procedural canonical   58,556 B @ 40.046 dB
+  AV1 preset2 crf43 g240     85,805 B @ 40.174 dB / SSIM 0.9757
+  AV1 preset2 crf40 g240    102,549 B @ 41.176 dB
+At matched quality v11 is 32% SMALLER at -0.13 dB. That is a larger
+margin than the 23% first reported against preset 6, because the
+correct AV1 point at 40 dB is crf43 rather than the crf45 I originally
+compared against.
+
+And the loss on soldier survives too, also against preset 2:
+  v11 ENGINE canonical  42,186 B @ 39.746 dB
+  AV1 preset2 crf58     18,941 B @ 42.346 dB
+AV1 is 2.2x smaller AND 2.6 dB better — slightly worse for v11 than the
+preset-6 comparison said. Both verdicts stand and the split between
+them is unchanged: the model wins where MC cannot reach the content,
+loses where it can.
+
+### Texture-adaptive deblock strength: right on real footage, WRONG on synthetic — and the premise was backwards
+
+The filter had no default because strength 2 measured right on
+synthetic content and 1 on real footage. Rather than pick a number
+(the fixed-threshold mistake this codec has made three times), the
+strength is now derived PER REGION from local texture — mean |second
+difference| over mean |first difference|, a cheap stand-in for
+spectral_probe's HF fraction. Premise: flat regions show blocking
+glaringly and have no detail to lose, so filter them hard; textured
+regions mask blocking and risk real detail, so damp.
+
+Measured, and the two clips disagree:
+
+  blackstar (real footage), dz32
+    off            332,841 B @ 35.619 dB / 0.97502   P16 1.419
+    fixed s1       331,432 B @ 35.616   / 0.97500    P16 1.341
+    fixed s2       337,810 B @ 35.591   / 0.97491    P16 1.219
+    ADAPTIVE s2    333,439 B @ 35.681   / 0.97506    P16 1.344
+    -> best PSNR AND best SSIM of any setting tried, for +0.2% bytes
+
+  procedural ground, dz32
+    off            227,533 B @ 31.536 / 0.8656   P16 4.642
+    fixed s2       227,899 B @ 31.652 / 0.8715   P16 1.909
+    ADAPTIVE s2    227,599 B @ 31.572 / 0.8677   P16 3.802
+    ADAPTIVE s4    227,333 B @ 31.616 / 0.8686   P16 3.117
+    -> WORSE than fixed on every axis that matters
+
+THE PREMISE IS BACKWARDS ON THE SECOND CLIP. That clip is entirely
+texture, so every region damps to the floor and the artifact survives —
+and filtering the textured regions is precisely what had helped, since
+their blocking was real error rather than protected detail. The
+adaptive rule cannot tell "detail I must protect" from "noise whose
+blocking I must fix", because reconstructed texture looks identical in
+both cases.
+
+The discriminating signal is available and I named it in the filter's
+own header without using it: blocking comes from QUANTISATION, so what
+separates the two cases is how hard each block was quantised, which the
+encoder holds in its per-block scale bytes. A block quantised coarsely
+in a flat area is an artifact; high curvature in a finely-quantised
+block is content. Reading the scale bytes is the named next
+construction.
+
+Until then both behaviours stay reachable — FAO_DEBLOCK=<strength> is
+adaptive, FAO_DEBLOCK_FIXED=1 restores uniform strength (verified
+byte-identical to the earlier fixed measurement, 227,899 B and P16
+1.909) — because one of them is right on real footage and the other on
+synthetic, and guessing which the caller has is exactly the mistake
+this entry exists to avoid repeating.
+
+### Quantisation-error deblock strength: better than texture on synthetic, WORSE on real — the split does not resolve
+
+The named construction: blocking comes from quantisation, so measure
+per region how far the reconstruction strayed from the source,
+normalised by the dead zone, and filter hard only where the coder was
+spending few enough bits to have produced the step. Encoder-side
+information the filter already had and was not reading. Three modes now
+exist (FAO_DEBLOCK_MODE = qerr | texture | fixed).
+
+All three, strength 2, against unfiltered:
+
+  procedural ground        bytes    PSNR    SSIM    P=16
+    off                  227,533  31.536  0.8656   4.642
+    fixed                227,899  31.652  0.8715   1.909  <- best
+    texture              227,599  31.572  0.8677   3.802
+    qerr                 229,010  31.651  0.8707   2.413
+
+  blackstar real           bytes    PSNR     SSIM    P=16
+    off                  332,841  35.619  0.97502  1.419
+    fixed s2             337,810  35.591  0.97491  1.219
+    texture              333,439  35.681  0.97506  1.344  <- best PSNR/SSIM
+    qerr                 334,889  35.574  0.97484  1.300
+
+qerr beats texture on the synthetic clip decisively (blockiness 3.80 ->
+2.41 at +0.08 dB and +0.003 SSIM) and LOSES to it on real footage
+(35.574 vs 35.681 dB, lower SSIM), while fixed remains best on
+synthetic. THREE RULES, THREE DIFFERENT WINNERS, and which one wins
+also depends on which metric is weighted: on blackstar, texture wins on
+PSNR/SSIM while qerr wins on blockiness and OFF is cheapest.
+
+That is the actual finding, and it is a stopping point rather than a
+failure to try harder. The metrics available cannot settle this:
+  * PSNR and SSIM systematically reward NOT filtering, because
+    filtering moves pixels away from the source even when it removes an
+    artifact a viewer would object to;
+  * blockiness measures one artifact and would happily be gamed by
+    over-smoothing (strength 4 already drove P=4 to 0.72, BELOW the
+    source's own statistic);
+  * no combination of the two expresses the trade a viewer makes.
+libvmaf is not compiled into this ffmpeg (only vmafmotion), so the one
+metric designed for this question is unavailable here.
+
+So the honest state: the filter WORKS — every mode cuts grid
+discontinuity substantially, and the in-loop byte effect is neutral to
+slightly positive — but its strength RULE cannot be chosen on this
+evidence. Choosing one anyway would be the fixed-threshold mistake
+again, this time dressed as adaptivity. Recorded as blocked on a
+perceptual metric: either build/obtain libvmaf, or make a deliberate
+policy decision that a fixed amount of blockiness reduction is worth a
+stated amount of PSNR, and write that trade down as a choice rather
+than discovering it as a measurement.
+
+### MS-SSIM settles the deblock question — and every adaptive rule I built LOSES to filtering uniformly
+
+libvmaf is not in this ffmpeg, so bin/msssim implements MS-SSIM (Wang,
+Simoncelli & Bovik 2003) with the published window, constants and
+five scale weights. Chosen precisely because it is not mine: inventing
+a metric to settle an argument about my own filter would be circular.
+It penalises errors that survive downsampling — which is what a step on
+a 16-pixel grid does — while discounting high-frequency noise a
+single-scale SSIM fixates on. Sanity-checked: identical input scores
+exactly 1.00000.
+
+  procedural ground        MS-SSIM
+    off (no deblock)       0.88716
+    FIXED strength 2       0.89591   <- best
+    qerr strength 2        0.89438
+    texture strength 2     0.88966
+
+  blackstar real footage   MS-SSIM
+    off                    0.98987
+    FIXED strength 2       0.99013   <- best
+    texture strength 2     0.99000
+    qerr strength 2        0.98995
+
+FIXED WINS ON BOTH CLIPS. Both adaptive rules — the texture one and the
+quantisation-error one built to replace it — are worse than simply
+filtering everything at uniform strength, and one of them (texture) is
+barely better than not filtering at all on the synthetic clip.
+
+This overturns the previous entry's reading. PSNR and SSIM had ranked
+texture FIRST on blackstar (35.681 dB / 0.97506, the best single-scale
+numbers of any setting), which is what made the split look real and
+unresolvable. At multiple scales that ranking inverts: texture's
+damping preserves exactly the grid steps that survive downsampling,
+and single-scale metrics could not see it.
+
+Two things worth carrying beyond this filter:
+  * The region-level adaptivity was NET NEGATIVE. Two plausible,
+    mechanism-backed rules both lost to a constant. Being principled
+    about where to apply effort is not the same as being right, and I
+    built the second rule (qerr) specifically to fix the first without
+    ever testing whether adaptivity itself was helping.
+  * The metric chose the outcome. Three sessions of deblock work looked
+    unresolvable under PSNR/SSIM/blockiness and resolved cleanly in one
+    measurement under a metric matched to the artifact. Before
+    concluding that a design question is genuinely undecidable, check
+    whether the instrument is.
+
+Default is now FAO_DEBLOCK_MODE=fixed. The adaptive modes stay
+reachable for re-testing when a perceptual metric better than MS-SSIM
+is available, but they are recorded as measured losses, not options.
+
+### Re-adjudicating the headline claim under MS-SSIM: the win SHRINKS from 32% to ~5%, and nearly inverts
+
+The MS-SSIM entry ended by noting that other results in this log were
+decided by PSNR/SSIM and might not survive a metric matched to the
+artifact. The biggest is the procedural-ground claim — the only content
+on which this codec beats AV1 — so it was re-run first.
+
+At MATCHED PSNR, which is how it was originally reported:
+  v11 procedural   58,556 B @ 40.046 dB   MS-SSIM 0.97692
+  AV1 p2 crf43     85,805 B @ 40.174 dB   MS-SSIM 0.98712
+Equal PSNR, and AV1 is a full point of MS-SSIM ahead. v11 also blocks
+harder (P=16 1.514 vs 0.935). So "32% smaller at matched quality" was
+32% smaller at matched PSNR and LOWER perceptual quality — the same
+error the deblock work had just been caught making.
+
+Re-measured on the MS-SSIM axis, with the deblocker on (fixed s2,
+which is now the default and helps here: 0.97692 -> 0.98050 for +0.8%
+bytes):
+  v11 procedural + deblock   59,036 B   MS-SSIM 0.98050
+  AV1 p2 crf50               54,396 B   MS-SSIM 0.97730
+  AV1 p2 crf47               66,179 B   MS-SSIM 0.98210
+v11 sits BETWEEN crf50 and crf47, closer to crf47. Interpolating on
+MS-SSIM, the AV1 point equal to v11 costs about 62 KB against v11's
+59 KB — v11 is roughly 5% smaller, not 32%.
+
+VERDICT: the win survives, barely, and only with deblocking on. The
+honest statement is now "v11 is approximately at parity with AV1 on
+procedural-surface content, perhaps ~5% ahead", not "32% ahead". Every
+earlier framing of this result in this log should be read with that
+correction, including the one that said the claim had SURVIVED the
+preset and GOP-length corrections — it survived those, and then did not
+survive the metric.
+
+What actually held up under all three corrections:
+  * the DIRECTION is real and repeatable — a world model beats a pixel
+    coder on content where motion compensation cannot reach, and the
+    wrong-camera control (209,449 B, no better than no model) says the
+    win is the camera being right;
+  * the magnitude was inflated roughly 6x by a metric that does not
+    charge for the artifact this codec produces most.
+The gap between those two sentences is the whole lesson of the last
+four entries: the codec's real deficit is not rate, it is that it
+degrades in a way PSNR does not price, so every rate comparison made
+against PSNR has been flattering it.
+
+### Deblocking turned ON by default — the first default set with the right metric and three content types
+
+MS-SSIM, deblock off -> strength 2 (fixed mode):
+  procedural ground   0.88716 -> 0.89591   bytes +0.16%
+  blackstar (game)    0.98987 -> 0.99013   bytes +1.5%
+  bloopers w1 (film)  0.97625 -> 0.97695   bytes +0.56%
+Grid discontinuity in the same runs, against each SOURCE's own figure:
+  film    source P=16 1.123 | off 2.860 -> deblocked 1.993
+  ground  source P=16 0.951 | off 4.642 -> deblocked 1.909
+Both move TOWARD the source statistic and stop short of it, which is
+the check that separates repair from over-smoothing (strength 4
+overshot to 0.72 on ground, below the source, and was rejected for it).
+
+Turned on rather than left opt-in because the artifact it removes is
+precisely the one PSNR does not price, and this codec was measured
+shipping 2-5x AV1's grid discontinuity while reporting competitive
+PSNR. Every rate comparison in this project was made in that state.
+FAO_DEBLOCK=0 disables; verified byte-identical to the pre-deblock
+baseline (487,382 B on w1), and the default verified byte-identical to
+an explicit FAO_DEBLOCK=2 (490,100 B).
+
+Worth stating plainly what this default is and is not. It is a
+PICTURE-QUALITY change that costs 0.2-1.5% of the bytes; it is not a
+rate improvement and does not move this codec's standing against AV1
+except on the procedural clip, where it is what keeps the win alive
+(0.97692 -> 0.98050 MS-SSIM, turning a lost comparison into a ~5% one).
+
+This is also the first default set in the v11 line with evidence from
+three content types AND a metric matched to the artifact. The three
+previous fixed constants in this codec — the MV rate charge,
+DICT_MARGIN, and the mover admission gate — were each set from one
+clip and each later measured wrong on a second. The procedure that
+caught them all was the same: sweep on content the constant was not
+derived from, and score with something that charges for the failure
+mode in question.
+
+### REGION=16 swept for the first time — the inherited constant is right, and REGION=8 is strictly wrong
+
+Applying the procedure that caught the other three fixed constants:
+sweep on content it was not derived from, score with a metric that
+charges for the failure mode. REGION sets mode granularity, the MV
+field, gain/offset, the dictionary fingerprint, mover masks and the
+deblock grid, and side info was 22% of blackstar's bytes and 57% of a
+quiet film shot's — so it is the largest untested constant in the
+codec. It is a compile-time const, so each point is a rebuild.
+
+  bloopers w1 (film), dz32, deblocked
+    REGION=8    834,191 B  MS-SSIM 0.97227   (mode+mv 618,452)
+    REGION=16   490,100 B          0.97695   (mode+mv 286,042)
+    REGION=32   388,250 B          0.96733   (mode+mv 146,182)
+  blackstar (game), dz32, deblocked
+    REGION=8    480,316 B  MS-SSIM 0.98623
+    REGION=16   337,810 B          0.99013
+    REGION=32   338,722 B          0.98756
+
+REGION=8 IS STRICTLY DOMINATED on both clips: it costs 70% more bytes
+on film and 42% more on the game while scoring WORSE on both. Finer
+mode granularity does not buy better prediction here — it buys a mode
+flag and a motion vector per 8x8 block, and the side info triples
+(286 KB -> 618 KB on film) faster than the residual falls (169.9 KB ->
+143.6 KB). That is a clean, one-directional result and it retires the
+"smaller regions would adapt better" intuition.
+
+REGION=32 is the interesting one, and it is a REAL trade rather than a
+domination: on film it saves 20.8% of bytes for -0.0096 MS-SSIM.
+Priced against the codec's OWN dead-zone ladder on the same clip and
+the same metric:
+
+  R16 dz40   -61.9 KB  -0.00229  =  27,022 KB per MS-SSIM point
+  R16 dz48   -88.7 KB  -0.00423  =  20,981 KB per MS-SSIM point
+  R32 dz32  -101.8 KB  -0.00962  =  10,587 KB per MS-SSIM point
+
+REGION=32 buys its bytes at HALF the exchange rate the dead zone
+offers. Anyone wanting that many bytes off should raise dz, not coarsen
+the region grid — and on blackstar REGION=32 is not even a trade, it is
+strictly worse (+0.3% bytes, -0.0026 MS-SSIM).
+
+VERDICT: REGION=16 survives, and unlike the other three constants it
+survives on both clips and on the right metric. Recorded because a
+negative sweep is worth as much as a positive one — this constant can
+now be left alone with evidence instead of by inheritance. Restored to
+16 and verified byte-identical to the pre-sweep baseline (490,100 B on
+w1); suite 97/0.
+
+Remaining inherited constants still unswept by this procedure:
+PLATE_DZ_DIV (swept on blackstar only, survived), the mover detection
+threshold, DICT_MAX_CAND/spread, and the 4x4 transform size itself —
+which is the one REGION=8's failure most implicates, since the side
+info explosion came from per-region flags rather than from the
+transform.
+
+### PLATE_DZ_DIV retuned 8 -> 4: the fourth inherited constant, and the fourth to be wrong
+
+The plate's dead-zone ratio was chosen by a full-suite sweep scored on
+PSNR, recorded at the site as "dz/8 sits at the knee, 19.6 MB per dB".
+That sweep measured the right thing with the wrong instrument: a
+coarser plate propagates its error into every frame that predicts from
+it, and the resulting damage is structural rather than mean-square,
+which is exactly the class of error PSNR under-prices.
+
+Re-swept on two content types with MS-SSIM:
+
+  bloopers w1 (film), dz32
+    div 4    465,286 B   MS-SSIM 0.97712
+    div 8    490,100 B           0.97695   (previous default)
+    div 16   516,641 B           0.97694
+  blackstar (game), dz32
+    div 2    303,877 B   MS-SSIM 0.98872
+    div 4    326,691 B           0.98993
+    div 8    337,810 B           0.99013   (previous default)
+
+On film div4 is STRICTLY BETTER — 5.1% fewer bytes AND higher MS-SSIM,
+so there is no trade to weigh. On blackstar it is a trade, 3.3% fewer
+bytes for -0.00020, and pricing it against that clip's own dead-zone
+ladder gives 55,595 KB per MS-SSIM point versus the ladder's ~27,000:
+buying those bytes through the plate ratio is TWICE as efficient as
+buying them by raising dz. Strictly better on one clip, better-than-
+ladder on the other, so 4 replaces 8. div16 loses on both axes on film
+and is not a candidate.
+
+Verified byte-identical to an explicit FAO_PLATE_DZ_DIV=4 (465,286 B on
+w1); suite 97/0; the override remains.
+
+Scoreboard for the procedure, now four constants deep. Each was set
+from a single measurement and each was wrong when re-swept on content
+it was not derived from, with a metric that charges for its failure
+mode: the MV rate charge, DICT_MARGIN, the mover admission gate, and
+now PLATE_DZ_DIV. REGION=16 is the only one that has survived. The
+common shape is not carelessness in the original tuning — every one of
+those sweeps was real work — it is that a constant tuned on one clip
+with one metric encodes that clip and that metric, and neither fact is
+visible in the constant afterwards.
+
+### PLATE_DZ_DIV, completed: 8 -> 2, and the "references need finer quantisation" premise is false on film
+
+The previous entry retuned 8 -> 4 on a three-point grid (4, 8, 16). 4
+was the LOWEST point tested, i.e. the winner sat at the edge of the
+grid — which is not a knee, it is a direction. Completing it changed
+the answer.
+
+  film w1 (dz32)                 blackstar game (dz32)
+    div1  444,448  0.97721         div1  297,076  0.98651
+    div2  449,872  0.97721         div2  303,877  0.98872
+    div3  457,969  0.97714         div4  326,691  0.98993
+    div4  465,286  0.97712         div8  337,810  0.99013
+    div8  490,100  0.97695
+    div16 516,641  0.97694
+
+On FILM every ratio below 8 is STRICTLY BETTER than 8 — fewer bytes AND
+higher MS-SSIM — and it saturates at 2 (div1 and div2 score identically
+at 0.97721, div1 saving only 5 KB more). So the plate had been coded
+four times finer than it needed to be, for 45 KB of pure waste per GOP.
+
+The premise in the original comment is FALSE on this content: "the
+plate is a REFERENCE, so its errors propagate, so it gets a finer dead
+zone than the frames." The extra fidelity never reached the output,
+because the frames' own dead zone discards it. That is exactly the
+mechanism the half-res-plate negative found on the SPATIAL axis
+("a cheaper reference is only cheap if the residual coder will fix it")
+— the same fact read in the profitable direction on the AMPLITUDE axis.
+Two entries in this log drew opposite conclusions from one mechanism
+because one was scored by PSNR and one by MS-SSIM.
+
+On GAME content the premise holds — MS-SSIM falls monotonically as the
+plate coarsens — so the choice is an exchange rate, not a domination:
+div2 costs 24,066 KB per MS-SSIM point against that clip's ladder at
+~27,000 (still cheaper than raising dz), while div1 costs 11,252 and is
+clearly worse than the ladder. 2 is the crossover.
+
+2 is the only point at-or-better than the ladder on both clips, so it
+is the default. Verified byte-identical to explicit FAO_PLATE_DZ_DIV=2
+(449,872 B on w1); suite 97/0.
+
+Process note, and it is the reason this entry exists as a correction
+rather than a footnote: a sweep whose winner is at the edge of the grid
+has not found an optimum, and I committed one anyway an hour ago. The
+check is mechanical — if the best point is the first or last tried,
+extend the grid — and it costs one more measurement.
+
+### Full 19-shot suite re-run with current defaults, scored on MS-SSIM
+
+Everything changed since the last suite: PLATE_DZ_DIV 8 -> 2,
+deblocking on by default at strength 2, and MS-SSIM as the scoring
+metric instead of PSNR. docs/suite_current_dz32.csv.
+
+  v11.3 (recorded, dz/8 plate, no deblock)   20.915 MB
+  CURRENT (dz/2 plate, deblock on)           19.663 MB   -6.0%
+  frame-weighted MS-SSIM                      0.96186
+  per shot: 15 wins, 2 losses, 2 exact ties
+
+The two ties are shots 5 and 17 reproducing byte-for-byte (297 and, on
+shot 17, 136 B — that one IMPROVED from 965 because the plate ratio
+change shrank a 2-frame shot's plate). Losses are shot 2 (+7.1%) and
+shot 10 (+2.5%). The wins are broad rather than concentrated: shot 4
+-14.3%, shot 7 -15.4%, shot 18 -13.5%, shot 11 -12.5%, shot 8 -9.1%.
+
+Standing against the user's AV1-150k anchor, now on the same metric:
+the anchor scores MS-SSIM 0.96538 on a 96-frame window against v11's
+0.96186 frame-weighted over the whole clip. So AV1 delivers slightly
+BETTER perceptual quality at 0.989 MB against v11's 19.663 MB — the
+codec is ~20x larger at marginally worse quality on film. That is the
+same bimodal verdict the project has carried since the first suite;
+the improvements this session moved the bytes 6% and did not change
+the standing.
+
+Two honest notes on this comparison. The 0.96538 is measured on one
+96-frame window rather than the full clip (the full-clip MS-SSIM run
+was killed for memory — the metric holds five pyramid levels of f64
+per frame, and 1080 frames of 1920x800 does not fit), so it is
+indicative rather than exact. And the two figures aggregate
+differently: v11's is frame-weighted across 19 shots, the anchor's is
+one window inside shot 10.
+
+What this suite is actually good for is the RELATIVE number: 6% fewer
+bytes at a metric that now charges for the artifact the codec produces,
+from two constant retunes and a filter, with no new coding tools. Both
+retuned constants had been set with PSNR, which is the whole point —
+this 6% was not bought, it was recovered from measurement error.
+
+### The mode-decision gates, swept for the first time: 64/96 -> 32/48
+
+The last two constants sitting in EVERY encode and never measured. A
+region leaves plate mode for prev-MC only if prev beats plate by more
+than prev_gate; it goes intra only if intra beats the best temporal
+predictor by more than intra_gate. Both exist so grain noise cannot
+dither a region into a mode that costs side bytes, and both values were
+written by hand.
+
+  prev gate, film w1 (dz32, MS-SSIM)
+    0    448,981  0.97724
+    32   448,036  0.97726   <- interior optimum
+    64   449,872  0.97721   (previous default)
+    128  448,883  0.97715
+    256  450,898  0.97698
+  intra gate, film w1
+    0    442,599  0.97731
+    48   440,657  0.97739   <- interior optimum
+    96   449,872  0.97721   (previous default)
+    192  465,163  0.97673
+    384  475,349  0.97612
+
+Both winners are INTERIOR — neighbours worse on each side — so the
+edge-of-grid failure that forced the PLATE_DZ_DIV correction does not
+apply here. Both are strictly better than the hand-written value on
+film: fewer bytes AND higher MS-SSIM.
+
+Cross-checked on blackstar: prev=32 is also strictly better there
+(-1.4 KB, +0.00002); intra=48 is a trade rather than a win (+1.7 KB for
++0.00011 = 15,818 KB per MS-SSIM point against that clip's ladder at
+~24,066, so it buys quality more cheaply than lowering dz would).
+
+Combined on film: 442,053 B @ 0.97746 against the previous default's
+449,872 @ 0.97721 — -1.7% bytes and +0.00025 MS-SSIM together, and both
+gates contribute (the pair beats either alone). Suite 97/0.
+
+The intra gate is the interesting one: at 96 it was suppressing intra
+so hard that raising it further cost 5.7% MORE bytes by 384, i.e. the
+gate was on the steep side of its own curve and pointed the wrong way.
+Halving it recovered 2% of the file. That the hand-written value sat
+near a steep gradient rather than in a flat basin is the argument for
+sweeping the rest: a constant nobody measured is not merely unverified,
+it is uniformly likely to be anywhere on the curve.
+
+Constants scoreboard, now six deep: MV rate charge, DICT_MARGIN, mover
+admission gate, PLATE_DZ_DIV, prev gate and intra gate all measured
+wrong; REGION=16 and deblock-strength-2 the only survivors.
+
+### GAIN_GATE swept: it SURVIVES, and the exchange-rate framing is why
+
+Last constant in the default encode path never measured. The L1 win a
+region's gain/offset correction must clear to be worth ~2 wire bytes.
+
+  film w1 (dz32, MS-SSIM)          blackstar (dz32)
+     48  615,594  0.97888            128  318,506  0.98912
+     96  564,694  0.97887            192  305,617  0.98883
+    128  500,790  0.97857            256  302,300  0.98863
+    192  442,053  0.97746
+    256  423,478  0.97612
+    384  408,666  0.97420
+    768  401,875  0.97075
+
+Read as raw quality this says LOWER IS BETTER — gate 96 scores 0.97887
+against 192's 0.97746 on film. That reading is wrong, and it is the
+same mistake as the original PSNR-matched AV1 comparisons: it ignores
+what the bytes could have bought elsewhere. Gate 96 costs 28% more
+bytes for quality available far more cheaply through the quantiser.
+
+Priced as MARGINAL exchange rate against each clip's own dead-zone
+ladder, the picture is unambiguous and identical on both:
+  film       96->128  213,013 KB/pt raise | 128->192 52,916 raise
+             192->256  13,862 KB/pt STOP
+  blackstar  128->192  44,445 KB/pt raise | 192->256 16,585 STOP
+The gate crosses its clip's ladder rate between 192 and 256 on BOTH
+clips. That is a stronger result than "192 scores best": it means 192
+sits where a byte spent on gain correction stops beating a byte spent
+through the quantiser, and the crossover is a property of the tool
+rather than of one clip.
+
+So GAIN_GATE=192 is the only hand-written constant in this codec to
+survive its sweep. Provenance is now recorded at the site, as it is for
+the six that did not.
+
+That closes the default encode path: every constant in it —
+REGION, PLATE_DZ_DIV, prev gate, intra gate, GAIN_GATE, deblock
+strength and mode — has now been swept on at least two content types
+with a metric matched to the artifact, and each carries its numbers in
+a comment. Two survived, five moved.
+
+### Final suite with the closed constant set
+
+All 19 shots, every default-path constant now swept
+(docs/suite_final_dz32.csv):
+
+  v11.3 recorded baseline   20.915 MB
+  FINAL                     19.657 MB   (94.0%)   MS-SSIM 0.96200
+  previous run (pre-gate)   19.663 MB             MS-SSIM 0.96186
+  per shot: 15 wins, 2 losses, 2 exact ties
+
+The gate retune moved the aggregate barely at all — 6 KB of 19.7 MB —
+while raising MS-SSIM 0.00014, which is a much better description of it
+than the -1.7% measured on the single film GOP it was tuned against.
+Per shot it is 10 shots better on BOTH axes, 4 mixed, and 2 worse on
+both (shots 9 and 18, the two hardest motion shots). Shot 16 alone gave
+back 53 KB; shot 19 cost 83 KB.
+
+That per-shot spread is the honest lesson about single-clip tuning,
+including the tuning done in this session: w1 is one GOP inside shot
+10, and shot 10 is one of the four that got WORSE in bytes. A constant
+measured on w1 and cross-checked on blackstar still moved two suite
+shots the wrong way. The cross-check made the decision defensible, not
+universally right, and the aggregate held only because the wins are
+broader than the losses.
+
+Standing against the user's AV1-150k anchor is unchanged: ~20x the
+bytes at slightly lower MS-SSIM on film. Nothing in this session's
+constant work touched that verdict, and nothing was expected to — the
+6% came from measurement error in the defaults, not from a new coding
+idea.
+
+State of the constant sweep, complete for the default path:
+  moved:    PLATE_DZ_DIV 8->2, prev gate 64->32, intra gate 96->48,
+            plus deblock turned on (new tool, not a retune)
+  survived: REGION=16, GAIN_GATE=192, deblock strength 2, deblock
+            mode fixed
+  off-path, still unswept: DICT_MARGIN (edge-of-grid, uncorrected),
+            DICT_MAX_CAND (also an edge), mover detection threshold,
+            and the 4x4 transform size that REGION=8's failure
+            implicated.
+
+### The plate router was scoring on SSE — fixed, and it now finds a shot where the plate is HARMFUL
+
+Diagnosing the suite's two worst shots (9 at MS-SSIM 0.907, 18 at
+0.927, against a 0.962 average) turned up something the null-hypothesis
+machinery had been built for and never caught.
+
+  bloopers shot 9  (48f) motion max |shift| 169.7px, min confidence 0.11
+    with plate    1,141,422 B  MS-SSIM 0.89747  (plate 126,218 B)
+    NO plate      1,041,582 B          0.89821
+    -> no-plate is STRICTLY BETTER: -8.7% bytes AND higher quality
+  bloopers shot 18 (33f) motion max 20.5px, confidence 0.89
+    with plate      989,711 B  MS-SSIM 0.92721  (plate 186,700 B)
+    NO plate        893,962 B          0.91743
+    -> plate wins: -9.7% bytes for -0.00978 is 9,790 KB per MS-SSIM
+       point against a ladder at ~27,000, a bad trade
+
+So on shot 9 the plate is not merely unhelpful, it is HARMFUL, and the
+cause is visible in the motion line: min confidence 0.11 with 170 px of
+shift. The plate is built by motion-compensating frames into a common
+frame, so when the motion estimate is unreliable the plate is a blur of
+misaligned content — 126 KB spent to make prediction worse.
+
+encode_gop_routed exists for exactly this and got it WRONG, picking
+PLATE, because it scored on SSE. SSE ranked the branches the other way
+by 0.9%. That is the same PSNR-domain error as the deblock rules and
+the AV1 comparisons, and it is worse here than elsewhere: a router that
+inherits the wrong metric makes confidently wrong decisions rather than
+noisy ones.
+
+Fixed by scoring the router on MS-SSIM (lifted from bin/msssim into
+src/msssim.rs so the encoder can call it; affordable because this is
+one binary choice per GOP over branches already fully encoded).
+
+The calibration took two attempts and the failure is worth recording.
+First version scaled the quality term by pixel count, which made the
+rate term dominate 100:1 and flipped the router to NO-PLATE on
+everything — accidentally right on shot 9, wrong on shot 18. The
+principled scale is the one every constant in this codec has been
+priced against: the clip's own dead-zone ladder, ~25,000,000 bytes per
+MS-SSIM point at dz32. Expressing J in BYTES as
+    J = bytes + (1 - MS-SSIM) x LADDER
+makes the comparison "would these bytes have bought more quality
+through the quantiser instead", which is what the routing question
+actually is. Both shots now route correctly.
+
+Worth noting what this does NOT yet do: --plate-route is still opt-in
+and costs a second full encode, so the suite does not use it. The cheap
+predictor is sitting in plain sight — motion confidence 0.11 vs 0.81
+and 0.89 separates the three shots perfectly — but one clean separation
+on three shots is a hypothesis, and this session has now been burned
+four times by constants fitted to that little evidence.
+
+### Frame bounds: a silent 1080p bug the whole test corpus hid
+
+User asked what happens at the bounds of a video and whether anything
+there is blowing up the numbers. It is, and the corpus had been hiding
+it by coincidence.
+
+gw and gh are fw/REGION and fh/REGION, which TRUNCATE. Any remainder
+strip on the right or bottom therefore never gets a mode decision, a
+motion vector or a gain correction — it silently takes the raw model
+prediction and the residual coder pays for the whole difference.
+Nothing crashes, which is exactly why it survived.
+
+Every clip used in this project is divisible by 16 by luck: 1920x800
+(the bloopers crop), 1536x864 (blackstar), 3840x2160 (Minecraft),
+640x384 (the synthetic labs), 1280x720. **1920x1080 is not** —
+1080/16 = 67.5 — so eight rows of every 1080p frame were coded that
+way, on the most common video size there is. The SMITE clip is 1080p
+and every SMITE measurement in this log carries it.
+
+Measured, SMITE 32 frames at dz32:
+  1920x1080 (8 rows uncovered)   2,187,422 B
+  1920x1072 (exact multiple)     2,100,682 B
+  -> 86,740 B for 8 rows = 0.177 B/px, against 0.032 B/px for
+     properly-coded content. FIVE AND A HALF TIMES the per-pixel cost,
+     4% of the file for 0.74% of the pixels.
+
+Fixed by replicate-padding to a multiple of REGION on the way in and
+cropping the reconstruction on the way out, rather than by teaching
+every region loop to clamp. The padding is a copy of the edge row, so
+it predicts near-perfectly and costs almost nothing, and a wrapper
+cannot introduce bounds bugs into the mode decision — which would be a
+worse failure than the one being fixed. Divisible sizes take a
+zero-cost early exit, verified by the suite staying 97/0 and by the
+divisible-size measurements in this log being unchanged.
+
+After the fix, same clip: 2,165,467 B @ MS-SSIM 0.95383 against
+2,187,422 @ 0.95324 — 1.0% fewer bytes AND higher quality, output
+verified still 1920x1080. Smaller than the 4% the strip was costing,
+because the padded rows now participate in mode decisions and add a
+little side info of their own; the net is what matters and it is
+strictly positive.
+
+The general point is the one the user's question implies: an encoder's
+edge handling is invisible in aggregate numbers and only shows up when
+someone asks what happens at the boundary. Worth checking the same way:
+sad_region and search_mv clamp their REFERENCE coordinates to the frame
+(so an MV pointing off-frame reads replicated edge pixels rather than
+failing), intra DC/planar fall back when the top or left border is
+missing, and the deblock filter skips the first 4 columns and rows.
+Those are all deliberate and were verified by reading; the region-grid
+truncation was not deliberate and was found only by measuring.

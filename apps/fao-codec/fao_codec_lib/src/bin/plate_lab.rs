@@ -460,6 +460,74 @@ fn main() {
                 }
                 cum[t] = gm::compose(&a, &cum[t - 1]);
             }
+            // Pose-vs-tracks desync census. The pose track accumulates
+            // GLOBAL phase-correlation motion, and only when confidence
+            // clears 0.15; the observations that triangulation consumes
+            // come from the FEATURE TRACKER. If those two disagree, every
+            // reprojection is wrong by the drift between them and no
+            // threshold tuning can help — so measure the disagreement
+            // directly instead of inferring it.
+            {
+                let (mut cum_pc, mut cum_tr) = (0.0f32, 0.0f32);
+                let mut worst = 0.0f32;
+                for t in 1..nfr {
+                    let mut dx: Vec<f32> = Vec::new();
+                    for (id, &(x1, _)) in &per_frame[t] {
+                        if let Some(&(x0, _)) = per_frame[t - 1].get(id) {
+                            dx.push(x1 - x0);
+                        }
+                    }
+                    if dx.len() < 6 { continue; }
+                    dx.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let med = dx[dx.len() / 2];
+                    cum_tr += med;
+                    cum_pc += poses[t].position.x - poses[t - 1].position.x;
+                    let d = (cum_tr + cum_pc).abs();
+                    if d > worst { worst = d; }
+                }
+                println!(
+                    "pose-vs-tracks: cumulative pose dx {:.1}px, cumulative track dx {:.1}px, worst |sum| {:.1}px",
+                    cum_pc, cum_tr, worst
+                );
+            }
+            // Correspondence quality: what fraction of per-pair matches
+            // sit within 2 px of the best-fit affine, and how big is the
+            // median motion they are supposed to be explaining. An RMS
+            // that dwarfs the motion means the correspondences are noise,
+            // and NO downstream geometry stage can recover from that —
+            // this is the number that separates "bad pose" from "bad
+            // tracks".
+            {
+                let (mut inl, mut tot, mut motion_acc, mut mp) = (0usize, 0usize, 0.0f32, 0usize);
+                for t in 1..nfr {
+                    let mut pairs: Vec<(f32, f32, f32, f32)> = Vec::new();
+                    for (id, &(x1, y1)) in &per_frame[t] {
+                        if let Some(&(x0, y0)) = per_frame[t - 1].get(id) {
+                            pairs.push((x0, y0, x1, y1));
+                        }
+                    }
+                    if pairs.len() < 6 { continue; }
+                    let a = gm::fit(&pairs).unwrap_or(gm::IDENTITY);
+                    let mut mags: Vec<f32> = Vec::with_capacity(pairs.len());
+                    for &(x0, y0, x1, y1) in &pairs {
+                        let px = a[0] * x0 + a[1] * y0 + a[2];
+                        let py = a[3] * x0 + a[4] * y0 + a[5];
+                        if ((px - x1).powi(2) + (py - y1).powi(2)).sqrt() <= 2.0 { inl += 1; }
+                        tot += 1;
+                        mags.push(((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt());
+                    }
+                    mags.sort_by(|u, v| u.partial_cmp(v).unwrap());
+                    motion_acc += mags[mags.len() / 2];
+                    mp += 1;
+                }
+                if tot > 0 {
+                    println!(
+                        "correspondences: {:.0}% within 2px of the pair affine | median per-pair motion {:.2}px",
+                        100.0 * inl as f32 / tot as f32,
+                        motion_acc / mp.max(1) as f32
+                    );
+                }
+            }
             if np > 0 {
                 println!(
                     "pairwise residual RMS: translation {:.2}px affine {:.2}px | max per-pair rot {:.3}rad",
@@ -629,6 +697,81 @@ fn main() {
                 (*id, (o.frame_idx, o.screen_x, o.screen_y))
             })
             .collect();
+        // --pose-from-tracks: rebuild the pose track from the MEDIAN
+        // displacement of static feature tracks instead of global phase
+        // correlation.
+        //
+        // The census says 191 of shot 4's 197 candidates die on
+        // reprojection error at a 48 px median, and the pose-vs-tracks
+        // diagnostic says why: phase correlation reports 126 px of
+        // camera motion where the tracks that triangulation actually
+        // consumes report 50.6 px. The pose track and the observations
+        // are describing different motions, so every reprojection is
+        // wrong by their drift and no threshold can rescue it.
+        //
+        // This is the SAME failure the canonical-fusion work already
+        // diagnosed and fixed one level up: raw phase correlation
+        // latches onto a large moving foreground (shot 4 carries 21
+        // detected movers), while a MEDIAN over blocks/tracks votes with
+        // the background because actors are the minority. That fix was
+        // applied to plate registration and never to the pose track.
+        // Two-pass by necessity: the consensus classifier needs a motion
+        // estimate to label tracks Static, so pass 1 stays phase-corr and
+        // pass 2 rebuilds the pose from the tracks it labelled.
+        // DEFAULT ON as of this session, on five-clip evidence.
+        // --pose-phasecorr restores the old behaviour for comparison.
+        //
+        // The phase-correlation pose track failed three DISTINCT ways
+        // across the corpus and the median-of-static-tracks rebuild
+        // fixes all three, which is what promoted it from a flag to the
+        // default: a single fix for three unrelated-looking symptoms is
+        // evidence the estimator was the common cause.
+        //   bloopers w1   81 -> 98 triangulated
+        //   bloopers sh4    2 ->  3   (material has no parallax; nothing
+        //                              to rescue, and it does not hurt)
+        //   SMITE          27 -> 31, mean reproj 2.17 -> 1.80 px
+        //   Minecraft      24 -> 101, no-baseline 327 -> 71
+        //   blackstar       0 -> 31, camera span 0.0 -> 46.1 px
+        if !args.iter().any(|a| a == "--pose-phasecorr") {
+            let nfr = frames.len();
+            let mut per_frame: Vec<std::collections::HashMap<u32, (f32, f32)>> =
+                vec![std::collections::HashMap::new(); nfr];
+            for (id, v) in &world {
+                for o in v {
+                    per_frame[o.frame_idx as usize].insert(*id, (o.screen_x, o.screen_y));
+                }
+            }
+            let (mut cx, mut cy) = (0.0f32, 0.0f32);
+            let mut n_fallback = 0usize;
+            for t in 1..nfr {
+                let (mut dx, mut dy) = (Vec::new(), Vec::new());
+                for (id, &(x1, y1)) in &per_frame[t] {
+                    if let Some(&(x0, y0)) = per_frame[t - 1].get(id) {
+                        dx.push(x1 - x0);
+                        dy.push(y1 - y0);
+                    }
+                }
+                if dx.len() >= 6 {
+                    dx.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    dy.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    // Same sign convention as the phase-corr path: content
+                    // moving right means the camera moved left.
+                    cx += -dx[dx.len() / 2];
+                    cy += -dy[dy.len() / 2];
+                } else {
+                    // Too few correspondences to trust a median: HOLD the
+                    // pose rather than fall back to phase correlation,
+                    // which is the estimator under suspicion.
+                    n_fallback += 1;
+                }
+                poses[t].position.x = cx;
+                poses[t].position.y = cy;
+            }
+            println!(
+                "pose rebuilt from static-track medians ({} frames held for <6 correspondences)",
+                n_fallback
+            );
+        }
         let cam_span = {
             let (mut minx, mut maxx, mut miny, mut maxy) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
             for p in &poses {
@@ -809,6 +952,156 @@ end_header
             );
             std::fs::write(&ply_path, header + &body).unwrap_or_else(|e| die(&format!("write {ply_path}: {e}")));
             println!("exported {} colored points -> {}", n_out, ply_path);
+        }
+        // --render3d <out.y4m>: THE BRIDGE — residual-coding against the
+        // canonical's RENDER, so the 3D path produces BYTES for the first
+        // time instead of match scores. The dense mesh is the canonical
+        // (requires --dense); each frame's prediction is render_mesh at
+        // that frame's pose; the prediction feeds encode_gop_v3_core —
+        // the SAME mode decision / gain / side-info / DCT-residual
+        // machinery as the 2D plate, so "3D render vs 2D plate as the
+        // world model" is a controlled comparison. Accounting mirrors
+        // the plate: model_bytes = serialized mesh (amortized; a
+        // library-matched canonical ships as ~24 B UUID+alignment —
+        // printed as the cited marginal), motion = 12 B/frame pose.
+        // Unrasterized pixels render as neutral gray: the mode decision
+        // routes those regions to prev/intra exactly as it does for
+        // plate misses. Lab honesty: exact-black mesh output is
+        // indistinguishable from a hole under this rule (none observed
+        // on this material — film black lifts off 0 after the h264
+        // chain).
+        if let Some(out3d) = arg_val(&args, "--render3d") {
+            use fao_codec::v8_rasterizer::render_mesh;
+            let Some(mesh) = dense_mesh.as_ref() else {
+                die("--render3d requires --dense (the sparse cloud does not rasterize)");
+            };
+            // Serialized canonical through mesh_pack (one AABB, quantised
+            // plane-split positions, delta-coded indices). --mesh-bits
+            // sweeps the rate knob; --mesh-nocolor drops vertex colours.
+            // The naive f32 form the first bridge shipped is still
+            // measured, as the baseline the pack has to beat, and the
+            // render uses the DECODED mesh so prediction quality pays
+            // for the quantisation honestly.
+            let naive_bytes = {
+                let mut raw: Vec<u8> =
+                    Vec::with_capacity(mesh.vertices.len() * 15 + mesh.indices.len() * 4);
+                for v in &mesh.vertices {
+                    raw.extend_from_slice(&v.x.to_le_bytes());
+                    raw.extend_from_slice(&v.y.to_le_bytes());
+                    raw.extend_from_slice(&v.z.to_le_bytes());
+                }
+                for c in &mesh.vertex_colors {
+                    for ch in c {
+                        raw.push((ch * 255.0).round().clamp(0.0, 255.0) as u8);
+                    }
+                }
+                for i in &mesh.indices {
+                    raw.extend_from_slice(&i.to_le_bytes());
+                }
+                zstd::encode_all(raw.as_slice(), 19).map(|c| c.len()).unwrap_or(raw.len())
+            };
+            let mp_opts = fao_codec::mesh_pack::MeshPackOpts {
+                pos_bits: arg_val(&args, "--mesh-bits")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(16),
+                keep_colors: !args.iter().any(|a| a == "--mesh-nocolor"),
+            };
+            let (wire, decoded_mesh) = fao_codec::mesh_pack::encode(mesh, &mp_opts);
+            let mesh_bytes = wire.len();
+            let (abs_e, frac_e) = fao_codec::mesh_pack::quant_error(mesh, &decoded_mesh);
+            println!(
+                "mesh pack: naive {} B -> packed {} B ({:.0}%) at {} bits | max vert error {:.4} ({:.2e} of diagonal)",
+                naive_bytes,
+                mesh_bytes,
+                100.0 * mesh_bytes as f32 / naive_bytes.max(1) as f32,
+                mp_opts.pos_bits,
+                abs_e,
+                frac_e
+            );
+            let mesh = &decoded_mesh;
+            let t3 = std::time::Instant::now();
+            // Full-range BT.601, the exact inverse of the color sampling
+            // that built the mesh (r = (Y + 1.402 V')/255 etc.).
+            let rgb_to_yuv = |rgb: &[u8], fw: usize, fh: usize| -> plate::Yuv420 {
+                let mut f = plate::Yuv420::new(fw, fh);
+                let cw = fw / 2;
+                let mut usum = vec![0u32; cw * (fh / 2)];
+                let mut vsum = vec![0u32; cw * (fh / 2)];
+                for y in 0..fh {
+                    for x in 0..fw {
+                        let i = (y * fw + x) * 3;
+                        let (r, g, b) = (rgb[i] as f32, rgb[i + 1] as f32, rgb[i + 2] as f32);
+                        let (r, g, b) = if rgb[i] == 0 && rgb[i + 1] == 0 && rgb[i + 2] == 0 {
+                            (128.0, 128.0, 128.0) // hole -> neutral gray
+                        } else {
+                            (r, g, b)
+                        };
+                        let yv = 0.299 * r + 0.587 * g + 0.114 * b;
+                        let uv = -0.168736 * r - 0.331264 * g + 0.5 * b + 128.0;
+                        let vv = 0.5 * r - 0.418688 * g - 0.081312 * b + 128.0;
+                        f.y[y * fw + x] = yv.round().clamp(0.0, 255.0) as u8;
+                        let ci = (y / 2) * cw + x / 2;
+                        usum[ci] += uv.round().clamp(0.0, 255.0) as u32;
+                        vsum[ci] += vv.round().clamp(0.0, 255.0) as u32;
+                    }
+                }
+                for (o, s) in f.u.iter_mut().zip(&usum) {
+                    *o = (s / 4) as u8;
+                }
+                for (o, s) in f.v.iter_mut().zip(&vsum) {
+                    *o = (s / 4) as u8;
+                }
+                f
+            };
+            let gray = plate::Yuv420::new(w, h); // render-failure fallback
+            let mut n_rendered = 0usize;
+            let mut pred_for = |fi: usize| -> plate::Yuv420 {
+                match render_mesh(mesh, None, &poses[fi], w, h) {
+                    Some(rgb) => {
+                        n_rendered += 1;
+                        rgb_to_yuv(&rgb, w, h)
+                    }
+                    None => {
+                        let mut g = gray.clone();
+                        for p in g.y.iter_mut() {
+                            *p = 128;
+                        }
+                        for p in g.u.iter_mut().chain(g.v.iter_mut()) {
+                            *p = 128;
+                        }
+                        g
+                    }
+                }
+            };
+            let pose_bytes = frames.len() * 12; // f32 xyz per frame
+            let (rep, _) = plate::encode_gop_v3_core(
+                &frames, &mut pred_for, mesh_bytes, pose_bytes, &opts, None,
+            );
+            let res_total: usize = rep.frames.iter().map(|c| c.residual_bytes).sum();
+            let mode_total: usize = rep.frames.iter().map(|c| c.mode_bytes).sum();
+            let n = frames.len();
+            let total = mesh_bytes + pose_bytes + res_total + mode_total;
+            let cited = 24 + pose_bytes + res_total + mode_total;
+            eprintln!(
+                "render3d: {} / {} frames rasterized  encode {:.1}s",
+                n_rendered,
+                n,
+                t3.elapsed().as_secs_f32()
+            );
+            println!(
+                "render3d byte split: mesh {} pose {} mode+mv {} residual {}",
+                mesh_bytes, pose_bytes, mode_total, res_total
+            );
+            println!(
+                "render3d prev_mode_share {:.3} (1.0 = render never used past frame 0)",
+                rep.prev_mode_share
+            );
+            println!(
+                "render3d total_bytes {total}  amortized_per_frame {}  cited_total {cited}  cited_per_frame {}",
+                total / n,
+                cited / n
+            );
+            write_y4m(&out3d, &header, &rep.recon);
         }
         return;
     }
@@ -1013,12 +1306,140 @@ end_header
         println!("total_bytes {total}  amortized_per_frame {}  marginal_per_frame {}", total / n, (res_total + rep.motion_bytes) / n);
         write_y4m(&args[1], &header, &rep.recon);
     } else {
+        let mut mover_model_bytes = 0usize;
         let rep = if args.iter().any(|a| a == "--v2") {
             plate::encode_gop_v2(&frames, &motions, &pl, &opts)
         } else {
             if let Some(ls) = arg_val(&args, "--lookahead") {
                 let thr: u32 = ls.parse().unwrap_or(1024);
                 plate::encode_gop_v3_lookahead(&frames, &motions, &pl, &opts, thr)
+            } else if let Some(sp) = arg_val(&args, "--use-canonical3d") {
+                // The engine-derived path: geometry and camera come from
+                // a .faoscene rather than from inverse rendering. This is
+                // the configuration engine_lab measured at -31% bytes and
+                // +5.5 dB against a self-coded 2D plate.
+                let raw = std::fs::read(&sp)
+                    .unwrap_or_else(|e| die(&format!("read {sp}: {e}")));
+                let scene = fao_codec::engine_scene::read(&raw)
+                    .unwrap_or_else(|e| die(&format!("scene rejected: {e}")));
+                let (fw, fh) = (frames[0].w, frames[0].h);
+                if scene.poses.len() < frames.len() {
+                    // Warn rather than refuse: a short pose stream still
+                    // codes (missing frames fall back to prev-MC), but
+                    // silently coding half a GOP against gray would look
+                    // like the codec underperforming.
+                    eprintln!(
+                        "WARNING: scene has {} poses for {} frames; the tail will code without a canonical",
+                        scene.poses.len(),
+                        frames.len()
+                    );
+                }
+                let mut pred = |fi: usize| scene.predict(fi, fw, fh);
+                let (rep, _) = plate::encode_gop_v3_core(
+                    &frames, &mut pred, 24, frames.len() * 12, &opts, None,
+                );
+                eprintln!(
+                    "canonical3d: {} verts {} tris, {} poses | cited at 24 B + 12 B/frame pose",
+                    scene.mesh.vertices.len(),
+                    scene.mesh.indices.len() / 3,
+                    scene.poses.len()
+                );
+                rep
+            } else if args.iter().any(|a| a == "--noplate") {
+                plate::encode_gop_no_plate(&frames, &opts)
+            } else if args.iter().any(|a| a == "--plate-route") {
+                let (rep, chose) = plate::encode_gop_routed(&frames, &motions, &pl, &opts);
+                eprintln!("plate route -> {}", if chose { "PLATE" } else { "NO-PLATE" });
+                rep
+            } else if let Some(sp) = arg_val(&args, "--scene-export") {
+                // Emit the GOP's object graph and stop. This is the file
+                // an editor — a person, or a model told "make the fight
+                // turn out differently" — rewrites and hands back via
+                // --scene-apply.
+                let thr: u32 = arg_val(&args, "--movers")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(16);
+                let mut scene = String::new();
+                let (_r, movers) = plate::encode_gop_v5_edited(
+                    &frames, &motions, &pl, &opts, thr, None, Some(&mut scene),
+                );
+                std::fs::write(&sp, &scene)
+                    .unwrap_or_else(|e| die(&format!("write {sp}: {e}")));
+                let risky = movers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| plate::mover_hole_risk(m) > 0.5)
+                    .map(|(i, m)| format!("{i} ({:.0}%)", 100.0 * plate::mover_hole_risk(m)))
+                    .collect::<Vec<_>>();
+                println!("scene: {} movers -> {}", movers.len(), sp);
+                if !risky.is_empty() {
+                    // Naming these up front is the difference between an
+                    // editor that refuses and one that smears: these
+                    // objects barely move, so the plate holds no clean
+                    // background behind them to reveal.
+                    println!(
+                        "  disocclusion risk >50% (moving these will expose plate that was never observed): {}",
+                        risky.join(", ")
+                    );
+                }
+                return;
+            } else if let Some(ap) = arg_val(&args, "--scene-apply") {
+                let thr: u32 = arg_val(&args, "--movers")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(16);
+                let js = std::fs::read_to_string(&ap)
+                    .unwrap_or_else(|e| die(&format!("read {ap}: {e}")));
+                // Count movers by re-deriving the scene, so the edited
+                // file is validated against the CURRENT detection rather
+                // than trusting its own header.
+                let mut base = String::new();
+                let (_r, movers) = plate::encode_gop_v5_edited(
+                    &frames, &motions, &pl, &opts, thr, None, Some(&mut base),
+                );
+                let tracks = plate::apply_scene_json(&js, movers.len(), frames.len())
+                    .unwrap_or_else(|e| die(&format!("scene rejected: {e}")));
+                let mut changed = 0usize;
+                for (m, t) in movers.iter().zip(&tracks) {
+                    if &m.track != t {
+                        changed += 1;
+                    }
+                }
+                // Retarget FIRST: the residual codes against the source,
+                // so editing only the predictor lets the codec correct
+                // the edit away (measured: 108 dB against the unedited
+                // encode — a perfect no-op). The edited scene has to
+                // become the new target.
+                let retargeted =
+                    plate::retarget_frames(&frames, &motions, &pl, &movers, &tracks);
+                let ((rep, nm, sprites, track, _picked), _) = plate::encode_gop_v5_edited(
+                    &retargeted, &motions, &pl, &opts, thr, Some(&tracks), None,
+                );
+                eprintln!(
+                    "scene applied: {} of {} mover tracks changed | sprites {} B track {} B",
+                    changed, nm, sprites, track
+                );
+                mover_model_bytes = sprites;
+                rep
+            } else if let Some(ms) = arg_val(&args, "--movers") {
+                // v11.5 mover layer: plate models the SET, movers travel
+                // as one-time sprites + 2 B/frame tracks, J-guarded
+                // against plain v3 (can only cost encode time).
+                let thr: u32 = ms.parse().unwrap_or(16);
+                let (rep, nm, sprites, track, picked) =
+                    plate::encode_gop_v5(&frames, &motions, &pl, &opts, thr);
+                eprintln!(
+                    "movers: {} detected | sprites {} B track+mask {} B | guard picked {}",
+                    nm, sprites, track,
+                    if picked { "V5" } else { "V3" }
+                );
+                // Citation covers the PLATE only: a canonical models the
+                // set; movers are the take's own staged content and their
+                // sprites travel with the take even when the plate is a
+                // 24-byte reference.
+                if picked {
+                    mover_model_bytes = sprites;
+                }
+                rep
             } else if do_route {
                 // Branch A: self (own motions + own plate).
                 let m_self = if args.iter().any(|a| a == "--static") {
@@ -1068,7 +1489,7 @@ end_header
         let n = frames.len();
         // A cited plate travels as a reference (UUID+alignment ≈ 24
         // bytes), not as payload.
-        let plate_cost = if cited_plate { 24 } else { rep.plate_bytes };
+        let plate_cost = if cited_plate { 24 + mover_model_bytes } else { rep.plate_bytes };
         let total = plate_cost + rep.motion_bytes + res_total + mode_total;
         let mut per: Vec<usize> = rep.frames.iter().map(|c| c.residual_bytes + c.mode_bytes).collect();
         println!("plate_bytes {} (cited: {})", plate_cost, cited_plate);
