@@ -20,6 +20,7 @@ pub mod tags;
 pub mod outputs;
 pub mod music_scan;
 pub mod real_catalog;
+pub mod cast;
 pub mod playback;
 pub mod surround;
 pub mod voice_control;
@@ -421,6 +422,11 @@ pub struct Controller {
     /// one yet. Cleared by the host (`take()`) the same frame it acts, so
     /// this never fires the same scan twice.
     pub pending_rescan: bool,
+    /// The host's LAN address for a B&O speaker to cast the current track
+    /// to (e.g. "http://192.168.1.50") — set by whatever picks the device
+    /// (a settings-page device list is a follow-up; nothing in this crate
+    /// discovers devices yet), read once by the host.
+    pub pending_cast: Option<String>,
     /// The rating the user last set; the host applies it and echoes back
     /// through `confirm_rating`. Same shape as `pending_route` — this view
     /// owns no library.
@@ -548,6 +554,7 @@ impl Controller {
             track_paths: Vec::new(),
             last_played_track: None,
             pending_rescan: false,
+            pending_cast: None,
             pending_source: None,
             pending_rating: None,
             active_device_url: String::new(),
@@ -1979,6 +1986,30 @@ impl Controller {
     /// A flat list rather than a map: a page is at most a few hundred rows,
     /// a linear scan over that is nothing, and a `Vec` keeps the controller
     /// `Clone` and comparable — which its tests rely on.
+    /// Ask the host to cast whatever is now playing to a networked B&O
+    /// speaker instead of (or alongside) local output. `now_playing_id`
+    /// carries the track; the host resolves it to a path the same way
+    /// `request_play` does and hands it to `bo_cast`.
+    ///
+    /// No-op with a toast if nothing is playing — casting silence to a
+    /// speaker is not a request that means anything.
+    pub fn request_cast(&mut self, device_base: String) {
+        if self.now_playing_id.is_some() {
+            self.pending_cast = Some(device_base);
+        } else {
+            self.toast.show("nothing is playing to cast");
+        }
+    }
+
+    /// The host reports how a cast attempt went.
+    pub fn cast_result(&mut self, ok: bool, detail: &str) {
+        if ok {
+            self.toast.show(&format!("casting via {detail}"));
+        } else {
+            self.toast.show(&format!("cast failed: {detail}"));
+        }
+    }
+
     pub fn set_track_paths(&mut self, paths: Vec<(i64, String)>) {
         self.track_paths = paths;
     }

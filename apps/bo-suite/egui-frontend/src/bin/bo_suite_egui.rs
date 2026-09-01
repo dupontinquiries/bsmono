@@ -25,6 +25,10 @@ struct App {
     /// scan progress, errors). Read non-blocking each frame in
     /// `pump_media_results`.
     media_res_rx: std::sync::mpsc::Receiver<bo_media::MediaResult>,
+    /// Casting to a networked B&O speaker — see cast.rs. Commands go out
+    /// on `cast_cmd_tx`; results come back non-blocking on `cast_res_rx`.
+    cast_cmd_tx: std::sync::mpsc::Sender<bo_suite_egui::cast::CastCmd>,
+    cast_res_rx: std::sync::mpsc::Receiver<bo_suite_egui::cast::CastResult>,
     /// The recogniser, when one is configured and voice is on.
     voice: bo_suite_egui::voice_source::VoiceSource,
     /// What the recogniser was last started with, so a settings change
@@ -87,6 +91,17 @@ impl App {
                 bo_media::run_media_worker(media_cmd_rx, media_res_tx, db_path, music_roots, Vec::new());
             });
         }
+        // Casting to a networked B&O speaker. Port 0 would be simpler but
+        // the URL handed to the device has to be stable across calls
+        // within one run, and TrackServer::bind picks whatever the OS
+        // gives it — 51423 is arbitrary but fixed, matching bo-controller's
+        // own practice of a fixed, documented port rather than one that
+        // changes every launch and complicates firewall rules.
+        let (cast_cmd_tx, cast_cmd_rx) = std::sync::mpsc::channel();
+        let (cast_res_tx, cast_res_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            bo_suite_egui::cast::run_cast_worker(cast_cmd_rx, cast_res_tx, 51423);
+        });
         let catalog = match bo_suite_egui::real_catalog::RealCatalog::open(&db_path, media_cmd_tx) {
             Ok(c) => c,
             Err(e) => {
@@ -126,6 +141,8 @@ impl App {
             last_note: String::new(),
             catalog,
             media_res_rx,
+            cast_cmd_tx,
+            cast_res_rx,
             voice: bo_suite_egui::voice_source::VoiceSource::new(),
             voice_cmd: String::new(),
         }
@@ -183,6 +200,26 @@ impl App {
             // persists it. `pump_media_results` reconciles the pending dot
             // once the worker echoes it back as `MediaResult::TrackRating`.
             self.catalog.set_rating(id, stars as i64);
+        }
+        if let Some(device_base) = self.controller.pending_cast.take() {
+            // Distributed daemon playback: hand the file to bo-cast's
+            // worker rather than local mpv. Resolved the same way
+            // request_play resolves a path — through RealCatalog, not a
+            // second lookup mechanism.
+            if let Some(id) = self.controller.now_playing_id {
+                match self.catalog.path_of(id) {
+                    Some(path) => {
+                        let title = self.controller.all_tracks.tracks().iter()
+                            .find(|t| t.id == id)
+                            .map(|t| t.title_text())
+                            .unwrap_or_default();
+                        let _ = self.cast_cmd_tx.send(bo_suite_egui::cast::CastCmd::PlayFile {
+                            device_base, local_path: std::path::PathBuf::from(path), title,
+                        });
+                    }
+                    None => self.last_note = "cast: no file for that track".into(),
+                }
+            }
         }
         if let Some(id) = self.controller.last_played_track.take() {
             // Persisted through the worker (play count + history), not
@@ -298,6 +335,11 @@ impl App {
                 // here either — see real_catalog.rs's follow-up note.
                 _ => {}
             }
+        }
+        // Cast attempts (bo-cast), separate from the media worker above —
+        // different channel, same drain-non-blocking shape.
+        while let Ok(r) = self.cast_res_rx.try_recv() {
+            self.controller.cast_result(r.ok, &r.detail);
         }
     }
 }

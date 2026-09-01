@@ -37,6 +37,11 @@ bo-core = { path = "../bo-core" }
 # read/write, playlists/queue/history) — see real_catalog.rs. Was reachable
 # only from the Qt binary; both front-ends now read/write the same database.
 bo-media = { path = "../bo-media" }
+# Casting to a networked B&O speaker (distributed daemon playback) —
+# see cast.rs for why it's a separate worker thread from real_catalog's.
+bo-cast = { path = "../bo-cast" }
+reqwest = { version = "0.11", features = ["json"] }
+tokio = { version = "1", features = ["rt", "net", "time"] }
 # Named directly in real_catalog.rs (RealCatalog.conn: rusqlite::Connection) —
 # same version bo-media pins, not a second copy: cargo unifies by semver.
 rusqlite = { version = "0.31", features = ["bundled"] }
