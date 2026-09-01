@@ -4847,18 +4847,44 @@ fn physical_ui_panel(s: &mut Scene, style: u32, pos: Vec3, face: f32, w: f32, h:
         3 => (c(0xd8, 0xd0, 0xba), c(0xc2, 0x98, 0x40), M::STONE, M::STONE, 0.10), // marble + gold trim
         _ => (c(0x55, 0x40, 0x2a), c(0x34, 0x26, 0x16), M::WOOD, M::WOOD, 0.06),   // wood board
     };
-    // frame (slightly larger panel set just behind the surface)
-    let mut fr = m3::panel(addv(ctr, mulv(n, -0.04)), right, up, w + 0.28, h + 0.28, frame); fr.mat = fmat; fr.emissive = emiss * 0.5; s.add(fr, Float::STILL);
+    // FRAME — a real stepped moulding, not one flat slab. Outer frame (dark, largest), then a
+    // gilt/lit BEVEL ring one step in front and slightly smaller, so the border reads as carved
+    // MATERIAL with actual depth — a picture-frame moulding, not a single flat-color rectangle
+    // behind the surface. This is the 3D counterpart to theme.rs's carved_frame bevel lip.
+    let bevel = mix_rgb(frame, c(0xff, 0xe2, 0xac), 0.42);
+    let mut fr = m3::panel(addv(ctr, mulv(n, -0.06)), right, up, w + 0.34, h + 0.34, frame); fr.mat = fmat; fr.emissive = emiss * 0.5; s.add(fr, Float::STILL);
+    let mut bv = m3::panel(addv(ctr, mulv(n, -0.03)), right, up, w + 0.16, h + 0.16, bevel); bv.mat = fmat; bv.emissive = emiss * 0.7 + 0.06; s.add(bv, Float::STILL);
+    // GILT CORNER BRACKETS — an actual L-shaped bracket (two perpendicular bars) at each corner,
+    // not a single bead. This is the 3D counterpart to the flat Panels-mode carved_frame's rune
+    // corners (theme.rs), scaled up to read as real hardware at this distance — the reference
+    // renders show every floating panel with a visible metal/gilt corner bracket, not a dot.
+    let stud_col = mix_rgb(frame, c(0xff, 0xd9, 0x8a), 0.55);
+    let bracket_len = (w.min(h) * 0.22).clamp(0.12, 0.5);
+    let bracket_r = 0.035;
+    for (sx, sy) in [(-1.0f32, 1.0f32), (1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)] {
+        let corner = addv(ctr, addv(mulv(right, sx * (w * 0.5 + 0.14)), addv(mulv(up, sy * (h * 0.5 + 0.14)), mulv(n, -0.07))));
+        let leg_h = addv(corner, mulv(right, -sx * bracket_len));
+        let leg_v = addv(corner, mulv(up, -sy * bracket_len));
+        let mut bh = m3::tube(corner, leg_h, bracket_r, 5, stud_col); bh.mat = fmat; bh.emissive = emiss * 1.5 + 0.18; s.add(bh, Float::STILL);
+        let mut bvv = m3::tube(corner, leg_v, bracket_r, 5, stud_col); bvv.mat = fmat; bvv.emissive = emiss * 1.5 + 0.18; s.add(bvv, Float::STILL);
+        let mut knob = m3::uv_sphere(corner, bracket_r * 1.6, 6, 5, stud_col); knob.mat = fmat; knob.emissive = emiss * 1.6 + 0.2; s.add(knob, Float::STILL);
+    }
     // surface
     let mut sf = m3::panel(ctr, right, up, w, h, surface); sf.mat = smat; sf.emissive = emiss;
     if style == 2 { m3::set_alpha(&mut sf, 130); } // glass = translucent
     s.add(sf, Float::STILL);
-    // content "lines" — thin pale stripes hinting at the text/graph that surfaces here
+    // content CARDS — each line is now a bordered plaque (a darker backing rect + a lighter inset
+    // face), reading as an actual card sitting ON the panel the way the reference renders show
+    // "Hypotheses / Evidence"-style boxes, rather than a flat stripe painted onto the board.
+    let card_back = mix_rgb(surface, c(0x00, 0x00, 0x00), 0.28);
     let ink = if style == 2 { c(0xf0, 0xfa, 0xff) } else { mix_rgb(surface, c(0xff, 0xff, 0xf4), 0.55) };
     for li in 0..4u32 {
         let ly = h * 0.30 - li as f32 * h * 0.16;
         let lw = w * (0.74 - li as f32 * 0.09);
-        let mut line = m3::panel(addv(ctr, addv(mulv(up, ly), mulv(n, 0.02))), right, up, lw, h * 0.045, ink);
+        let lh = h * 0.075;
+        let center = addv(ctr, addv(mulv(up, ly), mulv(n, 0.015)));
+        let mut back = m3::panel(center, right, up, lw + 0.05, lh + 0.03, card_back); back.mat = M::PAPER; back.emissive = emiss * 0.3; s.add(back, Float::STILL);
+        let mut line = m3::panel(addv(center, mulv(n, 0.01)), right, up, lw, lh * 0.6, ink);
         line.mat = M::PAPER; line.emissive = emiss * 0.6; s.add(line, Float::STILL);
     }
     // a small "active" node bead in the corner (the selection marker), warm/glowing
