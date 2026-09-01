@@ -3201,6 +3201,13 @@ reply is framed differently from the turn that produced it.");
         let stopdesc = match &stop {
             crate::workspace_exec::Stop::Done => "done".to_string(),
             crate::workspace_exec::Stop::StepLimit => format!("hit step limit ({turns} turns)"),
+            // THE DRIVER KNOWS WHY IT STOPPED, SO SAY IT. Asked why it had
+            // stopped, a small model answered "a self-imposed limit to
+            // prevent unnecessary verbosity" — a confabulation, because
+            // nothing about the halt was ever in its context. The reason
+            // lives out here; the UI must not leave the user asking the model.
+            crate::workspace_exec::Stop::Deadline =>
+                format!("reached the time limit ({turns} turns) — raise the wall clock, or narrow the task"),
             // Two different halts share Stop::Stalled and deserve different words: the loop guard
             // caught REPETITION; the phase machine's Blocked is counted evidence that the error
             // count stopped falling — the run should change approach, not just retry.

@@ -1285,6 +1285,21 @@ pub enum ReadPolicy { Full, Surgical }
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
     pub max_steps: usize,
+    /// Wall-clock bound on the whole run. `None` = steps are the only limit.
+    ///
+    /// WHY A CLOCK AND NOT JUST STEPS. "Keep working all night" is a DURATION,
+    /// and a step budget cannot express one: 24 steps is four minutes on a
+    /// small model reading three files, and four hours on a large one running
+    /// `cargo check` each turn. An operator who wants to come back in the
+    /// morning has to be able to say so in the unit they actually mean.
+    ///
+    /// CHECKED BETWEEN STEPS, NEVER INSIDE ONE. A step is the atom: it may
+    /// have written a file and not yet run the verifier, so cutting mid-step
+    /// can leave the workspace in a state no checkpoint covers. Overshooting
+    /// the deadline by one turn is the correct trade against stopping halfway
+    /// through an edit — the deadline is "stop starting new work after", not
+    /// "terminate at".
+    pub max_wall: Option<Duration>,
     /// Which tool calls are honoured. Default `Required(nonce)`: a call must carry this run's
     /// token, so a tool call the model QUOTED out of a file it read is inert. The nonce is not
     /// secrecy — the model may echo it — it separates "the model is calling a tool" from "the
@@ -1382,6 +1397,10 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_steps: 24,
+            // No deadline by default: an unattended overnight run is an
+            // explicit choice, and a default clock would silently truncate
+            // every ordinary run that happened to be slow.
+            max_wall: None,
             // Default::default() is Required(fresh nonce) — the fail-closed end. A default of Open
             // would make every caller that never thought about it vulnerable.
             gate: crate::taint::ToolGate::default(),
@@ -1417,7 +1436,7 @@ impl AgentConfig {
     /// The worker preset: surgical reads, no auto-verify (the coordinator verifies the stitched whole),
     /// tighter step budget — for fast parallel spin-off, per the coordinator-mode discussion.
     pub fn worker() -> Self {
-        Self { max_steps: 10, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false,
+        Self { max_steps: 10, max_wall: None, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false,
                read_policy: ReadPolicy::Surgical, doc_mode: false, hector_mode: false, ..Default::default() }
     }
 }
@@ -1851,6 +1870,11 @@ pub enum Stop {
     Done,
     /// Hit the step budget without finishing.
     StepLimit,
+    /// Ran out of WALL CLOCK. Distinct from `StepLimit` because they answer
+    /// different questions: a step limit means the work needed more turns, a
+    /// deadline means it needed more time, and the fix differs — raise the
+    /// budget versus start earlier or narrow the task.
+    Deadline,
     /// Aborted: the model was stuck repeating itself (caught by the loop guard) — a bad actor, cut so its
     /// speed stops being a runaway train.
     Stalled,
@@ -2628,7 +2652,14 @@ pub fn run_agent_cfg(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, cfg: &Ag
     let mut guard = crate::repetition::LoopGuard::default();
     let mut ladder = crate::line_calls::RefusalLadder::new(4);
 
+    // Same clock as the incremental driver, same reason: between steps only.
+    let run_started = Instant::now();
     for step in 0..cfg.max_steps {
+        if let Some(limit) = cfg.max_wall {
+            if run_started.elapsed() >= limit {
+                return Session { turns, stop: Stop::Deadline, files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier };
+            }
+        }
         let text = match llm.generate(&prompt) {
             Ok(t) => t,
             Err(e) => return Session { turns, stop: Stop::ModelError(e), files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier },
@@ -2737,6 +2768,12 @@ impl AgentRun {
         self.step += 1;
         if let Some(stop) = stop { return AgentStep::Finished(stop); }
         if self.step >= self.cfg.max_steps { return AgentStep::Finished(Stop::StepLimit); }
+        // The clock, checked here — before a step begins — for the reason in
+        // `AgentConfig::max_wall`: a step is the atom, and a run cut between
+        // a write and its verify leaves state no checkpoint covers.
+        if let Some(limit) = self.cfg.max_wall {
+            if self.started.elapsed() >= limit { return AgentStep::Finished(Stop::Deadline); }
+        }
         // Bound the transcript before it is submitted again — this is the only place the growing
         // prompt leaves the driver, so it is the only place the bound has to hold.
         self.compacted += maybe_compact(&mut self.prompt, &self.ws, &self.cfg, &self.plan, self.guide.as_ref());
@@ -4376,6 +4413,77 @@ mod read_budget_tests {
         assert!(!just_a.output.contains("touch b only"),
                 "path scoping leaked an unrelated commit:\n{}", just_a.output);
         assert!(just_a.output.contains("-- a.rs"), "provenance must name the scope");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A model that takes real time per turn, so a wall clock has something to
+    /// measure. 60 ms is enough to be unambiguous against a 120 ms budget and
+    /// short enough that the test stays sub-second.
+    struct Slow { each: Duration, calls: usize }
+    impl Llm for Slow {
+        fn generate(&mut self, _p: &str) -> Result<String, String> {
+            std::thread::sleep(self.each);
+            self.calls += 1;
+            Ok("thinking, no tools yet".to_string())
+        }
+    }
+
+    /// "Keep working all night" is a DURATION, and the driver only understood
+    /// steps. A step budget cannot express it: 24 steps is minutes on a small
+    /// model and hours on a large one, so an operator who wants to come back
+    /// in the morning had no way to say so.
+    #[test]
+    fn a_run_stops_on_the_clock_and_says_that_is_why() {
+        let dir = std::env::temp_dir().join(format!("ls-wall-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut ws = Workspace::new(&dir);
+        let mut llm = Slow { each: Duration::from_millis(60), calls: 0 };
+        let cfg = AgentConfig {
+            max_steps: 100,                                  // steps must NOT be what stops it
+            max_wall: Some(Duration::from_millis(120)),
+            ..Default::default()
+        };
+        let s = run_agent_cfg(&mut llm, &mut ws, "spin", &cfg);
+        assert_eq!(s.stop, Stop::Deadline, "the clock did not stop the run");
+        assert!(llm.calls >= 2, "stopped before doing any work: {} calls", llm.calls);
+        assert!(llm.calls < 100, "ran the full step budget: {} calls", llm.calls);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two limits answer different questions and must not be conflated: a
+    /// step limit means the work needed more TURNS, a deadline means it needed
+    /// more TIME, and the operator's fix differs.
+    #[test]
+    fn a_generous_clock_still_leaves_the_step_budget_in_charge() {
+        let dir = std::env::temp_dir().join(format!("ls-wall2-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut ws = Workspace::new(&dir);
+        let mut llm = Slow { each: Duration::from_millis(1), calls: 0 };
+        let cfg = AgentConfig {
+            max_steps: 3,
+            max_wall: Some(Duration::from_secs(3600)), // all night, effectively
+            ..Default::default()
+        };
+        let s = run_agent_cfg(&mut llm, &mut ws, "spin", &cfg);
+        assert_eq!(s.stop, Stop::StepLimit, "a distant deadline pre-empted the step budget");
+        assert_eq!(llm.calls, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No deadline is the default, and it must mean NO deadline rather than a
+    /// zero one — an `Option` read the wrong way would stop every ordinary run
+    /// instantly, and `Stop::Deadline` on turn zero is a confusing way to
+    /// discover that.
+    #[test]
+    fn the_absent_clock_does_not_stop_anything() {
+        let dir = std::env::temp_dir().join(format!("ls-wall3-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut ws = Workspace::new(&dir);
+        let mut llm = Slow { each: Duration::from_millis(1), calls: 0 };
+        let cfg = AgentConfig { max_steps: 2, max_wall: None, ..Default::default() };
+        let s = run_agent_cfg(&mut llm, &mut ws, "spin", &cfg);
+        assert_eq!(s.stop, Stop::StepLimit);
+        assert_eq!(llm.calls, 2, "the default config stopped early");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
