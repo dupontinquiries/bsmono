@@ -14,7 +14,13 @@ mod config;
 mod gestures;
 mod ipc;
 mod keyboard;
-mod layouts;
+// The layout layer lives in crates/board-layouts (gtk-free, shared with
+// egui-frontend) — see lib.rs's `pub use board_layouts as layouts;`. main.rs
+// is a separate crate root (binary target) so it needs its own alias rather
+// than inheriting the lib's; without this every `crate::layouts::` path in
+// ui/keyboard_view.rs, ui/settings_panel.rs, keyboard/engine.rs and the
+// keyboard_behaviors_tests suite fails to resolve when built as the binary.
+use board_layouts as layouts;
 mod llm;
 mod steno;
 mod ui;
