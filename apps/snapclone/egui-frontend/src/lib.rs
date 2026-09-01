@@ -263,6 +263,12 @@ pub struct Snapclone {
     /// go straight to camera; otherwise we show it and hide on `login_succeeded`.
     pub login_visible: bool,
     pub nav: Nav,
+    /// How many pages the last frame laid out side by side. One on a
+    /// phone; on a desktop as many as fit (`page_columns`).
+    pub cols_drawn: usize,
+    /// Hysteresis for the column count, so a window resized across a
+    /// breakpoint cannot shuffle the layout frame by frame.
+    pub plan: uikit_egui::pager::PlanState,
     pub bg: LiveBackground,
     pub peers: Vec<Peer>,
     /// The friends roster (Qt FriendListWidget). Derived from `peers` on
@@ -884,6 +890,8 @@ impl Snapclone {
             bar: UnifiedNav::new(),
             login_visible: !auto_logged_in,
             nav: Nav::new(PAGES.len()),
+            cols_drawn: 1,
+            plan: uikit_egui::pager::PlanState::new(),
             bg: LiveBackground::new(BgStyle::Aurora),
             gesture: GestureLayer::horizontal_page(320.0),
             palette: String::new(),
@@ -2241,6 +2249,34 @@ impl Snapclone {
         0.0
     }
 
+    /// The narrowest each page is worth drawing at. The viewfinder wants
+    /// room to be a viewfinder; a list does not.
+    pub fn page_metas() -> Vec<uikit_egui::pager::PageMeta> {
+        PAGES.iter().enumerate().map(|(i, name)| uikit_egui::pager::PageMeta {
+            id: i, title: name.to_string(),
+            min_width: if i == 0 { 420.0 } else { 340.0 },
+        }).collect()
+    }
+
+    /// The pages a `cols`-wide window shows, the active one included and
+    /// the window kept inside the page list rather than wrapping: a
+    /// desktop user reads left to right, and settings beside the camera
+    /// with the inbox off-screen reads as a bug.
+    pub fn visible_pages(active: usize, n: usize, cols: usize) -> Vec<usize> {
+        let cols = cols.clamp(1, n.max(1));
+        let start = active.min(n.saturating_sub(cols));
+        (start..start + cols).collect()
+    }
+
+    /// How many pages fit side by side in `width`, with hysteresis.
+    pub fn page_columns(&mut self, width: f32, gutter: f32, now_s: f64) -> usize {
+        let metas = Self::page_metas();
+        let plain = uikit_egui::pager::fit_cols(width, gutter, &metas);
+        let margined = uikit_egui::pager::fit_cols(
+            width * (1.0 - uikit_egui::pager::GROW_MARGIN), gutter, &metas);
+        self.plan.decide(plain, margined, now_s)
+    }
+
     pub fn swipe_page(&mut self, sign: i32) {
         // Counted here rather than at the gesture layer so a swipe that is
         // REFUSED — blocked by a dialog, or at the end of the pages — does not
@@ -2891,6 +2927,15 @@ impl Snapclone {
                 self.swipe_page(dir.sign());
             }
         }
+        // The detent: two-finger scroll along the page axis, accumulated
+        // past the threshold, clicks over to the next page — the Qt
+        // build's way of turning pages from a trackpad, ported to the
+        // gesture model a session ago and read by nothing until now.
+        if let Some(dir) = frame.detent {
+            if !claimed {
+                self.swipe_page(dir.sign());
+            }
+        }
 
         // Form factor first: every dialog opened this frame is placed by it.
         // The environment is the host's to report; what this view can see is
@@ -3216,8 +3261,7 @@ impl Snapclone {
         // Wayfinder, Settings — and the shell once routed three of them, so
         // two tabs led nowhere. That is most of why the app read as a demo:
         // the chrome promised more than the body delivered.
-        let draw_pages = |app: &mut Self, ui: &mut Ui| {
-            let page = app.nav.page();
+        let draw_page = |app: &mut Self, ui: &mut Ui, page: usize| {
             if page == 0 {
                 app.camera_page(ui, &colors);
                 return;
@@ -3232,7 +3276,32 @@ impl Snapclone {
                     _ => app.settings_page(ui, &colors),
                 });
         };
-        if page_offset.abs() < 0.5 {
+        let draw_pages = |app: &mut Self, ui: &mut Ui| {
+            let page = app.nav.page();
+            draw_page(app, ui, page);
+        };
+        // A desktop populates its width: as many pages side by side as fit,
+        // the active one among them, each in its own column and its own
+        // scroll. The phone keeps one page and the swipe. The kit's Pager
+        // does this for the rest of the fleet; snapclone has its own swipe
+        // physics, so it borrows the fit and the window rule and keeps the
+        // rest.
+        let gutter = adaptive.gutter.max(8.0);
+        let cols = if adaptive.is_compact() || self.nav.can_go_back() { 1 } else {
+            self.page_columns(ui.available_width(), gutter, ui.input(|i| i.time))
+        };
+        self.cols_drawn = cols;
+        if cols > 1 {
+            let avail = ui.available_rect_before_wrap();
+            let ids = Self::visible_pages(self.nav.page(), PAGES.len(), cols);
+            let col_w = (avail.width() - gutter * (cols as f32 - 1.0)) / cols as f32;
+            for (i, page) in ids.into_iter().enumerate() {
+                let x = avail.min.x + i as f32 * (col_w + gutter);
+                let r = egui::Rect::from_min_size(egui::pos2(x, avail.min.y),
+                                                  egui::vec2(col_w, avail.height()));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(r), |ui| draw_page(self, ui, page));
+            }
+        } else if page_offset.abs() < 0.5 {
             // The overwhelming majority of frames. No layer, no transform,
             // no cost — a swipe must not make the still case slower.
             draw_pages(self, ui);
@@ -4773,6 +4842,68 @@ mod tests {
         assert!(!app.flip_camera(), "one camera has no other side");
     }
 
+    /// A desktop shows as many pages as fit, the active one among them and
+    /// the window inside the list; a phone shows one.
+    #[test]
+    fn a_wide_screen_lays_out_columns_and_a_phone_one_page() {
+        assert_eq!(Snapclone::visible_pages(0, 5, 3), vec![0, 1, 2]);
+        assert_eq!(Snapclone::visible_pages(3, 5, 3), vec![2, 3, 4], "kept inside the list, no wrap");
+        assert_eq!(Snapclone::visible_pages(4, 5, 3), vec![2, 3, 4]);
+        assert_eq!(Snapclone::visible_pages(1, 5, 9), vec![0, 1, 2, 3, 4], "capped at the page count");
+        assert_eq!(Snapclone::visible_pages(2, 5, 1), vec![2]);
+
+        use egui::{Context, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        assert!(!adaptive.is_compact(), "the default adaptive is the desktop one");
+        let wide = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(1400.0, 900.0));
+        for i in 0..3 {
+            let _ = ctx.run(RawInput { screen_rect: Some(wide), time: Some(i as f64), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        }
+        assert!(app.cols_drawn >= 3, "1400 px drew {} column(s)", app.cols_drawn);
+        let narrow = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        for i in 3..8 {
+            let _ = ctx.run(RawInput { screen_rect: Some(narrow), time: Some(i as f64), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        }
+        assert_eq!(app.cols_drawn, 1, "400 px must fall back to one page");
+    }
+
+    /// The Qt build turned pages from a trackpad: two-finger scroll along
+    /// the page axis accumulates to a detent and clicks over. The detent
+    /// was in the gesture frame and nothing read it.
+    #[test]
+    fn a_two_finger_scroll_along_the_page_axis_turns_the_page() {
+        use egui::{Context, Event, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        assert_eq!(app.nav.page(), 0);
+        // The Qt constants: 220 raw at 0.75/ms is about 300 ms of scrolling,
+        // inside the 1 s arm window. Forty frames is well past it.
+        let mut t = 0.0;
+        for _ in 0..40 {
+            t += 0.016;
+            let events = vec![
+                Event::PointerMoved(Pos2::new(200.0, 400.0)),
+                // Positive along the axis is Next in the kit's trackpad path
+                // (the drag path feeds -dx; the wheel path feeds the delta).
+                Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(60.0, 0.0),
+                                    modifiers: Default::default(), phase: egui::TouchPhase::Move },
+            ];
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen), time: Some(t), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+            if app.nav.page() != 0 { break; }
+        }
+        assert_eq!(app.nav.page(), 1, "forty frames of scroll along the axis did not turn the page");
+    }
+
     #[test]
     fn dragging_across_the_page_turns_it_and_moves_it_on_the_way() {
         use egui::{Context, Event, PointerButton, Pos2, RawInput};
@@ -4935,7 +5066,11 @@ mod tests {
         let adaptive = Adaptive::default();
 
         let mut frame = |ctx: &Context, app: &mut Snapclone, events: Vec<Event>| {
-            let _ = ctx.run(RawInput { events, ..Default::default() }, |ctx| {
+            // One column: on egui's default 10 000-px screen the desktop
+            // shell lays out every page side by side, and Tab would walk
+            // the camera page before reaching this field.
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 800.0));
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen), ..Default::default() }, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
             });
         };
