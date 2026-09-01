@@ -130,7 +130,20 @@ pub use uikit_gesture::{Direction, GestureConfig, Outcome, ReleaseOutcome, TwoTi
 /// `Settings::poll()` reports a change so the whole UI reflects new prefs live.
 pub fn apply_prefs(ctx: &egui::Context, prefs: &settings_kit::Prefs) {
     let pid = snapclone_theme::PaletteId::from_str(&prefs.palette);
-    apply_palette(ctx, snapclone_theme::palette_for(pid));
+    let colors = apply_palette(ctx, snapclone_theme::palette_for(pid));
+    // Display accessibility (color-vision filter / lowered white point): apply_palette above
+    // always sets unfiltered Visuals (its own callers rely on that), so when a filter is
+    // configured, re-derive Visuals from filtered colors here. Gated on white_point/color_filter
+    // specifically (not the broader `is_active()`, which also covers opacity-only prefs) so an
+    // opacity-only change doesn't send colors through filter_color's float round-trip for
+    // nothing — that roundtrip is a color-preserving identity mathematically, but the
+    // u8 -> f32/255.0 -> *255.0 -> u8 conversion truncates rather than rounds, so an
+    // unnecessary pass can drift a channel by ±1 for no reason. Default Prefs has both at their
+    // neutral value, so this is a no-op for the overwhelming majority of users.
+    if prefs.display.white_point < 0.999 || prefs.display.color_filter != settings_kit::ColorFilter::None {
+        let filtered = theme_bridge::filter_palette_colors(&colors, &prefs.display);
+        ctx.set_visuals(theme_bridge::build_visuals(&filtered));
+    }
     let text = prefs.touch.text_scale.max(0.5);
     let btn = prefs.touch.button_scale.max(0.5);
     ctx.global_style_mut(|style| {
@@ -249,6 +262,65 @@ mod anim_apply_tests {
         apply_prefs(&ctx, &prefs);
         assert!(ctx.global_style().animation_time > BASE_ANIM_SECS, "heavy lingers");
         assert!(anim_secs(&ctx, 0.25) > 0.25, "carved sheen lengthens under heavy");
+    }
+}
+
+#[cfg(test)]
+mod display_filter_apply_tests {
+    use super::*;
+
+    /// The gap this closes: `apply_prefs` called `apply_palette` and threw away the
+    /// `PaletteColors` it returned, so `prefs.display.color_filter` / `white_point` were
+    /// computed by `theme_bridge::filter_color` (unit-tested in isolation) but never actually
+    /// reached the egui `Visuals` a real app paints with. This test goes through the real
+    /// entry point (`apply_prefs`, not `filter_color` directly) and checks the *rendered*
+    /// override text color, so a future refactor that reintroduces the gap fails here.
+    #[test]
+    fn grayscale_prefs_reach_the_actual_visuals() {
+        let ctx = egui::Context::default();
+
+        // Baseline: no display adjustment, unfiltered accent color.
+        let mut prefs = settings_kit::Prefs::default();
+        apply_prefs(&ctx, &prefs);
+        let unfiltered_text = ctx.style().visuals.override_text_color;
+
+        // A palette's text color is never perfectly gray by coincidence in this kit's palettes,
+        // so if grayscale is applied, r/g/b must converge; if it's silently dropped (the bug),
+        // this will fail because unfiltered_text and filtered_text will be identical instead.
+        prefs.display.color_filter = settings_kit::ColorFilter::Grayscale;
+        apply_prefs(&ctx, &prefs);
+        let filtered_text = ctx.style().visuals.override_text_color
+            .expect("apply_palette always sets an override text color");
+
+        assert!(
+            (filtered_text.r() as i32 - filtered_text.g() as i32).abs() <= 1
+                && (filtered_text.g() as i32 - filtered_text.b() as i32).abs() <= 1,
+            "color_filter = Grayscale must produce a near-gray override text color \
+             (got r={}, g={}, b={}) — if this equals the unfiltered color ({:?}), the filter \
+             is not reaching Visuals",
+            filtered_text.r(), filtered_text.g(), filtered_text.b(), unfiltered_text
+        );
+    }
+
+    /// Opacity-only prefs (the common case: translucent panels with no color-vision filter)
+    /// must NOT be routed through filter_color's float round-trip — that conversion is only a
+    /// mathematical no-op, not a bit-exact one (u8 -> f32/255.0 -> *255.0 -> u8 truncates), so
+    /// running it unnecessarily can drift a channel by ±1 for no reason.
+    #[test]
+    fn opacity_only_prefs_do_not_perturb_unrelated_colors() {
+        let ctx = egui::Context::default();
+
+        let mut baseline = settings_kit::Prefs::default();
+        apply_prefs(&ctx, &baseline);
+        let before = ctx.style().visuals.override_text_color;
+
+        baseline.display.opacity = 0.6; // is_active() would be true from this alone
+        apply_prefs(&ctx, &baseline);
+        let after = ctx.style().visuals.override_text_color;
+
+        assert_eq!(before, after,
+            "opacity-only prefs changed the text color ({before:?} -> {after:?}); the color \
+             re-derivation should be gated on white_point/color_filter, not opacity");
     }
 }
 

@@ -182,7 +182,7 @@ mod voice_glove_tests {
 
 #[cfg(test)]
 mod shake_binding_tests {
-    use uikit_egui::glove::{Orient, Tilt};
+    use uikit_egui::glove::Orient;
 
     #[test]
     fn a_double_flick_opens_a_tab_and_a_single_one_does_not() {

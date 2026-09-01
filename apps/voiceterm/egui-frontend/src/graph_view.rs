@@ -21,7 +21,7 @@
 #[path = "../../src/niftyplot_view.rs"]
 pub mod nifty;
 
-use egui::{Color32, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+use egui::{Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
 /// The view's own state: what is focused, how deep, and where we have been.
 #[derive(Debug, Clone)]

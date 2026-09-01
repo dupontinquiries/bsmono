@@ -79,7 +79,7 @@ pub enum ReleaseOutcome {
 }
 
 /// Tunable thresholds. Defaults match the FP5-tuned mobile/touchpad feel.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GestureConfig {
     /// Logical page width/height in px (page-jump thresholds are fractions of
     /// this, so the feel is identical on a 390 px phone and a 1440 px desktop).

@@ -38,7 +38,7 @@
 //! leaves a column of them in the scrollback, and the newest is the only one
 //! describing now.
 
-use crate::entity_extract::{Entity, ResolvedMatch};
+use crate::entity_extract::ResolvedMatch;
 use crate::dumb_summary::DetectedBar;
 
 /// Below this score gap between the top two matches, the answer is ambiguous
@@ -227,7 +227,7 @@ pub fn progress_ui(ui: &mut egui::Ui, r: &ProgressReadout, c: &uikit_egui::Palet
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity_extract::{EntityKind};
+    use crate::entity_extract::{Entity, EntityKind};
 
     fn ent(primary: &str, display: &str) -> Entity {
         Entity { kind: EntityKind::GitBranch, primary: primary.into(),
