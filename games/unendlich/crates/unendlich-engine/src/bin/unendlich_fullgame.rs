@@ -2833,6 +2833,27 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     if frame_pacer_enabled {
         log::info!("frame_pacer: ENABLED — driving shadow_chunk_stride from p90 frame time (UNENDLICH_FRAME_PACER=0 to disable)");
     }
+
+    // `sim::submit_schedule` is the OTHER dead-but-tested module (see the
+    // frame_pacer comment above for how that happened). Its real inputs
+    // (gpu_ms, cpu_ms, wait_ms) exist now (WorldRenderer::last_{gpu,cpu}_frame_ms
+    // / last_wait_fences_ms), so this feeds them in and logs what plan()
+    // WOULD decide — submit-skip, inflight up/down — WITHOUT acting on it.
+    //
+    // Not acted on because doing so means resizing WorldRenderer::frames (the
+    // per-frame Vulkan command buffers / sync objects) at runtime, which is a
+    // real resource-lifetime change I can't validate without a GPU to run
+    // against. This gets the observability in place first: once someone with
+    // real hardware confirms these numbers look sane and plan()'s decisions
+    // seem reasonable, wiring the actual frames_in_flight resize is a much
+    // smaller, better-informed next step.
+    let submit_schedule_log = std::env::var("UNENDLICH_SUBMIT_SCHEDULE_LOG")
+        .map(|v| v != "0" && !v.is_empty()).unwrap_or(false); // opt-in: pure diagnostic noise otherwise
+    let mut submit_schedule_hist: Vec<unendlich_engine::sim::submit_schedule::FrameStats> = Vec::with_capacity(8);
+    let mut submit_schedule_last = std::time::Instant::now();
+    if submit_schedule_log {
+        log::info!("submit_schedule: observation-only logging ENABLED (not driving anything live)");
+    }
     // r476: seed the Performance-page levers from their env vars so the env still
     // works as the initial value and the in-game controls reflect it. After this
     // the UI owns them live (the controller reads renderer.ui_adaptive_rd; the
@@ -4757,6 +4778,38 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     unendlich_engine::constants::set_lod_fidelity_override(new_knobs.lod_fidelity);
                 }
                 frame_pacer_knobs = new_knobs;
+            }
+        }
+
+        // submit_schedule: observation-only (see setup comment above). Push
+        // real per-frame stats every frame; log plan()'s hypothetical
+        // decision on a 500ms cadence (slower than frame_pacer's 200ms —
+        // this is diagnostic, not a control loop, no need to react fast).
+        if submit_schedule_log {
+            submit_schedule_hist.push(unendlich_engine::sim::submit_schedule::FrameStats {
+                gpu_ms: renderer.last_gpu_frame_ms() as f32,
+                cpu_ms: renderer.last_cpu_frame_ms().unwrap_or(0.0) as f32,
+                wait_ms: renderer.last_wait_fences_ms() as f32,
+            });
+            if submit_schedule_hist.len() > 8 {
+                submit_schedule_hist.remove(0);
+            }
+            if submit_schedule_last.elapsed() >= std::time::Duration::from_millis(500) {
+                submit_schedule_last = now;
+                let plan = unendlich_engine::sim::submit_schedule::plan(
+                    &submit_schedule_hist,
+                    renderer.frames_in_flight() as u8,
+                    frame_target_ms as f32,
+                );
+                log::info!(
+                    "[submit_schedule/observe] would-plan: submit={} max_inflight={} coalesce={} \
+                     (cur_inflight={}, last gpu={:.2}ms cpu={:.2}ms wait={:.2}ms)",
+                    plan.submit, plan.max_inflight, plan.coalesce,
+                    renderer.frames_in_flight(),
+                    renderer.last_gpu_frame_ms(),
+                    renderer.last_cpu_frame_ms().unwrap_or(-1.0),
+                    renderer.last_wait_fences_ms(),
+                );
             }
         }
         // rNNN: WEATHER SIM readout — every ~2s, sample the physical weather for

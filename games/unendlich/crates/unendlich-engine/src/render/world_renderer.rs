@@ -2751,6 +2751,15 @@ impl WorldRenderer {
         self.last_gpu_total_ms
     }
 
+    /// Current frames-in-flight depth (see `frames_in_flight` field docs).
+    /// Read-only for now — no live setter exists yet, since changing this
+    /// at runtime means resizing `self.frames` (Vulkan resource lifetime,
+    /// not just a number) and hasn't been done. `sim::submit_schedule`
+    /// needs this as the `cur_inflight` input to `plan()`.
+    pub fn frames_in_flight(&self) -> usize {
+        self.frames_in_flight
+    }
+
     /// Format and reset the per-pass GPU timing window. Call once
     /// per second alongside the existing FPS log line.
     ///
