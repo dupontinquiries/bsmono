@@ -1716,3 +1716,34 @@ when it selects between outcomes that genuinely differ (sampling, precision,
 risk). A flag that only chooses between "fast" and "slow" with identical
 output is a missing default, and its existence means the fast path is off for
 everyone who did not read the source.
+
+
+## 53. Physical UI: the gap between Mistfall (shipping) and Observatory (reference)
+
+Reference shots supplied. The running app and the target differ in ways that
+are mostly NOT styling, which is the useful finding — they are things a
+renderer is failing to do:
+
+1. **Graph labels collide.** Fixed this session as pure geometry
+   (`graph_labels::place`), NOT yet wired to the renderer. Wiring is small:
+   measure, build `Want`s, call `place`, draw the survivors and a "+n more".
+2. **The left nav.** Observatory uses an icon + title + one-line subtitle rail
+   ("GRAPH / Explore connections"). Mistfall uses a crowded bottom tab strip
+   with nine equal-weight tabs. The subtitle is what makes the reference
+   legible to someone who has not memorised the tabs.
+3. **Panel language.** Observatory's carved-stone frames are consistent across
+   every panel; the shipping app applies `carved_frame` to some and not
+   others. `theme::carved_frame` already exists — this is application, not new
+   code. The earlier "carved-frame sweep" commits did part of it.
+4. **Context cards carry a score** (0.98, 0.86) in the reference. We now HAVE
+   that number — `ctxplan::describes_project` produces exactly this relevance,
+   and the planner already decides whole/peek/skip. Surfacing it in the
+   Context panel would make the selection legible instead of invisible.
+
+(4) is the one that connects to this session's other work and is probably the
+highest value: the user currently cannot see WHY a file made it into the
+prompt, and the answer already exists as a float.
+
+Also: the scratch_code graph (§ this session) wants a view, and the
+Observatory GRAPH tab is the obvious home — nodes with `parent` edges is
+exactly the shape that panel already draws.
