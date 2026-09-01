@@ -10,6 +10,8 @@ use logscope_egui::model::ModelState;
 use logscope_egui::tabs::chat::Chat;
 use logscope_egui::theme;
 
+use std::env;
+
 struct App { chat: Chat, model: ModelState, doc: Doc, infer: Inference }
 
 impl eframe::App for App {
@@ -37,6 +39,8 @@ fn main() -> eframe::Result {
             chat.boot_demo(false); // populates msgs (incl. a code-bearing reply) WITHOUT forcing spatial_view
             chat.debug_force_show_context(true); // force the sidebar open for this screenshot
             chat.debug_force_engine_extras(true); // also show metrics/checkpoints/history cards
+            let page = env::var("LOGSCOPE_RIGHT_PAGE").ok().and_then(|v| v.parse::<u8>().ok()).unwrap_or(3);
+            chat.debug_force_right_page(page);
             let mut doc = Doc::default();
             doc.name = "sample.log".into();
             doc.lines = vec!["2024-05-07 12:01:15  pool_size=42 active=41".into(), "2024-05-07 12:01:16  pool_size=42 active=42".into()];

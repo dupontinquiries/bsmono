@@ -2179,6 +2179,12 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
     /// Force the right sidebar open. For render-verification harnesses only (e.g. panels-view) —
     /// normal flow toggles `show_context` from the "☰ Panels" button or the diag-notice jump.
     pub fn debug_force_show_context(&mut self, on: bool) { self.show_context = on; }
+    /// Cycle the right sidebar's subpage for render-verification harnesses. 0=Files 1=Graph
+    /// 2=Context 3=Prompting 4=Engine (mirrors RightPage's declaration order; RightPage itself is
+    /// private, so this takes an index rather than exposing the enum).
+    pub fn debug_force_right_page(&mut self, idx: u8) {
+        self.right_page = match idx { 0 => RightPage::Files, 1 => RightPage::Graph, 2 => RightPage::Context, 4 => RightPage::Engine, _ => RightPage::Prompting };
+    }
     /// Also render for render-verification harnesses: flips on the metrics card (checkpoints/
     /// history need private struct construction this isn't worth adding just for a screenshot).
     pub fn debug_force_engine_extras(&mut self, on: bool) { self.show_metrics = on; }
@@ -8566,7 +8572,7 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                             }
                         }
                         RightPage::Graph => {
-                            ui.label(RichText::new("CONVERSATION GRAPH").color(theme::DIM()).small().strong());
+                            theme::panel(ui, theme::CYAN(), "Conversation graph", None, |ui| {
                             ui.label(RichText::new("Click a node to jump the chat there; ◀ ▶ dolly the camera through it.").color(theme::FAINT()).small());
                             let mut g = self.convo_graph(self.msgs.len());
                             let budget = self.ctx.n_ctx.saturating_sub(self.ctx.max_tokens).max(1) as usize;
@@ -8638,10 +8644,10 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                                 ui.label(RichText::new(format!("{n} turns stored · {in_ctx} in window · ~{used}/{budget} tok")).color(theme::DIM()).small());
                                 ui.label(RichText::new("The amber ring is the walkthrough focus; click or step jumps the chat there. Branch forks appear once multiple-solution mapping is wired.").color(theme::FAINT()).small());
                             }
+                            }); // close "Conversation graph" carved panel
                         }
                         RightPage::Files => {
-                            ui.label(RichText::new("GENERATED FILES").color(theme::DIM()).small().strong());
-                            ui.add_space(4.0);
+                            theme::panel(ui, theme::GREEN(), "Generated files", None, |ui| {
                             if arts.is_empty() {
                                 ui.label(RichText::new("No files in the latest reply yet.").color(theme::DIM()).small());
                             } else {
@@ -8705,6 +8711,7 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                             }
                             ui.add_space(6.0);
                             ui.label(RichText::new("Files also appear in the drawer at the bottom (preview, save, history). Verify is the objective grader behind the coordinator loop — the compiler, not an LLM, decides if generated code is real.").color(theme::FAINT()).small());
+                            }); // close "Generated files" carved panel
                         }
                     }
                 });
