@@ -4094,9 +4094,9 @@ impl Snapclone {
     /// This is the bootstrap-independence lever. A device that remembers
     /// one other snapclone it has ever reached can rejoin the DHT through
     /// it, on a network where `bootstrap.jami.net` is blocked or gone.
-    /// It works because a peer's DHT socket is on the same port number as
-    /// its listen port (`dht_bind_addr`): the address we remember for
-    /// talking to it is also the address of its node.
+    /// It works because a peer's DHT socket is at a fixed offset from
+    /// its listen port (`DHT_PORT_OFFSET`): the address we remember for
+    /// talking to it names the address of its node.
     ///
     /// Newest first, unset addresses dropped, one entry per address.
     pub fn peer_bootstraps(&self) -> Vec<(std::net::SocketAddr, snapcore::routing::NodeId)> {
@@ -4106,7 +4106,7 @@ impl Snapclone {
             .chain(self.heard.recent().into_iter().map(|g| (g.sc_id.clone(), g.addr)));
         for (id, a) in candidates {
             if a.is_unset() || id.is_empty() || id == self.local_id { continue; }
-            let sa = std::net::SocketAddr::from((a.ip, a.port));
+            let Some(sa) = Self::dht_addr_of(a.ip, a.port) else { continue };
             if seen.insert(sa) {
                 out.push((sa, crate::identity::dht_node_id(&id)));
             }
@@ -4114,14 +4114,32 @@ impl Snapclone {
         out
     }
 
-    /// Where the DHT socket binds: UDP on the SAME port number as the
-    /// listen port, so any peer that knows how to reach the app knows
+    /// The DHT's UDP port is the listen port plus this. UDP on the listen
+    /// port itself is the voice socket (`voice_wire::VoiceSocket::bind`),
+    /// which this must not collide with — it did, for one commit: the DHT
+    /// spawned first at startup and voice could never bind.
+    ///
+    /// A fixed offset keeps the property that matters: a peer whose app
+    /// address we know has a node address we can DERIVE, without asking.
+    /// Stated once, here, and used by both `dht_bind_addr` and
+    /// `peer_bootstraps`, so the two cannot disagree.
+    pub const DHT_PORT_OFFSET: u16 = 1;
+
+    /// A peer's DHT address from its app address.
+    pub fn dht_addr_of(ip: [u8; 4], listen_port: u16) -> Option<std::net::SocketAddr> {
+        let port = listen_port.checked_add(Self::DHT_PORT_OFFSET)?;
+        Some(std::net::SocketAddr::from((ip, port)))
+    }
+
+    /// Where the DHT socket binds: UDP on the listen port plus
+    /// `DHT_PORT_OFFSET`, so any peer that knows how to reach the app knows
     /// how to reach the node. Falls back to an ephemeral port only if that
-    /// one is taken on UDP, in which case peers can still reach us through
-    /// the bootstrap servers but not directly.
+    /// one is taken, in which case peers can still reach us through the
+    /// bootstrap servers but not directly.
     pub fn dht_bind_addr(listen_port: u16) -> [std::net::SocketAddr; 2] {
-        [std::net::SocketAddr::from(([0, 0, 0, 0], listen_port)),
-         std::net::SocketAddr::from(([0, 0, 0, 0], 0))]
+        let preferred = Self::dht_addr_of([0, 0, 0, 0], listen_port)
+            .unwrap_or(std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+        [preferred, std::net::SocketAddr::from(([0, 0, 0, 0], 0))]
     }
 
     /// A peer was reached at this address. Expiring entries is the point: an
@@ -6658,18 +6676,23 @@ mod gossip_wiring_tests {
         app.punch.set("sc-unset", crate::punch_addrs::PeerAddr::new([0, 0, 0, 0], 0), 4_000);
         let got = app.peer_bootstraps();
         assert_eq!(got.len(), 2, "{got:?}");
-        assert!(got.iter().any(|(sa, id)| *sa == std::net::SocketAddr::from(([10, 0, 0, 5], 9876))
+        assert!(got.iter().any(|(sa, id)| *sa == std::net::SocketAddr::from(([10, 0, 0, 5], 9876 + Snapclone::DHT_PORT_OFFSET))
                                           && *id == crate::identity::dht_node_id("sc-alice")),
-                "alice under her real id");
+                "alice under her real id, at her NODE's port");
         // The same peer known to both tables is one entry.
-        assert_eq!(got.iter().filter(|(sa, _)| sa.port() == 9876).count(), 2);
+        assert_eq!(got.iter().filter(|(sa, _)| sa.port() == 9876 + Snapclone::DHT_PORT_OFFSET).count(), 2);
     }
 
     #[test]
-    fn the_dht_binds_the_listen_port_first_and_ephemeral_second() {
+    fn the_dht_port_is_derived_the_same_way_for_us_and_for_peers() {
         let [first, second] = Snapclone::dht_bind_addr(9876);
-        assert_eq!(first.port(), 9876);
+        assert_eq!(first.port(), 9876 + Snapclone::DHT_PORT_OFFSET);
+        assert_ne!(first.port(), 9876, "UDP on the listen port is the voice socket");
         assert_eq!(second.port(), 0);
+        assert_eq!(Snapclone::dht_addr_of([1, 2, 3, 4], 9876).map(|a| a.port()), Some(first.port()));
+        // The top of the range has nowhere to go: ephemeral, not wraparound.
+        assert_eq!(Snapclone::dht_bind_addr(65535)[0].port(), 0);
+        assert!(Snapclone::dht_addr_of([1, 2, 3, 4], 65535).is_none());
     }
 
     #[test]
