@@ -842,18 +842,33 @@ where T: Copy + PartialEq + Labelled {
     // changed — the popup state belongs to whichever drew last, so a
     // click on the first opens and immediately closes.
     //
-    // The salt is the VALUE TYPE's name rather than the label, so two
-    // controls over different enums can never collide however they are
-    // labelled — a rename cannot reintroduce this.
+    // Salting by the VALUE TYPE's name alone fixed THAT collision but
+    // opened an identical one the other way: front camera backend and
+    // rear camera backend are both `CameraBackend`, so
+    // `type_name::<CameraBackend>()` was the same id for both — same
+    // symptom (tab/click affects whichever combo drew last, so the
+    // setting reads as permanently stuck on one value), just triggered
+    // by two DIFFERENT labels sharing a type instead of two different
+    // types sharing a label. Salting by (type name, label) together
+    // means either axis alone can repeat without colliding — a second
+    // enum reusing a label, or a second control over the same enum with
+    // its own label, both stay distinct.
     ui.horizontal(|ui| {
         ui.label(label);
-        egui::ComboBox::from_id_salt(std::any::type_name::<T>())
+        egui::ComboBox::from_id_salt(combo_id_salt::<T>(label))
             .selected_text(value.text())
             .show_ui(ui, |ui| {
                 for v in all { ui.selectable_value(value, *v, v.text()); }
             });
     });
     before != *value
+}
+
+/// The id salt `combo` actually uses — pulled out so a test can call the
+/// exact same function production code does, rather than reimplementing
+/// the formula separately and drifting from it silently.
+fn combo_id_salt<T>(label: &str) -> (&'static str, String) {
+    (std::any::type_name::<T>(), label.to_owned())
 }
 
 fn combo_indexed<T>(ui: &mut egui::Ui, label: &str, value: &mut T, all: &'static [T]) -> bool
@@ -898,20 +913,50 @@ mod tests {
         // crypto. They shared an id, so neither could be changed: the
         // popup belongs to whichever drew last.
         //
-        // `combo` now salts by the value TYPE, which makes a label
-        // collision harmless. This test guards the label anyway, because
-        // a duplicate label is still a UI bug — two rows saying
-        // "backend" do not tell a person which backend.
+        // `combo` now salts by (value TYPE, label) together, which makes
+        // a label collision on its own harmless. This test guards the
+        // label anyway, because a duplicate label is still a UI bug —
+        // two rows saying "backend" do not tell a person which backend.
+        //
+        // Scans both `combo(` and `combo_indexed(` call sites — the
+        // front/rear camera backend collision (see
+        // `same_typed_combos_with_different_labels_get_different_ids`
+        // below) used the plain `combo(` form, which an earlier version
+        // of this test did not scan, so it passed while that bug shipped.
         let src = include_str!("settings_page.rs");
         let mut labels: Vec<&str> = src
             .lines()
-            .filter_map(|l| l.trim().strip_prefix("combo_indexed(ui, \""))
+            .filter_map(|l| {
+                let l = l.trim();
+                l.strip_prefix("combo_indexed(ui, \"").or_else(|| l.strip_prefix("combo(ui, \""))
+            })
             .filter_map(|r| r.split('"').next())
             .collect();
         let before = labels.len();
         labels.sort_unstable();
         labels.dedup();
         assert_eq!(labels.len(), before, "two combos share a label: {labels:?}");
+    }
+
+    #[test]
+    fn same_typed_combos_with_different_labels_get_different_ids() {
+        // The bug this guards: `combo`'s id_salt used to be JUST
+        // `type_name::<T>()`, so front camera backend and rear camera
+        // backend — both `CameraBackend` — collided with each other
+        // (same failure shape as the discovery/crypto label collision
+        // above, just triggered by sharing a TYPE instead of a LABEL).
+        // The symptom reported from a real device: the two dropdowns
+        // could not be opened independently and Tab moved both at once,
+        // because there was only ever one popup's worth of state for
+        // both of them to share.
+        //
+        // Calls `combo_id_salt` directly — the exact function `combo`
+        // itself uses — so a regression to the salt formula (e.g. back
+        // to bare `type_name::<T>()`) fails this test instead of it
+        // silently passing against a reimplemented copy of the formula.
+        let rear = egui::Id::new(combo_id_salt::<CameraBackend>("rear camera backend"));
+        let front = egui::Id::new(combo_id_salt::<CameraBackend>("front camera backend"));
+        assert_ne!(rear, front, "front/rear camera backend combos would share an id");
     }
 
     #[test]
