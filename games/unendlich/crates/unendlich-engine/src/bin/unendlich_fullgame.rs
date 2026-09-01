@@ -2795,6 +2795,44 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         log::info!("adaptive_render_distance: ENABLED — shrink>{:.1}ms grow<{:.1}ms min={} (UNENDLICH_ADAPTIVE_RENDER_DISTANCE)",
             adaptive_rd_shrink_ms, adaptive_rd_grow_ms, adaptive_rd_min);
     }
+
+    // `sim::frame_pacer` was written (see its module doc) to drive the
+    // "previously un-driven" shadow-stride and LOD-fidelity knobs from a p90
+    // of recent frame times, with multi-step degradation for severe overshoot
+    // and hysteresis to avoid oscillation. It shipped fully tested but was
+    // never called from either binary — only from a microbenchmark harness
+    // with an empty history — so none of that tuning has been affecting real
+    // frames. This wires it up for shadow_chunk_stride and lod_fidelity:
+    // froxel_steps has no corresponding real renderer setting anywhere in the
+    // codebase (frame_pacer's Knobs invented it without one existing), so it's
+    // left unapplied rather than fabricating a knob I don't understand the
+    // effect of. max_uploads already has its own live controller
+    // (adaptive_upload above), so `k.max_uploads` is computed by `adjust` but
+    // intentionally left unapplied here too, to avoid two controllers fighting
+    // over the same knob.
+    let frame_pacer_enabled = std::env::var("UNENDLICH_FRAME_PACER")
+        .map(|v| v != "0" && !v.is_empty()).unwrap_or(true); // default ON, bounded knob
+    let mut frame_pacer_hist = unendlich_engine::sim::frame_pacer::FrameHistory {
+        recent_ms: [0.0f32; 32],
+        len: 0,
+    };
+    let mut frame_pacer_knobs = unendlich_engine::sim::frame_pacer::Knobs {
+        shadow_stride: 1,
+        lod_fidelity: 1.0,
+        max_uploads: max_uploads_per_frame.clamp(1, 255) as u8,
+        froxel_steps: 16,
+    };
+    let frame_pacer_limits = unendlich_engine::sim::frame_pacer::Limits {
+        stride: (1, 8), // matches set_shadow_chunk_stride's own clamp
+        fidelity: (0.4, 1.0),
+        uploads: (1, 255),
+        froxel: (4, 16),
+    };
+    let mut frame_pacer_cursor: usize = 0; // next write slot, wraps independent of `len`
+    let mut frame_pacer_last = std::time::Instant::now();
+    if frame_pacer_enabled {
+        log::info!("frame_pacer: ENABLED — driving shadow_chunk_stride from p90 frame time (UNENDLICH_FRAME_PACER=0 to disable)");
+    }
     // r476: seed the Performance-page levers from their env vars so the env still
     // works as the initial value and the in-game controls reflect it. After this
     // the UI owns them live (the controller reads renderer.ui_adaptive_rd; the
@@ -4691,6 +4729,35 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // too slow to react when the frame rate has already collapsed).
             let effective_rd = renderer.ui_render_distance.min(adaptive_rd_cap).max(2);
             unendlich_engine::constants::set_render_distance_override(effective_rd);
+        }
+
+        // frame_pacer: push this frame's time into the ring every frame (cheap),
+        // but only run `adjust` + apply on a 200ms cadence like adaptive_rd above
+        // — p90 over a handful of stale samples isn't informative frame-to-frame.
+        if frame_pacer_enabled {
+            frame_pacer_hist.recent_ms[frame_pacer_cursor] = dt_ms as f32;
+            frame_pacer_cursor = (frame_pacer_cursor + 1) % 32;
+            frame_pacer_hist.len = (frame_pacer_hist.len + 1).min(32);
+            if frame_pacer_last.elapsed() >= std::time::Duration::from_millis(200) {
+                frame_pacer_last = now;
+                let new_knobs = unendlich_engine::sim::frame_pacer::adjust(
+                    &frame_pacer_hist,
+                    frame_target_ms as f32,
+                    frame_pacer_knobs,
+                    frame_pacer_limits,
+                );
+                if new_knobs.shadow_stride != frame_pacer_knobs.shadow_stride {
+                    log::info!("[frame_pacer] shadow_stride {} -> {} (p90-driven)",
+                        frame_pacer_knobs.shadow_stride, new_knobs.shadow_stride);
+                    renderer.set_shadow_chunk_stride(new_knobs.shadow_stride as u32);
+                }
+                if (new_knobs.lod_fidelity - frame_pacer_knobs.lod_fidelity).abs() > 1e-6 {
+                    log::info!("[frame_pacer] lod_fidelity {:.2} -> {:.2} (p90-driven)",
+                        frame_pacer_knobs.lod_fidelity, new_knobs.lod_fidelity);
+                    unendlich_engine::constants::set_lod_fidelity_override(new_knobs.lod_fidelity);
+                }
+                frame_pacer_knobs = new_knobs;
+            }
         }
         // rNNN: WEATHER SIM readout — every ~2s, sample the physical weather for
         // the player's column and log it (no gameplay/render side effects).

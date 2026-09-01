@@ -731,7 +731,10 @@ pub struct WorldRenderer {
     /// Default 1 = render all chunks every frame (no temporal
     /// amortization). > 1 = render only 1/N chunks per frame and
     /// rely on the shadow map preserving previous frames' depth.
-    shadow_chunk_stride: u32,
+    ///
+    /// `pub(crate)` (was private) so `sim::frame_pacer` can drive it live
+    /// from the fullgame binary's frame loop — see `set_shadow_chunk_stride`.
+    pub(crate) shadow_chunk_stride: u32,
 
     /// v0.24.NEXT (shadow-cache): when enabled, skip the entire shadow render
     /// pass on frames where the cascade view-projection is bit-identical to the
@@ -1044,6 +1047,14 @@ fn cache_lru_key(
 }
 
 impl WorldRenderer {
+    /// Live-adjust the shadow-cull temporal stride (see `shadow_chunk_stride`
+    /// docs). Clamped to `[1, 8]` — 8 is already well past where the shadow
+    /// map staleness becomes visible, so this bounds `sim::frame_pacer`
+    /// output regardless of what limits its caller passes.
+    pub fn set_shadow_chunk_stride(&mut self, stride: u32) {
+        self.shadow_chunk_stride = stride.clamp(1, 8);
+    }
+
     pub fn new(
         ctx: &VulkanContext,
         framebuffer_size: (u32, u32),
