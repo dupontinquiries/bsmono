@@ -698,3 +698,37 @@ including heavy ML deps like tract-onnx) was not run to completion in
 this sandbox — it exceeded a 280s budget mid-compile without erroring,
 just slow. Worth a dedicated longer run next session to be sure nothing
 outside the six crates touched here regressed.
+
+## 16. skydribble: 10 remaining dead-code findings, not chased individually
+
+After the fixes in `135dbb61`/`387c91db`/`1e23a0c1` (duplicate CLI arms,
+a misplaced/never-checked Fairphone-vs-desktop platform-classify
+diagnostic, two computations superseded by documented rewrites, and
+assorted `mut`/unused-var mechanics), `cargo-ailite check` still reports
+10 warnings, all genuine dead code with no nearby comment explaining
+whether each is superseded, unfinished, or speculative:
+
+`terrain_mesh` (main.rs, unused fn), `GFX_TIERS` (config.rs, unused
+const — but the game clearly has graphics tiers somewhere, since
+`VideoCfg` exists; worth checking if tier selection reads a different
+list), `VideoCfg::ray_dist` (unread field — sounds ray-tracing/reflection
+related, might be a stub for a feature not yet built), `Source::label`
+(gyro.rs, unused method — likely meant for a settings UI that doesn't
+call it), `Trick::Backboard` (replay.rs, unconstructed enum variant —
+one trick out of presumably several that the detector doesn't fire for
+yet), `Session::done` (academy.rs, unread field — sounds like tutorial
+completion tracking that nothing reads back), `Analyzer::summary`
+(style.rs, unused method), `Flick::hint` (sim.rs, unread struct field —
+probably meant for on-screen text that isn't drawn), `Body::{scale,
+rot, spin}` (world.rs, unread fields on what's presumably meant to be a
+general transform+physics body type), `World::surface_below` (unused
+method — sounds like it answers "how far to the nearest surface below
+this point," plausibly meant for spawn placement or fall-through
+prevention that doesn't call it yet).
+
+Ten unrelated findings is enough that most are probably genuinely
+per-feature unfinished work rather than one pattern, unlike bot-arena's
+13-function cluster (C13_TODO §14) which reads as one coherent unwired
+subsystem. Logged rather than triaged one-by-one — this is real-time
+game code with no way to verify "is this the right fix" without playing
+it, same caution as the physics deletions in this same pass.
