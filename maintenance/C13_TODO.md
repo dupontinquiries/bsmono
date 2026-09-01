@@ -1379,3 +1379,61 @@ deliberately, with the existing A/B gates used to confirm output stays
 within tolerance rather than assumed.
 
 Measure before and after. The tool is triage; it proves nothing.
+
+
+## 41. ctxplan.rs has no callers — the context planner was never wired
+
+Found while chasing the `:ws` question. `ctxplan.rs` (265 lines) computes
+exactly the thing that was missing: which files fit a token budget, whole
+vs peeked vs skipped, with `used_tokens`, `looped_in()`, `peeked()` and
+`skipped()` already implemented. **Nothing in the crate calls it.**
+`grep -rn "ctxplan::" src/ --include=*.rs` outside its own file returns
+nothing.
+
+So the prompt-building path that DOES run (`workspace_block` /
+`agent_context`) budgets by a coarse `ModelClass` and byte caps, while a
+per-file relevance-ranked planner sits beside it unused. That is the same
+"built, never wired" pattern already logged for tomescope (§ earlier) and
+bot-arena's engine.rs (§14), and this one has direct user-visible cost:
+the chat path shipped a directory listing where a planner would have
+chosen files.
+
+Next step is a judgement call, not a mechanical fix:
+- If ctxplan is the intended design, wire it into `workspace_block`
+  (it needs a token estimate per file and a real budget from the model's
+  context window — `Budget::for_context` already takes exactly that).
+- If it was superseded by read_harness's class budgets, delete it, because
+  a second unused answer to a question the codebase has already answered
+  is worse than none.
+
+Decide before adding anything else to either. Do NOT leave both.
+
+## 42. Model inventory — what the fleet can actually be tested against
+
+From the operator's `~/models` listing, so future work stops guessing what
+is available. Relevant to arch coverage:
+
+- **llama3**: 1B-Q4_K_M, 3B-Q2_K, 3B-UD-IQ1_S, 3.3-8B-Q4_K_M. The IQ1_S is
+  the one that exercises the native IQ1 path (see the loader's IQ1_S
+  transcode notes).
+- **qwen3**: Qwen3-14B-UD-IQ1_S, Qwen3.5-9B-Q4_K_M, Qwen3.8-27B-UD-Q4_K_M
+  (the 48/65 Gated DeltaNet hybrid), plus a `3p6` directory.
+- **DeepSeek-R1-0528-Qwen3-8B-Q4_K_M**, deepseek-coder-6.7b.
+- **Falcon-H1-Tiny-90M-Coder** — 24/24 Gated DeltaNet, i.e. a FULLY
+  recurrent model at 90M. That is the cheapest possible regression test for
+  the hybrid cache path that crashed prewarm; it loads in seconds.
+- **gemma4** e2b-it — exercises the Gemma family features (weightless V
+  norm, GeGLU, (1+w) norm) the glimmer work leans on.
+- **diffusion/llada-8b-instruct**, staging/llada2mini — the LLaDA paths.
+- **meta_muse-glimmer** — config only, NO weights. So glimmer work cannot
+  be end-to-end tested yet; the arch registration and swa_pattern tests are
+  as far as it goes without a converted GGUF.
+- qwen2.5-0.5b-instruct-q8_0, TinyLlama-1.1B-32k-Q2_K — small enough to
+  iterate the harness against quickly.
+- whisper: ggml-base.en / large-v3-turbo / tiny.en, plus a q4_k turbo.
+
+Two things follow. First, **Falcon-H1-Tiny-90M is the right smoke test**
+for anything touching recurrent state — it is 90M and fully recurrent, so
+it catches hybrid-cache bugs in seconds rather than on a 27B. Second, the
+glimmer implementation has no checkpoint to test against, so it should not
+progress past the registry/refusal stage until one exists.
