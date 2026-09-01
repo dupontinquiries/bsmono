@@ -394,11 +394,11 @@ pub fn pause_menu_body(ui: &mut egui::Ui, build_tag: &str) -> PauseOut {
         if pause_button(ui, "Resume") {
             out.pick = 1;
         }
-        ui.add_space(6.0);
+        ui.add_space(10.0); // was 6.0 -- more separation between touch targets
         if pause_button(ui, "Settings") {
             out.pick = 2;
         }
-        ui.add_space(6.0);
+        ui.add_space(10.0); // was 6.0
         // r533: change character WITHOUT leaving the world — the selector
         // was previously only on the title screen.
         if pause_button(ui, "Character") {
@@ -432,7 +432,7 @@ pub fn live_menu_body(ui: &mut egui::Ui, s: &LiveMenuState) -> LiveMenuOut {
                 if dest_button(ui, "Quit") {
                     out.menu_pick = 5;
                 }
-                ui.add_space(4.0);
+                ui.add_space(10.0); // was 4.0
                 if dest_button(ui, "Back") {
                     out.menu_pick = 6;
                 }
@@ -443,7 +443,7 @@ pub fn live_menu_body(ui: &mut egui::Ui, s: &LiveMenuState) -> LiveMenuOut {
                 if dest_button(ui, "Host World") {
                     out.menu_pick = 2;
                 }
-                ui.add_space(4.0);
+                ui.add_space(10.0); // was 4.0
                 if dest_button(ui, "Join Server") {
                     out.menu_pick = 3;
                 }
@@ -670,16 +670,16 @@ pub fn live_menu_body(ui: &mut egui::Ui, s: &LiveMenuState) -> LiveMenuOut {
                 if dest_button(ui, "Singleplayer") {
                     out.menu_pick = 8;
                 }
-                ui.add_space(4.0);
+                ui.add_space(10.0); // was 4.0 -- more separation between touch targets
                 if dest_button(ui, "Multiplayer") {
                     out.menu_pick = 2;
                 }
-                ui.add_space(4.0);
+                ui.add_space(10.0); // was 4.0
                 // r203: Settings reachable from the MAIN MENU.
                 if dest_button(ui, "Settings") {
                     out.open_settings = true;
                 }
-                ui.add_space(4.0);
+                ui.add_space(10.0); // was 4.0
                 // r488: open the character-select / customizer.
                 if dest_button(ui, "Character") {
                     out.open_character = true;
