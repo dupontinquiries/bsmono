@@ -1412,6 +1412,7 @@ fn carved_button_impl(ui: &mut egui::Ui, text: &str, accent: Option<Color32>) ->
 /// means "good/bad"): a crossing is neither a selection nor a verdict, it is provenance, and it
 /// needs to read as its own category at a glance in both the linear graph and the spatial scene.
 /// Violet sits outside every other role this palette assigns.
+#[allow(non_snake_case)] // matches every other palette-colour accessor in this file (PANEL, CYAN, LINE, …), which get the same allow from the macro that generates them; this one is hand-written because it isn't one of the base palette fields.
 pub fn CROSSING() -> Color32 { Color32::from_rgb(0xA0, 0x7C, 0xE8) }
 
 pub fn accent() -> Color32 {
