@@ -95,6 +95,12 @@ fn hero_title(ui: &mut egui::Ui) {
 
 /// The destiny-style menu button at an explicit width (kit) or a plain
 /// sized button — for rows that must budget horizontal space.
+///
+/// Height 46px (was 34px): the touch-target minimum recommended by both
+/// Apple's and Android's HIGs is ~44-48pt. 34px was fine for a mouse but
+/// unreliable to tap on a phone (Fairphone-class hardware is the actual
+/// target per user_prefs). Doesn't hurt desktop/mouse use — just a bit
+/// more generous.
 fn dest_button_sized(ui: &mut egui::Ui, label: &str, w: f32) -> bool {
     #[cfg(feature = "unendlich-ui")]
     {
@@ -102,17 +108,22 @@ fn dest_button_sized(ui: &mut egui::Ui, label: &str, w: f32) -> bool {
         // capped, not sized: the kit's `sized` is a MINIMUM and long
         // letterspaced labels outgrow any row budget (the off-screen delete
         // button). Capped elides the label instead of breaking the row.
-        unendlich_ui::button_capped(ui, label, accent, egui::vec2(w, 34.0)).clicked()
+        unendlich_ui::button_capped(ui, label, accent, egui::vec2(w, 46.0)).clicked()
     }
     #[cfg(not(feature = "unendlich-ui"))]
     {
-        ui.add_sized([w, 34.0], egui::Button::new(label)).clicked()
+        ui.add_sized([w, 46.0], egui::Button::new(label)).clicked()
     }
 }
 
 /// The destiny-style full-width menu button (kit) or a plain button.
+///
+/// Width now clamps to the available column width (capped at 220, floored
+/// at 160) instead of a hard 220px — so it doesn't overflow a narrow
+/// portrait phone viewport instead of just happening to fit one by luck.
 fn dest_button(ui: &mut egui::Ui, label: &str) -> bool {
-    dest_button_sized(ui, label, 220.0)
+    let w = ui.available_width().clamp(160.0, 220.0);
+    dest_button_sized(ui, label, w)
 }
 
 /// The theme accent (the menu's #6fc3ff), kit or fallback.
@@ -355,14 +366,15 @@ pub struct PauseOut {
 /// (kit `button_sized` at exactly 220×32; labels here are short and fixed,
 /// so no capping is needed).
 fn pause_button(ui: &mut egui::Ui, label: &str) -> bool {
+    // Height 46px (was 32px) — see dest_button_sized's doc for why.
     #[cfg(feature = "unendlich-ui")]
     {
         let accent = unendlich_ui::current_theme(ui.ctx()).accent;
-        unendlich_ui::button_sized(ui, label, accent, egui::vec2(220.0, 32.0)).clicked()
+        unendlich_ui::button_sized(ui, label, accent, egui::vec2(220.0, 46.0)).clicked()
     }
     #[cfg(not(feature = "unendlich-ui"))]
     {
-        ui.add_sized([220.0, 32.0], egui::Button::new(label)).clicked()
+        ui.add_sized([220.0, 46.0], egui::Button::new(label)).clicked()
     }
 }
 
