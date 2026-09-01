@@ -40,7 +40,7 @@ use serde_json::json;
 // startup search found nothing), Strategy 7 falls back to a live
 // search anyway — the cache is an optimization, not a precondition.
 
-type SsdpProvider = Box<dyn Fn(&str) -> Option<super::dlna_discover::DiscoveredDevice>
+type SsdpProvider = Box<dyn Fn(&str) -> Option<crate::dlna_discover::DiscoveredDevice>
                               + Send + Sync + 'static>;
 
 static SSDP_PROVIDER: once_cell::sync::OnceCell<SsdpProvider>
@@ -50,7 +50,7 @@ static SSDP_PROVIDER: once_cell::sync::OnceCell<SsdpProvider>
 /// result for a target host. main.rs installs this at startup, with
 /// the closure reading from main's SSDP_CACHE.
 pub fn set_ssdp_cache_provider<F>(provider: F)
-where F: Fn(&str) -> Option<super::dlna_discover::DiscoveredDevice>
+where F: Fn(&str) -> Option<crate::dlna_discover::DiscoveredDevice>
             + Send + Sync + 'static
 {
     let _ = SSDP_PROVIDER.set(Box::new(provider));
@@ -60,7 +60,7 @@ where F: Fn(&str) -> Option<super::dlna_discover::DiscoveredDevice>
 /// "192.168.2.12" or "192.168.2.12:8080"). Returns None when no
 /// provider is registered or the cache has no match.
 fn cached_ssdp_for_host(target_host: &str)
-    -> Option<super::dlna_discover::DiscoveredDevice>
+    -> Option<crate::dlna_discover::DiscoveredDevice>
 {
     SSDP_PROVIDER.get().and_then(|p| p(target_host))
 }
@@ -350,7 +350,7 @@ pub async fn play_url_on_device(
     // we first check the controller's startup-warmup cache; when the
     // device was discovered there, we skip the live search entirely.
     {
-        let target_host = match super::dlna_discover::host_of(device_base) {
+        let target_host = match crate::dlna_discover::host_of(device_base) {
             Some(h) => h,
             None => {
                 attempts.push(AttemptLog {
@@ -364,9 +364,9 @@ pub async fn play_url_on_device(
         // Try the warm cache first via the registered fetcher. If
         // it has fresh data for this host, use it; else fall through
         // to a live M-SEARCH.
-        let cached: Option<super::dlna_discover::DiscoveredDevice> =
+        let cached: Option<crate::dlna_discover::DiscoveredDevice> =
             cached_ssdp_for_host(&target_host);
-        let discovered: Vec<super::dlna_discover::DiscoveredDevice> = match cached {
+        let discovered: Vec<crate::dlna_discover::DiscoveredDevice> = match cached {
             Some(d) => {
                 eprintln!("play_uri: SSDP cache hit for {} → {}",
                           target_host, d.location);
@@ -376,8 +376,8 @@ pub async fn play_url_on_device(
                 eprintln!("play_uri: running SSDP M-SEARCH to find AVTransport control URL for {}",
                           target_host);
                 tokio::task::spawn_blocking(|| {
-                    super::dlna_discover::m_search(
-                        super::dlna_discover::ST_MEDIA_RENDERER,
+                    crate::dlna_discover::m_search(
+                        crate::dlna_discover::ST_MEDIA_RENDERER,
                         std::time::Duration::from_millis(1500),
                     ).unwrap_or_default()
                 }).await.unwrap_or_default()
@@ -386,7 +386,7 @@ pub async fn play_url_on_device(
 
         // Match the discovered devices against our target host.
         let target_dev = discovered.into_iter()
-            .find(|d| super::dlna_discover::matches_host(d, &target_host));
+            .find(|d| crate::dlna_discover::matches_host(d, &target_host));
         if let Some(dev) = target_dev {
             eprintln!("play_uri: SSDP matched device at {} (server: {})",
                       dev.location, dev.server);
@@ -397,7 +397,7 @@ pub async fn play_url_on_device(
             {
                 Ok(resp) if resp.status().is_success() => {
                     let xml = resp.text().await.unwrap_or_default();
-                    if let Some(info) = super::dlna_discover::extract_avtransport_info(
+                    if let Some(info) = crate::dlna_discover::extract_avtransport_info(
                         &xml, &dev.location)
                     {
                         eprintln!("play_uri: descriptor parsed: '{}' → control_url={}",

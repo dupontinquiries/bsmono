@@ -67,7 +67,7 @@ pub enum RouteEntry {
     /// later when the buffer finally drained.
     MixerStream {
         source_path: PathBuf,
-        mixer: Arc<std::sync::RwLock<crate::realtime_mixer::RealtimeMixer>>,
+        mixer: Arc<std::sync::RwLock<bo_core::realtime_mixer::RealtimeMixer>>,
         bitrate_kbps: u32,
     },
 }
@@ -132,7 +132,7 @@ impl TrackServer {
     pub fn expose_mixer_stream(
         &self,
         source_path: PathBuf,
-        mixer: Arc<std::sync::RwLock<crate::realtime_mixer::RealtimeMixer>>,
+        mixer: Arc<std::sync::RwLock<bo_core::realtime_mixer::RealtimeMixer>>,
         bitrate_kbps: u32,
     ) -> String {
         let token = random_token();
@@ -540,7 +540,7 @@ fn serve_bytes(
 fn serve_mixer_stream(
     stream: &mut TcpStream,
     source_path: &Path,
-    mixer: Arc<std::sync::RwLock<crate::realtime_mixer::RealtimeMixer>>,
+    mixer: Arc<std::sync::RwLock<bo_core::realtime_mixer::RealtimeMixer>>,
     bitrate_kbps: u32,
     head_only: bool,
 ) {
@@ -559,14 +559,14 @@ fn serve_mixer_stream(
     if head_only { return; }
 
     // ── Decode + resample once ─────────────────────────────────
-    let buf = match crate::looper::read_wav(source_path) {
+    let buf = match bo_core::looper::read_wav(source_path) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("track_server: mixer_stream read_wav failed: {}", e);
             return;
         }
     };
-    let pcm_48k = crate::looper::linear_resample_to_48k(
+    let pcm_48k = bo_core::looper::linear_resample_to_48k(
         &buf.samples_lr, buf.sample_rate);
     if pcm_48k.is_empty() {
         eprintln!("track_server: mixer_stream got empty pcm");
@@ -574,7 +574,7 @@ fn serve_mixer_stream(
     }
 
     // ── Per-connection mixer with shared params ────────────────
-    let mut local_mixer = crate::realtime_mixer::RealtimeMixer::new(48_000.0);
+    let mut local_mixer = bo_core::realtime_mixer::RealtimeMixer::new(48_000.0);
     if let Ok(m) = mixer.read() {
         local_mixer.set_params(m.params());
     }
@@ -899,7 +899,7 @@ mod tests {
         }
 
         let mixer = std::sync::Arc::new(std::sync::RwLock::new(
-            crate::realtime_mixer::RealtimeMixer::new(48_000.0)));
+            bo_core::realtime_mixer::RealtimeMixer::new(48_000.0)));
 
         let srv = TrackServer::bind(0).expect("bind");
         let token_path = srv.expose_mixer_stream(wav_path.clone(), mixer, 96);

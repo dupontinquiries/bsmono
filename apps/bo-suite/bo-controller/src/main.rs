@@ -68,8 +68,11 @@ mod settings_store;
 mod v1;
 mod room_geometry;
 mod speaker_calibration;
-mod track_server;
-mod play_uri;
+// track_server / play_uri moved to bo-cast (Qt-free, shared with
+// bo-suite-egui) along with dlna_discover/dlna_position below. Aliases
+// keep every existing call site in this file unchanged.
+pub(crate) use bo_cast::track_server;
+pub(crate) use bo_cast::play_uri;
 mod device_priority;
 mod anticipator;
 mod shadow_stream;
@@ -91,8 +94,8 @@ mod speculation_accuracy;
 mod rt_sched;
 mod dep_wrangler;
 mod dep_wrangler_run;
-mod dlna_discover;
-mod dlna_position;
+pub(crate) use bo_cast::dlna_discover;
+pub(crate) use bo_cast::dlna_position;
 mod mozart_source;
 mod mozart_source_switch;
 mod firmware_family;

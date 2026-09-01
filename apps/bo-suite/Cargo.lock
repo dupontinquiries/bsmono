@@ -209,12 +209,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "bo-cast"
+version = "0.1.0"
+dependencies = [
+ "bo-core",
+ "hound",
+ "ogg",
+ "once_cell",
+ "opus",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "urlencoding",
+]
+
+[[package]]
 name = "bo-controller"
 version = "0.1.0"
 dependencies = [
  "audio-kit",
  "audiopus",
  "bliss-audio",
+ "bo-cast",
  "bo-core",
  "bo-media",
  "bo-mux",

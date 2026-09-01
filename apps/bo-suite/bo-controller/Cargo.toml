@@ -42,6 +42,9 @@ mdns-sd = "0.11"
 # through this Qt binary. `mod media;` below is now a `use bo_media as
 # media;` alias so every existing `media::Foo` call site is unchanged.
 bo-media = { path = "../bo-media" }
+# dlna_discover / dlna_position / play_uri / track_server moved to bo-cast
+# (Qt-free) so bo-suite-egui can cast to a device too, not just this binary.
+bo-cast = { path = "../bo-cast" }
 # mux_bridge.rs calls bo_mux::control::socket_path() to reach the daemon's
 # control socket but the crate was never added as a dependency — pre-existing
 # gap, unrelated to the media extraction; fixed here since it's now blocking

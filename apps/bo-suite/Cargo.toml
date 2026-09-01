@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "bo-core",
     "bo-media",
+    "bo-cast",
     "bo-controller",
     "bo-mux",
 ]
