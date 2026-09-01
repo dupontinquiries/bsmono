@@ -545,27 +545,39 @@ impl eframe::App for LogscopeApp {
         switcher_panel.show_inside(ui, |ui| {
             ui.add_space(3.0);
             let now = ui.input(|i| i.time) as f32;
-            ui.horizontal_wrapped(|ui| {
-                for t in Tab::ALL {
-                    // WHAT IT IS FOR, on hover. The reference nav carries a subtitle under every
-                    // item; a tab bar has no room for a second line, so the same sentence goes
-                    // where it costs nothing. Several of these names cannot be guessed — "Peek",
-                    // "Bloc", and "Rotate", which reads as a view control and configures logrotate.
-                    let resp = ui.selectable_value(&mut self.tab, t, t.label())
-                        .on_hover_text(t.purpose());
-                    // carved-stone slab + (active) glowing inscription with a light sweep
-                    theme::carved_tab(ui.painter(), resp.rect, now, self.tab == t, theme::AMBER());
-                    let a = ui.ctx().animate_bool(resp.id, self.tab == t);
-                    if a > 0.0 {
-                        let rc = resp.rect;
-                        let w = rc.width() * a;
-                        let x0 = rc.center().x - w / 2.0;
-                        let y = rc.bottom() - 1.0;
-                        ui.painter().line_segment(
-                            [egui::pos2(x0, y), egui::pos2(x0 + w, y)],
-                            egui::Stroke::new(2.0_f32, theme::AMBER()));
+            // SCROLLABLE, not wrapped. `horizontal_wrapped` reported its wrapped-row height back to
+            // this Panel::bottom too late for the panel to reserve it, so on a narrow (phone) width
+            // the tabs that wrapped to a second row landed outside the panel's own rect — offscreen
+            // and untappable. "Chat" is late enough in Tab::ALL that it was the one this bit most.
+            // A horizontal ScrollArea has a fixed, single-row height the panel sizes correctly for
+            // every width, and on a touch device it's swipeable by construction — the tab strip
+            // itself becomes a scroll/swipe gesture for free rather than needing one built by hand.
+            egui::ScrollArea::horizontal().id_salt("tab_switcher").auto_shrink([false, true]).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for t in Tab::ALL {
+                        // WHAT IT IS FOR, on hover. The reference nav carries a subtitle under every
+                        // item; a tab bar has no room for a second line, so the same sentence goes
+                        // where it costs nothing. Several of these names cannot be guessed — "Peek",
+                        // "Bloc", and "Rotate", which reads as a view control and configures logrotate.
+                        let resp = ui.selectable_value(&mut self.tab, t, t.label())
+                            .on_hover_text(t.purpose());
+                        // carved-stone slab + (active) glowing inscription with a light sweep
+                        theme::carved_tab(ui.painter(), resp.rect, now, self.tab == t, theme::AMBER());
+                        let a = ui.ctx().animate_bool(resp.id, self.tab == t);
+                        if a > 0.0 {
+                            let rc = resp.rect;
+                            let w = rc.width() * a;
+                            let x0 = rc.center().x - w / 2.0;
+                            let y = rc.bottom() - 1.0;
+                            ui.painter().line_segment(
+                                [egui::pos2(x0, y), egui::pos2(x0 + w, y)],
+                                egui::Stroke::new(2.0_f32, theme::AMBER()));
+                        }
+                        // Active tab scrolled into view when changed elsewhere (e.g. a deep link or
+                        // a programmatic switch) rather than only when tapped directly in the strip.
+                        if self.tab == t && self.tab != self.last_tab { resp.scroll_to_me(Some(egui::Align::Center)); }
                     }
-                }
+                });
             });
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(40)); // inscription sweep animates
             ui.add_space(3.0);
