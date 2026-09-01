@@ -20,6 +20,10 @@ fao-codec-lib = { path = "../fao_codec_lib" }
 # first engine wired up rather than the most interesting one.
 early-fps = { path = "../../../games/soldier" }
 egui = "0.34"
+# For charging the pose streams the way the codec charges everything
+# else: the bytes that would go on the wire, after the same entropy
+# stage.
+zstd = "0.13"
 
 [profile.release]
 opt-level = 3

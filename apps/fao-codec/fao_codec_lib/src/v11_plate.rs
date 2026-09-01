@@ -768,6 +768,181 @@ fn search_mv(prev_y: &[u8], w: usize, h: usize, cur_y: &[u8], rx: usize, ry: usi
     ((qx as i8, qy as i8), qp_sad)
 }
 
+/// Frame-level weighted prediction for one reference: `y' = a*y + b`
+/// per plane, one (a, b) for the whole frame. What HEVC calls
+/// weighted prediction and what this codec was missing.
+///
+/// Why it exists, measured (fao_engine_capture, soldier, 48 f, dz32):
+/// with an EXACT engine canonical plus a +-5% global exposure drift,
+/// the per-region gain correction below spent 355-910 B/frame of side
+/// info tracking one number — 56% of the whole encode — because each
+/// region's quantised (a, b) pair rounds differently and zstd finds no
+/// repeats to bite on. Frame 0, where the drift is exactly 1.0, cost
+/// 17 B of side. One (a, b) per reference per frame is what the drift
+/// IS; the per-region pass then only has local work left.
+///
+/// `a` is quantised to 1/1024 (i16), `b` to integers (i8). Fit is
+/// least squares over every pixel of the plane; a global fit is robust
+/// to local misprediction because misaligned pixels pull toward
+/// identity, not away from it. Gated on L1 improvement so an
+/// uncorrelated reference (a wild prev under fast motion) keeps
+/// identity at zero cost.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WeightedPred {
+    pub qa: [i16; 3],
+    pub b: [i8; 3],
+}
+
+impl WeightedPred {
+    pub fn is_identity(&self) -> bool {
+        self.qa == [1024; 3] && self.b == [0; 3]
+    }
+    /// Wire bytes: 3 x (i16 + i8).
+    pub const WIRE: usize = 9;
+    pub fn write(&self, out: &mut Vec<u8>) {
+        for c in 0..3 {
+            out.extend_from_slice(&self.qa[c].to_le_bytes());
+            out.push(self.b[c] as u8);
+        }
+    }
+}
+
+fn fit_plane_gain(pred: &[u8], target: &[u8]) -> (i16, i8) {
+    let n = pred.len() as f64;
+    let (mut sp, mut st, mut spp, mut spt) = (0.0f64, 0.0, 0.0, 0.0);
+    for (&p, &t) in pred.iter().zip(target) {
+        let (p, t) = (p as f64, t as f64);
+        sp += p;
+        st += t;
+        spp += p * p;
+        spt += p * t;
+    }
+    let denom = n * spp - sp * sp;
+    if denom.abs() < 1e-6 {
+        return (1024, 0);
+    }
+    let a = ((n * spt - sp * st) / denom).clamp(0.5, 2.0);
+    let qa = (a * 1024.0).round() as i16;
+    let a = qa as f64 / 1024.0;
+    let b = ((st - a * sp) / n).round().clamp(-127.0, 127.0) as i8;
+    (qa, b)
+}
+
+fn plane_l1(pred: &[u8], target: &[u8], qa: i16, b: i8) -> i64 {
+    let a = qa as f64 / 1024.0;
+    let b = b as f64;
+    let mut e = 0i64;
+    for (&p, &t) in pred.iter().zip(target) {
+        let v = (a * p as f64 + b).round().clamp(0.0, 255.0);
+        e += (v - t as f64).abs() as i64;
+    }
+    e
+}
+
+/// Fit a frame-level (a, b) per plane against `target`; `None` when the
+/// fit does not clear the gate on total L1 across the three planes.
+/// The gate is in levels-per-pixel of improvement (FAO_WP_GATE,
+/// default 1/64): the correction costs 9 side bytes, so almost any
+/// real improvement pays, and the gate exists to reject noise fits
+/// rather than to price the bytes.
+pub fn fit_weighted_pred(pred: &Yuv420, target: &Yuv420) -> Option<WeightedPred> {
+    let gate: f64 = std::env::var("FAO_WP_GATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0 / 64.0);
+    let planes = [(&pred.y, &target.y), (&pred.u, &target.u), (&pred.v, &target.v)];
+    let mut wp = WeightedPred { qa: [1024; 3], b: [0; 3] };
+    let (mut e_raw, mut e_cor, mut npx) = (0i64, 0i64, 0usize);
+    for (c, (p, t)) in planes.iter().enumerate() {
+        let (qa, b) = fit_plane_gain(p, t);
+        let raw = plane_l1(p, t, 1024, 0);
+        let cor = plane_l1(p, t, qa, b);
+        // Per plane: keep identity if the fit does not help that plane.
+        if cor < raw {
+            wp.qa[c] = qa;
+            wp.b[c] = b;
+            e_cor += cor;
+        } else {
+            e_cor += raw;
+        }
+        e_raw += raw;
+        npx += p.len();
+    }
+    if wp.is_identity() {
+        return None;
+    }
+    if (e_raw - e_cor) as f64 > gate * npx as f64 {
+        Some(wp)
+    } else {
+        None
+    }
+}
+
+pub fn apply_weighted_pred(f: &mut Yuv420, wp: &WeightedPred) {
+    for (c, plane) in [&mut f.y, &mut f.u, &mut f.v].into_iter().enumerate() {
+        if wp.qa[c] == 1024 && wp.b[c] == 0 {
+            continue;
+        }
+        let a = wp.qa[c] as f32 / 1024.0;
+        let b = wp.b[c] as f32;
+        for v in plane.iter_mut() {
+            *v = (a * *v as f32 + b).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// True when `pred` is EXACT for this region up to rounding: every
+/// luma and 420-chroma sample within `EXACT_TOL` of the target.
+///
+/// Why this and not "codes as skip under the dead zone": the first
+/// version of this gate tested the residual coder's own skip
+/// condition, and it lost 0.045 MS-SSIM on film for -28% bytes — ten
+/// times worse than the dead-zone ladder. Under dz32 a region can be
+/// ~16 levels off everywhere and still code as skip, and on film the
+/// raw-SAD mode decision was quietly choosing the better of plate /
+/// prev-MC / intra for exactly those sub-dead-zone regions. That
+/// choice never reaches the residual, and it is where a large share of
+/// the quality comes from. A gate that suppresses it must only fire
+/// where NO predictor could do materially better, which is what
+/// "exact up to rounding" means.
+///
+/// Measured need (fao_engine_capture, soldier, exact canonical +
+/// exposure, after weighted prediction): frames whose residual stream
+/// was EMPTY still carried 90-186 B of side info — intra DC beating an
+/// exact canonical on flat-shaded walls (`0 + intra_gate < rounding
+/// noise`) and per-region gain pairs firing to remove +-1 rounding.
+/// Neither is worth a byte on MS-SSIM, and with the model already
+/// within rounding, mode 0 with no correction is the cheapest
+/// decodable choice.
+fn region_is_exact(pred: &Yuv420, f: &Yuv420, rx: usize, ry: usize) -> bool {
+    let exact_tol: i32 = std::env::var("FAO_EXACT_TOL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let fw = f.w;
+    for dy in 0..REGION {
+        let row = (ry + dy) * fw + rx;
+        for i in row..row + REGION {
+            if (f.y[i] as i32 - pred.y[i] as i32).abs() > exact_tol {
+                return false;
+            }
+        }
+    }
+    let cw = fw / 2;
+    let (crx, cry) = (rx / 2, ry / 2);
+    for (pp, fp) in [(&pred.u, &f.u), (&pred.v, &f.v)] {
+        for dy in 0..REGION / 2 {
+            let row = (cry + dy) * cw + crx;
+            for i in row..row + REGION / 2 {
+                if (fp[i] as i32 - pp[i] as i32).abs() > exact_tol {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 fn copy_region_mc(dst: &mut Yuv420, prev: &Yuv420, rx: usize, ry: usize, mv: (i8, i8)) {
     // mv is in QUARTER-PEL units. Whole-pixel components take the
     // exact integer path (bit-identical to the original behavior);
@@ -2119,20 +2294,52 @@ pub fn encode_gop_v3_core(
         .unwrap_or_else(|| (64.0 * opts.dead_zone).max(512.0) as u32);
     const MRU_CAP: usize = 128;
 
+    let wp_on = std::env::var("FAO_NO_WP").is_err();
+    // Exact-region gate, default ON at tolerance 1 (region_is_exact).
+    // Swept: off / tol 1 / tol 2 on film w1, SMITE, soldier:
+    //   w1 (film)      441,459/0.97721 | 441,967/0.97711 | 440,179/0.97684
+    //   soldier entity   5,576         |   1,997         |   1,626
+    // tol 2 is a priced LOSS on film (3.5 MB per MS-SSIM point against
+    // a 27 MB ladder); tol 1 moves film by +0.1% bytes / -0.0001, a
+    // deterministic ripple rather than a trade, and takes 64% off the
+    // exact-canonical encode. FAO_SKIPGATE=0 disables; FAO_EXACT_TOL
+    // overrides the tolerance for sweeps.
+    let skipgate = std::env::var("FAO_SKIPGATE").map(|v| v != "0").unwrap_or(true);
     for (fi, f) in frames.iter().enumerate() {
-        let plate_pred = pred_for(fi);
+        let mut plate_pred = pred_for(fi);
+        // ── Frame-level weighted prediction, one (a, b) per plane per
+        // REFERENCE, applied before the mode decision so every region
+        // chooses between photometrically aligned predictors. Charged
+        // as one flag byte plus 9 bytes per corrected reference, in the
+        // side stream. See WeightedPred for the measurement behind it.
+        let wp_plate = if wp_on { fit_weighted_pred(&plate_pred, f) } else { None };
+        if let Some(wp) = &wp_plate {
+            apply_weighted_pred(&mut plate_pred, wp);
+        }
+        let mut wp_prev: Option<WeightedPred> = None;
+        let plate_pred = plate_pred;
         let mut modes = vec![0u8; gw * gh];
         let mut mvs: Vec<(i8, i8)> = Vec::new();
         let mut dict_refs: Vec<(u8, u16, u16)> = Vec::new();
         let composite = if fi == 0 {
             plate_pred.clone()
         } else {
-            let prev = recon[fi - 1].clone();
+            let mut prev = recon[fi - 1].clone();
+            wp_prev = if wp_on { fit_weighted_pred(&prev, f) } else { None };
+            if let Some(wp) = &wp_prev {
+                apply_weighted_pred(&mut prev, wp);
+            }
+            let prev = prev;
             let mut comp = plate_pred.clone();
             let mut prev_regions = 0usize;
             for gy in 0..gh {
                 for gx in 0..gw {
                     let (rx, ry) = (gx * REGION, gy * REGION);
+                    // Model predictor already exact for this region:
+                    // mode 0, no search. See region_is_exact.
+                    if skipgate && region_is_exact(&plate_pred, f, rx, ry) {
+                        continue;
+                    }
                     let sad_plate = sad_region(&plate_pred.y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry);
                     let (mv, sad_prev) = search_mv(&prev.y, fw, fh, &f.y, rx, ry);
                     // Decision stays raw-SAD BY MEASUREMENT, not by
@@ -2386,6 +2593,11 @@ pub fn encode_gop_v3_core(
         for gy in 0..gh {
             for gx in 0..gw {
                 let (rx, ry) = (gx * REGION, gy * REGION);
+                // A region already exact up to rounding gains nothing
+                // worth 2 bytes from a correction.
+                if skipgate && region_is_exact(&composite, f, rx, ry) {
+                    continue;
+                }
                 let n = (REGION * REGION) as f64;
                 let (mut sp, mut sa, mut spp, mut spa) = (0.0f64, 0.0, 0.0, 0.0);
                 for dy in 0..REGION {
@@ -2593,19 +2805,48 @@ pub fn encode_gop_v3_core(
         }
         side.extend_from_slice(&gain_flags);
         side.extend_from_slice(&gain_vals);
+        // Weighted prediction: flag byte (bit0 plate/model ref, bit1
+        // prev ref), then the present pairs. Kept as a separate tail
+        // so an all-model frame can be signalled without it.
+        let side_core_zero = side.iter().all(|&b| b == 0);
+        let mut wp_tail: Vec<u8> = Vec::new();
+        let wp_flags = (wp_plate.is_some() as u8) | ((wp_prev.is_some() as u8) << 1);
+        wp_tail.push(wp_flags);
+        if let Some(wp) = &wp_plate {
+            wp.write(&mut wp_tail);
+        }
+        if let Some(wp) = &wp_prev {
+            wp.write(&mut wp_tail);
+        }
+        side.extend_from_slice(&wp_tail);
         if std::env::var("FAO_SIDE_DEBUG").is_ok() {
             eprintln!(
-                "side raw: mode {} nz {} mvd {} intra {} planar {} gflags {} gvals {}",
+                "side raw: mode {} nz {} mvd {} intra {} planar {} gflags {} gvals {} wp {:?}/{:?}",
                 (gw * gh + 7) / 8,
                 nz_bits.len(),
                 mv_deltas.len(),
                 intra_flags.len(),
                 planar_bits.len(),
                 gain_flags.len(),
-                gain_vals.len()
+                gain_vals.len(),
+                wp_plate,
+                wp_prev
             );
         }
-        let mode_bytes = zstd::encode_all(side.as_slice(), 19).map(|c| c.len()).unwrap_or(side.len());
+        // Side-stream method byte: 0 = zstd, 1 = raw, 2 = ALL-MODEL
+        // FRAME (every region mode 0, no gain, no intra; only the
+        // weighted-prediction tail follows). A frame of zero bitmaps
+        // was costing 17 B of zstd framing — on an exact engine
+        // canonical that is most frames. The marker means no path can
+        // lose more than one byte.
+        let mode_bytes = if side_core_zero {
+            1 + wp_tail.len()
+        } else {
+            1 + zstd::encode_all(side.as_slice(), 19)
+                .map(|c| c.len())
+                .unwrap_or(side.len())
+                .min(side.len())
+        };
 
         // ── MOTION-ADAPTIVE RATE ALLOCATION (FAO_DZ_MOTION).
         //

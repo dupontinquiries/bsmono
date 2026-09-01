@@ -6064,3 +6064,144 @@ failing), intra DC/planar fall back when the top or left border is
 missing, and the deblock filter skips the first 4 columns and rows.
 Those are all deliberate and were verified by reading; the region-grid
 truncation was not deliberate and was found only by measuring.
+
+## 2026-09-01 — where the engine-canonical bytes go, and three fixes that follow
+
+The previous session's honest headline was that even a PERFECT map
+canonical on soldier cost 42 KB for 48 frames against AV1's 20 KB, and
+recorded it as "AV1 wins here". Nobody had asked where the 42 KB went.
+`fao_engine_capture` now reports the split (model / motion / side /
+residual), takes `--no-actors` / `--no-exposure`, charges the camera
+and actor pose streams as real delta-coded zstd'd bytes instead of an
+assumed 24 B/frame, and adds an ENTITY row: the decoder also holds the
+actor mesh and re-renders it from a per-frame pose stream, so the only
+thing left for the residual is what neither side knows (the exposure
+drift).
+
+Baseline reproduced: map canonical 42,108 B @ 39.80 dB (logged 42,186).
+
+  side info was 23,665 B — 56% of the encode — at 355-910 B/frame,
+  against 17 B on frame 0 where the exposure gain is exactly 1.0.
+
+The per-region gain pairs were tracking ONE global number, and each
+region's quantised (a, b) rounds differently so zstd finds no repeats.
+Three changes, each measured on soldier (exact canonical), film (w1,
+bloopers @19.102s 48f crop 1920:800:0:140) and real game capture
+(SMITE, 32f @ t=5s, 1080p — recipe recorded here because the log had
+none):
+
+### 1. Frame-level weighted prediction (`WeightedPred`)
+
+One (a, b) per plane per REFERENCE — model/plate and prev — fitted by
+least squares over the frame, applied before the mode decision, 9
+side bytes each, gated on L1 improvement. HEVC weighted prediction;
+the codec did not have it.
+
+  soldier map canonical    42,108 @ 39.80 dB -> 26,509 @ 44.22 dB  (-37%)
+  soldier map+entity       30,659 @ 40.43    ->  6,436 @ 58.69     (-79%)
+  w1 film                 444,056 / 0.97731  -> 441,411 / 0.97721  (ladder rate: a wash)
+  SMITE                 1,144,815 / 0.95405  -> 856,878 / 0.95410  (-25%)
+
+The SMITE number needed explaining before it could be trusted. Fitted
+gains were luma identity, chroma a~0.80-0.89 with b~+30/+17, drifting
+smoothly across the GOP, while the SOURCE chroma is flat (U 122.8+-11
+every frame; `bin/chroma_probe`). So the plate's chroma is what is
+off, and the fit is least-squares ATTENUATION on a noisy predictor:
+the raw plate's luma fits a=0.85 too (probe), rejected by the L1 gate;
+chroma (std ~11) is accepted because shrinking costs correct pixels a
+few levels — which the dz32 dead zone then discards — and helps wrong
+pixels more. That could have been a quality trade invisible to a
+luma-only metric, so it was measured on the reconstruction:
+
+  SMITE chroma PSNR  no WP  U 28.39  V 32.53  |  WP  U 34.61  V 34.81  (Y unchanged 29.44)
+
++6.2 dB U and +2.3 dB V for -25% bytes: a real win on both axes. But
+28 dB chroma UNDER a 29 dB luma is backwards for any codec, and the
+cause is structural: `residual::encode` applies the luma dead zone to
+chroma, so at dz32 any chroma DC error under ~16 levels is never
+coded and chroma is "whatever the predictor gave". AV1 anchors on the
+same clip (libsvtav1 preset 4):
+
+  crf45  257,783 B  Y 41.78  U 47.48  V 47.72  MS-SSIM 0.99508
+  crf52  187,572 B  Y 40.13  U 46.28  V 46.53  MS-SSIM 0.99277
+  v11 WP 856,878 B  Y 29.44  U 34.61  V 34.81  MS-SSIM 0.95410
+
+METRIC CORRECTION, standing: the figure of merit is luma-only, and it
+has been hiding a 12 dB chroma deficit. Every comparison in this log
+should be read with that caveat until the bench reports chroma. The
+fix (a chroma dead-zone divisor, i.e. a chroma QP offset) is a
+one-line encoder change that needs a chroma-aware price to sweep
+against; not done this session.
+
+### 2. Two wire-framing fixes, unconditional
+
+`residual` method byte 2 = EMPTY (every block skip): 5 B instead of
+19 (4 header + method + 14 of zstd framing around a 5-byte all-skip
+payload). Side-stream method byte: 2 = ALL-MODEL FRAME (zero bitmaps,
+no gain; only the weighted-prediction tail follows): 1 + tail instead
+of 17. On an exact canonical that is most frames.
+
+  soldier map canonical   26,509 -> 25,831     entity 6,436 -> 5,576 (-13%)
+  w1 film                 441,411 -> 441,459   (framing marker cost, +48 B)
+
+### 3. Exact-region gate — and the version of it that was WRONG
+
+After 1+2, frames whose residual was EMPTY still carried 90-186 B of
+side: intra DC beating an exact canonical on flat-shaded walls
+(`0 + intra_gate < rounding noise`), and per-region gain pairs firing
+to remove +-1 rounding.
+
+First version gated on the residual coder's own skip test ("codes as
+all-skip under the dead zone"). Soldier entity 5,576 -> 1,626 B, and
+film w1 441,459/0.97721 -> 318,728/0.93248: -28% bytes for -0.045
+MS-SSIM, 2.7 MB per point against a 27 MB ladder, ten times worse
+than lowering dz. Under dz32 a region can be ~16 levels off and still
+code as skip, and on film the raw-SAD mode decision is quietly
+choosing the better of plate / prev-MC / intra for exactly those
+sub-dead-zone regions — the "accidental intra refresh" the code
+already documents. That choice never reaches the residual and it is
+where a large share of film quality comes from. Confirms the earlier
+finding from the other side: `region_codable_cost` lost as a mode
+decision, and it loses as a gate too, for the same reason.
+
+Replaced by `region_is_exact`: every luma and chroma sample within
+tolerance of the target, no DCT, no dead-zone dependence.
+
+  tol   w1 film               soldier map           soldier entity
+  off   441,459 / 0.97721     25,831 @ 44.22        5,576 @ 58.69
+  1     441,967 / 0.97711     22,468 @ 44.16        1,997 @ 57.09   <- default
+  2     440,179 / 0.97684     15,075 @ 40.22        1,626 @ 57.08
+
+tol 2 is a priced loss on film (3.5 MB/point). tol 1 moves film by
++0.1% bytes / -0.0001 — a deterministic ripple through the prev
+reference, not a trade — and takes 64% off the exact-canonical
+encode. The 4 dB PSNR drop on the map row at tol 2 is the per-region
+gains having been doing real +-1 work that MS-SSIM does not value;
+recorded so nobody reads the PSNR column as a regression.
+
+### Standing against AV1 on soldier (48 f, 640x384, dz32)
+
+  AV1 crf58 (libsvtav1 p4)      18,930 B  Y 40.73  U 43.50  V 44.45  MS-SSIM 0.99783
+  v11 map canonical             22,468 B  Y 44.16                     MS-SSIM 0.99934
+  v11 map + entity canonical     1,997 B  Y 57.09                     MS-SSIM 0.99994
+
+  entity: 9.5x smaller at +16 dB. Bytes: 48 model refs + 64 camera
+  + 710 entity poses + 935 side + 240 residual.
+
+What that number is and is not. It IS the regime FINDINGS named as the
+only one with a measured payoff, now with the actor split done the
+way an engine would do it (mesh in the library, trajectory per take).
+It is NOT a general video result: the decoder holds the game's
+renderer (the harness predicts with `early_fps::render` itself), the
+content is flat-shaded (the harness rasteriser does not sample the
+atlas), and the map row — actors as pixels — is still 1.19x AV1's
+bytes at higher quality, roughly a wash at matched quality. The
+`.faoscene` seam still carries one mesh and one camera and renders
+with the codec's own rasteriser, which cannot reproduce soldier's fog
+and lighting; the cost of that mismatch is the next thing to measure,
+and the v2 format (meshes + per-frame instances + a renderer identity)
+is the next thing to write.
+
+Sandbox notes: backgrounded builds die when the tool shell exits
+unless started with `setsid nohup ... < /dev/null &`. Both workspaces
+share CARGO_TARGET_DIR=/tmp/fao/target (7.1 GB free at the end).
