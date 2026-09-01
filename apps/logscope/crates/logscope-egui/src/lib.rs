@@ -105,6 +105,9 @@ pub mod workerroster;
 #[allow(dead_code)] pub mod bracecheck;
 #[allow(dead_code)] pub mod contextsrc;
 #[allow(dead_code)] pub mod ctxplan;
+// Label de-collision for the chat graph — see the module docs. Not yet wired
+// into the renderer; the geometry is the part worth getting right first.
+#[allow(dead_code)] pub mod graph_labels;
 pub use logscope_fan::quest;
 pub use logscope_fan::verdict;
 #[allow(dead_code)] pub mod script;
