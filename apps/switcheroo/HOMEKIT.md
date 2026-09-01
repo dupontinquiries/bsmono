@@ -76,3 +76,37 @@ once a real plug is in front of it, since a given vendor may use a
 proprietary characteristic instead of the assigned one. When that happens
 the write fails cleanly with "no Automation IO digital-output
 characteristic on this device" rather than silently doing nothing.
+
+
+## Field observations (2026-09-01, from the reporter)
+
+Two things came back from a real WSP100 that change the picture above.
+
+**Connecting alone turns the plug off.** A bare, unauthenticated BLE
+connect — no pairing, no command written — powers the load down. If that
+reproduces reliably then "off" is already reachable without HAP, and a
+deliberate connect-then-disconnect would implement one half of the switch.
+It is NOT wired up here, because shipping it as if it were a real off
+command would be lying about what the app is doing, and because half a
+switch presented as a whole one is worse than an honest refusal. But it is
+worth confirming: a reliable half is more useful than nothing, clearly
+labelled.
+
+Worth noting plainly that this is a security flaw in the accessory: anyone
+in radio range can power-cycle the load with no credential at all.
+
+**The reporter uses no Apple devices.** That removes the objection this
+document leans hardest on. If nothing else holds the pairing, pairing with
+switcheroo steals nothing, and implementing HAP becomes an ordinary
+(large) protocol task rather than a destructive one.
+
+Their suggested design is better than every option listed above and should
+be the plan of record: let **one known node on the bo-suite fabric hold the
+pairing and act as an oracle** for everyone else. That is structurally what
+an Apple TV or HomePod does — it sidesteps the one-pairing-at-a-time limit
+for every client except the hub, keeps the long-term keys in exactly one
+place with one backup story, and means a phone joining the fabric gets
+control without its own pairing ceremony. The `Backend` seam in
+switcheroo-core is already the right shape for this: a fabric-oracle
+backend submits the same `Command`s and returns the same `Event`s as the
+local radio, and the UI does not learn the difference.
