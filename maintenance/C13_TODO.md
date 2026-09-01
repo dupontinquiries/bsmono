@@ -1327,3 +1327,55 @@ would need, read off config.json:
 Scope this honestly before starting: the vision tower alone is comparable
 to the existing text engine. A staged plan (text-only path first, refusing
 image tokens by name; vision second) is the only version that lands.
+
+## 39. `:ws <path>` → "summarize the codebase": one cause found, one still open
+
+**Found and fixed:** the model was being reloaded on every request. The run
+log shows Llama-3.2-1B loaded TEN times in one session. `Cmd::Load` had no
+already-resident guard, while `Cmd::SetBackend` five lines above it does —
+added for precisely this reason. Each reload drops the KV prefix tree, the
+warmed pipelines and any prefix a long prompt already paid for, so no turn
+could build on the previous one. Fixed this session.
+
+**Still open — the two failures are different and should not be conflated:**
+
+- *Llama-3.2-1B "can't be useful".* A 1B at Q4_K_M summarising a codebase
+  is close to the model's ceiling regardless of harness. Before blaming the
+  engine, check what the prompt actually contains: `ctxplan.rs` decides
+  which files fit the budget, and a summary built from three truncated files
+  will be useless no matter how good the decode path is. The diagnostic to
+  add is one line saying how many files were considered, how many fit, and
+  what fraction of the context the prompt used — right now nothing reports
+  it, so "the model is bad" and "the prompt was empty" look identical.
+- *The Qwen model "blows up" on the same task.* Not characterised in any log
+  supplied so far — no panic, no OOM, no error text. Needs a run that
+  captures it. If it is the 27B hybrid, note that recurrent state cannot
+  seek, so trie/fleet prefix reuse is refused for that model (the loader
+  says so) and a long `:ws` prompt therefore re-prefills every turn with no
+  reuse at all — which is the same wound as the reload bug, from a
+  different direction, and would show up as time rather than a crash.
+
+Next step for both: instrument the `:ws` path to report prompt token count,
+files included vs skipped, and context utilisation. Both questions become
+answerable from one log line, and neither is answerable without it.
+
+## 40. Vectorization: 29 candidate loops, none acted on
+
+`maintenance/tools/vectorize_audit.py` now lists them (default score >= 4).
+Four are in the real CPU kernels; the rest are in CLI/diagnostic code and
+are almost certainly not worth touching. The four:
+
+- `cpumatvec.rs:146`, `:184`, `:630` — Q4_K/Q8_0 dequant matvec inner loops,
+  each flagged for a single float accumulator plus paired bounds-checked
+  indexing. `:184` is the one the log shows moving 0.72 GB.
+- `deltanet.rs` — one loop, relevant because the recurrent mixer is
+  CPU-routed and runs per layer per token on hybrid models.
+
+The accumulator finding is the interesting one and the fix is NOT free:
+splitting into partial sums changes the summation order, so the result can
+differ in the last bits. For a dequant matvec feeding attention that is
+almost certainly fine, but it is a numerical decision and should be made
+deliberately, with the existing A/B gates used to confirm output stays
+within tolerance rather than assumed.
+
+Measure before and after. The tool is triage; it proves nothing.
