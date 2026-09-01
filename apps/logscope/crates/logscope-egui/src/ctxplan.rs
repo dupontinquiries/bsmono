@@ -263,3 +263,169 @@ mod tests {
         assert!(!ctx.contains("<whole big.rs>"), "the big file was peeked, not looped in whole");
     }
 }
+
+// ── the missing half: where FileEntry.relevance comes from ───────────────────
+//
+// This planner was complete and tested and had NO CALLERS for its whole life,
+// and the reason is visible in `FileEntry`: it needs a `relevance` per file and
+// nothing in the crate produced one. So the prompt-building path grew its own
+// coarse byte caps instead, and the chat workspace block ended up shipping a
+// directory listing where a planner would have chosen files. Two answers to one
+// question, one of them unused.
+//
+// Relevance for "what is this repository" is not a hard problem and does not
+// need embeddings. Two signals carry most of it:
+//
+//   * DEPTH. A file at the root describes the project; one eight levels down
+//     describes a detail. This is the same insight that made `repo_tree`
+//     breadth-first — under a tight budget, shallow is what a summary needs.
+//   * NAME. Every ecosystem puts its description in a small set of filenames.
+//     A README or a manifest is worth more than an arbitrary source file, and
+//     both are worth more than a lockfile or a generated blob.
+
+/// Files whose name alone says they describe the project. Ordered most-telling
+/// first; the score is assigned by position so adding one is a one-line change.
+const DESCRIBES_PROJECT: [&str; 10] = [
+    "README.md", "README", "Cargo.toml", "pyproject.toml", "package.json",
+    "go.mod", "CMakeLists.txt", "Makefile", "ARCHITECTURE.md", "DESIGN.md",
+];
+
+/// Names that are large, generated, or lock-shaped: real files, but reading one
+/// teaches nothing about what the project IS, and they are usually the biggest
+/// thing in the tree. Skipped rather than down-ranked, because at a tight budget
+/// a down-ranked lockfile still wins against a deep source file.
+const NOT_WORTH_READING: [&str; 6] = [
+    "Cargo.lock", "package-lock.json", "yarn.lock", "poetry.lock",
+    "go.sum", "flake.lock",
+];
+
+/// Relevance in `[0, 1]` for "summarise this repository", from path shape alone.
+///
+/// Deliberately no content inspection: this runs over every file in a tree that
+/// may be tens of thousands of entries, and opening them all to decide what to
+/// open is the batch job the planner exists to avoid.
+pub fn describes_project(rel_path: &str) -> f32 {
+    let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    if NOT_WORTH_READING.contains(&name) {
+        return 0.0;
+    }
+    if let Some(i) = DESCRIBES_PROJECT.iter().position(|n| *n == name) {
+        // 1.0 down to 0.55 across the list — all comfortably above any
+        // ordinary source file, so the manifests always make the cut.
+        return 1.0 - (i as f32) * 0.05;
+    }
+    let depth = rel_path.matches('/').count();
+    let code = matches!(rel_path.rsplit('.').next().unwrap_or(""),
+        "rs" | "py" | "c" | "h" | "cpp" | "hpp" | "go" | "ts" | "js" | "qml" | "md" | "toml");
+    if !code {
+        return 0.0;
+    }
+    // An entry point outranks a sibling at the same depth: `main.rs`/`lib.rs`
+    // is where someone reading a crate starts.
+    let entry = matches!(name, "lib.rs" | "main.rs" | "mod.rs" | "__init__.py" | "index.ts");
+    let base = if entry { 0.50 } else { 0.35 };
+    // Each level down costs a little. Floored above `min_relevance` (0.15) only
+    // for the first few levels, so a deep file is skipped rather than crowding
+    // out a shallow one.
+    (base - depth as f32 * 0.06).max(0.0)
+}
+
+#[cfg(test)]
+mod relevance_tests {
+    use super::*;
+
+    #[test]
+    fn a_readme_outranks_any_source_file() {
+        assert!(describes_project("README.md") > describes_project("src/lib.rs"));
+        assert!(describes_project("Cargo.toml") > describes_project("src/main.rs"));
+    }
+
+    #[test]
+    fn shallow_outranks_deep_at_the_same_kind() {
+        assert!(describes_project("src/lib.rs")
+              > describes_project("crates/a/src/lib.rs"));
+    }
+
+    #[test]
+    fn an_entry_point_outranks_a_sibling() {
+        assert!(describes_project("src/lib.rs") > describes_project("src/util.rs"));
+    }
+
+    #[test]
+    fn a_lockfile_is_skipped_not_merely_ranked_low() {
+        // At a tight budget a low-but-nonzero lockfile still beats a deep source
+        // file, and it is usually the largest thing in the tree — so it has to be
+        // zero, not small.
+        assert_eq!(describes_project("Cargo.lock"), 0.0);
+        assert_eq!(describes_project("package-lock.json"), 0.0);
+    }
+
+    #[test]
+    fn binaries_and_unknown_extensions_are_skipped() {
+        assert_eq!(describes_project("assets/logo.png"), 0.0);
+        assert_eq!(describes_project("data/model.safetensors"), 0.0);
+    }
+
+    #[test]
+    fn a_very_deep_file_falls_below_the_default_min_relevance() {
+        // Budget::default().min_relevance is 0.15; a file this deep should be
+        // skipped by the planner rather than competing for the budget.
+        let deep = "a/b/c/d/e/f/g/deep.rs";
+        assert!(describes_project(deep) < Budget::default().min_relevance,
+            "got {}", describes_project(deep));
+    }
+
+    #[test]
+    fn one_medium_file_cannot_eat_the_whole_budget() {
+        // Found by running the wired planner over apps/switcheroo: a 1405-token
+        // HOMEKIT.md took 70% of a 2000-token budget and crowded out every
+        // source file, because `Budget { max_tokens, ..default() }` keeps
+        // `whole_file_max_tokens` at 1500 no matter how small the budget is.
+        // `for_context` caps a single whole file at a quarter of the budget.
+        let files: Vec<FileEntry> = [
+            ("NOTES.md", 5600usize),   // ~1400 tokens: fits the DEFAULT whole cap
+            ("Cargo.toml", 600),
+            ("src/main.rs", 1000),
+        ].iter().map(|(p, b)| FileEntry {
+            path: (*p).into(), bytes: *b,
+            relevance: describes_project(p), sections: Vec::new(),
+        }).collect();
+
+        let naive = plan(&files, &Budget { max_tokens: 2000, ..Budget::default() });
+        let sized = plan(&files, &Budget::for_context(2000, 0, 0));
+
+        let whole = |p: &Plan| -> Vec<String> {
+            p.inclusions.iter().filter_map(|i| match i {
+                Inclusion::Whole { path, .. } => Some(path.clone()), _ => None }).collect()
+        };
+        assert!(whole(&naive).contains(&"NOTES.md".to_string()),
+            "the naive budget is expected to swallow it — that is the bug being pinned");
+        assert!(!whole(&sized).contains(&"NOTES.md".to_string()),
+            "a 1400-token file must be peeked, not looped in whole, at a 2000-token budget");
+        assert!(whole(&sized).contains(&"Cargo.toml".to_string())
+             && whole(&sized).contains(&"src/main.rs".to_string()),
+            "and the small descriptive files must survive: {:?}", whole(&sized));
+    }
+
+    #[test]
+    fn the_planner_puts_the_manifests_in_first_under_a_tight_budget() {
+        // End to end: the shape a summary needs is manifests and entry points,
+        // not whatever the walk happened to reach first.
+        let files: Vec<FileEntry> = [
+            ("a/b/c/d/deep.rs", 4000usize),
+            ("README.md", 2000),
+            ("src/lib.rs", 3000),
+            ("Cargo.lock", 200000),
+        ].iter().map(|(p, b)| FileEntry {
+            path: (*p).into(), bytes: *b,
+            relevance: describes_project(p), sections: Vec::new(),
+        }).collect();
+        let budget = Budget { max_tokens: 1400, ..Budget::default() };
+        let plan = plan(&files, &budget);
+        let kept: Vec<String> = plan.reads().into_iter().map(|(p, _)| p).collect();
+        assert!(kept.contains(&"README.md".to_string()), "{kept:?}");
+        assert!(!kept.contains(&"Cargo.lock".to_string()),
+            "a 200 KB lockfile must never be read for a summary: {kept:?}");
+        assert!(!kept.contains(&"a/b/c/d/deep.rs".to_string()), "{kept:?}");
+    }
+}

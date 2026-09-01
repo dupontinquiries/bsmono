@@ -3339,6 +3339,68 @@ them to", patches.len());
     /// working the repo, while a chat turn may be about anything, so this
     /// buys awareness rather than evidence. History is one line (the newest
     /// subject) for the same reason — enough to know it exists.
+    /// The most descriptive files in the workspace, within `budget_bytes`.
+    ///
+    /// Walks the tree once, scores each path with
+    /// `ctxplan::describes_project` (path shape only — no file is opened to
+    /// decide whether to open it), then lets `ctxplan::plan` spend the budget.
+    /// Only the files the plan actually selects are read.
+    fn planned_files(&self, root: &std::path::Path, budget_bytes: usize) -> String {
+        use crate::ctxplan::{describes_project, plan, Budget, FileEntry};
+        const SKIP_DIR: [&str; 7] =
+            ["target", ".git", ".gitmind", ".logscope", "node_modules", "dist", ".cargo"];
+        // Bounded walk: a workspace can be enormous and this runs while building
+        // a prompt. The cap is on entries CONSIDERED, not selected.
+        let mut files: Vec<FileEntry> = Vec::new();
+        let mut queue = std::collections::VecDeque::from([(root.to_path_buf(), 0usize)]);
+        while let Some((dir, depth)) = queue.pop_front() {
+            if depth > 6 || files.len() > 4000 { break; }
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') { continue; }
+                if p.is_dir() {
+                    if !SKIP_DIR.contains(&name.as_str()) { queue.push_back((p, depth + 1)); }
+                    continue;
+                }
+                let Ok(rel) = p.strip_prefix(root) else { continue };
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                let r = describes_project(&rel);
+                if r <= 0.0 { continue; }
+                let bytes = e.metadata().map(|m| m.len() as usize).unwrap_or(0);
+                files.push(FileEntry { path: rel, bytes, relevance: r, sections: Vec::new() });
+            }
+        }
+        if files.is_empty() { return String::new(); }
+        // `Budget::for_context` rather than `Budget { max_tokens, ..default() }`.
+        // The default keeps `whole_file_max_tokens` at 1500 no matter how small
+        // the budget is, so ONE medium file can eat the lot. Caught by running
+        // this over apps/switcheroo: a 1405-token HOMEKIT.md took 70% of a
+        // 2000-token budget and crowded out every source file, which is the
+        // opposite of what a summary wants. `for_context` caps any single whole
+        // file at a quarter of the budget, so the manifests and entry points
+        // all fit. Reserves are 0 here because `budget_bytes` is already the
+        // block's share of the prompt, not the model's whole window.
+        let b = Budget::for_context(budget_bytes / 4, 0, 0);
+        let p = plan(&files, &b);
+        // Read only what was selected — the savings are the files never opened.
+        let body = p.assemble(|path, ranges| {
+            let full = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+            if ranges.is_empty() { return crate::read_harness::sanitize(&full); }
+            let mut s = String::new();
+            for (a, z) in ranges {
+                let (a, z) = ((*a).min(full.len()), (*z).min(full.len()));
+                if a < z { s.push_str(&full[a..z]); s.push('\n'); }
+            }
+            crate::read_harness::sanitize(&s)
+        });
+        crate::diag!("workspace files: {} considered, {} whole + {} peeked, {} skipped, \
+~{} tokens of file content in the prompt",
+            files.len(), p.looped_in(), p.peeked(), p.skipped(), p.used_tokens);
+        body
+    }
+
     fn workspace_block(&self) -> Option<String> {
         let sess = self.gitmind_session.as_ref()?;
         let root = sess.work_dir();
@@ -3381,6 +3443,23 @@ guessing at its contents.\n\n",
         let docs = crate::workspace_exec::collect_shared_docs(root, b.block_bytes);
         if !docs.is_empty() {
             out.push_str(&crate::read_harness::fence("shared notes", ".logscope/docs", &docs, &b, None));
+        }
+        // ACTUAL FILES, chosen by the planner that had no callers.
+        //
+        // ctxplan.rs computes exactly this — which files fit a token budget,
+        // whole vs peeked vs skipped — and sat unused for its whole life because
+        // nothing produced the `relevance` it needs. `ctxplan::describes_project`
+        // is that missing half. So the summary block is now manifests and entry
+        // points chosen deliberately, rather than whatever the tree walk reached
+        // first.
+        //
+        // Budgeted from `block_bytes` (the same class budget the rest of this
+        // function uses) rather than the model's full window, so this stays a
+        // bounded addition to a system prompt rather than becoming the prompt.
+        let planned = self.planned_files(root, b.block_bytes);
+        if !planned.is_empty() {
+            out.push_str(&crate::read_harness::fence(
+                "key files", "chosen by relevance under the context budget", &planned, &b, None));
         }
         if let Some(c) = crate::read_harness::read_git_log(root, 1).first() {
             out.push_str(&crate::read_harness::fence(
