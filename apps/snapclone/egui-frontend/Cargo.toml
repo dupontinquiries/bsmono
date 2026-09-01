@@ -34,6 +34,8 @@ snapclone-presence = { path = "../rust/snapclone-presence" }
 # For `NodeId` in identity::dht_node_id. The engine itself is reached
 # through snapclone-presence; this is the type only.
 snapcore = { path = "../../../shared/snapcore" }
+# STUN codec for the punch socket. Zero deps; see nat_traversal.
+nat-kit = { path = "../../../shared/nat-kit" }
 # SHA-256 for the DHT endpoint envelope. Already in this crate's lock as a
 # transitive dependency, so naming it directly does not move the lockfile —
 # and the Qt build's format is defined in terms of SHA-256, so matching it

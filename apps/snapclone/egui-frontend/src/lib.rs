@@ -72,6 +72,7 @@ pub mod dht_announce;
 pub mod dht_bootstrap;
 pub mod dht_envelope;
 pub mod dht_presence;
+pub mod nat_traversal;
 pub mod face_consent;
 pub mod frame_pump;
 pub mod firewall_backend;
@@ -217,6 +218,9 @@ pub struct Snapclone {
     /// handed off to cellular — and the status line says so rather than
     /// showing a peer count that is no longer true.
     pub dht_keepalive: Option<(usize, usize)>,
+    /// The punch socket's STUN-mapped address (`nat_traversal`). Announced
+    /// in our record so a peer's volley hits the mapping that exists.
+    pub reflexive: Option<std::net::SocketAddr>,
     /// The accessibility scene the settings toggles register with.
     /// Held here rather than in the page so focus survives between
     /// frames — a page-local scene forgets on every repaint, which
@@ -678,6 +682,7 @@ impl Snapclone {
             dht: None, dht_failed: false,
             dht_schedule: Default::default(),
             dht_keepalive: None,
+            reflexive: None,
             a11y: uikit_egui::a11y::A11yScene::new(),
             pending_vcard_text: None,
             import_report: None,
@@ -1428,7 +1433,7 @@ impl Snapclone {
                     crate::dht_announce::local_ipv4s().into_iter()
                         .map(|ip| crate::dht_announce::Addr::new(&ip.to_string(), port, 0))
                         .collect(),
-                    h.public_ip(), port);
+                    h.public_ip(), port, self.reflexive);
                 let published = if addrs.is_empty() {
                     0
                 } else {

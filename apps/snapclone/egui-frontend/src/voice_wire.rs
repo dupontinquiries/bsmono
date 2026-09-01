@@ -94,7 +94,7 @@ pub enum Refused {
     /// The source address is not one of the call's peers. Counted, not
     /// logged per packet: on a busy or hostile network this is the line that
     /// would fill the log and hide everything else.
-    UnknownSender(SocketAddr),
+    UnknownSender(SocketAddr, Vec<u8>),
     /// Zero bytes. A keepalive or a probe, not audio.
     Empty,
 }
@@ -124,6 +124,11 @@ impl VoiceSocket {
     /// Send one peer's payload. A failure is returned rather than retried:
     /// see the module docs on why a late voice frame is worse than a missing
     /// one.
+    /// A datagram to an arbitrary address — STUN requests and punches,
+    /// which go to servers and to addresses not yet in any peer table.
+    pub fn send_raw(&self, payload: &[u8], to: SocketAddr) -> std::io::Result<()> {
+        self.sock.send_to(payload, to).map(|_| ())
+    }
     pub fn send_to_peer(&self, addr: PeerAddr, payload: &[u8]) -> std::io::Result<()> {
         let to = SocketAddr::from((addr.ip, addr.port));
         self.sock.send_to(payload, to).map(|_| ())
@@ -161,8 +166,13 @@ impl VoiceSocket {
                 Ok((n, from)) => match peers.id_at(from) {
                     Some(id) => ok.push((id.to_string(), self.buf[..n].to_vec())),
                     None => {
+                        // Handed back WITH the bytes: a datagram from a
+                        // source we do not know is exactly what a punch
+                        // and a STUN reply look like (`nat_traversal`),
+                        // and dropping them here would leave the
+                        // traversal loop deaf.
                         self.refused_unknown += 1;
-                        refused.push(Refused::UnknownSender(from));
+                        refused.push(Refused::UnknownSender(from, self.buf[..n].to_vec()));
                     }
                 },
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -232,7 +242,7 @@ mod tests {
             if !refused.is_empty() { break; }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(matches!(refused.first(), Some(Refused::UnknownSender(_))), "{refused:?}");
+        assert!(matches!(refused.first(), Some(Refused::UnknownSender(..))), "{refused:?}");
         assert_eq!(b.refused_unknown, 1, "the count is what a UI can show");
     }
 

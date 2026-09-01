@@ -342,11 +342,22 @@ pub fn is_routable(ip: std::net::IpAddr) -> bool {
 /// in every reply (`NodeHost::public_ip`), by majority of the peers that
 /// answered, which is also the only source that reflects the network the
 /// DHT traffic actually crossed.
-pub fn with_public(mut addrs: Vec<Addr>, public_ip: Option<std::net::IpAddr>, port: u16) -> Vec<Addr> {
-    if let Some(ip) = public_ip {
+///
+/// `reflexive` is the punch socket's STUN-mapped address — the one that
+/// crosses a carrier NAT — and wins over the DHT-reported ip when both
+/// are known: it carries the mapped PORT, which `sa` never does, and a
+/// record with the wrong punch port sends every peer's volley to a
+/// mapping that does not exist.
+pub fn with_public(mut addrs: Vec<Addr>, public_ip: Option<std::net::IpAddr>, port: u16,
+                   reflexive: Option<std::net::SocketAddr>) -> Vec<Addr> {
+    let (ip, punch) = match (reflexive, public_ip) {
+        (Some(r), _) => (Some(r.ip()), r.port()),
+        (None, ip) => (ip, 0),
+    };
+    if let Some(ip) = ip {
         let host = ip.to_string();
         if is_routable(ip) && !addrs.iter().any(|a| a.host == host) {
-            addrs.push(Addr::new(&host, port, 0));
+            addrs.push(Addr::new(&host, port, punch));
         }
     }
     addrs
@@ -481,20 +492,30 @@ mod tests {
     fn the_reported_address_is_announced_only_when_routable_and_new() {
         let lan = vec![Addr::new("192.168.1.5", 9876, 0)];
         let pub_ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
-        let out = with_public(lan.clone(), Some(pub_ip), 9876);
+        let out = with_public(lan.clone(), Some(pub_ip), 9876, None);
         assert_eq!(out.len(), 2);
         assert_eq!(out[1].host, "203.0.113.7");
         assert_eq!(out[1].ws_port, 9876);
         // A LAN peer reports our LAN address back: not public, not added.
-        assert_eq!(with_public(lan.clone(), Some("192.168.1.5".parse().unwrap()), 9876).len(), 1);
-        assert_eq!(with_public(lan.clone(), Some("10.4.0.9".parse().unwrap()), 9876).len(), 1);
-        assert_eq!(with_public(lan.clone(), Some("127.0.0.1".parse().unwrap()), 9876).len(), 1);
+        assert_eq!(with_public(lan.clone(), Some("192.168.1.5".parse().unwrap()), 9876, None).len(), 1);
+        assert_eq!(with_public(lan.clone(), Some("10.4.0.9".parse().unwrap()), 9876, None).len(), 1);
+        assert_eq!(with_public(lan.clone(), Some("127.0.0.1".parse().unwrap()), 9876, None).len(), 1);
         // CGNAT space (100.64/10) is not reachable from outside either.
-        assert_eq!(with_public(lan.clone(), Some("100.72.1.1".parse().unwrap()), 9876).len(), 1);
+        assert_eq!(with_public(lan.clone(), Some("100.72.1.1".parse().unwrap()), 9876, None).len(), 1);
         // Already listed: not doubled.
         let already = vec![Addr::new("203.0.113.7", 9876, 0)];
-        assert_eq!(with_public(already, Some(pub_ip), 9876).len(), 1);
-        assert_eq!(with_public(lan, None, 9876).len(), 1);
+        assert_eq!(with_public(already, Some(pub_ip), 9876, None).len(), 1);
+        assert_eq!(with_public(lan.clone(), None, 9876, None).len(), 1);
+        // The STUN-mapped address wins and carries the mapped port: that
+        // port is what a peer's volley must hit.
+        let refl: std::net::SocketAddr = "203.0.113.7:51234".parse().unwrap();
+        let out = with_public(lan.clone(), Some("203.0.113.9".parse().unwrap()), 9876, Some(refl));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].host, "203.0.113.7");
+        assert_eq!(out[1].punch_port, 51234);
+        assert_eq!(out[1].ws_port, 9876);
+        assert_eq!(with_public(lan, None, 9876, Some("192.168.1.5:5".parse().unwrap())).len(), 1,
+                   "a LAN STUN answer (a hairpin, or a local server) is not public either");
         assert!(is_routable("2001:db8::1".parse().unwrap()));
         assert!(!is_routable("fd12::1".parse().unwrap()));
         assert!(!is_routable("fe80::1".parse().unwrap()));

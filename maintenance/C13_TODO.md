@@ -1400,3 +1400,27 @@ deliberately, with the existing A/B gates used to confirm output stays
 within tolerance rather than assumed.
 
 Measure before and after. The tool is triage; it proves nothing.
+
+## 35. NAT traversal in the egui port: the loop is wired, not yet field-run
+
+2026-09-01. `NatTraversal.cpp` is what got the Qt build across CGNAT:
+STUN from the punch socket (a mapping is per socket, so the announced port
+must be that socket's), a 60×150 ms punch volley then one every 20 s to
+hold the carrier's mapping, and registering the peer's REAL source address
+from the first punch that lands. The egui port had the strategy
+(`nat_punch`), the server list (`stun_servers`) and the codec (`nat-kit`)
+and ran none of them. `nat_traversal.rs` is the loop as a sans-io state
+machine with the C++ timings pinned on a fake clock; the binary drives it
+on the voice socket, which now outlives a call so its mapping does; the
+record carries the STUN-mapped punch port (`dht_announce::with_public`).
+
+Not done here, in order of value:
+- No real NAT in the sandbox: the state machine is tested, the wiring is
+  type-checked, nothing has crossed a NAT in this tree yet.
+- `nat_punch::classify` (symmetric vs cone, needs two servers' answers) is
+  still not driven, so `Strategy::Relay` is never chosen and there is no
+  relay to choose — same as the Qt roadmap.
+- Punches go to call participants and snap recipients only; the Qt build
+  also punched on `connectToPeer` for text. The conservative halving is
+  plumbed (`initiate(.., conservative, ..)`) but the binary passes false:
+  no power-context signal is read yet.
