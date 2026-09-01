@@ -545,8 +545,31 @@ pub fn provision_fleet_user(admin: &str, host: &str, password: &str) -> Result<S
 mod root_tests {
     use super::*;
 
+    /// GITMIND_ROOT IS PROCESS-GLOBAL, SO THESE TESTS CANNOT RUN AT ONCE.
+    ///
+    /// `repo_root` honours the env var, one test sets it to a temp fixture,
+    /// and cargo runs tests on parallel threads — so while
+    /// `discovers_apps_vs_games_by_name` held it, the other test resolved
+    /// `apps/gitmind` against `/tmp/gm-disc-<pid>` and found no Cargo.toml.
+    /// That is exactly how it failed in the fleet run:
+    ///
+    ///   resolved /tmp/gm-disc-580267/apps/gitmind should be a crate
+    ///
+    /// Neither test is wrong and the product is fine. An env var is shared
+    /// mutable state, and the only fix that does not weaken what either test
+    /// checks is to stop them overlapping. A mutex over the pair rather than
+    /// `--test-threads=1`, which would serialise all 327.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the lock without inheriting a poisoning from an unrelated failure
+    /// — a panic in one of these tests should fail that test, not cascade.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn repo_root_finds_monorepo_and_resolves_app_paths() {
+        let _g = env_guard();
         // running under cargo, CWD is the crate dir; walking up must find the repo root
         // (a dir with apps/ + a .git/.gitmind marker).
         let root = repo_root();
@@ -561,6 +584,7 @@ mod root_tests {
 
     #[test]
     fn discovers_apps_vs_games_by_name() {
+        let _g = env_guard();
         // a temp repo with an app under apps/ and a game under games/
         let root = std::env::temp_dir().join(format!("gm-disc-{}", std::process::id()));
         let _ = std::fs::create_dir_all(root.join("apps").join("gitmind"));

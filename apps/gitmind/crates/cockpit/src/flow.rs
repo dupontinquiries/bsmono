@@ -1260,13 +1260,25 @@ mod store_group_tests {
         // Paths are bare app/game NAMES — discovery resolves apps/ vs games/ at
         // build time — EXCEPT where the crate is not at apps/<name>:
         //
-        //   bsettings  apps/settings-app                 dir name != app name
-        //   studio     apps/studio/crates/studio-app     a workspace member
+        //   bsettings  apps/settings-app                    dir name != app name
+        //   studio     apps/studio/crates/studio-app        a workspace member
+        //   aperture   apps/aperture/crates/aperture-egui   workspace; bin is in a member
+        //   cadscope   apps/cadscope/crates/cadscope-egui   same
+        //   simscope   apps/simscope/crates/simscope-cli    same
         //
         // Listed by name rather than allowed generally, so a new explicit path
         // has to be justified here rather than slipping in: a bare name that
         // silently stopped resolving would look like a missing app.
-        const EXPLICIT_PATH: [&str; 2] = ["bsettings", "studio"];
+        //
+        // THE LAST THREE WERE MISSING AND THE TEST WAS RIGHT TO SAY SO. Each
+        // is a workspace whose runnable crate is a member — the registry
+        // entries say exactly that, a few hundred lines up, and adding the
+        // entry without adding the exception is what this assertion exists to
+        // catch. Fixed here rather than by relaxing the rule: "any path with a
+        // slash is fine" would have let a genuine typo through silently, which
+        // is the failure the rule was written against.
+        const EXPLICIT_PATH: [&str; 5] =
+            ["bsettings", "studio", "aperture", "cadscope", "simscope"];
         for a in &all.apps {
             assert!(!a.path.contains('/') || EXPLICIT_PATH.contains(&a.name.as_str()),
                     "{} has an explicit path {:?} but is not on the exception list",
