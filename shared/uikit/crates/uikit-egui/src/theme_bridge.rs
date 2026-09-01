@@ -66,6 +66,21 @@ impl PaletteColors {
 /// and spacing. Call when the user picks a theme in Settings ▸ Look.
 pub fn apply_palette(ctx: &Context, p: &Palette) -> PaletteColors {
     let c = PaletteColors::from_palette(p);
+    ctx.set_visuals(build_visuals(&c));
+    ctx.global_style_mut(|s| {
+        s.spacing.item_spacing = egui::vec2(tokens::SPACE_SM as f32, tokens::SPACE_SM as f32);
+        s.spacing.button_padding = egui::vec2(tokens::SPACE_MD as f32, tokens::SPACE_SM as f32);
+        s.spacing.interact_size.y = tokens::TOUCH_MIN as f32; // touch targets >= 40px
+    });
+    c
+}
+
+/// Build the egui [`Visuals`] for a resolved set of palette colors. Split out of
+/// [`apply_palette`] so [`crate::apply_prefs`] can re-derive Visuals from a
+/// *filtered* [`PaletteColors`] (see [`filter_palette_colors`]) without
+/// duplicating this color -> Visuals mapping, and without [`apply_palette`]'s
+/// own public (unfiltered) behavior changing for its existing callers.
+pub(crate) fn build_visuals(c: &PaletteColors) -> Visuals {
     let mut v = Visuals::dark(); // start dark; pale palettes override below
 
     v.override_text_color = Some(c.text);
@@ -94,15 +109,28 @@ pub fn apply_palette(ctx: &Context, p: &Palette) -> PaletteColors {
     }
     widgets.hovered.fg_stroke = Stroke::new(1.0_f32, c.text);
     widgets.active.bg_stroke = Stroke::new(1.0_f32, c.accent);
+    v
+}
 
-    // token-driven spacing so the egui app matches the FP5-tuned C++ metrics
-    ctx.set_visuals(v);
-    ctx.global_style_mut(|s| {
-        s.spacing.item_spacing = egui::vec2(tokens::SPACE_SM as f32, tokens::SPACE_SM as f32);
-        s.spacing.button_padding = egui::vec2(tokens::SPACE_MD as f32, tokens::SPACE_SM as f32);
-        s.spacing.interact_size.y = tokens::TOUCH_MIN as f32; // touch targets >= 40px
-    });
-    c
+/// Apply the display accessibility filter (color-vision filter + lowered white
+/// point) to every color in a resolved palette. A no-op copy when
+/// `d.is_active()` is false, so callers can run this unconditionally.
+pub(crate) fn filter_palette_colors(c: &PaletteColors, d: &settings_kit::DisplayPrefs) -> PaletteColors {
+    PaletteColors {
+        bg_base: filter_color(c.bg_base, d),
+        bg_card: filter_color(c.bg_card, d),
+        bg_raised: filter_color(c.bg_raised, d),
+        bg_hover: filter_color(c.bg_hover, d),
+        text: filter_color(c.text, d),
+        text_weak: filter_color(c.text_weak, d),
+        accent: filter_color(c.accent, d),
+        accent_soft: filter_color(c.accent_soft, d),
+        danger: filter_color(c.danger, d),
+        success: filter_color(c.success, d),
+        warning: filter_color(c.warning, d),
+        border: filter_color(c.border, d),
+        glow: filter_color(c.glow, d),
+    }
 }
 
 #[cfg(test)]

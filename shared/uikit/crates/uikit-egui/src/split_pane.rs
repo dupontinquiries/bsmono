@@ -71,7 +71,7 @@ impl SplitPane {
             Orientation::Vertical => (delta.x, total_size.x),
             Orientation::Horizontal => (delta.y, total_size.y),
         };
-        if extent <= 0.0 { return; }
+        if !extent.is_finite() || extent <= 0.0 { return; }
         self.fraction = (self.fraction + delta_along / extent).clamp(self.min_fraction, self.max_fraction);
     }
 
@@ -172,6 +172,27 @@ mod tests {
         let mut sp = SplitPane::new(Orientation::Vertical, 0.5);
         sp.drag(Vec2::new(50.0, 0.0), Vec2::new(0.0, 600.0));
         assert_eq!(sp.fraction, 0.5, "a collapsed total width must not panic or NaN the fraction");
+    }
+
+    /// `extent <= 0.0` (the guard above) is `false` for NaN — IEEE 754 comparisons against NaN
+    /// are always false — so a NaN extent slips past that check entirely. Once `fraction`
+    /// becomes NaN it stays NaN forever afterward (NaN propagates through `+`, and `.clamp()`
+    /// on a NaN self returns NaN too), so a single bad frame permanently wedges this divider
+    /// until the app is restarted. A NaN `total_size` shouldn't normally reach here, but egui
+    /// layout can transiently produce one (e.g. a panel mid-resize with a momentarily
+    /// zero-or-negative-turned-NaN dimension upstream), and the failure mode — a divider that
+    /// silently stops responding for the rest of the session — is exactly the kind of thing
+    /// that's cheap to guard against and expensive to debug from a user report.
+    #[test]
+    fn nan_extent_drag_is_a_no_op_not_a_permanent_nan_fraction() {
+        let mut sp = SplitPane::new(Orientation::Vertical, 0.5);
+        sp.drag(Vec2::new(50.0, 0.0), Vec2::new(f32::NAN, 600.0));
+        assert_eq!(sp.fraction, 0.5, "a NaN total width must not panic or NaN the fraction");
+
+        // and it must not have poisoned the pane for subsequent, perfectly valid drags
+        sp.drag(Vec2::new(100.0, 0.0), Vec2::new(1000.0, 600.0));
+        assert!((sp.fraction - 0.6).abs() < 1e-3,
+            "a prior NaN extent must not prevent later valid drags from working");
     }
 
     #[test]

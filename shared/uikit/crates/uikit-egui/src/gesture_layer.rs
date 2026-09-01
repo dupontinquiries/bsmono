@@ -49,6 +49,9 @@ pub struct GestureLayer {
     drag_total: f32,
     // px/ms, signed along the chosen axis.
     last_velocity: f32,
+    // snapshot for change detection in `update()` — see `config_mut`'s docs
+    // for why the reset can't just live in `config_mut()` itself.
+    last_config: GestureConfig,
 }
 
 impl GestureLayer {
@@ -59,6 +62,7 @@ impl GestureLayer {
             dragging: false,
             drag_total: 0.0,
             last_velocity: 0.0,
+            last_config: cfg,
         }
     }
 
@@ -68,6 +72,13 @@ impl GestureLayer {
     }
 
     /// Live-retune (Settings ▸ Gestures). Returns the mutable config.
+    ///
+    /// Note: does NOT reset the accumulated streak by itself — some callers
+    /// (e.g. `Pager::ui`) call this every frame to retune `page_size` to the
+    /// current layout width, which is normal operation, not a "settings
+    /// changed" event, and must not interrupt an in-progress drag. Streak
+    /// reset happens in `update()` instead, and only when the config's
+    /// *value* actually differs from last frame's — see `last_config`.
     pub fn config_mut(&mut self) -> &mut GestureConfig {
         self.gesture.config_mut()
     }
@@ -86,6 +97,18 @@ impl GestureLayer {
     /// when false, the detent streak is reset so a fresh pull starts clean
     /// (the model never invents a sub-step in the middle of a scroll).
     pub fn update(&mut self, ui: &Ui, surface: Rect, at_limit: bool) -> GestureFrame {
+        // Change-detection, not reset-on-every-call: `config_mut()` itself must stay reset-free
+        // (Pager retunes page_size to the current layout width via config_mut() every frame,
+        // which is normal operation and must not interrupt an in-progress drag). Only an actual
+        // *value* change — e.g. the user editing gesture sensitivity in Settings while mid-swipe
+        // — should discard accumulated state, so state computed against stale thresholds is
+        // never compared against a config that has since moved on.
+        let current_config = *self.gesture.config();
+        if current_config != self.last_config {
+            self.gesture.reset_streak();
+            self.last_config = current_config;
+        }
+
         let mut frame = GestureFrame::default();
         let now_ms = ui.input(|i| i.time) * 1000.0;
 
@@ -167,5 +190,94 @@ fn apply_outcome(o: Outcome, frame: &mut GestureFrame) {
             frame.barrier_fraction = fraction as f32;
             frame.barrier_edge = Some(edge);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Context, Event, PointerButton, Pos2, RawInput};
+
+    /// Drive `GestureLayer::update` through a real egui frame, mirroring the
+    /// harness `apps/snapclone-egui` uses for its own gesture tests — this
+    /// crate had zero test coverage on the egui-input adapter itself
+    /// (`uikit-gesture`'s pure model is tested separately, but nothing here
+    /// exercised the seam between real `Ui`/`InputState` and it).
+    fn frame(ctx: &Context, gesture: &mut GestureLayer, surface: Rect, events: Vec<Event>) -> GestureFrame {
+        let mut out = GestureFrame::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 800.0));
+        let _ = ctx.run(RawInput { events, screen_rect: Some(screen), ..Default::default() }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                out = gesture.update(ui, surface, true);
+            });
+        });
+        out
+    }
+
+    /// The bug: nothing detected a config change, so a value change mid-drag
+    /// (e.g. Settings ▸ Gestures edited while mid-swipe) left the accumulated
+    /// detent state (`raw`, `armed`, etc.) computed against thresholds that
+    /// no longer matched the config it would be compared against next frame.
+    /// The fix detects an actual *value* change in `update()` (not merely a
+    /// call to `config_mut()` — see that method's docs for why `Pager`
+    /// retuning `page_size` every frame must NOT trip this) and resets the
+    /// streak only then.
+    #[test]
+    fn a_real_config_value_change_mid_drag_resets_the_accumulated_streak() {
+        let ctx = Context::default();
+        let mut g = GestureLayer::horizontal_page(320.0);
+        let surface = Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+
+        let at = |x: f32| Event::PointerMoved(Pos2::new(x, 400.0));
+        let press = |x: f32| Event::PointerButton {
+            pos: Pos2::new(x, 400.0), button: PointerButton::Primary,
+            pressed: true, modifiers: Default::default() };
+
+        frame(&ctx, &mut g, surface, vec![at(320.0), press(320.0)]);
+        let mid = frame(&ctx, &mut g, surface, vec![at(260.0)]); // a real drag, accumulating
+        assert!(mid.raw != 0.0, "fixture must actually accumulate some raw progress to be meaningful");
+
+        // Mid-drag config VALUE change (e.g. user opens Settings ▸ Gestures while mid-swipe) —
+        // note this is a real value change, not merely a call to config_mut(), which by itself
+        // must be side-effect-free (Pager calls it every frame with an unchanged value).
+        g.config_mut().detent_threshold *= 2.0;
+
+        // Same position again -> zero delta this frame, so `raw` reflects only what survived
+        // the config change above, not any new accumulation.
+        let after = frame(&ctx, &mut g, surface, vec![at(260.0)]);
+        assert_eq!(after.raw, 0.0,
+            "a config VALUE change mid-drag must reset the accumulated streak, not leave it \
+             computed against the old config (got raw={})", after.raw);
+    }
+
+    /// The regression this guards against: `Pager::ui()` calls `config_mut()` every single
+    /// frame to retune `page_size` to the current layout width (see pager.rs) — that is normal
+    /// operation, not a settings change, and must never interrupt an in-progress drag. A naive
+    /// fix that resets the streak inside `config_mut()` itself (rather than detecting an actual
+    /// value change in `update()`) would break every app's swipe navigation, since the config
+    /// gets "mutated" (to the same value) every frame regardless of whether anything changed.
+    #[test]
+    fn config_mut_called_every_frame_with_an_unchanged_value_does_not_break_a_drag() {
+        let ctx = Context::default();
+        let mut g = GestureLayer::horizontal_page(320.0);
+        let surface = Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+
+        let at = |x: f32| Event::PointerMoved(Pos2::new(x, 400.0));
+        let press = |x: f32| Event::PointerButton {
+            pos: Pos2::new(x, 400.0), button: PointerButton::Primary,
+            pressed: true, modifiers: Default::default() };
+
+        frame(&ctx, &mut g, surface, vec![at(320.0), press(320.0)]);
+        let mid = frame(&ctx, &mut g, surface, vec![at(260.0)]);
+        assert!(mid.raw != 0.0, "fixture must actually accumulate some raw progress to be meaningful");
+
+        // Exactly what Pager::ui() does every frame: re-derive and re-assign the SAME value.
+        *g.config_mut() = uikit_gesture::GestureConfig::for_page_size(320.0);
+
+        // Continue the same drag — accumulation must carry over uninterrupted.
+        let after = frame(&ctx, &mut g, surface, vec![at(200.0)]);
+        assert!(after.raw.abs() > mid.raw.abs(),
+            "an unchanged-value config_mut() call must not reset an in-progress drag \
+             (mid={}, after={})", mid.raw, after.raw);
     }
 }
