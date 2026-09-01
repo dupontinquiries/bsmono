@@ -987,3 +987,134 @@ the input field, and the announce path.
   stuck in Python once a python test script inside a Rust crate is opened
   (the project-type detection latches and never re-evaluates).
 - **aperture** still has no tap-and-hold gesture for the command palette.
+
+## 27. voiceterm VT correctness — konsole is now vendored as the reference
+
+Supersedes the "audit against a real VT spec" note in §19. A konsole
+checkout was supplied specifically for this. The parts to read, in order:
+
+- `src/Screen.cpp :: displayCharacter` — the deferred-wrap model, and its
+  comment states the rule uikit-term is most likely getting wrong:
+  *"VT100 does wrapping BEFORE putting the character... We indicate the
+  fact that a newline has to be triggered by putting the cursor one right
+  to the last column."* uikit-term has a "phantom column" notion but it is
+  not clear it defers the wrap the same way, and this is exactly the state
+  that a `\r` in the middle of a prompt redraw interacts with.
+- `src/Screen.cpp :: clearToEndOfLine` / `clearToEndOfScreen` /
+  `eraseChars` / `clearImage` — the erase family, with konsole's handling
+  of the implicit param-0 case.
+- `src/Screen.cpp :: setLineProperty` and the `wrapped` line flag —
+  konsole tracks wrappedness PER LINE, which is what lets it walk back
+  through a wrapped run. uikit-term has no equivalent, and reflow was
+  already noted as out of scope in `Grid::resize`.
+- `src/Vt102Emulation.cpp` for the parser table.
+- `src/autotests/ScreenTest.cpp` and `Vt102EmulationTest.cpp` — the shape
+  of the fixtures to copy. Capturing a few real zsh/bash prompt-redraw
+  sequences as fixtures (the method that found the bug: dump raw pty bytes
+  to a file, feed them to `Parser` directly, diff the grid) is the way to
+  make this tractable.
+
+The concrete reproduction is already written down in §19: a themed zsh
+prompt redraw produces interleaved garbage (`➜/➜`, ` e`, ` t`, `~c~`
+across rows). Fix that and re-test §20.
+
+## 28. logscope wgpu backend should be one importable crate, not per-app
+
+Requested. `apps/logscope/crates/gpu-gemm` is a real GPU compute engine
+(kernels, memory planning, residency probing, sparse/streaming) that other
+apps will want and that will not benefit from diverging. Today it is a
+logscope-internal crate reached through `logscope-egui`'s `backend.rs`,
+which mixes engine concerns with that app's UI state.
+
+Shape to aim for, consistent with what worked for shellkit/scene-kit/peek
+earlier this session: promote `gpu-gemm` to `shared/` (name it for what it
+does, not for logscope), and put the API other apps consume behind a
+narrow trait — load a model, submit a prompt, stream tokens, report
+residency — so an app does not link the kernel internals. `backend.rs`
+becomes one implementation of that trait rather than the only door.
+
+Do this AFTER §29, because the residency/estimator work touches the same
+files and merging two refactors of gpu-gemm would be miserable.
+
+## 29. Small models refused on a machine with room — the f32 embedding term
+
+Reported: llama3.2-1b-instruct at q2_k and IQ1_S (~500 MB files) refused
+on a Fairphone with 8 GB and free memory, against a ceiling the message
+attributed to a completely different machine.
+
+Half fixed. The message now names its own provenance (commit in this
+session) so "which machine does this number describe" is answered in the
+message. What is NOT fixed is the arithmetic, and the prime suspect is
+named in the new message text:
+
+`store::estimate_resident_for_load` prices `token_embd.weight` and
+`output.weight` at **4 bytes per parameter unconditionally** — see
+`is_f32_kept` in `estimate_resident_from_tensors`. For llama-3.2-1B that
+is 128256 x 2048 x 4 = ~1.0 GiB for the embedding alone, i.e. more than
+the entire q2_k file weighs on disk, and it dominates `plan_q4()` for any
+small model with a large vocabulary. Modern small models are exactly the
+case where vocab dwarfs the hidden size, so this term is wrong in the
+worst place.
+
+To settle it, someone needs to answer the loader question I could not
+from reading: does the loader actually keep those two tensors at f32, or
+does it hold them at the file's quantisation like the rest? If the
+latter, the estimator should price them from `type_nbytes` the same way
+the IQ1_S native path already does, and the refusal disappears on its
+own. If the former, the fix is in the loader, not the estimator.
+
+Also worth checking while in here: `resident_budget_bytes` uses
+MemAvailable, which is right, but on a phone under memory pressure that
+can be far below MemTotal — a model that fits in RAM overall can still be
+refused. Whether that is correct behaviour or too strict is a judgement
+call, but it should be a deliberate one.
+
+## 30. logscope networking: join from a phone, drive models on the desktop
+
+Requested end state: open logscope on the Fairphone, join the desktop
+(M2 Ultra), type, and choose which models run there. Blocked in at least
+three separate places, all already recorded:
+
+- §22 — gitmind fleet discovery never found the phones at all, and there
+  is no diagnostic output explaining why. Whatever discovery logscope uses
+  should be made to SAY what it tried.
+- §25 — the trusted-devices field took one character. Fixed this session
+  (stable widget ids), so pairing should at least be typeable now.
+- The announce/verify handshake: a machine added by id alone is capped at
+  `Trust::Build` and stays "Unverified until it announces itself with a
+  key". The reporter got exactly that message and then could neither chat
+  nor list models. So `register_keyed` — the path that raises a peer past
+  Build once it presents a key — is either not wired to the announce
+  listener or the announce never arrives. That is the next thing to trace,
+  and it is testable without hardware: two processes on one host, one
+  registering the other by id, then announcing.
+
+Model SELECTION across machines is a further step behind that: `hive.rs`
+has the placement matrix and `workerkit.rs` the capacity model, but
+nothing yet lets a phone pick which of a remote box's models to load.
+
+## 31. switcheroo: field observation — connecting alone switches the plug off
+
+Reported after the first switcheroo commit: connecting to the WSP100 over
+plain Bluetooth causes it to turn OFF, with no command sent. Worth taking
+seriously for two reasons.
+
+Practically: if a bare unauthenticated connect reliably powers the load
+down, then "off" is already reachable without HAP, and a deliberate
+connect-then-disconnect is a legitimate (if blunt) implementation of one
+half of the switch. It should NOT be wired up as if it were a real off
+command without saying what it is — but it is worth confirming whether it
+reproduces, because a reliable half is more useful than nothing.
+
+Security-wise this is a genuine finding: any device in radio range can
+apparently power-cycle the load without pairing. That is the accessory's
+flaw, not ours, but it is worth writing down.
+
+Also captured from the same report: the reporter uses no iOS devices, so
+the objection in HOMEKIT.md about stealing the pairing from the Home app
+does not apply to them — which changes the calculus. Implementing HAP
+pairing becomes viable rather than destructive. The suggested design is
+worth keeping: let ONE known node on the bo-suite fabric hold the pairing
+and act as an oracle for the others, rather than every client pairing
+independently. That matches how a Home hub works and sidesteps the
+one-pairing-at-a-time limit for everything except the hub itself.
