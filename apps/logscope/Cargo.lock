@@ -1667,6 +1667,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "font8x8"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
+
+[[package]]
 name = "foreign-types"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2919,6 +2925,7 @@ dependencies = [
  "regex",
  "repo-map",
  "rfd",
+ "scene-kit",
  "serde",
  "serde_json",
  "touchkit",
@@ -4274,6 +4281,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "scene-kit"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "font8x8",
+ "noise-kit",
 ]
 
 [[package]]

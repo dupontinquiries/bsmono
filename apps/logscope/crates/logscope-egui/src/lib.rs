@@ -72,7 +72,10 @@ pub mod voiceconfirm; // voice interjection review, on voiceterm ConfirmDialog s
 pub mod readability; // the measure: line length, the one readability factor the palette cannot fix
 pub mod revealpace; // reveal at semantic boundaries when the model outruns reading speed
 pub mod micresponse; // sound -> physical motion: leaf inertia, rune onsets, frame-rate-independent decay
-pub mod textsurface; // which scene object carries words, and which shapes legibly can
+// Migrated to scene-kit (see its Cargo.toml comment above): zero source
+// changes since extraction, confirmed byte-identical before removing the
+// local copy.
+pub use scene_kit::textsurface; // which scene object carries words, and which shapes legibly can
 pub mod chatgesture; // swipe -> variant/branch, with the guards that keep it from fighting the scroller
 pub mod mobilelayout; // width rules: egui horizontal() does not wrap, so narrow rows overlap
 pub mod replicatorlayout; // where the fan's columns go, and what Enter does when it is open (pure)
@@ -171,7 +174,11 @@ pub use logscope_fan::coordinator; // gui gate was vestigial: zero gui refs (fan
 #[allow(dead_code)] pub mod governor;
 #[allow(dead_code)] pub mod convograph; // pure (no egui) + imported by lean modules → not gui-gated
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod walkcam;
-#[allow(dead_code)] pub mod spatial; // pure math (no egui) + imported by lean modules → not gui-gated
+// Migrated to scene-kit (see its Cargo.toml comment above): zero source
+// changes since extraction, confirmed byte-identical before removing the
+// local copy. Still pure math (no egui) + imported by lean modules → not
+// gui-gated.
+pub use scene_kit::spatial;
 // Picking + interaction states for the 3D scene: it had no hit testing at all,
 // so nothing in it could be pointed at. Pure math, same gating as spatial.
 #[allow(dead_code)] pub mod scenepick;

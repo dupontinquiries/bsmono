@@ -7,6 +7,14 @@ description = "egui/eframe port skeleton of the logscope UI (replaces the GTK4/A
 [dependencies]
 math-kit = { path = "../../../../shared/math-kit" }
 noise-kit = { path = "../../../../shared/noise-kit" }
+# scene-kit was extracted FROM this crate (see its own lib.rs doc comment);
+# most of its modules have since diverged from logscope's originals
+# (per-vertex UVs, `perf` replacing theme::{power_mode,detail}) and stay
+# local pending the "next scene co-change" TODO.md already names. `spatial`
+# and `textsurface` specifically have had zero changes since extraction
+# (confirmed byte-identical to this crate's own copies before removing
+# them) and depend on nothing else in scene-kit, so they migrate now.
+scene-kit = { path = "../../../../shared/scene-kit", default-features = false }
 libc = "0.2"  # fabric daemon: signals (SIGTERM) + double-fork
 repo-map = { path = "../../../../shared/repo-map" }
 # the egui-free orchestration core (fan-out, dispatch, verdicts, command language)
