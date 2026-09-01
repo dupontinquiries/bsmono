@@ -329,7 +329,7 @@ pub fn parse_pending(
     // ~1 ms; below that count it's not worth it.
     let progress = std::sync::Arc::new(
         std::sync::atomic::AtomicU64::new(0));
-    let mut parsed_results: Vec<(i64, crate::media::parser::ParsedTrack)> =
+    let mut parsed_results: Vec<(i64, crate::parser::ParsedTrack)> =
         Vec::with_capacity(work.len());
 
     if work.len() < 16 || n_threads <= 1 {
@@ -366,7 +366,7 @@ pub fn parse_pending(
                 let extra = extra_known_artists.to_vec();
                 let chunk = chunk.to_vec();
                 let h = scope.spawn(move || {
-                    let mut out: Vec<(i64, crate::media::parser::ParsedTrack)>
+                    let mut out: Vec<(i64, crate::parser::ParsedTrack)>
                         = Vec::with_capacity(chunk.len());
                     for (id, path) in chunk {
                         let path_obj = Path::new(&path);

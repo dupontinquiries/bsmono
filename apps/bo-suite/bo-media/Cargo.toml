@@ -1,0 +1,33 @@
+[package]
+name = "bo-media"
+version = "0.1.0"
+edition = "2021"
+description = "bo-controller's music-library subsystem (SQLite catalog, scanner, tag read/write, playlists/queue/history, smart-home cards), extracted Qt-free so any front-end — QML or egui — can drive it directly instead of going through the Qt binary. Was `bo-controller/src/media`; bo-controller now depends on this crate instead of owning the module."
+
+[dependencies]
+# read_audio/find_best_loop/write_loop_opus for the soundscape loop-finder,
+# process_file_through_mixer for the offline mixer commands — both were
+# `crate::looper` / `crate::realtime_mixer` reach-throughs into
+# bo-controller when this worker lived there. Both moved to bo-core (see
+# that crate's Cargo.toml) so bo-media doesn't depend back on bo-controller.
+bo-core = { path = "../bo-core" }
+rusqlite = { version = "0.31", features = ["bundled"] }
+walkdir = "2"
+regex = "1"
+lofty = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+once_cell = "1"
+
+# BPM/key via bliss-audio — pulls ffmpeg/symphonia, heavy and slow to
+# compile, so it stays optional exactly as it was inside bo-controller.
+# Without it, key_detection returns stubs and the analysis columns stay
+# null.
+bliss-audio = { version = "0.9", optional = true }
+
+[features]
+default = []
+analysis = ["dep:bliss-audio"]
+
+[dev-dependencies]
+tempfile = "3"

@@ -217,7 +217,7 @@ pub enum MediaCmd {
         input_path: String,
         output_path: String,
         bitrate_kbps: u32,
-        params: crate::realtime_mixer::MixerParams,
+        params: bo_core::realtime_mixer::MixerParams,
     },
     /// Compute the average power spectrum of a WAV. Reply:
     /// SpectrumDone with JSON [{hz, db}, ...] aligned to the same
@@ -738,13 +738,13 @@ pub fn run(
                 // updates back via the result channel keeps the QML
                 // progress bar live.
                 let tx_progress = tx.clone();
-                let result = (|| -> Result<crate::looper::LoopResult, String> {
+                let result = (|| -> Result<bo_core::looper::LoopResult, String> {
                     let path = std::path::PathBuf::from(&input_path);
                     eprintln!("looper: reading audio {}", path.display());
-                    let buf = crate::looper::read_audio(&path)?;
+                    let buf = bo_core::looper::read_audio(&path)?;
                     eprintln!("looper: decoded {} samples @ {} Hz ({:.1}s)",
                               buf.n_samples(), buf.sample_rate, buf.duration_seconds());
-                    let params = crate::looper::LoopParams {
+                    let params = bo_core::looper::LoopParams {
                         target_seconds,
                         tolerance_seconds,
                         n_candidates,
@@ -770,7 +770,7 @@ pub fn run(
                             h.finish()
                         },
                     };
-                    let result = crate::looper::find_best_loop(&buf, &params, |p| {
+                    let result = bo_core::looper::find_best_loop(&buf, &params, |p| {
                         // Throttle progress updates to ~20Hz worth so
                         // the channel doesn't get flooded.
                         let _ = tx_progress.send(ResultMessage::SoundscapeProgress(p));
@@ -799,7 +799,7 @@ pub fn run(
                             }
                         }
                     }
-                    crate::looper::write_loop_opus(&buf, &result, fade_samples,
+                    bo_core::looper::write_loop_opus(&buf, &result, fade_samples,
                                                    bitrate_kbps, &out)?;
                     eprintln!("looper: wrote {} ({} bytes)",
                               out.display(),
@@ -831,7 +831,7 @@ pub fn run(
                 // processes in well under a second on modern CPUs.
                 // Progress callbacks stream back to QML for the bar.
                 let tx_progress = tx.clone();
-                let result = crate::realtime_mixer::process_file_through_mixer(
+                let result = bo_core::realtime_mixer::process_file_through_mixer(
                     std::path::Path::new(&input_path),
                     std::path::Path::new(&output_path),
                     params,
@@ -863,7 +863,7 @@ pub fn run(
                 // the canvas can overlay them directly. 200 max
                 // frames is plenty for a stable average (≈ 4.6s of
                 // material at 44.1 kHz before striding).
-                let result = crate::looper::spectrum_average(
+                let result = bo_core::looper::spectrum_average(
                     std::path::Path::new(&input_path),
                     64, 20.0, 20_000.0, 200,
                 );

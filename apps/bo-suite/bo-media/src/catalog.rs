@@ -645,6 +645,15 @@ pub struct TrackSummary {
     pub rating: i64,
 }
 
+/// A track's file path, resolved by id. Used to hand a real file to a
+/// player: any front-end that lists tracks (this one via
+/// `all_tracks_page_sorted`/`recent`/etc., which don't carry every column)
+/// needs this instead of re-querying the full row.
+pub fn path_for_track(conn: &Connection, id: i64) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT path FROM tracks WHERE id = ?1", params![id],
+        |row| row.get(0)).optional()
+}
+
 pub fn recent(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<TrackSummary>> {
     let mut stmt = conn.prepare(r#"
         SELECT t.id, t.path, t.title, t.album, t.year, t.bpm, t.camelot, t.key_text,

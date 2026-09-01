@@ -1134,7 +1134,7 @@ fn refine_album_years(conn: &Connection, albums: &mut [AlbumSummary])
 /// the common case where the same album title appears under multiple
 /// artists (e.g. "Greatest Hits" by 47 different bands).
 pub fn tracks_in_album(conn: &Connection, album_title: &str, primary_artist: &str)
-    -> rusqlite::Result<Vec<crate::media::catalog::TrackSummary>>
+    -> rusqlite::Result<Vec<crate::catalog::TrackSummary>>
 {
     let mut stmt = conn.prepare(r#"
         SELECT t.id, t.path, t.title, t.album, t.year, t.bpm, t.camelot, t.key_text,
@@ -1147,7 +1147,7 @@ pub fn tracks_in_album(conn: &Connection, album_title: &str, primary_artist: &st
         WHERE t.album = ?1
         ORDER BY t.title COLLATE NOCASE
     "#)?;
-    let all = crate::media::catalog::rows_to_summaries(&mut stmt, params![album_title])?;
+    let all = crate::catalog::rows_to_summaries(&mut stmt, params![album_title])?;
     // Filter by primary_artist in Rust — the SQL would need a
     // subquery-on-correlated-result to do it in one shot, and the
     // typical bag of tracks-for-an-album is tiny.

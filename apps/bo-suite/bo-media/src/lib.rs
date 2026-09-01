@@ -1,9 +1,15 @@
-// src/media/mod.rs
+// bo-media/src/lib.rs — formerly bo-controller/src/media/mod.rs.
 //
 // The media library subsystem: a SQLite-backed catalog of local audio
 // files with a 3-phase scanner (walk → parse → optional analysis), smart
 // home cards, and a dedicated worker thread that owns the DB connection so
-// the UI never blocks while loading thousands of tracks.
+// no UI thread ever blocks while loading thousands of tracks. Extracted
+// into its own crate — it was already Qt-free (rusqlite/walkdir/lofty/regex,
+// plus bo-core for the offline mixer/loop-finder commands) — so bo-suite-egui
+// can depend on it directly instead of the library only existing behind
+// bo-controller's Qt binary. bo-controller now depends on this crate too;
+// every `media::Foo` call site there is unchanged via a `use bo_media as
+// media;` alias.
 //
 // Architecture:
 //   - catalog.rs      schema + queries (the SQLite layer)
