@@ -368,9 +368,32 @@ impl Grid {
     }
 
     /// Resize the grid, preserving the top-left content.
+    ///
+    /// Column-shrinking is destructive in the ACTIVE view (a narrower row cannot show what a
+    /// wider one did without real reflow, which needs to track wrap continuations across the
+    /// whole grid+scrollback and is a substantially larger change than this method's scope) —
+    /// but it no longer DISCARDS what it can't show: any row whose truncated tail is non-blank
+    /// is preserved verbatim, at its original width, as a scrollback entry inserted just above
+    /// that row, before the row itself gets copied into the resized (narrower) buffer below.
+    /// So a pane shrunk mid-output loses nothing permanently — scroll up to see the un-chopped
+    /// line — even though the live screen still wraps/truncates at the new width until real
+    /// reflow exists. Growing the pane back does not un-truncate the live row (it was already
+    /// copied narrow into `next`), but the scrollback copy survives regardless of later resizes.
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let cols = cols.max(1);
         let rows = rows.max(1);
+        if cols < self.cols {
+            for r in 0..self.rows {
+                let tail_has_content = (cols..self.cols).any(|c| self.cell(r, c).ch != ' ');
+                if tail_has_content {
+                    let full_row: Vec<Cell> = (0..self.cols).map(|c| self.cell(r, c)).collect();
+                    self.scrollback.push(full_row);
+                    if self.scrollback.len() > self.scrollback_cap {
+                        self.scrollback.remove(0);
+                    }
+                }
+            }
+        }
         let mut next = vec![Cell::default(); cols * rows];
         for r in 0..rows.min(self.rows) {
             for c in 0..cols.min(self.cols) {
@@ -1085,6 +1108,28 @@ impl App {
                     egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => {
                         submitted = Some(std::mem::take(&mut self.terminal.input));
                     }
+                    // Ctrl/Cmd+F: open the find bar. Must come BEFORE the catch-all key arm
+                    // below — that arm has no guard and matches every key press, so with this
+                    // one after it, Ctrl+F would already be consumed as a control-code chord
+                    // (queuing a raw 0x06 byte to the shell) before match ever reached here.
+                    // Confirmed unreachable by the compiler's own warning before this reorder;
+                    // see `ctrl_f_opens_search_instead_of_leaking_a_control_byte_to_the_shell`.
+                    egui::Event::Key { key: egui::Key::F, pressed: true, modifiers, .. }
+                        if modifiers.command || modifiers.ctrl =>
+                    {
+                        self.open_search();
+                    }
+                    // Ctrl/Cmd+P: reserved for the host app (voiceterm-egui's command palette).
+                    // This crate has no notion of "palette" — a no-op arm here just keeps the
+                    // catch-all below from sending its control byte (0x10, DLE) to the shell.
+                    // Bash/readline binds Ctrl+P to "previous history entry", the same action
+                    // ArrowUp already sends (`keys::Key::Up`, mapped below), so nothing unique
+                    // is lost — this is deduplicating a redundant path, not removing a feature.
+                    // See `ctrl_p_is_reserved_and_does_not_leak_a_control_byte_to_the_shell`.
+                    egui::Event::Key { key: egui::Key::P, pressed: true, modifiers, .. }
+                        if modifiers.command || modifiers.ctrl =>
+                    {
+                    }
                     // Everything else a SHELL needs, encoded as the bytes it
                     // parses. Without these the widget is a text field that
                     // submits lines: no Ctrl-C to stop a runaway command, no
@@ -1136,11 +1181,6 @@ impl App {
                                 pending.extend_from_slice(&bytes);
                             }
                         }
-                    }
-                    egui::Event::Key { key: egui::Key::F, pressed: true, modifiers, .. }
-                        if modifiers.command || modifiers.ctrl =>
-                    {
-                        self.open_search();
                     }
                     _ => {}
                 }
@@ -1899,6 +1939,81 @@ mod tests {
         prefs.touch.text_scale = 2.0;
         app.apply_settings(&ctx, &prefs);
         assert!(app.font_size > base, "text scale grows the monospace cell");
+    }
+
+    /// The bug: the catch-all key arm in `handle_input` (`egui::Event::Key { key: k, .. }`, no
+    /// guard) matches every key press, including Ctrl+F, before the match ever reaches the
+    /// specific `egui::Key::F ... if modifiers.command || modifiers.ctrl` arm below it — which
+    /// is therefore unreachable (confirmed by the compiler's own `unreachable_patterns`
+    /// warning). The doc comment on `open_search` says "Ctrl+F" is the intended shortcut; what
+    /// actually happens today is the catch-all treats Ctrl+F as a control-code chord and queues
+    /// a raw 0x06 (ACK) byte to send to the shell instead of opening the find bar.
+    #[test]
+    fn ctrl_f_opens_search_instead_of_leaking_a_control_byte_to_the_shell() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(80, 24);
+        assert!(!app.search_open, "fixture must start with search closed to be meaningful");
+
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let events = vec![egui::Event::Key {
+            key: egui::Key::F,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers { ctrl: true, ..Default::default() },
+        }];
+        let _ = ctx.run(
+            egui::RawInput { events, screen_rect: Some(screen), ..Default::default() },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.handle_input(ui);
+                });
+            },
+        );
+
+        assert!(app.search_open, "Ctrl+F must open the find bar (see open_search's doc comment)");
+        assert!(app.take_pending_bytes().is_empty(),
+            "Ctrl+F must not also queue bytes to send to the shell — the catch-all key arm \
+             matching first is exactly the bug this guards against");
+    }
+
+    /// The bug: `voiceterm-egui` binds Ctrl+P to open its command palette
+    /// (voiceterm_egui.rs, "the eleven-tab switcher's replacement"), an app-level
+    /// concern this crate has no knowledge of — but the SAME catch-all arm that
+    /// swallowed Ctrl+F also swallows Ctrl+P, sending its control byte (0x10, DLE)
+    /// to the shell. Bash/readline binds Ctrl+P to "previous history entry" (the
+    /// same action as the already-mapped ArrowUp key, so nothing unique is lost by
+    /// reserving it) — meaning every app-level Ctrl+P currently ALSO pollutes the
+    /// PTY with a spurious history-navigation byte the user never asked for, on
+    /// top of whatever else is going on with the shortcut on real hardware
+    /// (see maintenance/C11_TODO.md's C11-6c for the on-device "dead" report this
+    /// doesn't fully explain by itself, but which this collateral leak makes
+    /// worse either way).
+    #[test]
+    fn ctrl_p_is_reserved_and_does_not_leak_a_control_byte_to_the_shell() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(80, 24);
+
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let events = vec![egui::Event::Key {
+            key: egui::Key::P,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers { ctrl: true, ..Default::default() },
+        }];
+        let _ = ctx.run(
+            egui::RawInput { events, screen_rect: Some(screen), ..Default::default() },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.handle_input(ui);
+                });
+            },
+        );
+
+        assert!(app.take_pending_bytes().is_empty(),
+            "Ctrl+P is reserved for the host app's command palette and must not also \
+             queue a control byte to send to the shell");
     }
 
     fn snapclone_theme_palette() -> &'static snapclone_theme::Palette {
