@@ -26,7 +26,7 @@
 //! later. This sheet asks the deck for `selected()` every frame rather than
 //! caching what it was opened with.
 
-use crate::cards_view::{Card, CardKind, Deck};
+use crate::cards_view::{CardKind, Deck};
 
 /// What the operator chose from the sheet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,7 +138,7 @@ pub fn card_preview_ui(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cards_view::{CardSource, Deck};
+    use crate::cards_view::{Card, CardSource, Deck};
 
     fn card(t: &str, url: &str) -> Card {
         Card { title: t.into(), body: format!("body of {t}"), kind: CardKind::Prose,
