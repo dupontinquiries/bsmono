@@ -980,6 +980,10 @@ session's default format unless the pipeline states caps, and
 
 - **Settings panels flow over the bottom navbar and over each other**
   instead of establishing bounds and scrolling. Both platforms.
+  **snapclone: done 2026-09-01** — one ScrollArea at the page dispatch,
+  keyed by page (aec364ac), after the gesture rule learned that a
+  container yields to the page along the swipe axis (614718e9). Other
+  apps: same fix applies wherever a page is a bare stack; not done there.
 - **logscope portrait at 300% scale overflows left and right.** 200% is
   "a bit better". 300% is common on these compositors, so it is the case
   to design for, not an edge case.
@@ -1424,3 +1428,20 @@ Not done here, in order of value:
   also punched on `connectToPeer` for text. The conservative halving is
   plumbed (`initiate(.., conservative, ..)`) but the binary passes false:
   no power-context signal is read yet.
+
+## 36. snapclone UI, 2026-09-01: what landed and what is next
+
+Landed: swipe-vs-widget ownership in the shared bridges (one fix, every
+app); pages bounded and scrolling; a prioritised hint line (phone: short,
+above the tab bar; desktop: long, under the toolbar); double-tap flips
+the camera; the phone's camera picker is a dropdown; feed tiles no longer
+own drags; columns on a wide screen (the kit's fit + a no-wrap window);
+the trackpad detent turns pages. All headless-frame tested, none seen on
+a screen.
+
+Next, in order: the peers page as a table on desktop and cards on the
+phone (the hint pattern — one decision, two renderings — applied to a
+page); long-press a tab for its quick action; hold-to-preview a tile. The
+QR square is the identicon the Qt build also drew (`qr_render` says so);
+a real encoder is a separate decision, ~300 dependency-free lines if
+taken.
