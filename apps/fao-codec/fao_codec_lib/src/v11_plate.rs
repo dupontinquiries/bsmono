@@ -991,8 +991,16 @@ fn fit_plane_gain(pred: &[u8], target: &[u8]) -> (i16, i8) {
     // pixel of an exact canonical and drops the misaligned ones, so
     // a bad reference lands on identity instead of on a contrast
     // reduction that the dead zone then hides.
-    const WP_INLIER: f64 = 6.0;
-    let fit = |keep: &dyn Fn(usize) -> bool| -> Option<(f64, f64)> {
+    let wp_inlier: f64 = std::env::var("FAO_WP_INLIER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6.0);
+    // Returns (a, mean_p, mean_t): b is derived AFTER a is clamped and
+    // quantised, from the same sums. Deriving b from the unclamped a
+    // and clamping afterwards produced (0.5, +127) on a near-flat
+    // frame — an inconsistent pair that cost 3.4 KB of residual on
+    // one frame of an otherwise exact canonical.
+    let fit = |keep: &dyn Fn(usize) -> bool| -> Option<(f64, f64, f64)> {
         let (mut n, mut sp, mut st, mut spp, mut spt) = (0.0f64, 0.0f64, 0.0, 0.0, 0.0);
         for (i, (&p, &t)) in pred.iter().zip(target).enumerate() {
             if !keep(i) {
@@ -1009,16 +1017,17 @@ fn fit_plane_gain(pred: &[u8], target: &[u8]) -> (i16, i8) {
         if n < 64.0 || denom.abs() < 1e-6 {
             return None;
         }
-        let a = (n * spt - sp * st) / denom;
-        Some((a, (st - a * sp) / n))
+        Some(((n * spt - sp * st) / denom, sp / n, st / n))
     };
-    let Some((a0, b0)) = fit(&|_| true) else { return (1024, 0) };
-    let (a, b) = fit(&|i| ((target[i] as f64) - (a0 * pred[i] as f64 + b0)).abs() <= WP_INLIER)
-        .unwrap_or((a0, b0));
+    let Some((a0, mp0, mt0)) = fit(&|_| true) else { return (1024, 0) };
+    let b0 = mt0 - a0.clamp(0.5, 2.0) * mp0;
+    let a0c = a0.clamp(0.5, 2.0);
+    let (a, mp, mt) = fit(&|i| ((target[i] as f64) - (a0c * pred[i] as f64 + b0)).abs() <= wp_inlier)
+        .unwrap_or((a0, mp0, mt0));
     let a = a.clamp(0.5, 2.0);
     let qa = (a * 1024.0).round() as i16;
     let a = qa as f64 / 1024.0;
-    let b = b.round().clamp(-127.0, 127.0) as i8;
+    let b = (mt - a * mp).round().clamp(-127.0, 127.0) as i8;
     (qa, b)
 }
 

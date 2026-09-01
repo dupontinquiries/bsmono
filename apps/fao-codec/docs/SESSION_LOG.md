@@ -6339,8 +6339,24 @@ Same robust fit put into `WeightedPred`, where it changes the film
 result from a wash to a win on both axes and keeps SMITE's chroma:
 
   w1     no WP 444,056/0.97731 | naive 441,967/0.97711 | robust 440,102/0.97732
-  SMITE  naive 856,910/0.95410 U 34.61 V 34.81 | robust 858,369/0.95415 U 34.61 V 34.96
-  soldier entity unchanged (exact canonical: every pixel an inlier)
+  SMITE  naive 856,910/0.95410 U 34.61 V 34.81 | robust 861,688/0.95415 U 34.61 V 34.96
+  soldier map canonical   22,468 @ 44.16 dB -> 15,310 @ 47.64 dB / 0.99967
+  soldier map + entity     1,997 @ 57.09    ->  2,055 @ 57.09    / 0.99994
+
+The map row is where the robust fit earns its place: with the actors
+carried as pixels they are OUTLIERS in the exposure fit, and the
+naive fit was being pulled by them. Excluding them lands the
+background on the exact gain, and that row is now UNDER the AV1
+anchor (18,930 B @ 40.73) at +7 dB — the first time actors-as-pixels
+has beaten AV1 on this clip.
+
+The first cut of this commit reported soldier entity at 5,623 B and
+the log said "unchanged" — wrong, and caught by re-measuring before
+moving on. Cause: the rewrite derived b from the UNCLAMPED a and
+clamped a afterwards, so a near-flat frame (31: the camera walks
+into geometry, a ~ 0) shipped the pair (0.5, +127) — inconsistent —
+and paid 3.4 KB of residual for one frame. b is now derived after
+a is clamped and quantised, from the same sums, as the original did.
 
 `bin/photo_probe` runs the bank on real footage against the previous
 frame shifted by the phase-correlation translation:

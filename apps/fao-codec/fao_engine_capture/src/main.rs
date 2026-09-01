@@ -511,7 +511,7 @@ fn main() {
             &format!("(cam {cam_bytes} B + entity stream {ent_bytes} B)"),
         );
         if per_frame {
-            for (i, c) in rent.frames.iter().enumerate().take(8) {
+            for (i, c) in rent.frames.iter().enumerate().filter(|(_, c)| c.residual_bytes > 5 || c.mode_bytes > 100) {
                 eprintln!("  ent  f{i:>2}: side {:>5} resid {:>6}", c.mode_bytes, c.residual_bytes);
             }
         }
