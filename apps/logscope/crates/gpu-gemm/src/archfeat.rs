@@ -106,6 +106,27 @@ pub enum Feature {
     /// delta-rule state instead of a KV cache, fed by a causal depthwise conv over fused qkv.
     GatedDeltaNet,
     GatedAttentionOutput,
+    /// Attention output gate from a SEPARATE projection, rather than interleaved into a
+    /// double-width q.
+    ///
+    /// Split from `GatedAttentionOutput` because the two differ in the part that costs work.
+    /// That one reads the gate out of q itself (`per-head q‖gate interleaved`), so the loader
+    /// splits one tensor and nothing new is projected. Muse Glimmer has its own `attn_gate`
+    /// weight of {n_embd, n_head*head_dim} and projects it from the PRE-attention hidden state,
+    /// then applies `sigmoid(gate)` to the attention output BEFORE `wo`. That is an extra matmul
+    /// per layer and a different data flow; claiming it under the interleaved feature would be
+    /// the registry lying in the direction that costs a debugging session.
+    SeparateAttnOutputGate,
+    /// A weightless RMS norm applied to the token embeddings before block 0.
+    ///
+    /// Distinct from `EmbeddingScale` (Gemma's ×sqrt(d)) — that is a multiply by a constant,
+    /// this is a normalisation, and substituting either for the other changes every activation
+    /// downstream while still producing fluent-looking output.
+    EmbeddingNorm,
+    /// The final logits are multiplied by a constant from the hparams (`output_multiplier`)
+    /// before the softcap. One elementwise pass; listed separately because a missing scale is
+    /// invisible at greedy decode and only shows up as wrong temperature behaviour.
+    OutputMultiplier,
     MRopeSections,
     GatedSharedExpert,
     /// Dense (shared) FFN and the routed MoE run as PARALLEL branches off attn_out — each with its
@@ -160,6 +181,9 @@ impl Feature {
             Feature::AltAttnValueFromKey => "V sourced from the K projection (attn_v absent; weightless V norm)",
             Feature::GatedDeltaNet => "Gated DeltaNet recurrent layers (delta-rule state + conv, no KV cache)",
             Feature::GatedAttentionOutput => "gated attention (per-head q‖gate interleaved in a double-width q projection; attention output × sigmoid(gate))",
+            Feature::SeparateAttnOutputGate => "attention output gate from its own attn_gate projection off the pre-attention hidden state, applied before wo",
+            Feature::EmbeddingNorm => "weightless RMS norm on the token embeddings before block 0",
+            Feature::OutputMultiplier => "final logits scaled by an hparam constant before the softcap",
             Feature::MRopeSections => "multi-section rope (IMRoPE: rope.dimension_sections split across position channels)",
             Feature::GatedSharedExpert => "shared expert with its OWN sigmoid gate (ffn_gate_inp_shexp scales the shared expert's output per token)",
             Feature::TwinFfnParallelResidual => "dense + MoE FFN as parallel branches with one joining post-norm",
@@ -306,6 +330,12 @@ impl Feature {
             // (which also caught the post_attention_norm double-load on its first run). Every
             // other block fn refuses a gated layer by name (refuse_attn_gate_where_unapplied).
             Feature::GatedAttentionOutput => true,
+            // NOT implemented. The interleaved variant above is; this one needs a
+            // per-layer attn_gate tensor loaded, an extra matmul, and the gate
+            // applied between attention output and wo.
+            Feature::SeparateAttnOutputGate => false,
+            Feature::EmbeddingNorm => false,
+            Feature::OutputMultiplier => false,
             Feature::MRopeSections => false,
             // Wired at the moe_ffn funnel (one apply site serves decode AND prefill): the loader
             // reads ffn_gate_inp_shexp as a [1, d] f32 row, and the shared expert's output is
@@ -410,6 +440,13 @@ pub fn required(arch: &str, variant: u32) -> Vec<Feature> {
         "qwen3moe" | "qwen3" | "qwen35" => vec![Feature::QkNormPreRope],
         // Gemma 2/3/4 all use standard SWA on a layer pattern with a separate rope base; 3 and 4 add
         // learned Q/K norms before rope, and 4 adds per-layer rope frequency tensors.
+        // Everything else Muse Glimmer needs is already implemented and is NOT listed here:
+        // sliding-window attention (StandardSwa), the post-attn/post-FFN sandwich norms
+        // (PostNorm), per-layer NoPE on the full-attention layers (NoPe), weighted QK-norm
+        // (QkNormPreRope) and the final tanh softcap (FinalLogitSoftcap) all ship today. These
+        // three are the real remainder.
+        "muse_glimmer" | "museglimmer" => vec![
+            Feature::SeparateAttnOutputGate, Feature::EmbeddingNorm, Feature::OutputMultiplier],
         "gemma2" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::GeGluActivation,
                          Feature::GemmaRmsNorm, Feature::AttnLogitSoftcap, Feature::FinalLogitSoftcap, Feature::EmbeddingScale, Feature::PerLayerRopeBase, Feature::AttentionScaleHparam],
         "gemma3" | "gemma3n" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::QkNormPreRope,

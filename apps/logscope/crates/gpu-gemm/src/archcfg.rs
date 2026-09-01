@@ -11,7 +11,7 @@
 //! Gemma2 (geglu + dual soft-cap + a norm tweak), then Phi-3 (fused QKV / partial-rotary).
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Arch { Llama, Qwen2, Qwen3, Qwen35, Qwen3Moe, Qwen4, Llama4, Gemma2, Gemma3, DiffusionGemma, Phi3, Glm4Moe, DeepseekV3, Unknown }
+pub enum Arch { Llama, Qwen2, Qwen3, Qwen35, Qwen3Moe, Qwen4, Llama4, Gemma2, Gemma3, DiffusionGemma, Phi3, Glm4Moe, DeepseekV3, MuseGlimmer, Unknown }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Norm { /// x/rms(x) · w
@@ -214,6 +214,28 @@ experts, shared expert with its own gate, Q4_K/MXFP4 slice since c4-784/c4-805",
         // f_final_logit_softcapping to 0), plus learned per-head Q/K norms applied BEFORE rope — the same
         // shape Qwen3 uses, which is why attn_qk_norm carries it. Sliding window, (1+w) norm, GELU gating
         // and the post-norms are all implemented and gated (--gate-swa, --gate-gemma).
+        // Muse Glimmer (llama.cpp #26841, `src/models/muse-glimmer.cpp`). The TEXT half of a
+        // multimodal checkpoint; vision ships as a separate mmproj GGUF that this path never
+        // reads, so a text-only load is the upstream shape rather than a compromise.
+        //
+        // Most of what config.json makes look exotic is folded by the CONVERTER and never
+        // reaches us — see maintenance/MUSE_GLIMMER_AND_PERF_NOTES.md:
+        //   * qk_scale_factor (3.87) is baked into synthesized q_norm weights (k_norm is ones),
+        //     so this is ordinary weighted QK-norm — attn_qk_norm below, already supported.
+        //   * the `weight + 1` on the four layer norms is folded at conversion, so Norm::Rms is
+        //     correct here and Norm::RmsGemma would DOUBLE-apply it.
+        //   * Q/K arrive already un-permuted into ggml's interleaved layout.
+        // `interleaved_nope` carries the per-layer RoPE flag: the 13 full-attention layers do not
+        // rotate and the 39 sliding ones do (`use_rope = is_swa(il)` upstream) — the same axis
+        // Llama-4's iRoPE already uses.
+        "muse_glimmer" | "museglimmer" => ArchConfig {
+            arch: Arch::MuseGlimmer, prefix: "muse_glimmer", attn_qkv_bias: false, attn_qk_norm: true,
+            norm: Norm::Rms, act: Act::SwiGlu,
+            rope_interleaved: true, moe: false, moe_shared_expert: false, interleaved_nope: true,
+            logit_softcap: Some(20.0), attn_softcap: None, tied_embed_default: false,
+            supported: false, dense_supported: false,
+            note: "",
+        },
         "gemma3" | "gemma3n" => ArchConfig {
             arch: Arch::Gemma3, prefix: "gemma3", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::RmsGemma, act: Act::GeGlu,
             rope_interleaved: false, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
@@ -1378,5 +1400,150 @@ but this note still calls it pending");
                 "{arch}: the note says both UNVERIFIED and validated-by-a-gate. One of them is out \
 of date and a reader has no way to tell which");
         }
+    }
+}
+
+// ── sliding-window layer pattern ─────────────────────────────────────────────
+
+/// Which layers use sliding-window attention, from a GGUF's SWA pattern.
+///
+/// Two encodings exist upstream and a file may carry either
+/// (`llama-hparams.cpp::set_swa_pattern` and its `get_key_or_arr` caller):
+///
+///  * an explicit bool array, one entry per layer — what Muse Glimmer's
+///    converter writes (`add_sliding_window_pattern([t == "sliding_attention"
+///    for t in layer_types])`);
+///  * a scalar PERIOD, where layer `il` is windowed iff `il % period < period-1`
+///    — i.e. every `period`-th layer is full-attention.
+///
+/// `arr` wins when present, matching upstream's order. `period == 0` means every
+/// layer is windowed.
+pub fn swa_pattern(arr: Option<&[bool]>, period: u32, n_layer: usize) -> Vec<bool> {
+    if let Some(a) = arr {
+        // A short array is a malformed file, not a licence to guess: pad with
+        // `false` (full attention) rather than repeating, because a layer wrongly
+        // marked windowed silently truncates its context, which reads as the model
+        // being bad rather than as a loader bug.
+        return (0..n_layer).map(|i| a.get(i).copied().unwrap_or(false)).collect();
+    }
+    (0..n_layer)
+        .map(|i| period == 0 || (i as u32 % period) < period.saturating_sub(1))
+        .collect()
+}
+
+/// Do the two encodings agree? Used to turn the checked coincidence below into a
+/// load-time assertion when a file carries both.
+pub fn swa_pattern_agrees(arr: &[bool], period: u32, n_layer: usize) -> bool {
+    swa_pattern(Some(arr), period, n_layer) == swa_pattern(None, period, n_layer)
+}
+
+#[cfg(test)]
+mod swa_pattern_tests {
+    use super::*;
+
+    #[test]
+    fn the_period_rule_reproduces_muse_glimmers_own_layer_types() {
+        // 52 layers, period 4 → 3 windowed + 1 full per group. The checkpoint's
+        // config.json independently counts 39 sliding / 13 full. That the two
+        // derivations agree is what makes the period fallback trustworthy for
+        // this family — and it is a free assertion, so it is written down rather
+        // than noticed once and forgotten.
+        let p = swa_pattern(None, 4, 52);
+        assert_eq!(p.iter().filter(|x| **x).count(), 39, "sliding layers");
+        assert_eq!(p.iter().filter(|x| !**x).count(), 13, "full-attention layers");
+        // and the full ones are the 4th of each group
+        assert!(!p[3] && !p[7] && p[0] && p[1] && p[2]);
+    }
+
+    #[test]
+    fn an_explicit_array_overrides_the_period() {
+        // Upstream prefers the array; a file carrying a contradictory period must
+        // not quietly win, or a converter change silently reshapes attention.
+        let arr = vec![false, false, true, true];
+        assert_eq!(swa_pattern(Some(&arr), 4, 4), arr);
+        assert!(!swa_pattern_agrees(&arr, 4, 4), "these two disagree, and that must be visible");
+    }
+
+    #[test]
+    fn agreement_is_detectable_when_the_file_carries_both() {
+        let derived = swa_pattern(None, 4, 52);
+        assert!(swa_pattern_agrees(&derived, 4, 52));
+    }
+
+    #[test]
+    fn a_short_array_pads_to_full_attention_not_to_windowed() {
+        // Padding the other way truncates context on the missing layers, which
+        // looks like a bad model rather than a bad file.
+        let p = swa_pattern(Some(&[true, true]), 4, 5);
+        assert_eq!(p, vec![true, true, false, false, false]);
+    }
+
+    #[test]
+    fn period_zero_means_every_layer_is_windowed() {
+        assert_eq!(swa_pattern(None, 0, 3), vec![true, true, true]);
+    }
+
+    #[test]
+    fn period_one_means_no_layer_is_windowed() {
+        // il % 1 < 0 is never true. Worth pinning: an off-by-one here would make
+        // every layer windowed on a file that meant the opposite.
+        assert_eq!(swa_pattern(None, 1, 3), vec![false, false, false]);
+    }
+}
+
+#[cfg(test)]
+mod muse_glimmer_registry_tests {
+    use super::*;
+
+    #[test]
+    fn the_converter_folds_the_gemma_style_norm_so_we_must_not_apply_it_again() {
+        // config.json's norms are `weight + 1`, which looks like Norm::RmsGemma.
+        // It is not: `MuseGlimmerModel.norm_shift` adds the 1 at CONVERSION time
+        // for the four layer norms (0 for the final one). Selecting RmsGemma here
+        // would apply `(1 + w)` to a weight that already had 1 added — every
+        // normalised value wrong, and the output still fluent.
+        let c = for_arch("muse_glimmer");
+        assert_eq!(c.norm, Norm::Rms, "the +1 is already in the weights");
+    }
+
+    #[test]
+    fn qk_norm_is_ordinary_because_qk_scale_factor_is_baked_into_the_weights() {
+        // The converter synthesizes q_norm filled with qk_scale_factor and k_norm
+        // filled with ones. So there is nothing special to implement — but the
+        // flag must be ON, or the synthesized weights are ignored and Q is
+        // silently unscaled by 3.87.
+        assert!(for_arch("muse_glimmer").attn_qk_norm);
+    }
+
+    #[test]
+    fn per_layer_nope_is_declared_since_full_attention_layers_do_not_rotate() {
+        assert!(for_arch("muse_glimmer").interleaved_nope,
+            "13 of 52 layers use NoPE; without this they would be rotated");
+    }
+
+    #[test]
+    fn the_final_softcap_is_carried_and_the_attention_one_is_not() {
+        let c = for_arch("muse_glimmer");
+        assert_eq!(c.logit_softcap, Some(20.0));
+        assert_eq!(c.attn_softcap, None, "upstream caps only the final logits");
+    }
+
+    #[test]
+    fn it_is_declared_unsupported_and_names_exactly_what_is_missing() {
+        // The point of the registry: refuse by name. Three gaps, and none of them
+        // may be one of the features that already ship.
+        let gaps = crate::archfeat::gaps("muse_glimmer", 0);
+        assert_eq!(gaps.len(), 3, "{gaps:?}");
+        for g in &gaps {
+            assert!(!g.implemented(), "{g:?} is listed as a gap but is implemented");
+        }
+        for shipped in [crate::archfeat::Feature::StandardSwa,
+                        crate::archfeat::Feature::PostNorm,
+                        crate::archfeat::Feature::FinalLogitSoftcap,
+                        crate::archfeat::Feature::QkNormPreRope] {
+            assert!(!gaps.contains(&shipped),
+                "{shipped:?} already ships and must not be claimed as missing");
+        }
+        assert!(!is_supported("muse_glimmer", 0));
     }
 }
