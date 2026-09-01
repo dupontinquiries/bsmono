@@ -6205,3 +6205,83 @@ is the next thing to write.
 Sandbox notes: backgrounded builds die when the tool shell exits
 unless started with `setsid nohup ... < /dev/null &`. Both workspaces
 share CARGO_TARGET_DIR=/tmp/fao/target (7.1 GB free at the end).
+
+### Film: the budget attributed to WHAT it is spent on (same day)
+
+User's position: film is modelable; the codec has not targeted the
+right things. The 84%-novelty figure bounded a 2D plate, not a model.
+So: attribute the bytes. `FAO_LEDGER=path` now writes one line per
+region per frame from `encode_gop_v3_core` (mode, plate SAD, prev SAD,
+gain flag, residual raw cost from `residual::encode_with_map` scaled
+to the frame's real residual bytes).
+
+Grain first, because it is cheap to bound and the user was right to
+reject it: hqdn3d on w1 removes std 1.1-2.1 with lag-1 spatial
+correlation 0.72-0.83. Sensor grain is near-white; correlated "noise"
+is world texture the filter blurred (and this source is a YouTube
+H.264 rip — the stock's grain is already gone). Grain synthesis is
+off the table on this evidence, not on taste.
+
+w1 (film, 48 f, dz32, 441,967 B) decomposes as:
+
+  side info  277,484 B   63%     residual  129,781 B   29%     plate  34,318 B   8%
+
+The novelty is not pixels. It is 6,000 regions per frame each saying
+how they moved: prev-MC on 81.5% of regions, 126k nonzero MVs over
+the GOP, 750-1,500 gain pairs per frame. Raw per frame ~12 KB (mvd
+4.8 KB, gain values 1.5-3 KB, three 750 B bitmaps), ~5.8 KB after
+zstd.
+
+Residual, by what the region IS (plate SAD per pixel as the class):
+
+  moving object   (>12 lvl off plate)   31.9% of regions   81.1% of residual bytes
+  background the plate blurs (4-12)     41.8%               17.3%
+  background the plate has   (<=4)      26.3%                1.6%
+
+  0.7% of region-frames carry 50% of residual bytes; 1.8% carry 80%.
+
+And the predictor quality that explains the mode mix:
+
+  plate  prediction error  median 7.54 lvl/px   11% of regions within 2 lvl
+  prev   prediction error  median 1.08 lvl/px   66% of regions within 2 lvl
+
+A 48-frame median is the wrong background model for film. It is stale
+by construction — actors pass through it, lighting and codec noise
+change under it — while the previous frame is within 2 levels on two
+thirds of the picture. The codec knows this (81% prev-MC) and pays
+for it per region: mode bit, nz bit, an MV, often a gain pair, for
+regions that moved exactly with the camera.
+
+Affine camera tried (`estimate_motions_affine`, FAO_AFFINE=1): the
+log had "88% of correspondences within 2 px of a global affine" and
+the plate warps with 2 parameters. Integer block-match pairs + 3-sigma
+affine fit land at rms 2.4-3.2 px per pair, and the plate did not get
+sharper: median error 7.54 -> 8.50. Bytes 441,967 -> 441,672 and
+MS-SSIM 0.97711 -> 0.97877 (+0.0017, ~45 KB on the ladder) — a real
+gain whose mechanism is NOT alignment and is not explained. Left
+opt-in until it is; a default that works for an unknown reason is how
+this codec accumulated its wrong constants.
+
+What the ledger says to build, in the user's terms — objects and
+properties, camera first:
+
+1. A GLOBAL-MOTION mode: prev warped by the frame's affine as the
+   default predictor for every region, MVs coded as deltas from the
+   affine's local displacement (so a pan has all-zero deltas and the
+   nz bitmap is empty), the exact-region gate suppressing gains and
+   intra where it already lands within rounding. The 66% of regions
+   within 2 levels of prev should cost ~0 side bytes. Estimated from
+   the composition above: ~120-150 KB of the 277 KB. The plate keeps
+   its one real job — reveals and long-term reference — instead of
+   being the predictor of first resort it loses 81% of the time.
+2. Movers as OBJECTS on top of that: the 32% of regions >12 levels
+   off the plate carry 81% of the residual and are where an object
+   model (rigid, then articulated) pays. The mover layer exists;
+   it is not yet what the residual is attributed to.
+3. The bootstrap graph the user describes — priors over what
+   co-occurs (a face implies a body below it; stairs imply a
+   railing) — is what a tracker needs to instantiate (2) from
+   fragments. It is the right long-range target and the wrong
+   first step: it has nothing to attach to until (1) removes the
+   camera from the per-region budget and (2) gives objects a
+   representation the ledger can score.

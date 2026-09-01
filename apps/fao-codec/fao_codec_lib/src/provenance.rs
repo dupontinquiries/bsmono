@@ -352,7 +352,7 @@ mod tests {
             }
             frames.push(f);
         }
-        let m = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 }; frames.len()];
+        let m = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: crate::v11_plate::LIN_ID }; frames.len()];
         let plate = build_plate(&frames, &m);
         let opts = ResidualOpts { dead_zone: 8.0, ..ResidualOpts::default() };
         let (movers, _) = build_movers(&frames, &m, &plate, &opts, 12);

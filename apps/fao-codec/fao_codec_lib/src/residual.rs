@@ -175,6 +175,22 @@ pub fn encode(
     h: usize,
     opts: &ResidualOpts,
 ) -> Option<Vec<u8>> {
+    encode_with_map(predicted, target, w, h, opts).map(|(t, _)| t)
+}
+
+/// `encode`, plus a per-4x4-block RAW cost map (row-major over
+/// (w/4, h/4)): 0 for a skip block, else 3 + the number of nonzero
+/// quantised coefficients across the three channels. Diagnostic: it
+/// is what the ledger uses to attribute a frame's residual bytes to
+/// regions, since the entropy stage emits one stream per frame and
+/// cannot say where the bytes went. Encoder-only; nothing on the wire.
+pub fn encode_with_map(
+    predicted: &[u8],
+    target: &[u8],
+    w: usize,
+    h: usize,
+    opts: &ResidualOpts,
+) -> Option<(Vec<u8>, Vec<u16>)> {
     if predicted.len() != w * h * 3 || target.len() != w * h * 3 {
         return None;
     }
@@ -312,6 +328,16 @@ pub fn encode(
         }
     }
     
+    let cost_map: Vec<u16> = {
+        let thresh = opts.skip_threshold;
+        blocks
+            .iter()
+            .map(|(qs, _)| {
+                let nz = qs.iter().flat_map(|ch| ch.iter()).filter(|v| v.abs() > thresh).count();
+                if nz == 0 { 0 } else { 3 + nz as u16 }
+            })
+            .collect()
+    };
     // Pack blocks into a byte stream, with optional skip-block RLE.
     let payload = if opts.skip_block_rle {
         pack_skip_rle(&blocks, opts)
@@ -379,7 +405,7 @@ pub fn encode(
             out.extend_from_slice(&rw_field.to_le_bytes());
             out.extend_from_slice(&(rh as u16).to_le_bytes());
             out.push(2);
-            return Some(out);
+            return Some((out, cost_map));
         }
     }
     let use_rans = rans_candidate
@@ -404,7 +430,7 @@ pub fn encode(
     out.extend_from_slice(&(rh as u16).to_le_bytes());
     out.push(if use_rans { 1 } else { 0 });
     out.extend_from_slice(body);
-    Some(out)
+    Some((out, cost_map))
 }
 
 /// Pack blocks without skip-block RLE — every block emits its full 

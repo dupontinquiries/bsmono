@@ -105,7 +105,7 @@ fn main() {
 
     let t0 = std::time::Instant::now();
     let motions = if args.iter().any(|a| a == "--static") {
-        vec![plate::PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 }; frames.len()]
+        vec![plate::PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: fao_codec::v11_plate::LIN_ID }; frames.len()]
     } else {
         plate::estimate_motions(&frames)
     };
@@ -1443,7 +1443,7 @@ end_header
             } else if do_route {
                 // Branch A: self (own motions + own plate).
                 let m_self = if args.iter().any(|a| a == "--static") {
-                    vec![plate::PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 }; frames.len()]
+                    vec![plate::PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: fao_codec::v11_plate::LIN_ID }; frames.len()]
                 } else {
                     plate::estimate_motions(&frames)
                 };

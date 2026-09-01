@@ -57,6 +57,24 @@ pub struct PlateMotion {
     pub dx: f32,
     pub dy: f32,
     pub confidence: f32,
+    /// Linear part [a, b, d, e] of the frame-0 -> frame-i affine
+    /// x' = a x + b y + dx, y' = d x + e y + dy. Identity for the
+    /// translation-only estimator; `estimate_motions_affine` fills it.
+    /// Kept as a separate field so every consumer that reads dx/dy as
+    /// "the pan" keeps its meaning — dx/dy ARE the affine's translation.
+    pub lin: [f32; 4],
+}
+
+pub const LIN_ID: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+
+impl PlateMotion {
+    pub fn is_translation(&self) -> bool {
+        self.lin == LIN_ID
+    }
+    /// Frame-0 coordinates -> this frame's coordinates.
+    pub fn affine(&self) -> crate::global_motion::Affine {
+        [self.lin[0], self.lin[1], self.dx, self.lin[2], self.lin[3], self.dy]
+    }
 }
 
 /// The web: a background plate the size of the union of all warped frame
@@ -78,6 +96,9 @@ pub struct Plate {
 /// correlation (pairwise is robust to lighting drift; the cumulative sum
 /// gives each frame's offset in frame-0 coordinates).
 pub fn estimate_motions(frames: &[Yuv420]) -> Vec<PlateMotion> {
+    if std::env::var("FAO_AFFINE").map(|v| v != "0").unwrap_or(false) {
+        return estimate_motions_affine(frames);
+    }
     let mut out = Vec::with_capacity(frames.len());
     if frames.is_empty() {
         return out;
@@ -85,7 +106,7 @@ pub fn estimate_motions(frames: &[Yuv420]) -> Vec<PlateMotion> {
     let w = frames[0].w;
     let h = frames[0].h;
     let pass = PhaseCorrelationPass::new(512.min(w.min(h)));
-    out.push(PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 });
+    out.push(PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: LIN_ID });
     let (mut ax, mut ay) = (0.0f32, 0.0f32);
     for i in 1..frames.len() {
         let m = pass.estimate(&frames[i].y, &frames[i - 1].y, w, h);
@@ -96,7 +117,116 @@ pub fn estimate_motions(frames: &[Yuv420]) -> Vec<PlateMotion> {
             ax += m.dx;
             ay += m.dy;
         }
-        out.push(PlateMotion { dx: ax, dy: ay, confidence: m.confidence });
+        out.push(PlateMotion { dx: ax, dy: ay, confidence: m.confidence, lin: LIN_ID });
+    }
+    out
+}
+
+/// Global motion as a 6-DOF affine per frame, composed to frame 0.
+///
+/// Why: on the bloopers film 88% of correspondences sit within 2 px of
+/// a global AFFINE (SESSION_LOG, recorded as "the absence of parallax"
+/// and shelved). The plate was warping with 2 parameters, so a pan
+/// with any roll or zoom left the median 1-2 px misaligned across the
+/// frame; the ledger then showed 81% of regions abandoning the blurred
+/// plate for prev-MC with a motion vector each — 277 KB of side info
+/// on a 442 KB GOP. The camera is the first object in any world model
+/// of a film shot, and it needs six numbers, not two.
+///
+/// Estimation: phase correlation gives the pair translation; a grid of
+/// textured 16x16 blocks is matched around it (integer search, +-R);
+/// `global_motion::fit` solves the affine with one 3-sigma refit so
+/// the actors (a minority of blocks) drop out as outliers. Pairwise
+/// affines compose to frame 0, as the translations did.
+pub fn estimate_motions_affine(frames: &[Yuv420]) -> Vec<PlateMotion> {
+    use crate::global_motion as gm;
+    let mut out = Vec::with_capacity(frames.len());
+    if frames.is_empty() {
+        return out;
+    }
+    let (w, h) = (frames[0].w, frames[0].h);
+    let pass = PhaseCorrelationPass::new(512.min(w.min(h)));
+    out.push(PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: LIN_ID });
+    let mut acc: gm::Affine = gm::IDENTITY;
+    const B: usize = 16;
+    const STEP: usize = 48;
+    const R: i32 = 6;
+    for i in 1..frames.len() {
+        let (prev, cur) = (&frames[i - 1], &frames[i]);
+        let pc = pass.estimate(&cur.y, &prev.y, w, h);
+        // Sign: estimate_motions accumulates pc.dx as "content moved by
+        // +dx", so a frame-(i-1) point p appears at p + (dx, dy) in i.
+        let (tdx, tdy) = if pc.confidence > 0.15 { (pc.dx, pc.dy) } else { (0.0, 0.0) };
+        let mut pairs: Vec<(f32, f32, f32, f32)> = Vec::new();
+        let mut by = STEP / 2;
+        while by + B < h {
+            let mut bx = STEP / 2;
+            while bx + B < w {
+                // texture gate: skip flat blocks, they match anywhere
+                let mut mean = 0u32;
+                for y in 0..B {
+                    for x in 0..B {
+                        mean += prev.y[(by + y) * w + bx + x] as u32;
+                    }
+                }
+                let mean = mean / (B * B) as u32;
+                let mut var = 0u64;
+                for y in 0..B {
+                    for x in 0..B {
+                        let d = prev.y[(by + y) * w + bx + x] as i64 - mean as i64;
+                        var += (d * d) as u64;
+                    }
+                }
+                if var / (B * B) as u64 >= 64 {
+                    let (cx, cy) = (bx as f32 + tdx, by as f32 + tdy);
+                    let (cxi, cyi) = (cx.round() as i32, cy.round() as i32);
+                    let mut best = (u32::MAX, 0i32, 0i32);
+                    for oy in -R..=R {
+                        for ox in -R..=R {
+                            let (sx, sy) = (cxi + ox, cyi + oy);
+                            if sx < 0 || sy < 0 || sx as usize + B > w || sy as usize + B > h {
+                                continue;
+                            }
+                            let mut sad = 0u32;
+                            for y in 0..B {
+                                let pr = (by + y) * w + bx;
+                                let cr = (sy as usize + y) * w + sx as usize;
+                                for x in 0..B {
+                                    sad += (prev.y[pr + x] as i32 - cur.y[cr + x] as i32).unsigned_abs();
+                                }
+                            }
+                            if sad < best.0 {
+                                best = (sad, sx, sy);
+                            }
+                        }
+                    }
+                    if best.0 != u32::MAX {
+                        let (px, py) = (bx as f32 + B as f32 / 2.0, by as f32 + B as f32 / 2.0);
+                        pairs.push((px, py, best.1 as f32 + B as f32 / 2.0, best.2 as f32 + B as f32 / 2.0));
+                    }
+                }
+                bx += STEP;
+            }
+            by += STEP;
+        }
+        // Pair affine maps frame-(i-1) points to frame-i points. Fall
+        // back to the translation when the fit is unavailable.
+        let pair = gm::fit(&pairs).unwrap_or([1.0, 0.0, tdx, 0.0, 1.0, tdy]);
+        let pair = if pc.confidence > 0.15 { pair } else { gm::IDENTITY };
+        acc = gm::compose(&pair, &acc);
+        if std::env::var("FAO_AFFINE_DEBUG").is_ok() {
+            eprintln!(
+                "affine f{i}: pairs {} pc ({:.2},{:.2}) pair [{:.4} {:.4} {:.2} | {:.4} {:.4} {:.2}] rms {:.2}",
+                pairs.len(), tdx, tdy, pair[0], pair[1], pair[2], pair[3], pair[4], pair[5],
+                gm::rms(&pairs, &pair)
+            );
+        }
+        out.push(PlateMotion {
+            dx: acc[2],
+            dy: acc[5],
+            confidence: pc.confidence,
+            lin: [acc[0], acc[1], acc[3], acc[4]],
+        });
     }
     out
 }
@@ -110,11 +240,23 @@ pub fn build_plate(frames: &[Yuv420], motions: &[PlateMotion]) -> Plate {
     // Plate bounds in frame-0 coords: frame f occupies [-dx, -dx+fw) —
     // a camera pan of +dx moves CONTENT by -dx in frame-0 space.
     let (mut minx, mut miny, mut maxx, mut maxy) = (0.0f32, 0.0f32, fw as f32, fh as f32);
+    let any_affine = motions.iter().any(|m| !m.is_translation());
     for m in motions {
-        minx = minx.min(-m.dx);
-        miny = miny.min(-m.dy);
-        maxx = maxx.max(-m.dx + fw as f32);
-        maxy = maxy.max(-m.dy + fh as f32);
+        if m.is_translation() {
+            minx = minx.min(-m.dx);
+            miny = miny.min(-m.dy);
+            maxx = maxx.max(-m.dx + fw as f32);
+            maxy = maxy.max(-m.dy + fh as f32);
+        } else if let Some(inv) = crate::global_motion::invert(&m.affine()) {
+            // frame-i corners back into frame-0 coordinates
+            for (cx, cy) in [(0.0, 0.0), (fw as f32, 0.0), (0.0, fh as f32), (fw as f32, fh as f32)] {
+                let (x0, y0) = crate::global_motion::apply(&inv, cx, cy);
+                minx = minx.min(x0);
+                miny = miny.min(y0);
+                maxx = maxx.max(x0);
+                maxy = maxy.max(y0);
+            }
+        }
     }
     let pw = (maxx - minx).ceil() as usize;
     let ph = (maxy - miny).ceil() as usize;
@@ -135,8 +277,18 @@ pub fn build_plate(frames: &[Yuv420], motions: &[PlateMotion]) -> Plate {
                 samples.clear();
                 for (f, m) in frames.iter().zip(motions) {
                     // plate pixel (px,py) in frame f's coords:
-                    let fx = px as f32 + minx / sub as f32 + m.dx / sub as f32;
-                    let fy = py as f32 + miny / sub as f32 + m.dy / sub as f32;
+                    let (fx, fy) = if !any_affine {
+                        (
+                            px as f32 + minx / sub as f32 + m.dx / sub as f32,
+                            py as f32 + miny / sub as f32 + m.dy / sub as f32,
+                        )
+                    } else {
+                        // full-res frame-0 coordinate of this plate sample
+                        let x0 = (px * sub) as f32 + minx;
+                        let y0 = (py * sub) as f32 + miny;
+                        let (x, y) = crate::global_motion::apply(&m.affine(), x0, y0);
+                        (x / sub as f32, y / sub as f32)
+                    };
                     let (fx, fy) = (fx.round() as isize, fy.round() as isize);
                     if fx >= 0 && fy >= 0 && (fx as usize) < fw && (fy as usize) < fh {
                         samples.push(get(f)[fy as usize * fw + fx as usize]);
@@ -182,6 +334,28 @@ pub fn predict_frame(plate: &Plate, m: &PlateMotion, fw: usize, fh: usize) -> Yu
     // frame pixel (fx,fy) shows content at frame-0 coordinate
     // (fx - m.dx, fy - m.dy); that content lives at plate coordinate
     // (fx - m.dx - ox, fy - m.dy - oy).
+    if !m.is_translation() {
+        if let Some(inv) = crate::global_motion::invert(&m.affine()) {
+            for fy in 0..fh {
+                for fx in 0..fw {
+                    let (x0, y0) = crate::global_motion::apply(&inv, fx as f32, fy as f32);
+                    out.y[fy * fw + fx] =
+                        bilinear(&plate.y, plate.w, plate.h, x0 - plate.ox, y0 - plate.oy);
+                }
+            }
+            let (cw, ch) = (fw / 2, fh / 2);
+            for fy in 0..ch {
+                for fx in 0..cw {
+                    let (x0, y0) =
+                        crate::global_motion::apply(&inv, (fx * 2) as f32, (fy * 2) as f32);
+                    let (px, py) = (x0 / 2.0 - plate.ox / 2.0, y0 / 2.0 - plate.oy / 2.0);
+                    out.u[fy * cw + fx] = bilinear(&plate.u, plate.w / 2, plate.h / 2, px, py);
+                    out.v[fy * cw + fx] = bilinear(&plate.v, plate.w / 2, plate.h / 2, px, py);
+                }
+            }
+            return out;
+        }
+    }
     for fy in 0..fh {
         for fx in 0..fw {
             let px = fx as f32 - m.dx - plate.ox;
@@ -326,7 +500,7 @@ mod tests {
             }
             frames.push(f);
         }
-        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 }; frames.len()];
+        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: LIN_ID }; frames.len()];
         let plate = build_plate(&frames, &motions);
         // Plate background is the checkerboard, mover fully rejected.
         for y in 20..32 {
@@ -378,7 +552,7 @@ mod tests {
             // predict convention is "fx shows frame-0 coord fx - m.dx",
             // hence m.dx = -6t. (Content moving left in the viewport =
             // negative dx; the camera's own rightward pan is the negation.)
-            motions.push(PlateMotion { dx: -((t * 6) as f32), dy: 0.0, confidence: 1.0 });
+            motions.push(PlateMotion { dx: -((t * 6) as f32), dy: 0.0, confidence: 1.0, lin: LIN_ID });
         }
         let plate = build_plate(&frames, &motions);
         assert!(plate.w >= w + 7 * 6, "plate too narrow: {}", plate.w);
@@ -566,7 +740,7 @@ mod tests_v2 {
             }
             frames.push(f);
         }
-        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 }; frames.len()];
+        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: LIN_ID }; frames.len()];
         let plate = build_plate(&frames, &motions);
         let opts = ResidualOpts { dead_zone: 2.0, ..ResidualOpts::default() };
         let v1 = encode_gop(&frames, &motions, &plate, &opts);
@@ -1244,7 +1418,7 @@ pub fn load_plate(path: &str) -> std::io::Result<Plate> {
 pub fn align_plate_affine(plate: &Plate, frame0: &Yuv420) -> (Plate, crate::global_motion::Affine) {
     use crate::global_motion as gm;
     let (fw, fh) = (frame0.w, frame0.h);
-    let zero = PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 };
+    let zero = PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: LIN_ID };
     let pred0 = predict_frame(plate, &zero, fw, fh);
     // Block correspondences: pred0-view coords -> frame coords.
     let mut pairs: Vec<(f32, f32, f32, f32)> = Vec::new();
@@ -1319,14 +1493,14 @@ pub fn align_plate_affine(plate: &Plate, frame0: &Yuv420) -> (Plate, crate::glob
 pub fn motions_against_plate(frames: &[Yuv420], plate: &Plate) -> Vec<PlateMotion> {
     use crate::phase_correlation::PhaseCorrelationPass;
     let (fw, fh) = (frames[0].w, frames[0].h);
-    let zero = PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 };
+    let zero = PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: LIN_ID };
     let pred0 = predict_frame(plate, &zero, fw, fh);
     let pc = PhaseCorrelationPass::new(512.min(fw.min(fh)));
     let a = pc.estimate(&frames[0].y, &pred0.y, fw, fh);
     let (ax, ay) = if a.confidence > 0.1 { (-a.dx, -a.dy) } else { (0.0, 0.0) };
     estimate_motions(frames)
         .into_iter()
-        .map(|m| PlateMotion { dx: m.dx + ax, dy: m.dy + ay, confidence: m.confidence })
+        .map(|m| PlateMotion { dx: m.dx + ax, dy: m.dy + ay, confidence: m.confidence, lin: LIN_ID })
         .collect()
 }
 
@@ -2920,13 +3094,54 @@ pub fn encode_gop_v3_core(
         let opts = &frame_opts;
         let p444 = interleave_444(&composite);
         let t444 = interleave_444(f);
-        let (residual_bytes, rec) = match residual::encode(&p444, &t444, fw, fh, opts) {
-            Some(trailer) => {
-                let r = residual::apply(p444, &trailer, fw, fh);
-                (trailer.len(), deinterleave_420(&r, fw, fh))
+        let (residual_bytes, rec, cost_map) =
+            match residual::encode_with_map(&p444, &t444, fw, fh, opts) {
+                Some((trailer, map)) => {
+                    let r = residual::apply(p444, &trailer, fw, fh);
+                    (trailer.len(), deinterleave_420(&r, fw, fh), Some(map))
+                }
+                None => (0, composite.clone(), None),
+            };
+        // ── LEDGER (FAO_LEDGER=path): one line per region per frame,
+        // so a frame's bytes can be attributed to WHAT they were spent
+        // on — a moving object, a background surface the plate blurs,
+        // a reveal — rather than only to which coder spent them. The
+        // residual's raw cost map is scaled to the frame's actual
+        // residual bytes; side bytes are split evenly over regions
+        // that carry side info (mode != 0 or a gain).
+        if let Ok(path) = std::env::var("FAO_LEDGER") {
+            use std::io::Write;
+            let mut out = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+            if let (Some(out), Some(map)) = (out.as_mut(), cost_map.as_ref()) {
+                let bw4 = fw / 4;
+                let raw_total: u64 = map.iter().map(|&c| c as u64).sum::<u64>().max(1);
+                for gy in 0..gh {
+                    for gx in 0..gw {
+                        let gi = gy * gw + gx;
+                        let (rx, ry) = (gx * REGION, gy * REGION);
+                        let mut raw = 0u64;
+                        for by in 0..REGION / 4 {
+                            for bx in 0..REGION / 4 {
+                                raw += map[(ry / 4 + by) * bw4 + rx / 4 + bx] as u64;
+                            }
+                        }
+                        let sad_pl = sad_region(&plate_pred.y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry);
+                        let sad_pv = if fi > 0 {
+                            sad_region(&recon[fi - 1].y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry)
+                        } else {
+                            u32::MAX
+                        };
+                        let g = (gain_flags[gi / 8] >> (gi % 8)) & 1;
+                        let _ = writeln!(
+                            out,
+                            "{fi},{gx},{gy},{},{sad_pl},{sad_pv},{g},{:.2}",
+                            modes[gi],
+                            raw as f64 * residual_bytes as f64 / raw_total as f64
+                        );
+                    }
+                }
             }
-            None => (0, composite),
-        };
+        }
         out_frames.push(FrameCost { mode_bytes, residual_bytes });
         {
             let mut row = vec![0u32; gw * gh];
@@ -3837,7 +4052,7 @@ mod tests_v5 {
             }
             frames.push(f);
         }
-        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 }; frames.len()];
+        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: LIN_ID }; frames.len()];
         let plate = build_plate(&frames, &motions);
         let opts = ResidualOpts { dead_zone: 8.0, ..ResidualOpts::default() };
         let (movers, track_bytes) = build_movers(&frames, &motions, &plate, &opts, 12);
@@ -3929,7 +4144,7 @@ mod tests_v3 {
             }
             frames.push(f);
         }
-        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 }; frames.len()];
+        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: LIN_ID }; frames.len()];
         let plate = build_plate(&frames, &motions);
         let opts = ResidualOpts { dead_zone: 2.0, ..ResidualOpts::default() };
         let v2 = encode_gop_v2(&frames, &motions, &plate, &opts);
@@ -4775,7 +4990,7 @@ mod tests_sr {
                 *p = 128;
             }
             frames.push(f);
-            motions.push(PlateMotion { dx, dy, confidence: 1.0 });
+            motions.push(PlateMotion { dx, dy, confidence: 1.0, lin: LIN_ID });
         }
         let sp = build_plate_sr(&frames, &motions, s);
         let base_err = |pred: &Yuv420, f: &Yuv420| -> f64 {
