@@ -83,6 +83,10 @@ pub mod text_field;
 // were re-implemented per app; dialog_width had three copies and tomescope
 // had none (it hard-coded a 400pt minimum and overflowed).
 pub mod dialog;
+// Material model for the physical UI: specular sheen, gilt corner brackets and
+// weight-based motion durations. Geometry and maths only — painting stays with
+// the caller.
+pub mod lux;
 pub mod fmt;
 pub mod glove;
 pub mod upscale;

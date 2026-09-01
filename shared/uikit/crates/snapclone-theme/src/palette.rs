@@ -25,6 +25,12 @@ pub enum PaletteId {
     Voice,
     Amber,
     Arena,
+    /// Pale warm limestone — the one light palette in the mansion set.
+    Travertine,
+    /// Dark green-black marble with brass hardware.
+    Obsidian,
+    /// Indigo status board with a cyan-teal active state.
+    Lattice,
 }
 
 impl PaletteId {
@@ -44,6 +50,9 @@ impl PaletteId {
             Self::Voice      => "voice",
             Self::Amber      => "amber",
             Self::Arena      => "arena",
+            Self::Travertine => "travertine",
+            Self::Obsidian   => "obsidian",
+            Self::Lattice    => "lattice",
         }
     }
     pub fn display_name(self) -> &'static str {
@@ -62,6 +71,9 @@ impl PaletteId {
             Self::Voice      => "Voice",
             Self::Amber      => "Amber",
             Self::Arena      => "Arena",
+            Self::Travertine => "Travertine",
+            Self::Obsidian   => "Obsidian",
+            Self::Lattice    => "Lattice",
         }
     }
     pub fn from_str(s: &str) -> Self {
@@ -79,12 +91,16 @@ impl PaletteId {
             "voice"       => Self::Voice,
             "amber"       => Self::Amber,
             "arena"       => Self::Arena,
+            "travertine"  => Self::Travertine,
+            "obsidian"    => Self::Obsidian,
+            "lattice"     => Self::Lattice,
             _             => Self::Dark,
         }
     }
     pub fn all() -> &'static [Self] {
         &[Self::Dark, Self::PitchBlack, Self::Paper, Self::Neon, Self::Minimal, Self::Modern,
-          Self::Earth, Self::Pastels, Self::Metallic, Self::Night, Self::System, Self::Voice, Self::Amber, Self::Arena]
+          Self::Earth, Self::Pastels, Self::Metallic, Self::Night, Self::System, Self::Voice, Self::Amber, Self::Arena,
+          Self::Travertine, Self::Obsidian, Self::Lattice]
     }
 }
 
@@ -520,3 +536,116 @@ pub const METALLIC: Palette = Palette {
     glow_online:   "#55AA88",
 };
 
+
+// ── the mansion set ──────────────────────────────────────────────────────────
+//
+// Three palettes for the physical-UI surfaces, built to the brief: interactive
+// stone in a chic mansion, expensive rather than merely dark.
+//
+// What makes a palette read as cheap, from looking at the ones here that do:
+// pure black backgrounds (#000000 has no material — real stone in a lit room
+// never reaches it), greys with no hue (a neutral #3a3a3a beside a warm accent
+// reads as unfinished plastic), and a single accent doing every job so nothing
+// has a hierarchy. Each of these three keeps a consistent hue through the whole
+// background ramp, so the surfaces look like ONE material lit unevenly rather
+// than several materials that happen to be similar values.
+//
+// Amber is the reference point — it already does the warm ramp
+// (#1a1a1a → #33291a → #4a3f28) and that is why it reads better than its
+// neighbours. These extend the idea rather than departing from it.
+
+/// Travertine under low warm light: the Observatory reference's material.
+/// Pale, dusty, gold-veined. The one LIGHT palette in the set, because a
+/// mansion at midday is not a dark room and the physical UI should be able to
+/// look like limestone rather than only like basalt.
+pub const TRAVERTINE: Palette = Palette {
+    id: PaletteId::Travertine, name: "Travertine",
+    // A warm off-white ramp. Nothing here is neutral: every step carries the
+    // same faint ochre, which is what stops it reading as "grey with a filter".
+    bg_deep:   "#d9d0c2",
+    bg_base:   "#e6ded1",
+    bg_card:   "#efe8dc",
+    bg_raised: "#f6f1e8",
+    bg_hover:  "#e3d9c8",
+    bg_scrim:  "rgba(58,50,38,0.38)",
+    text_primary:   "#3a3226",
+    text_secondary: "#6b6152",
+    text_disabled:  "#a89e8d",
+    text_inverse:   "#f6f1e8",
+    // Old gold, not yellow. Desaturated enough to sit on pale stone without
+    // vibrating against it.
+    accent:      "#9a7b3f",
+    accent_soft: "#c4ab74",
+    accent_dim:  "#cfc4ae",
+    danger:  "#9c4f3f",
+    success: "#5d7a52",
+    warning: "#b08a44",
+    border:       "#cabfa9",
+    border_focus: "#9a7b3f",
+    gradient_hero: ["#f6f1e8", "#d9d0c2"],
+    gradient_bar:  ["#e6ded1", "#cfc4ae"],
+    glow_online:   "#5d7a52",
+};
+
+/// Polished dark marble with brass. The night counterpart to Travertine and the
+/// closest to the "interactive stone" brief: deep green-black with a cool
+/// undertone, lifted by brass rather than gold so the accent reads as hardware
+/// (a handle, an inlay) instead of decoration.
+pub const OBSIDIAN: Palette = Palette {
+    id: PaletteId::Obsidian, name: "Obsidian",
+    // Note the floor is #0d100f, NOT #000000. Stone in a lit room has a
+    // minimum luminance; black holes in a panel are what make dark themes look
+    // like a terminal rather than a surface.
+    bg_deep:   "#0d100f",
+    bg_base:   "#141917",
+    bg_card:   "#1c2321",
+    bg_raised: "#242c29",
+    bg_hover:  "#2d3733",
+    bg_scrim:  "rgba(13,16,15,0.74)",
+    text_primary:   "#e4e6e0",
+    text_secondary: "#a3a89f",
+    text_disabled:  "#5e645c",
+    text_inverse:   "#0d100f",
+    accent:      "#b08d57",
+    accent_soft: "#d8c49a",
+    accent_dim:  "#3b342a",
+    danger:  "#a05548",
+    success: "#5f8a68",
+    warning: "#c0994e",
+    border:       "#2d3733",
+    border_focus: "#b08d57",
+    gradient_hero: ["#1c2321", "#0d100f"],
+    gradient_bar:  ["#141917", "#0d100f"],
+    glow_online:   "#5f8a68",
+};
+
+/// Distributed-compute status board: the Folding@home lineage the operator
+/// named. Deep indigo ground with a saturated cyan-teal active state, kept
+/// legible because the ramp stays blue rather than drifting to grey. Its job
+/// is many small status cells that must be distinguishable at a glance, so
+/// success/warning/danger are pushed further apart here than in the two stone
+/// palettes above.
+pub const LATTICE: Palette = Palette {
+    id: PaletteId::Lattice, name: "Lattice",
+    bg_deep:   "#0a0f1a",
+    bg_base:   "#101828",
+    bg_card:   "#16203a",
+    bg_raised: "#1d2a49",
+    bg_hover:  "#26365c",
+    bg_scrim:  "rgba(10,15,26,0.76)",
+    text_primary:   "#dde6f5",
+    text_secondary: "#93a4c4",
+    text_disabled:  "#55648a",
+    text_inverse:   "#0a0f1a",
+    accent:      "#3fb8c4",
+    accent_soft: "#8fdce4",
+    accent_dim:  "#1b3b47",
+    danger:  "#c25b6a",
+    success: "#4fb07a",
+    warning: "#d9a441",
+    border:       "#26365c",
+    border_focus: "#3fb8c4",
+    gradient_hero: ["#16203a", "#0a0f1a"],
+    gradient_bar:  ["#101828", "#0a0f1a"],
+    glow_online:   "#4fb07a",
+};

@@ -34,7 +34,7 @@ pub mod tokens;
 pub use palette::{Palette, PaletteId};
 pub use tokens::Spacing;
 
-pub use palette::{DARK, PITCH_BLACK, PAPER, NEON, MINIMAL, MODERN, EARTH, PASTELS, METALLIC, NIGHT, SYSTEM, VOICE, AMBER, ARENA};
+pub use palette::{DARK, PITCH_BLACK, PAPER, NEON, MINIMAL, MODERN, EARTH, PASTELS, METALLIC, NIGHT, SYSTEM, VOICE, AMBER, ARENA, TRAVERTINE, OBSIDIAN, LATTICE};
 
 /// Parse one of this crate's `#RRGGBB` (or `#RRGGBBAA`) color strings to raw bytes.
 ///
@@ -97,6 +97,9 @@ pub fn palette_for(id: PaletteId) -> &'static Palette {
         PaletteId::Voice      => &VOICE,
         PaletteId::Amber      => &AMBER,
         PaletteId::Arena      => &ARENA,
+        PaletteId::Travertine => &TRAVERTINE,
+        PaletteId::Obsidian   => &OBSIDIAN,
+        PaletteId::Lattice    => &LATTICE,
     }
 }
 
@@ -170,7 +173,7 @@ mod tests {
         // all() must contain each variant exactly once. If a new palette is
         // added to the enum but not to all(), the selector won't offer it.
         let ids = PaletteId::all();
-        assert_eq!(ids.len(), 14, "expected 14 palettes in all()");
+        assert_eq!(ids.len(), 17, "expected 17 palettes in all()");
         for &id in ids {
             let count = ids.iter().filter(|&&x| x == id).count();
             assert_eq!(count, 1, "{id:?} appears {count} times in all()");
