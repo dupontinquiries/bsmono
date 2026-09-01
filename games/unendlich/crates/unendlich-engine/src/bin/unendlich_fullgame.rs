@@ -2853,6 +2853,17 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // that's visible in practice, the fix is sequencing (e.g. only let
     // frame_pacer degrade once adaptive_rd is already at its floor), not
     // disabling either system.
+    //
+    // Confirmed happening, not just theoretical: in the 2026-09-01
+    // xvfb+lavapipe soak, `[adaptive_rd] frame 4910ms -> render-distance cap 4`
+    // and `[frame_pacer] shadow_stride 1 -> 5` / `lod_fidelity 1.00 -> 0.60`
+    // all logged in the same second (03:47:17) on the same bad frame. Both
+    // then held at their clamps for the rest of the run without oscillating
+    // — lavapipe never recovered below the grow threshold (it's uniformly
+    // slow throughout, not spiky), so this soak confirms the simultaneous
+    // trigger happens and doesn't misbehave once pinned, but says nothing
+    // about whether independent RECOVERY (both climbing back up after a
+    // transient spike, on real variable frame times) is well-behaved.
 
     // `sim::submit_schedule` is the OTHER dead-but-tested module (see the
     // frame_pacer comment above for how that happened). Its real inputs
