@@ -8354,12 +8354,7 @@ if let Some(msg) = self.error_banner.clone() {
                             // doing and how long has it been" needs a fixed place to be answered.
                             // Rows rather than a sentence: see `runcard`.
                             if let Some(card) = self.agent_run.as_ref().map(|r| r.run_state()) {
-                                egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8),
-                                    inner_margin: egui::Margin::same(theme::PAD_SM),
-                                    outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() },
-                                    stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
-                                .show(ui, |ui| {
-                                    ui.label(RichText::new("ACTIVE THREAD").color(theme::DIM()).small().strong());
+                                theme::panel(ui, theme::CYAN(), "Active thread", None, |ui| {
                                     for (label, value) in crate::runcard::rows(&card) {
                                         ui.horizontal(|ui| {
                                             ui.label(RichText::new(label).color(theme::FAINT()).small());
@@ -8382,12 +8377,7 @@ if let Some(msg) = self.error_banner.clone() {
                                     .map(|b| (b.label, b.doing, b.files, b.verified, b.approved))
                                     .collect()).unwrap_or_default();
                             if !fan_rows.is_empty() {
-                                egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8),
-                                    inner_margin: egui::Margin::same(theme::PAD_SM),
-                                    outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() },
-                                    stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
-                                .show(ui, |ui| {
-                                    ui.label(RichText::new("ACTIVITY").color(theme::DIM()).small().strong());
+                                theme::panel(ui, theme::AMBER(), "Activity", None, |ui| {
                                     for (label, doing, detail) in crate::runcard::branch_rows(&fan_rows) {
                                         ui.horizontal(|ui| {
                                             // The branch holding the single worker is the one thing
