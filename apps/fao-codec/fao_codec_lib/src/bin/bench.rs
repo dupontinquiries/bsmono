@@ -97,9 +97,25 @@ struct Row {
     frames: usize,
     bytes: usize,
     msssim: f64,
+    /// Chroma PSNR, U and V. Reported because the luma-only figure
+    /// hid a 12 dB chroma deficit against AV1 (SESSION_LOG 2026-09-01).
+    psnr_u: f64,
+    psnr_v: f64,
     p16_src: f32,
     p16_out: f32,
     secs: f32,
+}
+
+fn plane_psnr(recon: &[plate::Yuv420], src: &[plate::Yuv420], get: impl Fn(&plate::Yuv420) -> &Vec<u8>) -> f64 {
+    let (mut se, mut n) = (0.0f64, 0u64);
+    for (r, s) in recon.iter().zip(src) {
+        for (&a, &b) in get(r).iter().zip(get(s)) {
+            let d = a as f64 - b as f64;
+            se += d * d;
+            n += 1;
+        }
+    }
+    if se == 0.0 { 99.0 } else { 10.0 * (255.0f64 * 255.0 * n as f64 / se).log10() }
 }
 
 fn run(clip: &str, config: &str, dz: f32) -> Row {
@@ -119,6 +135,8 @@ fn run(clip: &str, config: &str, dz: f32) -> Row {
         frames: frames.len(),
         bytes,
         msssim: fao_codec::msssim::recon_score(&rep.recon, &frames),
+        psnr_u: plane_psnr(&rep.recon, &frames, |f| &f.u),
+        psnr_v: plane_psnr(&rep.recon, &frames, |f| &f.v),
         // The SOURCE's own grid figure is reported alongside the
         // output's, because "less blocky" is only meaningful against
         // what the content already had — deblock strength 4 was
@@ -173,13 +191,13 @@ fn main() {
     }
 
     println!(
-        "{:<20} {:<6} {:>4} {:>10} {:>9} {:>9} {:>9} {:>7}",
-        "clip", "cfg", "n", "bytes", "MS-SSIM", "P16 src", "P16 out", "sec"
+        "{:<20} {:<6} {:>4} {:>10} {:>9} {:>6} {:>6} {:>8} {:>8} {:>7}",
+        "clip", "cfg", "n", "bytes", "MS-SSIM", "U dB", "V dB", "P16 src", "P16 out", "sec"
     );
     for r in &rows {
         println!(
-            "{:<20} {:<6} {:>4} {:>10} {:>9.5} {:>9.3} {:>9.3} {:>7.1}",
-            r.clip, r.config, r.frames, r.bytes, r.msssim, r.p16_src, r.p16_out, r.secs
+            "{:<20} {:<6} {:>4} {:>10} {:>9.5} {:>6.2} {:>6.2} {:>8.3} {:>8.3} {:>7.1}",
+            r.clip, r.config, r.frames, r.bytes, r.msssim, r.psnr_u, r.psnr_v, r.p16_src, r.p16_out, r.secs
         );
     }
     // A single figure of merit, in BYTES, on the same axis every
@@ -196,11 +214,11 @@ fn main() {
 
     if let Some(path) = csv {
         let mut out =
-            String::from("clip,config,frames,bytes,msssim,p16_src,p16_out,seconds\n");
+            String::from("clip,config,frames,bytes,msssim,psnr_u,psnr_v,p16_src,p16_out,seconds\n");
         for r in &rows {
             out.push_str(&format!(
-                "{},{},{},{},{:.5},{:.3},{:.3},{:.1}\n",
-                r.clip, r.config, r.frames, r.bytes, r.msssim, r.p16_src, r.p16_out, r.secs
+                "{},{},{},{},{:.5},{:.2},{:.2},{:.3},{:.3},{:.1}\n",
+                r.clip, r.config, r.frames, r.bytes, r.msssim, r.psnr_u, r.psnr_v, r.p16_src, r.p16_out, r.secs
             ));
         }
         std::fs::write(&path, out).unwrap_or_else(|e| panic!("write {path}: {e}"));
