@@ -309,6 +309,38 @@ fn plane_as_f32(buf: &AudioBufferRef, ch: usize, frames: usize) -> Vec<f32> {
 }
 
 #[cfg(test)]
+/// Can this machine run the ffmpeg-backed checks, with the encoders they need?
+///
+/// The comment on `ffmpeg_agrees_our_files_are_opus_of_the_right_length`
+/// used to say "ffprobe is already a hard requirement of studio-video's
+/// tests". That was true and is now false: studio-video skips cleanly when
+/// ffmpeg cannot encode what its fixture needs, and these two tests were
+/// the remaining places that assume presence. Both `expect()` on the
+/// spawn, so on a box with a stripped ffmpeg they fail rather than skip —
+/// the same shape that made the fleet report studio-video "bugs".
+///
+/// `want` is checked against `-encoders`, since a build can know OF a codec
+/// it cannot encode with, and encoding is what these tests do.
+pub(crate) fn ffmpeg_can(want: &[&str]) -> bool {
+    use std::process::Command;
+    let ok = |c: &str| Command::new(c).arg("-version").output()
+        .map(|o| o.status.success()).unwrap_or(false);
+    if !ok("ffmpeg") || !ok("ffprobe") { return false; }
+    let Ok(o) = Command::new("ffmpeg").arg("-hide_banner").arg("-encoders").output() else {
+        return false;
+    };
+    if !o.status.success() { return false; }
+    let enc = String::from_utf8_lossy(&o.stdout).into_owned();
+    for w in want {
+        if !enc.lines().any(|l| l.split_whitespace().nth(1) == Some(*w)) {
+            eprintln!("studio-media: ffmpeg cannot encode {w} — skipping this test");
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
@@ -545,8 +577,12 @@ mod opus_tests {
         assert_eq!(by_path.channels, by_bytes.channels, "one decoder, one answer");
     }
 
+
     #[test]
     fn a_vorbis_ogg_is_not_mistaken_for_opus() {
+        // libvorbis is optional in many builds, so this needs the guard even
+        // where ffmpeg itself is present.
+        if !ffmpeg_can(&["libvorbis"]) { return; }
         // Same container, different codec: the sniff must let Symphonia keep
         // the .ogg files it already handles.
         let out = std::env::temp_dir().join("studio-media-vorbis.ogg");
@@ -617,6 +653,8 @@ mod encode_tests {
 
     #[test]
     fn ffmpeg_agrees_our_files_are_opus_of_the_right_length() {
+        // Only ffprobe is used here, but the same presence question applies.
+        if !ffmpeg_can(&[]) { return; }
         // Roundtripping through our own decoder proves self-consistency; a
         // third-party reader proves the files leave the building. ffprobe
         // is already a hard requirement of studio-video's tests.
