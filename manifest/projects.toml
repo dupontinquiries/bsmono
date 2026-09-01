@@ -479,7 +479,21 @@ flatpak = false
 runtime = "none"
 targets = ["desktop"]
 bin = "studio"            # crates/studio-app produces the runnable binary
+primary = true            # egui-first; no Qt/GTK sibling exists, so nothing should
+                          # ever be offered as "the other build" of studio
 notes = "video NLE + audio editor sharing one Rust core, informed by kdenlive and Audacity rather than transliterated from them. Every edit is a serializable invertible Op, which makes undo, macros and REALTIME COLLABORATION one mechanism — see apps/studio/README.md. studio-core (model/undo) and studio-collab (convergent op log + presence) are tested; media I/O, the render graph and the egui frontend are the named next steps."
+
+[apps.cadscope]
+path = "apps/cadscope"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"          # pure egui/wgpu (wayland/x11), same convention as the other egui apps
+targets = ["desktop", "phone"]
+bin = "cadscope-egui"     # crates/cadscope-egui is the shell; logic lives in the cad-* crates
+primary = true            # egui-first from birth; no Qt/GTK surface exists to archive
+notes = "parametric CAD: forge Doc -> kernel Model -> cad-view draws the viewport through one egui_wgpu::Callback (skydribble-parity pass, Depth32Float). Was MISSING from this manifest entirely, so gitmind's app catalogue could not see or build it; added 2026-09-01 along with the wgpu device-limit clamp that fixes startup on phone GPUs (max_color_attachments 8 > 5)."
 
 [apps.settings-egui]
 path = "apps/settings/egui-frontend"
