@@ -24,6 +24,16 @@ That was true and is less true. What changed:
 What has NOT changed: the mission itself is `MissionRun::resolve`, a
 simulation. That is the boundary and it is now the only one.
 
+**c14 update (see `docs/VEHICLE_COMBAT.md`):** the wave now STANDS IN THE
+WORLD during a flown sortie — `field.rs` puts one agent per fighter on the
+map as a bot you can see, aim at, be shot by, be rammed by, tow, and throw;
+the player's body dying concedes the sortie. The fight is still the
+authority on HP; the field owns geometry and form. So of the four things
+the next bullet says do not exist, two now do: an enemy, and a way to
+fail. The loaded world is still skydribble's, and the objective is still a
+meter. `--grandeur` measures the scale question: engagement and reach sit
+at ~9x the reference in body-heights.
+
 ## 1. The renderer boundary — the whole remaining list
 
 Everything underneath is built and tested. What is missing is that almost none
@@ -31,7 +41,8 @@ of it is something you *do* rather than something that *resolves*.
 
 - [ ] **The mission is a simulation.** `MissionRun::resolve` decides a sortie
       in one call. Playing one means a loaded world, an objective, an enemy
-      and a way to fail — none of which exists as gameplay.
+      and a way to fail — the last two exist now (`field.rs`); the first two
+      do not.
 - [ ] **The drop is a number.** `drop.rs` flies a real descent and reports a
       miss distance. Nobody flies it.
 - [ ] **`foothold::assess`** decides where you can put down and what it costs,
