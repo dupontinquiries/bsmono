@@ -22,6 +22,11 @@ fn merge(shortlist: &mut Vec<Contact>, found: Vec<Contact>, me: &NodeId, rt: &mu
             continue;
         }
         rt.saw(nc.id, nc.addr, now);
+        // One address is one node, here as in the routing table: a reply
+        // names the responder under its REAL id, and the shortlist entry
+        // we reached it through carried a guessed one. Keeping both would
+        // store to the same socket twice and count it as two peers.
+        shortlist.retain(|s| s.addr != nc.addr || s.id == nc.id);
         if !shortlist.iter().any(|s| s.id == nc.id) {
             shortlist.push(nc);
         }

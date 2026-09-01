@@ -31,16 +31,26 @@
 //! woke up will have its answer arrive during the NEXT query, and accepting
 //! it would attribute one peer's node list to a different target.
 //!
-//! ## We are a client node, and we say so
+//! ## Two modes: a client that only asks, or a node that also answers
 //!
-//! Nothing reads this socket except a round trip that is waiting for its
-//! own answer, so an unsolicited query from another node is never seen, let
-//! alone answered. The reference has a flag for exactly that situation —
-//! `s: true` on every query — and a node that sees it answers us without
-//! adding us to its routing table, which is right: a peer that never answers
-//! is dead weight in anyone's table, and a phone behind carrier NAT cannot
-//! be reached unsolicited anyway. Turn it off with [`set_client`] for a
-//! node that is actually served by a responder.
+//! Unserved (the default), nothing reads this socket except a round trip
+//! waiting for its own answer, so an unsolicited query from another node
+//! is never seen. The reference has a flag for exactly that — `s: true` on
+//! every query — and a node that sees it answers us without adding us to
+//! its routing table, which is right: a peer that never answers is dead
+//! weight in anyone's table.
+//!
+//! But two devices that only ask can never find each other: A's `find` to
+//! B goes unanswered, and both depend on a third party that does answer.
+//! That third party has so far been `bootstrap.jami.net`. [`serve`] is
+//! the other mode: one thread owns the socket's read side, answers queries
+//! through a [`crate::wire::Responder`], and hands replies to whichever
+//! round trip is waiting for them. Served, this socket is a node in its
+//! own right — two of them on a LAN need nobody else — and `s` is off.
+//!
+//! The serving thread blocks in `recv_from` with no timeout. An idle node
+//! costs nothing; there is no poll interval to tune against a battery.
+//! [`stop_serving`] wakes it with a datagram to itself.
 //!
 //! ## The write token, and where it had to live
 //!
@@ -75,15 +85,16 @@
 //! coarser of the two mechanisms and the one that works without an inbound
 //! path.
 
-use crate::node::{FindValue, Transport};
+use crate::guard::RateLimiter;
+use crate::node::{FindValue, Node, Transport};
 use crate::routing::{Contact, NodeId};
 use crate::store::Key;
-use crate::wire::{content_id, from_ip, from_wire_addr, to_hash};
+use crate::wire::{content_id, from_ip, from_wire_addr, to_hash, Responder};
 use dht_kit::{Msg, Query, Value, WANT4, WANT6};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 /// How long to wait for one reply. Matches `udp`'s reasoning: a lookup makes
@@ -109,10 +120,22 @@ pub const MAX_TOKENS: usize = 256;
 /// map must not grow with the lie.
 pub const MAX_REPORTED: usize = 32;
 
+/// A round trip waiting for its answer, when a serving thread is the one
+/// reading the socket.
+struct Pending {
+    addr: SocketAddr,
+    tx: mpsc::Sender<Msg>,
+}
+
 pub struct WireUdpTransport {
     sock: UdpSocket,
     me: NodeId,
     client: AtomicBool,
+    /// Whether a serving thread owns the read side. When it does, round
+    /// trips wait on `pending` instead of reading the socket themselves.
+    served: AtomicBool,
+    stop: AtomicBool,
+    pending: Mutex<HashMap<u32, Pending>>,
     /// Write tokens by peer ADDRESS — see the module note on why not by id.
     tokens: Mutex<HashMap<SocketAddr, (Vec<u8>, Instant)>>,
     /// Votes for our own public ip, from `sa`.
@@ -131,6 +154,9 @@ impl WireUdpTransport {
         Ok(WireUdpTransport {
             sock, me,
             client: AtomicBool::new(true),
+            served: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            pending: Mutex::new(HashMap::new()),
             tokens: Mutex::new(HashMap::new()),
             reported: Mutex::new(HashMap::new()),
             tid: AtomicU32::new(1),
@@ -175,6 +201,20 @@ impl WireUdpTransport {
     /// match. All the same to the caller because the caller's response is
     /// the same: count it against that contact and move on.
     fn round_trip(&self, to: &Contact, tid: u32, msg: &Msg) -> Option<Msg> {
+        if self.served.load(Ordering::Acquire) {
+            // The serving thread reads; we wait for it to hand over the
+            // reply. Registered BEFORE sending, or a fast answer could
+            // arrive with nobody expecting it.
+            let (tx, rx) = mpsc::channel();
+            self.pending.lock().ok()?.insert(tid, Pending { addr: to.addr, tx });
+            let sent = self.sock.send_to(&msg.encode(), to.addr).is_ok();
+            let got = if sent { rx.recv_timeout(REPLY_TIMEOUT).ok() } else { None };
+            if let Ok(mut p) = self.pending.lock() { p.remove(&tid); }
+            return match got {
+                Some(Msg::Error { .. }) | None => None,
+                other => other,
+            };
+        }
         self.sock.send_to(&msg.encode(), to.addr).ok()?;
         // KEEP READING UNTIL THE DEADLINE rather than treating the first
         // datagram as the answer. One socket receives replies, unsolicited
@@ -208,9 +248,8 @@ impl WireUdpTransport {
                 // declined — but there is nothing in it for a `Transport`
                 // method to return, so it ends the wait like a timeout.
                 Msg::Error { tid: got, .. } if got == tid => return None,
-                Msg::Reply { tid: got, ref token, sa, .. } if got == tid => {
-                    self.remember_token(from, token);
-                    if let Some(ip) = sa { self.note_reported(from_ip(&ip)); }
+                Msg::Reply { tid: got, .. } if got == tid => {
+                    self.learn_from_reply(from, &reply);
                     return Some(reply);
                 }
                 // Fragments of a value too large for one datagram. Not
@@ -220,6 +259,91 @@ impl WireUdpTransport {
                 // Somebody else's business, or ours from a while ago.
                 _ => continue,
             }
+        }
+    }
+
+    /// What every accepted reply teaches: the peer's token and our address.
+    fn learn_from_reply(&self, from: SocketAddr, reply: &Msg) {
+        if let Msg::Reply { token, sa, .. } = reply {
+            self.remember_token(from, token);
+            if let Some(ip) = sa { self.note_reported(from_ip(ip)); }
+        }
+    }
+
+    /// The serving thread's half of a round trip: hand an inbound reply or
+    /// error to the round trip waiting for it. `true` if one was.
+    fn deliver(&self, from: SocketAddr, msg: Msg) -> bool {
+        let tid = match &msg {
+            Msg::Reply { tid, .. } | Msg::Error { tid, .. } => *tid,
+            _ => return false,
+        };
+        let Ok(mut p) = self.pending.lock() else { return false };
+        // Same rule as the unserved path: the answer must come from the
+        // address we asked, or a bystander steers the lookup.
+        let Some(w) = p.get(&tid) else { return false };
+        if w.addr != from { return false; }
+        let w = p.remove(&tid).unwrap();
+        drop(p);
+        self.learn_from_reply(from, &msg);
+        w.tx.send(msg).is_ok()
+    }
+
+    /// Become a node: answer queries, and route replies to round trips.
+    ///
+    /// The thread holds only a `Weak` to this transport, so dropping the
+    /// last `Arc` ends it at the next datagram; [`stop_serving`] sends that
+    /// datagram. `node` is locked once per inbound query, briefly — a
+    /// caller running a lookup should work on a snapshot of the routing
+    /// table rather than hold this lock across round trips.
+    pub fn serve(self: &Arc<Self>, node: Arc<Mutex<Node>>) -> std::io::Result<std::thread::JoinHandle<()>> {
+        let sock = self.sock.try_clone()?;
+        // No timeout: blocked in the kernel until a packet, costing nothing.
+        // (SO_RCVTIMEO is per socket, shared by the clone; the unserved read
+        // loop is never used once `served` is set, so nothing else minds.)
+        sock.set_read_timeout(None)?;
+        self.served.store(true, Ordering::Release);
+        self.client.store(false, Ordering::Relaxed);
+        let weak: Weak<Self> = Arc::downgrade(self);
+        let seed = u64::from_le_bytes(self.me.0[..8].try_into().unwrap());
+        Ok(std::thread::spawn(move || {
+            let mut responder = Responder::new(seed, now_ms());
+            let mut limiter = RateLimiter::default();
+            let mut buf = [0u8; MAX_DATAGRAM];
+            loop {
+                let Ok((n, from)) = sock.recv_from(&mut buf) else { return };
+                let Some(me) = weak.upgrade() else { return };
+                if me.stop.load(Ordering::Acquire) { return; }
+                let Some(msg) = Msg::decode(&buf[..n]) else { continue };
+                match msg {
+                    Msg::Query { .. } => {
+                        let ms = now_ms();
+                        if !limiter.allow(&from, ms) { continue; }
+                        limiter.gc(ms);
+                        let reply = {
+                            let Ok(mut node) = node.lock() else { return };
+                            responder.handle(&mut node, from, &msg, ms / 1000)
+                        };
+                        if let Some(r) = reply {
+                            let _ = sock.send_to(&r.encode(), from);
+                        }
+                    }
+                    Msg::Parts { .. } => {}
+                    other => { me.deliver(from, other); }
+                }
+            }
+        }))
+    }
+
+    /// Ask the serving thread to exit, and wake it so it does.
+    pub fn stop_serving(&self) {
+        self.stop.store(true, Ordering::Release);
+        if let Ok(local) = self.sock.local_addr() {
+            // The socket may be bound to 0.0.0.0; send to loopback on its
+            // port so the datagram actually arrives.
+            let wake = SocketAddr::new(
+                if local.is_ipv6() { "::1".parse().unwrap() } else { "127.0.0.1".parse().unwrap() },
+                local.port());
+            let _ = self.sock.send_to(&[], wake);
         }
     }
 
@@ -281,6 +405,13 @@ impl WireUdpTransport {
             client: self.client.load(Ordering::Relaxed),
         })
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// The contacts a reply teaches us about — INCLUDING the responder itself.
@@ -730,6 +861,61 @@ mod tests {
         t.ping(&contact(addr), &contact(addr));
         h.join().unwrap();
         assert_eq!(t.public_ip(), Some("203.0.113.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn two_served_transports_find_each_other_with_nobody_else() {
+        // The bootstrap-independence claim at its smallest: two nodes on
+        // a LAN, no third party. Each answers the other's queries from a
+        // serving thread while its own round trips complete.
+        let a = Arc::new(WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap());
+        let b = Arc::new(WireUdpTransport::bind(id(3), "127.0.0.1:0".parse().unwrap()).unwrap());
+        let node_a = Arc::new(Mutex::new(Node::new(id(1), a.local_addr().unwrap())));
+        let node_b = Arc::new(Mutex::new(Node::new(id(3), b.local_addr().unwrap())));
+        let ha = a.serve(node_a.clone()).unwrap();
+        let hb = b.serve(node_b.clone()).unwrap();
+        let ca = Contact::new(id(1), a.local_addr().unwrap(), 0);
+        let cb = Contact::new(id(3), b.local_addr().unwrap(), 0);
+
+        assert!(a.ping(&ca, &cb), "B did not answer A");
+        assert!(b.ping(&cb, &ca), "A did not answer B");
+        assert_eq!(node_b.lock().unwrap().rt.len(), 1, "B's table learned A from A's ping");
+
+        // A stores at B (get for a token, then put — inside store), and
+        // reads it back; B's own store holds it.
+        a.store(&ca, &cb, id(7), b"lan-record".to_vec(), 600);
+        assert_eq!(node_b.lock().unwrap().store.value_count(&id(7)), 1, "B did not store A's put");
+        match a.find_value(&ca, &cb, &id(7)) {
+            FindValue::Values(v) => assert_eq!(v, vec![b"lan-record".to_vec()]),
+            other => panic!("{other:?}"),
+        }
+        // Served nodes do not claim to be clients.
+        assert!(!a.client.load(Ordering::Relaxed));
+
+        a.stop_serving();
+        b.stop_serving();
+        drop(a); drop(b);
+        ha.join().unwrap();
+        hb.join().unwrap();
+    }
+
+    #[test]
+    fn a_served_transport_drops_a_reply_from_the_wrong_address() {
+        let a = Arc::new(WireUdpTransport::bind(id(1), "127.0.0.1:0".parse().unwrap()).unwrap());
+        let node_a = Arc::new(Mutex::new(Node::new(id(1), a.local_addr().unwrap())));
+        let h = a.serve(node_a).unwrap();
+        let (addr, _peer) = responder(|_| None);            // never answers
+        let other = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let me = a.local_addr().unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            other.send_to(&rep(1, peer3(), one_node(), vec![], vec![], None).encode(), me).unwrap();
+        });
+        let got = a.find_node(&contact(addr), &contact(addr), &id(2));
+        assert!(got.is_empty(), "a bystander's reply was delivered: {got:?}");
+        a.stop_serving();
+        drop(a);
+        h.join().unwrap();
     }
 
     #[test]
