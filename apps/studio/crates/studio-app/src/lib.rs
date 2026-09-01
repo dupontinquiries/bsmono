@@ -2210,7 +2210,7 @@ impl eframe::App for App {
         // panel below to gate over-scroll navigation. A local, not a field:
         // it is one frame's fact, recomputed from real width every time.
         let mut pages_mode = false;
-        egui::TopBottomPanel::top("bar").show(ctx, |ui| {
+        egui::Panel::top("bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 // Tabs when the labels actually fit, a compact picker when
                 // they don't — decided from a WIDTH FIT via responsive_nav,
@@ -2458,7 +2458,7 @@ impl eframe::App for App {
                 }
             });
         });
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+        egui::Panel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.studio.status);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2872,7 +2872,7 @@ impl eframe::App for App {
 
         let mut lib_action = None;
         if self.library_open {
-            egui::SidePanel::left("library").default_width(210.0).show(ctx, |ui| {
+            egui::Panel::left("library").default_size(210.0).show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.small_button("⟳").on_hover_text("rescan").clicked() {
                         self.library_tree.refresh();
@@ -3222,8 +3222,8 @@ impl eframe::App for App {
         let slot_visible = self.side_slot != SideSlot::Off
             && !(self.side_slot == SideSlot::Viewport && !has_video);
         if self.studio.combined && slot_visible {
-            egui::SidePanel::right("side-slot").resizable(true)
-                .default_width(360.0).show(ctx, |ui| {
+            egui::Panel::right("side-slot").resizable(true)
+                .default_size(360.0).show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         for (s, l) in [(SideSlot::Viewport, "viewport"),
                                        (SideSlot::Mixer, "mixer"),
@@ -3251,8 +3251,8 @@ impl eframe::App for App {
                 });
         }
         if self.studio.combined {
-            egui::TopBottomPanel::bottom("workbench").resizable(true)
-                .default_height(300.0).show(ctx, |ui| {
+            egui::Panel::bottom("workbench").resizable(true)
+                .default_size(300.0).show(ctx, |ui| {
                     // Which tool sits in the strip is the SAME panel state
                     // the tab layout uses, so switching layouts never loses
                     // your place; Timeline just isn't a strip tool — the
