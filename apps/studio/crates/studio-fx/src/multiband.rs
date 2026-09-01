@@ -210,16 +210,6 @@ mod tests {
 
     const RATE: f32 = 48_000.0;
 
-    /// White-ish sweep: enough content everywhere to measure reconstruction
-    /// across the whole spectrum rather than at one convenient frequency.
-    fn sweep(n: usize) -> Vec<f32> {
-        (0..n).map(|i| {
-            let t = i as f32 / RATE;
-            let f = 20.0 * (1000.0f32).powf(i as f32 / n as f32); // 20 Hz → 20 kHz
-            (TAU * f * t).sin() * 0.4
-        }).collect()
-    }
-
     fn tone(hz: f32, n: usize, amp: f32) -> Vec<f32> {
         (0..n).map(|i| (TAU * hz * i as f32 / RATE).sin() * amp).collect()
     }
