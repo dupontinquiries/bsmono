@@ -574,6 +574,14 @@ struct VoicetermApp {
     /// rather than a fidelity fix, and worth saying plainly because everything
     /// else in this file is measured against the QML.
     tabbar_open: bool,
+    /// The keycaps/gesture-chip row. Its own toggle because on a phone it is
+    /// a THIRD permanent bottom bar stacked under the bar and the session
+    /// strip — see `apply_compact_defaults`.
+    keycaps_open: bool,
+    /// Whether the one-time narrow-surface default has been applied. Applied
+    /// once rather than every frame, so collapsing is a starting position the
+    /// user can override, not a cage that re-shuts whatever they open.
+    compact_defaults_applied: bool,
     /// Swipe-to-switch-tab, from the kit rather than hand-rolled.
     ///
     /// The rail keeps the screen space; this is how you move between tabs
@@ -628,6 +636,43 @@ impl VoicetermApp {
     /// placement half runs FIRST — a new pane or tab has to exist before the
     /// view can be assigned to it, and assigning then splitting would leave
     /// the content on the pane the user was looking at.
+    /// Pick sane starting chrome for the surface, ONCE.
+    ///
+    /// `main.qml` does not keep this material on screen: the Qt surface puts
+    /// the file picker in a `Drawer`, and settings / favourites / voice / the
+    /// gesture menus in `Popup`s that open on demand. The egui port turned
+    /// several of those into permanently-mounted panels, so on a phone the
+    /// bottom bar, the session strip and the keycaps row stack into three
+    /// bands under a 168pt tab column, and the terminal — the thing the app
+    /// is for — gets what is left. That is the reported "too many panels
+    /// visible at once, and so big compared to the Qt ones".
+    ///
+    /// This is the cheap half of the fix: on a narrow surface, start with the
+    /// tab column collapsed to its rail and the keycaps row closed. Both stay
+    /// user-toggleable and the choice is applied once, so opening one does
+    /// not fight a rule that re-shuts it next frame. The real fix — moving
+    /// the on-demand surfaces into overlays the way the QML has them — is
+    /// larger and is written up in C13_TODO.
+    fn apply_compact_defaults(&mut self, ctx: &egui::Context) {
+        if self.compact_defaults_applied {
+            return;
+        }
+        // content_rect is empty before the first layout; waiting costs one
+        // frame and avoids concluding "narrow" from an unmeasured surface.
+        let w = ctx.content_rect().width();
+        if w <= 1.0 {
+            return;
+        }
+        self.compact_defaults_applied = true;
+        let compact = w < 600.0;
+        if compact {
+            self.tabbar_open = false;
+            self.keycaps_open = false;
+        } else {
+            self.keycaps_open = true;
+        }
+    }
+
     fn run_command(&mut self, cmd: voiceterm_egui::palette::Command) {
         use voiceterm_egui::gesture_menus::WsCall;
         use voiceterm_egui::palette::{Command, Target};
@@ -954,6 +999,7 @@ impl VoicetermApp {
 impl eframe::App for VoicetermApp {
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         uikit_egui::apply_palette(ctx, snapclone_theme::palette_for(self.theme));
         // ONCE PER FRAME, shared by every panel that needs it. detect reads
@@ -1249,6 +1295,7 @@ impl eframe::App for VoicetermApp {
                          && i.key_pressed(egui::Key::M)) {
             if !self.chrome.escape() { self.chrome.toggle(); }
         }
+        self.apply_compact_defaults(ctx);
         let show_chrome = self.chrome.mode().shows_tab_strip();
         // The session list used to be its own `SidePanel::left("sidebar")` at 160
         // points, beside the 168-point tab column. It now lives INSIDE that
@@ -1277,7 +1324,7 @@ impl eframe::App for VoicetermApp {
         // rows stopped hiding in Voice mode — silently, because nothing counts
         // panels. `chrome_mode`'s accounting still claimed BUTTONS_H back.
         // Caught by maintenance/tools/egui_chrome_audit.py, not by eye.
-        if show_chrome {
+        if show_chrome && self.keycaps_open {
         egui::TopBottomPanel::bottom("keycaps").show(ctx, |ui| {
             // The pipe/brace gesture chips sit on their own row above the keycaps (the QML toolbar
             // put them in modRow): hold + drag to a cell + release. The brace menu's deadband makes
@@ -3756,6 +3803,8 @@ fn main() -> eframe::Result<()> {
     },
         Box::new(move |_cc| {
             let mut app = VoicetermApp {
+                keycaps_open: true,
+                compact_defaults_applied: false,
                 ingest: Default::default(),
                 // Discovery once at startup, not per frame: scanning
                 // /sys/bus/iio/devices every repaint is a directory walk at 60
