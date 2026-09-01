@@ -552,9 +552,12 @@ impl App {
                     eprintln!("snapclone: our punch socket is {addr} from outside");
                 }
                 self.snap.reflexive = Some(addr);
+                self.snap.stun_failed = false;
             }
-            Event::StunFailed => eprintln!("snapclone: no STUN server answered — \
-                                            our public address stays unknown"),
+            Event::StunFailed => {
+                self.snap.stun_failed = true;
+                eprintln!("snapclone: no STUN server answered — our public address stays unknown");
+            }
             Event::PunchReady { peer, addr } =>
                 eprintln!("snapclone: punch volley to {peer} at {addr} complete; keeping it open"),
             Event::PunchArrived { peer, from } => {

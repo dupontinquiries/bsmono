@@ -72,6 +72,7 @@ pub mod dht_announce;
 pub mod dht_bootstrap;
 pub mod dht_envelope;
 pub mod dht_presence;
+pub mod hint;
 pub mod nat_traversal;
 pub mod face_consent;
 pub mod frame_pump;
@@ -221,6 +222,12 @@ pub struct Snapclone {
     /// The punch socket's STUN-mapped address (`nat_traversal`). Announced
     /// in our record so a peer's volley hits the mapping that exists.
     pub reflexive: Option<std::net::SocketAddr>,
+    /// STUN was asked and nobody answered (cleared when a server does).
+    pub stun_failed: bool,
+    /// Peers the node reported on its last publish or bootstrap.
+    pub dht_peers: usize,
+    /// The "reachable from outside" hint has been shown this session.
+    pub reachable_shown: bool,
     /// The accessibility scene the settings toggles register with.
     /// Held here rather than in the page so focus survives between
     /// frames — a page-local scene forgets on every repaint, which
@@ -683,6 +690,9 @@ impl Snapclone {
             dht_schedule: Default::default(),
             dht_keepalive: None,
             reflexive: None,
+            stun_failed: false,
+            dht_peers: 0,
+            reachable_shown: false,
             a11y: uikit_egui::a11y::A11yScene::new(),
             pending_vcard_text: None,
             import_report: None,
@@ -1563,7 +1573,7 @@ impl Snapclone {
                 // Zero peers is the normal state of a node that has just
                 // started and knows nobody, so it is not reported as a
                 // problem.
-                Event::Published { .. } => {}
+                Event::Published { peers, .. } => { self.dht_peers = peers; }
                 Event::Keepalive { pinged, answered } => {
                     self.dht_keepalive = Some((pinged, answered));
                     if pinged > 0 && answered == 0 {
@@ -3142,6 +3152,11 @@ impl Snapclone {
             if let Some(i) = picked {
                 self.nav.go_page(i);
             }
+            // Above the tab bar: bottom panels stack upward in the order
+            // they are shown.
+            egui::TopBottomPanel::bottom("hint")
+                .show_separator_line(false)
+                .show_inside(ui, |ui| { self.hint_bar(ui, true, &colors); });
         }
         if !adaptive.is_compact() && !self.nav.can_go_back() {
             // THE PORTED STRIP, not a hand-rolled row. strip_ui gives equal
@@ -3160,6 +3175,9 @@ impl Snapclone {
             if let Some(i) = crate::nav_chrome::strip_ui(ui, &self.strip, &colors) {
                 self.nav.go_page(i);
             }
+            // The status line a desktop user expects under the toolbar,
+            // with the number or the address, since there is room.
+            self.hint_bar(ui, false, &colors);
             ui.separator();
         }
 
@@ -3806,6 +3824,58 @@ impl Snapclone {
             ui, &self.roster, &mut self.cards, &mut self.add_form, &info, c) {
             self.apply_friends(a);
         }
+    }
+
+    /// What the hint reads. Assembled here so `hint::hint` stays a pure
+    /// function of a struct it can be handed in a test.
+    pub fn situation(&self) -> crate::hint::Situation {
+        use crate::send_state::SendState;
+        let unreachable = self.group_voice.participants.iter()
+            .filter(|p| !p.is_self && self.punch.get(&p.id).is_none()).count();
+        crate::hint::Situation {
+            has_identity: !self.local_id.is_empty(),
+            cameras: self.cameras.len(),
+            capture_exhausted: matches!(self.capture_status, crate::capture::Status::Exhausted { .. }),
+            capture_trying: matches!(self.capture_status, crate::capture::Status::Trying { .. }),
+            dht_running: self.dht.is_some(),
+            dht_peers: self.dht_peers,
+            keepalive: self.dht_keepalive,
+            reflexive: self.reflexive.map(|a| a.to_string()),
+            stun_failed: self.stun_failed,
+            in_call: self.group_voice.joined,
+            unreachable_participants: if self.group_voice.joined { unreachable } else { 0 },
+            sends_failed: self.sends.rows().iter().filter(|r| r.state == SendState::Failed).count(),
+            sends_pending: self.sends.rows().iter().filter(|r| r.state == SendState::Pending).count(),
+            unread: self.inbox.unread_count(),
+            reachable_shown: self.reachable_shown,
+        }
+    }
+
+    /// One line of chrome. Tapping it goes where it helps. `true` when a
+    /// line was drawn, so the caller can leave the row out otherwise.
+    fn hint_bar(&mut self, ui: &mut Ui, compact: bool, c: &PaletteColors) -> bool {
+        let Some(h) = crate::hint::hint(&self.situation()) else { return false };
+        let color = match h.level {
+            crate::hint::Level::Blocking => c.danger,
+            crate::hint::Level::Degraded => c.warning,
+            crate::hint::Level::Info => c.text_weak,
+        };
+        let text = if compact { h.short.clone() } else { h.long.clone() };
+        let r = ui.add(egui::Label::new(egui::RichText::new(text).color(color)).sense(egui::Sense::click()));
+        if h.level == crate::hint::Level::Info && h.short == "reachable from outside" {
+            // Said once: the next frame will not repeat it.
+            self.reachable_shown = true;
+        }
+        if r.clicked() {
+            match h.go {
+                crate::hint::GoTo::Camera => self.nav.go_page(0),
+                crate::hint::GoTo::Inbox => self.nav.go_page(1),
+                crate::hint::GoTo::Peers => self.nav.go_page(2),
+                crate::hint::GoTo::Settings => self.nav.go_page(4),
+                crate::hint::GoTo::Nowhere => {}
+            }
+        }
+        true
     }
 
     fn settings_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
@@ -4601,6 +4671,36 @@ mod tests {
         }
         assert!(deepest <= screen.max.y + 0.5,
                 "the page laid out to y={deepest} on a {}-tall screen: it is not scrolling", screen.max.y);
+    }
+
+    /// The hint reaches the screen through the real `ui()`, phone shell,
+    /// and reads the app's state rather than a copy of it.
+    #[test]
+    fn the_hint_bar_shows_the_situation_and_the_situation_reads_the_state() {
+        let mut app = app();
+        app.local_id.clear();
+        assert!(crate::hint::hint(&app.situation()).unwrap().short.contains("identity"));
+        app.local_id = "sc-me".into();
+        app.cameras.clear();
+        assert_eq!(crate::hint::hint(&app.situation()).unwrap().short, "no camera found");
+        app.cameras.push(crate::camera_select::Device {
+            id: "cam".into(), label: "cam".into(),
+            facing: crate::camera_select::Facing::Rear, capture_group: None });
+        app.dht_keepalive = Some((3, 0));
+        assert_eq!(crate::hint::hint(&app.situation()).unwrap().short, "network changed — reconnecting");
+        // And it is drawn: a compact frame lays out a label with that text.
+        use egui::{Context, Pos2, RawInput};
+        let ctx = Context::default();
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(360.0, 640.0));
+        let out = ctx.run(RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+        });
+        // Either shell: the phone says "network changed", the desktop
+        // "probably changed under us".
+        let drew_it = out.shapes.iter().any(|cs| matches!(&cs.shape, egui::Shape::Text(t)
+            if t.galley.text().contains("changed")));
+        assert!(drew_it, "the hint was decided but never drawn");
     }
 
     #[test]
