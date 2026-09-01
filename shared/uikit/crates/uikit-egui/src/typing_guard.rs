@@ -36,12 +36,12 @@ use egui::Modifiers;
 
 /// Is a text widget currently taking keystrokes?
 ///
-/// `wants_keyboard_input` rather than `focused()`: a focused BUTTON does
+/// `egui_wants_keyboard_input` rather than `focused()`: a focused BUTTON does
 /// not want text, and blocking shortcuts because a button has focus
 /// would break keyboard navigation — you would tab to a control and lose
 /// every app shortcut until you clicked away.
 pub fn text_has_focus(ctx: &egui::Context) -> bool {
-    ctx.wants_keyboard_input()
+    ctx.egui_wants_keyboard_input()
 }
 
 /// Should an app-level shortcut fire for this keystroke?
@@ -72,7 +72,7 @@ mod tests {
 
     /// `shortcut_allowed`'s decision, without a Context.
     ///
-    /// The egui half is one call (`wants_keyboard_input`); the DECISION
+    /// The egui half is one call (`egui_wants_keyboard_input`); the DECISION
     /// is the part worth pinning, and it is testable only if separated
     /// from the lookup. So this mirrors the logic — and the mirror is
     /// checked against the real function's shape by the fact that both

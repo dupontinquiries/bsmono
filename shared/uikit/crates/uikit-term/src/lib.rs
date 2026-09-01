@@ -1036,12 +1036,12 @@ impl App {
     /// symptom is the one that gets reported: a URL bar that accepts one
     /// character and then stops, because the terminal is eating the rest.
     ///
-    /// `wants_keyboard_input()` is true exactly when a widget has focus and
+    /// `egui_wants_keyboard_input()` is true exactly when a widget has focus and
     /// takes text, which is the condition under which the terminal must not
     /// look at the event stream at all.
     pub fn handle_input(&mut self, ui: &egui::Ui) -> Option<String> {
         self.pending_bytes.clear();
-        if ui.ctx().wants_keyboard_input() {
+        if ui.ctx().egui_wants_keyboard_input() {
             return None;
         }
         let mut pending: Vec<u8> = Vec::new();
