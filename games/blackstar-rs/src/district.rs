@@ -226,11 +226,7 @@ pub fn pieces(l: &Layout, th: &dyn Fn(f32, f32) -> f32, stone: [f32; 4], accent:
 
     // ---- plazas: a ring of low cover, a lit marker in the middle
     for c in &l.plazas {
-        let n = 10;
-        for i in 0..n {
-            let a = i as f32 / n as f32 * std::f32::consts::TAU;
-            let x = c.x + a.cos() * PLAZA_R_OH * u;
-            let z = c.z + a.sin() * PLAZA_R_OH * u;
+        for (x, z, a) in cover_ring(*c) {
             let g = th(x, z);
             let half = Vec3::new(1.2 * u, COVER_H_OH * u * 0.5, 0.45 * u);
             let rot = Quat::from_rotation_y(-a);
@@ -273,6 +269,24 @@ pub fn pieces(l: &Layout, th: &dyn Fn(f32, f32) -> f32, stone: [f32; 4], accent:
         out.push(rbox(Vec3::new(k.x, g + half.y * 2.0 + cap.y, k.z), Quat::IDENTITY, cap, accent, 0.6, 0.2));
     }
     out
+}
+
+/// A plaza's cover ring: (x, z, angle) for each block, so the field can
+/// stand a wave behind the same blocks the world built.
+pub fn cover_ring(c: Vec3) -> Vec<(f32, f32, f32)> {
+    let u = oh();
+    let n = 10;
+    (0..n)
+        .map(|i| {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            (c.x + a.cos() * PLAZA_R_OH * u, c.z + a.sin() * PLAZA_R_OH * u, a)
+        })
+        .collect()
+}
+
+/// Every cover block on the map, as positions.
+pub fn cover_points(l: &Layout) -> Vec<Vec3> {
+    l.plazas.iter().flat_map(|c| cover_ring(*c).into_iter().map(|(x, z, _)| Vec3::new(x, 0.0, z))).collect()
 }
 
 /// Is `p` on the boulevard: within its clear width, between its ends.

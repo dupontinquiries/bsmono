@@ -186,6 +186,9 @@ const STANDOFF: [f32; 3] = [6.0, 18.0, 34.0];
 const DEPTH: [(f32, f32); 3] = [(0.0, 8.0), (12.0, 22.0), (28.0, 40.0)];
 /// Lateral muster spread, metres.
 const LATERAL: f32 = 24.0;
+/// How far behind a cover block a body stands. GUESS: a body-length at
+/// the sandbox scale, so the block is between it and you.
+pub const BEHIND_COVER_M: f32 = 1.3;
 
 // ------------------------------------------------------------------ types ---
 
@@ -344,6 +347,12 @@ pub struct Field {
     pending: Vec<Event>,
     /// the player's tow line: which slot is on the end, and the cable
     tow: Option<(usize, Cable)>,
+    /// COVER, if the map has any near the anchor (`district.rs`'s plaza
+    /// blocks). Front and middle zones muster BEHIND the nearest free
+    /// block rather than on the hashed arc — Destiny's owned space is a
+    /// body at cover, not a body in the open. Set by the shell with the
+    /// anchor; empty on a map with none.
+    pub cover: Vec<Vec3>,
     /// gravity for flung bodies, m/s². Set by the shell for the map;
     /// the default is Earth so headless tests fly a sensible arc.
     pub g: f32,
@@ -419,7 +428,7 @@ impl Field {
     /// toward where the player will come from (the LZ); `ride_h` is the
     /// shell's ground clearance for a standing body.
     pub fn new(anchor: Vec3, facing: Vec3, seed: u64, ride_h: f32) -> Field {
-        Field { foes: Vec::new(), anchor, facing: unit_xz(facing), seed, ride_h, pending: Vec::new(), tow: None, g: 9.81 }
+        Field { foes: Vec::new(), anchor, facing: unit_xz(facing), seed, ride_h, pending: Vec::new(), tow: None, g: 9.81, cover: Vec::new() }
     }
 
     /// The conventional anchor for a sortie: `SITE_AHEAD_M` past the LZ
@@ -443,6 +452,7 @@ impl Field {
     pub fn muster(&mut self, wave: usize, fighters: &[Fighter], champion: Option<&str>) {
         self.foes.clear();
         let right = self.facing.cross(Vec3::Y).normalize_or(Vec3::X);
+        let mut taken: Vec<usize> = Vec::new();
         for (slot, f) in fighters.iter().enumerate() {
             if !f.alive() {
                 continue;
@@ -456,7 +466,26 @@ impl Field {
             let (d0, d1) = DEPTH[zone];
             let depth = d0 + (d1 - d0) * hash_unit(h, 1);
             let lat = (hash_unit(h, 2) * 2.0 - 1.0) * LATERAL;
-            let pos = self.anchor - self.facing * depth + right * lat;
+            let mut pos = self.anchor - self.facing * depth + right * lat;
+            // to cover, when there is cover: the nearest untaken block,
+            // and stand a body-length behind it, away from where you come
+            if zone < 2 && !self.cover.is_empty() {
+                let mut best: Option<(f32, usize)> = None;
+                for (ci, c) in self.cover.iter().enumerate() {
+                    if taken.contains(&ci) {
+                        continue;
+                    }
+                    let d = (Vec3::new(c.x, 0.0, c.z) - Vec3::new(pos.x, 0.0, pos.z)).length();
+                    if best.map(|b| d < b.0).unwrap_or(true) {
+                        best = Some((d, ci));
+                    }
+                }
+                if let Some((_, ci)) = best {
+                    taken.push(ci);
+                    let c = self.cover[ci];
+                    pos = Vec3::new(c.x, pos.y, c.z) - self.facing * BEHIND_COVER_M;
+                }
+            }
             let mut agent = Enemy::new_kind(slot as i32, pos, f.hp, kind, t.element);
             // the fight's HP is the truth, whatever the kind's default said
             agent.hp = f.hp;
@@ -1302,6 +1331,36 @@ mod tests {
         }
         let after = f.foes[0].pos();
         assert!((player - after).length() < (player - before).length(), "did not close on the shooter");
+    }
+
+    #[test]
+    fn with_cover_the_front_stands_behind_the_blocks_and_the_back_does_not() {
+        let s = wave(&["grunt", "grunt", "grunt", "grunt", "grunt", "grunt"]);
+        let mut f = field();
+        // a ring of blocks around the anchor
+        let blocks: Vec<Vec3> = (0..8)
+            .map(|i| {
+                let a = i as f32 / 8.0 * std::f32::consts::TAU;
+                f.anchor + Vec3::new(a.cos() * 12.0, 0.0, a.sin() * 12.0)
+            })
+            .collect();
+        f.cover = blocks.clone();
+        f.muster(1, &s.fighters, None);
+        let mut used = std::collections::HashSet::new();
+        for foe in &f.foes {
+            let zone = foe.agent.zone;
+            let nearest = blocks.iter().enumerate().map(|(i, b)| ((*b - foe.pos()) * Vec3::new(1.0, 0.0, 1.0), i)).min_by(|a, b| a.0.length().total_cmp(&b.0.length())).unwrap();
+            if zone < 2 {
+                assert!((nearest.0.length() - BEHIND_COVER_M).abs() < 1e-3, "front/mid slot {} is {:.1} m from its block", foe.slot, nearest.0.length());
+                // behind it: the block is toward the facing (toward the player) from the foe
+                assert!(nearest.0.normalize().dot(f.facing) > 0.99, "slot {} is beside its block, not behind it", foe.slot);
+                assert!(used.insert(nearest.1), "two bodies behind one block");
+            }
+        }
+        // no cover: the arc as before
+        let mut g = field();
+        g.muster(1, &s.fighters, None);
+        assert!(g.foes.iter().zip(f.foes.iter()).any(|(a, b)| a.pos() != b.pos()));
     }
 
     // ---- the two registers ----
