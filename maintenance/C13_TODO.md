@@ -732,3 +732,66 @@ per-feature unfinished work rather than one pattern, unlike bot-arena's
 subsystem. Logged rather than triaged one-by-one — this is real-time
 game code with no way to verify "is this the right fix" without playing
 it, same caution as the physics deletions in this same pass.
+
+## 17. apps/snapclone/rust and system/snapclone/rust are ~36,000 lines of near-duplicate workspace
+
+The biggest duplication found this session, by a wide margin. `diff -rq`
+across the two full ~40-crate workspaces (apps/snapclone/rust: 36,833
+source lines; system/snapclone/rust: 36,022) returns only 20 differing
+files total, and only 2 files that exist in one tree and not the other
+(both in `apps/`: `snapclone-presence`, the whole crate, and
+`snapclone-group/tests`). Everything else — every crate name, every
+module, essentially the entire dependency graph — is the same code
+forked at some point and never reconciled.
+
+**Confirmed independent convergent bug fixes.** All five of the real
+compile errors fixed in `apps/snapclone/rust` this session (commits
+`5c4cc8c1`, `a966c1b6`, `414a3fe7`, `a094f6f4`, `6bd4ad72`, `9a6b8673` —
+see §15 above) were found ALREADY FIXED in `system/snapclone/rust`,
+each with its own comment independently describing essentially the same
+root cause:
+
+- `snapclone-storage/db.rs`'s tracing-macro `display` collision — fixed
+  there as `display_name` (I used `shown_name`; same bug, different name).
+- `snapclone-core/app.rs`'s double-owned `evt_rx` — fixed there with a
+  comment reading almost like a paraphrase of mine: "A struct field
+  storing a value that's also returned is a compile error... fixed by
+  not double-owning it."
+- `snapclone-relay`'s missing `base64`/`futures-util` deps — fixed
+  there, with a comment noting the crate "had never compiled."
+- `snapclone-databus`'s missing `required-features = ["bin"]` gate — the
+  fix comment explicitly compares it to "the same class of bug the rest
+  of the fleet guards against."
+- `snapclone-network-diag`'s missing `chrono` dep — fixed there too.
+
+(`snapclone-piggyback`'s `[u8; 64]` serde issue, `snapclone-session`'s
+type-mismatch, and `snapclone-vcard`'s `&&str` ToOwned issue weren't
+individually diffed here but the same pattern almost certainly holds —
+worth confirming.)
+
+**What this means:** `system/snapclone/rust` is the ahead, working copy;
+`apps/snapclone/rust` was the stale fork that had drifted behind and
+accumulated the now-fixed bugs independently. The two fixes are
+functionally identical but textually different (variable naming,
+comment wording), so a naive `diff`-and-overwrite in either direction
+would lose real information from whichever side is discarded, and doing
+it by hand file-by-file for ~40 crates is exactly the kind of tedious,
+error-prone work a dedicated pass should do carefully rather than as a
+side effect of a bug-hunting session.
+
+**Not attempted here — this needs its own session.** Unifying two
+~36,000-line, ~40-crate workspaces safely requires: deciding which
+directory is canonical (or extracting a genuinely shared crate set that
+both `apps/` and `system/` path-depend on, mirroring the fix just
+applied to skydribble/blackstar-rs's vendored crates, but at roughly
+30x the scale); reconciling `snapclone-presence` and
+`snapclone-group/tests` (apps-only) into whichever side wins; and
+verifying the full test suite on both sides post-merge, which this
+session was never able to complete for even one side within the
+sandbox's timeouts. Flagging this as the single largest LOC-reduction
+and compile-speedup opportunity found this session — bigger than the
+skydribble/blackstar-rs vendor fix (11,656 lines) by more than 3x — but
+explicitly NOT something to attempt without a dedicated session and a
+plan for verifying both call sites (whatever consumes `apps/snapclone`
+as a GUI app vs whatever consumes `system/snapclone` as a daemon) still
+work after unification.
