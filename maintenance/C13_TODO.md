@@ -1262,3 +1262,68 @@ Still open, with what is known:
 - **logscope / logscope+features** — carried over; see §19.
 - **voiceterm-egui-frontend** — carried over; the real_pty VT work in §19
   and §27 is the blocker.
+
+## 37. Two bugs from the supplied run log (both fixed), and one that is not
+
+Fixed in this session (see the gpu-gemm commit): `prewarm` built a
+dense-only cache and panicked on any hybrid model — that is the whole of
+why Qwen3.8-27B "loaded" and then the worker died. And the engine printed
+two contradictory RoPE lines about the same model in the same run.
+
+**Not fixed: the buffer-overrun validation error that preceded the panic.**
+
+    Copy at offset 0 for 8192 bytes would end up overrunning the bounds of
+    the Source buffer of size 8
+
+logged twice as "device error (non-fatal, logged)" immediately before the
+prewarm panic. A source buffer of **8 bytes** where 8192 were expected is a
+factor of 1024 — that reads like a length being passed where a byte count
+was wanted, or an empty/placeholder buffer reaching a copy. Note that
+prewarm was running on a cache with missing recurrent slots at the time, so
+this MAY be a downstream symptom of the same bug and may simply vanish now.
+Check the next run's log before chasing it: if it is gone, it was the
+cache; if it persists, it is its own defect and the 8-vs-8192 ratio is the
+lead.
+
+**Also from this log — the GPU budget constant is being flagged by the
+engine itself.** It now advises "GPU budget 48.0 GiB is a CONSTANT, not a
+measurement... the constant has been wrong by 2.6x on this hardware", and
+separately the arena hits a wall at 24 GiB of mapped slabs against a
+compiled-in 31 GiB clamp. `kernel-validate --gate-vram` exists and measures
+the real ceiling; nothing consumes its result yet. That is the missing
+piece — see §29, which is the same "a number describes a different machine"
+problem from the phone side. Wiring the probe's measurement into
+`resident_budget()`/the clamp would fix both ends at once, and `probe_key`
++ `ResidencyProbe::explain` are already written for exactly this and have
+no callers.
+
+## 38. meta_muse-glimmer — a new architecture was supplied, unimplemented
+
+Config only (no weights): `meta_muse-glimmer/`, `model_type`
+"muse_glimmer", `MuseGlimmerForConditionalGeneration`. What the engine
+would need, read off config.json:
+
+- **Multimodal.** A vision tower (`vision_config`: hidden 1536, its own
+  `layer_types` mixing `window_attention` and `full_attention`) plus a
+  projector (`projector_hidden_size` 4096 → `out_hidden_size` 6144, gelu),
+  with `image_token_id` 200092 / `video_token_id` 200091 splicing embeddings
+  into the text stream. The engine is text-only today; this is the largest
+  single gap.
+- **Interleaved sliding/full attention.** 52 text layers, `layer_types`
+  counts 39 `sliding_attention` + 13 `full_attention`, `sliding_window`
+  2048. Per-layer attention kind, like the Gated DeltaNet hybrid routing
+  already in `decode_step_full` — that per-layer dispatch is the right
+  precedent to follow rather than a new mechanism.
+- **Per-layer RoPE theta.** `layer_rope_theta` is an ARRAY, with 0 entries
+  (no RoPE) on some layers. The engine stores one `rope_dims`/`base` for
+  the whole model, so this needs per-layer rope state — and note §37's
+  finding that even the single-value reporting was inconsistent.
+- **Logit softcapping** (`final_logit_softcapping` 20.0),
+  `qk_scale_factor` 3.87, `output_multiplier`, `post_norm_eps` 1e-8
+  distinct from `rms_norm_eps` 1e-5. Each is a small arithmetic change but
+  each silently produces fluent nonsense if missed.
+- vocab 202048, hidden 6656, 32 heads / 2 KV heads, head_dim 128.
+
+Scope this honestly before starting: the vision tower alone is comparable
+to the existing text engine. A staged plan (text-only path first, refusing
+image tokens by name; vision second) is the only version that lands.
