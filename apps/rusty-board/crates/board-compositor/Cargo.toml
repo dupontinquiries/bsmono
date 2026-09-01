@@ -1,0 +1,48 @@
+[package]
+name = "board-compositor"
+version = "0.1.0"
+edition = "2021"
+description = "rusty-board's virtual-keyboard delivery + focus tracking: zwp_virtual_keyboard_v1 / zwp_input_method_v2 (and the legacy v1 protocol), the X11/xdotool and no-op fallbacks, and an AT-SPI focus watcher for desktops with neither. GTK-free by default — the GTK app opts into GDK-connection-sharing and layer-shell placement via the `gdk-integration` feature; a plain wayland-client consumer (the egui port) does not need it."
+
+[dependencies]
+anyhow = "1.0"
+tracing = "0.1"
+parking_lot = "0.12"
+
+# Base Wayland protocol support — zero GTK/GDK involvement. This is
+# everything `try_new_standalone` needs: its own connection via
+# `Connection::connect_to_env()`, its own registry walk, the
+# input-method/virtual-keyboard protocol objects, and xkb keymap
+# synthesis.
+wayland-client = { version = "0.31", optional = true }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"], optional = true }
+wayland-protocols-misc = { version = "0.3", features = ["client"], optional = true }
+xkbcommon = { version = "0.8", optional = true }
+# memfd_create for the anonymous keymap file handed to the compositor.
+libc = { version = "0.2", optional = true }
+
+# Only for the GTK app's connection-sharing path (`try_new`,
+# `share_gdk_connection`) — reusing GDK's own Wayland connection so the
+# compositor's single per-seat input-method client is GTK's, not a
+# second competing one. A standalone consumer (egui-frontend) never
+# enables this and never links gtk4/gdk4-wayland.
+gdk4-wayland = { version = "0.10", features = ["wayland_crate", "v4_4"], optional = true }
+gtk4 = { version = "0.10", features = ["v4_12"], optional = true }
+glib = { version = "0.21", optional = true }
+
+# AT-SPI focus watcher (X11-desktop fallback, no compositor input-method
+# protocol). Pure D-Bus — no GTK.
+zbus = { version = "4.4", features = ["tokio"], optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
+futures = { version = "0.3", optional = true }
+
+[features]
+# Protocol only: virtual_keyboard + wayland_backend (standalone-connection
+# path), X11/xdotool fallback, no-op fallback. What a non-GTK consumer
+# (egui-frontend) wants.
+wayland = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-misc", "dep:xkbcommon", "dep:libc"]
+# Adds the GTK app's GDK-connection-sharing path on top of `wayland`.
+gdk-integration = ["wayland", "dep:gdk4-wayland", "dep:gtk4", "dep:glib"]
+# AT-SPI focus tracking for the X11-desktop fallback (needs the same
+# InputMethodActiveCallback type `wayland` defines).
+atspi = ["wayland", "dep:zbus", "dep:tokio", "dep:futures"]

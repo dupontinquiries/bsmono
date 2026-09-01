@@ -20,7 +20,7 @@ default = ["app"]
 # still compile and run, which is what makes this testable at all. On
 # device (Plasma Mobile, Fairphone) this is the feature that turns taps
 # into input for the FOCUSED window rather than for a preview box.
-wayland = ["dep:rusty-board"]
+wayland = ["dep:rusty-board", "rusty-board/wayland", "dep:glib"]
 # Dictation. Off by default because whisper-rs pulls a native build and a model
 # file; the keyboard is fully usable without it, and a phone build that cannot
 # compile is worse than one that cannot dictate.
@@ -34,6 +34,13 @@ app = ["dep:eframe"]
 # Only under `wayland`: this is the crate holding the zwp_input_method_v2 /
 # zwp_virtual_keyboard_v1 backends and their detection.
 rusty-board = { path = "..", optional = true, default-features = false }
+# Only under `wayland`: `rusty_board::compositor::wayland_backend` (the
+# zwp_input_method_v2/zwp_virtual_keyboard_v1 code) drives its dispatcher
+# with `glib::timeout_add_local_once` — see that module's doc for why
+# (self-adaptive polling, not an fd-watch). It doesn't need GTK itself,
+# just a running GLib main context, which this crate has to pump on its
+# own (there's no GTK main loop here) — see `wayland.rs`.
+glib = { version = "0.21", optional = true }
 # Mic-level peak metering used by the MOUNTED voice/recorder.rs — a dep the
 # GTK crate declares and this crate must too, or the shared file dangles
 # (the c11 mount-path lesson, dependency flavour).
@@ -47,6 +54,9 @@ tracing = "0.1"
 anyhow = "1"
 directories = "5"
 toml = "0.8"
+# Only used by the mounted src/steno/mod.rs's `global()` singleton —
+# same crate+version the GTK app depends on for the same file.
+once_cell = "1.20"
 egui = "0.34"
 # the shared layout/input model (the gtk app and this frontend read ONE schema)
 board-layouts = { path = "../crates/board-layouts" }

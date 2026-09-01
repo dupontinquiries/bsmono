@@ -51,6 +51,22 @@ pub trait Sink {
     /// distinction was invisible before, which is most of why this went
     /// unnoticed.
     fn describe(&self) -> String;
+
+    /// Drive whatever background event processing this sink needs
+    /// (e.g. dispatching a Wayland event queue). Called once per frame
+    /// from `demo_app`'s `update()`, regardless of which sink is active
+    /// — a no-op default means most sinks don't need to know this
+    /// exists.
+    fn pump(&mut self) {}
+
+    /// Whether the keyboard should currently be shown. The default is
+    /// `true` — `Preview` (desktop/tests) and any sink with no real
+    /// focus signal has no reason to hide itself; only a sink with an
+    /// actual compositor-driven focus signal (`WaylandIntegration`)
+    /// overrides this.
+    fn is_visible(&self) -> bool {
+        true
+    }
 }
 
 /// The desktop/test sink: remembers everything, sends nothing.
@@ -120,19 +136,22 @@ pub fn detect() -> Box<dyn Sink> {
 }
 
 /// The real sink, on a Wayland session with an input-method protocol.
+///
+/// Delegates entirely to [`crate::wayland::WaylandIntegration`], which
+/// also owns show/hide (see that module) — a bare
+/// `VirtualKeyboardBackend::detect().build()` deliberately returns an
+/// EMPTY Wayland backend with no input-method callback wired (see that
+/// function's own doc comment in `virtual_keyboard.rs`); getting the
+/// real one requires going through `wayland_backend::try_new_standalone`
+/// directly, which is what `WaylandIntegration::try_new` does.
 #[cfg(feature = "wayland")]
 pub fn system() -> Result<Box<dyn Sink>, String> {
-    let vk = rusty_board::compositor::virtual_keyboard::Detected::detect().build();
-    Ok(Box::new(SystemSink { vk }))
+    let integration = crate::wayland::WaylandIntegration::try_new()?;
+    Ok(Box::new(integration))
 }
 
 #[cfg(feature = "wayland")]
-struct SystemSink {
-    vk: Box<dyn rusty_board::compositor::virtual_keyboard::VirtualKeyboard>,
-}
-
-#[cfg(feature = "wayland")]
-impl Sink for SystemSink {
+impl Sink for crate::wayland::WaylandIntegration {
     fn commit_text(&mut self, text: &str) -> Result<(), String> {
         self.vk.commit_text(text).map_err(|e| e.to_string())
     }
@@ -141,6 +160,12 @@ impl Sink for SystemSink {
     }
     fn describe(&self) -> String {
         format!("{} (typing into the focused window)", self.vk.backend_name())
+    }
+    fn pump(&mut self) {
+        crate::wayland::WaylandIntegration::pump(self);
+    }
+    fn is_visible(&self) -> bool {
+        crate::wayland::WaylandIntegration::is_visible(self)
     }
 }
 

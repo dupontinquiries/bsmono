@@ -27,6 +27,9 @@ pub mod mic_source;
 pub mod tray;
 pub mod microterm;
 pub mod voice;
+pub mod steno;
+#[cfg(feature = "wayland")]
+pub mod wayland;
 pub mod settings;
 // config/mod.rs refers to `crate::util`, so the port re-exports it at the root.
 pub use settings::util;
@@ -66,17 +69,25 @@ pub struct Key {
     /// ccw is `,` instead, because a sentence-starting comma is common enough on the single most
     /// frequent key to be worth the exception.
     pub rotate_ccw: Option<String>,
+    /// `Some(button_id)` ("L1"/"L2"/"R1"/"R2") when this key routes gestures
+    /// into the stenotype engine instead of committing `emit`/`cardinal`
+    /// text directly. See `steno.rs`'s module doc for the dispatch this
+    /// enables and why cardinal's normal id==label string can't carry it
+    /// (steno phonemes collide across buttons/directions — `"n"` is both
+    /// L1-north and R2-north — so identity has to survive as the typed
+    /// button id, not be recovered from the committed text afterward).
+    pub steno_button: Option<String>,
 }
 
 impl Key {
     pub fn new(label: &str) -> Key {
-        Key { label: label.to_string(), weight: 1.0, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None }
+        Key { label: label.to_string(), weight: 1.0, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None }
     }
     pub fn wide(label: &str, weight: f32) -> Key {
-        Key { label: label.to_string(), weight, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None }
+        Key { label: label.to_string(), weight, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None }
     }
     pub fn emitting(label: &str, emit: &str, weight: f32) -> Key {
-        Key { label: label.to_string(), weight, emit: emit.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None }
+        Key { label: label.to_string(), weight, emit: emit.to_string(), variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None }
     }
     /// Attach long-press variant characters (each emits itself).
     pub fn with_variants(mut self, vs: &[&str]) -> Key {
@@ -171,7 +182,7 @@ fn layout_from_json(text: &str) -> Result<Layout, serde_json::Error> {
         weight: r.weight,
         keys: r.keys.into_iter().map(|k| {
             let emit = k.action.as_ref().and_then(|a| emit_for_action(&a.kind)).unwrap_or(&k.label).to_string();
-            let mut key = Key { label: k.label, weight: k.width, emit, variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None };
+            let mut key = Key { label: k.label, weight: k.width, emit, variants: Vec::new(), cardinal: Vec::new(), rotate_cw: None, rotate_ccw: None, steno_button: None };
             if !k.extended.is_empty() { key.variants = k.extended; }
             key
         }).collect(),
@@ -455,6 +466,55 @@ pub fn keyboard_ui_with_signal(
 /// use the ported rusty-board-GTK glass recipe (`uikit_egui::glass`): high-alpha tinted fill, hairline
 /// border, instant colour-flip on press — no gradient/sheen, no blur. Otherwise keys use the standard
 /// carved-tile motion glide.
+/// Reserved token prefix for a steno key's tap/swipe VALUE (as opposed to
+/// its displayed phoneme label). `\u{0}` can't occur in real layout text —
+/// same reservation trick `real_layout::classify`'s `ACT` prefix uses, kept
+/// separate (`"steno:"` vs `"act:"`) so the two decoders never collide.
+const STENO_TOKEN_PREFIX: &str = "\u{0}steno:";
+
+/// Encode a steno key's resolved gesture as a value string carrying the
+/// button id and gesture code, instead of the ambiguous phoneme text.
+///
+/// The GTK reference never needs this: it dispatches from the typed
+/// `KeyAction::Steno` + the classified swipe direction directly, in the
+/// same function call, so there's no round trip through committed text at
+/// all. This crate's render layer commits by returning a plain `String`
+/// from `paint_key` that a later `classify()` call re-interprets — so
+/// identity has to survive IN that string. It can't be the phoneme itself:
+/// `default_stenotype()` puts `"n"` on both L1's north swipe and R2's
+/// north swipe (see `crates/board-layouts/src/lib.rs`), so two different
+/// (button, direction) pairs produce the same letter and recovering one
+/// from the other is not possible after the fact.
+pub(crate) fn steno_token(button_id: &str, gesture_code: &str) -> String {
+    format!("{STENO_TOKEN_PREFIX}{button_id}:{gesture_code}")
+}
+
+/// Decode a `steno_token` back into `(button_id, gesture_code)`. Exposed so
+/// `real_layout::classify` (a different module, deliberately not sharing
+/// its own `ACT` reserved-prefix constant with this one) can recognize the
+/// same tokens `paint_key` produces.
+pub fn decode_steno_token(value: &str) -> Option<(&str, &str)> {
+    let rest = value.strip_prefix(STENO_TOKEN_PREFIX)?;
+    rest.split_once(':')
+}
+
+/// This crate's stable direction code for a steno swipe. Only N/E/S/W are
+/// reachable — `default_stenotype()` never sets a diagonal — but the match
+/// is total so a future diagonal doesn't silently vanish into `_`.
+pub(crate) fn dir_code(d: uikit_egui::slide_menu::Dir8) -> &'static str {
+    use uikit_egui::slide_menu::Dir8;
+    match d {
+        Dir8::N => "N",
+        Dir8::E => "E",
+        Dir8::S => "S",
+        Dir8::W => "W",
+        Dir8::NE => "NE",
+        Dir8::SE => "SE",
+        Dir8::SW => "SW",
+        Dir8::NW => "NW",
+    }
+}
+
 /// Bridge the classifier's `Direction` to the widget's `Dir8`.
 ///
 /// Two enums for one idea, in two crates that should not depend on each other:
@@ -518,12 +578,48 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
     // that direction's variant. `show_cardinal` resolves tap-vs-swipe, so no separate click handling.
     if !key.cardinal.is_empty() {
         let id = ui.id().with(("keycard", &key.label, rect.min.x as i32, rect.min.y as i32));
-        let tap = uikit_egui::slide_menu::SlideOption::new(key.emit.clone(), key.label.clone());
+        // Steno keys (L1/L2/R1/R2): the tap/direction resolution below is
+        // identical to a normal cardinal key, but the VALUE each option
+        // carries must be an unambiguous (button, gesture) token rather
+        // than the phoneme text — see `steno_token`'s doc comment for why
+        // the phoneme text alone can't identify which button/direction
+        // produced it. The displayed LABEL still shows the phoneme
+        // (`SlideOption::new(id, label)` keeps those independent), so the
+        // on-screen affordance is unchanged; only the returned value differs.
+        let tap_id = match &key.steno_button {
+            Some(btn) => steno_token(btn, "tap"),
+            None => key.emit.clone(),
+        };
+        let tap = uikit_egui::slide_menu::SlideOption::new(tap_id, key.label.clone());
         let dirs: Vec<(uikit_egui::slide_menu::Dir8, uikit_egui::slide_menu::SlideOption)> = key
             .cardinal
             .iter()
-            .map(|(d, s)| (*d, uikit_egui::slide_menu::SlideOption::new(s.clone(), s.clone())))
+            .map(|(d, s)| {
+                let opt_id = match &key.steno_button {
+                    Some(btn) => steno_token(btn, dir_code(*d)),
+                    None => s.clone(),
+                };
+                (*d, uikit_egui::slide_menu::SlideOption::new(opt_id, s.clone()))
+            })
             .collect();
+        // Steno keys skip hairpin/rotation tracking entirely — GTK's own
+        // dispatcher does the same ("Hairpin/rotation/diagonals: not used
+        // by steno"), and `default_stenotype()` never sets rotate_cw/ccw
+        // or a diagonal, so there is nothing for that path to reach here.
+        // More importantly: the hairpin branch below calls
+        // `target.to_uppercase()` on whatever it finds in `key.cardinal`,
+        // which would silently mangle a steno token's ASCII letters
+        // (the embedded `\u{0}` byte itself is case-invariant, but
+        // `"steno:l1:n"` uppercasing to `"STENO:L1:N"` breaks the exact
+        // string match `decode_steno_token` needs) if a stray out-and-back
+        // ever got sampled on one of these keys.
+        if key.steno_button.is_some() {
+            let menu = uikit_egui::slide_menu::SlideMenu::new(id).item_size((size.y * 0.9).clamp(36.0, 52.0));
+            if let uikit_egui::slide_menu::SlideOutcome::Selected(v, _) = menu.show_cardinal(ui, id, &resp, &tap, &dirs) {
+                return Some(v);
+            }
+            return None;
+        }
         // HAIRPIN TRACKING, alongside show_cardinal rather than replacing it.
         //
         // `show_cardinal` resolves tap-vs-direction and does it well, but it has
@@ -697,6 +793,30 @@ pub fn voice_key(scene: &mut uikit_egui::A11yScene, layout: &Layout, action: uik
 mod tests {
     use super::*;
     use uikit_egui::DeviceClass;
+
+    #[test]
+    fn steno_token_round_trips() {
+        let tok = steno_token("L1", "N");
+        assert_eq!(decode_steno_token(&tok), Some(("L1", "N")));
+    }
+
+    #[test]
+    fn steno_token_is_not_confused_with_plain_text() {
+        // A layout with no steno keys should never accidentally produce
+        // something `decode_steno_token` matches — the reserved `\u{0}`
+        // prefix can't occur in real layout text.
+        assert_eq!(decode_steno_token("n"), None);
+        assert_eq!(decode_steno_token("N"), None);
+    }
+
+    #[test]
+    fn dir_code_is_stable_for_the_four_directions_steno_actually_uses() {
+        use uikit_egui::slide_menu::Dir8;
+        assert_eq!(dir_code(Dir8::N), "N");
+        assert_eq!(dir_code(Dir8::E), "E");
+        assert_eq!(dir_code(Dir8::S), "S");
+        assert_eq!(dir_code(Dir8::W), "W");
+    }
 
     #[test]
     fn qwerty_shape() {

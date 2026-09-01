@@ -111,7 +111,7 @@ pub struct WaylandVirtualKeyboard {
     /// in `VirtualKeyboardBackend::build()` should return a
     /// `NoopVirtualKeyboard` instead, but we keep the Option here so a
     /// late-failing setup doesn't crash the keyboard.
-    backend: Option<crate::compositor::wayland_backend::WaylandBackend>,
+    backend: Option<crate::wayland_backend::WaylandBackend>,
 }
 
 #[cfg(feature = "wayland")]
@@ -119,7 +119,7 @@ impl WaylandVirtualKeyboard {
     /// Build with an existing backend (typical path — `window.rs` creates
     /// the backend once and passes it here so the same connection is
     /// shared with the input-method listener).
-    pub fn with_backend(backend: crate::compositor::wayland_backend::WaylandBackend) -> Self {
+    pub fn with_backend(backend: crate::wayland_backend::WaylandBackend) -> Self {
         Self {
             backend: Some(backend),
         }

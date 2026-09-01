@@ -36,12 +36,21 @@
 //!   delivery. The compositor still does the show/hide based on
 //!   `text-input-v3` focus events; we just react to those.
 
-pub mod im_socket;
-pub mod placement;
-pub mod virtual_keyboard;
+// Virtual-keyboard delivery (Wayland/X11/no-op), the AT-SPI focus
+// watcher, and the input-method socket-fd capture all moved to
+// `board-compositor` (a GTK-free crate — see its doc comment). Re-export
+// under the same module paths so existing `crate::compositor::X` call
+// sites throughout this crate are unaffected by the move.
+pub use board_compositor::im_socket;
+pub use board_compositor::virtual_keyboard;
 
 #[cfg(feature = "wayland")]
-pub mod wayland_backend;
+pub use board_compositor::wayland_backend;
+
+#[cfg(all(feature = "wayland", feature = "dbus"))]
+pub use board_compositor::atspi_focus;
+
+pub mod placement;
 
 pub use placement::{configure_window_placement, Placement};
 pub use virtual_keyboard::{VirtualKeyboard, VirtualKeyboardBackend};

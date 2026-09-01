@@ -58,23 +58,13 @@ cpal = { version = "0.15", optional = true }
 hound = { version = "3.5", optional = true }
 ringbuf = { version = "0.4", optional = true }
 
-# Wayland virtual keyboard + input method protocols. We share GTK's
-# Wayland connection by enabling gdk4-wayland's `wayland_crate` feature,
-# which exposes the underlying `wl_display`/`wl_seat` as wayland-client
-# `WlDisplay`/`WlSeat`. That lets us bind protocol globals on the same
-# connection GDK is already pumping, so the input-method focus events
-# the compositor sends actually reach us (the compositor routes them to
-# only one input-method client per seat).
-wayland-client = { version = "0.31", optional = true }
-wayland-protocols = { version = "0.32", features = ["client", "unstable"], optional = true }
-wayland-protocols-misc = { version = "0.3", features = ["client"], optional = true }
-smithay-client-toolkit = { version = "0.19", optional = true }
-# gdk4-wayland exposes the GTK display's wl_display for sharing.
-# Must match the gtk-rs 0.10 release matrix above.
-gdk4-wayland = { version = "0.10", features = ["wayland_crate", "v4_4"], optional = true }
-# Xkbcommon, for synthesizing the keymap we send to the compositor and
-# resolving keysyms to keycodes for virtual_keyboard's key() events.
-xkbcommon = { version = "0.8", optional = true }
+# Wayland virtual keyboard + input-method protocols, X11/xdotool and
+# no-op fallbacks, and AT-SPI focus tracking — factored into its own
+# GTK-free crate (see that crate's doc for why) so the egui port can
+# depend on the same protocol code without pulling in GTK. This crate
+# still needs `gtk4-layer-shell` directly (below) for layer-shell
+# placement, which has no GTK-free equivalent to extract.
+board-compositor = { path = "crates/board-compositor", default-features = false }
 # GTK4 + layer-shell — anchors the keyboard window to the bottom edge of
 # the screen as a layer surface (so other windows resize around it and we
 # don't steal focus). This is the GTK4-friendly equivalent of what the
@@ -83,12 +73,6 @@ gtk4-layer-shell = { version = "0.7", optional = true }
 
 # Math for swipe gesture recognition
 nalgebra = "0.33"
-
-# libc for memfd_create (used by wayland keymap upload). The xkb keymap
-# we send the compositor goes through an anonymous in-memory file, and
-# memfd_create is the Linux-specific way to make one without leaving
-# anything on disk.
-libc = { version = "0.2", optional = true }
 
 # IPC (D-Bus for integration)
 zbus = { version = "4.4", default-features = false, features = ["tokio"], optional = true }
@@ -133,17 +117,15 @@ llm = ["reqwest"]
 # inject text on a Wayland session (useful only for dev/testing on X
 # or in a window).
 wayland = [
-    "wayland-client",
-    "wayland-protocols",
-    "wayland-protocols-misc",
-    "smithay-client-toolkit",
-    "gdk4-wayland",
-    "xkbcommon",
+    "board-compositor/wayland",
+    "board-compositor/gdk-integration",
     "gtk4-layer-shell",
-    "libc",
 ]
 # D-Bus IPC (show/hide, external control, future global-menu mirror).
-dbus = ["zbus"]
+# Also turns on board-compositor's AT-SPI focus watcher (X11-desktop
+# fallback) — it's D-Bus-based, so it rides the same feature rather than
+# inventing a third one for what's already a niche fallback path.
+dbus = ["zbus", "board-compositor/atspi"]
 # Experimental input surfaces beyond plain QWERTY/Dvorak tap+swipe:
 # cardinal grid, stenotype, character-draw canvas, and the
 # command/palette surface. Pure-Rust + GTK, no extra crates — the
