@@ -354,8 +354,18 @@ impl Transport for WireUdpTransport {
         // holds a SET per key, and a fresh random id every hour would fill
         // it with copies of us.
         let v = Value::new(content_id(&value), value);
-        // The token this peer handed us during the lookup that found it.
-        let token = self.token_for(to.addr);
+        // The token this peer handed us during the lookup that found it —
+        // or, if the lookup learned of this peer from a third party and
+        // never asked it anything, ask it now. A lookup's final shortlist
+        // is the k CLOSEST, not the k QUERIED, and a put to a peer we have
+        // not spoken to is refused with 401 by the reference. It does a
+        // `get` to every announce target for the same reason.
+        let mut token = self.token_for(to.addr);
+        if token.is_empty() {
+            let (tid, get) = self.query(Query::Get, &key, Vec::new(), Vec::new());
+            let _ = self.round_trip(to, tid, &get);
+            token = self.token_for(to.addr);
+        }
         let (tid, msg) = self.query(Query::Put, &key, vec![v], token);
         // Fire and forget: `store` returns nothing, so there is no way to
         // report a refusal; the reply is still awaited so a token in it is
@@ -467,13 +477,30 @@ mod tests {
         }
     }
 
+    /// Like `responder`, but answers the preliminary get a `store` to an
+    /// unspoken peer makes, and hands back the put that follows.
+    fn put_responder() -> (SocketAddr, std::thread::JoinHandle<Option<Msg>>) {
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let addr = sock.local_addr().unwrap();
+        let h = std::thread::spawn(move || {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let (n, from) = sock.recv_from(&mut buf).ok()?;
+            let Some(Msg::Query { tid, query: Query::Get, .. }) = Msg::decode(&buf[..n]) else { return None };
+            sock.send_to(&rep(tid, peer3(), vec![], vec![], vec![1], None).encode(), from).ok()?;
+            let (n, from) = sock.recv_from(&mut buf).ok()?;
+            let got = Msg::decode(&buf[..n])?;
+            if let Msg::Query { tid, values, .. } = &got {
+                sock.send_to(&rep(*tid, peer3(), vec![], vec![], vec![], values.first().map(|v| v.id)).encode(), from).ok()?;
+            }
+            Some(got)
+        });
+        (addr, h)
+    }
+
     #[test]
     fn a_put_carries_the_value_in_the_references_shape_with_a_content_id() {
-        let (addr, h) = responder(|q| match q {
-            Msg::Query { tid, query: Query::Put, values, .. } =>
-                Some(rep(tid, peer3(), vec![], vec![], vec![], values.first().map(|v| v.id))),
-            _ => None,
-        });
+        let (addr, h) = put_responder();
         let t = transport();
         t.store(&contact(addr), &contact(addr), id(2), b"record".to_vec(), 600);
         match h.join().unwrap() {
@@ -548,17 +575,42 @@ mod tests {
     }
 
     #[test]
-    fn a_put_to_a_peer_we_have_not_spoken_to_sends_no_token_rather_than_a_wrong_one() {
+    fn a_put_to_a_peer_we_have_not_spoken_to_asks_it_first_and_uses_its_token() {
+        // The lookup's shortlist can name a peer no query ever reached. A
+        // put there has no token and is refused; so the transport gets one.
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let addr = sock.local_addr().unwrap();
+        let h = std::thread::spawn(move || {
+            let mut buf = [0u8; MAX_DATAGRAM];
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let (n, from) = sock.recv_from(&mut buf).unwrap();
+                let Some(Msg::Query { tid, query, token, .. }) = Msg::decode(&buf[..n]) else { panic!() };
+                seen.push((query, token));
+                sock.send_to(&rep(tid, peer3(), vec![], vec![], vec![7, 7, 7], None).encode(), from).unwrap();
+            }
+            seen
+        });
+        let t = transport();
+        t.store(&contact(addr), &contact(addr), id(2), b"v".to_vec(), 600);
+        let seen = h.join().unwrap();
+        assert_eq!(seen[0].0, Query::Get, "a get must precede the put to an unspoken peer");
+        assert_eq!(seen[1].0, Query::Put);
+        assert_eq!(seen[1].1, vec![7, 7, 7], "the put carries the token the get earned");
+    }
+
+    #[test]
+    fn a_put_to_a_peer_that_answers_nothing_sends_no_token_rather_than_a_wrong_one() {
         let (addr, h) = responder(|q| match q {
-            Msg::Query { tid, .. } => Some(reply(tid, InfoHash([3u8; 20]))),
+            // The get goes unanswered (None); the put still goes out, empty.
+            Msg::Query { query: Query::Get, .. } => None,
             _ => None,
         });
         let t = transport();
         t.store(&contact(addr), &contact(addr), id(2), b"v".to_vec(), 600);
-        match h.join().unwrap() {
-            Some(Msg::Query { token, .. }) => assert!(token.is_empty()),
-            other => panic!("{other:?}"),
-        }
+        // The responder saw the get; the put followed it after a timeout.
+        assert!(matches!(h.join().unwrap(), Some(Msg::Query { query: Query::Get, .. })));
     }
 
     #[test]
