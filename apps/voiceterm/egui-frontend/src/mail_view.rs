@@ -266,7 +266,7 @@ pub fn list_ui(ui: &mut egui::Ui, view: &mut MailView,
     let mut clicked = None;
     ui.horizontal(|ui| {
         ui.label("🔍");
-        ui.text_edit_singleline(&mut view.query);
+        ui.add(egui::TextEdit::singleline(&mut view.query).id_salt("mail_view-view_query"));
         let n = view.unread_total();
         if n > 0 { ui.label(egui::RichText::new(format!("{n} unread")).color(colors.accent).small()); }
     });

@@ -75,7 +75,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     egui::CollapsingHeader::new("discover devices").show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label("subnet");
-            ui.text_edit_singleline(&mut app.push.subnet);
+            ui.add(egui::TextEdit::singleline(&mut app.push.subnet).id_salt("push-app_push_subnet"));
             ui.label(egui::RichText::new("(blank = auto)").weak().small());
             if ui.add_enabled(!app.task.is_running(), egui::Button::new("scan")).clicked() {
                 app.push.discovering = true;
@@ -106,9 +106,9 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 
     ui.horizontal(|ui| {
         ui.label("user");
-        ui.text_edit_singleline(&mut app.push.user);
+        ui.add(egui::TextEdit::singleline(&mut app.push.user).id_salt("push-app_push_user"));
         ui.label("host");
-        ui.text_edit_singleline(&mut app.push.host);
+        ui.add(egui::TextEdit::singleline(&mut app.push.host).id_salt("push-app_push_host"));
     });
     if !app.push.host.trim().is_empty() {
         ui.horizontal(|ui| {
@@ -136,7 +136,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     }
     ui.horizontal(|ui| {
         ui.label("target");
-        ui.text_edit_singleline(&mut app.push.target);
+        ui.add(egui::TextEdit::singleline(&mut app.push.target).id_salt("push-app_push_target"));
         if ui.button("check strategy").clicked() {
             let host_native = cockpit::buildflags::normalize_native(&cockpit::ops::native_triple_local());
             let path = std::env::var("PATH").unwrap_or_default();
@@ -164,7 +164,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     // something the install path cannot honour.
     ui.horizontal(|ui| {
         ui.label("device folder");
-        ui.text_edit_singleline(&mut app.push.dest);
+        ui.add(egui::TextEdit::singleline(&mut app.push.dest).id_salt("push-app_push_dest"));
         if ui.button("browse…").clicked() {
             let mut b = crate::remote_browse::Browser::new(&app.push.user, &app.push.host);
             // Starting at the destination already typed rather than at

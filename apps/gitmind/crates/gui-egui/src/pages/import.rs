@@ -42,7 +42,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 
     ui.horizontal(|ui| {
         ui.label("path");
-        ui.text_edit_singleline(&mut app.import.path);
+        ui.add(egui::TextEdit::singleline(&mut app.import.path).id_salt("import-app_import_path"));
     });
     let can = !app.task.is_running() && !app.import.path.trim().is_empty();
     ui.horizontal(|ui| {

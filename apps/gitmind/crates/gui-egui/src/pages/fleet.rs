@@ -276,7 +276,7 @@ fn reroll_ui(app: &mut App, ui: &mut egui::Ui) {
         // neither would fail once per step with the same message.
         ui.horizontal(|ui| {
             ui.label("fleet user");
-            ui.text_edit_singleline(&mut st.reroll_user);
+            ui.add(egui::TextEdit::singleline(&mut st.reroll_user).id_salt("fleet-st_reroll_user"));
             ui.label("password");
             // `password(true)` so it is not shouldered off a screen. It
             // is only needed for FIRST enrolment — after that the key is

@@ -150,7 +150,7 @@ pub fn section(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.label("File:");
-        ui.text_edit_singleline(&mut bt.file);
+        ui.add(egui::TextEdit::singleline(&mut bt.file).id_salt("bluetooth-bt_file"));
     });
 
     ui.add_space(8.0);

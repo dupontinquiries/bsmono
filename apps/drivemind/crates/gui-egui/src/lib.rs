@@ -141,11 +141,11 @@ fn tab_health(ui: &mut Ui, st: &mut ShellState, colors: &uikit_egui::PaletteColo
 fn tab_verify(ui: &mut Ui, st: &mut ShellState, colors: &uikit_egui::PaletteColors) {
     ui.horizontal(|ui| {
         ui.label("root");
-        ui.text_edit_singleline(&mut st.scan_root);
+        ui.add(egui::TextEdit::singleline(&mut st.scan_root).id_salt("lib-st_scan_root-1"));
     });
     ui.horizontal(|ui| {
         ui.label("manifest");
-        ui.text_edit_singleline(&mut st.manifest_path);
+        ui.add(egui::TextEdit::singleline(&mut st.manifest_path).id_salt("lib-st_manifest_path"));
     });
     ui.horizontal(|ui| {
         let root = std::path::PathBuf::from(&st.scan_root);
@@ -186,7 +186,7 @@ fn tab_verify(ui: &mut Ui, st: &mut ShellState, colors: &uikit_egui::PaletteColo
 fn tab_cleanup(ui: &mut Ui, st: &mut ShellState) {
     ui.horizontal(|ui| {
         ui.label("path");
-        ui.text_edit_singleline(&mut st.scan_root);
+        ui.add(egui::TextEdit::singleline(&mut st.scan_root).id_salt("lib-st_scan_root-2"));
         if ui.add_enabled(!st.busy, egui::Button::new("Scan")).clicked() {
             st.send(Task::Cleanup(std::path::PathBuf::from(&st.scan_root)));
         }
@@ -213,7 +213,7 @@ fn tab_cleanup(ui: &mut Ui, st: &mut ShellState) {
 fn tab_videos(ui: &mut Ui, st: &mut ShellState) {
     ui.horizontal(|ui| {
         ui.label("path");
-        ui.text_edit_singleline(&mut st.scan_root);
+        ui.add(egui::TextEdit::singleline(&mut st.scan_root).id_salt("lib-st_scan_root-3"));
         if ui.add_enabled(!st.busy, egui::Button::new("Find candidates")).clicked() {
             st.send(Task::Videos(std::path::PathBuf::from(&st.scan_root)));
         }

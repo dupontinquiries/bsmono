@@ -110,7 +110,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.label("fetch from a peer");
     ui.horizontal(|ui| {
         ui.label("address");
-        ui.text_edit_singleline(&mut app.share.peer_addr);
+        ui.add(egui::TextEdit::singleline(&mut app.share.peer_addr).id_salt("share-app_share_peer_addr"));
         let can = !app.share.peer_addr.trim().is_empty() && !app.task.is_running();
         if ui.add_enabled(can, egui::Button::new("look up")).clicked() {
             match cockpit::netshare::lookup_peer(app.share.peer_addr.trim(),
@@ -145,7 +145,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         }
         ui.horizontal(|ui| {
             ui.label("into");
-            ui.text_edit_singleline(&mut app.share.dest);
+            ui.add(egui::TextEdit::singleline(&mut app.share.dest).id_salt("share-app_share_dest"));
         });
         let can_fetch = !app.task.is_running() && !provider.is_empty();
         if ui.add_enabled(can_fetch, egui::Button::new("fetch")).clicked() {

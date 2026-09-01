@@ -114,7 +114,7 @@ pub fn deck_ui(ui: &mut egui::Ui, d: &mut Deck,
                colors: &uikit_egui::PaletteColors) -> Option<String> {
     let mut opened = None;
     ui.horizontal(|ui| {
-        ui.text_edit_singleline(&mut d.query);
+        ui.add(egui::TextEdit::singleline(&mut d.query).id_salt("cards_view-d_query"));
         ui.checkbox(&mut d.hide_code, "hide code");
         if d.selected().is_some() && ui.small_button("merge ↓").clicked() {
             d.merge_with_next();

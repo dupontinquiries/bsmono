@@ -892,7 +892,7 @@ pub fn show_tree(ui: &mut egui::Ui, roots: &Roots, state: &mut TreeState,
     }
     ui.horizontal(|ui| {
         ui.label("find:");
-        ui.text_edit_singleline(&mut state.filter);
+        ui.add(egui::TextEdit::singleline(&mut state.filter).id_salt("library-state_filter"));
         if ui.small_button("⟳").on_hover_text("rescan").clicked() { state.refresh(); }
     });
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {

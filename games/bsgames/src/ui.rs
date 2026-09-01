@@ -159,7 +159,7 @@ impl GameCentre {
     fn profile_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Name:").weak().small());
-            if ui.text_edit_singleline(&mut self.name_edit).lost_focus() && !self.name_edit.trim().is_empty() {
+            if ui.add(egui::TextEdit::singleline(&mut self.name_edit).id_salt("ui-self_name_edit-1")).lost_focus() && !self.name_edit.trim().is_empty() {
                 let name = self.name_edit.trim().to_string();
                 self.identity.name = name.clone();
                 self.identity.save();
@@ -200,7 +200,7 @@ impl GameCentre {
     fn add_friend_section(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Add a friend by id:").weak().small());
-            ui.text_edit_singleline(&mut self.add_friend_input);
+            ui.add(egui::TextEdit::singleline(&mut self.add_friend_input).id_salt("ui-self_add_friend_input"));
             if ui.button("add").clicked() {
                 match centre::add_friend(&mut self.me, &mut self.svc, &self.add_friend_input) {
                     Ok(name) => {
@@ -234,7 +234,7 @@ impl GameCentre {
                 WizardPhase::Name => {
                     ui.heading("What should friends call you?");
                     ui.add_space(8.0);
-                    ui.text_edit_singleline(&mut self.name_edit);
+                    ui.add(egui::TextEdit::singleline(&mut self.name_edit).id_salt("ui-self_name_edit-2"));
                     ui.add_space(16.0);
                     ui.horizontal(|ui| {
                         if ui.button("Back").clicked() {
@@ -339,7 +339,7 @@ impl GameCentre {
             }
         });
         ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut self.chat_input);
+            ui.add(egui::TextEdit::singleline(&mut self.chat_input).id_salt("ui-self_chat_input"));
             if ui.button("send").clicked() && !self.chat_input.trim().is_empty() {
                 let msg = std::mem::take(&mut self.chat_input);
                 // real path: sealed posting into the DM feed on the fleet DHT store

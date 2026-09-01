@@ -266,7 +266,7 @@ pub fn settings_panel(
     if prefs.voice.offload_enabled {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("host:").weak().small());
-            ui.text_edit_singleline(&mut prefs.voice.compute_host);
+            ui.add(egui::TextEdit::singleline(&mut prefs.voice.compute_host).id_salt("shell-prefs_voice_compute_host"));
         });
     }
     uikit_egui::a11y::semantic_toggle(
@@ -353,7 +353,7 @@ pub fn settings_panel(
     ui.label(egui::RichText::new("models").strong());
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("pool directory:").weak().small());
-        ui.text_edit_singleline(&mut prefs.pool_dir);
+        ui.add(egui::TextEdit::singleline(&mut prefs.pool_dir).id_salt("shell-prefs_pool_dir"));
     });
 
     ui.add_space(10.0);

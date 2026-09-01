@@ -294,7 +294,7 @@ pub fn wizard_body(ui: &mut egui::Ui, s: &mut WizardState<'_>) -> WizardOut {
         // r179: name the world (action 7 applies).
         ui.horizontal(|ui| {
             ui.label("name:");
-            let resp = ui.text_edit_singleline(s.name_buf);
+            let resp = ui.add(egui::TextEdit::singleline(s.name_buf).id_salt("live_menu-name_buf"));
             // r205: focus the name box the first frame the wizard opens, so
             // typing works without a precise click on the field.
             if s.focus_name {
@@ -323,7 +323,7 @@ pub fn wizard_body(ui: &mut egui::Ui, s: &mut WizardState<'_>) -> WizardOut {
         // r181: type a seed directly (Enter/apply).
         ui.horizontal(|ui| {
             ui.label("seed:");
-            let resp = ui.text_edit_singleline(s.seed_buf);
+            let resp = ui.add(egui::TextEdit::singleline(s.seed_buf).id_salt("live_menu-seed_buf"));
             if resp.lost_focus() || wiz_button(ui, "apply") {
                 out.pick = 8;
             }

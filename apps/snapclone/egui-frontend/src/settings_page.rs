@@ -577,7 +577,7 @@ fn heading(ui: &mut egui::Ui, text: &str, colors: &uikit_egui::PaletteColors) {
 
 fn general_ui(ui: &mut egui::Ui, g: &mut General, colors: &uikit_egui::PaletteColors, a11y: &mut uikit_egui::a11y::A11yScene) {
     heading(ui, "Identity", colors);
-    ui.text_edit_singleline(&mut g.display_name);
+    ui.add(egui::TextEdit::singleline(&mut g.display_name).id_salt("settings_page-g_display_name"));
 
     heading(ui, "Appearance", colors);
     // The persisted value is the palette's `as_str` slug and the label is its
@@ -657,7 +657,7 @@ fn camera_ui(ui: &mut egui::Ui, c: &mut Camera,
              policy: &mut crate::camera_policy::CameraPolicy,
              colors: &uikit_egui::PaletteColors, a11y: &mut uikit_egui::a11y::A11yScene) {
     heading(ui, "Camera", colors);
-    ui.text_edit_singleline(&mut c.device);
+    ui.add(egui::TextEdit::singleline(&mut c.device).id_salt("settings_page-c_device"));
     uikit_egui::a11y::semantic_toggle(
         ui, a11y, egui::Id::new("snapclone.settings.mirror_front").value(),
         "mirror the front camera", &mut c.mirror_front);
@@ -779,7 +779,7 @@ fn storage_ui(ui: &mut egui::Ui, s: &mut Storage, colors: &uikit_egui::PaletteCo
         egui::DragValue::new(&mut s.keep_days).range(0..=3650).suffix(" days"));
 
     heading(ui, "Export", colors);
-    ui.text_edit_singleline(&mut s.export_dir);
+    ui.add(egui::TextEdit::singleline(&mut s.export_dir).id_salt("settings_page-s_export_dir"));
     ui.horizontal(|ui| {
         ui.label("auto-sync");
         ui.add(egui::TextEdit::singleline(&mut s.auto_sync_path).id_salt("settings_page-s_auto_sync_path")

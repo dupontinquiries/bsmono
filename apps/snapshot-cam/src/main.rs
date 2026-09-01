@@ -108,7 +108,7 @@ impl eframe::App for Cam {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label("send to:");
-                ui.text_edit_singleline(&mut self.contact);
+                ui.add(egui::TextEdit::singleline(&mut self.contact).id_salt("main-self_contact"));
             });
 
             if !self.note.is_empty() {

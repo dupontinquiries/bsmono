@@ -1134,7 +1134,7 @@ impl FpsApp {
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Friend's name:").monospace().size(12.0).color(dim()));
-                            ui.text_edit_singleline(&mut self.mp_friend_input);
+                            ui.add(egui::TextEdit::singleline(&mut self.mp_friend_input).id_salt("app-self_mp_friend_input"));
                         });
                         if menu_button(ui, "Join").clicked() {
                             let friend = self.mp_friend_input.trim().to_string();

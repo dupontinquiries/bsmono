@@ -170,11 +170,11 @@ pub fn soundscape_ui(ui: &mut egui::Ui, s: &mut Soundscape,
     ui.horizontal(|ui| {
         ui.label("in");
         let mut p = s.input_path.clone();
-        if ui.text_edit_singleline(&mut p).changed() { s.set_input(&p); }
+        if ui.add(egui::TextEdit::singleline(&mut p).id_salt("soundscape-p")).changed() { s.set_input(&p); }
     });
     ui.horizontal(|ui| {
         ui.label("out");
-        ui.text_edit_singleline(&mut s.output_path);
+        ui.add(egui::TextEdit::singleline(&mut s.output_path).id_salt("soundscape-s_output_path"));
     });
     ui.separator();
     ui.horizontal(|ui| {

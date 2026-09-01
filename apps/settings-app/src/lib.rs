@@ -132,7 +132,7 @@ impl SettingsEditor {
         }
         ui.horizontal(|ui| {
             ui.label("model pool dir:");
-            ui.text_edit_singleline(&mut self.prefs.pool_dir);
+            ui.add(egui::TextEdit::singleline(&mut self.prefs.pool_dir).id_salt("lib-self_prefs_pool_dir"));
         });
         ui.colored_label(colors.text_weak, "directory of *.gguf the fabric daemon shares to the LAN pool");
         ui.add_space(6.0);
@@ -244,7 +244,7 @@ impl SettingsEditor {
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut self.new_partner);
+            ui.add(egui::TextEdit::singleline(&mut self.new_partner).id_salt("lib-self_new_partner"));
             if ui.button("add partner").clicked() {
                 let id = self.new_partner.trim().to_string();
                 if !id.is_empty() && !self.prefs.voice.partners.contains(&id) {

@@ -505,7 +505,7 @@ impl Dashboard {
                     }
                     ui.horizontal(|ui| {
                         ui.colored_label(c.text, "Arg template ({in}, {out})");
-                        ui.text_edit_singleline(&mut cfg.tool_args);
+                        ui.add(egui::TextEdit::singleline(&mut cfg.tool_args).id_salt("lib-cfg_tool_args"));
                     });
                 }
                 ui.collapsing("Pipeline parameters", |ui| {

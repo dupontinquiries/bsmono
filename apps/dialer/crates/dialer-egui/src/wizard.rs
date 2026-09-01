@@ -211,7 +211,7 @@ impl Wizard {
 
         ui.horizontal(|ui| {
             ui.label("Search:");
-            ui.text_edit_singleline(&mut self.search);
+            ui.add(egui::TextEdit::singleline(&mut self.search).id_salt("wizard-self_search"));
         });
         let hits: Vec<Apn> =
             providers::search(&self.apns, &self.search).into_iter().take(30).cloned().collect();
@@ -226,16 +226,16 @@ impl Wizard {
         ui.add_space(8.0);
         egui::Grid::new("apn-fields").num_columns(2).show(ui, |ui| {
             ui.label("Carrier");
-            ui.text_edit_singleline(&mut self.carrier);
+            ui.add(egui::TextEdit::singleline(&mut self.carrier).id_salt("wizard-self_carrier"));
             ui.end_row();
             ui.label("APN");
-            ui.text_edit_singleline(&mut self.apn);
+            ui.add(egui::TextEdit::singleline(&mut self.apn).id_salt("wizard-self_apn"));
             ui.end_row();
             ui.label("Username");
-            ui.text_edit_singleline(&mut self.username);
+            ui.add(egui::TextEdit::singleline(&mut self.username).id_salt("wizard-self_username"));
             ui.end_row();
             ui.label("Password");
-            ui.text_edit_singleline(&mut self.password);
+            ui.add(egui::TextEdit::singleline(&mut self.password).id_salt("wizard-self_password"));
             ui.end_row();
         });
         if let Some(fb) = &self.apply_feedback {
@@ -306,10 +306,10 @@ impl Wizard {
 
         egui::Grid::new("mx-fields").num_columns(2).show(ui, |ui| {
             ui.label("Homeserver");
-            ui.text_edit_singleline(&mut self.mx_server);
+            ui.add(egui::TextEdit::singleline(&mut self.mx_server).id_salt("wizard-self_mx_server"));
             ui.end_row();
             ui.label("User");
-            ui.text_edit_singleline(&mut self.mx_user);
+            ui.add(egui::TextEdit::singleline(&mut self.mx_user).id_salt("wizard-self_mx_user"));
             ui.end_row();
             ui.label("Password");
             ui.add(egui::TextEdit::singleline(&mut self.mx_password).id_salt("wizard-self_mx_password").password(true));

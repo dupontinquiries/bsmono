@@ -334,7 +334,7 @@ impl TomeApp {
     fn draw_library_screen(&mut self, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
         ui.horizontal(|ui| {
             ui.label("Search:");
-            ui.text_edit_singleline(&mut self.library_query);
+            ui.add(egui::TextEdit::singleline(&mut self.library_query).id_salt("main-self_library_query"));
             egui::ComboBox::from_label("Sort")
                 .selected_text(self.sort_key.label())
                 .show_ui(ui, |ui| {
@@ -601,10 +601,10 @@ impl TomeApp {
         // recall prompt.
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(RichText::new("New note / card").color(colors.text_weak).small());
-            ui.text_edit_multiline(&mut self.flashcard_new_front);
+            ui.add(egui::TextEdit::multiline(&mut self.flashcard_new_front).id_salt("main-self_flashcard_new_front"));
             ui.horizontal(|ui| {
                 ui.label("Answer (optional):");
-                ui.text_edit_singleline(&mut self.flashcard_new_back);
+                ui.add(egui::TextEdit::singleline(&mut self.flashcard_new_back).id_salt("main-self_flashcard_new_back"));
             });
             ui.horizontal(|ui| {
                 let can_add = !self.flashcard_new_front.trim().is_empty();

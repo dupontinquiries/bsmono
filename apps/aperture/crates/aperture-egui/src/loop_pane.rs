@@ -124,7 +124,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, _now_ms: 
             let cfg = &mut state.logscope_cfg;
             ui.horizontal(|ui| {
                 ui.label(RichText::new("host").color(colors.text_weak));
-                changed |= ui.text_edit_singleline(&mut cfg.host).lost_focus();
+                changed |= ui.add(egui::TextEdit::singleline(&mut cfg.host).id_salt("loop_pane-cfg_host")).lost_focus();
                 ui.label(RichText::new("key").color(colors.text_weak));
                 changed |= ui.add(egui::TextEdit::singleline(&mut cfg.key).id_salt("loop_pane-cfg_key").password(true).desired_width(120.0)).lost_focus();
             });
@@ -158,11 +158,11 @@ pub fn show(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, _now_ms: 
         ProviderKind::Ollama => {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("host").color(colors.text_weak));
-                changed |= ui.text_edit_singleline(&mut state.ollama_cfg.host).lost_focus();
+                changed |= ui.add(egui::TextEdit::singleline(&mut state.ollama_cfg.host).id_salt("loop_pane-state_ollama_cfg_host")).lost_focus();
             });
             ui.horizontal(|ui| {
                 ui.label(RichText::new("model").color(colors.text_weak));
-                changed |= ui.text_edit_singleline(&mut state.ollama_cfg.model).lost_focus();
+                changed |= ui.add(egui::TextEdit::singleline(&mut state.ollama_cfg.model).id_salt("loop_pane-state_ollama_cfg_model")).lost_focus();
             });
             let mut np = state.ollama_cfg.num_predict as u32;
             if ui.add(egui::Slider::new(&mut np, 16..=256).text("max tokens")).changed() {
@@ -177,7 +177,7 @@ pub fn show(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, _now_ms: 
         }
         ProviderKind::Command => {
             ui.label(RichText::new("argv — stdin gets `prefix NUL suffix`, stdout is the completion").color(colors.text_weak).small());
-            changed |= ui.text_edit_singleline(&mut state.command_line).lost_focus();
+            changed |= ui.add(egui::TextEdit::singleline(&mut state.command_line).id_salt("loop_pane-state_command_line")).lost_focus();
         }
         ProviderKind::Demo => {
             ui.label(

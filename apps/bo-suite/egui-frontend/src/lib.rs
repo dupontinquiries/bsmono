@@ -1462,7 +1462,7 @@ impl Controller {
         // The real paged list: sort tabs, search, and the empty state that says
         // WHICH empty it is.
         ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut self.search.query);
+            ui.add(egui::TextEdit::singleline(&mut self.search.query).id_salt("lib-self_search_query"));
             if !self.search.tag.is_empty() {
                 if ui.button(format!("tag: {} ×", self.search.tag)).clicked() {
                     self.search.tag.clear();

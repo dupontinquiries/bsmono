@@ -112,7 +112,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.label("New branch:");
-        ui.text_edit_singleline(&mut app.branches.new_name);
+        ui.add(egui::TextEdit::singleline(&mut app.branches.new_name).id_salt("branches-app_branches_new_name"));
         let usable = name_is_usable(&app.branches.new_name);
         // Disabled rather than hidden, so the button shows the feature exists
         // and the name field shows why it is not available yet.

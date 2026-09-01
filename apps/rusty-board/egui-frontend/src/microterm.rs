@@ -171,7 +171,7 @@ pub fn microterm_ui(ui: &mut egui::Ui, m: &mut Microterm,
             });
         }
         Content::LlmPrompt { mut draft } => {
-            if ui.text_edit_singleline(&mut draft).changed() {
+            if ui.add(egui::TextEdit::singleline(&mut draft).id_salt("microterm-draft")).changed() {
                 m.set_content(Content::LlmPrompt { draft });
             }
         }

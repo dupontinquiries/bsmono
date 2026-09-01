@@ -474,7 +474,14 @@ pub fn semantic_toggle(ui: &mut Ui, scene: &mut A11yScene, id: u64, label: &str,
 /// necessarily `label` and this function has no way to infer one from the other.
 /// Returns true when the text changed this frame.
 pub fn semantic_text_edit(ui: &mut Ui, scene: &mut A11yScene, id: u64, label: &str, text: &mut String) -> bool {
-    let resp = ui.text_edit_singleline(text);
+    // The `id` this function already takes for the a11y scene is passed to the
+    // widget too. It was not, and the field therefore fell back to egui's
+    // position-derived id — which is the single-character input bug: focus is
+    // tracked by id, so any reflow (including the one caused by typing into a
+    // wrapped row) silently drops it after the first keystroke. Every caller
+    // was already supplying a stable id for accessibility; nothing had to be
+    // added at the call sites, the value just had to reach the widget.
+    let resp = ui.add(egui::TextEdit::singleline(text).id_salt(("a11y-field", id)));
     scene.add(id, Semantics::field(label, text), Some(resp.rect));
     resp.changed()
 }

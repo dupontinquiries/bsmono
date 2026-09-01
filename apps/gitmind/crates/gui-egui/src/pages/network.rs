@@ -23,9 +23,9 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 
     ui.horizontal(|ui| {
         ui.label("user");
-        ui.text_edit_singleline(&mut app.net.user);
+        ui.add(egui::TextEdit::singleline(&mut app.net.user).id_salt("network-app_net_user"));
         ui.label("host");
-        ui.text_edit_singleline(&mut app.net.host);
+        ui.add(egui::TextEdit::singleline(&mut app.net.host).id_salt("network-app_net_host"));
     });
     let idle = !app.task.is_running();
     let can = idle && !app.net.host.trim().is_empty();

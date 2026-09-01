@@ -247,7 +247,7 @@ impl eframe::App for App {
             Page::Library => {
                 uikit_egui::row(ui, |ui| {
                     ui.label("root");
-                    ui.text_edit_singleline(&mut self.root);
+                    ui.add(egui::TextEdit::singleline(&mut self.root).id_salt("main-self_root"));
                     if carved::button_accent(ui, "Scan", pal.bg_card, pal.accent, pal.text, &skin).clicked() {
                         self.rescan();
                     }
@@ -349,7 +349,7 @@ impl eframe::App for App {
             Page::Raids => {
                 uikit_egui::row(ui, |ui| {
                     ui.label("maps");
-                    ui.text_edit_singleline(&mut self.maps_path);
+                    ui.add(egui::TextEdit::singleline(&mut self.maps_path).id_salt("main-self_maps_path"));
                     ui.add(egui::Slider::new(&mut self.raid_phases, 2..=6).text("phases"));
                     let mut s64 = self.raid_seed as i64;
                     if ui.add(egui::Slider::new(&mut s64, 1..=999).text("seed")).changed() {
@@ -445,7 +445,7 @@ impl eframe::App for App {
                 });
                 uikit_egui::row(ui, |ui| {
                     ui.label("target");
-                    ui.text_edit_singleline(&mut self.fill_target);
+                    ui.add(egui::TextEdit::singleline(&mut self.fill_target).id_salt("main-self_fill_target"));
                     if self.selected.is_some()
                        && carved::button(ui, "use Library selection", pal.bg_card, pal.accent,
                                          pal.text, &skin).clicked() {
@@ -456,7 +456,7 @@ impl eframe::App for App {
                 });
                 uikit_egui::row(ui, |ui| {
                     ui.label("catalog");
-                    ui.text_edit_singleline(&mut self.fill_catalog);
+                    ui.add(egui::TextEdit::singleline(&mut self.fill_catalog).id_salt("main-self_fill_catalog"));
                     if carved::button(ui, "Harvest one", pal.bg_card, pal.accent, pal.text,
                                       &skin).clicked() {
                         let c = format!("assetkit-cli harvest {} --out hcat --min-tris 150",
@@ -557,7 +557,7 @@ impl eframe::App for App {
             Page::Export => {
                 uikit_egui::row(ui, |ui| {
                     ui.label("output");
-                    ui.text_edit_singleline(&mut self.out_dir);
+                    ui.add(egui::TextEdit::singleline(&mut self.out_dir).id_salt("main-self_out_dir"));
                 });
                 ui.separator();
                 // Exports shell out to the python pipeline rather than reimplementing
@@ -622,7 +622,7 @@ impl eframe::App for App {
                     });
                     uikit_egui::row(ui, |ui| {
                         ui.label("donors");
-                        ui.text_edit_singleline(&mut self.donors_path);
+                        ui.add(egui::TextEdit::singleline(&mut self.donors_path).id_salt("main-self_donors_path-1"));
                         if carved::button_accent(ui, "Export placements", pal.bg_card,
                                                  pal.accent, pal.text, &skin).clicked() {
                             let c = format!("assetkit-cli place {} --out placement",
@@ -651,7 +651,7 @@ impl eframe::App for App {
                     });
                     uikit_egui::row(ui, |ui| {
                         ui.label("donors");
-                        ui.text_edit_singleline(&mut self.donors_path);
+                        ui.add(egui::TextEdit::singleline(&mut self.donors_path).id_salt("main-self_donors_path-2"));
                         for (l, m) in [("decimate", "decimate"), ("box", "box")] {
                             if carved::pill(ui, l, pal.bg_card, pal.accent, pal.text, &skin,
                                             self.degrade == m).clicked() {
@@ -673,7 +673,7 @@ impl eframe::App for App {
                     });
                     uikit_egui::row(ui, |ui| {
                         ui.label("pairs");
-                        ui.text_edit_singleline(&mut self.pairs_path);
+                        ui.add(egui::TextEdit::singleline(&mut self.pairs_path).id_salt("main-self_pairs_path"));
                         ui.add(egui::Slider::new(&mut self.epochs, 1..=2000).text("epochs"));
                         ui.add(egui::Slider::new(&mut self.l1_weight, 0.0..=200.0).text("L1"));
                     });

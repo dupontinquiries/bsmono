@@ -4112,7 +4112,7 @@ impl App {
         egui::Window::new("Find in the timeline").open(&mut open).resizable(false)
             .default_width(460.0).show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let r = ui.text_edit_singleline(&mut ui_state.query);
+                    let r = ui.add(egui::TextEdit::singleline(&mut ui_state.query).id_salt("lib-ui_state_query"));
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         run = true;
                     }
@@ -4247,7 +4247,7 @@ impl App {
                 }
                 if let Some(i) = remove { a.artists.remove(i); }
                 ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut a.artist_input);
+                    ui.add(egui::TextEdit::singleline(&mut a.artist_input).id_salt("lib-a_artist_input"));
                     if ui.button("add").clicked() && !a.artist_input.trim().is_empty() {
                         a.artists.push(a.artist_input.trim().to_string());
                         a.artist_input.clear();
@@ -4264,7 +4264,7 @@ impl App {
                 }
                 if let Some(i) = remove { a.paths.remove(i); }
                 ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut a.path_input);
+                    ui.add(egui::TextEdit::singleline(&mut a.path_input).id_salt("lib-a_path_input"));
                     if ui.button("add").clicked() && !a.path_input.trim().is_empty() {
                         a.paths.push(a.path_input.trim().to_string());
                         a.path_input.clear();

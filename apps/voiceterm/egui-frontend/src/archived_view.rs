@@ -123,7 +123,7 @@ pub fn archive_ui(ui: &mut egui::Ui, v: &mut ArchiveView, pages: &[ArchivedPage]
                   colors: &uikit_egui::PaletteColors) -> Option<String> {
     let mut opened = None;
     ui.horizontal(|ui| {
-        ui.text_edit_singleline(&mut v.query);
+        ui.add(egui::TextEdit::singleline(&mut v.query).id_salt("archived_view-v_query"));
         ui.checkbox(&mut v.grouped, "by domain");
         if !v.domain.is_empty() && ui.small_button(format!("{} ✕", v.domain)).clicked() {
             v.domain.clear();

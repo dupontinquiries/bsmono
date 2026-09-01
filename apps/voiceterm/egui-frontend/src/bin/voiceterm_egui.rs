@@ -704,7 +704,7 @@ impl VoicetermApp {
         // The QML puts the palette in a right-edge drawer (paletteDrawer,
         // main.qml:31310), not a floating window; the form table agrees.
         let out = overlay::show(ctx, Surface::Palette, open_t, |ui| {
-                let resp = ui.text_edit_singleline(&mut self.palette_query);
+                let resp = ui.add(egui::TextEdit::singleline(&mut self.palette_query).id_salt("voiceterm_egui-self_palette_query"));
                 // Focused on open, because a palette you have to click into
                 // costs the keystroke it exists to save.
                 resp.request_focus();
@@ -1209,7 +1209,7 @@ impl eframe::App for VoicetermApp {
             let colors = self.colors.clone();
             let out = overlay::show(ctx, Surface::Workspaces, open_t, |ui| {
                 ui.heading("Workspaces");
-                ui.text_edit_singleline(&mut self.workspaces_filter);
+                ui.add(egui::TextEdit::singleline(&mut self.workspaces_filter).id_salt("voiceterm_egui-self_workspaces_filter"));
                 // The live session only shows at two or more tabs, matching
                 // the tab strip's own rule — a page that showed a one-tab
                 // session while the strip hid it would look like one of the
@@ -1440,7 +1440,7 @@ impl eframe::App for VoicetermApp {
             // command's output.
             ui.horizontal(|ui| {
                 ui.label("date:");
-                ui.text_edit_singleline(&mut self.date_phrase);
+                ui.add(egui::TextEdit::singleline(&mut self.date_phrase).id_salt("voiceterm_egui-self_date_phrase"));
                 let q = self.date_phrase.trim().to_string();
                 if !q.is_empty() && ui.small_button("ask").clicked() {
                     // TODAY is passed in, not read here: date_phrase is pure so
@@ -1468,7 +1468,7 @@ impl eframe::App for VoicetermApp {
             // on the move, one-handed, on a phone" — and had no surface at all.
             ui.horizontal(|ui| {
                 ui.label("say:");
-                let r = ui.text_edit_singleline(&mut self.editor_phrase);
+                let r = ui.add(egui::TextEdit::singleline(&mut self.editor_phrase).id_salt("voiceterm_egui-self_editor_phrase"));
                 // The editor is a CHOICE, not a guess: helix and vim diverge
                 // exactly where their keymaps do, and translating a phrase for
                 // the wrong one sends valid keystrokes that mean something else.
@@ -2161,7 +2161,7 @@ impl eframe::App for VoicetermApp {
                         // OpenDrafts is built on, and it had no surface at all.
                         ui.horizontal(|ui| {
                             ui.label("say:");
-                            ui.text_edit_singleline(&mut self.mail_phrase);
+                            ui.add(egui::TextEdit::singleline(&mut self.mail_phrase).id_salt("voiceterm_egui-self_mail_phrase"));
                         });
                         if !self.mail_phrase.trim().is_empty() {
                             let sel = voiceterm_egui::mail_selector::parse_selector(
@@ -2257,7 +2257,7 @@ impl eframe::App for VoicetermApp {
                             //
                             // Edit the field itself; commit on Enter or on
                             // focus loss.
-                            let r = ui.text_edit_singleline(&mut self.browser.url);
+                            let r = ui.add(egui::TextEdit::singleline(&mut self.browser.url).id_salt("voiceterm_egui-self_browser_url"));
                             let entered = r.lost_focus()
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
                             if entered || r.lost_focus() {
@@ -2475,7 +2475,7 @@ impl eframe::App for VoicetermApp {
                         use voiceterm_egui::corpus_tape as ct;
                         ui.horizontal(|ui| {
                             ui.label("read aloud:");
-                            ui.text_edit_singleline(&mut self.tape_reference);
+                            ui.add(egui::TextEdit::singleline(&mut self.tape_reference).id_salt("voiceterm_egui-self_tape_reference"));
                             if !self.tape.is_active() {
                                 // Refused without a reference rather than
                                 // recorded and discarded later: worth_keeping
@@ -2663,7 +2663,7 @@ impl eframe::App for VoicetermApp {
                         use voiceterm_egui::model_picker as mp;
                         ui.horizontal(|ui| {
                             ui.label("search:");
-                            ui.text_edit_singleline(&mut self.model_query);
+                            ui.add(egui::TextEdit::singleline(&mut self.model_query).id_salt("voiceterm_egui-self_model_query"));
                             if ui.button("open").clicked() && !self.model_query.trim().is_empty() {
                                 // URL construction, not fetching: this crate has
                                 // no HTTP client and the module was written to
@@ -2911,7 +2911,7 @@ impl eframe::App for VoicetermApp {
                                     bl::Listing::Here => bl::Listing::Orphans,
                                 };
                             }
-                            ui.text_edit_singleline(&mut self.backlinks.query);
+                            ui.add(egui::TextEdit::singleline(&mut self.backlinks.query).id_salt("voiceterm_egui-self_backlinks_query"));
                         });
                         // The empty reason is SHOWN, not collapsed into "no
                         // results": not-indexed, no-match and nothing-links
@@ -2963,7 +2963,7 @@ impl eframe::App for VoicetermApp {
                                     self.build.show = Show::Category(cat);
                                 }
                             }
-                            ui.text_edit_singleline(&mut self.build.query);
+                            ui.add(egui::TextEdit::singleline(&mut self.build.query).id_salt("voiceterm_egui-self_build_query"));
                         });
                         // rows() borrows the view; jump() mutates it (it
                         // records the selection). Collect the labels first so

@@ -2876,7 +2876,7 @@ impl Snapclone {
                 let mut child = ui.new_child(
                     egui::UiBuilder::new().max_rect(area.shrink(12.0)));
                 child.colored_label(colors.text, format!("rename {}", self.editor_id));
-                child.text_edit_singleline(&mut self.editor_name);
+                child.add(egui::TextEdit::singleline(&mut self.editor_name).id_salt("lib-editor_name"));
                 let ok = !self.editor_name.trim().is_empty();
                 child.horizontal(|ui| {
                     // Disabled on empty rather than accepting and silently
@@ -3481,7 +3481,7 @@ impl Snapclone {
         // the composer, over the captured frame
         ui.horizontal(|ui| {
             ui.label("caption");
-            let cap = ui.text_edit_singleline(&mut self.composer.caption);
+            let cap = ui.add(egui::TextEdit::singleline(&mut self.composer.caption).id_salt("lib-self_composer_caption"));
             // THE KEYBOARD INSET, finally fed. apply_keyboard_inset has been
             // written and tested since the port and nothing ever called it —
             // the manifest records the gap as an open on-device task, because
@@ -3626,7 +3626,7 @@ impl Snapclone {
         // The contact picker, so Friends is a place you DO something rather
         // than a list you look at.
         ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut self.picker.query);
+            ui.add(egui::TextEdit::singleline(&mut self.picker.query).id_salt("lib-self_picker_query"));
             let multi = self.picker.is_multi();
             if ui.selectable_label(multi, "multi").clicked() {
                 self.picker.mode = if multi { crate::contacts::PickMode::Single }
@@ -4383,7 +4383,7 @@ impl Snapclone {
             let n = self.conversation.unopened();
             if n > 0 { ui.colored_label(c.accent, format!("{n} unopened")); }
             ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.conversation.draft);
+                ui.add(egui::TextEdit::singleline(&mut self.conversation.draft).id_salt("lib-self_conversation_draft"));
                 if ui.add_enabled(self.conversation.can_send(),
                                   egui::Button::new("send")).clicked() {
                     self.conversation.take_draft();

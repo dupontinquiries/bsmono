@@ -690,7 +690,7 @@ impl App {
         ui.label(egui::RichText::new("library").small());
         ui.horizontal(|ui| {
             let mut path = self.cfg.data_dir.to_string_lossy().to_string();
-            if ui.text_edit_singleline(&mut path).changed() {
+            if ui.add(egui::TextEdit::singleline(&mut path).id_salt("gui-path")).changed() {
                 self.cfg.data_dir = path.into();
             }
             if ui.button(if self.picker_open { "hide" } else { "browse" }).clicked() {

@@ -1625,7 +1625,7 @@ impl App {
         let mut delete_requested = false;
         ui.horizontal(|ui| {
             ui.label("Group name:");
-            ui.text_edit_singleline(&mut self.groups[idx].name);
+            ui.add(egui::TextEdit::singleline(&mut self.groups[idx].name).id_salt(("app-group-name", idx)));
             if self.groups.len() > 1 
                 && ui.button("🗑 Delete tab").clicked() 
             {
@@ -1748,7 +1748,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Output template:");
             let hint = self.global_template.clone();
-            let resp = ui.text_edit_singleline(&mut self.groups[idx].output_template);
+            let resp = ui.add(egui::TextEdit::singleline(&mut self.groups[idx].output_template).id_salt(("app-group-output", idx)));
             resp.on_hover_text(format!(
                 "Tokens: {{groupname}} {{sourcename}} {{codec}} {{crf}} \
                  {{date}} {{time}} {{localdir}} {{savings}}. \
@@ -1800,7 +1800,7 @@ impl App {
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Global output template:");
-            ui.text_edit_singleline(&mut self.global_template);
+            ui.add(egui::TextEdit::singleline(&mut self.global_template).id_salt("app-self_global_template"));
         });
     }
     
@@ -1825,7 +1825,7 @@ impl App {
                     self.pick_input_file();
                 }
             });
-            ui.text_edit_singleline(&mut self.input_path);
+            ui.add(egui::TextEdit::singleline(&mut self.input_path).id_salt("app-self_input_path"));
             
             ui.add_space(6.0);
             
@@ -1839,7 +1839,7 @@ impl App {
                     self.check_for_resume();
                 }
             });
-            ui.text_edit_singleline(&mut self.output_path);
+            ui.add(egui::TextEdit::singleline(&mut self.output_path).id_salt("app-self_output_path"));
         });
         
         // Resume offer banner.
@@ -1943,7 +1943,7 @@ impl App {
             // Shared across codecs.
             ui.horizontal(|ui| {
                 ui.label("Pixel format");
-                ui.text_edit_singleline(&mut self.settings.pixel_format);
+                ui.add(egui::TextEdit::singleline(&mut self.settings.pixel_format).id_salt("app-self_settings_pixel_format"));
             });
             
             ui.add(egui::Slider::new(&mut self.chunk_seconds, 2.0..=30.0)

@@ -331,7 +331,7 @@ the live path is right")
 
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("in").small().weak());
-        ui.text_edit_singleline(&mut p.input);
+        ui.add(egui::TextEdit::singleline(&mut p.input).id_salt("fileproc-p_input"));
     });
 
     ui.horizontal(|ui| {
