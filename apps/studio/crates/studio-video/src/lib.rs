@@ -307,11 +307,46 @@ mod tests {
     /// `device` feature already makes for real audio hardware — except
     /// here the tests DO run in this sandbox, because both binaries are
     /// actually installed.
+    /// Can this machine build the test fixture?
+    ///
+    /// It is not enough that `ffmpeg` and `ffprobe` EXIST. `make_test_video`
+    /// encodes with libx264 and aac, and many distribution ffmpeg builds ship
+    /// without them (Debian/Ubuntu's `ffmpeg` from main historically has, and
+    /// the minimal container images usually do). On such a box the binaries
+    /// answer `-version` happily, this guard passed, and then the fixture's
+    /// `.expect("generating the test fixture itself must succeed")` panicked —
+    /// which is how the fleet reported three studio-video failures that look
+    /// like probe/thumbnail bugs and are neither. All 13 pass here against a
+    /// full build.
+    ///
+    /// This is the "a guard that watches one failure mode on a device that
+    /// produces another" shape that this codebase has already been bitten by
+    /// and calls out by name elsewhere. The guard now checks the capability
+    /// the tests actually need, not the binary's presence.
     fn has_ffmpeg() -> bool {
         static CHECKED: OnceLock<bool> = OnceLock::new();
         *CHECKED.get_or_init(|| {
-            Command::new("ffmpeg").arg("-version").output().map(|o| o.status.success()).unwrap_or(false)
-                && Command::new("ffprobe").arg("-version").output().map(|o| o.status.success()).unwrap_or(false)
+            let ok = |c: &str| Command::new(c).arg("-version").output()
+                .map(|o| o.status.success()).unwrap_or(false);
+            if !ok("ffmpeg") || !ok("ffprobe") { return false; }
+            // `-encoders` rather than `-codecs`: a build can know OF a codec it
+            // cannot encode with, and encoding is what the fixture does.
+            let enc = match Command::new("ffmpeg").arg("-hide_banner").arg("-encoders").output() {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+                _ => return false,
+            };
+            let have = |n: &str| enc.lines().any(|l| l.split_whitespace().nth(1) == Some(n));
+            if !have("libx264") {
+                eprintln!("studio-video tests: ffmpeg is present but cannot encode libx264 — \
+skipping the fixture-backed tests. Install a full ffmpeg build to get real coverage here.");
+                return false;
+            }
+            if !have("aac") {
+                eprintln!("studio-video tests: ffmpeg cannot encode aac — skipping the \
+fixture-backed tests (the audio fixture needs it).");
+                return false;
+            }
+            true
         })
     }
 
@@ -321,6 +356,11 @@ mod tests {
     /// a fresh temp path so tests can run concurrently without clashing.
     #[test]
     fn a_video_can_be_sampled_for_its_sound_and_trimmed_while_it_is_read() {
+        // Guarded like every other fixture-backed test here. These two were not,
+        // so on a box whose ffmpeg cannot encode libx264 they panicked inside
+        // make_test_video while the rest skipped cleanly — which is why the fleet
+        // saw a handful of studio-video failures rather than a whole-module skip.
+        if !has_ffmpeg() { eprintln!("skipping: ffmpeg cannot build the test fixture"); return; }
         // The sampler's headless half: half a second out of the middle of
         // a one-second clip, decoded back to prove it is real audio and
         // really that long.
@@ -346,6 +386,11 @@ mod tests {
 
     #[test]
     fn a_frame_arrives_as_exactly_the_rgb_buffer_a_texture_wants() {
+        // Guarded like every other fixture-backed test here. These two were not,
+        // so on a box whose ffmpeg cannot encode libx264 they panicked inside
+        // make_test_video while the rest skipped cleanly — which is why the fleet
+        // saw a handful of studio-video failures rather than a whole-module skip.
+        if !has_ffmpeg() { eprintln!("skipping: ffmpeg cannot build the test fixture"); return; }
         let path = make_test_video(false);
         let px = frame_rgb(&path, Ticks::from_seconds(0.5), 160, 90)
             .expect("a frame at half a second");
