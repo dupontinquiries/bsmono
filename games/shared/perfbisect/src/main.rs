@@ -335,6 +335,32 @@ pub fn parse_game(text: &str) -> Vec<(String, f64)> {
     out
 }
 
+/// The engine's events.jsonl: count the `gpu_spike` events after
+/// `warmup_complete` and the largest one, in ms. No JSON parser — the
+/// engine writes one flat object per line and two field names are all
+/// this needs.
+pub fn parse_spikes(text: &str) -> (usize, f64) {
+    let mut warm = false;
+    let mut n = 0usize;
+    let mut max_us = 0.0f64;
+    let field = |l: &str, k: &str| -> Option<f64> {
+        let i = l.find(&format!("\"{k}\":"))?;
+        l[i + k.len() + 3..].trim_start().split(|c: char| c == ',' || c == '}').next()?.parse::<f64>().ok()
+    };
+    for l in text.lines() {
+        if l.contains("\"kind\":\"warmup_complete\"") {
+            warm = true;
+        }
+        if warm && l.contains("\"kind\":\"gpu_spike\"") {
+            n += 1;
+            if let Some(t) = field(l, "total_us") {
+                max_us = max_us.max(t);
+            }
+        }
+    }
+    (n, max_us / 1000.0)
+}
+
 /// The knob matrix. Each variant isolates one suspect; the metric is the
 /// same for all of them so the compare can divide.
 pub fn matrix() -> Vec<(&'static str, Vec<(&'static str, &'static str)>, Vec<&'static str>)> {
@@ -451,20 +477,50 @@ fn run(args: &[String]) -> i32 {
                         continue;
                     }
                     eprintln!("perfbisect: game.{name}");
-                    let mut e: Vec<(&str, &str)> = vec![("UNENDLICH_MAX_DURATION_MS", dur.as_str()), ("UNENDLICH_WARMUP_MS", warm.as_str())];
+                    let events_path = std::env::temp_dir().join(format!("perfbisect-events-{name}.jsonl"));
+                    let _ = fs::remove_file(&events_path);
+                    let events_str = events_path.display().to_string();
+                    let mut e: Vec<(&str, &str)> = vec![("UNENDLICH_MAX_DURATION_MS", dur.as_str()), ("UNENDLICH_WARMUP_MS", warm.as_str()), ("UNENDLICH_EVENTS_PATH", events_str.as_str())];
                     e.extend(env.iter().copied());
                     let (text, ms, ok) = run_bin(&b, &[], &e, &clear, Duration::from_secs(seconds + 90));
                     let parsed = parse_game(&text);
-                    let frame = parsed
-                        .iter()
-                        .find(|(k, _)| k == "game.zone.frame.p50" || k == "game.gpu.total.p50" || k == "game.zone.main.p50")
-                        .map(|(_, v)| *v);
+                    // THE LAST BLOCK WINS. The engine prints its zone summary
+                    // more than once (a boot window, then steady state); the
+                    // first is the load and the last is the game. The desktop
+                    // report keyed on the first and read a 635 ms frame that
+                    // was chunk loading.
+                    let last = |k: &str| parsed.iter().rev().find(|(n, _)| n == k).map(|(_, v)| *v);
+                    // frame_total is the CPU frame; the GPU timer's total is
+                    // the fallback, and p99 is a first-class row because the
+                    // desktop's whole problem was a 4 ms p50 with a 1.6 s p99
+                    let frame = last("game.zone.frame_total.p50").or_else(|| last("game.zone.frame.p50")).or_else(|| last("game.gpu.total.p50"));
+                    let frame99 = last("game.zone.frame_total.p99").or_else(|| last("game.zone.frame.p99")).or_else(|| last("game.gpu.total.p99"));
                     match frame {
                         Some(v) => rep.rows.push(Row { probe: format!("game.{name}.frame_p50"), value: v, unit: "ms".into(), note: if ok { "ok".into() } else { "exit!=0".into() } }),
                         None => rep.rows.push(Row { probe: format!("game.{name}.frame_p50"), value: f64::NAN, unit: "ms".into(), note: format!("no summary in output (wall {ms:.0} ms, ok {ok})") }),
                     }
-                    for (k, v) in parsed {
-                        rep.rows.push(Row { probe: format!("game.{name}.{}", k.trim_start_matches("game.")), value: v, unit: "ms".into(), note: String::new() });
+                    if let Some(v) = frame99 {
+                        rep.rows.push(Row { probe: format!("game.{name}.frame_p99"), value: v, unit: "ms".into(), note: "the hitch".into() });
+                    }
+                    if let Some(v) = last("game.zone.draw.p99") {
+                        rep.rows.push(Row { probe: format!("game.{name}.draw_p99"), value: v, unit: "ms".into(), note: String::new() });
+                    }
+                    if let Some(v) = last("game.gpu.total.p50") {
+                        rep.rows.push(Row { probe: format!("game.{name}.gpu_p50"), value: v, unit: "ms".into(), note: String::new() });
+                    }
+                    // the engine's own event log: GPU spikes after warmup are
+                    // the hitches, counted and sized
+                    if let Ok(ev) = fs::read_to_string(&events_path) {
+                        let (n, max_ms) = parse_spikes(&ev);
+                        rep.rows.push(Row { probe: format!("game.{name}.gpu_spikes"), value: n as f64, unit: "count".into(), note: "after warmup_complete".into() });
+                        rep.rows.push(Row { probe: format!("game.{name}.spike_max"), value: max_ms, unit: "ms".into(), note: String::new() });
+                    }
+                    // every zone, last block only
+                    let mut seen = std::collections::HashSet::new();
+                    for (k, v) in parsed.iter().rev() {
+                        if seen.insert(k.clone()) {
+                            rep.rows.push(Row { probe: format!("game.{name}.{}", k.trim_start_matches("game.")), value: *v, unit: "ms".into(), note: String::new() });
+                        }
                     }
                 }
             }
@@ -544,12 +600,15 @@ pub fn verdicts(a: &Report, b: &Report, cmps: &[Cmp]) -> Vec<String> {
             v.push(format!("{name_a}: half render scale barely moves the frame ({base:.1} -> {half:.1} ms) — not fragment-bound; look at present mode, the CPU side, or uploads"));
         }
     }
-    if let (Some(base), Some(fifo), Some(imm)) = (g(a, "base"), g(a, "vsync.fifo"), g(a, "vsync.immediate")) {
-        let spread = (base.max(fifo).max(imm)) / (base.min(fifo).min(imm)).max(1e-6);
-        if spread < 1.1 {
-            v.push(format!("{name_a}: vsync fifo/immediate/base all within 10% ({fifo:.1}/{imm:.1}/{base:.1} ms) — present mode is not the cause"));
+    // fifo is CAPPED at the refresh by definition, so it is not evidence
+    // either way; immediate against base is the question (the first
+    // version called an 8.5 ms fifo frame a present-mode problem)
+    if let (Some(base), Some(imm)) = (g(a, "base"), g(a, "vsync.immediate")) {
+        let spread = base.max(imm) / base.min(imm).max(1e-6);
+        if spread < 1.15 {
+            v.push(format!("{name_a}: immediate and base within 15% ({imm:.1}/{base:.1} ms) — present mode is not the cause"));
         } else {
-            v.push(format!("{name_a}: present mode matters: fifo {fifo:.1}, immediate {imm:.1}, base {base:.1} ms — the compositor or the swapchain mode is in the loop"));
+            v.push(format!("{name_a}: immediate {imm:.1} vs base {base:.1} ms — the swapchain mode or the compositor is in the loop"));
         }
     }
     if let (Some(cpu), Some(gpu)) = (g(a, "gen.cpu"), g(a, "gen.gpu")) {
@@ -568,6 +627,36 @@ pub fn verdicts(a: &Report, b: &Report, cmps: &[Cmp]) -> Vec<String> {
     if let (Some(cpu), Some(gpu)) = (g(a, "mesher.cpu"), g(a, "mesher.gpu")) {
         if gpu / cpu.max(1e-6) > 1.4 {
             v.push(format!("{name_a}: the GPU mesher is slower than the CPU one there (x{:.2})", gpu / cpu.max(1e-6)));
+        }
+    }
+    // HITCHING, NOT SLOW: a fine p50 with a p99 twenty times it is a
+    // stall, and the stall has a knob if one variant's p99 is sane
+    let g99 = |r: &Report, k: &str| r.get(&format!("game.{k}.frame_p99")).filter(|x| x.is_finite());
+    if let (Some(p50), Some(p99)) = (g(a, "base"), g99(a, "base")) {
+        if p50 > 0.0 && p99 / p50 > 20.0 {
+            v.push(format!("{name_a}: not slow, HITCHING — base frame p50 {p50:.1} ms but p99 {p99:.0} ms (x{:.0}). The p50 is a fine machine; the p99 is a stall", p99 / p50));
+            let mut calm: Vec<(String, f64)> = matrix()
+                .iter()
+                .filter_map(|(n, _, _)| g99(a, n).map(|x| (n.to_string(), x)))
+                .filter(|(_, x)| *x < p99 * 0.1)
+                .collect();
+            calm.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some((n, x)) = calm.first() {
+                v.push(format!("{name_a}: the stall has a knob — game.{n} has frame p99 {x:.1} ms while base has {p99:.0}; that variant's one knob is the suspect"));
+            }
+        }
+    }
+    if let (Some(sc), Some(sg)) = (a.get("game.mesher.cpu.gpu_spikes"), a.get("game.mesher.gpu.gpu_spikes")) {
+        if sg >= 3.0 && sc <= 1.0 {
+            v.push(format!("{name_a}: {sg:.0} GPU spikes after warmup with the GPU mesher, {sc:.0} with the CPU mesher — the mesher's chunk arrival stalls the graphics queue"));
+        }
+    }
+    // roamer_tick variance across variants: world-state luck, not a knob
+    let roam: Vec<f64> = matrix().iter().filter_map(|(n, _, _)| a.get(&format!("game.{n}.zone.roamer_tick.p50"))).filter(|x| x.is_finite()).collect();
+    if roam.len() >= 4 {
+        let (lo, hi) = roam.iter().fold((f64::MAX, 0.0f64), |(l, h), x| (l.min(*x), h.max(*x)));
+        if hi > 8.0 && hi / lo.max(0.1) > 3.0 {
+            v.push(format!("{name_a}: roamer_tick p50 ranges {lo:.1}–{hi:.1} ms across variants that do not touch it — creature AI is world-state luck and, when heavy, most of a frame; cap its per-frame work"));
         }
     }
     // the biggest anomaly overall, if it is big
@@ -700,6 +789,27 @@ mod tests {
         assert!(all.contains("a layer is loaded by default"), "{all}");
         assert!(all.contains("fragment-bound"), "{all}");
         assert!(all.contains("present mode is not the cause"), "{all}");
+    }
+
+    #[test]
+    fn spikes_are_counted_after_warmup_only_and_the_largest_kept() {
+        let ev = "{\"kind\":\"gpu_spike\",\"main_us\":900000,\"total_us\":950000,\"ts_ms\":100}\n{\"kind\":\"warmup_complete\",\"ts_ms\":3000}\n{\"kind\":\"gpu_spike\",\"main_us\":545824,\"shadow_us\":171902,\"total_us\":717917,\"ts_ms\":7010}\n{\"kind\":\"gpu_spike\",\"total_us\":1017431,\"ts_ms\":7198}\n";
+        let (n, max_ms) = parse_spikes(ev);
+        assert_eq!(n, 2, "the boot spike counted");
+        assert!((max_ms - 1017.431).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_fine_p50_with_a_huge_p99_is_called_hitching_and_the_calm_variant_is_named() {
+        let mut desk = rep("desk", 100.0, &[("game.base.frame_p50", 19.8), ("game.base.frame_p99", 1600.0), ("game.mesher.cpu.frame_p99", 12.9), ("game.mesher.gpu.frame_p99", 766.0), ("game.fog.off.frame_p99", 991.0)]);
+        desk.rows.push(Row { probe: "game.mesher.cpu.gpu_spikes".into(), value: 0.0, unit: "count".into(), note: String::new() });
+        desk.rows.push(Row { probe: "game.mesher.gpu.gpu_spikes".into(), value: 6.0, unit: "count".into(), note: String::new() });
+        let phone = rep("phone", 300.0, &[("game.base.frame_p50", 30.0), ("game.base.frame_p99", 45.0)]);
+        let c = compare(&desk, &phone);
+        let all = verdicts(&desk, &phone, &c).join("\n");
+        assert!(all.contains("HITCHING"), "{all}");
+        assert!(all.contains("game.mesher.cpu has frame p99 12.9"), "{all}");
+        assert!(all.contains("stalls the graphics queue"), "{all}");
     }
 
     #[test]
