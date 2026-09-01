@@ -1720,7 +1720,7 @@ fn rune_mark(p: &egui::Painter, c: Pos2, s: f32, col: Color32, seed: u32, glow: 
 /// Dress `rect` as a carved-stone FRAME: a double beveled relief lip (lit top-left, shadowed bottom-right),
 /// the active material's grain scattered along the border band, and faint breathing runes in the corners.
 /// Painted only in the edge band (the panel's inner margin), so it never draws over content. Theme-adaptive.
-fn carved_frame(p: &egui::Painter, rect: egui::Rect, t: f32, accent: Color32) {
+pub(crate) fn carved_frame(p: &egui::Painter, rect: egui::Rect, t: f32, accent: Color32) {
     let pal = active();
     let sk = skin();
     let lit = Color32::from_white_alpha(sk.bevel_lit);

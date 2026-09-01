@@ -2179,6 +2179,9 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
     /// Force the right sidebar open. For render-verification harnesses only (e.g. panels-view) —
     /// normal flow toggles `show_context` from the "☰ Panels" button or the diag-notice jump.
     pub fn debug_force_show_context(&mut self, on: bool) { self.show_context = on; }
+    /// Also render for render-verification harnesses: flips on the metrics card (checkpoints/
+    /// history need private struct construction this isn't worth adding just for a screenshot).
+    pub fn debug_force_engine_extras(&mut self, on: bool) { self.show_metrics = on; }
 
     pub fn boot_demo(&mut self, spatial: bool) {
         use Role::{Assistant, User};
@@ -8761,7 +8764,10 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
         egui::Panel::bottom("chat_bottom").resizable(false).show_inside(ui, |ui| {
             ui.add_space(theme::PAD_XS as f32);
             if !arts.is_empty() && self.show_files {
-                egui::Frame { fill: theme::PANEL(), corner_radius: theme::r(10), inner_margin: egui::Margin::same(theme::PAD_MD),
+                // Own CollapsingHeader (dynamic count/stitched text) rather than a fixed title, so
+                // this can't go through theme::panel() directly — carve the same frame by hand
+                // instead of leaving it flat.
+                let gen_files_inner = egui::Frame { fill: theme::PANEL(), corner_radius: theme::r(10), inner_margin: egui::Margin::same(theme::PAD_MD),
                     outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
                 .show(ui, |ui| {
                     let stitched = arts.iter().filter(|a| a.fragments > 1).count();
@@ -8869,6 +8875,8 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                     });
                     }); // close gen_files_drawer
                 });
+                let t = ui.input(|i| i.time) as f32;
+                theme::carved_frame(ui.painter(), gen_files_inner.response.rect, t, theme::GREEN());
             }
             if let Some((msg, at)) = &self.ws_note {
                 let a = 1.0 - theme::appear(*at, 8.0);
@@ -8906,10 +8914,7 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                 });
             }
             if self.show_metrics {
-                egui::Frame { fill: theme::PANEL(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
-                    outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
-                .show(ui, |ui| {
-                    ui.label(RichText::new("GPU phase breakdown — last generation").color(theme::CYAN()).strong().small());
+                theme::panel(ui, theme::CYAN(), "GPU phase breakdown — last generation", None, |ui| {
                     let now = crate::metricspanel::snapshot(self.metrics_tokens);
                     let lines = now.since(&self.metrics_base).report(self.metrics_wall_ns);
                     if lines.is_empty() {
@@ -8928,9 +8933,7 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                 });
             }
             if self.show_checkpoints && !self.checkpoints.is_empty() {
-                egui::Frame { fill: theme::PANEL(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
-                    outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
-                .show(ui, |ui| {
+                theme::panel(ui, theme::CYAN(), "Checkpoints", None, |ui| {
                     egui::ScrollArea::vertical().id_salt("ckpts").max_height(140.0).show(ui, |ui| {
                         for (i, cp) in self.checkpoints.iter().enumerate().rev() {
                             ui.horizontal(|ui| {
@@ -8952,9 +8955,7 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                 if rows.is_empty() {
                     ui.label(RichText::new("no history yet — finish a turn to create the first node").color(theme::FAINT()).small());
                 } else {
-                    egui::Frame { fill: theme::PANEL(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
-                        outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
-                    .show(ui, |ui| {
+                    theme::panel(ui, theme::CYAN(), "History", None, |ui| {
                         egui::ScrollArea::vertical().id_salt("tree").max_height(170.0).show(ui, |ui| {
                             for (id, parent, label, nfiles, msgs) in &rows {
                                 ui.horizontal(|ui| {

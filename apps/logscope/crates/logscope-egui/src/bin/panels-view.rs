@@ -36,6 +36,7 @@ fn main() -> eframe::Result {
             let mut chat = Chat::default();
             chat.boot_demo(false); // populates msgs (incl. a code-bearing reply) WITHOUT forcing spatial_view
             chat.debug_force_show_context(true); // force the sidebar open for this screenshot
+            chat.debug_force_engine_extras(true); // also show metrics/checkpoints/history cards
             let mut doc = Doc::default();
             doc.name = "sample.log".into();
             doc.lines = vec!["2024-05-07 12:01:15  pool_size=42 active=41".into(), "2024-05-07 12:01:16  pool_size=42 active=42".into()];
