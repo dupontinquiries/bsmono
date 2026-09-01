@@ -2176,6 +2176,10 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
     /// True when there's no conversation loaded (used to decide whether glass mode should auto-seed a demo).
     pub fn is_empty(&self) -> bool { self.msgs.is_empty() }
 
+    /// Force the right sidebar open. For render-verification harnesses only (e.g. panels-view) —
+    /// normal flow toggles `show_context` from the "☰ Panels" button or the diag-notice jump.
+    pub fn debug_force_show_context(&mut self, on: bool) { self.show_context = on; }
+
     pub fn boot_demo(&mut self, spatial: bool) {
         use Role::{Assistant, User};
         let turns = vec![
@@ -8226,10 +8230,13 @@ if let Some(msg) = self.error_banner.clone() {
                     let kws: Vec<String> = self.ctx_card_kws.clone();
                     let has_file = !doc.name.is_empty();
                     if code.is_some() || has_file || !kws.is_empty() {
-                        egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
-                            outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("CONTEXT CARDS").color(theme::DIM()).small().strong());
+                        // Carved-frame treatment (bevel lip + material grain + breathing corner
+                        // runes) instead of the flat hairline box: `theme::panel()` already builds
+                        // exactly this — a titled, textured card matching the reference frames —
+                        // but had no callers, so every sidebar card was still a plain rectangle.
+                        // This is the card the reference images show most prominently, so it goes
+                        // first.
+                        theme::panel(ui, theme::CYAN(), "Context cards", None, |ui| {
                             if has_file {
                                 ui.add_space(3.0);
                                 // NAME, SIZE, AND WHY IT IS HERE — the three facts the reference
@@ -8441,8 +8448,10 @@ if let Some(msg) = self.error_banner.clone() {
                             ui.label(RichText::new(format!("~{used} / {budget} tok · model: {}", model.current())).color(theme::DIM()).small());
                         }
                         RightPage::Prompting => {
-                            ui.label(RichText::new("PROMPTING MODE").color(theme::DIM()).small().strong());
-                            ui.add_space(4.0);
+                            // Its own carved card — FREECAM KEYS / WORKING DISCIPLINE below stay
+                            // as plain sections, so only the thing the reference frames box off
+                            // (the mode picker) gets boxed off here too.
+                            theme::panel(ui, theme::AMBER(), "Prompting mode", None, |ui| {
                             // GROUP BY AXIS. Six entries answering two different questions — three vary how WIDE the
                             // fan-out is, three vary WHO REASONS — and an undifferentiated list makes an operator infer
                             // that from the names before they can choose. A heading per group costs two lines and
@@ -8493,6 +8502,7 @@ if let Some(msg) = self.error_banner.clone() {
                                     .small().italics());
                                 ui.add_space(6.0);
                             }
+                            }); // close "Prompting mode" carved panel
                             ui.separator();
                             // ── MOVEMENT KEYS ────────────────────────────────────────────────
                             ui.label(RichText::new("FREECAM KEYS").color(theme::FAINT()).small());
