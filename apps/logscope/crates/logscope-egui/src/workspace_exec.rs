@@ -1656,11 +1656,40 @@ pub fn parse_tools_reported(text: &str) -> (Vec<Tool>, Vec<Rejected>) {
 /// this must too, or a real call will be reported as an unknown one.
 fn diagnose(block: &str) -> Rejected {
     let Some(tool) = json_str(block, "tool") else { return Rejected::NoToolKey };
+    // EVERY tool the prompt advertises, not four of them.
+    //
+    // `RUNTIME_TOOLS` above lists ten tools and that list is what the model is
+    // told it may call. This match accepted four, so `search`, `run`, `git_log`,
+    // `doc`, `list_dir` and `propose` were rejected as "unknown tool" the moment
+    // a model used them — tools the same prompt had just offered. A 1B asked to
+    // summarise a repository emitted 13 tool blocks in one turn and every one
+    // was discarded this way; the transcript reads as a model that cannot call
+    // tools, and it was a model calling tools that were refused.
+    //
+    // The doc comment on RUNTIME_TOOLS says "One list, and a test that fails if
+    // the enum grows a variant that is not in it". That test compares the ENUM
+    // to RUNTIME_TOOLS. Nothing compared RUNTIME_TOOLS to this match, so this
+    // was the third list. `every_advertised_tool_is_accepted_by_the_validator`
+    // below closes that gap.
+    //
+    // Required fields mirror `parse_tool_block`'s `?` operators exactly — a
+    // field it unwraps with `?` is required here, one it defaults is not.
+    // Aliases are carried through for the same reason they exist there: a model
+    // that writes `edit_file` or `write_doc` meant the tool it named.
     let need: &[&'static str] = match tool.as_str() {
         "write_file" => &["path"],
         "read_file" => &["path"],
         "edit" | "edit_file" | "patch" => &["path", "find"],
         "read_range" => &["path"],
+        // `pattern` OR `query` satisfies search, so neither can be listed as
+        // required — parse_tool_block accepts either and rejecting here would
+        // refuse a call the parser would have built.
+        "search" => &[],
+        "list_dir" => &[],
+        "run" => &[],
+        "git_log" => &[],
+        "propose" | "dry_run" => &["path"],
+        "doc" | "share_doc" | "write_doc" => &["name"],
         _ => return Rejected::UnknownTool(tool),
     };
     for f in need {
@@ -1763,6 +1792,24 @@ fn parse_one(block: &str) -> Option<Tool> {
             path: json_str(block, "path").unwrap_or_default(),
         }),
         "list_dir" => Some(Tool::ListDir { path: json_str(block, "path").unwrap_or_default() }),
+        // IMPLEMENTED, ADVERTISED, AND UNPARSEABLE until now. `Tool::GitLog`
+        // has an enum variant, a wire name, a display form and an executor
+        // (`Runner::git_log`), and `RUNTIME_TOOLS` offers it to the model — but
+        // this match had no arm, so a model that called it got "unknown tool
+        // 'git_log'" and there was no way to reach the code that exists. The
+        // file's own comment at RUNTIME_TOOLS records git_log being missing
+        // from the PROMPT once before; it was then added there and not here.
+        //
+        // `n` accepts the spellings a model actually writes; absent means 10,
+        // which is git's own default and a sane amount of history.
+        "git_log" | "log" => Some(Tool::GitLog {
+            n: json_usize(block, "n")
+                .or_else(|| json_usize(block, "count"))
+                .or_else(|| json_usize(block, "limit"))
+                .unwrap_or(10)
+                .clamp(1, 100),
+            path: json_str(block, "path").unwrap_or_default(),
+        }),
         "propose" | "dry_run" => Some(Tool::Propose {
             path: json_str(block, "path")?,
             content: json_str(block, "content").or_else(|| json_str(block, "contents"))?,
@@ -1778,6 +1825,21 @@ fn parse_one(block: &str) -> Option<Tool> {
         }
         _ => None,
     }
+}
+
+/// Extract a JSON integer value for `key`. Tolerates a quoted number, because
+/// models write `"n": "10"` about as often as `"n": 10`.
+fn json_usize(src: &str, key: &str) -> Option<usize> {
+    let pat = format!("\"{key}\"");
+    let k = src.find(&pat)?;
+    let after = &src[k + pat.len()..];
+    let colon = after.find(':')?;
+    let digits: String = after[colon + 1..]
+        .chars()
+        .skip_while(|c| c.is_whitespace() || *c == '"')
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
 }
 
 /// Extract a JSON string value for `key` — handles the escapes model output actually contains (\n, \", \\, \t).
@@ -5888,5 +5950,65 @@ mod repo_tree_order_tests {
         let _ = std::fs::remove_dir_all(&d);
         assert!(tree.contains("README.md") && tree.contains("leaf.rs"), "{tree}");
         assert!(!tree.contains("truncated"), "{tree}");
+    }
+}
+
+#[cfg(test)]
+mod tool_surface_agreement {
+    use super::*;
+
+    /// Every tool the prompt offers must survive VALIDATION.
+    ///
+    /// This is the gap that produced the field report: `RUNTIME_TOOLS` listed
+    /// ten tools, the prompt offered all ten, and `validate_tool_block`'s match
+    /// accepted four. A 1B asked to summarise a repository emitted 13 tool
+    /// blocks in one turn and every one was discarded as "unknown tool" —
+    /// tools that same prompt had just advertised. The transcript reads as a
+    /// model too weak to call tools; it was a model calling tools that were
+    /// refused.
+    ///
+    /// The existing test compares the ENUM to RUNTIME_TOOLS. Nothing compared
+    /// RUNTIME_TOOLS to the validator, so the validator was a silent third list.
+    #[test]
+    fn every_advertised_tool_is_accepted_by_the_validator() {
+        // A block carrying every field any tool needs, so the only thing under
+        // test is name recognition rather than field checking.
+        let block = r#"{"tool":"X","path":"a.rs","find":"x","replace":"y","content":"c",
+                        "name":"n","pattern":"p","argv":["ls"],"n":3}"#;
+        for t in RUNTIME_TOOLS {
+            let filled = block.replace("\"X\"", &format!("\"{t}\""));
+            let v = diagnose(&filled);
+            assert!(!matches!(v, Rejected::UnknownTool(_)),
+                "'{t}' is advertised to the model but the validator rejects it: {v:?}");
+        }
+    }
+
+    /// And must then be CONSTRUCTIBLE. Validation passing while the builder has
+    /// no arm would be the same bug one step later — which is exactly what
+    /// `git_log` was: enum variant, wire name, executor and prompt entry all
+    /// present, and no arm in `parse_tool_block`, so the implemented code was
+    /// unreachable.
+    #[test]
+    fn every_advertised_tool_can_actually_be_built() {
+        let block = r#"{"tool":"X","path":"a.rs","find":"x","replace":"y","content":"c",
+                        "name":"n","pattern":"p","argv":["ls"],"n":3}"#;
+        for t in RUNTIME_TOOLS {
+            let filled = block.replace("\"X\"", &format!("\"{t}\""));
+            assert!(parse_one(&filled).is_some(),
+                "'{t}' validates but cannot be constructed — the implemented tool is unreachable");
+        }
+    }
+
+    #[test]
+    fn git_log_defaults_to_ten_and_is_bounded() {
+        // Absent `n` used to be unreachable entirely; now it must not be an
+        // unbounded history dump into a small model's context either.
+        let d = parse_one(r#"{"tool":"git_log"}"#).expect("git_log builds");
+        assert!(matches!(d, Tool::GitLog { n: 10, .. }), "{d:?}");
+        let big = parse_one(r#"{"tool":"git_log","n":100000}"#).unwrap();
+        assert!(matches!(big, Tool::GitLog { n: 100, .. }), "{big:?}");
+        // Models write quoted numbers about as often as bare ones.
+        let q = parse_one(r#"{"tool":"git_log","n":"5"}"#).unwrap();
+        assert!(matches!(q, Tool::GitLog { n: 5, .. }), "{q:?}");
     }
 }
