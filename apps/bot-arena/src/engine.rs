@@ -6038,6 +6038,10 @@ mod tests {
         write(&repo, "calc.py", "def add(a, b):\n    return a + b\n");
         write(&repo, "test_calc.py",
             "from calc import add\n\ndef test_a():\n    assert add(1, 2) == 3\n\ndef test_b():\n    assert add(2, 2) == 4\n");
+        if !pytest_available() {
+            eprintln!("SKIP clean_repo_passes_and_broken_fails: python3 -m pytest not installed");
+            return;
+        }
         let (p, t) = run_tests_local(&repo, "python3 -m pytest -q");
         assert_eq!((p, t), (2, 2), "clean repo should pass all tests");
 
@@ -6049,8 +6053,32 @@ mod tests {
         assert!(p2 < t2, "broken source should fail some tests ({p2}/{t2})");
     }
 
+    /// Is `python3 -m pytest` usable here?
+    ///
+    /// Two tests below drive the REAL evaluation path, and the only test runner
+    /// they know how to invoke is pytest. Without it every command fails, every
+    /// score is 0, and the assertions read as engine bugs — which is exactly how
+    /// they were reported from the fleet ("no-op worker on a passing repo should
+    /// score 1.0, got 0"). The engine was fine; the box had no pytest.
+    ///
+    /// Skipping beats both alternatives. Failing trains people to ignore a red
+    /// test that is usually environmental, and silently passing would hide a
+    /// real regression on machines that CAN run it.
+    fn pytest_available() -> bool {
+        std::process::Command::new("python3")
+            .args(["-m", "pytest", "--version"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     #[test]
     fn evaluate_real_noop_is_full_reward() {
+        if !pytest_available() {
+            eprintln!("SKIP evaluate_real_noop_is_full_reward: python3 -m pytest not installed \
+(this test drives the real evaluation path and pytest is the runner it invokes)");
+            return;
+        }
         let repo = tmp("repo2");
         write(&repo, "calc.py", "def add(a, b):\n    return a + b\n");
         write(&repo, "test_calc.py",
