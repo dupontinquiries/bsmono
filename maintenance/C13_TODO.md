@@ -642,3 +642,59 @@ supersede it, complement it, or were an abandoned direction.
 Fixed in the same pass, no risk: a stray `mut` on a closure in
 `merge_versions` that's never reassigned (`6777efa4`) — trivial and
 independent of whether the function itself ever gets called.
+
+## 15. apps/snapclone/rust did not compile at all — five independent errors, now fixed
+
+Unlike every other app swept this session (warnings at worst),
+`apps/snapclone/rust` — a ~40-crate workspace — failed to `cargo check`
+outright. Five genuinely independent compile errors, in five different
+crates, none related to each other except by being in the same
+workspace and none previously caught (this workspace has no CI signal
+visible to `verify.sh`, which is source-tree-static and doesn't compile
+anything). Fixed in five separate commits (`5c4cc8c1`, `a966c1b6`,
+`414a3fe7`, `a094f6f4`, `6bd4ad72`, `9a6b8673` — the last bundles three
+missing-dependency fixes together since they're the same class of bug):
+
+1. **snapclone-storage**: a local variable named `display` collided with
+   `tracing::field::display` inside the `debug!` macro's own expansion —
+   confirmed with a from-scratch repro outside this repo, so this is a
+   general `tracing` macro-hygiene gotcha (never name a local `display`
+   or `debug` near a tracing macro call), not specific to this code.
+2. **snapclone-core**: `AppCore::new` moved `evt_rx` into `Self` and then
+   used it again in the return tuple. The struct field was simply wrong
+   — nothing ever reads `self.evt_rx`, and the crate's own doctest says
+   the caller owns it.
+3. **snapclone-session**: an `if let Some(u) = relay_url` pattern against
+   a plain `String` field that could never type-check as written — dead
+   code from (probably) an earlier version where the field was
+   `Option<String>`. Also found and removed a genuinely-dead duplicate
+   `NetworkBin::of(ip)` computation right next to a `hints_for()` call
+   that already computes the identical value internally.
+4. **snapclone-piggyback**: `[u8; 64]` under `#[derive(Serialize)]` —
+   serde's array impls are a fixed enumerated list topping out below 64.
+   `snapclone-mailbox` hit this exact wall earlier and already
+   established the fix (hex-encoded `String` instead of a raw array);
+   applied the same pattern here rather than inventing a new one.
+5. **snapclone-vcard**: `Vec<&str>::first()` gives `Option<&&str>`, and
+   `.to_owned()` on that resolves to the blanket `impl<T: Clone> ToOwned`
+   at the outer `&str` level rather than descending to `str`'s `ToOwned
+   -> String` impl — `.to_string()` (via `Display`) resolves through the
+   reference correctly instead.
+6. **snapclone-relay / snapclone-databus / snapclone-network-diag**:
+   three separate missing-Cargo.toml-dependency/feature-gate bugs
+   (`base64`, `futures-util`, `chrono` never declared; a binary using an
+   optional dependency with no `required-features` gate on its `[[bin]]`
+   — the same silently-broken-by-default shape CLAUDE.md §3 already
+   documents for `[lib]` targets, just on `[[bin]]` instead).
+
+None of these are related to each other in cause — the common thread is
+just that this workspace had apparently never been fully `cargo check`'d
+end to end before. `cargo-ailite check` over the whole workspace now
+finishes clean; targeted `cargo-ailite test` runs on every touched crate
+(23 + 12 = 35 tests across snapclone-storage/core/session/piggyback/
+vcard/network-diag/relay/databus) all pass, 0 failed. The full
+`cargo-ailite test` across the ENTIRE workspace (all ~40 crates,
+including heavy ML deps like tract-onnx) was not run to completion in
+this sandbox — it exceeded a 280s budget mid-compile without erroring,
+just slow. Worth a dedicated longer run next session to be sure nothing
+outside the six crates touched here regressed.
