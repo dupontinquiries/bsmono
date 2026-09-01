@@ -3178,19 +3178,34 @@ impl Snapclone {
         // Clipped to the surface so the sliding page does not paint over
         // the tab bar and the title, which do not move with it — the chrome
         // is the fixed thing the page slides behind.
+        // Every page but the viewfinder scrolls inside the rect the tab bar
+        // left it. C13_TODO §24: settings flowed over the bottom bar and its
+        // sections over each other, on both platforms, because the page was
+        // a bare stack of sections with nothing bounding it — a Ui does not
+        // scroll, it clips. One ScrollArea here, keyed by page so each keeps
+        // its own offset, rather than one per page body that each author
+        // has to remember. The camera page fills; wrapping it would give the
+        // viewfinder a scrollbar.
+        //
+        // The nav has always declared five pages — Camera, Inbox, Friends,
+        // Wayfinder, Settings — and the shell once routed three of them, so
+        // two tabs led nowhere. That is most of why the app read as a demo:
+        // the chrome promised more than the body delivered.
         let draw_pages = |app: &mut Self, ui: &mut Ui| {
-            match app.nav.page() {
-                // The nav has always declared five pages — Camera, Inbox,
-                // Friends, Wayfinder, Settings — and the shell routed three
-                // of them, so two tabs led nowhere. That is most of why the
-                // app read as a demo: the chrome promised more than the
-                // body delivered.
-                0 => app.camera_page(ui, &colors),
-                1 => app.inbox_page(ui, &colors),
-                2 => app.peers_page(ui, &colors),
-                3 => app.wayfinder_page(ui, &colors),
-                _ => app.settings_page(ui, &colors),
+            let page = app.nav.page();
+            if page == 0 {
+                app.camera_page(ui, &colors);
+                return;
             }
+            egui::ScrollArea::vertical()
+                .id_salt(("page", page))
+                .auto_shrink([false, false])
+                .show(ui, |ui| match page {
+                    1 => app.inbox_page(ui, &colors),
+                    2 => app.peers_page(ui, &colors),
+                    3 => app.wayfinder_page(ui, &colors),
+                    _ => app.settings_page(ui, &colors),
+                });
         };
         if page_offset.abs() < 0.5 {
             // The overwhelming majority of frames. No layer, no transform,
@@ -4565,6 +4580,29 @@ mod tests {
     /// physics — `swipe_physics` was written and tested — it was that
     /// nothing reached it. A unit test on the physics passed the whole time
     /// the gesture did nothing.
+    /// C13_TODO §24: settings flowed past the bottom bar. On a phone-sized
+    /// screen the page must stay inside the rect it was given and scroll.
+    #[test]
+    fn a_tall_page_scrolls_inside_its_bounds_rather_than_flowing_past_the_tab_bar() {
+        use egui::{Context, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        app.nav.go_page(4);
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(360.0, 640.0));
+        let mut deepest = 0.0f32;
+        for _ in 0..3 {
+            let _ = ctx.run(RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.ui(ui, &adaptive);
+                    deepest = deepest.max(ui.min_rect().max.y);
+                });
+            });
+        }
+        assert!(deepest <= screen.max.y + 0.5,
+                "the page laid out to y={deepest} on a {}-tall screen: it is not scrolling", screen.max.y);
+    }
+
     #[test]
     fn dragging_across_the_page_turns_it_and_moves_it_on_the_way() {
         use egui::{Context, Event, PointerButton, Pos2, RawInput};
