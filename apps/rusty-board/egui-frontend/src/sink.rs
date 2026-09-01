@@ -51,6 +51,22 @@ pub trait Sink {
     /// distinction was invisible before, which is most of why this went
     /// unnoticed.
     fn describe(&self) -> String;
+
+    /// Drive whatever background event processing this sink needs
+    /// (e.g. dispatching a Wayland event queue). Called once per frame
+    /// from `demo_app`'s `update()`, regardless of which sink is active
+    /// — a no-op default means most sinks don't need to know this
+    /// exists.
+    fn pump(&mut self) {}
+
+    /// Whether the keyboard should currently be shown. The default is
+    /// `true` — `Preview` (desktop/tests) and any sink with no real
+    /// focus signal has no reason to hide itself; only a sink with an
+    /// actual compositor-driven focus signal (`WaylandIntegration`)
+    /// overrides this.
+    fn is_visible(&self) -> bool {
+        true
+    }
 }
 
 /// The desktop/test sink: remembers everything, sends nothing.
@@ -144,6 +160,12 @@ impl Sink for crate::wayland::WaylandIntegration {
     }
     fn describe(&self) -> String {
         format!("{} (typing into the focused window)", self.vk.backend_name())
+    }
+    fn pump(&mut self) {
+        crate::wayland::WaylandIntegration::pump(self);
+    }
+    fn is_visible(&self) -> bool {
+        crate::wayland::WaylandIntegration::is_visible(self)
     }
 }
 

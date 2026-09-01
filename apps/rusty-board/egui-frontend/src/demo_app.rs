@@ -179,6 +179,33 @@ impl eframe::App for Feel {
     #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_theme(ctx);
+
+        // Drive whatever background event processing the active sink
+        // needs (on Wayland: dispatching the input-method event queue —
+        // see `Sink::pump`'s doc and `wayland.rs`'s module doc for why
+        // that has to happen here rather than on some other thread).
+        // Must run before reading `is_visible()` below, or this frame's
+        // Activate/Deactivate event wouldn't be reflected until the
+        // next one.
+        self.sink.pump();
+
+        // Maliit-style focus-driven show/hide: a real compositor focus
+        // signal (Wayland input-method Activate/Deactivate), not
+        // internal app state. `Preview`/no-signal sinks default
+        // `is_visible()` to `true` (see `Sink`'s doc) so desktop/test
+        // runs keep behaving exactly as before — only a sink with a
+        // real signal ever asks to hide.
+        let should_show = self.sink.is_visible();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(should_show));
+        // Keep ticking even while hidden: a hidden/unfocused eframe
+        // window may not otherwise get repainted, which would starve
+        // `pump()` above and mean the NEXT focus event (the one that's
+        // supposed to show the keyboard again) never gets noticed. The
+        // interval matches wayland_backend's own idle-poll ceiling
+        // (see `install_glib_dispatcher`'s IDLE_MS) rather than
+        // inventing an unrelated number.
+        ctx.request_repaint_after(std::time::Duration::from_millis(320));
+
         // Drain the service queue once per frame. Without this `pending` grows
         // for the life of the process — a queue with no reader is a leak, and
         // the model cannot know whether a host exists to read it.
