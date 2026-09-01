@@ -417,6 +417,10 @@ pub struct Controller {
     /// the host (`take()`), not by this struct, so it survives exactly
     /// one read and never fires twice for the same play.
     pub last_played_track: Option<i64>,
+    /// The "scan library" button was pressed and the host hasn't started
+    /// one yet. Cleared by the host (`take()`) the same frame it acts, so
+    /// this never fires the same scan twice.
+    pub pending_rescan: bool,
     /// The rating the user last set; the host applies it and echoes back
     /// through `confirm_rating`. Same shape as `pending_route` — this view
     /// owns no library.
@@ -543,6 +547,7 @@ impl Controller {
             track_url: String::new(),
             track_paths: Vec::new(),
             last_played_track: None,
+            pending_rescan: false,
             pending_source: None,
             pending_rating: None,
             active_device_url: String::new(),
@@ -1845,6 +1850,13 @@ impl Controller {
         if ui.add_enabled(self.settings.can_scan(), egui::Button::new("scan library")).clicked() {
             self.settings.scan = crate::settings_page::Scan::Running {
                 seen: 0, total: None, path: String::new() };
+            // The button used to only flip local state — nothing ever
+            // told a host to actually scan, so "scan library" scanned
+            // nothing. A host that owns a real catalogue (see
+            // bo-suite-egui's real_catalog.rs) reads this flag and starts
+            // one, then drives `self.settings.scan` for real from the
+            // worker's own `ScanProgress` messages.
+            self.pending_rescan = true;
         }
         ui.separator();
         // product capabilities gate what is shown, per hasControl

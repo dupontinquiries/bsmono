@@ -21,6 +21,10 @@ struct App {
     /// (WAL-safe, see real_catalog.rs) with writes routed to the worker
     /// thread spawned below.
     catalog: bo_suite_egui::real_catalog::RealCatalog,
+    /// Confirmations and progress from the media worker (rating echoes,
+    /// scan progress, errors). Read non-blocking each frame in
+    /// `pump_media_results`.
+    media_res_rx: std::sync::mpsc::Receiver<bo_media::MediaResult>,
     /// The recogniser, when one is configured and voice is on.
     voice: bo_suite_egui::voice_source::VoiceSource,
     /// What the recogniser was last started with, so a settings change
@@ -75,7 +79,7 @@ impl App {
         let db_path = bo_suite_egui::real_catalog::db_path();
         let music_roots = bo_suite_egui::real_catalog::music_roots();
         let (media_cmd_tx, media_cmd_rx) = std::sync::mpsc::channel();
-        let (media_res_tx, _media_res_rx) = std::sync::mpsc::channel();
+        let (media_res_tx, media_res_rx) = std::sync::mpsc::channel();
         eprintln!("bo-suite: media db at {}, roots: {:?}", db_path.display(), music_roots);
         {
             let db_path = db_path.clone();
@@ -121,6 +125,7 @@ impl App {
             player: bo_suite_egui::playback::Player::new(),
             last_note: String::new(),
             catalog,
+            media_res_rx,
             voice: bo_suite_egui::voice_source::VoiceSource::new(),
             voice_cmd: String::new(),
         }
@@ -169,6 +174,16 @@ impl App {
     /// player did.
     fn pump_playback(&mut self) {
         use bo_suite_egui::playback::{plan, Request, State};
+        if self.controller.pending_rescan {
+            self.controller.pending_rescan = false;
+            self.catalog.rescan();
+        }
+        if let Some((id, stars)) = self.controller.pending_rating.take() {
+            // Optimistic star already filled by `Controller::rate`; this
+            // persists it. `pump_media_results` reconciles the pending dot
+            // once the worker echoes it back as `MediaResult::TrackRating`.
+            self.catalog.set_rating(id, stars as i64);
+        }
         if let Some(id) = self.controller.last_played_track.take() {
             // Persisted through the worker (play count + history), not
             // written on this connection — see real_catalog.rs.
@@ -237,6 +252,54 @@ impl App {
             eprintln!("bo-suite: {}", std::mem::take(&mut self.last_note));
         }
     }
+
+    /// Drain whatever the media worker has sent back since last frame.
+    /// Non-blocking: a worker mid-scan or mid-write just means nothing is
+    /// ready yet, not that this should wait for it.
+    fn pump_media_results(&mut self) {
+        use bo_media::MediaResult;
+        while let Ok(msg) = self.media_res_rx.try_recv() {
+            match msg {
+                // Closes the gap `confirm_rating`'s own doc comment named:
+                // a rating tapped in the UI stayed "pending" forever
+                // because nothing ever reported the stored value back.
+                MediaResult::TrackRating { track_id, rating } => {
+                    self.controller.confirm_rating(track_id, rating as u8);
+                }
+                MediaResult::ScanProgress(p) => {
+                    use bo_media::scanner::ScanPhase;
+                    use bo_suite_egui::settings_page::Scan;
+                    eprintln!("bo-suite: scan {:?} {}/{}", p.phase, p.done, p.total);
+                    self.controller.settings.scan = match p.phase {
+                        ScanPhase::Idle => Scan::Idle,
+                        ScanPhase::Done => Scan::Done { added: p.done as usize },
+                        ScanPhase::Walking | ScanPhase::Parsing | ScanPhase::Analyzing =>
+                            Scan::Running {
+                                seen: p.done as usize,
+                                total: if p.total > 0 { Some(p.total as usize) } else { None },
+                                path: String::new(),
+                            },
+                    };
+                    if p.phase == ScanPhase::Done {
+                        // The list showing what was already on disk before
+                        // the scan started is now stale — reload the page
+                        // and paths in view so new/changed tracks appear
+                        // without the user having to leave and re-enter
+                        // the library.
+                        self.controller.pending_tracks =
+                            Some(bo_suite_egui::all_tracks::TracksAction::Load { offset: 0 });
+                        self.controller.browse_tracks.clear();
+                    }
+                }
+                MediaResult::Error(e) => self.last_note = format!("library: {e}"),
+                // Everything else (playlists, queue, history, soundscape,
+                // mixer-offline, tags) has no egui surface calling the
+                // matching MediaCmd yet, so there is nothing to reconcile
+                // here either — see real_catalog.rs's follow-up note.
+                _ => {}
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -257,6 +320,7 @@ impl eframe::App for App {
         }
         self.pump_voice();
         self.pump_playback();
+        self.pump_media_results();
     }
 }
 
