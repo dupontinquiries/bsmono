@@ -248,7 +248,7 @@ pub fn page_bar_ui(ui: &mut egui::Ui, bar: &mut PageBar, tab_w: f32,
                 let sel = i == bar.active();
                 let text = egui::RichText::new(name)
                     .color(if sel { c.accent } else { c.text_weak });
-                if ui.add_sized([tab_w, 28.0], egui::SelectableLabel::new(sel, text)).clicked() {
+                if ui.add_sized([tab_w, 28.0], egui::Button::selectable(sel, text)).clicked() {
                     picked = Some(i);
                 }
             }

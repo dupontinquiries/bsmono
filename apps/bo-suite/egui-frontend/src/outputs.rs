@@ -138,7 +138,7 @@ pub fn device_selector_ui(ui: &mut egui::Ui, d: &mut DeviceSelector,
             let text = egui::RichText::new(dev.label())
                 .color(if active { c.accent } else { c.text });
             if ui.add_sized([ui.available_width(), h],
-                egui::SelectableLabel::new(active, text)).clicked() {
+                egui::Button::selectable(active, text)).clicked() {
                 if d.select(&dev.url) { picked = Some(dev.url.clone()); }
             }
         }
