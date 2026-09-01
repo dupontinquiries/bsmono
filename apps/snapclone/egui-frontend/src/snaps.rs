@@ -378,8 +378,14 @@ pub fn feed_ui(ui: &mut egui::Ui, feed: &SnapFeed, press: &mut Press, now: i64,
         for row in feed.entries().chunks(COLUMNS) {
             ui.horizontal(|ui| {
                 for e in row {
+                    // Click, not click_and_drag: a tile does nothing with a
+                    // drag except cancel its hold, and a widget that senses
+                    // drag OWNS it (uikit-egui's gesture rule) — a page swipe
+                    // starting on a tile would have gone nowhere. Movement is
+                    // read from the pointer instead; the feed's ScrollArea
+                    // takes the vertical drag, the pager the horizontal one.
                     let (rect, resp) = ui.allocate_exact_size(
-                        egui::vec2(tile_w, tile_w), egui::Sense::click_and_drag());
+                        egui::vec2(tile_w, tile_w), egui::Sense::click());
                     // The tile is a sealed card: chrome, a badge, a caption.
                     // Nothing here reads snap content, because the entry does
                     // not carry any.
@@ -398,7 +404,7 @@ pub fn feed_ui(ui: &mut egui::Ui, feed: &SnapFeed, press: &mut Press, now: i64,
                         egui::FontId::proportional(11.0), c.text_weak);
 
                     if resp.is_pointer_button_down_on() {
-                        if !resp.dragged() { press.down(); }
+                        if !ui.input(|i| i.pointer.is_decidedly_dragging()) { press.down(); }
                         if press.tick(dt) == Gesture::Hold {
                             action = Some(FeedAction::OpenThread(e.id.clone()));
                         }

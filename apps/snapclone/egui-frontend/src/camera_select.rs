@@ -136,6 +136,23 @@ pub fn select(devices: &[Device], preferred: &str, mirror_front: bool) -> Select
                         mirrored: mirror_front && pick.facing == Facing::Front }
 }
 
+/// The camera facing the other way from `current`, if there is one.
+///
+/// What a double-tap on the viewfinder switches to. The FIRST device of
+/// the other facing, in the session's order: the bridge's virtual node
+/// ranks ahead of the raw sensor it holds (`camera_enumerate`), so the
+/// flip lands on the one that opens. A device facing `Unknown` is never
+/// the answer — a USB webcam is not the back of a phone.
+pub fn other_facing<'a>(devices: &'a [Device], current: &str) -> Option<&'a Device> {
+    let cur = devices.iter().find(|d| d.id == current)?;
+    let want = match cur.facing {
+        Facing::Front => Facing::Rear,
+        Facing::Rear => Facing::Front,
+        _ => return None,
+    };
+    devices.iter().find(|d| d.facing == want)
+}
+
 /// Is PIP offerable?
 ///
 /// Two sensors is necessary and NOT sufficient. They must also be able to run
@@ -238,6 +255,20 @@ mod tests {
 
     fn dev(id: &str, label: &str, facing: Facing) -> Device {
         Device { id: id.into(), label: label.into(), facing, capture_group: None }
+    }
+
+    #[test]
+    fn the_other_facing_is_the_first_of_that_facing_and_never_unknown() {
+        let ds = vec![dev("virtual-cam-front", "bridge front", Facing::Front),
+                      dev("raw-rear", "sensor", Facing::Rear),
+                      dev("virtual-cam-rear", "bridge rear", Facing::Rear),
+                      dev("usb", "webcam", Facing::Unknown)];
+        assert_eq!(other_facing(&ds, "virtual-cam-front").map(|d| d.id.as_str()), Some("raw-rear"));
+        assert_eq!(other_facing(&ds, "raw-rear").map(|d| d.id.as_str()), Some("virtual-cam-front"));
+        assert!(other_facing(&ds, "usb").is_none(), "a webcam has no other side");
+        assert!(other_facing(&ds, "nope").is_none());
+        let one = vec![dev("front", "f", Facing::Front)];
+        assert!(other_facing(&one, "front").is_none(), "one camera flips to nothing");
     }
 
     fn shared(id: &str, label: &str, facing: Facing, group: u32) -> Device {

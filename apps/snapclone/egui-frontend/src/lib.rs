@@ -513,6 +513,10 @@ pub struct Snapclone {
     /// a watchdog — a pointer-up lost to a system gesture would otherwise
     /// leave the machine Held forever.
     pub press: crate::press_gesture::PressGesture,
+    /// Double-tap on the viewfinder flips the camera.
+    pub double_tap: crate::press_gesture::DoubleTap,
+    /// The shell is the phone one this frame (`Adaptive::is_compact`).
+    pub compact: bool,
     /// Horizontal scroll for the tile strip, with edge pass-through: at the
     /// end of the strip the wheel stops being ours and reaches the page
     /// navigator behind it. Without that the carousel silently swallows the
@@ -792,6 +796,8 @@ impl Snapclone {
             // Re-set from Adaptive each frame in `ui`.
             feedback: crate::touch_feedback::TouchFeedback::new(false),
             press: Default::default(),
+            double_tap: Default::default(),
+            compact: false,
             // Bounds are set from the tile count each frame; a strip that has
             // not been drawn yet scrolls nowhere rather than pretending to.
             strip_scroll: crate::scroll_passthrough::HScroll::new(0.0, 0.0),
@@ -2839,6 +2845,7 @@ impl Snapclone {
         // feedback follows the adaptive layer's answer rather than a guess —
         // the module's own rule is ripples on touch, not under a cursor.
         self.feedback.set_enabled(adaptive.is_compact());
+        self.compact = adaptive.is_compact();
         let dt_ms = ui.input(|i| i.stable_dt).min(0.1) * 1000.0;
         let pointer_down = ui.input(|i| i.pointer.any_down());
         // POSTURE. The fleet's only sensor integration — proximity from
@@ -3387,6 +3394,12 @@ impl Snapclone {
             match ev {
                 Some(crate::press_gesture::Event::Tap) => {
                     if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                        // Two taps: flip the camera. The first still
+                        // focuses, which is harmless and what phones do.
+                        let now_ms = ui.input(|i| i.time) * 1000.0;
+                        if self.double_tap.tap(pos.x, pos.y, now_ms) && self.flip_camera() {
+                            self.shutter_note = "flipped".into();
+                        }
                         // The viewfinder maps the tap to SENSOR coordinates
                         // itself (and refuses one outside the image rect), so
                         // it takes the screen point and the rect rather than
@@ -3455,12 +3468,33 @@ impl Snapclone {
         if !self.cameras.is_empty() {
             let pip_ok = crate::camera_select::pip_available(&self.cameras);
             ui.horizontal(|ui| {
-                for d in &self.cameras {
-                    let on = matches!(&self.cam_selection,
-                        Some(crate::camera_select::Selection::Single { id, .. }) if *id == d.id);
-                    if ui.selectable_label(on, &d.label).clicked() {
-                        self.cam_selection = Some(crate::camera_select::select(
-                            &self.cameras, &d.id, true));
+                let current = match &self.cam_selection {
+                    Some(crate::camera_select::Selection::Single { id, .. }) => id.clone(),
+                    _ => String::new(),
+                };
+                if self.compact {
+                    // C13_TODO §23: a phone lists its cameras in a dropdown,
+                    // not a row that runs off the page.
+                    let label = self.cameras.iter().find(|d| d.id == current)
+                        .map(|d| d.label.clone()).unwrap_or_else(|| "camera".into());
+                    let mut pick: Option<String> = None;
+                    egui::ComboBox::from_id_salt("camera_pick").selected_text(label).show_ui(ui, |ui| {
+                        for d in &self.cameras {
+                            if ui.selectable_label(d.id == current, &d.label).clicked() {
+                                pick = Some(d.id.clone());
+                            }
+                        }
+                    });
+                    if let Some(id) = pick {
+                        self.cam_selection = Some(crate::camera_select::select(&self.cameras, &id, true));
+                    }
+                } else {
+                    for d in &self.cameras {
+                        let on = d.id == current;
+                        if ui.selectable_label(on, &d.label).clicked() {
+                            self.cam_selection = Some(crate::camera_select::select(
+                                &self.cameras, &d.id, true));
+                        }
                     }
                 }
                 // Offered ONLY when the hardware can actually do it. A greyed
@@ -3824,6 +3858,19 @@ impl Snapclone {
             ui, &self.roster, &mut self.cards, &mut self.add_form, &info, c) {
             self.apply_friends(a);
         }
+    }
+
+    /// Switch to the camera facing the other way. `false` when there is
+    /// none, or the current selection is PIP (both are already showing).
+    pub fn flip_camera(&mut self) -> bool {
+        let current = match &self.cam_selection {
+            Some(crate::camera_select::Selection::Single { id, .. }) => id.clone(),
+            _ => return false,
+        };
+        let Some(other) = crate::camera_select::other_facing(&self.cameras, &current) else { return false };
+        let id = other.id.clone();
+        self.cam_selection = Some(crate::camera_select::select(&self.cameras, &id, true));
+        true
     }
 
     /// What the hint reads. Assembled here so `hint::hint` stays a pure
@@ -4701,6 +4748,29 @@ mod tests {
         let drew_it = out.shapes.iter().any(|cs| matches!(&cs.shape, egui::Shape::Text(t)
             if t.galley.text().contains("changed")));
         assert!(drew_it, "the hint was decided but never drawn");
+    }
+
+    /// The double-tap flips between the phone's two sides and does nothing
+    /// on a machine with one camera.
+    #[test]
+    fn flip_camera_switches_facing_and_refuses_when_there_is_no_other_side() {
+        let mut app = app();
+        app.cameras = vec![
+            crate::camera_select::Device { id: "front".into(), label: "front".into(),
+                facing: crate::camera_select::Facing::Front, capture_group: Some(1) },
+            crate::camera_select::Device { id: "rear".into(), label: "rear".into(),
+                facing: crate::camera_select::Facing::Rear, capture_group: Some(1) },
+        ];
+        app.cam_selection = Some(crate::camera_select::select(&app.cameras, "rear", true));
+        assert!(app.flip_camera());
+        assert!(matches!(&app.cam_selection,
+            Some(crate::camera_select::Selection::Single { id, .. }) if id == "front"));
+        assert!(app.flip_camera());
+        assert!(matches!(&app.cam_selection,
+            Some(crate::camera_select::Selection::Single { id, .. }) if id == "rear"));
+        app.cameras.truncate(1);
+        app.cam_selection = Some(crate::camera_select::select(&app.cameras, "front", true));
+        assert!(!app.flip_camera(), "one camera has no other side");
     }
 
     #[test]
