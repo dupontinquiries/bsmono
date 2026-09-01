@@ -1118,3 +1118,103 @@ worth keeping: let ONE known node on the bo-suite fabric hold the pairing
 and act as an oracle for the others, rather than every client pairing
 independently. That matches how a Home hub works and sidesteps the
 one-pairing-at-a-time limit for everything except the hub itself.
+
+---
+
+# Fleet run 2026-09-01 (late) + voiceterm direction
+
+## 32. Fleet failures, triaged. Three are NOT our code.
+
+- **beatspace / beatspace+features** — `error: instruction requires:
+  fullfp16`, emitted from `gemm-common-0.19.0/src/simd.rs` inline asm
+  (`fmla v0.8h, ...`). A third-party crate emitting ARM fp16 SIMD that the
+  target does not declare. Fix is a build-config decision, not a code one:
+  either add `-C target-feature=+fp16` for the aarch64 target in
+  `.cargo/config.toml` (correct only if every target device really has it —
+  the Fairphone's SC7280 does, an older ARM board may not), or pin/patch
+  gemm. Deliberately not guessed at, since getting it wrong produces
+  binaries that SIGILL on the device rather than failing to build.
+- **fao-codec / fao-codec-egui-frontend** — `dct_roundtrip`
+  (`in=-3, back=-1.176`), `dct_simd_matches_scalar`, `dct_dc_is_mean` all
+  failing in `fao_codec_core/src/dct.rs`. The scalar/SIMD disagreement plus
+  a roundtrip that loses more than rounding says the SIMD path is wrong on
+  this architecture, which given the beatspace finding above is very likely
+  the same ARM story. Check whether the SIMD path is gated on a target
+  feature it is not actually getting. Real bug, ours, worth doing.
+- **ambient-learner** — one failure, `security::tests::test_pairing` at
+  `src/security.rs:516`. 129 others pass. Small and self-contained.
+- **bot-arena** — four `engine::tests::*` failures
+  (`experience_log_dedups_identical_fixes`,
+  `clean_repo_passes_and_broken_fails`, `evaluate_real_noop_is_full_reward`,
+  `deny_and_allow_dirs_enforce_lists`). Note these are in the git-diff
+  version-merging subsystem recorded in §14 as having zero callers — so
+  either the tests exercise dead code (in which case §14's deletion
+  question answers this too), or something does call it and §14 is wrong.
+  Settle §14 first.
+- **studio** — three `studio-video` probe/thumbnail failures at
+  `crates/studio-video/src/lib.rs:415`. Almost certainly a missing or
+  differently-built ffmpeg on the runner rather than a logic error; confirm
+  before chasing.
+- **logscope / logscope+features / gpu-gemm / bo-suite /
+  voiceterm-egui-frontend** — carried over, see §19 and earlier entries.
+
+## 33. voiceterm-egui chrome: the rest of the density work
+
+Part 1 landed (narrow surfaces start with the tab column collapsed and the
+keycaps row closed). The structural half remains, and `main.qml` says
+exactly what to mirror — these are the constructs to match, not invent:
+
+- `Drawer` — the file picker. egui equivalent: an overlay `Area` that
+  slides in, not a mounted `SidePanel`.
+- `Popup` (with `closePolicy: Popup.CloseOnEscape`) — settings,
+  favourites, voice, ask-AI, the peer panel, the setup wizard. All of
+  these are `egui::Window`s at most, and several are currently panels.
+- `SlidePopup` — the tap/slide marking menus (link actions at
+  main.qml:1737, per-tab actions at :1766, pane long-press at :1780). The
+  egui port already has `slide_menu`/`gesture_menus`; the point is that
+  these are the ONLY way that material appears in Qt, never a fixed row.
+
+Concretely: the keycaps/gesture-chip row should become a `SlidePopup`-style
+overlay reachable by a gesture from the bottom bar, rather than a third
+permanent band. That deletes a whole bottom panel on every device, not just
+narrow ones.
+
+## 34. voiceterm mail: talk to Proton directly, using hydroxide as the reference
+
+A hydroxide checkout was supplied for this. It is a Go bridge exposing
+Proton Mail over standard IMAP/SMTP/CardDAV by implementing Proton's API
+client-side, and it is the right reference for two separable pieces:
+
+1. **The API/auth layer** — hydroxide's `protonmail` package: SRP login
+   (Proton uses SRP, not a bearer password), 2FA, the mailbox-password
+   step that unlocks the key ring, then OpenPGP key handling for
+   encrypt/decrypt. This is the part that is genuinely hard and where a
+   port must follow hydroxide closely rather than improvise.
+2. **The surface it presents** — hydroxide's own answer is "run a local
+   IMAP/SMTP server and let any client talk to it". Worth seriously
+   considering taking that same shape rather than embedding a Proton
+   client in voiceterm: a `voiceterm-mail` daemon speaking IMAP on
+   localhost means the existing mail code keeps working unchanged, the
+   crypto lives in one auditable place, and every other app on the fabric
+   (and any third-party client) gets Proton access for free. The
+   alternative — a Proton-specific backend inside voiceterm's mail view —
+   is less work once and more work forever.
+
+Recommend (2). Check the existing `apps/voiceterm/src/mail.rs` +
+`mail_view.rs` to see how much of it is already IMAP-shaped; if it is,
+this reduces to "point it at localhost and write the daemon".
+
+Licence check before porting anything: hydroxide is MIT, so lifting
+structure and algorithms is fine with attribution. Do not paste Go
+verbatim into a comment and call it a port.
+
+## 35. voiceterm voice features from the Qt predecessor
+
+Not started. The QML side has `ReplVoiceGlow.qml`, a voice `Popup` driven
+by wake-word signals (main.qml:2038 — `voice_pop_wake_event`, inline
+command acceptance, an ask-AI path on a second signal bit), and a
+`workflow_playback` intent confirmed through that popup (main.qml:2190).
+`uikit-egui` already has `repl_voice_glow`, so the visual half is
+partially lifted; the wake-signal plumbing and the intent confirmation
+flow are not. `apps/voiceterm/src/voice_intent.rs` and `editor_voice.rs`
+are the non-Qt logic to reuse.
