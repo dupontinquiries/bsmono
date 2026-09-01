@@ -1315,7 +1315,7 @@ fn bake_rcells(world: &world::World) -> Vec<u32> {
     out
 }
 
-fn bake_heightmap(gpu: &render::Gpu, seed: u64, style: &world::MapStyle) {
+fn bake_heightmap(gpu: &render::Gpu, seed: u64, style: &world::MapStyle, origin: Vec3) {
     let n = render::HMAP_SIZE as usize;
     let half = render::HMAP_HALF;
     let mut data = vec![0f32; n * n];
@@ -1323,7 +1323,9 @@ fn bake_heightmap(gpu: &render::Gpu, seed: u64, style: &world::MapStyle) {
         let z = (j as f32 / (n - 1) as f32 * 2.0 - 1.0) * half;
         for i in 0..n {
             let x = (i as f32 / (n - 1) as f32 * 2.0 - 1.0) * half;
-            data[j * n + i] = world::terrain_h_s(x, z, seed, style.amp, style.freq);
+            // world coordinates, the same the CPU grid sampled, or the
+            // GPU's ground disagrees with the one you drive on after a page
+            data[j * n + i] = world::terrain_h_s(x + origin.x, z + origin.z, seed, style.amp, style.freq);
         }
     }
     gpu.set_heightmap(&data);
@@ -1657,7 +1659,7 @@ fn main() {
     for _ in 0..(nc * nc) {
         gpu.add_mesh(&meshgen::MeshData::new());
     }
-    bake_heightmap(&gpu, seed, style0);
+    bake_heightmap(&gpu, seed, style0, Vec3::ZERO);
 
     // ---- models -----------------------------------------------------------
     let dir = assets_dir();
@@ -2600,14 +2602,25 @@ impl Game {
     /// Regenerate the world for a map style + seed (terrain mesh swapped in
     /// place so the mesh registry stays stable).
     fn load_map(&mut self, map: usize, seed: u64) {
+        self.load_map_at(map, seed, Vec3::ZERO);
+    }
+
+    /// THE WINDOW, REBUILT at `origin` on the world plane: the world,
+    /// its terrain chunks, the reflection cells and the heightmap. This
+    /// is the whole cost of a page — every bake the renderer needs, in
+    /// one go, on the main thread. It hitches. The double-buffered,
+    /// spread-over-frames version is the next step and is listed in
+    /// `docs/VEHICLE_COMBAT.md`; this one exists so the seam is real and
+    /// the hitch can be measured rather than imagined.
+    fn load_map_at(&mut self, map: usize, seed: u64, origin: Vec3) {
         self.save.map = map % world::STYLE_COUNT;
         self.save.seed = seed;
         let style = world::style(self.save.map);
-        self.world = World::generate(seed, style, self.cars.models[self.cars.active].half_h, self.cfg.arena.scale);
+        self.world = World::generate_at(seed, style, self.cars.models[self.cars.active].half_h, self.cfg.arena.scale, origin);
         self.applied_scale = self.cfg.arena.scale;
         self.tchunks = terrain_chunks(&mut self.gpu, &self.world);
         self.gpu.set_rcells(&bake_rcells(&self.world));
-        bake_heightmap(&self.gpu, seed, style);
+        bake_heightmap(&self.gpu, seed, style, origin);
         let dims_i = self.cars.active;
         self.car.reset(&self.world);
         apply_car_dims(&mut self.car, &self.cars.models[dims_i], self.cfg.car.size);
@@ -2629,6 +2642,91 @@ impl Game {
         self.air_t = 0.0;
         self.air_link = 0.0;
         self.toastf(&format!("MAP: {}", style.name));
+    }
+
+    /// PAGING — the window follows the car. TENTATIVE SYSTEM.
+    ///
+    /// A car at 60 mph crosses the ±1300 m tile in a minute and a half,
+    /// so on the district the tile is a window: when you are past
+    /// `PAGE_AT` of the half-extent from its origin, the window is
+    /// rebuilt centred on a lattice point near you and everything that
+    /// lives in window-local coordinates is shifted by the same delta.
+    /// The world plane is the truth; the window is a view of it
+    /// (`World::generate_at`, `district::layout`'s world-coordinate
+    /// hashing, `bake_heightmap`'s origin).
+    ///
+    /// What is shifted: the car, the ball, the bots, both shot pools, the
+    /// sortie's drop and field (anchor, cover, solids, every foe), the
+    /// ship's berth. What is NOT, and what that costs: the fx (a burst
+    /// mid-flight jumps by the delta — one frame of confetti in the wrong
+    /// place), the camera (it re-seats on the car next frame), the
+    /// sandbox's sequential-rng furniture (rings, pads — a district has
+    /// none, which is the reason paging is district-only for now).
+    ///
+    /// The lattice step is `PAGE_STEP` so origins are exact on the world
+    /// plane and a page back lands on the same ground.
+    fn page_window(&mut self) {
+        const PAGE_AT: f32 = 0.45;
+        const PAGE_STEP: f32 = 100.0;
+        // district only: the other styles scatter their content off a
+        // window-local rng and would be a different map after a page
+        if self.world.boulevard.is_none() && self.world.plazas.is_empty() && self.style().focal != 25 {
+            return;
+        }
+        if self.style().focal != 25 {
+            return;
+        }
+        let p = self.car.pos;
+        if p.x.abs() < world::TG_HALF * PAGE_AT && p.z.abs() < world::TG_HALF * PAGE_AT {
+            return;
+        }
+        let delta = Vec3::new((p.x / PAGE_STEP).round() * PAGE_STEP, 0.0, (p.z / PAGE_STEP).round() * PAGE_STEP);
+        if delta.length_squared() < 1.0 {
+            return;
+        }
+        let origin = self.world.origin + delta;
+        let map = self.save.map;
+        let seed = self.save.seed;
+        let parked = self.world.parked.as_ref().map(|(o, _)| *o);
+        let t0 = Instant::now();
+        // the bots list is cleared by load_map; keep the field's puppets
+        let kept: Vec<bots::Bot> = self.bots.drain(..).filter(|b| b.brain.hostile_slot().is_some()).collect();
+        self.load_map_at(map, seed, origin);
+        self.bots = kept;
+        // everything window-local moves the other way
+        self.car.pos -= delta;
+        self.ball.pos -= delta;
+        for b in self.bots.iter_mut() {
+            b.car.pos -= delta;
+        }
+        for sh in self.shots.live.iter_mut() {
+            sh.pos -= delta;
+        }
+        for sh in self.hostile_shots.live.iter_mut() {
+            sh.pos -= delta;
+        }
+        if let Some(s) = self.sortie.as_mut() {
+            s.drop.pos -= delta;
+            s.drop.lz -= delta;
+            s.field.anchor -= delta;
+            for c in s.field.cover.iter_mut() {
+                *c -= delta;
+            }
+            s.field.avoid = self.world.obstacles.clone();
+            for f in s.field.foes.iter_mut() {
+                f.agent.position -= delta;
+            }
+        }
+        // the ship berthed where it berthed: re-park at the shifted spot
+        if let Some(o) = parked {
+            self.world.park(o - delta, self.aboard.ship.clone());
+            self.last_room = None;
+            self.cam.indoors = None;
+        }
+        self.cam.pos -= delta;
+        self.cam.look -= delta;
+        let ms = t0.elapsed().as_secs_f32() * 1000.0;
+        self.toastf(&format!("window paged {:+.0},{:+.0} — {ms:.0} ms", delta.x, delta.z));
     }
 
     /// Offline game modes: clear or spawn the bot armies.
@@ -6688,6 +6786,10 @@ impl Game {
             // whatever the flow wanted said this frame, said once — the
             // toast is single-slot, so the FEED keeps the history and the
             // last line wins the slot
+            // THE WINDOW FOLLOWS THE CAR (district only; see `page_window`)
+            if self.mode == Mode::Play {
+                self.page_window();
+            }
             // THE FORGE RESOLVES IN THE LOOP: one try_recv per frame, no
             // blocking, no async runtime — the worker thread owns the wait.
             if let Some(rx) = &self.forge_rx {

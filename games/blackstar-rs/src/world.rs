@@ -385,6 +385,8 @@ pub struct World {
     pub obstacles: Vec<(Vec3, f32)>,
     /// the district's road: from, to, clear width
     pub boulevard: Option<(Vec3, Vec3, f32)>,
+    /// where this window sits on the world plane (`generate_at`)
+    pub origin: Vec3,
     #[allow(dead_code)] // map identity metadata; the grid is the live ground
     pub seed: u64,
     #[allow(dead_code)]
@@ -647,6 +649,18 @@ pub fn style(idx: usize) -> &'static MapStyle {
 // ---------------------------------------------------------- gen world ----
 impl World {
     pub fn generate(seed: u64, style: &MapStyle, car_half_h: f32, wscale: f32) -> World {
+        Self::generate_at(seed, style, car_half_h, wscale, Vec3::ZERO)
+    }
+
+    /// The same world, as the WINDOW at `origin` on the world plane. The
+    /// terrain noise is sampled at world coordinates, so two windows
+    /// agree on the ground where they overlap, and the district lattice
+    /// is addressed the same way. Everything else the generator
+    /// scatters (rings, balloons, the sandbox's furniture) still comes
+    /// off a sequential rng and belongs to the window, not the world —
+    /// which is why the district style zeroes it. `origin` is stored on
+    /// the world for the shell's paging.
+    pub fn generate_at(seed: u64, style: &MapStyle, car_half_h: f32, wscale: f32, origin: Vec3) -> World {
         let mut routes: Vec<(Vec<Vec3>, f32)> = Vec::new();
         let mut route_names: Vec<String> = Vec::new();
         let mut route_shapes: Vec<Vec<u32>> = Vec::new();
@@ -677,7 +691,7 @@ impl World {
             for i in 0..TG_N {
                 let x = (i as f32 / (TG_N - 1) as f32 * 2.0 - 1.0) * TG_HALF;
                 let z = (j as f32 / (TG_N - 1) as f32 * 2.0 - 1.0) * TG_HALF;
-                tgrid[j * TG_N + i] = terrain_h_s(x, z, seed, amp, freq);
+                tgrid[j * TG_N + i] = terrain_h_s(x + origin.x, z + origin.z, seed, amp, freq);
             }
         }
         let th = |x: f32, z: f32| grid_h(&tgrid, x, z);
@@ -3243,7 +3257,7 @@ impl World {
                 // piece by piece with this map's own palette: stone from
                 // the grass tone lifted, the accent as the lit lines, the
                 // spires and the hangar in a dark structural tone.
-                let lay = crate::district::layout(seed, TG_HALF);
+                let lay = crate::district::layout(seed, TG_HALF, origin);
                 let stone = mix4(style.grass, [0.85, 0.80, 0.72, 1.0], 0.55);
                 let dark = mix4(style.grass, [0.06, 0.06, 0.08, 1.0], 0.6);
                 for pc in crate::district::pieces(&lay, &th, stone, acc, dark) {
@@ -3252,7 +3266,9 @@ impl World {
                 plazas = lay.plazas.clone();
                 cover = crate::district::cover_points(&lay);
                 obstacles = crate::district::obstacles(&lay);
-                boulevard = Some((lay.boulevard.0, lay.boulevard.1, lay.width));
+                if lay.road_in_window {
+                    boulevard = Some((Vec3::new(-TG_HALF, 0.0, lay.road_z), Vec3::new(TG_HALF, 0.0, lay.road_z), lay.width));
+                }
             }
             _ => {}
         }
@@ -3797,7 +3813,7 @@ impl World {
             route_names.push(String::new());
             route_shapes.push(Vec::new());
         }
-        let mut w = World { nrm_cache: std::cell::Cell::new((Vec3::ZERO, Vec3::ZERO)), sdf_calls: std::cell::Cell::new(0), grav, ggrid, gdim, gdyn, mgrid: Vec::new(), sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, parked: None, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, plazas, cover, obstacles, boulevard, seed, t_amp: amp, t_freq: freq };
+        let mut w = World { nrm_cache: std::cell::Cell::new((Vec3::ZERO, Vec3::ZERO)), sdf_calls: std::cell::Cell::new(0), grav, ggrid, gdim, gdyn, mgrid: Vec::new(), sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, parked: None, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, plazas, cover, obstacles, boulevard, origin, seed, t_amp: amp, t_freq: freq };
         // prime the mover index so the very first frame is already fast
         w.rebuild_movers();
         w
