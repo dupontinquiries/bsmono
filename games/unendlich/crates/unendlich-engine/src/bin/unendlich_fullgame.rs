@@ -2812,6 +2812,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // over the same knob.
     let frame_pacer_enabled = std::env::var("UNENDLICH_FRAME_PACER")
         .map(|v| v != "0" && !v.is_empty()).unwrap_or(true); // default ON, bounded knob
+    // Runtime-checked (2026-09-01, xvfb+lavapipe soak, UNENDLICH_AUTOPLAY=1): fired
+    // correctly under extreme sustained overshoot (lavapipe frames run 1-2.5s vs a
+    // 16.67ms target) — shadow_stride climbed 1→5→8 and lod_fidelity dropped
+    // 1.00→0.60→0.40 over two adjustment cycles, then held at the configured clamps
+    // with no further log spam and no oscillation. No panics over 90s. This confirms
+    // the wiring and clamping are correct; it does NOT confirm the tuning (thresholds,
+    // step sizes) is good on real frame-time distributions — lavapipe's frame times
+    // bear no resemblance to real hardware, so that still needs an actual GPU.
     let mut frame_pacer_hist = unendlich_engine::sim::frame_pacer::FrameHistory {
         recent_ms: [0.0f32; 32],
         len: 0,
@@ -2852,13 +2860,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // / last_wait_fences_ms), so this feeds them in and logs what plan()
     // WOULD decide — submit-skip, inflight up/down — WITHOUT acting on it.
     //
-    // Not acted on because doing so means resizing WorldRenderer::frames (the
-    // per-frame Vulkan command buffers / sync objects) at runtime, which is a
-    // real resource-lifetime change I can't validate without a GPU to run
-    // against. This gets the observability in place first: once someone with
-    // real hardware confirms these numbers look sane and plan()'s decisions
-    // seem reasonable, wiring the actual frames_in_flight resize is a much
-    // smaller, better-informed next step.
+    // Runtime-checked (2026-09-01, xvfb+lavapipe soak, UNENDLICH_AUTOPLAY=1):
+    // last_gpu_frame_ms()/last_cpu_frame_ms() exactly match the engine's own
+    // trusted per-second diagnostic log (e.g. logged `gpu: ... total=1349.14ms`
+    // vs this code's `gpu=1349.14ms` the same tick) — the accessors are
+    // numerically correct, not just plausible. No panics over a 90s soak.
+    // Still NOT acted on: lavapipe has no real present/fence-wait behavior
+    // (wait_ms reads ~0 throughout, frames take 1-2.5s each under software
+    // rendering), so this soak validates the plumbing, not whether plan()'s
+    // decisions are good on real GPU frame pacing. That still needs hardware.
     let submit_schedule_log = std::env::var("UNENDLICH_SUBMIT_SCHEDULE_LOG")
         .map(|v| v != "0" && !v.is_empty()).unwrap_or(false); // opt-in: pure diagnostic noise otherwise
     let mut submit_schedule_hist: Vec<unendlich_engine::sim::submit_schedule::FrameStats> = Vec::with_capacity(8);
