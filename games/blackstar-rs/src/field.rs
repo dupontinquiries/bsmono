@@ -356,6 +356,13 @@ pub struct Field {
     /// gravity for flung bodies, m/s². Set by the shell for the map;
     /// the default is Earth so headless tests fly a sensible arc.
     pub g: f32,
+    /// SOLIDS the agents must not walk or drive through, as ground discs.
+    /// The agents are kinematic — `enemy::Enemy` moves a position, it does
+    /// not collide — so without this a foe drives straight through a
+    /// spire, which is the kind of thing a screen shows and a test does
+    /// not. Resolved after each move: a body inside a disc is pushed to
+    /// its rim. Set by the shell from the world; empty means open ground.
+    pub avoid: Vec<(Vec3, f32)>,
 }
 
 // ---------------------------------------------------------------- muster ---
@@ -428,7 +435,7 @@ impl Field {
     /// toward where the player will come from (the LZ); `ride_h` is the
     /// shell's ground clearance for a standing body.
     pub fn new(anchor: Vec3, facing: Vec3, seed: u64, ride_h: f32) -> Field {
-        Field { foes: Vec::new(), anchor, facing: unit_xz(facing), seed, ride_h, pending: Vec::new(), tow: None, g: 9.81, cover: Vec::new() }
+        Field { foes: Vec::new(), anchor, facing: unit_xz(facing), seed, ride_h, pending: Vec::new(), tow: None, g: 9.81, cover: Vec::new(), avoid: Vec::new() }
     }
 
     /// The conventional anchor for a sortie: `SITE_AHEAD_M` past the LZ
@@ -958,6 +965,11 @@ impl Field {
                 }
             }
 
+            // OUT OF THE SOLIDS: a body that ended the tick inside a disc
+            // is put on its rim, so it slides round a spire instead of
+            // driving through it
+            keep_out(&self.avoid, &mut foe.agent.position, foe.agent.radius);
+
             // ground snap and this tick's velocity
             let p = &mut foe.agent.position;
             p.y = ground(p.x, p.z) + ride_h;
@@ -1008,6 +1020,22 @@ impl Field {
             }
         }
         ev
+    }
+}
+
+/// Push `p` out of any disc it is inside, by its own radius. Two passes,
+/// because leaving one disc can land in a neighbour's.
+fn keep_out(discs: &[(Vec3, f32)], p: &mut Vec3, body_r: f32) {
+    for _ in 0..2 {
+        for (c, r) in discs {
+            let d = Vec3::new(p.x - c.x, 0.0, p.z - c.z);
+            let len = d.length();
+            let keep = r + body_r;
+            if len < keep {
+                let out = if len > 1e-4 { d / len } else { Vec3::X };
+                *p += out * (keep - len);
+            }
+        }
     }
 }
 
@@ -1361,6 +1389,36 @@ mod tests {
         let mut g = field();
         g.muster(1, &s.fighters, None);
         assert!(g.foes.iter().zip(f.foes.iter()).any(|(a, b)| a.pos() != b.pos()));
+    }
+
+    #[test]
+    fn a_driving_foe_goes_round_a_spire_not_through_it() {
+        let s = wave(&["grunt"]);
+        let mut f = field();
+        f.muster(1, &s.fighters, None);
+        f.foes[0].agent.state = State::Chase;
+        let start = f.foes[0].pos();
+        let player = Player::standing(start + Vec3::new(0.0, 0.0, -120.0));
+        // a spire dead on the line to its flank point (which sits FLANK_M
+        // beside the player, on the +x side for slot 0)
+        let spire = start + Vec3::new(FLANK_M * 0.5, 0.0, -60.0);
+        f.avoid = vec![(spire, 6.0)];
+        let mut nearest = f32::MAX;
+        let mut touched = false;
+        for _ in 0..(120 * 25) {
+            f.step(1.0 / 120.0, &player, &flat, &open);
+            let d = (f.foes[0].pos() - spire) * Vec3::new(1.0, 0.0, 1.0);
+            nearest = nearest.min(d.length());
+            if d.length() < 6.0 + f.foes[0].agent.radius + 0.05 {
+                touched = true;
+            }
+            if (f.foes[0].pos() - player.pos).length() < 20.0 {
+                break;
+            }
+        }
+        assert!(touched, "the spire was never in the way; the test proves nothing");
+        assert!(nearest >= 6.0 + f.foes[0].agent.radius - 1e-3, "drove through the spire: nearest {nearest:.2}");
+        assert!((f.foes[0].pos() - player.pos).length() < 40.0, "never got past it");
     }
 
     // ---- the two registers ----

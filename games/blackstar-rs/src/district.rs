@@ -289,6 +289,27 @@ pub fn cover_points(l: &Layout) -> Vec<Vec3> {
     l.plazas.iter().flat_map(|c| cover_ring(*c).into_iter().map(|(x, z, _)| Vec3::new(x, 0.0, z))).collect()
 }
 
+/// Everything a body should steer around, as (centre, radius) discs on
+/// the ground: spires, the arch pylons, the hangar. The cover blocks are
+/// NOT here — a body is meant to stand at them.
+pub fn obstacles(l: &Layout) -> Vec<(Vec3, f32)> {
+    let u = oh();
+    let mut out = Vec::new();
+    for (p, h) in &l.spires {
+        let r = h / (2.0 * CAP_TALL_HH + 2.0);
+        out.push((Vec3::new(p.x, 0.0, p.z), r * 1.15));
+    }
+    for a in &l.arches {
+        for side in [-1.0f32, 1.0] {
+            out.push((Vec3::new(a.x, 0.0, side * (l.width * 0.5 + 0.9 * u)), 1.1 * u));
+        }
+    }
+    // the hangar as one big disc: crude, and a body walking its edge is
+    // walking a wall it cannot enter anyway
+    out.push((Vec3::new(l.hangar.x, 0.0, l.hangar.z), HANGAR_L_OH * u * 0.55));
+    out
+}
+
 /// Is `p` on the boulevard: within its clear width, between its ends.
 pub fn on_boulevard(l: &Layout, p: Vec3) -> bool {
     p.x >= l.boulevard.0.x && p.x <= l.boulevard.1.x && p.z.abs() <= l.width * 0.5

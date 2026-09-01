@@ -380,6 +380,9 @@ pub struct World {
     pub plazas: Vec<Vec3>,
     /// the district's cover blocks, for a wave to stand behind
     pub cover: Vec<Vec3>,
+    /// the district's solids as ground discs, for kinematic bodies to
+    /// steer around (a spire is not a thing a foe drives through)
+    pub obstacles: Vec<(Vec3, f32)>,
     /// the district's road: from, to, clear width
     pub boulevard: Option<(Vec3, Vec3, f32)>,
     #[allow(dead_code)] // map identity metadata; the grid is the live ground
@@ -857,6 +860,7 @@ impl World {
         // shell to route by; empty on every other style
         let mut plazas: Vec<Vec3> = Vec::new();
         let mut cover: Vec<Vec3> = Vec::new();
+        let mut obstacles: Vec<(Vec3, f32)> = Vec::new();
         let mut boulevard: Option<(Vec3, Vec3, f32)> = None;
         match style.focal {
             1 => {
@@ -3247,6 +3251,7 @@ impl World {
                 }
                 plazas = lay.plazas.clone();
                 cover = crate::district::cover_points(&lay);
+                obstacles = crate::district::obstacles(&lay);
                 boulevard = Some((lay.boulevard.0, lay.boulevard.1, lay.width));
             }
             _ => {}
@@ -3792,7 +3797,7 @@ impl World {
             route_names.push(String::new());
             route_shapes.push(Vec::new());
         }
-        let mut w = World { nrm_cache: std::cell::Cell::new((Vec3::ZERO, Vec3::ZERO)), sdf_calls: std::cell::Cell::new(0), grav, ggrid, gdim, gdyn, mgrid: Vec::new(), sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, parked: None, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, plazas, cover, boulevard, seed, t_amp: amp, t_freq: freq };
+        let mut w = World { nrm_cache: std::cell::Cell::new((Vec3::ZERO, Vec3::ZERO)), sdf_calls: std::cell::Cell::new(0), grav, ggrid, gdim, gdyn, mgrid: Vec::new(), sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, parked: None, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, plazas, cover, obstacles, boulevard, seed, t_amp: amp, t_freq: freq };
         // prime the mover index so the very first frame is already fast
         w.rebuild_movers();
         w

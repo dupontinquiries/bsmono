@@ -6454,6 +6454,7 @@ impl Game {
                             s.field.facing = Vec3::new(to.x, 0.0, to.z).normalize_or(Vec3::Z);
                             // and the plaza's own blocks, so the front stands behind them
                             s.field.cover = self.world.cover.iter().filter(|c| (**c - *p).length() < 40.0).copied().collect();
+                            s.field.avoid = self.world.obstacles.clone();
                         }
                     }
                     // THE BODY READS THE FALL: nose down the velocity as a
