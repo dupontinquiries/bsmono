@@ -16,7 +16,7 @@ use voiceterm_egui::action_compass::ActionCompass;
 use voiceterm_egui::gesture_menus::{brace_bytes, brace_menu, brace_slide_menu, link_dispatch, link_menu, pane_dispatch, pane_menu, pipe_char, pipe_menu, pipe_slide_menu, tab_dispatch, tab_menu, tab_slide_menu, BlockAction, LinkAction, PaneAction};
 use voiceterm_egui::surface::{Surface, Surfaces};
 use voiceterm_egui::overlay;
-use voiceterm_egui::shell::{blocks_drawer_ui, fab_rect, keycap_bar_ui, load_prefs, mic_fab_ui, overflow_counts, paint_terminal_border, save_prefs, settings_panel, tab_row, theme_menu, Session, Sidebar, SidebarAction, Workspace, TERMINAL_KEYCAPS};
+use voiceterm_egui::shell::{blocks_drawer_ui, fab_rect, keycap_bar_ui, load_prefs, mic_fab_ui, overflow_counts, paint_terminal_border, save_prefs, settings_panel, tab_row, theme_menu, PaneView, Session, Sidebar, SidebarAction, Workspace, TERMINAL_KEYCAPS};
 use voiceterm_egui::slide_menu::SlideOutcome;
 use uikit_egui::PaletteColors;
 use voiceterm_egui::App;
@@ -26,8 +26,18 @@ use voiceterm_egui::App;
 /// The terminal is the default and always one tap away — voiceterm is a
 /// terminal first, and a switcher that made it a peer of the mail reader would
 /// be the wrong app.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CentralView { Terminal, Mail, Browser, Graph, Table, Docs, Archive, Models, Chat, Notes, Build }
+///
+/// Uses `voiceterm_egui::shell::PaneView` (the tiling-workspace model's own
+/// enum) rather than a second, locally-duplicated one: this file used to
+/// declare its own `CentralView` with the same 11 variants, set only by the
+/// quick-launcher's two doors (Models/Chat). The palette's `Command::OpenView`
+/// (typed or spoken — "mail", "open the graph") already called
+/// `workspace.open_view(..)` and that write landed correctly and was tested,
+/// but nothing here ever READ it back — the render dispatch below matched on
+/// the separate `CentralView` field, so a palette-driven view change updated
+/// the model and changed nothing on screen. One enum, read from the
+/// workspace's focused pane, is what makes "the pure core already works" also
+/// mean "and you can see it."
 
 impl VoicetermApp {
     /// The document ingest surface: diagnose, choose, confirm.
@@ -269,30 +279,6 @@ fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-impl CentralView {
-    // The array LENGTH is part of the type: adding a variant without widening
-    // this is a compile error rather than a tab that silently never renders,
-    // which is the failure mode a Vec here would have had.
-    const ALL: [CentralView; 11] = [CentralView::Terminal, CentralView::Mail,
-                                   CentralView::Browser, CentralView::Graph,
-                                   CentralView::Table, CentralView::Docs,
-                                   CentralView::Archive, CentralView::Models,
-                                   CentralView::Chat, CentralView::Notes,
-                                   CentralView::Build];
-    fn label(self) -> &'static str {
-        match self {
-            CentralView::Terminal => "Terminal", CentralView::Mail => "Mail",
-            CentralView::Browser => "Web", CentralView::Graph => "Graph",
-            CentralView::Table => "Table", CentralView::Docs => "Docs",
-            CentralView::Archive => "Archive",
-            CentralView::Models => "Models",
-            CentralView::Chat => "Chat",
-            CentralView::Notes => "Notes",
-            CentralView::Build => "Build",
-        }
-    }
-}
-
 struct VoicetermApp {
     app: App,
     /// The accelerometer, if this device has one. `None` on a desktop, which is
@@ -468,11 +454,6 @@ struct VoicetermApp {
     a11y: uikit_egui::a11y::A11yScene,
     /// Document ingest: diagnose a captured page, repair it, confirm or revert.
     ingest: voiceterm_egui::docingest::Ingest,
-    /// WHICH SURFACE the central panel shows. voiceterm had twelve ported
-    /// modules — mail, browser, graph, cards, viz, model picker, setup wizard,
-    /// chat panel and more — and the central panel always drew the terminal, so
-    /// none of them could be reached. This is the switch that makes them exist.
-    view: CentralView,
     mail: voiceterm_egui::mail_view::MailView,
     browser: voiceterm_egui::browser::Browser,
     graph: voiceterm_egui::graph_view::GraphView,
@@ -1646,7 +1627,7 @@ impl eframe::App for VoicetermApp {
             // Deferred because the surface switch happens INSIDE the
             // Settings overlay's own closure — opening another surface
             // mid-draw would tear down the panel being drawn.
-            let mut next_view: Option<CentralView> = None;
+            let mut next_view: Option<PaneView> = None;
             let out = overlay::show(ctx, Surface::Settings, open_t, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong("Settings");
@@ -1694,10 +1675,10 @@ impl eframe::App for VoicetermApp {
                         // exists, not to grow a second copy of it.
                         match ev {
                             LauncherEvent::OpenSetup => {
-                                next_view = Some(CentralView::Models);
+                                next_view = Some(PaneView::Models);
                             }
                             LauncherEvent::OpenChat => {
-                                next_view = Some(CentralView::Chat);
+                                next_view = Some(PaneView::Chat);
                             }
                             // These two genuinely have no destination, so
                             // they say so rather than opening a blank one.
@@ -1727,7 +1708,11 @@ impl eframe::App for VoicetermApp {
                 // Close the launcher on the way: leaving it over the
                 // destination would hide what the door just opened.
                 self.surfaces.close();
-                self.view = v;
+                // Through the same model the palette uses (`workspace.open_view`),
+                // not a separate field — that split is exactly what let a
+                // palette-driven "mail"/"graph"/etc. update the model with zero
+                // visible effect (see this file's `PaneView` doc comment above).
+                self.workspace.open_view(v);
             }
         }
 
@@ -2159,10 +2144,17 @@ impl eframe::App for VoicetermApp {
                 }
                 None => {}
             }
-            if self.view != CentralView::Terminal {
+            // Read from the workspace model, not a separate field — this is the
+            // other half of the `PaneView` fix (see the doc comment above): the
+            // palette's `Command::OpenView` writes to `workspace` via
+            // `open_view`, and the quick-launcher's two doors now do too, so
+            // this is the single place that has to read it back for either to
+            // reach the screen at all.
+            let view = self.workspace.pane_view(self.workspace.focused_pane());
+            if view != PaneView::Terminal {
                 let c = self.colors;
-                match self.view {
-                    CentralView::Mail => {
+                match view {
+                    PaneView::Mail => {
                         // The spoken selector, above the typed query. "my last
                         // couple emails from bob" parses to a count and a
                         // sender — the grammar every mail intent except
@@ -2254,7 +2246,7 @@ impl eframe::App for VoicetermApp {
                             }
                         }
                     }
-                    CentralView::Browser => {
+                    PaneView::Web => {
                         ui.horizontal(|ui| {
                             // THE ONE-CHARACTER BUG. This used to clone
                             // `self.browser.url` into a local every frame, edit
@@ -2349,7 +2341,7 @@ impl eframe::App for VoicetermApp {
                             }
                         }
                     }
-                    CentralView::Graph => {
+                    PaneView::Graph => {
                         // CONNECTIONS, above the niftyplot source. Two
                         // different graphs on one tab: this one is over the
                         // app's OWN data — "a unified Node abstraction over the
@@ -2434,7 +2426,7 @@ impl eframe::App for VoicetermApp {
                             voiceterm_egui::graph_view::graph_ui(ui, &mut self.graph, &topo, &c);
                         }
                     }
-                    CentralView::Table => {
+                    PaneView::Table => {
                         // The view returns a submitted line; the ENGINE decides
                         // what it means. Routing it through submit_with_engine
                         // rather than parsing here is what keeps table_nlp the
@@ -2474,7 +2466,7 @@ impl eframe::App for VoicetermApp {
                             }
                         }
                     }
-                    CentralView::Docs => {
+                    PaneView::Docs => {
                         // READING MODE. corpus_tape records a paragraph read
                         // aloud, and the corpus it fills is what acoustic_cache
                         // later learns from — "a bad recording here becomes a
@@ -2648,7 +2640,7 @@ impl eframe::App for VoicetermApp {
                             let _ = name;
                         }
                     }
-                    CentralView::Models => {
+                    PaneView::Models => {
                         // FIRST RUN: the wizard, until it finishes. It owns
                         // the phase machine (Intro → Browse → Downloading →
                         // Done) and reports events; the manual search below
@@ -2771,7 +2763,7 @@ impl eframe::App for VoicetermApp {
                             }
                         }
                     }
-                    CentralView::Archive => {
+                    PaneView::Archive => {
                         // Built from the browser's OWN saved pages, the same
                         // source the explore grouping uses — an archive of
                         // nothing would be the placeholder this replaces.
@@ -2795,7 +2787,7 @@ impl eframe::App for VoicetermApp {
                             self.toasts.info(url, ui.input(|i| i.time));
                         }
                     }
-                    CentralView::Chat => {
+                    PaneView::Chat => {
                         // The local model's conversation. The panel owns the
                         // transcript and returns what the user sent; there is
                         // no llama.cpp in this crate, so the reply is an
@@ -2806,7 +2798,7 @@ impl eframe::App for VoicetermApp {
                                 "user: {sent}\nassistant: (no local model attached in this build)"));
                         }
                     }
-                    CentralView::Notes => {
+                    PaneView::Notes => {
                         // CAPTURE → CARDS → BACKLINKS, in that order, because
                         // that is the dependency: the splitter produces the
                         // notes the index links. Editing the capture re-splits
@@ -2940,7 +2932,7 @@ impl eframe::App for VoicetermApp {
                             }
                         }
                     }
-                    CentralView::Build => {
+                    PaneView::Build => {
                         // Compiler output as a navigable list. No cargo is
                         // invoked here — the output is pasted, which is the
                         // same no-subprocess contract the Models tab keeps.
@@ -2996,7 +2988,7 @@ impl eframe::App for VoicetermApp {
                             }
                         }
                     }
-                    CentralView::Terminal => {}
+                    PaneView::Terminal => {}
                 }
                 return;
             }
@@ -3310,6 +3302,28 @@ impl eframe::App for VoicetermApp {
                         self.toasts.info("shell exited", ui.input(|i| i.time));
                     }
                 }
+            }
+            // BACKGROUND PANES. Only `self.pty` (the focused pane) was drained above — every
+            // other pane's real shell was spawned and left running, but its output sat unread
+            // in the OS pipe buffer forever: an unfocused pane looked frozen at whatever it
+            // showed the moment it lost focus, no matter how long its shell kept producing
+            // output. Mirrors the focused-pty drain above, but writes into that SPECIFIC pane's
+            // own `pane_apps` entry (never `self.app`, which is a different pane's live state) —
+            // the same per-pane isolation the render loop already reads from.
+            for (id, host) in self.pane_ptys.iter() {
+                let Some(h) = host else { continue };
+                let out = h.drain();
+                if out.is_empty() {
+                    continue;
+                }
+                if let Some(app) = self.pane_apps.get_mut(id) {
+                    let text = String::from_utf8_lossy(&out).into_owned();
+                    app.terminal.feed(&text);
+                }
+                // `h.ended()` (shell exited while backgrounded) is intentionally not surfaced
+                // here: the toast path above is keyed to the single focused-pane pty_ended_noted
+                // flag, and a per-pane version of that notification is a separate, larger piece
+                // of UI (which pane, shown where) rather than a one-line addition.
             }
             // The demo has no PTY to write to. Rather than dropping the bytes
             // again, they are kept on the app where a host can drain them, and
@@ -3853,7 +3867,6 @@ fn main() -> eframe::Result<()> {
                 pane_ptys: std::collections::HashMap::new(),
                 launcher: uikit_egui::quick_launcher::LauncherState::default(),
                 a11y: uikit_egui::a11y::A11yScene::new(),
-                view: CentralView::Terminal,
                 mail: Default::default(),
                 browser: Default::default(),
                 graph: Default::default(),
