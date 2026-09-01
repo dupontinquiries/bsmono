@@ -606,3 +606,39 @@ RMS-style tests, and picking (a) or (b) wrong either deletes a documented
 intentional feature or half-wires audio behavior nobody asked for and
 nothing tests. Reading whatever pre-port reference (if any) inspired the
 "trap halftime" comment, or asking whoever wrote it, would settle which.
+
+## 14. bot-arena: a whole git-history-mining subsystem, unwired and untested
+
+`cargo-ailite check` on apps/bot-arena/egui-frontend (which pulls in the
+main `bot-arena` lib) flags 14 functions in `src/engine.rs` as dead code.
+One (`sim_fitness`, line 326) is isolated. The other thirteen form a
+single coherent, self-contained pipeline clustered at lines 2599–2986:
+
+`extract_filepaths`, `weighted_vocab`, `tokens`, `diff_metrics`,
+`git_recent_commits`, `git_commit_diff`, `changed_lines`,
+`diff_similarity`, `diverse_commits`, `best_match`, `progression_refs`,
+`lcs_lines`, `merge_versions`.
+
+Read together they're a git-diff-based genome merger for whatever
+evolutionary/genetic-programming loop drives this arena: pull recent
+commits, tokenize and diff them, score similarity/diversity, pick a
+diverse reference set, and merge two "versions" of code by walking their
+LCS anchors and coin-flipping which side's hunk wins between anchors.
+Confirmed zero callers anywhere — not `src/`, not `egui-frontend/`, not
+even a test (`grep` across both trees, not just the lint).
+
+**Not touched.** This is a bigger, more self-contained candidate for
+wiring than tomescope's Nav or studio-fx's Halftime — it's pure
+string/git logic (no audio/UI feel to misjudge) and 13 functions is
+enough surface that SOME integration point in the arena's
+mutation/selection loop plausibly wants exactly this. But guessing where
+to call `merge_versions` from without understanding the rest of the
+arena's evolution loop risks bolting on a feature nobody asked for, with
+no test to confirm the wiring is even correct. Worth a dedicated look:
+find where the arena currently does mutation/crossover (if there's a
+simpler existing scheme it uses instead) and decide whether these
+supersede it, complement it, or were an abandoned direction.
+
+Fixed in the same pass, no risk: a stray `mut` on a closure in
+`merge_versions` that's never reassigned (`6777efa4`) — trivial and
+independent of whether the function itself ever gets called.
