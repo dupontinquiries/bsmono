@@ -39,6 +39,7 @@ mod foldaudit;
 mod foldsim;
 mod font;
 mod footing;
+mod field;
 mod foothold;
 mod fleet;
 mod fx;
@@ -940,6 +941,11 @@ struct Game {
     /// live projectiles — the thrown-mass and launched-charge verbs fly
     /// through `shots.rs` now instead of resolving in the trigger pull
     shots: shots::Shots,
+    /// HOSTILE FIRE: the field's shots, in their own pool so the two sets
+    /// of marks cannot be confused — the player's shots test against the
+    /// bots, these test against the player. Same pool type, same physics,
+    /// same medium; only the target list differs.
+    hostile_shots: shots::Shots,
     /// what the shots fly through, set with the map: vacuum carries,
     /// air drags. Subsea is the named next medium (needs the sea level).
     ambient: ballistics::Ambient,
@@ -1005,6 +1011,61 @@ struct Game {
 /// strike both go through it, so a railshot is worth the same wherever it
 /// lands and the number can be retuned in one place.
 const IMPULSE_TO_DAMAGE: f32 = 0.02;
+
+/// Line of sight through the world's SDF: march from `a` to `b` in 1.5 m
+/// steps and call it blocked when the field goes solid. Coarse on
+/// purpose — a hostile deciding whether it can see you does not need
+/// sub-metre precision, and `field.rs` only asks a few times a second
+/// per foe (`field::LOS_EVERY_S`).
+fn los_march(world: &World, a: Vec3, b: Vec3) -> bool {
+    let d = b - a;
+    let len = d.length();
+    if len < 1e-3 {
+        return true;
+    }
+    let dir = d / len;
+    let mut t = 1.5;
+    while t < len - 1.0 {
+        if world.sdf(a + dir * t) < 0.15 {
+            return false;
+        }
+        t += 1.5;
+    }
+    true
+}
+
+/// Which pose a field hostile shows: a chassis from the loaded roster
+/// (deterministic per slot, never a boss, only one that folds), and the
+/// frame of its fold strip that matches the foe's form — vehicle end,
+/// robot end, or a frame between while it is mid-fold. Without bot
+/// assets (the plain sandbox) it falls back to the three cars.
+fn hostile_pose(cars: &CarModels, foe: &field::Foe) -> usize {
+    let cands: Vec<usize> = cars
+        .chassis
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.boss && c.transforms && c.strip.len() >= 2)
+        .map(|(i, _)| i)
+        .collect();
+    if cands.is_empty() {
+        return foe.slot % cars.models.len().max(1).min(3);
+    }
+    // a Corrupted body wears the same chassis every time it appears so
+    // the wave reads; everyone else cycles the roster by slot
+    let ch = &cars.chassis[cands[foe.slot % cands.len()]];
+    let last = ch.strip.len() - 1;
+    let k = if foe.fold_t > 0.0 {
+        let frac = foe.fold_frac();
+        let toward_robot = foe.fold_to == field::Form::Robot;
+        let f = if toward_robot { frac } else { 1.0 - frac };
+        ((f * last as f32).round() as usize).min(last)
+    } else if foe.form == field::Form::Vehicle {
+        0
+    } else {
+        last
+    };
+    ch.strip[k]
+}
 
 /// One blade swing, trigger to follow-through, seconds. The arc lands at
 /// the midpoint. A GUESS tuned by feel once it is on a screen.
@@ -2116,6 +2177,7 @@ fn main() {
         raid: None,
         forge_rx: None,
         shots: shots::Shots::default(),
+        hostile_shots: shots::Shots::default(),
         ship_class: aboard::FLEET_DEFAULT,
         loco_mode: locomotion::decide(4, 0, 0, 0.0, 0.0),
         ambient: ballistics::Ambient::earthlike(),
@@ -3492,6 +3554,183 @@ impl Game {
         }
     }
 
+    /// A player hit landed on bot `id`: if it is a field hostile, land it
+    /// on the fight through the sortie's aimed door. Section damage and
+    /// the shove stay with the bot (that is what the renderer shows);
+    /// whether the hostile DIES is the fight's call, mirrored back by
+    /// `field::sync`.
+    fn hostile_hit(&mut self, id: usize, dmg: f32, elem: weapons::Element) {
+        let Some(slot) = self.bots.get(id).and_then(|b| b.brain.hostile_slot()) else { return };
+        if let Some(s) = self.sortie.as_mut() {
+            s.strike_slot(slot, dmg, elem);
+        }
+    }
+
+    /// Damage to the player's own body from the field — a hostile shot,
+    /// a lunge, a ram. One place, so the death check is one place too.
+    fn player_take(&mut self, dmg: f32, at: Vec3, kind: sections::Kind) {
+        if dmg <= 0.0 {
+            return;
+        }
+        let was = self.body.alive();
+        let local = (self.car.rot.inverse() * (at - self.car.pos)).clamp_length_max(1.0);
+        let _ = self.body.hit(kind, local, Vec3::Y, dmg, 0.6);
+        self.fx.ring_burst(at, [1.0, 0.35, 0.2, 1.0], false);
+        if was && !self.body.alive() {
+            if let Some(s) = self.sortie.as_mut() {
+                s.player_down();
+            } else {
+                self.toastf("STRUCTURAL FAILURE — grounded");
+            }
+        }
+    }
+
+    /// THE WAVE, STEPPED. The field is handed the player and hands back
+    /// events; this applies them — hostile fire into its own pool, lunges
+    /// and rams onto the body, the player's ram onto the fight — and then
+    /// mirrors every living foe onto a `Brain::Hostile` bot so the
+    /// renderer, the section damage and the shot marks all see the same
+    /// body. Outside an engagement it only sweeps up: leftover puppets
+    /// and in-flight hostile shots go, so an abandoned sortie does not
+    /// leave a wave standing in the sandbox.
+    fn tick_field(&mut self, dt: f32) {
+        let engaged = self.sortie.as_ref().map(|s| s.engaged()).unwrap_or(false);
+        if !engaged {
+            if self.bots.iter().any(|b| b.brain.hostile_slot().is_some()) {
+                self.bots.retain(|b| b.brain.hostile_slot().is_none());
+            }
+            self.hostile_shots.live.clear();
+            return;
+        }
+        let ppos = self.car.pos;
+        let pvel = self.car.vel;
+        let vehicle = !self.car.robot;
+        // the cloak ability exists in the tables and not on the hotbar yet
+        let cloaked = false;
+        let world = &self.world;
+        let ground = |x: f32, z: f32| world.ground_h(x, z);
+        let los = |a: Vec3, b: Vec3| los_march(world, a, b);
+        let ev = {
+            let s = self.sortie.as_mut().unwrap();
+            s.field.step(dt, ppos, pvel, vehicle, cloaked, &ground, &los)
+        };
+        for e in ev {
+            match e {
+                field::Event::Fire { from, dir, verb, element, dmg, .. } => {
+                    // a hostile beam flies as a very fast slug so one pool
+                    // carries every verb; speeds are GUESSES sized to be
+                    // dodgeable at range and not up close
+                    let deliv = match verb.delivery() {
+                        ballistics::Delivery::Melee => ballistics::Delivery::Kinetic,
+                        d => d,
+                    };
+                    let speed = match deliv {
+                        ballistics::Delivery::Beam => 220.0,
+                        ballistics::Delivery::Blast => 55.0,
+                        _ => 120.0,
+                    };
+                    self.hostile_shots.spawn(from, dir, deliv, speed, dmg / IMPULSE_TO_DAMAGE, element, &self.ambient, None);
+                }
+                field::Event::Melee { dmg, .. } => {
+                    self.player_take(dmg, ppos, sections::Kind::Kinetic);
+                }
+                field::Event::Ram { dv, dmg, .. } => {
+                    self.car.vel += dv;
+                    self.player_take(dmg, ppos, sections::Kind::Kinetic);
+                }
+                field::Event::Rammed { slot, dv, dmg } => {
+                    if let Some(s) = self.sortie.as_mut() {
+                        s.strike_slot(slot, dmg, weapons::Element::None);
+                    }
+                    if let Some(b) = self.bots.iter_mut().find(|b| b.brain.hostile_slot() == Some(slot)) {
+                        b.car.vel += dv;
+                        let at = b.car.pos;
+                        self.fx.ring_burst(at, [1.0, 0.8, 0.35, 1.0], true);
+                    }
+                    // you take a little of your own ram, and lose speed
+                    self.car.vel *= 0.8;
+                }
+                field::Event::Folded { slot, .. } => {
+                    if let Some(f) = self.sortie.as_ref().and_then(|s| s.field.foe(slot)) {
+                        let at = f.pos();
+                        self.fx.ring_burst(at, [0.7, 0.85, 1.0, 1.0], false);
+                    }
+                }
+                field::Event::Down { slot } => {
+                    if let Some(i) = self.bots.iter().position(|b| b.brain.hostile_slot() == Some(slot)) {
+                        let at = self.bots[i].car.pos;
+                        self.fx.ring_burst(at, [1.0, 0.55, 0.15, 1.0], true);
+                        self.bots.swap_remove(i);
+                    }
+                }
+            }
+        }
+
+        // HOSTILE SHOTS fly the same medium and gravity as yours, against
+        // one mark: you. A blast in the dirt beside you still bites.
+        if !self.hostile_shots.live.is_empty() {
+            let marks = [shots::Mark { pos: ppos, vel: pvel, r: self.car.half_len.max(self.car.half_h) }];
+            // a fresh closure: the one above ended with the field step
+            let world = &self.world;
+            let ground = |x: f32, z: f32| world.ground_h(x, z);
+            let hits = self.hostile_shots.step(dt, self.world_g, &self.ambient, &marks, &ground);
+            for h in hits {
+                let amount = h.dv.length() * IMPULSE_TO_DAMAGE;
+                let kind = match h.delivery {
+                    ballistics::Delivery::Blast => sections::Kind::Blast,
+                    ballistics::Delivery::Beam => sections::Kind::Beam,
+                    _ => sections::Kind::Kinetic,
+                };
+                match h.target {
+                    Some(_) => {
+                        self.car.vel += h.dv * 0.5;
+                        self.player_take(amount, h.at, kind);
+                    }
+                    None => {
+                        self.fx.ring_burst(h.at, [0.85, 0.7, 0.45, 1.0], false);
+                        const SPLASH_R: f32 = 4.0;
+                        let d = (h.at - ppos).length();
+                        if h.delivery == ballistics::Delivery::Blast && d <= SPLASH_R && amount > 0.0 {
+                            self.player_take(amount * (1.0 - d / SPLASH_R) * 0.5, h.at, sections::Kind::Blast);
+                        }
+                    }
+                }
+            }
+        }
+
+        // THE MIRROR: one bot per living foe, found by its slot marker
+        // rather than a stored index, because `bots` is cleared on every
+        // map change and an index into it is a bug waiting for one.
+        let Some(s) = self.sortie.as_ref() else { return };
+        let live: Vec<usize> = s.field.foes.iter().filter(|f| f.alive()).map(|f| f.slot).collect();
+        self.bots.retain(|b| b.brain.hostile_slot().map(|sl| live.contains(&sl)).unwrap_or(true));
+        for foe in s.field.foes.iter().filter(|f| f.alive()) {
+            let yaw = (-foe.facing.x).atan2(-foe.facing.z);
+            let idx = match self.bots.iter().position(|b| b.brain.hostile_slot() == Some(foe.slot)) {
+                Some(i) => i,
+                None => {
+                    let mut b = bots::mk_bot_brain(foe.pos(), yaw, bots::TEAM_BRONZE, 100 + foe.slot, bots::Brain::Hostile { slot: foe.slot as u8 });
+                    let t = foe.troop.tint;
+                    // the troop's own paint, lifted a touch: the sandbox
+                    // tints run over 1.0 and a dark hostile at 0.2 reads
+                    // as a hole in the ground
+                    b.tint = [t[0] as f32 / 255.0 * 1.25 + 0.05, t[1] as f32 / 255.0 * 1.25 + 0.05, t[2] as f32 / 255.0 * 1.25 + 0.05];
+                    self.bots.push(b);
+                    self.bots.len() - 1
+                }
+            };
+            let b = &mut self.bots[idx];
+            b.car.pos = foe.pos();
+            b.car.vel = foe.vel;
+            b.car.rot = Quat::from_rotation_y(yaw);
+            b.car.robot = !foe.is_vehicle();
+            if foe.is_vehicle() {
+                b.car.wheel_spin += foe.vel.length() * dt * 4.0;
+            }
+            b.model = hostile_pose(&self.cars, foe);
+        }
+    }
+
     /// Pull the trigger.
     ///
     /// Robot mode only: a car has no arms. Boost is the ammunition, which is
@@ -3591,21 +3830,13 @@ impl Game {
             self.fx.ring_burst(e.pos, e.color, e.scale > 1.5);
         }
 
-        // THE SORTIE BRIDGE: a shot that fired lands its REAL numbers on
-        // the engagement — the weapon's impulse through the same
-        // `IMPULSE_TO_DAMAGE` the section damage below uses, the Watch's
-        // element through the same advantage table the volleys use
-        // (`active()` is `Element::None` mid-attune, and that costs what
-        // the table says it costs). Pellets and chains are NOT multiplied
-        // in: one trigger pull, one hit on the line — conservative until
-        // the abstract fight has positions for a scatter to spread over.
-        if self.sortie.as_ref().map(|s| s.engaged()).unwrap_or(false) {
-            let p = self.wep.effective();
-            let elem = self.wep.watch.active();
-            if let Some(s) = self.sortie.as_mut() {
-                s.strike(p.impulse * IMPULSE_TO_DAMAGE, elem);
-            }
-        }
+        // THE SORTIE BRIDGE IS GONE. It used to land every trigger pull on
+        // "the hostile leading the line" whatever you were aiming at. The
+        // wave now stands in the world (`field.rs`) as bots with
+        // `Brain::Hostile`, so a shot reaches the engagement only by
+        // HITTING one — through `hits_on` below for the instant verbs and
+        // through the shot pool's impacts for the flying ones, both via
+        // `hostile_hit`. A miss is a miss.
         // the raid's kill bridge now runs the same element advantage
         // table the sortie and the live bots use (`RaidFlow::strike`)
         if self.raid.as_ref().map(|r| r.assaulting()).unwrap_or(false) {
@@ -3624,12 +3855,14 @@ impl Game {
         // are not the same event however similar their damage numbers.
         let kind = sections::kind_for(self.wep.profile().verb);
         let radius = if kind == sections::Kind::Blast { self.wep.effective().reach.min(3.0) } else { 0.0 };
+        let shooter_elem = self.wep.watch.active();
         for (id, dv) in &out.hits_on {
-            let Some(bot) = self.bots.get_mut(*id as usize) else { continue };
             let amount = dv.length() * IMPULSE_TO_DAMAGE;
             if amount <= 0.0 {
                 continue;
             }
+            self.hostile_hit(*id as usize, amount, shooter_elem);
+            let Some(bot) = self.bots.get_mut(*id as usize) else { continue };
             // world -> body space: the bot's own rotation, inverted
             let local = bot.car.rot.inverse() * (origin - bot.car.pos);
             let dir_local = (bot.car.rot.inverse() * dv.normalize_or(Vec3::Z)).normalize_or(Vec3::Z);
@@ -6010,6 +6243,9 @@ impl Game {
                         s.tick_engage(FIXED_DT);
                     }
                 }
+                // THE WAVE, IN THE WORLD: the field is stepped with the
+                // player and its events applied here (`tick_field`)
+                self.tick_field(FIXED_DT);
                 // THE ASSAULT TICKS ON POSITIONS: the machine is handed the
                 // player and the two seat-holding squad ghosts, and hands
                 // back what its mechanics did. Slams and chips are the
@@ -6094,6 +6330,7 @@ impl Game {
                         let amount = h.dv.length() * IMPULSE_TO_DAMAGE;
                         match h.target {
                             Some(i) => {
+                                self.hostile_hit(i, amount, h.element);
                                 if let Some(b) = self.bots.get_mut(i) {
                                     let kind = match h.delivery {
                                         ballistics::Delivery::Blast => sections::Kind::Blast,
@@ -6122,6 +6359,7 @@ impl Game {
                         // have switched forms entirely, so there is no live
                         // weapon state left to ask.
                         const SPLASH_R: f32 = 4.0;
+                        let mut splashed: Vec<(usize, f32)> = Vec::new();
                         if h.delivery == ballistics::Delivery::Blast && amount > 0.0 {
                             for (j, other) in self.bots.iter_mut().enumerate() {
                                 if h.target == Some(j) { continue; }
@@ -6134,6 +6372,14 @@ impl Game {
                                 let _ = other.body.hit(
                                     sections::Kind::Blast, local, Vec3::Y, splash, SPLASH_R,
                                 );
+                                if let Some(slot) = other.brain.hostile_slot() {
+                                    splashed.push((slot, splash));
+                                }
+                            }
+                            for (slot, dmg) in splashed.drain(..) {
+                                if let Some(s) = self.sortie.as_mut() {
+                                    s.strike_slot(slot, dmg, h.element);
+                                }
                             }
                         }
                     }
@@ -7411,7 +7657,7 @@ impl Game {
             for &(_, i) in order.iter().take(20) {
                 let b = &self.bots[i];
                 let m = &self.cars.models[b.model];
-                let t = bots::team_tint(b.team);
+                let t = b.tint;
                 self.push_car_proxy(&mut v, m, [t[0] * 0.6, t[1] * 0.6, t[2] * 0.6, 1.0], b.car.pos, b.car.rot, false, &mut push);
             }
         }
@@ -7520,6 +7766,8 @@ impl Game {
                 self.close_deck();
                 self.toastf(&format!("sortie accepted — {} over {}", s.mission.id, d.name));
                 self.raid = None; // one flight at a time
+                let mut s = s;
+                s.set_ride_h(self.car.ride_h.max(self.car.half_h));
                 self.sortie = Some(s);
             }
             Err(e) => self.toastf(e),
@@ -8165,7 +8413,7 @@ impl Game {
                 b.car.steer_vis,
                 0.0,
                 1.0,
-                Some(bots::team_tint(b.team)),
+                Some(b.tint),
                 d2 < 60.0 * 60.0, [0.0; 4],);
         }
 

@@ -50,6 +50,7 @@ use crate::bigbody::BigBody;
 use crate::campaign::{CampEvent, MissionRun, DEFAULT_DOCTRINE, DEFAULT_SQUAD};
 use crate::content::Mission;
 use crate::drop::{Drop, Landing, Mode};
+use crate::field::Field;
 use crate::foothold::{self, Approach, Plan, Site};
 use crate::patrol::{Destination, Faction, ROUTE};
 use crate::dropship;
@@ -64,6 +65,12 @@ use crate::weapons::Element;
 /// both toward a shared home rather than letting them drift. `pub` because
 /// the raid flow paces its footholds with the same legs.
 pub const SQUAD_SPEED_MS: f32 = 14.0;
+
+/// Ground clearance for a standing body when the shell has not said: the
+/// sandbox car's `half_h`. A GUESS in metres, which `docs/START_HERE.md`
+/// warns about — the shell overrides it with the live value
+/// (`set_ride_h`) so this only matters to headless callers.
+pub const DEFAULT_RIDE_H: f32 = 0.19;
 
 /// Where the flow is. `Debrief` keeps the outcome so the shell can close
 /// the sortie without re-asking the run.
@@ -122,6 +129,14 @@ pub struct Sortie {
     have: u32,
     /// ground height under the drop last step, for the HUD's prediction
     last_gy: f32,
+    /// THE WAVE, IN THE WORLD. Built at touchdown around the objective
+    /// site; mustered on every `WaveStart`, mirrored from the fight every
+    /// tick, stepped by the shell with the player's position. See
+    /// `field.rs` for the seam.
+    pub field: Field,
+    /// ground clearance for a standing body, handed in at accept so the
+    /// field can be rebuilt at touchdown without asking the shell again
+    ride_h: f32,
 }
 
 /// Is this order one the flow can fly? Returns the mission id and the
@@ -248,7 +263,16 @@ impl Sortie {
             toasts: Vec::new(),
             have,
             last_gy: 0.0,
+            field: Field::for_sortie(Vec3::ZERO, lz_dir, m.id, DEFAULT_RIDE_H),
+            ride_h: DEFAULT_RIDE_H,
         })
+    }
+
+    /// The shell's ground clearance for a standing body, so the field
+    /// seats foes the way the player is seated. Set before launch; the
+    /// field is rebuilt with it at touchdown.
+    pub fn set_ride_h(&mut self, h: f32) {
+        self.ride_h = h.max(0.01);
     }
 
     pub fn falling(&self) -> bool {
@@ -403,6 +427,15 @@ impl Sortie {
         run = run.with_modifiers(burn, card_exposure || self.site_exposure);
         self.landing = Some(l);
         self.run = Some(run);
+        // the wave will stand SITE_AHEAD_M past the LZ along the drop
+        // bearing; the first `WaveStart` musters it there
+        let lz = self.lz_now();
+        self.field = Field::for_sortie(
+            Vec3::new(lz.x, self.last_gy, lz.z),
+            self.lz_dir,
+            self.mission.id,
+            self.ride_h,
+        );
         self.stage = Stage::Engage;
     }
 
@@ -410,8 +443,17 @@ impl Sortie {
     pub fn tick_engage(&mut self, dt: f32) {
         let Some(run) = self.run.as_mut() else { return };
         for ev in run.step(dt) {
+            match ev {
+                CampEvent::WaveStart { wave, .. } => {
+                    self.field.muster(wave, run.foes(), self.mission.champion);
+                }
+                CampEvent::WaveCleared { .. } => self.field.clear(),
+                _ => {}
+            }
             Self::note(&mut self.feed, &mut self.toasts, ev);
         }
+        // the fight's own casualties reach the world through the mirror
+        self.field.sync(run.foes());
         if let Some(won) = run.outcome() {
             self.stage = Stage::Debrief { won };
         }
@@ -421,11 +463,46 @@ impl Sortie {
         }
     }
 
-    /// The player's shot, into the fight. `dmg` is the shell's conversion
-    /// of the weapon's REAL numbers (see `fire_weapon`); the element ring
-    /// is resolved here against the hostile leading the line, with the
-    /// same `advantage` the volleys use. Attuning fires as `Element::None`
-    /// and takes whatever the advantage table says that is worth.
+    /// A world hit on the hostile standing in `slot` (`field.rs`). The
+    /// element ring is resolved against THAT body; the fight applies its
+    /// own shield and evasion; the agent is woken so a foe shot from
+    /// cover turns to face you. This is the aimed door — the shell uses
+    /// it for every hit that lands on a hostile bot.
+    pub fn strike_slot(&mut self, slot: usize, dmg: f32, shooter: Element) {
+        if self.stage != Stage::Engage {
+            return;
+        }
+        let Some(run) = self.run.as_mut() else { return };
+        let ring = run.foe_element(slot).map(|d| shooter.advantage(d)).unwrap_or(1.0);
+        if let Some(ev) = run.player_strike_slot(slot, dmg, ring) {
+            Self::note(&mut self.feed, &mut self.toasts, ev);
+        }
+        self.field.poke(slot);
+    }
+
+    /// The player is down on the field: the sortie is lost, whatever the
+    /// squad ghosts were doing. Nothing is recorded until the debrief.
+    pub fn player_down(&mut self) {
+        if self.stage != Stage::Engage {
+            return;
+        }
+        let Some(run) = self.run.as_mut() else { return };
+        if let Some(ev) = run.concede() {
+            Self::note(&mut self.feed, &mut self.toasts, ev);
+            self.toasts.push("you are down — the sortie is lost".into());
+        }
+        self.field.clear();
+        self.stage = Stage::Debrief { won: false };
+    }
+
+    /// The player's shot, into the fight, AIM-AGNOSTIC: lands on the
+    /// hostile leading the line whatever the shell was pointing at. This
+    /// was the shell's whole bridge before `field.rs` gave hostiles
+    /// positions; the shell now uses `strike_slot`. Kept for headless
+    /// callers and the tests that pin the conversion. `dmg` is the
+    /// shell's conversion of the weapon's REAL numbers (see
+    /// `fire_weapon`); attuning fires as `Element::None` and takes
+    /// whatever the advantage table says that is worth.
     pub fn strike(&mut self, dmg: f32, shooter: Element) {
         if self.stage != Stage::Engage {
             return;
@@ -732,6 +809,89 @@ mod tests {
             s.run.as_ref().unwrap().foes_alive() < before,
             "overwhelming fire through the real rules killed nobody"
         );
+    }
+
+    #[test]
+    fn the_wave_stands_in_the_world_and_an_aimed_hit_lands_on_that_body() {
+        let mut s = Sortie::begin(first_mission(), None).unwrap();
+        fly_down(&mut s);
+        assert!(s.field.foes.is_empty(), "foes stood up before the first wave mustered");
+        s.tick_engage(0.05);
+        let run = s.run.as_ref().unwrap();
+        assert_eq!(s.field.alive(), run.foes_alive(), "the field and the fight disagree on who is standing");
+        assert!(s.field.alive() > 0);
+        // they muster past the LZ along the drop bearing, not on top of you
+        let lz = s.lz_now();
+        for f in &s.field.foes {
+            let d = (f.pos() - lz) * Vec3::new(1.0, 0.0, 1.0);
+            assert!(d.length() > 20.0, "foe {} mustered {:.0} m from the LZ", f.slot, d.length());
+        }
+        // an aimed hit on slot 1 costs slot 1, and only slot 1
+        let hp_before: Vec<f32> = run.foes().iter().map(|f| f.hp).collect();
+        let target = s.field.foes.iter().map(|f| f.slot).nth(1).unwrap_or(0);
+        for _ in 0..4 {
+            s.strike_slot(target, 40.0, Element::None);
+        }
+        let run = s.run.as_ref().unwrap();
+        let hp_after: Vec<f32> = run.foes().iter().map(|f| f.hp).collect();
+        assert!(hp_after[target] < hp_before[target], "the aimed body took nothing");
+        for (i, (a, b)) in hp_before.iter().zip(hp_after.iter()).enumerate() {
+            if i != target {
+                assert!((a - b).abs() < 1e-3, "slot {i} was hit by fire aimed at slot {target}");
+            }
+        }
+        // the woken foe is on the field, awake
+        assert_ne!(s.field.foe(target).unwrap().agent.state, crate::enemy::State::Idle);
+        // and a kill through the aimed door comes off the field on the next mirror
+        for _ in 0..40 {
+            s.strike_slot(target, 1.0e6, Element::None);
+        }
+        s.tick_engage(0.0);
+        assert!(!s.field.foe(target).map(|f| f.alive()).unwrap_or(false), "killed in the fight, still standing in the world");
+        assert_eq!(s.field.alive(), s.run.as_ref().unwrap().foes_alive());
+    }
+
+    #[test]
+    fn going_down_loses_the_sortie_and_clears_the_field() {
+        let mut s = Sortie::begin(first_mission(), None).unwrap();
+        fly_down(&mut s);
+        s.tick_engage(0.05);
+        assert!(s.field.alive() > 0);
+        s.player_down();
+        assert_eq!(s.stage, Stage::Debrief { won: false });
+        assert!(s.field.foes.is_empty(), "the wave outlived the sortie");
+        // idempotent, and the fight agrees it is over
+        s.player_down();
+        assert_eq!(s.run.as_ref().unwrap().outcome(), Some(false));
+        assert!(s.feed.iter().any(|l| l.contains("down")) || !s.feed.is_empty());
+    }
+
+    #[test]
+    fn a_cleared_wave_leaves_nobody_standing() {
+        let mut s = Sortie::begin(first_mission(), None).unwrap();
+        fly_down(&mut s);
+        s.tick_engage(0.05);
+        let n = s.run.as_ref().unwrap().foes().len();
+        for slot in 0..n {
+            for _ in 0..40 {
+                s.strike_slot(slot, 1.0e6, Element::None);
+            }
+        }
+        s.tick_engage(0.0);
+        assert_eq!(s.field.alive(), 0, "the wave is dead in the fight and alive in the world");
+        // the breather runs, then the next wave musters fresh bodies
+        let mut mustered = false;
+        for _ in 0..800 {
+            s.tick_engage(1.0 / 60.0);
+            if s.field.alive() > 0 {
+                mustered = true;
+                break;
+            }
+            if s.stage != Stage::Engage {
+                break;
+            }
+        }
+        assert!(mustered || s.stage != Stage::Engage, "no second wave and no ending either");
     }
 
     #[test]

@@ -30,7 +30,7 @@ use crate::content::{hostiles, missions_of, Mission, Objective, Role, MISSIONS};
 use crate::energon;
 use crate::patrol::{self, Faction};
 use crate::raidgen::{strhash, Rng};
-use crate::skirmish::{Casualty, Fight, Squad, OPEN_AT};
+use crate::skirmish::{Casualty, Fight, Fighter, Squad, OPEN_AT};
 use crate::weapons::Element;
 
 // --------------------------------------------------------------- waves ---
@@ -317,6 +317,37 @@ impl MissionRun {
     pub fn player_strike(&mut self, dmg: f32, ring: f32) -> Option<CampEvent> {
         let f = self.fight.as_mut()?;
         f.external_on_b(dmg, ring).map(|i| CampEvent::EnemyDown { wave_slot: i })
+    }
+
+    /// The player's fire, landed on ONE hostile — the one the shot hit in
+    /// the world. Same gates as `player_strike`; the difference is that
+    /// the caller knew where it was pointing.
+    pub fn player_strike_slot(&mut self, slot: usize, dmg: f32, ring: f32) -> Option<CampEvent> {
+        let f = self.fight.as_mut()?;
+        f.external_on_b_slot(slot, dmg, ring).map(|i| CampEvent::EnemyDown { wave_slot: i })
+    }
+
+    /// The hostiles on stage this wave, slot-indexed — what `field.rs`
+    /// stands up in the world. Empty between waves.
+    pub fn foes(&self) -> &[Fighter] {
+        self.fight.as_ref().map(|f| f.b.fighters.as_slice()).unwrap_or(&[])
+    }
+
+    /// The element of the hostile in `slot`, for the shooter's advantage
+    /// arithmetic against the body it actually hit.
+    pub fn foe_element(&self, slot: usize) -> Option<Element> {
+        self.foes().get(slot).filter(|f| f.alive()).map(|f| f.troop.element)
+    }
+
+    /// The player is down. The squad ghosts may still be standing; it
+    /// does not matter — a sortie you are not upright for is lost, which
+    /// is the "way to fail" the flown mission did not have.
+    pub fn concede(&mut self) -> Option<CampEvent> {
+        if self.outcome.is_some() {
+            return None;
+        }
+        self.outcome = Some(false);
+        Some(CampEvent::Lost)
     }
 
     fn spawn_wave(&mut self, ev: &mut Vec<CampEvent>) {
