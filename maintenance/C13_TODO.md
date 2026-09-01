@@ -1218,3 +1218,47 @@ command acceptance, an ask-AI path on a second signal bit), and a
 partially lifted; the wake-signal plumbing and the intent confirmation
 flow are not. `apps/voiceterm/src/voice_intent.rs` and `editor_voice.rs`
 are the non-Qt logic to reuse.
+
+## 36. Fleet run 3 — what moved, what is left
+
+Fixed this round: **ambient-learner** (pairing signature — was broken, not
+flaky; see the commit) and **voiceterm** (`qml_gen` id counters raced
+across tests, and the failure mode was duplicate QML ids, not just a red
+test). **fao-codec-egui-frontend**, **gpu-gemm** and **bo-suite** stopped
+failing on their own between runs — worth a glance to confirm that was the
+id/layout work and not luck.
+
+Still open, with what is known:
+
+- **gitmind** — NEW. `cargo test -p gitmind-egui --doc` fails with
+  `E0463: can't find crate for uikit_egui` / `settings_kit`, pointing at
+  `crates/gui-egui/src/pages/push.rs:384`, which is ORDINARY CODE, not a
+  doctest. Both crates are unconditional path deps in that Cargo.toml, so
+  the manifest is not the problem. That means the crate itself fails to
+  build under whatever configuration the doctest pass uses — a feature
+  set, or a target dir where those rlibs are absent. Attempted to
+  reproduce here and the build did not finish inside the sandbox's time
+  limit, twice, so this is UNCONFIRMED. Next step is cheap: run
+  `cargo test -p gitmind-egui --doc -v` on the fleet box and read which
+  `--extern` flags rustdoc is actually passing.
+- **beatspace / beatspace+features** — unchanged, and NOT ours:
+  `gemm-common 0.19.0` emits ARM fp16 asm (`fmla v0.8h`) the target does
+  not declare. See §32; still a build-config decision that wants a device
+  to validate against.
+- **fao-codec** — `dct_roundtrip` (`in=-3, back=-1.176`),
+  `dct_simd_matches_scalar`, `dct_dc_is_mean`. Scalar and SIMD disagree
+  and the roundtrip loses far more than rounding, so the SIMD path is
+  wrong on this architecture. Given the beatspace finding, first thing to
+  check is whether the SIMD path is gated on a target feature it is not
+  actually being given. Ours, real, and the most valuable one left.
+- **bot-arena** — four `engine::tests::*` failures, all inside the
+  git-diff version-merging subsystem that §14 recorded as having ZERO
+  callers. Settle §14 first: if it is genuinely dead the tests go with it,
+  and if it is not then §14 is wrong and needs correcting.
+- **studio** — three `studio-video` probe/thumbnail failures at
+  `crates/studio-video/src/lib.rs:415`. Suspect a missing or
+  differently-built ffmpeg on the runner rather than a logic error;
+  confirm before chasing.
+- **logscope / logscope+features** — carried over; see §19.
+- **voiceterm-egui-frontend** — carried over; the real_pty VT work in §19
+  and §27 is the blocker.
