@@ -7136,19 +7136,7 @@ pub fn run(args: &[String]) {
             ("near/low/flat", 3.0f32, 0.6f32, 0.0f32),
             ("far/high/down", 9.0, 3.0, -14.0),
         ] {
-            // the exact target: Fairphone 5 / postmarketOS / SC7280
-        let fp5 = crate::platform::classify(
-            "Linux version 7.1.2 #1-postmarketos-qcom-sc7280 SMP PREEMPT Mon Jul 13 21:02:06 UTC",
-            "fp5-black",
-            "Fairphone 5",
-            true,
-        );
-        println!("fp5-black        : {:?}  ({})", fp5.profile, fp5.why);
-        let pc = crate::platform::classify("Linux version 6.8.0-generic #1 SMP", "workstation", "", false);
-        println!("desktop x86      : {:?}  ({})", pc.profile, pc.why);
-        let target_ok = fp5.profile == crate::platform::Profile::Handheld
-            && pc.profile == crate::platform::Profile::Desktop;
-        let mut cfg = crate::config::Config::default();
+            let mut cfg = crate::config::Config::default();
             cfg.cam.dist = dist;
             cfg.cam.height = height;
             cfg.cam.angle_deg = ang;
@@ -7166,6 +7154,29 @@ pub fn run(args: &[String]) {
                 look_up
             );
         }
+        return;
+    }
+    if name == "platform" {
+        // Does platform::classify() actually tell a Fairphone from a
+        // desktop? This used to be pasted inside the "cam" diagnostic's
+        // loop, where it ran twice (once per camera config, for no
+        // reason), printed the same two lines both times, and never
+        // looked at its own `target_ok` result — so this check has never
+        // actually failed, because nothing was checking it. Same bug as
+        // skydribble's sim.rs (this file is a fork of it); fixed there
+        // first.
+        let fp5 = crate::platform::classify(
+            "Linux version 7.1.2 #1-postmarketos-qcom-sc7280 SMP PREEMPT Mon Jul 13 21:02:06 UTC",
+            "fp5-black",
+            "Fairphone 5",
+            true,
+        );
+        println!("fp5-black        : {:?}  ({})", fp5.profile, fp5.why);
+        let pc = crate::platform::classify("Linux version 6.8.0-generic #1 SMP", "workstation", "", false);
+        println!("desktop x86      : {:?}  ({})", pc.profile, pc.why);
+        let target_ok = fp5.profile == crate::platform::Profile::Handheld
+            && pc.profile == crate::platform::Profile::Desktop;
+        println!("{}", if target_ok { "PLATFORM CLASSIFY: PASS" } else { "PLATFORM CLASSIFY: FAIL" });
         return;
     }
     if name == "jump" {
