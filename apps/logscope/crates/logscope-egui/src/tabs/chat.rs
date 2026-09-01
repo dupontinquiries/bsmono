@@ -1201,6 +1201,11 @@ pub struct Chat {
     hide_bottom_bar: bool,         // hide the whole composer/files/suggestions strip — reclaims the
                                     // full window height for the physical UI (spatial_view), which was
                                     // otherwise cramped/cut off behind it with no way to get it back.
+    /// One-shot latch for the transcript swipe gestures (message-variant / background-branch): set
+    /// once a drag has fired an action, cleared when the pointer releases. Without this, checking
+    /// against `total_drag_delta()` every frame while the button stays down past the axis-lock
+    /// threshold would fire the SAME swipe again on every subsequent frame of one continuous drag.
+    swipe_consumed: bool,
     walk: crate::walkcam::WalkCam, // prezi-style walkthrough camera over the graph
     walk_focus: Option<usize>,     // node the walkthrough is centered on
     cam_pan_path: Vec<usize>,      // node-id path (graph shortest path) the camera is gliding along
@@ -1468,6 +1473,7 @@ impl Default for Chat {
             verify_net: false,
             show_files: false,
             hide_bottom_bar: false,
+            swipe_consumed: false,
             walk: crate::walkcam::WalkCam::new(13.0), walk_focus: None, scroll_chat_to: None,
             cam_pan_path: Vec::new(), cam_pan_t0: None,
             orbit: crate::spatial::OrbitCam::default(), spatial_view: false,
@@ -2175,6 +2181,27 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
     /// the spatial view, so the GPU scene can be rendered headless without a model or user input.
     /// True when there's no conversation loaded (used to decide whether glass mode should auto-seed a demo).
     pub fn is_empty(&self) -> bool { self.msgs.is_empty() }
+
+    /// Force the right sidebar open. For render-verification harnesses only (e.g. panels-view) —
+    /// normal flow toggles `show_context` from the "☰ Panels" button or the diag-notice jump.
+    pub fn debug_force_show_context(&mut self, on: bool) { self.show_context = on; }
+    /// Cycle the right sidebar's subpage for render-verification harnesses. 0=Files 1=Graph
+    /// 2=Context 3=Prompting 4=Engine (mirrors RightPage's declaration order; RightPage itself is
+    /// private, so this takes an index rather than exposing the enum).
+    pub fn debug_force_right_page(&mut self, idx: u8) {
+        self.right_page = match idx { 0 => RightPage::Files, 1 => RightPage::Graph, 2 => RightPage::Context, 4 => RightPage::Engine, _ => RightPage::Prompting };
+    }
+    /// Also render for render-verification harnesses: flips on the metrics card (checkpoints/
+    /// history need private struct construction this isn't worth adding just for a screenshot).
+    pub fn debug_force_engine_extras(&mut self, on: bool) { self.show_metrics = on; }
+    /// Populate Checkpoints for render-verification harnesses (History needs a real on-disk Vault
+    /// — vault::commit writes content-addressed blobs — which isn't worth faking here; that card
+    /// is verified by code review + the identical theme::panel()/list_item() calls already
+    /// confirmed elsewhere, same as noted in the commit history).
+    pub fn debug_force_checkpoints(&mut self) {
+        self.checkpoints.push(Checkpoint { label: "before refactor".into(), at_unix: 0, msgs: Vec::new() });
+        self.show_checkpoints = true;
+    }
 
     pub fn boot_demo(&mut self, spatial: bool) {
         use Role::{Assistant, User};
@@ -8226,10 +8253,13 @@ if let Some(msg) = self.error_banner.clone() {
                     let kws: Vec<String> = self.ctx_card_kws.clone();
                     let has_file = !doc.name.is_empty();
                     if code.is_some() || has_file || !kws.is_empty() {
-                        egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
-                            outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("CONTEXT CARDS").color(theme::DIM()).small().strong());
+                        // Carved-frame treatment (bevel lip + material grain + breathing corner
+                        // runes) instead of the flat hairline box: `theme::panel()` already builds
+                        // exactly this — a titled, textured card matching the reference frames —
+                        // but had no callers, so every sidebar card was still a plain rectangle.
+                        // This is the card the reference images show most prominently, so it goes
+                        // first.
+                        theme::panel(ui, theme::CYAN(), "Context cards", None, |ui| {
                             if has_file {
                                 ui.add_space(3.0);
                                 // NAME, SIZE, AND WHY IT IS HERE — the three facts the reference
@@ -8295,14 +8325,24 @@ if let Some(msg) = self.error_banner.clone() {
                                             crate::diagfeed::Kind::Performance => None,
                                             crate::diagfeed::Kind::Context => Some(egui::Color32::from_gray(140)),
                                         };
-                                        let line = format!("{}{}",
-                                            crate::diagfeed::shorten(&e.text, 72),
-                                            crate::diagfeed::count_suffix(e.count));
+                                        let line = crate::diagfeed::shorten(&e.text, 72);
                                         let rt = RichText::new(line).small();
                                         let rt = match col { Some(c) => rt.color(c), None => rt };
                                         // Full text on hover: shortening keeps the panel readable,
                                         // and the tail is where the engine explains itself.
-                                        ui.label(rt).on_hover_text(&e.text);
+                                        ui.horizontal(|ui| {
+                                            ui.label(rt).on_hover_text(&e.text);
+                                            // A folded line repeated itself — theme::event_pill is the
+                                            // built widget for exactly this (kind + ×count, reddens on
+                                            // spike) and had no callers; count_suffix's plain "  ×N"
+                                            // text is still what a Failure/Warning's own severity
+                                            // colour can't show (HOW OFTEN), so it becomes a pill
+                                            // instead of more inline text. Silent at 1, same as
+                                            // count_suffix always was.
+                                            if e.count > 1 {
+                                                theme::event_pill(ui, e.kind.short_label(), e.count, e.kind == crate::diagfeed::Kind::Failure);
+                                            }
+                                        });
                                     }
                                 });
                             }
@@ -8344,12 +8384,7 @@ if let Some(msg) = self.error_banner.clone() {
                             // doing and how long has it been" needs a fixed place to be answered.
                             // Rows rather than a sentence: see `runcard`.
                             if let Some(card) = self.agent_run.as_ref().map(|r| r.run_state()) {
-                                egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8),
-                                    inner_margin: egui::Margin::same(theme::PAD_SM),
-                                    outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() },
-                                    stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
-                                .show(ui, |ui| {
-                                    ui.label(RichText::new("ACTIVE THREAD").color(theme::DIM()).small().strong());
+                                theme::panel(ui, theme::CYAN(), "Active thread", None, |ui| {
                                     for (label, value) in crate::runcard::rows(&card) {
                                         ui.horizontal(|ui| {
                                             ui.label(RichText::new(label).color(theme::FAINT()).small());
@@ -8372,12 +8407,7 @@ if let Some(msg) = self.error_banner.clone() {
                                     .map(|b| (b.label, b.doing, b.files, b.verified, b.approved))
                                     .collect()).unwrap_or_default();
                             if !fan_rows.is_empty() {
-                                egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8),
-                                    inner_margin: egui::Margin::same(theme::PAD_SM),
-                                    outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() },
-                                    stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
-                                .show(ui, |ui| {
-                                    ui.label(RichText::new("ACTIVITY").color(theme::DIM()).small().strong());
+                                theme::panel(ui, theme::AMBER(), "Activity", None, |ui| {
                                     for (label, doing, detail) in crate::runcard::branch_rows(&fan_rows) {
                                         ui.horizontal(|ui| {
                                             // The branch holding the single worker is the one thing
@@ -8441,8 +8471,10 @@ if let Some(msg) = self.error_banner.clone() {
                             ui.label(RichText::new(format!("~{used} / {budget} tok · model: {}", model.current())).color(theme::DIM()).small());
                         }
                         RightPage::Prompting => {
-                            ui.label(RichText::new("PROMPTING MODE").color(theme::DIM()).small().strong());
-                            ui.add_space(4.0);
+                            // Its own carved card — FREECAM KEYS / WORKING DISCIPLINE below stay
+                            // as plain sections, so only the thing the reference frames box off
+                            // (the mode picker) gets boxed off here too.
+                            theme::panel(ui, theme::AMBER(), "Prompting mode", None, |ui| {
                             // GROUP BY AXIS. Six entries answering two different questions — three vary how WIDE the
                             // fan-out is, three vary WHO REASONS — and an undifferentiated list makes an operator infer
                             // that from the names before they can choose. A heading per group costs two lines and
@@ -8493,6 +8525,7 @@ if let Some(msg) = self.error_banner.clone() {
                                     .small().italics());
                                 ui.add_space(6.0);
                             }
+                            }); // close "Prompting mode" carved panel
                             ui.separator();
                             // ── MOVEMENT KEYS ────────────────────────────────────────────────
                             ui.label(RichText::new("FREECAM KEYS").color(theme::FAINT()).small());
@@ -8563,7 +8596,7 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                             }
                         }
                         RightPage::Graph => {
-                            ui.label(RichText::new("CONVERSATION GRAPH").color(theme::DIM()).small().strong());
+                            theme::panel(ui, theme::CYAN(), "Conversation graph", None, |ui| {
                             ui.label(RichText::new("Click a node to jump the chat there; ◀ ▶ dolly the camera through it.").color(theme::FAINT()).small());
                             let mut g = self.convo_graph(self.msgs.len());
                             let budget = self.ctx.n_ctx.saturating_sub(self.ctx.max_tokens).max(1) as usize;
@@ -8635,10 +8668,10 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                                 ui.label(RichText::new(format!("{n} turns stored · {in_ctx} in window · ~{used}/{budget} tok")).color(theme::DIM()).small());
                                 ui.label(RichText::new("The amber ring is the walkthrough focus; click or step jumps the chat there. Branch forks appear once multiple-solution mapping is wired.").color(theme::FAINT()).small());
                             }
+                            }); // close "Conversation graph" carved panel
                         }
                         RightPage::Files => {
-                            ui.label(RichText::new("GENERATED FILES").color(theme::DIM()).small().strong());
-                            ui.add_space(4.0);
+                            theme::panel(ui, theme::GREEN(), "Generated files", None, |ui| {
                             if arts.is_empty() {
                                 ui.label(RichText::new("No files in the latest reply yet.").color(theme::DIM()).small());
                             } else {
@@ -8702,6 +8735,7 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                             }
                             ui.add_space(6.0);
                             ui.label(RichText::new("Files also appear in the drawer at the bottom (preview, save, history). Verify is the objective grader behind the coordinator loop — the compiler, not an LLM, decides if generated code is real.").color(theme::FAINT()).small());
+                            }); // close "Generated files" carved panel
                         }
                     }
                 });
@@ -8751,7 +8785,10 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
         egui::Panel::bottom("chat_bottom").resizable(false).show_inside(ui, |ui| {
             ui.add_space(theme::PAD_XS as f32);
             if !arts.is_empty() && self.show_files {
-                egui::Frame { fill: theme::PANEL(), corner_radius: theme::r(10), inner_margin: egui::Margin::same(theme::PAD_MD),
+                // Own CollapsingHeader (dynamic count/stitched text) rather than a fixed title, so
+                // this can't go through theme::panel() directly — carve the same frame by hand
+                // instead of leaving it flat.
+                let gen_files_inner = egui::Frame { fill: theme::PANEL(), corner_radius: theme::r(10), inner_margin: egui::Margin::same(theme::PAD_MD),
                     outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
                 .show(ui, |ui| {
                     let stitched = arts.iter().filter(|a| a.fragments > 1).count();
@@ -8859,6 +8896,8 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                     });
                     }); // close gen_files_drawer
                 });
+                let t = ui.input(|i| i.time) as f32;
+                theme::carved_frame(ui.painter(), gen_files_inner.response.rect, t, theme::GREEN());
             }
             if let Some((msg, at)) = &self.ws_note {
                 let a = 1.0 - theme::appear(*at, 8.0);
@@ -8896,10 +8935,7 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                 });
             }
             if self.show_metrics {
-                egui::Frame { fill: theme::PANEL(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
-                    outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
-                .show(ui, |ui| {
-                    ui.label(RichText::new("GPU phase breakdown — last generation").color(theme::CYAN()).strong().small());
+                theme::panel(ui, theme::CYAN(), "GPU phase breakdown — last generation", None, |ui| {
                     let now = crate::metricspanel::snapshot(self.metrics_tokens);
                     let lines = now.since(&self.metrics_base).report(self.metrics_wall_ns);
                     if lines.is_empty() {
@@ -8918,14 +8954,14 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                 });
             }
             if self.show_checkpoints && !self.checkpoints.is_empty() {
-                egui::Frame { fill: theme::PANEL(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
-                    outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
-                .show(ui, |ui| {
+                theme::panel(ui, theme::CYAN(), "Checkpoints", None, |ui| {
                     egui::ScrollArea::vertical().id_salt("ckpts").max_height(140.0).show(ui, |ui| {
                         for (i, cp) in self.checkpoints.iter().enumerate().rev() {
-                            ui.horizontal(|ui| {
-                                if theme::action_button(ui, "Restore", theme::CYAN(), !streaming).clicked() { rollback = Some(i); }
-                                ui.label(RichText::new(format!("{} · {} msgs", cp.label, cp.msgs.len())).color(theme::DIM()).small());
+                            theme::list_item(ui, false, |ui| {
+                                ui.horizontal(|ui| {
+                                    if theme::action_button(ui, "Restore", theme::CYAN(), !streaming).clicked() { rollback = Some(i); }
+                                    ui.label(RichText::new(format!("{} · {} msgs", cp.label, cp.msgs.len())).color(theme::DIM()).small());
+                                });
                             });
                         }
                     });
@@ -8942,16 +8978,16 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                 if rows.is_empty() {
                     ui.label(RichText::new("no history yet — finish a turn to create the first node").color(theme::FAINT()).small());
                 } else {
-                    egui::Frame { fill: theme::PANEL(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
-                        outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
-                    .show(ui, |ui| {
+                    theme::panel(ui, theme::CYAN(), "History", None, |ui| {
                         egui::ScrollArea::vertical().id_salt("tree").max_height(170.0).show(ui, |ui| {
                             for (id, parent, label, nfiles, msgs) in &rows {
-                                ui.horizontal(|ui| {
-                                    let here = head_now == Some(*id);
-                                    if theme::action_button(ui, if here { "● here" } else { "Return" }, theme::CYAN(), !streaming && !here).clicked() { return_to = Some(*id); }
-                                    let from = parent.map(|p| format!(" ←#{p}")).unwrap_or_else(|| " (root)".into());
-                                    ui.label(RichText::new(format!("#{id}{from}  {}  · {} msgs · {} files", label, msgs, nfiles)).color(if here { theme::CYAN() } else { theme::DIM() }).small());
+                                let here = head_now == Some(*id);
+                                theme::list_item(ui, here, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if theme::action_button(ui, if here { "● here" } else { "Return" }, theme::CYAN(), !streaming && !here).clicked() { return_to = Some(*id); }
+                                        let from = parent.map(|p| format!(" ←#{p}")).unwrap_or_else(|| " (root)".into());
+                                        ui.label(RichText::new(format!("#{id}{from}  {}  · {} msgs · {} files", label, msgs, nfiles)).color(if here { theme::CYAN() } else { theme::DIM() }).small());
+                                    });
                                 });
                             }
                         });
@@ -9456,6 +9492,7 @@ dense briefing that replaces them as the working context, then carry on with roo
                     let step_open = self.step_open.clone();
                     let mut toggle_step: Option<(usize, usize)> = None;
                     let mut swipe_variant: Option<(usize, i32)> = None;
+                    let mut over_any_message = false;
                     let mut expand_msg: Option<usize> = None;
                     let mut collapse_msg: Option<usize> = None;
                     for (i, m) in self.msgs.iter_mut().enumerate() {
@@ -9471,21 +9508,40 @@ dense briefing that replaces them as the working context, then carry on with roo
                         // variants, the way a photo gallery does — which takes the arrow buttons out of
                         // a bar that was already overlapping rather than adding to it. The axis lock and
                         // the mid-stream refusal live in chatgesture; this only supplies the drag.
+                        //
+                        // CUMULATIVE distance since the press, not the per-frame delta. A per-frame
+                        // delta is typically a couple of points even for a fast drag — comparing THAT
+                        // against a 12pt threshold means the gesture only ever fired on a hard flick
+                        // that happened to move >12pt within one frame, not an ordinary slow swipe.
+                        // `total_drag_delta()` is the whole drag from press_origin to now, recomputed
+                        // fresh each frame, so a slow deliberate swipe crosses the threshold exactly
+                        // when it visually should. `swipe_consumed` stops it firing again on every
+                        // later frame of the SAME drag once past that threshold.
                         if m.variants.len() > 1 && !streaming_here {
-                            let d = ui.input(|i| i.pointer.delta());
                             if ui.rect_contains_pointer(ui.min_rect())
                                 && ui.input(|i| i.pointer.primary_down()) {
-                                let ax = crate::chatgesture::lock_axis(d.x, d.y);
-                                let delta = if d.x < -crate::chatgesture::AXIS_LOCK_PT { 1 }
-                                            else if d.x > crate::chatgesture::AXIS_LOCK_PT { -1 }
-                                            else { 0 };
-                                if let crate::chatgesture::Action::ShowVariant { delta, .. } =
-                                    crate::chatgesture::action(
-                                        crate::chatgesture::Target::Message(i), delta, ax,
-                                        streaming_here, m.variants.len(), m.cur) {
-                                    swipe_variant = Some((i, delta));
+                                over_any_message = true;
+                                if !self.swipe_consumed {
+                                    let d = ui.input(|i| i.pointer.total_drag_delta()).unwrap_or_default();
+                                    let ax = crate::chatgesture::lock_axis(d.x, d.y);
+                                    let delta = if d.x < -crate::chatgesture::AXIS_LOCK_PT { 1 }
+                                                else if d.x > crate::chatgesture::AXIS_LOCK_PT { -1 }
+                                                else { 0 };
+                                    if let crate::chatgesture::Action::ShowVariant { delta, .. } =
+                                        crate::chatgesture::action(
+                                            crate::chatgesture::Target::Message(i), delta, ax,
+                                            streaming_here, m.variants.len(), m.cur) {
+                                        swipe_variant = Some((i, delta));
+                                        self.swipe_consumed = true;
+                                    }
                                 }
                             }
+                        } else if ui.input(|i| i.pointer.primary_down()) && ui.rect_contains_pointer(ui.min_rect()) {
+                            // A single-variant (or streaming) message still counts as "on a message"
+                            // for the purposes of the background swipe below — chatgesture's own
+                            // ambiguous-target failure mode (#4) is exactly a drag over a message
+                            // being read as a background gesture because nothing claimed it.
+                            over_any_message = true;
                         }
                         theme::fade(ui, a, |ui| {
                             egui::Frame { fill, corner_radius: theme::r(10),
@@ -9741,6 +9797,29 @@ dense briefing that replaces them as the working context, then carry on with roo
                         let n = self.msgs[i].variants.len();
                         self.msgs[i].cur = (self.msgs[i].cur as i32 + d).clamp(0, n as i32 - 1) as usize;
                     }
+                    // SWIPE ON THE BACKGROUND — chatgesture's other target. A drag that landed on no
+                    // message at all (over_any_message tracked per-row above, so this can't fire from
+                    // a pixel inside a message bubble that merely had one variant) steps between
+                    // sibling branches instead, the same "hjkl branch" the header hints at, now
+                    // reachable without the keyboard. `switch_sibling` already exists and is wired to
+                    // h/l and the graph tab; chatgesture::action's Target::Background case had no
+                    // caller until this. Same cumulative-distance + one-shot-latch reasoning as the
+                    // message swipe above.
+                    if !over_any_message && !self.swipe_consumed
+                        && ui.rect_contains_pointer(ui.min_rect()) && ui.input(|i| i.pointer.primary_down()) {
+                        let d = ui.input(|i| i.pointer.total_drag_delta()).unwrap_or_default();
+                        let ax = crate::chatgesture::lock_axis(d.x, d.y);
+                        let delta = if d.x < -crate::chatgesture::AXIS_LOCK_PT { 1 }
+                                    else if d.x > crate::chatgesture::AXIS_LOCK_PT { -1 } else { 0 };
+                        if let crate::chatgesture::Action::SwitchBranch { delta } =
+                            crate::chatgesture::action(crate::chatgesture::Target::Background, delta, ax, false, 0, 0) {
+                            self.switch_sibling(delta);
+                            self.swipe_consumed = true;
+                        }
+                    }
+                    // Latch resets the instant the button lifts, whether or not this drag fired
+                    // anything — the next press starts a fresh gesture with its own drag distance.
+                    if !ui.input(|i| i.pointer.primary_down()) { self.swipe_consumed = false; }
                 });
         });
         } // narrow + fan-fullscreen: the fan took the central area instead of the log

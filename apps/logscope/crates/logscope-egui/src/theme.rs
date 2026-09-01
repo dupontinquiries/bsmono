@@ -1412,6 +1412,7 @@ fn carved_button_impl(ui: &mut egui::Ui, text: &str, accent: Option<Color32>) ->
 /// means "good/bad"): a crossing is neither a selection nor a verdict, it is provenance, and it
 /// needs to read as its own category at a glance in both the linear graph and the spatial scene.
 /// Violet sits outside every other role this palette assigns.
+#[allow(non_snake_case)] // matches every other palette-colour accessor in this file (PANEL, CYAN, LINE, …), which get the same allow from the macro that generates them; this one is hand-written because it isn't one of the base palette fields.
 pub fn CROSSING() -> Color32 { Color32::from_rgb(0xA0, 0x7C, 0xE8) }
 
 pub fn accent() -> Color32 {
@@ -1720,7 +1721,7 @@ fn rune_mark(p: &egui::Painter, c: Pos2, s: f32, col: Color32, seed: u32, glow: 
 /// Dress `rect` as a carved-stone FRAME: a double beveled relief lip (lit top-left, shadowed bottom-right),
 /// the active material's grain scattered along the border band, and faint breathing runes in the corners.
 /// Painted only in the edge band (the panel's inner margin), so it never draws over content. Theme-adaptive.
-fn carved_frame(p: &egui::Painter, rect: egui::Rect, t: f32, accent: Color32) {
+pub(crate) fn carved_frame(p: &egui::Painter, rect: egui::Rect, t: f32, accent: Color32) {
     let pal = active();
     let sk = skin();
     let lit = Color32::from_white_alpha(sk.bevel_lit);
@@ -1732,13 +1733,26 @@ fn carved_frame(p: &egui::Painter, rect: egui::Rect, t: f32, accent: Color32) {
         p.line_segment([q.right_top(), q.right_bottom()], Stroke::new(1.0_f32, shadow));
         p.line_segment([q.left_bottom(), q.right_bottom()], Stroke::new(1.0_f32, shadow));
     }
-    // grain along the top + bottom border bands so the frame reads as stone, not a drawn line
+    // grain along all four border bands so the frame reads as stone/wood/paper on every edge, not
+    // just top and bottom — matches the reference frames, whose borders are grained all the way
+    // round. Still confined to the band (never the interior), so the "never draws over content"
+    // invariant in this fn's doc comment stays true edge-to-edge, not just top/bottom.
     if pal.material != Material::None {
         let band = 9.0;
         let cols = (rect.width() / 18.0).clamp(6.0, 40.0) as usize;
         for ix in 0..cols {
             let fx = rect.left() + rect.width() * (ix as f32 + 0.5) / cols as f32;
             for fy in [rect.top() + band * 0.5, rect.bottom() - band * 0.5] {
+                let g = material_grain(pal.material, fx, fy);
+                let a = (g.abs() * 22.0).min(22.0) as u8;
+                let col = if g >= 0.0 { Color32::from_white_alpha(a) } else { Color32::from_black_alpha(a) };
+                p.circle_filled(egui::pos2(fx, fy), 1.1, col);
+            }
+        }
+        let rows = (rect.height() / 18.0).clamp(4.0, 40.0) as usize;
+        for iy in 0..rows {
+            let fy = rect.top() + rect.height() * (iy as f32 + 0.5) / rows as f32;
+            for fx in [rect.left() + band * 0.5, rect.right() - band * 0.5] {
                 let g = material_grain(pal.material, fx, fy);
                 let a = (g.abs() * 22.0).min(22.0) as u8;
                 let col = if g >= 0.0 { Color32::from_white_alpha(a) } else { Color32::from_black_alpha(a) };
@@ -1808,6 +1822,13 @@ pub fn panel(ui: &mut egui::Ui, accent: Color32, title: &str, copy: Option<Strin
         ..Default::default()
     }
     .show(ui, |ui| {
+        // Reserved BEFORE any content paints, so `interior_grain` (filled in below, once the final
+        // rect is known) lands between the frame's own background — reserved earlier still, by
+        // Frame::begin — and the title/body drawn after this line. Same reserve-now/fill-later
+        // trick Frame itself uses for its background, which is what lets this sit fully UNDER the
+        // text rather than risk a legibility hit from painting over it afterward like carved_frame's
+        // border grain does (safe there only because that band has no content in it).
+        let grain_idx = ui.painter().add(egui::Shape::Noop);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             let (bar, _) = ui.allocate_exact_size(egui::vec2(5.0, 15.0), Sense::hover());
@@ -1823,10 +1844,40 @@ pub fn panel(ui: &mut egui::Ui, accent: Color32, title: &str, copy: Option<Strin
         });
         ui.add_space(9.0);
         body(ui);
+        grain_idx
     });
     // carve the stone frame into the margin band after the content is laid out
     let t = ui.input(|i| i.time) as f32;
-    carved_frame(ui.painter(), inner.response.rect, t, accent);
+    let rect = inner.response.rect;
+    interior_grain(ui.painter(), rect, inner.inner);
+    carved_frame(ui.painter(), rect, t, accent);
+}
+
+/// Sparse material speckle across a panel's whole interior, filled into a shape slot reserved
+/// before content painted (see `panel()`) so it sits behind the text rather than on top of it —
+/// far lower alpha than the border band's grain (7 vs 22) since this one CAN'T rely on an empty
+/// band to stay clear of text; being behind the glyphs is what keeps it safe at any alpha, but
+/// low alpha keeps it reading as texture instead of dirt even where a background IS interior, not
+/// content (e.g. body text is short and leaves space).
+fn interior_grain(p: &egui::Painter, rect: egui::Rect, idx: egui::layers::ShapeIdx) {
+    let pal = active();
+    if pal.material == Material::None { p.set(idx, egui::Shape::Noop); return; }
+    let spacing = 24.0_f32;
+    let cols = (rect.width() / spacing).round().max(1.0) as usize;
+    let rows = (rect.height() / spacing).round().max(1.0) as usize;
+    let mut shapes = Vec::with_capacity(cols * rows);
+    for iy in 0..rows {
+        let fy = rect.top() + rect.height() * (iy as f32 + 0.5) / rows as f32;
+        for ix in 0..cols {
+            let fx = rect.left() + rect.width() * (ix as f32 + 0.5) / cols as f32;
+            let g = material_grain(pal.material, fx, fy);
+            let a = (g.abs() * 11.0).min(11.0) as u8;
+            if a == 0 { continue; }
+            let col = if g >= 0.0 { Color32::from_white_alpha(a) } else { Color32::from_black_alpha(a) };
+            shapes.push(egui::Shape::circle_filled(egui::pos2(fx, fy), 1.0, col));
+        }
+    }
+    p.set(idx, egui::Shape::Vec(shapes));
 }
 
 /// Section header: an amber lead glyph (▌) + UPPERCASE dim title.
@@ -1896,7 +1947,6 @@ pub fn stat_tile(ui: &mut egui::Ui, label: &str, value: &str, accent: Color32) {
 
 /// A run-list/sidebar item card. Idle reads as PANEL2; selected wears an amber
 /// border + warm fill; hovering fades an amber border in. Returns true on click.
-#[allow(dead_code)]
 pub fn list_item(ui: &mut egui::Ui, selected: bool, body: impl FnOnce(&mut egui::Ui)) -> bool {
     let (fill, stroke) = if selected { (lerp_col(PANEL2(), AMBER(), 0.10), AMBER()) } else { (PANEL2(), LINE()) };
     let inner = Frame {
@@ -1920,7 +1970,6 @@ pub fn list_item(ui: &mut egui::Ui, selected: bool, body: impl FnOnce(&mut egui:
 }
 
 /// A small event/count pill (kind + ×count); reddens on `spike`.
-#[allow(dead_code)]
 pub fn event_pill(ui: &mut egui::Ui, kind: &str, count: usize, spike: bool) {
     let cc = if spike { RED() } else { AMBER() };
     Frame {

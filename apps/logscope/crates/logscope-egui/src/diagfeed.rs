@@ -32,6 +32,11 @@ pub enum Kind {
 impl Kind {
     /// Does this deserve to pull the eye on its own?
     pub fn interrupts(self) -> bool { matches!(self, Kind::Warning | Kind::Failure) }
+    /// Short tag for a count pill (event_pill's `kind`) — lowercase, a few chars, same order as
+    /// the enum so severity reads left-to-right calm-to-urgent.
+    pub fn short_label(self) -> &'static str {
+        match self { Kind::Context => "ctx", Kind::Performance => "perf", Kind::Warning => "warn", Kind::Failure => "fail" }
+    }
 }
 
 /// Classify one engine line.

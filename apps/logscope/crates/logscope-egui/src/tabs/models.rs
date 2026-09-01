@@ -27,6 +27,14 @@ pub struct Models {
     /// discard an edit before the save, and saved on every change rather than on exit because a
     /// crash between the two loses exactly the machine someone just added.
     trusted: logscope_fan::trustkit::Registry,
+    /// This machine's real keypair, kept (not just its derived id string) because `lan` needs to
+    /// SIGN announcements with it every interval, not just display it once at startup. `None` only
+    /// if the identity file couldn't be loaded/created (see `my_id`'s fallback) — LAN discovery is
+    /// simply inert then, same as it is before the very first tick.
+    identity: Option<logscope_fan::machineid::Identity>,
+    /// LAN discovery — ticked every frame in `machines_ui`, independent of whether that section is
+    /// expanded, so "seen on LAN" doesn't lag behind opening the header.
+    lan: logscope_fan::lanpoll::LanPoll,
     add_id: String,
     machines: Vec<String>,
     machine_note: String,
@@ -40,6 +48,8 @@ pub struct Models {
 impl Default for Models {
     fn default() -> Self {
         let home = std::env::var("HOME").unwrap_or_default();
+        let identity = logscope_fan::machineid::Identity::load_or_create(
+            &state_dir().join(logscope_fan::clusternode::IDENTITY_FILE)).ok();
         Models {
             root: format!("{home}/models"),
             entries: Vec::new(), scanned: false,
@@ -51,10 +61,9 @@ impl Default for Models {
             // id that parses and is nobody's is worse than one that obviously did not load, because
             // the first gets pasted somewhere.
             trusted: logscope_fan::trustkit::Registry::load(&trust_path()).0,
-            my_id: Some(state_dir().join(logscope_fan::clusternode::IDENTITY_FILE))
-                .and_then(|p| logscope_fan::machineid::Identity::load_or_create(&p).ok())
-                .map(|id| id.id())
-                .unwrap_or_else(|| "— identity unavailable —".into()),
+            my_id: identity.as_ref().map(|id| id.id()).unwrap_or_else(|| "— identity unavailable —".into()),
+            identity,
+            lan: logscope_fan::lanpoll::LanPoll::new(),
             add_id: String::new(), machines: Vec::new(), machine_note: String::new(),
             plan: Vec::new(), conflicts: Vec::new(),
             note: String::new(), repo_hint: String::new(),
@@ -107,6 +116,11 @@ impl Models {
     /// where you already go to decide WHERE work runs — a machine and a model are the same decision
     /// from the operator's side.
     fn machines_ui(&mut self, ui: &mut egui::Ui) {
+        // Ticked unconditionally, even while the header below is collapsed — a discovery socket only
+        // costs anything when there's traffic to send or drain (both cheap, non-blocking), and a
+        // trusted machine that came online should be reflected the moment the header IS opened
+        // instead of the first LAN_INTERVAL_S after that.
+        if let Some(id) = &self.identity { self.lan.tick(id, &self.trusted); }
         egui::CollapsingHeader::new("trusted machines").default_open(false).show(ui, |ui| {
             // THIS machine's id, shown so it can be read off and typed into another. It is a
             // fingerprint of the public key, not a name — so pasting it IS the key exchange, and there
@@ -176,12 +190,25 @@ there is nothing else to exchange.").small().color(theme::FAINT()));
             if !self.machine_note.is_empty() {
                 ui.label(egui::RichText::new(&self.machine_note).small().color(theme::DIM()));
             }
+            // LAN discovery status line. Shown even when nothing is visible yet, because "the socket
+            // isn't bound" (a real failure someone should know about) and "bound but nothing has
+            // announced" (ordinary, especially in the first few seconds) are different situations —
+            // collapsing them into silence would hide the first one.
+            ui.horizontal(|ui| {
+                if self.lan.bound() {
+                    ui.label(egui::RichText::new("⛁ LAN discovery active").small().color(theme::DIM()));
+                } else {
+                    ui.label(egui::RichText::new("⚠ LAN discovery socket did not bind — another logscope may already be running on this machine")
+                        .small().color(theme::AMBER()));
+                }
+            });
             // FROM THE REGISTRY, not from a session Vec — so the list survives a restart and shows
             // what is actually trusted rather than what was typed since launch.
             //
             // The verified/unverified distinction is the point of showing it at all: an entry with no
             // key cannot be authenticated, so it is listed and cannot be acted on. trustkit calls that
             // unverifiable(), and a list that hid it would imply a working link that does not exist.
+            let seen = self.lan.seen();
             let mut revoke: Option<String> = None;
             for (id, level, verified) in self.trusted.entries_for_display() {
                 ui.horizontal(|ui| {
@@ -190,6 +217,16 @@ there is nothing else to exchange.").small().color(theme::FAINT()));
                         else { "⚠ unverified — no key yet" })
                         .small().color(if verified { theme::GREEN() } else { theme::AMBER() }));
                     ui.label(egui::RichText::new(format!("{level:?}")).small().color(theme::DIM()));
+                    // "On LAN" only ever comes from a signature verified against THIS id's registered
+                    // key (lanpoll -> announce::accept), so this can't be spoofed by a stranger's
+                    // packet the way a plain "IP replied" indicator could.
+                    match seen.iter().find(|(sid, _, _)| sid == &id) {
+                        Some((_, cand, age_s)) => {
+                            ui.label(egui::RichText::new(format!("● on LAN · {} · {age_s}s ago", cand.addr))
+                                .small().color(theme::GREEN()));
+                        }
+                        None => { ui.label(egui::RichText::new("· not seen on LAN").small().color(theme::FAINT())); }
+                    }
                     if ui.small_button("revoke").clicked() { revoke = Some(id.clone()); }
                 });
             }
