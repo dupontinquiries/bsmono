@@ -457,28 +457,28 @@ pub fn parse_html_with(html: &str, opts: &ParseOptions<'_>) -> RichDoc {
     let mut filtered = 0usize;
     let mut runs = 0usize;
     let mut runs_merged = 0usize;
-    /// Depth of the filtered element we are inside, like `noise_depth`: a
-    /// filter that dropped the open tag and not the subtree would leave the
-    /// advertisement's text in the document with its wrapper gone, which is
-    /// worse than not filtering.
+    // Depth of the filtered element we are inside, like `noise_depth`: a
+    // filter that dropped the open tag and not the subtree would leave the
+    // advertisement's text in the document with its wrapper gone, which is
+    // worse than not filtering.
     let mut skip_depth: usize = 0;
     let mut blocks: Vec<Block> = Vec::new();
-    /// While inside a noise element, text tokens are discarded. Depth-counted
-    /// rather than a flag, because `<svg><style>…</style></svg>` would
-    /// otherwise switch prose back on at the inner close.
+    // While inside a noise element, text tokens are discarded. Depth-counted
+    // rather than a flag, because `<svg><style>…</style></svg>` would
+    // otherwise switch prose back on at the inner close.
     let mut noise_depth: usize = 0;
     let mut cur: Option<Block> = None;
     let mut style = InlineStyle::default();
     let mut style_stack: Vec<InlineStyle> = Vec::new();
-    /// The table being built, if any. A stack would let nested tables work
-    /// and they are rare enough — and pathological enough as a layout
-    /// device — that the inner one flattening into the outer cell is the
-    /// better failure than the code to handle it.
-    /// The open `<ul>`/`<ol>` elements: (ordered, next number). A stack
-    /// rather than a depth counter because an ordered list nested inside a
-    /// bullet list has to keep counting from where it was when the inner
-    /// one closes.
+    // The open `<ul>`/`<ol>` elements: (ordered, next number). A stack
+    // rather than a depth counter because an ordered list nested inside a
+    // bullet list has to keep counting from where it was when the inner
+    // one closes.
     let mut lists: Vec<(bool, u32)> = Vec::new();
+    // The table being built, if any. A stack would let nested tables work
+    // and they are rare enough — and pathological enough as a layout
+    // device — that the inner one flattening into the outer cell is the
+    // better failure than the code to handle it.
     let mut table: Option<Block> = None;
     let mut row: Option<Vec<Cell>> = None;
     let mut cell: Option<Cell> = None;
