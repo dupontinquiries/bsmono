@@ -153,23 +153,100 @@ def _looks_like_char_literal(s, i):
         return s.find("'", i + 2, i + 14) != -1
     return i + 2 < n and s[i+2] == "'"
 
+_CRATE_ROOT_CACHE = {}
+
+def _declared_crate_roots(manifest_path):
+    """Absolute paths of every [lib]/[[bin]]/[[test]]/[[example]]/[[bench]]
+    `path = "..."` in this Cargo.toml — i.e. every file that is a crate root
+    by manifest declaration, not just by being named main.rs/lib.rs. Needed
+    because `required-features` is silently ignored on `[lib]` (see the
+    ambient-learner comment this repo already carries about it), so gated
+    crates commonly get a custom `[lib] path = "src/whatever.rs"` instead."""
+    cached = _CRATE_ROOT_CACHE.get(manifest_path)
+    if cached is not None:
+        return cached
+    roots = set()
+    data = load_toml(manifest_path)
+    root_dir = manifest_path.parent
+    lib = data.get("lib")
+    if isinstance(lib, dict) and lib.get("path"):
+        roots.add((root_dir / lib["path"]).resolve())
+    for key in ("bin", "test", "example", "bench"):
+        for entry in data.get(key, []) or []:
+            if isinstance(entry, dict) and entry.get("path"):
+                roots.add((root_dir / entry["path"]).resolve())
+    _CRATE_ROOT_CACHE[manifest_path] = roots
+    return roots
+
 def resolve_mod_files(rs_path, src):
     missing = []
     lines = src.splitlines()
     parent = rs_path.parent; stem = rs_path.stem
-    base = parent if stem in ("main", "lib", "mod") else parent / stem
+    is_declared_root = False
+    manifest = nearest_manifest(rs_path)
+    if manifest is not None:
+        try:
+            is_declared_root = rs_path.resolve() in _declared_crate_roots(manifest)
+        except OSError:
+            is_declared_root = False
+    file_base = parent if (stem in ("main", "lib", "mod") or is_declared_root) else parent / stem
+    # Stack of (name, depth-outside-the-block) for inline `mod name { ... }`
+    # blocks we're currently nested inside. Without this, a declaration like
+    # `mod egui;` inside `pub mod ui { mod egui; }` was checked against
+    # `<file>/egui.rs` instead of the real `<file>/ui/egui.rs` (or
+    # `<file>/ui/egui/mod.rs`) — a false positive on every nested inline mod.
+    mod_stack = []
+    depth = 0
     for n, raw in enumerate(lines, 1):
         line = raw.strip()
-        if line.startswith("//"): continue
+        if line.startswith("//"):
+            depth += raw.count("{") - raw.count("}")
+            continue
+        handled = False
         for kw in ("pub mod ", "mod "):
-            if line.startswith(kw) and line.endswith(";"):
-                name = line[len(kw):-1].strip()
-                if not name.isidentifier(): break
-                prev = lines[n-2].strip() if n >= 2 else ""
-                if "#[path" in prev or "#[cfg" in prev: break
-                if not ((base / f"{name}.rs").exists() or (base / name / "mod.rs").exists()):
-                    missing.append((n, name, str(base / f"{name}.rs")))
+            if line.startswith(kw) and line.endswith("{") and not line.endswith(";"):
+                name = line[len(kw):-1].strip().rstrip("{").strip()
+                if name.isidentifier():
+                    mod_stack.append((name, depth))
+                handled = True
                 break
+        if not handled:
+            for kw in ("pub mod ", "mod "):
+                if line.startswith(kw) and line.endswith(";"):
+                    name = line[len(kw):-1].strip()
+                    if not name.isidentifier(): break
+                    # Walk back through any stacked attribute lines directly
+                    # above the `mod` item (e.g. `#[path = ...]` followed by
+                    # `#[allow(...)]` followed by `mod foo;`) — a single
+                    # lines[n-2] lookback misses `#[path]` whenever another
+                    # attribute sits between it and the mod declaration.
+                    skip = False
+                    j = n - 2
+                    while j >= 0:
+                        prev = lines[j].strip()
+                        if not prev:
+                            j -= 1
+                            continue
+                        if prev.startswith("#!["):
+                            j -= 1
+                            continue
+                        if prev.startswith("#["):
+                            if "#[path" in prev or "#[cfg" in prev:
+                                skip = True
+                                break
+                            j -= 1
+                            continue
+                        break
+                    if skip: break
+                    base = file_base
+                    for seg, _ in mod_stack:
+                        base = base / seg
+                    if not ((base / f"{name}.rs").exists() or (base / name / "mod.rs").exists()):
+                        missing.append((n, name, str(base / f"{name}.rs")))
+                    break
+        depth += raw.count("{") - raw.count("}")
+        while mod_stack and depth <= mod_stack[-1][1]:
+            mod_stack.pop()
     return missing
 
 def static_check_file(p):
