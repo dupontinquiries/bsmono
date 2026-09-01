@@ -1,0 +1,15 @@
+[package]
+name = "d2x-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless dandere2x engine: block matching against a JPEG-quality gate, residual assembly, merge, and the frame pipeline. No GPU, no ffmpeg, no UI — those are shells around this."
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# png/jpeg only. jpeg is load-bearing: the quality gate is a JPEG round trip.
+image.workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "dandere2x"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "dandere2x CLI: ffmpeg in, block-matched residual upscaling on the GPU, ffmpeg out."
+
+[[bin]]
+name = "dandere2x"
+path = "src/main.rs"
+
+[dependencies]
+d2x-core = { path = "../d2x-core" }
+# The GPU backend, behind a default-on feature so a headless box can still
+# build the CLI with --no-default-features (cpu / external backends only).
+d2x-wgpu = { path = "../d2x-wgpu", optional = true }
+anyhow.workspace = true
+clap.workspace = true
+image.workspace = true
+serde_json.workspace = true
+
+[features]
+default = ["gpu"]
+gpu = ["dep:d2x-wgpu"]
