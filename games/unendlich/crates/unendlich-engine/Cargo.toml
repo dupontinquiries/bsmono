@@ -13,6 +13,8 @@ linkme = "0.3"
 unendlich-shared = { path = "../unendlich-shared" }
 # Fleet online play: the shared handoff + session control plane (games/shared/netcode)
 netcode = { path = "../../../shared/netcode" }
+# unendlich-netview bin: serves the live world-state debug view over HTTP
+netview = { path = "../../../../shared/netview" }
 
 # Math
 nalgebra-glm = "0.18"
