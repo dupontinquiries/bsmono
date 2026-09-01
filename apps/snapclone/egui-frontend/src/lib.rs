@@ -211,6 +211,12 @@ pub struct Snapclone {
     /// When to publish and who to look up. Pure policy, so the cadence is
     /// testable without a socket — see `dht_presence`.
     pub dht_schedule: crate::dht_presence::Schedule,
+    /// The last keepalive round: (pinged, answered). `None` until the node
+    /// has had an idle period. Zero answered of several pinged is the cue
+    /// that the network changed under us — a NAT mapping expired, wifi
+    /// handed off to cellular — and the status line says so rather than
+    /// showing a peer count that is no longer true.
+    pub dht_keepalive: Option<(usize, usize)>,
     /// The accessibility scene the settings toggles register with.
     /// Held here rather than in the page so focus survives between
     /// frames — a page-local scene forgets on every repaint, which
@@ -671,6 +677,7 @@ impl Snapclone {
             settings: crate::settings_page::SettingsPage::new(crate::settings_store::load()),
             dht: None, dht_failed: false,
             dht_schedule: Default::default(),
+            dht_keepalive: None,
             a11y: uikit_egui::a11y::A11yScene::new(),
             pending_vcard_text: None,
             import_report: None,
@@ -1552,6 +1559,17 @@ impl Snapclone {
                 // started and knows nobody, so it is not reported as a
                 // problem.
                 Event::Published { .. } => {}
+                Event::Keepalive { pinged, answered } => {
+                    self.dht_keepalive = Some((pinged, answered));
+                    if pinged > 0 && answered == 0 {
+                        // Every peer we were keeping warm has gone quiet at
+                        // once. Said once per transition, not per round:
+                        // a status that repeats every 25 s buries the
+                        // next thing that goes wrong.
+                        self.feed_note = format!(
+                            "no DHT peer answered ({pinged} pinged) — the network may have changed");
+                    }
+                }
                 Event::Stopped(why) => {
                     self.feed_note = why;
                     self.dht = None;

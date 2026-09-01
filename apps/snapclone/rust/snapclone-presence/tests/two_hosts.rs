@@ -84,3 +84,27 @@ fn the_raw_path_works_the_same_way_in_reverse() {
         _ => unreachable!(),
     }
 }
+
+#[test]
+fn an_idle_host_keeps_its_peers_warm_and_says_who_answered() {
+    let b = NodeHost::spawn(id(9), "127.0.0.1:0".parse().unwrap()).unwrap();
+    let a = NodeHost::spawn_with_keepalive(id(11), "127.0.0.1:0".parse().unwrap(),
+                                           Duration::from_millis(150)).unwrap();
+    assert!(a.bootstrap(b.local_addr(), id(9)));
+    wait_for(&a, |e| matches!(e, Event::Published { peers: 1, .. }), Duration::from_secs(5));
+    // With nothing asked of it, A pings B on its own and reports.
+    match wait_for(&a, |e| matches!(e, Event::Keepalive { .. }), Duration::from_secs(5)) {
+        Event::Keepalive { pinged, answered } => { assert_eq!(pinged, 1); assert_eq!(answered, 1); }
+        _ => unreachable!(),
+    }
+    // B, gone: the next round says so rather than pretending.
+    drop(b);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match wait_for(&a, |e| matches!(e, Event::Keepalive { .. }), Duration::from_secs(5)) {
+            Event::Keepalive { answered: 0, pinged } => { assert_eq!(pinged, 1); break; }
+            _ if Instant::now() < deadline => continue,
+            other => panic!("B never went unanswered: {other:?}"),
+        }
+    }
+}

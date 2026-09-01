@@ -90,6 +90,10 @@ pub enum Event {
     /// The worker stopped. Carries why, because a discovery feature that
     /// silently stops is one people conclude is "just slow".
     Stopped(String),
+    /// A keepalive round went out. `answered` of `pinged` peers replied —
+    /// zero of several is the app's cue that the network changed under
+    /// it (a NAT mapping expired, wifi handed off to cellular).
+    Keepalive { pinged: usize, answered: usize },
 }
 
 pub struct NodeHost {
@@ -126,6 +130,12 @@ impl NodeHost {
     /// keyspace across restarts — a node that re-randomises its id on
     /// every launch makes every other node's routing table stale.
     pub fn spawn(id: NodeId, bind: SocketAddr) -> std::io::Result<NodeHost> {
+        Self::spawn_with_keepalive(id, bind, KEEPALIVE)
+    }
+
+    /// `spawn` with the keepalive period chosen — tests use a short one.
+    pub fn spawn_with_keepalive(id: NodeId, bind: SocketAddr, keepalive: std::time::Duration)
+        -> std::io::Result<NodeHost> {
         let tx_udp = std::sync::Arc::new(UdpTransport::bind(id, bind)?);
         let local = tx_udp.local_addr()?;
         let (req_tx, req_rx) = std::sync::mpsc::channel::<Req>();
@@ -140,8 +150,37 @@ impl NodeHost {
                 // cost nothing. A DHT that burns a core waiting for
                 // something to do is a battery bug on a phone, and this
                 // is a phone app.
-                let req = match req_rx.recv() {
+                // Blocking with a period, not a poll loop: the thread
+                // wakes once per keepalive when idle, and that wake is the
+                // keepalive. See `KEEPALIVE` for why it exists at all.
+                let req = match req_rx.recv_timeout(keepalive) {
                     Ok(r) => r,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        let now = now_secs();
+                        let me = me_contact(id, local, now);
+                        let targets = {
+                            let n = match node.lock() { Ok(n) => n, Err(p) => p.into_inner() };
+                            // The peers most likely to hold our mapping and
+                            // to be asked about us: the ones nearest our
+                            // own id. Bounded, because this runs for the
+                            // life of the app.
+                            n.rt.closest(&id, KEEPALIVE_PEERS)
+                        };
+                        if targets.is_empty() { continue; }
+                        let mut answered = 0;
+                        for c in &targets {
+                            if snapcore::node::Transport::ping(&*tx_udp, &me, c) {
+                                answered += 1;
+                                match node.lock() { Ok(mut n) => n.rt.saw(c.id, c.addr, now), Err(p) => p.into_inner().rt.saw(c.id, c.addr, now) }
+                            } else {
+                                match node.lock() { Ok(mut n) => n.rt.failed(&c.id, now), Err(p) => p.into_inner().rt.failed(&c.id, now) }
+                            }
+                        }
+                        if ev_tx.send(Event::Keepalive { pinged: targets.len(), answered }).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
                     // The sender is gone, which means NodeHost was
                     // dropped. Exit rather than report — nobody is
                     // listening to the event channel either.
@@ -278,6 +317,25 @@ impl NodeHost {
         }
     }
 }
+
+/// How often an idle node pings the peers nearest it.
+///
+/// A served node is reachable only while its NAT mapping lives, and a
+/// UDP mapping dies after roughly thirty seconds of silence on most home
+/// routers and sooner on some carriers. Between lookups nothing else
+/// leaves this socket, so the mapping that every peer's record of us
+/// points at would expire within a minute of the last publish. Twenty-five
+/// seconds keeps it under the common thirty; it is also the figure the
+/// reference and Jami use, so a phone running both wakes its radio no
+/// more often than it already did. The cost is a few datagrams a
+/// minute; the alternative is a node that is only reachable for a minute
+/// after it last spoke.
+pub const KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// Peers pinged per keepalive. Three is enough to keep a mapping open
+/// through the routers between us and them, and to notice when none of
+/// them answer.
+pub const KEEPALIVE_PEERS: usize = 3;
 
 /// How long a published record lives, in seconds.
 ///
