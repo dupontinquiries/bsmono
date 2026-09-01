@@ -15,7 +15,7 @@
 //! about why. The message is kept distinguishable from content so the caller
 //! can style it, which the QML could not do with one string.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// What the viewer is showing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +167,7 @@ pub fn peek_viewer_ui(ui: &mut egui::Ui, v: &mut PeekViewer) {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
 
     fn tmp(name: &str, body: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("peek-{}-{}", std::process::id(), name));
