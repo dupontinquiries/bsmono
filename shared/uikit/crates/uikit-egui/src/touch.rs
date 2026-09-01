@@ -13,6 +13,8 @@ pub use touchkit::{Config, Gesture, GestureRecognizer, Touch, Vec2};
 /// so this keeps a small live-touch map and snapshots it.
 #[derive(Default)]
 pub struct TouchSource {
+    /// The current contact belongs to a widget — see step 2b in `poll`.
+    suppressed: bool,
     active: HashMap<u64, egui::Pos2>,
 }
 
@@ -56,8 +58,29 @@ impl TouchSource {
             });
         }
 
+        // 2b) a contact that a WIDGET owns is not a gesture. The same hole
+        // `GestureLayer` had: a finger selecting text in a field, or
+        // dragging a slider, was a swipe here. While the widget holds it,
+        // the recognizer sees no contact and anything it emits on that
+        // transition is dropped; the suppression lifts when the contact
+        // ends, so the next touch starts clean.
+        if !touches.is_empty() && !self.suppressed
+            && crate::gesture_layer::pointer_belongs_to_a_widget(ctx)
+        {
+            self.suppressed = true;
+        }
+        let widget_owned = self.suppressed;
+        if touches.is_empty() {
+            self.suppressed = false;
+        } else if widget_owned {
+            touches.clear();
+        }
+
         // 3) frame-driven recognizer
         let mut gestures = rec.update(&touches, now_ms);
+        if widget_owned {
+            gestures.clear();
+        }
 
         // 4) trackpad / wheel → pan + pinch (only when no fingers, so they don't fight)
         if touches.is_empty() {
@@ -83,5 +106,62 @@ impl TouchSource {
         gestures.extend(rec.momentum(now_ms));
         let gliding = gestures.iter().any(|g| matches!(g, Gesture::MomentumTick { .. }));
         (gestures, gliding)
+    }
+}
+
+#[cfg(test)]
+mod widget_ownership_tests {
+    use super::*;
+    use egui::{Context, Event, PointerButton, Pos2, RawInput, Rect, Ui};
+    use touchkit::Gesture;
+
+    const FIELD: Rect = Rect { min: Pos2::new(40.0, 380.0), max: Pos2::new(360.0, 420.0) };
+
+    /// Press at `from`, drag to `to`, release — through real egui frames
+    /// with a focused text field drawn each frame. Every gesture the
+    /// bridge emitted, in order.
+    fn drag(from: Pos2, to: Pos2) -> Vec<Gesture> {
+        let ctx = Context::default();
+        let mut src = TouchSource::new();
+        let mut rec = GestureRecognizer::default();
+        let mut text = String::from("some text to select by dragging across it");
+        let mut out = Vec::new();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 800.0));
+        let press = |pos: Pos2, pressed: bool| Event::PointerButton {
+            pos, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        let mut run = |events: Vec<Event>, t: f64, out: &mut Vec<Gesture>| {
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen), time: Some(t), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui: &mut Ui| {
+                    ui.put(FIELD, egui::TextEdit::singleline(&mut text)).request_focus();
+                });
+                let (g, _) = src.poll(ctx, &mut rec);
+                out.extend(g);
+            });
+        };
+        let mut t = 0.0;
+        run(vec![Event::PointerMoved(from)], t, &mut out);
+        t += 0.016;
+        run(vec![press(from, true)], t, &mut out);
+        for i in 1..=8 {
+            t += 0.016;
+            run(vec![Event::PointerMoved(from + (to - from) * (i as f32 / 8.0))], t, &mut out);
+        }
+        t += 0.016;
+        run(vec![press(to, false)], t, &mut out);
+        t += 0.016;
+        run(vec![], t, &mut out);
+        out
+    }
+
+    fn moved_the_page(g: &[Gesture]) -> bool {
+        g.iter().any(|g| matches!(g, Gesture::PanStart(_) | Gesture::Pan { .. } | Gesture::Fling { .. }))
+    }
+
+    #[test]
+    fn a_touch_drag_across_a_focused_text_field_is_not_a_gesture() {
+        let inside = drag(Pos2::new(300.0, 400.0), Pos2::new(60.0, 400.0));
+        assert!(!moved_the_page(&inside), "a text-selection drag produced page gestures: {inside:?}");
+        let outside = drag(Pos2::new(300.0, 600.0), Pos2::new(60.0, 600.0));
+        assert!(moved_the_page(&outside), "the control drag below the field must still pan or swipe: {outside:?}");
     }
 }
