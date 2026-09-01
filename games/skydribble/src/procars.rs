@@ -526,7 +526,7 @@ pub fn vipera(gpu: &mut Gpu) -> Model {
     // language, not a car that is wrong — which is why the proportion audit
     // has to know this one answers to its own sheet.
     let half_len = 0.77f32;
-    let half_w = half_len * 0.467; // 0.360
+    let _half_w = half_len * 0.467; // 0.360 — reference only; the shell below is hand-tuned, not driven by this
     let wheel_r = half_len * 0.170; // 0.131
     // wheelbase is 0.685 of length, so the axles sit at +/- 0.3425 of it
     let axle_z = half_len * 0.685;

@@ -385,8 +385,6 @@ fn parse_args() -> Opts {
             "--mute" => o.mute = true,
             "--mobile" => o.mobile = true,
             "--desktop-ui" => o.desktop_ui = true,
-            "--mobile" => o.mobile = true,
-            "--desktop-ui" => o.desktop_ui = true,
             "--dvorak" => o.dvorak = true,
             "--name" => o.name = args.next(),
             "--host" => o.host = true,
@@ -1427,7 +1425,7 @@ impl Game {
                 };
                 let (blue_home, orange_home) = (home_z(-1.0), home_z(1.0));
                 let bp = self.ball.pos;
-                let mut spawn = |team: u8, k: usize, brain: bots::Brain, sel: &mut Self| {
+                let spawn = |team: u8, k: usize, brain: bots::Brain, sel: &mut Self| {
                     let side = if team == bots::TEAM_BLUE { 1.0 } else { -1.0 };
                     // teammates spawn on the real surface too (a raised
                     // deck would otherwise swallow the whole lineup)
