@@ -6373,3 +6373,46 @@ and illumination on them. That is the honest answer to "cheap markers
 that pull apart any engine or the real world": yes for the global
 stages, validated; and on this film the cheap stages are not where
 the bytes are. The expensive ones are.
+
+### Fog as the first engine-supplied stage — and why estimating it from pixels lost (same day)
+
+The scenario: the library holds the world captured under one
+atmosphere; the take has another. soldier now exposes
+`render_with_depth` (per-vertex camera depth alongside the mesh —
+additive, `render` unchanged), the harness rasterises depth in
+painter's order like colour, and `--take-fog s e` renders the take
+under a different fog than the library's (55, 280).
+
+Three map-only predictors, 24 frames, actors on, take fog (12, 60):
+
+  library fog (canonical as stored)        23,975 B @ 40.39 dB / 0.99759   side 12,295  resid 11,598
+  world + fog ESTIMATED from pixels        32,804 B @ 38.36 dB / 0.99692   (per-pixel model)
+  world + fog FROM ENGINE, 7 B/frame        6,908 B @ 49.19 dB / 0.99960   side  1,598  resid  5,060
+
+The engine-supplied stage reconciles library and take for 168 bytes:
+3.5x fewer bytes AND +8.8 dB. Note what the mismatch was costing in
+the first row — 12 KB of side info, the per-region gains chasing a
+depth-dependent blend one region at a time, which frame-level
+weighted prediction cannot express either. The residual left in the
+third row is the actors carried as pixels.
+
+The estimator is the honest negative. `photometric::FogStage::fit`
+recovers the fog COLOUR (20,132,126 against 21,132,126) and lands
+`end` at 26-34 against a true 60, every time, with or without the
+far-cull pixels excluded. Not a fitting bug: soldier applies fog PER
+VERTEX and interpolates colour across the triangle in screen space,
+so on any large floor or wall the picture's fog is not a per-pixel
+function of depth at all. A per-pixel formula is a different
+function, and its best fit is a worse predictor than the library's
+wrong fog. The marker bank's fog DETECTION (R^2 0.92) was right;
+parameter recovery under the wrong formula is not.
+
+Consequence for the architecture, stated as a rule: a stage is
+parameters the renderer reads, not a formula the codec applies. The
+decoder owning the renderer means the renderer evaluates every
+stage — fog, cull, lighting — with the stage's parameters, and the
+codec's job is to carry the parameters at the right rate. Estimating
+a stage from pixels is only for footage with no engine, and there a
+renderer-agnostic formula has to be validated against the real
+world's actual formula the same way this one was validated against
+soldier's, or it will lose to no stage at all.

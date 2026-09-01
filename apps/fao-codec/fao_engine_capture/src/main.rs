@@ -343,9 +343,58 @@ fn main() {
         rasterise(&m)
     };
 
+    // Same scene, with per-pixel depth from the game's own projection
+    // and a caller-chosen fog (the world stage renders with NO fog:
+    // end pushed past the level; atmosphere is a later stage).
+    let render_scene_depth = |cam: &FpsCam, actors: &[ActorPose], fg: &Fog| -> (Vec<u8>, Vec<f32>) {
+        let mut all: Vec<early_fps::mesh::Mesh3> = level.meshes.clone();
+        all.extend(actors.iter().map(actor_mesh));
+        let (m, dz) = early_fps::render::render_with_depth(
+            &all, cam, W as f32 / 2.0, H as f32 / 2.0, scale, &light, fg,
+            W as f32, H as f32, 0.0, Vec2::new(0.0, 0.0), atlas, 1, &[],
+        );
+        let rgb = rasterise(&m);
+        // depth per pixel: barycentric, painter's order (last wins),
+        // same rule as the colour fill so the two line up
+        // 1e6: "no geometry here" — beyond any fog end, finite so a
+        // fit can bound its search, excluded from the fit itself.
+        let mut depth = vec![1.0e6f32; W * H];
+        for tri in m.indices.chunks_exact(3) {
+            let v: Vec<&egui::epaint::Vertex> = tri.iter().map(|&i| &m.vertices[i as usize]).collect();
+            let d: Vec<f32> = tri.iter().map(|&i| dz[i as usize]).collect();
+            let (p0, p1, p2) = (v[0].pos, v[1].pos, v[2].pos);
+            let minx = p0.x.min(p1.x).min(p2.x).floor().max(0.0) as usize;
+            let maxx = (p0.x.max(p1.x).max(p2.x).ceil().min(W as f32 - 1.0)).max(0.0) as usize;
+            let miny = p0.y.min(p1.y).min(p2.y).floor().max(0.0) as usize;
+            let maxy = (p0.y.max(p1.y).max(p2.y).ceil().min(H as f32 - 1.0)).max(0.0) as usize;
+            let area = (p1.x - p0.x) * (p2.y - p0.y) - (p2.x - p0.x) * (p1.y - p0.y);
+            if area.abs() < 1e-6 { continue; }
+            for y in miny..=maxy {
+                for x in minx..=maxx {
+                    let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+                    let w0 = ((p1.x - p0.x) * (fy - p0.y) - (fx - p0.x) * (p1.y - p0.y)) / area;
+                    let w1 = ((fx - p0.x) * (p2.y - p0.y) - (p2.x - p0.x) * (fy - p0.y)) / area;
+                    let w2 = 1.0 - w0 - w1;
+                    if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 { continue; }
+                    depth[y * W + x] = w2 * d[0] + w1 * d[1] + w0 * d[2];
+                }
+            }
+        }
+        (rgb, depth)
+    };
+    let no_fog = Fog::new(fog.color, 1.0e6, 2.0e6);
+    let take_fog: Option<Fog> = args.iter().position(|a| a == "--take-fog").and_then(|i| {
+        let s: f32 = args.get(i + 1)?.parse().ok()?;
+        let e: f32 = args.get(i + 2)?.parse().ok()?;
+        Some(Fog::new(fog.color, s, e))
+    });
+
     let render_footage = |fi: usize| -> Vec<u8> {
         let actors: &[ActorPose] = if with_actors { &actor_poses[fi] } else { &[] };
-        let mut rgb = render_scene(&cams[fi], actors);
+        let mut rgb = match &take_fog {
+            Some(fg) => render_scene_depth(&cams[fi], actors, fg).0,
+            None => render_scene(&cams[fi], actors),
+        };
         if with_exposure {
             // Exposure drift: the post-processing and encoder wobble a
             // static canonical cannot know about.
@@ -513,6 +562,54 @@ fn main() {
         if per_frame {
             for (i, c) in rent.frames.iter().enumerate().filter(|(_, c)| c.residual_bytes > 5 || c.mode_bytes > 100) {
                 eprintln!("  ent  f{i:>2}: side {:>5} resid {:>6}", c.mode_bytes, c.residual_bytes);
+            }
+        }
+    }
+
+    // ── FOG STAGE. The library's world was captured under the base
+    // atmosphere; the take has another. Three predictors, all map-only:
+    //   library fog      the canonical as stored (mismatch -> residual)
+    //   world + fitted   render WITHOUT fog, engine depth, fog stage
+    //                    fitted per frame from the footage (10 B/frame)
+    if take_fog.is_some() {
+        let mut pred_libfog = |fi: usize| to_yuv(&render_scene(&cams[fi], &[]));
+        let (rl, _) = plate::encode_gop_v3_core(&frames, &mut pred_libfog, LIB_REF, cam_bytes, &opts, None);
+        report("map canonical, LIBRARY fog", &rl, 0, "(take fog differs)");
+        let mut fitted: Vec<Option<fao_codec::photometric::FogStage>> = Vec::new();
+        let mut pred_stage = |fi: usize| {
+            let (rgb, depth) = render_scene_depth(&cams[fi], &[], &no_fog);
+            let lit = to_yuv(&rgb);
+            let st = fao_codec::photometric::FogStage::fit(&lit, &depth, &frames[fi]);
+            fitted.push(st);
+            match st {
+                Some(st) => {
+                    // The decoder knows `end`, so it renders the world
+                    // with the renderer's own far cull at end + margin
+                    // and NO blend (start == end), then applies the
+                    // stage. That is what a real stage does: it owns
+                    // the parameters the renderer reads.
+                    let culled = Fog::new(fog.color, st.end, st.end);
+                    let (rgb2, depth2) = render_scene_depth(&cams[fi], &[], &culled);
+                    st.apply(&to_yuv(&rgb2), &depth2)
+                }
+                None => lit,
+            }
+        };
+        let (rs, _) = plate::encode_gop_v3_core(&frames, &mut pred_stage, LIB_REF, cam_bytes, &opts, None);
+        let fog_bytes = fitted.iter().filter(|f| f.is_some()).count() * fao_codec::photometric::FogStage::WIRE;
+        report("map canonical, world + fog ESTIMATED", &rs, fog_bytes, &format!("(fog stream {fog_bytes} B)"));
+        // The stage as an engine supplies it: the take's fog is game
+        // state, like the camera. The decoder renders the world with
+        // those parameters — the renderer evaluates the stage, so its
+        // per-vertex blend and far cull are reproduced exactly.
+        let tf = take_fog.as_ref().unwrap();
+        let mut pred_engine = |fi: usize| to_yuv(&render_scene_depth(&cams[fi], &[], tf).0);
+        let (re, _) = plate::encode_gop_v3_core(&frames, &mut pred_engine, LIB_REF, cam_bytes, &opts, None);
+        let eng_bytes = n * fao_codec::photometric::FogStage::WIRE;
+        report("map canonical, world + fog FROM ENGINE", &re, eng_bytes, &format!("(fog stream {eng_bytes} B)"));
+        if per_frame {
+            for (i, f) in fitted.iter().enumerate().step_by(12) {
+                eprintln!("  fog f{i:>2}: {:?}", f);
             }
         }
     }

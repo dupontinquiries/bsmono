@@ -158,7 +158,7 @@ pub fn render(
     atlas_cols: usize,
     lights: &[crate::mesh::PointLight],
 ) -> Mesh {
-    render_inner(meshes.iter(), cam, cx, cy, scale, light, fog, view_w, view_h, time, wind, atlas, atlas_cols, lights)
+    render_inner(meshes.iter(), cam, cx, cy, scale, light, fog, view_w, view_h, time, wind, atlas, atlas_cols, lights).0
 }
 
 /// Render a list of mesh *references* — used by the dynamic LOD field, whose active-tier meshes live inside
@@ -179,7 +179,7 @@ pub fn render_refs(
     atlas_cols: usize,
     lights: &[crate::mesh::PointLight],
 ) -> Mesh {
-    render_inner(meshes.iter().copied(), cam, cx, cy, scale, light, fog, view_w, view_h, time, wind, atlas, atlas_cols, lights)
+    render_inner(meshes.iter().copied(), cam, cx, cy, scale, light, fog, view_w, view_h, time, wind, atlas, atlas_cols, lights).0
 }
 
 fn render_inner<'a>(
@@ -197,7 +197,7 @@ fn render_inner<'a>(
     atlas: egui::TextureId,
     atlas_cols: usize,
     lights: &[crate::mesh::PointLight],
-) -> Mesh {
+) -> (Mesh, Vec<f32>) {
     let l = light.dir.normalized();
     let (right, up, fwd) = cam.basis();
     let near = FpsCam::NEAR;
@@ -208,7 +208,7 @@ fn render_inner<'a>(
     let tan_v = (view_h * 0.5) / scale * 1.04;
 
     // (sort_depth, [screen pts], [colours], [uvs]) — fan-triangulated after clipping.
-    let mut out: Vec<(f32, [Pos2; 3], [Color32; 3], [Pos2; 3])> = Vec::new();
+    let mut out: Vec<(f32, [Pos2; 3], [Color32; 3], [Pos2; 3], [f32; 3])> = Vec::new();
 
     for m in meshes {
         // Whole-mesh (chunk) frustum cull: if a chunk's cached AABB is entirely behind, past the fog, or off
@@ -432,7 +432,7 @@ fn render_inner<'a>(
                     continue;
                 }
                 let sort = (a.1 + b.1 + c.1) / 3.0;
-                out.push((sort, [a.0, b.0, c.0], [a.2, b.2, c.2], [a.3, b.3, c.3]));
+                out.push((sort, [a.0, b.0, c.0], [a.2, b.2, c.2], [a.3, b.3, c.3], [a.1, b.1, c.1]));
             }
         }
     }
@@ -443,14 +443,40 @@ fn render_inner<'a>(
     mesh.texture_id = atlas;
     mesh.vertices.reserve(out.len() * 3);
     mesh.indices.reserve(out.len() * 3);
-    for (_, sp, cols, uvs) in out {
+    let mut depth: Vec<f32> = Vec::with_capacity(out.len() * 3);
+    for (_, sp, cols, uvs, dz) in out {
         let i = mesh.vertices.len() as u32;
         for k in 0..3 {
             mesh.vertices.push(egui::epaint::Vertex { pos: sp[k], uv: uvs[k], color: cols[k] });
+            depth.push(dz[k]);
         }
         mesh.add_triangle(i, i + 1, i + 2);
     }
-    mesh
+    (mesh, depth)
+}
+
+/// `render`, plus the camera-space depth of every output vertex,
+/// parallel to `mesh.vertices`. The renderer has this number at
+/// projection time and normally drops it; anything that wants to
+/// re-derive a depth-dependent effect from the picture (fog, defocus)
+/// needs it back. Additive: `render` is unchanged.
+pub fn render_with_depth(
+    meshes: &[Mesh3],
+    cam: &FpsCam,
+    cx: f32,
+    cy: f32,
+    scale: f32,
+    light: &Light,
+    fog: &Fog,
+    view_w: f32,
+    view_h: f32,
+    time: f32,
+    wind: crate::math::Vec2,
+    atlas: egui::TextureId,
+    atlas_cols: usize,
+    lights: &[crate::mesh::PointLight],
+) -> (Mesh, Vec<f32>) {
+    render_inner(meshes.iter(), cam, cx, cy, scale, light, fog, view_w, view_h, time, wind, atlas, atlas_cols, lights)
 }
 
 /// Sutherland–Hodgman clip of a convex polygon against the single plane `cam.z >= near`.

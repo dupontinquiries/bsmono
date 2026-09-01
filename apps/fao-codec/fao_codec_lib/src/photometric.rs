@@ -368,3 +368,188 @@ impl Signature {
         )
     }
 }
+
+// ── Fog stage: the first engine-supplied stage in the chain.
+//
+// pixel = lit * (1 - t) + C * t,  t = clamp((depth - start) / (end - start))
+//
+// The world stage renders `lit` (no atmosphere) and the engine hands
+// over per-pixel depth; the fog stage is then FIVE numbers per frame
+// (a colour and two distances) instead of a residual across the
+// picture. Fitted by grid search over (start, end) with the colour
+// closed-form per plane, on a pixel subsample; refined locally. The
+// blend is linear, so it commutes with the RGB->YUV transform and is
+// applied in YUV directly, chroma at half resolution with depth
+// box-averaged.
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FogStage {
+    pub color: [u8; 3],
+    pub start: f32,
+    pub end: f32,
+}
+
+impl FogStage {
+    pub const WIRE: usize = 3 + 2 + 2;
+
+    fn t(&self, d: f32) -> f32 {
+        if self.end <= self.start {
+            return 0.0;
+        }
+        ((d - self.start) / (self.end - self.start)).clamp(0.0, 1.0)
+    }
+
+    pub fn apply(&self, lit: &Yuv420, depth: &[f32]) -> Yuv420 {
+        let (w, h) = (lit.w, lit.h);
+        let mut out = Yuv420::new(w, h);
+        for i in 0..w * h {
+            // no geometry: the world render already shows what is
+            // there (sky / clear); atmosphere has nothing to blend
+            let t = if depth[i] > 1.0e5 { 0.0 } else { self.t(depth[i]) };
+            out.y[i] = (lit.y[i] as f32 * (1.0 - t) + self.color[0] as f32 * t).round().clamp(0.0, 255.0) as u8;
+        }
+        let cw = w / 2;
+        for cy in 0..h / 2 {
+            for cx in 0..cw {
+                let d = (depth[(cy * 2) * w + cx * 2]
+                    + depth[(cy * 2) * w + cx * 2 + 1]
+                    + depth[(cy * 2 + 1) * w + cx * 2]
+                    + depth[(cy * 2 + 1) * w + cx * 2 + 1])
+                    / 4.0;
+                let t = if d > 1.0e5 { 0.0 } else { self.t(d) };
+                let ci = cy * cw + cx;
+                out.u[ci] = (lit.u[ci] as f32 * (1.0 - t) + self.color[1] as f32 * t).round().clamp(0.0, 255.0) as u8;
+                out.v[ci] = (lit.v[ci] as f32 * (1.0 - t) + self.color[2] as f32 * t).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        out
+    }
+
+    /// Fit (colour, start, end) so that `apply(lit, depth)` matches
+    /// `target`, on luma, over a subsample. `None` when no fog beats
+    /// the identity by the gate (fraction of luma SSE removed).
+    pub fn fit(lit: &Yuv420, depth: &[f32], target: &Yuv420) -> Option<FogStage> {
+        // A renderer that culls past its fog end leaves clear colour
+        // where the world render has geometry; those pixels obey no
+        // blend and drag `end` inward. Fit, then refit excluding
+        // pixels beyond the first fit's end plus a margin.
+        let first = Self::fit_bounded(lit, depth, target, 1.0e5)?;
+        Self::fit_bounded(lit, depth, target, first.end + 6.0).or(Some(first))
+    }
+
+    /// Cull margin past `end` at which this renderer stops drawing.
+    pub const CULL_MARGIN: f32 = 6.0;
+
+    fn fit_bounded(lit: &Yuv420, depth: &[f32], target: &Yuv420, max_depth: f32) -> Option<FogStage> {
+        let (w, h) = (lit.w, lit.h);
+        let step = 4usize;
+        let mut ls = Vec::new();
+        let mut ds = Vec::new();
+        let mut ts = Vec::new();
+        let mut us = Vec::new();
+        let mut vs = Vec::new();
+        let mut lu = Vec::new();
+        let mut lv = Vec::new();
+        let cw = w / 2;
+        let mut y = 0;
+        while y < h {
+            let mut x = 0;
+            while x < w {
+                let i = y * w + x;
+                // uncovered pixels (no geometry) carry no depth
+                if !depth[i].is_finite() || depth[i] > max_depth {
+                    x += step;
+                    continue;
+                }
+                ls.push(lit.y[i] as f32);
+                ds.push(depth[i]);
+                ts.push(target.y[i] as f32);
+                let ci = (y / 2) * cw + x / 2;
+                lu.push(lit.u[ci] as f32);
+                lv.push(lit.v[ci] as f32);
+                us.push(target.u[ci] as f32);
+                vs.push(target.v[ci] as f32);
+                x += step;
+            }
+            y += step;
+        }
+        let n = ls.len();
+        if n < 256 {
+            return None;
+        }
+        let sse0: f64 = (0..n).map(|i| ((ts[i] - ls[i]) as f64).powi(2)).sum();
+        // closed-form colour and SSE for a given (start, end), luma
+        let eval = |start: f32, end: f32| -> (f64, f32) {
+            let st = FogStage { color: [0; 3], start, end };
+            let (mut num, mut den) = (0.0f64, 0.0f64);
+            for i in 0..n {
+                let t = st.t(ds[i]) as f64;
+                num += t * (ts[i] as f64 - ls[i] as f64 * (1.0 - t));
+                den += t * t;
+            }
+            if den < 1e-9 {
+                return (sse0, 0.0);
+            }
+            let c = (num / den).clamp(0.0, 255.0);
+            let sse: f64 = (0..n)
+                .map(|i| {
+                    let t = st.t(ds[i]) as f64;
+                    (ts[i] as f64 - (ls[i] as f64 * (1.0 - t) + c * t)).powi(2)
+                })
+                .sum();
+            (sse, c as f32)
+        };
+        let dmax = ds.iter().cloned().fold(0.0f32, f32::max).clamp(10.0, 1.0e4);
+        let mut best = (sse0, 0.0f32, 0.0f32, 0.0f32);
+        let mut start = 0.0f32;
+        while start < dmax {
+            let mut end = start + 5.0;
+            while end <= dmax * 1.5 {
+                let (sse, c) = eval(start, end);
+                if sse < best.0 {
+                    best = (sse, start, end, c);
+                }
+                end += dmax / 20.0;
+            }
+            start += dmax / 20.0;
+        }
+        // local refinement
+        for _ in 0..2 {
+            let (_, s0, e0, _) = best;
+            let ds_ = dmax / 80.0;
+            for si in -2..=2 {
+                for ei in -2..=2 {
+                    let (s, e) = (s0 + si as f32 * ds_, e0 + ei as f32 * ds_);
+                    if s < 0.0 || e <= s + 1.0 {
+                        continue;
+                    }
+                    let (sse, c) = eval(s, e);
+                    if sse < best.0 {
+                        best = (sse, s, e, c);
+                    }
+                }
+            }
+        }
+        let (sse, start, end, c_y) = best;
+        let gate: f64 = std::env::var("FAO_FOG_GATE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.05);
+        if sse0 <= 1e-9 || (sse0 - sse) / sse0 < gate {
+            return None;
+        }
+        // chroma colours given t
+        let st = FogStage { color: [0; 3], start, end };
+        let cfit = |lp: &[f32], tp: &[f32]| -> u8 {
+            let (mut num, mut den) = (0.0f64, 0.0f64);
+            for i in 0..n {
+                let t = st.t(ds[i]) as f64;
+                num += t * (tp[i] as f64 - lp[i] as f64 * (1.0 - t));
+                den += t * t;
+            }
+            if den < 1e-9 { 128 } else { (num / den).round().clamp(0.0, 255.0) as u8 }
+        };
+        Some(FogStage {
+            color: [c_y.round() as u8, cfit(&lu, &us), cfit(&lv, &vs)],
+            start,
+            end,
+        })
+    }
+}
