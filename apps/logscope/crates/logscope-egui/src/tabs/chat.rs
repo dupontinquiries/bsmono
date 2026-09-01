@@ -1201,6 +1201,11 @@ pub struct Chat {
     hide_bottom_bar: bool,         // hide the whole composer/files/suggestions strip — reclaims the
                                     // full window height for the physical UI (spatial_view), which was
                                     // otherwise cramped/cut off behind it with no way to get it back.
+    /// One-shot latch for the transcript swipe gestures (message-variant / background-branch): set
+    /// once a drag has fired an action, cleared when the pointer releases. Without this, checking
+    /// against `total_drag_delta()` every frame while the button stays down past the axis-lock
+    /// threshold would fire the SAME swipe again on every subsequent frame of one continuous drag.
+    swipe_consumed: bool,
     walk: crate::walkcam::WalkCam, // prezi-style walkthrough camera over the graph
     walk_focus: Option<usize>,     // node the walkthrough is centered on
     cam_pan_path: Vec<usize>,      // node-id path (graph shortest path) the camera is gliding along
@@ -1468,6 +1473,7 @@ impl Default for Chat {
             verify_net: false,
             show_files: false,
             hide_bottom_bar: false,
+            swipe_consumed: false,
             walk: crate::walkcam::WalkCam::new(13.0), walk_focus: None, scroll_chat_to: None,
             cam_pan_path: Vec::new(), cam_pan_t0: None,
             orbit: crate::spatial::OrbitCam::default(), spatial_view: false,
@@ -9502,20 +9508,32 @@ dense briefing that replaces them as the working context, then carry on with roo
                         // variants, the way a photo gallery does — which takes the arrow buttons out of
                         // a bar that was already overlapping rather than adding to it. The axis lock and
                         // the mid-stream refusal live in chatgesture; this only supplies the drag.
+                        //
+                        // CUMULATIVE distance since the press, not the per-frame delta. A per-frame
+                        // delta is typically a couple of points even for a fast drag — comparing THAT
+                        // against a 12pt threshold means the gesture only ever fired on a hard flick
+                        // that happened to move >12pt within one frame, not an ordinary slow swipe.
+                        // `total_drag_delta()` is the whole drag from press_origin to now, recomputed
+                        // fresh each frame, so a slow deliberate swipe crosses the threshold exactly
+                        // when it visually should. `swipe_consumed` stops it firing again on every
+                        // later frame of the SAME drag once past that threshold.
                         if m.variants.len() > 1 && !streaming_here {
-                            let d = ui.input(|i| i.pointer.delta());
                             if ui.rect_contains_pointer(ui.min_rect())
                                 && ui.input(|i| i.pointer.primary_down()) {
                                 over_any_message = true;
-                                let ax = crate::chatgesture::lock_axis(d.x, d.y);
-                                let delta = if d.x < -crate::chatgesture::AXIS_LOCK_PT { 1 }
-                                            else if d.x > crate::chatgesture::AXIS_LOCK_PT { -1 }
-                                            else { 0 };
-                                if let crate::chatgesture::Action::ShowVariant { delta, .. } =
-                                    crate::chatgesture::action(
-                                        crate::chatgesture::Target::Message(i), delta, ax,
-                                        streaming_here, m.variants.len(), m.cur) {
-                                    swipe_variant = Some((i, delta));
+                                if !self.swipe_consumed {
+                                    let d = ui.input(|i| i.pointer.total_drag_delta()).unwrap_or_default();
+                                    let ax = crate::chatgesture::lock_axis(d.x, d.y);
+                                    let delta = if d.x < -crate::chatgesture::AXIS_LOCK_PT { 1 }
+                                                else if d.x > crate::chatgesture::AXIS_LOCK_PT { -1 }
+                                                else { 0 };
+                                    if let crate::chatgesture::Action::ShowVariant { delta, .. } =
+                                        crate::chatgesture::action(
+                                            crate::chatgesture::Target::Message(i), delta, ax,
+                                            streaming_here, m.variants.len(), m.cur) {
+                                        swipe_variant = Some((i, delta));
+                                        self.swipe_consumed = true;
+                                    }
                                 }
                             }
                         } else if ui.input(|i| i.pointer.primary_down()) && ui.rect_contains_pointer(ui.min_rect()) {
@@ -9785,17 +9803,23 @@ dense briefing that replaces them as the working context, then carry on with roo
                     // sibling branches instead, the same "hjkl branch" the header hints at, now
                     // reachable without the keyboard. `switch_sibling` already exists and is wired to
                     // h/l and the graph tab; chatgesture::action's Target::Background case had no
-                    // caller until this.
-                    if !over_any_message && ui.rect_contains_pointer(ui.min_rect()) && ui.input(|i| i.pointer.primary_down()) {
-                        let d = ui.input(|i| i.pointer.delta());
+                    // caller until this. Same cumulative-distance + one-shot-latch reasoning as the
+                    // message swipe above.
+                    if !over_any_message && !self.swipe_consumed
+                        && ui.rect_contains_pointer(ui.min_rect()) && ui.input(|i| i.pointer.primary_down()) {
+                        let d = ui.input(|i| i.pointer.total_drag_delta()).unwrap_or_default();
                         let ax = crate::chatgesture::lock_axis(d.x, d.y);
                         let delta = if d.x < -crate::chatgesture::AXIS_LOCK_PT { 1 }
                                     else if d.x > crate::chatgesture::AXIS_LOCK_PT { -1 } else { 0 };
                         if let crate::chatgesture::Action::SwitchBranch { delta } =
                             crate::chatgesture::action(crate::chatgesture::Target::Background, delta, ax, false, 0, 0) {
                             self.switch_sibling(delta);
+                            self.swipe_consumed = true;
                         }
                     }
+                    // Latch resets the instant the button lifts, whether or not this drag fired
+                    // anything — the next press starts a fresh gesture with its own drag distance.
+                    if !ui.input(|i| i.pointer.primary_down()) { self.swipe_consumed = false; }
                 });
         });
         } // narrow + fan-fullscreen: the fan took the central area instead of the log
