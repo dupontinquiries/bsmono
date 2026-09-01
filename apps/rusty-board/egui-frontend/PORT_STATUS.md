@@ -59,6 +59,23 @@ moved.
   double-transcription bug this designed out), and `demo_app` owns a live `DictationService` +
   mic broker. Gated behind the `voice` feature (whisper-rs + cpal native build) — off by
   default so a phone build that can't compile whisper-rs still ships a usable keyboard.
+- **Stenotype** (`steno.rs`) — the GTK-free pairing engine (`src/steno/`) is mounted by
+  `#[path]`, same decision as voice/config. `default_stenotype()` (already in `board-layouts`)
+  renders through the existing `to_render`; the harder part was dispatch, not layout: steno
+  phonemes collide across buttons/directions (`"n"` is both L1-north and R2-north), so a
+  swipe's committed VALUE can't be the phoneme text the way the alphabet cardinal grid's can.
+  `Key::steno_button` + a reserved `steno_token`/`decode_steno_token` pair carry the (button,
+  gesture) identity through `paint_key` → `classify` → `Press::Steno` instead, while the
+  on-screen label stays the phoneme (`SlideOption::new(id, label)` keeps those independent).
+  Pairing/solo-flush has no glib timer to ride, so `steno.rs`'s `feed`/`poll_pending` track the
+  pending stroke's deadline against a real `Instant` and get polled once per frame from
+  `demo_app`'s `update()`. Candidate acceptance backspaces the raw phonemes already typed
+  before inserting the accepted word (`accept_word`'s `backspaces` count) — the naive
+  "just commit the tapped word" version this replaced would have produced `"katcat"`.
+  16 new tests (token round-trip, layout projection, classify, pair/solo timing, microterm
+  content mapping) plus the engine's own 24 mounted tests. **Not verified on a real running
+  app** — this environment has no display; everything here is `cargo test`-verified, not
+  clicked-through.
 
 ## Not done
 

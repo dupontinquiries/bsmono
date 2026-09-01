@@ -190,6 +190,17 @@ impl eframe::App for Feel {
         // line does both because the app holds a `dyn Sink` and does not
         // know which it has.
         let dt_ms = ctx.input(|i| i.stable_dt) * 1000.0;
+        // A steno stroke that didn't pair with its opposite thumb waits out
+        // the pairing window before committing solo — see `steno.rs`'s
+        // `Pending`/`poll_pending` doc comment for why that has to be
+        // polled here (once per frame, key-independent) rather than fired
+        // from a timer the way the GTK build's glib callback does it.
+        if let Some(commit) = crate::steno::poll_pending() {
+            self.emit_text(&commit.text);
+            if let Some(content) = crate::steno::commit_to_microterm(&commit) {
+                self.microterm.set_content(content);
+            }
+        }
         for text in self.service.take_pending() {
             if let Err(e) = self.sink.commit_text(&text) {
                 // Said out loud rather than swallowed: a keyboard that
@@ -501,13 +512,20 @@ impl eframe::App for Feel {
 
                 if let Some(tapped) = crate::microterm::microterm_ui(ui, &mut self.microterm, &c) {
 
-                    // Every commit path goes through the service, not just the
-                    // interesting ones. A host that receives swiped words but
-                    // not typed ones is worse than a host that receives
-                    // nothing: the gap looks like dropped input rather than a
-                    // missing integration.
-                    self.service.commit_text(&tapped);
-                    self.typed.push_str(&tapped);
+                    // Every candidate `microterm_ui` can return today comes
+                    // from the steno suggestion strip (its match arms only
+                    // set `tapped` in the `StenoSuggestions` branch).
+                    // Accepting a candidate must first DELETE the raw
+                    // phonemes already committed as the user stroked (e.g.
+                    // "kat") before inserting the whole word, or the editor
+                    // ends up with both ("katcat") — `accept_word`'s
+                    // `backspaces` count is exactly that many characters,
+                    // matching GTK's `spawn_microterm_bridge` tap callback.
+                    let accepted = crate::steno::engine::global().accept_word(&tapped);
+                    for _ in 0..accepted.backspaces {
+                        self.emit_key("BackSpace");
+                    }
+                    self.emit_text(&accepted.text);
 
                 }
 
@@ -682,6 +700,24 @@ impl eframe::App for Feel {
                                 }
                                 Some(Press::Backspace) => self.emit_key("BackSpace"),
                                 Some(Press::Return) => self.emit_key("Return"),
+                                Some(Press::Steno(button, gesture)) => {
+                                    // Commits verbatim, no auto-space — steno
+                                    // phonemes chain directly into syllables
+                                    // (`k`+`a`+`t` -> `kat`, not `k a t`),
+                                    // matching GTK's
+                                    // `EngineInput::StenoCommit` handling.
+                                    // A `None` here isn't an error: most
+                                    // strokes go pending and commit later,
+                                    // either from the opposite thumb's
+                                    // `feed` call above or from
+                                    // `poll_pending` in `update()`.
+                                    if let Some(commit) = crate::steno::feed(&button, &gesture) {
+                                        self.emit_text(&commit.text);
+                                        if let Some(content) = crate::steno::commit_to_microterm(&commit) {
+                                            self.microterm.set_content(content);
+                                        }
+                                    }
+                                }
                                 Some(Press::Voice) | None => {}
                                 Some(_) => {}
                             }

@@ -83,6 +83,14 @@ pub enum Press {
     Shift,
     SymbolsToggle,
     Voice,
+    /// A steno key's tap or cardinal swipe. Carries the button id
+    /// ("L1"/"L2"/"R1"/"R2") and gesture code ("tap"/"N"/"E"/"S"/"W") —
+    /// see `crate::decode_steno_token`'s doc comment for why the
+    /// committed phoneme text can't carry this identity itself. The
+    /// caller is expected to parse these into
+    /// `steno::engine::{StenoButton, StenoGesture}` and feed the
+    /// engine directly, NOT commit them as text.
+    Steno(String, String),
 }
 
 /// Reserved emit-token prefix for action keys crossing the render layer. `\u{0}` can't occur in
@@ -112,6 +120,9 @@ fn action_emit(action: &KeyAction, text: &str) -> String {
 
 /// Turn a `keyboard_ui` emission back into a typed [`Press`].
 pub fn classify(emit: &str) -> Press {
+    if let Some((button, gesture)) = crate::decode_steno_token(emit) {
+        return Press::Steno(button.to_string(), gesture.to_string());
+    }
     match emit.strip_prefix(ACT) {
         Some("shift") => Press::Shift,
         Some("backspace") => Press::Backspace,
@@ -249,6 +260,9 @@ pub fn to_render(file: &LayoutFile, shift: Shift) -> crate::Layout {
                     match &k.gestures {
                         Some(g) => apply_declared(&mut key, g),
                         None => assign_cardinals(&mut key),
+                    }
+                    if let KeyAction::Steno(button_id) = &k.action {
+                        key.steno_button = Some(button_id.clone());
                     }
                     key
                 })
@@ -510,5 +524,52 @@ mod tests {
         assert_eq!(b.current().name, "en_us_qwerty");
         assert_eq!(b.press(&action_emit(&KeyAction::Backspace, "")), Some(Press::Backspace));
         assert_eq!(b.press(&action_emit(&KeyAction::Space, "")), Some(Press::Text(" ".to_string())));
+    }
+
+    #[test]
+    fn stenotype_layout_marks_its_four_keys_with_steno_button() {
+        let layout = board_layouts::Layout::default_stenotype();
+        let rendered = to_render(&layout, Shift::Off);
+        let steno_keys: Vec<&crate::Key> = rendered.rows[0].keys.iter().collect();
+        assert_eq!(steno_keys.len(), 4, "L1 L2 R1 R2");
+        let ids: Vec<&str> = steno_keys.iter().map(|k| k.steno_button.as_deref().unwrap()).collect();
+        assert_eq!(ids, vec!["L1", "L2", "R1", "R2"]);
+        // Phoneme labels still show for display (the whole point of the
+        // token/label split): tap label is the base phoneme, and the
+        // cardinal directions carry the OTHER phonemes as labels while
+        // their VALUE is a steno token, not the phoneme text.
+        let l1 = &steno_keys[0];
+        assert_eq!(l1.label, "t");
+        assert_eq!(l1.cardinal.len(), 4, "N/E/S/W only — no diagonals declared");
+        for (_, label) in &l1.cardinal {
+            assert_ne!(label, "t", "cardinal labels are the OTHER phonemes, not the tap one");
+        }
+    }
+
+    #[test]
+    fn stenotype_utility_row_keys_are_not_steno_keys() {
+        let layout = board_layouts::Layout::default_stenotype();
+        let rendered = to_render(&layout, Shift::Off);
+        assert!(
+            rendered.rows[1].keys.iter().all(|k| k.steno_button.is_none()),
+            "settings/symbols/space/backspace/return must commit normally"
+        );
+    }
+
+    #[test]
+    fn steno_key_gestures_classify_as_press_steno_not_text() {
+        let layout = board_layouts::Layout::default_stenotype();
+        let rendered = to_render(&layout, Shift::Off);
+        let l1 = &rendered.rows[0].keys[0];
+        // Simulate what `paint_key` would return for each gesture: it
+        // never returns `key.emit`/the cardinal label for a steno key, it
+        // returns `crate::steno_token(button, gesture_code)`.
+        let tap_value = crate::steno_token("L1", "tap");
+        assert_eq!(classify(&tap_value), Press::Steno("L1".to_string(), "tap".to_string()));
+        for (dir, _label) in &l1.cardinal {
+            let code = crate::dir_code(*dir);
+            let value = crate::steno_token("L1", code);
+            assert_eq!(classify(&value), Press::Steno("L1".to_string(), code.to_string()));
+        }
     }
 }

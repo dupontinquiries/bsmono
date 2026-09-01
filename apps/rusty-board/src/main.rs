@@ -14,7 +14,16 @@ mod config;
 mod gestures;
 mod ipc;
 mod keyboard;
-mod layouts;
+// The layout layer moved to crates/board-layouts (see src/lib.rs's
+// identical shim comment) — `main.rs` declares its own module tree
+// separately from lib.rs (it's a second, `mod`-based crate root, not
+// a consumer of the lib target), so it needs the same re-export or
+// every `crate::layouts::` path in src/ui/* breaks. This binary was
+// left broken by the board-layouts extraction (commit ac325d46) until
+// this fix — that refactor's own message flagged it hadn't compile-
+// verified the GTK app for unrelated apt/mirror reasons, and no one
+// caught this gap since.
+use board_layouts as layouts;
 mod llm;
 mod steno;
 mod ui;

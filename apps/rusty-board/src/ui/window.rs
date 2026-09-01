@@ -722,9 +722,6 @@ fn build_vkbd_with_im_callback(
     };
 
     let detected = VirtualKeyboardBackend::detect();
-    if !matches!(detected, VirtualKeyboardBackend::Wayland) {
-        return detected.build();
-    }
 
     let win = window.clone();
     let kb_view_for_cb = keyboard_view.clone();
@@ -1206,6 +1203,29 @@ fn build_vkbd_with_im_callback(
                 },
             );
         });
+
+    // Non-Wayland (X11/noop) fallback: no compositor input-method
+    // protocol exists to drive `cb`, so wire it to the AT-SPI focus
+    // watcher instead — see `compositor::atspi_focus` for what it
+    // covers and does not cover (no surrounding-text/content-type
+    // signal on this path, so `st_cb` and tray-vs-full-keyboard
+    // content-type overrides don't apply here; every focus shows the
+    // full keyboard).
+    if !matches!(detected, VirtualKeyboardBackend::Wayland) {
+        #[cfg(feature = "dbus")]
+        {
+            crate::compositor::atspi_focus::spawn_atspi_focus_watcher(cb);
+        }
+        #[cfg(not(feature = "dbus"))]
+        {
+            let _ = cb;
+            tracing::info!(
+                "Non-Wayland session and no \"dbus\" feature — no AT-SPI \
+                 focus tracking; keyboard must be toggled manually."
+            );
+        }
+        return detected.build();
+    }
 
     match crate::compositor::wayland_backend::try_new(cb, st_cb) {
         Ok(Some(backend)) => {

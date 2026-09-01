@@ -43,5 +43,13 @@ pub mod virtual_keyboard;
 #[cfg(feature = "wayland")]
 pub mod wayland_backend;
 
+// AT-SPI focus watcher for the X11-desktop fallback path (no
+// compositor input-method protocol available). Reuses
+// `InputMethodActiveCallback` from `wayland_backend`, so it only
+// compiles when that type exists, and needs `zbus` (the "dbus"
+// feature) for the AT-SPI D-Bus connection.
+#[cfg(all(feature = "wayland", feature = "dbus"))]
+pub mod atspi_focus;
+
 pub use placement::{configure_window_placement, Placement};
 pub use virtual_keyboard::{VirtualKeyboard, VirtualKeyboardBackend};
