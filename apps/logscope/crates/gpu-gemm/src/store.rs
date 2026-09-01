@@ -981,3 +981,69 @@ mod epoch_tests {
         assert_eq!(flush_get("A"), None);
     }
 }
+
+// ── remembered speculative-drafting acceptance ───────────────────────────────
+//
+// `autospec::decide` takes an `accept_rate` so a model that drafts badly stops
+// being drafted for. That only works if the rate outlives the process, which is
+// what this is. Same file conventions as the autotune cache above, including
+// the epoch in the name: an acceptance measured against one drafter does not
+// describe a different one, so changing `spec::PromptLookup` means bumping this.
+fn spec_accept_file() -> PathBuf { cache_root().join("spec-accept-v1.tsv") }
+
+/// Remembered acceptance for `model` on `adapter`, if it has run before.
+pub fn spec_accept_get(adapter: &str, model: &str) -> Option<f64> {
+    let txt = std::fs::read_to_string(spec_accept_file()).ok()?;
+    for line in txt.lines() {
+        let mut f = line.split('\t');
+        if f.next() == Some(adapter) && f.next() == Some(model) {
+            return f.next().and_then(|v| v.parse::<f64>().ok())
+                .filter(|r| (0.0..=1.0).contains(r));
+        }
+    }
+    None
+}
+
+/// Record it. Keyed by BOTH adapter and model: acceptance is a property of the
+/// text being generated, but the decision it feeds also depends on the machine,
+/// and a rate measured on one is no evidence about the other.
+pub fn spec_accept_put(adapter: &str, model: &str, rate: f64) {
+    if !(0.0..=1.0).contains(&rate) { return; }
+    let _ = ensure_cache_dir();
+    let prev = std::fs::read_to_string(spec_accept_file()).unwrap_or_default();
+    let mut out = String::new();
+    for line in prev.lines() {
+        let mut f = line.split('\t');
+        let same = f.next() == Some(adapter) && f.next() == Some(model);
+        if !same && !line.trim().is_empty() { out.push_str(line); out.push('\n'); }
+    }
+    out.push_str(&format!("{adapter}\t{model}\t{rate:.4}\n"));
+    let _ = std::fs::write(spec_accept_file(), out);
+}
+
+#[cfg(test)]
+mod spec_accept_tests {
+    use super::*;
+
+    #[test]
+    fn a_rate_round_trips_and_is_scoped_to_adapter_and_model() {
+        let a = format!("spec-test-adapter-{}", std::process::id());
+        assert!(spec_accept_get(&a, "m.gguf").is_none(), "never measured is None, not a default");
+        spec_accept_put(&a, "m.gguf", 0.62);
+        assert_eq!(spec_accept_get(&a, "m.gguf"), Some(0.62));
+        // A different model on the same box is a different question.
+        assert!(spec_accept_get(&a, "other.gguf").is_none());
+        // Rewriting replaces rather than appends, or a re-measure never lands.
+        spec_accept_put(&a, "m.gguf", 0.11);
+        assert_eq!(spec_accept_get(&a, "m.gguf"), Some(0.11));
+    }
+
+    #[test]
+    fn an_impossible_rate_is_refused_rather_than_stored() {
+        let a = format!("spec-bad-{}", std::process::id());
+        spec_accept_put(&a, "m", 1.5);
+        spec_accept_put(&a, "m", -0.2);
+        assert!(spec_accept_get(&a, "m").is_none(),
+            "a rate outside [0,1] is a bug upstream; storing it would poison the decision");
+    }
+}

@@ -1097,8 +1097,17 @@ names which)",
             // LOGSCOPE_SPEC_DRAFT=lookup asks for the model-free drafter (c4-838): it finds the
             // current suffix earlier in the context and proposes what followed. No second
             // checkpoint to download, load or keep resident, and the same verifier c4-837 proved
-            // correct by self-draft — so output is identical to plain decoding, only the speed
-            // differs. Suited to repository reading, where identifiers and paths repeat; it should
+            // correct by self-draft — so at TEMPERATURE 0 output is bit-identical to plain
+            // decoding and only the speed differs.
+            //
+            // The temperature qualifier is not pedantry and this comment lacked it while
+            // perfverdict.rs carried it — two descriptions of one verifier, one of them wrong.
+            // `spec::accepted_run` is greedy: it accepts while the draft equals the verifier's
+            // own token and commits the verifier's tokens. That is identical output only where
+            // the verifier is deterministic. Above temperature 0 it samples, and a speculative
+            // run consumes randomness in a different order — still a valid draw from the same
+            // distribution, but not the SAME draw, so a prompt stops reproducing. See
+            // gpu_kernels::autospec, which is why auto-enabling is gated on temperature 0. Suited to repository reading, where identifiers and paths repeat; it should
             // mostly whiff on prose, which costs a verification slot and nothing else.
             let want_lookup = std::env::var("LOGSCOPE_SPEC_DRAFT").as_deref() == Ok("lookup");
             if want_lookup && self.draft.is_none() {

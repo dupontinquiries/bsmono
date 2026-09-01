@@ -68,6 +68,8 @@ pub mod iq2xxs;
 pub const BUILD: &str = env!("LOGSCOPE_BUILD");
 
 pub mod spec;
+// Whether to USE spec.rs, decided from measurement instead of an env flag.
+pub mod autospec;
 pub mod roofline;
 pub mod mxfp4;
 pub mod ctxwin;
