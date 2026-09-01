@@ -2037,6 +2037,7 @@ mod tests {
 
     #[test]
     fn cardinal_grid_words_has_5_rows_5_cols_each_summing_to_5() {
+        let _guard = crate::code_mode::tests::lock();
         crate::code_mode::set(crate::code_mode::CodeMode::Prose);
         let l = Layout::default_cardinal_grid_words();
         assert_eq!(l.rows.len(), 5, "letter rows + utility + action = 5");
@@ -2058,6 +2059,7 @@ mod tests {
         // already learned default_cardinal_grid's a/n/i/t/s/c/h/r
         // muscle memory carry it directly into the words layout.
         // If the letter cells diverge, that promise breaks.
+        let _guard = crate::code_mode::tests::lock();
         crate::code_mode::set(crate::code_mode::CodeMode::Prose);
         let words = Layout::default_cardinal_grid_words();
         let plain = Layout::default_cardinal_grid();
@@ -2079,6 +2081,7 @@ mod tests {
 
     #[test]
     fn cardinal_grid_words_has_lang_cycle_button_in_bottom_row() {
+        let _guard = crate::code_mode::tests::lock();
         crate::code_mode::set(crate::code_mode::CodeMode::Prose);
         let l = Layout::default_cardinal_grid_words();
         let bottom = &l.rows[4];
@@ -2096,6 +2099,7 @@ mod tests {
     #[test]
     fn cardinal_grid_words_cycle_button_label_follows_mode() {
         use crate::code_mode::{set, CodeMode};
+        let _guard = crate::code_mode::tests::lock();
         for (mode, expected_label) in [
             (CodeMode::Prose, "EN"),
             (CodeMode::C, "C"),
@@ -2125,6 +2129,7 @@ mod tests {
         // cluster: tap "the") and verify the Literal emission has a
         // trailing space so chaining works without manual space taps.
         use crate::code_mode::{set, CodeMode};
+        let _guard = crate::code_mode::tests::lock();
         set(CodeMode::Prose);
         let l = Layout::default_cardinal_grid_words();
         let articles = &l.rows[0].keys[3];
@@ -2147,6 +2152,7 @@ mod tests {
         // emissions on the word column. Word column starts at index 3
         // (rows 0/1/2 keep columns 3 and 4 as word/template cells).
         use crate::code_mode::{set, CodeMode};
+        let _guard = crate::code_mode::tests::lock();
 
         set(CodeMode::Prose);
         let prose = Layout::default_cardinal_grid_words();
