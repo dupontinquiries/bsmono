@@ -12731,10 +12731,27 @@ attn_k_b+attn_v_b), and attn_output closes the block", missing.join(", "))
                 Some(t) => format!("{t} (inactive)"),
                 None => "none".to_string(),
             };
-            let rot = rope_vals.len() * 2;
-            eprintln!("wgpu-engine: rope — base {base}, {rot} of {head_dim} dims rotate, {} pairing, \
+            // Report the AUTHORITATIVE rotated-dim count — the one stored in
+            // `self.rope_dims` from `{pfx}.rope.dimension_count` — not the
+            // length of the precomputed table.
+            //
+            // These are different numbers and this line printed the wrong one.
+            // On Qwen3.8-27B the loader correctly said "PARTIAL RoPE — 64 of
+            // 256 head dims rotate (rope.dimension_count)" and then this line
+            // said "256 of 256 dims rotate" a few lines later, in the same
+            // run, about the same model. The table is sized for the full head
+            // dim while only the first `rope_dims` actually rotate, so
+            // `rope_vals.len() * 2` measures the buffer, not the behaviour.
+            // The math was right both times; the diagnostic contradicted
+            // itself, which is worse than saying nothing — anyone debugging a
+            // partial-RoPE model had to decide which of two engine lines to
+            // believe.
+            let rot = self.rope_dims.load(std::sync::atomic::Ordering::Relaxed) as usize;
+            let table = rope_vals.len() * 2;
+            eprintln!("wgpu-engine: rope — base {base}, {rot} of {head_dim} dims rotate{}, {} pairing, \
 scaling {scaling}, mscale {mscale:.4}. All of this comes from the GGUF: there is no rope env flag, \
 and the autotuner (decode/GEMM tiles, submit batch) does not touch it.",
+                if table != rot { format!(" (table sized for {table})") } else { String::new() },
                 if acfg.rope_interleaved { "interleaved (GPT-J)" } else { "NEOX split-half" });
         }
         self.rope_mscale.store(mscale.to_bits(), std::sync::atomic::Ordering::Relaxed);
@@ -17448,7 +17465,25 @@ built with raw new_cache()? use new_cache_for(&model, ..) so hybrid models get p
     /// the "warm" signal a scheduler can read to know an instance is ready to serve.
     pub fn prewarm(&self, m: &Model) -> usize {
         self.activate_model(m);
-        let c = self.new_cache(m.n_layers, 4, m.kv_dim());
+        // `new_cache_for`, NOT the raw `new_cache`. The raw one allocates only
+        // the dense KV slots; a hybrid model's recurrent layers get no state
+        // slot, and `decode_step_full` then panics by name the moment it
+        // reaches one — which is exactly what the panic message it raises
+        // tells you to do ("use new_cache_for(&model, ..) so hybrid models get
+        // per-layer states").
+        //
+        // It went unnoticed because prewarm is only reached on a model that
+        // HAS recurrent layers, and until Qwen3.8-27B (48 of 65 blocks Gated
+        // DeltaNet) every model exercised here was dense, where the two
+        // constructors agree. The crash therefore landed inside
+        // `Engine::load` on the inference thread — i.e. the model appeared to
+        // load and then the worker died, rather than a load error being
+        // reported.
+        //
+        // `new_cache_for` also attaches the MLA cache, so the same call fixes
+        // prewarm for MLA checkpoints (DeepSeek-V2/V3 family), which would
+        // have hit the equivalent dense-arm fallthrough.
+        let c = self.new_cache_for(m, 4);
         let _ = self.prefill_batched(m, &c, &[0u32, 0]);
         let _ = self.decode_step(m, &c, 0, 2);
         self.pipeline_count()
