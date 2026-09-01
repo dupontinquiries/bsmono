@@ -11,3 +11,17 @@ description = "Shared bo-suite modules used by both bo-controller and bo-mux (au
 # the start. Zero-dependency itself (std + f32 math, one path dep on
 # core-kit), so this doesn't pull anything heavy into a std-only crate.
 audio-kit = { path = "../../../shared/audio-kit" }
+
+# realtime_mixer.rs is std-only (biquad math). looper.rs needs these three
+# for the soundscape loop-finder's WAV read (hound) and legacy OggOpus
+# encode (opus + ogg) — moved here verbatim from bo-controller, where they
+# were already Qt-free, so bo-media's media_worker (offline mixer/loop
+# commands) and bo-controller's live mixer can share one copy instead of
+# bo-media depending back on bo-controller.
+hound = "3"
+opus = "0.3"
+ogg = "0.9"
+
+# realtime_mixer::MixerParams and looper::LoopResult derive Serialize
+# (the QML/JSON boundary read/writes these), needed now that both live here.
+serde = { version = "1", features = ["derive"] }

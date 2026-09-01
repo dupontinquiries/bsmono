@@ -34,7 +34,9 @@ use std::process::Command as ProcessCommand;
 use std::path::{Path, PathBuf};
 
 // The media library subsystem (SQLite catalog + scanner + worker thread).
-mod media;
+// media/ moved to the bo-media crate (Qt-free, shared with bo-suite-egui).
+// Alias keeps every `media::Foo` call site in this file unchanged.
+use bo_media as media;
 mod mux_bridge;
 mod noise_adaptive_gain;
 mod playback_modes;
@@ -98,8 +100,12 @@ mod device_driver;
 mod sim;
 #[allow(dead_code)]   // consumed by build.rs via include!, not by main
 mod qml_lint;
-mod looper;
-mod realtime_mixer;
+// looper / realtime_mixer moved to bo-core (shared, Qt-free) so bo-media's
+// worker (offline mixer/loop-finder commands) doesn't have to depend back
+// on bo-controller. `use` aliases below keep every existing `looper::` /
+// `realtime_mixer::` call site in this file unchanged.
+pub(crate) use bo_core::looper;
+pub(crate) use bo_core::realtime_mixer;
 mod kde_tools;
 mod mpris_listener;
 mod stem_split;

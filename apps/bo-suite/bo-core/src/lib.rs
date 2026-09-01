@@ -4,3 +4,5 @@ pub mod audio_features;
 pub mod backup_beeper;
 pub mod music_masker;
 pub mod pattern_learner;
+pub mod realtime_mixer;
+pub mod looper;

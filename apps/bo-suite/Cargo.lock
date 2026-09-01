@@ -216,28 +216,26 @@ dependencies = [
  "audiopus",
  "bliss-audio",
  "bo-core",
+ "bo-media",
+ "bo-mux",
  "cstr",
  "dbus",
  "dirs",
  "hound",
  "include_dir",
  "libc",
- "lofty",
  "mdns-sd",
  "ogg",
  "once_cell",
  "opus",
  "qmetaobject",
- "regex",
  "reqwest",
- "rusqlite",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
  "urlencoding",
- "walkdir",
 ]
 
 [[package]]
@@ -245,6 +243,26 @@ name = "bo-core"
 version = "0.1.0"
 dependencies = [
  "audio-kit",
+ "hound",
+ "ogg",
+ "opus",
+ "serde",
+]
+
+[[package]]
+name = "bo-media"
+version = "0.1.0"
+dependencies = [
+ "bliss-audio",
+ "bo-core",
+ "lofty",
+ "once_cell",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "walkdir",
 ]
 
 [[package]]
