@@ -397,8 +397,14 @@ impl LodBands {
     }
 
     /// `UNENDLICH_LOD_FIDELITY` multiplier (default 1.0 = baseline bands).
-    /// Cached. Values <0.5 or >3.0 are clamped inside the band function.
+    /// The env var is read once and cached; `constants::lod_fidelity_override`
+    /// is checked on every call (cheap atomic load) so `sim::frame_pacer` can
+    /// adjust fidelity live without a restart, same pattern as render distance.
+    /// Values <0.5 or >3.0 are clamped inside the band function.
     fn fidelity_env() -> f32 {
+        if let Some(v) = crate::constants::lod_fidelity_override() {
+            return v;
+        }
         static CACHED: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
         *CACHED.get_or_init(|| {
             std::env::var("UNENDLICH_LOD_FIDELITY")

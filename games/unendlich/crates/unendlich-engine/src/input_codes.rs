@@ -251,7 +251,7 @@ pub use glfw_conv::{input_event_from_glfw, keycode_from_glfw};
 // =============================================================================
 // winit -> neutral (new backend). Gated on the winit dep.
 // =============================================================================
-#[cfg(feature = "winit")]
+#[cfg(feature = "window-winit")]
 mod winit_conv {
     use super::*;
     use winit::event::{ElementState, MouseButton as WMouse};
@@ -328,8 +328,60 @@ mod winit_conv {
         })
     }
 }
-#[cfg(feature = "winit")]
+#[cfg(feature = "window-winit")]
 pub use winit_conv::{key_action as winit_key_action, keycode_from_winit};
+
+#[cfg(all(test, feature = "window-winit"))]
+mod winit_conv_tests {
+    use super::*;
+    use winit::event::{ElementState, MouseButton as WMouse};
+    use winit::keyboard::{KeyCode as WKey, PhysicalKey};
+
+    // This module compiled for the first time this session (the feature
+    // gating it didn't exist before -- see the Cargo.toml comment on the
+    // `winit` dependency). These tests exist because "never compiled" also
+    // means "never actually checked against real winit types" -- confirming
+    // the mapping now, not just that it type-checks.
+
+    #[test]
+    fn key_action_maps_press_release_repeat() {
+        assert_eq!(winit_key_action(ElementState::Pressed, false), KeyAction::Press);
+        assert_eq!(winit_key_action(ElementState::Pressed, true), KeyAction::Repeat);
+        assert_eq!(winit_key_action(ElementState::Released, false), KeyAction::Release);
+        // Released+repeat is a nonsensical combo winit shouldn't send, but
+        // must still return something sane (not panic) -- Release wins,
+        // matching the match arms' priority order.
+        assert_eq!(winit_key_action(ElementState::Released, true), KeyAction::Release);
+    }
+
+    #[test]
+    fn mouse_button_roundtrips_known_variants() {
+        assert_eq!(MouseBtn::from(WMouse::Left), MouseBtn::Left);
+        assert_eq!(MouseBtn::from(WMouse::Right), MouseBtn::Right);
+        assert_eq!(MouseBtn::from(WMouse::Middle), MouseBtn::Middle);
+        assert_eq!(MouseBtn::from(WMouse::Back), MouseBtn::Back);
+        assert_eq!(MouseBtn::from(WMouse::Forward), MouseBtn::Forward);
+        assert_eq!(MouseBtn::from(WMouse::Other(7)), MouseBtn::Other(7));
+    }
+
+    #[test]
+    fn keycode_maps_letters_digits_and_arrows() {
+        assert_eq!(keycode_from_winit(PhysicalKey::Code(WKey::KeyW)), Some(Keycode::W));
+        assert_eq!(keycode_from_winit(PhysicalKey::Code(WKey::Digit0)), Some(Keycode::Num0));
+        assert_eq!(keycode_from_winit(PhysicalKey::Code(WKey::ArrowUp)), Some(Keycode::Up));
+        assert_eq!(keycode_from_winit(PhysicalKey::Code(WKey::Escape)), Some(Keycode::Escape));
+        assert_eq!(keycode_from_winit(PhysicalKey::Code(WKey::Space)), Some(Keycode::Space));
+    }
+
+    #[test]
+    fn keycode_unidentified_and_unmapped_are_none() {
+        assert_eq!(keycode_from_winit(PhysicalKey::Unidentified(
+            winit::keyboard::NativeKeyCode::Unidentified)), None);
+        // A real winit KeyCode this module doesn't model (media keys) should
+        // fall through to None, not panic or silently mismap to something.
+        assert_eq!(keycode_from_winit(PhysicalKey::Code(WKey::MediaPlayPause)), None);
+    }
+}
 
 #[cfg(test)]
 mod tests {

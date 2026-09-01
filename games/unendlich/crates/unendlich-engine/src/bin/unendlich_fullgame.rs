@@ -2795,6 +2795,98 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         log::info!("adaptive_render_distance: ENABLED — shrink>{:.1}ms grow<{:.1}ms min={} (UNENDLICH_ADAPTIVE_RENDER_DISTANCE)",
             adaptive_rd_shrink_ms, adaptive_rd_grow_ms, adaptive_rd_min);
     }
+
+    // `sim::frame_pacer` was written (see its module doc) to drive the
+    // "previously un-driven" shadow-stride and LOD-fidelity knobs from a p90
+    // of recent frame times, with multi-step degradation for severe overshoot
+    // and hysteresis to avoid oscillation. It shipped fully tested but was
+    // never called from either binary — only from a microbenchmark harness
+    // with an empty history — so none of that tuning has been affecting real
+    // frames. This wires it up for shadow_chunk_stride and lod_fidelity:
+    // froxel_steps has no corresponding real renderer setting anywhere in the
+    // codebase (frame_pacer's Knobs invented it without one existing), so it's
+    // left unapplied rather than fabricating a knob I don't understand the
+    // effect of. max_uploads already has its own live controller
+    // (adaptive_upload above), so `k.max_uploads` is computed by `adjust` but
+    // intentionally left unapplied here too, to avoid two controllers fighting
+    // over the same knob.
+    let frame_pacer_enabled = std::env::var("UNENDLICH_FRAME_PACER")
+        .map(|v| v != "0" && !v.is_empty()).unwrap_or(true); // default ON, bounded knob
+    // Runtime-checked (2026-09-01, xvfb+lavapipe soak, UNENDLICH_AUTOPLAY=1): fired
+    // correctly under extreme sustained overshoot (lavapipe frames run 1-2.5s vs a
+    // 16.67ms target) — shadow_stride climbed 1→5→8 and lod_fidelity dropped
+    // 1.00→0.60→0.40 over two adjustment cycles, then held at the configured clamps
+    // with no further log spam and no oscillation. No panics over 90s. This confirms
+    // the wiring and clamping are correct; it does NOT confirm the tuning (thresholds,
+    // step sizes) is good on real frame-time distributions — lavapipe's frame times
+    // bear no resemblance to real hardware, so that still needs an actual GPU.
+    let mut frame_pacer_hist = unendlich_engine::sim::frame_pacer::FrameHistory {
+        recent_ms: [0.0f32; 32],
+        len: 0,
+    };
+    let mut frame_pacer_knobs = unendlich_engine::sim::frame_pacer::Knobs {
+        shadow_stride: 1,
+        lod_fidelity: 1.0,
+        max_uploads: max_uploads_per_frame.clamp(1, 255) as u8,
+        froxel_steps: 16,
+    };
+    let frame_pacer_limits = unendlich_engine::sim::frame_pacer::Limits {
+        stride: (1, 8), // matches set_shadow_chunk_stride's own clamp
+        fidelity: (0.4, 1.0),
+        uploads: (1, 255),
+        froxel: (4, 16),
+    };
+    let mut frame_pacer_cursor: usize = 0; // next write slot, wraps independent of `len`
+    let mut frame_pacer_last = std::time::Instant::now();
+    if frame_pacer_enabled {
+        log::info!("frame_pacer: ENABLED — driving shadow_chunk_stride from p90 frame time (UNENDLICH_FRAME_PACER=0 to disable)");
+    }
+    // Known interaction, not fixed: `adaptive_rd` (above) and `frame_pacer`
+    // (below) both react to the same frame-time signal on the same 200ms
+    // cadence but don't know about each other. A sustained slow patch can
+    // trigger both in the same window — render distance shrinks AND shadow
+    // stride/lod fidelity degrade together, rather than one picking up the
+    // slack the other didn't need to take. Each recovers independently via
+    // its own hysteresis, so this should self-correct over a few frames
+    // rather than compound, but it's untested on real hardware and could
+    // read as a harsher-than-necessary quality dip on a single spike. If
+    // that's visible in practice, the fix is sequencing (e.g. only let
+    // frame_pacer degrade once adaptive_rd is already at its floor), not
+    // disabling either system.
+    //
+    // Confirmed happening, not just theoretical: in the 2026-09-01
+    // xvfb+lavapipe soak, `[adaptive_rd] frame 4910ms -> render-distance cap 4`
+    // and `[frame_pacer] shadow_stride 1 -> 5` / `lod_fidelity 1.00 -> 0.60`
+    // all logged in the same second (03:47:17) on the same bad frame. Both
+    // then held at their clamps for the rest of the run without oscillating
+    // — lavapipe never recovered below the grow threshold (it's uniformly
+    // slow throughout, not spiky), so this soak confirms the simultaneous
+    // trigger happens and doesn't misbehave once pinned, but says nothing
+    // about whether independent RECOVERY (both climbing back up after a
+    // transient spike, on real variable frame times) is well-behaved.
+
+    // `sim::submit_schedule` is the OTHER dead-but-tested module (see the
+    // frame_pacer comment above for how that happened). Its real inputs
+    // (gpu_ms, cpu_ms, wait_ms) exist now (WorldRenderer::last_{gpu,cpu}_frame_ms
+    // / last_wait_fences_ms), so this feeds them in and logs what plan()
+    // WOULD decide — submit-skip, inflight up/down — WITHOUT acting on it.
+    //
+    // Runtime-checked (2026-09-01, xvfb+lavapipe soak, UNENDLICH_AUTOPLAY=1):
+    // last_gpu_frame_ms()/last_cpu_frame_ms() exactly match the engine's own
+    // trusted per-second diagnostic log (e.g. logged `gpu: ... total=1349.14ms`
+    // vs this code's `gpu=1349.14ms` the same tick) — the accessors are
+    // numerically correct, not just plausible. No panics over a 90s soak.
+    // Still NOT acted on: lavapipe has no real present/fence-wait behavior
+    // (wait_ms reads ~0 throughout, frames take 1-2.5s each under software
+    // rendering), so this soak validates the plumbing, not whether plan()'s
+    // decisions are good on real GPU frame pacing. That still needs hardware.
+    let submit_schedule_log = std::env::var("UNENDLICH_SUBMIT_SCHEDULE_LOG")
+        .map(|v| v != "0" && !v.is_empty()).unwrap_or(false); // opt-in: pure diagnostic noise otherwise
+    let mut submit_schedule_hist: Vec<unendlich_engine::sim::submit_schedule::FrameStats> = Vec::with_capacity(8);
+    let mut submit_schedule_last = std::time::Instant::now();
+    if submit_schedule_log {
+        log::info!("submit_schedule: observation-only logging ENABLED (not driving anything live)");
+    }
     // r476: seed the Performance-page levers from their env vars so the env still
     // works as the initial value and the in-game controls reflect it. After this
     // the UI owns them live (the controller reads renderer.ui_adaptive_rd; the
@@ -4691,6 +4783,67 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // too slow to react when the frame rate has already collapsed).
             let effective_rd = renderer.ui_render_distance.min(adaptive_rd_cap).max(2);
             unendlich_engine::constants::set_render_distance_override(effective_rd);
+        }
+
+        // frame_pacer: push this frame's time into the ring every frame (cheap),
+        // but only run `adjust` + apply on a 200ms cadence like adaptive_rd above
+        // — p90 over a handful of stale samples isn't informative frame-to-frame.
+        if frame_pacer_enabled {
+            frame_pacer_hist.recent_ms[frame_pacer_cursor] = dt_ms as f32;
+            frame_pacer_cursor = (frame_pacer_cursor + 1) % 32;
+            frame_pacer_hist.len = (frame_pacer_hist.len + 1).min(32);
+            if frame_pacer_last.elapsed() >= std::time::Duration::from_millis(200) {
+                frame_pacer_last = now;
+                let new_knobs = unendlich_engine::sim::frame_pacer::adjust(
+                    &frame_pacer_hist,
+                    frame_target_ms as f32,
+                    frame_pacer_knobs,
+                    frame_pacer_limits,
+                );
+                if new_knobs.shadow_stride != frame_pacer_knobs.shadow_stride {
+                    log::info!("[frame_pacer] shadow_stride {} -> {} (p90-driven)",
+                        frame_pacer_knobs.shadow_stride, new_knobs.shadow_stride);
+                    renderer.set_shadow_chunk_stride(new_knobs.shadow_stride as u32);
+                }
+                if (new_knobs.lod_fidelity - frame_pacer_knobs.lod_fidelity).abs() > 1e-6 {
+                    log::info!("[frame_pacer] lod_fidelity {:.2} -> {:.2} (p90-driven)",
+                        frame_pacer_knobs.lod_fidelity, new_knobs.lod_fidelity);
+                    unendlich_engine::constants::set_lod_fidelity_override(new_knobs.lod_fidelity);
+                }
+                frame_pacer_knobs = new_knobs;
+            }
+        }
+
+        // submit_schedule: observation-only (see setup comment above). Push
+        // real per-frame stats every frame; log plan()'s hypothetical
+        // decision on a 500ms cadence (slower than frame_pacer's 200ms —
+        // this is diagnostic, not a control loop, no need to react fast).
+        if submit_schedule_log {
+            submit_schedule_hist.push(unendlich_engine::sim::submit_schedule::FrameStats {
+                gpu_ms: renderer.last_gpu_frame_ms() as f32,
+                cpu_ms: renderer.last_cpu_frame_ms().unwrap_or(0.0) as f32,
+                wait_ms: renderer.last_wait_fences_ms() as f32,
+            });
+            if submit_schedule_hist.len() > 8 {
+                submit_schedule_hist.remove(0);
+            }
+            if submit_schedule_last.elapsed() >= std::time::Duration::from_millis(500) {
+                submit_schedule_last = now;
+                let plan = unendlich_engine::sim::submit_schedule::plan(
+                    &submit_schedule_hist,
+                    renderer.frames_in_flight() as u8,
+                    frame_target_ms as f32,
+                );
+                log::info!(
+                    "[submit_schedule/observe] would-plan: submit={} max_inflight={} coalesce={} \
+                     (cur_inflight={}, last gpu={:.2}ms cpu={:.2}ms wait={:.2}ms)",
+                    plan.submit, plan.max_inflight, plan.coalesce,
+                    renderer.frames_in_flight(),
+                    renderer.last_gpu_frame_ms(),
+                    renderer.last_cpu_frame_ms().unwrap_or(-1.0),
+                    renderer.last_wait_fences_ms(),
+                );
+            }
         }
         // rNNN: WEATHER SIM readout — every ~2s, sample the physical weather for
         // the player's column and log it (no gameplay/render side effects).

@@ -91,6 +91,35 @@ pub fn octree_tile_enabled() -> u32 {
     OCTREE_TILE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Live LOD-fidelity override, stored as `(value * 1000.0).round() as u32`
+/// (atomics don't do f32 directly). 0 = unset (fall back to
+/// `UNENDLICH_LOD_FIDELITY` / the 1.0 default). Lets `sim::frame_pacer`
+/// degrade/restore LOD fidelity at runtime the same way `RENDER_DISTANCE_OVERRIDE`
+/// lets `adaptive_rd` drive render distance.
+pub static LOD_FIDELITY_OVERRIDE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Set the live LOD-fidelity override. `v <= 0.0` clears it (falls back to
+/// env/default); otherwise clamped to `[0.1, 4.0]` before encoding.
+pub fn set_lod_fidelity_override(v: f32) {
+    let encoded = if v.is_finite() && v > 0.0 {
+        (v.clamp(0.1, 4.0) * 1000.0).round() as u32
+    } else {
+        0
+    };
+    LOD_FIDELITY_OVERRIDE.store(encoded, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Decoded live LOD-fidelity override, or `None` if unset.
+pub fn lod_fidelity_override() -> Option<f32> {
+    let encoded = LOD_FIDELITY_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if encoded == 0 {
+        None
+    } else {
+        Some(encoded as f32 / 1000.0)
+    }
+}
+
 pub fn runtime_render_distance() -> i32 {
     let ovr = RENDER_DISTANCE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
     if ovr > 0 {

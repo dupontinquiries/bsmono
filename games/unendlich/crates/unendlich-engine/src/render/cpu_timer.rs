@@ -141,6 +141,17 @@ pub struct CpuTimer {
     /// `flush_log`.
     window_us: BTreeMap<&'static str, u64>,
     window_frames: u32,
+    /// Sum of all zone elapsed-times marked so far THIS frame (since the
+    /// last `begin_frame`). Reset there, accumulated in `mark`, snapshotted
+    /// into `last_frame_total_us` by `end_frame`.
+    current_frame_us: u64,
+    /// This render thread's total CPU time for the most recently completed
+    /// frame (sum of every zone marked between `begin_frame`/`end_frame`),
+    /// in microseconds. `None` until the first `end_frame`. Unlike
+    /// `window_us`/`lifetime`, this is a single-frame value, not an
+    /// aggregate — for callers (e.g. `sim::submit_schedule`) that need
+    /// "how long did the CPU spend this frame" rather than a mean.
+    last_frame_total_us: Option<u64>,
 }
 
 impl CpuTimer {
@@ -150,6 +161,8 @@ impl CpuTimer {
             lifetime: BTreeMap::new(),
             window_us: BTreeMap::new(),
             window_frames: 0,
+            current_frame_us: 0,
+            last_frame_total_us: None,
         }
     }
 
@@ -166,6 +179,7 @@ impl CpuTimer {
     /// frame, before any `mark`.
     pub fn begin_frame(&mut self) {
         self.last = Some(Instant::now());
+        self.current_frame_us = 0;
     }
 
     /// Record the elapsed time since the previous mark (or
@@ -181,12 +195,23 @@ impl CpuTimer {
         let label = zone.name();
         *self.window_us.entry(label).or_insert(0) += elapsed_us;
         self.lifetime.entry(label).or_default().push(elapsed_us);
+        self.current_frame_us = self.current_frame_us.saturating_add(elapsed_us);
     }
 
     /// Mark frame completion. Increments the per-window frame
-    /// counter; doesn't itself record any zone.
+    /// counter, and snapshots this frame's total into
+    /// `last_frame_total_ms()`. Doesn't itself record any zone.
     pub fn end_frame(&mut self) {
         self.window_frames += 1;
+        self.last_frame_total_us = Some(self.current_frame_us);
+    }
+
+    /// This frame's total marked CPU time (sum of all zones since the
+    /// last `begin_frame`), in milliseconds. `None` until the first
+    /// `end_frame` has run. A single-frame value, not a mean — see
+    /// `last_frame_total_us` field docs.
+    pub fn last_frame_total_ms(&self) -> Option<f64> {
+        self.last_frame_total_us.map(|us| us as f64 / 1000.0)
     }
 
     /// Format and reset the per-zone window stats. Returns a one-
@@ -329,6 +354,33 @@ mod tests {
         let mut t = CpuTimer::new();
         t.mark(CpuZone::WaitFences); // no panic, no log entry
         assert!(t.lifetime.is_empty());
+    }
+
+    /// `last_frame_total_ms` is `None` before the first `end_frame`.
+    #[test]
+    fn last_frame_total_none_before_first_frame() {
+        let t = CpuTimer::new();
+        assert_eq!(t.last_frame_total_ms(), None);
+    }
+
+    /// `last_frame_total_ms` sums every zone marked in the frame, not
+    /// just one — and resets to 0 for a frame with no marks at all
+    /// (e.g. every zone this frame was skipped for some reason).
+    #[test]
+    fn last_frame_total_sums_all_marks_and_resets_next_frame() {
+        let mut t = CpuTimer::new();
+        t.begin_frame();
+        t.mark(CpuZone::WaitFences);
+        t.mark(CpuZone::AcquireImage);
+        t.end_frame();
+        let first = t.last_frame_total_ms().expect("should be Some after end_frame");
+        assert!(first >= 0.0);
+
+        // A frame with no marks should report ~0, not carry over the
+        // previous frame's total.
+        t.begin_frame();
+        t.end_frame();
+        assert_eq!(t.last_frame_total_ms(), Some(0.0));
     }
 
     /// Basic flow: begin, mark each zone, end. Each zone gets one

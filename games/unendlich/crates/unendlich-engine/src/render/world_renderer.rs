@@ -731,7 +731,10 @@ pub struct WorldRenderer {
     /// Default 1 = render all chunks every frame (no temporal
     /// amortization). > 1 = render only 1/N chunks per frame and
     /// rely on the shadow map preserving previous frames' depth.
-    shadow_chunk_stride: u32,
+    ///
+    /// `pub(crate)` (was private) so `sim::frame_pacer` can drive it live
+    /// from the fullgame binary's frame loop — see `set_shadow_chunk_stride`.
+    pub(crate) shadow_chunk_stride: u32,
 
     /// v0.24.NEXT (shadow-cache): when enabled, skip the entire shadow render
     /// pass on frames where the cascade view-projection is bit-identical to the
@@ -892,6 +895,14 @@ pub struct WorldRenderer {
     /// first frame completes wait_for_fences.
     last_wait_fences_ms: f64,
 
+    /// This frame's total GPU time (sum of the "total" zone from
+    /// `gpu_timer.take_last_frame()`), in milliseconds. Populated
+    /// unconditionally alongside the existing gpu_spike-event check below
+    /// (which only fires above a 100ms threshold) so a real per-frame value
+    /// is available to callers like `sim::submit_schedule` without waiting
+    /// for a spike. 0.0 until the first frame's GPU query results land.
+    last_gpu_total_ms: f64,
+
     /// Resources awaiting deferred destruction (chunks evicted since last
     /// frame). Drained at the top of each frame.
     pending_destroy: Vec<PendingDestroy>,
@@ -1044,6 +1055,14 @@ fn cache_lru_key(
 }
 
 impl WorldRenderer {
+    /// Live-adjust the shadow-cull temporal stride (see `shadow_chunk_stride`
+    /// docs). Clamped to `[1, 8]` — 8 is already well past where the shadow
+    /// map staleness becomes visible, so this bounds `sim::frame_pacer`
+    /// output regardless of what limits its caller passes.
+    pub fn set_shadow_chunk_stride(&mut self, stride: u32) {
+        self.shadow_chunk_stride = stride.clamp(1, 8);
+    }
+
     pub fn new(
         ctx: &VulkanContext,
         framebuffer_size: (u32, u32),
@@ -1729,6 +1748,7 @@ impl WorldRenderer {
             cached_frustum: Frustum { planes: [[0.0; 4]; 6] },
             cached_frustum_key: None,
             last_wait_fences_ms: 0.0,
+            last_gpu_total_ms: 0.0,
             pending_destroy: Vec::new(),
             mesh_cache: HashMap::new(),
             mesh_cache_capacity: std::env::var("UNENDLICH_MESH_CACHE_SIZE")
@@ -2712,6 +2732,32 @@ impl WorldRenderer {
     /// initialized at 0.0 plus the dead band logic.
     pub fn last_wait_fences_ms(&self) -> f64 {
         self.last_wait_fences_ms
+    }
+
+    /// This render thread's total marked CPU time for the most recently
+    /// completed frame (sum of wait_fences/acquire/record/submit/present
+    /// zones), in milliseconds. `None` until the first frame completes.
+    /// A single-frame value, not a windowed mean — see `CpuTimer` docs.
+    pub fn last_cpu_frame_ms(&self) -> Option<f64> {
+        self.cpu_timer.last_frame_total_ms()
+    }
+
+    /// This frame's total GPU time, in milliseconds. See
+    /// `last_gpu_total_ms` field docs. 0.0 before the first frame's query
+    /// results have landed (real GPU frames are never exactly 0.0, so
+    /// callers can treat 0.0 as "not ready yet" alongside checking
+    /// `last_cpu_frame_ms().is_none()`).
+    pub fn last_gpu_frame_ms(&self) -> f64 {
+        self.last_gpu_total_ms
+    }
+
+    /// Current frames-in-flight depth (see `frames_in_flight` field docs).
+    /// Read-only for now — no live setter exists yet, since changing this
+    /// at runtime means resizing `self.frames` (Vulkan resource lifetime,
+    /// not just a number) and hasn't been done. `sim::submit_schedule`
+    /// needs this as the `cur_inflight` input to `plan()`.
+    pub fn frames_in_flight(&self) -> usize {
+        self.frames_in_flight
     }
 
     /// Format and reset the per-pass GPU timing window. Call once
@@ -5361,6 +5407,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
         // so this code path doesn't fire twice for the same frame.
         if let Some((collected_idx, per_zone_us)) = self.gpu_timer.take_last_frame() {
             if let Some(&total_us) = per_zone_us.get("total") {
+                self.last_gpu_total_ms = total_us as f64 / 1000.0;
                 if total_us > 100_000 {
                     unendlich_shared::events::record(
                         "gpu_spike",
