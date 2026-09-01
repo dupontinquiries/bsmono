@@ -45,9 +45,60 @@ fn main() -> eframe::Result<()> {
         // ViewRenderer pipeline declares. Skydribble parity; see cad-view/src/renderer.rs.
         depth_buffer: 32,
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]),
+        // Left at `..Default`, egui-wgpu requests `wgpu::Limits::default()` — which
+        // asks for 8 color attachments — without clamping to what the adapter
+        // actually allows, and startup dies with
+        //   WGPU error: Limit 'max_color_attachments' value 8 is better than allowed 5
+        // on a phone GPU that permits 5. That is the reported CADscope crash, and
+        // the same one snapshot-cam and logscope hit (see
+        // apps/snapclone/camera-bridge/src/view.rs, which carries this identical
+        // fix and the unit tests pinning it).
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
+                // without_display_handle(): WgpuSetupCreateNew holds boxed handles and
+                // has no Default; eframe fills the display handle in itself. Only the
+                // device request is ours.
+                eframe::egui_wgpu::WgpuSetupCreateNew {
+                    device_descriptor: std::sync::Arc::new(|adapter| {
+                        eframe::wgpu::DeviceDescriptor {
+                            label: Some("CADscope device (clamped limits)"),
+                            required_limits: device_limits(&adapter.limits()),
+                            ..Default::default()
+                        }
+                    }),
+                    ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
+                },
+            ),
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::run_native("CADscope", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+}
+
+/// What CADscope asks the GPU for, given what the adapter actually offers.
+///
+/// Returns the adapter's own limits verbatim. That reads like a no-op but is
+/// exactly the point: `wgpu::Limits::default()` is a fixed desktop-shaped
+/// wishlist (8 color attachments, 8192 textures) that is NOT checked against
+/// the adapter, so on a device offering 5 attachments the device request is
+/// rejected outright and eframe exits before a window ever appears. Echoing
+/// the adapter back can never fail that check, in either direction — some
+/// limits are "bigger is better" (attachments, texture size) and some are
+/// "smaller is better" (buffer offset alignments), and the adapter's own
+/// values are by definition acceptable for both.
+///
+/// The tradeoff, stated plainly: this does not act as a portability tripwire.
+/// A desktop-only feature creeping into the renderer will now fail at draw
+/// time on a phone rather than at device-request time. CADscope draws through
+/// one `egui_wgpu::Callback` into egui's own pass (see cad-view's
+/// `ViewRenderer`), so it needs whatever egui needs plus one depth target —
+/// well inside any adapter that can run egui at all. Pinning a hand-written
+/// floor here instead would mean guessing that budget for a renderer that is
+/// still growing, and guessing low would break desktop rendering to fix a
+/// startup crash. Not verified on hardware by the author of this change.
+fn device_limits(adapter: &eframe::wgpu::Limits) -> eframe::wgpu::Limits {
+    adapter.clone()
 }
 
 /// The M1 demo document. Primitives exercise the cached parametric meshes; the last three parts
