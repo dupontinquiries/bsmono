@@ -1303,8 +1303,10 @@ impl Snapclone {
                 return;
             }
             let id = crate::identity::dht_node_id(&self.local_id);
-            match snapclone_presence::node_host::NodeHost::spawn(
-                id, "0.0.0.0:0".parse().expect("a literal bind address"))
+            let [preferred, fallback] =
+                Self::dht_bind_addr(self.settings.current.network.listen_port);
+            match snapclone_presence::node_host::NodeHost::spawn(id, preferred)
+                .or_else(|_| snapclone_presence::node_host::NodeHost::spawn(id, fallback))
             {
                 Ok(h) => {
                     // BOOTSTRAP IMMEDIATELY, or the node is a routing
@@ -1338,6 +1340,12 @@ impl Snapclone {
                                 h.bootstrap(sa, id);
                             }
                         }
+                    }
+                    // And every peer we remember, under its real id. On a
+                    // network without the servers above, this is the
+                    // whole bootstrap.
+                    for (sa, id) in self.peer_bootstraps() {
+                        h.bootstrap(sa, id);
                     }
                     self.dht = Some(h);
                 }
@@ -1406,10 +1414,14 @@ impl Snapclone {
                 // The payload is `dht_announce`'s plaintext inside
                 // `dht_envelope`, byte for byte what a Qt peer stores.
                 let port = self.settings.current.network.listen_port;
-                let addrs: Vec<crate::dht_announce::Addr> =
+                // Local addresses, plus the one peers say we reach them
+                // from — what the Qt build asked ipify for, now read off
+                // the DHT's own replies.
+                let addrs: Vec<crate::dht_announce::Addr> = crate::dht_announce::with_public(
                     crate::dht_announce::local_ipv4s().into_iter()
                         .map(|ip| crate::dht_announce::Addr::new(&ip.to_string(), port, 0))
-                        .collect();
+                        .collect(),
+                    h.public_ip(), port);
                 let published = if addrs.is_empty() {
                     0
                 } else {
@@ -4074,6 +4086,44 @@ impl Snapclone {
             .collect()
     }
 
+    /// Peers we have spoken to, as DHT bootstrap entries — with their REAL
+    /// node ids, since a peer's id is a function of its sc-ID
+    /// (`identity::dht_node_id`), which is more than any bootstrap server
+    /// offers.
+    ///
+    /// This is the bootstrap-independence lever. A device that remembers
+    /// one other snapclone it has ever reached can rejoin the DHT through
+    /// it, on a network where `bootstrap.jami.net` is blocked or gone.
+    /// It works because a peer's DHT socket is on the same port number as
+    /// its listen port (`dht_bind_addr`): the address we remember for
+    /// talking to it is also the address of its node.
+    ///
+    /// Newest first, unset addresses dropped, one entry per address.
+    pub fn peer_bootstraps(&self) -> Vec<(std::net::SocketAddr, snapcore::routing::NodeId)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let candidates = self.punch.all().into_iter()
+            .chain(self.heard.recent().into_iter().map(|g| (g.sc_id.clone(), g.addr)));
+        for (id, a) in candidates {
+            if a.is_unset() || id.is_empty() || id == self.local_id { continue; }
+            let sa = std::net::SocketAddr::from((a.ip, a.port));
+            if seen.insert(sa) {
+                out.push((sa, crate::identity::dht_node_id(&id)));
+            }
+        }
+        out
+    }
+
+    /// Where the DHT socket binds: UDP on the SAME port number as the
+    /// listen port, so any peer that knows how to reach the app knows
+    /// how to reach the node. Falls back to an ephemeral port only if that
+    /// one is taken on UDP, in which case peers can still reach us through
+    /// the bootstrap servers but not directly.
+    pub fn dht_bind_addr(listen_port: u16) -> [std::net::SocketAddr; 2] {
+        [std::net::SocketAddr::from(([0, 0, 0, 0], listen_port)),
+         std::net::SocketAddr::from(([0, 0, 0, 0], 0))]
+    }
+
     /// A peer was reached at this address. Expiring entries is the point: an
     /// address nobody has confirmed in minutes is a guess wearing a fact's
     /// clothes.
@@ -6595,6 +6645,31 @@ mod gossip_wiring_tests {
         // No backend at all is a real answer, not a silent no-op.
         let none = Environment { has_iptables: false, has_pkexec: false, ..base };
         assert!(app.firewall_plan(&none, 7000).is_none());
+    }
+
+    #[test]
+    fn remembered_peers_become_bootstrap_entries_under_their_real_ids() {
+        let mut app = Snapclone::new_with_login(vec![], false);
+        app.local_id = "sc-me".into();
+        assert!(app.peer_bootstraps().is_empty());
+        app.note_peer_addr("sc-alice", [10, 0, 0, 5], 9876, 1_000);
+        app.note_peer_addr("sc-bob", [10, 0, 0, 6], 9876, 2_000);
+        app.note_peer_addr("sc-me", [10, 0, 0, 1], 9876, 3_000);      // ourselves: skipped
+        app.punch.set("sc-unset", crate::punch_addrs::PeerAddr::new([0, 0, 0, 0], 0), 4_000);
+        let got = app.peer_bootstraps();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.iter().any(|(sa, id)| *sa == std::net::SocketAddr::from(([10, 0, 0, 5], 9876))
+                                          && *id == crate::identity::dht_node_id("sc-alice")),
+                "alice under her real id");
+        // The same peer known to both tables is one entry.
+        assert_eq!(got.iter().filter(|(sa, _)| sa.port() == 9876).count(), 2);
+    }
+
+    #[test]
+    fn the_dht_binds_the_listen_port_first_and_ephemeral_second() {
+        let [first, second] = Snapclone::dht_bind_addr(9876);
+        assert_eq!(first.port(), 9876);
+        assert_eq!(second.port(), 0);
     }
 
     #[test]

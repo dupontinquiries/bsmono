@@ -319,6 +319,39 @@ pub fn parse_ip_addr_output(text: &str) -> Vec<Ipv4Addr> {
 /// always works and finds one. Falling back to one address is a degraded
 /// announcement; falling back to none would be a silent failure to be
 /// reachable at all.
+/// Is this an address other people could reach us at from outside?
+///
+/// Loopback, link-local, RFC 1918 / ULA and unspecified are not. What a
+/// peer reports as our address is one of these when the peer is on our
+/// LAN, and the record must not carry it as if it were public: a remote
+/// reader would try 192.168.x.x and conclude we are gone.
+pub fn is_routable(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => !(v4.is_private() || v4.is_loopback() || v4.is_link_local()
+            || v4.is_unspecified() || v4.is_broadcast() || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64),
+        std::net::IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified()
+            || (v6.octets()[0] & 0xFE) == 0xFC          // fc00::/7 unique local
+            || (v6.octets()[0] == 0xFE && (v6.octets()[1] & 0xC0) == 0x80)), // fe80::/10
+    }
+}
+
+/// The addresses to announce: every local one, plus what peers say we
+/// reach them from if that is routable and not already listed.
+///
+/// This is what the Qt build asked ipify for. The DHT reports it for free
+/// in every reply (`NodeHost::public_ip`), by majority of the peers that
+/// answered, which is also the only source that reflects the network the
+/// DHT traffic actually crossed.
+pub fn with_public(mut addrs: Vec<Addr>, public_ip: Option<std::net::IpAddr>, port: u16) -> Vec<Addr> {
+    if let Some(ip) = public_ip {
+        let host = ip.to_string();
+        if is_routable(ip) && !addrs.iter().any(|a| a.host == host) {
+            addrs.push(Addr::new(&host, port, 0));
+        }
+    }
+    addrs
+}
+
 pub fn local_ipv4s() -> Vec<Ipv4Addr> {
     let mut out = std::process::Command::new("ip")
         .args(["-o", "-4", "addr", "show"])
@@ -442,6 +475,29 @@ mod tests {
         });
         let got = parse(&text).unwrap();
         assert_eq!(got.addrs, vec![Addr::new("10.0.0.2", 9876, 9876)]);
+    }
+
+    #[test]
+    fn the_reported_address_is_announced_only_when_routable_and_new() {
+        let lan = vec![Addr::new("192.168.1.5", 9876, 0)];
+        let pub_ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let out = with_public(lan.clone(), Some(pub_ip), 9876);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].host, "203.0.113.7");
+        assert_eq!(out[1].ws_port, 9876);
+        // A LAN peer reports our LAN address back: not public, not added.
+        assert_eq!(with_public(lan.clone(), Some("192.168.1.5".parse().unwrap()), 9876).len(), 1);
+        assert_eq!(with_public(lan.clone(), Some("10.4.0.9".parse().unwrap()), 9876).len(), 1);
+        assert_eq!(with_public(lan.clone(), Some("127.0.0.1".parse().unwrap()), 9876).len(), 1);
+        // CGNAT space (100.64/10) is not reachable from outside either.
+        assert_eq!(with_public(lan.clone(), Some("100.72.1.1".parse().unwrap()), 9876).len(), 1);
+        // Already listed: not doubled.
+        let already = vec![Addr::new("203.0.113.7", 9876, 0)];
+        assert_eq!(with_public(already, Some(pub_ip), 9876).len(), 1);
+        assert_eq!(with_public(lan, None, 9876).len(), 1);
+        assert!(is_routable("2001:db8::1".parse().unwrap()));
+        assert!(!is_routable("fd12::1".parse().unwrap()));
+        assert!(!is_routable("fe80::1".parse().unwrap()));
     }
 
     #[test]
