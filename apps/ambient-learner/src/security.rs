@@ -133,10 +133,15 @@ impl SecurityManager {
         // Generate new identity
         println!("🔑 Generating new device identity...");
         
-        // For now, use a simple pseudo-keypair (would use ed25519-dalek in production)
+        // A REAL Ed25519 keypair, via shared/crypto-kit (ed25519-dalek).
+        // What was here derived the "public" key by hashing the private one and
+        // signed with a symmetric keyed hash, which is not asymmetric crypto at
+        // all — see the note on `simple_sign` below for why that made pairing
+        // impossible rather than merely weak.
         let device_id = uuid::Uuid::new_v4().to_string();
-        let private_key = Self::generate_random_bytes(32);
-        let public_key = Self::derive_public_key(&private_key);
+        let (sk, pk) = crypto_kit::ed25519_keypair();
+        let private_key = sk.to_vec();
+        let public_key = pk.to_vec();
         let fingerprint = Self::calculate_fingerprint(&public_key);
         
         let identity = DeviceIdentity {
@@ -178,10 +183,9 @@ impl SecurityManager {
         let private_key = self.identity.private_key.as_ref()
             .ok_or("Private key not loaded")?;
         
-        // In production, use ed25519-dalek for real signing
-        // For now, use a simple HMAC-like construction
-        let signature = Self::simple_sign(private_key, data);
-        Ok(hex::encode(signature))
+        let sk: [u8; 32] = private_key.as_slice().try_into()
+            .map_err(|_| "private key is not 32 bytes — delete the identity file to regenerate")?;
+        Ok(hex::encode(crypto_kit::sign(&sk, data)))
     }
     
     /// Verify signature from a known device
@@ -196,9 +200,11 @@ impl SecurityManager {
         let public_key = hex::decode(&trusted.public_key)
             .map_err(|e| e.to_string())?;
         
-        // Verify signature
-        let expected = Self::simple_sign(&public_key, data);
-        Ok(sig_bytes == expected)
+        let pk: [u8; 32] = public_key.as_slice().try_into()
+            .map_err(|_| "trusted device public key is not 32 bytes")?;
+        let sig: [u8; 64] = sig_bytes.as_slice().try_into()
+            .map_err(|_| "signature is not 64 bytes")?;
+        Ok(crypto_kit::verify(&pk, data, &sig))
     }
     
     /// Create a signed packet for transfer
@@ -293,8 +299,19 @@ impl SecurityManager {
         let sig_bytes = hex::decode(&request.signature)
             .map_err(|e| e.to_string())?;
         
-        let expected = Self::simple_sign(&public_key, message.as_bytes());
-        if sig_bytes != expected {
+        // THE BUG THIS FIXES. `sign_data` signed with the PRIVATE key while
+        // this verified with the PUBLIC one, through `simple_sign` — a
+        // symmetric keyed hash. A symmetric MAC cannot verify under a
+        // different key than it signed with, so this comparison could only
+        // ever succeed if the two halves of the "keypair" were identical.
+        // Pairing was not flaky; it could not work. Now a real Ed25519
+        // verify, which is what the surrounding comments always said this
+        // should be.
+        let pk: [u8; 32] = public_key.as_slice().try_into()
+            .map_err(|_| "public key is not 32 bytes".to_string())?;
+        let sig: [u8; 64] = sig_bytes.as_slice().try_into()
+            .map_err(|_| "signature is not 64 bytes".to_string())?;
+        if !crypto_kit::verify(&pk, message.as_bytes(), &sig) {
             return Err("Invalid pairing signature".to_string());
         }
         
@@ -412,29 +429,7 @@ impl SecurityManager {
         }
         bytes
     }
-    
-    fn derive_public_key(private_key: &[u8]) -> Vec<u8> {
-        // In production, use ed25519-dalek curve25519_dalek
-        // For now, simple hash-based derivation
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
         
-        let mut hasher = DefaultHasher::new();
-        private_key.hash(&mut hasher);
-        let hash = hasher.finish();
-        
-        let mut public_key = Vec::new();
-        let mut h = hash;
-        for _ in 0..32 {
-            public_key.push((h & 0xFF) as u8);
-            h >>= 8;
-            if h == 0 {
-                h = hash.wrapping_mul(6364136223846793005);
-            }
-        }
-        public_key
-    }
-    
     fn calculate_fingerprint(public_key: &[u8]) -> String {
         // SHA256 hash formatted as fingerprint
         // In production, use sha2 crate
@@ -453,28 +448,7 @@ impl SecurityManager {
             hash & 0xFFFF
         )
     }
-    
-    fn simple_sign(key: &[u8], data: &[u8]) -> Vec<u8> {
-        // Simplified HMAC-like construction
-        // In production, use ed25519-dalek for real Ed25519 signatures
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
         
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        data.hash(&mut hasher);
-        let hash = hasher.finish();
-        
-        let mut signature = Vec::new();
-        let mut h = hash;
-        for _ in 0..64 {
-            signature.push((h & 0xFF) as u8);
-            h = h.wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-        }
-        signature
-    }
-    
     fn get_device_name() -> String {
         if let Ok(output) = std::process::Command::new("hostname").output() {
             if let Ok(name) = String::from_utf8(output.stdout) {

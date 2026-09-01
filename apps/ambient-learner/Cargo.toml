@@ -55,6 +55,11 @@ service = ["dbus", "notify"]
 full = ["gtk", "qt", "dbus", "service"]
 
 [dependencies]
+# Real Ed25519 (ed25519-dalek) for device identity and pairing. security.rs
+# previously hand-rolled a "keypair" by hashing the private key and signed
+# with a symmetric keyed hash, which made pairing verification impossible
+# rather than merely weak.
+crypto-kit = { path = "../../shared/crypto-kit" }
 egui = { version = "0.34", optional = true }
 uikit-egui = { path = "../../shared/uikit/crates/uikit-egui", optional = true }
 weather-share = { path = "../../shared/weather-share", optional = true }

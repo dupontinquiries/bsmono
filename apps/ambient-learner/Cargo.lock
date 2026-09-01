@@ -83,6 +83,7 @@ dependencies = [
  "clap",
  "core-kit",
  "criterion",
+ "crypto-kit",
  "eframe",
  "egui",
  "env_logger",
