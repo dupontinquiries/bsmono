@@ -338,10 +338,16 @@ pub fn settings_panel(
             }
         }
     });
-    // White point in kelvin: lower is warmer. 6500K is daylight-neutral and the
-    // top of the range for that reason — going above it would tint the screen
-    // blue, which is the opposite of every reason someone opens this row.
-    ui.add(egui::Slider::new(&mut prefs.display.white_point, 2700.0..=6500.0).text("white point (K)"));
+    // White point: a 0.0–1.0 LUMINANCE SCALE that dims whites toward grey for
+    // light sensitivity (see settings_kit::DisplayPrefs::white_point's doc
+    // comment and apply_white_point) — NOT a photographic colour-temperature
+    // control, despite how "white point" usually reads. 0.4 is the kit's own
+    // documented floor for "strongly dimmed" before things get hard to read;
+    // 1.0 is normal/off. A Kelvin-shaped range here (e.g. 2700..=6500) would
+    // silently clamp to 1.0 for every value — a slider that visibly moves but
+    // never actually dims anything. See
+    // `the_white_point_slider_range_must_actually_be_able_to_dim_the_display`.
+    ui.add(egui::Slider::new(&mut prefs.display.white_point, 0.4..=1.0).text("white point (dim whites)"));
     ui.add_space(8.0);
 
     ui.label(egui::RichText::new("models").strong());
@@ -1051,6 +1057,49 @@ mod tests {
     use super::*;
     use crate::gesture_menus::{tab_dispatch, WsCall};
     use uikit_egui::slide_menu::Variant;
+
+    /// The bug: `settings_panel`'s white-point slider was `2700.0..=6500.0`, which
+    /// reads like a photographic color-temperature control ("white point" usually
+    /// means Kelvin) — but `settings_kit::DisplayPrefs::white_point` is documented
+    /// and tested (`display_apply_combines_filter_and_white_point`) as a 0.0–1.0
+    /// LUMINANCE SCALE, and `apply_white_point` clamps it to that range before use.
+    /// Every value the old slider could produce (2700–6500) was therefore clamped
+    /// to 1.0 — "normal, no dimming" — so moving it anywhere in its range had zero
+    /// visible effect. The accessibility feature it exposes (dim whites for light
+    /// sensitivity) was reachable and looked like it worked (the slider moved, the
+    /// value persisted to disk) but was silently inert.
+    ///
+    /// Extracts the slider's bounds from this file's own source (rather than
+    /// mirroring them as separate constants) so this can't drift the way the bug
+    /// itself did: a hardcoded pair of constants would keep passing even if
+    /// shell.rs's actual slider were changed back to something Kelvin-shaped,
+    /// since nothing would force the two copies to move together.
+    #[test]
+    fn the_white_point_slider_range_must_actually_be_able_to_dim_the_display() {
+        let src = include_str!("shell.rs");
+        let marker = "Slider::new(&mut prefs.display.white_point, ";
+        let start = src.find(marker).expect("white_point slider line must exist in shell.rs")
+            + marker.len();
+        let range_str = &src[start..];
+        let end = range_str.find(')').expect("slider range must close with )");
+        let range_str = &range_str[..end];
+        let (lo_str, hi_str) = range_str.split_once("..=")
+            .expect("slider range must be a RangeInclusive (lo..=hi)");
+        let lo: f32 = lo_str.trim().parse().expect("slider lower bound must parse as f32");
+        let hi: f32 = hi_str.trim().parse().expect("slider upper bound must parse as f32");
+
+        let dimmed_at_lo = settings_kit::apply_white_point((1.0, 1.0, 1.0), lo);
+        let dimmed_at_hi = settings_kit::apply_white_point((1.0, 1.0, 1.0), hi);
+
+        assert_ne!(dimmed_at_lo, (1.0, 1.0, 1.0),
+            "the slider's lower bound ({lo}) must actually dim white below full \
+             brightness — got {dimmed_at_lo:?}, meaning the control is a no-op \
+             across its whole range (this is the exact bug: a Kelvin-shaped range \
+             like 2700.0 clamps to 1.0 and never visibly does anything)");
+        assert_ne!(dimmed_at_lo, dimmed_at_hi,
+            "the slider's low and high ends ({lo}, {hi}) must produce visibly \
+             different results, or the control conveys a choice it cannot make");
+    }
 
     #[test]
     fn fab_docks_at_the_corner_overlapping_slightly() {
