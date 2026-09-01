@@ -79,6 +79,10 @@ pub mod fuzzy;
 // why this is a kit concern and not a per-app one (the single-character
 // input bug, found and re-found across 68 call sites).
 pub mod text_field;
+// Dialog width that fits a phone + in-bounds keyboard list selection. Both
+// were re-implemented per app; dialog_width had three copies and tomescope
+// had none (it hard-coded a 400pt minimum and overflowed).
+pub mod dialog;
 pub mod fmt;
 pub mod glove;
 pub mod upscale;

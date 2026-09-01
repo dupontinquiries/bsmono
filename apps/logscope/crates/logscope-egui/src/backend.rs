@@ -329,7 +329,7 @@ window submits bounded (watchdog-safe), governor uses the tight Apple-Vulkan bud
                 // the tensor table instead: no arch knowledge, and type-19 tensors are priced at
                 // the file's own bytes exactly when the loader will keep them that way.
                 let est = gpu_kernels::store::estimate_resident_for_load(&g);
-                if let Some(budget) = gpu_kernels::store::resident_budget_bytes() {
+                if let Some((budget, budget_from)) = gpu_kernels::store::resident_budget() {
                     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
                     if est.native_view_bytes > 0 {
                         // `load` is a constructor — no self yet, so the model is named by its file.
@@ -341,15 +341,40 @@ window submits bounded (watchdog-safe), governor uses the tight Apple-Vulkan bud
                                 std::env::var("LOGSCOPE_NO_IQ1_NATIVE").is_err()));
                     }
                     if est.plan_q4() > budget {
+                        // The ceiling's PROVENANCE is in the message, not just its
+                        // value. A refusal reading "~63 GiB available" on a phone is
+                        // unactionable: the reader cannot tell whether that is a stale
+                        // constant, a setting inherited from a desktop, or a real
+                        // reading. Naming the source ("90% of MemAvailable on
+                        // fp5 (Fairphone 5)" vs "LOGSCOPE_MAX_RESIDENT_GB=63") answers
+                        // that in the message instead of costing an evening.
+                        //
+                        // The f32 term is broken out for the same reason. On a small
+                        // model it DOMINATES and is the most likely thing to be wrong:
+                        // token_embd/output are priced at 4 bytes per parameter
+                        // regardless of how the file stores them, so a 1B with a 128k
+                        // vocab books ~1.0 GiB for the embedding alone — twice what the
+                        // whole q2_k file weighs on disk. If a small model is refused
+                        // on a machine that plainly has room, this line is where to
+                        // look first.
                         return Err(format!(
-                            "won't fit: ~{:.1} GiB needed even at q4-resident{}, ~{:.1} GiB available. Try a \
-                             smaller model, free memory, or LOGSCOPE_FORCE_LOAD=1 to try anyway (likely OOM).",
+                            "won't fit: ~{:.1} GiB needed even at q4-resident{}, against ~{:.1} GiB \
+                             ({}).{} Try a smaller model, free memory, LOGSCOPE_MAX_RESIDENT_GB=<gib> \
+                             to set the ceiling explicitly, or LOGSCOPE_FORCE_LOAD=1 to try anyway \
+                             (likely OOM).",
                             gib(est.plan_q4()),
                             if est.native_view_bytes > 0 {
                                 format!(" (of which {:.1} GiB is IQ1_S held in the file's own bytes)",
                                         gib(est.native_view_bytes))
                             } else { String::new() },
-                            gib(budget)));
+                            gib(budget),
+                            budget_from,
+                            if est.f32_bytes > est.q4_rest_bytes {
+                                format!(" NOTE: {:.1} GiB of that estimate is the embedding/output \
+                                         priced at f32 — for a small model with a large vocabulary \
+                                         this term dominates and may be pessimistic.",
+                                        gib(est.f32_bytes))
+                            } else { String::new() }));
                     }
                 }
             }

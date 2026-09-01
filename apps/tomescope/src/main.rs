@@ -114,6 +114,8 @@ struct TomeApp {
 
     command_palette_open: bool,
     command_query: String,
+    /// Keyboard selection in the palette list. See uikit_egui::dialog.
+    command_sel: uikit_egui::dialog::Selection,
 
     toc_open: bool,
     bookmarks_open: bool,
@@ -208,6 +210,7 @@ impl TomeApp {
 
             command_palette_open: false,
             command_query: String::new(),
+            command_sel: Default::default(),
 
             toc_open: false,
             bookmarks_open: false,
@@ -789,31 +792,95 @@ impl TomeApp {
             return;
         }
         let mut open = true;
+        const COMMANDS: [&str; 6] = [
+            "Go to Library",
+            "Go to Stats",
+            "Go to Flashcards",
+            "Go to Settings",
+            "Rescan library",
+            "Close current book",
+        ];
+        let hits: Vec<&str> = COMMANDS.into_iter()
+            .filter(|c| fuzzy::subsequence_match(&self.command_query, c))
+            .collect();
+        // Typing shortens the list, so an index left past the end would make
+        // Enter silently do nothing.
+        self.command_sel.clamp(hits.len());
+
+        // Keys BEFORE the widgets, so navigation resolves against the list
+        // the rows are about to be drawn from rather than lagging a frame.
+        let mut moved = false;
+        let mut activate = false;
+        ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                moved |= self.command_sel.step(1, hits.len());
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                moved |= self.command_sel.step(-1, hits.len());
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                activate = true;
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                self.command_palette_open = false;
+            }
+        });
+
+        // `set_min_width(400.0)` was a hard floor wider than a phone, so the
+        // palette ran off both edges. dialog_width asks for 400 and takes
+        // what the surface can actually give, measured from content_rect
+        // (not screen_rect, which includes the area under the system bars).
+        let avail = ctx.content_rect();
+        let w = uikit_egui::dialog::dialog_width(avail.width(), 400.0);
+        let mut chosen: Option<&str> = None;
         egui::Window::new("Command palette")
             .id(egui::Id::new("tomescope_cmd_palette"))
             .collapsible(false)
             .resizable(false)
+            .default_width(w)
+            .max_width(w)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.set_min_width(400.0);
-                ui.text_edit_singleline(&mut self.command_query);
-                let commands = [
-                    "Go to Library",
-                    "Go to Stats",
-                    "Go to Flashcards",
-                    "Go to Settings",
-                    "Rescan library",
-                    "Close current book",
-                ];
-                for cmd in commands {
-                    if fuzzy::subsequence_match(&self.command_query, cmd) {
-                        if ui.button(cmd).clicked() {
-                            self.run_command(cmd);
-                            self.command_palette_open = false;
-                        }
-                    }
+                ui.set_max_width(w);
+                ui.add(egui::TextEdit::singleline(&mut self.command_query)
+                    .id_salt("tomescope-command-query")
+                    .desired_width(f32::INFINITY));
+                if hits.is_empty() {
+                    ui.weak("no matching command");
                 }
+                // Capped and scrollable: without this the window grows past
+                // the bottom of the screen and the last entries are
+                // unreachable, because it is the WINDOW that overflowed and
+                // there is nothing to scroll.
+                egui::ScrollArea::vertical()
+                    .max_height(uikit_egui::dialog::list_max_height(avail.height()))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (i, cmd) in hits.iter().enumerate() {
+                            let selected = i == self.command_sel.index;
+                            let r = ui.add(egui::Button::selectable(selected, *cmd)
+                                .min_size(egui::vec2(ui.available_width(), 0.0)));
+                            // Only on an actual keyboard move — following the
+                            // selection every frame would pin the view and
+                            // make the list impossible to scroll by hand.
+                            if selected && moved {
+                                r.scroll_to_me(Some(egui::Align::Center));
+                            }
+                            if r.clicked() {
+                                chosen = Some(cmd);
+                            }
+                        }
+                    });
             });
+        if activate {
+            chosen = hits.get(self.command_sel.index).copied();
+        }
+        if let Some(cmd) = chosen {
+            self.run_command(cmd);
+            self.command_palette_open = false;
+            self.command_query.clear();
+            self.command_sel = Default::default();
+        }
         if !open {
             self.command_palette_open = false;
         }

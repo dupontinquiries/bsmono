@@ -408,10 +408,44 @@ pub fn available_memory_bytes() -> Option<u64> {
 /// Resident budget for a load: LOGSCOPE_MAX_RESIDENT_GB overrides; else 90% of available memory
 /// (headroom for the KV cache + compute buffers + OS). None if memory can't be determined.
 pub fn resident_budget_bytes() -> Option<u64> {
+    resident_budget().map(|(b, _)| b)
+}
+
+/// The budget AND where it came from.
+///
+/// Split out because a refusal that names a number without naming its source
+/// is unreadable off the machine it was tuned on: a phone reported being
+/// refused against a ceiling it recognised as a desktop's, and had no way to
+/// tell from the message whether that was a stale constant, an inherited
+/// setting, or a real reading of its own memory. Every message that prints
+/// the budget should print this alongside it.
+pub fn resident_budget() -> Option<(u64, String)> {
     if let Ok(s) = std::env::var("LOGSCOPE_MAX_RESIDENT_GB") {
-        if let Ok(gb) = s.trim().parse::<f64>() { return Some((gb * (1u64 << 30) as f64) as u64); }
+        if let Ok(gb) = s.trim().parse::<f64>() {
+            return Some(((gb * (1u64 << 30) as f64) as u64,
+                         format!("LOGSCOPE_MAX_RESIDENT_GB={}", s.trim())));
+        }
     }
-    available_memory_bytes().map(|a| a / 10 * 9)
+    available_memory_bytes().map(|a| {
+        (a / 10 * 9,
+         format!("90% of MemAvailable ({:.1} GiB) on {}",
+                 a as f64 / (1u64 << 30) as f64, host_label()))
+    })
+}
+
+/// A short "which machine am I" label for diagnostics. Kernel-provided, so it
+/// cannot be inherited from another host's config the way a tuned constant can.
+pub fn host_label() -> String {
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "this host".to_string());
+    match std::fs::read_to_string("/proc/device-tree/model") {
+        // Present on ARM SBCs and phones (postmarketOS on a Fairphone reports
+        // its board here), absent on x86 — exactly the case where a message
+        // naming a desktop's numbers is most confusing.
+        Ok(m) => format!("{host} ({})", m.trim_end_matches('\0').trim()),
+        Err(_) => host,
+    }
 }
 
 // ── model-level unification: discover + dedup GGUFs across the shared folder ──────────────────
