@@ -6416,3 +6416,23 @@ a stage from pixels is only for footage with no engine, and there a
 renderer-agnostic formula has to be validated against the real
 world's actual formula the same way this one was validated against
 soldier's, or it will lose to no stage at all.
+
+### `.faoscene` v2 — the seam that carries the day's results (same day)
+
+v1 carried one mesh and one camera: a map. Every large number this
+session came from something v1 cannot express — actors as entities
+(mesh in the library, pose per frame), and fog as a stage the
+renderer evaluates with transmitted parameters. v2 adds exactly
+those and nothing else: a renderer identity string (the decoder must
+hold THAT renderer; the codec's rasteriser is a fallback that gets
+geometry right and fog wrong), `meshes[]`, shot-level `stages`
+(kind + payload; fog = colour, start, end), per-frame `instances`
+(mesh id, position, [w,x,y,z]), per-frame stage `overrides`. Rates
+are the design: mesh once, shot stage once, camera and instances per
+frame, an override only when something changes — the library / shot
+/ frame factorisation as bytes. v1 files lift into v2 as a map with
+one identity instance per frame. Six tests: round trip, override
+resolution per frame, merged world-space geometry, v1 lift,
+truncation, dangling mesh reference. Not yet done: the harness
+writing a v2 scene from soldier and `plate_lab` citing it — the
+harness still predicts through its own closures.
