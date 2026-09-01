@@ -58,7 +58,7 @@ use crate::raidgen::strhash;
 use crate::sections;
 use crate::stations;
 use crate::survival::{Body, Bunker, Weather};
-use crate::weapons::Element;
+use crate::weapons::{Element, Register};
 
 /// The squad's overland speed for the foothold clock, m/s. The same
 /// Cybertronian figure `raidsim` defaults to — if that number moves, move
@@ -468,16 +468,20 @@ impl Sortie {
     /// own shield and evasion; the agent is woken so a foe shot from
     /// cover turns to face you. This is the aimed door — the shell uses
     /// it for every hit that lands on a hostile bot.
-    pub fn strike_slot(&mut self, slot: usize, dmg: f32, shooter: Element) {
+    pub fn strike_slot(&mut self, slot: usize, dmg: f32, shooter: Element, reg: Register) {
         if self.stage != Stage::Engage {
             return;
         }
         let Some(run) = self.run.as_mut() else { return };
+        // exposure is the field's: caught mid-fold, or on the end of a tow
+        let towed = self.field.towed(slot);
+        let dmg = dmg * self.field.foe(slot).map(|f| f.exposure(towed)).unwrap_or(1.0);
         let ring = run.foe_element(slot).map(|d| shooter.advantage(d)).unwrap_or(1.0);
         if let Some(ev) = run.player_strike_slot(slot, dmg, ring) {
             Self::note(&mut self.feed, &mut self.toasts, ev);
         }
-        self.field.poke(slot);
+        // the register's answer: stagger, suppression, a stalled fold
+        self.field.hit(slot, dmg * ring, reg);
     }
 
     /// The player is down on the field: the sortie is lost, whatever the
@@ -830,7 +834,7 @@ mod tests {
         let hp_before: Vec<f32> = run.foes().iter().map(|f| f.hp).collect();
         let target = s.field.foes.iter().map(|f| f.slot).nth(1).unwrap_or(0);
         for _ in 0..4 {
-            s.strike_slot(target, 40.0, Element::None);
+            s.strike_slot(target, 40.0, Element::None, Register::Medium);
         }
         let run = s.run.as_ref().unwrap();
         let hp_after: Vec<f32> = run.foes().iter().map(|f| f.hp).collect();
@@ -844,7 +848,7 @@ mod tests {
         assert_ne!(s.field.foe(target).unwrap().agent.state, crate::enemy::State::Idle);
         // and a kill through the aimed door comes off the field on the next mirror
         for _ in 0..40 {
-            s.strike_slot(target, 1.0e6, Element::None);
+            s.strike_slot(target, 1.0e6, Element::None, Register::Medium);
         }
         s.tick_engage(0.0);
         assert!(!s.field.foe(target).map(|f| f.alive()).unwrap_or(false), "killed in the fight, still standing in the world");
@@ -874,7 +878,7 @@ mod tests {
         let n = s.run.as_ref().unwrap().foes().len();
         for slot in 0..n {
             for _ in 0..40 {
-                s.strike_slot(slot, 1.0e6, Element::None);
+                s.strike_slot(slot, 1.0e6, Element::None, Register::Medium);
             }
         }
         s.tick_engage(0.0);

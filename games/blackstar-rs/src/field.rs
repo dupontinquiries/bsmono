@@ -41,6 +41,32 @@
 //! gives them no clean vehicle mode (`corruption.rs`'s continuous
 //! transformation) and they were already fast on foot.
 //!
+//! ## Two registers, and being caught between forms
+//!
+//! The brief is a mix: Dark of the Moon's slow, heavy, consequential
+//! hits and War for Cybertron's stream of fast rounds. `weapons::
+//! Register` names which a form is; the field answers each differently.
+//! A HEAVY hit worth a real fraction of the body's health STAGGERS it —
+//! still, silent, exposed for `STAGGER_S`. FAST fire SUPPRESSES: every
+//! hit adds to a pressure that widens the foe's spread and slows its
+//! advance, and drains when the fire stops. And a body hit hard while
+//! it is FOLDING is caught between forms — the fold stalls, and a shot
+//! into the exposed works costs it `MIDFOLD_EXPOSURE` times more. That
+//! last one is the reward for the still window every fold telegraphs.
+//!
+//! ## The cable
+//!
+//! `cable.rs` is a tether machine; this is where it becomes moves. A
+//! hostile from the rails (`cable_troop`) fires one at a robot-form
+//! player in the open and REELS — the pull, which drags you out of
+//! cover toward it unless you are heavier than it is, in which case it
+//! drags itself to you. The player in vehicle form hooks a foe and it
+//! becomes a TOW: dragged behind the car, unable to act, wearing road
+//! damage by the second. Turn hard and the body on the end swings —
+//! `Cable::swing_ms` — and letting go at speed is the WHIP: the body
+//! flies, and whatever it lands on takes the impact too. A foe heavier
+//! than the car reverses the trade and yanks the car instead.
+//!
 //! ## Guesses, labelled
 //!
 //! Every distance and multiplier under `tunables` is a GUESS with a
@@ -53,13 +79,14 @@
 
 use glam::Vec3;
 
+use crate::cable::{self, Cable, End, Fate, Mode};
 use crate::content::{Role, Troop};
 use crate::enemy::{Enemy, State};
 use crate::escalation::EnemyKind;
 use crate::patrol::Faction;
 use crate::raidgen::strhash;
 use crate::skirmish::Fighter;
-use crate::weapons::{Element, Verb};
+use crate::weapons::{Element, Register, Verb};
 
 // -------------------------------------------------------------- tunables ---
 
@@ -102,6 +129,55 @@ pub const SPREAD_RAD: f32 = 0.05;
 pub const SPREAD_REF_M: f32 = 30.0;
 /// Chest height above the ground contact, in the sandbox's car units.
 pub const CHEST_H: f32 = 0.8;
+
+// -- the two registers --
+/// A heavy hit worth at least this fraction of max hp staggers. GUESS:
+/// two railshots on a grunt, one on a swarmer.
+pub const STAGGER_FRAC: f32 = 0.18;
+/// How long a stagger holds a body still. GUESS: long enough to walk
+/// around it, short enough that it is not a stun-lock.
+pub const STAGGER_S: f32 = 1.4;
+/// Suppression added per fast hit, and its decay per second. GUESS:
+/// four hits in a second pins a grunt, a second of silence frees it.
+pub const SUPPRESS_PER_HIT: f32 = 0.28;
+pub const SUPPRESS_DECAY: f32 = 0.9;
+/// A hit while folding stalls the fold by this many seconds, capped at
+/// one whole extra fold. GUESS.
+pub const FOLD_STALL_S: f32 = 0.45;
+/// Damage multiplier on a body caught mid-fold. GUESS: the reward for
+/// hitting the window.
+pub const MIDFOLD_EXPOSURE: f32 = 1.6;
+/// Damage multiplier on a body being towed — dragged, upside down, not
+/// shooting back. GUESS.
+pub const TOWED_EXPOSURE: f32 = 1.3;
+
+// -- the cable --
+/// A cable troop reaches for the player between these ranges, robot
+/// form, line of sight. GUESSES.
+pub const CABLE_MIN_M: f32 = 8.0;
+pub const CABLE_MAX_M: f32 = 42.0;
+pub const CABLE_CD_S: f32 = 7.0;
+/// A pull that has not brought its target home in this long lets go.
+pub const CABLE_LIFE_S: f32 = 4.5;
+/// The player's vehicle-form hook reaches this far. GUESS: the Watch's
+/// GRAPPLE reach, so the two feel like one tool.
+pub const HOOK_REACH_M: f32 = 55.0;
+/// A tow costs the towed body this much per second per m/s of speed —
+/// road damage. GUESS sized so a ten-second drag at speed is a kill on
+/// a grunt and a scratch on a juggernaut.
+pub const TOW_DMG_PER_MS_S: f32 = 0.35;
+/// Road damage is reported in lumps this often so the fight is not asked
+/// 120 times a second for a rounding error.
+pub const TOW_REPORT_S: f32 = 0.25;
+/// A release with at least this much swing is a whip; less is a drop.
+pub const WHIP_MIN_MS: f32 = 9.0;
+/// A flung body lands its speed times this on whatever it hits, and on
+/// itself when it lands. GUESS: the ram's number, because it is a ram.
+pub const THROW_DMG_PER_MS: f32 = RAM_DMG_PER_MS;
+/// How heavy a chassis is next to the car, per unit of `Chassis::bulk`.
+/// GUESS: a standard bot is a little heavier than the car that stands
+/// in for it, a juggernaut is a truck.
+pub const BOT_MASS_PER_BULK: f32 = 1.3;
 
 /// Standoff per zone, metres: front pushes close, middle holds mid, back
 /// anchors. GUESS shaped by `enemy.rs`'s zone comments.
@@ -155,6 +231,41 @@ pub struct Foe {
     /// the fighter's last mirrored HP, so a death seen through the fight
     /// (a squad-ghost volley) is reported once
     seen_alive: bool,
+    /// relative mass, `cable::CAR_MASS` units, from the chassis bulk
+    pub mass: f32,
+    /// seconds of stagger left; a staggered body does nothing
+    pub stagger_t: f32,
+    /// suppression pressure, 0..1+; widens spread, slows the advance
+    pub suppress: f32,
+    /// this foe's cable on the player (the pull), while it holds
+    cable: Option<Cable>,
+    cable_cd: f32,
+    /// airborne after a whip: velocity, integrated under gravity until
+    /// it lands or hits someone
+    fling: Option<Vec3>,
+    /// road damage owed to the fight, reported in lumps
+    tow_owed: f32,
+    tow_t: f32,
+}
+
+impl Foe {
+    /// Is it doing anything at all this tick — no stagger, no tow, no
+    /// flight, no fold in progress.
+    pub fn free(&self) -> bool {
+        self.alive() && self.stagger_t <= 0.0 && self.fling.is_none() && self.fold_t <= 0.0
+    }
+    /// What a hit on this body is worth right now, over its base: caught
+    /// mid-fold or on the end of a tow, it is exposed.
+    pub fn exposure(&self, towed: bool) -> f32 {
+        let mut m = 1.0;
+        if self.fold_t > 0.0 {
+            m *= MIDFOLD_EXPOSURE;
+        }
+        if towed {
+            m *= TOWED_EXPOSURE;
+        }
+        m
+    }
 }
 
 impl Foe {
@@ -199,6 +310,26 @@ pub enum Event {
     Folded { slot: usize, form: Form },
     /// the foe in this slot is dead (by any hand) — fx and drop the bot
     Down { slot: usize },
+    /// a heavy hit put this body down for `STAGGER_S`
+    Staggered { slot: usize },
+    /// a hostile fired a cable at the player: draw it from `from`
+    CableOut { slot: usize, from: Vec3 },
+    /// the cable is hauling: apply `dv` to the player this tick
+    Pulled { slot: usize, dv: Vec3 },
+    /// a cable parted or was let go
+    CableOff { slot: usize },
+    /// the player's hook took hold of this body
+    Hooked { slot: usize },
+    /// the tow line is pulling the CAR: a heavier body on the end
+    Yanked { slot: usize, dv: Vec3 },
+    /// road damage owed to this body from being dragged (`Element::None`)
+    Towed { slot: usize, dmg: f32 },
+    /// the whip let go: the body is flying at `vel`
+    Whipped { slot: usize, vel: Vec3 },
+    /// a flung body landed — on the ground (`into: None`) or on another
+    /// foe. `dmg` is what the flung body takes; the one it landed on
+    /// takes the same
+    Thrown { slot: usize, into: Option<usize>, dmg: f32 },
 }
 
 /// The wave, in the world.
@@ -211,6 +342,11 @@ pub struct Field {
     seed: u64,
     ride_h: f32,
     pending: Vec<Event>,
+    /// the player's tow line: which slot is on the end, and the cable
+    tow: Option<(usize, Cable)>,
+    /// gravity for flung bodies, m/s². Set by the shell for the map;
+    /// the default is Earth so headless tests fly a sensible arc.
+    pub g: f32,
 }
 
 // ---------------------------------------------------------------- muster ---
@@ -250,6 +386,19 @@ fn can_fold(t: &Troop, kind: EnemyKind) -> bool {
         && !(t.role == Role::Variant && t.element == Element::None)
 }
 
+/// Who carries a cable: Blackstar's rail ranks ("raiders on the rails"
+/// — the Dreadwake roster in `content.rs`) and the Hijack elite that is
+/// starting to field recovered tech. Everyone else shoots.
+pub fn cable_troop(t: &Troop) -> bool {
+    t.faction == Faction::BlackstarClans || t.id.contains("harvester")
+}
+
+/// A chassis's mass next to the car, from its bulk.
+fn mass_for(t: &Troop) -> f32 {
+    let bulk = crate::content::chassis(t.chassis).map(|c| c.bulk).unwrap_or(1.0);
+    cable::CAR_MASS * BOT_MASS_PER_BULK * bulk
+}
+
 fn unit_xz(v: Vec3) -> Vec3 {
     let f = Vec3::new(v.x, 0.0, v.z);
     if f.length_squared() < 1e-6 {
@@ -270,7 +419,7 @@ impl Field {
     /// toward where the player will come from (the LZ); `ride_h` is the
     /// shell's ground clearance for a standing body.
     pub fn new(anchor: Vec3, facing: Vec3, seed: u64, ride_h: f32) -> Field {
-        Field { foes: Vec::new(), anchor, facing: unit_xz(facing), seed, ride_h, pending: Vec::new() }
+        Field { foes: Vec::new(), anchor, facing: unit_xz(facing), seed, ride_h, pending: Vec::new(), tow: None, g: 9.81 }
     }
 
     /// The conventional anchor for a sortie: `SITE_AHEAD_M` past the LZ
@@ -341,6 +490,14 @@ impl Field {
                 ram_cd: 0.0,
                 shots: 0,
                 seen_alive: true,
+                mass: mass_for(t),
+                stagger_t: 0.0,
+                suppress: 0.0,
+                cable: None,
+                cable_cd: CABLE_CD_S * 0.5 + hash_unit(h, 5) * CABLE_CD_S * 0.5,
+                fling: None,
+                tow_owed: 0.0,
+                tow_t: 0.0,
             });
         }
     }
@@ -351,8 +508,111 @@ impl Field {
             if f.alive() {
                 self.pending.push(Event::Down { slot: f.slot });
             }
+            if f.cable.is_some() {
+                self.pending.push(Event::CableOff { slot: f.slot });
+            }
+        }
+        if let Some((slot, _)) = self.tow.take() {
+            self.pending.push(Event::CableOff { slot });
         }
         self.foes.clear();
+    }
+
+    /// Is this slot on the end of the player's tow line.
+    pub fn towed(&self, slot: usize) -> bool {
+        self.tow.as_ref().map(|t| t.0 == slot).unwrap_or(false)
+    }
+
+    /// The player's hook, from vehicle form: the nearest living foe inside
+    /// `HOOK_REACH_M` and within the aim cone takes the line. Returns the
+    /// slot hooked. One tow at a time; a second hook while one holds is
+    /// refused rather than silently swapping.
+    pub fn hook(&mut self, from: Vec3, aim: Vec3, player_mass: f32) -> Option<usize> {
+        if self.tow.is_some() {
+            return None;
+        }
+        let aim = aim.normalize_or(Vec3::Z);
+        let mut best: Option<(f32, usize)> = None;
+        for f in self.foes.iter().filter(|f| f.alive() && f.fling.is_none()) {
+            let to = f.pos() - from;
+            let d = to.length();
+            if d > HOOK_REACH_M || d < 1.0 {
+                continue;
+            }
+            if to.normalize_or(aim).dot(aim) < 0.94 {
+                continue;
+            }
+            if best.map(|b| d < b.0).unwrap_or(true) {
+                best = Some((d, f.slot));
+            }
+        }
+        let (_, slot) = best?;
+        let foe = self.foes.iter_mut().find(|f| f.slot == slot)?;
+        let a = End { pos: from, vel: Vec3::ZERO, mass: player_mass };
+        let b = End { pos: foe.pos(), vel: Vec3::ZERO, mass: foe.mass };
+        self.tow = Some((slot, Cable::between(&a, &b)));
+        foe.goal = None;
+        self.pending.push(Event::Hooked { slot });
+        Some(slot)
+    }
+
+    /// Let the tow line go. At speed this is the whip: the body on the
+    /// end flies with the swing it had. Below `WHIP_MIN_MS` it is just
+    /// dropped where it is.
+    pub fn release(&mut self) {
+        let Some((slot, mut c)) = self.tow.take() else { return };
+        let swing = c.swing_ms;
+        if let Some(foe) = self.foes.iter_mut().find(|f| f.slot == slot) {
+            let b = End { pos: foe.pos(), vel: foe.vel, mass: foe.mass };
+            let v = c.release(&b);
+            if swing >= WHIP_MIN_MS && foe.alive() {
+                // carry the swing, and a little lift so it is a throw
+                let vel = v + Vec3::Y * (v.length() * 0.25);
+                foe.fling = Some(vel);
+                self.pending.push(Event::Whipped { slot, vel });
+            }
+        }
+        self.pending.push(Event::CableOff { slot });
+    }
+
+    /// A hit on this body, in a register. The FIGHT took the damage;
+    /// this is the field's answer to how it was delivered: heavy and
+    /// large enough staggers, fast suppresses, anything mid-fold stalls
+    /// the fold. `dmg` is what the fight was told (after exposure).
+    pub fn hit(&mut self, slot: usize, dmg: f32, reg: Register) {
+        let Some(foe) = self.foes.iter_mut().find(|f| f.slot == slot) else { return };
+        if !foe.alive() {
+            return;
+        }
+        if foe.agent.state == State::Idle {
+            foe.agent.state = State::Chase;
+        }
+        match reg {
+            Register::Heavy => {
+                if foe.fold_t > 0.0 {
+                    foe.fold_t = (foe.fold_t + FOLD_STALL_S).min(FOLD_S * 2.0);
+                }
+                if dmg >= STAGGER_FRAC * foe.agent.max_hp && foe.stagger_t <= 0.0 {
+                    foe.stagger_t = STAGGER_S;
+                    // a stagger drops whatever it was hauling
+                    if foe.cable.take().is_some() {
+                        self.pending.push(Event::CableOff { slot });
+                    }
+                    self.pending.push(Event::Staggered { slot });
+                }
+            }
+            Register::Fast => {
+                foe.suppress = (foe.suppress + SUPPRESS_PER_HIT).min(1.5);
+                if foe.fold_t > 0.0 {
+                    foe.fold_t = (foe.fold_t + FOLD_STALL_S * 0.3).min(FOLD_S * 2.0);
+                }
+            }
+            Register::Medium | Register::Utility => {
+                if foe.fold_t > 0.0 {
+                    foe.fold_t = (foe.fold_t + FOLD_STALL_S * 0.6).min(FOLD_S * 2.0);
+                }
+            }
+        }
     }
 
     /// Mirror the fight's HP onto the agents. A fighter the fight killed
@@ -387,22 +647,26 @@ impl Field {
         }
     }
 
-    /// One fixed step. `player_vehicle` and `player_vel` feed the ram
-    /// checks; `ground` is the height field; `los` the shell's own
+    /// One fixed step. The field is handed the player and hands back
+    /// events; `ground` is the height field; `los` the shell's own
     /// line-of-sight answer, asked at most every `LOS_EVERY_S` per foe.
-    #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
         dt: f32,
-        player_pos: Vec3,
-        player_vel: Vec3,
-        player_vehicle: bool,
-        player_cloaked: bool,
+        player: &Player,
         ground: &dyn Fn(f32, f32) -> f32,
         los: &dyn Fn(Vec3, Vec3) -> bool,
     ) -> Vec<Event> {
         let mut ev: Vec<Event> = std::mem::take(&mut self.pending);
         let ride_h = self.ride_h;
+        let g = self.g;
+        let player_pos = player.pos;
+        let towed_slot = self.tow.as_ref().map(|t| t.0);
+        let seed = self.seed;
+
+        // positions of the living, for a flung body to land on
+        let others: Vec<(usize, Vec3)> = self.foes.iter().filter(|f| f.alive()).map(|f| (f.slot, f.pos())).collect();
+
         for foe in self.foes.iter_mut() {
             if !foe.alive() {
                 foe.vel = Vec3::ZERO;
@@ -410,6 +674,8 @@ impl Field {
             }
             let before = foe.agent.position;
             foe.ram_cd = (foe.ram_cd - dt).max(0.0);
+            foe.cable_cd = (foe.cable_cd - dt).max(0.0);
+            foe.suppress = (foe.suppress - SUPPRESS_DECAY * dt).max(0.0);
 
             // line of sight, throttled
             foe.los_t -= dt;
@@ -423,7 +689,47 @@ impl Field {
             let dist = to.length();
             let dir_xz = unit_xz(to);
 
-            // a fold in progress: still, then done
+            // -- airborne after a whip: a ballistic arc, then a landing --
+            if let Some(mut v) = foe.fling {
+                v.y -= g * dt;
+                foe.agent.position += v * dt;
+                foe.fling = Some(v);
+                let p = foe.agent.position;
+                let floor = ground(p.x, p.z) + ride_h;
+                // landed on someone: both wear it
+                let hit = others
+                    .iter()
+                    .filter(|(sl, _)| *sl != foe.slot)
+                    .find(|(_, op)| (*op - p).length() <= RAM_R)
+                    .map(|(sl, _)| *sl);
+                if p.y <= floor || hit.is_some() {
+                    let speed = v.length();
+                    foe.agent.position.y = floor;
+                    foe.fling = None;
+                    foe.stagger_t = STAGGER_S;
+                    ev.push(Event::Thrown { slot: foe.slot, into: hit, dmg: speed * THROW_DMG_PER_MS });
+                }
+                foe.vel = v;
+                continue;
+            }
+
+            // -- on the end of the player's tow: dragged, not acting --
+            if towed_slot == Some(foe.slot) {
+                // the tow physics runs below, once, with the cable
+                if dist > 1e-3 {
+                    foe.facing = dir_xz;
+                }
+                continue;
+            }
+
+            // -- staggered: still, and the fold does not advance --
+            if foe.stagger_t > 0.0 {
+                foe.stagger_t -= dt;
+                foe.vel = Vec3::ZERO;
+                continue;
+            }
+
+            // -- a fold in progress: still, then done --
             if foe.fold_t > 0.0 {
                 foe.fold_t -= dt;
                 if foe.fold_t <= 0.0 {
@@ -432,6 +738,46 @@ impl Field {
                     ev.push(Event::Folded { slot: foe.slot, form: foe.form });
                 }
                 foe.vel = Vec3::ZERO;
+                continue;
+            }
+
+            // -- hauling on the player: the pull --
+            if let Some(c) = foe.cable.as_mut() {
+                let a = End { pos: foe.agent.position, vel: Vec3::ZERO, mass: foe.mass };
+                let b = End { pos: player.pos, vel: player.vel, mass: player.mass };
+                let (pull, fate) = c.step(dt, &a, &b, Mode::Reel);
+                let age = c.age;
+                match fate {
+                    Fate::Holding => {
+                        // a heavier player drags the hauler toward them
+                        foe.agent.position += pull.a * dt * 4.0;
+                        if pull.b.length_squared() > 0.0 {
+                            ev.push(Event::Pulled { slot: foe.slot, dv: pull.b });
+                        }
+                        if age > CABLE_LIFE_S || player.vehicle {
+                            // a car does not stay on a line; a long haul
+                            // that never landed lets go
+                            foe.cable = None;
+                            ev.push(Event::CableOff { slot: foe.slot });
+                        }
+                    }
+                    Fate::Reeled => {
+                        foe.cable = None;
+                        ev.push(Event::CableOff { slot: foe.slot });
+                        // that was the point of dragging you in
+                        ev.push(Event::Melee { slot: foe.slot, dmg: foe.agent.melee_damage().max(fighter_dmg_per_shot(foe)) });
+                    }
+                    Fate::Snapped { .. } => {
+                        foe.cable = None;
+                        ev.push(Event::CableOff { slot: foe.slot });
+                    }
+                }
+                if dist > 1e-3 {
+                    foe.facing = dir_xz;
+                }
+                foe.vel = (foe.agent.position - before) / dt.max(1e-4);
+                let p = &mut foe.agent.position;
+                p.y = ground(p.x, p.z) + ride_h;
                 continue;
             }
 
@@ -449,8 +795,33 @@ impl Field {
                         foe.vel = Vec3::ZERO;
                         continue;
                     }
-                    let los = foe.los;
-                    foe.agent.update(los, player_cloaked, player_pos, dt);
+                    // suppressed: slower on the approach
+                    let los_now = foe.los;
+                    let sup = foe.suppress.min(1.0);
+                    let base_speed = foe.agent.move_speed;
+                    foe.agent.move_speed = base_speed * (1.0 - 0.5 * sup);
+                    foe.agent.update(los_now, player.cloaked, player_pos, dt);
+                    foe.agent.move_speed = base_speed;
+
+                    // the cable, on its own clock, whenever it fits: a
+                    // rail rank does not wait to be in its standoff to
+                    // throw a line — the line is how it closes the gap
+                    let reaches = cable_troop(foe.troop)
+                        && foe.cable_cd <= 0.0
+                        && foe.los
+                        && !player.vehicle
+                        && dist >= CABLE_MIN_M
+                        && dist <= CABLE_MAX_M
+                        && matches!(foe.agent.state, State::Chase | State::Attack);
+                    if reaches {
+                        foe.agent.wants_to_fire = false;
+                        foe.cable_cd = CABLE_CD_S;
+                        let a = End { pos: foe.agent.position, vel: Vec3::ZERO, mass: foe.mass };
+                        let b = End { pos: player.pos, vel: player.vel, mass: player.mass };
+                        foe.cable = Some(Cable::between(&a, &b));
+                        ev.push(Event::CableOut { slot: foe.slot, from: foe.agent.position + Vec3::Y * CHEST_H });
+                    }
+
                     if foe.agent.wants_to_fire {
                         foe.shots += 1;
                         let from = foe.agent.position + Vec3::Y * CHEST_H;
@@ -461,22 +832,12 @@ impl Field {
                         {
                             ev.push(Event::Melee { slot: foe.slot, dmg: foe.agent.melee_damage().max(dmg) });
                         } else {
-                            // deterministic scatter, wider with range
-                            let h = strhash(foe.troop.id) ^ (foe.shots as u64) ^ self.seed;
-                            let spread = SPREAD_RAD * (dist / SPREAD_REF_M).clamp(0.4, 2.0);
-                            let side = aim.cross(Vec3::Y).normalize_or(Vec3::X);
-                            let upv = side.cross(aim).normalize_or(Vec3::Y);
-                            let jx = hash_unit(h, 3) * 2.0 - 1.0;
-                            let jy = hash_unit(h, 4) * 2.0 - 1.0;
-                            let dir = (aim + (side * jx + upv * jy) * spread).normalize_or(aim);
-                            ev.push(Event::Fire {
-                                slot: foe.slot,
-                                from,
-                                dir,
-                                verb: foe.troop.fire,
-                                element: foe.troop.element,
-                                dmg,
-                            });
+                            // deterministic scatter, wider with range and
+                            // wider again under fire
+                            let h = strhash(foe.troop.id) ^ (foe.shots as u64) ^ seed;
+                            let spread = SPREAD_RAD * (dist / SPREAD_REF_M).clamp(0.4, 2.0) * (1.0 + 2.0 * sup);
+                            let dir = scatter(aim, spread, h);
+                            ev.push(Event::Fire { slot: foe.slot, from, dir, verb: foe.troop.fire, element: foe.troop.element, dmg });
                         }
                     }
                     if dist > 1e-3 {
@@ -500,6 +861,22 @@ impl Field {
                     let speed = foe.agent.move_speed * VEH_MUL;
                     foe.agent.position += gd * speed * dt;
                     foe.facing = gd;
+
+                    // the swarm shoots from the saddle: a Hijack in
+                    // vehicle form takes wild pot-shots while closing
+                    if foe.agent.kind == EnemyKind::Hijack {
+                        foe.agent.fire_timer -= dt;
+                        if foe.agent.fire_timer <= 0.0 && foe.los && dist <= foe.agent.attack_range {
+                            foe.agent.fire_timer = foe.agent.fire_cooldown * 1.5;
+                            foe.shots += 1;
+                            let from = foe.agent.position + Vec3::Y * (CHEST_H * 0.5);
+                            let aim = (player_pos + Vec3::Y * CHEST_H - from).normalize_or(dir_xz);
+                            let h = strhash(foe.troop.id) ^ (foe.shots as u64) ^ seed;
+                            let dir = scatter(aim, SPREAD_RAD * 3.0, h);
+                            ev.push(Event::Fire { slot: foe.slot, from, dir, verb: foe.troop.fire, element: foe.troop.element, dmg: fighter_dmg_per_shot(foe) * 0.6 });
+                        }
+                    }
+
                     // the ram: through the player at speed. Checked BEFORE
                     // the unfold so a player standing in the lane is hit
                     // rather than politely stopped for.
@@ -522,11 +899,11 @@ impl Field {
 
             // the player's ram: vehicle form, real speed, contact
             let d_after = (player_pos - foe.agent.position).length();
-            if player_vehicle && d_after <= RAM_R && foe.ram_cd <= 0.0 {
-                let v = player_vel.length();
+            if player.vehicle && d_after <= RAM_R && foe.ram_cd <= 0.0 {
+                let v = player.vel.length();
                 if v >= PLAYER_RAM_MIN_MS {
                     foe.ram_cd = RAM_CD_S;
-                    let dv = unit_xz(player_vel) * v * 0.5 + Vec3::Y * (v * 0.12);
+                    let dv = unit_xz(player.vel) * v * 0.5 + Vec3::Y * (v * 0.12);
                     // the body is knocked along the pass; the shell's bot
                     // follows the agent, so the shove has to land here
                     foe.agent.position += unit_xz(dv) * (v * 0.08);
@@ -539,7 +916,83 @@ impl Field {
             p.y = ground(p.x, p.z) + ride_h;
             foe.vel = if dt > 0.0 { (*p - before) / dt } else { Vec3::ZERO };
         }
+
+        // -- THE TOW: the player's line, one cable, physics once --
+        if let Some((slot, c)) = self.tow.as_mut() {
+            let slot = *slot;
+            let mut drop = false;
+            if let Some(foe) = self.foes.iter_mut().find(|f| f.slot == slot) {
+                if !foe.alive() || !player.vehicle {
+                    // a dead body slips the hook; a robot cannot tow
+                    drop = true;
+                } else {
+                    let a = End { pos: player.pos, vel: player.vel, mass: player.mass };
+                    let b = End { pos: foe.agent.position, vel: foe.vel, mass: foe.mass };
+                    let (pull, fate) = c.step(dt, &a, &b, Mode::Hold);
+                    match fate {
+                        Fate::Holding => {
+                            if pull.a.length_squared() > 0.0 {
+                                ev.push(Event::Yanked { slot, dv: pull.a });
+                            }
+                            // the towed body: a velocity, ground drag, no will
+                            foe.vel += pull.b;
+                            foe.vel *= 1.0 - (2.5 * dt).min(0.5);
+                            foe.agent.position += foe.vel * dt;
+                            let p = &mut foe.agent.position;
+                            p.y = ground(p.x, p.z) + ride_h;
+                            let speed = foe.vel.length();
+                            foe.tow_owed += TOW_DMG_PER_MS_S * speed * dt;
+                            foe.tow_t += dt;
+                            if foe.tow_t >= TOW_REPORT_S && foe.tow_owed > 0.0 {
+                                ev.push(Event::Towed { slot, dmg: foe.tow_owed });
+                                foe.tow_owed = 0.0;
+                                foe.tow_t = 0.0;
+                            }
+                        }
+                        Fate::Snapped { .. } | Fate::Reeled => drop = true,
+                    }
+                }
+            } else {
+                drop = true;
+            }
+            if drop {
+                self.tow = None;
+                ev.push(Event::CableOff { slot });
+            }
+        }
         ev
+    }
+}
+
+/// A deterministic cone scatter around `aim`: two hashed lanes, one per
+/// axis, scaled by `spread` in radians.
+fn scatter(aim: Vec3, spread: f32, h: u64) -> Vec3 {
+    let side = aim.cross(Vec3::Y).normalize_or(Vec3::X);
+    let upv = side.cross(aim).normalize_or(Vec3::Y);
+    let jx = hash_unit(h, 3) * 2.0 - 1.0;
+    let jy = hash_unit(h, 4) * 2.0 - 1.0;
+    (aim + (side * jx + upv * jy) * spread).normalize_or(aim)
+}
+
+/// The player, as the field sees them this tick.
+#[derive(Clone, Copy, Debug)]
+pub struct Player {
+    pub pos: Vec3,
+    pub vel: Vec3,
+    /// vehicle form: rams, tows, cannot be pulled
+    pub vehicle: bool,
+    /// the cloak ability, when the shell wires it
+    pub cloaked: bool,
+    /// relative mass, `cable::CAR_MASS` units
+    pub mass: f32,
+}
+
+impl Player {
+    pub fn standing(pos: Vec3) -> Player {
+        Player { pos, vel: Vec3::ZERO, vehicle: false, cloaked: false, mass: cable::CAR_MASS }
+    }
+    pub fn driving(pos: Vec3, vel: Vec3) -> Player {
+        Player { pos, vel, vehicle: true, cloaked: false, mass: cable::CAR_MASS }
     }
 }
 
@@ -623,7 +1076,7 @@ mod tests {
         let mut fired = false;
         let mut max_lateral = 0.0f32;
         for _ in 0..(120 * 40) {
-            for e in f.step(1.0 / 120.0, player, Vec3::ZERO, false, false, &flat, &open) {
+            for e in f.step(1.0 / 120.0, &Player::standing(player), &flat, &open) {
                 match e {
                     Event::Folded { form: Form::Vehicle, .. } => folded_down = true,
                     Event::Folded { form: Form::Robot, .. } => folded_up = true,
@@ -657,7 +1110,7 @@ mod tests {
         let player = Vec3::new(0.0, 0.19, -60.0);
         let mut melee = false;
         for _ in 0..(120 * 60) {
-            for e in f.step(1.0 / 120.0, player, Vec3::ZERO, false, false, &flat, &wall) {
+            for e in f.step(1.0 / 120.0, &Player::standing(player), &flat, &wall) {
                 match e {
                     Event::Folded { .. } => panic!("a Corrupted folded"),
                     Event::Fire { .. } => panic!("a Corrupted shot instead of lunging"),
@@ -686,7 +1139,7 @@ mod tests {
         // let it fold and get rolling
         let mut ticks = 0;
         while !(f.foes[0].form == Form::Vehicle && f.foes[0].fold_t <= 0.0) {
-            f.step(1.0 / 120.0, player, Vec3::ZERO, false, false, &flat, &open);
+            f.step(1.0 / 120.0, &Player::standing(player), &flat, &open);
             ticks += 1;
             assert!(ticks < 120 * 5, "never got rolling");
         }
@@ -696,7 +1149,7 @@ mod tests {
         for _ in 0..60 {
             let foe = &f.foes[0];
             player = foe.pos() + foe.facing * 1.0;
-            for e in f.step(1.0 / 120.0, player, Vec3::ZERO, false, false, &flat, &open) {
+            for e in f.step(1.0 / 120.0, &Player::standing(player), &flat, &open) {
                 if let Event::Ram { dmg, dv, .. } = e {
                     assert!(dmg > 0.0 && dv.length() > 0.0);
                     rams += 1;
@@ -718,7 +1171,7 @@ mod tests {
         let player = f.foes[0].pos() + Vec3::new(0.0, 0.0, -90.0);
         let mut closest = f32::MAX;
         for _ in 0..(120 * 20) {
-            for e in f.step(1.0 / 120.0, player, Vec3::ZERO, false, false, &flat, &open) {
+            for e in f.step(1.0 / 120.0, &Player::standing(player), &flat, &open) {
                 if let Event::Ram { .. } = e {
                     panic!("rammed a player who stood still beside the lane");
                 }
@@ -741,16 +1194,16 @@ mod tests {
         let at = f.foes[0].pos();
         let fast = Vec3::new(0.0, 0.0, 20.0);
         // robot form: a hit at speed is not a ram
-        let ev = f.step(1.0 / 120.0, at, fast, false, false, &flat, &open);
+        let ev = f.step(1.0 / 120.0, &Player { pos: at, vel: fast, vehicle: false, cloaked: false, mass: cable::CAR_MASS }, &flat, &open);
         assert!(!ev.iter().any(|e| matches!(e, Event::Rammed { .. })), "rammed in robot form");
         // vehicle form, slow: not a ram
-        let ev = f.step(1.0 / 120.0, at, Vec3::new(0.0, 0.0, 3.0), true, false, &flat, &open);
+        let ev = f.step(1.0 / 120.0, &Player::driving(at, Vec3::new(0.0, 0.0, 3.0)), &flat, &open);
         assert!(!ev.iter().any(|e| matches!(e, Event::Rammed { .. })), "a rolling nudge counted");
         // vehicle form, fast: one ram, then the cooldown holds
-        let ev = f.step(1.0 / 120.0, at, fast, true, false, &flat, &open);
+        let ev = f.step(1.0 / 120.0, &Player::driving(at, fast), &flat, &open);
         let n = ev.iter().filter(|e| matches!(e, Event::Rammed { .. })).count();
         assert_eq!(n, 1);
-        let ev = f.step(1.0 / 120.0, at, fast, true, false, &flat, &open);
+        let ev = f.step(1.0 / 120.0, &Player::driving(at, fast), &flat, &open);
         assert!(!ev.iter().any(|e| matches!(e, Event::Rammed { .. })), "rammed twice in two ticks");
     }
 
@@ -762,13 +1215,13 @@ mod tests {
         s.fighters[1].hp = 0.0;
         f.sync(&s.fighters);
         f.sync(&s.fighters);
-        let ev = f.step(1.0 / 120.0, Vec3::new(0.0, 0.19, -500.0), Vec3::ZERO, false, false, &flat, &open);
+        let ev = f.step(1.0 / 120.0, &Player::standing(Vec3::new(0.0, 0.19, -500.0)), &flat, &open);
         let downs: Vec<_> = ev.iter().filter(|e| matches!(e, Event::Down { slot: 1 })).collect();
         assert_eq!(downs.len(), 1, "a fight kill reported {} times", downs.len());
         assert!(!f.foes[1].alive());
         assert_eq!(f.alive(), 2);
         f.clear();
-        let ev = f.step(1.0 / 120.0, Vec3::ZERO, Vec3::ZERO, false, false, &flat, &open);
+        let ev = f.step(1.0 / 120.0, &Player::standing(Vec3::ZERO), &flat, &open);
         assert_eq!(ev.iter().filter(|e| matches!(e, Event::Down { .. })).count(), 2);
         assert!(f.foes.is_empty());
     }
@@ -786,7 +1239,7 @@ mod tests {
         };
         let player = Vec3::new(0.0, 0.19, 40.0); // in sight, at range
         for _ in 0..120 {
-            f.step(1.0 / 120.0, player, Vec3::ZERO, false, false, &flat, &counting);
+            f.step(1.0 / 120.0, &Player::standing(player), &flat, &counting);
         }
         let n = asks.get();
         // 4 foes x 4 asks/s, plus the staggered first ask
@@ -818,9 +1271,307 @@ mod tests {
         let player = Vec3::new(30.0, 0.19, 30.0);
         let before = f.foes[0].pos();
         for _ in 0..240 {
-            f.step(1.0 / 120.0, player, Vec3::ZERO, false, false, &flat, &wall);
+            f.step(1.0 / 120.0, &Player::standing(player), &flat, &wall);
         }
         let after = f.foes[0].pos();
         assert!((player - after).length() < (player - before).length(), "did not close on the shooter");
+    }
+
+    // ---- the two registers ----
+
+    #[test]
+    fn a_heavy_hit_staggers_and_a_stream_of_fast_ones_suppresses() {
+        let s = wave(&["grunt", "grunt"]);
+        let mut f = field();
+        f.muster(1, &s.fighters, None);
+        let max = f.foes[0].agent.max_hp;
+        // heavy but small: no stagger
+        f.hit(0, max * STAGGER_FRAC * 0.5, Register::Heavy);
+        assert_eq!(f.foes[0].stagger_t, 0.0);
+        // heavy and large: staggered, and the field says so
+        f.hit(0, max * STAGGER_FRAC, Register::Heavy);
+        assert!(f.foes[0].stagger_t > 0.0);
+        let ev = f.step(1.0 / 120.0, &Player::standing(Vec3::new(0.0, 0.19, 40.0)), &flat, &open);
+        assert!(ev.iter().any(|e| matches!(e, Event::Staggered { slot: 0 })));
+        // a staggered body does not move for STAGGER_S
+        let before = f.foes[0].pos();
+        for _ in 0..(120 as f32 * STAGGER_S * 0.9) as usize {
+            f.step(1.0 / 120.0, &Player::standing(Vec3::new(0.0, 0.19, 40.0)), &flat, &open);
+        }
+        assert_eq!(f.foes[0].pos(), before, "moved while staggered");
+        assert!(!f.foes[0].free());
+        // fast fire never staggers, however much of it
+        for _ in 0..20 {
+            f.hit(1, max, Register::Fast);
+        }
+        assert_eq!(f.foes[1].stagger_t, 0.0);
+        assert!(f.foes[1].suppress >= 1.0, "twenty fast hits did not pin it: {}", f.foes[1].suppress);
+        // and suppression drains when the fire stops
+        for _ in 0..(120 * 3) {
+            f.step(1.0 / 120.0, &Player::standing(Vec3::new(0.0, 0.19, 400.0)), &flat, &wall);
+        }
+        assert_eq!(f.foes[1].suppress, 0.0);
+    }
+
+    #[test]
+    fn a_body_hit_mid_fold_is_caught_between_forms_and_exposed() {
+        let s = wave(&["grunt"]);
+        let mut f = field();
+        f.muster(1, &s.fighters, None);
+        f.foes[0].agent.state = State::Chase;
+        let player = Player::standing(Vec3::new(0.0, 0.19, -90.0));
+        let mut n = 0;
+        while f.foes[0].fold_t <= 0.0 {
+            f.step(1.0 / 120.0, &player, &flat, &open);
+            n += 1;
+            assert!(n < 600, "never started folding");
+        }
+        assert!((f.foes[0].exposure(false) - MIDFOLD_EXPOSURE).abs() < 1e-6);
+        let left = f.foes[0].fold_t;
+        f.hit(0, 1.0, Register::Heavy);
+        assert!(f.foes[0].fold_t > left, "the fold did not stall");
+        assert!(f.foes[0].fold_t <= FOLD_S * 2.0, "stall past the cap");
+        for _ in 0..(120 * 3) {
+            f.step(1.0 / 120.0, &player, &flat, &open);
+        }
+        assert_eq!(f.foes[0].fold_t, 0.0);
+        assert_eq!(f.foes[0].exposure(false), 1.0);
+    }
+
+    // ---- the cable ----
+
+    fn rail_troop() -> &'static str {
+        crate::content::hostiles()
+            .find(|t| cable_troop(t))
+            .map(|t| t.id)
+            .expect("no cable troop in content")
+    }
+
+    #[test]
+    fn a_rail_rank_reaches_for_a_standing_player_and_hauls() {
+        let id = rail_troop();
+        let s = wave(&[id]);
+        let mut f = field();
+        f.muster(1, &s.fighters, None);
+        f.foes[0].cable_cd = 0.0;
+        let at = f.foes[0].pos() + Vec3::new(0.0, 0.0, -30.0);
+        let mut player = Player::standing(at);
+        let mut out = false;
+        let mut pulled = Vec3::ZERO;
+        for _ in 0..(120 * 8) {
+            for e in f.step(1.0 / 120.0, &player, &flat, &open) {
+                match e {
+                    Event::CableOut { slot: 0, .. } => out = true,
+                    Event::Pulled { dv, .. } => {
+                        pulled += dv;
+                        player.vel += dv;
+                    }
+                    _ => {}
+                }
+            }
+            player.vel *= 0.96;
+            player.pos += player.vel * (1.0 / 120.0);
+            if pulled.length() > 3.0 {
+                break;
+            }
+        }
+        assert!(out, "the rail rank never threw a cable");
+        assert!(pulled.length() > 3.0, "the cable never hauled: {pulled:?}");
+        let toward = (f.foes[0].pos() - at).normalize_or(Vec3::Z);
+        assert!(pulled.normalize_or(Vec3::Z).dot(toward) > 0.8, "pulled the wrong way");
+    }
+
+    #[test]
+    fn a_car_cannot_be_pulled_and_a_line_on_one_is_let_go() {
+        let id = rail_troop();
+        let s = wave(&[id]);
+        let mut f = field();
+        f.muster(1, &s.fighters, None);
+        f.foes[0].cable_cd = 0.0;
+        let at = f.foes[0].pos() + Vec3::new(0.0, 0.0, -30.0);
+        let mut got = false;
+        for _ in 0..(120 * 6) {
+            for e in f.step(1.0 / 120.0, &Player::standing(at), &flat, &open) {
+                if let Event::CableOut { .. } = e {
+                    got = true;
+                }
+            }
+            if got {
+                break;
+            }
+        }
+        assert!(got);
+        let ev = f.step(1.0 / 120.0, &Player::driving(at, Vec3::ZERO), &flat, &open);
+        assert!(ev.iter().any(|e| matches!(e, Event::CableOff { slot: 0 })), "a car stayed on the line");
+        assert!(f.foes[0].cable.is_none());
+    }
+
+    #[test]
+    fn the_hook_takes_the_nearest_body_in_the_cone_and_only_one_at_a_time() {
+        let s = wave(&["grunt", "grunt", "grunt"]);
+        let mut f = field();
+        f.muster(1, &s.fighters, None);
+        let from = f.anchor + f.facing * 30.0;
+        let aim = -f.facing;
+        let slot = f.hook(from, aim, cable::CAR_MASS).expect("nothing hooked");
+        let d = (f.foes.iter().find(|x| x.slot == slot).unwrap().pos() - from).length();
+        for foe in &f.foes {
+            let od = (foe.pos() - from).length();
+            let to = (foe.pos() - from).normalize_or(aim);
+            if to.dot(aim) >= 0.94 {
+                assert!(od >= d - 1e-3, "hooked slot {slot} at {d:.1} with slot {} nearer at {od:.1}", foe.slot);
+            }
+        }
+        assert!(f.towed(slot));
+        assert!(f.hook(from, aim, cable::CAR_MASS).is_none());
+        f.release();
+        assert!(f.hook(from + f.facing * 200.0, aim, cable::CAR_MASS).is_none());
+    }
+
+    #[test]
+    fn a_towed_grunt_is_dragged_wears_road_damage_and_cannot_act() {
+        let s = wave(&["grunt"]);
+        let mut f = field();
+        f.muster(1, &s.fighters, None);
+        let start = f.foes[0].pos();
+        let mut car = Player::driving(start + Vec3::new(0.0, 0.0, -10.0), Vec3::new(0.0, 0.0, -18.0));
+        f.hook(car.pos, (start - car.pos).normalize(), car.mass).expect("hook");
+        let mut owed = 0.0;
+        let mut fired = false;
+        for _ in 0..(120 * 4) {
+            for e in f.step(1.0 / 120.0, &car, &flat, &open) {
+                match e {
+                    Event::Towed { dmg, .. } => owed += dmg,
+                    Event::Fire { .. } | Event::Melee { .. } => fired = true,
+                    Event::Yanked { dv, .. } => car.vel += dv,
+                    _ => {}
+                }
+            }
+            car.vel = car.vel.normalize_or(Vec3::NEG_Z) * 18.0;
+            car.pos += car.vel * (1.0 / 120.0);
+        }
+        assert!(f.towed(0), "the line did not hold a grunt behind a car");
+        let moved = (f.foes[0].pos() - start).length();
+        assert!(moved > 30.0, "dragged only {moved:.1} m in four seconds");
+        assert!(owed > 0.0, "no road damage owed");
+        assert!(!fired, "a towed body shot back");
+        assert!((f.foes[0].exposure(true) - TOWED_EXPOSURE).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_juggernaut_on_the_line_yanks_the_car_not_the_other_way() {
+        let s = wave(&["corrupted_apex"]);
+        let mut f = field();
+        f.muster(1, &s.fighters, Some("corrupted_apex"));
+        let start = f.foes[0].pos();
+        assert!(f.foes[0].mass > cable::CAR_MASS * 1.5, "a juggernaut should outweigh the car");
+        let mut car = Player::driving(start + Vec3::new(0.0, 0.0, -10.0), Vec3::new(0.0, 0.0, -18.0));
+        f.hook(car.pos, (start - car.pos).normalize(), car.mass).expect("hook");
+        let mut yank = Vec3::ZERO;
+        for _ in 0..(120 * 2) {
+            for e in f.step(1.0 / 120.0, &car, &flat, &open) {
+                if let Event::Yanked { dv, .. } = e {
+                    yank += dv;
+                    car.vel += dv;
+                }
+            }
+            car.pos += car.vel * (1.0 / 120.0);
+        }
+        let heavy_moved = (f.foes[0].pos() - start).length();
+        assert!(yank.length() > heavy_moved, "the car was not the one yanked: car {:.1} vs body {heavy_moved:.1}", yank.length());
+    }
+
+    #[test]
+    fn the_whip_flings_the_body_and_it_lands_on_a_neighbour() {
+        let s = wave(&["grunt", "grunt"]);
+        let mut f = field();
+        f.muster(1, &s.fighters, None);
+        let p0 = f.foes[0].pos();
+        let target = p0 + Vec3::new(12.0, 0.0, 0.0);
+        f.foes[1].agent.position = target;
+        let mut car = Player::driving(p0 + Vec3::new(0.0, 0.0, -6.0), Vec3::ZERO);
+        f.hook(car.pos, (p0 - car.pos).normalize(), car.mass).expect("hook");
+        let mut swing: f32 = 0.0;
+        for i in 0..(120 * 2) {
+            let t = i as f32 / 120.0;
+            let omega = 3.0;
+            let r = 6.0;
+            car.pos = p0 + Vec3::new(r * (omega * t).sin(), 0.0, -r * (omega * t).cos());
+            car.vel = Vec3::new(r * omega * (omega * t).cos(), 0.0, r * omega * (omega * t).sin());
+            f.step(1.0 / 120.0, &car, &flat, &open);
+            if let Some((_, c)) = f.tow.as_ref() {
+                swing = f32::max(swing, c.swing_ms);
+            } else {
+                break;
+            }
+        }
+        assert!(f.towed(0), "the line parted while loading the whip (swing {swing:.1})");
+        assert!(swing >= WHIP_MIN_MS, "never loaded a whip: {swing:.1} m/s");
+        f.foes[0].vel = Vec3::new(swing, 0.0, 0.0);
+        f.release();
+        let mut whipped = false;
+        let mut thrown: Option<Event> = None;
+        for _ in 0..(120 * 6) {
+            for e in f.step(1.0 / 120.0, &Player::driving(car.pos, Vec3::ZERO), &flat, &open) {
+                match e {
+                    Event::Whipped { slot: 0, .. } => whipped = true,
+                    Event::Thrown { slot: 0, .. } => thrown = Some(e),
+                    _ => {}
+                }
+            }
+            if thrown.is_some() {
+                break;
+            }
+        }
+        assert!(whipped, "no whip on release at {swing:.1} m/s");
+        match thrown {
+            Some(Event::Thrown { into, dmg, .. }) => {
+                assert!(dmg > 0.0);
+                assert_eq!(into, Some(1), "flew past the neighbour it was aimed at");
+            }
+            _ => panic!("never landed"),
+        }
+        assert!(f.foes[0].stagger_t > 0.0, "landed and got straight up");
+    }
+
+    #[test]
+    fn a_slow_release_is_a_drop_not_a_throw() {
+        let s = wave(&["grunt"]);
+        let mut f = field();
+        f.muster(1, &s.fighters, None);
+        let p0 = f.foes[0].pos();
+        let car = Player::driving(p0 + Vec3::new(0.0, 0.0, -6.0), Vec3::ZERO);
+        f.hook(car.pos, (p0 - car.pos).normalize(), car.mass).expect("hook");
+        f.step(1.0 / 120.0, &car, &flat, &open);
+        f.release();
+        let ev = f.step(1.0 / 120.0, &car, &flat, &open);
+        assert!(!ev.iter().any(|e| matches!(e, Event::Whipped { .. })));
+        assert!(ev.iter().any(|e| matches!(e, Event::CableOff { slot: 0 })));
+        assert!(f.foes[0].fling.is_none());
+        assert!(!f.towed(0));
+    }
+
+    #[test]
+    fn the_swarm_shoots_from_the_saddle() {
+        let s = wave(&["hijack_swarmer"]);
+        let mut f = field();
+        f.muster(1, &s.fighters, None);
+        f.foes[0].agent.state = State::Chase;
+        let player = Player::standing(f.foes[0].pos() + Vec3::new(0.0, 0.0, -100.0));
+        let mut saddle_shots = 0;
+        for _ in 0..(120 * 12) {
+            let veh = f.foes[0].form == Form::Vehicle && f.foes[0].fold_t <= 0.0;
+            for e in f.step(1.0 / 120.0, &player, &flat, &open) {
+                if let Event::Fire { .. } = e {
+                    if veh {
+                        saddle_shots += 1;
+                    }
+                }
+            }
+            if f.foes[0].form == Form::Robot && f.foes[0].fold_t <= 0.0 && saddle_shots > 0 {
+                break;
+            }
+        }
+        assert!(saddle_shots > 0, "a swarmer drove the whole way in silence");
     }
 }
