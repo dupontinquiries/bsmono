@@ -198,10 +198,29 @@ pub fn authorize_text(text: &str, gate: &ToolGate) -> (String, Vec<Anomaly>) {
         let after = &rest[i..];
 
         // The opener's own line/tag carries the attributes.
+        //
+        // FOR A FENCE, THE ATTRIBUTES END AT THE JSON, NOT AT THE NEWLINE.
+        // Taking the whole line worked only while models put the body on the
+        // next line. A one-line call —
+        //
+        //   ```toolnonce="a25d…"{"tool": "list_dir", "path": "src"}
+        //
+        // — has its body INSIDE that line, and the authorised branch then
+        // emitted a clean ```tool opener and resumed after the newline,
+        // throwing the arguments away. The tool parser downstream saw a call
+        // with no path and could not read anything; the operator saw a
+        // truncated diagnostic and reasonably concluded the model had sent an
+        // empty path. It had not.
+        //
+        // So the fence head stops at whichever comes first: the newline, or
+        // the `{` that starts the payload. XML is unaffected — `>` already
+        // ends the tag exactly.
         let head_end = if is_xml {
             after.find('>').map(|p| p + 1).unwrap_or(after.len())
         } else {
-            after.find('\n').map(|p| p + 1).unwrap_or(after.len())
+            let nl = after.find('\n').map(|p| p + 1).unwrap_or(after.len());
+            let brace = after.find('{').unwrap_or(after.len());
+            nl.min(brace)
         };
         let head = &after[..head_end];
 
@@ -246,9 +265,25 @@ impl Anomaly {
     }
 }
 
+/// The evidence line for a rejected call.
+///
+/// 70 characters was not enough and the shortfall actively misled. A real
+/// rejection read:
+///
+/// ```text
+/// ...: ```toolnonce="a25d4c37b6a0a717d400597c"{  "tool": "list_dir",  "path":
+/// ```
+///
+/// which is 67 characters — the cut landed one token past `"path":`, so the
+/// operator read it as the model having sent an empty path and went looking
+/// for a bug in the model. The nonce alone eats 36 of the 70.
+///
+/// 240 is enough to carry the fence, the nonce and a short call whole, and it
+/// says when it truncated so a cut is never mistaken for an empty field.
 fn snip(s: &str) -> String {
-    let one: String = s.chars().filter(|c| *c != '\n').take(70).collect();
-    one
+    const MAX: usize = 240;
+    let one: String = s.chars().filter(|c| *c != '\n').take(MAX).collect();
+    if one.chars().count() == MAX { format!("{one}… [truncated]") } else { one }
 }
 
 /// Pull the JSON payloads of properly nonced tool calls out of MODEL output. Returns the payloads
@@ -363,6 +398,62 @@ pub fn sanitize_for_display(s: &str, max_line: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A ONE-LINE TOOL CALL LOSES ITS BODY.
+    ///
+    /// `authorize_text` treats everything up to the first newline as the
+    /// opener's attribute line, and on the authorised path it emits a clean
+    /// ```` ```tool ```` opener and resumes AFTER that newline. A model that
+    /// puts the JSON on the same line as the nonce therefore has its arguments
+    /// eaten: the call reaches the tool parser with no path, no pattern, no
+    /// anything.
+    ///
+    /// This is what a real run looked like — note there is no newline between
+    /// the nonce and the `{`:
+    ///
+    /// ```text
+    /// ```toolnonce="a25d4c37b6a0a717d400597c"{  "tool": "list_dir",  "path": ...
+    /// ```
+    ///
+    /// Small models emit this shape often, because nothing in the prompt makes
+    /// the newline look load-bearing.
+    #[test]
+    fn a_tool_call_on_one_line_keeps_its_arguments() {
+        let n = Nonce::fresh();
+        // exactly the shape from the run: no space before `nonce`, no newline
+        // before the `{`
+        let text = format!(
+            "```toolnonce=\"{}\"{{\"tool\": \"list_dir\", \"path\": \"src\"}}\n```\n",
+            n.as_str()
+        );
+        let gate = ToolGate::Required(n);
+        let (out, anomalies) = authorize_text(&text, &gate);
+        assert!(anomalies.is_empty(), "a correctly nonced call was rejected: {anomalies:?}");
+        assert!(
+            out.contains("list_dir"),
+            "the tool name was eaten with the attribute line:\n{out}"
+        );
+        assert!(
+            out.contains("\"path\": \"src\""),
+            "the arguments were eaten — this is the empty-path bug:\n{out}"
+        );
+    }
+
+    /// The ordinary shape must keep working: nonce on the fence line, JSON on
+    /// the lines below.
+    #[test]
+    fn a_tool_call_across_lines_still_works() {
+        let n = Nonce::fresh();
+        let text = format!(
+            "```tool nonce=\"{}\"\n{{\"tool\": \"list_dir\", \"path\": \"src\"}}\n```\n",
+            n.as_str()
+        );
+        let gate = ToolGate::Required(n);
+        let (out, anomalies) = authorize_text(&text, &gate);
+        assert!(anomalies.is_empty(), "{anomalies:?}");
+        assert!(out.contains("\"path\": \"src\""), "{out}");
+    }
+
     use super::*;
 
     fn call(nonce: &str, json: &str) -> String {
