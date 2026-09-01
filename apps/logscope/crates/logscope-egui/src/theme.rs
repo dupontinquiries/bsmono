@@ -1822,6 +1822,13 @@ pub fn panel(ui: &mut egui::Ui, accent: Color32, title: &str, copy: Option<Strin
         ..Default::default()
     }
     .show(ui, |ui| {
+        // Reserved BEFORE any content paints, so `interior_grain` (filled in below, once the final
+        // rect is known) lands between the frame's own background — reserved earlier still, by
+        // Frame::begin — and the title/body drawn after this line. Same reserve-now/fill-later
+        // trick Frame itself uses for its background, which is what lets this sit fully UNDER the
+        // text rather than risk a legibility hit from painting over it afterward like carved_frame's
+        // border grain does (safe there only because that band has no content in it).
+        let grain_idx = ui.painter().add(egui::Shape::Noop);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             let (bar, _) = ui.allocate_exact_size(egui::vec2(5.0, 15.0), Sense::hover());
@@ -1837,10 +1844,40 @@ pub fn panel(ui: &mut egui::Ui, accent: Color32, title: &str, copy: Option<Strin
         });
         ui.add_space(9.0);
         body(ui);
+        grain_idx
     });
     // carve the stone frame into the margin band after the content is laid out
     let t = ui.input(|i| i.time) as f32;
-    carved_frame(ui.painter(), inner.response.rect, t, accent);
+    let rect = inner.response.rect;
+    interior_grain(ui.painter(), rect, inner.inner);
+    carved_frame(ui.painter(), rect, t, accent);
+}
+
+/// Sparse material speckle across a panel's whole interior, filled into a shape slot reserved
+/// before content painted (see `panel()`) so it sits behind the text rather than on top of it —
+/// far lower alpha than the border band's grain (7 vs 22) since this one CAN'T rely on an empty
+/// band to stay clear of text; being behind the glyphs is what keeps it safe at any alpha, but
+/// low alpha keeps it reading as texture instead of dirt even where a background IS interior, not
+/// content (e.g. body text is short and leaves space).
+fn interior_grain(p: &egui::Painter, rect: egui::Rect, idx: egui::layers::ShapeIdx) {
+    let pal = active();
+    if pal.material == Material::None { p.set(idx, egui::Shape::Noop); return; }
+    let spacing = 24.0_f32;
+    let cols = (rect.width() / spacing).round().max(1.0) as usize;
+    let rows = (rect.height() / spacing).round().max(1.0) as usize;
+    let mut shapes = Vec::with_capacity(cols * rows);
+    for iy in 0..rows {
+        let fy = rect.top() + rect.height() * (iy as f32 + 0.5) / rows as f32;
+        for ix in 0..cols {
+            let fx = rect.left() + rect.width() * (ix as f32 + 0.5) / cols as f32;
+            let g = material_grain(pal.material, fx, fy);
+            let a = (g.abs() * 11.0).min(11.0) as u8;
+            if a == 0 { continue; }
+            let col = if g >= 0.0 { Color32::from_white_alpha(a) } else { Color32::from_black_alpha(a) };
+            shapes.push(egui::Shape::circle_filled(egui::pos2(fx, fy), 1.0, col));
+        }
+    }
+    p.set(idx, egui::Shape::Vec(shapes));
 }
 
 /// Section header: an amber lead glyph (▌) + UPPERCASE dim title.
