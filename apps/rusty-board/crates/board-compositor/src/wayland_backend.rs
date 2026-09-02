@@ -96,6 +96,10 @@ pub type SurroundingTextCallback =
 #[derive(Clone)]
 pub struct WaylandBackend {
     inner: Arc<Mutex<BackendInner>>,
+    /// The connection the queue belongs to, kept OUTSIDE the mutex so
+    /// `pump` can read the socket without holding the backend lock
+    /// across a syscall (the dispatch handlers take that lock).
+    conn: Connection,
 }
 
 struct BackendInner {
@@ -210,6 +214,18 @@ fn share_gdk_connection(
 /// from its own input-method connection; it isn't a reason a wholly
 /// separate process/binary can't be its own single input-method client.
 fn open_standalone_connection() -> Result<(Connection, WlSeat)> {
+    // KWin (Plasma Mobile / Plasma desktop) launches the configured
+    // virtual keyboard with a PRIVILEGED socket in `WAYLAND_SOCKET`; the
+    // input-method globals live on that connection, not on the public
+    // `$WAYLAND_DISPLAY` one. The GTK build captures it in main.rs and
+    // `try_new` consumes it — the standalone path used to ignore it, so an
+    // eframe build started by KWin connected to the public socket, found no
+    // input-method global, and fell back to preview. Same precedence as
+    // `try_new`: inherited fd first, `$WAYLAND_DISPLAY` otherwise.
+    if let Some(fd) = crate::im_socket::take_inherited_fd() {
+        info!("Wayland backend (standalone): using inherited input-method fd {}", fd);
+        return open_inherited_connection(fd);
+    }
     let conn = Connection::connect_to_env()
         .map_err(|e| anyhow!("failed to connect to $WAYLAND_DISPLAY: {}", e))?;
     let seat = probe_seat(&conn)?;
@@ -362,11 +378,17 @@ fn finish_setup(
         keymap,
     }));
 
-    // 8. Hook the connection's fd into the GTK main loop so events get
-    //    dispatched without a polling thread.
-    install_glib_dispatcher(conn, inner.clone());
+    // 8. Dispatching is the HOST's job, through `WaylandBackend::pump`.
+    //    The GTK app has a GLib main loop and installs the self-adaptive
+    //    timer below on top of it; a host with its own frame loop (the
+    //    egui build) calls `pump()` once per frame instead. The timer
+    //    used to be installed unconditionally, which made the plain
+    //    `wayland` feature depend on `glib` without declaring it — the
+    //    GTK-free path could not compile on its own.
+    #[cfg(feature = "gdk-integration")]
+    install_glib_dispatcher(conn.clone(), inner.clone());
 
-    Ok(Some(WaylandBackend { inner }))
+    Ok(Some(WaylandBackend { inner, conn }))
 }
 
 /// Registry probe used by both `open_inherited_connection` and
@@ -487,6 +509,20 @@ pub fn try_new(
 }
 
 impl WaylandBackend {
+    /// Read whatever the compositor has sent, dispatch it to the protocol
+    /// handlers (Activate/Deactivate reach the callbacks from here), and
+    /// flush anything queued to go out. Non-blocking: returns immediately
+    /// with the number of events dispatched, `0` when nothing arrived.
+    ///
+    /// This is the one entry point a host loop needs. The GTK app never
+    /// calls it — its GLib timer (`install_glib_dispatcher`, under
+    /// `gdk-integration`) does the same three steps on a timer. Any other
+    /// host (eframe per frame, a layer-shell loop after each poll) calls
+    /// this itself; there is no thread and no toolkit inside.
+    pub fn pump(&self) -> Result<usize> {
+        dispatch_once(&self.conn, &self.inner)
+    }
+
     /// Whether this backend uses the modern input-method-v2 path
     /// (Phosh/wlroots) versus the legacy v1 path (Plasma Mobile).
     /// Useful for deciding whether to trust Activate events for
@@ -1220,6 +1256,43 @@ fn memfd_create(name: &str) -> Result<std::fs::File> {
 // which is plenty for input-method events (they fire on focus changes,
 // not at refresh rate).
 
+/// One dispatcher step: read the socket if it can be read now, dispatch
+/// the buffered events for our queue, flush the backstop. Shared by the
+/// GLib timer and `WaylandBackend::pump`, so the two hosts cannot drift in
+/// what "processing events" means.
+///
+/// Returns `Err` only for a dead connection (`read` or `dispatch_pending`
+/// failing for a reason other than WouldBlock); a caller on a timer should
+/// stop re-arming on `Err`.
+fn dispatch_once(conn: &Connection, inner: &Arc<Mutex<BackendInner>>) -> Result<usize> {
+    // When the backend already has events buffered, prepare_read()
+    // returns None (nothing to read yet — just dispatch). When the socket
+    // may have new bytes for us, it returns Some(guard) and we read. With
+    // our own connection nothing else reads the socket, so we must; with
+    // GDK's shared connection its poll loop is already reading and
+    // prepare_read usually returns None.
+    if let Some(guard) = conn.prepare_read() {
+        use wayland_client::backend::WaylandError;
+        match guard.read() {
+            Ok(_) => {}
+            Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => bail!("wl conn.read failed: {}", e),
+        }
+    }
+    let dispatched = {
+        let mut guard = inner.lock();
+        let BackendInner { queue, app_data, .. } = &mut *guard;
+        queue
+            .dispatch_pending(app_data)
+            .map_err(|e| anyhow!("queue.dispatch_pending failed: {}", e))?
+    };
+    // Backstop flush — most outgoing paths already flush themselves, so
+    // this is normally a no-op. Cheap to do unconditionally.
+    let _ = conn.flush();
+    Ok(dispatched)
+}
+
+#[cfg(feature = "gdk-integration")]
 fn install_glib_dispatcher(conn: Connection, inner: Arc<Mutex<BackendInner>>) {
     // Self-adaptive cadence. The dispatcher serves two jobs:
     //
@@ -1254,56 +1327,18 @@ fn install_glib_dispatcher(conn: Connection, inner: Arc<Mutex<BackendInner>>) {
     let rearm_inner = rearm_slot.clone();
 
     let tick: Rearm = Rc::new(move || {
-        // Try to read any pending events from the socket. When the
-        // backend already has events buffered, prepare_read() returns
-        // None (we don't need to read yet — just dispatch). When the
-        // socket may have new bytes for us, it returns Some(guard) and
-        // we read.
-        //
-        // With our own connection (inherited fd), nothing else reads
-        // the socket, so we must. With GDK's shared connection, GDK's
-        // own poll loop is already doing the reading; prepare_read
-        // will usually return None.
-        let mut read_yielded = false;
-        if let Some(guard) = conn.prepare_read() {
-            use wayland_client::backend::WaylandError;
-            match guard.read() {
-                Ok(_) => {
-                    read_yielded = true;
-                }
-                Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // No new events — fall through to dispatch any
-                    // already-buffered ones.
-                }
-                Err(e) => {
-                    warn!("wl conn.read failed: {}", e);
-                    return;
-                }
-            }
-        } else {
-            // None means events are already buffered in the queue —
-            // count that as activity so we keep polling fast.
-            read_yielded = true;
-        }
-
-        let dispatched = {
-            let mut guard = inner.lock();
-            let BackendInner {
-                queue, app_data, ..
-            } = &mut *guard;
-            match queue.dispatch_pending(app_data) {
-                Ok(n) => n,
-                Err(e) => {
-                    warn!("queue.dispatch_pending failed: {}", e);
-                    return;
-                }
+        // "Active" = something was read or dispatched this tick; the
+        // adaptive cadence below snaps to FAST_MS on activity. A `None`
+        // from prepare_read (events already buffered) counts as activity,
+        // which dispatch_once folds into its dispatched count.
+        let dispatched = match dispatch_once(&conn, &inner) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!("{}", e);
+                return;
             }
         };
-        // Backstop flush — most outgoing paths already flush themselves,
-        // so this is normally a no-op. Cheap to do unconditionally; not
-        // worth tracking outgoing state to skip it.
-        let _ = conn.flush();
-
+        let read_yielded = dispatched > 0;
         let active = read_yielded || dispatched > 0;
         let next = if active {
             FAST_MS
