@@ -281,6 +281,41 @@ impl ScanPicker {
     pub fn can_scan(&self) -> bool { !self.gather().is_empty() }
 }
 
+/// Draws the scan-picker dialog when `d.open`. Returns the gathered paths
+/// the frame "scan" is pressed. A floating `egui::Window`, same reasoning
+/// as the other two dialogs in this module.
+pub fn scan_picker_ui(ui: &mut egui::Ui, d: &mut ScanPicker, c: &uikit_egui::PaletteColors)
+    -> Option<Vec<String>>
+{
+    let mut result = None;
+    let mut still_open = d.open;
+    let mut cancel_pressed = false;
+    egui::Window::new("Choose folders to scan")
+        .id(egui::Id::new("scan_picker_dialog"))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut still_open)
+        .show(ui.ctx(), |ui| {
+            if d.suggestions.is_empty() {
+                ui.colored_label(c.text_weak, "no suggested folders — type a path below");
+            }
+            for path in d.suggestions.clone() {
+                let mut checked = d.is_selected(&path);
+                if ui.checkbox(&mut checked, &path).changed() { d.toggle(&path); }
+            }
+            ui.add(egui::TextEdit::singleline(&mut d.custom_path)
+                .hint_text("custom path").id_salt("scan_picker-custom_path"));
+            ui.horizontal(|ui| {
+                if ui.add_enabled(d.can_scan(), egui::Button::new("scan")).clicked() {
+                    result = Some(d.gather());
+                }
+                if ui.button("cancel").clicked() { cancel_pressed = true; }
+            });
+        });
+    if !still_open || cancel_pressed { d.close(); }
+    result
+}
+
 #[cfg(test)]
 mod frame_tests {
     use super::*;
@@ -389,6 +424,55 @@ mod frame_tests {
         let (texts, _) = draw_edit(&mut d);
         assert!(texts.join(" | ").contains("not a year"), "{texts:?}");
         assert!(!d.can_save(), "the save button should be disabled for this draft");
+    }
+
+    fn draw_scan(d: &mut ScanPicker) -> (Vec<String>, Option<Vec<String>>) {
+        let ctx = egui::Context::default();
+        let c = uikit_egui::palette_colors("amber");
+        let mut result = None;
+        let run = |ctx: &egui::Context, d: &mut ScanPicker, result: &mut Option<Vec<String>>| {
+            ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                                                            egui::vec2(500.0, 700.0))),
+                ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    *result = scan_picker_ui(ui, d, &c);
+                });
+            })
+        };
+        run(&ctx, d, &mut result);
+        let out = run(&ctx, d, &mut result);
+        let texts = out.shapes.iter().filter_map(|s| match &s.shape {
+            egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+            _ => None,
+        }).collect();
+        (texts, result)
+    }
+
+    #[test]
+    fn closed_scan_picker_draws_nothing() {
+        let mut d = ScanPicker::default();
+        let (texts, result) = draw_scan(&mut d);
+        assert!(texts.is_empty(), "{texts:?}");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn open_scan_picker_shows_the_suggestions() {
+        let mut d = ScanPicker::default();
+        d.open(vec!["/home/x/Music".into(), "/media/usb".into()]);
+        let (texts, _) = draw_scan(&mut d);
+        let joined = texts.join(" | ");
+        assert!(joined.contains("/home/x/Music") && joined.contains("/media/usb"), "{joined}");
+    }
+
+    #[test]
+    fn no_suggestions_says_so() {
+        let mut d = ScanPicker::default();
+        d.open(vec![]);
+        let (texts, _) = draw_scan(&mut d);
+        assert!(texts.join(" | ").contains("type a path below"), "{texts:?}");
     }
 }
 

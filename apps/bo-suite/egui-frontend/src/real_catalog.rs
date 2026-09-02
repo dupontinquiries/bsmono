@@ -83,13 +83,19 @@ impl RealCatalog {
     }
 
     /// Ask the worker to walk `music_roots()` and (re)populate the
-    /// catalog. Fire-and-forget: the worker's own `MediaResult::
-    /// ScanProgress` messages report progress, which this front-end does
-    /// not yet surface (see `all_tracks.rs`'s TODO on scan UI) — issuing
-    /// the command is the gap that mattered, since without it the
-    /// "Rescan" button had nothing to send.
+    /// catalog. Fire-and-forget: progress comes back as `MediaResult::
+    /// ScanProgress`, read in the bin's `pump_media_results`.
     pub fn rescan(&self) {
         let _ = self.cmd_tx.send(MediaCmd::RescanLibrary);
+    }
+
+    /// Ask the worker to walk exactly `roots` instead of the configured
+    /// default — what the scan picker is for. An empty `roots` falls back
+    /// to the worker's own default (see `MediaCmd::ScanWithRoots`'s doc),
+    /// same as an empty pick in the dialog meaning "scan everything as
+    /// usual" rather than "scan nothing".
+    pub fn scan_with_roots(&self, roots: Vec<String>) {
+        let _ = self.cmd_tx.send(MediaCmd::ScanWithRoots(roots));
     }
 
     /// Record that a track played (history + play-count), and persist a

@@ -287,6 +287,27 @@ impl App {
             self.controller.pending_tracks =
                 Some(bo_suite_egui::all_tracks::TracksAction::Load { offset: 0 });
         }
+        if self.controller.pending_scan_picker_open {
+            self.controller.pending_scan_picker_open = false;
+            // The picker's own doc: suggestions are the host's job, since
+            // it (not the Controller) knows $HOME/$BO_MUSIC_DIR. Offer the
+            // configured default roots plus common removable-media mount
+            // points, when they exist — a folder that isn't there yet
+            // isn't worth ticking.
+            let mut suggestions: Vec<String> = bo_suite_egui::real_catalog::music_roots()
+                .into_iter().map(|p| p.display().to_string()).collect();
+            for base in ["/media", "/run/media"] {
+                if let Ok(entries) = std::fs::read_dir(base) {
+                    for entry in entries.flatten() {
+                        suggestions.push(entry.path().display().to_string());
+                    }
+                }
+            }
+            self.controller.scan_picker.open(suggestions);
+        }
+        if let Some(roots) = self.controller.pending_scan_with_roots.take() {
+            self.catalog.scan_with_roots(roots);
+        }
         if let Some(id) = self.controller.last_played_track.take() {
             // Persisted through the worker (play count + history), not
             // written on this connection — see real_catalog.rs.

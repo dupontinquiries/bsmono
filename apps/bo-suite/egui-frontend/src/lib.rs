@@ -418,6 +418,15 @@ pub struct Controller {
     /// `EditTrack::payload()`.
     pub pending_track_edit_save:
         Option<(i64, Option<String>, Option<String>, Option<String>, Option<u16>)>,
+    /// The scan-folder picker. Same "tested model, never drawn" gap
+    /// `AddToPlaylist` and `EditTrack` had.
+    pub scan_picker: crate::dialogs::ScanPicker,
+    /// "choose folders…" was pressed; the host computes suggestions
+    /// (it knows $HOME/$BO_MUSIC_DIR, this struct doesn't) and opens
+    /// `scan_picker` with them.
+    pub pending_scan_picker_open: bool,
+    /// The picker's "scan" button was pressed with these paths.
+    pub pending_scan_with_roots: Option<Vec<String>>,
     /// The device switcher above the output controls. The sink picker itself
     /// lives in settings_page as `SinkPicker` — see outputs.rs's note.
     pub device_selector: crate::outputs::DeviceSelector,
@@ -584,6 +593,9 @@ impl Controller {
             edit_track: Default::default(),
             pending_track_edit_open: None,
             pending_track_edit_save: None,
+            scan_picker: Default::default(),
+            pending_scan_picker_open: false,
+            pending_scan_with_roots: None,
             device_selector: Default::default(),
             pending_route: None,
             pending_playback: None,
@@ -930,6 +942,14 @@ impl Controller {
                         track_id, save.title, save.artist, save.album, save.year));
                 }
                 self.edit_track.close();
+            }
+        }
+        if self.scan_picker.open {
+            if let Some(paths) = crate::dialogs::scan_picker_ui(ui, &mut self.scan_picker, &colors) {
+                self.settings.scan = crate::settings_page::Scan::Running {
+                    seen: 0, total: None, path: String::new() };
+                self.pending_scan_with_roots = Some(paths);
+                self.scan_picker.close();
             }
         }
     }
@@ -2016,6 +2036,9 @@ impl Controller {
             // one, then drives `self.settings.scan` for real from the
             // worker's own `ScanProgress` messages.
             self.pending_rescan = true;
+        }
+        if ui.button("choose folders…").clicked() {
+            self.pending_scan_picker_open = true;
         }
         ui.separator();
         // product capabilities gate what is shown, per hasControl
