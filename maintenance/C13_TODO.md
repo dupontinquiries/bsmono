@@ -2867,3 +2867,37 @@ the 134% accounting) all held up and led somewhere.
   names), bot-arena `fsm.rs` vs its doc copy (7). Both found by the function
   audit, so both are measured rather than inferred.
 - dandere2x CPU-path blending, and the missing high-frequency fixture.
+
+
+## 91. Merged bo-suite-continued-2 (9 commits, zero overlap)
+
+Three dead dialogs drawn (add-to-playlist, edit-track, scan-folder — each
+"opened into nothing"), playlist detail wired, device discovery for casting,
+real playlist/queue persistence, remote per-device queue, and directory
+browsing in the scan picker.
+
+`uikit-egui::path_picker` gained fuzzy filtering of its directory listing —
+worth knowing because that is shared: uikit-egui went 353 -> 359 tests and
+every consumer picks it up.
+
+Verified: uikit-egui 359, bo-suite-egui 545, bo-core 60, bo-media 94,
+bo-cast 76. All green, no conflicts.
+
+Also committed the lockfile fallout from the earlier games merge: `dht-kit`
+entered the graph via the snapclone/NAT work, and `worldhost-unendlich`'s lock
+had never been committed. `lock_check.py` tracks 128 lockfiles and expects
+them present and current, so leaving those dirty would have surfaced as a
+stale-lock report rather than as what it was.
+
+**`UI_STRATEGY.md` is new at the repo root and worth reading.** It states the
+tiering the fleet has been operating on implicitly: egui is primary, Qt/QML
+and GTK are ARCHIVED-not-retired — they stay in the tree, keep building, and
+are factored into kits, because egui has not reached parity on every surface.
+It also carries a per-app frontend inventory.
+
+That inventory answers a question this file has asked twice. §32/§46 flagged
+that `manifest/projects.toml`'s `primary` flag governs which frontend gitmind
+builds, and I audited it by hand. The two documents now overlap and can
+drift — worth a check that every app marked `primary = true` in the manifest
+matches the "egui (primary)" column here, and worth deciding which is
+canonical before they disagree.
