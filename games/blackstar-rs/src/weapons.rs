@@ -81,6 +81,27 @@ impl Verb {
     }
 }
 
+/// THE TWO REGISTERS a fight is written in. Dark of the Moon's combat is
+/// slow, heavy and consequential — a hit is a stagger, a fall, a section
+/// coming off. War for Cybertron's is fast — a stream of rounds a movie
+/// with plot-armoured leads cannot acknowledge and a game can. The forms
+/// already sit on both ends of that line (PHOTON is 26 impulse every
+/// 2.4 s; WATER is 1.6 every 0.06 s); this names which end each is on,
+/// so the field can answer a heavy hit with a stagger and a fast one
+/// with suppression rather than treating a railshot and a raindrop as
+/// the same event at different sizes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Register {
+    /// slow, hard: staggers what it hits, catches a body mid-fold
+    Heavy,
+    /// fast, light: suppresses — spread up, advance down — by volume
+    Fast,
+    /// in between: neither special effect, just damage
+    Medium,
+    /// blink, vortex, grapple: position, not damage
+    Utility,
+}
+
 pub struct Form {
     pub name: &'static str,
     pub verb: Verb,
@@ -149,6 +170,21 @@ pub const TABLE: [Form; FORMS] = [
     // one button both a weapon and a way up.
     f("GRAPPLE", Verb::Grapple, 0.45, 6.0, 22.0, 55.0, 0.0, 0.0, 1, 0.0, [0.85, 0.78, 0.45, 1.0], FxKind::Cable, FxKind::Cable),
 ];
+
+impl Form {
+    /// Which register this form fights in. Thresholds are on the table's
+    /// own numbers: a form that lands 7+ impulse and waits most of a
+    /// second between is heavy; one that fires more than three times a
+    /// second is fast.
+    pub fn register(&self) -> Register {
+        match self.verb {
+            Verb::Blink | Verb::Vortex | Verb::Grapple => Register::Utility,
+            _ if self.cooldown >= 0.8 && self.impulse >= 7.0 => Register::Heavy,
+            _ if self.cooldown <= 0.35 => Register::Fast,
+            _ => Register::Medium,
+        }
+    }
+}
 
 /// A shot in flight. Hitscan verbs never make one.
 #[derive(Clone, Copy)]
@@ -876,6 +912,27 @@ impl Weapons {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_registers_split_the_table_the_way_the_films_do() {
+        use super::{Register, Verb, TABLE};
+        let by = |name: &str| TABLE.iter().find(|f| f.name == name).unwrap().register();
+        assert_eq!(by("PHOTON"), Register::Heavy);
+        assert_eq!(by("TITANIUM"), Register::Heavy);
+        assert_eq!(by("TSUNAMI"), Register::Heavy);
+        assert_eq!(by("WATER"), Register::Fast);
+        assert_eq!(by("METAL"), Register::Fast);
+        assert_eq!(by("WIND"), Register::Fast);
+        assert_eq!(by("GRAPPLE"), Register::Utility);
+        assert_eq!(by("ICE"), Register::Utility);
+        // nothing is heavy AND fast, and every form has a register
+        for f in TABLE.iter() {
+            let _ = f.register();
+            if f.verb != Verb::Blink && f.verb != Verb::Vortex && f.verb != Verb::Grapple {
+                assert!(!(f.cooldown <= 0.35 && f.cooldown >= 0.8));
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

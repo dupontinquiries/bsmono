@@ -73,6 +73,21 @@ pub enum Brain {
     Defender { home: Vec3 },
     /// A striker that hands the ball to a teammate on a timer (pass drills).
     Passer { next: u8 },
+    /// A HOSTILE FROM THE FIELD (`field.rs`): this body is a puppet. Its
+    /// position, facing and form come from the sortie's field every
+    /// tick and `update` does not touch it. `slot` is the fight's roster
+    /// index, kept ON the bot rather than as a stored index into `bots`
+    /// because that list is cleared on every map change.
+    Hostile { slot: u8 },
+}
+
+impl Brain {
+    pub fn hostile_slot(self) -> Option<usize> {
+        match self {
+            Brain::Hostile { slot } => Some(slot as usize),
+            _ => None,
+        }
+    }
 }
 
 /// Striker state machine phases (tutorial stages, one enum variant each).
@@ -95,6 +110,10 @@ pub struct Bot {
     pub car: Car,
     pub team: u8,
     pub model: usize,
+    /// what it is painted: the team colour for the sandbox mobs, the
+    /// troop's own tint for a hostile. Read by every draw site instead
+    /// of `team_tint(team)` so a field body is not blue or orange.
+    pub tint: [f32; 3],
     pub brain: Brain,
     pub phase: Phase,
     pub got_reset: bool,   // style bookkeeping: at least one flip reset
@@ -186,6 +205,7 @@ pub fn mk_bot_brain(pos: Vec3, yaw: f32, team: u8, i: usize, brain: Brain) -> Bo
         car,
         team,
         model: i % 3,
+        tint: team_tint(team),
         brain,
         phase: Phase::Approach,
         got_reset: false,
@@ -293,6 +313,10 @@ pub fn update(
 
     let mut scratch = physics::StepEvents::default();
     for (bi, b) in bots.iter_mut().enumerate() {
+        // a field hostile is driven from outside; see Brain::Hostile
+        if matches!(b.brain, Brain::Hostile { .. }) {
+            continue;
+        }
         b.jump_cd = (b.jump_cd - dt).max(0.0);
         b.phase_t += dt;
         b.car.boost = 100.0 * cfg.car.boost_max;
@@ -306,6 +330,8 @@ pub fn update(
             Brain::Striker => striker(b, ball, world, &ctx, dt),
             Brain::Defender { home } => defender(b, ball, home, time),
             Brain::Passer { next: _ } => striker(b, ball, world, &ctx, dt),
+            // skipped above; listed so the match stays exhaustive
+            Brain::Hostile { .. } => continue,
         };
         let mut c = c;
         b.finisher = finisher_of.get(&b.team) == Some(&bi);

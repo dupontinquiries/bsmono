@@ -217,10 +217,22 @@ impl Fight {
     /// stream — `step` will not double-report it, since it only emits
     /// casualties for deaths its own volley caused.
     pub fn external_on_b(&mut self, dmg: f32, ring: f32) -> Option<usize> {
-        let (i, t) = self.b.fighters.iter_mut().enumerate().find(|(_, t)| t.alive())?;
+        let (i, _) = self.b.fighters.iter().enumerate().find(|(_, t)| t.alive())?;
+        self.external_on_b_slot(i, dmg, ring)
+    }
+
+    /// The same door, AIMED: external fire on side B's fighter in `slot`.
+    /// This is what a world hit resolves to once hostiles have positions
+    /// (`field.rs`) — the shooter chose a body, so the fight is told which.
+    /// A dead or absent slot takes nothing and reports nothing.
+    pub fn external_on_b_slot(&mut self, slot: usize, dmg: f32, ring: f32) -> Option<usize> {
+        let t = self.b.fighters.get_mut(slot)?;
+        if !t.alive() {
+            return None;
+        }
         t.hit(dmg, ring);
         if !t.alive() {
-            Some(i)
+            Some(slot)
         } else {
             None
         }

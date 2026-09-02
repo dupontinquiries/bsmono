@@ -82,22 +82,54 @@ pub struct GpuGeneratedChunk {
     pub blocks: Vec<BlockId>,
 }
 
-pub struct VulkanChunkGenerator {
-    // Order matters for Drop — destroyed bottom-up.
+/// One in-flight batch's worth of GPU resources. THE RING (perfbisect,
+/// 2026-09-01): the generator used to own one command buffer, one fence
+/// and one output buffer, and `generate_batch` was record → submit →
+/// `wait_for_fences(MAX)` → unpack, so the GPU sat idle while the CPU
+/// unpacked and the CPU sat idle while the GPU ran. `world-bench` measured
+/// the result at 0.63–0.98x the 24-core CPU generator. With `N` slots a
+/// batch is submitted while the previous one is still running and is
+/// unpacked when its fence signals; `generate_batch` keeps its blocking
+/// contract on top of that (submit, wait for THAT slot, collect), so the
+/// parity bench and every existing caller are unchanged.
+struct Slot {
     block_buffer: vk::Buffer,
     block_memory: vk::DeviceMemory,
     block_ptr: *mut u8,
+    descriptor_set: vk::DescriptorSet,
+    command_buffer: vk::CommandBuffer,
+    fence: vk::Fence,
+    /// the coords submitted into this slot, `None` when it is free
+    pending: Option<Vec<ChunkCoord>>,
+    /// monotonically increasing; a `Ticket` names one submission
+    ticket: u64,
+}
+
+/// Names one submitted batch. Returned by `submit`, consumed by `collect`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct Ticket(u64);
+
+struct Ring {
+    slots: Vec<Slot>,
+    /// the slot the next submit takes, round-robin
+    next: usize,
+    next_ticket: u64,
+}
+
+/// How many batches may be in flight. `UNENDLICH_GPU_GEN_INFLIGHT`,
+/// default 3: one running, one unpacking, one being recorded.
+pub const DEFAULT_INFLIGHT: usize = 3;
+
+pub struct VulkanChunkGenerator {
+    // Order matters for Drop — destroyed bottom-up.
+    ring: Mutex<Ring>,
 
     descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
     descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
 
     command_pool: vk::CommandPool,
-    command_buffer: vk::CommandBuffer,
-    fence: vk::Fence,
-    submit_lock: Mutex<()>,
 
     queue: vk::Queue,
     device: Device,
@@ -146,17 +178,16 @@ impl VulkanChunkGenerator {
         let pipeline = create_compute_pipeline(&device, pipeline_layout)?;
 
         // Block buffer holds packed bytes: 32^3 = 32,768 bytes per chunk,
-        // packed into u32 words (8,192 words per chunk).
+        // packed into u32 words (8,192 words per chunk). One per ring slot.
         let blocks_per_chunk_packed = CHUNK_VOLUME / 4; // 8,192 u32s
         let block_words_total = blocks_per_chunk_packed as u64 * batch_size as u64;
         let block_size = block_words_total * std::mem::size_of::<u32>() as u64;
 
-        let (block_buffer, block_memory) =
-            create_storage_buffer(&instance, &device, physical_device, block_size)?;
-
-        let block_ptr = unsafe {
-            device.map_memory(block_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *mut u8
-        };
+        let inflight = std::env::var("UNENDLICH_GPU_GEN_INFLIGHT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1 && *n <= 16)
+            .unwrap_or(DEFAULT_INFLIGHT);
 
         // r611: bake the biome-def registry into the shader's table.
         // Loaded here the same way TerrainGenerator loads it (a second
@@ -176,29 +207,44 @@ impl VulkanChunkGenerator {
             device.unmap_memory(defs_memory);
         }
 
-        let (descriptor_pool, descriptor_set) =
-            allocate_descriptor_set(&device, descriptor_set_layout)?;
-        update_descriptor_set(&device, descriptor_set, block_buffer, defs_buffer);
+        let (descriptor_pool, descriptor_sets) =
+            allocate_descriptor_sets(&device, descriptor_set_layout, inflight as u32)?;
 
-        let command_buffer = unsafe {
+        let command_buffers = unsafe {
             device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::builder()
                     .command_pool(command_pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )?[0]
+                    .command_buffer_count(inflight as u32),
+            )?
         };
 
-        let fence = unsafe {
-            device.create_fence(&vk::FenceCreateInfo::builder(), None)?
-        };
+        let mut slots = Vec::with_capacity(inflight);
+        for i in 0..inflight {
+            let (block_buffer, block_memory) =
+                create_storage_buffer(&instance, &device, physical_device, block_size)?;
+            let block_ptr = unsafe {
+                device.map_memory(block_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *mut u8
+            };
+            update_descriptor_set(&device, descriptor_sets[i], block_buffer, defs_buffer);
+            let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None)? };
+            slots.push(Slot {
+                block_buffer,
+                block_memory,
+                block_ptr,
+                descriptor_set: descriptor_sets[i],
+                command_buffer: command_buffers[i],
+                fence,
+                pending: None,
+                ticket: 0,
+            });
+        }
 
         Ok(Self {
-            block_buffer, block_memory, block_ptr,
-            descriptor_pool, descriptor_set, descriptor_set_layout,
+            ring: Mutex::new(Ring { slots, next: 0, next_ticket: 1 }),
+            descriptor_pool, descriptor_set_layout,
             pipeline, pipeline_layout,
-            command_pool, command_buffer, fence,
-            submit_lock: Mutex::new(()),
+            command_pool,
             queue,
             device,
             _instance: instance,
@@ -223,30 +269,93 @@ impl VulkanChunkGenerator {
     /// instrument that ends the tree-mass theorizing: whatever disagrees
     /// with the CPU per-column first IS the bug.
     pub fn export_decisions(&self, coord: ChunkCoord, seed: u32) -> Result<Vec<u32>> {
-        let raw = self.generate_batch_inner(&[coord], seed, 1)?;
-        // blocks come back unpacked to BlockId — we need raw words, so
-        // re-read from the mapped buffer directly instead.
-        drop(raw);
-        let words = 4usize * 32 * 32;
+        // raw words, straight from the slot this submission took: with the
+        // ring there is no longer one buffer to re-read, so the read is
+        // done against the ticket's own slot before it is freed
+        let t = self.submit_inner(&[coord], seed, 1)?;
+        self.collect_raw(t, 4usize * 32 * 32)
+    }
+
+    /// Wait for a ticket and copy the first `words` u32s of its slot's
+    /// output, un-unpacked. The decision-export instrument's read.
+    pub fn collect_raw(&self, t: Ticket, words: usize) -> Result<Vec<u32>> {
+        let mut ring = self.ring.lock().unwrap();
+        let Some(i) = ring.slots.iter().position(|s| s.pending.is_some() && s.ticket == t.0) else {
+            return Err(GpuGenError::Other(format!("ticket {} is not in flight", t.0)));
+        };
+        let slot = &mut ring.slots[i];
+        unsafe {
+            self.device.wait_for_fences(std::slice::from_ref(&slot.fence), true, u64::MAX)?;
+        }
+        let coords = slot.pending.take().unwrap_or_default();
+        let cap = (CHUNK_VOLUME / 4) * coords.len();
+        let words = words.min(cap);
         let mut out = vec![0u32; words];
         unsafe {
-            let src = self.block_ptr as *const u32;
-            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), words);
+            std::ptr::copy_nonoverlapping(slot.block_ptr as *const u32, out.as_mut_ptr(), words);
         }
         Ok(out)
     }
 
     fn generate_batch_inner(&self, coords: &[ChunkCoord], seed: u32, debug_mode: u32) -> Result<Vec<GpuGeneratedChunk>> {
         if coords.is_empty() { return Ok(Vec::new()); }
+        let t = self.submit_inner(coords, seed, debug_mode)?;
+        self.collect(t)
+    }
+
+    /// How many batches the ring can hold in flight.
+    pub fn inflight_capacity(&self) -> usize {
+        self.ring.lock().unwrap().slots.len()
+    }
+
+    /// Submit a batch WITHOUT waiting for it. Takes the next free ring
+    /// slot and returns the ticket to collect with. If every slot is in
+    /// flight it is an ERROR, not a stall: the caller has outrun `poll`.
+    ///
+    /// THE INVARIANT (the one llama.cpp's WebGPU backend sizes its param
+    /// arena by, batch + margin, and the one logscope's PASS_FUSE broke):
+    /// a slot's buffer, descriptor set, command buffer and fence are never
+    /// reused until that slot's result has been collected, and the push
+    /// constants are recorded by value into the command buffer — so no
+    /// dispatch in flight ever refers to a resource another submission
+    /// has recycled. The pool IS the in-flight count.
+    pub fn submit(&self, coords: &[ChunkCoord], seed: u32) -> Result<Ticket> {
+        self.submit_inner(coords, seed, 0)
+    }
+
+    fn submit_inner(&self, coords: &[ChunkCoord], seed: u32, debug_mode: u32) -> Result<Ticket> {
+        if coords.is_empty() {
+            return Err(GpuGenError::Other("empty batch".into()));
+        }
         if coords.len() > self.batch_size as usize {
             return Err(GpuGenError::Other(format!(
                 "Batch size {} exceeds generator capacity {}",
                 coords.len(), self.batch_size
             )));
         }
-
-        let _guard = self.submit_lock.lock().unwrap();
-        let cmd = self.command_buffer;
+        let mut ring = self.ring.lock().unwrap();
+        // a free slot, round-robin from `next`; else nothing is free and the
+        // caller has outrun `collect` — that is the caller's pacing bug, and
+        // the honest answer is an error rather than a silent stall
+        let n = ring.slots.len();
+        let mut pick = None;
+        for k in 0..n {
+            let i = (ring.next + k) % n;
+            if ring.slots[i].pending.is_none() {
+                pick = Some(i);
+                break;
+            }
+        }
+        let Some(i) = pick else {
+            return Err(GpuGenError::Other(format!(
+                "all {n} ring slots are in flight; collect a ticket before submitting"
+            )));
+        };
+        ring.next = (i + 1) % n;
+        let ticket = ring.next_ticket;
+        ring.next_ticket += 1;
+        let slot = &mut ring.slots[i];
+        let cmd = slot.command_buffer;
 
         unsafe {
             self.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
@@ -260,23 +369,17 @@ impl VulkanChunkGenerator {
             self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
             self.device.cmd_bind_descriptor_sets(
                 cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout,
-                0, std::slice::from_ref(&self.descriptor_set), &[],
+                0, std::slice::from_ref(&slot.descriptor_set), &[],
             );
 
             // Zero the output region for this batch first, since the shader
             // uses atomicAnd/atomicOr to write bytes within u32 words. Stale
             // bits would otherwise leak from previous batches.
-            //
-            // We do this via vkCmdFillBuffer (size in bytes), which zeros
-            // the storage buffer atomically before we dispatch.
             let blocks_per_chunk_packed = (CHUNK_VOLUME / 4) as u64;
             let used_words = blocks_per_chunk_packed * coords.len() as u64;
             let used_bytes = used_words * std::mem::size_of::<u32>() as u64;
-            self.device.cmd_fill_buffer(cmd, self.block_buffer, 0, used_bytes, 0);
+            self.device.cmd_fill_buffer(cmd, slot.block_buffer, 0, used_bytes, 0);
 
-            // Barrier: the fill must complete before the shader reads the buffer
-            // (well, the shader writes to it — but the writes might be
-            // RMW via atomicAnd, so we still need fill -> compute ordering).
             let fill_barrier = vk::MemoryBarrier::builder()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
@@ -288,11 +391,11 @@ impl VulkanChunkGenerator {
                 std::slice::from_ref(&fill_barrier), &[], &[],
             );
 
-            for (slot, &c) in coords.iter().enumerate() {
+            for (idx, &c) in coords.iter().enumerate() {
                 let pc = PushConstants {
                     chunk_x: c.x, chunk_y: c.y, chunk_z: c.z,
                     seed,
-                    chunk_index: slot as u32,
+                    chunk_index: idx as u32,
                     _pad: debug_mode, // r617: 1 = decision-export
                 };
                 let bytes = std::slice::from_raw_parts(
@@ -302,12 +405,14 @@ impl VulkanChunkGenerator {
                 self.device.cmd_push_constants(
                     cmd, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, bytes,
                 );
-                // Workgroup is 8x8x8, chunk is 32x32x32 -> dispatch (1,1,1) since
-                // each invocation handles 4x4x4 sub-blocks internally.
+                // ONE WORKGROUP PER CHUNK (8x8x8 invocations, 4x4x4 blocks
+                // each). This is the other half of the 0.63x: a 16-chunk
+                // batch is 16 workgroups on a GPU with hundreds of cores.
+                // The ring pipelines batches; occupancy needs the shader to
+                // take more workgroups per chunk (see the findings note).
                 self.device.cmd_dispatch(cmd, 1, 1, 1);
             }
 
-            // Compute writes -> host reads barrier.
             let read_barrier = vk::MemoryBarrier::builder()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::HOST_READ);
@@ -321,13 +426,58 @@ impl VulkanChunkGenerator {
 
             self.device.end_command_buffer(cmd)?;
 
-            self.device.reset_fences(std::slice::from_ref(&self.fence))?;
+            self.device.reset_fences(std::slice::from_ref(&slot.fence))?;
             let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd));
-            self.device.queue_submit(self.queue, std::slice::from_ref(&submit), self.fence)?;
-            self.device.wait_for_fences(std::slice::from_ref(&self.fence), true, u64::MAX)?;
+            self.device.queue_submit(self.queue, std::slice::from_ref(&submit), slot.fence)?;
         }
+        slot.pending = Some(coords.to_vec());
+        slot.ticket = ticket;
+        Ok(Ticket(ticket))
+    }
 
-        self.read_back(coords)
+    /// Is this ticket's batch finished on the GPU? Non-blocking. `None` if
+    /// the ticket is unknown (never submitted, or already collected).
+    pub fn ready(&self, t: Ticket) -> Option<bool> {
+        let ring = self.ring.lock().unwrap();
+        let slot = ring.slots.iter().find(|s| s.pending.is_some() && s.ticket == t.0)?;
+        Some(unsafe { self.device.get_fence_status(slot.fence).unwrap_or(false) })
+    }
+
+    /// Every finished batch, unpacked, oldest first. Non-blocking: batches
+    /// still running stay in the ring. This is the call the streaming pool
+    /// makes once per pass.
+    pub fn poll(&self) -> Result<Vec<(Ticket, Vec<GpuGeneratedChunk>)>> {
+        let mut ring = self.ring.lock().unwrap();
+        let mut done: Vec<usize> = Vec::new();
+        for (i, slot) in ring.slots.iter().enumerate() {
+            if slot.pending.is_some() && unsafe { self.device.get_fence_status(slot.fence)? } {
+                done.push(i);
+            }
+        }
+        done.sort_by_key(|&i| ring.slots[i].ticket);
+        let mut out = Vec::with_capacity(done.len());
+        for i in done {
+            let slot = &mut ring.slots[i];
+            let coords = slot.pending.take().unwrap_or_default();
+            let chunks = read_back_from(slot.block_ptr, &coords)?;
+            out.push((Ticket(slot.ticket), chunks));
+        }
+        Ok(out)
+    }
+
+    /// Wait for ONE ticket and unpack it. Blocking on its fence only; other
+    /// batches keep running.
+    pub fn collect(&self, t: Ticket) -> Result<Vec<GpuGeneratedChunk>> {
+        let mut ring = self.ring.lock().unwrap();
+        let Some(i) = ring.slots.iter().position(|s| s.pending.is_some() && s.ticket == t.0) else {
+            return Err(GpuGenError::Other(format!("ticket {} is not in flight", t.0)));
+        };
+        let slot = &mut ring.slots[i];
+        unsafe {
+            self.device.wait_for_fences(std::slice::from_ref(&slot.fence), true, u64::MAX)?;
+        }
+        let coords = slot.pending.take().unwrap_or_default();
+        read_back_from(slot.block_ptr, &coords)
     }
 
     /// Convenience: generate a batch and convert to `Chunk` values directly.
@@ -337,14 +487,20 @@ impl VulkanChunkGenerator {
         Ok(raw.into_iter().map(|g| Chunk::from_blocks(g.coord, g.blocks)).collect())
     }
 
-    fn read_back(&self, coords: &[ChunkCoord]) -> Result<Vec<GpuGeneratedChunk>> {
+}
+
+/// Unpack a slot's mapped output into chunks. Only called after that
+/// slot's fence has signalled (`poll`/`collect`).
+fn read_back_from(block_ptr: *mut u8, coords: &[ChunkCoord]) -> Result<Vec<GpuGeneratedChunk>> {
+    {
         let blocks_per_chunk_packed = CHUNK_VOLUME / 4;
         let total_packed_words = blocks_per_chunk_packed * coords.len();
 
-        // SAFETY: persistent map. The fence wait above ensures the GPU has
-        // finished. HOST_COHERENT memory means no explicit invalidate call.
+        // SAFETY: persistent map. The fence wait/status check before this
+        // call ensures the GPU has finished. HOST_COHERENT memory means no
+        // explicit invalidate call.
         let block_data: &[u32] = unsafe {
-            std::slice::from_raw_parts(self.block_ptr as *const u32, total_packed_words)
+            std::slice::from_raw_parts(block_ptr as *const u32, total_packed_words)
         };
 
         let mut out = Vec::with_capacity(coords.len());
@@ -373,12 +529,14 @@ impl Drop for VulkanChunkGenerator {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
-            self.device.free_command_buffers(self.command_pool, &[self.command_buffer]);
-            self.device.destroy_fence(self.fence, None);
-
-            self.device.unmap_memory(self.block_memory);
-            self.device.destroy_buffer(self.block_buffer, None);
-            self.device.free_memory(self.block_memory, None);
+            let ring = self.ring.get_mut().unwrap();
+            for slot in ring.slots.iter() {
+                self.device.free_command_buffers(self.command_pool, &[slot.command_buffer]);
+                self.device.destroy_fence(slot.fence, None);
+                self.device.unmap_memory(slot.block_memory);
+                self.device.destroy_buffer(slot.block_buffer, None);
+                self.device.free_memory(slot.block_memory, None);
+            }
 
             self.device.destroy_buffer(self.defs_buffer, None);
             self.device.free_memory(self.defs_memory, None);
@@ -568,22 +726,23 @@ fn create_compute_pipeline(device: &Device, layout: vk::PipelineLayout) -> Resul
     Ok(pipelines[0])
 }
 
-fn allocate_descriptor_set(device: &Device, layout: vk::DescriptorSetLayout)
-    -> Result<(vk::DescriptorPool, vk::DescriptorSet)>
+fn allocate_descriptor_sets(device: &Device, layout: vk::DescriptorSetLayout, count: u32)
+    -> Result<(vk::DescriptorPool, Vec<vk::DescriptorSet>)>
 {
     let sizes = [vk::DescriptorPoolSize {
         ty: vk::DescriptorType::STORAGE_BUFFER,
-        descriptor_count: 2, // r611: block buffer + biome-def table
+        descriptor_count: 2 * count, // r611: block buffer + biome-def table, per slot
     }];
     let pool_info = vk::DescriptorPoolCreateInfo::builder()
         .pool_sizes(&sizes)
-        .max_sets(1);
+        .max_sets(count);
     let pool = unsafe { device.create_descriptor_pool(&pool_info, None)? };
+    let layouts: Vec<vk::DescriptorSetLayout> = (0..count).map(|_| layout).collect();
     let alloc_info = vk::DescriptorSetAllocateInfo::builder()
         .descriptor_pool(pool)
-        .set_layouts(std::slice::from_ref(&layout));
+        .set_layouts(&layouts);
     let sets = unsafe { device.allocate_descriptor_sets(&alloc_info)? };
-    Ok((pool, sets[0]))
+    Ok((pool, sets))
 }
 
 fn update_descriptor_set(

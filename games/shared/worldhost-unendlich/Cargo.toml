@@ -1,0 +1,15 @@
+[package]
+name = "worldhost-unendlich"
+version = "0.1.0"
+edition = "2021"
+description = """
+The unendlich half of the seam: `worldhost::WorldHost` for its
+`ChunkManager`. NOT COMPILED IN THE SESSION THAT WROTE IT — see src/lib.rs.
+Deliberately outside both workspaces so nobody's build depends on it
+until it has been built once.
+"""
+
+[dependencies]
+glam = "0.28"
+worldhost = { path = "../worldhost" }
+unendlich-engine = { path = "../../unendlich/crates/unendlich-engine", default-features = false }

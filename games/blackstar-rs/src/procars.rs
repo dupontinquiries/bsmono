@@ -162,7 +162,7 @@ pub fn volt(gpu: &mut Gpu) -> Model {
     ev_wheels(gpu, &mut prims, 0.125, 0.28, -0.36, 0.36, -0.07, [0.72, 0.76, 0.80, 1.0]);
     Model { prims, settle: glam::Quat::IDENTITY,
         tuck: Vec::new(),
-        pack: Vec::new(), fittings: crate::turret::Fittings::default(), drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.56, half_h: 0.26, ride_h: 0.26, half_w: 0.31, wheel_r: 0.125 }
+        pack: Vec::new(), fittings: crate::turret::Fittings::default(), hardpoints: crate::hardpoints::Hardpoints::default(), drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.56, half_h: 0.26, ride_h: 0.26, half_w: 0.31, wheel_r: 0.125 }
 }
 
 /// AXION — a low electric hypercar. Long, flat, fast: the flick blade.
@@ -193,7 +193,7 @@ pub fn axion(gpu: &mut Gpu) -> Model {
     ev_wheels(gpu, &mut prims, 0.105, 0.34, -0.50, 0.50, -0.045, [0.55, 0.58, 0.62, 1.0]);
     Model { prims, settle: glam::Quat::IDENTITY,
         tuck: Vec::new(),
-        pack: Vec::new(), fittings: crate::turret::Fittings::default(), drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.78, half_h: 0.17, ride_h: 0.17, half_w: 0.38, wheel_r: 0.105 }
+        pack: Vec::new(), fittings: crate::turret::Fittings::default(), hardpoints: crate::hardpoints::Hardpoints::default(), drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.78, half_h: 0.17, ride_h: 0.17, half_w: 0.38, wheel_r: 0.105 }
 }
 
 /// HAULER — an electric pickup, all shoulders. The heaviest-feeling of the
@@ -225,7 +225,7 @@ pub fn hauler(gpu: &mut Gpu) -> Model {
     ev_wheels(gpu, &mut prims, 0.145, 0.31, -0.40, 0.40, -0.06, [0.28, 0.30, 0.33, 1.0]);
     Model { prims, settle: glam::Quat::IDENTITY,
         tuck: Vec::new(),
-        pack: Vec::new(), fittings: crate::turret::Fittings::default(), drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.66, half_h: 0.28, ride_h: 0.28, half_w: 0.34, wheel_r: 0.145 }
+        pack: Vec::new(), fittings: crate::turret::Fittings::default(), hardpoints: crate::hardpoints::Hardpoints::default(), drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.66, half_h: 0.28, ride_h: 0.28, half_w: 0.34, wheel_r: 0.145 }
 }
 
 /// PULSE — a rally EV on tall soft tyres: short overhangs, high stance, a
@@ -258,7 +258,7 @@ pub fn pulse(gpu: &mut Gpu) -> Model {
     ev_wheels(gpu, &mut prims, 0.155, 0.30, -0.32, 0.34, -0.02, [0.85, 0.86, 0.88, 1.0]);
     Model { prims, settle: glam::Quat::IDENTITY,
         tuck: Vec::new(),
-        pack: Vec::new(), fittings: crate::turret::Fittings::default(), drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.52, half_h: 0.30, ride_h: 0.30, half_w: 0.33, wheel_r: 0.155 }
+        pack: Vec::new(), fittings: crate::turret::Fittings::default(), hardpoints: crate::hardpoints::Hardpoints::default(), drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.52, half_h: 0.30, ride_h: 0.30, half_w: 0.33, wheel_r: 0.155 }
 }
 
 /// TRAM — an electric shuttle: a long slab of glass and aluminium with a
@@ -289,7 +289,7 @@ pub fn tram(gpu: &mut Gpu) -> Model {
     ev_wheels(gpu, &mut prims, 0.125, 0.29, -0.38, 0.40, -0.07, [0.62, 0.65, 0.70, 1.0]);
     Model { prims, settle: glam::Quat::IDENTITY,
         tuck: Vec::new(),
-        pack: Vec::new(), fittings: crate::turret::Fittings::default(), drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.62, half_h: 0.34, ride_h: 0.34, half_w: 0.32, wheel_r: 0.125 }
+        pack: Vec::new(), fittings: crate::turret::Fittings::default(), hardpoints: crate::hardpoints::Hardpoints::default(), drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.62, half_h: 0.34, ride_h: 0.34, half_w: 0.32, wheel_r: 0.125 }
 }
 
 // ======================= ELECTRIFICATION =================================
@@ -368,6 +368,7 @@ pub fn hoverize(gpu: &mut Gpu, base: &Model, accent: [f32; 4], h: crate::physics
         tuck: Vec::new(),
         pack: Vec::new(),
         fittings: crate::turret::Fittings::default(),
+        hardpoints: crate::hardpoints::Hardpoints::default(),
         cloud: base.cloud.clone(),
         cloud_n: base.cloud_n.clone(),
         sdf_half: base.sdf_half,
@@ -450,6 +451,7 @@ pub fn electrify(gpu: &mut Gpu, base: &Model, accent: [f32; 4]) -> Model {
         tuck: Vec::new(),
         pack: Vec::new(),
         fittings: crate::turret::Fittings::default(),
+        hardpoints: crate::hardpoints::Hardpoints::default(),
         cloud: base.cloud.clone(),
         cloud_n: base.cloud_n.clone(),
         sdf_half: base.sdf_half,
@@ -614,7 +616,7 @@ pub fn vipera(gpu: &mut Gpu) -> Model {
     mount_wheels(gpu, &mut prims, &hp, [0.16, 0.17, 0.19, 1.0], 6);
     Model { prims, settle: glam::Quat::IDENTITY,
         tuck: Vec::new(),
-        pack: Vec::new(), fittings: crate::turret::Fittings::default(), drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len, half_h: 0.175, ride_h: 0.175, half_w, wheel_r }
+        pack: Vec::new(), fittings: crate::turret::Fittings::default(), hardpoints: crate::hardpoints::Hardpoints::default(), drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len, half_h: 0.175, ride_h: 0.175, half_w, wheel_r }
 }
 
 /// AEGIS — the silver armoured wedge.
@@ -711,7 +713,7 @@ pub fn aegis(gpu: &mut Gpu) -> Model {
     mount_wheels(gpu, &mut prims, &hp, copper, 6);
     Model { prims, settle: glam::Quat::IDENTITY,
         tuck: Vec::new(),
-        pack: Vec::new(), fittings: crate::turret::Fittings::default(), drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len, half_h: 0.205, ride_h: 0.205, half_w, wheel_r }
+        pack: Vec::new(), fittings: crate::turret::Fittings::default(), hardpoints: crate::hardpoints::Hardpoints::default(), drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len, half_h: 0.205, ride_h: 0.205, half_w, wheel_r }
 }
 
 /// The house recipe, in one place.
@@ -773,7 +775,7 @@ pub fn breadbox(gpu: &mut Gpu) -> Model {
     wheels(gpu, &mut prims, 0.115, 0.30, -0.32, 0.32, -0.09);
     Model { prims, settle: glam::Quat::IDENTITY,
         tuck: Vec::new(),
-        pack: Vec::new(), fittings: crate::turret::Fittings::default(), drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.56, half_h: 0.25, ride_h: 0.25, half_w: 0.36, wheel_r: 0.115 }
+        pack: Vec::new(), fittings: crate::turret::Fittings::default(), hardpoints: crate::hardpoints::Hardpoints::default(), drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.56, half_h: 0.25, ride_h: 0.25, half_w: 0.36, wheel_r: 0.115 }
 }
 
 
@@ -800,7 +802,7 @@ pub fn wedge(gpu: &mut Gpu) -> Model {
     wheels(gpu, &mut prims, 0.095, 0.36, -0.52, 0.52, -0.06);
     Model { prims, settle: glam::Quat::IDENTITY,
         tuck: Vec::new(),
-        pack: Vec::new(), fittings: crate::turret::Fittings::default(), drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.80, half_h: 0.125, ride_h: 0.125, half_w: 0.42, wheel_r: 0.095 }
+        pack: Vec::new(), fittings: crate::turret::Fittings::default(), hardpoints: crate::hardpoints::Hardpoints::default(), drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.80, half_h: 0.125, ride_h: 0.125, half_w: 0.42, wheel_r: 0.095 }
 }
 
 
@@ -825,7 +827,7 @@ pub fn roller(gpu: &mut Gpu) -> Model {
     wheels(gpu, &mut prims, 0.13, 0.29, -0.28, 0.28, -0.08);
     Model { prims, settle: glam::Quat::IDENTITY,
         tuck: Vec::new(),
-        pack: Vec::new(), fittings: crate::turret::Fittings::default(), drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.48, half_h: 0.24, ride_h: 0.24, half_w: 0.34, wheel_r: 0.13 }
+        pack: Vec::new(), fittings: crate::turret::Fittings::default(), hardpoints: crate::hardpoints::Hardpoints::default(), drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.48, half_h: 0.24, ride_h: 0.24, half_w: 0.34, wheel_r: 0.13 }
 }
 
 
@@ -850,7 +852,7 @@ pub fn longboy(gpu: &mut Gpu) -> Model {
     wheels(gpu, &mut prims, 0.09, 0.27, -0.72, 0.72, -0.05);
     Model { prims, settle: glam::Quat::IDENTITY,
         tuck: Vec::new(),
-        pack: Vec::new(), fittings: crate::turret::Fittings::default(), drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 1.00, half_h: 0.115, ride_h: 0.115, half_w: 0.30, wheel_r: 0.09 }
+        pack: Vec::new(), fittings: crate::turret::Fittings::default(), hardpoints: crate::hardpoints::Hardpoints::default(), drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 1.00, half_h: 0.115, ride_h: 0.115, half_w: 0.30, wheel_r: 0.09 }
 }
 
 
@@ -883,7 +885,7 @@ pub fn cube(gpu: &mut Gpu) -> Model {
     wheels(gpu, &mut prims, 0.11, 0.30, -0.225, 0.225, -0.14);
     Model { prims, settle: glam::Quat::IDENTITY,
         tuck: Vec::new(),
-        pack: Vec::new(), fittings: crate::turret::Fittings::default(), drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.34, half_h: 0.34, ride_h: 0.34, half_w: 0.34, wheel_r: 0.11 }
+        pack: Vec::new(), fittings: crate::turret::Fittings::default(), hardpoints: crate::hardpoints::Hardpoints::default(), drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.34, half_h: 0.34, ride_h: 0.34, half_w: 0.34, wheel_r: 0.11 }
 }
 
 pub fn shark(gpu: &mut Gpu) -> Model {
@@ -909,6 +911,6 @@ pub fn shark(gpu: &mut Gpu) -> Model {
     wheels(gpu, &mut prims, 0.10, 0.28, -0.44, 0.44, -0.09);
     Model { prims, settle: glam::Quat::IDENTITY,
         tuck: Vec::new(),
-        pack: Vec::new(), fittings: crate::turret::Fittings::default(), drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.66, half_h: 0.20, ride_h: 0.20, half_w: 0.31, wheel_r: 0.10 }
+        pack: Vec::new(), fittings: crate::turret::Fittings::default(), hardpoints: crate::hardpoints::Hardpoints::default(), drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.66, half_h: 0.20, ride_h: 0.20, half_w: 0.31, wheel_r: 0.10 }
 }
 

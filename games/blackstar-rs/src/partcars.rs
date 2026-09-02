@@ -188,6 +188,7 @@ pub fn assemble(
         tuck: Vec::new(),
         pack: Vec::new(),
         fittings: crate::turret::Fittings::default(),
+        hardpoints: crate::hardpoints::Hardpoints::default(),
         cloud: Vec::new(),
         cloud_n: Vec::new(),
         sdf_half: Vec3::ZERO,

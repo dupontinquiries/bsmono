@@ -91,6 +91,9 @@ pub struct Model {
     /// (`turret::find`). Indices are into `prims`, so the draw path can
     /// give the turret its own rotation without a second model.
     pub fittings: crate::turret::Fittings,
+    /// where the guns, thrusters and cockpit are on this pose, read off
+    /// the same oriented points (`hardpoints::find`). Model space.
+    pub hardpoints: crate::hardpoints::Hardpoints,
     /// downsampled surface points (final meters) for the reflection SDF bake
     pub cloud: Vec<Vec3>,
     /// outward normal for each cloud point — this is what makes the baked
@@ -1527,6 +1530,7 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
     // and "along the side" mean what they say (`turret::find`).
     let refs: Vec<&[Vec3]> = prim_pts.iter().map(|v| v.as_slice()).collect();
     let fittings = crate::turret::find(&refs);
+    let hardpoints = crate::hardpoints::find(&refs);
     // AND HOW MUCH OF IT IS IN THE WAY. The skeleton finds the core and
     // the appendages; `compact` shortens each overhanging one along its
     // own axis to half its reach, which is the number that keeps a jet's
@@ -1593,7 +1597,7 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
     let stride = (cloud_all.len() / 2600).max(1);
     let cloud: Vec<Vec3> = cloud_all.into_iter().step_by(stride).collect();
     let cloud_n: Vec<Vec3> = cloud_nrm.into_iter().step_by(stride).collect();
-    Model { prims, drive: Drive::Combustion, hover: None, settle, tuck, pack, fittings, cloud, cloud_n, sdf_half: Vec3::ZERO,
+    Model { prims, drive: Drive::Combustion, hover: None, settle, tuck, pack, fittings, hardpoints, cloud, cloud_n, sdf_half: Vec3::ZERO,
             half_len: half.z, half_h: half.y, half_w: half.x, wheel_r,
             // Same sign convention as xform::Morph::bounds_at: -lo.y, the
             // distance from the origin to the pose's actual lowest point,

@@ -438,6 +438,7 @@ pub fn run(args: &[String]) {
             tuck: Vec::new(),
             pack: Vec::new(),
             fittings: crate::turret::Fittings::default(),
+            hardpoints: crate::hardpoints::Hardpoints::default(),
             prims: Vec::new(),
             drive: crate::model::Drive::Combustion,
             cloud: Vec::new(),

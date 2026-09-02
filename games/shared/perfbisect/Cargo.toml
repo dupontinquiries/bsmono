@@ -1,0 +1,18 @@
+[package]
+name = "perfbisect"
+version = "0.1.0"
+edition = "2021"
+description = """
+Bisect a performance disparity between two machines without doing it by
+hand. `perfbisect run` executes unendlich's existing probes and the game
+itself over a knob matrix, fingerprints the machine, and writes one TSV;
+`perfbisect compare a.tsv b.tsv` ranks every probe by how far its
+cross-machine ratio departs from what the CPU alone explains, and names
+the suspects. std only; no engine dependency - it runs the binaries.
+"""
+
+[[bin]]
+name = "perfbisect"
+path = "src/main.rs"
+
+[dependencies]

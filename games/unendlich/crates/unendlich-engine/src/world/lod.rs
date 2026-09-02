@@ -966,6 +966,132 @@ pub fn downsample_for_lod(src: &Chunk, lod: LodLevel) -> Chunk {
     downsample_pow2(src, decimation_for(lod))
 }
 
+// ------------------------------------------------------------------------
+// MEGACHUNKS — one mesh per f³ chunks (perfbisect findings, 2026-09-01).
+//
+// `downsample_pow2` coarsens a chunk's BLOCKS so the greedy mesher emits
+// fewer quads, but the chunk COUNT is untouched: at render distance 60 the
+// very-far shell is ~180 000 chunks and therefore ~180 000 meshes and
+// draws, against an indirect pool that clamps at 65 536. LOD that cuts
+// voxels and not meshes does not reach 60.
+//
+// A megachunk is the f³ block of chunks (f = the band's decimation: 2 mid,
+// 4 far, 8 very far) assembled into ONE 32³ `Chunk` of cells, each cell the
+// representative of an f×f×f group in the source chunk it falls in. The
+// unchanged CPU mesher meshes that one chunk; the renderer places it at
+// the block's origin with positions scaled by f. 512 very-far chunks
+// become one draw, and rd 60's 180 000 become ~350. The same shape the
+// logscope batch-submit work had: many small submissions into one.
+//
+// Missing members are air, so a partially loaded block still meshes (its
+// missing faces fill in when the chunks arrive and the block is
+// re-assembled). Assembly is pure over a lookup closure so it can run on
+// the meshing pool's threads against whatever the chunk manager holds.
+
+/// A block of `factor`³ chunks, addressed by its block coordinate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct MegaCoord {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub factor: u32,
+}
+
+impl MegaCoord {
+    /// The block a chunk belongs to at `factor`. `factor` of 1 is the
+    /// chunk itself.
+    pub fn of(c: ChunkCoord, factor: u32) -> MegaCoord {
+        let f = factor.max(1) as i32;
+        MegaCoord { x: c.x.div_euclid(f), y: c.y.div_euclid(f), z: c.z.div_euclid(f), factor: factor.max(1) }
+    }
+
+    /// The `factor`³ chunks in this block, x fastest.
+    pub fn members(&self) -> Vec<ChunkCoord> {
+        let f = self.factor as i32;
+        let mut out = Vec::with_capacity((f * f * f) as usize);
+        for dy in 0..f {
+            for dz in 0..f {
+                for dx in 0..f {
+                    out.push(ChunkCoord::new(self.x * f + dx, self.y * f + dy, self.z * f + dz));
+                }
+            }
+        }
+        out
+    }
+
+    /// The block's origin in world blocks.
+    pub fn origin_blocks(&self) -> [i32; 3] {
+        let f = self.factor as i32;
+        let cs = CHUNK_SIZE as i32;
+        [self.x * f * cs, self.y * f * cs, self.z * f * cs]
+    }
+
+    /// The renderer's placement for the assembled mesh: translate to the
+    /// block origin, scale mesh-local units by `factor`. A mesh vertex at
+    /// local (x, y, z) sits at `origin + factor * (x, y, z)` in the world.
+    pub fn placement(&self) -> ([f32; 3], f32) {
+        let o = self.origin_blocks();
+        ([o[0] as f32, o[1] as f32, o[2] as f32], self.factor as f32)
+    }
+}
+
+/// Assemble the block into one chunk of cells. `get` looks a member up;
+/// a member it cannot find is air. `None` when NO member is loaded — there
+/// is nothing to mesh. The returned chunk's `coord` is the block coordinate
+/// (not a real chunk coordinate) so a caller cannot mistake it for one.
+pub fn assemble_megachunk<'a, F>(mc: MegaCoord, get: F) -> Option<Chunk>
+where
+    F: Fn(ChunkCoord) -> Option<&'a Chunk>,
+{
+    let f = mc.factor.max(1) as usize;
+    let cs = CHUNK_SIZE as usize;
+    if f == 1 {
+        return get(ChunkCoord::new(mc.x, mc.y, mc.z)).cloned();
+    }
+    if cs % f != 0 {
+        return None;
+    }
+    // cells per source chunk along one axis: a factor-8 block puts 4x4x4
+    // cells of one source chunk into the assembled chunk
+    let per = cs / f;
+    let members = mc.members();
+    let mut any = false;
+    let mut blocks = vec![BlockId::Air; CHUNK_VOLUME];
+    let mut samples: Vec<BlockId> = Vec::with_capacity(f * f * f);
+    for (mi, coord) in members.iter().enumerate() {
+        let Some(src) = get(*coord) else { continue };
+        any = true;
+        // where this member's cells land in the assembled chunk
+        let (dx, dy, dz) = (mi % f, mi / (f * f), (mi / f) % f);
+        for cy in 0..per {
+            for cz in 0..per {
+                for cx in 0..per {
+                    samples.clear();
+                    for sy in 0..f {
+                        for sz in 0..f {
+                            for sx in 0..f {
+                                let x = cx * f + sx;
+                                let y = cy * f + sy;
+                                let z = cz * f + sz;
+                                samples.push(src.blocks[x + z * cs + y * cs * cs]);
+                            }
+                        }
+                    }
+                    let rep = representative(&samples);
+                    let ax = dx * per + cx;
+                    let ay = dy * per + cy;
+                    let az = dz * per + cz;
+                    blocks[ax + az * cs + ay * cs * cs] = rep;
+                }
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    Some(Chunk::from_blocks(ChunkCoord::new(mc.x, mc.y, mc.z), blocks))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1554,6 +1680,93 @@ mod tests {
         assert!(!cull_boundary_face(far, near, true));
         assert!(!cull_boundary_face(near, far, true));
         assert!(!cull_boundary_face(far, near, false));
+    }
+
+    // ---- megachunks ----
+
+    fn flat_world_chunk(c: ChunkCoord, surface_y: i32) -> Chunk {
+        let cs = CHUNK_SIZE as usize;
+        let mut blocks = vec![BlockId::Air; CHUNK_VOLUME];
+        for y in 0..cs {
+            let wy = c.y * cs as i32 + y as i32;
+            if wy < surface_y {
+                for z in 0..cs {
+                    for x in 0..cs {
+                        blocks[x + z * cs + y * cs * cs] = BlockId::Stone;
+                    }
+                }
+            }
+        }
+        Chunk::from_blocks(c, blocks)
+    }
+
+    #[test]
+    fn a_block_has_f_cubed_members_and_of_is_stable() {
+        for f in [1u32, 2, 4, 8] {
+            let mc = MegaCoord::of(ChunkCoord::new(-9, 3, 17), f);
+            let m = mc.members();
+            assert_eq!(m.len(), (f * f * f) as usize);
+            for c in &m {
+                assert_eq!(MegaCoord::of(*c, f), mc, "member {c:?} maps to another block");
+            }
+            let (o, s) = mc.placement();
+            assert_eq!(s, f as f32);
+            assert_eq!(o[0], (mc.x * f as i32 * CHUNK_SIZE as i32) as f32);
+        }
+    }
+
+    #[test]
+    fn a_flat_world_assembles_into_one_chunk_with_the_surface_in_the_right_cell() {
+        let f = 4u32;
+        let surface = 40;
+        let mc = MegaCoord { x: 0, y: 0, z: 0, factor: f };
+        let world: std::collections::HashMap<ChunkCoord, Chunk> =
+            mc.members().into_iter().map(|c| (c, flat_world_chunk(c, surface))).collect();
+        let mega = assemble_megachunk(mc, |c| world.get(&c)).expect("nothing assembled");
+        let cs = CHUNK_SIZE as usize;
+        let at = |x: usize, y: usize, z: usize| mega.blocks[x + z * cs + y * cs * cs];
+        assert_eq!(at(5, 9, 5), BlockId::Stone);
+        assert_eq!(at(5, 10, 5), BlockId::Air);
+        assert_eq!(at(31, 0, 31), BlockId::Stone);
+        assert_eq!(at(0, 31, 0), BlockId::Air);
+    }
+
+    // the mesher lives behind `render-core` (or `mesh-ref`); the count
+    // claim needs it, the assembly claims above do not
+    #[cfg(any(feature = "render-core", feature = "mesh-ref"))]
+    #[test]
+    fn a_megachunk_is_one_mesh_where_the_members_were_sixty_four() {
+        let f = 4u32;
+        let mc = MegaCoord { x: 0, y: 0, z: 0, factor: f };
+        let world: std::collections::HashMap<ChunkCoord, Chunk> =
+            mc.members().into_iter().map(|c| (c, flat_world_chunk(c, 40))).collect();
+        let mut per_chunk_verts = 0usize;
+        let mut per_chunk_meshes = 0usize;
+        for c in world.values() {
+            let d = downsample_pow2(c, f);
+            let m = crate::render::mesher::mesh_chunk(&d);
+            if !m.vertices.is_empty() {
+                per_chunk_meshes += 1;
+            }
+            per_chunk_verts += m.vertices.len();
+        }
+        let mega = assemble_megachunk(mc, |c| world.get(&c)).unwrap();
+        let m = crate::render::mesher::mesh_chunk(&mega);
+        assert!(!m.vertices.is_empty());
+        assert!(per_chunk_meshes > 1, "the flat world should have meshed more than one member");
+        assert!(m.vertices.len() < per_chunk_verts, "one mesh ({}) should be lighter than {per_chunk_meshes} meshes ({per_chunk_verts})", m.vertices.len());
+    }
+
+    #[test]
+    fn missing_members_are_air_and_an_empty_block_is_none() {
+        let mc = MegaCoord { x: 2, y: 0, z: -1, factor: 2 };
+        let only = mc.members()[0];
+        let one = flat_world_chunk(only, 8);
+        let mega = assemble_megachunk(mc, |c| if c == only { Some(&one) } else { None }).unwrap();
+        let cs = CHUNK_SIZE as usize;
+        assert_eq!(mega.blocks[0], BlockId::Stone);
+        assert_eq!(mega.blocks[(cs - 1) + (cs - 1) * cs], BlockId::Air);
+        assert!(assemble_megachunk(mc, |_| None).is_none());
     }
 }
 

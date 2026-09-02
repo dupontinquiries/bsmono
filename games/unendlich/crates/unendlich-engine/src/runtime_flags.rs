@@ -90,13 +90,31 @@ pub fn profile(name: &str) -> Option<&'static [(&'static str, &'static str)]> {
             ("UNENDLICH_APPLY_BUDGET", "32"),
             ("UNENDLICH_EVICT_BUDGET", "32"),
         ]),
+        // HONEYKRISP (Asahi, Apple GPUs) — from the perfbisect desktop report
+        // of 2026-09-01 (docs/claude-notes/perfbisect-desktop-findings.md).
+        // Both GPU offload paths are record→submit→wait_for_fences(MAX) on
+        // the ONE graphics queue, so a 64-chunk mesh dispatch sits in front
+        // of the frame's main pass and the frame stalls 0.5-1.6 s on every
+        // chunk arrival; with the CPU mesher the frame p99 was 12.9 ms. The
+        // GPU generator measured 0.63-0.98x the 24-core CPU one. Indirect
+        // draw cost 1.4 of a 3.9 ms GPU frame at 31 chunks (driver-side
+        // emulation of draw_indexed_indirect_count is the suspect). This
+        // preset is the measured answer until the submissions are made
+        // asynchronous; it is a driver profile, not a quality one.
+        "honeykrisp" => Some(&[
+            ("UNENDLICH_GPU_MESHER", "0"),
+            ("UNENDLICH_GPU_MESHER_MID", "0"),
+            ("UNENDLICH_GEN_BACKEND", "cpu"),
+            ("UNENDLICH_INDIRECT", "0"),
+            ("UNENDLICH_ROAMER_BUDGET_MS", "4"),
+        ]),
         _ => None,
     }
 }
 
 /// All known profile names (for help text + tests).
 pub fn profile_names() -> &'static [&'static str] {
-    &["rd24"]
+    &["rd24", "honeykrisp"]
 }
 
 /// Static registry of all runtime knobs.
@@ -1227,5 +1245,18 @@ mod tests {
         assert!(p.iter().any(|(k, _)| *k == "UNENDLICH_PREFETCH"));
         assert!(super::profile("does-not-exist").is_none());
         assert!(super::profile_names().contains(&"rd24"));
+        // every named profile resolves, has no duplicate keys, and its keys
+        // are all UNENDLICH_ knobs (a driver preset that set a typo would
+        // silently do nothing)
+        for name in super::profile_names() {
+            let p = super::profile(name).expect("named profile resolves");
+            let keys: std::collections::HashSet<&str> = p.iter().map(|(k, _)| *k).collect();
+            assert_eq!(keys.len(), p.len(), "{name} has duplicate keys");
+            for (k, _) in p.iter() {
+                assert!(k.starts_with("UNENDLICH_"), "{name} sets a non-engine key {k}");
+            }
+        }
+        let h = super::profile("honeykrisp").unwrap();
+        assert!(h.iter().any(|(k, v)| *k == "UNENDLICH_GPU_MESHER" && *v == "0"));
     }
 }

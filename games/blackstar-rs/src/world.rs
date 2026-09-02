@@ -376,6 +376,17 @@ pub struct World {
     pub nets: Vec<NetGoal>,
     pub pads: Vec<Pad>,
     pub decor_cars: Vec<Mat4>,
+    /// where a wave stands on a district (`district.rs`); empty elsewhere
+    pub plazas: Vec<Vec3>,
+    /// the district's cover blocks, for a wave to stand behind
+    pub cover: Vec<Vec3>,
+    /// the district's solids as ground discs, for kinematic bodies to
+    /// steer around (a spire is not a thing a foe drives through)
+    pub obstacles: Vec<(Vec3, f32)>,
+    /// the district's road: from, to, clear width
+    pub boulevard: Option<(Vec3, Vec3, f32)>,
+    /// where this window sits on the world plane (`generate_at`)
+    pub origin: Vec3,
     #[allow(dead_code)] // map identity metadata; the grid is the live ground
     pub seed: u64,
     #[allow(dead_code)]
@@ -571,7 +582,7 @@ pub struct MapStyle {
     pub focal: u8,
 }
 
-pub const STYLE_COUNT: usize = 36;
+pub const STYLE_COUNT: usize = 37;
 
 /// Adapted from logscope scene3d's ROOMS table — same sixteen names, each
 /// translated from an indoor room into an open-world mood.
@@ -620,6 +631,13 @@ pub fn styles() -> &'static [MapStyle; STYLE_COUNT] {
             MapStyle { name: "WYRMFIRE", grass: g(0x2A1410), zenith: rgb3(0x2A0E12), fog: rgb3(0x6E2412), fog_d: 0.0016, sun: [0.4, 0.5, -0.3], accent: g(0xFF7A18), pal_mix: 0.6, amp: 0.35, freq: 1.2, wet: 0.22, glow: 0.75, rings: 4, halos: 4, balloons: 0, domes: 0, ramps: 5, platforms: 6, trees: 0, small_pads: 26, nets: 2, focal: 22 },
             MapStyle { name: "BREAKWATER", grass: g(0x8C8A84), zenith: rgb3(0x7FB4D8), fog: rgb3(0xC6D8E2), fog_d: 0.0011, sun: [0.5, 0.7, 0.2], accent: g(0x2FBFA6), pal_mix: 0.4, amp: 0.05, freq: 1.0, wet: 0.55, glow: 0.3, rings: 3, halos: 2, balloons: 0, domes: 0, ramps: 5, platforms: 8, trees: 0, small_pads: 28, nets: 2, focal: 23 },
             MapStyle { name: "CHAMBER", grass: g(0x1E1C26), zenith: rgb3(0x0E1018), fog: rgb3(0x2A2636), fog_d: 0.0013, sun: [-0.35, 0.7, 0.25], accent: g(0x9FE3FF), pal_mix: 0.45, amp: 0.0, freq: 1.0, wet: 0.42, glow: 0.55, rings: 2, halos: 3, balloons: 0, domes: 0, ramps: 4, platforms: 6, trees: 0, small_pads: 24, nets: 2, focal: 24 },
+            // DISTRICT (`district.rs`): the open ground authored in
+            // occupant heights, the Earth column of the lore's palette —
+            // warm, gold, life, noise. No scattered furniture: the plan
+            // is the map, and the counts below are zero so nothing lands
+            // in the boulevard. Terrain amp is low because the road IS
+            // the terrain between its kerbs.
+            MapStyle { name: "DISTRICT", grass: g(0x3E3A32), zenith: rgb3(0xFFC58A), fog: rgb3(0xE8C9A0), fog_d: 0.0009, sun: [0.55, 0.42, 0.35], accent: g(0xFFD27A), pal_mix: 0.5, amp: 0.22, freq: 0.6, wet: 0.16, glow: 0.35, rings: 0, halos: 0, balloons: 0, domes: 0, ramps: 0, platforms: 0, trees: 0, small_pads: 30, nets: 0, focal: 25 },
         ]
     })
 }
@@ -631,6 +649,18 @@ pub fn style(idx: usize) -> &'static MapStyle {
 // ---------------------------------------------------------- gen world ----
 impl World {
     pub fn generate(seed: u64, style: &MapStyle, car_half_h: f32, wscale: f32) -> World {
+        Self::generate_at(seed, style, car_half_h, wscale, Vec3::ZERO)
+    }
+
+    /// The same world, as the WINDOW at `origin` on the world plane. The
+    /// terrain noise is sampled at world coordinates, so two windows
+    /// agree on the ground where they overlap, and the district lattice
+    /// is addressed the same way. Everything else the generator
+    /// scatters (rings, balloons, the sandbox's furniture) still comes
+    /// off a sequential rng and belongs to the window, not the world —
+    /// which is why the district style zeroes it. `origin` is stored on
+    /// the world for the shell's paging.
+    pub fn generate_at(seed: u64, style: &MapStyle, car_half_h: f32, wscale: f32, origin: Vec3) -> World {
         let mut routes: Vec<(Vec<Vec3>, f32)> = Vec::new();
         let mut route_names: Vec<String> = Vec::new();
         let mut route_shapes: Vec<Vec<u32>> = Vec::new();
@@ -661,7 +691,7 @@ impl World {
             for i in 0..TG_N {
                 let x = (i as f32 / (TG_N - 1) as f32 * 2.0 - 1.0) * TG_HALF;
                 let z = (j as f32 / (TG_N - 1) as f32 * 2.0 - 1.0) * TG_HALF;
-                tgrid[j * TG_N + i] = terrain_h_s(x, z, seed, amp, freq);
+                tgrid[j * TG_N + i] = terrain_h_s(x + origin.x, z + origin.z, seed, amp, freq);
             }
         }
         let th = |x: f32, z: f32| grid_h(&tgrid, x, z);
@@ -840,6 +870,12 @@ impl World {
 
         // ---- spawn centerpiece (the ROOMS focal, translated) -------------
         let acc = style.accent;
+        // the district's landmarks, for the field to muster at and the
+        // shell to route by; empty on every other style
+        let mut plazas: Vec<Vec3> = Vec::new();
+        let mut cover: Vec<Vec3> = Vec::new();
+        let mut obstacles: Vec<(Vec3, f32)> = Vec::new();
+        let mut boulevard: Option<(Vec3, Vec3, f32)> = None;
         match style.focal {
             1 => {
                 // obelisk: one tall glowing four-square spire
@@ -3216,6 +3252,24 @@ impl World {
                 }
                 zones.push(Zone { pos: Vec3::new(0.0, g0 + 2.0, 0.0), r: 10.0, kind: ZoneKind::Boost });
             }
+            25 => {
+                // THE DISTRICT. Pure plan from `district::layout`, pushed
+                // piece by piece with this map's own palette: stone from
+                // the grass tone lifted, the accent as the lit lines, the
+                // spires and the hangar in a dark structural tone.
+                let lay = crate::district::layout(seed, TG_HALF, origin);
+                let stone = mix4(style.grass, [0.85, 0.80, 0.72, 1.0], 0.55);
+                let dark = mix4(style.grass, [0.06, 0.06, 0.08, 1.0], 0.6);
+                for pc in crate::district::pieces(&lay, &th, stone, acc, dark) {
+                    push(&mut shapes, pc.mesh, pc.pos, pc.rot, pc.scale, pc.sdf, pc.color, pc.emissive, pc.spec);
+                }
+                plazas = lay.plazas.clone();
+                cover = crate::district::cover_points(&lay);
+                obstacles = crate::district::obstacles(&lay);
+                if lay.road_in_window {
+                    boulevard = Some((Vec3::new(-TG_HALF, 0.0, lay.road_z), Vec3::new(TG_HALF, 0.0, lay.road_z), lay.width));
+                }
+            }
             _ => {}
         }
 
@@ -3759,7 +3813,7 @@ impl World {
             route_names.push(String::new());
             route_shapes.push(Vec::new());
         }
-        let mut w = World { nrm_cache: std::cell::Cell::new((Vec3::ZERO, Vec3::ZERO)), sdf_calls: std::cell::Cell::new(0), grav, ggrid, gdim, gdyn, mgrid: Vec::new(), sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, parked: None, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq };
+        let mut w = World { nrm_cache: std::cell::Cell::new((Vec3::ZERO, Vec3::ZERO)), sdf_calls: std::cell::Cell::new(0), grav, ggrid, gdim, gdyn, mgrid: Vec::new(), sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, parked: None, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, plazas, cover, obstacles, boulevard, origin, seed, t_amp: amp, t_freq: freq };
         // prime the mover index so the very first frame is already fast
         w.rebuild_movers();
         w
@@ -5033,5 +5087,33 @@ mod wall_ahead_tests {
         // loose upper bound: real number, somewhere between the probe and
         // the probe's own max_height ceiling -- not pinning an exact
         // hull-to-origin vertical offset this test doesn't need to know
+    }
+}
+
+
+// ------------------------------------------------------------ the seam ---
+//
+// What the game asks of this world, as `worldhost::WorldHost`. Every
+// answer is a field or a method this file already had; the trait is the
+// list of them, so a second host (unendlich's chunks) can answer the same
+// questions without the game knowing which engine it is standing on.
+impl worldhost::WorldHost for World {
+    fn ground_h(&self, x: f32, z: f32) -> f32 {
+        World::ground_h(self, x, z)
+    }
+    fn clearance(&self, p: Vec3) -> f32 {
+        self.sdf(p)
+    }
+    fn origin(&self) -> Vec3 {
+        self.origin
+    }
+    fn plazas(&self) -> &[Vec3] {
+        &self.plazas
+    }
+    fn cover(&self) -> &[Vec3] {
+        &self.cover
+    }
+    fn obstacles(&self) -> &[(Vec3, f32)] {
+        &self.obstacles
     }
 }
