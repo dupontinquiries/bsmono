@@ -31,6 +31,8 @@ pub mod steno;
 #[cfg(feature = "wayland")]
 pub mod wayland;
 pub mod settings;
+/// Session/placement policy: which host obligations the shell can meet, KWin socket capture.
+pub mod platform;
 // config/mod.rs refers to `crate::util`, so the port re-exports it at the root.
 pub use settings::util;
 // …and the shared voice tree refers to `crate::config::VoiceConfig`, so the
@@ -229,7 +231,12 @@ impl Layout {
                 Row {
                     keys: vec![
                         Key::emitting("⌫", "\u{8}", 1.5),
-                        Key::emitting("space", " ", 4.0),
+                        // Dictation reachable from the cardinal board. The GTK build only ever
+                        // put the mic on the qwerty row, so the two best input modes could not
+                        // be used together; the token is the same `\u{0}act:voice` the real
+                        // layout files' Voice action crosses the render layer as.
+                        Key::emitting("🎤", &real_layout::voice_emit(), 1.0),
+                        Key::emitting("space", " ", 3.0),
                         Key::emitting("⏎", "\n", 1.5),
                     ],
                     weight: 1.0,
@@ -270,6 +277,7 @@ impl Layout {
                 ]),
                 Row {
                     keys: vec![
+                        Key::emitting("🎤", &real_layout::voice_emit(), 1.0),
                         Key::emitting("space", " ", 2.0),
                         Key::emitting("⌫", "\u{8}", 1.0),
                         Key::emitting("⏎", "\n", 1.0),

@@ -118,6 +118,13 @@ fn action_emit(action: &KeyAction, text: &str) -> String {
     }
 }
 
+/// The render-layer token for the Voice action, for layouts built in code (the cardinal
+/// boards) that want a mic key without a `KeyAction`. Same bytes `action_emit` produces for
+/// `KeyAction::Voice`, so `classify` reads both identically — asserted in a test.
+pub fn voice_emit() -> String {
+    action_emit(&KeyAction::Voice, "")
+}
+
 /// Turn a `keyboard_ui` emission back into a typed [`Press`].
 pub fn classify(emit: &str) -> Press {
     if let Some((button, gesture)) = crate::decode_steno_token(emit) {
@@ -571,5 +578,11 @@ mod tests {
             let value = crate::steno_token("L1", code);
             assert_eq!(classify(&value), Press::Steno("L1".to_string(), code.to_string()));
         }
+    }
+
+    #[test]
+    fn voice_emit_classifies_as_voice_like_the_real_layout_action() {
+        assert_eq!(classify(&voice_emit()), Press::Voice);
+        assert_eq!(voice_emit(), action_emit(&KeyAction::Voice, "🎤"));
     }
 }

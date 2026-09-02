@@ -13,7 +13,16 @@ use crate::swipe::{candidate_bar, draw_trail_styled, set_trail_debug_styling, tr
 use crate::{apply_theme, keyboard_ui, Board};
 use uikit_egui::Adaptive;
 
-struct Feel {
+pub struct Feel {
+    /// Which of the three keyboard obligations (no focus, bottom edge, focus-driven show/hide)
+    /// this host meets, decided once — see `platform.rs`. Shown in the status strip.
+    placement: crate::platform::Placement,
+    /// The in-board reveal that runs when the compositor shows us. Motion INSIDE a rectangle
+    /// whose size never changes: one map, one relayout, no per-frame resize storm on a tiling
+    /// compositor (a sliding WINDOW does exactly that).
+    reveal: crate::animations::OneShot,
+    /// Last frame's visibility, to detect the hidden→shown edge that starts the reveal.
+    was_visible: bool,
     /// The accessibility scene widgets register with. Held here rather
     /// than built per frame because `A11yScene` remembers focus BY ID
     /// between frames; a per-frame scene forgets, which presents as
@@ -129,8 +138,36 @@ impl Feel {
         }
     }
 
+    /// Start or stop dictation. ONE place for the toolbar button and the 🎤 key on any board,
+    /// so the voice mode cannot be wired to one surface and forgotten on the next — which is
+    /// how the GTK build shipped voice on qwerty only.
+    pub fn toggle_dictation(&mut self) {
+        if self.dictation.is_active() {
+            // PartialsOnly: the last partial IS the result, so release commits without a
+            // second inference.
+            if let Some(text) = self.dictation.release() {
+                if !self.typed.is_empty() && !self.typed.ends_with(' ') {
+                    self.typed.push(' ');
+                }
+                self.service.commit_text(&text);
+                self.typed.push_str(&text);
+            }
+            // RELEASED: the keyboard comes back now the voice session is over.
+            let _ = self.service.set_suppressed(false);
+        } else {
+            self.dictation.start();
+            // SUPPRESSED while the voice session runs — keyboard_service's own doc names a
+            // voice session as exactly the trigger. The Hidden event is dropped on purpose:
+            // this app reads service STATE directly and consumes no ServiceEvent anywhere.
+            let _hidden = self.service.set_suppressed(true);
+        }
+    }
+
     pub fn new() -> Feel {
         Feel {
+            placement: crate::platform::placement(),
+            reveal: Default::default(),
+            was_visible: false,
             a11y: uikit_egui::a11y::A11yScene::new(),
             trail_style: TrailStyle::Solid,
             board: Board::new(),
@@ -176,8 +213,19 @@ impl eframe::App for Feel {
     // this eframe's App trait requires ui(); the app is driven from update() below.
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 
-    #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frame(ctx);
+    }
+}
+
+impl Feel {
+    /// One frame of the keyboard screen against a bare `egui::Context`. THE SHELL SEAM: the
+    /// eframe `App::update` above is one caller; a shell that owns its own surface (a
+    /// layer-shell loop calling `ctx.run(raw_input, |ctx| feel.frame(ctx))`) is the other. The
+    /// screen asks for show/hide through `ViewportCommand::Visible` and never touches a window
+    /// handle, so which shell is running is invisible from in here.
+    #[allow(deprecated)]
+    pub fn frame(&mut self, ctx: &egui::Context) {
         apply_theme(ctx);
 
         // Drive whatever background event processing the active sink
@@ -197,6 +245,10 @@ impl eframe::App for Feel {
         // real signal ever asks to hide.
         let should_show = self.sink.is_visible();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(should_show));
+        if should_show && !self.was_visible {
+            self.reveal.start();
+        }
+        self.was_visible = should_show;
         // Keep ticking even while hidden: a hidden/unfocused eframe
         // window may not otherwise get repainted, which would starve
         // `pump()` above and mean the NEXT focus event (the one that's
@@ -243,6 +295,8 @@ impl eframe::App for Feel {
             self.commit_flash.start();
         }
         self.commit_flash.tick(dt_ms, crate::animations::COMMIT_MS);
+        self.reveal.tick(dt_ms, crate::platform::REVEAL_MS);
+        if self.reveal.is_running() { ctx.request_repaint(); }
         // The pulse follows the mic rather than being toggled alongside it —
         // two booleans for one fact drift, and the one that drifts is the one
         // the user is looking at.
@@ -286,46 +340,7 @@ impl eframe::App for Feel {
                 {
                     let listening = self.dictation.is_active();
                     if ui.selectable_label(listening, if listening { "● dictating" } else { "dictate" }).clicked() {
-                        if listening {
-                            // PartialsOnly: the last partial IS the result, so
-                            // release commits without a second inference.
-                            if let Some(text) = self.dictation.release() {
-                                if !self.typed.is_empty() && !self.typed.ends_with(' ') {
-                                    self.typed.push(' ');
-                                }
-                                self.service.commit_text(&text);
-                                self.typed.push_str(&text);
-                            }
-                            // RELEASED. The keyboard comes back now the voice
-                            // session is over, in the same place the session
-                            // ends — a release that lived anywhere else would
-                            // eventually be reached by a path that skipped it.
-                            let _ = self.service.set_suppressed(false);
-                        } else {
-                            // The broker decides. On device the host supplies a
-                            // real one; until then the state stays Idle rather
-                            // than pretending a grant was obtained, because
-                            // claiming to be listening when nothing is captured
-                            // is exactly the dud-demo failure.
-                            self.dictation.start();
-                            // SUPPRESSED. keyboard_service::set_suppressed has
-                            // existed since the port with nothing calling it,
-                            // and its own doc names this trigger: "a keyboard
-                            // left on screen after the reason for suppressing
-                            // it arrived — glove mode starting, a voice session
-                            // opening — is the failure the suppression exists
-                            // to prevent, arriving one state later."
-                            //
-                            // A voice session is exactly that reason, and the
-                            // two services have sat in the same struct without
-                            // a wire between them.
-                            // The Hidden event is dropped deliberately: this
-                            // app reads service STATE directly (is_visible,
-                            // suppressed) and consumes no ServiceEvent
-                            // anywhere, so routing one event alone would be a
-                            // second mechanism for one reader.
-                            let _hidden = self.service.set_suppressed(true);
-                        }
+                        self.toggle_dictation();
                     }
                     if listening {
                         // AUDIO ACCOUNTING. The service needs to know how much
@@ -399,7 +414,7 @@ impl eframe::App for Feel {
                 ui.label(
                     egui::RichText::new(match &self.sink_error {
                         Some(e) => format!("sink error: {e}"),
-                        None => self.sink.describe(),
+                        None => format!("{} · {}", self.sink.describe(), self.placement.describe()),
                     })
                     .size(10.0)
                     .color(if self.sink_error.is_some() {
@@ -703,6 +718,12 @@ impl eframe::App for Feel {
                 });
                 ui.separator();
                 ui.vertical(|ui| {
+                    // The reveal: content settles up from 12px low and fades in, inside the
+                    // panel. `set_opacity` scopes to this Ui, so the sidebar and status strip
+                    // are already at rest when the keys arrive.
+                    let t = self.reveal.progress(crate::platform::REVEAL_MS);
+                    ui.add_space(crate::platform::reveal_offset(t, 12.0));
+                    ui.set_opacity(0.15 + 0.85 * crate::platform::reveal_progress(t));
                     let board_top = ui.cursor().min;
                     if self.real_active {
                         // the real layout files: render via the projection, feed emissions through
@@ -745,15 +766,22 @@ impl eframe::App for Feel {
                                         }
                                     }
                                 }
-                                Some(Press::Voice) | None => {}
+                                Some(Press::Voice) => self.toggle_dictation(),
+                                None => {}
                                 Some(_) => {}
                             }
                         }
                     } else if let Some(e) = keyboard_ui(ui, self.board.current(), &adaptive, self.board.palette()) {
-                        if e == "\u{8}" {
-                            self.emit_key("BackSpace");
-                        } else {
-                            self.emit_text(&e);
+                        // Same decoder as the real layouts, so a mic key or an action token
+                        // on a code-built board means the same thing it means on a JSON one.
+                        match crate::real_layout::classify(&e) {
+                            Press::Backspace => self.emit_key("BackSpace"),
+                            Press::Return => self.emit_key("Return"),
+                            Press::Voice => self.toggle_dictation(),
+                            Press::Text(t) if t == "\u{8}" => self.emit_key("BackSpace"),
+                            Press::Text(t) if t == "\n" => self.emit_key("Return"),
+                            Press::Text(t) => self.emit_text(&t),
+                            _ => {}
                         }
                     }
                     // ── swipe typing over whichever board is showing ──────────────────
@@ -811,9 +839,18 @@ pub fn run(title: &str) -> eframe::Result<()> {
         // An on-screen keyboard wants to be WIDE and SHORT, and it must not
         // steal focus from the app being typed into — a keyboard that takes
         // focus types into itself.
-        viewport: uikit_egui::desktop::viewport(APP_ID, title, [900.0, 340.0])
-            .with_resizable(true)
-            .with_active(false),
+        viewport: {
+            let v = uikit_egui::desktop::viewport(APP_ID, title, [900.0, 340.0])
+                .with_resizable(true)
+                .with_active(false);
+            match crate::platform::placement() {
+                // Docked-by-rule: no titlebar to grab, and ask for the top level. On Wayland
+                // the level is the rule's job (winit cannot set it); on X11 it is honoured.
+                crate::platform::Placement::RuledToplevel | crate::platform::Placement::LayerShell =>
+                    v.with_decorations(false).with_always_on_top(),
+                crate::platform::Placement::Floating => v,
+            }
+        },
         ..Default::default()
     };
     let r = eframe::run_native(APP_ID, opts, Box::new(|_cc| Ok(Box::new(Feel::new()))));
