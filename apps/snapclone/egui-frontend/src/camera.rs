@@ -185,27 +185,22 @@ impl Viewfinder {
 }
 
 /// Draw the viewfinder. `frame` is the latest camera image, if any.
-/// How tall the viewfinder should be on a page that also carries controls.
+/// The band at the foot of the viewfinder that the controls are drawn OVER.
 ///
-/// The camera page allocated the viewfinder a hard-coded 220 px and then had
-/// `viewfinder` take `available_size()` INSIDE that box — so the preview was a
-/// fixed strip on every screen, while the page dispatch was deliberately not
-/// wrapping this page in a ScrollArea precisely so that it could fill ("the
-/// camera page fills; wrapping it would give the viewfinder a scrollbar").
-/// The dispatch's intent and the page's allocation disagreed, and the page won.
+/// The camera page used to RESERVE space for its controls, which itself
+/// replaced a hard-coded 220px preview. Both were the wrong shape: a viewfinder
+/// that stops short of the edge reads as a preview of a camera rather than as
+/// the camera, and the part it gives up is the bottom — which on a phone held
+/// at arm's length is where the subject is.
 ///
-/// The reserve is on the SMALL, roughly-constant part — the description line,
-/// the device picker and the shutter row — rather than on the large variable
-/// one. That is the right way round: a magic number that bounds the controls is
-/// wrong by a few pixels on an unusual theme, whereas a magic number that
-/// bounds the preview is wrong by the entire difference between a phone and a
-/// desktop, which is what 220 was.
-///
-/// `floor` keeps a short window showing SOME preview rather than none: on a
-/// window shorter than the controls need, a naive subtraction goes negative and
-/// the viewfinder vanishes entirely, which is worse than a cramped one.
-pub fn viewfinder_height(available: f32, controls_reserve: f32, floor: f32) -> f32 {
-    (available - controls_reserve).max(floor)
+/// So the preview is the whole page and this is where the chrome floats. The
+/// clamp is the load-bearing part: on a short window the controls' natural
+/// height can exceed the frame, and a band taller than what it overlays would
+/// cover the entire preview with a scrim to show a shutter button sitting on
+/// nothing.
+pub fn controls_band(vf: Rect, natural_h: f32) -> Rect {
+    let h = natural_h.max(0.0).min(vf.height() * 0.5);
+    Rect::from_min_max(Pos2::new(vf.left(), vf.bottom() - h), vf.max)
 }
 
 pub fn viewfinder(ui: &mut Ui, vf: &mut Viewfinder, frame: Option<&egui::TextureHandle>,
@@ -260,26 +255,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_viewfinder_grows_with_the_page_instead_of_sitting_at_220() {
-        // The defect, named: a constant. On any page taller than the old 220,
-        // the preview must be bigger than it was.
-        let tall_phone = viewfinder_height(900.0, 180.0, 160.0);
-        assert_eq!(tall_phone, 720.0);
-        assert!(tall_phone > 220.0, "a 900px page still gives a 220px strip");
-        // And it must actually TRACK the page, not just exceed one threshold —
-        // a check that only asserted `> 220` would pass on a new constant.
-        assert!(viewfinder_height(1200.0, 180.0, 160.0) > tall_phone);
-        assert!(viewfinder_height(600.0, 180.0, 160.0) < tall_phone);
+    fn the_controls_band_sits_at_the_foot_of_the_frame() {
+        let vf = Rect::from_min_size(Pos2::new(10.0, 20.0), Vec2::new(400.0, 800.0));
+        let b = controls_band(vf, 180.0);
+        assert_eq!(b.bottom(), vf.bottom(), "the band floated off the bottom edge");
+        assert_eq!(b.height(), 180.0);
+        assert_eq!((b.left(), b.right()), (vf.left(), vf.right()));
+        assert!(vf.contains_rect(b), "the band escaped the viewfinder");
     }
 
     #[test]
-    fn a_short_window_keeps_some_preview_rather_than_none() {
-        // Naive subtraction goes negative here and the preview disappears,
-        // which is worse than a cramped one. Both directions: the floor holds,
-        // and it does not clamp a page that has room.
-        assert_eq!(viewfinder_height(100.0, 180.0, 160.0), 160.0);
-        assert_eq!(viewfinder_height(180.0, 180.0, 160.0), 160.0);
-        assert_eq!(viewfinder_height(500.0, 180.0, 160.0), 320.0, "the floor must not clamp a roomy page");
+    fn the_band_never_takes_more_than_half_the_frame() {
+        // On a short window the controls' natural height can exceed the frame.
+        // Without the clamp the scrim covers the whole preview to show a
+        // shutter sitting on nothing — worse than cramped chrome.
+        let vf = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0));
+        let b = controls_band(vf, 900.0);
+        assert_eq!(b.height(), 100.0);
+        assert!(vf.contains_rect(b));
+        // And it does not clamp a frame with room, which a floor-only test
+        // would not distinguish.
+        let tall = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 900.0));
+        assert_eq!(controls_band(tall, 180.0).height(), 180.0);
     }
 
     fn wide() -> Rect { Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 400.0)) }

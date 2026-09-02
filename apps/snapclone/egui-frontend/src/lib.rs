@@ -3534,7 +3534,12 @@ impl Snapclone {
     }
 
     fn camera_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
-        self.nav.title_bar(ui, "Camera");
+        // NO TITLE BAR. Every other page gets one; a camera does not. The word
+        // "Camera" above a viewfinder tells the user what they are already
+        // looking at, and it costs a band of the preview to say it — on a
+        // phone, the band it costs is the one their own face is in.
+        //
+        // The tab bar below still names the page, so nothing is unlabelled.
         // THE AMBIENT FIELD, painted first so everything else sits on it. Its
         // colours come from ambient_palette's sampling of the last frame, so
         // the glow behind the camera is the camera's own light rather than a
@@ -3601,17 +3606,17 @@ impl Snapclone {
             // wedge the driver on Busy forever.
             self.ambient_camera_done(None);
         }
+        // THE WHOLE PAGE. The controls are drawn OVER the preview further down
+        // rather than under it, so nothing is reserved from the frame.
+        //
+        // This replaces a reserve-a-band arrangement, which itself replaced a
+        // hard-coded 220px strip. The band was the right shape for a page with
+        // a form on it and the wrong shape for a camera: a viewfinder that
+        // stops short of the edge reads as a preview OF a camera rather than
+        // as the camera, and the part it gives up is the bottom, which on a
+        // phone held at arm's length is where the subject is.
         let vf_rect = {
-            // The controls below: a description line, the device picker row and
-            // the shutter row. Reserved from the page rather than the preview
-            // being capped — see `camera::viewfinder_height` for why that is
-            // the right way round. Derived from the theme's own interact size
-            // so a larger UI scale reserves proportionally more, instead of the
-            // shutter being pushed off a phone at 200%.
-            let row = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
-            let h = crate::camera::viewfinder_height(
-                ui.available_height(), row * 3.0 + 16.0, 160.0);
-            let r = ui.allocate_ui(egui::vec2(ui.available_width(), h), |ui| {
+            let r = ui.allocate_ui(ui.available_size(), |ui| {
                 crate::camera::viewfinder(ui, &mut self.viewfinder,
                                           self.cam_texture.as_ref(), c);
             });
@@ -3682,6 +3687,40 @@ impl Snapclone {
                         c.accent.r(), c.accent.g(), c.accent.b(), a)));
             }
         }
+        // ── from here the controls are drawn OVER the preview ───────────────
+        //
+        // A child Ui on the lower band of the viewfinder, so every `ui.` call
+        // below lands on the overlay instead of below the frame. Shadowing
+        // rather than wrapping the rest in a closure: the block that follows
+        // borrows `self` in a dozen places and a closure would fight the
+        // borrow checker for no gain.
+        //
+        // A scrim first. White shutter chrome over a bright sky is invisible,
+        // and a camera is pointed at bright things by definition; the gradient
+        // is what every phone camera puts there and it is not decoration.
+        //
+        // The band's height is derived from the theme's own interact size, so a
+        // larger UI scale gets proportionally more room instead of the shutter
+        // being clipped at 200%; `controls_band` clamps it against the frame.
+        let band = {
+            let row = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+            crate::camera::controls_band(vf_rect, row * 3.0 + 16.0)
+        };
+        {
+            let p = ui.painter_at(band);
+            let steps = 8;
+            for i in 0..steps {
+                let t = i as f32 / steps as f32;
+                let slice = egui::Rect::from_min_max(
+                    egui::pos2(band.left(), band.top() + band.height() * t),
+                    egui::pos2(band.right(), band.top() + band.height() * (t + 1.0 / steps as f32)),
+                );
+                let a = (t * t * 170.0) as u8;
+                p.rect_filled(slice, 0.0, egui::Color32::from_black_alpha(a));
+            }
+        }
+        let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(band.shrink(6.0)));
+        let ui = &mut ui;
         // A FROZEN STREAM IS MARKED rather than silently frozen: the user is
         // about to take a photo based on what this shows, and a still image
         // that stopped updating is a lie about what the lens sees.
