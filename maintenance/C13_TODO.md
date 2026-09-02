@@ -2532,3 +2532,26 @@ Remaining:
 - `texgen` — still reversed. scene-kit's is stale (98% of it inside logscope's,
   which is 2.3x the size). Update scene-kit FROM logscope first. Migrating it
   the obvious direction loses ~330 lines.
+
+
+## 79. texgen migrated (reverse-first). One scene module left.
+
+scene-kit updated FROM logscope, then re-exported. Test count 64 -> 71 on the
+swap, which confirms the direction: logscope's copy carried seven tests
+scene-kit's lacked.
+
+**The failure this avoided is worth naming, because it is silent.** Migrating
+texgen the obvious way compiles cleanly — the public surface is identical —
+and simply renders the scene with 5 materials instead of 11. No error, no
+failing test, just a worse-looking scene nobody would trace to a refactor.
+That is why §75's content-ratio measure mattered: surface compatibility says
+nothing about which side holds the work.
+
+Totals: glow_scene -449, mesh3d -1733, texgen -601 = **-2783 lines** from
+logscope-egui; scene-kit gained 347 lines of content it was missing.
+
+**Left: `gpuscene`.** 90%/93% shared — genuinely two-way, both sides moved —
+and it reads `theme::power_mode`, so it needs the `perf` override treatment
+glow_scene got PLUS a real content review. The two-way part means neither
+"copy A over B" is safe; someone has to read the diff and decide per hunk.
+This is the one §18's original verdict was right about.
