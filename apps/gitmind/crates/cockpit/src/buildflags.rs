@@ -132,19 +132,38 @@ pub fn build_id(app: &str, toml: &str) -> String {
 /// Falls back to `build_id` when there is no `[[bin]]` name, which is the
 /// common case where package and binary agree.
 pub fn artifact_name(app: &str, toml: &str) -> String {
-    if let Some(n) = first_bin_name(toml) {
+    let bins = bin_names(toml);
+    // A bin named after the APP ID wins over position.
+    //
+    // This used to take the first `[[bin]]` unconditionally, on the reasoning
+    // that "a crate with several bins lists the primary one first by
+    // convention". `apps/settings-app` does not: it lists `bsettings-cli`
+    // first and `bsettings` (the GUI, behind `required-features = ["gui"]`)
+    // second. So gitmind built the store entry `bsettings` with the `gui`
+    // feature on, then went looking for the artifact and found the COMMAND
+    // LINE TOOL, pinned it under the name `bsettings`, and gave the run button
+    // a binary that prints usage and exits. Reported as "bsettings-cli does not
+    // get the launch gui treatment", which is exact: the thing being launched
+    // was bsettings-cli.
+    //
+    // Matching the app ID rather than the package name keeps the case the
+    // original comment was defending — voiceterm's crate is still named
+    // `web2qml`, studio's package is `studio-app` — because in both of those
+    // the bin IS named after the app, and neither has a second bin to be
+    // confused by. Position remains the fallback for a crate whose single bin
+    // is named after neither.
+    if bins.iter().any(|b| b == app) {
+        return app.to_string();
+    }
+    if let Some(n) = bins.into_iter().next() {
         return n;
     }
     build_id(app, toml)
 }
 
-/// The first `[[bin]] name = "..."` in a manifest.
-///
-/// First rather than "the one matching the package": a crate with several bins
-/// lists the primary one first by convention, and picking by name would fail
-/// for exactly the case this exists to handle — where the bin is NOT named
-/// after the package.
-fn first_bin_name(toml: &str) -> Option<String> {
+/// Every `[[bin]] name = "..."` in a manifest, in declaration order.
+fn bin_names(toml: &str) -> Vec<String> {
+    let mut out = Vec::new();
     let mut in_bin = false;
     for line in toml.lines() {
         let t = line.trim();
@@ -157,14 +176,16 @@ fn first_bin_name(toml: &str) -> Option<String> {
                 if let Some(v) = rest.split('=').nth(1) {
                     let v = v.trim().trim_matches('"').trim_matches('\'');
                     if !v.is_empty() {
-                        return Some(v.to_string());
+                        out.push(v.to_string());
+                        in_bin = false; // one name per [[bin]]
                     }
                 }
             }
         }
     }
-    None
+    out
 }
+
 
 /// The crate's `[package] description`, if any. Pure — unit-tested.
 pub fn package_description(toml: &str) -> Option<String> {
@@ -746,6 +767,38 @@ mod test_argv_tests {
 #[cfg(test)]
 mod artifact_name_tests {
     use super::*;
+
+    /// The real manifest, not a fixture. The bug was a convention assumption —
+    /// "a crate with several bins lists the primary one first" — that one crate
+    /// in this tree breaks, and a fixture written by the same hand would have
+    /// listed them in the order the assumption expects.
+    #[test]
+    fn the_gui_bin_wins_even_though_the_cli_is_declared_first() {
+        let root = crate::ops::repo_root();
+        let toml = std::fs::read_to_string(root.join("apps/settings-app/Cargo.toml"))
+            .expect("apps/settings-app/Cargo.toml");
+        // Guard the premise on the [[bin]] DECLARATIONS, not on any mention of
+        // the names: settings-app's own description names both binaries, so a
+        // plain `find` matches prose and the guard would pass whatever the
+        // order became.
+        let cli_at = toml.find("name = \"bsettings-cli\"").expect("bsettings-cli bin");
+        let gui_at = toml.find("name = \"bsettings\"").expect("bsettings bin");
+        assert!(cli_at < gui_at, "the CLI is no longer declared first — this test is moot");
+
+        assert_eq!(artifact_name("bsettings", &toml), "bsettings",
+                   "gitmind pins the command-line tool and the run button gets a binary \
+                    that prints usage and exits");
+        assert_eq!(artifact_name("bsettings-cli", &toml), "bsettings-cli",
+                   "the CLI must still be reachable when it is what was asked for");
+    }
+
+    #[test]
+    fn position_still_decides_when_no_bin_is_named_after_the_app() {
+        // The case the original first-bin rule existed for. Removing the
+        // fallback would break it, so both halves are pinned.
+        let odd = "[package]\nname = \"pkg\"\n\n[[bin]]\nname = \"other\"\n";
+        assert_eq!(artifact_name("app-id", odd), "other", "position is still the fallback");
+    }
 
     const STUDIO: &str = "[package]\nname = \"studio-app\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"studio\"\npath = \"src/main.rs\"\n";
 

@@ -380,7 +380,6 @@ kind = "cargo"
 "#;
 
     #[test]
-    #[test]
     fn the_catalogue_sees_projects_outside_apps() {
         // Against the REAL manifest, not a fixture: the bug was that a whole
         // class of section never reached the catalogue, and a fixture written
