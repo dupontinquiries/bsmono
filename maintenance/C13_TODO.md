@@ -1784,3 +1784,30 @@ evidence it LOOKS expensive. Three specific things want eyes on a screen:
 - Surface `ctxplan` relevance on the context cards (§53 item 4) — the number
   exists, the reference shows it, and it is the one that makes the system
   legible rather than merely prettier.
+
+
+## 55. Two liaisons, one of them dead — and it is the one named in the warnings
+
+`logscope-egui/src/liaison.rs` defines a `Liaison` struct that **nothing
+constructs**. `grep` for `Liaison::new` across the workspace returns nothing.
+Only its `Epistemic` enum is used (by `promptroute` and one field in chat).
+Meanwhile `liaisonhud` uses `logscope::liaison::Statement` — a SECOND liaison
+module in the other crate.
+
+The `field phase_done is never read` warning in the build log is the visible
+edge of this: it is set by `advance()` and read by nobody, because the whole
+struct is unreachable.
+
+So "the liaison isn't working" is accurate in the strongest sense — the one in
+the egui crate has never run. Before writing any new wiring, decide which of
+the two is canonical:
+
+- if `logscope::liaison` is the real one, delete the egui copy (a second
+  unused answer to a question already answered is worse than none — the same
+  call made for ctxplan in §41, which went the other way);
+- if the egui one is the intended design, `liaisonhud` should be reading it,
+  and `phase_done` needs a reader or removing.
+
+Do not leave both. Note the HUD *is* wired and fed (`hud.observe` at three
+sites, `hud.display` in the chat view), so the display half works — it is the
+state machine behind it that is absent.
