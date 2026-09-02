@@ -40,6 +40,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+mod curves;
+pub use curves::{Binding, Curve, Gate, Opening, Sweep};
+
 /// A point or duration on the project timebase, in ticks.
 ///
 /// One tick is 1/[`TICKS_PER_SECOND`] of a second, chosen so that common video
@@ -77,6 +80,8 @@ id_type!(TrackId, "A track's stable identity.");
 id_type!(SourceId, "A media source (Audacity's sequence/blocks, kdenlive's bin clip). The timeline references samples; it never owns them.");
 id_type!(BusId, "A bus's stable identity. Busses form a routing graph (parent hierarchy plus sends), not a flat list, which is why they get ids rather than being addressed by position.");
 id_type!(GroupId, "A composition's stable identity: a named set of clips the timeline folds to one block — kdenlive's pre-batched group, After Effects' precomp, as the smallest model that supports the gesture. Membership is a PROJECT fact (a collaborator sees your composition); folded open or closed is view state in the device's workspace sidecar, the solo rule.");
+id_type!(CurveId, "A reusable automation curve's identity — see `curves`. A curve is named and addressed on its own, not through the target it drives, because the same curve may drive twelve clips.");
+id_type!(BindingId, "One binding of a curve to a target through a gate — see `curves::Binding`.");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrackKind { Video, Audio }
@@ -206,6 +211,16 @@ pub struct Project {
     /// undo could not restore.
     #[serde(default)]
     pub groups: BTreeMap<GroupId, Group>,
+    /// Reusable automation curves, addressed by id — see the `curves`
+    /// module. A curve with no binding is inert; a curve is never removed
+    /// while a binding names it. `serde(default)` for the usual reason.
+    #[serde(default)]
+    pub curves: BTreeMap<CurveId, Curve>,
+    /// Which curves drive which targets through which gates. Multiplied
+    /// into the target's lane at render time; a binding whose gate clip is
+    /// gone dangles harmlessly, the lanes' and groups' own rule.
+    #[serde(default)]
+    pub bindings: BTreeMap<BindingId, Binding>,
     /// The song's key, when the writer has decided one. `None` means "no
     /// opinion" and every note is in key — a project must never be told
     /// its notes are wrong because nobody set a field.
@@ -597,6 +612,24 @@ pub enum Op {
     /// Markers"). One op, one undo — a hundred RemoveMarkers would be a
     /// hundred presses of `u`.
     ClearMarkers,
+    /// Create or rename a reusable automation curve, absolutely (the
+    /// `SetGroup` shape: the last name written wins on every replica).
+    SetCurve { id: CurveId, name: String },
+    /// Remove a curve. Refused while any binding names it — the
+    /// `RemoveSource` rule, so deleting a curve can never silently
+    /// un-automate twelve clips. The inverse restores name AND points as
+    /// one `Group`, the `ClearMarkers` precedent.
+    RemoveCurve { id: CurveId },
+    /// Place, move or restate one point on a curve, in CURVE-LOCAL time —
+    /// exactly `SetAutoPoint`'s semantics one level of indirection over.
+    SetCurvePoint { curve: CurveId, at: Ticks, value: f32 },
+    RemoveCurvePoint { curve: CurveId, at: Ticks },
+    /// Aim a curve at a target through a gate, or restate the aim. Absolute
+    /// (whole binding every time). Refused for a missing curve, a missing
+    /// target, a locked track's gain (a ride is a mix edit), a gate on a
+    /// missing clip, or an empty window.
+    SetBinding { id: BindingId, binding: Binding },
+    RemoveBinding { id: BindingId },
     /// Several ops as ONE step: applied in order, inverted as a whole (the
     /// inverse is the members' inverses in reverse). A partial application
     /// rolls back what landed — half an edit is worse than none. This is
@@ -635,6 +668,12 @@ pub enum EditError {
     NoSuchSource(SourceId),
     /// A clip still references this source — see `Op::RemoveSource`.
     SourceInUse(SourceId),
+    NoSuchCurve(CurveId),
+    /// A binding still names this curve — see `Op::RemoveCurve`.
+    CurveInUse(CurveId),
+    NoSuchBinding(BindingId),
+    /// A `Gate::Window` whose end is not after its start can never open.
+    EmptyWindow,
 }
 
 impl Project {
@@ -726,6 +765,71 @@ impl Project {
                 // `Pattern::set_mod` follows one crate over.
                 if lane.is_empty() { self.automation.remove(target); }
                 Ok(Op::SetAutoPoint { target: *target, at: *at, value: old })
+            }
+            Op::SetCurve { id, name } => {
+                match self.curves.get_mut(id) {
+                    Some(c) => {
+                        let inv = Op::SetCurve { id: *id, name: c.name.clone() };
+                        c.name = name.clone();
+                        Ok(inv)
+                    }
+                    None => {
+                        self.curves.insert(*id, Curve { name: name.clone(), points: Vec::new() });
+                        Ok(Op::RemoveCurve { id: *id })
+                    }
+                }
+            }
+            Op::RemoveCurve { id } => {
+                if !self.curves.contains_key(id) { return Err(EditError::NoSuchCurve(*id)); }
+                if self.bindings.values().any(|b| b.curve == *id) {
+                    return Err(EditError::CurveInUse(*id));
+                }
+                let old = self.curves.remove(id).ok_or(EditError::NoSuchCurve(*id))?;
+                let mut restore = vec![Op::SetCurve { id: *id, name: old.name }];
+                restore.extend(old.points.into_iter()
+                    .map(|(at, value)| Op::SetCurvePoint { curve: *id, at, value }));
+                Ok(Op::Group { ops: restore })
+            }
+            Op::SetCurvePoint { curve, at, value } => {
+                let c = self.curves.get_mut(curve).ok_or(EditError::NoSuchCurve(*curve))?;
+                match c.points.iter_mut().find(|(t, _)| t == at) {
+                    Some(p) => {
+                        let inv = Op::SetCurvePoint { curve: *curve, at: *at, value: p.1 };
+                        p.1 = *value;
+                        Ok(inv)
+                    }
+                    None => {
+                        c.points.push((*at, *value));
+                        c.points.sort_by_key(|(t, _)| *t);
+                        Ok(Op::RemoveCurvePoint { curve: *curve, at: *at })
+                    }
+                }
+            }
+            Op::RemoveCurvePoint { curve, at } => {
+                let c = self.curves.get_mut(curve).ok_or(EditError::NoSuchCurve(*curve))?;
+                let i = c.points.iter().position(|(t, _)| t == at).ok_or(EditError::NoSuchAutoPoint)?;
+                let (_, old) = c.points.remove(i);
+                Ok(Op::SetCurvePoint { curve: *curve, at: *at, value: old })
+            }
+            Op::SetBinding { id, binding } => {
+                if !self.curves.contains_key(&binding.curve) {
+                    return Err(EditError::NoSuchCurve(binding.curve));
+                }
+                self.check_auto_target(binding.target)?;
+                match binding.gate {
+                    Gate::Always => {}
+                    Gate::Clip(c) => { if !self.clips.contains_key(&c) { return Err(EditError::NoSuchClip(c)); } }
+                    Gate::Window { start, end } => { if end <= start { return Err(EditError::EmptyWindow); } }
+                }
+                let inv = match self.bindings.insert(*id, *binding) {
+                    Some(old) => Op::SetBinding { id: *id, binding: old },
+                    None => Op::RemoveBinding { id: *id },
+                };
+                Ok(inv)
+            }
+            Op::RemoveBinding { id } => {
+                let old = self.bindings.remove(id).ok_or(EditError::NoSuchBinding(*id))?;
+                Ok(Op::SetBinding { id: *id, binding: old })
             }
             Op::AddClip { clip } => {
                 self.check_track(clip.track)?;
