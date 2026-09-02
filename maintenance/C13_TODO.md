@@ -2085,3 +2085,57 @@ that will fail if the arm is missed).
 The `patch mode: no patches applied — the reply was prose` message is working
 as designed and is worth keeping; it is the only line in the run that told
 the operator plainly that nothing had been written.
+
+
+## 62. Merged the games bundle (c14unified-010); two pre-existing example failures
+
+16 commits, 39 files, ZERO overlap with this session — no conflicts. blackstar
+vehicle combat and the district/world loop, unendlich's generator ring and
+behavior field, `perfbisect`, and `games/shared/worldhost`.
+
+`worldhost` is the piece that matters for the engine port: a small trait of
+world questions (ground height, clearance, line of sight, standing spots,
+steering obstacles) and deliberately nothing else — physics excluded because
+skydribble's is coupled to its shape list and unendlich has its own voxel one.
+Two implementors intended, `worldhost-unendlich` already stubbed.
+
+Verified after merge: worldhost 2, blackstar-rs bins 1497, perfbisect 8. All
+green.
+
+**Two pre-existing failures, confirmed against the merge base in a scratch
+worktree rather than assumed:**
+- blackstar-rs EXAMPLES fail `E0433: cannot find 'anim' / 'orient' /
+  'hardpoints' in crate`. The same class fails at the base (example
+  `botcheck` there, `rigpose` after). They pull `src/*.rs` in via
+  `examples/../src/` and reference crate-root paths the example's own root
+  does not declare. The shellkit de-vendoring earlier in this session is a
+  plausible origin and is worth checking before assuming it is ancient.
+- `unendlich-engine`'s `opus_decode_check` example: `cannot find 'audio' in
+  unendlich_engine`. Same shape.
+
+Neither blocks libs or bins, but both make `cargo test` red in those crates,
+which hides real regressions behind known noise. Worth fixing for that reason
+alone.
+
+## 63. Compaction staging is manual BY DESIGN — decide whether it should be
+
+The operator saw the compaction prompt appear in their text box and read it as
+a leak. It is not: both call sites do `self.input = teacher_turn(...)` and the
+note says "Send it; the briefing becomes the working context". Human-in-the-
+loop, so you see what will be folded and pick the model that folds it.
+
+But the "summarize, don't squeeze" checkbox reasonably implies something
+automatic, and the operator expected it to be. That is a real UX mismatch and
+it is a DESIGN question, not a defect:
+
+- if staging is right, the checkbox and the note should say so — something
+  like "stage a compaction for review" rather than a setting that sounds like
+  a policy;
+- if it should be automatic, the teacher turn needs to run on its own
+  generation and substitute `staged_context` without touching the composer,
+  and the operator needs an undo, because a bad briefing silently replaces
+  real history.
+
+Do not leave it ambiguous. Fixed separately this session: the plan now refuses
+to stage at all when there is too little to fold (§ the refresh commit), which
+removes the most confusing instance without answering this question.
