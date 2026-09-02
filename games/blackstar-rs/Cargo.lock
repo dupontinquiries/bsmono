@@ -612,6 +612,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "dht-kit"
+version = "0.1.0"
+
+[[package]]
 name = "dispatch"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2076,6 +2080,9 @@ dependencies = [
 [[package]]
 name = "snapcore"
 version = "0.1.0"
+dependencies = [
+ "dht-kit",
+]
 
 [[package]]
 name = "spirv"
