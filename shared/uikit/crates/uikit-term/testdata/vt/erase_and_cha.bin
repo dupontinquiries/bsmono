@@ -1,0 +1,5 @@
+[?2004h[1;32m➜ [36m~[0m printf 'abcdefgh\rXY\033[K\n1234\033[3G_\033[2K|\n'
+[?2004labcdefghXY[K
+1234[3G_[2K|
+[?2004h[1;32m➜ [36m~[0m exit
+[?2004lexit

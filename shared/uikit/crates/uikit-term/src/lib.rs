@@ -14,6 +14,7 @@
 
 pub mod keys;
 pub mod blocks;
+pub mod snapshot;
 
 // ── colours + style ──────────────────────────────────────────────────────────
 

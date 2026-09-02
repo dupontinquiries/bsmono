@@ -1,0 +1,5 @@
+[?2004h[1;32m➜ [36m~[0m echo unfinished^C[?2004l[?2004h[?2004l
+[?2004h[1;32m➜ [36m~[0m echo after
+[?2004lafter
+[?2004h[1;32m➜ [36m~[0m exit
+[?2004lexit

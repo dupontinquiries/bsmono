@@ -1,0 +1,4 @@
+[?2004h[1;32m➜ [36m~[0m printf 'ab\tcd\tefghijk\tZ\n'
+[?2004lab	cd	efghijk	Z
+[?2004h[1;32m➜ [36m~[0m exit
+[?2004lexit
