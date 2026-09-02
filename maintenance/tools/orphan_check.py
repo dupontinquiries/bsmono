@@ -116,8 +116,160 @@ def scan(crate: pathlib.Path):
     return orphans
 
 
+
+# ── orphaned PUBLIC FUNCTIONS ────────────────────────────────────────────────
+#
+# The file-level check above catches code the compiler never sees. This catches
+# the next layer: code the compiler DOES see, that nothing calls.
+#
+# Four of these were found by hand in one maintenance session and every one had
+# the same shape — the outer crate carrying its own copy of something the inner
+# crate already had:
+#
+#   * `RUNTIME_TOOLS` advertised ten tools while the validator accepted four,
+#     and `git_log` had an executor with no parser arm;
+#   * two `liaison` modules, two types called `Statement`, one set live;
+#   * `taint::extract_nonced`, a half-implemented SECURITY check with no
+#     callers — scanning only for XML and blind to the fence form the prompt
+#     teaches.
+#
+# The last is why this is worth automating. An unused function is usually
+# harmless; an unused function that looks like the right one is a trap, because
+# the next person needing that check finds it first. Each was found by noticing
+# a symptom and grepping backwards. This finds them by reading.
+#
+# DELIBERATELY CONSERVATIVE. It only reports a `pub fn` with ZERO mentions
+# anywhere in the workspace outside its own file. That misses plenty (a
+# function called once from a test it shares a file with still counts as used),
+# and that is the right trade: this competes for attention with real work, and
+# a checker people learn to skim is worth less than one that reports five
+# things a year and is right about all five.
+
+PUB_FN = re.compile(r'^\s*pub(?:\(crate\))?\s+(?:async\s+)?(?:unsafe\s+)?fn\s+([a-z_][a-z0-9_]*)')
+
+# Names whose only caller is the language or a derive, or which are meant to be
+# reached from outside the workspace entirely.
+EXEMPT = {
+    "main", "new", "default", "fmt", "clone", "drop", "from", "into",
+    "next", "poll", "update", "ui", "run", "build", "len", "is_empty",
+}
+
+
+def public_fns(path: pathlib.Path) -> list:
+    """(name, line) for each pub fn declared in this file, comments excluded."""
+    out = []
+    src = BLOCK_COMMENT.sub("", path.read_text(errors="ignore"))
+    for i, raw in enumerate(src.split("\n"), 1):
+        raw = LINE_COMMENT.sub("", raw)
+        m = PUB_FN.match(raw)
+        if m and m.group(1) not in EXEMPT:
+            out.append((m.group(1), i))
+    return out
+
+
+def orphan_fns(root: pathlib.Path) -> list:
+    """pub fns whose name appears nowhere in the workspace but their own file.
+
+    Tokenised ONCE rather than searched per candidate. The obvious
+    implementation — for each name, scan every file — is O(names x files) and
+    on this tree (thousands of each) does not finish. Counting identifier
+    occurrences per file and comparing a name's total against its count in the
+    declaring file is one pass over the corpus and answers the same question:
+    if every occurrence is in the file that declares it, nothing else uses it.
+    """
+    import collections
+    ident = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+    # Vendored code is EXCLUDED from reporting but still SEARCHED: a binding
+    # crate is meant to expose API nobody here calls yet, so reporting it is
+    # pure noise (vendor/opendht alone accounts for most of a 4454-line first
+    # run). It still has to be scanned, because a vendored file calling one of
+    # our functions is a real use.
+    files = [p for p in root.rglob("*.rs")
+             if "/target/" not in str(p) and "/.git/" not in str(p)]
+    reportable = lambda p: "/vendor/" not in str(p) and not str(p).startswith("vendor/")
+    per_file = {}
+    total = collections.Counter()
+    for p in files:
+        c = collections.Counter(ident.findall(p.read_text(errors="ignore")))
+        per_file[p] = c
+        total.update(c)
+
+    declared = {}
+    for p in files:
+        for name, line in public_fns(p):
+            declared.setdefault(name, []).append((p, line))
+
+    # WHAT TO REPORT — the first cut got this backwards.
+    #
+    # "Unused public function" is accurate and useless: this tree has 4442 of
+    # them, because a monorepo of 290 crates has a lot of library API that only
+    # its own module calls yet. A checker reporting 4442 things is a checker
+    # nobody reads.
+    #
+    # The signal is not UNUSED, it is UNUSED **AND DUPLICATED**: a function
+    # whose name is also defined somewhere else, where one definition is live
+    # and the other is not. That is the shape of every instance found by hand —
+    # two `liaison` modules with two `Statement`s, `extract_nonced` beside
+    # `authorize_text`, a tool list beside a tool list. The dead twin is
+    # dangerous precisely BECAUSE the live one proves the name is the right
+    # name to reach for.
+    #
+    # So the earlier version skipped multi-site names as "ambiguous" and threw
+    # away the only thing worth finding.
+    out = []
+    for name, sites in declared.items():
+        if len(sites) < 2:
+            continue  # a lone unused fn is ordinary dead code, not a trap
+        dead = [(p, l) for (p, l) in sites
+                if total[name] == sum(per_file[q][name] for (q, _) in sites) - 0
+                and per_file[p][name] == total[name] - sum(
+                    per_file[q][name] for (q, _) in sites if q != p)]
+        # Simpler and correct: a site is dead if the name appears nowhere
+        # outside the files that DECLARE it — i.e. every mention is a
+        # definition or an internal use, so no other module reaches any of them
+        # by that name.
+        decl_files = {p for (p, _) in sites}
+        outside = total[name] - sum(per_file[q][name] for q in decl_files)
+        if outside > 0:
+            continue  # at least one twin is genuinely called from elsewhere
+        for (p, line) in sites:
+            if reportable(p):
+                out.append((p.relative_to(root), line, name))
+        _ = dead
+    return sorted(out)
+
+
 def main() -> int:
-    root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "/home/claude/repo")
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    fns_mode = "--functions" in sys.argv
+    root = pathlib.Path(args[0] if args else "/home/claude/repo")
+    if fns_mode:
+        import collections
+        found = orphan_fns(root)
+        # GROUPED BY FILE PAIR. Ungrouped, one known duplication drowns the
+        # rest: apps/snapclone vs system/snapclone (C13_TODO 17, ~36k lines)
+        # accounts for most of the raw count, and printing it 400 times says
+        # nothing the first line did not. Grouping turns "718 functions" into
+        # "these files shadow each other", which is the actionable shape and
+        # the one that would have surfaced the two liaisons as a single item.
+        by_name = collections.defaultdict(list)
+        for rel, line, name in found:
+            by_name[name].append((rel, line))
+        pairs = collections.Counter()
+        for name, sites in by_name.items():
+            fs = tuple(sorted({str(r) for r, _ in sites}))
+            if len(fs) > 1:
+                pairs[fs] += 1
+        print("Duplicated public functions, by the files that shadow each other.")
+        print("A name defined in two places where NEITHER is reached from outside "
+              "those files: the dead twin is dangerous precisely because the live "
+              "one proves the name is right to reach for.\n")
+        for fs, n in pairs.most_common(15):
+            print(f"  {n:4d} shared name(s)")
+            for f in fs:
+                print(f"         {f}")
+        print(f"\n{len(pairs)} shadowing file-set(s), {len(found)} function site(s).")
+        return 1 if pairs else 0
     total_files = total_tests = 0
     crates = 0
     for crate in crate_dirs(root):
