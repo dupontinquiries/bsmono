@@ -56,13 +56,21 @@ SKIP_PARTS = {"target", "vendor", ".git", "node_modules"}
 SECTION = re.compile(r'^\s*\[(?:target\.[^\]]+\.)?(dependencies|dev-dependencies|build-dependencies)\]\s*$')
 ANY_SECTION = re.compile(r'^\s*\[')
 DEP_LINE = re.compile(r'^\s*["\']?([A-Za-z0-9_.-]+)["\']?\s*=\s*(.*)$')
+OPTIONAL = re.compile(r'\boptional\s*=\s*true\b')
 PACKAGE_RENAME = re.compile(r'\bpackage\s*=\s*["\']([^"\']+)["\']')
 LOCK_NAME = re.compile(r'^name = "([^"]+)"$', re.M)
 WS_MEMBERS = re.compile(r'^\s*\[workspace\]', re.M)
 
 
-def declared(text):
-    """Dependency names as the LOCK will spell them (i.e. after `package =`)."""
+def declared(text, with_dev=True):
+    """Dependency names as the LOCK will spell them (i.e. after `package =`).
+
+    `with_dev=False` for a crate reached THROUGH a path dependency: cargo
+    resolves dev-dependencies for the crate being built, not for its path
+    dependencies, so a path dep's dev-deps are not in the dependent's lock and
+    demanding them would be a false positive on every crate with a test-only
+    dependency anywhere in its graph.
+    """
     out, cur = set(), None
     for line in text.splitlines():
         m = SECTION.match(line)
@@ -70,7 +78,7 @@ def declared(text):
             cur = m.group(1); continue
         if ANY_SECTION.match(line):
             cur = None; continue
-        if not cur:
+        if not cur or (cur == "dev-dependencies" and not with_dev):
             continue
         d = DEP_LINE.match(line)
         if not d:
@@ -79,9 +87,110 @@ def declared(text):
         if name in {"version", "features", "path", "optional", "git", "branch",
                     "rev", "tag", "workspace", "default-features", "registry", "package"}:
             continue
+        # `serde.workspace = true` is the dotted spelling of workspace
+        # inheritance; the lock spells the crate `serde`. Without this the
+        # checker demanded a crate literally named "serde.workspace".
+        if name.endswith(".workspace"):
+            name = name[: -len(".workspace")]
+        # OPTIONAL dependencies past the first hop are skipped. A dependent can
+        # turn a path dep's default features OFF — bot-arena-egui takes
+        # `bot-arena = { path = "..", default-features = false }` precisely to
+        # get the engine without GTK — and cargo then leaves those optional
+        # crates out of the lock entirely. Deciding which are active needs real
+        # feature resolution, which a line scanner cannot do, so the checker
+        # UNDER-reports here rather than crying wolf. Verified the right way
+        # round: `cargo generate-lockfile` was run on every crate this flagged,
+        # and for these it regenerated the lock WITHOUT them — cargo's own
+        # verdict that they do not belong.
+        if not with_dev and OPTIONAL.search(rhs):
+            continue
         rename = PACKAGE_RENAME.search(rhs)
         out.add(rename.group(1) if rename else name)
     return out
+
+
+PATH_DEP = re.compile(r'\bpath\s*=\s*["\']([^"\']+)["\']')
+
+
+def path_deps(text, crate_dir, with_dev=True):
+    """Directories of this manifest's `path = "..."` dependencies.
+
+    Only inside a dependency section, so a `[package]` or `[[bin]]` `path` is
+    not mistaken for one.
+    """
+    out, cur = [], None
+    for line in text.splitlines():
+        m = SECTION.match(line)
+        if m:
+            cur = m.group(1); continue
+        if ANY_SECTION.match(line):
+            cur = None; continue
+        if not cur or (cur == "dev-dependencies" and not with_dev):
+            continue
+        d = DEP_LINE.match(line)
+        if not d:
+            continue
+        if d.group(1) in {"version", "features", "path", "optional", "git", "branch",
+                          "rev", "tag", "workspace", "default-features", "registry", "package"}:
+            continue
+        # Same rule as `declared`: do not FOLLOW an optional path dep past the
+        # first hop either. Skipping only its name while still walking into it
+        # collects everything IT depends on, which is how `worldhost-unendlich`
+        # was asked for `egui` — reached through
+        # `unendlich-ui = { path = "...", optional = true }`, a crate it never
+        # builds.
+        if not with_dev and OPTIONAL.search(d.group(2)):
+            continue
+        pm = PATH_DEP.search(d.group(2))
+        if pm:
+            out.append((crate_dir / pm.group(1)).resolve())
+    return out
+
+
+def declared_transitive(crate_dir):
+    """Every crate name that must appear in this crate's lock.
+
+    NOT just the crate's own [dependencies]. Cargo's lock covers the whole
+    resolved graph, so when a PATH dependency gains a dependency, this crate's
+    committed lock goes stale — and the crate's own manifest does not change,
+    so a check that reads one manifest cannot see it.
+
+    That is not hypothetical: it happened twice in one session. `uikit-egui`
+    gained `math-kit`, and both `uikit-term`'s and `voiceterm-egui`'s locks were
+    rewritten by cargo on the first build while this script reported
+    "stale: 0" on the very same tree. Every crate in the fleet that reaches
+    uikit-egui through a path dep had the same latent staleness, and it would
+    have kept surfacing one lockfile at a time, on whichever crate someone
+    happened to build next.
+
+    Registry dependencies are NOT followed: their transitive names are in the
+    lock too, but reading them needs the registry, and a stale lock caused by an
+    upstream crate's new dependency is a `cargo update` question rather than a
+    committed-file question. Path deps are the ones this repo can go stale
+    against by editing itself.
+
+    Cycles are possible in principle (dev-dependencies can be circular), hence
+    the visited set.
+    """
+    seen, names, queue = set(), set(), [(crate_dir, True)]
+    while queue:
+        d, with_dev = queue.pop()
+        if d in seen:
+            continue
+        seen.add(d)
+        toml = d / "Cargo.toml"
+        try:
+            text = toml.read_text(errors="replace")
+        except OSError:
+            # A path dep pointing at nothing is a real problem, but it is
+            # cargo's to report — this check is about locks, and inventing a
+            # second error here would bury the one that matters.
+            continue
+        names |= declared(text, with_dev)
+        # Everything past the first hop is a path DEPENDENCY, so its own
+        # dev-dependencies are out of scope from here down.
+        queue.extend((p, False) for p in path_deps(text, d, with_dev))
+    return names
 
 
 def is_workspace_member(crate_dir):
@@ -116,7 +225,7 @@ def main():
             skipped += 1
             continue
         try:
-            want = declared(toml.read_text(errors="replace"))
+            want = declared_transitive(lock.parent)
             have = {n.replace("_", "-") for n in LOCK_NAME.findall(lock.read_text(errors="replace"))}
         except OSError as e:
             print(f"  ?? {lock.parent.relative_to(ROOT)}: {e}")
