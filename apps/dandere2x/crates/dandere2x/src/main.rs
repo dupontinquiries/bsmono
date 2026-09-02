@@ -165,6 +165,23 @@ fn main() -> anyhow::Result<()> {
             job.encode.crf = crf;
             job.encode.preset = preset;
             job.encode.ten_bit = !eight_bit;
+            // PREFLIGHT BEFORE ANY WORK. The encoder is the last step of the
+            // pipeline, so a missing libsvtav1 surfaces after every frame has
+            // been through the CNN — the whole job wasted to learn something
+            // one `ffmpeg -encoders` call knows up front. Only the encoder
+            // actually selected is required; asking for AV1 support on an
+            // x264 run would be a refusal the operator cannot act on.
+            {
+                let want_enc: &[&str] = match job.encode.codec.as_str() {
+                    "av1" => &["libsvtav1"],
+                    "x265" => &["libx265"],
+                    _ => &["libx264"],
+                };
+                let pf = ffmpeg::preflight(want_enc, &[]);
+                if let Some(msg) = pf.problem() {
+                    anyhow::bail!("{msg}");
+                }
+            }
             if job.jobs > 1 {
                 let s = job::run_segmented(&job, |seg, e| {
                     if !matches!(e, Event::Finished { .. }) {
