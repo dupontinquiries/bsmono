@@ -151,6 +151,47 @@ impl RealCatalog {
         bo_media::library::delete_playlist(&self.conn, playlist_id).is_ok()
     }
 
+    // ── Track edits ─────────────────────────────────────────────────
+    // Backs `dialogs::EditTrack`. Goes through `MediaCmd::SetOverride`
+    // (a DB-only overlay row) rather than `WriteTagsToFile` (which
+    // rewrites the actual audio file's tags) — an override applies
+    // immediately and is what `all_tracks_page_sorted` and friends
+    // already coalesce onto the parsed values (see `apply_overrides` in
+    // bo-media's catalog.rs), where a file-tag write only shows up after
+    // the next rescan re-parses it. Permanent file tagging stays a
+    // follow-up, same as it was in bo-controller's own QML pages.
+
+    /// The current (parsed-or-overridden) title/artist/album/year, for
+    /// seeding the editor when it opens. `None` if the track has vanished
+    /// between the row being drawn and the edit button being pressed.
+    pub fn track_fields(&self, track_id: i64) -> Option<crate::dialogs::TrackFields> {
+        self.conn.query_row(
+            "SELECT title, COALESCE((SELECT a.name FROM artists a
+                 JOIN track_artists ta ON ta.artist_id = a.id
+                 WHERE ta.track_id = t.id AND ta.role = 'primary'
+                 ORDER BY ta.ord LIMIT 1), ''),
+                    COALESCE(album, ''), COALESCE(year, 0)
+             FROM tracks t WHERE t.id = ?1",
+            [track_id],
+            |r| Ok(crate::dialogs::TrackFields {
+                title: r.get::<_, String>(0)?,
+                artist: r.get::<_, String>(1)?,
+                album: r.get::<_, String>(2)?,
+                year: match r.get::<_, i64>(3)? { 0 => String::new(), y => y.to_string() },
+            }),
+        ).ok()
+    }
+
+    /// Persists only the fields `EditTrack::payload()` says changed —
+    /// `None` for the rest leaves them as whatever the parser/previous
+    /// override already had, which is the whole point of an overlay
+    /// rather than a full-row rewrite.
+    pub fn save_track_edit(&self, track_id: i64,
+        title: Option<String>, artist: Option<String>, album: Option<String>, year: Option<u16>)
+    {
+        let _ = self.cmd_tx.send(MediaCmd::SetOverride { track_id, title, artist, album, year });
+    }
+
     // ── Queue ───────────────────────────────────────────────────────
     // `device_url` is the same string `outputs::Device.url` carries and
     // `cast.rs` passes to `play_url_on_device` — one identity for "which
@@ -324,5 +365,33 @@ mod tests {
         assert!(cat.delete_playlist(id));
         assert!(cat.playlists().is_empty());
         assert!(cat.playlist_tracks(id).is_empty(), "a deleted playlist has no tracks");
+    }
+
+    #[test]
+    fn track_fields_reads_the_current_row() {
+        let (_dir, cat) = temp_catalog();
+        cat.conn.execute(
+            "INSERT INTO tracks (path, size, mtime, title, album, year, rating)
+             VALUES ('/m/a.flac', 100, 0, 'A Song', 'An Album', 2020, 0)",
+            [],
+        ).unwrap();
+        let id = cat.conn.last_insert_rowid();
+        let f = cat.track_fields(id).expect("row exists");
+        assert_eq!(f.title, "A Song");
+        assert_eq!(f.album, "An Album");
+        assert_eq!(f.year, "2020");
+        assert_eq!(f.artist, "", "no artist row linked yet");
+    }
+
+    #[test]
+    fn track_fields_on_a_missing_track_is_none() {
+        let (_dir, cat) = temp_catalog();
+        assert_eq!(cat.track_fields(999), None);
+    }
+
+    #[test]
+    fn save_track_edit_sends_without_a_receiver_alive() {
+        let (_dir, cat) = temp_catalog();
+        cat.save_track_edit(1, Some("New Title".into()), None, None, Some(1999));
     }
 }

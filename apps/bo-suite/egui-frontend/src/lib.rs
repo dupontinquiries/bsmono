@@ -406,6 +406,18 @@ pub struct Controller {
     /// (track_id, playlist_id), resolved from the dialog's name-based
     /// `add()` via `playlists_page`. Cleared by the host.
     pub pending_add_to_playlist: Option<(i64, i64)>,
+    /// The edit-track dialog. Same model dialogs.rs has had since it was
+    /// ported; nothing opened or drew it until now.
+    pub edit_track: crate::dialogs::EditTrack,
+    /// A track whose current fields the host hasn't fetched yet — set
+    /// when the edit button is pressed, before the dialog has anything
+    /// to show.
+    pub pending_track_edit_open: Option<i64>,
+    /// A save the host hasn't persisted yet: (track_id, title, artist,
+    /// album, year) — only the changed fields are `Some`, straight from
+    /// `EditTrack::payload()`.
+    pub pending_track_edit_save:
+        Option<(i64, Option<String>, Option<String>, Option<String>, Option<u16>)>,
     /// The device switcher above the output controls. The sink picker itself
     /// lives in settings_page as `SinkPicker` — see outputs.rs's note.
     pub device_selector: crate::outputs::DeviceSelector,
@@ -569,6 +581,9 @@ impl Controller {
             pending_playlist_open: None,
             pending_playlist_delete: None,
             pending_add_to_playlist: None,
+            edit_track: Default::default(),
+            pending_track_edit_open: None,
+            pending_track_edit_save: None,
             device_selector: Default::default(),
             pending_route: None,
             pending_playback: None,
@@ -903,6 +918,18 @@ impl Controller {
                         self.pending_add_to_playlist = Some((track_id, playlist_id));
                     }
                 }
+            }
+        }
+        // EDIT TRACK, the same shape as add-to-playlist above: a floating
+        // dialog above whichever page is showing, opened by an `edit`
+        // button that lives inside the track row it edits.
+        if self.edit_track.is_open() {
+            if let Some(save) = crate::dialogs::edit_track_ui(ui, &mut self.edit_track, &colors) {
+                if let Ok(track_id) = save.track_id.parse::<i64>() {
+                    self.pending_track_edit_save = Some((
+                        track_id, save.title, save.artist, save.album, save.year));
+                }
+                self.edit_track.close();
             }
         }
     }
@@ -1526,6 +1553,9 @@ impl Controller {
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if ui.small_button("queue").clicked() {
                                         self.apply_browse(crate::browse::Action::Queue(t.id));
+                                    }
+                                    if ui.small_button("edit").clicked() {
+                                        self.pending_track_edit_open = Some(t.id);
                                     }
                                 });
                             });

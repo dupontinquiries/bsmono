@@ -177,6 +177,69 @@ impl EditTrack {
     pub fn can_save(&self) -> bool { self.is_dirty() && self.problems().is_empty() }
 }
 
+/// What `edit_track_ui` hands back when Save is pressed — `d.payload()`'s
+/// pairs, resolved into typed fields (`year` parsed and range-checked,
+/// same rule `problems()` already enforces so this can't fail here) plus
+/// the track id, since the dialog only tracked it as a bare `String`.
+pub struct EditSave {
+    pub track_id: String,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub year: Option<u16>,
+}
+
+/// Draws the edit-track dialog when `d.is_open()`. Returns `Some` the
+/// frame Save is pressed (never while `can_save()` is false — the button
+/// is disabled, and Enter is not wired to bypass it). A floating
+/// `egui::Window`, same reasoning as `add_to_playlist_ui`: has to sit
+/// above whichever page opened it.
+pub fn edit_track_ui(ui: &mut egui::Ui, d: &mut EditTrack, c: &uikit_egui::PaletteColors)
+    -> Option<EditSave>
+{
+    let mut result = None;
+    let mut still_open = d.is_open();
+    let mut cancel_pressed = false;
+    let Some(track_id) = d.track.clone() else { return None };
+    egui::Window::new("Edit track")
+        .id(egui::Id::new("edit_track_dialog"))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut still_open)
+        .show(ui.ctx(), |ui| {
+            egui::Grid::new("edit_track_fields").num_columns(2).show(ui, |ui| {
+                ui.colored_label(c.text_weak, "Title"); ui.text_edit_singleline(&mut d.draft.title); ui.end_row();
+                ui.colored_label(c.text_weak, "Artist"); ui.text_edit_singleline(&mut d.draft.artist); ui.end_row();
+                ui.colored_label(c.text_weak, "Album"); ui.text_edit_singleline(&mut d.draft.album); ui.end_row();
+                ui.colored_label(c.text_weak, "Year"); ui.text_edit_singleline(&mut d.draft.year); ui.end_row();
+            });
+            for p in d.problems() {
+                ui.colored_label(egui::Color32::from_rgb(200, 80, 80), p);
+            }
+            ui.horizontal(|ui| {
+                if ui.add_enabled(d.can_save(), egui::Button::new("save")).clicked() {
+                    let payload = d.payload();
+                    let get = |key: &str| payload.iter().find(|(k, _)| *k == key)
+                        .map(|(_, v)| v.clone());
+                    result = Some(EditSave {
+                        track_id: track_id.clone(),
+                        title: get("title"),
+                        artist: get("artist"),
+                        album: get("album"),
+                        // Guarded by can_save()/problems() above — an
+                        // out-of-range or non-numeric year never reaches
+                        // here, so a parse failure just omits the field
+                        // rather than silently writing something wrong.
+                        year: get("year").and_then(|y| y.parse::<u16>().ok()),
+                    });
+                }
+                if ui.button("cancel").clicked() { cancel_pressed = true; }
+            });
+        });
+    if !still_open || cancel_pressed { d.close(); }
+    result
+}
+
 // ── scan picker ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
@@ -274,6 +337,58 @@ mod frame_tests {
         d.open("t1");
         let (texts, _) = draw(&mut d);
         assert!(texts.join(" | ").contains("create one first"), "{texts:?}");
+    }
+
+    fn draw_edit(d: &mut EditTrack) -> (Vec<String>, Option<EditSave>) {
+        let ctx = egui::Context::default();
+        let c = uikit_egui::palette_colors("amber");
+        let mut result = None;
+        let run = |ctx: &egui::Context, d: &mut EditTrack, result: &mut Option<EditSave>| {
+            ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                                                            egui::vec2(500.0, 700.0))),
+                ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    *result = edit_track_ui(ui, d, &c);
+                });
+            })
+        };
+        run(&ctx, d, &mut result);
+        let out = run(&ctx, d, &mut result);
+        let texts = out.shapes.iter().filter_map(|s| match &s.shape {
+            egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+            _ => None,
+        }).collect();
+        (texts, result)
+    }
+
+    #[test]
+    fn closed_edit_draws_nothing() {
+        let mut d = EditTrack::default();
+        let (texts, result) = draw_edit(&mut d);
+        assert!(texts.is_empty(), "{texts:?}");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn open_edit_shows_the_current_fields() {
+        let mut d = EditTrack::default();
+        d.open("t1", TrackFields { title: "Old Title".into(), artist: "Some Artist".into(),
+                                    album: "".into(), year: "".into() });
+        let (texts, _) = draw_edit(&mut d);
+        let joined = texts.join(" | ");
+        assert!(joined.contains("Old Title") && joined.contains("Some Artist"), "{joined}");
+    }
+
+    #[test]
+    fn a_bad_year_shows_a_problem() {
+        let mut d = EditTrack::default();
+        d.open("t1", TrackFields::default());
+        d.draft.year = "nineteen".into();
+        let (texts, _) = draw_edit(&mut d);
+        assert!(texts.join(" | ").contains("not a year"), "{texts:?}");
+        assert!(!d.can_save(), "the save button should be disabled for this draft");
     }
 }
 

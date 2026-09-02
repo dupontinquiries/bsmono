@@ -270,6 +270,23 @@ impl App {
                 self.last_note = "could not add track to playlist".into();
             }
         }
+        if let Some(id) = self.controller.pending_track_edit_open.take() {
+            match self.catalog.track_fields(id) {
+                Some(fields) => self.controller.edit_track.open(&id.to_string(), fields),
+                None => self.last_note = "could not load track for editing".into(),
+            }
+        }
+        if let Some((id, title, artist, album, year)) = self.controller.pending_track_edit_save.take() {
+            self.catalog.save_track_edit(id, title, artist, album, year);
+            // The override applies immediately in the catalog (see
+            // real_catalog.rs), so reload whatever's currently showing
+            // this track rather than waiting for the next scan.
+            if let Some(pid) = self.controller.open_playlist {
+                self.controller.browse_tracks = self.catalog.playlist_tracks(pid);
+            }
+            self.controller.pending_tracks =
+                Some(bo_suite_egui::all_tracks::TracksAction::Load { offset: 0 });
+        }
         if let Some(id) = self.controller.last_played_track.take() {
             // Persisted through the worker (play count + history), not
             // written on this connection — see real_catalog.rs.
