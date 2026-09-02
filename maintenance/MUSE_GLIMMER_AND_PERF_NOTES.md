@@ -342,12 +342,57 @@ dims / 4109 inputs`: a fused pass that reuses a bind group whose dims buffer
 has since been rewritten would produce exactly the symptom (right shape,
 wrong numbers, non-deterministic across configurations).
 
-**This is a hypothesis and must be tested before anything is re-enabled.**
-`LOGSCOPE_PASS_FUSE` stays retracted until someone has (a) confirmed the wgpu
-version we use provides the intra-pass guarantee, and (b) re-run the two gates
-that caught it — `tools/gate-passfuse-diffusion.sh` and the AR decode gate —
-with the bind-group cache disabled, to separate the two effects. If it passes
-with the cache off and fails with it on, the fusion was never the bug.
+### Corrected, and it is better than the hypothesis
+
+Reading our own retraction comment afterwards (`lib.rs::pass_fuse_enabled`)
+shows the analysis had already got further than I had, and got it right:
+
+> the leading candidate is dims-buffer lifetime — deferred dispatches replay
+> after `ring_dims` has recycled and rewritten the uniform they read, so an
+> earlier dispatch executes with a later dispatch's dims.
+
+That is a RESOURCE-LIFETIME bug, not an ordering bug, and it is consistent
+with everything above: WebGPU's intra-pass guarantee covers ordering, so
+batching was never going to corrupt by itself. My guess at the bind-group
+cache was wrong and our own bisection had already cleared it ("BG cache,
+FUSE_GLU and FUSE_DOWN are each clean, LOGSCOPE_PASS_FUSE=1 alone reproduces
+it").
+
+**And upstream shows the fix directly.** `initialize_webgpu_context` sizes
+its parameter arena as:
+
+```
+command_submit_batch_size + WEBGPU_NUM_PARAM_SLOT_SAFETY_MARGIN   // 64 + 10
+```
+
+The param pool is sized *by the batch size*, so a slot cannot be recycled
+while a dispatch in the current batch still refers to it. That is precisely
+the invariant our `ring_dims` violates when fusion defers dispatches: our ring
+is sized independently of how many dispatches may be in flight, so a long
+fused batch wraps the ring and overwrites uniforms that pending dispatches
+have not consumed yet.
+
+So the fix is not "make fusion safe" in the abstract. It is: **size the dims
+ring to at least the maximum fused batch length, plus a margin** — and then
+the wrap can no longer reach a live slot. That also explains why the
+immediate-encode path is fine (it consumes each slot before the next is
+handed out) and why only the deferred path breaks, which the retraction
+comment noted but could not account for.
+
+**Still to prove before re-enabling.**
+`LOGSCOPE_PASS_FUSE` stays retracted until someone has:
+
+1. sized `ring_dims` to `max_fused_batch + margin` (upstream's shape), and
+2. re-run `gate-decode-parity` — the probe that actually caught this, because
+   it compares a fused DECODE against the unfused PREFILL that must agree with
+   it. `gate-passfuse-diffusion.sh` missed the bug precisely because it
+   compared fused against fused, and our own notes already say so: "a gate
+   that only exercises the feature it is testing cannot see the feature being
+   wrong".
+
+If the ring is the mechanism, parity should return to the 8e-8 agreement the
+unfused path gets. If it does not, the mechanism is still unproven and the
+retraction stands.
 
 Payoff if it holds: 96% of submits are pass boundaries, and sync is 97% of
 wall time. Going from 1.3 dispatches/pass toward upstream's 64 is the largest
