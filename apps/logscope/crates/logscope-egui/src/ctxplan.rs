@@ -429,3 +429,120 @@ mod relevance_tests {
         assert!(!kept.contains(&"a/b/c/d/deep.rs".to_string()), "{kept:?}");
     }
 }
+
+/// Relevance for a SPECIFIC question, not just "what is this repository".
+///
+/// `describes_project` ranks by path shape alone, which is right for "summarise
+/// this codebase" and wrong for everything else. A field run asked "add a new
+/// theme bright pink"; the planner surfaced `Cargo.toml` (0.90) and buried
+/// `snapclone-theme/src/palette.rs` (0.17), and the model — shown a manifest
+/// and asked about themes — confabulated a `themes` array into it. It did
+/// exactly what it was pointed at. The wrong file is worse than no file,
+/// because a model given nothing says so and a model given the wrong thing
+/// invents.
+///
+/// The boost is deliberately crude: content words from the question matched
+/// against the PATH. No embeddings, no content scan — the planner exists to
+/// avoid opening everything, so its ranking may not open anything either.
+/// Path matching is enough here because repositories name things after what
+/// they do: a question about themes finds `snapclone-theme/`, `theme.rs`,
+/// `palette.rs` is found by "palette", and so on.
+pub fn relevance_for_query(rel_path: &str, query: &str) -> f32 {
+    let base = describes_project(rel_path);
+    // A file the shape rule REFUSED stays refused. A lockfile or a PNG that
+    // happens to contain the word is still a lockfile or a PNG, and letting a
+    // name coincidence resurrect a 200 KB Cargo.lock into the prompt is the
+    // opposite of the point.
+    if base <= 0.0 {
+        return 0.0;
+    }
+    let hay = rel_path.to_lowercase();
+    // Words worth matching on. Short ones match everything ("a" is in "palette")
+    // and stopwords carry no signal, so both are dropped rather than weighted
+    // down — a 0.05 boost applied to every file is just noise with a cost.
+    const STOP: [&str; 24] = [
+        "add", "new", "the", "and", "for", "with", "make", "change", "fix", "update",
+        "please", "can", "you", "how", "what", "where", "why", "does", "this", "that",
+        "into", "from", "some", "file",
+    ];
+    let mut hits = 0usize;
+    let mut terms = 0usize;
+    for w in query.to_lowercase().split(|c: char| !c.is_alphanumeric()) {
+        if w.len() < 4 || STOP.contains(&w) { continue; }
+        terms += 1;
+        // Singular/plural without a stemmer: "themes" should find "theme".
+        let stem = w.strip_suffix('s').unwrap_or(w);
+        if hay.contains(stem) { hits += 1; }
+    }
+    if terms == 0 || hits == 0 {
+        return base;
+    }
+    // A path that names what was asked about must DECISIVELY outrank a
+    // manifest, not merely edge past it. First attempt added a ratio-scaled
+    // boost to the base and lost: `snapclone-theme/src/palette.rs` scored
+    // 0.50 against `Cargo.toml`'s 0.90, so the field case would have failed
+    // again. The floor is what fixes it — any name match lands above the
+    // manifest tier (0.90), with the ratio and the base only breaking ties
+    // among matches. A README still leads at 1.0, which is right: it is
+    // genuinely worth reading for almost any question.
+    let ratio = (hits as f32 / terms as f32).min(1.0);
+    (0.92 + 0.07 * ratio + 0.01 * base).min(1.0)
+}
+
+#[cfg(test)]
+mod query_relevance_tests {
+    use super::*;
+
+    #[test]
+    fn the_field_case_now_surfaces_the_palette_not_the_manifest() {
+        // "add a new theme bright pink" — the exact prompt that produced a
+        // confabulated `themes` array in Cargo.toml.
+        let q = "add a new theme bright pink";
+        let palette = relevance_for_query("crates/snapclone-theme/src/palette.rs", q);
+        let manifest = relevance_for_query("Cargo.toml", q);
+        assert!(palette > manifest,
+            "palette {palette:.2} must outrank the root manifest {manifest:.2} for a theme task");
+    }
+
+    #[test]
+    fn an_unrelated_question_leaves_the_ranking_alone() {
+        // The boost must not fire on everything, or it replaces one fixed
+        // ranking with a differently-fixed one.
+        let q = "why is decoding slow";
+        for p in ["Cargo.toml", "crates/snapclone-theme/src/palette.rs", "README.md"] {
+            assert_eq!(relevance_for_query(p, q), describes_project(p), "{p} moved");
+        }
+    }
+
+    #[test]
+    fn a_summarise_style_question_falls_back_to_path_shape() {
+        // All stopwords and short words: nothing to match on, so the
+        // "what is this repository" ranking is the right answer and must survive.
+        let q = "what does this do";
+        assert_eq!(relevance_for_query("Cargo.toml", q), describes_project("Cargo.toml"));
+    }
+
+    #[test]
+    fn plurals_match_their_singular() {
+        let a = relevance_for_query("src/themes.rs", "add a theme");
+        let b = relevance_for_query("src/theme.rs", "add some themes");
+        assert!(a > describes_project("src/themes.rs"));
+        assert!(b > describes_project("src/theme.rs"));
+    }
+
+    #[test]
+    fn a_skipped_file_stays_skipped_even_when_its_name_matches() {
+        // A lockfile mentioning "theme" is still a lockfile. describes_project
+        // returns 0 for these and the boost must not resurrect them, or a
+        // 200 KB Cargo.lock lands in the prompt for a one-word coincidence.
+        assert_eq!(relevance_for_query("Cargo.lock", "add a theme"), 0.0);
+        assert_eq!(relevance_for_query("assets/theme.png", "add a theme"), 0.0);
+    }
+
+    #[test]
+    fn the_score_stays_in_range() {
+        let q = "theme palette colour snapclone egui bright";
+        let r = relevance_for_query("crates/snapclone-theme/src/palette.rs", q);
+        assert!((0.0..=1.0).contains(&r), "got {r}");
+    }
+}

@@ -1159,6 +1159,8 @@ pub struct Chat {
     /// it `&mut` would push interior mutability up through several callers for
     /// no gain.
     planned_cache: std::cell::RefCell<Option<(std::path::PathBuf, usize, String)>>,
+    /// The question the cached plan was built for.
+    planned_q: std::cell::RefCell<Option<String>>,
     threading: bool,   // thread prior turns into the prompt, or single-shot
     /// Oldest turn currently in the model's window, remembered so it can STAY there.
     ///
@@ -1466,6 +1468,7 @@ impl Default for Chat {
             msgs: Vec::new(), input: String::new(),
             context: LONG_HORIZON.into(),
             planned_cache: std::cell::RefCell::new(None),
+            planned_q: std::cell::RefCell::new(None),
             threading: true, show_context: false, attach_log: true, fix_mode: false,
             right_page: RightPage::Prompting, coord_mode: crate::coordinator::Mode::Barebones,
             // PERSISTED CHOICES, restored here rather than defaulted. A Dvorak user re-selecting
@@ -3364,18 +3367,31 @@ them to", patches.len());
         // this is on a per-frame path, and walking a workspace tree plus reading
         // the selected files at 60 Hz is what produced the endlessly repeating
         // "workspace files: …" log line.
+        // Keyed on the QUESTION as well, now that selection depends on it —
+        // otherwise turn one's plan is served for the rest of the conversation
+        // and the query-awareness never takes effect after the first message.
+        let q = self.msgs.iter().rev().find(|m| m.role == Role::User)
+            .map(|m| m.text().to_string()).unwrap_or_default();
         if let Some((r, b, s)) = self.planned_cache.borrow().as_ref() {
-            if r == root && *b == budget_bytes {
+            if r == root && *b == budget_bytes && self.planned_q.borrow().as_deref() == Some(q.as_str()) {
                 return s.clone();
             }
         }
         let out = self.plan_files_uncached(root, budget_bytes);
         *self.planned_cache.borrow_mut() = Some((root.to_path_buf(), budget_bytes, out.clone()));
+        *self.planned_q.borrow_mut() = Some(q);
         out
     }
 
     fn plan_files_uncached(&self, root: &std::path::Path, budget_bytes: usize) -> String {
-        use crate::ctxplan::{describes_project, plan, Budget, FileEntry};
+        // The most recent user turn is the question the selection should serve.
+        // Empty (no turns yet) falls back to path-shape ranking, which is the
+        // right answer for an opening "what is this".
+        let question = self.msgs.iter().rev()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.text().to_string())
+            .unwrap_or_default();
+        use crate::ctxplan::{plan, relevance_for_query, Budget, FileEntry};
         const SKIP_DIR: [&str; 7] =
             ["target", ".git", ".gitmind", ".logscope", "node_modules", "dist", ".cargo"];
         // Bounded walk: a workspace can be enormous and this runs while building
@@ -3395,7 +3411,11 @@ them to", patches.len());
                 }
                 let Ok(rel) = p.strip_prefix(root) else { continue };
                 let rel = rel.to_string_lossy().replace('\\', "/");
-                let r = describes_project(&rel);
+                // Ranked against the LIVE QUESTION, not just path shape. See
+                // ctxplan::relevance_for_query: "add a new theme bright pink"
+                // surfaced Cargo.toml and buried palette.rs, and the model
+                // invented a `themes` array into the manifest it was shown.
+                let r = relevance_for_query(&rel, &question);
                 if r <= 0.0 { continue; }
                 let bytes = e.metadata().map(|m| m.len() as usize).unwrap_or(0);
                 files.push(FileEntry { path: rel, bytes, relevance: r, sections: Vec::new() });
