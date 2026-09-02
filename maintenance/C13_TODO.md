@@ -2209,3 +2209,42 @@ that works and the same field inside a paged view does not, the gesture layer
 is the cause and (2) fixes both. If both fail, the id hypothesis was wrong for
 a different reason and the next suspect is the on-screen keyboard's input
 method, not egui ids.
+
+
+## 66. §65 partially closed — logscope's swipes now check drag ownership
+
+Both `total_drag_delta()` sites in chat.rs now consult
+`gesture_layer::drag_owner` before treating a drag as a swipe, with a
+source-level regression test that fails if a third drag read is added without
+a guard (verified by deleting one).
+
+**The test to run on the Fairphone**, in this order, because it distinguishes
+three hypotheses cheaply:
+1. Type into the logscope chat composer. If it now takes more than one
+   character, the swipe recogniser was the cause and the id work was a red
+   herring — say so and stop looking at egui ids.
+2. If still one character, type into a field in an app with NO swipe handling
+   (switcheroo has none; its palette-free UI is a clean control). If that
+   works, something else is competing for the press. If it also fails, the
+   cause is below egui — the on-screen keyboard's input method — and the
+   next step is capturing what events actually arrive, not more egui changes.
+
+**Remaining adoption gaps** (same fix, other apps): every app that swipes by
+hand rather than through `pager`. `pager::` still has ONE consumer,
+snapclone. Grep for `total_drag_delta()` across apps/ — after this commit
+logscope's two are guarded; check aperture, voiceterm and studio next.
+
+## 67. Still open on logscope-egui, in the order I would take them
+
+1. **`setup` is 32% of wall time on the 8B** (57.8s of 179.6s) and nothing
+   has explained that line. Second-largest bucket after sync.
+2. **The profile buckets sum to 134%**, so at least two overlap. Until that
+   is fixed the split cannot be trusted to prioritise by, which makes it a
+   prerequisite rather than housekeeping.
+3. **The retry ladder does not converge** (§57): the same malformed call
+   repeated a dozen times with the reminder growing each round. The ladder
+   text does reach the model, so escalation is happening and not working.
+4. **Two liaison modules, one dead** (§55) — decide which is canonical.
+5. **`ctxplan` relevance on context cards** (§53 item 4) — the number now
+   exists and the reference design shows it; surfacing it would make the
+   selection legible instead of invisible.
