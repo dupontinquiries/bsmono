@@ -186,7 +186,13 @@ pub fn resolve_app_dir(path: &str) -> PathBuf {
     // Otherwise treat `path` as a bare app/game NAME and DISCOVER where it lives, so we never hard-code
     // "apps/<name>" vs "games/<name>" — the filesystem is the source of truth. Games and apps can move
     // trees without touching the store.
-    for base in ["apps", "games"] {
+    // `system` is here because `system/photosync` and `system/snapclone` are
+    // real, manifest-registered projects, and a bare name for either resolved
+    // to nothing — which surfaced as "photosync produces no build artifact",
+    // the build having been pointed at a directory that does not exist. The
+    // comment in `flow.rs`'s store list asserted photosync was "a plain
+    // package at apps/photosync"; it never has been.
+    for base in ["apps", "games", "system"] {
         let cand = root.join(base).join(path);
         if cand.exists() {
             return cand;

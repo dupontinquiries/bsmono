@@ -1083,7 +1083,15 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     // photosync joins media as a SIMPLE entry: unlike cadscope and
     // aperture it is a plain package at apps/photosync, so
     // `resolve_app_dir` finds it without a custom path.
-    let media = ["av1tuner", "av1tuner-m1", "snapclone", "paperbound", "snapshot-cam",
+    // av1tuner-m1 was HERE until now: the fork was merged into apps/av1tuner and
+    // retired in c11 (see apps/av1tuner/DUPLICATE.md), the directory is gone,
+    // and the manifest entry carries a RESOLVED comment — but this list still
+    // offered it, so it resolved to nothing and failed on every device it was
+    // installed to. Exactly the phantom entry the comment below says was
+    // refused when the source was missing; nothing noticed when one appeared by
+    // deletion instead. `every_store_entry_resolves_to_a_real_directory` is now
+    // the thing that notices.
+    let media = ["av1tuner", "snapclone", "paperbound", "snapshot-cam",
                  "photosync"];
     // beatspace is a CUSTOM entry below (it needs run_flags), so it is not in
     // this simple list — being in both would put it in the group twice.
@@ -1978,5 +1986,98 @@ mod launch_consistency_tests {
         // real config file would be testing the filesystem.
         assert!(record_run_args("anything", "").is_ok());
         assert!(record_run_args("anything", "   ").is_ok());
+    }
+
+    /// Every app the store offers must point at a directory that exists.
+    ///
+    /// `store_groups()` is a HAND-CURATED list of names and paths, and the
+    /// manifest and the filesystem move without it. Two ways it had already
+    /// drifted, both found by writing this:
+    ///
+    /// * `av1tuner-m1` was still offered a session after the fork was merged
+    ///   into `apps/av1tuner` and the directory deleted. The comment beside the
+    ///   custom entries says a phantom entry was refused when the source was
+    ///   missing — and it was, when someone ADDED one. Nothing noticed when one
+    ///   appeared by deletion instead.
+    /// * `photosync` resolved nowhere, because it lives at `system/photosync`
+    ///   and `resolve_app_dir` searched only `apps/` and `games/`. The comment
+    ///   in the store list asserted it was "a plain package at apps/photosync",
+    ///   which it has never been — a doc stating engine state confidently and
+    ///   wrongly, which is the failure CLAUDE.md §5 is about.
+    ///
+    /// A phantom entry costs a build and a confusing "no such package" on every
+    /// device it is installed to, so this is a hard failure rather than a
+    /// warning.
+    #[test]
+    fn every_store_entry_resolves_to_a_real_directory() {
+        let groups = store_groups();
+        // A list that came back empty would pass every assertion below it.
+        let total: usize = groups.iter().map(|g| g.apps.len()).sum();
+        assert!(total >= 15, "store_groups() offered only {total} apps");
+
+        let mut phantom = Vec::new();
+        for g in &groups {
+            for a in &g.apps {
+                let dir = crate::ops::resolve_app_dir(&a.path);
+                if !dir.is_dir() {
+                    phantom.push(format!(
+                        "  {} (group {}) -> {} does not exist",
+                        a.name, g.name, dir.display()
+                    ));
+                }
+            }
+        }
+        assert!(
+            phantom.is_empty(),
+            "{} store entr(ies) point at nothing — each one is a failed build on \
+             every device it reaches:\n{}",
+            phantom.len(),
+            phantom.join("\n")
+        );
+    }
+
+    /// The complement: an app the manifest calls primary and runnable should be
+    /// offered, or its absence should be a decision somebody made rather than a
+    /// list nobody updated.
+    ///
+    /// Reported from the field as "some missing apps like tadpole from the
+    /// gitmind deploy list", and tadpole is one of several. NOT a hard failure:
+    /// adding an app to the store without knowing it builds would trade a
+    /// missing entry for a phantom one, which is worse. This prints the gap so
+    /// the next person closes it deliberately.
+    #[test]
+    fn manifest_primary_apps_that_the_store_does_not_offer() {
+        let root = crate::ops::repo_root();
+        let Ok(text) = std::fs::read_to_string(root.join("manifest/projects.toml")) else {
+            eprintln!("no manifest to compare against; skipping");
+            return;
+        };
+        let entries = crate::appcatalog::parse_manifest(&text);
+        assert!(entries.len() > 60, "only {} manifest entries parsed", entries.len());
+
+        let offered: std::collections::BTreeSet<String> = store_groups()
+            .iter()
+            .flat_map(|g| g.apps.iter().map(|a| a.name.clone()))
+            .collect();
+
+        let mut gap = Vec::new();
+        for e in &entries {
+            if !e.primary || !e.is_runnable() {
+                continue;
+            }
+            // The store keys on the app FOLDER, not the manifest id: an entry
+            // at `apps/tadpole/egui-frontend` is offered as "tadpole".
+            let folder = e.path.split('/').nth(1).unwrap_or("");
+            if folder.is_empty() || offered.contains(folder) {
+                continue;
+            }
+            gap.push(format!("{folder} ({}, {})", e.app_id, e.path));
+        }
+        if !gap.is_empty() {
+            eprintln!(
+                "manifest marks these primary + runnable, and the store does not offer them:\n  {}",
+                gap.join("\n  ")
+            );
+        }
     }
 }
