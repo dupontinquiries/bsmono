@@ -870,6 +870,11 @@ and a desktop webcam) rather than compile-check alone.
 
 ## 19. voiceterm real_pty: zsh prompt redraw garbles the grid (root cause NOT fixed)
 
+**2026-09-02 (c15): the cause named below is DISPROVED.** Not deferred wrap —
+eight constructed right-margin fixtures agree with tmux against the parser as
+it was. It is missing CSI opcodes, CHA above all. See C14_TODO §1–2 and
+`shared/uikit/crates/uikit-term/tests/vt_corpus.rs`.
+
 Fleet failure: `a_tab_lands_on_its_column_stop` and
 `colour_codes_from_a_real_program_leave_nothing_on_the_screen` both fail
 with a screen showing only `➜  ~ =` and no command output.
@@ -906,6 +911,10 @@ the same underlying defect as the "voiceterm panes can't be used like
 konsole" field report (§20), so it is worth doing once, properly.
 
 ## 20. voiceterm-egui panes still unusable as a real terminal
+
+**2026-09-02 (c15): still open, and probably mostly the alternate screen.**
+There is no `CSI ?1049h` handling at all, so vim/less/htop draw over the
+primary screen and never restore it. C14_TODO §3.
 
 Standing field report, still open. Almost certainly the same root cause as
 §19 — the grid mis-tracks the cursor through a real interactive shell's
@@ -1014,6 +1023,12 @@ the input field, and the announce path.
 - **aperture** still has no tap-and-hold gesture for the command palette.
 
 ## 27. voiceterm VT correctness — konsole is now vendored as the reference
+
+**2026-09-02 (c15): superseded, and its premise was wrong.** No konsole
+checkout is in the c14unified-025 bundle. The deferred-wrap reading list below
+answers a question that is not the one being asked — see C14_TODO §1. The
+fixture-corpus method this section recommends WAS built and did find the real
+defects; tmux and pyte stand in for konsole as the reference.
 
 Supersedes the "audit against a real VT spec" note in §19. A konsole
 checkout was supplied specifically for this. The parts to read, in order:
