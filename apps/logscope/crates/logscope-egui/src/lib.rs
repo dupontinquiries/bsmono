@@ -210,7 +210,18 @@ pub use scene_kit::spatial;
 #[cfg(feature = "gui")] pub use scene_kit::mesh3d;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod pearl_input;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod scene3d;
-#[cfg(feature = "gui")] #[allow(dead_code)] pub mod gpuscene;
+// MIGRATED to scene-kit — the last of the four, and the only one §18's
+// "genuinely diverged" verdict was right about. It was two-way: scene-kit had
+// the inscription materials (MAT_INSCRIPTION/2), the UV attribute plumbing and
+// the u_page/u_page2 samplers; logscope had `ray_uv`, live at two call sites
+// in the chat scene for touch picking.
+//
+// So neither direction was a copy. `ray_uv` was ported into scene-kit beside
+// `dir_uv` (documented as its inverse, and only correct as a pair) WITH its
+// two tests, then this became a re-export. The `theme::power_mode` coupling
+// is handled by the same `perf::set_overrides` push that glow_scene needed —
+// already wired in app.rs.
+#[cfg(feature = "gui")] pub use scene_kit::gpuscene;
 // MIGRATED to scene-kit, but the DIRECTION was the opposite of the others and
 // getting it wrong would have cost ~330 lines. §75 measured it: 98% of
 // scene-kit's texgen was already inside logscope's, and logscope's was 2.3x
