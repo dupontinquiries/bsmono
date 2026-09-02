@@ -2632,3 +2632,28 @@ like the seam this replaces.
 repo, so nothing validates seam behaviour on the content where it actually
 appears. The blend tests use synthetic step edges, which prove the MECHANISM
 but not the outcome on footage.
+
+
+## 83. Seam fix is live on the GPU path
+
+Overlapped tiling + feathered blending now default in `d2x-wgpu`, overlap =
+`pre_pad` (reuses context already computed and previously discarded).
+`D2X_BLEND=0` restores the hard crop for A/B on real footage — which is the
+only place this can actually be judged.
+
+**Check on the next run:** same clip, blending on vs `D2X_BLEND=0`. If seams
+persist with blending ON, the cause is not the compositing and the next
+suspect is `pre_pad` still being too small for RRDB's receptive field — try
+`D2X_TILE_PAD=64`, which widens both the context AND the overlap, since the
+overlap is derived from it.
+
+Still open:
+- **CPU path still hard-crops.** `upscale_cpu` uses `tiles()` +
+  `write_output`. Deliberate: making it blend too would have hidden the parity
+  signal that caught my compositing change. Worth doing after the GPU path is
+  confirmed on footage, and it needs a tensor-domain `Blender` since the CPU
+  path composites `Tensor`, not RGBA bytes.
+- **No high-frequency fixture** (§81). The blend tests use synthetic step
+  edges — they prove the mechanism and pin an 8x reduction in seam step, but
+  nothing in the repo validates the outcome on the content where tiling
+  artefacts actually appear.
