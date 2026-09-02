@@ -11,6 +11,10 @@ pub mod biome_loader;
 pub mod blocks;
 pub mod block_transform;
 pub mod chunk;
+/// Toroidal chunk window — headless core (docs/claude-notes/chunk-window-design.md).
+pub mod chunk_window;
+/// Column-bitmask chunk representation + binary greedy face merging.
+pub mod bitchunk;
 pub mod chunk_loader;
 pub mod chunk_manager;
 pub mod block_textures;
