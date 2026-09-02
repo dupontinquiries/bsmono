@@ -31,34 +31,20 @@ use std::path::{Path, PathBuf};
 /// code. The note says what the sequence is for, because "CSI X" is not a
 /// reason to prioritise anything and "the shell erases N characters instead of
 /// redrawing the line" is.
-const KNOWN_GAPS: &[(&str, &str)] = &[
-    (
-        "save_restore",
-        "DECSC/DECRC (ESC 7 / ESC 8) and SCOSC/SCORC (CSI s / CSI u) — save and \
-         restore the cursor. Prompt-drawing code parks the cursor, writes \
-         somewhere else and expects to come back.",
-    ),
-    (
-        "charset_designate",
-        "ESC ( B and friends — charset designation. The parser drops the ESC ( \
-         and then prints the designator letter as text, so an ncurses program's \
-         setup leaves a stray B on the screen. This one is a leak, not an \
-         omission: not implementing it would be harmless, half-implementing it \
-         is not.",
-    ),
-    (
-        "decaln",
-        "ESC # 8 (DECALN) — same leak as the charset designators, a different \
-         intermediate byte. The parser prints the 8. Fixing how intermediates \
-         are consumed should close both fixtures at once.",
-    ),
-    (
-        "margin_wide",
-        "A double-width glyph's second cell is filled with a space, so \
-         row_text() reads back one more column than the screen shows. The glyph \
-         wraps correctly; it is the read-back that is wrong.",
-    ),
-];
+/// Sequences the parser does not implement, with the fixture that proves it.
+///
+/// **Currently empty: every fixture in the corpus is enforced.** It started at
+/// eleven, and each entry was deleted by the commit that closed it, which is
+/// what `known_gaps_still_diverge` exists to force.
+///
+/// Leaving the list (rather than deleting the machinery now that it is empty)
+/// is deliberate: the next unimplemented sequence someone finds gets recorded
+/// here with what it costs, instead of as a `#[ignore]` or a fixture quietly
+/// left out of the directory. An empty list is also the one state where
+/// `known_gaps_still_diverge` proves nothing on its own — which is why
+/// `the_whole_corpus_is_enforced` below asserts the count directly rather than
+/// letting an empty list read as success.
+const KNOWN_GAPS: &[(&str, &str)] = &[];
 
 fn vt_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/vt")
@@ -126,6 +112,21 @@ fn the_corpus_is_not_empty() {
         names.len() >= 20,
         "expected the recorded + constructed corpus, found {} fixtures",
         names.len()
+    );
+}
+
+#[test]
+fn the_whole_corpus_is_enforced() {
+    // An empty KNOWN_GAPS makes `known_gaps_still_diverge` vacuous — it
+    // iterates nothing and passes. So the claim "every fixture is checked" is
+    // asserted here as a number instead, where an accidentally-shrinking
+    // corpus or a re-populated gap list is visible.
+    let total = fixtures().len();
+    let gaps = KNOWN_GAPS.len();
+    assert!(
+        gaps * 4 < total,
+        "{gaps} of {total} fixtures are excused — the corpus is mostly a list of \
+         things that do not work, which is a different document"
     );
 }
 

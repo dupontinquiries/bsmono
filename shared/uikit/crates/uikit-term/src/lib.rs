@@ -49,6 +49,19 @@ impl Default for Style {
     }
 }
 
+/// The filler in the second column of a double-width glyph.
+///
+/// The cell must be OCCUPIED — otherwise the next `put` lands on top of the
+/// glyph's right half — but it holds no character of its own. It used to be a
+/// space, which made `row_text` read back one more column than the screen
+/// shows: `世界` came out as `"世 界"`, so search, copy and every consumer of
+/// the text saw a word that is not on screen.
+///
+/// A sentinel rather than a flag on [`Cell`]: every reader already handles
+/// `ch`, so one skip in the three places that assemble text is the whole
+/// change, and `Cell` stays `Copy` and two fields wide.
+pub const WIDE_TAIL: char = '\0';
+
 /// One screen cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
@@ -99,6 +112,11 @@ pub struct Grid {
     /// top.
     pub scroll_top: usize,
     pub scroll_bot: usize,
+    /// The cursor and pen parked by DECSC (`ESC 7`) or SCOSC (`CSI s`), for
+    /// the matching restore. Prompt-drawing code parks the cursor, writes
+    /// somewhere else and expects to come back; with this dropped, it came
+    /// back to wherever it happened to be.
+    saved_cursor: Option<(usize, usize, Style)>,
     /// Scrollback view: how many lines ABOVE the live bottom the viewport is showing.
     /// 0 = live. While scrolled back, new output does not move the view (the offset is bumped
     /// as lines enter scrollback — the standard terminal pin), and the cursor is hidden.
@@ -133,6 +151,7 @@ impl Grid {
             bracketed_paste: false,
             scroll_top: 0,
             scroll_bot: rows - 1,
+            saved_cursor: None,
             view_offset: 0,
         }
     }
@@ -155,7 +174,8 @@ impl Grid {
             return String::new();
         }
         let start = self.idx(r, 0);
-        let s: String = self.cells[start..start + self.cols].iter().map(|c| c.ch).collect();
+        let s: String = self.cells[start..start + self.cols].iter()
+            .map(|c| c.ch).filter(|c| *c != WIDE_TAIL).collect();
         s.trim_end().to_string()
     }
 
@@ -165,7 +185,8 @@ impl Grid {
         let mut v: Vec<String> = self
             .scrollback
             .iter()
-            .map(|row| row.iter().map(|c| c.ch).collect::<String>().trim_end().to_string())
+            .map(|row| row.iter().map(|c| c.ch).filter(|c| *c != WIDE_TAIL)
+                .collect::<String>().trim_end().to_string())
             .collect();
         for r in 0..self.rows {
             v.push(self.row_text(r));
@@ -222,7 +243,7 @@ impl Grid {
             // glyph's right half. A space is the honest filler — row_text then
             // reads back the same visual width the screen shows.
             let j = self.idx(self.cur_row, self.cur_col + 1);
-            self.cells[j] = Cell { ch: ' ', style: self.pen };
+            self.cells[j] = Cell { ch: WIDE_TAIL, style: self.pen };
         }
         self.cur_col += w;
     }
@@ -247,6 +268,44 @@ impl Grid {
         } else {
             self.cur_row = self.cur_row.saturating_sub(1);
         }
+    }
+
+    /// DECSC / SCOSC — park the cursor AND the pen.
+    ///
+    /// The pen matters and is easy to leave out: a prompt that saves, switches
+    /// to a colour to draw something elsewhere, then restores, expects its
+    /// original colour back. Saving only the position gives the cursor back
+    /// and leaves the rest of the line painted in whatever the excursion used.
+    pub fn save_cursor(&mut self) {
+        self.saved_cursor = Some((self.cur_row, self.cur_col, self.pen));
+    }
+
+    /// DECRC / SCORC. A restore with nothing saved homes the cursor, which is
+    /// what a VT does — not a no-op, which would leave it wherever a
+    /// half-understood sequence had wandered.
+    pub fn restore_cursor(&mut self) {
+        match self.saved_cursor {
+            Some((r, c, pen)) => {
+                self.cur_row = r.min(self.rows - 1);
+                self.cur_col = c.min(self.cols - 1);
+                self.pen = pen;
+            }
+            None => {
+                self.cur_row = 0;
+                self.cur_col = 0;
+            }
+        }
+    }
+
+    /// DECALN (`ESC # 8`) — fill the screen with `E` and home the cursor. A
+    /// diagnostic pattern, rare in the wild, and here because the parser has to
+    /// consume the `#` either way: half-understanding it printed the `8`.
+    pub fn screen_alignment_test(&mut self) {
+        for c in &mut self.cells {
+            *c = Cell { ch: 'E', style: Style::default() };
+        }
+        self.cur_row = 0;
+        self.cur_col = 0;
     }
 
     /// Set the scrolling region (DECSTBM), 1-based inclusive as the protocol
@@ -395,7 +454,8 @@ impl Grid {
     pub fn line_text_global(&self, line: usize) -> String {
         let sb = self.scrollback.len();
         if line < sb {
-            self.scrollback[line].iter().map(|c| c.ch).collect::<String>().trim_end().to_string()
+            self.scrollback[line].iter().map(|c| c.ch).filter(|c| *c != WIDE_TAIL)
+                .collect::<String>().trim_end().to_string()
         } else {
             self.row_text((line - sb).min(self.rows.saturating_sub(1)))
         }
@@ -613,6 +673,15 @@ enum State {
     /// shell with prompt-integration hooks) reliably produced exactly this:
     /// stray characters like a lone `=` appearing right after the prompt,
     /// with no correlation to anything the test actually ran.
+    /// After `ESC` and an INTERMEDIATE byte (`(`, `)`, `*`, `+`, `#`, `%`) —
+    /// one more character completes the sequence and is consumed.
+    ///
+    /// Without this state, `ESC ( B` (designate ASCII into G0, which ncurses
+    /// emits on almost every screen setup) fell through `Esc`'s catch-all back
+    /// to `Ground` and the `B` was PRINTED. A stray letter on screen from a
+    /// sequence that carries no visible information at all — the worst trade
+    /// available, since not implementing it would have been harmless.
+    EscIntermediate(char),
     Osc,
     /// Inside `ESC ]`, having just seen an `ESC` — one more char decides
     /// whether this is the String Terminator (`ESC \`, ending the OSC) or
@@ -683,8 +752,25 @@ impl Parser {
                 ']' => self.state = State::Osc,
                 // RI — reverse index. Not a CSI: a bare `ESC M`.
                 'M' => { grid.reverse_index(); self.state = State::Ground; }
+                // DECSC / DECRC.
+                '7' => { grid.save_cursor(); self.state = State::Ground; }
+                '8' => { grid.restore_cursor(); self.state = State::Ground; }
+                // Charset designators and the DEC private `#` family: the
+                // NEXT byte belongs to the sequence and must not be printed.
+                '(' | ')' | '*' | '+' | '#' | '%' | ' ' => {
+                    self.state = State::EscIntermediate(ch);
+                }
                 _ => self.state = State::Ground, // ignore non-CSI escapes for v1
             },
+            State::EscIntermediate(kind) => {
+                // Only `ESC # 8` does anything this grid can show; every other
+                // designator is consumed and discarded, which is the whole
+                // point of the state.
+                if kind == '#' && ch == '8' {
+                    grid.screen_alignment_test();
+                }
+                self.state = State::Ground;
+            }
             State::Osc => match ch {
                 '\x07' => self.state = State::Ground, // BEL terminator
                 '\x1b' => self.state = State::OscEsc,
@@ -810,6 +896,11 @@ impl Parser {
                 for _ in 0..n.max(1) { grid.scroll_up(); }
             }
             'T' => grid.scroll_region_down(Self::param_or(params, 0, 1) as usize),
+            // SCOSC / SCORC — the ANSI.SYS spelling of save/restore. Same
+            // meaning as ESC 7 / ESC 8 and a different byte, so a program that
+            // uses one and not the other still works.
+            's' => grid.save_cursor(),
+            'u' => grid.restore_cursor(),
             'r' => grid.set_scroll_region(
                 Self::param_or(params, 0, 1), params.get(1).copied().unwrap_or(0)),
             'J' => grid.erase_in_display(params.first().copied().unwrap_or(0)),
@@ -1168,7 +1259,11 @@ pub fn render_grid(
             while end < grid.cols && grid.display_cell(r, end).style == start.style {
                 end += 1;
             }
-            let text: String = (c..end).map(|cc| grid.display_cell(r, cc).ch).collect();
+            // The wide-glyph tail is skipped here too: painting a NUL would
+            // put a tofu box in the right half of every CJK character, and
+            // painting a space would shift the run's remaining text left.
+            let text: String = (c..end).map(|cc| grid.display_cell(r, cc).ch)
+                .filter(|c| *c != WIDE_TAIL).collect();
             let (fg, bg) = resolve_colors(start.style, colors);
             let x0 = origin.x + c as f32 * cell_w;
             let rect = egui::Rect::from_min_size(egui::pos2(x0, y), egui::vec2((end - c) as f32 * cell_w, cell_h));
@@ -2156,6 +2251,78 @@ mod tests {
         t.feed("abcde");
         assert_eq!(t.grid.row_text(0), "abcd");
         assert_eq!(t.grid.row_text(1), "e");
+    }
+
+    #[test]
+    fn save_and_restore_carry_the_pen_as_well_as_the_position() {
+        // The pen is the half that is easy to leave out: a prompt saves,
+        // switches colour to draw elsewhere, restores, and expects its own
+        // colour back. Asserting only the position would pass on that bug.
+        let mut t = Terminal::new(10, 4);
+        t.feed("\x1b[31;1mA\x1b7\x1b[0;32m\x1b[3;5HB\x1b8C");
+        assert_eq!(t.grid.cur_row, 0);
+        assert_eq!(t.grid.row_text(0), "AC", "the cursor did not come back");
+        let st = t.grid.cell(0, 1).style;
+        assert_eq!(st.fg, TermColor::Ansi(1), "the pen was not restored");
+        assert!(st.bold, "bold was not restored");
+        // The excursion still happened where it was told to.
+        assert_eq!(t.grid.row_text(2), "    B");
+    }
+
+    #[test]
+    fn the_ansi_sys_spelling_of_save_restore_agrees_with_the_dec_one() {
+        // Two byte sequences, one meaning. A program that uses `CSI s` and not
+        // `ESC 7` must behave identically, and they are easy to implement in
+        // only one place.
+        for (save, restore) in [("\x1b7", "\x1b8"), ("\x1b[s", "\x1b[u")] {
+            let mut t = Terminal::new(10, 4);
+            t.feed(&format!("A{save}\x1b[3;5HB{restore}C"));
+            assert_eq!(t.grid.row_text(0), "AC", "{save}/{restore} did not round-trip");
+        }
+    }
+
+    #[test]
+    fn a_restore_with_nothing_saved_homes_the_cursor() {
+        let mut t = Terminal::new(10, 4);
+        t.feed("\x1b[3;5H\x1b8X");
+        assert_eq!((t.grid.cur_row, t.grid.row_text(0)), (0, "X".to_string()));
+    }
+
+    #[test]
+    fn escape_intermediates_are_consumed_not_printed() {
+        // The leak, named. `ESC ( B` designates ASCII into G0 and ncurses emits
+        // it on almost every screen setup; the parser dropped the `ESC (` and
+        // printed the `B`. Not implementing it would have been harmless —
+        // half-implementing it put a stray letter on screen.
+        let mut t = Terminal::new(20, 3);
+        t.feed("\x1b(B\x1b)0hello\x1b(0\x1b(Bworld");
+        assert_eq!(t.grid.row_text(0), "helloworld");
+        assert_eq!(t.grid.cur_col, 10, "a designator byte advanced the cursor");
+    }
+
+    #[test]
+    fn decaln_fills_the_screen_and_homes() {
+        // Rare in the wild; here because the `#` has to be consumed either way,
+        // and consuming it while ignoring the `8` would be the same leak.
+        let mut t = Terminal::new(4, 3);
+        t.feed("junk\x1b#8");
+        assert_eq!(t.grid.row_text(0), "EEEE");
+        assert_eq!(t.grid.row_text(2), "EEEE");
+        assert_eq!((t.grid.cur_row, t.grid.cur_col), (0, 0));
+    }
+
+    #[test]
+    fn a_wide_glyph_reads_back_at_its_screen_width() {
+        // The tail cell must be OCCUPIED (or the next put lands on the glyph's
+        // right half) and must not be TEXT (or every consumer of row_text sees
+        // a word that is not on screen). Both halves are asserted.
+        let mut t = Terminal::new(10, 2);
+        t.feed("世界x");
+        assert_eq!(t.grid.row_text(0), "世界x");
+        assert_eq!(t.grid.cur_col, 5, "the glyphs did not each take two columns");
+        assert_eq!(t.grid.cell(0, 1).ch, WIDE_TAIL, "the tail cell was left free");
+        // all_lines is scrollback-then-rows, and there is no scrollback here.
+        assert_eq!(t.grid.all_lines()[0], "世界x", "all_lines disagrees with row_text");
     }
 
     #[test]
