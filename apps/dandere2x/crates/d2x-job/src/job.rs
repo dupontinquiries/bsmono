@@ -65,6 +65,12 @@ pub struct Job {
     /// Set from another thread to stop after the current frame; the encoder
     /// then finalises a playable partial file.
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Difficulty cascade: route smooth missing blocks (luma std below
+    /// `pipeline.analyze.tier_std[1]`) to this cheaper model instead of the
+    /// main one. `Some(None)` = the vendored compact model.
+    pub cascade_model: Option<Option<PathBuf>>,
+    /// Route flat missing blocks (luma std below `tier_std[0]`) to bicubic.
+    pub flat_bypass: bool,
 }
 
 impl Default for Job {
@@ -86,6 +92,8 @@ impl Default for Job {
             start: 0.0,
             end: None,
             cancel: None,
+            cascade_model: None,
+            flat_bypass: false,
         }
     }
 }
@@ -110,6 +118,26 @@ pub fn load_model(explicit: Option<&Path>) -> anyhow::Result<(Arc<Network>, Path
     };
     let net = Network::load(&path).with_context(|| format!("loading model {}", path.display()))?;
     Ok((Arc::new(net), path))
+}
+
+/// All upscaler tiers for a job: main, then the cascade model, then bicubic.
+pub fn build_tiers(job: &Job) -> anyhow::Result<Vec<Box<dyn Upscaler>>> {
+    let mut tiers = vec![build_upscaler(job)?];
+    if let Some(cheap) = &job.cascade_model {
+        let mut j = job.clone();
+        j.model = cheap.clone();
+        j.cascade_model = None;
+        tiers.push(build_upscaler(&j)?);
+    }
+    if job.flat_bypass {
+        if tiers.len() == 1 {
+            // Tier index 2 is bicubic by definition; fill tier 1 with the
+            // main upscaler so routing stays meaningful without a cascade.
+            tiers.push(build_upscaler(job)?);
+        }
+        tiers.push(Box::new(BicubicUpscaler { scale: job.scale }));
+    }
+    Ok(tiers)
 }
 
 pub fn build_upscaler(job: &Job) -> anyhow::Result<Box<dyn Upscaler>> {
@@ -336,8 +364,8 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
     let p = ffmpeg::probe(&job.input)?;
     let keyframes = ffmpeg::keyframe_times(&job.input).unwrap_or_default();
     let segs = ffmpeg::segments(&keyframes, p.duration_s, job.jobs);
-    let server = BatchServer::start(build_upscaler(job)?, std::time::Duration::from_millis(15), 4_000_000);
-    let scale = server.scale;
+    let servers: Vec<Arc<BatchServer>> = build_tiers(job)?.into_iter().map(|u| BatchServer::start(u, std::time::Duration::from_millis(15), 4_000_000)).collect();
+    let scale = servers[0].scale;
     let (w, h) = (p.info.width * scale, p.info.height * scale);
     let stem = job.output.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "out".into());
     let ext = job.output.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "mkv".into());
@@ -346,7 +374,7 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
     let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<PEvent, String>)>();
     let mut handles = Vec::new();
     for (seg, part) in segs.iter().zip(&parts) {
-        let (seg, part, tx, p, job, server, all) = (*seg, part.clone(), tx.clone(), p.clone(), job.clone(), server.clone(), keyframes.clone());
+        let (seg, part, tx, p, job, servers, all) = (*seg, part.clone(), tx.clone(), p.clone(), job.clone(), servers.clone(), keyframes.clone());
         handles.push(std::thread::Builder::new().name(format!("d2x-seg{}", seg.index)).spawn(move || -> anyhow::Result<Summary> {
             let src = Box::new(FfmpegSource::open_segment(&job.input, &p, seg)?);
             let mut enc = job.encode.clone();
@@ -354,8 +382,8 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
             enc.keyframes = all.iter().filter(|&&t| t >= seg.start && seg.end.map_or(true, |e| t < e)).map(|t| t - seg.start).collect();
             let enc = with_keyint(enc, &all, p.info.fps);
             let sink = Box::new(FfmpegSink::open(&part, None, &p, w, h, &enc)?);
-            let up: Box<dyn Upscaler> = Box::new(server.client());
-            let r = d2x_core::pipeline::run(src, up, sink, job.pipeline, |e| {
+            let ups: Vec<Box<dyn Upscaler>> = servers.iter().map(|s| Box::new(s.client()) as Box<dyn Upscaler>).collect();
+            let r = d2x_core::pipeline::run_tiered(src, ups, sink, job.pipeline, |e| {
                 let _ = tx.send((seg.index, Ok(e)));
             });
             if let Err(e) = &r {
@@ -373,10 +401,12 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
     }
     let mut frames = 0;
     let mut fraction = 0.0;
+    let mut heavy = 0.0;
     let mut elapsed = std::time::Duration::ZERO;
     for h in handles {
         let s = h.join().map_err(|_| anyhow!("segment worker panicked"))??;
         fraction += s.upscaled_pixel_fraction * s.frames as f64;
+        heavy += s.heavy_pixel_fraction * s.frames as f64;
         frames += s.frames;
         elapsed = elapsed.max(s.elapsed);
     }
@@ -384,7 +414,7 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
     for part in &parts {
         let _ = std::fs::remove_file(part);
     }
-    Ok(Summary { frames, elapsed, upscaled_pixel_fraction: if frames > 0 { fraction / frames as f64 } else { 0.0 } })
+    Ok(Summary { frames, elapsed, upscaled_pixel_fraction: if frames > 0 { fraction / frames as f64 } else { 0.0 }, heavy_pixel_fraction: if frames > 0 { heavy / frames as f64 } else { 0.0 } })
 }
 
 /// Run a job end to end. `on_event` receives pipeline events on the calling thread.
@@ -402,10 +432,10 @@ pub fn run(job: &Job, mut on_event: impl FnMut(Event)) -> anyhow::Result<Summary
         Vec::new()
     };
     on_event(Event::Stage(format!("loading model and initialising the {:?} backend", job.backend)));
-    let upscaler = build_upscaler(job)?;
-    let scale = upscaler.scale();
+    let tiers = build_tiers(job)?;
+    let scale = tiers[0].scale();
     on_event(Event::Stage("starting encoder".into()));
     let sink = open_sink(job, probe.as_ref(), &keyframes, info.width * scale, info.height * scale)?;
     on_event(Event::Stage("frame 0 is a full-frame upscale; later frames only pay for what changed".into()));
-    d2x_core::pipeline::run(source, upscaler, sink, job.pipeline, |e| on_event(Event::Pipeline(e)))
+    d2x_core::pipeline::run_tiered(source, tiers, sink, job.pipeline, |e| on_event(Event::Pipeline(e)))
 }

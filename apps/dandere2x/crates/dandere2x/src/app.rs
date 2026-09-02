@@ -97,7 +97,7 @@ fn run_job(job: Job, analyze_only: bool, tx: Sender<Msg>, stop: Arc<AtomicBool>)
             let s = d2x_core::pipeline::analyze_only(source, job.pipeline, |i, st, _frac, t| {
                 let _ = tx.send(Msg::Event(Event::FrameDone { index: i, stats: *st, analyze_time: t, upscale_time: Duration::ZERO, merge_time: Duration::ZERO }));
             })?;
-            let _ = tx.send(Msg::Event(Event::Finished { frames: s.frames, elapsed: s.elapsed, upscaled_pixel_fraction: s.upscaled_pixel_fraction }));
+            let _ = tx.send(Msg::Event(Event::Finished { frames: s.frames, elapsed: s.elapsed, upscaled_pixel_fraction: s.upscaled_pixel_fraction, heavy_pixel_fraction: s.heavy_pixel_fraction }));
             return Ok(());
         }
         if job.jobs > 1 {
@@ -127,13 +127,13 @@ fn run_job(job: Job, analyze_only: bool, tx: Sender<Msg>, stop: Arc<AtomicBool>)
             Vec::new()
         };
         let _ = tx.send(Msg::Log(LogLevel::Info, format!("loading model and initialising the {:?} backend", job.backend)));
-        let upscaler = job::build_upscaler(&job)?;
-        let scale = upscaler.scale();
+        let tiers = job::build_tiers(&job)?;
+        let scale = tiers[0].scale();
         let inner = job::open_sink(&job, probe.as_ref(), &keyframes, info.width * scale, info.height * scale)?;
         let sink: Box<dyn FrameSink> = Box::new(TeeSink { inner, tx: tx.clone(), every: 4, n: 0 });
         let _ = tx.send(Msg::Log(LogLevel::Info, "frame 0 is a full-frame upscale; later frames only pay for what changed".into()));
         let tx2 = tx.clone();
-        d2x_core::pipeline::run(source, upscaler, sink, job.pipeline, move |e| {
+        d2x_core::pipeline::run_tiered(source, tiers, sink, job.pipeline, move |e| {
             let _ = tx2.send(Msg::Event(e));
         })?;
         Ok(())
@@ -156,6 +156,7 @@ struct Shell {
     input: String,
     output: String,
     model: String,
+    cascade: bool,
     running: bool,
     stop: Arc<AtomicBool>,
     rx: Option<Receiver<Msg>>,
@@ -179,6 +180,7 @@ impl Default for Shell {
             input: String::new(),
             output: String::new(),
             model,
+            cascade: false,
             running: false,
             stop: Arc::new(AtomicBool::new(false)),
             rx: None,
@@ -209,6 +211,8 @@ impl Shell {
         job.model = if self.model.trim().is_empty() { None } else { Some(self.model.trim().into()) };
         job.backend = [Backend::Wgpu, Backend::Cpu, Backend::Bicubic, Backend::Nearest][self.backend];
         job.pipeline.matcher = [MatcherKind::Stationary, MatcherKind::Diamond, MatcherKind::Exhaustive { radius: 4 }][self.matcher];
+        job.cascade_model = if self.cascade { Some(None) } else { None };
+        job.pipeline.tiers = 1 + self.cascade as usize + job.flat_bypass as usize;
         if job.input.as_os_str().is_empty() || (!analyze_only && job.output.as_os_str().is_empty()) {
             self.push_log(LogLevel::Error, "input (and output) paths are required".into());
             return;
@@ -251,7 +255,7 @@ impl Shell {
                         self.push_log(if stats.redraw { LogLevel::Warn } else { LogLevel::Debug }, format!("frame {index}: psnr {:.1}, stat {} mov {} rec {} miss {} fade {}{}; A {:.1}ms U {:.1}ms M {:.1}ms", stats.psnr, stats.stationary, stats.moved, stats.recalled, stats.missing, stats.fades, if stats.redraw { " REDRAW" } else { "" }, analyze_time.as_secs_f64() * 1e3, upscale_time.as_secs_f64() * 1e3, merge_time.as_secs_f64() * 1e3));
                     }
                 }
-                Msg::Event(Event::Finished { frames, elapsed, upscaled_pixel_fraction }) => {
+                Msg::Event(Event::Finished { frames, elapsed, upscaled_pixel_fraction, .. }) => {
                     let s = format!("{frames} frames in {:.1}s ({:.2} fps); {:.1}% of pixels went through the network", elapsed.as_secs_f64(), frames as f64 / elapsed.as_secs_f64().max(1e-9), upscaled_pixel_fraction * 100.0);
                     self.push_log(LogLevel::Info, s.clone());
                     self.summary = Some(s);
@@ -329,6 +333,18 @@ impl Shell {
                 ui.add(egui::DragValue::new(&mut self.job.pipeline.keyframe_refs).range(0..=256));
                 ui.label("batch");
                 ui.add(egui::DragValue::new(&mut self.job.pipeline.batch).range(1..=32));
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.cascade, "cascade (smooth → compact net)");
+                ui.checkbox(&mut self.job.flat_bypass, "flat → bicubic");
+            });
+            ui.horizontal(|ui| {
+                ui.label("flat std");
+                ui.add(egui::DragValue::new(&mut self.job.pipeline.analyze.tier_std[0]).range(0.0..=50.0).speed(0.1));
+                ui.label("smooth std");
+                ui.add(egui::DragValue::new(&mut self.job.pipeline.analyze.tier_std[1]).range(0.0..=100.0).speed(0.1));
+                ui.label("streak bonus");
+                ui.add(egui::DragValue::new(&mut self.job.pipeline.analyze.streak_bonus).range(0.0..=3.0).speed(0.05));
             });
             egui::ComboBox::from_label("matcher").selected_text(["stationary", "diamond", "exhaustive r4"][self.matcher]).show_ui(ui, |ui| {
                 for (i, n) in ["stationary", "diamond", "exhaustive r4"].iter().enumerate() {

@@ -8,25 +8,32 @@
 //! the block proper starts `bleed` further in.
 
 use crate::frame::{Frame, Pad};
-use crate::plan::{BlockMatch, FramePlan};
+use crate::plan::{BlockMatch, FramePlan, MAX_TIERS};
 
-/// What the upscaler is asked to produce for this frame.
+/// What the upscalers are asked to produce for this frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Residual {
     /// Nothing changed: no upscale at all.
     None,
-    /// Upscale this packed image and stitch per `plan.residuals`.
-    Packed(Frame),
-    /// Upscale the whole frame; it becomes the output verbatim.
+    /// One packed image per tier (`None` where a tier has no blocks);
+    /// stitch per `plan.residuals`.
+    Packed([Option<Frame>; MAX_TIERS]),
+    /// Upscale the whole frame (tier 0); it becomes the output verbatim.
     Whole(Frame),
 }
 
 impl Residual {
-    pub fn frame(&self) -> Option<&Frame> {
+    /// The image for `tier`, if any.
+    pub fn tier(&self, t: usize) -> Option<&Frame> {
         match self {
             Residual::None => None,
-            Residual::Packed(f) | Residual::Whole(f) => Some(f),
+            Residual::Packed(v) => v[t].as_ref(),
+            Residual::Whole(f) => (t == 0).then_some(f),
         }
+    }
+    /// Tier-0 image (what a single-upscaler pipeline needs).
+    pub fn frame(&self) -> Option<&Frame> {
+        self.tier(0)
     }
 }
 
@@ -39,26 +46,37 @@ pub fn make_residual(next_original: &Frame, plan: &FramePlan, bleed: u32) -> Res
     }
     let bs = plan.grid.block_size;
     let cell = bs + 2 * bleed;
-    let (cols, rows) = (plan.stats.residual_cols, plan.stats.residual_rows);
-    debug_assert_eq!((cols, rows), FramePlan::residual_dims_for(plan.residuals.len()));
 
     // Black beyond the frame edge, as upstream. (Replicate would arguably be
     // kinder to the CNN, but the merge never reads the bleed ring back, so
     // it only affects the ring's influence on the block — keep parity.)
     let padded = next_original.padded(bleed, Pad::Black);
-    let mut out = Frame::new(cols * cell, rows * cell);
+    let mut imgs: [Option<Frame>; MAX_TIERS] = Default::default();
+    for (t, img) in imgs.iter_mut().enumerate() {
+        let (cols, rows) = plan.stats.residual_tiers[t];
+        if cols > 0 {
+            *img = Some(Frame::new(cols * cell, rows * cell));
+        }
+    }
     for rv in &plan.residuals {
+        let out = imgs[rv.tier as usize].as_mut().expect("tier image sized for its blocks");
         // In padded coordinates the block starts at (frame_x + bleed); the
         // cell we want starts `bleed` before that, i.e. at (frame_x, frame_y).
         out.copy_block(&padded, cell, rv.frame_x, rv.frame_y, rv.cell_x * cell, rv.cell_y * cell);
     }
-    Residual::Packed(out)
+    Residual::Packed(imgs)
 }
 
 /// Build the upscaled next frame from the upscaled previous frame, the
 /// older upscaled references (same order as given to `analyze`), the
-/// upscaled residual, and the plan. `scale` is the upscaler's factor.
+/// upscaled residual (tier 0), and the plan. `scale` is the upscaler's factor.
 pub fn merge(prev_up: &Frame, older_up: &[&Frame], residual_up: Option<&Frame>, plan: &FramePlan, scale: u32, bleed: u32) -> anyhow::Result<Frame> {
+    let tiers: [Option<&Frame>; MAX_TIERS] = [residual_up, None, None];
+    merge_tiered(prev_up, older_up, &tiers, plan, scale, bleed)
+}
+
+/// [`merge`] with one upscaled residual image per tier.
+pub fn merge_tiered(prev_up: &Frame, older_up: &[&Frame], residual_up: &[Option<&Frame>; MAX_TIERS], plan: &FramePlan, scale: u32, bleed: u32) -> anyhow::Result<Frame> {
     let bs = plan.grid.block_size;
     let s = scale;
     anyhow::ensure!(
@@ -72,7 +90,7 @@ pub fn merge(prev_up: &Frame, older_up: &[&Frame], residual_up: Option<&Frame>, 
     );
 
     if plan.redraw {
-        let r = residual_up.ok_or_else(|| anyhow::anyhow!("merge: redraw plan without an upscaled frame"))?;
+        let r = residual_up[0].ok_or_else(|| anyhow::anyhow!("merge: redraw plan without an upscaled frame"))?;
         anyhow::ensure!((r.width, r.height) == (prev_up.width, prev_up.height), "merge: redraw frame size mismatch");
         return Ok(r.clone());
     }
@@ -100,14 +118,17 @@ pub fn merge(prev_up: &Frame, older_up: &[&Frame], residual_up: Option<&Frame>, 
         }
     }
 
-    // 3. Residual blocks.
-    if !plan.residuals.is_empty() {
-        let r = residual_up.ok_or_else(|| anyhow::anyhow!("merge: plan has residuals but no upscaled residual"))?;
-        let cell = bs + 2 * bleed;
-        let (cols, rows) = (plan.stats.residual_cols, plan.stats.residual_rows);
+    // 3. Residual blocks, from their tier's image.
+    let cell = bs + 2 * bleed;
+    for t in 0..MAX_TIERS {
+        let (cols, rows) = plan.stats.residual_tiers[t];
+        if cols == 0 {
+            continue;
+        }
+        let r = residual_up[t].ok_or_else(|| anyhow::anyhow!("merge: plan has tier-{t} residuals but no upscaled image for that tier"))?;
         anyhow::ensure!(
             r.width == cols * cell * s && r.height == rows * cell * s,
-            "merge: residual_up {}x{} does not match {}x{} cells of {} at scale {}",
+            "merge: tier {t} residual_up {}x{} does not match {}x{} cells of {} at scale {}",
             r.width,
             r.height,
             cols,
@@ -115,16 +136,10 @@ pub fn merge(prev_up: &Frame, older_up: &[&Frame], residual_up: Option<&Frame>, 
             cell,
             s
         );
-        for rv in &plan.residuals {
-            out.copy_block(
-                r,
-                bs * s,
-                (rv.cell_x * cell + bleed) * s,
-                (rv.cell_y * cell + bleed) * s,
-                rv.frame_x * s,
-                rv.frame_y * s,
-            );
-        }
+    }
+    for rv in &plan.residuals {
+        let r = residual_up[rv.tier as usize].expect("checked above");
+        out.copy_block(r, bs * s, (rv.cell_x * cell + bleed) * s, (rv.cell_y * cell + bleed) * s, rv.frame_x * s, rv.frame_y * s);
     }
     Ok(out)
 }
@@ -224,6 +239,35 @@ mod tests {
         let res = make_residual(&base, &plan, 1);
         let res_up = res.frame().map(|f| up.upscale(f).unwrap());
         let merged = merge(&prev_up, &[&older_hi], res_up.as_ref(), &plan, 2, 1).unwrap();
+        assert_eq!(merged, up.upscale(&working_next).unwrap());
+    }
+
+    /// Three tiers of nearest upscalers round-trip exactly: routing changes
+    /// which image a block comes from, never what it contains.
+    #[test]
+    fn tiered_residuals_roundtrip() {
+        use crate::predict::{analyze_tiered, AnalyzeState};
+        let cfg = AnalyzeConfig { block_size: 16, bleed: 1, tier_std: [2.0, 12.0], ..Default::default() };
+        let prev = smooth(64, 64, 1);
+        let mut next = prev.clone();
+        for y in 0..16 {
+            for x in 0..16 {
+                next.set_px(x, y, [200, 200, 200]);
+                next.set_px(16 + x, y, [(100 + x + y) as u8; 3]);
+                let c = if (x + y) % 2 == 0 { 30 } else { 220 };
+                next.set_px(32 + x, y, [c, c, c]);
+            }
+        }
+        let mut up = NearestUpscaler { scale: 2 };
+        let prev_up = up.upscale(&prev).unwrap();
+        let mut w = prev.clone();
+        let mut st = AnalyzeState::default();
+        let (plan, working_next) = analyze_tiered(&mut w, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 3, &mut st).unwrap();
+        assert_eq!(plan.stats.residual_tiers, [(1, 1), (1, 1), (1, 1)]);
+        let res = make_residual(&next, &plan, 1);
+        let ups: Vec<Option<Frame>> = (0..3).map(|t| res.tier(t).map(|f| up.upscale(f).unwrap())).collect();
+        let refs: [Option<&Frame>; 3] = [ups[0].as_ref(), ups[1].as_ref(), ups[2].as_ref()];
+        let merged = merge_tiered(&prev_up, &[], &refs, &plan, 2, 1).unwrap();
         assert_eq!(merged, up.upscale(&working_next).unwrap());
     }
 

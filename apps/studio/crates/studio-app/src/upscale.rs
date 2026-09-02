@@ -81,7 +81,7 @@ pub fn start(input: PathBuf, start_s: f64, end_s: f64, out: PathBuf, settings: &
                     let frac = total.map_or(0.0, |n| (index + 1) as f32 / n.max(1) as f32).min(0.999);
                     let _ = tx.send(Event::Progress { done: 0, jobs: 1, frac });
                 }
-                d2x_job::PipelineEvent::Finished { frames, elapsed, upscaled_pixel_fraction } => {
+                d2x_job::PipelineEvent::Finished { frames, elapsed, upscaled_pixel_fraction, .. } => {
                     let _ = tx.send(Event::Note(format!("upscale: {frames} frames in {:.0}s, {:.0}% of pixels through the network", elapsed.as_secs_f64(), upscaled_pixel_fraction * 100.0)));
                 }
             },

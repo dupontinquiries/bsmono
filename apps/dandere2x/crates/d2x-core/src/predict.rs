@@ -16,7 +16,7 @@
 use crate::frame::{block_sse, block_sse_bounded, Frame};
 use crate::gate::{ReferenceMaker, ThresholdMap};
 use crate::matcher::BlockMatcher;
-use crate::plan::{BlockMatch, FadeBlock, FramePlan, FrameStats, Grid, ResidualVector};
+use crate::plan::{BlockMatch, FadeBlock, FramePlan, FrameStats, Grid, ResidualVector, MAX_TIERS};
 use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -34,12 +34,45 @@ pub struct AnalyzeConfig {
     pub redraw_fraction: f64,
     /// Run the per-block brightness-shift pass.
     pub fade: bool,
+    /// Texture thresholds (luma standard deviation, 0–255 units) for routing
+    /// missing blocks to cheaper tiers: below `[0]` → tier 2 (bicubic),
+    /// below `[1]` → tier 1 (cheap network), else tier 0. Only tiers the
+    /// pipeline actually has upscalers for are used.
+    pub tier_std: [f64; 2],
+    /// Gate hysteresis: a block that has been reused for `n` consecutive
+    /// frames gets its threshold scaled by `1 + streak_bonus · min(n, 8) / 8`.
+    /// Bounds drift at that multiple of the JPEG error. 0 = off.
+    pub streak_bonus: f64,
 }
 
 impl Default for AnalyzeConfig {
     fn default() -> Self {
-        AnalyzeConfig { block_size: 30, bleed: 1, min_psnr: 5.2, redraw_fraction: 0.90, fade: true }
+        AnalyzeConfig { block_size: 30, bleed: 1, min_psnr: 5.2, redraw_fraction: 0.90, fade: true, tier_std: [2.0, 8.0], streak_bonus: 0.0 }
     }
+}
+
+/// Per-cell state carried across frames by the caller (both stages keep
+/// none of it on the merge side; it only affects the gate).
+#[derive(Debug, Clone, Default)]
+pub struct AnalyzeState {
+    /// Consecutive frames each cell has been reused (any non-Missing match).
+    pub streak: Vec<u16>,
+}
+
+/// Luma standard deviation of a block — the texture measure for tiering.
+fn block_luma_std(f: &Frame, x: u32, y: u32, size: u32) -> f64 {
+    let n = (size * size) as f64;
+    let (mut s, mut s2) = (0.0f64, 0.0f64);
+    for j in 0..size {
+        let row = f.row(y + j, x, x + size);
+        for px in row.chunks_exact(3) {
+            let l = 0.299 * px[0] as f64 + 0.587 * px[1] as f64 + 0.114 * px[2] as f64;
+            s += l;
+            s2 += l * l;
+        }
+    }
+    let mean = s / n;
+    (s2 / n - mean * mean).max(0.0).sqrt()
 }
 
 /// Mean per-channel difference `next - prev` over a block, rounded.
@@ -94,6 +127,22 @@ pub fn analyze(
     matcher: &dyn BlockMatcher,
     cfg: &AnalyzeConfig,
 ) -> anyhow::Result<(FramePlan, Frame)> {
+    let mut st = AnalyzeState::default();
+    analyze_tiered(prev_working, next, older, reference, matcher, cfg, 1, &mut st)
+}
+
+/// [`analyze`] with `tiers` upscalers available (1–3) and persistent state.
+#[allow(clippy::too_many_arguments)]
+pub fn analyze_tiered(
+    prev_working: &mut Frame,
+    next: &Frame,
+    older: &[&Frame],
+    reference: &dyn ReferenceMaker,
+    matcher: &dyn BlockMatcher,
+    cfg: &AnalyzeConfig,
+    tiers: usize,
+    state: &mut AnalyzeState,
+) -> anyhow::Result<(FramePlan, Frame)> {
     anyhow::ensure!(
         (prev_working.width, prev_working.height) == (next.width, next.height),
         "analyze: frame size changed {}x{} -> {}x{}",
@@ -106,12 +155,21 @@ pub fn analyze(
     let bs = cfg.block_size;
 
     let psnr = prev_working.psnr(next);
+    if state.streak.len() != grid.len() {
+        state.streak = vec![0; grid.len()];
+    }
     if psnr < cfg.min_psnr {
+        state.streak.iter_mut().for_each(|s| *s = 0);
         return Ok((FramePlan::redraw(grid, psnr), next.clone()));
     }
 
     let degraded = reference.degrade(next)?;
-    let thresholds = ThresholdMap::compute(next, &degraded, grid);
+    let mut thresholds = ThresholdMap::compute(next, &degraded, grid);
+    if cfg.streak_bonus > 0.0 {
+        for (t, &n) in thresholds.sse.iter_mut().zip(&state.streak) {
+            *t = (*t as f64 * (1.0 + cfg.streak_bonus * (n.min(8) as f64) / 8.0)) as u64;
+        }
+    }
 
     // --- fade pass: evaluated in parallel on the untouched prev, applied after.
     let mut fades: Vec<FadeBlock> = Vec::new();
@@ -182,23 +240,56 @@ pub fn analyze(
         for f in &fades {
             prev_working.add_scalar_block(f.x, f.y, bs, -f.scalar);
         }
+        state.streak.iter_mut().for_each(|s| *s = 0);
         let mut plan = FramePlan::redraw(grid, psnr);
         plan.stats.fades = 0;
         return Ok((plan, next.clone()));
     }
+    for (s, m) in state.streak.iter_mut().zip(&matches) {
+        *s = if *m == BlockMatch::Missing { 0 } else { s.saturating_add(1) };
+    }
 
-    // --- residual vectors, row-major over missing cells.
-    let mut residuals = Vec::with_capacity(stats.missing as usize);
-    let mut k: u32 = 0;
+    // --- route missing blocks to tiers by texture, then pack per tier.
+    let tiers = tiers.clamp(1, MAX_TIERS);
+    let tier_of: Vec<u8> = (0..grid.len())
+        .into_par_iter()
+        .map(|i| {
+            if matches[i] != BlockMatch::Missing || tiers == 1 {
+                return 0;
+            }
+            let (x, y) = grid.origin(i);
+            let sd = block_luma_std(next, x, y, bs);
+            if tiers >= 3 && sd < cfg.tier_std[0] {
+                2
+            } else if tiers >= 2 && sd < cfg.tier_std[1] {
+                1
+            } else {
+                0
+            }
+        })
+        .collect();
+    let mut counts = [0usize; MAX_TIERS];
     for (i, m) in matches.iter().enumerate() {
         if *m == BlockMatch::Missing {
-            let (x, y) = grid.origin(i);
-            residuals.push(ResidualVector { frame_x: x, frame_y: y, cell_x: k % cols, cell_y: k / cols });
-            k += 1;
+            counts[tier_of[i] as usize] += 1;
         }
     }
-    stats.residual_cols = cols;
-    stats.residual_rows = rows;
+    let mut residual_tiers = [(0u32, 0u32); MAX_TIERS];
+    for t in 0..MAX_TIERS {
+        residual_tiers[t] = FramePlan::residual_dims_for(counts[t]);
+    }
+    let mut residuals = Vec::with_capacity(stats.missing as usize);
+    let mut k = [0u32; MAX_TIERS];
+    for (i, m) in matches.iter().enumerate() {
+        if *m == BlockMatch::Missing {
+            let t = tier_of[i] as usize;
+            let (x, y) = grid.origin(i);
+            let cols = residual_tiers[t].0;
+            residuals.push(ResidualVector { frame_x: x, frame_y: y, cell_x: k[t] % cols, cell_y: k[t] / cols, tier: t as u8 });
+            k[t] += 1;
+        }
+    }
+    stats.residual_tiers = residual_tiers;
 
     // --- low-res reconstruction of next: matched blocks come from prev.
     let mut working_next = next.clone();
@@ -278,7 +369,7 @@ mod tests {
         assert_eq!(plan.stats.missing, 1);
         assert_eq!(plan.residuals.len(), 1);
         assert_eq!((plan.residuals[0].frame_x, plan.residuals[0].frame_y), (32, 16));
-        assert_eq!((plan.stats.residual_cols, plan.stats.residual_rows), (1, 1));
+        assert_eq!(plan.stats.residual_tiers[0], (1, 1));
         // Reconstruction: missing block is next's, everything else prev's.
         assert_eq!(next_w.crop(32, 16, 16, 16), next.crop(32, 16, 16, 16));
         assert_eq!(next_w.crop(0, 0, 16, 16), prev.crop(0, 0, 16, 16));
@@ -345,5 +436,66 @@ mod ring_tests {
         let cell = 1 + plan.grid.cols as usize;
         assert!(matches!(plan.matches[cell], BlockMatch::Recalled { r: 0 }));
         assert_eq!(next_w, base);
+    }
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+    use crate::gate::JpegReference;
+    use crate::matcher::Stationary;
+    use crate::testimg::smooth;
+
+    #[test]
+    fn missing_blocks_route_by_texture() {
+        let cfg = AnalyzeConfig { block_size: 16, bleed: 1, tier_std: [2.0, 12.0], ..Default::default() };
+        let prev = smooth(64, 64, 1);
+        let mut next = prev.clone();
+        // flat block (uniform), smooth block (gentle ramp), textured block (checker)
+        for y in 0..16 {
+            for x in 0..16 {
+                next.set_px(x, y, [200, 200, 200]);
+                next.set_px(16 + x, y, [(100 + x + y) as u8, (100 + x + y) as u8, (100 + x + y) as u8]);
+                let c = if (x + y) % 2 == 0 { 30 } else { 220 };
+                next.set_px(32 + x, y, [c, c, c]);
+            }
+        }
+        let mut w = prev.clone();
+        let mut st = AnalyzeState::default();
+        let (plan, _) = analyze_tiered(&mut w, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 3, &mut st).unwrap();
+        assert_eq!(plan.stats.missing, 3, "{:?}", plan.stats);
+        let tier_at = |x: u32| plan.residuals.iter().find(|r| r.frame_x == x && r.frame_y == 0).unwrap().tier;
+        assert_eq!(tier_at(0), 2, "flat -> bicubic");
+        assert_eq!(tier_at(16), 1, "smooth -> cheap net");
+        assert_eq!(tier_at(32), 0, "textured -> main net");
+        assert_eq!(plan.stats.residual_tiers, [(1, 1), (1, 1), (1, 1)]);
+        // With a single tier everything is tier 0.
+        let mut w = prev.clone();
+        let (plan1, _) = analyze_tiered(&mut w, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
+        assert!(plan1.residuals.iter().all(|r| r.tier == 0));
+        assert_eq!(plan1.stats.residual_tiers[0], (2, 2));
+    }
+
+    #[test]
+    fn streak_hysteresis_widens_the_gate_only_for_reused_blocks() {
+        let cfg = AnalyzeConfig { block_size: 16, bleed: 1, streak_bonus: 1.0, ..Default::default() };
+        let base = smooth(64, 64, 2);
+        let mut st = AnalyzeState::default();
+        let mut w = base.clone();
+        for _ in 0..8 {
+            let (_, nw) = analyze_tiered(&mut w, &base, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
+            w = nw;
+        }
+        assert!(st.streak.iter().all(|&s| s == 8));
+        // A change a bit above the JPEG threshold is now absorbed on a
+        // long-reused block (bonus 1.0 doubles the gate).
+        let mut next = base.clone();
+        next.add_uniform_noise(2, 5);
+        let mut w0 = base.clone();
+        let mut fresh = AnalyzeState::default();
+        let (p_fresh, _) = analyze_tiered(&mut w0, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut fresh).unwrap();
+        let mut w1 = base.clone();
+        let (p_streak, _) = analyze_tiered(&mut w1, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
+        assert!(p_streak.stats.missing <= p_fresh.stats.missing, "streak {:?} vs fresh {:?}", p_streak.stats, p_fresh.stats);
     }
 }

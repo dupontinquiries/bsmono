@@ -67,14 +67,19 @@ pub enum BlockMatch {
     Missing,
 }
 
+/// Number of upscaler tiers a plan can route to: 0 = the main network,
+/// 1 = a cheaper network for smooth blocks, 2 = bicubic for flat blocks.
+pub const MAX_TIERS: usize = 3;
+
 /// Maps a missing block at `(frame_x, frame_y)` to cell `(cell_x, cell_y)`
-/// of the residual image.
+/// of the residual image of `tier`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResidualVector {
     pub frame_x: u32,
     pub frame_y: u32,
     pub cell_x: u32,
     pub cell_y: u32,
+    pub tier: u8,
 }
 
 /// A flat brightness shift applied to a block of the previous frame before
@@ -96,12 +101,21 @@ pub struct FrameStats {
     pub fades: u32,
     /// Blocks recovered from older references.
     pub recalled: u32,
-    /// Residual image size in cells (0×0 if none). Rectangular: `cols =
-    /// ceil(sqrt(n))`, `rows = ceil(n / cols)`, so at most `cols − 1` cells
-    /// are wasted instead of up to `2·sqrt(n)` for a square.
-    pub residual_cols: u32,
-    pub residual_rows: u32,
+    /// Residual image size in cells per tier (0×0 if none). Rectangular:
+    /// `cols = ceil(sqrt(n))`, `rows = ceil(n / cols)`, so at most `cols − 1`
+    /// cells are wasted instead of up to `2·sqrt(n)` for a square.
+    pub residual_tiers: [(u32, u32); MAX_TIERS],
     pub redraw: bool,
+}
+
+impl FrameStats {
+    /// Tier-0 residual size in cells.
+    pub fn residual_cols(&self) -> u32 {
+        self.residual_tiers[0].0
+    }
+    pub fn residual_rows(&self) -> u32 {
+        self.residual_tiers[0].1
+    }
 }
 
 impl FrameStats {
@@ -113,9 +127,20 @@ impl FrameStats {
             return 1.0;
         }
         let cell = (grid.block_size + 2 * bleed) as f64;
-        let res_px = (self.residual_cols as f64 * cell) * (self.residual_rows as f64 * cell);
         let frame_px = (grid.width() as f64) * (grid.height() as f64);
+        // Tiers 0 and 1 are networks; tier 2 is bicubic and costs nothing worth counting.
+        let res_px: f64 = self.residual_tiers.iter().take(2).map(|&(c, r)| (c as f64 * cell) * (r as f64 * cell)).sum();
         res_px / frame_px
+    }
+
+    /// Fraction of the frame's pixels that went through the *main* network.
+    pub fn heavy_fraction(&self, grid: &Grid, bleed: u32) -> f64 {
+        if self.redraw {
+            return 1.0;
+        }
+        let cell = (grid.block_size + 2 * bleed) as f64;
+        let (c, r) = self.residual_tiers[0];
+        (c as f64 * cell) * (r as f64 * cell) / ((grid.width() as f64) * (grid.height() as f64))
     }
 }
 

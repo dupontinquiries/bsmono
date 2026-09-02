@@ -56,6 +56,7 @@ dandere2x selftest --model RealESRGAN_x2.safetensors   # GPU vs CPU, byte-exact
 dandere2x analyze  -i in.mkv                       # what block reuse buys, per frame, no CNN
 dandere2x upscale  -i in.mkv -o out.mkv --model RealESRGAN_x2.safetensors
 dandere2x upscale  -i in.mkv -o out.mkv -j 4      # keyframe-aligned segments, one shared GPU, 4 encoders
+dandere2x upscale  -i in.mkv -o out.mkv --model RealESRGAN_x2.safetensors --cascade default --flat-bypass
 dandere2x upscale  -i in.mkv -o clip.mkv --start 61.5 --end 90   # a range (audio trimmed + re-encoded, opus)
 dandere2x app                                      # the shell
 ```
@@ -135,6 +136,21 @@ What is built:
   much time the job spends on tiny residuals.
 - **Keyframe-aligned segments** (`-j`): N encoders, one shared GPU, resumable
   parts.
+- **Difficulty cascade** (`--cascade default|model.safetensors`,
+  `--flat-bypass`): missing blocks are classed by luma standard deviation.
+  Flat blocks (< `--flat-std`, default 2) get bicubic; smooth blocks
+  (< `--smooth-std`, default 8) get the compact network (~7× cheaper than
+  RRDB x2); only textured blocks pay for the main model. Each tier is its own
+  packed residual image and its own (batched) upscaler; `analyze` reports
+  the main-network share separately, which is what RRDB time follows. On the
+  synthetic partial-motion clip in `tools/` this cut the main-network share
+  from 50 % to 36 % of pixels; photo footage has a far larger smooth share.
+  Seams between tiers are possible on blocks near a threshold — raise
+  `--smooth-std` cautiously and look.
+- **Gate hysteresis** (`--streak-bonus b`, default 0 = off): a block reused
+  for `n` consecutive frames gets its threshold scaled by
+  `1 + b·min(n,8)/8`, so blocks that keep matching stop flickering out at
+  the threshold. Drift is bounded at that multiple of the JPEG error.
 
 What would move the big number (RRDB is ~9 TMAC per 1080p frame; the conv
 kernel is all of it):
@@ -146,8 +162,6 @@ kernel is all of it):
   channel; 4×2 pixels × 8 channels roughly doubles FMA-per-load.
 - **f16 storage** (f32 math) halves activation bandwidth where the adapter
   offers `SHADER_F16`.
-- **Difficulty cascade**: route low-texture residual blocks to the compact
-  net (7× cheaper) and only detailed blocks to RRDB.
 - **Gate**: the JPEG round trip could be replaced by a DCT-domain
   quantisation-error estimate (same number by Parseval, ~10× cheaper,
   library-independent) if analysis ever becomes the bottleneck under `-j`.

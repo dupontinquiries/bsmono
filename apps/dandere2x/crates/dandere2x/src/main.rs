@@ -63,6 +63,22 @@ struct Common {
     /// Frames whose residuals share one GPU call.
     #[arg(long, default_value_t = 4)]
     batch: usize,
+    /// Difficulty cascade: smooth missing blocks go to a cheaper model. Give a
+    /// model path, or "default" for the vendored realesr-animevideov3.
+    #[arg(long)]
+    cascade: Option<String>,
+    /// Flat missing blocks (luma std below --flat-std) skip the network: bicubic.
+    #[arg(long)]
+    flat_bypass: bool,
+    /// Luma std-dev below which a block is "flat".
+    #[arg(long, default_value_t = 2.0)]
+    flat_std: f64,
+    /// Luma std-dev below which a block is "smooth" (cascade tier).
+    #[arg(long, default_value_t = 8.0)]
+    smooth_std: f64,
+    /// Gate hysteresis for long-reused blocks: threshold × (1 + bonus·min(streak,8)/8). 0 = off.
+    #[arg(long, default_value_t = 0.0)]
+    streak_bonus: f64,
 }
 
 #[derive(Subcommand)]
@@ -141,7 +157,18 @@ fn job_from(common: &Common, input: PathBuf, output: PathBuf) -> anyhow::Result<
     j.pipeline.keyframe_refs = common.keyframe_refs;
     j.pipeline.batch = common.batch;
     j.pipeline.queue_depth = common.batch.max(2) * 2;
+    j.pipeline.analyze.tier_std = [common.flat_std, common.smooth_std];
+    j.pipeline.analyze.streak_bonus = common.streak_bonus;
+    j.cascade_model = common.cascade.as_ref().map(|c| if c == "default" { None } else { Some(PathBuf::from(c)) });
+    j.flat_bypass = common.flat_bypass;
+    j.pipeline.tiers = 1 + j.cascade_model.is_some() as usize + j.flat_bypass as usize;
     Ok(j)
+}
+
+fn tiers_str(s: &d2x_core::plan::FrameStats) -> String {
+    let names = ["main", "cheap", "bicubic"];
+    let parts: Vec<String> = s.residual_tiers.iter().enumerate().filter(|(_, &(c, _))| c > 0).map(|(t, &(c, r))| format!("{}:{c}x{r}", names[t])).collect();
+    if parts.is_empty() { "-".into() } else { parts.join(" ") }
 }
 
 fn print_event(e: &Event) {
@@ -153,21 +180,20 @@ fn print_event(e: &Event) {
         Event::FrameDone { index, stats, analyze_time, upscale_time, merge_time } => {
             let kind = if stats.redraw { "REDRAW" } else { "" };
             eprintln!(
-                "frame {index:6}  psnr {:5.1}  stat {:4} mov {:4} rec {:3} miss {:4} fade {:3}  residual {}x{} {kind}  A {:5.1}ms U {:7.1}ms M {:5.1}ms",
+                "frame {index:6}  psnr {:5.1}  stat {:4} mov {:4} rec {:3} miss {:4} fade {:3}  residual {} {kind}  A {:5.1}ms U {:7.1}ms M {:5.1}ms",
                 stats.psnr,
                 stats.stationary,
                 stats.moved,
                 stats.recalled,
                 stats.missing,
                 stats.fades,
-                stats.residual_cols,
-                stats.residual_rows,
+                tiers_str(stats),
                 analyze_time.as_secs_f64() * 1e3,
                 upscale_time.as_secs_f64() * 1e3,
                 merge_time.as_secs_f64() * 1e3
             );
         }
-        Event::Finished { frames, elapsed, upscaled_pixel_fraction } => {
+        Event::Finished { frames, elapsed, upscaled_pixel_fraction, .. } => {
             eprintln!("done: {frames} frames in {:.1}s ({:.2} fps); {:.1}% of pixels went through the network", elapsed.as_secs_f64(), *frames as f64 / elapsed.as_secs_f64().max(1e-9), upscaled_pixel_fraction * 100.0);
         }
     }
@@ -207,7 +233,7 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("frame {i:6}  psnr {:5.1}  stat {:4} mov {:4} rec {:3} miss {:4} fade {:3}  upscaled {:5.1}%{}  {:.1}ms", s.psnr, s.stationary, s.moved, s.recalled, s.missing, s.fades, frac * 100.0, if s.redraw { " REDRAW" } else { "" }, t.as_secs_f64() * 1e3);
             })?;
             let _ = bleed;
-            eprintln!("{} frames, {:.1}% of pixels would go through the network ({:.1}x fewer than full upscaling)", summary.frames, summary.upscaled_pixel_fraction * 100.0, 1.0 / summary.upscaled_pixel_fraction.max(1e-9));
+            eprintln!("{} frames: {:.1}% of pixels through the main network ({:.1}x fewer than full upscaling), {:.1}% through any network tier", summary.frames, summary.heavy_pixel_fraction * 100.0, 1.0 / summary.heavy_pixel_fraction.max(1e-9), summary.upscaled_pixel_fraction * 100.0);
         }
         Cmd::Selftest { model, tile } => {
             #[cfg(feature = "gpu")]
