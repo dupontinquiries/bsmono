@@ -2508,8 +2508,52 @@ pub fn encode_gop_v3_core(
     // exact-canonical encode. FAO_SKIPGATE=0 disables; FAO_EXACT_TOL
     // overrides the tolerance for sweeps.
     let skipgate = std::env::var("FAO_SKIPGATE").map(|v| v != "0").unwrap_or(true);
+    // ── GLOBAL-MOTION MODEL (FAO_GMC=1): the mode-0 predictor for
+    // frame i is the previous RECONSTRUCTION warped by the pairwise
+    // global affine, instead of the long-term plate. The ledger on
+    // film measured the median plate at 7.5 levels/px median error
+    // and used by 6% of regions, against the previous frame at 1.1
+    // levels/px and within 2 levels on 66% — the camera is the first
+    // object, and this makes its motion free per region. Six numbers
+    // per frame on the wire (charged as 16 B on top of the 8 the
+    // caller already counts). Frame 0 keeps the caller's model.
+    let gmc = std::env::var("FAO_GMC").map(|v| v != "0").unwrap_or(false);
+    let mut gmc_extra_bytes = 0usize;
     for (fi, f) in frames.iter().enumerate() {
-        let mut plate_pred = pred_for(fi);
+        let mut plate_pred = if gmc && fi > 0 {
+            let pair = estimate_motions_affine(&frames[fi - 1..=fi]);
+            let m = &pair[1];
+            let prev = &recon[fi - 1];
+            let as_plate = Plate {
+                w: prev.w,
+                h: prev.h,
+                ox: 0.0,
+                oy: 0.0,
+                y: prev.y.clone(),
+                u: prev.u.clone(),
+                v: prev.v.clone(),
+            };
+            let warped = predict_frame(&as_plate, m, fw, fh);
+            // Per-frame choice between the caller's model and the
+            // warped previous frame, by whole-frame luma SAD: one bit
+            // on the wire, and the choice cannot lose to either
+            // alone. Measured need: GMC alone was -16% / +0.0017 on
+            // film and -1.8% / -0.0023 on SMITE, whose fast local
+            // motion the long-term plate serves better.
+            let model = pred_for(fi);
+            let sad = |p: &Yuv420| -> u64 {
+                p.y.iter().zip(&f.y).map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs() as u64).sum()
+            };
+            gmc_extra_bytes += 1;
+            if sad(&warped) <= sad(&model) {
+                gmc_extra_bytes += 16;
+                warped
+            } else {
+                model
+            }
+        } else {
+            pred_for(fi)
+        };
         // ── Frame-level weighted prediction, one (a, b) per plane per
         // REFERENCE, applied before the mode decision so every region
         // chooses between photometrically aligned predictors. Charged
@@ -3230,7 +3274,7 @@ pub fn encode_gop_v3_core(
     let denom = (frames.len().saturating_sub(1)).max(1) as f64;
     (PlateEncodeReportV2 {
         plate_bytes: model_bytes,
-        motion_bytes,
+        motion_bytes: motion_bytes + gmc_extra_bytes,
         frames: out_frames,
         recon,
         prev_mode_share: (prev_share_acc / denom) as f32,

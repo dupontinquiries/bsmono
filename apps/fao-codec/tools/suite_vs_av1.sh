@@ -35,20 +35,26 @@ done
 tail -n +2 "$SHOTS" | while IFS=, read -r shot start frames rest; do
   [ -z "$shot" ] && continue
   y4m="$OUT/shot_$shot.y4m"
-  ffmpeg -v error -y -ss "$start" -i "$SRC" -frames:v "$frames" -vf "$CROP" -pix_fmt yuv420p "$y4m"
+  ffmpeg -nostdin -v error -y -ss "$start" -i "$SRC" -frames:v "$frames" -vf "$CROP" -pix_fmt yuv420p "$y4m"
   # codec
-  line=$("$BENCH" --csv "$OUT/bench_$shot.csv" "$y4m" 2>/dev/null | grep "^shot_$shot.y4m" | head -1 || true)
+  # SKIP_CODEC=1: score anchors only (a fresh AV1 ladder against the
+  # same shots), reusing a previous run's codec numbers from CODEC_CSV.
+  if [ "${SKIP_CODEC:-0}" = "1" ]; then
+    line=$(awk -F, -v s="$shot" '$1==s {printf "x x x %s %s %s %s", $4, $5, $6, $7}' "${CODEC_CSV:-/dev/null}")
+  else
+    line=$("$BENCH" --csv "$OUT/bench_$shot.csv" "$y4m" 2>/dev/null </dev/null | grep "^shot_$shot.y4m" | head -1 || true)
+  fi
   cb=$(echo "$line" | awk '{print $4}'); cm=$(echo "$line" | awk '{print $5}'); cu=$(echo "$line" | awk '{print $6}'); cv=$(echo "$line" | awk '{print $7}')
   row="$shot,$start,$frames,$cb,$cm,$cu,$cv"
   end=$(python3 -c "print($start + $frames / $FPS)")
   for i in "${!ANCHORS[@]}"; do
     a="${ANCHORS[$i]}"
     dec="$OUT/anchor_${i}_shot_$shot.y4m"
-    ffmpeg -v error -y -ss "$start" -i "$a" -frames:v "$frames" -vf "$CROP" -pix_fmt yuv420p "$dec"
+    ffmpeg -nostdin -v error -y -ss "$start" -i "$a" -frames:v "$frames" -vf "$CROP" -pix_fmt yuv420p "$dec"
     ab=$(awk -F, -v s="$start" -v e="$end" '$1>=s && $1<e {b+=$2} END{print b+0}' "${PKT[$i]}")
-    am=$("$MSSSIM" "$y4m" "$dec" 2>/dev/null | tail -1 | awk '{print $2}')
+    am=$("$MSSSIM" "$y4m" "$dec" 2>/dev/null </dev/null | tail -1 | awk '{print $2}')
     # near-black shots score "inf"; keep the loop alive and record 99
-    uv=$(ffmpeg -v info -i "$y4m" -i "$dec" -lavfi psnr -f null - 2>&1 | grep -o "u:[0-9.inf]* v:[0-9.inf]*" | tail -1 || true)
+    uv=$(ffmpeg -nostdin -v info -i "$y4m" -i "$dec" -lavfi psnr -f null - 2>&1 | grep -o "u:[0-9.inf]* v:[0-9.inf]*" | tail -1 || true)
     au=$(echo "$uv" | sed 's/u:\([0-9.inf]*\) v:.*/\1/; s/inf/99/'); av=$(echo "$uv" | sed 's/.*v:\([0-9.inf]*\)/\1/; s/inf/99/')
     row="$row,$ab,$am,$au,$av"
     rm -f "$dec"

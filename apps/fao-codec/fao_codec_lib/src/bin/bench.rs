@@ -122,9 +122,16 @@ fn run(clip: &str, config: &str, dz: f32) -> Row {
     let (w, h, frames) = read_y4m(clip);
     let opts = ResidualOpts { dead_zone: dz, ..ResidualOpts::default() };
     let t0 = std::time::Instant::now();
-    let m = plate::estimate_motions(&frames);
-    let pl = plate::build_plate(&frames, &m);
-    let rep = plate::encode_gop_v3(&frames, &m, &pl, &opts);
+    // FAO_NOPLATE=1: no long-term plate at all — frame 0 from gray
+    // (intra + residual), later frames from whatever the core's model
+    // is (with FAO_GMC, the warped previous reconstruction).
+    let rep = if std::env::var("FAO_NOPLATE").map(|v| v != "0").unwrap_or(false) {
+        plate::encode_gop_no_plate(&frames, &opts)
+    } else {
+        let m = plate::estimate_motions(&frames);
+        let pl = plate::build_plate(&frames, &m);
+        plate::encode_gop_v3(&frames, &m, &pl, &opts)
+    };
     let secs = t0.elapsed().as_secs_f32();
     let bytes = rep.plate_bytes
         + rep.motion_bytes

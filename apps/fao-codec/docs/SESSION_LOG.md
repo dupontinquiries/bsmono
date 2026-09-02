@@ -6436,3 +6436,88 @@ resolution per frame, merged world-space geometry, v1 lift,
 truncation, dangling mesh reference. Not yet done: the harness
 writing a v2 scene from soldier and `plate_lab` citing it — the
 harness still predicts through its own closures.
+
+### The suite against the user's own AV1 files, and the film levers that followed (2026-09-01/02)
+
+`tools/suite_vs_av1.sh` + `tools/suite_summary.py`: the 19 shots cut
+from the user's source, the codec run per shot, the user's two AV1
+files decoded per shot and scored against the same cropped source,
+AV1 bytes summed from packet sizes inside each shot's pts window.
+Luma MS-SSIM AND chroma PSNR — `bench` now reports U/V dB. Table in
+docs/suite_vs_av1_2026-09-01.csv.
+
+  codec (session defaults)   18,706,801 B   MS-SSIM 0.96290   chroma 34-41 dB
+  user's AV1 @150k              993,657 B   MS-SSIM 0.95267   chroma 41-45 dB   codec 18.8x
+  user's AV1 default         17,766,513 B   MS-SSIM 0.99560   chroma ~50 dB     codec 1.05x
+
+Per shot the codec is 8-34x the 150k file on everything with motion;
+the one shot it wins is black. Fresh SVT-AV1 ladder (preset 6, crf
+40/46/52): 6.51 / 4.55 / 3.24 MB, chroma 47-49 dB — scored per shot
+not yet (`msssim` loads a whole clip as f64 and dies on 1080 frames;
+the suite has SKIP_CODEC=1 for scoring anchors against a prior run).
+
+Two bugs the first run found, recorded because the next person will
+hit them: ffmpeg inside `while read` eats the CSV from stdin
+(-nostdin, </dev/null everywhere); near-black shots score "inf" PSNR
+and pipefail then kills the loop silently.
+
+### GMC — the camera as the first object, on film
+
+`FAO_GMC=1` in `encode_gop_v3_core`: the mode-0 predictor for frame i
+is the previous RECONSTRUCTION warped by the pairwise global affine
+(`estimate_motions_affine` on the frame pair), chosen against the
+caller's model per frame by whole-frame SAD — one bit, cannot lose
+to either alone. The ledger asked for exactly this: median plate at
+7.5 levels/px used by 6% of regions, previous frame at 1.1 levels/px
+and within 2 on 66%.
+
+  w1 (film)   440,102 / 0.97732 U 38.4  ->  368,284 / 0.97901 U 38.8   -16%, better on every axis,
+              prev-MC share 0.815 -> 0.222, grid figure 1.946 -> 1.404
+  + no plate (FAO_NOPLATE=1, frame 0 intra)   348,149 / 0.97891        -21%
+  SMITE       861,688 / 0.95415  ->  846,305 / 0.95184                 -1.8% for -0.0023: a loss
+              at the ladder rate; the per-frame choice is what keeps
+              it from being one when GMC is default
+
+Not default yet: the suite has to be re-run with it on. Extrapolated,
+18.8x becomes ~15x. Real, and not the target.
+
+### Dedup across a hard cut: shots 12 -> 13, the reel's one shared location
+
+User's reframing: parallax was never the goal; the goal is re-using
+content across a hard cut, and the residual coder pays for whatever
+the model does not supply. So: bytes, not depth. Thumbnails of all
+19 shots (mid-frame) show ~13 distinct locations in 45 s; the only
+pair on one location is 12 and 13 — the masked man on the ground,
+teepees mid-distance, hills far, two camera positions.
+
+`bin/cite_probe`: Harris keypoints per grid cell, half-res 15x15 NCC
+patches (31x31 of context) with a ratio test inside a spatial radius,
+mutual-best; RANSAC homography via `two_view::fit_homography`;
+normalised 8-point fundamental with Sampson inliers; A's last frame
+warped through H as B's frame-0 model; B encoded from scratch vs
+citing, same core, GMC after frame 0 in both.
+
+  same shot, 100 frames apart (control):
+    130 matches   H inliers 98   F inliers 105   F-only 7 at 7.1 px
+    -> within a shot the parallax is 7 px on 7% of points: unobservable
+       for reconstruction, as the log said, and the pipeline works.
+  12 -> 13 (the cut):
+    24 matches    H inliers 0    F inliers 12 (chance)   median H error 292 px
+    A warped -> B frame 0: 0.0% of regions within 2 levels, MS-SSIM 0.44
+    B from scratch   629,022 B   frame 0  66,582 B   MS-SSIM 0.97390
+    B citing A       629,626 B   frame 0  77,085 B   MS-SSIM 0.97394
+
+No usable correspondence across the cut with patch correlation: the
+baseline (angle + scale + the actor filling half the frame) is past
+what NCC survives, and the codec has no scale/rotation-invariant
+descriptor. A wrong model costs +10 KB on frame 0 — the coder
+charges for models that are wrong, which is why every model in this
+codec now goes through a per-frame SAD choice.
+
+The bound is the result. After GMC, frame 0 is the only per-shot
+fixed cost — 66.6 KB of 629 KB here, 10.6%. A cross-cut cite of the
+BACKGROUND can save at most the I-frame; the 562 KB after it is 81%
+actors by the ledger, which no background model touches. So on this
+codec at this operating point, corpus-scale dedup of locations is
+worth ~10% of film bytes, bounded above, before any matcher exists.
+Worth having if a wide-baseline matcher is cheap; not the lever.
