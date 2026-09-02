@@ -2021,3 +2021,37 @@ Still unwired, and why — decide per item, don't wire blind:
   each, when the settings page is redone (§24's "sections that fit").
 - `modal::{dismiss_layer,dismiss_topmost}`: library API; `dismiss_all` is
   used.
+
+
+---
+
+## 60. Merged the snapclone session (c14unified-019) — and it closes part of §23
+
+23 commits, merged at `0adf560ce`. Common ancestor is `origin/main`; the only
+file both sessions touched was this one (append/append), and the two blocks
+are kept side by side — see the numbering note above, since both sessions
+independently used §24/§35/§36 for different items and renumbering would
+break every commit message that references them.
+
+**Closes two items from §23 (camera enumeration on postmarketOS):**
+- "device names run off the page; should be a dropdown" — done by
+  `a2cc0b969`, which also adds double-tap to flip.
+- "default selection lands on /dev/video0 and hangs" — addressed by
+  `fcd55ce67`, which asks PipeWire for cameras BEFORE reading `/dev/video*`.
+  That is the right order: the decoder/encoder nodes that were cluttering the
+  list are v4l2 devices, and PipeWire knows which are real capture sources.
+
+Still open from §23 and worth re-testing on the phone now: the 640x480 /
+low-framerate advertisement on a 4K sensor. Format negotiation was not part
+of this session's work.
+
+**Verified after merge:** uikit-egui 353 tests (my 349 + their 4, no
+interaction), snapclone-egui 1605, snapcore 112, dht-kit 32. All green, no
+conflicts outside this file.
+
+Worth noting for the fleet-testing pass: this session ported `NatTraversal`
+(STUN on the punch socket, volleys, mapping maintenance) and made the DHT
+bind the listen port and bootstrap from remembered peers. That is directly
+relevant to §22 — gitmind fleet discovery never finding the Fairphones — and
+may be the missing piece there, or at least the place to look first now that
+there is real NAT code to point at the problem.
