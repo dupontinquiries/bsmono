@@ -1885,3 +1885,29 @@ Two things stand out beyond the known sync problem:
 
 The readback-backoff fix from earlier this session is NOT in these numbers
 (the run predates it). The next run's sync figure is the measurement.
+
+
+## 59. repo_tree: wrong in both directions before it was right
+
+Worth recording as a pattern, not just a fix. `repo_tree` shipped
+depth-first (all 40 entries in one deep branch, no top level), then
+breadth-first after my change (all 40 at the top, no source), and is now
+depth-balanced. Each of the first two had a test that passed, because each
+test asserted the property that the OTHER failure violates:
+
+- "a tight cap keeps the shallow files, not one deep branch" — passes under
+  BFS, and passes under balanced.
+- "a tight cap reaches the deep files too" — the one that was missing, and
+  the one the operator found by using the thing.
+
+A selection function needs its tests to bracket the answer from both sides.
+One-sided assertions on a ranking or sampling function will happily certify
+the opposite mistake. Same lesson as §48's verify-by-running, from the test
+side rather than the observation side.
+
+**Still open on the same report:** the operator also saw the model emit paths
+like `./logscope/ crates/gpu- gemm/Cargo.toml` — spaces inserted mid-path,
+matching the `read_ file` / `git_ log` space-insertion noted earlier. Now
+that the tree will actually contain deep paths, it is worth checking whether
+those spaces are the model's own tokenisation or something in our rendering
+of long paths. If the tree line-wraps anywhere, that is the first suspect.
