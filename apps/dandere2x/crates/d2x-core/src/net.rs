@@ -823,3 +823,252 @@ zero-padding contamination will reach into the visible crop");
         }
     }
 }
+
+// ── overlapped tiling with feathered blending ────────────────────────────────
+//
+// The cure for the tile seams that raising `pre_pad` only mitigates.
+//
+// `pre_pad` buys context so the network's output inside a tile is closer to
+// correct. It cannot make it exact: the convs are zero-padded and the
+// receptive field is hundreds of pixels, so SOME error always survives at the
+// tile edge. A hard crop then places two independently-wrong edges side by
+// side, and the eye finds the discontinuity instantly — that is what reads as
+// a seam even when each tile alone looks fine.
+//
+// Blending removes the discontinuity rather than the error. Tiles overlap, and
+// across the overlap each contributes a weight that falls to zero at its own
+// outer edge. Where two tiles meet, the one whose edge it is has weight ~0 and
+// the one that sees that area as interior has weight ~1, so the visible pixel
+// comes from whichever tile had the most context for it. The result is smooth
+// by construction: adjacent output can differ by at most the ramp's slope.
+
+/// Tiles stepped by `tile - overlap`, so neighbours share a border band.
+///
+/// `overlap` is clamped below `tile` — a step of zero would loop forever, and
+/// that is a caller bug worth surviving rather than hanging on.
+pub fn tiles_overlapped(width: u32, height: u32, tile: u32, overlap: u32) -> Vec<TileRect> {
+    assert!(tile > 0);
+    let ov = overlap.min(tile.saturating_sub(1));
+    let step = tile - ov;
+    let mut v = Vec::new();
+    let mut y = 0;
+    loop {
+        let h = tile.min(height - y);
+        let mut x = 0;
+        loop {
+            let w = tile.min(width - x);
+            v.push(TileRect { x, y, w, h });
+            if x + w >= width { break; }
+            x = (x + step).min(width - 1);
+        }
+        if y + h >= height { break; }
+        y = (y + step).min(height - 1);
+    }
+    v
+}
+
+/// Accumulates weighted tile output and normalises at the end.
+pub struct Blender {
+    w: usize,
+    h: usize,
+    acc: Vec<f32>,
+    wsum: Vec<f32>,
+    feather: f32,
+}
+
+impl Blender {
+    /// `feather` is the ramp width in OUTPUT pixels — normally
+    /// `overlap * scale`. Zero means a hard crop, which reproduces the old
+    /// behaviour and is useful for showing the difference.
+    pub fn new(w: u32, h: u32, feather: u32) -> Self {
+        let (w, h) = (w as usize, h as usize);
+        Blender { w, h, acc: vec![0.0; w * h * 3], wsum: vec![0.0; w * h], feather: feather as f32 }
+    }
+
+    /// Weight for a pixel `d` output-pixels from the nearest tile edge.
+    ///
+    /// Never returns 0: a pixel covered by exactly one tile must still be
+    /// reproducible, and a zero weight there would divide by zero and leave a
+    /// black hole — which is the very artefact this exists to remove.
+    fn ramp(&self, d: f32, half_extent: f32) -> f32 {
+        if self.feather <= 0.0 { return 1.0; }
+        // Capped by the tile's own half-extent. Without this a tile shorter
+        // than 2*feather never reaches full weight anywhere, so its whole
+        // contribution is scaled down — harmless where another tile covers the
+        // same pixels (the weights still normalise) but wrong at a frame edge,
+        // where the only tile present would be uniformly under-weighted
+        // against nothing.
+        let f = self.feather.min(half_extent.max(1.0));
+        (d / f).clamp(0.0, 1.0).max(1e-3)
+    }
+
+    /// Add one tile's RGBA output. `ox, oy` is where the tile's cropped region
+    /// lands in the output; `ow, oh` are its dimensions.
+    pub fn add(&mut self, ox: u32, oy: u32, ow: u32, oh: u32, rgba: &[u8], stride_px: u32) {
+        for y in 0..oh as usize {
+            let dy = y.min(oh as usize - 1 - y) as f32;
+            for x in 0..ow as usize {
+                let dx = x.min(ow as usize - 1 - x) as f32;
+                let wgt = self.ramp(dx, ow as f32 * 0.5).min(self.ramp(dy, oh as f32 * 0.5));
+                let (gx, gy) = (ox as usize + x, oy as usize + y);
+                if gx >= self.w || gy >= self.h { continue; }
+                let si = (y * stride_px as usize + x) * 4;
+                let di = (gy * self.w + gx) * 3;
+                for c in 0..3 {
+                    self.acc[di + c] += rgba[si + c] as f32 * wgt;
+                }
+                self.wsum[gy * self.w + gx] += wgt;
+            }
+        }
+    }
+
+    /// Normalise into an RGB frame.
+    pub fn finish(self) -> Frame {
+        let mut f = Frame::new(self.w as u32, self.h as u32);
+        for i in 0..self.w * self.h {
+            let s = self.wsum[i];
+            // An uncovered pixel means the tiler did not span the frame — a
+            // bug, but leaving it black would look exactly like the seam this
+            // replaces, so it is left at zero AND countable by the caller.
+            let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
+            for c in 0..3 {
+                // ROUND, not truncate. `as u8` truncates, and the weighted sum
+                // of an exact value lands a hair below it in f32 — a flat 200
+                // came back as 199 on 852 pixels of a 96x48 test frame. That
+                // is a uniform darkening across every blended region, which is
+                // a subtler version of the artefact this code is fixing.
+                f.data[i * 3 + c] = (self.acc[i * 3 + c] * inv).clamp(0.0, 255.0).round() as u8;
+            }
+        }
+        f
+    }
+
+    /// Pixels no tile covered. Should be zero; non-zero means the tiler and
+    /// the frame disagree, which is worth failing a test over.
+    pub fn uncovered(&self) -> usize {
+        self.wsum.iter().filter(|s| **s <= 0.0).count()
+    }
+}
+
+#[cfg(test)]
+mod blend_tests {
+    use super::*;
+
+    #[test]
+    fn overlapped_tiles_cover_the_frame_without_gaps() {
+        for (w, h, t, ov) in [(100u32, 60u32, 32u32, 8u32), (64, 64, 64, 8), (7, 5, 4, 2)] {
+            let mut b = Blender::new(w, h, ov);
+            for r in tiles_overlapped(w, h, t, ov) {
+                let px = vec![255u8; (r.w * r.h * 4) as usize];
+                b.add(r.x, r.y, r.w, r.h, &px, r.w);
+            }
+            assert_eq!(b.uncovered(), 0, "gap at {w}x{h} tile {t} overlap {ov}");
+        }
+    }
+
+    #[test]
+    fn a_flat_image_survives_blending_exactly() {
+        // The strongest correctness check: if every tile agrees, the weights
+        // must cancel and give the input back. Any normalisation error shows
+        // up here as a band.
+        let (w, h) = (96u32, 48u32);
+        let mut b = Blender::new(w, h, 8);
+        for r in tiles_overlapped(w, h, 32, 8) {
+            let px = vec![200u8; (r.w * r.h * 4) as usize];
+            b.add(r.x, r.y, r.w, r.h, &px, r.w);
+        }
+        let f = b.finish();
+        let bad = f.data.iter().filter(|v| **v != 200).count();
+        assert_eq!(bad, 0, "{bad} pixels drifted from a flat input");
+    }
+
+    #[test]
+    fn the_ramp_never_reaches_zero() {
+        // A pixel covered by exactly one tile must still be reproducible. A
+        // zero weight there divides by zero and leaves a black hole — the
+        // artefact this whole mechanism exists to remove.
+        let b = Blender::new(4, 4, 8);
+        assert!(b.ramp(0.0, 8.0) > 0.0);
+    }
+
+    #[test]
+    fn zero_feather_reproduces_the_hard_crop() {
+        let b = Blender::new(4, 4, 0);
+        assert_eq!(b.ramp(0.0, 8.0), 1.0);
+        assert_eq!(b.ramp(99.0, 8.0), 1.0);
+    }
+
+    #[test]
+    fn an_overlap_at_or_above_the_tile_size_does_not_hang() {
+        // step = tile - overlap; overlap >= tile is a caller bug that would
+        // otherwise loop forever.
+        let v = tiles_overlapped(50, 20, 8, 100);
+        assert!(!v.is_empty() && v.len() < 10_000);
+    }
+
+    #[test]
+    fn blending_is_smoother_across_a_seam_than_a_hard_crop() {
+        // The property the feature exists for. Two tiles that disagree: a hard
+        // crop puts the full jump at one pixel; the ramp spreads it.
+        let (w, h) = (64u32, 8u32);
+        let mut hard = Blender::new(w, h, 0);
+        let mut soft = Blender::new(w, h, 16);
+        for (i, r) in tiles_overlapped(w, h, 40, 16).into_iter().enumerate() {
+            let v = if i % 2 == 0 { 60u8 } else { 200u8 };
+            let px = vec![v; (r.w * r.h * 4) as usize];
+            hard.add(r.x, r.y, r.w, r.h, &px, r.w);
+            soft.add(r.x, r.y, r.w, r.h, &px, r.w);
+        }
+        // Sampled at the VERTICAL MIDDLE. Row 0 is every tile's own top edge,
+        // where the vertical ramp is at its minimum for both tiles equally —
+        // the weights still normalise correctly there, but the row shows the
+        // hard-crop average and so cannot distinguish the two. Picking row 0
+        // first is what made this test fail against correct code.
+        let mid = (h / 2) as usize;
+        let jump = |f: &Frame| -> i32 {
+            (0..w as usize - 1)
+                .map(|x| {
+                    let i = |xx: usize| (mid * w as usize + xx) * 3;
+                    (f.data[i(x + 1)] as i32 - f.data[i(x)] as i32).abs()
+                })
+                .max().unwrap_or(0)
+        };
+        let (jh, js) = (jump(&hard.finish()), jump(&soft.finish()));
+        assert!(js < jh, "feathered jump {js} should be below the hard-crop jump {jh}");
+    }
+}
+
+#[cfg(test)]
+mod blend_magnitude {
+    use super::*;
+
+    /// How much better, not merely "better".
+    ///
+    /// `blending_is_smoother_across_a_seam_than_a_hard_crop` only asserts an
+    /// inequality, which a one-count improvement would satisfy while the seam
+    /// stayed obvious. This pins the ORDER of the improvement, because that is
+    /// what decides whether the feature is worth its cost.
+    #[test]
+    fn a_wide_feather_cuts_the_seam_step_by_an_order_of_magnitude() {
+        let (w, h) = (128u32, 64u32);
+        let build = |feather: u32| {
+            let mut b = Blender::new(w, h, feather);
+            for (i, r) in tiles_overlapped(w, h, 80, 32).into_iter().enumerate() {
+                let v = if i % 2 == 0 { 40u8 } else { 220u8 };
+                b.add(r.x, r.y, r.w, r.h, &vec![v; (r.w * r.h * 4) as usize], r.w);
+            }
+            b.finish()
+        };
+        let mid = (h / 2) as usize;
+        let step = |f: &Frame| (0..w as usize - 1)
+            .map(|x| {
+                let i = |xx: usize| (mid * w as usize + xx) * 3;
+                (f.data[i(x + 1)] as i32 - f.data[i(x)] as i32).abs()
+            })
+            .max().unwrap_or(0);
+        let (hard, soft) = (step(&build(0)), step(&build(32)));
+        assert!(hard > 50, "the fixture must actually contain a seam, got {hard}");
+        assert!(soft * 8 < hard,
+            "feathering cut the step only from {hard} to {soft} — not enough to be worth the overlap");
+    }
+}
