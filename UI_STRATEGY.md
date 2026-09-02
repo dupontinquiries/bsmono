@@ -39,6 +39,65 @@ interaction model. Collapsing each into a kit (rather than leaving per-app copie
 maintain the reference implementation, and a clean home to pull from when an egui surface needs to reach
 parity with something the mature front-end already does well.
 
+## New egui app: good defaults for "avoid boilerplate, but I'll want nice-to-haves later"
+
+Written after a pass on bo-suite-egui that kept finding the same two failure shapes across a real app —
+recorded here so the next app doesn't repeat them.
+
+- **Depend on `uikit-egui` from the first commit, even for a "quick" app.** It's already in the tree;
+  pulling it in costs a `Cargo.toml` line and buys palette/theme, toast, dialogs, adaptive layout, a11y
+  focus, and gesture handling for free. The apps that skipped it and built their own toast/dialog/palette
+  are the ones that later needed a rewrite to look consistent with the fleet.
+- **But don't invent a widget for a generic need — check `shared/uikit/crates/uikit-egui` first.** This
+  pass found `fuzzy.rs` (subsequence scoring, built for voiceterm's command palette) and `path_picker.rs`
+  (a lister-agnostic directory walker, generalized from gitmind's SSH deploy browser) already solved
+  problems that three different apps had each solved again on their own — one bespoke picker per app
+  instead of one picker three apps use. Search the kit before writing a file/fuzzy/dialog/picker widget;
+  if it's there, use it; if it's *almost* there, extend it in place (small, tested, additive) rather than
+  forking it, so every consumer gets the improvement.
+- **The recurring bug worth naming: a fully-tested dialog struct with nobody drawing it.** Three separate
+  dialogs in one app (`AddToPlaylist`, `EditTrack`, `ScanPicker`) each had a complete, unit-tested
+  lifecycle — `open`/`close`/validation/`payload` — a real call site that called `.open(...)`, and *no
+  rendering function anywhere in the crate*. All the tests passed. Nothing on screen ever appeared. The
+  tests exercised the model in isolation and never caught that the model had no view. Two things prevent
+  this: (1) treat "state machine" and "renders it" as one unit of work — don't merge a dialog's model
+  without its `_ui` function in the same change, even a minimal one; (2) run `tools/peek` before calling a
+  feature done — it exists specifically to flag possibly-unwired modules, over-reports (treat hits as
+  candidates), but a `.open()` call with no matching `_ui(...)` call site is exactly its blind spot turned
+  into a real bug, and worth a manual grep (`is_open()` / `\.open(` without a sibling `_ui(` in the same
+  file) when peek can't see it either.
+- **A headless-egui frame test is cheap insurance against exactly that.** `egui::Context::default()` +
+  two `ctx.run(...)` passes (a floating `Window` auto-sizes from the previous frame, so the first pass
+  paints nothing — this is a test-harness detail, not something the shipped app inherits) + scraping
+  `out.shapes` for `Shape::Text` is enough to assert a dialog actually draws its expected labels when
+  open and nothing when closed. It would have caught all three dialogs above on the first commit that
+  claimed to "add" them. Cheap enough to write for every new modal.
+- **The `pending_X` request-slot pattern is the default shape for a Controller ↔ host boundary**, seen
+  working repeatedly this pass (`pending_rescan`, `pending_cast`, `pending_playlist_create`,
+  `pending_track_edit_save`, `pending_scan_with_roots`, `pending_remote_queue_push`): pure, synchronous,
+  unit-testable `Controller` code sets an `Option<T>`/`bool` field describing what it wants; an impure
+  host (`main.rs`/the `eframe::App`) drains it once per frame and does the actual I/O; a `confirm_*`/
+  `*_result` method on `Controller` reconciles the answer back in. No `async`/`await` anywhere in the UI
+  layer, and the business logic is testable with zero mocking — every test in this pass that touched
+  request/response state did it by constructing a `Controller` and asserting on the plain field, not by
+  spinning up a runtime.
+- **Anything that touches disk or network gets its own thread + channel, never runs on the UI thread.**
+  A scan, a cast attempt, a database write that might contend with another writer — spawn a
+  `std::thread` owning an `mpsc::Sender`/`Receiver` pair, poll it non-blocking (`try_recv`) each frame.
+  This is the same shape bo-media's own worker uses internally; reusing it at the app level instead of
+  blocking `update()` is what keeps the frame rate honest under a slow operation.
+- **A local SQLite (or similar) database read doesn't need to go through that worker if it's WAL-mode.**
+  A second connection opened directly for reads is fast and safe *precisely because* WAL exists for this
+  — only serialize the writes that need real ordering (a scan vs. a rating vs. a playlist edit can race
+  harmlessly with a `busy_timeout`; a scan racing itself cannot). Don't reflexively route every read
+  through the write-owning worker "to be safe" — that's the assumption that produced this app's original
+  filename-guessing catalog instead of just opening a second connection to the real one.
+- **Feature-gate the slow-to-compile optional dependency, not the whole capability.** bo-media's BPM/key
+  analysis (`bliss-audio`, which pulls ffmpeg/symphonia) sits behind an `analysis` cargo feature so a base
+  build stays fast and the app still works — those columns just stay null — without it. When a
+  nice-to-have needs a heavy crate, this is cheaper than making the feature itself optional at the API
+  level.
+
 ## Migration steps (per app, on a Qt/GTK-capable build host)
 
 1. **egui is default.** Ensure the app's default/primary build path is the egui front-end. (Config only —
