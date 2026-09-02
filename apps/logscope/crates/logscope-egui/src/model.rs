@@ -159,7 +159,9 @@ pub fn folder_popup(ui: &mut egui::Ui, models_dir: &mut String, native: &mut boo
     // CloseOnClickOutside so the text field / checkbox / buttons INSIDE work without dismissing the popup
     // (menu_button closed on every click — that was the "can't interact" bug).
     egui::popup_below_widget(ui, pid, &btn, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
-        ui.set_min_width(340.0);
+        // A 340pt FLOOR overflows a 360pt phone once margins are counted.
+        ui.set_min_width(uikit_egui::dialog::dialog_width(
+            ui.ctx().content_rect().width(), 340.0));
         ui.label(RichText::new("models folder").color(theme::DIM()).small());
         ui.add(egui::TextEdit::singleline(models_dir).id_salt("model-models_dir")
             .font(egui::TextStyle::Monospace).desired_width(320.0)

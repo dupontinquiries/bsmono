@@ -119,7 +119,9 @@ fn edit_review_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColo
                 .corner_radius(CornerRadius::same(8))
                 .inner_margin(10.0)
                 .show(ui, |ui| {
-                    ui.set_width(520.0);
+                    // Clamped: 520 is wider than a phone. See the palette below.
+                    ui.set_width(uikit_egui::dialog::dialog_width(
+                        ui.ctx().content_rect().width(), 520.0));
                     ui.label(egui::RichText::new(format!("AI edit: {}", pending.instruction)).color(colors.text_weak).small());
                     ui.add_space(4.0);
                     match &pending.proposed {
@@ -984,7 +986,14 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                 .corner_radius(CornerRadius::same(8))
                 .inner_margin(10.0)
                 .show(ui, |ui| {
-                    ui.set_width(460.0);
+                    // `set_width(460.0)` was a HARD width, wider than a phone
+                    // screen, so the palette ran off both edges — the same bug
+                    // tomescope's palette had. `dialog_width` asks for 460 and
+                    // takes what the surface can actually give, measured from
+                    // content_rect (the usable area, excluding what sits under
+                    // the system bars) rather than screen_rect.
+                    ui.set_width(uikit_egui::dialog::dialog_width(
+                        ctx.content_rect().width(), 460.0));
                     let hint = match p.mode {
                         Mode::Commands => "command, theme, or :line…",
                         Mode::OpenFile => "path to open…",

@@ -108,7 +108,9 @@ impl Wizard {
             })
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                ui.set_width(516.0);
+                // 516 is wider than a phone screen; take what the surface has.
+                ui.set_width(uikit_egui::dialog::dialog_width(
+                    ui.ctx().content_rect().width(), 516.0));
                 // brand + step dots
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("LOGSCOPE").color(theme::AMBER()).strong().size(13.0));
