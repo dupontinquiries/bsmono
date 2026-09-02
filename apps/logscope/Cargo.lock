@@ -4289,6 +4289,7 @@ version = "0.1.0"
 dependencies = [
  "egui",
  "font8x8",
+ "math-kit",
  "noise-kit",
 ]
 
@@ -5025,6 +5026,7 @@ name = "uikit-egui"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "math-kit",
  "settings-kit",
  "snapclone-theme",
  "touchkit",

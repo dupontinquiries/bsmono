@@ -11,6 +11,8 @@ default = ["glow"]
 glow = ["dep:eframe"]
 
 [dependencies]
+# Dependency-free maths; `mesh3d::sun_clock_at` delegates to its `daylight`.
+math-kit = { path = "../math-kit" }
 egui = "0.34"
 noise-kit = { path = "../noise-kit" }
 font8x8 = "0.3"

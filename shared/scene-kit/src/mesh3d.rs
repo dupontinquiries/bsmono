@@ -774,19 +774,17 @@ pub fn sun_clock() -> (f32, f32, f32) {
 }
 
 /// The same day-cycle lighting, at a caller-chosen hour.
+///
+/// DELEGATES to `math_kit::daylight`, which is where this curve now lives.
+/// It was defined here AND in `uikit_egui::lux` AND in logscope-egui's own
+/// mesh3d — three copies of nine lines of trigonometry. That is not a
+/// tidiness point: the panels were taught to track the clock precisely so the
+/// room behind the glass and the glass itself would not disagree about the
+/// time of day, and a second copy re-creates the disagreement the change was
+/// made to remove. math-kit has no dependencies, so this crate can take it
+/// without pulling in a UI kit.
 pub fn sun_clock_at(h: f32) -> (f32, f32, f32) {
-    // Wrapped, not clamped: hour 25 is 1am, and an animator stepping past
-    // midnight should roll over rather than stick at dusk.
-    let h = h.rem_euclid(24.0);
-    // elevation 0..1 over the day; smooth, with civil-twilight tails
-    let elev = (std::f32::consts::PI * ((h - 6.0) / 12.0)).sin();
-    let day = elev.max(0.0);                       // 0 at/under horizon, 1 at noon
-    let strength = (0.12 + 0.88 * day).clamp(0.10, 1.0);
-    // warmth: hottest when the sun is low but up (dawn/dusk), neutral high noon, cool at night
-    let low_sun = (1.0 - (elev.abs())).clamp(0.0, 1.0); // 1 near the horizon
-    let warmth = if elev > 0.04 { low_sun * 0.85 } else { -0.55 * (1.0 - day) }; // warm by day-edge, cool by night
-    let ambient = 0.56 + 0.62 * day;               // dim fill at night, more at midday
-    (strength, warmth, ambient)
+    math_kit::daylight::sun_clock_at(h)
 }
 
 /// Build a lit 3D scene for the conversation graph: a shaded orb per node (coloured by `node_cols`, the

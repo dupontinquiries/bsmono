@@ -19,6 +19,9 @@ license = "MIT OR Apache-2.0"
 # layer for apps/logscope (see examples/logscope_touch.rs).
 
 [dependencies]
+# Dependency-free maths. `lux::sky_at` delegates to `math_kit::daylight` so the
+# panels, scene-kit and logscope all read ONE sun curve — see that module.
+math-kit = { path = "../../../math-kit" }
 touchkit = { path = "../../../touchkit", features = ["egui"] }
 # `glow` alone leaves winit with NO Linux backend compiled, so the `demo`
 # feature failed to build anywhere on Linux with "The platform you're compiling

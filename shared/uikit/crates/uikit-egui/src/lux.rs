@@ -227,35 +227,16 @@ mod integration_notes {
 // caller can drive it from a scrubber (a demo, a screenshot set, "show me this
 // panel at 3am") instead of only from `now`.
 
-/// The light at a moment.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Sky {
-    /// Sun brightness, 0.1 (night) to 1.0 (noon).
-    pub strength: f32,
-    /// -1 cool to +1 warm. Peaks near sunrise and sunset, neutral at noon,
-    /// negative at night — the golden-hour curve, which is NOT the same as
-    /// "warm during the day".
-    pub warmth: f32,
-    /// Ambient fill multiplier.
-    pub ambient: f32,
-}
-
-/// The sky at local hour `h` (0..24, fractional).
+/// The light at a moment — re-exported from `math_kit::daylight`.
 ///
-/// Matches `mesh3d::sun_clock`'s curve exactly so the panels and the scene
-/// cannot drift apart; that function should delegate here rather than keep a
-/// second copy.
-pub fn sky_at(h: f32) -> Sky {
-    let h = h.rem_euclid(24.0);
-    let elev = (std::f32::consts::PI * ((h - 6.0) / 12.0)).sin();
-    let day = elev.max(0.0);
-    let low_sun = (1.0 - elev.abs()).clamp(0.0, 1.0);
-    Sky {
-        strength: (0.12 + 0.88 * day).clamp(0.10, 1.0),
-        warmth: if elev > 0.04 { low_sun * 0.85 } else { -0.55 * (1.0 - day) },
-        ambient: 0.56 + 0.62 * day,
-    }
-}
+/// The curve USED to be defined here. It moved because three places needed it
+/// and no two could reasonably depend on each other: this crate grades palette
+/// colours by time of day, `scene_kit::mesh3d` lights the 3D scene, and
+/// `logscope_egui::mesh3d` drives that scene. Three copies re-created exactly
+/// the disagreement that teaching the panels to track the clock was meant to
+/// remove — the room behind the glass and the glass itself drifting apart.
+/// math-kit has no dependencies, so both sides can take it.
+pub use math_kit::daylight::{sky_at, Sky};
 
 /// Grade one RGB colour by the sky.
 ///

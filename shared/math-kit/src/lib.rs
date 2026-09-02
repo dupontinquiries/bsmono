@@ -32,6 +32,7 @@
 //!   standard offset-basis/prime pair those copies already use.
 
 pub mod aabb;
+pub mod daylight;
 pub mod geom;
 pub mod hash;
 pub mod mat;
