@@ -292,6 +292,18 @@ pub struct SlideMenu {
     pub deadband_px: Option<f32>,
     /// Full-width header band above the grid (the per-tab menu shows the tab name here).
     pub title: Option<String>,
+    /// Whether [`SlideMenu::show_cardinal`] draws its floating compass.
+    ///
+    /// `true` (the default) suits a host with nothing of its own to morph —
+    /// voiceterm's action compass floats over a terminal grid, where there is
+    /// no affordance to substitute into and the popup IS the affordance.
+    ///
+    /// `false` when the host renders the gesture itself via
+    /// [`peek_cardinal`] + [`paint_cardinal_morph`]. The gesture still resolves
+    /// identically; only the chrome is suppressed. Drawing both is strictly
+    /// worse than either: the popup then occludes the very cap that is
+    /// animating underneath it.
+    pub cardinal_compass: bool,
     state: SlideState,
     id: Id,
 }
@@ -307,6 +319,7 @@ impl SlideMenu {
             deadzone: 18.0,
             deadband_px: None,
             title: None,
+            cardinal_compass: true,
             state: SlideState::default(),
             id: Id::new(id_source),
         }
@@ -680,6 +693,123 @@ pub fn swipe_dir8(delta: Vec2, deadzone: f32) -> Option<Dir8> {
     })
 }
 
+/// How far past the deadzone a reach must go before the direction is drawn as
+/// fully committed. A multiple of the deadzone rather than an absolute, so it
+/// scales with the key the way the deadzone already does.
+pub const CARDINAL_COMMIT_FACTOR: f32 = 2.2;
+
+/// What a cardinal press looks like RIGHT NOW, for something else to draw.
+///
+/// No egui and no painting: this is the arithmetic a popup compass and an
+/// in-key morph both need, and having it in one pure place is what lets a
+/// keyboard render the gesture on the keycap while a terminal renders the same
+/// gesture as a floating compass.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct CardinalPreview {
+    /// The direction the reach currently points at, or `None` while it is still
+    /// inside the deadzone (i.e. still a tap).
+    pub active: Option<Dir8>,
+    /// 0 at the deadzone edge, 1 once the reach is unambiguously committed.
+    /// Clamped, so a renderer can use it directly as an interpolation factor.
+    pub progress: f32,
+}
+
+/// Reduce a reach from the press origin to what a renderer needs.
+///
+/// Pure, so the "how committed does this look" rule is testable without a
+/// pointer — the same reason [`swipe_dir8`] and [`farther`] are pure.
+pub fn cardinal_preview(reach: Vec2, deadzone: f32, commit_factor: f32) -> CardinalPreview {
+    let active = swipe_dir8(reach, deadzone);
+    let span = (deadzone * commit_factor - deadzone).max(1.0);
+    let progress = ((reach.length() - deadzone) / span).clamp(0.0, 1.0);
+    // No separate "and zero it out when there is no direction" guard: inside the
+    // deadzone the numerator is negative and the clamp already floors it at 0,
+    // and `swipe_dir8` returns `Some` on exactly the same condition. A guard was
+    // written here first and removed — breaking it changed nothing, in any test,
+    // because the clamp was doing the work (CLAUDE.md 5b).
+    CardinalPreview { active, progress }
+}
+
+/// Read the live preview for an in-flight cardinal press without disturbing it.
+///
+/// Exists because of paint/dispatch ordering: a host paints its affordance
+/// BEFORE it resolves the gesture (rusty-board's `paint_key_face` then
+/// `dispatch_key`), so the painter needs to see the press state that the
+/// dispatcher will later advance. Peeking rather than driving keeps one owner
+/// of the state — [`SlideMenu::show_cardinal`] still advances it — and costs
+/// one frame of lag at the very start of a press, which is below the threshold
+/// of noticing.
+///
+/// `None` when no press is open on `id`.
+pub fn peek_cardinal(ctx: &egui::Context, id: Id, deadzone: f32) -> Option<CardinalPreview> {
+    let st = ctx.data_mut(|d| d.get_temp::<SlideState>(id))?;
+    if !st.open {
+        return None;
+    }
+    let pointer = ctx.pointer_latest_pos()?;
+    Some(cardinal_preview(pointer - st.origin, deadzone, CARDINAL_COMMIT_FACTOR))
+}
+
+/// Draw a cardinal press AS A SUBSTITUTION ON THE HOST ITSELF: the resting
+/// glyph slides out against the swipe and fades, while the glyph the gesture
+/// is activating slides in from that direction and takes its place.
+///
+/// The alternative this replaces is a floating compass drawn over the press
+/// point, which has two problems on a keyboard. It occludes — nine cells appear
+/// on top of the neighbouring keys at the moment you most want to see them. And
+/// its centre cell, the tap glyph, is drawn exactly under the finger that is
+/// hiding it, so the one option rendered in the most prominent position is the
+/// only one you cannot see.
+///
+/// A keycap that already prints its eight directions around the edge (which
+/// rusty-board's does) has no need to be told what the options are a second
+/// time; what it needs to say is *which one is armed right now*, and the
+/// clearest place to say that is the cap itself. So this paints no chrome at
+/// all: it moves two glyphs.
+///
+/// `progress` drives both halves, so the swap is continuous rather than a
+/// switch — the reader can see how far in they are, and back out.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_cardinal_morph(
+    painter: &egui::Painter,
+    rect: Rect,
+    resting: &str,
+    incoming: &str,
+    dir: Dir8,
+    progress: f32,
+    font: FontId,
+    color: Color32,
+) {
+    let p = progress.clamp(0.0, 1.0);
+    let off = dir.offset();
+    // Far enough that the outgoing glyph has cleared the cap by p = 1, and the
+    // incoming one started from off-cap rather than appearing mid-air.
+    let travel = rect.height() * 0.46;
+    let center = rect.center();
+
+    // Fade the outgoing glyph faster than it travels: two glyphs at similar
+    // weight in the same small cap read as a smear rather than a swap.
+    let out_alpha = (1.0 - p * 1.4).clamp(0.0, 1.0);
+    if out_alpha > 0.01 {
+        painter.text(
+            center - off * travel * p,
+            Align2::CENTER_CENTER,
+            resting,
+            font.clone(),
+            color.gamma_multiply(out_alpha),
+        );
+    }
+    if p > 0.0 {
+        painter.text(
+            center + off * travel * (1.0 - p),
+            Align2::CENTER_CENTER,
+            incoming,
+            font,
+            color.gamma_multiply(p.clamp(0.15, 1.0)),
+        );
+    }
+}
+
 impl SlideMenu {
     /// A cardinal-swipe key popup: press shows `tap` at the center with each `dirs` variant floated in
     /// its compass direction; the live swipe from center highlights a direction; release commits the
@@ -722,6 +852,7 @@ impl SlideMenu {
         let appear = crate::motion::animate_eased(ui.ctx(), id.with("appear"), st.open, 0.14, crate::motion::ease::out_back);
         let item = self.item_size;
 
+        if self.cardinal_compass {
         egui::Area::new(id.with("area")).order(Order::Foreground).fixed_pos(Pos2::ZERO).show(ui.ctx(), |ui| {
             let vis = ui.visuals().clone();
             let ctx = ui.ctx().clone();
@@ -743,6 +874,7 @@ impl SlideMenu {
                 cell(c, &opt.label, hot == Some(*d), idx + 1);
             }
         });
+        }
         ui.ctx().request_repaint();
 
         if ui.input(|i| i.pointer.any_released()) {
@@ -783,6 +915,52 @@ pub fn farther(peak: Vec2, delta: Vec2) -> Vec2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cardinal_preview_is_inert_inside_the_deadzone() {
+        // A tap must not animate anything. Asserting only `active.is_none()`
+        // would pass on a progress that ramps while the finger sits still, so
+        // both halves are checked.
+        for reach in [Vec2::ZERO, Vec2::new(5.0, 0.0), Vec2::new(0.0, -17.9)] {
+            let p = cardinal_preview(reach, 18.0, CARDINAL_COMMIT_FACTOR);
+            assert_eq!(p.active, None, "{reach:?} is inside the deadzone");
+            assert_eq!(p.progress, 0.0, "{reach:?} must not arm the morph");
+        }
+    }
+
+    #[test]
+    fn cardinal_preview_ramps_from_the_deadzone_edge_to_commit() {
+        let (dz, k) = (20.0_f32, 2.0_f32); // commit at 40px, so the span is 20px
+        // Just past the edge: armed, but barely moved.
+        let near = cardinal_preview(Vec2::new(21.0, 0.0), dz, k);
+        assert_eq!(near.active, Some(Dir8::E));
+        assert!(near.progress > 0.0 && near.progress < 0.1, "got {}", near.progress);
+        // Halfway across the span.
+        let mid = cardinal_preview(Vec2::new(30.0, 0.0), dz, k);
+        assert!((mid.progress - 0.5).abs() < 0.01, "got {}", mid.progress);
+        // At and beyond commit it saturates rather than running past 1, which a
+        // renderer would turn into a glyph flying off the far side of the cap.
+        for x in [40.0, 60.0, 400.0] {
+            let far = cardinal_preview(Vec2::new(x, 0.0), dz, k);
+            assert_eq!(far.progress, 1.0, "reach {x} should saturate");
+        }
+    }
+
+    #[test]
+    fn cardinal_preview_direction_agrees_with_the_committing_one() {
+        // The morph shows one glyph and the release commits another if these
+        // two ever disagree — so the preview must read direction through the
+        // same function the commit does, not a second copy of the rule.
+        for (reach, want) in [
+            (Vec2::new(40.0, 0.0), Dir8::E),
+            (Vec2::new(0.0, -40.0), Dir8::N),
+            (Vec2::new(-30.0, 30.0), Dir8::SW),
+            (Vec2::new(30.0, -30.0), Dir8::NE),
+        ] {
+            assert_eq!(cardinal_preview(reach, 18.0, 2.2).active, Some(want));
+            assert_eq!(swipe_dir8(reach, 18.0), Some(want));
+        }
+    }
 
     #[test]
     fn grid_dims_caps_columns_and_wraps_rows() {
