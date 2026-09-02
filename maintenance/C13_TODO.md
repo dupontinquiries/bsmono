@@ -2171,3 +2171,41 @@ entirely is its own smell. Nothing currently needs it — the refusal is
 enforced upstream — but a caller that receives a list of security anomalies
 and only prints them will eventually be given one that matters. Consider
 making the return type harder to ignore.
+
+
+## 65. Mobile input: the machinery is right, the ADOPTION is the gap
+
+Three field reports, and they are not three bugs.
+
+**1. Palette does not fit (aperture).** Fixed, plus a sweep — hard widths of
+460/520/516/340 clamped to `dialog::dialog_width`. Two Window-based sites
+remain (av1tuner `default_width(400)`, studio `default_width(460)`); they need
+`ctx` at the call site, which is a slightly larger edit.
+
+**2. Input fields do not override swipe page gestures.** The mechanism EXISTS
+and is correct: `gesture_layer::drag_owner` returns `Owner::Widget` when a
+TextEdit is selecting, a slider is dragging, or the focused widget's rect
+contains the press origin, and both `GestureLayer` and `touch.rs`'s
+recognizer suppress on it. It arrived with the snapclone merge (9e1b62bc7).
+
+**The gap is that almost nothing uses it.** `pager::` has exactly ONE consumer
+in the whole tree — `apps/snapclone/egui-frontend`. Every other app that
+swipes pages does it by hand and therefore does not get the widget-ownership
+check. That is the fix: migrate the hand-rolled swipes onto `pager`/
+`GestureLayer`, or at minimum have them call `drag_owner` before treating a
+drag as a page change. Do NOT re-implement the check per app — that is how
+this diverged in the first place.
+
+**3. One character on the Fairphone, STILL.** My widget-id work (68 + 89 call
+sites, plus `text_field` in the kit) did not fix it, so the id hypothesis was
+wrong or incomplete. Given (2), the leading candidate is now that the
+page-swipe recogniser is consuming the touch that would give the field focus —
+which would make (2) and (3) the same bug, and would explain why it is
+Fairphone-specific (a touch device) and why stable ids changed nothing.
+
+Test for it cheaply before building anything: on the device, open a field
+inside a NON-swipeable view (a modal, or an app with no pager) and type. If
+that works and the same field inside a paged view does not, the gesture layer
+is the cause and (2) fixes both. If both fail, the id hypothesis was wrong for
+a different reason and the next suspect is the on-screen keyboard's input
+method, not egui ids.
