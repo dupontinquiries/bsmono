@@ -2274,3 +2274,21 @@ cost; under (2) it may be mostly lock contention, which is a different fix.
 
 Cheapest experiment: record the counters per thread id and print the count of
 distinct contributing threads alongside the totals. One number decides it.
+
+
+## 69. The 134% question is now self-answering — read the next log
+
+`timing_thread_count()` ships in the profile line. The next 8B run on the
+Asahi box prints which of the two cases holds, and they need different work:
+
+- **"OVER 100% because N THREADS…"** → nothing is broken except the
+  presentation. Stop treating the buckets as a partition; §67 item 1 is then
+  a real finding and setup at 32% is worth attacking.
+- **"OVER 100% on a SINGLE THREAD…"** → double counting. `setup` is inflated
+  by time blocked on `bg_cache.lock()`, and the first move is to split the
+  lock wait out of the setup span, not to optimise bind-group construction.
+  The bind-group cache reports 30% hits on that run, so a contended lock
+  around a mostly-missing cache is entirely plausible.
+
+Do not work §67 item 1 until this line has been read once. Guessing wrong
+means optimising bind-group construction to fix a mutex, or the reverse.
