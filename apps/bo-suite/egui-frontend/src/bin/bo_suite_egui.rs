@@ -250,6 +250,18 @@ impl App {
                 None => self.last_note = format!("could not create playlist '{name}'"),
             }
         }
+        if let Some(id) = self.controller.pending_playlist_open.take() {
+            let tracks = self.catalog.playlist_tracks(id);
+            self.controller.browse_tracks = tracks;
+            sync_track_paths(&mut self.controller, &self.catalog);
+        }
+        if let Some(id) = self.controller.pending_playlist_delete.take() {
+            if self.catalog.delete_playlist(id) {
+                self.controller.playlists_page.set(self.catalog.playlists());
+            } else {
+                self.last_note = "could not delete playlist".into();
+            }
+        }
         if let Some(id) = self.controller.last_played_track.take() {
             // Persisted through the worker (play count + history), not
             // written on this connection — see real_catalog.rs.

@@ -392,6 +392,16 @@ pub struct Controller {
     pub now_playing_id: Option<i64>,
     /// The tag whose tracks are being shown, if any.
     pub open_tag: Option<i64>,
+    /// The playlist currently drilled into, mirroring `open_tag`. Tracks
+    /// for it land in `browse_tracks` — the same field Albums/Artists
+    /// already use for a drilled-in row list — so play/queue on a
+    /// playlist row goes through the one tested `apply_browse` path
+    /// instead of a second copy of "how does tapping a track work".
+    pub open_playlist: Option<i64>,
+    /// A playlist the host hasn't loaded tracks for yet (set by `Open`).
+    pub pending_playlist_open: Option<i64>,
+    /// A playlist the host hasn't deleted yet (set by `Delete`).
+    pub pending_playlist_delete: Option<i64>,
     /// The device switcher above the output controls. The sink picker itself
     /// lives in settings_page as `SinkPicker` — see outputs.rs's note.
     pub device_selector: crate::outputs::DeviceSelector,
@@ -551,6 +561,9 @@ impl Controller {
             ratings: Default::default(),
             now_playing_id: None,
             open_tag: None,
+            open_playlist: None,
+            pending_playlist_open: None,
+            pending_playlist_delete: None,
             device_selector: Default::default(),
             pending_route: None,
             pending_playback: None,
@@ -1036,24 +1049,34 @@ impl Controller {
     /// these and re-publishes, which is the only way the list changes.
     pub fn apply_playlist(&mut self, a: crate::sources::PlaylistAction) {
         use crate::sources::PlaylistAction;
-        if let PlaylistAction::Create { name, description } = a {
-            let id = self.playlists_page.all().iter().map(|p| p.id).max().unwrap_or(0) + 1;
-            let mut all = self.playlists_page.all().to_vec();
-            all.push(crate::sources::PlaylistSummary {
-                id, name: name.clone(), description: description.clone(),
-                track_count: 0, updated_at: self.now_secs });
-            self.playlists_page.set(all);
-            // Bring it into view: a new row appearing off-screen looks like
-            // nothing happened.
-            self.playlists_page.focus(id);
-            // The optimistic row above has a LOCALLY-MADE id — it was never
-            // real, which is why this used to be the entire method: a
-            // playlist created here lived exactly as long as the process
-            // did. The host persists the real one and reloads the list
-            // (see pending_playlist_create's doc comment), which replaces
-            // this row with the true id rather than trying to patch it in
-            // place.
-            self.pending_playlist_create = Some((name, description));
+        match a {
+            PlaylistAction::Create { name, description } => {
+                let id = self.playlists_page.all().iter().map(|p| p.id).max().unwrap_or(0) + 1;
+                let mut all = self.playlists_page.all().to_vec();
+                all.push(crate::sources::PlaylistSummary {
+                    id, name: name.clone(), description: description.clone(),
+                    track_count: 0, updated_at: self.now_secs });
+                self.playlists_page.set(all);
+                // Bring it into view: a new row appearing off-screen looks like
+                // nothing happened.
+                self.playlists_page.focus(id);
+                // The optimistic row above has a LOCALLY-MADE id — it was never
+                // real, which is why this used to be the entire method: a
+                // playlist created here lived exactly as long as the process
+                // did. The host persists the real one and reloads the list
+                // (see pending_playlist_create's doc comment), which replaces
+                // this row with the true id rather than trying to patch it in
+                // place.
+                self.pending_playlist_create = Some((name, description));
+            }
+            PlaylistAction::Open(id) => {
+                self.open_playlist = Some(id);
+                self.pending_playlist_open = Some(id);
+            }
+            PlaylistAction::Delete(id) => {
+                self.pending_playlist_delete = Some(id);
+                if self.open_playlist == Some(id) { self.open_playlist = None; }
+            }
         }
     }
 
@@ -1443,10 +1466,53 @@ impl Controller {
             // apply_playlist has handled Create since it was written — with a
             // test. The only missing piece was a tab to reach it, so a whole
             // ported page had no route in.
-            if let Some(act) =
-                crate::sources::playlists_ui(ui, &mut self.playlists_page, self.now_secs, c)
-            {
-                self.apply_playlist(act);
+            match self.open_playlist {
+                Some(id) => {
+                    let name = self.playlists_page.all().iter().find(|p| p.id == id)
+                        .map(|p| p.name.clone()).unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        if ui.button("‹").clicked() { self.open_playlist = None; }
+                        ui.strong(name);
+                        if ui.small_button("delete").clicked() {
+                            self.apply_playlist(crate::sources::PlaylistAction::Delete(id));
+                        }
+                    });
+                    if !self.browse_tracks.is_empty() {
+                        if ui.button("▶ play all").clicked() {
+                            let ids: Vec<i64> = self.browse_tracks.iter().map(|t| t.id).collect();
+                            self.apply_browse(crate::browse::Action::PlayAll(ids));
+                        }
+                    }
+                    // The loaded tracks — same field and row shape Albums/
+                    // Artists detail views already use, so tapping a row
+                    // here goes through the one tested play/queue path
+                    // rather than a playlist-specific copy of it.
+                    egui::ScrollArea::vertical().id_salt("playlist-tracks").show(ui, |ui| {
+                        if self.browse_tracks.is_empty() {
+                            ui.colored_label(c.text_weak, "no tracks in this playlist yet");
+                        }
+                        for t in self.browse_tracks.clone() {
+                            ui.horizontal(|ui| {
+                                let label = if t.title.trim().is_empty() { "(untitled)" } else { &t.title };
+                                if ui.selectable_label(false, label).clicked() {
+                                    self.apply_browse(crate::browse::Action::Play(t.id));
+                                }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button("queue").clicked() {
+                                        self.apply_browse(crate::browse::Action::Queue(t.id));
+                                    }
+                                });
+                            });
+                        }
+                    });
+                }
+                None => {
+                    if let Some(act) =
+                        crate::sources::playlists_ui(ui, &mut self.playlists_page, self.now_secs, c)
+                    {
+                        self.apply_playlist(act);
+                    }
+                }
             }
             return;
         }
@@ -2954,6 +3020,32 @@ mod tests {
         assert!(active < quiet, "fully active flows faster ({active} < {quiet})");
         assert!(c.watermark.blur().is_none(), "egui cannot blur; the module degrades");
         assert!(c.watermark.opacity() > 0.0);
+    }
+
+    #[test]
+    fn opening_a_playlist_sets_open_and_asks_the_host_to_load_it() {
+        let mut c = Controller::new(vec![], vec![]);
+        c.apply_playlist(crate::sources::PlaylistAction::Open(7));
+        assert_eq!(c.open_playlist, Some(7));
+        assert_eq!(c.pending_playlist_open, Some(7));
+    }
+
+    #[test]
+    fn deleting_the_open_playlist_closes_the_detail_view() {
+        let mut c = Controller::new(vec![], vec![]);
+        c.open_playlist = Some(7);
+        c.apply_playlist(crate::sources::PlaylistAction::Delete(7));
+        assert_eq!(c.open_playlist, None, "the view you were looking at just got deleted");
+        assert_eq!(c.pending_playlist_delete, Some(7));
+    }
+
+    #[test]
+    fn deleting_a_playlist_that_is_not_open_leaves_the_view_alone() {
+        let mut c = Controller::new(vec![], vec![]);
+        c.open_playlist = Some(3);
+        c.apply_playlist(crate::sources::PlaylistAction::Delete(9));
+        assert_eq!(c.open_playlist, Some(3));
+        assert_eq!(c.pending_playlist_delete, Some(9));
     }
 }
 

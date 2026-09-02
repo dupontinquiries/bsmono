@@ -131,6 +131,26 @@ impl RealCatalog {
         bo_media::library::add_to_playlist(&self.conn, playlist_id, track_id).is_ok()
     }
 
+    /// The tracks in a playlist, in order — what a "playlist detail" view
+    /// needs. Mapped to `browse::BrowseTrack` rather than a new row type:
+    /// it's the type `Controller::browse_tracks` already holds, so the
+    /// playlist detail view reuses the same field and the same tested
+    /// `apply_browse`/`Action::Play`/`Queue`/`PlayAll` path Albums and
+    /// Artists detail views already go through, instead of a
+    /// playlist-specific copy of "how does tapping a track work".
+    pub fn playlist_tracks(&self, playlist_id: i64) -> Vec<crate::browse::BrowseTrack> {
+        bo_media::library::tracks_in_playlist(&self.conn, playlist_id).unwrap_or_default()
+            .into_iter().map(|t| crate::browse::BrowseTrack {
+                id: t.id, title: t.title, album: t.album,
+                primary_artist: t.primary_artist, artist_id: 0,
+                year: t.year, play_count: 0, last_played_at: None,
+            }).collect()
+    }
+
+    pub fn delete_playlist(&self, playlist_id: i64) -> bool {
+        bo_media::library::delete_playlist(&self.conn, playlist_id).is_ok()
+    }
+
     // ── Queue ───────────────────────────────────────────────────────
     // `device_url` is the same string `outputs::Device.url` carries and
     // `cast.rs` passes to `play_url_on_device` — one identity for "which
@@ -280,5 +300,29 @@ mod tests {
         // A different device's queue is empty — queues don't leak across
         // speakers.
         assert!(cat.queue_for_device("http://192.168.1.99").is_empty());
+    }
+
+    #[test]
+    fn playlist_tracks_reads_back_in_order_and_delete_empties_the_list() {
+        let (_dir, cat) = temp_catalog();
+        let id = cat.create_playlist("Focus", "").unwrap();
+        assert!(cat.playlist_tracks(id).is_empty());
+        for (title, path) in [("First", "/m/1.flac"), ("Second", "/m/2.flac")] {
+            cat.conn.execute(
+                "INSERT INTO tracks (path, size, mtime, title, album, year, rating)
+                 VALUES (?1, 100, 0, ?2, '', 2020, 0)",
+                rusqlite::params![path, title],
+            ).unwrap();
+            let track_id = cat.conn.last_insert_rowid();
+            assert!(cat.add_to_playlist(id, track_id));
+        }
+        let tracks = cat.playlist_tracks(id);
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].title, "First");
+        assert_eq!(tracks[1].title, "Second");
+
+        assert!(cat.delete_playlist(id));
+        assert!(cat.playlists().is_empty());
+        assert!(cat.playlist_tracks(id).is_empty(), "a deleted playlist has no tracks");
     }
 }
