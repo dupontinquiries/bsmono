@@ -162,6 +162,8 @@ pub mod block_store;
 pub mod engine_scene;
 pub mod mesh_pack;
 pub mod msssim;
+pub mod photometric;
+pub mod bincoder;
 pub mod provenance;
 pub mod library;
 

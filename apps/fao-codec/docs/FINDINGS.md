@@ -28,6 +28,14 @@ Do **not** score with PSNR. Every comparison in this project made on
 PSNR turned out to flatter the codec, because PSNR does not charge for
 the grid discontinuity that is this codec's characteristic artifact.
 
+**And do not trust the luma-only figure either, yet (2026-09-01).**
+MS-SSIM here is computed on Y. On SMITE the reconstruction's chroma
+PSNR was 28 dB under a 29 dB luma while AV1 at a fifth of the bytes
+sits at 46 dB chroma: the residual coder applies the luma dead zone to
+chroma, so at dz32 chroma is essentially never corrected. A 12 dB
+chroma deficit was invisible to every number in this file. Until the
+bench reports chroma, read every comparison with that caveat.
+
 ## Standing, honestly
 
 | content | v11 | AV1 anchor | verdict |
@@ -35,12 +43,24 @@ the grid discontinuity that is this codec's characteristic artifact.
 | film (bloopers, 19 shots) | 19.657 MB @ MS-SSIM 0.96200 | 0.989 MB @ 0.96538 | ~20x larger, slightly worse |
 | game, flat-shaded (blackstar) | matched-quality ~43x | SVT-AV1 p2 | loses badly |
 | game, textured (Minecraft 4K) | 29.8x at -0.14 dB | | loses |
-| soldier (real capture, engine canonical) | 42,186 B @ 39.7 dB | 18,941 B @ 42.3 dB | AV1 2.2x smaller |
+| soldier, map canonical, actors as pixels | 22,468 B @ 44.2 dB / 0.99934 | 18,930 B @ 40.7 dB / 0.99783 | ~wash at matched quality |
+| **soldier, map + entity canonical** | **1,997 B @ 57.1 dB / 0.99994** | 18,930 B @ 40.7 dB / 0.99783 | **v11 9.5x smaller, +16 dB** |
 | **procedural surface + correct model** | **59,036 B @ 0.98050** | **~62 KB interpolated** | **v11 ~5% ahead** |
 
-One content class wins, and only with a correct world model and the
-deblocker on. The 32% figure first reported for it was a PSNR artifact;
-on MS-SSIM it is ~5%.
+(soldier rows updated 2026-09-01; the 42,186 B @ 39.7 dB figure the
+previous session recorded was 56% side info chasing a global exposure
+drift — see SESSION_LOG for the decomposition and the three fixes.)
+
+Two content classes win. The procedural one by ~5% with a correct
+world model and the deblocker on (the 32% first reported was a PSNR
+artifact). The engine one by ~10x, and only in a regime that must be
+stated exactly: the decoder holds the game's renderer, the map mesh
+and the actor mesh are library assets, and the wire carries camera +
+actor poses (delta-coded, ~16 B/frame total here) plus a residual for
+what neither side knows. With actors carried as pixels instead of
+poses the same clip is a wash against AV1. That gap — 22,468 vs
+1,997 B — is the price of not knowing what is moving, and it is the
+whole argument for the entity split.
 
 ## What decides it
 
@@ -118,6 +138,13 @@ coding one. Concretely:
   carries state at 30 Hz and `cinema()` derives a camera, so the pieces
   exist; the arena mesh has no export and the gameplay camera is not
   logged. That is the highest-value remaining task in the project.
+  Since 2026-09-01 the measured payoff is ~10x under AV1 on soldier,
+  but only with actors as ENTITIES (mesh + pose stream), which the v1
+  format cannot carry: it holds one mesh and one camera. v2 needs
+  meshes[], per-frame instances (mesh id + pose), and a renderer
+  identity — soldier's fog and lighting are not reproducible by the
+  codec's generic rasteriser, and the cost of that mismatch is the
+  next number to get.
 * **Valid but blocked: the canonical must widen beyond a mesh.** The
   procedural-ground case cannot be a mesh — pixel-rate noise needs ~a
   vertex per pixel, discarding the saving. `engine_scene` carries

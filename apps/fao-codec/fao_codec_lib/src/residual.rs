@@ -175,6 +175,22 @@ pub fn encode(
     h: usize,
     opts: &ResidualOpts,
 ) -> Option<Vec<u8>> {
+    encode_with_map(predicted, target, w, h, opts).map(|(t, _)| t)
+}
+
+/// `encode`, plus a per-4x4-block RAW cost map (row-major over
+/// (w/4, h/4)): 0 for a skip block, else 3 + the number of nonzero
+/// quantised coefficients across the three channels. Diagnostic: it
+/// is what the ledger uses to attribute a frame's residual bytes to
+/// regions, since the entropy stage emits one stream per frame and
+/// cannot say where the bytes went. Encoder-only; nothing on the wire.
+pub fn encode_with_map(
+    predicted: &[u8],
+    target: &[u8],
+    w: usize,
+    h: usize,
+    opts: &ResidualOpts,
+) -> Option<(Vec<u8>, Vec<u16>)> {
     if predicted.len() != w * h * 3 || target.len() != w * h * 3 {
         return None;
     }
@@ -312,6 +328,16 @@ pub fn encode(
         }
     }
     
+    let cost_map: Vec<u16> = {
+        let thresh = opts.skip_threshold;
+        blocks
+            .iter()
+            .map(|(qs, _)| {
+                let nz = qs.iter().flat_map(|ch| ch.iter()).filter(|v| v.abs() > thresh).count();
+                if nz == 0 { 0 } else { 3 + nz as u16 }
+            })
+            .collect()
+    };
     // Pack blocks into a byte stream, with optional skip-block RLE.
     let payload = if opts.skip_block_rle {
         pack_skip_rle(&blocks, opts)
@@ -355,9 +381,33 @@ pub fn encode(
     if opts.channel_deinterleave { rw_field |= FLAG_DEINTERLEAVE; }
     
     // Method byte after the 4-byte header: 0 = whole-payload zstd,
-    // 1 = rANS-split (structure zstd + per-context rANS coefficients).
+    // 1 = rANS-split (structure zstd + per-context rANS coefficients),
+    // 2 = EMPTY: every block is skip, no body follows.
     // Chosen per frame by size; the flag costs one byte and the rANS
     // path can therefore never lose more than that.
+    //
+    // Method 2 exists because a frame with nothing to code was costing
+    // 19 bytes — 4 header + 1 method + 14 of zstd framing around a
+    // 5-byte all-skip RLE payload. On an exact engine canonical that
+    // is most frames, and 14 B x 48 frames was 10% of the whole
+    // encode (fao_engine_capture, soldier, entity canonical: 6,436 B).
+    if opts.skip_block_rle {
+        let thresh = opts.skip_threshold;
+        let all_skip = blocks
+            .iter()
+            .all(|(qs, _)| qs.iter().all(|ch| ch.iter().all(|v| v.abs() <= thresh)));
+        if all_skip {
+            let mut out = Vec::with_capacity(5);
+            let mut rw_field: u16 = (rw as u16) & RW_MASK;
+            rw_field |= FLAG_DCT_FORMAT | FLAG_SKIP_RLE;
+            if opts.dc_prediction { rw_field |= FLAG_DC_PREDICTION; }
+            if opts.channel_deinterleave { rw_field |= FLAG_DEINTERLEAVE; }
+            out.extend_from_slice(&rw_field.to_le_bytes());
+            out.extend_from_slice(&(rh as u16).to_le_bytes());
+            out.push(2);
+            return Some((out, cost_map));
+        }
+    }
     let use_rans = rans_candidate
         .as_ref()
         .map(|r| r.len() < compressed.len())
@@ -380,7 +430,7 @@ pub fn encode(
     out.extend_from_slice(&(rh as u16).to_le_bytes());
     out.push(if use_rans { 1 } else { 0 });
     out.extend_from_slice(body);
-    Some(out)
+    Some((out, cost_map))
 }
 
 /// Pack blocks without skip-block RLE — every block emits its full 
@@ -675,6 +725,8 @@ pub fn apply(predicted: Vec<u8>, residual_bytes: &[u8], w: usize, h: usize) -> V
     if rw * 4 > w || rh * 4 > h { return predicted; }
     
     let method = *residual_bytes.get(4).unwrap_or(&0);
+    // Method 2: nothing was coded; the prediction is the picture.
+    if method == 2 { return predicted; }
     let n_blocks = rw * rh;
     let mut blocks: Vec<([[i8; 16]; 3], [QuantParams; 3])> = vec![
         ([[0; 16]; 3], [QuantParams { scale_byte: 0, saliency_boost: 0 }; 3]); 

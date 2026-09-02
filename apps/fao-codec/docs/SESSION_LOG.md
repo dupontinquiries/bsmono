@@ -6064,3 +6064,705 @@ failing), intra DC/planar fall back when the top or left border is
 missing, and the deblock filter skips the first 4 columns and rows.
 Those are all deliberate and were verified by reading; the region-grid
 truncation was not deliberate and was found only by measuring.
+
+## 2026-09-01 — where the engine-canonical bytes go, and three fixes that follow
+
+The previous session's honest headline was that even a PERFECT map
+canonical on soldier cost 42 KB for 48 frames against AV1's 20 KB, and
+recorded it as "AV1 wins here". Nobody had asked where the 42 KB went.
+`fao_engine_capture` now reports the split (model / motion / side /
+residual), takes `--no-actors` / `--no-exposure`, charges the camera
+and actor pose streams as real delta-coded zstd'd bytes instead of an
+assumed 24 B/frame, and adds an ENTITY row: the decoder also holds the
+actor mesh and re-renders it from a per-frame pose stream, so the only
+thing left for the residual is what neither side knows (the exposure
+drift).
+
+Baseline reproduced: map canonical 42,108 B @ 39.80 dB (logged 42,186).
+
+  side info was 23,665 B — 56% of the encode — at 355-910 B/frame,
+  against 17 B on frame 0 where the exposure gain is exactly 1.0.
+
+The per-region gain pairs were tracking ONE global number, and each
+region's quantised (a, b) rounds differently so zstd finds no repeats.
+Three changes, each measured on soldier (exact canonical), film (w1,
+bloopers @19.102s 48f crop 1920:800:0:140) and real game capture
+(SMITE, 32f @ t=5s, 1080p — recipe recorded here because the log had
+none):
+
+### 1. Frame-level weighted prediction (`WeightedPred`)
+
+One (a, b) per plane per REFERENCE — model/plate and prev — fitted by
+least squares over the frame, applied before the mode decision, 9
+side bytes each, gated on L1 improvement. HEVC weighted prediction;
+the codec did not have it.
+
+  soldier map canonical    42,108 @ 39.80 dB -> 26,509 @ 44.22 dB  (-37%)
+  soldier map+entity       30,659 @ 40.43    ->  6,436 @ 58.69     (-79%)
+  w1 film                 444,056 / 0.97731  -> 441,411 / 0.97721  (ladder rate: a wash)
+  SMITE                 1,144,815 / 0.95405  -> 856,878 / 0.95410  (-25%)
+
+The SMITE number needed explaining before it could be trusted. Fitted
+gains were luma identity, chroma a~0.80-0.89 with b~+30/+17, drifting
+smoothly across the GOP, while the SOURCE chroma is flat (U 122.8+-11
+every frame; `bin/chroma_probe`). So the plate's chroma is what is
+off, and the fit is least-squares ATTENUATION on a noisy predictor:
+the raw plate's luma fits a=0.85 too (probe), rejected by the L1 gate;
+chroma (std ~11) is accepted because shrinking costs correct pixels a
+few levels — which the dz32 dead zone then discards — and helps wrong
+pixels more. That could have been a quality trade invisible to a
+luma-only metric, so it was measured on the reconstruction:
+
+  SMITE chroma PSNR  no WP  U 28.39  V 32.53  |  WP  U 34.61  V 34.81  (Y unchanged 29.44)
+
++6.2 dB U and +2.3 dB V for -25% bytes: a real win on both axes. But
+28 dB chroma UNDER a 29 dB luma is backwards for any codec, and the
+cause is structural: `residual::encode` applies the luma dead zone to
+chroma, so at dz32 any chroma DC error under ~16 levels is never
+coded and chroma is "whatever the predictor gave". AV1 anchors on the
+same clip (libsvtav1 preset 4):
+
+  crf45  257,783 B  Y 41.78  U 47.48  V 47.72  MS-SSIM 0.99508
+  crf52  187,572 B  Y 40.13  U 46.28  V 46.53  MS-SSIM 0.99277
+  v11 WP 856,878 B  Y 29.44  U 34.61  V 34.81  MS-SSIM 0.95410
+
+METRIC CORRECTION, standing: the figure of merit is luma-only, and it
+has been hiding a 12 dB chroma deficit. Every comparison in this log
+should be read with that caveat until the bench reports chroma. The
+fix (a chroma dead-zone divisor, i.e. a chroma QP offset) is a
+one-line encoder change that needs a chroma-aware price to sweep
+against; not done this session.
+
+### 2. Two wire-framing fixes, unconditional
+
+`residual` method byte 2 = EMPTY (every block skip): 5 B instead of
+19 (4 header + method + 14 of zstd framing around a 5-byte all-skip
+payload). Side-stream method byte: 2 = ALL-MODEL FRAME (zero bitmaps,
+no gain; only the weighted-prediction tail follows): 1 + tail instead
+of 17. On an exact canonical that is most frames.
+
+  soldier map canonical   26,509 -> 25,831     entity 6,436 -> 5,576 (-13%)
+  w1 film                 441,411 -> 441,459   (framing marker cost, +48 B)
+
+### 3. Exact-region gate — and the version of it that was WRONG
+
+After 1+2, frames whose residual was EMPTY still carried 90-186 B of
+side: intra DC beating an exact canonical on flat-shaded walls
+(`0 + intra_gate < rounding noise`), and per-region gain pairs firing
+to remove +-1 rounding.
+
+First version gated on the residual coder's own skip test ("codes as
+all-skip under the dead zone"). Soldier entity 5,576 -> 1,626 B, and
+film w1 441,459/0.97721 -> 318,728/0.93248: -28% bytes for -0.045
+MS-SSIM, 2.7 MB per point against a 27 MB ladder, ten times worse
+than lowering dz. Under dz32 a region can be ~16 levels off and still
+code as skip, and on film the raw-SAD mode decision is quietly
+choosing the better of plate / prev-MC / intra for exactly those
+sub-dead-zone regions — the "accidental intra refresh" the code
+already documents. That choice never reaches the residual and it is
+where a large share of film quality comes from. Confirms the earlier
+finding from the other side: `region_codable_cost` lost as a mode
+decision, and it loses as a gate too, for the same reason.
+
+Replaced by `region_is_exact`: every luma and chroma sample within
+tolerance of the target, no DCT, no dead-zone dependence.
+
+  tol   w1 film               soldier map           soldier entity
+  off   441,459 / 0.97721     25,831 @ 44.22        5,576 @ 58.69
+  1     441,967 / 0.97711     22,468 @ 44.16        1,997 @ 57.09   <- default
+  2     440,179 / 0.97684     15,075 @ 40.22        1,626 @ 57.08
+
+tol 2 is a priced loss on film (3.5 MB/point). tol 1 moves film by
++0.1% bytes / -0.0001 — a deterministic ripple through the prev
+reference, not a trade — and takes 64% off the exact-canonical
+encode. The 4 dB PSNR drop on the map row at tol 2 is the per-region
+gains having been doing real +-1 work that MS-SSIM does not value;
+recorded so nobody reads the PSNR column as a regression.
+
+### Standing against AV1 on soldier (48 f, 640x384, dz32)
+
+  AV1 crf58 (libsvtav1 p4)      18,930 B  Y 40.73  U 43.50  V 44.45  MS-SSIM 0.99783
+  v11 map canonical             22,468 B  Y 44.16                     MS-SSIM 0.99934
+  v11 map + entity canonical     1,997 B  Y 57.09                     MS-SSIM 0.99994
+
+  entity: 9.5x smaller at +16 dB. Bytes: 48 model refs + 64 camera
+  + 710 entity poses + 935 side + 240 residual.
+
+What that number is and is not. It IS the regime FINDINGS named as the
+only one with a measured payoff, now with the actor split done the
+way an engine would do it (mesh in the library, trajectory per take).
+It is NOT a general video result: the decoder holds the game's
+renderer (the harness predicts with `early_fps::render` itself), the
+content is flat-shaded (the harness rasteriser does not sample the
+atlas), and the map row — actors as pixels — is still 1.19x AV1's
+bytes at higher quality, roughly a wash at matched quality. The
+`.faoscene` seam still carries one mesh and one camera and renders
+with the codec's own rasteriser, which cannot reproduce soldier's fog
+and lighting; the cost of that mismatch is the next thing to measure,
+and the v2 format (meshes + per-frame instances + a renderer identity)
+is the next thing to write.
+
+Sandbox notes: backgrounded builds die when the tool shell exits
+unless started with `setsid nohup ... < /dev/null &`. Both workspaces
+share CARGO_TARGET_DIR=/tmp/fao/target (7.1 GB free at the end).
+
+### Film: the budget attributed to WHAT it is spent on (same day)
+
+User's position: film is modelable; the codec has not targeted the
+right things. The 84%-novelty figure bounded a 2D plate, not a model.
+So: attribute the bytes. `FAO_LEDGER=path` now writes one line per
+region per frame from `encode_gop_v3_core` (mode, plate SAD, prev SAD,
+gain flag, residual raw cost from `residual::encode_with_map` scaled
+to the frame's real residual bytes).
+
+Grain first, because it is cheap to bound and the user was right to
+reject it: hqdn3d on w1 removes std 1.1-2.1 with lag-1 spatial
+correlation 0.72-0.83. Sensor grain is near-white; correlated "noise"
+is world texture the filter blurred (and this source is a YouTube
+H.264 rip — the stock's grain is already gone). Grain synthesis is
+off the table on this evidence, not on taste.
+
+w1 (film, 48 f, dz32, 441,967 B) decomposes as:
+
+  side info  277,484 B   63%     residual  129,781 B   29%     plate  34,318 B   8%
+
+The novelty is not pixels. It is 6,000 regions per frame each saying
+how they moved: prev-MC on 81.5% of regions, 126k nonzero MVs over
+the GOP, 750-1,500 gain pairs per frame. Raw per frame ~12 KB (mvd
+4.8 KB, gain values 1.5-3 KB, three 750 B bitmaps), ~5.8 KB after
+zstd.
+
+Residual, by what the region IS (plate SAD per pixel as the class):
+
+  moving object   (>12 lvl off plate)   31.9% of regions   81.1% of residual bytes
+  background the plate blurs (4-12)     41.8%               17.3%
+  background the plate has   (<=4)      26.3%                1.6%
+
+  0.7% of region-frames carry 50% of residual bytes; 1.8% carry 80%.
+
+And the predictor quality that explains the mode mix:
+
+  plate  prediction error  median 7.54 lvl/px   11% of regions within 2 lvl
+  prev   prediction error  median 1.08 lvl/px   66% of regions within 2 lvl
+
+A 48-frame median is the wrong background model for film. It is stale
+by construction — actors pass through it, lighting and codec noise
+change under it — while the previous frame is within 2 levels on two
+thirds of the picture. The codec knows this (81% prev-MC) and pays
+for it per region: mode bit, nz bit, an MV, often a gain pair, for
+regions that moved exactly with the camera.
+
+Affine camera tried (`estimate_motions_affine`, FAO_AFFINE=1): the
+log had "88% of correspondences within 2 px of a global affine" and
+the plate warps with 2 parameters. Integer block-match pairs + 3-sigma
+affine fit land at rms 2.4-3.2 px per pair, and the plate did not get
+sharper: median error 7.54 -> 8.50. Bytes 441,967 -> 441,672 and
+MS-SSIM 0.97711 -> 0.97877 (+0.0017, ~45 KB on the ladder) — a real
+gain whose mechanism is NOT alignment and is not explained. Left
+opt-in until it is; a default that works for an unknown reason is how
+this codec accumulated its wrong constants.
+
+What the ledger says to build, in the user's terms — objects and
+properties, camera first:
+
+1. A GLOBAL-MOTION mode: prev warped by the frame's affine as the
+   default predictor for every region, MVs coded as deltas from the
+   affine's local displacement (so a pan has all-zero deltas and the
+   nz bitmap is empty), the exact-region gate suppressing gains and
+   intra where it already lands within rounding. The 66% of regions
+   within 2 levels of prev should cost ~0 side bytes. Estimated from
+   the composition above: ~120-150 KB of the 277 KB. The plate keeps
+   its one real job — reveals and long-term reference — instead of
+   being the predictor of first resort it loses 81% of the time.
+2. Movers as OBJECTS on top of that: the 32% of regions >12 levels
+   off the plate carry 81% of the residual and are where an object
+   model (rigid, then articulated) pays. The mover layer exists;
+   it is not yet what the residual is attributed to.
+3. The bootstrap graph the user describes — priors over what
+   co-occurs (a face implies a body below it; stairs imply a
+   railing) — is what a tracker needs to instantiate (2) from
+   fragments. It is the right long-range target and the wrong
+   first step: it has nothing to attach to until (1) removes the
+   camera from the per-region budget and (2) gives objects a
+   representation the ledger can score.
+
+### Photometric marker bank — pulling the image-formation chain apart, validated on an engine, run on film (same day)
+
+User's framing, which the day's numbers had been circling: the world
+the decoder emulates includes the camera. Fog is an entity AND a light
+AND a shader into a lens, and the trick is separating those given a
+scene. Separation is by SIGNATURE — each stage is a function of a
+different thing (global / per-channel / radius / depth / normal /
+local shift) and persists over a different span (frame / shot /
+camera / library).
+
+`photometric::signature(pred, target)`: a bank of closed-form least-
+squares fits of the difference, scored as explained variance:
+exposure (global affine on Y, robust two-pass), white balance (a
+YUV linear map per plane, vs the same gain applied about 128),
+vignette (gain quadratic in r^2), fog (blend toward one colour with
+a row-quadratic strength), lag-1 autocorrelation of what is left,
+and the fraction a +-4 px local shift removes. Cheap enough per
+frame in an encoder.
+
+Validated with `fao_engine_capture --vary <stage>`: soldier rendered
+with the camera still and exactly one stage varying. Mid-GOP frame:
+
+  varied     exp   wb   vig   fog  lag1  motion   recovered
+  none       0.00 0.00  0.00  0.00 0.00  0.00
+  exposure   1.00 0.80  1.00  0.99 0.71  0.01     a 1.078 (true 1.08)
+  wb         0.92 0.99  0.92  0.00 0.88  0.02     shared 0.01 vs wb 0.99
+  vignette   0.53 0.87  1.00  0.57 0.95  0.03     v1 -0.349 (true -0.35)
+  fog        0.54 0.86  0.56  0.92 0.92  0.03     C (129,127) vs fog (132,126)
+  light      0.00 0.07  0.01  0.05 0.79  0.00     nothing fits: structured,
+                                                  not kinematic — that IS
+                                                  the illumination marker
+
+Two lessons the table teaches. Exposure is contained in vignette and
+fog (they reduce to it), so the selector is per parameter — the
+simplest stage within a margin of the best — not the highest R^2.
+And "light" has no cheap basis without normals; it shows up as high
+lag-1 with everything else near zero, which is a usable marker for
+"this needs geometry".
+
+Two bugs of mine the validation caught before film saw them: the
+chroma R^2 was computed on the concatenated planes and scored
+"nothing explained" as 0.50, so the WB marker had never worked (a
+per-channel RGB gain is not a per-plane affine in YUV); and the plain
+least-squares gain on a misaligned predictor is biased toward 0 —
+soldier's forward-moving camera (phase correlation sees expansion as
+(0,0)) fitted a = 0.80-0.88 for a 1% exposure change. Fixed with an
+inlier refit (6 levels): the same frame now reports a 0.99 at 5%
+inliers, i.e. rejected.
+
+Same robust fit put into `WeightedPred`, where it changes the film
+result from a wash to a win on both axes and keeps SMITE's chroma:
+
+  w1     no WP 444,056/0.97731 | naive 441,967/0.97711 | robust 440,102/0.97732
+  SMITE  naive 856,910/0.95410 U 34.61 V 34.81 | robust 861,688/0.95415 U 34.61 V 34.96
+  soldier map canonical   22,468 @ 44.16 dB -> 15,310 @ 47.64 dB / 0.99967
+  soldier map + entity     1,997 @ 57.09    ->  2,055 @ 57.09    / 0.99994
+
+The map row is where the robust fit earns its place: with the actors
+carried as pixels they are OUTLIERS in the exposure fit, and the
+naive fit was being pulled by them. Excluding them lands the
+background on the exact gain, and that row is now UNDER the AV1
+anchor (18,930 B @ 40.73) at +7 dB — the first time actors-as-pixels
+has beaten AV1 on this clip.
+
+The first cut of this commit reported soldier entity at 5,623 B and
+the log said "unchanged" — wrong, and caught by re-measuring before
+moving on. Cause: the rewrite derived b from the UNCLAMPED a and
+clamped a afterwards, so a near-flat frame (31: the camera walks
+into geometry, a ~ 0) shipped the pair (0.5, +127) — inconsistent —
+and paid 3.4 KB of residual for one frame. b is now derived after
+a is clamped and quantised, from the same sums, as the original did.
+
+`bin/photo_probe` runs the bank on real footage against the previous
+frame shifted by the phase-correlation translation:
+
+  w1 (film)   exp 0.01-0.03  wb 0  vig 0.02  fog 0.02  lag1 0.3-0.6  motion 0.48-0.72
+  SMITE       exp 0.00-0.06  wb 0  vig 0.04  fog 0.03  lag1 0.0-0.6  motion 0.59-0.95
+
+Neither has a global photometric stage frame to frame. What remains
+after a global shift is structured (lag1 ~0.5) and half to nine
+tenths kinematic (local shift). So on the film clip in hand the
+stages the bank can name are absent, and the unexplained part is the
+two the bank cannot fit without geometry: local motion of objects
+and illumination on them. That is the honest answer to "cheap markers
+that pull apart any engine or the real world": yes for the global
+stages, validated; and on this film the cheap stages are not where
+the bytes are. The expensive ones are.
+
+### Fog as the first engine-supplied stage — and why estimating it from pixels lost (same day)
+
+The scenario: the library holds the world captured under one
+atmosphere; the take has another. soldier now exposes
+`render_with_depth` (per-vertex camera depth alongside the mesh —
+additive, `render` unchanged), the harness rasterises depth in
+painter's order like colour, and `--take-fog s e` renders the take
+under a different fog than the library's (55, 280).
+
+Three map-only predictors, 24 frames, actors on, take fog (12, 60):
+
+  library fog (canonical as stored)        23,975 B @ 40.39 dB / 0.99759   side 12,295  resid 11,598
+  world + fog ESTIMATED from pixels        32,804 B @ 38.36 dB / 0.99692   (per-pixel model)
+  world + fog FROM ENGINE, 7 B/frame        6,908 B @ 49.19 dB / 0.99960   side  1,598  resid  5,060
+
+The engine-supplied stage reconciles library and take for 168 bytes:
+3.5x fewer bytes AND +8.8 dB. Note what the mismatch was costing in
+the first row — 12 KB of side info, the per-region gains chasing a
+depth-dependent blend one region at a time, which frame-level
+weighted prediction cannot express either. The residual left in the
+third row is the actors carried as pixels.
+
+The estimator is the honest negative. `photometric::FogStage::fit`
+recovers the fog COLOUR (20,132,126 against 21,132,126) and lands
+`end` at 26-34 against a true 60, every time, with or without the
+far-cull pixels excluded. Not a fitting bug: soldier applies fog PER
+VERTEX and interpolates colour across the triangle in screen space,
+so on any large floor or wall the picture's fog is not a per-pixel
+function of depth at all. A per-pixel formula is a different
+function, and its best fit is a worse predictor than the library's
+wrong fog. The marker bank's fog DETECTION (R^2 0.92) was right;
+parameter recovery under the wrong formula is not.
+
+Consequence for the architecture, stated as a rule: a stage is
+parameters the renderer reads, not a formula the codec applies. The
+decoder owning the renderer means the renderer evaluates every
+stage — fog, cull, lighting — with the stage's parameters, and the
+codec's job is to carry the parameters at the right rate. Estimating
+a stage from pixels is only for footage with no engine, and there a
+renderer-agnostic formula has to be validated against the real
+world's actual formula the same way this one was validated against
+soldier's, or it will lose to no stage at all.
+
+### `.faoscene` v2 — the seam that carries the day's results (same day)
+
+v1 carried one mesh and one camera: a map. Every large number this
+session came from something v1 cannot express — actors as entities
+(mesh in the library, pose per frame), and fog as a stage the
+renderer evaluates with transmitted parameters. v2 adds exactly
+those and nothing else: a renderer identity string (the decoder must
+hold THAT renderer; the codec's rasteriser is a fallback that gets
+geometry right and fog wrong), `meshes[]`, shot-level `stages`
+(kind + payload; fog = colour, start, end), per-frame `instances`
+(mesh id, position, [w,x,y,z]), per-frame stage `overrides`. Rates
+are the design: mesh once, shot stage once, camera and instances per
+frame, an override only when something changes — the library / shot
+/ frame factorisation as bytes. v1 files lift into v2 as a map with
+one identity instance per frame. Six tests: round trip, override
+resolution per frame, merged world-space geometry, v1 lift,
+truncation, dangling mesh reference. Not yet done: the harness
+writing a v2 scene from soldier and `plate_lab` citing it — the
+harness still predicts through its own closures.
+
+### The suite against the user's own AV1 files, and the film levers that followed (2026-09-01/02)
+
+`tools/suite_vs_av1.sh` + `tools/suite_summary.py`: the 19 shots cut
+from the user's source, the codec run per shot, the user's two AV1
+files decoded per shot and scored against the same cropped source,
+AV1 bytes summed from packet sizes inside each shot's pts window.
+Luma MS-SSIM AND chroma PSNR — `bench` now reports U/V dB. Table in
+docs/suite_vs_av1_2026-09-01.csv.
+
+  codec (session defaults)   18,706,801 B   MS-SSIM 0.96290   chroma 34-41 dB
+  user's AV1 @150k              993,657 B   MS-SSIM 0.95267   chroma 41-45 dB   codec 18.8x
+  user's AV1 default         17,766,513 B   MS-SSIM 0.99560   chroma ~50 dB     codec 1.05x
+
+Per shot the codec is 8-34x the 150k file on everything with motion;
+the one shot it wins is black. Fresh SVT-AV1 ladder (preset 6, crf
+40/46/52): 6.51 / 4.55 / 3.24 MB, chroma 47-49 dB — scored per shot
+not yet (`msssim` loads a whole clip as f64 and dies on 1080 frames;
+the suite has SKIP_CODEC=1 for scoring anchors against a prior run).
+
+Two bugs the first run found, recorded because the next person will
+hit them: ffmpeg inside `while read` eats the CSV from stdin
+(-nostdin, </dev/null everywhere); near-black shots score "inf" PSNR
+and pipefail then kills the loop silently.
+
+### GMC — the camera as the first object, on film
+
+`FAO_GMC=1` in `encode_gop_v3_core`: the mode-0 predictor for frame i
+is the previous RECONSTRUCTION warped by the pairwise global affine
+(`estimate_motions_affine` on the frame pair), chosen against the
+caller's model per frame by whole-frame SAD — one bit, cannot lose
+to either alone. The ledger asked for exactly this: median plate at
+7.5 levels/px used by 6% of regions, previous frame at 1.1 levels/px
+and within 2 on 66%.
+
+  w1 (film)   440,102 / 0.97732 U 38.4  ->  368,284 / 0.97901 U 38.8   -16%, better on every axis,
+              prev-MC share 0.815 -> 0.222, grid figure 1.946 -> 1.404
+  + no plate (FAO_NOPLATE=1, frame 0 intra)   348,149 / 0.97891        -21%
+  SMITE       861,688 / 0.95415  ->  846,305 / 0.95184                 -1.8% for -0.0023: a loss
+              at the ladder rate; the per-frame choice is what keeps
+              it from being one when GMC is default
+
+Not default yet: the suite has to be re-run with it on. Extrapolated,
+18.8x becomes ~15x. Real, and not the target.
+
+### Dedup across a hard cut: shots 12 -> 13, the reel's one shared location
+
+User's reframing: parallax was never the goal; the goal is re-using
+content across a hard cut, and the residual coder pays for whatever
+the model does not supply. So: bytes, not depth. Thumbnails of all
+19 shots (mid-frame) show ~13 distinct locations in 45 s; the only
+pair on one location is 12 and 13 — the masked man on the ground,
+teepees mid-distance, hills far, two camera positions.
+
+`bin/cite_probe`: Harris keypoints per grid cell, half-res 15x15 NCC
+patches (31x31 of context) with a ratio test inside a spatial radius,
+mutual-best; RANSAC homography via `two_view::fit_homography`;
+normalised 8-point fundamental with Sampson inliers; A's last frame
+warped through H as B's frame-0 model; B encoded from scratch vs
+citing, same core, GMC after frame 0 in both.
+
+  same shot, 100 frames apart (control):
+    130 matches   H inliers 98   F inliers 105   F-only 7 at 7.1 px
+    -> within a shot the parallax is 7 px on 7% of points: unobservable
+       for reconstruction, as the log said, and the pipeline works.
+  12 -> 13 (the cut):
+    24 matches    H inliers 0    F inliers 12 (chance)   median H error 292 px
+    A warped -> B frame 0: 0.0% of regions within 2 levels, MS-SSIM 0.44
+    B from scratch   629,022 B   frame 0  66,582 B   MS-SSIM 0.97390
+    B citing A       629,626 B   frame 0  77,085 B   MS-SSIM 0.97394
+
+No usable correspondence across the cut with patch correlation: the
+baseline (angle + scale + the actor filling half the frame) is past
+what NCC survives, and the codec has no scale/rotation-invariant
+descriptor. A wrong model costs +10 KB on frame 0 — the coder
+charges for models that are wrong, which is why every model in this
+codec now goes through a per-frame SAD choice.
+
+The bound is the result. After GMC, frame 0 is the only per-shot
+fixed cost — 66.6 KB of 629 KB here, 10.6%. A cross-cut cite of the
+BACKGROUND can save at most the I-frame; the 562 KB after it is 81%
+actors by the ledger, which no background model touches. So on this
+codec at this operating point, corpus-scale dedup of locations is
+worth ~10% of film bytes, bounded above, before any matcher exists.
+Worth having if a wide-baseline matcher is cheap; not the lever.
+
+### Motion layers — the camera and the actor as two affines (2026-09-02)
+
+User's point: parallax detectors fight tremor and noise; a static
+model plus residual beats chasing jitter that was never content. The
+owner of the tremor is the camera model, six numbers a frame, and
+the block-match affine was too coarse to take it. Three steps, two
+of which taught something by failing.
+
+1. Sub-pixel block matches (parabolic peak): rms per pair 2.1-3.4
+   px, unchanged; bytes -0.8%. The residual was not quantisation.
+2. RANSAC affine at 1 px instead of one 3-sigma pass: 65-75%
+   inliers, rms 0.4 px on them — a clean camera. Bytes +2.9%
+   (365,364 -> 375,858). w1 is a face filling the frame; the
+   "outliers" are most of the picture, and the contaminated fit had
+   been half-tracking the actor. A correct camera model loses to a
+   compromise when the object is bigger than the background.
+3. `estimate_layers`: sequential RANSAC — dominant affine, remove
+   its inliers, fit the rest (1 px for the camera, 2 px for objects,
+   32 px block grid so the second layer has enough blocks). Every
+   region picks among {caller's model, layer 1, layer 2} by SAD with
+   a margin (FAO_GMC_MARGIN 128 — without it the selection map
+   flipped on ties and cost 950 B/frame, more than it saved); the
+   map is one symbol per region, zstd'd, ~400 B/frame.
+
+  w1 (film)   440,102 / 0.97732  ->  370,196 / 0.97937  U 39.1 V 41.2   -16%, +0.0021
+              model error median 1.01 lvl/px, 50% of regions within 1 level
+              mode share: model 69%, prev-MC 20%, intra 11%
+  SMITE       861,688 / 0.95415  ->  819,564 / 0.95470                    -5%, +0.0006
+              (single-layer GMC was a LOSS here; the second layer is the player)
+
+GMC is now default (two layers, margin 128; FAO_GMC=0 restores the
+plate-only model).
+
+Tried and lost, kept in the code as a comment at the site: searching
+mode-1 vectors from the layered prediction instead of the raw
+previous frame — w1 +2%, SMITE +12%; the warp is bilinear-resampled
+and softer than the raw reference, and a wrong object layer puts the
+search window in the wrong place.
+
+What the side info is now (raw, per frame, w1): mode/intra/gain
+bitmaps 750 B each, 1,053 motion vectors (2.1 KB), 690 gain pairs
+(1.4 KB), ~4 KB after zstd. The vectors and gain pairs are
+high-entropy bytes a general-purpose compressor cannot shrink; the
+next byte in side info is a context-adaptive coder for them, or
+fewer of them (a segmentation map predicted from the previous
+frame's instead of sent whole). The residual sits 45% on model
+regions and 48% on prev-MC regions.
+
+### Context-adaptive side coding, the base-layer hybrid, and the 1/8-scale control (2026-09-02)
+
+Question from the user: is there anything in the 3D pose to quantise
+or statistically represent residuals with? Ranked answer in the
+transcript; the actionable one was geometry as ENTROPY CONTEXT. First
+fact: the rANS path with static per-frame tables is chosen on 0 of 49
+w1 frames — an order-0 coder loses to zstd's LZ+FSE, and contexts on
+a path never taken buy nothing. So `bincoder.rs`: an LZMA-family
+adaptive binary range coder (8-bit probabilities, fast-then-slow
+update) with binarised symbols under context: region mode given the
+left/top modes and the region's MOTION LAYER, vector zero-flag given
+neighbour zero-flags, vector deltas from the median predictor as
+exp-Golomb with per-bin contexts, gain flag given neighbours and
+layer, gain pairs likewise. Side method 3, charged as the shorter of
+it and zstd per frame. Round-trip tests. Per frame on w1 it is 92.4%
+of zstd's bytes:
+
+  w1     370,196 -> 352,288   (-4.8%, quality identical)
+  SMITE  819,564 -> 800,487   (-2.3%)
+
+Then the user's hybrid: bootstrap from an 8x-downscaled AV1 stream
+and code the residual at full resolution. As spatial scalability it
+cannot win (the enhancement carries all the high-frequency bytes at a
+worse rate than AV1). As a decoder-side hint it targets the 52% of
+film bytes that are side info. Measured (`FAO_PRED_Y4M`, the
+upscaled base as the mode-0 model; base bytes added):
+
+  w1   base 1/8 crf20   codec 239,359 + base 29,217 = 268,576 B   0.98211  U 43.7 V 45.0   (-27% vs 370,196 / 0.97937 / U 39.1)
+  w1   base 1/4 crf20   codec 154,029 + base 76,859 = 230,888 B   0.98845  U 46.6 V 47.9
+  SMITE base 1/8 crf20  codec 464,718 + base 44,729 = 509,447 B   0.95459  U 37.4          (-36% vs 800,487 / 0.95470 / U 34.2)
+  decoder-side layer choice against the base (map free): 319,098 / 0.98015 — the base
+  is a worse referee than the source and the map costs only ~400 B/frame; LOST.
+
+The trend is the finding. The quarter-res base alone costs 77 KB —
+the same as full-resolution AV1 at crf50 (77,632 B @ 0.99126), which
+beats every hybrid row. "More AV1, less codec" improves monotonically
+and its limit is all AV1. The hybrid helps the codec because the base
+supplies accurate LOW FREQUENCIES AND CHROMA, which the codec's own
+predictors get wrong and its dead zone then refuses to fix (+4.6 dB U
+on w1 from a 29 KB base). That is the design lesson worth keeping: an
+accurate cheap LF/chroma layer inside the codec, not a second codec.
+
+Two controls close it:
+
+  Metric. The 1/8 AV1 base merely upscaled by Lanczos scores luma
+  MS-SSIM 0.963 at 29 KB — equal to the codec's whole-suite average
+  at 1/50 of the bytes. The figure of merit is nearly blind to an 8x
+  loss of resolution. Every quality claim in this log needs a
+  detail-sensitive metric beside it before it means what it says.
+
+  Scale. The codec on the 240x100 clip itself, scored at that size:
+    codec dz16  31,555 B  0.96013     AV1 crf20  29,217 B  0.99719
+    codec dz32  14,643 B  0.93435     AV1 crf35  14,135 B  0.99298
+    codec dz48  11,098 B  0.91554     AV1 crf50   6,956 B  0.98222
+  At 1/8 resolution there is no grid-discontinuity story, no plate,
+  nothing a world model could add, and AV1 is ~4.5x smaller at higher
+  quality. The gap is the core inter coder — 16x16 modes, 4x4 DCT,
+  per-region side info — at every scale. The world-model layers on
+  top of it (GMC, layers, WP, exact gate, stages) are each real and
+  each bounded by it.
+
+### The coarse level, built inside the codec, loses (2026-09-02)
+
+User's diagnosis: abstractions right, data structures wrong — a
+one-level plate/sprite representation starves compression. First
+concrete test of a two-level object: `lf_correct`, an LF/chroma
+correction coded at 1/8 resolution with a fine dead zone before the
+HF residual, sparse by skip-RLE where the prediction is already
+right (user's "prunable, not a box").
+
+  w1     352,288/0.97937 U 39.1  ->  dz/4 365,398/0.97885 U 40.5   dz/8 391,787/0.97903 U 42.1
+  SMITE  800,487/0.95470 U 34.2  ->  dz/4 970,892/0.95301 U 35.2
+
+Chroma up, luma slightly down, bytes up: a loss. The coarse residual
+costs ~408 B/frame and saves ~135 B/frame of HF.
+
+Why it is not the hybrid. Splitting the AV1-base hybrid's win on w1:
+side 176 -> 136 KB, residual 176 -> 104 KB. The base was not a
+photometric patch applied after the mode decision; it was a
+temporally coherent, high-quality low-res VIDEO (0.997 MS-SSIM at
+1/8, 600 B/frame) that refereed every mode decision (fewer vectors,
+fewer intra) and stood in for the plate. A coarse level earns its
+place only with a coarse coder that is efficient, and the 1/8-scale
+control already measured that the codec's is not (14.6 KB @ 0.934
+against AV1's 14.1 KB @ 0.993 on the same 240x100 clip). Kept
+opt-in (FAO_LF_SCALE=8).
+
+The structural conclusion survives the failed test, sharpened: the
+object needs a persistent, temporally coherent coarse state — a
+level that is PREDICTED frame to frame, not patched frame by frame —
+and every level, coarse or fine, is only as good as the coder that
+carries its residual. Which is the same bottleneck the day keeps
+finding from every direction.
+
+### Persistent layer mosaic — a deeper data structure, measured neutral at GOP timescales (2026-09-02)
+
+User's thesis: the abstractions (world, camera, layers, stages) are
+right and the data structures are wrong — one-layer-deep sprites and
+plates kill compression. The coarse-level-as-patch (lf_correct) had
+already lost; the AV1-base hybrid had won by being a temporally
+coherent model, not a patch. So the structure that isn't one layer
+deep: `LayerMosaic` — an accumulated appearance of the dominant layer
+in frame-0 coordinates, updated from every reconstruction (decoder
+keeps the same one), aligned sub-pixel by the composed layer affine,
+its LF and chroma the running mean of every frame that saw them,
+sparse by observation (weight 0 where unseen; running mean capped at
+FAO_MOSAIC_WMAX so stale content fades — the user's "not a box").
+Fourth per-region candidate beside the plate model and the two
+prev-warp layers. FAO_MOSAIC=1.
+
+  w1  48 f    352,288 / 0.97937  ->  wmax 8: 357,750 / 0.97968   wmax 32: 352,913 / 0.97970
+  SMITE 32 f  800,487 / 0.95470  ->  795,062 / 0.95455
+  shot 10, 140 f (the longest shot in the reel)
+              959,536 / 0.98177  ->  958,972 / 0.98188
+
+Chosen on 3.7% of regions; the prev-warp layer takes 90%. Neutral
+everywhere, including at 140 frames. The reading: on a slow pan the
+previous RECONSTRUCTION already is a persistent object — it carries
+accumulated appearance forward frame to frame — and a mosaic adds
+only averaging (a little quality, +0.0003 at wmax 32) and memory of
+content that left and returned, of which a shot has almost none.
+Memory pays at the timescale of cut-backs and libraries (bounded at
+the I-frame within a clip, ~10%), not inside a GOP.
+
+What the data-structure changes measured, as a pattern: structures
+that remove side-info entropy or fix the MOTION model win (layers
+-16%, context coder -5%, exact gate, WP); structures that add
+APPEARANCE memory do not, because the reconstruction already carries
+appearance perfectly on this content. The bytes are on the actor —
+81% of residual, non-rigid — and in the coder. The structure that
+addresses the actor is a deformation model per object layer (a
+coarse control-point mesh carrying the actor's non-rigid motion in a
+few dozen parameters, replacing ~1,050 per-region vectors a frame)
+— not yet built. Kept opt-in; the plate remains the mode-0 model.
+
+### Deformation field on the object layer — measured and lost (2026-09-02)
+
+The structure aimed at the 81%: `DeformField`, a control-point grid
+over the object layer carrying residual displacement past its
+affine, bilinear to every pixel (no motion blocks), quarter-pel,
+neighbour-predicted through the context coder; the object layer's
+candidate becomes the deformed warp. Fitted from block correspon-
+dences by inverse-distance weighting. FAO_DEFORM=<step px>.
+
+  w1 baseline                          352,288 / 0.97937
+  step 32, claimed + leftovers         378,773 / 0.97951   field ~330 B/frame, 26-31 x 13 cells
+  step 64, claimed + leftovers         362,628 / 0.97958
+  step 32, claimed only, SAD-gated     359,225 / 0.97947   passes the gate on 41/47 frames
+  step 64, claimed only, SAD-gated     362,808 / 0.97945
+
+Two reasons, both instructive. The field lowers whole-frame SAD by
+~1% (7.12M -> 7.05M) — 0.05 levels/px spread thin, under the dead
+zone everywhere, so it never reaches the coder while its bytes do.
+And on w1 the second layer is not a compact object: its claimed
+pairs span 48 x 20 cells at step 32. The "actor layer" on this shot
+is a second near-global affine, and a deformation grid over it is a
+whole-frame field with sparse support. A dense non-rigid motion
+model fitted from sparse 16x16 matches cannot beat an exhaustive
+per-region search against the true target; doing it properly means
+fitting the field to the CODED cost with dense flow on the object,
+which is the mesh-versus-block argument block codecs won. Kept
+opt-in.
+
+### OpenCV as the analysis front end: what dense flow and masks would buy, bounded (2026-09-02)
+
+User asked about OpenCV detection, masking and boxing to guide the
+codec. Before adding a dependency, the sandbox can bound it:
+`tools/flow_oracle.py` (opencv-python-headless) builds prediction
+y4ms for `bench` via FAO_PRED_Y4M.
+
+  ORACLE — previous reconstruction warped by DIS dense flow, flow
+  uncharged (the ceiling for ANY motion representation):
+    w1   212,943 / 0.98158 U 39.1     vs GMC defaults 352,288 / 0.97937   -40%, +0.0022
+    72% of pixels within 1 level (the region model: 50% of regions)
+  MASK — pixels deviating > 1.5 px from a RANSAC global affine of
+  the flow, opened, blobs > 2000 px:
+    41.7% of the frame in ~13 blobs; the global affine fits 42% of pixels
+  MESH — the same flow sampled on a grid, quarter-pel, delta-coded
+  zstd (proxy for the context coder), bilinear back to dense:
+    grid 16   flow 5,821 B/frame   codec 233,889   total 507 KB   worse
+    grid 32   flow 1,759 B/frame   codec 250,600   total 333,294 / 0.98093   -5.4%, +0.0016
+
+Three conclusions. Any motion model is bounded at -40% on this shot,
+and that ceiling needs per-pixel flow the decoder cannot be sent; a
+32 px mesh keeps a modest -5% (perhaps -9% through the context
+coder) and the rest of the ceiling is fine structure. Boxing and
+detection would not localise this content: the non-rigid region is
+42% of the picture in thirteen pieces, which is why the affine
+object layer and the deformation grid both found "a second global
+motion" instead of an actor. What OpenCV would contribute that the
+codec lacks is the DENSE FLOW ESTIMATOR itself (DIS: 16 s for 47
+frames at 1920x800 in Python) and wide-baseline features for the
+cross-cut cite; a detector would matter later, for appearance priors
+on the 81% of residual that sits on people, which no motion model
+touches. The dependency is defensible for the flow; it is not a
+route to the target.

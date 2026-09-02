@@ -57,6 +57,24 @@ pub struct PlateMotion {
     pub dx: f32,
     pub dy: f32,
     pub confidence: f32,
+    /// Linear part [a, b, d, e] of the frame-0 -> frame-i affine
+    /// x' = a x + b y + dx, y' = d x + e y + dy. Identity for the
+    /// translation-only estimator; `estimate_motions_affine` fills it.
+    /// Kept as a separate field so every consumer that reads dx/dy as
+    /// "the pan" keeps its meaning — dx/dy ARE the affine's translation.
+    pub lin: [f32; 4],
+}
+
+pub const LIN_ID: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+
+impl PlateMotion {
+    pub fn is_translation(&self) -> bool {
+        self.lin == LIN_ID
+    }
+    /// Frame-0 coordinates -> this frame's coordinates.
+    pub fn affine(&self) -> crate::global_motion::Affine {
+        [self.lin[0], self.lin[1], self.dx, self.lin[2], self.lin[3], self.dy]
+    }
 }
 
 /// The web: a background plate the size of the union of all warped frame
@@ -78,6 +96,9 @@ pub struct Plate {
 /// correlation (pairwise is robust to lighting drift; the cumulative sum
 /// gives each frame's offset in frame-0 coordinates).
 pub fn estimate_motions(frames: &[Yuv420]) -> Vec<PlateMotion> {
+    if std::env::var("FAO_AFFINE").map(|v| v != "0").unwrap_or(false) {
+        return estimate_motions_affine(frames);
+    }
     let mut out = Vec::with_capacity(frames.len());
     if frames.is_empty() {
         return out;
@@ -85,7 +106,7 @@ pub fn estimate_motions(frames: &[Yuv420]) -> Vec<PlateMotion> {
     let w = frames[0].w;
     let h = frames[0].h;
     let pass = PhaseCorrelationPass::new(512.min(w.min(h)));
-    out.push(PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 });
+    out.push(PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: LIN_ID });
     let (mut ax, mut ay) = (0.0f32, 0.0f32);
     for i in 1..frames.len() {
         let m = pass.estimate(&frames[i].y, &frames[i - 1].y, w, h);
@@ -96,7 +117,499 @@ pub fn estimate_motions(frames: &[Yuv420]) -> Vec<PlateMotion> {
             ax += m.dx;
             ay += m.dy;
         }
-        out.push(PlateMotion { dx: ax, dy: ay, confidence: m.confidence });
+        out.push(PlateMotion { dx: ax, dy: ay, confidence: m.confidence, lin: LIN_ID });
+    }
+    out
+}
+
+/// RANSAC over `global_motion::fit`: minimal 3-pair hypotheses, inlier
+/// count at `tol` px, LS refit on the best consensus. Returns None
+/// under 6 inliers.
+pub fn ransac_affine(pairs: &[(f32, f32, f32, f32)], tol: f32, iters: usize) -> Option<crate::global_motion::Affine> {
+    use crate::global_motion as gm;
+    if pairs.len() < 6 {
+        return None;
+    }
+    let mut seed = 0x9E3779B97F4A7C15u64 ^ (pairs.len() as u64);
+    let mut rnd = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let err = |m: &gm::Affine, p: &(f32, f32, f32, f32)| -> f32 {
+        let (x, y) = gm::apply(m, p.0, p.1);
+        ((x - p.2).powi(2) + (y - p.3).powi(2)).sqrt()
+    };
+    // exact affine from 3 pairs
+    let solve3 = |a: &(f32, f32, f32, f32), b: &(f32, f32, f32, f32), c: &(f32, f32, f32, f32)| -> Option<gm::Affine> {
+        let det = (a.0 * (b.1 - c.1) + b.0 * (c.1 - a.1) + c.0 * (a.1 - b.1)) as f64;
+        if det.abs() < 1e-3 {
+            return None;
+        }
+        let sol = |ta: f32, tb: f32, tc: f32| -> (f32, f32, f32) {
+            let (ta, tb, tc) = (ta as f64, tb as f64, tc as f64);
+            let (ax, ay, bx, by, cx, cy) = (a.0 as f64, a.1 as f64, b.0 as f64, b.1 as f64, c.0 as f64, c.1 as f64);
+            let p = (ta * (by - cy) + tb * (cy - ay) + tc * (ay - by)) / det;
+            let q = (ta * (cx - bx) + tb * (ax - cx) + tc * (bx - ax)) / det;
+            let r = (ta * (bx * cy - cx * by) + tb * (cx * ay - ax * cy) + tc * (ax * by - bx * ay)) / det;
+            (p as f32, q as f32, r as f32)
+        };
+        let (m0, m1, m2) = sol(a.2, b.2, c.2);
+        let (m3, m4, m5) = sol(a.3, b.3, c.3);
+        Some([m0, m1, m2, m3, m4, m5])
+    };
+    let mut best: Option<(usize, Vec<bool>)> = None;
+    for _ in 0..iters {
+        let i = (rnd() % pairs.len() as u64) as usize;
+        let j = (rnd() % pairs.len() as u64) as usize;
+        let k = (rnd() % pairs.len() as u64) as usize;
+        if i == j || j == k || i == k {
+            continue;
+        }
+        let Some(m) = solve3(&pairs[i], &pairs[j], &pairs[k]) else { continue };
+        let inl: Vec<bool> = pairs.iter().map(|p| err(&m, p) < tol).collect();
+        let n = inl.iter().filter(|&&b| b).count();
+        if best.as_ref().map(|b| n > b.0).unwrap_or(true) {
+            best = Some((n, inl));
+        }
+    }
+    let (n, inl) = best?;
+    if n < 6 {
+        return None;
+    }
+    let sub: Vec<_> = pairs.iter().zip(&inl).filter(|(_, &b)| b).map(|(p, _)| *p).collect();
+    let m = gm::fit(&sub)?;
+    if std::env::var("FAO_AFFINE_DEBUG").is_ok() {
+        let rms = gm::rms(&sub, &m);
+        eprintln!("ransac_affine: {n}/{} inliers at {tol} px, rms on inliers {rms:.2}", pairs.len());
+    }
+    Some(m)
+}
+
+/// Motion LAYERS between two frames: sequential RANSAC over the block
+/// correspondences. Layer 0 is the dominant affine (the camera, or the
+/// actor filling the frame — whichever most blocks agree on); its
+/// inliers are removed and the next layer is fitted to the rest,
+/// until fewer than `min_inliers` remain. Common fate, by consensus.
+///
+/// Why: on w1 a clean camera-only affine (73/115 inliers at 1 px)
+/// LOST 2.9% of bytes to the contaminated fit, because the actor is
+/// most of the picture and the contaminated fit half-tracked him.
+/// Two layers are what the picture contains; the region picks one.
+pub fn estimate_layers(prev: &Yuv420, cur: &Yuv420, max_layers: usize) -> Vec<crate::global_motion::Affine> {
+    estimate_layers_with_pairs(prev, cur, max_layers).0
+}
+
+/// As `estimate_layers`, also returning the correspondences each layer
+/// claimed and the leftovers no layer explained — the material a
+/// deformation model is fitted from.
+pub fn estimate_layers_with_pairs(
+    prev: &Yuv420,
+    cur: &Yuv420,
+    max_layers: usize,
+) -> (Vec<crate::global_motion::Affine>, Vec<Vec<(f32, f32, f32, f32)>>, Vec<(f32, f32, f32, f32)>) {
+    use crate::global_motion as gm;
+    let (w, h) = (prev.w, prev.h);
+    let pass = PhaseCorrelationPass::new(512.min(w.min(h)));
+    let pc = pass.estimate(&cur.y, &prev.y, w, h);
+    let (tdx, tdy) = if pc.confidence > 0.15 { (pc.dx, pc.dy) } else { (0.0, 0.0) };
+    let mut pairs = block_pairs(prev, cur, tdx, tdy);
+    let mut layers = Vec::new();
+    let mut claimed: Vec<Vec<(f32, f32, f32, f32)>> = Vec::new();
+    let min_inliers = 8usize;
+    while layers.len() < max_layers && pairs.len() >= min_inliers {
+        // The camera gets 1 px; later layers are objects, whose block
+        // matches are noisier (smoother texture, slight non-rigidity),
+        // and get 2 px.
+        let tol = if layers.is_empty() { 1.0 } else { 2.0 };
+        let Some(m) = ransac_affine(&pairs, tol, 400) else { break };
+        let (mine, rest): (Vec<_>, Vec<_>) = pairs.iter().partition(|p| {
+            let (x, y) = gm::apply(&m, p.0, p.1);
+            ((x - p.2).powi(2) + (y - p.3).powi(2)).sqrt() < tol * 1.5
+        });
+        if mine.len() < min_inliers {
+            break;
+        }
+        pairs = rest;
+        layers.push(m);
+        claimed.push(mine);
+    }
+    if layers.is_empty() {
+        layers.push([1.0, 0.0, tdx, 0.0, 1.0, tdy]);
+        claimed.push(Vec::new());
+    }
+    (layers, claimed, pairs)
+}
+
+/// A coarse control-point deformation over one object layer: residual
+/// displacement past the layer's affine, bilinearly interpolated to
+/// every pixel, so the layer's non-rigid motion is carried by a few
+/// dozen parameters instead of one quarter-pel vector per 16x16
+/// region — and the warp is continuous, with no block boundaries in
+/// the motion field. Displacements are in PREVIOUS-frame coordinates:
+/// source(p) = A^-1(p) + d(p). Quantised to quarter-pel on the wire.
+///
+/// Why: the ledger puts 81% of film residual on the actor, whose rigid
+/// part the affine layer took and whose deformation was being paid as
+/// ~1,050 independent vectors a frame plus the residual where 16x16
+/// blocks cannot follow a face.
+#[derive(Clone, Debug)]
+pub struct DeformField {
+    pub x0: f32,
+    pub y0: f32,
+    pub step: f32,
+    pub cols: usize,
+    pub rows: usize,
+    /// Quarter-pel displacement per control point, row-major.
+    pub qd: Vec<(i16, i16)>,
+}
+
+impl DeformField {
+    /// Fit from the correspondences an affine layer claimed plus the
+    /// leftovers, over their bounding box with one cell of margin.
+    /// Each control point takes the inverse-distance-weighted mean of
+    /// the residual displacement of pairs within 1.5 cells; points
+    /// with no support are zero (pure affine there).
+    pub fn fit(affine: &crate::global_motion::Affine, pairs: &[(f32, f32, f32, f32)], step: f32, fw: usize, fh: usize) -> Option<DeformField> {
+        use crate::global_motion as gm;
+        if pairs.len() < 6 {
+            return None;
+        }
+        let inv = gm::invert(affine)?;
+        let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for p in pairs {
+            minx = minx.min(p.2);
+            miny = miny.min(p.3);
+            maxx = maxx.max(p.2);
+            maxy = maxy.max(p.3);
+        }
+        let x0 = (minx - step).max(0.0);
+        let y0 = (miny - step).max(0.0);
+        let x1 = (maxx + step).min(fw as f32);
+        let y1 = (maxy + step).min(fh as f32);
+        let cols = ((x1 - x0) / step).ceil() as usize + 1;
+        let rows = ((y1 - y0) / step).ceil() as usize + 1;
+        if cols < 2 || rows < 2 || cols * rows > 4096 {
+            return None;
+        }
+        // residual displacement per pair, in previous-frame coords
+        let res: Vec<(f32, f32, f32, f32)> = pairs
+            .iter()
+            .map(|p| {
+                let (sx, sy) = gm::apply(&inv, p.2, p.3);
+                (p.2, p.3, p.0 - sx, p.1 - sy)
+            })
+            .collect();
+        let radius = step * 1.5;
+        let mut qd = Vec::with_capacity(cols * rows);
+        for r in 0..rows {
+            for c in 0..cols {
+                let (cx, cy) = (x0 + c as f32 * step, y0 + r as f32 * step);
+                let (mut sw, mut sx, mut sy) = (0.0f32, 0.0f32, 0.0f32);
+                for &(px, py, dx, dy) in &res {
+                    let d = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
+                    if d < radius {
+                        let wgt = 1.0 / (1.0 + d);
+                        sw += wgt;
+                        sx += wgt * dx;
+                        sy += wgt * dy;
+                    }
+                }
+                if sw > 0.0 {
+                    let (dx, dy) = ((sx / sw).clamp(-16.0, 16.0), (sy / sw).clamp(-16.0, 16.0));
+                    qd.push(((dx * 4.0).round() as i16, (dy * 4.0).round() as i16));
+                } else {
+                    qd.push((0, 0));
+                }
+            }
+        }
+        Some(DeformField { x0, y0, step, cols, rows, qd })
+    }
+
+    fn disp_at(&self, x: f32, y: f32) -> (f32, f32) {
+        let gx = ((x - self.x0) / self.step).clamp(0.0, (self.cols - 1) as f32 - 1e-3);
+        let gy = ((y - self.y0) / self.step).clamp(0.0, (self.rows - 1) as f32 - 1e-3);
+        let (c0, r0) = (gx.floor() as usize, gy.floor() as usize);
+        let (tx, ty) = (gx - c0 as f32, gy - r0 as f32);
+        let g = |c: usize, r: usize| {
+            let q = self.qd[r * self.cols + c];
+            (q.0 as f32 / 4.0, q.1 as f32 / 4.0)
+        };
+        let (a, b, c, d) = (g(c0, r0), g(c0 + 1, r0), g(c0, r0 + 1), g(c0 + 1, r0 + 1));
+        let top = (a.0 * (1.0 - tx) + b.0 * tx, a.1 * (1.0 - tx) + b.1 * tx);
+        let bot = (c.0 * (1.0 - tx) + d.0 * tx, c.1 * (1.0 - tx) + d.1 * tx);
+        (top.0 * (1.0 - ty) + bot.0 * ty, top.1 * (1.0 - ty) + bot.1 * ty)
+    }
+
+    /// Warp `prev` into the current frame by affine + deformation
+    /// inside the field's box, plain affine outside.
+    pub fn warp(&self, prev: &Yuv420, affine: &crate::global_motion::Affine, fw: usize, fh: usize) -> Yuv420 {
+        use crate::global_motion as gm;
+        let inv = match gm::invert(affine) {
+            Some(i) => i,
+            None => return prev.clone(),
+        };
+        let mut out = Yuv420::new(fw, fh);
+        let (bx1, by1) = (self.x0 + (self.cols - 1) as f32 * self.step, self.y0 + (self.rows - 1) as f32 * self.step);
+        for fy in 0..fh {
+            for fx in 0..fw {
+                let (x, y) = (fx as f32, fy as f32);
+                let (mut sx, mut sy) = gm::apply(&inv, x, y);
+                if x >= self.x0 && x <= bx1 && y >= self.y0 && y <= by1 {
+                    let (dx, dy) = self.disp_at(x, y);
+                    sx += dx;
+                    sy += dy;
+                }
+                out.y[fy * fw + fx] = bilinear(&prev.y, fw, fh, sx, sy);
+            }
+        }
+        let (cw, ch) = (fw / 2, fh / 2);
+        for fy in 0..ch {
+            for fx in 0..cw {
+                let (x, y) = ((fx * 2) as f32, (fy * 2) as f32);
+                let (mut sx, mut sy) = gm::apply(&inv, x, y);
+                if x >= self.x0 && x <= bx1 && y >= self.y0 && y <= by1 {
+                    let (dx, dy) = self.disp_at(x, y);
+                    sx += dx;
+                    sy += dy;
+                }
+                out.u[fy * cw + fx] = bilinear(&prev.u, cw, ch, sx / 2.0, sy / 2.0);
+                out.v[fy * cw + fx] = bilinear(&prev.v, cw, ch, sx / 2.0, sy / 2.0);
+            }
+        }
+        out
+    }
+
+    /// Wire bytes: box + grid header (10 B) and the quarter-pel
+    /// displacements as deltas from the mean of the left and top
+    /// neighbours, through the context coder.
+    pub fn wire_bytes(&self) -> usize {
+        use crate::bincoder::{Ctx, Encoder};
+        let mut e = Encoder::new();
+        let mut mag: Vec<Ctx> = (0..8).map(|_| Ctx::new()).collect();
+        let mut sign = Ctx::new();
+        for r in 0..self.rows {
+            for c in 0..self.cols {
+                let q = self.qd[r * self.cols + c];
+                let l = if c > 0 { self.qd[r * self.cols + c - 1] } else { (0, 0) };
+                let t = if r > 0 { self.qd[(r - 1) * self.cols + c] } else { (0, 0) };
+                let pred = ((l.0 as i32 + t.0 as i32) / 2, (l.1 as i32 + t.1 as i32) / 2);
+                e.seg(&mut mag, &mut sign, q.0 as i32 - pred.0);
+                e.seg(&mut mag, &mut sign, q.1 as i32 - pred.1);
+            }
+        }
+        10 + e.finish().len()
+    }
+}
+
+
+/// Sub-pixel block correspondences prev -> cur around a translation
+/// prior: textured 16x16 blocks on a 48 px grid, +-6 px integer search,
+/// parabolic peak refinement.
+pub fn block_pairs(prev: &Yuv420, cur: &Yuv420, tdx: f32, tdy: f32) -> Vec<(f32, f32, f32, f32)> {
+    let (w, h) = (prev.w, prev.h);
+    const B: usize = 16;
+    let step: usize = std::env::var("FAO_BLOCK_STEP").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
+    const R: i32 = 6;
+    let mut pairs: Vec<(f32, f32, f32, f32)> = Vec::new();
+    let mut by = step / 2;
+    while by + B < h {
+        let mut bx = step / 2;
+        while bx + B < w {
+            let mut mean = 0u32;
+            for y in 0..B {
+                for x in 0..B {
+                    mean += prev.y[(by + y) * w + bx + x] as u32;
+                }
+            }
+            let mean = mean / (B * B) as u32;
+            let mut var = 0u64;
+            for y in 0..B {
+                for x in 0..B {
+                    let d = prev.y[(by + y) * w + bx + x] as i64 - mean as i64;
+                    var += (d * d) as u64;
+                }
+            }
+            if var / (B * B) as u64 >= 64 {
+                let (cx, cy) = (bx as f32 + tdx, by as f32 + tdy);
+                let (cxi, cyi) = (cx.round() as i32, cy.round() as i32);
+                let side = (2 * R + 1) as usize;
+                let mut grid = vec![u32::MAX; side * side];
+                let mut best = (u32::MAX, 0i32, 0i32);
+                for oy in -R..=R {
+                    for ox in -R..=R {
+                        let (sx, sy) = (cxi + ox, cyi + oy);
+                        if sx < 0 || sy < 0 || sx as usize + B > w || sy as usize + B > h {
+                            continue;
+                        }
+                        let mut sad = 0u32;
+                        for y in 0..B {
+                            let pr = (by + y) * w + bx;
+                            let cr = (sy as usize + y) * w + sx as usize;
+                            for x in 0..B {
+                                sad += (prev.y[pr + x] as i32 - cur.y[cr + x] as i32).unsigned_abs();
+                            }
+                        }
+                        grid[(oy + R) as usize * side + (ox + R) as usize] = sad;
+                        if sad < best.0 {
+                            best = (sad, sx, sy);
+                        }
+                    }
+                }
+                if best.0 != u32::MAX {
+                    let (ox, oy) = ((best.1 - cxi + R) as usize, (best.2 - cyi + R) as usize);
+                    let sub = |m: u32, l: u32, r: u32| -> f32 {
+                        if l == u32::MAX || r == u32::MAX {
+                            return 0.0;
+                        }
+                        let d = (l as f32 - 2.0 * m as f32 + r as f32).max(1.0);
+                        ((l as f32 - r as f32) / (2.0 * d)).clamp(-0.5, 0.5)
+                    };
+                    let fx = if ox > 0 && ox + 1 < side { sub(best.0, grid[oy * side + ox - 1], grid[oy * side + ox + 1]) } else { 0.0 };
+                    let fy = if oy > 0 && oy + 1 < side { sub(best.0, grid[(oy - 1) * side + ox], grid[(oy + 1) * side + ox]) } else { 0.0 };
+                    let (px, py) = (bx as f32 + B as f32 / 2.0, by as f32 + B as f32 / 2.0);
+                    pairs.push((px, py, best.1 as f32 + fx + B as f32 / 2.0, best.2 as f32 + fy + B as f32 / 2.0));
+                }
+            }
+            bx += step;
+        }
+        by += step;
+    }
+    pairs
+}
+
+/// Global motion as a 6-DOF affine per frame, composed to frame 0.
+///
+/// Why: on the bloopers film 88% of correspondences sit within 2 px of
+/// a global AFFINE (SESSION_LOG, recorded as "the absence of parallax"
+/// and shelved). The plate was warping with 2 parameters, so a pan
+/// with any roll or zoom left the median 1-2 px misaligned across the
+/// frame; the ledger then showed 81% of regions abandoning the blurred
+/// plate for prev-MC with a motion vector each — 277 KB of side info
+/// on a 442 KB GOP. The camera is the first object in any world model
+/// of a film shot, and it needs six numbers, not two.
+///
+/// Estimation: phase correlation gives the pair translation; a grid of
+/// textured 16x16 blocks is matched around it (integer search, +-R);
+/// `global_motion::fit` solves the affine with one 3-sigma refit so
+/// the actors (a minority of blocks) drop out as outliers. Pairwise
+/// affines compose to frame 0, as the translations did.
+pub fn estimate_motions_affine(frames: &[Yuv420]) -> Vec<PlateMotion> {
+    use crate::global_motion as gm;
+    let mut out = Vec::with_capacity(frames.len());
+    if frames.is_empty() {
+        return out;
+    }
+    let (w, h) = (frames[0].w, frames[0].h);
+    let pass = PhaseCorrelationPass::new(512.min(w.min(h)));
+    out.push(PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: LIN_ID });
+    let mut acc: gm::Affine = gm::IDENTITY;
+    const B: usize = 16;
+    const STEP: usize = 48;
+    const R: i32 = 6;
+    for i in 1..frames.len() {
+        let (prev, cur) = (&frames[i - 1], &frames[i]);
+        let pc = pass.estimate(&cur.y, &prev.y, w, h);
+        // Sign: estimate_motions accumulates pc.dx as "content moved by
+        // +dx", so a frame-(i-1) point p appears at p + (dx, dy) in i.
+        let (tdx, tdy) = if pc.confidence > 0.15 { (pc.dx, pc.dy) } else { (0.0, 0.0) };
+        let mut pairs: Vec<(f32, f32, f32, f32)> = Vec::new();
+        let mut by = STEP / 2;
+        while by + B < h {
+            let mut bx = STEP / 2;
+            while bx + B < w {
+                // texture gate: skip flat blocks, they match anywhere
+                let mut mean = 0u32;
+                for y in 0..B {
+                    for x in 0..B {
+                        mean += prev.y[(by + y) * w + bx + x] as u32;
+                    }
+                }
+                let mean = mean / (B * B) as u32;
+                let mut var = 0u64;
+                for y in 0..B {
+                    for x in 0..B {
+                        let d = prev.y[(by + y) * w + bx + x] as i64 - mean as i64;
+                        var += (d * d) as u64;
+                    }
+                }
+                if var / (B * B) as u64 >= 64 {
+                    let (cx, cy) = (bx as f32 + tdx, by as f32 + tdy);
+                    let (cxi, cyi) = (cx.round() as i32, cy.round() as i32);
+                    // SAD over the whole window, kept, so the winner's
+                    // neighbours give a SUB-PIXEL peak by parabolic
+                    // fit. Integer matches left 2.4-3.2 px rms per
+                    // pair; the camera tremor this model exists to
+                    // absorb is sub-pixel, and what the global model
+                    // misses is paid again per region as a vector.
+                    let side = (2 * R + 1) as usize;
+                    let mut grid = vec![u32::MAX; side * side];
+                    let mut best = (u32::MAX, 0i32, 0i32);
+                    for oy in -R..=R {
+                        for ox in -R..=R {
+                            let (sx, sy) = (cxi + ox, cyi + oy);
+                            if sx < 0 || sy < 0 || sx as usize + B > w || sy as usize + B > h {
+                                continue;
+                            }
+                            let mut sad = 0u32;
+                            for y in 0..B {
+                                let pr = (by + y) * w + bx;
+                                let cr = (sy as usize + y) * w + sx as usize;
+                                for x in 0..B {
+                                    sad += (prev.y[pr + x] as i32 - cur.y[cr + x] as i32).unsigned_abs();
+                                }
+                            }
+                            grid[(oy + R) as usize * side + (ox + R) as usize] = sad;
+                            if sad < best.0 {
+                                best = (sad, sx, sy);
+                            }
+                        }
+                    }
+                    if best.0 != u32::MAX {
+                        let (ox, oy) = ((best.1 - cxi + R) as usize, (best.2 - cyi + R) as usize);
+                        let sub = |m: u32, l: u32, r: u32| -> f32 {
+                            if l == u32::MAX || r == u32::MAX {
+                                return 0.0;
+                            }
+                            let d = (l as f32 - 2.0 * m as f32 + r as f32).max(1.0);
+                            ((l as f32 - r as f32) / (2.0 * d)).clamp(-0.5, 0.5)
+                        };
+                        let fx = if ox > 0 && ox + 1 < side { sub(best.0, grid[oy * side + ox - 1], grid[oy * side + ox + 1]) } else { 0.0 };
+                        let fy = if oy > 0 && oy + 1 < side { sub(best.0, grid[(oy - 1) * side + ox], grid[(oy + 1) * side + ox]) } else { 0.0 };
+                        let (px, py) = (bx as f32 + B as f32 / 2.0, by as f32 + B as f32 / 2.0);
+                        pairs.push((px, py, best.1 as f32 + fx + B as f32 / 2.0, best.2 as f32 + fy + B as f32 / 2.0));
+                    }
+                }
+                bx += STEP;
+            }
+            by += STEP;
+        }
+        // Pair affine maps frame-(i-1) points to frame-i points. Fall
+        // back to the translation when the fit is unavailable.
+        //
+        // RANSAC, not one 3-sigma pass: with the actors in the block
+        // set the fitter's own residual is ~2.5 px rms, its rejection
+        // threshold 7.5 px, and an actor moving 5 px is an inlier —
+        // the camera and the actors were being fitted together.
+        // Consensus at 1 px separates them; the LS refit on the
+        // consensus set is the camera.
+        let pair = ransac_affine(&pairs, 1.0, 400).unwrap_or([1.0, 0.0, tdx, 0.0, 1.0, tdy]);
+        let pair = if pc.confidence > 0.15 { pair } else { gm::IDENTITY };
+        acc = gm::compose(&pair, &acc);
+        if std::env::var("FAO_AFFINE_DEBUG").is_ok() {
+            eprintln!(
+                "affine f{i}: pairs {} pc ({:.2},{:.2}) pair [{:.4} {:.4} {:.2} | {:.4} {:.4} {:.2}] rms {:.2}",
+                pairs.len(), tdx, tdy, pair[0], pair[1], pair[2], pair[3], pair[4], pair[5],
+                gm::rms(&pairs, &pair)
+            );
+        }
+        out.push(PlateMotion {
+            dx: acc[2],
+            dy: acc[5],
+            confidence: pc.confidence,
+            lin: [acc[0], acc[1], acc[3], acc[4]],
+        });
     }
     out
 }
@@ -110,11 +623,23 @@ pub fn build_plate(frames: &[Yuv420], motions: &[PlateMotion]) -> Plate {
     // Plate bounds in frame-0 coords: frame f occupies [-dx, -dx+fw) —
     // a camera pan of +dx moves CONTENT by -dx in frame-0 space.
     let (mut minx, mut miny, mut maxx, mut maxy) = (0.0f32, 0.0f32, fw as f32, fh as f32);
+    let any_affine = motions.iter().any(|m| !m.is_translation());
     for m in motions {
-        minx = minx.min(-m.dx);
-        miny = miny.min(-m.dy);
-        maxx = maxx.max(-m.dx + fw as f32);
-        maxy = maxy.max(-m.dy + fh as f32);
+        if m.is_translation() {
+            minx = minx.min(-m.dx);
+            miny = miny.min(-m.dy);
+            maxx = maxx.max(-m.dx + fw as f32);
+            maxy = maxy.max(-m.dy + fh as f32);
+        } else if let Some(inv) = crate::global_motion::invert(&m.affine()) {
+            // frame-i corners back into frame-0 coordinates
+            for (cx, cy) in [(0.0, 0.0), (fw as f32, 0.0), (0.0, fh as f32), (fw as f32, fh as f32)] {
+                let (x0, y0) = crate::global_motion::apply(&inv, cx, cy);
+                minx = minx.min(x0);
+                miny = miny.min(y0);
+                maxx = maxx.max(x0);
+                maxy = maxy.max(y0);
+            }
+        }
     }
     let pw = (maxx - minx).ceil() as usize;
     let ph = (maxy - miny).ceil() as usize;
@@ -135,8 +660,18 @@ pub fn build_plate(frames: &[Yuv420], motions: &[PlateMotion]) -> Plate {
                 samples.clear();
                 for (f, m) in frames.iter().zip(motions) {
                     // plate pixel (px,py) in frame f's coords:
-                    let fx = px as f32 + minx / sub as f32 + m.dx / sub as f32;
-                    let fy = py as f32 + miny / sub as f32 + m.dy / sub as f32;
+                    let (fx, fy) = if !any_affine {
+                        (
+                            px as f32 + minx / sub as f32 + m.dx / sub as f32,
+                            py as f32 + miny / sub as f32 + m.dy / sub as f32,
+                        )
+                    } else {
+                        // full-res frame-0 coordinate of this plate sample
+                        let x0 = (px * sub) as f32 + minx;
+                        let y0 = (py * sub) as f32 + miny;
+                        let (x, y) = crate::global_motion::apply(&m.affine(), x0, y0);
+                        (x / sub as f32, y / sub as f32)
+                    };
                     let (fx, fy) = (fx.round() as isize, fy.round() as isize);
                     if fx >= 0 && fy >= 0 && (fx as usize) < fw && (fy as usize) < fh {
                         samples.push(get(f)[fy as usize * fw + fx as usize]);
@@ -182,6 +717,28 @@ pub fn predict_frame(plate: &Plate, m: &PlateMotion, fw: usize, fh: usize) -> Yu
     // frame pixel (fx,fy) shows content at frame-0 coordinate
     // (fx - m.dx, fy - m.dy); that content lives at plate coordinate
     // (fx - m.dx - ox, fy - m.dy - oy).
+    if !m.is_translation() {
+        if let Some(inv) = crate::global_motion::invert(&m.affine()) {
+            for fy in 0..fh {
+                for fx in 0..fw {
+                    let (x0, y0) = crate::global_motion::apply(&inv, fx as f32, fy as f32);
+                    out.y[fy * fw + fx] =
+                        bilinear(&plate.y, plate.w, plate.h, x0 - plate.ox, y0 - plate.oy);
+                }
+            }
+            let (cw, ch) = (fw / 2, fh / 2);
+            for fy in 0..ch {
+                for fx in 0..cw {
+                    let (x0, y0) =
+                        crate::global_motion::apply(&inv, (fx * 2) as f32, (fy * 2) as f32);
+                    let (px, py) = (x0 / 2.0 - plate.ox / 2.0, y0 / 2.0 - plate.oy / 2.0);
+                    out.u[fy * cw + fx] = bilinear(&plate.u, plate.w / 2, plate.h / 2, px, py);
+                    out.v[fy * cw + fx] = bilinear(&plate.v, plate.w / 2, plate.h / 2, px, py);
+                }
+            }
+            return out;
+        }
+    }
     for fy in 0..fh {
         for fx in 0..fw {
             let px = fx as f32 - m.dx - plate.ox;
@@ -326,7 +883,7 @@ mod tests {
             }
             frames.push(f);
         }
-        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 }; frames.len()];
+        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: LIN_ID }; frames.len()];
         let plate = build_plate(&frames, &motions);
         // Plate background is the checkerboard, mover fully rejected.
         for y in 20..32 {
@@ -378,7 +935,7 @@ mod tests {
             // predict convention is "fx shows frame-0 coord fx - m.dx",
             // hence m.dx = -6t. (Content moving left in the viewport =
             // negative dx; the camera's own rightward pan is the negation.)
-            motions.push(PlateMotion { dx: -((t * 6) as f32), dy: 0.0, confidence: 1.0 });
+            motions.push(PlateMotion { dx: -((t * 6) as f32), dy: 0.0, confidence: 1.0, lin: LIN_ID });
         }
         let plate = build_plate(&frames, &motions);
         assert!(plate.w >= w + 7 * 6, "plate too narrow: {}", plate.w);
@@ -566,7 +1123,7 @@ mod tests_v2 {
             }
             frames.push(f);
         }
-        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 }; frames.len()];
+        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: LIN_ID }; frames.len()];
         let plate = build_plate(&frames, &motions);
         let opts = ResidualOpts { dead_zone: 2.0, ..ResidualOpts::default() };
         let v1 = encode_gop(&frames, &motions, &plate, &opts);
@@ -766,6 +1323,508 @@ fn search_mv(prev_y: &[u8], w: usize, h: usize, cur_y: &[u8], rx: usize, ry: usi
         }
     }
     ((qx as i8, qy as i8), qp_sad)
+}
+
+/// A persistent, accumulated appearance of one motion layer in that
+/// layer's own coordinate frame (frame 0's, for the layer tracked from
+/// the start). The one-layer-deep plate is a median frozen at GOP
+/// start, warped by two parameters, used by 6% of regions; this is
+/// what replaces it: updated from every RECONSTRUCTION (so the decoder
+/// keeps the same one), aligned sub-pixel by the layer's affine, its
+/// low frequencies and chroma the average of every frame that saw
+/// them — which is what the AV1-base hybrid supplied and what a
+/// per-frame coarse patch could not (SESSION_LOG 2026-09-02). Sparse
+/// by observation: weight 0 where nothing has been seen, and a
+/// recency-limited running mean so stale content fades. Bounds are a
+/// margin around frame 0's footprint; content that leaves them is
+/// simply not remembered.
+pub struct LayerMosaic {
+    pub w: usize,
+    pub h: usize,
+    /// Frame-0 coordinate of mosaic pixel (0,0).
+    pub ox: f32,
+    pub oy: f32,
+    pub y: Vec<f32>,
+    pub u: Vec<f32>,
+    pub v: Vec<f32>,
+    pub wy: Vec<u8>,
+    pub wc: Vec<u8>,
+}
+
+impl LayerMosaic {
+    pub fn new(fw: usize, fh: usize, margin: f32) -> Self {
+        let mw = ((fw as f32) * (1.0 + 2.0 * margin)) as usize / 2 * 2;
+        let mh = ((fh as f32) * (1.0 + 2.0 * margin)) as usize / 2 * 2;
+        LayerMosaic {
+            w: mw,
+            h: mh,
+            ox: -(fw as f32) * margin,
+            oy: -(fh as f32) * margin,
+            y: vec![0.0; mw * mh],
+            u: vec![0.0; mw * mh / 4],
+            v: vec![0.0; mw * mh / 4],
+            wy: vec![0; mw * mh],
+            wc: vec![0; mw * mh / 4],
+        }
+    }
+
+    /// Prediction of a frame whose frame-0 -> frame affine is `acc`:
+    /// every frame pixel maps back to frame-0 coordinates and samples
+    /// the mosaic where it has been observed, else takes `fallback`.
+    pub fn predict(&self, acc: &crate::global_motion::Affine, fallback: &Yuv420) -> Yuv420 {
+        let Some(inv) = crate::global_motion::invert(acc) else { return fallback.clone() };
+        let (fw, fh) = (fallback.w, fallback.h);
+        let mut out = fallback.clone();
+        let sample = |p: &[f32], wt: &[u8], pw: usize, ph: usize, x: f32, y: f32| -> Option<f32> {
+            if x < 0.0 || y < 0.0 || x >= (pw - 1) as f32 || y >= (ph - 1) as f32 {
+                return None;
+            }
+            let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+            let (tx, ty) = (x - x0 as f32, y - y0 as f32);
+            let i = y0 * pw + x0;
+            if wt[i] == 0 || wt[i + 1] == 0 || wt[i + pw] == 0 || wt[i + pw + 1] == 0 {
+                return None;
+            }
+            let top = p[i] * (1.0 - tx) + p[i + 1] * tx;
+            let bot = p[i + pw] * (1.0 - tx) + p[i + pw + 1] * tx;
+            Some(top * (1.0 - ty) + bot * ty)
+        };
+        for fy in 0..fh {
+            for fx in 0..fw {
+                let (x0, y0) = crate::global_motion::apply(&inv, fx as f32, fy as f32);
+                if let Some(v) = sample(&self.y, &self.wy, self.w, self.h, x0 - self.ox, y0 - self.oy) {
+                    out.y[fy * fw + fx] = v.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        let (cw, ch) = (fw / 2, fh / 2);
+        for fy in 0..ch {
+            for fx in 0..cw {
+                let (x0, y0) = crate::global_motion::apply(&inv, (fx * 2) as f32, (fy * 2) as f32);
+                let (mx, my) = ((x0 - self.ox) / 2.0, (y0 - self.oy) / 2.0);
+                if let Some(v) = sample(&self.u, &self.wc, self.w / 2, self.h / 2, mx, my) {
+                    out.u[fy * cw + fx] = v.round().clamp(0.0, 255.0) as u8;
+                }
+                if let Some(v) = sample(&self.v, &self.wc, self.w / 2, self.h / 2, mx, my) {
+                    out.v[fy * cw + fx] = v.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        out
+    }
+
+    /// Fold a reconstructed frame in: each frame pixel whose region is
+    /// `keep` splats (nearest) into the mosaic as a running mean with
+    /// weight capped at `wmax`, so a fresh observation always moves the
+    /// stored value by at least 1/wmax of the way.
+    pub fn update(&mut self, recon: &Yuv420, acc: &crate::global_motion::Affine, keep: &dyn Fn(usize, usize) -> bool, wmax: u8) {
+        let Some(inv) = crate::global_motion::invert(acc) else { return };
+        let (fw, fh) = (recon.w, recon.h);
+        for fy in 0..fh {
+            for fx in 0..fw {
+                if !keep(fx, fy) {
+                    continue;
+                }
+                let (x0, y0) = crate::global_motion::apply(&inv, fx as f32, fy as f32);
+                let (mx, my) = ((x0 - self.ox).round(), (y0 - self.oy).round());
+                if mx < 0.0 || my < 0.0 || mx >= self.w as f32 || my >= self.h as f32 {
+                    continue;
+                }
+                let i = my as usize * self.w + mx as usize;
+                let wt = self.wy[i] as f32;
+                self.y[i] = (self.y[i] * wt + recon.y[fy * fw + fx] as f32) / (wt + 1.0);
+                self.wy[i] = (self.wy[i] + 1).min(wmax);
+                if fx % 2 == 0 && fy % 2 == 0 {
+                    let ci = (my as usize / 2) * (self.w / 2) + mx as usize / 2;
+                    let wc = self.wc[ci] as f32;
+                    let fi = (fy / 2) * (fw / 2) + fx / 2;
+                    self.u[ci] = (self.u[ci] * wc + recon.u[fi] as f32) / (wc + 1.0);
+                    self.v[ci] = (self.v[ci] * wc + recon.v[fi] as f32) / (wc + 1.0);
+                    self.wc[ci] = (self.wc[ci] + 1).min(wmax);
+                }
+            }
+        }
+    }
+}
+
+/// Frame-level weighted prediction for one reference: `y' = a*y + b`
+/// per plane, one (a, b) for the whole frame. What HEVC calls
+/// weighted prediction and what this codec was missing.
+///
+/// Why it exists, measured (fao_engine_capture, soldier, 48 f, dz32):
+/// with an EXACT engine canonical plus a +-5% global exposure drift,
+/// the per-region gain correction below spent 355-910 B/frame of side
+/// info tracking one number — 56% of the whole encode — because each
+/// region's quantised (a, b) pair rounds differently and zstd finds no
+/// repeats to bite on. Frame 0, where the drift is exactly 1.0, cost
+/// 17 B of side. One (a, b) per reference per frame is what the drift
+/// IS; the per-region pass then only has local work left.
+///
+/// `a` is quantised to 1/1024 (i16), `b` to integers (i8). Fit is
+/// least squares over every pixel of the plane; a global fit is robust
+/// to local misprediction because misaligned pixels pull toward
+/// identity, not away from it. Gated on L1 improvement so an
+/// uncorrelated reference (a wild prev under fast motion) keeps
+/// identity at zero cost.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WeightedPred {
+    pub qa: [i16; 3],
+    pub b: [i8; 3],
+}
+
+impl WeightedPred {
+    pub fn is_identity(&self) -> bool {
+        self.qa == [1024; 3] && self.b == [0; 3]
+    }
+    /// Wire bytes: 3 x (i16 + i8).
+    pub const WIRE: usize = 9;
+    pub fn write(&self, out: &mut Vec<u8>) {
+        for c in 0..3 {
+            out.extend_from_slice(&self.qa[c].to_le_bytes());
+            out.push(self.b[c] as u8);
+        }
+    }
+}
+
+fn fit_plane_gain(pred: &[u8], target: &[u8]) -> (i16, i8) {
+    // Two-pass robust least squares. The plain fit is biased toward
+    // a < 1 on any predictor that is wrong in places (regression
+    // dilution): the photometric marker bank measured a = 0.80-0.88
+    // on a misaligned prev reference whose true exposure change was
+    // 1%, and the plate on film fitted a = 0.75. Refitting on the
+    // pixels within WP_INLIER levels of the first fit keeps every
+    // pixel of an exact canonical and drops the misaligned ones, so
+    // a bad reference lands on identity instead of on a contrast
+    // reduction that the dead zone then hides.
+    let wp_inlier: f64 = std::env::var("FAO_WP_INLIER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6.0);
+    // Returns (a, mean_p, mean_t): b is derived AFTER a is clamped and
+    // quantised, from the same sums. Deriving b from the unclamped a
+    // and clamping afterwards produced (0.5, +127) on a near-flat
+    // frame — an inconsistent pair that cost 3.4 KB of residual on
+    // one frame of an otherwise exact canonical.
+    let fit = |keep: &dyn Fn(usize) -> bool| -> Option<(f64, f64, f64)> {
+        let (mut n, mut sp, mut st, mut spp, mut spt) = (0.0f64, 0.0f64, 0.0, 0.0, 0.0);
+        for (i, (&p, &t)) in pred.iter().zip(target).enumerate() {
+            if !keep(i) {
+                continue;
+            }
+            let (p, t) = (p as f64, t as f64);
+            n += 1.0;
+            sp += p;
+            st += t;
+            spp += p * p;
+            spt += p * t;
+        }
+        let denom = n * spp - sp * sp;
+        if n < 64.0 || denom.abs() < 1e-6 {
+            return None;
+        }
+        Some(((n * spt - sp * st) / denom, sp / n, st / n))
+    };
+    let Some((a0, mp0, mt0)) = fit(&|_| true) else { return (1024, 0) };
+    let b0 = mt0 - a0.clamp(0.5, 2.0) * mp0;
+    let a0c = a0.clamp(0.5, 2.0);
+    let (a, mp, mt) = fit(&|i| ((target[i] as f64) - (a0c * pred[i] as f64 + b0)).abs() <= wp_inlier)
+        .unwrap_or((a0, mp0, mt0));
+    let a = a.clamp(0.5, 2.0);
+    let qa = (a * 1024.0).round() as i16;
+    let a = qa as f64 / 1024.0;
+    let b = (mt - a * mp).round().clamp(-127.0, 127.0) as i8;
+    (qa, b)
+}
+
+fn plane_l1(pred: &[u8], target: &[u8], qa: i16, b: i8) -> i64 {
+    let a = qa as f64 / 1024.0;
+    let b = b as f64;
+    let mut e = 0i64;
+    for (&p, &t) in pred.iter().zip(target) {
+        let v = (a * p as f64 + b).round().clamp(0.0, 255.0);
+        e += (v - t as f64).abs() as i64;
+    }
+    e
+}
+
+/// Fit a frame-level (a, b) per plane against `target`; `None` when the
+/// fit does not clear the gate on total L1 across the three planes.
+/// The gate is in levels-per-pixel of improvement (FAO_WP_GATE,
+/// default 1/64): the correction costs 9 side bytes, so almost any
+/// real improvement pays, and the gate exists to reject noise fits
+/// rather than to price the bytes.
+pub fn fit_weighted_pred(pred: &Yuv420, target: &Yuv420) -> Option<WeightedPred> {
+    let gate: f64 = std::env::var("FAO_WP_GATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0 / 64.0);
+    let planes = [(&pred.y, &target.y), (&pred.u, &target.u), (&pred.v, &target.v)];
+    let mut wp = WeightedPred { qa: [1024; 3], b: [0; 3] };
+    let (mut e_raw, mut e_cor, mut npx) = (0i64, 0i64, 0usize);
+    for (c, (p, t)) in planes.iter().enumerate() {
+        let (qa, b) = fit_plane_gain(p, t);
+        let raw = plane_l1(p, t, 1024, 0);
+        let cor = plane_l1(p, t, qa, b);
+        // Per plane: keep identity if the fit does not help that plane.
+        if cor < raw {
+            wp.qa[c] = qa;
+            wp.b[c] = b;
+            e_cor += cor;
+        } else {
+            e_cor += raw;
+        }
+        e_raw += raw;
+        npx += p.len();
+    }
+    if wp.is_identity() {
+        return None;
+    }
+    if (e_raw - e_cor) as f64 > gate * npx as f64 {
+        Some(wp)
+    } else {
+        None
+    }
+}
+
+pub fn apply_weighted_pred(f: &mut Yuv420, wp: &WeightedPred) {
+    for (c, plane) in [&mut f.y, &mut f.u, &mut f.v].into_iter().enumerate() {
+        if wp.qa[c] == 1024 && wp.b[c] == 0 {
+            continue;
+        }
+        let a = wp.qa[c] as f32 / 1024.0;
+        let b = wp.b[c] as f32;
+        for v in plane.iter_mut() {
+            *v = (a * *v as f32 + b).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// True when `pred` is EXACT for this region up to rounding: every
+/// luma and 420-chroma sample within `EXACT_TOL` of the target.
+///
+/// Why this and not "codes as skip under the dead zone": the first
+/// version of this gate tested the residual coder's own skip
+/// condition, and it lost 0.045 MS-SSIM on film for -28% bytes — ten
+/// times worse than the dead-zone ladder. Under dz32 a region can be
+/// ~16 levels off everywhere and still code as skip, and on film the
+/// raw-SAD mode decision was quietly choosing the better of plate /
+/// prev-MC / intra for exactly those sub-dead-zone regions. That
+/// choice never reaches the residual, and it is where a large share of
+/// the quality comes from. A gate that suppresses it must only fire
+/// where NO predictor could do materially better, which is what
+/// "exact up to rounding" means.
+///
+/// Measured need (fao_engine_capture, soldier, exact canonical +
+/// exposure, after weighted prediction): frames whose residual stream
+/// was EMPTY still carried 90-186 B of side info — intra DC beating an
+/// exact canonical on flat-shaded walls (`0 + intra_gate < rounding
+/// noise`) and per-region gain pairs firing to remove +-1 rounding.
+/// Neither is worth a byte on MS-SSIM, and with the model already
+/// within rounding, mode 0 with no correction is the cheapest
+/// decodable choice.
+fn region_is_exact(pred: &Yuv420, f: &Yuv420, rx: usize, ry: usize) -> bool {
+    let exact_tol: i32 = std::env::var("FAO_EXACT_TOL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let fw = f.w;
+    for dy in 0..REGION {
+        let row = (ry + dy) * fw + rx;
+        for i in row..row + REGION {
+            if (f.y[i] as i32 - pred.y[i] as i32).abs() > exact_tol {
+                return false;
+            }
+        }
+    }
+    let cw = fw / 2;
+    let (crx, cry) = (rx / 2, ry / 2);
+    for (pp, fp) in [(&pred.u, &f.u), (&pred.v, &f.v)] {
+        for dy in 0..REGION / 2 {
+            let row = (cry + dy) * cw + crx;
+            for i in row..row + REGION / 2 {
+                if (fp[i] as i32 - pp[i] as i32).abs() > exact_tol {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// The COARSE LEVEL of the prediction: an LF/chroma correction coded
+/// at 1/`scale` resolution with a fine dead zone, applied to the
+/// composite before the full-resolution residual.
+///
+/// Why (SESSION_LOG 2026-09-02): a 29 KB AV1 base at 1/8 resolution
+/// used as the model took film -24% and chroma +4.6 dB, and the
+/// quarter-res base got 0.988. The base's value was accurate LOW
+/// FREQUENCIES AND CHROMA; the codec's own predictors get those wrong
+/// and the dz32 dead zone then refuses to fix a 10-level DC error
+/// because it is 16 levels of DCT-domain zone away. At 1/8 resolution
+/// the same correction is 1/64 of the pixels, so a fine dead zone is
+/// cheap, and every 4x4 block there is a 32x32 block of DC here.
+/// This is the object's coarse level, inside the codec.
+///
+/// Returns the corrected composite and the coarse stream's bytes.
+fn coarse_correct(composite: &Yuv420, f: &Yuv420, scale: usize, dz: f32) -> (Yuv420, usize) {
+    let (w, h) = (f.w, f.h);
+    // low-res dims, padded to a multiple of 8 so chroma is a multiple of 4
+    let (lw0, lh0) = (w / scale, h / scale);
+    let (lw, lh) = ((lw0 + 7) / 8 * 8, (lh0 + 7) / 8 * 8);
+    if lw0 < 16 || lh0 < 16 {
+        return (composite.clone(), 0);
+    }
+    let down = |src: &Yuv420| -> Yuv420 {
+        let mut o = Yuv420::new(lw, lh);
+        let box_avg = |p: &[u8], pw: usize, ph: usize, x: usize, y: usize, s: usize| -> u8 {
+            let (mut acc, mut n) = (0u32, 0u32);
+            for dy in 0..s {
+                for dx in 0..s {
+                    let (px, py) = ((x * s + dx).min(pw - 1), (y * s + dy).min(ph - 1));
+                    acc += p[py * pw + px] as u32;
+                    n += 1;
+                }
+            }
+            ((acc + n / 2) / n) as u8
+        };
+        for y in 0..lh {
+            for x in 0..lw {
+                o.y[y * lw + x] = box_avg(&src.y, w, h, x.min(lw0 - 1), y.min(lh0 - 1), scale);
+            }
+        }
+        let (cw, ch) = (w / 2, h / 2);
+        let (clw, clh) = (lw / 2, lh / 2);
+        let (clw0, clh0) = ((lw0 / 2).max(1), (lh0 / 2).max(1));
+        for y in 0..clh {
+            for x in 0..clw {
+                o.u[y * clw + x] = box_avg(&src.u, cw, ch, x.min(clw0 - 1), y.min(clh0 - 1), scale);
+                o.v[y * clw + x] = box_avg(&src.v, cw, ch, x.min(clw0 - 1), y.min(clh0 - 1), scale);
+            }
+        }
+        o
+    };
+    let c_lo = down(composite);
+    let f_lo = down(f);
+    let opts_lo = crate::residual::ResidualOpts { dead_zone: dz, ..crate::residual::ResidualOpts::default() };
+    let p444 = interleave_444(&c_lo);
+    let t444 = interleave_444(&f_lo);
+    let Some(trailer) = crate::residual::encode(&p444, &t444, lw, lh, &opts_lo) else {
+        return (composite.clone(), 0);
+    };
+    let bytes = trailer.len();
+    let dec = deinterleave_420(&crate::residual::apply(p444, &trailer, lw, lh), lw, lh);
+    // correction = decoded - coarse composite, upsampled bilinearly
+    let mut out = composite.clone();
+    let up = |dst: &mut [u8], dw: usize, dh: usize, dec_p: &[u8], base_p: &[u8], pw: usize, ph: usize, s: usize| {
+        for y in 0..dh {
+            let fy = ((y as f32 + 0.5) / s as f32 - 0.5).max(0.0);
+            let y0 = (fy.floor() as usize).min(ph - 1);
+            let y1 = (y0 + 1).min(ph - 1);
+            let ty = fy - y0 as f32;
+            for x in 0..dw {
+                let fx = ((x as f32 + 0.5) / s as f32 - 0.5).max(0.0);
+                let x0 = (fx.floor() as usize).min(pw - 1);
+                let x1 = (x0 + 1).min(pw - 1);
+                let tx = fx - x0 as f32;
+                let d = |p: &[u8], i: usize| p[i] as f32;
+                let c00 = d(dec_p, y0 * pw + x0) - d(base_p, y0 * pw + x0);
+                let c10 = d(dec_p, y0 * pw + x1) - d(base_p, y0 * pw + x1);
+                let c01 = d(dec_p, y1 * pw + x0) - d(base_p, y1 * pw + x0);
+                let c11 = d(dec_p, y1 * pw + x1) - d(base_p, y1 * pw + x1);
+                let corr = (c00 * (1.0 - tx) + c10 * tx) * (1.0 - ty) + (c01 * (1.0 - tx) + c11 * tx) * ty;
+                let i = y * dw + x;
+                dst[i] = (dst[i] as f32 + corr).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    };
+    up(&mut out.y, w, h, &dec.y, &c_lo.y, lw, lh, scale);
+    up(&mut out.u, w / 2, h / 2, &dec.u, &c_lo.u, lw / 2, lh / 2, scale);
+    up(&mut out.v, w / 2, h / 2, &dec.v, &c_lo.v, lw / 2, lh / 2, scale);
+    (out, bytes)
+}
+
+/// Coarse level of the prediction: an LF/chroma correction coded at
+/// 1/`scale` resolution with a fine dead zone, before the HF residual.
+///
+/// Why (SESSION_LOG 2026-09-02): an 8x-downscaled AV1 base used as
+/// the model cut film bytes 24% and raised chroma 4.6 dB, and the
+/// mechanism was not the second codec — it was accurate LOW
+/// FREQUENCIES AND CHROMA, which the codec's predictors get wrong and
+/// the full-resolution dead zone then refuses to fix (a 16-level DC
+/// error sits under dz32's zone; a 4x4 block cannot say "this whole
+/// region is 6 levels too dark" for one byte). At 1/8 resolution the
+/// same correction is 1/64 of the pixels, so a fine dead zone there
+/// is cheap, and the residual coder's skip-RLE leaves the level EMPTY
+/// wherever the prediction was already right: the coarse level is
+/// sparse by the same test as everything else, not a box.
+///
+/// Returns the bytes charged. The decoder repeats: decode the coarse
+/// residual, upsample the decoded correction, add.
+fn lf_correct(composite: &mut Yuv420, f: &Yuv420, scale: usize, opts: &ResidualOpts) -> usize {
+    let (w, h) = (f.w, f.h);
+    if scale < 2 || w % (2 * scale) != 0 || h % (2 * scale) != 0 {
+        return 0;
+    }
+    let (lw, lh) = (w / scale, h / scale);
+    let (pw, ph) = ((lw + 7) / 8 * 8, (lh + 7) / 8 * 8);
+    let down = |p: &[u8], pw_: usize, ph_: usize, s: usize, ow: usize, oh: usize| -> Vec<u8> {
+        let (dw, dh) = (pw_ / s, ph_ / s);
+        let mut o = vec![0u8; ow * oh];
+        for y in 0..oh {
+            for x in 0..ow {
+                let (sx, sy) = (x.min(dw - 1), y.min(dh - 1));
+                let mut acc = 0u32;
+                for yy in 0..s {
+                    for xx in 0..s {
+                        acc += p[(sy * s + yy) * pw_ + sx * s + xx] as u32;
+                    }
+                }
+                o[y * ow + x] = ((acc + (s * s / 2) as u32) / (s * s) as u32) as u8;
+            }
+        }
+        o
+    };
+    let mk = |src: &Yuv420| -> Yuv420 {
+        let mut o = Yuv420::new(pw, ph);
+        o.y = down(&src.y, w, h, scale, pw, ph);
+        o.u = down(&src.u, w / 2, h / 2, scale, pw / 2, ph / 2);
+        o.v = down(&src.v, w / 2, h / 2, scale, pw / 2, ph / 2);
+        o
+    };
+    let comp_lo = mk(composite);
+    let f_lo = mk(f);
+    let p444 = interleave_444(&comp_lo);
+    let t444 = interleave_444(&f_lo);
+    let Some(trailer) = residual::encode(&p444, &t444, pw, ph, opts) else { return 0 };
+    let bytes = trailer.len();
+    let dec = deinterleave_420(&residual::apply(p444, &trailer, pw, ph), pw, ph);
+    let up_add = |plane: &mut [u8], fw_: usize, fh_: usize, lo_dec: &[u8], lo_pred: &[u8], lo_w: usize, s: usize| {
+        let lo_h = lo_dec.len() / lo_w;
+        for y in 0..fh_ {
+            let sy = ((y as f32 + 0.5) / s as f32 - 0.5).max(0.0);
+            let y0 = (sy.floor() as usize).min(lo_h - 1);
+            let y1 = (y0 + 1).min(lo_h - 1);
+            let ty = sy - y0 as f32;
+            for x in 0..fw_ {
+                let sx = ((x as f32 + 0.5) / s as f32 - 0.5).max(0.0);
+                let x0 = (sx.floor() as usize).min(lo_w - 1);
+                let x1 = (x0 + 1).min(lo_w - 1);
+                let tx = sx - x0 as f32;
+                let c = |i: usize| lo_dec[i] as f32 - lo_pred[i] as f32;
+                let top = c(y0 * lo_w + x0) * (1.0 - tx) + c(y0 * lo_w + x1) * tx;
+                let bot = c(y1 * lo_w + x0) * (1.0 - tx) + c(y1 * lo_w + x1) * tx;
+                let corr = top * (1.0 - ty) + bot * ty;
+                if corr != 0.0 {
+                    let i = y * fw_ + x;
+                    plane[i] = (plane[i] as f32 + corr).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    };
+    up_add(&mut composite.y, w, h, &dec.y, &comp_lo.y, pw, scale);
+    up_add(&mut composite.u, w / 2, h / 2, &dec.u, &comp_lo.u, pw / 2, scale);
+    up_add(&mut composite.v, w / 2, h / 2, &dec.v, &comp_lo.v, pw / 2, scale);
+    bytes
 }
 
 fn copy_region_mc(dst: &mut Yuv420, prev: &Yuv420, rx: usize, ry: usize, mv: (i8, i8)) {
@@ -1069,7 +2128,7 @@ pub fn load_plate(path: &str) -> std::io::Result<Plate> {
 pub fn align_plate_affine(plate: &Plate, frame0: &Yuv420) -> (Plate, crate::global_motion::Affine) {
     use crate::global_motion as gm;
     let (fw, fh) = (frame0.w, frame0.h);
-    let zero = PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 };
+    let zero = PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: LIN_ID };
     let pred0 = predict_frame(plate, &zero, fw, fh);
     // Block correspondences: pred0-view coords -> frame coords.
     let mut pairs: Vec<(f32, f32, f32, f32)> = Vec::new();
@@ -1144,14 +2203,14 @@ pub fn align_plate_affine(plate: &Plate, frame0: &Yuv420) -> (Plate, crate::glob
 pub fn motions_against_plate(frames: &[Yuv420], plate: &Plate) -> Vec<PlateMotion> {
     use crate::phase_correlation::PhaseCorrelationPass;
     let (fw, fh) = (frames[0].w, frames[0].h);
-    let zero = PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 };
+    let zero = PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: LIN_ID };
     let pred0 = predict_frame(plate, &zero, fw, fh);
     let pc = PhaseCorrelationPass::new(512.min(fw.min(fh)));
     let a = pc.estimate(&frames[0].y, &pred0.y, fw, fh);
     let (ax, ay) = if a.confidence > 0.1 { (-a.dx, -a.dy) } else { (0.0, 0.0) };
     estimate_motions(frames)
         .into_iter()
-        .map(|m| PlateMotion { dx: m.dx + ax, dy: m.dy + ay, confidence: m.confidence })
+        .map(|m| PlateMotion { dx: m.dx + ax, dy: m.dy + ay, confidence: m.confidence, lin: LIN_ID })
         .collect()
 }
 
@@ -2119,22 +3178,222 @@ pub fn encode_gop_v3_core(
         .unwrap_or_else(|| (64.0 * opts.dead_zone).max(512.0) as u32);
     const MRU_CAP: usize = 128;
 
+    let wp_on = std::env::var("FAO_NO_WP").is_err();
+    // Exact-region gate, default ON at tolerance 1 (region_is_exact).
+    // Swept: off / tol 1 / tol 2 on film w1, SMITE, soldier:
+    //   w1 (film)      441,459/0.97721 | 441,967/0.97711 | 440,179/0.97684
+    //   soldier entity   5,576         |   1,997         |   1,626
+    // tol 2 is a priced LOSS on film (3.5 MB per MS-SSIM point against
+    // a 27 MB ladder); tol 1 moves film by +0.1% bytes / -0.0001, a
+    // deterministic ripple rather than a trade, and takes 64% off the
+    // exact-canonical encode. FAO_SKIPGATE=0 disables; FAO_EXACT_TOL
+    // overrides the tolerance for sweeps.
+    let skipgate = std::env::var("FAO_SKIPGATE").map(|v| v != "0").unwrap_or(true);
+    // ── GLOBAL-MOTION MODEL (FAO_GMC=1): the mode-0 predictor for
+    // frame i is the previous RECONSTRUCTION warped by the pairwise
+    // global affine, instead of the long-term plate. The ledger on
+    // film measured the median plate at 7.5 levels/px median error
+    // and used by 6% of regions, against the previous frame at 1.1
+    // levels/px and within 2 levels on 66% — the camera is the first
+    // object, and this makes its motion free per region. Six numbers
+    // per frame on the wire (charged as 16 B on top of the 8 the
+    // caller already counts). Frame 0 keeps the caller's model.
+    // Default ON since 2026-09-02, two layers, margin 128 — measured
+    // on both content types, both axes (bench, dz32):
+    //   w1 film   440,102 / 0.97732  ->  370,196 / 0.97937   -16%
+    //   SMITE     861,688 / 0.95415  ->  819,564 / 0.95470    -5%
+    // FAO_GMC=0 restores the plate-only model.
+    let gmc = std::env::var("FAO_GMC").map(|v| v != "0").unwrap_or(true);
+    let mut gmc_extra_bytes = 0usize;
+    // ── Persistent layer mosaic (FAO_MOSAIC=1): accumulated appearance
+    // of the dominant layer in frame-0 coordinates; a fourth candidate
+    // per region, updated from each reconstruction. See LayerMosaic.
+    let mosaic_on = std::env::var("FAO_MOSAIC").map(|v| v != "0").unwrap_or(false) && gmc;
+    let mosaic_wmax: u8 = std::env::var("FAO_MOSAIC_WMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let mut mosaic: Option<LayerMosaic> = if mosaic_on { Some(LayerMosaic::new(fw, fh, 0.25)) } else { None };
+    let mut mosaic_acc: crate::global_motion::Affine = crate::global_motion::IDENTITY;
+    let mut mosaic_ci: usize = usize::MAX;
     for (fi, f) in frames.iter().enumerate() {
-        let plate_pred = pred_for(fi);
+        let mut layer_sel: Option<Vec<u8>> = None;
+        let mut plate_pred = if gmc && fi > 0 {
+            // Motion LAYERS: the previous reconstruction warped by
+            // each of up to FAO_GMC_LAYERS affines (camera, actor,
+            // ...), plus the caller's model; every region takes the
+            // candidate with the lowest luma SAD. One symbol per
+            // region, zstd'd with the frame's side info; 16 B per
+            // layer. A per-FRAME choice was tried first and kept the
+            // actor and the camera fighting over one affine.
+            let max_layers: usize = std::env::var("FAO_GMC_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+            let prev = &recon[fi - 1];
+            let (layers, claimed, leftover) = estimate_layers_with_pairs(&frames[fi - 1], f, max_layers);
+            let deform_step: f32 = std::env::var("FAO_DEFORM").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            let as_plate = Plate {
+                w: prev.w,
+                h: prev.h,
+                ox: 0.0,
+                oy: 0.0,
+                y: prev.y.clone(),
+                u: prev.u.clone(),
+                v: prev.v.clone(),
+            };
+            let mut cands: Vec<Yuv420> = vec![pred_for(fi)];
+            for (li, m) in layers.iter().enumerate() {
+                // Object layers (index >= 1) carry a deformation field
+                // when FAO_DEFORM=<step px> is set: their candidate is
+                // the deformed warp, fitted from the pairs the layer
+                // claimed plus the leftovers no layer explained.
+                let pm = PlateMotion { dx: m[2], dy: m[5], confidence: 1.0, lin: [m[0], m[1], m[3], m[4]] };
+                let rigid = predict_frame(&as_plate, &pm, fw, fh);
+                // Fitted from the pairs this layer CLAIMED (compact:
+                // the object), not the leftovers (scattered noise that
+                // stretched the box over the whole frame at 330 B a
+                // frame). Emitted only if it beats the rigid warp by
+                // its own wire cost in SAD terms — one flag bit.
+                let field = if deform_step >= 8.0 && li >= 1 {
+                    DeformField::fit(m, &claimed[li], deform_step, fw, fh)
+                } else {
+                    None
+                };
+                let _ = &leftover;
+                let mut pushed = false;
+                if let Some(fd) = field {
+                    let warped = fd.warp(prev, m, fw, fh);
+                    let sad = |p: &Yuv420| -> u64 {
+                        p.y.iter().zip(&f.y).map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs() as u64).sum()
+                    };
+                    let (s_rigid, s_def) = (sad(&rigid), sad(&warped));
+                    let cost = fd.wire_bytes();
+                    // 8 SAD per byte: the residual coder's rough
+                    // exchange rate at dz32 (one byte buys ~8 levels)
+                    if s_def + (cost as u64) * 8 < s_rigid {
+                        gmc_extra_bytes += cost;
+                        if std::env::var("FAO_GMC_DEBUG").is_ok() {
+                            eprintln!("deform f{fi} layer {li}: {}x{} grid, {} B, SAD {} -> {}", fd.cols, fd.rows, cost, s_rigid, s_def);
+                        }
+                        cands.push(warped);
+                        pushed = true;
+                    }
+                }
+                gmc_extra_bytes += 1;
+                if !pushed {
+                    cands.push(rigid);
+                }
+            }
+            gmc_extra_bytes += 16 * layers.len();
+            // Mosaic candidate: follows layer 0 (the dominant affine);
+            // its accumulated frame-0 -> frame-i map composes the
+            // pairwise affines. Falls back to the plate model where
+            // nothing has been observed yet.
+            mosaic_ci = usize::MAX;
+            if let (Some(mo), Some(m0)) = (mosaic.as_ref(), layers.first()) {
+                mosaic_acc = crate::global_motion::compose(m0, &mosaic_acc);
+                cands.push(mo.predict(&mosaic_acc, &cands[0]));
+                mosaic_ci = cands.len() - 1;
+            }
+            // Default candidate: the camera layer when there is one.
+            // Another candidate must beat it by FAO_GMC_MARGIN SAD
+            // (default 128 over 256 px, i.e. half a level) — without
+            // the margin the map flipped wherever candidates tied and
+            // cost ~950 B/frame, more than it saved.
+            let default_ci = if layers.is_empty() { 0 } else { 1 };
+            let margin: u32 = std::env::var("FAO_GMC_MARGIN").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+            // FAO_GMC_SEL_FROM_MODEL=1: the layer choice is made
+            // against the caller's MODEL instead of the source, so a
+            // decoder holding the same model (an upscaled base layer)
+            // makes the identical choice and the map costs nothing.
+            let sel_from_model = std::env::var("FAO_GMC_SEL_FROM_MODEL").map(|v| v != "0").unwrap_or(false);
+            let referee: &Yuv420 = if sel_from_model { &cands[0] } else { f };
+            let mut composite = cands[default_ci].clone();
+            let mut sel: Vec<u8> = vec![default_ci as u8; gw * gh];
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    let (rx, ry) = (gx * REGION, gy * REGION);
+                    let base = sad_region(&cands[default_ci].y, fw, fh, rx as i32, ry as i32, &referee.y, rx, ry);
+                    let mut best = (base, default_ci);
+                    for (ci, c) in cands.iter().enumerate() {
+                        if ci == default_ci || (sel_from_model && ci == 0) {
+                            continue;
+                        }
+                        let sd = sad_region(&c.y, fw, fh, rx as i32, ry as i32, &referee.y, rx, ry);
+                        if sd + margin < best.0 {
+                            best = (sd, ci);
+                        }
+                    }
+                    let ci = best.1;
+                    sel[gy * gw + gx] = ci as u8;
+                    if ci != default_ci {
+                        let src = &cands[ci];
+                        for dy in 0..REGION {
+                            let o = (ry + dy) * fw + rx;
+                            composite.y[o..o + REGION].copy_from_slice(&src.y[o..o + REGION]);
+                        }
+                        let cw = fw / 2;
+                        for dy in 0..REGION / 2 {
+                            let o = (ry / 2 + dy) * cw + rx / 2;
+                            composite.u[o..o + REGION / 2].copy_from_slice(&src.u[o..o + REGION / 2]);
+                            composite.v[o..o + REGION / 2].copy_from_slice(&src.v[o..o + REGION / 2]);
+                        }
+                    }
+                }
+            }
+            if !sel_from_model {
+                gmc_extra_bytes += zstd::encode_all(sel.as_slice(), 19).map(|c| c.len()).unwrap_or(sel.len());
+            }
+            if std::env::var("FAO_GMC_DEBUG").is_ok() {
+                let mut hist = vec![0usize; cands.len()];
+                for &v in &sel { hist[v as usize] += 1; }
+                eprintln!("gmc f{fi}: layers {} pick {:?}", layers.len(), hist);
+            }
+            layer_sel = Some(sel);
+            composite
+        } else {
+            pred_for(fi)
+        };
+        // ── Frame-level weighted prediction, one (a, b) per plane per
+        // REFERENCE, applied before the mode decision so every region
+        // chooses between photometrically aligned predictors. Charged
+        // as one flag byte plus 9 bytes per corrected reference, in the
+        // side stream. See WeightedPred for the measurement behind it.
+        let wp_plate = if wp_on { fit_weighted_pred(&plate_pred, f) } else { None };
+        if let Some(wp) = &wp_plate {
+            apply_weighted_pred(&mut plate_pred, wp);
+        }
+        let mut wp_prev: Option<WeightedPred> = None;
+        let plate_pred = plate_pred;
         let mut modes = vec![0u8; gw * gh];
         let mut mvs: Vec<(i8, i8)> = Vec::new();
         let mut dict_refs: Vec<(u8, u16, u16)> = Vec::new();
         let composite = if fi == 0 {
             plate_pred.clone()
         } else {
-            let prev = recon[fi - 1].clone();
+            let mut prev = recon[fi - 1].clone();
+            wp_prev = if wp_on { fit_weighted_pred(&prev, f) } else { None };
+            if let Some(wp) = &wp_prev {
+                apply_weighted_pred(&mut prev, wp);
+            }
+            let prev = prev;
             let mut comp = plate_pred.clone();
             let mut prev_regions = 0usize;
             for gy in 0..gh {
                 for gx in 0..gw {
                     let (rx, ry) = (gx * REGION, gy * REGION);
+                    // Model predictor already exact for this region:
+                    // mode 0, no search. See region_is_exact.
+                    if skipgate && region_is_exact(&plate_pred, f, rx, ry) {
+                        continue;
+                    }
                     let sad_plate = sad_region(&plate_pred.y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry);
-                    let (mv, sad_prev) = search_mv(&prev.y, fw, fh, &f.y, rx, ry);
+                    // TRIED AND LOST: searching mode-1 from the
+                    // layered prediction instead of the raw previous
+                    // frame (so vectors would be refinements past the
+                    // layer). w1 370,196/0.97937 -> 378,139/0.97884,
+                    // SMITE 846,305 -> 945,335. The warp is bilinear-
+                    // resampled and softer than the raw reference,
+                    // and on fast local motion the actor layer puts
+                    // the search window in the wrong place. The raw
+                    // previous frame stays the MC reference.
+                    let mc_ref: &Yuv420 = &prev;
+                    let (mv, sad_prev) = search_mv(&mc_ref.y, fw, fh, &f.y, rx, ry);
                     // Decision stays raw-SAD BY MEASUREMENT, not by
                     // principle. A deadzone-aware codable cost was built
                     // (region_codable_cost) and lost on every tuning:
@@ -2175,7 +3434,7 @@ pub fn encode_gop_v3_core(
                         modes[gy * gw + gx] = 1;
                         mvs.push(mv);
                         prev_regions += 1;
-                        copy_region_mc(&mut comp, &prev, rx, ry, mv);
+                        copy_region_mc(&mut comp, mc_ref, rx, ry, mv);
                     }
                     // ── DC intra (mode 2): predict the region as the mean
                     // of its already-composed top/left borders. Raster
@@ -2386,6 +3645,11 @@ pub fn encode_gop_v3_core(
         for gy in 0..gh {
             for gx in 0..gw {
                 let (rx, ry) = (gx * REGION, gy * REGION);
+                // A region already exact up to rounding gains nothing
+                // worth 2 bytes from a correction.
+                if skipgate && region_is_exact(&composite, f, rx, ry) {
+                    continue;
+                }
                 let n = (REGION * REGION) as f64;
                 let (mut sp, mut sa, mut spp, mut spa) = (0.0f64, 0.0, 0.0, 0.0);
                 for dy in 0..REGION {
@@ -2593,19 +3857,70 @@ pub fn encode_gop_v3_core(
         }
         side.extend_from_slice(&gain_flags);
         side.extend_from_slice(&gain_vals);
+        // Weighted prediction: flag byte (bit0 plate/model ref, bit1
+        // prev ref), then the present pairs. Kept as a separate tail
+        // so an all-model frame can be signalled without it.
+        let side_core_zero = side.iter().all(|&b| b == 0);
+        let mut wp_tail: Vec<u8> = Vec::new();
+        let wp_flags = (wp_plate.is_some() as u8) | ((wp_prev.is_some() as u8) << 1);
+        wp_tail.push(wp_flags);
+        if let Some(wp) = &wp_plate {
+            wp.write(&mut wp_tail);
+        }
+        if let Some(wp) = &wp_prev {
+            wp.write(&mut wp_tail);
+        }
+        side.extend_from_slice(&wp_tail);
         if std::env::var("FAO_SIDE_DEBUG").is_ok() {
             eprintln!(
-                "side raw: mode {} nz {} mvd {} intra {} planar {} gflags {} gvals {}",
+                "side raw: mode {} nz {} mvd {} intra {} planar {} gflags {} gvals {} wp {:?}/{:?}",
                 (gw * gh + 7) / 8,
                 nz_bits.len(),
                 mv_deltas.len(),
                 intra_flags.len(),
                 planar_bits.len(),
                 gain_flags.len(),
-                gain_vals.len()
+                gain_vals.len(),
+                wp_plate,
+                wp_prev
             );
         }
-        let mode_bytes = zstd::encode_all(side.as_slice(), 19).map(|c| c.len()).unwrap_or(side.len());
+        // Side-stream method byte: 0 = zstd, 1 = raw, 2 = ALL-MODEL
+        // FRAME (every region mode 0, no gain, no intra; only the
+        // weighted-prediction tail follows). A frame of zero bitmaps
+        // was costing 17 B of zstd framing — on an exact engine
+        // canonical that is most frames. The marker means no path can
+        // lose more than one byte.
+        // Method 3: the adaptive binary coder with contexts (mode
+        // given neighbours and motion layer, vector deltas, gain
+        // pairs) — see bincoder.rs. Per frame the shorter of it and
+        // zstd is charged; dict references (mode 4) stay on the zstd
+        // path since the context coder does not carry them yet.
+        let ctx_side: Option<usize> = if use_dict || std::env::var("FAO_NO_CTXCODER").is_ok() {
+            None
+        } else {
+            let gain_flag: Vec<bool> = (0..gw * gh).map(|gi| (gain_flags[gi / 8] >> (gi % 8)) & 1 == 1).collect();
+            let gains: Vec<(i8, i8)> = gain_vals.chunks_exact(2).map(|p| (p[0] as i8, p[1] as i8)).collect();
+            let rs = crate::bincoder::RegionSide {
+                gw,
+                gh,
+                modes: &modes,
+                mvs: &mvs,
+                gain_flag: &gain_flag,
+                gains: &gains,
+                layer: layer_sel.as_deref(),
+            };
+            Some(crate::bincoder::encode_side(&rs).len() + wp_tail.len())
+        };
+        let zstd_side = zstd::encode_all(side.as_slice(), 19).map(|c| c.len()).unwrap_or(side.len()).min(side.len());
+        if std::env::var("FAO_SIDE_DEBUG").is_ok() {
+            eprintln!("side coded: zstd {} ctx {:?}", zstd_side, ctx_side);
+        }
+        let mode_bytes = if side_core_zero {
+            1 + wp_tail.len()
+        } else {
+            1 + ctx_side.map(|c| c.min(zstd_side)).unwrap_or(zstd_side)
+        };
 
         // ── MOTION-ADAPTIVE RATE ALLOCATION (FAO_DZ_MOTION).
         //
@@ -2677,15 +3992,90 @@ pub fn encode_gop_v3_core(
             opts.clone()
         };
         let opts = &frame_opts;
+        // ── Coarse level (FAO_LF_SCALE=8 to enable; off by default;
+        // FAO_LF_DZ_DIV divides the dead zone there, default 4). See
+        // lf_correct. MEASURED AND LOST as built (2026-09-02):
+        //   w1     352,288/0.97937 -> 365,398/0.97885 (dz/4), 391,787 (dz/8)
+        //   SMITE  800,487/0.95470 -> 970,892/0.95301
+        // The coarse residual costs ~408 B/frame through the same
+        // residual coder and saves ~135 B/frame of HF. The AV1-base
+        // hybrid it imitates saved 40 KB of SIDE info and 72 KB of
+        // residual on w1 because the base was a temporally coherent
+        // low-res VIDEO refereeing every mode decision — a coarse
+        // level needs a coarse coder that is good, and at 240x100 the
+        // codec's own costs 14.6 KB @ 0.934 where AV1's costs 14.1 KB
+        // @ 0.993. Kept opt-in for the day that coder exists.
+        let lf_scale: usize = std::env::var("FAO_LF_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let mut composite = composite;
+        let lf_bytes = if lf_scale >= 2 {
+            let div: f32 = std::env::var("FAO_LF_DZ_DIV").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
+            let lo_opts = ResidualOpts { dead_zone: opts.dead_zone / div, dz_map: None, ..opts.clone() };
+            let mut sc = lf_scale;
+            let mut b = 0;
+            while sc >= 2 {
+                if fw % (2 * sc) == 0 && fh % (2 * sc) == 0 {
+                    b = lf_correct(&mut composite, f, sc, &lo_opts);
+                    break;
+                }
+                sc /= 2;
+            }
+            b
+        } else {
+            0
+        };
+        if std::env::var("FAO_SIDE_DEBUG").is_ok() {
+            eprintln!("coarse level: {lf_bytes} B");
+        }
         let p444 = interleave_444(&composite);
         let t444 = interleave_444(f);
-        let (residual_bytes, rec) = match residual::encode(&p444, &t444, fw, fh, opts) {
-            Some(trailer) => {
-                let r = residual::apply(p444, &trailer, fw, fh);
-                (trailer.len(), deinterleave_420(&r, fw, fh))
+        let (residual_bytes, rec, cost_map) =
+            match residual::encode_with_map(&p444, &t444, fw, fh, opts) {
+                Some((trailer, map)) => {
+                    let r = residual::apply(p444, &trailer, fw, fh);
+                    (trailer.len() + lf_bytes, deinterleave_420(&r, fw, fh), Some(map))
+                }
+                None => (lf_bytes, composite.clone(), None),
+            };
+        // ── LEDGER (FAO_LEDGER=path): one line per region per frame,
+        // so a frame's bytes can be attributed to WHAT they were spent
+        // on — a moving object, a background surface the plate blurs,
+        // a reveal — rather than only to which coder spent them. The
+        // residual's raw cost map is scaled to the frame's actual
+        // residual bytes; side bytes are split evenly over regions
+        // that carry side info (mode != 0 or a gain).
+        if let Ok(path) = std::env::var("FAO_LEDGER") {
+            use std::io::Write;
+            let mut out = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+            if let (Some(out), Some(map)) = (out.as_mut(), cost_map.as_ref()) {
+                let bw4 = fw / 4;
+                let raw_total: u64 = map.iter().map(|&c| c as u64).sum::<u64>().max(1);
+                for gy in 0..gh {
+                    for gx in 0..gw {
+                        let gi = gy * gw + gx;
+                        let (rx, ry) = (gx * REGION, gy * REGION);
+                        let mut raw = 0u64;
+                        for by in 0..REGION / 4 {
+                            for bx in 0..REGION / 4 {
+                                raw += map[(ry / 4 + by) * bw4 + rx / 4 + bx] as u64;
+                            }
+                        }
+                        let sad_pl = sad_region(&plate_pred.y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry);
+                        let sad_pv = if fi > 0 {
+                            sad_region(&recon[fi - 1].y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry)
+                        } else {
+                            u32::MAX
+                        };
+                        let g = (gain_flags[gi / 8] >> (gi % 8)) & 1;
+                        let _ = writeln!(
+                            out,
+                            "{fi},{gx},{gy},{},{sad_pl},{sad_pv},{g},{:.2}",
+                            modes[gi],
+                            raw as f64 * residual_bytes as f64 / raw_total as f64
+                        );
+                    }
+                }
             }
-            None => (0, composite),
-        };
+        }
         out_frames.push(FrameCost { mode_bytes, residual_bytes });
         {
             let mut row = vec![0u32; gw * gh];
@@ -2724,6 +4114,23 @@ pub fn encode_gop_v3_core(
         if strength > 0 {
             deblock(&mut rec, f, &modes, gw, gh, opts.dead_zone, strength);
         }
+        if let Some(mo) = mosaic.as_mut() {
+            // Regions that followed layer 0 / the mosaic / the plate
+            // feed the mosaic; regions on another layer are that
+            // layer's content and would smear the background.
+            let sel = layer_sel.clone();
+            let keep = |fx: usize, fy: usize| -> bool {
+                let gi = (fy / REGION) * gw + fx / REGION;
+                match sel.as_ref() {
+                    Some(m) => {
+                        let c = m[gi] as usize;
+                        c == 0 || c == 1 || c == mosaic_ci
+                    }
+                    None => true,
+                }
+            };
+            mo.update(&rec, &mosaic_acc, &keep, mosaic_wmax);
+        }
         recon.push(rec);
         // Index frame fi-1 now that fi is done: at the NEXT iteration's
         // query (frame fi+1) the newest entry is fi-1, one frame older
@@ -2745,7 +4152,7 @@ pub fn encode_gop_v3_core(
     let denom = (frames.len().saturating_sub(1)).max(1) as f64;
     (PlateEncodeReportV2 {
         plate_bytes: model_bytes,
-        motion_bytes,
+        motion_bytes: motion_bytes + gmc_extra_bytes,
         frames: out_frames,
         recon,
         prev_mode_share: (prev_share_acc / denom) as f32,
@@ -3596,7 +5003,7 @@ mod tests_v5 {
             }
             frames.push(f);
         }
-        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 }; frames.len()];
+        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: LIN_ID }; frames.len()];
         let plate = build_plate(&frames, &motions);
         let opts = ResidualOpts { dead_zone: 8.0, ..ResidualOpts::default() };
         let (movers, track_bytes) = build_movers(&frames, &motions, &plate, &opts, 12);
@@ -3688,7 +5095,7 @@ mod tests_v3 {
             }
             frames.push(f);
         }
-        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0 }; frames.len()];
+        let motions = vec![PlateMotion { dx: 0.0, dy: 0.0, confidence: 1.0, lin: LIN_ID }; frames.len()];
         let plate = build_plate(&frames, &motions);
         let opts = ResidualOpts { dead_zone: 2.0, ..ResidualOpts::default() };
         let v2 = encode_gop_v2(&frames, &motions, &plate, &opts);
@@ -4534,7 +5941,7 @@ mod tests_sr {
                 *p = 128;
             }
             frames.push(f);
-            motions.push(PlateMotion { dx, dy, confidence: 1.0 });
+            motions.push(PlateMotion { dx, dy, confidence: 1.0, lin: LIN_ID });
         }
         let sp = build_plate_sr(&frames, &motions, s);
         let base_err = |pred: &Yuv420, f: &Yuv420| -> f64 {

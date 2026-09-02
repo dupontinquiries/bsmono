@@ -221,6 +221,7 @@ dependencies = [
  "early-fps",
  "egui",
  "fao-codec-lib",
+ "zstd",
 ]
 
 [[package]]
