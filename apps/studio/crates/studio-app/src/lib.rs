@@ -2152,9 +2152,7 @@ impl Default for App {
         } else {
             None
         };
-        let library_root = std::env::var("STUDIO_LIBRARY")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| "library".into());
+        let library_root = project_dir::library_root();
         let library_tree = library::TreeState::default();
         let midi = midi::MidiIn::open(std::env::var("STUDIO_MIDI").ok().as_deref()).ok();
         let analog = WootingAnalog::default();
