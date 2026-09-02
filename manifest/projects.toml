@@ -495,6 +495,19 @@ bin = "cadscope-egui"     # crates/cadscope-egui is the shell; logic lives in th
 primary = true            # egui-first from birth; no Qt/GTK surface exists to archive
 notes = "parametric CAD: forge Doc -> kernel Model -> cad-view draws the viewport through one egui_wgpu::Callback (skydribble-parity pass, Depth32Float). Was MISSING from this manifest entirely, so gitmind's app catalogue could not see or build it; added 2026-09-01 along with the wgpu device-limit clamp that fixes startup on phone GPUs (max_color_attachments 8 > 5)."
 
+[apps.dandere2x]
+path = "apps/dandere2x"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"          # egui shell behind the `app` feature; CLI otherwise
+targets = ["desktop"]     # NOT phone: the CNN needs a GPU budget a Fairphone does not have,
+                          # and the useful models are 67 MB downloads
+bin = "dandere2x"         # crates/dandere2x is the CLI + egui shell
+primary = true            # egui-first; no other surface exists
+notes = "Block-matched residual video super-resolution (Real-ESRGAN RRDBNet / SRVGGNetCompact / waifu2x upconv_7) on wgpu, with an AV1 pipeline. Only the changed parts of a frame go through the CNN. Three crates: d2x-core is headless (gate, matchers, residual/merge, the Network op-list model layer with a CPU reference) and depends only on image/rayon/serde; d2x-wgpu is the GPU Network runner; dandere2x is the CLI+shell. EXPERIMENTAL. Models are DATA and are resolved from ~/models/upscale then ~/models before the vendored copy (d2x_core::model_search_dirs) — only the 2.5 MB realesr-animevideov3 is in-tree; the 10.6 MB waifu2x JSON was removed and the 67 MB RRDB photo models were never vendored. beatspace consumes d2x-core behind its off-by-default `upscale` / `upscale-gpu` features."
+
 [apps.switcheroo]
 path = "apps/switcheroo"
 kind = "cargo"
