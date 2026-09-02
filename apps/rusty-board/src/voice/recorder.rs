@@ -65,7 +65,7 @@ impl GrowBuf {
         self.data.clone()
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.data.len()
     }
 }

@@ -2099,6 +2099,10 @@ fn streaming_partial_worker(
         // Non-destructive snapshot of the ring. Lock is held briefly:
         // just enough to copy the contents into a Vec.
         let samples = crate::voice::recorder::snapshot_ring(&ring);
+        // The last 12 s only. Re-transcribing the WHOLE ring every interval is what made
+        // partials fall behind the speaker on the FP5 — and whisper's window is 30 s anyway.
+        let keep = sample_rate as usize * 12;
+        let samples: Vec<f32> = if samples.len() > keep { samples[samples.len() - keep..].to_vec() } else { samples };
 
         if samples.is_empty() {
             continue;
@@ -2110,7 +2114,9 @@ fn streaming_partial_worker(
 
         // Resample + transcribe. This is the expensive call.
         let resampled = crate::voice::recorder::resample_to_16k(&samples, sample_rate);
-        let text = match transcriber.transcribe(&resampled) {
+        // Partial parameters: encoder sized to the window, no temperature fallback — the
+        // next partial is the retry. See transcriber.rs.
+        let text = match transcriber.transcribe_with(&resampled, crate::voice::transcriber::Pass::Partial) {
             Ok(t) => t,
             Err(e) => {
                 tracing::debug!("streaming inference error (ignored): {}", e);
