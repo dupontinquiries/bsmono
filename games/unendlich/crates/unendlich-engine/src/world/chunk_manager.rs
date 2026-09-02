@@ -197,6 +197,7 @@ fn prefetch_lookahead() -> f32 {
         .unwrap_or(16.0)
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // superseded by the cursor variant; kept for its tests
 fn should_rewalk(
     player_moved: bool,
     any_completed: bool,
@@ -205,6 +206,25 @@ fn should_rewalk(
 ) -> bool {
     player_moved || first_request_pending || (any_completed && last_walk_saturated)
 }
+
+/// 2026-09-02: with a walk cursor, a completion after a saturated walk
+/// refills from the cursor instead of re-walking the sphere; the full
+/// walk is only needed when the cursor has run dry.
+fn should_rewalk_with_cursor(
+    player_moved: bool,
+    any_completed: bool,
+    first_request_pending: bool,
+    last_walk_saturated: bool,
+    cursor_empty: bool,
+) -> bool {
+    player_moved || first_request_pending || (any_completed && last_walk_saturated && cursor_empty)
+}
+
+/// Upper bound on the walk cursor. Beyond this the walk stops early and
+/// a later completion re-walks; 16× the per-tier budget (1 024 coords,
+/// 16 KB) keeps the
+/// steady-state stream running for many frames between walks.
+const WALK_CURSOR_CAP: usize = GPU_MAX_QUEUED_CHUNKS * 16;
 
 /// Choose which out-of-range chunks to evict this call. `candidates` is every
 /// chunk currently beyond the eviction radius paired with its squared distance
@@ -310,6 +330,12 @@ pub struct ChunkManager {
     /// per-frame ~15k-coord traversal — logged at ~31ms/frame at RD=12 — into
     /// nothing once the desired set is fully enqueued.
     last_walk_saturated: bool,
+    /// 2026-09-02: the unloaded coordinates the last walk found beyond
+    /// its per-tier budgets, in walk (distance) order. Completions pop
+    /// from here instead of re-walking O(rd³) — which `should_rewalk`
+    /// did on EVERY completion while saturated, i.e. every frame during
+    /// streaming. Cleared by each full walk.
+    walk_cursor: parking_lot::Mutex<std::collections::VecDeque<(ChunkCoord, i32)>>,
     /// Coords of chunks that currently have at least one active block
     /// transition (visual lerp in progress). Maintained by the apply
     /// phase: a chunk is added when it gains its first transition and
@@ -478,6 +504,7 @@ impl ChunkManager {
             // Start true so the very first completion-driven re-walk isn't
             // suppressed before we've ever measured saturation.
             last_walk_saturated: true,
+            walk_cursor: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             chunks_with_transitions: std::collections::HashSet::new(),
             transition_remesh_stride: std::env::var("UNENDLICH_TRANSITION_REMESH_STRIDE")
                 .ok().and_then(|v| v.parse::<u64>().ok()).filter(|&n| n >= 1).unwrap_or(1),
@@ -914,8 +941,10 @@ impl ChunkManager {
         // need to re-walk request_visible — newly-completed chunks could
         // mean the heap now has room; only worth re-walking if so).
         let mut any_completed = false;
+        let mut completed_count: usize = 0;
         for loaded in self.loader.drain_completed_iter() {
             any_completed = true;
+            completed_count += 1;
             let crate::world::chunk_loader::LoadedChunk { mut chunk, octree, edits_applied } = loaded;
             // Overlay any persisted edits on top of the freshly-generated
             // procedural chunk. Edits "stick" through worldgen changes.
@@ -981,14 +1010,17 @@ impl ChunkManager {
         // mgr_update cost, which user logs showed at 29-79ms/sec for
         // pure-overhead frames during initial chunk loading.
         let t_req_start = std::time::Instant::now();
-        if should_rewalk(
+        if should_rewalk_with_cursor(
             player_moved,
             any_completed,
             self.first_request_pending,
             self.last_walk_saturated,
+            self.walk_cursor.lock().is_empty(),
         ) {
             self.first_request_pending = false;
             self.last_walk_saturated = self.request_visible();
+        } else if completed_count > 0 && self.last_walk_saturated {
+            self.refill_from_cursor(completed_count);
         }
         MGR_REQUEST_US.fetch_add(
             t_req_start.elapsed().as_micros() as u64,
@@ -1705,6 +1737,7 @@ impl ChunkManager {
         let mid_outer  = bands.mid.min(rd);
         let far_outer  = bands.far.min(rd);
 
+        self.walk_cursor.lock().clear();
         let mut to_request: Vec<(ChunkCoord, i32)> = Vec::with_capacity(PER_TIER_BUDGET * 4);
         let mut near_count: usize = 0;
         let mut mid_count:  usize = 0;
@@ -1735,7 +1768,11 @@ impl ChunkManager {
             } else {
                 vfar_count >= PER_TIER_BUDGET
             };
-            if tier_saturated { continue; }
+            // 2026-09-02: a saturated tier's shells are still walked, in
+            // cursor mode — unloaded coords go to `walk_cursor` (bounded)
+            // so completions can request them without a re-walk. Once the
+            // cursor is full there is nothing more to learn: stop.
+            if tier_saturated && self.walk_cursor.lock().len() >= WALK_CURSOR_CAP { break; }
 
             // Pick which counter we'll be incrementing — same tier
             // for the entire shell.
@@ -1781,11 +1818,14 @@ impl ChunkManager {
                     }
                 }
 
-                if *counter >= PER_TIER_BUDGET {
-                    // This shell's tier just filled mid-shell.
-                    // Stop walking the rest of this shell; the
-                    // outer-loop check will skip remaining shells
-                    // of this tier next iteration.
+                if tier_saturated || *counter >= PER_TIER_BUDGET {
+                    // This tier is full: remember the coord for the
+                    // cursor (walk order == distance order) and move on.
+                    let mut cursor = self.walk_cursor.lock();
+                    if cursor.len() < WALK_CURSOR_CAP {
+                        cursor.push_back((coord, dx*dx + dy*dy + dz*dz));
+                        continue;
+                    }
                     break 'shell_walk;
                 }
                 *counter += 1;
@@ -1835,10 +1875,15 @@ impl ChunkManager {
             }
 
             // Early exit when every tier is saturated.
+            // All tiers full AND the cursor full: nothing left to learn.
+            // (Before the cursor this broke on all-tiers-full alone; now a
+            // saturated walk keeps going, in cursor mode, until it has
+            // banked WALK_CURSOR_CAP coords for the completions to drain.)
             if near_count >= PER_TIER_BUDGET
                 && mid_count  >= PER_TIER_BUDGET
                 && far_count  >= PER_TIER_BUDGET
                 && vfar_count >= PER_TIER_BUDGET
+                && self.walk_cursor.lock().len() >= WALK_CURSOR_CAP
             {
                 break;
             }
@@ -1857,6 +1902,25 @@ impl ChunkManager {
             || mid_count >= PER_TIER_BUDGET
             || far_count >= PER_TIER_BUDGET
             || vfar_count >= PER_TIER_BUDGET
+    }
+
+    /// Request up to `n` coords from the walk cursor (the unloaded chunks
+    /// the last walk found beyond its budgets, nearest first), skipping
+    /// any that loaded meanwhile or fell out of range. O(n), no walk.
+    fn refill_from_cursor(&mut self, n: usize) {
+        let rd = runtime_render_distance();
+        let rd_sq = rd * rd;
+        let player = self.player_chunk;
+        let mut batch: Vec<(ChunkCoord, i32)> = Vec::with_capacity(n);
+        while batch.len() < n {
+            let Some((coord, prio)) = self.walk_cursor.lock().pop_front() else { break };
+            if coord.distance_sq(player) > rd_sq { continue; }
+            if self.chunks.contains_key(&coord) { continue; }
+            batch.push((coord, prio));
+        }
+        if !batch.is_empty() {
+            self.loader.request_many(&batch);
+        }
     }
 
     fn evict_distant(&self) {
@@ -3364,6 +3428,18 @@ mod tests {
         // Truly idle frame: no move, no completion, already walked once.
         assert!(!should_rewalk(false, false, false, true),
             "idle frame should not re-walk");
+    }
+
+    #[test]
+    fn cursor_makes_completions_cheap_until_it_runs_dry() {
+        assert!(!should_rewalk_with_cursor(false, true, false, true, false),
+            "completion with a non-empty cursor refills instead of walking");
+        assert!(should_rewalk_with_cursor(false, true, false, true, true),
+            "cursor dry → walk, as before");
+        assert!(should_rewalk_with_cursor(true, false, false, false, false));
+        assert!(should_rewalk_with_cursor(false, false, true, false, false));
+        assert!(!should_rewalk_with_cursor(false, false, false, true, true));
+        assert!(WALK_CURSOR_CAP >= GPU_MAX_QUEUED_CHUNKS);
     }
 
     // Use the unused-import suppression for Biome (might or might not be needed).
