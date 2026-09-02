@@ -2488,7 +2488,24 @@ the model attempted a call and it was discarded, which is not the same as the mo
         let last_reason = rejected.last().map(|r| format!("{r:?}"))
             .or_else(|| line_rejects.last().map(|r| format!("{r:?}")))
             .unwrap_or_else(|| "no call shape at all".into());
-        match ladder.observe(!tools.is_empty() || text.contains(DONE_MARKER), n.as_str(), &last_reason) {
+        // `accepted` is a TOOL CALL LANDING — not the model claiming it is done.
+        //
+        // This passed `|| text.contains(DONE_MARKER)`, so any turn ending
+        // "TASK_COMPLETE" reset the miss counter. A field run shows an 8B doing
+        // exactly that: every reply appended "The final answer is:
+        // TASK_COMPLETE (after verification)" while every tool call it made was
+        // being refused, so the ladder reset on all nine turns and never fired.
+        // Its cap is 4; the run was stopped by the looping detector instead,
+        // which is a coarser guard that took more than twice as long to act.
+        //
+        // A model asserting completion is precisely what a stuck model does. It
+        // cannot be the signal that progress happened — only an executed call
+        // can be that. Genuine completion is handled below: a DONE_MARKER with
+        // no pending work ends the run through its own path, so treating it as
+        // a miss here does not trap a model that really has finished, it only
+        // stops one from claiming its way out of the ladder.
+        let progressed = !tools.is_empty();
+        match ladder.observe(progressed, n.as_str(), &last_reason) {
             Some(crate::line_calls::LadderStep::Abort(v)) if tried_and_failed => {
                 crate::diag!("wgpu-engine: agent stopped by the refusal ladder — {v}");
                 return (Vec::new(), Some(Stop::Stalled));

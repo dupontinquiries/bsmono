@@ -223,3 +223,59 @@ mod tests {
         assert!(l.observe(true, N, "").is_none(), "reset after success");
     }
 }
+
+#[cfg(test)]
+mod ladder_progress_tests {
+    use super::*;
+
+    const N: &str = "3f2a90c1deadbeef";
+
+    /// A model claiming completion must NOT count as progress.
+    ///
+    /// The field case: an 8B whose every tool call was refused appended "The
+    /// final answer is: TASK_COMPLETE (after verification)" to each reply. The
+    /// call site passed `!tools.is_empty() || text.contains(DONE_MARKER)` as
+    /// `accepted`, so the marker reset the counter on all nine turns and this
+    /// ladder — cap 4 — never fired. The run was eventually stopped by the
+    /// looping detector, a coarser guard that took more than twice as long.
+    ///
+    /// Asserting completion is exactly what a stuck model does, so it cannot
+    /// be the evidence that something happened.
+    #[test]
+    fn repeated_refusals_abort_even_when_the_model_says_it_is_done() {
+        let mut l = RefusalLadder::new(4);
+        let mut steps = Vec::new();
+        for _ in 0..6 {
+            // `false` is what the call site now passes for a turn whose calls
+            // were all refused, regardless of what the prose claims.
+            steps.push(l.observe(false, N, "UnknownTool"));
+        }
+        assert!(matches!(steps[3], Some(LadderStep::Abort(_))),
+            "cap 4 must abort on the 4th consecutive miss, got {:?}", steps[3]);
+    }
+
+    #[test]
+    fn one_landed_call_still_clears_the_count() {
+        // The reset must survive: a model that stumbles twice and then works
+        // should not be aborted on its next stumble.
+        let mut l = RefusalLadder::new(4);
+        l.observe(false, N, "x");
+        l.observe(false, N, "x");
+        assert!(l.observe(true, N, "x").is_none(), "an accepted call clears the ladder");
+        for i in 0..3 {
+            assert!(!matches!(l.observe(false, N, "x"), Some(LadderStep::Abort(_))),
+                "aborted at miss {i} after a reset — the count did not clear");
+        }
+    }
+
+    #[test]
+    fn the_correction_carries_the_live_nonce() {
+        // A correction that omits the run token teaches the model the wrong
+        // shape, which is the failure the ladder exists to break out of.
+        let mut l = RefusalLadder::new(4);
+        match l.observe(false, N, "x") {
+            Some(LadderStep::Correct(msg)) => assert!(msg.contains(N), "{msg}"),
+            other => panic!("expected a correction first, got {other:?}"),
+        }
+    }
+}
