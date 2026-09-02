@@ -6521,3 +6521,51 @@ actors by the ledger, which no background model touches. So on this
 codec at this operating point, corpus-scale dedup of locations is
 worth ~10% of film bytes, bounded above, before any matcher exists.
 Worth having if a wide-baseline matcher is cheap; not the lever.
+
+### Motion layers — the camera and the actor as two affines (2026-09-02)
+
+User's point: parallax detectors fight tremor and noise; a static
+model plus residual beats chasing jitter that was never content. The
+owner of the tremor is the camera model, six numbers a frame, and
+the block-match affine was too coarse to take it. Three steps, two
+of which taught something by failing.
+
+1. Sub-pixel block matches (parabolic peak): rms per pair 2.1-3.4
+   px, unchanged; bytes -0.8%. The residual was not quantisation.
+2. RANSAC affine at 1 px instead of one 3-sigma pass: 65-75%
+   inliers, rms 0.4 px on them — a clean camera. Bytes +2.9%
+   (365,364 -> 375,858). w1 is a face filling the frame; the
+   "outliers" are most of the picture, and the contaminated fit had
+   been half-tracking the actor. A correct camera model loses to a
+   compromise when the object is bigger than the background.
+3. `estimate_layers`: sequential RANSAC — dominant affine, remove
+   its inliers, fit the rest (1 px for the camera, 2 px for objects,
+   32 px block grid so the second layer has enough blocks). Every
+   region picks among {caller's model, layer 1, layer 2} by SAD with
+   a margin (FAO_GMC_MARGIN 128 — without it the selection map
+   flipped on ties and cost 950 B/frame, more than it saved); the
+   map is one symbol per region, zstd'd, ~400 B/frame.
+
+  w1 (film)   440,102 / 0.97732  ->  370,196 / 0.97937  U 39.1 V 41.2   -16%, +0.0021
+              model error median 1.01 lvl/px, 50% of regions within 1 level
+              mode share: model 69%, prev-MC 20%, intra 11%
+  SMITE       861,688 / 0.95415  ->  819,564 / 0.95470                    -5%, +0.0006
+              (single-layer GMC was a LOSS here; the second layer is the player)
+
+GMC is now default (two layers, margin 128; FAO_GMC=0 restores the
+plate-only model).
+
+Tried and lost, kept in the code as a comment at the site: searching
+mode-1 vectors from the layered prediction instead of the raw
+previous frame — w1 +2%, SMITE +12%; the warp is bilinear-resampled
+and softer than the raw reference, and a wrong object layer puts the
+search window in the wrong place.
+
+What the side info is now (raw, per frame, w1): mode/intra/gain
+bitmaps 750 B each, 1,053 motion vectors (2.1 KB), 690 gain pairs
+(1.4 KB), ~4 KB after zstd. The vectors and gain pairs are
+high-entropy bytes a general-purpose compressor cannot shrink; the
+next byte in side info is a context-adaptive coder for them, or
+fewer of them (a segmentation map predicted from the previous
+frame's instead of sent whole). The residual sits 45% on model
+regions and 48% on prev-MC regions.
