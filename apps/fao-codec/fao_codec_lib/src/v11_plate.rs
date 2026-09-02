@@ -1149,6 +1149,128 @@ fn search_mv(prev_y: &[u8], w: usize, h: usize, cur_y: &[u8], rx: usize, ry: usi
     ((qx as i8, qy as i8), qp_sad)
 }
 
+/// A persistent, accumulated appearance of one motion layer in that
+/// layer's own coordinate frame (frame 0's, for the layer tracked from
+/// the start). The one-layer-deep plate is a median frozen at GOP
+/// start, warped by two parameters, used by 6% of regions; this is
+/// what replaces it: updated from every RECONSTRUCTION (so the decoder
+/// keeps the same one), aligned sub-pixel by the layer's affine, its
+/// low frequencies and chroma the average of every frame that saw
+/// them — which is what the AV1-base hybrid supplied and what a
+/// per-frame coarse patch could not (SESSION_LOG 2026-09-02). Sparse
+/// by observation: weight 0 where nothing has been seen, and a
+/// recency-limited running mean so stale content fades. Bounds are a
+/// margin around frame 0's footprint; content that leaves them is
+/// simply not remembered.
+pub struct LayerMosaic {
+    pub w: usize,
+    pub h: usize,
+    /// Frame-0 coordinate of mosaic pixel (0,0).
+    pub ox: f32,
+    pub oy: f32,
+    pub y: Vec<f32>,
+    pub u: Vec<f32>,
+    pub v: Vec<f32>,
+    pub wy: Vec<u8>,
+    pub wc: Vec<u8>,
+}
+
+impl LayerMosaic {
+    pub fn new(fw: usize, fh: usize, margin: f32) -> Self {
+        let mw = ((fw as f32) * (1.0 + 2.0 * margin)) as usize / 2 * 2;
+        let mh = ((fh as f32) * (1.0 + 2.0 * margin)) as usize / 2 * 2;
+        LayerMosaic {
+            w: mw,
+            h: mh,
+            ox: -(fw as f32) * margin,
+            oy: -(fh as f32) * margin,
+            y: vec![0.0; mw * mh],
+            u: vec![0.0; mw * mh / 4],
+            v: vec![0.0; mw * mh / 4],
+            wy: vec![0; mw * mh],
+            wc: vec![0; mw * mh / 4],
+        }
+    }
+
+    /// Prediction of a frame whose frame-0 -> frame affine is `acc`:
+    /// every frame pixel maps back to frame-0 coordinates and samples
+    /// the mosaic where it has been observed, else takes `fallback`.
+    pub fn predict(&self, acc: &crate::global_motion::Affine, fallback: &Yuv420) -> Yuv420 {
+        let Some(inv) = crate::global_motion::invert(acc) else { return fallback.clone() };
+        let (fw, fh) = (fallback.w, fallback.h);
+        let mut out = fallback.clone();
+        let sample = |p: &[f32], wt: &[u8], pw: usize, ph: usize, x: f32, y: f32| -> Option<f32> {
+            if x < 0.0 || y < 0.0 || x >= (pw - 1) as f32 || y >= (ph - 1) as f32 {
+                return None;
+            }
+            let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+            let (tx, ty) = (x - x0 as f32, y - y0 as f32);
+            let i = y0 * pw + x0;
+            if wt[i] == 0 || wt[i + 1] == 0 || wt[i + pw] == 0 || wt[i + pw + 1] == 0 {
+                return None;
+            }
+            let top = p[i] * (1.0 - tx) + p[i + 1] * tx;
+            let bot = p[i + pw] * (1.0 - tx) + p[i + pw + 1] * tx;
+            Some(top * (1.0 - ty) + bot * ty)
+        };
+        for fy in 0..fh {
+            for fx in 0..fw {
+                let (x0, y0) = crate::global_motion::apply(&inv, fx as f32, fy as f32);
+                if let Some(v) = sample(&self.y, &self.wy, self.w, self.h, x0 - self.ox, y0 - self.oy) {
+                    out.y[fy * fw + fx] = v.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        let (cw, ch) = (fw / 2, fh / 2);
+        for fy in 0..ch {
+            for fx in 0..cw {
+                let (x0, y0) = crate::global_motion::apply(&inv, (fx * 2) as f32, (fy * 2) as f32);
+                let (mx, my) = ((x0 - self.ox) / 2.0, (y0 - self.oy) / 2.0);
+                if let Some(v) = sample(&self.u, &self.wc, self.w / 2, self.h / 2, mx, my) {
+                    out.u[fy * cw + fx] = v.round().clamp(0.0, 255.0) as u8;
+                }
+                if let Some(v) = sample(&self.v, &self.wc, self.w / 2, self.h / 2, mx, my) {
+                    out.v[fy * cw + fx] = v.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        out
+    }
+
+    /// Fold a reconstructed frame in: each frame pixel whose region is
+    /// `keep` splats (nearest) into the mosaic as a running mean with
+    /// weight capped at `wmax`, so a fresh observation always moves the
+    /// stored value by at least 1/wmax of the way.
+    pub fn update(&mut self, recon: &Yuv420, acc: &crate::global_motion::Affine, keep: &dyn Fn(usize, usize) -> bool, wmax: u8) {
+        let Some(inv) = crate::global_motion::invert(acc) else { return };
+        let (fw, fh) = (recon.w, recon.h);
+        for fy in 0..fh {
+            for fx in 0..fw {
+                if !keep(fx, fy) {
+                    continue;
+                }
+                let (x0, y0) = crate::global_motion::apply(&inv, fx as f32, fy as f32);
+                let (mx, my) = ((x0 - self.ox).round(), (y0 - self.oy).round());
+                if mx < 0.0 || my < 0.0 || mx >= self.w as f32 || my >= self.h as f32 {
+                    continue;
+                }
+                let i = my as usize * self.w + mx as usize;
+                let wt = self.wy[i] as f32;
+                self.y[i] = (self.y[i] * wt + recon.y[fy * fw + fx] as f32) / (wt + 1.0);
+                self.wy[i] = (self.wy[i] + 1).min(wmax);
+                if fx % 2 == 0 && fy % 2 == 0 {
+                    let ci = (my as usize / 2) * (self.w / 2) + mx as usize / 2;
+                    let wc = self.wc[ci] as f32;
+                    let fi = (fy / 2) * (fw / 2) + fx / 2;
+                    self.u[ci] = (self.u[ci] * wc + recon.u[fi] as f32) / (wc + 1.0);
+                    self.v[ci] = (self.v[ci] * wc + recon.v[fi] as f32) / (wc + 1.0);
+                    self.wc[ci] = (self.wc[ci] + 1).min(wmax);
+                }
+            }
+        }
+    }
+}
+
 /// Frame-level weighted prediction for one reference: `y' = a*y + b`
 /// per plane, one (a, b) for the whole frame. What HEVC calls
 /// weighted prediction and what this codec was missing.
@@ -2907,6 +3029,14 @@ pub fn encode_gop_v3_core(
     // FAO_GMC=0 restores the plate-only model.
     let gmc = std::env::var("FAO_GMC").map(|v| v != "0").unwrap_or(true);
     let mut gmc_extra_bytes = 0usize;
+    // ── Persistent layer mosaic (FAO_MOSAIC=1): accumulated appearance
+    // of the dominant layer in frame-0 coordinates; a fourth candidate
+    // per region, updated from each reconstruction. See LayerMosaic.
+    let mosaic_on = std::env::var("FAO_MOSAIC").map(|v| v != "0").unwrap_or(false) && gmc;
+    let mosaic_wmax: u8 = std::env::var("FAO_MOSAIC_WMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let mut mosaic: Option<LayerMosaic> = if mosaic_on { Some(LayerMosaic::new(fw, fh, 0.25)) } else { None };
+    let mut mosaic_acc: crate::global_motion::Affine = crate::global_motion::IDENTITY;
+    let mut mosaic_ci: usize = usize::MAX;
     for (fi, f) in frames.iter().enumerate() {
         let mut layer_sel: Option<Vec<u8>> = None;
         let mut plate_pred = if gmc && fi > 0 {
@@ -2935,6 +3065,16 @@ pub fn encode_gop_v3_core(
                 cands.push(predict_frame(&as_plate, &pm, fw, fh));
             }
             gmc_extra_bytes += 16 * layers.len();
+            // Mosaic candidate: follows layer 0 (the dominant affine);
+            // its accumulated frame-0 -> frame-i map composes the
+            // pairwise affines. Falls back to the plate model where
+            // nothing has been observed yet.
+            mosaic_ci = usize::MAX;
+            if let (Some(mo), Some(m0)) = (mosaic.as_ref(), layers.first()) {
+                mosaic_acc = crate::global_motion::compose(m0, &mosaic_acc);
+                cands.push(mo.predict(&mosaic_acc, &cands[0]));
+                mosaic_ci = cands.len() - 1;
+            }
             // Default candidate: the camera layer when there is one.
             // Another candidate must beat it by FAO_GMC_MARGIN SAD
             // (default 128 over 256 px, i.e. half a level) — without
@@ -3758,6 +3898,23 @@ pub fn encode_gop_v3_core(
             .unwrap_or(2);
         if strength > 0 {
             deblock(&mut rec, f, &modes, gw, gh, opts.dead_zone, strength);
+        }
+        if let Some(mo) = mosaic.as_mut() {
+            // Regions that followed layer 0 / the mosaic / the plate
+            // feed the mosaic; regions on another layer are that
+            // layer's content and would smear the background.
+            let sel = layer_sel.clone();
+            let keep = |fx: usize, fy: usize| -> bool {
+                let gi = (fy / REGION) * gw + fx / REGION;
+                match sel.as_ref() {
+                    Some(m) => {
+                        let c = m[gi] as usize;
+                        c == 0 || c == 1 || c == mosaic_ci
+                    }
+                    None => true,
+                }
+            };
+            mo.update(&rec, &mosaic_acc, &keep, mosaic_wmax);
         }
         recon.push(rec);
         // Index frame fi-1 now that fi is done: at the NEXT iteration's

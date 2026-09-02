@@ -6663,3 +6663,44 @@ level that is PREDICTED frame to frame, not patched frame by frame —
 and every level, coarse or fine, is only as good as the coder that
 carries its residual. Which is the same bottleneck the day keeps
 finding from every direction.
+
+### Persistent layer mosaic — a deeper data structure, measured neutral at GOP timescales (2026-09-02)
+
+User's thesis: the abstractions (world, camera, layers, stages) are
+right and the data structures are wrong — one-layer-deep sprites and
+plates kill compression. The coarse-level-as-patch (lf_correct) had
+already lost; the AV1-base hybrid had won by being a temporally
+coherent model, not a patch. So the structure that isn't one layer
+deep: `LayerMosaic` — an accumulated appearance of the dominant layer
+in frame-0 coordinates, updated from every reconstruction (decoder
+keeps the same one), aligned sub-pixel by the composed layer affine,
+its LF and chroma the running mean of every frame that saw them,
+sparse by observation (weight 0 where unseen; running mean capped at
+FAO_MOSAIC_WMAX so stale content fades — the user's "not a box").
+Fourth per-region candidate beside the plate model and the two
+prev-warp layers. FAO_MOSAIC=1.
+
+  w1  48 f    352,288 / 0.97937  ->  wmax 8: 357,750 / 0.97968   wmax 32: 352,913 / 0.97970
+  SMITE 32 f  800,487 / 0.95470  ->  795,062 / 0.95455
+  shot 10, 140 f (the longest shot in the reel)
+              959,536 / 0.98177  ->  958,972 / 0.98188
+
+Chosen on 3.7% of regions; the prev-warp layer takes 90%. Neutral
+everywhere, including at 140 frames. The reading: on a slow pan the
+previous RECONSTRUCTION already is a persistent object — it carries
+accumulated appearance forward frame to frame — and a mosaic adds
+only averaging (a little quality, +0.0003 at wmax 32) and memory of
+content that left and returned, of which a shot has almost none.
+Memory pays at the timescale of cut-backs and libraries (bounded at
+the I-frame within a clip, ~10%), not inside a GOP.
+
+What the data-structure changes measured, as a pattern: structures
+that remove side-info entropy or fix the MOTION model win (layers
+-16%, context coder -5%, exact gate, WP); structures that add
+APPEARANCE memory do not, because the reconstruction already carries
+appearance perfectly on this content. The bytes are on the actor —
+81% of residual, non-rigid — and in the coder. The structure that
+addresses the actor is a deformation model per object layer (a
+coarse control-point mesh carrying the actor's non-rigid motion in a
+few dozen parameters, replacing ~1,050 per-region vectors a frame)
+— not yet built. Kept opt-in; the plate remains the mode-0 model.
