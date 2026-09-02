@@ -6704,3 +6704,31 @@ addresses the actor is a deformation model per object layer (a
 coarse control-point mesh carrying the actor's non-rigid motion in a
 few dozen parameters, replacing ~1,050 per-region vectors a frame)
 — not yet built. Kept opt-in; the plate remains the mode-0 model.
+
+### Deformation field on the object layer — measured and lost (2026-09-02)
+
+The structure aimed at the 81%: `DeformField`, a control-point grid
+over the object layer carrying residual displacement past its
+affine, bilinear to every pixel (no motion blocks), quarter-pel,
+neighbour-predicted through the context coder; the object layer's
+candidate becomes the deformed warp. Fitted from block correspon-
+dences by inverse-distance weighting. FAO_DEFORM=<step px>.
+
+  w1 baseline                          352,288 / 0.97937
+  step 32, claimed + leftovers         378,773 / 0.97951   field ~330 B/frame, 26-31 x 13 cells
+  step 64, claimed + leftovers         362,628 / 0.97958
+  step 32, claimed only, SAD-gated     359,225 / 0.97947   passes the gate on 41/47 frames
+  step 64, claimed only, SAD-gated     362,808 / 0.97945
+
+Two reasons, both instructive. The field lowers whole-frame SAD by
+~1% (7.12M -> 7.05M) — 0.05 levels/px spread thin, under the dead
+zone everywhere, so it never reaches the coder while its bytes do.
+And on w1 the second layer is not a compact object: its claimed
+pairs span 48 x 20 cells at step 32. The "actor layer" on this shot
+is a second near-global affine, and a deformation grid over it is a
+whole-frame field with sparse support. A dense non-rigid motion
+model fitted from sparse 16x16 matches cannot beat an exhaustive
+per-region search against the true target; doing it properly means
+fitting the field to the CODED cost with dense flow on the object,
+which is the mesh-versus-block argument block codecs won. Kept
+opt-in.

@@ -198,6 +198,17 @@ pub fn ransac_affine(pairs: &[(f32, f32, f32, f32)], tol: f32, iters: usize) -> 
 /// most of the picture and the contaminated fit half-tracked him.
 /// Two layers are what the picture contains; the region picks one.
 pub fn estimate_layers(prev: &Yuv420, cur: &Yuv420, max_layers: usize) -> Vec<crate::global_motion::Affine> {
+    estimate_layers_with_pairs(prev, cur, max_layers).0
+}
+
+/// As `estimate_layers`, also returning the correspondences each layer
+/// claimed and the leftovers no layer explained — the material a
+/// deformation model is fitted from.
+pub fn estimate_layers_with_pairs(
+    prev: &Yuv420,
+    cur: &Yuv420,
+    max_layers: usize,
+) -> (Vec<crate::global_motion::Affine>, Vec<Vec<(f32, f32, f32, f32)>>, Vec<(f32, f32, f32, f32)>) {
     use crate::global_motion as gm;
     let (w, h) = (prev.w, prev.h);
     let pass = PhaseCorrelationPass::new(512.min(w.min(h)));
@@ -205,6 +216,7 @@ pub fn estimate_layers(prev: &Yuv420, cur: &Yuv420, max_layers: usize) -> Vec<cr
     let (tdx, tdy) = if pc.confidence > 0.15 { (pc.dx, pc.dy) } else { (0.0, 0.0) };
     let mut pairs = block_pairs(prev, cur, tdx, tdy);
     let mut layers = Vec::new();
+    let mut claimed: Vec<Vec<(f32, f32, f32, f32)>> = Vec::new();
     let min_inliers = 8usize;
     while layers.len() < max_layers && pairs.len() >= min_inliers {
         // The camera gets 1 px; later layers are objects, whose block
@@ -212,21 +224,185 @@ pub fn estimate_layers(prev: &Yuv420, cur: &Yuv420, max_layers: usize) -> Vec<cr
         // and get 2 px.
         let tol = if layers.is_empty() { 1.0 } else { 2.0 };
         let Some(m) = ransac_affine(&pairs, tol, 400) else { break };
-        let before = pairs.len();
-        pairs.retain(|p| {
+        let (mine, rest): (Vec<_>, Vec<_>) = pairs.iter().partition(|p| {
             let (x, y) = gm::apply(&m, p.0, p.1);
-            ((x - p.2).powi(2) + (y - p.3).powi(2)).sqrt() >= tol * 1.5
+            ((x - p.2).powi(2) + (y - p.3).powi(2)).sqrt() < tol * 1.5
         });
-        if before - pairs.len() < min_inliers {
+        if mine.len() < min_inliers {
             break;
         }
+        pairs = rest;
         layers.push(m);
+        claimed.push(mine);
     }
     if layers.is_empty() {
         layers.push([1.0, 0.0, tdx, 0.0, 1.0, tdy]);
+        claimed.push(Vec::new());
     }
-    layers
+    (layers, claimed, pairs)
 }
+
+/// A coarse control-point deformation over one object layer: residual
+/// displacement past the layer's affine, bilinearly interpolated to
+/// every pixel, so the layer's non-rigid motion is carried by a few
+/// dozen parameters instead of one quarter-pel vector per 16x16
+/// region — and the warp is continuous, with no block boundaries in
+/// the motion field. Displacements are in PREVIOUS-frame coordinates:
+/// source(p) = A^-1(p) + d(p). Quantised to quarter-pel on the wire.
+///
+/// Why: the ledger puts 81% of film residual on the actor, whose rigid
+/// part the affine layer took and whose deformation was being paid as
+/// ~1,050 independent vectors a frame plus the residual where 16x16
+/// blocks cannot follow a face.
+#[derive(Clone, Debug)]
+pub struct DeformField {
+    pub x0: f32,
+    pub y0: f32,
+    pub step: f32,
+    pub cols: usize,
+    pub rows: usize,
+    /// Quarter-pel displacement per control point, row-major.
+    pub qd: Vec<(i16, i16)>,
+}
+
+impl DeformField {
+    /// Fit from the correspondences an affine layer claimed plus the
+    /// leftovers, over their bounding box with one cell of margin.
+    /// Each control point takes the inverse-distance-weighted mean of
+    /// the residual displacement of pairs within 1.5 cells; points
+    /// with no support are zero (pure affine there).
+    pub fn fit(affine: &crate::global_motion::Affine, pairs: &[(f32, f32, f32, f32)], step: f32, fw: usize, fh: usize) -> Option<DeformField> {
+        use crate::global_motion as gm;
+        if pairs.len() < 6 {
+            return None;
+        }
+        let inv = gm::invert(affine)?;
+        let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for p in pairs {
+            minx = minx.min(p.2);
+            miny = miny.min(p.3);
+            maxx = maxx.max(p.2);
+            maxy = maxy.max(p.3);
+        }
+        let x0 = (minx - step).max(0.0);
+        let y0 = (miny - step).max(0.0);
+        let x1 = (maxx + step).min(fw as f32);
+        let y1 = (maxy + step).min(fh as f32);
+        let cols = ((x1 - x0) / step).ceil() as usize + 1;
+        let rows = ((y1 - y0) / step).ceil() as usize + 1;
+        if cols < 2 || rows < 2 || cols * rows > 4096 {
+            return None;
+        }
+        // residual displacement per pair, in previous-frame coords
+        let res: Vec<(f32, f32, f32, f32)> = pairs
+            .iter()
+            .map(|p| {
+                let (sx, sy) = gm::apply(&inv, p.2, p.3);
+                (p.2, p.3, p.0 - sx, p.1 - sy)
+            })
+            .collect();
+        let radius = step * 1.5;
+        let mut qd = Vec::with_capacity(cols * rows);
+        for r in 0..rows {
+            for c in 0..cols {
+                let (cx, cy) = (x0 + c as f32 * step, y0 + r as f32 * step);
+                let (mut sw, mut sx, mut sy) = (0.0f32, 0.0f32, 0.0f32);
+                for &(px, py, dx, dy) in &res {
+                    let d = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
+                    if d < radius {
+                        let wgt = 1.0 / (1.0 + d);
+                        sw += wgt;
+                        sx += wgt * dx;
+                        sy += wgt * dy;
+                    }
+                }
+                if sw > 0.0 {
+                    let (dx, dy) = ((sx / sw).clamp(-16.0, 16.0), (sy / sw).clamp(-16.0, 16.0));
+                    qd.push(((dx * 4.0).round() as i16, (dy * 4.0).round() as i16));
+                } else {
+                    qd.push((0, 0));
+                }
+            }
+        }
+        Some(DeformField { x0, y0, step, cols, rows, qd })
+    }
+
+    fn disp_at(&self, x: f32, y: f32) -> (f32, f32) {
+        let gx = ((x - self.x0) / self.step).clamp(0.0, (self.cols - 1) as f32 - 1e-3);
+        let gy = ((y - self.y0) / self.step).clamp(0.0, (self.rows - 1) as f32 - 1e-3);
+        let (c0, r0) = (gx.floor() as usize, gy.floor() as usize);
+        let (tx, ty) = (gx - c0 as f32, gy - r0 as f32);
+        let g = |c: usize, r: usize| {
+            let q = self.qd[r * self.cols + c];
+            (q.0 as f32 / 4.0, q.1 as f32 / 4.0)
+        };
+        let (a, b, c, d) = (g(c0, r0), g(c0 + 1, r0), g(c0, r0 + 1), g(c0 + 1, r0 + 1));
+        let top = (a.0 * (1.0 - tx) + b.0 * tx, a.1 * (1.0 - tx) + b.1 * tx);
+        let bot = (c.0 * (1.0 - tx) + d.0 * tx, c.1 * (1.0 - tx) + d.1 * tx);
+        (top.0 * (1.0 - ty) + bot.0 * ty, top.1 * (1.0 - ty) + bot.1 * ty)
+    }
+
+    /// Warp `prev` into the current frame by affine + deformation
+    /// inside the field's box, plain affine outside.
+    pub fn warp(&self, prev: &Yuv420, affine: &crate::global_motion::Affine, fw: usize, fh: usize) -> Yuv420 {
+        use crate::global_motion as gm;
+        let inv = match gm::invert(affine) {
+            Some(i) => i,
+            None => return prev.clone(),
+        };
+        let mut out = Yuv420::new(fw, fh);
+        let (bx1, by1) = (self.x0 + (self.cols - 1) as f32 * self.step, self.y0 + (self.rows - 1) as f32 * self.step);
+        for fy in 0..fh {
+            for fx in 0..fw {
+                let (x, y) = (fx as f32, fy as f32);
+                let (mut sx, mut sy) = gm::apply(&inv, x, y);
+                if x >= self.x0 && x <= bx1 && y >= self.y0 && y <= by1 {
+                    let (dx, dy) = self.disp_at(x, y);
+                    sx += dx;
+                    sy += dy;
+                }
+                out.y[fy * fw + fx] = bilinear(&prev.y, fw, fh, sx, sy);
+            }
+        }
+        let (cw, ch) = (fw / 2, fh / 2);
+        for fy in 0..ch {
+            for fx in 0..cw {
+                let (x, y) = ((fx * 2) as f32, (fy * 2) as f32);
+                let (mut sx, mut sy) = gm::apply(&inv, x, y);
+                if x >= self.x0 && x <= bx1 && y >= self.y0 && y <= by1 {
+                    let (dx, dy) = self.disp_at(x, y);
+                    sx += dx;
+                    sy += dy;
+                }
+                out.u[fy * cw + fx] = bilinear(&prev.u, cw, ch, sx / 2.0, sy / 2.0);
+                out.v[fy * cw + fx] = bilinear(&prev.v, cw, ch, sx / 2.0, sy / 2.0);
+            }
+        }
+        out
+    }
+
+    /// Wire bytes: box + grid header (10 B) and the quarter-pel
+    /// displacements as deltas from the mean of the left and top
+    /// neighbours, through the context coder.
+    pub fn wire_bytes(&self) -> usize {
+        use crate::bincoder::{Ctx, Encoder};
+        let mut e = Encoder::new();
+        let mut mag: Vec<Ctx> = (0..8).map(|_| Ctx::new()).collect();
+        let mut sign = Ctx::new();
+        for r in 0..self.rows {
+            for c in 0..self.cols {
+                let q = self.qd[r * self.cols + c];
+                let l = if c > 0 { self.qd[r * self.cols + c - 1] } else { (0, 0) };
+                let t = if r > 0 { self.qd[(r - 1) * self.cols + c] } else { (0, 0) };
+                let pred = ((l.0 as i32 + t.0 as i32) / 2, (l.1 as i32 + t.1 as i32) / 2);
+                e.seg(&mut mag, &mut sign, q.0 as i32 - pred.0);
+                e.seg(&mut mag, &mut sign, q.1 as i32 - pred.1);
+            }
+        }
+        10 + e.finish().len()
+    }
+}
+
 
 /// Sub-pixel block correspondences prev -> cur around a translation
 /// prior: textured 16x16 blocks on a 48 px grid, +-6 px integer search,
@@ -3049,7 +3225,8 @@ pub fn encode_gop_v3_core(
             // actor and the camera fighting over one affine.
             let max_layers: usize = std::env::var("FAO_GMC_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
             let prev = &recon[fi - 1];
-            let layers = estimate_layers(&frames[fi - 1], f, max_layers);
+            let (layers, claimed, leftover) = estimate_layers_with_pairs(&frames[fi - 1], f, max_layers);
+            let deform_step: f32 = std::env::var("FAO_DEFORM").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
             let as_plate = Plate {
                 w: prev.w,
                 h: prev.h,
@@ -3060,9 +3237,47 @@ pub fn encode_gop_v3_core(
                 v: prev.v.clone(),
             };
             let mut cands: Vec<Yuv420> = vec![pred_for(fi)];
-            for m in &layers {
+            for (li, m) in layers.iter().enumerate() {
+                // Object layers (index >= 1) carry a deformation field
+                // when FAO_DEFORM=<step px> is set: their candidate is
+                // the deformed warp, fitted from the pairs the layer
+                // claimed plus the leftovers no layer explained.
                 let pm = PlateMotion { dx: m[2], dy: m[5], confidence: 1.0, lin: [m[0], m[1], m[3], m[4]] };
-                cands.push(predict_frame(&as_plate, &pm, fw, fh));
+                let rigid = predict_frame(&as_plate, &pm, fw, fh);
+                // Fitted from the pairs this layer CLAIMED (compact:
+                // the object), not the leftovers (scattered noise that
+                // stretched the box over the whole frame at 330 B a
+                // frame). Emitted only if it beats the rigid warp by
+                // its own wire cost in SAD terms — one flag bit.
+                let field = if deform_step >= 8.0 && li >= 1 {
+                    DeformField::fit(m, &claimed[li], deform_step, fw, fh)
+                } else {
+                    None
+                };
+                let _ = &leftover;
+                let mut pushed = false;
+                if let Some(fd) = field {
+                    let warped = fd.warp(prev, m, fw, fh);
+                    let sad = |p: &Yuv420| -> u64 {
+                        p.y.iter().zip(&f.y).map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs() as u64).sum()
+                    };
+                    let (s_rigid, s_def) = (sad(&rigid), sad(&warped));
+                    let cost = fd.wire_bytes();
+                    // 8 SAD per byte: the residual coder's rough
+                    // exchange rate at dz32 (one byte buys ~8 levels)
+                    if s_def + (cost as u64) * 8 < s_rigid {
+                        gmc_extra_bytes += cost;
+                        if std::env::var("FAO_GMC_DEBUG").is_ok() {
+                            eprintln!("deform f{fi} layer {li}: {}x{} grid, {} B, SAD {} -> {}", fd.cols, fd.rows, cost, s_rigid, s_def);
+                        }
+                        cands.push(warped);
+                        pushed = true;
+                    }
+                }
+                gmc_extra_bytes += 1;
+                if !pushed {
+                    cands.push(rigid);
+                }
             }
             gmc_extra_bytes += 16 * layers.len();
             // Mosaic candidate: follows layer 0 (the dominant affine);
