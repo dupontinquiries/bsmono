@@ -21,6 +21,25 @@
 //! So requests go down a channel and results come back up one, and the
 //! app polls. The app never waits.
 //!
+//! ## It answers, too
+//!
+//! The first version only asked. Its worker blocked on the request channel
+//! and nothing read the socket between lookups, so an unsolicited query
+//! from another node — the thing that makes a node a node — was never
+//! seen. Two of these on a LAN could not find each other: each `find`
+//! went unanswered, and both depended on a third party that did answer,
+//! which has meant `bootstrap.jami.net`. The transport now serves
+//! (`WireUdpTransport::serve`): one thread blocks in `recv_from` and
+//! answers queries through `snapcore::wire::Responder`, while the worker
+//! here drives lookups. Two hosts need nobody else — `tests/two_hosts.rs`.
+//!
+//! The two threads share the `Node` under a mutex. The serving thread
+//! locks it per inbound packet, briefly. The worker does NOT hold it across
+//! a lookup: it clones the routing table, runs the lookup on the clone, and
+//! merges back whatever the lookup touched (`with_rt`). A lookup is
+//! seconds of round trips, and a node that stops answering for the
+//! duration of its own questions is a node its peers mark bad.
+//!
 //! ## What it deliberately does not do
 //!
 //! It does not decide what a result MEANS. `peer_source::Reach` already
@@ -71,12 +90,36 @@ pub enum Event {
     /// The worker stopped. Carries why, because a discovery feature that
     /// silently stops is one people conclude is "just slow".
     Stopped(String),
+    /// A keepalive round went out. `answered` of `pinged` peers replied —
+    /// zero of several is the app's cue that the network changed under
+    /// it (a NAT mapping expired, wifi handed off to cellular).
+    Keepalive { pinged: usize, answered: usize },
 }
 
 pub struct NodeHost {
     tx: Sender<Req>,
     rx: Receiver<Event>,
     local: SocketAddr,
+    transport: std::sync::Arc<UdpTransport>,
+    serving: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Run `f` on a snapshot of the routing table, then merge back what it
+/// touched. Contacts the lookup saw carry `last_seen >= now`; those it did
+/// not are left as the shared table already has them, so a lookup cannot
+/// refresh staleness it never checked.
+fn with_rt<R>(node: &std::sync::Mutex<Node>, now: u64,
+              f: impl FnOnce(&mut snapcore::routing::RoutingTable) -> R) -> R {
+    let mut rt = match node.lock() { Ok(n) => n.rt.clone(), Err(p) => p.into_inner().rt.clone() };
+    let r = f(&mut rt);
+    let mut n = match node.lock() { Ok(n) => n, Err(p) => p.into_inner() };
+    let me = n.id();
+    for c in rt.closest(&me, usize::MAX) {
+        if c.last_seen >= now {
+            n.rt.saw(c.id, c.addr, c.last_seen);
+        }
+    }
+    r
 }
 
 impl NodeHost {
@@ -87,20 +130,57 @@ impl NodeHost {
     /// keyspace across restarts — a node that re-randomises its id on
     /// every launch makes every other node's routing table stale.
     pub fn spawn(id: NodeId, bind: SocketAddr) -> std::io::Result<NodeHost> {
-        let tx_udp = UdpTransport::bind(id, bind)?;
+        Self::spawn_with_keepalive(id, bind, KEEPALIVE)
+    }
+
+    /// `spawn` with the keepalive period chosen — tests use a short one.
+    pub fn spawn_with_keepalive(id: NodeId, bind: SocketAddr, keepalive: std::time::Duration)
+        -> std::io::Result<NodeHost> {
+        let tx_udp = std::sync::Arc::new(UdpTransport::bind(id, bind)?);
         let local = tx_udp.local_addr()?;
         let (req_tx, req_rx) = std::sync::mpsc::channel::<Req>();
         let (ev_tx, ev_rx) = std::sync::mpsc::channel::<Event>();
+        let node = std::sync::Arc::new(std::sync::Mutex::new(Node::new(id, local)));
+        let serving = tx_udp.serve(node.clone())?;
 
+        let transport = tx_udp.clone();
         std::thread::spawn(move || {
-            let mut node = Node::new(id, local);
             loop {
                 // Blocking recv, not a poll loop: an idle node should
                 // cost nothing. A DHT that burns a core waiting for
                 // something to do is a battery bug on a phone, and this
                 // is a phone app.
-                let req = match req_rx.recv() {
+                // Blocking with a period, not a poll loop: the thread
+                // wakes once per keepalive when idle, and that wake is the
+                // keepalive. See `KEEPALIVE` for why it exists at all.
+                let req = match req_rx.recv_timeout(keepalive) {
                     Ok(r) => r,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        let now = now_secs();
+                        let me = me_contact(id, local, now);
+                        let targets = {
+                            let n = match node.lock() { Ok(n) => n, Err(p) => p.into_inner() };
+                            // The peers most likely to hold our mapping and
+                            // to be asked about us: the ones nearest our
+                            // own id. Bounded, because this runs for the
+                            // life of the app.
+                            n.rt.closest(&id, KEEPALIVE_PEERS)
+                        };
+                        if targets.is_empty() { continue; }
+                        let mut answered = 0;
+                        for c in &targets {
+                            if snapcore::node::Transport::ping(&*tx_udp, &me, c) {
+                                answered += 1;
+                                match node.lock() { Ok(mut n) => n.rt.saw(c.id, c.addr, now), Err(p) => p.into_inner().rt.saw(c.id, c.addr, now) }
+                            } else {
+                                match node.lock() { Ok(mut n) => n.rt.failed(&c.id, now), Err(p) => p.into_inner().rt.failed(&c.id, now) }
+                            }
+                        }
+                        if ev_tx.send(Event::Keepalive { pinged: targets.len(), answered }).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
                     // The sender is gone, which means NodeHost was
                     // dropped. Exit rather than report — nobody is
                     // listening to the event channel either.
@@ -115,35 +195,47 @@ impl NodeHost {
                         // zero rather than a distinct event: the app's
                         // question is "can I reach anyone", and the
                         // table size answers it.
-                        node.rt.saw(peer, addr, now);
-                        Event::Published { sc_id: String::new(), peers: node.rt.len() }
+                        let mut n = match node.lock() { Ok(n) => n, Err(p) => p.into_inner() };
+                        n.rt.saw(peer, addr, now);
+                        Event::Published { sc_id: String::new(), peers: n.rt.len() }
                     }
                     Req::Publish { sc_id, name, ip, port } => {
-                        let me = me_contact(&node, id, local, now);
-                        let n = crate::dht::publish(
-                            &me, &mut node.rt, &tx_udp,
-                            &sc_id, &name, &ip, port, DEFAULT_TTL, now);
+                        let me = me_contact(id, local, now);
+                        let (_, value) = crate::announce_record(&sc_id, &name, &ip, port);
+                        let n = with_rt(&node, now, |rt| crate::dht::publish(
+                            &me, rt, &*tx_udp,
+                            &sc_id, &name, &ip, port, DEFAULT_TTL, now));
+                        store_local(&node, &sc_id, value.data, now);
                         Event::Published { sc_id, peers: n }
                     }
                     Req::PublishRaw { sc_id, value_id, payload } => {
-                        let me = me_contact(&node, id, local, now);
-                        let n = crate::dht::publish_raw(
-                            &me, &mut node.rt, &tx_udp,
-                            &sc_id, value_id, payload, DEFAULT_TTL, now);
+                        let me = me_contact(id, local, now);
+                        let n = with_rt(&node, now, |rt| crate::dht::publish_raw(
+                            &me, rt, &*tx_udp,
+                            &sc_id, value_id, payload.clone(), DEFAULT_TTL, now));
+                        store_local(&node, &sc_id, payload, now);
                         Event::Published { sc_id, peers: n }
                     }
                     Req::ResolveRaw { sc_id } => {
-                        let me = me_contact(&node, id, local, now);
-                        let values = crate::dht::resolve_raw(
-                            &me, &mut node.rt, &tx_udp, &sc_id, now)
+                        let me = me_contact(id, local, now);
+                        let mut values = with_rt(&node, now, |rt| crate::dht::resolve_raw(
+                            &me, rt, &*tx_udp, &sc_id, now))
                             .unwrap_or_default();
+                        for b in local_values(&node, &sc_id, now) {
+                            if !values.contains(&b) { values.push(b); }
+                        }
                         Event::ResolvedRaw { sc_id, values }
                     }
                     Req::Resolve { sc_id } => {
-                        let me = me_contact(&node, id, local, now);
-                        let found = crate::dht::resolve(
-                            &me, &mut node.rt, &tx_udp, &sc_id, now)
+                        let me = me_contact(id, local, now);
+                        let mut found = with_rt(&node, now, |rt| crate::dht::resolve(
+                            &me, rt, &*tx_udp, &sc_id, now))
                             .unwrap_or_default();
+                        for b in local_values(&node, &sc_id, now) {
+                            if let Some(p) = crate::dht::parse_record(&sc_id, &b) {
+                                if !found.contains(&p) { found.push(p); }
+                            }
+                        }
                         Event::Resolved { sc_id, found }
                     }
                 };
@@ -156,7 +248,13 @@ impl NodeHost {
             }
         });
 
-        Ok(NodeHost { tx: req_tx, rx: ev_rx, local })
+        Ok(NodeHost { tx: req_tx, rx: ev_rx, local, transport, serving: Some(serving) })
+    }
+
+    /// The ip peers say we reach them from — see
+    /// `WireUdpTransport::public_ip`. `None` until any peer has answered.
+    pub fn public_ip(&self) -> Option<std::net::IpAddr> {
+        self.transport.public_ip()
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -220,6 +318,25 @@ impl NodeHost {
     }
 }
 
+/// How often an idle node pings the peers nearest it.
+///
+/// A served node is reachable only while its NAT mapping lives, and a
+/// UDP mapping dies after roughly thirty seconds of silence on most home
+/// routers and sooner on some carriers. Between lookups nothing else
+/// leaves this socket, so the mapping that every peer's record of us
+/// points at would expire within a minute of the last publish. Twenty-five
+/// seconds keeps it under the common thirty; it is also the figure the
+/// reference and Jami use, so a phone running both wakes its radio no
+/// more often than it already did. The cost is a few datagrams a
+/// minute; the alternative is a node that is only reachable for a minute
+/// after it last spoke.
+pub const KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// Peers pinged per keepalive. Three is enough to keep a mapping open
+/// through the routers between us and them, and to notice when none of
+/// them answer.
+pub const KEEPALIVE_PEERS: usize = 3;
+
 /// How long a published record lives, in seconds.
 ///
 /// Short enough that a device that goes away stops being advertised
@@ -234,8 +351,33 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// The reference's `put` stores locally as well as announcing, and its
+/// `get` reads the local store first. Without both, the record a lone
+/// pair of nodes exchanged lives only on the peer that received it, and
+/// that peer resolving it would ask the other and find nothing.
+fn store_local(node: &std::sync::Mutex<Node>, sc_id: &str, bytes: Vec<u8>, now: u64) {
+    let key = crate::dht::key_of(&crate::presence::key_for_scid(sc_id));
+    let mut n = match node.lock() { Ok(n) => n, Err(p) => p.into_inner() };
+    n.store.put(key, bytes, DEFAULT_TTL, now);
+}
+
+fn local_values(node: &std::sync::Mutex<Node>, sc_id: &str, now: u64) -> Vec<Vec<u8>> {
+    let key = crate::dht::key_of(&crate::presence::key_for_scid(sc_id));
+    let n = match node.lock() { Ok(n) => n, Err(p) => p.into_inner() };
+    n.store.get(&key, now)
+}
+
+impl Drop for NodeHost {
+    fn drop(&mut self) {
+        // Wake the serving thread so it notices the transport is going.
+        self.transport.stop_serving();
+        if let Some(h) = self.serving.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 fn me_contact(
-    _node: &Node,
     id: NodeId,
     addr: SocketAddr,
     now: u64,

@@ -222,7 +222,19 @@ impl RoutingTable {
     }
 
     /// Record a positive interaction with a node. Our own id is ignored.
+    ///
+    /// One address is one node. A contact already held at `addr` under a
+    /// DIFFERENT id is dropped first — it is a bootstrap entry whose id was
+    /// guessed before anyone spoke to it, or a node that restarted with a
+    /// new id. Left in place, the stale id is a phantom that never gets
+    /// evicted: every probe sent to it is answered by the real node at that
+    /// address, so it never fails, and every lookup near it queries and
+    /// stores to the same socket twice.
     pub fn saw(&mut self, id: NodeId, addr: SocketAddr, now: u64) {
+        for b in self.buckets.iter_mut() {
+            b.contacts.retain(|c| c.addr != addr || c.id == id);
+            b.replacements.retain(|c| c.addr != addr || c.id == id);
+        }
         if let Some(b) = self.local.bucket_index(&id) {
             self.buckets[b].saw(Contact::new(id, addr, now), now, &self.params);
         }
@@ -303,6 +315,25 @@ mod tests {
         assert_eq!(zero.bucket_index(&id_bit(0)), Some(0)); // top bit differs
         assert_eq!(zero.bucket_index(&id_bit(159)), Some(159)); // last bit differs
         assert_eq!(zero.bucket_index(&id_bit(8)), Some(8)); // top bit of byte 1
+    }
+
+    #[test]
+    fn a_new_id_at_a_known_address_replaces_the_old_one() {
+        // The bootstrap case: an entry added by address with a guessed id,
+        // then the real id learned from the first reply.
+        let local = id([0u8; ID_LEN]);
+        let mut rt = RoutingTable::with_params(local, fast_params());
+        let addr: SocketAddr = "10.0.0.1:4222".parse().unwrap();
+        let guessed = id([0xEE; ID_LEN]);
+        let real = id([0x33; ID_LEN]);
+        rt.saw(guessed, addr, 1);
+        rt.saw(real, addr, 2);
+        assert_eq!(rt.len(), 1, "the guessed id lingered as a phantom");
+        assert_eq!(rt.closest(&local, 1)[0].id, real);
+        // Same id, same address: still one, still refreshed.
+        rt.saw(real, addr, 3);
+        assert_eq!(rt.len(), 1);
+        assert_eq!(rt.closest(&local, 1)[0].last_seen, 3);
     }
 
     #[test]

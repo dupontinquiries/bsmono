@@ -392,6 +392,11 @@ impl Snapclone {
                 // normal, and letting a late low sequence move the ack
                 // backwards makes the peer re-send everything after it.
                 self.sessions.entry(&from).observe_seq(frame.header.seq);
+                // The bytes, kept, or nothing can ever be opened.
+                self.keep_received(frame.to_snap(&from));
+                // And the ambient palette is told: it decides itself whether
+                // this arrival is worth a derivation.
+                let _ = self.ambient_snap_arrived(self.now_secs.max(0) as u64 * 1000);
                 let row = frame.to_feed_entry(&from);
                 // The finished set is consulted for a SINGLE arrival too,
                 // not only at a bulk feed load. A peer that re-sends a snap
@@ -440,7 +445,13 @@ impl Snapclone {
             HostEvent::NatProbed { local_port, a, b } => {
                 out.push(HostCommand::NatClassified(self.classify_nat(local_port, &a, &b)));
             }
-            HostEvent::ExpirePunchAddrs { now_ms } => { self.punch.expire(now_ms); }
+            HostEvent::ExpirePunchAddrs { now_ms } => {
+                self.punch.expire(now_ms);
+                // Gossip too, or the heard table grows for the life of the
+                // app. A day: a peer not heard from since yesterday is a
+                // bootstrap entry worth trying, not a live one.
+                self.heard.purge_stale(now_ms, 24 * 60 * 60 * 1000);
+            }
 
             HostEvent::VoiceLink(on) => self.voice_bridge.set_connected(on),
             HostEvent::VoiceReceived { sender, payload } => {

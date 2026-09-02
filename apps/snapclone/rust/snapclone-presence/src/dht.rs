@@ -138,6 +138,17 @@ pub fn resolve_raw<T: Transport>(
     if found.is_empty() { None } else { Some(found) }
 }
 
+/// One stored value as a `Presence`, or `None` if it is not one.
+///
+/// `from_value`, not a byte parser: the record is a dht-kit `Value`, and
+/// its `id` is part of what identifies it. One definition of what a
+/// presence record IS, used by the network path and the local store alike
+/// — the alternative is a second parser that can drift.
+pub fn parse_record(sc_id: &str, bytes: &[u8]) -> Option<crate::presence::Presence> {
+    crate::presence::Presence::from_value(
+        &crate::Value::new(crate::presence::value_id_for(sc_id), bytes.to_vec()))
+}
+
 /// Find someone by their sc-ID.
 ///
 /// `None` means the lookup finished without a value — nobody had it, or
@@ -168,16 +179,7 @@ pub fn resolve<T: Transport>(
         // A record that does not parse is SKIPPED, not fatal. Anyone can
         // store anything under any key in a DHT, so one malformed value
         // must not hide the good ones sitting beside it.
-        // `from_value`, not a byte parser: the record is a dht-kit
-        // `Value`, and its `id` is part of what identifies it. Rebuilding
-        // the Value here keeps one definition of what a presence record
-        // IS — the alternative is a second parser that can drift.
-        .filter_map(|b| {
-            crate::presence::Presence::from_value(&crate::Value {
-                id: crate::presence::value_id_for(sc_id),
-                data: b.clone(),
-            })
-        })
+        .filter_map(|b| parse_record(sc_id, b))
         .collect();
     if parsed.is_empty() {
         None

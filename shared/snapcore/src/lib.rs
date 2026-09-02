@@ -56,11 +56,11 @@ pub mod sim;
 pub mod guard;
 pub mod store;
 
-#[cfg(feature = "wire")]
+
 pub mod wire;
 
 /// The socket that speaks `wire`'s format. Behind the same feature, since
 /// it needs dht-kit's codec — and separate from `udp`, which keeps its own
 /// bespoke framing for the five crates already using it.
-#[cfg(feature = "wire")]
+
 pub mod wire_udp;

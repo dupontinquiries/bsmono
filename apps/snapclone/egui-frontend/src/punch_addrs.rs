@@ -69,6 +69,17 @@ impl PunchAddrs {
     /// caller could try to punch to. `Option` makes the miss impossible to use
     /// by accident, and `PeerAddr::is_unset` exists for call sites that still
     /// want the old shape.
+    /// Every remembered (id, address), newest first. For the DHT's
+    /// bootstrap list: a peer we have spoken to is a node we can start
+    /// from, and its id is derivable from its sc-ID, which is more than
+    /// any bootstrap server offers.
+    pub fn all(&self) -> Vec<(String, PeerAddr)> {
+        let mut v: Vec<(String, PeerAddr, u64)> = self.map.iter()
+            .map(|(id, e)| (id.clone(), e.addr, e.inserted_ms)).collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        v.into_iter().map(|(id, a, _)| (id, a)).collect()
+    }
+
     pub fn get(&self, id: &str) -> Option<PeerAddr> {
         self.map.get(id).map(|e| e.addr)
     }

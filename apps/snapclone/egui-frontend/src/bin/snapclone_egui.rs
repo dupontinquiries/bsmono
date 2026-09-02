@@ -85,6 +85,13 @@ struct VoiceRig {
     last_sink_tick: std::time::Instant,
     /// Said once per call, not per frame.
     warned_no_audio: bool,
+    /// Mic and speaker are up. The SOCKET outlives a call — it is the
+    /// punch socket, and its NAT mapping is what our record announces
+    /// (`nat_traversal`): STUN discovered it from this socket, and a
+    /// mapping measured on a socket that closes when the call ends is a
+    /// mapping nobody can use.
+    joined: bool,
+    warned_no_socket: bool,
 }
 
 impl VoiceRig {
@@ -94,10 +101,27 @@ impl VoiceRig {
             mic: audio::MicShared::new(), mic_stop: Arc::new(AtomicBool::new(false)),
             mic_child: None, mic_thread: None, speaker: None, speaker_child: None,
             last_sink_tick: std::time::Instant::now(), warned_no_audio: false,
+            joined: false, warned_no_socket: false,
         }
     }
 
-    fn live(&self) -> bool { self.sock.is_some() }
+    /// Bind the punch/voice socket if it is not already. Said once on
+    /// failure; retried every call so a port freed later is picked up.
+    fn ensure_socket(&mut self, port: u16) -> bool {
+        if self.sock.is_some() { return true; }
+        match snapclone_egui::voice_wire::VoiceSocket::bind(port) {
+            Ok(s) => { self.sock = Some(s); self.warned_no_socket = false; true }
+            Err(e) => {
+                if !self.warned_no_socket {
+                    self.warned_no_socket = true;
+                    eprintln!("snapclone: no voice/punch socket on UDP {port}: {e}");
+                }
+                false
+            }
+        }
+    }
+
+    fn live(&self) -> bool { self.joined }
 
     /// Bring up the socket and both devices. A missing audio tool is NOT
     /// fatal to the call: the socket still carries the other direction, and
@@ -106,13 +130,11 @@ impl VoiceRig {
     fn start(&mut self, port: u16, frame_ms: u32, record_cmd: &str, play_cmd: &str)
              -> Vec<String> {
         let mut notes = Vec::new();
-        match snapclone_egui::voice_wire::VoiceSocket::bind(port) {
-            Ok(s) => self.sock = Some(s),
-            Err(e) => {
-                notes.push(format!("no voice socket on UDP {port}: {e}"));
-                return notes;
-            }
+        if !self.ensure_socket(port) {
+            notes.push(format!("no voice socket on UDP {port}"));
+            return notes;
         }
+        self.joined = true;
         self.mic_stop = Arc::new(AtomicBool::new(false));
         self.mic = audio::MicShared::new();
         match audio::spawn(record_cmd, audio::Direction::Record) {
@@ -145,8 +167,8 @@ impl VoiceRig {
         // mid-buffer.
         self.speaker = None;
         if let Some(c) = self.speaker_child.take() { c.stop(); c.reap(); }
-        self.sock = None;
-        self.peers = snapclone_egui::voice_wire::Peers::new();
+        // The socket stays: see `joined`.
+        self.joined = false;
         self.warned_no_audio = false;
     }
 }
@@ -167,6 +189,15 @@ struct App {
     /// listener that only ran on the Inbox page would drop it.
     snaps_in: Option<snapclone_egui::snap_transport::Listener>,
     voice: VoiceRig,
+    /// `NatTraversal.cpp`'s loop, driven from `pump_nat` on the voice socket.
+    nat: snapclone_egui::nat_traversal::Traversal,
+    nat_id: String,
+    last_stun_ms: Option<u64>,
+    /// A resolver in flight for the STUN list. DNS is synchronous and can
+    /// block for seconds on a network with a dead resolver — the hotspot
+    /// case the server list has IP entries for — and this is the UI
+    /// thread. Resolved off it; picked up when ready.
+    stun_resolve: Option<Arc<std::sync::Mutex<Option<Vec<std::net::SocketAddr>>>>>,
     /// The bytes of the last shutter press, kept so Send has something to
     /// send. Held by the HOST and not by the app: the controller has no
     /// business carrying a photo in memory purely to hand it back.
@@ -290,6 +321,8 @@ impl App {
                last_snap: None, sending: Vec::new(),
                send_results: Arc::new(Mutex::new(Vec::new())),
                voice: VoiceRig::idle(), rig: CaptureRig::idle(),
+               nat: snapclone_egui::nat_traversal::Traversal::new(""), nat_id: String::new(),
+               last_stun_ms: None, stun_resolve: None,
                plan_logged: false, focused: true,
                gossip, last_announce: 0, warned_unsigned: false, identity: keys }
     }
@@ -491,6 +524,112 @@ impl App {
     }
 
     /// Bring the voice path up and down with the call, and pump it.
+    /// Hand refused datagrams to the traversal: punches and STUN replies
+    /// arrive from senders the voice path does not know. Returns what was
+    /// neither.
+    fn feed_nat(&mut self, refused: Vec<snapclone_egui::voice_wire::Refused>)
+        -> Vec<snapclone_egui::voice_wire::Refused> {
+        let mut rest = Vec::new();
+        for r in refused {
+            match r {
+                snapclone_egui::voice_wire::Refused::UnknownSender(from, bytes) => {
+                    match self.nat.on_datagram(from, &bytes) {
+                        Some(ev) => self.on_nat_event(ev),
+                        None => rest.push(snapclone_egui::voice_wire::Refused::UnknownSender(from, bytes)),
+                    }
+                }
+                other => rest.push(other),
+            }
+        }
+        rest
+    }
+
+    fn on_nat_event(&mut self, ev: snapclone_egui::nat_traversal::Event) {
+        use snapclone_egui::nat_traversal::Event;
+        match ev {
+            Event::Reflexive(addr) => {
+                if self.snap.reflexive != Some(addr) {
+                    eprintln!("snapclone: our punch socket is {addr} from outside");
+                }
+                self.snap.reflexive = Some(addr);
+                self.snap.stun_failed = false;
+            }
+            Event::StunFailed => {
+                self.snap.stun_failed = true;
+                eprintln!("snapclone: no STUN server answered — our public address stays unknown");
+            }
+            Event::PunchReady { peer, addr } =>
+                eprintln!("snapclone: punch volley to {peer} at {addr} complete; keeping it open"),
+            Event::PunchArrived { peer, from } => {
+                // registerPunchedPeer: where the packets ACTUALLY come from
+                // is the address to send to, whatever the record said.
+                if let std::net::IpAddr::V4(ip) = from.ip() {
+                    self.snap.note_peer_addr(&peer, ip.octets(), from.port(), wall_ms());
+                    eprintln!("snapclone: punch from {peer} at {from}");
+                }
+            }
+        }
+    }
+
+    /// STUN once we know who we are, again every fifteen minutes, and
+    /// when the DHT says nobody answers any more (the network changed);
+    /// punch every call participant that has an address; send what is due.
+    fn pump_nat(&mut self) {
+        let port = self.snap.settings.current.network.listen_port;
+        if !self.voice.ensure_socket(port) { return; }
+        if self.snap.local_id.is_empty() { return; }
+        if self.nat_id != self.snap.local_id {
+            self.nat = snapclone_egui::nat_traversal::Traversal::new(&self.snap.local_id);
+            self.nat_id = self.snap.local_id.clone();
+            self.last_stun_ms = None;
+        }
+        let now_ms = wall_ms();
+        let network_changed = matches!(self.snap.dht_keepalive, Some((n, 0)) if n > 0)
+            && self.last_stun_ms.is_some_and(|t| now_ms.saturating_sub(t) > 60_000);
+        let stale = self.last_stun_ms.is_none_or(|t| now_ms.saturating_sub(t) > 15 * 60_000);
+        let mut outs = Vec::new();
+        if (stale || network_changed) && self.stun_resolve.is_none() {
+            self.last_stun_ms = Some(now_ms);
+            let net = &self.snap.settings.current.network;
+            let extra: Vec<String> = net.stun_extra.split_whitespace().map(String::from).collect();
+            let names: Vec<String> = snapclone_egui::stun_servers::addresses(net.stun_mask)
+                .into_iter().chain(extra).collect();
+            let slot = Arc::new(std::sync::Mutex::new(None));
+            self.stun_resolve = Some(slot.clone());
+            std::thread::spawn(move || {
+                let servers: Vec<std::net::SocketAddr> = names.iter()
+                    .filter_map(|a| std::net::ToSocketAddrs::to_socket_addrs(a.as_str()).ok()?.find(|s| s.is_ipv4()))
+                    .collect();
+                if let Ok(mut s) = slot.lock() { *s = Some(servers); }
+            });
+        }
+        if let Some(slot) = self.stun_resolve.as_ref() {
+            let ready = slot.lock().ok().and_then(|mut s| s.take());
+            if let Some(servers) = ready {
+                self.stun_resolve = None;
+                outs.extend(self.nat.start_stun(servers, now_ms));
+            }
+        }
+        if self.voice.live() {
+            let targets: Vec<(String, snapclone_egui::punch_addrs::PeerAddr)> =
+                self.snap.group_voice.participants.iter()
+                    .filter(|p| !p.is_self)
+                    .filter_map(|p| self.snap.punch.get(&p.id).map(|a| (p.id.clone(), a)))
+                    .collect();
+            for (id, a) in targets {
+                let _ = self.nat.initiate(&id, std::net::SocketAddr::from((a.ip, a.port)), false, now_ms);
+            }
+        }
+        let (due, events) = self.nat.tick(now_ms);
+        outs.extend(due);
+        if let Some(sock) = self.voice.sock.as_ref() {
+            for o in outs {
+                let _ = sock.send_raw(&o.bytes, o.to);
+            }
+        }
+        for ev in events { self.on_nat_event(ev); }
+    }
+
     fn pump_voice(&mut self) {
         let joined = self.snap.group_voice.joined;
         let frame_ms = self.snap.sink_latency.frame_ms;
@@ -518,8 +657,24 @@ impl App {
             self.voice.stop();
             let cmds = self.snap.apply(HostEvent::VoiceLink(false));
             self.handle(cmds);
+            // The call is over; the paths held open for it can close. A
+            // snap in flight keeps its own (see SendSnap).
+            let ids: Vec<String> = self.snap.group_voice.participants.iter()
+                .filter(|p| !p.is_self).map(|p| p.id.clone()).collect();
+            for id in ids { self.nat.stop(&id); }
         }
-        if !self.voice.live() { return; }
+        self.pump_nat();
+        if !self.voice.live() {
+            // Not in a call, but the socket is up and STUN replies and
+            // punches still arrive on it. Drain them.
+            let empty = snapclone_egui::voice_wire::Peers::new();
+            let refused = match self.voice.sock.as_mut() {
+                Some(s) => s.poll(&empty, 16).1,
+                None => Vec::new(),
+            };
+            self.feed_nat(refused);
+            return;
+        }
 
         // WHO IS IN THE CALL, and where. Rebuilt each frame from the app's
         // own participant list crossed with the punch addresses gossip
@@ -580,6 +735,7 @@ impl App {
             let cmds = self.snap.apply(HostEvent::VoiceReceived { sender, payload });
             self.handle(cmds);
         }
+        let refused = self.feed_nat(refused);
         if !refused.is_empty() && !self.voice.warned_no_audio {
             self.voice.warned_no_audio = true;
             eprintln!("snapclone: voice datagrams refused — sender not a known call \
@@ -800,6 +956,14 @@ impl App {
                 // and doing that inline would freeze the UI for twenty
                 // seconds per person.
                 HostCommand::SendSnap { to } => {
+                    // Open the path first: on a port-preserving NAT the TCP
+                    // SYN that follows rides the UDP mapping the volley
+                    // makes (the C++ comment on why TCP works afterwards).
+                    for who in &to {
+                        if let Some(a) = self.snap.punch.get(who) {
+                            let _ = self.nat.initiate(who, std::net::SocketAddr::from((a.ip, a.port)), false, wall_ms());
+                        }
+                    }
                     let Some(bytes) = self.last_snap.clone() else {
                         eprintln!("snapclone: nothing to send — take a photo first");
                         continue;
@@ -982,8 +1146,23 @@ impl eframe::App for App {
         // come round on its own or an idle window never polls the socket —
         // and a live viewfinder needs the frame loop at frame rate, or the
         // preview updates only when the mouse moves.
-        ctx.request_repaint_after(std::time::Duration::from_millis(
-            if self.rig.running() { 33 } else { 500 }));
+        //
+        // A live CALL needs it at the audio frame rate: `pump_voice` takes
+        // at most four mic frames and sixteen datagrams per update, which
+        // at 500 ms wakeups is a fifth of what a 20 ms codec produces —
+        // the mic queue backs up without bound and the far end hears
+        // half-second bursts. Only the viewfinder used to raise the rate,
+        // so a call with the camera off stuttered and one with it on did
+        // not, which is the kind of correlation that sends people looking
+        // at the wrong subsystem.
+        let interval_ms: u64 = if self.voice.live() {
+            u64::from(self.snap.sink_latency.frame_ms).clamp(10, 33)
+        } else if self.rig.running() {
+            33
+        } else {
+            500
+        };
+        ctx.request_repaint_after(std::time::Duration::from_millis(interval_ms));
 
         let focused = ctx.input(|i| i.focused);
         if focused != self.focused {
@@ -1028,4 +1207,11 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(APP_ID, opts, Box::new(|_cc| Ok(Box::new(App::new()))))
+}
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }

@@ -72,6 +72,9 @@ pub mod dht_announce;
 pub mod dht_bootstrap;
 pub mod dht_envelope;
 pub mod dht_presence;
+pub mod hint;
+pub mod palette;
+pub mod nat_traversal;
 pub mod face_consent;
 pub mod frame_pump;
 pub mod firewall_backend;
@@ -211,6 +214,21 @@ pub struct Snapclone {
     /// When to publish and who to look up. Pure policy, so the cadence is
     /// testable without a socket — see `dht_presence`.
     pub dht_schedule: crate::dht_presence::Schedule,
+    /// The last keepalive round: (pinged, answered). `None` until the node
+    /// has had an idle period. Zero answered of several pinged is the cue
+    /// that the network changed under us — a NAT mapping expired, wifi
+    /// handed off to cellular — and the status line says so rather than
+    /// showing a peer count that is no longer true.
+    pub dht_keepalive: Option<(usize, usize)>,
+    /// The punch socket's STUN-mapped address (`nat_traversal`). Announced
+    /// in our record so a peer's volley hits the mapping that exists.
+    pub reflexive: Option<std::net::SocketAddr>,
+    /// STUN was asked and nobody answered (cleared when a server does).
+    pub stun_failed: bool,
+    /// Peers the node reported on its last publish or bootstrap.
+    pub dht_peers: usize,
+    /// The "reachable from outside" hint has been shown this session.
+    pub reachable_shown: bool,
     /// The accessibility scene the settings toggles register with.
     /// Held here rather than in the page so focus survives between
     /// frames — a page-local scene forgets on every repaint, which
@@ -246,6 +264,12 @@ pub struct Snapclone {
     /// go straight to camera; otherwise we show it and hide on `login_succeeded`.
     pub login_visible: bool,
     pub nav: Nav,
+    /// How many pages the last frame laid out side by side. One on a
+    /// phone; on a desktop as many as fit (`page_columns`).
+    pub cols_drawn: usize,
+    /// Hysteresis for the column count, so a window resized across a
+    /// breakpoint cannot shuffle the layout frame by frame.
+    pub plan: uikit_egui::pager::PlanState,
     pub bg: LiveBackground,
     pub peers: Vec<Peer>,
     /// The friends roster (Qt FriendListWidget). Derived from `peers` on
@@ -347,6 +371,14 @@ pub struct Snapclone {
     /// The action menu, opened by right-click on a desktop and press-and-hold
     /// on a phone. Before this the fleet had neither, anywhere.
     pub menu: uikit_egui::menu::ContextMenu,
+    /// Snaps that arrived this session, bytes and all, so a tap on a tile
+    /// can open one. Nothing kept them before: `SnapArrived` built the
+    /// feed entry and dropped the frame, and the receive path ended at a
+    /// badge. Bounded by count and bytes; a snap is view-once and the
+    /// oldest go first.
+    pub received: Vec<crate::snaps::Snap>,
+    /// A menu chose "View": opened on the next frame, which has a surface.
+    pub pending_open: Option<String>,
     /// "Someone is looking at this screen", from the gaze layer.
     pub attention: crate::gaze::Attention,
     /// The snap the menu was opened on.
@@ -496,6 +528,10 @@ pub struct Snapclone {
     /// a watchdog — a pointer-up lost to a system gesture would otherwise
     /// leave the machine Held forever.
     pub press: crate::press_gesture::PressGesture,
+    /// Double-tap on the viewfinder flips the camera.
+    pub double_tap: crate::press_gesture::DoubleTap,
+    /// The shell is the phone one this frame (`Adaptive::is_compact`).
+    pub compact: bool,
     /// Horizontal scroll for the tile strip, with edge pass-through: at the
     /// end of the strip the wheel stops being ours and reaches the page
     /// navigator behind it. Without that the carousel silently swallows the
@@ -608,6 +644,21 @@ pub struct Snapclone {
     /// OR any other input, so a reader pausing on a short section is not
     /// dismissed mid-read.
     pub help: crate::help_manual::HelpManual,
+    pub help_filter: String,
+    pub help_scroll_y: f32,
+    /// The command palette (`palette`): open, its text, its cursor.
+    pub palette_open: bool,
+    pub palette_input: String,
+    pub palette_cursor: usize,
+    /// Set the frame the palette opens, so the field takes focus once.
+    pub palette_focus: bool,
+    pub schedule: crate::palette::Schedule,
+    /// The keyboard is driving: Tab was pressed and the pointer has not
+    /// moved since. Draws the focus ring and its caption.
+    pub keyboard_nav: bool,
+    /// What Space/Enter does on a widget, by id, registered as widgets
+    /// draw (`key_label`). Cleared every frame.
+    pub key_labels: std::collections::HashMap<egui::Id, String>,
     /// Running edge-pixel samples. Kept across snaps rather than recomputed:
     /// the palette should settle as the inbox fills, not lurch to whatever
     /// arrived last.
@@ -671,6 +722,11 @@ impl Snapclone {
             settings: crate::settings_page::SettingsPage::new(crate::settings_store::load()),
             dht: None, dht_failed: false,
             dht_schedule: Default::default(),
+            dht_keepalive: None,
+            reflexive: None,
+            stun_failed: false,
+            dht_peers: 0,
+            reachable_shown: false,
             a11y: uikit_egui::a11y::A11yScene::new(),
             pending_vcard_text: None,
             import_report: None,
@@ -708,6 +764,8 @@ impl Snapclone {
             shutter_pressed: false,
             video: None,
             menu: Default::default(),
+            received: Vec::new(),
+            pending_open: None,
             attention: Default::default(),
             menu_target: None,
             snaps_saved: Vec::new(),
@@ -770,6 +828,8 @@ impl Snapclone {
             // Re-set from Adaptive each frame in `ui`.
             feedback: crate::touch_feedback::TouchFeedback::new(false),
             press: Default::default(),
+            double_tap: Default::default(),
+            compact: false,
             // Bounds are set from the tile count each frame; a strip that has
             // not been drawn yet scrolls nowhere rather than pretending to.
             strip_scroll: crate::scroll_passthrough::HScroll::new(0.0, 0.0),
@@ -836,6 +896,15 @@ impl Snapclone {
                      five minutes, so neither your timezone nor your exact \
                      habits are readable from the data."),
             ]),
+            help_filter: String::new(),
+            help_scroll_y: 0.0,
+            palette_open: false,
+            palette_input: String::new(),
+            palette_cursor: 0,
+            palette_focus: false,
+            schedule: Default::default(),
+            keyboard_nav: false,
+            key_labels: Default::default(),
             ambient_samples: Default::default(),
             // Labels from PAGE_NAMES, not a second list. The bar said "Chats"
             // and "Map" where the rest of the app says "Inbox" and
@@ -856,6 +925,8 @@ impl Snapclone {
             bar: UnifiedNav::new(),
             login_visible: !auto_logged_in,
             nav: Nav::new(PAGES.len()),
+            cols_drawn: 1,
+            plan: uikit_egui::pager::PlanState::new(),
             bg: LiveBackground::new(BgStyle::Aurora),
             gesture: GestureLayer::horizontal_page(320.0),
             palette: String::new(),
@@ -1303,8 +1374,10 @@ impl Snapclone {
                 return;
             }
             let id = crate::identity::dht_node_id(&self.local_id);
-            match snapclone_presence::node_host::NodeHost::spawn(
-                id, "0.0.0.0:0".parse().expect("a literal bind address"))
+            let [preferred, fallback] =
+                Self::dht_bind_addr(self.settings.current.network.listen_port);
+            match snapclone_presence::node_host::NodeHost::spawn(id, preferred)
+                .or_else(|_| snapclone_presence::node_host::NodeHost::spawn(id, fallback))
             {
                 Ok(h) => {
                     // BOOTSTRAP IMMEDIATELY, or the node is a routing
@@ -1338,6 +1411,12 @@ impl Snapclone {
                                 h.bootstrap(sa, id);
                             }
                         }
+                    }
+                    // And every peer we remember, under its real id. On a
+                    // network without the servers above, this is the
+                    // whole bootstrap.
+                    for (sa, id) in self.peer_bootstraps() {
+                        h.bootstrap(sa, id);
                     }
                     self.dht = Some(h);
                 }
@@ -1406,10 +1485,14 @@ impl Snapclone {
                 // The payload is `dht_announce`'s plaintext inside
                 // `dht_envelope`, byte for byte what a Qt peer stores.
                 let port = self.settings.current.network.listen_port;
-                let addrs: Vec<crate::dht_announce::Addr> =
+                // Local addresses, plus the one peers say we reach them
+                // from — what the Qt build asked ipify for, now read off
+                // the DHT's own replies.
+                let addrs: Vec<crate::dht_announce::Addr> = crate::dht_announce::with_public(
                     crate::dht_announce::local_ipv4s().into_iter()
                         .map(|ip| crate::dht_announce::Addr::new(&ip.to_string(), port, 0))
-                        .collect();
+                        .collect(),
+                    h.public_ip(), port, self.reflexive);
                 let published = if addrs.is_empty() {
                     0
                 } else {
@@ -1539,7 +1622,18 @@ impl Snapclone {
                 // Zero peers is the normal state of a node that has just
                 // started and knows nobody, so it is not reported as a
                 // problem.
-                Event::Published { .. } => {}
+                Event::Published { peers, .. } => { self.dht_peers = peers; }
+                Event::Keepalive { pinged, answered } => {
+                    self.dht_keepalive = Some((pinged, answered));
+                    if pinged > 0 && answered == 0 {
+                        // Every peer we were keeping warm has gone quiet at
+                        // once. Said once per transition, not per round:
+                        // a status that repeats every 25 s buries the
+                        // next thing that goes wrong.
+                        self.feed_note = format!(
+                            "no DHT peer answered ({pinged} pinged) — the network may have changed");
+                    }
+                }
                 Event::Stopped(why) => {
                     self.feed_note = why;
                     self.dht = None;
@@ -2190,6 +2284,34 @@ impl Snapclone {
         0.0
     }
 
+    /// The narrowest each page is worth drawing at. The viewfinder wants
+    /// room to be a viewfinder; a list does not.
+    pub fn page_metas() -> Vec<uikit_egui::pager::PageMeta> {
+        PAGES.iter().enumerate().map(|(i, name)| uikit_egui::pager::PageMeta {
+            id: i, title: name.to_string(),
+            min_width: if i == 0 { 420.0 } else { 340.0 },
+        }).collect()
+    }
+
+    /// The pages a `cols`-wide window shows, the active one included and
+    /// the window kept inside the page list rather than wrapping: a
+    /// desktop user reads left to right, and settings beside the camera
+    /// with the inbox off-screen reads as a bug.
+    pub fn visible_pages(active: usize, n: usize, cols: usize) -> Vec<usize> {
+        let cols = cols.clamp(1, n.max(1));
+        let start = active.min(n.saturating_sub(cols));
+        (start..start + cols).collect()
+    }
+
+    /// How many pages fit side by side in `width`, with hysteresis.
+    pub fn page_columns(&mut self, width: f32, gutter: f32, now_s: f64) -> usize {
+        let metas = Self::page_metas();
+        let plain = uikit_egui::pager::fit_cols(width, gutter, &metas);
+        let margined = uikit_egui::pager::fit_cols(
+            width * (1.0 - uikit_egui::pager::GROW_MARGIN), gutter, &metas);
+        self.plan.decide(plain, margined, now_s)
+    }
+
     pub fn swipe_page(&mut self, sign: i32) {
         // Counted here rather than at the gesture layer so a swipe that is
         // REFUSED — blocked by a dialog, or at the end of the pages — does not
@@ -2648,6 +2770,7 @@ impl Snapclone {
         let expired = self.snaps_expired.iter().any(|e| e == id);
         let items = vec![
             MenuItem::new("open", "View"),
+            MenuItem::new("thread", "Conversation"),
             if expired { MenuItem::new("save", "Save").disabled() }
             else { MenuItem::new("save", "Save") },
             MenuItem::separator(),
@@ -2662,8 +2785,14 @@ impl Snapclone {
     pub fn apply_menu(&mut self, id: &str) {
         let Some(target) = self.menu_target.take() else { return };
         match id {
-            "delete" => { self.feed.remove(&target); }
+            "delete" => { self.feed.remove(&target); self.received.retain(|s| s.id != target); }
             "save" => self.snaps_saved.push(target),
+            "open" => { self.pending_open = Some(target); }
+            "thread" => {
+                if let Some(e) = self.feed.entries().iter().find(|e| e.id == target) {
+                    self.conversation_peer = e.sender_name.clone();
+                }
+            }
             _ => {}
         }
     }
@@ -2673,6 +2802,28 @@ impl Snapclone {
     /// A video goes to the persistent viewer and an image to the view-once one.
     /// The routing lives here, once, rather than at each tile: a tile that
     /// picked its own viewer would eventually pick the wrong one.
+    /// Remember an arrived snap so it can be opened. See `received`.
+    pub fn keep_received(&mut self, snap: crate::snaps::Snap) {
+        const MAX_COUNT: usize = 48;
+        const MAX_BYTES: usize = 96 * 1024 * 1024;
+        if self.received.iter().any(|s| s.id == snap.id) { return; }
+        self.received.push(snap);
+        while self.received.len() > MAX_COUNT
+            || self.received.iter().map(|s| s.bytes.len()).sum::<usize>() > MAX_BYTES
+        {
+            if self.received.len() <= 1 { break; }
+            self.received.remove(0);
+        }
+    }
+
+    /// Open a received snap by id, routed by its kind. `false` if it is
+    /// not held any more (expired, evicted, or never arrived here).
+    pub fn open_received(&mut self, id: &str, surface: egui::Rect) -> bool {
+        let Some(snap) = self.received.iter().find(|s| s.id == id).cloned() else { return false };
+        self.open_snap_routed(snap, surface);
+        true
+    }
+
     pub fn open_snap_routed(&mut self, snap: crate::snaps::Snap, surface: egui::Rect) {
         let id = snap.id.clone();
         if snap.media == crate::snaps::Media::Video {
@@ -2794,6 +2945,61 @@ impl Snapclone {
         // feedback follows the adaptive layer's answer rather than a guess —
         // the module's own rule is ripples on touch, not under a cursor.
         self.feedback.set_enabled(adaptive.is_compact());
+        self.compact = adaptive.is_compact();
+        // Grand where it is held constantly, comfortable where it is rarely
+        // touched: the phone's talk button is the former.
+        self.voicebar.set_talk_prominent(adaptive.is_compact());
+        // The keyboard warrior's chrome: Tab starts keyboard mode, a pointer
+        // move ends it; Ctrl+K the palette; Ctrl+1..5 the pages.
+        self.key_labels.clear();
+        // Read from the events, not the modifier snapshot: the chord's
+        // modifiers ride on the key event, and a first pointer position has
+        // no delta.
+        let (tab, moved, ctrl_k, page_key) = ui.input(|i| {
+            let mut tab = false; let mut moved = false; let mut ctrl_k = false; let mut page = None;
+            for e in &i.events {
+                match e {
+                    egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                        let chord = modifiers.command || modifiers.ctrl;
+                        match key {
+                            egui::Key::Tab => tab = true,
+                            egui::Key::K if chord => ctrl_k = true,
+                            egui::Key::Num1 if chord => page = Some(0),
+                            egui::Key::Num2 if chord => page = Some(1),
+                            egui::Key::Num3 if chord => page = Some(2),
+                            egui::Key::Num4 if chord => page = Some(3),
+                            egui::Key::Num5 if chord => page = Some(4),
+                            _ => {}
+                        }
+                    }
+                    egui::Event::PointerMoved(_) => moved = true,
+                    _ => {}
+                }
+            }
+            (tab, moved, ctrl_k, page)
+        });
+        if tab { self.keyboard_nav = true; }
+        if moved { self.keyboard_nav = false; }
+        if ctrl_k {
+            self.palette_open = !self.palette_open;
+            self.palette_focus = self.palette_open;
+        }
+        if let Some(i) = page_key { self.nav.go_page(i); }
+        // Deferred commands whose time has come.
+        let wall_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64).unwrap_or(0);
+        for item in self.schedule.due(wall_ms) {
+            self.feed_note = format!("now: {}", item.label);
+            self.run_action(item.action);
+        }
+        // Escape closes everything that is open, the way a desktop expects.
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) && self.modal.blocks_input() {
+            self.modal.dismiss_all();
+            self.viewer.close();
+            self.video = None;
+            self.qr = None;
+            self.editor_id.clear();
+        }
         let dt_ms = ui.input(|i| i.stable_dt).min(0.1) * 1000.0;
         let pointer_down = ui.input(|i| i.pointer.any_down());
         // POSTURE. The fleet's only sensor integration — proximity from
@@ -2836,6 +3042,15 @@ impl Snapclone {
         let claimed = std::mem::take(&mut self.swipe_claimed);
         if let Some(dir) = frame.page_jump {
             if !claimed && self.axis_lock.intent() != crate::swipe_physics::Intent::Page {
+                self.swipe_page(dir.sign());
+            }
+        }
+        // The detent: two-finger scroll along the page axis, accumulated
+        // past the threshold, clicks over to the next page — the Qt
+        // build's way of turning pages from a trackpad, ported to the
+        // gesture model a session ago and read by nothing until now.
+        if let Some(dir) = frame.detent {
+            if !claimed {
                 self.swipe_page(dir.sign());
             }
         }
@@ -2916,16 +3131,16 @@ impl Snapclone {
                     egui::UiBuilder::new().max_rect(area.shrink(12.0)));
                 let ev = self.video.as_mut().and_then(|v|
                     crate::video_viewer::video_viewer_ui(&mut child, v, "~/Videos", &colors));
+                let vid = self.modal.topmost(crate::modal::Layer::Dialog)
+                    .and_then(|p| p.id.strip_prefix("video:").map(String::from)).unwrap_or_default();
+                // close_video carries no wipe, by design — the snap outlives
+                // the viewer. One path for the button and the viewer's own
+                // Closed event.
                 if child.button("close").clicked() {
-                    // close() carries no wipe, by design — the snap outlives
-                    // the viewer. Clearing the state here is all that closing
-                    // means for a persistent video.
-                    self.video = None;
-                    self.modal.dismiss_topmost();
+                    self.close_video(&vid);
                 }
                 if let Some(crate::video_viewer::VideoEvent::Closed) = ev {
-                    self.video = None;
-                    self.modal.dismiss_topmost();
+                    self.close_video(&vid);
                 }
             }
         }
@@ -3107,6 +3322,11 @@ impl Snapclone {
             if let Some(i) = picked {
                 self.nav.go_page(i);
             }
+            // Above the tab bar: bottom panels stack upward in the order
+            // they are shown.
+            egui::TopBottomPanel::bottom("hint")
+                .show_separator_line(false)
+                .show_inside(ui, |ui| { self.hint_bar(ui, true, &colors); });
         }
         if !adaptive.is_compact() && !self.nav.can_go_back() {
             // THE PORTED STRIP, not a hand-rolled row. strip_ui gives equal
@@ -3125,6 +3345,9 @@ impl Snapclone {
             if let Some(i) = crate::nav_chrome::strip_ui(ui, &self.strip, &colors) {
                 self.nav.go_page(i);
             }
+            // The status line a desktop user expects under the toolbar,
+            // with the number or the address, since there is room.
+            self.hint_bar(ui, false, &colors);
             ui.separator();
         }
 
@@ -3143,21 +3366,106 @@ impl Snapclone {
         // Clipped to the surface so the sliding page does not paint over
         // the tab bar and the title, which do not move with it — the chrome
         // is the fixed thing the page slides behind.
-        let draw_pages = |app: &mut Self, ui: &mut Ui| {
-            match app.nav.page() {
-                // The nav has always declared five pages — Camera, Inbox,
-                // Friends, Wayfinder, Settings — and the shell routed three
-                // of them, so two tabs led nowhere. That is most of why the
-                // app read as a demo: the chrome promised more than the
-                // body delivered.
-                0 => app.camera_page(ui, &colors),
-                1 => app.inbox_page(ui, &colors),
-                2 => app.peers_page(ui, &colors),
-                3 => app.wayfinder_page(ui, &colors),
-                _ => app.settings_page(ui, &colors),
+        // Every page but the viewfinder scrolls inside the rect the tab bar
+        // left it. C13_TODO §24: settings flowed over the bottom bar and its
+        // sections over each other, on both platforms, because the page was
+        // a bare stack of sections with nothing bounding it — a Ui does not
+        // scroll, it clips. One ScrollArea here, keyed by page so each keeps
+        // its own offset, rather than one per page body that each author
+        // has to remember. The camera page fills; wrapping it would give the
+        // viewfinder a scrollbar.
+        //
+        // The nav has always declared five pages — Camera, Inbox, Friends,
+        // Wayfinder, Settings — and the shell once routed three of them, so
+        // two tabs led nowhere. That is most of why the app read as a demo:
+        // the chrome promised more than the body delivered.
+        if self.palette_open {
+            self.palette_ui(ui, surface, wall_ms, &colors);
+        }
+        // The help manual: ported with its filter, its idle countdown and the
+        // scrolled/interacted distinction, and opened by nothing but tests.
+        if self.help.is_open() {
+            let area = surface.shrink2(egui::vec2(surface.width() * 0.08, 24.0));
+            ui.painter().rect_filled(area, 10.0, colors.bg_base);
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area.shrink(12.0)));
+            if child.input(|i| i.pointer.any_down() || !i.events.is_empty()) {
+                self.help_interacted();
             }
+            child.horizontal(|ui| {
+                ui.colored_label(colors.text, "help");
+                let r = ui.add(egui::TextEdit::singleline(&mut self.help_filter).hint_text("filter").id_salt("lib-help_filter"));
+                if r.changed() {
+                    let f = self.help_filter.clone();
+                    self.help.set_filter(&f);
+                }
+                if ui.button("close").clicked() { self.help.close(); }
+            });
+            let out = egui::ScrollArea::vertical().id_salt("help_scroll").show(&mut child, |ui| {
+                let sections: Vec<(String, String)> = self.help.visible().iter()
+                    .map(|s| (s.title.clone(), s.body.clone())).collect();
+                for (title, body) in sections {
+                    ui.colored_label(colors.accent, title);
+                    ui.colored_label(colors.text, body);
+                    ui.add_space(8.0);
+                }
+            });
+            if (out.state.offset.y - self.help_scroll_y).abs() > 0.5 {
+                self.help_scroll_y = out.state.offset.y;
+                self.help.scrolled();
+            }
+        }
+        // The snap menu, drawn over whatever page is up; its choice applied
+        // here so every entry point (a tile's hold, a keyboard activate)
+        // ends in one place.
+        if let Some(choice) = uikit_egui::menu::menu_ui(ui, &mut self.menu, &colors) {
+            self.apply_menu(&choice);
+        }
+        if let Some(id) = self.pending_open.take() {
+            if !self.open_received(&id, surface) {
+                self.feed_note = format!("{id}: not held on this device any more");
+            }
+        }
+        let draw_page = |app: &mut Self, ui: &mut Ui, page: usize| {
+            if page == 0 {
+                app.camera_page(ui, &colors);
+                return;
+            }
+            egui::ScrollArea::vertical()
+                .id_salt(("page", page))
+                .auto_shrink([false, false])
+                .show(ui, |ui| match page {
+                    1 => app.inbox_page(ui, &colors),
+                    2 => app.peers_page(ui, &colors),
+                    3 => app.wayfinder_page(ui, &colors),
+                    _ => app.settings_page(ui, &colors),
+                });
         };
-        if page_offset.abs() < 0.5 {
+        let draw_pages = |app: &mut Self, ui: &mut Ui| {
+            let page = app.nav.page();
+            draw_page(app, ui, page);
+        };
+        // A desktop populates its width: as many pages side by side as fit,
+        // the active one among them, each in its own column and its own
+        // scroll. The phone keeps one page and the swipe. The kit's Pager
+        // does this for the rest of the fleet; snapclone has its own swipe
+        // physics, so it borrows the fit and the window rule and keeps the
+        // rest.
+        let gutter = adaptive.gutter.max(8.0);
+        let cols = if adaptive.is_compact() || self.nav.can_go_back() { 1 } else {
+            self.page_columns(ui.available_width(), gutter, ui.input(|i| i.time))
+        };
+        self.cols_drawn = cols;
+        if cols > 1 {
+            let avail = ui.available_rect_before_wrap();
+            let ids = Self::visible_pages(self.nav.page(), PAGES.len(), cols);
+            let col_w = (avail.width() - gutter * (cols as f32 - 1.0)) / cols as f32;
+            for (i, page) in ids.into_iter().enumerate() {
+                let x = avail.min.x + i as f32 * (col_w + gutter);
+                let r = egui::Rect::from_min_size(egui::pos2(x, avail.min.y),
+                                                  egui::vec2(col_w, avail.height()));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(r), |ui| draw_page(self, ui, page));
+            }
+        } else if page_offset.abs() < 0.5 {
             // The overwhelming majority of frames. No layer, no transform,
             // no cost — a swipe must not make the still case slower.
             draw_pages(self, ui);
@@ -3178,6 +3486,8 @@ impl Snapclone {
                     egui::vec2(page_offset, 0.0)));
             ui.ctx().set_sublayer(ui.layer_id(), layer);
         }
+        // Last, over everything: the keyboard caption.
+        self.keyboard_caption(ui, &colors);
 
         // THE DIM, painted last so it covers the page rather than being
         // covered by it. dim_overlay_ui returns immediately at zero, so this
@@ -3312,6 +3622,17 @@ impl Snapclone {
                     if self.press.is_idle() { self.press.press(lx, ly); }
                     else { let _ = self.press.move_to(lx, ly); }
                 }
+                // Swipe UP to send: the composer's own gesture (Composer::
+                // begin_drag/end_drag, upward only, a fraction of the height),
+                // ported and tested and fed by nothing. On release past the
+                // fraction, the recipient picker opens with "Send" armed.
+                if resp.drag_started() {
+                    self.composer.begin_drag(ly / vf_rect.height().max(1.0));
+                }
+                if resp.drag_stopped() && self.composer.end_drag(ly / vf_rect.height().max(1.0)) {
+                    self.picker.mode = crate::contacts::PickMode::Multi { confirm_label: "Send".into() };
+                    self.nav.go_page(2);
+                }
             }
             let ev = self.press.tick(dt_ms).or_else(|| {
                 if ui.input(|i| i.pointer.any_released()) { self.press.release() } else { None }
@@ -3319,6 +3640,12 @@ impl Snapclone {
             match ev {
                 Some(crate::press_gesture::Event::Tap) => {
                     if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                        // Two taps: flip the camera. The first still
+                        // focuses, which is harmless and what phones do.
+                        let now_ms = ui.input(|i| i.time) * 1000.0;
+                        if self.double_tap.tap(pos.x, pos.y, now_ms) && self.flip_camera() {
+                            self.shutter_note = "flipped".into();
+                        }
                         // The viewfinder maps the tap to SENSOR coordinates
                         // itself (and refuses one outside the image rect), so
                         // it takes the screen point and the rect rather than
@@ -3387,12 +3714,33 @@ impl Snapclone {
         if !self.cameras.is_empty() {
             let pip_ok = crate::camera_select::pip_available(&self.cameras);
             ui.horizontal(|ui| {
-                for d in &self.cameras {
-                    let on = matches!(&self.cam_selection,
-                        Some(crate::camera_select::Selection::Single { id, .. }) if *id == d.id);
-                    if ui.selectable_label(on, &d.label).clicked() {
-                        self.cam_selection = Some(crate::camera_select::select(
-                            &self.cameras, &d.id, true));
+                let current = match &self.cam_selection {
+                    Some(crate::camera_select::Selection::Single { id, .. }) => id.clone(),
+                    _ => String::new(),
+                };
+                if self.compact {
+                    // C13_TODO §23: a phone lists its cameras in a dropdown,
+                    // not a row that runs off the page.
+                    let label = self.cameras.iter().find(|d| d.id == current)
+                        .map(|d| d.label.clone()).unwrap_or_else(|| "camera".into());
+                    let mut pick: Option<String> = None;
+                    egui::ComboBox::from_id_salt("camera_pick").selected_text(label).show_ui(ui, |ui| {
+                        for d in &self.cameras {
+                            if ui.selectable_label(d.id == current, &d.label).clicked() {
+                                pick = Some(d.id.clone());
+                            }
+                        }
+                    });
+                    if let Some(id) = pick {
+                        self.cam_selection = Some(crate::camera_select::select(&self.cameras, &id, true));
+                    }
+                } else {
+                    for d in &self.cameras {
+                        let on = d.id == current;
+                        if ui.selectable_label(on, &d.label).clicked() {
+                            self.cam_selection = Some(crate::camera_select::select(
+                                &self.cameras, &d.id, true));
+                        }
                     }
                 }
                 // Offered ONLY when the hardware can actually do it. A greyed
@@ -3723,8 +4071,12 @@ impl Snapclone {
         // right surface on a machine with no camera and the honest one while
         // the capture pipeline is still unwired.
         ui.horizontal(|ui| {
-            if ui.button("Scan code").clicked() { self.open_qr_scan(true); }
-            if ui.button("Enter code").clicked() { self.open_qr_scan(false); }
+            let r = ui.button("Scan code");
+            self.key_label(&r, "scan a friend's code with the camera");
+            if r.clicked() { self.open_qr_scan(true); }
+            let r = ui.button("Enter code");
+            self.key_label(&r, "type a friend's code");
+            if r.clicked() { self.open_qr_scan(false); }
         });
 
         // WHAT DISCOVERY FOUND, and what the app makes of it. Two gaps this
@@ -3758,7 +4110,174 @@ impl Snapclone {
         }
     }
 
+    /// Switch to the camera facing the other way. `false` when there is
+    /// none, or the current selection is PIP (both are already showing).
+    pub fn flip_camera(&mut self) -> bool {
+        let current = match &self.cam_selection {
+            Some(crate::camera_select::Selection::Single { id, .. }) => id.clone(),
+            _ => return false,
+        };
+        let Some(other) = crate::camera_select::other_facing(&self.cameras, &current) else { return false };
+        let id = other.id.clone();
+        self.cam_selection = Some(crate::camera_select::select(&self.cameras, &id, true));
+        true
+    }
+
+    /// Carry out a palette action. Every arm is a method that already
+    /// existed; the palette only reaches it by name, now or later.
+    pub fn run_action(&mut self, a: crate::palette::Action) {
+        use crate::palette::Action;
+        match a {
+            Action::Call { leave } => {
+                if leave == self.group_voice.joined { self.toggle_voice(); }
+            }
+            Action::SendTo { id, name } => {
+                self.send_requested.push(id);
+                self.feed_note = format!("sending to {name}");
+            }
+            Action::FlipCamera => { self.flip_camera(); }
+            Action::GoPage(i) => self.nav.go_page(i.min(PAGES.len() - 1)),
+            Action::Snap => { self.nav.go_page(0); self.shutter_pressed = true; }
+            Action::Help => self.help.open(),
+        }
+    }
+
+    /// Register what Space/Enter does on a widget, for the keyboard caption.
+    pub fn key_label(&mut self, r: &egui::Response, what: &str) {
+        self.key_labels.insert(r.id, what.to_string());
+    }
+
+    /// Contacts as the palette wants them: `(sc_id, name)`.
+    fn palette_contacts(&self) -> Vec<(String, String)> {
+        self.contact_book.iter().map(|c| (c.sc_id.clone(), c.label().to_string())).collect()
+    }
+
+    /// The palette: a field, a ranked list, a cursor. Enter runs the
+    /// chosen one now or puts it on the schedule; Escape closes.
+    fn palette_ui(&mut self, ui: &mut Ui, surface: egui::Rect, now_ms: u64, c: &PaletteColors) {
+        let area = egui::Rect::from_min_size(
+            egui::pos2(surface.min.x + surface.width() * 0.1, surface.min.y + 24.0),
+            egui::vec2(surface.width() * 0.8, 260.0));
+        ui.painter().rect_filled(area, 10.0, c.bg_raised);
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area.shrink(12.0)));
+        let field = child.add(egui::TextEdit::singleline(&mut self.palette_input)
+            .hint_text("call at the hour · send ada in 10 min · flip · inbox")
+            .desired_width(f32::INFINITY).id_salt("lib-palette_input"));
+        if std::mem::take(&mut self.palette_focus) { field.request_focus(); }
+        let contacts = self.palette_contacts();
+        let items = crate::palette::suggest(&self.palette_input, now_ms, 0, &contacts,
+                                            self.group_voice.joined, &PAGES);
+        let n = items.len().min(7);
+        if n == 0 { self.palette_cursor = 0; } else { self.palette_cursor = self.palette_cursor.min(n - 1); }
+        let (up, down, enter, esc) = child.input(|i| (
+            i.key_pressed(egui::Key::ArrowUp), i.key_pressed(egui::Key::ArrowDown),
+            i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+        if up && self.palette_cursor > 0 { self.palette_cursor -= 1; }
+        if down && n > 0 && self.palette_cursor + 1 < n { self.palette_cursor += 1; }
+        let mut chosen: Option<usize> = None;
+        for (i, it) in items.iter().take(n).enumerate() {
+            let on = i == self.palette_cursor;
+            let r = child.selectable_label(on, &it.label);
+            if r.clicked() { chosen = Some(i); }
+        }
+        if n == 0 && !self.palette_input.trim().is_empty() {
+            child.colored_label(c.text_weak, "nothing matches — a time that did not parse, or a name nobody has");
+        }
+        if enter && n > 0 { chosen = Some(self.palette_cursor); }
+        if let Some(i) = chosen {
+            let it = items[i].clone();
+            match it.at_ms {
+                Some(at) => {
+                    self.schedule.add(crate::palette::Scheduled { at_ms: at, label: it.label.clone(), action: it.action });
+                    self.feed_note = format!("scheduled: {}", it.label);
+                }
+                None => self.run_action(it.action),
+            }
+            self.palette_open = false;
+            self.palette_input.clear();
+        }
+        if esc { self.palette_open = false; }
+    }
+
+    /// The keyboard caption: a ring around the focused widget and one line
+    /// under it saying what Space/Enter does there, only while the keyboard
+    /// is driving. A mouse user never sees it.
+    fn keyboard_caption(&self, ui: &mut Ui, c: &PaletteColors) {
+        if !self.keyboard_nav { return; }
+        let Some(id) = ui.ctx().memory(|m| m.focused()) else { return };
+        let Some(r) = ui.ctx().read_response(id) else { return };
+        let rect = r.rect.expand(3.0);
+        ui.painter().rect_stroke(rect, 6.0, egui::Stroke::new(2.0, c.accent), egui::StrokeKind::Outside);
+        let what = self.key_labels.get(&id).cloned().unwrap_or_else(|| "activate".into());
+        let text = format!("Space / Enter: {what} · Tab: next · Ctrl+K: commands");
+        let pos = egui::pos2(rect.left(), rect.bottom() + 4.0);
+        let galley = ui.painter().layout_no_wrap(text, egui::FontId::proportional(11.0), c.text);
+        let bg = egui::Rect::from_min_size(pos, galley.size() + egui::vec2(8.0, 4.0));
+        ui.painter().rect_filled(bg, 4.0, c.bg_raised);
+        ui.painter().galley(pos + egui::vec2(4.0, 2.0), galley, c.text);
+    }
+
+    /// What the hint reads. Assembled here so `hint::hint` stays a pure
+    /// function of a struct it can be handed in a test.
+    pub fn situation(&self) -> crate::hint::Situation {
+        use crate::send_state::SendState;
+        let unreachable = self.group_voice.participants.iter()
+            .filter(|p| !p.is_self && self.punch.get(&p.id).is_none()).count();
+        crate::hint::Situation {
+            has_identity: !self.local_id.is_empty(),
+            cameras: self.cameras.len(),
+            capture_exhausted: matches!(self.capture_status, crate::capture::Status::Exhausted { .. }),
+            capture_trying: matches!(self.capture_status, crate::capture::Status::Trying { .. }),
+            dht_running: self.dht.is_some(),
+            dht_peers: self.dht_peers,
+            keepalive: self.dht_keepalive,
+            reflexive: self.reflexive.map(|a| a.to_string()),
+            stun_failed: self.stun_failed,
+            in_call: self.group_voice.joined,
+            unreachable_participants: if self.group_voice.joined { unreachable } else { 0 },
+            sends_failed: self.sends.rows().iter().filter(|r| r.state == SendState::Failed).count(),
+            sends_pending: self.sends.rows().iter().filter(|r| r.state == SendState::Pending).count(),
+            unread: self.inbox.unread_count(),
+            reachable_shown: self.reachable_shown,
+            next_scheduled: self.schedule.next().map(|n| {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64).unwrap_or(0);
+                format!("{} {}", n.label.split(" · ").next().unwrap_or(&n.label), crate::palette::until(n.at_ms, now))
+            }),
+        }
+    }
+
+    /// One line of chrome. Tapping it goes where it helps. `true` when a
+    /// line was drawn, so the caller can leave the row out otherwise.
+    fn hint_bar(&mut self, ui: &mut Ui, compact: bool, c: &PaletteColors) -> bool {
+        let Some(h) = crate::hint::hint(&self.situation()) else { return false };
+        let color = match h.level {
+            crate::hint::Level::Blocking => c.danger,
+            crate::hint::Level::Degraded => c.warning,
+            crate::hint::Level::Info => c.text_weak,
+        };
+        let text = if compact { h.short.clone() } else { h.long.clone() };
+        let r = ui.add(egui::Label::new(egui::RichText::new(text).color(color)).sense(egui::Sense::click()));
+        if h.level == crate::hint::Level::Info && h.short == "reachable from outside" {
+            // Said once: the next frame will not repeat it.
+            self.reachable_shown = true;
+        }
+        if r.clicked() {
+            match h.go {
+                crate::hint::GoTo::Camera => self.nav.go_page(0),
+                crate::hint::GoTo::Inbox => self.nav.go_page(1),
+                crate::hint::GoTo::Peers => self.nav.go_page(2),
+                crate::hint::GoTo::Settings => self.nav.go_page(4),
+                crate::hint::GoTo::Nowhere => {}
+            }
+        }
+        true
+    }
+
     fn settings_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
+        let r = ui.button("help");
+        self.key_label(&r, "open the help");
+        if r.clicked() { self.help.open(); }
         // DIAGNOSTIC CHANNELS, one toggle each. Individually, which is the
         // whole point of the module: the C++ it replaces used setFilterRules,
         // so switching one channel on silently switched every other off —
@@ -4074,6 +4593,62 @@ impl Snapclone {
             .collect()
     }
 
+    /// Peers we have spoken to, as DHT bootstrap entries — with their REAL
+    /// node ids, since a peer's id is a function of its sc-ID
+    /// (`identity::dht_node_id`), which is more than any bootstrap server
+    /// offers.
+    ///
+    /// This is the bootstrap-independence lever. A device that remembers
+    /// one other snapclone it has ever reached can rejoin the DHT through
+    /// it, on a network where `bootstrap.jami.net` is blocked or gone.
+    /// It works because a peer's DHT socket is at a fixed offset from
+    /// its listen port (`DHT_PORT_OFFSET`): the address we remember for
+    /// talking to it names the address of its node.
+    ///
+    /// Newest first, unset addresses dropped, one entry per address.
+    pub fn peer_bootstraps(&self) -> Vec<(std::net::SocketAddr, snapcore::routing::NodeId)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let candidates = self.punch.all().into_iter()
+            .chain(self.heard.recent().into_iter().map(|g| (g.sc_id.clone(), g.addr)));
+        for (id, a) in candidates {
+            if a.is_unset() || id.is_empty() || id == self.local_id { continue; }
+            let Some(sa) = Self::dht_addr_of(a.ip, a.port) else { continue };
+            if seen.insert(sa) {
+                out.push((sa, crate::identity::dht_node_id(&id)));
+            }
+        }
+        out
+    }
+
+    /// The DHT's UDP port is the listen port plus this. UDP on the listen
+    /// port itself is the voice socket (`voice_wire::VoiceSocket::bind`),
+    /// which this must not collide with — it did, for one commit: the DHT
+    /// spawned first at startup and voice could never bind.
+    ///
+    /// A fixed offset keeps the property that matters: a peer whose app
+    /// address we know has a node address we can DERIVE, without asking.
+    /// Stated once, here, and used by both `dht_bind_addr` and
+    /// `peer_bootstraps`, so the two cannot disagree.
+    pub const DHT_PORT_OFFSET: u16 = 1;
+
+    /// A peer's DHT address from its app address.
+    pub fn dht_addr_of(ip: [u8; 4], listen_port: u16) -> Option<std::net::SocketAddr> {
+        let port = listen_port.checked_add(Self::DHT_PORT_OFFSET)?;
+        Some(std::net::SocketAddr::from((ip, port)))
+    }
+
+    /// Where the DHT socket binds: UDP on the listen port plus
+    /// `DHT_PORT_OFFSET`, so any peer that knows how to reach the app knows
+    /// how to reach the node. Falls back to an ephemeral port only if that
+    /// one is taken, in which case peers can still reach us through the
+    /// bootstrap servers but not directly.
+    pub fn dht_bind_addr(listen_port: u16) -> [std::net::SocketAddr; 2] {
+        let preferred = Self::dht_addr_of([0, 0, 0, 0], listen_port)
+            .unwrap_or(std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+        [preferred, std::net::SocketAddr::from(([0, 0, 0, 0], 0))]
+    }
+
     /// A peer was reached at this address. Expiring entries is the point: an
     /// address nobody has confirmed in minutes is a guess wearing a fact's
     /// clothes.
@@ -4326,31 +4901,25 @@ impl Snapclone {
         if !self.feed.is_empty() {
             ui.separator();
             let now = self.now_secs;
+            let surface = ui.ctx().content_rect();
             if let Some(act) = crate::snaps::feed_ui(ui, &self.feed, &mut self.feed_press, now, c) {
                 match act {
-                    crate::snaps::FeedAction::OpenThread(sender) => {
-                        // A HOLD opens the sender's conversation, which is
-                        // already the page's own mechanism just below.
-                        self.conversation_peer = sender;
+                    // A hold on a tile is the tile's menu — view, save,
+                    // conversation, delete — the Qt goodie that was ported,
+                    // tested, and opened from nowhere. Opening the thread
+                    // directly is one of its entries.
+                    crate::snaps::FeedAction::OpenThread(id) => {
+                        let at = ui.input(|i| i.pointer.latest_pos())
+                            .map(|p| (p.x, p.y)).unwrap_or((surface.center().x, surface.center().y));
+                        self.open_snap_menu(&id, at);
                     }
+                    // A tap opens the snap, routed by kind. The bytes are
+                    // held since arrival (`received`); before that a tap
+                    // could only write a note.
                     crate::snaps::FeedAction::Open(id) => {
-                        // A TAP should open the ephemeral viewer, and cannot
-                        // yet. open_snap_routed takes a Snap with its
-                        // DECRYPTED BYTES; a FeedEntry carries an id, a
-                        // sender, a timestamp and a thumbnail path. Fetching
-                        // and decrypting the payload is the host's job and
-                        // there is no request path for it here.
-                        //
-                        // Constructing a Snap with empty bytes would open a
-                        // viewer onto nothing and start its expiry timer — the
-                        // snap would be consumed without ever being seen,
-                        // which is worse than not opening.
-                        // Said in place rather than through a toast: this
-                        // controller has no general message channel
-                        // (shutter_note is the camera's), and inventing one
-                        // for a single line would be a mechanism with one
-                        // caller.
-                        self.feed_note = format!("{id}: waiting on the host to fetch this snap");
+                        if !self.open_received(&id, surface) {
+                            self.feed_note = format!("{id}: not held on this device any more");
+                        }
                     }
                 }
             }
@@ -4384,8 +4953,9 @@ impl Snapclone {
             if n > 0 { ui.colored_label(c.accent, format!("{n} unopened")); }
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.conversation.draft).id_salt("lib-self_conversation_draft"));
-                if ui.add_enabled(self.conversation.can_send(),
-                                  egui::Button::new("send")).clicked() {
+                let r = ui.add_enabled(self.conversation.can_send(), egui::Button::new("send"));
+                self.key_label(&r, "send this message");
+                if r.clicked() {
                     self.conversation.take_draft();
                 }
             });
@@ -4474,6 +5044,238 @@ mod tests {
     /// physics — `swipe_physics` was written and tested — it was that
     /// nothing reached it. A unit test on the physics passed the whole time
     /// the gesture did nothing.
+    /// C13_TODO §24: settings flowed past the bottom bar. On a phone-sized
+    /// screen the page must stay inside the rect it was given and scroll.
+    #[test]
+    fn a_tall_page_scrolls_inside_its_bounds_rather_than_flowing_past_the_tab_bar() {
+        use egui::{Context, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        app.nav.go_page(4);
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(360.0, 640.0));
+        let mut deepest = 0.0f32;
+        for _ in 0..3 {
+            let _ = ctx.run(RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.ui(ui, &adaptive);
+                    deepest = deepest.max(ui.min_rect().max.y);
+                });
+            });
+        }
+        assert!(deepest <= screen.max.y + 0.5,
+                "the page laid out to y={deepest} on a {}-tall screen: it is not scrolling", screen.max.y);
+    }
+
+    /// The hint reaches the screen through the real `ui()`, phone shell,
+    /// and reads the app's state rather than a copy of it.
+    #[test]
+    fn the_hint_bar_shows_the_situation_and_the_situation_reads_the_state() {
+        let mut app = app();
+        app.local_id.clear();
+        assert!(crate::hint::hint(&app.situation()).unwrap().short.contains("identity"));
+        app.local_id = "sc-me".into();
+        app.cameras.clear();
+        assert_eq!(crate::hint::hint(&app.situation()).unwrap().short, "no camera found");
+        app.cameras.push(crate::camera_select::Device {
+            id: "cam".into(), label: "cam".into(),
+            facing: crate::camera_select::Facing::Rear, capture_group: None });
+        app.dht_keepalive = Some((3, 0));
+        assert_eq!(crate::hint::hint(&app.situation()).unwrap().short, "network changed — reconnecting");
+        // And it is drawn: a compact frame lays out a label with that text.
+        use egui::{Context, Pos2, RawInput};
+        let ctx = Context::default();
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(360.0, 640.0));
+        let out = ctx.run(RawInput { screen_rect: Some(screen), ..Default::default() }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+        });
+        // Either shell: the phone says "network changed", the desktop
+        // "probably changed under us".
+        let drew_it = out.shapes.iter().any(|cs| matches!(&cs.shape, egui::Shape::Text(t)
+            if t.galley.text().contains("changed")));
+        assert!(drew_it, "the hint was decided but never drawn");
+    }
+
+    /// The double-tap flips between the phone's two sides and does nothing
+    /// on a machine with one camera.
+    #[test]
+    fn flip_camera_switches_facing_and_refuses_when_there_is_no_other_side() {
+        let mut app = app();
+        app.cameras = vec![
+            crate::camera_select::Device { id: "front".into(), label: "front".into(),
+                facing: crate::camera_select::Facing::Front, capture_group: Some(1) },
+            crate::camera_select::Device { id: "rear".into(), label: "rear".into(),
+                facing: crate::camera_select::Facing::Rear, capture_group: Some(1) },
+        ];
+        app.cam_selection = Some(crate::camera_select::select(&app.cameras, "rear", true));
+        assert!(app.flip_camera());
+        assert!(matches!(&app.cam_selection,
+            Some(crate::camera_select::Selection::Single { id, .. }) if id == "front"));
+        assert!(app.flip_camera());
+        assert!(matches!(&app.cam_selection,
+            Some(crate::camera_select::Selection::Single { id, .. }) if id == "rear"));
+        app.cameras.truncate(1);
+        app.cam_selection = Some(crate::camera_select::select(&app.cameras, "front", true));
+        assert!(!app.flip_camera(), "one camera has no other side");
+    }
+
+    /// A desktop shows as many pages as fit, the active one among them and
+    /// the window inside the list; a phone shows one.
+    #[test]
+    fn a_wide_screen_lays_out_columns_and_a_phone_one_page() {
+        assert_eq!(Snapclone::visible_pages(0, 5, 3), vec![0, 1, 2]);
+        assert_eq!(Snapclone::visible_pages(3, 5, 3), vec![2, 3, 4], "kept inside the list, no wrap");
+        assert_eq!(Snapclone::visible_pages(4, 5, 3), vec![2, 3, 4]);
+        assert_eq!(Snapclone::visible_pages(1, 5, 9), vec![0, 1, 2, 3, 4], "capped at the page count");
+        assert_eq!(Snapclone::visible_pages(2, 5, 1), vec![2]);
+
+        use egui::{Context, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        assert!(!adaptive.is_compact(), "the default adaptive is the desktop one");
+        let wide = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(1400.0, 900.0));
+        for i in 0..3 {
+            let _ = ctx.run(RawInput { screen_rect: Some(wide), time: Some(i as f64), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        }
+        assert!(app.cols_drawn >= 3, "1400 px drew {} column(s)", app.cols_drawn);
+        let narrow = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        for i in 3..8 {
+            let _ = ctx.run(RawInput { screen_rect: Some(narrow), time: Some(i as f64), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        }
+        assert_eq!(app.cols_drawn, 1, "400 px must fall back to one page");
+    }
+
+    /// The Qt build turned pages from a trackpad: two-finger scroll along
+    /// the page axis accumulates to a detent and clicks over. The detent
+    /// was in the gesture frame and nothing read it.
+    #[test]
+    fn a_two_finger_scroll_along_the_page_axis_turns_the_page() {
+        use egui::{Context, Event, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        assert_eq!(app.nav.page(), 0);
+        // The Qt constants: 220 raw at 0.75/ms is about 300 ms of scrolling,
+        // inside the 1 s arm window. Forty frames is well past it.
+        let mut t = 0.0;
+        for _ in 0..40 {
+            t += 0.016;
+            let events = vec![
+                Event::PointerMoved(Pos2::new(200.0, 400.0)),
+                // Positive along the axis is Next in the kit's trackpad path
+                // (the drag path feeds -dx; the wheel path feeds the delta).
+                Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(60.0, 0.0),
+                                    modifiers: Default::default(), phase: egui::TouchPhase::Move },
+            ];
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen), time: Some(t), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+            if app.nav.page() != 0 { break; }
+        }
+        assert_eq!(app.nav.page(), 1, "forty frames of scroll along the axis did not turn the page");
+    }
+
+    /// The receive path used to end at a tile: the frame's bytes were
+    /// dropped as the feed entry was built. Now a snap that arrives is
+    /// held and a tap opens it, routed by kind.
+    #[test]
+    fn a_snap_that_arrives_can_be_opened_and_a_hold_has_a_menu() {
+        let mut app = app();
+        let frame = crate::snap_wire::SnapFrame::announce(
+            7, 3, "sc-ada", "ada", crate::snaps::Media::Image, 1_700_000_000, 5, vec![9u8; 2048]);
+        let id = crate::snap_wire::content_id("sc-ada", &[9u8; 2048]);
+        app.apply(crate::host::HostEvent::SnapArrived { from: "sc-ada".into(), frame: Box::new(frame) });
+        assert_eq!(app.received.len(), 1, "the bytes were not kept");
+        let surface = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 800.0));
+        assert!(app.open_received(&id, surface));
+        assert!(app.viewer.is_open(), "an image did not open the view-once viewer");
+        assert!(!app.open_received("nope", surface));
+
+        assert!(app.open_snap_menu(&id, (100.0, 100.0)));
+        assert!(app.menu.is_open());
+        app.menu_target = Some(id.clone());
+        app.apply_menu("delete");
+        assert!(app.received.is_empty(), "delete must drop the held bytes too");
+    }
+
+    /// Received snaps are bounded: a session that receives forever does
+    /// not hold forever.
+    #[test]
+    fn received_snaps_are_bounded_oldest_first() {
+        let mut app = app();
+        for i in 0..60u32 {
+            app.keep_received(crate::snaps::Snap { id: format!("s{i}"), sender_id: "a".into(),
+                sender_name: "a".into(), sent_at: i as i64, media: crate::snaps::Media::Image,
+                duration_secs: 5, bytes: vec![0; 10] });
+        }
+        assert!(app.received.len() <= 48);
+        assert_eq!(app.received[0].id, "s12", "the oldest went first");
+    }
+
+    /// Ctrl+K opens the palette, typing narrows it, Enter runs the choice —
+    /// through real frames — and a timed one waits on the schedule.
+    #[test]
+    fn the_palette_runs_a_command_and_schedules_a_timed_one() {
+        use egui::{Context, Event, Key, Modifiers, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let key = |k: Key, m: Modifiers| Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: m };
+        let mut frame = |app: &mut Snapclone, events: Vec<Event>| {
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        };
+        frame(&mut app, vec![key(Key::K, Modifiers::COMMAND)]);
+        assert!(app.palette_open, "Ctrl+K did not open the palette");
+        frame(&mut app, vec![]);
+        app.palette_input = "inbox".into();
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert_eq!(app.nav.page(), 1, "Enter on \"go to Inbox\" did not go");
+        assert!(!app.palette_open);
+
+        frame(&mut app, vec![key(Key::K, Modifiers::COMMAND)]);
+        app.palette_input = "call at the hour".into();
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert_eq!(app.schedule.len(), 1, "a timed command must wait, not run");
+        assert!(!app.group_voice.joined);
+        // The situation carries it; the hint ranks it below blocking problems
+        // (this fixture has no camera), which hint.rs tests.
+        assert!(app.situation().next_scheduled.map(|n| n.starts_with("call in")).unwrap_or(false),
+                "the schedule did not reach the situation");
+    }
+
+    #[test]
+    fn tab_turns_the_keyboard_caption_on_and_a_pointer_move_turns_it_off() {
+        use egui::{Context, Event, Key, Modifiers, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let mut frame = |app: &mut Snapclone, events: Vec<Event>| {
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        };
+        frame(&mut app, vec![Event::Key { key: Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }]);
+        assert!(app.keyboard_nav);
+        frame(&mut app, vec![Event::PointerMoved(Pos2::new(10.0, 10.0)), Event::PointerMoved(Pos2::new(30.0, 40.0))]);
+        assert!(!app.keyboard_nav, "a mouse user must never see the caption");
+        // Ctrl+3 is the Friends page.
+        frame(&mut app, vec![Event::Key { key: Key::Num3, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND }]);
+        assert_eq!(app.nav.page(), 2);
+    }
+
     #[test]
     fn dragging_across_the_page_turns_it_and_moves_it_on_the_way() {
         use egui::{Context, Event, PointerButton, Pos2, RawInput};
@@ -4636,7 +5438,11 @@ mod tests {
         let adaptive = Adaptive::default();
 
         let mut frame = |ctx: &Context, app: &mut Snapclone, events: Vec<Event>| {
-            let _ = ctx.run(RawInput { events, ..Default::default() }, |ctx| {
+            // One column: on egui's default 10 000-px screen the desktop
+            // shell lays out every page side by side, and Tab would walk
+            // the camera page before reaching this field.
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 800.0));
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen), ..Default::default() }, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
             });
         };
@@ -6595,6 +7401,36 @@ mod gossip_wiring_tests {
         // No backend at all is a real answer, not a silent no-op.
         let none = Environment { has_iptables: false, has_pkexec: false, ..base };
         assert!(app.firewall_plan(&none, 7000).is_none());
+    }
+
+    #[test]
+    fn remembered_peers_become_bootstrap_entries_under_their_real_ids() {
+        let mut app = Snapclone::new_with_login(vec![], false);
+        app.local_id = "sc-me".into();
+        assert!(app.peer_bootstraps().is_empty());
+        app.note_peer_addr("sc-alice", [10, 0, 0, 5], 9876, 1_000);
+        app.note_peer_addr("sc-bob", [10, 0, 0, 6], 9876, 2_000);
+        app.note_peer_addr("sc-me", [10, 0, 0, 1], 9876, 3_000);      // ourselves: skipped
+        app.punch.set("sc-unset", crate::punch_addrs::PeerAddr::new([0, 0, 0, 0], 0), 4_000);
+        let got = app.peer_bootstraps();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.iter().any(|(sa, id)| *sa == std::net::SocketAddr::from(([10, 0, 0, 5], 9876 + Snapclone::DHT_PORT_OFFSET))
+                                          && *id == crate::identity::dht_node_id("sc-alice")),
+                "alice under her real id, at her NODE's port");
+        // The same peer known to both tables is one entry.
+        assert_eq!(got.iter().filter(|(sa, _)| sa.port() == 9876 + Snapclone::DHT_PORT_OFFSET).count(), 2);
+    }
+
+    #[test]
+    fn the_dht_port_is_derived_the_same_way_for_us_and_for_peers() {
+        let [first, second] = Snapclone::dht_bind_addr(9876);
+        assert_eq!(first.port(), 9876 + Snapclone::DHT_PORT_OFFSET);
+        assert_ne!(first.port(), 9876, "UDP on the listen port is the voice socket");
+        assert_eq!(second.port(), 0);
+        assert_eq!(Snapclone::dht_addr_of([1, 2, 3, 4], 9876).map(|a| a.port()), Some(first.port()));
+        // The top of the range has nowhere to go: ephemeral, not wraparound.
+        assert_eq!(Snapclone::dht_bind_addr(65535)[0].port(), 0);
+        assert!(Snapclone::dht_addr_of([1, 2, 3, 4], 65535).is_none());
     }
 
     #[test]

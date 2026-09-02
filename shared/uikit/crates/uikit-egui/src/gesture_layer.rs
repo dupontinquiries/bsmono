@@ -46,6 +46,11 @@ pub struct GestureLayer {
     gesture: TwoTierGesture,
     axis: Axis,
     dragging: bool,
+    /// The current press belongs to a widget — a text selection, a slider,
+    /// a scroll area's own drag — and is not a page gesture. Set at drag
+    /// start or the moment a widget claims the pointer mid-drag; cleared
+    /// on release. See `pointer_belongs_to_a_widget`.
+    suppressed: bool,
     drag_total: f32,
     // px/ms, signed along the chosen axis.
     last_velocity: f32,
@@ -60,6 +65,7 @@ impl GestureLayer {
             gesture: TwoTierGesture::new(cfg),
             axis,
             dragging: false,
+            suppressed: false,
             drag_total: 0.0,
             last_velocity: 0.0,
             last_config: cfg,
@@ -81,6 +87,29 @@ impl GestureLayer {
     /// *value* actually differs from last frame's — see `last_config`.
     pub fn config_mut(&mut self) -> &mut GestureConfig {
         self.gesture.config_mut()
+    }
+
+    /// Is the press a widget's rather than the page's? A container (a
+    /// ScrollArea) owns it only once the finger has moved decidedly ACROSS
+    /// the page axis — along it, the page keeps the drag and the container
+    /// applies nothing. Until the motion decides, the page proceeds; a few
+    /// pixels of progress on a drag that turns out vertical is the cost.
+    fn widget_owns(&self, ui: &Ui, surface: Rect) -> bool {
+        match drag_owner(ui.ctx(), surface) {
+            Owner::Page => false,
+            Owner::Widget => true,
+            Owner::Container => {
+                let motion = ui.input(|i| {
+                    match (i.pointer.press_origin(), i.pointer.latest_pos()) {
+                        (Some(a), Some(b)) => b - a,
+                        _ => Vec2::ZERO,
+                    }
+                });
+                let along = self.axis_of(motion).abs();
+                let across = match self.axis { Axis::Horizontal => motion.y, Axis::Vertical => motion.x }.abs();
+                across > 8.0 && across > along
+            }
+        }
     }
 
     fn axis_of(&self, v: Vec2) -> f32 {
@@ -124,11 +153,28 @@ impl GestureLayer {
         });
 
         // ----- page tier: pointer drag within the surface -----
+        //
+        // THE MONOREPO-WIDE BUG lived on this branch: any primary-down
+        // pointer over the surface was a page drag, so selecting text in a
+        // TextEdit, dragging a slider, or scrolling a list by touch all
+        // swiped the page out from under the widget being used. Every app
+        // feeds this one adapter, which is why it was every app's bug and
+        // is one fix.
         if pointer_down && (self.dragging || hovered) {
             if !self.dragging {
                 self.dragging = true;
                 self.drag_total = 0.0;
                 self.gesture.reset_streak();
+                self.suppressed = self.widget_owns(ui, surface);
+            } else if !self.suppressed && self.widget_owns(ui, surface) {
+                // A widget claimed the pointer after the press — a text
+                // selection only becomes a drag once the finger has moved.
+                // Whatever this drag accumulated was the widget's motion.
+                self.suppressed = true;
+                self.gesture.reset_streak();
+            }
+            if self.suppressed {
+                return frame;
             }
             let d = self.axis_of(delta);
             self.drag_total += d;
@@ -142,6 +188,9 @@ impl GestureLayer {
         } else if self.dragging {
             // release
             self.dragging = false;
+            if std::mem::take(&mut self.suppressed) {
+                return frame;
+            }
             let rel = self
                 .gesture
                 .on_release(self.last_velocity as f64 * -1.0, self.drag_total as f64 * -1.0);
@@ -178,6 +227,62 @@ impl GestureLayer {
     }
 }
 
+/// Who owns the current press.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Owner {
+    /// Nobody has claimed it: it is the page's.
+    Page,
+    /// A widget — a text selection, a slider — owns it outright.
+    Widget,
+    /// A widget as large as the surface owns it: a ScrollArea, which claims
+    /// a drag in ANY direction once its content overflows and then applies
+    /// only its own axis. The page yields to it across the page axis and
+    /// keeps the drag along it, or every long list would eat every swipe.
+    Container,
+}
+
+/// Does the current press belong to a widget rather than to the page?
+///
+/// Two signals, both from egui's own bookkeeping rather than from any
+/// list of widget types this crate would have to keep current:
+///
+/// * `dragged_id()` — a widget with `Sense::drag` is being dragged. egui
+///   sets it in the start-of-frame interaction snapshot, so it reads the
+///   same whether this layer updates before or after the widget draws.
+///   A TextEdit selecting text, a selectable label, a slider, a
+///   ScrollArea being dragged by touch all set it.
+/// * the focused widget's rect contains the press origin — the press
+///   landed in the text field the user is editing. Caught at press time,
+///   before any movement, so the page never moves even for the first few
+///   pixels of a selection drag.
+///
+/// `surface` tells a container from a control: a dragged widget whose rect
+/// covers at least half the surface is a container. `egui_wants_pointer_input`
+/// is deliberately NOT used: it is true whenever the pointer merely hovers a
+/// widget, which is always.
+pub fn drag_owner(ctx: &egui::Context, surface: Rect) -> Owner {
+    if let Some(origin) = ctx.input(|i| i.pointer.press_origin()) {
+        let in_focused = ctx.memory(|m| m.focused())
+            .and_then(|id| ctx.read_response(id))
+            .is_some_and(|r| r.rect.contains(origin));
+        if in_focused { return Owner::Widget; }
+    }
+    match ctx.dragged_id() {
+        None => Owner::Page,
+        Some(id) => {
+            let big = ctx.read_response(id)
+                .is_some_and(|r| r.rect.area() >= 0.5 * surface.area());
+            if big { Owner::Container } else { Owner::Widget }
+        }
+    }
+}
+
+/// Kept for callers that want a yes/no: containers count as widgets here.
+pub fn pointer_belongs_to_a_widget(ctx: &egui::Context) -> bool {
+    drag_owner(ctx, Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(f32::MAX, f32::MAX))) == Owner::Widget
+        || ctx.dragged_id().is_some()
+}
+
 fn apply_outcome(o: Outcome, frame: &mut GestureFrame) {
     match o {
         Outcome::None => {}
@@ -212,6 +317,132 @@ mod tests {
             });
         });
         out
+    }
+
+    /// Like `frame`, with a clock and content drawn inside the surface
+    /// BEFORE the layer updates — the order every app uses, and the order
+    /// in which the bug reproduced.
+    fn frame_with(ctx: &Context, gesture: &mut GestureLayer, surface: Rect, t: f64,
+                  events: Vec<Event>, mut draw: impl FnMut(&mut Ui)) -> GestureFrame {
+        let mut out = GestureFrame::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 800.0));
+        let _ = ctx.run(RawInput { events, screen_rect: Some(screen), time: Some(t), ..Default::default() }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                draw(ui);
+                out = gesture.update(ui, surface, true);
+            });
+        });
+        out
+    }
+
+    /// Press at `from`, drag to `to` over several frames, release. Returns
+    /// every frame's outcome; the last is the release.
+    fn drag(ctx: &Context, g: &mut GestureLayer, surface: Rect, from: Pos2, to: Pos2,
+            mut draw: impl FnMut(&mut Ui)) -> Vec<GestureFrame> {
+        let press = |pos: Pos2, pressed: bool| Event::PointerButton {
+            pos, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        let mut t = 0.0;
+        let mut out = Vec::new();
+        // A warm-up frame so egui knows the widget rects before the press.
+        frame_with(ctx, g, surface, t, vec![Event::PointerMoved(from)], &mut draw);
+        t += 0.016;
+        out.push(frame_with(ctx, g, surface, t, vec![press(from, true)], &mut draw));
+        for i in 1..=8 {
+            t += 0.016;
+            let pos = from + (to - from) * (i as f32 / 8.0);
+            out.push(frame_with(ctx, g, surface, t, vec![Event::PointerMoved(pos)], &mut draw));
+        }
+        t += 0.016;
+        out.push(frame_with(ctx, g, surface, t, vec![press(to, false)], &mut draw));
+        out
+    }
+
+    const FIELD: Rect = Rect { min: Pos2::new(40.0, 380.0), max: Pos2::new(360.0, 420.0) };
+
+    fn draw_text_field(text: &mut String, focus: bool) -> impl FnMut(&mut Ui) + '_ {
+        move |ui: &mut Ui| {
+            let r = ui.put(FIELD, egui::TextEdit::singleline(text));
+            if focus { r.request_focus(); }
+        }
+    }
+
+    /// THE MONOREPO-WIDE BUG. Selecting text by dragging across a focused
+    /// TextEdit swiped the page: the layer took any primary-down pointer
+    /// over the surface as a page drag. The same drag, same distance, same
+    /// velocity, outside the field is the control and must still swipe.
+    #[test]
+    fn a_drag_inside_a_focused_text_field_does_not_swipe_the_page() {
+        let surface = Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let mut text = String::from("select some of this text by dragging");
+
+        let ctx = Context::default();
+        let mut g = GestureLayer::horizontal_page(320.0);
+        let frames = drag(&ctx, &mut g, surface, Pos2::new(300.0, 400.0), Pos2::new(60.0, 400.0),
+                          draw_text_field(&mut text, true));
+        assert!(frames.iter().all(|f| f.page_jump.is_none() && f.detent.is_none() && f.raw == 0.0),
+                "a text-selection drag moved the page: {:?}",
+                frames.iter().map(|f| (f.page_jump, f.raw)).collect::<Vec<_>>());
+
+        // Control: the same drag below the field.
+        let ctx = Context::default();
+        let mut g = GestureLayer::horizontal_page(320.0);
+        let frames = drag(&ctx, &mut g, surface, Pos2::new(300.0, 600.0), Pos2::new(60.0, 600.0),
+                          draw_text_field(&mut text, true));
+        assert!(frames.last().unwrap().page_jump.is_some(),
+                "the control drag outside the field must still swipe, or the fix is a suppression of everything");
+    }
+
+    /// A widget that claims the pointer only once the finger has moved — a
+    /// slider, a selectable label, a scroll area's touch drag — was not
+    /// under the press as a focused field. The layer must let go the frame
+    /// the widget takes hold, and not fire a jump on release for the
+    /// distance it had already counted.
+    #[test]
+    fn a_widget_claiming_the_pointer_mid_drag_takes_it_from_the_page() {
+        let surface = Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let mut value = 0.5f32;
+        let ctx = Context::default();
+        let mut g = GestureLayer::horizontal_page(320.0);
+        // The rail is `slider_width` wide regardless of the rect it is put
+        // in; widen it so the press lands ON the slider, or this tests a
+        // press on empty page, which must jump.
+        let frames = drag(&ctx, &mut g, surface, Pos2::new(300.0, 400.0), Pos2::new(60.0, 400.0),
+                          |ui: &mut Ui| {
+                              ui.spacing_mut().slider_width = 300.0;
+                              ui.put(FIELD, egui::Slider::new(&mut value, 0.0..=1.0).show_value(false));
+                          });
+        assert!(frames.last().unwrap().page_jump.is_none(), "the slider's drag became a page jump");
+        assert!(value < 0.5, "the slider itself did not receive the drag: {value}");
+    }
+
+    /// The regression the first fix would have shipped: a ScrollArea claims
+    /// a drag in ANY direction once its content overflows, so every long
+    /// list would have eaten every horizontal swipe. A container yields to
+    /// the page along the page axis.
+    #[test]
+    fn a_horizontal_swipe_over_an_overflowing_list_still_swipes() {
+        let surface = Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let ctx = Context::default();
+        let mut g = GestureLayer::horizontal_page(320.0);
+        let frames = drag(&ctx, &mut g, surface, Pos2::new(300.0, 400.0), Pos2::new(60.0, 400.0),
+                          |ui: &mut Ui| {
+                              egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                                  for i in 0..200 { ui.label(format!("row {i}")); }
+                              });
+                          });
+        assert!(frames.last().unwrap().page_jump.is_some(),
+                "a horizontal swipe over a long list did not swipe: the list took it");
+        // And a vertical drag over the same list is the list's, not the page's.
+        let ctx = Context::default();
+        let mut g = GestureLayer::horizontal_page(320.0);
+        let frames = drag(&ctx, &mut g, surface, Pos2::new(200.0, 700.0), Pos2::new(210.0, 200.0),
+                          |ui: &mut Ui| {
+                              egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                                  for i in 0..200 { ui.label(format!("row {i}")); }
+                              });
+                          });
+        assert!(frames.iter().all(|f| f.page_jump.is_none() && f.detent.is_none()),
+                "a vertical scroll of a list moved the page");
     }
 
     /// The bug: nothing detected a config change, so a value change mid-drag

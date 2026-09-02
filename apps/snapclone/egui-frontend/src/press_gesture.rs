@@ -296,3 +296,54 @@ mod tests {
         assert!((g.progress() - 0.5).abs() < 0.01);
     }
 }
+
+/// Two taps close in time and place. Kept apart from `PressGesture`,
+/// which decides what ONE press is; this decides whether the tap it just
+/// reported completes a pair. Android's camera flips on it, and a user
+/// who has held a phone expects it.
+#[derive(Clone, Debug, Default)]
+pub struct DoubleTap {
+    last: Option<(f32, f32, f64)>,
+}
+
+/// The second tap must land within this of the first.
+pub const DOUBLE_TAP_MS: f64 = 300.0;
+/// And within this many pixels — a thumb does not land twice in the same
+/// place, and a tap on the other side of the screen is two taps.
+pub const DOUBLE_TAP_SLOP: f32 = 40.0;
+
+impl DoubleTap {
+    /// Report a tap. `true` when it is the second of a pair — and that
+    /// pair is consumed, so a third tap starts a new one rather than
+    /// pairing with the second.
+    pub fn tap(&mut self, x: f32, y: f32, now_ms: f64) -> bool {
+        match self.last.take() {
+            Some((lx, ly, t)) if now_ms - t <= DOUBLE_TAP_MS
+                && ((x - lx).powi(2) + (y - ly).powi(2)).sqrt() <= DOUBLE_TAP_SLOP => true,
+            _ => { self.last = Some((x, y, now_ms)); false }
+        }
+    }
+}
+
+#[cfg(test)]
+mod double_tap_tests {
+    use super::*;
+
+    #[test]
+    fn two_taps_close_in_time_and_place_pair_and_a_pair_is_consumed() {
+        let mut d = DoubleTap::default();
+        assert!(!d.tap(100.0, 100.0, 0.0));
+        assert!(d.tap(110.0, 95.0, 200.0), "second tap within slop and window");
+        assert!(!d.tap(110.0, 95.0, 300.0), "a third tap starts over, not a triple");
+        assert!(d.tap(110.0, 95.0, 400.0));
+    }
+
+    #[test]
+    fn far_apart_in_time_or_place_is_two_taps() {
+        let mut d = DoubleTap::default();
+        assert!(!d.tap(100.0, 100.0, 0.0));
+        assert!(!d.tap(100.0, 100.0, 301.0), "late");
+        assert!(!d.tap(200.0, 100.0, 400.0), "elsewhere — and this one becomes the new first");
+        assert!(d.tap(205.0, 100.0, 500.0));
+    }
+}

@@ -85,6 +85,8 @@ impl HelpManual {
     }
 
     pub fn is_open(&self) -> bool { self.open }
+    /// Closed by the user, as opposed to by the idle countdown.
+    pub fn close(&mut self) { self.open = false; }
     pub fn closed_by(&self) -> Option<Closed> { self.closed_by }
     pub fn idle_ms(&self) -> f32 { self.idle_ms }
 

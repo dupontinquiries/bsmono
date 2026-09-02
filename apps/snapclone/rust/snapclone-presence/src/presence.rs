@@ -53,12 +53,12 @@ impl Presence {
         put(&mut data, &self.display_name);
         put(&mut data, &self.host);
         data.extend_from_slice(&self.port.to_be_bytes());
-        Value { id: value_id, data }
+        Value::new(value_id, data)
     }
     pub fn from_value(v: &Value) -> Option<Presence> {
         let d = &v.data;
         let mut i = 0;
-        let mut take = |i: &mut usize| -> Option<String> {
+        let take = |i: &mut usize| -> Option<String> {
             let n = *d.get(*i)? as usize; *i += 1;
             let s = d.get(*i..*i + n)?; *i += n;
             String::from_utf8(s.to_vec()).ok()

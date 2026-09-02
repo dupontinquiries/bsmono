@@ -378,8 +378,14 @@ pub fn feed_ui(ui: &mut egui::Ui, feed: &SnapFeed, press: &mut Press, now: i64,
         for row in feed.entries().chunks(COLUMNS) {
             ui.horizontal(|ui| {
                 for e in row {
+                    // Click, not click_and_drag: a tile does nothing with a
+                    // drag except cancel its hold, and a widget that senses
+                    // drag OWNS it (uikit-egui's gesture rule) — a page swipe
+                    // starting on a tile would have gone nowhere. Movement is
+                    // read from the pointer instead; the feed's ScrollArea
+                    // takes the vertical drag, the pager the horizontal one.
                     let (rect, resp) = ui.allocate_exact_size(
-                        egui::vec2(tile_w, tile_w), egui::Sense::click_and_drag());
+                        egui::vec2(tile_w, tile_w), egui::Sense::click());
                     // The tile is a sealed card: chrome, a badge, a caption.
                     // Nothing here reads snap content, because the entry does
                     // not carry any.
@@ -397,8 +403,29 @@ pub fn feed_ui(ui: &mut egui::Ui, feed: &SnapFeed, press: &mut Press, now: i64,
                         egui::Align2::LEFT_BOTTOM, e.caption(now),
                         egui::FontId::proportional(11.0), c.text_weak);
 
+                    // The affordances. A pointer that hovers is told what a
+                    // tap and a hold do; a press — finger or button — draws a
+                    // ring that fills as the hold completes, so the user can
+                    // see the menu coming rather than wonder how long to
+                    // wait. Touch only hovers while pressing, so the caption
+                    // never clutters a phone that is not touching anything.
+                    if resp.hovered() && !resp.is_pointer_button_down_on() {
+                        ui.painter().rect_stroke(rect.shrink(1.0), 8.0,
+                            egui::Stroke::new(1.5, c.accent), egui::StrokeKind::Inside);
+                        ui.painter().text(rect.left_top() + egui::vec2(8.0, 8.0),
+                            egui::Align2::LEFT_TOP, "tap · hold for menu",
+                            egui::FontId::proportional(10.0), c.text_weak);
+                    }
                     if resp.is_pointer_button_down_on() {
-                        if !resp.dragged() { press.down(); }
+                        if !ui.input(|i| i.pointer.is_decidedly_dragging()) { press.down(); }
+                        let p = press.progress();
+                        if p > 0.0 {
+                            let a = (p * 255.0) as u8;
+                            let col = egui::Color32::from_rgba_unmultiplied(c.accent.r(), c.accent.g(), c.accent.b(), a);
+                            ui.painter().circle_stroke(rect.center(), rect.width() * 0.3,
+                                egui::Stroke::new(2.0 + 4.0 * p, col));
+                            ui.ctx().request_repaint();
+                        }
                         if press.tick(dt) == Gesture::Hold {
                             action = Some(FeedAction::OpenThread(e.id.clone()));
                         }
