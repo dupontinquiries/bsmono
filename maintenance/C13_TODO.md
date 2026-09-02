@@ -2321,3 +2321,26 @@ big one — which the engine's own advice line has been recommending
 ("16 performance and 8 efficiency cores detected — a small liaison can run
 on the efficiency cores without taking any from the thinker") and nothing
 schedules.
+
+
+## 71. §56 fully closed — all four dead duplicates resolved
+
+`extract_nonced` deleted; its one non-duplicate test ported to the live gate.
+That completes the set found this session: the three-way tool-list
+disagreement, the two liaisons, and this. Each was the outer crate carrying
+its own copy of something the inner crate already had.
+
+Worth a standing check rather than a fourth discovery: a periodic sweep for
+`pub fn`s in `logscope-egui` with no callers outside their own module would
+have found all three. `maintenance/tools/orphan_check.py` already reports
+orphaned FILES (7 currently, carrying 0 tests); extending it to orphaned
+public FUNCTIONS is the same shape of tool and would close the pattern rather
+than the instances.
+
+**Near-miss worth recording**, since it argues for how to write these
+assertions: porting the shared-doc worm test, I first asserted the payload
+TEXT was absent from the gate's output. It failed — correctly, because
+`wrap_untrusted` defangs delimiters and deliberately keeps content readable.
+The property that matters is whether a TOOL can be BUILT, which holds. A
+security assertion on the wrong observable would have reported a hole that
+does not exist; assert on the capability, not on the string.
