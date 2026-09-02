@@ -415,3 +415,73 @@ this list.
 * `03ea04175` / `ef07a4090` — set_rows and rms_norm/soft_max optimisations,
   both small and self-contained. Good candidates if the pass work turns out to
   be blocked.
+
+
+---
+
+# The surefire one: sync was a 50 ms sleep
+
+Everything else on this list needs a measurement to justify. This one is
+settled by arithmetic already in the log.
+
+The decode readback loop polled, checked, then slept a **flat 50 ms**. The
+field run reports 1151 tokens in 90.7 s with 87.76 s charged to sync:
+
+    76.2 ms of sync per token  /  50 ms quantum  =  1.52
+
+One to two sleeps per token. If the readback lands in 5-25 ms — which a 1B on
+this hardware should — the majority of that 76 ms was spent waiting on a
+timer, not on the GPU. Fixed: `memplan::readback_backoff`, spin for the first
+300 us then geometric to a 15 ms cap, so overshoot is proportional instead of
+flat.
+
+## Two independent corroborations, both from the log
+
+**1. The poll count does not fit.** The profile says `320 polls` for 1151
+tokens. Every counted poll goes through `counted_poll`, which uses
+`wait_indefinitely()` — a proper blocking wait with no granularity problem.
+So the counted, efficient waits number 320, while sync consumed 87.76 s. That
+is only possible if the bulk of sync time accumulates somewhere that charges
+GPU_SYNC_NS **without** incrementing GPU_POLLS — and the readback loop at
+`lib.rs:2603` is exactly that: it adds to the sync bucket and counts no polls.
+The two numbers disagreeing was itself the evidence, and it was sitting in
+every profile line.
+
+**2. The engine's own verdict.** `roofline — 19 GB/s of 800 spec = 2% ... NOT
+bandwidth-bound — the hardware is mostly idle and the limit is dispatch,
+submit or sync overhead. A faster model will not help; the engine is the
+lever.` It was right, and more specific than anyone read it as: the hardware
+was idle because we were asleep.
+
+## Why this was hard to see
+
+`GPU_SYNC_NS` is a single bucket, so "sync" looked like an inherent cost of
+talking to a GPU rather than a bug with a line number. Three things would
+have surfaced it sooner and are worth having:
+
+- **count the polls in every loop that charges the sync bucket.** The
+  mismatch above was a free signal nobody could act on because one of the two
+  numbers was silently not being kept.
+- **report sync per token beside the quantum.** 76 ms/token means nothing on
+  its own; 76 ms against a 50 ms sleep step is a diagnosis.
+- **split the bucket by site.** "sync 87760ms" cannot be acted on; "readback
+  wait 84 s, queue drain 3 s" can.
+
+## Audit result: it was one site, not a pattern
+
+Checked every `thread::sleep` in the engine. Three exist and the other two are
+correct — a 1 ms GPU-clock keepalive on its own dedicated thread, and the
+submit governor's 50 us. Worth recording because "sleeps are the problem"
+would have been the wrong generalisation; the problem was one loop whose
+quantum was 1000x its sibling's.
+
+## Still expected to matter, in order
+
+1. This fix (landed, unmeasured — the next profile line reports it directly).
+2. Pass batching toward upstream's 64/pass, once the `ring_dims` sizing above
+   is done. 96% of submits are pass boundaries.
+3. `LOGSCOPE_SPEC_DRAFT=lookup` via `autospec` — decode is 23.6x prefill per
+   token, which is the starved-decode signature speculation addresses.
+
+Note the ordering changed: sync was assumed to be a floor and turns out to be
+the cheapest fix of the three.
