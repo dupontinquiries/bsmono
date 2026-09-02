@@ -2732,6 +2732,7 @@ pub fn encode_gop_v3_core(
     let gmc = std::env::var("FAO_GMC").map(|v| v != "0").unwrap_or(true);
     let mut gmc_extra_bytes = 0usize;
     for (fi, f) in frames.iter().enumerate() {
+        let mut layer_sel: Option<Vec<u8>> = None;
         let mut plate_pred = if gmc && fi > 0 {
             // Motion LAYERS: the previous reconstruction warped by
             // each of up to FAO_GMC_LAYERS affines (camera, actor,
@@ -2765,18 +2766,24 @@ pub fn encode_gop_v3_core(
             // cost ~950 B/frame, more than it saved.
             let default_ci = if layers.is_empty() { 0 } else { 1 };
             let margin: u32 = std::env::var("FAO_GMC_MARGIN").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+            // FAO_GMC_SEL_FROM_MODEL=1: the layer choice is made
+            // against the caller's MODEL instead of the source, so a
+            // decoder holding the same model (an upscaled base layer)
+            // makes the identical choice and the map costs nothing.
+            let sel_from_model = std::env::var("FAO_GMC_SEL_FROM_MODEL").map(|v| v != "0").unwrap_or(false);
+            let referee: &Yuv420 = if sel_from_model { &cands[0] } else { f };
             let mut composite = cands[default_ci].clone();
             let mut sel: Vec<u8> = vec![default_ci as u8; gw * gh];
             for gy in 0..gh {
                 for gx in 0..gw {
                     let (rx, ry) = (gx * REGION, gy * REGION);
-                    let base = sad_region(&cands[default_ci].y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry);
+                    let base = sad_region(&cands[default_ci].y, fw, fh, rx as i32, ry as i32, &referee.y, rx, ry);
                     let mut best = (base, default_ci);
                     for (ci, c) in cands.iter().enumerate() {
-                        if ci == default_ci {
+                        if ci == default_ci || (sel_from_model && ci == 0) {
                             continue;
                         }
-                        let sd = sad_region(&c.y, fw, fh, rx as i32, ry as i32, &f.y, rx, ry);
+                        let sd = sad_region(&c.y, fw, fh, rx as i32, ry as i32, &referee.y, rx, ry);
                         if sd + margin < best.0 {
                             best = (sd, ci);
                         }
@@ -2798,12 +2805,15 @@ pub fn encode_gop_v3_core(
                     }
                 }
             }
-            gmc_extra_bytes += zstd::encode_all(sel.as_slice(), 19).map(|c| c.len()).unwrap_or(sel.len());
+            if !sel_from_model {
+                gmc_extra_bytes += zstd::encode_all(sel.as_slice(), 19).map(|c| c.len()).unwrap_or(sel.len());
+            }
             if std::env::var("FAO_GMC_DEBUG").is_ok() {
                 let mut hist = vec![0usize; cands.len()];
                 for &v in &sel { hist[v as usize] += 1; }
                 eprintln!("gmc f{fi}: layers {} pick {:?}", layers.len(), hist);
             }
+            layer_sel = Some(sel);
             composite
         } else {
             pred_for(fi)
@@ -3350,13 +3360,35 @@ pub fn encode_gop_v3_core(
         // was costing 17 B of zstd framing — on an exact engine
         // canonical that is most frames. The marker means no path can
         // lose more than one byte.
+        // Method 3: the adaptive binary coder with contexts (mode
+        // given neighbours and motion layer, vector deltas, gain
+        // pairs) — see bincoder.rs. Per frame the shorter of it and
+        // zstd is charged; dict references (mode 4) stay on the zstd
+        // path since the context coder does not carry them yet.
+        let ctx_side: Option<usize> = if use_dict || std::env::var("FAO_NO_CTXCODER").is_ok() {
+            None
+        } else {
+            let gain_flag: Vec<bool> = (0..gw * gh).map(|gi| (gain_flags[gi / 8] >> (gi % 8)) & 1 == 1).collect();
+            let gains: Vec<(i8, i8)> = gain_vals.chunks_exact(2).map(|p| (p[0] as i8, p[1] as i8)).collect();
+            let rs = crate::bincoder::RegionSide {
+                gw,
+                gh,
+                modes: &modes,
+                mvs: &mvs,
+                gain_flag: &gain_flag,
+                gains: &gains,
+                layer: layer_sel.as_deref(),
+            };
+            Some(crate::bincoder::encode_side(&rs).len() + wp_tail.len())
+        };
+        let zstd_side = zstd::encode_all(side.as_slice(), 19).map(|c| c.len()).unwrap_or(side.len()).min(side.len());
+        if std::env::var("FAO_SIDE_DEBUG").is_ok() {
+            eprintln!("side coded: zstd {} ctx {:?}", zstd_side, ctx_side);
+        }
         let mode_bytes = if side_core_zero {
             1 + wp_tail.len()
         } else {
-            1 + zstd::encode_all(side.as_slice(), 19)
-                .map(|c| c.len())
-                .unwrap_or(side.len())
-                .min(side.len())
+            1 + ctx_side.map(|c| c.min(zstd_side)).unwrap_or(zstd_side)
         };
 
         // ── MOTION-ADAPTIVE RATE ALLOCATION (FAO_DZ_MOTION).

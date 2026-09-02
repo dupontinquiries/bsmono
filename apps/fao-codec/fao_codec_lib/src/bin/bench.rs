@@ -125,7 +125,16 @@ fn run(clip: &str, config: &str, dz: f32) -> Row {
     // FAO_NOPLATE=1: no long-term plate at all — frame 0 from gray
     // (intra + residual), later frames from whatever the core's model
     // is (with FAO_GMC, the warped previous reconstruction).
-    let rep = if std::env::var("FAO_NOPLATE").map(|v| v != "0").unwrap_or(false) {
+    // FAO_PRED_Y4M=<file>: an EXTERNAL model — e.g. an 8x-downscaled
+    // AV1 base layer decoded and upscaled — used as the mode-0
+    // predictor. Its bytes are charged by the caller (the base
+    // stream), not here.
+    let rep = if let Ok(path) = std::env::var("FAO_PRED_Y4M") {
+        let (_, _, pred) = read_y4m(&path);
+        let n = frames.len().min(pred.len());
+        let (r, _) = plate::encode_gop_v3_core(&frames[..n], &mut |fi| pred[fi].clone(), 0, 0, &opts, None);
+        r
+    } else if std::env::var("FAO_NOPLATE").map(|v| v != "0").unwrap_or(false) {
         plate::encode_gop_no_plate(&frames, &opts)
     } else {
         let m = plate::estimate_motions(&frames);

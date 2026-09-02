@@ -6569,3 +6569,64 @@ next byte in side info is a context-adaptive coder for them, or
 fewer of them (a segmentation map predicted from the previous
 frame's instead of sent whole). The residual sits 45% on model
 regions and 48% on prev-MC regions.
+
+### Context-adaptive side coding, the base-layer hybrid, and the 1/8-scale control (2026-09-02)
+
+Question from the user: is there anything in the 3D pose to quantise
+or statistically represent residuals with? Ranked answer in the
+transcript; the actionable one was geometry as ENTROPY CONTEXT. First
+fact: the rANS path with static per-frame tables is chosen on 0 of 49
+w1 frames — an order-0 coder loses to zstd's LZ+FSE, and contexts on
+a path never taken buy nothing. So `bincoder.rs`: an LZMA-family
+adaptive binary range coder (8-bit probabilities, fast-then-slow
+update) with binarised symbols under context: region mode given the
+left/top modes and the region's MOTION LAYER, vector zero-flag given
+neighbour zero-flags, vector deltas from the median predictor as
+exp-Golomb with per-bin contexts, gain flag given neighbours and
+layer, gain pairs likewise. Side method 3, charged as the shorter of
+it and zstd per frame. Round-trip tests. Per frame on w1 it is 92.4%
+of zstd's bytes:
+
+  w1     370,196 -> 352,288   (-4.8%, quality identical)
+  SMITE  819,564 -> 800,487   (-2.3%)
+
+Then the user's hybrid: bootstrap from an 8x-downscaled AV1 stream
+and code the residual at full resolution. As spatial scalability it
+cannot win (the enhancement carries all the high-frequency bytes at a
+worse rate than AV1). As a decoder-side hint it targets the 52% of
+film bytes that are side info. Measured (`FAO_PRED_Y4M`, the
+upscaled base as the mode-0 model; base bytes added):
+
+  w1   base 1/8 crf20   codec 239,359 + base 29,217 = 268,576 B   0.98211  U 43.7 V 45.0   (-27% vs 370,196 / 0.97937 / U 39.1)
+  w1   base 1/4 crf20   codec 154,029 + base 76,859 = 230,888 B   0.98845  U 46.6 V 47.9
+  SMITE base 1/8 crf20  codec 464,718 + base 44,729 = 509,447 B   0.95459  U 37.4          (-36% vs 800,487 / 0.95470 / U 34.2)
+  decoder-side layer choice against the base (map free): 319,098 / 0.98015 — the base
+  is a worse referee than the source and the map costs only ~400 B/frame; LOST.
+
+The trend is the finding. The quarter-res base alone costs 77 KB —
+the same as full-resolution AV1 at crf50 (77,632 B @ 0.99126), which
+beats every hybrid row. "More AV1, less codec" improves monotonically
+and its limit is all AV1. The hybrid helps the codec because the base
+supplies accurate LOW FREQUENCIES AND CHROMA, which the codec's own
+predictors get wrong and its dead zone then refuses to fix (+4.6 dB U
+on w1 from a 29 KB base). That is the design lesson worth keeping: an
+accurate cheap LF/chroma layer inside the codec, not a second codec.
+
+Two controls close it:
+
+  Metric. The 1/8 AV1 base merely upscaled by Lanczos scores luma
+  MS-SSIM 0.963 at 29 KB — equal to the codec's whole-suite average
+  at 1/50 of the bytes. The figure of merit is nearly blind to an 8x
+  loss of resolution. Every quality claim in this log needs a
+  detail-sensitive metric beside it before it means what it says.
+
+  Scale. The codec on the 240x100 clip itself, scored at that size:
+    codec dz16  31,555 B  0.96013     AV1 crf20  29,217 B  0.99719
+    codec dz32  14,643 B  0.93435     AV1 crf35  14,135 B  0.99298
+    codec dz48  11,098 B  0.91554     AV1 crf50   6,956 B  0.98222
+  At 1/8 resolution there is no grid-discontinuity story, no plate,
+  nothing a world model could add, and AV1 is ~4.5x smaller at higher
+  quality. The gap is the core inter coder — 16x16 modes, 4x4 DCT,
+  per-region side info — at every scale. The world-model layers on
+  top of it (GMC, layers, WP, exact gate, stages) are each real and
+  each bounded by it.
