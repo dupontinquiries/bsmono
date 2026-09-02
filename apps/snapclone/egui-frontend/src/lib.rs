@@ -370,6 +370,14 @@ pub struct Snapclone {
     /// The action menu, opened by right-click on a desktop and press-and-hold
     /// on a phone. Before this the fleet had neither, anywhere.
     pub menu: uikit_egui::menu::ContextMenu,
+    /// Snaps that arrived this session, bytes and all, so a tap on a tile
+    /// can open one. Nothing kept them before: `SnapArrived` built the
+    /// feed entry and dropped the frame, and the receive path ended at a
+    /// badge. Bounded by count and bytes; a snap is view-once and the
+    /// oldest go first.
+    pub received: Vec<crate::snaps::Snap>,
+    /// A menu chose "View": opened on the next frame, which has a surface.
+    pub pending_open: Option<String>,
     /// "Someone is looking at this screen", from the gaze layer.
     pub attention: crate::gaze::Attention,
     /// The snap the menu was opened on.
@@ -635,6 +643,8 @@ pub struct Snapclone {
     /// OR any other input, so a reader pausing on a short section is not
     /// dismissed mid-read.
     pub help: crate::help_manual::HelpManual,
+    pub help_filter: String,
+    pub help_scroll_y: f32,
     /// Running edge-pixel samples. Kept across snaps rather than recomputed:
     /// the palette should settle as the inbox fills, not lurch to whatever
     /// arrived last.
@@ -740,6 +750,8 @@ impl Snapclone {
             shutter_pressed: false,
             video: None,
             menu: Default::default(),
+            received: Vec::new(),
+            pending_open: None,
             attention: Default::default(),
             menu_target: None,
             snaps_saved: Vec::new(),
@@ -870,6 +882,8 @@ impl Snapclone {
                      five minutes, so neither your timezone nor your exact \
                      habits are readable from the data."),
             ]),
+            help_filter: String::new(),
+            help_scroll_y: 0.0,
             ambient_samples: Default::default(),
             // Labels from PAGE_NAMES, not a second list. The bar said "Chats"
             // and "Map" where the rest of the app says "Inbox" and
@@ -2735,6 +2749,7 @@ impl Snapclone {
         let expired = self.snaps_expired.iter().any(|e| e == id);
         let items = vec![
             MenuItem::new("open", "View"),
+            MenuItem::new("thread", "Conversation"),
             if expired { MenuItem::new("save", "Save").disabled() }
             else { MenuItem::new("save", "Save") },
             MenuItem::separator(),
@@ -2749,8 +2764,14 @@ impl Snapclone {
     pub fn apply_menu(&mut self, id: &str) {
         let Some(target) = self.menu_target.take() else { return };
         match id {
-            "delete" => { self.feed.remove(&target); }
+            "delete" => { self.feed.remove(&target); self.received.retain(|s| s.id != target); }
             "save" => self.snaps_saved.push(target),
+            "open" => { self.pending_open = Some(target); }
+            "thread" => {
+                if let Some(e) = self.feed.entries().iter().find(|e| e.id == target) {
+                    self.conversation_peer = e.sender_name.clone();
+                }
+            }
             _ => {}
         }
     }
@@ -2760,6 +2781,28 @@ impl Snapclone {
     /// A video goes to the persistent viewer and an image to the view-once one.
     /// The routing lives here, once, rather than at each tile: a tile that
     /// picked its own viewer would eventually pick the wrong one.
+    /// Remember an arrived snap so it can be opened. See `received`.
+    pub fn keep_received(&mut self, snap: crate::snaps::Snap) {
+        const MAX_COUNT: usize = 48;
+        const MAX_BYTES: usize = 96 * 1024 * 1024;
+        if self.received.iter().any(|s| s.id == snap.id) { return; }
+        self.received.push(snap);
+        while self.received.len() > MAX_COUNT
+            || self.received.iter().map(|s| s.bytes.len()).sum::<usize>() > MAX_BYTES
+        {
+            if self.received.len() <= 1 { break; }
+            self.received.remove(0);
+        }
+    }
+
+    /// Open a received snap by id, routed by its kind. `false` if it is
+    /// not held any more (expired, evicted, or never arrived here).
+    pub fn open_received(&mut self, id: &str, surface: egui::Rect) -> bool {
+        let Some(snap) = self.received.iter().find(|s| s.id == id).cloned() else { return false };
+        self.open_snap_routed(snap, surface);
+        true
+    }
+
     pub fn open_snap_routed(&mut self, snap: crate::snaps::Snap, surface: egui::Rect) {
         let id = snap.id.clone();
         if snap.media == crate::snaps::Media::Video {
@@ -2882,6 +2925,17 @@ impl Snapclone {
         // the module's own rule is ripples on touch, not under a cursor.
         self.feedback.set_enabled(adaptive.is_compact());
         self.compact = adaptive.is_compact();
+        // Grand where it is held constantly, comfortable where it is rarely
+        // touched: the phone's talk button is the former.
+        self.voicebar.set_talk_prominent(adaptive.is_compact());
+        // Escape closes everything that is open, the way a desktop expects.
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) && self.modal.blocks_input() {
+            self.modal.dismiss_all();
+            self.viewer.close();
+            self.video = None;
+            self.qr = None;
+            self.editor_id.clear();
+        }
         let dt_ms = ui.input(|i| i.stable_dt).min(0.1) * 1000.0;
         let pointer_down = ui.input(|i| i.pointer.any_down());
         // POSTURE. The fleet's only sensor integration — proximity from
@@ -3013,16 +3067,16 @@ impl Snapclone {
                     egui::UiBuilder::new().max_rect(area.shrink(12.0)));
                 let ev = self.video.as_mut().and_then(|v|
                     crate::video_viewer::video_viewer_ui(&mut child, v, "~/Videos", &colors));
+                let vid = self.modal.topmost(crate::modal::Layer::Dialog)
+                    .and_then(|p| p.id.strip_prefix("video:").map(String::from)).unwrap_or_default();
+                // close_video carries no wipe, by design — the snap outlives
+                // the viewer. One path for the button and the viewer's own
+                // Closed event.
                 if child.button("close").clicked() {
-                    // close() carries no wipe, by design — the snap outlives
-                    // the viewer. Clearing the state here is all that closing
-                    // means for a persistent video.
-                    self.video = None;
-                    self.modal.dismiss_topmost();
+                    self.close_video(&vid);
                 }
                 if let Some(crate::video_viewer::VideoEvent::Closed) = ev {
-                    self.video = None;
-                    self.modal.dismiss_topmost();
+                    self.close_video(&vid);
                 }
             }
         }
@@ -3261,6 +3315,49 @@ impl Snapclone {
         // Wayfinder, Settings — and the shell once routed three of them, so
         // two tabs led nowhere. That is most of why the app read as a demo:
         // the chrome promised more than the body delivered.
+        // The help manual: ported with its filter, its idle countdown and the
+        // scrolled/interacted distinction, and opened by nothing but tests.
+        if self.help.is_open() {
+            let area = surface.shrink2(egui::vec2(surface.width() * 0.08, 24.0));
+            ui.painter().rect_filled(area, 10.0, colors.bg_base);
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area.shrink(12.0)));
+            if child.input(|i| i.pointer.any_down() || !i.events.is_empty()) {
+                self.help_interacted();
+            }
+            child.horizontal(|ui| {
+                ui.colored_label(colors.text, "help");
+                let r = ui.add(egui::TextEdit::singleline(&mut self.help_filter).hint_text("filter").id_salt("lib-help_filter"));
+                if r.changed() {
+                    let f = self.help_filter.clone();
+                    self.help.set_filter(&f);
+                }
+                if ui.button("close").clicked() { self.help.close(); }
+            });
+            let out = egui::ScrollArea::vertical().id_salt("help_scroll").show(&mut child, |ui| {
+                let sections: Vec<(String, String)> = self.help.visible().iter()
+                    .map(|s| (s.title.clone(), s.body.clone())).collect();
+                for (title, body) in sections {
+                    ui.colored_label(colors.accent, title);
+                    ui.colored_label(colors.text, body);
+                    ui.add_space(8.0);
+                }
+            });
+            if (out.state.offset.y - self.help_scroll_y).abs() > 0.5 {
+                self.help_scroll_y = out.state.offset.y;
+                self.help.scrolled();
+            }
+        }
+        // The snap menu, drawn over whatever page is up; its choice applied
+        // here so every entry point (a tile's hold, a keyboard activate)
+        // ends in one place.
+        if let Some(choice) = uikit_egui::menu::menu_ui(ui, &mut self.menu, &colors) {
+            self.apply_menu(&choice);
+        }
+        if let Some(id) = self.pending_open.take() {
+            if !self.open_received(&id, surface) {
+                self.feed_note = format!("{id}: not held on this device any more");
+            }
+        }
         let draw_page = |app: &mut Self, ui: &mut Ui, page: usize| {
             if page == 0 {
                 app.camera_page(ui, &colors);
@@ -3455,6 +3552,17 @@ impl Snapclone {
                 if resp.drag_started() || resp.is_pointer_button_down_on() {
                     if self.press.is_idle() { self.press.press(lx, ly); }
                     else { let _ = self.press.move_to(lx, ly); }
+                }
+                // Swipe UP to send: the composer's own gesture (Composer::
+                // begin_drag/end_drag, upward only, a fraction of the height),
+                // ported and tested and fed by nothing. On release past the
+                // fraction, the recipient picker opens with "Send" armed.
+                if resp.drag_started() {
+                    self.composer.begin_drag(ly / vf_rect.height().max(1.0));
+                }
+                if resp.drag_stopped() && self.composer.end_drag(ly / vf_rect.height().max(1.0)) {
+                    self.picker.mode = crate::contacts::PickMode::Multi { confirm_label: "Send".into() };
+                    self.nav.go_page(2);
                 }
             }
             let ev = self.press.tick(dt_ms).or_else(|| {
@@ -3995,6 +4103,7 @@ impl Snapclone {
     }
 
     fn settings_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
+        if ui.button("help").clicked() { self.help.open(); }
         // DIAGNOSTIC CHANNELS, one toggle each. Individually, which is the
         // whole point of the module: the C++ it replaces used setFilterRules,
         // so switching one channel on silently switched every other off —
@@ -4618,31 +4727,25 @@ impl Snapclone {
         if !self.feed.is_empty() {
             ui.separator();
             let now = self.now_secs;
+            let surface = ui.ctx().content_rect();
             if let Some(act) = crate::snaps::feed_ui(ui, &self.feed, &mut self.feed_press, now, c) {
                 match act {
-                    crate::snaps::FeedAction::OpenThread(sender) => {
-                        // A HOLD opens the sender's conversation, which is
-                        // already the page's own mechanism just below.
-                        self.conversation_peer = sender;
+                    // A hold on a tile is the tile's menu — view, save,
+                    // conversation, delete — the Qt goodie that was ported,
+                    // tested, and opened from nowhere. Opening the thread
+                    // directly is one of its entries.
+                    crate::snaps::FeedAction::OpenThread(id) => {
+                        let at = ui.input(|i| i.pointer.latest_pos())
+                            .map(|p| (p.x, p.y)).unwrap_or((surface.center().x, surface.center().y));
+                        self.open_snap_menu(&id, at);
                     }
+                    // A tap opens the snap, routed by kind. The bytes are
+                    // held since arrival (`received`); before that a tap
+                    // could only write a note.
                     crate::snaps::FeedAction::Open(id) => {
-                        // A TAP should open the ephemeral viewer, and cannot
-                        // yet. open_snap_routed takes a Snap with its
-                        // DECRYPTED BYTES; a FeedEntry carries an id, a
-                        // sender, a timestamp and a thumbnail path. Fetching
-                        // and decrypting the payload is the host's job and
-                        // there is no request path for it here.
-                        //
-                        // Constructing a Snap with empty bytes would open a
-                        // viewer onto nothing and start its expiry timer — the
-                        // snap would be consumed without ever being seen,
-                        // which is worse than not opening.
-                        // Said in place rather than through a toast: this
-                        // controller has no general message channel
-                        // (shutter_note is the camera's), and inventing one
-                        // for a single line would be a mechanism with one
-                        // caller.
-                        self.feed_note = format!("{id}: waiting on the host to fetch this snap");
+                        if !self.open_received(&id, surface) {
+                            self.feed_note = format!("{id}: not held on this device any more");
+                        }
                     }
                 }
             }
@@ -4902,6 +5005,43 @@ mod tests {
             if app.nav.page() != 0 { break; }
         }
         assert_eq!(app.nav.page(), 1, "forty frames of scroll along the axis did not turn the page");
+    }
+
+    /// The receive path used to end at a tile: the frame's bytes were
+    /// dropped as the feed entry was built. Now a snap that arrives is
+    /// held and a tap opens it, routed by kind.
+    #[test]
+    fn a_snap_that_arrives_can_be_opened_and_a_hold_has_a_menu() {
+        let mut app = app();
+        let frame = crate::snap_wire::SnapFrame::announce(
+            7, 3, "sc-ada", "ada", crate::snaps::Media::Image, 1_700_000_000, 5, vec![9u8; 2048]);
+        let id = crate::snap_wire::content_id("sc-ada", &[9u8; 2048]);
+        app.apply(crate::host::HostEvent::SnapArrived { from: "sc-ada".into(), frame: Box::new(frame) });
+        assert_eq!(app.received.len(), 1, "the bytes were not kept");
+        let surface = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 800.0));
+        assert!(app.open_received(&id, surface));
+        assert!(app.viewer.is_open(), "an image did not open the view-once viewer");
+        assert!(!app.open_received("nope", surface));
+
+        assert!(app.open_snap_menu(&id, (100.0, 100.0)));
+        assert!(app.menu.is_open());
+        app.menu_target = Some(id.clone());
+        app.apply_menu("delete");
+        assert!(app.received.is_empty(), "delete must drop the held bytes too");
+    }
+
+    /// Received snaps are bounded: a session that receives forever does
+    /// not hold forever.
+    #[test]
+    fn received_snaps_are_bounded_oldest_first() {
+        let mut app = app();
+        for i in 0..60u32 {
+            app.keep_received(crate::snaps::Snap { id: format!("s{i}"), sender_id: "a".into(),
+                sender_name: "a".into(), sent_at: i as i64, media: crate::snaps::Media::Image,
+                duration_secs: 5, bytes: vec![0; 10] });
+        }
+        assert!(app.received.len() <= 48);
+        assert_eq!(app.received[0].id, "s12", "the oldest went first");
     }
 
     #[test]

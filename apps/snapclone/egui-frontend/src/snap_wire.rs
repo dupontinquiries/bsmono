@@ -292,6 +292,22 @@ impl SnapFrame {
     /// the whole reason this takes an argument: the id used for content
     /// addressing and display must be the one that was authenticated, or a
     /// peer can post snaps as somebody else.
+    /// The snap itself, bytes and all — what the viewer opens. `from` is
+    /// the transport's identity for the sender, which wins over the name
+    /// inside the frame for the same reason it does in `to_feed_entry`.
+    pub fn to_snap(&self, from: &str) -> crate::snaps::Snap {
+        crate::snaps::Snap {
+            id: content_id(from, &self.payload),
+            sender_id: from.to_string(),
+            sender_name: if self.sender_name.trim().is_empty() { from.to_string() }
+                         else { self.sender_name.clone() },
+            sent_at: self.sent_at,
+            media: self.media,
+            duration_secs: u32::from(self.duration_secs),
+            bytes: self.payload.clone(),
+        }
+    }
+
     pub fn to_feed_entry(&self, from: &str) -> crate::snaps::FeedEntry {
         crate::snaps::FeedEntry {
             id: content_id(from, &self.payload),

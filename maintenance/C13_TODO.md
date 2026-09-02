@@ -1445,3 +1445,39 @@ page); long-press a tab for its quick action; hold-to-preview a tile. The
 QR square is the identicon the Qt build also drew (`qr_render` says so);
 a real encoder is a separate decision, ~300 dependency-free lines if
 taken.
+
+### §36 addendum — the goodies, 2026-09-01
+
+Wired this pass (each was ported, tested, and reached from nowhere):
+- **Received snaps can be opened.** `SnapArrived` dropped the frame's bytes
+  as it built the feed entry, so no received snap could ever be viewed.
+  `Snapclone::received` holds them (48 / 96 MB, oldest first); a tap on a
+  tile opens through `open_snap_routed`, by kind.
+- **Hold on a tile opens the snap menu** (`open_snap_menu` / `apply_menu`,
+  `menu_ui` now drawn); "Conversation" is one of its entries, which is what
+  a hold used to do directly.
+- **Swipe up on the viewfinder sends** (`Composer::begin_drag/end_drag`):
+  opens the recipient picker with "Send" armed.
+- **The help manual is drawn**, with its filter and its scrolled/interacted
+  distinction (`help_interacted`, `scrolled`, `set_filter`); "help" in
+  Settings opens it; it closes itself on idle as designed.
+- `close_video` is the one close path; `ambient_snap_arrived` on arrival;
+  `Gossip::purge_stale` daily on the expiry tick; `set_talk_prominent`
+  follows the shell; Escape dismisses every modal.
+
+Still unwired, and why — decide per item, don't wire blind:
+- `face_consent::{grant,revoke}`: methods on the crop STORE, which the app
+  does not instantiate; the app holds the `Consent` enum. Wire when a
+  detector produces crops.
+- `reticle::set_state`, `video_viewer::{note_frame,note_error}`,
+  `voice_playout::note_decoder_unavailable`, `peer_session::note_sync_reply`:
+  each needs a signal the binary does not yet raise (a focus result from
+  the camera, frames/errors from a video backend, a decoder, a sync reply).
+- `prepare_send`, `publish_landmark`, `attach_photo_hashes`, `open_playlist`:
+  need the send receipt, landmark fingerprints and a thread playlist to be
+  computed somewhere first — features, not call sites.
+- `set_speed`, `set_auto_sync`, `set_mobile_display_debug`, `set_dwell_armed`,
+  `set_long_press_ms`: settings surface without a control; a settings row
+  each, when the settings page is redone (§24's "sections that fit").
+- `modal::{dismiss_layer,dismiss_topmost}`: library API; `dismiss_all` is
+  used.
