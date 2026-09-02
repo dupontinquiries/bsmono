@@ -262,6 +262,14 @@ impl App {
                 self.last_note = "could not delete playlist".into();
             }
         }
+        if let Some((track_id, playlist_id)) = self.controller.pending_add_to_playlist.take() {
+            if self.catalog.add_to_playlist(playlist_id, track_id) {
+                // track_count on the index page is now stale.
+                self.controller.playlists_page.set(self.catalog.playlists());
+            } else {
+                self.last_note = "could not add track to playlist".into();
+            }
+        }
         if let Some(id) = self.controller.last_played_track.take() {
             // Persisted through the worker (play count + history), not
             // written on this connection — see real_catalog.rs.

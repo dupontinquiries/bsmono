@@ -67,6 +67,53 @@ impl AddToPlaylist {
     }
 }
 
+/// Draws the add-to-playlist dialog when `d.is_open()`. Returns
+/// `(track_id, playlist_name)` the frame a playlist row is tapped — the
+/// same pair `d.add()` returns, so callers resolve the real playlist id
+/// out of it the same way regardless of how the dialog got its answer.
+///
+/// A floating `egui::Window` rather than inline content: this has to
+/// appear above whatever page is showing, not just above the track row
+/// that opened it, and it needs to stay open across an "add to Chill,
+/// add to Focus, add to Loud" sequence in one sitting — `add()`'s own doc
+/// on why the dialog doesn't close after one add.
+pub fn add_to_playlist_ui(ui: &mut egui::Ui, d: &mut AddToPlaylist, c: &uikit_egui::PaletteColors)
+    -> Option<(String, String)>
+{
+    let mut result = None;
+    let mut still_open = d.is_open();
+    egui::Window::new("Add to playlist")
+        .id(egui::Id::new("add_to_playlist_dialog"))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut still_open)
+        .show(ui.ctx(), |ui| {
+            ui.add(egui::TextEdit::singleline(&mut d.query)
+                .hint_text("search playlists").id_salt("add_to_playlist-query"));
+            if let Some(name) = &d.just_added {
+                ui.colored_label(c.accent, format!("added to {name}"));
+            }
+            let visible: Vec<String> = d.visible().into_iter().map(str::to_string).collect();
+            if visible.is_empty() {
+                ui.colored_label(c.text_weak,
+                    if d.playlists.is_empty() { "no playlists yet — create one first" }
+                    else { "no playlists match" });
+            }
+            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                for name in visible {
+                    if ui.button(&name).clicked() {
+                        if let Some(pair) = d.add(&name) { result = Some(pair); }
+                    }
+                }
+            });
+        });
+    // The Window's own [x] sets `still_open` false; a track picked from a
+    // list that then vanishes reads as a bug, so an explicit close is the
+    // only thing that actually clears the subject.
+    if !still_open { d.close(); }
+    result
+}
+
 // ── edit track ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -169,6 +216,65 @@ impl ScanPicker {
     }
 
     pub fn can_scan(&self) -> bool { !self.gather().is_empty() }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    fn draw(d: &mut AddToPlaylist) -> (Vec<String>, Option<(String, String)>) {
+        let ctx = egui::Context::default();
+        let c = uikit_egui::palette_colors("amber");
+        let mut result = None;
+        let run = |ctx: &egui::Context, d: &mut AddToPlaylist, result: &mut Option<(String, String)>| {
+            ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                                                            egui::vec2(500.0, 700.0))),
+                ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    *result = add_to_playlist_ui(ui, d, &c);
+                });
+            })
+        };
+        // A floating Window auto-sizes from its previous frame's content —
+        // the first pass has no prior size to lay out against, so nothing
+        // is painted yet. Two passes is the same thing a real app gets for
+        // free by simply running more than one frame.
+        run(&ctx, d, &mut result);
+        let out = run(&ctx, d, &mut result);
+        let texts = out.shapes.iter().filter_map(|s| match &s.shape {
+            egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+            _ => None,
+        }).collect();
+        (texts, result)
+    }
+
+    #[test]
+    fn closed_draws_nothing() {
+        let mut d = AddToPlaylist::default();
+        let (texts, result) = draw(&mut d);
+        assert!(texts.is_empty(), "{texts:?}");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn open_shows_the_playlists() {
+        let mut d = AddToPlaylist { playlists: vec!["Chill".into(), "Focus".into()],
+                                     ..Default::default() };
+        d.open("t1");
+        let (texts, _) = draw(&mut d);
+        let joined = texts.join(" | ");
+        assert!(joined.contains("Chill") && joined.contains("Focus"), "{joined}");
+    }
+
+    #[test]
+    fn no_playlists_says_so_rather_than_showing_an_empty_list() {
+        let mut d = AddToPlaylist::default();
+        d.open("t1");
+        let (texts, _) = draw(&mut d);
+        assert!(texts.join(" | ").contains("create one first"), "{texts:?}");
+    }
 }
 
 #[cfg(test)]

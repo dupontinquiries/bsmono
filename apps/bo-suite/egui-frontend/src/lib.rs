@@ -402,6 +402,10 @@ pub struct Controller {
     pub pending_playlist_open: Option<i64>,
     /// A playlist the host hasn't deleted yet (set by `Delete`).
     pub pending_playlist_delete: Option<i64>,
+    /// A "+" on a track was tapped and a playlist chosen in the dialog —
+    /// (track_id, playlist_id), resolved from the dialog's name-based
+    /// `add()` via `playlists_page`. Cleared by the host.
+    pub pending_add_to_playlist: Option<(i64, i64)>,
     /// The device switcher above the output controls. The sink picker itself
     /// lives in settings_page as `SinkPicker` — see outputs.rs's note.
     pub device_selector: crate::outputs::DeviceSelector,
@@ -564,6 +568,7 @@ impl Controller {
             open_playlist: None,
             pending_playlist_open: None,
             pending_playlist_delete: None,
+            pending_add_to_playlist: None,
             device_selector: Default::default(),
             pending_route: None,
             pending_playback: None,
@@ -879,6 +884,27 @@ impl Controller {
         // someone who can also see the screen: without it, nothing on the
         // display says where the voice focus is.
         self.a11y.paint_focus_ring(ui, colors.accent);
+
+        // ADD-TO-PLAYLIST, after both layout branches for the same reason
+        // the focus ring is: it has to float above whichever page is
+        // showing, not live inside library_view where the "+" button that
+        // opens it happens to sit. `add_to_playlist.open()` has been called
+        // from that button since the dialog was ported — with a full,
+        // tested model — and nothing ever drew it: `is_open()` had no
+        // reader, so the dialog "opened" into nothing appearing on screen.
+        if self.add_to_playlist.is_open() {
+            if let Some((track_id, playlist_name)) =
+                crate::dialogs::add_to_playlist_ui(ui, &mut self.add_to_playlist, &colors)
+            {
+                if let Ok(track_id) = track_id.parse::<i64>() {
+                    if let Some(playlist_id) = self.playlists_page.all().iter()
+                        .find(|p| p.name == playlist_name).map(|p| p.id)
+                    {
+                        self.pending_add_to_playlist = Some((track_id, playlist_id));
+                    }
+                }
+            }
+        }
     }
 
     fn devices_view(&mut self, ui: &mut Ui, c: &PaletteColors) {
@@ -1627,6 +1653,12 @@ impl Controller {
                         ui.colored_label(c.text_weak, t.album.as_str());
                         if ui.small_button("+").clicked() {
                             self.add_to_playlist.open(&t.id.to_string());
+                            // The dialog's model is name-based (see its own
+                            // doc); real ids are resolved back out through
+                            // playlists_page when a name is picked (see
+                            // pending_add_to_playlist).
+                            self.add_to_playlist.playlists =
+                                self.playlists_page.all().iter().map(|p| p.name.clone()).collect();
                         }
                     });
                 });
