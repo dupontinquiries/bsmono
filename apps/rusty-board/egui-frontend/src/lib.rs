@@ -537,6 +537,24 @@ fn dir8_from(d: cardinal_gesture::Direction) -> uikit_egui::slide_menu::Dir8 {
     }
 }
 
+/// The id a cardinal key's press state lives under.
+///
+/// Factored out because BOTH halves of the key need it and they must agree:
+/// `paint_key_face` peeks at the press to draw the morph, and `dispatch_key`
+/// drives the same press to resolve it. Two id expressions is one rename away
+/// from a cap that animates nothing while the gesture works fine, which is a
+/// bug with no error message.
+fn cardinal_id(ui: &Ui, key: &Key, rect: Rect) -> egui::Id {
+    ui.id().with(("keycard", &key.label, rect.min.x as i32, rect.min.y as i32))
+}
+
+/// The tap/swipe boundary, derived from the key so a phone key and a desktop
+/// key both flick at a quarter of their height. Shared by the widget, the
+/// classifier and the morph — see `dispatch_key`'s note on the interlock.
+fn key_deadzone(size: Vec2) -> f32 {
+    (size.y * 0.25).clamp(9.0, 16.0)
+}
+
 fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors, glass: bool) -> Option<String> {
     // CLICK AND DRAG. This was `Sense::click()`, which is why cardinal swipes
     // did nothing: a key that only senses clicks never sees a drag, so the
@@ -556,9 +574,50 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
     dispatch_key(ui, key, rect, size, &resp)
 }
 
+/// The glyph on the cap: the resting label, or the morph mid-swap.
+///
+/// One helper rather than the same three lines in each palette branch, because
+/// a palette chooses how a key LOOKS and never gets to decide what a gesture
+/// means — the same rule that made the cardinal path unreachable under the
+/// glass recipe once already.
+fn paint_cap_label(
+    painter: &egui::Painter,
+    rect: Rect,
+    label: &str,
+    morph: Option<(uikit_egui::slide_menu::Dir8, &str, f32)>,
+    font: FontId,
+    color: egui::Color32,
+) {
+    match morph {
+        Some((dir, incoming, progress)) => uikit_egui::slide_menu::paint_cardinal_morph(
+            painter, rect, label, incoming, dir, progress, font, color,
+        ),
+        None => {
+            painter.text(rect.center(), Align2::CENTER_CENTER, label, font, color);
+        }
+    }
+}
+
 /// The visual half of a key: glass or carved-tile, pressed/hovered/at-rest. No gesture logic.
 #[allow(clippy::too_many_arguments)]
 fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c: &PaletteColors, glass: bool, resp: &egui::Response) {
+    // What the in-flight swipe (if any) is currently arming. Peeked, not
+    // driven: `dispatch_key` still owns the press state, and it runs after
+    // this. On the first frame of a press there is nothing to peek yet and the
+    // cap paints at rest, which is one frame and not perceptible.
+    let preview = if key.cardinal.is_empty() {
+        None
+    } else {
+        uikit_egui::slide_menu::peek_cardinal(ui.ctx(), cardinal_id(ui, key, rect), key_deadzone(size))
+    };
+    // Only an ARMED direction that this key actually carries morphs the cap.
+    // A swipe toward a direction with no variant leaves the resting glyph
+    // alone rather than fading it out to nothing.
+    let morph: Option<(uikit_egui::slide_menu::Dir8, &str, f32)> = preview.and_then(|p| {
+        let d = p.active?;
+        let s = key.cardinal.iter().find(|(k, _)| *k == d).map(|(_, s)| s.as_str())?;
+        Some((d, s, p.progress))
+    });
     let painter = ui.painter();
     let pressed = resp.is_pointer_button_down_on();
     let rounding = CornerRadius::same((size.y * 0.18) as u8);
@@ -577,14 +636,14 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
             uikit_egui::paint_top_hairline(ui, rect);
         }
         let text_color = if pressed { egui::Color32::WHITE } else { c.text };
-        painter.text(rect.center(), Align2::CENTER_CENTER, &key.label, font.clone(), text_color);
+        paint_cap_label(painter, rect, &key.label, morph, font.clone(), text_color);
     } else {
         // Rest→hover→press glides (120ms) instead of snapping — the QML key ColorAnimation feel.
         let fill = uikit_egui::motion::interactive_fill(ui.ctx(), resp, c.bg_raised, c.bg_hover, c.accent);
         painter.rect_filled(rect, rounding, fill);
         painter.rect_stroke(rect, rounding, Stroke::new(1.0_f32, c.bg_base), egui::StrokeKind::Inside);
         let text_color = if pressed { c.bg_base } else { c.text };
-        painter.text(rect.center(), Align2::CENTER_CENTER, &key.label, font.clone(), text_color);
+        paint_cap_label(painter, rect, &key.label, morph, font.clone(), text_color);
     }
     // The compass hints, drawn small around the tap label so a cardinal key advertises its
     // swipes at rest (FlickBoard/MessagEase draw every direction's glyph in its corner). Only the
@@ -594,9 +653,22 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
         let hint_color = c.text.gamma_multiply(0.55);
         let inset = size.y * 0.16;
         for (d, s) in &key.cardinal {
+            // The armed direction's hint is suppressed as its glyph travels to
+            // the centre: leaving it printed shows the same letter twice on a
+            // cap this small, which reads as a rendering fault rather than as
+            // motion. The others dim, so the one in play is the only thing at
+            // full weight.
+            let (skip, dim) = match morph {
+                Some((md, _, p)) if md == *d => (p > 0.35, 1.0),
+                Some((_, _, p)) => (false, 1.0 - 0.55 * p),
+                None => (false, 1.0),
+            };
+            if skip {
+                continue;
+            }
             let off = d.offset();
             let anchor = rect.center() + Vec2::new(off.x * (rect.width() * 0.5 - inset), off.y * (rect.height() * 0.5 - inset));
-            painter.text(anchor, Align2::CENTER_CENTER, s, hint.clone(), hint_color);
+            painter.text(anchor, Align2::CENTER_CENTER, s, hint.clone(), hint_color.gamma_multiply(dim));
         }
     }
 }
@@ -609,13 +681,13 @@ fn dispatch_key(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, resp: &egui::Res
     // Cardinal-swipe key (MessagEase-style): tap emits `emit`, a swipe in a compass direction emits
     // that direction's variant. `show_cardinal` resolves tap-vs-swipe from the PRESS POINT.
     if !key.cardinal.is_empty() {
-        let id = ui.id().with(("keycard", &key.label, rect.min.x as i32, rect.min.y as i32));
+        let id = cardinal_id(ui, key, rect);
         // ONE tap/swipe boundary for the widget and the classifier. The classifier's module doc
         // calls this an interlock: if the two disagree, a movement is a tap to one and a swipe to
         // the other, and the key fires twice or not at all. Derived from the key size so a phone
         // key and a desktop key both flick at a quarter of their height (FlickBoard's default
         // swipe threshold is 8dp — short flicks are the point of this layout).
-        let deadzone = (size.y * 0.25).clamp(9.0, 16.0);
+        let deadzone = key_deadzone(size);
         let thresholds = cardinal_gesture::CardinalThresholds::default()
             .scaled(deadzone as f64 / cardinal_gesture::CardinalThresholds::default().tap_max_excursion_px);
         // Steno keys (L1/L2/R1/R2): the tap/direction resolution is identical to a normal cardinal
@@ -690,6 +762,15 @@ fn dispatch_key(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, resp: &egui::Res
         }
         let mut menu = uikit_egui::slide_menu::SlideMenu::new(id).item_size((size.y * 0.9).clamp(36.0, 52.0));
         menu.deadzone = deadzone;
+        // NO FLOATING COMPASS. The keycap draws the gesture itself (see
+        // `paint_key_face`), and the popup was doing three unhelpful things at
+        // once: covering the neighbouring keys, printing the eight options a
+        // second time when the cap already prints them at rest, and rendering
+        // the tap glyph in its most prominent cell — directly under the finger
+        // hiding it. `show_cardinal` still owns resolution; only its chrome is
+        // off. voiceterm's action compass keeps the popup, because a terminal
+        // grid has no cap to substitute into.
+        menu.cardinal_compass = false;
         // ALWAYS shown, even on a frame the classifier claimed: this is what closes the widget's
         // press state. Returning early before this call left the compass open with a stale origin.
         let outcome = menu.show_cardinal(ui, id, resp, &tap, &dirs);
