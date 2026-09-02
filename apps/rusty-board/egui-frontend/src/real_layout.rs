@@ -118,6 +118,13 @@ fn action_emit(action: &KeyAction, text: &str) -> String {
     }
 }
 
+/// The render-layer token for the Voice action, for layouts built in code (the cardinal
+/// boards) that want a mic key without a `KeyAction`. Same bytes `action_emit` produces for
+/// `KeyAction::Voice`, so `classify` reads both identically — asserted in a test.
+pub fn voice_emit() -> String {
+    action_emit(&KeyAction::Voice, "")
+}
+
 /// Turn a `keyboard_ui` emission back into a typed [`Press`].
 pub fn classify(emit: &str) -> Press {
     if let Some((button, gesture)) = crate::decode_steno_token(emit) {
@@ -286,9 +293,24 @@ pub struct RealBoard {
 }
 
 impl RealBoard {
-    /// A board over the shipped layouts, starting on the first (QWERTY).
+    /// A board over the shipped layouts, starting on the first (QWERTY), plus the two
+    /// experimental boards the GTK build ships from code: its cardinal grid (the reference
+    /// implementation of the 11-gesture keys — `KeyGestures` with cw/ccw digits) and the
+    /// stenotype. Neither was reachable from the sidebar before, so the steno engine — mounted,
+    /// tested, 24 tests — had never had a key stroked into it, and the GTK cardinal layout could
+    /// not be compared against the code-built `cardinal`/`cardinal8` demo boards.
     pub fn new() -> RealBoard {
-        RealBoard { files: builtin(), active: 0, shift: Shift::Off, before_symbols: None }
+        let mut files = builtin();
+        files.push(board_layouts::Layout::default_cardinal_grid());
+        files.push(board_layouts::Layout::default_stenotype());
+        RealBoard { files, active: 0, shift: Shift::Off, before_symbols: None }
+    }
+
+    /// Indices into `files` that get a sidebar tab (everything but the symbols page, which is
+    /// reached through the ?123 key). The sidebar maps tab position ↔ file through this rather
+    /// than assuming `qwerty=0, dvorak=1`, which stopped being the whole list.
+    pub fn tab_files(&self) -> Vec<usize> {
+        self.files.iter().enumerate().filter(|(_, f)| f.name != "symbols").map(|(i, _)| i).collect()
     }
 
     pub fn with_files(files: Vec<LayoutFile>) -> RealBoard {
@@ -571,5 +593,29 @@ mod tests {
             let value = crate::steno_token("L1", code);
             assert_eq!(classify(&value), Press::Steno("L1".to_string(), code.to_string()));
         }
+    }
+
+    #[test]
+    fn voice_emit_classifies_as_voice_like_the_real_layout_action() {
+        assert_eq!(classify(&voice_emit()), Press::Voice);
+        assert_eq!(voice_emit(), action_emit(&KeyAction::Voice, "🎤"));
+    }
+
+    #[test]
+    fn the_real_board_reaches_the_cardinal_grid_and_the_stenotype() {
+        let b = RealBoard::new();
+        let tabs = b.tab_files();
+        assert_eq!(tabs.len(), 4, "qwerty, dvorak, cardinal grid, stenotype — symbols has no tab");
+        assert!(tabs.iter().all(|&i| b.files[i].name != "symbols"));
+        // the GTK cardinal grid renders with gestures AND rotation digits (the reference)
+        let cg = b.files.iter().find(|f| f.name == "cardinal_grid_en").expect("cardinal grid present");
+        let r = to_render(cg, Shift::Off);
+        let a = r.rows.iter().flat_map(|r| &r.keys).find(|k| k.emit == "a").expect("the `a` cell");
+        assert!(a.cardinal.len() >= 4, "{:?}", a.cardinal);
+        assert_eq!(a.rotate_cw.as_deref(), Some("1"));
+        // the stenotype renders with steno buttons, so a stroke reaches the engine
+        let st = b.files.iter().find(|f| f.name == "stenotype").expect("stenotype present");
+        let r = to_render(st, Shift::Off);
+        assert!(r.rows.iter().flat_map(|r| &r.keys).any(|k| k.steno_button.is_some()));
     }
 }

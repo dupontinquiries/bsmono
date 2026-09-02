@@ -6,5 +6,8 @@
 //! Run:  cargo run --bin rusty-board-egui --features app   (from apps/rusty-board/egui-frontend)
 
 fn main() -> eframe::Result<()> {
+    // FIRST, before eframe/winit touch Wayland: KWin hands the input-method socket over as
+    // WAYLAND_SOCKET, and a toolkit that sees it connects to the wrong socket for rendering.
+    rusty_board_egui::platform::capture_inherited_socket();
     rusty_board_egui::demo_app::run("rusty-board")
 }

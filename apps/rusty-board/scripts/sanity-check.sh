@@ -62,7 +62,7 @@ if [[ -n "${BINARY_PATH:-}" && -x "$BINARY_PATH" ]]; then
 fi
 if [[ -z "${BINARY_PATH:-}" ]]; then
     fail "No rusty-board binary found in /usr/local/bin or ~/.local/bin"
-    echo "    Try: cargo b --release && sudo install -m755 target/release/rusty-board /usr/local/bin/"
+    echo "    Try: ./scripts/redeploy.sh   (builds the egui v2 frontend and installs it as rusty-board)"
 fi
 echo
 

@@ -145,6 +145,75 @@ fi
 # Both calls are best-effort — if KWin isn't running or dbus isn't
 # reachable, we just continue (the changes still got written to
 # the config file and will take effect on next session start).
+# ---- 3b. KWin window rule for the egui (v2) keyboard ---------
+# The GTK build docks itself with gtk4-layer-shell. The egui build runs
+# on eframe/winit, which can only make an ordinary toplevel — so the
+# three things a keyboard window needs (never take focus, stay above,
+# sit at the bottom edge) come from a KWin rule matched on its app id
+# instead. Without the rule, clicking a key focuses the keyboard window
+# and the virtual-keyboard protocol types into the keyboard itself.
+#
+# Written with kwriteconfig6 into ~/.config/kwinrulesrc, keyed by a
+# stable rule id so re-running replaces rather than duplicates. The
+# position/size are forced from the primary output's geometry when
+# kscreen-doctor can report it (logical pixels, which is what rules
+# use); otherwise the rule still applies focus/above/border and the
+# window lands wherever KWin puts it.
+RULE_ID="rusty-board-egui-keyboard"
+APP_ID="org.rustyboard.RustyBoard"    # must equal demo_app::APP_ID
+KB_HEIGHT="${RUSTY_BOARD_HEIGHT:-340}"
+KWINRULES="${XDG_CONFIG_HOME:-$HOME/.config}/kwinrulesrc"
+write_kwin_rule() {
+    local kw
+    if command -v kwriteconfig6 >/dev/null 2>&1; then kw=kwriteconfig6
+    elif command -v kwriteconfig5 >/dev/null 2>&1; then kw=kwriteconfig5
+    else
+        echo "NOTE: no kwriteconfig; skipping the KWin window rule."
+        echo "      Add one by hand in SystemSettings → Window Management → Window Rules:"
+        echo "      match window class '$APP_ID' exactly; force: accept focus = no,"
+        echo "      keep above = yes, no titlebar = yes, skip taskbar/switcher/pager = yes."
+        return 0
+    fi
+    echo "==> Writing KWin window rule '$RULE_ID' for $APP_ID ($KWINRULES)"
+    local g="--file $KWINRULES --group $RULE_ID --key"
+    $kw $g Description "RustyBoard on-screen keyboard (egui): no focus, on top, bottom edge"
+    $kw $g wmclass "$APP_ID"
+    $kw $g wmclassmatch 1          # exact
+    $kw $g wmclasscomplete false
+    $kw $g acceptfocus false;      $kw $g acceptfocusrule 2       # 2 = force
+    $kw $g above true;             $kw $g aboverule 2
+    $kw $g noborder true;          $kw $g noborderrule 2
+    $kw $g skiptaskbar true;       $kw $g skiptaskbarrule 2
+    $kw $g skipswitcher true;      $kw $g skipswitcherrule 2
+    $kw $g skippager true;         $kw $g skippagerrule 2
+    $kw $g types 1                 # normal windows only
+    # Geometry from the primary output, if we can read it. kscreen-doctor
+    # prints e.g. "Geometry: 0,0 1080x2340" per output.
+    local geo
+    geo=$(kscreen-doctor -o 2>/dev/null | grep -m1 -oE 'Geometry: [0-9]+,[0-9]+ [0-9]+x[0-9]+' || true)
+    if [[ -n "$geo" ]]; then
+        local ox oy ow oh
+        read -r ox oy ow oh < <(echo "$geo" | sed -E 's/Geometry: ([0-9]+),([0-9]+) ([0-9]+)x([0-9]+)/\1 \2 \3 \4/')
+        $kw $g position "$ox,$(( oy + oh - KB_HEIGHT ))"; $kw $g positionrule 2
+        $kw $g size "${ow}x${KB_HEIGHT}";                 $kw $g sizerule 2
+        echo "    forced geometry ${ow}x${KB_HEIGHT} at $ox,$(( oy + oh - KB_HEIGHT )) (output ${ow}x${oh})"
+    else
+        echo "    (kscreen-doctor unavailable — rule written without a forced position/size)"
+    fi
+    # Register the rule id in [General] rules= (a comma-separated list) if absent.
+    local kr rules
+    kr=${kw/kwrite/kread}
+    rules=$($kr --file "$KWINRULES" --group General --key rules 2>/dev/null || true)
+    case ",$rules," in
+        *",$RULE_ID,"*) ;;
+        *)  if [[ -n "$rules" ]]; then rules="$rules,$RULE_ID"; else rules="$RULE_ID"; fi
+            $kw --file "$KWINRULES" --group General --key rules "$rules"
+            $kw --file "$KWINRULES" --group General --key count "$(echo "$rules" | tr ',' '\n' | grep -c .)"
+            ;;
+    esac
+}
+write_kwin_rule
+
 echo "==> Telling KWin to reconfigure"
 if command -v qdbus6 >/dev/null 2>&1; then
     qdbus6 org.kde.KWin /KWin reconfigure 2>/dev/null || true

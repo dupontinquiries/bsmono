@@ -35,6 +35,15 @@ pub trait VirtualKeyboard {
 
     /// Human-readable backend name for diagnostics.
     fn backend_name(&self) -> &'static str;
+
+    /// Process pending compositor events, if this backend has any to
+    /// process. Hosts without a GLib loop (the egui build) call this once
+    /// per frame; it is what delivers Activate/Deactivate to the
+    /// focus callback. Non-blocking. The X11 and no-op backends have
+    /// nothing to pump, hence the default.
+    fn pump(&self) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 /// Which backend strategy is in use. Picked at startup.
@@ -135,6 +144,13 @@ impl WaylandVirtualKeyboard {
 
 #[cfg(feature = "wayland")]
 impl VirtualKeyboard for WaylandVirtualKeyboard {
+    fn pump(&self) -> Result<usize> {
+        match &self.backend {
+            Some(b) => b.pump(),
+            None => Ok(0),
+        }
+    }
+
     fn commit_text(&self, text: &str) -> Result<()> {
         match &self.backend {
             Some(b) => b.commit_text(text),

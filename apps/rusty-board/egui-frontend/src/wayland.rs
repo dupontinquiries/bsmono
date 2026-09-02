@@ -29,18 +29,17 @@
 //! per-seat-singleton concern it raises is about not fragmenting one
 //! toolkit's OWN two connections, not about separate processes).
 //!
-//! ## Why this crate has to pump GLib itself
+//! ## Why `pump()` is a frame-loop call, not a thread or a GLib timer
 //!
-//! `wayland_backend.rs` dispatches its event queue from a
-//! self-rescheduling `glib::timeout_add_local_once` (see
-//! `install_glib_dispatcher`'s doc — adaptive polling, not an fd-watch).
-//! That only fires if something is actually iterating the thread-default
-//! `glib::MainContext`. A GTK app gets that for free from its own main
-//! loop; an eframe/winit app has no GLib loop running at all. So
-//! `pump()` below calls `glib::MainContext::default().iteration(false)`
-//! once per frame from `demo_app`'s `update()` — the non-blocking
-//! (`false`) form so it never stalls the render loop waiting for a wl
-//! event that may never come.
+//! `wayland_backend` used to dispatch its event queue from a
+//! self-rescheduling `glib::timeout_add_local_once`, which meant an
+//! eframe app had to iterate a GLib `MainContext` every frame to make it
+//! fire — and had to link `glib` to do so. The backend now exposes
+//! `pump()` (read-if-readable, dispatch, flush — non-blocking) and the
+//! GTK app's GLib timer is one caller of it among others. This module
+//! calls it once per frame from `demo_app`'s `update()`; the same call
+//! is what a layer-shell loop would make after each poll. No toolkit
+//! inside.
 //!
 //! ## What this does NOT do
 //!
@@ -64,10 +63,13 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
+use board_compositor::virtual_keyboard::{VirtualKeyboard, WaylandVirtualKeyboard};
+use board_compositor::wayland_backend::{self, InputMethodActiveCallback, SurroundingTextCallback};
+
 /// Owns the real Wayland input-method backend and the focus flag it
 /// drives. One instance lives for the app's lifetime.
 pub struct WaylandIntegration {
-    pub(crate) vk: Box<dyn rusty_board::compositor::virtual_keyboard::VirtualKeyboard>,
+    pub(crate) vk: Box<dyn VirtualKeyboard>,
     visible: Rc<Cell<bool>>,
 }
 
@@ -79,21 +81,27 @@ impl WaylandIntegration {
     /// failure modes matters for a human reading logs, not for the
     /// caller's control flow.
     pub fn try_new() -> Result<Self, String> {
-        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-            return Err("$WAYLAND_DISPLAY not set".to_string());
+        // KWin launches its virtual keyboard with the privileged socket in
+        // WAYLAND_SOCKET (captured into im_socket by the binary's main);
+        // that is a Wayland session with no WAYLAND_DISPLAY needed for
+        // the input-method side, so the gate is "either".
+        if std::env::var_os("WAYLAND_DISPLAY").is_none()
+            && !board_compositor::im_socket::has_inherited_fd()
+        {
+            return Err("neither $WAYLAND_DISPLAY nor an inherited WAYLAND_SOCKET".to_string());
         }
         let visible = Rc::new(Cell::new(false));
         let visible_for_cb = visible.clone();
-        let im_callback: rusty_board::compositor::wayland_backend::InputMethodActiveCallback =
+        let im_callback: InputMethodActiveCallback =
             Rc::new(move |active| visible_for_cb.set(active));
         // Surrounding-text isn't consumed by anything in this port yet
         // (no Synonym/Rewrite-style feature reaching for editor context
         // the way the GTK build's does) — an intentionally empty sink,
         // not a placeholder for something broken.
-        let surrounding_text_callback: rusty_board::compositor::wayland_backend::SurroundingTextCallback =
+        let surrounding_text_callback: SurroundingTextCallback =
             Rc::new(|_text: String, _cursor: u32, _anchor: u32| {});
 
-        let backend = rusty_board::compositor::wayland_backend::try_new_standalone(
+        let backend = wayland_backend::try_new_standalone(
             im_callback,
             surrounding_text_callback,
         )
@@ -103,20 +111,20 @@ impl WaylandIntegration {
         })?;
 
         Ok(Self {
-            vk: Box::new(
-                rusty_board::compositor::virtual_keyboard::WaylandVirtualKeyboard::with_backend(
-                    backend,
-                ),
-            ),
+            vk: Box::new(WaylandVirtualKeyboard::with_backend(backend)),
             visible,
         })
     }
 
-    /// Call once per frame. Non-blocking: drives whatever GLib timeout
-    /// sources are due (the wl dispatcher's adaptive poll) and returns
-    /// immediately either way.
+    /// Call once per frame. Non-blocking: reads what the compositor has
+    /// sent, dispatches it (Activate/Deactivate land in `visible` from
+    /// here), flushes, and returns. A dead connection is logged once per
+    /// frame rather than panicking — the keyboard degrades to a preview
+    /// that says so in its status line, which beats a crash mid-typing.
     pub fn pump(&self) {
-        while glib::MainContext::default().iteration(false) {}
+        if let Err(e) = self.vk.pump() {
+            tracing::warn!("wayland pump: {e}");
+        }
     }
 
     /// Whether the compositor currently has a text field focused —

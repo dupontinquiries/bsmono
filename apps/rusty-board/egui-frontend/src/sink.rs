@@ -16,7 +16,7 @@
 //!
 //! ## What was already there
 //!
-//! Nearly everything. `rusty_board::compositor::virtual_keyboard` has a
+//! Nearly everything. `board_compositor::virtual_keyboard` has a
 //! `VirtualKeyboard` trait with `commit_text` / `press_keysym`, backend
 //! DETECTION (`detect()`), and a Wayland implementation speaking
 //! `zwp_input_method_v2` / `zwp_virtual_keyboard_v1`. The egui front-end
