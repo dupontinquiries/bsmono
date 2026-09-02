@@ -82,9 +82,14 @@ fn shifted_sse_bounded(prev: &Frame, next: &Frame, x: u32, y: u32, size: u32, sc
 /// exact low-resolution mirror of what the merge stage will produce. Returns
 /// the plan and the reconstructed next frame to use as `prev_working` for
 /// the following transition.
+/// `older` are further references (low-res reconstructions), most useful
+/// first; a block nothing in `prev_working` explains is tried at the same
+/// position in each before being declared missing. One bounded SSE per
+/// reference per missing block, so a deep ring is cheap.
 pub fn analyze(
     prev_working: &mut Frame,
     next: &Frame,
+    older: &[&Frame],
     reference: &dyn ReferenceMaker,
     matcher: &dyn BlockMatcher,
     cfg: &AnalyzeConfig,
@@ -139,10 +144,17 @@ pub fn analyze(
             if block_sse_bounded(next, x, y, prev_ro, x, y, bs, limit).is_some() {
                 return BlockMatch::Stationary;
             }
-            match matcher.search(prev_ro, next, x, y, bs, limit) {
-                Some(c) if c.sse <= limit => BlockMatch::Moved { src_x: c.src_x, src_y: c.src_y },
-                _ => BlockMatch::Missing,
+            if let Some(c) = matcher.search(prev_ro, next, x, y, bs, limit) {
+                if c.sse <= limit {
+                    return BlockMatch::Moved { src_x: c.src_x, src_y: c.src_y };
+                }
             }
+            for (r, old) in older.iter().enumerate().take(255) {
+                if (old.width, old.height) == (next.width, next.height) && block_sse_bounded(next, x, y, old, x, y, bs, limit).is_some() {
+                    return BlockMatch::Recalled { r: r as u8 };
+                }
+            }
+            BlockMatch::Missing
         })
         .collect();
 
@@ -151,6 +163,7 @@ pub fn analyze(
         match m {
             BlockMatch::Stationary => stats.stationary += 1,
             BlockMatch::Moved { .. } => stats.moved += 1,
+            BlockMatch::Recalled { .. } => stats.recalled += 1,
             BlockMatch::Missing => stats.missing += 1,
         }
     }
@@ -159,9 +172,9 @@ pub fn analyze(
     // of the frame's pixels. Counted in pixels, not blocks: with bleed the
     // residual cells are bigger than blocks, so a mostly-missing frame packs
     // into something *larger* than the frame itself.
-    let dim = FramePlan::residual_dim_for(stats.missing as usize);
+    let (cols, rows) = FramePlan::residual_dims_for(stats.missing as usize);
     let cell = (cfg.block_size + 2 * cfg.bleed) as f64;
-    let residual_px = (dim as f64 * cell).powi(2);
+    let residual_px = (cols as f64 * cell) * (rows as f64 * cell);
     let frame_px = (grid.width() as f64) * (grid.height() as f64);
     if residual_px >= cfg.redraw_fraction * frame_px {
         // Undo the fades: the redraw output is the original next frame, and
@@ -180,11 +193,12 @@ pub fn analyze(
     for (i, m) in matches.iter().enumerate() {
         if *m == BlockMatch::Missing {
             let (x, y) = grid.origin(i);
-            residuals.push(ResidualVector { frame_x: x, frame_y: y, cell_x: k % dim, cell_y: k / dim });
+            residuals.push(ResidualVector { frame_x: x, frame_y: y, cell_x: k % cols, cell_y: k / cols });
             k += 1;
         }
     }
-    stats.residual_dim = dim;
+    stats.residual_cols = cols;
+    stats.residual_rows = rows;
 
     // --- low-res reconstruction of next: matched blocks come from prev.
     let mut working_next = next.clone();
@@ -193,6 +207,7 @@ pub fn analyze(
         match *m {
             BlockMatch::Stationary => working_next.copy_block(prev_working, bs, x, y, x, y),
             BlockMatch::Moved { src_x, src_y } => working_next.copy_block(prev_working, bs, src_x, src_y, x, y),
+            BlockMatch::Recalled { r } => working_next.copy_block(older[r as usize], bs, x, y, x, y),
             BlockMatch::Missing => {}
         }
     }
@@ -226,7 +241,7 @@ mod tests {
     fn identical_frames_are_all_stationary() {
         let prev = smooth(64, 48, 0);
         let mut w = prev.clone();
-        let (plan, next_w) = analyze(&mut w, &prev, &JpegReference { quality: 97 }, &Stationary, &cfg()).unwrap();
+        let (plan, next_w) = analyze(&mut w, &prev, &[], &JpegReference { quality: 97 }, &Stationary, &cfg()).unwrap();
         assert!(!plan.redraw);
         assert_eq!(plan.stats.stationary, plan.grid.len() as u32);
         assert!(plan.residuals.is_empty());
@@ -241,7 +256,7 @@ mod tests {
             *b = (i * 31 % 251) as u8;
         }
         let mut w = prev.clone();
-        let (plan, next_w) = analyze(&mut w, &next, &JpegReference { quality: 97 }, &Stationary, &cfg()).unwrap();
+        let (plan, next_w) = analyze(&mut w, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg()).unwrap();
         assert!(plan.redraw);
         assert_eq!(next_w, next);
         assert_eq!(w, prev, "redraw must leave prev untouched");
@@ -258,12 +273,12 @@ mod tests {
             }
         }
         let mut w = prev.clone();
-        let (plan, next_w) = analyze(&mut w, &next, &JpegReference { quality: 97 }, &Stationary, &cfg()).unwrap();
+        let (plan, next_w) = analyze(&mut w, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg()).unwrap();
         assert!(!plan.redraw);
         assert_eq!(plan.stats.missing, 1);
         assert_eq!(plan.residuals.len(), 1);
         assert_eq!((plan.residuals[0].frame_x, plan.residuals[0].frame_y), (32, 16));
-        assert_eq!(plan.stats.residual_dim, 1);
+        assert_eq!((plan.stats.residual_cols, plan.stats.residual_rows), (1, 1));
         // Reconstruction: missing block is next's, everything else prev's.
         assert_eq!(next_w.crop(32, 16, 16, 16), next.crop(32, 16, 16, 16));
         assert_eq!(next_w.crop(0, 0, 16, 16), prev.crop(0, 0, 16, 16));
@@ -276,7 +291,7 @@ mod tests {
         // Brighten one block by a flat +20 (values stay in range for this texture).
         next.add_scalar_block(0, 0, 16, 20);
         let mut w = prev.clone();
-        let (plan, next_w) = analyze(&mut w, &next, &JpegReference { quality: 97 }, &Stationary, &cfg()).unwrap();
+        let (plan, next_w) = analyze(&mut w, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg()).unwrap();
         assert_eq!(plan.stats.missing, 0, "fade should be absorbed, got {:?}", plan.stats);
         assert_eq!(plan.fades.len(), 1);
         assert_eq!(plan.fades[0].scalar, 20);
@@ -292,12 +307,43 @@ mod tests {
         let moved = prev.crop(44, 50, 16, 16);
         next.copy_block(&moved, 16, 0, 0, 48, 48);
         let mut w = prev.clone();
-        let (plan, _) = analyze(&mut w, &next, &JpegReference { quality: 97 }, &Diamond::default(), &cfg()).unwrap();
+        let (plan, _) = analyze(&mut w, &next, &[], &JpegReference { quality: 97 }, &Diamond::default(), &cfg()).unwrap();
         let cell = (48 / 16) + (48 / 16) * plan.grid.cols;
         assert!(
             matches!(plan.matches[cell as usize], BlockMatch::Moved { src_x: 44, src_y: 50 }),
             "got {:?}",
             plan.matches[cell as usize]
         );
+    }
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::*;
+    use crate::gate::JpegReference;
+    use crate::matcher::Stationary;
+    use crate::testimg::smooth;
+
+    /// A block occluded for one frame and revealed again is recalled from
+    /// the older reference instead of going to the CNN.
+    #[test]
+    fn occluded_block_is_recalled_from_older_reference() {
+        let cfg = AnalyzeConfig { block_size: 16, bleed: 1, ..Default::default() };
+        let base = smooth(64, 64, 4);
+        let mut occluded = base.clone();
+        for y in 16..32 {
+            for x in 16..32 {
+                occluded.set_px(x, y, [250, 250, 250]);
+            }
+        }
+        // frame 0 = base, frame 1 = occluded, frame 2 = base again.
+        let older = base.clone();
+        let mut prev = occluded.clone();
+        let (plan, next_w) = analyze(&mut prev, &base, &[&older], &JpegReference { quality: 97 }, &Stationary, &cfg).unwrap();
+        assert_eq!(plan.stats.missing, 0, "{:?}", plan.stats);
+        assert_eq!(plan.stats.recalled, 1);
+        let cell = 1 + plan.grid.cols as usize;
+        assert!(matches!(plan.matches[cell], BlockMatch::Recalled { r: 0 }));
+        assert_eq!(next_w, base);
     }
 }

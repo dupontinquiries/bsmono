@@ -54,6 +54,15 @@ struct Common {
     /// Stop after N frames (settings trials).
     #[arg(long, default_value_t = 0)]
     frames: u64,
+    /// Recent outputs kept as extra references (occlusions, flicker).
+    #[arg(long, default_value_t = 3)]
+    refs: usize,
+    /// Shot-start outputs retained as references (cut-backs). ~25 MB each at 4K.
+    #[arg(long, default_value_t = 4)]
+    keyframe_refs: usize,
+    /// Frames whose residuals share one GPU call.
+    #[arg(long, default_value_t = 4)]
+    batch: usize,
 }
 
 #[derive(Subcommand)]
@@ -128,6 +137,10 @@ fn job_from(common: &Common, input: PathBuf, output: PathBuf) -> anyhow::Result<
     j.pipeline.quality = common.quality;
     j.pipeline.noise = common.noise;
     j.pipeline.matcher = parse_matcher(&common.matcher)?;
+    j.pipeline.recent_refs = common.refs;
+    j.pipeline.keyframe_refs = common.keyframe_refs;
+    j.pipeline.batch = common.batch;
+    j.pipeline.queue_depth = common.batch.max(2) * 2;
     Ok(j)
 }
 
@@ -140,14 +153,15 @@ fn print_event(e: &Event) {
         Event::FrameDone { index, stats, analyze_time, upscale_time, merge_time } => {
             let kind = if stats.redraw { "REDRAW" } else { "" };
             eprintln!(
-                "frame {index:6}  psnr {:5.1}  stat {:4} mov {:4} miss {:4} fade {:3}  residual {}x{} {kind}  A {:5.1}ms U {:7.1}ms M {:5.1}ms",
+                "frame {index:6}  psnr {:5.1}  stat {:4} mov {:4} rec {:3} miss {:4} fade {:3}  residual {}x{} {kind}  A {:5.1}ms U {:7.1}ms M {:5.1}ms",
                 stats.psnr,
                 stats.stationary,
                 stats.moved,
+                stats.recalled,
                 stats.missing,
                 stats.fades,
-                stats.residual_dim,
-                stats.residual_dim,
+                stats.residual_cols,
+                stats.residual_rows,
                 analyze_time.as_secs_f64() * 1e3,
                 upscale_time.as_secs_f64() * 1e3,
                 merge_time.as_secs_f64() * 1e3
@@ -190,7 +204,7 @@ fn main() -> anyhow::Result<()> {
             let (source, _) = job::open_source(&job)?;
             let bleed = job.pipeline.analyze.bleed;
             let summary = d2x_core::pipeline::analyze_only(source, job.pipeline, |i, s, frac, t| {
-                eprintln!("frame {i:6}  psnr {:5.1}  stat {:4} mov {:4} miss {:4} fade {:3}  upscaled {:5.1}%{}  {:.1}ms", s.psnr, s.stationary, s.moved, s.missing, s.fades, frac * 100.0, if s.redraw { " REDRAW" } else { "" }, t.as_secs_f64() * 1e3);
+                eprintln!("frame {i:6}  psnr {:5.1}  stat {:4} mov {:4} rec {:3} miss {:4} fade {:3}  upscaled {:5.1}%{}  {:.1}ms", s.psnr, s.stationary, s.moved, s.recalled, s.missing, s.fades, frac * 100.0, if s.redraw { " REDRAW" } else { "" }, t.as_secs_f64() * 1e3);
             })?;
             let _ = bleed;
             eprintln!("{} frames, {:.1}% of pixels would go through the network ({:.1}x fewer than full upscaling)", summary.frames, summary.upscaled_pixel_fraction * 100.0, 1.0 / summary.upscaled_pixel_fraction.max(1e-9));

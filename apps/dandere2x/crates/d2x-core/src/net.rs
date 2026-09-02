@@ -651,6 +651,9 @@ pub struct CpuNet {
 }
 
 impl crate::upscale::Upscaler for CpuNet {
+    fn as_dyn(&mut self) -> &mut dyn crate::upscale::Upscaler {
+        self
+    }
     fn scale(&self) -> u32 {
         self.net.scale
     }

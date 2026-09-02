@@ -18,6 +18,7 @@
 //! Video I/O (ffmpeg), the wgpu backend, and any UI live in other crates and
 //! only ever see these traits.
 
+pub mod batch;
 pub mod frame;
 pub mod gate;
 pub mod matcher;

@@ -39,14 +39,14 @@ pub fn make_residual(next_original: &Frame, plan: &FramePlan, bleed: u32) -> Res
     }
     let bs = plan.grid.block_size;
     let cell = bs + 2 * bleed;
-    let dim = plan.stats.residual_dim;
-    debug_assert_eq!(dim, FramePlan::residual_dim_for(plan.residuals.len()));
+    let (cols, rows) = (plan.stats.residual_cols, plan.stats.residual_rows);
+    debug_assert_eq!((cols, rows), FramePlan::residual_dims_for(plan.residuals.len()));
 
     // Black beyond the frame edge, as upstream. (Replicate would arguably be
     // kinder to the CNN, but the merge never reads the bleed ring back, so
     // it only affects the ring's influence on the block — keep parity.)
     let padded = next_original.padded(bleed, Pad::Black);
-    let mut out = Frame::new(dim * cell, dim * cell);
+    let mut out = Frame::new(cols * cell, rows * cell);
     for rv in &plan.residuals {
         // In padded coordinates the block starts at (frame_x + bleed); the
         // cell we want starts `bleed` before that, i.e. at (frame_x, frame_y).
@@ -56,8 +56,9 @@ pub fn make_residual(next_original: &Frame, plan: &FramePlan, bleed: u32) -> Res
 }
 
 /// Build the upscaled next frame from the upscaled previous frame, the
+/// older upscaled references (same order as given to `analyze`), the
 /// upscaled residual, and the plan. `scale` is the upscaler's factor.
-pub fn merge(prev_up: &Frame, residual_up: Option<&Frame>, plan: &FramePlan, scale: u32, bleed: u32) -> anyhow::Result<Frame> {
+pub fn merge(prev_up: &Frame, older_up: &[&Frame], residual_up: Option<&Frame>, plan: &FramePlan, scale: u32, bleed: u32) -> anyhow::Result<Frame> {
     let bs = plan.grid.block_size;
     let s = scale;
     anyhow::ensure!(
@@ -87,9 +88,15 @@ pub fn merge(prev_up: &Frame, residual_up: Option<&Frame>, plan: &FramePlan, sca
     //    already in place, so only Moved and Missing blocks need work.
     let mut out = faded.clone();
     for (i, m) in plan.matches.iter().enumerate() {
-        if let BlockMatch::Moved { src_x, src_y } = *m {
-            let (x, y) = plan.grid.origin(i);
-            out.copy_block(&faded, bs * s, src_x * s, src_y * s, x * s, y * s);
+        let (x, y) = plan.grid.origin(i);
+        match *m {
+            BlockMatch::Moved { src_x, src_y } => out.copy_block(&faded, bs * s, src_x * s, src_y * s, x * s, y * s),
+            BlockMatch::Recalled { r } => {
+                let old = older_up.get(r as usize).ok_or_else(|| anyhow::anyhow!("merge: plan recalls reference {r} but only {} were given", older_up.len()))?;
+                anyhow::ensure!((old.width, old.height) == (prev_up.width, prev_up.height), "merge: reference {r} size mismatch");
+                out.copy_block(old, bs * s, x * s, y * s, x * s, y * s);
+            }
+            _ => {}
         }
     }
 
@@ -97,13 +104,14 @@ pub fn merge(prev_up: &Frame, residual_up: Option<&Frame>, plan: &FramePlan, sca
     if !plan.residuals.is_empty() {
         let r = residual_up.ok_or_else(|| anyhow::anyhow!("merge: plan has residuals but no upscaled residual"))?;
         let cell = bs + 2 * bleed;
-        let dim = plan.stats.residual_dim;
+        let (cols, rows) = (plan.stats.residual_cols, plan.stats.residual_rows);
         anyhow::ensure!(
-            r.width == dim * cell * s && r.height == dim * cell * s,
-            "merge: residual_up {}x{} does not match {} cells of {} at scale {}",
+            r.width == cols * cell * s && r.height == rows * cell * s,
+            "merge: residual_up {}x{} does not match {}x{} cells of {} at scale {}",
             r.width,
             r.height,
-            dim,
+            cols,
+            rows,
             cell,
             s
         );
@@ -140,10 +148,10 @@ mod tests {
         // The previous *output* predates this frame's fades — as in the pipeline.
         let prev_up = up.upscale(prev).unwrap();
         let mut w = prev.clone();
-        let (plan, working_next) = analyze(&mut w, next, &JpegReference { quality: 97 }, matcher, &cfg).unwrap();
+        let (plan, working_next) = analyze(&mut w, next, &[], &JpegReference { quality: 97 }, matcher, &cfg).unwrap();
         let res = make_residual(next, &plan, bleed);
         let res_up = res.frame().map(|f| up.upscale(f).unwrap());
-        let merged = merge(&prev_up, res_up.as_ref(), &plan, scale, bleed).unwrap();
+        let merged = merge(&prev_up, &[], res_up.as_ref(), &plan, scale, bleed).unwrap();
         let expect = up.upscale(&working_next).unwrap();
         assert_eq!(merged, expect, "roundtrip mismatch (bleed {bleed}, scale {scale}, stats {:?})", plan.stats);
     }
@@ -195,14 +203,38 @@ mod tests {
         roundtrip(&prev, &next, 1, 2, &Stationary);
     }
 
+    /// Recalled blocks round-trip exactly through merge with a reference ring.
+    #[test]
+    fn recalled_blocks_roundtrip() {
+        let cfg = AnalyzeConfig { block_size: 16, bleed: 1, ..Default::default() };
+        let mut up = NearestUpscaler { scale: 2 };
+        let base = smooth(64, 64, 4);
+        let mut occluded = base.clone();
+        for y in 16..48 {
+            for x in 32..48 {
+                occluded.set_px(x, y, [250, 250, 250]);
+            }
+        }
+        let older_lo = base.clone();
+        let older_hi = up.upscale(&older_lo).unwrap();
+        let prev_up = up.upscale(&occluded).unwrap();
+        let mut w = occluded.clone();
+        let (plan, working_next) = analyze(&mut w, &base, &[&older_lo], &JpegReference { quality: 97 }, &Stationary, &cfg).unwrap();
+        assert_eq!(plan.stats.recalled, 2);
+        let res = make_residual(&base, &plan, 1);
+        let res_up = res.frame().map(|f| up.upscale(f).unwrap());
+        let merged = merge(&prev_up, &[&older_hi], res_up.as_ref(), &plan, 2, 1).unwrap();
+        assert_eq!(merged, up.upscale(&working_next).unwrap());
+    }
+
     #[test]
     fn identical_frames_need_no_residual() {
         let prev = smooth(64, 64, 0);
         let cfg = AnalyzeConfig { block_size: 16, ..Default::default() };
         let mut w = prev.clone();
-        let (plan, _) = analyze(&mut w, &prev, &JpegReference { quality: 97 }, &Stationary, &cfg).unwrap();
+        let (plan, _) = analyze(&mut w, &prev, &[], &JpegReference { quality: 97 }, &Stationary, &cfg).unwrap();
         assert_eq!(make_residual(&prev, &plan, 1), Residual::None);
         let up = NearestUpscaler { scale: 2 }.upscale(&prev).unwrap();
-        assert_eq!(merge(&up, None, &plan, 2, 1).unwrap(), up);
+        assert_eq!(merge(&up, &[], None, &plan, 2, 1).unwrap(), up);
     }
 }

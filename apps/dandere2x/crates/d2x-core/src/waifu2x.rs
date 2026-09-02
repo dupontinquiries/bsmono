@@ -376,6 +376,9 @@ pub struct CpuWaifu2x {
 }
 
 impl crate::upscale::Upscaler for CpuWaifu2x {
+    fn as_dyn(&mut self) -> &mut dyn crate::upscale::Upscaler {
+        self
+    }
     fn scale(&self) -> u32 {
         2
     }

@@ -540,8 +540,17 @@ impl WgpuUpscaler {
 }
 
 impl Upscaler for WgpuUpscaler {
+    fn as_dyn(&mut self) -> &mut dyn Upscaler {
+        self
+    }
     fn scale(&self) -> u32 {
         self.net.scale
+    }
+    /// Pack small inputs up to one tile: one tile is one dispatch's worth of
+    /// work, and a residual of a few cells on its own leaves most of the
+    /// device idle.
+    fn canvas(&self) -> u32 {
+        self.tile
     }
     fn upscale(&mut self, frame: &Frame) -> anyhow::Result<Frame> {
         self.upscale_frame(frame)

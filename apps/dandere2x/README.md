@@ -111,6 +111,48 @@ refuses them). `mesa-vulkan-drivers` from the asahi COPR; `vulkaninfo
 - Not verified: anything on Honeykrisp / M-series; the egui shell has only
   been compiled and linked, not run (no display here).
 
+## Throughput notes (multi-hour footage)
+
+What is built:
+
+- **Reference ring.** Missing blocks are checked at the same position in the
+  last `--refs` outputs and the last `--keyframe-refs` shot starts before
+  going to the network; a hit is a copy (`rec` in the per-frame line).
+  Occlusions, flicker, and cut-backs stop costing CNN time. One bounded SSE
+  per reference per missing block, so a deep ring is nearly free in CPU and
+  ~25 MB per reference at 4K in memory.
+- **Rectangular residual packing** (`cols = ceil(sqrt(n))`): wastes at most
+  `cols − 1` cells instead of up to `2·sqrt(n)`.
+- **Cross-frame residual batching** (`--batch`, and across `-j` segments via
+  the GPU server): small residuals are packed into one canvas per call. A
+  residual of a few cells is a handful of workgroups; below ~150 px on a side
+  the device is underoccupied and per-dispatch overhead (RRDB is ~400
+  dispatches per tile) dominates. Above that the network already fills the
+  GPU, so only clearly small items (< canvas²/8) are packed — the replicate
+  gutter costs 17–46 % extra pixels and only pays where the GPU is idle
+  anyway. On lavapipe this is a net loss (CPU rasterizer, pixel-
+  proportional); the gain exists only on a real GPU and is bounded by how
+  much time the job spends on tiny residuals.
+- **Keyframe-aligned segments** (`-j`): N encoders, one shared GPU, resumable
+  parts.
+
+What would move the big number (RRDB is ~9 TMAC per 1080p frame; the conv
+kernel is all of it):
+
+- **Winograd F(2×2, 3×3)**: 2.25× fewer multiplies for every 3×3 same-pad
+  conv, exact in f32. Transform-domain batched GEMM is a kernel the tree
+  already has form for (gpu-gemm).
+- **Register tiling**: the kernel does 36 vec4 FMAs per 52 loads per input
+  channel; 4×2 pixels × 8 channels roughly doubles FMA-per-load.
+- **f16 storage** (f32 math) halves activation bandwidth where the adapter
+  offers `SHADER_F16`.
+- **Difficulty cascade**: route low-texture residual blocks to the compact
+  net (7× cheaper) and only detailed blocks to RRDB.
+- **Gate**: the JPEG round trip could be replaced by a DCT-domain
+  quantisation-error estimate (same number by Parseval, ~10× cheaper,
+  library-independent) if analysis ever becomes the bottleneck under `-j`.
+- **Distillation** of a shallow net from the full RRDB on your own clips.
+
 ## Next
 
 - Flat-block bypass (bicubic for near-zero-variance new content), neighbour

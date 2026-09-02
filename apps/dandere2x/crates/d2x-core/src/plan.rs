@@ -60,7 +60,10 @@ pub enum BlockMatch {
     Stationary,
     /// The block at `(src_x, src_y)` in the previous frame passes the gate.
     Moved { src_x: u32, src_y: u32 },
-    /// Nothing in the previous frame passes; the block must be upscaled.
+    /// Same position in an older reference (`r` indexes the reference
+    /// list: recent frames first, then retained shot starts) passes the gate.
+    Recalled { r: u8 },
+    /// Nothing in any reference passes; the block must be upscaled.
     Missing,
 }
 
@@ -91,8 +94,13 @@ pub struct FrameStats {
     pub moved: u32,
     pub missing: u32,
     pub fades: u32,
-    /// Side length, in cells, of the square residual image (0 if none).
-    pub residual_dim: u32,
+    /// Blocks recovered from older references.
+    pub recalled: u32,
+    /// Residual image size in cells (0×0 if none). Rectangular: `cols =
+    /// ceil(sqrt(n))`, `rows = ceil(n / cols)`, so at most `cols − 1` cells
+    /// are wasted instead of up to `2·sqrt(n)` for a square.
+    pub residual_cols: u32,
+    pub residual_rows: u32,
     pub redraw: bool,
 }
 
@@ -105,7 +113,7 @@ impl FrameStats {
             return 1.0;
         }
         let cell = (grid.block_size + 2 * bleed) as f64;
-        let res_px = (self.residual_dim as f64 * cell).powi(2);
+        let res_px = (self.residual_cols as f64 * cell) * (self.residual_rows as f64 * cell);
         let frame_px = (grid.width() as f64) * (grid.height() as f64);
         res_px / frame_px
     }
@@ -136,13 +144,13 @@ impl FramePlan {
         }
     }
 
-    /// Side length of the residual image in cells for `n` missing blocks.
-    pub fn residual_dim_for(n: usize) -> u32 {
+    /// Residual image size in cells `(cols, rows)` for `n` missing blocks.
+    pub fn residual_dims_for(n: usize) -> (u32, u32) {
         if n == 0 {
-            0
-        } else {
-            (n as f64).sqrt().ceil() as u32
+            return (0, 0);
         }
+        let cols = (n as f64).sqrt().ceil() as u32;
+        (cols, (n as u32).div_ceil(cols))
     }
 }
 
@@ -161,11 +169,16 @@ mod tests {
     }
 
     #[test]
-    fn residual_dim_is_ceil_sqrt() {
-        assert_eq!(FramePlan::residual_dim_for(0), 0);
-        assert_eq!(FramePlan::residual_dim_for(1), 1);
-        assert_eq!(FramePlan::residual_dim_for(4), 2);
-        assert_eq!(FramePlan::residual_dim_for(5), 3);
-        assert_eq!(FramePlan::residual_dim_for(9), 3);
+    fn residual_dims_are_rectangular() {
+        assert_eq!(FramePlan::residual_dims_for(0), (0, 0));
+        assert_eq!(FramePlan::residual_dims_for(1), (1, 1));
+        assert_eq!(FramePlan::residual_dims_for(4), (2, 2));
+        assert_eq!(FramePlan::residual_dims_for(5), (3, 2));
+        assert_eq!(FramePlan::residual_dims_for(9), (3, 3));
+        assert_eq!(FramePlan::residual_dims_for(50), (8, 7));
+        for n in 1..500usize {
+            let (c, r) = FramePlan::residual_dims_for(n);
+            assert!((c * r) as usize >= n && ((c * r) as usize) < n + c as usize, "n={n}");
+        }
     }
 }

@@ -79,7 +79,7 @@ impl Default for Job {
             require_hw: false,
             // Noise 0: upstream's 8 raised the gate floor for waifu2x; Real-ESRGAN
             // is degradation-trained and would just denoise it away.
-            pipeline: PipelineConfig { analyze: AnalyzeConfig::default(), quality: 97, noise: 0, matcher: MatcherKind::Diamond, queue_depth: 2 },
+            pipeline: PipelineConfig { analyze: AnalyzeConfig::default(), quality: 97, noise: 0, matcher: MatcherKind::Diamond, ..PipelineConfig::default() },
             encode: EncodeOptions::default(),
             max_frames: 0,
             jobs: 1,
@@ -230,20 +230,99 @@ pub fn open_sink(job: &Job, probe: Option<&ffmpeg::Probe>, keyframes: &[f64], wi
     Ok(Box::new(FfmpegSink::open_ranged(&job.output, Some(&job.input), p, width, height, &enc, job.start, job.end)?))
 }
 
-/// One upscaler shared by several pipelines: the GPU is serial anyway; what
-/// sharing buys is that every worker's decode, analysis, merge and encode
-/// overlap with the others' upscales, so the GPU queue is rarely empty.
-pub struct SharedUpscaler(pub Arc<std::sync::Mutex<Box<dyn Upscaler>>>);
+/// One upscaler shared by several pipelines through a server thread that
+/// batches concurrent requests into one packed call. The GPU is serial
+/// anyway; what this buys is that (a) every worker's decode, analysis,
+/// merge and encode overlap the others' upscales, and (b) several segments'
+/// small residuals share one dispatch instead of each occupying a sliver of
+/// the device.
+struct BatchRequest {
+    frames: Vec<Frame>,
+    reply: std::sync::mpsc::Sender<anyhow::Result<Vec<Frame>>>,
+}
+
+pub struct BatchServer {
+    tx: std::sync::mpsc::Sender<BatchRequest>,
+    pub scale: u32,
+    name: String,
+    canvas: u32,
+}
+
+impl BatchServer {
+    /// Owns `up` on its own thread. `wait` is how long to linger for more
+    /// requests after the first arrives; `max_pixels` caps one packed call.
+    pub fn start(mut up: Box<dyn Upscaler>, wait: std::time::Duration, max_pixels: u64) -> Arc<BatchServer> {
+        let (tx, rx) = std::sync::mpsc::channel::<BatchRequest>();
+        let (scale, name, canvas) = (up.scale(), up.name(), up.canvas());
+        std::thread::Builder::new()
+            .name("d2x-gpu".into())
+            .spawn(move || {
+                while let Ok(first) = rx.recv() {
+                    let mut reqs = vec![first];
+                    let mut px: u64 = reqs[0].frames.iter().map(|f| (f.width * f.height) as u64).sum();
+                    let deadline = std::time::Instant::now() + wait;
+                    while px < max_pixels {
+                        let now = std::time::Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        match rx.recv_timeout(deadline - now) {
+                            Ok(r) => {
+                                px += r.frames.iter().map(|f| (f.width * f.height) as u64).sum::<u64>();
+                                reqs.push(r);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let all: Vec<&Frame> = reqs.iter().flat_map(|r| r.frames.iter()).collect();
+                    match up.upscale_many(&all) {
+                        Ok(mut outs) => {
+                            for r in reqs {
+                                let n = r.frames.len();
+                                let mine: Vec<Frame> = outs.drain(..n).collect();
+                                let _ = r.reply.send(Ok(mine));
+                            }
+                        }
+                        Err(e) => {
+                            let msg = format!("{e:#}");
+                            for r in reqs {
+                                let _ = r.reply.send(Err(anyhow!("{msg}")));
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("spawn gpu server");
+        Arc::new(BatchServer { tx, scale, name, canvas })
+    }
+
+    pub fn client(self: &Arc<Self>) -> SharedUpscaler {
+        SharedUpscaler(self.clone())
+    }
+}
+
+pub struct SharedUpscaler(Arc<BatchServer>);
 
 impl Upscaler for SharedUpscaler {
+    fn as_dyn(&mut self) -> &mut dyn Upscaler {
+        self
+    }
     fn scale(&self) -> u32 {
-        self.0.lock().unwrap().scale()
+        self.0.scale
+    }
+    fn canvas(&self) -> u32 {
+        0 // packing happens in the server
     }
     fn upscale(&mut self, frame: &Frame) -> anyhow::Result<Frame> {
-        self.0.lock().unwrap().upscale(frame)
+        Ok(self.upscale_many(&[frame])?.remove(0))
+    }
+    fn upscale_many(&mut self, frames: &[&Frame]) -> anyhow::Result<Vec<Frame>> {
+        let (reply, rx) = std::sync::mpsc::channel();
+        self.0.tx.send(BatchRequest { frames: frames.iter().map(|f| (*f).clone()).collect(), reply }).map_err(|_| anyhow!("gpu server gone"))?;
+        rx.recv().map_err(|_| anyhow!("gpu server dropped the request"))?
     }
     fn name(&self) -> String {
-        format!("shared {}", self.0.lock().unwrap().name())
+        format!("shared {} (batched, canvas {})", self.0.name, self.0.canvas)
     }
 }
 
@@ -257,8 +336,8 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
     let p = ffmpeg::probe(&job.input)?;
     let keyframes = ffmpeg::keyframe_times(&job.input).unwrap_or_default();
     let segs = ffmpeg::segments(&keyframes, p.duration_s, job.jobs);
-    let upscaler = Arc::new(std::sync::Mutex::new(build_upscaler(job)?));
-    let scale = upscaler.lock().unwrap().scale();
+    let server = BatchServer::start(build_upscaler(job)?, std::time::Duration::from_millis(15), 4_000_000);
+    let scale = server.scale;
     let (w, h) = (p.info.width * scale, p.info.height * scale);
     let stem = job.output.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "out".into());
     let ext = job.output.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "mkv".into());
@@ -267,7 +346,7 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
     let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<PEvent, String>)>();
     let mut handles = Vec::new();
     for (seg, part) in segs.iter().zip(&parts) {
-        let (seg, part, tx, p, job, upscaler, all) = (*seg, part.clone(), tx.clone(), p.clone(), job.clone(), upscaler.clone(), keyframes.clone());
+        let (seg, part, tx, p, job, server, all) = (*seg, part.clone(), tx.clone(), p.clone(), job.clone(), server.clone(), keyframes.clone());
         handles.push(std::thread::Builder::new().name(format!("d2x-seg{}", seg.index)).spawn(move || -> anyhow::Result<Summary> {
             let src = Box::new(FfmpegSource::open_segment(&job.input, &p, seg)?);
             let mut enc = job.encode.clone();
@@ -275,7 +354,7 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
             enc.keyframes = all.iter().filter(|&&t| t >= seg.start && seg.end.map_or(true, |e| t < e)).map(|t| t - seg.start).collect();
             let enc = with_keyint(enc, &all, p.info.fps);
             let sink = Box::new(FfmpegSink::open(&part, None, &p, w, h, &enc)?);
-            let up: Box<dyn Upscaler> = Box::new(SharedUpscaler(upscaler));
+            let up: Box<dyn Upscaler> = Box::new(server.client());
             let r = d2x_core::pipeline::run(src, up, sink, job.pipeline, |e| {
                 let _ = tx.send((seg.index, Ok(e)));
             });

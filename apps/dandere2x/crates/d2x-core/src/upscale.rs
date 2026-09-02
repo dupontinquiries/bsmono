@@ -13,6 +13,20 @@ pub trait Upscaler: Send {
     fn scale(&self) -> u32;
     fn upscale(&mut self, frame: &Frame) -> anyhow::Result<Frame>;
     fn name(&self) -> String;
+    /// Side of the canvas that several small inputs should be packed into
+    /// before one call (0 = don't pack). A GPU runner returns its tile size.
+    fn canvas(&self) -> u32 {
+        0
+    }
+    /// Upscale several frames; order preserved. Packs into canvases when
+    /// [`Upscaler::canvas`] says so, so small residuals from several frames
+    /// share one dispatch.
+    fn upscale_many(&mut self, frames: &[&Frame]) -> anyhow::Result<Vec<Frame>> {
+        crate::batch::upscale_many_dyn(self.as_dyn(), frames)
+    }
+    /// Object-safety shim for the default `upscale_many`; every impl returns `self`.
+    #[doc(hidden)]
+    fn as_dyn(&mut self) -> &mut dyn Upscaler;
 }
 
 /// Pixel replication. Exact, so tests can compare bit for bit.
@@ -22,6 +36,9 @@ pub struct NearestUpscaler {
 }
 
 impl Upscaler for NearestUpscaler {
+    fn as_dyn(&mut self) -> &mut dyn Upscaler {
+        self
+    }
     fn scale(&self) -> u32 {
         self.scale
     }
@@ -59,6 +76,9 @@ pub struct BicubicUpscaler {
 }
 
 impl Upscaler for BicubicUpscaler {
+    fn as_dyn(&mut self) -> &mut dyn Upscaler {
+        self
+    }
     fn scale(&self) -> u32 {
         self.scale
     }
@@ -113,8 +133,14 @@ pub struct Resampled {
 }
 
 impl Upscaler for Resampled {
+    fn as_dyn(&mut self) -> &mut dyn Upscaler {
+        self
+    }
     fn scale(&self) -> u32 {
         self.target
+    }
+    fn canvas(&self) -> u32 {
+        self.inner.canvas()
     }
     fn upscale(&mut self, frame: &Frame) -> anyhow::Result<Frame> {
         let native = self.inner.upscale(frame)?;

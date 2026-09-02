@@ -67,8 +67,15 @@ pub struct PipelineConfig {
     /// Uniform noise strength added to every input frame (0 = off).
     pub noise: u8,
     pub matcher: MatcherKind,
-    /// Frames queued between the two stages.
+    /// Frames queued between the two stages. Also bounds how many frames'
+    /// residuals stage B can batch into one GPU call.
     pub queue_depth: usize,
+    /// Recent outputs kept as extra references (occlusions, flicker).
+    pub recent_refs: usize,
+    /// Shot-start (redraw) outputs retained as references (cut-backs).
+    pub keyframe_refs: usize,
+    /// Max frames whose residuals share one upscale call.
+    pub batch: usize,
 }
 
 impl Default for PipelineConfig {
@@ -78,7 +85,10 @@ impl Default for PipelineConfig {
             quality: 97,
             noise: 8,
             matcher: MatcherKind::Stationary,
-            queue_depth: 2,
+            queue_depth: 8,
+            recent_refs: 3,
+            keyframe_refs: 4,
+            batch: 4,
         }
     }
 }
@@ -106,6 +116,38 @@ struct Work {
     plan: Option<FramePlan>, // None for the first frame
     residual: Residual,
     analyze_time: Duration,
+}
+
+/// The reference bookkeeping both stages mirror, so `Recalled { r }` means
+/// the same frame on the low-res and the upscaled side.
+struct Ring<T> {
+    recent: std::collections::VecDeque<T>,
+    keyframes: std::collections::VecDeque<T>,
+    recent_cap: usize,
+    keyframe_cap: usize,
+}
+
+impl<T: Clone> Ring<T> {
+    fn new(recent_cap: usize, keyframe_cap: usize) -> Self {
+        Ring { recent: Default::default(), keyframes: Default::default(), recent_cap, keyframe_cap }
+    }
+    /// References in `Recalled` index order: recent (newest first), then
+    /// retained shot starts (newest first).
+    fn refs(&self) -> Vec<&T> {
+        self.recent.iter().chain(self.keyframes.iter()).collect()
+    }
+    /// After a frame is finished: `prev` becomes a recent reference; a redraw
+    /// frame is also retained as a shot start.
+    fn advance(&mut self, prev: T, this: &T, this_is_redraw: bool) {
+        if self.recent_cap > 0 {
+            self.recent.push_front(prev);
+            self.recent.truncate(self.recent_cap);
+        }
+        if this_is_redraw && self.keyframe_cap > 0 {
+            self.keyframes.push_front(this.clone());
+            self.keyframes.truncate(self.keyframe_cap);
+        }
+    }
 }
 
 /// Pad up to a block-size multiple (replicate) and add noise.
@@ -146,12 +188,14 @@ pub fn run(
     let (tx, rx) = mpsc::sync_channel::<anyhow::Result<Work>>(cfg.queue_depth.max(1));
     let acfg = cfg.analyze;
     let noise = cfg.noise;
+    let (recent_refs, keyframe_refs, batch) = (cfg.recent_refs, cfg.keyframe_refs, cfg.batch.max(1));
 
     // Stage A.
     let analyzer = std::thread::Builder::new().name("d2x-analyze".into()).spawn(move || {
         let reference: &dyn ReferenceMaker = &reference;
         let mut index: u64 = 0;
         let mut prev_working: Option<Frame> = None;
+        let mut ring: Ring<Frame> = Ring::new(recent_refs, keyframe_refs);
         loop {
             let raw = match source.next_frame() {
                 Ok(Some(f)) => f,
@@ -165,14 +209,18 @@ pub fn run(
             let frame = prepare(raw, bs, noise, index);
             let work = match prev_working.take() {
                 None => {
+                    ring.keyframes.push_front(frame.clone());
+                    ring.keyframes.truncate(ring.keyframe_cap);
                     prev_working = Some(frame.clone());
                     Work { index, plan: None, residual: Residual::Whole(frame), analyze_time: t0.elapsed() }
                 }
                 Some(mut prev) => {
-                    let r = analyze(&mut prev, &frame, reference, matcher.as_ref(), &acfg);
+                    let older = ring.refs();
+                    let r = analyze(&mut prev, &frame, &older, reference, matcher.as_ref(), &acfg);
                     match r {
                         Ok((plan, working_next)) => {
                             let residual = make_residual(&frame, &plan, bleed);
+                            ring.advance(prev, &working_next, plan.redraw);
                             prev_working = Some(working_next);
                             Work { index, plan: Some(plan), residual, analyze_time: t0.elapsed() }
                         }
@@ -190,74 +238,92 @@ pub fn run(
         }
     })?;
 
-    // Stage B, on this thread.
+    // Stage B, on this thread. Frames are taken from the channel in groups
+    // so their residuals share one upscale call; merges stay sequential.
     let crop_w = info.width * scale;
     let crop_h = info.height * scale;
     let mut prev_up: Option<Frame> = None;
+    let mut ring: Ring<Frame> = Ring::new(recent_refs, keyframe_refs);
     let mut frames: u64 = 0;
     let mut fraction_sum = 0.0;
     let mut result: anyhow::Result<()> = Ok(());
 
-    for msg in rx.iter() {
-        let work = match msg {
-            Ok(w) => w,
-            Err(e) => {
+    'outer: loop {
+        let mut group: Vec<Work> = Vec::with_capacity(batch);
+        match rx.recv() {
+            Ok(Ok(w)) => group.push(w),
+            Ok(Err(e)) => {
                 result = Err(e);
                 break;
             }
-        };
-        let t0 = Instant::now();
-        let residual_up = match work.residual.frame() {
-            Some(f) => match upscaler.upscale(f) {
-                Ok(u) => Some(u),
-                Err(e) => {
-                    result = Err(e.context(format!("upscaling frame {}", work.index)));
-                    break;
+            Err(_) => break,
+        }
+        while group.len() < batch {
+            match rx.try_recv() {
+                Ok(Ok(w)) => group.push(w),
+                Ok(Err(e)) => {
+                    result = Err(e);
+                    break 'outer;
                 }
-            },
-            None => None,
-        };
-        let upscale_time = t0.elapsed();
-
-        let t1 = Instant::now();
-        let (out, stats) = match (&work.plan, prev_up.as_ref()) {
-            (None, _) => {
-                let f = residual_up.expect("first frame is always upscaled whole");
-                (f, FrameStats { redraw: true, psnr: f64::NAN, ..Default::default() })
+                Err(_) => break,
             }
-            (Some(plan), Some(prev)) => match merge(prev, residual_up.as_ref(), plan, scale, bleed) {
-                Ok(f) => (f, plan.stats),
-                Err(e) => {
-                    result = Err(e.context(format!("merging frame {}", work.index)));
-                    break;
-                }
-            },
-            (Some(_), None) => {
-                result = Err(anyhow::anyhow!("frame {} has a plan but no previous output", work.index));
+        }
+
+        let t0 = Instant::now();
+        let inputs: Vec<&Frame> = group.iter().filter_map(|w| w.residual.frame()).collect();
+        let mut ups: std::collections::VecDeque<Frame> = match upscaler.upscale_many(&inputs) {
+            Ok(v) => v.into(),
+            Err(e) => {
+                result = Err(e.context(format!("upscaling frames {}..", group[0].index)));
                 break;
             }
         };
-        let merge_time = t1.elapsed();
+        let upscale_time = t0.elapsed() / (group.len() as u32);
 
-        let visible = if (out.width, out.height) == (crop_w, crop_h) { out.clone() } else { out.crop(0, 0, crop_w, crop_h) };
-        if let Err(e) = sink.write(&visible) {
-            result = Err(e.context(format!("writing frame {}", work.index)));
-            break;
+        for work in group {
+            let residual_up = if work.residual.frame().is_some() { ups.pop_front() } else { None };
+            let t1 = Instant::now();
+            let (out, stats) = match (&work.plan, prev_up.as_ref()) {
+                (None, _) => {
+                    let f = residual_up.expect("first frame is always upscaled whole");
+                    ring.keyframes.push_front(f.clone());
+                    ring.keyframes.truncate(ring.keyframe_cap);
+                    (f, FrameStats { redraw: true, psnr: f64::NAN, ..Default::default() })
+                }
+                (Some(plan), Some(prev)) => {
+                    let older = ring.refs();
+                    match merge(prev, &older, residual_up.as_ref(), plan, scale, bleed) {
+                        Ok(f) => (f, plan.stats),
+                        Err(e) => {
+                            result = Err(e.context(format!("merging frame {}", work.index)));
+                            break 'outer;
+                        }
+                    }
+                }
+                (Some(_), None) => {
+                    result = Err(anyhow::anyhow!("frame {} has a plan but no previous output", work.index));
+                    break 'outer;
+                }
+            };
+            let merge_time = t1.elapsed();
+
+            let visible = if (out.width, out.height) == (crop_w, crop_h) { out.clone() } else { out.crop(0, 0, crop_w, crop_h) };
+            if let Err(e) = sink.write(&visible) {
+                result = Err(e.context(format!("writing frame {}", work.index)));
+                break 'outer;
+            }
+            let fraction = match &work.plan {
+                None => 1.0,
+                Some(p) => p.stats.upscaled_fraction(&p.grid, bleed),
+            };
+            fraction_sum += fraction;
+            frames += 1;
+            if let Some(p) = prev_up.take() {
+                ring.advance(p, &out, stats.redraw);
+            }
+            prev_up = Some(out);
+            on_event(Event::FrameDone { index: work.index, stats, analyze_time: work.analyze_time, upscale_time, merge_time });
         }
-        let fraction = match &work.plan {
-            None => 1.0,
-            Some(p) => p.stats.upscaled_fraction(&p.grid, bleed),
-        };
-        fraction_sum += fraction;
-        frames += 1;
-        prev_up = Some(out);
-        on_event(Event::FrameDone {
-            index: work.index,
-            stats,
-            analyze_time: work.analyze_time,
-            upscale_time,
-            merge_time,
-        });
     }
     drop(rx);
     let _ = analyzer.join();
@@ -283,6 +349,7 @@ pub fn analyze_only(
     let reference = JpegReference { quality: cfg.quality };
     let started = Instant::now();
     let mut prev: Option<Frame> = None;
+    let mut ring: Ring<Frame> = Ring::new(cfg.recent_refs, cfg.keyframe_refs);
     let mut index = 0u64;
     let mut fraction_sum = 0.0;
     while let Some(raw) = source.next_frame()? {
@@ -292,13 +359,16 @@ pub fn analyze_only(
             None => {
                 fraction_sum += 1.0;
                 on_frame(index, &FrameStats { redraw: true, psnr: f64::NAN, ..Default::default() }, 1.0, t0.elapsed());
+                ring.keyframes.push_front(frame.clone());
                 prev = Some(frame);
             }
             Some(mut p) => {
-                let (plan, next_w) = analyze(&mut p, &frame, &reference, matcher.as_ref(), &cfg.analyze)?;
+                let older = ring.refs();
+                let (plan, next_w) = analyze(&mut p, &frame, &older, &reference, matcher.as_ref(), &cfg.analyze)?;
                 let fr = plan.stats.upscaled_fraction(&plan.grid, bleed);
                 fraction_sum += fr;
                 on_frame(index, &plan.stats, fr, t0.elapsed());
+                ring.advance(p, &next_w, plan.redraw);
                 prev = Some(next_w);
             }
         }
@@ -371,7 +441,9 @@ mod tests {
         for (i, b) in f3.data.iter_mut().enumerate() {
             *b = (i * 31 % 251) as u8;
         }
-        let frames = vec![f0.clone(), f1.clone(), f2.clone(), f3.clone()];
+        // f4 = f2 again: its scribbled block is recalled from the ring, not re-upscaled.
+        let f4 = f2.clone();
+        let frames = vec![f0.clone(), f1.clone(), f2.clone(), f3.clone(), f4.clone()];
         let out = Arc::new(Mutex::new(Vec::new()));
         let cfg = PipelineConfig {
             analyze: AnalyzeConfig { block_size: 16, bleed: 1, ..Default::default() },
@@ -387,9 +459,9 @@ mod tests {
             |e| events.push(e),
         )
         .unwrap();
-        assert_eq!(summary.frames, 4);
+        assert_eq!(summary.frames, 5);
         let out = out.lock().unwrap();
-        assert_eq!(out.len(), 4);
+        assert_eq!(out.len(), 5);
         for f in out.iter() {
             assert_eq!((f.width, f.height), (140, 100));
         }
@@ -400,8 +472,13 @@ mod tests {
         // through the gate, which with bit-identical frames is also exact.
         assert_eq!(out[2], up.upscale(&f2).unwrap());
         assert_eq!(out[3], up.upscale(&f3).unwrap());
+        assert_eq!(out[4], up.upscale(&f4).unwrap());
         let done = events.iter().filter(|e| matches!(e, Event::FrameDone { .. })).count();
-        assert_eq!(done, 4);
+        assert_eq!(done, 5);
+        // Frame 4 after the scene cut: everything comes back from the ring.
+        let last = events.iter().rev().find_map(|e| if let Event::FrameDone { index: 4, stats, .. } = e { Some(*stats) } else { None }).unwrap();
+        assert_eq!(last.missing, 0, "{last:?}");
+        assert!(last.recalled > 0, "{last:?}");
         assert!(summary.upscaled_pixel_fraction < 1.0);
     }
 

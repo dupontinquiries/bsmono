@@ -243,12 +243,12 @@ impl Shell {
                     let fraction = if stats.redraw { 1.0 } else {
                         // residual area relative to frame area is what FrameStats knows once it has a grid;
                         // here we approximate from block counts for the bar (exact number is in the log).
-                        let total = (stats.stationary + stats.moved + stats.missing).max(1) as f32;
+                        let total = (stats.stationary + stats.moved + stats.recalled + stats.missing).max(1) as f32;
                         stats.missing as f32 / total
                     };
                     self.rows.push(FrameRow { fraction, redraw: stats.redraw, analyze_ms: analyze_time.as_secs_f32() * 1e3, upscale_ms: upscale_time.as_secs_f32() * 1e3 });
                     if index % 25 == 0 || stats.redraw {
-                        self.push_log(if stats.redraw { LogLevel::Warn } else { LogLevel::Debug }, format!("frame {index}: psnr {:.1}, stat {} mov {} miss {} fade {}{}; A {:.1}ms U {:.1}ms M {:.1}ms", stats.psnr, stats.stationary, stats.moved, stats.missing, stats.fades, if stats.redraw { " REDRAW" } else { "" }, analyze_time.as_secs_f64() * 1e3, upscale_time.as_secs_f64() * 1e3, merge_time.as_secs_f64() * 1e3));
+                        self.push_log(if stats.redraw { LogLevel::Warn } else { LogLevel::Debug }, format!("frame {index}: psnr {:.1}, stat {} mov {} rec {} miss {} fade {}{}; A {:.1}ms U {:.1}ms M {:.1}ms", stats.psnr, stats.stationary, stats.moved, stats.recalled, stats.missing, stats.fades, if stats.redraw { " REDRAW" } else { "" }, analyze_time.as_secs_f64() * 1e3, upscale_time.as_secs_f64() * 1e3, merge_time.as_secs_f64() * 1e3));
                     }
                 }
                 Msg::Event(Event::Finished { frames, elapsed, upscaled_pixel_fraction }) => {
@@ -321,6 +321,14 @@ impl Shell {
                 ui.label("noise");
                 ui.add(egui::DragValue::new(&mut self.job.pipeline.noise).range(0..=32));
                 ui.checkbox(&mut self.job.pipeline.analyze.fade, "fades");
+            });
+            ui.horizontal(|ui| {
+                ui.label("refs");
+                ui.add(egui::DragValue::new(&mut self.job.pipeline.recent_refs).range(0..=64));
+                ui.label("shot refs");
+                ui.add(egui::DragValue::new(&mut self.job.pipeline.keyframe_refs).range(0..=256));
+                ui.label("batch");
+                ui.add(egui::DragValue::new(&mut self.job.pipeline.batch).range(1..=32));
             });
             egui::ComboBox::from_label("matcher").selected_text(["stationary", "diamond", "exhaustive r4"][self.matcher]).show_ui(ui, |ui| {
                 for (i, n) in ["stationary", "diamond", "exhaustive r4"].iter().enumerate() {
