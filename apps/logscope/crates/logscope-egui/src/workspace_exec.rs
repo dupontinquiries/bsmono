@@ -6474,14 +6474,11 @@ mod tool_protocol_round_trip {
                 assert!(msg.contains(c.because),
                     "[{}] was refused for the wrong reason.\n  wanted: {}\n  got:    {msg}",
                     c.what, c.because);
-                // KNOWN DEFECT, pinned as an expectation rather than asserted
-                // away — see the `#[ignore]`d test below. `authorize_text`
-                // defangs the fence head, but `parse_tools` finds the JSON
-                // payload regardless of its fence, so a refused call can still
-                // be built. Whether it is then EXECUTED depends on the caller.
-                // Recorded here so the round-trip suite passes on today's
-                // behaviour while the hole stays visible.
-                let _ = &built;
+                // Now enforceable: a refused call is removed entirely, so it
+                // cannot reach the parser. This assertion was a `let _ =` while
+                // the hole was open.
+                assert!(built.is_empty(),
+                    "[{}] was refused AND still built a tool", c.what);
             }
         }
     }
@@ -6535,7 +6532,11 @@ mod tool_gate_hole {
     use super::*;
     use crate::taint::{authorize_text, Nonce, ToolGate};
 
-    /// FAILS TODAY, deliberately not fixed in the same change that found it.
+    /// CLOSED. Was failing: `authorize_text` defanged only the fence head and
+    /// `parse_tools` found the payload anyway, so a refused call still became a
+    /// Tool — and nothing downstream gated on the anomaly, so the hole was live
+    /// rather than defence-in-depth. `authorize_text` now removes the whole
+    /// refused block and leaves `REFUSED_MARKER` in its place.
     ///
     /// `authorize_text` is the gate: it checks the fence head for this run's
     /// nonce, and on failure raises `UnnoncedToolCall` and rewrites the head to
@@ -6553,7 +6554,6 @@ mod tool_gate_hole {
     /// have `parse_tools` require an authorised fence — and picking wrong
     /// changes the behaviour of every caller. Un-ignore when fixed.
     #[test]
-    #[ignore = "known defect: parse_tools ignores the fence, so a refused call still builds"]
     fn a_refused_call_must_not_survive_into_a_tool() {
         let nonce = match ToolGate::default() { ToolGate::Required(n) => n, _ => unreachable!() };
         let quoted_from_a_file =
