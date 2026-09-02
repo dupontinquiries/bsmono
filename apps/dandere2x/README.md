@@ -91,6 +91,31 @@ full-frame upscale; each is reported as a stage so the shell is never silent.
   pixel-unshuffles, so 16 input px of overlap is 8. Big tiles (default 400)
   keep seams around 1 LSB.
 
+## CPU hot paths
+
+Checked in the post-LTO binary (`objdump`), not the pre-LTO `.s` — thin LTO
+inlines `block_sse` into its callers, and there it vectorises (`pmaddwd` on
+SSE2, `smull`/`sabd` on NEON). What did not vectorise were the per-pixel
+index-arithmetic loops around the GPU; those are now row-wise with narrow
+integer reductions. `cargo test --release -p d2x-core --test bench_hot --
+--ignored --nocapture` prints per-call timings; on one SSE2 core:
+
+| path | before | after |
+|---|---|---|
+| `padded_to` replicate, 1080p +16 | 4.4 ms | 1.6 ms |
+| `add_uniform_noise`, 1080p | 13.7 ms | 3.2 ms |
+| `extract_input`, 400-tile (u=1 / u=2) | 1.1 / 1.3 ms | 0.25 / 0.63 ms |
+| `write_output_rgba8`, 400-tile ×4 | 2.0 ms | 1.6 ms |
+| `block_sse` ×2304, `hash_cell` ×2304 | ~2 ms | unchanged (already packed) |
+
+The JPEG gate now encodes the frame in 16-row-aligned strips across the
+rayon pool; JPEG blocks reconstruct independently, so the threshold map is
+bit-identical to the single-strip result (tested at 2/3/5/8 threads) and
+the largest single stage-A cost scales with cores. No `target-cpu` flags:
+NEON is baseline on aarch64, and fleet-wide `fullfp16` is the SIGILL the
+lessons doc warns about; on x86 hosts `RUSTFLAGS=-C target-cpu=native` is
+a per-machine choice that roughly doubles the SSE paths.
+
 ## Asahi / Honeykrisp
 
 Rules from `maintenance/ASAHI_GPU.md` and `ASAHI_VULKAN_LESSONS.md` are

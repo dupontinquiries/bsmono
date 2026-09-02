@@ -68,18 +68,23 @@ pub type CachedBlocks = std::collections::HashMap<u64, std::sync::Arc<Vec<u8>>>;
 
 /// Luma standard deviation of a block — the texture measure for tiering.
 fn block_luma_std(f: &Frame, x: u32, y: u32, size: u32) -> f64 {
+    // Integer luma (BT.601 weights in 8.8 fixed point) with 32-bit row
+    // sums: luma ≤ 255, luma² ≤ 65 025, so a row of ≤ 255 pixels fits.
     let n = (size * size) as f64;
-    let (mut s, mut s2) = (0.0f64, 0.0f64);
+    let (mut s, mut s2) = (0u64, 0u64);
     for j in 0..size {
         let row = f.row(y + j, x, x + size);
+        let (mut rs, mut rs2) = (0u32, 0u32);
         for px in row.chunks_exact(3) {
-            let l = 0.299 * px[0] as f64 + 0.587 * px[1] as f64 + 0.114 * px[2] as f64;
-            s += l;
-            s2 += l * l;
+            let l = (77 * px[0] as u32 + 150 * px[1] as u32 + 29 * px[2] as u32) >> 8;
+            rs += l;
+            rs2 += l * l;
         }
+        s += rs as u64;
+        s2 += rs2 as u64;
     }
-    let mean = s / n;
-    (s2 / n - mean * mean).max(0.0).sqrt()
+    let mean = s as f64 / n;
+    (s2 as f64 / n - mean * mean).max(0.0).sqrt()
 }
 
 /// Mean per-channel difference `next - prev` over a block, rounded.
@@ -88,9 +93,13 @@ fn fade_scalar(prev: &Frame, next: &Frame, x: u32, y: u32, size: u32) -> i32 {
     for j in 0..size {
         let rp = prev.row(y + j, x, x + size);
         let rn = next.row(y + j, x, x + size);
+        // A row is at most 3·size ≤ 3·255 bytes of |diff| ≤ 255: i32 is safe
+        // and keeps the reduction in packed lanes.
+        let mut row: i32 = 0;
         for (&p, &n) in rp.iter().zip(rn) {
-            sum += n as i64 - p as i64;
+            row += n as i32 - p as i32;
         }
+        sum += row as i64;
     }
     let count = (size as i64) * (size as i64) * 3;
     ((sum as f64) / (count as f64)).round() as i32

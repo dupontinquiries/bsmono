@@ -121,12 +121,25 @@ impl Frame {
                 }
             }
             Pad::Replicate => {
+                // Row-wise: the interior is a memcpy, the left/right margins
+                // are one pixel repeated, and out-of-range rows repeat the
+                // nearest source row. No per-pixel index arithmetic.
+                let rb = (self.width as usize) * 3;
                 for y in 0..h {
                     let sy = y.saturating_sub(oy).min(self.height - 1);
-                    for x in 0..w {
-                        let sx = x.saturating_sub(ox).min(self.width - 1);
-                        let p = self.px(sx, sy);
-                        out.set_px(x, y, p);
+                    let src = self.row(sy, 0, self.width);
+                    let d0 = out.idx(0, y);
+                    let row = &mut out.data[d0..d0 + (w as usize) * 3];
+                    let (left, rest) = row.split_at_mut((ox as usize) * 3);
+                    let (mid, right) = rest.split_at_mut(rb);
+                    mid.copy_from_slice(src);
+                    let first = &src[..3];
+                    let last = &src[rb - 3..];
+                    for px in left.chunks_exact_mut(3) {
+                        px.copy_from_slice(first);
+                    }
+                    for px in right.chunks_exact_mut(3) {
+                        px.copy_from_slice(last);
                     }
                 }
             }
@@ -161,14 +174,19 @@ impl Frame {
         }
         let mut s = seed ^ 0x9E37_79B9_7F4A_7C15;
         let span = 2 * strength as u32 + 1;
-        for b in &mut self.data {
+        // One SplitMix64 step feeds eight bytes; the byte-level work is a
+        // fixed-width loop the compiler can vectorise.
+        for chunk in self.data.chunks_mut(8) {
             s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
             let mut z = s;
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             z ^= z >> 31;
-            let n = (z % span as u64) as i32 - strength as i32;
-            *b = (*b as i32 + n).clamp(0, 255) as u8;
+            let lanes = z.to_le_bytes();
+            for (b, &r) in chunk.iter_mut().zip(&lanes) {
+                let n = (r as u32 % span) as i32 - strength as i32;
+                *b = (*b as i32 + n).clamp(0, 255) as u8;
+            }
         }
     }
 
@@ -180,13 +198,19 @@ impl Frame {
     /// ≈5.2 dB in these units — see `AnalyzeConfig::min_psnr`.
     pub fn psnr(&self, other: &Frame) -> f64 {
         assert_eq!((self.width, self.height), (other.width, other.height));
+        // 32-bit partial sums per 4 KiB (max 4096·255² < 2³²) so the reduction
+        // stays in packed 32-bit lanes; SSE2 has no 64-bit multiply.
         let sse: u64 = self
             .data
-            .iter()
-            .zip(&other.data)
-            .map(|(&a, &b)| {
-                let d = a as i64 - b as i64;
-                (d * d) as u64
+            .chunks(4096)
+            .zip(other.data.chunks(4096))
+            .map(|(x, y)| {
+                let mut s: u32 = 0;
+                for (&a, &b) in x.iter().zip(y) {
+                    let d = a as i32 - b as i32;
+                    s += (d * d) as u32;
+                }
+                s as u64
             })
             .sum();
         if sse == 0 {

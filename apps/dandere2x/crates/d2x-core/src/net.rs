@@ -562,13 +562,39 @@ impl Network {
         let (rw, rh) = (io.region_w as usize, io.region_h as usize);
         let (tw, th) = (rw / u, rh / u);
         let mut t = Tensor::zeros(3 * u * u, th, tw);
+        const INV: f32 = 1.0 / 255.0;
+        if u == 1 {
+            // De-interleave RGB rows into three planes; per-row slices, no
+            // per-pixel index arithmetic.
+            for y in 0..rh {
+                let row = padded.row(io.region_y + y as u32, io.region_x, io.region_x + rw as u32);
+                let (r, gb) = t.data.split_at_mut(th * tw);
+                let (g, b) = gb.split_at_mut(th * tw);
+                let (r, g, b) = (&mut r[y * tw..(y + 1) * tw], &mut g[y * tw..(y + 1) * tw], &mut b[y * tw..(y + 1) * tw]);
+                for (((px, r), g), b) in row.chunks_exact(3).zip(r.iter_mut()).zip(g.iter_mut()).zip(b.iter_mut()) {
+                    *r = px[0] as f32 * INV;
+                    *g = px[1] as f32 * INV;
+                    *b = px[2] as f32 * INV;
+                }
+            }
+            return t;
+        }
+        // pixel_unshuffle: out[c*u*u + (y%u)*u + (x%u)][y/u][x/u]. u is a
+        // power of two (2 or 4); the per-x work is a mask and a shift.
+        let shift = u.trailing_zeros();
+        let mask = u - 1;
         for y in 0..rh {
             let row = padded.row(io.region_y + y as u32, io.region_x, io.region_x + rw as u32);
-            for x in 0..rw {
-                for c in 0..3 {
-                    // pixel_unshuffle: out[c*u*u + (y%u)*u + (x%u)][y/u][x/u]
-                    let ch = c * u * u + (y % u) * u + (x % u);
-                    t.data[(ch * th + y / u) * tw + x / u] = row[x * 3 + c] as f32 / 255.0;
+            let (ry, yy) = (y & mask, y >> shift);
+            for c in 0..3 {
+                for rx in 0..u {
+                    let ch = c * u * u + ry * u + rx;
+                    let base = (ch * th + yy) * tw;
+                    let dst = &mut t.data[base..base + tw];
+                    // Pixels x with x % u == rx, in order: x = rx, rx+u, ...
+                    for (k, px) in row.chunks_exact(3).skip(rx).step_by(u).enumerate() {
+                        dst[k] = px[c] as f32 * INV;
+                    }
                 }
             }
         }
@@ -621,10 +647,11 @@ impl Network {
         for y in 0..ch {
             let sy = y + io.crop_y as usize;
             let base = out.idx(io.rect.x * s as u32, io.rect.y * s as u32 + y as u32);
-            for x in 0..cw {
-                let sx = x + io.crop_x as usize;
-                let i = (sy * ow + sx) * 4;
-                out.data[base + x * 3..base + x * 3 + 3].copy_from_slice(&rgba[i..i + 3]);
+            let src = &rgba[(sy * ow + io.crop_x as usize) * 4..(sy * ow + io.crop_x as usize + cw) * 4];
+            let dst = &mut out.data[base..base + cw * 3];
+            // RGBA → RGB, one row at a time.
+            for (d, s4) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
+                d.copy_from_slice(&s4[..3]);
             }
         }
     }

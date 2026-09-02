@@ -99,15 +99,15 @@ pub fn upscale_packed(up: &mut dyn Upscaler, frames: &[&Frame], canvas: u32) -> 
         let mut cv = Frame::new(cw, ch);
         for sl in &slots {
             let f = frames[sl.item];
-            // Item plus its replicate gutter ring.
+            // Item plus its replicate gutter ring: one padded copy, blitted
+            // row by row.
+            let ring = f.padded(GUTTER, crate::frame::Pad::Replicate);
             let x0 = sl.x - GUTTER;
             let y0 = sl.y - GUTTER;
-            for y in 0..f.height + 2 * GUTTER {
-                let sy = y.saturating_sub(GUTTER).min(f.height - 1);
-                for x in 0..f.width + 2 * GUTTER {
-                    let sx = x.saturating_sub(GUTTER).min(f.width - 1);
-                    cv.set_px(x0 + x, y0 + y, f.px(sx, sy));
-                }
+            let rb = (ring.width as usize) * 3;
+            for y in 0..ring.height {
+                let d = cv.idx(x0, y0 + y);
+                cv.data[d..d + rb].copy_from_slice(ring.row(y, 0, ring.width));
             }
         }
         let big = up.upscale(&cv)?;
