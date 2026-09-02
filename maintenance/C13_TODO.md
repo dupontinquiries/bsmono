@@ -2691,3 +2691,31 @@ reading.
    `D2X_TILE_PAD=64`, and `D2X_BLEND=0` to see the before-picture.
 Distinguishing 2 from 3 by whether the artefact blinks is the same test that
 found this one.
+
+
+## 85. §67-3 closed: the ladder was being reset by the model's own claim
+
+The retry ladder (cap 4) never fired on a run that looped 9 turns, because
+`observe`'s `accepted` argument included `|| text.contains(DONE_MARKER)`. The
+8B appended "TASK_COMPLETE" to every reply while every call was refused, so
+the counter reset each turn.
+
+Now only an executed call counts as progress.
+
+**The general shape, worth checking elsewhere:** a guard whose reset condition
+can be satisfied by the thing it is guarding against. The ladder exists to
+catch a model that cannot produce a valid call; letting that model's own
+assertion clear the counter hands it the key. Two other places in this
+codebase take a model's word for state — worth auditing with this in mind:
+- `action_sig` at workspace_exec.rs:2465 also branches on
+  `text.contains(DONE_MARKER) && tools.is_empty()`, i.e. the same claim from
+  the same untrusted source. It feeds loop detection rather than a reset, so
+  it is likely fine, but it is the same input.
+- the plan's `verified`/`unverifiable` counts come from the model's own
+  reporting; the field log showed "plan 0/4 verified, 4 unverifiable", which
+  is at least honest, but nothing cross-checks it against files actually read.
+
+**Remaining on the agent loop**, now that calls parse, refusals are enforced
+and the ladder fires: nothing known. The next run should show either working
+tool calls or a clean abort at 4 turns with a named reason — both are
+actionable, which the previous 9-turn loop was not.
