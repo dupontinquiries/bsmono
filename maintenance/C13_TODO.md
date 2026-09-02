@@ -2423,3 +2423,46 @@ logscope-egui's (48 shared, 5 extra, 0 unique). Same terms as
 (`gpuscene`, `texgen`, `glow_scene`) should be re-measured the same way:
 compare the PUBLIC SURFACE, not the diff-line count, which was what made §18
 wrong about mesh3d.
+
+
+## 75. §18 finished: per-module verdicts for the four scene-kit modules
+
+Measured properly this time — public surface AND literal shared content, per
+module. §18 said all four were "genuinely diverged (100-360 diff lines)" and
+left them alone. Diff-line count was the wrong instrument: it cannot tell an
+additive superset from a two-way rewrite, and it cannot tell WHICH SIDE is
+ahead.
+
+```
+              logscope  scene-kit  shared   of logscope / of scene-kit
+mesh3d            1646       1714    1572      95%           91%
+gpuscene           880        851     799      90%           93%
+texgen             571        244     241      42%           98%
+glow_scene         429        496     421      98%           84%
+```
+
+Public surface: logscope has NOTHING unique in any of the four. scene-kit
+adds `MAT_INSCRIPTION`/`MAT_INSCRIPTION2` (gpuscene), `PageTex`
+(glow_scene), and the `uvs` field (mesh3d).
+
+**Verdicts, which differ per module and were NOT interchangeable:**
+
+- `mesh3d` — migrate to scene-kit. Superset, additive (`uvs`). Same terms as
+  spatial/textsurface.
+- `glow_scene` — migrate to scene-kit. 98% of logscope's content is already
+  there and scene-kit adds `PageTex`.
+- `texgen` — **DO NOT MIGRATE. scene-kit's is the STALE one.** 98% of
+  scene-kit's content is in logscope's, and logscope's is 2.3x the size:
+  logscope's grew after extraction. Migrating logscope onto scene-kit would
+  delete ~330 lines of real work. The correct order is to update scene-kit
+  FROM logscope first, then migrate.
+- `gpuscene` — genuinely two-way (90%/93%). The one module §18's verdict was
+  right about. Needs a real review, not a sweep.
+
+**Correcting my own advice from §74.** I recommended re-measuring these "by
+public surface, not diff lines". That would have said texgen was safe to
+migrate — logscope has no unique public items — and the migration would have
+silently dropped 330 lines of private implementation. Public surface answers
+"is the API compatible"; it says nothing about WHERE THE WORK IS. Both
+measures are needed, and the content ratio is the one that identifies the
+stale side.
