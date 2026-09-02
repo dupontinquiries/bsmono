@@ -21,10 +21,12 @@
 pub mod frame;
 pub mod gate;
 pub mod matcher;
+pub mod net;
 pub mod pipeline;
 pub mod plan;
 pub mod predict;
 pub mod residual;
+pub mod st;
 pub mod upscale;
 pub mod waifu2x;
 
