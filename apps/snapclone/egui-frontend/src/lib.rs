@@ -3602,7 +3602,16 @@ impl Snapclone {
             self.ambient_camera_done(None);
         }
         let vf_rect = {
-            let r = ui.allocate_ui(egui::vec2(ui.available_width(), 220.0), |ui| {
+            // The controls below: a description line, the device picker row and
+            // the shutter row. Reserved from the page rather than the preview
+            // being capped — see `camera::viewfinder_height` for why that is
+            // the right way round. Derived from the theme's own interact size
+            // so a larger UI scale reserves proportionally more, instead of the
+            // shutter being pushed off a phone at 200%.
+            let row = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+            let h = crate::camera::viewfinder_height(
+                ui.available_height(), row * 3.0 + 16.0, 160.0);
+            let r = ui.allocate_ui(egui::vec2(ui.available_width(), h), |ui| {
                 crate::camera::viewfinder(ui, &mut self.viewfinder,
                                           self.cam_texture.as_ref(), c);
             });

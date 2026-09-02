@@ -185,6 +185,29 @@ impl Viewfinder {
 }
 
 /// Draw the viewfinder. `frame` is the latest camera image, if any.
+/// How tall the viewfinder should be on a page that also carries controls.
+///
+/// The camera page allocated the viewfinder a hard-coded 220 px and then had
+/// `viewfinder` take `available_size()` INSIDE that box — so the preview was a
+/// fixed strip on every screen, while the page dispatch was deliberately not
+/// wrapping this page in a ScrollArea precisely so that it could fill ("the
+/// camera page fills; wrapping it would give the viewfinder a scrollbar").
+/// The dispatch's intent and the page's allocation disagreed, and the page won.
+///
+/// The reserve is on the SMALL, roughly-constant part — the description line,
+/// the device picker and the shutter row — rather than on the large variable
+/// one. That is the right way round: a magic number that bounds the controls is
+/// wrong by a few pixels on an unusual theme, whereas a magic number that
+/// bounds the preview is wrong by the entire difference between a phone and a
+/// desktop, which is what 220 was.
+///
+/// `floor` keeps a short window showing SOME preview rather than none: on a
+/// window shorter than the controls need, a naive subtraction goes negative and
+/// the viewfinder vanishes entirely, which is worse than a cramped one.
+pub fn viewfinder_height(available: f32, controls_reserve: f32, floor: f32) -> f32 {
+    (available - controls_reserve).max(floor)
+}
+
 pub fn viewfinder(ui: &mut Ui, vf: &mut Viewfinder, frame: Option<&egui::TextureHandle>,
                   colors: &uikit_egui::PaletteColors) -> Rect {
     let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click());
@@ -235,6 +258,29 @@ pub fn viewfinder(ui: &mut Ui, vf: &mut Viewfinder, frame: Option<&egui::Texture
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_viewfinder_grows_with_the_page_instead_of_sitting_at_220() {
+        // The defect, named: a constant. On any page taller than the old 220,
+        // the preview must be bigger than it was.
+        let tall_phone = viewfinder_height(900.0, 180.0, 160.0);
+        assert_eq!(tall_phone, 720.0);
+        assert!(tall_phone > 220.0, "a 900px page still gives a 220px strip");
+        // And it must actually TRACK the page, not just exceed one threshold —
+        // a check that only asserted `> 220` would pass on a new constant.
+        assert!(viewfinder_height(1200.0, 180.0, 160.0) > tall_phone);
+        assert!(viewfinder_height(600.0, 180.0, 160.0) < tall_phone);
+    }
+
+    #[test]
+    fn a_short_window_keeps_some_preview_rather_than_none() {
+        // Naive subtraction goes negative here and the preview disappears,
+        // which is worse than a cramped one. Both directions: the floor holds,
+        // and it does not clamp a page that has room.
+        assert_eq!(viewfinder_height(100.0, 180.0, 160.0), 160.0);
+        assert_eq!(viewfinder_height(180.0, 180.0, 160.0), 160.0);
+        assert_eq!(viewfinder_height(500.0, 180.0, 160.0), 320.0, "the floor must not clamp a roomy page");
+    }
 
     fn wide() -> Rect { Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 400.0)) }
     fn tall() -> Rect { Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 800.0)) }
