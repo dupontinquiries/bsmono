@@ -2248,3 +2248,29 @@ logscope's two are guarded; check aperture, voiceterm and studio next.
 5. **`ctxplan` relevance on context cards** (§53 item 4) — the number now
    exists and the reference design shows it; surfacing it would make the
    selection legible instead of invisible.
+
+
+## 68. Profile accounting: overlap disclosed, cause not yet isolated
+
+The "134.3% accounted" line now says the buckets overlap and must not be
+ranked against each other. That unblocks nothing on its own — it stops the
+split being trusted, which is correct, because it should not have been.
+
+**Ruled out:** prefill. It fit the arithmetic well (50.25s prefill against a
+61.5s excess) but `td` and all counter baselines are taken after it.
+
+**Two candidates left**, to separate with per-thread accounting:
+1. Decode runs on several threads, so per-thread times sum past wall clock.
+   Then the excess is real and no bucket is wrong — the LINE is wrong for
+   presenting them as a partition.
+2. A timed region nests inside another. `setup`'s span covers
+   `bg_cache.lock()`, so a thread blocked on the mutex is charged to setup
+   while the holder is charged elsewhere. Then setup is inflated and the
+   32%-of-wall-time reading (§67 item 1) is an artefact.
+
+These have OPPOSITE implications for §67 item 1, which is why it should not
+be worked until this is settled: under (1) setup really is the second-largest
+cost; under (2) it may be mostly lock contention, which is a different fix.
+
+Cheapest experiment: record the counters per thread id and print the count of
+distinct contributing threads alongside the totals. One number decides it.
