@@ -2488,3 +2488,25 @@ Remaining, in order:
 `mesh3d` is the same shape and can follow. `texgen` must NOT (§75 — scene-kit's
 is stale, update it from logscope first). `gpuscene` is genuinely two-way and
 needs review rather than a sweep.
+
+
+## 77. glow_scene migrated (-449 lines). mesh3d is next; texgen still must not.
+
+Done: `app.rs` drives `scene_kit::perf::set_overrides` per frame, the module
+is a re-export, and `gpu-scene` forwards to `scene-kit/glow` (needed because
+logscope takes scene-kit with `default-features = false`, so the re-export did
+not resolve until the feature was threaded — only visible when building with
+the feature ON).
+
+**The one unverified thing**, and the reason the perf override exists: that
+logscope's in-app power control still changes render resolution. Check it with
+the settings open; the migration is only correct if that survives.
+
+Next, in order:
+- `mesh3d` — same shape (superset, additive `uvs`). No `perf` coupling to
+  solve, so it should be a straight re-export.
+- `gpuscene` — genuinely two-way (90%/93%), and it also reads
+  `theme::power_mode`. Needs review, not a sweep.
+- `texgen` — reverse direction. scene-kit's is the stale copy (98% of it is
+  inside logscope's, which is 2.3x the size). Update scene-kit FROM logscope
+  before any migration, or ~330 lines are lost.
