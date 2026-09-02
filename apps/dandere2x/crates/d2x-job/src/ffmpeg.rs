@@ -71,16 +71,53 @@ pub fn probe(path: &Path) -> anyhow::Result<Probe> {
     })
 }
 
-/// Presentation times of the source's keyframes (decoder skips everything
-/// else, so this is fast even on long files).
+/// Presentation times of the source's keyframes.
+///
+/// Demuxes only: `-show_packets` reads container packet headers and their
+/// `K` flag, never touching the decoder. On a two-hour AV1 file that is a
+/// few seconds; the `-skip_frame nokey` route decodes every keyframe and
+/// was the reason long inputs sat silent for a minute before frame 0.
+/// Cached in a sidecar next to the input keyed by size+mtime, so the second
+/// run (and every segment worker) pays nothing.
 pub fn keyframe_times(path: &Path) -> anyhow::Result<Vec<f64>> {
+    let meta = std::fs::metadata(path)?;
+    let key = format!("{} {}", meta.len(), meta.modified().ok().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs()));
+    let sidecar = path.with_extension(format!("{}.d2xkf", path.extension().and_then(|e| e.to_str()).unwrap_or("bin")));
+    if let Ok(text) = std::fs::read_to_string(&sidecar) {
+        let mut lines = text.lines();
+        if lines.next() == Some(key.as_str()) {
+            return Ok(lines.filter_map(|l| l.parse::<f64>().ok()).collect());
+        }
+    }
     let out = Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey", "-show_entries", "frame=pts_time", "-of", "csv=p=0"])
+        .args(["-v", "error", "-select_streams", "v:0", "-show_packets", "-show_entries", "packet=pts_time,dts_time,flags", "-of", "csv=p=0"])
         .arg(path)
         .output()
         .context("ffprobe keyframes")?;
     anyhow::ensure!(out.status.success(), "ffprobe keyframes failed: {}", String::from_utf8_lossy(&out.stderr));
-    Ok(String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().trim_end_matches(',').parse::<f64>().ok()).collect())
+    let mut times: Vec<f64> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split(',');
+            let pts = f.next()?.trim();
+            let dts = f.next()?.trim();
+            let flags = f.next()?.trim();
+            if !flags.contains('K') {
+                return None;
+            }
+            pts.parse::<f64>().ok().or_else(|| dts.parse::<f64>().ok())
+        })
+        .collect();
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    times.dedup();
+    let mut text = key.clone();
+    text.push('\n');
+    for t in &times {
+        text.push_str(&format!("{t:.6}\n"));
+    }
+    // Best effort: a read-only directory just means no cache.
+    let _ = std::fs::write(&sidecar, text);
+    Ok(times)
 }
 
 pub struct FfmpegSource {
@@ -127,7 +164,7 @@ impl FfmpegSource {
     }
 
     /// Decode only `[seg.start, seg.end)`. Input-side `-ss` on a keyframe
-    /// time is exact; `-to` is relative to the seek.
+    /// time is exact; `-t` is the duration from there.
     pub fn open_segment(path: &Path, p: &Probe, seg: Segment) -> anyhow::Result<Self> {
         let mut vf = String::from("format=rgb24");
         if let Some(space) = &p.color.space {
@@ -141,7 +178,9 @@ impl FfmpegSource {
         }
         cmd.arg("-i").arg(path);
         if let Some(end) = seg.end {
-            cmd.args(["-to", &format!("{:.6}", end - seg.start)]);
+            // `-t` (duration): unambiguous as an input option, unlike `-to`,
+            // which some ffmpeg versions take relative to the seek point.
+            cmd.args(["-t", &format!("{:.6}", end - seg.start)]);
         }
         let mut child = cmd
             .args(["-map", "0:v:0", "-vf", &vf, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
@@ -223,6 +262,13 @@ impl FfmpegSink {
     /// `None` writes a video-only part (segment parallelism muxes audio at
     /// the end).
     pub fn open(out: &Path, src: Option<&Path>, p: &Probe, width: u32, height: u32, opts: &EncodeOptions) -> anyhow::Result<Self> {
+        Self::open_ranged(out, src, p, width, height, opts, 0.0, None)
+    }
+
+    /// As `open`, muxing only `[start, end)` of the source's audio/subtitles
+    /// so a clip bounce stays in sync.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_ranged(out: &Path, src: Option<&Path>, p: &Probe, width: u32, height: u32, opts: &EncodeOptions, start: f64, end: Option<f64>) -> anyhow::Result<Self> {
         let fps = format!("{}/{}", p.info.fps.0, p.info.fps.1);
         let size = format!("{width}x{height}");
         let mut cmd = Command::new("ffmpeg");
@@ -230,7 +276,18 @@ impl FfmpegSink {
         cmd.args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &size, "-r", &fps, "-i", "-"]);
         if let Some(src) = src {
             cmd.arg("-i").arg(src);
-            cmd.args(["-map", "0:v:0", "-map", "1:a?", "-map", "1:s?", "-map_metadata", "1", "-c:a", "copy", "-c:s", "copy"]);
+            if start > 0.0 || end.is_some() {
+                // Sub-range: input-side seeking on a stream-copied audio track
+                // lands on the previous cluster and `-t` is then ignored, so
+                // the audio is trimmed as a filter and re-encoded (opus).
+                // Subtitles are dropped for a range (their timing would need
+                // the same shift and the container can't trim them by copy).
+                let e = end.map(|e| format!(":end={e:.6}")).unwrap_or_default();
+                cmd.args(["-map", "0:v:0", "-map", "1:a?", "-map_metadata", "1"]);
+                cmd.args(["-af", &format!("atrim=start={start:.6}{e},asetpts=PTS-STARTPTS"), "-c:a", "libopus", "-b:a", "160k"]);
+            } else {
+                cmd.args(["-map", "0:v:0", "-map", "1:a?", "-map", "1:s?", "-map_metadata", "1", "-c:a", "copy", "-c:s", "copy"]);
+            }
         } else {
             cmd.args(["-map", "0:v:0"]);
         }

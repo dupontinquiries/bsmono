@@ -218,6 +218,8 @@ pub enum Event {
     Progress { done: usize, jobs: usize, frac: f32 },
     /// A deliverable landed on disk.
     File(PathBuf),
+    /// A line for the status bar (what stage a long job is in).
+    Note(String),
     Done,
     Cancelled,
     Failed(String),

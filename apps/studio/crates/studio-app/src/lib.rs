@@ -21,6 +21,7 @@ pub mod capture;
 /// Playing a synth, and getting a pattern back.
 pub mod perform;
 pub mod export;
+pub mod upscale;
 pub mod clip_inspector;
 pub mod find;
 pub mod library;
@@ -1928,6 +1929,10 @@ pub struct App {
     export_run: Option<export::Run>,
     export_done: Vec<std::path::PathBuf>,
     export_progress: (usize, usize, f32),
+    /// The clip a dandere2x bounce belongs to while its run is in flight;
+    /// landed from the tracker's Done.
+    upscale_clip: Option<studio_core::ClipId>,
+    upscale_settings: upscale::Settings,
     /// The archive popup's working state while open.
     archive_ui: Option<ArchiveUi>,
     /// The workbench's right slot: the viewport (default) or another tool,
@@ -2066,6 +2071,8 @@ impl Default for App {
               export_run: None,
               export_done: Vec::new(),
               export_progress: (0, 0, 0.0),
+              upscale_clip: None,
+              upscale_settings: upscale::Settings::default(),
               tune_scale: None,
               analog: Box::new(analog),
               loaded: SinkContent::Nothing }
@@ -2343,6 +2350,23 @@ impl eframe::App for App {
                                 }
                                 self.audio.insert(id, audio);
                             }
+                        }
+                    }
+                }
+                // dandere2x clip bounce: same shape as tune take (a whole-
+                // clip pass landing a new clip), through the export tracker.
+                if !self.studio.selection.is_empty() && self.export_run.is_none() {
+                    let busy = self.export_run.is_some();
+                    if ui.add_enabled(!busy, egui::Button::new("upscale clip"))
+                        .on_hover_text("dandere2x: block-matched Real-ESRGAN upscale of the selected clip's range, to a new clip beside it (D2X_MODEL selects the model; default is the fast anime-video net)")
+                        .clicked()
+                    {
+                        let settings = self.upscale_settings.clone();
+                        if let Some((clip, run)) = self.studio.upscale_selected(&settings) {
+                            self.export_done.clear();
+                            self.export_progress = (0, 1, 0.0);
+                            self.upscale_clip = Some(clip);
+                            self.export_run = Some(run);
                         }
                     }
                 }
@@ -4506,19 +4530,35 @@ impl App {
                     self.export_progress = (done, jobs, frac);
                 }
                 export::Event::File(p) => self.export_done.push(p),
+                export::Event::Note(m) => self.studio.status = m,
                 export::Event::Done => {
-                    self.studio.status = format!(
-                        "exported {} file{}", self.export_done.len(),
-                        if self.export_done.len() == 1 { "" } else { "s" });
+                    if let Some(clip) = self.upscale_clip.take() {
+                        if let Some(p) = self.export_done.last().cloned() {
+                            self.studio.land_upscaled(clip, &p);
+                        }
+                    } else {
+                        self.studio.status = format!(
+                            "exported {} file{}", self.export_done.len(),
+                            if self.export_done.len() == 1 { "" } else { "s" });
+                    }
                     finished = true;
                 }
                 export::Event::Cancelled => {
-                    self.studio.status = format!(
-                        "export cancelled — {} file{} kept", self.export_done.len(),
-                        if self.export_done.len() == 1 { "" } else { "s" });
+                    // A cancelled bounce is still a playable file: land it,
+                    // with its real (shorter) length, rather than lose it.
+                    if let Some(clip) = self.upscale_clip.take() {
+                        if let Some(p) = self.export_done.last().cloned() {
+                            self.studio.land_upscaled(clip, &p);
+                        }
+                    } else {
+                        self.studio.status = format!(
+                            "export cancelled — {} file{} kept", self.export_done.len(),
+                            if self.export_done.len() == 1 { "" } else { "s" });
+                    }
                     finished = true;
                 }
                 export::Event::Failed(e) => {
+                    self.upscale_clip = None;
                     self.studio.status = format!("export failed: {e}");
                     finished = true;
                 }

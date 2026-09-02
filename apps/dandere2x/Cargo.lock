@@ -539,6 +539,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "d2x-job"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "d2x-core",
+ "d2x-wgpu",
+ "image",
+ "serde_json",
+]
+
+[[package]]
 name = "d2x-wgpu"
 version = "0.1.0"
 dependencies = [
@@ -557,11 +568,10 @@ dependencies = [
  "anyhow",
  "clap",
  "d2x-core",
+ "d2x-job",
  "d2x-wgpu",
  "eframe",
  "egui",
- "image",
- "serde_json",
  "snapclone-theme",
  "uikit-egui",
 ]

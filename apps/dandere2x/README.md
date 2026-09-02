@@ -17,7 +17,13 @@ ffmpeg (libdav1d) ─▶ analysis (CPU) ─▶ residual ─▶ wgpu CNN ─▶ m
 |---|---|---|
 | `crates/d2x-core` | the engine, headless: gate, matchers, plan, residual/merge, the `Network` op-list model layer with CPU reference, the two-stage pipeline | image, rayon, serde |
 | `crates/d2x-wgpu` | `Network` on wgpu 29: conv3x3 / deconv / add / pack kernels, tile loop, selftest | wgpu, pollster |
-| `crates/dandere2x` | CLI + egui shell (`app` feature): ffmpeg I/O, AV1 sink, segment parallelism | clap, eframe, uikit-egui |
+| `crates/d2x-job` | the job as a library: ffmpeg I/O, AV1 sink, backends, keyframe-aligned segment parallelism, clip ranges, cancel, stage events | image, serde_json |
+| `crates/dandere2x` | CLI + egui shell (`app` feature) over `d2x-job` | clap, eframe, uikit-egui |
+
+Studio (`apps/studio`) uses `d2x-job` directly: "upscale clip" bounces the
+selected clip's range in the background and lands a new source + clip beside
+the original (autotune's print-side pattern; dandere2x is sequential, so it
+cannot be a chain effect).
 
 Every layer above the engine only sees the traits `FrameSource`, `FrameSink`,
 `Upscaler`. The GPU is one `Upscaler`; the CPU reference is another; tests
@@ -50,6 +56,7 @@ dandere2x selftest --model RealESRGAN_x2.safetensors   # GPU vs CPU, byte-exact
 dandere2x analyze  -i in.mkv                       # what block reuse buys, per frame, no CNN
 dandere2x upscale  -i in.mkv -o out.mkv --model RealESRGAN_x2.safetensors
 dandere2x upscale  -i in.mkv -o out.mkv -j 4      # keyframe-aligned segments, one shared GPU, 4 encoders
+dandere2x upscale  -i in.mkv -o clip.mkv --start 61.5 --end 90   # a range (audio trimmed + re-encoded, opus)
 dandere2x app                                      # the shell
 ```
 
@@ -64,6 +71,10 @@ median keyframe interval (ffmpeg < 7 ignores `-force_key_frames` for
 libsvtav1; ≥ 7 gets the exact list). Colour tags are carried from the source;
 untagged sources are converted and tagged BT.709/tv. Audio, subtitles and
 metadata are remuxed from the source.
+
+Before frame 0 a long input costs a probe, a keyframe scan (packet headers
+only, cached in `<input>.<ext>.d2xkf`), the model load, GPU init and one
+full-frame upscale; each is reported as a stage so the shell is never silent.
 
 ## Numbers and where the time goes
 

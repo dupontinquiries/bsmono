@@ -1,10 +1,20 @@
 //! One place that turns settings into a running pipeline, shared by the CLI
 //! subcommands and the egui shell so they cannot drift.
 
-use crate::ffmpeg::{self, EncodeOptions, FfmpegSink, FfmpegSource, PngDirSink, PngDirSource};
+use crate::ffmpeg::{self, EncodeOptions, FfmpegSink, FfmpegSource, PngDirSink, PngDirSource, Segment};
 use anyhow::{anyhow, Context};
 use d2x_core::net::{CpuNet, Network};
-use d2x_core::pipeline::{Event, FrameSink, FrameSource, MatcherKind, PipelineConfig, Summary};
+use d2x_core::pipeline::{Event as PEvent, FrameSink, FrameSource, MatcherKind, PipelineConfig, Summary};
+
+/// What a job reports. `Stage` covers the work before the first frame,
+/// which on a long input used to be a silent minute.
+#[derive(Debug, Clone)]
+pub enum Event {
+    Stage(String),
+    Pipeline(PEvent),
+    /// Segment-parallel runs: which worker the pipeline event belongs to.
+    Segment(usize, PEvent),
+}
 use d2x_core::predict::AnalyzeConfig;
 use d2x_core::upscale::{BicubicUpscaler, NearestUpscaler, Resampled, Upscaler};
 use std::path::{Path, PathBuf};
@@ -48,6 +58,13 @@ pub struct Job {
     /// keyframes, share one upscaler, encode to part files, and are
     /// concatenated by stream copy at the end.
     pub jobs: usize,
+    /// Only this range of the input, in seconds (a clip's in/out points).
+    /// `start` is snapped to the previous keyframe by the decoder; `end` is exact.
+    pub start: f64,
+    pub end: Option<f64>,
+    /// Set from another thread to stop after the current frame; the encoder
+    /// then finalises a playable partial file.
+    pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for Job {
@@ -66,6 +83,9 @@ impl Default for Job {
             encode: EncodeOptions::default(),
             max_frames: 0,
             jobs: 1,
+            start: 0.0,
+            end: None,
+            cancel: None,
         }
     }
 }
@@ -140,18 +160,37 @@ impl FrameSource for Limited {
 }
 use d2x_core::frame::Frame;
 
+struct Cancellable {
+    inner: Box<dyn FrameSource>,
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FrameSource for Cancellable {
+    fn info(&self) -> d2x_core::pipeline::SourceInfo {
+        self.inner.info()
+    }
+    fn next_frame(&mut self) -> anyhow::Result<Option<Frame>> {
+        if self.flag.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
+        self.inner.next_frame()
+    }
+}
+
 pub fn open_source(job: &Job) -> anyhow::Result<(Box<dyn FrameSource>, Option<ffmpeg::Probe>)> {
     let (src, probe): (Box<dyn FrameSource>, Option<ffmpeg::Probe>) = if job.input.is_dir() {
         (Box::new(PngDirSource::open(&job.input, (30, 1))?), None)
     } else {
         let p = ffmpeg::probe(&job.input)?;
-        (Box::new(FfmpegSource::open(&job.input, &p)?), Some(p))
+        let seg = Segment { index: 0, start: job.start, end: job.end };
+        (Box::new(FfmpegSource::open_segment(&job.input, &p, seg)?), Some(p))
     };
-    if job.max_frames > 0 {
-        Ok((Box::new(Limited { inner: src, left: job.max_frames }), probe))
-    } else {
-        Ok((src, probe))
-    }
+    let src: Box<dyn FrameSource> = if job.max_frames > 0 { Box::new(Limited { inner: src, left: job.max_frames }) } else { src };
+    let src: Box<dyn FrameSource> = match &job.cancel {
+        Some(flag) => Box::new(Cancellable { inner: src, flag: flag.clone() }),
+        None => src,
+    };
+    Ok((src, probe))
 }
 
 /// Median keyframe interval of the source, in frames, so the output GOP
@@ -175,21 +214,20 @@ fn with_keyint(mut enc: EncodeOptions, keyframes: &[f64], fps: (u32, u32)) -> En
     enc
 }
 
-pub fn open_sink(job: &Job, probe: Option<&ffmpeg::Probe>, width: u32, height: u32) -> anyhow::Result<Box<dyn FrameSink>> {
+pub fn open_sink(job: &Job, probe: Option<&ffmpeg::Probe>, keyframes: &[f64], width: u32, height: u32) -> anyhow::Result<Box<dyn FrameSink>> {
     if job.output.extension().is_none() || job.output.is_dir() {
         return Ok(Box::new(PngDirSink::open(&job.output)?));
     }
     let p = probe.ok_or_else(|| anyhow!("encoding to a video needs a video input (PNG-dir input can only write a PNG dir)"))?;
     let mut enc = job.encode.clone();
     if enc.keyframes.is_empty() {
-        match ffmpeg::keyframe_times(&job.input) {
-            Ok(k) => enc.keyframes = k,
-            Err(e) => eprintln!("note: could not read source keyframes ({e}); encoder picks its own"),
-        }
+        enc.keyframes = keyframes.iter().filter(|&&t| t >= job.start && job.end.map_or(true, |e| t < e)).map(|t| t - job.start).collect();
     }
-    let kf = enc.keyframes.clone();
-    let enc = with_keyint(enc, &kf, p.info.fps);
-    Ok(Box::new(FfmpegSink::open(&job.output, Some(&job.input), p, width, height, &enc)?))
+    let enc = with_keyint(enc, keyframes, p.info.fps);
+    // A range that is only audio-muxable if it starts at 0: ffmpeg would
+    // otherwise pair frame 0 with the source's first audio sample. Cut the
+    // audio to the same range.
+    Ok(Box::new(FfmpegSink::open_ranged(&job.output, Some(&job.input), p, width, height, &enc, job.start, job.end)?))
 }
 
 /// One upscaler shared by several pipelines: the GPU is serial anyway; what
@@ -213,8 +251,9 @@ impl Upscaler for SharedUpscaler {
 /// video input, one shared upscaler, part files concatenated at the end.
 /// Events carry the segment index as `Event::Started`'s upscaler name prefix
 /// and are delivered on the calling thread.
-pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, Event)) -> anyhow::Result<Summary> {
+pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyhow::Result<Summary> {
     anyhow::ensure!(!job.input.is_dir() && job.output.extension().is_some(), "--jobs needs a video input and a video output");
+    anyhow::ensure!(job.start == 0.0 && job.end.is_none(), "segment parallelism over a sub-range is not implemented yet; use jobs = 1 for clip bounces");
     let p = ffmpeg::probe(&job.input)?;
     let keyframes = ffmpeg::keyframe_times(&job.input).unwrap_or_default();
     let segs = ffmpeg::segments(&keyframes, p.duration_s, job.jobs);
@@ -225,15 +264,14 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, Event)) -> anyho
     let ext = job.output.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "mkv".into());
     let parts: Vec<PathBuf> = segs.iter().map(|s| job.output.with_file_name(format!("{stem}.part{:03}.{ext}", s.index))).collect();
 
-    let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<Event, String>)>();
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<PEvent, String>)>();
     let mut handles = Vec::new();
     for (seg, part) in segs.iter().zip(&parts) {
-        let (seg, part, tx, p, job, upscaler) = (*seg, part.clone(), tx.clone(), p.clone(), job.clone(), upscaler.clone());
+        let (seg, part, tx, p, job, upscaler, all) = (*seg, part.clone(), tx.clone(), p.clone(), job.clone(), upscaler.clone(), keyframes.clone());
         handles.push(std::thread::Builder::new().name(format!("d2x-seg{}", seg.index)).spawn(move || -> anyhow::Result<Summary> {
             let src = Box::new(FfmpegSource::open_segment(&job.input, &p, seg)?);
             let mut enc = job.encode.clone();
-            // Keyframes relative to this segment's start.
-            let all = ffmpeg::keyframe_times(&job.input).unwrap_or_default();
+            // Keyframes relative to this segment's start (one scan, shared).
             enc.keyframes = all.iter().filter(|&&t| t >= seg.start && seg.end.map_or(true, |e| t < e)).map(|t| t - seg.start).collect();
             let enc = with_keyint(enc, &all, p.info.fps);
             let sink = Box::new(FfmpegSink::open(&part, None, &p, w, h, &enc)?);
@@ -273,12 +311,22 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, Event)) -> anyho
 /// Run a job end to end. `on_event` receives pipeline events on the calling thread.
 pub fn run(job: &Job, mut on_event: impl FnMut(Event)) -> anyhow::Result<Summary> {
     if job.jobs > 1 {
-        return run_segmented(job, |_, e| on_event(e));
+        return run_segmented(job, |i, e| on_event(Event::Segment(i, e)));
     }
+    on_event(Event::Stage(format!("probing {}", job.input.display())));
     let (source, probe) = open_source(job)?;
     let info = source.info();
+    let keyframes = if probe.is_some() && job.output.extension().is_some() {
+        on_event(Event::Stage("scanning keyframes (packet headers only; cached in a sidecar)".into()));
+        ffmpeg::keyframe_times(&job.input).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    on_event(Event::Stage(format!("loading model and initialising the {:?} backend", job.backend)));
     let upscaler = build_upscaler(job)?;
     let scale = upscaler.scale();
-    let sink = open_sink(job, probe.as_ref(), info.width * scale, info.height * scale)?;
-    d2x_core::pipeline::run(source, upscaler, sink, job.pipeline, on_event)
+    on_event(Event::Stage("starting encoder".into()));
+    let sink = open_sink(job, probe.as_ref(), &keyframes, info.width * scale, info.height * scale)?;
+    on_event(Event::Stage("frame 0 is a full-frame upscale; later frames only pay for what changed".into()));
+    d2x_core::pipeline::run(source, upscaler, sink, job.pipeline, |e| on_event(Event::Pipeline(e)))
 }

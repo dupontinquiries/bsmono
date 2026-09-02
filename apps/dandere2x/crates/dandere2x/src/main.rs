@@ -6,14 +6,12 @@
 //! `dandere2x probe`                  adapters wgpu can see
 //! `dandere2x app`                    the egui shell (feature `app`)
 
-mod ffmpeg;
-mod job;
 #[cfg(feature = "app")]
 mod app;
 
 use clap::{Parser, Subcommand};
 use d2x_core::pipeline::{Event, MatcherKind};
-use job::{Backend, Job};
+use d2x_job::job::{self, Backend, Job};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -82,6 +80,12 @@ enum Cmd {
         /// Segment workers: cut on source keyframes, one shared GPU, N encoders, parts concatenated.
         #[arg(long, short = 'j', default_value_t = 1)]
         jobs: usize,
+        /// Start time in seconds (snaps to the previous keyframe).
+        #[arg(long, default_value_t = 0.0)]
+        start: f64,
+        /// End time in seconds.
+        #[arg(long)]
+        end: Option<f64>,
     },
     /// Stage A only: per-frame reuse statistics, no upscaling.
     Analyze {
@@ -158,23 +162,27 @@ fn print_event(e: &Event) {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Upscale { input, output, common, codec, crf, preset, eight_bit, jobs } => {
+        Cmd::Upscale { input, output, common, codec, crf, preset, eight_bit, jobs, start, end } => {
             let mut job = job_from(&common, input, output)?;
             job.jobs = jobs;
+            job.start = start;
+            job.end = end;
             job.encode.codec = codec;
             job.encode.crf = crf;
             job.encode.preset = preset;
             job.encode.ten_bit = !eight_bit;
-            if job.jobs > 1 {
-                let s = job::run_segmented(&job, |seg, e| {
+            let s = job::run(&job, |e| match e {
+                job::Event::Stage(m) => eprintln!("… {m}"),
+                job::Event::Pipeline(e) => print_event(&e),
+                job::Event::Segment(seg, e) => {
                     if !matches!(e, Event::Finished { .. }) {
                         eprint!("[seg {seg}] ");
                         print_event(&e);
                     }
-                })?;
+                }
+            })?;
+            if job.jobs > 1 {
                 eprintln!("done: {} frames in {:.1}s ({:.2} fps); {:.1}% of pixels went through the network", s.frames, s.elapsed.as_secs_f64(), s.frames as f64 / s.elapsed.as_secs_f64().max(1e-9), s.upscaled_pixel_fraction * 100.0);
-            } else {
-                job::run(&job, |e| print_event(&e))?;
             }
         }
         Cmd::Analyze { input, common } => {

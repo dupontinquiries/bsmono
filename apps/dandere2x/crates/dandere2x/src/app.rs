@@ -4,7 +4,7 @@
 //! a preview of the latest output frame. Stop is clean — the source is cut
 //! and the encoder finalises a playable partial file.
 
-use crate::job::{self, Backend, Job};
+use d2x_job::job::{self, Backend, Job};
 use d2x_core::frame::Frame;
 use d2x_core::pipeline::{Event, FrameSink, FrameSource, MatcherKind, SourceInfo};
 use eframe::egui;
@@ -90,33 +90,48 @@ impl FrameSource for StoppableSource {
 
 fn run_job(job: Job, analyze_only: bool, tx: Sender<Msg>, stop: Arc<AtomicBool>) {
     let r = (|| -> anyhow::Result<()> {
-        let (source, probe) = job::open_source(&job)?;
-        if let Some(p) = &probe {
-            let _ = tx.send(Msg::Log(LogLevel::Info, format!("source: {} {} {}{}", p.codec, p.pix_fmt, p.color.space.as_deref().unwrap_or("untagged"), p.duration_s.map_or(String::new(), |d| format!(", {d:.1}s")))));
-        }
-        let source: Box<dyn FrameSource> = Box::new(StoppableSource { inner: source, stop });
         if analyze_only {
-            let s = d2x_core::pipeline::analyze_only(source, job.pipeline, |i, st, frac, t| {
+            let _ = tx.send(Msg::Log(LogLevel::Info, "probing".into()));
+            let (source, _) = job::open_source(&job)?;
+            let source: Box<dyn FrameSource> = Box::new(StoppableSource { inner: source, stop });
+            let s = d2x_core::pipeline::analyze_only(source, job.pipeline, |i, st, _frac, t| {
                 let _ = tx.send(Msg::Event(Event::FrameDone { index: i, stats: *st, analyze_time: t, upscale_time: Duration::ZERO, merge_time: Duration::ZERO }));
-                let _ = frac;
             })?;
             let _ = tx.send(Msg::Event(Event::Finished { frames: s.frames, elapsed: s.elapsed, upscaled_pixel_fraction: s.upscaled_pixel_fraction }));
             return Ok(());
         }
         if job.jobs > 1 {
             let _ = tx.send(Msg::Log(LogLevel::Info, format!("{} segment workers, one shared upscaler; parts are concatenated at the end (no preview in this mode)", job.jobs)));
-            drop(source);
             let tx2 = tx.clone();
-            job::run_segmented(&job, move |_, e| {
-                let _ = tx2.send(Msg::Event(e));
+            job::run(&job, move |e| {
+                let _ = match e {
+                    job::Event::Stage(m) => tx2.send(Msg::Log(LogLevel::Info, m)),
+                    job::Event::Pipeline(e) | job::Event::Segment(_, e) => tx2.send(Msg::Event(e)),
+                };
             })?;
             return Ok(());
         }
+        // Single pipeline, assembled here so the sink can be wrapped for
+        // preview and the source for Stop.
+        let _ = tx.send(Msg::Log(LogLevel::Info, format!("probing {}", job.input.display())));
+        let (source, probe) = job::open_source(&job)?;
+        if let Some(p) = &probe {
+            let _ = tx.send(Msg::Log(LogLevel::Info, format!("source: {} {} {}x{}, colour {}/{}/{}", p.codec, p.pix_fmt, p.info.width, p.info.height, p.color.primaries.as_deref().unwrap_or("?"), p.color.transfer.as_deref().unwrap_or("?"), p.color.space.as_deref().unwrap_or("?"))));
+        }
+        let source: Box<dyn FrameSource> = Box::new(StoppableSource { inner: source, stop });
         let info = source.info();
+        let keyframes = if probe.is_some() && job.output.extension().is_some() {
+            let _ = tx.send(Msg::Log(LogLevel::Info, "scanning keyframes (packet headers only; cached in a sidecar)".into()));
+            d2x_job::ffmpeg::keyframe_times(&job.input).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let _ = tx.send(Msg::Log(LogLevel::Info, format!("loading model and initialising the {:?} backend", job.backend)));
         let upscaler = job::build_upscaler(&job)?;
         let scale = upscaler.scale();
-        let inner = job::open_sink(&job, probe.as_ref(), info.width * scale, info.height * scale)?;
+        let inner = job::open_sink(&job, probe.as_ref(), &keyframes, info.width * scale, info.height * scale)?;
         let sink: Box<dyn FrameSink> = Box::new(TeeSink { inner, tx: tx.clone(), every: 4, n: 0 });
+        let _ = tx.send(Msg::Log(LogLevel::Info, "frame 0 is a full-frame upscale; later frames only pay for what changed".into()));
         let tx2 = tx.clone();
         d2x_core::pipeline::run(source, upscaler, sink, job.pipeline, move |e| {
             let _ = tx2.send(Msg::Event(e));
