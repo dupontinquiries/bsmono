@@ -915,6 +915,178 @@ mod tests {
     }
 }
 
+/// Drive the real widget with real pointer events.
+///
+/// Every other test in this file holds the PURE half still — `grab`,
+/// `move_target`, `snap` — and they all pass while the field report says a
+/// dragged clip does not land. That is the gap those tests cannot see: the
+/// lifecycle between them (does `drag_started` fire, is `interact_pointer_pos`
+/// still valid on the release frame, does `drag_stopped` reach the arm that
+/// fills `moved`) lives in egui, not in this crate's arithmetic.
+///
+/// # Status: the harness does not work yet, and that is not evidence
+///
+/// The drag test is `#[ignore]`d. Synthetic frames get as far as a held button
+/// with 400px of travel and `view.drag` still `None`, which means
+/// `resp.drag_started()` never fires. **This says nothing about the reported
+/// bug** — a simulated pointer that fails to start a drag is the likeliest
+/// explanation, and reading it as a reproduction would be exactly the mistake
+/// of trusting a red result as much as a green one.
+///
+/// What was ruled out along the way, so the next attempt does not redo it:
+///
+/// * **Geometry.** `grab()` called directly at the same coordinates the test
+///   aims at returns `Some(ClipDrag { kind: Move, .. })`. The aim is right.
+/// * **Panel margins.** A `CentralPanel` insets its contents, so the widget's
+///   origin is not `(0, 0)` and every coordinate computed against `origin_x =
+///   0.0` lands a few pixels off. Fixed with `Frame::NONE`; the symptom did
+///   not change.
+/// * **Pointer state.** Instrumented per frame: press registers
+///   (`press_origin = Some`), the button stays down, and the pointer reaches
+///   400px away — well past egui's 6px `max_click_dist`.
+/// * **`interact_pointer_pos` on release.** egui 0.34 sets it when
+///   `drag_stopped()`, with a comment saying so, so the release frame is not
+///   where a position is lost.
+///
+/// What is left to check: `Interaction::potential_drag_id` is captured from
+/// `hits.drag` on the Pressed event, so if the widget is not in the PREVIOUS
+/// frame's registered rects at that moment, the drag can never start no matter
+/// how far the pointer travels. That is a plausible harness fault (frame
+/// ordering) and a plausible product fault (the timeline re-allocating under a
+/// different id between frames), and telling them apart is the next step.
+/// `egui_kittest` exists for precisely this and is probably the shorter road
+/// than hand-rolling the frames.
+#[cfg(test)]
+mod drag_lifecycle_tests {
+    use super::*;
+    use studio_core::{Clip, ClipId, Op, Source, SourceId, Track, TrackId};
+
+    fn doc() -> Doc {
+        let mut p = Project::default();
+        for (i, (kind, nm)) in [(studio_core::TrackKind::Video, "V1"),
+                                (studio_core::TrackKind::Audio, "A1"),
+                                (studio_core::TrackKind::Audio, "A2")].iter().enumerate() {
+            p.apply(&Op::AddTrack { track: Track { id: TrackId(i as u64 + 1), kind: *kind,
+                name: (*nm).into(), muted: false, locked: false, gain: 1.0, route: None },
+                at: i }).unwrap();
+        }
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
+            len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 2,
+            has_video: true } }).unwrap();
+        // Audio clip on A1 (row 1), 3s..8s — the same shape the pure tests use.
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(20), source: SourceId(1),
+            track: TrackId(2), pos: Ticks::from_seconds(3.0), src_in: Ticks::ZERO,
+            len: Ticks::from_seconds(5.0), gain: 1.0, effects: vec![] } }).unwrap();
+        Doc::new(studio_collab::SiteId(1), p)
+    }
+
+    /// One timeline frame with the pointer in a given state. Returns what the
+    /// widget reported and where the frame put its origin, so a caller can aim
+    /// the next event at a real clip.
+    fn frame(
+        ctx: &egui::Context,
+        doc: &Doc,
+        view: &mut View,
+        events: Vec<egui::Event>,
+        pointer: Option<Pos2>,
+    ) -> TimelineResponse {
+        let mut input = egui::RawInput {
+            events,
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+            ..Default::default()
+        };
+        if let Some(p) = pointer {
+            input.events.insert(0, egui::Event::PointerMoved(p));
+        }
+        let mut out = TimelineResponse::default();
+        let colors = PaletteColors::from_palette(&snapclone_theme::palette::DARK);
+        let peaks = std::collections::BTreeMap::new();
+        let closed = std::collections::BTreeSet::new();
+        // An Area at a fixed origin, NOT a CentralPanel: a panel applies an
+        // inner margin, so the widget's rect.min would not be (0, 0) and every
+        // coordinate this test computes with `origin_x = 0.0` would be aimed a
+        // few pixels off the thing it means to hit. That failure looks exactly
+        // like the bug under investigation, which is the worst way for a test
+        // fixture to be wrong.
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                out = timeline(ui, doc, view, &colors, Ticks::ZERO, &[], &peaks,
+                               TrimSide::Left, &closed, keys::Mode::Normal,
+                               playkeys::InputMode::Motions, "", None);
+            });
+        });
+        out
+    }
+
+    // IGNORED: the HARNESS is unproven, not the widget. See the module note
+    // below for exactly what was ruled out and what is left to check.
+    #[test]
+    #[ignore = "synthetic pointer frames do not start an egui drag yet; harness, not product"]
+    fn a_body_drag_reports_a_move_on_release() {
+        let d = doc();
+        let mut view = View::default();
+        let ctx = egui::Context::default();
+
+        // The panel's origin is not known until a frame has run, and the first
+        // frame of any egui context is a layout pass. So: settle, then aim.
+        frame(&ctx, &d, &mut view, vec![], None);
+
+        // Somewhere in the middle of clip 20's body on row 1 — away from both
+        // edges, so this is a Move grab and not a trim.
+        let grab_x = view.time_to_x(Ticks::from_seconds(5.0), 0.0);
+        let row1_y = RULER_H + view.track_h * 1.5;
+        let from = Pos2::new(grab_x, row1_y);
+        let to = Pos2::new(view.time_to_x(Ticks::from_seconds(9.0), 0.0), row1_y);
+
+        // Press. egui does not call this a DRAG until the pointer has moved
+        // past its threshold, so nothing is grabbed yet — a press that never
+        // moves is a click, which is correct and is why the grab is asserted
+        // after the motion rather than here.
+        frame(&ctx, &d, &mut view, vec![egui::Event::PointerButton {
+            pos: from, button: egui::PointerButton::Primary, pressed: true,
+            modifiers: Default::default() }], Some(from));
+
+        // Move, still held. Two frames: the first crosses the threshold and is
+        // where `drag_started` fires, the second is an ordinary drag frame.
+        frame(&ctx, &d, &mut view, vec![], Some(to));
+        assert!(view.drag.is_some(), "the drag did not grab the clip");
+        let mid = frame(&ctx, &d, &mut view, vec![], Some(to));
+        assert!(mid.moved.is_none(), "a move must not commit before release");
+
+        // Release.
+        let out = frame(&ctx, &d, &mut view, vec![egui::Event::PointerButton {
+            pos: to, button: egui::PointerButton::Primary, pressed: false,
+            modifiers: Default::default() }], Some(to));
+
+        let (id, pos, track) = out.moved.expect(
+            "release over the timeline reported no move — the drop is being dropped");
+        assert_eq!(id, ClipId(20));
+        assert_eq!(track, TrackId(2), "a horizontal drag keeps the track");
+        assert!(pos > Ticks::from_seconds(3.0), "the clip should have moved right, got {pos:?}");
+        assert!(view.drag.is_none(), "the drag state outlived the release");
+    }
+
+    #[test]
+    fn a_release_without_a_grab_reports_nothing() {
+        // The complement: if `moved` fired on any release the test above would
+        // pass while the widget was broken in the other direction.
+        let d = doc();
+        let mut view = View::default();
+        let ctx = egui::Context::default();
+        frame(&ctx, &d, &mut view, vec![], None);
+        // Empty space well past every clip.
+        let at = Pos2::new(view.time_to_x(Ticks::from_seconds(40.0), 0.0),
+                           RULER_H + view.track_h * 2.5);
+        frame(&ctx, &d, &mut view, vec![egui::Event::PointerButton {
+            pos: at, button: egui::PointerButton::Primary, pressed: true,
+            modifiers: Default::default() }], Some(at));
+        let out = frame(&ctx, &d, &mut view, vec![egui::Event::PointerButton {
+            pos: at, button: egui::PointerButton::Primary, pressed: false,
+            modifiers: Default::default() }], Some(at));
+        assert!(out.moved.is_none(), "a release on empty space moved something");
+    }
+}
+
 #[cfg(test)]
 mod move_target_tests {
     use super::*;
@@ -1072,3 +1244,4 @@ mod grab_and_trim_tests {
         assert_eq!(view.scroll, Ticks::ZERO, "there is nothing before the origin to see");
     }
 }
+

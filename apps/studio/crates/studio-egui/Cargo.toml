@@ -22,3 +22,9 @@ studio-audio = { path = "../studio-audio" }
 studio-fx = { path = "../studio-fx" }
 egui = "0.34"        # must match uikit-egui, or Color32 and Sense are different types
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
+
+[dev-dependencies]
+# Only the tests need to BUILD a palette; the widget takes one it is handed.
+# uikit-egui's PaletteColors is constructed from a snapclone-theme Palette and
+# has no Default, so a test that drives the real widget needs the source type.
+snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }
