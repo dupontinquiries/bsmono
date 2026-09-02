@@ -747,16 +747,17 @@ pub fn sun_dir_3d() -> Vec3 {
 /// `warmth` -1..1 (warm orange near sunrise/sunset, neutral at noon, cool blue at night), and `ambient` mul.
 /// Lets the scene's sun colour, exposure and fill track the real time of day on top of the per-theme grade.
 pub fn sun_clock() -> (f32, f32, f32) {
-    let h = local_hour();
-    // elevation 0..1 over the day; smooth, with civil-twilight tails
-    let elev = (std::f32::consts::PI * ((h - 6.0) / 12.0)).sin();
-    let day = elev.max(0.0);                       // 0 at/under horizon, 1 at noon
-    let strength = (0.12 + 0.88 * day).clamp(0.10, 1.0);
-    // warmth: hottest when the sun is low but up (dawn/dusk), neutral high noon, cool at night
-    let low_sun = (1.0 - (elev.abs())).clamp(0.0, 1.0); // 1 near the horizon
-    let warmth = if elev > 0.04 { low_sun * 0.85 } else { -0.55 * (1.0 - day) }; // warm by day-edge, cool by night
-    let ambient = 0.56 + 0.62 * day;               // dim fill at night, more at midday
-    (strength, warmth, ambient)
+    // DELEGATES to uikit_egui::lux::sky_at, which is the same curve extracted so
+    // the 2D panels can share it.
+    //
+    // Before this the scene tracked the real clock and the panels did not, so
+    // the room behind the glass changed through the day and the glass did not —
+    // the clearest tell that they are two unrelated renderers rather than one
+    // place. Keeping a second copy of the curve here would have let them drift
+    // the moment either was tuned, which is the same two-lists problem that has
+    // bitten this codebase repeatedly (see the tool-surface work).
+    let s = uikit_egui::lux::sky_at(local_hour());
+    (s.strength, s.warmth, s.ambient)
 }
 
 /// Build a lit 3D scene for the conversation graph: a shaded orb per node (coloured by `node_cols`, the

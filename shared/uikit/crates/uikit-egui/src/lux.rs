@@ -213,3 +213,170 @@ mod integration_notes {
              surfaces feel unchanged");
     }
 }
+
+// ── time of day ──────────────────────────────────────────────────────────────
+//
+// logscope's 3D scene already tracks the real local clock (`mesh3d::sun_clock`)
+// — a warm low sun at dawn and dusk, neutral at noon, cool and dim at night.
+// The 2D panels do not, so the room behind the glass changes through the day
+// and the glass itself does not, which is the single most obvious tell that
+// they are two unrelated renderers rather than one place.
+//
+// This is the same model, extracted so both can share it. Pure and
+// hour-parameterised rather than clock-reading, so it is testable and so a
+// caller can drive it from a scrubber (a demo, a screenshot set, "show me this
+// panel at 3am") instead of only from `now`.
+
+/// The light at a moment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sky {
+    /// Sun brightness, 0.1 (night) to 1.0 (noon).
+    pub strength: f32,
+    /// -1 cool to +1 warm. Peaks near sunrise and sunset, neutral at noon,
+    /// negative at night — the golden-hour curve, which is NOT the same as
+    /// "warm during the day".
+    pub warmth: f32,
+    /// Ambient fill multiplier.
+    pub ambient: f32,
+}
+
+/// The sky at local hour `h` (0..24, fractional).
+///
+/// Matches `mesh3d::sun_clock`'s curve exactly so the panels and the scene
+/// cannot drift apart; that function should delegate here rather than keep a
+/// second copy.
+pub fn sky_at(h: f32) -> Sky {
+    let h = h.rem_euclid(24.0);
+    let elev = (std::f32::consts::PI * ((h - 6.0) / 12.0)).sin();
+    let day = elev.max(0.0);
+    let low_sun = (1.0 - elev.abs()).clamp(0.0, 1.0);
+    Sky {
+        strength: (0.12 + 0.88 * day).clamp(0.10, 1.0),
+        warmth: if elev > 0.04 { low_sun * 0.85 } else { -0.55 * (1.0 - day) },
+        ambient: 0.56 + 0.62 * day,
+    }
+}
+
+/// Grade one RGB colour by the sky.
+///
+/// `amount` in `[0,1]` is how much of the effect to apply — 0 is the palette
+/// untouched. It exists because time-of-day grading must be DEFEATABLE: a
+/// palette is a deliberate choice, and an operator who picked Travertine and
+/// gets muddy blue Travertine at 2am will conclude the theme is broken rather
+/// than that it is 2am. The default should be subtle and the setting should
+/// reach zero.
+///
+/// Deliberately a channel tilt plus a luminance nudge rather than a hue
+/// rotation: rotating hue moves an accent off the palette's identity (gold
+/// becomes green), while tilting red against blue keeps the colour recognisably
+/// itself and just changes the light falling on it — which is the physical
+/// thing being modelled.
+pub fn grade(rgb: [u8; 3], sky: Sky, amount: f32) -> [u8; 3] {
+    let a = amount.clamp(0.0, 1.0);
+    if a == 0.0 {
+        return rgb;
+    }
+    // Warm tilts red up and blue down; cool does the reverse. Bounded so a
+    // fully warm sky can never blow a channel out on its own.
+    let tilt = sky.warmth.clamp(-1.0, 1.0) * 0.10 * a;
+    // Night dims, noon leaves alone. Never brightens past the palette's own
+    // value: a theme author picked those numbers and the clock is not entitled
+    // to overrule them upward.
+    let lum = 1.0 - (1.0 - sky.strength.clamp(0.0, 1.0)) * 0.18 * a;
+    let ch = |v: u8, t: f32| -> u8 {
+        let x = v as f32 / 255.0;
+        ((x * (1.0 + t) * lum).clamp(0.0, 1.0) * 255.0).round() as u8
+    };
+    [ch(rgb[0], tilt), ch(rgb[1], tilt * 0.25), ch(rgb[2], -tilt)]
+}
+
+#[cfg(test)]
+mod sky_tests {
+    use super::*;
+
+    #[test]
+    fn noon_is_bright_and_neutral_dawn_and_dusk_are_warm() {
+        let noon = sky_at(12.0);
+        assert!(noon.strength > 0.9, "{noon:?}");
+        assert!(noon.warmth.abs() < 0.2, "noon should be near-neutral: {noon:?}");
+        // The golden-hour curve: warmest when the sun is LOW but up, which is
+        // not the same as "warm all day".
+        assert!(sky_at(6.5).warmth > noon.warmth);
+        assert!(sky_at(17.5).warmth > noon.warmth);
+    }
+
+    #[test]
+    fn night_is_dim_and_cool() {
+        let n = sky_at(2.0);
+        assert!(n.strength <= 0.15, "{n:?}");
+        assert!(n.warmth < 0.0, "night must go cool, not merely dark: {n:?}");
+        assert!(n.ambient < sky_at(12.0).ambient);
+    }
+
+    #[test]
+    fn the_curve_wraps_and_never_produces_nonsense() {
+        for h in [-6.0, 0.0, 5.9, 12.0, 23.9, 30.0] {
+            let s = sky_at(h);
+            assert!(s.strength.is_finite() && (0.0..=1.0).contains(&s.strength), "h={h} {s:?}");
+            assert!((-1.0..=1.0).contains(&s.warmth), "h={h} {s:?}");
+            assert!(s.ambient > 0.0, "h={h} {s:?}");
+        }
+        assert_eq!(sky_at(1.0), sky_at(25.0), "the day must wrap");
+    }
+
+    #[test]
+    fn amount_zero_leaves_the_palette_exactly_alone() {
+        // The defeat switch has to be exact, not approximately exact — a user
+        // who turns this off and still sees drift will not trust the setting.
+        let c = [0xC8, 0xA0, 0x4B];
+        assert_eq!(grade(c, sky_at(3.0), 0.0), c);
+        assert_eq!(grade(c, sky_at(12.0), 0.0), c);
+    }
+
+    #[test]
+    fn grading_never_brightens_past_the_authors_colour() {
+        // A theme author picked these values; the clock may dim them, not
+        // overrule them upward.
+        let c = [0x80, 0x80, 0x80];
+        for h in [0.0, 6.0, 12.0, 18.0, 22.0] {
+            let g = grade(c, sky_at(h), 1.0);
+            let lum = |v: [u8; 3]| v[0] as u32 + v[1] as u32 + v[2] as u32;
+            assert!(lum(g) <= lum(c) + 8, "h={h} brightened {c:?} -> {g:?}");
+        }
+    }
+
+    #[test]
+    fn a_warm_sky_tilts_red_up_and_blue_down_without_rotating_hue() {
+        // Gold must stay gold. A hue rotation would move it off the palette's
+        // identity, which is why this is a channel tilt.
+        //
+        // Asserted first as "red must not fall in warm light", which failed —
+        // and the code was right. Dawn is warm AND DIM: strength is low just
+        // after sunrise, so the luminance term pulls every channel down and
+        // absolute red drops even as the light warms. The physical property is
+        // RELATIVE — warm light moves the red:blue ratio up — and comparing
+        // against noon is how you see it without the brightness confound.
+        let gold = [0xC8, 0xA0, 0x4B];
+        let dawn = grade(gold, sky_at(6.5), 1.0);
+        let noon = grade(gold, sky_at(12.0), 1.0);
+        let ratio = |c: [u8; 3]| c[0] as f32 / (c[2] as f32).max(1.0);
+        assert!(ratio(dawn) > ratio(noon),
+            "warm light must raise red against blue: dawn {dawn:?} noon {noon:?}");
+        // still recognisably gold: red > green > blue
+        assert!(dawn[0] > dawn[1] && dawn[1] > dawn[2], "{dawn:?} is no longer gold");
+    }
+
+    #[test]
+    fn no_channel_can_overflow_or_wrap() {
+        for c in [[0xFF, 0xFF, 0xFF], [0x00, 0x00, 0x00], [0xFF, 0x00, 0x80]] {
+            for h in [0.0, 6.0, 12.0, 18.0] {
+                let g = grade(c, sky_at(h), 1.0);
+                // u8 cannot exceed 255, but a wrap would show as a dark result
+                // for a white input — check the direction is sane.
+                if c == [0xFF, 0xFF, 0xFF] {
+                    assert!(g[0] > 150 && g[1] > 150, "white went dark at h={h}: {g:?}");
+                }
+            }
+        }
+    }
+}
