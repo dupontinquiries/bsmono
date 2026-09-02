@@ -416,6 +416,12 @@ impl Snapclone {
                 self.feed.set_entries(self.snap_state.filter_unfinished(entries));
             }
             HostEvent::SnapSaved(r) => {
+                // Flash only on SUCCESS. The universal camera confirmation
+                // should not fire for a capture that produced no file — that
+                // would be a worse lie than the silence it replaces.
+                if r.is_ok() {
+                    self.snap_flash = Some(0.0);
+                }
                 self.shutter_note = match r {
                     // The basename, not the path: a phone's data dir is
                     // sixty characters of XDG and the filename is the part

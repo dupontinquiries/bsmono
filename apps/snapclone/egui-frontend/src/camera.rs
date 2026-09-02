@@ -50,6 +50,15 @@ pub struct Viewfinder {
     pub scan_mode: bool,
     /// Sensor aspect (width / height).
     pub sensor_aspect: f32,
+    /// Quarter turns clockwise applied to the preview, 0..=3.
+    ///
+    /// A ROTATION, not a mirror. The chrome button used to call `flip()`,
+    /// which swaps the front and back CAMERA — a different action entirely,
+    /// already reachable from the device picker beside it, and not what a
+    /// circular-arrow icon means anywhere else. A phone whose sensor is
+    /// mounted sideways (which is most of them) needs a way to say so, and
+    /// that is this.
+    pub quarter_turns: u8,
     /// Focus point in NORMALISED sensor coordinates, so it survives a resize.
     pub focus: Option<[f32; 2]>,
     /// The reticle proper: three states and a linger, from `FocusReticle`.
@@ -69,7 +78,7 @@ impl Default for Viewfinder {
     fn default() -> Self {
         Viewfinder {
             facing: Facing::Back, full_bleed: true, scan_mode: false,
-            sensor_aspect: 4.0 / 3.0, focus: None, focus_age: 0.0,
+            sensor_aspect: 4.0 / 3.0, quarter_turns: 0, focus: None, focus_age: 0.0,
             reticle: Default::default(), recipient: None,
         }
     }
@@ -89,7 +98,7 @@ impl Viewfinder {
     /// Full-bleed crops to fill; framed letterboxes. Silently choosing the wrong
     /// one crops people out of their own photos, which is why it is tested.
     pub fn image_rect(&self, into: Rect) -> Rect {
-        let want = self.sensor_aspect.max(0.01);
+        let want = self.drawn_aspect();
         let have = (into.width() / into.height().max(1.0)).max(0.01);
         if self.full_bleed {
             // fill: the smaller dimension is covered, the larger overflows
@@ -114,12 +123,46 @@ impl Viewfinder {
     /// Normalised, so a focus point survives a rotation or a resize; mirrored
     /// for the front camera, or tapping the left of the screen focuses the right
     /// of the sensor.
+    /// Texture coordinates for the four corners of the destination rect, in
+    /// the order top-left, top-right, bottom-right, bottom-left.
+    ///
+    /// A quarter turn cannot be expressed as a UV `Rect` — that only flips —
+    /// so the preview is drawn as a mesh and this is the whole of the rotation.
+    /// Pure, because getting it wrong produces a picture that is merely
+    /// mirrored or upside down rather than obviously broken, and by eye those
+    /// are hard to tell from a sensor that really is mounted that way.
+    pub fn corner_uvs(&self) -> [Pos2; 4] {
+        let mut c = [
+            Pos2::new(0.0, 0.0),
+            Pos2::new(1.0, 0.0),
+            Pos2::new(1.0, 1.0),
+            Pos2::new(0.0, 1.0),
+        ];
+        // Mirror FIRST, then rotate. The other order gives the mirror image of
+        // the rotation, which for odd turns is not the same picture.
+        if self.facing.mirrored() {
+            c.swap(0, 1);
+            c.swap(2, 3);
+        }
+        c.rotate_right((self.quarter_turns % 4) as usize);
+        c
+    }
+
     pub fn to_sensor(&self, p: Pos2, into: Rect) -> Option<[f32; 2]> {
         let r = self.image_rect(into);
         if r.width() <= 0.0 || r.height() <= 0.0 { return None; }
         let mut x = (p.x - r.min.x) / r.width();
         let y = (p.y - r.min.y) / r.height();
         if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) { return None; }
+        // UNDO the rotation, so a tap lands on the part of the SENSOR the user
+        // pointed at. A focus point stored in screen terms would move the
+        // moment the preview was turned.
+        let (mut x, mut y) = (x, y);
+        for _ in 0..(self.quarter_turns % 4) {
+            let (nx, ny) = (y, 1.0 - x);
+            x = nx;
+            y = ny;
+        }
         if self.facing.mirrored() { x = 1.0 - x; }
         Some([x, y])
     }
@@ -176,6 +219,25 @@ impl Viewfinder {
         if self.scan_mode { 1.0 / SCAN_FPS } else { 1.0 / 30.0 }
     }
 
+    /// Advance the preview one quarter turn clockwise, wrapping at four.
+    ///
+    /// The focus point is kept: unlike a camera swap, a rotation is the same
+    /// sensor looking at the same scene, and the tap the user made is still
+    /// about the same part of it. `to_sensor` already stores focus in
+    /// normalised SENSOR coordinates for exactly this reason.
+    pub fn rotate_cw(&mut self) {
+        self.quarter_turns = (self.quarter_turns + 1) % 4;
+    }
+
+    /// The aspect as the preview is DRAWN — the sensor's, inverted on an odd
+    /// quarter turn. Without this a rotated 4:3 frame is letterboxed as though
+    /// it were still landscape and the image is squashed into the wrong box,
+    /// which looks like a broken decoder rather than a rotation.
+    pub fn drawn_aspect(&self) -> f32 {
+        let a = self.sensor_aspect.max(0.01);
+        if self.quarter_turns % 2 == 1 { 1.0 / a } else { a }
+    }
+
     pub fn flip(&mut self) {
         self.facing = self.facing.flipped();
         // A focus point belongs to the sensor that set it; keeping it across a
@@ -185,6 +247,28 @@ impl Viewfinder {
 }
 
 /// Draw the viewfinder. `frame` is the latest camera image, if any.
+/// How long the capture flash lasts, seconds.
+pub const FLASH_SECS: f32 = 0.22;
+
+/// Opacity of the capture flash `t` seconds after the shutter fired.
+///
+/// The shutter WAS wired — `shutter_pressed` becomes `HostCommand::CaptureSnap`,
+/// the host writes the file, and `HostEvent::SnapSaved` sets a note. What it
+/// had no way to say was "that happened": the only feedback was a line of text
+/// under a fullscreen preview, which on a phone is easy to miss entirely. The
+/// report "the photo button isn't wired yet" is what a working capture with no
+/// visible confirmation looks like from the outside.
+///
+/// So: the flash every camera has. Bright immediately and gone quickly —
+/// linear rather than eased, because a flash that lingers reads as a rendering
+/// fault over a moving preview rather than as a shutter.
+pub fn flash_alpha(t: f32) -> f32 {
+    if t < 0.0 || t >= FLASH_SECS {
+        return 0.0;
+    }
+    1.0 - t / FLASH_SECS
+}
+
 /// The band at the foot of the viewfinder that the controls are drawn OVER.
 ///
 /// The camera page used to RESERVE space for its controls, which itself
@@ -211,12 +295,21 @@ pub fn viewfinder(ui: &mut Ui, vf: &mut Viewfinder, frame: Option<&egui::Texture
     let img = vf.image_rect(rect);
     match frame {
         Some(t) => {
-            let uv = if vf.facing.mirrored() {
-                Rect::from_min_max(Pos2::new(1.0, 0.0), Pos2::new(0.0, 1.0))
-            } else {
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))
-            };
-            p.image(t.id(), img, uv, Color32::WHITE);
+            // A MESH, not `Painter::image`: that takes a UV rect, which can
+            // mirror but cannot turn a picture ninety degrees. Four vertices
+            // with permuted UVs can, and it is the same one draw call.
+            let uvs = vf.corner_uvs();
+            let corners = [
+                img.left_top(), img.right_top(), img.right_bottom(), img.left_bottom(),
+            ];
+            let mut mesh = egui::Mesh::with_texture(t.id());
+            for (i, pos) in corners.iter().enumerate() {
+                mesh.colored_vertex(*pos, Color32::WHITE);
+                mesh.vertices[i].uv = uvs[i];
+            }
+            mesh.add_triangle(0, 1, 2);
+            mesh.add_triangle(0, 2, 3);
+            p.add(egui::Shape::mesh(mesh));
         }
         None => {
             // No camera is a STATE, not an error: say so rather than showing a
@@ -253,6 +346,91 @@ pub fn viewfinder(ui: &mut Ui, vf: &mut Viewfinder, frame: Option<&egui::Texture
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rotation_is_a_quarter_turn_and_wraps() {
+        let mut vf = Viewfinder::default();
+        assert_eq!(vf.quarter_turns, 0);
+        for want in [1, 2, 3, 0] {
+            vf.rotate_cw();
+            assert_eq!(vf.quarter_turns, want);
+        }
+        // And it does NOT change the camera — the bug being fixed is that this
+        // control swapped front/back instead.
+        let facing = vf.facing;
+        vf.rotate_cw();
+        assert_eq!(vf.facing, facing, "rotating swapped the camera");
+    }
+
+    #[test]
+    fn an_odd_quarter_turn_inverts_the_drawn_aspect() {
+        // A rotated 4:3 frame letterboxed as though still landscape is
+        // squashed into the wrong box, which reads as a broken decoder rather
+        // than a rotation.
+        let mut vf = Viewfinder { sensor_aspect: 4.0 / 3.0, ..Default::default() };
+        assert!((vf.drawn_aspect() - 4.0 / 3.0).abs() < 1e-6);
+        vf.rotate_cw();
+        assert!((vf.drawn_aspect() - 3.0 / 4.0).abs() < 1e-6, "{}", vf.drawn_aspect());
+        vf.rotate_cw();
+        assert!((vf.drawn_aspect() - 4.0 / 3.0).abs() < 1e-6, "half a turn is the same shape");
+    }
+
+    #[test]
+    fn each_quarter_turn_gives_a_different_corner_mapping() {
+        // Getting this wrong produces a picture that is merely mirrored or
+        // upside down rather than obviously broken, and by eye that is hard to
+        // tell from a sensor genuinely mounted that way. So: all four
+        // distinct, and four turns returns to the start.
+        let mut seen = Vec::new();
+        for q in 0..4u8 {
+            let vf = Viewfinder { quarter_turns: q, ..Default::default() };
+            let uvs = vf.corner_uvs();
+            assert!(!seen.contains(&uvs), "turn {q} repeats an earlier mapping");
+            seen.push(uvs);
+            // Every corner of the texture is used exactly once, whatever the
+            // turn — a permutation, never a fold.
+            let mut sorted = uvs;
+            sorted.sort_by(|a, b| (a.x, a.y).partial_cmp(&(b.x, b.y)).unwrap());
+            assert_eq!(sorted, [Pos2::new(0.0, 0.0), Pos2::new(0.0, 1.0),
+                                Pos2::new(1.0, 0.0), Pos2::new(1.0, 1.0)]);
+        }
+        let full = Viewfinder { quarter_turns: 4, ..Default::default() };
+        assert_eq!(full.corner_uvs(), Viewfinder::default().corner_uvs());
+    }
+
+    #[test]
+    fn a_tap_maps_back_through_the_rotation() {
+        // The focus point is stored in SENSOR coordinates so it survives a
+        // resize; it has to survive a rotation for the same reason. A tap on
+        // the top-left of a preview turned once clockwise is the BOTTOM-left
+        // of the sensor.
+        let into = Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 300.0));
+        let vf = Viewfinder { full_bleed: false, sensor_aspect: 1.0,
+                              quarter_turns: 1, ..Default::default() };
+        let s = vf.to_sensor(Pos2::new(10.0, 10.0), into).expect("inside the frame");
+        assert!(s[0] < 0.2 && s[1] > 0.8, "got {s:?}");
+        // Unrotated, the same tap is the top-left of the sensor — so the test
+        // is measuring the rotation and not the mapping in general.
+        let flat = Viewfinder { full_bleed: false, sensor_aspect: 1.0, ..Default::default() };
+        let s0 = flat.to_sensor(Pos2::new(10.0, 10.0), into).unwrap();
+        assert!(s0[0] < 0.2 && s0[1] < 0.2, "got {s0:?}");
+    }
+
+    #[test]
+    fn the_capture_flash_is_bright_then_gone() {
+        assert!((flash_alpha(0.0) - 1.0).abs() < 1e-6);
+        assert!(flash_alpha(FLASH_SECS * 0.5) < 0.6);
+        assert_eq!(flash_alpha(FLASH_SECS), 0.0, "the flash must end, not linger");
+        assert_eq!(flash_alpha(FLASH_SECS * 10.0), 0.0);
+        assert_eq!(flash_alpha(-1.0), 0.0, "a negative age must not paint");
+        // Monotone: a flash that brightened again would read as a fault.
+        let mut last = flash_alpha(0.0);
+        for i in 1..=20 {
+            let a = flash_alpha(FLASH_SECS * i as f32 / 20.0);
+            assert!(a <= last + 1e-6, "the flash brightened at step {i}");
+            last = a;
+        }
+    }
 
     #[test]
     fn the_controls_band_sits_at_the_foot_of_the_frame() {

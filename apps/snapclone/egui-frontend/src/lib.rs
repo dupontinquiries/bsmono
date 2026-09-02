@@ -361,6 +361,11 @@ pub struct Snapclone {
     /// ripple survive the redraw they are animating through.
     pub glass_flip: crate::glass::GlassButton,
     pub glass_shutter: crate::glass::GlassButton,
+    /// Seconds since the capture flash started; `None` when not flashing.
+    /// Set from `HostEvent::SnapSaved`, so it fires on the file actually
+    /// existing rather than on the tap — a flash on the tap would confirm a
+    /// capture that failed.
+    pub snap_flash: Option<f32>,
     /// Set when the shutter is tapped; the host captures the frame.
     pub shutter_pressed: bool,
     /// The video snap viewer. Separate from `viewer` because a video snap is
@@ -761,6 +766,7 @@ impl Snapclone {
             dialog_form: crate::mobile_dialog::Form::Sheet,
             glass_flip: Default::default(),
             glass_shutter: Default::default(),
+            snap_flash: None,
             shutter_pressed: false,
             video: None,
             menu: Default::default(),
@@ -3687,6 +3693,22 @@ impl Snapclone {
                         c.accent.r(), c.accent.g(), c.accent.b(), a)));
             }
         }
+        // THE CAPTURE FLASH, over the preview and under the chrome: the
+        // confirmation the shutter never had. Advanced here rather than in a
+        // tick method because this is the only page that draws it, and a timer
+        // that runs while its painter does not is a timer that has already
+        // expired by the time anyone looks.
+        if let Some(age) = self.snap_flash {
+            let a = crate::camera::flash_alpha(age);
+            if a <= 0.0 {
+                self.snap_flash = None;
+            } else {
+                ui.painter_at(vf_rect).rect_filled(
+                    vf_rect, 0.0, egui::Color32::from_white_alpha((a * 220.0) as u8));
+                self.snap_flash = Some(age + ui.input(|i| i.stable_dt).min(0.1));
+                ui.ctx().request_repaint();
+            }
+        }
         // ── from here the controls are drawn OVER the preview ───────────────
         //
         // A child Ui on the lower band of the viewfinder, so every `ui.` call
@@ -3812,8 +3834,14 @@ impl Snapclone {
         // mottling and the tap-keyed ripple are the two things a stylesheet
         // cannot express, which is why Qt paints them.
         ui.horizontal(|ui| {
+            // ROTATE, not swap. This called `flip()`, which changes the front/
+            // back CAMERA — a different action, already reachable from the
+            // device picker directly above, and not what a circular arrow
+            // means anywhere else. Reported from the phone as "the rotate
+            // button should rotate by 90deg not flip".
             if crate::glass::glass_button_ui(ui, &mut self.glass_flip, "⟲", 44.0, c) {
-                self.viewfinder.flip();
+                self.viewfinder.rotate_cw();
+                self.shutter_note = format!("rotated {}°", self.viewfinder.quarter_turns as u32 * 90);
             }
             // THE REAL SHUTTER, not a button that sets a bool. One control,
             // four gestures: tap for a photo, hold to record, swipe up to lock
