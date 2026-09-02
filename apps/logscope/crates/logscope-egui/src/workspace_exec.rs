@@ -2096,48 +2096,81 @@ fn version_key(v: &str) -> Vec<u64> {
 /// what stops a model from asking the user what the repository contains — it can SEE it.
 pub fn repo_tree(root: &std::path::Path, cap: usize) -> String {
     const SKIP: [&str; 7] = ["target", ".git", ".gitmind", ".logscope", "node_modules", "dist", ".cargo"];
-    let mut out: Vec<String> = Vec::new();
-    // BREADTH-FIRST, and the change matters most exactly where the cap bites.
+    // DEPTH-BALANCED. This has now been wrong in both directions and the middle
+    // is the answer.
     //
-    // This was a `Vec` used as a stack (`stack.pop()`), i.e. depth-first. Under a
-    // tight cap that is close to the worst possible order: a Small-class model
-    // gets 40 entries, and depth-first spends all 40 inside whichever deep
-    // subdirectory it descended into first, never reaching the sibling
-    // top-level directories that say what the repository IS. Asked to
-    // "summarize the codebase" the model was shown one leaf of one branch.
+    // Originally depth-FIRST (a Vec used as a stack): a 40-entry cap was spent
+    // inside whichever deep subdirectory was descended into first, so the tree
+    // never reached the sibling top-level directories that say what the project
+    // IS. I changed it to breadth-first, which fixed that and broke the mirror
+    // image — measured on this repo, a 40-entry BFS tree is 36 files at depth 0
+    // and 4 at depth 1, i.e. the top level and nothing else. The operator saw
+    // exactly that: "it looks like it's only reading files in the toplevel
+    // directory". A model shown no `crates/*/src/*.rs` cannot read one.
     //
-    // Breadth-first spends the same 40 entries on the shallowest files it can
-    // find — the top-level manifests and READMEs first, then one level down.
-    // For a summary that is the useful half of the tree, and for a large cap
-    // the two orders converge because everything is included anyway. Same cost,
-    // same output when not truncated.
-    let mut queue: std::collections::VecDeque<(std::path::PathBuf, usize)> =
-        std::collections::VecDeque::new();
-    queue.push_back((root.to_path_buf(), 0usize));
-    let mut truncated = false;
+    // Neither order is the fix, because the problem is ALLOCATION, not
+    // traversal. Walk everything (bounded), group by depth, then round-robin
+    // across depths until the cap is spent. Every level that exists gets
+    // representation, so the manifests at the root AND a sample of the source
+    // beneath them both appear.
+    let mut by_depth: std::collections::BTreeMap<usize, Vec<(String, u64)>> =
+        std::collections::BTreeMap::new();
+    let mut seen = 0usize;
+    // Bounded independently of `cap`: this is the candidate pool, and a huge
+    // monorepo must not be walked forever just to sample 40 lines from it.
+    const MAX_SCAN: usize = 20_000;
+    let mut queue = std::collections::VecDeque::from([(root.to_path_buf(), 0usize)]);
     while let Some((dir, depth)) = queue.pop_front() {
-        if depth > 6 { continue; }
+        if depth > 6 || seen >= MAX_SCAN { break; }
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         let mut entries: Vec<_> = rd.flatten().collect();
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
-            if out.len() >= cap { truncated = true; break; }
+            if seen >= MAX_SCAN { break; }
             let p = e.path();
             let name = e.file_name().to_string_lossy().into_owned();
             if p.is_dir() {
-                if !SKIP.contains(&name.as_str()) && !name.starts_with('.') { queue.push_back((p, depth + 1)); }
+                if !SKIP.contains(&name.as_str()) && !name.starts_with('.') {
+                    queue.push_back((p, depth + 1));
+                }
             } else if !name.starts_with('.') {
                 if let Ok(rel) = p.strip_prefix(root) {
                     let size = e.metadata().map(|m| m.len()).unwrap_or(0);
-                    out.push(format!("{} ({} B)", rel.to_string_lossy(), size));
+                    by_depth.entry(depth).or_default().push((rel.to_string_lossy().into_owned(), size));
+                    seen += 1;
                 }
             }
         }
-        if truncated { break; }
+    }
+    let total: usize = by_depth.values().map(|v| v.len()).sum();
+    let truncated = total > cap;
+    // Round-robin: take one from each depth in turn. Shallow depths run out
+    // first (there are fewer files up there), and their unused share flows
+    // naturally to the deeper levels rather than being reserved and wasted.
+    let mut cursors: std::collections::BTreeMap<usize, usize> =
+        by_depth.keys().map(|d| (*d, 0usize)).collect();
+    let mut out: Vec<String> = Vec::new();
+    'fill: loop {
+        let mut progressed = false;
+        for (d, files) in by_depth.iter() {
+            let c = cursors.get_mut(d).expect("cursor per depth");
+            if *c < files.len() {
+                let (rel, size) = &files[*c];
+                out.push(format!("{} ({} B)", rel, size));
+                *c += 1;
+                progressed = true;
+                if out.len() >= cap { break 'fill; }
+            }
+        }
+        if !progressed { break; }
     }
     out.sort();
     let mut s = out.join("\n");
-    if truncated { s.push_str(&format!("\n… (truncated at {cap} entries — use list_dir/search for the rest)")); }
+    if truncated {
+        s.push_str(&format!(
+            "\n… truncated: showing {} of {total} entries, sampled across every \
+directory depth so no level is invisible — use list_dir/search for the rest)", out.len()));
+    }
     s
 }
 
@@ -6057,6 +6090,36 @@ mod repo_tree_order_tests {
             "a 6-entry tree that omits the README is not a description of the repo:\n{tree}");
         assert!(tree.contains("Cargo.toml"), "{tree}");
         assert!(tree.contains("truncated"), "a capped tree must say it was capped:\n{tree}");
+    }
+
+    /// THE REGRESSION THE BFS FIX CAUSED. A tight cap must not spend itself
+    /// entirely on the top level, or the model is shown no source at all and
+    /// cannot read a file it was never told exists. Measured on the real repo
+    /// before this fix: 36 entries at depth 0, 4 at depth 1, nothing deeper.
+    #[test]
+    fn a_tight_cap_reaches_the_deep_files_too_not_only_the_top() {
+        let d = std::env::temp_dir().join(format!("wstree-bal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("crates/engine/src")).unwrap();
+        // A wide top level, which is what starves the deeper ones under BFS.
+        for i in 0..30 {
+            std::fs::write(d.join(format!("top{i}.md")), "x").unwrap();
+        }
+        std::fs::write(d.join("Cargo.toml"), "x").unwrap();
+        std::fs::write(d.join("crates/engine/src/lib.rs"), "x").unwrap();
+        std::fs::write(d.join("crates/engine/src/decode.rs"), "x").unwrap();
+
+        let tree = repo_tree(&d, 10);
+        let _ = std::fs::remove_dir_all(&d);
+
+        let depths: Vec<usize> = tree.lines()
+            .filter(|l| !l.starts_with('…'))
+            .map(|l| l.matches('/').count())
+            .collect();
+        assert!(depths.iter().any(|d| *d == 0), "no top-level entry:\n{tree}");
+        assert!(depths.iter().any(|d| *d >= 3),
+            "a 10-entry tree reached no deep file — the model cannot read what it \
+cannot see:\n{tree}");
     }
 
     #[test]
