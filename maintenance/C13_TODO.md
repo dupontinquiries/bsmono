@@ -2369,3 +2369,36 @@ pairs nobody had logged:
 
 Run it after any extraction or merge; it is the cheap check that would have
 caught all four of this session's by hand finds.
+
+
+## 73. §18 corrected: mesh3d is a superset, not a divergence — and the sun curve is in three places
+
+**§18 was wrong about mesh3d.** It is not "genuinely diverged": the 253-line
+diff is one added field (`Mesh3::uvs`) plus its mechanical propagation, and
+scene-kit's public surface is a STRICT SUPERSET of logscope-egui's — 48 shared
+functions, 5 extra there, zero unique here. Migration candidate on the same
+terms as `spatial`/`textsurface`, which went cleanly. Worth re-checking the
+other three modules §18 dismissed (`gpuscene`, `texgen`, `glow_scene`) the
+same way: count the public surface, not the diff lines.
+
+**Open design call, created by this session's own work.** Three copies of the
+sun curve now exist:
+- `uikit_egui::lux::sky_at` — the extraction, and where the 2D panel grading
+  reads from;
+- `logscope_egui::mesh3d::sun_clock` — delegates to it (correct);
+- `scene_kit::mesh3d::sun_clock` / `sun_clock_at` — its own copy.
+
+Making the scene and the panels share a clock unified two and left a third.
+scene-kit does not depend on uikit-egui and should not for one function, so
+the options are:
+  a. move `sky_at` into a leaner crate both can take (math-kit? it is pure
+     maths with no egui types), then have all three delegate;
+  b. let scene-kit own it and have `lux` delegate the other way — but lux is
+     where the palette grading needs it and scene-kit is heavier to pull into
+     uikit;
+  c. leave three and rely on the agreement test.
+
+(a) is probably right. Until then an agreement test in logscope-egui holds
+scene-kit's copy to `lux::sky_at` across ten hours, so they cannot drift
+silently — a drift would otherwise appear only as the scene and the panels
+disagreeing about the time of day.
