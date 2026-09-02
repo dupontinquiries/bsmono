@@ -2657,3 +2657,37 @@ Still open:
   edges — they prove the mechanism and pin an 8x reduction in seam step, but
   nothing in the repo validates the outcome on the content where tiling
   artefacts actually appear.
+
+
+## 84. Seam diagnosis corrected — it is the residual bleed ring
+
+I diagnosed the black tile seams twice as CNN tiling and was wrong both times.
+The operator's observation settled it: **the lines FLICKER at fixed
+positions.**
+
+That single fact discriminates all three candidates:
+- steady at fixed positions  -> CNN tile grid (fixed, every frame the same)
+- sliding with the camera    -> motion-driven, i.e. block-matcher geometry
+- BLINKING at fixed positions -> the seam is drawn where a block was
+  re-upscaled and absent where the frame was copied from the previous one.
+  That is the residual path.
+
+Fixed: `make_residual`'s bleed ring was `Pad::Black` (the CNN sees a cliff to
+zero around every residual block, and the receptive field carries it inward),
+and the default ring was 1 pixel — upstream's waifu2x value, against an RRDB
+receptive field of hundreds. Now Replicate, default 8, GUI range widened to 24.
+
+**The earlier CNN-tiling work is not wasted but was not the reported bug.**
+`pre_pad` 8->32 and the overlapped blending are real improvements to a real
+(if less visible) artefact, and they are independently tested. But I should
+have asked what the artefact DID before assuming what it was — "black seams at
+block boundaries" had three plausible causes and I picked one on the first
+reading.
+
+**Ordering for the next run**, cheapest first:
+1. Default now: bleed 8 + Replicate. If the flicker is gone, done.
+2. Still flickering -> `--bleed 16`. The ring is the first dial.
+3. Steady seams remaining (not flickering) -> those ARE the CNN tile grid;
+   `D2X_TILE_PAD=64`, and `D2X_BLEND=0` to see the before-picture.
+Distinguishing 2 from 3 by whether the artefact blinks is the same test that
+found this one.
