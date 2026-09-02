@@ -2510,3 +2510,25 @@ Next, in order:
 - `texgen` — reverse direction. scene-kit's is the stale copy (98% of it is
   inside logscope's, which is 2.3x the size). Update scene-kit FROM logscope
   before any migration, or ~330 lines are lost.
+
+
+## 78. mesh3d migrated (-1733). Two scene modules left, both needing judgement.
+
+glow_scene (-449) and mesh3d (-1733) are now re-exports; -2182 lines from
+logscope-egui across the two. Neither was a sweep: glow_scene needed the
+`perf` override built first, and mesh3d needed three `uvs: None` additions the
+compiler found exactly.
+
+**Method note worth keeping.** §18 left all four modules local on a diff-line
+count. For mesh3d the three measures disagreed and only together were they
+right: 253 diff lines said "diverged", public surface said "superset", content
+ratio (95%/91%) said "same file plus a field". Diff count alone is what kept
+1733 lines duplicated for months.
+
+Remaining:
+- `gpuscene` — 90%/93%, genuinely two-way, AND reads `theme::power_mode`. Both
+  sides have moved. Needs a real review; the `perf` override means the theme
+  coupling is at least solvable the same way glow_scene's was.
+- `texgen` — still reversed. scene-kit's is stale (98% of it inside logscope's,
+  which is 2.3x the size). Update scene-kit FROM logscope first. Migrating it
+  the obvious direction loses ~330 lines.
