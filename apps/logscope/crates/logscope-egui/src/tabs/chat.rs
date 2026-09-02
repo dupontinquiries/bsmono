@@ -6437,6 +6437,10 @@ the repository — a chat turn cannot open files.",
         let time = ui.input(|i| i.time) as f32;
         let acc = theme::accent();
         let _acc_a = |a: u8| egui::Color32::from_rgba_unmultiplied(acc.r(), acc.g(), acc.b(), a); // (ripple rings removed)
+        // Node captions are collected during the draw and placed afterwards, so
+        // they can be de-collided against each other. See the push site below.
+        let mut label_wants: Vec<(crate::graph_labels::Want,)> = Vec::new();
+        let mut label_items: Vec<(String, egui::FontId, egui::Color32)> = Vec::new();
         for &(id, sx, sy, depth) in &proj {
             let nd = &g.nodes[id];
             let t = ((depth - near) / span).clamp(0.0, 1.0); // 0 near, 1 far
@@ -6506,13 +6510,67 @@ the repository — a chat turn cannot open files.",
                 // around the approach and fading back out as the pearl's own text resolves (t→0).
                 let label_fade = ((t - 0.12) / 0.10).clamp(0.0, 1.0) * (1.0 - ((t - 0.30) / 0.12).clamp(0.0, 1.0));
                 if label_fade > 0.02 {
+                    // COLLECTED, not painted here. A fixed offset per node is what
+                    // made these overlap into illegibility — see graph_labels.
+                    // Measuring now and placing after the loop is the only order
+                    // that works: you cannot avoid a collision you have not
+                    // measured, and you cannot measure a label you have not laid
+                    // out.
+                    let txt = format!("{}t · {}", nd.tokens,
+                        crate::nodelabel::elide_words(&nd.preview, 22));
+                    let font = egui::FontId::proportional(11.0);
+                    // `painter().layout_no_wrap` is this codebase's measuring
+                    // idiom (theme.rs uses it in three places); `ui.fonts(..)`
+                    // hands out a shared reference and cannot lay out.
+                    let galley = p.layout_no_wrap(txt.clone(), font.clone(), egui::Color32::WHITE);
                     let base = if t < 0.2 { theme::INK() } else { theme::DIM() };
-                    p.text(egui::pos2(sx + radius + 5.0, sy), egui::Align2::LEFT_CENTER,
-                        // Same word-safe elision as the scene labels — a 2D list has more room for
-                        // the text but no more excuse for cutting it mid-word.
-                        format!("{}t · {}", nd.tokens, crate::nodelabel::elide_words(&nd.preview, 22)),
-                        egui::FontId::proportional(11.0), base.gamma_multiply(label_fade));
+                    label_wants.push((
+                        crate::graph_labels::Want {
+                            id: label_items.len(),
+                            x: sx + radius, y: sy,
+                            w: galley.size().x, h: galley.size().y,
+                            // The label the user is looking at survives a
+                            // contested spot. Then brightness: one fading OUT is
+                            // a better thing to drop than one fading in, and
+                            // `label_fade` already encodes exactly that.
+                            priority: if self.walk_focus == Some(id) { 10.0 } else { label_fade },
+                        },
+                        ));
+                    label_items.push((txt, font, base.gamma_multiply(label_fade)));
                 }
+            }
+        }
+        // PLACE THE CAPTIONS, now that every one has been measured.
+        //
+        // Before this they were painted at a fixed offset from their node, so a
+        // cluster produced the overlapping run visible in the field screenshot
+        // ("14t · create a rust crate th" on top of "221t · rust use
+        // std::colle"). `place` walks a fixed ladder of candidate offsets and
+        // drops what will not fit rather than stacking it — three readable
+        // captions and an honest "+7" beats ten illegible ones.
+        {
+            let wants: Vec<crate::graph_labels::Want> = label_wants.iter().map(|w| w.0).collect();
+            let b = crate::graph_labels::Box2 {
+                x: rect.left(), y: rect.top(), w: rect.width(), h: rect.height(),
+            };
+            let (placed, dropped) = crate::graph_labels::place(&wants, b, 2.0);
+            for pl in &placed {
+                let (txt, font, col) = &label_items[pl.id];
+                // A flipped label sits LEFT of its node, so it must be
+                // right-aligned or it runs back over the dot it belongs to.
+                let (anchor, x) = if pl.flipped {
+                    (egui::Align2::RIGHT_CENTER, pl.at.x + pl.at.w)
+                } else {
+                    (egui::Align2::LEFT_CENTER, pl.at.x)
+                };
+                p.text(egui::pos2(x, pl.at.y + pl.at.h * 0.5), anchor, txt, font.clone(), *col);
+            }
+            if dropped > 0 {
+                // Said, not hidden. A caption silently missing reads as a bug in
+                // the graph; a count reads as a full view.
+                p.text(egui::pos2(rect.right() - 6.0, rect.top() + 6.0), egui::Align2::RIGHT_TOP,
+                    format!("+{dropped} more"), egui::FontId::proportional(10.0),
+                    theme::DIM());
             }
         }
         // glowing identicon runes inscribed on each near stone — the node's short-id, encoded + emissive

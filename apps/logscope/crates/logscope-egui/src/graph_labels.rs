@@ -234,3 +234,59 @@ mod tests {
         assert!(!a.overlaps(&b));
     }
 }
+
+#[cfg(test)]
+mod caller_contract {
+    //! Properties the chat-graph caller relies on. `place` is generic; these
+    //! pin the specific things that call site assumes, so a future change to
+    //! the placer cannot quietly break it.
+
+    use super::*;
+
+    const BOUNDS: Box2 = Box2 { x: 0.0, y: 0.0, w: 900.0, h: 600.0 };
+
+    fn want(id: usize, x: f32, y: f32, priority: f32) -> Want {
+        // Roughly a real caption: "221t · rust use std::colle" at 11pt.
+        Want { id, x, y, w: 150.0, h: 13.0, priority }
+    }
+
+    #[test]
+    fn the_focused_node_keeps_its_label_when_a_cluster_competes() {
+        // The caller gives the walkthrough's focused node priority 10 and every
+        // other node its fade (0..1). If a crowded cluster could drop the
+        // focused one, the user would lose the caption they are looking at —
+        // the single worst label to lose.
+        let mut ws: Vec<Want> = (0..12).map(|i| want(i, 400.0, 300.0, 0.5)).collect();
+        ws.push(want(99, 400.0, 300.0, 10.0));
+        let (placed, dropped) = place(&ws, BOUNDS, 2.0);
+        assert!(dropped > 0, "the fixture must actually be over-subscribed");
+        assert!(placed.iter().any(|p| p.id == 99),
+            "the focused label was dropped while {} others were placed", placed.len());
+    }
+
+    #[test]
+    fn a_brighter_label_outranks_a_fading_one() {
+        // Priority is `label_fade`, so a caption fading OUT is dropped before
+        // one fading in. Dropping the brighter one would read as a flicker.
+        let ws = vec![want(0, 400.0, 300.0, 0.05), want(1, 400.0, 300.0, 0.95)];
+        let (placed, _) = place(&ws, BOUNDS, 2.0);
+        let pos = |id| placed.iter().position(|p| p.id == id);
+        // Both fit here; the bright one must hold the PREFERRED (right) offset.
+        let bright = placed.iter().find(|p| p.id == 1).unwrap();
+        assert!(!bright.flipped && bright.at.x > 400.0,
+            "the brighter label should hold the preferred slot: {bright:?}");
+        assert!(pos(0).is_some() && pos(1).is_some());
+    }
+
+    #[test]
+    fn a_label_at_the_right_edge_flips_rather_than_escaping() {
+        // Nodes near the right edge are common (the graph fills its rect), and
+        // an escaped label is invisible — indistinguishable from a bug.
+        let ws = vec![want(0, BOUNDS.w - 20.0, 300.0, 1.0)];
+        let (placed, dropped) = place(&ws, BOUNDS, 2.0);
+        assert_eq!(dropped, 0, "a single label near the edge must still place");
+        let p0 = &placed[0];
+        assert!(p0.at.x >= BOUNDS.x && p0.at.x + p0.at.w <= BOUNDS.x + BOUNDS.w,
+            "{p0:?} escapes the graph rect");
+    }
+}
