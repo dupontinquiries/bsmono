@@ -42,6 +42,7 @@ pub mod file;
 pub mod assets;
 pub mod session;
 pub mod stream;
+pub mod voice;
 pub mod dht;
 
 use serde::{Deserialize, Serialize};
@@ -85,6 +86,11 @@ pub struct Presence {
     /// Monotonic per-site counter so a late presence packet cannot resurrect a
     /// stale playhead.
     pub seq: u64,
+    /// The peer has a take rolling. The producer's timeline says so and
+    /// keeps its hands off their playhead; nothing about this enters the
+    /// project. `serde(default)` so an older presence deserializes quiet.
+    #[serde(default)]
+    pub recording: bool,
 }
 
 /// The rack (patterns, channels, tempo), synced as a **last-writer-wins
@@ -438,18 +444,18 @@ mod tests {
         let before = d.history().len();
         d.presence(Presence { site: SiteId(2), name: "kes".into(),
             playhead: Ticks::from_seconds(2.0), selection: vec![ClipId(10)],
-            active_track: Some(TrackId(1)), seq: 5 });
+            active_track: Some(TrackId(1)), seq: 5 , recording: false,});
         assert_eq!(d.history().len(), before, "presence must never enter the op log");
         assert_eq!(d.peers_on(ClipId(10)).len(), 1, "a peer inside the clip is reported");
         // a stale packet cannot rewind them
         d.presence(Presence { site: SiteId(2), name: "kes".into(),
             playhead: Ticks::from_seconds(99.0), selection: vec![],
-            active_track: None, seq: 4 });
+            active_track: None, seq: 4 , recording: false,});
         assert_eq!(d.peers[&SiteId(2)].playhead, Ticks::from_seconds(2.0), "stale presence ignored");
         // and a peer outside the clip is not reported as being on it
         d.presence(Presence { site: SiteId(2), name: "kes".into(),
             playhead: Ticks::from_seconds(99.0), selection: vec![],
-            active_track: None, seq: 6 });
+            active_track: None, seq: 6 , recording: false,});
         assert!(d.peers_on(ClipId(10)).is_empty());
     }
 

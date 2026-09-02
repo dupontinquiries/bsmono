@@ -590,7 +590,7 @@ impl Studio {
             playhead,
             selection: self.selection.clone(),
             active_track,
-            seq: self.presence_seq + 1,
+            seq: self.presence_seq + 1, recording: false,
         };
         self.presence_seq += 1;
         self.last_presence = Some(cur.clone());

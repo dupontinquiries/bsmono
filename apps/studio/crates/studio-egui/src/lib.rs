@@ -901,7 +901,7 @@ mod tests {
         assert!(doc.peers_on(ClipId(10)).is_empty());
         doc.presence(Presence { site: SiteId(2), name: "ada".into(),
             playhead: Ticks::from_seconds(3.0), selection: vec![ClipId(10)],
-            active_track: Some(TrackId(1)), seq: 1 });
+            active_track: Some(TrackId(1)), seq: 1 , recording: false,});
         assert_eq!(doc.peers_on(ClipId(10)).len(), 1, "the peer is inside the 2s..6s clip");
         assert!(doc.peers_on(ClipId(20)).is_empty(), "and not inside the other one");
     }
