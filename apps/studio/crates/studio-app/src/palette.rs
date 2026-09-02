@@ -72,6 +72,10 @@ pub enum ShellVerb {
     /// always to the strip's lane when nothing is selected) — see
     /// `Studio::new_curve_on_selection`.
     NewCurve,
+    /// Cut the selection on the rack grid every N steps (4 = beat, 16 = bar).
+    SplitOnGrid(u8),
+    /// The strip's binding gets its own copy of its curve.
+    MakeCurveUnique,
     ArchiveDialog,
     ExportDialog,
     Settings,
@@ -238,6 +242,9 @@ pub fn root() -> Vec<Choice> {
         c("yank selection", Some("y"), Then::Do(Act::Key('y'))),
         c("paste at playhead (with automation)", Some("p"), Then::Do(Act::Key('p'))),
         c("automation curve on selected clips", None, Then::Do(Act::Shell(ShellVerb::NewCurve))),
+        c("split selection on beats", None, Then::Do(Act::Shell(ShellVerb::SplitOnGrid(4)))),
+        c("split selection on bars", None, Then::Do(Act::Shell(ShellVerb::SplitOnGrid(16)))),
+        c("make curve unique (strip's binding)", None, Then::Do(Act::Shell(ShellVerb::MakeCurveUnique))),
         c("save archive…", None, Then::Do(Act::Shell(ShellVerb::ArchiveDialog))),
         c("export…", None, Then::Do(Act::Shell(ShellVerb::ExportDialog))),
         c("settings…", None, Then::Do(Act::Shell(ShellVerb::Settings))),
