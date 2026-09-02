@@ -198,7 +198,16 @@ pub use scene_kit::spatial;
 #[allow(dead_code)] pub mod gen_profile;  // std only
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod hud_pack;   // eframe::egui geometry
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod touch_nav;  // touchkit + crate::spatial
-#[cfg(feature = "gui")] #[allow(dead_code)] pub mod mesh3d;
+// MIGRATED to scene-kit, same terms as glow_scene/spatial/textsurface. §75
+// measured it: scene-kit's copy is a superset — 48 shared public functions,
+// 5 extra there, 0 unique here — and the 253-line diff was almost entirely
+// one added field (`Mesh3::uvs`) propagating through struct literals, NOT the
+// two-way divergence §18 assumed from the diff count alone.
+//
+// No `theme` coupling to unpick, unlike glow_scene, so this is a straight
+// re-export. `sun_clock` here delegated to `math_kit::daylight` and
+// scene-kit's does too, so the curve is unaffected.
+#[cfg(feature = "gui")] pub use scene_kit::mesh3d;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod pearl_input;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod scene3d;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod gpuscene;

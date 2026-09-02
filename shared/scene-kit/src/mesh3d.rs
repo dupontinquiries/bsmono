@@ -1807,3 +1807,37 @@ mod sun_at_tests {
     }
 }
 
+
+#[cfg(test)]
+mod sun_curve_delegation {
+    //! `sun_clock_at` must stay a delegation to `math_kit::daylight`.
+    //!
+    //! There were three copies of this curve. The panels were taught to track
+    //! the clock precisely so the room behind the glass and the glass itself
+    //! would not disagree about the time of day, and a re-inlined formula here
+    //! would re-create that disagreement silently — nothing fails, the scene
+    //! just drifts from the UI.
+    //!
+    //! This guard previously lived in logscope-egui's own mesh3d, which could
+    //! see both sides. That file is now a re-export of this one, so the guard
+    //! moves here, where the delegation actually is.
+
+    #[test]
+    fn it_matches_the_canonical_curve_across_the_day() {
+        for h in [0.0_f32, 3.0, 6.0, 6.5, 9.0, 12.0, 15.0, 17.5, 21.0, 23.5, 25.0] {
+            let want = math_kit::daylight::sky_at(h);
+            let got = super::sun_clock_at(h);
+            assert!((want.strength - got.0).abs() < 1e-6, "strength at h={h}");
+            assert!((want.warmth - got.1).abs() < 1e-6, "warmth at h={h}");
+            assert!((want.ambient - got.2).abs() < 1e-6, "ambient at h={h}");
+        }
+    }
+
+    #[test]
+    fn sun_clock_reads_the_same_curve_at_the_current_hour() {
+        let (s, w, a) = super::sun_clock();
+        let e = math_kit::daylight::sky_at(super::local_hour());
+        assert!((s - e.strength).abs() < 1e-6 && (w - e.warmth).abs() < 1e-6
+                && (a - e.ambient).abs() < 1e-6);
+    }
+}
