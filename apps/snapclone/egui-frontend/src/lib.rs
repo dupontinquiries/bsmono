@@ -361,6 +361,12 @@ pub struct Snapclone {
     /// ripple survive the redraw they are animating through.
     pub glass_flip: crate::glass::GlassButton,
     pub glass_shutter: crate::glass::GlassButton,
+    /// Paint the capture flash white instead of dark. Off by default — see
+    /// `camera::flash_color` for why the dark one is the right default. A
+    /// session setting, like this app's other toggles: nothing here is
+    /// persisted yet, and pretending otherwise in a doc comment is how the
+    /// next reader loses an afternoon.
+    pub snap_flash_bright: bool,
     /// Seconds since the capture flash started; `None` when not flashing.
     /// Set from `HostEvent::SnapSaved`, so it fires on the file actually
     /// existing rather than on the tap — a flash on the tap would confirm a
@@ -766,6 +772,7 @@ impl Snapclone {
             dialog_form: crate::mobile_dialog::Form::Sheet,
             glass_flip: Default::default(),
             glass_shutter: Default::default(),
+            snap_flash_bright: false,
             snap_flash: None,
             shutter_pressed: false,
             video: None,
@@ -3704,7 +3711,8 @@ impl Snapclone {
                 self.snap_flash = None;
             } else {
                 ui.painter_at(vf_rect).rect_filled(
-                    vf_rect, 0.0, egui::Color32::from_white_alpha((a * 220.0) as u8));
+                    vf_rect, 0.0,
+                    crate::camera::flash_color(age, self.snap_flash_bright));
                 self.snap_flash = Some(age + ui.input(|i| i.stable_dt).min(0.1));
                 ui.ctx().request_repaint();
             }
@@ -4361,6 +4369,17 @@ impl Snapclone {
         // FACE DETECTION CONSENT. A control, not a notice: the module's
         // argument is that consent decides whether the work HAPPENS, so the
         // switch has to be reachable.
+        // CAMERA. One toggle so far; a collapsible rather than a bare
+        // checkbox so the next camera setting has somewhere to go that is not
+        // the top of the page.
+        ui.collapsing("camera", |ui| {
+            ui.checkbox(&mut self.snap_flash_bright, "bright capture flash");
+            ui.colored_label(c.text_weak, if self.snap_flash_bright {
+                "white, like a phone screen"
+            } else {
+                "dark, like a shutter — easier on the eyes in a dim room"
+            });
+        });
         ui.collapsing("faces", |ui| {
             use crate::face_consent::Consent;
             let mut granted = self.face_consent.may_detect();

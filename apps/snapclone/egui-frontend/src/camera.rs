@@ -269,6 +269,32 @@ pub fn flash_alpha(t: f32) -> f32 {
     1.0 - t / FLASH_SECS
 }
 
+/// The colour the capture flash paints, at age `t`.
+///
+/// **Dark by default.** A white flash is what a phone screen does because a
+/// phone screen is also the fill light; a camera's own shutter does the
+/// opposite — the frame goes BLACK for the moment the mirror is up, and that
+/// is the confirmation people who have used a camera actually recognise. It is
+/// also the kinder one: this app is pointed at faces in dim rooms, and a
+/// full-brightness white rectangle at arm's length in the dark is unpleasant
+/// in a way the alternative is not.
+///
+/// `bright` is the opt-in, for anyone who wants the phone behaviour or is
+/// shooting somewhere a dark flash is invisible against a dark scene.
+///
+/// Alpha peaks lower than opaque in both directions: a flash that fully
+/// replaces the frame loses the picture the user just took, and seeing the
+/// shot dim rather than vanish is what makes it read as a shutter rather than
+/// as a dropped frame.
+pub fn flash_color(t: f32, bright: bool) -> Color32 {
+    let a = (flash_alpha(t) * 220.0) as u8;
+    if bright {
+        Color32::from_white_alpha(a)
+    } else {
+        Color32::from_black_alpha(a)
+    }
+}
+
 /// The band at the foot of the viewfinder that the controls are drawn OVER.
 ///
 /// The camera page used to RESERVE space for its controls, which itself
@@ -414,6 +440,24 @@ mod tests {
         let flat = Viewfinder { full_bleed: false, sensor_aspect: 1.0, ..Default::default() };
         let s0 = flat.to_sensor(Pos2::new(10.0, 10.0), into).unwrap();
         assert!(s0[0] < 0.2 && s0[1] < 0.2, "got {s0:?}");
+    }
+
+    #[test]
+    fn the_flash_is_dark_unless_asked_otherwise() {
+        // The default is the whole point of this function, so the default is
+        // what the test names. A check that only compared the two modes would
+        // pass with them swapped.
+        let dark = flash_color(0.0, false);
+        assert_eq!(dark.to_srgba_unmultiplied()[..3], [0, 0, 0], "the default flash is not dark");
+        let bright = flash_color(0.0, true);
+        assert_eq!(bright.to_srgba_unmultiplied()[..3], [255, 255, 255]);
+        // Both fade on the same clock, and neither is ever fully opaque — a
+        // flash that replaces the frame loses the shot the user just took.
+        for bright in [false, true] {
+            assert!(flash_color(0.0, bright).a() < 255, "the flash hid the photo");
+            assert_eq!(flash_color(FLASH_SECS, bright).a(), 0, "the flash lingered");
+            assert!(flash_color(FLASH_SECS * 0.5, bright).a() < flash_color(0.0, bright).a());
+        }
     }
 
     #[test]
