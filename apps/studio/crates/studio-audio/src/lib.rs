@@ -568,6 +568,12 @@ pub fn mixdown_into(
         // track. The lane itself is then swept with a cursor rather than
         // binary-searched per sample (see `eval_lane_cursor`).
         let track_lane = project.automation.get(&AutoTarget::TrackGain(track.id));
+        // The curves bound to this track's gain, gates resolved once per
+        // render (a clip-gated binding's span is a fact about the project,
+        // not about the sample) and swept with the same cursor rule as the
+        // lane. Empty for every project from before bindings existed, and
+        // an empty product is 1.0 — bit-identical, pinned below.
+        let mut track_sweeps = project.binding_sweeps(AutoTarget::TrackGain(track.id));
         for clip in project.track_clips(track.id) {
             // skip clips entirely outside the window
             if clip.end() <= from || clip.pos >= to { continue; }
@@ -611,10 +617,14 @@ pub fn mixdown_into(
                 // docs). Per-sample evaluation at the `at` this loop
                 // already computes: automation that stepped per buffer
                 // would zipper on any ramp steeper than gentle.
-                let auto = match track_lane {
+                let mut auto = match track_lane {
                     Some(lane) => studio_core::eval_lane_cursor(lane, at, &mut lane_cursor),
                     None => 1.0,
                 };
+                // Bindings MULTIPLY into the lane, never replace it — see
+                // `studio_core::curves`: two bindings on one track compose,
+                // and a binding whose gate is closed reads 1.0.
+                for sw in track_sweeps.iter_mut() { auto *= sw.value(at); }
                 let g = clip.gain * track.gain * auto * fade.gain_at(into_clip, clip.len);
                 let oi = (out_off + i) * 2;
                 let read = |c: &[f32], pos: f64| -> Option<f32> {
@@ -715,20 +725,24 @@ pub fn mixdown_into(
         }
         zero_resize(&mut scratch.pre, buf.len());
         scratch.pre.copy_from_slice(&buf);
-        match project.automation.get(&AutoTarget::BusGain(id)) {
-            Some(lane) => {
-                // The bus fader's ride, per interleaved frame — L and R of
-                // one instant share one lane value, or a ramp would tilt
-                // the image sideways.
-                let from_s = from.to_samples(rate);
-                for (fi, pair) in buf.chunks_exact_mut(2).enumerate() {
-                    let at = Ticks::from_samples(from_s + fi as i64, rate);
-                    let g = bus.gain * eval_lane(lane, at);
-                    pair[0] *= g;
-                    pair[1] *= g;
-                }
+        let bus_lane = project.automation.get(&AutoTarget::BusGain(id));
+        let mut bus_sweeps = project.binding_sweeps(AutoTarget::BusGain(id));
+        if bus_lane.is_some() || !bus_sweeps.is_empty() {
+            // The bus fader's ride, per interleaved frame — L and R of
+            // one instant share one value, or a ramp would tilt the image
+            // sideways. Bindings multiply in exactly as on a track; a bus
+            // gated by a clip on some OTHER track is how a vocal ducks the
+            // drum bus without a sidechain compressor.
+            let from_s = from.to_samples(rate);
+            for (fi, pair) in buf.chunks_exact_mut(2).enumerate() {
+                let at = Ticks::from_samples(from_s + fi as i64, rate);
+                let mut g = bus.gain * bus_lane.map_or(1.0, |lane| eval_lane(lane, at));
+                for sw in bus_sweeps.iter_mut() { g *= sw.value(at); }
+                pair[0] *= g;
+                pair[1] *= g;
             }
-            None => for s in buf.iter_mut() { *s *= bus.gain; },
+        } else {
+            for s in buf.iter_mut() { *s *= bus.gain; }
         }
 
         for send in &bus.sends {
@@ -1744,6 +1758,123 @@ mod automation_render_tests {
         for i in 0..plain.len() {
             assert!((plain[i] - unity[i]).abs() < 1e-6, "a unity lane is transparent at {i}");
         }
+    }
+}
+
+#[cfg(test)]
+mod binding_render_tests {
+    //! The curves module's promise, checked through a REAL render rather
+    //! than through `auto_value`: a clip-gated ride follows its clip, a bus
+    //! ducks under a clip on another track, and a project with no bindings
+    //! renders bit-identically to before bindings existed.
+    use super::*;
+    use studio_core::{AutoTarget, Binding, BindingId, Bus, BusId, Clip, ClipId, CurveId, Gate, Op,
+                      Source, SourceId, Track, TrackId, TrackKind};
+
+    /// Two tracks, one 0.5-DC source, a clip on track 1 at 0.2–0.4 s. A
+    /// "dip" curve reading 0.0 at its own 0.1 s, 1.0 at its ends.
+    fn fixture() -> (Project, BTreeMap<SourceId, SourceAudio>) {
+        let mut p = Project::default();
+        for id in [1, 2] {
+            p.apply(&Op::AddTrack { track: Track { id: TrackId(id), kind: TrackKind::Audio,
+                name: format!("A{id}"), muted: false, locked: false, gain: 1.0, route: None }, at: 0 }).unwrap();
+        }
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "x".into(),
+            len: Ticks::from_seconds(1.0), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1),
+            track: TrackId(1), pos: Ticks::from_seconds(0.2), src_in: Ticks::ZERO,
+            len: Ticks::from_seconds(0.2), gain: 1.0, effects: vec![] } }).unwrap();
+        p.apply(&Op::SetCurve { id: CurveId(1), name: "dip".into() }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::ZERO, value: 1.0 }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::from_seconds(0.1), value: 0.0 }).unwrap();
+        p.apply(&Op::SetCurvePoint { curve: CurveId(1), at: Ticks::from_seconds(0.2), value: 1.0 }).unwrap();
+        let mut audio = BTreeMap::new();
+        audio.insert(SourceId(1), SourceAudio { sample_rate: 48_000, channels: vec![vec![0.5; 48_000]] });
+        (p, audio)
+    }
+    fn render(p: &Project, a: &BTreeMap<SourceId, SourceAudio>) -> Vec<f32> {
+        mixdown(p, a, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(1.0), 48_000, &[], &[])
+    }
+    fn left_at(out: &[f32], secs: f64) -> f32 { out[(secs * 48_000.0) as usize * 2] }
+
+    #[test]
+    fn no_bindings_renders_bit_identically_to_a_pre_binding_project() {
+        let (mut p, a) = fixture();
+        let before = render(&p, &a);
+        // A curve with no binding, and then no curve at all, must both be
+        // the same samples: the render only ever sees bindings.
+        let with_curve = render(&p, &a);
+        assert_eq!(before, with_curve);
+        p.curves.clear();
+        assert_eq!(before, render(&p, &a));
+        assert!((left_at(&before, 0.3) - 0.5).abs() < 1e-6, "the clip is audible at unity");
+    }
+
+    #[test]
+    fn a_clip_gated_ride_follows_the_clip_through_a_real_render() {
+        let (mut p, a) = fixture();
+        p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding { curve: CurveId(1),
+            target: AutoTarget::TrackGain(TrackId(1)), gate: Gate::Clip(ClipId(1)) } }).unwrap();
+        let out = render(&p, &a);
+        assert!((left_at(&out, 0.3)).abs() < 1e-3, "the dip lands 0.1 s into the clip, got {}", left_at(&out, 0.3));
+        assert!((left_at(&out, 0.25) - 0.25).abs() < 2e-3, "halfway down the ramp");
+        // Move the clip: the dip must move with it and leave nothing behind.
+        p.apply(&Op::MoveClip { id: ClipId(1), pos: Ticks::from_seconds(0.6), track: TrackId(1) }).unwrap();
+        let out = render(&p, &a);
+        assert_eq!(left_at(&out, 0.3), 0.0, "nothing plays where the clip was");
+        assert!((left_at(&out, 0.7)).abs() < 1e-3, "the dip is at the new place");
+        assert!((left_at(&out, 0.65) - 0.25).abs() < 2e-3);
+    }
+
+    #[test]
+    fn a_bus_ducks_under_a_clip_on_another_track() {
+        // Track 2 carries a constant tone through a bus; track 1's clip
+        // gates a dip on the BUS gain. Structural sidechain: while the
+        // vocal plays, the drums drop, and nothing else changes.
+        let (mut p, a) = fixture();
+        p.apply(&Op::AddBus { bus: Bus { id: BusId(1), name: "drums".into(), parent: None,
+            gain: 1.0, chain: vec![], sends: vec![], muted: false } }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(2), bus: Some(BusId(1)) }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(2), source: SourceId(1),
+            track: TrackId(2), pos: Ticks::ZERO, src_in: Ticks::ZERO,
+            len: Ticks::from_seconds(1.0), gain: 1.0, effects: vec![] } }).unwrap();
+        // Mute track 1 so only the bus's output is measured.
+        p.apply(&Op::SetTrackFlags { id: TrackId(1), muted: true, locked: false }).unwrap();
+        p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding { curve: CurveId(1),
+            target: AutoTarget::BusGain(BusId(1)), gate: Gate::Clip(ClipId(1)) } }).unwrap();
+        let out = render(&p, &a);
+        assert!((left_at(&out, 0.1) - 0.5).abs() < 1e-6, "before the vocal: full");
+        assert!((left_at(&out, 0.3)).abs() < 1e-3, "under the vocal's dip: ducked, got {}", left_at(&out, 0.3));
+        assert!((left_at(&out, 0.5) - 0.5).abs() < 1e-6, "after the vocal: full again");
+        // L and R duck together — a ramp must not tilt the image.
+        let fi = (0.25 * 48_000.0) as usize * 2;
+        assert_eq!(out[fi], out[fi + 1]);
+    }
+
+    #[test]
+    fn the_render_matches_the_models_own_definition_sample_for_sample() {
+        // The equivalence guard: the swept fast path against a naive
+        // per-sample `auto_value`, across a lane AND two bindings.
+        let (mut p, a) = fixture();
+        let t = AutoTarget::TrackGain(TrackId(1));
+        p.apply(&Op::SetAutoPoint { target: t, at: Ticks::ZERO, value: 0.5 }).unwrap();
+        p.apply(&Op::SetAutoPoint { target: t, at: Ticks::from_seconds(1.0), value: 1.0 }).unwrap();
+        p.apply(&Op::SetBinding { id: BindingId(1), binding: Binding { curve: CurveId(1),
+            target: t, gate: Gate::Clip(ClipId(1)) } }).unwrap();
+        p.apply(&Op::SetBinding { id: BindingId(2), binding: Binding { curve: CurveId(1),
+            target: t, gate: Gate::Window { start: Ticks::from_seconds(0.3), end: Ticks::from_seconds(0.5) } } }).unwrap();
+        let out = render(&p, &a);
+        let mut checked = 0;
+        for f in (0..48_000).step_by(97) {
+            let at = Ticks::from_samples(f, 48_000);
+            let expected = if at >= Ticks::from_seconds(0.2) && at < Ticks::from_seconds(0.4) {
+                0.5 * p.auto_value(t, at)
+            } else { 0.0 };
+            let got = out[f as usize * 2];
+            assert!((got - expected).abs() < 1e-5, "frame {f}: render {got} vs model {expected}");
+            checked += 1;
+        }
+        assert!(checked > 400);
     }
 }
 
