@@ -162,6 +162,7 @@ pub mod item_brain;
 pub mod emission;
 pub mod column_memo;
 pub mod ai_budget;
+pub mod behavior_field;
 pub mod buddy_pool;
 pub mod neighbor_grid;
 pub mod carry;

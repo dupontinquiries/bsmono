@@ -126,3 +126,49 @@ slots and a mesher that meshes chunks one at a time. So, in order:
 If `mesher.cpu ≈ mesher.gpu` there and `gpu_spikes` is 0 in both, the
 stall is Honeykrisp-specific and (1)+(2) are the desktop's work. If the
 phone's `roamer_tick` p50 is in the tens of ms, (5) is everyone's.
+
+## Second pass (same day): what is now built
+
+- **The generator ring** (`world/gpu_generator.rs`). N slots
+  (`UNENDLICH_GPU_GEN_INFLIGHT`, default 3), each with its own output
+  buffer, descriptor set, command buffer and fence. `submit` returns a
+  `Ticket`; `poll` returns every finished batch, oldest first, without
+  blocking; `collect` waits for one. `generate_batch` is submit + collect,
+  so `world-bench` and every caller keep their contract. The invariant
+  llama.cpp's WebGPU backend sizes its param arena by (batch + margin) and
+  logscope's PASS_FUSE broke: a slot is never reused until its result is
+  collected, push constants are recorded by value — no dispatch in flight
+  refers to a recycled resource, because the pool IS the in-flight count.
+  Type-checked under `--features gpu` here; not run on a GPU. The
+  streaming pool still calls `generate_batch`; switching it to
+  `submit`/`poll` is the wiring. NOTE the other half of the 0.63x, read off
+  the record loop: `cmd_dispatch(1, 1, 1)` per chunk — one 8×8×8 workgroup
+  per chunk, 16 workgroups per batch on a GPU with hundreds of cores. The
+  ring pipelines; occupancy needs `chunk_generation.comp` to take more
+  workgroups per chunk (each invocation one block instead of 4×4×4, and
+  dispatch (4,4,4)), which is a shader change validated on the box.
+- **Megachunks** (`world/lod.rs`: `MegaCoord`, `assemble_megachunk`,
+  `placement`). One 32³ chunk of cells per f³ block, meshed by the
+  unchanged mesher, placed at the block origin scaled by f. Tested: the
+  block addressing is stable, a flat world's surface lands in the right
+  cell, missing members are air, and — with the reference mesher — one
+  megachunk mesh is lighter than its 64 members' meshes. The renderer's
+  side (a draw path that takes `placement`'s offset + scale, and the
+  scheduler choosing blocks instead of chunks for the far bands) is the
+  wiring; the mesher and the data are done.
+- **The behavior field** (`sim/behavior_field.rs`). Food, threat, herd,
+  height, water on a coarse grid over the loaded area, built once per tick
+  (one surface read per cell, one splat per creature), sampled per
+  creature by bilinear read and gradient. `grazer_intent` is the decision:
+  flee down threat, else climb food, else drift to the herd until crowded.
+  Tested. Cost is per cell, not per creature × per scan, so a thousand
+  creatures are the price of twenty — no dumber, no fewer. The GPU build
+  is the same layout from a compute pass over the surface data, read back
+  once per tick through the same ring shape; the CPU build is what it
+  replaces, and the API is what the roamer loop's forage/flee code should
+  be rewritten against. That rewrite is the wiring.
+
+Not done, still: the mesher's ring on the graphics queue (same shape as
+the generator's, in `gpu_meshing_octree::record_submit_wait`, plus either
+a compute queue family or GPU-time-sized batches), and the fullgame bin
+build of the roamer budget wiring.
