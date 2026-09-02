@@ -13,7 +13,8 @@
 //! of the original; here redraw keeps the original so the two domains
 //! never disagree.
 
-use crate::frame::{block_sse, block_sse_bounded, Frame};
+use crate::blockcache::{hash_cell, BlockCache};
+use crate::frame::{block_sse, block_sse_bounded, Frame, Pad};
 use crate::gate::{ReferenceMaker, ThresholdMap};
 use crate::matcher::BlockMatcher;
 use crate::plan::{BlockMatch, FadeBlock, FramePlan, FrameStats, Grid, ResidualVector, MAX_TIERS};
@@ -52,12 +53,18 @@ impl Default for AnalyzeConfig {
 }
 
 /// Per-cell state carried across frames by the caller (both stages keep
-/// none of it on the merge side; it only affects the gate).
+/// none of it on the merge side; it only affects the gate), plus the shared
+/// block cache if one is in use.
 #[derive(Debug, Clone, Default)]
 pub struct AnalyzeState {
     /// Consecutive frames each cell has been reused (any non-Missing match).
     pub streak: Vec<u16>,
+    pub cache: Option<std::sync::Arc<std::sync::Mutex<BlockCache>>>,
 }
+
+/// Upscaled bytes for the `Cached` blocks of one plan, attached by the
+/// analysis stage so eviction between the stages cannot lose them.
+pub type CachedBlocks = std::collections::HashMap<u64, std::sync::Arc<Vec<u8>>>;
 
 /// Luma standard deviation of a block — the texture measure for tiering.
 fn block_luma_std(f: &Frame, x: u32, y: u32, size: u32) -> f64 {
@@ -128,7 +135,8 @@ pub fn analyze(
     cfg: &AnalyzeConfig,
 ) -> anyhow::Result<(FramePlan, Frame)> {
     let mut st = AnalyzeState::default();
-    analyze_tiered(prev_working, next, older, reference, matcher, cfg, 1, &mut st)
+    let (plan, w, _) = analyze_tiered(prev_working, next, older, reference, matcher, cfg, 1, &mut st)?;
+    Ok((plan, w))
 }
 
 /// [`analyze`] with `tiers` upscalers available (1–3) and persistent state.
@@ -142,7 +150,7 @@ pub fn analyze_tiered(
     cfg: &AnalyzeConfig,
     tiers: usize,
     state: &mut AnalyzeState,
-) -> anyhow::Result<(FramePlan, Frame)> {
+) -> anyhow::Result<(FramePlan, Frame, CachedBlocks)> {
     anyhow::ensure!(
         (prev_working.width, prev_working.height) == (next.width, next.height),
         "analyze: frame size changed {}x{} -> {}x{}",
@@ -160,7 +168,7 @@ pub fn analyze_tiered(
     }
     if psnr < cfg.min_psnr {
         state.streak.iter_mut().for_each(|s| *s = 0);
-        return Ok((FramePlan::redraw(grid, psnr), next.clone()));
+        return Ok((FramePlan::redraw(grid, psnr), next.clone(), CachedBlocks::new()));
     }
 
     let degraded = reference.degrade(next)?;
@@ -222,6 +230,7 @@ pub fn analyze_tiered(
             BlockMatch::Stationary => stats.stationary += 1,
             BlockMatch::Moved { .. } => stats.moved += 1,
             BlockMatch::Recalled { .. } => stats.recalled += 1,
+            BlockMatch::Cached { .. } => stats.cached += 1,
             BlockMatch::Missing => stats.missing += 1,
         }
     }
@@ -243,10 +252,42 @@ pub fn analyze_tiered(
         state.streak.iter_mut().for_each(|s| *s = 0);
         let mut plan = FramePlan::redraw(grid, psnr);
         plan.stats.fades = 0;
-        return Ok((plan, next.clone()));
+        return Ok((plan, next.clone(), CachedBlocks::new()));
     }
     for (s, m) in state.streak.iter_mut().zip(&matches) {
         *s = if *m == BlockMatch::Missing { 0 } else { s.saturating_add(1) };
+    }
+
+    // --- content hashes of missing cells (block + bleed ring, black beyond
+    // the frame, exactly what make_residual packs), and cache lookups.
+    let cell_px = bs + 2 * cfg.bleed;
+    let padded = next.padded(cfg.bleed, Pad::Black);
+    let keys: Vec<u64> = (0..grid.len())
+        .into_par_iter()
+        .map(|i| {
+            if matches[i] != BlockMatch::Missing {
+                return 0;
+            }
+            let (x, y) = grid.origin(i);
+            hash_cell(&padded, x, y, cell_px)
+        })
+        .collect();
+    let mut cached_blocks = CachedBlocks::new();
+    let mut matches = matches;
+    if let Some(cache) = &state.cache {
+        let mut c = cache.lock().unwrap();
+        if c.enabled() {
+            for i in 0..grid.len() {
+                if matches[i] == BlockMatch::Missing {
+                    if let Some(b) = c.get(keys[i]) {
+                        cached_blocks.insert(keys[i], b);
+                        matches[i] = BlockMatch::Cached { key: keys[i] };
+                        stats.cached += 1;
+                        stats.missing -= 1;
+                    }
+                }
+            }
+        }
     }
 
     // --- route missing blocks to tiers by texture, then pack per tier.
@@ -285,7 +326,7 @@ pub fn analyze_tiered(
             let t = tier_of[i] as usize;
             let (x, y) = grid.origin(i);
             let cols = residual_tiers[t].0;
-            residuals.push(ResidualVector { frame_x: x, frame_y: y, cell_x: k[t] % cols, cell_y: k[t] / cols, tier: t as u8 });
+            residuals.push(ResidualVector { frame_x: x, frame_y: y, cell_x: k[t] % cols, cell_y: k[t] / cols, tier: t as u8, key: keys[i] });
             k[t] += 1;
         }
     }
@@ -299,11 +340,12 @@ pub fn analyze_tiered(
             BlockMatch::Stationary => working_next.copy_block(prev_working, bs, x, y, x, y),
             BlockMatch::Moved { src_x, src_y } => working_next.copy_block(prev_working, bs, src_x, src_y, x, y),
             BlockMatch::Recalled { r } => working_next.copy_block(older[r as usize], bs, x, y, x, y),
-            BlockMatch::Missing => {}
+            // Cached blocks are the frame's own content, like Missing.
+            BlockMatch::Cached { .. } | BlockMatch::Missing => {}
         }
     }
 
-    Ok((FramePlan { grid, matches, residuals, fades, redraw: false, stats }, working_next))
+    Ok((FramePlan { grid, matches, residuals, fades, redraw: false, stats }, working_next, cached_blocks))
 }
 
 /// Debug aid: the SSE of the reconstruction against the true next frame,
@@ -462,7 +504,7 @@ mod tier_tests {
         }
         let mut w = prev.clone();
         let mut st = AnalyzeState::default();
-        let (plan, _) = analyze_tiered(&mut w, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 3, &mut st).unwrap();
+        let (plan, _, _) = analyze_tiered(&mut w, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 3, &mut st).unwrap();
         assert_eq!(plan.stats.missing, 3, "{:?}", plan.stats);
         let tier_at = |x: u32| plan.residuals.iter().find(|r| r.frame_x == x && r.frame_y == 0).unwrap().tier;
         assert_eq!(tier_at(0), 2, "flat -> bicubic");
@@ -471,7 +513,7 @@ mod tier_tests {
         assert_eq!(plan.stats.residual_tiers, [(1, 1), (1, 1), (1, 1)]);
         // With a single tier everything is tier 0.
         let mut w = prev.clone();
-        let (plan1, _) = analyze_tiered(&mut w, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
+        let (plan1, _, _) = analyze_tiered(&mut w, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
         assert!(plan1.residuals.iter().all(|r| r.tier == 0));
         assert_eq!(plan1.stats.residual_tiers[0], (2, 2));
     }
@@ -483,7 +525,7 @@ mod tier_tests {
         let mut st = AnalyzeState::default();
         let mut w = base.clone();
         for _ in 0..8 {
-            let (_, nw) = analyze_tiered(&mut w, &base, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
+            let (_, nw, _) = analyze_tiered(&mut w, &base, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
             w = nw;
         }
         assert!(st.streak.iter().all(|&s| s == 8));
@@ -493,9 +535,60 @@ mod tier_tests {
         next.add_uniform_noise(2, 5);
         let mut w0 = base.clone();
         let mut fresh = AnalyzeState::default();
-        let (p_fresh, _) = analyze_tiered(&mut w0, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut fresh).unwrap();
+        let (p_fresh, _, _) = analyze_tiered(&mut w0, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut fresh).unwrap();
         let mut w1 = base.clone();
-        let (p_streak, _) = analyze_tiered(&mut w1, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
+        let (p_streak, _, _) = analyze_tiered(&mut w1, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
         assert!(p_streak.stats.missing <= p_fresh.stats.missing, "streak {:?} vs fresh {:?}", p_streak.stats, p_fresh.stats);
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::blockcache::BlockCache;
+    use crate::gate::JpegReference;
+    use crate::matcher::Stationary;
+    use crate::testimg::smooth;
+    use std::sync::{Arc, Mutex};
+
+    /// The same new content at a different position on a later frame is a
+    /// cache hit, carrying the bytes that were inserted for it.
+    #[test]
+    fn repeated_cell_content_is_served_from_the_cache() {
+        let cfg = AnalyzeConfig { block_size: 16, bleed: 1, ..Default::default() };
+        let base = smooth(64, 64, 6);
+        let stamp = |f: &mut Frame, x0: u32, y0: u32| {
+            for y in 0..16 {
+                for x in 0..16 {
+                    f.set_px(x0 + x, y0 + y, [((x * 13 + y * 7) % 200) as u8, 40, ((x ^ y) * 9) as u8]);
+                }
+            }
+        };
+        let cache = Arc::new(Mutex::new(BlockCache::new(1 << 20)));
+        let mut st = AnalyzeState { streak: Vec::new(), cache: Some(cache.clone()) };
+        // Frame 1: the stamp at (16,16), with a black bleed ring? No — bleed
+        // ring comes from the surrounding smooth image, so use a frame where
+        // the ring is identical both times: put the stamp fully inside a
+        // uniform region.
+        let mut uniform = Frame::new(64, 64);
+        uniform.data.iter_mut().for_each(|b| *b = 90);
+        let mut f1 = uniform.clone();
+        stamp(&mut f1, 16, 16);
+        let _ = base;
+        let mut w = uniform.clone();
+        let (p1, _, c1) = analyze_tiered(&mut w, &f1, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
+        assert!(c1.is_empty());
+        let rv = p1.residuals.iter().find(|r| (r.frame_x, r.frame_y) == (16, 16)).unwrap();
+        cache.lock().unwrap().insert(rv.key, Arc::new(vec![7u8; 32 * 32 * 3]));
+        // Frame 2: same stamp at (32,32) in the same uniform surround.
+        let mut f2 = uniform.clone();
+        stamp(&mut f2, 32, 32);
+        let mut w = f1.clone();
+        let (p2, _, c2) = analyze_tiered(&mut w, &f2, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 1, &mut st).unwrap();
+        let cell = (32 / 16) + (32 / 16) * p2.grid.cols;
+        assert!(matches!(p2.matches[cell as usize], BlockMatch::Cached { .. }), "{:?}", p2.matches[cell as usize]);
+        assert_eq!(p2.stats.cached, 1);
+        assert_eq!(c2.len(), 1);
+        assert!(c2.values().next().unwrap().iter().all(|&b| b == 7));
     }
 }

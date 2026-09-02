@@ -147,6 +147,29 @@ What is built:
   from 50 % to 36 % of pixels; photo footage has a far larger smooth share.
   Seams between tiers are possible on blocks near a threshold — raise
   `--smooth-std` cautiously and look.
+- **Memory budgets** (`--ram-budget`, `--vram-budget`; default half of
+  `MemAvailable`, a quarter of that for the GPU — gpu-gemm's memplan
+  convention). The RAM budget sizes the reference rings (40 %, split across
+  `-j` workers: up to 32 recent, the rest shot starts up to 4096) and the
+  block cache (20 %), leaving headroom for decoder, encoder and queues.
+  `--refs/--keyframe-refs/--block-cache` override. With 192 GB that is a
+  ring spanning the whole film's shot starts, so any cut-back is a copy.
+- **Block cache** (`cache` column): a cell whose exact bytes (block + bleed
+  ring) were upscaled before — anywhere in the frame, any time in the job —
+  is served from memory: static overlays, letterbox, black, repeated UI,
+  animation cycles, a moving logo. Exact match only; FIFO under its byte
+  budget; shared across `-j` workers. Hits lag the pipeline depth (stage A
+  analyses ahead of stage B's inserts), so a repeat two frames later misses
+  and one twenty frames later hits. On photo footage the hit rate is
+  content-dependent; the column tells you what it is on yours.
+- **In-flight activation sets** (`--inflight N`, default 2): every GPU tier
+  holds N sets of buffers and rotates tiles through them, waiting on each
+  tile's own submission, so upload of tile k+1 and readback of tile k−1
+  overlap compute of tile k. The GPU budget is split across tiers by
+  per-pixel cost and across sets; tiles shrink to fit. All tiers share one
+  device. Bit-exact against the CPU reference with three sets over
+  five-tile frames on lavapipe; the overlap itself only shows on a real
+  GPU.
 - **Gate hysteresis** (`--streak-bonus b`, default 0 = off): a block reused
   for `n` consecutive frames gets its threshold scaled by
   `1 + b·min(n,8)/8`, so blocks that keep matching stop flickering out at

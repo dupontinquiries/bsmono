@@ -333,7 +333,10 @@ impl Shell {
                 ui.add(egui::DragValue::new(&mut self.job.pipeline.keyframe_refs).range(0..=256));
                 ui.label("batch");
                 ui.add(egui::DragValue::new(&mut self.job.pipeline.batch).range(1..=32));
+                ui.label("in flight");
+                ui.add(egui::DragValue::new(&mut self.job.inflight).range(1..=8));
             });
+            ui.label("ring depths and block cache follow the memory budget (half of available RAM) unless set on the CLI");
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.cascade, "cascade (smooth → compact net)");
                 ui.checkbox(&mut self.job.flat_bypass, "flat → bicubic");

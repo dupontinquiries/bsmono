@@ -63,6 +63,9 @@ pub enum BlockMatch {
     /// Same position in an older reference (`r` indexes the reference
     /// list: recent frames first, then retained shot starts) passes the gate.
     Recalled { r: u8 },
+    /// The block's cell content was upscaled before; the block cache holds
+    /// the result under `key`.
+    Cached { key: u64 },
     /// Nothing in any reference passes; the block must be upscaled.
     Missing,
 }
@@ -80,6 +83,8 @@ pub struct ResidualVector {
     pub cell_x: u32,
     pub cell_y: u32,
     pub tier: u8,
+    /// Content hash of the cell, the block cache key once it is upscaled.
+    pub key: u64,
 }
 
 /// A flat brightness shift applied to a block of the previous frame before
@@ -101,6 +106,8 @@ pub struct FrameStats {
     pub fades: u32,
     /// Blocks recovered from older references.
     pub recalled: u32,
+    /// Blocks served from the content-keyed block cache.
+    pub cached: u32,
     /// Residual image size in cells per tier (0×0 if none). Rectangular:
     /// `cols = ceil(sqrt(n))`, `rows = ceil(n / cols)`, so at most `cols − 1`
     /// cells are wasted instead of up to `2·sqrt(n)` for a square.

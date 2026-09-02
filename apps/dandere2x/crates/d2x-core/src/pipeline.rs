@@ -16,7 +16,9 @@ use crate::frame::{Frame, Pad};
 use crate::gate::{JpegReference, ReferenceMaker};
 use crate::matcher::{BlockMatcher, Diamond, Exhaustive, Stationary};
 use crate::plan::{FramePlan, FrameStats, MAX_TIERS};
-use crate::predict::{analyze_tiered, AnalyzeConfig, AnalyzeState};
+use crate::blockcache::BlockCache;
+use crate::predict::{analyze_tiered, AnalyzeConfig, AnalyzeState, CachedBlocks};
+use std::sync::{Arc, Mutex};
 use crate::residual::{make_residual, merge_tiered, Residual};
 use crate::upscale::Upscaler;
 use std::sync::mpsc;
@@ -79,6 +81,9 @@ pub struct PipelineConfig {
     /// For `analyze_only`: how many upscaler tiers to assume when routing
     /// (the real run uses the number of upscalers it is given).
     pub tiers: usize,
+    /// Byte budget of the content-keyed block cache (0 = off). Shared
+    /// across segment workers when `run_tiered` is given one.
+    pub block_cache_bytes: u64,
 }
 
 impl Default for PipelineConfig {
@@ -93,6 +98,7 @@ impl Default for PipelineConfig {
             keyframe_refs: 4,
             batch: 4,
             tiers: 1,
+            block_cache_bytes: 0,
         }
     }
 }
@@ -122,6 +128,7 @@ struct Work {
     index: u64,
     plan: Option<FramePlan>, // None for the first frame
     residual: Residual,
+    cached: CachedBlocks,
     analyze_time: Duration,
 }
 
@@ -181,12 +188,26 @@ pub fn run(
 /// Run with up to [`MAX_TIERS`] upscalers: tier 0 is the main network and
 /// takes redraws and textured blocks; tier 1 (cheap network) and tier 2
 /// (bicubic) take smooth and flat blocks per `AnalyzeConfig::tier_std`.
-/// All tiers must produce the same scale.
+/// All tiers must produce the same scale. A private block cache is created
+/// per `cfg.block_cache_bytes`; use [`run_tiered_with_cache`] to share one.
 pub fn run_tiered(
+    source: Box<dyn FrameSource>,
+    tiers: Vec<Box<dyn Upscaler>>,
+    sink: Box<dyn FrameSink>,
+    cfg: PipelineConfig,
+    on_event: impl FnMut(Event),
+) -> anyhow::Result<Summary> {
+    let cache = (cfg.block_cache_bytes > 0).then(|| Arc::new(Mutex::new(BlockCache::new(cfg.block_cache_bytes))));
+    run_tiered_with_cache(source, tiers, sink, cfg, cache, on_event)
+}
+
+/// [`run_tiered`] with an explicit (possibly shared) block cache.
+pub fn run_tiered_with_cache(
     mut source: Box<dyn FrameSource>,
     mut tiers: Vec<Box<dyn Upscaler>>,
     mut sink: Box<dyn FrameSink>,
     cfg: PipelineConfig,
+    cache: Option<Arc<Mutex<BlockCache>>>,
     mut on_event: impl FnMut(Event),
 ) -> anyhow::Result<Summary> {
     anyhow::ensure!(!tiers.is_empty() && tiers.len() <= MAX_TIERS, "1 to {MAX_TIERS} upscaler tiers");
@@ -216,6 +237,8 @@ pub fn run_tiered(
     let acfg = cfg.analyze;
     let noise = cfg.noise;
     let (recent_refs, keyframe_refs, batch) = (cfg.recent_refs, cfg.keyframe_refs, cfg.batch.max(1));
+    let cache_a = cache.clone();
+    let cache_b = cache;
 
     // Stage A.
     let analyzer = std::thread::Builder::new().name("d2x-analyze".into()).spawn(move || {
@@ -223,7 +246,7 @@ pub fn run_tiered(
         let mut index: u64 = 0;
         let mut prev_working: Option<Frame> = None;
         let mut ring: Ring<Frame> = Ring::new(recent_refs, keyframe_refs);
-        let mut state = AnalyzeState::default();
+        let mut state = AnalyzeState { streak: Vec::new(), cache: cache_a };
         loop {
             let raw = match source.next_frame() {
                 Ok(Some(f)) => f,
@@ -240,17 +263,17 @@ pub fn run_tiered(
                     ring.keyframes.push_front(frame.clone());
                     ring.keyframes.truncate(ring.keyframe_cap);
                     prev_working = Some(frame.clone());
-                    Work { index, plan: None, residual: Residual::Whole(frame), analyze_time: t0.elapsed() }
+                    Work { index, plan: None, residual: Residual::Whole(frame), cached: CachedBlocks::new(), analyze_time: t0.elapsed() }
                 }
                 Some(mut prev) => {
                     let older = ring.refs();
                     let r = analyze_tiered(&mut prev, &frame, &older, reference, matcher.as_ref(), &acfg, n_tiers, &mut state);
                     match r {
-                        Ok((plan, working_next)) => {
+                        Ok((plan, working_next, cached)) => {
                             let residual = make_residual(&frame, &plan, bleed);
                             ring.advance(prev, &working_next, plan.redraw);
                             prev_working = Some(working_next);
-                            Work { index, plan: Some(plan), residual, analyze_time: t0.elapsed() }
+                            Work { index, plan: Some(plan), residual, cached, analyze_time: t0.elapsed() }
                         }
                         Err(e) => {
                             let _ = tx.send(Err(e));
@@ -333,9 +356,22 @@ pub fn run_tiered(
                     (f, FrameStats { redraw: true, psnr: f64::NAN, ..Default::default() })
                 }
                 (Some(plan), Some(prev)) => {
+                    // Feed the block cache with what the networks just produced.
+                    if let (Some(c), false) = (&cache_b, plan.redraw) {
+                        let cell = (bs + 2 * bleed) * scale;
+                        let side = bs * scale;
+                        let mut c = c.lock().unwrap();
+                        for rv in plan.residuals.iter().filter(|rv| rv.tier < 2) {
+                            let img = if rv.tier == 0 { residual_up.as_ref() } else { tier_up[rv.tier as usize].as_ref() };
+                            if let Some(img) = img {
+                                let blk = img.crop(rv.cell_x * cell + bleed * scale, rv.cell_y * cell + bleed * scale, side, side);
+                                c.insert(rv.key, Arc::new(blk.data));
+                            }
+                        }
+                    }
                     let older = ring.refs();
                     let refs: [Option<&Frame>; MAX_TIERS] = [residual_up.as_ref(), tier_up[1].as_ref(), tier_up[2].as_ref()];
-                    match merge_tiered(prev, &older, &refs, plan, scale, bleed) {
+                    match merge_tiered(prev, &older, &refs, &work.cached, plan, scale, bleed) {
                         Ok(f) => (f, plan.stats),
                         Err(e) => {
                             result = Err(e.context(format!("merging frame {}", work.index)));
@@ -396,6 +432,7 @@ pub fn analyze_only(
     let mut prev: Option<Frame> = None;
     let mut ring: Ring<Frame> = Ring::new(cfg.recent_refs, cfg.keyframe_refs);
     let mut state = AnalyzeState::default();
+    // analyze_only never produces upscaled blocks, so a cache can't fill; skip it.
     let mut index = 0u64;
     let mut fraction_sum = 0.0;
     let mut heavy_sum = 0.0;
@@ -412,7 +449,7 @@ pub fn analyze_only(
             }
             Some(mut p) => {
                 let older = ring.refs();
-                let (plan, next_w) = analyze_tiered(&mut p, &frame, &older, &reference, matcher.as_ref(), &cfg.analyze, cfg.tiers.max(1), &mut state)?;
+                let (plan, next_w, _) = analyze_tiered(&mut p, &frame, &older, &reference, matcher.as_ref(), &cfg.analyze, cfg.tiers.max(1), &mut state)?;
                 let fr = plan.stats.upscaled_fraction(&plan.grid, bleed);
                 fraction_sum += fr;
                 heavy_sum += plan.stats.heavy_fraction(&plan.grid, bleed);
@@ -557,6 +594,46 @@ mod tests {
         let out = out.lock().unwrap();
         assert_eq!(out[1], NearestUpscaler { scale: 2 }.upscale(&f1).unwrap());
         assert_eq!(stats[1].residual_tiers, [(1, 1), (1, 1), (1, 1)], "{:?}", stats[1]);
+    }
+
+    /// A block whose exact cell content reappears at a new position is
+    /// served from the block cache, and the output is still exact. Hits lag
+    /// the pipeline depth: stage A analyses ahead of stage B's inserts, so
+    /// the repeat sits several frames after the original.
+    #[test]
+    fn block_cache_serves_repeated_content() {
+        let mut uniform = Frame::new(64, 64);
+        uniform.data.iter_mut().for_each(|b| *b = 90);
+        let stamp = |f: &mut Frame, x0: u32, y0: u32| {
+            for y in 0..16 {
+                for x in 0..16 {
+                    f.set_px(x0 + x, y0 + y, [((x * 13 + y * 7) % 200) as u8, 40, ((x ^ y) * 9) as u8]);
+                }
+            }
+        };
+        let mut f1 = uniform.clone();
+        stamp(&mut f1, 16, 16);
+        let mut f2 = uniform.clone();
+        stamp(&mut f2, 32, 32);
+        let mut f3 = uniform.clone();
+        stamp(&mut f3, 0, 32);
+        let frames = vec![uniform.clone(), f1.clone(), uniform.clone(), uniform.clone(), uniform.clone(), uniform.clone(), f2.clone(), f3.clone()];
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let cfg = PipelineConfig { analyze: AnalyzeConfig { block_size: 16, bleed: 1, ..Default::default() }, noise: 0, block_cache_bytes: 1 << 20, recent_refs: 0, keyframe_refs: 0, queue_depth: 1, batch: 1, ..Default::default() };
+        let mut stats = Vec::new();
+        run_tiered(Box::new(VecSource::new(frames, (30, 1))), vec![Box::new(NearestUpscaler { scale: 2 })], Box::new(VecSink { frames: out.clone() }), cfg, |e| {
+            if let Event::FrameDone { stats: s, .. } = e {
+                stats.push(s);
+            }
+        })
+        .unwrap();
+        let out = out.lock().unwrap();
+        let mut up = NearestUpscaler { scale: 2 };
+        assert_eq!(out[6], up.upscale(&f2).unwrap());
+        assert_eq!(out[7], up.upscale(&f3).unwrap());
+        assert_eq!(stats[1].cached, 0);
+        assert_eq!(stats[6].cached, 1, "{:?}", stats[6]);
+        assert_eq!(stats[7].cached, 1, "{:?}", stats[7]);
     }
 
     #[test]

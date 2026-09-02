@@ -16,6 +16,8 @@ pub enum Event {
     Segment(usize, PEvent),
 }
 use d2x_core::predict::AnalyzeConfig;
+use d2x_core::blockcache::BlockCache;
+use d2x_core::budget::{plan_ring, MemoryBudget, RingPlan};
 use d2x_core::upscale::{BicubicUpscaler, NearestUpscaler, Resampled, Upscaler};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,6 +73,17 @@ pub struct Job {
     pub cascade_model: Option<Option<PathBuf>>,
     /// Route flat missing blocks (luma std below `tier_std[0]`) to bicubic.
     pub flat_bypass: bool,
+    /// Memory budgets; `None` = detect (half of MemAvailable for RAM, a
+    /// quarter of that for the GPU). The RAM budget sizes the reference
+    /// rings and the block cache unless those are set explicitly.
+    pub ram_budget: Option<u64>,
+    pub vram_budget: Option<u64>,
+    /// Explicit ring depths override the budget-derived ones.
+    pub refs_override: Option<(usize, usize)>,
+    /// Explicit block-cache bytes override the budget-derived figure.
+    pub block_cache_override: Option<u64>,
+    /// Activation sets in flight per GPU upscaler.
+    pub inflight: usize,
 }
 
 impl Default for Job {
@@ -94,6 +107,11 @@ impl Default for Job {
             cancel: None,
             cascade_model: None,
             flat_bypass: false,
+            ram_budget: None,
+            vram_budget: None,
+            refs_override: None,
+            block_cache_override: None,
+            inflight: 2,
         }
     }
 }
@@ -120,8 +138,88 @@ pub fn load_model(explicit: Option<&Path>) -> anyhow::Result<(Arc<Network>, Path
     Ok((Arc::new(net), path))
 }
 
+/// Resolved memory plan for a job: budgets, ring depths, block cache.
+#[derive(Debug, Clone, Copy)]
+pub struct MemPlan {
+    pub budget: MemoryBudget,
+    pub ring: RingPlan,
+    pub block_cache_bytes: u64,
+    pub recent_refs: usize,
+    pub keyframe_refs: usize,
+}
+
+impl std::fmt::Display for MemPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "budget RAM {} MiB / GPU {} MiB → {} recent + {} shot-start references ({:.1} MiB each), block cache {} MiB",
+            self.budget.ram >> 20,
+            self.budget.vram >> 20,
+            self.recent_refs,
+            self.keyframe_refs,
+            self.ring.bytes_per_ref as f64 / (1u64 << 20) as f64,
+            self.block_cache_bytes >> 20
+        )
+    }
+}
+
+/// Turn the job's budgets into ring depths and cache size for a source of
+/// `in_w`×`in_h` at `scale`.
+pub fn mem_plan(job: &Job, in_w: u32, in_h: u32, scale: u32) -> MemPlan {
+    let mut budget = MemoryBudget::detect();
+    if let Some(r) = job.ram_budget {
+        budget.ram = r;
+    }
+    if let Some(v) = job.vram_budget {
+        budget.vram = v;
+    }
+    let ring = plan_ring(&budget, in_w, in_h, scale, job.jobs.max(1), 32, 4096);
+    let (recent_refs, keyframe_refs) = job.refs_override.unwrap_or((ring.recent_refs, ring.keyframe_refs));
+    let block_cache_bytes = job.block_cache_override.unwrap_or(ring.block_cache_bytes);
+    MemPlan { budget, ring, block_cache_bytes, recent_refs, keyframe_refs }
+}
+
+/// Apply a memory plan to the pipeline config.
+pub fn apply_plan(cfg: &mut PipelineConfig, plan: &MemPlan) {
+    cfg.recent_refs = plan.recent_refs;
+    cfg.keyframe_refs = plan.keyframe_refs;
+    cfg.block_cache_bytes = plan.block_cache_bytes;
+}
+
 /// All upscaler tiers for a job: main, then the cascade model, then bicubic.
+/// GPU tiers share one device; `vram` is split across them by their cost.
 pub fn build_tiers(job: &Job) -> anyhow::Result<Vec<Box<dyn Upscaler>>> {
+    #[cfg(feature = "gpu")]
+    if job.backend == Backend::Wgpu {
+        let budget = job.vram_budget.unwrap_or_else(|| MemoryBudget::detect().vram);
+        let ctx = d2x_wgpu::GpuContext::new(&d2x_wgpu::GpuOptions { require_hw: job.require_hw, ..Default::default() })?;
+        let mut nets: Vec<(Arc<Network>, u32)> = Vec::new();
+        let (net, _) = load_model(job.model.as_deref())?;
+        nets.push((net, job.tile));
+        if let Some(cheap) = &job.cascade_model {
+            let (n, _) = load_model(cheap.as_deref())?;
+            nets.push((n, 0));
+        }
+        // Split the GPU budget by each net's per-pixel cost so the expensive
+        // one gets the big tiles.
+        let total_cost: f64 = nets.iter().map(|(n, _)| n.macs_per_input_pixel()).sum();
+        let mut tiers: Vec<Box<dyn Upscaler>> = Vec::new();
+        for (n, tile) in nets {
+            let share = (budget as f64 * n.macs_per_input_pixel() / total_cost.max(1.0)) as u64;
+            let up = d2x_wgpu::WgpuUpscaler::with_context(ctx.clone(), n, d2x_wgpu::GpuOptions { tile, require_hw: job.require_hw, low_power: false, inflight: job.inflight.max(1), vram_budget: share })?;
+            let native = up.scale();
+            let boxed: Box<dyn Upscaler> = Box::new(up);
+            tiers.push(if native == job.scale { boxed } else { Box::new(Resampled { inner: boxed, target: job.scale }) });
+        }
+        if job.flat_bypass {
+            if tiers.len() == 1 {
+                tiers.push(Box::new(BicubicUpscaler { scale: job.scale }));
+                // tier 1 = bicubic too: without a cascade, "smooth" is as good as "flat".
+            }
+            tiers.push(Box::new(BicubicUpscaler { scale: job.scale }));
+        }
+        return Ok(tiers);
+    }
     let mut tiers = vec![build_upscaler(job)?];
     if let Some(cheap) = &job.cascade_model {
         let mut j = job.clone();
@@ -153,7 +251,7 @@ pub fn build_upscaler(job: &Job) -> anyhow::Result<Box<dyn Upscaler>> {
             #[cfg(feature = "gpu")]
             {
                 let (net, _) = load_model(job.model.as_deref())?;
-                Box::new(d2x_wgpu::WgpuUpscaler::new(net, d2x_wgpu::GpuOptions { tile: job.tile, require_hw: job.require_hw, low_power: false })?)
+                Box::new(d2x_wgpu::WgpuUpscaler::new(net, d2x_wgpu::GpuOptions { tile: job.tile, require_hw: job.require_hw, low_power: false, inflight: job.inflight.max(1), vram_budget: job.vram_budget.unwrap_or(0) })?)
             }
             #[cfg(not(feature = "gpu"))]
             {
@@ -366,6 +464,11 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
     let segs = ffmpeg::segments(&keyframes, p.duration_s, job.jobs);
     let servers: Vec<Arc<BatchServer>> = build_tiers(job)?.into_iter().map(|u| BatchServer::start(u, std::time::Duration::from_millis(15), 4_000_000)).collect();
     let scale = servers[0].scale;
+    let plan = mem_plan(job, p.info.width, p.info.height, scale);
+    let mut cfg = job.pipeline;
+    apply_plan(&mut cfg, &plan);
+    eprintln!("memory: {plan} (rings per worker, cache shared)");
+    let shared_cache = (cfg.block_cache_bytes > 0).then(|| Arc::new(std::sync::Mutex::new(BlockCache::new(cfg.block_cache_bytes))));
     let (w, h) = (p.info.width * scale, p.info.height * scale);
     let stem = job.output.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "out".into());
     let ext = job.output.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "mkv".into());
@@ -374,7 +477,7 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
     let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<PEvent, String>)>();
     let mut handles = Vec::new();
     for (seg, part) in segs.iter().zip(&parts) {
-        let (seg, part, tx, p, job, servers, all) = (*seg, part.clone(), tx.clone(), p.clone(), job.clone(), servers.clone(), keyframes.clone());
+        let (seg, part, tx, p, job, servers, all, cache, cfg) = (*seg, part.clone(), tx.clone(), p.clone(), job.clone(), servers.clone(), keyframes.clone(), shared_cache.clone(), cfg);
         handles.push(std::thread::Builder::new().name(format!("d2x-seg{}", seg.index)).spawn(move || -> anyhow::Result<Summary> {
             let src = Box::new(FfmpegSource::open_segment(&job.input, &p, seg)?);
             let mut enc = job.encode.clone();
@@ -383,7 +486,7 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
             let enc = with_keyint(enc, &all, p.info.fps);
             let sink = Box::new(FfmpegSink::open(&part, None, &p, w, h, &enc)?);
             let ups: Vec<Box<dyn Upscaler>> = servers.iter().map(|s| Box::new(s.client()) as Box<dyn Upscaler>).collect();
-            let r = d2x_core::pipeline::run_tiered(src, ups, sink, job.pipeline, |e| {
+            let r = d2x_core::pipeline::run_tiered_with_cache(src, ups, sink, cfg, cache, |e| {
                 let _ = tx.send((seg.index, Ok(e)));
             });
             if let Err(e) = &r {
@@ -434,8 +537,12 @@ pub fn run(job: &Job, mut on_event: impl FnMut(Event)) -> anyhow::Result<Summary
     on_event(Event::Stage(format!("loading model and initialising the {:?} backend", job.backend)));
     let tiers = build_tiers(job)?;
     let scale = tiers[0].scale();
+    let plan = mem_plan(job, info.width, info.height, scale);
+    let mut cfg = job.pipeline;
+    apply_plan(&mut cfg, &plan);
+    on_event(Event::Stage(format!("memory: {plan}")));
     on_event(Event::Stage("starting encoder".into()));
     let sink = open_sink(job, probe.as_ref(), &keyframes, info.width * scale, info.height * scale)?;
     on_event(Event::Stage("frame 0 is a full-frame upscale; later frames only pay for what changed".into()));
-    d2x_core::pipeline::run_tiered(source, tiers, sink, job.pipeline, |e| on_event(Event::Pipeline(e)))
+    d2x_core::pipeline::run_tiered(source, tiers, sink, cfg, |e| on_event(Event::Pipeline(e)))
 }

@@ -54,12 +54,24 @@ struct Common {
     /// Stop after N frames (settings trials).
     #[arg(long, default_value_t = 0)]
     frames: u64,
-    /// Recent outputs kept as extra references (occlusions, flicker).
-    #[arg(long, default_value_t = 3)]
-    refs: usize,
-    /// Shot-start outputs retained as references (cut-backs). ~25 MB each at 4K.
-    #[arg(long, default_value_t = 4)]
-    keyframe_refs: usize,
+    /// Recent outputs kept as extra references (occlusions, flicker). Default: from --ram-budget.
+    #[arg(long)]
+    refs: Option<usize>,
+    /// Shot-start outputs retained as references (cut-backs). Default: from --ram-budget.
+    #[arg(long)]
+    keyframe_refs: Option<usize>,
+    /// Host memory the job may hold (e.g. 96G). Default: half of MemAvailable.
+    #[arg(long)]
+    ram_budget: Option<String>,
+    /// GPU memory for activation sets (e.g. 8G). Default: a quarter of the RAM budget.
+    #[arg(long)]
+    vram_budget: Option<String>,
+    /// Content-keyed block cache size (e.g. 4G; 0 = off). Default: 20% of the RAM budget.
+    #[arg(long)]
+    block_cache: Option<String>,
+    /// Activation sets in flight per GPU upscaler (uploads/readbacks overlap compute).
+    #[arg(long, default_value_t = 2)]
+    inflight: usize,
     /// Frames whose residuals share one GPU call.
     #[arg(long, default_value_t = 4)]
     batch: usize,
@@ -153,8 +165,14 @@ fn job_from(common: &Common, input: PathBuf, output: PathBuf) -> anyhow::Result<
     j.pipeline.quality = common.quality;
     j.pipeline.noise = common.noise;
     j.pipeline.matcher = parse_matcher(&common.matcher)?;
-    j.pipeline.recent_refs = common.refs;
-    j.pipeline.keyframe_refs = common.keyframe_refs;
+    j.refs_override = match (common.refs, common.keyframe_refs) {
+        (None, None) => None,
+        (r, k) => Some((r.unwrap_or(3), k.unwrap_or(4))),
+    };
+    j.ram_budget = common.ram_budget.as_deref().map(d2x_core::budget::parse_bytes).transpose()?;
+    j.vram_budget = common.vram_budget.as_deref().map(d2x_core::budget::parse_bytes).transpose()?;
+    j.block_cache_override = common.block_cache.as_deref().map(d2x_core::budget::parse_bytes).transpose()?;
+    j.inflight = common.inflight;
     j.pipeline.batch = common.batch;
     j.pipeline.queue_depth = common.batch.max(2) * 2;
     j.pipeline.analyze.tier_std = [common.flat_std, common.smooth_std];
@@ -180,11 +198,12 @@ fn print_event(e: &Event) {
         Event::FrameDone { index, stats, analyze_time, upscale_time, merge_time } => {
             let kind = if stats.redraw { "REDRAW" } else { "" };
             eprintln!(
-                "frame {index:6}  psnr {:5.1}  stat {:4} mov {:4} rec {:3} miss {:4} fade {:3}  residual {} {kind}  A {:5.1}ms U {:7.1}ms M {:5.1}ms",
+                "frame {index:6}  psnr {:5.1}  stat {:4} mov {:4} rec {:3} cache {:3} miss {:4} fade {:3}  residual {} {kind}  A {:5.1}ms U {:7.1}ms M {:5.1}ms",
                 stats.psnr,
                 stats.stationary,
                 stats.moved,
                 stats.recalled,
+                stats.cached,
                 stats.missing,
                 stats.fades,
                 tiers_str(stats),
@@ -240,7 +259,7 @@ fn main() -> anyhow::Result<()> {
             {
                 let (net, path) = job::load_model(model.as_deref())?;
                 eprintln!("model: {} ({:.2} MMAC per input pixel, x{})", path.display(), net.macs_per_input_pixel() / 1e6, net.scale);
-                let r = d2x_wgpu::selftest(net, d2x_wgpu::GpuOptions { tile, require_hw: false, low_power: false })?;
+                let r = d2x_wgpu::selftest(net, d2x_wgpu::GpuOptions { tile, ..Default::default() })?;
                 println!("{r}");
                 if !r.pass {
                     std::process::exit(1);

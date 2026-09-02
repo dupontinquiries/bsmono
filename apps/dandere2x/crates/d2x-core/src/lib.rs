@@ -19,6 +19,8 @@
 //! only ever see these traits.
 
 pub mod batch;
+pub mod blockcache;
+pub mod budget;
 pub mod frame;
 pub mod gate;
 pub mod matcher;

@@ -9,6 +9,7 @@
 
 use crate::frame::{Frame, Pad};
 use crate::plan::{BlockMatch, FramePlan, MAX_TIERS};
+use crate::predict::CachedBlocks;
 
 /// What the upscalers are asked to produce for this frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,11 +73,12 @@ pub fn make_residual(next_original: &Frame, plan: &FramePlan, bleed: u32) -> Res
 /// upscaled residual (tier 0), and the plan. `scale` is the upscaler's factor.
 pub fn merge(prev_up: &Frame, older_up: &[&Frame], residual_up: Option<&Frame>, plan: &FramePlan, scale: u32, bleed: u32) -> anyhow::Result<Frame> {
     let tiers: [Option<&Frame>; MAX_TIERS] = [residual_up, None, None];
-    merge_tiered(prev_up, older_up, &tiers, plan, scale, bleed)
+    merge_tiered(prev_up, older_up, &tiers, &CachedBlocks::new(), plan, scale, bleed)
 }
 
-/// [`merge`] with one upscaled residual image per tier.
-pub fn merge_tiered(prev_up: &Frame, older_up: &[&Frame], residual_up: &[Option<&Frame>; MAX_TIERS], plan: &FramePlan, scale: u32, bleed: u32) -> anyhow::Result<Frame> {
+/// [`merge`] with one upscaled residual image per tier and the bytes of
+/// any `Cached` blocks (`(block·scale)²` RGB each).
+pub fn merge_tiered(prev_up: &Frame, older_up: &[&Frame], residual_up: &[Option<&Frame>; MAX_TIERS], cached: &CachedBlocks, plan: &FramePlan, scale: u32, bleed: u32) -> anyhow::Result<Frame> {
     let bs = plan.grid.block_size;
     let s = scale;
     anyhow::ensure!(
@@ -113,6 +115,13 @@ pub fn merge_tiered(prev_up: &Frame, older_up: &[&Frame], residual_up: &[Option<
                 let old = older_up.get(r as usize).ok_or_else(|| anyhow::anyhow!("merge: plan recalls reference {r} but only {} were given", older_up.len()))?;
                 anyhow::ensure!((old.width, old.height) == (prev_up.width, prev_up.height), "merge: reference {r} size mismatch");
                 out.copy_block(old, bs * s, x * s, y * s, x * s, y * s);
+            }
+            BlockMatch::Cached { key } => {
+                let b = cached.get(&key).ok_or_else(|| anyhow::anyhow!("merge: cached block {key:#x} not attached"))?;
+                let side = bs * s;
+                anyhow::ensure!(b.len() == (side * side * 3) as usize, "merge: cached block has {} bytes, expected {}", b.len(), side * side * 3);
+                let blk = Frame::from_rgb(side, side, (**b).clone())?;
+                out.copy_block(&blk, side, 0, 0, x * s, y * s);
             }
             _ => {}
         }
@@ -262,12 +271,12 @@ mod tests {
         let prev_up = up.upscale(&prev).unwrap();
         let mut w = prev.clone();
         let mut st = AnalyzeState::default();
-        let (plan, working_next) = analyze_tiered(&mut w, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 3, &mut st).unwrap();
+        let (plan, working_next, _) = analyze_tiered(&mut w, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 3, &mut st).unwrap();
         assert_eq!(plan.stats.residual_tiers, [(1, 1), (1, 1), (1, 1)]);
         let res = make_residual(&next, &plan, 1);
         let ups: Vec<Option<Frame>> = (0..3).map(|t| res.tier(t).map(|f| up.upscale(f).unwrap())).collect();
         let refs: [Option<&Frame>; 3] = [ups[0].as_ref(), ups[1].as_ref(), ups[2].as_ref()];
-        let merged = merge_tiered(&prev_up, &[], &refs, &plan, 2, 1).unwrap();
+        let merged = merge_tiered(&prev_up, &[], &refs, &CachedBlocks::new(), &plan, 2, 1).unwrap();
         assert_eq!(merged, up.upscale(&working_next).unwrap());
     }
 
