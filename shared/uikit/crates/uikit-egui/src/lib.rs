@@ -47,6 +47,7 @@
 //! `.default_width(168.0)` that reads like the same statement and is not one.
 
 pub mod fonts;
+pub mod input_probe;
 pub mod desktop;
 pub mod notify;
 pub mod single_instance;
