@@ -584,6 +584,78 @@ mod tests {
         }
     }
 
+    /// In-process A/B of the two tint-cache shapes. Across-run timing on
+    /// this hardware has a ±25 % band; interleaving them in one process
+    /// with the same data measures the change itself.
+    #[test]
+    #[ignore]
+    fn cache_shape_ab() {
+        use std::time::Instant;
+        let c = chunk_from(ChunkCoord::new(0, 0, 0), |x, y, z| {
+            if ((x * 7 + y * 13 + z * 5) % 11) < 3 { BlockId::Air } else { BlockId::Stone } });
+        // The cave chunk's ~36 K single-cell quads each do one cached
+        // tint lookup; replay that access pattern directly.
+        let cells: Vec<(i32, i32, i32)> = (0..32).flat_map(|y| (0..32).flat_map(move |z| (0..32).map(move |x| (x, y, z)))).collect();
+        let rounds = 20;
+        let (mut t_new, mut t_old) = (0.0f64, 0.0f64);
+        let mut sink = 0.0f32;
+        for r in 0..rounds {
+            // Alternate order so drift and turbo effects hit both.
+            if r % 2 == 0 {
+                mesher::tint_cache_reset();
+                let t = Instant::now();
+                for &(x, y, z) in &cells { sink += mesher::tint_for_position_cached(BlockId::Stone, x, y, z, &c)[0]; }
+                t_new += t.elapsed().as_secs_f64();
+                mesher::tint_cache_reset();
+                let t = Instant::now();
+                for &(x, y, z) in &cells { sink += mesher::tint_for_position_cached_legacy(BlockId::Stone, x, y, z, &c)[0]; }
+                t_old += t.elapsed().as_secs_f64();
+            } else {
+                mesher::tint_cache_reset();
+                let t = Instant::now();
+                for &(x, y, z) in &cells { sink += mesher::tint_for_position_cached_legacy(BlockId::Stone, x, y, z, &c)[0]; }
+                t_old += t.elapsed().as_secs_f64();
+                mesher::tint_cache_reset();
+                let t = Instant::now();
+                for &(x, y, z) in &cells { sink += mesher::tint_for_position_cached(BlockId::Stone, x, y, z, &c)[0]; }
+                t_new += t.elapsed().as_secs_f64();
+            }
+        }
+        // Every cell is a MISS here (one lookup each), so this measures the
+        // miss path. Now the hit path: same cells twice, second pass hits.
+        let (mut h_new, mut h_old) = (0.0f64, 0.0f64);
+        for _ in 0..rounds {
+            mesher::tint_cache_reset();
+            for &(x, y, z) in &cells { sink += mesher::tint_for_position_cached(BlockId::Stone, x, y, z, &c)[0]; }
+            let t = Instant::now();
+            for &(x, y, z) in &cells { sink += mesher::tint_for_position_cached(BlockId::Stone, x, y, z, &c)[0]; }
+            h_new += t.elapsed().as_secs_f64();
+            mesher::tint_cache_reset();
+            for &(x, y, z) in &cells { sink += mesher::tint_for_position_cached_legacy(BlockId::Stone, x, y, z, &c)[0]; }
+            let t = Instant::now();
+            for &(x, y, z) in &cells { sink += mesher::tint_for_position_cached_legacy(BlockId::Stone, x, y, z, &c)[0]; }
+            h_old += t.elapsed().as_secs_f64();
+        }
+        let n = (cells.len() * rounds) as f64;
+        println!("tint cache A/B over {} lookups each:\n  miss path: old {:6.1} ns  new {:6.1} ns  ({:+.1}%)\n  hit  path: old {:6.1} ns  new {:6.1} ns  ({:+.1}%)   [sink {}]",
+            n, t_old * 1e9 / n, t_new * 1e9 / n, (t_new / t_old - 1.0) * 100.0,
+            h_old * 1e9 / n, h_new * 1e9 / n, (h_new / h_old - 1.0) * 100.0, sink as i64);
+    }
+
+    #[test]
+    fn cached_tint_matches_the_legacy_shape_exactly() {
+        let c = chunk_from(ChunkCoord::new(-3, 1, 2), |_, y, _| if y < 20 { BlockId::Stone } else { BlockId::Air });
+        for (x, y, z) in [(0, 0, 0), (31, 31, 31), (5, 12, 19), (17, 3, 28)] {
+            mesher::tint_cache_reset();
+            let a = mesher::tint_for_position_cached(BlockId::Stone, x, y, z, &c);
+            mesher::tint_cache_reset();
+            let b = mesher::tint_for_position_cached_legacy(BlockId::Stone, x, y, z, &c);
+            assert_eq!(a, b);
+            // And a second (hit) lookup returns the same value.
+            assert_eq!(mesher::tint_for_position_cached(BlockId::Stone, x, y, z, &c), a);
+        }
+    }
+
     #[test]
     fn all_air_chunk_is_empty_and_fast_path_matches() {
         let c = chunk_from(ChunkCoord::new(2, 3, 4), |_, _, _| BlockId::Air);

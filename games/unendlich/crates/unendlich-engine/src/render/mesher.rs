@@ -479,7 +479,7 @@ pub(crate) fn tint_cache_reset() {
 /// mesh pass). Falls back to direct computation outside chunk-local bounds —
 /// defensive only; every current caller passes an in-chunk block position.
 #[inline]
-fn tint_for_position_cached(block: BlockId, wx: i32, wy: i32, wz: i32, chunk: &Chunk) -> [f32; 3] {
+pub(crate) fn tint_for_position_cached(block: BlockId, wx: i32, wy: i32, wz: i32, chunk: &Chunk) -> [f32; 3] {
     let (ox, oy, oz) = chunk.coord.block_origin();
     let lx = wx - ox;
     let ly = wy - oy;
@@ -489,14 +489,25 @@ fn tint_for_position_cached(block: BlockId, wx: i32, wy: i32, wz: i32, chunk: &C
         && lz >= 0 && (lz as usize) < TINT_CACHE_W
     {
         let idx = (ly as usize * TINT_CACHE_W + lz as usize) * TINT_CACHE_W + lx as usize;
-        let gen = TINT_CACHE_GEN.with(|g| g.get());
-        let hit = TINT_CACHE.with(|c| {
-            let entry = c.borrow()[idx];
-            if entry.1 == gen { Some(entry.0) } else { None }
+        // 2026-09-02: ONE thread-local access on the hit path. This was
+        // three (`GEN.with`, `CACHE.with` to read, `CACHE.with` to write)
+        // plus two RefCell borrows; on a cave chunk the mesher calls this
+        // ~36 K times and the TLS/borrow overhead was a measurable share
+        // of the ~190 ns per quad. Same values, same generation
+        // semantics.
+        // ONE thread-local access on the hit path (was three: gen, read,
+        // and — on a miss — write; plus two RefCell borrows). The miss
+        // computation stays OUTSIDE the closure: an in-process A/B
+        // (`mesher_binary::tests::cache_shape_ab`) showed that folding it
+        // in costs the miss path ~16 % while the hit path gains ~19 %,
+        // so the hit fast-path is folded and the miss is not.
+        let (gen, hit) = TINT_CACHE.with(|c| {
+            let gen = TINT_CACHE_GEN.with(|g| g.get());
+            let cache = c.borrow();
+            let entry = cache[idx];
+            (gen, if entry.1 == gen { Some(entry.0) } else { None })
         });
-        if let Some(v) = hit {
-            return v;
-        }
+        if let Some(v) = hit { return v; }
         let v = tint_for_position(block, wx, wy, wz);
         TINT_CACHE.with(|c| c.borrow_mut()[idx] = (v, gen));
         v
@@ -509,6 +520,33 @@ fn tint_for_position_cached(block: BlockId, wx: i32, wy: i32, wz: i32, chunk: &C
 /// this one for up to SKY_PROBE depth. Returns [0, 1]. Out-of-chunk
 /// reads above count as air (conservative for surface blocks at the
 /// chunk top).
+/// The pre-2026-09-02 cache shape (three thread-local accesses, two
+/// RefCell borrows per hit), kept ONLY so the two can be A/B'd in one
+/// process — across-run timing on a shared vCPU has a ±25 % band, which
+/// is wider than the effect. See `cache_shape_ab` in the tests below.
+#[cfg(test)]
+pub(crate) fn tint_for_position_cached_legacy(block: BlockId, wx: i32, wy: i32, wz: i32, chunk: &Chunk) -> [f32; 3] {
+    let (ox, oy, oz) = chunk.coord.block_origin();
+    let (lx, ly, lz) = (wx - ox, wy - oy, wz - oz);
+    if lx >= 0 && (lx as usize) < TINT_CACHE_W
+        && ly >= 0 && (ly as usize) < TINT_CACHE_W
+        && lz >= 0 && (lz as usize) < TINT_CACHE_W
+    {
+        let idx = (ly as usize * TINT_CACHE_W + lz as usize) * TINT_CACHE_W + lx as usize;
+        let gen = TINT_CACHE_GEN.with(|g| g.get());
+        let hit = TINT_CACHE.with(|c| {
+            let entry = c.borrow()[idx];
+            if entry.1 == gen { Some(entry.0) } else { None }
+        });
+        if let Some(v) = hit { return v; }
+        let v = tint_for_position(block, wx, wy, wz);
+        TINT_CACHE.with(|c| c.borrow_mut()[idx] = (v, gen));
+        v
+    } else {
+        tint_for_position(block, wx, wy, wz)
+    }
+}
+
 const SKY_PROBE: i32 = 12;
 #[inline]
 fn sky_exposure_at(wx: i32, wy: i32, wz: i32, chunk: &Chunk) -> f32 {
@@ -650,14 +688,21 @@ fn sample_env_at_cached(
         && lz >= 0 && (lz as usize) < ENV_CACHE_W
     {
         let idx = (ly as usize * ENV_CACHE_W + lz as usize) * ENV_CACHE_W + lx as usize;
-        let gen = ENV_CACHE_GEN.with(|g| g.get());
-        let hit = ENV_CACHE.with(|c| {
-            let entry = c.borrow()[idx];
-            if entry.1 == gen { Some(entry.0) } else { None }
+        // One thread-local access on the hit path — see the note in
+        // `tint_for_position_cached`.
+        // ONE thread-local access on the hit path (was three: gen, read,
+        // and — on a miss — write; plus two RefCell borrows). The miss
+        // computation stays OUTSIDE the closure: an in-process A/B
+        // (`mesher_binary::tests::cache_shape_ab`) showed that folding it
+        // in costs the miss path ~16 % while the hit path gains ~19 %,
+        // so the hit fast-path is folded and the miss is not.
+        let (gen, hit) = ENV_CACHE.with(|c| {
+            let gen = ENV_CACHE_GEN.with(|g| g.get());
+            let cache = c.borrow();
+            let entry = cache[idx];
+            (gen, if entry.1 == gen { Some(entry.0) } else { None })
         });
-        if let Some(v) = hit {
-            return v;
-        }
+        if let Some(v) = hit { return v; }
         let v = sample_env_at(block, wx, wy, wz, chunk, world_model);
         ENV_CACHE.with(|c| c.borrow_mut()[idx] = (v, gen));
         v
