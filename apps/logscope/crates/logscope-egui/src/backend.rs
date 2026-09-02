@@ -1794,8 +1794,31 @@ than none)", self.name),
             // first 729 hardware log: ~= means pass-per-dispatch, a multiple means fusion is live.
             let (gp1, gd1) = (gpu_kernels::GPU_PASSES_OPENED.load(AOrd::Relaxed).saturating_sub(gp0),
                               gpu_kernels::GPU_DISPATCHES.load(AOrd::Relaxed).saturating_sub(gd0));
-            crate::diag!("wgpu-engine: [{}] profile — {ds} submits ({:.0}/tok), {dp} polls, {gp1} passes / {gd1} disp ({:.1}/pass) | setup {setup_ms:.0}ms + encode {encode_ms:.0}ms + submit {submit_ms:.0}ms + sync {sync_ms:.0}ms + sample {sample_ms:.0}ms of {total_ms:.0}ms ({bound}-bound, {:.1}% accounted)",
-                self.name, ds as f64 / per, gd1 as f64 / (gp1.max(1)) as f64, accounted / total_ms.max(1.0) * 100.0);
+            // OVER 100% IS NOT A ROUNDING ERROR AND MUST NOT READ AS ONE.
+            //
+            // A real 8B run reported "134.3% accounted", which looks like a bug
+            // in the report and is worse than that: it means the buckets
+            // OVERLAP, so the split cannot be used to prioritise. Whichever
+            // bucket is largest may be largest only because it contains
+            // another. Saying so is the difference between a number someone
+            // acts on and a number someone should not.
+            //
+            // Prefill is not the cause — `td` and every baseline are taken
+            // after it. The two live candidates, neither confirmed:
+            //   * these counters are process-wide and decode may run on more
+            //     than one thread, in which case per-thread times sum past
+            //     wall clock and the excess is real but not double-counting;
+            //   * a timed region nests inside another (setup's span covers a
+            //     `bg_cache.lock()`, so a thread blocked there is charged to
+            //     setup while the holder is charged to whatever it is doing).
+            // Distinguishing them needs per-thread accounting, which is a
+            // change to the counters rather than to this line.
+            let over = accounted > total_ms * 1.02;
+            crate::diag!("wgpu-engine: [{}] profile — {ds} submits ({:.0}/tok), {dp} polls, {gp1} passes / {gd1} disp ({:.1}/pass) | setup {setup_ms:.0}ms + encode {encode_ms:.0}ms + submit {submit_ms:.0}ms + sync {sync_ms:.0}ms + sample {sample_ms:.0}ms of {total_ms:.0}ms ({bound}-bound, {:.1}% accounted){}",
+                self.name, ds as f64 / per, gd1 as f64 / (gp1.max(1)) as f64, accounted / total_ms.max(1.0) * 100.0,
+                if over {
+                    " — OVER 100%, so these buckets OVERLAP: do NOT rank them against each other. Either decode ran on several threads (per-thread times sum past the wall clock) or one timed region nests inside another. The only safe reading is that any bucket at or above wall time is genuinely large; the rest is unattributed"
+                } else { "" });
             // WHY the frame drained, not just how often. On Metal a run showed 1119 submits/token at
             // 2.0 ms each while flush_every was 128 — five passes per submit — and nothing in the log
             // said which mechanism was responsible.
