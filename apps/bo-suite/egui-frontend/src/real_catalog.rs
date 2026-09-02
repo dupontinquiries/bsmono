@@ -62,6 +62,15 @@ impl RealCatalog {
     /// WAL database the worker thread writes through `cmd_tx`.
     pub fn open(path: &std::path::Path, cmd_tx: Sender<MediaCmd>) -> rusqlite::Result<Self> {
         let conn = catalog::open(path)?;
+        // Playlist/queue writes below go directly on THIS connection
+        // rather than through cmd_tx (unlike rescan/rating/play — see
+        // those methods' comments): they're small, single-row-ish
+        // mutations with no ordering dependency on the scanner's own
+        // writes, so routing them through the worker would only add
+        // latency for no correctness gain. A busy_timeout means the rare
+        // moment they do collide with a worker write waits briefly for
+        // the WAL lock instead of surfacing SQLITE_BUSY to the UI.
+        conn.busy_timeout(std::time::Duration::from_secs(3))?;
         Ok(Self { conn, cmd_tx })
     }
 
@@ -93,6 +102,50 @@ impl RealCatalog {
 
     pub fn set_rating(&self, track_id: i64, rating: i64) {
         let _ = self.cmd_tx.send(MediaCmd::SetTrackRating { track_id, rating });
+    }
+
+    // ── Playlists ───────────────────────────────────────────────────
+    // Direct on this connection (see the busy_timeout note in `open`),
+    // not through cmd_tx — these are what closed the gap in `sources.rs`'s
+    // `PlaylistsPage`/`dialogs.rs`'s `AddToPlaylist`: both had a full,
+    // tested local model and zero persistence, so a create survived
+    // exactly as long as the process did.
+
+    pub fn playlists(&self) -> Vec<crate::sources::PlaylistSummary> {
+        bo_media::library::list_playlists(&self.conn).unwrap_or_default()
+            .into_iter().map(|p| crate::sources::PlaylistSummary {
+                id: p.id, name: p.name, description: p.description,
+                track_count: p.track_count.max(0) as u32,
+                updated_at: p.updated_at.unwrap_or(p.created_at),
+            }).collect()
+    }
+
+    /// Returns the new playlist's real id, or `None` on failure (a toast,
+    /// not a panic — a duplicate name or a disk-full condition is a thing
+    /// that happens, not a bug).
+    pub fn create_playlist(&self, name: &str, description: &str) -> Option<i64> {
+        bo_media::library::create_playlist(&self.conn, name, description).ok()
+    }
+
+    pub fn add_to_playlist(&self, playlist_id: i64, track_id: i64) -> bool {
+        bo_media::library::add_to_playlist(&self.conn, playlist_id, track_id).is_ok()
+    }
+
+    // ── Queue ───────────────────────────────────────────────────────
+    // `device_url` is the same string `outputs::Device.url` carries and
+    // `cast.rs` passes to `play_url_on_device` — one identity for "which
+    // speaker", not a second id space to keep in sync with the first.
+
+    pub fn queue_push(&self, track_id: i64, device_url: &str) -> bool {
+        bo_media::library::queue_push(&self.conn, track_id, device_url).is_ok()
+    }
+
+    pub fn queue_for_device(&self, device_url: &str) -> Vec<bo_media::library::QueueEntry> {
+        bo_media::library::queue_list(&self.conn, device_url).unwrap_or_default()
+    }
+
+    pub fn queue_devices(&self) -> Vec<bo_media::library::QueueDeviceSummary> {
+        bo_media::library::queue_devices(&self.conn).unwrap_or_default()
     }
 }
 
@@ -177,5 +230,55 @@ mod tests {
         cat.rescan();
         cat.record_play(1);
         cat.set_rating(1, 4);
+    }
+
+    #[test]
+    fn a_created_playlist_shows_up_in_the_list_and_can_take_a_track() {
+        let (_dir, cat) = temp_catalog();
+        assert!(cat.playlists().is_empty());
+        let id = cat.create_playlist("Chill", "wind-down").expect("create succeeds");
+        let all = cat.playlists();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, id);
+        assert_eq!(all[0].name, "Chill");
+        assert_eq!(all[0].track_count, 0);
+
+        cat.conn.execute(
+            "INSERT INTO tracks (path, size, mtime, title, album, year, rating)
+             VALUES ('/music/a.flac', 100, 0, 'A Song', 'An Album', 2020, 0)",
+            [],
+        ).unwrap();
+        let track_id = cat.conn.last_insert_rowid();
+        assert!(cat.add_to_playlist(id, track_id));
+        assert_eq!(cat.playlists()[0].track_count, 1);
+    }
+
+    #[test]
+    fn adding_to_a_playlist_that_does_not_exist_fails_without_panicking() {
+        let (_dir, cat) = temp_catalog();
+        assert!(!cat.add_to_playlist(999, 1));
+    }
+
+    #[test]
+    fn queue_push_and_read_back_round_trip_per_device() {
+        let (_dir, cat) = temp_catalog();
+        cat.conn.execute(
+            "INSERT INTO tracks (path, size, mtime, title, album, year, rating)
+             VALUES ('/music/a.flac', 100, 0, 'A Song', 'An Album', 2020, 0)",
+            [],
+        ).unwrap();
+        let track_id = cat.conn.last_insert_rowid();
+        assert!(cat.queue_devices().is_empty());
+        assert!(cat.queue_push(track_id, "http://192.168.1.50"));
+        let entries = cat.queue_for_device("http://192.168.1.50");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].track_id, track_id);
+        let devices = cat.queue_devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].device_url, "http://192.168.1.50");
+        assert_eq!(devices[0].item_count, 1);
+        // A different device's queue is empty — queues don't leak across
+        // speakers.
+        assert!(cat.queue_for_device("http://192.168.1.99").is_empty());
     }
 }

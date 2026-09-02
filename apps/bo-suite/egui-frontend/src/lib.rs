@@ -427,6 +427,11 @@ pub struct Controller {
     /// (a settings-page device list is a follow-up; nothing in this crate
     /// discovers devices yet), read once by the host.
     pub pending_cast: Option<String>,
+    /// A playlist create the host hasn't persisted yet. `apply_playlist`
+    /// already inserts an optimistic row with a locally-made id (see
+    /// there); this is the paired request to make it real. Cleared by the
+    /// host, same one-shot pattern as `pending_cast`/`pending_rescan`.
+    pub pending_playlist_create: Option<(String, String)>,
     /// The rating the user last set; the host applies it and echoes back
     /// through `confirm_rating`. Same shape as `pending_route` — this view
     /// owns no library.
@@ -555,6 +560,7 @@ impl Controller {
             last_played_track: None,
             pending_rescan: false,
             pending_cast: None,
+            pending_playlist_create: None,
             pending_source: None,
             pending_rating: None,
             active_device_url: String::new(),
@@ -876,6 +882,15 @@ impl Controller {
             // otherwise revoke an unlock the operator just granted.
             if url != self.active_device_url {
                 self.safety.new_session();
+                // A "device" here is an ADDRESS (outputs.rs's own doc), so
+                // an http(s) one is a networked B&O speaker to cast to —
+                // distinct from the Bluetooth/local sinks `SinkPicker`
+                // handles. `request_cast` no-ops with a toast if nothing
+                // is playing, so selecting a cast target before pressing
+                // play is harmless, not a silent failure.
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    self.request_cast(url.clone());
+                }
             }
             self.active_device_url = url;
         }
@@ -1025,11 +1040,20 @@ impl Controller {
             let id = self.playlists_page.all().iter().map(|p| p.id).max().unwrap_or(0) + 1;
             let mut all = self.playlists_page.all().to_vec();
             all.push(crate::sources::PlaylistSummary {
-                id, name, description, track_count: 0, updated_at: self.now_secs });
+                id, name: name.clone(), description: description.clone(),
+                track_count: 0, updated_at: self.now_secs });
             self.playlists_page.set(all);
             // Bring it into view: a new row appearing off-screen looks like
             // nothing happened.
             self.playlists_page.focus(id);
+            // The optimistic row above has a LOCALLY-MADE id — it was never
+            // real, which is why this used to be the entire method: a
+            // playlist created here lived exactly as long as the process
+            // did. The host persists the real one and reloads the list
+            // (see pending_playlist_create's doc comment), which replaces
+            // this row with the true id rather than trying to patch it in
+            // place.
+            self.pending_playlist_create = Some((name, description));
         }
     }
 

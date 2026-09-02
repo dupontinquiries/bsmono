@@ -108,3 +108,48 @@ async fn cast_one(
         },
     }
 }
+
+/// Run one SSDP search round and translate the results into
+/// `outputs::Device` rows the existing `DeviceSelector` already knows how
+/// to render — it was built to receive exactly this ("supply the
+/// discovered speakers... not called yet", see outputs.rs) but had no
+/// discovery source until now.
+///
+/// `DiscoveredDevice` carries no friendly name (that needs a second HTTP
+/// GET of the device descriptor XML, which this skips for now — see the
+/// name fallback below); the picker shows the `Server` header or the host
+/// instead. Good enough to pick "the speaker at .34" from a short LAN
+/// list; a real name is a follow-up, not a blocker.
+pub fn discover_devices_once(timeout: std::time::Duration) -> Vec<crate::outputs::Device> {
+    let found = match bo_cast::dlna_discover::m_search(
+        bo_cast::dlna_discover::ST_MEDIA_RENDERER, timeout)
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("bo-suite: device discovery failed: {e}");
+            return Vec::new();
+        }
+    };
+    found.into_iter().filter_map(|d| {
+        let host = bo_cast::dlna_discover::host_of(&d.location)?;
+        let name = if d.server.trim().is_empty() { host.clone() } else { d.server.clone() };
+        Some(crate::outputs::Device {
+            url: format!("http://{host}"),
+            name,
+            kind: "cast".into(),
+        })
+    }).collect()
+}
+
+/// Repeats `discover_devices_once` on `interval`, sending each round's
+/// result whether it changed or not — the host (`set_devices`) already
+/// tolerates a same-content refresh, and diffing here would just be a
+/// second copy of that logic. Runs until the sender's receiver is
+/// dropped (app shutdown).
+pub fn run_discovery_worker(tx: Sender<Vec<crate::outputs::Device>>, interval: std::time::Duration) {
+    loop {
+        let devices = discover_devices_once(std::time::Duration::from_secs(2));
+        if tx.send(devices).is_err() { return; }
+        std::thread::sleep(interval);
+    }
+}

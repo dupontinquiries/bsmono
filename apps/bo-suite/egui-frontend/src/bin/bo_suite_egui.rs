@@ -29,6 +29,9 @@ struct App {
     /// on `cast_cmd_tx`; results come back non-blocking on `cast_res_rx`.
     cast_cmd_tx: std::sync::mpsc::Sender<bo_suite_egui::cast::CastCmd>,
     cast_res_rx: std::sync::mpsc::Receiver<bo_suite_egui::cast::CastResult>,
+    /// SSDP discovery results, refreshed periodically by a background
+    /// thread and read non-blocking each frame — see cast.rs.
+    discovery_rx: std::sync::mpsc::Receiver<Vec<bo_suite_egui::outputs::Device>>,
     /// The recogniser, when one is configured and voice is on.
     voice: bo_suite_egui::voice_source::VoiceSource,
     /// What the recogniser was last started with, so a settings change
@@ -102,6 +105,14 @@ impl App {
         std::thread::spawn(move || {
             bo_suite_egui::cast::run_cast_worker(cast_cmd_rx, cast_res_tx, 51423);
         });
+        // SSDP discovery for the "cast to" device picker. Every 20s: rare
+        // enough not to spam the LAN or wake sleeping devices repeatedly,
+        // often enough that a speaker that just powered on shows up
+        // without restarting the app.
+        let (discovery_tx, discovery_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            bo_suite_egui::cast::run_discovery_worker(discovery_tx, std::time::Duration::from_secs(20));
+        });
         let catalog = match bo_suite_egui::real_catalog::RealCatalog::open(&db_path, media_cmd_tx) {
             Ok(c) => c,
             Err(e) => {
@@ -135,6 +146,9 @@ impl App {
             controller.answer_tracks_from(&catalog);
             sync_track_paths(&mut controller, &catalog);
         }
+        // Whatever playlists already exist, so the page isn't empty until
+        // the user creates one to see it work.
+        controller.playlists_page.set(catalog.playlists());
         Self {
             controller,
             player: bo_suite_egui::playback::Player::new(),
@@ -143,6 +157,7 @@ impl App {
             media_res_rx,
             cast_cmd_tx,
             cast_res_rx,
+            discovery_rx,
             voice: bo_suite_egui::voice_source::VoiceSource::new(),
             voice_cmd: String::new(),
         }
@@ -219,6 +234,20 @@ impl App {
                     }
                     None => self.last_note = "cast: no file for that track".into(),
                 }
+            }
+        }
+        if let Some((name, description)) = self.controller.pending_playlist_create.take() {
+            // A local SQLite insert, not a network/scan operation — done
+            // directly here rather than round-tripped through the media
+            // worker, same reasoning as RealCatalog's other direct writes.
+            match self.catalog.create_playlist(&name, &description) {
+                Some(_id) => {
+                    // Replaces the optimistic fake-id row from
+                    // apply_playlist with the real list rather than trying
+                    // to patch just that one row in place.
+                    self.controller.playlists_page.set(self.catalog.playlists());
+                }
+                None => self.last_note = format!("could not create playlist '{name}'"),
             }
         }
         if let Some(id) = self.controller.last_played_track.take() {
@@ -340,6 +369,14 @@ impl App {
         // different channel, same drain-non-blocking shape.
         while let Ok(r) = self.cast_res_rx.try_recv() {
             self.controller.cast_result(r.ok, &r.detail);
+        }
+        // Only the LAST round matters — a discovery result is a full
+        // snapshot, not a delta, so draining to the newest and discarding
+        // any stale ones queued behind it is correct, not a shortcut.
+        let mut latest_devices = None;
+        while let Ok(d) = self.discovery_rx.try_recv() { latest_devices = Some(d); }
+        if let Some(devices) = latest_devices {
+            self.controller.device_selector.set_devices(devices);
         }
     }
 }
