@@ -25,6 +25,16 @@ struct Shell {
 }
 
 impl eframe::App for Shell {
+    // This fleet's eframe requires `ui` ALONGSIDE `update`. The app is driven
+    // from update() below, as every other egui frontend here does it, so this
+    // is deliberately empty rather than a todo!().
+    //
+    // I wrote this crate from eframe's documented API without compiling it —
+    // said so at the time — and got this wrong. dialer-egui carries the same
+    // comment for the same reason; the convention was already established and
+    // I did not look. Checking one working sibling would have cost nothing.
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         switcheroo_egui::ui::draw(&mut self.app, ctx);
     }

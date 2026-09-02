@@ -18,6 +18,11 @@ use switcheroo_core::{Device, DeviceId, Power};
 const ROW_H: f32 = 56.0;
 
 pub fn draw(app: &mut App, ctx: &egui::Context) {
+    // `Panel::top`/`Panel::bottom` with `.show(ctx, ..)` is this fleet's egui
+    // 0.34 form — `TopBottomPanel` is a deprecated alias. Verified against
+    // dialer-egui rather than guessed; writing this crate from remembered API
+    // is what produced the missing `eframe::App::ui` that stopped it building.
+
     app.tick(Instant::now());
     // BLE state changes arrive on a background thread, so the UI cannot
     // wait for input to repaint or a toggle would appear to hang.
@@ -34,7 +39,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) {
 }
 
 fn top_bar(app: &mut App, ctx: &egui::Context) {
-    egui::TopBottomPanel::top("switcheroo-top").show(ctx, |ui| {
+    egui::Panel::top("switcheroo-top").show(ctx, |ui| {
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             ui.heading("switcheroo");
@@ -64,7 +69,7 @@ fn top_bar(app: &mut App, ctx: &egui::Context) {
 }
 
 fn bottom_bar(app: &mut App, ctx: &egui::Context) {
-    egui::TopBottomPanel::bottom("switcheroo-bottom").show(ctx, |ui| {
+    egui::Panel::bottom("switcheroo-bottom").show(ctx, |ui| {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             for (tab, label) in [
