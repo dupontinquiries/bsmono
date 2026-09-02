@@ -139,6 +139,13 @@ pub struct Studio {
     /// from whenever `y` was pressed. Local: your clipboard is not a
     /// project fact.
     pub clipboard: Vec<studio_core::ClipId>,
+    /// What a placement does to the clips it lands on — the default and
+    /// per-track overrides. Local (workspace sidecar): it decides which
+    /// ops THIS editor emits, and every op it emits converges the same.
+    pub overlap: studio_core::Overlap,
+    pub overlap_tracks: std::collections::BTreeMap<studio_core::TrackId, studio_core::Overlap>,
+    /// A take is rolling on this site — rides in presence so peers know.
+    pub recording: bool,
     /// Workbench layout: the timeline stays on screen with the Rack /
     /// Program / Mixer in a resizable strip below it, instead of four
     /// full-screen tabs. The tabs remain the phone's layout; this is the
@@ -218,6 +225,9 @@ impl Studio {
             auto_binding: None,
             auto_drag: None,
             clipboard: Vec::new(),
+            overlap: studio_core::Overlap::default(),
+            overlap_tracks: Default::default(),
+            recording: false,
             combined: false,
             closed_groups: Default::default(),
             key_guide: true,
@@ -574,6 +584,7 @@ impl Studio {
             Some(last) => last.playhead != playhead
                 || last.selection != self.selection
                 || last.active_track != active_track
+                || last.recording != self.recording
                 || (self.display_name.is_empty() != last.name.starts_with("site "))
                 || (!self.display_name.is_empty() && last.name != self.display_name),
         };
@@ -590,7 +601,7 @@ impl Studio {
             playhead,
             selection: self.selection.clone(),
             active_track,
-            seq: self.presence_seq + 1, recording: false,
+            seq: self.presence_seq + 1, recording: self.recording,
         };
         self.presence_seq += 1;
         self.last_presence = Some(cur.clone());
@@ -844,6 +855,10 @@ impl Studio {
                 }
                 replies
             }
+            // Voice is for the jitter buffer and the sink, not the Doc;
+            // the receive half is not wired yet, so a frame is dropped
+            // here on purpose rather than half-handled.
+            Packet::Voice { .. } => Vec::new(),
         }
     }
 
@@ -935,7 +950,7 @@ impl Studio {
         let want = studio_core::Ticks(self.session.doc.project.clips[&anchor].pos.0 + delta.0);
         match self.session.doc.project.move_together_ops(&ids, anchor, want) {
             Ok(ops) if ops.is_empty() => self.status = "nudge: already at the start".into(),
-            Ok(ops) => { let n = ops.len(); self.edit_group(ops, &format!("nudged {n}")); }
+            Ok(ops) => { let n = ops.len(); let ops = self.with_room(ops); self.edit_group(ops, &format!("nudged {n}")); }
             Err(e) => self.status = format!("nudge refused: {e:?}"),
         }
     }
@@ -958,19 +973,106 @@ impl Studio {
         set
     }
 
+    /// The overlap policy for a track: its override, else the default.
+    pub fn policy_for(&self, track: studio_core::TrackId) -> studio_core::Overlap {
+        self.overlap_tracks.get(&track).copied().unwrap_or(self.overlap)
+    }
+
+    /// Resolve the placements in `ops` (MoveClip / AddClip) against each
+    /// track's overlap policy, on a probe copy so a second placement sees
+    /// what the first one trimmed. Trim: make_room_ops before the op.
+    /// Lane: the op is retargeted to the parent's shadow lane (created if
+    /// absent), and room is then made on the lane. Refuse: the op goes as
+    /// is and the model says no. Everything else passes through.
+    pub fn with_room(&self, ops: Vec<studio_core::Op>) -> Vec<studio_core::Op> {
+        use studio_core::{Op, Overlap};
+        let moving: Vec<studio_core::ClipId> = ops.iter().filter_map(|o| match o {
+            Op::MoveClip { id, .. } => Some(*id), Op::AddClip { clip } => Some(clip.id), _ => None }).collect();
+        let mut probe = self.session.doc.project.clone();
+        let mut next = probe.clips.keys().map(|c| c.0).max().unwrap_or(0) + 1
+            + ops.iter().filter(|o| matches!(o, Op::AddClip { .. })).count() as u64;
+        let mut next_track = probe.tracks.iter().map(|t| t.id.0).max().unwrap_or(0) + 1;
+        let mut out = Vec::with_capacity(ops.len());
+        fn push(probe: &mut studio_core::Project, out: &mut Vec<studio_core::Op>, op: studio_core::Op) {
+            let _ = probe.apply(&op);
+            out.push(op);
+        }
+        for op in ops {
+            let prospective = match &op {
+                Op::MoveClip { id, pos, track } => probe.clips.get(id).map(|c| {
+                    let mut c = c.clone(); c.pos = *pos; c.track = *track; c }),
+                Op::AddClip { clip } => Some(clip.clone()),
+                _ => None,
+            };
+            let Some(mut clip) = prospective else { push(&mut probe, &mut out, op); continue };
+            let mut op = op;
+            match self.policy_for(clip.track) {
+                Overlap::Refuse => {}
+                Overlap::Lane if !probe.overlappers(&clip, &moving).is_empty() => {
+                    let lane = match probe.shadow_lane(clip.track) {
+                        Some(l) => l,
+                        None => {
+                            let l = studio_core::TrackId(next_track);
+                            next_track += 1;
+                            if let Ok(mk) = probe.shadow_lane_ops(clip.track, l) {
+                                for m in mk { push(&mut probe, &mut out, m); }
+                            }
+                            l
+                        }
+                    };
+                    clip.track = lane;
+                    op = match op {
+                        Op::MoveClip { id, pos, .. } => Op::MoveClip { id, pos, track: lane },
+                        Op::AddClip { mut clip } => { clip.track = lane; Op::AddClip { clip } }
+                        other => other,
+                    };
+                    for r in probe.make_room_ops(&clip, &moving, &mut next) { push(&mut probe, &mut out, r); }
+                }
+                Overlap::Lane => {}
+                Overlap::Trim => {
+                    for r in probe.make_room_ops(&clip, &moving, &mut next) { push(&mut probe, &mut out, r); }
+                }
+            }
+            push(&mut probe, &mut out, op);
+        }
+        out
+    }
+
+    /// Set the overlap policy for one track (or the default with `None`).
+    pub fn set_overlap(&mut self, track: Option<studio_core::TrackId>, policy: studio_core::Overlap) {
+        match track {
+            Some(t) => { self.overlap_tracks.insert(t, policy); }
+            None => self.overlap = policy,
+        }
+        self.status = format!("overlap on {}: {}", match track {
+            Some(t) => self.session.doc.project.tracks.iter().find(|x| x.id == t)
+                .map(|x| x.name.clone()).unwrap_or_else(|| "?".into()),
+            None => "every track".into() }, policy.name());
+    }
+
     /// A timeline drop: the whole moving set by the anchor's delta, each
     /// on its own track; a lone clip also honours the track it was
     /// dropped on. One group, one undo, refused whole.
     pub fn drop_clip(&mut self, id: studio_core::ClipId, pos: Ticks, track: studio_core::TrackId, alone: bool) {
         let set = self.moving_set(id, alone);
-        if set.len() == 1 {
-            self.edit(studio_core::Op::MoveClip { id, pos, track }, "moved");
-            return;
-        }
-        match self.session.doc.project.move_together_ops(&set, id, pos) {
-            Ok(ops) if ops.is_empty() => self.status = "moved: nowhere to go".into(),
-            Ok(ops) => { let n = ops.len(); self.edit_group(ops, &format!("moved {n} together")); }
-            Err(e) => self.status = format!("move refused: {e:?}"),
+        let ops = if set.len() == 1 {
+            vec![studio_core::Op::MoveClip { id, pos, track }]
+        } else {
+            match self.session.doc.project.move_together_ops(&set, id, pos) {
+                Ok(ops) => ops,
+                Err(e) => { self.status = format!("move refused: {e:?}"); return; }
+            }
+        };
+        if ops.is_empty() { self.status = "moved: nowhere to go".into(); return; }
+        let moved = ops.len();
+        let ops = self.with_room(ops);
+        let gave_way = ops.len() - moved;
+        let what = if moved == 1 { "moved".to_string() } else { format!("moved {moved} together") };
+        if ops.len() == 1 {
+            self.edit(ops.into_iter().next().unwrap(), &what);
+        } else {
+            self.edit_group(ops, &format!("{what}{}", if gave_way > 0 {
+                format!(", {gave_way} op{} made room", if gave_way == 1 { "" } else { "s" }) } else { String::new() }));
         }
     }
 
@@ -1230,6 +1332,7 @@ impl Studio {
             }
         }
         let n = live.len();
+        let ops = self.with_room(ops);
         self.edit_group(ops, &format!("pasted {n} clip{}{}{}{}",
             if groups > 0 { format!(" in {groups} composition{}", if groups == 1 { "" } else { "s" }) }
             else { String::new() },
@@ -2230,6 +2333,11 @@ impl Default for App {
             .find(|p| p.label() == ws.panel) { studio.panel = *p; }
         studio.view.px_per_sec = ws.px_per_sec;
         studio.view.scroll = studio_core::Ticks(ws.scroll_ticks);
+        studio.overlap = studio_core::Overlap::parse(&ws.overlap).unwrap_or_default();
+        studio.overlap_tracks = ws.overlap_tracks.split(',')
+            .filter_map(|kv| { let (t, p) = kv.split_once(':')?;
+                Some((studio_core::TrackId(t.trim().parse().ok()?), studio_core::Overlap::parse(p)?)) })
+            .collect();
         studio.closed_groups = ws.closed_groups.iter()
             .map(|g| studio_core::GroupId(*g)).collect();
         let bounce_format = morph_pad::BounceFormat::from_token(&ws.bounce_format);
@@ -2629,6 +2737,9 @@ impl eframe::App for App {
                         display_name: self.studio.display_name.clone(),
                         rebinds: self.rebinds.encode(),
                         piano_zones: self.zones.encode(),
+                        overlap: self.studio.overlap.name().to_string(),
+                        overlap_tracks: self.studio.overlap_tracks.iter()
+                            .map(|(t, p)| format!("{}:{}", t.0, p.name())).collect::<Vec<_>>().join(","),
                     });
                     // The directory must exist (and be ours) BEFORE the
                     // file is written: a save into a fresh project root
@@ -2681,6 +2792,7 @@ impl eframe::App for App {
                 // on it — a recording UI that does not show you it is
                 // recording is how takes get lost.
                 let live = self.mic.recording();
+                self.studio.recording = live;
                 let label = if live { format!("⏺ {:.1}s", self.mic.elapsed()) }
                             else { "⏺".to_string() };
                 let btn = egui::Button::new(label)
@@ -4324,6 +4436,11 @@ impl App {
                     self.studio.new_curve_on_selection(t);
                 }
                 palette::ShellVerb::SplitOnGrid(steps) => self.studio.split_selection_on_grid(steps as i64),
+                palette::ShellVerb::Overlap(policy) => {
+                    let track = self.studio.selection.first()
+                        .and_then(|c| self.studio.session.doc.project.clips.get(c)).map(|c| c.track);
+                    self.studio.set_overlap(track, policy);
+                }
                 palette::ShellVerb::MakeCurveUnique => match self.studio.auto_binding {
                     Some(b) => self.studio.make_unique(b),
                     None => self.studio.status = "make unique: pick a binding in the curves row first".into(),
@@ -6422,12 +6539,22 @@ mod curve_shell_tests {
     }
 
     #[test]
-    fn a_paste_with_no_room_is_refused_whole() {
+    fn a_paste_with_no_room_makes_room_by_default_and_refuses_whole_when_told_to() {
         let (mut s, _clip, _) = with_bound_clip();
         s.yank();
         // Clip 4 sits on track 1 at 10.5 s; pasting a 3 s clip at 9 s
-        // overlaps it. Nothing may land — not the clip, not the binding.
+        // overlaps its head. Newest wins: 4 is left-trimmed and slid to
+        // 12 s, the paste lands, one undo restores everything.
         let before = s.session.doc.project.clone();
+        s.paste_at(Ticks::from_seconds(9.0));
+        assert!(s.status.starts_with("pasted 1 clip"), "status was: {}", s.status);
+        let p = &s.session.doc.project;
+        assert_eq!(p.clips[&studio_core::ClipId(4)].pos, Ticks::from_seconds(12.0));
+        assert_eq!(p.clips[&studio_core::ClipId(4)].len, Ticks::from_seconds(1.5));
+        s.key(Key::c('u'));
+        assert_eq!(s.session.doc.project, before, "one undo, and the take is whole again");
+        // Refuse: nothing may land — not the clip, not the binding.
+        s.overlap = studio_core::Overlap::Refuse;
         s.paste_at(Ticks::from_seconds(9.0));
         assert!(s.status.contains("refused"), "status was: {}", s.status);
         assert_eq!(s.session.doc.project, before, "a refused paste leaves nothing behind");
@@ -6569,6 +6696,79 @@ mod curve_shell_tests {
         assert_eq!(p.curve_share_count(curve), 1);
         assert_eq!(p.curves.len(), 2);
         assert_ne!(p.bindings[&studio_core::BindingId(2)].curve, curve);
+    }
+
+    #[test]
+    fn a_drop_onto_a_long_take_trims_it_by_default_and_refuses_only_when_asked() {
+        // Demo: clips 1 (0–3 s) and 4 (10.5–13.5 s) share track 1. Drop 4
+        // onto 1's tail: newest wins, 1 is trimmed, one undo restores both.
+        let mut s = Studio::demo();
+        let t = s.session.doc.project.clips[&studio_core::ClipId(1)].track;
+        assert_eq!(s.policy_for(t), studio_core::Overlap::Trim, "the default");
+        s.selection.clear();
+        s.drop_clip(studio_core::ClipId(4), Ticks::from_seconds(2.0), t, true);
+        assert!(s.status.contains("made room"), "status was: {}", s.status);
+        let p = &s.session.doc.project;
+        assert_eq!(p.clips[&studio_core::ClipId(4)].pos, Ticks::from_seconds(2.0));
+        assert_eq!(p.clips[&studio_core::ClipId(1)].len, Ticks::from_seconds(2.0), "the take gave way to the newcomer");
+        s.key(Key::c('u'));
+        let p = &s.session.doc.project;
+        assert_eq!(p.clips[&studio_core::ClipId(1)].len, Ticks::from_seconds(3.0));
+        assert_eq!(p.clips[&studio_core::ClipId(4)].pos, Ticks::from_seconds(10.5), "one undo, both facts back");
+        s.set_overlap(Some(t), studio_core::Overlap::Refuse);
+        s.drop_clip(studio_core::ClipId(4), Ticks::from_seconds(2.0), t, true);
+        assert!(s.status.contains("refused"), "status was: {}", s.status);
+        assert_eq!(s.session.doc.project.clips[&studio_core::ClipId(4)].pos, Ticks::from_seconds(10.5));
+    }
+
+    #[test]
+    fn the_lane_policy_lands_the_overlap_on_a_shadow_track_through_the_same_bus() {
+        let mut s = Studio::demo();
+        let t = s.session.doc.project.clips[&studio_core::ClipId(1)].track;
+        s.set_overlap(Some(t), studio_core::Overlap::Lane);
+        assert!(s.status.ends_with(": lane"), "status was: {}", s.status);
+        let tracks_before = s.session.doc.project.tracks.len();
+        s.selection.clear();
+        s.drop_clip(studio_core::ClipId(4), Ticks::from_seconds(1.0), t, true);
+        let p = &s.session.doc.project;
+        assert_eq!(p.tracks.len(), tracks_before + 1, "a shadow lane was made");
+        let lane = p.shadow_lane(t).expect("found by name beside its parent");
+        let moved = &p.clips[&studio_core::ClipId(4)];
+        assert_eq!(moved.track, lane);
+        assert_eq!(moved.pos, Ticks::from_seconds(1.0));
+        assert_eq!(p.clips[&studio_core::ClipId(1)].len, Ticks::from_seconds(3.0), "the take on the parent is untouched");
+        assert_eq!(p.tracks.iter().find(|x| x.id == lane).unwrap().route,
+                   p.tracks.iter().find(|x| x.id == t).unwrap().route, "same bus");
+        // A second overlap reuses the lane rather than making another.
+        s.drop_clip(studio_core::ClipId(5), Ticks::from_seconds(0.5), t, true);
+        assert_eq!(s.session.doc.project.tracks.len(), tracks_before + 1);
+        s.key(Key::c('u'));
+        s.key(Key::c('u'));
+        assert_eq!(s.session.doc.project.tracks.len(), tracks_before, "undo removes the lane it made");
+    }
+
+    #[test]
+    fn overlap_policy_survives_the_workspace_sidecar() {
+        let mut ws = workspace::WorkspaceState::default();
+        ws.overlap = "lane".into();
+        ws.overlap_tracks = "3:refuse,7:trim, junk ,9:nope".into();
+        let back = workspace::WorkspaceState::decode(&ws.encode());
+        assert_eq!(back.overlap, "lane");
+        assert_eq!(back.overlap_tracks, ws.overlap_tracks);
+        assert_eq!(studio_core::Overlap::parse(&back.overlap), Some(studio_core::Overlap::Lane));
+        let parsed: Vec<_> = back.overlap_tracks.split(',')
+            .filter_map(|kv| { let (t, p) = kv.split_once(':')?;
+                Some((t.trim().parse::<u64>().ok()?, studio_core::Overlap::parse(p)?)) }).collect();
+        assert_eq!(parsed, vec![(3, studio_core::Overlap::Refuse), (7, studio_core::Overlap::Trim)],
+                   "junk and unknown policies are dropped, never load-bearing");
+    }
+
+    #[test]
+    fn presence_says_when_a_take_is_rolling() {
+        let mut s = Studio::demo();
+        s.recording = true;
+        let pkt = s.presence_beat(10_000).expect("first presence is always due");
+        match pkt { studio_collab::wire::Packet::Presence(p) => assert!(p.recording), other => panic!("{other:?}") }
     }
 
     #[test]

@@ -19,6 +19,9 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceState {
     pub combined: bool,
+    /// Overlap policy: the default's name, and "track:policy" pairs.
+    pub overlap: String,
+    pub overlap_tracks: String,
     /// Panel and side-slot as their LABELS, not indices — a reordered enum
     /// in a future build must not silently retarget everyone's layout.
     pub panel: String,
@@ -69,14 +72,15 @@ impl Default for WorkspaceState {
                          pinned: Vec::new(), demoted: Vec::new(),
                          voice_domains: "common,instruments".into(),
                          library_open: true, display_name: String::new(),
-                         rebinds: String::new(), piano_zones: String::new() }
+                         rebinds: String::new(), piano_zones: String::new(),
+                         overlap: "trim".into(), overlap_tracks: String::new() }
     }
 }
 
 impl WorkspaceState {
     pub fn encode(&self) -> String {
         format!("# per-device layout; safe to delete, never load-bearing\n\
-                 combined={}\npanel={}\nside_slot={}\npx_per_sec={}\nscroll_ticks={}\nclosed_groups={}\nbounce_format={}\npinned={}\ndemoted={}\nvoice_domains={}\nlibrary_open={}\ndisplay_name={}\nrebinds={}\npiano_zones={}\n",
+                 combined={}\npanel={}\nside_slot={}\npx_per_sec={}\nscroll_ticks={}\nclosed_groups={}\nbounce_format={}\npinned={}\ndemoted={}\nvoice_domains={}\nlibrary_open={}\ndisplay_name={}\nrebinds={}\npiano_zones={}\noverlap={}\noverlap_tracks={}\n",
                 self.combined, self.panel, self.side_slot,
                 self.px_per_sec, self.scroll_ticks,
                 self.closed_groups.iter().map(|g| g.to_string())
@@ -88,7 +92,7 @@ impl WorkspaceState {
                 self.pinned.join("\t"),
                 self.demoted.join("\t"),
                 self.voice_domains, self.library_open, self.display_name,
-                self.rebinds, self.piano_zones)
+                self.rebinds, self.piano_zones, self.overlap, self.overlap_tracks)
     }
     /// Parse leniently: defaults underneath, known keys on top, everything
     /// else ignored. There is no error case ON PURPOSE.
@@ -120,6 +124,8 @@ impl WorkspaceState {
                 "display_name" => w.display_name = v.trim().to_string(),
                 "rebinds" => w.rebinds = v.trim().to_string(),
                 "piano_zones" => w.piano_zones = v.trim().to_string(),
+                "overlap" => w.overlap = v.trim().to_string(),
+                "overlap_tracks" => w.overlap_tracks = v.trim().to_string(),
                 _ => {} // a newer build's key, not our business
             }
         }
@@ -226,7 +232,8 @@ mod tests {
             pinned: vec!["kicks/808, big.wav".into()], demoted: vec!["hats/tick.opus".into()],
             voice_domains: "trap,film".into(),
             library_open: false, display_name: "kes".into(),
-            rebinds: "44>46,107>100".into(), piano_zones: "97>0,115>0".into() };
+            rebinds: "44>46,107>100".into(), piano_zones: "97>0,115>0".into(),
+            overlap: "lane".into(), overlap_tracks: "3:refuse".into() };
         assert_eq!(WorkspaceState::decode(&w.encode()), w);
         // A newer build's key rides along harmlessly; garbage lines too.
         let with_future = format!("{}\nfuture_key=whatever\n<<<garbage", w.encode());

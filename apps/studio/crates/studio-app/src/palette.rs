@@ -76,6 +76,8 @@ pub enum ShellVerb {
     SplitOnGrid(u8),
     /// The strip's binding gets its own copy of its curve.
     MakeCurveUnique,
+    /// Overlap policy for the selected clip's track (every track with none selected).
+    Overlap(studio_core::Overlap),
     ArchiveDialog,
     ExportDialog,
     Settings,
@@ -245,6 +247,9 @@ pub fn root() -> Vec<Choice> {
         c("split selection on beats", None, Then::Do(Act::Shell(ShellVerb::SplitOnGrid(4)))),
         c("split selection on bars", None, Then::Do(Act::Shell(ShellVerb::SplitOnGrid(16)))),
         c("make curve unique (strip's binding)", None, Then::Do(Act::Shell(ShellVerb::MakeCurveUnique))),
+        c("overlap: newest wins (trim what it lands on)", None, Then::Do(Act::Shell(ShellVerb::Overlap(studio_core::Overlap::Trim)))),
+        c("overlap: shadow lane (a track beside it, same bus)", None, Then::Do(Act::Shell(ShellVerb::Overlap(studio_core::Overlap::Lane)))),
+        c("overlap: refuse", None, Then::Do(Act::Shell(ShellVerb::Overlap(studio_core::Overlap::Refuse)))),
         c("save archive…", None, Then::Do(Act::Shell(ShellVerb::ArchiveDialog))),
         c("export…", None, Then::Do(Act::Shell(ShellVerb::ExportDialog))),
         c("settings…", None, Then::Do(Act::Shell(ShellVerb::Settings))),

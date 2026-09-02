@@ -505,8 +505,11 @@ pub fn timeline(
         painter.line_segment([Pos2::new(x, origin.y + RULER_H), Pos2::new(x, rect.max.y)],
                              Stroke::new(1.5_f32, tint));
         // the name rides at the top so several peers stay readable
+        // A live take is said in the label itself: the one thing a
+        // collaborator must not do to a singer mid-take is move her.
+        let label = if peer.recording { format!("{} ● rec", peer.name) } else { peer.name.clone() };
         painter.text(Pos2::new(x + 3.0, origin.y + RULER_H + 1.0), Align2::LEFT_TOP,
-                     &peer.name, FontId::proportional(10.0), tint);
+                     label, FontId::proportional(10.0), tint);
     }
 
     // ── our own playhead, last, so it is never hidden by a peer's ──────────
