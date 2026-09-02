@@ -1,0 +1,5 @@
+shell one
+shell two
+[3;4Hparked[?1049hPAGER
+second line of pager
+[10;1Hbottom[?1049lAFTER

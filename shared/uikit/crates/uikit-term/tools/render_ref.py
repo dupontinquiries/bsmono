@@ -62,6 +62,13 @@ DIVERGENT = {
                    "does not wrap as a unit. tmux believed.",
     "save_restore": "pyte implements neither ESC 7 / ESC 8 nor CSI s / CSI u. "
                     "tmux believed.",
+    "alt_screen": "pyte has no alternate screen: it keeps writing to the one "
+                  "buffer, so the pager's output stays on screen after the "
+                  "switch back and the shell's is gone. tmux believed.",
+    "alt_screen_47": "same — pyte has no alternate screen. tmux also shows the "
+                     "cursor NOT being restored by ?47l, which is the whole "
+                     "reason ?1049 exists. tmux believed.",
+    "alt_screen_nested": "same — pyte has no alternate screen. tmux believed.",
 }
 
 # pyte reports the eight base colours by name and everything else -- including

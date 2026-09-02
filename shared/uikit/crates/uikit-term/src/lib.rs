@@ -62,6 +62,17 @@ impl Default for Style {
 /// change, and `Cell` stays `Copy` and two fields wide.
 pub const WIDE_TAIL: char = '\0';
 
+/// The primary screen while the alternate one is in front of it.
+#[derive(Debug, Clone)]
+struct AltSave {
+    cells: Vec<Cell>,
+    cur_row: usize,
+    cur_col: usize,
+    pen: Style,
+    scroll_top: usize,
+    scroll_bot: usize,
+}
+
 /// One screen cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
@@ -117,6 +128,15 @@ pub struct Grid {
     /// somewhere else and expects to come back; with this dropped, it came
     /// back to wherever it happened to be.
     saved_cursor: Option<(usize, usize, Style)>,
+    /// The PRIMARY screen, parked while the alternate one is showing.
+    ///
+    /// `Some` IS the "alternate screen is active" flag — one field rather than
+    /// a bool beside a buffer, so the two cannot disagree about which screen
+    /// is on. Full-screen programs (vim, less, htop) switch to the alternate
+    /// screen, draw, and switch back expecting to find the shell exactly as
+    /// they left it; without this they drew over the shell's output and it was
+    /// gone for good.
+    alt_saved: Option<AltSave>,
     /// Scrollback view: how many lines ABOVE the live bottom the viewport is showing.
     /// 0 = live. While scrolled back, new output does not move the view (the offset is bumped
     /// as lines enter scrollback — the standard terminal pin), and the cursor is hidden.
@@ -152,12 +172,21 @@ impl Grid {
             scroll_top: 0,
             scroll_bot: rows - 1,
             saved_cursor: None,
+            alt_saved: None,
             view_offset: 0,
         }
     }
 
     fn idx(&self, r: usize, c: usize) -> usize {
         r * self.cols + c
+    }
+
+    /// Buffer length, so a test can catch a screen restored at the wrong size
+    /// (which otherwise shows up as an unrelated panic several operations
+    /// later).
+    #[doc(hidden)]
+    pub fn cells_len_for_test(&self) -> usize {
+        self.cells.len()
     }
 
     pub fn cell(&self, r: usize, c: usize) -> Cell {
@@ -268,6 +297,79 @@ impl Grid {
         } else {
             self.cur_row = self.cur_row.saturating_sub(1);
         }
+    }
+
+    /// Is the alternate screen showing?
+    pub fn on_alt_screen(&self) -> bool {
+        self.alt_saved.is_some()
+    }
+
+    /// Switch to the alternate screen (`CSI ?1049h` / `?1047h` / `?47h`).
+    ///
+    /// Idempotent: a second enter while already on the alternate screen must
+    /// NOT re-save, or the primary buffer is overwritten with the alternate
+    /// one and the shell's output is lost — which is the exact failure this
+    /// exists to prevent, arriving through the mechanism meant to prevent it.
+    /// Programs do send a redundant enter (a nested pager under an editor).
+    ///
+    /// `save_cursor` decides whether the cursor rides along: `?1049` saves it,
+    /// the older `?47`/`?1047` do not.
+    pub fn enter_alt_screen(&mut self, save_cursor: bool) {
+        if self.alt_saved.is_some() {
+            return;
+        }
+        self.alt_saved = Some(AltSave {
+            cells: self.cells.clone(),
+            cur_row: self.cur_row,
+            cur_col: self.cur_col,
+            pen: self.pen,
+            scroll_top: self.scroll_top,
+            scroll_bot: self.scroll_bot,
+        });
+        self.scroll_top = 0;
+        self.scroll_bot = self.rows - 1;
+        if !save_cursor {
+            // `?47h` / `?1047h` swap the buffer and DO NOTHING ELSE: no cursor
+            // save, no clear, no home. Checked against tmux, where the
+            // character after `?47l` lands at the column the alternate screen
+            // reached rather than the one the primary left. Clearing and
+            // homing here felt obviously right and was obviously wrong — the
+            // difference between these and `?1049` is precisely that `?1049`
+            // was added to do the extra work.
+            return;
+        }
+        self.save_cursor();
+        // The alternate screen starts blank. Not `clear()`, which would also
+        // home the cursor — the save above has to happen first, and doing the
+        // two steps by hand makes that ordering visible.
+        for c in &mut self.cells {
+            *c = Cell::default();
+        }
+        self.cur_row = 0;
+        self.cur_col = 0;
+    }
+
+    /// Switch back, putting the primary screen and its cursor back exactly.
+    /// A leave with no alternate screen active is a no-op rather than a clear:
+    /// a stray `?1049l` from a program that crashed mid-switch must not eat
+    /// the shell's scrollback position.
+    pub fn leave_alt_screen(&mut self, restore_cursor: bool) {
+        let Some(saved) = self.alt_saved.take() else { return };
+        self.cells = saved.cells;
+        self.scroll_top = saved.scroll_top;
+        self.scroll_bot = saved.scroll_bot;
+        if restore_cursor {
+            self.restore_cursor();
+        }
+        // Otherwise the cursor is LEFT WHERE THE ALTERNATE SCREEN PUT IT.
+        //
+        // That looks like an omission and is not: `?47`/`?1047` restore the
+        // buffer and say nothing about the cursor, which is exactly why
+        // `?1049` was added. Checked against tmux — after `?47l` the next
+        // character lands at the column the alternate screen had reached, not
+        // at the one the primary left. Putting `saved.cur_*` back here would
+        // be tidier and wrong, and the fixture catches it.
+        let _ = (saved.cur_row, saved.cur_col, saved.pen);
     }
 
     /// DECSC / SCOSC — park the cursor AND the pen.
@@ -413,7 +515,12 @@ impl Grid {
     /// that reserves only a footer. Worth revisiting with a real `less`
     /// session in front of you.)
     pub fn scroll_up(&mut self) {
-        let full = self.scroll_top == 0 && self.scroll_bot == self.rows - 1;
+        // The alternate screen is a scratch surface, not history. A pager that
+        // scrolls through a long file would otherwise push every frame of its
+        // own rendering into the buffer and bury the shell session underneath
+        // it — and the buffer exists to hold the shell session.
+        let full = self.scroll_top == 0 && self.scroll_bot == self.rows - 1
+            && self.alt_saved.is_none();
         if full {
             let top: Vec<Cell> = self.cells[0..self.cols].to_vec();
             self.scrollback.push(top);
@@ -619,6 +726,7 @@ impl Grid {
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let cols = cols.max(1);
         let rows = rows.max(1);
+        let (old_cols, old_rows) = (self.cols, self.rows);
         if cols < self.cols {
             for r in 0..self.rows {
                 let tail_has_content = (cols..self.cols).any(|c| self.cell(r, c).ch != ' ');
@@ -649,6 +757,23 @@ impl Grid {
         // what the next escape will correct.
         self.scroll_top = 0;
         self.scroll_bot = rows - 1;
+        // The PARKED primary buffer is sized for the old grid. Leaving it
+        // would make `leave_alt_screen` install a Vec of the wrong length and
+        // every subsequent index land on the wrong row — a corruption that
+        // appears minutes later, when the pager exits.
+        if let Some(saved) = &mut self.alt_saved {
+            let mut next = vec![Cell::default(); cols * rows];
+            for r in 0..rows.min(old_rows) {
+                for c in 0..cols.min(old_cols) {
+                    next[r * cols + c] = saved.cells[r * old_cols + c];
+                }
+            }
+            saved.cells = next;
+            saved.cur_row = saved.cur_row.min(rows - 1);
+            saved.cur_col = saved.cur_col.min(cols - 1);
+            saved.scroll_top = 0;
+            saved.scroll_bot = rows - 1;
+        }
     }
 }
 
@@ -833,6 +958,15 @@ impl Parser {
                 1 => grid.app_cursor = set,
                 // DEC 2004 — bracketed paste.
                 2004 => grid.bracketed_paste = set,
+                // The alternate screen. Three spellings with slightly
+                // different cursor behaviour, all handled here rather than in
+                // three places: `?1049` saves and restores the cursor around
+                // the switch, `?47` and `?1047` switch the buffer only.
+                1049 => if set { grid.enter_alt_screen(true) } else { grid.leave_alt_screen(true) },
+                47 | 1047 => if set { grid.enter_alt_screen(false) } else { grid.leave_alt_screen(false) },
+                // `?1048` is the cursor half on its own — some programs pair it
+                // with `?1047` to get `?1049`'s behaviour in two escapes.
+                1048 => if set { grid.save_cursor() } else { grid.restore_cursor() },
                 _ => {}
             }
         }
@@ -2251,6 +2385,87 @@ mod tests {
         t.feed("abcde");
         assert_eq!(t.grid.row_text(0), "abcd");
         assert_eq!(t.grid.row_text(1), "e");
+    }
+
+    #[test]
+    fn the_primary_screen_survives_a_full_screen_program() {
+        let mut t = Terminal::new(20, 5);
+        t.feed("shell output\r\nsecond line");
+        t.feed("\x1b[?1049h");
+        assert!(t.grid.on_alt_screen());
+        assert_eq!(t.grid.row_text(0), "", "the alternate screen was not blank");
+        t.feed("PAGER");
+        assert_eq!(t.grid.row_text(0), "PAGER");
+        t.feed("\x1b[?1049l");
+        assert!(!t.grid.on_alt_screen());
+        assert_eq!(t.grid.row_text(0), "shell output", "the shell's output was lost");
+        assert_eq!(t.grid.row_text(1), "second line");
+        // And the cursor came back, so the next thing the shell prints
+        // continues its own line rather than starting wherever the pager left.
+        t.feed("X");
+        assert_eq!(t.grid.row_text(1), "second lineX");
+    }
+
+    #[test]
+    fn the_alternate_screen_does_not_reach_scrollback() {
+        // A pager scrolling a long file would otherwise push every frame of
+        // its own rendering into the buffer and bury the shell session — and
+        // the buffer exists to hold the shell session. Both directions: the
+        // primary screen must still save.
+        let mut t = Terminal::new(6, 3);
+        t.feed("\x1b[?1049h");
+        for _ in 0..10 { t.feed("x\r\n"); }
+        assert!(t.grid.scrollback.is_empty(), "the pager filled the scrollback");
+        t.feed("\x1b[?1049l");
+        for _ in 0..10 { t.feed("y\r\n"); }
+        assert!(!t.grid.scrollback.is_empty(), "the primary screen stopped saving history");
+    }
+
+    #[test]
+    fn a_redundant_enter_does_not_clobber_the_parked_screen() {
+        // Programs do send this — a pager launched from inside an editor. A
+        // second save would overwrite the primary buffer with the alternate
+        // one, which is the exact loss the alternate screen exists to prevent,
+        // arriving through the mechanism meant to prevent it.
+        let mut t = Terminal::new(20, 3);
+        t.feed("keep me\x1b[?1049hfirst\x1b[?1049hsecond\x1b[?1049l");
+        assert_eq!(t.grid.row_text(0), "keep me");
+    }
+
+    #[test]
+    fn a_leave_with_no_alternate_screen_is_a_no_op() {
+        // A stray `?1049l` from a program that died mid-switch must not eat
+        // the screen.
+        let mut t = Terminal::new(20, 3);
+        t.feed("intact\x1b[?1049l");
+        assert_eq!(t.grid.row_text(0), "intact");
+        assert!(!t.grid.on_alt_screen());
+    }
+
+    #[test]
+    fn the_older_spelling_swaps_the_buffer_and_nothing_else() {
+        // `?47`/`?1047` restore the buffer and say nothing about the cursor,
+        // which is exactly why `?1049` was added. Verified against tmux: the
+        // character after `?47l` lands where the ALTERNATE screen reached.
+        let mut t = Terminal::new(10, 3);
+        t.feed("abc\x1b[2;3H\x1b[?47hXY\x1b[?47lZ");
+        assert_eq!(t.grid.row_text(0), "abc", "the primary buffer was not restored");
+        assert_eq!(t.grid.row_text(1), "    Z");
+        assert_eq!(t.grid.cur_col, 5);
+    }
+
+    #[test]
+    fn a_resize_while_parked_resizes_the_parked_screen_too() {
+        // The parked buffer is sized for the old grid. Leaving it stale makes
+        // `leave_alt_screen` install a Vec of the wrong length, and every
+        // index after that lands on the wrong row — a corruption that surfaces
+        // minutes later, when the pager exits.
+        let mut t = Terminal::new(10, 6);
+        t.feed("primary\x1b[?1049h");
+        t.resize(6, 3);
+        t.feed("\x1b[?1049l");
+        assert_eq!(t.grid.cells_len_for_test(), 6 * 3, "the parked buffer was the old size");
+        assert_eq!(t.grid.row_text(0), "primar", "the primary content did not survive the resize");
     }
 
     #[test]

@@ -131,6 +131,24 @@ SYNTHETIC = {
     # the cheapest possible check that an intermediate byte is consumed rather
     # than printed.
     "decaln": b"\x1b#8",
+    # The alternate screen: a full-screen program's whole life cycle. Shell
+    # output, switch, draw over it, switch back. What must survive is the
+    # shell output AND the cursor position, which is the pair a partial
+    # implementation gets half right.
+    "alt_screen": (
+        b"shell one\r\nshell two\r\n\x1b[3;4Hparked"
+        b"\x1b[?1049h"
+        b"PAGER\r\nsecond line of pager\r\n\x1b[10;1Hbottom"
+        b"\x1b[?1049l"
+        b"AFTER"
+    ),
+    # The older spelling, which switches the buffer and NOT the cursor.
+    "alt_screen_47": b"abc\x1b[2;3H\x1b[?47hXY\x1b[?47lZ",
+    # A redundant enter, which programs do send (a pager under an editor). The
+    # second one must not overwrite the parked primary with the alternate.
+    "alt_screen_nested": (
+        b"keep me\x1b[?1049hfirst alt\x1b[?1049hsecond alt\x1b[?1049l"
+    ),
     # Reverse index at the top of the screen scrolls DOWN.
     "reverse_index": b"line1\r\nline2\x1b[1;1H\x1bMtop",
 }
