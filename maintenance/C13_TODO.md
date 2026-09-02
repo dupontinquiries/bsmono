@@ -2292,3 +2292,32 @@ Asahi box prints which of the two cases holds, and they need different work:
 
 Do not work §67 item 1 until this line has been read once. Guessing wrong
 means optimising bind-group construction to fix a mutex, or the reverse.
+
+
+## 70. §55/§67-4 closed — the duplicate liaison is gone
+
+`logscope::liaison` is canonical and wired (persona, codecompare,
+liaison_relay, liaisonhud, 53 tests). The `logscope-egui` copy was
+unreachable and is deleted down to `Epistemic`, which is the only part
+anything used. The long-standing `phase_done is never read` warning is gone
+with it.
+
+**Third dead-duplicate resolved this session**, after the tool lists and
+`extract_nonced`. The pattern is consistent enough to be worth stating: in
+every case the dead copy was the one in the OUTER crate (the egui frontend),
+duplicating something the inner crate already had. A frontend reaching for a
+concept the core already models, and building its own because the core's was
+not quite shaped for the UI, is how all three started.
+
+`extract_nonced` (§56) is still the outstanding one — XML-only, no callers,
+security-relevant. Same treatment: delete it or make it delegate to
+`authorize_text`.
+
+**What "the liaison working" now requires** is no longer a choice between two
+modules, just wiring on the live one: `liaisonhud` is fed (three
+`hud.observe` sites) and displayed, and `LIAISON_SYSTEM` is selectable. What
+is missing is a small model actually running as the liaison alongside the
+big one — which the engine's own advice line has been recommending
+("16 performance and 8 efficiency cores detected — a small liaison can run
+on the efficiency cores without taking any from the thinker") and nothing
+schedules.
