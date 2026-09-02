@@ -97,6 +97,29 @@ moved.
   not been run against a compositor. First run is on a device; the things most likely to be
   wrong are integer-only scale (soft text at 2.5×) and the map/unmap sequence on KWin.
 
+## Voice: connected, and faster (feature `voice`)
+
+The egui build had the dictation state machine, the mic-state UI and the engine mounted from
+the GTK app by `#[path]` — and nothing connecting them: "dictate" started a state machine no
+audio ever reached. `voice_host.rs` is the connection, the GTK streaming worker re-shaped for a
+frame loop (one inference in flight, bounded 12 s window, `Pass::Partial`), wired into
+`toggle_dictation` and the per-frame poll. The 🎤 key on the cardinal boards and the toolbar
+button both go through it.
+
+The transcriber itself (`src/voice/transcriber.rs`, shared with the GTK build) is tuned for a
+keyboard: the encoder is sized to the audio present (`audio_ctx`, floor 512 of 1500 — the
+partial loop was paying for 30 s of silence padding on every 2 s window), partials skip the
+temperature-fallback re-decodes and timestamp tokens, one `WhisperState` is reused instead of
+allocated per call, `.en` models skip the language-detection pass, and every call records a
+`Timing` the status row shows (`partial 2.1s ctx512 180ms · corpus 12`). The fingerprint
+corpus (`audio_kit::fingerprint` 64-bit + length, voice-kit's cache, persisted at
+`~/.local/share/rusty-board/voice-fingerprints.tsv`) answers a repeated COMMITTED utterance
+before whisper runs; partials are never remembered. `RUSTY_BOARD_VOICE_FPCACHE=0` disables it.
+
+Compile-verified only: this sandbox has no microphone and no model. The number that matters
+is the `ms` in the status row on the phone; `MIN_AUDIO_CTX` and the model preference order in
+voice-kit's `model.rs` are the two knobs if it is not enough.
+
 ## The state bug that hid every experimental keyboard (fixed)
 
 `paint_key`'s glass branch (the "system" palette, which is `Board::new()`'s default) painted the

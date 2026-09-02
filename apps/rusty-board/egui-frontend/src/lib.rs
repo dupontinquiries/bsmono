@@ -47,6 +47,9 @@ pub use settings::util;
 #[cfg(feature = "voice")]
 #[path = "../../src/config/mod.rs"]
 pub mod config;
+/// Capture + streaming partials, driving the mounted engine from the frame loop.
+#[cfg(feature = "voice")]
+pub mod voice_host;
 pub mod swipe;
 #[cfg(feature = "app")]
 pub mod demo_app;
