@@ -151,6 +151,13 @@ pub struct MeshRequest {
 pub struct MeshResult {
     pub coord: ChunkCoord,
     pub mesh: ChunkMesh,
+    /// The same mesh in wire format, quantized on the producing thread.
+    /// `Some` for every result the pool's workers and GPU dispatchers
+    /// send; the render thread should upload this and never touch
+    /// `mesh.vertices`. `mesh` keeps its vertices for consumers that
+    /// need them (collision debug, tests) — dropping that is a follow-up
+    /// once no reader is left.
+    pub packed: Option<crate::render::mesher::PackedMesh>,
     /// r195: echoed world epoch (see MeshRequest::epoch).
     pub epoch: u64,
     /// Version this mesh was generated against.
@@ -159,6 +166,20 @@ pub struct MeshResult {
     /// renderer's `upload_prebuilt_mesh_at_lod` so the slot key
     /// is correct.
     pub lod: crate::world::lod::LodLevel,
+}
+
+
+/// Pack a finished mesh on the producing thread (see `MeshResult::packed`).
+fn pack_result(coord: ChunkCoord, mesh: &ChunkMesh) -> crate::render::mesher::PackedMesh {
+    let (ox, oy, oz) = coord.block_origin();
+    mesh.pack([ox as f32, oy as f32, oz as f32], crate::constants::CHUNK_SIZE as f32)
+}
+
+/// A result carrying an empty mesh (failures, placeholders).
+fn empty_result(coord: ChunkCoord, epoch: u64, version: u64, lod: crate::world::lod::LodLevel) -> MeshResult {
+    let mesh = ChunkMesh { vertices: Vec::new(), indices: Vec::new() };
+    let packed = pack_result(coord, &mesh);
+    MeshResult { coord, mesh, packed: Some(packed), epoch, version, lod }
 }
 
 /// v0.24.21-gpu-mesher-prod: internal handoff from worker thread to
@@ -635,13 +656,7 @@ fn worker_loop(
             // directly and skip the GPU round-trip. Only the trivially-safe
             // uniform-air case is skipped (OctreeArray::is_uniform_air).
             if skip_air_chunks && octree.is_uniform_air() {
-                let _ = res_tx.send(MeshResult {
-                    coord: req.coord,
-                    mesh: ChunkMesh { vertices: Vec::new(), indices: Vec::new() },
-                    epoch: req.epoch,
-                    version: req.version_at_submit,
-                    lod: req.lod,
-                });
+                let _ = res_tx.send(empty_result(req.coord, req.epoch, req.version_at_submit, req.lod));
                 continue;
             }
 
@@ -816,9 +831,11 @@ fn worker_loop(
         let elapsed_us = t0.elapsed().as_micros() as u64;
         mesher_timer.record(req.lod, elapsed_us);
 
+        let packed = pack_result(req.coord, &mesh);
         let result = MeshResult {
             coord: req.coord,
             mesh,
+            packed: Some(packed),
             epoch: req.epoch, // r195
             version: req.version_at_submit,
             lod: req.lod,
@@ -903,13 +920,7 @@ fn gpu_dispatcher_loop(
                 // The renderer's stale-mesh re-request logic will pick
                 // them up again later.
                 for r in &batch {
-                    let _ = res_tx.send(MeshResult {
-                        coord: r.coord,
-                        mesh: ChunkMesh { vertices: Vec::new(), indices: Vec::new() },
-                        epoch: r.epoch, // r195
-                        version: r.version,
-                        lod: r.lod,
-                    });
+                    let _ = res_tx.send(empty_result(r.coord, r.epoch, r.version, r.lod));
                 }
                 continue;
             }
@@ -941,8 +952,9 @@ fn gpu_dispatcher_loop(
                     ChunkMesh { vertices: Vec::new(), indices: Vec::new() }
                 }
             };
+            let packed = pack_result(r.coord, &mesh);
             if res_tx.send(MeshResult {
-                coord: r.coord, mesh,
+                coord: r.coord, mesh, packed: Some(packed),
                 epoch: r.epoch, version: r.version, lod: r.lod, // r195
             }).is_err() {
                 // result channel closed — pool dropping.
@@ -997,63 +1009,64 @@ fn octree_gpu_dispatcher_loop(
     mesher: Arc<crate::render::gpu_meshing_octree::OctreeGpuMesher>,
     mesher_timer: Arc<crate::render::mesher_timer::MesherTimer>,
 ) {
-    use crate::render::gpu_meshing_octree::{OctreeBatchInput, effective_batch_size};
+    use crate::render::gpu_meshing_octree::{OctreeBatchInput, OctreeBatchOutput, MeshTicket, effective_batch_size};
     use crate::world::lod::LodLevel;
 
     let batch_cap = effective_batch_size() as usize;
-    // r476: ADAPTIVE batch sizing. The octree mesh dispatch is a synchronous GPU compute on the
-    // SHARED graphics queue (no distinct compute queue on Asahi: "Compute queue ... graphics handle
-    // reused"), so a slow batch serializes ahead of the render pass and stalls the frame. On the
-    // M2/Asahi the mesher runs ~47ms/CHUNK, so a 4-chunk batch is one ~190ms GPU block that the
-    // render present waits out (observed: mesh_q backed up -> FPS 1-10 while moving). We start at
-    // batch_cap and SHRINK toward 1 when a dispatch overruns a frame budget — smaller dispatches let
-    // rendering interleave between them — and GROW back when dispatches are cheap. Auto-tunes to the
-    // GPU: fast GPUs keep big throughput batches; slow ones pin near 1 to minimize per-stall length.
-    // UNENDLICH_GPU_MESH_ADAPTIVE=0 pins it at batch_cap (the old fixed behavior).
+    // 2026-09-02 ring: the dispatch is SUBMITTED, not waited on. The mesher
+    // keeps `inflight` slots; we poll fences, drain finished batches, and
+    // size the NEXT batch from the mesher's per-chunk GPU-time model so
+    // one dispatch never occupies the queue for more than
+    // `UNENDLICH_GPU_MESH_DISPATCH_US` in front of a frame. This replaces
+    // r476's ±1-per-dispatch adaptation, which needed ~60 dispatches to
+    // come down from 64 and produced the five 450–860 ms spikes after
+    // warmup in the 2026-09-01 desktop report. UNENDLICH_GPU_MESH_ADAPTIVE=0
+    // pins the batch at the slot cap (A/B only).
     let adaptive = std::env::var("UNENDLICH_GPU_MESH_ADAPTIVE")
         .map(|v| v != "0" && !v.is_empty()).unwrap_or(true);
-    let mut cur_batch_target = batch_cap;
-    // r476: all of these are now LEVERS (were hardcoded constants). On Asahi the
-    // octree mesher can run 38-171ms/CHUNK, so the operator needs to tune the
-    // adaptive thresholds and the GPU duty cycle per device without a rebuild.
     let env_u64 = |k: &str, d: u64| std::env::var(k).ok()
         .and_then(|s| s.parse::<u64>().ok()).unwrap_or(d);
-    // Dispatch over SHRINK_US -> shrink the batch (let render interleave);
-    // under GROW_US -> grow it back (throughput when dispatches are cheap).
-    let adapt_shrink_us = env_u64("UNENDLICH_GPU_MESH_SHRINK_US", 33_000);
-    let adapt_grow_us   = env_u64("UNENDLICH_GPU_MESH_GROW_US",   12_000);
+    let inflight_cap = mesher.inflight_capacity().max(1);
+    let slot_cap = mesher.slot_capacity().min(batch_cap).max(1);
+    // Per-dispatch queue-time budget. On a shared graphics queue the frame
+    // can sit behind EVERY in-flight dispatch, so the budget is split by
+    // the ring depth; on a distinct compute queue the frame does not
+    // queue behind us and the budget only limits contention.
+    let dispatch_budget_us = env_u64(
+        "UNENDLICH_GPU_MESH_DISPATCH_US",
+        if mesher.queue_is_async() { 16_000 } else { 3_000 });
+    let per_dispatch_us = if mesher.queue_is_async() { dispatch_budget_us }
+        else { (dispatch_budget_us / inflight_cap as u64).max(200) };
     // Batch accumulation window (ms). Smaller = lower latency / smaller batches.
-    let batch_timeout = Duration::from_millis(
-        env_u64("UNENDLICH_GPU_MESH_TIMEOUT_MS", 8));
-    // DYNAMIC THROTTLE: after each dispatch, sleep dispatch_time * YIELD_PCT/100
-    // so the shared GPU queue is left idle for the render pass. Read LIVE from a
-    // global (settable from the Performance page); seed it from the env var once.
+    let batch_timeout = Duration::from_millis(env_u64("UNENDLICH_GPU_MESH_TIMEOUT_MS", 8));
+    // How often to poll fences while batches are in flight and no request
+    // is waiting.
+    let poll_interval = Duration::from_micros(env_u64("UNENDLICH_GPU_MESH_POLL_US", 500));
+    // DYNAMIC THROTTLE: after each completed dispatch, sleep gpu_time *
+    // YIELD_PCT/100 so a shared queue is left idle for the render pass.
     let yield_seed = env_u64("UNENDLICH_GPU_MESH_YIELD_PCT", 0);
     crate::constants::set_gpu_mesh_yield_pct(yield_seed);
-    // r708: per-FRAME GPU-mesh budget. `yield_pct` is a proportional per-dispatch
-    // sleep (a constant duty ratio), so under a deep queue meshing still eats a lot
-    // of wall time. This instead HARD-CAPS GPU-mesh wall time to `budget_us` per
-    // `window_us` (≈ one render frame): once the dispatcher has spent its budget for
-    // the window it sleeps out the remainder, guaranteeing the render
-    // (window − budget) of GPU time every frame no matter how many chunks are
-    // queued — so a 190-chunk burst spreads across frames instead of monopolising
-    // one and producing the 1071ms spike. Default 0 → disabled (yield_pct still
-    // applies). Set UNENDLICH_GPU_MESH_BUDGET_US=4000 for ~4ms/frame of meshing,
-    // leaving ~12ms/frame for the render at the default 16.67ms window.
-    let mesh_budget_us = env_u64("UNENDLICH_GPU_MESH_BUDGET_US", 4000); // r709: default ON (~4ms/frame)
+    // r708: per-FRAME GPU-mesh budget, now charged from the ring's
+    // overlap-deduplicated GPU time at fence-signal (`take_costs`), not
+    // from the wall time around a blocking call. Once the window's budget
+    // is spent the dispatcher stops SUBMITTING until the window rolls;
+    // batches already in flight finish on their own.
+    let mesh_budget_us = env_u64("UNENDLICH_GPU_MESH_BUDGET_US", 4000);
     let mesh_window_us = env_u64("UNENDLICH_GPU_MESH_WINDOW_US", 16_670).max(1);
     if mesh_budget_us > 0 {
         log::info!(
             "octree-gpu-mesh-dispatcher: per-frame GPU-mesh budget = {}us / {}us window \
-             (UNENDLICH_GPU_MESH_BUDGET_US) — dispatcher yields the GPU to the render once spent",
+             (UNENDLICH_GPU_MESH_BUDGET_US) — dispatcher stops submitting once spent",
             mesh_budget_us, mesh_window_us
         );
     }
     let mut mesh_window_start = Instant::now();
     let mut mesh_window_used_us: u64 = 0;
-    log::info!("octree-gpu-mesh-dispatcher: batch cap = {}, timeout = {:?}, adaptive = {}, \
-                shrink_us = {}, grow_us = {}, yield_pct = {}",
-        batch_cap, batch_timeout, adaptive, adapt_shrink_us, adapt_grow_us, yield_seed);
+    log::info!("octree-gpu-mesh-dispatcher: ring inflight = {}, slot cap = {} (env cap {}), \
+                per-dispatch budget = {}us ({}), timeout = {:?}, adaptive = {}, yield_pct = {}",
+        inflight_cap, slot_cap, batch_cap, per_dispatch_us,
+        if mesher.queue_is_async() { "async compute queue" } else { "shared graphics queue" },
+        batch_timeout, adaptive, yield_seed);
 
     let verify_output = std::env::var("UNENDLICH_OCTREE_MESH_VERIFY")
         .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
@@ -1112,286 +1125,286 @@ fn octree_gpu_dispatcher_loop(
     let mut diag = DiagThrottle::new();
     const DIAG_INTERVAL: Duration = Duration::from_secs(10);
 
-    // v0.24.39-mid-lod: dispatcher now batches by LOD. When a
-    // request arrives with a different LOD than the current batch,
-    // we stash it in `pending` and dispatch the current batch first;
-    // the stashed request becomes the seed of the next batch.
-    //
-    // This preserves the single-LOD invariant the shader needs
-    // (push constants apply to the whole dispatch).
+    // v0.24.39-mid-lod: batches are single-LOD (push constants apply to
+    // the whole dispatch). A request with a different LOD is stashed and
+    // seeds the next batch.
     let mut pending: Option<OctreeGpuMeshRequest> = None;
-    // Reuse batch and inputs vecs across iterations to avoid per-dispatch
-    // heap allocation. At adaptive batch target 1-2 (ARM GPUs), this
-    // eliminates ~2 allocs per dispatch.
-    let mut batch: Vec<OctreeGpuMeshRequest> = Vec::with_capacity(batch_cap);
-    let mut inputs: Vec<OctreeBatchInput> = Vec::with_capacity(batch_cap);
+    // Batches on the GPU, oldest first, with the requests they carry.
+    let mut in_flight: std::collections::VecDeque<(MeshTicket, Vec<OctreeGpuMeshRequest>, LodLevel)> =
+        std::collections::VecDeque::with_capacity(inflight_cap);
+    let mut inputs: Vec<OctreeBatchInput> = Vec::with_capacity(slot_cap);
+    let mut channel_open = true;
+
+    // Finish every batch the mesher hands back: charge the window budget,
+    // feed the per-LOD timer, run fallbacks/decoration, send results.
+    // Returns false when the result channel is closed.
+    let finish = |done: Vec<(MeshTicket, Vec<OctreeBatchOutput>)>,
+                      in_flight: &mut std::collections::VecDeque<(MeshTicket, Vec<OctreeGpuMeshRequest>, LodLevel)>,
+                      diag: &mut DiagThrottle,
+                      mesh_window_used_us: &mut u64| -> bool {
+        let costs = mesher.take_costs();
+        for (k, (ticket, outputs)) in done.into_iter().enumerate() {
+            let Some(pos) = in_flight.iter().position(|(t, _, _)| *t == ticket) else {
+                log::error!("octree-gpu-mesh-dispatcher: mesher returned unknown ticket {:?}", ticket);
+                continue;
+            };
+            let (_, batch, batch_lod) = in_flight.remove(pos).expect("position exists");
+            let cost = costs.get(k).copied().unwrap_or_default();
+            let gpu_us = cost.gpu_exclusive_us;
+            let per_chunk_us = if cost.chunks == 0 { 0 } else { gpu_us / cost.chunks as u64 };
+            // r463 (T1 triage): catch catastrophic mesh hitches.
+            if gpu_us > 100_000 {
+                log::warn!("[mesh-stall] octree dispatch {}ms of queue time for {} chunks ({}us/chunk) — \
+                            investigate this chunk batch", gpu_us / 1000, batch.len(), per_chunk_us);
+            }
+            *mesh_window_used_us = mesh_window_used_us.saturating_add(gpu_us);
+            let yield_pct = crate::constants::gpu_mesh_yield_pct();
+            if yield_pct > 0 {
+                let nap_us = gpu_us.saturating_mul(yield_pct) / 100;
+                if nap_us > 0 { thread::sleep(Duration::from_micros(nap_us)); }
+            }
+            for _ in &batch {
+                mesher_timer.record(batch_lod, per_chunk_us);
+            }
+            diag.accum_batches += 1;
+            diag.accum_chunks += batch.len() as u32;
+            if !finish_octree_batch(
+                &batch, outputs, &res_tx, diag,
+                verify_output, gpu_decorate, gpu_overflow_fallback,
+            ) {
+                return false;
+            }
+        }
+        true
+    };
 
     loop {
-        let first = match pending.take() {
-            Some(r) => r,
-            None => match rx.recv() {
-                Ok(r) => r,
-                Err(_) => {
-                    log::info!("octree-gpu-mesh-dispatcher: channel closed, exiting");
-                    return;
-                }
-            },
-        };
-        let batch_lod = first.lod;
-        let batch_lod_stride: u32 = match batch_lod {
-            LodLevel::Near    => 1,
-            LodLevel::Mid     => 2,
-            LodLevel::Far     => 4,
-            LodLevel::VeryFar => 8,
-        };
-        let batch_start = Instant::now();
-        batch.clear();
-        batch.push(first);
-
-        while batch.len() < cur_batch_target {
-            let elapsed = batch_start.elapsed();
-            if elapsed >= batch_timeout { break; }
-            let remaining = batch_timeout - elapsed;
-            match rx.recv_timeout(remaining) {
-                Ok(r) if r.lod == batch_lod => batch.push(r),
-                Ok(r) => {
-                    // Different LOD — stash and flush current batch.
-                    pending = Some(r);
-                    break;
-                }
-                Err(_) => break,
+        // 1. Drain what has finished — non-blocking.
+        match mesher.poll() {
+            Ok(done) if !done.is_empty() => {
+                if !finish(done, &mut in_flight, &mut diag, &mut mesh_window_used_us) { return; }
             }
+            Ok(_) => {}
+            Err(e) => log::error!("octree-gpu-mesh-dispatcher: poll failed: {}", e),
         }
 
-        // Build inputs by cloning the Arc<OctreeArray> handles —
-        // cheap (atomic refcount), and the OctreeGpuMesher's batch
-        // API takes ownership of each input's Arc clone.
-        // v0.24.31-version-tracked: include the chunk's content
-        // version so the pool can short-circuit redundant uploads.
-        // v0.24.33-climate-tint: include per-chunk temperature and
-        // humidity for shader-side color modulation.
-        inputs.clear();
-        inputs.extend(batch.iter().map(|r| OctreeBatchInput {
-            coord: r.coord,
-            octree: Arc::clone(&r.octree),
-            version: r.version,
-            temperature: r.temperature,
-            humidity: r.humidity,
-        }));
-
-        let t0 = Instant::now();
-        let outputs = match mesher.mesh_chunks_batch(&inputs, batch_lod_stride) {
-            Ok(o) => o,
-            Err(e) => {
-                log::error!("octree-gpu-mesh-dispatcher: batch dispatch failed: {} (batch_size={})",
-                    e, batch.len());
-                for r in &batch {
-                    let _ = res_tx.send(MeshResult {
-                        coord: r.coord,
-                        mesh: ChunkMesh { vertices: Vec::new(), indices: Vec::new() },
-                        epoch: r.epoch, // r195
-                        version: r.version,
-                        lod: r.lod,
-                    });
-                }
-                continue;
-            }
-        };
-        let dispatch_us = t0.elapsed().as_micros() as u64;
-
-        let per_chunk_us = if batch.is_empty() { 0 } else { dispatch_us / batch.len() as u64 };
-        // r463 (T1 triage): catch the catastrophic mesh hitches seen in log-r462 (near max=889ms).
-        if dispatch_us > 100_000 {
-            log::warn!("[mesh-stall] octree dispatch {}ms for {} chunks ({}us/chunk) — investigate this chunk batch", dispatch_us / 1000, batch.len(), per_chunk_us);
-        }
-        // r476: adapt the batch target so one dispatch can't stall the render frame for long. The
-        // dispatch is synchronous on the shared graphics queue, so its wall time blocks the next
-        // render present. Shrink when a dispatch overruns the frame budget (rendering interleaves
-        // between shorter dispatches); grow when dispatches are cheap. Heavy streaming batches
-        // (>33ms) pin this toward 1; light mostly-air batches (<12ms) grow it back toward batch_cap.
-        if adaptive {
-            let prev = cur_batch_target;
-            if dispatch_us > adapt_shrink_us && cur_batch_target > 1 {
-                cur_batch_target -= 1;
-            } else if dispatch_us < adapt_grow_us && cur_batch_target < batch_cap {
-                cur_batch_target += 1;
-            }
-            if cur_batch_target != prev {
-                log::debug!("octree-gpu-mesh-dispatcher: adaptive batch {} -> {} (last dispatch {}ms)",
-                    prev, cur_batch_target, dispatch_us / 1000);
-            }
-        }
-        // r476: dynamic GPU-duty throttle. The dispatch monopolized the shared
-        // graphics queue for `dispatch_us`; sleeping a fraction of that here
-        // leaves the queue idle so the render pass can land a frame, trading
-        // chunk pop-in speed for playable FPS while streaming. yield_pct=100
-        // => sleep == dispatch time (~50% mesh duty). Default 0 = no throttle.
-        let yield_pct = crate::constants::gpu_mesh_yield_pct();
-        if yield_pct > 0 {
-            let nap_us = dispatch_us.saturating_mul(yield_pct) / 100;
-            if nap_us > 0 {
-                thread::sleep(Duration::from_micros(nap_us));
-            }
-        }
-        // r708: per-frame GPU-mesh budget — once this window's meshing budget is
-        // spent, sleep out the rest of the window so the render owns the GPU for
-        // the remainder of the frame. The window resets either when it elapses
-        // naturally or right after a budget-triggered yield.
+        // 2. Window budget. Spent → do not submit until the window rolls;
+        //    keep polling so in-flight batches still land.
+        let mut budget_open = true;
         if mesh_budget_us > 0 {
-            mesh_window_used_us = mesh_window_used_us.saturating_add(dispatch_us);
             let win_elapsed = mesh_window_start.elapsed().as_micros() as u64;
             if win_elapsed >= mesh_window_us {
                 mesh_window_start = Instant::now();
                 mesh_window_used_us = 0;
             } else if mesh_window_used_us >= mesh_budget_us {
-                thread::sleep(Duration::from_micros(mesh_window_us - win_elapsed));
-                mesh_window_start = Instant::now();
-                mesh_window_used_us = 0;
-            }
-        }
-        for _ in &batch {
-            mesher_timer.record(LodLevel::Near, per_chunk_us);
-        }
-        // every DIAG_INTERVAL. Output-sanity check (if enabled)
-        // still runs every batch — only the LOG is throttled.
-        diag.accum_batches += 1;
-        diag.accum_chunks += batch.len() as u32;
-
-        for (r, o) in batch.iter().zip(outputs.iter()) {
-            if let Ok(m) = &o.mesh {
-                let vc = m.vertices.len() as u32;
-                if vc == 0 {
-                    diag.accum_empty += 1;
-                } else {
-                    diag.accum_nonempty += 1;
-                    diag.accum_total_verts += vc as u64;
-                    if vc > diag.accum_max_verts { diag.accum_max_verts = vc; }
-                }
-                if verify_output {
-                    if let Err(msg) =
-                        crate::render::gpu_meshing_octree_cpu_ref::check_mesh_invariants(m, r.coord)
-                    {
-                        diag.accum_invariant_violations += 1;
-                        diag.last_violation = Some(format!("coord={:?}: {}", r.coord, msg));
-                    }
-                }
+                budget_open = false;
             }
         }
 
+        // 3. Diag line.
         if diag.last_log.elapsed() >= DIAG_INTERVAL {
+            let (ema, samples) = mesher.per_chunk_estimate_us();
             let avg = if diag.accum_nonempty > 0 {
                 diag.accum_total_verts / diag.accum_nonempty as u64
             } else { 0 };
             log::info!(
                 "octree-mesher: {} batches / {} chunks in last {}s: empty={} nonempty={} \
-                 avg_verts={} max_verts={}{}",
-                diag.accum_batches, diag.accum_chunks,
-                DIAG_INTERVAL.as_secs(),
-                diag.accum_empty, diag.accum_nonempty,
-                avg, diag.accum_max_verts,
+                 avg_verts={} max_verts={} per_chunk_gpu={:.0}us ({} samples) in_flight={}{}",
+                diag.accum_batches, diag.accum_chunks, DIAG_INTERVAL.as_secs(),
+                diag.accum_empty, diag.accum_nonempty, avg, diag.accum_max_verts,
+                ema, samples, in_flight.len(),
                 if verify_output {
                     format!(" invariant_violations={}", diag.accum_invariant_violations)
                 } else { String::new() },
             );
             if verify_output && diag.accum_invariant_violations > 0 {
-                log::warn!(
-                    "octree-mesher: {} mesh-invariant violations in last {}s. \
-                     Latest: {}",
-                    diag.accum_invariant_violations,
-                    DIAG_INTERVAL.as_secs(),
-                    diag.last_violation.as_deref().unwrap_or("(none)"),
-                );
+                log::warn!("octree-mesher: {} mesh-invariant violations in last {}s. Latest: {}",
+                    diag.accum_invariant_violations, DIAG_INTERVAL.as_secs(),
+                    diag.last_violation.as_deref().unwrap_or("(none)"));
             }
             diag = DiagThrottle::new();
         }
 
-        for (r, o) in batch.iter().zip(outputs.into_iter()) {
-            let (mut mesh, run_gpu_decorate) = match o.mesh {
-                Ok(m) => (m, true),
-                Err(e) => {
-                    // v0.24.NEXT+9-overflow-fix: the GPU octree mesher
-                    // overflowed its fixed per-chunk buffers (dense foliage
-                    // chunks — leaves don't merge, so vertex/index counts
-                    // explode). Emitting an empty mesh leaves a visible
-                    // HOLE. Instead, re-mesh this one chunk on the CPU
-                    // greedy mesher, which has no fixed cap. The chunk is
-                    // already threaded in (for decoration), so this is a
-                    // direct call. `mesh_chunk_greedy` produces a complete
-                    // mesh (solid faces + grass/water/lava decoration baked
-                    // in), so we DON'T run the extra decoration pass below
-                    // for the fallback.
-                    //
-                    // v0.24.NEXT-stripe-fix: feed the request's world_model so
-                    // the fallback bakes the SAME climate tint as a normal CPU
-                    // mesh (mesh_chunk_greedy samples temperature/humidity per
-                    // face from it). The GPU request now carries world_model
-                    // (added alongside the per-chunk temperature/humidity it was
-                    // already computing). Previously this passed None,None ->
-                    // an untinted band next to tinted GPU neighbours = the
-                    // stripe (docs/MEMORY-PRESSURE.md). Sky stays None for now
-                    // (neutral lighting; the GPU request has no Sky and the CPU
-                    // tint is the dominant visual diff) — a follow-up if needed.
-                    // Default on; UNENDLICH_GPU_OVERFLOW_FALLBACK=0 restores the
-                    // old empty-on-overflow behaviour for A/B.
-                    if gpu_overflow_fallback {
-                        GPU_OOM_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
-                        log::warn!(
-                            "octree-gpu-mesh-dispatcher: chunk {:?} overflowed GPU mesher \
-                             ({}); CPU-fallback meshing to avoid a hole", r.coord, e);
-                        let m = crate::render::mesher::mesh_chunk_greedy(
-                            &r.chunk, None, r.world_model.as_ref(), r.current_tick);
-                        (m, false)
-                    } else {
-                        log::warn!("octree-gpu-mesh-dispatcher: chunk {:?} failed: {}", r.coord, e);
-                        (ChunkMesh { vertices: Vec::new(), indices: Vec::new() }, false)
-                    }
-                }
-            };
-
-            // v0.24.NEXT+2-gpu-decorate: append the CPU-only post-passes
-            // the GPU mesher doesn't emit. Gated on `run_gpu_decorate`
-            // (true only for successful GPU meshes — the CPU fallback
-            // above already includes decoration, so we must not double it).
-            // An all-water "ocean surface" chunk has an empty solid mesh
-            // but should still get water tops, so we run the passes on
-            // empty-but-valid GPU meshes too. decorate_chunk iterates only
-            // the chunk's plant index, so non-plant chunks add ~zero cost.
-            // Sky is passed as None (neutral lighting on decoration);
-            // threading the per-chunk Sky is a follow-up once `Sky`'s
-            // Clone-ability is confirmed (sky.rs not in scope here).
-            // Coordinates match: both the GPU mesher and these passes emit
-            // world-space vertices offset by block_origin().
-            // r496/r505: gate the expensive sub-voxel decoration (dense stringy leaves,
-            // grass tufts) to the NEAREST tier only. r496 made leaves ~3-4× denser, which
-            // inflates chunk mesh size; bigger meshes feed the M2 upload-pressure stall
-            // (HOST_COHERENT memcpy → GPU cache-invalidation, the documented chug). r497
-            // gated Far/VeryFar off; r505 also drops Mid (its fine foliage is small at that
-            // distance) so near forests keep the full dense look while mid-distance chunks
-            // stay light on the upload path. Water + lava surfaces still emit at all tiers.
-            // Revert to `<= Mid` for more foliage distance at the cost of bigger mid uploads.
-            let decorate_lod_ok = r.lod == crate::world::lod::LodLevel::Near;
-            if gpu_decorate && run_gpu_decorate {
-                let (ox, oy, oz) = r.coord.block_origin();
-                let origin = [ox, oy, oz];
-                if decorate_lod_ok {
-                    crate::render::mesher::decorate_chunk(
-                        &r.chunk, &mut mesh, origin, Some(&r.sky), r.current_tick);
-                }
-                crate::render::mesher::emit_water_surface(
-                    &r.chunk, &mut mesh, origin, Some(&r.sky));
-                crate::render::mesher::emit_lava_surface(
-                    &r.chunk, &mut mesh, origin, Some(&r.sky));
-            }
-
-            if res_tx.send(MeshResult {
-                coord: r.coord, mesh,
-                epoch: r.epoch, version: r.version, lod: r.lod, // r195
-            }).is_err() {
-                log::info!("octree-gpu-mesh-dispatcher: result channel closed, exiting");
+        // 4. Exit when the request channel is closed and nothing is left.
+        if !channel_open {
+            if in_flight.is_empty() && pending.is_none() {
+                log::info!("octree-gpu-mesh-dispatcher: channel closed, exiting");
                 return;
             }
         }
+
+        // 5. Gather a batch. Block only when nothing is in flight and the
+        //    budget is open; otherwise poll with a short timeout so fences
+        //    keep getting checked.
+        let can_take_more = budget_open && mesher.can_submit() && (channel_open || pending.is_some());
+        let first = match pending.take_if(|_| can_take_more) {
+            Some(r) => Some(r),
+            None if !can_take_more => {
+                if in_flight.is_empty() && !budget_open {
+                    // Nothing running, budget spent: sleep out the window.
+                    let win_elapsed = mesh_window_start.elapsed().as_micros() as u64;
+                    thread::sleep(Duration::from_micros(mesh_window_us.saturating_sub(win_elapsed).max(100)));
+                } else if !mesher.can_submit() && channel_open {
+                    // Ring full: bounded wait on the oldest — the backpressure.
+                    match mesher.wait_oldest(Duration::from_millis(50)) {
+                        Ok(done) if !done.is_empty() => {
+                            if !finish(done, &mut in_flight, &mut diag, &mut mesh_window_used_us) { return; }
+                        }
+                        Ok(_) => {}
+                        Err(e) => log::error!("octree-gpu-mesh-dispatcher: wait_oldest failed: {}", e),
+                    }
+                } else {
+                    thread::sleep(poll_interval);
+                }
+                continue;
+            }
+            None if in_flight.is_empty() => match rx.recv() {
+                Ok(r) => Some(r),
+                // A blocking recv fails only when every sender is gone.
+                Err(_) => { channel_open = false; continue; }
+            },
+            None => match rx.recv_timeout(poll_interval) {
+                Ok(r) => Some(r),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => { channel_open = false; None }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => None,
+            },
+        };
+        let Some(first) = first else { continue; };
+
+        let batch_lod = first.lod;
+        let batch_lod_stride: u32 = match batch_lod {
+            LodLevel::Near => 1, LodLevel::Mid => 2, LodLevel::Far => 4, LodLevel::VeryFar => 8,
+        };
+        let target = if adaptive { mesher.suggested_batch(per_dispatch_us).min(slot_cap) } else { slot_cap };
+        let batch_start = Instant::now();
+        let mut batch: Vec<OctreeGpuMeshRequest> = Vec::with_capacity(target);
+        batch.push(first);
+        while batch.len() < target {
+            let elapsed = batch_start.elapsed();
+            if elapsed >= batch_timeout { break; }
+            match rx.recv_timeout(batch_timeout - elapsed) {
+                Ok(r) if r.lod == batch_lod => batch.push(r),
+                Ok(r) => { pending = Some(r); break; }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => { channel_open = false; break; }
+                Err(_) => break,
+            }
+        }
+
+        inputs.clear();
+        inputs.extend(batch.iter().map(|r| OctreeBatchInput {
+            coord: r.coord,
+            octree: Arc::clone(&r.octree),
+            version: r.version,
+            temperature: if neutral_tint { 0.5 } else { r.temperature },
+            humidity: if neutral_tint { 0.5 } else { r.humidity },
+        }));
+
+        // 6. Submit. `Busy` should not happen (we checked can_submit) but
+        //    a bounded wait handles it; any other error fails the batch.
+        let mut submitted = mesher.submit_batch(&inputs, batch_lod_stride);
+        if matches!(submitted, Err(crate::render::gpu_meshing_octree::OctreeMeshError::Busy)) {
+            match mesher.wait_oldest(Duration::from_millis(100)) {
+                Ok(done) => { if !finish(done, &mut in_flight, &mut diag, &mut mesh_window_used_us) { return; } }
+                Err(e) => log::error!("octree-gpu-mesh-dispatcher: wait_oldest failed: {}", e),
+            }
+            submitted = mesher.submit_batch(&inputs, batch_lod_stride);
+        }
+        match submitted {
+            Ok(ticket) => in_flight.push_back((ticket, batch, batch_lod)),
+            Err(e) => {
+                log::error!("octree-gpu-mesh-dispatcher: batch submit failed: {} (batch_size={})",
+                    e, batch.len());
+                for r in &batch {
+                    if res_tx.send(empty_result(r.coord, r.epoch, r.version, r.lod)).is_err() {
+                        log::info!("octree-gpu-mesh-dispatcher: result channel closed, exiting");
+                        return;
+                    }
+                }
+            }
+        }
     }
+}
+
+/// Post-process one finished GPU batch: overflow → CPU fallback (default
+/// on), optional CPU decoration passes, invariant check, send. Returns
+/// false when the result channel is closed.
+fn finish_octree_batch(
+    batch: &[OctreeGpuMeshRequest],
+    outputs: Vec<crate::render::gpu_meshing_octree::OctreeBatchOutput>,
+    res_tx: &Sender<MeshResult>,
+    diag: &mut DiagThrottle,
+    verify_output: bool,
+    gpu_decorate: bool,
+    gpu_overflow_fallback: bool,
+) -> bool {
+    for (r, o) in batch.iter().zip(outputs.into_iter()) {
+        if let Ok(m) = &o.mesh {
+            let vc = m.vertices.len() as u32;
+            if vc == 0 {
+                diag.accum_empty += 1;
+            } else {
+                diag.accum_nonempty += 1;
+                diag.accum_total_verts += vc as u64;
+                if vc > diag.accum_max_verts { diag.accum_max_verts = vc; }
+            }
+            if verify_output {
+                if let Err(msg) =
+                    crate::render::gpu_meshing_octree_cpu_ref::check_mesh_invariants(m, r.coord)
+                {
+                    diag.accum_invariant_violations += 1;
+                    diag.last_violation = Some(format!("coord={:?}: {}", r.coord, msg));
+                }
+            }
+        }
+        let (mut mesh, run_gpu_decorate) = match o.mesh {
+            Ok(m) => (m, true),
+            Err(e) => {
+                // v0.24.NEXT+9-overflow-fix: the GPU octree mesher overflowed its
+                // fixed per-chunk buffers (dense foliage). Re-mesh on the CPU
+                // greedy mesher (no fixed cap) instead of leaving a hole; the
+                // fallback bakes the same climate tint from world_model
+                // (v0.24.NEXT-stripe-fix) and includes decoration, so the
+                // decoration pass below is skipped for it.
+                if gpu_overflow_fallback {
+                    GPU_OOM_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+                    log::warn!(
+                        "octree-gpu-mesh-dispatcher: chunk {:?} overflowed GPU mesher \
+                         ({}); CPU-fallback meshing to avoid a hole", r.coord, e);
+                    let m = crate::render::mesher::mesh_chunk_greedy(
+                        &r.chunk, None, r.world_model.as_ref(), r.current_tick);
+                    (m, false)
+                } else {
+                    log::warn!("octree-gpu-mesh-dispatcher: chunk {:?} failed: {}", r.coord, e);
+                    (ChunkMesh { vertices: Vec::new(), indices: Vec::new() }, false)
+                }
+            }
+        };
+
+        // v0.24.NEXT+2-gpu-decorate: CPU-only post-passes the GPU mesher
+        // doesn't emit (grass tufts, water, lava). r496/r505: sub-voxel
+        // decoration only for the nearest tier; water/lava at every tier.
+        let decorate_lod_ok = r.lod == crate::world::lod::LodLevel::Near;
+        if gpu_decorate && run_gpu_decorate {
+            let (ox, oy, oz) = r.coord.block_origin();
+            let origin = [ox, oy, oz];
+            if decorate_lod_ok {
+                crate::render::mesher::decorate_chunk(
+                    &r.chunk, &mut mesh, origin, Some(&r.sky), r.current_tick);
+            }
+            crate::render::mesher::emit_water_surface(&r.chunk, &mut mesh, origin, Some(&r.sky));
+            crate::render::mesher::emit_lava_surface(&r.chunk, &mut mesh, origin, Some(&r.sky));
+        }
+
+        let packed = pack_result(r.coord, &mesh);
+        if res_tx.send(MeshResult {
+            coord: r.coord, mesh, packed: Some(packed),
+            epoch: r.epoch, version: r.version, lod: r.lod, // r195
+        }).is_err() {
+            log::info!("octree-gpu-mesh-dispatcher: result channel closed, exiting");
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]

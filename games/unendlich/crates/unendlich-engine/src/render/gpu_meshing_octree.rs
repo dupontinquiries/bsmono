@@ -72,6 +72,24 @@ const CELLS_PER_CHUNK: u32 = 32 * 32 * 32;
 const WORKGROUPS_PER_CHUNK_X: u32 = CELLS_PER_CHUNK / WORKGROUP_SIZE;
 const _: () = assert!(CELLS_PER_CHUNK % WORKGROUP_SIZE == 0);
 
+/// One vertex as `chunk_mesh_octree.comp` writes it: 3 floats position
+/// (world space), 3 floats color. This is the wire format between the
+/// shader and the host and it is pinned at 24 bytes; `mesher::Vertex`
+/// is the CPU type and may grow fields (it did: `sway`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GpuWireVertex {
+    pub position: [f32; 3],
+    pub color: [f32; 3],
+}
+const _: [(); 24] = [(); std::mem::size_of::<GpuWireVertex>()];
+impl GpuWireVertex {
+    #[inline]
+    pub fn to_vertex(self) -> crate::render::mesher::Vertex {
+        crate::render::mesher::Vertex::new(self.position, self.color)
+    }
+}
+
 /// Per-chunk vertex slot capacity. Matches sparse mesher; large
 /// enough that fully-dense surface chunks fit comfortably (typical
 /// surface: 15-30K vertices; pathological worst case observed at
@@ -174,6 +192,11 @@ pub enum OctreeMeshError {
     Overflow { vertex_count: u32, index_count: u32 },
     TooManyNodes(usize),
     NoSuitableMemoryType,
+    /// Every ring slot is in flight; `poll`/`wait_oldest` first.
+    Busy,
+    EmptyBatch,
+    BatchTooLarge { got: usize, cap: usize },
+    UnknownTicket(u64),
 }
 impl From<vk::Result> for OctreeMeshError { fn from(r: vk::Result) -> Self { Self::Vulkan(r) } }
 impl From<std::io::Error> for OctreeMeshError { fn from(e: std::io::Error) -> Self { Self::Io(e) } }
@@ -188,6 +211,11 @@ impl std::fmt::Display for OctreeMeshError {
             Self::TooManyNodes(n) =>
                 write!(f, "octree has too many nodes: {} (max {})", n, MAX_NODES_PER_CHUNK),
             Self::NoSuitableMemoryType => write!(f, "no host-visible memory type"),
+            Self::Busy => write!(f, "every mesh ring slot is in flight"),
+            Self::EmptyBatch => write!(f, "empty mesh batch"),
+            Self::BatchTooLarge { got, cap } =>
+                write!(f, "mesh batch of {} exceeds slot capacity {}", got, cap),
+            Self::UnknownTicket(t) => write!(f, "mesh ticket {} is not in flight", t),
         }
     }
 }
@@ -261,6 +289,98 @@ struct PushConstants {
 }
 const _: [(); 24] = [(); std::mem::size_of::<PushConstants>()];
 
+/// Chunks per dispatch slot for a ring of `inflight` slots. The output
+/// buffers are sized ONCE at `MAX_BATCH_CHUNKS` and partitioned between
+/// the slots, so memory is constant whatever the ring depth (218 MB of
+/// host-visible output at 64 chunks; a per-slot copy would be N× that on
+/// unified memory). A deeper ring therefore means smaller dispatches —
+/// which is what the single-queue hitch wants anyway.
+pub fn slot_chunks_for(inflight: usize) -> usize {
+    (MAX_BATCH_CHUNKS as usize / inflight.max(1)).max(1)
+}
+
+/// `UNENDLICH_GPU_MESH_INFLIGHT` — how many mesh dispatches may be on the
+/// queue at once. 1 is the old synchronous shape (submit → wait → read).
+/// Default 2: one running while the next is uploaded and recorded.
+pub const DEFAULT_INFLIGHT: usize = 2;
+pub fn inflight_from_env() -> usize {
+    std::env::var("UNENDLICH_GPU_MESH_INFLIGHT").ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.clamp(1, MAX_BATCH_CHUNKS as usize))
+        .unwrap_or(DEFAULT_INFLIGHT)
+}
+
+/// Storage-buffer descriptor offsets must satisfy
+/// `minStorageBufferOffsetAlignment`, which the spec caps at 256. The
+/// slot's chunk-meta region is aligned to that so the per-slot descriptor
+/// write is legal on every driver without querying.
+const META_REGION_ALIGN: u64 = 256;
+
+fn meta_region_stride(slot_chunks: usize) -> u64 {
+    let raw = slot_chunks as u64 * std::mem::size_of::<ChunkMetaGpu>() as u64;
+    (raw + META_REGION_ALIGN - 1) / META_REGION_ALIGN * META_REGION_ALIGN
+}
+
+/// Names one submitted mesh batch. Returned by `submit_batch`, handed back
+/// by `poll` / `wait_oldest` / `collect` with that batch's outputs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct MeshTicket(u64);
+
+/// What the caller learns about a finished dispatch besides its meshes:
+/// how long it held the queue (exclusive, overlap-deduplicated — see
+/// `DispatchRing::complete`) and how many chunks it carried. The
+/// dispatcher's budget and batch sizer are fed from this, never from the
+/// wall time around a blocking call.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DispatchCost {
+    pub gpu_exclusive_us: u64,
+    pub chunks: u32,
+}
+
+/// One batch in flight: the pre-screened output placeholders (readback
+/// fills the active ones), and which positions are active.
+struct PendingBatch {
+    outputs: Vec<OctreeBatchOutput>,
+    active: Vec<usize>,
+    ticket: u64,
+}
+
+/// Vulkan resources of one ring slot. Owned per slot so two dispatches in
+/// flight never share a command buffer, a fence, or an output region.
+struct SlotVk {
+    command_buffer: vk::CommandBuffer,
+    fence: vk::Fence,
+    /// Same bindings as every other slot except binding 4 (chunk_metas),
+    /// which points at THIS slot's region so the shader's
+    /// `chunk_metas[gl_WorkGroupID.y]` stays zero-based per dispatch.
+    descriptor_set: vk::DescriptorSet,
+    pending: Option<PendingBatch>,
+}
+
+struct RingVk {
+    /// Lifecycle + GPU-time accounting (`render::mesh_dispatch_ring`).
+    lifecycle: crate::render::mesh_dispatch_ring::DispatchRing,
+    slots: Vec<SlotVk>,
+    /// Wall clock the ring's `u64` microseconds are measured from.
+    epoch: std::time::Instant,
+    next_ticket: u64,
+    /// Per-chunk GPU cost model, µs, exponential moving average of the
+    /// exclusive dispatch time divided by its chunk count. Starts at a
+    /// conservative prior so the first dispatch on an unknown driver is
+    /// small; converges within a few dispatches.
+    per_chunk_ema_us: f64,
+    samples: u64,
+    /// Costs of dispatches completed since the last `take_costs`.
+    costs: Vec<DispatchCost>,
+}
+
+/// Prior per-chunk cost before any measurement. 2 ms is roughly what the
+/// Honeykrisp report implies per chunk at the low end (8–15 ms measured;
+/// the prior errs small so a fast driver ramps up in two or three
+/// dispatches rather than one slow driver hitching on the first).
+const PER_CHUNK_PRIOR_US: f64 = 2_000.0;
+const EMA_ALPHA: f64 = 0.35;
+
 /// Octree-driven GPU mesher. Mirrors `SparseGpuMesher` shape but
 /// for octree input. Both mesher kinds can coexist on the same
 /// VulkanContext; each owns its own buffers + pipeline.
@@ -272,12 +392,38 @@ const _: [(); 24] = [(); std::mem::size_of::<PushConstants>()];
 /// "unverified consumer buffer" class of bug that v0.24.27 spent
 /// three sub-ships chasing.
 ///
-/// The mesher's `mesh_chunks_one_submission` locks the pool for
-/// the duration of upload + dispatch + readback (~1 ms per batch).
-/// Main-thread per-chunk uploads (~10 µs each) contend on this
-/// lock; expected wait is ~30 µs per upload at steady state.
-/// Acceptable for foundation. A deferred-free pattern that lets
-/// dispatch happen lock-free is filed as a follow-up.
+/// ## The ring (2026-09-02)
+///
+/// The perfbisect desktop report (docs/claude-notes/
+/// perfbisect-desktop-findings.md) showed the frame's main pass queued
+/// behind a 64-chunk mesh dispatch on the one graphics queue for
+/// 0.5–1.6 s on Honeykrisp. Two things fix that and both live here:
+///
+/// 1. **Dispatches are submitted, not waited on.** `submit_batch` uploads
+///    and pins the batch's octree spans under the pool lock, drops the
+///    lock, records into a free slot and submits. `poll` returns finished
+///    batches without blocking; `wait_oldest` bounds the wait when every
+///    slot is busy. The pure lifecycle is
+///    `render::mesh_dispatch_ring::DispatchRing`; this type attaches the
+///    `vk::Fence`/`vk::CommandBuffer`/output regions to its slot indices.
+///    Pinning is no longer optional: a mutex cannot be held across an
+///    asynchronous dispatch, so every span a dispatch reads is pinned
+///    from submit to completion and freed by the ledger after.
+///    `UNENDLICH_GPU_POOL_PIN` and `UNENDLICH_GPU_POOL_EARLY_UNLOCK` are
+///    therefore gone from this module (the lock-held mode they toggled
+///    no longer exists).
+/// 2. **The queue is the compute queue when the context has a distinct
+///    one** (`VulkanContext::compute_queue_is_distinct`). On a device with
+///    a dedicated COMPUTE family the frame never queues behind a mesh
+///    dispatch at all. On a single-family device the mesher stays on the
+///    graphics queue and the *batch sizer* bounds the hitch: each
+///    completed dispatch updates a per-chunk GPU-time model, and
+///    `suggested_batch(budget_us)` answers how many chunks fit in the
+///    time the dispatcher is willing to put in front of a frame.
+///
+/// `mesh_chunks_batch` keeps its blocking contract (submit + collect per
+/// window of `slot_capacity()` chunks) so `gpu-mesh-bench` and the
+/// parity tests are unchanged.
 pub struct OctreeGpuMesher {
     /// v0.24.30-shared-octree: handle to the renderer's pool.
     /// Used for upload + slot lookup during `mesh_chunks_*`. The
@@ -287,10 +433,8 @@ pub struct OctreeGpuMesher {
     octree_pool: Arc<Mutex<crate::render::octree_buffer::OctreeBufferPool>>,
     /// Stable buffer handle captured at construction. The pool
     /// never reallocates its buffer over its lifetime, so this
-    /// handle is valid as long as `octree_pool` is alive. We
-    /// cache it here so the descriptor set wire-up at construction
-    /// (and any future descriptor updates) can access it without
-    /// locking.
+    /// handle is valid as long as `octree_pool` is alive.
+    #[allow(dead_code)]
     octree_pool_buffer: vk::Buffer,
 
     chunk_metas_buffer: vk::Buffer,
@@ -313,36 +457,64 @@ pub struct OctreeGpuMesher {
     pipeline_layout: vk::PipelineLayout,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
 
     command_pool: vk::CommandPool,
-    command_buffer: vk::CommandBuffer,
-    fence: vk::Fence,
-
-    submit_lock: Mutex<()>,
-    queue_submit_lock: Arc<Mutex<()>>,
+    ring: Mutex<RingVk>,
+    /// Chunks one dispatch slot can carry (`MAX_BATCH_CHUNKS / inflight`).
+    slot_chunks: usize,
+    meta_stride: u64,
 
     queue: vk::Queue,
+    /// True when `queue` is not the graphics queue: the frame does not
+    /// queue behind our dispatches, so the dispatcher may use a larger
+    /// per-dispatch budget.
+    queue_is_async: bool,
+    queue_submit_lock: Arc<Mutex<()>>,
     device: Device,
 }
 
-// SAFETY: persistent maps are HOST_COHERENT; all access via submit_lock.
+// SAFETY: persistent maps are HOST_COHERENT; every touch of a slot's
+// region happens under the `ring` mutex, and a slot's region is only
+// read by the host after its fence has signaled.
 unsafe impl Send for OctreeGpuMesher {}
 unsafe impl Sync for OctreeGpuMesher {}
 
 impl OctreeGpuMesher {
     /// v0.24.30-shared-octree: construct with a handle to the
     /// renderer's `OctreeBufferPool`. The pool's buffer is bound
-    /// to the mesher's compute descriptor set; subsequent
-    /// dispatches read from there. The mesher no longer owns
-    /// its own octree storage.
+    /// to every slot's compute descriptor set; dispatches read from
+    /// there. The mesher owns no octree storage.
+    ///
+    /// Ring depth is `inflight_from_env()`; use `with_inflight` to pin it
+    /// (benches, tests).
     pub fn new(
         ctx: &VulkanContext,
         octree_pool: Arc<Mutex<crate::render::octree_buffer::OctreeBufferPool>>,
     ) -> Result<Self> {
+        Self::with_inflight(ctx, octree_pool, inflight_from_env())
+    }
+
+    pub fn with_inflight(
+        ctx: &VulkanContext,
+        octree_pool: Arc<Mutex<crate::render::octree_buffer::OctreeBufferPool>>,
+        inflight: usize,
+    ) -> Result<Self> {
+        let inflight = inflight.clamp(1, MAX_BATCH_CHUNKS as usize);
+        let slot_chunks = slot_chunks_for(inflight);
+        let meta_stride = meta_region_stride(slot_chunks);
         let device = ctx.device.clone();
-        let queue = ctx.graphics_queue;
         let queue_submit_lock = ctx.queue_submit_lock.clone();
+
+        // The queue. A distinct compute queue means the frame's main pass
+        // never sits behind a mesh dispatch; on a one-queue device we are
+        // on the graphics queue and the dispatcher's batch sizer is what
+        // bounds the hitch. Reported at info so a perfbisect run can tell
+        // which world it measured.
+        let (queue, queue_family, queue_is_async) = if ctx.compute_queue_is_distinct {
+            (ctx.compute_queue, ctx.compute_queue_family, true)
+        } else {
+            (ctx.graphics_queue, ctx.graphics_queue_family, false)
+        };
 
         // Capture the pool's buffer handle under a short lock.
         // The handle is stable for the pool's lifetime.
@@ -352,12 +524,9 @@ impl OctreeGpuMesher {
         };
 
         unsafe {
-            // 1. Allocate per-batch buffers (no longer including
-            //    the octree buffer — that comes from the shared
-            //    pool now).
-
-            let chunk_metas_bytes = (MAX_BATCH_CHUNKS as u64)
-                * (std::mem::size_of::<ChunkMetaGpu>() as u64);
+            // 1. Output buffers, sized once at MAX_BATCH_CHUNKS and
+            //    partitioned between the slots.
+            let chunk_metas_bytes = inflight as u64 * meta_stride;
             let (chunk_metas_buffer, chunk_metas_memory, chunk_metas_ptr) =
                 create_host_visible_storage(&device, &ctx.instance, ctx.physical_device, chunk_metas_bytes)?;
 
@@ -379,32 +548,44 @@ impl OctreeGpuMesher {
             let pipeline_layout = create_pipeline_layout(&device, descriptor_set_layout)?;
             let pipeline = create_compute_pipeline(&device, pipeline_layout)?;
 
-            // 3. Descriptor set. Octree binding points at the
-            //    shared pool's buffer.
-            let (descriptor_pool, descriptor_set) =
-                allocate_descriptor_set(&device, descriptor_set_layout)?;
-            update_descriptor_set(
-                &device, descriptor_set,
-                octree_pool_buffer, vertex_buffer, index_buffer, counter_buffer, chunk_metas_buffer,
-            );
+            // 3. One descriptor set per slot. Bindings 0-3 are the whole
+            //    buffers (bases are absolute); binding 4 is the slot's
+            //    meta region.
+            let (descriptor_pool, sets) =
+                allocate_descriptor_sets(&device, descriptor_set_layout, inflight as u32)?;
+            for (k, &set) in sets.iter().enumerate() {
+                update_descriptor_set(
+                    &device, set,
+                    octree_pool_buffer, vertex_buffer, index_buffer, counter_buffer,
+                    chunk_metas_buffer, k as u64 * meta_stride, meta_stride,
+                );
+            }
 
-            // 4. Command pool + buffer + fence.
+            // 4. Command pool on the chosen family; one command buffer and
+            //    one fence per slot.
             let pool_info = vk::CommandPoolCreateInfo::builder()
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-                .queue_family_index(ctx.graphics_queue_family);
+                .queue_family_index(queue_family);
             let command_pool = device.create_command_pool(&pool_info, None)?;
             let alloc_info = vk::CommandBufferAllocateInfo::builder()
                 .command_pool(command_pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-            let command_buffer = device.allocate_command_buffers(&alloc_info)?[0];
+                .command_buffer_count(inflight as u32);
+            let cmds = device.allocate_command_buffers(&alloc_info)?;
 
-            let fence_info = vk::FenceCreateInfo::builder();
-            let fence = device.create_fence(&fence_info, None)?;
+            let mut slots = Vec::with_capacity(inflight);
+            for (k, cmd) in cmds.into_iter().enumerate() {
+                let fence = device.create_fence(&vk::FenceCreateInfo::builder(), None)?;
+                slots.push(SlotVk { command_buffer: cmd, fence, descriptor_set: sets[k], pending: None });
+            }
 
             log::info!(
-                "OctreeGpuMesher initialized (shared-pool octree buffer, vert cap={}, idx cap={})",
+                "OctreeGpuMesher initialized: ring inflight={} slot_chunks={} queue={} \
+                 (vert cap={}, idx cap={}, output {} MB host-visible)",
+                inflight, slot_chunks,
+                if queue_is_async { "compute (distinct)" } else { "graphics (shared)" },
                 VERTEX_CAPACITY, INDEX_CAPACITY,
+                (vertex_bytes + index_bytes + counter_bytes + chunk_metas_bytes) / (1024 * 1024),
             );
 
             Ok(Self {
@@ -413,312 +594,232 @@ impl OctreeGpuMesher {
                 vertex_buffer, vertex_memory, vertex_ptr,
                 index_buffer, index_memory, index_ptr,
                 counter_buffer, counter_memory, counter_ptr,
-                pipeline, pipeline_layout, descriptor_set_layout,
-                descriptor_pool, descriptor_set,
-                command_pool, command_buffer, fence,
-                submit_lock: Mutex::new(()),
-                queue_submit_lock,
-                queue, device,
+                pipeline, pipeline_layout, descriptor_set_layout, descriptor_pool,
+                command_pool,
+                ring: Mutex::new(RingVk {
+                    lifecycle: crate::render::mesh_dispatch_ring::DispatchRing::new(inflight),
+                    slots,
+                    epoch: std::time::Instant::now(),
+                    next_ticket: 1,
+                    per_chunk_ema_us: PER_CHUNK_PRIOR_US,
+                    samples: 0,
+                    costs: Vec::new(),
+                }),
+                slot_chunks, meta_stride,
+                queue, queue_is_async,
+                queue_submit_lock, device,
             })
         }
     }
 
-    /// Mesh up to `effective_batch_size()` chunks per submission.
-    /// Auto-chunks if `chunks.len()` exceeds the cap.
+    /// Chunks one dispatch can carry. The dispatcher's batch cap.
+    pub fn slot_capacity(&self) -> usize { self.slot_chunks }
+    /// Ring depth.
+    pub fn inflight_capacity(&self) -> usize { self.ring.lock().unwrap().slots.len() }
+    /// Dispatches currently on the queue.
+    pub fn in_flight(&self) -> usize { self.ring.lock().unwrap().lifecycle.in_flight() }
+    /// True when dispatches go to a queue the frame does not share.
+    pub fn queue_is_async(&self) -> bool { self.queue_is_async }
+    /// Is a slot free right now?
+    pub fn can_submit(&self) -> bool {
+        matches!(self.ring.lock().unwrap().lifecycle.admission(),
+                 crate::render::mesh_dispatch_ring::Admission::Submit { .. })
+    }
+
+    /// The batch sizer. How many chunks fit in `dispatch_budget_us` of
+    /// queue time according to the per-chunk model, clamped to
+    /// `[1, slot_capacity]`. Before any measurement the prior
+    /// (`PER_CHUNK_PRIOR_US`) answers, so the first dispatch is small.
+    pub fn suggested_batch(&self, dispatch_budget_us: u64) -> usize {
+        let ring = self.ring.lock().unwrap();
+        let n = (dispatch_budget_us as f64 / ring.per_chunk_ema_us.max(1.0)).floor() as usize;
+        n.clamp(1, self.slot_chunks)
+    }
+
+    /// Current per-chunk GPU-time estimate, µs, and how many dispatches fed it.
+    pub fn per_chunk_estimate_us(&self) -> (f64, u64) {
+        let ring = self.ring.lock().unwrap();
+        (ring.per_chunk_ema_us, ring.samples)
+    }
+
+    /// Costs of dispatches completed since the last call. The dispatcher
+    /// charges its per-frame window budget from these, not from the wall
+    /// time around a blocking call (which double-counts under overlap).
+    pub fn take_costs(&self) -> Vec<DispatchCost> {
+        std::mem::take(&mut self.ring.lock().unwrap().costs)
+    }
+
+    /// Mesh up to `slot_capacity()` chunks per submission, blocking.
+    /// Auto-windows if `chunks.len()` exceeds the cap. Submit + collect per
+    /// window, so this never overlaps two of its own windows; it is the
+    /// bench/test entry, not the streaming path.
     ///
     /// `lod_stride` is the LOD's source-block stride: 1 for Near
     /// (per-block iteration), 2 for Mid (each mesher cell represents
     /// a 2³ source-block group). All chunks in the batch must be at
-    /// the same LOD. v0.24.39-mid-lod added the parameter; existing
-    /// Near callers pass 1.
+    /// the same LOD.
     pub fn mesh_chunks_batch(&self, chunks: &[OctreeBatchInput], lod_stride: u32) -> Result<Vec<OctreeBatchOutput>> {
         if chunks.is_empty() {
             return Ok(Vec::new());
+        }
+        let mut all_outputs = Vec::with_capacity(chunks.len());
+        for window in chunks.chunks(self.slot_chunks) {
+            let t = self.submit_batch(window, lod_stride)?;
+            all_outputs.append(&mut self.collect(t)?);
+        }
+        Ok(all_outputs)
+    }
+
+    /// Submit one batch WITHOUT waiting. Uploads and pins the batch's
+    /// octree spans under the pool lock, releases it, records into a free
+    /// slot and submits. `Err(Busy)` if every slot is in flight — the
+    /// caller has outrun `poll`; wait with `wait_oldest` first.
+    ///
+    /// THE INVARIANT (same as the generator ring): a slot's command
+    /// buffer, fence, descriptor set and output region are never reused
+    /// until that slot's result has been drained, and every octree span
+    /// the dispatch reads stays pinned until then. No dispatch in flight
+    /// refers to a recycled resource.
+    pub fn submit_batch(&self, chunks: &[OctreeBatchInput], lod_stride: u32) -> Result<MeshTicket> {
+        use crate::render::mesh_dispatch_ring::Admission;
+        if chunks.is_empty() {
+            return Err(OctreeMeshError::EmptyBatch);
+        }
+        if chunks.len() > self.slot_chunks {
+            return Err(OctreeMeshError::BatchTooLarge { got: chunks.len(), cap: self.slot_chunks });
         }
         debug_assert!(
             lod_stride == 1 || lod_stride == 2 || lod_stride == 4 || lod_stride == 8,
             "lod_stride must divide 32 and be a power of two; got {}", lod_stride
         );
-        let mut all_outputs = Vec::with_capacity(chunks.len());
-        for window in chunks.chunks(effective_batch_size() as usize) {
-            let mut outs = self.mesh_chunks_one_submission(window, lod_stride)?;
-            all_outputs.append(&mut outs);
-        }
-        Ok(all_outputs)
-    }
 
-    fn mesh_chunks_one_submission(
-        &self, chunks: &[OctreeBatchInput], lod_stride: u32,
-    ) -> Result<Vec<OctreeBatchOutput>> {
-        debug_assert!(chunks.len() <= MAX_BATCH_CHUNKS as usize);
-
-        // Pre-screen.
-        let mut active_slots: Vec<usize> = Vec::with_capacity(chunks.len());
-        let mut outputs: Vec<OctreeBatchOutput> = chunks.iter().map(|c| {
+        // Pre-screen. `active` lists the positions in `chunks` that go to
+        // the GPU; they are compacted to meta indices 0..active.len() so
+        // the dispatch carries no stale metas.
+        let mut active: Vec<usize> = Vec::with_capacity(chunks.len());
+        let mut outputs: Vec<OctreeBatchOutput> = chunks.iter().enumerate().map(|(i, c)| {
             let n = c.octree.nodes.len();
-            if n > MAX_NODES_PER_CHUNK as usize {
-                OctreeBatchOutput {
-                    coord: c.coord,
-                    mesh: Err(OctreeMeshError::TooManyNodes(n)),
-                }
+            let mesh = if n > MAX_NODES_PER_CHUNK as usize {
+                Err(OctreeMeshError::TooManyNodes(n))
             } else if n == 0 {
-                // Empty octree (shouldn't happen but handle anyway).
-                OctreeBatchOutput {
-                    coord: c.coord,
-                    mesh: Ok(ChunkMesh::empty()),
-                }
+                Ok(ChunkMesh::empty())
             } else {
-                OctreeBatchOutput {
-                    coord: c.coord,
-                    mesh: Err(OctreeMeshError::Vulkan(vk::Result::NOT_READY)),
-                }
-            }
+                active.push(i);
+                Err(OctreeMeshError::Vulkan(vk::Result::NOT_READY))
+            };
+            OctreeBatchOutput { coord: c.coord, mesh }
         }).collect();
 
-        for (idx, c) in chunks.iter().enumerate() {
-            let n = c.octree.nodes.len();
-            if n > 0 && n <= MAX_NODES_PER_CHUNK as usize {
-                active_slots.push(idx);
+        let mut ring = self.ring.lock().unwrap();
+        let slot = match ring.lifecycle.admission() {
+            Admission::Submit { slot } => slot,
+            Admission::WaitOldest { .. } => return Err(OctreeMeshError::Busy),
+        };
+
+        if active.is_empty() {
+            // Nothing for the GPU: hand the pre-screened outputs back via
+            // a ticket that `poll`/`collect` resolve without a fence.
+            // Recorded as an already-signaled slot: the fence is left
+            // signaled from creation? No — fences start unsignaled, so we
+            // mark this slot pending with a signaled fence explicitly.
+            let ticket = ring.next_ticket;
+            ring.next_ticket += 1;
+            ring.lifecycle.acquire(slot, Vec::new());
+            let now = ring.epoch.elapsed().as_micros() as u64;
+            ring.lifecycle.submitted(slot, now);
+            unsafe {
+                let submit = vk::SubmitInfo::builder().build();
+                let s = &ring.slots[slot];
+                self.device.reset_fences(&[s.fence])?;
+                let _qg = self.queue_submit_lock.lock().expect("octree mesher queue submit lock poisoned");
+                // An empty submit still signals the fence: keeps every
+                // ticket on one code path.
+                self.device.queue_submit(self.queue, &[submit], s.fence)?;
             }
+            ring.slots[slot].pending = Some(PendingBatch { outputs, active, ticket });
+            return Ok(MeshTicket(ticket));
         }
-        if active_slots.is_empty() {
-            return Ok(outputs);
-        }
 
-        let _guard = self.submit_lock.lock().unwrap();
-
-        // v0.24.30-shared-octree: upload via the shared pool. The
-        // pool will allocate (or reuse) a span per chunk and return
-        // the absolute node base index. We capture indices into a
-        // local vec, then carry them through the meta-write step.
-        //
-        // Lock policy (r-t1-pool-pin, T1 in docs/device_logs/TRIAGE_r462.md):
-        // - Default (UNENDLICH_GPU_POOL_PIN unset/0): the pool lock is HELD
-        //   for the entire dispatch+readback window so main-thread evictions
-        //   can't reuse a span while the GPU is mid-read. On Asahi the
-        //   dispatch's submit-to-signal wall time is 47–889 ms, so every
-        //   main/render-thread pool touch (evict_chunks, world reset, coord
-        //   snapshot, uploads) can stall behind this lock for that long —
-        //   the log-r462 LONG FRAMEs (dt 113–664 ms with GPU total=7.75 ms).
-        //   (The old "~1 ms per batch" claim here predated that data.)
-        // - UNENDLICH_GPU_POOL_PIN=1: spans this dispatch reads (batch
-        //   chunks + resident neighbors) are PINNED under the lock, then the
-        //   lock is RELEASED for the fence wait + readback and re-taken
-        //   briefly to unpin. Frees of pinned spans defer to unpin, so the
-        //   GPU-visible bytes are identical to the lock-held mode; only the
-        //   mutex hold time changes. Default OFF until A/B'd on hardware.
-        let pool_pin = std::env::var("UNENDLICH_GPU_POOL_PIN")
-            .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
-        let pool_guard = self.octree_pool.lock()
-            .map_err(|_| OctreeMeshError::Vulkan(vk::Result::ERROR_UNKNOWN))?;
-
-        // Per-active-slot: pool's base_node_index (u32::MAX = upload failed).
-        let mut node_bases: Vec<u32> = Vec::with_capacity(active_slots.len());
-        // r-t1-pool-pin: byte offsets pinned for this dispatch, one entry
-        // per pin() call (duplicates legal — the ledger refcounts), so
-        // unpin_spans(&pin_offsets) is exactly symmetric.
-        let mut pin_offsets: Vec<u64> = Vec::new();
-        // v0.24.30-cross-chunk: per-active-slot, the 6 neighbor
-        // octree bases in the pool (or u32::MAX if not resident).
-        // Order: [+X, -X, +Y, -Y, +Z, -Z].
-        let mut neighbor_bases: Vec<[u32; 6]> = Vec::with_capacity(active_slots.len());
+        // Upload + pin under the pool lock; the lock is released before
+        // recording so main-thread uploads/evictions proceed while the
+        // GPU runs (frees of pinned spans defer to the unpin at drain).
+        let mut node_bases: Vec<u32> = Vec::with_capacity(active.len());
+        let mut neighbor_bases: Vec<[u32; 6]> = Vec::with_capacity(active.len());
+        let mut pin_offsets: Vec<u64> = Vec::with_capacity(active.len() * 7);
         {
-            let mut pool = pool_guard;
-            for &slot_idx in &active_slots {
-                let c = &chunks[slot_idx];
-                // Reuse pool slot if present. Replacing on every
-                // dispatch would waste allocator churn — the pool's
-                // upload() handles replacement implicitly, but we
-                // can avoid it when the chunk is already resident.
-                //
-                // Note: this is correct only because chunk octrees
-                // are immutable for a given (coord, version). The
-                // streaming layer re-uploads under a new version when
-                // the chunk changes; v0.24.30-foundation does NOT
-                // track version yet, so for now we upload every time
-                // to guarantee freshness. The TODO is filed.
+            let mut pool = self.octree_pool.lock()
+                .map_err(|_| OctreeMeshError::Vulkan(vk::Result::ERROR_UNKNOWN))?;
+            for &ci in &active {
+                let c = &chunks[ci];
                 match pool.upload_if_changed(c.coord, &c.octree, c.version) {
-                    Ok(slot) => {
-                        if pool_pin {
-                            pool.pin_slot(slot);
-                            pin_offsets.push(slot.byte_offset);
-                        }
-                        node_bases.push(slot.base_node_index());
+                    Ok(s) => {
+                        pool.pin_slot(s);
+                        pin_offsets.push(s.byte_offset);
+                        node_bases.push(s.base_node_index());
                     }
                     Err(e) => {
                         log::warn!(
-                            "OctreeGpuMesher: pool upload failed for {:?}: {}; \
-                             skipping this chunk in batch",
+                            "OctreeGpuMesher: pool upload failed for {:?}: {}; skipping this chunk in batch",
                             c.coord, e
                         );
-                        // Mark this slot's output as failed and use a
-                        // sentinel so positional indices line up.
-                        outputs[slot_idx].mesh =
+                        outputs[ci].mesh =
                             Err(OctreeMeshError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
                         node_bases.push(u32::MAX);
                     }
                 }
-
-                // v0.24.30-cross-chunk: resolve the 6 neighbor
-                // octree bases. A neighbor is "resident" if it has
-                // an active slot in the pool — typically true for
-                // RD-1 chunks (the chunks around our active set
-                // are usually also loaded). When not resident, we
-                // pass u32::MAX and the shader falls back to
-                // open-boundary semantics for that face.
-                //
-                // The cost is 6 HashMap lookups per chunk. At 64
-                // chunks per batch that's ~384 lookups — bounded
-                // and cheap relative to the GPU work.
-                //
-                // r-t1-pool-pin: resolved as a two-step (lookup all six,
-                // then pin) because pinning needs `&mut pool` and the old
-                // closure held a shared borrow.
+                // v0.24.30-cross-chunk: the 6 neighbor bases, pinned too
+                // (the shader reads them). Order: [+X, -X, +Y, -Y, +Z, -Z];
+                // u32::MAX = not resident → open-boundary for that face.
                 const NEIGHBOR_DELTAS: [(i32, i32, i32); 6] = [
-                    ( 1,  0,  0), // +X
-                    (-1,  0,  0), // -X
-                    ( 0,  1,  0), // +Y
-                    ( 0, -1,  0), // -Y
-                    ( 0,  0,  1), // +Z
-                    ( 0,  0, -1), // -Z
+                    ( 1,  0,  0), (-1,  0,  0), ( 0,  1,  0), ( 0, -1,  0), ( 0,  0,  1), ( 0,  0, -1),
                 ];
                 let mut bases = [u32::MAX; 6];
                 for (k, dc) in NEIGHBOR_DELTAS.iter().enumerate() {
-                    let nc = crate::world::chunk::ChunkCoord::new(
-                        c.coord.x + dc.0, c.coord.y + dc.1, c.coord.z + dc.2,
-                    );
+                    let nc = ChunkCoord::new(c.coord.x + dc.0, c.coord.y + dc.1, c.coord.z + dc.2);
                     if let Some(s) = pool.slot(nc) {
                         bases[k] = s.base_node_index();
-                        if pool_pin {
-                            pool.pin_slot(s);
-                            pin_offsets.push(s.byte_offset);
-                        }
+                        pool.pin_slot(s);
+                        pin_offsets.push(s.byte_offset);
                     }
                 }
                 neighbor_bases.push(bases);
             }
-
-            // r-t1-pool-pin: with pinning on, every span this dispatch
-            // reads is now pinned — the pool can safely take uploads and
-            // evictions from other threads while the GPU runs (frees of
-            // pinned spans defer to the unpin below). Release the mutex
-            // BEFORE the fence wait; this is the T1 fix.
-            if pool_pin {
-                drop(pool);
-                let dispatched = self.dispatch_and_wait(
-                    &active_slots, chunks, &node_bases, &neighbor_bases,
-                    lod_stride, &mut outputs,
-                );
-                // Readback touches only the mesher's own output buffers,
-                // never the pool. Skip it if the dispatch failed.
-                let read = match &dispatched {
-                    Ok(()) => self.readback_outputs(&active_slots, &mut outputs),
-                    Err(_) => Ok(()),
-                };
-                // Unpin on EVERY path — a leaked pin permanently blocks the
-                // span's free (visible as pin_stats().1 > 0 at idle).
-                match self.octree_pool.lock() {
-                    Ok(mut pool) => pool.unpin_spans(&pin_offsets),
-                    Err(_) => log::error!(
-                        "OctreeGpuMesher: octree pool poisoned at unpin — \
-                         {} pinned spans leaked", pin_offsets.len()),
-                }
-                dispatched?;
-                read?;
-                return Ok(outputs);
-            }
-
-            // Pool guard `pool` stays live through the dispatch call
-            // below so the GPU's reads of the buffer aren't
-            // invalidated by a concurrent eviction.
-            self.dispatch_and_wait(
-                &active_slots, chunks, &node_bases, &neighbor_bases,
-                lod_stride, &mut outputs,
-            )?;
-
-            // v0.24.NEXT+3-pool-early-unlock: at this point the fence has
-            // signalled, so the GPU has finished reading the octree pool
-            // for this batch (the submitted command buffer contained only
-            // this dispatch). The readback below reads ONLY the mesher's
-            // own output buffers (counter/vertex/index), never the pool.
-            // So it is safe to release the pool lock now, before the
-            // readback memcpy — which lets main-thread octree uploads
-            // (~10 µs each) proceed during the readback instead of
-            // queueing behind it. Shortens the contended window by the
-            // readback duration; biggest effect during chunk-storm bursts
-            // where many uploads stack up.
-            //
-            // Gated (default off) so the default pipeline is byte-for-byte
-            // unchanged until A/B'd on hardware: the safety argument is
-            // sound (and matches the long-standing comment that eviction
-            // is safe "after this point"), but releasing a lock earlier
-            // around GPU memory is exactly the kind of change that wants
-            // a hardware confirmation before becoming default.
-            let early_unlock = std::env::var("UNENDLICH_GPU_POOL_EARLY_UNLOCK")
-                .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
-            if early_unlock {
-                drop(pool);
-            }
-            self.readback_outputs(&active_slots, &mut outputs)?;
-            // If !early_unlock, `pool` drops here at end-of-scope (after
-            // the readback) — the original, more conservative behaviour.
         }
 
-        Ok(outputs)
-    }
+        // Compact: positions whose upload failed drop out of the dispatch
+        // (their outputs already carry the error).
+        let mut dispatched: Vec<usize> = Vec::with_capacity(active.len());
+        let mut dispatched_bases: Vec<(u32, [u32; 6])> = Vec::with_capacity(active.len());
+        for (pos, &ci) in active.iter().enumerate() {
+            if node_bases[pos] != u32::MAX {
+                dispatched.push(ci);
+                dispatched_bases.push((node_bases[pos], neighbor_bases[pos]));
+            }
+        }
+        if dispatched.is_empty() {
+            // Every upload failed. Unpin what we pinned and report the
+            // batch as one failed dispatch rather than hanging a ticket.
+            if let Ok(mut pool) = self.octree_pool.lock() { pool.unpin_spans(&pin_offsets); }
+            return Err(OctreeMeshError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
+        }
 
-    /// v0.24.30-shared-octree: factored out so the pool lock holds
-    /// over upload + dispatch as a single critical section. Operates on
-    /// caller-provided `node_bases` (one per active slot). Skips chunks
-    /// whose `node_bases[i] == u32::MAX` (pool-upload failures recorded
-    /// into `outputs[i]` already).
-    ///
-    /// v0.24.NEXT+3: renamed from `dispatch_and_readback` — this now
-    /// ends at the fence wait (`record_submit_wait`); readback is a
-    /// separate `readback_outputs` call so the caller can drop the pool
-    /// lock before reading back (the GPU is done with the octree pool
-    /// at fence-signal).
-    ///
-    /// v0.24.30-cross-chunk: `neighbor_bases[i]` carries the 6
-    /// neighbor octree bases for active slot `i`, in order
-    /// `[+X, -X, +Y, -Y, +Z, -Z]`. `u32::MAX` means "neighbor not
-    /// resident in pool — shader falls back to open-boundary."
-    fn dispatch_and_wait(
-        &self,
-        active_slots: &[usize],
-        chunks: &[OctreeBatchInput],
-        node_bases: &[u32],
-        neighbor_bases: &[[u32; 6]],
-        lod_stride: u32,
-        outputs: &mut [OctreeBatchOutput],
-    ) -> Result<()> {
-        debug_assert_eq!(active_slots.len(), node_bases.len());
-        debug_assert_eq!(active_slots.len(), neighbor_bases.len());
+        let ticket = ring.next_ticket;
+        ring.next_ticket += 1;
+        ring.lifecycle.acquire(slot, pin_offsets);
 
+        // Metas into this slot's region: meta i describes dispatched[i],
+        // whose output lives at global chunk index base + i.
+        let global_base = (slot * self.slot_chunks) as u32;
         unsafe {
-            for (pos, &slot_idx) in active_slots.iter().enumerate() {
-                let octree_base = node_bases[pos];
-                if octree_base == u32::MAX {
-                    // Pool upload failed for this slot — skip the
-                    // meta write so the GPU effectively does nothing
-                    // for it. The matching `outputs[slot_idx]` is
-                    // already marked Err.
-                    continue;
-                }
-                let c = &chunks[slot_idx];
-                let nb = &neighbor_bases[pos];
-
-                // ChunkMeta → chunk_metas_buffer. octree_base is the
-                // pool's absolute node index for this chunk; the
-                // shader walks the octree starting there. Neighbor
-                // bases let the shader sample across chunk boundaries
-                // instead of treating them as open.
+            for (i, (&ci, &(octree_base, nb))) in dispatched.iter().zip(dispatched_bases.iter()).enumerate() {
+                let c = &chunks[ci];
+                let g = global_base + i as u32;
                 let origin = c.coord.block_origin();
                 let meta = ChunkMetaGpu {
                     octree_base,
-                    vertex_base: (slot_idx as u32) * VERTEX_CAPACITY,
-                    index_base:  (slot_idx as u32) * INDEX_CAPACITY,
-                    counter_base: (slot_idx as u32) * 4,
+                    vertex_base: g * VERTEX_CAPACITY,
+                    index_base:  g * INDEX_CAPACITY,
+                    counter_base: g * 4,
                     chunk_origin_x: origin.0,
                     chunk_origin_y: origin.1,
                     chunk_origin_z: origin.2,
@@ -732,228 +833,246 @@ impl OctreeGpuMesher {
                     temperature: c.temperature,
                     humidity: c.humidity,
                 };
-                let meta_dst_offset = (slot_idx as u64)
-                    * (std::mem::size_of::<ChunkMetaGpu>() as u64);
-                let meta_dst = self.chunk_metas_ptr.add(meta_dst_offset as usize);
-                std::ptr::copy_nonoverlapping(
-                    &meta as *const _ as *const u8,
-                    meta_dst,
-                    std::mem::size_of::<ChunkMetaGpu>(),
+                let dst = self.chunk_metas_ptr.add(
+                    (slot as u64 * self.meta_stride) as usize
+                        + i * std::mem::size_of::<ChunkMetaGpu>(),
                 );
+                std::ptr::copy_nonoverlapping(
+                    &meta as *const _ as *const u8, dst, std::mem::size_of::<ChunkMetaGpu>());
             }
         }
-        self.record_submit_wait(active_slots, chunks, lod_stride, outputs)?;
-        Ok(())
+
+        let record = self.record_and_submit(&ring.slots[slot], slot, dispatched.len() as u32, lod_stride);
+        match record {
+            Ok(()) => {
+                let now = ring.epoch.elapsed().as_micros() as u64;
+                ring.lifecycle.submitted(slot, now);
+                ring.slots[slot].pending = Some(PendingBatch { outputs, active: dispatched, ticket });
+                Ok(MeshTicket(ticket))
+            }
+            Err(e) => {
+                let pins = ring.lifecycle.abort_recording(slot);
+                if let Ok(mut pool) = self.octree_pool.lock() { pool.unpin_spans(&pins); }
+                Err(e)
+            }
+        }
     }
 
-    /// Records the compute dispatch + submits + waits on the fence.
-    /// Caller must hold the pool lock for the duration of this call (so
-    /// the GPU's reads of the pool buffer aren't invalidated by a
-    /// concurrent eviction). Readback is **not** done here — see
-    /// `readback_outputs`.
-    fn record_submit_wait(
-        &self,
-        active_slots: &[usize],
-        chunks: &[OctreeBatchInput],
-        lod_stride: u32,
-        outputs: &mut [OctreeBatchOutput],
-    ) -> Result<()> {
-        // 2. Record command buffer.
-        let counter_bytes_total = (MAX_BATCH_CHUNKS as u64) * 16;
+    /// Records the slot's command buffer and submits it with the slot's
+    /// fence. No wait. Zeroes ONLY this slot's counter region: the other
+    /// slots' counters may be mid-write on the GPU.
+    fn record_and_submit(&self, s: &SlotVk, slot: usize, batch_count: u32, lod_stride: u32) -> Result<()> {
+        let cmd = s.command_buffer;
+        let counter_off = (slot * self.slot_chunks) as u64 * 16;
+        let counter_len = self.slot_chunks as u64 * 16;
         unsafe {
-            self.device.reset_command_buffer(
-                self.command_buffer,
-                vk::CommandBufferResetFlags::empty(),
-            )?;
+            self.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             let begin = vk::CommandBufferBeginInfo::builder()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            self.device.begin_command_buffer(self.command_buffer, &begin)?;
+            self.device.begin_command_buffer(cmd, &begin)?;
 
-            // Zero all counters for the active slots (cheap — 256 B total).
-            self.device.cmd_fill_buffer(
-                self.command_buffer,
-                self.counter_buffer, 0, counter_bytes_total, 0,
-            );
+            self.device.cmd_fill_buffer(cmd, self.counter_buffer, counter_off, counter_len, 0);
             let counter_barrier = vk::BufferMemoryBarrier::builder()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .buffer(self.counter_buffer)
-                .offset(0).size(counter_bytes_total)
+                .offset(counter_off).size(counter_len)
                 .build();
             self.device.cmd_pipeline_barrier(
-                self.command_buffer,
+                cmd,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &[], &[counter_barrier], &[],
             );
 
-            // Bind pipeline + descriptor set.
-            self.device.cmd_bind_pipeline(
-                self.command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                self.pipeline,
-            );
+            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
             self.device.cmd_bind_descriptor_sets(
-                self.command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                self.pipeline_layout, 0,
-                std::slice::from_ref(&self.descriptor_set), &[],
+                cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0,
+                std::slice::from_ref(&s.descriptor_set), &[],
             );
 
-            // ONE dispatch covering the whole batch. The shader's
-            // chunk_idx = gl_WorkGroupID.y selects the slot from
-            // chunk_metas; active_slots are the slots we filled.
-            // Inactive slots will have stale counters (we zeroed
-            // them) and zero output — they're harmless because we
-            // only read back the active ones.
-            // v0.24.39-mid-lod: derive cell count from stride. For
-            // Near stride=1, cell_count=32, ³ = 32768 cells, workgroups
-            // = 32768/64 = 512. For Mid stride=2, cell_count=16, ³
-            // = 4096 cells, workgroups = 64.
+            // ONE dispatch covering the batch. chunk_idx = gl_WorkGroupID.y
+            // indexes this slot's meta region. v0.24.39-mid-lod: cell
+            // count from stride (Near 32³ → 512 workgroups; Mid 16³ → 64).
             let lod_cell_count = 32 / lod_stride;
             let cells_per_chunk = lod_cell_count * lod_cell_count * lod_cell_count;
             let workgroups_x = (cells_per_chunk + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
             let push = PushConstants {
                 vertex_capacity: VERTEX_CAPACITY,
                 index_capacity: INDEX_CAPACITY,
-                batch_count: chunks.len() as u32,
+                batch_count,
                 lod_cell_count,
                 lod_cell_stride: lod_stride,
                 tile_enabled: octree_tile_enabled(),
             };
             let push_bytes = std::slice::from_raw_parts(
-                &push as *const _ as *const u8,
-                std::mem::size_of::<PushConstants>(),
-            );
+                &push as *const _ as *const u8, std::mem::size_of::<PushConstants>());
             self.device.cmd_push_constants(
-                self.command_buffer, self.pipeline_layout,
-                vk::ShaderStageFlags::COMPUTE, 0, push_bytes,
-            );
-            self.device.cmd_dispatch(
-                self.command_buffer,
-                workgroups_x, chunks.len() as u32, 1,
-            );
+                cmd, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
+            self.device.cmd_dispatch(cmd, workgroups_x, batch_count, 1);
 
-            // Barrier: shader writes → host reads on the output
-            // buffers (single barrier per buffer for clarity).
+            // Shader writes → host reads on the output buffers.
             let buffer_barriers = [
                 buf_barrier(self.vertex_buffer),
                 buf_barrier(self.index_buffer),
                 buf_barrier(self.counter_buffer),
             ];
             self.device.cmd_pipeline_barrier(
-                self.command_buffer,
+                cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::HOST,
                 vk::DependencyFlags::empty(),
                 &[], &buffer_barriers, &[],
             );
+            self.device.end_command_buffer(cmd)?;
 
-            self.device.end_command_buffer(self.command_buffer)?;
-
-            // Submit + wait.
-            self.device.reset_fences(&[self.fence])?;
+            self.device.reset_fences(&[s.fence])?;
             let submit = vk::SubmitInfo::builder()
-                .command_buffers(std::slice::from_ref(&self.command_buffer))
+                .command_buffers(std::slice::from_ref(&cmd))
                 .build();
-            {
-                let _qg = self.queue_submit_lock.lock()
-                    .expect("octree mesher queue submit lock poisoned");
-                self.device.queue_submit(self.queue, &[submit], self.fence)?;
-            }
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            let _qg = self.queue_submit_lock.lock()
+                .expect("octree mesher queue submit lock poisoned");
+            self.device.queue_submit(self.queue, &[submit], s.fence)?;
         }
         Ok(())
     }
 
-    /// Reads the GPU mesh output (counters + vertex/index data) for each
-    /// active slot into `outputs`. Reads **only** the mesher's own
-    /// HOST_COHERENT output buffers (counter/vertex/index) — never the
-    /// octree pool — so the caller does NOT need to hold the octree-pool
-    /// lock for this. The GPU finished reading the octree pool at
-    /// fence-signal inside `record_submit_wait`, so by the time we get
-    /// here the pool can already have been released (see the
-    /// `UNENDLICH_GPU_POOL_EARLY_UNLOCK` path in `mesh_chunks_batch`).
-    /// Split out of the former `record_and_submit` in v0.24.NEXT+3 so
-    /// that early-unlock is possible.
-    fn readback_outputs(
-        &self,
-        active_slots: &[usize],
-        outputs: &mut [OctreeBatchOutput],
-    ) -> Result<()> {
-        // 3. Readback per active slot.
-        //
-        // v0.24.30-shared-octree: skip slots whose pool upload
-        // failed earlier. Those slots have a specific upload-failure
-        // error (`Vulkan(ERROR_OUT_OF_DEVICE_MEMORY)`) set in
-        // outputs, and no valid meta was written to GPU, so the
-        // counter buffer contains stale data. Reading it would
-        // overwrite the Err with a meaningless Ok.
-        //
-        // Active slots (the normal case) start with the placeholder
-        // `Err(NOT_READY)` which means "needs readback"; that gets
-        // overwritten by the successful `Ok(ChunkMesh {...})` below.
-        for &slot_idx in active_slots {
-            if matches!(
-                outputs[slot_idx].mesh,
-                Err(OctreeMeshError::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY))
-            ) {
-                continue;
-            }
-            let counter_offset = (slot_idx as u32) * 4;
-            let (vc, ic, overflow) = unsafe {
-                let p = self.counter_ptr as *const u32;
-                (
-                    *p.add(counter_offset as usize + 0),
-                    *p.add(counter_offset as usize + 1),
-                    *p.add(counter_offset as usize + 2),
-                )
-            };
+    /// Every finished batch, read back and unpinned, oldest first.
+    /// Non-blocking; batches still running stay in the ring.
+    pub fn poll(&self) -> Result<Vec<(MeshTicket, Vec<OctreeBatchOutput>)>> {
+        let mut ring = self.ring.lock().unwrap();
+        self.drain_finished(&mut ring, None)
+    }
 
+    /// Block (at most `timeout`) on the OLDEST in-flight dispatch, then
+    /// drain everything that has finished. The backpressure call for a
+    /// full ring; returns empty if nothing is in flight or the wait timed
+    /// out.
+    pub fn wait_oldest(&self, timeout: std::time::Duration) -> Result<Vec<(MeshTicket, Vec<OctreeBatchOutput>)>> {
+        use crate::render::mesh_dispatch_ring::Admission;
+        let mut ring = self.ring.lock().unwrap();
+        let oldest = match ring.lifecycle.admission() {
+            Admission::WaitOldest { slot } => Some(slot),
+            Admission::Submit { .. } => {
+                // Not full; still wait on the oldest pending one if any.
+                ring.slots.iter().enumerate()
+                    .filter(|(_, s)| s.pending.is_some())
+                    .min_by_key(|(_, s)| s.pending.as_ref().map(|p| p.ticket).unwrap_or(u64::MAX))
+                    .map(|(i, _)| i)
+            }
+        };
+        if let Some(i) = oldest {
+            let fence = ring.slots[i].fence;
+            let ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
+            match unsafe { self.device.wait_for_fences(&[fence], true, ns) } {
+                Ok(()) | Err(vk::Result::TIMEOUT) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        self.drain_finished(&mut ring, None)
+    }
+
+    /// Wait for ONE ticket and return its outputs. Other batches keep
+    /// running and are not drained here.
+    pub fn collect(&self, t: MeshTicket) -> Result<Vec<OctreeBatchOutput>> {
+        let mut ring = self.ring.lock().unwrap();
+        let Some(i) = ring.slots.iter().position(|s| s.pending.as_ref().map(|p| p.ticket) == Some(t.0)) else {
+            return Err(OctreeMeshError::UnknownTicket(t.0));
+        };
+        let fence = ring.slots[i].fence;
+        unsafe { self.device.wait_for_fences(&[fence], true, u64::MAX)?; }
+        let mut out = self.drain_finished(&mut ring, Some(i))?;
+        debug_assert_eq!(out.len(), 1);
+        Ok(out.pop().map(|(_, o)| o).unwrap_or_default())
+    }
+
+    /// Drain slots whose fence has signaled (all of them, or `only` that
+    /// one): charge GPU time, read back, unpin, release. Oldest first.
+    fn drain_finished(
+        &self, ring: &mut RingVk, only: Option<usize>,
+    ) -> Result<Vec<(MeshTicket, Vec<OctreeBatchOutput>)>> {
+        let mut done: Vec<usize> = Vec::new();
+        for (i, s) in ring.slots.iter().enumerate() {
+            if only.map_or(true, |o| o == i) && s.pending.is_some()
+                && unsafe { self.device.get_fence_status(s.fence)? }
+            {
+                done.push(i);
+            }
+        }
+        done.sort_by_key(|&i| ring.slots[i].pending.as_ref().map(|p| p.ticket).unwrap_or(0));
+        let mut out = Vec::with_capacity(done.len());
+        for i in done {
+            let now = ring.epoch.elapsed().as_micros() as u64;
+            let before = ring.lifecycle.gpu_time_consumed_us();
+            let pins = ring.lifecycle.complete(i, now);
+            let charged = ring.lifecycle.gpu_time_consumed_us() - before;
+            let mut pending = ring.slots[i].pending.take().expect("drained slot has a batch");
+            self.readback_slot(i, &mut pending);
+            if !pins.is_empty() {
+                match self.octree_pool.lock() {
+                    Ok(mut pool) => pool.unpin_spans(&pins),
+                    Err(_) => log::error!(
+                        "OctreeGpuMesher: octree pool poisoned at unpin — {} pinned spans leaked",
+                        pins.len()),
+                }
+            }
+            let chunks = pending.active.len() as u32;
+            if chunks > 0 {
+                let per = charged as f64 / chunks as f64;
+                ring.per_chunk_ema_us = if ring.samples == 0 { per }
+                    else { ring.per_chunk_ema_us * (1.0 - EMA_ALPHA) + per * EMA_ALPHA };
+                ring.samples += 1;
+            }
+            ring.costs.push(DispatchCost { gpu_exclusive_us: charged, chunks });
+            out.push((MeshTicket(pending.ticket), pending.outputs));
+        }
+        Ok(out)
+    }
+
+    /// Reads the mesh output (counters + vertex/index data) for each
+    /// dispatched position of slot `slot` into its outputs. Touches only
+    /// the mesher's own HOST_COHERENT buffers, never the octree pool.
+    fn readback_slot(&self, slot: usize, pending: &mut PendingBatch) {
+        let global_base = slot * self.slot_chunks;
+        for (i, &ci) in pending.active.iter().enumerate() {
+            let g = global_base + i;
+            let (vc, ic, overflow) = unsafe {
+                let p = (self.counter_ptr as *const u32).add(g * 4);
+                (*p, *p.add(1), *p.add(2))
+            };
             if overflow != 0 || vc > VERTEX_CAPACITY || ic > INDEX_CAPACITY {
-                outputs[slot_idx].mesh = Err(OctreeMeshError::Overflow {
+                pending.outputs[ci].mesh = Err(OctreeMeshError::Overflow {
                     vertex_count: vc, index_count: ic,
                 });
                 continue;
             }
-
-            // v0.24.44-readback-bulk: bulk memcpy via slice::to_vec
-            // instead of per-vertex push. `Vertex` is `repr(C)` of
-            // `[f32; 6]` so the layout matches the shader's emit
-            // (3 floats pos, 3 floats color, no padding). The previous
-            // per-element push loop did 1 array construction + 1
-            // Vertex::new call + 1 vec push per vertex; for the
-            // worst-case 44K-vertex chunk that's 132K function
-            // invocations, even though the data is already in the
-            // right shape. Single `to_vec` is a memcpy + alloc.
-            //
-            // Same treatment for indices below.
-            let v_base_floats = (slot_idx as usize) * (VERTEX_CAPACITY as usize) * 6;
-            let vertex_src: &[crate::render::mesher::Vertex] = unsafe {
+            // The shader emits `GpuWireVertex` (6 floats, 24 B). It is NOT
+            // `mesher::Vertex`: r594 added a `sway: u8` to `Vertex`, making
+            // it 28 B, and the v0.24.44 "readback-bulk" cast of this region
+            // to `*const Vertex` then read every vertex after the first at
+            // the wrong stride — and ran ~390 KB past the buffer end for the
+            // last slot. Convert per element; the static assert below keeps
+            // the wire type honest.
+            let wire: &[GpuWireVertex] = unsafe {
                 std::slice::from_raw_parts(
-                    (self.vertex_ptr as *const f32).add(v_base_floats)
-                        as *const crate::render::mesher::Vertex,
+                    (self.vertex_ptr as *const f32).add(g * VERTEX_CAPACITY as usize * 6)
+                        as *const GpuWireVertex,
                     vc as usize,
                 )
             };
-            let vertices = vertex_src.to_vec();
-
-            let i_base = (slot_idx as usize) * (INDEX_CAPACITY as usize);
-            let index_src: &[u32] = unsafe {
+            let vertices: Vec<crate::render::mesher::Vertex> =
+                wire.iter().map(|w| w.to_vertex()).collect();
+            let indices = unsafe {
                 std::slice::from_raw_parts(
-                    (self.index_ptr as *const u32).add(i_base),
+                    (self.index_ptr as *const u32).add(g * INDEX_CAPACITY as usize),
                     ic as usize,
                 )
-            };
-            let indices = index_src.to_vec();
-
-            outputs[slot_idx].mesh = Ok(ChunkMesh { vertices, indices });
+            }.to_vec();
+            pending.outputs[ci].mesh = Ok(ChunkMesh { vertices, indices });
         }
-
-        Ok(())
     }
 }
 
@@ -972,8 +1091,12 @@ impl Drop for OctreeGpuMesher {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
-            self.device.destroy_fence(self.fence, None);
-            self.device.free_command_buffers(self.command_pool, &[self.command_buffer]);
+            let ring = self.ring.get_mut().unwrap_or_else(|e| e.into_inner());
+            let cmds: Vec<vk::CommandBuffer> = ring.slots.iter().map(|s| s.command_buffer).collect();
+            for s in &ring.slots {
+                self.device.destroy_fence(s.fence, None);
+            }
+            self.device.free_command_buffers(self.command_pool, &cmds);
             self.device.destroy_command_pool(self.command_pool, None);
 
             self.device.destroy_pipeline(self.pipeline, None);
@@ -981,12 +1104,7 @@ impl Drop for OctreeGpuMesher {
             self.device.destroy_descriptor_pool(self.descriptor_pool, None);
             self.device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
 
-            // v0.24.30-shared-octree: the octree buffer is owned by
-            // the renderer's `OctreeBufferPool` (via Arc<Mutex>).
-            // The Arc clone we hold is dropped automatically when
-            // `OctreeGpuMesher` is dropped; if it's the last clone,
-            // the pool's own Drop runs. We must NOT destroy the
-            // pool's buffer here — that's the pool's responsibility.
+            // The octree buffer is the renderer's `OctreeBufferPool`'s.
 
             self.device.unmap_memory(self.chunk_metas_memory);
             self.device.destroy_buffer(self.chunk_metas_buffer, None);
@@ -1083,31 +1201,35 @@ unsafe fn create_compute_pipeline(
     Ok(pipelines[0])
 }
 
-unsafe fn allocate_descriptor_set(
-    device: &Device, layout: vk::DescriptorSetLayout,
-) -> Result<(vk::DescriptorPool, vk::DescriptorSet)> {
+unsafe fn allocate_descriptor_sets(
+    device: &Device, layout: vk::DescriptorSetLayout, count: u32,
+) -> Result<(vk::DescriptorPool, Vec<vk::DescriptorSet>)> {
     let sizes = [vk::DescriptorPoolSize {
-        ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 5,
+        ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 5 * count,
     }];
     let info = vk::DescriptorPoolCreateInfo::builder()
-        .pool_sizes(&sizes).max_sets(1);
+        .pool_sizes(&sizes).max_sets(count);
     let pool = device.create_descriptor_pool(&info, None)?;
+    let layouts = vec![layout; count as usize];
     let alloc = vk::DescriptorSetAllocateInfo::builder()
-        .descriptor_pool(pool).set_layouts(std::slice::from_ref(&layout));
+        .descriptor_pool(pool).set_layouts(&layouts);
     let sets = device.allocate_descriptor_sets(&alloc)?;
-    Ok((pool, sets[0]))
+    Ok((pool, sets))
 }
 
+/// Bindings 0-3 whole-buffer; binding 4 (chunk_metas) is the slot's
+/// region `[meta_offset, meta_offset + meta_range)` so the shader's
+/// zero-based `chunk_metas[chunk_idx]` lands in that slot.
 unsafe fn update_descriptor_set(
     device: &Device, set: vk::DescriptorSet,
     octree: vk::Buffer, vertex: vk::Buffer, index: vk::Buffer,
-    counter: vk::Buffer, metas: vk::Buffer,
+    counter: vk::Buffer, metas: vk::Buffer, meta_offset: u64, meta_range: u64,
 ) {
     let o = vk::DescriptorBufferInfo::builder().buffer(octree).range(vk::WHOLE_SIZE).build();
     let v = vk::DescriptorBufferInfo::builder().buffer(vertex).range(vk::WHOLE_SIZE).build();
     let i = vk::DescriptorBufferInfo::builder().buffer(index).range(vk::WHOLE_SIZE).build();
     let c = vk::DescriptorBufferInfo::builder().buffer(counter).range(vk::WHOLE_SIZE).build();
-    let m = vk::DescriptorBufferInfo::builder().buffer(metas).range(vk::WHOLE_SIZE).build();
+    let m = vk::DescriptorBufferInfo::builder().buffer(metas).offset(meta_offset).range(meta_range).build();
     let writes = [
         vk::WriteDescriptorSet::builder().dst_set(set).dst_binding(0)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
@@ -1163,4 +1285,58 @@ unsafe fn create_host_visible_storage(
     device.bind_buffer_memory(buffer, memory, 0)?;
     let ptr = device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *mut u8;
     Ok((buffer, memory, ptr))
+}
+
+#[cfg(test)]
+mod ring_layout_tests {
+    use super::*;
+
+    #[test]
+    fn wire_vertex_is_the_shader_stride_and_cpu_vertex_is_not() {
+        // The bug this guards: reading the shader's 24 B vertices as
+        // `mesher::Vertex` (28 B since r594's `sway`).
+        assert_eq!(std::mem::size_of::<GpuWireVertex>(), 24);
+        assert_ne!(std::mem::size_of::<crate::render::mesher::Vertex>(), 24,
+            "if Vertex is 24 B again this test is stale, not the code");
+        let w = GpuWireVertex { position: [1.0, 2.0, 3.0], color: [0.1, 0.2, 0.3] };
+        let v = w.to_vertex();
+        assert_eq!(v.position, [1.0, 2.0, 3.0]);
+        assert_eq!(v.color, [0.1, 0.2, 0.3]);
+        assert_eq!(v.sway, 0);
+    }
+
+    #[test]
+    fn slots_partition_the_fixed_output_and_never_exceed_it() {
+        for inflight in 1..=(MAX_BATCH_CHUNKS as usize) {
+            let per = slot_chunks_for(inflight);
+            assert!(per >= 1);
+            assert!(per * inflight <= MAX_BATCH_CHUNKS as usize,
+                "inflight {} × {} chunks overruns the buffers", inflight, per);
+        }
+        assert_eq!(slot_chunks_for(1), 64);
+        assert_eq!(slot_chunks_for(2), 32);
+        assert_eq!(slot_chunks_for(3), 21);
+        assert_eq!(slot_chunks_for(0), 64, "inflight 0 is treated as 1");
+    }
+
+    #[test]
+    fn meta_regions_are_256_aligned_and_hold_the_slot() {
+        for per in [1usize, 2, 21, 32, 64] {
+            let stride = meta_region_stride(per);
+            assert_eq!(stride % META_REGION_ALIGN, 0);
+            assert!(stride >= per as u64 * std::mem::size_of::<ChunkMetaGpu>() as u64);
+            assert!(stride < (per as u64 + 4) * std::mem::size_of::<ChunkMetaGpu>() as u64,
+                "stride {} wastes more than a page of metas for {} chunks", stride, per);
+        }
+    }
+
+    #[test]
+    fn inflight_env_is_clamped() {
+        // Not asserting on the live env (tests share a process); the
+        // clamp is the contract.
+        for (raw, want) in [("0", 1usize), ("1", 1), ("2", 2), ("999", 64)] {
+            let n: usize = raw.parse().unwrap();
+            assert_eq!(n.clamp(1, MAX_BATCH_CHUNKS as usize), want);
+        }
+    }
 }

@@ -1013,7 +1013,64 @@ pub struct ChunkMesh {
     pub indices:  Vec<u32>,
 }
 
+/// A mesh in the pool's wire format: `PackedVertex` (8 B) + u32 indices,
+/// with the vertical bounds the renderer needs for its slot metadata.
+/// Produced by [`ChunkMesh::pack`] on the meshing WORKER so the render
+/// thread does one memcpy per chunk instead of a per-vertex quantize
+/// loop (see docs/claude-notes/gpu-cpu-residency-audit.md, "CPU-mesher
+/// path"). Both meshers' results carry one of these; `upload_mesh` only
+/// packs itself for callers that hand it a raw `ChunkMesh`.
+#[derive(Debug, Clone, Default)]
+pub struct PackedMesh {
+    pub vertices: Vec<PackedVertex>,
+    pub indices: Vec<u32>,
+    /// World-space min/max Y over the vertices (for an empty mesh: the
+    /// chunk's own vertical extent, `[origin_y, origin_y + CHUNK_SIZE]`).
+    pub min_y: f32,
+    pub max_y: f32,
+}
+
+impl PackedMesh {
+    pub fn vertex_count(&self) -> u32 { self.vertices.len() as u32 }
+    pub fn index_count(&self) -> u32 { self.indices.len() as u32 }
+    pub fn is_empty(&self) -> bool { self.vertices.is_empty() || self.indices.is_empty() }
+}
+
 impl ChunkMesh {
+    /// Quantize to the pool's wire format (`PackedVertex`) relative to
+    /// `chunk_origin`, computing the Y bounds in the same pass
+    /// (v0.24.53-pack-singlepass). `chunk_extent` is the chunk's height in
+    /// blocks, used as the Y range of an empty mesh.
+    pub fn pack(&self, chunk_origin: [f32; 3], chunk_extent: f32) -> PackedMesh {
+        if self.vertices.is_empty() {
+            return PackedMesh {
+                vertices: Vec::new(),
+                indices: self.indices.clone(),
+                min_y: chunk_origin[1],
+                max_y: chunk_origin[1] + chunk_extent,
+            };
+        }
+        let mut packed: Vec<PackedVertex> = Vec::with_capacity(self.vertices.len());
+        let first_y = self.vertices[0].position[1];
+        let mut min_y = first_y;
+        let mut max_y = first_y;
+        for v in self.vertices.iter() {
+            let y = v.position[1];
+            if y < min_y { min_y = y; }
+            if y > max_y { max_y = y; }
+            packed.push(PackedVertex::from_world(v, chunk_origin));
+        }
+        PackedMesh { vertices: packed, indices: self.indices.clone(), min_y, max_y }
+    }
+
+    /// Like [`pack`] but consumes the mesh so the index vector moves
+    /// instead of copying.
+    pub fn into_packed(self, chunk_origin: [f32; 3], chunk_extent: f32) -> PackedMesh {
+        let mut p = self.pack(chunk_origin, chunk_extent);
+        p.indices = self.indices;
+        p
+    }
+
     /// A typical near-LOD chunk produces ~3000 vertices and ~4500 indices.
     /// Pre-allocating avoids ~12 Vec doublings per buffer during the greedy
     /// mesh pass. Overshooting wastes a few KB that's freed immediately

@@ -24,6 +24,7 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use parking_lot::Mutex;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
@@ -61,12 +62,23 @@ impl Ord for ChunkRequest {
 pub struct LoadedChunk {
     pub chunk: Chunk,
     pub octree: OctreeArray,
+    /// True when the worker already applied the on-disk edit records for
+    /// this chunk (and built `octree` from the edited blocks). The main
+    /// thread must not load them again — and must not rebuild the
+    /// octree for `chunk.dirty`, because the dirt IS those edits.
+    pub edits_applied: bool,
 }
 
 pub struct ChunkLoader {
     request_tx: Sender<()>,
     chunk_rx: Receiver<LoadedChunk>,
     queue: Arc<Mutex<PendingQueue>>,
+    /// 2026-09-02: the persistent world root, shared with the workers so
+    /// edit records are read from disk and applied ON THE WORKER. Until
+    /// now `ChunkManager::update` did that on the main thread per
+    /// arriving chunk — a file read plus, for any edited chunk, a 32³
+    /// octree rebuild — in the frame. `None` = no persistence.
+    world_root: Arc<Mutex<Option<PathBuf>>>,
     /// Hold a clone of the generator so accessors like `model_arc()`
     /// can return its world-model without going through workers.
     generator: Arc<TerrainGenerator>,
@@ -110,6 +122,7 @@ struct PendingQueue {
 
 impl ChunkLoader {
     pub fn new(generator: Arc<TerrainGenerator>, num_workers: usize) -> Self {
+        let world_root: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let queue = Arc::new(Mutex::new(PendingQueue {
             heap: BinaryHeap::with_capacity(256),
             wanted: std::collections::HashMap::with_capacity(1024),
@@ -126,6 +139,7 @@ impl ChunkLoader {
             let generator = Arc::clone(&generator);
             let request_rx = request_rx.clone();
             let chunk_tx = chunk_tx.clone();
+            let world_root = Arc::clone(&world_root);
 
             let handle = thread::Builder::new()
                 .name(format!("chunk-loader-{}", worker_id))
@@ -138,7 +152,7 @@ impl ChunkLoader {
                     crate::thread_priority::configure_current_thread(
                         crate::thread_priority::ThreadRole::ChunkLoader,
                     );
-                    Self::worker_loop(worker_id, queue, generator, request_rx, chunk_tx);
+                    Self::worker_loop(worker_id, queue, generator, request_rx, chunk_tx, world_root);
                 })
                 .expect("Failed to spawn chunk loader worker");
 
@@ -149,6 +163,7 @@ impl ChunkLoader {
             request_tx,
             chunk_rx,
             queue,
+            world_root,
             generator,
             _workers: workers,
         }
@@ -250,12 +265,19 @@ impl ChunkLoader {
         q.wanted.len() + q.in_flight.len()
     }
 
+    /// Point the workers at the persistent world root. Chunks completed
+    /// after this call arrive with their edits applied.
+    pub fn set_world_root(&self, root: Option<PathBuf>) {
+        *self.world_root.lock() = root;
+    }
+
     fn worker_loop(
         _worker_id: usize,
         queue: Arc<Mutex<PendingQueue>>,
         generator: Arc<TerrainGenerator>,
         request_rx: Receiver<()>,
         chunk_tx: Sender<LoadedChunk>,
+        world_root: Arc<Mutex<Option<PathBuf>>>,
     ) {
         while request_rx.recv().is_ok() {
             // Drain extra wake signals — we'll process whatever's queued.
@@ -321,7 +343,22 @@ impl ChunkLoader {
                     let mut q = queue.lock();
                     q.in_flight.remove(&coord);
                 }
-                for chunk in single {
+                for mut chunk in single {
+                    // 2026-09-02: apply persisted edits here, before the
+                    // octree is built, so the main thread neither touches
+                    // the disk nor rebuilds the octree for an edited chunk.
+                    let root = world_root.lock().clone();
+                    let edits_applied = match root {
+                        Some(root) => {
+                            match crate::storage::load_chunk_edits(&root, &mut chunk) {
+                                Ok(0) => {}
+                                Ok(n) => log::debug!("loader: {} edits applied for {:?}", n, chunk.coord),
+                                Err(e) => log::warn!("loader: edit load failed for {:?}: {}", chunk.coord, e),
+                            }
+                            true
+                        }
+                        None => false,
+                    };
                     // v0.24.23 propagation: build the sparse octree on
                     // the worker so the per-chunk cost (~ a few hundred
                     // microseconds, dominated by 32K cell reads) is
@@ -329,7 +366,7 @@ impl ChunkLoader {
                     // (ChunkManager) gets a chunk-and-octree pair as
                     // one unit.
                     let octree = OctreeArray::from_chunk(&chunk);
-                    let loaded = LoadedChunk { chunk, octree };
+                    let loaded = LoadedChunk { chunk, octree, edits_applied };
                     if chunk_tx.send(loaded).is_err() {
                         return;
                     }

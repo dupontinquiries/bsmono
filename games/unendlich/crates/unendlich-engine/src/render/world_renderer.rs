@@ -17,6 +17,18 @@ use crate::render::camera::{FlyCamera, View};
 use crate::render::chunk_pipeline::ChunkPipeline;
 use crate::render::entity_pipeline::EntityPipeline;
 use crate::render::context::VulkanContext;
+
+/// What an upload entry point was handed: a raw mesh (packed here) or a
+/// mesh already packed on the meshing worker.
+pub enum MeshPayload {
+    Raw(ChunkMesh),
+    Packed(crate::render::mesher::PackedMesh),
+}
+impl MeshPayload {
+    fn is_empty(&self) -> bool {
+        match self { MeshPayload::Raw(m) => m.is_empty(), MeshPayload::Packed(p) => p.is_empty() }
+    }
+}
 use crate::render::depth::DepthBuffer;
 use crate::render::froxel::{FroxelVolume, FROXEL_X, FROXEL_Y, FROXEL_Z, FROXEL_NEAR_M, FROXEL_FAR_M};
 use crate::render::froxel_fill_pipeline::{FroxelFillPipeline, FroxelFillPushConstants};
@@ -1379,6 +1391,9 @@ impl WorldRenderer {
         let octree_pool = Arc::new(Mutex::new(unsafe {
             crate::render::octree_buffer::OctreeBufferPool::new(
                 &ctx.device, &ctx.instance, ctx.physical_device,
+                // 2026-09-02 ring: the mesher reads the pool on the compute
+                // family when it is distinct; the probe on graphics.
+                &[ctx.graphics_queue_family, ctx.compute_queue_family],
             )
         }.map_err(|e| WorldRenderError::Other(
             format!("Failed to create octree buffer pool: {}", e)
@@ -1909,10 +1924,48 @@ impl WorldRenderer {
 
     fn upload_prebuilt_mesh_at_lod_inner(
         &mut self,
-        _ctx: &VulkanContext,
+        ctx: &VulkanContext,
         coord: ChunkCoord,
         lod: crate::world::lod::LodLevel,
         mesh: ChunkMesh,
+        version: u64,
+        deferrable: bool,
+    ) -> Result<()> {
+        self.upload_payload_at_lod_inner(ctx, coord, lod, MeshPayload::Raw(mesh), version, deferrable)
+    }
+
+    /// Upload a mesh packed on a worker thread (`ChunkMesh::pack`). Same
+    /// empty-mesh / stale-LOD handling as the raw path; the difference is
+    /// that this thread does one memcpy per buffer instead of a
+    /// per-vertex quantize loop.
+    pub fn upload_packed_mesh_at_lod(
+        &mut self,
+        ctx: &VulkanContext,
+        coord: ChunkCoord,
+        lod: crate::world::lod::LodLevel,
+        packed: crate::render::mesher::PackedMesh,
+        version: u64,
+    ) -> Result<()> {
+        self.upload_payload_at_lod_inner(ctx, coord, lod, MeshPayload::Packed(packed), version, false)
+    }
+
+    pub fn upload_packed_mesh_at_lod_deferrable(
+        &mut self,
+        ctx: &VulkanContext,
+        coord: ChunkCoord,
+        lod: crate::world::lod::LodLevel,
+        packed: crate::render::mesher::PackedMesh,
+        version: u64,
+    ) -> Result<()> {
+        self.upload_payload_at_lod_inner(ctx, coord, lod, MeshPayload::Packed(packed), version, true)
+    }
+
+    fn upload_payload_at_lod_inner(
+        &mut self,
+        _ctx: &VulkanContext,
+        coord: ChunkCoord,
+        lod: crate::world::lod::LodLevel,
+        mesh: MeshPayload,
         version: u64,
         deferrable: bool,
     ) -> Result<()> {
@@ -2023,7 +2076,10 @@ impl WorldRenderer {
         // original inline body silently introduced.
         self.evict_stale_lods(coord, lod);
 
-        self.upload_mesh(coord, lod, &mesh, version, deferrable)
+        match mesh {
+            MeshPayload::Raw(m) => self.upload_mesh(coord, lod, &m, version, deferrable),
+            MeshPayload::Packed(p) => self.upload_packed(coord, lod, &p, version, deferrable),
+        }
     }
 
     fn upload_mesh(
@@ -2035,44 +2091,31 @@ impl WorldRenderer {
         deferrable: bool,
     ) -> Result<()> {
         // v0.24.20-vertex-pack: bytes on the wire are PackedVertex
-        // (8 bytes), not the CPU-side Vertex (24 bytes). 3× upload
-        // bandwidth reduction vs the pre-pack path.
-        let vert_count = mesh.vertex_count() as usize;
-        let vert_bytes = vert_count * std::mem::size_of::<PackedVertex>();
-        let idx_bytes = (mesh.index_count() as usize) * std::mem::size_of::<u32>();
-
-        // v0.24.53-pack-singlepass: combine Y-bounds computation
-        // and vertex packing into a single linear pass over
-        // mesh.vertices. The previous form did two passes: one
-        // for fold-based min/max Y, another for .map().collect()
-        // into packed. For a 44K-vertex chunk that's 88K vertex
-        // ops; now it's 44K. CPU savings scale linearly with
-        // mesh size — meaningful during burst-upload after
-        // movement when 64 chunks/frame are getting packed.
-        //
-        // Branches in the body (min/max update conditionals) are
-        // predicted-not-taken for the common case (most iterations
-        // don't update the bounds). The pack call is the
-        // bottleneck.
+        // (8 bytes), not the CPU-side Vertex (28). Callers that already
+        // packed on a worker thread go through `upload_packed` directly;
+        // this path packs here (the pack loop is the cost — see the
+        // residency audit).
         let (ox, oy, oz) = coord.block_origin();
-        let chunk_origin_f = [ox as f32, oy as f32, oz as f32];
+        let packed = mesh.pack([ox as f32, oy as f32, oz as f32], CHUNK_SIZE as f32);
+        self.upload_packed(coord, lod, &packed, version, deferrable)
+    }
 
-        let (packed_verts, min_y, max_y) = if mesh.vertices.is_empty() {
-            let oy_f = oy as f32;
-            (Vec::new(), oy_f, oy_f + CHUNK_SIZE as f32)
-        } else {
-            let mut packed: Vec<PackedVertex> = Vec::with_capacity(mesh.vertices.len());
-            let first_y = mesh.vertices[0].position[1];
-            let mut min_y = first_y;
-            let mut max_y = first_y;
-            for v in mesh.vertices.iter() {
-                let y = v.position[1];
-                if y < min_y { min_y = y; }
-                if y > max_y { max_y = y; }
-                packed.push(PackedVertex::from_world(v, chunk_origin_f));
-            }
-            (packed, min_y, max_y)
-        };
+    /// Upload a mesh already in wire format. One memcpy per buffer; no
+    /// per-vertex work on this thread.
+    fn upload_packed(
+        &mut self,
+        coord: ChunkCoord,
+        lod: crate::world::lod::LodLevel,
+        packed: &crate::render::mesher::PackedMesh,
+        version: u64,
+        deferrable: bool,
+    ) -> Result<()> {
+        let vert_count = packed.vertices.len();
+        let vert_bytes = vert_count * std::mem::size_of::<PackedVertex>();
+        let idx_bytes = packed.indices.len() * std::mem::size_of::<u32>();
+        let packed_verts = &packed.vertices;
+        let (min_y, max_y) = (packed.min_y, packed.max_y);
+        let (ox, oy, oz) = coord.block_origin();
 
         // Sub-allocator design (v0.19): every upload allocates fresh
         // spans sized to the actual mesh. No slot reuse — the previous
@@ -2153,7 +2196,7 @@ impl WorldRenderer {
         // per upload — meaningful at sustained upload pressure.
         let idx_byte_slice = unsafe {
             std::slice::from_raw_parts(
-                mesh.indices.as_ptr() as *const u8,
+                packed.indices.as_ptr() as *const u8,
                 idx_bytes,
             )
         };
@@ -2221,7 +2264,7 @@ impl WorldRenderer {
         // logic will consume it.
         let flags = crate::world::lod::flags_with_lod(flag_bits, lod);
         let chunk_draw = crate::render::chunk_indirect::ChunkDraw {
-            index_count: mesh.index_count(),
+            index_count: packed.index_count(),
             first_index: (new_slot.idx_offset / INDEX_SIZE) as u32,
             vertex_offset: vert_base_count,
             flags,
@@ -2231,7 +2274,7 @@ impl WorldRenderer {
 
         let new = UploadedMesh {
             slot: new_slot,
-            index_count: mesh.index_count(),
+            index_count: packed.index_count(),
             version,
             min_y, max_y,
             draw_slot,
