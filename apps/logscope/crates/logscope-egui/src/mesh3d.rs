@@ -1686,3 +1686,48 @@ mod tests {
         assert_ne!(rune_cells(1, 5), rune_cells(2, 5), "different ids → different runes");
     }
 }
+
+#[cfg(test)]
+mod sun_curve_agreement {
+    //! THREE implementations of one sun curve, and nothing made them agree.
+    //!
+    //! `uikit_egui::lux::sky_at` is the extraction; this module's `sun_clock`
+    //! delegates to it (done earlier so the 2D panels and the 3D scene share a
+    //! clock); and `scene_kit::mesh3d` carries its OWN copy with a public
+    //! `sun_clock_at`. The delegation therefore unified two and left a third,
+    //! which is worse than it sounds — the whole point was that the room
+    //! behind the glass and the glass itself must not drift.
+    //!
+    //! Unifying properly means deciding where the curve lives, and scene-kit
+    //! does not depend on uikit-egui (adding that would couple a lean geometry
+    //! crate to the whole UI kit). That is a design call, recorded in
+    //! C13_TODO. Until it is made, this crate can see both, so it can at least
+    //! hold them to the same numbers — a drift that would otherwise only show
+    //! up as the scene and the panels disagreeing about the time of day.
+
+    #[test]
+    fn scene_kits_copy_matches_the_extracted_curve() {
+        for h in [0.0_f32, 3.0, 6.0, 6.5, 9.0, 12.0, 15.0, 17.5, 21.0, 23.5] {
+            let ours = uikit_egui::lux::sky_at(h);
+            let theirs = scene_kit::mesh3d::sun_clock_at(h);
+            assert!((ours.strength - theirs.0).abs() < 1e-5,
+                "strength differs at h={h}: lux {} vs scene-kit {}", ours.strength, theirs.0);
+            assert!((ours.warmth - theirs.1).abs() < 1e-5,
+                "warmth differs at h={h}: lux {} vs scene-kit {}", ours.warmth, theirs.1);
+            assert!((ours.ambient - theirs.2).abs() < 1e-5,
+                "ambient differs at h={h}: lux {} vs scene-kit {}", ours.ambient, theirs.2);
+        }
+    }
+
+    #[test]
+    fn this_modules_sun_clock_is_the_extracted_curve_at_the_current_hour() {
+        // Guards the delegation itself: if someone re-inlines the formula here,
+        // the panels and the scene start drifting again and nothing else
+        // notices.
+        let (s, w, a) = super::sun_clock();
+        let expect = uikit_egui::lux::sky_at(super::local_hour());
+        assert!((s - expect.strength).abs() < 1e-5);
+        assert!((w - expect.warmth).abs() < 1e-5);
+        assert!((a - expect.ambient).abs() < 1e-5);
+    }
+}
