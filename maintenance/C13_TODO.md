@@ -2781,3 +2781,31 @@ source.
 Remaining genuinely open from §53: nothing. The graph-label placer
 (`graph_labels::place`) is still unwired into the renderer, which is tracked
 separately.
+
+
+## 88. Graph label placer: the wiring point, located
+
+`graph_labels::place` (built earlier, 7 tests) is still unwired. The paint
+site is `tabs/chat.rs:6510`:
+
+```rust
+p.text(egui::pos2(sx + radius + 5.0, sy), egui::Align2::LEFT_CENTER,
+    format!("{}t · {}", nd.tokens, nodelabel::elide_words(&nd.preview, 22)), ..)
+```
+
+A FIXED offset from each node — which is the collision, and it is the exact
+label from the screenshot ("14t: create a rust crate th" overlapping "221t:
+rust use std::colle").
+
+Wiring needs a two-pass restructure of that loop, which is why it has not been
+done in passing:
+1. First pass over the visible nodes: build the label string, measure it
+   (`ui.fonts(|f| f.layout_no_wrap(..))`), and collect a `Want { id, x, y, w,
+   h, priority }`. Priority should be the selected node first, then recency —
+   when labels compete, the one the user is looking at must be the survivor.
+2. `place(&wants, bounds, pad)` where `bounds` is the graph rect.
+3. Second pass: paint only what came back, honouring `flipped` by switching to
+   `Align2::RIGHT_CENTER`, and render `dropped` as a "+n more" affordance.
+
+The fade (`label_fade`) has to be preserved and should probably feed priority
+too — a label fading out is a better one to drop than one fading in.
