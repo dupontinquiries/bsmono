@@ -697,13 +697,17 @@ impl Feel {
                     // demo layouts first, then the REAL layout files (shift/symbols live)
                     let mut names: Vec<String> = self.board.layout_names().iter().map(|s| s.to_string()).collect();
                     let demo_n = names.len();
-                    for f in &self.real.files {
-                        if f.name != "symbols" { // symbols is reached via the ?123 key, not a tab
-                            names.push(format!("{} ⌨", f.display_name));
-                        }
+                    let tab_files = self.real.tab_files();
+                    for &fi in &tab_files {
+                        names.push(format!("{} ⌨", self.real.files[fi].display_name));
                     }
                     let tabs: Vec<uikit_egui::vertical_tabs::Tab> = names.iter().map(|n| uikit_egui::vertical_tabs::Tab::new(n)).collect();
-                    let sel = if self.real_active { demo_n + self.real.active.min(1) } else { self.board.layout_index() };
+                    let sel = if self.real_active {
+                        // While on the symbols page (no tab of its own) keep the previous tab lit.
+                        demo_n + tab_files.iter().position(|&fi| fi == self.real.active).unwrap_or(0)
+                    } else {
+                        self.board.layout_index()
+                    };
                     let colors = uikit_egui::palette_colors(self.board.palette());
                     if let Some(i) = uikit_egui::vertical_tabs::show(ui, &tabs, sel, adaptive.min_touch_target, &colors) {
                         if i < demo_n {
@@ -711,7 +715,7 @@ impl Feel {
                             self.board.set_layout(i);
                         } else {
                             self.real_active = true;
-                            self.real.active = i - demo_n; // qwerty=0, dvorak=1 (symbols excluded)
+                            self.real.active = tab_files[i - demo_n];
                             self.real.shift = crate::real_layout::Shift::Off;
                         }
                     }

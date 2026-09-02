@@ -1267,6 +1267,35 @@ mod swipe_delivery_tests {
     }
 
     #[test]
+    fn the_gtk_cardinal_grid_flicks_and_rotates_through_the_egui_path() {
+        // THE REFERENCE. The GTK build's own cardinal layout (board_layouts'
+        // `default_cardinal_grid`, rendered by `real_layout::to_render` as the sidebar tab
+        // does), driven through the same press-drag-release rig: `a` east is `e`, `a` north is
+        // `u`, and a clockwise circle on `a` is its digit `1` — the eleven-gesture key working
+        // end to end, not just its classifier.
+        let file = board_layouts::Layout::default_cardinal_grid();
+        let mut rig = Rig::new(crate::real_layout::to_render(&file, crate::real_layout::Shift::Off), "system");
+        let (row, col) = rig.layout.rows.iter().enumerate()
+            .find_map(|(r, row)| row.keys.iter().position(|k| k.emit == "a").map(|c| (r, c)))
+            .expect("the `a` cell");
+        let rect = rig.key_rect(row, col);
+        let c = rect.center();
+        assert_eq!(rig.tap(c), vec!["a".to_string()]);
+        assert_eq!(rig.gesture(c, &[c + Vec2::new(20.0, 0.0)], c + Vec2::new(40.0, 0.0)), vec!["e".to_string()]);
+        assert_eq!(rig.gesture(c, &[c + Vec2::new(0.0, -20.0)], c + Vec2::new(0.0, -40.0)), vec!["u".to_string()]);
+        // clockwise on screen (y down): E → S → W → N and back — a full turn, ending near the start
+        let r = 30.0;
+        let circle: Vec<Pos2> = (1..24).map(|i| {
+            let a = i as f32 / 24.0 * std::f32::consts::TAU;
+            c + Vec2::new(r * a.cos(), r * a.sin()) - Vec2::new(r, 0.0)
+        }).collect();
+        let start = c;
+        let end = c + Vec2::new(0.5, 0.0);
+        let out = rig.gesture(start, &circle, end);
+        assert_eq!(out, vec!["1".to_string()], "a clockwise turn on `a` types its digit");
+    }
+
+    #[test]
     fn a_plain_key_still_types_on_tap_under_the_glass_palette() {
         // The complement: restructuring paint_key must not have taken the click path away
         // from ordinary keys, which is the whole qwerty board.
