@@ -2901,3 +2901,23 @@ builds, and I audited it by hand. The two documents now overlap and can
 drift — worth a check that every app marked `primary = true` in the manifest
 matches the "egui (primary)" column here, and worth deciding which is
 canonical before they disagree.
+
+
+## 92. UI_STRATEGY now points at the manifest; av1tuner's entry was stale
+
+Two documents, one answer. `manifest/projects.toml` is canonical because it is
+machine-read; UI_STRATEGY keeps the tiering rationale, which the manifest
+cannot express, and points at the manifest for the inventory.
+
+**The reconciliation found the manifest was the stale side**, which is the
+opposite of what I expected — I had assumed a prose document would drift
+against a build file. `[apps.av1tuner]` said `runtime = "tbd"` / "GUI toolkit
+not yet confirmed" with no `primary` flag, long after av1tuner_app settled on
+eframe+egui. Third manifest gap found this session, after cadscope (absent
+entirely) and studio (no `primary`). The pattern: a manifest entry written
+before an app's toolkit was decided never gets revisited, because nothing
+fails — gitmind just cannot offer that app.
+
+**Worth a check, not yet done:** every app whose `runtime` is still "tbd" or
+whose entry lacks `primary`. That is a two-line query and it would close the
+class rather than the three instances found by hand.
