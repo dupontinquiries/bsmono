@@ -343,7 +343,27 @@ pub fn scan_content(origin: Origin, name: &str, body: &str) -> Vec<Anomaly> {
 pub fn neutralize(body: &str) -> String {
     body.replace("<tool_call", "<​tool_call_quoted")
         .replace("</tool_call>", "</tool_call_quoted>")
-        .replace("```tool", "```tool_quoted")
+        // IDEMPOTENT, and it was not. `"```tool_quoted"` still CONTAINS
+        // `"```tool"`, so neutralising an already-neutralised string appended
+        // another suffix. A transcript that carries a defanged block forward and
+        // re-neutralises it each turn produced exactly this, from a field log:
+        //
+        //     ```tool_quoted{...}             turn 1
+        //     ```tool_quoted_quoted{...}      turn 2
+        //     ```tool_quoted_quoted_quoted{}  turn 3
+        //
+        // Three real costs. The text GROWS seven bytes per occurrence per turn,
+        // pushing a long agent transcript into compaction sooner. The model sees
+        // a fence spelling that mutates under it and imitates whichever it saw
+        // last, which is one route by which it starts emitting malformed fences.
+        // And a log reader cannot tell how many passes a block has been through.
+        //
+        // The XML branch above was already immune and shows the fix: it inserts a
+        // ZERO-WIDTH SPACE after `<`, so the trigger no longer matches on a second
+        // pass. The fence branch never got the same treatment. Same device here —
+        // the marker stops containing its own trigger, and the text is visually
+        // unchanged to a reader.
+        .replace("```tool", "```\u{200b}tool_quoted")
 }
 
 /// Wrap untrusted content for injection into a prompt: provenance banner + neutralised body.
@@ -624,5 +644,59 @@ mod tests {
     fn display_sanitiser_keeps_tabs_and_newlines() {
         let s = sanitize_for_display("a\tb\nc", 100);
         assert_eq!(s, "a\tb\nc\n");
+    }
+}
+
+#[cfg(test)]
+mod neutralize_idempotence {
+    use super::*;
+
+    /// The field bug: `tool_quoted` -> `tool_quoted_quoted` ->
+    /// `tool_quoted_quoted_quoted` across three turns of one agent run.
+    #[test]
+    fn neutralising_twice_is_the_same_as_once() {
+        let src = "```tool\n{\"tool\": \"read_file\", \"path\": \"Cargo.toml\"}\n```";
+        let once = neutralize(src);
+        let twice = neutralize(&once);
+        assert_eq!(once, twice, "neutralize compounded: {once:?} -> {twice:?}");
+    }
+
+    #[test]
+    fn it_stays_stable_over_many_passes_so_a_long_transcript_cannot_grow() {
+        // A transcript re-neutralised every turn must not grow without bound.
+        // Seven bytes per occurrence per turn is what pushed a real run into
+        // compaction early.
+        let mut s = neutralize("prefix ```tool payload <tool_call x> suffix");
+        let first = s.clone();
+        for _ in 0..25 {
+            s = neutralize(&s);
+        }
+        assert_eq!(s, first, "grew over 25 passes");
+    }
+
+    #[test]
+    fn the_defanged_fence_no_longer_contains_its_own_trigger() {
+        // The property that makes it idempotent, asserted directly so a future
+        // edit to the marker cannot silently reintroduce compounding.
+        let out = neutralize("```tool");
+        assert!(!out.contains("```tool"),
+            "the marker still matches itself and will compound: {out:?}");
+    }
+
+    #[test]
+    fn a_call_is_still_actually_defanged_and_its_content_preserved() {
+        // Idempotence is worthless if it stopped neutralising, and defanging is
+        // worthless if it damages the text the model is meant to read.
+        let out = neutralize("```tool\n{\"tool\":\"run\",\"argv\":[\"ls\"]}\n```");
+        assert!(!out.contains("```tool\n"), "the fence survived: {out:?}");
+        assert!(out.contains("tool_quoted"), "no defang marker present: {out:?}");
+        assert!(out.contains("\"tool\":\"run\""), "content was damaged: {out:?}");
+    }
+
+    #[test]
+    fn the_xml_branch_was_already_immune_and_still_is() {
+        let src = "<tool_call nonce=\"x\">{}</tool_call>";
+        let once = neutralize(src);
+        assert_eq!(once, neutralize(&once));
     }
 }
