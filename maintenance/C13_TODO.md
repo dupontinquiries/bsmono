@@ -2344,3 +2344,28 @@ TEXT was absent from the gate's output. It failed — correctly, because
 The property that matters is whether a TOOL can be BUILT, which holds. A
 security assertion on the wrong observable would have reported a hole that
 does not exist; assert on the capability, not on the string.
+
+
+## 72. orphan_check --functions: three new duplications, and §17 confirmed
+
+The duplicate-detector now exists. It rediscovered §17 (apps/snapclone vs
+system/snapclone) independently, which is the validation, and surfaced three
+pairs nobody had logged:
+
+- `apps/bo-suite/bo-controller/src/passby_canceller.rs` vs
+  `apps/bo-suite/bo-mux/src/passby_canceller.rs` — 9 shared names. Two crates
+  in ONE app carrying the same canceller. Likely the same lift-to-shared job
+  that worked for shellkit and scene-kit.
+- `apps/logscope/crates/logscope-egui/src/mesh3d.rs` vs
+  `shared/scene-kit/src/mesh3d.rs` — 6 shared names. mesh3d was one of the
+  four modules left alone in the scene-kit de-duplication as "genuinely
+  diverged" (§18). Worth re-checking: 6 shared public names suggests the
+  divergence may be smaller than the 100-360 diff lines implied.
+- `apps/bot-arena/src/fsm.rs` vs
+  `games/unendlich/docs/experience-brain/reference/fsm.rs` — 7 shared names.
+  A DOC copy shadowing live code, which is the worst variety: it is not
+  compiled, so it rots silently, and it is exactly what `orphan_check`'s
+  original file-level mode was written about.
+
+Run it after any extraction or merge; it is the cheap check that would have
+caught all four of this session's by hand finds.
