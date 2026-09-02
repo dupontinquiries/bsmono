@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=Studio
+GenericName=Audio and Video Editor
+Comment=A beat rack, an arrangement timeline and a mixer that two people can edit at once
+Exec=studio %f
+Icon=org.bigsilicon.Studio
+Terminal=false
+Categories=AudioVideo;Audio;AudioVideoEditing;Sequencer;
+Keywords=daw;beat;sampler;sequencer;mixer;timeline;808;trap;
+MimeType=application/x-studio-project;
+StartupNotify=true
+StartupWMClass=org.bigsilicon.Studio
+# Phone shells (phosh, plasma-mobile) read this to allow the app on a
+# narrow screen; the four-tab layout is the phone's, see README.
+X-Purism-FormFactor=Workstation;Mobile;
+X-KDE-FormFactor=desktop;handset;tablet;
