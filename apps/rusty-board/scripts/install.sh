@@ -11,15 +11,17 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=frontend.sh
+source "$PROJECT_ROOT/scripts/frontend.sh"
 
 # Default install prefix: ~/.local for user installs (no sudo), /usr/local
 # if you pass --system.
 PREFIX="${PREFIX:-$HOME/.local}"
 SYSTEM_INSTALL=0
 SKIP_BUILD=0
-# Which frontend to build and install. The GTK build is still the default
-# because it is the one KWin has been tested against; --egui selects the port.
-FRONTEND="gtk"
+# Which frontend to build and install. The egui keyboard is the v2 default
+# (manifest/projects.toml marks it primary); --gtk selects the GTK4 original.
+FRONTEND="egui"
 WITH_MODEL=0
 MODEL="ggml-base.en.bin"
 
@@ -33,8 +35,10 @@ Options:
   --prefix DIR     Install prefix (default: \$HOME/.local)
   --system         Install to /usr/local (requires sudo)
   --skip-build     Skip cargo build (use existing target/release/)
-  --gtk            Build and install the GTK frontend (default)
-  --egui           Build and install the egui frontend instead
+  --egui           Build and install the egui frontend (default, v2)
+  --gtk            Build and install the GTK4 frontend instead
+  --no-wayland     egui only: build without the Wayland input-method
+                   backend (a preview that types into its own window)
   --with-model     Download a Whisper model after install
   --model NAME     Whisper model to download (default: ggml-base.en.bin)
                      options: tiny.en, base.en, small.en, medium.en, large
@@ -49,6 +53,7 @@ while [[ $# -gt 0 ]]; do
         --skip-build)   SKIP_BUILD=1; shift ;;
         --egui)         FRONTEND="egui"; shift ;;
         --gtk)          FRONTEND="gtk"; shift ;;
+        --no-wayland)   FRONTEND_EGUI_FEATURES=""; shift ;;
         --with-model)   WITH_MODEL=1; shift ;;
         --model)        MODEL="$2"; shift 2 ;;
         -h|--help)      usage; exit 0 ;;
@@ -81,38 +86,15 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 1
 fi
 
-# 2. Check system dependencies (best effort)
-echo "==> Checking system dependencies..."
-MISSING=()
-for pkg in pkg-config; do
-    if ! command -v "$pkg" >/dev/null 2>&1; then
-        MISSING+=("$pkg")
-    fi
-done
-if ! pkg-config --exists gtk4 2>/dev/null; then
-    MISSING+=("libgtk-4-dev (or gtk4-devel)")
-fi
-if ! pkg-config --exists libadwaita-1 2>/dev/null; then
-    MISSING+=("libadwaita-1-dev (or libadwaita-devel)")
-fi
-if ! pkg-config --exists xkbcommon 2>/dev/null; then
-    MISSING+=("libxkbcommon-dev (or libxkbcommon-devel) — keymap synthesis for Wayland virtual keyboard")
-fi
-if ! pkg-config --exists gtk4-layer-shell-0 2>/dev/null; then
-    MISSING+=("libgtk4-layer-shell-dev (or gtk4-layer-shell-devel) — needed for Wayland docking")
-fi
+# 2. Check system dependencies (best effort) — per frontend; see frontend.sh.
+frontend_select "$FRONTEND"
+echo "==> Checking system dependencies for the $FRONTEND frontend..."
+mapfile -t MISSING < <(frontend_check_deps)
 if [[ ${#MISSING[@]} -gt 0 ]]; then
     echo "WARNING: missing dependencies:"
     for m in "${MISSING[@]}"; do echo "  - $m"; done
     echo
-    echo "On Debian/Ubuntu:"
-    echo "    sudo apt install build-essential pkg-config libgtk-4-dev libadwaita-1-dev libgtk4-layer-shell-dev libxkbcommon-dev libasound2-dev"
-    echo "On Fedora:"
-    echo "    sudo dnf install gcc pkgconf-pkg-config gtk4-devel libadwaita-devel gtk4-layer-shell-devel libxkbcommon-devel alsa-lib-devel"
-    echo "On Arch:"
-    echo "    sudo pacman -S base-devel pkgconf gtk4 libadwaita gtk4-layer-shell libxkbcommon alsa-lib"
-    echo "On Alpine (postmarketOS):"
-    echo "    sudo apk add build-base pkgconf gtk4.0-dev libadwaita-dev gtk4-layer-shell-dev libxkbcommon-dev alsa-lib-dev pango-dev gdk-pixbuf-dev"
+    frontend_deps_hint
     echo
     read -r -p "Continue anyway? [y/N] " yn
     case "$yn" in [Yy]*) ;; *) exit 1 ;; esac
@@ -121,12 +103,7 @@ fi
 # 3. Build
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
     echo "==> Building (release)..."
-    cd "$PROJECT_ROOT"
-    if [[ "$FRONTEND" == "egui" ]]; then
-        cargo build --release -p rusty-board-egui
-    else
-        cargo build --release
-    fi
+    frontend_build
 fi
 
 # The egui port ships a DIFFERENT binary name, so installing it as
@@ -134,18 +111,15 @@ fi
 # systemd unit and KWin's virtual-keyboard registration all name that path,
 # and renaming any one of them without the others produces a keyboard that
 # installs cleanly and never appears.
-if [[ "$FRONTEND" == "egui" ]]; then
-    BIN_SRC="$PROJECT_ROOT/target/release/rusty-board-egui"
-else
-    BIN_SRC="$PROJECT_ROOT/target/release/rusty-board"
-fi
+BIN_SRC="$(frontend_binary)"
+# The config CLI is part of the GTK package; it is only there if that was built.
 BIN_CFG="$PROJECT_ROOT/target/release/rusty-board-config"
 
 if [[ ! -x "$BIN_SRC" ]]; then
     if [[ "$SKIP_BUILD" -eq 1 ]]; then
         echo "ERROR: $BIN_SRC not found, and --skip-build was given." >&2
         echo "       Run without --skip-build, or build first with:" >&2
-        echo "         cargo build --release" >&2
+        echo "         ./scripts/install.sh   (or: cd egui-frontend && cargo build --release --features wayland)" >&2
     else
         echo "ERROR: $BIN_SRC not found. Did the build fail?" >&2
     fi

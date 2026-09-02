@@ -8,9 +8,8 @@ scripts are idempotent — safe to re-run.
 Order matters once, after that everything is fire-and-forget.
 
 ```bash
-# 1. Build and install the binary.
-cargo build --release
-sudo install -m755 target/release/rusty-board /usr/local/bin/
+# 1. Build and install the binary (the egui v2 keyboard, --features wayland).
+./scripts/install.sh --system          # or: ./scripts/install.sh --gtk --system
 
 # 2. Register rusty-board as a virtual keyboard with Plasma/KWin.
 #    Drops the .desktop file in /usr/share/applications/, writes
@@ -28,11 +27,12 @@ summon RustyBoard. If it doesn't, see "Troubleshooting" below.
 ./scripts/redeploy.sh
 ```
 
-Equivalent to:
+Equivalent to (see `frontend.sh`, which both install.sh and redeploy.sh source
+so they cannot disagree about which frontend is built or where its binary is):
 
 ```bash
-cargo build --release
-sudo install -m755 target/release/rusty-board /usr/local/bin/
+( cd egui-frontend && cargo build --release --features wayland )
+sudo install -m755 egui-frontend/target/release/rusty-board-egui /usr/local/bin/rusty-board
 pkill -f rusty-board
 qdbus6 org.kde.KWin /KWin reconfigure
 sleep 3
@@ -40,9 +40,29 @@ tail -40 /run/user/$(id -u)/rusty-board.log
 ```
 
 Options:
+- `--gtk` — build and install the GTK4 frontend instead of the egui v2 one
+- `--no-wayland` — egui without the input-method backend (types into its own preview)
 - `--skip-build` — reinstall existing binary without rebuilding
 - `--wait N` — seconds to wait for KWin to re-spawn (default: 3)
 - `--log-lines N` — log tail length (default: 40)
+
+## The egui (v2) keyboard on KWin: the window rule
+
+The GTK build docks itself with gtk4-layer-shell. The egui build runs on
+eframe/winit, which can only make an ordinary toplevel, so `plasma-setup.sh`
+also writes a KWin window rule (`~/.config/kwinrulesrc`, rule id
+`rusty-board-egui-keyboard`, matched on the app id `org.rustyboard.RustyBoard`)
+that forces: accept focus = no, keep above, no titlebar, skip taskbar/switcher/
+pager, and — when `kscreen-doctor` can report the primary output — a size of
+`<width>x340` at the bottom edge (`RUSTY_BOARD_HEIGHT` overrides 340). The
+keyboard's status strip says which placement it believes it has
+(`toplevel + window rule` on Wayland); `RUSTY_BOARD_PLACEMENT=floating`
+forces the dev-mode window with decorations.
+
+Without the rule, clicking a key gives the keyboard window focus and the
+virtual-keyboard protocol then types into the keyboard itself. If keys visibly
+press but nothing arrives in the app: check the rule exists, then
+`qdbus6 org.kde.KWin /KWin reconfigure`.
 
 ## Troubleshooting
 
@@ -101,6 +121,9 @@ qdbus6 org.kde.KWin /KWin reconfigure
 
 ## Other scripts in this directory
 
+- `frontend.sh` — sourced by install.sh and redeploy.sh: which
+  frontend (egui v2 by default, `--gtk` for the original), how it is
+  built, where its binary lands, which system deps it needs.
 - `install.sh` — full-featured installer with packaging,
   systemd user service, optional Whisper model download.
   Use this when packaging for distribution; for personal dev

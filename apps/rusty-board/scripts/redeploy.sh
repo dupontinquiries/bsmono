@@ -6,8 +6,8 @@
 # Use this every time you change source code on the device.
 #
 # Steps:
-#   1. cargo build --release
-#   2. sudo install -m755 target/release/rusty-board /usr/local/bin/
+#   1. cargo build --release  (egui-frontend, --features wayland; see frontend.sh)
+#   2. sudo install -m755 <built binary> /usr/local/bin/rusty-board
 #   3. pkill -f rusty-board   (stop the running instance)
 #   4. qdbus6 org.kde.KWin /KWin reconfigure
 #      (kwin re-execs the configured virtual keyboard binary,
@@ -19,6 +19,11 @@
 # ============================================================
 set -euo pipefail
 
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=frontend.sh
+source "$PROJECT_ROOT/scripts/frontend.sh"
+
+FRONTEND="egui"
 SKIP_BUILD=0
 WAIT_SECS=3
 LOG_LINES=40
@@ -29,6 +34,9 @@ Usage: $0 [options]
 
 Options:
   --skip-build       Skip cargo build; reinstall existing binary
+  --egui             Build the egui (v2) frontend — the default
+  --gtk              Build the GTK4 frontend instead
+  --no-wayland       egui only: build without the input-method backend
   --wait N           Seconds to wait for KWin to re-spawn (default: 3)
   --log-lines N      How many lines of the log to show (default: 40)
   -h, --help         Show this help
@@ -38,6 +46,9 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-build)   SKIP_BUILD=1; shift ;;
+        --egui)         FRONTEND="egui"; shift ;;
+        --gtk)          FRONTEND="gtk"; shift ;;
+        --no-wayland)   FRONTEND_EGUI_FEATURES=""; shift ;;
         --wait)         WAIT_SECS="$2"; shift 2 ;;
         --log-lines)    LOG_LINES="$2"; shift 2 ;;
         -h|--help)      usage; exit 0 ;;
@@ -46,12 +57,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ---- 1. Build -----------------------------------------------
+frontend_select "$FRONTEND"
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
-    echo "==> cargo build --release"
-    cargo build --release
+    frontend_build
 fi
 
-BIN_SRC="target/release/rusty-board"
+BIN_SRC="$(frontend_binary)"
 if [[ ! -x "$BIN_SRC" ]]; then
     echo "ERROR: $BIN_SRC not found. Did the build fail?" >&2
     exit 1
