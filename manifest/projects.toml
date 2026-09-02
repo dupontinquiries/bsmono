@@ -97,9 +97,11 @@ kind = "cargo"
 role = "app"
 daemon = false
 flatpak = true
-runtime = "tbd"          # GUI toolkit not yet confirmed
+runtime = "none"         # pure egui/glow — av1tuner_app depends on eframe + egui and nothing else
 targets = ["desktop"]
-notes = "AV1 encoding GUI; per-segment isolation/resume; runtime TBD"
+bin = "av1tuner_app"
+primary = true           # egui-first; no Qt/GTK surface exists, so nothing to archive
+notes = "AV1 encoding GUI; per-segment isolation/resume. Runtime was 'tbd' with the note 'GUI toolkit not yet confirmed' long after av1tuner_app settled on eframe+egui, and it carried no `primary` flag — so gitmind's catalogue could not tell which frontend to build. Confirmed and set 2026-09-02 while reconciling this file against UI_STRATEGY.md, which had already listed it as egui-only."
 # RESOLVED (c11): av1tuner-m1 merged into apps/av1tuner (union of both sides'
 # fixes) and retired. This entry is the survivor. apps/av1tuner/DUPLICATE.md
 # has the full ledger; the fork's history remains in git.

@@ -13,24 +13,32 @@ on every surface yet. Nothing here deletes a working front-end.
 - **qt-ui-kit (archived, maintained).** The reusable Qt/QML surface, kept for parity and reference.
 - **gtk-ui-kit (archived, maintained).** The reusable GTK4/libadwaita surface, same footing.
 
-## Frontend inventory (as of this pass)
+## Frontend inventory
 
-| app             | egui (primary)                    | Qt/QML (→ qt-ui-kit)        | GTK (→ gtk-ui-kit)      |
-|-----------------|-----------------------------------|-----------------------------|-------------------------|
-| gitmind         | crates/gui-egui                   | crates/gui (15 qml)         | —                       |
-| aperture        | crates/aperture-egui (only UI)    | —                           | —                       |
-| voiceterm       | egui-frontend                     | qml (18 qml)                | —                       |
-| bo-suite        | egui-frontend                     | bo-controller/qml (46 qml)  | —                       |
-| ambient-learner | src/ui/egui (feature `egui`)      | 14 qml                      | gtk4 + libadwaita       |
-| bot-arena       | egui-frontend                     | —                           | gtk4                    |
-| rusty-board     | egui-frontend                     | —                           | gtk4                    |
-| logscope        | crates/logscope-egui              | —                           | crates/logscope (gtk)   |
-| snapclone       | egui-frontend                     | —                           | —                       |
-| hatch           | egui-frontend                     | qml (Plasma 6 plasmoid)     | —                       |
-| av1tuner(-m1)   | av1tuner_app                      | —                           | —                       |
-| settings-app    | SettingsEditor (`bsettings`)      | —                           | —                       |
-| dialer          | crates/dialer-egui (only UI)      | —                           | —                       |
-| launcher        | apps/hatch/egui-frontend          | apps/hatch/qml (8 qml)      | —                       |
+**`manifest/projects.toml` is canonical.** It is machine-read — gitmind's app
+catalogue builds from it — so a table here would be a second answer to a
+question that already has one, and the two would drift silently. They already
+had: this file listed av1tuner as egui-only while the manifest still said
+`runtime = "tbd"` ("GUI toolkit not yet confirmed") with no `primary` flag, so
+the catalogue could not tell which frontend to build. Reconciled 2026-09-02;
+the manifest was the stale side and was corrected.
+
+To read the inventory:
+
+```sh
+# every app and which frontend is primary
+grep -E '^\[apps\.|^primary|^runtime' manifest/projects.toml
+```
+
+`primary = true` marks the frontend that `cargo build --release` should
+produce and that gitmind offers. An app with a Qt/QML or GTK surface alongside
+its egui one carries the flag on the egui entry; the archived surface stays in
+the tree and keeps building (see the tiers above) but is not what gets built
+by default.
+
+If you add a frontend, put it in the manifest. This file explains WHY the
+tiers exist; it does not track WHICH apps are in them.
+
 
 ## Why kits, not deletion
 
