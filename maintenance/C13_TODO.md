@@ -2719,3 +2719,26 @@ codebase take a model's word for state — worth auditing with this in mind:
 and the ladder fires: nothing known. The next run should show either working
 tool calls or a clean abort at 4 turns with a named reason — both are
 actionable, which the previous 9-turn loop was not.
+
+
+## 86. §53-4 closed: the context selection is now inspectable
+
+`Plan::explain` + a Files-page panel showing every candidate with its
+relevance and verdict, sorted so the cut line is visible.
+
+Note that §53 item 4 as originally written ("surface ctxplan relevance on the
+context cards") was slightly wrong about WHERE. The context CARDS already
+carry a relevance figure — `ctxcard`'s topic-match count, deliberately a
+checkable ratio rather than an invented confidence. That answers "how related
+is this document". The gap was the other question: "why did the planner choose
+these files", which is a different measure over a different set and belongs in
+its own panel rather than on the cards.
+
+Two panels, two numbers, and they must not be confused:
+- card relevance  = topic words matched / topic words present, per document.
+- plan relevance  = `relevance_for_query` path-shape + question match, per
+  candidate file, and it is what decides whether the model sees the file at all.
+
+Remaining from the reference design (§53): the left nav's icon+title+subtitle
+rail, and applying `carved_frame` consistently. Both are application rather
+than new code.
