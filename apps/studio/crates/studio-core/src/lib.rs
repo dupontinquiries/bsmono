@@ -42,6 +42,7 @@ use std::collections::BTreeMap;
 
 mod curves;
 pub use curves::{Binding, Curve, Gate, Opening, Sweep};
+mod batch;
 
 /// A point or duration on the project timebase, in ticks.
 ///
