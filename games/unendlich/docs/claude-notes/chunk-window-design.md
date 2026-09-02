@@ -181,3 +181,55 @@ own passes.
 Steps 1–2 have no hardware dependency and no build dependency on the
 engine, which is why they were done first. Step 3 is a day of careful
 API-preserving surgery; 4 is where the numbers change.
+
+## Addendum 2026-09-02 (later): the binary mesher in the crate, and what it found
+
+`render/mesher_binary.rs` landed: bit visibility + merging on `bitchunk`,
+the engine's own emitters for everything else, coverage-identical to the
+greedy mesher (tested against it, including transparent-vs-same-type across
+a chunk boundary). `UNENDLICH_MESHER=binary` selects it.
+
+Measured in-crate at opt-level 2, one 2.1 GHz core, 20 iterations:
+
+| chunk | greedy | binary | vertices | of which |
+|---|---|---|---|---|
+| stone heightfield | 2.4–3.2 ms | 0.6–1.0 ms (3.3–3.8×) | 12 524 | all plain quads |
+| grass/dirt/stone surface | 10–16 ms | 8.5–13 ms (1.2×) | **236 208** | ~106 K special emitters, ~127 K decoration, ~3 K plain |
+| underground caves | 8.7–9.0 ms | 7.0 ms (1.2×) | 145 440 | 36 K plain quads × 4 |
+
+The scan is gone (the 3.8× on plain terrain). What is left is emission,
+and the emission numbers are the finding:
+
+- A **surface chunk** — every chunk you look at — is 236 K vertices where
+  its cube faces need ~15 K. `emit_jittered_top` / `emit_subdivided_top`
+  / `emit_soft_side_face` produce ~16 vertices per face on 6 651 faces;
+  `decorate_chunk` emits a sub-voxel *grid* per grass tuft
+  (`emit_subvoxel_grid`, ~280 vertices, 45 % of grass blocks). That is
+  5.6 MB of vertex data per surface chunk at the CPU `Vertex` size, 1.9 MB
+  on the wire. It is the direct cause of: the upload budget knobs, the M2
+  memcpy stall, mesh-pool fragmentation, the 220 chunks/s ceiling, and
+  why rd > 8 hurts. With `UNENDLICH_MESHER_PLAIN_TOPS=1
+  UNENDLICH_MESHER_PLAIN_SIDES=1` the same chunk meshes in 3.3 ms with
+  157 K vertices — still 127 K of tufts.
+- **Caves** are 36 K plain quads → 145 K vertices at 7 ms: `emit_quad`
+  is ~190 ns per quad (tint noise + brightness + corner memo). Fine per
+  quad; the count is the terrain's.
+
+So the mesher's remaining cost and the renderer's vertex load have the
+same two causes, both art-side emitters: the special top/side emitters
+(~35 verts/face) and voxel-grid grass tufts (~280 verts/tuft). Neither is
+a mesher problem. The decisions to put in front of a playtest:
+
+1. Tufts as cross-quads (8 vertices) or a billboard atlas, not sub-voxel
+   grids; density is fine, geometry is 35× too heavy.
+2. Soft sides and jittered tops as vertex-shader displacement over merged
+   quads (the sag/jitter is a function of world position and block — it
+   can be evaluated in `chunk.vert` from the packed position), which
+   restores merging and drops the special emitters to 4 verts/face.
+3. Until then, the two `PLAIN_*` knobs for an A/B of look vs. cost.
+
+The binary mesher is the right base for (2): once specials are shader-
+side, every face is a plain quad and the whole surface chunk is ~4 K
+quads in well under a millisecond — which is what makes the toroidal
+window's fixed mesh slots feasible (a surface slot at 16 K vertices is
+128 KB packed, not 1.9 MB).

@@ -49,6 +49,11 @@ pub struct BinaryMeshStats {
     pub plain_quads: u32,
     /// Faces routed to a special emitter (jittered/subdivided top, soft side).
     pub special_faces: u32,
+    /// Vertices the cube faces produced (plain + special), before decoration.
+    pub face_vertices: u32,
+    /// Vertices added by `decorate_chunk` + water + lava. On a grass
+    /// surface chunk this is ~124 per grass block — half the mesh.
+    pub decoration_vertices: u32,
 }
 
 /// Which `AXIS_CONFIGS` entry a `bitchunk::Face` maps to, and whether the
@@ -178,6 +183,32 @@ fn scan(chunk: &Chunk) -> Sets {
     s
 }
 
+/// Which faces bypass the special emitters and become plain merged
+/// quads. `UNENDLICH_MESHER_PLAIN_TOPS=1` / `UNENDLICH_MESHER_PLAIN_SIDES=1`.
+/// The timing report shows why the knobs exist: on a grass/dirt surface
+/// chunk the special emitters produce ~35 vertices per face (236 K
+/// vertices per chunk) and ~13 of 16 ms; plain quads are 4 vertices and
+/// merge. It is a visual decision, so it is a knob and not a default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BinaryOpts {
+    pub plain_tops: bool,
+    pub plain_sides: bool,
+}
+
+impl BinaryOpts {
+    pub fn from_env() -> BinaryOpts {
+        static V: std::sync::OnceLock<BinaryOpts> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            let on = |k: &str| std::env::var(k).map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+            let o = BinaryOpts { plain_tops: on("UNENDLICH_MESHER_PLAIN_TOPS"), plain_sides: on("UNENDLICH_MESHER_PLAIN_SIDES") };
+            if o.plain_tops || o.plain_sides {
+                log::info!("binary mesher: plain_tops={} plain_sides={} (special emitters bypassed)", o.plain_tops, o.plain_sides);
+            }
+            o
+        })
+    }
+}
+
 /// Mesh `chunk` with `bitchunk` visibility + merging and the engine's own
 /// emitters. Drop-in for `mesh_chunk_greedy_with_neighbors`.
 pub fn mesh_chunk_binary(
@@ -196,6 +227,17 @@ pub fn mesh_chunk_binary_with_stats(
     sky: Option<&crate::sky::Sky>,
     world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>>,
     current_tick: Option<u64>,
+) -> (ChunkMesh, BinaryMeshStats) {
+    mesh_chunk_binary_opts(chunk, neighbors, sky, world_model, current_tick, BinaryOpts::from_env())
+}
+
+pub fn mesh_chunk_binary_opts(
+    chunk: &Chunk,
+    neighbors: &NeighborChunks,
+    sky: Option<&crate::sky::Sky>,
+    world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>>,
+    current_tick: Option<u64>,
+    opts: BinaryOpts,
 ) -> (ChunkMesh, BinaryMeshStats) {
     let mut mesh = ChunkMesh::empty();
     let mut stats = BinaryMeshStats::default();
@@ -231,8 +273,8 @@ pub fn mesh_chunk_binary_with_stats(
             let (cfg, swap) = cfg_for(face_dir);
             let is_top = face_dir == Face::PosY;
             let is_side = matches!(face_dir, Face::PosX | Face::NegX | Face::PosZ | Face::NegZ);
-            let special_set = if is_top && sets.any_jitter { Some(&sets.jitter_top) }
-                else if is_side && sets.any_soft { Some(&sets.soft_side) }
+            let special_set = if is_top && sets.any_jitter && !opts.plain_tops { Some(&sets.jitter_top) }
+                else if is_side && sets.any_soft && !opts.plain_sides { Some(&sets.soft_side) }
                 else { None };
             let mut plain = visible;
             if let Some(sp) = special_set {
@@ -294,9 +336,11 @@ pub fn mesh_chunk_binary_with_stats(
                 stats.plain_quads += 1;
             }
         }
+        stats.face_vertices = mesh.vertices.len() as u32;
         mesher::decorate_chunk(chunk, &mut mesh, origin, sky, current_tick);
         mesher::emit_water_surface(chunk, &mut mesh, origin, sky);
         mesher::emit_lava_surface(chunk, &mut mesh, origin, sky);
+        stats.decoration_vertices = mesh.vertices.len() as u32 - stats.face_vertices;
     }
     (mesh, stats)
 }
@@ -479,9 +523,33 @@ mod tests {
             let mut bv = 0; let mut st = BinaryMeshStats::default();
             for _ in 0..iters { let (m, s) = mesh_chunk_binary_with_stats(&c, &nb, None, None, None); bv = m.vertices.len(); st = s; }
             let b_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
-            println!("{:42} greedy {:8.0} us ({} verts)   binary {:8.0} us ({} verts)   faces={} plain_quads={} special={}   ratio {:.1}x",
-                name, g_us, gv, b_us, bv, st.faces, st.plain_quads, st.special_faces, g_us / b_us);
+            let plain = BinaryOpts { plain_tops: true, plain_sides: true };
+            let t = Instant::now();
+            let mut pv = 0; let mut pst = BinaryMeshStats::default();
+            for _ in 0..iters { let (m, s) = mesh_chunk_binary_opts(&c, &nb, None, None, None, plain); pv = m.vertices.len(); pst = s; }
+            let p_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            println!("{:42} greedy {:8.0} us ({} verts)   binary {:8.0} us ({} verts: {} faces + {} decoration)   faces={} plain_quads={} special={}   ratio {:.1}x   | plain-specials {:8.0} us ({} verts: {} faces + {} decoration, {} quads) ratio {:.1}x",
+                name, g_us, gv, b_us, bv, st.face_vertices, st.decoration_vertices, st.faces, st.plain_quads, st.special_faces, g_us / b_us,
+                p_us, pv, pst.face_vertices, pst.decoration_vertices, pst.plain_quads, g_us / p_us);
         }
+    }
+
+    #[test]
+    fn plain_specials_cover_every_face_with_four_vertex_quads() {
+        let f = |x: i32, y: i32, z: i32| -> BlockId {
+            let h = 8 + ((x * 2 + z) % 5);
+            if y + 1 == h { BlockId::Grass } else if y < h { BlockId::Dirt } else { BlockId::Air }
+        };
+        let c = chunk_from(ChunkCoord::new(0, 0, 0), f);
+        let plain = BinaryOpts { plain_tops: true, plain_sides: true };
+        let (m, st) = mesh_chunk_binary_opts(&c, &NeighborChunks::none(), None, None, None, plain);
+        assert_eq!(st.special_faces, 0);
+        // Every cube face is now a plain 4-vertex quad; everything else in
+        // the mesh is decoration (grass tufts), which the stats separate.
+        assert_eq!(st.face_vertices, st.plain_quads * 4);
+        assert_eq!(m.vertices.len() as u32, st.face_vertices + st.decoration_vertices);
+        assert!(st.decoration_vertices > st.face_vertices,
+            "on a grass surface the tufts outweigh the terrain: {} vs {}", st.decoration_vertices, st.face_vertices);
     }
 
     #[test]
