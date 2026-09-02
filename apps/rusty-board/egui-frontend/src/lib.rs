@@ -619,6 +619,20 @@ fn dispatch_key(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, resp: &egui::Res
         // key and a desktop key both flick at a quarter of their height (FlickBoard's default
         // swipe threshold is 8dp — short flicks are the point of this layout).
         let deadzone = (size.y * 0.25).clamp(9.0, 16.0);
+        // ENGAGED = something can come out of this key this frame: it is pressed, dragging,
+        // releasing, or its compass is still open from an earlier frame. A key that is none
+        // of those (thirty-nine of the forty, on any frame) returns here, before the option
+        // strings below are built and before the widget is consulted. This was the
+        // per-frame cost of a cardinal board: nine small allocations per key per frame for
+        // keys nobody was touching.
+        let engaged = resp.is_pointer_button_down_on()
+            || resp.dragged()
+            || resp.drag_stopped()
+            || resp.clicked()
+            || uikit_egui::slide_menu::SlideMenu::is_cardinal_open(ui, id);
+        if !engaged {
+            return None;
+        }
         let thresholds = cardinal_gesture::CardinalThresholds::default()
             .scaled(deadzone as f64 / cardinal_gesture::CardinalThresholds::default().tap_max_excursion_px);
         // Steno keys (L1/L2/R1/R2): the tap/direction resolution is identical to a normal cardinal

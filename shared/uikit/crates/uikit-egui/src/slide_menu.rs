@@ -759,6 +759,14 @@ impl SlideMenu {
         SlideOutcome::Idle
     }
 
+    /// Whether a cardinal press is in progress on `id`. A host with many cardinal keys (a
+    /// keyboard: forty of them, every frame) can skip building this key's option list and
+    /// calling `show_cardinal` at all unless the key is pressed, being dragged, releasing, or
+    /// OPEN from an earlier frame — this is the probe for the last case. One map lookup.
+    pub fn is_cardinal_open(ui: &Ui, id: Id) -> bool {
+        ui.ctx().data(|d| d.get_temp::<SlideState>(id).map(|s| s.open).unwrap_or(false))
+    }
+
     /// Forget an in-progress cardinal press without committing it. For a host that resolved the
     /// same press some other way (a hairpin classifier claiming it for capitalisation, say): if
     /// the state were left `open`, the compass would stay drawn and the NEXT press on this key

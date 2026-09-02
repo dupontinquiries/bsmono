@@ -750,7 +750,7 @@ impl Feel {
                     if self.real_active {
                         // the real layout files: render via the projection, feed emissions through
                         // the board's state machine (shift/symbols absorbed), act on the rest
-                        let render = self.real.render();
+                        let render = self.real.render_rc();
                         if let Some(e) = keyboard_ui(ui, &render, &adaptive, self.board.palette()) {
                             // THROUGH THE SINK, not straight into the
                             // preview string. These wrote to `self.typed`
@@ -809,8 +809,15 @@ impl Feel {
                     // ── swipe typing over whichever board is showing ──────────────────
                     let board_rect = egui::Rect::from_min_max(board_top, ui.cursor().min
                         + egui::vec2(ui.available_width(), 0.0));
-                    let render = if self.real_active { self.real.render() } else { self.board.current().clone() };
-                    if self.swipe.update(ui, &render, board_rect, &adaptive).is_some() {
+                    // The swipe overlay reads the same layout the keys were drawn from: the
+                    // cached projection for a real file (no second projection), a borrow of
+                    // the demo board (no clone — `swipe` and `board` are disjoint fields).
+                    let real_render = if self.real_active { Some(self.real.render_rc()) } else { None };
+                    let render: &Layout = match &real_render {
+                        Some(r) => r,
+                        None => self.board.current(),
+                    };
+                    if self.swipe.update(ui, render, board_rect, &adaptive).is_some() {
                         // A completed swipe suppresses nothing: the candidates appear above and
                         // the user picks. Committing automatically would fight the tap that the
                         // same gesture's lift also produces on some touch stacks.

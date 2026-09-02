@@ -290,6 +290,12 @@ pub struct RealBoard {
     pub active: usize,
     pub shift: Shift,
     before_symbols: Option<usize>,
+    /// The last projection, keyed by what it depends on. `to_render` clones every key of the
+    /// active file (labels, variants, cardinal tables); the screen asked for it twice a frame
+    /// (once to draw, once for the swipe overlay), so a 40-key board was ~600 string clones per
+    /// frame that produced the same layout as the frame before. `Rc` so callers hold it across
+    /// their own `&mut self` work without a borrow of the board.
+    render_cache: Option<(usize, Shift, std::rc::Rc<crate::Layout>)>,
 }
 
 impl RealBoard {
@@ -303,7 +309,20 @@ impl RealBoard {
         let mut files = builtin();
         files.push(board_layouts::Layout::default_cardinal_grid());
         files.push(board_layouts::Layout::default_stenotype());
-        RealBoard { files, active: 0, shift: Shift::Off, before_symbols: None }
+        RealBoard { files, active: 0, shift: Shift::Off, before_symbols: None, render_cache: None }
+    }
+
+    /// The render layout for the current file + shift state, cached until either changes.
+    /// This is what the screen calls every frame; `render()` remains for one-off projections.
+    pub fn render_rc(&mut self) -> std::rc::Rc<crate::Layout> {
+        if let Some((a, s, rc)) = &self.render_cache {
+            if *a == self.active && *s == self.shift {
+                return rc.clone();
+            }
+        }
+        let rc = std::rc::Rc::new(self.render());
+        self.render_cache = Some((self.active, self.shift, rc.clone()));
+        rc
     }
 
     /// Indices into `files` that get a sidebar tab (everything but the symbols page, which is
@@ -314,7 +333,7 @@ impl RealBoard {
     }
 
     pub fn with_files(files: Vec<LayoutFile>) -> RealBoard {
-        RealBoard { files, active: 0, shift: Shift::Off, before_symbols: None }
+        RealBoard { files, active: 0, shift: Shift::Off, before_symbols: None, render_cache: None }
     }
 
     pub fn current(&self) -> &LayoutFile {
@@ -599,6 +618,29 @@ mod tests {
     fn voice_emit_classifies_as_voice_like_the_real_layout_action() {
         assert_eq!(classify(&voice_emit()), Press::Voice);
         assert_eq!(voice_emit(), action_emit(&KeyAction::Voice, "🎤"));
+    }
+
+    #[test]
+    fn the_cached_projection_is_shared_until_shift_or_layout_changes() {
+        let mut b = RealBoard::new();
+        let a = b.render_rc();
+        let a2 = b.render_rc();
+        assert!(std::rc::Rc::ptr_eq(&a, &a2), "same file, same shift: same allocation");
+        b.shift = Shift::Once;
+        let c = b.render_rc();
+        assert!(!std::rc::Rc::ptr_eq(&a, &c), "shift changed: re-projected");
+        assert_ne!(a.rows[0].keys[0].emit, c.rows[0].keys[0].emit, "and the projection actually differs");
+        b.active = 1;
+        let d = b.render_rc();
+        assert!(!std::rc::Rc::ptr_eq(&c, &d));
+        let plain = b.render();
+        assert_eq!(d.name, plain.name, "the cache is the plain projection, not a variant of it");
+        assert_eq!(d.rows.len(), plain.rows.len());
+        for (x, y) in d.rows.iter().zip(&plain.rows) {
+            let xs: Vec<&str> = x.keys.iter().map(|k| k.emit.as_str()).collect();
+            let ys: Vec<&str> = y.keys.iter().map(|k| k.emit.as_str()).collect();
+            assert_eq!(xs, ys);
+        }
     }
 
     #[test]
