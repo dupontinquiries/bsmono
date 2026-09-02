@@ -33,25 +33,6 @@ use std::path::{Path, PathBuf};
 /// redrawing the line" is.
 const KNOWN_GAPS: &[(&str, &str)] = &[
     (
-        "cha_and_vpa",
-        "CHA (CSI n G) and VPA (CSI n d) — absolute column and row addressing. \
-         readline redraws an edited line by jumping to a column rather than by \
-         counting backspaces, so without CHA the redraw lands wherever the \
-         cursor happened to be and the line interleaves with itself.",
-    ),
-    (
-        "erase_and_cha",
-        "Same CHA gap, reached through a real recorded shell session rather \
-         than a constructed sequence.",
-    ),
-    (
-        "ich_dch_ech",
-        "ICH (CSI n @), DCH (CSI n P), ECH (CSI n X) — insert, delete and erase \
-         characters in place. A line editor uses these to rewrite the middle of \
-         a line without repainting the tail; ignoring them leaves the stale \
-         tail on screen.",
-    ),
-    (
         "il_dl_region",
         "IL (CSI n L), DL (CSI n M) and DECSTBM (CSI t;b r) — insert/delete \
          line, and the scrolling region they operate inside. Every full-screen \

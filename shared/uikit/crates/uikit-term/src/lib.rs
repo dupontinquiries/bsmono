@@ -343,6 +343,58 @@ impl Grid {
         }
     }
 
+    /// Erase `n` characters from the cursor (ECH, `CSI n X`): blank them in
+    /// place, shifting nothing and moving the cursor nowhere.
+    ///
+    /// Distinct from [`Grid::erase_in_line`], which always runs to the end of
+    /// the row. A line editor uses ECH to clear exactly the width of the text
+    /// it is about to overwrite, and treating it as "erase to end" throws away
+    /// the tail the editor was relying on keeping.
+    pub fn erase_chars(&mut self, n: usize) {
+        let base = self.idx(self.cur_row, 0);
+        let start = self.cur_col.min(self.cols);
+        let end = (start + n.max(1)).min(self.cols);
+        for c in start..end {
+            self.cells[base + c] = Cell { ch: ' ', style: self.pen };
+        }
+    }
+
+    /// Insert `n` blanks at the cursor (ICH, `CSI n @`), pushing the rest of
+    /// the row right. Characters pushed past the last column are lost — the
+    /// row does not wrap into the next one, which is what makes this cheap
+    /// enough for an editor to use on every keystroke.
+    pub fn insert_chars(&mut self, n: usize) {
+        let base = self.idx(self.cur_row, 0);
+        let start = self.cur_col.min(self.cols);
+        if start >= self.cols {
+            return;
+        }
+        let n = n.max(1).min(self.cols - start);
+        for c in (start + n..self.cols).rev() {
+            self.cells[base + c] = self.cells[base + c - n];
+        }
+        for c in start..(start + n).min(self.cols) {
+            self.cells[base + c] = Cell { ch: ' ', style: self.pen };
+        }
+    }
+
+    /// Delete `n` characters at the cursor (DCH, `CSI n P`), pulling the rest
+    /// of the row left and blanking the `n` columns freed at the end.
+    pub fn delete_chars(&mut self, n: usize) {
+        let base = self.idx(self.cur_row, 0);
+        let start = self.cur_col.min(self.cols);
+        if start >= self.cols {
+            return;
+        }
+        let n = n.max(1).min(self.cols - start);
+        for c in start..self.cols - n {
+            self.cells[base + c] = self.cells[base + c + n];
+        }
+        for c in self.cols - n..self.cols {
+            self.cells[base + c] = Cell { ch: ' ', style: self.pen };
+        }
+    }
+
     /// Erase in display: 0 = cursor→end, 1 = start→cursor, 2 = whole screen.
     pub fn erase_in_display(&mut self, mode: u16) {
         match mode {
@@ -590,6 +642,32 @@ impl Parser {
                 let c = Self::param_or(params, 1, 1).saturating_sub(1) as usize;
                 grid.move_to(r, c);
             }
+            // CNL / CPL — down/up n lines AND to column 0. Not the same as
+            // 'B'/'A', which preserve the column.
+            'E' => {
+                let n = Self::param_or(params, 0, 1) as usize;
+                grid.move_to(grid.cur_row + n, 0);
+            }
+            'F' => {
+                let n = Self::param_or(params, 0, 1) as usize;
+                grid.move_to(grid.cur_row.saturating_sub(n), 0);
+            }
+            // CHA / HPA — absolute column, 1-based. This is how readline
+            // redraws an edited line: it jumps to a column rather than
+            // counting backspaces. Dropping it was why a themed prompt's
+            // redraw interleaved with itself (C13_TODO §19).
+            'G' | '`' => {
+                let c = Self::param_or(params, 0, 1).saturating_sub(1) as usize;
+                grid.move_to(grid.cur_row, c);
+            }
+            // VPA — absolute row, 1-based, column preserved.
+            'd' => {
+                let r = Self::param_or(params, 0, 1).saturating_sub(1) as usize;
+                grid.move_to(r, grid.cur_col);
+            }
+            '@' => grid.insert_chars(Self::param_or(params, 0, 1) as usize),
+            'P' => grid.delete_chars(Self::param_or(params, 0, 1) as usize),
+            'X' => grid.erase_chars(Self::param_or(params, 0, 1) as usize),
             'J' => grid.erase_in_display(params.first().copied().unwrap_or(0)),
             'K' => grid.erase_in_line(params.first().copied().unwrap_or(0)),
             'm' => self.apply_sgr(params, grid),
@@ -1873,6 +1951,80 @@ mod tests {
         t.feed("abcde");
         assert_eq!(t.grid.row_text(0), "abcd");
         assert_eq!(t.grid.row_text(1), "e");
+    }
+
+    #[test]
+    fn absolute_column_and_row_addressing() {
+        // CHA and VPA are what readline redraws an edited line with. The two
+        // spellings of CHA ('G' and the older '`') must agree, or a program
+        // using the one that is missing redraws into the wrong column.
+        let mut t = Terminal::new(10, 4);
+        t.feed("abcdefgh\x1b[3G_");
+        assert_eq!(t.grid.row_text(0), "ab_defgh");
+        t.feed("\x1b[1`X");
+        assert_eq!(t.grid.row_text(0), "Xb_defgh");
+        t.feed("\x1b[3dQ");
+        assert_eq!(t.grid.cur_row, 2, "VPA moves the row");
+        assert_eq!(t.grid.row_text(2), " Q", "and preserves the column");
+    }
+
+    #[test]
+    fn erase_chars_clears_exactly_n_and_shifts_nothing() {
+        // The property is "n cells, in place". Asserting only that the row
+        // changed would pass for erase-to-end, which is the bug ECH exists to
+        // avoid — so the tail is asserted too, in both directions.
+        let mut t = Terminal::new(10, 2);
+        t.feed("abcdefgh\x1b[1;3H\x1b[2X");
+        assert_eq!(t.grid.row_text(0), "ab  efgh");
+        assert_eq!(t.grid.cur_col, 2, "ECH does not move the cursor");
+
+        // n past the end of the row clamps rather than spilling into the next.
+        let mut t = Terminal::new(4, 2);
+        t.feed("abcd\x1b[2;1Hz\x1b[1;3H\x1b[99X");
+        assert_eq!(t.grid.row_text(0), "ab");
+        assert_eq!(t.grid.row_text(1), "z", "the next row is untouched");
+    }
+
+    #[test]
+    fn insert_and_delete_chars_shift_within_the_row_only() {
+        let mut t = Terminal::new(8, 2);
+        t.feed("abcdef\x1b[2;1Hz\x1b[1;3H\x1b[2@");
+        assert_eq!(t.grid.row_text(0), "ab  cdef");
+        assert_eq!(t.grid.row_text(1), "z", "insert does not wrap into row 1");
+
+        // What insert pushes past the last column is lost, not wrapped.
+        let mut t = Terminal::new(6, 2);
+        t.feed("abcdef\x1b[1;1H\x1b[2@");
+        assert_eq!(t.grid.row_text(0), "  abcd");
+
+        let mut t = Terminal::new(8, 2);
+        t.feed("abcdef\x1b[1;3H\x1b[2P");
+        assert_eq!(t.grid.row_text(0), "abef");
+        assert_eq!(t.grid.cur_col, 2, "DCH does not move the cursor");
+    }
+
+    #[test]
+    fn character_ops_at_the_last_column_are_bounded() {
+        // Every one of these is an index computation on a row, and the last
+        // column is where an off-by-one becomes a write into the next row.
+        for seq in ["\x1b[3X", "\x1b[3@", "\x1b[3P"] {
+            let mut t = Terminal::new(4, 2);
+            t.feed("ab\x1b[2;1Hkeep\x1b[1;4H");
+            t.feed(seq);
+            assert_eq!(t.grid.row_text(1), "keep", "{seq} reached into row 1");
+            assert_eq!(t.grid.cur_row, 0, "{seq} moved the cursor");
+        }
+    }
+
+    #[test]
+    fn cnl_and_cpl_move_to_column_zero() {
+        // The whole difference between CNL/CPL and CUD/CUU is the column, so
+        // that is the thing to assert.
+        let mut t = Terminal::new(10, 5);
+        t.feed("abcde\x1b[2EX");
+        assert_eq!((t.grid.cur_row, t.grid.row_text(2)), (2, "X".to_string()));
+        t.feed("\x1b[1FY");
+        assert_eq!((t.grid.cur_row, t.grid.row_text(1)), (1, "Y".to_string()));
     }
 
     #[test]
