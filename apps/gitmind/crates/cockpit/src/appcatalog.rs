@@ -64,7 +64,21 @@ impl ManifestEntry {
     }
 }
 
-/// Parse `manifest/projects.toml`'s `[apps.*]` sections into a flat list. Minimal hand-rolled
+/// Parse `manifest/projects.toml`'s project sections into a flat list.
+///
+/// EVERY table, not just `[apps.*]`. This read `[apps.` only, and flushed on
+/// any other table header — so `[system.photosync]`, `[system.snapclone]` and
+/// all ten `[games.*]` were invisible to the catalogue. The symptom reported
+/// from the field was "photosync produces no build artifact in gitmind", which
+/// is accurate and understates it: there was no catalogue entry to build, and
+/// nothing said so, because an app that is absent looks exactly like an app
+/// that failed.
+///
+/// Widening this is safe because `is_runnable()` already gates what gets
+/// OFFERED: the twenty `[shared.*]` entries are `role = "library"` and the
+/// seven `[tools.*]` are `role = "tool"`, so neither becomes a build button.
+/// What changes is that they can be SEEN, and that the sections which really
+/// are apps — the games, the two system daemons — reach the catalogue at all. Minimal hand-rolled
 /// line scanning (matching this file's existing `json_field`-style tiny extractors) rather than
 /// a full TOML dependency — the manifest's shape (`[apps.NAME]` sections, quoted string values)
 /// doesn't need one. Pure — no filesystem access; the caller reads the file.
@@ -81,13 +95,15 @@ pub fn parse_manifest(text: &str) -> Vec<ManifestEntry> {
     };
     for raw in text.lines() {
         let line = raw.trim();
-        if let Some(rest) = line.strip_prefix("[apps.").and_then(|r| r.strip_suffix(']')) {
+        if let Some(inner) = line.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
             flush(&mut cur, &mut out);
-            cur = Some((rest.to_string(), String::new(), String::new(), false, String::new()));
-            continue;
-        }
-        if line.starts_with('[') {
-            flush(&mut cur, &mut out); // a different table — this app's section ended
+            // `apps.voiceterm` -> section "apps", id "voiceterm". A table with
+            // no dot (`[targets]`, say) is not a project and starts nothing.
+            if let Some((section, id)) = inner.split_once('.') {
+                if !section.is_empty() && !id.is_empty() && !id.contains('.') {
+                    cur = Some((id.to_string(), String::new(), String::new(), false, String::new()));
+                }
+            }
             continue;
         }
         if let Some((_, path, notes, primary, role)) = cur.as_mut() {
@@ -362,6 +378,43 @@ notes = "the egui-primary port of bo-controller."
 path = "apps/logscope"
 kind = "cargo"
 "#;
+
+    #[test]
+    #[test]
+    fn the_catalogue_sees_projects_outside_apps() {
+        // Against the REAL manifest, not a fixture: the bug was that a whole
+        // class of section never reached the catalogue, and a fixture written
+        // by the same hand that wrote the parser would have had `[apps.*]`
+        // sections in it and passed.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../manifest/projects.toml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let entries = parse_manifest(&text);
+        // A scan that matched nothing passes every assertion below it.
+        assert!(entries.len() > 60, "only {} entries parsed", entries.len());
+
+        let has = |id: &str| entries.iter().any(|e| e.app_id == id);
+        // [system.*] — photosync was the reported symptom: no build artifact,
+        // because there was no entry.
+        assert!(has("photosync"), "system.photosync is not catalogued");
+        assert!(has("snapclone"), "system.snapclone is not catalogued");
+        // [games.*] — ten of them, none previously visible.
+        assert!(has("unendlich"), "games.unendlich is not catalogued");
+        // [apps.*] must not have regressed.
+        assert!(has("voiceterm-egui"), "apps.* stopped being parsed");
+
+        // And the complement: widening WHAT IS SEEN must not widen what is
+        // offered as a build. Libraries and tools are catalogued and not
+        // runnable, which is the whole point of `role`.
+        let by = |id: &str| entries.iter().find(|e| e.app_id == id).cloned();
+        if let Some(lib) = by("core-kit") {
+            assert!(!lib.is_runnable(), "a shared library became a build target");
+        }
+        if let Some(tool) = by("rustcheck") {
+            assert!(!tool.is_runnable(), "a tool became a build target");
+        }
+    }
 
     #[test]
     fn a_primary_port_is_marked_and_the_default_build_is_unambiguous() {
