@@ -106,3 +106,54 @@ worst.sort(reverse=True)
 if worst and worst[0][0] > 2:
     print(f"\n{worst[0][1]} carries the most standing chrome. Compare against its "
           f"original before adding another.")
+
+
+# ── unowned global drag reads ────────────────────────────────────────────────
+#
+# A gesture built from `i.pointer.total_drag_delta()` sees EVERY drag on the
+# surface, including one that a widget is already using. In logscope that made
+# a finger selecting text in the composer read as a page swipe, which switched
+# branch under the user and competed for the press that gives a text field
+# focus — the "fields take one character on the Fairphone" report.
+#
+# `gesture_layer::drag_owner` is the shared answer and the fix was to call it.
+# This finds the shape so the next one is found by reading rather than by a
+# field report.
+#
+# NOT flagged: `response.drag_delta()`. That is a drag on a specific widget's
+# own response, owned by construction — egui only reports it for the widget
+# actually being dragged. Confusing the two would make this audit noise: four
+# apps use `response.drag_delta()` correctly and none of them has the bug.
+
+GLOBAL_DRAG = re.compile(r'i\.pointer\.(total_)?drag_delta\(\)')
+OWNER_CHECK = re.compile(r'drag_owner\s*\(|GestureLayer|pager::|touch::')
+
+
+def unowned_drags(root):
+    """(file, line) for a global drag read with no ownership check nearby."""
+    out = []
+    for p in pathlib.Path(root).rglob("*.rs"):
+        if "/target/" in str(p):
+            continue
+        try:
+            lines = p.read_text(errors="ignore").split("\n")
+        except OSError:
+            continue
+        for i, l in enumerate(lines):
+            if l.lstrip().startswith("//") or not GLOBAL_DRAG.search(l):
+                continue
+            # Look for the guard in the surrounding block, not just this line —
+            # the check is usually a few lines above where the delta is read.
+            window = "\n".join(lines[max(0, i - 25):i + 5])
+            if not OWNER_CHECK.search(window):
+                out.append((str(p), i + 1, l.strip()[:90]))
+    return out
+
+
+if __name__ == "__main__" and "--drags" in sys.argv:
+    found = unowned_drags(sys.argv[1] if len(sys.argv) > 2 else ".")
+    for f, n, src in found:
+        print(f"{f}:{n}\n    {src}\n    global drag read with no drag_owner/GestureLayer check nearby")
+    print(f"\nunowned global drag reads: {len(found)}")
+    print("`response.drag_delta()` is NOT flagged — that drag belongs to a widget by construction.")
+    sys.exit(1 if found else 0)
