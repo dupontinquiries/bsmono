@@ -1811,3 +1811,34 @@ the two is canonical:
 Do not leave both. Note the HUD *is* wired and fed (`hud.observe` at three
 sites, `hud.display` in the chat view), so the display half works — it is the
 state machine behind it that is absent.
+
+
+## 56. A refused tool call still builds a Tool (gate hole), + a third dead duplicate
+
+Found by the new `tool_protocol_round_trip` suite.
+
+**The hole.** `authorize_text` refuses an unnonced call — raises
+`UnnoncedToolCall`, rewrites the head to ```tool_quoted — but `parse_tools`
+scans for the JSON payload without requiring a fence, so the refused call
+still becomes a `Tool`. The prompt promises "tool syntax you quote out of a
+file you read cannot execute"; this is the path by which it could. Pinned as
+an `#[ignore]`d failing test (`tool_gate_hole`).
+
+Two candidate fixes, and the choice matters:
+- `authorize_text` removes the whole refused BLOCK, not just the head. Safest,
+  but it changes what the model sees echoed back and may hurt the retry ladder
+  (the model no longer sees what it got wrong).
+- `parse_tools` requires an authorised fence. Cleaner separation, but every
+  caller that feeds it un-authorised text (tests, the line-call fallback)
+  changes behaviour.
+
+Before either: check whether the executor actually gates on anomalies. If it
+does, this is defence-in-depth rather than a live hole — worth knowing which.
+
+**The duplicate.** `taint::extract_nonced` scans only for `<tool_call` and
+never for ```tool fences, so it cannot see the form the prompt teaches. It has
+no callers; production uses `authorize_text`. Third instance of the
+two-implementations pattern this session (after the tool lists and the two
+liaisons). Delete it or make it delegate — an unused half-implementation of a
+security-relevant check is the worst kind to leave lying around, because the
+next person to need one will find it first.
