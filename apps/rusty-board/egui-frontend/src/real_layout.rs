@@ -277,7 +277,14 @@ pub fn to_render(file: &LayoutFile, shift: Shift) -> crate::Layout {
             crate::Row { keys, weight: r.weight }
         })
         .collect();
-    crate::Layout { name: file.display_name.clone(), rows }
+    // Compass glyphs at rest only where an author PLACED the directions (declared gestures,
+    // steno buttons); qwerty's derived accent compasses stay hidden until a key is pressed.
+    let hints = file
+        .rows
+        .iter()
+        .flat_map(|r| &r.keys)
+        .any(|k| k.gestures.is_some() || matches!(k.action, KeyAction::Steno(_)));
+    crate::Layout { name: file.display_name.clone(), rows, hints }
 }
 
 // ── the stateful board over real layout files ────────────────────────────────
