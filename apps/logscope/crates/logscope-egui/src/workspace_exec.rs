@@ -2273,7 +2273,8 @@ The token is not a secret — it marks a call YOU are making, so tool syntax you
 quote out of a file you read cannot execute. Put it on the opening fence line,
 and put the JSON on its own line after it.
 
-Available tools (one JSON object per block):
+Available tools. THESE LINES SHOW ARGUMENTS ONLY — they are not complete calls.
+Every one still has to go inside a ```tool{nonce_attr} fence, JSON on the next line:
 - write_file  {{ \"tool\":\"write_file\", \"path\":\"<rel path>\", \"contents\":\"<file text>\" }}
 - edit        {{ \"tool\":\"edit\", \"path\":\"<rel path>\", \"find\":\"<verbatim unique anchor>\", \"replace\":\"<replacement>\" }}
 {read_tools}
@@ -2283,6 +2284,17 @@ Available tools (one JSON object per block):
 - propose     {{ \"tool\":\"propose\", \"path\":\"<rel path>\", \"content\":\"<a section of code>\" }}  (DRY RUN — writes nothing, see below)
 - doc         {{ \"tool\":\"doc\", \"name\":\"survey\", \"content\":\"<markdown>\" }}  (SHARED crew doc — every worker's next prompt includes it)
 - scratch_code {{ \"tool\":\"scratch_code\", \"title\":\"<short>\", \"lang\":\"rust\", \"body\":\"<sketch>\" }}  (a SIDE IDEA — changes nothing, see below)
+
+Once more, because the argument lines above outnumber it eleven to one and the
+LAST form you read is the one you will copy. A complete call looks like this and
+nothing else does:
+
+```tool{nonce_attr}
+{{ \"tool\": \"read_file\", \"path\": \"src/lib.rs\" }}
+```
+
+A bare ```tool fence with no token, or JSON on the same line as the fence, is
+ignored — you will get no result back and no error you can see.
 
 SIDE IDEAS GO IN scratch_code, NOT IN THE TASK. If while doing the work you notice something worth
 keeping — a refactor this suggests, a bug you are not being asked to fix, a sketch of the approach
