@@ -46,6 +46,7 @@
 //! `main.qml`'s fixed `width: root.termSidebarWidth` (168) against a
 //! `.default_width(168.0)` that reads like the same statement and is not one.
 
+pub mod fonts;
 pub mod desktop;
 pub mod notify;
 pub mod single_instance;

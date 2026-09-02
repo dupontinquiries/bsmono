@@ -65,6 +65,11 @@ impl PaletteColors {
 /// Apply a palette to the whole context: base Visuals + the app's token radius
 /// and spacing. Call when the user picks a theme in Settings ▸ Look.
 pub fn apply_palette(ctx: &Context, p: &Palette) -> PaletteColors {
+    // The symbol fallbacks, here rather than in every app's startup, because
+    // this is the one function a themed app already calls and a font nobody
+    // installs is how 132 characters came to render as boxes fleet-wide.
+    // Idempotent — see `fonts::install`.
+    crate::fonts::install(ctx);
     let c = PaletteColors::from_palette(p);
     ctx.set_visuals(build_visuals(&c));
     ctx.global_style_mut(|s| {

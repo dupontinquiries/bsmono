@@ -141,10 +141,19 @@ fn main() {
         .unwrap_or_else(|| PathBuf::from("."));
     let found = scan(&root);
 
-    // A bare context with the DEFAULT fonts — the state every app in this tree
-    // is actually in, since none of them install any.
+    // The fonts an app ACTUALLY gets. `uikit_egui::fonts::install` is what
+    // `apply_palette` calls, so auditing a bare default context would measure
+    // a configuration nothing ships and report boxes that users never see.
+    //
+    // Pass `--bare` to audit the defaults instead — useful for seeing what the
+    // symbol fonts are buying, and for reproducing the original finding.
+    let bare = std::env::args().any(|a| a == "--bare");
     let ctx = egui::Context::default();
     ctx.run(Default::default(), |_| {}); // one pass so the font atlas exists
+    if !bare {
+        uikit_egui::fonts::install(&ctx);
+        ctx.run(Default::default(), |_| {}); // rebuild the atlas with them in it
+    }
 
     // Ask at a real UI size. Coverage does not vary by size, but asking
     // through a FontId is the API, and Body is what most of these are drawn
@@ -164,9 +173,22 @@ fn main() {
     let control = |c: char| ctx.fonts_mut(|f| f.has_glyph(&font, c));
     assert!(control('a') && control('é'), "Latin is missing — the atlas did not build");
     assert!(control('▶') && control('⬅'), "the icon font is not loaded at all");
-    assert!(!control('→') && !control('▲'),
-            "the controls now resolve — either a font was added (good: update these) \
-             or has_glyph has stopped discriminating (bad)");
+    if bare {
+        // The original finding, kept runnable. `▶` is covered by egui's
+        // hand-picked subset and `▲` is not; `⬅` is and `→` is not. Neighbours
+        // on opposite sides of that subset, so a `has_glyph` that has stopped
+        // discriminating fails here instead of reporting "nothing is missing",
+        // which would read as a result.
+        assert!(!control('→') && !control('▲'),
+                "the bare defaults now cover these — egui changed its bundled fonts");
+    } else {
+        // With the symbol fonts in, the same two must resolve. This is the
+        // acceptance test for `fonts::install`: a font that is declared but
+        // never reaches the atlas leaves the audit reporting exactly what it
+        // reported before, and the run still exits 0.
+        assert!(control('→') && control('▲') && control('✓'),
+                "fonts::install ran but the symbol faces are not in the atlas");
+    }
 
     let mut missing: Vec<(char, usize, BTreeSet<String>)> = Vec::new();
     let mut present = 0usize;
