@@ -2139,3 +2139,35 @@ it is a DESIGN question, not a defect:
 Do not leave it ambiguous. Fixed separately this session: the plan now refuses
 to stage at all when there is too little to fold (§ the refresh commit), which
 removes the most confusing instance without answering this question.
+
+
+## 64. §56 gate hole CLOSED — and it was live
+
+The prior question is answered: nothing gates on `anomalies`. The one
+production caller logs them with `eprintln!` and parses the text anyway. So a
+tool call quoted out of a file the model read COULD execute; it was not
+defence-in-depth.
+
+Fixed conservatively — `authorize_text` removes the whole refused block and
+leaves `REFUSED_MARKER`. The alternative (make `parse_tools` require an
+authorised fence) stays unimplemented on purpose: cleaner in shape, but it
+changes every caller that feeds un-authorised text, and this was not the path
+to take the elegant option on.
+
+**Overridden a prior deliberate design choice**, recorded because it should
+not be discovered by surprise later: refused content is no longer "preserved
+for the human to read" inside the model-facing text. It is preserved in the
+anomaly snippet, which is the operator-facing channel. Same goal, right
+channel — and the old behaviour was the vulnerability.
+
+**Follow-up worth doing, now cheap:** `parse_tools` requiring an authorised
+fence would make this defence-in-depth rather than a single point. Not
+urgent now that the payload never reaches it, but it is the difference
+between one correct function and a system that stays correct if that
+function regresses. Do it when the callers can be audited properly.
+
+**Also still true and unaddressed:** the executor ignoring `anomalies`
+entirely is its own smell. Nothing currently needs it — the refusal is
+enforced upstream — but a caller that receives a list of security anomalies
+and only prints them will eventually be given one that matters. Consider
+making the return type harder to ignore.
