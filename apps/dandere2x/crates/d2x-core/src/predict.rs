@@ -28,9 +28,9 @@ pub struct AnalyzeConfig {
     /// figure, which is ≈5.2 dB of true PSNR; this is only a shortcut past
     /// matching, `redraw_fraction` is the decision that matters.
     pub min_psnr: f64,
-    /// If more than this fraction of blocks are missing, redraw the whole
-    /// frame instead of assembling a residual that is nearly the frame.
-    /// Upstream's test works out to ≈0.89 at block 30 / bleed 1.
+    /// Redraw the whole frame when the packed residual would cover at least
+    /// this fraction of the frame's pixels (it can exceed 1.0: bleed makes
+    /// cells bigger than blocks). Upstream's test is the same idea at 0.95.
     pub redraw_fraction: f64,
     /// Run the per-block brightness-shift pass.
     pub fade: bool,
@@ -155,7 +155,15 @@ pub fn analyze(
         }
     }
 
-    if (stats.missing as f64) > cfg.redraw_fraction * (grid.len() as f64) {
+    // Redraw when the packed residual would cover at least `redraw_fraction`
+    // of the frame's pixels. Counted in pixels, not blocks: with bleed the
+    // residual cells are bigger than blocks, so a mostly-missing frame packs
+    // into something *larger* than the frame itself.
+    let dim = FramePlan::residual_dim_for(stats.missing as usize);
+    let cell = (cfg.block_size + 2 * cfg.bleed) as f64;
+    let residual_px = (dim as f64 * cell).powi(2);
+    let frame_px = (grid.width() as f64) * (grid.height() as f64);
+    if residual_px >= cfg.redraw_fraction * frame_px {
         // Undo the fades: the redraw output is the original next frame, and
         // the low-res prev must not carry a shift the high-res prev never got.
         for f in &fades {
@@ -167,7 +175,6 @@ pub fn analyze(
     }
 
     // --- residual vectors, row-major over missing cells.
-    let dim = FramePlan::residual_dim_for(stats.missing as usize);
     let mut residuals = Vec::with_capacity(stats.missing as usize);
     let mut k: u32 = 0;
     for (i, m) in matches.iter().enumerate() {

@@ -102,3 +102,30 @@ mod tests {
         assert_eq!((up.width, up.height), (14, 10));
     }
 }
+
+/// Runs an upscaler at its native factor and resamples the result to
+/// `target` (Lanczos3). Lets a x4 network serve a x2 job — the supersampled
+/// route Real-ESRGAN's own `--outscale` takes — and a x2 network serve x1
+/// (a pure restoration pass).
+pub struct Resampled {
+    pub inner: Box<dyn Upscaler>,
+    pub target: u32,
+}
+
+impl Upscaler for Resampled {
+    fn scale(&self) -> u32 {
+        self.target
+    }
+    fn upscale(&mut self, frame: &Frame) -> anyhow::Result<Frame> {
+        let native = self.inner.upscale(frame)?;
+        if self.inner.scale() == self.target {
+            return Ok(native);
+        }
+        let img = image::RgbImage::from_raw(native.width, native.height, native.data).ok_or_else(|| anyhow::anyhow!("bad frame buffer"))?;
+        let out = image::imageops::resize(&img, frame.width * self.target, frame.height * self.target, image::imageops::FilterType::Lanczos3);
+        Ok(Frame::from_rgb(out.width(), out.height(), out.into_raw())?)
+    }
+    fn name(&self) -> String {
+        format!("{} -> x{} (lanczos)", self.inner.name(), self.target)
+    }
+}

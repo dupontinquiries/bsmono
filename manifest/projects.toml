@@ -611,6 +611,17 @@ runtime = "none"
 targets = ["desktop"]
 notes = "a Rust port of the kBM3 mel-spectrogram GAN. A tool rather than a shipped app. NOTE: needs libasound2-dev — `cargo check` fails in alsa-sys's build script without it, which is a host requirement rather than a code fault. Registered anyway so the dependency is discoverable from here instead of on first build."
 
+[apps.dandere2x]
+path = "apps/dandere2x"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"          # egui/glow shell (wayland/x11) + CLI; GPU via wgpu 29 (Vulkan on Asahi)
+targets = ["desktop"]
+primary = true
+notes = "Rust port of dandere2x (block-matched residual video super-resolution) with a native wgpu conv-net runner (Real-ESRGAN RRDB/SRVGG, waifu2x upconv_7 as op lists) and an ffmpeg AV1 pipeline (libdav1d in, libsvtav1 10-bit out, keyframe-aligned segment parallelism, audio remux). Workspace: crates/d2x-core (headless engine, 38 tests), crates/d2x-wgpu (GPU bit-exact vs CPU on lavapipe for all three nets), crates/dandere2x (CLI + `app` feature egui shell, both default-on; `--no-default-features --features gpu` is the CI build). Model weights: tools/pth2st.py converts PyTorch .pth without torch; models/ vendors realesr-animevideov3 only (RRDB photo models are 67 MB each, download separately). Verified end to end here on a synthetic 10-bit AV1 clip with lavapipe; not yet run on Honeykrisp."
+
 [apps.echelon]
 path = "games/echelon"
 kind = "cargo"
