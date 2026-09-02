@@ -55,6 +55,32 @@ pub fn effect(kind: &str, params: &[(&str, f32)]) -> studio_core::Effect {
     }
 }
 
+/// The context menu on a fader: aim the strip at this parameter's lane,
+/// or mint a curve on it — gated to the selected clips (a bus fader
+/// gated to a vocal clip is the structural sidechain), or bound always
+/// when nothing is selected. What Gemini's read of FL called the
+/// "context-menu parameter binding": the knob is where automation starts.
+fn automate_menu(resp: &egui::Response, s: &mut Studio, target: studio_core::AutoTarget) {
+    resp.context_menu(|ui| {
+        if ui.button("automate: show lane").clicked() {
+            s.auto_target = Some(target);
+            s.auto_binding = None;
+            s.status = "lane in the strip under the timeline".into();
+            ui.close();
+        }
+        let sel = s.selection.len();
+        let label = if sel > 0 {
+            format!("automate: new curve gated to {sel} selected clip{}", if sel == 1 { "" } else { "s" })
+        } else {
+            "automate: new curve (always)".into()
+        };
+        if ui.button(label).clicked() {
+            s.new_curve_on_selection(Some(target));
+            ui.close();
+        }
+    });
+}
+
 pub fn show(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors)
     -> crate::scroll_edge::ScrollReport {
     // The map explains what the rows below edit: the whole graph at once,
@@ -210,6 +236,10 @@ fn show_inner(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
                 s.edit(studio_core::Op::SetTrackGain { id: t.id, gain: shown },
                        "gain");
             }
+            // Right-click the parameter to automate it — the fader is the
+            // ingress point, not a separate routing matrix. The strip lives
+            // under the timeline; the status line says so.
+            automate_menu(&resp, s, studio_core::AutoTarget::TrackGain(t.id));
         });
     }
     // ── busses ──────────────────────────────────────────────────────────
@@ -252,6 +282,7 @@ fn show_inner(ui: &mut egui::Ui, s: &mut Studio, c: &PaletteColors) {
             } else if resp.changed() && !resp.dragged() {
                 s.edit(studio_core::Op::SetBusGain { id: b.id, gain: shown }, "bus gain");
             }
+            automate_menu(&resp, s, studio_core::AutoTarget::BusGain(b.id));
             ui.label("→");
             let parent_label = b.parent
                 .and_then(|p| busses.iter().find(|x| x.id == p))

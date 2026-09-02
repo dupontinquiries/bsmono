@@ -68,6 +68,10 @@ pub enum ShellVerb {
     GotoStart,
     GotoEnd,
     MixMaster,
+    /// Mint an automation curve gated to the selected clips (or bound
+    /// always to the strip's lane when nothing is selected) — see
+    /// `Studio::new_curve_on_selection`.
+    NewCurve,
     ArchiveDialog,
     ExportDialog,
     Settings,
@@ -231,6 +235,9 @@ pub fn root() -> Vec<Choice> {
         c("ungroup", Some("G"), Then::Do(Act::Key('G'))),
         c("split at playhead", Some("s"), Then::Do(Act::Key('s'))),
         c("delete selection", Some("d"), Then::Do(Act::Key('d'))),
+        c("yank selection", Some("y"), Then::Do(Act::Key('y'))),
+        c("paste at playhead (with automation)", Some("p"), Then::Do(Act::Key('p'))),
+        c("automation curve on selected clips", None, Then::Do(Act::Shell(ShellVerb::NewCurve))),
         c("save archive…", None, Then::Do(Act::Shell(ShellVerb::ArchiveDialog))),
         c("export…", None, Then::Do(Act::Shell(ShellVerb::ExportDialog))),
         c("settings…", None, Then::Do(Act::Shell(ShellVerb::Settings))),
@@ -662,7 +669,8 @@ mod tests {
         // teaches the shortcut that makes the palette unnecessary.
         let r = root();
         for (label, key) in [("undo", 'u'), ("split at playhead", 's'),
-                             ("align selected clips", 'A')] {
+                             ("align selected clips", 'A'), ("yank selection", 'y'),
+                             ("paste at playhead (with automation)", 'p')] {
             let c = r.iter().find(|c| c.label == label).unwrap();
             assert_eq!(c.then, Then::Do(Act::Key(key)));
             assert!(c.hint.is_some(), "'{label}' has a key and must show it");
