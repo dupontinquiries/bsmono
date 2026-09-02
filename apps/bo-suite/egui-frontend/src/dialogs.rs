@@ -67,6 +67,53 @@ impl AddToPlaylist {
     }
 }
 
+/// Draws the add-to-playlist dialog when `d.is_open()`. Returns
+/// `(track_id, playlist_name)` the frame a playlist row is tapped — the
+/// same pair `d.add()` returns, so callers resolve the real playlist id
+/// out of it the same way regardless of how the dialog got its answer.
+///
+/// A floating `egui::Window` rather than inline content: this has to
+/// appear above whatever page is showing, not just above the track row
+/// that opened it, and it needs to stay open across an "add to Chill,
+/// add to Focus, add to Loud" sequence in one sitting — `add()`'s own doc
+/// on why the dialog doesn't close after one add.
+pub fn add_to_playlist_ui(ui: &mut egui::Ui, d: &mut AddToPlaylist, c: &uikit_egui::PaletteColors)
+    -> Option<(String, String)>
+{
+    let mut result = None;
+    let mut still_open = d.is_open();
+    egui::Window::new("Add to playlist")
+        .id(egui::Id::new("add_to_playlist_dialog"))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut still_open)
+        .show(ui.ctx(), |ui| {
+            ui.add(egui::TextEdit::singleline(&mut d.query)
+                .hint_text("search playlists").id_salt("add_to_playlist-query"));
+            if let Some(name) = &d.just_added {
+                ui.colored_label(c.accent, format!("added to {name}"));
+            }
+            let visible: Vec<String> = d.visible().into_iter().map(str::to_string).collect();
+            if visible.is_empty() {
+                ui.colored_label(c.text_weak,
+                    if d.playlists.is_empty() { "no playlists yet — create one first" }
+                    else { "no playlists match" });
+            }
+            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                for name in visible {
+                    if ui.button(&name).clicked() {
+                        if let Some(pair) = d.add(&name) { result = Some(pair); }
+                    }
+                }
+            });
+        });
+    // The Window's own [x] sets `still_open` false; a track picked from a
+    // list that then vanishes reads as a bug, so an explicit close is the
+    // only thing that actually clears the subject.
+    if !still_open { d.close(); }
+    result
+}
+
 // ── edit track ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -130,6 +177,69 @@ impl EditTrack {
     pub fn can_save(&self) -> bool { self.is_dirty() && self.problems().is_empty() }
 }
 
+/// What `edit_track_ui` hands back when Save is pressed — `d.payload()`'s
+/// pairs, resolved into typed fields (`year` parsed and range-checked,
+/// same rule `problems()` already enforces so this can't fail here) plus
+/// the track id, since the dialog only tracked it as a bare `String`.
+pub struct EditSave {
+    pub track_id: String,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub year: Option<u16>,
+}
+
+/// Draws the edit-track dialog when `d.is_open()`. Returns `Some` the
+/// frame Save is pressed (never while `can_save()` is false — the button
+/// is disabled, and Enter is not wired to bypass it). A floating
+/// `egui::Window`, same reasoning as `add_to_playlist_ui`: has to sit
+/// above whichever page opened it.
+pub fn edit_track_ui(ui: &mut egui::Ui, d: &mut EditTrack, c: &uikit_egui::PaletteColors)
+    -> Option<EditSave>
+{
+    let mut result = None;
+    let mut still_open = d.is_open();
+    let mut cancel_pressed = false;
+    let Some(track_id) = d.track.clone() else { return None };
+    egui::Window::new("Edit track")
+        .id(egui::Id::new("edit_track_dialog"))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut still_open)
+        .show(ui.ctx(), |ui| {
+            egui::Grid::new("edit_track_fields").num_columns(2).show(ui, |ui| {
+                ui.colored_label(c.text_weak, "Title"); ui.text_edit_singleline(&mut d.draft.title); ui.end_row();
+                ui.colored_label(c.text_weak, "Artist"); ui.text_edit_singleline(&mut d.draft.artist); ui.end_row();
+                ui.colored_label(c.text_weak, "Album"); ui.text_edit_singleline(&mut d.draft.album); ui.end_row();
+                ui.colored_label(c.text_weak, "Year"); ui.text_edit_singleline(&mut d.draft.year); ui.end_row();
+            });
+            for p in d.problems() {
+                ui.colored_label(egui::Color32::from_rgb(200, 80, 80), p);
+            }
+            ui.horizontal(|ui| {
+                if ui.add_enabled(d.can_save(), egui::Button::new("save")).clicked() {
+                    let payload = d.payload();
+                    let get = |key: &str| payload.iter().find(|(k, _)| *k == key)
+                        .map(|(_, v)| v.clone());
+                    result = Some(EditSave {
+                        track_id: track_id.clone(),
+                        title: get("title"),
+                        artist: get("artist"),
+                        album: get("album"),
+                        // Guarded by can_save()/problems() above — an
+                        // out-of-range or non-numeric year never reaches
+                        // here, so a parse failure just omits the field
+                        // rather than silently writing something wrong.
+                        year: get("year").and_then(|y| y.parse::<u16>().ok()),
+                    });
+                }
+                if ui.button("cancel").clicked() { cancel_pressed = true; }
+            });
+        });
+    if !still_open || cancel_pressed { d.close(); }
+    result
+}
+
 // ── scan picker ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
@@ -138,6 +248,12 @@ pub struct ScanPicker {
     pub suggestions: Vec<String>,
     selected: std::collections::BTreeSet<String>,
     pub custom_path: String,
+    /// Real filesystem navigation, alongside the suggestion checkboxes
+    /// and manual path field above — the shared, fuzzy-filterable widget
+    /// from `uikit_egui::path_picker` rather than a second bespoke
+    /// browser. `None` until "browse…" is pressed, since most scans just
+    /// tick a suggestion and never need it.
+    pub browse: Option<uikit_egui::path_picker::PathPicker>,
 }
 
 impl ScanPicker {
@@ -146,6 +262,7 @@ impl ScanPicker {
         self.suggestions = suggestions;
         self.selected.clear();
         self.custom_path.clear();
+        self.browse = None;
     }
 
     pub fn close(&mut self) { self.open = false; }
@@ -155,6 +272,14 @@ impl ScanPicker {
     }
 
     pub fn is_selected(&self, path: &str) -> bool { self.selected.contains(path) }
+
+    /// A folder chosen through `browse` — added to both the selection AND
+    /// the suggestion list, so it shows up ticked rather than as a
+    /// selected-but-invisible path the person can't see confirmed.
+    pub fn add_browsed(&mut self, path: String) {
+        if !self.suggestions.contains(&path) { self.suggestions.push(path.clone()); }
+        self.selected.insert(path);
+    }
 
     /// `gatherSelectedPaths()` — the ticked suggestions plus the custom path.
     ///
@@ -169,6 +294,248 @@ impl ScanPicker {
     }
 
     pub fn can_scan(&self) -> bool { !self.gather().is_empty() }
+}
+
+/// Draws the scan-picker dialog when `d.open`. Returns the gathered paths
+/// the frame "scan" is pressed. A floating `egui::Window`, same reasoning
+/// as the other two dialogs in this module.
+pub fn scan_picker_ui(ui: &mut egui::Ui, d: &mut ScanPicker, c: &uikit_egui::PaletteColors)
+    -> Option<Vec<String>>
+{
+    let mut result = None;
+    let mut still_open = d.open;
+    let mut cancel_pressed = false;
+    egui::Window::new("Choose folders to scan")
+        .id(egui::Id::new("scan_picker_dialog"))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut still_open)
+        .show(ui.ctx(), |ui| {
+            if d.suggestions.is_empty() {
+                ui.colored_label(c.text_weak, "no suggested folders — type a path below");
+            }
+            for path in d.suggestions.clone() {
+                let mut checked = d.is_selected(&path);
+                if ui.checkbox(&mut checked, &path).changed() { d.toggle(&path); }
+            }
+            ui.add(egui::TextEdit::singleline(&mut d.custom_path)
+                .hint_text("custom path").id_salt("scan_picker-custom_path"));
+            ui.horizontal(|ui| {
+                let label = if d.browse.is_some() { "hide browser" } else { "browse…" };
+                if ui.button(label).clicked() {
+                    d.browse = if d.browse.is_some() { None } else {
+                        // Start from $HOME when the shell has one — a
+                        // browser that opens at "nowhere yet" (PathPicker's
+                        // own idle state) makes someone press "up" or type
+                        // a root before it's useful for anything.
+                        let mut p = uikit_egui::path_picker::PathPicker::new();
+                        if let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok()) {
+                            p.open(&home, uikit_egui::path_picker::list_local);
+                        }
+                        Some(p)
+                    };
+                }
+            });
+            if let Some(browse) = d.browse.as_mut() {
+                ui.separator();
+                match uikit_egui::path_picker::picker_ui(ui, browse, c, 6) {
+                    Some(uikit_egui::path_picker::Action::Enter(p)) =>
+                        browse.open(&p, uikit_egui::path_picker::list_local),
+                    Some(uikit_egui::path_picker::Action::Up) =>
+                        browse.up(uikit_egui::path_picker::list_local),
+                    Some(uikit_egui::path_picker::Action::ToggleHidden) => {
+                        browse.show_hidden = !browse.show_hidden;
+                        let cur = browse.current().map(str::to_string);
+                        if let Some(cur) = cur { browse.open(&cur, uikit_egui::path_picker::list_local); }
+                    }
+                    Some(uikit_egui::path_picker::Action::Choose(p)) => {
+                        d.add_browsed(p);
+                        d.browse = None;
+                    }
+                    None => {}
+                }
+                ui.separator();
+            }
+            ui.horizontal(|ui| {
+                if ui.add_enabled(d.can_scan(), egui::Button::new("scan")).clicked() {
+                    result = Some(d.gather());
+                }
+                if ui.button("cancel").clicked() { cancel_pressed = true; }
+            });
+        });
+    if !still_open || cancel_pressed { d.close(); }
+    result
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    fn draw(d: &mut AddToPlaylist) -> (Vec<String>, Option<(String, String)>) {
+        let ctx = egui::Context::default();
+        let c = uikit_egui::palette_colors("amber");
+        let mut result = None;
+        let run = |ctx: &egui::Context, d: &mut AddToPlaylist, result: &mut Option<(String, String)>| {
+            ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                                                            egui::vec2(500.0, 700.0))),
+                ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    *result = add_to_playlist_ui(ui, d, &c);
+                });
+            })
+        };
+        // A floating Window auto-sizes from its previous frame's content —
+        // the first pass has no prior size to lay out against, so nothing
+        // is painted yet. Two passes is the same thing a real app gets for
+        // free by simply running more than one frame.
+        run(&ctx, d, &mut result);
+        let out = run(&ctx, d, &mut result);
+        let texts = out.shapes.iter().filter_map(|s| match &s.shape {
+            egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+            _ => None,
+        }).collect();
+        (texts, result)
+    }
+
+    #[test]
+    fn closed_draws_nothing() {
+        let mut d = AddToPlaylist::default();
+        let (texts, result) = draw(&mut d);
+        assert!(texts.is_empty(), "{texts:?}");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn open_shows_the_playlists() {
+        let mut d = AddToPlaylist { playlists: vec!["Chill".into(), "Focus".into()],
+                                     ..Default::default() };
+        d.open("t1");
+        let (texts, _) = draw(&mut d);
+        let joined = texts.join(" | ");
+        assert!(joined.contains("Chill") && joined.contains("Focus"), "{joined}");
+    }
+
+    #[test]
+    fn no_playlists_says_so_rather_than_showing_an_empty_list() {
+        let mut d = AddToPlaylist::default();
+        d.open("t1");
+        let (texts, _) = draw(&mut d);
+        assert!(texts.join(" | ").contains("create one first"), "{texts:?}");
+    }
+
+    fn draw_edit(d: &mut EditTrack) -> (Vec<String>, Option<EditSave>) {
+        let ctx = egui::Context::default();
+        let c = uikit_egui::palette_colors("amber");
+        let mut result = None;
+        let run = |ctx: &egui::Context, d: &mut EditTrack, result: &mut Option<EditSave>| {
+            ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                                                            egui::vec2(500.0, 700.0))),
+                ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    *result = edit_track_ui(ui, d, &c);
+                });
+            })
+        };
+        run(&ctx, d, &mut result);
+        let out = run(&ctx, d, &mut result);
+        let texts = out.shapes.iter().filter_map(|s| match &s.shape {
+            egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+            _ => None,
+        }).collect();
+        (texts, result)
+    }
+
+    #[test]
+    fn closed_edit_draws_nothing() {
+        let mut d = EditTrack::default();
+        let (texts, result) = draw_edit(&mut d);
+        assert!(texts.is_empty(), "{texts:?}");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn open_edit_shows_the_current_fields() {
+        let mut d = EditTrack::default();
+        d.open("t1", TrackFields { title: "Old Title".into(), artist: "Some Artist".into(),
+                                    album: "".into(), year: "".into() });
+        let (texts, _) = draw_edit(&mut d);
+        let joined = texts.join(" | ");
+        assert!(joined.contains("Old Title") && joined.contains("Some Artist"), "{joined}");
+    }
+
+    #[test]
+    fn a_bad_year_shows_a_problem() {
+        let mut d = EditTrack::default();
+        d.open("t1", TrackFields::default());
+        d.draft.year = "nineteen".into();
+        let (texts, _) = draw_edit(&mut d);
+        assert!(texts.join(" | ").contains("not a year"), "{texts:?}");
+        assert!(!d.can_save(), "the save button should be disabled for this draft");
+    }
+
+    fn draw_scan(d: &mut ScanPicker) -> (Vec<String>, Option<Vec<String>>) {
+        let ctx = egui::Context::default();
+        let c = uikit_egui::palette_colors("amber");
+        let mut result = None;
+        let run = |ctx: &egui::Context, d: &mut ScanPicker, result: &mut Option<Vec<String>>| {
+            ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                                                            egui::vec2(500.0, 700.0))),
+                ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    *result = scan_picker_ui(ui, d, &c);
+                });
+            })
+        };
+        run(&ctx, d, &mut result);
+        let out = run(&ctx, d, &mut result);
+        let texts = out.shapes.iter().filter_map(|s| match &s.shape {
+            egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+            _ => None,
+        }).collect();
+        (texts, result)
+    }
+
+    #[test]
+    fn closed_scan_picker_draws_nothing() {
+        let mut d = ScanPicker::default();
+        let (texts, result) = draw_scan(&mut d);
+        assert!(texts.is_empty(), "{texts:?}");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn open_scan_picker_shows_the_suggestions() {
+        let mut d = ScanPicker::default();
+        d.open(vec!["/home/x/Music".into(), "/media/usb".into()]);
+        let (texts, _) = draw_scan(&mut d);
+        let joined = texts.join(" | ");
+        assert!(joined.contains("/home/x/Music") && joined.contains("/media/usb"), "{joined}");
+    }
+
+    #[test]
+    fn no_suggestions_says_so() {
+        let mut d = ScanPicker::default();
+        d.open(vec![]);
+        let (texts, _) = draw_scan(&mut d);
+        assert!(texts.join(" | ").contains("type a path below"), "{texts:?}");
+    }
+
+    #[test]
+    fn a_browse_toggle_is_offered_and_its_label_reflects_state() {
+        let mut d = ScanPicker::default();
+        d.open(vec!["/music".into()]);
+        let (texts, _) = draw_scan(&mut d);
+        assert!(texts.join(" | ").contains("browse…"), "{texts:?}");
+        d.browse = Some(uikit_egui::path_picker::PathPicker::new());
+        let (texts, _) = draw_scan(&mut d);
+        assert!(texts.join(" | ").contains("hide browser"), "{texts:?}");
+    }
 }
 
 #[cfg(test)]
@@ -298,5 +665,35 @@ mod tests {
         s.custom_path = "/b".into();
         s.open(vec!["/a".into()]);
         assert!(!s.can_scan(), "previous choices are not carried over");
+    }
+
+    #[test]
+    fn a_browsed_folder_is_both_ticked_and_visible_in_the_list() {
+        // add_browsed's whole point: a path chosen via the shared
+        // path_picker has to show up ticked, not just be selected somewhere
+        // the person can't see confirmed.
+        let mut s = ScanPicker::default();
+        s.open(vec!["/music".into()]);
+        s.add_browsed("/media/usb/podcasts".into());
+        assert!(s.suggestions.contains(&"/media/usb/podcasts".to_string()));
+        assert!(s.is_selected("/media/usb/podcasts"));
+        assert!(s.gather().contains(&"/media/usb/podcasts".to_string()));
+    }
+
+    #[test]
+    fn browsing_to_an_existing_suggestion_does_not_duplicate_the_row() {
+        let mut s = ScanPicker::default();
+        s.open(vec!["/music".into()]);
+        s.add_browsed("/music".into());
+        assert_eq!(s.suggestions.iter().filter(|p| *p == "/music").count(), 1);
+    }
+
+    #[test]
+    fn reopening_the_scan_picker_also_closes_any_open_browser() {
+        let mut s = ScanPicker::default();
+        s.open(vec!["/a".into()]);
+        s.browse = Some(uikit_egui::path_picker::PathPicker::new());
+        s.open(vec!["/a".into()]);
+        assert!(s.browse.is_none(), "a stale browser from the last open would show the wrong folder");
     }
 }

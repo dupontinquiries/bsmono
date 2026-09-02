@@ -29,6 +29,9 @@ struct App {
     /// on `cast_cmd_tx`; results come back non-blocking on `cast_res_rx`.
     cast_cmd_tx: std::sync::mpsc::Sender<bo_suite_egui::cast::CastCmd>,
     cast_res_rx: std::sync::mpsc::Receiver<bo_suite_egui::cast::CastResult>,
+    /// SSDP discovery results, refreshed periodically by a background
+    /// thread and read non-blocking each frame — see cast.rs.
+    discovery_rx: std::sync::mpsc::Receiver<Vec<bo_suite_egui::outputs::Device>>,
     /// The recogniser, when one is configured and voice is on.
     voice: bo_suite_egui::voice_source::VoiceSource,
     /// What the recogniser was last started with, so a settings change
@@ -102,6 +105,14 @@ impl App {
         std::thread::spawn(move || {
             bo_suite_egui::cast::run_cast_worker(cast_cmd_rx, cast_res_tx, 51423);
         });
+        // SSDP discovery for the "cast to" device picker. Every 20s: rare
+        // enough not to spam the LAN or wake sleeping devices repeatedly,
+        // often enough that a speaker that just powered on shows up
+        // without restarting the app.
+        let (discovery_tx, discovery_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            bo_suite_egui::cast::run_discovery_worker(discovery_tx, std::time::Duration::from_secs(20));
+        });
         let catalog = match bo_suite_egui::real_catalog::RealCatalog::open(&db_path, media_cmd_tx) {
             Ok(c) => c,
             Err(e) => {
@@ -135,6 +146,9 @@ impl App {
             controller.answer_tracks_from(&catalog);
             sync_track_paths(&mut controller, &catalog);
         }
+        // Whatever playlists already exist, so the page isn't empty until
+        // the user creates one to see it work.
+        controller.playlists_page.set(catalog.playlists());
         Self {
             controller,
             player: bo_suite_egui::playback::Player::new(),
@@ -143,6 +157,7 @@ impl App {
             media_res_rx,
             cast_cmd_tx,
             cast_res_rx,
+            discovery_rx,
             voice: bo_suite_egui::voice_source::VoiceSource::new(),
             voice_cmd: String::new(),
         }
@@ -219,6 +234,94 @@ impl App {
                     }
                     None => self.last_note = "cast: no file for that track".into(),
                 }
+            }
+        }
+        if let Some((name, description)) = self.controller.pending_playlist_create.take() {
+            // A local SQLite insert, not a network/scan operation — done
+            // directly here rather than round-tripped through the media
+            // worker, same reasoning as RealCatalog's other direct writes.
+            match self.catalog.create_playlist(&name, &description) {
+                Some(_id) => {
+                    // Replaces the optimistic fake-id row from
+                    // apply_playlist with the real list rather than trying
+                    // to patch just that one row in place.
+                    self.controller.playlists_page.set(self.catalog.playlists());
+                }
+                None => self.last_note = format!("could not create playlist '{name}'"),
+            }
+        }
+        if let Some(id) = self.controller.pending_playlist_open.take() {
+            let tracks = self.catalog.playlist_tracks(id);
+            self.controller.browse_tracks = tracks;
+            sync_track_paths(&mut self.controller, &self.catalog);
+        }
+        if let Some(id) = self.controller.pending_playlist_delete.take() {
+            if self.catalog.delete_playlist(id) {
+                self.controller.playlists_page.set(self.catalog.playlists());
+            } else {
+                self.last_note = "could not delete playlist".into();
+            }
+        }
+        if let Some((track_id, playlist_id)) = self.controller.pending_add_to_playlist.take() {
+            if self.catalog.add_to_playlist(playlist_id, track_id) {
+                // track_count on the index page is now stale.
+                self.controller.playlists_page.set(self.catalog.playlists());
+            } else {
+                self.last_note = "could not add track to playlist".into();
+            }
+        }
+        if let Some(id) = self.controller.pending_track_edit_open.take() {
+            match self.catalog.track_fields(id) {
+                Some(fields) => self.controller.edit_track.open(&id.to_string(), fields),
+                None => self.last_note = "could not load track for editing".into(),
+            }
+        }
+        if let Some((id, title, artist, album, year)) = self.controller.pending_track_edit_save.take() {
+            self.catalog.save_track_edit(id, title, artist, album, year);
+            // The override applies immediately in the catalog (see
+            // real_catalog.rs), so reload whatever's currently showing
+            // this track rather than waiting for the next scan.
+            if let Some(pid) = self.controller.open_playlist {
+                self.controller.browse_tracks = self.catalog.playlist_tracks(pid);
+            }
+            self.controller.pending_tracks =
+                Some(bo_suite_egui::all_tracks::TracksAction::Load { offset: 0 });
+        }
+        if self.controller.pending_scan_picker_open {
+            self.controller.pending_scan_picker_open = false;
+            // The picker's own doc: suggestions are the host's job, since
+            // it (not the Controller) knows $HOME/$BO_MUSIC_DIR. Offer the
+            // configured default roots plus common removable-media mount
+            // points, when they exist — a folder that isn't there yet
+            // isn't worth ticking.
+            let mut suggestions: Vec<String> = bo_suite_egui::real_catalog::music_roots()
+                .into_iter().map(|p| p.display().to_string()).collect();
+            for base in ["/media", "/run/media"] {
+                if let Ok(entries) = std::fs::read_dir(base) {
+                    for entry in entries.flatten() {
+                        suggestions.push(entry.path().display().to_string());
+                    }
+                }
+            }
+            self.controller.scan_picker.open(suggestions);
+        }
+        if let Some(roots) = self.controller.pending_scan_with_roots.take() {
+            self.catalog.scan_with_roots(roots);
+        }
+        if let Some(url) = self.controller.pending_remote_queue_load.take() {
+            self.controller.remote_queue = self.catalog.queue_for_device(&url).into_iter()
+                .map(|e| (e.track_id, e.title, e.primary_artist.unwrap_or_default()))
+                .collect();
+        }
+        if let Some((url, track_id)) = self.controller.pending_remote_queue_push.take() {
+            if self.catalog.queue_push(track_id, &url) {
+                // Reflect it immediately rather than waiting for the next
+                // time the device is reselected.
+                self.controller.remote_queue = self.catalog.queue_for_device(&url).into_iter()
+                    .map(|e| (e.track_id, e.title, e.primary_artist.unwrap_or_default()))
+                    .collect();
+            } else {
+                self.last_note = "could not queue track on that speaker".into();
             }
         }
         if let Some(id) = self.controller.last_played_track.take() {
@@ -340,6 +443,14 @@ impl App {
         // different channel, same drain-non-blocking shape.
         while let Ok(r) = self.cast_res_rx.try_recv() {
             self.controller.cast_result(r.ok, &r.detail);
+        }
+        // Only the LAST round matters — a discovery result is a full
+        // snapshot, not a delta, so draining to the newest and discarding
+        // any stale ones queued behind it is correct, not a shortcut.
+        let mut latest_devices = None;
+        while let Ok(d) = self.discovery_rx.try_recv() { latest_devices = Some(d); }
+        if let Some(devices) = latest_devices {
+            self.controller.device_selector.set_devices(devices);
         }
     }
 }
