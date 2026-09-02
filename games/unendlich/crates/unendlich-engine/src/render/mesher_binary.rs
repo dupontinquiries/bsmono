@@ -193,6 +193,8 @@ fn scan(chunk: &Chunk) -> Sets {
 pub struct BinaryOpts {
     pub plain_tops: bool,
     pub plain_sides: bool,
+    /// Grass tuft style override; `None` = `TuftStyle::from_env()`.
+    pub tuft_style: Option<mesher::TuftStyle>,
 }
 
 impl BinaryOpts {
@@ -200,7 +202,7 @@ impl BinaryOpts {
         static V: std::sync::OnceLock<BinaryOpts> = std::sync::OnceLock::new();
         *V.get_or_init(|| {
             let on = |k: &str| std::env::var(k).map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
-            let o = BinaryOpts { plain_tops: on("UNENDLICH_MESHER_PLAIN_TOPS"), plain_sides: on("UNENDLICH_MESHER_PLAIN_SIDES") };
+            let o = BinaryOpts { plain_tops: on("UNENDLICH_MESHER_PLAIN_TOPS"), plain_sides: on("UNENDLICH_MESHER_PLAIN_SIDES"), tuft_style: None };
             if o.plain_tops || o.plain_sides {
                 log::info!("binary mesher: plain_tops={} plain_sides={} (special emitters bypassed)", o.plain_tops, o.plain_sides);
             }
@@ -337,7 +339,8 @@ pub fn mesh_chunk_binary_opts(
             }
         }
         stats.face_vertices = mesh.vertices.len() as u32;
-        mesher::decorate_chunk(chunk, &mut mesh, origin, sky, current_tick);
+        let tuft = opts.tuft_style.unwrap_or_else(mesher::TuftStyle::from_env);
+        mesher::decorate_chunk_styled(chunk, &mut mesh, origin, sky, current_tick, tuft);
         mesher::emit_water_surface(chunk, &mut mesh, origin, sky);
         mesher::emit_lava_surface(chunk, &mut mesh, origin, sky);
         stats.decoration_vertices = mesh.vertices.len() as u32 - stats.face_vertices;
@@ -523,14 +526,20 @@ mod tests {
             let mut bv = 0; let mut st = BinaryMeshStats::default();
             for _ in 0..iters { let (m, s) = mesh_chunk_binary_with_stats(&c, &nb, None, None, None); bv = m.vertices.len(); st = s; }
             let b_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
-            let plain = BinaryOpts { plain_tops: true, plain_sides: true };
+            let plain = BinaryOpts { plain_tops: true, plain_sides: true, tuft_style: None };
             let t = Instant::now();
             let mut pv = 0; let mut pst = BinaryMeshStats::default();
             for _ in 0..iters { let (m, s) = mesh_chunk_binary_opts(&c, &nb, None, None, None, plain); pv = m.vertices.len(); pst = s; }
             let p_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
-            println!("{:42} greedy {:8.0} us ({} verts)   binary {:8.0} us ({} verts: {} faces + {} decoration)   faces={} plain_quads={} special={}   ratio {:.1}x   | plain-specials {:8.0} us ({} verts: {} faces + {} decoration, {} quads) ratio {:.1}x",
+            let lean = BinaryOpts { plain_tops: true, plain_sides: true, tuft_style: Some(mesher::TuftStyle::Cross) };
+            let t = Instant::now();
+            let mut lv = 0; let mut lst = BinaryMeshStats::default();
+            for _ in 0..iters { let (m, s) = mesh_chunk_binary_opts(&c, &nb, None, None, None, lean); lv = m.vertices.len(); lst = s; }
+            let l_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            println!("{:42} greedy {:8.0} us ({} verts)   binary {:8.0} us ({} verts: {} faces + {} decoration)   faces={} plain_quads={} special={}   ratio {:.1}x   | plain-specials {:8.0} us ({} verts: {} faces + {} decoration, {} quads) ratio {:.1}x   | +cross tufts {:8.0} us ({} verts: {} faces + {} decoration) ratio {:.1}x",
                 name, g_us, gv, b_us, bv, st.face_vertices, st.decoration_vertices, st.faces, st.plain_quads, st.special_faces, g_us / b_us,
-                p_us, pv, pst.face_vertices, pst.decoration_vertices, pst.plain_quads, g_us / p_us);
+                p_us, pv, pst.face_vertices, pst.decoration_vertices, pst.plain_quads, g_us / p_us,
+                l_us, lv, lst.face_vertices, lst.decoration_vertices, g_us / l_us);
         }
     }
 
@@ -541,7 +550,7 @@ mod tests {
             if y + 1 == h { BlockId::Grass } else if y < h { BlockId::Dirt } else { BlockId::Air }
         };
         let c = chunk_from(ChunkCoord::new(0, 0, 0), f);
-        let plain = BinaryOpts { plain_tops: true, plain_sides: true };
+        let plain = BinaryOpts { plain_tops: true, plain_sides: true, tuft_style: None };
         let (m, st) = mesh_chunk_binary_opts(&c, &NeighborChunks::none(), None, None, None, plain);
         assert_eq!(st.special_faces, 0);
         // Every cube face is now a plain 4-vertex quad; everything else in
@@ -550,6 +559,29 @@ mod tests {
         assert_eq!(m.vertices.len() as u32, st.face_vertices + st.decoration_vertices);
         assert!(st.decoration_vertices > st.face_vertices,
             "on a grass surface the tufts outweigh the terrain: {} vs {}", st.decoration_vertices, st.face_vertices);
+    }
+
+    #[test]
+    fn cross_tufts_are_eight_vertices_and_double_sided() {
+        let f = |_x: i32, y: i32, _z: i32| -> BlockId { if y < 5 { BlockId::Grass } else { BlockId::Air } };
+        let c = chunk_from(ChunkCoord::new(0, 0, 0), f);
+        let base = BinaryOpts { plain_tops: true, plain_sides: true, tuft_style: Some(mesher::TuftStyle::None) };
+        let (m0, s0) = mesh_chunk_binary_opts(&c, &NeighborChunks::none(), None, None, None, base);
+        assert_eq!(s0.decoration_vertices, 0);
+        let cross = BinaryOpts { tuft_style: Some(mesher::TuftStyle::Cross), ..base };
+        let (m1, s1) = mesh_chunk_binary_opts(&c, &NeighborChunks::none(), None, None, None, cross);
+        assert!(s1.decoration_vertices > 0);
+        assert_eq!(s1.decoration_vertices % 8, 0, "8 vertices per tuft");
+        let tufts = s1.decoration_vertices / 8;
+        assert_eq!(m1.indices.len() - m0.indices.len(), tufts as usize * 24, "24 indices per tuft (both windings)");
+        let grid = BinaryOpts { tuft_style: Some(mesher::TuftStyle::Grid), ..base };
+        let (_, s2) = mesh_chunk_binary_opts(&c, &NeighborChunks::none(), None, None, None, grid);
+        assert!(s2.decoration_vertices > s1.decoration_vertices * 10,
+            "grid tufts {} should dwarf cross tufts {}", s2.decoration_vertices, s1.decoration_vertices);
+        // Tuft vertices sit within their block column and above the surface.
+        for v in &m1.vertices[s1.face_vertices as usize..] {
+            assert!(v.position[1] >= 5.0 - 0.51 && v.position[1] <= 6.0 + 0.51);
+        }
     }
 
     #[test]

@@ -2597,6 +2597,32 @@ fn mesh_chunk_greedy_undecorated(chunk: &Chunk, sky: Option<&crate::sky::Sky>) -
     mesh
 }
 
+/// How decoration grass tufts are built. `UNENDLICH_TUFT_STYLE`:
+/// `grid` (default, today's sub-voxel mini-cube grid, ~280 vertices per
+/// tuft), `cross` (two vertical quads in an X, double-sided, 8 vertices),
+/// `none`. The 2026-09-02 timing report found the grid tufts to be
+/// ~127 K of a surface chunk's 236 K vertices — half the mesh — at the
+/// same density a cross-quad gives for 35× fewer vertices. Visual
+/// decision, so a knob; the density gate is unchanged either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TuftStyle { Grid, Cross, None }
+
+impl TuftStyle {
+    pub fn from_env() -> TuftStyle {
+        static V: std::sync::OnceLock<TuftStyle> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            let v = std::env::var("UNENDLICH_TUFT_STYLE").unwrap_or_default().to_ascii_lowercase();
+            let st = match v.as_str() {
+                "cross" => TuftStyle::Cross,
+                "none" | "off" | "0" => TuftStyle::None,
+                _ => TuftStyle::Grid,
+            };
+            if st != TuftStyle::Grid { log::info!("decorate: grass tuft style = {:?} (UNENDLICH_TUFT_STYLE)", st); }
+            st
+        })
+    }
+}
+
 /// Probability that a grass-bearing block spawns a sub-voxel tuft above it.
 /// For dedicated plant blocks (Fern, Flower, TallGrass) the probability is
 /// always 1.0 — the block IS the plant. This constant only gates surface
@@ -2633,6 +2659,17 @@ pub(crate) fn decorate_chunk(
     origin: [i32; 3],
     sky: Option<&crate::sky::Sky>,
     current_tick: Option<u64>,
+) {
+    decorate_chunk_styled(chunk, mesh, origin, sky, current_tick, TuftStyle::from_env())
+}
+
+pub(crate) fn decorate_chunk_styled(
+    chunk: &Chunk,
+    mesh: &mut ChunkMesh,
+    origin: [i32; 3],
+    sky: Option<&crate::sky::Sky>,
+    current_tick: Option<u64>,
+    tuft_style: TuftStyle,
 ) {
     let n = N as i32;
     // Iterate the inverted plant index instead of scanning every cell.
@@ -2764,18 +2801,74 @@ pub(crate) fn decorate_chunk(
         // same plant_hash so visual variation matches across the
         // two paths.
         let (_, hash_int) = crate::world::subvoxel::plant_hash(wx, wy, wz);
-        if let Some(tmpl) = crate::world::subvoxel_templates::template_for(BlockId::Grass, hash_int) {
-            crate::world::subvoxel_templates::stamp_template(
-                &mut mesh.vertices, &mut mesh.indices,
-                tmpl,
-                [wx as f32, (wy + 1) as f32 + corner_avg_offset, wz as f32],
-                sky, color_mul,
-            );
-        } else if let Some(grid) = crate::world::subvoxel::procedural_subgrid(BlockId::Grass, wx, wy, wz) {
-            emit_subvoxel_grid(mesh, &grid,
-                [wx as f32, (wy + 1) as f32 + corner_avg_offset, wz as f32],
-                sky, color_mul);
+        let tuft_origin = [wx as f32, (wy + 1) as f32 + corner_avg_offset, wz as f32];
+        match tuft_style {
+            TuftStyle::None => {}
+            TuftStyle::Cross => {
+                let (_, h2) = hash_for_decoration(wx, wy + 7, wz);
+                emit_grass_cross_quad(mesh, tuft_origin, h2, sky, color_mul);
+            }
+            TuftStyle::Grid => {
+                if let Some(tmpl) = crate::world::subvoxel_templates::template_for(BlockId::Grass, hash_int) {
+                    crate::world::subvoxel_templates::stamp_template(
+                        &mut mesh.vertices, &mut mesh.indices,
+                        tmpl, tuft_origin, sky, color_mul,
+                    );
+                } else if let Some(grid) = crate::world::subvoxel::procedural_subgrid(BlockId::Grass, wx, wy, wz) {
+                    emit_subvoxel_grid(mesh, &grid, tuft_origin, sky, color_mul);
+                }
+            }
         }
+    }
+}
+
+/// A grass tuft as a cross-quad: two vertical quads through the block's
+/// centre at 45° to the axes (an X from above), double-sided by emitting
+/// both windings over the same 8 vertices. `sub_hash` (0..1) varies the
+/// height (0.55–0.95 blocks) and rotates the X by up to 30° so a field
+/// doesn't tile. Bottom vertices carry sway tag 2 (anchor), top 1 (sway),
+/// like the sub-voxel foliage, so `sim::foliage_sway` acts on it.
+fn emit_grass_cross_quad(
+    mesh: &mut ChunkMesh,
+    origin: [f32; 3],
+    sub_hash: f32,
+    sky: Option<&crate::sky::Sky>,
+    color_mul: [f32; 3],
+) {
+    let directional = match sky { Some(sky) => sky.directional_intensity(), None => 1.0 };
+    // Side-face shade: neither top-lit nor bottom-dark; the grid emitter's
+    // vertical faces land near 0.85 of the top brightness.
+    let shade = 0.85 * directional;
+    let base = block_color(BlockId::TallGrass).unwrap_or([0.36, 0.62, 0.22]);
+    let color = [
+        (base[0] * color_mul[0] * shade).clamp(0.0, 1.0),
+        (base[1] * color_mul[1] * shade).clamp(0.0, 1.0),
+        (base[2] * color_mul[2] * shade).clamp(0.0, 1.0),
+    ];
+    let height = 0.55 + 0.40 * sub_hash;
+    let angle = (sub_hash - 0.5) * (std::f32::consts::PI / 3.0); // ±30°
+    let (cx, cz) = (origin[0] + 0.5, origin[2] + 0.5);
+    let (y0, y1) = (origin[1], origin[1] + height);
+    let r = 0.5_f32; // half-diagonal reach from the centre
+    let sway_on = crate::sim::foliage_sway::FOLIAGE_SWAY_ENABLED;
+    let tag_bottom = if sway_on { 2 } else { 0 };
+    let tag_top = if sway_on { 1 } else { 0 };
+    for k in 0..2 {
+        let a = angle + std::f32::consts::FRAC_PI_4 + k as f32 * std::f32::consts::FRAC_PI_2;
+        let (dx, dz) = (a.cos() * r, a.sin() * r);
+        let p0 = [cx - dx, y0, cz - dz];
+        let p1 = [cx + dx, y0, cz + dz];
+        let p2 = [cx + dx, y1, cz + dz];
+        let p3 = [cx - dx, y1, cz - dz];
+        let b = mesh.vertices.len() as u32;
+        mesh.vertices.push(Vertex::with_sway(p0, color, tag_bottom));
+        mesh.vertices.push(Vertex::with_sway(p1, color, tag_bottom));
+        mesh.vertices.push(Vertex::with_sway(p2, color, tag_top));
+        mesh.vertices.push(Vertex::with_sway(p3, color, tag_top));
+        // Front winding…
+        mesh.indices.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+        // …and back, so the quad reads from both sides with cull_mode=BACK.
+        mesh.indices.extend_from_slice(&[b, b + 2, b + 1, b, b + 3, b + 2]);
     }
 }
 
