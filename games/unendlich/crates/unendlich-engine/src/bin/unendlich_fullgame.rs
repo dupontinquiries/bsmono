@@ -12138,9 +12138,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
 
             // v0.24.3: compute the bytes BEFORE the upload call (which
             // consumes result.mesh by value).
-            let this_mesh_bytes =
-                result.mesh.vertex_count() as usize * VERTEX_BYTES
-                + result.mesh.index_count() as usize * INDEX_BYTES;
+            // 2026-09-02: the pool sheds the raw vertices after packing
+            // (unless the GPU-compare debug mode keeps them), so counts
+            // come from the wire form when present.
+            let (res_vc, res_ic) = match &result.packed {
+                Some(p) => (p.vertex_count() as usize, p.index_count() as usize),
+                None => (result.mesh.vertex_count() as usize, result.mesh.index_count() as usize),
+            };
+            let this_mesh_bytes = res_vc * VERTEX_BYTES + res_ic * INDEX_BYTES;
 
             // v0.24.37-mesh-cmp: gated GPU↔CPU equivalence check.
             // Runs CPU reference (with the same cross-chunk neighbors
@@ -12274,7 +12279,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         log::error!(
                             "[watchdog] WILD mesh RESULT drained: coord=({},{},{}) lod={:?} version={} verts={} — a poisoned request or a placeholder result",
                             result.coord.x, result.coord.y, result.coord.z,
-                            result.lod, result.version, result.mesh.vertices.len()
+                            result.lod, result.version, res_vc
                         );
                     });
                 }

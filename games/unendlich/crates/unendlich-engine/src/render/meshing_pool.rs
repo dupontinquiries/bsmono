@@ -186,6 +186,27 @@ fn pack_result(coord: ChunkCoord, mesh: &ChunkMesh) -> crate::render::mesher::Pa
     mesh.pack([ox as f32, oy as f32, oz as f32], crate::constants::CHUNK_SIZE as f32)
 }
 
+/// Pack, then drop the 28-byte `Vertex` copy unless something on the
+/// main thread still reads it (the `UNENDLICH_OCTREE_MESH_GPU_CMP`
+/// debug compare). Without this every mesh crossed to the render thread
+/// twice — packed AND raw — and the raw one (6.6 MB for a 236 K-vertex
+/// surface chunk) was freed there. Counts the bin needs come from
+/// `packed`.
+fn pack_and_shed(coord: ChunkCoord, mesh: &mut ChunkMesh) -> crate::render::mesher::PackedMesh {
+    let packed = pack_result(coord, mesh);
+    if !keep_raw_vertices() {
+        mesh.vertices = Vec::new();
+        mesh.indices = Vec::new();
+    }
+    packed
+}
+
+fn keep_raw_vertices() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("UNENDLICH_OCTREE_MESH_GPU_CMP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false))
+}
+
 /// A result carrying an empty mesh (failures, placeholders).
 fn empty_result(coord: ChunkCoord, epoch: u64, version: u64, lod: crate::world::lod::LodLevel) -> MeshResult {
     let mesh = ChunkMesh { vertices: Vec::new(), indices: Vec::new() };
@@ -843,7 +864,8 @@ fn worker_loop(
         let elapsed_us = t0.elapsed().as_micros() as u64;
         mesher_timer.record(req.lod, elapsed_us);
 
-        let packed = pack_result(req.coord, &mesh);
+        let mut mesh = mesh;
+        let packed = pack_and_shed(req.coord, &mut mesh);
         let result = MeshResult {
             coord: req.coord,
             mesh,
@@ -964,7 +986,8 @@ fn gpu_dispatcher_loop(
                     ChunkMesh { vertices: Vec::new(), indices: Vec::new() }
                 }
             };
-            let packed = pack_result(r.coord, &mesh);
+            let mut mesh = mesh;
+            let packed = pack_and_shed(r.coord, &mut mesh);
             if res_tx.send(MeshResult {
                 coord: r.coord, mesh, packed: Some(packed),
                 epoch: r.epoch, version: r.version, lod: r.lod, // r195
@@ -1407,7 +1430,8 @@ fn finish_octree_batch(
             crate::render::mesher::emit_lava_surface(&r.chunk, &mut mesh, origin, Some(&r.sky));
         }
 
-        let packed = pack_result(r.coord, &mesh);
+        let mut mesh = mesh;
+        let packed = pack_and_shed(r.coord, &mut mesh);
         if res_tx.send(MeshResult {
             coord: r.coord, mesh, packed: Some(packed),
             epoch: r.epoch, version: r.version, lod: r.lod, // r195
