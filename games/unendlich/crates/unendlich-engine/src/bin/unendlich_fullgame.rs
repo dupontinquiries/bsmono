@@ -3073,6 +3073,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     }
     const GRAZE_SCAN_INTERVAL: u32 = 6;
     const BREED_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
+    // perfbisect 2026-09-01: ROAMER TIME BOX. The distance bands bound how
+    // often a brain runs; this bounds how long the whole pass may take —
+    // roamer_tick measured 12-16 ms p50 whenever the herd was unlucky. Once
+    // the box is spent, only creatures within NEAR_ALWAYS_BLOCKS tick; the
+    // rest catch up through the r265 path next frame (they do not record
+    // last_tick_frame). UNENDLICH_ROAMER_BUDGET_MS, default 4.0, 0 = off.
+    let mut roamer_budget = unendlich_engine::sim::ai_budget::FrameBudget::from_env();
+    if roamer_budget.enabled() {
+        log::info!("[roamer_budget] ENABLED — {} ms per pass, near {} blocks always",
+            std::env::var("UNENDLICH_ROAMER_BUDGET_MS").unwrap_or_else(|_| unendlich_engine::sim::ai_budget::DEFAULT_ROAMER_BUDGET_MS.to_string()),
+            unendlich_engine::sim::ai_budget::NEAR_ALWAYS_BLOCKS);
+    }
     const PROFILE_DUMP_SECS: f32 = 5.0;
 
     // Cloud animation cadence: every N seconds, bump the version of
@@ -8302,6 +8314,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             } else {
                 Vec::new()
             };
+            roamer_budget.begin();
             for r in roamers.iter_mut() {
                 // r265: catch-up count carried from the gate to the tick body.
                 let mut mob_band_catch_up: u32 = 1;
@@ -8310,6 +8323,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     let db = (((p[0] - budget_viewer.x).powi(2)
                         + (p[2] - budget_viewer.z).powi(2))
                         .sqrt()) as i32;
+                    // THE TIME BOX, before the curfew gate so a skipped
+                    // creature never records a tick it did not take and the
+                    // catch-up sees the gap. Persistent (dragons) exempt.
+                    if !r.persistent && !roamer_budget.allow(db) {
+                        continue;
+                    }
                     let band = unendlich_engine::sim::ai_budget::TickBand::from_distance(db);
                     let ent_id = r.flight_phase.to_bits() as u64;
                     // persistent (dragons) are exempt: flight arcs + breath
@@ -9679,6 +9698,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
             }
             if profile_on { prof.record("roamer_tick", _t_roamer.elapsed().as_secs_f64() * 1e3); }
+            // the time box's own accounting: how many it ran and skipped, as a
+            // zone so it lands in the same summary perfbisect reads
+            if profile_on {
+                prof.record("roamer_skipped", roamer_budget.skipped as f64);
+                prof.record("roamer_ran", roamer_budget.ran as f64);
+            }
+            if let Some(line) = roamer_budget.report() {
+                log::debug!("{line}");
+            }
             if profile_on {
                 prof.record("roamer_blockscan", _t_blockscan_us as f64 / 1000.0);
                 prof.record("roamer_herdscan", _t_herdscan_us as f64 / 1000.0);
