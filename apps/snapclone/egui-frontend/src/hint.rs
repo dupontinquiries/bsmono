@@ -78,6 +78,8 @@ pub struct Situation {
     pub unread: usize,
     /// The user has already seen the "reachable" line this session.
     pub reachable_shown: bool,
+    /// The soonest scheduled command, rendered ("call in 12 min").
+    pub next_scheduled: Option<String>,
 }
 
 /// The decision.
@@ -144,6 +146,10 @@ pub fn hint(s: &Situation) -> Option<Hint> {
                  format!("Reachable from outside at {r}; peers on other networks can open a path to us."),
                  GoTo::Nowhere);
     }
+    if let Some(next) = &s.next_scheduled {
+        return h(Level::Info, &format!("next: {next}"),
+                 format!("Scheduled: {next}. Ctrl+K to add or change."), GoTo::Nowhere);
+    }
     if s.unread > 0 {
         let n = s.unread;
         return h(Level::Info, &format!("{n} new"), format!("{n} unread snap{}.", if n == 1 { "" } else { "s" }),
@@ -183,6 +189,8 @@ mod tests {
         assert!(hint(&s).unwrap().short.contains("network changed"));
         s.keepalive = Some((3, 3));
         assert_eq!(hint(&s).unwrap().short, "2 new");
+        s.next_scheduled = Some("call in 12 min".into());
+        assert_eq!(hint(&s).unwrap().short, "next: call in 12 min", "what is coming beats what is new");
     }
 
     #[test]

@@ -403,8 +403,29 @@ pub fn feed_ui(ui: &mut egui::Ui, feed: &SnapFeed, press: &mut Press, now: i64,
                         egui::Align2::LEFT_BOTTOM, e.caption(now),
                         egui::FontId::proportional(11.0), c.text_weak);
 
+                    // The affordances. A pointer that hovers is told what a
+                    // tap and a hold do; a press — finger or button — draws a
+                    // ring that fills as the hold completes, so the user can
+                    // see the menu coming rather than wonder how long to
+                    // wait. Touch only hovers while pressing, so the caption
+                    // never clutters a phone that is not touching anything.
+                    if resp.hovered() && !resp.is_pointer_button_down_on() {
+                        ui.painter().rect_stroke(rect.shrink(1.0), 8.0,
+                            egui::Stroke::new(1.5, c.accent), egui::StrokeKind::Inside);
+                        ui.painter().text(rect.left_top() + egui::vec2(8.0, 8.0),
+                            egui::Align2::LEFT_TOP, "tap · hold for menu",
+                            egui::FontId::proportional(10.0), c.text_weak);
+                    }
                     if resp.is_pointer_button_down_on() {
                         if !ui.input(|i| i.pointer.is_decidedly_dragging()) { press.down(); }
+                        let p = press.progress();
+                        if p > 0.0 {
+                            let a = (p * 255.0) as u8;
+                            let col = egui::Color32::from_rgba_unmultiplied(c.accent.r(), c.accent.g(), c.accent.b(), a);
+                            ui.painter().circle_stroke(rect.center(), rect.width() * 0.3,
+                                egui::Stroke::new(2.0 + 4.0 * p, col));
+                            ui.ctx().request_repaint();
+                        }
                         if press.tick(dt) == Gesture::Hold {
                             action = Some(FeedAction::OpenThread(e.id.clone()));
                         }

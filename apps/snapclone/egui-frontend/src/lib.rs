@@ -73,6 +73,7 @@ pub mod dht_bootstrap;
 pub mod dht_envelope;
 pub mod dht_presence;
 pub mod hint;
+pub mod palette;
 pub mod nat_traversal;
 pub mod face_consent;
 pub mod frame_pump;
@@ -645,6 +646,19 @@ pub struct Snapclone {
     pub help: crate::help_manual::HelpManual,
     pub help_filter: String,
     pub help_scroll_y: f32,
+    /// The command palette (`palette`): open, its text, its cursor.
+    pub palette_open: bool,
+    pub palette_input: String,
+    pub palette_cursor: usize,
+    /// Set the frame the palette opens, so the field takes focus once.
+    pub palette_focus: bool,
+    pub schedule: crate::palette::Schedule,
+    /// The keyboard is driving: Tab was pressed and the pointer has not
+    /// moved since. Draws the focus ring and its caption.
+    pub keyboard_nav: bool,
+    /// What Space/Enter does on a widget, by id, registered as widgets
+    /// draw (`key_label`). Cleared every frame.
+    pub key_labels: std::collections::HashMap<egui::Id, String>,
     /// Running edge-pixel samples. Kept across snaps rather than recomputed:
     /// the palette should settle as the inbox fills, not lurch to whatever
     /// arrived last.
@@ -884,6 +898,13 @@ impl Snapclone {
             ]),
             help_filter: String::new(),
             help_scroll_y: 0.0,
+            palette_open: false,
+            palette_input: String::new(),
+            palette_cursor: 0,
+            palette_focus: false,
+            schedule: Default::default(),
+            keyboard_nav: false,
+            key_labels: Default::default(),
             ambient_samples: Default::default(),
             // Labels from PAGE_NAMES, not a second list. The bar said "Chats"
             // and "Map" where the rest of the app says "Inbox" and
@@ -2928,6 +2949,49 @@ impl Snapclone {
         // Grand where it is held constantly, comfortable where it is rarely
         // touched: the phone's talk button is the former.
         self.voicebar.set_talk_prominent(adaptive.is_compact());
+        // The keyboard warrior's chrome: Tab starts keyboard mode, a pointer
+        // move ends it; Ctrl+K the palette; Ctrl+1..5 the pages.
+        self.key_labels.clear();
+        // Read from the events, not the modifier snapshot: the chord's
+        // modifiers ride on the key event, and a first pointer position has
+        // no delta.
+        let (tab, moved, ctrl_k, page_key) = ui.input(|i| {
+            let mut tab = false; let mut moved = false; let mut ctrl_k = false; let mut page = None;
+            for e in &i.events {
+                match e {
+                    egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                        let chord = modifiers.command || modifiers.ctrl;
+                        match key {
+                            egui::Key::Tab => tab = true,
+                            egui::Key::K if chord => ctrl_k = true,
+                            egui::Key::Num1 if chord => page = Some(0),
+                            egui::Key::Num2 if chord => page = Some(1),
+                            egui::Key::Num3 if chord => page = Some(2),
+                            egui::Key::Num4 if chord => page = Some(3),
+                            egui::Key::Num5 if chord => page = Some(4),
+                            _ => {}
+                        }
+                    }
+                    egui::Event::PointerMoved(_) => moved = true,
+                    _ => {}
+                }
+            }
+            (tab, moved, ctrl_k, page)
+        });
+        if tab { self.keyboard_nav = true; }
+        if moved { self.keyboard_nav = false; }
+        if ctrl_k {
+            self.palette_open = !self.palette_open;
+            self.palette_focus = self.palette_open;
+        }
+        if let Some(i) = page_key { self.nav.go_page(i); }
+        // Deferred commands whose time has come.
+        let wall_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64).unwrap_or(0);
+        for item in self.schedule.due(wall_ms) {
+            self.feed_note = format!("now: {}", item.label);
+            self.run_action(item.action);
+        }
         // Escape closes everything that is open, the way a desktop expects.
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) && self.modal.blocks_input() {
             self.modal.dismiss_all();
@@ -3315,6 +3379,9 @@ impl Snapclone {
         // Wayfinder, Settings — and the shell once routed three of them, so
         // two tabs led nowhere. That is most of why the app read as a demo:
         // the chrome promised more than the body delivered.
+        if self.palette_open {
+            self.palette_ui(ui, surface, wall_ms, &colors);
+        }
         // The help manual: ported with its filter, its idle countdown and the
         // scrolled/interacted distinction, and opened by nothing but tests.
         if self.help.is_open() {
@@ -3419,6 +3486,8 @@ impl Snapclone {
                     egui::vec2(page_offset, 0.0)));
             ui.ctx().set_sublayer(ui.layer_id(), layer);
         }
+        // Last, over everything: the keyboard caption.
+        self.keyboard_caption(ui, &colors);
 
         // THE DIM, painted last so it covers the page rather than being
         // covered by it. dim_overlay_ui returns immediately at zero, so this
@@ -4002,8 +4071,12 @@ impl Snapclone {
         // right surface on a machine with no camera and the honest one while
         // the capture pipeline is still unwired.
         ui.horizontal(|ui| {
-            if ui.button("Scan code").clicked() { self.open_qr_scan(true); }
-            if ui.button("Enter code").clicked() { self.open_qr_scan(false); }
+            let r = ui.button("Scan code");
+            self.key_label(&r, "scan a friend's code with the camera");
+            if r.clicked() { self.open_qr_scan(true); }
+            let r = ui.button("Enter code");
+            self.key_label(&r, "type a friend's code");
+            if r.clicked() { self.open_qr_scan(false); }
         });
 
         // WHAT DISCOVERY FOUND, and what the app makes of it. Two gaps this
@@ -4050,6 +4123,100 @@ impl Snapclone {
         true
     }
 
+    /// Carry out a palette action. Every arm is a method that already
+    /// existed; the palette only reaches it by name, now or later.
+    pub fn run_action(&mut self, a: crate::palette::Action) {
+        use crate::palette::Action;
+        match a {
+            Action::Call { leave } => {
+                if leave == self.group_voice.joined { self.toggle_voice(); }
+            }
+            Action::SendTo { id, name } => {
+                self.send_requested.push(id);
+                self.feed_note = format!("sending to {name}");
+            }
+            Action::FlipCamera => { self.flip_camera(); }
+            Action::GoPage(i) => self.nav.go_page(i.min(PAGES.len() - 1)),
+            Action::Snap => { self.nav.go_page(0); self.shutter_pressed = true; }
+            Action::Help => self.help.open(),
+        }
+    }
+
+    /// Register what Space/Enter does on a widget, for the keyboard caption.
+    pub fn key_label(&mut self, r: &egui::Response, what: &str) {
+        self.key_labels.insert(r.id, what.to_string());
+    }
+
+    /// Contacts as the palette wants them: `(sc_id, name)`.
+    fn palette_contacts(&self) -> Vec<(String, String)> {
+        self.contact_book.iter().map(|c| (c.sc_id.clone(), c.label().to_string())).collect()
+    }
+
+    /// The palette: a field, a ranked list, a cursor. Enter runs the
+    /// chosen one now or puts it on the schedule; Escape closes.
+    fn palette_ui(&mut self, ui: &mut Ui, surface: egui::Rect, now_ms: u64, c: &PaletteColors) {
+        let area = egui::Rect::from_min_size(
+            egui::pos2(surface.min.x + surface.width() * 0.1, surface.min.y + 24.0),
+            egui::vec2(surface.width() * 0.8, 260.0));
+        ui.painter().rect_filled(area, 10.0, c.bg_raised);
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area.shrink(12.0)));
+        let field = child.add(egui::TextEdit::singleline(&mut self.palette_input)
+            .hint_text("call at the hour · send ada in 10 min · flip · inbox")
+            .desired_width(f32::INFINITY).id_salt("lib-palette_input"));
+        if std::mem::take(&mut self.palette_focus) { field.request_focus(); }
+        let contacts = self.palette_contacts();
+        let items = crate::palette::suggest(&self.palette_input, now_ms, 0, &contacts,
+                                            self.group_voice.joined, &PAGES);
+        let n = items.len().min(7);
+        if n == 0 { self.palette_cursor = 0; } else { self.palette_cursor = self.palette_cursor.min(n - 1); }
+        let (up, down, enter, esc) = child.input(|i| (
+            i.key_pressed(egui::Key::ArrowUp), i.key_pressed(egui::Key::ArrowDown),
+            i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+        if up && self.palette_cursor > 0 { self.palette_cursor -= 1; }
+        if down && n > 0 && self.palette_cursor + 1 < n { self.palette_cursor += 1; }
+        let mut chosen: Option<usize> = None;
+        for (i, it) in items.iter().take(n).enumerate() {
+            let on = i == self.palette_cursor;
+            let r = child.selectable_label(on, &it.label);
+            if r.clicked() { chosen = Some(i); }
+        }
+        if n == 0 && !self.palette_input.trim().is_empty() {
+            child.colored_label(c.text_weak, "nothing matches — a time that did not parse, or a name nobody has");
+        }
+        if enter && n > 0 { chosen = Some(self.palette_cursor); }
+        if let Some(i) = chosen {
+            let it = items[i].clone();
+            match it.at_ms {
+                Some(at) => {
+                    self.schedule.add(crate::palette::Scheduled { at_ms: at, label: it.label.clone(), action: it.action });
+                    self.feed_note = format!("scheduled: {}", it.label);
+                }
+                None => self.run_action(it.action),
+            }
+            self.palette_open = false;
+            self.palette_input.clear();
+        }
+        if esc { self.palette_open = false; }
+    }
+
+    /// The keyboard caption: a ring around the focused widget and one line
+    /// under it saying what Space/Enter does there, only while the keyboard
+    /// is driving. A mouse user never sees it.
+    fn keyboard_caption(&self, ui: &mut Ui, c: &PaletteColors) {
+        if !self.keyboard_nav { return; }
+        let Some(id) = ui.ctx().memory(|m| m.focused()) else { return };
+        let Some(r) = ui.ctx().read_response(id) else { return };
+        let rect = r.rect.expand(3.0);
+        ui.painter().rect_stroke(rect, 6.0, egui::Stroke::new(2.0, c.accent), egui::StrokeKind::Outside);
+        let what = self.key_labels.get(&id).cloned().unwrap_or_else(|| "activate".into());
+        let text = format!("Space / Enter: {what} · Tab: next · Ctrl+K: commands");
+        let pos = egui::pos2(rect.left(), rect.bottom() + 4.0);
+        let galley = ui.painter().layout_no_wrap(text, egui::FontId::proportional(11.0), c.text);
+        let bg = egui::Rect::from_min_size(pos, galley.size() + egui::vec2(8.0, 4.0));
+        ui.painter().rect_filled(bg, 4.0, c.bg_raised);
+        ui.painter().galley(pos + egui::vec2(4.0, 2.0), galley, c.text);
+    }
+
     /// What the hint reads. Assembled here so `hint::hint` stays a pure
     /// function of a struct it can be handed in a test.
     pub fn situation(&self) -> crate::hint::Situation {
@@ -4072,6 +4239,11 @@ impl Snapclone {
             sends_pending: self.sends.rows().iter().filter(|r| r.state == SendState::Pending).count(),
             unread: self.inbox.unread_count(),
             reachable_shown: self.reachable_shown,
+            next_scheduled: self.schedule.next().map(|n| {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64).unwrap_or(0);
+                format!("{} {}", n.label.split(" · ").next().unwrap_or(&n.label), crate::palette::until(n.at_ms, now))
+            }),
         }
     }
 
@@ -4103,7 +4275,9 @@ impl Snapclone {
     }
 
     fn settings_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
-        if ui.button("help").clicked() { self.help.open(); }
+        let r = ui.button("help");
+        self.key_label(&r, "open the help");
+        if r.clicked() { self.help.open(); }
         // DIAGNOSTIC CHANNELS, one toggle each. Individually, which is the
         // whole point of the module: the C++ it replaces used setFilterRules,
         // so switching one channel on silently switched every other off —
@@ -4779,8 +4953,9 @@ impl Snapclone {
             if n > 0 { ui.colored_label(c.accent, format!("{n} unopened")); }
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.conversation.draft).id_salt("lib-self_conversation_draft"));
-                if ui.add_enabled(self.conversation.can_send(),
-                                  egui::Button::new("send")).clicked() {
+                let r = ui.add_enabled(self.conversation.can_send(), egui::Button::new("send"));
+                self.key_label(&r, "send this message");
+                if r.clicked() {
                     self.conversation.take_draft();
                 }
             });
@@ -5042,6 +5217,63 @@ mod tests {
         }
         assert!(app.received.len() <= 48);
         assert_eq!(app.received[0].id, "s12", "the oldest went first");
+    }
+
+    /// Ctrl+K opens the palette, typing narrows it, Enter runs the choice —
+    /// through real frames — and a timed one waits on the schedule.
+    #[test]
+    fn the_palette_runs_a_command_and_schedules_a_timed_one() {
+        use egui::{Context, Event, Key, Modifiers, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let key = |k: Key, m: Modifiers| Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: m };
+        let mut frame = |app: &mut Snapclone, events: Vec<Event>| {
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        };
+        frame(&mut app, vec![key(Key::K, Modifiers::COMMAND)]);
+        assert!(app.palette_open, "Ctrl+K did not open the palette");
+        frame(&mut app, vec![]);
+        app.palette_input = "inbox".into();
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert_eq!(app.nav.page(), 1, "Enter on \"go to Inbox\" did not go");
+        assert!(!app.palette_open);
+
+        frame(&mut app, vec![key(Key::K, Modifiers::COMMAND)]);
+        app.palette_input = "call at the hour".into();
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        assert_eq!(app.schedule.len(), 1, "a timed command must wait, not run");
+        assert!(!app.group_voice.joined);
+        // The situation carries it; the hint ranks it below blocking problems
+        // (this fixture has no camera), which hint.rs tests.
+        assert!(app.situation().next_scheduled.map(|n| n.starts_with("call in")).unwrap_or(false),
+                "the schedule did not reach the situation");
+    }
+
+    #[test]
+    fn tab_turns_the_keyboard_caption_on_and_a_pointer_move_turns_it_off() {
+        use egui::{Context, Event, Key, Modifiers, Pos2, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        let adaptive = Adaptive::default();
+        let screen = egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 800.0));
+        let mut frame = |app: &mut Snapclone, events: Vec<Event>| {
+            let _ = ctx.run(RawInput { events, screen_rect: Some(screen), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        };
+        frame(&mut app, vec![Event::Key { key: Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }]);
+        assert!(app.keyboard_nav);
+        frame(&mut app, vec![Event::PointerMoved(Pos2::new(10.0, 10.0)), Event::PointerMoved(Pos2::new(30.0, 40.0))]);
+        assert!(!app.keyboard_nav, "a mouse user must never see the caption");
+        // Ctrl+3 is the Friends page.
+        frame(&mut app, vec![Event::Key { key: Key::Num3, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND }]);
+        assert_eq!(app.nav.page(), 2);
     }
 
     #[test]
