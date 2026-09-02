@@ -878,6 +878,7 @@ impl ChunkManager {
         if let Err(e) = std::fs::create_dir_all(&world_root) {
             log::warn!("Failed to create world root {}: {}", world_root.display(), e);
         }
+        self.loader.set_world_root(Some(world_root.clone()));
         self.world_root = Some(world_root);
     }
 
@@ -886,6 +887,7 @@ impl ChunkManager {
         if let Err(e) = std::fs::create_dir_all(&world_root) {
             log::warn!("Failed to create world root {}: {}", world_root.display(), e);
         }
+        self.loader.set_world_root(Some(world_root.clone()));
         self.world_root = Some(world_root);
         self
     }
@@ -914,14 +916,21 @@ impl ChunkManager {
         let mut any_completed = false;
         for loaded in self.loader.drain_completed_iter() {
             any_completed = true;
-            let crate::world::chunk_loader::LoadedChunk { mut chunk, octree } = loaded;
+            let crate::world::chunk_loader::LoadedChunk { mut chunk, octree, edits_applied } = loaded;
             // Overlay any persisted edits on top of the freshly-generated
             // procedural chunk. Edits "stick" through worldgen changes.
-            if let Some(root) = &self.world_root {
-                match crate::storage::load_chunk_edits(root, &mut chunk) {
-                    Ok(0) => {}
-                    Ok(n) => log::debug!("Loaded {} edits for chunk {:?}", n, chunk.coord),
-                    Err(e) => log::warn!("Failed to load edits for {:?}: {}", chunk.coord, e),
+            // 2026-09-02: the loader's workers do this (and build the
+            // octree from the edited blocks) once they know the world
+            // root; this branch only remains for chunks that were in
+            // flight when the root was set. It was a file read per
+            // arriving chunk on the main thread.
+            if !edits_applied {
+                if let Some(root) = &self.world_root {
+                    match crate::storage::load_chunk_edits(root, &mut chunk) {
+                        Ok(0) => {}
+                        Ok(n) => log::debug!("Loaded {} edits for chunk {:?}", n, chunk.coord),
+                        Err(e) => log::warn!("Failed to load edits for {:?}: {}", chunk.coord, e),
+                    }
                 }
             }
             // Allocate field grids for this chunk if fields are enabled.
@@ -934,7 +943,10 @@ impl ChunkManager {
             // worker-built octree is stale relative to the chunk. Rebuild
             // here so the maps stay in sync. The common case (no
             // persisted edits) uses the worker-built octree directly.
-            let octree = if chunk.dirty {
+            // When the worker applied the edits, its octree already
+            // reflects them; a 32³ rebuild on the main thread is only
+            // needed for the in-flight-at-root-set case above.
+            let octree = if chunk.dirty && !edits_applied {
                 OctreeArray::from_chunk(&chunk)
             } else {
                 octree
@@ -1093,7 +1105,7 @@ impl ChunkManager {
             // No interest points — drain completed chunks anyway so they
             // don't pile up indefinitely on a dedicated server tick.
             for loaded in self.loader.drain_completed_iter() {
-                let crate::world::chunk_loader::LoadedChunk { chunk, octree } = loaded;
+                let crate::world::chunk_loader::LoadedChunk { chunk, octree, .. } = loaded;
                 if let Some(state) = &self.fields {
                     let grid = ChunkFields::new(chunk.coord, state.registry.len());
                     state.chunk_grids.insert(chunk.coord, RwLock::new(grid));
