@@ -12247,9 +12247,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         }
                     }
                 }
-                if let Err(e) = renderer.upload_prebuilt_mesh_at_lod_deferrable(
-                    &ctx, result.coord, result.lod, result.mesh, result.version,
-                ) {
+                // 2026-09-02: the pool packs on the worker; upload the wire
+                // form so this thread does a memcpy, not a per-vertex loop.
+                let up = match result.packed {
+                    Some(p) => renderer.upload_packed_mesh_at_lod_deferrable(
+                        &ctx, result.coord, result.lod, p, result.version),
+                    None => renderer.upload_prebuilt_mesh_at_lod_deferrable(
+                        &ctx, result.coord, result.lod, result.mesh, result.version),
+                };
+                if let Err(e) = up {
                     log::warn!("Deferrable upload failed for {:?} at {:?}: {}", result.coord, result.lod, e);
                     continue;
                 }
@@ -12275,7 +12281,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 false
             } {
                 unreachable!()
-            } else if let Err(e) = renderer.upload_prebuilt_mesh_at_lod(&ctx, result.coord, result.lod, result.mesh, result.version) {
+            } else if let Err(e) = match result.packed {
+                Some(p) => renderer.upload_packed_mesh_at_lod(&ctx, result.coord, result.lod, p, result.version),
+                None => renderer.upload_prebuilt_mesh_at_lod(&ctx, result.coord, result.lod, result.mesh, result.version),
+            } {
                 log::warn!("Upload failed for {:?} at {:?}: {}", result.coord, result.lod, e);
                 continue;
             }
