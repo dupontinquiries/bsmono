@@ -33,19 +33,6 @@ use std::path::{Path, PathBuf};
 /// redrawing the line" is.
 const KNOWN_GAPS: &[(&str, &str)] = &[
     (
-        "il_dl_region",
-        "IL (CSI n L), DL (CSI n M) and DECSTBM (CSI t;b r) — insert/delete \
-         line, and the scrolling region they operate inside. Every full-screen \
-         program sets a region; without one, a scroll intended for part of the \
-         screen moves all of it.",
-    ),
-    (
-        "reverse_index",
-        "RI (ESC M) — reverse index, which scrolls DOWN when the cursor is at \
-         the top of the region. Used by anything that draws upward, and by less \
-         when scrolling back.",
-    ),
-    (
         "save_restore",
         "DECSC/DECRC (ESC 7 / ESC 8) and SCOSC/SCORC (CSI s / CSI u) — save and \
          restore the cursor. Prompt-drawing code parks the cursor, writes \

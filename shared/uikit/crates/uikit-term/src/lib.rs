@@ -89,6 +89,16 @@ pub struct Grid {
     /// inside fzf and vim, could never be reached.
     pub app_cursor: bool,
     pub bracketed_paste: bool,
+    /// The scrolling region (DECSTBM), 0-based and INCLUSIVE: the band of rows
+    /// a line feed scrolls, leaving everything outside it fixed. Defaults to
+    /// the whole screen, which is what every existing caller assumed.
+    ///
+    /// Without this, a program that reserves a status line — less, vim, htop,
+    /// anything full-screen — had its region ignored, so a scroll meant for
+    /// part of the screen moved all of it and the status line marched off the
+    /// top.
+    pub scroll_top: usize,
+    pub scroll_bot: usize,
     /// Scrollback view: how many lines ABOVE the live bottom the viewport is showing.
     /// 0 = live. While scrolled back, new output does not move the view (the offset is bumped
     /// as lines enter scrollback — the standard terminal pin), and the cursor is hidden.
@@ -121,6 +131,8 @@ impl Grid {
             scrollback_cap: 1000,
             app_cursor: false,
             bracketed_paste: false,
+            scroll_top: 0,
+            scroll_bot: rows - 1,
             view_offset: 0,
         }
     }
@@ -217,11 +229,101 @@ impl Grid {
 
     /// Move down one line, scrolling if at the bottom.
     pub fn line_feed(&mut self) {
-        if self.cur_row + 1 >= self.rows {
+        // At the region's BOTTOM, scroll the region. Not `rows - 1`: with a
+        // region set, the last row of the screen is outside it and must not
+        // move, and a cursor already below the region just walks down.
+        if self.cur_row == self.scroll_bot {
             self.scroll_up();
-        } else {
+        } else if self.cur_row + 1 < self.rows {
             self.cur_row += 1;
         }
+    }
+
+    /// Reverse index (`ESC M`): up one, scrolling the region DOWN at its top.
+    /// What a program uses to draw upward, and what `less` uses to scroll back.
+    pub fn reverse_index(&mut self) {
+        if self.cur_row == self.scroll_top {
+            self.scroll_region_down(1);
+        } else {
+            self.cur_row = self.cur_row.saturating_sub(1);
+        }
+    }
+
+    /// Set the scrolling region (DECSTBM), 1-based inclusive as the protocol
+    /// sends it. A region that would be empty or inverted is REFUSED — the
+    /// whole screen is restored instead, which is what `CSI r` with no
+    /// parameters means and what a program sends to undo one.
+    pub fn set_scroll_region(&mut self, top: u16, bot: u16) {
+        let t = (top.max(1) as usize - 1).min(self.rows - 1);
+        let b = if bot == 0 { self.rows - 1 } else { (bot as usize - 1).min(self.rows - 1) };
+        if t >= b {
+            self.scroll_top = 0;
+            self.scroll_bot = self.rows - 1;
+        } else {
+            self.scroll_top = t;
+            self.scroll_bot = b;
+        }
+        // DECSTBM homes the cursor. Programs rely on it: the usual sequence is
+        // "set the region, then draw from the top of it" with no explicit move.
+        self.cur_row = 0;
+        self.cur_col = 0;
+    }
+
+    /// Move the rows of `[top, bot]` up by `n`, blanking the `n` freed at the
+    /// bottom. The primitive under a line feed at the region's foot, `SU`, and
+    /// `DL` (which passes the cursor's row as `top`).
+    fn shift_up(&mut self, top: usize, bot: usize, n: usize) {
+        if top > bot || n == 0 { return; }
+        let n = n.min(bot - top + 1);
+        for r in top..=bot - n {
+            let (src, dst) = (self.idx(r + n, 0), self.idx(r, 0));
+            self.cells.copy_within(src..src + self.cols, dst);
+        }
+        for r in bot + 1 - n..=bot {
+            let base = self.idx(r, 0);
+            for c in 0..self.cols {
+                self.cells[base + c] = Cell::default();
+            }
+        }
+    }
+
+    /// The mirror of [`Grid::shift_up`], for `RI`, `SD` and `IL`.
+    fn shift_down(&mut self, top: usize, bot: usize, n: usize) {
+        if top > bot || n == 0 { return; }
+        let n = n.min(bot - top + 1);
+        for r in (top + n..=bot).rev() {
+            let (src, dst) = (self.idx(r - n, 0), self.idx(r, 0));
+            self.cells.copy_within(src..src + self.cols, dst);
+        }
+        for r in top..top + n {
+            let base = self.idx(r, 0);
+            for c in 0..self.cols {
+                self.cells[base + c] = Cell::default();
+            }
+        }
+    }
+
+    /// Scroll the region down `n` (content moves toward the bottom).
+    pub fn scroll_region_down(&mut self, n: usize) {
+        let (t, b) = (self.scroll_top, self.scroll_bot);
+        self.shift_down(t, b, n);
+    }
+
+    /// Insert `n` blank lines AT THE CURSOR, pushing the rest of the region
+    /// down and off its bottom. A no-op outside the region, which is what
+    /// keeps a stray IL from a program that has moved above its own region
+    /// from shifting the status line it was protecting.
+    pub fn insert_lines(&mut self, n: usize) {
+        if self.cur_row < self.scroll_top || self.cur_row > self.scroll_bot { return; }
+        let (r, b) = (self.cur_row, self.scroll_bot);
+        self.shift_down(r, b, n.max(1));
+    }
+
+    /// Delete `n` lines at the cursor, pulling the rest of the region up.
+    pub fn delete_lines(&mut self, n: usize) {
+        if self.cur_row < self.scroll_top || self.cur_row > self.scroll_bot { return; }
+        let (r, b) = (self.cur_row, self.scroll_bot);
+        self.shift_up(r, b, n.max(1));
     }
 
     pub fn carriage_return(&mut self) {
@@ -237,23 +339,36 @@ impl Grid {
         self.cur_col = next.min(self.cols - 1);
     }
 
-    /// Scroll the whole screen up one line; the top row goes to scrollback.
+    /// Scroll the SCROLLING REGION up one line.
+    ///
+    /// The row leaving the top enters scrollback only when the region is the
+    /// whole screen. A program that reserved a status line is redrawing a
+    /// window over its own content, not producing history; putting those rows
+    /// in the scrollback would fill it with half-frames of vim and make the
+    /// buffer useless for the thing it exists for.
+    ///
+    /// (xterm's own rule is narrower — it saves whenever the region's top is
+    /// row 0 — which would also capture a bottom-anchored region. Requiring
+    /// the FULL screen is the conservative reading: it never captures a frame
+    /// that was not history, at the cost of missing scrollback for a program
+    /// that reserves only a footer. Worth revisiting with a real `less`
+    /// session in front of you.)
     pub fn scroll_up(&mut self) {
-        let top: Vec<Cell> = self.cells[0..self.cols].to_vec();
-        self.scrollback.push(top);
-        if self.scrollback.len() > self.scrollback_cap {
-            self.scrollback.remove(0);
+        let full = self.scroll_top == 0 && self.scroll_bot == self.rows - 1;
+        if full {
+            let top: Vec<Cell> = self.cells[0..self.cols].to_vec();
+            self.scrollback.push(top);
+            if self.scrollback.len() > self.scrollback_cap {
+                self.scrollback.remove(0);
+            }
+            // pin the view while scrolled back: the bottom moved one line away, so keep pointing at
+            // the same content (clamped — eviction above can shrink what's reachable)
+            if self.view_offset > 0 {
+                self.view_offset = (self.view_offset + 1).min(self.scrollback.len());
+            }
         }
-        // pin the view while scrolled back: the bottom moved one line away, so keep pointing at
-        // the same content (clamped — eviction above can shrink what's reachable)
-        if self.view_offset > 0 {
-            self.view_offset = (self.view_offset + 1).min(self.scrollback.len());
-        }
-        self.cells.copy_within(self.cols.., 0);
-        let last = self.cells.len() - self.cols;
-        for c in &mut self.cells[last..] {
-            *c = Cell::default();
-        }
+        let (t, b) = (self.scroll_top, self.scroll_bot);
+        self.shift_up(t, b, 1);
     }
 
     /// Page the viewport up into scrollback by `n` lines (clamped to what exists).
@@ -467,6 +582,13 @@ impl Grid {
         self.rows = rows;
         self.cur_row = self.cur_row.min(rows - 1);
         self.cur_col = self.cur_col.min(cols - 1);
+        // A region that outlived the rows it named would make `line_feed`
+        // compare the cursor against a row that no longer exists, and the
+        // screen would stop scrolling entirely. A resize is also when a shell
+        // re-sends DECSTBM, so resetting to the full screen is both safe and
+        // what the next escape will correct.
+        self.scroll_top = 0;
+        self.scroll_bot = rows - 1;
     }
 }
 
@@ -559,6 +681,8 @@ impl Parser {
                     self.state = State::Csi;
                 }
                 ']' => self.state = State::Osc,
+                // RI — reverse index. Not a CSI: a bare `ESC M`.
+                'M' => { grid.reverse_index(); self.state = State::Ground; }
                 _ => self.state = State::Ground, // ignore non-CSI escapes for v1
             },
             State::Osc => match ch {
@@ -677,6 +801,17 @@ impl Parser {
             '@' => grid.insert_chars(Self::param_or(params, 0, 1) as usize),
             'P' => grid.delete_chars(Self::param_or(params, 0, 1) as usize),
             'X' => grid.erase_chars(Self::param_or(params, 0, 1) as usize),
+            'L' => grid.insert_lines(Self::param_or(params, 0, 1) as usize),
+            'M' => grid.delete_lines(Self::param_or(params, 0, 1) as usize),
+            // SU / SD scroll the region itself, cursor unmoved — distinct from
+            // IL/DL, which anchor at the cursor.
+            'S' => {
+                let n = Self::param_or(params, 0, 1) as usize;
+                for _ in 0..n.max(1) { grid.scroll_up(); }
+            }
+            'T' => grid.scroll_region_down(Self::param_or(params, 0, 1) as usize),
+            'r' => grid.set_scroll_region(
+                Self::param_or(params, 0, 1), params.get(1).copied().unwrap_or(0)),
             'J' => grid.erase_in_display(params.first().copied().unwrap_or(0)),
             'K' => grid.erase_in_line(params.first().copied().unwrap_or(0)),
             'm' => self.apply_sgr(params, grid),
@@ -2021,6 +2156,95 @@ mod tests {
         t.feed("abcde");
         assert_eq!(t.grid.row_text(0), "abcd");
         assert_eq!(t.grid.row_text(1), "e");
+    }
+
+    #[test]
+    fn a_line_feed_at_the_regions_foot_scrolls_only_the_region() {
+        // The property, stated as what must NOT move: rows outside the band.
+        // A test that only checked the band would pass on a full-screen scroll,
+        // which is the bug.
+        let mut t = Terminal::new(6, 5);
+        t.feed("a\r\nb\r\nc\r\nd\r\ne");
+        t.feed("\x1b[2;4r");                 // region = rows 1..3
+        t.feed("\x1b[4;1H\n");              // cursor at the foot, then LF
+        assert_eq!(t.grid.row_text(0), "a", "the row above the region moved");
+        assert_eq!(t.grid.row_text(4), "e", "the row below the region moved");
+        assert_eq!(t.grid.row_text(1), "c");
+        assert_eq!(t.grid.row_text(2), "d");
+        assert_eq!(t.grid.row_text(3), "", "the freed row was not blanked");
+        assert_eq!(t.grid.cur_row, 3, "the cursor left the region's foot");
+    }
+
+    #[test]
+    fn a_regional_scroll_does_not_enter_scrollback() {
+        // A program redrawing a window over its own content is not producing
+        // history. Both directions: a full-screen scroll still must.
+        let mut t = Terminal::new(6, 4);
+        t.feed("\x1b[1;3r\x1b[3;1H\n\n\n");
+        assert!(t.grid.scrollback.is_empty(), "a windowed redraw polluted the scrollback");
+        let mut t = Terminal::new(6, 4);
+        t.feed("a\r\nb\r\nc\r\nd\n");
+        assert_eq!(t.grid.scrollback.len(), 1, "a full-screen scroll must still save the row");
+    }
+
+    #[test]
+    fn reverse_index_scrolls_down_only_at_the_regions_top() {
+        let mut t = Terminal::new(6, 5);
+        t.feed("a\r\nb\r\nc\r\nd\r\ne\x1b[2;4r");
+        t.feed("\x1b[3;1H\x1bM");            // inside the region: just move up
+        assert_eq!((t.grid.cur_row, t.grid.row_text(1)), (1, "b".to_string()));
+        t.feed("\x1bM");                      // now AT the top: scroll down
+        assert_eq!(t.grid.cur_row, 1, "RI at the top must not leave the region");
+        assert_eq!(t.grid.row_text(1), "", "the top of the region was not blanked");
+        assert_eq!(t.grid.row_text(2), "b");
+        assert_eq!(t.grid.row_text(0), "a", "RI moved a row outside the region");
+        assert_eq!(t.grid.row_text(4), "e", "RI moved a row outside the region");
+    }
+
+    #[test]
+    fn insert_and_delete_line_are_bounded_by_the_region() {
+        let mut t = Terminal::new(6, 5);
+        t.feed("a\r\nb\r\nc\r\nd\r\ne\x1b[2;4r\x1b[2;1H\x1b[L");
+        assert_eq!(t.grid.row_text(1), "");
+        assert_eq!(t.grid.row_text(2), "b");
+        assert_eq!(t.grid.row_text(3), "c");
+        assert_eq!(t.grid.row_text(4), "e", "the row below the region was pushed");
+
+        // A cursor OUTSIDE the region must not shift it — otherwise a stray IL
+        // from a program that has moved above its own region drags the status
+        // line it was protecting.
+        let mut t = Terminal::new(6, 5);
+        t.feed("a\r\nb\r\nc\r\nd\r\ne\x1b[2;4r\x1b[1;1H\x1b[L");
+        for (r, want) in [(0, "a"), (1, "b"), (2, "c"), (3, "d"), (4, "e")] {
+            assert_eq!(t.grid.row_text(r), want, "row {r} moved on an out-of-region IL");
+        }
+    }
+
+    #[test]
+    fn an_inverted_or_empty_region_restores_the_whole_screen() {
+        // `CSI r` with no parameters is how a program undoes a region, and a
+        // degenerate one must not leave the screen unable to scroll at all.
+        let mut t = Terminal::new(6, 5);
+        t.feed("\x1b[2;4r");
+        assert_eq!((t.grid.scroll_top, t.grid.scroll_bot), (1, 3));
+        t.feed("\x1b[r");
+        assert_eq!((t.grid.scroll_top, t.grid.scroll_bot), (0, 4));
+        t.feed("\x1b[4;2r");                  // inverted
+        assert_eq!((t.grid.scroll_top, t.grid.scroll_bot), (0, 4), "an inverted region stuck");
+        t.feed("\x1b[3;3r");                  // single row = empty band
+        assert_eq!((t.grid.scroll_top, t.grid.scroll_bot), (0, 4));
+    }
+
+    #[test]
+    fn a_resize_clears_a_region_that_would_outlive_its_rows() {
+        // A scroll_bot past the new last row makes line_feed compare against a
+        // row that does not exist, and the screen stops scrolling entirely.
+        let mut t = Terminal::new(6, 10);
+        t.feed("\x1b[3;9r");
+        t.resize(6, 4);
+        assert_eq!((t.grid.scroll_top, t.grid.scroll_bot), (0, 3));
+        t.feed("\x1b[4;1Hx\n\ny");
+        assert!(t.grid.scrollback.len() >= 1, "the screen stopped scrolling after a resize");
     }
 
     #[test]
