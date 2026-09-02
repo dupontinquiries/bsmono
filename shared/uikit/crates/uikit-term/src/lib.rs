@@ -18,11 +18,20 @@ pub mod snapshot;
 
 // ── colours + style ──────────────────────────────────────────────────────────
 
-/// A terminal colour: the theme default, or an ANSI palette index (0–7 normal, 8–15 bright).
+/// A terminal colour: the theme default, a palette index, or a direct colour.
+///
+/// `Ansi` is the FULL 256-entry palette, not just 0–15. Widening its meaning
+/// rather than adding a second indexed variant keeps `SGR 31` and
+/// `SGR 38;5;1` landing on the same value — two representations of one index
+/// is the kind of ambiguity that makes a later comparison quietly wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TermColor {
     Default,
+    /// xterm palette index: 0–7 normal, 8–15 bright, 16–231 the 6x6x6 cube,
+    /// 232–255 the greyscale ramp.
     Ansi(u8),
+    /// A direct 24-bit colour (`SGR 38;2;r;g;b`).
+    Rgb(u8, u8, u8),
 }
 
 /// A cell's visual attributes.
@@ -675,9 +684,54 @@ impl Parser {
         }
     }
 
+    /// SGR, including the extended `38`/`48` forms.
+    ///
+    /// The extended forms CONSUME their sub-parameters, and that is the whole
+    /// point. Before this they did not: `38;5;33` fell through to the plain
+    /// table, where `38` matched nothing, `5` matched nothing and `33` landed
+    /// in the `30..=37` arm as foreground 3 — a wrong colour, silently. Worse,
+    /// `38;2;255;128;0` ended on a `0`, which is SGR RESET, so a truecolour
+    /// escape cleared every attribute the pen was carrying. Modern prompts
+    /// emit these constantly, so "themed prompt loses all its styling" was one
+    /// missing loop.
     fn apply_sgr(&self, params: &[u16], grid: &mut Grid) {
         let ps = if params.is_empty() { &[0u16][..] } else { params };
-        for &p in ps {
+        let mut i = 0usize;
+        while i < ps.len() {
+            let p = ps[i];
+            // `38`/`48` take a form selector and then its arguments. An
+            // incomplete run at the end of the sequence is DROPPED rather than
+            // partially applied: a truncated escape is not evidence about what
+            // colour was wanted, and guessing is how the reset bug behaved.
+            if matches!(p, 38 | 48) {
+                let taken = match ps.get(i + 1) {
+                    Some(5) => match ps.get(i + 2) {
+                        Some(&n) => {
+                            let c = TermColor::Ansi(n.min(255) as u8);
+                            if p == 38 { grid.pen.fg = c } else { grid.pen.bg = c }
+                            3
+                        }
+                        None => ps.len() - i,
+                    },
+                    Some(2) => match (ps.get(i + 2), ps.get(i + 3), ps.get(i + 4)) {
+                        (Some(&r), Some(&g), Some(&b)) => {
+                            let c = TermColor::Rgb(
+                                r.min(255) as u8, g.min(255) as u8, b.min(255) as u8);
+                            if p == 38 { grid.pen.fg = c } else { grid.pen.bg = c }
+                            5
+                        }
+                        _ => ps.len() - i,
+                    },
+                    // An unknown selector (0/1/3/4 exist in the ISO form and
+                    // nothing here can honour them). Skip the selector too, so
+                    // its arguments are not read as colour codes.
+                    Some(_) => 2,
+                    None => 1,
+                };
+                i += taken;
+                continue;
+            }
+            i += 1;
             match p {
                 0 => grid.pen = Style::default(),
                 1 => grid.pen.bold = true,
@@ -785,7 +839,21 @@ pub fn ansi_color(idx: u8) -> egui::Color32 {
         12 => C::from_rgb(0x55, 0x99, 0xff),
         13 => C::from_rgb(0xff, 0x55, 0xff),
         14 => C::from_rgb(0x55, 0xff, 0xff),
-        _ => C::from_rgb(0xff, 0xff, 0xff),
+        15 => C::from_rgb(0xff, 0xff, 0xff),
+        // The 6x6x6 cube. The level table is not linear — xterm's steps are
+        // 0, 95, then 40 apart — and interpolating instead would make every
+        // 256-colour prompt subtly wrong in a way nobody can point at.
+        16..=231 => {
+            const L: [u8; 6] = [0, 95, 135, 175, 215, 255];
+            let i = (idx - 16) as usize;
+            C::from_rgb(L[i / 36], L[(i / 6) % 6], L[i % 6])
+        }
+        // The 24-step greyscale ramp, 8..238 by 10.
+        _ => {
+            let v = 8u16 + 10 * (idx as u16 - 232);
+            let v = v.min(255) as u8;
+            C::from_rgb(v, v, v)
+        }
     }
 }
 
@@ -795,10 +863,12 @@ pub fn resolve_colors(style: Style, colors: &uikit_egui::PaletteColors) -> (egui
     let fg = match style.fg {
         TermColor::Default => colors.text,
         TermColor::Ansi(i) => ansi_color(i),
+        TermColor::Rgb(r, g, b) => egui::Color32::from_rgb(r, g, b),
     };
     let bg = match style.bg {
         TermColor::Default => colors.bg_base,
         TermColor::Ansi(i) => ansi_color(i),
+        TermColor::Rgb(r, g, b) => egui::Color32::from_rgb(r, g, b),
     };
     if style.inverse {
         (bg, fg)
@@ -1951,6 +2021,98 @@ mod tests {
         t.feed("abcde");
         assert_eq!(t.grid.row_text(0), "abcd");
         assert_eq!(t.grid.row_text(1), "e");
+    }
+
+    #[test]
+    fn extended_sgr_sets_the_colour_it_names() {
+        let mut t = Terminal::new(10, 2);
+        t.feed("\x1b[38;5;33mA\x1b[48;5;236mB\x1b[38;2;255;128;0mC");
+        assert_eq!(t.grid.cell(0, 0).style.fg, TermColor::Ansi(33));
+        assert_eq!(t.grid.cell(0, 1).style.bg, TermColor::Ansi(236));
+        assert_eq!(t.grid.cell(0, 2).style.fg, TermColor::Rgb(255, 128, 0));
+        // The background set two escapes ago is still there: an extended form
+        // must consume its own arguments and touch nothing else.
+        assert_eq!(t.grid.cell(0, 2).style.bg, TermColor::Ansi(236));
+    }
+
+    #[test]
+    fn an_extended_colour_does_not_reset_the_pen() {
+        // The actual reported damage. `38;2;255;128;0` used to fall through to
+        // the plain table and end on a `0`, which is SGR RESET — so a
+        // truecolour escape cleared bold, inverse and every colour the prompt
+        // had set. Asserting the new colour alone would not have caught it.
+        let mut t = Terminal::new(10, 2);
+        t.feed("\x1b[1;7;41m\x1b[38;2;10;20;30mX");
+        let st = t.grid.cell(0, 0).style;
+        assert!(st.bold, "bold was cleared by a truecolour escape");
+        assert!(st.inverse, "inverse was cleared by a truecolour escape");
+        assert_eq!(st.bg, TermColor::Ansi(1), "background was cleared");
+        assert_eq!(st.fg, TermColor::Rgb(10, 20, 30));
+    }
+
+    #[test]
+    fn attributes_after_an_extended_colour_still_apply() {
+        // The complement of consuming arguments: consuming too MANY would eat
+        // the parameters that follow, which is the opposite failure and just
+        // as silent.
+        let mut t = Terminal::new(10, 2);
+        t.feed("\x1b[38;5;196;1;4mX");
+        assert_eq!(t.grid.cell(0, 0).style.fg, TermColor::Ansi(196));
+        assert!(t.grid.cell(0, 0).style.bold, "the `1` after the colour was swallowed");
+        let mut t = Terminal::new(10, 2);
+        t.feed("\x1b[38;2;1;2;3;7mX");
+        assert!(t.grid.cell(0, 0).style.inverse, "the `7` after a truecolour was swallowed");
+    }
+
+    #[test]
+    fn a_truncated_extended_colour_is_dropped_not_half_applied() {
+        // `38;5` with no index, and `38;2;1;2` with no blue. Neither says what
+        // colour was wanted, and the old code's answer was to interpret the
+        // leftovers as separate SGR codes — which is how a reset appeared out
+        // of a colour change.
+        for seq in ["\x1b[1m\x1b[38;5mX", "\x1b[1m\x1b[38;2;1;2mX"] {
+            let mut t = Terminal::new(10, 2);
+            t.feed(seq);
+            let st = t.grid.cell(0, 0).style;
+            assert!(st.bold, "{seq:?} disturbed the pen");
+            assert_eq!(st.fg, TermColor::Default, "{seq:?} invented a colour");
+        }
+    }
+
+    #[test]
+    fn an_unknown_extended_selector_takes_its_selector_with_it() {
+        // `38` followed by a form this cannot honour (the ISO `0`-`4` variants).
+        // The selector must be skipped ALONG WITH the 38, or it is read as a
+        // plain SGR code — and the selectors that collide are the worst two:
+        // `0` is RESET and `1` is bold. `38;0m` clearing the pen is the same
+        // damage the truecolour bug did, from the other direction.
+        //
+        // This case was untested until breaking it changed nothing, which is
+        // the only way that would have shown (CLAUDE.md §5b).
+        let mut t = Terminal::new(10, 2);
+        t.feed("\x1b[1;7m\x1b[38;0mX");
+        let st = t.grid.cell(0, 0).style;
+        assert!(st.bold && st.inverse, "an unknown selector's `0` reset the pen");
+
+        let mut t = Terminal::new(10, 2);
+        t.feed("\x1b[38;1mX");
+        assert!(!t.grid.cell(0, 0).style.bold, "an unknown selector's `1` was read as bold");
+    }
+
+    #[test]
+    fn the_palette_covers_all_256_entries_distinctly() {
+        // `Ansi` now means 0..=255, so the resolver must answer for the cube
+        // and the grey ramp too — not fall into a catch-all that paints every
+        // 256-colour prompt white.
+        assert_eq!(ansi_color(16), egui::Color32::from_rgb(0, 0, 0));
+        assert_eq!(ansi_color(231), egui::Color32::from_rgb(255, 255, 255));
+        assert_eq!(ansi_color(33), egui::Color32::from_rgb(0, 0x87, 0xff));
+        assert_eq!(ansi_color(232), egui::Color32::from_rgb(8, 8, 8));
+        assert_eq!(ansi_color(255), egui::Color32::from_rgb(238, 238, 238));
+        // A floor on distinctness: a resolver that collapsed the cube would
+        // still pass the spot checks above if they happened to be its constant.
+        let n = (0u16..=255).map(|i| ansi_color(i as u8).to_array()).collect::<std::collections::BTreeSet<_>>().len();
+        assert!(n > 230, "only {n} distinct colours in a 256-entry palette");
     }
 
     #[test]

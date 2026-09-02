@@ -22,6 +22,7 @@ fn color(c: TermColor) -> String {
     match c {
         TermColor::Default => "default".to_string(),
         TermColor::Ansi(i) => format!("i{i}"),
+        TermColor::Rgb(r, g, b) => format!("rgb:{r:02x}{g:02x}{b:02x}"),
     }
 }
 

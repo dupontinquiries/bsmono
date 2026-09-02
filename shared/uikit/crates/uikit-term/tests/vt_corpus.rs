@@ -66,13 +66,6 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
          are consumed should close both fixtures at once.",
     ),
     (
-        "sgr_256_and_truecolor",
-        "SGR 38/48 with a 5;n (palette) or 2;r;g;b (direct colour) argument. \
-         Worse than ignored: the sub-parameters fall through to the plain SGR \
-         table, so 38;5;33 sets foreground 3 and 38;2;255;128;0 ends on a 0 \
-         that RESETS the pen. Every themed prompt emits these.",
-    ),
-    (
         "margin_wide",
         "A double-width glyph's second cell is filled with a space, so \
          row_text() reads back one more column than the screen shows. The glyph \
