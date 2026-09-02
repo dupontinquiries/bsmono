@@ -56,11 +56,19 @@ pub struct PathPicker {
     /// Off by default and toggleable rather than absent: a music library does
     /// not need them and a config root is nothing but them.
     pub show_hidden: bool,
+    /// Typed into the filter box. Subdirectories are ranked by
+    /// `fuzzy::score` against this and non-matches dropped — the same
+    /// subsequence matching voiceterm's navigation palette uses, so
+    /// typing "dnl" narrows straight to "Downloads" instead of requiring
+    /// an exact prefix. Empty matches (and ranks) everything, so a picker
+    /// with nothing typed behaves exactly as it did before this field
+    /// existed.
+    pub filter: String,
 }
 
 impl Default for PathPicker {
     fn default() -> Self {
-        PathPicker { stack: Vec::new(), state: State::Idle, show_hidden: false }
+        PathPicker { stack: Vec::new(), state: State::Idle, show_hidden: false, filter: String::new() }
     }
 }
 
@@ -197,7 +205,7 @@ pub enum Action {
 /// widget that hid the difference would stall a frame on somebody's network.
 pub fn picker_ui(
     ui: &mut egui::Ui,
-    p: &PathPicker,
+    p: &mut PathPicker,
     c: &crate::PaletteColors,
     max_rows: usize,
 ) -> Option<Action> {
@@ -228,12 +236,27 @@ pub fn picker_ui(
                 // about the filesystem, and showing nothing at all reads as a
                 // broken picker.
                 ui.label(egui::RichText::new("no subfolders here").weak().small());
+            } else {
+                ui.add(egui::TextEdit::singleline(&mut p.filter)
+                    .hint_text("filter…").id_salt("path_picker-filter"));
+            }
+            // Ranked, not just filtered: `crate::fuzzy::score` rewards an
+            // early, contiguous match, so typing "dnl" on a directory with
+            // both "Downloads" and "download-old" puts the more likely one
+            // first instead of leaving list order (usually alphabetical,
+            // sometimes filesystem-arbitrary) to decide.
+            let mut ranked: Vec<(&String, i32)> = l.dirs.iter()
+                .filter_map(|d| crate::fuzzy::score(&p.filter, d).map(|s| (d, s)))
+                .collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1));
+            if ranked.is_empty() && !p.filter.is_empty() {
+                ui.label(egui::RichText::new("no folders match").weak().small());
             }
             egui::ScrollArea::vertical()
                 .max_height(max_rows as f32 * 22.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    for d in &l.dirs {
+                    for (d, _) in ranked {
                         if ui.selectable_label(false, format!("📁 {d}")).clicked() {
                             let joined = Path::new(&l.path).join(d);
                             act = Some(Action::Enter(joined.to_string_lossy().to_string()));
@@ -251,7 +274,19 @@ pub fn picker_ui(
             });
         }
     }
+    // A filter typed in this directory means nothing once the listing
+    // changes underneath it — clearing on navigation is what keeps a
+    // leftover "dnl" from hiding every entry in the next folder shown.
+    clear_filter_on_navigate(p, &act);
     act
+}
+
+/// Extracted so the navigate-clears-filter rule is testable without
+/// simulating an egui click through `picker_ui`'s full render.
+fn clear_filter_on_navigate(p: &mut PathPicker, act: &Option<Action>) {
+    if matches!(act, Some(Action::Enter(_)) | Some(Action::Up)) {
+        p.filter.clear();
+    }
 }
 
 /// Keep the tail of a long path, with a leading ellipsis.
@@ -379,6 +414,87 @@ mod tests {
         assert_eq!(l.dirs, vec!["sub"], "files must not appear as folders");
         assert!(!l.path.is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn draw(p: &mut PathPicker) -> (Vec<String>, Option<Action>) {
+        let ctx = egui::Context::default();
+        let c = crate::palette_colors("midnight");
+        let mut act = None;
+        let run = |ctx: &egui::Context, p: &mut PathPicker, act: &mut Option<Action>| {
+            ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO,
+                                                            egui::vec2(400.0, 600.0))),
+                ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { *act = picker_ui(ui, p, &c, 8); });
+            })
+        };
+        run(&ctx, p, &mut act);
+        let out = run(&ctx, p, &mut act);
+        let texts = out.shapes.iter().filter_map(|s| match &s.shape {
+            egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+            _ => None,
+        }).collect();
+        (texts, act)
+    }
+
+    #[test]
+    fn an_empty_filter_shows_everything() {
+        let mut p = PathPicker::new();
+        p.open("/music", fake);
+        let (texts, _) = draw(&mut p);
+        let joined = texts.join(" | ");
+        // "Beta" and "alpha" both show; ".hidden" is excluded by
+        // show_hidden defaulting off, unrelated to the filter.
+        assert!(joined.contains("Zed") && joined.contains("alpha") && joined.contains("Beta"),
+                "{joined}");
+    }
+
+    #[test]
+    fn typing_a_subsequence_narrows_and_ranks() {
+        let mut p = PathPicker::new();
+        p.open("/music", fake);
+        p.filter = "eta".into();
+        let (texts, _) = draw(&mut p);
+        let joined = texts.join(" | ");
+        assert!(joined.contains("Beta"), "'eta' is a subsequence of 'Beta'; {joined}");
+        assert!(!joined.contains("Zed") && !joined.contains("alpha"),
+                "neither 'Zed' nor 'alpha' contains 'eta' in order; {joined}");
+    }
+
+    #[test]
+    fn a_filter_with_no_matches_says_so() {
+        let mut p = PathPicker::new();
+        p.open("/music", fake);
+        p.filter = "xyz not a subsequence of anything".into();
+        let (texts, _) = draw(&mut p);
+        assert!(texts.join(" | ").contains("no folders match"), "{texts:?}");
+    }
+
+    #[test]
+    fn entering_a_directory_clears_the_stale_filter() {
+        let mut p = PathPicker::new();
+        p.filter = "something from the parent directory".into();
+        clear_filter_on_navigate(&mut p, &Some(Action::Enter("/music/alpha".into())));
+        assert_eq!(p.filter, "");
+    }
+
+    #[test]
+    fn going_up_also_clears_it() {
+        let mut p = PathPicker::new();
+        p.filter = "leftover".into();
+        clear_filter_on_navigate(&mut p, &Some(Action::Up));
+        assert_eq!(p.filter, "");
+    }
+
+    #[test]
+    fn choosing_or_no_action_leaves_the_filter_alone() {
+        let mut p = PathPicker::new();
+        p.filter = "kept".into();
+        clear_filter_on_navigate(&mut p, &Some(Action::Choose("/music".into())));
+        assert_eq!(p.filter, "kept", "Choose exits the picker; nothing to re-filter");
+        clear_filter_on_navigate(&mut p, &None);
+        assert_eq!(p.filter, "kept");
     }
 }
 

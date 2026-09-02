@@ -709,7 +709,7 @@ impl App {
             // read_dir happens here where it is obviously synchronous. Local
             // listing is sub-millisecond; if this ever browses a network path
             // it has to move off the frame, and the seam is already in place.
-            if let Some(a) = picker_ui(ui, &self.picker, &colors, 8) {
+            if let Some(a) = picker_ui(ui, &mut self.picker, &colors, 8) {
                 match a {
                     Action::Enter(p) => self.picker.open(&p, list_local),
                     Action::Up => self.picker.up(list_local),
