@@ -2555,3 +2555,26 @@ and it reads `theme::power_mode`, so it needs the `perf` override treatment
 glow_scene got PLUS a real content review. The two-way part means neither
 "copy A over B" is safe; someone has to read the diff and decide per hunk.
 This is the one §18's original verdict was right about.
+
+
+## 80. §18 CLOSED — all four scene modules single-copy, -3706 lines
+
+  glow_scene  migrate after building a `perf` override      -449
+  mesh3d      straight re-export (+3 `uvs: None`)           -1733
+  texgen      REVERSE first — scene-kit held the stale copy  -601
+  gpuscene    two-way merge; ported `ray_uv` + its 2 tests   -923
+
+scene-kit: +415 lines of content it was missing, 58 -> 73 tests.
+
+**Four modules, four different correct treatments.** That is the finding worth
+keeping. §18's blanket "genuinely diverged, leave them" was wrong for three of
+four; a blanket "they are duplicates, migrate them" would have been wrong for
+texgen (silently dropping 6 of 11 material layers) and for gpuscene (dropping
+`ray_uv`, live at two call sites). The instrument that separated them was
+measuring THREE things per module — diff size, public surface, and content
+ratio in BOTH directions — and diff size alone, which is what §18 used, is the
+one that misleads.
+
+Re-run `orphan_check.py --functions` after this; the scene-kit/logscope pairs
+should be gone from its output, which is the independent check that the
+de-duplication actually landed.
