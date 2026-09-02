@@ -1842,3 +1842,46 @@ two-implementations pattern this session (after the tool lists and the two
 liaisons). Delete it or make it delegate — an unused half-implementation of a
 security-relevant check is the worst kind to leave lying around, because the
 next person to need one will find it first.
+
+
+## 57. Agent tool-channel: three causes found, ranked by how much each explains
+
+The 8B `:ws` runs produced perfect JSON payloads and zero executed calls.
+Three independent defects, all now understood:
+
+1. **`neutralize` was not idempotent** (FIXED). Compounding
+   `tool_quoted_quoted_quoted` across turns. Explains the mutating fence the
+   model imitates, and part of the context growth that triggered the
+   compact/summarise prompt. This is the one that gets WORSE the longer a run
+   goes, which matches the transcripts degrading rather than failing flat.
+2. **The prompt showed one correct example and eleven argument-only lines**
+   (FIXED). Explains the initial malformed fence on turn one.
+3. **A refused call still builds a Tool** (§56, NOT fixed, pinned as an
+   ignored test). Not a cause of the failure — a hole in the guarantee.
+
+**Still unexplained and worth the next look:** the model appends "The final
+answer is: TASK_COMPLETE (after verification) Please let me know what to do
+next." to a turn whose tool call was ignored. It is declaring completion
+while having read nothing. Once calls actually execute this may vanish on its
+own; if it does not, the retry ladder is not telling the model that its call
+failed — the anomaly is logged to the operator, not fed back into the
+transcript. Check whether `line_calls`'s ladder text reaches the model.
+
+## 58. Performance: the 8B numbers, and what they change
+
+`setup 57798ms + encode 4639ms + submit 4643ms + sync 174054ms of 179589ms`
+at 4.87 tok/s, 15 submits/tok, 1.7 dispatches/pass.
+
+Two things stand out beyond the known sync problem:
+
+- **`setup` is now 57.8s of 179.6s (32%)** — it was negligible on the 1B.
+  Nothing has explained this line yet and it is the second-largest bucket.
+  Worth finding what "setup" covers before optimising anything else, since a
+  third of wall time is a bigger prize than most of the kernel list.
+- **"134.3% accounted"** — the buckets sum to more than wall time, so at
+  least two of them overlap (sync is probably counted inside setup, or vice
+  versa). Until that is resolved the split cannot be trusted to prioritise
+  by, which makes fixing the accounting a prerequisite rather than a nicety.
+
+The readback-backoff fix from earlier this session is NOT in these numbers
+(the run predates it). The next run's sync figure is the measurement.
