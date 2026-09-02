@@ -109,6 +109,10 @@ pub fn walk_and_upsert(
     eprintln!("scanner: preloaded {} existing track rows", existing.len());
 
     let mut walked = 0u64;
+    // Directories the filter refused, so a scan that finds nothing can say
+    // WHY it found nothing. RefCell because `filter_entry` takes a `Fn`, not
+    // a `FnMut`, and this is the only shared state it touches.
+    let skipped: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
     let mut found_paths: HashSet<String> = HashSet::with_capacity(existing.len() + 1024);
     let mut needs_parse = Vec::new();
     // Pending DB writes — batched into a single transaction at the end
@@ -129,13 +133,11 @@ pub fn walk_and_upsert(
                 if e.depth() == 0 { return true; } // always descend the root
                 let name = e.file_name().to_string_lossy();
                 if name.starts_with('.') { return false; }
-                !matches!(name.as_ref(),
-                    "node_modules" | "target" | "build" | "dist" | "out" |
-                    "__pycache__" | ".cache" | ".git" | ".svn" | ".hg" |
-                    "venv" | ".venv" | "env" | ".env" |
-                    "Cache" | "Caches" | "Trash" | ".Trash" |
-                    "Library" | "AppData" | "tmp"
-                )
+                if is_noise_dir(name.as_ref()) {
+                    skipped.borrow_mut().push(e.path().display().to_string());
+                    return false;
+                }
+                true
             });
         for entry in walker.filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() { continue; }
@@ -190,6 +192,42 @@ pub fn walk_and_upsert(
         }
     }
 
+    // ── A scan that found nothing must say why ──
+    //
+    // An empty library and a refused directory look identical in the UI:
+    // no rows, no message, and the user is left to guess whether the path
+    // was wrong, the formats were wrong, or the app is broken. That was the
+    // reported failure ("trouble scanning my library when I point it at the
+    // right folder"), and it is a reporting bug as much as a filter one —
+    // narrowing `is_noise_dir` fixes the case we know about, this covers
+    // the ones we do not.
+    //
+    // Only on ZERO finds: a scan that worked does not need explaining, and
+    // a message on every scan is noise that gets tuned out before the one
+    // time it matters.
+    if walked == 0 {
+        let refused = skipped.into_inner();
+        let roots_desc: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
+        let mut why = format!("no audio found under {}", roots_desc.join(", "));
+        if !refused.is_empty() {
+            let shown: Vec<&str> = refused.iter().map(|s| s.as_str()).take(3).collect();
+            why.push_str(&format!(
+                " — {} director{} were skipped as build/tool noise: {}{}",
+                refused.len(),
+                if refused.len() == 1 { "y" } else { "ies" },
+                shown.join(", "),
+                if refused.len() > 3 { ", ..." } else { "" },
+            ));
+        } else {
+            why.push_str(&format!(
+                " — recognised extensions are: {}",
+                AUDIO_EXTS.join(", ")
+            ));
+        }
+        eprintln!("scanner: {why}");
+        let _ = tx.send(ResultMessage::Error(why));
+    }
+
     // ── Commit all the queued writes in one transaction ──
     //
     // Single transaction = single fsync at the end (with the default
@@ -240,6 +278,33 @@ pub fn walk_and_upsert(
     }));
 
     Ok(needs_parse)
+}
+
+/// Directories never worth descending during a music scan.
+///
+/// **`Library` used to be on this list, and it is the single most likely
+/// name for the folder a user points a music scanner at.** So did `build`,
+/// `dist`, `out`, `env` and `tmp` — every one of them a plausible album,
+/// artist or playlist folder. Pointing the picker at a root with a
+/// `Library/` under it returned zero tracks and said nothing, which is
+/// exactly the reported symptom.
+///
+/// The list exists for a real reason: a music root that overlaps a
+/// development workspace makes a scan crawl. But the cost of a wrong entry
+/// is not "slower", it is "your library is empty and no message explains
+/// why", so what is left here is only names that cannot plausibly be music:
+/// tool directories with no other meaning, matched CASE-SENSITIVELY
+/// (`Target` the album is not `target` the build dir).
+///
+/// Hidden directories are still skipped by the caller, separately — a
+/// leading dot is a real signal and `.git` and friends are covered by it
+/// anyway.
+pub fn is_noise_dir(name: &str) -> bool {
+    matches!(name,
+        "node_modules" | "__pycache__" | "site-packages" |
+        "target" | "venv" |
+        "Trash" | "AppData" | "System Volume Information"
+    )
 }
 
 fn is_audio(path: &Path) -> bool {
@@ -579,6 +644,43 @@ pub fn analyze_pending(
 
 fn unix_now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod noise_dir_tests {
+    use super::is_noise_dir;
+
+    #[test]
+    fn a_folder_a_person_would_call_their_music_is_not_skipped() {
+        // The bug, named. `Library` was on the skip list, so pointing the
+        // picker at a root with a `Library/` under it walked zero files and
+        // reported nothing. Every name here was on that list and every one
+        // of them is a plausible album, artist, playlist or top-level music
+        // folder.
+        for name in ["Library", "library", "build", "dist", "out", "env",
+                     "tmp", "Cache", "Caches", "Media", "Music"] {
+            assert!(!is_noise_dir(name), "{name} would be skipped — it is a plausible music folder");
+        }
+    }
+
+    #[test]
+    fn tool_directories_are_still_skipped() {
+        // The complement. Without this the test above passes on a predicate
+        // that returns false for everything, which would put a whole dev
+        // workspace back into every scan.
+        for name in ["node_modules", "__pycache__", "target", "venv", "Trash"] {
+            assert!(is_noise_dir(name), "{name} should still be skipped");
+        }
+    }
+
+    #[test]
+    fn the_match_is_case_sensitive() {
+        // `Target` is an album; `target` is a build directory. Lowercasing
+        // the comparison would take the album with it.
+        assert!(is_noise_dir("target"));
+        assert!(!is_noise_dir("Target"));
+        assert!(!is_noise_dir("Node_Modules"));
+    }
 }
 
 #[cfg(test)]
