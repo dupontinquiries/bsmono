@@ -248,6 +248,12 @@ pub struct ScanPicker {
     pub suggestions: Vec<String>,
     selected: std::collections::BTreeSet<String>,
     pub custom_path: String,
+    /// Real filesystem navigation, alongside the suggestion checkboxes
+    /// and manual path field above — the shared, fuzzy-filterable widget
+    /// from `uikit_egui::path_picker` rather than a second bespoke
+    /// browser. `None` until "browse…" is pressed, since most scans just
+    /// tick a suggestion and never need it.
+    pub browse: Option<uikit_egui::path_picker::PathPicker>,
 }
 
 impl ScanPicker {
@@ -256,6 +262,7 @@ impl ScanPicker {
         self.suggestions = suggestions;
         self.selected.clear();
         self.custom_path.clear();
+        self.browse = None;
     }
 
     pub fn close(&mut self) { self.open = false; }
@@ -265,6 +272,14 @@ impl ScanPicker {
     }
 
     pub fn is_selected(&self, path: &str) -> bool { self.selected.contains(path) }
+
+    /// A folder chosen through `browse` — added to both the selection AND
+    /// the suggestion list, so it shows up ticked rather than as a
+    /// selected-but-invisible path the person can't see confirmed.
+    pub fn add_browsed(&mut self, path: String) {
+        if !self.suggestions.contains(&path) { self.suggestions.push(path.clone()); }
+        self.selected.insert(path);
+    }
 
     /// `gatherSelectedPaths()` — the ticked suggestions plus the custom path.
     ///
@@ -305,6 +320,42 @@ pub fn scan_picker_ui(ui: &mut egui::Ui, d: &mut ScanPicker, c: &uikit_egui::Pal
             }
             ui.add(egui::TextEdit::singleline(&mut d.custom_path)
                 .hint_text("custom path").id_salt("scan_picker-custom_path"));
+            ui.horizontal(|ui| {
+                let label = if d.browse.is_some() { "hide browser" } else { "browse…" };
+                if ui.button(label).clicked() {
+                    d.browse = if d.browse.is_some() { None } else {
+                        // Start from $HOME when the shell has one — a
+                        // browser that opens at "nowhere yet" (PathPicker's
+                        // own idle state) makes someone press "up" or type
+                        // a root before it's useful for anything.
+                        let mut p = uikit_egui::path_picker::PathPicker::new();
+                        if let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok()) {
+                            p.open(&home, uikit_egui::path_picker::list_local);
+                        }
+                        Some(p)
+                    };
+                }
+            });
+            if let Some(browse) = d.browse.as_mut() {
+                ui.separator();
+                match uikit_egui::path_picker::picker_ui(ui, browse, c, 6) {
+                    Some(uikit_egui::path_picker::Action::Enter(p)) =>
+                        browse.open(&p, uikit_egui::path_picker::list_local),
+                    Some(uikit_egui::path_picker::Action::Up) =>
+                        browse.up(uikit_egui::path_picker::list_local),
+                    Some(uikit_egui::path_picker::Action::ToggleHidden) => {
+                        browse.show_hidden = !browse.show_hidden;
+                        let cur = browse.current().map(str::to_string);
+                        if let Some(cur) = cur { browse.open(&cur, uikit_egui::path_picker::list_local); }
+                    }
+                    Some(uikit_egui::path_picker::Action::Choose(p)) => {
+                        d.add_browsed(p);
+                        d.browse = None;
+                    }
+                    None => {}
+                }
+                ui.separator();
+            }
             ui.horizontal(|ui| {
                 if ui.add_enabled(d.can_scan(), egui::Button::new("scan")).clicked() {
                     result = Some(d.gather());
@@ -474,6 +525,17 @@ mod frame_tests {
         let (texts, _) = draw_scan(&mut d);
         assert!(texts.join(" | ").contains("type a path below"), "{texts:?}");
     }
+
+    #[test]
+    fn a_browse_toggle_is_offered_and_its_label_reflects_state() {
+        let mut d = ScanPicker::default();
+        d.open(vec!["/music".into()]);
+        let (texts, _) = draw_scan(&mut d);
+        assert!(texts.join(" | ").contains("browse…"), "{texts:?}");
+        d.browse = Some(uikit_egui::path_picker::PathPicker::new());
+        let (texts, _) = draw_scan(&mut d);
+        assert!(texts.join(" | ").contains("hide browser"), "{texts:?}");
+    }
 }
 
 #[cfg(test)]
@@ -603,5 +665,35 @@ mod tests {
         s.custom_path = "/b".into();
         s.open(vec!["/a".into()]);
         assert!(!s.can_scan(), "previous choices are not carried over");
+    }
+
+    #[test]
+    fn a_browsed_folder_is_both_ticked_and_visible_in_the_list() {
+        // add_browsed's whole point: a path chosen via the shared
+        // path_picker has to show up ticked, not just be selected somewhere
+        // the person can't see confirmed.
+        let mut s = ScanPicker::default();
+        s.open(vec!["/music".into()]);
+        s.add_browsed("/media/usb/podcasts".into());
+        assert!(s.suggestions.contains(&"/media/usb/podcasts".to_string()));
+        assert!(s.is_selected("/media/usb/podcasts"));
+        assert!(s.gather().contains(&"/media/usb/podcasts".to_string()));
+    }
+
+    #[test]
+    fn browsing_to_an_existing_suggestion_does_not_duplicate_the_row() {
+        let mut s = ScanPicker::default();
+        s.open(vec!["/music".into()]);
+        s.add_browsed("/music".into());
+        assert_eq!(s.suggestions.iter().filter(|p| *p == "/music").count(), 1);
+    }
+
+    #[test]
+    fn reopening_the_scan_picker_also_closes_any_open_browser() {
+        let mut s = ScanPicker::default();
+        s.open(vec!["/a".into()]);
+        s.browse = Some(uikit_egui::path_picker::PathPicker::new());
+        s.open(vec!["/a".into()]);
+        assert!(s.browse.is_none(), "a stale browser from the last open would show the wrong folder");
     }
 }
