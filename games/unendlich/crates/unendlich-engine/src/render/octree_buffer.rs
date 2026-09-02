@@ -348,13 +348,23 @@ impl OctreeBufferPool {
     /// device-memory headroom — at 256 MiB the pool is a hard ceiling well
     /// below typical workstation GPU memory; raising it directly raises the
     /// number of resident chunks before OOM fallback fires.
+    ///
+    /// `queue_families`: every queue family that will read this buffer.
+    /// The renderer's octree probe reads it on the graphics family; the
+    /// octree mesher reads it on the compute family when the context
+    /// has a distinct one. With two distinct families the buffer is
+    /// created CONCURRENT — an EXCLUSIVE buffer touched by two families
+    /// without ownership transfers has undefined contents per spec (it
+    /// "works" on unified memory until it doesn't). One family, or
+    /// duplicates, → EXCLUSIVE as before.
     pub unsafe fn new(
         device: &Device,
         instance: &Instance,
         physical_device: vk::PhysicalDevice,
+        queue_families: &[u32],
     ) -> Result<Self, OctreePoolError> {
         let cap = runtime_octree_pool_bytes();
-        Self::with_capacity(device, instance, physical_device, cap)
+        Self::with_capacity(device, instance, physical_device, cap, queue_families)
     }
 
     /// Create the pool with a specific buffer capacity. Useful for
@@ -364,9 +374,10 @@ impl OctreeBufferPool {
         instance: &Instance,
         physical_device: vk::PhysicalDevice,
         capacity: u64,
+        queue_families: &[u32],
     ) -> Result<Self, OctreePoolError> {
         let (buffer, memory, map_ptr) = create_octree_buffer(
-            device, instance, physical_device, capacity,
+            device, instance, physical_device, capacity, queue_families,
         )?;
         Ok(Self {
             cpu: CpuOctreePool::new(capacity),
@@ -598,11 +609,20 @@ unsafe fn create_octree_buffer(
     instance: &Instance,
     physical_device: vk::PhysicalDevice,
     size: u64,
+    queue_families: &[u32],
 ) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), OctreePoolError> {
+    let mut families: Vec<u32> = queue_families.to_vec();
+    families.sort_unstable();
+    families.dedup();
     let info = vk::BufferCreateInfo::builder()
         .size(size)
-        .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST);
+    let info = if families.len() >= 2 {
+        log::info!("octree pool: CONCURRENT across queue families {:?}", families);
+        info.sharing_mode(vk::SharingMode::CONCURRENT).queue_family_indices(&families)
+    } else {
+        info.sharing_mode(vk::SharingMode::EXCLUSIVE)
+    };
     let buffer = device.create_buffer(&info, None)
         .map_err(|e| OctreePoolError::Backend(format!("vkCreateBuffer: {:?}", e)))?;
 
