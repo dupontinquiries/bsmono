@@ -308,6 +308,22 @@ impl App {
         if let Some(roots) = self.controller.pending_scan_with_roots.take() {
             self.catalog.scan_with_roots(roots);
         }
+        if let Some(url) = self.controller.pending_remote_queue_load.take() {
+            self.controller.remote_queue = self.catalog.queue_for_device(&url).into_iter()
+                .map(|e| (e.track_id, e.title, e.primary_artist.unwrap_or_default()))
+                .collect();
+        }
+        if let Some((url, track_id)) = self.controller.pending_remote_queue_push.take() {
+            if self.catalog.queue_push(track_id, &url) {
+                // Reflect it immediately rather than waiting for the next
+                // time the device is reselected.
+                self.controller.remote_queue = self.catalog.queue_for_device(&url).into_iter()
+                    .map(|e| (e.track_id, e.title, e.primary_artist.unwrap_or_default()))
+                    .collect();
+            } else {
+                self.last_note = "could not queue track on that speaker".into();
+            }
+        }
         if let Some(id) = self.controller.last_played_track.take() {
             // Persisted through the worker (play count + history), not
             // written on this connection — see real_catalog.rs.
