@@ -2055,3 +2055,33 @@ bind the listen port and bootstrap from remembered peers. That is directly
 relevant to §22 — gitmind fleet discovery never finding the Fairphones — and
 may be the missing piece there, or at least the place to look first now that
 there is real NAT code to point at the problem.
+
+
+## 61. The "bright pink theme" run: what it proves
+
+The model was patient, not blocked — the operator confirmed replies do arrive.
+So the failure is quality, not plumbing, and the run is a clean diagnosis:
+
+- **It never read a file** (`0 file(s)`, plan `4 unverifiable`). It invented
+  a `themes` array in a Cargo.toml.
+- **The harness pointed it there.** Query-blind ranking put both Cargo.tomls
+  at 0.90 and `palette.rs` at 0.17. Fixed this session.
+- **It could not have found palette.rs anyway** — that run predates the
+  depth-balanced `repo_tree` (§59), so the tree it saw was top-level only.
+  Both fixes are needed together and neither is in the running build.
+
+**Ruled out, so nobody re-chases it:** the garbled identifiers are not a
+tokenizer bug. `uikit-egui` appears correctly beside `uikit - egui` in one
+line, and `drop_report()` — which prints on any encode/decode drop — is
+absent from the log. It is confabulation.
+
+**Still open and now the most interesting question:** the loop guard fired at
+9 turns, which is the right outcome, but the model spent those turns
+rewriting the same wrong file. Once it can see and read the right one, re-run
+this exact prompt — it is a good regression case because the answer is
+verifiable (a new palette constant, an enum arm, and the `all()` count test
+that will fail if the arm is missed).
+
+The `patch mode: no patches applied — the reply was prose` message is working
+as designed and is worth keeping; it is the only line in the run that told
+the operator plainly that nothing had been written.
