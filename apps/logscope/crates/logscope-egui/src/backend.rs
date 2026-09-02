@@ -1817,8 +1817,15 @@ than none)", self.name),
             crate::diag!("wgpu-engine: [{}] profile — {ds} submits ({:.0}/tok), {dp} polls, {gp1} passes / {gd1} disp ({:.1}/pass) | setup {setup_ms:.0}ms + encode {encode_ms:.0}ms + submit {submit_ms:.0}ms + sync {sync_ms:.0}ms + sample {sample_ms:.0}ms of {total_ms:.0}ms ({bound}-bound, {:.1}% accounted){}",
                 self.name, ds as f64 / per, gd1 as f64 / (gp1.max(1)) as f64, accounted / total_ms.max(1.0) * 100.0,
                 if over {
-                    " — OVER 100%, so these buckets OVERLAP: do NOT rank them against each other. Either decode ran on several threads (per-thread times sum past the wall clock) or one timed region nests inside another. The only safe reading is that any bucket at or above wall time is genuinely large; the rest is unattributed"
-                } else { "" });
+                    // The thread count decides between the two explanations, so the
+                    // line reports the ANSWER rather than restating the dilemma.
+                    let n = gpu_kernels::timing_thread_count();
+                    if n > 1 {
+                        format!(" — OVER 100% because {n} THREADS charged these counters, so per-thread times sum past the wall clock. The buckets are individually right; they are NOT a partition of one timeline and must not be ranked against each other as though they were")
+                    } else {
+                        " — OVER 100% on a SINGLE THREAD, so this is genuine double counting: a timed region nests inside another. setup's span covers a bg_cache.lock(), so a thread blocked there is charged to setup while the holder is charged elsewhere — read a large `setup` as possible LOCK CONTENTION rather than resource churn until that is separated".to_string()
+                    }
+                } else { String::new() });
             // WHY the frame drained, not just how often. On Metal a run showed 1119 submits/token at
             // 2.0 ms each while flush_every was 128 — five passes per submit — and nothing in the log
             // said which mechanism was responsible.

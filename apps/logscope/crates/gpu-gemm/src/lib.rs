@@ -470,6 +470,45 @@ pub static GPU_POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// bind groups / use push constants) or GPU-bound (→ fuse kernels / fewer dispatches).
 pub static GPU_SETUP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static GPU_SYNC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many DISTINCT THREADS have charged the timing counters.
+///
+/// The one number that settles why the profile reports "134.3% accounted".
+/// The buckets sum past wall time and there are exactly two explanations,
+/// with opposite consequences:
+///
+///  * **more than one thread** — per-thread times legitimately sum past the
+///    wall clock. No bucket is wrong; the profile LINE is wrong for
+///    presenting them as a partition of one timeline.
+///  * **one thread** — then the excess is genuine double counting, a timed
+///    region nesting inside another. `GPU_SETUP_NS`'s span covers a
+///    `bg_cache.lock()`, so a thread blocked there is charged to setup while
+///    the holder is charged elsewhere; that would mean setup's 32%-of-wall
+///    reading is mostly lock contention and not resource churn at all.
+///
+/// Those imply different fixes, which is why the count is worth carrying
+/// rather than guessing. Implemented as a bitmask over a hash of the thread
+/// id: exact counts would need a set and a lock on the hot path, and the only
+/// question being asked is "one, or more than one".
+pub static TIMING_THREADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record that the calling thread charged a timing counter. Cheap enough for
+/// the dispatch path: one hash, one `fetch_or`.
+#[inline]
+pub fn note_timing_thread() {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::thread::current().id().hash(&mut h);
+    let bit = 1u64 << (h.finish() % 64);
+    TIMING_THREADS.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many distinct threads have been seen (lower bound — 64 buckets, so
+/// collisions undercount, which is the safe direction: it can say "one" only
+/// when it really has seen one hash).
+pub fn timing_thread_count() -> u32 {
+    TIMING_THREADS.load(std::sync::atomic::Ordering::Relaxed).count_ones()
+}
 /// Dims-uniform cache accounting: a MISS is a real `create_buffer_init` (an upload); a HIT reuses a
 /// cached buffer (the eliminated upload). Hits/(hits+misses) is the upload-churn reduction — a
 /// hardware-INDEPENDENT structural number, valid here on lavapipe.
@@ -993,6 +1032,7 @@ pub fn counted_poll(device: &wgpu::Device) {
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     GPU_POLLS.fetch_add(1, Relaxed);
     GPU_SYNC_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+    note_timing_thread();
 }
 
 pub fn gpu_counters_reset() {
@@ -4510,6 +4550,7 @@ make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
                     BG_HITS_VIEWED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 GPU_SETUP_NS.fetch_add(t_setup.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        note_timing_thread();
                 self.record_dispatch(pipeline, &bg, wg, None);
                 return;
             }
@@ -4572,6 +4613,7 @@ make the kernel read @builtin(num_workgroups). First shader line: {head:?}");
             if cache.len() < BG_CACHE_CAP { cache.insert(key, bg.clone()); }
         }
         GPU_SETUP_NS.fetch_add(t_setup.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        note_timing_thread();
         mark_dispatch(pipe_ptr, wg, dims.first().map(|b| *b as u32).unwrap_or(0));
         self.record_dispatch(pipeline, &bg, wg, Some(&dbuf));
     }
@@ -22945,5 +22987,42 @@ mod window_batching_tests {
         assert!(at8 < at2,
             "a 4x larger window did not reduce readbacks ({at2} -> {at8}) — the 1/k lever the \
              dense verdict advertises does not exist");
+    }
+}
+
+#[cfg(test)]
+mod timing_thread_tests {
+    use super::*;
+
+    #[test]
+    fn one_thread_reads_as_one() {
+        // The whole value of this counter is that "1" is trustworthy: it is
+        // what tells us the profile's overlap is genuine double counting
+        // rather than several threads summing past the wall clock.
+        TIMING_THREADS.store(0, std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..50 { note_timing_thread(); }
+        assert_eq!(timing_thread_count(), 1, "one thread must not read as several");
+    }
+
+    #[test]
+    fn several_threads_read_as_several() {
+        TIMING_THREADS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let hs: Vec<_> = (0..8).map(|_| std::thread::spawn(note_timing_thread)).collect();
+        for h in hs { h.join().unwrap(); }
+        // Collisions in 64 buckets undercount, which is the SAFE direction —
+        // it can never invent a second thread that did not exist. So assert
+        // "more than one", not an exact count.
+        assert!(timing_thread_count() > 1, "8 threads read as {}", timing_thread_count());
+    }
+
+    #[test]
+    fn the_count_is_monotonic_within_a_run() {
+        // It is a bitmask, so it only ever gains bits. A counter that could
+        // fall would make "1" unreliable at exactly the moment it matters.
+        TIMING_THREADS.store(0, std::sync::atomic::Ordering::Relaxed);
+        note_timing_thread();
+        let a = timing_thread_count();
+        std::thread::spawn(note_timing_thread).join().unwrap();
+        assert!(timing_thread_count() >= a);
     }
 }
