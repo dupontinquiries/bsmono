@@ -1161,6 +1161,11 @@ pub struct Chat {
     planned_cache: std::cell::RefCell<Option<(std::path::PathBuf, usize, String)>>,
     /// The question the cached plan was built for.
     planned_q: std::cell::RefCell<Option<String>>,
+    /// Why each candidate is or is not in the prompt, for the context panel.
+    /// Previously this existed only as a `diag!` line giving counts without
+    /// names — enough to know a selection happened, not enough to disagree
+    /// with it.
+    pub planned_why: std::cell::RefCell<Vec<crate::ctxplan::Explained>>,
     threading: bool,   // thread prior turns into the prompt, or single-shot
     /// Oldest turn currently in the model's window, remembered so it can STAY there.
     ///
@@ -1469,6 +1474,7 @@ impl Default for Chat {
             context: LONG_HORIZON.into(),
             planned_cache: std::cell::RefCell::new(None),
             planned_q: std::cell::RefCell::new(None),
+            planned_why: std::cell::RefCell::new(Vec::new()),
             threading: true, show_context: false, attach_log: true, fix_mode: false,
             right_page: RightPage::Prompting, coord_mode: crate::coordinator::Mode::Barebones,
             // PERSISTED CHOICES, restored here rather than defaulted. A Dvorak user re-selecting
@@ -3444,6 +3450,11 @@ them to", patches.len());
             }
             crate::read_harness::sanitize(&s)
         });
+        // Keep the per-file verdicts, not just the counts. The counts say a
+        // selection happened; the verdicts are what let someone see that
+        // palette.rs was ranked 0.17 and dropped while two manifests at 0.90
+        // went in — which is the field case this planner exists to fix.
+        *self.planned_why.borrow_mut() = p.explain(&files);
         crate::diag!("workspace files: {} considered, {} whole + {} peeked, {} skipped, \
 ~{} tokens of file content in the prompt",
             files.len(), p.looped_in(), p.peeked(), p.skipped(), p.used_tokens);
@@ -8852,6 +8863,46 @@ sets how often each worker sees another's latest. Run :lanes {} so they generate
                             }); // close "Conversation graph" carved panel
                         }
                         RightPage::Files => {
+                            // WHY THESE FILES. The planner ranks every candidate
+                            // and shows the model a few; without this the choice
+                            // is invisible, and an invisible choice is one nobody
+                            // can disagree with. The field case: "add a bright
+                            // pink theme" put two Cargo.tomls in front of the
+                            // model at 0.90 and dropped palette.rs at 0.17.
+                            {
+                                let why = self.planned_why.borrow();
+                                if !why.is_empty() {
+                                    theme::panel(ui, theme::BLUE(), "Workspace files in context", None, |ui| {
+                                        let shown = why.iter().filter(|e| e.verdict != "skip").count();
+                                        ui.label(RichText::new(format!(
+                                            "{} of {} candidates, ranked by relevance to your last message",
+                                            shown, why.len())).color(theme::DIM()).small());
+                                        egui::ScrollArea::vertical().max_height(220.0)
+                                            .id_salt("ctxplan-why").show(ui, |ui| {
+                                            // Ranked order, so the cut line is visible: the
+                                            // first thing that did NOT make it sits directly
+                                            // under the last thing that did.
+                                            let mut rows: Vec<_> = why.iter().collect();
+                                            rows.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance)
+                                                .unwrap_or(std::cmp::Ordering::Equal));
+                                            for e in rows {
+                                                let inc = e.verdict.starts_with("whole") || e.verdict.starts_with("peek");
+                                                let col = if inc { theme::INK() } else { theme::DIM() };
+                                                ui.horizontal(|ui| {
+                                                    ui.label(RichText::new(format!("{:.2}", e.relevance))
+                                                        .monospace().small().color(
+                                                            if inc { theme::GREEN() } else { theme::DIM() }));
+                                                    ui.label(RichText::new(&e.path).small().color(col));
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        ui.label(RichText::new(&e.verdict).small().color(theme::DIM()));
+                                                    });
+                                                });
+                                            }
+                                        });
+                                    });
+                                    ui.add_space(6.0);
+                                }
+                            }
                             theme::panel(ui, theme::GREEN(), "Generated files", None, |ui| {
                             if arts.is_empty() {
                                 ui.label(RichText::new("No files in the latest reply yet.").color(theme::DIM()).small());

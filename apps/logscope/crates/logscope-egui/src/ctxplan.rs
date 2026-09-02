@@ -546,3 +546,111 @@ mod query_relevance_tests {
         assert!((0.0..=1.0).contains(&r), "got {r}");
     }
 }
+
+// ── explaining the selection ─────────────────────────────────────────────────
+
+/// One line per file, for the panel that shows what the model is looking at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Explained {
+    pub path: String,
+    /// `describes_project`/`relevance_for_query` score, 0..1.
+    pub relevance: f32,
+    /// "whole", "peek", or the skip reason.
+    pub verdict: String,
+    pub est_tokens: usize,
+}
+
+impl Plan {
+    /// Why each candidate is or is not in the prompt, ordered as the planner
+    /// ranked them.
+    ///
+    /// The context panel already shows a topic-match figure per DOCUMENT —
+    /// deliberately a checkable count rather than an invented confidence (see
+    /// `ctxcard`'s module doc). This is the other half and answers a different
+    /// question: not "how related is this document" but "why did the planner
+    /// put this file in front of the model and drop that one".
+    ///
+    /// That was previously visible only as a `diag!` line ("51 considered,
+    /// 2 whole + 3 peeked, 46 skipped"), which gives the counts and not the
+    /// names — enough to know a selection happened, not enough to disagree
+    /// with it. A selection nobody can inspect is one nobody can correct, and
+    /// the field case for that is sharp: a "add a bright pink theme" run was
+    /// shown two Cargo.tomls at 0.90 and never saw palette.rs at 0.17.
+    ///
+    /// `relevance` is looked up from the caller's scored candidates rather
+    /// than recomputed, so this panel can never disagree with the ranking that
+    /// actually ran.
+    pub fn explain(&self, scored: &[FileEntry]) -> Vec<Explained> {
+        let score = |p: &str| scored.iter().find(|f| f.path == p).map(|f| f.relevance).unwrap_or(0.0);
+        self.inclusions.iter().map(|i| match i {
+            Inclusion::Whole { path, est_tokens } => Explained {
+                relevance: score(path), path: path.clone(),
+                verdict: "whole".into(), est_tokens: *est_tokens,
+            },
+            Inclusion::Peek { path, sections, est_tokens } => Explained {
+                relevance: score(path), path: path.clone(),
+                verdict: format!("peek · {} section(s)", sections.len()), est_tokens: *est_tokens,
+            },
+            Inclusion::Skip { path, reason } => Explained {
+                relevance: score(path), path: path.clone(),
+                verdict: (*reason).to_string(), est_tokens: 0,
+            },
+        }).collect()
+    }
+}
+
+#[cfg(test)]
+mod explain_tests {
+    use super::*;
+
+    fn entry(p: &str, bytes: usize, rel: f32) -> FileEntry {
+        FileEntry { path: p.into(), bytes, relevance: rel, sections: Vec::new() }
+    }
+
+    #[test]
+    fn every_candidate_is_accounted_for_including_the_skipped() {
+        // A panel that lists only what got in cannot be used to ask "why
+        // isn't palette.rs here" — which is the exact question the field case
+        // raised.
+        let files = vec![
+            entry("Cargo.toml", 600, 0.90),
+            entry("src/palette.rs", 200_000, 0.17),
+            entry("src/lib.rs", 1000, 0.32),
+        ];
+        let p = plan(&files, &Budget::for_context(2000, 0, 0));
+        let ex = p.explain(&files);
+        assert_eq!(ex.len(), files.len(), "a candidate vanished from the explanation");
+        for f in &files {
+            assert!(ex.iter().any(|e| e.path == f.path), "{} missing", f.path);
+        }
+    }
+
+    #[test]
+    fn a_skip_carries_its_reason_not_just_absence() {
+        let files = vec![entry("huge.rs", 5_000_000, 0.35), entry("small.rs", 100, 0.35)];
+        let p = plan(&files, &Budget::for_context(500, 0, 0));
+        let ex = p.explain(&files);
+        let huge = ex.iter().find(|e| e.path == "huge.rs").unwrap();
+        assert!(huge.verdict != "whole", "{huge:?}");
+        assert!(!huge.verdict.is_empty(), "a verdict must say something");
+    }
+
+    #[test]
+    fn the_relevance_shown_is_the_one_the_planner_ranked_on() {
+        // Looked up, not recomputed. If the panel derived its own score it
+        // could disagree with the ranking that actually ran, which would make
+        // it worse than showing nothing.
+        let files = vec![entry("a.rs", 100, 0.77)];
+        let p = plan(&files, &Budget::for_context(2000, 0, 0));
+        assert_eq!(p.explain(&files)[0].relevance, 0.77);
+    }
+
+    #[test]
+    fn an_unknown_path_scores_zero_rather_than_panicking() {
+        let p = Plan {
+            inclusions: vec![Inclusion::Whole { path: "ghost.rs".into(), est_tokens: 10 }],
+            used_tokens: 10,
+        };
+        assert_eq!(p.explain(&[])[0].relevance, 0.0);
+    }
+}
