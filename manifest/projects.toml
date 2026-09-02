@@ -132,7 +132,9 @@ kind = "cargo"
 role = "app"
 daemon = false
 flatpak = "tbd"
-runtime = "tbd"
+runtime = "kde"          # crates/gui is Qt/QML (15 qml files) — the ARCHIVED surface per UI_STRATEGY.md;
+                         # the primary frontend is [apps.gitmind-egui]. Was "tbd" long after both
+                         # surfaces existed, which is the same unrevisited-entry gap av1tuner had.
 targets = ["desktop"]
 notes = "git-graph tool (gin); peek dedup DONE — GUI consumes tools/peek lib; marked broken upstream. Store now has a third chunk encoding ('R' raw, entropy-gated) for incompressible content, and `gin migrate` moves delta-hostile files (media/models/archives) out of git and into the chunk store, reversibly (.gitmind/migrated.jsonl + --restore)."
 
