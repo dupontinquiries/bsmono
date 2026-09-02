@@ -2466,3 +2466,25 @@ silently dropped 330 lines of private implementation. Public surface answers
 "is the API compatible"; it says nothing about WHERE THE WORK IS. Both
 measures are needed, and the content ratio is the one that identifies the
 stale side.
+
+
+## 76. glow_scene migration unblocked (not done)
+
+`scene_kit::perf::set_overrides` exists, so the host can push its own power /
+texture / bump dials and the env vars stay the fallback. That was the only
+thing standing between logscope's `glow_scene` and scene-kit's — the 8 unique
+lines were all `theme::power_mode`/`theme::detail` calls.
+
+Remaining, in order:
+1. logscope calls `scene_kit::perf::set_overrides(...)` wherever it currently
+   reads `theme::detail(effective_variant())`, once per frame or on settings
+   change.
+2. Replace `logscope_egui::glow_scene` with `pub use scene_kit::glow_scene`,
+   as was done for `spatial`/`textsurface`.
+3. Verify the in-app power control still changes render resolution — that is
+   the capability the override exists to preserve, and the migration is only
+   correct if it survives.
+
+`mesh3d` is the same shape and can follow. `texgen` must NOT (§75 — scene-kit's
+is stale, update it from logscope first). `gpuscene` is genuinely two-way and
+needs review rather than a sweep.
