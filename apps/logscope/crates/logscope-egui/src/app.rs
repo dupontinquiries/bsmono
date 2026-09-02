@@ -361,6 +361,16 @@ impl eframe::App for LogscopeApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Push this app's power/detail dials into scene-kit before anything
+        // renders. scene-kit's `perf` reads env vars by default, which is fine
+        // for a standalone consumer but would silently replace logscope's
+        // in-app power control with a restart-only variable — so the host
+        // drives it instead. Three relaxed stores; cheap enough per frame, and
+        // per frame is right because the variant changes from the settings UI.
+        {
+            let d = theme::detail(theme::effective_variant());
+            scene_kit::perf::set_overrides(theme::power_mode(), d.0, d.2);
+        }
         self.drain_scan(&ctx);
         self.drain_infer(&ctx);
         self.autoload_if_changed(); // no Load button — the active target loads itself when it changes

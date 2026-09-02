@@ -203,7 +203,16 @@ pub use scene_kit::spatial;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod scene3d;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod gpuscene;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod texgen;
-#[cfg(feature = "gpu-scene")] pub mod glow_scene;
+// MIGRATED to scene-kit. 98% of this module's content was already there and
+// scene-kit's copy additionally carries `PageTex`; the only lines unique to
+// logscope's were `theme::power_mode`/`theme::detail` calls, which
+// `scene_kit::perf::set_overrides` now receives from `app.rs` each frame — so
+// the in-app power control still drives render resolution, which is the one
+// capability this migration had to preserve.
+//
+// Re-exported rather than removed so `crate::glow_scene::` call sites keep
+// working, the same shape as `spatial` and `textsurface` before it.
+#[cfg(feature = "gpu-scene")] pub use scene_kit::glow_scene;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod estimate;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod multiparty;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod directives;

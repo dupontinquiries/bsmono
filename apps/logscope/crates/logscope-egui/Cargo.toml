@@ -75,7 +75,7 @@ voice-metal = ["voice", "whisper-rs/metal"]    # GPU whisper on macOS
 # the GPU scene renderer (depth-sorted GLSL pass via an egui_glow callback over scene3d). DEFAULT so the GUI
 # uses the same renderer as scene-view — without it the GUI silently falls back to the CPU software path and
 # none of the shader work (pearl/frost/bloom/grade/underwater) appears. CPU-only build: --no-default-features --features gui
-gpu-scene = ["gui"]  # uses eframe::glow + eframe::egui_glow (re-exported by the glow backend)
+gpu-scene = ["gui", "scene-kit/glow"]  # uses eframe::glow + eframe::egui_glow (re-exported by the glow backend)
 
 [lib]
 name = "logscope_egui"
