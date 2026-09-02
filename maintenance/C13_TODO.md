@@ -2605,3 +2605,30 @@ interior error, measured in tests") taken on synthetic content. The lesson is
 not that the measurement was sloppy — it is that a tiling artefact is
 content-dependent, so smooth test material cannot validate it. Any future
 change here needs a high-frequency fixture, and there is currently none.
+
+
+## 82. Blending landed in d2x-core; wiring it is the next step
+
+`tiles_overlapped` + `Blender` exist and are tested (8x reduction in the
+maximum seam step, pinned). NOT yet used by `upscale_frame` in either the CPU
+or wgpu path — they still call `tiles()` and `write_output_rgba8`.
+
+Wiring is small but needs one decision: **the default overlap**. It trades
+directly against compute — every tile grows by `overlap` on each side, so at
+tile 256 an overlap of 32 is ~28% more pixels through the network. Options:
+  - overlap = `pre_pad` (32). Free in a sense: that context is already being
+    computed and then thrown away by the crop. This is probably right.
+  - a separate smaller overlap with the crop still discarding `pre_pad`.
+    Cheaper, less smooth.
+
+Recommend the first — it reuses work already done rather than adding any.
+
+Then: `upscale_frame` builds a `Blender::new(out_w, out_h, overlap * scale)`,
+loops `tiles_overlapped`, and calls `add` instead of `write_output_rgba8`.
+Assert `uncovered() == 0` in a test over several frame sizes; a gap would look
+like the seam this replaces.
+
+**Fixture gap still open** (§81): there is no high-frequency test image in the
+repo, so nothing validates seam behaviour on the content where it actually
+appears. The blend tests use synthetic step edges, which prove the MECHANISM
+but not the outcome on footage.
