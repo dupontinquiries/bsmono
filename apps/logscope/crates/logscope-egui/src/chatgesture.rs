@@ -154,3 +154,43 @@ mod tests {
         assert_eq!(action(Target::Message(0), 0, Axis::Horizontal, false, 3, 1), Action::None);
     }
 }
+
+#[cfg(test)]
+mod widget_ownership_wiring {
+    //! The swipe handlers must ASK who owns the drag.
+    //!
+    //! `chatgesture::action` is pure and cannot see a pointer, so the
+    //! ownership check necessarily lives at the call sites in chat.rs. That
+    //! makes it exactly the kind of guard that gets dropped in a refactor and
+    //! is never noticed, because nothing fails — a swipe simply starts
+    //! stealing presses again, and the symptom (text fields taking one
+    //! character on a touch device) looks nothing like its cause.
+    //!
+    //! Source-level, therefore. Not elegant, but it pins the wiring that the
+    //! unit tests structurally cannot reach.
+
+    #[test]
+    fn both_swipe_sites_consult_drag_owner() {
+        let src = include_str!("tabs/chat.rs");
+        let drags = src.matches("total_drag_delta()").count();
+        // Two live reads (plus two mentions in comments, which do not carry
+        // the call parentheses in a way that matters here — count the calls).
+        let calls = src.matches("i.pointer.total_drag_delta()").count();
+        assert_eq!(calls, 2, "the number of hand-rolled drag reads changed ({calls}); \
+if a third was added it needs the ownership guard too");
+        let guards = src.matches("gesture_layer::drag_owner(").count();
+        assert!(guards >= calls,
+            "{calls} drag read(s) but only {guards} ownership check(s) — a swipe that does not \
+ask whether a widget owns the press will steal it from a text field");
+        let _ = drags;
+    }
+
+    #[test]
+    fn the_guard_uses_the_shared_helper_not_a_local_reimplementation() {
+        // The whole point of `drag_owner` is that there is ONE answer. A
+        // hand-rolled equivalent here would drift from pager's and touch's.
+        let src = include_str!("tabs/chat.rs");
+        assert!(src.contains("uikit_egui::gesture_layer::drag_owner"),
+            "the ownership check must come from uikit-egui, not be re-derived locally");
+    }
+}

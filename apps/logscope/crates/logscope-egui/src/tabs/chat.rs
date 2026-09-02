@@ -9710,7 +9710,13 @@ dense briefing that replaces them as the working context, then carry on with roo
                             if ui.rect_contains_pointer(ui.min_rect())
                                 && ui.input(|i| i.pointer.primary_down()) {
                                 over_any_message = true;
-                                if !self.swipe_consumed {
+                                // Same widget-ownership check as the background
+                                // swipe below. A message bubble can contain a
+                                // selectable label or a code block being
+                                // scrolled; neither is a variant swipe.
+                                let widget_owns = uikit_egui::gesture_layer::drag_owner(
+                                    ui.ctx(), ui.min_rect()) == uikit_egui::gesture_layer::Owner::Widget;
+                                if !self.swipe_consumed && !widget_owns {
                                     let d = ui.input(|i| i.pointer.total_drag_delta()).unwrap_or_default();
                                     let ax = crate::chatgesture::lock_axis(d.x, d.y);
                                     let delta = if d.x < -crate::chatgesture::AXIS_LOCK_PT { 1 }
@@ -9994,7 +10000,22 @@ dense briefing that replaces them as the working context, then carry on with roo
                     // h/l and the graph tab; chatgesture::action's Target::Background case had no
                     // caller until this. Same cumulative-distance + one-shot-latch reasoning as the
                     // message swipe above.
-                    if !over_any_message && !self.swipe_consumed
+                    // A drag a WIDGET owns is not a page gesture. Without this,
+                    // a finger selecting text in the composer, dragging a
+                    // slider, or touch-scrolling a list reads as a background
+                    // swipe and switches branch under the user — and on a touch
+                    // device it competes for the press that would give a text
+                    // field focus, which is the leading suspect for the
+                    // "fields take one character on the Fairphone" report.
+                    //
+                    // `drag_owner` is the shared answer (uikit-egui), added with
+                    // the snapclone merge and until now used only by `pager` and
+                    // `touch`, neither of which logscope goes through. Calling it
+                    // here rather than re-deriving the check is the point: a
+                    // second copy is how these diverge.
+                    let widget_owns = uikit_egui::gesture_layer::drag_owner(
+                        ui.ctx(), ui.min_rect()) == uikit_egui::gesture_layer::Owner::Widget;
+                    if !over_any_message && !self.swipe_consumed && !widget_owns
                         && ui.rect_contains_pointer(ui.min_rect()) && ui.input(|i| i.pointer.primary_down()) {
                         let d = ui.input(|i| i.pointer.total_drag_delta()).unwrap_or_default();
                         let ax = crate::chatgesture::lock_axis(d.x, d.y);
