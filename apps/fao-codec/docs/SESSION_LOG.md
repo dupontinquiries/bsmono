@@ -6732,3 +6732,37 @@ per-region search against the true target; doing it properly means
 fitting the field to the CODED cost with dense flow on the object,
 which is the mesh-versus-block argument block codecs won. Kept
 opt-in.
+
+### OpenCV as the analysis front end: what dense flow and masks would buy, bounded (2026-09-02)
+
+User asked about OpenCV detection, masking and boxing to guide the
+codec. Before adding a dependency, the sandbox can bound it:
+`tools/flow_oracle.py` (opencv-python-headless) builds prediction
+y4ms for `bench` via FAO_PRED_Y4M.
+
+  ORACLE — previous reconstruction warped by DIS dense flow, flow
+  uncharged (the ceiling for ANY motion representation):
+    w1   212,943 / 0.98158 U 39.1     vs GMC defaults 352,288 / 0.97937   -40%, +0.0022
+    72% of pixels within 1 level (the region model: 50% of regions)
+  MASK — pixels deviating > 1.5 px from a RANSAC global affine of
+  the flow, opened, blobs > 2000 px:
+    41.7% of the frame in ~13 blobs; the global affine fits 42% of pixels
+  MESH — the same flow sampled on a grid, quarter-pel, delta-coded
+  zstd (proxy for the context coder), bilinear back to dense:
+    grid 16   flow 5,821 B/frame   codec 233,889   total 507 KB   worse
+    grid 32   flow 1,759 B/frame   codec 250,600   total 333,294 / 0.98093   -5.4%, +0.0016
+
+Three conclusions. Any motion model is bounded at -40% on this shot,
+and that ceiling needs per-pixel flow the decoder cannot be sent; a
+32 px mesh keeps a modest -5% (perhaps -9% through the context
+coder) and the rest of the ceiling is fine structure. Boxing and
+detection would not localise this content: the non-rigid region is
+42% of the picture in thirteen pieces, which is why the affine
+object layer and the deformation grid both found "a second global
+motion" instead of an actor. What OpenCV would contribute that the
+codec lacks is the DENSE FLOW ESTIMATOR itself (DIS: 16 s for 47
+frames at 1920x800 in Python) and wide-baseline features for the
+cross-cut cite; a detector would matter later, for appearance priors
+on the 81% of residual that sits on people, which no motion model
+touches. The dependency is defensible for the flow; it is not a
+route to the target.
