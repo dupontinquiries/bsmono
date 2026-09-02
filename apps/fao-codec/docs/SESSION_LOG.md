@@ -6630,3 +6630,36 @@ Two controls close it:
   per-region side info — at every scale. The world-model layers on
   top of it (GMC, layers, WP, exact gate, stages) are each real and
   each bounded by it.
+
+### The coarse level, built inside the codec, loses (2026-09-02)
+
+User's diagnosis: abstractions right, data structures wrong — a
+one-level plate/sprite representation starves compression. First
+concrete test of a two-level object: `lf_correct`, an LF/chroma
+correction coded at 1/8 resolution with a fine dead zone before the
+HF residual, sparse by skip-RLE where the prediction is already
+right (user's "prunable, not a box").
+
+  w1     352,288/0.97937 U 39.1  ->  dz/4 365,398/0.97885 U 40.5   dz/8 391,787/0.97903 U 42.1
+  SMITE  800,487/0.95470 U 34.2  ->  dz/4 970,892/0.95301 U 35.2
+
+Chroma up, luma slightly down, bytes up: a loss. The coarse residual
+costs ~408 B/frame and saves ~135 B/frame of HF.
+
+Why it is not the hybrid. Splitting the AV1-base hybrid's win on w1:
+side 176 -> 136 KB, residual 176 -> 104 KB. The base was not a
+photometric patch applied after the mode decision; it was a
+temporally coherent, high-quality low-res VIDEO (0.997 MS-SSIM at
+1/8, 600 B/frame) that refereed every mode decision (fewer vectors,
+fewer intra) and stood in for the plate. A coarse level earns its
+place only with a coarse coder that is efficient, and the 1/8-scale
+control already measured that the codec's is not (14.6 KB @ 0.934
+against AV1's 14.1 KB @ 0.993 on the same 240x100 clip). Kept
+opt-in (FAO_LF_SCALE=8).
+
+The structural conclusion survives the failed test, sharpened: the
+object needs a persistent, temporally coherent coarse state — a
+level that is PREDICTED frame to frame, not patched frame by frame —
+and every level, coarse or fine, is only as good as the coder that
+carries its residual. Which is the same bottleneck the day keeps
+finding from every direction.

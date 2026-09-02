@@ -1353,6 +1353,182 @@ fn region_is_exact(pred: &Yuv420, f: &Yuv420, rx: usize, ry: usize) -> bool {
     true
 }
 
+/// The COARSE LEVEL of the prediction: an LF/chroma correction coded
+/// at 1/`scale` resolution with a fine dead zone, applied to the
+/// composite before the full-resolution residual.
+///
+/// Why (SESSION_LOG 2026-09-02): a 29 KB AV1 base at 1/8 resolution
+/// used as the model took film -24% and chroma +4.6 dB, and the
+/// quarter-res base got 0.988. The base's value was accurate LOW
+/// FREQUENCIES AND CHROMA; the codec's own predictors get those wrong
+/// and the dz32 dead zone then refuses to fix a 10-level DC error
+/// because it is 16 levels of DCT-domain zone away. At 1/8 resolution
+/// the same correction is 1/64 of the pixels, so a fine dead zone is
+/// cheap, and every 4x4 block there is a 32x32 block of DC here.
+/// This is the object's coarse level, inside the codec.
+///
+/// Returns the corrected composite and the coarse stream's bytes.
+fn coarse_correct(composite: &Yuv420, f: &Yuv420, scale: usize, dz: f32) -> (Yuv420, usize) {
+    let (w, h) = (f.w, f.h);
+    // low-res dims, padded to a multiple of 8 so chroma is a multiple of 4
+    let (lw0, lh0) = (w / scale, h / scale);
+    let (lw, lh) = ((lw0 + 7) / 8 * 8, (lh0 + 7) / 8 * 8);
+    if lw0 < 16 || lh0 < 16 {
+        return (composite.clone(), 0);
+    }
+    let down = |src: &Yuv420| -> Yuv420 {
+        let mut o = Yuv420::new(lw, lh);
+        let box_avg = |p: &[u8], pw: usize, ph: usize, x: usize, y: usize, s: usize| -> u8 {
+            let (mut acc, mut n) = (0u32, 0u32);
+            for dy in 0..s {
+                for dx in 0..s {
+                    let (px, py) = ((x * s + dx).min(pw - 1), (y * s + dy).min(ph - 1));
+                    acc += p[py * pw + px] as u32;
+                    n += 1;
+                }
+            }
+            ((acc + n / 2) / n) as u8
+        };
+        for y in 0..lh {
+            for x in 0..lw {
+                o.y[y * lw + x] = box_avg(&src.y, w, h, x.min(lw0 - 1), y.min(lh0 - 1), scale);
+            }
+        }
+        let (cw, ch) = (w / 2, h / 2);
+        let (clw, clh) = (lw / 2, lh / 2);
+        let (clw0, clh0) = ((lw0 / 2).max(1), (lh0 / 2).max(1));
+        for y in 0..clh {
+            for x in 0..clw {
+                o.u[y * clw + x] = box_avg(&src.u, cw, ch, x.min(clw0 - 1), y.min(clh0 - 1), scale);
+                o.v[y * clw + x] = box_avg(&src.v, cw, ch, x.min(clw0 - 1), y.min(clh0 - 1), scale);
+            }
+        }
+        o
+    };
+    let c_lo = down(composite);
+    let f_lo = down(f);
+    let opts_lo = crate::residual::ResidualOpts { dead_zone: dz, ..crate::residual::ResidualOpts::default() };
+    let p444 = interleave_444(&c_lo);
+    let t444 = interleave_444(&f_lo);
+    let Some(trailer) = crate::residual::encode(&p444, &t444, lw, lh, &opts_lo) else {
+        return (composite.clone(), 0);
+    };
+    let bytes = trailer.len();
+    let dec = deinterleave_420(&crate::residual::apply(p444, &trailer, lw, lh), lw, lh);
+    // correction = decoded - coarse composite, upsampled bilinearly
+    let mut out = composite.clone();
+    let up = |dst: &mut [u8], dw: usize, dh: usize, dec_p: &[u8], base_p: &[u8], pw: usize, ph: usize, s: usize| {
+        for y in 0..dh {
+            let fy = ((y as f32 + 0.5) / s as f32 - 0.5).max(0.0);
+            let y0 = (fy.floor() as usize).min(ph - 1);
+            let y1 = (y0 + 1).min(ph - 1);
+            let ty = fy - y0 as f32;
+            for x in 0..dw {
+                let fx = ((x as f32 + 0.5) / s as f32 - 0.5).max(0.0);
+                let x0 = (fx.floor() as usize).min(pw - 1);
+                let x1 = (x0 + 1).min(pw - 1);
+                let tx = fx - x0 as f32;
+                let d = |p: &[u8], i: usize| p[i] as f32;
+                let c00 = d(dec_p, y0 * pw + x0) - d(base_p, y0 * pw + x0);
+                let c10 = d(dec_p, y0 * pw + x1) - d(base_p, y0 * pw + x1);
+                let c01 = d(dec_p, y1 * pw + x0) - d(base_p, y1 * pw + x0);
+                let c11 = d(dec_p, y1 * pw + x1) - d(base_p, y1 * pw + x1);
+                let corr = (c00 * (1.0 - tx) + c10 * tx) * (1.0 - ty) + (c01 * (1.0 - tx) + c11 * tx) * ty;
+                let i = y * dw + x;
+                dst[i] = (dst[i] as f32 + corr).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    };
+    up(&mut out.y, w, h, &dec.y, &c_lo.y, lw, lh, scale);
+    up(&mut out.u, w / 2, h / 2, &dec.u, &c_lo.u, lw / 2, lh / 2, scale);
+    up(&mut out.v, w / 2, h / 2, &dec.v, &c_lo.v, lw / 2, lh / 2, scale);
+    (out, bytes)
+}
+
+/// Coarse level of the prediction: an LF/chroma correction coded at
+/// 1/`scale` resolution with a fine dead zone, before the HF residual.
+///
+/// Why (SESSION_LOG 2026-09-02): an 8x-downscaled AV1 base used as
+/// the model cut film bytes 24% and raised chroma 4.6 dB, and the
+/// mechanism was not the second codec — it was accurate LOW
+/// FREQUENCIES AND CHROMA, which the codec's predictors get wrong and
+/// the full-resolution dead zone then refuses to fix (a 16-level DC
+/// error sits under dz32's zone; a 4x4 block cannot say "this whole
+/// region is 6 levels too dark" for one byte). At 1/8 resolution the
+/// same correction is 1/64 of the pixels, so a fine dead zone there
+/// is cheap, and the residual coder's skip-RLE leaves the level EMPTY
+/// wherever the prediction was already right: the coarse level is
+/// sparse by the same test as everything else, not a box.
+///
+/// Returns the bytes charged. The decoder repeats: decode the coarse
+/// residual, upsample the decoded correction, add.
+fn lf_correct(composite: &mut Yuv420, f: &Yuv420, scale: usize, opts: &ResidualOpts) -> usize {
+    let (w, h) = (f.w, f.h);
+    if scale < 2 || w % (2 * scale) != 0 || h % (2 * scale) != 0 {
+        return 0;
+    }
+    let (lw, lh) = (w / scale, h / scale);
+    let (pw, ph) = ((lw + 7) / 8 * 8, (lh + 7) / 8 * 8);
+    let down = |p: &[u8], pw_: usize, ph_: usize, s: usize, ow: usize, oh: usize| -> Vec<u8> {
+        let (dw, dh) = (pw_ / s, ph_ / s);
+        let mut o = vec![0u8; ow * oh];
+        for y in 0..oh {
+            for x in 0..ow {
+                let (sx, sy) = (x.min(dw - 1), y.min(dh - 1));
+                let mut acc = 0u32;
+                for yy in 0..s {
+                    for xx in 0..s {
+                        acc += p[(sy * s + yy) * pw_ + sx * s + xx] as u32;
+                    }
+                }
+                o[y * ow + x] = ((acc + (s * s / 2) as u32) / (s * s) as u32) as u8;
+            }
+        }
+        o
+    };
+    let mk = |src: &Yuv420| -> Yuv420 {
+        let mut o = Yuv420::new(pw, ph);
+        o.y = down(&src.y, w, h, scale, pw, ph);
+        o.u = down(&src.u, w / 2, h / 2, scale, pw / 2, ph / 2);
+        o.v = down(&src.v, w / 2, h / 2, scale, pw / 2, ph / 2);
+        o
+    };
+    let comp_lo = mk(composite);
+    let f_lo = mk(f);
+    let p444 = interleave_444(&comp_lo);
+    let t444 = interleave_444(&f_lo);
+    let Some(trailer) = residual::encode(&p444, &t444, pw, ph, opts) else { return 0 };
+    let bytes = trailer.len();
+    let dec = deinterleave_420(&residual::apply(p444, &trailer, pw, ph), pw, ph);
+    let up_add = |plane: &mut [u8], fw_: usize, fh_: usize, lo_dec: &[u8], lo_pred: &[u8], lo_w: usize, s: usize| {
+        let lo_h = lo_dec.len() / lo_w;
+        for y in 0..fh_ {
+            let sy = ((y as f32 + 0.5) / s as f32 - 0.5).max(0.0);
+            let y0 = (sy.floor() as usize).min(lo_h - 1);
+            let y1 = (y0 + 1).min(lo_h - 1);
+            let ty = sy - y0 as f32;
+            for x in 0..fw_ {
+                let sx = ((x as f32 + 0.5) / s as f32 - 0.5).max(0.0);
+                let x0 = (sx.floor() as usize).min(lo_w - 1);
+                let x1 = (x0 + 1).min(lo_w - 1);
+                let tx = sx - x0 as f32;
+                let c = |i: usize| lo_dec[i] as f32 - lo_pred[i] as f32;
+                let top = c(y0 * lo_w + x0) * (1.0 - tx) + c(y0 * lo_w + x1) * tx;
+                let bot = c(y1 * lo_w + x0) * (1.0 - tx) + c(y1 * lo_w + x1) * tx;
+                let corr = top * (1.0 - ty) + bot * ty;
+                if corr != 0.0 {
+                    let i = y * fw_ + x;
+                    plane[i] = (plane[i] as f32 + corr).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    };
+    up_add(&mut composite.y, w, h, &dec.y, &comp_lo.y, pw, scale);
+    up_add(&mut composite.u, w / 2, h / 2, &dec.u, &comp_lo.u, pw / 2, scale);
+    up_add(&mut composite.v, w / 2, h / 2, &dec.v, &comp_lo.v, pw / 2, scale);
+    bytes
+}
+
 fn copy_region_mc(dst: &mut Yuv420, prev: &Yuv420, rx: usize, ry: usize, mv: (i8, i8)) {
     // mv is in QUARTER-PEL units. Whole-pixel components take the
     // exact integer path (bit-identical to the original behavior);
@@ -3461,15 +3637,49 @@ pub fn encode_gop_v3_core(
             opts.clone()
         };
         let opts = &frame_opts;
+        // ── Coarse level (FAO_LF_SCALE=8 to enable; off by default;
+        // FAO_LF_DZ_DIV divides the dead zone there, default 4). See
+        // lf_correct. MEASURED AND LOST as built (2026-09-02):
+        //   w1     352,288/0.97937 -> 365,398/0.97885 (dz/4), 391,787 (dz/8)
+        //   SMITE  800,487/0.95470 -> 970,892/0.95301
+        // The coarse residual costs ~408 B/frame through the same
+        // residual coder and saves ~135 B/frame of HF. The AV1-base
+        // hybrid it imitates saved 40 KB of SIDE info and 72 KB of
+        // residual on w1 because the base was a temporally coherent
+        // low-res VIDEO refereeing every mode decision — a coarse
+        // level needs a coarse coder that is good, and at 240x100 the
+        // codec's own costs 14.6 KB @ 0.934 where AV1's costs 14.1 KB
+        // @ 0.993. Kept opt-in for the day that coder exists.
+        let lf_scale: usize = std::env::var("FAO_LF_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let mut composite = composite;
+        let lf_bytes = if lf_scale >= 2 {
+            let div: f32 = std::env::var("FAO_LF_DZ_DIV").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
+            let lo_opts = ResidualOpts { dead_zone: opts.dead_zone / div, dz_map: None, ..opts.clone() };
+            let mut sc = lf_scale;
+            let mut b = 0;
+            while sc >= 2 {
+                if fw % (2 * sc) == 0 && fh % (2 * sc) == 0 {
+                    b = lf_correct(&mut composite, f, sc, &lo_opts);
+                    break;
+                }
+                sc /= 2;
+            }
+            b
+        } else {
+            0
+        };
+        if std::env::var("FAO_SIDE_DEBUG").is_ok() {
+            eprintln!("coarse level: {lf_bytes} B");
+        }
         let p444 = interleave_444(&composite);
         let t444 = interleave_444(f);
         let (residual_bytes, rec, cost_map) =
             match residual::encode_with_map(&p444, &t444, fw, fh, opts) {
                 Some((trailer, map)) => {
                     let r = residual::apply(p444, &trailer, fw, fh);
-                    (trailer.len(), deinterleave_420(&r, fw, fh), Some(map))
+                    (trailer.len() + lf_bytes, deinterleave_420(&r, fw, fh), Some(map))
                 }
-                None => (0, composite.clone(), None),
+                None => (lf_bytes, composite.clone(), None),
             };
         // ── LEDGER (FAO_LEDGER=path): one line per region per frame,
         // so a frame's bytes can be attributed to WHAT they were spent
