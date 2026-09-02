@@ -2809,3 +2809,30 @@ done in passing:
 
 The fade (`label_fade`) has to be preserved and should probably feed priority
 too — a label fading out is a better one to drop than one fading in.
+
+
+## 89. §53 fully closed — graph labels wired
+
+The label placer is in the renderer. All four §53 items are now resolved: two
+were already done (closed by measurement, §87), one was a measurement error on
+my part (carved_frame consistency), and this was the real one.
+
+**§53's one genuine finding was the visual one.** Written from screenshots, it
+got the two code-level claims wrong and the two pixel-level ones right (label
+collision, and the palette/relevance card gap). That is consistent with §87's
+note: visual comparison spots symptoms reliably and attributes them badly. The
+right use of a screenshot is "something is wrong here", never "this is why".
+
+**Worth checking on the next run**, since only the app can show it:
+- captions in a dense cluster should be spread rather than stacked, with a
+  "+n more" in the graph's top-right when some are dropped;
+- the walkthrough's focused node must keep its caption when the cluster is
+  crowded — that is the one the tests guarantee and the one most worth
+  confirming by eye;
+- captions near the right edge flip to the left of their dot and stay inside
+  the rect.
+
+If captions still overlap, the placer is not the problem — check that
+`label_fade > 0.02` is not admitting far more labels than the ladder's eight
+candidate offsets can seat, in which case the fix is a tighter fade gate or
+more offsets, not different geometry.
