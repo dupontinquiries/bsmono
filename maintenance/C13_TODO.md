@@ -2742,3 +2742,42 @@ Two panels, two numbers, and they must not be confused:
 Remaining from the reference design (§53): the left nav's icon+title+subtitle
 rail, and applying `carved_frame` consistently. Both are application rather
 than new code.
+
+
+## 87. §53 items 2 and 3 were ALREADY DONE — closing them by measurement
+
+Went to implement the last two reference-design gaps and found both already
+addressed, more carefully than my note described. Recording this rather than
+quietly dropping it, because a stale TODO costs the next person the same hour
+it just cost me.
+
+**"Left nav: Observatory has icon+title+subtitle, we have a crowded tab
+strip."** The subtitle exists as `Tab::purpose()` on hover, covering all 11
+tabs (checked, none missing), and the code carries the same reasoning I was
+about to write: a tab bar has no room for a second line, so the sentence goes
+where it costs nothing. It also names why it matters — "Peek", "Bloc" and
+"Rotate" cannot be guessed, and Rotate reads as a view control but configures
+logrotate. The strip is also a horizontal ScrollArea rather than
+`horizontal_wrapped`, with a comment explaining that wrapped rows reported
+their height too late for `Panel::bottom` to reserve, putting tabs offscreen
+on a phone.
+
+**"Apply carved_frame consistently."** Measured instead of eyeballed:
+`theme::panel` already calls `carved_frame`, and there are 13 of those against
+9 raw `egui::Frame::` uses. Reading all 9, every one is a correct choice —
+`Frame::NONE` for the glass-mode central panel, full-bleed for the scene
+preview, `Frame::popup` for a popup, `Frame::group` for a repeated model ROW
+(carving a list row would be noise, and `theme::panel`'s title and 16px
+margins are wrong for one). Tabs get `carved_tab`. There is no inconsistency
+to fix.
+
+**Where §53 went wrong:** it was written from screenshots — the shipping app
+against the reference renders — without reading the code. Two of its four
+items described work already done. The one real finding in it (graph label
+collision) was also visual, and that one held up. Visual comparison is good at
+spotting SYMPTOMS and bad at attributing them; the attribution needs the
+source.
+
+Remaining genuinely open from §53: nothing. The graph-label placer
+(`graph_labels::place`) is still unwired into the renderer, which is tracked
+separately.
