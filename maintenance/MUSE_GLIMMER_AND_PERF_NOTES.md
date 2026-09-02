@@ -289,3 +289,84 @@ observation.
 loading the per-layer `attn_gate` tensor, plus refusing image/video
 tokens (200092 / 200091) by name at tokenize time so a multimodal prompt
 fails honestly instead of splicing garbage into the text stream.
+
+
+---
+
+# The submit/pass finding, from llama.cpp's own WebGPU backend
+
+Our measured bottleneck is not bandwidth. The field run says so directly:
+`19 GB/s of 800 spec = 2% of the decode ceiling; NOT bandwidth-bound`,
+`sync 87760ms of 90710ms`, `7800 submits (7/tok)`, and
+`96% of submits were forced by PASS BOUNDARIES ... 115100 passes for 153438
+dispatches` — **1.3 dispatches per compute pass**.
+
+llama.cpp has a WebGPU backend, i.e. the same wgpu-shaped API we target, and
+it is the closest thing to a reference implementation available. What it does:
+
+* `ggml_backend_webgpu_graph_compute` opens **one compute pass** with
+  `BeginComputePass()` and accumulates dispatches into it.
+* It breaks the pass on exactly one condition:
+  `num_batched_kernels >= command_submit_batch_size`, where the default is
+  **`WEBGPU_DEFAULT_COMMAND_SUBMIT_BATCH_SIZE = 64`** (`ggml-webgpu.cpp:89`).
+  That is a throughput knob, not a correctness constraint.
+* `82677a6ed` is the commit that introduced this ("compute pass batching and
+  removing profiling overhead"), and its own changelog ends with **"remove iOS
+  throttling now that we're batching compute passes"** — batching removed the
+  need for a throttle they had previously had to add.
+* `54121f732` later made it toggleable, and the un-batched path (one pass per
+  dispatch — our current shape) exists **only for GPU profiling**.
+
+So the arrangement we are in by default is the one upstream uses only when it
+wants per-dispatch timestamps.
+
+## The part that deserves scrutiny, stated carefully
+
+**There is not one mention of the word "barrier" in the entire 4790-line
+WebGPU backend.** They batch 64 dispatches into a pass, those dispatches read
+and write the same storage buffers, and nothing in the backend reasons about
+synchronising between them. That is only sound if WebGPU guarantees hazard
+tracking between dispatches within a compute pass — which the spec does, and
+which is a real difference from raw Vulkan, where the barrier would be the
+caller's job.
+
+If that reading is right, it has a specific consequence for us:
+**`LOGSCOPE_PASS_FUSE` may have been retracted for the wrong reason.** It was
+withdrawn because it "broke AR decode 6/6 (c4-736) and changes generated
+tokens on 3 of 6 diffusion configurations". If the API guarantees ordering
+within a pass, then merging dispatches into one pass cannot itself be the
+corruption — and the actual bug would be something the fusion did *alongside*
+the merge. The bind-group cache is the first suspect, since the same run
+reports `76762 of 115100 lookups hit ... Repeat misses: 357 output / 34142
+dims / 4109 inputs`: a fused pass that reuses a bind group whose dims buffer
+has since been rewritten would produce exactly the symptom (right shape,
+wrong numbers, non-deterministic across configurations).
+
+**This is a hypothesis and must be tested before anything is re-enabled.**
+`LOGSCOPE_PASS_FUSE` stays retracted until someone has (a) confirmed the wgpu
+version we use provides the intra-pass guarantee, and (b) re-run the two gates
+that caught it — `tools/gate-passfuse-diffusion.sh` and the AR decode gate —
+with the bind-group cache disabled, to separate the two effects. If it passes
+with the cache off and fails with it on, the fusion was never the bug.
+
+Payoff if it holds: 96% of submits are pass boundaries, and sync is 97% of
+wall time. Going from 1.3 dispatches/pass toward upstream's 64 is the largest
+single lever in the engine, and it is worth more than any kernel change on
+this list.
+
+## Smaller WebGPU-backend findings worth copying
+
+* `7c908502e` — "improve MTP inference by using mat-vec path for small
+  batches". We have `MATVEC_SMALL_Q4` already; the question is whether our
+  crossover threshold is tuned or assumed. Upstream tunes it per quant type
+  (`2b5621094` does the same for CUDA), and ours is one constant.
+* `bd90fc74c` — flash attention improved by *software pipelining*. Relevant
+  because our phase-balance line says decode has "nothing in flight to cover
+  memory latency", which is the same disease pipelining treats.
+* `32e41fa5b` — "tune subgroup split (d_split) in flash_attn_vec". We disable
+  subgroups entirely on Asahi for a real hang, so this is not directly
+  usable — but it is a reminder that the subgroup path is where upstream gets
+  its wins, and our hang is worth revisiting rather than treating as settled.
+* `03ea04175` / `ef07a4090` — set_rows and rms_norm/soft_max optimisations,
+  both small and self-contained. Good candidates if the pass work turns out to
+  be blocked.
