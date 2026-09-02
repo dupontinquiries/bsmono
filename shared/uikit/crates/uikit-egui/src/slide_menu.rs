@@ -267,6 +267,11 @@ struct SlideState {
     /// Last in-bounds hover — held during the vertical-edge freeze so release still commits it.
     hot: Option<usize>,
     variant: Variant,
+    /// Cardinal mode: the farthest the pointer has reached from `origin` during this press.
+    /// Direction is decided from THIS on release, not from the release position — a finger
+    /// lifting off drifts, and a fast flick that overshoots and bounces back should still read
+    /// as the flick. (FlickBoard's `mostExtremePosFromDown`.)
+    peak: Vec2,
 }
 
 /// A reusable gesture grid menu. Hold one instance per host affordance, OR use
@@ -692,7 +697,15 @@ impl SlideMenu {
         let mut st = ui.ctx().data_mut(|d| d.get_temp::<SlideState>(id).unwrap_or_default());
         if !st.open && host.is_pointer_button_down_on() {
             st.open = true;
-            st.origin = host.rect.center();
+            // THE PRESS POINT, not the key's centre. Measured from the centre, a press in the
+            // outer third of a 44px key already sits past an 18px deadzone — so a plain tap near
+            // an edge read as a swipe toward that edge, and a press on the left third followed
+            // by a rightward swipe netted out to "tap". Every direction is relative to where the
+            // finger went down; the key's geometry has nothing to do with it.
+            st.origin = ui.ctx().input(|i| i.pointer.press_origin())
+                .or_else(|| host.interact_pointer_pos())
+                .unwrap_or_else(|| host.rect.center());
+            st.peak = Vec2::ZERO;
         }
         if !st.open {
             ui.ctx().data_mut(|d| d.insert_temp(id, st));
@@ -700,6 +713,8 @@ impl SlideMenu {
         }
         let center = st.origin;
         let pointer = ui.ctx().pointer_latest_pos().unwrap_or(center);
+        st.peak = farther(st.peak, pointer - center);
+        // Live highlight follows the finger; the COMMITTED direction (below) follows the peak.
         let hot = swipe_dir8(pointer - center, self.deadzone);
         let radius = self.item_size + 6.0;
 
@@ -732,8 +747,9 @@ impl SlideMenu {
 
         if ui.input(|i| i.pointer.any_released()) {
             st.open = false;
+            let committed = swipe_dir8(st.peak, self.deadzone);
             ui.ctx().data_mut(|d| d.insert_temp(id, st));
-            let chosen = hot
+            let chosen = committed
                 .and_then(|d| dirs.iter().find(|(dd, _)| *dd == d))
                 .map(|(_, o)| o.id.clone())
                 .unwrap_or_else(|| tap.id.clone());
@@ -742,6 +758,26 @@ impl SlideMenu {
         ui.ctx().data_mut(|d| d.insert_temp(id, st));
         SlideOutcome::Idle
     }
+
+    /// Forget an in-progress cardinal press without committing it. For a host that resolved the
+    /// same press some other way (a hairpin classifier claiming it for capitalisation, say): if
+    /// the state were left `open`, the compass would stay drawn and the NEXT press on this key
+    /// would be measured from the stale origin.
+    pub fn cancel_cardinal(ui: &Ui, id: Id) {
+        ui.ctx().data_mut(|d| {
+            if let Some(mut st) = d.get_temp::<SlideState>(id) {
+                st.open = false;
+                st.peak = Vec2::ZERO;
+                d.insert_temp(id, st);
+            }
+        });
+    }
+}
+
+/// The farther of two reaches from the press origin. Pure so the "direction comes from the
+/// farthest point, not the release point" rule is testable without a pointer.
+pub fn farther(peak: Vec2, delta: Vec2) -> Vec2 {
+    if delta.length_sq() > peak.length_sq() { delta } else { peak }
 }
 
 #[cfg(test)]
@@ -786,6 +822,22 @@ mod tests {
         assert_eq!(swipe_dir8(Vec2::new(-30.0, 0.0), 18.0), Some(Dir8::W));
         assert_eq!(swipe_dir8(Vec2::new(25.0, -25.0), 18.0), Some(Dir8::NE));
         assert_eq!(swipe_dir8(Vec2::new(5.0, 5.0), 18.0), None); // inside deadzone → a tap
+    }
+
+    #[test]
+    fn direction_commits_from_the_farthest_reach_not_the_release_point() {
+        // A rightward flick that overshoots to 40px and settles back to 12px on lift-off is
+        // still East: the release point is inside the deadzone, the peak is not.
+        let mut peak = Vec2::ZERO;
+        for d in [Vec2::new(10.0, 0.0), Vec2::new(40.0, 0.0), Vec2::new(12.0, 0.0)] {
+            peak = farther(peak, d);
+        }
+        assert_eq!(swipe_dir8(peak, 18.0), Some(Dir8::E));
+        assert_eq!(swipe_dir8(Vec2::new(12.0, 0.0), 18.0), None, "the release point alone would have been a tap");
+        // and a reach that never left the deadzone stays a tap
+        let mut still = Vec2::ZERO;
+        for d in [Vec2::new(3.0, 2.0), Vec2::new(-4.0, 1.0)] { still = farther(still, d); }
+        assert_eq!(swipe_dir8(still, 18.0), None);
     }
 
     #[test]
