@@ -532,18 +532,31 @@ fn dir8_from(d: cardinal_gesture::Direction) -> uikit_egui::slide_menu::Dir8 {
 fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors, glass: bool) -> Option<String> {
     // CLICK AND DRAG. This was `Sense::click()`, which is why cardinal swipes
     // did nothing: a key that only senses clicks never sees a drag, so the
-    // direction could not be measured however good the classifier was. `Key`
-    // has carried `cardinal` — the MessagEase direction→string table — the
-    // whole time, and nothing could reach it.
-    //
-    // The keys with the most cardinal entries are exactly the ones reported
-    // unreachable: on a compact layout a letter like L lives on a swipe, not a
-    // tile of its own.
+    // direction could not be measured however good the classifier was.
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    // PAINT, then DISPATCH — two steps, and the first has no return in it.
+    //
+    // The glass recipe used to be a control-flow branch that painted the key
+    // and then `return resp.clicked()`-ed — so under the "system" palette
+    // (which is `Board::new()`'s default) the cardinal, hold-variant and
+    // steno paths below were unreachable, and every cardinal key was a plain
+    // click. That was the state bug behind "swipes don't register on the
+    // experimental keyboards": the classifier, the widget and the layouts
+    // were all fine, and none of them was being called. A palette chooses
+    // how a key LOOKS; it never gets to decide what a gesture MEANS.
+    paint_key_face(ui, key, rect, size, gutter, c, glass, &resp);
+    dispatch_key(ui, key, rect, size, &resp)
+}
+
+/// The visual half of a key: glass or carved-tile, pressed/hovered/at-rest. No gesture logic.
+#[allow(clippy::too_many_arguments)]
+fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c: &PaletteColors, glass: bool, resp: &egui::Response) {
     let painter = ui.painter();
+    let pressed = resp.is_pointer_button_down_on();
+    let rounding = CornerRadius::same((size.y * 0.18) as u8);
+    let font = FontId::proportional((size.y * 0.42).clamp(11.0, 26.0));
     if glass {
         let modifier = key.label.chars().count() > 1; // "shift"/"space"/"enter" etc. — sit subtly less present
-        let pressed = resp.is_pointer_button_down_on();
         let (fill, stroke) = if pressed {
             (uikit_egui::glass_tint(c.accent, uikit_egui::GlassAlphas::PRESSED_ACCENT), uikit_egui::key_border(c.border))
         } else if modifier {
@@ -551,41 +564,56 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
         } else {
             (if resp.hovered() { uikit_egui::key_fill_hover(c.bg_card) } else { uikit_egui::key_fill(c.bg_card) }, uikit_egui::key_border(c.border))
         };
-        let rounding = CornerRadius::same((size.y * 0.18) as u8);
         painter.rect(rect, rounding, fill, stroke, egui::StrokeKind::Inside);
         if rect.top() <= gutter + 1.0 {
             uikit_egui::paint_top_hairline(ui, rect);
         }
         let text_color = if pressed { egui::Color32::WHITE } else { c.text };
-        painter.text(rect.center(), Align2::CENTER_CENTER, &key.label, FontId::proportional((size.y * 0.42).clamp(11.0, 26.0)), text_color);
-        return resp.clicked().then(|| key.emit.clone());
+        painter.text(rect.center(), Align2::CENTER_CENTER, &key.label, font.clone(), text_color);
+    } else {
+        // Rest→hover→press glides (120ms) instead of snapping — the QML key ColorAnimation feel.
+        let fill = uikit_egui::motion::interactive_fill(ui.ctx(), resp, c.bg_raised, c.bg_hover, c.accent);
+        painter.rect_filled(rect, rounding, fill);
+        painter.rect_stroke(rect, rounding, Stroke::new(1.0_f32, c.bg_base), egui::StrokeKind::Inside);
+        let text_color = if pressed { c.bg_base } else { c.text };
+        painter.text(rect.center(), Align2::CENTER_CENTER, &key.label, font.clone(), text_color);
     }
-    // Rest→hover→press glides (120ms) instead of snapping — the QML key ColorAnimation feel.
-    let fill = uikit_egui::motion::interactive_fill(ui.ctx(), &resp, c.bg_raised, c.bg_hover, c.accent);
-    let rounding = CornerRadius::same((size.y * 0.18) as u8);
-    painter.rect_filled(rect, rounding, fill);
-    painter.rect_stroke(rect, rounding, Stroke::new(1.0_f32, c.bg_base), egui::StrokeKind::Inside);
-    let text_color = if resp.is_pointer_button_down_on() { c.bg_base } else { c.text };
-    painter.text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        &key.label,
-        FontId::proportional((size.y * 0.42).clamp(11.0, 26.0)),
-        text_color,
-    );
-    let _ = gutter;
+    // The compass hints, drawn small around the tap label so a cardinal key advertises its
+    // swipes at rest (FlickBoard/MessagEase draw every direction's glyph in its corner). Only the
+    // four cardinals ride the edges; diagonals sit in their corners.
+    if !key.cardinal.is_empty() {
+        let hint = FontId::proportional((size.y * 0.22).clamp(8.0, 13.0));
+        let hint_color = c.text.gamma_multiply(0.55);
+        let inset = size.y * 0.16;
+        for (d, s) in &key.cardinal {
+            let off = d.offset();
+            let anchor = rect.center() + Vec2::new(off.x * (rect.width() * 0.5 - inset), off.y * (rect.height() * 0.5 - inset));
+            painter.text(anchor, Align2::CENTER_CENTER, s, hint.clone(), hint_color);
+        }
+    }
+}
+
+/// The gesture half of a key: which string this press/drag/hold resolves to, if any. Runs for
+/// every palette. Cardinal keys go through the compass widget (direction) plus the ported
+/// classifier (hairpin = capitalise, rotation = digit); plain keys through hold-variants or a
+/// click.
+fn dispatch_key(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, resp: &egui::Response) -> Option<String> {
     // Cardinal-swipe key (MessagEase-style): tap emits `emit`, a swipe in a compass direction emits
-    // that direction's variant. `show_cardinal` resolves tap-vs-swipe, so no separate click handling.
+    // that direction's variant. `show_cardinal` resolves tap-vs-swipe from the PRESS POINT.
     if !key.cardinal.is_empty() {
         let id = ui.id().with(("keycard", &key.label, rect.min.x as i32, rect.min.y as i32));
-        // Steno keys (L1/L2/R1/R2): the tap/direction resolution below is
-        // identical to a normal cardinal key, but the VALUE each option
-        // carries must be an unambiguous (button, gesture) token rather
-        // than the phoneme text — see `steno_token`'s doc comment for why
-        // the phoneme text alone can't identify which button/direction
-        // produced it. The displayed LABEL still shows the phoneme
-        // (`SlideOption::new(id, label)` keeps those independent), so the
-        // on-screen affordance is unchanged; only the returned value differs.
+        // ONE tap/swipe boundary for the widget and the classifier. The classifier's module doc
+        // calls this an interlock: if the two disagree, a movement is a tap to one and a swipe to
+        // the other, and the key fires twice or not at all. Derived from the key size so a phone
+        // key and a desktop key both flick at a quarter of their height (FlickBoard's default
+        // swipe threshold is 8dp — short flicks are the point of this layout).
+        let deadzone = (size.y * 0.25).clamp(9.0, 16.0);
+        let thresholds = cardinal_gesture::CardinalThresholds::default()
+            .scaled(deadzone as f64 / cardinal_gesture::CardinalThresholds::default().tap_max_excursion_px);
+        // Steno keys (L1/L2/R1/R2): the tap/direction resolution is identical to a normal cardinal
+        // key, but the VALUE each option carries must be an unambiguous (button, gesture) token
+        // rather than the phoneme text — see `steno_token`'s doc comment. The displayed LABEL
+        // still shows the phoneme; only the returned value differs.
         let tap_id = match &key.steno_button {
             Some(btn) => steno_token(btn, "tap"),
             None => key.emit.clone(),
@@ -602,107 +630,66 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
                 (*d, uikit_egui::slide_menu::SlideOption::new(opt_id, s.clone()))
             })
             .collect();
-        // Steno keys skip hairpin/rotation tracking entirely — GTK's own
-        // dispatcher does the same ("Hairpin/rotation/diagonals: not used
-        // by steno"), and `default_stenotype()` never sets rotate_cw/ccw
-        // or a diagonal, so there is nothing for that path to reach here.
-        // More importantly: the hairpin branch below calls
-        // `target.to_uppercase()` on whatever it finds in `key.cardinal`,
-        // which would silently mangle a steno token's ASCII letters
-        // (the embedded `\u{0}` byte itself is case-invariant, but
-        // `"steno:l1:n"` uppercasing to `"STENO:L1:N"` breaks the exact
-        // string match `decode_steno_token` needs) if a stray out-and-back
-        // ever got sampled on one of these keys.
-        if key.steno_button.is_some() {
-            let menu = uikit_egui::slide_menu::SlideMenu::new(id).item_size((size.y * 0.9).clamp(36.0, 52.0));
-            if let uikit_egui::slide_menu::SlideOutcome::Selected(v, _) = menu.show_cardinal(ui, id, &resp, &tap, &dirs) {
-                return Some(v);
+        // HAIRPIN / ROTATION TRACKING, alongside show_cardinal rather than replacing it.
+        // `show_cardinal` owns direction; it has no concept of out-and-back (capitalisation) or
+        // rotation (digits). The path is sampled here and classified on release, and a claim
+        // from the classifier OVERRIDES the widget's answer for that release. Steno keys skip
+        // this: GTK's dispatcher does the same ("Hairpin/rotation/diagonals: not used by steno"),
+        // and the hairpin arm's `to_uppercase` would mangle a steno token.
+        let mut claimed: Option<String> = None;
+        if key.steno_button.is_none() {
+            let path_id = id.with("hairpin");
+            if resp.drag_started() {
+                if let Some(p) = ui.ctx().input(|i| i.pointer.press_origin()).or_else(|| resp.interact_pointer_pos()) {
+                    let t = (ui.input(|i| i.time) * 1000.0) as u32;
+                    ui.ctx().data_mut(|d| d.insert_temp(path_id, vec![(p.x, p.y, t)]));
+                }
             }
-            return None;
-        }
-        // HAIRPIN TRACKING, alongside show_cardinal rather than replacing it.
-        //
-        // `show_cardinal` resolves tap-vs-direction and does it well, but it has
-        // no concept of a hairpin (out and BACK) or a rotation — grep it for
-        // either word and there is nothing. In the cardinal layout the hairpin
-        // is CAPITALISATION, so without this the layout cannot produce a
-        // capital letter at all. That is why the ported classifier is not
-        // redundant with the widget, and why the answer is not "delete one".
-        //
-        // The path is sampled here and classified on release; the widget keeps
-        // owning direction. Two jobs, one gesture, no second direction
-        // implementation to drift.
-        let path_id = id.with("hairpin");
-        if resp.drag_started() {
-            if let Some(p) = resp.interact_pointer_pos() {
-                // Stamp the start with the SAME clock the drag samples use.
-                // This was a literal 0 while every later point carried
-                // `time * 1000` (ms since app start), so rebasing on it left
-                // the duration equal to the app's uptime and the hairpin arm —
-                // capitalisation — went dead 600 ms after launch.
-                let t = (ui.input(|i| i.time) * 1000.0) as u32;
-                ui.ctx().data_mut(|d| d.insert_temp(path_id, vec![(p.x, p.y, t)]));
+            if resp.dragged() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let t = (ui.input(|i| i.time) * 1000.0) as u32;
+                    ui.ctx().data_mut(|d| {
+                        let mut v: Vec<(f32, f32, u32)> = d.get_temp(path_id).unwrap_or_default();
+                        if v.len() < 256 { v.push((p.x, p.y, t)); }
+                        d.insert_temp(path_id, v);
+                    });
+                }
             }
-        }
-        if resp.dragged() {
-            if let Some(p) = resp.interact_pointer_pos() {
-                let t = (ui.input(|i| i.time) * 1000.0) as u32;
-                ui.ctx().data_mut(|d| {
-                    let mut v: Vec<(f32, f32, u32)> = d.get_temp(path_id).unwrap_or_default();
-                    // Bounded: a slow drag across one key would otherwise
-                    // accumulate a point per frame for as long as it is held.
-                    if v.len() < 256 { v.push((p.x, p.y, t)); }
-                    d.insert_temp(path_id, v);
-                });
-            }
-        }
-        if resp.drag_stopped() {
-            let pts: Vec<(f32, f32, u32)> =
-                ui.ctx().data_mut(|d| d.get_temp(path_id).unwrap_or_default());
-            ui.ctx().data_mut(|d| d.remove::<Vec<(f32, f32, u32)>>(path_id));
-            if pts.len() >= 3 {
-                let path = cardinal_gesture::path_from_samples(&pts);
-                let th = cardinal_gesture::CardinalThresholds::default();
-                match cardinal_gesture::classify(&path, &th) {
-                    cardinal_gesture::CardinalGesture::Hairpin(d) => {
-                        // The hairpin's DIRECTION selects which variant to
-                        // capitalise, so an out-and-back toward the north variant
-                        // capitalises that letter rather than the key's own.
-                        let want = dir8_from(d);
-                        let target = key.cardinal.iter().find(|(k, _)| *k == want)
-                            .map(|(_, s)| s.clone())
-                            .unwrap_or_else(|| key.emit.clone());
-                        return Some(target.to_uppercase());
-                    }
-                    // Rotation reaches what neither tap nor a cardinal swipe
-                    // can: the tap letter's OWN capital (a hairpin needs a
-                    // direction to capitalise, and the tap letter has none —
-                    // GTK's `KeyGestures` doc comment says so directly) and,
-                    // clockwise, a digit — GTK's `default_cardinal_grid*`
-                    // maps each cell's CW rotation to a fixed digit at that
-                    // cell's own numpad position, so digits are reachable
-                    // without ever leaving the letter grid for a symbols
-                    // page. Ported here as plain data (`Key::rotate_cw`/
-                    // `rotate_ccw`) rather than a second lookup table, so a
-                    // layout with no rotation data (most keys, most
-                    // layouts) simply does nothing — the same "None is a
-                    // real answer" shape `key.cardinal` already uses.
-                    cardinal_gesture::CardinalGesture::Rotation(r) => {
-                        let out = match r {
-                            cardinal_gesture::Rotation::Cw => key.rotate_cw.clone(),
-                            cardinal_gesture::Rotation::Ccw => key.rotate_ccw.clone(),
-                        };
-                        if let Some(out) = out {
-                            return Some(out);
+            if resp.drag_stopped() {
+                let pts: Vec<(f32, f32, u32)> = ui.ctx().data_mut(|d| d.get_temp(path_id).unwrap_or_default());
+                ui.ctx().data_mut(|d| d.remove::<Vec<(f32, f32, u32)>>(path_id));
+                if pts.len() >= 3 {
+                    let path = cardinal_gesture::path_from_samples(&pts);
+                    match cardinal_gesture::classify(&path, &thresholds) {
+                        cardinal_gesture::CardinalGesture::Hairpin(d) => {
+                            // The hairpin's DIRECTION selects which variant to capitalise.
+                            let want = dir8_from(d);
+                            let target = key.cardinal.iter().find(|(k, _)| *k == want)
+                                .map(|(_, s)| s.clone())
+                                .unwrap_or_else(|| key.emit.clone());
+                            claimed = Some(target.to_uppercase());
                         }
+                        cardinal_gesture::CardinalGesture::Rotation(r) => {
+                            claimed = match r {
+                                cardinal_gesture::Rotation::Cw => key.rotate_cw.clone(),
+                                cardinal_gesture::Rotation::Ccw => key.rotate_ccw.clone(),
+                            };
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
-
-        let menu = uikit_egui::slide_menu::SlideMenu::new(id).item_size((size.y * 0.9).clamp(36.0, 52.0));
-        if let uikit_egui::slide_menu::SlideOutcome::Selected(v, _) = menu.show_cardinal(ui, id, &resp, &tap, &dirs) {
+        let mut menu = uikit_egui::slide_menu::SlideMenu::new(id).item_size((size.y * 0.9).clamp(36.0, 52.0));
+        menu.deadzone = deadzone;
+        // ALWAYS shown, even on a frame the classifier claimed: this is what closes the widget's
+        // press state. Returning early before this call left the compass open with a stale origin.
+        let outcome = menu.show_cardinal(ui, id, resp, &tap, &dirs);
+        if let Some(c) = claimed {
+            uikit_egui::slide_menu::SlideMenu::cancel_cardinal(ui, id);
+            return Some(c);
+        }
+        if let uikit_egui::slide_menu::SlideOutcome::Selected(v, _) = outcome {
             return Some(v);
         }
         return None;
@@ -716,7 +703,7 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
             .map(|v| uikit_egui::slide_menu::SlideOption::new(v.clone(), v.clone()))
             .collect();
         let menu = uikit_egui::slide_menu::SlideMenu::new(id).columns(key.variants.len().min(5)).hold(0.3);
-        match menu.show_stored(ui, id, &resp, &opts) {
+        match menu.show_stored(ui, id, resp, &opts) {
             uikit_egui::slide_menu::SlideOutcome::Selected(v, _) => return Some(v),
             uikit_egui::slide_menu::SlideOutcome::Cancelled => return None, // opened then released without a pick
             uikit_egui::slide_menu::SlideOutcome::Idle => {}
@@ -1079,5 +1066,204 @@ mod voice_tests {
         assert_eq!(v.status(), mic_kit::InputStatus::Silent);
         // nothing accumulated → finish yields no text (graceful, not an error)
         assert!(v.finish(&mut Stub("phantom")).is_none());
+    }
+}
+
+/// Headless end-to-end: synthetic pointer events through a real `egui::Context`, into
+/// `keyboard_ui`, out as the committed string. This is the test that was missing while the
+/// cardinal path was dead — every unit under it passed (classifier, widget maths, layout tables)
+/// and no test ever pressed a key and looked at what came out.
+#[cfg(test)]
+mod swipe_delivery_tests {
+    use super::*;
+    use egui::{Event, Modifiers, PointerButton, Pos2, RawInput};
+
+    const KEY_H: f32 = 44.0;
+    const GUTTER: f32 = 4.0;
+    const W: f32 = 400.0;
+
+    struct Rig {
+        ctx: egui::Context,
+        layout: Layout,
+        adaptive: Adaptive,
+        palette: &'static str,
+        t: f64,
+    }
+
+    impl Rig {
+        fn new(layout: Layout, palette: &'static str) -> Rig {
+            let rig = Rig {
+                ctx: egui::Context::default(),
+                layout,
+                adaptive: Adaptive { min_touch_target: KEY_H, gutter: GUTTER, ..Adaptive::default() },
+                palette,
+                t: 0.0,
+            };
+            rig
+        }
+
+        /// One frame with `events`; returns what `keyboard_ui` emitted.
+        fn frame(&mut self, events: Vec<Event>) -> Option<String> {
+            self.t += 0.03;
+            let raw = RawInput {
+                events,
+                time: Some(self.t),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(W, 300.0))),
+                ..Default::default()
+            };
+            let mut out = None;
+            let (layout, adaptive, palette) = (&self.layout, &self.adaptive, self.palette);
+            let _ = self.ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                    // No inter-key spacing, so key geometry is exactly `key_rect`'s arithmetic.
+                    ui.spacing_mut().item_spacing = Vec2::ZERO;
+                    out = keyboard_ui(ui, layout, adaptive, palette);
+                });
+            });
+            out
+        }
+
+        /// Where key (row, col) is on screen under the test panel.
+        fn key_rect(&self, row: usize, col: usize) -> Rect {
+            let r = &self.layout.rows[row];
+            let total_weight: f32 = r.keys.iter().map(|k| k.weight).sum();
+            let usable = W - GUTTER * (r.keys.len() as f32 + 1.0);
+            let mut x = GUTTER;
+            for (c, k) in r.keys.iter().enumerate() {
+                let w = usable * (k.weight / total_weight);
+                if c == col {
+                    return Rect::from_min_size(Pos2::new(x, row as f32 * (KEY_H + GUTTER)), Vec2::new(w, KEY_H));
+                }
+                x += w;
+            }
+            panic!("no key at ({row},{col})");
+        }
+
+        /// Press at `from`, drag through `via`, release at `to`. Returns everything emitted
+        /// across the gesture's frames (a correct gesture emits exactly once).
+        fn gesture(&mut self, from: Pos2, via: &[Pos2], to: Pos2) -> Vec<String> {
+            let mut emitted = Vec::new();
+            // warm-up: egui hit-tests against the previous frame's widget rects
+            self.frame(vec![]);
+            self.frame(vec![]);
+            let press = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::default() };
+            emitted.extend(self.frame(vec![Event::PointerMoved(from), press(from, true)]));
+            for &p in via {
+                emitted.extend(self.frame(vec![Event::PointerMoved(p)]));
+            }
+            emitted.extend(self.frame(vec![Event::PointerMoved(to)]));
+            emitted.extend(self.frame(vec![press(to, false)]));
+            emitted.extend(self.frame(vec![]));
+            emitted.extend(self.frame(vec![]));
+            emitted
+        }
+
+        fn tap(&mut self, at: Pos2) -> Vec<String> {
+            self.gesture(at, &[], at)
+        }
+    }
+
+    /// The cardinal8 layout's top-left key: tap `e`, N `E`, E `b`, S `v`, NE `1`, SE `2`, SW `3`.
+    fn e_key(rig: &Rig) -> Rect {
+        let r = rig.key_rect(0, 0);
+        assert_eq!(rig.layout.rows[0].keys[0].emit, "e");
+        r
+    }
+
+    #[test]
+    fn a_tap_in_the_middle_of_a_cardinal_key_types_its_centre() {
+        for palette in ["system", "default"] {
+            let mut rig = Rig::new(Layout::cardinal8(), palette);
+            let r = e_key(&rig);
+            assert_eq!(rig.tap(r.center()), vec!["e".to_string()], "palette {palette}");
+        }
+    }
+
+    #[test]
+    fn a_tap_near_the_edge_of_a_cardinal_key_is_still_a_tap() {
+        // THE REGRESSION. Measured from the key centre, a press 18px above centre was already
+        // past the deadzone, so a plain tap near the top edge typed the NORTH variant (`E`).
+        // Measured from the press point it has not moved at all.
+        for palette in ["system", "default"] {
+            let mut rig = Rig::new(Layout::cardinal8(), palette);
+            let r = e_key(&rig);
+            let near_top = Pos2::new(r.center().x, r.top() + 4.0);
+            assert_eq!(rig.tap(near_top), vec!["e".to_string()], "palette {palette}");
+            let near_left = Pos2::new(r.left() + 5.0, r.center().y);
+            assert_eq!(rig.tap(near_left), vec!["e".to_string()], "palette {palette}");
+        }
+    }
+
+    #[test]
+    fn cardinal_swipes_from_the_centre_hit_the_directional_keys() {
+        let mut rig = Rig::new(Layout::cardinal8(), "system");
+        let r = e_key(&rig);
+        let c = r.center();
+        let d = 40.0;
+        let cases = [
+            (Vec2::new(0.0, -d), "E"),  // N
+            (Vec2::new(d, 0.0), "b"),   // E
+            (Vec2::new(0.0, d), "v"),   // S
+            (Vec2::new(d, -d), "1"),    // NE
+            (Vec2::new(d, d), "2"),     // SE
+            (Vec2::new(-d, d), "3"),    // SW
+        ];
+        for (delta, want) in cases {
+            let mid = c + delta * 0.5;
+            let end = c + delta;
+            assert_eq!(rig.gesture(c, &[mid], end), vec![want.to_string()], "swipe {delta:?}");
+        }
+    }
+
+    #[test]
+    fn cardinal_swipes_are_relative_to_the_press_point_not_the_key() {
+        // Press on the LEFT third of the key and swipe right: relative to the centre this nets
+        // out near zero (a "tap"); relative to the press point it is unambiguously East.
+        for palette in ["system", "default"] {
+            let mut rig = Rig::new(Layout::cardinal8(), palette);
+            let r = e_key(&rig);
+            let from = Pos2::new(r.left() + 8.0, r.center().y);
+            let to = Pos2::new(r.left() + 8.0 + 36.0, r.center().y);
+            assert_eq!(rig.gesture(from, &[Pos2::new(from.x + 18.0, from.y)], to), vec!["b".to_string()], "palette {palette}");
+            // and from the TOP edge, swiping down is South, even though the finger ends up
+            // below the key's centre by less than it started above it
+            let from = Pos2::new(r.center().x, r.top() + 4.0);
+            let to = Pos2::new(r.center().x, r.top() + 4.0 + 36.0);
+            assert_eq!(rig.gesture(from, &[Pos2::new(from.x, from.y + 18.0)], to), vec!["v".to_string()], "palette {palette}");
+        }
+    }
+
+    #[test]
+    fn an_overshoot_that_settles_back_is_still_the_swipe() {
+        // Lift-off drift: out 40px east, back to 6px before release. The release point is
+        // inside the deadzone; the farthest reach is not.
+        let mut rig = Rig::new(Layout::cardinal8(), "system");
+        let r = e_key(&rig);
+        let c = r.center();
+        let out = rig.gesture(c, &[c + Vec2::new(40.0, 0.0)], c + Vec2::new(6.0, 0.0));
+        assert_eq!(out, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn a_hairpin_capitalises_the_direction_it_points_at() {
+        // Out to the east and back within the hairpin window: the east variant, capitalised.
+        // Runs THROUGH the widget on the same press — the classifier's claim must win and the
+        // compass state must be closed afterwards, or the next tap is measured from a stale origin.
+        let mut rig = Rig::new(Layout::cardinal8(), "system");
+        let r = e_key(&rig);
+        let c = r.center();
+        let out = rig.gesture(c, &[c + Vec2::new(30.0, 0.0), c + Vec2::new(60.0, 0.0), c + Vec2::new(30.0, 0.0)], c + Vec2::new(2.0, 0.0));
+        assert_eq!(out, vec!["B".to_string()]);
+        // the follow-up tap is a clean tap
+        assert_eq!(rig.tap(c), vec!["e".to_string()]);
+    }
+
+    #[test]
+    fn a_plain_key_still_types_on_tap_under_the_glass_palette() {
+        // The complement: restructuring paint_key must not have taken the click path away
+        // from ordinary keys, which is the whole qwerty board.
+        let mut rig = Rig::new(Layout::qwerty(), "system");
+        let q = rig.key_rect(0, 0);
+        assert_eq!(rig.tap(q.center()), vec!["q".to_string()]);
     }
 }
