@@ -43,6 +43,8 @@ use std::collections::BTreeMap;
 mod curves;
 pub use curves::{Binding, Curve, Gate, Opening, Sweep};
 mod batch;
+mod room;
+pub use room::{Overlap, LANE_SUFFIX};
 
 /// A point or duration on the project timebase, in ticks.
 ///
