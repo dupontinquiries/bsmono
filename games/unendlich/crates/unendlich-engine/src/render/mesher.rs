@@ -343,7 +343,7 @@ thread_local! {
 
 /// Invalidate the corner memo — O(1) generation bump.
 #[inline]
-fn corner_cache_reset() {
+pub(crate) fn corner_cache_reset() {
     CORNER_CACHE_GEN.with(|g| {
         g.set(g.get().wrapping_add(1));
         // Avoid generation 0 (the initial value in the cache entries).
@@ -467,7 +467,7 @@ thread_local! {
 
 /// Invalidate the tint memo — O(1) generation bump (see CORNER_CACHE_GEN).
 #[inline]
-fn tint_cache_reset() {
+pub(crate) fn tint_cache_reset() {
     TINT_CACHE_GEN.with(|g| {
         g.set(g.get().wrapping_add(1));
         if g.get() == 0 { g.set(1); }
@@ -620,7 +620,7 @@ thread_local! {
 
 /// Invalidate the env memo — O(1) generation bump (see CORNER_CACHE_GEN).
 #[inline]
-fn env_cache_reset() {
+pub(crate) fn env_cache_reset() {
     ENV_CACHE_GEN.with(|g| {
         g.set(g.get().wrapping_add(1));
         if g.get() == 0 { g.set(1); }
@@ -1113,7 +1113,7 @@ const FACE_NORMALS: [[f32; 3]; 6] = [
 
 /// Block face indices, used to index FACE_LIGHT.
 #[allow(dead_code)]
-mod face {
+pub(crate) mod face {
     pub const TOP:    usize = 0;
     pub const BOTTOM: usize = 1;
     pub const EAST:   usize = 2;
@@ -1280,7 +1280,7 @@ fn block_color_per_face(b: BlockId) -> Option<[[f32; 3]; 6]> {
 }
 
 /// Whether this block should be meshed at all (i.e. has visible faces).
-fn is_meshable(b: BlockId) -> bool {
+pub(crate) fn is_meshable(b: BlockId) -> bool {
     // r699: single array load via the compile-time LUT instead of three `matches!`
     // chains (`!is_air() && is_solid() && !is_subvoxel_only()`). The LUT is built
     // from `is_meshable_cube` — the exact same predicate — so this is identical to
@@ -1292,7 +1292,7 @@ fn is_meshable(b: BlockId) -> bool {
 /// Whether a face between `inner` (the meshed block) and `neighbor` should
 /// be emitted. Delegates to the narrow `produces_face_against` predicate
 /// on BlockId so the rule is owned by the block type, not duplicated here.
-fn should_emit_face(inner: BlockId, neighbor: BlockId) -> bool {
+pub(crate) fn should_emit_face(inner: BlockId, neighbor: BlockId) -> bool {
     // r700: single flat 2D-array load via the compile-time LUT instead of four
     // predicate evaluations + a compare in `produces_face_against`. The LUT is
     // built from that exact predicate (parity-tested over BlockId::ALL²), so this
@@ -1886,15 +1886,15 @@ fn idx2d(u: usize, v: usize) -> usize { u + v * N }
 /// Per-face axis configuration: (axis, u, v) indices into a 3-tuple [x, y, z].
 /// The `axis_sign` is +1 for "positive" faces (top, east, south) — we mesh
 /// the face on the *upper* side of the slice — and -1 for "negative" faces.
-struct AxisConfig {
-    axis: usize,
-    u: usize,
-    v: usize,
-    axis_sign: i32,
-    face: usize,
+pub(crate) struct AxisConfig {
+    pub(crate) axis: usize,
+    pub(crate) u: usize,
+    pub(crate) v: usize,
+    pub(crate) axis_sign: i32,
+    pub(crate) face: usize,
 }
 
-const AXIS_CONFIGS: [AxisConfig; 6] = [
+pub(crate) const AXIS_CONFIGS: [AxisConfig; 6] = [
     // TOP (+Y): axis=1 (y), u=0 (x), v=2 (z). Positive face.
     AxisConfig { axis: 1, u: 0, v: 2, axis_sign:  1, face: face::TOP },
     // BOTTOM (-Y): axis=1, u=0, v=2. Negative face.
@@ -3092,7 +3092,7 @@ fn bumpy_height(wx: f32, wz: f32, softness: f32, weathering_factor: f32) -> f32 
 /// the subdivided top emission — adjacent blocks have different
 /// weathering and thus different bump intensities.
 #[inline]
-fn weathering_at_world(block: BlockId, wx: i32, wy: i32, wz: i32) -> f32 {
+pub(crate) fn weathering_at_world(block: BlockId, wx: i32, wy: i32, wz: i32) -> f32 {
     let mut s = crate::world::chunk::BlockInstanceState::default();
     s.age_ticks = worldgen_weathering_at(block, wx, wy, wz);
     crate::world::weathering::weathering_value(s)
@@ -3145,7 +3145,7 @@ fn top_subdivision() -> i32 {
 ///
 /// Cost: 81 vertices + 128 triangles per top face vs the previous
 /// 4 vertices + 2 triangles.
-fn emit_subdivided_top(
+pub(crate) fn emit_subdivided_top(
     mesh: &mut ChunkMesh,
     slice: i32,
     u: i32,
@@ -3263,7 +3263,7 @@ fn emit_subdivided_top(
     }
 }
 
-fn emit_jittered_top(
+pub(crate) fn emit_jittered_top(
     mesh: &mut ChunkMesh,
     slice: i32,    // chunk-local Y
     u: i32,        // chunk-local X
@@ -3323,7 +3323,7 @@ fn emit_jittered_top(
 }
 
 
-fn emit_quad(
+pub(crate) fn emit_quad(
     mesh: &mut ChunkMesh,
     cfg: &AxisConfig,
     slice: i32,
@@ -3485,7 +3485,7 @@ fn emit_quad(
 ///
 /// `cfg` must be one of EAST/WEST/SOUTH/NORTH (not TOP/BOTTOM); caller is
 /// responsible for that.
-fn emit_soft_side_face(
+pub(crate) fn emit_soft_side_face(
     mesh: &mut ChunkMesh,
     cfg: &AxisConfig,
     slice: i32,

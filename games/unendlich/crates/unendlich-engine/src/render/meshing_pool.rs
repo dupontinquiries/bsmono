@@ -169,6 +169,17 @@ pub struct MeshResult {
 }
 
 
+/// `UNENDLICH_MESHER=binary` selects `render::mesher_binary` for Near
+/// chunks on the CPU path. Read once; the value can't change mid-run.
+fn near_mesher_is_binary() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let on = std::env::var("UNENDLICH_MESHER").map(|v| v.eq_ignore_ascii_case("binary")).unwrap_or(false);
+        if on { log::info!("meshing pool: Near-LOD CPU mesher = binary (UNENDLICH_MESHER=binary)"); }
+        on
+    })
+}
+
 /// Pack a finished mesh on the producing thread (see `MeshResult::packed`).
 fn pack_result(coord: ChunkCoord, mesh: &ChunkMesh) -> crate::render::mesher::PackedMesh {
     let (ox, oy, oz) = coord.block_origin();
@@ -807,17 +818,18 @@ fn worker_loop(
             NEAR_CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
         }
         let mesh = if req.lod == LodLevel::Near {
-            match (&req.world_model, req.current_tick) {
-                (Some(model), Some(tick)) => {
-                    crate::render::mesher::mesh_chunk_greedy_with_neighbors(
-                        &req.chunk, &req.neighbors, Some(&req.sky), Some(model), Some(tick))
-                }
-                (Some(model), None) => {
-                    crate::render::mesher::mesh_chunk_greedy_with_neighbors(
-                        &req.chunk, &req.neighbors, Some(&req.sky), Some(model), None)
-                }
-                (None, _) => crate::render::mesher::mesh_chunk_greedy_with_neighbors(
-                    &req.chunk, &req.neighbors, Some(&req.sky), None, None),
+            // The three arms only differ in which optionals are passed;
+            // `current_tick` is meaningful only with a world model.
+            let tick = if req.world_model.is_some() { req.current_tick } else { None };
+            if near_mesher_is_binary() {
+                // 2026-09-02: UNENDLICH_MESHER=binary — visibility and
+                // merging on world::bitchunk, same emitters. See
+                // render::mesher_binary. Off by default until seen on hardware.
+                crate::render::mesher_binary::mesh_chunk_binary(
+                    &req.chunk, &req.neighbors, Some(&req.sky), req.world_model.as_ref(), tick)
+            } else {
+                crate::render::mesher::mesh_chunk_greedy_with_neighbors(
+                    &req.chunk, &req.neighbors, Some(&req.sky), req.world_model.as_ref(), tick)
             }
         } else if is_virtual_eligible {
             let factor = lod_settings.factor_for(req.lod);

@@ -20,6 +20,8 @@ pub mod offscreen;
 pub mod hot_shaders;
 pub mod light;
 pub mod mesher;
+/// Binary (column-bitmask) mesher — same emit path as `mesher`, culling and merging on `world::bitchunk`.
+pub mod mesher_binary;
 pub mod mesh_buffer_alloc;
 pub mod segmented_alloc; // r-vulkanmod-cf: growable multi-segment allocator (VulkanMod AreaBuffer equivalent), staged — see mesh_pool_segmented_integration.md before wiring into mesh_buffer_pool
 pub mod copy_coalesce;
