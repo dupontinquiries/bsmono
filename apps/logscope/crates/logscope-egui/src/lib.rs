@@ -211,7 +211,16 @@ pub use scene_kit::spatial;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod pearl_input;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod scene3d;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod gpuscene;
-#[cfg(feature = "gui")] #[allow(dead_code)] pub mod texgen;
+// MIGRATED to scene-kit, but the DIRECTION was the opposite of the others and
+// getting it wrong would have cost ~330 lines. §75 measured it: 98% of
+// scene-kit's texgen was already inside logscope's, and logscope's was 2.3x
+// the size — logscope's grew after extraction (LAYERS went 5 -> 11, with a
+// real `roughness` curve and more palettes), so scene-kit held the STALE copy.
+//
+// Migrating logscope onto scene-kit naively — the move that was right for
+// glow_scene and mesh3d — would have deleted that work. scene-kit was updated
+// FROM logscope first; only then is this re-export lossless.
+#[cfg(feature = "gui")] pub use scene_kit::texgen;
 // MIGRATED to scene-kit. 98% of this module's content was already there and
 // scene-kit's copy additionally carries `PageTex`; the only lines unique to
 // logscope's were `theme::power_mode`/`theme::detail` calls, which
