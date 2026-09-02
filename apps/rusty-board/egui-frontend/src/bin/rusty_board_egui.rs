@@ -9,5 +9,27 @@ fn main() -> eframe::Result<()> {
     // FIRST, before eframe/winit touch Wayland: KWin hands the input-method socket over as
     // WAYLAND_SOCKET, and a toolkit that sees it connects to the wrong socket for rendering.
     rusty_board_egui::platform::capture_inherited_socket();
+    // Docked first, where the build and the compositor allow it. An explicit
+    // RUSTY_BOARD_PLACEMENT=ruled|floating skips the attempt (the eframe shell is the
+    // one with a real window to look at in dev).
+    #[cfg(feature = "layer")]
+    {
+        use rusty_board_egui::platform::{session, Session};
+        use rusty_board_egui::shell::layer::{self, LayerError};
+        let forced = std::env::var("RUSTY_BOARD_PLACEMENT").ok();
+        let skip = matches!(forced.as_deref().map(str::trim), Some("ruled") | Some("floating"));
+        if session() == Session::Wayland && !skip {
+            match layer::run("rusty-board") {
+                Ok(()) => return Ok(()),
+                Err(LayerError::Unsupported(why)) => {
+                    eprintln!("[rusty-board] {why}; running as a toplevel window instead");
+                }
+                Err(LayerError::Runtime(e)) => {
+                    eprintln!("[rusty-board] layer-shell shell failed: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
     rusty_board_egui::demo_app::run("rusty-board")
 }

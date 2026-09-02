@@ -119,7 +119,7 @@ if [[ ! -x "$BIN_SRC" ]]; then
     if [[ "$SKIP_BUILD" -eq 1 ]]; then
         echo "ERROR: $BIN_SRC not found, and --skip-build was given." >&2
         echo "       Run without --skip-build, or build first with:" >&2
-        echo "         ./scripts/install.sh   (or: cd egui-frontend && cargo build --release --features wayland)" >&2
+        echo "         ./scripts/install.sh   (or: cd egui-frontend && cargo build --release --features wayland,layer)" >&2
     else
         echo "ERROR: $BIN_SRC not found. Did the build fail?" >&2
     fi

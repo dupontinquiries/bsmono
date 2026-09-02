@@ -163,6 +163,24 @@ impl Feel {
         }
     }
 
+    /// Advance the sink WITHOUT running a frame. A shell that sleeps between frames (the
+    /// layer shell) calls this on every wake, so Activate/Deactivate are seen while idle
+    /// without repainting a keyboard nobody is touching. Returns whether the compositor
+    /// currently wants the keyboard shown; the shell compares that with its map state and
+    /// runs a frame (which emits `Visible`) only when they differ.
+    pub fn pump_sink(&mut self) -> bool {
+        self.sink.pump();
+        self.sink.is_visible()
+    }
+
+    /// A screen for a shell that KNOWS its placement (the layer shell), rather than inferring
+    /// it from the environment as `new` does for eframe.
+    pub fn with_placement(placement: crate::platform::Placement) -> Feel {
+        let mut f = Feel::new();
+        f.placement = placement;
+        f
+    }
+
     pub fn new() -> Feel {
         Feel {
             placement: crate::platform::placement(),

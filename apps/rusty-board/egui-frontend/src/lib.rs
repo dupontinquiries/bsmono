@@ -33,6 +33,9 @@ pub mod wayland;
 pub mod settings;
 /// Session/placement policy: which host obligations the shell can meet, KWin socket capture.
 pub mod platform;
+/// The shells: what owns the surface and runs `Feel::frame` in it (layer-shell under `layer`).
+#[cfg(feature = "app")]
+pub mod shell;
 // config/mod.rs refers to `crate::util`, so the port re-exports it at the root.
 pub use settings::util;
 // …and the shared voice tree refers to `crate::config::VoiceConfig`, so the

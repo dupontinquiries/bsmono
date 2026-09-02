@@ -11,9 +11,9 @@
 #
 # Frontends:
 #   egui  (default, the v2 keyboard) — apps/rusty-board/egui-frontend,
-#         its own Cargo package. Built with --features wayland so it
-#         types into the focused window; without that feature it is
-#         a preview that types into itself.
+#         its own Cargo package. Built with --features wayland,layer so
+#         it types into the focused window and docks as a layer surface;
+#         without `wayland` it is a preview that types into itself.
 #   gtk   — the GTK4/libadwaita original in apps/rusty-board/src.
 #
 # Usage from a script:
@@ -26,9 +26,14 @@
 
 FRONTEND_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FRONTEND_NAME="egui"
-# Extra cargo features for the egui build. `voice` adds whisper-rs
-# dictation (native build + a model); leave it to the person.
-FRONTEND_EGUI_FEATURES="${RUSTY_BOARD_EGUI_FEATURES:-wayland}"
+# Cargo features for the egui build:
+#   wayland — the input-method backend (types into the focused window)
+#   layer   — the docked zwlr_layer_shell_v1 surface (bottom edge, exclusive
+#             zone, never focused; falls back to a toplevel window at runtime
+#             if the compositor has no layer shell)
+# `voice` adds whisper-rs dictation (native build + a model); leave it to
+# the person: RUSTY_BOARD_EGUI_FEATURES="wayland,layer,voice".
+FRONTEND_EGUI_FEATURES="${RUSTY_BOARD_EGUI_FEATURES:-wayland,layer}"
 
 frontend_select() {
     case "${1:-egui}" in

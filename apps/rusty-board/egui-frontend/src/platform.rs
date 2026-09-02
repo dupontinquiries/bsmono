@@ -129,10 +129,9 @@ pub enum Placement {
     /// keyboard-interactivity none. The compositor does all three obligations. This is what
     /// the GTK build has via gtk4-layer-shell and what Phosh/Sway/KWin all honour.
     ///
-    /// NOT REACHABLE from the eframe shell: winit gives its surface the xdg_toplevel role and a
-    /// surface has exactly one role. The arm exists so `describe()` and the settings panel can
-    /// name it, and so a shell that speaks layer-shell directly (the next step — see
-    /// `shell.rs`) has a value to return without touching the screen code.
+    /// Not reachable from the eframe shell (winit gives its surface the xdg_toplevel role and
+    /// a surface has exactly one role); `shell::layer` (feature `layer`) is the shell that
+    /// speaks the protocol directly and constructs the screen with this placement.
     LayerShell,
     /// A normal toplevel that a window-manager RULE keeps unfocusable, above other windows and
     /// at the bottom edge. On KWin `scripts/plasma-setup.sh` writes that rule for the app id.
@@ -155,9 +154,10 @@ impl Placement {
     }
 }
 
-/// Decide the placement for the eframe shell. The shell cannot do layer-shell itself, so on
-/// Wayland the best it can offer is a ruled toplevel — and whether the rule exists is the
-/// window manager's knowledge, not ours, so the env override is how a person tells us.
+/// Decide the placement for the EFRAME shell (the layer shell does not ask; it knows). eframe
+/// cannot do layer-shell itself, so on Wayland the best it can offer is a ruled toplevel — and
+/// whether the rule exists is the window manager's knowledge, not ours, so the env override is
+/// how a person tells us.
 ///
 /// `RUSTY_BOARD_PLACEMENT=floating|ruled` overrides for testing.
 pub fn placement() -> Placement {

@@ -21,6 +21,19 @@ default = ["app"]
 # device (Plasma Mobile, Fairphone) this is the feature that turns taps
 # into input for the FOCUSED window rather than for a preview box.
 wayland = ["dep:board-compositor", "board-compositor/wayland"]
+# THE DOCKED KEYBOARD. A zwlr_layer_shell_v1 surface driven by sctk + EGL
+# (glutin) + egui_glow, no winit: anchored to the bottom edge with an
+# exclusive zone, never focused, mapped on Activate / unmapped on
+# Deactivate. This is what "tucks away like Maliit" means on Phosh, Sway
+# and KWin. Off by default for the same reason as `wayland`: a desktop
+# checkout must build with no compositor. Every crate here is already in
+# the tree through eframe's Wayland path; `client_system` on
+# wayland-backend is what gives EGL a `wl_proxy*` to bind to.
+layer = [
+  "app",
+  "dep:smithay-client-toolkit", "dep:wayland-client", "dep:wayland-backend",
+  "dep:glutin", "dep:egui_glow", "dep:glow", "dep:raw-window-handle", "dep:libc",
+]
 # Dictation. Off by default because whisper-rs pulls a native build and a model
 # file; the keyboard is fully usable without it, and a phone build that cannot
 # compile is worse than one that cannot dictate.
@@ -70,6 +83,16 @@ mic-kit = { path = "../../../shared/mic-kit" }
 voice-kit = { path = "../../../shared/voice-kit" }
 signal-kit = { path = "../../../shared/signal-kit" }
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
+
+# Only under `layer` — see the feature's comment.
+smithay-client-toolkit = { version = "0.19", default-features = false, optional = true }
+wayland-client = { version = "0.31", optional = true }
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"], optional = true }
+glutin = { version = "0.32", default-features = false, features = ["egl", "wayland"], optional = true }
+egui_glow = { version = "0.34", default-features = false, optional = true }
+glow = { version = "0.17", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"] }
