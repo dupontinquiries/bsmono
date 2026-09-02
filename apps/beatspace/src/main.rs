@@ -12,6 +12,7 @@ mod micsession;
 mod audio_io;
 mod config;
 mod dataset;
+mod upscale;
 mod dsp;
 #[cfg(feature = "gpu")]
 mod gpu;

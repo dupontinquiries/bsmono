@@ -1,0 +1,17 @@
+[package]
+name = "d2x-wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "waifu2x upconv_7 on wgpu compute (Vulkan on Asahi/Mesa, Metal/DX12/GL elsewhere), implementing d2x-core Upscaler. CPU-validated by selftest."
+
+[dependencies]
+d2x-core = { path = "../d2x-core" }
+anyhow.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+# wgsl-in explicitly: naga default feature set is empty (see beatspace).
+naga.workspace = true

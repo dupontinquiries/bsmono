@@ -1,0 +1,171 @@
+//! The data the analysis stage hands to the merge stage: for every block of
+//! the next frame, where its pixels come from.
+//!
+//! This is the in-memory form of upstream's `pframe_N.txt` / `residual_N.txt`
+//! / `fade_N.txt` triple. Nothing here touches pixels.
+
+use serde::{Deserialize, Serialize};
+
+/// The block lattice over a frame whose dimensions are multiples of
+/// `block_size`. The pipeline pads frames up to that before analysis, so
+/// blocks never overlap and never run off the edge — upstream instead
+/// silently never updates the ragged edge strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grid {
+    pub block_size: u32,
+    pub cols: u32,
+    pub rows: u32,
+}
+
+impl Grid {
+    pub fn new(width: u32, height: u32, block_size: u32) -> Self {
+        assert!(block_size > 0);
+        assert!(
+            width % block_size == 0 && height % block_size == 0,
+            "Grid::new: {width}x{height} is not a multiple of block size {block_size}"
+        );
+        Grid { block_size, cols: width / block_size, rows: height / block_size }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        (self.cols as usize) * (self.rows as usize)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Pixel origin of cell `i` (row-major).
+    #[inline]
+    pub fn origin(&self, i: usize) -> (u32, u32) {
+        let bx = (i % self.cols as usize) as u32;
+        let by = (i / self.cols as usize) as u32;
+        (bx * self.block_size, by * self.block_size)
+    }
+
+    pub fn width(&self) -> u32 {
+        self.cols * self.block_size
+    }
+
+    pub fn height(&self) -> u32 {
+        self.rows * self.block_size
+    }
+}
+
+/// Where one block of the next frame comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlockMatch {
+    /// Same position in the previous frame passes the quality gate.
+    Stationary,
+    /// The block at `(src_x, src_y)` in the previous frame passes the gate.
+    Moved { src_x: u32, src_y: u32 },
+    /// Nothing in the previous frame passes; the block must be upscaled.
+    Missing,
+}
+
+/// Maps a missing block at `(frame_x, frame_y)` to cell `(cell_x, cell_y)`
+/// of the residual image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResidualVector {
+    pub frame_x: u32,
+    pub frame_y: u32,
+    pub cell_x: u32,
+    pub cell_y: u32,
+}
+
+/// A flat brightness shift applied to a block of the previous frame before
+/// matching — catches fades and global lighting changes as one integer per
+/// block instead of a residual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FadeBlock {
+    pub x: u32,
+    pub y: u32,
+    pub scalar: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct FrameStats {
+    pub psnr: f64,
+    pub stationary: u32,
+    pub moved: u32,
+    pub missing: u32,
+    pub fades: u32,
+    /// Side length, in cells, of the square residual image (0 if none).
+    pub residual_dim: u32,
+    pub redraw: bool,
+}
+
+impl FrameStats {
+    /// Fraction of the frame's pixels that are re-upscaled this frame, in
+    /// terms of the residual image's area relative to the frame. This is the
+    /// number dandere2x exists to make small.
+    pub fn upscaled_fraction(&self, grid: &Grid, bleed: u32) -> f64 {
+        if self.redraw {
+            return 1.0;
+        }
+        let cell = (grid.block_size + 2 * bleed) as f64;
+        let res_px = (self.residual_dim as f64 * cell).powi(2);
+        let frame_px = (grid.width() as f64) * (grid.height() as f64);
+        res_px / frame_px
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FramePlan {
+    pub grid: Grid,
+    /// One entry per grid cell, row-major.
+    pub matches: Vec<BlockMatch>,
+    pub residuals: Vec<ResidualVector>,
+    pub fades: Vec<FadeBlock>,
+    /// The whole frame is upscaled and the plan's blocks are ignored.
+    pub redraw: bool,
+    pub stats: FrameStats,
+}
+
+impl FramePlan {
+    pub fn redraw(grid: Grid, psnr: f64) -> Self {
+        let n = grid.len();
+        FramePlan {
+            grid,
+            matches: vec![BlockMatch::Missing; n],
+            residuals: Vec::new(),
+            fades: Vec::new(),
+            redraw: true,
+            stats: FrameStats { psnr, missing: n as u32, redraw: true, ..Default::default() },
+        }
+    }
+
+    /// Side length of the residual image in cells for `n` missing blocks.
+    pub fn residual_dim_for(n: usize) -> u32 {
+        if n == 0 {
+            0
+        } else {
+            (n as f64).sqrt().ceil() as u32
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid_origins_are_row_major() {
+        let g = Grid::new(60, 30, 30);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g.origin(0), (0, 0));
+        assert_eq!(g.origin(1), (30, 0));
+        let g = Grid::new(30, 60, 30);
+        assert_eq!(g.origin(1), (0, 30));
+    }
+
+    #[test]
+    fn residual_dim_is_ceil_sqrt() {
+        assert_eq!(FramePlan::residual_dim_for(0), 0);
+        assert_eq!(FramePlan::residual_dim_for(1), 1);
+        assert_eq!(FramePlan::residual_dim_for(4), 2);
+        assert_eq!(FramePlan::residual_dim_for(5), 3);
+        assert_eq!(FramePlan::residual_dim_for(9), 3);
+    }
+}
