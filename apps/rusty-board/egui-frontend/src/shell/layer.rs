@@ -1,0 +1,669 @@
+//! shell::layer — the keyboard as a `zwlr_layer_shell_v1` surface, no winit.
+//!
+//! This is the shell that meets all three obligations `platform.rs` lists, the way the GTK
+//! build does through gtk4-layer-shell and Maliit does through layer-shell-qt: the surface is
+//! anchored to the bottom edge with an exclusive zone (other windows make room), it never
+//! takes keyboard focus (`KeyboardInteractivity::None`), and it is mapped on Activate and
+//! unmapped on Deactivate — the compositor's decision, delivered through the input-method
+//! backend into `Feel`, which asks for it the only way the screen knows how:
+//! `ViewportCommand::Visible`. This loop is the second reader of that command; eframe was
+//! the first. Phosh, Sway and KWin (5.20+) all speak the protocol.
+//!
+//! ## What is here, in the order it runs
+//!
+//! 1. `Connection::connect_to_env` — the PUBLIC socket. `platform::capture_inherited_socket`
+//!    has already moved KWin's privileged fd out of the environment, so this cannot land on
+//!    the wrong one.
+//! 2. sctk globals: compositor, layer shell (absent → [`LayerError::Unsupported`], and the
+//!    binary falls back to eframe), seat (pointer + touch), outputs (for scale).
+//! 3. One `wl_surface`, one layer surface, initial commit, wait for the first `configure`.
+//! 4. EGL through glutin's EGL API from the raw `wl_display` / `wl_surface` pointers — glutin
+//!    creates the `wl_egl_window` itself. `glow` over `eglGetProcAddress`, `egui_glow::Painter`
+//!    on top. Swap interval 0: with interval 1, `eglSwapBuffers` blocks until the compositor's
+//!    frame callback, and an UNMAPPED surface never gets one — a hidden keyboard would hang on
+//!    its first hide. Throttling is done by `wl_surface.frame` instead (`frame_pending`).
+//! 5. The loop: pump the input-method sink on every wake (cheap, no paint); run a
+//!    `Feel::frame` only when it is DUE — input arrived, a configure landed, egui's
+//!    `repaint_delay` elapsed, or the sink's wish disagrees with our map state; act on
+//!    `Visible`; paint if mapped and the compositor has consumed the previous frame; sleep
+//!    until the socket is readable or the next deadline. An idle keyboard paints nothing,
+//!    which on a phone is the difference between a keyboard and a heater; a poll timeout of
+//!    at most 50 ms bounds the Activate→shown latency.
+//!
+//! ## Map / unmap
+//!
+//! The protocol's own recipe (zwlr_layer_surface_v1, "unmapping"): attach a null buffer and
+//! commit to hide; to show again, commit WITHOUT a buffer, wait for `configure`, ack, then
+//! commit a buffer (which, with EGL, is what `swap_buffers` does). So `visible` is not one
+//! flag but two: `mapped` (what we asked for) and `configured` (what the compositor has
+//! acknowledged), and painting requires both. Rendering into an unconfigured surface is a
+//! protocol error that kills the client.
+//!
+//! ## Not done here
+//!
+//! - Fractional scale (`wp_fractional_scale_v1`): integer `set_buffer_scale` from the
+//!   compositor's preferred scale. On a 2.5× phone KWin scales the buffer; text is slightly
+//!   soft. It is the right next protocol to add, in `scale_factor_changed`.
+//! - Keyboard input: none by design (interactivity None).
+//! - Cursor shape: the pointer over a keyboard keeps whatever cursor it had.
+//!
+//! Nothing in this file has been run against a compositor. It compiles; the protocol
+//! sequence follows the spec text and sctk's `simple_layer` example; the EGL setup follows
+//! glutin's own Wayland path. First run is on a device.
+
+use std::ffi::CStr;
+use std::num::NonZeroU32;
+use std::os::fd::AsFd;
+use std::ptr::NonNull;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use glutin::config::{ConfigSurfaceTypes, ConfigTemplateBuilder};
+use glutin::api::egl::context::PossiblyCurrentContext;
+use glutin::context::{ContextApi, ContextAttributesBuilder, Version};
+use glutin::display::GetGlDisplay;
+use glutin::prelude::*;
+use glutin::surface::{SurfaceAttributesBuilder, SwapInterval, WindowSurface};
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
+use smithay_client_toolkit::{
+    compositor::{CompositorHandler, CompositorState},
+    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry, delegate_seat,
+    delegate_touch,
+    output::{OutputHandler, OutputState},
+    registry::{ProvidesRegistryState, RegistryState},
+    registry_handlers,
+    seat::{
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        touch::TouchHandler,
+        Capability, SeatHandler, SeatState,
+    },
+    shell::{
+        wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure},
+        WaylandSurface,
+    },
+};
+use wayland_client::{
+    globals::registry_queue_init,
+    protocol::{wl_output, wl_pointer, wl_seat, wl_surface, wl_touch},
+    Connection, Proxy, QueueHandle,
+};
+
+use crate::demo_app::Feel;
+use crate::platform::Placement;
+
+/// Logical height of the keyboard strip. Same number the KWin rule and the eframe viewport
+/// use, so the three placements agree about how much of the screen a keyboard is.
+pub const HEIGHT: u32 = 340;
+
+/// Poll timeout while nothing is animating. Bounds the Activate→shown latency when idle; the
+/// GTK backend's SLOW_MS is in the same range.
+const IDLE_POLL: Duration = Duration::from_millis(50);
+
+#[derive(Debug)]
+pub enum LayerError {
+    /// The compositor has no `zwlr_layer_shell_v1` (or no `wl_compositor`, or the socket is
+    /// not there). The caller should run the eframe shell instead; the keyboard still works,
+    /// it just cannot dock.
+    Unsupported(String),
+    /// Something failed AFTER the shell was up — GL, a dead connection. Not a reason to try
+    /// another shell; surface it.
+    Runtime(anyhow::Error),
+}
+
+impl std::fmt::Display for LayerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LayerError::Unsupported(s) => write!(f, "layer-shell unsupported: {s}"),
+            LayerError::Runtime(e) => write!(f, "layer-shell runtime: {e:#}"),
+        }
+    }
+}
+
+/// Which layer to sit on. `RUSTY_BOARD_LAYER=overlay` puts the keyboard above fullscreen
+/// windows and lock screens; the default `top` is above normal windows and below fullscreen,
+/// which is where an OSK belongs unless the lock screen itself needs typing.
+fn layer_from_env() -> Layer {
+    match std::env::var("RUSTY_BOARD_LAYER").ok().as_deref().map(str::trim) {
+        Some("overlay") => Layer::Overlay,
+        Some("bottom") => Layer::Bottom,
+        _ => Layer::Top,
+    }
+}
+
+/// Everything the Wayland dispatch handlers write into. The GL objects live outside (in
+/// `run`), because they borrow the connection pointers and are created after the first
+/// configure; the handlers only need to know sizes and to queue egui events.
+struct State {
+    registry_state: RegistryState,
+    seat_state: SeatState,
+    output_state: OutputState,
+    pointer: Option<wl_pointer::WlPointer>,
+    touch: Option<wl_touch::WlTouch>,
+    layer: LayerSurface,
+    /// Logical size the compositor last configured. `None` until the first configure.
+    size: Option<(u32, u32)>,
+    /// Integer buffer scale the compositor prefers for our surface (its `wl_output` scale).
+    scale: i32,
+    /// A `configure` arrived that we have not painted for yet.
+    needs_paint: bool,
+    /// We asked the compositor to show us and have (since then) received a configure.
+    configured: bool,
+    /// A `wl_surface.frame` callback is outstanding — don't paint again until it lands.
+    frame_pending: bool,
+    /// The compositor closed the layer surface (output gone, shell shutting down).
+    closed: bool,
+    /// egui input for the next frame.
+    events: Vec<egui::Event>,
+    /// The first finger down, whose id is the one that also drives the pointer emulation.
+    primary_touch: Option<i32>,
+    /// Last pointer/primary-finger position in logical points, for pointer-button events.
+    last_pos: egui::Pos2,
+}
+
+impl State {
+    fn logical_size(&self) -> (u32, u32) {
+        self.size.unwrap_or((0, HEIGHT))
+    }
+
+    fn pixel_size(&self) -> [u32; 2] {
+        let (w, h) = self.logical_size();
+        let s = self.scale.max(1) as u32;
+        [w.max(1) * s, h.max(1) * s]
+    }
+
+    fn pointer_button(&mut self, pressed: bool) {
+        self.events.push(egui::Event::PointerButton {
+            pos: self.last_pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        });
+    }
+}
+
+/// Run the keyboard under the layer shell until the compositor closes it. `Err(Unsupported)`
+/// means nothing was shown and the caller may run a different shell.
+pub fn run(title: &str) -> Result<(), LayerError> {
+    let conn = Connection::connect_to_env().map_err(|e| LayerError::Unsupported(format!("connect: {e}")))?;
+    let (globals, mut queue) =
+        registry_queue_init::<State>(&conn).map_err(|e| LayerError::Unsupported(format!("registry: {e}")))?;
+    let qh = queue.handle();
+
+    let compositor = CompositorState::bind(&globals, &qh).map_err(|e| LayerError::Unsupported(format!("wl_compositor: {e}")))?;
+    let layer_shell = LayerShell::bind(&globals, &qh).map_err(|e| LayerError::Unsupported(format!("zwlr_layer_shell_v1: {e}")))?;
+
+    let surface = compositor.create_surface(&qh);
+    let layer = layer_shell.create_layer_surface(&qh, surface, layer_from_env(), Some(title.to_string()), None);
+    // Bottom edge, full width (width 0 = stretch between the two side anchors), a strip
+    // HEIGHT tall that other windows must make room for, and NO keyboard focus — the text goes
+    // to whoever had it.
+    layer.set_anchor(Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+    layer.set_size(0, HEIGHT);
+    layer.set_exclusive_zone(HEIGHT as i32);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+    // Initial commit without a buffer: this is what asks for the first configure.
+    layer.commit();
+
+    let mut state = State {
+        registry_state: RegistryState::new(&globals),
+        seat_state: SeatState::new(&globals, &qh),
+        output_state: OutputState::new(&globals, &qh),
+        pointer: None,
+        touch: None,
+        layer,
+        size: None,
+        scale: 1,
+        needs_paint: false,
+        configured: false,
+        frame_pending: false,
+        closed: false,
+        events: Vec::new(),
+        primary_touch: None,
+        last_pos: egui::Pos2::ZERO,
+    };
+
+    // Wait for the first configure so the EGL window can be created at a real size.
+    while state.size.is_none() && !state.closed {
+        queue.blocking_dispatch(&mut state).map_err(|e| LayerError::Unsupported(format!("first configure: {e}")))?;
+    }
+    if state.closed {
+        return Err(LayerError::Unsupported("layer surface closed before configure".into()));
+    }
+
+    let mut gl = Gl::new(&conn, state.layer.wl_surface(), state.pixel_size()).map_err(LayerError::Runtime)?;
+    let ctx = egui::Context::default();
+    let mut feel = Feel::with_placement(Placement::LayerShell);
+    // We are mapped from the first paint; `Feel` decides from the sink whether we should be,
+    // and its first frame will say Visible(false) on a Wayland session with nothing focused.
+    let mut mapped = true;
+    let start = Instant::now();
+    let mut last_frame = Instant::now();
+    // When egui next wants a frame regardless of input (animations, request_repaint_after).
+    let mut repaint_at = Instant::now();
+
+    tracing::info!("layer-shell shell up: {}x{} @{}x, layer {:?}", state.logical_size().0, state.logical_size().1, state.scale, layer_from_env());
+
+    while !state.closed {
+        // ---- 0. the sink first: Activate/Deactivate are seen on every wake, and a change of
+        //         wish is itself a reason to run a frame (which is what emits `Visible`).
+        let wanted = feel.pump_sink();
+        let due = !state.events.is_empty()
+            || state.needs_paint
+            || wanted != mapped
+            || Instant::now() >= repaint_at;
+        if !due {
+            let timeout = deadline_timeout(repaint_at, &state);
+            wait_for_socket(&conn, &mut queue, &mut state, timeout)?;
+            continue;
+        }
+
+        // ---- 1. one egui frame.
+        let (lw, lh) = state.logical_size();
+        let ppp = state.scale.max(1) as f32;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(lw as f32, lh as f32))),
+            time: Some(start.elapsed().as_secs_f64()),
+            predicted_dt: last_frame.elapsed().as_secs_f32().clamp(1.0 / 240.0, 0.1),
+            events: std::mem::take(&mut state.events),
+            ..Default::default()
+        };
+        last_frame = Instant::now();
+        ctx.set_pixels_per_point(ppp);
+        let out = ctx.run_ui(raw, |ctx| feel.frame(ctx));
+
+        // ---- 2. the screen's one request of the shell.
+        let mut want_visible = None;
+        let mut repaint_delay = Duration::from_secs(3600);
+        if let Some(vp) = out.viewport_output.get(&egui::ViewportId::ROOT) {
+            repaint_delay = vp.repaint_delay;
+            repaint_at = Instant::now() + repaint_delay;
+            for cmd in &vp.commands {
+                if let egui::ViewportCommand::Visible(v) = cmd {
+                    want_visible = Some(*v);
+                }
+            }
+        }
+        match want_visible {
+            Some(false) if mapped => {
+                // Hide: null buffer + commit. The exclusive zone goes with the map state, so
+                // the app below gets its space back in the same commit.
+                state.layer.wl_surface().attach(None, 0, 0);
+                state.layer.wl_surface().commit();
+                mapped = false;
+                state.configured = false;
+                state.frame_pending = false;
+                tracing::debug!("layer: unmapped");
+            }
+            Some(true) if !mapped => {
+                // Show: commit without a buffer, then wait for configure (handled below).
+                state.layer.set_size(0, HEIGHT);
+                state.layer.set_exclusive_zone(HEIGHT as i32);
+                state.layer.wl_surface().commit();
+                mapped = true;
+                tracing::debug!("layer: map requested");
+            }
+            _ => {}
+        }
+
+        // ---- 3. paint if the compositor has said we may. Every frame that ran is painted
+        //         (that is what egui's model expects; frames only run when due).
+        if mapped && state.configured && !state.frame_pending {
+            let px = state.pixel_size();
+            gl.resize_if_needed(px).map_err(LayerError::Runtime)?;
+            state.layer.wl_surface().set_buffer_scale(state.scale.max(1));
+            let primitives = ctx.tessellate(out.shapes, ppp);
+            gl.paint(px, ppp, &primitives, &out.textures_delta);
+            // Throttle to the compositor: no more paints until it says it consumed this one.
+            state.layer.wl_surface().frame(&qh, state.layer.wl_surface().clone());
+            state.frame_pending = true;
+            gl.swap().map_err(LayerError::Runtime)?;
+            state.needs_paint = false;
+        }
+
+        // ---- 4. sleep until the socket is readable or egui's next deadline.
+        let timeout = deadline_timeout(repaint_at, &state);
+        wait_for_socket(&conn, &mut queue, &mut state, timeout)?;
+        let _ = repaint_delay;
+    }
+
+    gl.destroy();
+    tracing::info!("layer-shell shell: surface closed by the compositor, exiting");
+    Ok(())
+}
+
+/// How long the loop may sleep: until egui's deadline, capped at IDLE_POLL so the sink is
+/// pumped often enough — and never a zero-timeout spin while a frame callback is outstanding
+/// (the callback arrives on the socket; poll wakes us for it).
+fn deadline_timeout(repaint_at: Instant, state: &State) -> Duration {
+    if state.frame_pending {
+        IDLE_POLL
+    } else {
+        repaint_at.saturating_duration_since(Instant::now()).min(IDLE_POLL)
+    }
+}
+
+/// Flush, dispatch what is already buffered, sleep on the socket up to `timeout`, read and
+/// dispatch again. The prepare_read/poll/read sequence is wayland-client's own recipe for a
+/// single-threaded client that owns its loop.
+fn wait_for_socket(
+    conn: &Connection,
+    queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+    timeout: Duration,
+) -> Result<(), LayerError> {
+    conn.flush().map_err(|e| LayerError::Runtime(anyhow::anyhow!("flush: {e}")))?;
+    // Anything already buffered is dispatched before sleeping, so an event that arrived
+    // during the paint is not delayed by a whole poll timeout.
+    queue.dispatch_pending(state).map_err(|e| LayerError::Runtime(anyhow::anyhow!("dispatch: {e}")))?;
+    if let Some(guard) = conn.prepare_read() {
+        let fd = guard.connection_fd();
+        let mut pfd = libc::pollfd { fd: fd.as_fd().as_raw_fd_compat(), events: libc::POLLIN, revents: 0 };
+        let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: pfd is a valid, initialised pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if ready > 0 {
+            match guard.read() {
+                Ok(_) => {}
+                Err(wayland_client::backend::WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(LayerError::Runtime(anyhow::anyhow!("read: {e}"))),
+            }
+        } else {
+            drop(guard);
+        }
+    } else {
+        // Events were already buffered by someone else's read (never, single-threaded — but
+        // the API allows it); don't spin.
+        std::thread::sleep(timeout.min(Duration::from_millis(4)));
+    }
+    queue.dispatch_pending(state).map_err(|e| LayerError::Runtime(anyhow::anyhow!("dispatch: {e}")))?;
+    Ok(())
+}
+
+/// `AsRawFd` without importing it at every call site; sctk's guard hands back a `BorrowedFd`.
+trait RawFdCompat {
+    fn as_raw_fd_compat(&self) -> i32;
+}
+impl RawFdCompat for std::os::fd::BorrowedFd<'_> {
+    fn as_raw_fd_compat(&self) -> i32 {
+        use std::os::fd::AsRawFd;
+        self.as_raw_fd()
+    }
+}
+
+/// The GL half: EGL display/context/surface via glutin, glow, and the egui painter.
+struct Gl {
+    display: glutin::api::egl::display::Display,
+    context: PossiblyCurrentContext,
+    surface: glutin::api::egl::surface::Surface<WindowSurface>,
+    painter: egui_glow::Painter,
+    size: [u32; 2],
+}
+
+impl Gl {
+    fn new(conn: &Connection, wl_surface: &wl_surface::WlSurface, size: [u32; 2]) -> anyhow::Result<Gl> {
+        use anyhow::{anyhow, Context as _};
+        // Raw pointers into libwayland: this needs wayland-backend's `client_system` (the
+        // libwayland-backed implementation), which the `layer` feature turns on. The pure-Rust
+        // backend has no `wl_proxy*` for EGL to bind to.
+        let display_ptr = NonNull::new(conn.backend().display_ptr() as *mut std::ffi::c_void)
+            .ok_or_else(|| anyhow!("null wl_display"))?;
+        let surface_ptr = NonNull::new(wl_surface.id().as_ptr() as *mut std::ffi::c_void)
+            .ok_or_else(|| anyhow!("wl_surface has no proxy pointer (is the pure-Rust wayland backend in use?)"))?;
+        let rdh = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(display_ptr));
+        let rwh = RawWindowHandle::Wayland(WaylandWindowHandle::new(surface_ptr));
+
+        // SAFETY: the display pointer is a live wl_display owned by `conn`, which outlives Gl.
+        let display = unsafe { glutin::api::egl::display::Display::new(rdh) }.context("EGL display")?;
+        let template = ConfigTemplateBuilder::new()
+            .with_alpha_size(8)
+            .with_surface_type(ConfigSurfaceTypes::WINDOW)
+            .build();
+        // SAFETY: display is valid.
+        let config = unsafe { display.find_configs(template) }
+            .context("EGL configs")?
+            .next()
+            .ok_or_else(|| anyhow!("no EGL config with an alpha channel and window support"))?;
+        let attrs = ContextAttributesBuilder::new()
+            .with_context_api(ContextApi::Gles(Some(Version::new(2, 0))))
+            .build(Some(rwh));
+        // SAFETY: config belongs to display.
+        let not_current = unsafe { display.create_context(&config, &attrs) }.context("EGL context")?;
+        let sattrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
+            rwh,
+            NonZeroU32::new(size[0].max(1)).unwrap(),
+            NonZeroU32::new(size[1].max(1)).unwrap(),
+        );
+        // SAFETY: rwh is a live wl_surface proxy that outlives the EGL surface (destroy() runs first).
+        let surface = unsafe { display.create_window_surface(&config, &sattrs) }.context("EGL window surface")?;
+        let context = not_current.make_current(&surface).context("make current")?;
+        // Interval 0 — see the module doc: interval 1 blocks in eglSwapBuffers waiting for a
+        // frame callback an unmapped surface never receives.
+        surface.set_swap_interval(&context, SwapInterval::DontWait).context("swap interval")?;
+
+        let gl_display = context.display();
+        // SAFETY: the loader is queried while the context is current on this thread.
+        let glow = unsafe {
+            glow::Context::from_loader_function_cstr(|name: &CStr| gl_display.get_proc_address(name) as *const _)
+        };
+        let painter = egui_glow::Painter::new(Arc::new(glow), "", None, false)
+            .map_err(|e| anyhow!("egui_glow painter: {e}"))?;
+        Ok(Gl { display, context, surface, painter, size })
+    }
+
+    fn resize_if_needed(&mut self, size: [u32; 2]) -> anyhow::Result<()> {
+        if size != self.size {
+            self.surface.resize(
+                &self.context,
+                NonZeroU32::new(size[0].max(1)).unwrap(),
+                NonZeroU32::new(size[1].max(1)).unwrap(),
+            );
+            self.size = size;
+        }
+        Ok(())
+    }
+
+    fn paint(&mut self, size: [u32; 2], ppp: f32, primitives: &[egui::ClippedPrimitive], textures: &egui::TexturesDelta) {
+        // Transparent clear: the board paints its own background, and anything it leaves
+        // clear shows the app underneath — which is how the glass palette reads on a phone.
+        self.painter.clear(size, [0.0, 0.0, 0.0, 0.0]);
+        self.painter.paint_and_update_textures(size, ppp, primitives, textures);
+    }
+
+    fn swap(&self) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        self.surface.swap_buffers(&self.context).context("eglSwapBuffers")
+    }
+
+    fn destroy(&mut self) {
+        self.painter.destroy();
+        let _ = &self.display;
+    }
+}
+
+// ---------------------------------------------------------------- sctk handlers
+
+impl CompositorHandler for State {
+    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, new_factor: i32) {
+        if new_factor != self.scale {
+            self.scale = new_factor;
+            self.needs_paint = true;
+        }
+    }
+    fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
+        self.frame_pending = false;
+    }
+    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+    fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+}
+
+impl OutputHandler for State {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output_state
+    }
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+}
+
+impl LayerShellHandler for State {
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
+        self.closed = true;
+    }
+
+    fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface, configure: LayerSurfaceConfigure, _serial: u32) {
+        // sctk acks the configure for us. A zero dimension means "you choose": keep the
+        // height we asked for and, for width, what we last knew (or the ask).
+        let (w, h) = configure.new_size;
+        let prev = self.size.unwrap_or((0, HEIGHT));
+        let w = if w == 0 { prev.0.max(1) } else { w };
+        let h = if h == 0 { HEIGHT } else { h };
+        self.size = Some((w, h));
+        self.configured = true;
+        self.needs_paint = true;
+    }
+}
+
+impl SeatHandler for State {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, capability: Capability) {
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            self.pointer = self.seat_state.get_pointer(qh, &seat).ok();
+        }
+        if capability == Capability::Touch && self.touch.is_none() {
+            self.touch = self.seat_state.get_touch(qh, &seat).ok();
+        }
+    }
+    fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat, capability: Capability) {
+        if capability == Capability::Pointer {
+            if let Some(p) = self.pointer.take() { p.release(); }
+        }
+        if capability == Capability::Touch {
+            if let Some(t) = self.touch.take() { t.release(); }
+        }
+    }
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl PointerHandler for State {
+    fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
+        for ev in events {
+            if ev.surface != *self.layer.wl_surface() {
+                continue;
+            }
+            let pos = egui::pos2(ev.position.0 as f32, ev.position.1 as f32);
+            match ev.kind {
+                PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                    self.last_pos = pos;
+                    self.events.push(egui::Event::PointerMoved(pos));
+                }
+                PointerEventKind::Leave { .. } => {
+                    self.events.push(egui::Event::PointerGone);
+                }
+                // BTN_LEFT is 0x110; any button is a press for a keyboard.
+                PointerEventKind::Press { .. } => {
+                    self.last_pos = pos;
+                    self.events.push(egui::Event::PointerMoved(pos));
+                    self.pointer_button(true);
+                }
+                PointerEventKind::Release { .. } => {
+                    self.last_pos = pos;
+                    self.pointer_button(false);
+                }
+                PointerEventKind::Axis { .. } => {}
+            }
+        }
+    }
+}
+
+impl TouchHandler for State {
+    fn down(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_touch::WlTouch, _serial: u32, _time: u32, surface: wl_surface::WlSurface, id: i32, position: (f64, f64)) {
+        if surface != *self.layer.wl_surface() {
+            return;
+        }
+        let pos = egui::pos2(position.0 as f32, position.1 as f32);
+        self.events.push(egui::Event::Touch {
+            device_id: egui::TouchDeviceId(0),
+            id: egui::TouchId(id as u64),
+            phase: egui::TouchPhase::Start,
+            pos,
+            force: None,
+        });
+        // The first finger is the pointer: egui's widgets (and so every key) are driven by
+        // pointer events; Touch events feed multi-touch gestures only. Same emulation
+        // egui-winit does.
+        if self.primary_touch.is_none() {
+            self.primary_touch = Some(id);
+            self.last_pos = pos;
+            self.events.push(egui::Event::PointerMoved(pos));
+            self.pointer_button(true);
+        }
+    }
+
+    fn up(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_touch::WlTouch, _serial: u32, _time: u32, id: i32) {
+        self.events.push(egui::Event::Touch {
+            device_id: egui::TouchDeviceId(0),
+            id: egui::TouchId(id as u64),
+            phase: egui::TouchPhase::End,
+            pos: self.last_pos,
+            force: None,
+        });
+        if self.primary_touch == Some(id) {
+            self.primary_touch = None;
+            self.pointer_button(false);
+            self.events.push(egui::Event::PointerGone);
+        }
+    }
+
+    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_touch::WlTouch, _time: u32, id: i32, position: (f64, f64)) {
+        let pos = egui::pos2(position.0 as f32, position.1 as f32);
+        self.events.push(egui::Event::Touch {
+            device_id: egui::TouchDeviceId(0),
+            id: egui::TouchId(id as u64),
+            phase: egui::TouchPhase::Move,
+            pos,
+            force: None,
+        });
+        if self.primary_touch == Some(id) {
+            self.last_pos = pos;
+            self.events.push(egui::Event::PointerMoved(pos));
+        }
+    }
+
+    fn shape(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_touch::WlTouch, _id: i32, _major: f64, _minor: f64) {}
+    fn orientation(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_touch::WlTouch, _id: i32, _orientation: f64) {}
+
+    fn cancel(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_touch::WlTouch) {
+        // The compositor took the touch sequence (a gesture, a swipe from the edge). Release
+        // whatever egui thinks is pressed so no key stays down.
+        if self.primary_touch.take().is_some() {
+            self.pointer_button(false);
+            self.events.push(egui::Event::PointerGone);
+        }
+        self.events.push(egui::Event::Touch {
+            device_id: egui::TouchDeviceId(0),
+            id: egui::TouchId(0),
+            phase: egui::TouchPhase::Cancel,
+            pos: self.last_pos,
+            force: None,
+        });
+    }
+}
+
+delegate_compositor!(State);
+delegate_output!(State);
+delegate_seat!(State);
+delegate_pointer!(State);
+delegate_touch!(State);
+delegate_layer!(State);
+delegate_registry!(State);
+
+impl ProvidesRegistryState for State {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+    registry_handlers![OutputState, SeatState];
+}

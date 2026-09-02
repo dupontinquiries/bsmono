@@ -31,7 +31,7 @@ Equivalent to (see `frontend.sh`, which both install.sh and redeploy.sh source
 so they cannot disagree about which frontend is built or where its binary is):
 
 ```bash
-( cd egui-frontend && cargo build --release --features wayland )
+( cd egui-frontend && cargo build --release --features wayland,layer )
 sudo install -m755 egui-frontend/target/release/rusty-board-egui /usr/local/bin/rusty-board
 pkill -f rusty-board
 qdbus6 org.kde.KWin /KWin reconfigure
@@ -46,11 +46,20 @@ Options:
 - `--wait N` — seconds to wait for KWin to re-spawn (default: 3)
 - `--log-lines N` — log tail length (default: 40)
 
-## The egui (v2) keyboard on KWin: the window rule
+## The egui (v2) keyboard: docking
 
-The GTK build docks itself with gtk4-layer-shell. The egui build runs on
-eframe/winit, which can only make an ordinary toplevel, so `plasma-setup.sh`
-also writes a KWin window rule (`~/.config/kwinrulesrc`, rule id
+Built with `--features layer` (the default), the keyboard is a
+`zwlr_layer_shell_v1` surface: bottom edge, exclusive zone, never focused,
+mapped on Activate and unmapped on Deactivate — the same protocol the GTK build
+uses through gtk4-layer-shell and Maliit through layer-shell-qt. Phosh, Sway
+and KWin all honour it. `RUSTY_BOARD_LAYER=overlay` puts it above fullscreen
+windows and the lock screen. If the compositor has no layer shell the binary
+says so on stderr and runs as a toplevel window instead, which is where the
+rule below matters.
+
+### The KWin window rule (fallback for the toplevel window)
+
+`plasma-setup.sh` also writes a KWin window rule (`~/.config/kwinrulesrc`, rule id
 `rusty-board-egui-keyboard`, matched on the app id `org.rustyboard.RustyBoard`)
 that forces: accept focus = no, keep above, no titlebar, skip taskbar/switcher/
 pager, and — when `kscreen-doctor` can report the primary output — a size of

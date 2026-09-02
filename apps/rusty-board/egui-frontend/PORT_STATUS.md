@@ -84,16 +84,18 @@ moved.
   doesn't host an assistant subsystem yet, so there's no port-side page for it. Not "the panel
   isn't built" — the panel exists; this one section is deliberately withheld rather than
   offering a control that does nothing.
-- **Layer-shell placement** — the GTK build docks itself with gtk4-layer-shell. eframe/winit
-  gives its surface the xdg_toplevel role, so this shell cannot. What exists instead
-  (`platform.rs`): the host obligations are decided once as `Placement` data — on Wayland a
-  **ruled toplevel** (no decorations; `scripts/plasma-setup.sh` writes the KWin rule that forces
-  no-focus / keep-above / bottom-edge geometry), elsewhere floating — and the status strip says
-  which. Show/hide is one map/unmap of a fixed-size window, with the motion INSIDE the board
-  (`reveal_*`), so a tiling compositor sees one relayout per show rather than a per-frame resize.
-  The `Placement::LayerShell` arm and `Feel::frame(&egui::Context)` are the seam for a shell that
-  owns its own layer surface (sctk + egui_glow); that shell is not written. Phosh/Sway users get
-  the floating window until it is.
+- **Layer-shell placement** — done as a second SHELL, not a change to the screen: `shell::layer`
+  (feature `layer`, on by default in the install scripts) owns a `zwlr_layer_shell_v1` surface
+  through sctk, renders egui with glutin-EGL + egui_glow, translates sctk pointer/touch into
+  egui events, and maps/unmaps on the screen's `ViewportCommand::Visible` (the protocol's own
+  null-buffer / re-configure recipe). Bottom anchor, exclusive zone = 340, keyboard
+  interactivity None, swap interval 0 with `wl_surface.frame` throttling, frames run only when
+  due (idle = no paint). The eframe shell remains for desktops and as the runtime fallback when
+  a compositor has no layer shell; there it is a **ruled toplevel** (`plasma-setup.sh` writes
+  the KWin rule) and the status strip says which. `Feel::frame(&egui::Context)` +
+  `Feel::pump_sink()` are the seam both shells use. Compile-verified only: the layer shell has
+  not been run against a compositor. First run is on a device; the things most likely to be
+  wrong are integer-only scale (soft text at 2.5×) and the map/unmap sequence on KWin.
 
 ## The state bug that hid every experimental keyboard (fixed)
 
