@@ -2578,3 +2578,30 @@ one that misleads.
 Re-run `orphan_check.py --functions` after this; the scene-kit/logscope pairs
 should be gone from its output, which is the independent check that the
 de-duplication actually landed.
+
+
+## 81. dandere2x tile seams: pad raised, blending is the real fix
+
+Black seams at tile boundaries on ESRGAN footage. Cause is zero-padded convs
+(`pad: 1` throughout the RRDB/SRVGG bodies): at a tile's feature-space edge the
+convolutions read zeros and a dark band grows inward ~1px per conv layer.
+`pre_pad` was 8 against a body dozens of convs deep.
+
+Raised to 32, exposed as `D2X_TILE_PAD` (0..128), with a test pinning
+pad >= conv-stack depth.
+
+**Still the right fix: overlapping tiles with feathered blending.** Raising
+the pad moves the contaminated band out of the crop for typical content; it
+cannot remove it, because the receptive field is genuinely hundreds of pixels.
+The shape:
+  - step tiles by `tile - overlap` instead of `tile`;
+  - write with a cosine/linear ramp across the overlap instead of a hard crop;
+  - `write_output_rgba8` becomes accumulate-and-normalise rather than copy.
+That is a contained change to `tiles()` and `write_output_rgba8` and it makes
+`pre_pad` a quality knob rather than a correctness one.
+
+**Method note.** The old value was justified by a real measurement ("~1 LSB
+interior error, measured in tests") taken on synthetic content. The lesson is
+not that the measurement was sloppy — it is that a tiling artefact is
+content-dependent, so smooth test material cannot validate it. Any future
+change here needs a high-frequency fixture, and there is currently none.
