@@ -55,6 +55,50 @@ pub fn plan(turns: &[(String, String)], keep_recent: usize, ratio: f32) -> Plan 
     }
 }
 
+/// Below this many folded tokens, compaction cannot pay for itself.
+///
+/// Folding costs a whole generation — a prompt, a decode, and the operator's
+/// attention. Recovering a few hundred tokens is not worth that, and recovering
+/// seven is absurd.
+pub const MIN_FOLD_TOKENS: usize = 400;
+
+impl Plan {
+    /// Is this fold worth a round trip?
+    ///
+    /// The turn-count guard at the call sites (`turns.len() < 2`) counts the
+    /// wrong thing. A two-turn conversation passes it, folds one turn, and a
+    /// field report shows the result: a single seven-token user message
+    /// ("add a new theme bright pink") staged for compaction with
+    /// "Target: about 6 tokens" — a full generation to save one token, on a
+    /// conversation with no history to speak of.
+    ///
+    /// What matters is the SAVING, not the number of turns. Refuse when there
+    /// is too little folded to bother with, or when the plan does not actually
+    /// shrink anything.
+    pub fn worth_doing(&self) -> bool {
+        self.fold > 0
+            && self.folded_tokens >= MIN_FOLD_TOKENS
+            && self.after_tokens < self.before_tokens
+    }
+
+    /// Why not, for the operator. `None` when it is worth doing.
+    pub fn refusal(&self) -> Option<String> {
+        if self.worth_doing() { return None; }
+        if self.fold == 0 {
+            return Some("compaction: nothing to fold — every turn is being kept".into());
+        }
+        if self.folded_tokens < MIN_FOLD_TOKENS {
+            return Some(format!(
+                "compaction: only {} token(s) of history to fold (floor {MIN_FOLD_TOKENS}) — \
+a generation to save that much costs more than it recovers",
+                self.folded_tokens));
+        }
+        Some(format!(
+            "compaction: this plan does not shrink anything ({} → {} tokens)",
+            self.before_tokens, self.after_tokens))
+    }
+}
+
 /// The compaction instruction handed to the model (student == teacher) over the folded span.
 pub const TEACHER_PROMPT: &str = "\
 You are compacting your own prior context. Rewrite the conversation below into a single, dense briefing that \
@@ -247,5 +291,62 @@ mod request_tests {
         let (keep, ratio) = plan_for_request(&[], 1000, 4096, 512);
         assert_eq!(keep, 0);
         assert!(ratio > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod worth_doing_tests {
+    use super::*;
+
+    #[test]
+    fn the_field_case_is_refused() {
+        // "add a new theme bright pink" alone, plus one reply. The turn-count
+        // guard let this through and staged "Target: about 6 tokens".
+        let turns = vec![
+            ("user".to_string(), "add a new theme bright pink".to_string()),
+            ("assistant".to_string(), "Sure.".to_string()),
+        ];
+        let p = plan(&turns, 4, 0.3);
+        assert!(!p.worth_doing(), "{p:?}");
+        let why = p.refusal().expect("a refusal must explain itself");
+        assert!(why.contains("token(s) of history"), "{why}");
+    }
+
+    #[test]
+    fn a_real_conversation_is_still_compacted() {
+        // The guard must not become a blanket refusal — that would trade a
+        // silly compaction for no compaction at all.
+        let turns: Vec<(String, String)> = (0..12)
+            .map(|i| ((if i % 2 == 0 { "user" } else { "assistant" }).to_string(),
+                      "word ".repeat(200)))
+            .collect();
+        let p = plan(&turns, 4, 0.3);
+        assert!(p.worth_doing(), "{p:?}");
+        assert!(p.refusal().is_none());
+        assert!(p.after_tokens < p.before_tokens);
+    }
+
+    #[test]
+    fn a_plan_that_does_not_shrink_is_refused_even_when_large() {
+        // ratio clamps at 0.9, so a fold can approach break-even. If it ever
+        // reaches it, spending a generation is pure loss.
+        let turns: Vec<(String, String)> = (0..6)
+            .map(|_| ("user".to_string(), "word ".repeat(300)))
+            .collect();
+        let p = plan(&turns, 4, 0.9);
+        // large enough to clear the floor, so only the shrink test can refuse it
+        assert!(p.folded_tokens >= MIN_FOLD_TOKENS);
+        assert_eq!(p.worth_doing(), p.after_tokens < p.before_tokens);
+    }
+
+    #[test]
+    fn every_refusal_names_a_number_the_operator_can_act_on() {
+        let turns = vec![
+            ("user".to_string(), "hi".to_string()),
+            ("assistant".to_string(), "hello".to_string()),
+        ];
+        let why = plan(&turns, 4, 0.3).refusal().unwrap();
+        assert!(why.chars().any(|c| c.is_ascii_digit()),
+            "a refusal with no number tells the operator nothing: {why}");
     }
 }

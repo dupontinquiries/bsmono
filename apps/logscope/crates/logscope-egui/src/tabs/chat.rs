@@ -7617,6 +7617,11 @@ an empty result set: nothing was searched.");
                 else {
                     let ratio = arg.trim().parse::<f32>().ok().filter(|r| *r > 0.0 && *r < 1.0).unwrap_or(0.3);
                     let plan = crate::refresh::plan(&turns, 4, ratio);
+                    // Guard on the SAVING, not the turn count. `turns.len() < 2`
+                    // above lets a two-turn chat fold one turn: a field report
+                    // shows a seven-token message staged with "Target: about 6
+                    // tokens", i.e. a whole generation to recover nothing.
+                    if let Some(why) = plan.refusal() { self.note = why; return; }
                     let folded: Vec<(String, String)> = turns[..plan.fold].to_vec();
                     self.input = crate::refresh::teacher_turn(&folded, plan.target_tokens);
                     self.note = format!(
@@ -10077,6 +10082,12 @@ dense briefing that replaces them as the working context, then carry on with roo
                     &turns, keep_tokens, self.ctx.n_ctx as usize,
                     crate::refresh::REPLY_FLOOR);
                 let plan = crate::refresh::plan(&turns, keep, ratio);
+                // Same guard as the :compact path. The engine asking for room
+                // does not make a pointless fold worth doing — if there is too
+                // little history to recover, say so rather than staging a
+                // generation that cannot help.
+                if let Some(why) = plan.refusal() { self.note = why; }
+                else {
                 let folded: Vec<(String, String)> = turns[..plan.fold].to_vec();
                 self.input = crate::refresh::teacher_turn(&folded, plan.target_tokens);
                 self.note = format!(
@@ -10084,6 +10095,7 @@ dense briefing that replaces them as the working context, then carry on with roo
 recent → context {}→{} tok (−{:.0}%). Send it; the briefing becomes the working context.",
                     plan.fold, plan.target_tokens, plan.keep, plan.before_tokens, plan.after_tokens,
                     plan.ratio_saved() * 100.0);
+                }
             }
         }
         if do_checkpoint { self.checkpoint(format!("manual · {} msgs", self.msgs.len())); }
