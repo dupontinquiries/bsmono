@@ -84,8 +84,39 @@ moved.
   doesn't host an assistant subsystem yet, so there's no port-side page for it. Not "the panel
   isn't built" — the panel exists; this one section is deliberately withheld rather than
   offering a control that does nothing.
-- **Platform placement** — layer-shell anchoring, exclusive zone, focus-follows behaviour.
-  This is eframe/winit territory rather than a UI port, and belongs with the on-device work.
+- **Layer-shell placement** — the GTK build docks itself with gtk4-layer-shell. eframe/winit
+  gives its surface the xdg_toplevel role, so this shell cannot. What exists instead
+  (`platform.rs`): the host obligations are decided once as `Placement` data — on Wayland a
+  **ruled toplevel** (no decorations; `scripts/plasma-setup.sh` writes the KWin rule that forces
+  no-focus / keep-above / bottom-edge geometry), elsewhere floating — and the status strip says
+  which. Show/hide is one map/unmap of a fixed-size window, with the motion INSIDE the board
+  (`reveal_*`), so a tiling compositor sees one relayout per show rather than a per-frame resize.
+  The `Placement::LayerShell` arm and `Feel::frame(&egui::Context)` are the seam for a shell that
+  owns its own layer surface (sctk + egui_glow); that shell is not written. Phosh/Sway users get
+  the floating window until it is.
+
+## The state bug that hid every experimental keyboard (fixed)
+
+`paint_key`'s glass branch (the "system" palette, which is `Board::new()`'s default) painted the
+key and `return`ed on `resp.clicked()`. Everything after it — the compass widget, the
+hairpin/rotation classifier, hold-variants, the steno token path — was unreachable under the
+default palette, so every cardinal AND steno key was a plain click. The classifier, the widget
+maths and the layout tables all passed their tests throughout; no test pressed a key and looked
+at what came out. `paint_key` is now `paint_key_face` (looks) + `dispatch_key` (meaning) with no
+early return, and `swipe_delivery_tests` in `lib.rs` drives synthetic pointer events through a
+real `egui::Context` into `keyboard_ui`. The compass widget itself had a second bug — it
+measured direction from the key's centre rather than the press point (fixed in uikit-egui, with
+the committed direction now taken from the farthest reach, FlickBoard-style). Both are headless-
+verified only; the steno board has still never been stroked on a device.
+
+## Wayland without GTK (fixed)
+
+The `wayland` feature depended on the GTK crate (`rusty-board/wayland` → `gdk-integration` +
+`gtk4-layer-shell`), and `board-compositor`'s own `wayland` feature called GLib without
+declaring it. Both are gone: the feature points at `board-compositor/wayland`, the backend
+exposes `pump()` which `wayland.rs` calls per frame, and KWin's inherited `WAYLAND_SOCKET` is
+captured by the binary before eframe connects (`platform::capture_inherited_socket`). Verified
+by `cargo check --bins --features wayland` in a sandbox with no GTK.
 
 ## The one open decision: the GTK side of `board-gestures`
 
