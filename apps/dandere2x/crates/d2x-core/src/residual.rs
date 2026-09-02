@@ -42,10 +42,27 @@ pub fn make_residual(next_original: &Frame, plan: &FramePlan, bleed: u32) -> Res
     let dim = plan.stats.residual_dim;
     debug_assert_eq!(dim, FramePlan::residual_dim_for(plan.residuals.len()));
 
-    // Black beyond the frame edge, as upstream. (Replicate would arguably be
-    // kinder to the CNN, but the merge never reads the bleed ring back, so
-    // it only affects the ring's influence on the block — keep parity.)
-    let padded = next_original.padded(bleed, Pad::Black);
+    // REPLICATE, not black. The old comment argued for black on the grounds
+    // that "the merge never reads the bleed ring back, so it only affects the
+    // ring's influence on the block". That reasoning is backwards, and it is
+    // the cause of the reported seams.
+    //
+    // The bleed ring is not decoration — it is the CONTEXT the CNN sees around
+    // each residual block, and the network's receptive field carries that
+    // context inward. Filling it with black darkens the block's own outer
+    // pixels, which the merge very much does read back. Not reading the ring
+    // itself is irrelevant; the damage is already inside the block.
+    //
+    // The observation that identified this: the dark lines MOVE WITH THE
+    // CAMERA and grow and shrink with motion locality. CNN tiles are a fixed
+    // grid and cannot do that. Residual blocks are chosen by the block matcher
+    // and therefore follow motion — so a per-block edge artefact is the only
+    // thing that behaves this way, which rules out the CNN tiling I had
+    // assumed and points here.
+    //
+    // Replicate makes the ring an extension of the block's own content, so the
+    // CNN sees a plausible continuation instead of a cliff to zero.
+    let padded = next_original.padded(bleed, Pad::Replicate);
     let mut out = Frame::new(dim * cell, dim * cell);
     for rv in &plan.residuals {
         // In padded coordinates the block starts at (frame_x + bleed); the
@@ -204,5 +221,53 @@ mod tests {
         assert_eq!(make_residual(&prev, &plan, 1), Residual::None);
         let up = NearestUpscaler { scale: 2 }.upscale(&prev).unwrap();
         assert_eq!(merge(&up, None, &plan, 2, 1).unwrap(), up);
+    }
+}
+
+#[cfg(test)]
+mod bleed_ring_tests {
+    use super::*;
+    use crate::frame::Frame;
+
+    /// The bleed ring must continue the block's content, not cut to black.
+    ///
+    /// This was `Pad::Black`, justified by "the merge never reads the bleed
+    /// ring back". That is true and irrelevant: the ring is the CONTEXT the
+    /// CNN sees, and its receptive field carries a black cliff INWARD, so the
+    /// block's own outer pixels — which the merge does read — come back dark.
+    ///
+    /// The symptom is specific and worth recording, because it is what
+    /// distinguishes this from CNN tile-grid artefacts: the dark lines move
+    /// with the camera and grow and shrink with motion locality. A CNN tile
+    /// grid is fixed and cannot do that; residual blocks are chosen by the
+    /// block matcher and follow motion.
+    #[test]
+    fn the_bleed_ring_continues_the_image_rather_than_going_black() {
+        // A bright frame, so "black bleed" is unmistakable in the packed cell.
+        let (w, h) = (64u32, 64u32);
+        let mut f = Frame::new(w, h);
+        for y in 0..h { for x in 0..w { f.set_px(x, y, [220, 210, 200]); } }
+
+        let bleed = 4u32;
+        let padded = f.padded(bleed, Pad::Replicate);
+        // The ring immediately outside the frame must carry the frame's value.
+        let px = padded.px(0, bleed + 1);
+        assert_eq!(px, [220, 210, 200],
+            "the bleed ring went to {px:?} instead of continuing the image");
+        let px2 = padded.px(bleed + 1, 0);
+        assert_eq!(px2, [220, 210, 200], "top ring: {px2:?}");
+    }
+
+    #[test]
+    fn a_black_ring_would_be_visibly_different() {
+        // Guards the test above from passing vacuously: if `Pad::Black` and
+        // `Pad::Replicate` produced the same thing here, the assertion proves
+        // nothing.
+        let mut f = Frame::new(32, 32);
+        for y in 0..32 { for x in 0..32 { f.set_px(x, y, [220, 210, 200]); } }
+        let black = f.padded(4, Pad::Black);
+        let repl = f.padded(4, Pad::Replicate);
+        assert_ne!(black.px(0, 5), repl.px(0, 5),
+            "the two padding modes are indistinguishable — this test cannot detect a regression");
     }
 }
