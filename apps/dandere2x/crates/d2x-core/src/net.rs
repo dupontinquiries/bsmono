@@ -609,6 +609,26 @@ impl Network {
         }
     }
 
+    /// Write a tile given as packed RGBA8 for the *full* output region
+    /// (`scale × region`, what the GPU pack pass produces), cropping to the
+    /// tile. Shuffle and skip have already been applied.
+    pub fn write_output_rgba8(&self, out: &mut Frame, io: TileIo, rgba: &[u8]) {
+        let s = self.scale as usize;
+        // Same-pad nets emit the whole region; valid nets emit exactly the tile.
+        let (ow, oh) = if self.exact { (io.rect.w as usize * s, io.rect.h as usize * s) } else { (io.region_w as usize * s, io.region_h as usize * s) };
+        assert_eq!(rgba.len(), ow * oh * 4, "packed tile size");
+        let (cw, ch) = (io.rect.w as usize * s, io.rect.h as usize * s);
+        for y in 0..ch {
+            let sy = y + io.crop_y as usize;
+            let base = out.idx(io.rect.x * s as u32, io.rect.y * s as u32 + y as u32);
+            for x in 0..cw {
+                let sx = x + io.crop_x as usize;
+                let i = (sy * ow + sx) * 4;
+                out.data[base + x * 3..base + x * 3 + 3].copy_from_slice(&rgba[i..i + 3]);
+            }
+        }
+    }
+
     /// Whole-frame upscale on the CPU, tiled. The oracle and the no-GPU fallback.
     pub fn upscale_cpu(&self, frame: &Frame, tile: u32) -> Frame {
         let padded = self.pad_frame(frame);

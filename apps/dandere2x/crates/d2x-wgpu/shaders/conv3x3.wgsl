@@ -1,19 +1,23 @@
-// Valid 3x3 convolution + LeakyReLU(0.1), planar f32 in and out.
+// 3x3 convolution over planar f32 channels, same or valid padding, with the
+// source optionally read as nearest-upsampled x2 (in_scale), a fused
+// residual (out = acc*res_scale + residual), and a fused activation
+// (none / LeakyReLU / per-channel PReLU). Writes channels
+// [dst_off, dst_off+out_ch) of the output buffer, so dense concatenation is
+// a channel offset and never a copy.
 //
 // Each invocation produces a 2x2 patch of output pixels for 4 output
-// channels (one vec4 per pixel). Per input channel it loads a 4x4 input
-// patch (16 scalars) and 9 vec4 weights and performs 36 vec4 FMAs — about
-// 2.2x the arithmetic per byte of a one-pixel-per-thread kernel, with no
-// workgroup memory (which on AGX costs occupancy — see ASAHI_GPU.md).
+// channels: per input channel it loads a 4x4 input patch and 9 vec4
+// weights and does 36 vec4 FMAs. No workgroup memory (AGX occupancy), no
+// dynamic shifts (Honeykrisp K2), no subgroup ops.
 //
 // Layouts:
-//   input   [ic][y][x]            f32
-//   weights [oc/4][ic][ky][kx]    vec4 = (oc+0, oc+1, oc+2, oc+3)
-//   bias    [oc/4]                vec4
-//   output  [oc][y][x]            f32
-//
-// No dynamic shifts anywhere (K2 hazard on Honeykrisp); the only divisions
-// are by constants.
+//   input     [ic][y][x]            f32   (read_write: a dense block reads and
+//                                          writes disjoint ranges of one buffer)
+//   weights   [oc/4][ic][ky][kx]    vec4
+//   bias      [oc/4]                vec4
+//   output    [oc][y][x]            f32
+//   prelu     [oc/4]                vec4  (slopes; only read when act == 2)
+//   residual  [oc][y][x]            f32   (only read when has_res == 1)
 
 struct Params {
     in_w: u32,
@@ -22,20 +26,55 @@ struct Params {
     out_ch4: u32,
     out_w: u32,
     out_h: u32,
-    _pad0: u32,
-    _pad1: u32,
+    in_scale: u32,
+    pad: u32,
+    dst_off: u32,
+    act: u32,
+    has_res: u32,
+    _p0: u32,
+    slope: f32,
+    res_scale: f32,
+    _p1: f32,
+    _p2: f32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read_write> input: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read> bias: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
+@group(0) @binding(5) var<storage, read> prelu: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> residual: array<f32>;
 
-const SLOPE: f32 = 0.1;
+// Source sample at virtual (upsampled) coordinates; zero outside.
+fn load(ic_base: u32, sy: i32, sx: i32) -> f32 {
+    let vw = i32(p.in_w * p.in_scale);
+    let vh = i32(p.in_h * p.in_scale);
+    if (sx < 0 || sy < 0 || sx >= vw || sy >= vh) {
+        return 0.0;
+    }
+    var x = u32(sx);
+    var y = u32(sy);
+    if (p.in_scale == 2u) {
+        x = x / 2u;
+        y = y / 2u;
+    }
+    return input[ic_base + y * p.in_w + x];
+}
 
-fn leaky(v: vec4<f32>) -> vec4<f32> {
-    return select(v * SLOPE, v, v >= vec4<f32>(0.0));
+fn epilogue(acc: vec4<f32>, oc4: u32, idx: u32, out_plane: u32) -> vec4<f32> {
+    var v = acc;
+    if (p.has_res == 1u) {
+        let rb = (oc4 * 4u) * out_plane + idx;
+        let r = vec4<f32>(residual[rb], residual[rb + out_plane], residual[rb + 2u * out_plane], residual[rb + 3u * out_plane]);
+        v = v * p.res_scale + r;
+    }
+    if (p.act == 1u) {
+        v = select(v * p.slope, v, v >= vec4<f32>(0.0));
+    } else if (p.act == 2u) {
+        v = select(v * prelu[oc4], v, v >= vec4<f32>(0.0));
+    }
+    return v;
 }
 
 fn store4(base: u32, plane: u32, v: vec4<f32>) {
@@ -53,12 +92,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (ox >= p.out_w || oy >= p.out_h || oc4 >= p.out_ch4) {
         return;
     }
-    // Edge patches may be 1 pixel wide/high; compute all four and store
-    // only what exists (reads are clamped to stay in the input).
     let has_x1 = (ox + 1u) < p.out_w;
     let has_y1 = (oy + 1u) < p.out_h;
-    let xw = select(0u, 1u, has_x1);
-    let yw = select(0u, 1u, has_y1);
 
     let b = bias[oc4];
     var a00 = b;
@@ -68,26 +103,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let in_plane = p.in_w * p.in_h;
     var wi = oc4 * p.in_ch * 9u;
+    // Top-left source coordinate of the 4x4 patch.
+    let sx0 = i32(ox) - i32(p.pad);
+    let sy0 = i32(oy) - i32(p.pad);
 
     for (var ic = 0u; ic < p.in_ch; ic = ic + 1u) {
-        let r0 = ic * in_plane + oy * p.in_w + ox;
-        let r1 = r0 + p.in_w;
-        let r2 = r1 + p.in_w;
-        let r3 = r2 + p.in_w * yw;   // clamped when the patch is 1 high
-        let x3 = 2u + xw;            // clamped when the patch is 1 wide
-
-        // 4x4 input patch.
-        let i00 = input[r0]; let i01 = input[r0 + 1u]; let i02 = input[r0 + 2u]; let i03 = input[r0 + x3];
-        let i10 = input[r1]; let i11 = input[r1 + 1u]; let i12 = input[r1 + 2u]; let i13 = input[r1 + x3];
-        let i20 = input[r2]; let i21 = input[r2 + 1u]; let i22 = input[r2 + 2u]; let i23 = input[r2 + x3];
-        let i30 = input[r3]; let i31 = input[r3 + 1u]; let i32 = input[r3 + 2u]; let i33 = input[r3 + x3];
+        let ib = ic * in_plane;
+        let i00 = load(ib, sy0, sx0);      let i01 = load(ib, sy0, sx0 + 1);      let i02 = load(ib, sy0, sx0 + 2);      let i03 = load(ib, sy0, sx0 + 3);
+        let i10 = load(ib, sy0 + 1, sx0);  let i11 = load(ib, sy0 + 1, sx0 + 1);  let i12 = load(ib, sy0 + 1, sx0 + 2);  let i13 = load(ib, sy0 + 1, sx0 + 3);
+        let i20 = load(ib, sy0 + 2, sx0);  let i21 = load(ib, sy0 + 2, sx0 + 1);  let i22 = load(ib, sy0 + 2, sx0 + 2);  let i23 = load(ib, sy0 + 2, sx0 + 3);
+        let i30 = load(ib, sy0 + 3, sx0);  let i31 = load(ib, sy0 + 3, sx0 + 1);  let i32 = load(ib, sy0 + 3, sx0 + 2);  let i33 = load(ib, sy0 + 3, sx0 + 3);
 
         let w00 = weights[wi];      let w01 = weights[wi + 1u]; let w02 = weights[wi + 2u];
         let w10 = weights[wi + 3u]; let w11 = weights[wi + 4u]; let w12 = weights[wi + 5u];
         let w20 = weights[wi + 6u]; let w21 = weights[wi + 7u]; let w22 = weights[wi + 8u];
         wi = wi + 9u;
 
-        // Same summation order as the CPU reference: rows, then columns.
         a00 = a00 + w00 * i00 + w01 * i01 + w02 * i02
                   + w10 * i10 + w11 * i11 + w12 * i12
                   + w20 * i20 + w21 * i21 + w22 * i22;
@@ -103,15 +134,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let out_plane = p.out_w * p.out_h;
-    let o00 = (oc4 * 4u) * out_plane + oy * p.out_w + ox;
-    store4(o00, out_plane, leaky(a00));
+    let idx00 = oy * p.out_w + ox;
+    let obase = (p.dst_off + oc4 * 4u) * out_plane;
+    store4(obase + idx00, out_plane, epilogue(a00, oc4, idx00, out_plane));
     if (has_x1) {
-        store4(o00 + 1u, out_plane, leaky(a01));
+        store4(obase + idx00 + 1u, out_plane, epilogue(a01, oc4, idx00 + 1u, out_plane));
     }
     if (has_y1) {
-        store4(o00 + p.out_w, out_plane, leaky(a10));
+        let idx10 = idx00 + p.out_w;
+        store4(obase + idx10, out_plane, epilogue(a10, oc4, idx10, out_plane));
         if (has_x1) {
-            store4(o00 + p.out_w + 1u, out_plane, leaky(a11));
+            store4(obase + idx10 + 1u, out_plane, epilogue(a11, oc4, idx10 + 1u, out_plane));
         }
     }
 }
