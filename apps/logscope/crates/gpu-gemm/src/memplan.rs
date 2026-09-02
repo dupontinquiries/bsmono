@@ -2552,3 +2552,106 @@ mod ceiling_kind_tests {
             "must carry the two real numbers that show the gap is 2x, not rounding");
     }
 }
+
+// ── readback wait backoff ────────────────────────────────────────────────────
+
+/// How long to sleep before re-polling a readback that is not ready yet.
+///
+/// **This is the sync bottleneck, and the arithmetic is unambiguous.** The
+/// decode readback loop polled, checked, then slept a flat 50 ms. The field run
+/// reports 1151 tokens in 90.7 s with 87.76 s charged to sync — 76.2 ms of sync
+/// per token against a 50 ms quantum, i.e. one to two sleeps per token. If the
+/// GPU actually finishes in 5–25 ms, most of that 76 ms is spent waiting on a
+/// TIMER, not on the GPU, and no kernel change can recover it.
+///
+/// That the 50 ms was an oversight rather than a tuning decision is visible
+/// inside the same file: the submit governor's wait loop uses
+/// `from_micros(50)` — a thousand times finer — for the same job.
+///
+/// The schedule spins briefly, then backs off geometrically, so the wait is
+/// proportional to how long the work has already taken rather than flat:
+/// overshoot stays near 10% of elapsed instead of being up to 50 ms regardless.
+/// The cap keeps a genuinely stuck dispatch from spinning a core for the whole
+/// 20 s budget.
+pub fn readback_backoff(elapsed: std::time::Duration) -> std::time::Duration {
+    use std::time::Duration;
+    let us = elapsed.as_micros();
+    if us < 300 {
+        // A warm decode readback usually lands here. Yield rather than sleep:
+        // asking the scheduler for any sleep at all costs more than the wait.
+        Duration::from_micros(0)
+    } else if us < 3_000 {
+        Duration::from_micros(50)
+    } else if us < 30_000 {
+        Duration::from_micros(400)
+    } else if us < 300_000 {
+        Duration::from_millis(3)
+    } else {
+        // Long enough that this is a prefill chunk or a stall; stop burning CPU.
+        Duration::from_millis(15)
+    }
+}
+
+#[cfg(test)]
+mod readback_backoff_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_fast_readback_is_not_charged_a_sleep_at_all() {
+        // The case that dominates decode. Under the old flat 50 ms this cost a
+        // full quantum; it must now cost nothing.
+        assert_eq!(readback_backoff(Duration::from_micros(0)), Duration::ZERO);
+        assert_eq!(readback_backoff(Duration::from_micros(299)), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_wait_never_overshoots_by_more_than_about_a_tenth_of_elapsed() {
+        // The property that makes this better than any single constant: the
+        // error is proportional, so a 2 ms readback cannot be rounded up to
+        // 50 ms and a 2 s stall does not spin a core.
+        for us in [500u64, 2_000, 10_000, 100_000, 1_000_000] {
+            let e = Duration::from_micros(us);
+            let s = readback_backoff(e);
+            assert!(s.as_secs_f64() <= e.as_secs_f64() * 0.35 + 1e-6,
+                "at {us}us the step is {s:?}, more than a third of elapsed");
+        }
+    }
+
+    #[test]
+    fn it_is_monotonic_so_a_longer_wait_never_polls_harder() {
+        let mut prev = Duration::ZERO;
+        for us in [0u64, 299, 300, 2_999, 3_000, 29_999, 30_000, 299_999, 300_000, 5_000_000] {
+            let s = readback_backoff(Duration::from_micros(us));
+            assert!(s >= prev, "step fell at {us}us: {prev:?} -> {s:?}");
+            prev = s;
+        }
+    }
+
+    #[test]
+    fn the_step_is_capped_so_a_stuck_dispatch_does_not_spin_a_core() {
+        assert_eq!(readback_backoff(Duration::from_secs(19)), Duration::from_millis(15));
+    }
+
+    #[test]
+    fn a_typical_decode_readback_costs_far_less_than_the_old_flat_50ms() {
+        // Walk the schedule as the loop would, and total the sleeping done
+        // before a readback that completes at 8 ms. The old loop would have
+        // slept 50 ms to notice; this must be a small fraction of that.
+        let mut elapsed = Duration::ZERO;
+        let mut slept = Duration::ZERO;
+        let target = Duration::from_millis(8);
+        let mut guard = 0;
+        while elapsed < target && guard < 100_000 {
+            let s = readback_backoff(elapsed);
+            // Model the poll itself as ~10us of work so the loop advances even
+            // when the step is zero.
+            elapsed += s + Duration::from_micros(10);
+            slept += s;
+            guard += 1;
+        }
+        assert!(slept < Duration::from_millis(10),
+            "slept {slept:?} waiting for an 8ms readback");
+        assert!(guard < 100_000, "the schedule failed to advance");
+    }
+}

@@ -2578,11 +2578,31 @@ line: {head:?}. Compiler: {e}");
         // Polling in bounded steps turns it into a diagnosable failure. The GPU is not going to
         // finish; the only question is whether anyone finds out.
         const DECODE_POLL_BUDGET_S: u64 = 20;
+        // ADAPTIVE, was a flat 50 ms sleep — and that flat step was the sync
+        // bottleneck, not the GPU.
+        //
+        // The field run: 1151 tokens in 90.7 s with 87.76 s charged to sync =
+        // 76.2 ms of sync per token against a 50 ms quantum. One to two sleeps
+        // per token, so if the readback actually lands in 5-25 ms most of that
+        // time was spent waiting on a TIMER. No kernel change can recover it,
+        // which is why the roofline verdict kept saying "the hardware is mostly
+        // idle and the limit is dispatch, submit or sync overhead".
+        //
+        // That the 50 ms was an oversight and not a decision is visible in this
+        // same file: the submit governor's wait loop uses `from_micros(50)` for
+        // the same job, a thousand times finer.
+        //
+        // `readback_backoff` spins for the first 300 us (where a warm decode
+        // readback lands, and where asking for any sleep costs more than the
+        // wait), then backs off geometrically so overshoot stays proportional
+        // instead of being up to 50 ms regardless. The cap stops a genuinely
+        // stuck dispatch from spinning a core for the full budget below.
         let mut waited = std::time::Duration::ZERO;
-        let step = std::time::Duration::from_millis(50);
+        let t_wait = std::time::Instant::now();
         loop {
             let _ = self.device.poll(wgpu::PollType::Poll);
             if mapped.load(std::sync::atomic::Ordering::Acquire) { break; }
+            let step = crate::memplan::readback_backoff(t_wait.elapsed());
             if waited.as_secs() >= DECODE_POLL_BUDGET_S {
                 eprintln!("wgpu-engine: decode readback did not complete within \
 {DECODE_POLL_BUDGET_S}s — the GPU has almost certainly had this dispatch killed by its watchdog \
@@ -2590,8 +2610,11 @@ line: {head:?}. Compiler: {e}");
 waiting longer will not help because the work is gone");
                 break;
             }
-            std::thread::sleep(step);
-            waited += step;
+            // A zero step means "spin": yield so a single-core box still makes
+            // progress, but do not pay the scheduler for a sleep we do not want.
+            if step.is_zero() { std::hint::spin_loop(); std::thread::yield_now(); }
+            else { std::thread::sleep(step); }
+            waited = t_wait.elapsed();
         }
         GPU_SYNC_NS.fetch_add(t_sync.elapsed().as_nanos() as u64,
                               std::sync::atomic::Ordering::Relaxed);
