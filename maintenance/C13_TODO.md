@@ -2402,3 +2402,24 @@ the options are:
 scene-kit's copy to `lux::sky_at` across ten hours, so they cannot drift
 silently — a drift would otherwise appear only as the scene and the panels
 disagreeing about the time of day.
+
+
+## 74. §73 closed — the sun curve is in one place
+
+`math_kit::daylight` is canonical; `uikit_egui::lux` re-exports it and
+`scene_kit::mesh3d::sun_clock_at` delegates. Both gained a path dep on a crate
+with an empty `[dependencies]`, so neither pays for it.
+
+The general shape, worth reusing: when N crates need one small pure function
+and none can sensibly depend on another, the answer is a dependency-free crate
+that all of them can take — not picking a winner among the existing ones. The
+alternatives here were scene-kit depending on the whole UI kit, or uikit
+depending on the scene renderer; both are heavier than moving nine lines.
+
+**Still open from §73:** `mesh3d` itself is a migration candidate, not a
+divergence — scene-kit's public surface is a strict superset of
+logscope-egui's (48 shared, 5 extra, 0 unique). Same terms as
+`spatial`/`textsurface`. And the other three modules §18 dismissed
+(`gpuscene`, `texgen`, `glow_scene`) should be re-measured the same way:
+compare the PUBLIC SURFACE, not the diff-line count, which was what made §18
+wrong about mesh3d.
