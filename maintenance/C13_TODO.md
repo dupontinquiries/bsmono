@@ -2836,3 +2836,34 @@ If captions still overlap, the placer is not the problem — check that
 `label_fade > 0.02` is not admitting far more labels than the ladder's eight
 candidate offsets can seat, in which case the fix is a tighter fade gate or
 more offsets, not different geometry.
+
+
+## 90. §65 closed — only logscope had the unowned-drag bug
+
+aperture, voiceterm and studio never needed the fix. Their global pointer
+reads are camera-follow suppression; their swipes are widget-scoped;
+`response.drag_delta()` is owned by construction. §65 inferred otherwise from
+`pager::` having one consumer.
+
+`egui_chrome_audit.py --drags` now finds the class by reading. Verified both
+ways: 0 on the current tree, 1 when logscope's guard is removed.
+
+**Three consecutive items now (§87 x2, §90) have been already-correct, and all
+three were written by inference rather than measurement.** The tell is a TODO
+that reasons from an adjacent fact — "X has one consumer, therefore Y",
+"the reference looks different, therefore Z". Each cost a full investigation
+to close.
+
+Going forward, entries in this file should either carry the measurement that
+motivated them, or say plainly that they are a hypothesis. The ones that did
+carry measurements (§75's three-way module comparison, §79's content ratios,
+the 134% accounting) all held up and led somewhere.
+
+**Still genuinely open, measured:**
+- §67-1 setup at 32% of wall time — blocked on reading the new thread-count
+  line from a real run.
+- §63 compaction staging — a design question, not a defect.
+- §72's duplications: bo-controller/bo-mux `passby_canceller` (9 shared
+  names), bot-arena `fsm.rs` vs its doc copy (7). Both found by the function
+  audit, so both are measured rather than inferred.
+- dandere2x CPU-path blending, and the missing high-frequency fixture.
