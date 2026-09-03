@@ -131,7 +131,11 @@ impl Engine {
                     // climb the frequency ranking.
                     if let Some(u) = self.sink.last_unit() {
                         let u = u.to_string();
-                        self.syms.merge_source(&u);
+                        // merge_identifiers, not merge_source: feeding
+                        // our own prose back in taught the table that
+                        // "state" is an identifier, which then beat the
+                        // buffer's `State` in path position.
+                        self.syms.merge_identifiers(&u);
                     }
                 }
                 changed
@@ -292,6 +296,148 @@ mod tests {
         fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
             &xs[(self.next() % xs.len() as u64) as usize]
         }
+    }
+
+    /// Realistic dictation, expectations written BEFORE running.
+    ///
+    /// Everything else in this repo tests correctness — that a function
+    /// does what it says. This measures QUALITY: does dictating a real
+    /// line of Rust actually produce that line? The first run scored
+    /// 6/10, and the four failures were worth more than the six passes:
+    /// single-word symbol resolution turning "path" into `Path`,
+    /// numerals shredding "f sixty four" into `f 60 4`, and the engine
+    /// poisoning its own symbol table with its own prose.
+    ///
+    /// Expectations are written first and NOT adjusted to match output,
+    /// or this becomes a change-detector instead of a measurement. When
+    /// a case here is genuinely unreasonable to expect, delete it and
+    /// say why — do not weaken it.
+    #[test]
+    fn realistic_dictation_fixtures() {
+        struct Case {
+            name: &'static str,
+            buf: &'static str,
+            mode: Mode,
+            say: &'static [&'static str],
+            want: &'static str,
+        }
+        let cases: &[Case] = &[
+            Case {
+                name: "let binding with call",
+                buf: "fn read_to_string(p:&Path)->Result<String>{}\n",
+                mode: Mode::Code,
+                say: &["let raw equals read to string open paren path close paren question mark semicolon"],
+                want: "let raw = read_to_string(path)?;",
+            },
+            Case {
+                name: "struct literal",
+                buf: "struct UserStore{max_retries:usize,timeout:u64}\n",
+                mode: Mode::Code,
+                say: &[
+                    "let store equals user store open brace",
+                    "new line", "indent",
+                    "max retries colon three comma",
+                    "new line", "timeout colon thirty comma",
+                    "new line", "dedent", "close brace semicolon",
+                ],
+                want: "let store = UserStore {\n    max_retries: 3,\n    timeout: 30,\n};",
+            },
+            Case {
+                name: "fn signature with primitive types",
+                buf: "",
+                mode: Mode::Code,
+                say: &["pub fn snake compute average open paren snake values colon ampersand open bracket close bracket f sixty four close paren arrow f sixty four open brace"],
+                want: "pub fn compute_average(values: &[] f64) -> f64 {",
+            },
+            Case {
+                name: "match arm with enum paths",
+                buf: "enum State{Idle,Running}\n",
+                mode: Mode::Code,
+                say: &[
+                    "match state open brace",
+                    "new line", "indent",
+                    "state double colon idle fat arrow zero comma",
+                    "new line", "state double colon running fat arrow one comma",
+                    "new line", "dedent", "close brace",
+                ],
+                want: "match state {\n    State::Idle => 0,\n    State::Running => 1,\n}",
+            },
+            Case {
+                name: "string literal",
+                buf: "",
+                mode: Mode::Code,
+                say: &["let name equals quote Paris quote semicolon"],
+                want: "let name = \"Paris\";",
+            },
+            Case {
+                name: "method chain",
+                buf: "fn as_str(){} fn to_owned(){}\n",
+                mode: Mode::Code,
+                say: &["let s equals raw dot as str open paren close paren dot to owned open paren close paren semicolon"],
+                want: "let s = raw.as_str().to_owned();",
+            },
+            Case {
+                name: "prose then code",
+                buf: "",
+                mode: Mode::Prose,
+                say: &[
+                    "This computes the average.",
+                    "code mode", "new line",
+                    "let n equals values dot len open paren close paren semicolon",
+                ],
+                want: "This computes the average.\nlet n = values.len();",
+            },
+            Case {
+                name: "prose paragraph",
+                buf: "",
+                mode: Mode::Prose,
+                say: &[
+                    "We tried three approaches.",
+                    "The second one worked best.",
+                    "It was faster and simpler.",
+                ],
+                want: "We tried three approaches. The second one worked best. It was faster and simpler.",
+            },
+            Case {
+                name: "repair after misrecognition",
+                buf: "fn read_to_end(){}\n",
+                mode: Mode::Code,
+                say: &[
+                    "let n equals read to string semicolon",
+                    "replace read to string with read to end",
+                ],
+                want: "let n = read_to_end;",
+            },
+            Case {
+                name: "const with screaming case",
+                buf: "",
+                mode: Mode::Code,
+                say: &["const screaming max retries colon usize equals five semicolon"],
+                want: "const MAX_RETRIES: usize = 5;",
+            },
+        ];
+
+        let mut failures = Vec::new();
+        for c in cases {
+            let mut e = Engine::new(c.buf, c.buf.len(), c.mode, Policy::default(), 40, 3);
+            let mut t = 0u64;
+            for u in c.say {
+                e.capture_start(t);
+                e.recognize(Tier::Whisper, u, 1.0, t + 300);
+                t += 1000;
+            }
+            let got = &e.text()[c.buf.len()..];
+            if got != c.want {
+                failures.push(format!("\n  {}\n    want {:?}\n    got  {:?}", c.name, c.want, got));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {} fixtures regressed:{}",
+            failures.len(),
+            cases.len(),
+            failures.join("")
+        );
     }
 
     #[test]

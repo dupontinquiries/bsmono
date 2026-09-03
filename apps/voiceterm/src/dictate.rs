@@ -384,6 +384,43 @@ pub fn spoken_code_with(text: &str, mode: Mode, syms: Option<&SymbolTable>) -> S
             }
         }
         if !matched {
+            // Rust primitive types, spoken as letter-plus-number. Bounded
+            // closed set, very high frequency, and the numeral pass would
+            // otherwise shred "f sixty four" into "f 60 4". The transform
+            // is already Rust-leaning (-> :: =>), so this is consistent
+            // rather than a new assumption.
+            let upper = 3.min(words.len() - i);
+            for len in (2..=upper).rev() {
+                let span = words[i..i + len].join(" ").to_lowercase();
+                if let Some(t) = primitive_type(&span) {
+                    toks.push(Tok::word(t));
+                    i += len;
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if !matched {
+            // Path position: a single word next to `::` is naming code,
+            // not prose, so the table may resolve it there even though
+            // bare single words are refused everywhere else.
+            if let Some(t) = syms {
+                let after_sep = toks.last().map(|p| p.text == "::").unwrap_or(false);
+                let before_sep = (1..=2.min(words.len() - i - 1)).any(|l| {
+                    words.get(i + 1..i + 1 + l).map(|w| {
+                        symbol(&w.join(" ").to_lowercase()).map(|s| s.text == "::").unwrap_or(false)
+                    }) == Some(true)
+                });
+                if after_sep || before_sep {
+                    if let Some(id) = t.resolve_path_segment(words[i]) {
+                        toks.push(Tok::word(id));
+                        i += 1;
+                        matched = true;
+                    }
+                }
+            }
+        }
+        if !matched {
             if let Some(n) = numeral(&words[i].to_lowercase()) {
                 toks.push(Tok::word(&n.to_string()));
                 i += 1;
@@ -396,6 +433,25 @@ pub fn spoken_code_with(text: &str, mode: Mode, syms: Option<&SymbolTable>) -> S
         }
     }
     join(&toks)
+}
+
+/// Spoken forms of the Rust primitive numeric types.
+fn primitive_type(span: &str) -> Option<&'static str> {
+    Some(match span {
+        "f thirty two" => "f32",
+        "f sixty four" => "f64",
+        "u eight" => "u8",
+        "u sixteen" => "u16",
+        "u thirty two" => "u32",
+        "u sixty four" => "u64",
+        "u one twenty eight" | "u128" => "u128",
+        "i eight" => "i8",
+        "i sixteen" => "i16",
+        "i thirty two" => "i32",
+        "i sixty four" => "i64",
+        "i one twenty eight" => "i128",
+        _ => return None,
+    })
 }
 
 /// Number words → digits. Code mode only, where "thirty" is far more
