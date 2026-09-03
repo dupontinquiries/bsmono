@@ -2470,6 +2470,54 @@ mod hotspot_tests {
     /// density noise is ~4 % of the column pass and all 32 768 `is_cave`
     /// calls together are under 2 ms — so this splits the column pass
     /// into its two parts and times them separately.
+    /// Split the surface/biome pass. `biome_at_3d` runs once per column
+    /// and is now the biggest remaining piece of a chunk; this times its
+    /// parts so the next change is aimed rather than guessed.
+    #[test]
+    #[ignore]
+    fn biome_pass_breakdown() {
+        use std::time::Instant;
+        let g = WorldGenerator::new(20260902);
+        let (ox, _oy, oz) = ChunkCoord::new(4, 0, 4).block_origin();
+        let cols: Vec<(i32, i32)> = (0..CHUNK_SIZE).flat_map(|lz| (0..CHUNK_SIZE).map(move |lx| (lx, lz)))
+            .map(|(lx, lz)| (ox + lx, oz + lz)).collect();
+        let rounds = 4;
+        let time = |label: &str, f: &dyn Fn() -> f64| {
+            let t = Instant::now();
+            let mut sink = 0.0f64;
+            for _ in 0..rounds { sink += f(); }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / rounds as f64;
+            println!("  {:34} {:8.2} ms   ({:7.2} us/column)  [{}]", label, ms, ms * 1000.0 / 1024.0, sink as i64);
+        };
+        println!("biome pass breakdown, one surface chunk (1024 columns):");
+        time("biome_at_3d (whole)", &|| {
+            cols.iter().map(|&(x, z)| g.biome_at_3d(x, 0, z).temperature).sum()
+        });
+        time("  model.temperature", &|| {
+            cols.iter().map(|&(x, z)| g.model.temperature(x as f64, 0.0, z as f64, 0.0)).sum()
+        });
+        time("  model.humidity", &|| {
+            cols.iter().map(|&(x, z)| g.model.humidity(x as f64, 0.0, z as f64, 0.0)).sum()
+        });
+        time("  fbm_2d erosion", &|| {
+            cols.iter().map(|&(x, z)| super::super::noise::fbm_2d(
+                x as f64 * 0.0008, z as f64 * 0.0008, g.params.seed.wrapping_add(0xE105), 2, 1.0, 1.0)).sum()
+        });
+        time("  sea_level", &|| {
+            cols.iter().map(|&(x, z)| g.model.sea_level(x as f64, z as f64, 0.0)).sum()
+        });
+        time("  continental + hills", &|| {
+            cols.iter().map(|&(x, z)| g.model.continental(x as f64, z as f64)
+                + g.model.hills(x as f64, z as f64)).sum()
+        });
+        time("  surface_y_at (shelf branch)", &|| {
+            cols.iter().map(|&(x, z)| g.surface_y_at(x, z, -60, 140).unwrap_or(0) as f64).sum()
+        });
+        time("  surface_target", &|| {
+            cols.iter().map(|&(x, z)| g.model.surface_target(x as f64, z as f64, 0.0)).sum()
+        });
+    }
+
     #[test]
     #[ignore]
     fn column_pass_breakdown() {
