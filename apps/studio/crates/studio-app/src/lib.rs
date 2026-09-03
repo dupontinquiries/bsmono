@@ -2212,7 +2212,11 @@ impl eframe::App for App {
             self.studio.key(studio_egui::keys::Key::c(ch));
         }
 
-        let colors = uikit_egui::palette_colors("midnight");
+        // ctx variant: same colours, plus the symbol fonts. studio draws a
+        // lot of glyphs and had none of them — nine files here use
+        // PaletteColors and nothing installed a font. See
+        // maintenance/tools/font_install_check.py.
+        let colors = uikit_egui::palette_colors_ctx(ctx, "midnight");
         // Whether the top bar chose Pages this frame — read by the central
         // panel below to gate over-scroll navigation. A local, not a field:
         // it is one frame's fact, recomputed from real width every time.

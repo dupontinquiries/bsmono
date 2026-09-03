@@ -136,6 +136,26 @@ pub fn palette_colors(id: &str) -> PaletteColors {
         .unwrap_or_else(|| snapclone_theme::PaletteId::all()[0]);
     PaletteColors::from_palette(snapclone_theme::palette_for(pid))
 }
+/// [`palette_colors`], plus the symbol fonts.
+///
+/// The safe conversion for the eleven apps `font_install_check.py` names.
+///
+/// `palette_colors` is pure — no `Context`, which is exactly why twenty-nine
+/// apps reach for it and exactly why none of them can install a font through
+/// it. The fonts arrive with `apply_palette`, and telling those apps to call
+/// that instead is not a one-line change: `apply_palette` also SETS VISUALS,
+/// so it recolours an app that was theming itself by hand. That is the reason
+/// ten of the eleven are still on the list rather than fixed in a sweep.
+///
+/// This is the version that changes nothing visible. Same colours out, fonts
+/// in, one word different at the call site. An app that wants the full theme
+/// should still call `apply_palette`; an app that just wants its arrows to
+/// stop being boxes should call this.
+pub fn palette_colors_ctx(ctx: &egui::Context, id: &str) -> PaletteColors {
+    crate::fonts::install(ctx);
+    palette_colors(id)
+}
+
 pub use uikit_gesture::{Direction, GestureConfig, Outcome, ReleaseOutcome, TwoTierGesture};
 
 /// Apply the theme + touch parts of cross-app [`settings_kit::Prefs`] to an egui context:

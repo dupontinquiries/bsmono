@@ -44,7 +44,7 @@ import sys
 ROOT = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else ".")
 
 # Reaching `fonts::install`, directly or through the palette.
-REACHES = re.compile(r"\b(apply_palette|apply_prefs|fonts::install)\b")
+REACHES = re.compile(r"\b(apply_palette|apply_prefs|palette_colors_ctx|fonts::install)\b")
 
 # Crates that draw with egui but are NOT app frontends, so the fonts are the
 # embedding app's business rather than theirs.
@@ -89,8 +89,6 @@ KNOWN_MISSES = {
     "apps/settings-app": "bsettings; no palette call.",
     "apps/snapclone/camera-bridge": "a probe UI; low glyph count, low priority.",
     "apps/snapshot-cam": "no palette call.",
-    "apps/studio/crates/studio-app": "NINE files use PaletteColors and none applies the palette — "
-        "the widest gap of the ten, and a video editor is glyph-heavy.",
     "games/road-warrior/shell": "no palette call.",
     "games/unendlich/crates/unendlich-dash": "telemetry dashboard; also the crate "
         "eframe_backend_check flags (C14_TODO §6).",
