@@ -429,3 +429,144 @@ pub fn concat_parts(parts: &[PathBuf], src: &Path, out: &Path) -> anyhow::Result
     anyhow::ensure!(st.success(), "ffmpeg concat exited with {st}");
     Ok(())
 }
+
+// ── codec preflight ─────────────────────────────────────────────────────────
+//
+// PORTED BACK from the inline layer this crate superseded
+// (maintenance/archive/dandere2x-inline-ffmpeg.rs). The merge that promoted
+// ffmpeg handling into this crate carried everything except this, and the
+// difference is not cosmetic: what this crate had was a check that ffmpeg
+// EXISTS. That passes on a box with a stripped ffmpeg and no libsvtav1, and
+// the run then dies at the encoder — which is the LAST step, so it wastes the
+// entire upscale.
+//
+// "Install ffmpeg" is also the wrong advice for that box, and sends the
+// operator somewhere the problem is not.
+
+/// `-codecs`, because a build can know OF a codec it cannot use.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Preflight {
+    pub ffmpeg: bool,
+    pub ffprobe: bool,
+    /// Encoders present, of those asked for.
+    pub encoders: Vec<String>,
+    /// Encoders asked for and MISSING — the actionable list.
+    pub missing_encoders: Vec<String>,
+    pub missing_decoders: Vec<String>,
+}
+
+impl Preflight {
+    pub fn ok(&self) -> bool {
+        self.ffmpeg && self.ffprobe
+            && self.missing_encoders.is_empty()
+            && self.missing_decoders.is_empty()
+    }
+
+    /// One actionable line, or `None` when everything needed is present.
+    pub fn problem(&self) -> Option<String> {
+        if self.ok() { return None; }
+        if !self.ffmpeg || !self.ffprobe {
+            return Some(format!(
+                "ffmpeg preflight: {} not found on PATH — this pipeline shells out to both",
+                if !self.ffmpeg { "ffmpeg" } else { "ffprobe" }));
+        }
+        let mut parts = Vec::new();
+        if !self.missing_encoders.is_empty() {
+            parts.push(format!("cannot ENCODE with {}", self.missing_encoders.join(", ")));
+        }
+        if !self.missing_decoders.is_empty() {
+            parts.push(format!("cannot DECODE {}", self.missing_decoders.join(", ")));
+        }
+        Some(format!(
+            "ffmpeg preflight: your ffmpeg is present but {}. Install a full build, or pass \
+             --encoder x264 to avoid AV1. Checked now rather than at the end of the run, \
+             because the encoder is the LAST step and failing there wastes the whole upscale.",
+            parts.join(" and ")))
+    }
+}
+
+fn ffmpeg_list(flag: &str) -> Option<String> {
+    let out = Command::new("ffmpeg").arg("-hide_banner").arg(flag).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn lists(text: &str, name: &str) -> bool {
+    // The name is the SECOND column of an -encoders/-decoders row; substring
+    // matching would let "libsvtav1" be satisfied by a description mentioning it.
+    text.lines().any(|l| l.split_whitespace().nth(1) == Some(name))
+}
+
+/// Run the check. `want_encoders`/`want_decoders` are ffmpeg component names.
+pub fn preflight(want_encoders: &[&str], want_decoders: &[&str]) -> Preflight {
+    let have = |c: &str| Command::new(c).arg("-version").output()
+        .map(|o| o.status.success()).unwrap_or(false);
+    let (ffmpeg, ffprobe) = (have("ffmpeg"), have("ffprobe"));
+    if !ffmpeg {
+        return Preflight { ffmpeg, ffprobe, encoders: Vec::new(),
+            missing_encoders: want_encoders.iter().map(|s| s.to_string()).collect(),
+            missing_decoders: want_decoders.iter().map(|s| s.to_string()).collect() };
+    }
+    let enc = ffmpeg_list("-encoders").unwrap_or_default();
+    let dec = ffmpeg_list("-decoders").unwrap_or_default();
+    let mut encoders = Vec::new();
+    let mut missing_encoders = Vec::new();
+    for e in want_encoders {
+        if lists(&enc, e) { encoders.push(e.to_string()) } else { missing_encoders.push(e.to_string()) }
+    }
+    let missing_decoders = want_decoders.iter()
+        .filter(|d| !lists(&dec, d)).map(|s| s.to_string()).collect();
+    Preflight { ffmpeg, ffprobe, encoders, missing_encoders, missing_decoders }
+}
+
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+
+    #[test]
+    fn a_clean_preflight_reports_no_problem() {
+        let p = Preflight { ffmpeg: true, ffprobe: true, encoders: vec!["libsvtav1".into()],
+            missing_encoders: vec![], missing_decoders: vec![] };
+        assert!(p.ok());
+        assert!(p.problem().is_none());
+    }
+
+    #[test]
+    fn a_missing_codec_is_reported_as_a_codec_not_a_missing_ffmpeg() {
+        // The distinction that matters: "install ffmpeg" is wrong advice for a
+        // box that has ffmpeg and lacks libsvtav1, and sends the operator to
+        // the wrong place.
+        let p = Preflight { ffmpeg: true, ffprobe: true, encoders: vec![],
+            missing_encoders: vec!["libsvtav1".into()], missing_decoders: vec![] };
+        let m = p.problem().unwrap();
+        assert!(m.contains("libsvtav1"), "{m}");
+        assert!(m.contains("present but"), "must not read as a missing binary: {m}");
+        assert!(m.contains("--encoder"), "must name a way forward: {m}");
+    }
+
+    #[test]
+    fn a_missing_binary_is_reported_as_a_missing_binary() {
+        let p = Preflight { ffmpeg: false, ffprobe: true, encoders: vec![],
+            missing_encoders: vec!["libsvtav1".into()], missing_decoders: vec![] };
+        let m = p.problem().unwrap();
+        assert!(m.contains("not found on PATH"), "{m}");
+    }
+
+    #[test]
+    fn a_name_is_matched_as_a_column_not_a_substring() {
+        // A description mentioning the codec must not satisfy the check.
+        let listing = " V..... libaom-av1   AV1 (Alliance for Open Media), also see libsvtav1\n \
+                        V..... mpeg4        MPEG-4 part 2";
+        assert!(!lists(listing, "libsvtav1"), "matched a mention in a description");
+        assert!(lists(listing, "libaom-av1"));
+    }
+
+    #[test]
+    fn the_real_environment_answers_without_panicking() {
+        // Whatever this machine has, the check must return rather than blow up
+        // — a preflight that crashes is worse than the failure it prevents.
+        let p = preflight(&["libsvtav1"], &["libdav1d"]);
+        let _ = p.problem();
+        assert_eq!(p.ok(), p.problem().is_none());
+    }
+}

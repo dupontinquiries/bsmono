@@ -118,15 +118,141 @@ impl Default for Job {
 
 /// The vendored fast model, relative to the app's `models/` directory, tried
 /// when no `--model` is given.
-pub fn default_model_paths() -> Vec<PathBuf> {
+// ── model resolution ────────────────────────────────────────────────────────
+//
+// PORTED BACK from maintenance/archive/dandere2x-inline-job.rs. What this
+// crate had was `default_model_paths` walking the executable's ancestors and
+// the compile-time manifest dir for ONE hard-coded filename — so `--model
+// realesrgan-x4` could not be written by name, `~/models` was never looked at,
+// and `env!("CARGO_MANIFEST_DIR")` is a path baked at build time that resolves
+// only on the machine that built the binary.
+//
+// That last one is the same defect as unendlich's shader paths
+// (games/unendlich/crates/unendlich-engine/src/assets.rs): a pinned or copied
+// binary fails on a file that ships with the repo. It is kept here as the LAST
+// candidate, where it costs one probe and can still help a `cargo run`, rather
+// than as the answer.
+//
+// Order matters and is stated in the original: an operator's own directory
+// beats a checkout's vendored copy, always. A tree that shadows the model
+// someone deliberately installed is a tree that silently upscales with the
+// wrong network.
+
+/// Where a model may live, in resolution order.
+///
+/// The operator's own model directory comes FIRST, before anything vendored.
+/// This monorepo already has a `~/models` tree (GGUFs for logscope, whisper
+/// weights, and so on) and the big super-resolution checkpoints belong beside
+/// them rather than in git: `RealESRGAN_x2` is 67 MB, and waifu2x's
+/// `upconv_7` ships as a 10.6 MB JSON — four times the size of the
+/// safetensors model this repo does vendor, for a format that compresses
+/// worse and diffs worse.
+///
+/// So: only the 2.5 MB `realesr-animevideov3` is carried in-tree, as the
+/// working default. Everything else is found, not shipped.
+///
+/// `DANDERE2X_MODELS` overrides, `~/models` and `~/models/upscale` are the
+/// conventional homes, then XDG data, then the vendored fallback.
+pub fn model_search_dirs() -> Vec<PathBuf> {
     let mut v = Vec::new();
+    if let Ok(d) = std::env::var("DANDERE2X_MODELS") {
+        v.push(PathBuf::from(d));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let h = PathBuf::from(home);
+        v.push(h.join("models/upscale"));
+        v.push(h.join("models"));
+    }
+    if let Ok(x) = std::env::var("XDG_DATA_HOME") {
+        v.push(PathBuf::from(x).join("dandere2x/models"));
+    } else if let Ok(home) = std::env::var("HOME") {
+        v.push(PathBuf::from(home).join(".local/share/dandere2x/models"));
+    }
+    // Vendored, last: a checkout's copy should never shadow one the operator
+    // deliberately put in their own directory.
     if let Ok(exe) = std::env::current_exe() {
         for anc in exe.ancestors().take(5) {
-            v.push(anc.join("models/realesr-animevideov3.safetensors"));
+            v.push(anc.join("models"));
         }
     }
-    v.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models/realesr-animevideov3.safetensors"));
+    v.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models"));
     v
+}
+
+/// Resolve a model by BARE NAME across the search dirs, so `--model
+/// RealESRGAN_x2` works without the operator typing a path. A name containing
+/// a separator is taken as a path and used as given.
+pub fn resolve_model(name: &str) -> Option<PathBuf> {
+    let p = Path::new(name);
+    if p.is_absolute() || name.contains('/') {
+        return p.exists().then(|| p.to_path_buf());
+    }
+    for d in model_search_dirs() {
+        for ext in ["", ".safetensors", ".json"] {
+            let c = d.join(format!("{name}{ext}"));
+            if c.is_file() { return Some(c); }
+        }
+    }
+    None
+}
+
+/// The default model, tried when no `--model` is given.
+pub fn default_model_paths() -> Vec<PathBuf> {
+    model_search_dirs().into_iter()
+        .map(|d| d.join("realesr-animevideov3.safetensors"))
+        .collect()
+}
+
+
+#[cfg(test)]
+mod model_search_tests {
+    use super::*;
+
+    #[test]
+    fn an_operators_directory_beats_a_vendored_copy() {
+        // The ORDER is the property. A checkout's `models/` shadowing one the
+        // operator deliberately installed means silently upscaling with the
+        // wrong network, and the output looks fine — just not as good as they
+        // asked for.
+        //
+        // SAFETY: single-threaded test; both variables are restored.
+        let prev = (std::env::var_os("DANDERE2X_MODELS"), std::env::var_os("HOME"));
+        unsafe {
+            std::env::set_var("DANDERE2X_MODELS", "/opt/chosen");
+            std::env::set_var("HOME", "/home/u");
+        }
+        let dirs = model_search_dirs();
+        let pos = |s: &str| dirs.iter().position(|d| d.to_string_lossy() == s);
+        assert_eq!(pos("/opt/chosen"), Some(0), "the explicit override is not first");
+        let home_models = dirs.iter().position(|d| d.ends_with("models") && d.starts_with("/home/u"));
+        let vendored = dirs.iter().rposition(|d| d.to_string_lossy().contains(".."));
+        if let (Some(h), Some(v)) = (home_models, vendored) {
+            assert!(h < v, "a vendored copy outranks the operator's own directory");
+        }
+        // And the compile-time path is LAST, for the same reason it is last in
+        // unendlich: it is right only on the machine that built the binary.
+        assert!(
+            dirs.last().is_some_and(|d| d.to_string_lossy().contains("..")),
+            "the build-time path is not the fallback: {:?}", dirs.last()
+        );
+        unsafe {
+            match prev.0 { Some(v) => std::env::set_var("DANDERE2X_MODELS", v), None => std::env::remove_var("DANDERE2X_MODELS") }
+            match prev.1 { Some(v) => std::env::set_var("HOME", v), None => std::env::remove_var("HOME") }
+        }
+    }
+
+    #[test]
+    fn a_path_is_used_as_given_and_a_bare_name_is_searched() {
+        // The distinction the old `default_model_paths` could not make: one
+        // hard-coded filename meant `--model realesrgan-x4` was not expressible
+        // at all.
+        assert_eq!(resolve_model("/definitely/not/here.safetensors"), None,
+                   "a missing absolute path was invented");
+        assert_eq!(resolve_model("also/not/here"), None);
+        // A bare name that exists nowhere resolves to nothing rather than to a
+        // plausible-looking path that fails later at load.
+        assert_eq!(resolve_model("no-such-model-anywhere"), None);
+    }
 }
 
 pub fn load_model(explicit: Option<&Path>) -> anyhow::Result<(Arc<Network>, PathBuf)> {
