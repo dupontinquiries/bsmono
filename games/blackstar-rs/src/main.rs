@@ -40,6 +40,7 @@ mod foldaudit;
 mod foldsim;
 mod font;
 mod footing;
+mod fragment;
 mod cable;
 mod field;
 mod grandeur;
