@@ -110,6 +110,37 @@ fn ray_hits_box(o: Vec3, d: Vec3, lo: Vec3, hi: Vec3) -> bool {
     tmax > 1e-4
 }
 
+/// Load a strip the way the GAME builds it.
+///
+/// `load_raw_at` for the span, then `load_raw` at ONE shared scale across
+/// the whole strip — mirroring main.rs's build_morph, and matching what
+/// `examples/refusal_audit.rs` already does. Its comment records why:
+/// skipping either step produced 1800+ bogus faults on chassis that are
+/// clean.
+///
+/// This harness originally used `load_raw_unoriented`, which is neither
+/// oriented nor consistently scaled. Every number it produced before this
+/// change described a pipeline the game does not run — the same mistake
+/// twice over, since the exposure metric had already been corrected once
+/// for measuring the unified prim set instead of the model's own.
+fn load_strip(dirs: &[PathBuf]) -> Option<Vec<Vec<model::RawPrim>>> {
+    let raw_span = |p: &PathBuf| -> f32 {
+        let (_, _, _, s, _) = model::load_raw_at(p, 1.0, false);
+        if s > 1e-9 { 1.0 / s } else { 1.0 }
+    };
+    let span0 = raw_span(dirs.first()?);
+    let mut strip = Vec::with_capacity(dirs.len());
+    for d in dirs {
+        let target = 1.32 * raw_span(d) / span0.max(1e-6);
+        let (raws, _) = std::panic::catch_unwind(|| model::load_raw(d, target)).ok()?;
+        if raws.is_empty() {
+            return None;
+        }
+        strip.push(raws);
+    }
+    Some(strip)
+}
+
 fn centroid(pts: &[Vec3]) -> Vec3 {
     if pts.is_empty() {
         return Vec3::ZERO;
@@ -121,14 +152,11 @@ fn audit(pose_dirs: &[PathBuf]) -> Option<Finding> {
     // Load every pose through the game's own loader, then unify them the
     // way the game does — anything else would be auditing a different
     // transform from the one that ships.
-    let strip: Vec<Vec<model::RawPrim>> =
-        pose_dirs.iter().map(|d| model::load_raw_unoriented(d)).collect();
-    if strip.iter().any(|p| p.is_empty()) {
-        return None;
-    }
+    let strip = load_strip(pose_dirs)?;
     // The pose's own prims, kept alongside the unified strip: the stow the
     // game applies is derived from these, not from the unified set.
-    let t0_own: Vec<Vec<Vec3>> = model::load_raw_unoriented(&pose_dirs[0])
+    let t0_own: Vec<Vec<Vec3>> = load_strip(&pose_dirs[..1])?
+        .remove(0)
         .iter()
         .map(|p| p.verts.iter().map(|v| Vec3::from_array(v.pos)).collect())
         .collect();
@@ -1169,12 +1197,10 @@ fn unify_report(root: &Path) {
             skipped += 1;
             continue;
         }
-        let strip: Vec<Vec<model::RawPrim>> =
-            poses.iter().map(|d| model::load_raw_unoriented(d)).collect();
-        if strip.iter().any(|p| p.is_empty()) {
+        let Some(strip) = load_strip(&poses) else {
             skipped += 1;
             continue;
-        }
+        };
         if align::unify(strip).is_some() {
             ok += 1;
         } else {
