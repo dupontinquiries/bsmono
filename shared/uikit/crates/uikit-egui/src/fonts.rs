@@ -68,6 +68,16 @@ const INSTALLED: &str = "uikit-egui/fonts-installed";
 /// Idempotent: rebuilding the font atlas is not free, and this is called from
 /// [`crate::apply_palette`], which an app may call on every settings change.
 pub fn install(ctx: &Context) {
+    // THE ON-SCREEN KEYBOARD, from the same hook.
+    //
+    // Every app in the fleet reaches this function — that is what
+    // `font_install_check.py` enforces — which makes it the one place a
+    // window-level setting can be applied without twenty-three apps
+    // remembering to. See `crate::ime` for why IME needs asking for at all.
+    //
+    // It is its own idempotent flag, not this one: a context that already had
+    // fonts installed by an earlier version must still get the IME request.
+    crate::ime::allow_ime(ctx);
     if ctx.data(|d| d.get_temp::<bool>(egui::Id::new(INSTALLED))).unwrap_or(false) {
         return;
     }
@@ -90,4 +100,33 @@ pub fn install(ctx: &Context) {
     }
     ctx.set_fonts(defs);
     ctx.data_mut(|d| d.insert_temp(egui::Id::new(INSTALLED), true));
+}
+
+#[cfg(test)]
+mod ime_hook_tests {
+    use super::*;
+
+    #[test]
+    fn installing_the_fonts_also_asks_for_ime() {
+        // The WIRING, not the mechanism. `ime`'s own tests cover the request;
+        // this covers the fact that `fonts::install` makes it — which is the
+        // whole distribution strategy, because every app in the fleet reaches
+        // this function (font_install_check.py enforces that) and none of them
+        // would remember a second call.
+        //
+        // Written because deleting the call from `install` failed no test,
+        // exactly like the unendlich consent seed in 62474b370. The mechanism
+        // and its wiring need separate assertions; a test of the mechanism
+        // passes perfectly with nothing calling it.
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput::default());
+        assert!(!crate::ime::ime_requested(&ctx));
+        install(&ctx);
+        assert!(
+            crate::ime::ime_requested(&ctx),
+            "fonts::install no longer asks for IME — on-screen keyboards will \
+             not reach a text field until it already has focus"
+        );
+        let _ = ctx.end_pass();
+    }
 }
