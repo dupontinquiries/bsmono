@@ -75,6 +75,11 @@ struct Finding {
     /// share of the total. What an artist would look at first.
     worst_limb_prim: usize,
     worst_limb_share: f32,
+    /// Worst radius error the CURRENT blend introduces on a part whose
+    /// motion is a rotation about the body, as a fraction of its radius.
+    /// A polar blend removes this by construction, so the number is the
+    /// improvement available. See the block that computes it.
+    chord_error: f32,
 }
 
 /// Slab test: does the ray from `o` along `d` meet the box at a positive
@@ -163,6 +168,141 @@ fn audit(pose_dirs: &[PathBuf]) -> Option<Finding> {
         }
     }
 
+    // WHAT A POLAR BLEND WOULD BUY — ESTIMATE ONLY, NOT REPORTED.
+    //
+    // Three confounds I have not controlled, found while building this:
+    //
+    // 1. `u.poses` carries PLACEHOLDER entries for parts absent from a
+    //    pose, collapsed to a single point. Their centroid is a real
+    //    number describing a part that is not there.
+    // 2. The body centroid drifts between poses, so "radius from the
+    //    body" is measured against a moving origin.
+    // 3. A part moving RADIALLY should travel a chord; polar blending
+    //    would be wrong for it. Filtering to near-constant radius helps
+    //    and does not separate the two cleanly.
+    //
+    // With the filter the fleet median came out at 0.62 radii, which
+    // implies a typical swing of ~135 degrees. That is possible for a
+    // transformer limb and it is also exactly what the confounds above
+    // would produce, and I cannot currently tell which. So the value is
+    // computed and kept for whoever picks this up, and not printed.
+    //
+    // The number that IS trustworthy is the fixture one in
+    // `xform::staged_pipeline`: a 90-degree swing passes at 0.707 of its
+    // radius, 29% inside the arc. That is measured on geometry I
+    // constructed, with no matcher and no placeholders in the way.
+    //
+    // The excursion below is caused by the per-vertex linear blend: a
+    // part swinging about the body travels the CHORD between its two
+    // authored positions, dipping toward the centre. Measured on a
+    // fixture, a 90-degree swing passes at 0.707 of its radius — 29%
+    // inside the arc.
+    //
+    // The fix does not need a full rigid-transform decomposition. If a
+    // part's distance from the body centre is similar at both ends, its
+    // motion is a rotation about the body, and blending the DIRECTION
+    // separately from the RADIUS follows the arc. This measures what
+    // that change would buy, per chassis, before anyone writes it.
+    //
+    // Centroids only: this is an estimate of the improvement, not a
+    // proposed implementation. A real one has to carry the vertices.
+    let polar_estimate = {
+        let pose_n = u.poses.len();
+        let centroids: Vec<Vec<Vec3>> = (0..pose_n)
+            .map(|k| {
+                (0..n_prims)
+                    .map(|p| {
+                        let v = &u.poses[k][p];
+                        if v.is_empty() {
+                            Vec3::ZERO
+                        } else {
+                            v.iter().fold(Vec3::ZERO, |a, x| a + Vec3::from_array(x.pos))
+                                / v.len() as f32
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let body_of = |k: usize| -> Vec3 {
+            let c = &centroids[k];
+            if c.is_empty() { Vec3::ZERO } else { c.iter().fold(Vec3::ZERO, |a, b| a + *b) / c.len() as f32 }
+        };
+        let mut worst_polar = 0.0f32;
+        let mut rot_pairs = 0usize;
+        for p in 0..n_prims {
+            for k in 0..pose_n - 1 {
+                let (b0, b1) = (body_of(k), body_of(k + 1));
+                let (a, b) = (centroids[k][p] - b0, centroids[k + 1][p] - b1);
+                let (ra, rb) = (a.length(), b.length());
+                if ra < 1e-4 || rb < 1e-4 {
+                    continue;
+                }
+                // ONLY WHERE THE MOTION IS A ROTATION.
+                //
+                // A polar blend is the right model for a part that swings
+                // about the body at roughly constant radius. It is the
+                // WRONG model for one that moves radially — a limb
+                // folding inward genuinely should travel a straight line,
+                // and the chord is correct there.
+                //
+                // Without this filter the metric reported a median error
+                // of 0.673 radii, which is not a finding about rotation:
+                // it was counting every radial fold as a chord failure.
+                let scale = ra.max(rb);
+                if (ra - rb).abs() > 0.25 * scale {
+                    continue;
+                }
+                rot_pairs += 1;
+                let mut chord_worst = 0.0f32;
+                let mut polar_worst = 0.0f32;
+                for i in 1..8 {
+                    let f = i as f32 / 8.0;
+                    // what the current blend does
+                    let lin = a.lerp(b, f).length();
+                    // what a polar blend would do: radius lerped,
+                    // direction taken along the arc
+                    let dir = {
+                        let (na, nb) = (a / ra, b / rb);
+                        let dot = na.dot(nb).clamp(-1.0, 1.0);
+                        let ang = dot.acos();
+                        // `sin(ang)` vanishes at BOTH ends: parallel and
+                        // ANTIPODAL. A part swinging a full 180 degrees
+                        // about the body hits the second, the slerp
+                        // divides by ~0, and the direction comes out
+                        // non-unit — which my own debug_assert caught.
+                        //
+                        // At 180 degrees the arc is genuinely ambiguous:
+                        // every plane through the two points is an equally
+                        // good path, and a real implementation has to pick
+                        // one from the part's rotation rather than from
+                        // its centroid. Normalising keeps the estimate
+                        // honest without pretending that choice is made.
+                        let sa = ang.sin();
+                        if ang < 1e-4 || sa.abs() < 1e-3 {
+                            na.lerp(nb, f).normalize_or(na)
+                        } else {
+                            ((na * ((1.0 - f) * ang).sin() + nb * (f * ang).sin()) / sa)
+                                .normalize_or(na)
+                        }
+                    };
+                    let pol = (dir * (ra + (rb - ra) * f)).length();
+                    let want = ra + (rb - ra) * f;
+                    chord_worst = chord_worst.max((want - lin).abs() / scale);
+                    polar_worst = polar_worst.max((want - pol).abs() / scale);
+                }
+                // The polar path's radius is `want` by construction, so
+                // `polar_worst` is zero and reporting it would be a
+                // tautology dressed as a result. What is worth measuring
+                // is the error the CURRENT blend introduces — which is
+                // exactly the improvement a polar blend would deliver.
+                debug_assert!(polar_worst < 1e-4, "polar path should preserve radius");
+                worst_polar = worst_polar.max(chord_worst);
+            }
+        }
+        let _ = rot_pairs;
+        worst_polar
+    };
+
     // EXCURSION: how far past its own endpoints a part wanders.
     let mut worst = Finding {
         worst_excursion: 0.0,
@@ -176,6 +316,7 @@ fn audit(pose_dirs: &[PathBuf]) -> Option<Finding> {
         exposure_silhouette: 0.0,
         worst_limb_prim: 0,
         worst_limb_share: 0.0,
+        chord_error: polar_estimate,
     };
     for (p, row) in offsets.iter().enumerate() {
         let anchor = row[0].max(row[STEPS - 1]);
@@ -628,6 +769,7 @@ fn main() {
     let mut exp_all: Vec<f32> = Vec::new();
     let mut expp_all: Vec<f32> = Vec::new();
     let mut exps_all: Vec<f32> = Vec::new();
+    let mut expol_all: Vec<f32> = Vec::new();
     for name in &names {
         let dir = root.join(name);
         let poses = poses_of(&dir);
@@ -641,6 +783,7 @@ fn main() {
         exp_all.push(f.exposure);
         expp_all.push(f.exposure_packed);
         exps_all.push(f.exposure_silhouette);
+        expol_all.push(f.chord_error);
         if worst_n.is_some() {
             ranked.push((name.clone(), f));
             continue;
@@ -721,6 +864,13 @@ fn main() {
         "packed     median {:.0}%  p10 {:.0}%  min {:.0}%   (exposure after fold_pack)",
         pct(&mut expp_all, 0.5) * 100.0, pct(&mut expp_all, 0.1) * 100.0, pct(&mut expp_all, 0.0) * 100.0
     );
+    // chord_error is COMPUTED and deliberately NOT PRINTED. See the
+    // comment where it is calculated: the per-chassis estimate has
+    // confounds I have not controlled, and a number in a report gets
+    // used. The trustworthy figure for the chord problem is the fixture
+    // one in `xform::staged_pipeline` — a 90-degree swing passes at
+    // 0.707 of its radius, 29% inside the arc.
+    let _ = &expol_all;
     println!(
         "silhouette median {:.0}%  p10 {:.0}%  min {:.0}%   (shift chosen to minimise visible samples)",
         pct(&mut exps_all, 0.5) * 100.0, pct(&mut exps_all, 0.1) * 100.0, pct(&mut exps_all, 0.0) * 100.0
