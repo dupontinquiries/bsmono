@@ -145,9 +145,31 @@ where guessing was wrong twice.
   modules of `apps/voiceterm` compile standalone with
   `rustc --test src/module.rs`; the app crate does not build.
 
+## Clicking things
+
+`xdotool getwindowgeometry --shell` reports the **client area**, and
+under openbox that is not where the frame is — computing a click from it
+lands outside the window. Read coordinates off a screenshot instead and
+pass them to `xdotool mousemove X Y click 1` in root space.
+
+`xdotool windowactivate` sometimes prints
+`XGetWindowProperty[_NET_ACTIVE_WINDOW] failed (code=1)` and works
+anyway. It is not a reason to stop and retry.
+
 ## Disk
 
-The sandbox filled to 90% during this. `target/` for an eframe app is
-several GB. Clear other crates' `target/` directories before starting,
-and expect a full debug build of a large egui binary to be ~100 MB on
-its own.
+**Two egui apps do not fit in this sandbox at once.** Measured:
+
+| app | build | binary | target tree |
+|---|---|---|---|
+| `voiceterm-egui` | ~2 min | 96 MB | 2.3 GB |
+| `aperture` (wgpu + tree-sitter) | ~9 min | 413 MB | 3.0 GB |
+
+Build one, look at it, `rm -rf target`, then build the other. I hit 96%
+full mid-link and had to free the first tree before the second would
+finish.
+
+Poll a long build from separate short tool calls
+(`nohup cargo build > /tmp/build.log 2>&1 &` then `tail -1
+/tmp/build.log`) — a single call that waits for a nine-minute build will
+time out and take the build with it.
