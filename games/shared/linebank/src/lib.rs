@@ -40,6 +40,7 @@
 //! `the_cost_of_a_carrier_is_multiplicative_and_says_so` exists so nobody
 //! designs a three-slot line and discovers it is 60 reads at the session.
 
+pub mod assets;
 pub mod slice;
 pub mod verify;
 
