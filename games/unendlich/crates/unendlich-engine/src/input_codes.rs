@@ -311,6 +311,34 @@ mod winit_conv {
 
     /// Map a winit physical `KeyCode` to our neutral keycode (physical layout,
     /// matching glfw's physical-key semantics). `None` for unmodelled keys.
+    /// A winit touch into our neutral event.
+    ///
+    /// THIS is why winit is here. The Cargo.toml note says it plainly: winit
+    /// gives real per-finger multi-touch through `WindowEvent::Touch` with an
+    /// id and a phase, and GLFW cannot report touch on Linux at all — it only
+    /// ever sees a single emulated pointer from the compositor. The shipping
+    /// backend is glfw, so on a phone today the game receives no touch events
+    /// whatsoever, and no amount of work in `touch_controls` or `InputCache`
+    /// changes that. The backend is the blocker, not the model.
+    ///
+    /// `Cancelled` maps to `End`, not dropped. A cancelled contact is one the
+    /// compositor took away — a system gesture, a notification shade — and a
+    /// finger that never ends leaves the player walking into a wall by itself.
+    /// Ending it is the honest translation of "this contact is over".
+    pub fn touch_event_from_winit(t: &winit::event::Touch) -> InputEvent {
+        use winit::event::TouchPhase as WPhase;
+        InputEvent::Touch {
+            id: t.id,
+            x: t.location.x as f32,
+            y: t.location.y as f32,
+            phase: match t.phase {
+                WPhase::Started => TouchPhase::Start,
+                WPhase::Moved => TouchPhase::Move,
+                WPhase::Ended | WPhase::Cancelled => TouchPhase::End,
+            },
+        }
+    }
+
     pub fn keycode_from_winit(pk: PhysicalKey) -> Option<Keycode> {
         let k = match pk {
             PhysicalKey::Code(c) => c,

@@ -345,3 +345,55 @@ matters.
   BROKEN file as the "clean" backup; the restore then put back a file missing a
   guard, and only a test caught it. `git show HEAD:path > /tmp/backup` has no
   such failure mode.
+
+## 12. unendlich touch: the model and the wiring are done, the BACKEND is the blocker
+
+Three commits landed a working touch path: `touch_controls` (the model, 11
+tests), `InputCache` integration (5 tests, and it found a real bug — see
+below), and `touch_event_from_winit`.
+
+**None of it can receive an event today, and the reason is not fixable in this
+crate.** From `unendlich-engine/Cargo.toml`, written by whoever added the winit
+dep:
+
+> winit gives real per-finger multi-touch (WindowEvent::Touch with id+phase),
+> which GLFW cannot report on Linux at all — it only ever sees a single
+> emulated pointer from the compositor.
+
+The shipping backend is glfw. `window-winit` exists, compiles, and is "NOT
+wired into unendlich_fullgame.rs yet, additive only". So on a phone the game
+receives no touch events whatsoever, and no further work on the model changes
+that.
+
+### What is left, in order
+
+1. **Wire `window-winit` into `unendlich_fullgame`.** The converters exist for
+   keys, mouse and now touch; what does not exist is a winit event loop in the
+   binary. This is the whole remaining job and it is a window-management change,
+   not an input one.
+2. **Call `tick_touch(dt, width)` once at the top of the frame.** One line,
+   but it must be before consumers read — `end_frame` clears `cursor_delta`, so
+   folding late zeroes the drag on the frame it arrived.
+3. **Read `move_axes()` in the player controller** and blend it with the WASD
+   axes rather than replacing them, so a keyboard still works on a device with
+   both.
+4. **Draw something.** The controls are invisible: no stick ring, no hint. That
+   is defensible for look (nobody draws a look zone) and not for the stick,
+   where a first-time player has no way to discover the left half is one.
+
+### The bug the wiring found, recorded because the shape recurs
+
+`InputCache::default()` starts with screen width 0, and a tap on the first
+frame beats the first resize. Role was computed eagerly at touch-down, so that
+tap classified against width 0 — `x < 0.0` is false for every finger — and the
+player's FIRST thumb-down was always a look, never the stick.
+
+It would have been reported as "the movement stick doesn't work until you touch
+the screen twice". Nobody maps that back to a width of zero.
+
+The general shape: **a pure model can be correct in isolation and wrong in the
+only configuration that ships.** The model's own eleven tests all constructed
+`TouchState::new(1000.0)`, so none of them could see it. Writing the caller
+found it in one run, which is an argument for wiring promptly rather than
+banking a tested model — and a counterweight to §10, which is about the
+opposite failure.
