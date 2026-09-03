@@ -279,6 +279,66 @@ pub fn scan_cmake_options(text: &str) -> Vec<CmakeOption> {
 /// `cargo build` argv. An empty `triple` means a **native** build (no `--target`, so
 /// no rustup target/linker is needed — the host toolchain builds for itself); a
 /// non-empty triple cross-builds for that target. Pure — unit-tested.
+/// Environment a cross build needs on top of `--target`.
+///
+/// `cargo build --target aarch64-...` compiles fine and then fails at LINK
+/// time, because cargo invokes the host `cc` for the target's objects. The
+/// error is a wall of `unrecognized opcode` or "incompatible" from the host
+/// linker, which does not mention cross-compilation at all — so it reads as a
+/// broken toolchain rather than a missing setting.
+///
+/// One variable per target fixes it:
+/// `CARGO_TARGET_<TRIPLE_UPPER_UNDERSCORED>_LINKER`.
+///
+/// Returned as pairs rather than applied, so a caller can print them for a dry
+/// run and so this is testable with no toolchain present — which matters,
+/// because a sandbox without `rustup` cannot install a target's std and
+/// therefore cannot prove a cross build works. It can still prove the argv and
+/// the environment are right.
+///
+/// An empty `triple` is a native build and needs nothing: the host `cc` IS the
+/// right linker.
+pub fn cross_env(triple: &str) -> Vec<(String, String)> {
+    // No early return for the empty triple: `cross_linker("")` matches no arm
+    // and returns None, so the unknown-triple path below already covers it. I
+    // wrote the guard first and then could not break it — deleting it failed
+    // no test, because it never did anything. `a_native_build_needs_no_cross_
+    // environment` still pins the behaviour, now on the one path that provides
+    // it rather than on two.
+    let Some(linker) = cross_linker(triple) else {
+        // An unknown triple gets no guess. A wrong linker fails later and more
+        // confusingly than no linker, which at least names the variable cargo
+        // wanted.
+        return Vec::new();
+    };
+    let key = format!(
+        "CARGO_TARGET_{}_LINKER",
+        triple.to_uppercase().replace('-', "_")
+    );
+    vec![(key, linker.to_string())]
+}
+
+/// The linker binary for a target triple, if this fleet knows one.
+///
+/// musl and gnu need DIFFERENT linkers even for the same architecture —
+/// `musl-gcc` is a wrapper that points gcc at musl's headers and libc, and
+/// using the gnu cross-gcc for a musl target produces a binary that links
+/// against glibc and dies on the device with a loader error. Both fleet
+/// targets are aarch64, so architecture alone does not decide it.
+pub fn cross_linker(triple: &str) -> Option<&'static str> {
+    match triple {
+        "aarch64-unknown-linux-gnu" => Some("aarch64-linux-gnu-gcc"),
+        // The Alpine/postmarketOS target. `musl-gcc` on a Debian host is the
+        // HOST's musl wrapper and is x86_64 — the aarch64 musl target wants
+        // `aarch64-linux-musl-gcc` from a musl cross toolchain, which is not
+        // in Debian's archive. Named here anyway so the failure is "linker not
+        // found: aarch64-linux-musl-gcc" rather than a link error nobody can
+        // read.
+        "aarch64-unknown-linux-musl" => Some("aarch64-linux-musl-gcc"),
+        _ => None,
+    }
+}
+
 pub fn cargo_build_argv(app: &str, triple: &str, features: &[String], no_default: bool) -> Vec<String> {
     cargo_build_argv_kind(app, triple, features, no_default, false)
 }
@@ -837,4 +897,54 @@ mod artifact_name_tests {
     fn an_empty_manifest_falls_back_to_the_app_name() {
         assert_eq!(artifact_name("unendlich", ""), "unendlich");
     }
+    #[test]
+    fn a_native_build_needs_no_cross_environment() {
+        // The host `cc` IS the right linker. Setting one would override a
+        // perfectly good default with a guess.
+        assert!(cross_env("").is_empty());
+        assert_eq!(cross_linker(""), None);
+    }
+
+    #[test]
+    fn the_variable_name_is_the_one_cargo_reads() {
+        // Uppercase with dashes as underscores. Get this wrong and cargo
+        // silently ignores it, then fails at link with an error that does not
+        // mention cross-compilation.
+        let e = cross_env("aarch64-unknown-linux-gnu");
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].0, "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER");
+        assert_eq!(e[0].1, "aarch64-linux-gnu-gcc");
+    }
+
+    #[test]
+    fn musl_and_gnu_get_different_linkers() {
+        // Same architecture, different libc. Using the gnu cross-gcc for a musl
+        // target produces a binary linked against glibc that dies on the device
+        // with a loader error — and both fleet targets are aarch64, so
+        // architecture alone cannot decide it.
+        let gnu = cross_linker("aarch64-unknown-linux-gnu").unwrap();
+        let musl = cross_linker("aarch64-unknown-linux-musl").unwrap();
+        assert_ne!(gnu, musl);
+        assert!(musl.contains("musl"), "{musl}");
+        assert!(!gnu.contains("musl"), "{gnu}");
+    }
+
+    #[test]
+    fn every_fleet_target_has_a_linker() {
+        // `BUILD_TARGETS` is what the UI offers. A target that can be selected and
+        // cannot be linked is a build that fails after several minutes.
+        for t in BUILD_TARGETS {
+            assert!(cross_linker(t).is_some(), "{t} is offered with no linker");
+            assert_eq!(cross_env(t).len(), 1, "{t} produced no environment");
+        }
+    }
+
+    #[test]
+    fn an_unknown_triple_gets_no_guess() {
+        // A wrong linker fails later and more confusingly than no linker, which
+        // at least names the variable cargo wanted.
+        assert_eq!(cross_linker("riscv64gc-unknown-linux-gnu"), None);
+        assert!(cross_env("riscv64gc-unknown-linux-gnu").is_empty());
+    }
+
 }
