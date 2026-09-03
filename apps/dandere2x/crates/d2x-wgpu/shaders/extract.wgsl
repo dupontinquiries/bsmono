@@ -10,13 +10,21 @@
 // and the per-tile copy happening *inside* the encoder, a whole frame becomes
 // one submit and one wait (logscope's "K steps in one submit").
 //
-//   frame   [y][x]  u32 RGBA8, row stride `frame_w`
+// The frame is uploaded UNPADDED: replicate padding is coordinate clamping,
+// which costs nothing here and saves building a padded copy of every frame on
+// the host (a 1952x1112 allocation, a replicate fill and ~10% more pixels to
+// convert and upload, per frame).
+//
+//   frame   [y][x]  u32 RGBA8, row stride `frame_w`, size frame_w x frame_h
 //   out     [c*u*u + (y%u)*u + (x%u)][y/u][x/u]  f32
 
 struct Params {
     frame_w: u32,
-    region_x: u32,
-    region_y: u32,
+    frame_h: u32,
+    // Region origin in UNPADDED frame coordinates; may be negative, and reads
+    // outside the frame clamp to the edge pixel (replicate).
+    origin_x: i32,
+    origin_y: i32,
     region_w: u32,
     region_h: u32,
     unshuffle: u32,
@@ -35,7 +43,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (x >= p.region_w || y >= p.region_h) {
         return;
     }
-    let px = frame[(p.region_y + y) * p.frame_w + p.region_x + x];
+    let sx = u32(clamp(p.origin_x + i32(x), 0, i32(p.frame_w) - 1));
+    let sy = u32(clamp(p.origin_y + i32(y), 0, i32(p.frame_h) - 1));
+    let px = frame[sy * p.frame_w + sx];
     // unpack4x8unorm is the exact inverse of the pack the CPU path uses.
     let rgba = unpack4x8unorm(px);
     let u = p.unshuffle;

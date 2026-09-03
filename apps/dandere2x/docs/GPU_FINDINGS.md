@@ -205,7 +205,40 @@ function.** Box-averaging is otherwise a slightly different filter from
 Lanczos, which shows as 45.8 dB / 0.995 SSIM between the two renders —
 visually indistinguishable, and softer rather than sharper.
 
-## 10. Open questions the next hardware run should answer
+## 10. Host work on the critical path
+
+Per frame, between GPU submits, the host was doing more than it needed to.
+Measured on the sandbox box (one core, x86, contended — read the *ratios*, not
+the absolutes):
+
+| step | ms |
+|---|---|
+| pad frame + convert to RGBA8 (old) | 2.63 |
+| convert raw frame to RGBA8 (new) | 1.71 |
+| RGBA→RGB readback pass, 4K | 5.67 |
+| `write_output_rgba8`, 400-tile ×4 (now unused on the GPU path) | 1.60 |
+
+Two changes:
+
+- **No padded copy.** `pad_frame` allocated a 1952×1112 frame, replicate-filled
+  it, and then ~10% more pixels were converted and uploaded — all to emulate
+  coordinate clamping the extract shader can do for free. It now clamps its own
+  reads. The output is *bit-identical* to the padded path (18/18 frames,
+  infinite PSNR), which is the proof that clamping ≡ replicate padding here.
+- **Both frame conversions are row-parallel** (`Network::frame_rgba8_into`,
+  `Network::rgb_from_rgba8`). The readback shuffle is 8.3 M pixels at 4K and
+  was the largest single host cost left. **Unmeasurable in this sandbox — it
+  has one core** — so this is a change justified by shape, not by a number:
+  both loops are independent per row and should scale with cores.
+
+What remains on the host per frame: one RGBA8 conversion up, one RGB
+conversion back, and the analysis stage. The readback could be cut a further
+25% by packing RGB24 on device instead of RGBA8, but that needs each thread to
+own 4 output pixels (3 u32 words) to avoid two threads writing the same word,
+and the row stride stops being word-aligned when the width is not a multiple
+of 4 — not obviously worth the edge cases.
+
+## 11. Open questions the next hardware run should answer
 
 - Do `rt2h` / `rt2c8h` (hoisted addressing, single code path) clear rt2f's
   1022, and does channel blocking finally compose?

@@ -343,13 +343,22 @@ struct PackDst {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ExtractParams {
     frame_w: u32,
-    region_x: u32,
-    region_y: u32,
+    frame_h: u32,
+    origin_x: i32,
+    origin_y: i32,
     region_w: u32,
     region_h: u32,
     unshuffle: u32,
     tw: u32,
+}
+
+// `th` rides in a second uniform-sized tail so the struct stays 16-byte
+// aligned without a manual pad field.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ExtractParamsTail {
     th: u32,
+    _pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -466,6 +475,7 @@ pub struct WgpuUpscaler {
     frame_buf: Option<wgpu::Buffer>,
     frame_words: u64,
     frame_width: u32,
+    frame_height: u32,
     /// One RGBA8 buffer for the whole output frame. The pack pass writes each
     /// tile's cropped result straight into its place here, so the readback is
     /// exactly frame-sized instead of the sum of the padded regions (~10%
@@ -754,7 +764,7 @@ impl WgpuUpscaler {
             sets.push(ActSet { conv_cache: vec![None; steps.len()], bufs, steps, pack_params, pack_bind: None, staging });
         }
         let set_bytes_total = set_bytes(&net, tile as u64) * inflight as u64;
-        Ok(WgpuUpscaler { ctx, net, tile, inflight, kernel: opts.kernel, target_scale: opts.target_scale, conv_pipeline, deconv_pipeline, add_pipeline, pack_pipeline, extract_pipeline, extract_layout, frame_buf: None, frame_words: 0, frame_width: 0, frame_out: None, frame_out_words: 0, out_stride: 0, pack_layout, tile_cache: Vec::new(), tile_cache_key: None, rgba_scratch: Vec::new(), batch_staging: None, sets, _weights: weights, set_bytes_total })
+        Ok(WgpuUpscaler { ctx, net, tile, inflight, kernel: opts.kernel, target_scale: opts.target_scale, conv_pipeline, deconv_pipeline, add_pipeline, pack_pipeline, extract_pipeline, extract_layout, frame_buf: None, frame_words: 0, frame_width: 0, frame_height: 0, frame_out: None, frame_out_words: 0, out_stride: 0, pack_layout, tile_cache: Vec::new(), tile_cache_key: None, rgba_scratch: Vec::new(), batch_staging: None, sets, _weights: weights, set_bytes_total })
     }
 
     /// Encode and submit one tile on activation set `si`; returns the
@@ -983,8 +993,13 @@ impl WgpuUpscaler {
                 // Baked at creation, NOT `write_buffer`: queued writes all land
                 // before any command in the submit, so a per-tile queued write
                 // would give every tile the last tile's parameters.
-                let ep = ExtractParams { frame_w: self.frame_width, region_x: io.region_x, region_y: io.region_y, region_w: io.region_w, region_h: io.region_h, unshuffle: u, tw, th };
-                let params = self.ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("extract params"), contents: bytemuck::bytes_of(&ep), usage: wgpu::BufferUsages::UNIFORM });
+                // Region origin in unpadded coordinates: `tile_io` reports it
+                // in the padded frame's space, whose origin sits `pre_pad` in.
+                let ep = ExtractParams { frame_w: self.frame_width, frame_h: self.frame_height, origin_x: io.region_x as i32 - net.pre_pad as i32, origin_y: io.region_y as i32 - net.pre_pad as i32, region_w: io.region_w, region_h: io.region_h, unshuffle: u, tw };
+                let tail = ExtractParamsTail { th, _pad: [0; 3] };
+                let mut bytes = bytemuck::bytes_of(&ep).to_vec();
+                bytes.extend_from_slice(bytemuck::bytes_of(&tail));
+                let params = self.ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("extract params"), contents: &bytes, usage: wgpu::BufferUsages::UNIFORM });
                 let bind = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("extract"),
                     layout: &self.extract_layout,
@@ -1051,25 +1066,27 @@ impl WgpuUpscaler {
     /// (~10% of the bytes at tile 688) crossing the bus.
     pub fn upscale_frame(&mut self, frame: &Frame) -> anyhow::Result<Frame> {
         let net = self.net.clone();
-        let padded = net.pad_frame(frame);
+        // No padded copy: the extract pass clamps its reads, which is the same
+        // thing replicate padding does and costs nothing on device.
         let rects = tiles(frame.width, frame.height, self.tile);
         let ios: Vec<TileIo> = rects.iter().map(|r| net.tile_io(*r)).collect();
         let (ow, oh) = (frame.width * self.out_scale(), frame.height * self.out_scale());
         let out_words = (ow as u64) * (oh as u64);
 
-        let words = (padded.width as u64) * (padded.height as u64);
+        let words = (frame.width as u64) * (frame.height as u64);
         let frame_realloc = self.ensure_frame_buffers(words, out_words * 4);
         self.out_stride = ow;
         self.ensure_out_buffer(out_words)?;
-        self.frame_width = padded.width;
+        self.frame_width = frame.width;
+        self.frame_height = frame.height;
         // The extract bind groups reference the frame buffer, so a reallocation
         // invalidates them along with a change of tile layout.
-        let key = (padded.width, padded.height, self.tile * 100_000 + self.out_stride);
+        let key = (frame.width, frame.height, self.tile * 100_000 + self.out_stride);
         if frame_realloc || self.tile_cache_key != Some(key) {
             self.rebuild_tile_cache(&ios);
             self.tile_cache_key = Some(key);
         }
-        Network::frame_rgba8_into(&padded, &mut self.rgba_scratch);
+        Network::frame_rgba8_into(frame, &mut self.rgba_scratch);
         self.ctx.queue.write_buffer(self.frame_buf.as_ref().unwrap(), 0, bytemuck::cast_slice(&self.rgba_scratch));
 
         // Tiles are grouped by region size: the conv params uniforms live in
@@ -1118,11 +1135,10 @@ impl WgpuUpscaler {
         let mut out = Frame::new(ow, oh);
         {
             let mapped = slice.get_mapped_range();
-            // One straight RGBA -> RGB pass over the frame, replacing a crop
-            // and copy per tile.
-            for (dst, src) in out.data.chunks_exact_mut(3).zip(mapped.chunks_exact(4)) {
-                dst.copy_from_slice(&src[..3]);
-            }
+            // One RGBA -> RGB pass over the frame (replacing a crop and copy
+            // per tile), row-parallel because at 4K it is 8.3 M pixels and was
+            // the largest host cost left in this path.
+            Network::rgb_from_rgba8(&mapped, &mut out);
         }
         staging.unmap();
         Ok(out)

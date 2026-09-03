@@ -670,13 +670,33 @@ impl Network {
 
     /// [`Network::frame_rgba8`] reusing the caller's allocation: this runs once
     /// per frame on ~2 M pixels, so the 8 MB Vec should not be rebuilt each time.
-    pub fn frame_rgba8_into(padded: &Frame, out: &mut Vec<u32>) {
+    pub fn frame_rgba8_into(src: &Frame, out: &mut Vec<u32>) {
+        let n = (src.width as usize) * (src.height as usize);
         out.clear();
-        out.reserve((padded.width as usize) * (padded.height as usize));
-        for y in 0..padded.height {
-            let row = padded.row(y, 0, padded.width);
-            out.extend(row.chunks_exact(3).map(|p| (p[0] as u32) | ((p[1] as u32) << 8) | ((p[2] as u32) << 16) | 0xff00_0000));
-        }
+        out.resize(n, 0);
+        // Row-parallel: this is ~2 M independent pixels on the critical path
+        // between GPU submits, and it was running on one core.
+        let w = src.width as usize;
+        out.par_chunks_mut(w).enumerate().for_each(|(y, dst)| {
+            let row = src.row(y as u32, 0, src.width);
+            for (d, p) in dst.iter_mut().zip(row.chunks_exact(3)) {
+                *d = (p[0] as u32) | ((p[1] as u32) << 8) | ((p[2] as u32) << 16) | 0xff00_0000;
+            }
+        });
+    }
+
+    /// The inverse for readback: packed RGBA8 words to an RGB frame, in
+    /// parallel. At 4K this is 8.3 M pixels per frame and was the largest
+    /// single host cost in the GPU path.
+    pub fn rgb_from_rgba8(src: &[u8], out: &mut Frame) {
+        let w = out.width as usize;
+        assert_eq!(src.len(), w * (out.height as usize) * 4, "readback size");
+        out.data.par_chunks_mut(w * 3).enumerate().for_each(|(y, dst)| {
+            let row = &src[y * w * 4..(y + 1) * w * 4];
+            for (d, s) in dst.chunks_exact_mut(3).zip(row.chunks_exact(4)) {
+                d.copy_from_slice(&s[..3]);
+            }
+        });
     }
 
     /// Whole-frame upscale on the CPU, tiled. The oracle and the no-GPU fallback.

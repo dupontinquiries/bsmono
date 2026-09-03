@@ -40,6 +40,23 @@ fn hot_paths() {
         for by in 0..36 { for bx in 0..64 { h ^= d2x_core::blockcache::hash_cell(&p, bx * 30, by * 30, 32); } }
         h
     });
+    // The per-frame host work the GPU path pays between submits.
+    let padded = hd.padded(16, Pad::Replicate);
+    let mut scratch = Vec::new();
+    time("frame_rgba8_into 1080p (raw)", 10, || { Network::frame_rgba8_into(&hd, &mut scratch); scratch.len() });
+    time("frame_rgba8_into 1080p (padded +16)", 10, || { Network::frame_rgba8_into(&padded, &mut scratch); scratch.len() });
+    time("pad_frame + convert (the old path)", 10, || {
+        let p = hd.padded(16, Pad::Replicate);
+        Network::frame_rgba8_into(&p, &mut scratch);
+        scratch.len()
+    });
+    let rgba = vec![0u8; (3840 * 2160 * 4) as usize];
+    let mut out4k = Frame::new(3840, 2160);
+    time("RGBA->RGB readback pass, 4K", 10, || {
+        Network::rgb_from_rgba8(&rgba, &mut out4k);
+        out4k.data.len()
+    });
+
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/realesr-animevideov3.safetensors");
     let srvgg = Network::load(&p).unwrap();
     let padded = srvgg.pad_frame(&frame(480, 480));
