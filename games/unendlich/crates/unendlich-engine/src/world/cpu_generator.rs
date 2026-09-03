@@ -123,6 +123,13 @@ pub fn topmost_standable(solid_at: impl Fn(i32) -> bool, y_min: i32, y_max: i32)
 /// `0.075 * VERTICAL_BIAS_SCALE` = 3 blocks; 6 is twice that.
 const DENSITY_SKIP_MARGIN: f64 = 6.0;
 
+/// `UNENDLICH_SURFACE_SCAN_SEED` (default on). Read once: it used to be
+/// an `std::env::var` on every `surface_y_at` call, i.e. per column.
+fn surface_scan_seed_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("UNENDLICH_SURFACE_SCAN_SEED").map(|v| v != "0").unwrap_or(true))
+}
+
 impl WorldGenerator {
     pub fn new(seed: u32) -> Self {
         Self {
@@ -384,18 +391,30 @@ impl WorldGenerator {
     /// guaranteed-air region above. (Set UNENDLICH_SURFACE_SCAN_SEED=0 to scan
     /// from the raw `y_max`, the pre-r299 behaviour.)
     pub fn surface_y_at(&self, world_x: i32, world_z: i32, y_min: i32, y_max: i32) -> Option<i32> {
+        // 2026-09-02: this scans up to ~130 y values for ONE column, and
+        // every probe recomputed `surface_target(world_x, world_z)` TWICE
+        // — once inside `density`, once inside `is_cave` — while the
+        // function already computes it for the scan seed. That is one
+        // pure function of (x, z) evaluated a few hundred times per
+        // column at ~3.6 us each. Computed once here and threaded into
+        // both. Exact, not an approximation.
+        //
+        // The env read was per call too (a getenv and a String for every
+        // column reaching the shelf branch of `biome_at_3d`); it is a
+        // OnceLock now. UNENDLICH_SURFACE_SCAN_SEED still works, read
+        // once per process.
+        let st = self.model.surface_target(world_x as f64, world_z as f64, 0.0);
         let solid_at = |y: i32| {
-            self.density(world_x, y, world_z) > anchors::DENSITY_THRESHOLD
-                && !self.is_cave(world_x, y, world_z)
+            self.model.density_from_surface(st, world_x as f64, y as f64, world_z as f64)
+                > anchors::DENSITY_THRESHOLD
+                && !self.is_cave_with_surface(world_x, y, world_z, st)
         };
         // Generous margin above the proven +3 boundary, so future tweaks to the
         // detail amplitude can't silently clip a surface. Still typically saves
         // hundreds of blocks vs y_max=512.
         const SURFACE_SCAN_MARGIN: i32 = 16;
-        let seed_enabled = std::env::var("UNENDLICH_SURFACE_SCAN_SEED")
-            .map(|v| v != "0").unwrap_or(true);
+        let seed_enabled = surface_scan_seed_enabled();
         let scan_top = if seed_enabled {
-            let st = self.model.surface_target(world_x as f64, world_z as f64, 0.0);
             // Tighter upper bound, but never above the caller's y_max and never
             // below y_min (a degenerate window still scans correctly → None).
             (st.floor() as i32 + SURFACE_SCAN_MARGIN).min(y_max).max(y_min)
@@ -2392,6 +2411,33 @@ mod cave_surface_tests {
     }
 
     #[test]
+    fn surface_y_at_is_unchanged_by_the_hoist() {
+        // The scan's own result, against a reference that recomputes
+        // surface_target on every probe exactly as the old body did.
+        let g = WorldGenerator::new(20260902);
+        let reference = |wx: i32, wz: i32, y_min: i32, y_max: i32| -> Option<i32> {
+            let solid_at = |y: i32| {
+                g.density(wx, y, wz) > anchors::DENSITY_THRESHOLD && !g.is_cave(wx, y, wz)
+            };
+            let st = g.model.surface_target(wx as f64, wz as f64, 0.0);
+            let scan_top = (st.floor() as i32 + 16).min(y_max).max(y_min);
+            topmost_standable(solid_at, y_min, scan_top)
+        };
+        let mut checked = 0u32;
+        for (x0, z0) in [(0i32, 0i32), (128, 128), (-400, 250), (4096, -4096)] {
+            for dx in (0..32).step_by(2) {
+                for dz in (0..32).step_by(2) {
+                    let (wx, wz) = (x0 + dx, z0 + dz);
+                    assert_eq!(g.surface_y_at(wx, wz, -64, 200), reference(wx, wz, -64, 200),
+                        "surface_y_at differs at ({}, {})", wx, wz);
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 4 * 16 * 16);
+    }
+
+    #[test]
     #[ignore]
     fn generate_chunk_after_ab() {
         use std::time::Instant;
@@ -2453,18 +2499,34 @@ mod hotspot_tests {
         }
         let t_density = t.elapsed().as_secs_f64();
 
-        // 3. is_cave, 32 cells per column.
+        // 3. is_cave, 32 cells per column — with the column's surface
+        //    target reused, as the generator now does.
         let t = Instant::now();
         let mut caves = 0u32;
-        for lz in 0..CHUNK_SIZE { for lx in 0..CHUNK_SIZE { for ly in 0..CHUNK_SIZE {
-            if g.is_cave(ox + lx, oy + ly, oz + lz) { caves += 1; }
-        }}}
+        for (ci, &st) in targets.iter().enumerate() {
+            let lz = ci as i32 / CHUNK_SIZE;
+            let lx = ci as i32 % CHUNK_SIZE;
+            for ly in 0..CHUNK_SIZE {
+                if g.is_cave_with_surface(ox + lx, oy + ly, oz + lz, st) { caves += 1; }
+            }
+        }
         let t_cave = t.elapsed().as_secs_f64();
+
+        // 4. Everything after the mask: the surface/biome pass. Timed as
+        //    (whole chunk) - (the three above), since it is not callable
+        //    on its own.
+        let t = Instant::now();
+        let ch = g.generate_chunk(ChunkCoord::new(4, 0, 4));
+        let t_whole = t.elapsed().as_secs_f64();
+        std::hint::black_box(&ch);
 
         let ms = |t: f64| t * 1e3;
         println!("column pass breakdown, one surface chunk (1024 columns, 32768 cells):");
         println!("  surface_target  x1024   {:8.1} ms   ({:7.1} us each)", ms(t_surface), t_surface * 1e6 / cols as f64);
         println!("  density         x32768  {:8.1} ms   ({:7.3} us each)  {} solid", ms(t_density), t_density * 1e6 / 32768.0, solid);
         println!("  is_cave         x32768  {:8.1} ms   ({:7.3} us each)  {} caves", ms(t_cave), t_cave * 1e6 / 32768.0, caves);
+        let rest = t_whole - t_surface - t_density - t_cave;
+        println!("  ---- whole chunk        {:8.1} ms", ms(t_whole));
+        println!("  surface/biome pass etc. {:8.1} ms   (whole minus the three above)", ms(rest));
     }
 }
