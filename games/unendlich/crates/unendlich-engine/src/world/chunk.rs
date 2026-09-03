@@ -459,7 +459,71 @@ impl Chunk {
     /// wood blocks to seed wood_indices. Both indices are then
     /// maintained incrementally by `set()` — the scan happens exactly
     /// once per chunk lifetime.
+    /// Per-block-id classification for [`from_blocks`], as one byte:
+    /// bit 0 has_subvoxels, bit 1 is a log, bit 2 is air, bit 3 is an
+    /// opaque occluder. One array read per cell instead of four
+    /// predicate evaluations (`has_subvoxels` alone is an 11-arm
+    /// `matches!`), 32 768 times per loaded chunk.
+    const CLASS_LUT: [u8; 256] = {
+        let mut t = [0u8; 256];
+        let mut i = 0;
+        while i < BlockId::ALL.len() {
+            let b = BlockId::ALL[i];
+            let mut f = 0u8;
+            // `has_subvoxels` is not a const fn; its arm list is
+            // duplicated here and pinned by `class_lut_matches_predicates`.
+            if matches!(b,
+                BlockId::Grass | BlockId::TallGrass | BlockId::Fern | BlockId::Flower
+                | BlockId::OakLeaves | BlockId::BirchLeaves
+                | BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout)
+            { f |= 1; }
+            if matches!(b, BlockId::OakLog | BlockId::BirchLog) { f |= 2; }
+            if b.is_air() { f |= 4; }
+            if b.is_opaque_occluder() { f |= 8; }
+            t[b as usize] = f;
+            i += 1;
+        }
+        t
+    };
+
     pub fn from_blocks(coord: ChunkCoord, blocks: Vec<BlockId>) -> Self {
+        debug_assert_eq!(blocks.len(), CHUNK_VOLUME, "block array must be CHUNK_VOLUME");
+        // 2026-09-02: one LUT read per cell, and the index sets are built
+        // from ASCENDING vectors — `BTreeSet::from_iter` bulk-loads
+        // sorted input in O(n) instead of n separate O(log n) inserts
+        // (a grass-covered chunk has ~1 000 plant cells). Same fields,
+        // same values; `from_blocks_matches_legacy` pins that.
+        let mut plants: Vec<u16> = Vec::new();
+        let mut wood: Vec<u16> = Vec::new();
+        let mut all_air = true;
+        let mut all_opaque = true;
+        for (i, b) in blocks.iter().enumerate() {
+            let f = Self::CLASS_LUT[*b as usize];
+            if f & 1 != 0 { plants.push(i as u16); }
+            if f & 2 != 0 { wood.push(i as u16); }
+            if f & 4 == 0 { all_air = false; }
+            if f & 8 == 0 { all_opaque = false; }
+        }
+        Self {
+            coord, blocks,
+            dirty: false, version: 0,
+            explicit_indices: std::collections::BTreeSet::new(),
+            plant_indices: plants.into_iter().collect(),
+            tree_root_indices: std::collections::BTreeSet::new(),
+            wood_indices: wood.into_iter().collect(),
+            poi_cache: None,
+            instance_state: std::collections::BTreeMap::new(),
+            transitions: std::collections::BTreeMap::new(),
+            structural_dirty: true,
+            cached_all_air: all_air,
+            cached_all_opaque: all_opaque,
+        }
+    }
+
+    /// The pre-2026-09-02 body. Test-only: correctness reference and A/B
+    /// partner for [`from_blocks`].
+    #[cfg(test)]
+    pub fn from_blocks_legacy(coord: ChunkCoord, blocks: Vec<BlockId>) -> Self {
         debug_assert_eq!(blocks.len(), CHUNK_VOLUME, "block array must be CHUNK_VOLUME");
         // One-time scan to populate the plant_indices and wood_indices
         // inverted indices. After this point, both are maintained
@@ -1218,5 +1282,94 @@ mod tests {
         c.set(0, 0, 0, BlockId::Air);
         assert!(c.cached_all_air,
             "no-op set (air over air) should not invalidate cached_all_air");
+    }
+}
+
+#[cfg(test)]
+mod from_blocks_tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng { fn next(&mut self) -> u64 { let mut x = self.0; x ^= x << 13; x ^= x >> 7; x ^= x << 17; self.0 = x; x } }
+
+    fn shapes() -> Vec<(&'static str, Vec<BlockId>)> {
+        let n = CHUNK_SIZE;
+        let mut r = Rng(0x1234_5678_9ABC_DEF1);
+        let mut mixed = vec![BlockId::Air; CHUNK_VOLUME];
+        for b in mixed.iter_mut() {
+            *b = match r.next() % 8 {
+                0 => BlockId::Air, 1 => BlockId::Grass, 2 => BlockId::OakLog,
+                3 => BlockId::OakLeaves, 4 => BlockId::Flower, 5 => BlockId::Water,
+                6 => BlockId::Glass, _ => BlockId::Stone,
+            };
+        }
+        let mut surface = vec![BlockId::Air; CHUNK_VOLUME];
+        for y in 0..n { for z in 0..n { for x in 0..n {
+            let h = 6 + ((x * 3 + z * 5) % 13);
+            surface[Chunk::block_index(x, y, z)] =
+                if y + 1 == h { BlockId::Grass } else if y < h { BlockId::Stone } else { BlockId::Air };
+        }}}
+        vec![
+            ("all air", vec![BlockId::Air; CHUNK_VOLUME]),
+            ("all stone", vec![BlockId::Stone; CHUNK_VOLUME]),
+            ("all grass", vec![BlockId::Grass; CHUNK_VOLUME]),
+            ("surface", surface),
+            ("mixed", mixed),
+        ]
+    }
+
+    #[test]
+    fn class_lut_matches_predicates() {
+        // The LUT duplicates `has_subvoxels`'s arm list because that
+        // method is not const; if either list changes this fails.
+        for &b in BlockId::ALL.iter() {
+            let f = Chunk::CLASS_LUT[b as usize];
+            assert_eq!(f & 1 != 0, b.has_subvoxels(), "has_subvoxels for {:?}", b);
+            assert_eq!(f & 2 != 0, matches!(b, BlockId::OakLog | BlockId::BirchLog), "log for {:?}", b);
+            assert_eq!(f & 4 != 0, b.is_air(), "is_air for {:?}", b);
+            assert_eq!(f & 8 != 0, b.is_opaque_occluder(), "occluder for {:?}", b);
+        }
+    }
+
+    #[test]
+    fn from_blocks_matches_legacy() {
+        for (name, blocks) in shapes() {
+            let a = Chunk::from_blocks(ChunkCoord::new(1, -2, 3), blocks.clone());
+            let b = Chunk::from_blocks_legacy(ChunkCoord::new(1, -2, 3), blocks);
+            assert_eq!(a.plant_indices, b.plant_indices, "{}: plant_indices", name);
+            assert_eq!(a.wood_indices, b.wood_indices, "{}: wood_indices", name);
+            assert_eq!(a.cached_all_air, b.cached_all_air, "{}: all_air", name);
+            assert_eq!(a.cached_all_opaque, b.cached_all_opaque, "{}: all_opaque", name);
+            assert_eq!(a.blocks, b.blocks, "{}: blocks", name);
+            assert_eq!(a.coord, b.coord);
+            assert_eq!(a.version, b.version);
+            assert_eq!(a.dirty, b.dirty);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn from_blocks_ab() {
+        use std::time::Instant;
+        let rounds = 40;
+        println!("Chunk::from_blocks A/B ({} rounds each, interleaved):", rounds);
+        for (name, blocks) in shapes() {
+            let (mut t_new, mut t_old) = (0.0f64, 0.0f64);
+            let mut plants = 0usize;
+            for r in 0..rounds {
+                let b1 = blocks.clone();
+                let b2 = blocks.clone();
+                if r % 2 == 0 {
+                    let t = Instant::now(); let c = Chunk::from_blocks(ChunkCoord::new(0, 0, 0), b1); t_new += t.elapsed().as_secs_f64(); plants = c.plant_indices.len();
+                    let t = Instant::now(); let c = Chunk::from_blocks_legacy(ChunkCoord::new(0, 0, 0), b2); t_old += t.elapsed().as_secs_f64(); std::hint::black_box(c);
+                } else {
+                    let t = Instant::now(); let c = Chunk::from_blocks_legacy(ChunkCoord::new(0, 0, 0), b2); t_old += t.elapsed().as_secs_f64(); std::hint::black_box(c);
+                    let t = Instant::now(); let c = Chunk::from_blocks(ChunkCoord::new(0, 0, 0), b1); t_new += t.elapsed().as_secs_f64(); plants = c.plant_indices.len();
+                }
+            }
+            let us = |t: f64| t * 1e6 / rounds as f64;
+            println!("  {:10} {:6} plant cells   legacy {:8.1} us   lut+bulk {:8.1} us   ({:+.1}%)",
+                name, plants, us(t_old), us(t_new), (t_new / t_old - 1.0) * 100.0);
+        }
     }
 }
