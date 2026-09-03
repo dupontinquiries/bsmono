@@ -389,7 +389,7 @@ mod tests {
         // the shell nothing at all.
         assert_eq!(
             src.matches("self.app.terminal.feed(").count(),
-            0,
+            1, // exactly one: feed_pty, which mirrors shell output to the DISPLAYED grid
             "an input affordance is calling the OUTPUT path again — use \
              send_input for keys and show_line for text this app produced."
         );

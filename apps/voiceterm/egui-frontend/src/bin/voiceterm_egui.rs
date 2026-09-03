@@ -148,11 +148,28 @@ impl VoicetermApp {
     /// the part that is genuinely the app's: which grid, and which
     /// parser state goes with it.
     fn feed_pty(&mut self, bytes: &[u8]) {
-        // The session's own parser, not an app-level one. A single Vt
-        // shared across panes resumes one pane's half-finished escape
-        // sequence with another pane's bytes the moment focus moves
-        // mid-sequence, and `vt` was not in the swap_focus list.
+        // BOTH GRIDS, AND THE REASON IS EMBARRASSING.
+        //
+        // `self.app.render_at` is what actually draws the terminal, so
+        // `app.terminal.grid` is the DISPLAYED grid. `session.grid` is
+        // the one feed_pty filled. I had it backwards for several
+        // commits, reasoning from a `session.grid` row-drawing block
+        // that is not the one on screen, and only found out by taking a
+        // screenshot of the running app: commands executed and the
+        // display never changed.
+        //
+        // So the shell's output has to reach the displayed grid or
+        // nothing appears — that is the actual "text does not go into
+        // the terminal" bug, underneath all the input-path ones.
+        //
+        // Feeding both rather than picking one, deliberately and
+        // temporarily: `session.grid` now carries the scrollback, the
+        // find index and the key mode that the input path reads, and
+        // `app.terminal.grid` carries the pixels. Consolidating them is
+        // the fix; doing it inside a screenshot loop at the end of a
+        // long session is how you break a working display.
         self.session.feed(bytes);
+        self.app.terminal.feed(&String::from_utf8_lossy(bytes));
     }
 
     /// The connections graph over what this app actually holds.
