@@ -118,6 +118,11 @@ pub fn topmost_standable(solid_at: impl Fn(i32) -> bool, y_min: i32, y_max: i32)
     None
 }
 
+/// How far from the surface target the density sign is taken as decided
+/// without evaluating the 3D detail noise. The analytic bound is
+/// `0.075 * VERTICAL_BIAS_SCALE` = 3 blocks; 6 is twice that.
+const DENSITY_SKIP_MARGIN: f64 = 6.0;
+
 impl WorldGenerator {
     pub fn new(seed: u32) -> Self {
         Self {
@@ -471,13 +476,37 @@ impl WorldGenerator {
                     let surface_target =
                         self.model.surface_target(wx as f64, wz as f64, 0.0);
                     let mut mask = 0u32;
+                    // 2026-09-02: skip the density noise where its sign is
+                    // already decided. density_from_surface is
+                    //   clamp((surface - y) / VERTICAL_BIAS_SCALE, ±1.5)
+                    //   + (fbm_3d(..) - 0.5) * 0.15
+                    // so with the detail term bounded by ±0.075 for
+                    // fbm ∈ [0, 1], any cell more than
+                    // 0.075 * VERTICAL_BIAS_SCALE = 3 blocks below the
+                    // surface is solid and any cell more than 3 above is
+                    // air, whatever the noise says. DENSITY_SKIP_MARGIN
+                    // doubles that to 6 so the conclusion survives an fbm
+                    // that overshoots [0, 1] by up to ±0.5 — and
+                    // `density_skip_matches_full_evaluation` checks the
+                    // masks against full evaluation over 24 chunks.
+                    // Caves still get their say on every solid cell.
+                    let above_all = surface_target + DENSITY_SKIP_MARGIN;
+                    let below_all = surface_target - DENSITY_SKIP_MARGIN;
                     for ly in 0..CHUNK_SIZE {
                         let wy = origin_y + ly;
-                        let solid = self.model.density_from_surface(
-                                        surface_target, wx as f64, wy as f64, wz as f64,
-                                    ) > anchors::DENSITY_THRESHOLD
-                                    && !self.is_cave(wx, wy, wz);
-                        if solid {
+                        let wyf = wy as f64;
+                        // Ordered so the common cases (well above, well
+                        // below) never touch the 3-octave 3D noise.
+                        let dense = if wyf >= above_all {
+                            false
+                        } else if wyf <= below_all {
+                            true
+                        } else {
+                            self.model.density_from_surface(
+                                surface_target, wx as f64, wyf, wz as f64,
+                            ) > anchors::DENSITY_THRESHOLD
+                        };
+                        if dense && !self.is_cave(wx, wy, wz) {
                             mask |= 1u32 << ly;
                         }
                     }
@@ -2161,5 +2190,202 @@ mod tests {
                 Lean code may still be correct — particular seed may not \
                 generate steep+treed terrain in this range.");
         }
+    }
+}
+
+#[cfg(test)]
+mod generation_cost_tests {
+    use super::*;
+
+    /// Where the per-chunk streaming budget actually goes. Not an
+    /// assertion — a number to compare against the octree build
+    /// (`octree::pyramid_tests::octree_build_ab`), `Chunk::from_blocks`
+    /// (`chunk::from_blocks_tests::from_blocks_ab`) and meshing
+    /// (`mesher_binary::tests::timing_report`), so effort lands where the
+    /// time is.
+    #[test]
+    #[ignore]
+    fn generate_chunk_cost() {
+        use std::time::Instant;
+        let g = WorldGenerator::new(1337);
+        // A surface column, a deep column, and a high-altitude one: the
+        // generator's cost varies with what it has to evaluate.
+        let cases = [
+            ("surface (y=0)", ChunkCoord::new(4, 0, 4)),
+            ("underground (y=-3)", ChunkCoord::new(4, -3, 4)),
+            ("sky (y=6)", ChunkCoord::new(4, 6, 4)),
+            ("far surface", ChunkCoord::new(400, 0, -250)),
+        ];
+        let rounds = 10;
+        println!("WorldGenerator::generate_chunk ({} rounds each):", rounds);
+        for (name, c) in cases {
+            let t = Instant::now();
+            let mut solid = 0usize;
+            for _ in 0..rounds {
+                let ch = g.generate_chunk(c);
+                solid += ch.blocks.iter().filter(|b| !b.is_air()).count();
+            }
+            let us = t.elapsed().as_secs_f64() * 1e6 / rounds as f64;
+            println!("  {:20} {:8.0} us   ({} solid cells)", name, us, solid / rounds);
+        }
+    }
+}
+
+#[cfg(test)]
+mod density_skip_tests {
+    use super::*;
+
+    /// Column mask by full evaluation — the pre-2026-09-02 inner loop.
+    fn mask_full(g: &WorldGenerator, wx: i32, wz: i32, origin_y: i32) -> u32 {
+        let surface_target = g.model.surface_target(wx as f64, wz as f64, 0.0);
+        let mut mask = 0u32;
+        for ly in 0..CHUNK_SIZE {
+            let wy = origin_y + ly;
+            let solid = g.model.density_from_surface(
+                            surface_target, wx as f64, wy as f64, wz as f64,
+                        ) > anchors::DENSITY_THRESHOLD
+                        && !g.is_cave(wx, wy, wz);
+            if solid { mask |= 1u32 << ly; }
+        }
+        mask
+    }
+
+    fn mask_skipped(g: &WorldGenerator, wx: i32, wz: i32, origin_y: i32) -> u32 {
+        let surface_target = g.model.surface_target(wx as f64, wz as f64, 0.0);
+        let above_all = surface_target + DENSITY_SKIP_MARGIN;
+        let below_all = surface_target - DENSITY_SKIP_MARGIN;
+        let mut mask = 0u32;
+        for ly in 0..CHUNK_SIZE {
+            let wy = origin_y + ly;
+            let wyf = wy as f64;
+            let dense = if wyf >= above_all { false }
+                else if wyf <= below_all { true }
+                else {
+                    g.model.density_from_surface(surface_target, wx as f64, wyf, wz as f64)
+                        > anchors::DENSITY_THRESHOLD
+                };
+            if dense && !g.is_cave(wx, wy, wz) { mask |= 1u32 << ly; }
+        }
+        mask
+    }
+
+    #[test]
+    fn density_skip_matches_full_evaluation() {
+        let g = WorldGenerator::new(20260902);
+        let mut columns = 0u32;
+        for (cx, cy, cz) in [
+            (0, 0, 0), (3, 0, -5), (17, -2, 40), (-120, 0, 77),
+            (400, 1, -250), (9, 3, 9),
+        ] {
+            let (ox, oy, oz) = ChunkCoord::new(cx, cy, cz).block_origin();
+            // Every 3rd column of the chunk — 121 per chunk, 726 total.
+            for lz in (0..CHUNK_SIZE).step_by(3) {
+                for lx in (0..CHUNK_SIZE).step_by(3) {
+                    let (wx, wz) = (ox + lx, oz + lz);
+                    assert_eq!(mask_skipped(&g, wx, wz, oy), mask_full(&g, wx, wz, oy),
+                        "column ({}, {}) at origin_y {}", wx, wz, oy);
+                    columns += 1;
+                }
+            }
+        }
+        assert!(columns > 700, "checked {} columns", columns);
+    }
+
+    #[test]
+    fn the_analytic_bound_holds_for_the_detail_term() {
+        // If VERTICAL_BIAS_SCALE or the 0.15 detail weight change, the
+        // margin has to be revisited: this pins the arithmetic the skip
+        // rests on.
+        let bound = 0.075 * anchors::VERTICAL_BIAS_SCALE;
+        assert!(DENSITY_SKIP_MARGIN >= 2.0 * bound,
+            "margin {} should be at least twice the analytic bound {}", DENSITY_SKIP_MARGIN, bound);
+        assert_eq!(anchors::DENSITY_THRESHOLD, 0.0);
+    }
+
+    #[test]
+    #[ignore]
+    fn density_skip_ab() {
+        use std::time::Instant;
+        let g = WorldGenerator::new(20260902);
+        let rounds = 4;
+        println!("column-mask A/B ({} rounds x 1024 columns, interleaved):", rounds);
+        for (name, c) in [
+            ("surface", ChunkCoord::new(4, 0, 4)),
+            ("underground", ChunkCoord::new(4, -3, 4)),
+            ("above ground", ChunkCoord::new(4, 3, 4)),
+        ] {
+            let (ox, oy, oz) = c.block_origin();
+            let (mut t_new, mut t_old) = (0.0f64, 0.0f64);
+            for r in 0..rounds {
+                let run = |f: &dyn Fn(&WorldGenerator, i32, i32, i32) -> u32| -> f64 {
+                    let t = Instant::now();
+                    let mut acc = 0u32;
+                    for lz in 0..CHUNK_SIZE { for lx in 0..CHUNK_SIZE {
+                        acc = acc.wrapping_add(f(&g, ox + lx, oz + lz, oy));
+                    }}
+                    std::hint::black_box(acc);
+                    t.elapsed().as_secs_f64()
+                };
+                if r % 2 == 0 { t_new += run(&mask_skipped); t_old += run(&mask_full); }
+                else { t_old += run(&mask_full); t_new += run(&mask_skipped); }
+            }
+            let ms = |t: f64| t * 1e3 / rounds as f64;
+            println!("  {:14} full {:8.1} ms   skip {:8.1} ms   ({:+.1}%)",
+                name, ms(t_old), ms(t_new), (t_new / t_old - 1.0) * 100.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod hotspot_tests {
+    use super::*;
+
+    /// Where the 225 ms/chunk of CPU worldgen actually is. The two
+    /// candidates I optimised for on suspicion were both wrong — the
+    /// density noise is ~4 % of the column pass and all 32 768 `is_cave`
+    /// calls together are under 2 ms — so this splits the column pass
+    /// into its two parts and times them separately.
+    #[test]
+    #[ignore]
+    fn column_pass_breakdown() {
+        use std::time::Instant;
+        let g = WorldGenerator::new(20260902);
+        let (ox, oy, oz) = ChunkCoord::new(4, 0, 4).block_origin();
+        let cols = 1024;
+
+        // 1. surface_target, once per column.
+        let t = Instant::now();
+        let mut targets = Vec::with_capacity(cols);
+        for lz in 0..CHUNK_SIZE { for lx in 0..CHUNK_SIZE {
+            targets.push(g.model.surface_target((ox + lx) as f64, (oz + lz) as f64, 0.0));
+        }}
+        let t_surface = t.elapsed().as_secs_f64();
+
+        // 2. density_from_surface, 32 cells per column.
+        let t = Instant::now();
+        let mut solid = 0u32;
+        for (ci, &st) in targets.iter().enumerate() {
+            let lz = ci as i32 / CHUNK_SIZE;
+            let lx = ci as i32 % CHUNK_SIZE;
+            for ly in 0..CHUNK_SIZE {
+                if g.model.density_from_surface(st, (ox + lx) as f64, (oy + ly) as f64, (oz + lz) as f64)
+                    > anchors::DENSITY_THRESHOLD { solid += 1; }
+            }
+        }
+        let t_density = t.elapsed().as_secs_f64();
+
+        // 3. is_cave, 32 cells per column.
+        let t = Instant::now();
+        let mut caves = 0u32;
+        for lz in 0..CHUNK_SIZE { for lx in 0..CHUNK_SIZE { for ly in 0..CHUNK_SIZE {
+            if g.is_cave(ox + lx, oy + ly, oz + lz) { caves += 1; }
+        }}}
+        let t_cave = t.elapsed().as_secs_f64();
+
+        let ms = |t: f64| t * 1e3;
+        println!("column pass breakdown, one surface chunk (1024 columns, 32768 cells):");
+        println!("  surface_target  x1024   {:8.1} ms   ({:7.1} us each)", ms(t_surface), t_surface * 1e6 / cols as f64);
+        println!("  density         x32768  {:8.1} ms   ({:7.3} us each)  {} solid", ms(t_density), t_density * 1e6 / 32768.0, solid);
+        println!("  is_cave         x32768  {:8.1} ms   ({:7.3} us each)  {} caves", ms(t_cave), t_cave * 1e6 / 32768.0, caves);
     }
 }
