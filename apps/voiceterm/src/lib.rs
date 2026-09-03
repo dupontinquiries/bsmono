@@ -57,6 +57,7 @@
 //! std-only modules is a small price for the test suite existing at all, and
 //! the refactor belongs with the feature-gating above.
 
+pub mod bar_action;
 pub mod bar_pages;
 pub mod bottom_bar;
 pub mod code_symbols;
@@ -98,7 +99,7 @@ mod purity {
             .filter_map(|l| l.strip_prefix("pub mod "))
             .filter_map(|l| l.strip_suffix(';'))
             .collect();
-        assert_eq!(exposed.len(), 17, "module list changed; update this count deliberately");
+        assert_eq!(exposed.len(), 18, "module list changed; update this count deliberately");
 
         let mut impure = Vec::new();
         for m in &exposed {

@@ -124,8 +124,11 @@ pub fn bar_for(page: &Page, live: &Live) -> BottomBar {
     let mut bar = BottomBar::new();
 
     // Persistent leading button.
+    // bar_pages owns the namespacing. Callers supply bare ids; leaving
+    // it to them means one caller eventually forgets and ships an
+    // unroutable option that no module's tests cover.
     let tab_opts: Vec<BarOption> =
-        live.tabs.iter().map(|(id, l)| BarOption::new(id.clone(), l.clone())).collect();
+        live.tabs.iter().map(|(id, l)| BarOption::new(format!("tab:{id}"), l.clone())).collect();
     let mut tabs = BarButton::new("tabs", "Tabs", BarButtonKind::Tabs)
         .with_primary("tab:last")
         .with_options(tab_opts);
@@ -186,17 +189,27 @@ pub fn swipe_order(current: &Page) -> Vec<Page> {
 }
 
 fn workspaces_button(live: &Live) -> BarButton {
-    let opts: Vec<BarOption> =
-        live.workspaces.iter().map(|(id, l)| BarOption::new(id.clone(), l.clone())).collect();
-    let mut b = BarButton::new("workspaces", "Spaces", BarButtonKind::Workspaces).with_options(opts);
+    let opts: Vec<BarOption> = live
+        .workspaces
+        .iter()
+        .map(|(id, l)| BarOption::new(format!("workspace:{id}"), l.clone()))
+        .collect();
+    // Explicit namespaced primary: BarButton::new defaults primary to
+    // the button id, which is not routable. A bar_action test catches
+    // this, which is the point of having the parser at all.
+    let mut b = BarButton::new("workspaces", "Spaces", BarButtonKind::Workspaces)
+        .with_primary("workspace:last")
+        .with_options(opts);
     b.enabled = !live.workspaces.is_empty();
     b
 }
 
 fn quick_button(live: &Live) -> BarButton {
     let opts: Vec<BarOption> =
-        live.quick.iter().map(|(id, l)| BarOption::new(id.clone(), l.clone())).collect();
-    let mut b = BarButton::new("quick", "Launch", BarButtonKind::QuickLaunch).with_options(opts);
+        live.quick.iter().map(|(id, l)| BarOption::new(format!("launch:{id}"), l.clone())).collect();
+    let mut b = BarButton::new("quick", "Launch", BarButtonKind::QuickLaunch)
+        .with_primary("launch:last")
+        .with_options(opts);
     b.enabled = !live.quick.is_empty();
     b
 }
@@ -393,10 +406,12 @@ mod tests {
     #[test]
     fn selection_routing_resolves_through_the_existing_router() {
         let bar = bar_for(&Page::Terminal, &live());
-        let (kind, opt) = bar.resolve("tabs", "t2").unwrap();
+        let (kind, opt) = bar.resolve("tabs", "tab:t2").unwrap();
         assert_eq!(kind, BarButtonKind::Tabs);
         assert_eq!(opt.label, "notes");
         assert!(bar.resolve("tabs", "nope").is_none());
+        // callers pass bare ids; the module namespaces them
+        assert!(bar.resolve("tabs", "t2").is_none());
     }
 
     #[test]

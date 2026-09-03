@@ -176,6 +176,9 @@ mod voice_status;
 // Which buttons the bottom bar shows, keyed on the live voice grammar.
 // Pure; composes bottom_bar + editor_voice + dictate.
 mod bar_pages;
+// The single handler for bar selections: namespaced id -> typed action.
+// Pure.
+mod bar_action;
 // Targeted fixes to the last dictated unit (recase, spell, change a
 // word) instead of discarding it. Pure.
 mod repair;
