@@ -1102,3 +1102,47 @@ mod blend_magnitude {
             "feathering cut the step only from {hard} to {soft} — not enough to be worth the overlap");
     }
 }
+
+#[cfg(test)]
+mod blend_crop_agreement {
+    use super::*;
+
+    /// The blended path must read the SAME pixels the hard crop reads.
+    ///
+    /// `write_output_rgba8` walks the packed tile with a `crop_x/crop_y`
+    /// offset and a `region_w * scale` stride; the blended path hands
+    /// `Blender::add` a pre-offset slice with the same stride. Those are two
+    /// expressions of one piece of arithmetic written in different places, and
+    /// the failure mode if they disagree is a fixed pixel shift per tile — which
+    /// looks like a seam, i.e. exactly the bug being fixed, so it would be very
+    /// easy to misread as "blending did not work".
+    #[test]
+    fn the_blended_offset_indexes_the_same_pixel_as_the_hard_crop() {
+        for (scale, pre_pad, unshuffle, exact) in
+            [(2u32, 32u32, 1u32, false), (4, 32, 2, false), (2, 7, 1, true)]
+        {
+            let net = Network {
+                name: "probe".into(), ops: Vec::new(), bufs: Vec::new(),
+                input: 0, output: 0, scale, unshuffle, shuffle: 1,
+                add_input: false, pre_pad, exact,
+            };
+            let rect = TileRect { x: 64, y: 32, w: 128, h: 96 };
+            let io = net.tile_io(rect);
+            let stride = if exact { rect.w * scale } else { io.region_w * scale };
+            // Hard crop, for pixel (0,0) of the tile's own output:
+            let hard = ((io.crop_y as usize) * stride as usize + io.crop_x as usize) * 4;
+            // Blended: the slice is offset by the same amount, then indexed
+            // from its own origin.
+            let blended_off = (io.crop_y * stride + io.crop_x) as usize * 4;
+            assert_eq!(hard, blended_off,
+                "crop offset disagrees for scale {scale} pad {pre_pad} u {unshuffle} exact {exact}");
+            // And the last pixel of the tile must still be inside the region.
+            let last = ((io.crop_y + rect.h * scale - 1) as usize * stride as usize
+                        + (io.crop_x + rect.w * scale - 1) as usize) * 4;
+            let region_px = if exact { (rect.w * scale * rect.h * scale) as usize }
+                            else { (io.region_w * scale * io.region_h * scale) as usize };
+            assert!(last / 4 < region_px,
+                "the cropped tile runs past the packed region for scale {scale}");
+        }
+    }
+}

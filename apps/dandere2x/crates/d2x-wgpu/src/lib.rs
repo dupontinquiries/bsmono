@@ -20,7 +20,7 @@
 
 use anyhow::{anyhow, Context};
 use d2x_core::frame::Frame;
-use d2x_core::net::{tiles, Act, Network, Op, Tensor, TileIo};
+use d2x_core::net::{tiles, tiles_overlapped, Blender, Act, Network, Op, Tensor, TileIo, TileRect};
 use d2x_core::upscale::Upscaler;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -284,6 +284,12 @@ impl GpuContext {
 }
 
 pub struct WgpuUpscaler {
+    /// Composite overlapping tiles with a feathered ramp instead of a hard
+    /// crop. Default on; `D2X_BLEND=0` or setting this false restores the old
+    /// path. A field rather than an env read per frame so a caller — notably
+    /// the GPU/CPU parity test — can control it deterministically, without
+    /// process-wide env mutation racing other tests.
+    pub blend: bool,
     ctx: Arc<GpuContext>,
     pub net: Arc<Network>,
     pub tile: u32,
@@ -506,7 +512,7 @@ impl WgpuUpscaler {
             sets.push(ActSet { bufs, steps, pack_params, pack_bind, out, staging });
         }
         let set_bytes_total = set_bytes(&net, tile as u64) * inflight as u64;
-        Ok(WgpuUpscaler { ctx, net, tile, inflight, conv_pipeline, deconv_pipeline, add_pipeline, pack_pipeline, sets, _weights: weights, set_bytes_total })
+        Ok(WgpuUpscaler { blend: std::env::var("D2X_BLEND").map(|v| v.trim() != "0").unwrap_or(true), ctx, net, tile, inflight, conv_pipeline, deconv_pipeline, add_pipeline, pack_pipeline, sets, _weights: weights, set_bytes_total })
     }
 
     /// Encode and submit one tile on activation set `si`; returns the
@@ -623,25 +629,73 @@ impl WgpuUpscaler {
     pub fn upscale_frame(&mut self, frame: &Frame) -> anyhow::Result<Frame> {
         let net = self.net.clone();
         let padded = net.pad_frame(frame);
-        let mut out = Frame::new(frame.width * net.scale, frame.height * net.scale);
-        let mut pending: std::collections::VecDeque<(usize, wgpu::SubmissionIndex, TileIo, u64)> = std::collections::VecDeque::new();
-        for (k, rect) in tiles(frame.width, frame.height, self.tile).into_iter().enumerate() {
+        // OVERLAP = pre_pad, and that choice is the point.
+        //
+        // Every tile already computes `pre_pad` pixels of context on each side
+        // and then throws them away at the crop. Stepping by `tile - pre_pad`
+        // and blending REUSES that work rather than adding any: the network
+        // runs on the same padded region it always did, and the only extra
+        // cost is the tiles the smaller step introduces.
+        //
+        // `D2X_BLEND=0` restores the hard crop, because this is the change
+        // that fixes a visual defect and the operator needs to be able to A/B
+        // it on their own footage — a fix you cannot turn off is a fix you
+        // cannot verify.
+        //
+        // BOTH paths keep the in-flight set rotation. The commit this is
+        // replayed from predates it and ran tiles synchronously through
+        // `run_tile`; taking that shape back would have quietly serialised the
+        // GPU to fix a seam, which is the kind of trade nobody notices until a
+        // benchmark does.
+        let blend = self.blend;
+        let (ow, oh) = (frame.width * net.scale, frame.height * net.scale);
+        let overlap = if blend { net.pre_pad.min(self.tile.saturating_sub(1)) } else { 0 };
+        let rects = if blend {
+            tiles_overlapped(frame.width, frame.height, self.tile, overlap)
+        } else {
+            tiles(frame.width, frame.height, self.tile)
+        };
+
+        let mut out = Frame::new(ow, oh);
+        let mut b = Blender::new(ow, oh, overlap * net.scale);
+        // `rect` rides along in the queue: a blended tile is placed by its own
+        // rect, and by the time the readback completes the loop has moved on.
+        let mut pending: std::collections::VecDeque<(usize, wgpu::SubmissionIndex, TileIo, u64, TileRect)>
+            = std::collections::VecDeque::new();
+        let mut place = |out: &mut Frame, b: &mut Blender, io: TileIo, rect: TileRect, rgba: &[u8]| {
+            if !blend {
+                net.write_output_rgba8(out, io, rgba);
+                return;
+            }
+            // The packed tile is `region * scale` wide for same-pad nets, and
+            // the crop offset says where this tile's own pixels start inside
+            // it — so the blender is handed the cropped view, not the region.
+            let stride = if net.exact { rect.w * net.scale } else { io.region_w * net.scale };
+            let off = (io.crop_y * stride + io.crop_x) as usize * 4;
+            b.add(rect.x * net.scale, rect.y * net.scale,
+                  rect.w * net.scale, rect.h * net.scale, &rgba[off..], stride);
+        };
+        for (k, rect) in rects.into_iter().enumerate() {
             let si = k % self.inflight;
             if pending.len() == self.inflight {
-                let (s, idx, io, n) = pending.pop_front().unwrap();
+                let (s, idx, io, n, r) = pending.pop_front().unwrap();
                 let rgba = self.finish_tile(s, idx, n)?;
-                net.write_output_rgba8(&mut out, io, &rgba);
+                place(&mut out, &mut b, io, r, &rgba);
             }
             let io: TileIo = net.tile_io(rect);
             let input = net.extract_input(&padded, io);
             let (idx, n) = self.submit_tile(si, &input)?;
-            pending.push_back((si, idx, io, n));
+            pending.push_back((si, idx, io, n, rect));
         }
-        while let Some((s, idx, io, n)) = pending.pop_front() {
+        while let Some((s, idx, io, n, r)) = pending.pop_front() {
             let rgba = self.finish_tile(s, idx, n)?;
-            net.write_output_rgba8(&mut out, io, &rgba);
+            place(&mut out, &mut b, io, r, &rgba);
         }
-        Ok(out)
+        if !blend {
+            return Ok(out);
+        }
+        debug_assert_eq!(b.uncovered(), 0, "overlapped tiling left uncovered pixels");
+        Ok(b.finish())
     }
 }
 
@@ -694,6 +748,13 @@ pub fn selftest(net: Arc<Network>, opts: GpuOptions) -> anyhow::Result<SelftestR
     // Three sets in flight and a frame of five tiles, so set rotation and
     // per-submission waits are exercised, not just the kernels.
     let mut gpu = WgpuUpscaler::new(net.clone(), GpuOptions { tile, inflight: 3, ..opts })?;
+    // KERNEL parity, not compositor parity. The CPU reference composites with a
+    // hard crop; the GPU path now blends overlapping tiles by default. Leaving
+    // blending on here compares two different tiling STRATEGIES and reports
+    // "kernels disagree" — it failed at 93.3% exact, worst delta 3, which is
+    // the blend working, not a kernel bug. Turn it off so this measures the one
+    // thing it is named for.
+    gpu.blend = false;
     let (w, h) = (gpu.tile * 2 + 13, gpu.tile + 5);
     let mut frame = Frame::new(w, h);
     for y in 0..h {
