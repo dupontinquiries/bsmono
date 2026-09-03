@@ -2532,6 +2532,56 @@ mod hotspot_tests {
         });
     }
 
+    /// Does one `biome_def_at` per column give the same answer as the
+    /// four the surface pass actually makes? The doc
+    /// (`worldgen-hotspots-2026-09-02.md`) asks for a disagreement RATE
+    /// over a wide sweep before anyone collapses those four calls into
+    /// one, because `temperature` moves with `y` and a column on a
+    /// climate boundary could legitimately differ. This is that sweep:
+    /// many columns, several regions, several altitudes, counting
+    /// mismatches rather than asserting none.
+    #[test]
+    #[ignore]
+    fn biome_def_y_disagreement_sweep() {
+        let (g, loaded) = production_like_generator(20260902);
+        if !loaded {
+            println!("standard biome registry did not load — sweep is meaningless, skipping");
+            return;
+        }
+        let mut checked = 0u64;
+        let mut differ = 0u64;
+        let mut examples: Vec<String> = Vec::new();
+        // Regions far apart so different climates are covered, and a
+        // range of surface altitudes.
+        for (x0, z0) in [(0i32, 0i32), (5000, 5000), (-8000, 3000), (120000, -70000),
+                         (-333, 999), (64, -64), (2048, 2048), (-15000, -15000)] {
+            for dx in 0..40 {
+                for dz in 0..40 {
+                    let (x, z) = (x0 + dx * 7, z0 + dz * 11);
+                    // Where the surface actually is for this column, so
+                    // the 4 y values are the ones the pass really uses.
+                    let st = g.model.surface_target(x as f64, z as f64, 0.0);
+                    let sy = st.floor() as i32;
+                    let at = |y: i32| g.biome_def_at(x, y, z).map(|d| d.id.clone());
+                    let top = at(sy);
+                    for d in 1..=3 {
+                        let sub = at(sy - d);
+                        if sub != top {
+                            differ += 1;
+                            if examples.len() < 5 {
+                                examples.push(format!("({}, {}, {}) surface {:?} vs sub-{} {:?}", x, sy, z, top, d, sub));
+                            }
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        println!("biome_def y-disagreement sweep: {} subsurface cells checked, {} differ from their column's surface def ({:.4}%)",
+            checked, differ, differ as f64 * 100.0 / checked as f64);
+        for e in &examples { println!("  e.g. {}", e); }
+    }
+
     /// The per-cell part of the surface pass: `biome_def_at` and its
     /// two components. Called 4x per column (pick_surface_block once,
     /// pick_subsurface_block three times).

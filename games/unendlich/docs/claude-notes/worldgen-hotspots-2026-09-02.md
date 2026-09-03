@@ -86,10 +86,20 @@ per column — and of that, temperature+humidity is 4.48 ms while
 `best_fit` over 39 biomes is only 0.27 ms. So the cost is entirely the
 climate recompute, not the biome search.
 
-And the shape of the fix is visible in the data: **in 256 sampled
-columns, the 4 y values resolved to the same `BiomeDef` every time**
-(0 differed). One call per column would give the same answer in every
-case sampled.
+**The obvious fix — one `biome_def_at` per column instead of four — is
+REJECTED on measurement.** `biome_def_y_disagreement_sweep` puts 38 400
+subsurface cells across 8 far-apart regions against their column's
+surface def, sampling at each column's ACTUAL surface (not a fixed
+altitude): **1 261 differ, 3.28 %**. They are not near-misses either —
+e.g. `unendlich:temperate_forest` at the surface against
+`arenas:gilded_glade` three blocks down, which is a visibly different
+block once dug. Collapsing the four calls would rewrite ~3 % of
+subsurface blocks.
+
+An earlier sample said 0 of 256 columns differed; that sample probed
+fixed altitudes (y = 40..37) rather than each column's surface, so it
+was mostly asking the question in air and rock far from any climate
+boundary. The sweep is the honest version and it says no.
 
 It is **not** a free hoist, which is why it is written down instead of
 done: `temperature(x, y, z)` depends on `y` (altitude cooling and the
@@ -97,25 +107,30 @@ done: `temperature(x, y, z)` depends on `y` (altitude cooling and the
 `pick_*_block` samples at the cell's `wy`. Reusing the column value
 would change output. The options, cheapest first:
 
-1. One `biome_def_at` per column, reused for the surface block and the
-   three subsurface blocks. 0 of 256 sampled columns would change — but
-   "0 of 256" is evidence, not a proof: `temperature` moves with `y`
-   (altitude cooling is 0.0045 over 3 blocks, plus the 3D blend), so a
-   column sitting exactly on a climate boundary could in principle pick
-   a different def for a subsurface block than for the surface one. The
-   affected cells are 1-3 blocks under the surface, so the visible
-   difference is what you see after digging. Worth doing as a measured
-   change with a wide equality sweep (thousands of columns across
-   several regions) reporting the disagreement rate, not as a silent
-   hoist. ~4.5 ms of ~48 ms per chunk.
+1. ~~One `biome_def_at` per column~~ — **rejected, 3.28 % of subsurface
+   cells would change** (see above). Do not revisit without changing the
+   climate model itself. This is why the sweep exists: the idea looked
+   free, the cheap sample agreed with it, and it was wrong.
 2. Give `biome_def_at` a variant taking `(temp, humid)` and hoist the
    *per-y* computation to one place in the loop.
-3. Longer term: `at_block_blended` does 8 DashMap gets per call and all
-   1 024 columns of a chunk fall in one or two region cells — the 8
-   corner values are nearly constant for the whole chunk. A per-chunk
-   corner cache would make temperature/humidity/sea_level/continental/
-   hills all close to free. This is the biggest structural win left in
-   the generator and it is measurable before it is written.
+3. **The one to do next**: `at_block_blended` does 8 `DashMap` gets per
+   call, and the climate recompute (4.48 ms of the 4.54 ms) is entirely
+   those gets — `best_fit` over 39 biomes is 0.27 ms, so the search is
+   not the problem. All 1 024 columns of a chunk fall in one or two
+   region cells, so the 8 corner values are nearly constant chunk-wide.
+   A corner memo is EXACT — it returns the same values, unlike option 1
+   — which makes it the right shape: temperature, humidity, sea_level,
+   continental and hills all get close to free, and no equality sweep is
+   needed beyond "same values out".
+
+   The implementation problem is where to put it. `RegionField<T>` is
+   generic and shared across rayon workers, so a `Mutex` memo would
+   contend and a plain `thread_local!` cannot name `T`. The two ways
+   that work: (a) pass a caller-owned `CornerCache<T>` down from
+   `generate_chunk`, which is explicit but touches several signatures;
+   (b) a small direct-mapped per-thread cache in front of `at()` keyed
+   by `(field id, RegionCoord)` with the field carrying a `u32` id.
+   Measure with `biome_pass_breakdown` before and after.
 
 ## Method note
 
