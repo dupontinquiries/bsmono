@@ -2510,6 +2510,7 @@ impl Backend {
             Err(e) => return err_json(&e),
         };
         let card_json = String::from_utf8_lossy(&card.to_bytes()).into_owned();
+        let name = card.name.clone();
         let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
             Ok(l) => l,
             Err(e) => return err_json(&format!("bind port {port}: {e}")),
@@ -2518,7 +2519,7 @@ impl Backend {
         self.advertiser.begin(addr.clone());
         let adv = std::sync::Arc::clone(&self.advertiser);
         std::thread::spawn(move || {
-            let _ = netshare::serve_loop(listener, card_json, adv.clone());
+            let _ = netshare::serve_loop(listener, card_json, name, adv.clone());
             adv.end();
         });
         QString::from(json!({"ok": true, "addr": addr, "name": card.name}).to_string())

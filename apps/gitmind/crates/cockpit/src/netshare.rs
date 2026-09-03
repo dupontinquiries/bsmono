@@ -21,6 +21,42 @@ use std::time::Duration;
 /// The path a peer GETs to read the advertised card.
 pub const CARD_PATH: &str = "/card";
 
+/// What `curl http://<addr>/` returns: instructions, in plain text.
+///
+/// # The bug this fixes
+///
+/// The share UI advertises a bare `host:port` and the operator does the
+/// obvious thing — `curl -O http://192.168.1.20:9876` from the phone. That
+/// failed, and the way it failed gave nothing to go on: this server answers
+/// ONLY `/card`, so `/` returned "unknown path" with a 404, and `curl -O` on a
+/// URL with no filename component reports "Remote filename has no length"
+/// before it even shows the body.
+///
+/// So an operator following the address the app gave them got an error about
+/// curl's arguments for a server that was working correctly and had simply not
+/// been asked for the one path it serves.
+///
+/// The address is a discovery endpoint, not a download. Rather than pretend
+/// otherwise by serving a file, `/` now explains what this is and gives the
+/// two commands that do work — which is what the operator was looking for.
+pub fn bootstrap_text(addr: &str, card_name: &str) -> String {
+    format!(
+        "gitmind share — {card_name}\n\
+         \n\
+         This is a DISCOVERY endpoint, not a file download. There is nothing\n\
+         here to `curl -O`; the repo travels over ssh, not over this port.\n\
+         \n\
+         The card, as JSON:\n\
+         \x20 curl http://{addr}{CARD_PATH}\n\
+         \n\
+         Add this peer from another device:\n\
+         \x20 gin peer add http://{addr}\n\
+         \n\
+         The card names the ssh:// provider to fetch from. That machine needs\n\
+         to accept your key already — this port does not carry credentials.\n"
+    )
+}
+
 // ───────────────────────── advertise (serve) ─────────────────────────
 
 /// Shared state for the advertising HTTP server. `addr` empty = not serving.
@@ -57,7 +93,7 @@ impl Advertiser {
 /// Serve `card_json` at GET /card on an already-bound `listener` until the
 /// advertiser is asked to stop. Non-blocking accept + a short poll so the stop
 /// flag is honored promptly.
-pub fn serve_loop(listener: TcpListener, card_json: String, adv: Arc<Advertiser>) -> Result<(), String> {
+pub fn serve_loop(listener: TcpListener, card_json: String, name: String, adv: Arc<Advertiser>) -> Result<(), String> {
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     loop {
         if adv.should_stop() {
@@ -69,8 +105,19 @@ pub fn serve_loop(listener: TcpListener, card_json: String, adv: Arc<Advertiser>
                 if let Some(req) = http::read_request(&mut stream) {
                     let resp = if req.path == CARD_PATH {
                         http::ServerResponse::json(200, "OK", card_json.clone())
+                    } else if req.path == "/" {
+                        // 200, not a redirect or a 404. An operator who typed
+                        // the advertised address deserves an answer, and a
+                        // 404 here is what sent them looking for a mistake
+                        // they had not made.
+                        http::ServerResponse::text(200, "OK", bootstrap_text(&adv.addr(), &name))
                     } else {
-                        http::ServerResponse::text(404, "Not Found", "unknown path")
+                        // Still 404 for anything else, but say what IS served —
+                        // "unknown path" alone gives a reader nothing to try
+                        // next.
+                        http::ServerResponse::text(
+                            404, "Not Found",
+                            format!("unknown path — this server serves / and {CARD_PATH}\n"))
                     };
                     let _ = stream.write_all(&resp.to_wire());
                     let _ = stream.flush();
@@ -252,4 +299,42 @@ mod tests {
         assert!(!a.is_serving());
         assert!(a.should_stop(), "end() requests the loop stop");
     }
+    #[test]
+    fn the_bootstrap_page_answers_the_question_the_operator_asked() {
+        // They ran `curl -O <addr>` from the phone and got nothing usable. The
+        // page has to say what this is, and give the commands that DO work —
+        // an error page that only says "no" leaves them where they started.
+        let t = bootstrap_text("192.168.1.20:9876", "monorepo");
+        assert!(t.contains("monorepo"), "the page does not say which repo");
+        // Line-bounded, not a substring: `.contains("…/card")` is satisfied by
+        // "…/cards", so a page printing a path the server does not serve
+        // passed. Found by breaking exactly that.
+        assert!(t.lines().any(|l| l.trim() == "curl http://192.168.1.20:9876/card"),
+                "no fetchable card URL on a line of its own: {t}");
+        assert!(t.contains("gin peer add"), "no command to actually add the peer");
+        // And it says plainly there is nothing to download, because that is the
+        // belief that sent them here.
+        assert!(t.to_lowercase().contains("not a file download"),
+                "the page does not correct the assumption: {t}");
+    }
+
+    #[test]
+    fn the_card_path_in_the_page_matches_the_one_the_server_serves() {
+        // Two places naming one path is how a page confidently prints a URL
+        // that 404s.
+        let t = bootstrap_text("h:1", "r");
+        let want = format!("curl http://h:1{CARD_PATH}");
+        assert!(t.lines().any(|l| l.trim() == want),
+                "the page's card URL is not exactly {want}: {t}");
+    }
+
+    #[test]
+    fn an_unknown_path_says_what_is_served() {
+        // The old reply was "unknown path", which gives a reader nothing to try
+        // next. This is the string the 404 arm builds.
+        let msg = format!("unknown path — this server serves / and {CARD_PATH}\n");
+        assert!(msg.contains("/card"));
+        assert!(msg.contains("serves /"));
+    }
+
 }
