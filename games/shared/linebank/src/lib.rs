@@ -41,6 +41,7 @@
 //! designs a three-slot line and discovers it is 60 reads at the session.
 
 pub mod assets;
+pub mod ids;
 pub mod session;
 pub mod wav_error;
 pub mod slice;
