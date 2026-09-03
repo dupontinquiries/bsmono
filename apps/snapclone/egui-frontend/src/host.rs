@@ -375,7 +375,22 @@ impl Snapclone {
                     &self.cameras, &self.settings.current.camera.device);
             }
             HostEvent::CameraWorked { id, now_ms } => self.note_camera_worked(&id, now_ms),
-            HostEvent::CameraFrame(f) => self.frames.offer(f),
+            HostEvent::CameraFrame(f) => {
+                // Into the recording FIRST, while the frame is still owned
+                // here: `frames.offer` moves it into the pump.
+                //
+                // The sink discards for now — there is no encoder linked (§15
+                // step 2) — but the admission rules, the frame count and the
+                // measured rate are all real, so what the app reports about a
+                // recording is measured rather than assumed. Dropping the
+                // pixels is also the correct shape: `video_record` keeps none
+                // either, and a sink that buffered them would be the voice-kit
+                // leak again.
+                if let Some(r) = self.recorder.as_mut() {
+                    let _ = r.offer(&f, &mut |_| {});
+                }
+                self.frames.offer(f)
+            }
             HostEvent::CaptureStatus(st) => self.capture_status = st,
             HostEvent::SnapStateLoaded(st) => {
                 self.snap_state = *st;
@@ -1346,6 +1361,49 @@ mod tests {
         let mut s = app();
         assert!(s.apply(HostEvent::WindowFocus(true)).is_empty());
         assert!(s.apply(HostEvent::GazeLost).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod recording_wiring_tests {
+    use super::*;
+
+    fn frame(seq: u64, ms: u64) -> frame_pump::RawFrame {
+        frame_pump::RawFrame {
+            width: 32, height: 32, captured_ms: ms, seq,
+            rgba: vec![0u8; 32 * 32 * 4].into(),
+        }
+    }
+
+    #[test]
+    fn camera_frames_reach_the_recorder_only_while_recording() {
+        // The WIRING, which `video_record`'s own tests cannot see: they prove
+        // the recorder counts correctly and pass perfectly with nothing
+        // feeding it. Same split that hid the IME hook and the JPEG quality
+        // clamp.
+        let mut s = Snapclone::new(Vec::new());
+        s.apply(HostEvent::CameraFrame(frame(1, 0)));
+        assert!(s.recorder.is_none(), "a recorder appeared without a gesture");
+
+        s.recorder = Some(crate::video_record::Recorder::new(
+            crate::video_record::Limits::default()));
+        s.apply(HostEvent::CameraFrame(frame(2, 100)));
+        s.apply(HostEvent::CameraFrame(frame(3, 200)));
+        let r = s.recorder.as_ref().expect("still recording");
+        assert_eq!(r.frames(), 2, "camera frames are not reaching the recorder");
+        assert!((r.duration_secs() - 0.1).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_frame_still_reaches_the_pump_after_the_recorder_sees_it() {
+        // The recorder borrows the frame before `frames.offer` moves it. If
+        // that order were wrong the preview would freeze during every
+        // recording, which is a worse bug than not recording at all.
+        let mut s = Snapclone::new(Vec::new());
+        s.recorder = Some(crate::video_record::Recorder::new(
+            crate::video_record::Limits::default()));
+        s.apply(HostEvent::CameraFrame(frame(1, 0)));
+        assert!(s.frames.has_frame(), "the preview stopped getting frames");
     }
 }
 

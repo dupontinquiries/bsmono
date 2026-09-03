@@ -158,6 +158,12 @@ pub struct Snapclone {
     /// What the shutter last did, shown under it. Plain state rather than a
     /// toast system: this app has none, and adding one to report a duration
     /// would be the tail wagging the dog.
+    /// The recording in progress, if the shutter is held.
+    ///
+    /// `Option` because a `Recorder` is only meaningful during a recording and
+    /// its counters must start clean each time — reusing one would report the
+    /// previous clip's duration on the next.
+    pub recorder: Option<crate::video_record::Recorder>,
     pub shutter_note: String,
     /// Why the last feed tap did not open a viewer. Empty when there is
     /// nothing to say.
@@ -709,6 +715,7 @@ impl Snapclone {
             cameras: Vec::new(),
             cam_selection: None,
             shutter: Default::default(),
+            recorder: None,
             shutter_note: String::new(),
             feed_note: String::new(),
             local_id: String::new(),
@@ -3889,12 +3896,31 @@ impl Snapclone {
             };
             match ev {
                 Some(crate::shutter::Shutter::Photo) => self.shutter_pressed = true,
+                Some(crate::shutter::Shutter::RecordStarted) => {
+                    // A FRESH recorder each time. Reusing one would report the
+                    // previous clip's duration on the next.
+                    self.recorder = Some(crate::video_record::Recorder::new(
+                        crate::video_record::Limits::default()));
+                }
                 Some(crate::shutter::Shutter::RecordStopped { duration_ms }) => {
                     // Report the DURATION: a recording that stopped without
                     // saying how long it was leaves the user unsure whether it
                     // captured anything at all.
-                    self.shutter_note = format!("recorded {:.1}s",
-                                                duration_ms as f32 / 1000.0);
+                    //
+                    // And report that NOTHING WAS WRITTEN, because nothing was.
+                    // The frames were counted and measured; no encoder is linked
+                    // yet (C14_TODO §15 step 2). Saying "recorded 3.2s" alone
+                    // would be the same lie `EncoderReady(true)` tells on the
+                    // voice path — §14 — and this one is avoidable today.
+                    self.shutter_note = match self.recorder.take() {
+                        Some(r) => format!(
+                            "would record {:.1}s — {} frames at {:.0} fps, no encoder linked yet",
+                            r.duration_secs(),
+                            r.frames(),
+                            r.measured_fps().unwrap_or(0.0),
+                        ),
+                        None => format!("recorded {:.1}s", duration_ms as f32 / 1000.0),
+                    };
                 }
                 Some(crate::shutter::Shutter::OpenModePicker) => {
                     // The voice/text picker does not exist yet, so this RECORDS
