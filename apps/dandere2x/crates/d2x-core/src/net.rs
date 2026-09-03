@@ -335,23 +335,46 @@ impl Network {
         for op in &self.ops {
             match op {
                 Op::Conv(c) => {
-                    let src_t = bufs[c.src].as_ref().expect("conv src");
-                    let (ih, iw) = (src_t.h * c.in_scale as usize, src_t.w * c.in_scale as usize);
-                    let (oh, ow) = (ih + 2 * c.pad as usize - 2, iw + 2 * c.pad as usize - 2);
-                    let residual = c.residual.map(|(b, s)| (bufs[b].as_ref().expect("residual buf").clone(), s));
-                    // A dense-block conv reads [0, src_ch) and writes [dst_off, ..) of
-                    // the same buffer; the ranges are disjoint, so a copy of the
-                    // input channels is the honest reference semantics.
-                    let src_owned: Tensor = {
-                        let mut t = Tensor::zeros(c.src_ch, src_t.h, src_t.w);
-                        for ch in 0..c.src_ch {
-                            t.plane_mut(ch).copy_from_slice(src_t.plane(ch));
-                        }
-                        t
+                    let (sh, sw) = {
+                        let t = bufs[c.src].as_ref().expect("conv src");
+                        (t.h, t.w)
                     };
-                    let mut dst = bufs[c.dst].take().filter(|t| t.h == oh && t.w == ow).unwrap_or_else(|| Tensor::zeros(self.bufs[c.dst].channels, oh, ow));
-                    conv3x3_cpu(c, &src_owned, &mut dst, residual.as_ref());
-                    bufs[c.dst] = Some(dst);
+                    let (ih, iw) = (sh * c.in_scale as usize, sw * c.in_scale as usize);
+                    let (oh, ow) = (ih + 2 * c.pad as usize - 2, iw + 2 * c.pad as usize - 2);
+                    let plane = oh * ow;
+                    if c.src == c.dst {
+                        // A dense block reads the front of a buffer and writes
+                        // further along the same one. The ranges are disjoint,
+                        // so split rather than copy the input — that copy was
+                        // up to 192 planes, ~280 times per RRDB tile.
+                        debug_assert!(c.dst_off >= c.src_ch, "aliased conv must write past what it reads");
+                        let mut buf = bufs[c.dst].take().expect("aliased conv buffer");
+                        let res = c.residual.map(|(b, sc)| (bufs[b].as_ref().expect("residual buf").data.clone(), sc));
+                        let (head, tail) = buf.data.split_at_mut(c.dst_off * plane);
+                        conv3x3_core(c, head, sh, sw, tail, oh, ow, res.as_ref().map(|(d, sc)| (d.as_slice(), *sc)));
+                        bufs[c.dst] = Some(buf);
+                    } else {
+                        // `conv_body` adds its residual from the buffer it also
+                        // writes, so that one has to be copied; every other
+                        // residual (the per-RDB one, which runs 69 times more
+                        // often) reads a different buffer and is borrowed.
+                        let res_owned = match c.residual {
+                            Some((b, sc)) if b == c.dst => Some((bufs[b].as_ref().expect("residual buf").data.clone(), sc)),
+                            _ => None,
+                        };
+                        // Take the destination out first; the source and the
+                        // residual are then plain shared borrows, no clones.
+                        let mut dst = bufs[c.dst].take().filter(|t| t.h == oh && t.w == ow).unwrap_or_else(|| Tensor::zeros(self.bufs[c.dst].channels, oh, ow));
+                        let src = bufs[c.src].as_ref().expect("conv src");
+                        let res = match (&res_owned, c.residual) {
+                            (Some((d, sc)), _) => Some((d.as_slice(), *sc)),
+                            (None, Some((b, sc))) => Some((bufs[b].as_ref().expect("residual buf").data.as_slice(), sc)),
+                            _ => None,
+                        };
+                        let base = c.dst_off * plane;
+                        conv3x3_core(c, &src.data, sh, sw, &mut dst.data[base..], oh, ow, res);
+                        bufs[c.dst] = Some(dst);
+                    }
                 }
                 Op::Deconv(d) => {
                     let src = bufs[d.src].as_ref().expect("deconv src");
@@ -359,21 +382,25 @@ impl Network {
                     bufs[d.dst] = Some(out);
                 }
                 Op::Copy { src, dst, dst_off, ch } => {
-                    let s = bufs[*src].as_ref().expect("copy src").clone();
-                    let mut d = bufs[*dst].take().filter(|t| t.h == s.h && t.w == s.w).unwrap_or_else(|| Tensor::zeros(self.bufs[*dst].channels, s.h, s.w));
+                    let (sh, sw) = {
+                        let t = bufs[*src].as_ref().expect("copy src");
+                        (t.h, t.w)
+                    };
+                    let mut d = bufs[*dst].take().filter(|t| t.h == sh && t.w == sw).unwrap_or_else(|| Tensor::zeros(self.bufs[*dst].channels, sh, sw));
+                    let s = bufs[*src].as_ref().expect("copy src");
                     for c in 0..*ch {
                         d.plane_mut(dst_off + c).copy_from_slice(s.plane(c));
                     }
                     bufs[*dst] = Some(d);
                 }
                 Op::AddScaled { dst, src, ch, scale } => {
-                    let s = bufs[*src].as_ref().expect("add src").clone();
-                    let d = bufs[*dst].as_mut().expect("add dst");
-                    for c in 0..*ch {
-                        for (dv, sv) in d.plane_mut(c).iter_mut().zip(s.plane(c)) {
-                            *dv = *dv * scale + sv;
-                        }
+                    let mut d = bufs[*dst].take().expect("add dst");
+                    let s = bufs[*src].as_ref().expect("add src");
+                    let n = d.h * d.w * *ch;
+                    for (dv, sv) in d.data[..n].iter_mut().zip(&s.data[..n]) {
+                        *dv = *dv * scale + sv;
                     }
+                    bufs[*dst] = Some(d);
                 }
             }
         }
@@ -383,22 +410,28 @@ impl Network {
 
 /// Same/valid 3×3 conv with folded nearest upsampling, residual, activation.
 /// Writes channels `[dst_off, dst_off+out_ch)` of `dst`.
-pub fn conv3x3_cpu(c: &ConvOp, x: &Tensor, dst: &mut Tensor, residual: Option<&(Tensor, f32)>) {
+/// Convolve `src` (`src_ch` planes of `sh` x `sw`) into `out`, which holds
+/// `out_ch` contiguous planes of `oh` x `ow` starting at its own channel 0.
+///
+/// Slice-based rather than `Tensor`-based so a dense block, which reads the
+/// front of a buffer and writes further along the same one, can pass two
+/// disjoint halves instead of copying its input.
+#[allow(clippy::too_many_arguments)]
+pub fn conv3x3_core(c: &ConvOp, src: &[f32], sh: usize, sw: usize, out: &mut [f32], oh: usize, ow: usize, residual: Option<(&[f32], f32)>) {
     let s = c.in_scale as usize;
-    let (ih, iw) = (x.h * s, x.w * s);
+    let (ih, iw) = (sh * s, sw * s);
     let pad = c.pad as usize;
-    let (oh, ow) = (dst.h, dst.w);
     debug_assert_eq!((oh, ow), (ih + 2 * pad - 2, iw + 2 * pad - 2));
     let in_ch = c.src_ch;
     let plane = oh * ow;
-    let base = c.dst_off * plane;
+    let src_plane = sh * sw;
     // Output channels are handled four at a time so each input row is read
     // once and used twelve times (4 channels x 3 taps) instead of being
     // re-read for every channel. Same trade that won on the GPU, and it counts
     // for more here because memory is the tighter resource on the machines
     // this path serves.
     const OCB: usize = 4;
-    dst.data[base..base + c.out_ch * plane].par_chunks_mut(OCB * plane).enumerate().for_each(|(g, outs)| {
+    out[..c.out_ch * plane].par_chunks_mut(OCB * plane).enumerate().for_each(|(g, outs)| {
         let oc0 = g * OCB;
         let nch = OCB.min(c.out_ch - oc0);
         for j in 0..nch {
@@ -416,13 +449,13 @@ pub fn conv3x3_cpu(c: &ConvOp, x: &Tensor, dst: &mut Tensor, residual: Option<&(
         // kx), so this is bit-identical, not merely close.
         for oy in 0..oh {
             for ic in 0..in_ch {
-                let xp = x.plane(ic);
+                let xp = &src[ic * src_plane..(ic + 1) * src_plane];
                 for ky in 0..3 {
                     let sy = oy + ky;
                     if sy < pad || sy - pad >= ih {
                         continue;
                     }
-                    let row = &xp[((sy - pad) / s) * x.w..((sy - pad) / s + 1) * x.w];
+                    let row = &xp[((sy - pad) / s) * sw..((sy - pad) / s + 1) * sw];
                     for kx in 0..3 {
                         // Output columns whose source column sx = ox + kx - pad is inside [0, iw).
                         let ox0 = pad.saturating_sub(kx);
@@ -453,7 +486,7 @@ pub fn conv3x3_cpu(c: &ConvOp, x: &Tensor, dst: &mut Tensor, residual: Option<&(
             let oc = oc0 + j;
             let out = &mut outs[j * plane..(j + 1) * plane];
             if let Some((r, scale)) = residual {
-                for (v, rv) in out.iter_mut().zip(r.plane(oc)) {
+                for (v, rv) in out.iter_mut().zip(&r[oc * plane..(oc + 1) * plane]) {
                     *v = *v * scale + rv;
                 }
             }

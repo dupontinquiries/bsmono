@@ -65,6 +65,13 @@ fn hot_paths() {
             let tile = frame(64, 64);
             time("CPU upscale, SRVGG, 64x64 tile", 3, || net.upscale_cpu(&tile, 64));
         }
+        // RRDB is where the per-conv clones were: dense blocks copy up to 192
+        // planes, ~280 times a tile.
+        if let Ok(w) = std::env::var("D2X_RRDB_X2") {
+            let net = Network::load(std::path::Path::new(&w)).unwrap();
+            let tile = frame(48, 48);
+            time("CPU upscale, RRDB x2, 48x48 tile", 1, || net.upscale_cpu(&tile, 48));
+        }
     }
 
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/realesr-animevideov3.safetensors");

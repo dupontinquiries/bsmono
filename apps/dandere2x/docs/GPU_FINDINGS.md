@@ -259,6 +259,22 @@ the row keeps one output row in L1 across all of them. Expect a larger win on
 a phone than the 1.23x seen here, since the sandbox has more cache than the
 targets do.
 
+**Removing the per-op tensor clones was worth 6% on RRDB** (8389 → 7878 ms for
+a 48x48 tile) and nothing measurable on SRVGG, which has no aliased convs to
+clone for. The executor used to copy the whole source activation before every
+conv — up to 192 planes, about 280 times per RRDB tile — because a dense block
+reads the front of a buffer and writes further along the same one, which the
+borrow checker will not allow without separating them. `split_at_mut` on the
+one buffer does it for free. `Copy` and `AddScaled` cloned their sources too;
+taking the destination out of its slot first makes the rest plain shared
+borrows. One clone remains and is worth keeping: `conv_body` adds its residual
+from the buffer it also writes, but that runs once per network against the
+per-RDB residual's 69 times.
+
+Less than the arithmetic suggests, because the convolution's own memory traffic
+dominates the copies — but it also cuts allocation churn, which counts for more
+on a small machine than the 6% does here.
+
 **Channel blocking added only 2%** — four output channels per task so each
 input row is read once and used twelve times. The same trade was worth 9% on
 the GPU; here the input rows were evidently already resident, so the ceiling is
