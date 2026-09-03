@@ -562,6 +562,10 @@ fn main() {
         eprintln!("usage: fold_audit <bots dir> <chassis>... | <bots dir> --sweep-all");
         std::process::exit(2);
     }
+    if args.get(2).map(|a| a == "--colors").unwrap_or(false) {
+        dump_colors(&PathBuf::from(&args[1]));
+        return;
+    }
     let root = PathBuf::from(&args[1]);
     let names: Vec<String> = if args[2] == "--sweep-all" {
         let mut v: Vec<String> = std::fs::read_dir(&root)
@@ -718,4 +722,23 @@ fn main() {
         pct(&mut isl_all, 0.5), pct(&mut isl_all, 0.9), pct(&mut isl_all, 1.0)
     );
     println!("\n{ex_hits} with a part leaving the body mid-fold, {isl_hits} with a part floating free at rest, {con_hits} where containment made the overhang worse, of {checked} checked");
+}
+
+#[allow(dead_code)]
+fn dump_colors(dir: &Path) {
+    let raws = model::load_raw_unoriented(dir);
+    let mut seen: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    for p in &raws {
+        let k = format!("{:.2},{:.2},{:.2}", p.color[0], p.color[1], p.color[2]);
+        let e = seen.entry(k).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += p.verts.len();
+    }
+    println!("{} prims, {} distinct colours:", raws.len(), seen.len());
+    for (k, (n, v)) in seen {
+        println!("   {k}   {n} prims, {v} verts");
+    }
+    let tex: std::collections::BTreeSet<&str> =
+        raws.iter().filter_map(|p| p.tex_uri.as_deref()).collect();
+    println!("   textures: {:?}", tex);
 }
