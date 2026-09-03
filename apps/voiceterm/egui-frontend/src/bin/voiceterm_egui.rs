@@ -3874,11 +3874,18 @@ impl eframe::App for VoicetermApp {
             if let Some(sel) = self.app.selection.clone() {
                 if let Some(vrow) = sel.row {
                     let abs = self.session.grid.abs_row_of_viewport(vrow);
-                    let line = self.session.grid.abs_row_text(abs);
-                    let fixed = line.trim_end().to_string();
+                    // A tap carries its column and means the WORD there;
+                    // a long-press carries none and means the line.
+                    // Reading the line for both would turn every tap into
+                    // a line selection without saying so.
+                    let fixed = match sel.col {
+                        Some(col) => self.session.grid.word_at(abs, col),
+                        None => self.session.grid.abs_row_text(abs).trim_end().to_string(),
+                    };
                     if !fixed.is_empty() {
                         self.app.selection = Some(uikit_term::Selection {
                             row: Some(vrow),
+                            col: sel.col,
                             text: fixed,
                         });
                     } else {

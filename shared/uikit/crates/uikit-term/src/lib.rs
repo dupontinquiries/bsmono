@@ -988,9 +988,17 @@ const CELL_H_RATIO: f32 = 1.3;
 /// A tap or long-press's resolved terminal position + (for long-press) what it selected.
 #[derive(Clone, Debug, Default)]
 pub struct Selection {
-    /// The row this selection is on, if any.
+    /// The VIEWPORT row this selection is on, if any.
     pub row: Option<usize>,
-    /// The selected text (a word for a tap-and-hold on it, a whole line for a long-press).
+    /// The column that was hit, for a tap. `None` for a long-press,
+    /// which selects the whole line and has no single column.
+    ///
+    /// Carried because a host may hit-test with THIS widget (it owns the
+    /// cell metrics) while the text lives in a different grid — see
+    /// `cell_at`. Without the column such a host can only recover the
+    /// line, so a tap-to-select-WORD silently becomes select-line.
+    pub col: Option<usize>,
+    /// The selected text (a word for a tap on it, a whole line for a long-press).
     pub text: String,
 }
 
@@ -1362,13 +1370,14 @@ impl App {
                         if let Some(url) = url_in_word(&word) {
                             self.link_tap = Some((egui::pos2(p.x, p.y), url));
                         }
-                        self.selection = Some(Selection { row: Some(row), text: word });
+                        self.selection = Some(Selection { row: Some(row), col: Some(col), text: word });
                     }
                 }
                 uikit_egui::touch::Gesture::LongPress(p) => {
                     if let Some((_, row)) = self.cell_at(origin, egui::pos2(p.x, p.y)) {
                         let line = self.terminal.grid.global_line_of_viewport_row(row);
-                        self.selection = Some(Selection { row: Some(row), text: self.terminal.grid.line_text_global(line) });
+                        // No column: a long-press takes the whole line.
+                        self.selection = Some(Selection { row: Some(row), col: None, text: self.terminal.grid.line_text_global(line) });
                     }
                     self.long_press = Some(egui::pos2(p.x, p.y));
                 }
@@ -1603,6 +1612,18 @@ mod tests {
     }
 
     #[test]
+    fn a_tap_carries_its_column_and_a_long_press_does_not() {
+        // The distinction is what lets a host that hit-tests here but
+        // reads text elsewhere tell select-WORD from select-LINE. Without
+        // it, such a host can only recover the line and tap-to-select-word
+        // silently becomes select-line.
+        let word = Selection { row: Some(2), col: Some(7), text: "cargo".into() };
+        let line = Selection { row: Some(2), col: None, text: "cargo test".into() };
+        assert!(word.col.is_some());
+        assert!(line.col.is_none(), "a long-press has no single column");
+    }
+
+    #[test]
     fn word_at_finds_the_whitespace_delimited_word() {
         assert_eq!(word_at("hello world", 0), "hello");
         assert_eq!(word_at("hello world", 4), "hello");
@@ -1716,7 +1737,7 @@ mod tests {
         let expect = app.terminal.grid.line_text_global(shown);
         // simulate what the LongPress handler now does
         let line = app.terminal.grid.global_line_of_viewport_row(0);
-        app.selection = Some(Selection { row: Some(0), text: app.terminal.grid.line_text_global(line) });
+        app.selection = Some(Selection { row: Some(0), col: None, text: app.terminal.grid.line_text_global(line) });
         assert_eq!(app.selection.as_ref().unwrap().text, expect);
         assert_ne!(expect, app.terminal.grid.row_text(0), "scrolled view must not read the live row");
     }
@@ -1760,7 +1781,7 @@ mod tests {
         let tap_pos = egui::pos2(cw * 8.5, ch * 0.5);
         if let Some((col, row)) = app.cell_at(origin, tap_pos) {
             let word = word_at(&app.terminal.grid.row_text(row), col);
-            app.selection = Some(Selection { row: Some(row), text: word });
+            app.selection = Some(Selection { row: Some(row), col: Some(col), text: word });
         }
         assert_eq!(app.selection.as_ref().map(|s| s.text.as_str()), Some("world"));
     }
