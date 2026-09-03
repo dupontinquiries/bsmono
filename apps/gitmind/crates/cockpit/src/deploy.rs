@@ -508,6 +508,66 @@ pub fn parse_dir_listing(stdout: &str) -> Vec<String> {
 
 /// rsync argv to push the monorepo working tree (minus build artifacts) to the
 /// device. Pure builder so the exact flags are unit-tested.
+/// What opening a port on a device came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortOpen {
+    /// A firewall was found and told about the port.
+    Opened(crate::device_firewall::DeviceFirewall),
+    /// A firewall was found and refused. Carries its output.
+    Failed(String),
+    /// No firewall this fleet knows. Not an error — see `unknown_advice`.
+    Unknown,
+    /// The device could not be reached to ask.
+    Unreachable(String),
+}
+
+impl PortOpen {
+    /// Advisory text, empty when there is nothing to say.
+    ///
+    /// None of these is fatal. A bootstrap whose firewall step failed still
+    /// deployed the code, and aborting there would turn a warning into a lost
+    /// build — while silently continuing is how the operator ends up curling
+    /// at a port nothing will answer.
+    pub fn note(&self, port: u16) -> String {
+        match self {
+            PortOpen::Opened(fw) => format!("opened tcp/{port} on the device ({fw:?})"),
+            PortOpen::Failed(why) => format!(
+                "could not open tcp/{port} on the device: {why}. The deploy \
+                 finished; the port may need opening by hand."
+            ),
+            PortOpen::Unknown => crate::device_firewall::unknown_advice(port),
+            PortOpen::Unreachable(why) => format!(
+                "could not ask the device about tcp/{port}: {why}"
+            ),
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        matches!(self, PortOpen::Opened(_))
+    }
+}
+
+/// Ask the device what firewall it runs, then tell that firewall about `port`.
+///
+/// Two round trips rather than one script, on purpose: the DETECTION result is
+/// worth reporting on its own. A device that turns out to run awall and one
+/// that runs nothing need different follow-up from the operator, and a single
+/// fused command would collapse both into "it worked" or "it did not".
+pub fn ensure_port_open_remote(user: &str, host: &str, port: u16) -> PortOpen {
+    use crate::device_firewall as fw;
+    let detected = match remote_capture(user, host, &fw::detect_cmd()) {
+        Ok(out) => fw::parse_detect(&out),
+        Err(e) => return PortOpen::Unreachable(e),
+    };
+    let Some(cmd) = fw::open_cmd(detected, port) else {
+        return PortOpen::Unknown;
+    };
+    match remote_capture(user, host, &cmd) {
+        Ok(_) => PortOpen::Opened(detected),
+        Err(e) => PortOpen::Failed(e),
+    }
+}
+
 /// The remote shell script that installs one daemon, from its [`InstallPlan`].
 ///
 /// Returned as a STRING rather than executed, for the same reason the plan is
@@ -1702,6 +1762,46 @@ mod tests {
         // And `set -e`, so a failed enable does not get followed by a start
         // that reports success.
         assert!(sh.starts_with("set -e"), "{sh}");
+    }
+
+    #[test]
+    fn every_port_open_outcome_says_something_useful_and_names_the_port() {
+        // A bootstrap that silently skipped the firewall is how the operator
+        // ends up curling at a port nothing will answer.
+        use crate::device_firewall::DeviceFirewall;
+        let cases = [
+            PortOpen::Opened(DeviceFirewall::Awall),
+            PortOpen::Failed("permission denied".into()),
+            PortOpen::Unknown,
+            PortOpen::Unreachable("ssh: connect timed out".into()),
+        ];
+        for c in &cases {
+            let n = c.note(9876);
+            assert!(!n.is_empty(), "{c:?} produced no note");
+            assert!(n.contains("9876"), "{c:?} does not name the port: {n}");
+        }
+        assert!(cases[0].is_open());
+        assert!(!cases[1].is_open() && !cases[2].is_open() && !cases[3].is_open());
+    }
+
+    #[test]
+    fn a_failure_says_the_deploy_still_finished() {
+        // None of these is fatal. An operator who reads "could not open the
+        // port" and assumes the whole deploy rolled back will redo work that
+        // succeeded.
+        let n = PortOpen::Failed("nope".into()).note(9876);
+        assert!(n.contains("deploy \nfinished") || n.contains("deploy finished"),
+                "the note does not say the deploy completed: {n}");
+    }
+
+    #[test]
+    fn the_detected_firewall_is_named_in_the_success_note() {
+        // Which one it was matters to the operator: an awall device and an
+        // nftables device need different follow-up if the rule later
+        // disappears.
+        use crate::device_firewall::DeviceFirewall;
+        assert!(PortOpen::Opened(DeviceFirewall::Awall).note(1).contains("Awall"));
+        assert!(PortOpen::Opened(DeviceFirewall::Nftables).note(1).contains("Nftables"));
     }
 
 }

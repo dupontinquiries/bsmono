@@ -841,3 +841,67 @@ That is the join between this chapter and §16. `system/` is where daemons live;
 Steps 1 and 2 are pure and testable here. Step 3 needs a cross toolchain in the
 sandbox, which apt can probably supply (`gcc-aarch64-linux-gnu`,
 `musl-tools`) — untested. Step 4 needs a device.
+
+## 18. gitmind LAN share: three independent failures, and where the fix stops
+
+Reported as "curl -O <addr> on the phone didn't work". It was three separate
+things, any one of which produces that symptom, and the operator had no way to
+tell them apart.
+
+### 1. The advertised address served nothing at `/`
+
+`netshare::serve_loop` answers exactly one path, `/card`, and 404'd everything
+else with "unknown path". The UI advertises a bare `host:port`, so the obvious
+command hits `/`, and `curl -O` on a URL with no filename reports "Remote
+filename has no length" before printing the body. Fixed in 6e44c224: `/` now
+returns a plain-text page explaining what the endpoint is and giving the two
+commands that work.
+
+### 2. The advertised address could be one no peer can reach
+
+`local_ip()` reads back the interface holding the DEFAULT ROUTE. Wrong twice:
+a VPN holding the route advertises a `100.64/10` the phone cannot see, and no
+default route at all makes it return `None` — after which the caller fell back
+to `127.0.0.1` and displayed it as if it were fine. Fixed in 75357fbc
+(ranking) and 2ee0ce56 (enumerating real interfaces, and refusing to advertise
+when nothing usable exists).
+
+### 3. Packets can be dropped at either end
+
+The desktop's own firewall is now caught by `netshare::self_check`
+(201d2cd3), which connects to the host's OWN LAN address — not loopback, which
+bypasses the INPUT chain and would report success on a machine dropping every
+LAN packet.
+
+The device's firewall is `device_firewall` + `deploy::ensure_port_open_remote`
+(a967eccd, this commit). awall is the one that matters: postmarketOS uses it,
+it COMPILES policies into the ruleset, and `awall activate` discards any raw
+iptables rule — so the naive fix works and then silently stops.
+
+### Where this stops, and what needs a device
+
+**The awall policy schema is written from documentation, not from a machine
+that accepted it.** If a field name is wrong, `awall enable` fails and the port
+stays shut. That is the single highest-value thing to check, and it is one
+command on the phone:
+
+    # run the generated command, then:
+    awall list        # gitmind-share should appear, enabled
+
+Also not done: nothing CALLS `ensure_port_open_remote` yet. The function and
+its reporting are tested; the bootstrap flow does not invoke it, deliberately,
+because wiring it before the schema is confirmed would put an untested remote
+command in the path of every deploy.
+
+### A test-writing note this thread produced twice
+
+Two assertions passed on the wrong thing, both substring matches where the
+wrong value contained the right one:
+
+* `contains("/card")` was satisfied by a page printing `/cards`
+* `contains("9876")` was satisfied by a message that named the port elsewhere
+  while the `ufw` command lost it
+
+Both are now line- or phrase-exact. For ports, paths and identifiers the wrong
+value being a superstring of the right one is the common case, not the rare
+one — a substring assertion there is close to no assertion at all.
