@@ -273,3 +273,75 @@ this crate specifically the line is
 `--features render,window,ui-overlay`, and the two useful invocations are the
 whole package (which surfaces §9) and `--bin unendlich-fullgame` (which is what
 ships).
+
+## 10. The recurring defect this session found six times: ported, not wired
+
+Six separate instances, in six different apps, of the same shape — code that
+exists, compiles, is often tested, and **nothing calls it**. Listing them
+together because individually each looked like a one-off and collectively they
+are a pattern with a cheap detector.
+
+| what | how it presented | found by |
+|---|---|---|
+| `uikit_egui::fonts::install` | eleven apps drew boxes for glyphs that worked elsewhere | reading switcheroo's colours for an unrelated reason |
+| `d2x-job::preflight` | ported back, then had no caller for an hour | grepping for callers before claiming it done |
+| `net::Blender` | 249 lines and its own tests; `write_output_rgba8` still hard-cropped | the commit that ported it said so |
+| `camera::viewfinder_height` | helper with tests, no callers, after its call site changed | noticing the tests were about nothing |
+| snapclone's shutter | fully wired; the FEEDBACK was a text line nobody sees | tracing it end to end instead of believing the report |
+| `crates/dandere2x/src/{ffmpeg,job}.rs` | 861 lines, 5 tests, undeclared in `src/` after a merge | `orphan_check.py` |
+
+Only the last was caught by a tool. `orphan_check.py` works at FILE
+granularity — a file with no `mod` reaching it — and every other row here is a
+function or a call site, which it cannot see.
+
+### The detector that would work, and why I did not write it
+
+"Public item with no non-test caller anywhere in the workspace" catches all six.
+It also fires on every genuinely-public API — `uikit-egui` exists to be called
+from outside itself — so it needs a notion of which crates are libraries for
+other crates and which are app internals, and that distinction is not in
+`manifest/projects.toml` today (`role = "lib"` exists but only three crates set
+it).
+
+Two ways in, cheapest first:
+
+1. **App crates only.** Skip anything under `shared/`, and anything with
+   `role = "lib"`. Within an app, a `pub fn` with no caller is nearly always
+   dead or unwired, because nothing outside links it. That would have caught
+   `preflight`, `viewfinder_height` and `Blender`.
+2. **Whole fleet, with a KNOWN list**, the way `font_install_check.py` handles
+   its eight. More work, more value, and the list is the interesting output.
+
+Not written because a checker that cries wolf gets ignored (`lock_check.py`'s
+first run said 26 and three of those classes were false), and calibrating this
+one needs a pass over the results that I did not have room for.
+
+### The habit that actually caught them
+
+Five of the six were found by asking "what calls this?" immediately after
+writing or merging something — not by a tool. That question belongs in the
+routine next to the build, and it is cheaper than the checker:
+
+```
+git grep -n 'the_new_function' -- '*.rs' | grep -v test
+```
+
+If the only hits are the definition and its tests, it is not done.
+
+## 11. Verification traps hit this session, as commands rather than principles
+
+Three, all the same species: the obvious invocation was not the one that
+matters.
+
+* **`cargo check -p unendlich-engine --lib` is not the build.** Default features
+  skip the sparse mesher, so a real type error in my own change reached the
+  operator. The line is
+  `cargo check --bin unendlich-fullgame --features render,window,ui-overlay`.
+* **`cargo check --all-features` is not the build either.** On `beatspace` it
+  pulls a macOS-only path and fails on `objc2` before reaching any of the
+  crate's own code. Default features are clean.
+* **A break test needs its backup from git, not from disk.** Twice a batched
+  break loop failed partway, and the next command's `cp` captured the ALREADY
+  BROKEN file as the "clean" backup; the restore then put back a file missing a
+  guard, and only a test caught it. `git show HEAD:path > /tmp/backup` has no
+  such failure mode.
