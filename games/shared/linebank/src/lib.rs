@@ -41,6 +41,7 @@
 //! designs a three-slot line and discovers it is 60 reads at the session.
 
 pub mod slice;
+pub mod verify;
 
 use std::collections::{BTreeMap, BTreeSet};
 
