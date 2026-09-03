@@ -9,6 +9,7 @@
 
 pub mod pngutil;
 pub mod constants;
+pub mod scale;
 pub mod runtime_flags;
 pub mod thread_probe;
 pub mod warn_snipe;

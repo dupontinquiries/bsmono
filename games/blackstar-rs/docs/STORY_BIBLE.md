@@ -304,6 +304,9 @@ two_artifacts
 asteri_were_not_first
 architecture_is_machine
 edge_lattice
+machine_answers_the_watch
+glaciem_was_an_outpost
+vault_plate_is_complete
 cold_war_debris
 later_forgery
 instrument_artefact
