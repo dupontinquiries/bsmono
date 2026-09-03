@@ -162,13 +162,12 @@ impl VoicetermApp {
         // nothing appears — that is the actual "text does not go into
         // the terminal" bug, underneath all the input-path ones.
         //
-        // Feeding both rather than picking one, deliberately and
-        // temporarily: `session.grid` now carries the scrollback, the
-        // find index and the key mode that the input path reads, and
-        // `app.terminal.grid` carries the pixels. Consolidating them is
-        // the fix; doing it inside a screenshot loop at the end of a
-        // long session is how you break a working display.
-        self.session.feed(bytes);
+        // ONE grid now. Everything that read `session.grid` — the key
+        // mode, the cursor row, the resize dimensions, the LLM screen
+        // context, scroll-to-bottom — reads `app.terminal.grid`, which
+        // has all of it natively: cols/rows, cur_row, scrollback, and a
+        // parser that tracks DECCKM. Feeding two was the temporary state
+        // while I worked out which one reaches the screen.
         self.app.terminal.feed(&String::from_utf8_lossy(bytes));
     }
 
@@ -857,7 +856,7 @@ impl VoicetermApp {
         // Reading history and then typing means you want to see what you
         // typed. Every other terminal does this and its absence reads as
         // the keyboard being broken.
-        self.session.grid.scroll_to_bottom();
+        self.app.terminal.grid.scroll_to_bottom();
         self.session.pty_out.extend_from_slice(bytes);
         if let Ok(t) = std::str::from_utf8(bytes) {
             for ch in t.chars().filter(|c| !c.is_control()) {
@@ -892,7 +891,7 @@ impl VoicetermApp {
         for cmd in self.line_buf.feed(bytes) {
             // `start_row`: where the block begins in the scrollback. The
             // kit's tracker stamps its own wall clock.
-            let row = self.session.grid.cursor().1;
+            let row = self.app.terminal.grid.cur_row;
             self.blocks.submit_command(&cmd, row);
         }
     }
@@ -1113,7 +1112,7 @@ impl eframe::App for VoicetermApp {
                 self.last_memlog_s = now;
                 let h = memlog::Holders {
                     terminals: 1,
-                    scrollback_rows: self.session.grid.rows,
+                    scrollback_rows: self.app.terminal.grid.rows,
                     // self.workspace (singular) holds the tabs; self.workspaces
                     // is the VIEW over saved ones and has no count.
                     workspaces: self.workspace.tabs.len(),
@@ -2856,8 +2855,8 @@ impl eframe::App for VoicetermApp {
                         // is to see what would leave, and a preview that only
                         // appears once the feature ships is a preview nobody
                         // checks.
-                        let ctx: String = (0..self.session.grid.rows)
-                            .map(|y| self.session.grid.row_text(y))
+                        let ctx: String = (0..self.app.terminal.grid.rows)
+                            .map(|y| self.app.terminal.grid.row_text(y))
                             .collect::<Vec<_>>()
                             .join("\n");
                         let total = ctx.lines().count();
@@ -3251,7 +3250,7 @@ impl eframe::App for VoicetermApp {
                 // Fourth link in the same chain: encoder, parser, call
                 // site, and now the right parser.
                 voiceterm_egui::pty_input::drain_egui(
-                    ui, self.session.grid.key_mode(),
+                    ui, self.app.terminal.grid.key_mode(),
                     self.workspace.tabs.len() > 1)
             };
             for out in key_outs
@@ -3323,7 +3322,7 @@ impl eframe::App for VoicetermApp {
                         // encoder's own answer to this and had no
                         // consumer, because there was nothing to scroll.
                         if out.snap_to_bottom || uikit_term::keys::clears_the_line(&out.bytes) {
-                            self.session.grid.scroll_to_bottom();
+                            self.app.terminal.grid.scroll_to_bottom();
                         }
                         self.session.pty_out.extend_from_slice(&out.bytes);
                     }
@@ -3382,11 +3381,13 @@ impl eframe::App for VoicetermApp {
             // here to name a foreground process, so the heuristic runs on the
             // prompt text alone — which is the case the module was written for
             // (`foreground` is None rather than guessed).
+            let cursor_row_text =
+                self.app.terminal.grid.row_text(self.app.terminal.grid.cur_row);
             self.password_mode = voiceterm_egui::password_prompt::is_password_prompt(
                 &voiceterm_egui::password_prompt::TermState {
                     alt_screen: false,
                     foreground: None,
-                    visible: Some(&self.session.grid.row_text(self.session.grid.cursor().1)),
+                    visible: Some(&cursor_row_text),
                 });
             // The widget's own find bar, which searches app.terminal's
             // grid — fed since feed_pty started mirroring there, so it
@@ -3492,8 +3493,8 @@ impl eframe::App for VoicetermApp {
             // means nothing has to track when the window changed.
             if let Some(host) = &mut self.pty {
                 host.resize(
-                    self.session.grid.cols.min(u16::MAX as usize) as u16,
-                    self.session.grid.rows.min(u16::MAX as usize) as u16,
+                    self.app.terminal.grid.cols.min(u16::MAX as usize) as u16,
+                    self.app.terminal.grid.rows.min(u16::MAX as usize) as u16,
                 );
             }
 
@@ -3555,8 +3556,14 @@ impl eframe::App for VoicetermApp {
                 // the pane regained focus. The drain exists to stop an
                 // unfocused pane looking frozen; writing to the wrong
                 // grid moved the problem rather than fixing it.
-                if let Some(sess) = self.pane_sessions.get_mut(id) {
-                    sess.feed(&out);
+                // Into the pane's own App — for an unfocused pane that
+                // is where its displayed grid is parked, exactly as
+                // swap_focus left it. I had moved this to pane_sessions
+                // while I believed session.grid was the drawn one; with
+                // one grid per pane living in the App, this is simply
+                // the parked half of the same rule.
+                if let Some(app) = self.pane_apps.get_mut(id) {
+                    app.terminal.feed(&String::from_utf8_lossy(&out));
                 }
                 // `h.ended()` (shell exited while backgrounded) is intentionally not surfaced
                 // here: the toast path above is keyed to the single focused-pane pty_ended_noted

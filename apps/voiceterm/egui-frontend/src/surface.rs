@@ -300,8 +300,9 @@ mod tests {
         // focused pane, so asking it returns the default forever — the
         // expression looks right and the behaviour does not change.
         assert!(
-            src.contains("self.session.grid.key_mode()"),
-            "the key mode must come from a grid feed_pty writes."
+            src.contains("self.app.terminal.grid.key_mode()"),
+            "the key mode must come from the grid feed_pty writes, which is \
+             the DISPLAYED one."
         );
         // ONE INPUT OWNER. uikit_term::App::handle_input and
         // pty_input::drain_egui both read this frame's events; if the
@@ -389,7 +390,7 @@ mod tests {
         // the shell nothing at all.
         assert_eq!(
             src.matches("self.app.terminal.feed(").count(),
-            1, // exactly one: feed_pty, which mirrors shell output to the DISPLAYED grid
+            1, // feed_pty only; the background drain binds a local `app`
             "an input affordance is calling the OUTPUT path again — use \
              send_input for keys and show_line for text this app produced."
         );
