@@ -881,13 +881,35 @@ impl App {
                 HostCommand::CaptureSnap => {
                     let outcome = match self.rig.shared.peek_frame() {
                         Some(f) if f.pixels_plausible() => {
-                            // Kept for Send, in the same format written to
-                            // disk, so what a peer receives is byte for byte
-                            // what the local file holds. A second encoding
-                            // path is a second thing that can differ subtly
-                            // from the photo you looked at.
-                            self.last_snap = Some(snapclone_egui::frame_pump::ppm_bytes(&f));
-                            save_ppm(&f)
+                            // ONE ENCODE, used for both the file and the wire.
+                            //
+                            // The old code called `ppm_bytes` twice — once for
+                            // `last_snap` and again inside `save_ppm` — and
+                            // relied on the encode being deterministic to make
+                            // its "byte for byte what the local file holds"
+                            // claim true. It was true, and it was incidental.
+                            // Encoding once and using the same buffer makes it
+                            // structural: there is no second encode that could
+                            // ever differ.
+                            //
+                            // JPEG rather than raw RGB. A 1080p snap goes from
+                            // 6.2 MB on the wire to about 300 KB; see
+                            // src/media_encode.rs.
+                            match snapclone_egui::media_encode::encode_still(
+                                &f, snapclone_egui::media_encode::DEFAULT_QUALITY)
+                            {
+                                Ok(enc) => {
+                                    let ratio = snapclone_egui::media_encode::compression_ratio(
+                                        &f, enc.bytes.len());
+                                    eprintln!(
+                                        "snapclone: snap {}x{} -> {} KB ({:.0}x smaller than raw)",
+                                        f.width, f.height, enc.bytes.len() / 1024, ratio);
+                                    let r = save_snap(&enc);
+                                    self.last_snap = Some(enc.bytes);
+                                    r
+                                }
+                                Err(e) => Err(e),
+                            }
                         }
                         Some(_) => Err("the frame arrived torn".to_string()),
                         None => Err("no live frame".to_string()),
@@ -1105,17 +1127,22 @@ impl App {
     }
 }
 
-/// Write one frame as binary PPM under the app's data dir, named by wall
-/// clock so a burst of presses cannot overwrite each other within a second
-/// (the millisecond field sees to that).
-fn save_ppm(f: &snapclone_egui::frame_pump::RawFrame) -> Result<String, String> {
+/// Write an already-encoded snap under the app's data dir, named by wall clock
+/// so a burst of presses cannot overwrite each other within a second (the
+/// millisecond field sees to that).
+///
+/// Takes the ENCODED bytes rather than the frame, which is the change that
+/// makes the disk file and the sent payload the same object rather than two
+/// results of the same function. The extension comes from the encoder, so a
+/// format change moves the filename with it and cannot leave `.ppm` on a JPEG.
+fn save_snap(enc: &snapclone_egui::media_encode::Encoded) -> Result<String, String> {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis()).unwrap_or(0);
     let dir = config_kit::data_dir("snapclone").join("snaps");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let path = dir.join(format!("snap-{ms}.ppm"));
-    std::fs::write(&path, snapclone_egui::frame_pump::ppm_bytes(f)).map_err(|e| format!("{}: {e}", path.display()))?;
+    let path = dir.join(format!("snap-{ms}.{}", enc.ext));
+    std::fs::write(&path, &enc.bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path.display().to_string())
 }
 

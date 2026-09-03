@@ -18,6 +18,11 @@ default = ["app"]
 app = ["dep:eframe"]
 
 [dependencies]
+# JPEG for the send path. Pure Rust, no native encoder: `default-features =
+# false` keeps out the formats this app will never read, and `jpeg` alone is
+# what takes a 1080p snap from 6.2 MB on the wire to about 300 KB. See
+# src/media_encode.rs for why not AV1 yet.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # The composer tile-strip decision model. A real dependency rather than a
 # #[path] include: it is a standalone crate with an rlib target, and its `ffi`
 # module uses `crate::` paths that break when a lib.rs is pulled in as a

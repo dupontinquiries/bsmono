@@ -1351,6 +1351,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2668,6 +2670,7 @@ dependencies = [
  "device-kit",
  "eframe",
  "egui",
+ "image",
  "nat-kit",
  "peermux-core",
  "settings-kit",

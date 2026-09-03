@@ -111,3 +111,67 @@ fn a_non_square_frame_is_not_transposed() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "30,10");
     let _ = std::fs::remove_file(&path);
 }
+
+// ── the JPEG the app actually sends ─────────────────────────────────────────
+//
+// `ppm_bytes` is no longer on the send path; `media_encode::encode_still` is.
+// The reasoning at the top of this file applies to it more strongly, not less:
+// a lossy encoder's own unit tests agree with it about the format by
+// construction, and a channel swap in the RGBA-to-RGB step would satisfy every
+// one of them while producing a photo with the colours wrong. `image` can
+// decode what `image` wrote no matter which way round it put the channels.
+//
+// So the independent opinion matters here, and it is the same one: ffmpeg
+// decodes the file and says what it sees.
+
+#[test]
+fn a_real_decoder_agrees_about_the_jpeg_and_its_channels() {
+    if !have("ffmpeg") || !have("ffprobe") {
+        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    use snapclone_egui::media_encode::{encode_still, DEFAULT_QUALITY};
+
+    // A frame whose three channels are DIFFERENT and unambiguous: strong red,
+    // mid green, dark blue. A gradient would survive a channel swap looking
+    // plausible; this does not.
+    let (w, h) = (32u32, 24u32);
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for _ in 0..(w * h) {
+        rgba.extend_from_slice(&[220, 120, 30, 255]);
+    }
+    let f = RawFrame { width: w, height: h, rgba: rgba.into(), captured_ms: 0, seq: 0 };
+    let enc = encode_still(&f, DEFAULT_QUALITY).expect("encode");
+    let path = tmp("snap.jpg");
+    std::fs::write(&path, &enc.bytes).unwrap();
+
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "stream=width,height", "-of", "csv=p=0"])
+        .arg(&path)
+        .output()
+        .expect("ffprobe did not run");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "32,24",
+               "ffprobe disagrees about the JPEG's dimensions");
+
+    // Decode to raw RGB and check the channel ORDER survived. Generous
+    // tolerance because JPEG is lossy — the point is that red is red and blue
+    // is blue, not that the values are exact.
+    let raw = tmp("snap.rgb");
+    let ok = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-i"])
+        .arg(&path)
+        .args(["-f", "rawvideo", "-pix_fmt", "rgb24"])
+        .arg(&raw)
+        .status()
+        .expect("ffmpeg did not run");
+    assert!(ok.success(), "ffmpeg could not decode the snap");
+    let px = std::fs::read(&raw).unwrap();
+    assert_eq!(px.len(), (w * h * 3) as usize);
+    let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
+    assert!((r - 220).abs() < 30, "red channel came back {r}");
+    assert!((g - 120).abs() < 30, "green channel came back {g}");
+    assert!((b - 30).abs() < 30, "blue channel came back {b} — channels are swapped");
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&raw);
+}
