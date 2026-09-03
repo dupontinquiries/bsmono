@@ -55,7 +55,6 @@ static const ex_link_t ex_gen_links_forge_lattice[2] = { { "architecture_is_mach
 static const ex_link_t ex_gen_links_emptied_vault[1] = { { "archivist_collecting", EX_BEARING_SUPPORTS }, };
 static const ex_link_t ex_gen_links_vault_plate_inventory[2] = { { "vault_plate_is_complete", EX_BEARING_SUPPORTS }, { "archivist_collecting", EX_BEARING_MENTIONS }, };
 static const ex_link_t ex_gen_links_glaciem_rotation_roster[2] = { { "glaciem_was_an_outpost", EX_BEARING_SUPPORTS }, { "vault_plate_is_complete", EX_BEARING_CONTRADICTS }, };
-static const ex_link_t ex_gen_links_glaciem_rotation_plate[2] = { { "glaciem_was_an_outpost", EX_BEARING_SUPPORTS }, { "archivist_collecting", EX_BEARING_MENTIONS }, };
 static const ex_link_t ex_gen_links_glaciem_survey_plate[3] = { { "watchers_observed", EX_BEARING_SUPPORTS }, { "glaciem_was_an_outpost", EX_BEARING_SUPPORTS }, { "vault_plate_is_complete", EX_BEARING_MENTIONS }, };
 static const ex_link_t ex_gen_links_pluto_line_marker[2] = { { "asteri_were_not_first", EX_BEARING_SUPPORTS }, { "bridge_predates_coalition", EX_BEARING_MENTIONS }, };
 static const ex_link_t ex_gen_links_asteri_signal_beacon[1] = { { "later_forgery", EX_BEARING_SUPPORTS }, };
@@ -79,7 +78,7 @@ static const ex_link_t ex_gen_links_undelivered_manifest[2] = { { "convergence_w
 static const ex_link_t ex_gen_links_kesswick_relay_log[2] = { { "watchers_observed", EX_BEARING_SUPPORTS }, { "convergence_was_not_first", EX_BEARING_SUPPORTS }, };
 static const ex_link_t ex_gen_links_far_manifest_wreck[2] = { { "convergence_was_not_first", EX_BEARING_SUPPORTS }, { "societies_existed", EX_BEARING_SUPPORTS }, };
 
-static const ex_finding_t ex_gen_findings[47] = {
+static const ex_finding_t ex_gen_findings[46] = {
   { "bunker_alloy", "earth", "la_bunker", EX_MEDIUM_ARTIFACT, NULL, ex_gen_links_bunker_alloy, 3 },
   { "bunker_roster", "earth", "la_bunker", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_bunker_roster, 2 },
   { "directorate_record", "earth", "the_record", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_directorate_record, 2 },
@@ -104,7 +103,6 @@ static const ex_finding_t ex_gen_findings[47] = {
   { "emptied_vault", "glaciem", "emptied_vaults", EX_MEDIUM_SITE, NULL, ex_gen_links_emptied_vault, 1 },
   { "vault_plate_inventory", "glaciem", "emptied_vaults", EX_MEDIUM_SITE, NULL, ex_gen_links_vault_plate_inventory, 2 },
   { "glaciem_rotation_roster", "glaciem", "outpost_roster", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_glaciem_rotation_roster, 2 },
-  { "glaciem_rotation_plate", "glaciem", "rotation_roster", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_glaciem_rotation_plate, 2 },
   { "glaciem_survey_plate", "glaciem", "survey_plate", EX_MEDIUM_ARTIFACT, NULL, ex_gen_links_glaciem_survey_plate, 3 },
   { "pluto_line_marker", "pluto", "pluto_marker", EX_MEDIUM_SITE, NULL, ex_gen_links_pluto_line_marker, 2 },
   { "asteri_signal_beacon", "pluto", "imitation_beacon", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_asteri_signal_beacon, 1 },
@@ -128,7 +126,7 @@ static const ex_finding_t ex_gen_findings[47] = {
   { "kesswick_relay_log", "earth", "kesswick_incident", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_kesswick_relay_log, 2 },
   { "far_manifest_wreck", "mars", "mars_transfer_wreck", EX_MEDIUM_SITE, NULL, ex_gen_links_far_manifest_wreck, 2 },
 };
-#define EX_GEN_FINDING_COUNT 47
+#define EX_GEN_FINDING_COUNT 46
 
 static const ex_received_t ex_gen_received[8] = {
   { "unicron_in_earth", EX_BEARING_SUPPORTS, "lived_through_it", 0.2000f, "the thing in the mantle -- you were there" },

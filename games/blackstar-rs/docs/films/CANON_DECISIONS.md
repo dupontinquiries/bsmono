@@ -454,7 +454,7 @@ adding a variant in passing.
 
 ### His rhythm belongs to him
 
-**He is off-shift.** `glaciem_rotation_plate` is the schedule: four names
+**He is off-shift.** `glaciem_rotation_roster` is the schedule: four names
 rotating out and back. Not a reward timer — an NPC with a life, which is what
 makes a world feel inhabited (Majora's Mask, not Xur).
 

@@ -503,7 +503,6 @@ pub static SOURCES: &[Source] = &[
     Source { id: "europa_post", what: "the listening post's final hour" },
     Source { id: "io_forge", what: "the tide-forges, pouring into moulds nobody cut" },
     Source { id: "emptied_vaults", what: "a lattice pool vault, opened cleanly and emptied" },
-    Source { id: "rotation_roster", what: "a duty roster plate from the ice, and the hand that kept it" },
     Source { id: "survey_plate", what: "a pre-contact survey of the ice, and its mineral classifications" },
     Source { id: "pluto_marker", what: "a boundary marker set into the ice" },
     Source { id: "carrion_wreck", what: "a hull that came apart on a straight edge" },
@@ -945,21 +944,11 @@ pub static FINDINGS: &[Finding] = &[
         source: "outpost_roster",
         medium: Medium::Terminal,
         gate: None,
-        blurb: "a rotation board in the vault office. four names, a return date nobody came back \
-                for, and a hand-off note listing what the next shift should log properly. one \
-                item on that note is not on the plate.",
+        blurb: "a rotation board in the vault office, kept in one hand for nine hundred years. \
+                four names, out and back, out and back; nobody on it was born here and nobody \
+                retired. under it a hand-off note listing what the next shift should log \
+                properly. one item on that note is not on the plate.",
         links: &[s("glaciem_was_an_outpost"), c("vault_plate_is_complete")],
-    },
-    Finding {
-        id: "glaciem_rotation_plate",
-        site: "glaciem",
-        source: "rotation_roster",
-        medium: Medium::Terminal,
-        gate: None,
-        blurb: "a duty roster, kept in the same hand for nine hundred years. the same four names \
-                rotate out and back. nobody on it was ever born here and nobody on it ever \
-                retired.",
-        links: &[s("glaciem_was_an_outpost"), m("archivist_collecting")],
     },
     Finding {
         id: "glaciem_survey_plate",
