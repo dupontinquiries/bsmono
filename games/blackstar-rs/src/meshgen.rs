@@ -34,6 +34,21 @@ impl MeshData {
 /// Bake a transform into a mesh's vertices (normals rotated, not scaled-skewed
 /// beyond uniformish use). For assembling composite procedural models.
 pub fn bake(m: &mut MeshData, scale: glam::Vec3, rot: glam::Quat, off: glam::Vec3) {
+    // A NON-FINITE TRANSFORM LEAVES THE MESH ALONE.
+    //
+    // These transforms come from glTF node matrices, so a corrupt file
+    // supplies them. Measured: a NaN `scale` gave every vertex a NaN
+    // position — and note the normals SURVIVED, because
+    // `scale.max(1e-4)` below drops a NaN operand. Half-poisoned geometry
+    // is worse than either outcome: the mesh has plausible normals and
+    // positions that fail every bounds test downstream, including the
+    // ones meant to reject it.
+    //
+    // An unbaked mesh is wrong in an obvious, visible way. A NaN one is
+    // invisible.
+    if !scale.is_finite() || !off.is_finite() || !rot.is_finite() {
+        return;
+    }
     for v in m.verts.iter_mut() {
         let p = rot * (glam::Vec3::from(v.pos) * scale) + off;
         v.pos = p.to_array();
@@ -347,7 +362,11 @@ pub fn flip_inward(m: &mut MeshData) {
 }
 
 pub fn cbox(bevel: f32) -> MeshData {
-    let b = bevel.clamp(0.02, 0.45);
+    // `f32::clamp` does not launder a NaN — `NAN.clamp(0.02, 0.45)` is
+    // NaN — so this looked guarded and produced a box with NaN vertices.
+    // Same mechanism as anim.rs, xform.rs and skeleton.rs; see
+    // docs/NON_FINITE_INPUTS.md.
+    let b = if bevel.is_finite() { bevel } else { 0.02 }.clamp(0.02, 0.45);
     let i = 1.0 - b;
     let mut m = MeshData::new();
     // eight face quads (inset) plus the bevel bands between them
@@ -915,6 +934,51 @@ pub fn terrain<F: Fn(f32, f32) -> f32>(radius: f32, n: u32, h: F) -> MeshData {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn all_finite(m: &MeshData) -> bool {
+        m.verts.iter().all(|v| {
+            v.pos.iter().all(|c| c.is_finite()) && v.nrm.iter().all(|c| c.is_finite())
+        })
+    }
+
+    #[test]
+    fn a_non_finite_transform_leaves_the_mesh_unbaked() {
+        // glTF node matrices come from files nobody here authored. A NaN
+        // scale used to poison every vertex POSITION while leaving the
+        // normals intact, because `scale.max(1e-4)` drops a NaN operand —
+        // geometry that looks plausible and fails every bounds test.
+        let base = hex_prism();
+        for (label, scale, off) in [
+            ("scale NaN", glam::Vec3::splat(f32::NAN), glam::Vec3::ZERO),
+            ("offset NaN", glam::Vec3::ONE, glam::Vec3::splat(f32::NAN)),
+            ("scale inf", glam::Vec3::splat(f32::INFINITY), glam::Vec3::ZERO),
+        ] {
+            let mut m = hex_prism();
+            bake(&mut m, scale, glam::Quat::IDENTITY, off);
+            assert!(all_finite(&m), "{label} poisoned the mesh");
+            assert_eq!(m.verts.len(), base.verts.len(), "{label} changed the vertex count");
+        }
+    }
+
+    #[test]
+    fn a_normal_bake_still_transforms() {
+        // The guard must not stop the working path.
+        let mut m = hex_prism();
+        let before = m.verts[0].pos;
+        bake(&mut m, glam::Vec3::splat(2.0), glam::Quat::IDENTITY, glam::Vec3::new(1.0, 0.0, 0.0));
+        assert!(all_finite(&m));
+        assert_ne!(m.verts[0].pos, before, "a valid bake did nothing");
+    }
+
+    #[test]
+    fn a_non_finite_bevel_still_makes_a_box() {
+        for bevel in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let m = cbox(bevel);
+            assert!(all_finite(&m), "cbox({bevel}) produced NaN geometry");
+            assert!(!m.verts.is_empty());
+        }
+    }
     #[test]
     fn flipping_inward_reverses_both_normals_and_winding() {
         // Both halves matter and they fix different things. Normals
@@ -943,3 +1007,4 @@ mod tests {
         assert!(a.verts.iter().zip(&b.verts).all(|(x, y)| x.nrm == y.nrm));
     }
 }
+

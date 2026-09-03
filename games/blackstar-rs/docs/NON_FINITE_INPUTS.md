@@ -30,6 +30,7 @@ Probing each module took a couple of minutes.
 | `compact.rs` | clean |
 | `partdetect.rs` | clean |
 | `model.rs` (orientation search) | clean |
+| `meshgen.rs` | `bake` half-poisoned a mesh; `cbox` clamped a NaN |
 
 The panic is the only crash. The rest are quieter and, for a renderer,
 mostly worse to diagnose:
@@ -106,6 +107,28 @@ kept) and the test passed against it. Reversing the comparison to
 knowing if you are ever checking whether a NaN test actually bites: half
 the plausible mutations are accidentally correct.
 
+## meshgen, and the worst failure shape in this note
+
+The generators are fine: `tube`, `ring_deck`, `rim` and `torus_tube` all
+clamp their segment counts internally and produce geometry for 0, 1 or
+2. `loft` of an empty section list is an empty mesh.
+
+`bake` is where the transform enters, and it had the nastiest variant of
+this class. A NaN `scale` poisoned every vertex POSITION while leaving
+the NORMALS intact, because `scale.max(1e-4)` on the normal path drops a
+NaN operand and the position path has no such call.
+
+**Half-poisoned geometry is worse than either whole outcome.** The mesh
+has plausible normals and positions that fail every bounds test
+downstream, including the ones meant to reject it. An unbaked mesh is
+wrong in a visible way; this is invisible.
+
+`cbox` was the fifth appearance of the clamp mechanism above:
+`bevel.clamp(0.02, 0.45)` on a NaN is NaN.
+
 ## Where this has not been done
 
-`align.rs` and `meshgen.rs` have not been probed.
+`align.rs` has not been probed. Its three entry points all take
+`&[Vec<RawPrim>]` — whole loaded meshes rather than loose scalars — so it
+needs fixtures rather than a two-minute parameter sweep, which is why it
+is still open.
