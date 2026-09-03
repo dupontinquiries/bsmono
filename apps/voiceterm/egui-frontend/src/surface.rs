@@ -285,5 +285,135 @@ mod tests {
              while a surface is up, or keys reach the shell through the \
              backdrop."
         );
+        // THE LIVE TERMINAL MODE. Passing TermMode::default() hardcodes
+        // "never in application-cursor mode", which makes the encoder's
+        // SS3 branch and the parser's DECCKM tracking unreachable —
+        // arrows stop working inside fzf, vim and less while every unit
+        // test still passes, because each piece is correct on its own.
+        assert_eq!(
+            src.matches("pty_input::TermMode::default()").count(),
+            0,
+            "drain_egui is being handed a default mode again — pass \
+             the session grid's key_mode(), or app-cursor arrows break."
+        );
+        // FROM THE FED GRID. app.terminal.grid is never fed for the
+        // focused pane, so asking it returns the default forever — the
+        // expression looks right and the behaviour does not change.
+        assert!(
+            src.contains("self.app.terminal.grid.key_mode()"),
+            "the key mode must come from the grid feed_pty writes, which is \
+             the DISPLAYED one."
+        );
+        // ONE INPUT OWNER. uikit_term::App::handle_input and
+        // pty_input::drain_egui both read this frame's events; if the
+        // widget is not told the host owns encoding, every keystroke
+        // reaches the shell twice and every Enter runs the command twice.
+        // THE SUBMITTED LINE IS A NOTIFICATION, NOT A SOURCE OF BYTES.
+        // The raw key path already sent it character by character; a
+        // second append is the doubling bug.
+        assert!(
+            !src.contains("pty_out.extend_from_slice(line.as_bytes())"),
+            "the submitted line is emitting bytes again — the raw path \
+             already sent them and the shell will run everything twice."
+        );
+        // ONE RISK GATE, IN THE KEY PATH. Asking on `submitted` is too
+        // late: the Enter byte went to the shell on the same keypress.
+        assert_eq!(
+            src.matches("cmd_risk::withhold_enter(").count(),
+            1,
+            "the Enter-withholding decision is inlined again — it gates \
+             destructive commands and belongs in a tested function."
+        );
+        assert_eq!(
+            src.matches("ConfirmDialog::new(").count(),
+            1,
+            "a second risk-confirmation site is back — the one that can \
+             actually withhold Enter lives in the key path."
+        );
+        assert_eq!(
+            src.matches("set_input_owner(").count(),
+            1,
+            "the input-owner declaration is gone — the widget and the raw \
+             path will both encode, and `ls` will run twice."
+        );
+        // THE FOCUSED PANE'S SHELL. `hosted` includes pane_focus, so the
+        // reconcile loop never spawns for it, while swap_focus hands a
+        // newly focused pane None. Without this call a split produces a
+        // terminal that echoes locally and never runs anything.
+        assert_eq!(
+            src.matches("pane_host::focused_needs_shell(").count(),
+            1,
+            "the focused-pane shell check is gone — a split pane will have \
+             no shell and no command will run in it."
+        );
+        // WAKING THE UI. An immediate-mode GUI draws when asked; a shell
+        // answering half a frame after Enter is not an input event, so
+        // without a waker the output sits in the reader's buffer until
+        // the next keystroke or mouse move.
+        assert!(
+            src.contains("fn repaint_waker("),
+            "the pty waker is gone — shell output will only appear when \
+             something else happens to repaint the UI."
+        );
+        assert_eq!(
+            src.matches("PtyHost::spawn(80, 24)").count(),
+            0,
+            "a PtyHost is being spawned without a waker again."
+        );
+        // COMMANDS TYPED BY A SURFACE MUST MIRROR INTO THE LINE BUFFER.
+        // cmd_risk::withhold_enter reads app.terminal.input to decide
+        // whether to hold Enter. A surface that appends only to pty_out
+        // leaves the shell holding a command the gate cannot see, and
+        // `rm -rf` dropped from the command sheet then runs unconfirmed.
+        assert!(
+            src.contains("fn stage_command("),
+            "the type-into-shell funnel is gone — surfaces will append \
+             commands the risk gate cannot see."
+        );
+        // Four surfaces stage commands; each must go through the funnel.
+        assert!(
+            src.matches("self.stage_command(").count() >= 4,
+            "a surface stopped using stage_command — check whether it now \
+             appends to pty_out directly."
+        );
+        // A LINE DISCARD MUST REACH BOTH COPIES. Ctrl-C/Ctrl-U empty the
+        // shell's line; the widget's copy is what the risk gate reads.
+        assert!(
+            src.contains("keys::clears_the_line("),
+            "line discards are no longer mirrored — the risk gate will \
+             classify a line the shell has already thrown away."
+        );
+        // INPUT IS NOT OUTPUT. `Terminal::feed` PARSES bytes as terminal
+        // output into a grid; the keycap bar, the pipe menu and the
+        // brace menu are input affordances. Calling feed from one of
+        // them draws the character on a grid nothing renders and sends
+        // the shell nothing at all.
+        assert_eq!(
+            src.matches("self.app.terminal.feed(").count(),
+            1, // feed_pty only; the background drain binds a local `app`
+            "an input affordance is calling the OUTPUT path again — use \
+             send_input for keys and show_line for text this app produced."
+        );
+        assert!(
+            src.contains("fn send_input(") && src.contains("fn show_line("),
+            "the input/output split is gone."
+        );
+        // NOTHING MAY READ THE WIDGET'S GRID. It is not fed for the
+        // focused pane, so every read is empty or stale: "Clear" cleared
+        // nothing, "copy screen" copied nothing, page-up paged nothing.
+        // FIND SEARCHES THE GRID WITH THE TEXT. The widget's find bar
+        // searches its own unfed grid, and nothing here ever rendered
+        // it — the menu item set a flag no frame read.
+        // The widget's find bar is CORRECT again: feed_pty mirrors the
+        // shell into app.terminal, so its grid has the history. It must
+        // also be rendered — open_search only sets a flag.
+        assert!(
+            src.contains("self.app.search_ui(ui)"),
+            "open_search sets a flag that no frame renders; call search_ui."
+        );
+        // A SELECTION MUST COME FROM THE FED GRID. handle_gestures
+        // hit-tests correctly and then reads text from the widget's
+        // unfed grid, so a tap yields Some("") — which DEFEATS the copy
+        // path's fallback to the screen, giving an empty clipboard.
     }
 }

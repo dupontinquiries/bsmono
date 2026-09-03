@@ -1501,9 +1501,17 @@ const CELL_H_RATIO: f32 = 1.3;
 /// A tap or long-press's resolved terminal position + (for long-press) what it selected.
 #[derive(Clone, Debug, Default)]
 pub struct Selection {
-    /// The row this selection is on, if any.
+    /// The VIEWPORT row this selection is on, if any.
     pub row: Option<usize>,
-    /// The selected text (a word for a tap-and-hold on it, a whole line for a long-press).
+    /// The column that was hit, for a tap. `None` for a long-press,
+    /// which selects the whole line and has no single column.
+    ///
+    /// Carried because a host may hit-test with THIS widget (it owns the
+    /// cell metrics) while the text lives in a different grid — see
+    /// `cell_at`. Without the column such a host can only recover the
+    /// line, so a tap-to-select-WORD silently becomes select-line.
+    pub col: Option<usize>,
+    /// The selected text (a word for a tap on it, a whole line for a long-press).
     pub text: String,
 }
 
@@ -1516,6 +1524,10 @@ pub struct App {
     /// control codes, arrows, tab. Distinct from the submitted line, which is
     /// user text the host may echo or log.
     pending_bytes: Vec<u8>,
+    /// Who encodes keyboard input — see `set_input_owner`. Default
+    /// `Widget`, which is the safe side: a host that forgets to declare
+    /// itself gets a working line editor rather than a dead terminal.
+    input_owner: keys::InputOwner,
     pub prefs: settings_kit::Prefs,
     pub cell: (f32, f32),
     pub font_size: f32,
@@ -1526,6 +1538,9 @@ pub struct App {
     /// In-screen find state; `search_open` toggles the search bar.
     pub search: SearchState,
     pub search_open: bool,
+    /// Set when the bar is opened, cleared once the query field has
+    /// taken focus. See `open_search`.
+    search_wants_focus: bool,
     /// Cursor interaction mode + its glide/pulse state — see `CursorMode`/`CursorAnim`.
     pub cursor_mode: CursorMode,
     cursor_anim: CursorAnim,
@@ -1550,6 +1565,7 @@ impl App {
     pub fn new(cols: usize, rows: usize) -> App {
         App {
             pending_bytes: Vec::new(),
+            input_owner: keys::InputOwner::default(),
             terminal: Terminal::new(cols, rows),
             prefs: settings_kit::Prefs::default(),
             cell: (DEFAULT_FONT_SIZE * CELL_W_RATIO, DEFAULT_FONT_SIZE * CELL_H_RATIO),
@@ -1558,6 +1574,7 @@ impl App {
             recognizer: uikit_egui::touch::GestureRecognizer::new(uikit_egui::touch::Config::default()),
             search: SearchState::default(),
             search_open: false,
+            search_wants_focus: false,
             cursor_mode: CursorMode::default(), // Slide, matching the QML's default
             cursor_anim: CursorAnim::default(),
             selection: None,
@@ -1591,7 +1608,15 @@ impl App {
 
     /// Convert a screen position to a (col, row) in the grid, given the terminal's on-screen
     /// origin. `None` if the position falls outside the grid.
-    fn cell_at(&self, origin: egui::Pos2, pos: egui::Pos2) -> Option<(usize, usize)> {
+    /// Which (column, viewport row) a screen position falls on.
+    ///
+    /// Public because hit-testing needs this widget's cell metrics
+    /// (font size, pinch zoom) while the TEXT may live in a different
+    /// grid — voiceterm renders its own and feeds this one nothing, so
+    /// `handle_gestures` selecting from `self.terminal.grid` there
+    /// returns empty strings. A host in that position uses this to find
+    /// the cell and reads the text from its own grid.
+    pub fn cell_at(&self, origin: egui::Pos2, pos: egui::Pos2) -> Option<(usize, usize)> {
         let rel = pos - origin;
         if rel.x < 0.0 || rel.y < 0.0 { return None; }
         let (col, row) = ((rel.x / self.cell.0) as usize, (rel.y / self.cell.1) as usize);
@@ -1618,14 +1643,26 @@ impl App {
         if ui.ctx().egui_wants_keyboard_input() {
             return None;
         }
+        // Who encodes keys. `InputOwner::Host` means the host already
+        // read these events and produced bytes itself, so accumulating a
+        // line and encoding control keys here would send everything
+        // twice — see keys::InputOwner.
+        let owner = self.input_owner;
+        let mine = |c: keys::EventClass| keys::widget_handles(owner, c);
         let mut pending: Vec<u8> = Vec::new();
         let mut submitted = None;
         ui.input(|i| {
             for ev in &i.events {
                 match ev {
                     egui::Event::Text(t) => {
-                        self.terminal.grid.scroll_to_bottom(); // typing returns to live
-                        self.terminal.input.push_str(t);
+                        // Scroll-to-bottom happens in BOTH modes: typing
+                        // returning you to the live tail is the widget's
+                        // job either way, and the host's raw path has no
+                        // access to the scrollback.
+                        self.terminal.grid.scroll_to_bottom();
+                        if mine(keys::EventClass::Text) {
+                            self.terminal.input.push_str(t);
+                        }
                     }
                     egui::Event::Key { key: egui::Key::PageUp, pressed: true, modifiers, .. }
                         if modifiers.shift =>
@@ -1653,10 +1690,14 @@ impl App {
                         pending.extend_from_slice(
                             &keys::paste(t, self.terminal.grid.key_mode()));
                     }
-                    egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                    egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. }
+                        if mine(keys::EventClass::LineEdit) =>
+                    {
                         self.terminal.input.pop();
                     }
-                    egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => {
+                    egui::Event::Key { key: egui::Key::Enter, pressed: true, .. }
+                        if mine(keys::EventClass::LineEdit) =>
+                    {
                         submitted = Some(std::mem::take(&mut self.terminal.input));
                     }
                     // Ctrl/Cmd+F: open the find bar. Must come BEFORE the catch-all key arm
@@ -1685,7 +1726,9 @@ impl App {
                     // parses. Without these the widget is a text field that
                     // submits lines: no Ctrl-C to stop a runaway command, no
                     // up-arrow so every command is retyped, no tab completion.
-                    egui::Event::Key { key: k, pressed: true, modifiers, .. } => {
+                    egui::Event::Key { key: k, pressed: true, modifiers, .. }
+                        if mine(keys::EventClass::Encoded) =>
+                    {
                         let m = keys::Mods {
                             ctrl: modifiers.ctrl || modifiers.command,
                             alt: modifiers.alt,
@@ -1747,6 +1790,20 @@ impl App {
     /// Separate from the submitted line because they are a different thing: a
     /// line is user text the host may echo or log, these are raw terminal
     /// input the shell interprets immediately.
+    /// Declare who encodes keyboard input.
+    ///
+    /// A host that runs its own key encoder over the same egui events
+    /// MUST call this with [`keys::InputOwner::Host`], or every
+    /// keystroke reaches the shell twice. Defaults to `Widget`, which is
+    /// right for a host with no shell at all.
+    pub fn set_input_owner(&mut self, owner: keys::InputOwner) {
+        self.input_owner = owner;
+    }
+
+    pub fn input_owner(&self) -> keys::InputOwner {
+        self.input_owner
+    }
+
     pub fn take_pending_bytes(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending_bytes)
     }
@@ -1754,6 +1811,16 @@ impl App {
     /// Open the find bar (the compass "search" action / Ctrl+F).
     pub fn open_search(&mut self) {
         self.search_open = true;
+        // AND TAKE THE KEYBOARD. A find bar that opens without focus
+        // sends your query to whatever had it before — for a terminal
+        // host that is the SHELL, so pressing Ctrl+F and typing
+        // "FINDME" ran `FINDME` as a command. Seen in a screenshot: the
+        // field still showed its placeholder while the text appeared at
+        // the prompt.
+        //
+        // Deferred to the next frame rather than done here because the
+        // widget does not exist yet; `search_ui` consumes the flag.
+        self.search_wants_focus = true;
     }
 
     /// Render the search bar when open: a query field, an `n/N` match counter, prev/next, and close.
@@ -1769,6 +1836,9 @@ impl App {
                     .hint_text("find in screen…")
                     .desired_width(180.0),
             );
+            if std::mem::take(&mut self.search_wants_focus) {
+                resp.request_focus();
+            }
             if resp.changed() {
                 self.search.run(&self.terminal.grid);
             }
@@ -1778,15 +1848,21 @@ impl App {
             if resp.changed() || resp.lost_focus() {
                 self.scroll_to_search_active();
             }
-            if ui.button("▲").clicked() {
+            // ASCII labels, not the triangle/cross glyphs. egui's
+            // default font stack does not carry them on every platform:
+            // a screenshot of this bar under a plain X session showed
+            // three empty boxes, and a control you cannot identify is a
+            // control you will not press. Found by looking; no test can
+            // see a missing glyph.
+            if ui.button("prev").clicked() {
                 self.search.prev();
                 self.scroll_to_search_active();
             }
-            if ui.button("▼").clicked() {
+            if ui.button("next").clicked() {
                 self.search.next();
                 self.scroll_to_search_active();
             }
-            if ui.button("✕").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if ui.button("close").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.search_open = false;
                 self.search.query.clear();
                 self.search.matches.clear();
@@ -1830,13 +1906,14 @@ impl App {
                         if let Some(url) = url_in_word(&word) {
                             self.link_tap = Some((egui::pos2(p.x, p.y), url));
                         }
-                        self.selection = Some(Selection { row: Some(row), text: word });
+                        self.selection = Some(Selection { row: Some(row), col: Some(col), text: word });
                     }
                 }
                 uikit_egui::touch::Gesture::LongPress(p) => {
                     if let Some((_, row)) = self.cell_at(origin, egui::pos2(p.x, p.y)) {
                         let line = self.terminal.grid.global_line_of_viewport_row(row);
-                        self.selection = Some(Selection { row: Some(row), text: self.terminal.grid.line_text_global(line) });
+                        // No column: a long-press takes the whole line.
+                        self.selection = Some(Selection { row: Some(row), col: None, text: self.terminal.grid.line_text_global(line) });
                     }
                     self.long_press = Some(egui::pos2(p.x, p.y));
                 }
@@ -2071,6 +2148,18 @@ mod tests {
     }
 
     #[test]
+    fn a_tap_carries_its_column_and_a_long_press_does_not() {
+        // The distinction is what lets a host that hit-tests here but
+        // reads text elsewhere tell select-WORD from select-LINE. Without
+        // it, such a host can only recover the line and tap-to-select-word
+        // silently becomes select-line.
+        let word = Selection { row: Some(2), col: Some(7), text: "cargo".into() };
+        let line = Selection { row: Some(2), col: None, text: "cargo test".into() };
+        assert!(word.col.is_some());
+        assert!(line.col.is_none(), "a long-press has no single column");
+    }
+
+    #[test]
     fn word_at_finds_the_whitespace_delimited_word() {
         assert_eq!(word_at("hello world", 0), "hello");
         assert_eq!(word_at("hello world", 4), "hello");
@@ -2184,7 +2273,7 @@ mod tests {
         let expect = app.terminal.grid.line_text_global(shown);
         // simulate what the LongPress handler now does
         let line = app.terminal.grid.global_line_of_viewport_row(0);
-        app.selection = Some(Selection { row: Some(0), text: app.terminal.grid.line_text_global(line) });
+        app.selection = Some(Selection { row: Some(0), col: None, text: app.terminal.grid.line_text_global(line) });
         assert_eq!(app.selection.as_ref().unwrap().text, expect);
         assert_ne!(expect, app.terminal.grid.row_text(0), "scrolled view must not read the live row");
     }
@@ -2228,7 +2317,7 @@ mod tests {
         let tap_pos = egui::pos2(cw * 8.5, ch * 0.5);
         if let Some((col, row)) = app.cell_at(origin, tap_pos) {
             let word = word_at(&app.terminal.grid.row_text(row), col);
-            app.selection = Some(Selection { row: Some(row), text: word });
+            app.selection = Some(Selection { row: Some(row), col: Some(col), text: word });
         }
         assert_eq!(app.selection.as_ref().map(|s| s.text.as_str()), Some("world"));
     }

@@ -23,14 +23,58 @@ fn main() {
         let (_, _, _, s, _) = model::load_raw_at(p, 1.0, false);
         if s > 1e-9 { 1.0 / s } else { 1.0 }
     };
+    // STOWED, THE WAY THE GAME DRAWS IT.
+    //
+    // `load_raw` returns the authored pose. The GAME does not draw that:
+    // at the vehicle end of the fold it applies `Model::pack` — the
+    // hinge and shift from `skeleton::fold_pack` — to tuck the limbs into
+    // the shell (see the crossfade in main.rs, `pack.shift.lerp(tuck,
+    // fold_t)`).
+    //
+    // So a still from this harness was showing geometry the game never
+    // puts on screen, and robot parts standing proud of a hull in one of
+    // these renders did not mean they were visible in play. That
+    // misdirected a whole investigation. `--raw` keeps the old behaviour
+    // for looking at what an artist actually exported.
+    let raw_mode = std::env::args().any(|a| a == "--raw");
+    let stow = |mut raws: Vec<model::RawPrim>| -> Vec<model::RawPrim> {
+        if raw_mode {
+            return raws;
+        }
+        let pts: Vec<Vec<glam::Vec3>> = raws
+            .iter()
+            .map(|p| p.verts.iter().map(|v| glam::Vec3::from_array(v.pos)).collect())
+            .collect();
+        let refs: Vec<&[glam::Vec3]> = pts.iter().map(|v| v.as_slice()).collect();
+        let sk = skeleton::skeletonize(&refs);
+        let steps = skeleton::fold_pack(&sk, &refs, 0.25, glam::Vec3::Y);
+        for (i, prim) in raws.iter_mut().enumerate() {
+            let st = steps.get(i).copied().unwrap_or_default();
+            if st == skeleton::FoldStep::default() {
+                continue;
+            }
+            for v in prim.verts.iter_mut() {
+                let p = glam::Vec3::from_array(v.pos);
+                let q = st.pivot + st.rot * (p - st.pivot) + st.shift;
+                v.pos = q.to_array();
+                let n = st.rot * glam::Vec3::from_array(v.nrm);
+                v.nrm = n.to_array();
+            }
+        }
+        raws
+    };
+
     let (raws, half) = match &refdir {
-        None => model::load_raw(&dir, 4.2),
+        None => {
+            let (r, h) = model::load_raw(&dir, 4.2);
+            (stow(r), h)
+        }
         Some(r) => {
             let s0 = span(r);
             let target = 4.2 * span(&dir) / s0.max(1e-6);
             let (raws, _) = model::load_raw(&dir, target);
             let (_, rhalf) = model::load_raw(r, 4.2);
-            (raws, rhalf) // frame on the reference so the camera never moves
+            (stow(raws), rhalf) // frame on the reference so the camera never moves
         }
     };
 

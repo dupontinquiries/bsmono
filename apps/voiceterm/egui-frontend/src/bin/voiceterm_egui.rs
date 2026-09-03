@@ -148,7 +148,27 @@ impl VoicetermApp {
     /// the part that is genuinely the app's: which grid, and which
     /// parser state goes with it.
     fn feed_pty(&mut self, bytes: &[u8]) {
-        self.vt.feed(&mut self.session.grid, bytes);
+        // BOTH GRIDS, AND THE REASON IS EMBARRASSING.
+        //
+        // `self.app.render_at` is what actually draws the terminal, so
+        // `app.terminal.grid` is the DISPLAYED grid. `session.grid` is
+        // the one feed_pty filled. I had it backwards for several
+        // commits, reasoning from a `session.grid` row-drawing block
+        // that is not the one on screen, and only found out by taking a
+        // screenshot of the running app: commands executed and the
+        // display never changed.
+        //
+        // So the shell's output has to reach the displayed grid or
+        // nothing appears — that is the actual "text does not go into
+        // the terminal" bug, underneath all the input-path ones.
+        //
+        // ONE grid now. Everything that read `session.grid` — the key
+        // mode, the cursor row, the resize dimensions, the LLM screen
+        // context, scroll-to-bottom — reads `app.terminal.grid`, which
+        // has all of it natively: cols/rows, cur_row, scrollback, and a
+        // parser that tracks DECCKM. Feeding two was the temporary state
+        // while I worked out which one reaches the screen.
+        self.app.terminal.feed(&String::from_utf8_lossy(bytes));
     }
 
     /// The connections graph over what this app actually holds.
@@ -417,9 +437,6 @@ struct VoicetermApp {
     /// Command blocks (QML blocksDrawer): tracked from what the demo feeds; the
     /// left-edge drawer shows when `surfaces` says `Surface::Blocks`.
     blocks: uikit_term::blocks::BlockTracker,
-    /// The escape-sequence parser's state. Held across frames because a
-    /// sequence can be split between two pty reads — see `term_grid::Vt`.
-    vt: voiceterm_egui::term_grid::Vt,
     /// Bytes bound for the shell, split into commands as lines complete.
     line_buf: uikit_term::blocks::CommandLines,
     /// One-shot scroll target for the tab bar ("N more" pill taps apply next frame).
@@ -445,6 +462,9 @@ struct VoicetermApp {
     /// shell failed to spawn is a REMEMBERED None rather than a missing
     /// key that the next swap would try to spawn again.
     pane_ptys: std::collections::HashMap<u64, Option<voiceterm_egui::pty_host::PtyHost>>,
+    /// Panes whose shell spawn already failed. Without this a machine
+    /// with no usable shell is asked for one sixty times a second.
+    pty_spawn_failed: std::collections::HashSet<u64>,
     /// One-shot latch so "shell exited" is said once, not every frame.
     pty_ended_noted: bool,
     /// The QML settingsPopup's launcher half — four doors plus voice
@@ -798,11 +818,80 @@ impl VoicetermApp {
     /// they were three fiddly cases (backspace before the control-byte
     /// check, escape sequences rejected, `\r` and `\n` both ending a line)
     /// sitting inline in a frame loop where nothing could test them.
+    /// Type a command into the shell WITHOUT running it, and keep the
+    /// widget's line buffer in step.
+    ///
+    /// ## The hole this closes
+    ///
+    /// Several surfaces "type, not run" a command — the favourites
+    /// pane's `cd`, the command sheet's drop, a clicked search hit, a
+    /// staged card. Each appended to `pty_out` only. The shell's line
+    /// editor then held a command that `app.terminal.input` knew nothing
+    /// about.
+    ///
+    /// That matters because `cmd_risk::withhold_enter` reads
+    /// `app.terminal.input` to decide whether to hold the Enter byte. So
+    /// dropping `rm -rf build` from the command sheet and pressing Enter
+    /// classified the EMPTY string, found it not Mutating, and ran the
+    /// command with no confirmation at all. The gate was not bypassed by
+    /// a clever input; it simply never saw the line.
+    ///
+    /// One funnel, so a surface cannot add a command path and forget the
+    /// mirror. `stage` replaces the buffer rather than appending,
+    /// matching what these surfaces do to the shell's line.
+    /// Send bytes to the SHELL, as if typed.
+    ///
+    /// `Terminal::feed` is the OUTPUT path — it parses bytes as terminal
+    /// output into a grid. Several input affordances called it: the
+    /// keycap bar, the pipe menu, the brace menu. Pressing a keycap
+    /// therefore parsed the character into `app.terminal`'s grid, which
+    /// this view does not draw, and sent the shell nothing at all. Wrong
+    /// grid and wrong direction at once.
+    ///
+    /// Printable bytes are mirrored into the widget's line buffer for
+    /// the same reason `stage_command` mirrors: `cmd_risk::withhold_enter`
+    /// reads that buffer, and a `|` or a `{` inserted by a menu is part
+    /// of the line it will classify.
+    fn send_input(&mut self, bytes: &[u8]) {
+        // Reading history and then typing means you want to see what you
+        // typed. Every other terminal does this and its absence reads as
+        // the keyboard being broken.
+        self.app.terminal.grid.scroll_to_bottom();
+        self.session.pty_out.extend_from_slice(bytes);
+        if let Ok(t) = std::str::from_utf8(bytes) {
+            for ch in t.chars().filter(|c| !c.is_control()) {
+                self.app.terminal.input.push(ch);
+            }
+        }
+    }
+
+    /// Show a line on the terminal screen WITHOUT sending it to the
+    /// shell — an answer this app produced itself.
+    ///
+    /// Goes through the session grid, the one that is drawn. Feeding
+    /// `app.terminal` put these lines on a grid nothing renders, so the
+    /// feature looked like it did nothing.
+    fn show_line(&mut self, text: &str) {
+        self.feed_pty(text.as_bytes());
+    }
+
+    fn stage_command(&mut self, cmd: &str) {
+        // Kill whatever is on the shell's line first. `Terminal::stage`
+        // REPLACES the widget's buffer, but appending to the shell only
+        // adds — so staging on top of a half-typed line left the shell
+        // holding `ls rm -rf build` while the mirror said `rm -rf build`.
+        // The mirror has to be exact, not approximate, because a safety
+        // check reads it.
+        self.session.pty_out.push(0x15); // Ctrl-U, unix-line-discard
+        self.session.pty_out.extend_from_slice(cmd.as_bytes());
+        self.app.terminal.stage(cmd);
+    }
+
     fn record_typed(&mut self, bytes: &[u8]) {
         for cmd in self.line_buf.feed(bytes) {
             // `start_row`: where the block begins in the scrollback. The
             // kit's tracker stamps its own wall clock.
-            let row = self.session.grid.cursor().1;
+            let row = self.app.terminal.grid.cur_row;
             self.blocks.submit_command(&cmd, row);
         }
     }
@@ -1023,7 +1112,7 @@ impl eframe::App for VoicetermApp {
                 self.last_memlog_s = now;
                 let h = memlog::Holders {
                     terminals: 1,
-                    scrollback_rows: self.session.grid.rows,
+                    scrollback_rows: self.app.terminal.grid.rows,
                     // self.workspace (singular) holds the tabs; self.workspaces
                     // is the VIEW over saved ones and has no count.
                     workspaces: self.workspace.tabs.len(),
@@ -1072,8 +1161,7 @@ impl eframe::App for VoicetermApp {
                             // Typed, not run — consistent with every other
                             // surface in this app that produces a command.
                             fv::Action::Cd(path) => {
-                                self.session.pty_out.extend_from_slice(
-                                    format!("cd {path:?}").as_bytes());
+                                self.stage_command(&format!("cd {path:?}"));
                                 self.surfaces.close();
                             }
                             fv::Action::Close => self.surfaces.close(),
@@ -1130,7 +1218,7 @@ impl eframe::App for VoicetermApp {
                         // these are commands you already ran once, often the
                         // one just before something went wrong.
                         A::Drop(cmd) => {
-                            self.session.pty_out.extend_from_slice(cmd.as_bytes());
+                            self.stage_command(&cmd);
                             self.surfaces.close();
                             self.cmd_sheet.close(); // clears the in-flight drag
                         }
@@ -1170,7 +1258,7 @@ impl eframe::App for VoicetermApp {
                     // clicking a search result is a navigation gesture, and
                     // spawning an editor from one is a surprise.
                     let cmd = format!("${{EDITOR:-vi}} +{} {}", hit.line, hit.path);
-                    self.session.pty_out.extend_from_slice(cmd.as_bytes());
+                    self.stage_command(&cmd);
                     self.fs_search.cancel();
                 }
             });
@@ -1334,7 +1422,7 @@ impl eframe::App for VoicetermApp {
                 let pipe_host = ui.button("|\u{22EF}");
                 if let SlideOutcome::Selected(id, _) = self.pipe_menu.show(ui, &pipe_host, &pipe_menu()) {
                     if let Some(ch) = pipe_char(&id) {
-                        self.app.terminal.feed(ch);
+                        self.send_input(ch.as_bytes());
                     }
                 }
                 // the 🏠 chip opens favorites (QML: home icon in the toolbar)
@@ -1396,7 +1484,7 @@ impl eframe::App for VoicetermApp {
                 let brace_host = ui.button("{\u{22EF}}");
                 if let SlideOutcome::Selected(id, variant) = self.brace_menu.show(ui, &brace_host, &brace_menu()) {
                     if let Some(bytes) = brace_bytes(&id, variant) {
-                        self.app.terminal.feed(&bytes);
+                        self.send_input(bytes.as_bytes());
                     }
                 }
             });
@@ -1505,7 +1593,7 @@ impl eframe::App for VoicetermApp {
                         // user acts on it.
                         None => format!("I do not know the date of {q}"),
                     };
-                    self.app.terminal.feed(&format!("{line}\r\n"));
+                    self.show_line(&format!("{line}\r\n"));
                     self.date_phrase.clear();
                 }
             });
@@ -1659,7 +1747,7 @@ impl eframe::App for VoicetermApp {
             // a keyboard, and a large tablet still does not.
             if adaptive.touch {
                 if let Some(send) = keycap_bar_ui(ui, TERMINAL_KEYCAPS, &self.colors) {
-                    self.app.terminal.feed(send);
+                    self.send_input(send.as_bytes());
                 }
             }
         });
@@ -1868,7 +1956,7 @@ impl eframe::App for VoicetermApp {
                                                 { "unknown command" } else { "mutating" }),
                                         ui.input(|i| i.time));
                                 }
-                                self.app.terminal.feed(&echoed);
+                                self.show_line(&echoed);
                                 self.blocks.submit_command(&cmd, 0);
                             }
                         }
@@ -2767,8 +2855,8 @@ impl eframe::App for VoicetermApp {
                         // is to see what would leave, and a preview that only
                         // appears once the feature ships is a preview nobody
                         // checks.
-                        let ctx: String = (0..self.session.grid.rows)
-                            .map(|y| self.session.grid.row_text(y))
+                        let ctx: String = (0..self.app.terminal.grid.rows)
+                            .map(|y| self.app.terminal.grid.row_text(y))
                             .collect::<Vec<_>>()
                             .join("\n");
                         let total = ctx.lines().count();
@@ -2905,7 +2993,7 @@ impl eframe::App for VoicetermApp {
                                 // Typed, not run — same rule as a clicked
                                 // search hit: the operator presses Enter.
                                 P::Stage(body) => {
-                                    self.session.pty_out.extend_from_slice(body.as_bytes());
+                                    self.stage_command(&body);
                                     self.deck.clear_selection();
                                 }
                                 P::OpenSource(url) => {
@@ -3108,11 +3196,61 @@ impl eframe::App for VoicetermApp {
             // problem: a modal popup takes focus and the terminal item is
             // simply not delivered keys. (Esc is doubly safe here:
             // Modal::should_close CONSUMES it before this runs.)
+            // THIS HOST ALWAYS ENCODES.
+            //
+            // Not conditional on having a shell, which is what I tried
+            // first and got wrong twice. The widget's fallback IS its
+            // line buffer, `terminal.input` — and this host never draws
+            // it. It renders `session.grid`. So handing input to the
+            // widget when no shell is attached makes typing INVISIBLE
+            // until Enter, which is worse than the doubling it was
+            // meant to fix.
+            //
+            // Whether a shell exists decides where the bytes GO — the
+            // pty, or feed_pty for local echo — not who produces them.
+            // One encoder, two sinks.
+            //
+            // The widget keeps its line buffer running (see
+            // keys::widget_handles): it emits no bytes, and `submitted`
+            // is what the audit chain and the risk gate below are built
+            // on.
+            let input_owner = uikit_term::keys::InputOwner::Host;
+            self.app.set_input_owner(input_owner);
+            debug_assert!(
+                uikit_term::keys::host_encodes(input_owner),
+                "this host renders session.grid, not the widget's line buffer, \
+                 so it must always be the encoder"
+            );
             let key_outs = if self.surfaces.captures_input() {
                 Vec::new()
             } else {
+                // THE LIVE MODE, NOT THE DEFAULT.
+                //
+                // In application-cursor mode (DECCKM — set by fzf, vim,
+                // less, and readline in some configs) arrows are SS3
+                // `ESC O A`, not CSI `ESC [ A`. Passing
+                // TermMode::default() here hardcodes "never in app
+                // mode", so the encoder's app-cursor branch and the
+                // parser's DECCKM tracking were both correct and both
+                // unreachable — arrows did nothing useful inside exactly
+                // the programs pty_input's header names as the reported
+                // symptom (Ctrl+R fzf history, where you cannot move
+                // through the match).
+                //
+                // FROM THE GRID THE SHELL ACTUALLY FEEDS.
+                //
+                // There are two grids. `session.grid` is what feed_pty
+                // writes and what this view draws; `app.terminal.grid`
+                // belongs to the uikit-term widget and, for the focused
+                // pane, is never fed at all. Asking the widget's grid
+                // for the mode read a parser with no input — it returned
+                // the default forever, so the previous "fix" here
+                // changed the expression and not the behaviour.
+                //
+                // Fourth link in the same chain: encoder, parser, call
+                // site, and now the right parser.
                 voiceterm_egui::pty_input::drain_egui(
-                    ui, voiceterm_egui::pty_input::TermMode::default(),
+                    ui, self.app.terminal.grid.key_mode(),
                     self.workspace.tabs.len() > 1)
             };
             for out in key_outs
@@ -3133,7 +3271,61 @@ impl eframe::App for VoicetermApp {
                 // the same bytes both reach a future PTY and appear on screen,
                 // through one path rather than two that can disagree.
                 if !out.bytes.is_empty() {
-                    self.session.pty_out.extend_from_slice(&out.bytes);
+                    // HOLD THE ENTER OF A DANGEROUS LINE.
+                    //
+                    // The risk confirmation used to hang off the widget's
+                    // `submitted`, which fires on the SAME keypress whose
+                    // Enter byte the raw path had already sent — so the
+                    // dialog asked whether to run a command that had
+                    // already run. A confirmation you answer afterwards
+                    // is not a confirmation.
+                    //
+                    // Only the Enter byte is withheld. The characters are
+                    // already in the shell's line editor, so confirming
+                    // just sends `\r`, and cancelling leaves the line
+                    // typed and editable rather than silently discarding
+                    // what someone wrote.
+                    let line = self.app.terminal.input.clone();
+                    if voiceterm_egui::cmd_risk::withhold_enter(
+                        &out.bytes,
+                        &line,
+                        self.password_mode,
+                        self.pending_confirm.is_some(),
+                    ) {
+                        use voiceterm_egui::confirm_dialog::{ConfirmDialog, TimeoutAction};
+                        self.pending_confirm = Some((
+                            String::new(), // the line is already typed; only \r is pending
+                            ConfirmDialog::new(
+                                "Run this command?",
+                                format!("`{line}` can modify or delete data."),
+                                "Run",
+                            )
+                            .with_timeout(20.0)
+                            .with_timeout_action(TimeoutAction::Cancel),
+                        ));
+                    } else {
+                        // MIRROR A LINE DISCARD. Ctrl-C and Ctrl-U empty
+                        // the shell's input line; the widget keeps its
+                        // own copy, and withhold_enter reads that copy to
+                        // decide whether a command needs confirming. Let
+                        // them drift and a confirmation quotes text that
+                        // was never entered — or, worse, a stale prefix
+                        // makes a real command classify wrong.
+                        //
+                        // Terminal::interrupt existed for this and had no
+                        // caller anywhere.
+                        if uikit_term::keys::clears_the_line(&out.bytes) {
+                            self.app.terminal.interrupt();
+                        }
+                        // Same rule as send_input: typing returns to the
+                        // live tail. `out.snap_to_bottom` is the
+                        // encoder's own answer to this and had no
+                        // consumer, because there was nothing to scroll.
+                        if out.snap_to_bottom || uikit_term::keys::clears_the_line(&out.bytes) {
+                            self.app.terminal.grid.scroll_to_bottom();
+                        }
+                        self.session.pty_out.extend_from_slice(&out.bytes);
+                    }
                 }
                 // `out.snap_to_bottom` is deliberately not consumed. This view
                 // draws a fixed grid with no scrollback, so it is always
@@ -3189,12 +3381,21 @@ impl eframe::App for VoicetermApp {
             // here to name a foreground process, so the heuristic runs on the
             // prompt text alone — which is the case the module was written for
             // (`foreground` is None rather than guessed).
+            let cursor_row_text =
+                self.app.terminal.grid.row_text(self.app.terminal.grid.cur_row);
             self.password_mode = voiceterm_egui::password_prompt::is_password_prompt(
                 &voiceterm_egui::password_prompt::TermState {
                     alt_screen: false,
                     foreground: None,
-                    visible: Some(&self.session.grid.row_text(self.session.grid.cursor().1)),
+                    visible: Some(&cursor_row_text),
                 });
+            // The widget's own find bar, which searches app.terminal's
+            // grid — fed since feed_pty started mirroring there, so it
+            // has the shell's history for the first time. The
+            // hand-rolled bar that searched session.grid is gone: it
+            // found matches in a buffer nobody was looking at and
+            // scrolled a view nobody could see.
+            self.app.search_ui(ui);
             if self.password_mode {
                 // SAID OUT LOUD. A terminal that silently stops echoing looks
                 // broken; one that says why looks careful — and this is also
@@ -3227,33 +3428,16 @@ impl eframe::App for VoicetermApp {
                         self.audit_lines.drain(..cut);
                     }
                 }
-                // A MUTATING COMMAND ASKS FIRST. cmd_risk already classified
-                // every line for the snapshot policy; until now that verdict
-                // never stopped anything. The dialog's timeout action is
-                // Cancel — a confirmation that runs `rm -rf` because nobody
-                // was looking is not a confirmation.
-                use voiceterm_egui::cmd_risk::Risk;
-                use voiceterm_egui::confirm_dialog::{ConfirmDialog, TimeoutAction};
-                if voiceterm_egui::cmd_risk::classify(&line) == Risk::Mutating
-                    && self.pending_confirm.is_none()
-                {
-                    self.pending_confirm = Some((
-                        line.clone(),
-                        ConfirmDialog::new(
-                            "Run this command?",
-                            format!("`{line}` can modify or delete data."),
-                            "Run",
-                        )
-                        .with_timeout(20.0)
-                        .with_timeout_action(TimeoutAction::Cancel),
-                    ));
-                } else {
-                    // A PTY does not distinguish "the user typed a command"
-                    // from "the user typed bytes", and having two paths is how
-                    // they drift.
-                    self.session.pty_out.extend_from_slice(line.as_bytes());
-                    self.session.pty_out.push(b'\r');
-                }
+                // NO BYTES FROM HERE. The raw key path already sent this
+                // line, character by character, as it was typed — that is
+                // what made the shell run everything twice. `submitted`
+                // is now purely a NOTIFICATION that a line was entered:
+                // it feeds the audit chain above, and nothing else.
+                //
+                // The risk confirmation moved to the key path too, where
+                // it can withhold the Enter byte. Asking here was always
+                // too late: `\r` had already gone to the shell on the
+                // same keypress that produced this line.
             }
             // LOCAL ECHO INTO THE SCREEN, since there is no PTY here.
             //
@@ -3309,8 +3493,8 @@ impl eframe::App for VoicetermApp {
             // means nothing has to track when the window changed.
             if let Some(host) = &mut self.pty {
                 host.resize(
-                    self.session.grid.cols.min(u16::MAX as usize) as u16,
-                    self.session.grid.rows.min(u16::MAX as usize) as u16,
+                    self.app.terminal.grid.cols.min(u16::MAX as usize) as u16,
+                    self.app.terminal.grid.rows.min(u16::MAX as usize) as u16,
                 );
             }
 
@@ -3363,9 +3547,23 @@ impl eframe::App for VoicetermApp {
                 if out.is_empty() {
                     continue;
                 }
+                // INTO THE PANE'S SESSION, WHICH IS WHAT GETS DRAWN.
+                //
+                // This wrote into `pane_apps[id].terminal` — the
+                // uikit-term widget's grid — while the view renders
+                // `session.grid`. So a background pane's output landed
+                // somewhere nothing draws, and was still missing when
+                // the pane regained focus. The drain exists to stop an
+                // unfocused pane looking frozen; writing to the wrong
+                // grid moved the problem rather than fixing it.
+                // Into the pane's own App — for an unfocused pane that
+                // is where its displayed grid is parked, exactly as
+                // swap_focus left it. I had moved this to pane_sessions
+                // while I believed session.grid was the drawn one; with
+                // one grid per pane living in the App, this is simply
+                // the parked half of the same rule.
                 if let Some(app) = self.pane_apps.get_mut(id) {
-                    let text = String::from_utf8_lossy(&out).into_owned();
-                    app.terminal.feed(&text);
+                    app.terminal.feed(&String::from_utf8_lossy(&out));
                 }
                 // `h.ended()` (shell exited while backgrounded) is intentionally not surfaced
                 // here: the toast path above is keyed to the single focused-pane pty_ended_noted
@@ -3446,7 +3644,7 @@ impl eframe::App for VoicetermApp {
                 // failure is logged and left as None: that pane falls back
                 // to local echo, which is worse than a shell and much
                 // better than a dead rectangle.
-                let host = match voiceterm_egui::pty_host::PtyHost::spawn(80, 24) {
+                let host = match voiceterm_egui::pty_host::PtyHost::spawn(80, 24, repaint_waker(ui.ctx())) {
                     Ok(h) => Some(h),
                     Err(e) => {
                         eprintln!("[voiceterm] pane {id}: no shell: {e}");
@@ -3466,6 +3664,37 @@ impl eframe::App for VoicetermApp {
                 // `PtyHost::drop`), so closing a pane does not leave a
                 // shell running with nothing attached to it.
                 self.pane_ptys.remove(id);
+                // Forget the failure too, or a pane id reused by a later
+                // session would inherit a verdict about a different pane.
+                self.pty_spawn_failed.remove(id);
+            }
+
+            // THE FOCUSED PANE FALLS BETWEEN THE TWO RULES ABOVE.
+            //
+            // `hosted` includes `pane_focus`, so the spawn loop never
+            // considers the focused pane — correct while it HAS a shell.
+            // But `swap_focus` hands a newly focused pane `fresh()`,
+            // which for `Option<PtyHost>` is `None`. So splitting a pane
+            // produced a focused terminal with no shell, permanently:
+            // the next frame has `prev == now`, `swap_focus` is a no-op,
+            // and nothing else ever looks. Keys went to `pty_out`, fell
+            // through to local echo, and no command ever ran.
+            //
+            // Spawning here rather than inside the loop keeps the
+            // background rule intact: parked panes are reconciled by id,
+            // the focused pane is reconciled by whether it actually has
+            // a shell in hand.
+            if voiceterm_egui::pane_host::focused_needs_shell(
+                self.pty.is_some(),
+                self.pty_spawn_failed.contains(&self.pane_focus),
+            ) {
+                match voiceterm_egui::pty_host::PtyHost::spawn(80, 24, repaint_waker(ui.ctx())) {
+                    Ok(h) => self.pty = Some(h),
+                    Err(e) => {
+                        eprintln!("[voiceterm] pane {}: no shell: {e}", self.pane_focus);
+                        self.pty_spawn_failed.insert(self.pane_focus);
+                    }
+                }
             }
 
             // THE PANE GRID. A tab can hold several panes now, so the terminal no longer owns
@@ -3601,6 +3830,10 @@ impl eframe::App for VoicetermApp {
             if self.app.handle_gestures(ctx, term_rect.min) {
                 ctx.request_repaint(); // fling momentum still gliding
             }
+            // The selection re-read that used to live here is gone:
+            // feed_pty now feeds app.terminal, so handle_gestures reads
+            // a grid with the shell's text in it and its word/line
+            // selection is correct on its own.
             // Long-press on the pane opens the 3x3 marking menu at the press point (detached host:
             // the terminal isn't a widget Response). The line selection the long-press also made is
             // exactly what the menu's "copy" cell copies.
@@ -3613,46 +3846,26 @@ impl eframe::App for VoicetermApp {
             // the pane the border says is focused. One grid still serves
             // whichever pane holds focus; a per-pane grid (session follows
             // its pane) stays on-device work, recorded in C11_TODO.
-            ui.scope_builder(
-                egui::UiBuilder::new().max_rect(term_rect.shrink(8.0)),
-                |ui| {
-            if self.session.grid.is_dirty() || self.session.grid.cursor() != (0, 0) {
-                let (cx, cy) = self.session.grid.cursor();
-                // The grid reports WHICH rows changed; RowCache turns that into
-                // the minimal set to re-shape. take_dirty rather than
-                // dirty_rows, so the range is consumed once — reading it
-                // without clearing would mark the same rows every frame and
-                // the cache would never hit.
-                if let Some((lo, hi)) = self.session.grid.take_dirty() {
-                    self.session.row_dirty.mark_range(lo, hi);
-                }
-                let width = ui.available_width(); // the child ui below term_rect's border
-                // frame_plan flushes the dirty set and INVALIDATES those
-                // slots, returning which rows need rebuilding. The return value
-                // is not iterated here — get_or_build below does the work,
-                // building exactly the invalidated rows and reusing the rest.
-                // Calling it for its effect is the point.
-                let _plan = voiceterm_egui::row_render::frame_plan(
-                    &mut self.session.row_dirty, &mut self.session.row_galleys, width);
-                egui::Frame::NONE.show(ui, |ui| {
-                    for y in 0..24 {
-                        // A hit returns the cached string; a miss shapes it
-                        // once. row_text is the expensive part on a wide grid,
-                        // and the closure means an unchanged row never calls it.
-                        let Some(row) = self.session.row_galleys
-                            .get_or_build(y, || self.session.grid.row_text(y)) else { continue };
-                        if row.trim().is_empty() && y > cy { continue; }
-                        // The cursor row is marked rather than drawn as a
-                        // block: this is a monospace label, not a canvas, and a
-                        // fake caret that sits in the wrong column is worse
-                        // than none.
-                        let txt = if y == cy { format!("{row}  <{cx}") } else { row };
-                        ui.label(egui::RichText::new(txt).monospace().small());
-                    }
-                });
-            }
-            })
-            ;
+            // THE SECOND RENDER OF THE TERMINAL, REMOVED.
+            //
+            // A ~40-line block here re-drew the whole grid from
+            // `session.grid` through its own row cache and galley cache.
+            // Its comment said it painted "after the focused app" so the
+            // live session would land in the pane the border marks as
+            // focused — but `self.app.render_at` sits ~150 lines further
+            // down and paints last, so every one of those rows was
+            // shaped, laid out, painted and then covered.
+            //
+            // That inverted ordering IS the original "text does not
+            // appear in the terminal" bug: the shell's output went to
+            // session.grid, this block drew it, and render_at painted
+            // app.terminal's grid on top. Making feed_pty mirror into
+            // app.terminal fixed the symptom; this removes the wasted
+            // half.
+            //
+            // Per frame, on a phone, that is a full grid of text layout
+            // for pixels nobody sees. Verified by screenshot before and
+            // after: identical.
             if let Some(p) = self.app.take_long_press() {
                 self.pane_menu.open_at(ui, p, &pane_menu());
             }
@@ -3681,13 +3894,29 @@ impl eframe::App for VoicetermApp {
                 self.pane_menu.show_detached(ui, &pane_menu())
             {
                 match pane_dispatch(&id, variant) {
-                    Some(PaneAction::Clear) => self.app.terminal.clear(), // the demo has no PTY; Terminal::clear is Ctrl+L's effect
+                    // Onto the grid that is DRAWN. Clearing the widget's
+                    // terminal emptied a grid this view never renders, so
+                    // "Clear" did nothing you could see.
+                    Some(PaneAction::Clear) => self.app.terminal.clear(),
                     Some(PaneAction::CopySelection) => {
-                        let text = self.app.selection.take().map(|s| s.text).unwrap_or_else(|| self.app.terminal.screen_text());
+                        // Same reason: `Terminal::screen_text` reads the
+                        // widget's grid, which nothing feeds for the
+                        // focused pane, so "copy screen" copied an empty
+                        // string. Built from the session grid instead —
+                        // the same rows the user is looking at.
+                        let text = self
+                            .app
+                            .selection
+                            .take()
+                            .map(|s| s.text)
+                            .unwrap_or_else(|| self.app.terminal.screen_text());
                         ctx.copy_text(text);
                         self.toasts.success("Copied", ctx.input(|i| i.time));
                     }
-                    Some(PaneAction::CommandPalette) => self.app.open_search(), // nearest on-device affordance today
+                    // Opens THIS find bar, not the widget's: that one
+                    // searches a grid nothing feeds and was never
+                    // rendered by any frame here.
+                    Some(PaneAction::CommandPalette) => self.app.open_search(),
                     // Through apply(), the same WsCall path the keyboard chords use —
                     // this arm was `{}` and the 3x3 menu's new-tab/split/close silently
                     // did nothing (field report, c11). Mic remains on-device wiring.
@@ -3699,6 +3928,11 @@ impl eframe::App for VoicetermApp {
                         self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command("new tab".into()));
                     }
                     Some(PaneAction::Mic) => {}
+                    // Onto app.terminal.grid, which is what render_at
+                    // draws. Paging session.grid moved a buffer nobody
+                    // sees — the mistake this whole area kept making,
+                    // just in the other direction once I learned which
+                    // grid is on screen.
                     Some(PaneAction::PageUpScrollback) => {
                         let page = self.app.terminal.grid.rows.saturating_sub(1).max(1);
                         self.app.terminal.grid.page_up(page);
@@ -3746,6 +3980,17 @@ impl eframe::App for VoicetermApp {
 /// SILENTLY: the app runs and has no icon, no dock grouping and the wrong
 /// name in the switcher.
 const APP_ID: &str = "org.voiceterm.VoiceTerm";
+
+
+/// A waker for `PtyHost`: the reader thread calls this when the shell
+/// speaks, so the frame that draws its output actually runs.
+///
+/// egui coalesces repeated requests inside one frame, so calling it per
+/// read rather than per byte costs nothing.
+fn repaint_waker(ctx: &egui::Context) -> voiceterm_egui::pty_host::Waker {
+    let ctx = ctx.clone();
+    std::sync::Arc::new(move || ctx.request_repaint())
+}
 
 fn main() -> eframe::Result<()> {
     let mut app = App::new(80, 24);
@@ -3892,28 +4137,38 @@ fn main() -> eframe::Result<()> {
                 link_url: None,
                 workspace: Workspace::new(&["main", "logs"]),
                 pane_apps: std::collections::HashMap::new(),
-                pane_focus: 0, // TermWorkspace's first pane is id 0
+                // Fixed up from the model immediately after construction
+                // — see below. Hardcoding 0 here was wrong: the comment
+                // said "TermWorkspace's first pane is id 0", which is
+                // true of TermWorkspace and false of the shell::Workspace
+                // wrapper this app actually uses, whose first pane is 1.
+                pane_focus: 0,
 
                 theme: boot_theme,
                 theme_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-theme-menu").columns(3).hold(0.35).item_size(64.0),
                 blocks,
                 line_buf: Default::default(),
-                vt: Default::default(),
                 tabbar_scroll_to: None,
                 toasts: uikit_egui::toast::Toasts::new(),
                 // 80x24 is a placeholder: the first frame calls
                 // `resize` with the real grid size, and starting at the
                 // conventional default means a shell that prints a banner
                 // before then wraps sensibly rather than at zero columns.
-                pty: match voiceterm_egui::pty_host::PtyHost::spawn(80, 24) {
-                    Ok(h) => Some(h),
-                    Err(e) => {
-                        eprintln!("[voiceterm] no shell: {e} — falling back to local echo");
-                        None
-                    }
-                },
+                // NO SHELL HERE. `focused_needs_shell` owns shell
+                // creation for the focused pane and runs on the first
+                // frame; spawning one here too produced TWO — observed
+                // as two `/bin/sh -l` children of the app on a real run.
+                // Only `self.pty` is ever written to, so the second sat
+                // idle holding a pty and a reader thread for the life of
+                // the process.
+                //
+                // One rule, and it is the one with the failure memory
+                // (`pty_spawn_failed`), so a machine with no usable shell
+                // is asked once rather than once per frame.
+                pty: None,
                 pty_ended_noted: false,
                 pane_ptys: std::collections::HashMap::new(),
+                pty_spawn_failed: std::collections::HashSet::new(),
                 launcher: uikit_egui::quick_launcher::LauncherState::default(),
                 a11y: uikit_egui::a11y::A11yScene::new(),
                 mail: Default::default(),
@@ -3971,6 +4226,22 @@ fn main() -> eframe::Result<()> {
                 web_prefs: voiceterm_egui::web_prefs::load(),
                 graph_source: String::new(),
             };
+            // Take the focused pane id FROM THE MODEL rather than
+            // hardcoding it.
+            //
+            // The old literal `0` carried the comment "TermWorkspace's
+            // first pane is id 0", which is true of TermWorkspace and
+            // says nothing about the shell::Workspace wrapper this app
+            // uses. It happens to agree today — a probe on a real run
+            // printed `focus=0 panes=[0, 1]` — so this is not a bug fix,
+            // it is removing a coincidence that a change to the default
+            // layout would quietly turn into one.
+            //
+            // Recorded because I first read the two shells that run at
+            // startup as a double-spawn and "fixed" it. They are
+            // correct: the default workspace has TWO panes, and one
+            // shell each is the intended behaviour.
+            app.pane_focus = app.workspace.focused_pane();
             // ONE SCAN AT STARTUP, so the mail views have something the
             // moment they are opened rather than only after the person
             // finds the rescan button. Not repeated: a Maildir scan is

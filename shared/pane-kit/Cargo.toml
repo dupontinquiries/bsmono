@@ -1,0 +1,8 @@
+[package]
+name = "pane-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Tabs of split panes as a pure binary layout tree: splits, geometric focus, resize, pane rects, and LRU tab bubbling with pins and fences. Generic over what a pane holds — voiceterm holds PTY/web sessions, aperture holds document views. Lifted from voiceterm's terminal_workspace so both apps share one tree instead of two."
+
+[dependencies]

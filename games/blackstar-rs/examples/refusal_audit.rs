@@ -1,7 +1,11 @@
 // Why a chassis in fleet.json's "refused" list is refused, in its own
 // words. `stripcheck.rs` answers accepted-or-not; this decodes the real
-// pack data through the real loader (`model::load_raw_unoriented`, same
-// path `main.rs` uses at runtime) and, for anything that DOES build a
+// pack data through the real loader (`model::load_raw_at` for the span,
+// then `model::load_raw` at ONE SHARED SCALE across the strip — the same
+// path `main.rs` uses at runtime; see the comment at the load site, and
+// note this header said `load_raw_unoriented` for a while, which is what
+// the code does NOT do and what a later harness copied by mistake) and,
+// for anything that DOES build a
 // `Morph`, runs `foldaudit::audit` over it to say WHERE the fold goes
 // wrong — self-intersection, volume collapse, a velocity spike, a NaN —
 // rather than leaving "refused" as an unexplained verdict.

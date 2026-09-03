@@ -9,6 +9,9 @@ edition = "2021"
 peer-handshake = { path = "../../shared/peer-handshake" }
 voiced-core = { path = "../../shared/voiced-core" }
 nifty-core = { path = "../../shared/nifty-core" }
+# Tabs of split panes. Lifted out of src/terminal_workspace.rs so aperture
+# can use the same tree with a document payload.
+pane-kit = { path = "../../shared/pane-kit" }
 # hallucination filtering shared with rusty-board (voice keyboard) — see
 # TODO.md's aperture-adjacent "voiceterm voice.rs hallucination fns ->
 # voice-kit" item. Zero-dependency itself (only models-kit, a path dep),

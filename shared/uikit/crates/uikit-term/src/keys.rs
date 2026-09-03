@@ -75,6 +75,152 @@ pub struct TermMode {
 
 /// Encode with the default (reset) modes. Kept so existing callers do not have
 /// to thread a mode they do not track.
+/// Who owns keyboard input for a terminal widget.
+///
+/// `uikit_term::App::handle_input` has always had two destinations — a
+/// line buffer for a host with no shell, and raw `pending_bytes` for one
+/// with a PTY — and its own doc says "a host wires ONE of them".
+/// voiceterm-egui wired both AND ran its own `pty_input::drain_egui`
+/// over the same events, so every keystroke reached the shell twice and
+/// every Enter ran the command twice: `ls` typed once, executed twice;
+/// Ctrl-C sending two SIGINTs; up-arrow skipping two history entries.
+///
+/// Nothing detected it because each path is individually correct. This
+/// enum is the missing statement of which one is in charge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputOwner {
+    /// The widget owns input: accumulate a line, submit on Enter, encode
+    /// control keys. Right when there is no shell — a demo, a failed
+    /// spawn — where the line buffer is the only thing making typing
+    /// visible.
+    #[default]
+    Widget,
+    /// The HOST encodes keys itself and the widget must not also. It
+    /// still handles what the host's raw path does not: scrollback keys,
+    /// find, and paste.
+    Host,
+}
+
+/// What a widget should do with one event class under `owner`.
+///
+/// Split out as a predicate rather than left as `if` statements inside
+/// the event loop so the policy is testable without an egui context —
+/// which is the only reason the bug above is now pinned by a test rather
+/// than by someone typing `ls` and watching it run twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventClass {
+    /// Printable text.
+    Text,
+    /// Enter, Backspace — the line editor's keys.
+    LineEdit,
+    /// Arrows, Tab, Escape, Ctrl-letter: encoded to PTY bytes.
+    Encoded,
+    /// Shift+PageUp/PageDown.
+    Scrollback,
+    /// Ctrl+F find, Ctrl+P reserved.
+    WidgetChord,
+    /// Clipboard paste.
+    Paste,
+}
+
+/// Whether the widget should act on this event class.
+///
+/// Only `Encoded` produces BYTES. `Text` and `LineEdit` maintain the
+/// widget's line buffer, which produces nothing on its own — so they
+/// stay with the widget in both modes, and a host that encodes keys
+/// itself still gets a `submitted` line out of Enter. That line is what
+/// the audit chain and the risk confirmation are built on; gating it off
+/// silently disabled both, which is how the first version of this
+/// function was wrong.
+///
+/// Paste stays with the widget in BOTH modes too: voiceterm's raw path
+/// reads `Event::Text` and `Event::Key` and has no paste arm at all, so
+/// handing paste to the host would silently disable pasting into the
+/// terminal. Bracketing (DEC 2004) also needs the terminal's mode, which
+/// the widget has and a stateless encoder does not.
+/// Whether these bytes make the SHELL discard its current input line.
+///
+/// A host that keeps its own copy of the line — voiceterm's does, and
+/// `cmd_risk::withhold_enter` reads it to decide whether a command needs
+/// confirming — has to clear that copy when the shell clears its own, or
+/// the two drift apart.
+///
+/// The drift is not cosmetic. Type `rm -rf build`, press Ctrl-C (the
+/// shell discards it), type `ls`, press Enter: the host's copy reads
+/// `rm -rf buildls`, so a confirmation appears quoting a command that
+/// was never entered — and, worse in the other direction, a stale
+/// harmless prefix can make a real one classify wrong.
+///
+/// `Terminal::interrupt` existed for exactly this and had no caller.
+///
+/// * `0x03` Ctrl-C — SIGINT; readline abandons the line.
+/// * `0x15` Ctrl-U — unix-line-discard; kills it outright.
+///
+/// Ctrl-W (delete word) and Ctrl-K (kill to end) are deliberately absent:
+/// they edit the line rather than discard it, and mirroring a partial
+/// edit needs the host to model readline, which is a much bigger claim
+/// than "these two bytes empty it".
+pub fn clears_the_line(bytes: &[u8]) -> bool {
+    bytes == [0x03] || bytes == [0x15]
+}
+
+/// Chords the WIDGET claims for itself, which the host's raw key path
+/// must therefore not encode.
+///
+/// Ctrl+F opens the find bar and Ctrl+P is reserved for the host's
+/// palette. `App::handle_input` already refuses to turn them into
+/// control bytes — but a host running its OWN encoder over the same
+/// events does not know that, so pressing Ctrl+F both opened the bar
+/// and sent 0x06 to the shell. Observed as a literal `^F` at the prompt
+/// in a screenshot; no unit test was going to catch it, because each
+/// reader was individually correct.
+///
+/// Same shape as `widget_handles`: one statement of who owns what, read
+/// by both readers.
+pub fn is_widget_chord(key: Key, m: Mods) -> bool {
+    // Ctrl+F find, Ctrl+P palette.
+    if m.ctrl && !m.alt && matches!(key, Key::Char('f') | Key::Char('F') | Key::Char('p') | Key::Char('P'))
+    {
+        return true;
+    }
+    // Shift+PageUp/PageDown scroll the SCROLLBACK. `handle_input` has
+    // explicit arms for them and its catch-all excludes them
+    // (`PageUp if !m.shift`), so the widget plainly owns them — but the
+    // host's raw path encoded them anyway and sent `ESC [ 5 ; 2 ~` to
+    // the shell. Seen at the prompt in a screenshot as `^[[5;2~` sitting
+    // in front of a typed command.
+    //
+    // WITHOUT shift they belong to the program: less and vim page with
+    // a bare PageUp, and stealing that would break them.
+    m.shift && !m.ctrl && !m.alt && matches!(key, Key::PageUp | Key::PageDown)
+}
+
+/// Whether the HOST's raw key path should run this frame.
+///
+/// The mirror of `widget_handles`, and the half that was missing: gating
+/// only the widget fixed the doubling when a shell was attached and left
+/// it in place when one was not, where the same two readers doubled into
+/// the local echo instead. Two consumers, one decision.
+pub fn host_encodes(owner: InputOwner) -> bool {
+    matches!(owner, InputOwner::Host)
+}
+
+pub fn widget_handles(owner: InputOwner, class: EventClass) -> bool {
+    match (owner, class) {
+        (InputOwner::Widget, _) => true,
+        // The line buffer, which emits no bytes — kept so `submitted`
+        // still fires for the audit chain and the risk gate.
+        (InputOwner::Host, EventClass::Text) => true,
+        (InputOwner::Host, EventClass::LineEdit) => true,
+        // The only byte-producing class, and therefore the only one that
+        // can double.
+        (InputOwner::Host, EventClass::Encoded) => false,
+        (InputOwner::Host, EventClass::Scrollback) => true,
+        (InputOwner::Host, EventClass::WidgetChord) => true,
+        (InputOwner::Host, EventClass::Paste) => true,
+    }
+}
+
 pub fn encode(key: Key, m: Mods) -> Option<Vec<u8>> {
     encode_mode(key, m, TermMode::default())
 }
@@ -239,6 +385,110 @@ pub fn is_eof(key: Key, m: Mods) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupt_and_line_discard_clear_the_line() {
+        assert!(clears_the_line(&[0x03]), "Ctrl-C");
+        assert!(clears_the_line(&[0x15]), "Ctrl-U");
+    }
+
+    #[test]
+    fn partial_line_edits_do_not_count() {
+        // mirroring these needs the host to model readline
+        assert!(!clears_the_line(&[0x17]), "Ctrl-W deletes a word");
+        assert!(!clears_the_line(&[0x0b]), "Ctrl-K kills to end of line");
+        assert!(!clears_the_line(&[0x7f]), "backspace");
+        assert!(!clears_the_line(b"\r"));
+        assert!(!clears_the_line(b"ls"));
+        assert!(!clears_the_line(&[]));
+        // a control byte inside a longer sequence is not a discard
+        assert!(!clears_the_line(&[0x1b, 0x03]));
+    }
+
+    #[test]
+    fn the_widget_claims_find_and_palette() {
+        let ctrl = Mods { ctrl: true, alt: false, shift: false };
+        assert!(is_widget_chord(Key::Char('f'), ctrl));
+        assert!(is_widget_chord(Key::Char('F'), ctrl));
+        assert!(is_widget_chord(Key::Char('p'), ctrl));
+    }
+
+    #[test]
+    fn shift_paging_is_scrollback_and_bare_paging_is_the_programs() {
+        let shift = Mods { ctrl: false, alt: false, shift: true };
+        assert!(is_widget_chord(Key::PageUp, shift));
+        assert!(is_widget_chord(Key::PageDown, shift));
+        // bare PageUp belongs to less/vim; stealing it breaks them
+        assert!(!is_widget_chord(Key::PageUp, Mods::none()));
+        assert!(!is_widget_chord(Key::PageDown, Mods::none()));
+    }
+
+    #[test]
+    fn an_unclaimed_key_still_reaches_the_shell() {
+        assert!(!is_widget_chord(Key::Char('f'), Mods::none()), "typing f is not a chord");
+        let ctrl = Mods { ctrl: true, alt: false, shift: false };
+        assert!(!is_widget_chord(Key::Char('c'), ctrl), "Ctrl-C must still interrupt");
+        let ctrl_alt = Mods { ctrl: true, alt: true, shift: false };
+        assert!(!is_widget_chord(Key::Char('f'), ctrl_alt), "Ctrl+Alt+F is a different chord");
+    }
+
+    #[test]
+    fn the_widget_owns_everything_when_there_is_no_shell() {
+        for c in [
+            EventClass::Text,
+            EventClass::LineEdit,
+            EventClass::Encoded,
+            EventClass::Scrollback,
+            EventClass::WidgetChord,
+            EventClass::Paste,
+        ] {
+            assert!(widget_handles(InputOwner::Widget, c), "{c:?}");
+        }
+        assert_eq!(InputOwner::default(), InputOwner::Widget, "the safe default");
+    }
+
+    #[test]
+    fn a_host_takes_only_the_byte_producing_class() {
+        // Encoded is the only class that emits bytes, so it is the only
+        // one that can double.
+        assert!(!widget_handles(InputOwner::Host, EventClass::Encoded));
+        // The line buffer emits nothing and must keep running, or the
+        // host loses the `submitted` line the audit chain and the risk
+        // confirmation are built on.
+        assert!(widget_handles(InputOwner::Host, EventClass::Text));
+        assert!(widget_handles(InputOwner::Host, EventClass::LineEdit));
+        // And these are what no host raw path covers.
+        assert!(widget_handles(InputOwner::Host, EventClass::Scrollback));
+        assert!(widget_handles(InputOwner::Host, EventClass::WidgetChord));
+    }
+
+    #[test]
+    fn exactly_one_reader_produces_bytes() {
+        // The invariant both gates exist to hold, stated over the class
+        // that actually emits bytes. An earlier version asserted it over
+        // Text and LineEdit too, which forced those off in Host mode and
+        // took the audit chain and the risk confirmation with them —
+        // a wrong invariant is worse than none, because it argues for
+        // the bug.
+        for owner in [InputOwner::Widget, InputOwner::Host] {
+            assert_ne!(
+                host_encodes(owner),
+                widget_handles(owner, EventClass::Encoded),
+                "{owner:?}: both or neither would encode"
+            );
+        }
+    }
+
+    #[test]
+    fn paste_stays_with_the_widget_in_both_modes() {
+        // voiceterm's raw path reads Text and Key events and has NO
+        // paste arm; handing paste to the host would silently break
+        // pasting, and bracketing needs the terminal's DEC 2004 state
+        // that only the widget has
+        assert!(widget_handles(InputOwner::Host, EventClass::Paste));
+        assert!(widget_handles(InputOwner::Widget, EventClass::Paste));
+    }
+
 
     fn enc(k: Key, m: Mods) -> String {
         String::from_utf8_lossy(&encode(k, m).expect("encodes")).into_owned()

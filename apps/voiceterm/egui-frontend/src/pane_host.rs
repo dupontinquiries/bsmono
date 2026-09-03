@@ -18,28 +18,28 @@
 
 use std::collections::HashMap;
 
-/// The per-pane terminal session: everything the typed history IS.
+/// The per-pane byte buffer bound for that pane's shell.
+///
+/// It used to carry a grid, a VT parser and two render caches as well.
+/// None of that was ever DRAWN: `app.render_at` paints
+/// `app.terminal.grid`, and a pane's terminal lives in its `App` —
+/// focused in `self.app`, parked in `pane_apps`. The render half here
+/// was a second copy that was fed, laid out and then overpainted.
+///
+/// What is left is the part that was always real: bytes going to the
+/// shell, and how much of them has been handled.
 pub struct PaneSession {
-    /// The live VT screen — where every typed byte echoes.
-    pub grid: crate::term_grid::TermGrid,
     /// Bytes going TO the shell; a host drains this to a real PTY.
     pub pty_out: Vec<u8>,
-    /// High-water mark of `pty_out` already echoed to the grid.
+    /// High-water mark of `pty_out` already handled.
     pub pty_echoed: usize,
-    /// Which grid rows changed since last shape.
-    pub row_dirty: crate::row_cache::RowCache,
-    /// Shaped galleys per row, reused while a row is unchanged.
-    pub row_galleys: crate::row_render::RowLayoutCache<String>,
 }
 
 impl PaneSession {
     pub fn new() -> PaneSession {
         PaneSession {
-            grid: crate::term_grid::TermGrid::new(80, 24),
             pty_out: Vec::new(),
             pty_echoed: 0,
-            row_dirty: crate::row_cache::RowCache::new(24), // matches the 80x24 grid above
-            row_galleys: crate::row_render::RowLayoutCache::new(),
         }
     }
 }
@@ -48,6 +48,29 @@ impl Default for PaneSession {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether the focused pane needs a shell spawned for it right now.
+///
+/// ## The hole this closes
+///
+/// The reconcile loop builds `hosted` as the parked-pane ids PLUS the
+/// focused id, then spawns for everything in the workspace that is not
+/// hosted. That is correct for background panes and wrong for the
+/// focused one: `swap_focus` hands a newly focused pane `fresh()`, which
+/// for `Option<PtyHost>` is `None`, and then `hosted` claims the pane is
+/// already served so the spawn loop skips it.
+///
+/// So splitting a pane produced a focused terminal with NO shell —
+/// permanently, because the next frame has `prev == now` and
+/// `swap_focus` is a no-op. Keys went to `pty_out`, fell through to
+/// local echo, and nothing ever ran. Every piece was individually
+/// correct; the focused pane simply fell between two rules.
+///
+/// `tried` is what stops a failing spawn being retried every frame
+/// forever — the same reason the background loop remembers a `None`.
+pub fn focused_needs_shell(has_shell: bool, tried: bool) -> bool {
+    !has_shell && !tried
 }
 
 /// Exchange the focused state with the parked map when focus moves from
@@ -75,6 +98,31 @@ pub fn swap_focus<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+
+
+
+    #[test]
+    fn a_freshly_focused_pane_with_no_shell_asks_for_one() {
+        // the split case: swap_focus handed it None and the reconcile
+        // loop skipped it because `hosted` already claimed the id
+        assert!(focused_needs_shell(false, false));
+    }
+
+    #[test]
+    fn a_pane_that_already_has_a_shell_is_left_alone() {
+        assert!(!focused_needs_shell(true, false));
+        assert!(!focused_needs_shell(true, true));
+    }
+
+    #[test]
+    fn a_failed_spawn_is_not_retried_every_frame() {
+        // sixty spawn attempts a second against a machine with no shell
+        // is worse than a pane that falls back to local echo
+        assert!(!focused_needs_shell(false, true));
+    }
+
 
     /// The property the whole module exists for: a pane's content survives
     /// losing and regaining focus, and each pane sees only its own.
@@ -126,6 +174,6 @@ mod tests {
         let s = PaneSession::new();
         assert!(s.pty_out.is_empty());
         assert_eq!(s.pty_echoed, 0);
-        assert_eq!(s.grid.cursor(), (0, 0));
+        assert_eq!(s.pty_echoed, 0);
     }
 }

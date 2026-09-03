@@ -372,11 +372,43 @@ exactly where that difference gets lost.
   rewires the build makes it impossible to tell later which changes came from
   upstream and which were integration choices."
 - Say what was verified and what was not, in the message. "Unverified by
-  compilation" is an acceptable state here — GPU, Qt and GTK paths cannot be
-  built in this sandbox — but it has to be *said*, or the next session inherits
-  a claim it cannot audit.
+  compilation" is an acceptable state here — but it has to be *said*, or the
+  next session inherits a claim it cannot audit.
+- **Check what the sandbox can actually do before claiming it cannot.** This
+  rule used to read "GPU, Qt and GTK paths cannot be built in this sandbox".
+  That is true of **Qt** (`qmetaobject` needs headers that are not installable)
+  and **false of egui/eframe/glow**, which build, link, run against software
+  GL, and can be driven with synthetic keystrokes and screenshotted — see
+  [docs/agents/HEADLESS_GUI_TESTING.md](docs/agents/HEADLESS_GUI_TESTING.md).
+  The claim was written for Qt and generalised; a session inherited it and
+  spent sixteen commits reasoning about a UI it could have looked at, then a
+  single screenshot overturned a premise four of those commits rested on. One
+  `cargo build` is cheaper than the assumption.
 - Write long messages to a file and use `git commit -F`. Heredocs through a
   `sh -c` wrapper mangle apostrophes and silently truncate.
+- **`cargo test --lib` is not the test suite.** It skips `tests/`, and a
+  signature change to a public function will sit broken there while every run
+  reports green. A session changed `PtyHost::spawn` to take a required
+  argument and reported "1237 tests pass" fifteen times before discovering
+  `tests/real_pty.rs` — the only test that drives a real shell — had not
+  compiled since. Run plain `cargo test` (all targets) before claiming a count,
+  and reach for `--lib` only to go faster mid-loop.
+- **A harness that measures runtime behaviour must load its data the way the
+  runtime does, and should name the function it mirrors in a comment.** A
+  self-consistent harness answering a question nobody asked is the hardest kind
+  of wrong to notice: every number it prints is reproducible. In one session a
+  fold audit measured the unified prim set instead of the model's own, a
+  screenshot tool rendered a pose the game never draws, and the same audit used
+  an unoriented, unscaled loader — three separate wrong answers, all internally
+  tidy. The sibling harness had the rule written down already.
+- **A grep hit pointing at an existing module is worth two minutes before you
+  build a parallel one.** `src/foldaudit.rs` — 549 lines, nine tests, wired into
+  two callers — appeared in a search result and was not followed up; a second
+  audit got written beside it.
+- **"Nothing references this" is a claim to grep for across the whole repo.**
+  Two of three modules called unreferenced in one commit had callers: one was
+  the Qt app's own file reached by `#[path]`, another was used by an
+  integration test. Impressions from one directory are not an audit.
 
 ## 9. Name output bundles `c9-NNN-<summary>.bundle`
 

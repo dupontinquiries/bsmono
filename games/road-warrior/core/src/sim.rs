@@ -118,3 +118,98 @@ mod tests {
         assert!(v.pos_x > track.total_length, "sanity check: vehicle should actually have outrun the track for this test to mean anything");
     }
 }
+
+#[cfg(test)]
+mod level_one_playability {
+    //! Can the shipped first level actually be played?
+    //!
+    //! Every other test here uses a synthetic track, which is right for
+    //! testing the seam but says nothing about whether Dust Bowl is
+    //! completable. These use its real shape — Flat 30, Ramp 8 rising to 5,
+    //! Gap 10, Flat 40 — and were written after driving it in the running
+    //! game and finding the jump always cost health.
+    //!
+    //! It turned out not to be a bug: the ramp launch needs active tilt to
+    //! land clean, and the attempts were made through a software renderer
+    //! running the simulation at roughly a quarter speed, so a held key was
+    //! a quarter of the input it looked like. These pin the numbers so the
+    //! next person does not have to rediscover that.
+
+    use super::*;
+    use crate::track::Segment;
+    use crate::vehicle::CarKind;
+
+    fn dust_bowl() -> Track {
+        Track::new(
+            "Dust Bowl",
+            vec![
+                Segment::Flat { length: 30.0, height: 0.0 },
+                Segment::Ramp { length: 8.0, from_height: 0.0, to_height: 5.0 },
+                Segment::Gap { length: 10.0 },
+                Segment::Flat { length: 40.0, height: 0.0 },
+            ],
+        )
+    }
+
+    /// Drive from the start at full throttle, holding `tilt_steps` of
+    /// nose-down tilt once airborne. Returns the vehicle at the moment it
+    /// lands again.
+    fn jump_with(tilt_steps: u32) -> crate::vehicle::Vehicle {
+        let track = dust_bowl();
+        let mut v = crate::vehicle::Vehicle::new(CarKind::RedSedan);
+        let dt = 1.0 / 60.0;
+        let mut air = 0;
+        for _ in 0..3000 {
+            let was_air = v.airborne;
+            let tilt = if v.airborne && air < tilt_steps { -1.0 } else { 0.0 };
+            if v.airborne {
+                air += 1;
+            }
+            advance(&mut v, &track, dt, 1.0, tilt, false, -9.8);
+            if was_air && !v.airborne {
+                break;
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn full_throttle_clears_the_gap() {
+        // The gap runs 38..48. Landing short is landing in the pit.
+        let v = jump_with(0);
+        assert!(!v.airborne, "the car should have landed");
+        assert!(v.pos_x > 48.0, "cleared the gap; landed at {}", v.pos_x);
+    }
+
+    #[test]
+    fn the_jump_is_survivable_without_any_input() {
+        // A player who does nothing mid-air lands nose-up and takes a
+        // scratch, not a death. If this ever costs more than a few points
+        // the level has become punishing by accident.
+        let v = jump_with(0);
+        let lost = 70.0 - v.health;
+        assert!(lost > 0.0, "a nose-up landing should cost something");
+        assert!(lost < 10.0, "but not this much: lost {lost}");
+        assert_eq!(v.nitro, 0.0, "and it should not be rewarded");
+    }
+
+    #[test]
+    fn a_third_of_a_second_of_tilt_earns_the_nitro() {
+        // The actual skill window. 20 steps at 60Hz is 0.33s of held tilt;
+        // anything less lands rough. This is the number that makes the
+        // flip-for-boost loop work, and it is worth knowing it is a third
+        // of a second rather than a frame or a full second.
+        assert_eq!(jump_with(15).nitro, 0.0, "15 steps is not enough");
+        assert_eq!(jump_with(20).nitro, 25.0, "20 steps lands clean");
+        assert_eq!(jump_with(20).health, 70.0, "and takes no damage");
+    }
+
+    #[test]
+    fn over_rotating_is_not_punished_on_this_ramp() {
+        // Holding tilt for the whole flight still lands clean here, because
+        // air_drag bleeds the spin off before touchdown. Worth pinning: if
+        // a future tuning pass makes long holds flip the car past upright,
+        // this level's jump becomes a trap rather than a skill check.
+        assert_eq!(jump_with(50).nitro, 25.0);
+    }
+}

@@ -96,6 +96,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "aperture-collab"
+version = "0.1.0"
+dependencies = [
+ "aperture-core",
+]
+
+[[package]]
 name = "aperture-complete"
 version = "0.1.0"
 
@@ -103,6 +110,7 @@ version = "0.1.0"
 name = "aperture-core"
 version = "0.1.0"
 dependencies = [
+ "pane-kit",
  "ropey",
  "streaming-iterator",
  "tree-sitter",
@@ -2000,6 +2008,10 @@ checksum = "b7d950ca161dc355eaf28f82b11345ed76c6e1f6eb1f4f4479e0323b9e2fbd0e"
 dependencies = [
  "num-traits",
 ]
+
+[[package]]
+name = "pane-kit"
+version = "0.1.0"
 
 [[package]]
 name = "parking_lot"

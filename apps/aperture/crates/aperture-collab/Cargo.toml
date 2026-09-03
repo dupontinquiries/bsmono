@@ -1,0 +1,16 @@
+[package]
+name = "aperture-collab"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Multi-user editing for aperture: an RGA sequence CRDT under aperture-core's Op, so several people can edit one buffer with no server deciding who wins. Carets anchor to character ids rather than indices, so presence survives remote edits without transformation. Dependency-free."
+
+[features]
+default = []
+# The one-line conversion between TextEdit and aperture_core::Op. Off by
+# default so the CRDT core stays dependency-free and `cargo test -p
+# aperture-collab` needs no rope, no editor, no egui.
+aperture-core = ["dep:aperture-core"]
+
+[dependencies]
+aperture-core = { workspace = true, optional = true }

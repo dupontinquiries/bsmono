@@ -46,6 +46,33 @@ pub struct Outcome {
     pub applied: bool,
     /// The session ended on this result.
     pub ended: bool,
+    /// A (misheard, intended) pair the user just volunteered by
+    /// correcting us.
+    ///
+    /// Returned rather than recorded because `confusion_table` holds a
+    /// global Mutex and writes to disk, and this crate's pure half must
+    /// stay pure. The impure caller does:
+    ///
+    /// ```text
+    /// if let Some((heard, meant)) = outcome.teach {
+    ///     confusion_table::learn_from_confirmation(&heard, &meant);
+    /// }
+    /// ```
+    ///
+    /// Only emitted when the repair actually applied — a correction that
+    /// did not land is not evidence of anything.
+    ///
+    /// Feeding this in is safe even for pairs that are not really
+    /// mishearings, because `learn_from_confirmation` applies its own
+    /// similarity filter and `correct()` requires MIN_CONFIRMATIONS
+    /// before it acts. Verified against the real table: "read to
+    /// strong" -> "read to string" is learned, while "three" -> "nine"
+    /// and "read to end" -> "read to string" are dropped as too
+    /// dissimilar. That distinction is exactly the one that matters —
+    /// it separates "you misheard me" from "I changed my mind" — and it
+    /// means this side does not need its own acoustic-plausibility
+    /// check.
+    pub teach: Option<(String, String)>,
 }
 
 /// A live dictation session over one buffer.
@@ -113,6 +140,10 @@ impl Engine {
         let r = Recognition { text: text.to_string(), tier, confidence };
         let route = self.session.route(&r);
 
+        // Captured before the repair runs: afterwards the buffer holds
+        // the corrected text and the misheard version is gone.
+        let unit_before = self.sink.last_unit().map(|s| s.to_string());
+
         let applied = match &route {
             Route::Content(t) => {
                 // segment_strict, not segment: a recognizer classifies a
@@ -170,7 +201,14 @@ impl Engine {
             now_ms,
         );
 
-        Outcome { route, applied, ended: self.session.ended() }
+        let teach = match (&route, applied) {
+            (Route::Repair(rep), true) => unit_before
+                .as_deref()
+                .and_then(|u| crate::repair::training_pair(u, rep)),
+            _ => None,
+        };
+
+        Outcome { route, applied, ended: self.session.ended(), teach }
     }
 
     /// Apply a repair, accounting for the fact that what is IN the
@@ -440,6 +478,144 @@ mod tests {
         );
     }
 
+    /// Prose dictation fixtures. The code fixtures said nothing about
+    /// this half, and prose fails differently: whisper's per-utterance
+    /// capitalization, its punctuation guesses, and sentence boundaries
+    /// hidden behind closing marks.
+    ///
+    /// First run scored 10/12 and found a real bug (a closing quote hid
+    /// the period behind it) plus one decision that measuring reversed
+    /// (lowercased proper nouns).
+    #[test]
+    fn prose_dictation_fixtures() {
+        let cases: &[(&str, &[&str], &str)] = &[
+            (
+                "plain continuation",
+                &["the quick brown fox", "Jumped over the lazy dog"],
+                "the quick brown fox jumped over the lazy dog",
+            ),
+            ("sentence boundary", &["She left.", "Then it rained."], "She left. Then it rained."),
+            (
+                "closing quote hides the period",
+                &["He said \"hello.\"", "Then he left."],
+                "He said \"hello.\" Then he left.",
+            ),
+            (
+                "abbreviation mid-sentence",
+                &["We saw Dr.", "Smith at the clinic."],
+                "We saw Dr. Smith at the clinic.",
+            ),
+            (
+                "etc mid-sentence",
+                &["We brought food, drinks, etc.", "And a tent."],
+                "We brought food, drinks, etc. And a tent.",
+            ),
+            (
+                "closing paren then continue",
+                &["It rained (a lot)", "Which ruined the trip."],
+                "It rained (a lot) which ruined the trip.",
+            ),
+            (
+                "comma continuation",
+                &["Because it rained,", "We stayed inside."],
+                "Because it rained, we stayed inside.",
+            ),
+            (
+                "proper noun keeps its capital",
+                &["we flew to", "Paris in the spring"],
+                "we flew to Paris in the spring",
+            ),
+            (
+                "acronym continuation",
+                &["the server uses", "HTTP for everything"],
+                "the server uses HTTP for everything",
+            ),
+            ("question then answer", &["Did it work?", "Yes, mostly."], "Did it work? Yes, mostly."),
+            (
+                "numeric continuation",
+                &["we tried", "3 different approaches"],
+                "we tried 3 different approaches",
+            ),
+            ("the pronoun I", &["yesterday", "I went home"], "yesterday I went home"),
+        ];
+
+        let mut failures = Vec::new();
+        for (name, say, want) in cases {
+            let mut e = Engine::new("", 0, Mode::Prose, Policy::default(), 40, 3);
+            let mut t = 0u64;
+            for u in *say {
+                e.capture_start(t);
+                e.recognize(Tier::Whisper, u, 1.0, t + 300);
+                t += 1000;
+            }
+            if e.text() != *want {
+                failures.push(format!("\n  {}\n    want {:?}\n    got  {:?}", name, want, e.text()));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {} prose fixtures regressed:{}",
+            failures.len(),
+            cases.len(),
+            failures.join("")
+        );
+    }
+
+    /// The same fixtures, degraded the way whisper actually degrades
+    /// them. This is the robustness half of the measurement: the clean
+    /// fixtures say the transform is right, these say whether it
+    /// survives contact with a real recognizer.
+    ///
+    /// Corruptions are one-at-a-time and drawn from observed whisper
+    /// behaviour, not invented: disfluencies transcribed literally,
+    /// homophone substitutions for symbol words, split compounds, and
+    /// the sentence capital whisper puts on every utterance.
+    ///
+    /// Two cases here are expected to stay BROKEN, and are asserted as
+    /// broken. A dropped word and a duplicated word cannot be repaired
+    /// without guessing at every bare noun in the stream, and a visible
+    /// artifact the speaker fixes with one phrase beats a silent wrong
+    /// guess.
+    #[test]
+    fn degraded_transcripts_mostly_recover() {
+        let buf = "fn read_to_string(p:&Path)->Result<String>{}\n";
+        let go = |say: &str| {
+            let mut e = Engine::new(buf, buf.len(), Mode::Code, Policy::default(), 40, 3);
+            e.capture_start(0);
+            e.recognize(Tier::Whisper, say, 1.0, 300);
+            e.text()[buf.len()..].to_string()
+        };
+
+        // recovered
+        for (name, say, want) in [
+            ("leading filler", "um let x equals five semicolon", "let x = 5;"),
+            ("mid filler", "let x equals uh five semicolon", "let x = 5;"),
+            ("filler pair", "let x you know equals five semicolon", "let x = 5;"),
+            ("colon as column", "let x column i thirty two equals five semicolon", "let x: i32 = 5;"),
+            ("comma as coma", "foo open paren a coma b close paren", "foo(a, b)"),
+            ("paren as parent", "foo open parent a close parent", "foo(a)"),
+            ("brace as braise", "if x open braise", "if x {"),
+            ("split semicolon", "let x equals five semi colon", "let x = 5;"),
+            ("equals as equal", "let x equal five semicolon", "let x = 5;"),
+            ("sentence capital", "Let x equals five semicolon", "let x = 5;"),
+            ("trailing period", "let x equals five semicolon.", "let x = 5;"),
+        ] {
+            assert_eq!(go(say), want, "{name}");
+        }
+
+        // deliberately NOT recovered
+        assert_eq!(
+            go("foo paren a close paren"),
+            "foo paren a)",
+            "a dropped word must stay visibly wrong rather than be guessed at"
+        );
+        assert_eq!(
+            go("let let x equals five semicolon"),
+            "let let x = 5;",
+            "a duplicated word is the speaker's to fix"
+        );
+    }
+
     #[test]
     fn random_utterance_streams_never_corrupt_the_buffer() {
         // The engine does byte-index arithmetic throughout — insert_str,
@@ -602,6 +778,46 @@ mod tests {
         let o = say(&mut e, "change nine to two", 2000);
         assert!(!o.applied);
         assert_eq!(e.text(), "retries: 3,");
+    }
+
+    #[test]
+    fn a_correction_yields_a_training_pair() {
+        let mut e = eng("");
+        say(&mut e, "read to end", 0);
+        let o = say(&mut e, "no I meant read to string", 2000);
+        assert!(o.applied);
+        assert_eq!(
+            o.teach,
+            Some(("read to end".into(), "read to string".into())),
+            "the misheard text must be captured BEFORE the repair overwrites it"
+        );
+        assert_eq!(e.text(), "read to string");
+    }
+
+    #[test]
+    fn a_reshaping_repair_teaches_nothing() {
+        let mut e = eng("");
+        say(&mut e, "read to string", 0);
+        let o = say(&mut e, "make that snake case", 2000);
+        assert!(o.applied);
+        assert_eq!(o.teach, None, "whisper heard this correctly; only the shape was wrong");
+    }
+
+    #[test]
+    fn a_failed_repair_teaches_nothing() {
+        let mut e = eng("");
+        say(&mut e, "read to string", 0);
+        let o = say(&mut e, "change absent to x", 2000);
+        assert!(!o.applied);
+        assert_eq!(o.teach, None, "a correction that did not land is not evidence");
+    }
+
+    #[test]
+    fn ordinary_content_teaches_nothing() {
+        let mut e = eng("");
+        let o = say(&mut e, "let x equals five", 0);
+        assert!(o.applied);
+        assert_eq!(o.teach, None);
     }
 
     #[test]

@@ -26,24 +26,33 @@ use std::time::{Duration, Instant};
 
 use uikit_term::blocks::{BlockTracker, CommandLines};
 use voiceterm_egui::pty_host::PtyHost;
-use voiceterm_egui::term_grid::{TermGrid, Vt};
+use uikit_term::Terminal;
 
 /// Everything the app holds for one terminal.
 struct Rig {
     host: PtyHost,
-    grid: TermGrid,
-    vt: Vt,
+    /// uikit-term's Terminal, because that is what the app draws.
+    ///
+    /// This rig used to hold `term_grid::TermGrid` + `Vt`. Those are the
+    /// frontend's own parser, and the app stopped using them once
+    /// feed_pty was pointed at the DISPLAYED grid — so the only test
+    /// that drives a real shell through the pipeline was driving a
+    /// parser the app no longer runs. A test of dead code passes
+    /// forever and tells you nothing.
+    term: Terminal,
     blocks: BlockTracker,
     lines: CommandLines,
 }
 
 impl Rig {
     fn start() -> Option<Rig> {
-        let host = PtyHost::spawn(100, 30).ok()?;
+        // The waker is a no-op here: this rig polls `drain` itself and
+        // has no UI to repaint. Required rather than optional so a real
+        // host cannot forget it — see pty_host::Waker.
+        let host = PtyHost::spawn(100, 30, std::sync::Arc::new(|| {})).ok()?;
         Some(Rig {
             host,
-            grid: TermGrid::new(100, 30),
-            vt: Vt::new(),
+            term: Terminal::new(100, 30),
             blocks: BlockTracker::new(),
             lines: CommandLines::new(),
         })
@@ -74,7 +83,7 @@ impl Rig {
                 self.blocks.feed_line(clean);
             }
         }
-        self.vt.feed(&mut self.grid, &out);
+        self.term.feed(&text);
         n
     }
 
@@ -130,17 +139,14 @@ impl Rig {
     }
 
     fn row(&self, y: usize) -> String {
-        let mut s = String::new();
-        for x in 0..self.grid.cols {
-            if let Some(c) = self.grid.cell(x, y) {
-                s.push(c.ch);
-            }
-        }
-        s.trim_end().to_string()
+        // uikit-term exposes the row directly and already skips the
+        // phantom half of a wide glyph, which the hand-rolled cell loop
+        // this replaced did not.
+        self.term.grid.row_text(y).trim_end().to_string()
     }
 
     fn screen(&self) -> String {
-        (0..self.grid.rows).map(|y| self.row(y)).collect::<Vec<_>>().join("\n")
+        (0..self.term.grid.rows).map(|y| self.row(y)).collect::<Vec<_>>().join("\n")
     }
 }
 
@@ -207,7 +213,7 @@ fn a_tab_lands_on_its_column_stop() {
     rig.type_line("printf 'a\\tb\\n'\r");
     rig.settle(1500);
 
-    let hit = (0..rig.grid.rows).map(|y| rig.row(y))
+    let hit = (0..rig.term.grid.rows).map(|y| rig.row(y))
         .find(|r| r.starts_with('a') && r.contains('b') && !r.contains("printf"));
     let row = hit.expect(&format!("no output row:\n{}", rig.screen()));
     // Column 8, because a tab advances to the next multiple of eight.

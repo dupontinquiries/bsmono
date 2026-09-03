@@ -53,12 +53,48 @@ impl Track {
     /// it outran the level (which a fast car does in a few seconds). Interior
     /// `Gap` segments are still genuine voids — this only affects the two ends.
     pub fn height_at(&self, x: f32) -> Option<f32> {
+        // A NON-FINITE x IS NOT GROUND, AND MUST NOT PANIC.
+        //
+        // Two mechanisms met in three lines here, and the same two account
+        // for most of the equivalent class in games/blackstar-rs (see its
+        // docs/NON_FINITE_INPUTS.md):
+        //
+        //   1. `f32::clamp` does not launder a NaN — `NAN.clamp(0.0, len)`
+        //      is NaN — so the clamp below looked like a guard and was not.
+        //   2. `height_at_within_track` then hits
+        //      `binary_search_by(|s| s.partial_cmp(&x).unwrap())`, and NaN
+        //      compares to nothing, so the unwrap fires.
+        //
+        // `height_at` is called every tick by `sim::advance` with
+        // `vehicle.pos_x`, and per column by the terrain sampler and the
+        // lighting bake. One NaN reaching the vehicle's position took the
+        // whole game down.
+        //
+        // None is already this function's answer for "no ground here" — it
+        // is what a Gap returns — so an unusable x routes to an existing
+        // behaviour rather than a new one. The vehicle then treats it as a
+        // pit, which is the right reading of a position that is not a
+        // place.
+        if !x.is_finite() {
+            return None;
+        }
         let clamped = x.clamp(0.0, self.total_length);
         self.height_at_within_track(clamped)
     }
 
     fn height_at_within_track(&self, x: f32) -> Option<f32> {
-        let idx = match self.starts.binary_search_by(|s| s.partial_cmp(&x).unwrap()) {
+        // A track with no segments has no ground anywhere. Without this,
+        // `segments[idx]` indexes an empty vector and panics — reachable
+        // through the public `Track::new(name, vec![])`.
+        if self.segments.is_empty() {
+            return None;
+        }
+        // `unwrap_or` rather than `unwrap`: `height_at` already rejects a
+        // non-finite x, so this cannot fire today, but a total comparison
+        // costs nothing and keeps it that way if another caller appears.
+        let idx = match self.starts.binary_search_by(|s| {
+            s.partial_cmp(&x).unwrap_or(std::cmp::Ordering::Equal)
+        }) {
             Ok(i) => i,
             Err(0) => 0,
             Err(i) => i - 1,
@@ -88,6 +124,37 @@ impl Track {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_non_finite_position_is_not_ground_and_does_not_panic() {
+        // This PANICKED: NaN survives the clamp, then `partial_cmp`
+        // inside the binary search compares it to nothing and the unwrap
+        // fires. `height_at` runs every tick against `vehicle.pos_x`.
+        let t = sample_track();
+        for x in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(t.height_at(x), None, "height_at({x}) should be no ground");
+            assert_eq!(t.slope_at(x), 0.0, "slope_at({x}) should be flat");
+        }
+    }
+
+    #[test]
+    fn a_track_with_no_segments_has_no_ground() {
+        // `Track::new(name, vec![])` is public and its lookup indexed an
+        // empty vector.
+        let empty = Track::new("Empty", vec![]);
+        assert_eq!(empty.height_at(0.0), None);
+        assert_eq!(empty.height_at(50.0), None);
+        assert_eq!(empty.slope_at(0.0), 0.0);
+    }
+
+    #[test]
+    fn an_enormous_position_still_clamps_to_the_track() {
+        // Finite but far outside is a different case and keeps the old
+        // behaviour: the track clamps to its own ends.
+        let t = sample_track();
+        assert_eq!(t.height_at(-1e30), t.height_at(0.0));
+        assert_eq!(t.height_at(1e30), t.height_at(t.total_length));
+    }
     use super::*;
 
     fn sample_track() -> Track {

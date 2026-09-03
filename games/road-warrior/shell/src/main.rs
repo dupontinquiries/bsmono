@@ -11,9 +11,9 @@ mod render;
 mod save;
 
 use eframe::egui_wgpu;
-use road_warrior_core::{campaign, encounter, Boss, CarKind, Campaign, SaveState, Track, Vehicle};
+use road_warrior_core::{campaign, encounter, BakedLighting, Boss, CarKind, Campaign, SaveState, Sun, Track, Vehicle};
 use gyro::GyroTilt;
-use render::{SceneCallback, SceneResources, SceneUniforms};
+use render::{SceneCallback, SceneResources, SceneUniforms, TerrainUniforms};
 
 /// A short-lived on-screen message for events the player should actually see
 /// — "unlocked!", "new best time!", etc. These previously only went to
@@ -26,6 +26,20 @@ struct Toast {
 
 const TOAST_DURATION_SECS: f32 = 3.0;
 
+/// One physics step. 60Hz: the vehicle integrator is a simple Euler step and
+/// gets visibly springier on ramps at 30.
+const FIXED_DT: f32 = 1.0 / 60.0;
+/// Most steps to run in one frame before giving up on catching all the way
+/// up. Four means a frame as slow as 66ms still simulates in real time.
+const MAX_STEPS_PER_FRAME: u32 = 4;
+
+/// Samples in the baked lighting field, over the whole track.
+///
+/// 256 across an 88-unit level is a sample every ~0.34 units, finer than
+/// the 64 columns the viewport shows, so the shader's interpolation is
+/// never the limiting factor. The bake is a few milliseconds at level load.
+const LIGHT_SAMPLES: usize = 256;
+
 struct RoadWarriorApp {
     vehicle: Vehicle,
     track: Track,
@@ -34,6 +48,14 @@ struct RoadWarriorApp {
     save: SaveState,
     tilt: GyroTilt,
     throttle: f32,
+    /// Rays traced once when the level loaded. The camera is fixed and the
+    /// sun does not move, so per-column sun visibility and sky openness are
+    /// properties of the terrain alone — tracing them every frame would
+    /// recompute identical numbers sixty times a second.
+    light: BakedLighting,
+    /// Unspent real time, carried between frames so slow frames do not lose
+    /// it. See the accumulator in `update`.
+    accumulator: f32,
     start_time: std::time::Instant,
     last_frame: std::time::Instant,
     level_start_time: std::time::Instant,
@@ -127,12 +149,14 @@ impl RoadWarriorApp {
 
         Self {
             vehicle,
+            light: BakedLighting::bake(&track, Sun::default(), LIGHT_SAMPLES),
             track,
             boss,
             campaign,
             save,
             tilt,
             throttle: 0.0,
+            accumulator: 0.0,
             start_time: std::time::Instant::now(),
             last_frame: std::time::Instant::now(),
             level_start_time: std::time::Instant::now(),
@@ -145,6 +169,17 @@ impl RoadWarriorApp {
     /// for this genre, chosen since there was no direction on what death
     /// should do; the alternative (lose a life / restart the whole campaign)
     /// is a bigger design decision I didn't want to guess at silently.
+    fn respawn_out_of_fuel(&mut self) {
+        let kind = self.vehicle.kind;
+        self.vehicle = Vehicle::new(kind);
+        self.load_current_level();
+        self.level_start_time = std::time::Instant::now();
+        self.toasts.push(Toast {
+            message: "Out of fuel! Retrying level...".to_string(),
+            shown_at: std::time::Instant::now(),
+        });
+    }
+
     fn respawn(&mut self) {
         let kind = self.vehicle.kind;
         self.vehicle = Vehicle::new(kind);
@@ -164,6 +199,9 @@ impl RoadWarriorApp {
                     b.max_health = 10.0;
                 }
             }
+            // Trace the level's lighting once, here, where the track
+            // changes — not per frame.
+            self.light = BakedLighting::bake(&track, Sun::default(), LIGHT_SAMPLES);
             self.track = track;
             self.boss = boss;
             self.vehicle.pos_x = 0.0;
@@ -171,11 +209,96 @@ impl RoadWarriorApp {
     }
 }
 
+/// How many fixed steps this frame gets, and what time is carried over.
+///
+/// Pulled out of `update` because it is the piece that was wrong: the old
+/// code took `elapsed.min(FIXED_DT)` and dropped the remainder, so a device
+/// that could not hold 60fps ran the whole simulation slow. `update` needs
+/// an egui context and cannot be unit-tested; this can.
+fn steps_for(accumulator: &mut f32, elapsed: f32) -> u32 {
+    *accumulator = (*accumulator + elapsed.max(0.0)).min(FIXED_DT * MAX_STEPS_PER_FRAME as f32);
+    let steps = (*accumulator / FIXED_DT) as u32;
+    *accumulator -= steps as f32 * FIXED_DT;
+    steps
+}
+
+#[cfg(test)]
+mod timestep_tests {
+    use super::*;
+
+    #[test]
+    fn a_normal_frame_takes_exactly_one_step() {
+        let mut acc = 0.0;
+        assert_eq!(steps_for(&mut acc, FIXED_DT), 1);
+        assert!(acc < 1e-6, "and leaves nothing behind");
+    }
+
+    #[test]
+    fn a_slow_frame_catches_up_instead_of_running_slow() {
+        // THE BUG. A 100ms frame is three steps' worth of time. The old
+        // clamp ran one and threw the other two away, which is why 175
+        // seconds of wall clock integrated 13 seconds of physics.
+        let mut acc = 0.0;
+        assert_eq!(steps_for(&mut acc, 0.1), 4);
+    }
+
+    #[test]
+    fn no_time_is_lost_across_frames_that_do_not_divide_evenly() {
+        // Half-steps must accumulate, or a 90fps display loses a third of
+        // every frame forever.
+        let mut acc = 0.0;
+        let frame = FIXED_DT * 0.5;
+        let mut total = 0;
+        for _ in 0..100 {
+            total += steps_for(&mut acc, frame);
+        }
+        assert!((49..=51).contains(&total), "100 half-frames is ~50 steps, got {total}");
+    }
+
+    #[test]
+    fn a_stall_is_capped_rather_than_simulated_in_full() {
+        // The reason a cap exists at all: simulating a five-second stall as
+        // 300 steps takes longer than five seconds, and the backlog then
+        // grows every frame until the app is wedged. Past the cap we drop
+        // time on purpose.
+        let mut acc = 0.0;
+        assert_eq!(steps_for(&mut acc, 5.0), MAX_STEPS_PER_FRAME);
+        assert!(acc < FIXED_DT, "no backlog is carried out of a stall: {acc}");
+    }
+
+    #[test]
+    fn a_backwards_clock_does_not_underflow() {
+        let mut acc = 0.0;
+        assert_eq!(steps_for(&mut acc, -1.0), 0);
+        assert!(acc >= 0.0);
+    }
+}
+
 impl eframe::App for RoadWarriorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // FIXED-STEP ACCUMULATOR, not a clamped frame delta.
+        //
+        // This used to be `dt = elapsed.min(1/30)` with `last_frame = now`,
+        // which DISCARDS every millisecond past 33 — so on any device that
+        // cannot hold 30fps the simulation silently runs in slow motion
+        // while the clock keeps real time. Measured under software Vulkan:
+        // 175 seconds of wall clock had integrated about 13 seconds of
+        // physics, so a tank of fuel lasted three minutes and the car
+        // crawled. The clamp's intent (don't take one giant step after a
+        // stall) was right; throwing the time away was not.
+        //
+        // Now the leftover is carried in `self.accumulator` and spent as
+        // whole `FIXED_DT` steps. Slow frames take several steps instead of
+        // losing time.
         let now = std::time::Instant::now();
-        let dt = (now - self.last_frame).as_secs_f32().min(1.0 / 30.0); // clamp to avoid huge steps on stalls
+        let elapsed = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
+        // A cap on steps per frame, because the alternative to slow motion
+        // is a death spiral: if simulating N steps takes longer than N*dt,
+        // the backlog grows every frame and the app locks up. Past the cap
+        // we DO drop time, deliberately and visibly, rather than freeze.
+        let steps = steps_for(&mut self.accumulator, elapsed);
+        let dt = FIXED_DT;
 
         // Keyboard fallback for desktop testing; gyro drives `tilt` on-device.
         // Left/Right does double duty: throttle while grounded (where tilt
@@ -205,13 +328,26 @@ impl eframe::App for RoadWarriorApp {
 
         let tilt = (self.tilt.get() + keyboard_tilt).clamp(-1.0, 1.0);
 
-        if let Some(boss) = &mut self.boss {
-            let outcome = encounter::advance(&mut self.vehicle, &self.track, boss, dt, self.throttle, tilt, nitro_active, -9.8);
-            if outcome.boss_defeated_this_tick {
-                self.toasts.push(Toast { message: "Boss defeated!".to_string(), shown_at: std::time::Instant::now() });
+        // Every step in the frame's budget. `steps` is 1 at 60fps and more
+        // when a frame ran long; input is sampled once per frame and held
+        // across the sub-steps, which is what a player expects from a held
+        // key.
+        let mut boss_defeated_this_frame = false;
+        for _ in 0..steps {
+            if let Some(boss) = &mut self.boss {
+                let outcome = encounter::advance(&mut self.vehicle, &self.track, boss, dt, self.throttle, tilt, nitro_active, -9.8);
+                boss_defeated_this_frame |= outcome.boss_defeated_this_tick;
+            } else {
+                road_warrior_core::sim::advance(&mut self.vehicle, &self.track, dt, self.throttle, tilt, nitro_active, -9.8);
             }
-        } else {
-            road_warrior_core::sim::advance(&mut self.vehicle, &self.track, dt, self.throttle, tilt, nitro_active, -9.8);
+            // Stop sub-stepping the moment the car dies, so a death is not
+            // simulated three more steps past the point it happened.
+            if self.vehicle.health <= 0.0 {
+                break;
+            }
+        }
+        if boss_defeated_this_frame {
+            self.toasts.push(Toast { message: "Boss defeated!".to_string(), shown_at: std::time::Instant::now() });
         }
 
         // Checked before level-completion below: no point evaluating whether
@@ -220,6 +356,16 @@ impl eframe::App for RoadWarriorApp {
         // does NOT also count as completing it.
         if self.vehicle.health <= 0.0 {
             self.respawn();
+        } else if self.vehicle.is_stranded() {
+            // An empty tank used to be a SOFTLOCK: the car coasts to a stop,
+            // health is still positive so nothing respawns, the level cannot
+            // complete, and there is no refuel anywhere in the game. The
+            // player sits at a standstill until they quit.
+            //
+            // Retrying the level is the existing recovery path and it
+            // already restores fuel, so this is the same failure as a crash
+            // with an honest message.
+            self.respawn_out_of_fuel();
         }
 
         // Guard against re-triggering every frame forever: once the campaign
@@ -272,6 +418,7 @@ impl eframe::App for RoadWarriorApp {
             let boss_present = self.boss.as_ref().map_or(0.0, |b| if b.phase() != road_warrior_core::BossPhase::Defeated { 1.0 } else { 0.0 });
             let boss_telegraphing = self.boss.as_ref().map_or(0.0, |b| if b.is_telegraphing() { 1.0 } else { 0.0 });
 
+            let material = road_warrior_core::material::for_vehicle(&self.vehicle.stats);
             let uniforms = SceneUniforms {
                 car_x: self.vehicle.pos_x * 0.05, // scale world units into shader's [-1,1]-ish space
                 car_y: self.vehicle.pos_y,
@@ -282,13 +429,17 @@ impl eframe::App for RoadWarriorApp {
                 boss_present,
                 boss_telegraphing,
                 car_kind: car_kind_index(self.vehicle.kind),
-                _pad1: 0.0,
-                _pad2: 0.0,
+                reflectivity: material.reflectivity,
+                specular_power: material.specular_power,
             };
+
+            // Sampled per frame from the live track, so the ground the
+            // shader draws is the ground the physics is using.
+            let terrain = TerrainUniforms::sample(&self.track, &self.light, self.vehicle.pos_x);
 
             ui.painter().add(egui_wgpu::Callback::new_paint_callback(
                 rect,
-                SceneCallback { uniforms },
+                SceneCallback { uniforms, terrain },
             ));
 
             egui::Area::new("hud".into())

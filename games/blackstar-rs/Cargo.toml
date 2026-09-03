@@ -106,5 +106,9 @@ name = "trace_compact"
 path = "examples/trace_compact.rs"
 
 [[example]]
+name = "fold_audit"
+path = "examples/fold_audit.rs"
+
+[[example]]
 name = "check_treads"
 path = "examples/check_treads.rs"

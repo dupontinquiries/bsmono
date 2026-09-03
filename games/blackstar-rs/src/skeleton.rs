@@ -513,11 +513,22 @@ pub fn compact(sk: &Skeleton, prim_count: usize, factor: f32) -> Vec<Vec3> {
 /// because these skeletons are DERIVED from arbitrary meshes and nobody
 /// is there to author one.
 pub fn fold_rotation(limb: &Limb, up: Vec3, t: f32) -> Quat {
+    // NON-FINITE GEOMETRY IS A LIMB WITH NOTHING TO SWING, not a crash.
+    //
+    // These skeletons come from arbitrary third-party meshes, and a NaN
+    // vertex reaching here used to PANIC — `min_by` below compares
+    // `dir.dot(axis)` with `partial_cmp().unwrap()`, and NaN compares to
+    // nothing, so the unwrap fires. A corrupt model should cost one limb,
+    // not the process.
     let reach = limb.tip - limb.root;
     let len = reach.length();
-    if len < 1e-4 {
+    if !len.is_finite() || len < 1e-4 {
         return Quat::IDENTITY; // a limb with no extent has nothing to swing
     }
+    // A NaN `t` produced a NaN quaternion, which does not fold a limb
+    // wrong — it deletes it, because every point it transforms becomes
+    // NaN. Unfolded is the safe reading of "no usable amount".
+    let t = if t.is_finite() { t } else { 0.0 };
     let dir = reach / len;
     let up = up.normalize_or(Vec3::Y);
     // The axis is perpendicular to the limb AND TO WHERE IT IS GOING, not
@@ -537,7 +548,14 @@ pub fn fold_rotation(limb: &Limb, up: Vec3, t: f32) -> Quat {
         .iter()
         .copied()
         .filter(|c| c.dot(up).abs() < 0.9) // not the up axis: stow flat, not vertical
-        .min_by(|a, b| dir.dot(*a).abs().partial_cmp(&dir.dot(*b).abs()).unwrap())
+        // `unwrap` here was the panic path above; total ordering keeps it
+        // total even if a NaN ever reaches this point by another route.
+        .min_by(|a, b| {
+            dir.dot(*a)
+                .abs()
+                .partial_cmp(&dir.dot(*b).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .unwrap_or(Vec3::Z);
     let axis = {
         let c = dir.cross(along);
@@ -674,6 +692,36 @@ pub fn fold_pack(sk: &Skeleton, prims: &[&[Vec3]], slack: f32, up: Vec3) -> Vec<
         let span = hi - lo;
         let pokes = (hi - ehi).max(Vec3::ZERO) + (elo - lo).max(Vec3::ZERO);
         let needs_hinge = (0..3).any(|a| pokes[a] > 1e-4 && span[a] > 2.0 * env[a]);
+        // KEEP THE HINGE ONLY IF IT HELPS.
+        //
+        // `needs_hinge` fires when a limb pokes out and spans more than
+        // twice the envelope on that axis, which is the wing case the
+        // rotation exists for. But a limb oversized on EVERY axis cannot
+        // be helped by rotating: turning it only changes which axis pokes
+        // furthest. Measured on truck_lynx_dominante_av_445 — a limb
+        // spanning 2.00 x 1.61 x 1.33 inside a 0.72 x 0.72 x 0.33
+        // envelope, hinged, overhang 0.639 before and 0.702 after. The
+        // hinge made containment WORSE and nothing checked.
+        //
+        // Both candidates are now built and the better one wins, measured
+        // the same way the caller cares about: the furthest any point
+        // still pokes out of the envelope. A rotation that does not
+        // improve that is not worth the risk of decoupling a limb.
+        let overhang_of = |step: &FoldStep| -> f32 {
+            let mut worst = 0.0f32;
+            for i in &limb.prims {
+                for p in prims.get(*i).copied().unwrap_or(&[]) {
+                    let q = step.pivot + step.rot * (*p - step.pivot) + step.shift;
+                    let out = (elo - q).max(q - ehi).max(Vec3::ZERO);
+                    worst = worst.max(out.max_element());
+                }
+            }
+            worst
+        };
+        let flat_step = FoldStep {
+            shift: contain_shift(lo, hi, elo, ehi, sk.core_centre),
+            ..FoldStep::default()
+        };
         let step = if needs_hinge {
             let rot = fold_rotation(limb, up, 1.0);
             // bounds of the limb AFTER the hinge — the silhouette the
@@ -686,16 +734,18 @@ pub fn fold_pack(sk: &Skeleton, prims: &[&[Vec3]], slack: f32, up: Vec3) -> Vec<
                     rhi = rhi.max(q);
                 }
             }
-            FoldStep {
+            let hinged = FoldStep {
                 rot,
                 pivot: limb.root,
                 shift: contain_shift(rlo, rhi, elo, ehi, sk.core_centre),
+            };
+            if overhang_of(&hinged) <= overhang_of(&flat_step) {
+                hinged
+            } else {
+                flat_step
             }
         } else {
-            FoldStep {
-                shift: contain_shift(lo, hi, elo, ehi, sk.core_centre),
-                ..FoldStep::default()
-            }
+            flat_step
         };
         if step == FoldStep::default() {
             continue;
@@ -996,6 +1046,110 @@ mod role_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_hinge_is_kept_only_when_it_improves_containment() {
+        // A limb oversized on every axis cannot be helped by rotating:
+        // turning it only changes which axis pokes furthest. `needs_hinge`
+        // fires on span alone, so it used to hinge anyway and could leave
+        // the limb further outside than it started. Measured on
+        // truck_lynx_dominante_av_445: overhang 0.639 -> 0.702.
+        //
+        // The property that must hold for every limb and every chassis:
+        // fold_pack never makes the overhang worse than doing nothing.
+        let core: Vec<Vec3> = cube(Vec3::ZERO, Vec3::splat(0.5));
+        // A limb far larger than the envelope in all three axes.
+        let blob: Vec<Vec3> = cube(Vec3::new(1.4, 0.3, 0.2), Vec3::new(1.0, 0.8, 0.7));
+        let prims: Vec<&[Vec3]> = vec![&core, &blob];
+        let sk = skeletonize(&prims);
+        if sk.limbs.is_empty() {
+            return; // the classifier did not see a limb; nothing to assert
+        }
+        let slack = 0.25;
+        let steps = fold_pack(&sk, &prims, slack, Vec3::Y);
+        let env = sk.core_half * (1.0 + slack);
+        let (elo, ehi) = (sk.core_centre - env, sk.core_centre + env);
+        let overhang = |pts: &[Vec3], st: &FoldStep| -> f32 {
+            let mut w = 0.0f32;
+            for p in pts {
+                let q = st.pivot + st.rot * (*p - st.pivot) + st.shift;
+                let out = (elo - q).max(q - ehi).max(Vec3::ZERO);
+                w = w.max(out.max_element());
+            }
+            w
+        };
+        for limb in &sk.limbs {
+            for i in &limb.prims {
+                let pts = prims[*i];
+                let before = overhang(pts, &FoldStep::default());
+                let after = overhang(pts, &steps[*i]);
+                assert!(
+                    after <= before + 1e-4,
+                    "containment made it worse: {before:.3} -> {after:.3}"
+                );
+            }
+        }
+    }
+
+    /// Eight corners of a box, enough for the skeletonizer to see a shape.
+    fn cube(centre: Vec3, half: Vec3) -> Vec<Vec3> {
+        let mut v = Vec::with_capacity(8);
+        for sx in [-1.0f32, 1.0] {
+            for sy in [-1.0f32, 1.0] {
+                for sz in [-1.0f32, 1.0] {
+                    v.push(centre + Vec3::new(half.x * sx, half.y * sy, half.z * sz));
+                }
+            }
+        }
+        v
+    }
+
+    /// `fold_rotation` runs on skeletons derived from arbitrary
+    /// third-party meshes, so it meets geometry nobody authored.
+    #[test]
+    fn a_non_finite_limb_costs_one_limb_not_the_process() {
+        // This PANICKED: `min_by` compares `dir.dot(axis)` through
+        // `partial_cmp().unwrap()`, and NaN compares to nothing.
+        let bad = Limb {
+            prims: vec![0],
+            root: Vec3::ZERO,
+            tip: Vec3::splat(f32::NAN),
+            reach: f32::NAN,
+        };
+        let q = fold_rotation(&bad, Vec3::Y, 1.0);
+        assert_eq!(q, Quat::IDENTITY, "a limb with no usable extent stays put");
+    }
+
+    #[test]
+    fn a_non_finite_fold_amount_leaves_the_limb_unfolded() {
+        // A NaN quaternion does not fold a limb wrong, it deletes it:
+        // every point it transforms becomes NaN.
+        let l = Limb {
+            prims: vec![0],
+            root: Vec3::ZERO,
+            tip: Vec3::new(5.0, 0.0, 0.0),
+            reach: 5.0,
+        };
+        for t in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let q = fold_rotation(&l, Vec3::Y, t);
+            assert!(q.is_finite(), "NaN quaternion from t={t}");
+        }
+        assert_eq!(fold_rotation(&l, Vec3::Y, f32::NAN), Quat::IDENTITY);
+    }
+
+    #[test]
+    fn a_non_finite_point_does_not_spread_through_fold_point() {
+        // fold_point is the caller-side half; a bad limb must not turn a
+        // good point into NaN.
+        let bad = Limb {
+            prims: vec![0],
+            root: Vec3::ZERO,
+            tip: Vec3::splat(f32::NAN),
+            reach: f32::NAN,
+        };
+        let p = fold_point(Vec3::new(1.0, 2.0, 3.0), &bad, Vec3::Y, 1.0);
+        assert!(p.is_finite(), "a bad limb leaked NaN into a good point: {p:?}");
+    }
     use super::*;
 
     fn blob(c: Vec3, r: Vec3, n: usize) -> Vec<Vec3> {
@@ -1345,3 +1499,4 @@ mod tests {
         assert!(sk.limbs.len() < 6, "every link stayed its own limb: {}", sk.report());
     }
 }
+

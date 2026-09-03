@@ -22,6 +22,10 @@ tree-sitter = ["dep:tree-sitter", "dep:tree-sitter-rust", "dep:streaming-iterato
 
 [dependencies]
 ropey = "1.6"
+# Tabs of split panes, lifted out of voiceterm. Dependency-free; the
+# tree is generic over what a pane holds, which here is a DocId plus
+# per-pane view state (see src/panes.rs).
+pane-kit = { path = "../../../../shared/pane-kit" }
 tree-sitter = { version = "0.25", optional = true }
 tree-sitter-rust = { version = "0.24", optional = true }
 # tree-sitter 0.25 returns query captures as a StreamingIterator, not Iterator.

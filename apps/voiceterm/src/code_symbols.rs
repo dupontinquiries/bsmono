@@ -232,6 +232,12 @@ impl SymbolTable {
     /// ~600 chars is a safe stand-in for 224 tokens of English; be
     /// conservative, because whisper silently truncates from the FRONT
     /// and you would lose your most frequent symbols.
+    ///
+    /// Imperfection worth knowing: identifiers containing digits render
+    /// their digits as digits, so `u64` becomes "u 64" while whisper
+    /// would actually emit "u sixty four". Harmless — the prompt is a
+    /// bias, not a constraint — and fixing it needs a digits-to-words
+    /// table that does not otherwise earn its place.
     pub fn prompt(&self, budget: usize) -> String {
         let mut entries: Vec<(&str, usize)> = self
             .by_spoken

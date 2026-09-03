@@ -45,6 +45,9 @@
 
 pub mod buffer;
 pub mod editor;
+/// Tabs of split panes, over `shared/pane-kit`. Holds which pane looks
+/// at which document; the documents themselves stay with the shell.
+pub mod panes;
 /// Modal motions and operators, active while typewriter mode is on.
 pub mod helix;
 /// Multi-cursor: `Selection` becomes `Vec<Selection>` and edits fan out.

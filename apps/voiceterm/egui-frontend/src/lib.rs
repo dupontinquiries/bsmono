@@ -12,7 +12,6 @@
 //! enough to run a shell, `ls --color`, vim's basic drawing, etc. Rarer sequences are ignored
 //! rather than mis-rendered.
 
-pub mod term_grid;
 pub mod iio_light;
 pub mod editor_keys;
 pub mod date_phrase;
@@ -65,7 +64,6 @@ pub mod pty_input;
 /// The other half of the terminal: a real shell on a real pty.
 pub mod pty_host;
 pub mod table_view;
-pub mod row_render;
 pub mod docingest;
 pub mod detect;
 pub mod explore;
@@ -251,17 +249,6 @@ pub mod gesture_menus;
 #[path = "../../src/terminal_workspace.rs"]
 pub mod terminal_workspace;
 
-/// The table engine, on the same terms. `table_ops` holds TableOp and the apply
-/// pipeline, `table_nlp` turns natural language into ops and meta-commands.
-/// Both are plain Rust with no Qt in them, and `table_view` is the surface over
-/// them — the view was what was missing, not the engine. Included rather than
-/// re-implemented so the two frontends parse the same vocabulary; a second
-/// parser would accept a slightly different English within a week.
-/// The dirty-row tracker, on the same terms — pure, dependency-free, and fed by
-/// the grid. `row_render` is the egui-side use of it; see that module for why
-/// what it saves here is text LAYOUT rather than serialisation.
-#[path = "../../src/row_cache.rs"]
-pub mod row_cache;
 
 /// The include chain terminates here: entity_extract needs clog!, log needs
 /// util, and util is std-only with no crate:: references at all. Worth naming

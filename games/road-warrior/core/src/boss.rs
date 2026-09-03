@@ -46,6 +46,28 @@ pub struct Boss {
 
 impl Boss {
     pub fn new(name: impl Into<String>, max_health: f32, phase_2_threshold: f32, attacks: Vec<Attack>) -> Self {
+        // AN UNFIGHTABLE BOSS MUST NOT BE AN UNBEATABLE ONE.
+        //
+        // These numbers come from level JSON, which is hand-edited today
+        // and generated tomorrow (see BACKLOG.md). A non-finite
+        // `max_health` made the boss INVINCIBLE and silent about it:
+        // `phase()` decides Defeated with `health <= 0.0`, and `NaN <= 0.0`
+        // is false, so the boss never dies — and `is_level_complete`
+        // requires the boss dead, so the campaign stops there permanently.
+        //
+        // Zero is the answer, because a boss with no health is already
+        // Defeated and that is an existing, handled state: the level
+        // completes without a fight. A level whose boss data is broken
+        // should be finishable, not a wall.
+        let max_health = if max_health.is_finite() && max_health > 0.0 { max_health } else { 0.0 };
+        // A non-finite threshold never compares true, so the boss never
+        // enrages. Zero keeps it in its opening phase for the whole fight,
+        // which is the same outcome stated deliberately.
+        let phase_2_threshold = if phase_2_threshold.is_finite() {
+            phase_2_threshold.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         Self {
             name: name.into(),
             max_health,
@@ -140,6 +162,37 @@ pub fn attack_hits_vehicle(attack: AttackKind, boss_x: f32, vehicle: &Vehicle) -
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_boss_with_broken_health_data_is_beatable_not_invincible() {
+        // `phase()` decides Defeated with `health <= 0.0`, and NaN fails
+        // that test, so a NaN max_health produced a boss that could never
+        // die — and `is_level_complete` requires a dead boss, so the
+        // campaign would stop at that level forever.
+        for max in [f32::NAN, f32::INFINITY, 0.0, -100.0] {
+            let b = Boss::new("Broken", max, 0.4, vec![]);
+            assert!(b.health.is_finite(), "max={max} gave health {}", b.health);
+            assert_eq!(b.phase(), BossPhase::Defeated, "max={max} left a boss that cannot be killed");
+        }
+    }
+
+    #[test]
+    fn a_broken_phase_threshold_does_not_wedge_the_phase() {
+        let mut b = Boss::new("B", 100.0, f32::NAN, vec![]);
+        assert_eq!(b.phase(), BossPhase::Opening);
+        b.apply_damage(99.9);
+        // With a sanitised threshold the phase is well-defined at every
+        // health; before, every comparison against NaN was false.
+        assert!(matches!(b.phase(), BossPhase::Opening | BossPhase::Enraged));
+    }
+
+    #[test]
+    fn a_healthy_boss_is_unaffected_by_the_guards() {
+        let b = Boss::new("Real", 1000.0, 0.4, vec![]);
+        assert_eq!(b.max_health, 1000.0);
+        assert_eq!(b.health, 1000.0);
+        assert_eq!(b.phase(), BossPhase::Opening);
+    }
     use super::*;
     use crate::vehicle::CarKind;
 

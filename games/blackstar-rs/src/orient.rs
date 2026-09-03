@@ -188,7 +188,38 @@ pub fn guess(verts: &[Vertex]) -> Guess {
 
 /// The rotation `model.rs`'s own loader expects: this frame onto
 /// (Y up, -Z forward) — same construction as `find_orientation`.
+///
+/// ## The inputs are not assumed to be orthonormal
+///
+/// They used to be, and `guess` is not obliged to supply that. Measured
+/// on the old version:
+///
+/// * a non-unit `up` gave a quaternion of length 1.22, which SCALES the
+///   model rather than rotating it — `up * 3.0` came back as a 1.5x
+///   enlargement;
+/// * `up` and `forward` 22 degrees off perpendicular produced a rotation
+///   that did not actually take `up` to Y, landing it at
+///   (0, 0.97, 0.19) — a skew, not a frame change;
+/// * `forward == up`, or a zero `up`, produced `Quat(NaN, NaN, NaN, NaN)`,
+///   because `forward.cross(up)` is the zero vector and normalising it
+///   divides by zero. A NaN transform does not render wrong, it renders
+///   nothing.
+///
+/// So the frame is built rather than trusted: `up` is normalised, the
+/// component of `forward` along `up` is removed (Gram-Schmidt), and a
+/// `forward` parallel to `up` — which carries no directional information
+/// at all — falls back to an arbitrary perpendicular from
+/// [`perp_pair`], the same helper the axis search already uses. An
+/// arbitrary forward is a guess; a NaN is a missing model.
 pub fn rotation_for(up: Vec3, forward: Vec3) -> Quat {
+    let up = up.normalize_or_zero();
+    let up = if up.length_squared() < 0.5 { Vec3::Y } else { up };
+    let flat = forward - up * forward.dot(up);
+    let forward = if flat.length_squared() < 1e-8 {
+        perp_pair(up).0
+    } else {
+        flat.normalize()
+    };
     let right = forward.cross(up).normalize();
     let m = glam::Mat3::from_cols(right, up, -forward).transpose();
     Quat::from_mat3(&m)
@@ -275,6 +306,67 @@ pub fn write_orient_json(dir: &std::path::Path, up: Vec3, forward: Vec3, source:
 
 #[cfg(test)]
 mod tests {
+
+    /// `rotation_for` is handed axes GUESSED from a mesh, and a guess is
+    /// not obliged to be orthonormal. Each of these produced a wrong or
+    /// NaN transform before the frame was built rather than trusted.
+    #[test]
+    fn a_canonical_frame_is_the_identity() {
+        let q = rotation_for(Vec3::Y, Vec3::NEG_Z);
+        assert!((q * Vec3::Y - Vec3::Y).length() < 1e-5);
+        assert!((q.length() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_non_unit_up_rotates_without_scaling() {
+        // Was a quaternion of length 1.22, which enlarged the model 1.5x.
+        let q = rotation_for(Vec3::Y * 3.0, Vec3::NEG_Z);
+        assert!((q.length() - 1.0).abs() < 1e-5, "not a unit quaternion: {}", q.length());
+        assert!((q * Vec3::Y - Vec3::Y).length() < 1e-5);
+    }
+
+    #[test]
+    fn a_skewed_frame_still_puts_up_on_y() {
+        // Was landing up at (0, 0.97, 0.19) — a skew rather than a frame
+        // change. Whatever forward we settle on, up must go to Y.
+        let up = Vec3::new(0.0, 1.0, 0.4).normalize();
+        let q = rotation_for(up, Vec3::NEG_Z);
+        let mapped = q * up;
+        assert!((mapped - Vec3::Y).length() < 1e-4, "up landed at {mapped:?}");
+    }
+
+    #[test]
+    fn a_forward_parallel_to_up_gives_a_rotation_not_a_nan() {
+        // A NaN transform does not render wrong, it renders nothing.
+        for fwd in [Vec3::Y, Vec3::NEG_Y] {
+            let q = rotation_for(Vec3::Y, fwd);
+            assert!(q.is_finite(), "NaN quaternion from forward={fwd:?}");
+            assert!((q.length() - 1.0).abs() < 1e-5);
+            assert!((q * Vec3::Y - Vec3::Y).length() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn a_zero_up_falls_back_rather_than_dividing_by_zero() {
+        let q = rotation_for(Vec3::ZERO, Vec3::NEG_Z);
+        assert!(q.is_finite());
+        assert!((q.length() - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn every_axis_pair_produces_a_finite_unit_rotation() {
+        // The guess can return any axis for either role; none of the
+        // combinations may produce a transform that loses the model.
+        let axes = [Vec3::X, Vec3::NEG_X, Vec3::Y, Vec3::NEG_Y, Vec3::Z, Vec3::NEG_Z];
+        for up in axes {
+            for fwd in axes {
+                let q = rotation_for(up, fwd);
+                assert!(q.is_finite(), "NaN from up={up:?} forward={fwd:?}");
+                assert!((q.length() - 1.0).abs() < 1e-4, "non-unit from up={up:?} forward={fwd:?}");
+                assert!((q * up - Vec3::Y).length() < 1e-4, "up={up:?} forward={fwd:?} did not land on Y");
+            }
+        }
+    }
     use super::*;
 
     fn box_verts(hx: f32, hy: f32, hz: f32, n_per_axis: usize) -> Vec<Vertex> {
@@ -341,3 +433,4 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+

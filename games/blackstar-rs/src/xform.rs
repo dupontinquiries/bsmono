@@ -222,7 +222,54 @@ impl Xform {
 /// one source mesh through one colour merge, so the shapes match prim for
 /// prim and vertex for vertex — `check()` refuses to build a morph that does
 /// not, because a mismatched strip would blend garbage rather than fail.
+/// Remap a global fold parameter so each strip segment gets its own share
+/// of the timeline.
+///
+/// `Morph::sample` maps `t` linearly onto the strip, so with five poses
+/// every one of the four segments takes a quarter of the transform
+/// whatever it contains. A staged transform does not want that: the
+/// stage where the innards fuse should be slow and legible, and getting
+/// the skeleton into position should be quick. See
+/// `docs/STAGED_TRANSFORM.md`.
+///
+/// `weights` is one duration per SEGMENT (one fewer than the pose count).
+/// Only the ratios matter. Returns a position along the strip in `[0, 1]`
+/// which `sample` then scales by `n - 1` as before, so uniform weights
+/// reproduce the old behaviour exactly.
+///
+/// Degenerate input falls back to uniform rather than distorting the
+/// fold: no weights, a single weight, anything non-finite, anything
+/// negative, or a total of zero. A transform that runs evenly is a tuning
+/// mistake someone will notice; one that jumps or stalls looks like a
+/// crash. (See docs/NON_FINITE_INPUTS.md for why this is spelled out.)
+pub fn stage_time(t: f32, weights: Option<&[f32]>) -> f32 {
+    let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 };
+    let Some(w) = weights else { return t };
+    if w.len() < 2 || w.iter().any(|v| !v.is_finite() || *v < 0.0) {
+        return t;
+    }
+    let total: f32 = w.iter().sum();
+    if total <= 1e-6 {
+        return t;
+    }
+    // Walk the segments, spending `t` against each one's share.
+    let n = w.len() as f32;
+    let mut acc = 0.0f32;
+    for (i, seg) in w.iter().enumerate() {
+        let share = seg / total;
+        if t <= acc + share || i == w.len() - 1 {
+            // A zero-width segment is stepped over rather than divided by.
+            let f = if share > 1e-9 { ((t - acc) / share).clamp(0.0, 1.0) } else { 1.0 };
+            return ((i as f32 + f) / n).clamp(0.0, 1.0);
+        }
+        acc += share;
+    }
+    t
+}
+
 pub struct Morph {
+    /// Per-segment durations; `None` is uniform. See `stage_time`.
+    pub stage_weights: Option<Vec<f32>>,
     poses: Vec<Vec<Vec<Vertex>>>,
     idx: Vec<Vec<u32>>,
     /// scratch, reused every frame so a 60 Hz morph does not allocate
@@ -264,7 +311,7 @@ impl Morph {
                 sum / prim.len() as f32
             })
             .collect();
-        Some(Morph { poses, idx, scratch: Vec::new(), compaction: None, centres })
+        Some(Morph { stage_weights: None, poses, idx, scratch: Vec::new(), compaction: None, centres })
     }
 
     pub fn prims(&self) -> usize {
@@ -277,6 +324,7 @@ impl Morph {
     /// side. Normals are blended too and renormalised — skipping that is
     /// what makes a cheap morph look like shrink-wrap partway through.
     pub fn sample(&mut self, p: usize, t: f32) -> MeshData {
+        let t = stage_time(t, self.stage_weights.as_deref());
         let n = self.poses.len();
         let x = (t.clamp(0.0, 1.0) * (n - 1) as f32).min((n - 1) as f32 - 1e-5);
         let k = x.floor() as usize;
@@ -390,6 +438,22 @@ impl Morph {
 /// a rendered frame — tune `min_overflow` and whether this should
 /// blend with `t` toward the edges once someone can actually look at it.
 pub fn redistribute_length_to_height(actual: Vec3, veh_len: f32, bot_len: f32, t: f32) -> Vec3 {
+    // NON-FINITE IN, UNCHANGED OUT.
+    //
+    // Every argument here reaches a multiply that feeds the vehicle's
+    // dimensions. Measured before this guard: a NaN `t` returned
+    // (1.0, NaN, NaN), a NaN `veh_len` the same, and a NaN in `actual`
+    // spread to the components beside it. A box with NaN extents is not a
+    // mis-sized vehicle, it is one that fails every comparison it is later
+    // used in — including the bounds checks meant to catch it.
+    //
+    // `actual` unchanged is this function's own answer for "nothing to
+    // redistribute", so it is the honest result for "nothing usable to
+    // redistribute with" too. Note `f32::clamp` does not launder a NaN:
+    // `NAN.clamp(0.0, 1.0)` is NaN, which is how `t` got through.
+    if !actual.is_finite() || !veh_len.is_finite() || !bot_len.is_finite() || !t.is_finite() {
+        return actual;
+    }
     let expected_len = veh_len + (bot_len - veh_len) * t.clamp(0.0, 1.0);
     if actual.z <= expected_len || actual.x <= 0.0 || actual.y <= 0.0 {
         return actual; // nothing to redistribute, or a degenerate box
@@ -405,6 +469,126 @@ pub fn redistribute_length_to_height(actual: Vec3, veh_len: f32, bot_len: f32, t
 
 #[cfg(test)]
 mod endpoint_tests {
+
+    /// Per-segment durations. `Morph::sample` maps `t` linearly onto the
+    /// strip, so every segment takes an equal share whatever it contains;
+    /// a staged transform wants the fusion stage slow and the posing
+    /// stages quick. See docs/STAGED_TRANSFORM.md.
+    #[test]
+    fn uniform_weights_reproduce_the_old_mapping() {
+        // The whole point of the fallback: an existing chassis with no
+        // weights must fold exactly as it did.
+        for t in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            assert!((stage_time(t, None) - t).abs() < 1e-6);
+            assert!((stage_time(t, Some(&[1.0, 1.0, 1.0, 1.0])) - t).abs() < 1e-5, "t={t}");
+        }
+    }
+
+    #[test]
+    fn a_heavier_segment_takes_more_of_the_timeline() {
+        // Two segments, the second three times as long. At the halfway
+        // point of the transform we should still be inside the FIRST
+        // segment's share only if that share exceeds half — here it is a
+        // quarter, so t=0.5 is well into segment two.
+        let w = [1.0f32, 3.0];
+        // segment one owns t in [0, 0.25] and maps onto strip [0, 0.5]
+        assert!((stage_time(0.25, Some(&w)) - 0.5).abs() < 1e-5);
+        // half the transform is a third of the way through segment two
+        let mid = stage_time(0.5, Some(&w));
+        assert!(mid > 0.5 && mid < 0.75, "got {mid}");
+    }
+
+    #[test]
+    fn the_endpoints_are_still_the_endpoints() {
+        for w in [vec![1.0f32, 3.0], vec![5.0, 1.0, 2.0], vec![0.1, 0.1, 9.0]] {
+            assert!((stage_time(0.0, Some(&w)) - 0.0).abs() < 1e-6, "{w:?}");
+            assert!((stage_time(1.0, Some(&w)) - 1.0).abs() < 1e-6, "{w:?}");
+        }
+    }
+
+    #[test]
+    fn the_mapping_is_monotonic() {
+        // A fold that goes backwards mid-transform reads as a glitch.
+        let w = [2.0f32, 1.0, 4.0, 1.0];
+        let mut prev = -1.0;
+        for i in 0..=200 {
+            let v = stage_time(i as f32 / 200.0, Some(&w));
+            assert!(v >= prev - 1e-6, "went backwards at {i}: {prev} -> {v}");
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn degenerate_weights_fall_back_to_uniform() {
+        // A transform that runs evenly is a tuning mistake someone
+        // notices; one that jumps or stalls looks like a crash.
+        for bad in [
+            vec![],
+            vec![1.0f32],
+            vec![0.0, 0.0],
+            vec![1.0, f32::NAN],
+            vec![1.0, -2.0],
+            vec![f32::INFINITY, 1.0],
+        ] {
+            for t in [0.0f32, 0.3, 0.7, 1.0] {
+                let v = stage_time(t, Some(&bad));
+                assert!(v.is_finite(), "{bad:?} at {t} gave {v}");
+                assert!((v - t).abs() < 1e-5, "{bad:?} at {t} gave {v}, expected uniform");
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_width_segment_is_stepped_over_not_divided_by() {
+        let w = [1.0f32, 0.0, 1.0];
+        let mut prev = -1.0;
+        for i in 0..=100 {
+            let v = stage_time(i as f32 / 100.0, Some(&w));
+            assert!(v.is_finite() && v >= prev - 1e-6);
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn a_non_finite_fold_parameter_does_not_escape() {
+        for t in [f32::NAN, f32::INFINITY, -5.0, 9.0] {
+            let v = stage_time(t, Some(&[1.0, 2.0]));
+            assert!((0.0..=1.0).contains(&v), "t={t} gave {v}");
+        }
+    }
+
+    #[test]
+    fn non_finite_inputs_leave_the_box_alone() {
+        // A box with NaN extents is not a mis-sized vehicle — it fails
+        // every comparison it is later used in, including the bounds
+        // checks meant to catch it.
+        let good = Vec3::new(1.0, 1.0, 4.0);
+        assert_eq!(redistribute_length_to_height(good, 2.0, 3.0, f32::NAN), good);
+        assert_eq!(redistribute_length_to_height(good, f32::NAN, 3.0, 0.5), good);
+        assert_eq!(redistribute_length_to_height(good, 2.0, f32::INFINITY, 0.5), good);
+        // A NaN that ARRIVED in `actual` comes back out — this function
+        // does not invent geometry — but it must not spread to the
+        // components beside it, which is what happened before.
+        // Compared per-component because NaN != NaN makes assert_eq on the
+        // whole vector fail even when every element matches.
+        let bad = Vec3::new(f32::NAN, 1.0, 4.0);
+        let out = redistribute_length_to_height(bad, 2.0, 3.0, 0.5);
+        assert!(out.x.is_nan());
+        assert_eq!(out.y, 1.0, "the NaN spread into y");
+        assert_eq!(out.z, 4.0, "the NaN spread into z");
+    }
+
+    #[test]
+    fn a_normal_redistribution_still_conserves_volume() {
+        // The guard must not change the working path: length above the
+        // expected value is traded for height at constant volume.
+        let a = Vec3::new(1.0, 1.0, 4.0);
+        let r = redistribute_length_to_height(a, 2.0, 3.0, 1.0);
+        assert_eq!(r.z, 3.0, "length capped to expected");
+        let before = a.x * a.y * a.z;
+        let after = r.x * r.y * r.z;
+        assert!((before - after).abs() < 1e-4, "volume changed: {before} -> {after}");
+    }
     use super::*;
 
     /// Step a fold the way the shell does, recording the `t` values a caller
@@ -760,5 +944,239 @@ mod tests {
         x.update(BLEND_SEC * 0.3);
         assert!(x.request(1.0)); // reverse
         assert!(!x.folding_to_robot(), "direction did not flip on reversal");
+    }
+}
+
+
+#[cfg(test)]
+mod staged_pipeline {
+    //! A seven-pose chassis, generated rather than modelled, run through
+    //! the real pipeline — `align::unify` then `Morph` — to find what the
+    //! strip can and cannot express. Item 2 of
+    //! `docs/STAGED_TRANSFORM.md`'s suggested order.
+    //!
+    //! The six stages are authored as six segments across seven poses:
+    //!
+    //!   f00 bot form
+    //!   f01 skeleton in position
+    //!   f02 hoist state
+    //!   f03 limbs detached, folded, rotated
+    //!   f04 innards fused small          <- the volume stage
+    //!   f05 vehicle components pulled in, helpers gone
+    //!   f06 shell assembled
+    //!
+    //! Three things the design needs and the assets do not currently
+    //! exercise: a part that DEPARTS (a helper), a part that ARRIVES (a
+    //! shell panel), and a part that SHRINKS without leaving (the fusion).
+
+    use super::*;
+    use crate::meshgen::Vertex;
+    use crate::model::{RawPrim, Tag};
+
+    fn cube(centre: Vec3, half: f32) -> RawPrim {
+        let mut verts = Vec::new();
+        for i in 0..8 {
+            let s = Vec3::new(
+                if i & 1 == 0 { -1.0 } else { 1.0 },
+                if i & 2 == 0 { -1.0 } else { 1.0 },
+                if i & 4 == 0 { -1.0 } else { 1.0 },
+            );
+            let p = centre + s * half;
+            verts.push(Vertex { pos: p.to_array(), nrm: [0.0, 1.0, 0.0], uv: [0.0, 0.0] });
+        }
+        // Indices are not exercised by the blend, but unify and Morph
+        // both carry them, so give it a real (if crude) triangle list.
+        let idx: Vec<u32> = (0..8u32).flat_map(|i| [i, (i + 1) % 8, (i + 2) % 8]).collect();
+        RawPrim { verts, idx, color: [1.0; 4], tex_uri: None, tag: Tag::Body, pivot: None }
+    }
+
+    fn extent(m: &MeshData) -> f32 {
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for v in &m.verts {
+            let p = Vec3::from_array(v.pos);
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
+        (hi - lo).max_element()
+    }
+
+    /// body, an arm that folds in, a helper that departs, a shell panel
+    /// that arrives. Indices are stable where a part is present.
+    fn strip() -> Vec<Vec<RawPrim>> {
+        let body = |h: f32| cube(Vec3::ZERO, h);
+        let arm = |x: f32| cube(Vec3::new(x, 0.0, 0.0), 0.4);
+        let helper = || cube(Vec3::new(0.0, 2.0, 0.0), 0.2);
+        let panel = |h: f32| cube(Vec3::new(0.0, 0.0, 1.2), h);
+        vec![
+            // f00 bot: body + arm out + helper, no shell
+            vec![body(1.0), arm(2.5), helper()],
+            // f01 skeleton positioned
+            vec![body(1.0), arm(2.2), helper()],
+            // f02 hoist
+            vec![body(1.0), arm(1.8), helper()],
+            // f03 arm folded in
+            vec![body(1.0), arm(1.0), helper()],
+            // f04 THE FUSION: body shrinks, arm shrinks with it
+            vec![body(0.45), arm(0.5), helper()],
+            // f05 helper gone, shell panel arrives small
+            vec![body(0.45), arm(0.5), panel(0.2)],
+            // f06 shell assembled
+            vec![body(0.45), arm(0.5), panel(1.0)],
+        ]
+    }
+
+    #[test]
+    fn a_seven_pose_strip_unifies_and_morphs() {
+        // The loader takes any pose count >= 2 (main.rs:1922), so six
+        // stages need no code change. This pins that end to end.
+        let u = crate::align::unify(strip()).expect("seven poses should unify");
+        assert_eq!(u.poses.len(), 7, "one entry per pose");
+        let m = Morph::build(u.poses.clone(), u.idx.clone());
+        assert!(m.is_some(), "Morph should accept a seven-pose strip");
+    }
+
+    #[test]
+    fn a_departing_helper_shrinks_away_instead_of_popping() {
+        // `align::unify` collapses an absent part to its centroid, so the
+        // lerp scales it out. That is stage 6.3, "pop away helpers",
+        // already implemented — this asserts it rather than assuming it.
+        let u = crate::align::unify(strip()).unwrap();
+        let mut m = Morph::build(u.poses.clone(), u.idx.clone()).unwrap();
+        let helper = 2; // third prim in the pose-0 order
+        let before = extent(&m.sample(helper, 4.0 / 6.0));
+        let after = extent(&m.sample(helper, 5.0 / 6.0));
+        assert!(after < before * 0.5, "helper did not shrink away: {before} -> {after}");
+    }
+
+    #[test]
+    fn the_fusion_stage_actually_reduces_volume() {
+        // Stage 5 is where the order of magnitude has to come from (see
+        // STOWING.md). The strip CAN express it: the body is authored
+        // smaller in f04, and the blend carries it there.
+        let u = crate::align::unify(strip()).unwrap();
+        let mut m = Morph::build(u.poses.clone(), u.idx.clone()).unwrap();
+        let body = 0;
+        let before = extent(&m.sample(body, 3.0 / 6.0));
+        let after = extent(&m.sample(body, 4.0 / 6.0));
+        assert!(after < before * 0.6, "fusion did not shrink the body: {before} -> {after}");
+    }
+
+    #[test]
+    fn stage_weights_can_make_the_fusion_stage_slow() {
+        // The point of per-segment durations: give stage 5 more of the
+        // timeline without re-authoring the poses. Six segments, the
+        // fifth (index 4) weighted heavily.
+        let w = [1.0f32, 1.0, 1.0, 1.0, 6.0, 1.0];
+        // Half the transform should still be inside the fusion segment,
+        // which spans strip positions 4/6..5/6.
+        let mid = stage_time(0.5, Some(&w));
+        assert!(
+            (4.0 / 6.0..=5.0 / 6.0).contains(&mid),
+            "t=0.5 should sit inside the weighted stage, got {mid}"
+        );
+        // and uniform weights would have been well past it
+        assert!(stage_time(0.5, None) < 4.0 / 6.0);
+    }
+
+    /// ROTATION TRAVELS A CHORD, measured on a fixture rather than
+    /// inferred from shipped assets.
+    ///
+    /// A part that swings 90 degrees about the body between two poses is
+    /// authored at two positions on a circle. The blend is per-vertex
+    /// linear, so it takes the straight line between them — cutting
+    /// across the inside of the arc, through wherever the body is.
+    ///
+    /// This is stage 4.3 ("rotate pieces") and it is why `fold_audit`
+    /// finds parts leaving the body worst at t=0.50: the midpoint is
+    /// where a chord deviates most from its arc.
+    #[test]
+    fn a_rotating_part_cuts_the_corner_by_a_predictable_amount() {
+        const R: f32 = 2.0;
+        // Same part, swung 90 degrees about Y: +X to +Z, radius R.
+        let a = cube(Vec3::new(R, 0.0, 0.0), 0.3);
+        let b = cube(Vec3::new(0.0, 0.0, R), 0.3);
+        // Built straight from poses rather than through `align::unify`,
+        // which declines a strip this small — the chord is a property of
+        // `Morph`'s blend, so the matcher is not part of the question.
+        let mut m = Morph::build(
+            vec![vec![a.verts.clone()], vec![b.verts.clone()]],
+            vec![a.idx.clone()],
+        )
+        .expect("two poses build");
+
+        let centre_at = |m: &mut Morph, t: f32| -> Vec3 {
+            let s = m.sample(0, t);
+            let sum = s.verts.iter().fold(Vec3::ZERO, |acc, v| acc + Vec3::from_array(v.pos));
+            sum / s.verts.len() as f32
+        };
+
+        let ends = centre_at(&mut m, 0.0).length();
+        let mid = centre_at(&mut m, 0.5).length();
+        // The chord midpoint of a quarter circle sits at cos(45) of the
+        // radius: 0.707. Anything following the arc would stay at 1.0.
+        assert!((ends - R).abs() < 1e-3, "endpoint radius {ends}");
+        assert!(
+            (mid / ends - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.02,
+            "expected the chord's 0.707 of radius, got {:.3}",
+            mid / ends
+        );
+        // Stated as the thing that matters: the part passes ~29% of its
+        // radius closer to the body than it should, which on a real
+        // chassis is the difference between swinging past the hull and
+        // through it.
+        let intrusion = (ends - mid) / ends;
+        assert!(intrusion > 0.28 && intrusion < 0.30, "intrusion {intrusion:.3}");
+    }
+
+    /// The same swing split across more poses shrinks the error, which is
+    /// the workaround available today without touching the blend.
+    #[test]
+    fn more_intermediate_poses_reduce_the_chord_error() {
+        const R: f32 = 2.0;
+        let at = |deg: f32| {
+            let r = deg.to_radians();
+            cube(Vec3::new(R * r.cos(), 0.0, R * r.sin()), 0.3)
+        };
+        let build = |degs: &[f32]| -> Morph {
+            let prims: Vec<RawPrim> = degs.iter().map(|d| at(*d)).collect();
+            let idx = vec![prims[0].idx.clone()];
+            Morph::build(prims.iter().map(|p| vec![p.verts.clone()]).collect(), idx).unwrap()
+        };
+        let coarse = build(&[0.0, 90.0]);
+        let fine = build(&[0.0, 30.0, 60.0, 90.0]);
+
+        let worst = |m: &mut Morph| -> f32 {
+            let mut w = 0.0f32;
+            for i in 0..=40 {
+                let t = i as f32 / 40.0;
+                let s = m.sample(0, t);
+                let c = s.verts.iter().fold(Vec3::ZERO, |a, v| a + Vec3::from_array(v.pos))
+                    / s.verts.len() as f32;
+                w = w.max((R - c.length()) / R);
+            }
+            w
+        };
+
+        let (mut coarse, mut fine) = (coarse, fine);
+        let (wc, wf) = (worst(&mut coarse), worst(&mut fine));
+        assert!(wc > 0.28, "two poses should cut the corner badly: {wc:.3}");
+        assert!(wf < wc * 0.4, "subdividing should help: {wc:.3} -> {wf:.3}");
+    }
+
+    #[test]
+    fn an_arriving_panel_scales_in_rather_than_appearing() {
+        let u = crate::align::unify(strip()).unwrap();
+        let mut m = Morph::build(u.poses.clone(), u.idx.clone()).unwrap();
+        // The panel is absent from f00..f04, so it occupies a slot after
+        // the base prims; find it by looking for the part that grows.
+        let grew = (0..u.poses[0].len()).find(|p| {
+            let mut mm = Morph::build(u.poses.clone(), u.idx.clone()).unwrap();
+            let a = extent(&mm.sample(*p, 5.0 / 6.0));
+            let b = extent(&mm.sample(*p, 1.0));
+            b > a * 1.5
+        });
+        assert!(grew.is_some(), "no part scaled in across the last segment");
+        let p = grew.unwrap();
+        assert!(extent(&m.sample(p, 4.0 / 6.0)) < extent(&m.sample(p, 1.0)));
     }
 }

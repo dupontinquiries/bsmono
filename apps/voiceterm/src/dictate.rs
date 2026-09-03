@@ -216,33 +216,47 @@ impl Tok {
 
 /// Spoken symbol → source text. Multi-word entries are matched
 /// longest-first, so "double colon" beats "colon".
+///
+/// Several arms carry whisper HOMOPHONES rather than things anyone
+/// says: "coma" for comma, "dote" for dot, "open parent" for open
+/// paren, "braise" for brace, "aero" for arrow. Measured against
+/// degraded transcripts, these are the substitutions that actually
+/// occur, and each one otherwise leaves a stray English word in the
+/// middle of a line of code.
+///
+/// One judgment call: "column" → `:`. Colon is among the highest
+/// frequency symbols in typed code, and "column" is what whisper
+/// returns for it often enough to matter — but "column" is also a real
+/// identifier word in database code. Both failure directions are
+/// visible and repairable; this bets on the commoner one. Delete the
+/// alias if your buffers are full of columns.
 fn symbol(span: &str) -> Option<Tok> {
     let t = |s: &str, l: bool, r: bool| Some(Tok { text: s.into(), glue_left: l, glue_right: r });
     match span {
-        "open paren" | "left paren" | "open parenthesis" => t("(", false, true),
-        "close paren" | "right paren" | "close parenthesis" => t(")", true, false),
-        "open brace" | "left brace" | "open curly" => t("{", false, false),
-        "close brace" | "right brace" | "close curly" => t("}", false, false),
+        "open paren" | "left paren" | "open parenthesis" | "open parent" | "opening paren" => t("(", false, true),
+        "close paren" | "right paren" | "close parenthesis" | "close parent" | "closing paren" => t(")", true, false),
+        "open brace" | "left brace" | "open curly" | "open braise" | "open brays" => t("{", false, false),
+        "close brace" | "right brace" | "close curly" | "close braise" | "close brays" => t("}", false, false),
         "open bracket" | "left bracket" => t("[", false, true),
         "close bracket" | "right bracket" => t("]", true, false),
         "open angle" | "less than" => t("<", false, true),
         "close angle" | "greater than" => t(">", true, false),
-        "arrow" | "thin arrow" => t("->", false, false),
-        "fat arrow" | "rocket" => t("=>", false, false),
-        "double colon" | "colon colon" | "path separator" => t("::", true, true),
-        "colon" => t(":", true, false),
-        "semicolon" | "semi colon" => t(";", true, false),
-        "comma" => t(",", true, false),
-        "dot" | "period" | "full stop" => t(".", true, true),
+        "arrow" | "thin arrow" | "aero" => t("->", false, false),
+        "fat arrow" | "rocket" | "fat aero" => t("=>", false, false),
+        "double colon" | "colon colon" | "path separator" | "double column" | "double colin" => t("::", true, true),
+        "colon" | "column" | "colin" => t(":", true, false),
+        "semicolon" | "semi colon" | "semi-colon" | "semicolin" => t(";", true, false),
+        "comma" | "coma" => t(",", true, false),
+        "dot" | "period" | "full stop" | "dote" => t(".", true, true),
         "question mark" => t("?", true, false),
         "bang" | "exclamation mark" => t("!", true, false),
         "double equals" | "equals equals" => t("==", false, false),
         "not equals" | "bang equals" => t("!=", false, false),
-        "equals" | "assign" => t("=", false, false),
-        "ampersand" | "and sign" | "reference" => t("&", false, true),
-        "star" | "asterisk" => t("*", false, true),
+        "equals" | "assign" | "equal" => t("=", false, false),
+        "ampersand" | "and sign" | "reference" | "amperstand" | "ampersat" => t("&", false, true),
+        "star" | "asterisk" | "asterix" => t("*", false, true),
         "pipe" => t("|", false, false),
-        "underscore" => t("_", true, true),
+        "underscore" | "under score" => t("_", true, true),
         "quote" | "double quote" => t("\"", false, false),
         "single quote" | "tick" => t("'", false, false),
         "backtick" => t("`", false, false),
@@ -332,7 +346,18 @@ pub fn spoken_code_with(text: &str, mode: Mode, syms: Option<&SymbolTable>) -> S
         return text.trim().to_string();
     }
     let stripped = strip_punct(text);
-    let words: Vec<&str> = stripped.split_whitespace().collect();
+    let words: Vec<&str> = strip_fillers(&stripped.split_whitespace().collect::<Vec<_>>());
+    // Whisper capitalizes the first word of every utterance, so a code
+    // line dictated as its own burst arrives as "Let raw equals...".
+    // Only KEYWORDS are lowered, not any capitalized leading word: a
+    // line starting with a type name the buffer has not seen yet
+    // ("Config open brace") is a real case, and guessing there would
+    // corrupt a name the speaker deliberately capitalized.
+    let leading = words.first().map(|w| lower_if_keyword(w));
+    let words: Vec<&str> = match &leading {
+        Some(Some(k)) => std::iter::once(*k).chain(words.iter().skip(1).copied()).collect(),
+        _ => words,
+    };
     let mut toks: Vec<Tok> = Vec::new();
     let mut i = 0;
     while i < words.len() {
@@ -433,6 +458,62 @@ pub fn spoken_code_with(text: &str, mode: Mode, syms: Option<&SymbolTable>) -> S
         }
     }
     join(&toks)
+}
+
+/// Keywords across the languages this transform targets. Only used to
+/// undo whisper's utterance-initial capital.
+const LEADING_KEYWORDS: &[&str] = &[
+    "let", "fn", "pub", "use", "mod", "impl", "struct", "enum", "trait", "type", "const",
+    "static", "match", "if", "else", "for", "while", "loop", "return", "break", "continue",
+    "unsafe", "async", "await", "move", "where", "def", "class", "import", "from", "var",
+    "function", "public", "private", "void", "new", "try", "catch", "throw", "print", "with",
+    "elif", "lambda", "yield", "assert", "delete", "export", "interface", "package",
+];
+
+fn lower_if_keyword(w: &str) -> Option<&'static str> {
+    let mut cs = w.chars();
+    let f = cs.next()?;
+    if !f.is_uppercase() || cs.any(|c| c.is_uppercase()) {
+        return None;
+    }
+    let lw = w.to_lowercase();
+    LEADING_KEYWORDS.iter().find(|k| **k == lw).copied()
+}
+
+/// Disfluencies whisper transcribes literally. Removed in Code mode
+/// only.
+///
+/// Prose keeps them on purpose: "um" in dictated dialogue or an
+/// interview transcript is content, and silently deleting words from
+/// someone's prose is a worse failure than leaving one in. In code it
+/// is never content.
+///
+/// Deliberately short. "like", "so", "right", "well" and "I mean" are
+/// all real disfluencies and all real words; stripping them would break
+/// more than it fixes.
+const FILLERS: &[&str] = &["um", "uh", "erm", "uhm", "ahem", "mhm", "hmm"];
+const FILLER_PAIRS: &[[&str; 2]] = &[["you", "know"], ["sort", "of"], ["kind", "of"]];
+
+fn strip_fillers<'a>(words: &[&'a str]) -> Vec<&'a str> {
+    let mut out: Vec<&str> = Vec::with_capacity(words.len());
+    let mut i = 0;
+    while i < words.len() {
+        let lw = words[i].to_lowercase();
+        if i + 1 < words.len() {
+            let lw2 = words[i + 1].to_lowercase();
+            if FILLER_PAIRS.iter().any(|p| p[0] == lw && p[1] == lw2) {
+                i += 2;
+                continue;
+            }
+        }
+        if FILLERS.contains(&lw.as_str()) {
+            i += 1;
+            continue;
+        }
+        out.push(words[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Spoken forms of the Rust primitive numeric types.
@@ -656,7 +737,8 @@ impl BufferSink {
                     let pos = self.resolve(at);
                     let sep = self.spacer(pos);
                     let body = if self.mode == Mode::Prose {
-                        decapitalize_continuation(text, self.preceding(pos))
+                        let ctx = self.text.clone();
+                        decapitalize_continuation_in(text, self.preceding(pos), &ctx)
                     } else {
                         text.clone()
                     };
@@ -770,7 +852,10 @@ impl BufferSink {
             .chars()
             .rev()
             .take_while(|c| *c != '\n')
-            .find(|c| !c.is_whitespace())
+            // Skip closing marks so the terminator behind them is
+            // found: `He said "hello."` ends in a quote, but the
+            // sentence ended at the period.
+            .find(|c| !c.is_whitespace() && !matches!(c, '"' | '\'' | ')' | ']' | '}' | '»' | '”' | '’'))
     }
 
     fn resolve(&self, at: &Placement) -> usize {
@@ -820,24 +905,74 @@ pub fn floor_char_boundary(s: &str, i: usize) -> usize {
     i
 }
 
+/// Words common enough that a capital on them at the start of a
+/// continuation is whisper's doing, not the speaker's.
+///
+/// Chosen for the position they occupy: the first word of a phrase that
+/// continues a sentence. That is overwhelmingly a pronoun, auxiliary,
+/// preposition, conjunction, determiner, or a very frequent verb.
+const COMMON_LEADING: &[&str] = &[
+    "a", "about", "after", "again", "against", "all", "almost", "along", "already", "also",
+    "although", "always", "among", "an", "and", "another", "any", "anything", "are", "around",
+    "as", "at", "back", "be", "became", "because", "become", "been", "before", "began", "being",
+    "below", "besides", "best", "better", "between", "both", "but", "by", "came", "can", "cannot",
+    "come", "comes", "could", "did", "do", "does", "doing", "done", "down", "during", "each",
+    "either", "else", "enough", "even", "ever", "every", "except", "far", "few", "finally",
+    "first", "for", "found", "from", "further", "gave", "get", "gets", "getting", "give", "given",
+    "go", "goes", "going", "gone", "got", "had", "has", "have", "having", "he", "held", "her",
+    "here", "hers", "him", "his", "how", "however", "if", "in", "instead", "into", "is", "it",
+    "its", "just", "keep", "kept", "knew", "know", "known", "last", "later", "least", "leave",
+    "left", "less", "let", "like", "likely", "made", "make", "makes", "making", "many", "may",
+    "maybe", "me", "meant", "might", "more", "most", "much", "must", "my", "near", "need",
+    "needs", "neither", "never", "next", "no", "none", "nor", "not", "nothing", "now", "of",
+    "off", "often", "on", "once", "one", "only", "onto", "or", "other", "others", "our", "out",
+    "over", "own", "part", "past", "perhaps", "put", "quite", "rather", "really", "right", "run",
+    "said", "same", "saw", "say", "says", "see", "seem", "seemed", "seems", "seen", "several",
+    "shall", "she", "should", "since", "so", "some", "something", "soon", "still", "such",
+    "take", "taken", "takes", "than", "that", "the", "their", "them", "then", "there",
+    "therefore", "these", "they", "thing", "things", "think", "this", "those", "though",
+    "through", "thus", "to", "together", "too", "took", "toward", "towards", "under", "until",
+    "up", "upon", "us", "use", "used", "using", "usually", "very", "want", "wanted", "was",
+    "way", "we", "well", "went", "were", "what", "when", "where", "whether", "which", "while",
+    "who", "whom", "whose", "why", "will", "with", "within", "without", "won", "would", "yet",
+    "you", "your", "yours",
+    // frequent verb forms that plausibly start a continuation
+    "added", "asked", "broke", "brought", "built", "called", "carried", "changed", "closed",
+    "cost", "covered", "cut", "decided", "dropped", "ended", "failed", "fell", "filled",
+    "followed", "grew", "happened", "hit", "jumped", "kicked", "landed", "lay", "led", "lived",
+    "looked", "lost", "moved", "opened", "passed", "played", "pulled", "pushed", "raised",
+    "reached", "read", "returned", "rose", "sat", "sent", "set", "showed", "shut", "sold",
+    "spent", "started", "stayed", "stood", "stopped", "talked", "told", "touched", "tried",
+    "turned", "walked", "wrote",
+];
+
 /// Drop the stray capital whisper puts on every utterance's first word
 /// when the utterance is CONTINUING a sentence.
 ///
-/// Whisper transcribes each burst independently, so "the quick brown
-/// fox" followed by "jumped over" arrives as "Jumped over" and the
-/// buffer reads "the quick brown fox Jumped over". Lowering it is right
-/// far more often than wrong.
+/// Whisper transcribes each burst independently and capitalizes each
+/// one, so "the quick brown fox" followed by "jumped over" arrives as
+/// "Jumped over".
 ///
-/// When it IS wrong the word is a proper noun, and the fix is one short
-/// utterance away — `repair::Repair::Capitalize` acts on exactly this
-/// unit. That asymmetry is the whole argument: a stray capital every
-/// other sentence is a constant tax, a lowered proper noun is
-/// occasional and already has a one-phrase undo.
+/// **Only words that are plausibly whisper's doing get lowered.** An
+/// earlier version lowered ANY leading capital and accepted lowercased
+/// proper nouns as the cost, on the theory that `Repair::Capitalize`
+/// was one phrase away. Measuring prose fixtures changed my mind: "we
+/// flew to Paris" became "we flew to paris", and a lowercased proper
+/// noun is a factual error in the text, while a stray capital on an
+/// uncommon word is cosmetic. The failure mode should be the cosmetic
+/// one.
 ///
-/// Left alone: anything after a sentence terminator or at the start of
-/// a line, all-caps words (acronyms), and words with internal capitals
-/// (`GitHub`, `iPhone`), which are never whisper's doing.
-pub fn decapitalize_continuation(text: &str, preceding: Option<char>) -> String {
+/// So a capital is dropped only if the word is in `COMMON_LEADING` or
+/// already appears in lowercase elsewhere in `context` — the second
+/// clause catching domain vocabulary no fixed list can know about.
+///
+/// Left alone regardless: anything after a sentence terminator or at the
+/// start of a line, all-caps words (acronyms), internal capitals
+/// (GitHub), and "I".
+/// `context` is the surrounding document, so a capitalized word can be
+/// checked against its own lowercase use elsewhere. Pass "" when there
+/// is none.
+pub fn decapitalize_continuation_in(text: &str, preceding: Option<char>, context: &str) -> String {
     let continuing = match preceding {
         None => false,
         Some(c) => !matches!(c, '.' | '!' | '?' | ':' | ';'),
@@ -860,10 +995,25 @@ pub fn decapitalize_continuation(text: &str, preceding: Option<char>) -> String 
         return text.to_string();
     }
     let lowered = f.to_lowercase().collect::<String>() + &tail;
+    // Linear scan: ~250 entries, once per utterance, against a ~1200ms
+    // recognizer. Sorting for a binary search would be a false economy
+    // and the list would silently rot out of order.
+    let known =
+        COMMON_LEADING.contains(&lowered.as_str()) || appears_lowercase(context, &lowered);
+    if !known {
+        return text.to_string();
+    }
     match rest {
         Some(r) => format!("{lowered} {r}"),
         None => lowered,
     }
+}
+
+/// Whether `word` occurs, lowercase and whole, in `context`.
+fn appears_lowercase(context: &str, word: &str) -> bool {
+    context
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|t| t == word)
 }
 
 /// Sink B: a modal editor owns the document; we can only send bytes.
@@ -1221,19 +1371,51 @@ mod tests {
 
     #[test]
     fn acronyms_and_internal_capitals_survive() {
-        assert_eq!(decapitalize_continuation("HTTP is fine", Some('s')), "HTTP is fine");
-        assert_eq!(decapitalize_continuation("GitHub said no", Some('s')), "GitHub said no");
-        assert_eq!(decapitalize_continuation("I went", Some('s')), "I went", "lone I is all-caps");
+        assert_eq!(decapitalize_continuation_in("HTTP is fine", Some('s'), ""), "HTTP is fine");
+        assert_eq!(decapitalize_continuation_in("GitHub said no", Some('s'), ""), "GitHub said no");
+        assert_eq!(decapitalize_continuation_in("I went", Some('s'), ""), "I went", "lone I is all-caps");
     }
 
     #[test]
-    fn a_lowered_proper_noun_is_one_repair_away() {
-        // the acknowledged failure mode, and its escape hatch
+    fn a_proper_noun_keeps_its_capital() {
+        // The reversal. An earlier version lowered any leading capital
+        // and treated "we flew to paris" as an acceptable cost because
+        // Repair::Capitalize was one phrase away. A lowercased proper
+        // noun is a factual error in the text; a stray capital on an
+        // uncommon word is cosmetic. Prefer the cosmetic failure.
         let mut b = BufferSink::new("we flew to", 10).with_mode(Mode::Prose);
         b.apply(&plan(&segment("Paris"), Mode::Prose, Placement::Cursor));
-        assert_eq!(b.text, "we flew to paris");
-        assert!(b.repair(&Repair::Capitalize));
         assert_eq!(b.text, "we flew to Paris");
+    }
+
+    #[test]
+    fn a_common_word_still_loses_it() {
+        let mut b = BufferSink::new("the quick brown fox", 19).with_mode(Mode::Prose);
+        b.apply(&plan(&segment("Jumped over"), Mode::Prose, Placement::Cursor));
+        assert_eq!(b.text, "the quick brown fox jumped over");
+    }
+
+    #[test]
+    fn a_closing_quote_does_not_hide_the_sentence_end() {
+        let mut b = BufferSink::new("He said \"hello.\"", 16).with_mode(Mode::Prose);
+        b.apply(&plan(&segment("Then he left."), Mode::Prose, Placement::Cursor));
+        assert_eq!(b.text, "He said \"hello.\" Then he left.");
+    }
+
+    #[test]
+    fn domain_vocabulary_is_learned_from_the_document() {
+        // no fixed list can know "refactoring" belongs here, but the
+        // document already uses it in lowercase
+        let ctx = "we spent the week refactoring the parser";
+        assert_eq!(
+            decapitalize_continuation_in("Refactoring again", Some('r'), ctx),
+            "refactoring again"
+        );
+        // and without that evidence it keeps the capital
+        assert_eq!(
+            decapitalize_continuation_in("Refactoring again", Some('r'), ""),
+            "Refactoring again"
+        );
     }
 
     #[test]
@@ -1356,6 +1538,52 @@ mod tests {
         b.apply(&[Edit::IndentDelta(-1)]);
         // only spaces are eaten; the é is untouched
         assert_eq!(b.text, "  é");
+    }
+
+    #[test]
+    fn code_mode_drops_disfluencies() {
+        assert_eq!(spoken_code("um let x equals five", Mode::Code), "let x = 5");
+        assert_eq!(spoken_code("let x equals uh five", Mode::Code), "let x = 5");
+        assert_eq!(spoken_code("let x you know equals five", Mode::Code), "let x = 5");
+    }
+
+    #[test]
+    fn prose_keeps_disfluencies() {
+        // deleting words from someone's prose is worse than leaving one in
+        assert_eq!(spoken_code("Um, we tried three.", Mode::Prose), "Um, we tried three.");
+    }
+
+    #[test]
+    fn whisper_homophones_resolve_to_their_symbols() {
+        // measured against degraded transcripts, not invented
+        assert_eq!(spoken_code("foo open parent a coma b close parent", Mode::Code), "foo(a, b)");
+        assert_eq!(spoken_code("raw dote as str", Mode::Code), "raw.as str");
+        assert_eq!(spoken_code("let x equal five semi colon", Mode::Code), "let x = 5;");
+        assert_eq!(spoken_code("if x open braise", Mode::Code), "if x {");
+        assert_eq!(spoken_code("let x column i thirty two", Mode::Code), "let x: i32");
+        assert_eq!(spoken_code("std double column fs", Mode::Code), "std::fs");
+    }
+
+    #[test]
+    fn a_dropped_word_is_left_visibly_wrong() {
+        // "foo paren a close paren" is missing "open". Guessing at it
+        // would mean guessing at every bare noun; a visible artifact the
+        // speaker can repair is the better failure.
+        assert_eq!(spoken_code("foo paren a close paren", Mode::Code), "foo paren a)");
+    }
+
+    #[test]
+    fn a_leading_keyword_loses_whispers_capital() {
+        assert_eq!(spoken_code("Let x equals five", Mode::Code), "let x = 5");
+        assert_eq!(spoken_code("Match state open brace", Mode::Code), "match state {");
+        assert_eq!(spoken_code("Return none", Mode::Code), "return none");
+    }
+
+    #[test]
+    fn a_leading_type_name_keeps_its_capital() {
+        // the case that stops this from being a general lowercase rule
+        assert_eq!(spoken_code("Config open brace", Mode::Code), "Config {");
+        assert_eq!(spoken_code("UserStore new", Mode::Code), "UserStore new");
     }
 
     #[test]

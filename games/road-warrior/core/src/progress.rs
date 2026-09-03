@@ -77,6 +77,25 @@ impl SaveState {
     /// A tied time is *not* a new record — deliberately strict, since a tie
     /// isn't an improvement and shouldn't trigger the same celebration.
     pub fn record_time(&mut self, level_name: &str, time: f32) -> bool {
+        // A BEST TIME IS A FINITE, POSITIVE DURATION.
+        //
+        // Without this, a NaN was stored AND reported as a new record:
+        // `time >= existing` is false for NaN, so it fell through to the
+        // insert arm. It then reached the save file on disk and the HUD,
+        // where "best 45.2s" became "best NaN".
+        //
+        // Note the asymmetry that made it worse: the `>=` test rejects a
+        // slower time, and NaN fails every comparison, so a bad value
+        // looked exactly like a very fast one.
+        //
+        // Returning false is already this function's answer for "not a new
+        // record", so an unusable time routes to an existing behaviour and
+        // leaves whatever was there before intact. This matters more once
+        // times are shared -- the LAN and leaderboard work in BACKLOG.md
+        // would otherwise propagate one bad float to everyone.
+        if !time.is_finite() || time <= 0.0 {
+            return false;
+        }
         match self.best_times.get(level_name) {
             Some(&existing) if time >= existing => false,
             _ => {
@@ -95,6 +114,28 @@ impl Default for SaveState {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_non_finite_time_is_not_a_record() {
+        // NaN fails every comparison, so `time >= existing` was false and
+        // it fell through to the insert — stored, reported as a record,
+        // written to disk and shown in the HUD.
+        let mut save = SaveState::new();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -5.0] {
+            assert!(!save.record_time("Dust Bowl", bad), "{bad} was accepted as a best time");
+            assert_eq!(save.best_time("Dust Bowl"), None, "{bad} was stored");
+        }
+    }
+
+    #[test]
+    fn a_bad_time_does_not_overwrite_a_good_one() {
+        let mut save = SaveState::new();
+        assert!(save.record_time("Dust Bowl", 42.0));
+        for bad in [f32::NAN, f32::INFINITY, -1.0] {
+            assert!(!save.record_time("Dust Bowl", bad));
+            assert_eq!(save.best_time("Dust Bowl"), Some(42.0), "{bad} clobbered a real record");
+        }
+    }
     use super::*;
     use crate::track::Segment;
 
@@ -231,3 +272,4 @@ mod tests {
         assert_eq!(loaded.best_time("Scrapyard Gauntlet"), Some(61.4));
     }
 }
+
