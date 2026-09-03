@@ -308,6 +308,14 @@ the distinction between them is the point:
 * **DID NOT COMPILE** — inconclusive, and NOT a pass
 * **ANCHOR MISS** — nothing was changed, so the run says nothing
 
+A fifth outcome the script CANNOT detect: an anchor that matches inside a
+DOC COMMENT. Breaking `<<'GITMIND_UNIT'` reported NOT CAUGHT because the first
+occurrence in the file was the comment explaining why the delimiter is quoted,
+so the edit was inert. Anchor on something that only appears in code, and
+prefer driving the loop from Python over bash — three of four breaks in that
+same run were ANCHOR MISS purely from shell escaping of `\n` and nested
+quotes.
+
 The third and fourth are why it exists. A hand-rolled `grep -c FAILED` reports
 zero failures for a break that did not compile and for one whose anchor never
 matched, and both read as "nothing catches this" — that happened twice in one

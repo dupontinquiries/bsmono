@@ -508,6 +508,70 @@ pub fn parse_dir_listing(stdout: &str) -> Vec<String> {
 
 /// rsync argv to push the monorepo working tree (minus build artifacts) to the
 /// device. Pure builder so the exact flags are unit-tested.
+/// The remote shell script that installs one daemon, from its [`InstallPlan`].
+///
+/// Returned as a STRING rather than executed, for the same reason the plan is
+/// data: it can be printed for a dry run, diffed between releases, and tested
+/// without a device. `install_daemon_remote` is the four lines that run it.
+///
+/// The unit is written with a HEREDOC rather than pushed as a file. Two
+/// reasons, and the second is the one that matters:
+///
+/// * one `ssh` round trip instead of an `scp` plus an `ssh`, which on a phone
+///   over wifi is the difference between a deploy that feels instant and one
+///   that does not;
+/// * and there is no temp file to leave behind when the connection drops
+///   halfway. A half-written unit in `~/.config/systemd/user/` is worse than
+///   none: systemd will parse it, fail, and report a syntax error about a file
+///   the operator did not write.
+///
+/// `mkdir -p` on the unit's directory first, because
+/// `~/.config/systemd/user/` does not exist on a device that has never had a
+/// user unit — which is every device before the first deploy, and the same
+/// class of missing-directory failure as rusty-board's `ReadWritePaths`
+/// (33b48880).
+///
+/// The quoted heredoc delimiter (`<<'GITMIND_UNIT'`) stops the remote shell
+/// expanding `$` and backticks in the unit body. systemd units contain `%h`
+/// rather than `$HOME` so this is belt and braces today, but an unquoted
+/// heredoc would silently mangle the first unit that uses a shell character.
+pub fn install_daemon_script(plan: &crate::daemons::InstallPlan) -> String {
+    let dir = std::path::Path::new(&plan.unit_path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/".into());
+    let mut sh = String::new();
+    sh.push_str("set -e\n");
+    sh.push_str(&format!("mkdir -p -- {}\n", shell_quote(&dir)));
+    sh.push_str(&format!(
+        "cat > {} <<'GITMIND_UNIT'\n{}GITMIND_UNIT\n",
+        shell_quote(&plan.unit_path),
+        // The body already ends in a newline; a heredoc terminator must be on
+        // a line of its own, so a body that did not would swallow it.
+        if plan.unit_body.ends_with('\n') { plan.unit_body.clone() } else { format!("{}\n", plan.unit_body) },
+    ));
+    if plan.executable {
+        sh.push_str(&format!("chmod +x {}\n", shell_quote(&plan.unit_path)));
+    }
+    for c in &plan.commands {
+        sh.push_str(c);
+        sh.push('\n');
+    }
+    sh
+}
+
+/// Install a daemon's unit on a device and bring it up.
+///
+/// The binary itself is pushed separately — `scp_push` already does that, and
+/// which artifact to send is the build system's business, not this function's.
+pub fn install_daemon_remote(
+    user: &str,
+    host: &str,
+    plan: &crate::daemons::InstallPlan,
+) -> Result<String, String> {
+    remote_capture(user, host, &install_daemon_script(plan))
+}
+
 pub fn push_argv(repo: &str, user: &str, host: &str, dir: &str) -> Vec<String> {
     let src = format!("{}/", repo.trim_end_matches('/'));
     let dest = format!("{user}@{host}:{}/", dir.trim_end_matches('/'));
@@ -1564,4 +1628,80 @@ mod tests {
             assert_eq!(known_hosts_key(&once).as_deref(), Some(once.as_str()), "{h}");
         }
     }
+    #[test]
+    fn the_install_script_makes_the_unit_directory_before_writing_into_it() {
+        // `~/.config/systemd/user/` does not exist on a device that has never
+        // had a user unit — which is every device before the first deploy.
+        // Same class of missing-directory failure as rusty-board's
+        // ReadWritePaths (33b48880).
+        let d = &crate::daemons::all()[0];
+        let plan = crate::daemons::install_plan(
+            d, crate::daemons::InitSystem::Systemd, "/home/u/.local/bin/voiced", "/home/u");
+        let sh = install_daemon_script(&plan);
+        let mkdir = sh.find("mkdir -p").expect("no mkdir");
+        let write = sh.find("cat >").expect("no write");
+        assert!(mkdir < write, "the unit is written before its directory exists");
+        assert!(sh.contains("/home/u/.config/systemd/user"), "{sh}");
+    }
+
+    #[test]
+    fn the_heredoc_is_quoted_so_the_remote_shell_does_not_expand_the_unit() {
+        // An unquoted delimiter lets the device's shell eat `$` and backticks
+        // in the unit body. Units use `%h` rather than `$HOME` today, so this
+        // is belt and braces — and it is the first unit with a shell character
+        // that would find out.
+        let d = &crate::daemons::all()[0];
+        let plan = crate::daemons::install_plan(
+            d, crate::daemons::InitSystem::Systemd, "/x", "/home/u");
+        let sh = install_daemon_script(&plan);
+        assert!(sh.contains("<<'GITMIND_UNIT'"), "the heredoc delimiter is unquoted: {sh}");
+    }
+
+    #[test]
+    fn the_heredoc_terminator_is_on_its_own_line() {
+        // A body not ending in a newline would put `GITMIND_UNIT` at the end of
+        // the last unit line, so the heredoc never terminates and the remote
+        // shell hangs waiting for input. Constructed rather than relying on the
+        // generator happening to end with one.
+        let plan = crate::daemons::InstallPlan {
+            unit_path: "/tmp/x.service".into(),
+            unit_body: "[Unit]\nDescription=no trailing newline".into(),
+            executable: false,
+            commands: vec![],
+        };
+        let sh = install_daemon_script(&plan);
+        assert!(sh.contains("newline\nGITMIND_UNIT\n"), "terminator is not alone: {sh:?}");
+    }
+
+    #[test]
+    fn an_openrc_script_is_chmodded_and_a_systemd_unit_is_not() {
+        let d = &crate::daemons::all()[0];
+        let rc = install_daemon_script(&crate::daemons::install_plan(
+            d, crate::daemons::InitSystem::OpenRc, "/x", "/h"));
+        assert!(rc.contains("chmod +x"), "the init script would not be executable");
+        let sd = install_daemon_script(&crate::daemons::install_plan(
+            d, crate::daemons::InitSystem::Systemd, "/x", "/h"));
+        assert!(!sd.contains("chmod +x"), "a systemd unit does not need +x");
+    }
+
+    #[test]
+    fn the_lifecycle_commands_survive_into_the_script_in_order() {
+        // The script is the only thing that runs; a plan whose commands were
+        // dropped or reordered on the way in would undo `install_plan`'s whole
+        // point (0642a81e).
+        let d = &crate::daemons::all()[0];
+        let plan = crate::daemons::install_plan(
+            d, crate::daemons::InitSystem::Systemd, "/x", "/h");
+        let sh = install_daemon_script(&plan);
+        let mut at = 0usize;
+        for c in &plan.commands {
+            let i = sh[at..].find(c.as_str())
+                .unwrap_or_else(|| panic!("command missing or out of order: {c}"));
+            at += i + c.len();
+        }
+        // And `set -e`, so a failed enable does not get followed by a start
+        // that reports success.
+        assert!(sh.starts_with("set -e"), "{sh}");
+    }
+
 }
