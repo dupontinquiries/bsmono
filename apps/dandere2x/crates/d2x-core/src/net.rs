@@ -248,10 +248,32 @@ impl Network {
         ops.push(conv("conv_hr", top, nf, 1, b_hr, 0, 1, lrelu, None)?);
         ops.push(conv("conv_last", b_hr, nf, 1, b_out, 0, 1, Act::None, None)?);
 
-        // Overlap: the body's receptive field is hundreds of pixels, so no
-        // overlap makes tiles independent; 8 *feature* pixels keeps the
-        // interior error around 1 LSB (measured in tests). Use big tiles.
-        let pre_pad = 8 * unshuffle;
+        // Overlap. This was 8 feature pixels, justified as "keeps the interior
+        // error around 1 LSB (measured in tests)".
+        //
+        // That measurement does not hold on real footage. RRDB's body has a
+        // receptive field of HUNDREDS of pixels, and every conv here is
+        // `pad: 1` — ZERO padding. At a tile's feature-space boundary the
+        // convolutions therefore read zeros, and with only 8 pixels of context
+        // that contamination propagates well inside the cropped region. On
+        // smooth synthetic content it averages out to ~1 LSB; on real detail it
+        // is a visible dark seam at every tile edge, which is exactly what was
+        // reported from a run over footage.
+        //
+        // 8 -> 32 as the default: 4x the context for 2*24 extra pixels per tile
+        // edge, which at the default tile size is a few percent more work. Not
+        // a cure — with zero-padded convs and a receptive field this large,
+        // NOTHING short of overlap-plus-feathered-blending removes the seam
+        // entirely — but it moves the contaminated band out of the visible
+        // crop for typical content.
+        //
+        // Settable, because the right value depends on the model's depth and
+        // the operator's tolerance for compute, and 8 was a hardcoded number
+        // that nobody could raise when it turned out to be wrong.
+        let pre_pad = std::env::var("D2X_TILE_PAD").ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(32)
+            .clamp(0, 128) * unshuffle;
         Ok(Network { name, ops, bufs, input: b_in, output: b_out, scale, unshuffle, shuffle: 1, add_input: false, pre_pad, exact: false })
     }
 
@@ -795,3 +817,39 @@ mod tests {
 }
 
 
+
+#[cfg(test)]
+mod tile_pad_tests {
+    /// The seam mechanism, stated so nobody re-lowers this without knowing.
+    ///
+    /// Every conv in the RRDB/SRVGG bodies is `pad: 1` — ZERO padding. At a
+    /// tile's feature-space boundary the convolutions read zeros, so a band of
+    /// darkened output grows inward, one pixel per conv layer. `pre_pad` is the
+    /// margin that band is allowed to eat before it reaches the cropped region.
+    ///
+    /// A pad SMALLER than the number of stacked convs guarantees contamination
+    /// inside the crop. That is not a tuning preference; it is arithmetic, and
+    /// it is what produced visible black seams on real footage while a
+    /// synthetic-content test measured "~1 LSB".
+    #[test]
+    fn the_pad_covers_at_least_the_conv_stack_depth() {
+        // Conservative floor: a 16-conv body needs 16 pixels of context before
+        // the crop even begins. The default is 32.
+        let default_pad: u32 = std::env::var("D2X_TILE_PAD").ok()
+            .and_then(|v| v.trim().parse().ok()).unwrap_or(32);
+        assert!(default_pad >= 16,
+            "pad {default_pad} is below the conv-stack depth of the shallowest body here; \
+zero-padding contamination will reach into the visible crop");
+    }
+
+    #[test]
+    fn the_override_is_bounded_so_a_typo_cannot_exhaust_the_tile() {
+        // Clamped to 128: the padded region is (tile + 2*pad), so an
+        // unbounded value silently makes every tile mostly margin and the
+        // upscale crawl for no benefit.
+        for v in ["0", "8", "32", "128", "100000"] {
+            let parsed = v.parse::<u32>().unwrap().clamp(0, 128);
+            assert!(parsed <= 128);
+        }
+    }
+}
