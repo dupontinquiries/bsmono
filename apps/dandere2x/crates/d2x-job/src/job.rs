@@ -113,8 +113,8 @@ impl Default for Job {
             vram_budget: None,
             refs_override: None,
             block_cache_override: None,
-            inflight: 2,
-            kernel: "rt4".into(),
+            inflight: 1,
+            kernel: "rt2".into(),
         }
     }
 }

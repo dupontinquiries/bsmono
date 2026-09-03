@@ -69,11 +69,14 @@ struct Common {
     /// Content-keyed block cache size (e.g. 4G; 0 = off). Default: 20% of the RAM budget.
     #[arg(long)]
     block_cache: Option<String>,
-    /// Activation sets in flight per GPU upscaler (uploads/readbacks overlap compute).
-    #[arg(long, default_value_t = 2)]
+    /// Activation sets in flight per GPU upscaler. On unified memory (Apple/Asahi)
+    /// there is no transfer to hide and each set steals VRAM from tile size:
+    /// measured 27% slower at 4 sets than at 1. Raise only on discrete GPUs.
+    #[arg(long, default_value_t = 1)]
     inflight: usize,
-    /// Conv kernel: rt4 (4x4 px per thread) | rt2 (2x2). Both bit-exact; `bench` compares speed.
-    #[arg(long, default_value = "rt4")]
+    /// Conv kernel: rt2 | rt1 | rt4 | wino (Winograd F(2,3), 2.25x fewer multiplies).
+    /// All bit-exact; `bench` compares. rt2 is fastest on AGX among the direct forms.
+    #[arg(long, default_value = "rt2")]
     kernel: String,
     /// Frames whose residuals share one GPU call.
     #[arg(long, default_value_t = 4)]
@@ -140,8 +143,8 @@ enum Cmd {
         model: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
         tile: u32,
-        /// rt4 | rt2
-        #[arg(long, default_value = "rt4")]
+        /// rt1 | rt2 | rt4 | wino
+        #[arg(long, default_value = "rt2")]
         kernel: String,
     },
     /// List GPU adapters.
@@ -152,7 +155,7 @@ enum Cmd {
         model: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
         tile: u32,
-        #[arg(long, default_value_t = 2)]
+        #[arg(long, default_value_t = 1)]
         inflight: usize,
         #[arg(long, default_value_t = 6)]
         iters: u32,
@@ -298,7 +301,7 @@ fn main() -> anyhow::Result<()> {
                 let (net, path) = job::load_model(model.as_deref())?;
                 let budget = vram_budget.as_deref().map(d2x_core::budget::parse_bytes).transpose()?.unwrap_or(0);
                 eprintln!("model: {} ({:.2} MMAC per input pixel, x{})", path.display(), net.macs_per_input_pixel() / 1e6, net.scale);
-                for kernel in ["rt2", "rt4"] {
+                for kernel in ["rt1", "rt2", "rt4", "wino"] {
                     let opts = d2x_wgpu::GpuOptions { tile, inflight, vram_budget: budget, kernel: kernel.parse()?, ..Default::default() };
                     match d2x_wgpu::bench(net.clone(), opts, iters) {
                         Ok(r) => println!("{r}"),

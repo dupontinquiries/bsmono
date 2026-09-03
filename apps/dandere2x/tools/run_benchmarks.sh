@@ -50,9 +50,9 @@ run "$BIN" probe
 SOFT=0; "$BIN" probe 2>/dev/null | head -1 | grep -q SOFTWARE && SOFT=1
 if [ "$SOFT" = 1 ]; then
   echo "!! software adapter: numbers below are for a CPU rasterizer. Reducing sizes so the kit still completes (smoke test only)." | tee -a "$LOG"
-  BENCH_TILE="--tile 48"; ITERS=2; BUDGETS="2G"; INFLIGHTS="1 2"; FIXED_TILES="48 96"; CLIP_SIZE="320x180"; AFRAMES=12; QUICK=1
+  BENCH_TILE="--tile 48"; ITERS=2; BUDGETS="2G"; INFLIGHTS="1"; FIXED_TILES="48 96"; CLIP_SIZE="320x180"; AFRAMES=12; QUICK=1
 else
-  BENCH_TILE=""; ITERS=6; BUDGETS="2G 8G 24G"; INFLIGHTS="1 2 4"; FIXED_TILES="400 640 1024"; CLIP_SIZE="1920x1080"; AFRAMES=48
+  BENCH_TILE=""; ITERS=6; BUDGETS="8G"; INFLIGHTS="1 2"; FIXED_TILES="256 384 512 688 896"; CLIP_SIZE="1920x1080"; AFRAMES=48
 fi
 
 say "model costs"
@@ -60,7 +60,7 @@ run "$BIN" model "$MODEL_X2"
 run "$BIN" model "$MODEL_FAST"
 
 say "selftest: GPU kernels vs CPU reference on THIS device (both kernels, both models)"
-for k in rt4 rt2; do
+for k in rt1 rt2 rt4 wino; do
   run "$BIN" selftest --model "$MODEL_FAST" --tile 40 --kernel "$k"
   run "$BIN" selftest --model "$MODEL_X2" --tile 48 --kernel "$k"
 done
@@ -71,18 +71,18 @@ say "core + gpu test suites (CPU exactness vs numpy references; GPU bit-exact in
 say "CPU hot paths (per-call ms, one core)"
 ( cd apps/dandere2x && cargo test --release -p d2x-core --test bench_hot -- --ignored --nocapture 2>&1 | grep -E ' ms$' ) | tee -a "$LOG"
 
-say "GPU kernel bench: RealESRGAN x2, both kernels, by VRAM budget (tile) and in-flight sets"
+say "GPU kernel bench: RealESRGAN x2, all four kernels. Tile sweep first (the M2 Ultra data says tile size matters and extra in-flight sets only steal VRAM from it)."
 for vb in $BUDGETS; do
   for inf in $INFLIGHTS; do
     run "$BIN" bench --model "$MODEL_X2" --vram-budget "$vb" --inflight "$inf" --iters "$ITERS" $BENCH_TILE
   done
 done
-say "GPU kernel bench: fixed tiles ($FIXED_TILES) at inflight 2"
+say "GPU kernel bench: fixed tiles ($FIXED_TILES) at inflight 1"
 for t in $FIXED_TILES; do
-  run "$BIN" bench --model "$MODEL_X2" --tile "$t" --inflight 2 --iters "$ITERS"
+  run "$BIN" bench --model "$MODEL_X2" --tile "$t" --inflight 1 --iters "$ITERS"
 done
 say "GPU kernel bench: compact model"
-run "$BIN" bench --model "$MODEL_FAST" --vram-budget 8G --inflight 2 --iters "$ITERS" $BENCH_TILE
+run "$BIN" bench --model "$MODEL_FAST" --vram-budget 8G --inflight 1 --iters "$ITERS" $BENCH_TILE
 
 say "synthetic clips ($CLIP_SIZE)"
 CLIPS="$REP/clips"; mkdir -p "$CLIPS"
@@ -113,17 +113,17 @@ if [ -z "${QUICK:-}" ]; then
   OUT="$REP/out"; mkdir -p "$OUT"
   ENCARGS="--codec x264 --preset 12 --crf 30"
   if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libsvtav1; then ENCARGS="--codec av1 --preset 12 --crf 35"; fi
-  runt e2e-x2-rt4            "$BIN" upscale -i "$CLIPS/partial.mkv" -o "$OUT/x2-rt4.mkv" --model "$MODEL_X2" --frames "$FRAMES" --quality 93 --cascade default --flat-bypass --vram-budget 8G --inflight 2 $ENCARGS
-  runt e2e-x2-rt2            "$BIN" upscale -i "$CLIPS/partial.mkv" -o "$OUT/x2-rt2.mkv" --model "$MODEL_X2" --frames "$FRAMES" --quality 93 --cascade default --flat-bypass --vram-budget 8G --inflight 2 --kernel rt2 $ENCARGS
-  runt e2e-x2-nocascade      "$BIN" upscale -i "$CLIPS/partial.mkv" -o "$OUT/x2-nocascade.mkv" --model "$MODEL_X2" --frames "$FRAMES" --quality 93 --vram-budget 8G --inflight 2 $ENCARGS
-  runt e2e-x2-motion         "$BIN" upscale -i "$CLIPS/motion.mkv"  -o "$OUT/x2-motion.mkv" --model "$MODEL_X2" --frames "$FRAMES" --quality 93 --cascade default --flat-bypass --vram-budget 8G --inflight 2 $ENCARGS
-  runt e2e-x2-j2             "$BIN" upscale -i "$CLIPS/partial.mkv" -o "$OUT/x2-j2.mkv" --model "$MODEL_X2" --frames "$FRAMES" --quality 93 --cascade default --flat-bypass --vram-budget 8G --inflight 2 -j 2 $ENCARGS
-  runt e2e-fast              "$BIN" upscale -i "$CLIPS/partial.mkv" -o "$OUT/fast.mkv" --model "$MODEL_FAST" --frames "$FRAMES" --quality 93 --vram-budget 8G --inflight 2 $ENCARGS
+  runt e2e-x2-rt2            "$BIN" upscale -i "$CLIPS/partial.mkv" -o "$OUT/x2-rt2.mkv" --model "$MODEL_X2" --frames "$FRAMES" --quality 93 --cascade default --flat-bypass --vram-budget 8G --inflight 1 --kernel rt2 $ENCARGS
+  runt e2e-x2-wino           "$BIN" upscale -i "$CLIPS/partial.mkv" -o "$OUT/x2-wino.mkv" --model "$MODEL_X2" --frames "$FRAMES" --quality 93 --cascade default --flat-bypass --vram-budget 8G --inflight 1 --kernel wino $ENCARGS
+  runt e2e-x2-nocascade      "$BIN" upscale -i "$CLIPS/partial.mkv" -o "$OUT/x2-nocascade.mkv" --model "$MODEL_X2" --frames "$FRAMES" --quality 93 --vram-budget 8G --inflight 1 $ENCARGS
+  runt e2e-x2-motion         "$BIN" upscale -i "$CLIPS/motion.mkv"  -o "$OUT/x2-motion.mkv" --model "$MODEL_X2" --frames "$FRAMES" --quality 93 --cascade default --flat-bypass --vram-budget 8G --inflight 1 $ENCARGS
+  runt e2e-x2-j2             "$BIN" upscale -i "$CLIPS/partial.mkv" -o "$OUT/x2-j2.mkv" --model "$MODEL_X2" --frames "$FRAMES" --quality 93 --cascade default --flat-bypass --vram-budget 8G --inflight 1 -j 2 $ENCARGS
+  runt e2e-fast              "$BIN" upscale -i "$CLIPS/partial.mkv" -o "$OUT/fast.mkv" --model "$MODEL_FAST" --frames "$FRAMES" --quality 93 --vram-budget 8G --inflight 1 $ENCARGS
   if [ -n "${CLIP:-}" ] && [ -f "$CLIP" ]; then
-    runt e2e-real-x2         "$BIN" upscale -i "$CLIP" -o "$OUT/real-x2.mkv" --model "$MODEL_X2" --frames "$FRAMES" --quality 93 --cascade default --flat-bypass --vram-budget 8G --inflight 2 $ENCARGS
+    runt e2e-real-x2         "$BIN" upscale -i "$CLIP" -o "$OUT/real-x2.mkv" --model "$MODEL_X2" --frames "$FRAMES" --quality 93 --cascade default --flat-bypass --vram-budget 8G --inflight 1 $ENCARGS
   fi
-  say "per-frame lines from the x2 rt4 run (A = analysis, U = upscale, M = merge, ms)"
-  grep -E '^frame ' "$REP/e2e-x2-rt4.log" | head -12 | tee -a "$LOG"
+  say "per-frame lines from the x2 rt2 run (A = analysis, U = upscale, M = merge, ms)"
+  grep -E '^frame ' "$REP/e2e-x2-rt2.log" | head -12 | tee -a "$LOG"
   rm -rf "$OUT"
 fi
 

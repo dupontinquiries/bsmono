@@ -27,6 +27,8 @@ use wgpu::util::DeviceExt;
 
 pub const CONV_WGSL: &str = include_str!("../shaders/conv3x3.wgsl");
 pub const CONV_RT4_WGSL: &str = include_str!("../shaders/conv3x3_rt4.wgsl");
+pub const CONV_RT1_WGSL: &str = include_str!("../shaders/conv3x3_rt1.wgsl");
+pub const CONV_WINO_WGSL: &str = include_str!("../shaders/conv3x3_wino.wgsl");
 pub const DECONV_WGSL: &str = include_str!("../shaders/deconv4x4s2.wgsl");
 pub const ADD_WGSL: &str = include_str!("../shaders/add_scaled.wgsl");
 pub const PACK_WGSL: &str = include_str!("../shaders/pack.wgsl");
@@ -50,39 +52,66 @@ pub struct GpuOptions {
     pub kernel: ConvKernel,
 }
 
+/// Which conv kernel to run. All three are bit-exact against the CPU
+/// reference; they trade arithmetic intensity against register pressure,
+/// and which wins is a property of the device, not of the network.
+///
+/// Measured on an M2 Ultra (Honeykrisp, RealESRGAN x2, tile 512):
+/// `Rt2` 878 GMAC/s, `Rt4` 671. The 4x4 tile does 2.9x the FMAs per load
+/// but needs ~130 live registers, and AGX occupancy falls off a cliff past
+/// ~64 — so the extra arithmetic buys nothing and the lost parallelism
+/// costs 24%. On llvmpipe (no occupancy limit) `Rt4` wins by 1.46x. Hence
+/// the default is the middle one and `bench` picks per machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConvKernel {
-    /// 2x2 pixels × 4 channels per thread, 16x16 workgroups.
+    /// 1 pixel × 4 channels per thread: lowest registers, lowest intensity.
+    Rt1,
+    /// 2x2 pixels × 4 channels per thread, 16x16 workgroups. Fastest on AGX.
+    #[default]
     Rt2,
     /// 4x4 pixels × 4 channels per thread, 8x8 workgroups: ~2.9x the FMAs
-    /// per load, ~130 live registers.
-    #[default]
+    /// per load, ~130 live registers. Fastest where registers are plentiful.
     Rt4,
+    /// Winograd F(2x2, 3x3): 16 multiplies per 2x2 output tile instead of
+    /// 36. Weights are transformed once at upload (entries in {1, ½}, so
+    /// exact in f32); the input and output transforms are adds.
+    Wino,
 }
 
 impl ConvKernel {
     fn source(self) -> &'static str {
         match self {
+            ConvKernel::Rt1 => CONV_RT1_WGSL,
             ConvKernel::Rt2 => CONV_WGSL,
             ConvKernel::Rt4 => CONV_RT4_WGSL,
+            ConvKernel::Wino => CONV_WINO_WGSL,
         }
+    }
+
+    /// Transformed weight taps per (out-channel group, in-channel).
+    fn taps(self) -> usize {
+        if self == ConvKernel::Wino { 16 } else { 9 }
     }
     /// Output pixels covered per workgroup along each axis.
     fn wg_span(self) -> u32 {
         match self {
-            ConvKernel::Rt2 => 32,
-            ConvKernel::Rt4 => 32,
+            ConvKernel::Rt1 => 16,
+            ConvKernel::Rt2 | ConvKernel::Rt4 => 32,
+            ConvKernel::Wino => 32,
         }
     }
+    pub const ALL: [ConvKernel; 4] = [ConvKernel::Rt1, ConvKernel::Rt2, ConvKernel::Rt4, ConvKernel::Wino];
 }
 
 impl std::str::FromStr for ConvKernel {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "rt1" | "1x1" => Ok(ConvKernel::Rt1),
             "rt2" | "2x2" => Ok(ConvKernel::Rt2),
             "rt4" | "4x4" => Ok(ConvKernel::Rt4),
-            _ => Err(anyhow!("kernel must be rt2|rt4")),
+            "wino" | "winograd" => Ok(ConvKernel::Wino),
+            _ => Err(anyhow!("kernel must be rt1|rt2|rt4|wino")),
         }
     }
 }
@@ -426,13 +455,41 @@ impl WgpuUpscaler {
                     anyhow::ensure!(c.dst_off % 4 == 0, "{}: dst_off {} not a multiple of 4", c.name, c.dst_off);
                     let oc4 = c.out_ch.div_ceil(4);
                     let ocp = oc4 * 4;
-                    let mut w: Vec<f32> = Vec::with_capacity(oc4 * c.src_ch * 9 * 4);
+                    let taps = opts.kernel.taps();
+                    let mut w: Vec<f32> = Vec::with_capacity(oc4 * c.src_ch * taps * 4);
                     for g in 0..oc4 {
                         for ic in 0..c.src_ch {
-                            for k in 0..9 {
-                                for j in 0..4 {
-                                    let oc = g * 4 + j;
-                                    w.push(if oc < c.out_ch { c.weight[(oc * c.src_ch + ic) * 9 + k] } else { 0.0 });
+                            // Per output channel lane: the 9 raw taps, or the
+                            // 16 Winograd taps G g Gᵀ (G entries 1 and ½, so
+                            // the transform is exact in f32).
+                            let mut lane = [[0.0f32; 16]; 4];
+                            for (j, l) in lane.iter_mut().enumerate() {
+                                let oc = g * 4 + j;
+                                if oc >= c.out_ch {
+                                    continue;
+                                }
+                                let gk = &c.weight[(oc * c.src_ch + ic) * 9..(oc * c.src_ch + ic) * 9 + 9];
+                                if taps == 9 {
+                                    l[..9].copy_from_slice(gk);
+                                } else {
+                                    const GM: [[f32; 3]; 4] = [[1.0, 0.0, 0.0], [0.5, 0.5, 0.5], [0.5, -0.5, 0.5], [0.0, 0.0, 1.0]];
+                                    // tmp = G g  (4x3), then out = tmp Gᵀ (4x4)
+                                    let mut tmp = [[0.0f32; 3]; 4];
+                                    for (r, t) in tmp.iter_mut().enumerate() {
+                                        for cc in 0..3 {
+                                            t[cc] = (0..3).map(|k| GM[r][k] * gk[k * 3 + cc]).sum();
+                                        }
+                                    }
+                                    for r in 0..4 {
+                                        for cc in 0..4 {
+                                            l[r * 4 + cc] = (0..3).map(|k| tmp[r][k] * GM[cc][k]).sum();
+                                        }
+                                    }
+                                }
+                            }
+                            for k in 0..taps {
+                                for l in lane.iter() {
+                                    w.push(l[k]);
                                 }
                             }
                         }
@@ -838,7 +895,7 @@ mod tests {
     /// with no GPU at all.
     #[test]
     fn shaders_validate() {
-        for (name, src) in [("conv3x3", CONV_WGSL), ("conv3x3_rt4", CONV_RT4_WGSL), ("deconv4x4s2", DECONV_WGSL), ("add_scaled", ADD_WGSL), ("pack", PACK_WGSL)] {
+        for (name, src) in [("conv3x3", CONV_WGSL), ("conv3x3_rt1", CONV_RT1_WGSL), ("conv3x3_rt4", CONV_RT4_WGSL), ("conv3x3_wino", CONV_WINO_WGSL), ("deconv4x4s2", DECONV_WGSL), ("add_scaled", ADD_WGSL), ("pack", PACK_WGSL)] {
             let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(src)));
             let mut v = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty());
             v.validate(&module).unwrap_or_else(|e| panic!("{name}: {e:?}"));
@@ -869,7 +926,7 @@ mod tests {
         let m = d2x_core::waifu2x::Upconv7::synthetic(7);
         let net = Arc::new(net_from_upconv7(&m));
         let p = models_dir().join("realesr-animevideov3.safetensors");
-        for kernel in [ConvKernel::Rt2, ConvKernel::Rt4] {
+        for kernel in ConvKernel::ALL {
             let r = selftest(net.clone(), GpuOptions { tile: 32, kernel, ..Default::default() }).unwrap();
             eprintln!("{r}");
             assert!(r.pass, "{kernel:?}: {r}");
