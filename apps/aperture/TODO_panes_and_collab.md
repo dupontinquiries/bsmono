@@ -29,6 +29,34 @@ having read the code, so the next session argues with specifics.
   being drawn, and that already caused a silently dead editor once. A
   pane that closes while focused is the same hazard with more ways in.
 
+## What step 1 actually costs — measured
+
+`.editor` appears **230 times** across `aperture-egui/src`. That number
+alone would make it a large but mechanical change, every site
+compiler-checked.
+
+It understates it. `state.editor` is a FIELD, so the borrow checker
+splits it from its siblings: `state.editor.insert(...)` and
+`state.camera` can be live at once. An `editor()` / `editor_mut()`
+accessor borrows **all of `state`**, so every site that currently holds
+two field borrows at once stops compiling and needs restructuring — not
+substitution.
+
+That is the difference between a morning and a session, and it is the
+concrete reason this note exists instead of a commit. Anyone starting it
+should expect the borrow conflicts, not the 230 renames, to be the work.
+
+Two ways to soften it, neither free:
+
+* Keep `editor` as a field and make the pane map hold only the
+  NON-focused documents, swapping on focus change the way voiceterm's
+  `pane_host::swap_focus` does. Preserves split borrows entirely; costs
+  a swap step and the class of bug voiceterm hit repeatedly, where the
+  focused copy and the parked copy disagree.
+* Move `camera` and the other per-view fields onto `panes::View` FIRST,
+  in a separate commit, so fewer sites hold two borrows by the time
+  `editor` moves.
+
 ## Decision 1 — does a split share the document?
 
 `panes` already answers this and the answer is tested: **document state
