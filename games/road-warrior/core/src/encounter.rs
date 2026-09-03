@@ -171,3 +171,4 @@ mod tests {
         assert!(!second.boss_defeated_this_tick, "defeat should only be reported once, not every subsequent tick");
     }
 }
+
