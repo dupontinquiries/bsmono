@@ -46,6 +46,33 @@ pub struct Outcome {
     pub applied: bool,
     /// The session ended on this result.
     pub ended: bool,
+    /// A (misheard, intended) pair the user just volunteered by
+    /// correcting us.
+    ///
+    /// Returned rather than recorded because `confusion_table` holds a
+    /// global Mutex and writes to disk, and this crate's pure half must
+    /// stay pure. The impure caller does:
+    ///
+    /// ```text
+    /// if let Some((heard, meant)) = outcome.teach {
+    ///     confusion_table::learn_from_confirmation(&heard, &meant);
+    /// }
+    /// ```
+    ///
+    /// Only emitted when the repair actually applied — a correction that
+    /// did not land is not evidence of anything.
+    ///
+    /// Feeding this in is safe even for pairs that are not really
+    /// mishearings, because `learn_from_confirmation` applies its own
+    /// similarity filter and `correct()` requires MIN_CONFIRMATIONS
+    /// before it acts. Verified against the real table: "read to
+    /// strong" -> "read to string" is learned, while "three" -> "nine"
+    /// and "read to end" -> "read to string" are dropped as too
+    /// dissimilar. That distinction is exactly the one that matters —
+    /// it separates "you misheard me" from "I changed my mind" — and it
+    /// means this side does not need its own acoustic-plausibility
+    /// check.
+    pub teach: Option<(String, String)>,
 }
 
 /// A live dictation session over one buffer.
@@ -113,6 +140,10 @@ impl Engine {
         let r = Recognition { text: text.to_string(), tier, confidence };
         let route = self.session.route(&r);
 
+        // Captured before the repair runs: afterwards the buffer holds
+        // the corrected text and the misheard version is gone.
+        let unit_before = self.sink.last_unit().map(|s| s.to_string());
+
         let applied = match &route {
             Route::Content(t) => {
                 // segment_strict, not segment: a recognizer classifies a
@@ -170,7 +201,14 @@ impl Engine {
             now_ms,
         );
 
-        Outcome { route, applied, ended: self.session.ended() }
+        let teach = match (&route, applied) {
+            (Route::Repair(rep), true) => unit_before
+                .as_deref()
+                .and_then(|u| crate::repair::training_pair(u, rep)),
+            _ => None,
+        };
+
+        Outcome { route, applied, ended: self.session.ended(), teach }
     }
 
     /// Apply a repair, accounting for the fact that what is IN the
@@ -657,6 +695,46 @@ mod tests {
         let o = say(&mut e, "change nine to two", 2000);
         assert!(!o.applied);
         assert_eq!(e.text(), "retries: 3,");
+    }
+
+    #[test]
+    fn a_correction_yields_a_training_pair() {
+        let mut e = eng("");
+        say(&mut e, "read to end", 0);
+        let o = say(&mut e, "no I meant read to string", 2000);
+        assert!(o.applied);
+        assert_eq!(
+            o.teach,
+            Some(("read to end".into(), "read to string".into())),
+            "the misheard text must be captured BEFORE the repair overwrites it"
+        );
+        assert_eq!(e.text(), "read to string");
+    }
+
+    #[test]
+    fn a_reshaping_repair_teaches_nothing() {
+        let mut e = eng("");
+        say(&mut e, "read to string", 0);
+        let o = say(&mut e, "make that snake case", 2000);
+        assert!(o.applied);
+        assert_eq!(o.teach, None, "whisper heard this correctly; only the shape was wrong");
+    }
+
+    #[test]
+    fn a_failed_repair_teaches_nothing() {
+        let mut e = eng("");
+        say(&mut e, "read to string", 0);
+        let o = say(&mut e, "change absent to x", 2000);
+        assert!(!o.applied);
+        assert_eq!(o.teach, None, "a correction that did not land is not evidence");
+    }
+
+    #[test]
+    fn ordinary_content_teaches_nothing() {
+        let mut e = eng("");
+        let o = say(&mut e, "let x equals five", 0);
+        assert!(o.applied);
+        assert_eq!(o.teach, None);
     }
 
     #[test]

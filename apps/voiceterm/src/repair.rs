@@ -128,6 +128,10 @@ pub fn parse(phrase: &str) -> Option<Repair> {
         ("swap ", " for "),
     ] {
         if let Some(rest) = p.strip_prefix(lead) {
+            // Note: `from` cannot itself be the separator word, so
+            // "change to into" does not parse. Saying it a different
+            // way ("replace to with into") does. Special-casing the
+            // separator would make every "change X to Y" ambiguous.
             if let Some(i) = rest.find(sep) {
                 let from = rest[..i].trim();
                 let to = rest[i + sep.len()..].trim();
@@ -241,6 +245,59 @@ fn replace_word(unit: &str, from: &str, to: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The (misheard, intended) pair a repair reveals, if any.
+///
+/// A repair is a labelled correction the user volunteered: they heard
+/// the wrong thing come out and told us the right one. That is the same
+/// signal `confusion_table::learn_from_confirmation` was built to
+/// consume, and nothing currently feeds it. Wiring repairs into it means
+/// the recognizer gets better at the words this particular person says,
+/// on this particular mic, without anyone running a training job.
+///
+/// `unit` is what is in the buffer (the misheard text); the pair is
+/// returned as (misheard, intended) for the caller to hand to the table.
+///
+/// **Only recognition errors teach.** Recase, Capitalize, Upper, Lower
+/// and Join are TRANSFORM choices — whisper heard the words correctly
+/// and the user wants them shaped differently. Feeding those in would
+/// teach the table that "readtostring" is a mishearing of
+/// "read_to_string", which is not true and would poison corrections for
+/// everyone.
+///
+/// `Spell` is excluded for a different reason: the user has already
+/// given up on being understood, so the pair is real but the acoustic
+/// evidence behind it is whatever the recognizer produced for spelled
+/// letters — not a substitution the table can generalize from.
+pub fn training_pair(unit: &str, r: &Repair) -> Option<(String, String)> {
+    let u = unit.trim();
+    if u.is_empty() {
+        return None;
+    }
+    match r {
+        // "I said X" — the whole unit was misheard.
+        Repair::Literal(intended) => {
+            let i = intended.trim();
+            if i.is_empty() || i.eq_ignore_ascii_case(u) {
+                return None;
+            }
+            Some((u.to_string(), i.to_string()))
+        }
+        // "change foo to bar" — one word, the cleanest signal there is.
+        Repair::Change { from, to } => {
+            if from.eq_ignore_ascii_case(to) {
+                return None;
+            }
+            Some((from.clone(), to.clone()))
+        }
+        Repair::Recase(_)
+        | Repair::Capitalize
+        | Repair::Uppercase
+        | Repair::Lowercase
+        | Repair::Join
+        | Repair::Spell(_) => None,
+    }
 }
 
 /// Turn spoken letters into a string. Accepts bare letters ("r e a d",
@@ -435,6 +492,48 @@ mod tests {
         assert_eq!(parse("i said read to string"), Some(Repair::Literal("read to string".into())));
         assert_eq!(parse("no I meant Path"), Some(Repair::Literal("path".into())));
         assert_eq!(apply("anything", &Repair::Literal("x".into())).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn recognition_errors_produce_a_training_pair() {
+        assert_eq!(
+            training_pair("read to end", &Repair::Literal("read to string".into())),
+            Some(("read to end".into(), "read to string".into()))
+        );
+        assert_eq!(
+            training_pair(
+                "read_to_string",
+                &Repair::Change { from: "to".into(), to: "into".into() }
+            ),
+            Some(("to".into(), "into".into()))
+        );
+    }
+
+    #[test]
+    fn transform_choices_teach_nothing() {
+        // whisper heard these correctly; the user wanted a different
+        // shape. Learning from them would teach the table that
+        // "readtostring" is a mishearing of "read_to_string".
+        for r in [
+            Repair::Recase(Casing::Snake),
+            Repair::Capitalize,
+            Repair::Uppercase,
+            Repair::Lowercase,
+            Repair::Join,
+            Repair::Spell("read".into()),
+        ] {
+            assert_eq!(training_pair("read to string", &r), None, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn a_no_op_correction_teaches_nothing() {
+        assert_eq!(training_pair("path", &Repair::Literal("Path".into())), None, "same word");
+        assert_eq!(
+            training_pair("x", &Repair::Change { from: "a".into(), to: "A".into() }),
+            None
+        );
+        assert_eq!(training_pair("", &Repair::Literal("x".into())), None);
     }
 
     #[test]
