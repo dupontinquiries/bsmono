@@ -52,7 +52,7 @@ if [ "$SOFT" = 1 ]; then
   echo "!! software adapter: numbers below are for a CPU rasterizer. Reducing sizes so the kit still completes (smoke test only)." | tee -a "$LOG"
   BENCH_TILE="--tile 48"; ITERS=2; BUDGETS="2G"; INFLIGHTS="1"; FIXED_TILES="48 96"; CLIP_SIZE="320x180"; AFRAMES=12; QUICK=1
 else
-  BENCH_TILE=""; ITERS=6; BUDGETS="8G"; INFLIGHTS="1 2"; FIXED_TILES="256 384 512 688 896"; CLIP_SIZE="1920x1080"; AFRAMES=48
+  BENCH_TILE=""; ITERS=6; BUDGETS="8G"; INFLIGHTS="1"; FIXED_TILES="512 688"; CLIP_SIZE="1920x1080"; AFRAMES=48
 fi
 
 say "model costs"
@@ -60,7 +60,7 @@ run "$BIN" model "$MODEL_X2"
 run "$BIN" model "$MODEL_FAST"
 
 say "selftest: GPU kernels vs CPU reference on THIS device (both kernels, both models)"
-for k in rt1 rt2 rt4 wino; do
+for k in rt1 rt2 rt4 wino rt2c8; do
   run "$BIN" selftest --model "$MODEL_FAST" --tile 40 --kernel "$k"
   run "$BIN" selftest --model "$MODEL_X2" --tile 48 --kernel "$k"
 done

@@ -143,7 +143,7 @@ enum Cmd {
         model: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
         tile: u32,
-        /// rt1 | rt2 | rt4 | wino
+        /// rt1 | rt2 | rt4 | wino | rt2c8
         #[arg(long, default_value = "rt2")]
         kernel: String,
     },
@@ -301,7 +301,7 @@ fn main() -> anyhow::Result<()> {
                 let (net, path) = job::load_model(model.as_deref())?;
                 let budget = vram_budget.as_deref().map(d2x_core::budget::parse_bytes).transpose()?.unwrap_or(0);
                 eprintln!("model: {} ({:.2} MMAC per input pixel, x{})", path.display(), net.macs_per_input_pixel() / 1e6, net.scale);
-                for kernel in ["rt1", "rt2", "rt4", "wino"] {
+                for kernel in ["rt2", "rt1", "rt4", "wino", "rt2c8"] {
                     let opts = d2x_wgpu::GpuOptions { tile, inflight, vram_budget: budget, kernel: kernel.parse()?, ..Default::default() };
                     match d2x_wgpu::bench(net.clone(), opts, iters) {
                         Ok(r) => println!("{r}"),

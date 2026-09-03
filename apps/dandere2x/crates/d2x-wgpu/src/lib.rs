@@ -29,6 +29,7 @@ pub const CONV_WGSL: &str = include_str!("../shaders/conv3x3.wgsl");
 pub const CONV_RT4_WGSL: &str = include_str!("../shaders/conv3x3_rt4.wgsl");
 pub const CONV_RT1_WGSL: &str = include_str!("../shaders/conv3x3_rt1.wgsl");
 pub const CONV_WINO_WGSL: &str = include_str!("../shaders/conv3x3_wino.wgsl");
+pub const CONV_RT2C8_WGSL: &str = include_str!("../shaders/conv3x3_rt2c8.wgsl");
 pub const DECONV_WGSL: &str = include_str!("../shaders/deconv4x4s2.wgsl");
 pub const ADD_WGSL: &str = include_str!("../shaders/add_scaled.wgsl");
 pub const PACK_WGSL: &str = include_str!("../shaders/pack.wgsl");
@@ -76,6 +77,9 @@ pub enum ConvKernel {
     /// 36. Weights are transformed once at upload (entries in {1, ½}, so
     /// exact in f32); the input and output transforms are adds.
     Wino,
+    /// 2x2 pixels × 8 output channels: rt2's input footprint, twice the
+    /// arithmetic per load, on the channel axis instead of the pixel axis.
+    Rt2c8,
 }
 
 impl ConvKernel {
@@ -85,6 +89,7 @@ impl ConvKernel {
             ConvKernel::Rt2 => CONV_WGSL,
             ConvKernel::Rt4 => CONV_RT4_WGSL,
             ConvKernel::Wino => CONV_WINO_WGSL,
+            ConvKernel::Rt2c8 => CONV_RT2C8_WGSL,
         }
     }
 
@@ -97,10 +102,14 @@ impl ConvKernel {
         match self {
             ConvKernel::Rt1 => 16,
             ConvKernel::Rt2 | ConvKernel::Rt4 => 32,
-            ConvKernel::Wino => 32,
+            ConvKernel::Wino | ConvKernel::Rt2c8 => 32,
         }
     }
-    pub const ALL: [ConvKernel; 4] = [ConvKernel::Rt1, ConvKernel::Rt2, ConvKernel::Rt4, ConvKernel::Wino];
+    /// Output-channel groups (of 4) handled per dispatch z.
+    fn groups_per_z(self) -> u32 {
+        if self == ConvKernel::Rt2c8 { 2 } else { 1 }
+    }
+    pub const ALL: [ConvKernel; 5] = [ConvKernel::Rt1, ConvKernel::Rt2, ConvKernel::Rt4, ConvKernel::Wino, ConvKernel::Rt2c8];
 }
 
 impl std::str::FromStr for ConvKernel {
@@ -111,7 +120,8 @@ impl std::str::FromStr for ConvKernel {
             "rt2" | "2x2" => Ok(ConvKernel::Rt2),
             "rt4" | "4x4" => Ok(ConvKernel::Rt4),
             "wino" | "winograd" => Ok(ConvKernel::Wino),
-            _ => Err(anyhow!("kernel must be rt1|rt2|rt4|wino")),
+            "rt2c8" | "c8" => Ok(ConvKernel::Rt2c8),
+            _ => Err(anyhow!("kernel must be rt1|rt2|rt4|wino|rt2c8")),
         }
     }
 }
@@ -651,7 +661,8 @@ impl WgpuUpscaler {
                     pass.set_pipeline(&self.conv_pipeline);
                     pass.set_bind_group(0, bind, &[]);
                     let span = self.kernel.wg_span();
-                    pass.dispatch_workgroups(ow.div_ceil(span), oh.div_ceil(span), c.out_ch.div_ceil(4) as u32);
+                    let z = (c.out_ch.div_ceil(4) as u32).div_ceil(self.kernel.groups_per_z());
+                    pass.dispatch_workgroups(ow.div_ceil(span), oh.div_ceil(span), z);
                 }
                 Step::Deconv { op, params, bind } => {
                     let Op::Deconv(d) = &net.ops[*op] else { unreachable!() };
@@ -895,7 +906,7 @@ mod tests {
     /// with no GPU at all.
     #[test]
     fn shaders_validate() {
-        for (name, src) in [("conv3x3", CONV_WGSL), ("conv3x3_rt1", CONV_RT1_WGSL), ("conv3x3_rt4", CONV_RT4_WGSL), ("conv3x3_wino", CONV_WINO_WGSL), ("deconv4x4s2", DECONV_WGSL), ("add_scaled", ADD_WGSL), ("pack", PACK_WGSL)] {
+        for (name, src) in [("conv3x3", CONV_WGSL), ("conv3x3_rt1", CONV_RT1_WGSL), ("conv3x3_rt4", CONV_RT4_WGSL), ("conv3x3_wino", CONV_WINO_WGSL), ("conv3x3_rt2c8", CONV_RT2C8_WGSL), ("deconv4x4s2", DECONV_WGSL), ("add_scaled", ADD_WGSL), ("pack", PACK_WGSL)] {
             let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(src)));
             let mut v = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty());
             v.validate(&module).unwrap_or_else(|e| panic!("{name}: {e:?}"));
