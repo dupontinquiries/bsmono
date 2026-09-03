@@ -965,6 +965,56 @@ visible on real footage at the tile sizes now in use — the default tile grew t
 That is one screenshot, and per `docs/agents/HEADLESS_GUI_TESTING.md` this
 sandbox can take it.
 
+
+## 20. The sandbox CAN see a GUI, and a dozen of my claims today were unnecessary
+
+`docs/agents/HEADLESS_GUI_TESTING.md` arrived in c14unified-026 correcting
+CLAUDE.md's "GPU, Qt and GTK paths cannot be built in this sandbox". I tested
+the correction rather than believing it, and it is right.
+
+    apt-get install -y --no-install-recommends xvfb openbox xdotool imagemagick
+    export DISPLAY=:99 LIBGL_ALWAYS_SOFTWARE=1
+    Xvfb :99 -screen 0 1280x800x24 &   # then openbox, then the app
+    import -window root /tmp/shot.png
+
+**switcheroo-egui built, launched, rendered and screenshotted.** Roughly seven
+minutes for a cold debug build, seconds for everything else. `openbox` really
+is required — without a window manager `xdotool windowactivate` fails and
+synthetic keys go nowhere.
+
+### What the screenshot settled instantly
+
+Two things I committed blind today, both confirmed:
+
+* **The symbol fonts reach switcheroo.** `☆` and `↻` render as glyphs, not
+  tofu boxes. That was the whole claim of 51e910c8 and I had no way to check
+  it — cropping the pin button to 40x40 shows a star.
+* **The palette applies.** Dark theme, orange warning text for the missing
+  Bluetooth socket, accent on the active tab. The `Colors` indirection from
+  that commit is doing what it was written to do.
+
+It also showed the touch targets are the right size beside the toggle, which
+was the other half of that commit.
+
+### The claims that are still unverified but no longer unverifiABLE
+
+Every "NOT verified by eye — no display here" I wrote today was avoidable:
+snapclone's fullscreen camera and 90° rotation and dark capture flash,
+aperture's palette scroll and its two regressions, logscope's boxed glyphs,
+photosync's grid. The camera ones need a camera and would show chrome layout
+at least; the aperture and logscope ones need nothing but a build.
+
+The honest summary is that I inherited a claim, repeated it a dozen times, and
+never spent the one `cargo build` that would have tested it — while spending
+the whole session telling other people's code to check its assumptions.
+
+### Cost, so the next session budgets it
+
+A cold debug build of a small egui app is ~7 minutes here and must be
+backgrounded across tool calls. The X server, window manager and capture are
+seconds. Disk is the real constraint: a debug target dir is 1-3 GB and this
+sandbox hit genuine `No space left on device` twice today.
+
 ---
 
 # C14_TODO — open threads from the c14 session (blackstar/voice line)
