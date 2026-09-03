@@ -906,6 +906,65 @@ Both are now line- or phrase-exact. For ports, paths and identifiers the wrong
 value being a superstring of the right one is the common case, not the rare
 one — a substring assertion there is close to no assertion at all.
 
+
+## 19. dandere2x seam blending: what the frame-resident rewrite costs to restore
+
+Recorded because merging c14unified-026's dandere line (67ed5800) dropped it,
+and the reason it cannot simply be re-applied is architectural rather than a
+matter of effort. Without this note the next attempt re-derives it.
+
+### Where it used to hook
+
+The replayed seam work (c2a3b204, 4fde955f) composited on the HOST: tiles were
+read back one at a time, `Blender::add` accumulated each into a weighted output,
+and `tiles_overlapped` stepped by `tile - pre_pad` so the context each tile
+already computes was reused rather than discarded.
+
+### Why that hook no longer exists
+
+The new path never reads a tile back. `shaders/pack.wgsl` writes each tile's
+output **cropped and addressed straight into a frame-sized device buffer**
+(`dst_x`, `dst_y`, `out_stride`), and the frame is read back exactly once at
+exactly its own size. That is where the 11x comes from — one submit and one
+readback per frame instead of one per tile.
+
+So compositing has moved onto the GPU, into a shader that OVERWRITES. There is
+no per-tile host step left to blend in.
+
+### What restoring it actually requires
+
+Not a Rust change. `pack.wgsl` would need to:
+
+1. take a weight per output pixel — a separable ramp over the overlap region,
+   derivable from `crop_*` and the overlap width, no texture needed;
+2. ACCUMULATE rather than store — `out` is `array<u32>` RGBA8, so weighted
+   accumulation needs either an f32 accumulation buffer plus a normalisation
+   pass, or atomics; f32 plus a pass is the simpler and is one extra
+   frame-sized buffer;
+3. and the tile walk moves from `tiles` to `tiles_overlapped`, which is the
+   only Rust-side change and is one line.
+
+The normalisation pass is also where the RGBA8 conversion would happen, so it
+replaces rather than adds a step.
+
+### What survives, and what to check first
+
+`Blender` and `tiles_overlapped` are still in `d2x-core/net.rs` with their
+tests passing — the arithmetic and the weight ramp are intact and are what the
+shader would implement. The CPU path still blends.
+
+`selftest` keeps the comment explaining that kernel parity must be measured
+with blending OFF (93.3% exact, worst delta 3, which was the blend working);
+whatever turns it on must turn it off there.
+
+**Check the artefact is back before doing any of this.** The fix addressed the
+fainter STEADY seams; the flickering ones were the residual bleed ring, fixed
+separately in f0049067 and untouched by the merge. If the steady seams are not
+visible on real footage at the tile sizes now in use — the default tile grew to
+688-1024 in this line, from 40-64 — the work may not be worth a shader rewrite.
+That is one screenshot, and per `docs/agents/HEADLESS_GUI_TESTING.md` this
+sandbox can take it.
+
 ---
 
 # C14_TODO — open threads from the c14 session (blackstar/voice line)

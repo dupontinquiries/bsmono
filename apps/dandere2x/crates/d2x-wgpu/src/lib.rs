@@ -1068,6 +1068,13 @@ impl WgpuUpscaler {
     /// frame-sized output buffer, so the readback is the frame and nothing
     /// more — no per-tile crop on the host, and none of the padded overlap
     /// (~10% of the bytes at tile 688) crossing the bus.
+    /// NOTE on seam blending, removed by the merge that brought this path:
+    /// compositing now happens in `pack.wgsl`, which writes each tile cropped
+    /// and addressed into a frame-sized device buffer and OVERWRITES. There is
+    /// no per-tile host step left for `Blender` to hook into, so restoring the
+    /// overlap fix is a shader change (weighted accumulate + a normalisation
+    /// pass), not a Rust one. `maintenance/C14_TODO.md` §19 has the specifics
+    /// and the check to run first.
     pub fn upscale_frame(&mut self, frame: &Frame) -> anyhow::Result<Frame> {
         let net = self.net.clone();
         // No padded copy: the extract pass clamps its reads, which is the same
