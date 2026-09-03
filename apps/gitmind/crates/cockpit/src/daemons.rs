@@ -134,6 +134,90 @@ pub fn openrc_service(d: &Daemon, exec_path: &str) -> String {
     )
 }
 
+/// A daemon this fleet knows about, from either source.
+///
+/// Owned, unlike [`Daemon`], because the manifest-discovered ones cannot be
+/// `&'static str`. The static registry stays as the richer description — it
+/// carries the socket namespace and the core-kit integration, which the
+/// manifest does not know — and discovery fills in the rest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownDaemon {
+    pub name: String,
+    pub description: String,
+    pub integration: String,
+    /// The project whose tree it ships from, as the manifest names it.
+    pub project: String,
+    /// True when it came from [`all`] rather than from a unit file on disk.
+    pub registered: bool,
+}
+
+/// Service names a project ships, from its `systemd/` directory listing.
+///
+/// `.socket` files are EXCLUDED. A socket unit is an activation mechanism for
+/// a service of the same name, not a second daemon — `sharemd.socket` beside
+/// `sharemd.service` is one daemon, and counting it twice would offer the
+/// operator two buttons that install the same thing and a `rc-update add
+/// sharemd.socket` that OpenRC cannot satisfy at all.
+///
+/// Pure over a listing so the rule is testable without a filesystem.
+pub fn daemon_names_from_units(file_names: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = file_names
+        .iter()
+        .filter_map(|f| f.strip_suffix(".service"))
+        .map(|n| n.to_string())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Merge the static registry with what the manifest's `daemon = true` projects
+/// actually ship.
+///
+/// `discovered` is `(project, service names)` — the caller lists each daemon
+/// project's `systemd/` directory, which is the shell around this.
+///
+/// # Why both sources instead of one
+///
+/// The registry knows things the filesystem cannot: which core-kit a service
+/// integrates and which ipc-kit socket namespace it serves. The filesystem
+/// knows things the registry has not been told: `snapclone-bus`,
+/// `snapclone-camera-bridge` and `photosync` all ship units and none of them
+/// is in [`all`], which is C14_TODO §17's finding — two lists describing one
+/// fleet with nothing keeping them in step.
+///
+/// So the registry wins where it has an entry, and discovery adds the rest
+/// rather than replacing it. A discovered daemon gets an empty `integration`,
+/// which is honest: it has not declared one, and `is_fleet_daemon` will say so
+/// of its hand-written unit too.
+pub fn known(discovered: &[(String, Vec<String>)]) -> Vec<KnownDaemon> {
+    let mut out: Vec<KnownDaemon> = all()
+        .iter()
+        .map(|d| KnownDaemon {
+            name: d.name.to_string(),
+            description: d.description.to_string(),
+            integration: d.integration.to_string(),
+            project: d.name.to_string(),
+            registered: true,
+        })
+        .collect();
+    for (project, services) in discovered {
+        for svc in services {
+            if out.iter().any(|k| &k.name == svc) {
+                continue;
+            }
+            out.push(KnownDaemon {
+                name: svc.clone(),
+                description: format!("{svc} (from {project}/systemd)"),
+                integration: String::new(),
+                project: project.clone(),
+                registered: false,
+            });
+        }
+    }
+    out
+}
+
 /// Everything needed to put a daemon on a machine: one file, then some commands.
 ///
 /// Returned as DATA rather than executed, so the same plan drives a local
@@ -529,6 +613,66 @@ mod tests {
         assert!(s.unit_path.ends_with(".service"));
         assert!(o.unit_path.starts_with("/etc/init.d/"), "{}", o.unit_path);
         assert_ne!(s.unit_path, o.unit_path);
+    }
+
+    #[test]
+    fn a_socket_unit_is_not_a_second_daemon() {
+        // `sharemd.socket` beside `sharemd.service` is ONE daemon. Counting it
+        // twice offers two buttons that install the same thing, and
+        // `rc-update add sharemd.socket` is something OpenRC cannot satisfy at
+        // all.
+        let files: Vec<String> = ["sharemd.service", "sharemd.socket", "voiced.socket", "voiced.service"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(daemon_names_from_units(&files), vec!["sharemd", "voiced"]);
+        // And a directory of nothing but sockets yields no daemons rather than
+        // names with the wrong suffix stripped.
+        let only_sockets: Vec<String> = vec!["x.socket".into()];
+        assert!(daemon_names_from_units(&only_sockets).is_empty());
+    }
+
+    #[test]
+    fn discovery_finds_the_daemons_the_registry_never_knew() {
+        // The whole point (C14_TODO §17): `all()` lists five fabric services
+        // and knows about none of the three that actually ship unit files.
+        let discovered = vec![
+            ("snapclone".to_string(),
+             vec!["snapclone-bus".to_string(), "snapclone-camera-bridge".to_string()]),
+            ("photosync".to_string(), vec!["photosync".to_string()]),
+        ];
+        let k = known(&discovered);
+        let names: Vec<&str> = k.iter().map(|d| d.name.as_str()).collect();
+        for want in ["snapclone-bus", "snapclone-camera-bridge", "photosync"] {
+            assert!(names.contains(&want), "{want} was not discovered: {names:?}");
+        }
+        // The registry's own entries survive alongside them.
+        assert!(names.contains(&"voiced"));
+        assert_eq!(k.len(), all().len() + 3);
+    }
+
+    #[test]
+    fn the_registry_wins_where_it_has_an_entry() {
+        // It knows the socket namespace and the core-kit integration; the
+        // filesystem does not. Discovery must not overwrite a described daemon
+        // with a bare one.
+        let discovered = vec![("voiced".to_string(), vec!["voiced".to_string()])];
+        let k = known(&discovered);
+        let v: Vec<&KnownDaemon> = k.iter().filter(|d| d.name == "voiced").collect();
+        assert_eq!(v.len(), 1, "voiced appeared twice");
+        assert!(v[0].registered);
+        assert_eq!(v[0].integration, "voiced-core", "the described entry was replaced");
+    }
+
+    #[test]
+    fn a_discovered_daemon_admits_it_has_no_integration() {
+        // Rather than inventing one. `is_fleet_daemon` will say the same of its
+        // hand-written unit, so claiming an integration here would make the two
+        // disagree.
+        let discovered = vec![("snapclone".to_string(), vec!["snapclone-bus".to_string()])];
+        let k = known(&discovered);
+        let d = k.iter().find(|d| d.name == "snapclone-bus").unwrap();
+        assert!(d.integration.is_empty());
+        assert!(!d.registered);
+        assert_eq!(d.project, "snapclone");
     }
 
 }
