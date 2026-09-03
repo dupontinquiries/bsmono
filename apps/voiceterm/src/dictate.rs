@@ -216,33 +216,47 @@ impl Tok {
 
 /// Spoken symbol → source text. Multi-word entries are matched
 /// longest-first, so "double colon" beats "colon".
+///
+/// Several arms carry whisper HOMOPHONES rather than things anyone
+/// says: "coma" for comma, "dote" for dot, "open parent" for open
+/// paren, "braise" for brace, "aero" for arrow. Measured against
+/// degraded transcripts, these are the substitutions that actually
+/// occur, and each one otherwise leaves a stray English word in the
+/// middle of a line of code.
+///
+/// One judgment call: "column" → `:`. Colon is among the highest
+/// frequency symbols in typed code, and "column" is what whisper
+/// returns for it often enough to matter — but "column" is also a real
+/// identifier word in database code. Both failure directions are
+/// visible and repairable; this bets on the commoner one. Delete the
+/// alias if your buffers are full of columns.
 fn symbol(span: &str) -> Option<Tok> {
     let t = |s: &str, l: bool, r: bool| Some(Tok { text: s.into(), glue_left: l, glue_right: r });
     match span {
-        "open paren" | "left paren" | "open parenthesis" => t("(", false, true),
-        "close paren" | "right paren" | "close parenthesis" => t(")", true, false),
-        "open brace" | "left brace" | "open curly" => t("{", false, false),
-        "close brace" | "right brace" | "close curly" => t("}", false, false),
+        "open paren" | "left paren" | "open parenthesis" | "open parent" | "opening paren" => t("(", false, true),
+        "close paren" | "right paren" | "close parenthesis" | "close parent" | "closing paren" => t(")", true, false),
+        "open brace" | "left brace" | "open curly" | "open braise" | "open brays" => t("{", false, false),
+        "close brace" | "right brace" | "close curly" | "close braise" | "close brays" => t("}", false, false),
         "open bracket" | "left bracket" => t("[", false, true),
         "close bracket" | "right bracket" => t("]", true, false),
         "open angle" | "less than" => t("<", false, true),
         "close angle" | "greater than" => t(">", true, false),
-        "arrow" | "thin arrow" => t("->", false, false),
-        "fat arrow" | "rocket" => t("=>", false, false),
-        "double colon" | "colon colon" | "path separator" => t("::", true, true),
-        "colon" => t(":", true, false),
-        "semicolon" | "semi colon" => t(";", true, false),
-        "comma" => t(",", true, false),
-        "dot" | "period" | "full stop" => t(".", true, true),
+        "arrow" | "thin arrow" | "aero" => t("->", false, false),
+        "fat arrow" | "rocket" | "fat aero" => t("=>", false, false),
+        "double colon" | "colon colon" | "path separator" | "double column" | "double colin" => t("::", true, true),
+        "colon" | "column" | "colin" => t(":", true, false),
+        "semicolon" | "semi colon" | "semi-colon" | "semicolin" => t(";", true, false),
+        "comma" | "coma" => t(",", true, false),
+        "dot" | "period" | "full stop" | "dote" => t(".", true, true),
         "question mark" => t("?", true, false),
         "bang" | "exclamation mark" => t("!", true, false),
         "double equals" | "equals equals" => t("==", false, false),
         "not equals" | "bang equals" => t("!=", false, false),
-        "equals" | "assign" => t("=", false, false),
-        "ampersand" | "and sign" | "reference" => t("&", false, true),
-        "star" | "asterisk" => t("*", false, true),
+        "equals" | "assign" | "equal" => t("=", false, false),
+        "ampersand" | "and sign" | "reference" | "amperstand" | "ampersat" => t("&", false, true),
+        "star" | "asterisk" | "asterix" => t("*", false, true),
         "pipe" => t("|", false, false),
-        "underscore" => t("_", true, true),
+        "underscore" | "under score" => t("_", true, true),
         "quote" | "double quote" => t("\"", false, false),
         "single quote" | "tick" => t("'", false, false),
         "backtick" => t("`", false, false),
@@ -332,7 +346,18 @@ pub fn spoken_code_with(text: &str, mode: Mode, syms: Option<&SymbolTable>) -> S
         return text.trim().to_string();
     }
     let stripped = strip_punct(text);
-    let words: Vec<&str> = stripped.split_whitespace().collect();
+    let words: Vec<&str> = strip_fillers(&stripped.split_whitespace().collect::<Vec<_>>());
+    // Whisper capitalizes the first word of every utterance, so a code
+    // line dictated as its own burst arrives as "Let raw equals...".
+    // Only KEYWORDS are lowered, not any capitalized leading word: a
+    // line starting with a type name the buffer has not seen yet
+    // ("Config open brace") is a real case, and guessing there would
+    // corrupt a name the speaker deliberately capitalized.
+    let leading = words.first().map(|w| lower_if_keyword(w));
+    let words: Vec<&str> = match &leading {
+        Some(Some(k)) => std::iter::once(*k).chain(words.iter().skip(1).copied()).collect(),
+        _ => words,
+    };
     let mut toks: Vec<Tok> = Vec::new();
     let mut i = 0;
     while i < words.len() {
@@ -433,6 +458,62 @@ pub fn spoken_code_with(text: &str, mode: Mode, syms: Option<&SymbolTable>) -> S
         }
     }
     join(&toks)
+}
+
+/// Keywords across the languages this transform targets. Only used to
+/// undo whisper's utterance-initial capital.
+const LEADING_KEYWORDS: &[&str] = &[
+    "let", "fn", "pub", "use", "mod", "impl", "struct", "enum", "trait", "type", "const",
+    "static", "match", "if", "else", "for", "while", "loop", "return", "break", "continue",
+    "unsafe", "async", "await", "move", "where", "def", "class", "import", "from", "var",
+    "function", "public", "private", "void", "new", "try", "catch", "throw", "print", "with",
+    "elif", "lambda", "yield", "assert", "delete", "export", "interface", "package",
+];
+
+fn lower_if_keyword(w: &str) -> Option<&'static str> {
+    let mut cs = w.chars();
+    let f = cs.next()?;
+    if !f.is_uppercase() || cs.any(|c| c.is_uppercase()) {
+        return None;
+    }
+    let lw = w.to_lowercase();
+    LEADING_KEYWORDS.iter().find(|k| **k == lw).copied()
+}
+
+/// Disfluencies whisper transcribes literally. Removed in Code mode
+/// only.
+///
+/// Prose keeps them on purpose: "um" in dictated dialogue or an
+/// interview transcript is content, and silently deleting words from
+/// someone's prose is a worse failure than leaving one in. In code it
+/// is never content.
+///
+/// Deliberately short. "like", "so", "right", "well" and "I mean" are
+/// all real disfluencies and all real words; stripping them would break
+/// more than it fixes.
+const FILLERS: &[&str] = &["um", "uh", "erm", "uhm", "ahem", "mhm", "hmm"];
+const FILLER_PAIRS: &[[&str; 2]] = &[["you", "know"], ["sort", "of"], ["kind", "of"]];
+
+fn strip_fillers<'a>(words: &[&'a str]) -> Vec<&'a str> {
+    let mut out: Vec<&str> = Vec::with_capacity(words.len());
+    let mut i = 0;
+    while i < words.len() {
+        let lw = words[i].to_lowercase();
+        if i + 1 < words.len() {
+            let lw2 = words[i + 1].to_lowercase();
+            if FILLER_PAIRS.iter().any(|p| p[0] == lw && p[1] == lw2) {
+                i += 2;
+                continue;
+            }
+        }
+        if FILLERS.contains(&lw.as_str()) {
+            i += 1;
+            continue;
+        }
+        out.push(words[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Spoken forms of the Rust primitive numeric types.
@@ -1356,6 +1437,52 @@ mod tests {
         b.apply(&[Edit::IndentDelta(-1)]);
         // only spaces are eaten; the é is untouched
         assert_eq!(b.text, "  é");
+    }
+
+    #[test]
+    fn code_mode_drops_disfluencies() {
+        assert_eq!(spoken_code("um let x equals five", Mode::Code), "let x = 5");
+        assert_eq!(spoken_code("let x equals uh five", Mode::Code), "let x = 5");
+        assert_eq!(spoken_code("let x you know equals five", Mode::Code), "let x = 5");
+    }
+
+    #[test]
+    fn prose_keeps_disfluencies() {
+        // deleting words from someone's prose is worse than leaving one in
+        assert_eq!(spoken_code("Um, we tried three.", Mode::Prose), "Um, we tried three.");
+    }
+
+    #[test]
+    fn whisper_homophones_resolve_to_their_symbols() {
+        // measured against degraded transcripts, not invented
+        assert_eq!(spoken_code("foo open parent a coma b close parent", Mode::Code), "foo(a, b)");
+        assert_eq!(spoken_code("raw dote as str", Mode::Code), "raw.as str");
+        assert_eq!(spoken_code("let x equal five semi colon", Mode::Code), "let x = 5;");
+        assert_eq!(spoken_code("if x open braise", Mode::Code), "if x {");
+        assert_eq!(spoken_code("let x column i thirty two", Mode::Code), "let x: i32");
+        assert_eq!(spoken_code("std double column fs", Mode::Code), "std::fs");
+    }
+
+    #[test]
+    fn a_dropped_word_is_left_visibly_wrong() {
+        // "foo paren a close paren" is missing "open". Guessing at it
+        // would mean guessing at every bare noun; a visible artifact the
+        // speaker can repair is the better failure.
+        assert_eq!(spoken_code("foo paren a close paren", Mode::Code), "foo paren a)");
+    }
+
+    #[test]
+    fn a_leading_keyword_loses_whispers_capital() {
+        assert_eq!(spoken_code("Let x equals five", Mode::Code), "let x = 5");
+        assert_eq!(spoken_code("Match state open brace", Mode::Code), "match state {");
+        assert_eq!(spoken_code("Return none", Mode::Code), "return none");
+    }
+
+    #[test]
+    fn a_leading_type_name_keeps_its_capital() {
+        // the case that stops this from being a general lowercase rule
+        assert_eq!(spoken_code("Config open brace", Mode::Code), "Config {");
+        assert_eq!(spoken_code("UserStore new", Mode::Code), "UserStore new");
     }
 
     #[test]

@@ -440,6 +440,61 @@ mod tests {
         );
     }
 
+    /// The same fixtures, degraded the way whisper actually degrades
+    /// them. This is the robustness half of the measurement: the clean
+    /// fixtures say the transform is right, these say whether it
+    /// survives contact with a real recognizer.
+    ///
+    /// Corruptions are one-at-a-time and drawn from observed whisper
+    /// behaviour, not invented: disfluencies transcribed literally,
+    /// homophone substitutions for symbol words, split compounds, and
+    /// the sentence capital whisper puts on every utterance.
+    ///
+    /// Two cases here are expected to stay BROKEN, and are asserted as
+    /// broken. A dropped word and a duplicated word cannot be repaired
+    /// without guessing at every bare noun in the stream, and a visible
+    /// artifact the speaker fixes with one phrase beats a silent wrong
+    /// guess.
+    #[test]
+    fn degraded_transcripts_mostly_recover() {
+        let buf = "fn read_to_string(p:&Path)->Result<String>{}\n";
+        let go = |say: &str| {
+            let mut e = Engine::new(buf, buf.len(), Mode::Code, Policy::default(), 40, 3);
+            e.capture_start(0);
+            e.recognize(Tier::Whisper, say, 1.0, 300);
+            e.text()[buf.len()..].to_string()
+        };
+
+        // recovered
+        for (name, say, want) in [
+            ("leading filler", "um let x equals five semicolon", "let x = 5;"),
+            ("mid filler", "let x equals uh five semicolon", "let x = 5;"),
+            ("filler pair", "let x you know equals five semicolon", "let x = 5;"),
+            ("colon as column", "let x column i thirty two equals five semicolon", "let x: i32 = 5;"),
+            ("comma as coma", "foo open paren a coma b close paren", "foo(a, b)"),
+            ("paren as parent", "foo open parent a close parent", "foo(a)"),
+            ("brace as braise", "if x open braise", "if x {"),
+            ("split semicolon", "let x equals five semi colon", "let x = 5;"),
+            ("equals as equal", "let x equal five semicolon", "let x = 5;"),
+            ("sentence capital", "Let x equals five semicolon", "let x = 5;"),
+            ("trailing period", "let x equals five semicolon.", "let x = 5;"),
+        ] {
+            assert_eq!(go(say), want, "{name}");
+        }
+
+        // deliberately NOT recovered
+        assert_eq!(
+            go("foo paren a close paren"),
+            "foo paren a)",
+            "a dropped word must stay visibly wrong rather than be guessed at"
+        );
+        assert_eq!(
+            go("let let x equals five semicolon"),
+            "let let x = 5;",
+            "a duplicated word is the speaker's to fix"
+        );
+    }
+
     #[test]
     fn random_utterance_streams_never_corrupt_the_buffer() {
         // The engine does byte-index arithmetic throughout — insert_str,
