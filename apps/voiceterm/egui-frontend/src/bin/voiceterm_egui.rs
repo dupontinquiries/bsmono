@@ -3839,46 +3839,26 @@ impl eframe::App for VoicetermApp {
             // the pane the border says is focused. One grid still serves
             // whichever pane holds focus; a per-pane grid (session follows
             // its pane) stays on-device work, recorded in C11_TODO.
-            ui.scope_builder(
-                egui::UiBuilder::new().max_rect(term_rect.shrink(8.0)),
-                |ui| {
-            if self.session.grid.is_dirty() || self.session.grid.cursor() != (0, 0) {
-                let (cx, cy) = self.session.grid.cursor();
-                // The grid reports WHICH rows changed; RowCache turns that into
-                // the minimal set to re-shape. take_dirty rather than
-                // dirty_rows, so the range is consumed once — reading it
-                // without clearing would mark the same rows every frame and
-                // the cache would never hit.
-                if let Some((lo, hi)) = self.session.grid.take_dirty() {
-                    self.session.row_dirty.mark_range(lo, hi);
-                }
-                let width = ui.available_width(); // the child ui below term_rect's border
-                // frame_plan flushes the dirty set and INVALIDATES those
-                // slots, returning which rows need rebuilding. The return value
-                // is not iterated here — get_or_build below does the work,
-                // building exactly the invalidated rows and reusing the rest.
-                // Calling it for its effect is the point.
-                let _plan = voiceterm_egui::row_render::frame_plan(
-                    &mut self.session.row_dirty, &mut self.session.row_galleys, width);
-                egui::Frame::NONE.show(ui, |ui| {
-                    for y in 0..24 {
-                        // A hit returns the cached string; a miss shapes it
-                        // once. row_text is the expensive part on a wide grid,
-                        // and the closure means an unchanged row never calls it.
-                        let Some(row) = self.session.row_galleys
-                            .get_or_build(y, || self.session.grid.row_text(y)) else { continue };
-                        if row.trim().is_empty() && y > cy { continue; }
-                        // The cursor row is marked rather than drawn as a
-                        // block: this is a monospace label, not a canvas, and a
-                        // fake caret that sits in the wrong column is worse
-                        // than none.
-                        let txt = if y == cy { format!("{row}  <{cx}") } else { row };
-                        ui.label(egui::RichText::new(txt).monospace().small());
-                    }
-                });
-            }
-            })
-            ;
+            // THE SECOND RENDER OF THE TERMINAL, REMOVED.
+            //
+            // A ~40-line block here re-drew the whole grid from
+            // `session.grid` through its own row cache and galley cache.
+            // Its comment said it painted "after the focused app" so the
+            // live session would land in the pane the border marks as
+            // focused — but `self.app.render_at` sits ~150 lines further
+            // down and paints last, so every one of those rows was
+            // shaped, laid out, painted and then covered.
+            //
+            // That inverted ordering IS the original "text does not
+            // appear in the terminal" bug: the shell's output went to
+            // session.grid, this block drew it, and render_at painted
+            // app.terminal's grid on top. Making feed_pty mirror into
+            // app.terminal fixed the symptom; this removes the wasted
+            // half.
+            //
+            // Per frame, on a phone, that is a full grid of text layout
+            // for pixels nobody sees. Verified by screenshot before and
+            // after: identical.
             if let Some(p) = self.app.take_long_press() {
                 self.pane_menu.open_at(ui, p, &pane_menu());
             }
