@@ -69,11 +69,17 @@ crossfade are stage 6.1.
 
 ## What is missing
 
-**Stage duration is uniform.** The fold parameter maps linearly across
-the whole strip, so every stage takes the same share of the transform.
-Stage 5 wants to be slow and showy; stage 3 wants to be fast. This needs
-a per-segment duration curve — small, and the natural place to attach the
-energy budget below.
+**~~Stage duration is uniform.~~ DONE.** `xform::stage_time` remaps the
+fold parameter so each segment gets its own share, set by
+`Morph::stage_weights`. `None` is uniform and reproduces the previous
+mapping exactly, so no existing chassis changes. Degenerate weights fall
+back to uniform rather than distorting the fold: a transform that runs
+evenly is a tuning mistake someone notices, one that jumps or stalls
+looks like a crash. Seven tests, including monotonicity — a fold that
+goes backwards mid-transform reads as a glitch.
+
+Nothing sets the weights yet. That is the energy budget below, and it is
+now a matter of choosing numbers rather than writing machinery.
 
 **Rotation during a segment travels a chord.** The blend is per-vertex
 linear, so a piece that rotates as it moves cuts across the arc instead
@@ -107,8 +113,7 @@ choice its shape, and it can be built before any shard physics exists.
 
 ## Suggested order
 
-1. **Per-segment durations.** Small, unblocks the energy budget, needs no
-   art.
+1. ~~Per-segment durations.~~ Done — .
 2. **A seven-pose test chassis** authoring the six stages, to find what
    the strip cannot express before building anything for it.
 3. **Watch stage 4.3 with `fold_audit --worst`.** Rotation is where the

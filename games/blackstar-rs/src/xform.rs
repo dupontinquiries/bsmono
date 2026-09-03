@@ -222,7 +222,54 @@ impl Xform {
 /// one source mesh through one colour merge, so the shapes match prim for
 /// prim and vertex for vertex — `check()` refuses to build a morph that does
 /// not, because a mismatched strip would blend garbage rather than fail.
+/// Remap a global fold parameter so each strip segment gets its own share
+/// of the timeline.
+///
+/// `Morph::sample` maps `t` linearly onto the strip, so with five poses
+/// every one of the four segments takes a quarter of the transform
+/// whatever it contains. A staged transform does not want that: the
+/// stage where the innards fuse should be slow and legible, and getting
+/// the skeleton into position should be quick. See
+/// `docs/STAGED_TRANSFORM.md`.
+///
+/// `weights` is one duration per SEGMENT (one fewer than the pose count).
+/// Only the ratios matter. Returns a position along the strip in `[0, 1]`
+/// which `sample` then scales by `n - 1` as before, so uniform weights
+/// reproduce the old behaviour exactly.
+///
+/// Degenerate input falls back to uniform rather than distorting the
+/// fold: no weights, a single weight, anything non-finite, anything
+/// negative, or a total of zero. A transform that runs evenly is a tuning
+/// mistake someone will notice; one that jumps or stalls looks like a
+/// crash. (See docs/NON_FINITE_INPUTS.md for why this is spelled out.)
+pub fn stage_time(t: f32, weights: Option<&[f32]>) -> f32 {
+    let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 };
+    let Some(w) = weights else { return t };
+    if w.len() < 2 || w.iter().any(|v| !v.is_finite() || *v < 0.0) {
+        return t;
+    }
+    let total: f32 = w.iter().sum();
+    if total <= 1e-6 {
+        return t;
+    }
+    // Walk the segments, spending `t` against each one's share.
+    let n = w.len() as f32;
+    let mut acc = 0.0f32;
+    for (i, seg) in w.iter().enumerate() {
+        let share = seg / total;
+        if t <= acc + share || i == w.len() - 1 {
+            // A zero-width segment is stepped over rather than divided by.
+            let f = if share > 1e-9 { ((t - acc) / share).clamp(0.0, 1.0) } else { 1.0 };
+            return ((i as f32 + f) / n).clamp(0.0, 1.0);
+        }
+        acc += share;
+    }
+    t
+}
+
 pub struct Morph {
+    /// Per-segment durations; `None` is uniform. See `stage_time`.
+    pub stage_weights: Option<Vec<f32>>,
     poses: Vec<Vec<Vec<Vertex>>>,
     idx: Vec<Vec<u32>>,
     /// scratch, reused every frame so a 60 Hz morph does not allocate
@@ -264,7 +311,7 @@ impl Morph {
                 sum / prim.len() as f32
             })
             .collect();
-        Some(Morph { poses, idx, scratch: Vec::new(), compaction: None, centres })
+        Some(Morph { stage_weights: None, poses, idx, scratch: Vec::new(), compaction: None, centres })
     }
 
     pub fn prims(&self) -> usize {
@@ -277,6 +324,7 @@ impl Morph {
     /// side. Normals are blended too and renormalised — skipping that is
     /// what makes a cheap morph look like shrink-wrap partway through.
     pub fn sample(&mut self, p: usize, t: f32) -> MeshData {
+        let t = stage_time(t, self.stage_weights.as_deref());
         let n = self.poses.len();
         let x = (t.clamp(0.0, 1.0) * (n - 1) as f32).min((n - 1) as f32 - 1e-5);
         let k = x.floor() as usize;
@@ -421,6 +469,93 @@ pub fn redistribute_length_to_height(actual: Vec3, veh_len: f32, bot_len: f32, t
 
 #[cfg(test)]
 mod endpoint_tests {
+
+    /// Per-segment durations. `Morph::sample` maps `t` linearly onto the
+    /// strip, so every segment takes an equal share whatever it contains;
+    /// a staged transform wants the fusion stage slow and the posing
+    /// stages quick. See docs/STAGED_TRANSFORM.md.
+    #[test]
+    fn uniform_weights_reproduce_the_old_mapping() {
+        // The whole point of the fallback: an existing chassis with no
+        // weights must fold exactly as it did.
+        for t in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            assert!((stage_time(t, None) - t).abs() < 1e-6);
+            assert!((stage_time(t, Some(&[1.0, 1.0, 1.0, 1.0])) - t).abs() < 1e-5, "t={t}");
+        }
+    }
+
+    #[test]
+    fn a_heavier_segment_takes_more_of_the_timeline() {
+        // Two segments, the second three times as long. At the halfway
+        // point of the transform we should still be inside the FIRST
+        // segment's share only if that share exceeds half — here it is a
+        // quarter, so t=0.5 is well into segment two.
+        let w = [1.0f32, 3.0];
+        // segment one owns t in [0, 0.25] and maps onto strip [0, 0.5]
+        assert!((stage_time(0.25, Some(&w)) - 0.5).abs() < 1e-5);
+        // half the transform is a third of the way through segment two
+        let mid = stage_time(0.5, Some(&w));
+        assert!(mid > 0.5 && mid < 0.75, "got {mid}");
+    }
+
+    #[test]
+    fn the_endpoints_are_still_the_endpoints() {
+        for w in [vec![1.0f32, 3.0], vec![5.0, 1.0, 2.0], vec![0.1, 0.1, 9.0]] {
+            assert!((stage_time(0.0, Some(&w)) - 0.0).abs() < 1e-6, "{w:?}");
+            assert!((stage_time(1.0, Some(&w)) - 1.0).abs() < 1e-6, "{w:?}");
+        }
+    }
+
+    #[test]
+    fn the_mapping_is_monotonic() {
+        // A fold that goes backwards mid-transform reads as a glitch.
+        let w = [2.0f32, 1.0, 4.0, 1.0];
+        let mut prev = -1.0;
+        for i in 0..=200 {
+            let v = stage_time(i as f32 / 200.0, Some(&w));
+            assert!(v >= prev - 1e-6, "went backwards at {i}: {prev} -> {v}");
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn degenerate_weights_fall_back_to_uniform() {
+        // A transform that runs evenly is a tuning mistake someone
+        // notices; one that jumps or stalls looks like a crash.
+        for bad in [
+            vec![],
+            vec![1.0f32],
+            vec![0.0, 0.0],
+            vec![1.0, f32::NAN],
+            vec![1.0, -2.0],
+            vec![f32::INFINITY, 1.0],
+        ] {
+            for t in [0.0f32, 0.3, 0.7, 1.0] {
+                let v = stage_time(t, Some(&bad));
+                assert!(v.is_finite(), "{bad:?} at {t} gave {v}");
+                assert!((v - t).abs() < 1e-5, "{bad:?} at {t} gave {v}, expected uniform");
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_width_segment_is_stepped_over_not_divided_by() {
+        let w = [1.0f32, 0.0, 1.0];
+        let mut prev = -1.0;
+        for i in 0..=100 {
+            let v = stage_time(i as f32 / 100.0, Some(&w));
+            assert!(v.is_finite() && v >= prev - 1e-6);
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn a_non_finite_fold_parameter_does_not_escape() {
+        for t in [f32::NAN, f32::INFINITY, -5.0, 9.0] {
+            let v = stage_time(t, Some(&[1.0, 2.0]));
+            assert!((0.0..=1.0).contains(&v), "t={t} gave {v}");
+        }
+    }
 
     #[test]
     fn non_finite_inputs_leave_the_box_alone() {
