@@ -166,6 +166,10 @@ mod dictate;
 // spellings in the open file, and derives the dictation-scoped whisper
 // initial_prompt. Pure.
 mod code_symbols;
+// Per-utterance routing for a dictation session: which recognizer is
+// allowed to act on what, plus the shadow record that decides when the
+// acoustic fast path can be trusted. Pure.
+mod dictation_session;
 // v0.1.609: motion-rollback position-history core (TODO_motion_rollback
 // option 1, the testable piece). Status-line parsing stays build-gated.
 mod motion_history;
