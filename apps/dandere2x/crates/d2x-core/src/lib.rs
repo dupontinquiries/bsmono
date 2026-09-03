@@ -28,6 +28,7 @@ pub mod net;
 pub mod pipeline;
 pub mod plan;
 pub mod predict;
+pub mod quality;
 pub mod registry;
 pub mod residual;
 pub mod st;

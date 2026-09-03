@@ -10,7 +10,7 @@
 mod app;
 
 use clap::{Parser, Subcommand};
-use d2x_core::pipeline::{Event, MatcherKind};
+use d2x_core::pipeline::{Event, FrameSource, MatcherKind};
 use d2x_job::job::{self, Backend, Job};
 use std::path::PathBuf;
 
@@ -152,6 +152,23 @@ enum Cmd {
         /// rt2f (default) | rt2h | rt2c8h | rt2c8 | rt2 | rt1 | rt4 | wino
         #[arg(long, default_value = "rt2f")]
         kernel: String,
+    },
+    /// Compare two renders of the same clip: PSNR and SSIM per frame, plus the
+    /// worst frame. This is the other half of every speed number — run the
+    /// slow settings once as a reference, then price a fast setting against it.
+    Compare {
+        /// Reference render (the slow settings).
+        #[arg(short, long)]
+        reference: PathBuf,
+        /// Render under test.
+        #[arg(short, long)]
+        test: PathBuf,
+        /// Stop after N frames (0 = all).
+        #[arg(long, default_value_t = 0)]
+        frames: u64,
+        /// Print a line per frame, not just the summary.
+        #[arg(long)]
+        per_frame: bool,
     },
     /// List GPU adapters.
     Probe,
@@ -374,6 +391,42 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
             }
+        }
+        Cmd::Compare { reference, test, frames, per_frame } => {
+            let (pa, pb) = (d2x_job::ffmpeg::probe(&reference)?, d2x_job::ffmpeg::probe(&test)?);
+            anyhow::ensure!(
+                (pa.info.width, pa.info.height) == (pb.info.width, pb.info.height),
+                "different sizes: {}x{} vs {}x{} — compare renders of the same clip at the same scale",
+                pa.info.width,
+                pa.info.height,
+                pb.info.width,
+                pb.info.height
+            );
+            let mut a = d2x_job::ffmpeg::FfmpegSource::open(&reference, &pa)?;
+            let mut b = d2x_job::ffmpeg::FfmpegSource::open(&test, &pb)?;
+            let mut rep = d2x_core::quality::QualityReport::new();
+            let mut i = 0u64;
+            loop {
+                if frames > 0 && i >= frames {
+                    break;
+                }
+                let (fa, fb) = (a.next_frame()?, b.next_frame()?);
+                let (fa, fb) = match (fa, fb) {
+                    (Some(x), Some(y)) => (x, y),
+                    (None, None) => break,
+                    // A length mismatch is worth failing on: comparing a
+                    // truncated render against a full one would report a
+                    // flattering number for the frames that exist.
+                    (x, y) => anyhow::bail!("clips differ in length: reference {} test {} after {i} frames", if x.is_some() { "has more" } else { "ended" }, if y.is_some() { "has more" } else { "ended" }),
+                };
+                rep.push(i, &fa, &fb);
+                if per_frame {
+                    let p = fa.psnr(&fb);
+                    println!("frame {i:6}  psnr {:7.2} dB  ssim {:.4}", p, d2x_core::quality::ssim(&fa, &fb));
+                }
+                i += 1;
+            }
+            println!("{rep}");
         }
         Cmd::Probe => {
             #[cfg(feature = "gpu")]

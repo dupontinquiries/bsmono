@@ -101,6 +101,26 @@ Before frame 0 a long input costs a probe, a keyframe scan (packet headers
 only, cached in `<input>.<ext>.d2xkf`), the model load, GPU init and one
 full-frame upscale; each is reported as a stage so the shell is never silent.
 
+## Pricing a speed setting
+
+Every throughput number here is a trade, so `compare` reports the other side
+of it. Render once with slow settings as a reference, once with the fast ones,
+then:
+
+```
+dandere2x compare -r ref.mkv -t fast.mkv
+18 frames (0 identical): PSNR mean 43.96 dB, min 40.01 dB @ frame 17;
+SSIM mean 0.9904, min 0.9812 @ frame 17 — very close
+```
+
+That run cost 6x less network work (54.5% of pixels down to 8.9%) for 44 dB /
+0.990 SSIM. Both metrics are reported because they disagree usefully — a flat
+brightness shift wrecks PSNR while SSIM barely moves — and both the mean and
+the **minimum with its frame index** are shown, because a mean hides the one
+frame an eye catches. `--per-frame` prints every frame; `--frames N` bounds a
+trial. A length mismatch is an error rather than a partial comparison, since a
+truncated render would otherwise score well on the frames that exist.
+
 ## Numbers and where the time goes
 
 - The engine is 8-bit RGB. 10-bit sources are dithered to 8 on decode; the
