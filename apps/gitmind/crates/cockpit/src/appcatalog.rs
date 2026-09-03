@@ -47,6 +47,15 @@ pub struct ManifestEntry {
     /// right way round once a port has taken over: the thing you get by default
     /// should be the thing the project actually ships.
     pub primary: bool,
+    /// `daemon = true` — this project ships one or more background services.
+    ///
+    /// Read so `daemons.rs` can stop keeping a SECOND, hand-maintained list of
+    /// which projects have services. It had five entries and knew about none
+    /// of the three real ones (`snapclone-bus`, `camera-bridge`,
+    /// `photosync-daemon`), because nothing kept the two in step — see
+    /// C14_TODO §17. The manifest already marks them and is the file people
+    /// actually edit when they add a project.
+    pub daemon: bool,
     /// `role` from the manifest: "app", "lib", "daemon"...
     ///
     /// The catalogue ignored this, which meant an entry like `settings-egui` —
@@ -84,12 +93,12 @@ impl ManifestEntry {
 /// doesn't need one. Pure — no filesystem access; the caller reads the file.
 pub fn parse_manifest(text: &str) -> Vec<ManifestEntry> {
     let mut out = Vec::new();
-    // (app_id, path, notes, primary, role)
-    let mut cur: Option<(String, String, String, bool, String)> = None;
-    let flush = |cur: &mut Option<(String, String, String, bool, String)>, out: &mut Vec<ManifestEntry>| {
-        if let Some((id, path, notes, primary, role)) = cur.take() {
+    // (app_id, path, notes, primary, role, daemon)
+    let mut cur: Option<(String, String, String, bool, String, bool)> = None;
+    let flush = |cur: &mut Option<(String, String, String, bool, String, bool)>, out: &mut Vec<ManifestEntry>| {
+        if let Some((id, path, notes, primary, role, daemon)) = cur.take() {
             if !path.is_empty() {
-                out.push(ManifestEntry { app_id: id, path, notes, primary, role });
+                out.push(ManifestEntry { app_id: id, path, notes, primary, role, daemon });
             }
         }
     };
@@ -101,12 +110,12 @@ pub fn parse_manifest(text: &str) -> Vec<ManifestEntry> {
             // no dot (`[targets]`, say) is not a project and starts nothing.
             if let Some((section, id)) = inner.split_once('.') {
                 if !section.is_empty() && !id.is_empty() && !id.contains('.') {
-                    cur = Some((id.to_string(), String::new(), String::new(), false, String::new()));
+                    cur = Some((id.to_string(), String::new(), String::new(), false, String::new(), false));
                 }
             }
             continue;
         }
-        if let Some((_, path, notes, primary, role)) = cur.as_mut() {
+        if let Some((_, path, notes, primary, role, daemon)) = cur.as_mut() {
             if let Some(v) = toml_string_value(line, "path") { *path = v; }
             if let Some(v) = toml_string_value(line, "notes") { *notes = v; }
             if let Some(v) = toml_string_value(line, "role") { *role = v; }
@@ -115,6 +124,15 @@ pub fn parse_manifest(text: &str) -> Vec<ManifestEntry> {
                 let rest = rest.trim_start().strip_prefix('=').map(|r| r.trim_start());
                 if let Some(r) = rest {
                     *primary = r.starts_with("true");
+                }
+            }
+            // `daemon = true`, same bare-boolean shape. Every real entry has a
+            // trailing comment after it (`daemon = true  # bo-mux has a unit`),
+            // so `starts_with` rather than an equality test.
+            if let Some(rest) = line.strip_prefix("daemon") {
+                let rest = rest.trim_start().strip_prefix('=').map(|r| r.trim_start());
+                if let Some(r) = rest {
+                    *daemon = r.starts_with("true");
                 }
             }
         }
@@ -614,4 +632,38 @@ kind = "cargo"
         assert_eq!(c[1].description, "", "missing blurb tolerated");
         assert_eq!(c[2].name, "photosync");
     }
+    #[test]
+    fn the_real_daemon_projects_are_all_found_in_the_manifest() {
+        // Against the REAL manifest, not a fixture: the point is that this list
+        // and `daemons::all()` describe the same fleet, and a fixture would let
+        // them drift while the test stayed green.
+        let text = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../manifest/projects.toml"))
+            .expect("the fleet manifest");
+        let entries = parse_manifest(&text);
+        let daemons: Vec<&str> = entries.iter()
+            .filter(|e| e.daemon)
+            .map(|e| e.app_id.as_str())
+            .collect();
+
+        // A floor first: a parser that found nothing would satisfy every
+        // assertion below it.
+        assert!(daemons.len() >= 5, "only {} daemon entries: {daemons:?}", daemons.len());
+
+        // The three `daemons::all()` does not know about — the whole reason
+        // this field exists (C14_TODO §17).
+        for want in ["snapclone", "photosync"] {
+            assert!(daemons.contains(&want),
+                    "{want} is `daemon = true` in the manifest but not parsed as one");
+        }
+        // And the fabric services it DOES know, so the two lists can be
+        // compared rather than merged blind.
+        for want in ["voiced", "sharemd", "settingsd"] {
+            assert!(daemons.contains(&want), "{want} missing from the parsed daemons");
+        }
+        // Both directions: a project with no `daemon` key must not become one.
+        let non: Vec<&str> = entries.iter().filter(|e| !e.daemon).map(|e| e.app_id.as_str()).collect();
+        assert!(non.contains(&"aperture"), "a non-daemon project was marked as one");
+    }
+
 }
