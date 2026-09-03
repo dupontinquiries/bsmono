@@ -39,9 +39,60 @@ pub struct SceneUniforms {
     pub _pad2: f32,
 }
 
+/// How many world units of track the viewport shows, and where the car sits
+/// across it.
+///
+/// Both are shared with the shader rather than duplicated: the shader places
+/// the car at `CAR_SCREEN_X` and the CPU samples terrain so that the sample
+/// under that column is the ground the car is standing on. Two independent
+/// copies of either number puts the car above or below its own terrain.
+pub const VIEW_SPAN_WORLD: f32 = 34.0;
+pub const CAR_SCREEN_X: f32 = 0.32;
+/// Terrain samples uploaded per frame, packed 4-per-vec4 for uniform-array
+/// alignment (a `array<f32>` in uniform space would stride at 16 bytes and
+/// waste three quarters of the buffer).
+pub const TERRAIN_SAMPLES: usize = 64;
+
+/// The ground profile across the viewport, left edge to right edge.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct TerrainUniforms {
+    pub heights: [[f32; 4]; TERRAIN_SAMPLES / 4],
+}
+
+impl TerrainUniforms {
+    /// Sample `height_at` across the visible span.
+    ///
+    /// Off the ends of the track `height_at` returns None; those become the
+    /// nearest in-track height rather than 0.0, so the ground does not fall
+    /// off a cliff at the start line — the first version used 0.0 and drew a
+    /// step down at x=0 that looked like a rendering fault.
+    pub fn sample(track: &road_warrior_core::Track, car_pos_x: f32) -> Self {
+        let mut flat = [0.0f32; TERRAIN_SAMPLES];
+        let mut last_known = track.height_at(car_pos_x).unwrap_or(0.0);
+        for (i, slot) in flat.iter_mut().enumerate() {
+            let t = i as f32 / (TERRAIN_SAMPLES - 1) as f32;
+            let world_x = car_pos_x + (t - CAR_SCREEN_X) * VIEW_SPAN_WORLD;
+            match track.height_at(world_x) {
+                Some(h) => {
+                    last_known = h;
+                    *slot = h;
+                }
+                None => *slot = last_known,
+            }
+        }
+        let mut heights = [[0.0f32; 4]; TERRAIN_SAMPLES / 4];
+        for (i, chunk) in flat.chunks(4).enumerate() {
+            heights[i].copy_from_slice(chunk);
+        }
+        Self { heights }
+    }
+}
+
 pub struct SceneResources {
     pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
+    terrain_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
 }
 
@@ -59,27 +110,41 @@ impl SceneResources {
             mapped_at_creation: false,
         });
 
+        let terrain_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("scene-terrain"),
+            size: std::mem::size_of::<TerrainUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let uniform_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene-bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
+            entries: &[uniform_entry(0), uniform_entry(1)],
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scene-bg"),
             layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: terrain_buffer.as_entire_binding(),
+                },
+            ],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -111,12 +176,13 @@ impl SceneResources {
             multiview: None,
         });
 
-        Self { pipeline, uniform_buffer, bind_group }
+        Self { pipeline, uniform_buffer, terrain_buffer, bind_group }
     }
 }
 
 pub struct SceneCallback {
     pub uniforms: SceneUniforms,
+    pub terrain: TerrainUniforms,
 }
 
 impl egui_wgpu::CallbackTrait for SceneCallback {
@@ -132,6 +198,7 @@ impl egui_wgpu::CallbackTrait for SceneCallback {
             .get()
             .expect("SceneResources must be inserted into callback_resources at app init");
         queue.write_buffer(&resources.uniform_buffer, 0, bytemuck::bytes_of(&self.uniforms));
+        queue.write_buffer(&resources.terrain_buffer, 0, bytemuck::bytes_of(&self.terrain));
         Vec::new()
     }
 
@@ -145,5 +212,114 @@ impl egui_wgpu::CallbackTrait for SceneCallback {
         render_pass.set_pipeline(&resources.pipeline);
         render_pass.set_bind_group(0, &resources.bind_group, &[]);
         render_pass.draw(0..3, 0..1); // fullscreen triangle
+    }
+}
+
+#[cfg(test)]
+mod terrain_tests {
+    //! The sampling half of terrain rendering, tested without a GPU.
+    //!
+    //! The shader half needs a device and a screenshot; this half is
+    //! arithmetic and is where an off-by-a-span error would hide. Dust
+    //! Bowl's real shape — Flat 30, Ramp 8 rising to 5, Gap 10, Flat 40 —
+    //! is used deliberately rather than a synthetic track, so the numbers
+    //! mean something when they fail.
+
+    use super::*;
+    use road_warrior_core::{Segment, Track};
+
+    fn dust_bowl() -> Track {
+        Track::new(
+            "Dust Bowl",
+            vec![
+                Segment::Flat { length: 30.0, height: 0.0 },
+                Segment::Ramp { length: 8.0, from_height: 0.0, to_height: 5.0 },
+                Segment::Gap { length: 10.0 },
+                Segment::Flat { length: 40.0, height: 0.0 },
+            ],
+        )
+    }
+
+    fn flat(t: &TerrainUniforms) -> Vec<f32> {
+        t.heights.iter().flatten().copied().collect()
+    }
+
+    #[test]
+    fn the_sample_under_the_car_is_the_ground_the_car_stands_on() {
+        // This is the alignment that puts the wheels on the terrain rather
+        // than above or below it: the sample at CAR_SCREEN_X must be
+        // height_at(car_pos_x).
+        let track = dust_bowl();
+        for pos in [0.0f32, 12.0, 31.0, 33.0, 60.0] {
+            let s = flat(&TerrainUniforms::sample(&track, pos));
+            let idx = (CAR_SCREEN_X * (TERRAIN_SAMPLES - 1) as f32).round() as usize;
+            let want = track.height_at(pos).unwrap_or(0.0);
+            assert!(
+                (s[idx] - want).abs() < 0.2,
+                "at pos {pos}: sample {} vs height_at {want}",
+                s[idx]
+            );
+        }
+    }
+
+    #[test]
+    fn the_ramp_shows_up_before_the_car_reaches_it() {
+        // The whole point of drawing terrain: you can see what is coming.
+        // The ramp starts at x=30 and the view reaches
+        // (1 - CAR_SCREEN_X) * VIEW_SPAN_WORLD ahead of the car.
+        let track = dust_bowl();
+        let lead = (1.0 - CAR_SCREEN_X) * VIEW_SPAN_WORLD;
+        assert!(lead > 20.0, "the viewport should see well ahead; got {lead}");
+
+        let early = flat(&TerrainUniforms::sample(&track, 5.0));
+        assert!(
+            early.iter().all(|h| h.abs() < 0.01),
+            "at x=5 nothing but flat ground is in view yet"
+        );
+
+        let approaching = flat(&TerrainUniforms::sample(&track, 20.0));
+        let peak = approaching.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(peak > 1.0, "at x=20 the ramp should be visible ahead; peak {peak}");
+        assert!(
+            approaching[0] < approaching[TERRAIN_SAMPLES - 1],
+            "and it should rise toward the right, not the left"
+        );
+    }
+
+    #[test]
+    fn a_gap_holds_the_last_height_instead_of_dropping_to_zero() {
+        // height_at returns None over a Gap. Filling those with 0.0 drew a
+        // cliff down to the baseline in the middle of a jump, which reads
+        // as a rendering fault rather than as a hole.
+        let track = dust_bowl();
+        assert_eq!(track.height_at(42.0), None, "x=42 is inside the gap");
+        let s = flat(&TerrainUniforms::sample(&track, 42.0));
+        let idx = (CAR_SCREEN_X * (TERRAIN_SAMPLES - 1) as f32).round() as usize;
+        assert!(s[idx] > 1.0, "the gap should carry the ramp's height forward, got {}", s[idx]);
+    }
+
+    #[test]
+    fn before_the_start_line_does_not_fall_off_a_cliff() {
+        // Sampling starts CAR_SCREEN_X * span behind the car, which at x=0
+        // is off the front of the track where height_at is None.
+        let track = dust_bowl();
+        let s = flat(&TerrainUniforms::sample(&track, 0.0));
+        assert!(s.iter().all(|h| h.is_finite()), "no NaNs off the end of the track");
+        assert!(s[0].abs() < 0.01, "behind the start it should match the first flat segment");
+    }
+
+    #[test]
+    fn the_packing_matches_what_the_shader_indexes() {
+        // The shader reads heights[i / 4][i % 4]; if the CPU packed in a
+        // different order the terrain would come out shuffled into blocks
+        // of four.
+        let track = Track::new(
+            "Ascending",
+            vec![Segment::Ramp { length: 100.0, from_height: 0.0, to_height: 50.0 }],
+        );
+        let s = flat(&TerrainUniforms::sample(&track, 50.0));
+        for w in s.windows(2) {
+            assert!(w[1] >= w[0] - 1e-3, "a monotonic ramp must sample monotonically: {s:?}");
+        }
     }
 }

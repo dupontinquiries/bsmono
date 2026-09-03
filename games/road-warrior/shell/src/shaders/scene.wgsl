@@ -33,6 +33,32 @@ struct Uniforms {
 @group(0) @binding(0)
 var<uniform> u: Uniforms;
 
+// The ground profile across the viewport, left edge to right edge, sampled
+// CPU-side from `Track::height_at`. Packed 4-per-vec4 because a
+// `array<f32>` in uniform space strides at 16 bytes.
+//
+// Before this the ground was a flat line at a fixed `horizon`. The car
+// rotated on slopes and the physics launched it off ramps, but the terrain
+// those slopes belong to was never drawn — so the thing the game is about
+// was invisible, and a screenshot of a running session is what made that
+// obvious.
+struct Terrain {
+    heights: array<vec4<f32>, 16>,
+};
+@group(0) @binding(1)
+var<uniform> terrain: Terrain;
+
+/// Ground height in world units at a horizontal screen position.
+fn ground_height(x: f32) -> f32 {
+    let t = clamp(x, 0.0, 1.0) * 63.0;
+    let i0 = u32(floor(t));
+    let i1 = min(i0 + 1u, 63u);
+    let f = t - floor(t);
+    let h0 = terrain.heights[i0 / 4u][i0 % 4u];
+    let h1 = terrain.heights[i1 / 4u][i1 % 4u];
+    return mix(h0, h1, f);
+}
+
 struct VertexOut {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -94,16 +120,32 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // Y-up, same as OpenGL) — ground belongs in the low-uv.y branch, sky in
     // the high one. Confirmed by actually running this: the first version
     // had these swapped, putting sky at the bottom of the screen.
+    // The car's own resting line, and the vertical scale world units map
+    // through. Kept as one expression shared by the terrain and the car so
+    // the wheels sit ON the ground they are driving over: the car is placed
+    // at `horizon - 0.05 + car_y * 0.02` below, and the ground under it is
+    // the same formula with the terrain height in place of car_y.
+    let base_line = 0.62 - 0.05;
+    let v_scale = 0.02;
+    // Surface at this column, and at the car's column for the sky split.
+    let surface = base_line + ground_height(uv.x) * v_scale;
     let horizon = 0.62;
     var color: vec3<f32>;
-    if (uv.y < horizon) {
-        let ground_t = uv.y / horizon;
+    if (uv.y < surface) {
+        let ground_t = uv.y / max(surface, 0.001);
         let dirt_noise = noise(uv * vec2<f32>(40.0 * aspect, 40.0) + vec2<f32>(u.car_x * 2.0, 0.0));
         let base = mix(vec3<f32>(0.20, 0.15, 0.11), vec3<f32>(0.36, 0.28, 0.20), ground_t);
         color = base + vec3<f32>(dirt_noise * 0.06);
     } else {
-        let sky_t = (uv.y - horizon) / (1.0 - horizon);
+        // Sky gradient still keys off the FIXED horizon, not the surface:
+        // gradients that follow the terrain make the sky appear to slide up
+        // and down as you drive, which reads as the camera lurching.
+        let sky_t = clamp((uv.y - horizon) / (1.0 - horizon), 0.0, 1.0);
         color = mix(vec3<f32>(0.82, 0.80, 0.74), vec3<f32>(0.55, 0.62, 0.68), sky_t);
+        // A darker lip right at the surface so a ridge against the sky has
+        // an edge instead of fading into it.
+        let edge = smoothstep(0.012, 0.0, uv.y - surface);
+        color = mix(color, vec3<f32>(0.16, 0.12, 0.09), edge);
     }
 
     // --- car: body + cabin + wheels, shaped/colored per car kind ---
