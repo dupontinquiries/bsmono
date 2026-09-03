@@ -195,6 +195,11 @@ pub struct BinaryOpts {
     pub plain_sides: bool,
     /// Grass tuft style override; `None` = `TuftStyle::from_env()`.
     pub tuft_style: Option<mesher::TuftStyle>,
+    /// A/B only: recompute the face brightness inside every `emit_quad`
+    /// (four trig calls per quad) instead of hoisting the six values once
+    /// per chunk. Output-identical; exists so `light_hoist_ab` can
+    /// measure both in one process.
+    pub legacy_per_quad_light: bool,
 }
 
 impl BinaryOpts {
@@ -202,7 +207,7 @@ impl BinaryOpts {
         static V: std::sync::OnceLock<BinaryOpts> = std::sync::OnceLock::new();
         *V.get_or_init(|| {
             let on = |k: &str| std::env::var(k).map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
-            let o = BinaryOpts { plain_tops: on("UNENDLICH_MESHER_PLAIN_TOPS"), plain_sides: on("UNENDLICH_MESHER_PLAIN_SIDES"), tuft_style: None };
+            let o = BinaryOpts { plain_tops: on("UNENDLICH_MESHER_PLAIN_TOPS"), plain_sides: on("UNENDLICH_MESHER_PLAIN_SIDES"), tuft_style: None, legacy_per_quad_light: false };
             if o.plain_tops || o.plain_sides {
                 log::info!("binary mesher: plain_tops={} plain_sides={} (special emitters bypassed)", o.plain_tops, o.plain_sides);
             }
@@ -255,6 +260,9 @@ pub fn mesh_chunk_binary_opts(
         let trans_blockers: Vec<BitChunk> = sets.transparent.iter()
             .map(|(_, set)| sets.opaque.union(set)).collect();
 
+        // Four trig calls each (Sky::sun_direction + directional_intensity),
+        // constant per direction for the whole chunk.
+        let lights = mesher::face_lights(sky);
         let mut quads: Vec<Quad> = Vec::with_capacity(2048);
         for face_dir in [Face::PosY, Face::NegY, Face::PosX, Face::NegX, Face::PosZ, Face::NegZ] {
             let nb = neighbour_for(neighbors, face_dir);
@@ -334,7 +342,8 @@ pub fn mesh_chunk_binary_opts(
                 } else {
                     (q.u as usize, q.v as usize, q.w as usize, q.h as usize)
                 };
-                mesher::emit_quad(&mut mesh, cfg, q.slice as i32, u, v, w, h, b, origin, sky, Some(chunk), world_model);
+                let lit = if opts.legacy_per_quad_light { None } else { Some(lights[cfg.face]) };
+                mesher::emit_quad_lit(&mut mesh, cfg, q.slice as i32, u, v, w, h, b, origin, sky, Some(chunk), world_model, lit);
                 stats.plain_quads += 1;
             }
         }
@@ -526,12 +535,12 @@ mod tests {
             let mut bv = 0; let mut st = BinaryMeshStats::default();
             for _ in 0..iters { let (m, s) = mesh_chunk_binary_with_stats(&c, &nb, None, None, None); bv = m.vertices.len(); st = s; }
             let b_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
-            let plain = BinaryOpts { plain_tops: true, plain_sides: true, tuft_style: None };
+            let plain = BinaryOpts { plain_tops: true, plain_sides: true, tuft_style: None, legacy_per_quad_light: false };
             let t = Instant::now();
             let mut pv = 0; let mut pst = BinaryMeshStats::default();
             for _ in 0..iters { let (m, s) = mesh_chunk_binary_opts(&c, &nb, None, None, None, plain); pv = m.vertices.len(); pst = s; }
             let p_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
-            let lean = BinaryOpts { plain_tops: true, plain_sides: true, tuft_style: Some(mesher::TuftStyle::Cross) };
+            let lean = BinaryOpts { plain_tops: true, plain_sides: true, tuft_style: Some(mesher::TuftStyle::Cross), legacy_per_quad_light: false };
             let t = Instant::now();
             let mut lv = 0; let mut lst = BinaryMeshStats::default();
             for _ in 0..iters { let (m, s) = mesh_chunk_binary_opts(&c, &nb, None, None, None, lean); lv = m.vertices.len(); lst = s; }
@@ -550,7 +559,7 @@ mod tests {
             if y + 1 == h { BlockId::Grass } else if y < h { BlockId::Dirt } else { BlockId::Air }
         };
         let c = chunk_from(ChunkCoord::new(0, 0, 0), f);
-        let plain = BinaryOpts { plain_tops: true, plain_sides: true, tuft_style: None };
+        let plain = BinaryOpts { plain_tops: true, plain_sides: true, tuft_style: None, legacy_per_quad_light: false };
         let (m, st) = mesh_chunk_binary_opts(&c, &NeighborChunks::none(), None, None, None, plain);
         assert_eq!(st.special_faces, 0);
         // Every cube face is now a plain 4-vertex quad; everything else in
@@ -565,7 +574,7 @@ mod tests {
     fn cross_tufts_are_eight_vertices_and_double_sided() {
         let f = |_x: i32, y: i32, _z: i32| -> BlockId { if y < 5 { BlockId::Grass } else { BlockId::Air } };
         let c = chunk_from(ChunkCoord::new(0, 0, 0), f);
-        let base = BinaryOpts { plain_tops: true, plain_sides: true, tuft_style: Some(mesher::TuftStyle::None) };
+        let base = BinaryOpts { plain_tops: true, plain_sides: true, tuft_style: Some(mesher::TuftStyle::None), legacy_per_quad_light: false };
         let (m0, s0) = mesh_chunk_binary_opts(&c, &NeighborChunks::none(), None, None, None, base);
         assert_eq!(s0.decoration_vertices, 0);
         let cross = BinaryOpts { tuft_style: Some(mesher::TuftStyle::Cross), ..base };
@@ -654,6 +663,60 @@ mod tests {
             // And a second (hit) lookup returns the same value.
             assert_eq!(mesher::tint_for_position_cached(BlockId::Stone, x, y, z, &c), a);
         }
+    }
+
+    #[test]
+    fn hoisted_light_is_output_identical() {
+        let sky = crate::sky::Sky::default();
+        let c = chunk_from(ChunkCoord::new(0, 0, 0), |x, y, z| {
+            if ((x * 7 + y * 13 + z * 5) % 11) < 3 { BlockId::Air } else { BlockId::Stone } });
+        let hoisted = BinaryOpts::default();
+        let legacy = BinaryOpts { legacy_per_quad_light: true, ..BinaryOpts::default() };
+        for sky_opt in [None, Some(&sky)] {
+            let (a, _) = mesh_chunk_binary_opts(&c, &NeighborChunks::none(), sky_opt, None, None, hoisted);
+            let (b, _) = mesh_chunk_binary_opts(&c, &NeighborChunks::none(), sky_opt, None, None, legacy);
+            assert_eq!(a.vertices.len(), b.vertices.len());
+            assert_eq!(a.indices, b.indices);
+            for (va, vb) in a.vertices.iter().zip(b.vertices.iter()) {
+                assert_eq!(va.position, vb.position);
+                assert_eq!(va.color, vb.color, "hoisting the face light must not change a colour");
+            }
+        }
+    }
+
+    /// In-process A/B of hoisting the per-face brightness out of emit_quad.
+    #[test]
+    #[ignore]
+    fn light_hoist_ab() {
+        use std::time::Instant;
+        let sky = crate::sky::Sky::default();
+        let c = chunk_from(ChunkCoord::new(0, 0, 0), |x, y, z| {
+            if ((x * 7 + y * 13 + z * 5) % 11) < 3 { BlockId::Air } else { BlockId::Stone } });
+        let nb = NeighborChunks::none();
+        let hoisted = BinaryOpts::default();
+        let legacy = BinaryOpts { legacy_per_quad_light: true, ..BinaryOpts::default() };
+        let rounds = 12;
+        let (mut t_new, mut t_old) = (0.0f64, 0.0f64);
+        let mut quads = 0u32;
+        let run = |o: BinaryOpts| -> (f64, u32) {
+            let t = Instant::now();
+            let (_, s) = mesh_chunk_binary_opts(&c, &nb, Some(&sky), None, None, o);
+            (t.elapsed().as_secs_f64(), s.plain_quads)
+        };
+        for r in 0..rounds {
+            if r % 2 == 0 {
+                let (a, q) = run(hoisted); t_new += a; quads = q;
+                let (b, _) = run(legacy);  t_old += b;
+            } else {
+                let (b, _) = run(legacy);  t_old += b;
+                let (a, q) = run(hoisted); t_new += a; quads = q;
+            }
+        }
+        let per = |t: f64| t * 1e6 / rounds as f64;
+        println!("face-light hoist A/B ({} plain quads/chunk, {} rounds):\n  per-quad light: {:8.0} us   hoisted: {:8.0} us   ({:+.1}%, {:.1} ns/quad saved)",
+            quads, rounds, per(t_old), per(t_new),
+            (t_new / t_old - 1.0) * 100.0,
+            (t_old - t_new) * 1e9 / (rounds as f64 * quads as f64));
     }
 
     #[test]

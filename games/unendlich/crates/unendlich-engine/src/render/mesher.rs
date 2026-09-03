@@ -3461,6 +3461,25 @@ pub(crate) fn emit_jittered_top(
 }
 
 
+/// Brightness of a face direction. Four trig calls through
+/// `Sky::sun_direction` + `directional_intensity`; it depends only on
+/// `face` and the sky, so a mesher that emits many quads should compute
+/// the six values once and pass them (see `face_lights`).
+#[inline]
+pub(crate) fn face_light(face: usize, sky: Option<&crate::sky::Sky>) -> f32 {
+    match sky {
+        Some(sky) => sky.face_brightness(FACE_NORMALS[face]),
+        None => FACE_LIGHT[face],
+    }
+}
+
+/// The six face brightnesses, in `face::*` order.
+pub(crate) fn face_lights(sky: Option<&crate::sky::Sky>) -> [f32; 6] {
+    let mut l = [0.0f32; 6];
+    for (i, slot) in l.iter_mut().enumerate() { *slot = face_light(i, sky); }
+    l
+}
+
 pub(crate) fn emit_quad(
     mesh: &mut ChunkMesh,
     cfg: &AxisConfig,
@@ -3474,6 +3493,27 @@ pub(crate) fn emit_quad(
     sky: Option<&crate::sky::Sky>,
     chunk: Option<&Chunk>,
     world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>>,
+) {
+    emit_quad_lit(mesh, cfg, slice, u, v, w, h, block, origin, sky, chunk, world_model, None)
+}
+
+/// `emit_quad` with the face brightness already known. Identical output;
+/// saves four trig calls per quad (36 K quads on a cave chunk).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_quad_lit(
+    mesh: &mut ChunkMesh,
+    cfg: &AxisConfig,
+    slice: i32,
+    u: usize,
+    v: usize,
+    w: usize,
+    h: usize,
+    block: BlockId,
+    origin: [i32; 3],
+    sky: Option<&crate::sky::Sky>,
+    chunk: Option<&Chunk>,
+    world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>>,
+    precomputed_light: Option<f32>,
 ) {
     // For greedy-merged quads (w > 1 or h > 1) we use a single uniform
     // color for the whole quad — by definition merging requires uniform
@@ -3505,10 +3545,7 @@ pub(crate) fn emit_quad(
     // Pick brightness either from the sun (if a Sky was provided) or from
     // the static fallback table. The sky path computes per-face brightness
     // from outward-normal · sun_direction.
-    let light = match sky {
-        Some(sky) => sky.face_brightness(FACE_NORMALS[cfg.face]),
-        None => FACE_LIGHT[cfg.face],
-    };
+    let light = precomputed_light.unwrap_or_else(|| face_light(cfg.face, sky));
     let color = [
         (base_color[0] * light).clamp(0.0, 1.0),
         (base_color[1] * light).clamp(0.0, 1.0),
