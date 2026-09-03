@@ -24,6 +24,8 @@ pub enum HashAlgorithm {
     SHA256,     // Slower, cryptographic (for integrity verification)
 }
 
+pub mod album;
+
 // Configuration
 pub struct DeduplicationConfig {
     pub chunk_size: usize,
