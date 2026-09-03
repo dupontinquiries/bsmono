@@ -28,7 +28,7 @@
 use crate::campaign::CampaignLog;
 use crate::chi::Chi;
 use crate::content::MISSIONS;
-use crate::energon;
+use crate::valence;
 use crate::gear::{Gear, Item, Rail};
 use crate::menu::{Event, Menu, Row};
 use crate::menufx::DeployStyle;
@@ -47,7 +47,7 @@ use crate::watch::{Watch, NATIVE, PHOTON};
 /// The rooms with consoles in them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Station {
-    /// sorties, the week's nightfall, the energon ledger
+    /// sorties, the week's nightfall, the valence ledger
     Bridge,
     /// rails, worn armor, the bag — the gear sheet
     Armory,
@@ -270,8 +270,8 @@ impl Shipboard {
         sv.finds = self.dig.line();
         save::store(&sv, &b, &cfg);
     }
-    pub fn energon(&self) -> u32 {
-        energon::energon(&self.camp, &self.raids, self.nf.count())
+    pub fn valence(&self) -> u32 {
+        valence::valence(&self.camp, &self.raids, self.nf.count())
     }
 }
 
@@ -462,7 +462,7 @@ fn gate_open_for(dest: &str, sb: &Shipboard) -> bool {
     }
     // THE BRIDGE GATES EVERYTHING OUTSIDE SOL. Reaching a world on a mission
     // is not the same as being able to GO there: leaving the system needs the
-    // space bridge, and the bridge stays dark until Jhiaxus is dead. Before
+    // space bridge, and the bridge stays dark until Assay is dead. Before
     // this, an extra-solar destination opened purely because a mission had
     // touched it, so the reason the bridge was shut was nowhere in the game.
     if crate::patrol::beyond_sol(dest) && !crate::patrol::bridge_powered(&sb.camp) {
@@ -587,8 +587,8 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
         }
         Station::Bridge => {
             rows.push(Row::heading(&format!(
-                "ENERGON {}  ({}m {}w {}n)",
-                sb.energon(),
+                "VALENCE {}  ({}m {}w {}n)",
+                sb.valence(),
                 sb.camp.done(),
                 sb.raids.shards(),
                 sb.nf.count()
@@ -609,8 +609,8 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
             rows.push(Row::heading("SORTIES"));
             match sb.camp.next() {
                 Some(m) => {
-                    let rec = energon::rec_energon(m);
-                    let have = sb.energon();
+                    let rec = valence::rec_valence(m);
+                    let have = sb.valence();
                     // A campaign built on introducing one mechanic per mission
                     // should SAY so on the row that offers it -- that is the
                     // whole shape of the thing (see curriculum.rs), and a
@@ -634,7 +634,7 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
                     };
                     // WHO IS IN IT. The row said what the mission is and who
                     // opposes you, never who is present with you — so a beat
-                    // that turns on playing as Prime and watching Megatron go
+                    // that turns on playing as Keelwright and watching Cleave go
                     // read as an anonymous errand until you were in it.
                     let cast: Vec<String> = m
                         .cast
@@ -645,7 +645,7 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
                     let r = Row::action(m.id, &label);
                     let who = if cast.is_empty() { String::new() } else { format!("  |  {}", cast.join(", ")) };
                     rows.push(if have < rec {
-                        r.hint("LOW ENERGON: this will hurt")
+                        r.hint("LOW VALENCE: this will hurt")
                     } else if let Some(k) = teaches.first() {
                         r.hint(leak(format!("{}  |  {}{who}", m.beat, k.note)))
                     } else {
@@ -1296,7 +1296,7 @@ pub fn run_order(order: &Order) -> (String, bool) {
     let camp = CampaignLog::from_line(&sv.missions);
     let raids = crate::raidlog::RaidLog::from_line(&sv.wardens);
     let nf = crate::nightfall::NightfallLog::from_line(&sv.nightfalls);
-    let have = crate::energon::energon(&camp, &raids, nf.count());
+    let have = crate::valence::valence(&camp, &raids, nf.count());
 
     let Some((m, card)) = order_target(order) else {
         return (format!("{order:?}"), false);
@@ -1315,7 +1315,7 @@ pub fn run_order(order: &Order) -> (String, bool) {
     let squad: Vec<&str> = DEFAULT_SQUAD.to_vec();
     let mut run = MissionRun::new(m, &squad, DEFAULT_DOCTRINE, have);
     // SPEND THE PENALTY. `power` is the multiplier the whole engagement runs
-    // on, resolved once against the mission's recommended energon — which is
+    // on, resolved once against the mission's recommended valence — which is
     // exactly where arriving badly belongs. A cost that costs nothing is
     // decoration, and this is the first consequence in the game for getting
     // somewhere badly.
@@ -2059,7 +2059,7 @@ mod tests {
         use crate::patrol::{beyond_sol, ROUTE};
         let named = [
             "earth", "mars", "luna", "europa", "io", "titan", "pluto", "outer_rim",
-            "glaciem", "carrion", "helix", "cybertron", "uncharted", "shield_edge",
+            "glaciem", "carrion", "helix", "foundry", "uncharted", "shield_edge",
             "trappist1e", "trappist1g", "proxima_b", "kepler186f",
         ];
         assert!(!ROUTE.is_empty(), "the route table is empty; this test proves nothing");
@@ -2072,7 +2072,7 @@ mod tests {
         }
         // and the split is real in both directions
         assert!(!beyond_sol("earth") && !beyond_sol("pluto"), "Sol is not in Sol");
-        assert!(beyond_sol("cybertron") && beyond_sol("glaciem"), "the bridge worlds are in Sol");
+        assert!(beyond_sol("foundry") && beyond_sol("glaciem"), "the bridge worlds are in Sol");
     }
 
     #[test]
@@ -2130,7 +2130,7 @@ mod tests {
         let mut sb = board();
         assert!(!sb.unrestricted(), "the master ship is on by default");
         // fresh save: everything shut
-        assert!(!gate_open_for("cybertron", &sb), "precondition");
+        assert!(!gate_open_for("foundry", &sb), "precondition");
         let next = sb.raids.next_up().expect("a ladder").id;
         assert!(
             matches!(apply(Station::Wardeck, &Event::Pressed(next), &mut sb, 4), Some(Order::Did(_))),
@@ -2138,7 +2138,7 @@ mod tests {
         );
 
         sb.debug_ship = true;
-        assert!(gate_open_for("cybertron", &sb), "an extra-solar world stayed shut");
+        assert!(gate_open_for("foundry", &sb), "an extra-solar world stayed shut");
         assert!(gate_open_for("trappist1e", &sb), "an exoworld stayed shut");
         assert!(gate_open_for("earth", &sb), "the master ship closed Sol");
         assert_eq!(
@@ -2149,16 +2149,16 @@ mod tests {
     }
 
     #[test]
-    fn the_bridge_stays_dark_until_jhiaxus_is_dead() {
+    fn the_bridge_stays_dark_until_assay_is_dead() {
         // Reaching a world on a mission is not being able to GO there:
         // leaving Sol needs the bridge, and the bridge was shut because an
         // infestation was loose in the system.
         let mut sb = board();
-        // a mission HAS reached Cybertron, which is what used to be enough
+        // a mission HAS reached the Foundry, which is what used to be enough
         sb.camp.record("beneath_the_pacific");
         assert!(!crate::patrol::bridge_powered(&sb.camp), "the bridge is already powered?");
         assert!(
-            !gate_open_for("cybertron", &sb),
+            !gate_open_for("foundry", &sb),
             "an extra-solar destination opened with the bridge dark"
         );
         // and Sol is unaffected — the gate must not strand the player at home
@@ -2168,14 +2168,14 @@ mod tests {
     }
 
     #[test]
-    fn killing_jhiaxus_powers_it() {
+    fn killing_assay_powers_it() {
         // The complement: a gate that never opens is not a gate. Both halves
         // are needed — the bridge AND a mission that reached the world.
         let mut sb = board();
         sb.camp.record("beneath_the_pacific");
         sb.camp.record(crate::patrol::BRIDGE_SAFE_AFTER);
         assert!(crate::patrol::bridge_powered(&sb.camp));
-        assert!(gate_open_for("cybertron", &sb), "Jhiaxus is dead and the bridge is still shut");
+        assert!(gate_open_for("foundry", &sb), "Assay is dead and the bridge is still shut");
         // the bridge alone is not a route: nothing has reached Helix
         assert!(
             !gate_open_for("helix", &sb),

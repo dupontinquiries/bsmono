@@ -3,7 +3,7 @@
 //! Ported from `game.c`. Low-health enemies stagger; close in and execute,
 //! and their actual body parts go ballistic. The C's own table:
 //!
-//! > prime → MERCIFUL: one clean strike, the frame folds, parts drop soft
+//! > keelwright → MERCIFUL: one clean strike, the frame folds, parts drop soft
 //! > reaver/pyre → BRUTAL: torn apart, everything flies hard, oil smoke
 //! > scout/interceptor → PRECISION: a flank-shift, one tight pop, neat ring
 //! > specialist/warden → SURGICAL: parts lift in ordered anti-grav float
@@ -19,7 +19,7 @@
 //! There is a seventh, and `game.c` only mentions it in a comment next to the
 //! condition: a big frame that gets its hands on a small enemy
 //! **does not scatter it — it takes it in both hands and tears it in TWO**,
-//! along your own shoulder line. Prime will not (mercy holds) and the beast
+//! along your own shoulder line. Keelwright will not (mercy holds) and the beast
 //! will not (it thrashes). Everyone else will.
 //!
 //! What makes it read is coherence: the two halves are given near-identical
@@ -94,7 +94,7 @@ pub enum Style {
 /// The player's frame class, as the styles care about it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Frame {
-    Prime,
+    Keelwright,
     Reaver,
     Scout,
     Specialist,
@@ -124,10 +124,10 @@ pub const BIG_BULK: f32 = 0.72;
 ///
 /// The override is the interesting line and it is a THREE-way condition: big
 /// enough, small enough victim, and not one of the two frames that will not
-/// do it. Prime's refusal is mercy; the beast's is that it has its own idea.
+/// do it. Keelwright's refusal is mercy; the beast's is that it has its own idea.
 pub fn style_for(frame: Frame, victim: Victim, bulk: f32) -> Style {
     let base = match frame {
-        Frame::Prime => Style::Merciful,
+        Frame::Keelwright => Style::Merciful,
         Frame::Reaver => Style::Brutal,
         Frame::Scout => Style::Precision,
         Frame::Specialist => Style::Surgical,
@@ -135,7 +135,7 @@ pub fn style_for(frame: Frame, victim: Victim, bulk: f32) -> Style {
         Frame::Beast => Style::Thrash,
     };
     let big = bulk > BIG_BULK;
-    let refuses = matches!(frame, Frame::Prime | Frame::Beast);
+    let refuses = matches!(frame, Frame::Keelwright | Frame::Beast);
     if big && victim == Victim::Small && !refuses {
         return Style::Jazz;
     }
@@ -271,7 +271,7 @@ pub fn run() {
     println!("  WHO DOES WHAT\n");
     println!("  {:<12} {:>8} {:>14} {:>14}", "frame", "bulk", "vs a grunt", "vs a standard");
     for (f, bulk) in [
-        (Frame::Prime, 0.85),
+        (Frame::Keelwright, 0.85),
         (Frame::Reaver, 0.80),
         (Frame::Scout, 0.30),
         (Frame::Specialist, 0.60),
@@ -287,7 +287,7 @@ pub fn run() {
         );
     }
     println!("\n  the override needs all three: big enough, small enough victim, and");
-    println!("  not one of the two who refuse. Prime's refusal is mercy. The beast's");
+    println!("  not one of the two who refuse. Keelwright's refusal is mercy. The beast's");
     println!("  is that it already has its own idea.\n");
 
     println!("  AND A SCOUT DOES NOT CHARGE");
@@ -428,7 +428,7 @@ mod tests {
             "a light frame cannot tear anything in half"
         );
         assert_eq!(
-            style_for(Frame::Prime, Victim::Small, 0.95),
+            style_for(Frame::Keelwright, Victim::Small, 0.95),
             Style::Merciful,
             "mercy holds"
         );
@@ -443,7 +443,7 @@ mod tests {
     fn every_frame_has_its_own_signature_style() {
         use std::collections::BTreeSet;
         let s: BTreeSet<String> = [
-            Frame::Prime,
+            Frame::Keelwright,
             Frame::Reaver,
             Frame::Scout,
             Frame::Specialist,

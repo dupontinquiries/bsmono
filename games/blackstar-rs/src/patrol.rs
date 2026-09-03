@@ -38,7 +38,7 @@ pub enum Terrain {
 
 /// Who you meet there. The factions are the script's, not invented:
 /// the Hijacks are the erratic conquerors the elemental shield holds back,
-/// the Corrupted are Jhiaxus' experiment, and Blackstar's clans tax the
+/// the Corrupted are Assay' experiment, and Blackstar's clans tax the
 /// outer rim.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Faction {
@@ -79,7 +79,7 @@ pub struct Destination {
 /// homeworlds Glaciem, Carrion and Helix.
 /// THE MISSION THAT MAKES THE BRIDGE SAFE TO POWER ON.
 ///
-/// Film 2, the vault: Jhiaxus, the architect of the Corrupted. The space
+/// Film 2, the vault: Assay, the architect of the Corrupted. The space
 /// bridge was never off for want of engineering — it was off because turning
 /// it on while an infestation was loose in the system would have handed that
 /// infestation a door, and because the system needed the bridge as a position
@@ -88,7 +88,7 @@ pub struct Destination {
 ///
 /// So the bridge is not gated on arriving somewhere. It is gated on the
 /// reason it was shut.
-pub const BRIDGE_SAFE_AFTER: &str = "what_jhiaxus_grew";
+pub const BRIDGE_SAFE_AFTER: &str = "what_assay_grew";
 
 /// Is the space bridge safe to run?
 ///
@@ -96,7 +96,7 @@ pub const BRIDGE_SAFE_AFTER: &str = "what_jhiaxus_grew";
 /// `the_far_gate` (mission 10, Film 4). These are two stages of one system and
 /// the gap between them is deliberate: from Film 2 the bridge can be powered,
 /// and from Film 4 it has actually been used. A player who has cleared
-/// Jhiaxus but not reached the far gate is looking at a working bridge and
+/// Assay but not reached the far gate is looking at a working bridge and
 /// nowhere charted to send it, which is the correct state for Films 2-4.
 pub fn bridge_powered(log: &crate::campaign::CampaignLog) -> bool {
     log.is_cleared(BRIDGE_SAFE_AFTER)
@@ -112,8 +112,8 @@ pub fn beyond_sol(id: &str) -> bool {
     match id {
         // Sol: Earth and its neighbours, out to the rim
         "earth" | "mars" | "luna" | "europa" | "io" | "titan" | "pluto" | "outer_rim" => false,
-        // the clone homeworlds and Cybertron — reachable only by bridge
-        "glaciem" | "carrion" | "helix" | "cybertron" => true,
+        // the clone homeworlds and the Foundry — reachable only by bridge
+        "glaciem" | "carrion" | "helix" | "foundry" => true,
         // the catalogued exoplanets (exoworlds.rs). Tens of light years out:
         // beyond Sol by a margin nothing else on this list approaches.
         "trappist1e" | "trappist1g" | "proxima_b" | "kepler186f" => true,
@@ -219,9 +219,9 @@ pub const ROUTE: &[Destination] = &[
             "Charon fills a third of the sky"
         ],
     },
-    Destination { id: "cybertron", name: "CYBERTRON", terrain: Terrain::Surface, gravity: 1.15, weather: false,
+    Destination { id: "foundry", name: "THE FOUNDRY", terrain: Terrain::Surface, gravity: 1.15, weather: false,
         hostiles: Faction::Corrupted,
-        note: "the Silent Century — Cybertron went dark; no record says why",
+        note: "the Silent Century — the Foundry went dark; no record says why",
         sky: Sky::Vacuum, day_len: 0.0, ambient: &[
             "a forge-song, one voice, a thousand cities gone", 
             "the Silent Century left no record of why", 
@@ -408,12 +408,12 @@ pub struct Tick {
 /// The archive drip. Fourteen lines carried over verbatim in spirit — the
 /// war, the older strata, and the clone lines' homeworlds.
 pub const ARCHIVE: &[&str] = &[
-    "ARCHIVE: the energy signature matches ancient Cybertronian records",
-    "ARCHIVE: the Fallen's war fleet seeded an energon cache deep in Earth's mantle",
-    "ARCHIVE: the bunker was built over an ancient site — near Unicron's core",
+    "ARCHIVE: the energy signature matches ancient Machine records",
+    "ARCHIVE: the Fallen's war fleet seeded an valence cache deep in Earth's mantle",
+    "ARCHIVE: the bunker was built over an ancient site — near the Unending's core",
     "ARCHIVE: before the war there was the Age of Foundries — a thousand cities, one forge-song",
     "ARCHIVE: the First Bridge era — when the gates opened and every world was a doorway",
-    "ARCHIVE: the Silent Century — Cybertron went dark; no record says why",
+    "ARCHIVE: the Silent Century — the Foundry went dark; no record says why",
     "ARCHIVE: Europa listening post, final log — 'something answered from below the ice'",
     "ARCHIVE: Io's tide-forges never cool; the magma-clone fires burn since before the war",
     "ARCHIVE: Titan tithe-ledger — the clans tax the only world where fuel falls as rain",

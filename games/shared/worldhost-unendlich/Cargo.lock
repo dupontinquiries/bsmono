@@ -172,6 +172,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "isosurface"
+version = "0.1.0"
+dependencies = [
+ "glam",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -667,6 +674,7 @@ dependencies = [
  "crossbeam-channel",
  "dashmap",
  "env_logger",
+ "isosurface",
  "libc",
  "linkme",
  "log",

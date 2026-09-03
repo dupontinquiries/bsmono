@@ -109,7 +109,7 @@ pub struct Arena {
 }
 
 /// The raid map pool. Five hang off patrol worlds so a patrol can FIND a
-/// raid; five are deep sites the bridge reaches. `unicron` is where every
+/// raid; five are deep sites the bridge reaches. `unending` is where every
 /// SYNC finale ends, because the plate mechanic wants the arena where the
 /// horizon curves the wrong way.
 pub const ARENAS: &[Arena] = &[
@@ -121,7 +121,7 @@ pub const ARENAS: &[Arena] = &[
         orbit: Orbit { star: StarClass::G, au: 39.5, albedo: 0.5, air: 0.0 },
         weather: Weather::Clear,
         note: "where the defense ring stood, and did not hold" },
-    Arena { id: "cybertron", name: "THE SILENT FORGES", via: Some("cybertron"),
+    Arena { id: "foundry", name: "THE SILENT FORGES", via: Some("foundry"),
         orbit: Orbit { star: StarClass::K, au: 0.9, albedo: 0.3, air: 0.0 },
         weather: Weather::Clear,
         note: "a thousand cities gone quiet in one century" },
@@ -149,7 +149,7 @@ pub const ARENAS: &[Arena] = &[
         orbit: Orbit { star: StarClass::K, au: 0.45, albedo: 0.28, air: 0.85 },
         weather: Weather::GiantWave,
         note: "an ocean world; the water rises to meet whatever walks it" },
-    Arena { id: "unicron", name: "THE DEVOURER'S MAW", via: None,
+    Arena { id: "unending", name: "THE DEVOURER'S MAW", via: None,
         orbit: Orbit { star: StarClass::M, au: 0.08, albedo: 0.05, air: 0.1 },
         weather: Weather::FlareFront,
         note: "the horizon curves the wrong way; every SYNC ends here" },
@@ -187,8 +187,28 @@ pub struct Boss {
 }
 
 pub const BOSSES: &[Boss] = &[
+    // ---- the Lattice (docs/films/CANON_DECISIONS.md §4) ----
+    //
+    // SYNC because the mechanic falls out of the fiction rather than being
+    // assigned: plates that need several bodies standing together IS "the
+    // solid only opens when matter outside it is arranged correctly". Arena
+    // `unending` because `raidgen` makes the finale the boss's own arena and
+    // every SYNC boss's arena is `unending` — a roster fact `raidcon` tests —
+    // and because the Earth-remnant thread is where this belongs anyway.
+    //
+    // Element::Rock: the Anvil is the closed state, and what a closed thing
+    // does is refuse. Nothing else in the ring reads as "will not move".
+    Boss { id: "the_anvil", name: "The Lattice", title: "The Anvil",
+        mech: Mech::Sync, element: Element::Rock, arena: "unending", tier: 3,
+        premise: "a perfect solid that must open to act, so armour and agency are the same resource",
+        relic: &[
+            "it has no front. closed, it is six identical faces and no way in;",
+            "struck, it does not move -- it shapes what struck it. the crews that",
+            "hit it hardest came back wearing the wrong silhouettes.",
+        ],
+        shard: "you do not damage it. you take cells it no longer governs." },
     Boss { id: "speakerman", name: "Astro Armor Titan Speakerman", title: "The Last Resonance",
-        mech: Mech::Sync, element: Element::Electric, arena: "unicron", tier: 3,
+        mech: Mech::Sync, element: Element::Electric, arena: "unending", tier: 3,
         premise: "sings across half a galaxy; fractures planets by matching tectonic resonance",
         relic: &[
             "a walking observatory that made moons into transmitters.",
@@ -196,7 +216,7 @@ pub const BOSSES: &[Boss] = &[
             "the weapon. it still broadcasts. no fleet that answers returns.",
         ],
         shard: "it was not singing to anyone. it was holding a note." },
-    Boss { id: "jhiaxus_omega", name: "Devastator Jhiaxus", title: "Prototype Omega",
+    Boss { id: "assay_omega", name: "Devastator Assay", title: "Prototype Omega",
         mech: Mech::Purge, element: Element::Fire, arena: "kuiper", tier: 3,
         premise: "destroying one only caused it to rebuild itself",
         relic: &[
@@ -224,11 +244,11 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "the march has a route. the route is a circle around something." },
     Boss { id: "gigadrill", name: "Gigadrill", title: "The Core Piercer",
-        mech: Mech::Air, element: Element::Rock, arena: "cybertron", tier: 2,
+        mech: Mech::Air, element: Element::Rock, arena: "foundry", tier: 2,
         premise: "it drilled through moons, worlds, dwarf planets",
         relic: &[
             "built to learn why planets have metallic hearts. some worlds",
-            "screamed; some contained machinery older than cybertron.",
+            "screamed; some contained machinery older than foundry.",
             "it vanished under a rogue planet and came back marked.",
         ],
         shard: "it stopped drilling down. the last bore was a way OUT for something." },
@@ -251,7 +271,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "the charge was never at an enemy. it was AWAY from a place." },
     Boss { id: "judgementor", name: "Judgementor", title: "Executor of Empires",
-        mech: Mech::Sync, element: Element::Electric, arena: "unicron", tier: 3,
+        mech: Mech::Sync, element: Element::Electric, arena: "unending", tier: 3,
         premise: "it did not fight wars, it ended them",
         relic: &[
             "not a tank. a mobile courtroom. civilizations stood trial",
@@ -261,7 +281,7 @@ pub const BOSSES: &[Boss] = &[
         shard: "one verdict was never delivered. the case is still open." },
     Boss { id: "mantis", name: "Primitive Mantis Mech", title: "The First Hunter",
         mech: Mech::Purge, element: Element::Vine, arena: "frostline", tier: 1,
-        premise: "the oldest predator pattern Cybertron ever built",
+        premise: "the oldest predator pattern the Foundry ever built",
         relic: &[
             "older than language, older than cities, older than elegant",
             "transformation. its nerves evolved rather than being engineered.",
@@ -269,7 +289,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "it was not hunting. it was patrolling a perimeter that predates it." },
     Boss { id: "pyrachnid", name: "Pyrachnid", title: "Forge Widow",
-        mech: Mech::Sync, element: Element::Fire, arena: "unicron", tier: 2,
+        mech: Mech::Sync, element: Element::Fire, arena: "unending", tier: 2,
         premise: "it spins its own foundry around its prey",
         relic: &[
             "born inside stellar furnaces. the web is superconducting",
@@ -305,7 +325,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "it has a destination. it has been refusing to arrive for an age." },
     Boss { id: "tremor", name: "Tremor", title: "Planetbreaker",
-        mech: Mech::Ground, element: Element::Rock, arena: "cybertron", tier: 2,
+        mech: Mech::Ground, element: Element::Rock, arena: "foundry", tier: 2,
         premise: "the ground is its weapon",
         relic: &[
             "not seismic — gravitational. singularity oscillators in the",
@@ -314,7 +334,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "the heartbeat is a countermeasure. it is jamming a deeper signal." },
     Boss { id: "trenchmaster", name: "Trenchmaster", title: "The Ocean King",
-        mech: Mech::Sync, element: Element::Water, arena: "unicron", tier: 3,
+        mech: Mech::Sync, element: Element::Water, arena: "unending", tier: 3,
         premise: "the ocean king; the water rises to meet it",
         relic: &[
             "made for abyssal wars. it treats the deep as a highway and",
@@ -337,7 +357,7 @@ pub const BOSSES: &[Boss] = &[
         relic: &[
             "the camera titans were never soldiers. every photon they",
             "captured is stored in quantum crystal. this one remembers",
-            "cybertron's birth. damaging its armor physically erases history.",
+            "foundry's birth. damaging its armor physically erases history.",
         ],
         shard: "the oldest frame in its memory is of the lock being built." },
     Boss { id: "observer", name: "Sphere Robot", title: "The Observer",
@@ -350,11 +370,11 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "it does not watch events. it watches the thing that causes them." },
     Boss { id: "divergence", name: "Titan Cameraman 3.0 (What If...)", title: "The Divergence",
-        mech: Mech::Sync, element: Element::Electric, arena: "unicron", tier: 3,
+        mech: Mech::Sync, element: Element::Electric, arena: "unending", tier: 3,
         premise: "the recording and the event no longer agree",
         relic: &[
             "not from this timeline. its memory holds events that never",
-            "happened: fallen primes who live, victors who lost. its armor",
+            "happened: fallen keelwrights who live, victors who lost. its armor",
             "phases, and pieces of other histories briefly become real.",
         ],
         shard: "in every timeline it remembers, the lock is in the same place." },
@@ -719,13 +739,15 @@ mod tests {
 
     #[test]
     fn nineteen_bosses_with_the_recorded_spread() {
-        // the spread RAIDS.md documents: 5 PURGE, 5 GROUND, 4 AIR, 5 SYNC
-        assert_eq!(BOSSES.len(), 19);
+        // the spread RAIDS.md documents: 5 PURGE, 5 GROUND, 4 AIR, 5 SYNC —
+        // plus the Lattice, which made SYNC 6. Adding a boss is supposed to
+        // fail here; the number is the record that somebody meant to.
+        assert_eq!(BOSSES.len(), 20);
         let n = |m: Mech| BOSSES.iter().filter(|b| b.mech == m).count();
         assert_eq!(n(Mech::Purge), 5);
         assert_eq!(n(Mech::Ground), 5);
         assert_eq!(n(Mech::Air), 4);
-        assert_eq!(n(Mech::Sync), 5);
+        assert_eq!(n(Mech::Sync), 6);
     }
 
     #[test]
@@ -738,9 +760,9 @@ mod tests {
     }
 
     #[test]
-    fn every_sync_boss_ends_at_unicron() {
+    fn every_sync_boss_ends_at_unending() {
         for b in BOSSES.iter().filter(|b| b.mech == Mech::Sync) {
-            assert_eq!(b.arena, "unicron", "{} is SYNC and ends elsewhere", b.id);
+            assert_eq!(b.arena, "unending", "{} is SYNC and ends elsewhere", b.id);
         }
     }
 
@@ -867,7 +889,7 @@ mod tests {
     fn the_minimal_json_parser_handles_the_boss_schema() {
         let text = r#"[
             {"id": "test_boss", "name": "Test \"Quoted\" Boss", "title": "T",
-             "mech": "Sync", "element": "Fire", "arena": "unicron", "tier": 2,
+             "mech": "Sync", "element": "Fire", "arena": "unending", "tier": 2,
              "premise": "p", "relic": ["line one", "line two"], "shard": "s"}
         ]"#;
         let v = json::parse(text).expect("valid JSON should parse");

@@ -134,7 +134,7 @@ SOLAR
 PHOTON
 ```
 
-Trilogy one (DOOMSDAY / DOMINION / DESTINY) is Earth, Unicron, and the shield.
+Trilogy one (DOOMSDAY / DOMINION / DESTINY) is Earth, the Unending, and the shield.
 Trilogy two (FIRST LIGHT / SOLAR / PHOTON) leaves the shield and finds out how
 large the cosmos is. The Watch's ceiling is the climax; `watch.rs` owns the
 mechanic and `chi.rs` owns the attunement.
@@ -290,7 +290,7 @@ find contested. They live in `archive::CLAIMS`.
 
 ```canon:claims
 bridge_predates_coalition
-unicron_in_earth
+unending_in_earth
 convergence_was_not_first
 societies_existed
 facility_built_2003
@@ -314,7 +314,7 @@ instrument_artefact
 
 Three of these are **mundane answers to false leads** — `cold_war_debris`,
 `later_forgery`, `instrument_artefact`. Chasing `satellite_fragment_17`,
-`asteri_signal_beacon` or `unicron_detection_scan` is not punished and not
+`asteri_signal_beacon` or `unending_detection_scan` is not punished and not
 rewarded. It is *answered*. A universe where every glowing object means
 something is a theme park.
 
@@ -348,7 +348,7 @@ new evidence table.
 - **VOLTAGE** — charm and electromagnetics; reads rooms and power draw first.
 - **KINETIC** — reads movement, distance, and what left.
 - **THE ARCHIVIST** — the villain campaign. He already knows; he is checking
-  whether you do. (A nod to War for Cybertron / Fall of Cybertron letting you
+  whether you do. (A nod to War for the Foundry / Fall of the Foundry letting you
   run the other side; see `docs/WFC_FOC_RESEARCH.md` in the C tree.)
 
 Reading coverage is **deliberately partial**. Four voices across every finding
@@ -502,7 +502,7 @@ costs nothing extra because the evidence was already written.
 `farmhouse_photograph`, `trench_excavation_scar` and `thermal_plate` all
 describe THE RIDGE, and together they date the Directorate's dig to 1998, 1996
 and 1994 against an official record of 2003. The ridge overlooks the shore
-where Unicron's fissure opens.
+where the Unending's fissure opens.
 
 Which answers something the tables raised and never resolved: **the record is
 not falsified to hide a building. It is falsified because somebody was digging
@@ -652,10 +652,10 @@ nothing; the distribution means a great deal, because the placement rules were
 written against the film material's geography and reading them back gives
 statements nobody typed.
 
-- **All 56 unrecorded shapes are on Cybertron, and every one is Corrupted.**
+- **All 56 unrecorded shapes are on the Foundry, and every one is Corrupted.**
   Their shared hook — *"a shape the coalition has no record of"* — is already
   a provenance statement. `substrate_sample` says from the other direction
-  that Cybertron's architecture is older than its own record of inventing it.
+  that the Foundry's architecture is older than its own record of inventing it.
 - **All 46 on Earth are Coalition, and all road vehicles.** Cars, trucks,
   racers, a few helicopters. Nothing that could not be parked. Concealment as
   a demographic fact, and the first thing a human investigator notices.

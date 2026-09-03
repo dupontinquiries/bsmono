@@ -29,7 +29,7 @@
 //!   * `COALITION TACNET` — cold cyan wireframe, fast sweep, dashed
 //!     rings: the military plot.
 //!   * `FORGE ORRERY`     — ember and brass, slow sweep, solid rings:
-//!     the Cybertronian instrument, built not rendered.
+//!     the Machine instrument, built not rendered.
 //!   * `HIJACK VEIL`      — violet on near-black, no grid, slowest
 //!     sweep: the stolen chart that does not want to be read.
 //!
@@ -86,14 +86,14 @@ pub const CHART: &[ChartBody] = &[
     ChartBody { id: "shield_edge", au: 55.0, weight: 0.35 },
 ];
 
-/// DESTINATIONS THIS TABLE CANNOT RING. Cybertron and the exoplanets
+/// DESTINATIONS THIS TABLE CANNOT RING. the Foundry and the exoplanets
 /// orbit OTHER STARS, and `uncharted` is the wildcard; a heliocentric
 /// plot that gave them an AU would be lying with geometry. A real chart
 /// marks them as BEARINGS at the rim — a direction and a name, distance
 /// unplottable — which is also the cinematic answer: distant contacts
 /// at the table's edge. Bearings hash from the id, stable forever.
 pub const BEACONS: &[&str] =
-    &["cybertron", "proxima_b", "trappist1e", "trappist1g", "kepler186f", "uncharted"];
+    &["foundry", "proxima_b", "trappist1e", "trappist1g", "kepler186f", "uncharted"];
 
 /// A beacon's rim bearing, radians — hashed, not authored, same as the
 /// orbital phases.
@@ -177,7 +177,7 @@ pub const SKINS: &[Skin] = &[
         rings_dashed: false,
         grid: false,
         sweep_hz: 0.12,
-        note: "the Cybertronian instrument: ember and brass, built rather than rendered",
+        note: "the Machine instrument: ember and brass, built rather than rendered",
     },
     Skin {
         id: "veil",

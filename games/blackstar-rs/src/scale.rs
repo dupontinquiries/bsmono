@@ -8,7 +8,7 @@
 //!
 //! ## The problem is not the camera. It is that size is not data.
 //!
-//! `model_tuning.json` carries a per-model `scale`, and Optimus Prime's is
+//! `model_tuning.json` carries a per-model `scale`, and Keelwright's is
 //! **0.4989**. Across 1,012 models the medians by kind land between 0.5 and
 //! 1.8 — robots at 0.904, vehicles at 0.530 — which is to say every model,
 //! whatever it depicts, is normalised into the same box. A Transformer and a
@@ -487,7 +487,7 @@ mod tests {
 
     #[test]
     fn true_scale_undoes_the_normalisation() {
-        // Optimus Prime ships at 0.4989, which fits him in the playable box.
+        // Keelwright ships at 0.4989, which fits him in the playable box.
         // At his real height he should be an order of magnitude larger.
         let real = true_scale(0.4989, 8.5);
         assert!(real > 10.0, "true scale {real} is not bot-sized");

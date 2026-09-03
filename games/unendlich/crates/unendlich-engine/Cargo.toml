@@ -11,6 +11,9 @@ ogg = { version = "0.9", optional = true }  # ogg demux for ogg-opus; audio feat
 linkme = "0.3"
 # Workspace deps
 unendlich-shared = { path = "../unendlich-shared" }
+# Surface nets over a scalar field (games/shared/isosurface): pure geometry,
+# tested in a second outside this crate. See src/world/smooth.rs.
+isosurface = { path = "../../../shared/isosurface" }
 # Fleet online play: the shared handoff + session control plane (games/shared/netcode)
 netcode = { path = "../../../shared/netcode" }
 # unendlich-netview bin: serves the live world-state debug view over HTTP

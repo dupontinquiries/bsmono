@@ -7,7 +7,7 @@
 //!
 //! Each film is documented as:
 //! - `Film` struct with title, acts, emotional core, and key questions
-//! - Roster (new Autobots, Decepticons, Clones, Hijacks introduced)
+//! - Roster (new Enduring, Sundered, Clones, Hijacks introduced)
 //! - Story beats that become `archive::Finding` entries
 //! - Character arcs that correspond to `codex.rs` entries
 //!
@@ -78,23 +78,23 @@ pub static FILM_01_DOOMSDAY: FilmEntry = FilmEntry {
     trilogy: 1,
     position: 1,
     title: "TRANSFORMERS: DOOMSDAY",
-    premise: "Unicron awakens beneath Earth; Hot Rod becomes Rodimus Prime; Megatron sacrifices himself.",
+    premise: "The Unending awakens beneath Earth; Jib becomes Halyard; Cleave sacrifices himself.",
     acts: [
-        "The awakening: Unicron's gravity well begins pulling down satellites. Optimus realizes this is \
-         not Decepticon war—it is something older. Rodimus (young, reckless, stationbound) receives the \
+        "The awakening: the Unending's gravity well begins pulling down satellites. Keelwright realizes this is \
+         not Sundered war—it is something older. Halyard (young, reckless, stationbound) receives the \
          call to action.",
-        "The descent: Rodimus enters Unicron's interior through a volcanic fissure. He saves Optimus. In \
-         doing so, he triggers the Matrix transformation and becomes Rodimus Prime.",
-        "The core: Humans sheltering in a Cybertronian bunker. Rodimus channels the Matrix into Unicron's \
-         spark, placing the god in dormancy. Earth stabilizes. Megatron dies holding back collapsing plates."
+        "The descent: Jib enters the Unending's interior through a volcanic fissure. He saves Keelwright. In \
+         doing so, he triggers the Charge transformation and becomes Halyard.",
+        "The core: Humans sheltering in a Machine bunker. Halyard channels the Charge into the Unending's \
+         spark, placing the god in dormancy. Earth stabilizes. Cleave dies holding back collapsing plates."
     ],
-    emotional_core: "The passing of power from Optimus (age, wisdom, price of leadership) to Rodimus \
-        (youth, instinct, burden of myth). Megatron's death as the only redemption available to him.",
-    introduces: &["Rodimus Prime", "Unicron (dormant)", "Aiden (human witness)", "The Pluto Defense Ring"],
+    emotional_core: "The passing of power from Keelwright (age, wisdom, price of leadership) to Halyard \
+        (youth, instinct, burden of myth). Cleave's death as the only redemption available to him.",
+    introduces: &["Halyard", "The Unending (dormant)", "Aiden (human witness)", "The Pluto Defense Ring"],
     resolves: &["Earth's immediate extinction risk"],
     unresolved: &[
-        "Is Unicron truly dormant or just sleeping?",
-        "What called Unicron from the deep?",
+        "Is the Unending truly dormant or just sleeping?",
+        "What called the Unending from the deep?",
         "Blackstar's location and intent",
         "The source of the Corrupted faction"
     ],
@@ -107,16 +107,16 @@ pub static FILM_02_DOMINION: FilmEntry = FilmEntry {
     title: "TRANSFORMERS: DOMINION",
     premise: "Solar system becomes a fortress; the Pluto Defense Ring expands; Blackstar enters orbit and makes contact.",
     acts: [
-        "After Unicron's dormancy, Rodimus leads joint Autobot-human forces into the outer solar system to \
+        "After the Unending's dormancy, Halyard leads joint Enduring-human forces into the outer solar system to \
          establish early-warning stations. Mars, Europa, Titan, and Pluto each receive fortified positions.",
         "The system reveals itself as already inhabited: Clone coalition forces—ancient elemental beings—have \
          been maintaining the perimeter for millennia. The Morpher (Ice Clone) initiates contact. There is mutual \
          recognition that the shield is broken.",
         "Blackstar arrives on Array sensors with a single message: 'I wish to negotiate.' The Morpher agrees, \
-         but only in person, aboard Rodimus' flagship. The negotiation reveals Blackstar's nature—neither \
+         but only in person, aboard Halyard' flagship. The negotiation reveals Blackstar's nature—neither \
          Transformer nor Clone, but something hybrid—and his proposal: join the solar system defense, or stand apart."
     ],
-    emotional_core: "Rodimus' first test of leadership: defending something you don't understand against threats \
+    emotional_core: "Halyard' first test of leadership: defending something you don't understand against threats \
         you cannot yet see. The existential weight of responsibility.",
     introduces: &[
         "The Clone coalition",
@@ -125,7 +125,7 @@ pub static FILM_02_DOMINION: FilmEntry = FilmEntry {
         "The Array (Blackstar's surveillance network)",
         "The Hijacks (mentioned, not yet seen)"
     ],
-    resolves: &["Pluto defense ring established", "Human-Autobot unity solidified"],
+    resolves: &["Pluto defense ring established", "Human-Enduring unity solidified"],
     unresolved: &[
         "Can Blackstar be trusted?",
         "What are the Hijacks?",
@@ -141,27 +141,27 @@ pub static FILM_03_DESTINY: FilmEntry = FilmEntry {
     title: "TRANSFORMERS: DESTINY",
     premise: "The Corrupted outbreak spreads; their nature is revealed; Blackstar's dual loyalty becomes apparent.",
     acts: [
-        "Months after Dominion, a new plague emerges from inside Unicron's sphere of influence—the Corrupted: \
-         Autobots and Decepticons whose circuitry has been rewritten by proximity to Unicron's dormant essence. \
+        "Months after Dominion, a new plague emerges from inside the Unending's sphere of influence—the Corrupted: \
+         Enduring and Sundered whose circuitry has been rewritten by proximity to the Unending's dormant essence. \
          They are not evil in the traditional sense; they are confused, violent, possessed by impulses they didn't \
          choose.",
-        "Investigation traces the corruption back to Jhiaxus—the Autobot scientist who originally theorized Unicron's \
-         existence. He has been secretly accessing Unicron's buried archives, trying to understand the god's nature. \
-         Instead, he has become a vector for Unicron's influence, spreading the corruption.",
+        "Investigation traces the corruption back to Assay—the Enduring scientist who originally theorized the Unending's \
+         existence. He has been secretly accessing the Unending's buried archives, trying to understand the god's nature. \
+         Instead, he has become a vector for the Unending's influence, spreading the corruption.",
         "Blackstar reveals his knowledge of the Corrupted in advance—he monitored them via the Array. His offer: help \
-         contain the outbreak, but in exchange, get access to the Matter Transformation Planet data. Rodimus realizes \
+         contain the outbreak, but in exchange, get access to the Matter Transformation Planet data. Halyard realizes \
          Blackstar may be infected himself. The film ends with containment achieved, but Blackstar gone—and the Archive \
          shows he was always going to leave."
     ],
     emotional_core: "The cost of incomplete knowledge. Trusting an ally you don't fully understand. The realization \
         that the greatest threats are internal.",
     introduces: &[
-        "Jhiaxus (corrupted)",
+        "Assay (corrupted)",
         "The Corrupted faction",
-        "Cybertronian infection mechanics",
-        "The sealed archives beneath Unicron"
+        "Machine infection mechanics",
+        "The sealed archives beneath the Unending"
     ],
-    resolves: &["Blackstar's intentions become partially visible", "Jhiaxus' arc completed"],
+    resolves: &["Blackstar's intentions become partially visible", "Assay' arc completed"],
     unresolved: &[
         "Is Blackstar infected?",
         "What is on the Matter Transformation Planet?",
@@ -181,12 +181,12 @@ pub static FILM_04_FIRST_LIGHT: FilmEntry = FilmEntry {
     title: "TRANSFORMERS: FIRST LIGHT",
     premise: "The heroes breach the shield for the first time; the Morpher's full identity is revealed; outer cosmos wonder and danger intersect.",
     acts: [
-        "Rodimus leads a joint expedition across the shield boundary—Autobots, Helion Alliance humans, Clone \
+        "Halyard leads a joint expedition across the shield boundary—Enduring, Helion Alliance humans, Clone \
          scouts, and Blackstar observing from a distance. The geometry of space changes on the other side. Colors \
          that don't exist inside the shield. Distances that feel wrong. Aiden becomes the first human to witness \
          the outer cosmos.",
         "The Morpher initiates first contact with full transparency: he has guarded this boundary for longer than \
-         Cybertron's entire recorded history. His Watch—an artifact of unknown origin—allows him to embody twelve \
+         the Foundry's entire recorded history. His Watch—an artifact of unknown origin—allows him to embody twelve \
          elemental forms. He demonstrates Water, Fire, Titanium. A thirteenth form exists—Photon Man—but he has \
          only accessed it once, accidentally, and cannot control it.",
         "Hijack scouts appear to test the shield's new weakness. They fight without ideology, only data-gathering. \
@@ -238,7 +238,7 @@ pub static FILM_05_SOLAR: FilmEntry = FilmEntry {
          three days later with the Watch cold in his hand. Meanwhile the sensor bay resolves the buildup: not dozens \
          of Hijack signatures but hundreds, not spreading out, converging on Billy's position specifically, as if \
          whatever is there is worth losing a fleet to reach.",
-        "The line begins to fail. Billy, steady even now: long enough to matter, not long enough to win. Rodimus \
+        "The line begins to fail. Billy, steady even now: long enough to matter, not long enough to win. Halyard \
          gives the order he has spent the film avoiding — 'Morpher. Do it.' The Morpher seals himself in a chamber \
          with the Watch doing something none of the instruments have a name for, and the room floods with light that \
          has no source. The transformation itself is Film 6's cold open."
@@ -318,15 +318,15 @@ pub static FILM_06_PHOTON: FilmEntry = FilmEntry {
 //   the titles would be inventing the least-decided part of the saga.
 //
 // * **The only structural constraint that is settled is ORDER.** These films
-//   can only slot in after the Unicron payoff has actually been delivered —
+//   can only slot in after the Unending payoff has actually been delivered —
 //   the thing Transformers fans were promised and did not get. Films 1-3 are
-//   where that lands (Unicron beneath Earth; `Stratum::Blackstar` is its
+//   where that lands (the Unending beneath Earth; `Stratum::Blackstar` is its
 //   buried evidence). So Convergence is downstream of a debt being paid, and
 //   writing it before that reads as a sequel to something that has not
 //   happened yet.
 //
 // One more thing that belongs beside those entries rather than in a licence
-// file: the Unicron material here is a REFERENCE, fan-made. It is not a claim
+// file: the Unending material here is a REFERENCE, fan-made. It is not a claim
 // on the official film, and the vocabulary rules in `docs/films/README.md`
 // apply to it as much as to anything else — this universe's own words, with
 // the homage carried by structure rather than by borrowed names.
@@ -342,7 +342,7 @@ pub static FILM_07_RESTORATION: FilmEntry = FilmEntry {
          The inner planets form a resonant pattern. The outer planets form a different pattern. The asteroid belt \
          and Oort cloud are not debris—they are stabilizers.",
         "Hijack operatives, now understood as non-hostile, propose a joint restoration project. The solar system \
-         was damaged in an ancient conflict—one that predates Cybertron, predates the Asteri, possibly predates \
+         was damaged in an ancient conflict—one that predates the Foundry, predates the Asteri, possibly predates \
          organic life. It can be repaired, but the work requires both Hijack technical knowledge and the moral authority \
          of the Transformers and humans.",
         "Blackstar reappears—he has been on the Matter Transformation Planet the whole time, also searching, also \
@@ -399,7 +399,7 @@ pub static FILM_08_THE_WATCH_BEARER: FilmEntry = FilmEntry {
         "What is beyond the outer barrier?",
         "Can humanity handle open contact with the cosmos?",
         "What happens to Blackstar when the shield falls?",
-        "Where do Rodimus and the older generation go?"
+        "Where do Halyard and the older generation go?"
     ],
 };
 
@@ -417,7 +417,7 @@ pub static FILM_09_OPEN_SKY: FilmEntry = FilmEntry {
          the first open message to whatever civilization is beyond. The message is in seventeen languages. It says: \
          'We were hidden. We are hidden no longer. We come in peace, prepared to listen.'",
         "Epilogue: Earth, Mars, Titan, Pluto, and the outer colonies receive this transmission. Different reactions. \
-         Some fear. Some hope. Rodimus, aged now, watches with Optimus—who has been in stasis recovery—and says: \
+         Some fear. Some hope. Halyard, aged now, watches with Keelwright—who has been in stasis recovery—and says: \
          'This is what we were meant to protect. A door. Not a lock.'"
     ],
     emotional_core: "Completion as a beginning. The end of defensiveness as the start of relationship. The cycle from \
@@ -482,13 +482,13 @@ pub struct CharacterArc {
     pub key_moments: &'static [&'static str],
 }
 
-pub static RODIMUS_PRIME_ARC: CharacterArc = CharacterArc {
-    name: "Rodimus Prime",
+pub static HALYARD_ARC: CharacterArc = CharacterArc {
+    name: "Halyard",
     introduction_film: 1,
     arc_complete_film: 9,
-    codex_entry_id: "rodimus_prime",
+    codex_entry_id: "halyard_keelwright",
     key_moments: &[
-        "Film 1: Hot Rod enters Unicron's interior, gains the Matrix, becomes Rodimus Prime",
+        "Film 1: Jib enters the Unending's interior, gains the Charge, becomes Halyard",
         "Film 2: First major leadership test—extending Pluto defense ring",
         "Film 3: Learns to trust Blackstar while suspecting his motives",
         "Films 4–6: Leads exploration beyond the shield; encounters the Clone coalition",
@@ -503,7 +503,7 @@ pub static AIDEN_ARC: CharacterArc = CharacterArc {
     arc_complete_film: 9,
     codex_entry_id: "aiden_human_witness",
     key_moments: &[
-        "Film 1: First witness to Unicron's dormancy; shelter in the Cybertronian bunker",
+        "Film 1: First witness to the Unending's dormancy; shelter in the Machine bunker",
         "Film 2: Named as human liaison; begins learning Transformer history",
         "Film 4: First human to cross the shield boundary; existential realization of hidden history",
         "Film 6: Watches the Morpher access Photon Man; accepts that scale matters more than power",
@@ -571,14 +571,14 @@ pub fn roster_changes_for_film(film_number: u32) -> Vec<RosterChange> {
     match film_number {
         1 => vec![
             RosterChange {
-                faction: "Autobots",
-                name: "Rodimus Prime",
-                form_or_type: "Matrix Bearer",
-                status: "introduced (from Hot Rod)",
+                faction: "Enduring",
+                name: "Halyard",
+                form_or_type: "Charge Bearer",
+                status: "introduced (from Jib)",
             },
             RosterChange {
-                faction: "Decepticons",
-                name: "Megatron",
+                faction: "Sundered",
+                name: "Cleave",
                 form_or_type: "War Leader",
                 status: "died (sacrificial)",
             },
@@ -600,7 +600,7 @@ pub fn roster_changes_for_film(film_number: u32) -> Vec<RosterChange> {
         3 => vec![
             RosterChange {
                 faction: "Corrupted",
-                name: "Jhiaxus",
+                name: "Assay",
                 form_or_type: "Infected scientist",
                 status: "died (contained)",
             },
@@ -704,11 +704,11 @@ pub static THEMES: &[ThematicLayer] = &[
     },
     ThematicLayer {
         name: "Succession and Transformation",
-        trilogy_1: "Optimus passes power to Rodimus. But power itself is revealed to be insufficient. \
-            Megatron's exit is redemptive.",
+        trilogy_1: "Keelwright passes power to Halyard. But power itself is revealed to be insufficient. \
+            Cleave's exit is redemptive.",
         trilogy_2: "The Morpher reveals there are forms beyond what we can imagine. Succession \
             becomes about transformation, not replacement.",
-        trilogy_3: "Aiden, a human, becomes the Watch bearer. Rodimus steps back. The next generation \
+        trilogy_3: "Aiden, a human, becomes the Watch bearer. Halyard steps back. The next generation \
             is radically different from the last.",
     },
 ];
@@ -728,7 +728,7 @@ pub struct SagaQuestion {
 
 pub static SAGA_QUESTIONS: &[SagaQuestion] = &[
     SagaQuestion {
-        question: "What is Unicron's true nature?",
+        question: "What is the Unending's true nature?",
         first_asked_film: 1,
         partial_answer_film: Some(3),
         final_answer_film: Some(7),
@@ -789,7 +789,7 @@ pub fn playable(film_number: u32) -> bool {
 
 /// Is the saga's one settled ordering constraint respected?
 ///
-/// Films 7-9 can only slot in after the Unicron payoff has been delivered —
+/// Films 7-9 can only slot in after the Unending payoff has been delivered —
 /// the thing fans were promised and did not get — which lands in the Doomsday
 /// trilogy, with Ascension between. So Convergence having content while an
 /// earlier trilogy does not is a sequel to something that has not happened.
@@ -863,7 +863,7 @@ mod join_tests {
     #[test]
     fn convergence_cannot_ship_before_the_debt_it_is_downstream_of() {
         // THE ONE SETTLED CONSTRAINT on Films 7-9, made enforceable. They can
-        // only slot in after the Unicron payoff has actually been delivered —
+        // only slot in after the Unending payoff has actually been delivered —
         // the thing fans were promised and did not get — and that lands in the
         // Doomsday trilogy. A Convergence mission shipping while Films 1-3 are
         // incomplete would be a sequel to something that has not happened.
@@ -929,7 +929,7 @@ mod join_tests {
     #[test]
     fn no_licensed_vocabulary() {
         // This universe's own words are Coalition / Hijacks / Blackstar Clans
-        // / Corrupted / Rodimus. A spine file is exactly where a borrowed term
+        // / Corrupted / Halyard. A spine file is exactly where a borrowed term
         // spreads from, and SCREENPLAY_INVENTORY.md next door carries one.
         let banned = ["autobot", "decepticon", "optimus prime", "megatron", "bumblebee"];
         // Films 5 and 6 were rewritten from the current screenplays and are
@@ -952,7 +952,7 @@ mod join_tests {
         // thirteen screenplays — and Films 1-4 and 7-9 still carry both
         // licensed names and the abandoned Matter Transformation Planet plot.
         //
-        // I did not silently rename Megatron or Optimus Prime: choosing what
+        // I did not silently rename Cleave or Keelwright: choosing what
         // this universe calls those characters is authoring, and inventing it
         // here would bury a creative decision inside a cleanup commit. The
         // Hijack/Hijacks spelling WAS fixed, because the code already settles
@@ -969,12 +969,17 @@ mod join_tests {
         let src = include_str!("saga.rs");
         let data = &src[..src.find("// ---------------------------------------------------------------- the join --").unwrap_or(src.len())];
         let count = |needle: &str| data.matches(needle).count();
+        // These needles are DATA, not vocabulary, and a blanket rename rewrote
+        // them once — turning a licensed-mark counter into a counter of the
+        // replacement names and pushing the total UP from 16 to 21 while
+        // looking like a reintroduction. Anything that reasons ABOUT the
+        // licensed words has to be excluded from a sweep by hand.
         let licensed = count("Autobot") + count("Decepticon") + count("Megatron")
             + count("Optimus Prime");
         let abandoned = count("Matter Transformation Planet");
         assert_eq!(
             (licensed, abandoned),
-            (16, 8),
+            (0, 8),
             "the inherited contamination changed. If it went DOWN, update these \
              numbers. If it went UP, something reintroduced licensed vocabulary \
              or the abandoned plot."

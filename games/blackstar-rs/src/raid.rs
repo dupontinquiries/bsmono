@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn a_quiet_world_lets_a_raid_finish() {
         // which is what makes it the place you go to learn an encounter
-        let r = run(&raid(Weather::Clear, quiet()), Body::Cybertronian, 14.0, 5, &[Body::Cybertronian]);
+        let r = run(&raid(Weather::Clear, quiet()), Body::Machine, 14.0, 5, &[Body::Machine]);
         assert_eq!(r.phase, Phase::Extracted);
         assert_eq!(r.encounters_cleared, 3);
         assert!(r.drop.is_some(), "a finished raid paid nothing");
@@ -376,8 +376,8 @@ mod tests {
         fast.sites = vec![site(Approach::ClearLz, 200.0, 60.0)];
         let mut slow = fast.clone();
         slow.sites = vec![site(Approach::ClearLz, 200.0, 1_200.0)];
-        let a = run(&fast, Body::Cybertronian, 14.0, 1, &[Body::Cybertronian]);
-        let b = run(&slow, Body::Cybertronian, 14.0, 1, &[Body::Cybertronian]);
+        let a = run(&fast, Body::Machine, 14.0, 1, &[Body::Machine]);
+        let b = run(&slow, Body::Machine, 14.0, 1, &[Body::Machine]);
         assert!(a.phase > b.phase, "a slow landing should cost encounters: {a:?} {b:?}");
     }
 
@@ -392,9 +392,9 @@ mod tests {
         // position is actually for.
         let mut r = raid(Weather::DustStorm, quiet());
         r.sites = vec![site(Approach::SeizeFortress, 300.0, 120.0)];
-        let fort = run(&r, Body::Cybertronian, 14.0, 2, &[Body::Cybertronian]);
+        let fort = run(&r, Body::Machine, 14.0, 2, &[Body::Machine]);
         r.sites = vec![site(Approach::ClearLz, 300.0, 120.0)];
-        let lz = run(&r, Body::Cybertronian, 14.0, 2, &[Body::Cybertronian]);
+        let lz = run(&r, Body::Machine, 14.0, 2, &[Body::Machine]);
         assert!(fort.phase >= lz.phase, "fortress {:?} lz {:?}", fort.phase, lz.phase);
     }
 
@@ -421,7 +421,7 @@ mod tests {
         // being wrong, and it means the body difference shows up as TIME TO
         // SPARE rather than as a different ending.
         let r = raid(Weather::GiantWave, quiet());
-        let bot = run(&r, Body::Cybertronian, 16.0, 9, &[Body::Cybertronian]);
+        let bot = run(&r, Body::Machine, 16.0, 9, &[Body::Machine]);
         let man = run(&r, Body::HumanSuited, 2.5, 9, &[Body::HumanSuited]);
         assert!(bot.margin_s > man.margin_s + 30.0,
             "a machine should have far more slack: {:.0} vs {:.0}", bot.margin_s, man.margin_s);
@@ -429,7 +429,7 @@ mod tests {
         // system saying the difference only shows under pressure
         let easy = raid(Weather::DustStorm, quiet());
         assert_eq!(
-            run(&easy, Body::Cybertronian, 16.0, 9, &[Body::Cybertronian]).phase,
+            run(&easy, Body::Machine, 16.0, 9, &[Body::Machine]).phase,
             run(&easy, Body::HumanSuited, 2.5, 9, &[Body::HumanSuited]).phase
         );
     }
@@ -437,8 +437,8 @@ mod tests {
     #[test]
     fn the_same_raid_run_twice_does_the_same_thing() {
         let r = raid(Weather::DustStorm, quiet());
-        let a = run(&r, Body::Cybertronian, 14.0, 77, &[Body::Cybertronian]);
-        let b = run(&r, Body::Cybertronian, 14.0, 77, &[Body::Cybertronian]);
+        let a = run(&r, Body::Machine, 14.0, 77, &[Body::Machine]);
+        let b = run(&r, Body::Machine, 14.0, 77, &[Body::Machine]);
         assert_eq!(a.phase, b.phase);
         assert_eq!(a.drop.map(|d| d.grade), b.drop.map(|d| d.grade));
     }
@@ -452,8 +452,8 @@ mod tests {
         lz.sites = vec![site(Approach::ClearLz, 200.0, 60.0)];
         let mut fort = r.clone();
         fort.sites = vec![site(Approach::SeizeFortress, 300.0, 120.0)];
-        let a = run(&lz, Body::Cybertronian, 14.0, 4, &[Body::Cybertronian]);
-        let b = run(&fort, Body::Cybertronian, 14.0, 4, &[Body::Cybertronian]);
+        let a = run(&lz, Body::Machine, 14.0, 4, &[Body::Machine]);
+        let b = run(&fort, Body::Machine, 14.0, 4, &[Body::Machine]);
         assert!(ship_exposure(&a, &lz) > 0.0, "a pinned ship should be exposed");
         assert_eq!(ship_exposure(&b, &fort), 0.0, "a ship in orbit takes nothing");
 
@@ -474,8 +474,8 @@ mod tests {
         let d = Drive { dv_kms: 200.0, supply_s: 6.0 * 3600.0, ..Drive::default() };
         let near = plan(1.0, 1.524, &d, 4);
         let far = plan(1.0, 9.537, &d, 4);
-        let a = run_after_voyage(&r, &near, Body::Cybertronian, 14.0, 3, &[Body::Cybertronian]);
-        let b = run_after_voyage(&r, &far, Body::Cybertronian, 14.0, 3, &[Body::Cybertronian]);
+        let a = run_after_voyage(&r, &near, Body::Machine, 14.0, 3, &[Body::Machine]);
+        let b = run_after_voyage(&r, &far, Body::Machine, 14.0, 3, &[Body::Machine]);
         assert!(a.margin_s >= b.margin_s, "the long haul should not arrive richer");
         assert_eq!(a.phase, Phase::Extracted);
     }
@@ -487,7 +487,7 @@ mod tests {
         let d = Drive { dv_kms: 4.0, ..Drive::default() };
         let leg = plan(1.0, 39.48, &d, 4);
         assert!(!leg.reachable);
-        let out = run_after_voyage(&r, &leg, Body::Cybertronian, 14.0, 1, &[Body::Cybertronian]);
+        let out = run_after_voyage(&r, &leg, Body::Machine, 14.0, 1, &[Body::Machine]);
         assert_eq!(out.phase, Phase::Repulsed);
         assert!(out.note.contains("never arrived"), "{}", out.note);
         assert!(out.drop.is_none());
@@ -508,7 +508,7 @@ mod tests {
         // and this is the bunker-drowns rule paying off rather than biting:
         // foothold refuses a HOLE against water, and a seawall is not a hole
         let r = tidemaw();
-        let out = run(&r, Body::Cybertronian, 13.0, 11, &[Body::Cybertronian]);
+        let out = run(&r, Body::Machine, 13.0, 11, &[Body::Machine]);
         assert!(out.phase >= Phase::Contested, "{:?} {}", out.phase, out.note);
     }
 
@@ -531,7 +531,7 @@ mod tests {
         let cold = Orbit { star: StarClass::G, au: 32.0, albedo: 0.5, air: 0.0 };
         let mut r = raid(Weather::Clear, cold);
         r.encounters = vec![30.0];
-        let out = run(&r, Body::Cybertronian, 14.0, 4, &[Body::Cybertronian]);
+        let out = run(&r, Body::Machine, 14.0, 4, &[Body::Machine]);
         assert_eq!(out.phase, Phase::Extracted);
         assert_eq!(out.drop.unwrap().base.effect, crate::loadout::Effect::ColdFloor);
     }

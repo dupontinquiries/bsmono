@@ -19,7 +19,7 @@
 //! 0.05 AU gets minutes. Pluto would get days.
 //!
 //! Bodies differ in the way the fiction wants them to and the physics
-//! supports. A Cybertronian is a machine: vacuum is nothing, the temperature
+//! supports. A Machine is a machine: vacuum is nothing, the temperature
 //! band is enormous, and what actually threatens it is the flare — charged
 //! particles into unshielded electronics. A human in a suit has the opposite
 //! profile: the suit handles vacuum and radiation for a while, and the
@@ -32,7 +32,7 @@ use crate::sun::{Orbit, SunState, Surface};
 pub enum Body {
     /// a machine. Wide thermal band, indifferent to vacuum, vulnerable to
     /// charged particles.
-    Cybertronian,
+    Machine,
     /// pressure suit with radiation shielding and finite consumables
     HumanSuited,
     /// no suit. Included because the campaign has civilians in it and the
@@ -60,7 +60,7 @@ impl Body {
             // metal, sealed, and built for a war fought across a solar
             // system. The band is wide but not infinite: past rock's solidus
             // the ground it stands on is liquid.
-            Body::Cybertronian => Envelope {
+            Body::Machine => Envelope {
                 t_min: 20.0,
                 t_max: 1_350.0,
                 vacuum_ok: true,
@@ -87,7 +87,7 @@ impl Body {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Body::Cybertronian => "CYBERTRONIAN",
+            Body::Machine => "MACHINE",
             Body::HumanSuited => "SUITED",
             Body::HumanBare => "UNPROTECTED",
         }
@@ -206,7 +206,7 @@ pub fn can_reach(body: Body, b: &Bunker, seconds: f32, speed_ms: f32) -> (bool, 
     let travel = b.distance_m / speed_ms.max(0.1);
     // a machine does not slow down; a suited human loses time to terrain
     let fudge = match body {
-        Body::Cybertronian => 1.0,
+        Body::Machine => 1.0,
         Body::HumanSuited => 1.35,
         Body::HumanBare => 1.2,
     };
@@ -254,12 +254,12 @@ mod tests {
     fn a_bot_stands_where_a_person_cannot() {
         // the whole reason the campaign can go to these places
         let luna = Orbit { star: StarClass::G, au: 1.0, albedo: 0.12, air: 0.0 };
-        assert_eq!(threat(Body::Cybertronian, &luna, &day(), false), Threat::None);
+        assert_eq!(threat(Body::Machine, &luna, &day(), false), Threat::None);
         assert_eq!(threat(Body::HumanBare, &luna, &day(), false), Threat::Vacuum);
         // and a suit buys the middle ground rather than parity
         assert_eq!(threat(Body::HumanSuited, &luna, &day(), false), Threat::None);
         assert!(time_to_trouble(Body::HumanSuited, &luna, &day(), false).is_finite());
-        assert!(time_to_trouble(Body::Cybertronian, &luna, &day(), false).is_infinite());
+        assert!(time_to_trouble(Body::Machine, &luna, &day(), false).is_infinite());
     }
 
     #[test]
@@ -291,7 +291,7 @@ mod tests {
     fn molten_ground_is_immediate_for_everything() {
         let lava = Orbit { star: StarClass::G, au: 0.02, albedo: 0.1, air: 0.0 };
         assert_eq!(lava.surface(), Surface::Molten);
-        for b in [Body::Cybertronian, Body::HumanSuited, Body::HumanBare] {
+        for b in [Body::Machine, Body::HumanSuited, Body::HumanBare] {
             assert_eq!(time_to_trouble(b, &lava, &day(), false), 0.0, "{b:?} stood on lava");
         }
     }
@@ -313,11 +313,11 @@ mod tests {
         let secs = flare_warning_s(&m, true);
         let near = Bunker { distance_m: 400.0, shielded: true };
         let far = Bunker { distance_m: 40_000.0, shielded: true };
-        assert!(can_reach(Body::Cybertronian, &near, secs, 18.0).0, "a bot could not make 400 m");
+        assert!(can_reach(Body::Machine, &near, secs, 18.0).0, "a bot could not make 400 m");
         assert!(!can_reach(Body::HumanSuited, &far, secs, 2.5).0, "a suited human crossed 40 km");
         // and the bot beats the human over the same ground, which is the
         // reason to be one
-        let (_, bot_spare) = can_reach(Body::Cybertronian, &near, secs, 18.0);
+        let (_, bot_spare) = can_reach(Body::Machine, &near, secs, 18.0);
         let (_, human_spare) = can_reach(Body::HumanSuited, &near, secs, 2.5);
         assert!(bot_spare > human_spare);
     }
@@ -575,7 +575,7 @@ mod shelter_tests {
     #[test]
     fn a_bot_in_the_open_outlasts_a_suited_human_in_the_open() {
         // and the campaign's premise holds under weather too
-        let bot = survive_s(Body::Cybertronian, ShelterKind::None, Weather::ThermalFront, 120.0);
+        let bot = survive_s(Body::Machine, ShelterKind::None, Weather::ThermalFront, 120.0);
         let man = survive_s(Body::HumanSuited, ShelterKind::None, Weather::ThermalFront, 120.0);
         assert!(bot >= man, "{bot} vs {man}");
     }
@@ -611,7 +611,7 @@ mod shelter_tests {
             (ShelterKind::Bunker, Bunker { distance_m: 40.0, shielded: true }),
             (ShelterKind::SkyCity, Bunker { distance_m: 300.0, shielded: false }),
         ];
-        let pick = best_reachable(Body::Cybertronian, &opts, Weather::GiantWave, 120.0, 12.0);
+        let pick = best_reachable(Body::Machine, &opts, Weather::GiantWave, 120.0, 12.0);
         assert_eq!(pick.map(|p| p.0), Some(ShelterKind::SkyCity),
             "it ran into a hole with a wave coming");
     }

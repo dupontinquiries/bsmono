@@ -63,7 +63,7 @@ pub static CODEX: &[Entry] = &[
         title: "the under-garden",
         claim: None,
         lines: &[
-            "jhiaxus kept his failures. fed them. below the garden",
+            "assay kept his failures. fed them. below the garden",
             "of helix the roof is alive, and it remembers how to",
             "hold on. do not trust a ceiling you cannot see.",
         ],
@@ -153,7 +153,7 @@ pub static CODEX: &[Entry] = &[
         title: "the corrupted",
         claim: None,
         lines: &[
-            "unicron's tissue hijacks the will to transform.",
+            "unending's tissue hijacks the will to transform.",
             "no fixed shape, ever. they hunt by spark resonance,",
             "so stillness will not hide you. only the sparkless walk free.",
         ],
@@ -259,8 +259,8 @@ pub static CODEX: &[Entry] = &[
         ],
     },
     Entry {
-        id: "jhiaxus",
-        title: "jhiaxus",
+        id: "assay",
+        title: "assay",
         claim: None,
         lines: &[
             "the signal architect. never afraid, never cruel --",
@@ -279,8 +279,8 @@ pub static CODEX: &[Entry] = &[
         ],
     },
     Entry {
-        id: "optimus",
-        title: "optimus",
+        id: "keelwright",
+        title: "keelwright",
         claim: None,
         lines: &[
             "he stops believing himself eternal, and begins",
@@ -289,8 +289,8 @@ pub static CODEX: &[Entry] = &[
         ],
     },
     Entry {
-        id: "rodimus",
-        title: "rodimus",
+        id: "halyard",
+        title: "halyard",
         claim: None,
         lines: &[
             "the heir who leads as if apologizing for it,",
@@ -309,9 +309,9 @@ pub static CODEX: &[Entry] = &[
         ],
     },
     Entry {
-        id: "unicron",
-        title: "unicron",
-        claim: Some("unicron_in_earth"),
+        id: "unending",
+        title: "unending",
+        claim: Some("unending_in_earth"),
         lines: &[
             "not a villain -- an event. a devourer the matrix",
             "drove dormant but never silenced. his neural remnants",
@@ -329,13 +329,13 @@ pub static CODEX: &[Entry] = &[
         ],
     },
     Entry {
-        id: "cybertron",
-        title: "cybertron",
+        id: "foundry",
+        title: "foundry",
         claim: Some("architecture_is_machine"),
         lines: &[
             "it stood for millions of cycles, and mistook",
             "endurance for destiny. rule by restricted data tier;",
-            "only the prime-line held the oldest secret of all.",
+            "only the keelwright-line held the oldest secret of all.",
         ],
     },
     Entry {
@@ -343,7 +343,7 @@ pub static CODEX: &[Entry] = &[
         title: "the clone coalition",
         claim: None,
         lines: &[
-            "elemental nations older than cybertron's golden age,",
+            "elemental nations older than foundry's golden age,",
             "each a people of a single power -- ice, fire, metal --",
             "holding the shield's perimeter against the hijacks.",
         ],
@@ -354,7 +354,7 @@ pub static CODEX: &[Entry] = &[
         claim: None,
         lines: &[
             "humans who have lived inside the shield the longest,",
-            "and so read its interior as no cybertronian can.",
+            "and so read its interior as no machine can.",
             "the bearer trusts them a shade more than the rest.",
         ],
     },
@@ -365,7 +365,7 @@ pub static CODEX: &[Entry] = &[
         lines: &[
             "warm gold and noise and life -- pluto's opposite.",
             "beneath the crust, a metallic hand sinking, geological,",
-            "and the sealed truth the prime-line always carried.",
+            "and the sealed truth the keelwright-line always carried.",
         ],
     },
     Entry {
@@ -393,27 +393,27 @@ pub static CODEX: &[Entry] = &[
         title: "cryotek",
         claim: None,
         lines: &[
-            "the cold open: an ice-base decepticon holding the outer rim,",
-            "ice-plasma and frozen shards, mining cybertron's dead fragments.",
+            "the cold open: an ice-base sundered holding the outer rim,",
+            "ice-plasma and frozen shards, mining foundry's dead fragments.",
             "sam ends him early -- the first skirmish, and a statement of tone.",
         ],
     },
     Entry {
         id: "hot_rod",
-        title: "hot rod",
+        title: "jib",
         claim: None,
         lines: &[
-            "a reckless young scout in earth orbit who idolizes prime.",
+            "a reckless young scout in earth orbit who idolizes keelwright.",
             "he dives the ruptured mantle, and at the worst moment",
-            "takes up the matrix -- and rises out of it as rodimus.",
+            "takes up the matrix -- and rises out of it as halyard.",
         ],
     },
     Entry {
-        id: "megatron",
-        title: "megatron",
+        id: "cleave",
+        title: "cleave",
         claim: None,
         lines: &[
-            "drawn to the energon pulse, he returns changed --",
+            "drawn to the valence pulse, he returns changed --",
             "hardened, reflective. he has watched the devourer eat",
             "even his own kind, and for the first time offers a truce.",
         ],
@@ -429,8 +429,8 @@ pub static CODEX: &[Entry] = &[
         ],
     },
     Entry {
-        id: "the_decepticons",
-        title: "the decepticons",
+        id: "the_sundered",
+        title: "the sundered",
         claim: None,
         lines: &[
             "conquest was the old war. this one is different --",
@@ -453,7 +453,7 @@ pub static CODEX: &[Entry] = &[
         title: "forgeheart",
         claim: None,
         lines: &[
-            "an autobot who fights the terrain itself: flips a spinning",
+            "an enduring who fights the terrain itself: flips a spinning",
             "asteroid to crush an ambush, raises debris into cover.",
             "heavy, deliberate, and hard to move once he sets his feet.",
         ],
@@ -473,7 +473,7 @@ pub static CODEX: &[Entry] = &[
         title: "the reassembler",
         claim: None,
         lines: &[
-            "unicron was never built to destroy. he was built to rebuild --",
+            "unending was never built to destroy. he was built to rebuild --",
             "break dead worlds down, reforge them into living ones.",
             "a god-machine. the makers simply lost the controls.",
         ],
@@ -483,7 +483,7 @@ pub static CODEX: &[Entry] = &[
         title: "sam witwicky",
         claim: None,
         lines: &[
-            "the human who has stood with the autobots longest.",
+            "the human who has stood with the enduring longest.",
             "he builds the interface, keeps the link to old lore,",
             "and mentors the one who will carry it forward.",
         ],
@@ -494,7 +494,7 @@ pub static CODEX: &[Entry] = &[
         claim: None,
         lines: &[
             "between mars and jupiter, a belt of broken war --",
-            "cybertron's scattered fragments, dead outposts, drifting hulls.",
+            "foundry's scattered fragments, dead outposts, drifting hulls.",
             "when the devourer woke, the whole belt woke with it.",
         ],
     },
@@ -516,7 +516,7 @@ pub static CODEX: &[Entry] = &[
             "archive enforcement, technocracy era. deep purple",
             "oxidation over hard geometric lines -- no flashy parts.",
             "speaks in clipped logic; never monologues. believes",
-            "cybertron fell when it abandoned purity. he wants the",
+            "foundry fell when it abandoned purity. he wants the",
             "buried cores. everything else is an obstacle.",
         ],
     },
@@ -533,13 +533,13 @@ pub static CODEX: &[Entry] = &[
         ],
     },
     Entry {
-        id: "dossier_jhiaxus",
-        title: "dossier: jhiaxus",
+        id: "dossier_assay",
+        title: "dossier: assay",
         claim: None,
         lines: &[
             "he helped design the control interface, under the",
             "technocrats, and regrets nothing. not evil -- clinical.",
-            "cybertron failed, he says, because it hesitated. his",
+            "foundry failed, he says, because it hesitated. his",
             "gardens grow bodies perfected past identity. the",
             "crawlers in the roots are his drafts.",
         ],
@@ -589,7 +589,7 @@ pub static CODEX: &[Entry] = &[
         lines: &[
             "a fragment, unsigned, found threaded through the watch's code:",
             "'we grew them a body that remembers being both. metal that",
-            "breathes. energon that beats. if you are reading this, archivist,",
+            "breathes. valence that beats. if you are reading this, archivist,",
             "the graft is yours to wake.'",
         ],
     },

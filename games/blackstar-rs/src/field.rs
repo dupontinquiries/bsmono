@@ -44,7 +44,7 @@
 //! ## Two registers, and being caught between forms
 //!
 //! The brief is a mix: Dark of the Moon's slow, heavy, consequential
-//! hits and War for Cybertron's stream of fast rounds. `weapons::
+//! hits and War for the Foundry's stream of fast rounds. `weapons::
 //! Register` names which a form is; the field answers each differently.
 //! A HEAVY hit worth a real fraction of the body's health STAGGERS it —
 //! still, silent, exposed for `STAGGER_S`. FAST fire SUPPRESSES: every

@@ -192,6 +192,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "audio-kit"
+version = "0.1.0"
+dependencies = [
+ "core-kit",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -498,6 +505,10 @@ dependencies = [
  "core-foundation",
  "libc",
 ]
+
+[[package]]
+name = "core-kit"
+version = "0.1.0"
 
 [[package]]
 name = "coreaudio-rs"
@@ -1263,6 +1274,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "linebank"
+version = "0.1.0"
+dependencies = [
+ "audio-kit",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2009,6 +2027,7 @@ dependencies = [
  "gltf",
  "image",
  "libloading",
+ "linebank",
  "log",
  "miniz_oxide",
  "naga",

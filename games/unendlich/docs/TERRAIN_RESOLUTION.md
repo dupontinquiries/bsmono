@@ -35,13 +35,17 @@ stride 1 by definition, so the near field pays the multiplier in full.
 
 Two further multipliers people forget:
 
-* **Fields cost more than terrain.** A registered `f32` field is 4 bytes per
-  cell against 1 byte for a block id — 128 KB per chunk per field versus 32 KB
-  for the blocks. Temperature plus humidity plus a density field already
-  outweigh the terrain data by a wide margin, and they scale with cell count
-  too.
-* **The weather sim is per-cell work**, so it pays the multiplier as compute,
-  not just memory. It is an argument for caution here, not reassurance.
+* **Fields are cheap, and this file used to claim otherwise.** An earlier
+  revision said a registered `f32` field costs 4 bytes per CELL — 128 KB per
+  chunk. That is wrong. `fields.rs` sets `FIELD_RESOLUTION = 8`, so a field
+  grid is 8³ = 512 samples per 32³ chunk: **2 KB**, with `sample_at_block`
+  mapping a block coordinate onto it by dividing by 32. Fields are a coarse
+  overlay, not a per-voxel store, and they are not the memory problem.
+  Corrected because the mistaken figure was being used as an argument against
+  a smaller block, and it was not a real one.
+* **The weather sim is per-cell work**, so it pays the multiplier as compute.
+  Still a reason for caution, though a smaller one than the line above
+  implied.
 
 ## Why the blockiness is not actually a cell-size problem
 
@@ -57,10 +61,22 @@ cell. Effective precision stops being the grid and becomes the float. Slopes
 become continuous, so the step-height navigation problem disappears rather
 than shrinking.
 
-**The storage for this already exists.** The field system is per-cell `f32`
-indexed by a registry (`ChunkManager::field_at`, `FieldRegistry`,
-`chunk_field_snapshot`) — the same machinery carrying temperature and
-humidity. A `density` field is a new registry entry, not new infrastructure.
+**The storage does NOT already exist, and this file used to say it did.** The
+field system looked like the answer — `ChunkManager::field_at`,
+`FieldRegistry`, `chunk_field_snapshot`, the machinery already carrying
+temperature and humidity. It is not, for the reason above: at
+`FIELD_RESOLUTION = 8` a field grid is FOUR TIMES COARSER than the block grid
+it overlays. Density must be at least per-block or it cannot say where inside
+a block the surface sits, which is the entire point. Register `density` as a
+`FieldDef` and you get a working, useless, blurry answer.
+
+**What it actually needs: a per-block scalar beside the block ids** — and `u8`,
+not `f32`. The extractor's own measured precision bound is about 0.2 cells
+(`isosurface`'s `a_sphere_comes_out_round`); 8 bits gives 1/256 of a cell,
+two orders of magnitude finer than the method can use. That puts density at
+32 KB per chunk, the same as the block ids, so chunk memory roughly DOUBLES
+rather than quintupling. `isosurface::Field` is a trait over `f32`, so a `u8`
+store maps onto it at sample time with no change to the extractor.
 
 **What has to change is the extractor.** `render/mesher.rs` is greedy meshing:
 it merges quads of the same block type, which is inherently the blocky path.
@@ -79,15 +95,25 @@ conservatively declines to cull across a stride change. That works for cubes,
 where a mismatch leaves a seam of duplicated quads. A smooth surface does not
 get off that lightly — a stride mismatch leaves a hole you can see through.
 
-**This cost exists at any block size.** It is the reason to change one thing at
-a time.
+**This cost existed at any block size**, which was the reason to change one
+thing at a time. It is now paid.
 
 ## Sequence
 
 1. Add the `density` field. No storage-model change, no visual change.
 2. Replace the terrain extractor with surface nets / dual contouring reading
    density. Keep greedy meshing for anything built out of discrete blocks.
-3. Solve LOD stitching. Expect this to be the bulk of the work.
+3. ~~Solve LOD stitching.~~ **DONE — `games/shared/isosurface`.** Expected to
+   be the bulk of the work; was about forty lines and a composition rule. A
+   boundary cell facing a coarser neighbour is meshed on the NEIGHBOUR'S cell
+   grid (`Seams`), so both sides interpolate the same samples: 1.46 cells of
+   disagreement down to 0.14. The remainder is structural — abutting chunks
+   own different cells either side of the plane — and closes completely when
+   the fine chunk meshes one coarse footprint PAST the shared plane, at which
+   point it owns the neighbour's cell, computes the identical vertex, and
+   emits the bridging quads. Every coarse vertex matches to within 1e-3. What
+   is left is SCHEDULING: which chunk owns the overlap, and re-meshing when a
+   neighbour's stride changes.
 4. **Measure on ARM** (postmarketOS / Fairphone / PinePhone class).
 5. Only then consider 0.5 m, and only with the profile in hand.
 

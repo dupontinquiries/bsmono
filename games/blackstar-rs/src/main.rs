@@ -40,6 +40,7 @@ mod foldaudit;
 mod foldsim;
 mod font;
 mod footing;
+mod fragment;
 mod cable;
 mod field;
 mod grandeur;
@@ -50,7 +51,7 @@ mod fx;
 mod gyro;
 mod content;
 mod crawler;
-mod cybertronian;
+mod machine;
 mod curriculum;
 mod corruption;
 mod cyber;
@@ -65,6 +66,8 @@ mod perception;
 mod trainwatch;
 mod tuner;
 mod tuning;
+mod vo;
+mod vocab;
 mod valuestruct;
 mod hazard;
 mod helmai;
@@ -134,9 +137,10 @@ mod sortie;
 mod stance;
 mod stations;
 mod suitability;
+mod superform;
 mod stealth;
 mod vault;
-mod energon;
+mod valence;
 mod finale;
 mod nightfall;
 mod orient;
@@ -636,7 +640,7 @@ fn parse_args() -> Opts {
                 println!("  --bench [code] roll, keep and share authored frames");
                 println!("  --voxel        critics for a voxel GAN: skeleton and part matching");
                 println!("  --gravity      the well formula, checked against real physics");
-                println!("  --frames       cybertronian frames, designed from the planet");
+                println!("  --frames       machine frames, designed from the planet");
                 println!("  --space        kuiper as space: angular LOD, gravity, depth, the floor");
                 println!("  --roster       the bot census, and what the distribution implies");
                 println!("  --rip          finishers: the style of the kill is who you are");
@@ -1455,7 +1459,7 @@ fn main() {
         return;
     }
     if argv.iter().any(|a| a == "--frames") {
-        cybertronian::run();
+        machine::run();
         return;
     }
     if argv.iter().any(|a| a == "--space") {
@@ -1541,6 +1545,12 @@ fn main() {
     if argv.iter().any(|a| a == "--arch") {
         // the archaeological map: strata, findings, the Asteri arithmetic
         archsim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--vo") {
+        // the voice bank: lines lifted from the screenplays, barks authored,
+        // ids derived, scripts written for the booth
+        vo::run(&argv);
         return;
     }
     if argv.iter().any(|a| a == "--campaign") {
@@ -8183,7 +8193,7 @@ impl Game {
         };
         // WHO THE ECHO IS ALLOWED TO CARRY. The model may have asked for
         // anyone; `casting::admit` checks each name against this save's own
-        // campaign, so the same forged raid can legally cast Megatron for a
+        // campaign, so the same forged raid can legally cast Cleave for a
         // player mid-Film-3 and cast nobody for one who has seen the plates
         // close. Parsing deliberately kept the request unvalidated because it
         // has no idea which save it is for.
@@ -8733,7 +8743,7 @@ impl Game {
         // ---- TRACERS: every live shot, both pools ----
         // The shot pools flew invisible rounds: `shots::step` landed them
         // and `fx` burst on impact, but nothing drew the flight. War for
-        // Cybertron's whole feel is the stream in the air; a fight where
+        // the Foundry's whole feel is the stream in the air; a fight where
         // you cannot see what is coming reads as nothing happening. A
         // stretched emissive sphere along the velocity, element-tinted;
         // hostile rounds pulled toward a hot red so whose it is reads at a

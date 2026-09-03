@@ -499,7 +499,7 @@ mod tests {
         assert!(s.plot("nowhere", Arrival::Fly).is_err());
         s.fuel = 0.0;
         assert_eq!(
-            s.plot("cybertron", Arrival::Fly).unwrap_err(),
+            s.plot("foundry", Arrival::Fly).unwrap_err(),
             "not enough fuel for that leg"
         );
     }

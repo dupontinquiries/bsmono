@@ -83,7 +83,7 @@ impl Verb {
 
 /// THE TWO REGISTERS a fight is written in. Dark of the Moon's combat is
 /// slow, heavy and consequential — a hit is a stagger, a fall, a section
-/// coming off. War for Cybertron's is fast — a stream of rounds a movie
+/// coming off. War for the Foundry's is fast — a stream of rounds a movie
 /// with plot-armoured leads cannot acknowledge and a game can. The forms
 /// already sit on both ends of that line (PHOTON is 26 impulse every
 /// 2.4 s; WATER is 1.6 every 0.06 s); this names which end each is on,
@@ -1369,7 +1369,7 @@ pub enum Mod {
     Stabilizer,
     Amplifier,
     ChainCoil,
-    EnergonCell,
+    ValenceCell,
     RapidCoil,
     PierceCore,
     ScatterBarrel,
@@ -1384,7 +1384,7 @@ pub const MOD_SLOTS: usize = 3;
 
 pub const MODS: [Mod; 16] = [
     Mod::LongBarrel, Mod::Scope, Mod::ExtMag, Mod::Underbarrel, Mod::Stabilizer,
-    Mod::Amplifier, Mod::ChainCoil, Mod::EnergonCell, Mod::RapidCoil, Mod::PierceCore,
+    Mod::Amplifier, Mod::ChainCoil, Mod::ValenceCell, Mod::RapidCoil, Mod::PierceCore,
     Mod::ScatterBarrel, Mod::RippleCoil, Mod::CryoRounds, Mod::FlakCore, Mod::PlasmaCore,
     Mod::SuppressCore,
 ];
@@ -1399,7 +1399,7 @@ impl Mod {
             Mod::Stabilizer => "STABILIZER",
             Mod::Amplifier => "AMPLIFIER",
             Mod::ChainCoil => "CHAIN COIL",
-            Mod::EnergonCell => "ENERGON CELL",
+            Mod::ValenceCell => "VALENCE CELL",
             Mod::RapidCoil => "RAPID COIL",
             Mod::PierceCore => "PIERCE CORE",
             Mod::ScatterBarrel => "SCATTER BARREL",
@@ -1424,7 +1424,7 @@ impl Mod {
             Mod::Stabilizer => "stabilizer",
             Mod::Amplifier => "amplifier",
             Mod::ChainCoil => "chain_coil",
-            Mod::EnergonCell => "energon_cell",
+            Mod::ValenceCell => "valence_cell",
             Mod::RapidCoil => "rapid_coil",
             Mod::PierceCore => "pierce_core",
             Mod::ScatterBarrel => "scatter_barrel",
@@ -1502,7 +1502,7 @@ impl Form {
                 Mod::Stabilizer => { e.spread *= 0.60; }
                 Mod::Amplifier => { e.impulse *= 1.30; e.cooldown *= 1.20; }
                 Mod::ChainCoil => { e.chains += 1; }
-                Mod::EnergonCell => { e.impulse *= 1.45; e.cooldown *= 1.30; }
+                Mod::ValenceCell => { e.impulse *= 1.45; e.cooldown *= 1.30; }
                 Mod::RapidCoil => { e.cooldown *= 0.60; e.impulse *= 0.75; }
                 Mod::CryoRounds => { e.slow = e.slow.max(0.45); }
                 Mod::PierceCore => { e.speed = 0.0; e.reach *= 1.25; e.cooldown *= 1.20; }

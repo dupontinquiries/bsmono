@@ -19,6 +19,8 @@ gamepad = ["dep:gilrs", "shellkit/gamepad"]
 analog = ["dep:libloading", "shellkit/analog"]
 
 [dependencies]
+# voice bank: ids, screenplay parsing, scripts, size budget (games/shared/linebank)
+linebank = { path = "../shared/linebank" }
 # THE FORGE'S MOUTH (src/raidforge.rs): aperture's completion engine, which is
 # logscope-fan's dependency-free ollama client grown a Provider trait — raw
 # TcpStream HTTP/1.1, std-only, zero transitive deps, blocking by design so it

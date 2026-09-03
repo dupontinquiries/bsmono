@@ -1,7 +1,7 @@
-//! THE CORRUPTED — Jhiaxus' experiment, mechanized.
+//! THE CORRUPTED — Assay' experiment, mechanized.
 //!
 //! Source: `TF_JHIAXUS_AND_THE_CORRUPTED.md`, the screenplay's Film 2
-//! horror design document. A Decepticon exposed to Unicron's neural
+//! horror design document. A Sundered exposed to the Unending's neural
 //! remnant does not die; its transformation protocol is hijacked and
 //! reissued forever, with no defined endpoint, so the body attempts
 //! transformation perpetually. This module is the treatment's "Powers
@@ -14,7 +14,7 @@
 //!   logic — and it is why the watch-bearer (`chi.rs`, `clones.rs`,
 //!   `watch.rs`) is not a liability against them, structurally,
 //!   regardless of how the fight is going for everyone else.
-//! * **Energon cascade transmission** — "any Transformer struck by it
+//! * **Valence cascade transmission** — "any Transformer struck by it
 //!   risks beginning Stage 1 corruption." A human is never at risk;
 //!   the doc's transmission is a Transformer-to-Transformer problem,
 //!   same as detection.
@@ -149,7 +149,7 @@ impl Corrupted {
         if target_is_human {
             return false;
         }
-        // higher stages bleed more energon, more often
+        // higher stages bleed more valence, more often
         let chance = match self.stage {
             Stage::One => 0.08,
             Stage::Two => 0.16,

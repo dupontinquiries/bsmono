@@ -54,7 +54,7 @@ fn material_of(d: &Destination) -> Material {
         // volcanic: Io's tide-forges resurface it faster than it weathers
         "io" => Material::Basalt,
         // worked metal, not geology
-        "cybertron" => Material::Metal,
+        "foundry" => Material::Metal,
         // wind-sorted grains over rock: the dune worlds
         "mars" | "titan" => Material::Regolith,
         // airless and impact-gardened: regolith over basalt, and the top
@@ -83,8 +83,8 @@ fn air_of(d: &Destination) -> f32 {
         (Sky::Atmosphere, _) => 1.0,
         (Sky::Murk, _) => 0.5,
         (Sky::Ember, _) => 0.01,
-        // deep-space starfield and Cybertron's lattice sky: no atmosphere to
-        // speak of. Cybertron's is a built ceiling, not weather.
+        // deep-space starfield and the Foundry's lattice sky: no atmosphere to
+        // speak of. the Foundry's is a built ceiling, not weather.
         (Sky::Starfield, _) => 0.0,
         (Sky::Lattice, _) => 0.0,
     }
@@ -513,7 +513,7 @@ fn scale_cmd() {
     println!("  a car game and not about cameras. Pointed at an 8.5 m bot that");
     println!("  distance is nearer than the bot is tall.");
     println!("\n  model_tuning.json normalises every model INTO that body:");
-    println!("  Optimus Prime ships at scale 0.4989. At his real height he");
+    println!("  Keelwright ships at scale 0.4989. At his real height he");
     println!("  wants {:.1}.", scale::true_scale(0.4989, 8.5));
     let (d, _) = scale::camera_for(Class::Titan, 228.0);
     println!("\n  a person and Two California Plaza in one shot is a 130:1 span");
@@ -728,7 +728,7 @@ mod tests {
     fn material_is_stated_for_every_named_world() {
         // the mapping is a judgement, so it should be a DELIBERATE one for
         // every world the fiction names; the default is for procedural rows
-        for id in ["earth", "mars", "luna", "europa", "io", "titan", "glaciem", "pluto", "cybertron"] {
+        for id in ["earth", "mars", "luna", "europa", "io", "titan", "glaciem", "pluto", "foundry"] {
             let d = patrol::find(id).unwrap();
             let m = material_of(d);
             assert_ne!(
@@ -737,7 +737,7 @@ mod tests {
                 "a named world fell through to the default"
             );
         }
-        assert_eq!(material_of(patrol::find("cybertron").unwrap()), Material::Metal);
+        assert_eq!(material_of(patrol::find("foundry").unwrap()), Material::Metal);
         assert_eq!(material_of(patrol::find("pluto").unwrap()), Material::SoftIce);
     }
 

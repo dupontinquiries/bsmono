@@ -13,8 +13,8 @@
 //!   the documented intent real.
 //! * **The finale is the boss's own arena.** This replaces the C version's
 //!   random finale: The Reactor happens where the walking reactor lives.
-//!   Because every SYNC boss's arena is `unicron` (a roster fact raidcon
-//!   tests), the old "SYNC finishes at unicron" rule falls out for free.
+//!   Because every SYNC boss's arena is `unending` (a roster fact raidcon
+//!   tests), the old "SYNC finishes at unending" rule falls out for free.
 //! * **Every arena a phase references must exist** — checked at
 //!   construction, because the C header once shipped with two of three
 //!   phases pointing at maps that were never defined.
@@ -273,9 +273,13 @@ mod tests {
     use crate::raidcon::BOSSES;
 
     #[test]
-    fn nineteen_plans_of_three_phases() {
+    fn every_boss_gets_a_plan_of_three_phases() {
+        // Was nineteen_plans_of_three_phases; the Lattice made it twenty.
+        // Deriving the count from BOSSES rather than hardcoding it means
+        // raidcon::nineteen_bosses_with_the_recorded_spread stays the single
+        // place a roster change has to be acknowledged, instead of two.
         let all = plan_all(7);
-        assert_eq!(all.len(), 19);
+        assert_eq!(all.len(), BOSSES.len());
         for p in &all {
             assert_eq!(p.phases.len(), 3, "{}", p.boss.id);
             for ph in &p.phases {
@@ -307,12 +311,12 @@ mod tests {
     }
 
     #[test]
-    fn the_finale_is_the_bosss_own_arena_and_sync_ends_at_unicron() {
+    fn the_finale_is_the_bosss_own_arena_and_sync_ends_at_unending() {
         for p in plan_all(5) {
             let last = p.phases.last().unwrap();
             assert_eq!(last.arena.id, p.boss.arena, "{}", p.boss.id);
             if p.boss.mech == Mech::Sync {
-                assert_eq!(last.arena.id, "unicron", "{} is SYNC and ended elsewhere", p.boss.id);
+                assert_eq!(last.arena.id, "unending", "{} is SYNC and ended elsewhere", p.boss.id);
             }
             // and the approach opens AWAY from the boss's rules
             assert_ne!(p.phases[0].arena.id, p.boss.arena, "{} opens at home", p.boss.id);
@@ -357,7 +361,7 @@ mod tests {
     #[test]
     fn every_phase_of_every_raid_is_plannable() {
         // the content-level promise: whatever arena and weather a phase
-        // landed on, a Cybertronian team can take SOME foothold there.
+        // landed on, a Machine team can take SOME foothold there.
         // This is the check that catches an arena whose sky refuses every
         // site — the class of failure that otherwise shows up as a player
         // staring at REPULSED.
@@ -365,7 +369,7 @@ mod tests {
             for i in 0..p.phases.len() {
                 let r = phase_raid(&p, i);
                 assert!(
-                    takeable(&r.orbit, r.weather, &r.sites, Body::Cybertronian, 14.0),
+                    takeable(&r.orbit, r.weather, &r.sites, Body::Machine, 14.0),
                     "{} phase {} ({}) cannot be entered at all",
                     p.boss.id, i, p.phases[i].arena.id
                 );
@@ -379,7 +383,7 @@ mod tests {
         // roster should be clearable — that is what "authored" means here
         let mut cleared = 0;
         for p in plan_all(2) {
-            let (runs, won) = run_plan(&p, Body::Cybertronian, 14.0, 8, &[Body::Cybertronian; 3]);
+            let (runs, won) = run_plan(&p, Body::Machine, 14.0, 8, &[Body::Machine; 3]);
             if won {
                 cleared += 1;
                 assert_eq!(runs.len(), 3);
@@ -402,7 +406,7 @@ mod tests {
         // The flare arenas do not produce this split (their windows are
         // hours), which is itself worth knowing: the killer is the walk.
         let p = plan_for(boss_by("cherno"), 3, 4);
-        let (_, machine) = run_plan(&p, Body::Cybertronian, 14.0, 4, &[Body::Cybertronian; 3]);
+        let (_, machine) = run_plan(&p, Body::Machine, 14.0, 4, &[Body::Machine; 3]);
         let (runs, suited) = run_plan(&p, Body::HumanSuited, 2.5, 4, &[Body::HumanSuited; 3]);
         assert!(machine, "the machine team should clear the reactor's raid");
         assert!(!suited, "a suited team outran a thermal front on foot");

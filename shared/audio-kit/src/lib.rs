@@ -26,9 +26,11 @@
 
 pub mod gen;
 pub mod goertzel;
+pub mod envelope;
 pub mod fingerprint;
 pub mod level;
 pub mod pitch;
+pub mod wav;
 pub mod window;
 
 pub use gen::{Noise, Tone};

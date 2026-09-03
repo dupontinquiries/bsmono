@@ -38,7 +38,7 @@ You are dropped somewhere and the place keeps producing things to do.
 * Quota grows with clears. The world escalates around a player who is
   winning, which is not the same as a difficulty setting and does not feel
   like one.
-* Clearing pays energon; every third clear pays a rare heroic drop.
+* Clearing pays valence; every third clear pays a rare heroic drop.
 * Missing the clock fails the event and resets the cooldown. Nothing hangs.
 * The archive drips a fragment every 55–85 s. This is where the setting is
   delivered — while you are busy, one line at a time, never as a wall.
@@ -60,7 +60,7 @@ medium.
 | `Procedural` | generated from a seed | whatever it rolled |
 
 Earth, Mars, Luna, Europa, Io, Titan, Glaciem, Carrion Drift, Helix,
-Cybertron, the Outer Rim, the Shield Boundary, and Uncharted. Nine come from
+the Foundry, the Outer Rim, the Shield Boundary, and Uncharted. Nine come from
 the film material rather than being invented — the C engine modelled five
 planets and said nothing about what a planet *is*; the lore names Europa's
 listening post, Io's tide-forges, Titan's fuel rain, and the three clone
@@ -72,7 +72,7 @@ Four factions, all the script's:
 
 * **Hijacks** — the erratic conquerors the coalition shield holds back.
   They belong at the boundary and on anything outside it.
-* **Corrupted** — Jhiaxus' experiment. Earth, Europa, Cybertron: the places
+* **Corrupted** — Assay' experiment. Earth, Europa, the Foundry: the places
   where something is wrong underneath.
 * **Blackstar's clans** — they tax the outer rim, so they own Titan, Io and
   Carrion, and they are on the Outer Rim because he is already moving.

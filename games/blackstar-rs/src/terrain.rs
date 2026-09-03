@@ -41,7 +41,7 @@ pub enum Material {
     Sandstone,
     /// loose grains, no cohesion
     Regolith,
-    /// worked metal, for Cybertron and hulls
+    /// worked metal, for the Foundry and hulls
     Metal,
 }
 

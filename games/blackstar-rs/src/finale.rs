@@ -25,7 +25,7 @@
 //! reluctance about using full force"); choosing it once, in front of
 //! everyone, because the people he would otherwise kill are the
 //! reinforcements arriving to help him, is his version of the
-//! completed arc the treatment already gives Rodimus and Blackstar.
+//! completed arc the treatment already gives Halyard and Blackstar.
 //!
 //! Photon Man's role changes to match. The earlier draft had the two
 //! blasts colliding; the stronger version is a division of labour, and
@@ -40,9 +40,11 @@
 //! deliberately-not-full release (the doc flags this explicitly rather
 //! than quietly picking one), so both branches are left as they were.
 
+use crate::link::{Link, Refusal};
 use crate::watch::{self, Watch, PHOTON};
 
 /// What the strike did to whatever it caught.
+#[derive(Debug)]
 pub struct Convergence {
     /// hostiles cleared — scales with how much of the star Billy held,
     /// but is capped by construction below what a true nova would do,
@@ -62,13 +64,31 @@ pub const MIN_HELD_MULT: f32 = 3.0;
 /// formula below.
 const HULLS_PER_MULT: f32 = 40.0;
 
-/// Attempt the strike. Three gates, all of them load-bearing:
+/// Attempt the strike. Four gates, all of them load-bearing:
 /// * a TRUE nova refuses outright — that blast has no aim, and the
 ///   arriving allies are standing in its radius;
 /// * too small a draw refuses too — a shrug does not touch a fleet;
 /// * Photon Man has to be the one aiming it, or the held draw goes out
-///   broad instead of directed and costs exactly what a nova would.
-pub fn converge(star_mult: f32, star_was_full: bool, watch: &Watch) -> Result<Convergence, String> {
+///   broad instead of directed and costs exactly what a nova would;
+/// * and THE TUNNEL HAS TO BE UP.
+///
+/// That last one is `link.rs` finally having a say at the one place in
+/// six films where the ceiling is actually reached. `link` refuses
+/// Photon Man off the tether — the ceiling cannot come out of a tank —
+/// and `watch.rs` alone cannot express that, because resolve is the
+/// MAN's cost and the tether is the DEVICE's. A severed Morpher can be
+/// at full resolve and still be unable to do this.
+///
+/// It also decides something the fiction had left vague: the climax
+/// cannot be staged anywhere the tunnel does not reach. That is a
+/// constraint on the scene, not a number, and it belongs in the gate
+/// rather than in a note.
+pub fn converge(
+    star_mult: f32,
+    star_was_full: bool,
+    watch: &Watch,
+    link: &Link,
+) -> Result<Convergence, String> {
     if star_was_full {
         return Err(
             "a true nova was fired; nothing in its radius survives, and the arriving allies were standing in it"
@@ -80,6 +100,13 @@ pub fn converge(star_mult: f32, star_was_full: bool, watch: &Watch) -> Result<Co
     }
     if watch.current() != Some(PHOTON) {
         return Err("the Watch does not hold Photon Man; the held draw goes out broad, not aimed".into());
+    }
+    if let Err(Refusal::PhotonOffTether) = link.authorize(PHOTON, true) {
+        return Err(
+            "the tunnel is down; whatever the Watch is running on out here, it is not the machine, \
+             and Photon Man does not come out of a tank"
+                .into(),
+        );
     }
     let fleet_cleared = ((star_mult - MIN_HELD_MULT).max(0.0) * HULLS_PER_MULT) as u32 + 40;
     Ok(Convergence { fleet_cleared })
@@ -124,6 +151,43 @@ pub fn teleport_affordable(watch: &Watch) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_severed_morpher_cannot_reach_the_climax_however_much_resolve_he_has() {
+        // link.rs's rule, at the one place in six films where the ceiling is
+        // actually reached. The point is that resolve is NOT the constraint
+        // here: this Watch is holding Photon Man and the draw is real, and it
+        // still refuses, because the tether is the device's cost and the pool
+        // is the man's. watch.rs alone cannot express that.
+        let aimed = photon_watch();
+        let mut cut = Link::default();
+        cut.sever();
+        let e = converge(6.0, false, &aimed, &cut).unwrap_err();
+        assert!(e.contains("tunnel"), "refused for the wrong reason: {e}");
+        // and the identical strike goes through with the tunnel up
+        assert!(converge(6.0, false, &aimed, &tethered()).is_ok(), "the same strike refused with the tunnel up");
+    }
+
+    #[test]
+    fn a_full_reservoir_is_not_the_tunnel() {
+        // The failure mode this gate exists to prevent: a caller topping the
+        // reservoir up and expecting the climax to become available. Photon
+        // Man does not come out of a tank at any charge level.
+        let aimed = photon_watch();
+        let mut cut = Link::default();
+        cut.sever();
+        cut.recharge(u8::MAX);
+        assert_eq!(cut.charge(), cut.capacity(), "fixture did not fill");
+        assert!(converge(6.0, false, &aimed, &cut).is_err(), "a full tank bought the ceiling");
+    }
+
+    /// The climax as the fiction stages it: the tunnel up. `Link::default()`
+    /// is tethered, so this names the assumption rather than hiding it behind
+    /// a default.
+    fn tethered() -> Link {
+        Link::default()
+    }
+
     use super::*;
     use crate::weapons::{Star, STAR_FULL};
 
@@ -168,29 +232,29 @@ mod tests {
         // an option here, not even with Photon Man aiming it
         let mut watch = Watch::default();
         watch.shift(PHOTON, true).unwrap();
-        assert!(converge(6.0, true, &watch).is_err(), "a true nova was allowed through");
+        assert!(converge(6.0, true, &watch, &tethered()).is_err(), "a true nova was allowed through");
     }
 
     #[test]
     fn a_shrug_does_not_clear_anything_and_photon_man_still_has_to_be_the_one_aiming() {
         let watch = Watch::default(); // native Ice, not Photon
-        assert!(converge(6.0, true, &watch).is_err(), "double-refused for the wrong combination of reasons");
-        assert!(converge(1.5, false, &watch).is_err(), "a token flick with no Photon Man still cleared something");
+        assert!(converge(6.0, true, &watch, &tethered()).is_err(), "double-refused for the wrong combination of reasons");
+        assert!(converge(1.5, false, &watch, &tethered()).is_err(), "a token flick with no Photon Man still cleared something");
         let mut photon_watch = Watch::default();
         photon_watch.shift(PHOTON, true).unwrap();
-        assert!(converge(1.5, false, &photon_watch).is_err(), "too small a draw still cleared something");
-        assert!(converge(3.5, false, &photon_watch).is_ok(), "a real held draw, aimed, still refused");
+        assert!(converge(1.5, false, &photon_watch, &tethered()).is_err(), "too small a draw still cleared something");
+        assert!(converge(3.5, false, &photon_watch, &tethered()).is_ok(), "a real held draw, aimed, still refused");
     }
 
     #[test]
     fn a_bigger_held_draw_clears_more_but_never_as_much_as_a_nova_would() {
         let mut watch = Watch::default();
         watch.shift(PHOTON, true).unwrap();
-        let small = converge(MIN_HELD_MULT + 0.1, false, &watch).unwrap();
+        let small = converge(MIN_HELD_MULT + 0.1, false, &watch, &tethered()).unwrap();
         // the ceiling: the strongest legal held draw is just under the
         // true-nova multiplier weapons.rs computes at STAR_FULL
         let ceiling_mult = 1.0 + STAR_FULL * 5.0 - 0.01;
-        let big = converge(ceiling_mult, false, &watch).unwrap();
+        let big = converge(ceiling_mult, false, &watch, &tethered()).unwrap();
         assert!(big.fleet_cleared > small.fleet_cleared, "scale did not matter");
     }
 
@@ -203,10 +267,10 @@ mod tests {
         star.update(10.0, true); // fully charged
         let (mult, full) = star.release();
         assert!(full, "a full charge did not read as a true nova in weapons.rs");
-        assert!(converge(mult, true, &Watch::default()).is_err(), "that exact release should have refused");
+        assert!(converge(mult, true, &Watch::default(), &tethered()).is_err(), "that exact release should have refused");
         let mut aimed = Watch::default();
         aimed.shift(PHOTON, true).unwrap();
-        assert!(converge(mult - 0.5, false, &aimed).is_ok(), "a draw just under the nova threshold should have gone through");
+        assert!(converge(mult - 0.5, false, &aimed, &tethered()).is_ok(), "a draw just under the nova threshold should have gone through");
     }
 
     #[test]
@@ -259,13 +323,17 @@ pub fn run(argv: &[String]) {
     // the refusals, each with the state that causes it
     let aimed = photon_watch();
     let wrong_form = Watch::default();
+    let up = Link::default();
+    let mut cut = Link::default();
+    cut.sever();
     println!("  WHAT IT REFUSES\n");
-    for (what, mult, full, w) in [
-        ("a true nova", 9.0f32, true, &aimed),
-        ("too small a draw", 1.0, false, &aimed),
-        ("nobody aiming it", 9.0, false, &wrong_form),
+    for (what, mult, full, w, l) in [
+        ("a true nova", 9.0f32, true, &aimed, &up),
+        ("too small a draw", 1.0, false, &aimed, &up),
+        ("nobody aiming it", 9.0, false, &wrong_form, &up),
+        ("the tunnel is down", 9.0, false, &aimed, &cut),
     ] {
-        match converge(mult, full, w) {
+        match converge(mult, full, w, l) {
             Err(e) => println!("    {:<18} {}", what, e),
             Ok(c) => println!("    {:<18} UNEXPECTEDLY ALLOWED ({} cleared)", what, c.fleet_cleared),
         }
@@ -274,7 +342,7 @@ pub fn run(argv: &[String]) {
     println!("\n  WHAT IT DOES, by how much of the star he holds\n");
     println!("    {:>6}  {:>14}", "mult", "fleet cleared");
     for mult in [3.0f32, 4.0, 6.0, 9.0, 12.0] {
-        match converge(mult, false, &aimed) {
+        match converge(mult, false, &aimed, &up) {
             Ok(c) => println!("    {mult:>6.1}  {:>14}", c.fleet_cleared),
             Err(e) => println!("    {mult:>6.1}  {e}"),
         }

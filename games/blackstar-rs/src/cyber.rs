@@ -1,4 +1,4 @@
-//! CYBERTRONIAN JOINTS — not a pin through two plates.
+//! MACHINE JOINTS — not a pin through two plates.
 //!
 //! The measurement that led here: on `racer_grit`, 71 of 78 fitted joints
 //! have a pivot more than a quarter of the smaller joined part away from
@@ -10,7 +10,7 @@
 //! exactly on the seam, because anything else opens a gap the instant the
 //! joint moves. Nothing that has to survive being shot at is built that way.
 //! Real machines put a boot over the hinge; real bodies put tissue across
-//! it; and a Cybertronian, which is both, would do more.
+//! it; and a Machine, which is both, would do more.
 //!
 //! So a joint here has three parts, and each one earns its place by solving
 //! something the pin cannot:

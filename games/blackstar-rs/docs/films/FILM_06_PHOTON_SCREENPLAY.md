@@ -22,7 +22,7 @@ recognizing, for the first time, something categorically beyond it.
 
 **Setting**: Continuous from Film 5's final image. The sealed chamber.
 
-**Characters**: The Morpher, Rodimus Prime (observing, helpless)
+**Characters**: The Morpher, Halyard Prime (observing, helpless)
 
 ---
 
@@ -31,7 +31,7 @@ When it clears, the Morpher is standing, and everyone in the room
 understands without being told that whatever is standing there is not,
 right now, entirely him.*
 
-**RODIMUS PRIME**
+**HALYARD**
 *(quiet, to the room)*
 Hold position. Nobody touches the door until he tells us to.
 
@@ -84,7 +84,7 @@ Then another. Then another.*
 Those aren't our ships. I mean — they are. I don't know how they got here
 that fast.
 
-**RODIMUS PRIME**
+**HALYARD**
 *(realizing)*
 They didn't approach. They warped the space between here and the rest of
 the Coalition's reserve, and repositioned the whole formation at once.
@@ -172,7 +172,7 @@ Ask me in a minute.
 
 **Setting**: The battle space, aftermath.
 
-**Characters**: Rodimus Prime, Aiden, the Morpher (recovering), Meridian
+**Characters**: Halyard Prime, Aiden, the Morpher (recovering), Meridian
 
 ---
 
@@ -200,11 +200,11 @@ progress looks like out here.
 **Setting**: Medical bay. The Morpher, three days into what everyone
 understands will be a three-day recovery.
 
-**Characters**: Rodimus Prime, Aiden, Billy
+**Characters**: Halyard Prime, Aiden, Billy
 
 ---
 
-**RODIMUS PRIME**
+**HALYARD**
 *(quiet, at the Morpher's side)*
 You were right. It was worth it.
 
@@ -227,11 +227,11 @@ expecting to still be alone after today.
 both — drifting in the light of a sun that, for a few seconds today,
 briefly had company.
 
-**Characters**: Rodimus Prime (V.O.)
+**Characters**: Halyard Prime (V.O.)
 
 ---
 
-**RODIMUS PRIME (V.O.)**
+**HALYARD (V.O.)**
 We came out here thinking we were at war. What we found out today is that
 we were being studied — and that whatever's out here studying us just
 learned something it didn't expect to find.

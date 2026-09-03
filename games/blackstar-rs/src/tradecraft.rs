@@ -74,8 +74,8 @@ impl Society {
     /// The commander archetypes needed NO translation, which is the whole
     /// finding. Four dials — aggression, caution, encircle, regroup —
     /// describe how an armed group behaves under pressure, and nothing in
-    /// them is Cybertronian. A Directorate strike team surrounds you for the
-    /// same reason a Decepticon squad does: numbers and a doctrine that says
+    /// them is Machine. A Directorate strike team surrounds you for the
+    /// same reason a Sundered squad does: numbers and a doctrine that says
     /// close the ring.
     ///
     /// So the human campaign gets `skirmish.rs` for free, and the mapping is
@@ -347,7 +347,7 @@ pub fn available(r: &Relay, era: Era) -> bool {
 //
 // The raid system asks a question the detective campaign asks too: two ways
 // in, trading against each other, judged against a clock. `foothold.rs` asks
-// it in Cybertronian — weather windows, habitability, a ship that has to
+// it in Machine — weather windows, habitability, a ship that has to
 // stay grounded. None of those nouns exist in 1998 Los Angeles, but the
 // question survives the translation intact, so the arithmetic is shared
 // (`approach.rs`) and only the domain is rewritten here.
@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn the_hunter_is_answered_with_distance_and_nothing_else() {
         use crate::perception::Watcher;
-        // the Jhiaxus case, and the second caller that justifies perception
+        // the Assay case, and the second caller that justifies perception
         // existing. A hunter sees less far than a floodlit sentry and never
         // stops, so cover and patience buy nothing — only being outside its
         // range does.

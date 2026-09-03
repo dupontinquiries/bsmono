@@ -97,7 +97,7 @@ pub const TROOPS: &[Troop] = &[
     Troop { id: "reaver",      role: Role::PlayerClass, chassis: "raptor",     fire: Verb::Bank,   element: Element::Rock,     tint: [180, 165, 140], abilities: &["dash", "pulse"] , faction: patrol::Faction::Coalition },
     Troop { id: "warden",      role: Role::PlayerClass, chassis: "bruiser",    fire: Verb::Beam,   element: Element::Ice,      tint: [150, 185, 205], abilities: &["shield", "resonance"] , faction: patrol::Faction::Coalition },
     Troop { id: "pyre",        role: Role::PlayerClass, chassis: "angular",    fire: Verb::Flak,   element: Element::Fire,     tint: [220, 130, 70], abilities: &["overclock", "pulse"] , faction: patrol::Faction::Coalition },
-    Troop { id: "prime",       role: Role::PlayerClass, chassis: "sentinel",   fire: Verb::Shove,  element: Element::Water,    tint: [90, 140, 210], abilities: &["shield", "resonance"] , faction: patrol::Faction::Coalition },
+    Troop { id: "keelwright",       role: Role::PlayerClass, chassis: "sentinel",   fire: Verb::Shove,  element: Element::Water,    tint: [90, 140, 210], abilities: &["shield", "resonance"] , faction: patrol::Faction::Coalition },
     Troop { id: "scout",       role: Role::PlayerClass, chassis: "raptor",     fire: Verb::Pool,   element: Element::Vine,     tint: [120, 180, 120], abilities: &["hover", "dash"] , faction: patrol::Faction::Coalition },
     Troop { id: "siege",       role: Role::PlayerClass, chassis: "juggernaut", fire: Verb::Pool,   element: Element::Rock,     tint: [165, 150, 130], abilities: &["turret", "shield"] , faction: patrol::Faction::Coalition },
     // ---- hostiles: what patrol has been missing ----
@@ -109,7 +109,7 @@ pub const TROOPS: &[Troop] = &[
     // "First Light" / Film 5 "Solar"): a scouting force, not an army --
     // "sending fifty to accomplish what three could do is normal to
     // them," no ideology or strategy in the Transformer sense, and by
-    // Film 5 they are field-testing tech pulled from recovered Unicron
+    // Film 5 they are field-testing tech pulled from recovered the Unending
     // debris in the outer belt. Two roster gaps that left "uncharted"
     // and "shield_edge" (both Faction::Hijacks sites) drawing on the
     // same three troops as the Trilogy One frontier fights: swarmer is
@@ -124,10 +124,10 @@ pub const TROOPS: &[Troop] = &[
     Troop { id: "ashfall_lancer",     role: Role::Variant, chassis: "raptor",   fire: Verb::Flak,     element: Element::Fire, tint: [210, 110, 60], abilities: &["overclock"] , faction: patrol::Faction::Coalition },
     Troop { id: "hoarfrost_sentinel", role: Role::Variant, chassis: "sentinel", fire: Verb::Beam,     element: Element::Ice,  tint: [170, 215, 235], abilities: &["shield", "resonance"] , faction: patrol::Faction::Coalition },
     Troop { id: "magma_breaker",      role: Role::Variant, chassis: "bruiser",  fire: Verb::Pool,     element: Element::Fire, tint: [200, 80, 40], abilities: &["pulse"] , faction: patrol::Faction::Coalition },
-    // ---- the Corrupted: Jhiaxus' experiment, in three stages ----
+    // ---- the Corrupted: Assay' experiment, in three stages ----
     // (see corruption.rs; element is None because the treatment never
     // gives them one, and Role::Enemy because they are not coalition
-    // elites — they are the thing the coalition and the Autobots both
+    // elites — they are the thing the coalition and the Enduring both
     // fear equally)
     Troop { id: "corrupted_drifter", role: Role::Enemy, chassis: "standard", fire: Verb::Push,  element: Element::None, tint: [70, 90, 70],  abilities: &["dash"], faction: patrol::Faction::Corrupted },
     Troop { id: "corrupted_bloom",   role: Role::Enemy, chassis: "bruiser",  fire: Verb::Pool,  element: Element::None, tint: [55, 75, 55],  abilities: &["shield", "pulse"], faction: patrol::Faction::Corrupted },
@@ -158,7 +158,7 @@ pub const TROOPS: &[Troop] = &[
     // caught only by actually running the missions rather than trusting
     // the build. Left as roster entries rather than champions for
     // either mission: both missions' text is already composed around
-    // Unicron's own avatar and the Corrupted converging, and forcing a
+    // The Unending's own avatar and the Corrupted converging, and forcing a
     // named champion into an established wave count is how this
     // session broke campaign balance twice already. Tagged
     // Faction::Corrupted — Earth's own faction — so they surface
@@ -199,10 +199,10 @@ pub const FILMS: &[Film] = &[
         theatres: &["earth", "luna", "mars"] },
     Film { n: 2, title: "DOMINION", subtitle: "God of Chaos",
         tone: "occupation; Earth has fallen and the fight is from underneath",
-        theatres: &["earth", "cybertron", "europa"] },
+        theatres: &["earth", "foundry", "europa"] },
     Film { n: 3, title: "DESTINY", subtitle: "The Core",
         tone: "revelation; the shield, the coalition, and why Earth sits at the centre",
-        theatres: &["earth", "cybertron", "shield_edge"] },
+        theatres: &["earth", "foundry", "shield_edge"] },
     Film { n: 4, title: "FIRST LIGHT", subtitle: "Contact and Wonder",
         tone: "exploration; the cosmos is vast and strange and nobody is defending anything",
         theatres: &["glaciem", "helix", "uncharted"] },
@@ -211,7 +211,7 @@ pub const FILMS: &[Film] = &[
         theatres: &["io", "titan", "outer_rim"] },
     Film { n: 6, title: "PHOTON", subtitle: "The Watch's Ceiling",
         tone: "climax; the apex form nobody has fully mapped",
-        theatres: &["shield_edge", "outer_rim", "cybertron"] },
+        theatres: &["shield_edge", "outer_rim", "foundry"] },
 ];
 
 pub fn film(n: u8) -> Option<&'static Film> {
@@ -239,9 +239,9 @@ mod tests {
 
         // names the cutscene prose actually uses, and the codex id they map to
         let spoken = [
-            ("prime", "optimus"),
-            ("megatron", "megatron"),
-            ("rodimus", "rodimus"),
+            ("keelwright", "keelwright"),
+            ("cleave", "cleave"),
+            ("halyard", "halyard"),
             ("aiden", "aiden"),
         ];
         for (word, id) in spoken {
@@ -270,7 +270,7 @@ mod tests {
                 .map(|(_, p)| p.label())
                 .collect()
         };
-        for id in ["optimus"] {
+        for id in ["keelwright"] {
             let m = modes(id);
             assert!(
                 m.len() >= 2,
@@ -282,12 +282,12 @@ mod tests {
         let truce = MISSIONS.iter().find(|m| m.id == "the_ashen_truce").expect("truce");
         let deep = MISSIONS.iter().find(|m| m.id == "beneath_the_pacific").expect("pacific");
         assert!(
-            truce.cast.contains(&("optimus", Presence::Playable)),
-            "the airlock meeting is not played as Prime"
+            truce.cast.contains(&("keelwright", Presence::Playable)),
+            "the airlock meeting is not played as Keelwright"
         );
         assert!(
-            deep.cast.contains(&("megatron", Presence::Seen)),
-            "Megatron planting himself under the plates is not SEEN — being told he did it \
+            deep.cast.contains(&("cleave", Presence::Seen)),
+            "Cleave planting himself under the plates is not SEEN — being told he did it \
              is the thing this field exists to prevent"
         );
     }
@@ -383,7 +383,7 @@ mod tests {
     fn every_theatre_is_a_real_destination() {
         // the check that stops the campaign pointing at a map that does not
         // exist — the same class of bug RAIDS.md records the raid generator
-        // catching when phases referenced kuiper and unicron
+        // catching when phases referenced kuiper and unending
         for f in FILMS {
             for t in f.theatres {
                 assert!(patrol::find(t).is_some(), "film {} names unknown theatre {t}", f.n);
@@ -495,7 +495,7 @@ pub enum Presence {
     /// Present and can be engaged with — a console, a conversation, a hand-off.
     Interactable,
     /// On screen, doing something, not addressable. The one that was missing:
-    /// seeing Megatron leave is not the same as being told he left.
+    /// seeing Cleave leave is not the same as being told he left.
     Seen,
     /// Referred to in the briefing, not present.
     Named,
@@ -533,8 +533,8 @@ pub struct Mission {
     /// WHO IS THERE, and in what capacity.
     ///
     /// `champion` says who opposes you and there was nothing that said who is
-    /// PRESENT WITH you — so a mission whose prose turns on Prime meeting an
-    /// old enemy at an airlock had no way to record that Prime is in it. That
+    /// PRESENT WITH you — so a mission whose prose turns on Keelwright meeting an
+    /// old enemy at an airlock had no way to record that Keelwright is in it. That
     /// is the failure Destiny spent two expansions correcting: three named
     /// legends with enormous lore who stood still in a social space while the
     /// player did everything, until Forsaken put one of them in the mission
@@ -555,7 +555,7 @@ pub const MISSIONS: &[Mission] = &[
     // ============ TRILOGY ONE — disaster, war, sacrifice ============
     Mission { order: 1, id: "the_pluto_line", film: 1, dest: "pluto", site: "the outer containment line",
         objective: Objective::Eliminate, champion: Some("hoarfrost_sentinel"),
-        cast: &[("optimus", Presence::Ally)],
+        cast: &[("keelwright", Presence::Ally)],
         beat: "hold the outer containment line; Cryotek attacks",
         intro: &[
             "the system's edge. an old soldier in an older suit walks the wall he helped build.",
@@ -571,7 +571,7 @@ pub const MISSIONS: &[Mission] = &[
         cast: &[],
         beat: "Blackstar, the Kuiper warlord",
         intro: &[
-            "the frontier is full of cybertron's scattered children -- and their king.",
+            "the frontier is full of foundry's scattered children -- and their king.",
             "blackstar doesn't serve the devourer. he collects what it leaves. he finds hope FUNNY.",
             "his raiders pin the convoy where it drifts. so do not drift.",
         ],
@@ -603,11 +603,11 @@ pub const MISSIONS: &[Mission] = &[
         ],
         outro: &[
             "the civilians are out. aiden is still at the fissure edge, shaking, staying.",
-            "prime hears it through spark, not sound. far away, something old turns toward earth.",
+            "keelwright hears it through spark, not sound. far away, something old turns toward earth.",
         ] },
-    Mission { order: 5, id: "what_jhiaxus_grew", film: 2, dest: "earth", site: "the vault",
+    Mission { order: 5, id: "what_assay_grew", film: 2, dest: "earth", site: "the vault",
         objective: Objective::Eliminate, champion: None,
-        cast: &[("jhiaxus", Presence::Seen)],
+        cast: &[("assay", Presence::Seen)],
         beat: "the architect of the Corrupted",
         intro: &[
             "the architect meant to study the corruption. to catalogue it. to KEEP it.",
@@ -621,22 +621,22 @@ pub const MISSIONS: &[Mission] = &[
     Mission { order: 6, id: "the_mantle_dive", film: 2, dest: "earth", site: "the foundry",
         objective: Objective::Control, champion: None,
         cast: &[],
-        beat: "Hot Rod becomes Rodimus",
+        beat: "Jib becomes Halyard",
         intro: &[
-            "down the ruptured mantle: living-metal corridors, energon rivers, cathedral dark.",
-            "hot rod dives beside you -- reckless, loud, terrified of one thing: failing prime.",
-            "hold the descent. the avatar is forming out of the magma, and it is looking at optimus.",
+            "down the ruptured mantle: living-metal corridors, valence rivers, cathedral dark.",
+            "jib dives beside you -- reckless, loud, terrified of one thing: failing keelwright.",
+            "hold the descent. the avatar is forming out of the magma, and it is looking at keelwright.",
         ],
         outro: &[
-            "unicron impales prime. hot rod doesn't cause the fall this time -- he catches it.",
-            "the matrix opens for the one who reached without wanting it. rodimus rises, burning.",
+            "unending impales keelwright. jib doesn't cause the fall this time -- he catches it.",
+            "the matrix opens for the one who reached without wanting it. halyard rises, burning.",
         ] },
     Mission { order: 7, id: "the_drowned_approach", film: 2, dest: "earth", site: "the trench",
         objective: Objective::Survive, champion: None,
-        cast: &[("rodimus", Presence::Playable), ("optimus", Presence::Named)],
+        cast: &[("halyard", Presence::Playable), ("keelwright", Presence::Named)],
         beat: "hold the descent as the Corrupted converge on the wound",
         intro: &[
-            "rodimus leads now, and hates how the word sounds. prime recovers in the fleet above.",
+            "halyard leads now, and hates how the word sounds. keelwright recovers in the fleet above.",
             "below the pacific, the corrupted converge on a light that should not be down here.",
             "survive the descent past the vent spires. every one that reaches the rift feeds it.",
         ],
@@ -646,34 +646,34 @@ pub const MISSIONS: &[Mission] = &[
         ] },
     Mission { order: 8, id: "the_ashen_truce", film: 3, dest: "shield_edge", site: "the picket line",
         objective: Objective::Control, champion: None,
-        cast: &[("optimus", Presence::Playable), ("megatron", Presence::Interactable)],
-        beat: "Megatron comes back through the shield; the line has to decide",
+        cast: &[("keelwright", Presence::Playable), ("cleave", Presence::Interactable)],
+        beat: "Cleave comes back through the shield; the line has to decide",
         intro: &[
-            "a decepticon signature crosses the shield, transponder open, weapons cold.",
-            "megatron. alone. half his frame is scar. 'the devourer eats decepticons too.'",
+            "a sundered signature crosses the shield, transponder open, weapons cold.",
+            "cleave. alone. half his frame is scar. 'the devourer eats sundered too.'",
             "hold the picket while the line decides whether an old enemy can surrender UP.",
         ],
         outro: &[
-            "prime meets him at the airlock. no speech. two old soldiers, one war left.",
+            "keelwright meets him at the airlock. no speech. two old soldiers, one war left.",
             "the truce is not forgiveness. it is arithmetic. everyone does it silently.",
         ] },
-    Mission { order: 9, id: "beneath_the_pacific", film: 3, dest: "cybertron", site: "the gravity well",
+    Mission { order: 9, id: "beneath_the_pacific", film: 3, dest: "foundry", site: "the gravity well",
         objective: Objective::Eliminate, champion: None,
-        cast: &[("optimus", Presence::Playable), ("megatron", Presence::Seen)],
-        beat: "Unicron; the truce; the gravity well",
+        cast: &[("keelwright", Presence::Playable), ("cleave", Presence::Seen)],
+        beat: "The Unending; the truce; the gravity well",
         intro: &[
-            "megatron came back changed. harder. quieter. 'the devourer eats decepticons too.'",
+            "cleave came back changed. harder. quieter. 'the devourer eats sundered too.'",
             "the plates begin to close over the only road to the core. someone has to hold them.",
             "he plants himself under the collapsing world. 'go,' he says. nothing else.",
         ],
         outro: &[
             "the avatar goes dark. the machine sleeps -- not dead, only denied. the plates settle.",
-            "they never find megatron. prime marks the spot anyway. the war's oldest debt, paid last.",
+            "they never find cleave. keelwright marks the spot anyway. the war's oldest debt, paid last.",
         ] },
     // ============ TRILOGY TWO — the inversion: wonder, scale, light ============
     Mission { order: 10, id: "the_far_gate", film: 4, dest: "uncharted", site: "the dig",
         objective: Objective::Eliminate, champion: Some("hijack_swarmer"),
-        cast: &[("rodimus", Presence::Playable), ("the_morpher", Presence::Ally)],
+        cast: &[("halyard", Presence::Playable), ("the_morpher", Presence::Ally)],
         beat: "the bridge's first jump; the Hijacks were already testing the boundary",
         intro: &[
             "the bridge did not ask where you wanted to go. it took you where the signal was.",
@@ -694,7 +694,7 @@ pub const MISSIONS: &[Mission] = &[
             "the corrupted have come to eat the archive. defend the memory of the dead. all of it.",
         ],
         outro: &[
-            "the archive stands. cryotek prime bows -- glacier-deep, centuries slow -- and opens the vault.",
+            "the archive stands. cryotek keelwright bows -- glacier-deep, centuries slow -- and opens the vault.",
             "inside: a build-record with a keyhole for a heart. the matrix is the key.",
         ] },
     Mission { order: 12, id: "the_tide_forges", film: 5, dest: "io", site: "the forge line",
@@ -721,7 +721,7 @@ pub const MISSIONS: &[Mission] = &[
         ],
         outro: &[
             "the engine falls. an old clone watches it burn: 'he was the first of us to laugh.'",
-            "rodimus walks the wreck-streets a long time. 'they made a LIFE out here. out of nothing.'",
+            "halyard walks the wreck-streets a long time. 'they made a LIFE out here. out of nothing.'",
         ] },
     Mission { order: 14, id: "the_ashes_court", film: 6, dest: "outer_rim", site: "the dreadnought",
         objective: Objective::Breach, champion: Some("blackstar_raider"),
@@ -738,14 +738,14 @@ pub const MISSIONS: &[Mission] = &[
             "later, alone with aiden: 'i was wrong about one thing. the far-travelers who never came home --",
             "they weren't unprepared because they grew too fast. they were unprepared because they grew alone.'",
         ] },
-    Mission { order: 15, id: "the_heart_of_the_god_machine", film: 6, dest: "cybertron", site: "the spark chamber",
+    Mission { order: 15, id: "the_heart_of_the_god_machine", film: 6, dest: "foundry", site: "the spark chamber",
         objective: Objective::Eliminate, champion: None,
-        cast: &[("rodimus", Presence::Playable), ("photon", Presence::Seen)],
-        beat: "everyone comes; Rodimus goes in alone",
+        cast: &[("halyard", Presence::Playable), ("photon", Presence::Seen)],
+        beat: "everyone comes; Halyard goes in alone",
         intro: &[
             "everyone comes: the fleet, the clans, the mourners, the perfected. even the ashes' king.",
             "witwicky flies the breach run he's rehearsed for twenty years. aiden calls it from the bunker.",
-            "cut a road to the spark chamber. rodimus goes in alone -- the way prime once did for him.",
+            "cut a road to the spark chamber. halyard goes in alone -- the way keelwright once did for him.",
         ],
         outro: &[
             "the matrix pours into the heart. not destruction -- QUIET. the god-machine lies down.",

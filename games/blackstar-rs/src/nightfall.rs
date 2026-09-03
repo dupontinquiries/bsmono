@@ -9,11 +9,11 @@
 //! Determinism does the scheduling: the week number is days-since-epoch
 //! over seven, so every player on the planet gets the same card without
 //! a server existing anywhere. The card cycles missions and burns on
-//! coprime periods (15 and 7), so the same pairing repeats only every
+//! cokeelwright periods (15 and 7), so the same pairing repeats only every
 //! 105 weeks — two years of distinct Tuesdays from two modular indexes.
 //!
 //! The lockout rides the save as a `nightfalls` line of week numbers:
-//! cleared weeks bank energon (`energon::PER_NIGHTFALL`) and cannot be
+//! cleared weeks bank valence (`valence::PER_NIGHTFALL`) and cannot be
 //! farmed twice. Ids-not-indices does not apply — a week IS its number.
 
 use crate::content::{Mission, MISSIONS};
@@ -90,7 +90,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_card_is_deterministic_and_cycles_on_coprime_periods() {
+    fn the_card_is_deterministic_and_cycles_on_cokeelwright_periods() {
         assert_eq!(card(7).mission.id, card(7).mission.id);
         assert_eq!(card(7).burn, card(7).burn);
         // 15 missions x 7 burns: the pairing has period 105

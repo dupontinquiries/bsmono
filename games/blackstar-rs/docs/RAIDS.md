@@ -24,9 +24,9 @@ Three rules the generator enforces:
 * **The boss's own mechanic appears on at least one encounter per phase.** A phase
   where everything is PURGE plays identically to a phase with no mechanic at all.
 * **Every map a phase references must exist.** This check was added because the
-  hand-written raid plan pointed at `kuiper` and `unicron`, which had never been
+  hand-written raid plan pointed at `kuiper` and `unending`, which had never been
   defined — two of three phases were loading an undefined theme.
-* **SYNC bosses finish at `unicron`.** The plate mechanic wants the arena where
+* **SYNC bosses finish at `unending`.** The plate mechanic wants the arena where
   the horizon curves the wrong way.
 
 Phases run **The Approach → The Gauntlet → The <finale>**, four encounters each,
@@ -74,7 +74,7 @@ The design intent: by the end of the Gauntlet you should have solved the mechani
 ### The finale
 
 Named for the boss's title — The Reactor, The Core Piercer, The Ocean King — and
-sited either at `unicron` (every SYNC boss) or on the most extreme map the seed
+sited either at `unending` (every SYNC boss) or on the most extreme map the seed
 picked. All four encounters, with the boss's mechanic guaranteed.
 
 ### Reading a mechanic
@@ -123,9 +123,9 @@ Worth spelling out for three, because the mapping is the interesting part:
 |---|---|---|
 | The Approach | `frostline` | SYNC, PURGE, PURGE, SYNC |
 | The Gauntlet | `mining` | PURGE, PURGE, PURGE, SYNC |
-| The Resonance | `unicron` | PURGE, PURGE, SYNC, SYNC |
+| The Resonance | `unending` | PURGE, PURGE, SYNC, SYNC |
 
-### Devastator Jhiaxus — "Prototype Omega"
+### Devastator Assay — "Prototype Omega"
 
 > destroying one only caused it to rebuild itself
 
@@ -147,7 +147,7 @@ Worth spelling out for three, because the mapping is the interesting part:
 |---|---|---|
 | The Approach | `kuiper` | PURGE, GROUND, PURGE, GROUND |
 | The Gauntlet | `vault` | GROUND, PURGE, GROUND, GROUND |
-| The Burner | `unicron` | PURGE, PURGE, GROUND, GROUND |
+| The Burner | `unending` | PURGE, PURGE, GROUND, GROUND |
 
 ### Cherno Alpha — "The Walking Reactor"
 
@@ -171,7 +171,7 @@ Worth spelling out for three, because the mapping is the interesting part:
 |---|---|---|
 | The Approach | `outer_rim` | PURGE, AIR, AIR, AIR |
 | The Gauntlet | `emberpit` | AIR, PURGE, PURGE, AIR |
-| The Piercer | `unicron` | PURGE, AIR, AIR, AIR |
+| The Piercer | `unending` | PURGE, AIR, AIR, AIR |
 
 ### Hardboil — "The Pressure King"
 
@@ -207,18 +207,18 @@ Worth spelling out for three, because the mapping is the interesting part:
 |---|---|---|
 | The Approach | `shield_edge` | PURGE, SYNC, PURGE, SYNC |
 | The Gauntlet | `pluto` | PURGE, PURGE, SYNC, SYNC |
-| The Empires | `unicron` | PURGE, SYNC, PURGE, SYNC |
+| The Empires | `unending` | PURGE, SYNC, PURGE, SYNC |
 
 ### Primitive Mantis Mech — "The First Hunter"
 
-> the oldest predator pattern Cybertron ever built
+> the oldest predator pattern the Foundry ever built
 
 **PURGE**, arena `ambush`. Clear every hostile in the zone.
 
 | phase | map | encounter mechanics |
 |---|---|---|
 | The Approach | `kuiper` | PURGE, PURGE, PURGE, PURGE |
-| The Gauntlet | `unicron` | PURGE, PURGE, PURGE, PURGE |
+| The Gauntlet | `unending` | PURGE, PURGE, PURGE, PURGE |
 | The Hunter | `foundry` | PURGE, PURGE, PURGE, PURGE |
 
 ### Pyrachnid — "Forge Widow"
@@ -231,7 +231,7 @@ Worth spelling out for three, because the mapping is the interesting part:
 |---|---|---|
 | The Approach | `mining` | PURGE, PURGE, SYNC, SYNC |
 | The Gauntlet | `emberpit` | PURGE, PURGE, PURGE, SYNC |
-| The Widow | `unicron` | PURGE, PURGE, SYNC, SYNC |
+| The Widow | `unending` | PURGE, PURGE, SYNC, SYNC |
 
 ### Scorpion Commander — "The Frontier Marshal"
 
@@ -265,7 +265,7 @@ Worth spelling out for three, because the mapping is the interesting part:
 
 | phase | map | encounter mechanics |
 |---|---|---|
-| The Approach | `unicron` | PURGE, PURGE, PURGE, AIR |
+| The Approach | `unending` | PURGE, PURGE, PURGE, AIR |
 | The Gauntlet | `outer_rim` | PURGE, PURGE, PURGE, AIR |
 | The Walker | `pluto` | AIR, AIR, PURGE, AIR |
 
@@ -278,8 +278,8 @@ Worth spelling out for three, because the mapping is the interesting part:
 | phase | map | encounter mechanics |
 |---|---|---|
 | The Approach | `pluto` | GROUND, PURGE, PURGE, GROUND |
-| The Gauntlet | `unicron` | PURGE, PURGE, PURGE, GROUND |
-| The Planetbreaker | `cybertron` | PURGE, GROUND, PURGE, GROUND |
+| The Gauntlet | `unending` | PURGE, PURGE, PURGE, GROUND |
+| The Planetbreaker | `foundry` | PURGE, GROUND, PURGE, GROUND |
 
 ### Trenchmaster — "The Ocean King"
 
@@ -289,9 +289,9 @@ Worth spelling out for three, because the mapping is the interesting part:
 
 | phase | map | encounter mechanics |
 |---|---|---|
-| The Approach | `cybertron` | PURGE, SYNC, SYNC, SYNC |
+| The Approach | `foundry` | PURGE, SYNC, SYNC, SYNC |
 | The Gauntlet | `vault` | PURGE, PURGE, PURGE, SYNC |
-| The King | `unicron` | SYNC, SYNC, PURGE, SYNC |
+| The King | `unending` | SYNC, SYNC, PURGE, SYNC |
 
 ### Wuthering Waves Sigillum — "The Seal"
 
@@ -327,7 +327,7 @@ Worth spelling out for three, because the mapping is the interesting part:
 |---|---|---|
 | The Approach | `mining` | PURGE, PURGE, PURGE, PURGE |
 | The Gauntlet | `kuiper` | PURGE, PURGE, PURGE, PURGE |
-| The Observer | `unicron` | PURGE, PURGE, PURGE, PURGE |
+| The Observer | `unending` | PURGE, PURGE, PURGE, PURGE |
 
 ### Titan Cameraman 3.0 (What If...) — "The Divergence"
 
@@ -337,6 +337,6 @@ Worth spelling out for three, because the mapping is the interesting part:
 
 | phase | map | encounter mechanics |
 |---|---|---|
-| The Approach | `cybertron` | PURGE, PURGE, SYNC, SYNC |
+| The Approach | `foundry` | PURGE, PURGE, SYNC, SYNC |
 | The Gauntlet | `foundry` | SYNC, SYNC, PURGE, SYNC |
-| The Divergence | `unicron` | SYNC, PURGE, PURGE, SYNC |
+| The Divergence | `unending` | SYNC, PURGE, PURGE, SYNC |

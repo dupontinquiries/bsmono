@@ -1,8 +1,8 @@
-//! ENERGON — power a bot can point to.
+//! VALENCE — power a bot can point to.
 //!
 //! The Destiny Light loop, adapted and renamed for what it is here: the
-//! squad are Cybertronians, and what a mission banks in their frames is
-//! energon. Progression is not a number the game hands you, it is the
+//! squad are Machines, and what a mission banks in their frames is
+//! valence. Progression is not a number the game hands you, it is the
 //! sum of what you have actually recovered. Missions bank
 //! a little, wardens bank more (a relic is a relic), the weekly nightfall
 //! banks a trickle. Content advertises a RECOMMENDED light, and the squad
@@ -11,7 +11,7 @@
 //!
 //! What this buys the campaign: trilogy two stops being a tuning problem
 //! and becomes a progression statement. A fresh squad walking into film 4
-//! at storyline energon is fine; the same squad rushed there under-light is
+//! at storyline valence is fine; the same squad rushed there under-light is
 //! SUPPOSED to bounce, and the number tells them why — the same honesty
 //! Destiny's "recommended 280" bought with one glyph.
 //!
@@ -30,7 +30,7 @@ pub const PER_NIGHTFALL: u32 = 2;
 
 /// The one number, derived — never stored, so it cannot drift from the
 /// logs that justify it.
-pub fn energon(camp: &CampaignLog, raids: &RaidLog, nightfalls: u32) -> u32 {
+pub fn valence(camp: &CampaignLog, raids: &RaidLog, nightfalls: u32) -> u32 {
     camp.done() as u32 * PER_MISSION + raids.shards() * PER_WARDEN + nightfalls * PER_NIGHTFALL
 }
 
@@ -40,7 +40,7 @@ pub fn energon(camp: &CampaignLog, raids: &RaidLog, nightfalls: u32) -> u32 {
 /// slack is what makes the number a warning rather than a treadmill.
 /// The films' escalation (raiders, warband, shielded coalition) eats
 /// most of the surplus back; the sequence test holds the balance.
-pub fn rec_energon(m: &Mission) -> u32 {
+pub fn rec_valence(m: &Mission) -> u32 {
     match m.film {
         1 => 0,
         2 => 2,
@@ -57,8 +57,8 @@ pub fn rec_energon(m: &Mission) -> u32 {
 /// sits where film six's finale needs the road's FULL surplus: the last
 /// two missions are the one stretch that spends everything the storyline
 /// banked, which is what a finale is for.
-pub fn scale(energon: u32, rec: u32) -> f32 {
-    let delta = energon as f32 - rec as f32;
+pub fn scale(valence: u32, rec: u32) -> f32 {
+    let delta = valence as f32 - rec as f32;
     (1.0 + 0.05 * delta).clamp(0.60, 1.50)
 }
 
@@ -68,13 +68,13 @@ mod tests {
     use crate::content::MISSIONS;
 
     #[test]
-    fn energon_is_the_sum_of_what_was_actually_recovered() {
+    fn valence_is_the_sum_of_what_was_actually_recovered() {
         let mut camp = CampaignLog::default();
         let mut raids = RaidLog::default();
-        assert_eq!(energon(&camp, &raids, 0), 0);
+        assert_eq!(valence(&camp, &raids, 0), 0);
         camp.record(MISSIONS[0].id);
         raids.record("gigadrill");
-        assert_eq!(energon(&camp, &raids, 1), PER_MISSION + PER_WARDEN + PER_NIGHTFALL);
+        assert_eq!(valence(&camp, &raids, 1), PER_MISSION + PER_WARDEN + PER_NIGHTFALL);
     }
 
     #[test]
@@ -86,19 +86,19 @@ mod tests {
     }
 
     #[test]
-    fn storyline_energon_meets_every_recommendation() {
+    fn storyline_valence_meets_every_recommendation() {
         // a player who clears the campaign IN ORDER arrives at each film
-        // at or above its recommended energon — the road is enough, wardens
-        // and nightfalls are gravy. This pins rec_energon to PER_MISSION.
+        // at or above its recommended valence — the road is enough, wardens
+        // and nightfalls are gravy. This pins rec_valence to PER_MISSION.
         let mut camp = CampaignLog::default();
         let raids = RaidLog::default();
         for m in MISSIONS {
             assert!(
-                energon(&camp, &raids, 0) >= rec_energon(m),
+                valence(&camp, &raids, 0) >= rec_valence(m),
                 "{} recommends {} but the road only provides {}",
                 m.id,
-                rec_energon(m),
-                energon(&camp, &raids, 0)
+                rec_valence(m),
+                valence(&camp, &raids, 0)
             );
             camp.record(m.id);
         }

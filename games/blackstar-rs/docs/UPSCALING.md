@@ -44,7 +44,7 @@ optimisation and becomes a precondition.
 
 It is robot form only, as OBJ. There are no bones, no vehicle mode and no
 fold, so it is a POSE and DENSITY reference rather than a rig reference. It
-cannot tell us where a Cybertronian's joints go — only what one should look
+cannot tell us where a Machine's joints go — only what one should look
 like once they are in the right place.
 
 98 textures at 628 MB accompany it. Deliberately NOT committed: the bundle

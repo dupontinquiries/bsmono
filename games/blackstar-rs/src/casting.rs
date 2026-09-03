@@ -20,7 +20,7 @@
 //! * **Spoiling.** A forged raid that casts the Morpher before Film 4 has
 //!   introduced him hands the player a character the campaign was about to
 //!   reveal. Generated content must not run ahead of authored content.
-//! * **Contradiction.** Megatron plants himself under the closing plates in
+//! * **Contradiction.** Cleave plants himself under the closing plates in
 //!   `beneath_the_pacific` and is never found. A raid that casts him after
 //!   that is not a cameo, it is the campaign being wrong.
 //! * **Cheapening.** A character who turns up in every third procedural raid
@@ -48,7 +48,7 @@ pub struct Castable {
     pub written_out_by: Option<&'static str>,
     /// The strongest presence a GENERATED raid may give them. Authored
     /// missions are unconstrained; a forged one should not be handing out
-    /// playable Primes.
+    /// playable Keelwrights.
     pub ceiling: Presence,
 }
 
@@ -72,21 +72,21 @@ pub const CASTABLE: &[Castable] = &[
         ceiling: Presence::Ally,
     },
     Castable {
-        id: "rodimus",
+        id: "halyard",
         introduced_by: "the_drowned_approach",
         written_out_by: None,
         ceiling: Presence::Ally,
     },
     Castable {
-        id: "optimus",
+        id: "keelwright",
         introduced_by: "the_pluto_line",
         written_out_by: None,
         ceiling: Presence::Seen,
     },
-    // Megatron plants himself under the closing plates and is never found.
+    // Cleave plants himself under the closing plates and is never found.
     // He is castable only in the window where that has not happened yet.
     Castable {
-        id: "megatron",
+        id: "cleave",
         introduced_by: "the_ashen_truce",
         written_out_by: Some("beneath_the_pacific"),
         ceiling: Presence::Seen,
@@ -226,35 +226,35 @@ mod tests {
 
     #[test]
     fn the_campaign_can_write_someone_out() {
-        // Megatron is never found after the plates close. A raid casting him
+        // Cleave is never found after the plates close. A raid casting him
         // afterwards is not a cameo, it is the campaign being wrong.
         let during = log(&["the_ashen_truce"]);
-        assert!(castable("megatron", &during).is_some(), "the truce window is closed");
+        assert!(castable("cleave", &during).is_some(), "the truce window is closed");
         let after = log(&["the_ashen_truce", "beneath_the_pacific"]);
-        assert_eq!(castable("megatron", &after), None, "cast after he is written out");
+        assert_eq!(castable("cleave", &after), None, "cast after he is written out");
         // and the others are unaffected by his exit
-        assert!(castable("optimus", &log(&["the_pluto_line", "beneath_the_pacific"])).is_some());
+        assert!(castable("keelwright", &log(&["the_pluto_line", "beneath_the_pacific"])).is_some());
     }
 
     #[test]
     fn presence_has_a_ceiling_and_a_budget() {
         // Two different limits, and both are needed. A ceiling stops a forge
-        // handing out playable Primes; a budget stops it casting everyone
+        // handing out playable Keelwrights; a budget stops it casting everyone
         // available every single time, which is what makes presence stop
         // meaning anything.
         let late = log(&["the_pluto_line", "the_drowned_approach", "the_far_gate", "the_tide_forges"]);
         assert!(available(&late).len() >= 3, "not enough cast to test a budget");
 
-        assert_eq!(castable("optimus", &late), Some(Presence::Seen), "Prime is not playable in a forge");
+        assert_eq!(castable("keelwright", &late), Some(Presence::Seen), "Keelwright is not playable in a forge");
         assert!(
-            !matches!(castable("optimus", &late), Some(Presence::Playable)),
+            !matches!(castable("keelwright", &late), Some(Presence::Playable)),
             "a generated raid can cast a playable lead"
         );
 
-        let asked = ["optimus", "rodimus", "billy_the_fire_clone", "the_morpher"];
+        let asked = ["keelwright", "halyard", "billy_the_fire_clone", "the_morpher"];
         let got = admit(&asked, &late);
         assert_eq!(got.len(), CAST_BUDGET, "the budget was not applied: {got:?}");
-        assert_eq!(got[0].0, "optimus", "admit did not respect the order asked for");
+        assert_eq!(got[0].0, "keelwright", "admit did not respect the order asked for");
     }
 
     #[test]
@@ -264,10 +264,10 @@ mod tests {
         // forgiving: an invented name is dropped, a repeat is collapsed, and a
         // request nobody has met yields nothing rather than an error.
         let late = log(&["the_pluto_line"]);
-        let junk = ["a_bot_that_does_not_exist", "optimus", "optimus"];
+        let junk = ["a_bot_that_does_not_exist", "keelwright", "keelwright"];
         let got = admit(&junk, &late);
         assert_eq!(got.len(), 1, "nonsense was not filtered: {got:?}");
-        assert_eq!(got[0].0, "optimus");
+        assert_eq!(got[0].0, "keelwright");
         assert!(admit(&["the_morpher"], &late).is_empty(), "unmet character admitted");
         assert!(admit(&[], &late).is_empty());
     }
@@ -308,10 +308,10 @@ mod tests {
         // the plates close would be shown a contradiction rather than a
         // mystery, so written-out still means absent — for everyone.
         let after = log(&["the_ashen_truce", "beneath_the_pacific"]);
-        assert_eq!(billing("megatron", &after), None, "the dead were redacted back in");
+        assert_eq!(billing("cleave", &after), None, "the dead were redacted back in");
         // and before that, an unmet player sees the mystery rather than nothing
         let early = log(&[]);
-        let m = billing("megatron", &early).expect("present in the window");
+        let m = billing("cleave", &early).expect("present in the window");
         assert_eq!(m.label, REDACTED);
     }
 

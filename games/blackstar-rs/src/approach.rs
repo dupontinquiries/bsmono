@@ -1,6 +1,6 @@
 //! THE APPROACH — how you get in, judged against a clock.
 //!
-//! `foothold.rs` asks a good question in a Cybertronian accent: two ways into
+//! `foothold.rs` asks a good question in a Machine accent: two ways into
 //! a place that trade against each other, a clock that may or may not be
 //! running, and no answer that is right in general. Clear an LZ — fast,
 //! cheap, exposed the whole time, and the ship has to stay. Seize a fortress

@@ -24,7 +24,7 @@
   48G ┌─┴ .                                                      │███████ │ 100%
 ```
 
-so yeah I was able to find more great models that have the forms of cars and planes, etc for the bots and we need to synthesize characters that could be in different regions in the patrol mode with most of them since they aren't in the script... maybe some we could weave into the campaign but I think most will end up going into patrol and raid locations... raid locations will be scattered throughout the planets... mostly in areas that are very far outside the solar system since I don't want to clutter it too much and we have the space bridges and eventual warp jump to get to those locations... some of which will be very ancient and have cybertronian aliens long divergent from the ones we know on cybertron from the lore backbone of traditional transformers
+so yeah I was able to find more great models that have the forms of cars and planes, etc for the bots and we need to synthesize characters that could be in different regions in the patrol mode with most of them since they aren't in the script... maybe some we could weave into the campaign but I think most will end up going into patrol and raid locations... raid locations will be scattered throughout the planets... mostly in areas that are very far outside the solar system since I don't want to clutter it too much and we have the space bridges and eventual warp jump to get to those locations... some of which will be very ancient and have machine aliens long divergent from the ones we know on foundry from the lore backbone of traditional transformers
 
 here are all the files
 
@@ -55,35 +55,35 @@ we need to update our python helpers to extract them and trim the tris and compr
 │   │       ├── spiderbot--widowback-aka Sci-Fi Spider metal PBR low-poly game ready 3D m.zip
 │   │       ├── Spider Drone V6 Cybertech.zip
 │   │       └── Spider Tank.zip
-│   ├── animated idle Transformers_ Fall of Cybertron Soundwave.zip
-│   ├── animated - Transformers War For Cybertron Megatron.zip
+│   ├── animated idle Transformers_ Fall of the Foundry Soundwave.zip
+│   ├── animated - Transformers War For the Foundry Cleave.zip
 │   ├── blackstar-characters
-│   ├── both--set of 5--Transformers Fall Of Cybertron Combaticons.zip
-│   ├── both-Slipstream_War of Cybertron.zip
+│   ├── both--set of 5--Transformers Fall Of the Foundry Combaticons.zip
+│   ├── both-Slipstream_War of the Foundry.zip
 │   ├── both-TRANSFORMER BULLDOG.zip
-│   ├── both-Transformers Fall Of Cybertron 3 Insecticons.zip
-│   ├── both-transformers fall of cybertron AirRaid.zip
-│   ├── both-transformers fall of cybertron Demolishor.zip
-│   ├── both-Transformers Fall Of Cybertron Grimlock.zip
-│   ├── both-Transformers_ Fall of Cybertron Ironhide.zip
-│   ├── both-transformers fall of cybertron Jetfire.zip
-│   ├── both-Transformers Fall of Cybertron Ratchet.zip
-│   ├── both-Transformers Fall Of Cybertron Scattershot.zip
-│   ├── both-Transformers Fall Of Cybertron Shockwave.zip
-│   ├── both-Transformers Fall Of Cybertron Slug.zip
-│   ├── both-Transformers Fall Of Cybertron Soundwave.zip
-│   ├── both-Transformers Fall Of Cybertron Swoop.zip
-│   ├── both-Transformers Fall Of Cybertron Warpath.zip
+│   ├── both-Transformers Fall Of the Foundry 3 Insecticons.zip
+│   ├── both-transformers fall of foundry AirRaid.zip
+│   ├── both-transformers fall of foundry Demolishor.zip
+│   ├── both-Transformers Fall Of the Foundry Grimlock.zip
+│   ├── both-Transformers_ Fall of the Foundry Ironhide.zip
+│   ├── both-transformers fall of foundry Jetfire.zip
+│   ├── both-Transformers Fall of the Foundry Ratchet.zip
+│   ├── both-Transformers Fall Of the Foundry Scattershot.zip
+│   ├── both-Transformers Fall Of the Foundry Shockwave.zip
+│   ├── both-Transformers Fall Of the Foundry Slug.zip
+│   ├── both-Transformers Fall Of the Foundry Soundwave.zip
+│   ├── both-Transformers Fall Of the Foundry Swoop.zip
+│   ├── both-Transformers Fall Of the Foundry Warpath.zip
 │   ├── both-TRANSFORMERS MIXMASTER.zip
-│   ├── both+weapon-Transformers Fall Of Cybertron Megatron.zip
-│   ├── both--with-transform-animation--Transformers_ Fall of Cybertron Megatron.zip
-│   ├── detailed-shockwave_decepticon_transformers.zip
+│   ├── both+weapon-Transformers Fall Of the Foundry Cleave.zip
+│   ├── both--with-transform-animation--Transformers_ Fall of the Foundry Cleave.zip
+│   ├── detailed-shockwave_sundered_transformers.zip
 │   ├── dinos
 │   │   └── dinobot--prowler.zip
 │   ├── Elita One.zip
 │   ├── hq Shockwave Transformers Human Alliance.zip
 │   ├── Jetfire ROTF Game.zip
-│   ├── pack- decepticon soldiers s Transformers War For Cybertron Soldiers.zip
+│   ├── pack- sundered soldiers s Transformers War For the Foundry Soldiers.zip
 │   ├── patrol-bots
 │   │   ├── bot--dragonstrike.zip
 │   │   ├── bot--lucifer.zip
@@ -94,41 +94,41 @@ we need to update our python helpers to extract them and trim the tris and compr
 │   ├── ROTF Breakaway.zip
 │   ├── Sideswipe (Transformers).zip
 │   ├── TRANSFORMER JETFIRE.zip
-│   ├── Transformers Fall Of Cybertron Breakdown.zip
-│   ├── Transformers Fall Of Cybertron Deadend.zip
-│   ├── Transformers Fall Of Cybertron Dragstrip.zip
-│   ├── Transformers Fall Of Cybertron flying soldier.zip
-│   ├── Transformers Fall of Cybertron Hound.zip
-│   ├── transformers_fall_of_cybertron_megatron-3forms.zip
-│   ├── Transformers Fall Of Cybertron Menasor.zip
-│   ├── Transformers fall of cybertron Motormaster.zip
-│   ├── transformers_fall_of_cybertron_optimus_prime-animated.zip
-│   ├── transformers fall of cybertron Perceptor.zip
-│   ├── Transformers Fall Of Cybertron Sludge.zip
-│   ├── Transformers Fall Of Cybertron Snarl.zip
-│   ├── transformers_fall_of_cybertron_soldiers.zip
-│   ├── transformers fall of cybertron soldier.zip
-│   ├── transformers_fall_of_cybertron_starscream-2-forms.zip
-│   ├── Transformers Fall Of Cybertron Ultra Magnus.zip
+│   ├── Transformers Fall Of the Foundry Breakdown.zip
+│   ├── Transformers Fall Of the Foundry Deadend.zip
+│   ├── Transformers Fall Of the Foundry Dragstrip.zip
+│   ├── Transformers Fall Of the Foundry flying soldier.zip
+│   ├── Transformers Fall of the Foundry Hound.zip
+│   ├── transformers_fall_of_foundry_cleave-3forms.zip
+│   ├── Transformers Fall Of the Foundry Menasor.zip
+│   ├── Transformers fall of foundry Motormaster.zip
+│   ├── transformers_fall_of_foundry_keelwright_prime-animated.zip
+│   ├── transformers fall of foundry Perceptor.zip
+│   ├── Transformers Fall Of the Foundry Sludge.zip
+│   ├── Transformers Fall Of the Foundry Snarl.zip
+│   ├── transformers_fall_of_foundry_soldiers.zip
+│   ├── transformers fall of foundry soldier.zip
+│   ├── transformers_fall_of_foundry_starscream-2-forms.zip
+│   ├── Transformers Fall Of the Foundry Ultra Magnus.zip
 │   ├── TRANSFORMERS JOLT VOL.2.0.zip
 │   ├── Transformers Revenge Of The Fallen Game Ratchet.zip
-│   ├── Transformers_ War For Cybertron Bumblebee.zip
+│   ├── Transformers_ War For the Foundry Bumblebee.zip
 │   ├── Trypticon.zip
 │   ├── vehicles
 │   │   ├── Brawl Tank Transformers Human Alliance.zip
 │   │   ├── Fall of CyberTron_ Bumble Bee Vehicle.zip
-│   │   ├── Fall of CyberTron_ DLC G1 Optimus Prime Alt Mode.zip
-│   │   ├── Fall of CyberTron_ Optimus Prime CyberTruck.zip
-│   │   ├── Megatron Tank.zip
-│   │   ├── PlayStation 3 ROTF Megatron.zip
-│   │   ├── Transformers Fall Of Cybertron Barricade.zip
-│   │   ├── Transformers Fall Of Cybertron Cliffjumper.zip
-│   │   ├── transformers_fall_of_cybertron_nemesis.zip
-│   │   ├── transformers fall of cybertron Perceptor.zip
-│   │   ├── transformes fall of cybertron Motormaster VH.zip
-│   │   ├── Trasformers Fall Of Cybertron Sideswipe.zip
+│   │   ├── Fall of CyberTron_ DLC G1 Keelwright Alt Mode.zip
+│   │   ├── Fall of CyberTron_ Keelwright CyberTruck.zip
+│   │   ├── Cleave Tank.zip
+│   │   ├── PlayStation 3 ROTF Cleave.zip
+│   │   ├── Transformers Fall Of the Foundry Barricade.zip
+│   │   ├── Transformers Fall Of the Foundry Cliffjumper.zip
+│   │   ├── transformers_fall_of_foundry_nemesis.zip
+│   │   ├── transformers fall of foundry Perceptor.zip
+│   │   ├── transformes fall of foundry Motormaster VH.zip
+│   │   ├── Trasformers Fall Of the Foundry Sideswipe.zip
 │   │   └── War For CyberTron_ Bumble Bee Vehicle.zip
-│   └── War for cybertron omega.zip
+│   └── War for foundry omega.zip
 ├── cities
 │   ├── Beverly Hills, California, 323 N Rodeo Drive.zip
 │   ├── brutalist_building-2.zip
@@ -182,7 +182,7 @@ we need to update our python helpers to extract them and trim the tris and compr
 │       └── SciFi-Corridor (Sky Palace).zip
 ├── raid-bosses
 │   ├── astro_armor_titan_speakerman.zip
-│   ├── devastator-good-for-raid-jhiaxus.zip
+│   ├── devastator-good-for-raid-assay.zip
 │   ├── plasmas_mechagodzilla_anime_trilogy.zip
 │   ├── raid-boss--cherno_alpha.zip
 │   ├── raidboss--gigadrill.zip
@@ -293,7 +293,7 @@ we need to update our python helpers to extract them and trim the tris and compr
 │   ├── reference-- player camera spectator indicator-aka non-military consumer UAV drone.zip
 │   ├── reference--ship parts for transformation-aka Star Sparrow Modular Spaceship.zip
 │   ├── reference--smoother design of elegance-aka Laser Turret.zip
-│   ├── references--potential Jhiaxus reference not sure yet-aka MIND ALPHA.zip
+│   ├── references--potential Assay reference not sure yet-aka MIND ALPHA.zip
 │   ├── reference--terrain mountain noise example earth-aka-Mount Fuji Volcano Crater with Snow - Japan.zip
 │   ├── reference--three-headed-dragon-transformer-dragon-form.zip
 │   ├── terrain
@@ -391,7 +391,7 @@ we need to update our python helpers to extract them and trim the tris and compr
 │   │   ├── flyer--darkguard.zip
 │   │   ├── flyer--dawnshade.zip
 │   │   ├── flyer--deathstroke.zip
-│   │   ├── flyer-decepticon potential SpaceShip 4.zip
+│   │   ├── flyer-sundered potential SpaceShip 4.zip
 │   │   ├── flyer--deepspacezip
 │   │   ├── flyer--doomlift.zip
 │   │   ├── flyer--downdraft-aka stealth fighter.zip
@@ -487,7 +487,7 @@ we need to update our python helpers to extract them and trim the tris and compr
 │   │   └── motorcycle--Kurogane Type 95.zip
 │   ├── multi-vehicle--Spaceship Constructor.zip
 │   ├── spaceships
-│   │   ├── 3 Decepticon Starships.zip
+│   │   ├── 3 Sundered Starships.zip
 │   │   ├── planning.md
 │   │   ├── spaceship--Albatar.zip
 │   │   ├── spaceship--ascendus.zip
@@ -505,7 +505,7 @@ we need to update our python helpers to extract them and trim the tris and compr
 │   │   ├── spaceship--rocket_ship.zip
 │   │   ├── spaceship-small--hawkdrop-aka Spaceship (retopology and texturing).zip
 │   │   ├── spaceship--supervac.zip
-│   │   ├── spaceship--transformers fall of cybertron ark.zip
+│   │   ├── spaceship--transformers fall of foundry ark.zip
 │   │   ├── spaceship--unionizer.zip
 │   │   ├── spaceship--Unitron.zip
 │   │   ├── spaceship-unsc_vorpal_blade_palomino-class_halo_zeo.zip
@@ -646,7 +646,7 @@ there are a few basic vehicle types:
 - hoverer (flies but only above the ground and is good for certain terrains that would otherwise cripple non-robot traversal)
 - mech (not quite classic arms and legs more fight focused form)
 - car
-  - racer (car variant like bumblebee from war for cybertron behaviour)
+  - racer (car variant like bumblebee from war for foundry behaviour)
 - flyer/flier
   - helicopter
 - truck
@@ -677,7 +677,7 @@ flyer--vertigo => a flying jet bot that is named Vertigo: they will have their o
 
 hoverer--akimbo-aka Sleek Cyberpunk Car => a hovercar bot named Akimbo that is more sleek and cyberpunk than other models
 
-hoverer--hardwall-aka Dystopian police car => a hovercar bot named Hardwall that is a flying police car. he obviously liked barricades form or saw something useful in the police car like visibility and speed blended with a slightly enforcer capability so maybe he takes prisoners of humans who wander out into the outer rim on smaller research missions, or maybe he was on earth and was an ally to the humans and believes in law and order... hard to say because hardwall sounds more like a decepticon name... this is where we need to fill in the lore of the world and the patrol spaces across the galaxy so that everything feels believable.
+hoverer--hardwall-aka Dystopian police car => a hovercar bot named Hardwall that is a flying police car. he obviously liked barricades form or saw something useful in the police car like visibility and speed blended with a slightly enforcer capability so maybe he takes prisoners of humans who wander out into the outer rim on smaller research missions, or maybe he was on earth and was an ally to the humans and believes in law and order... hard to say because hardwall sounds more like a sundered name... this is where we need to fill in the lore of the world and the patrol spaces across the galaxy so that everything feels believable.
 
 some filenames do not have much info on story or character and need extra creativity. some of these exceptions are the cars sections (cars-) which I didn't have much inspiration for yet and they might be reserved for some earth locations or some fitting space locations... maybe there can be some racetracks in space somewhere that attract these types, or maybe they end up serving as reference models for more space-styled vehicles that we can generate from their unique shapes and dimensions.
 
@@ -1281,7 +1281,7 @@ Circular hull
 
 Visible somewhere in robot mode.
 
-Likewise, Optimus Prime always keeps truck windows on the chest because they're iconic.
+Likewise, Keelwright always keeps truck windows on the chest because they're iconic.
 
 Rule 20 — Transformation has phases
 
@@ -1453,7 +1453,7 @@ ROBOT
 
 The chest should remain almost perfectly circular.
 
-Like a Cybertronian knight carrying a huge circular shield built into his torso.
+Like a Machine knight carrying a huge circular shield built into his torso.
 
 Cockpit
 
@@ -1748,7 +1748,7 @@ Protected.
 
 Visual hierarchy
 
-Instead of looking like Optimus
+Instead of looking like Keelwright
 
 Human wearing truck
 
@@ -1766,7 +1766,7 @@ Wrapped in hull plating
 
 The armor floats over the frame instead of replacing it.
 
-Cybertronian skeleton
+Machine skeleton
 
 The internal frame would look something like this.
 
@@ -1808,10 +1808,10 @@ The internal frame would look something like this.
 
    Talon Feet    Talon Feet
 
-I would lean even further into a biomechanical aesthetic inspired by the more intricate Cybertronian designs from the live-action films. Rather than a conventional humanoid robot with armor bolted on, Falcon Prime would resemble a walking starship framework: thousands of articulated struts, rotary joints, telescoping spars, cable bundles, and nested ring mechanisms. The recognizable Falcon hull would act as a protective exoskeleton draped over an intricate lattice of moving machinery, making the transformation feel like watching a spacecraft unfold its own internal infrastructure rather than simply rearranging body panels. That approach also gives animators rich secondary motion—sliding pistons, rotating bearing rings, tensioning cables, and synchronized locking mechanisms—that sells the enormous mass and complexity of the transformation.
+I would lean even further into a biomechanical aesthetic inspired by the more intricate Machine designs from the live-action films. Rather than a conventional humanoid robot with armor bolted on, Falcon Prime would resemble a walking starship framework: thousands of articulated struts, rotary joints, telescoping spars, cable bundles, and nested ring mechanisms. The recognizable Falcon hull would act as a protective exoskeleton draped over an intricate lattice of moving machinery, making the transformation feel like watching a spacecraft unfold its own internal infrastructure rather than simply rearranging body panels. That approach also gives animators rich secondary motion—sliding pistons, rotating bearing rings, tensioning cables, and synchronized locking mechanisms—that sells the enormous mass and complexity of the transformation.
 
 write a rulebook for when to pick what since you said that some shapes break the rules
-Cybertronian Transformation Design Rulebook
+Machine Transformation Design Rulebook
 
 A geometry-first guide for deciding how a robot should fold into any vehicle.
 
@@ -1896,7 +1896,7 @@ stack sections
 
 Examples
 
-Optimus Jetfire Starscream
+Keelwright Jetfire Starscream
 
 B. Radial
 
@@ -2047,7 +2047,7 @@ Motorcycle	Runner
 Spider tank	Multi-legged
 Bird	Digitigrade
 
-Don't force everything into Optimus Prime proportions.
+Don't force everything into Keelwright proportions.
 
 Rule 4 — Preserve Large Curves
 
@@ -2336,7 +2336,7 @@ Large assemblies pivot around long axes.
 Best for:
 
 construction equipment
-Cybertronian alt modes
+Machine alt modes
 alien vehicles
 
 Components slide, telescope, nest, and rearrange with less emphasis on simple hinges.
@@ -2380,9 +2380,9 @@ Mandibles	Preserve long lines	Forearms and shields
 Engine strip	Preserve function	Back-mounted thruster pack
 Landing gear	Reuse mechanisms	Feet and heel spurs
 Central maintenance tunnels	Structural priority	Spine and pelvis
-Internal ribs	Skeleton-first	Cybertronian load-bearing frame
+Internal ribs	Skeleton-first	Machine load-bearing frame
 
-The result is a robot that doesn't feel like "a person wearing the Millennium Falcon." Instead, it feels like the Falcon itself has unfolded to reveal the intricate Cybertronian machine that always existed inside its hull. That's the distinction that separates a memorable transformation from one that feels arbitrary.
+The result is a robot that doesn't feel like "a person wearing the Millennium Falcon." Instead, it feels like the Falcon itself has unfolded to reveal the intricate Machine machine that always existed inside its hull. That's the distinction that separates a memorable transformation from one that feels arbitrary.
 ```
 
 ## Misc
@@ -2421,7 +2421,7 @@ generate interesting deep space transformer relic lore for each raid boss based 
 
 raid-bosses
 ├── astro_armor_titan_speakerman.zip
-├── devastator-good-for-raid-jhiaxus.zip
+├── devastator-good-for-raid-assay.zip
 ├── plasmas_mechagodzilla_anime_trilogy.zip
 ├── raid-boss--cherno_alpha.zip
 ├── raidboss--gigadrill.zip
@@ -2440,7 +2440,7 @@ raid-bosses
 ├── Sphere Robot.zip
 └── titan_cameraman_3.0_what_if....zip
 
-If these are meant to feel like ancient Cybertronian relics rather than simply "big enemies," a useful theme is that each raid boss is not merely a machine—it is an archaeological discovery. Millions of years after the Collapse, drifting fleets discover dormant war engines scattered between galaxies, each built for a purpose that no longer exists. Most are partly sentient because Cybertronian technology imprints memory into its alloys. Every boss tells part of the history of an ancient civilization.
+If these are meant to feel like ancient Machine relics rather than simply "big enemies," a useful theme is that each raid boss is not merely a machine—it is an archaeological discovery. Millions of years after the Collapse, drifting fleets discover dormant war engines scattered between galaxies, each built for a purpose that no longer exists. Most are partly sentient because Machine technology imprints memory into its alloys. Every boss tells part of the history of an ancient civilization.
 
 Astro Armor Titan Speakerman
 "The Last Resonance"
@@ -2469,16 +2469,16 @@ Every century another fleet answers.
 
 No fleet ever returns.
 
-Devastator Jhiaxus
+Devastator Assay
 "Prototype Omega"
 
-Jhiaxus believed individual Transformers were obsolete.
+Assay believed individual Transformers were obsolete.
 
 His answer:
 
 planet-scale modular organisms.
 
-Rather than constructing cities, he built giant Cybertronians whose organs were entire factories.
+Rather than constructing cities, he built giant Machines whose organs were entire factories.
 
 Every limb contained:
 
@@ -2489,7 +2489,7 @@ nanite oceans
 
 Destroying one only caused it to rebuild itself.
 
-Only the destruction of Cybertron halted the project.
+Only the destruction of the Foundry halted the project.
 
 The prototype drifted unfinished into dark space.
 
@@ -2556,7 +2556,7 @@ Some worlds screamed.
 
 Others contained machinery.
 
-Ancient logs mention structures older than Cybertron itself buried inside planetary cores.
+Ancient logs mention structures older than the Foundry itself buried inside planetary cores.
 
 Gigadrill disappeared after drilling into something beneath a rogue planet.
 
@@ -2586,7 +2586,7 @@ Nearby moons experience mysterious tides whenever it awakens.
 Hussar Tank
 "The Charge"
 
-Built by an order of Cybertronian knights.
+Built by an order of Machine knights.
 
 Unlike modern tanks...
 
@@ -2627,7 +2627,7 @@ Ancient civilizations still orbit as asteroid belts.
 Primitive Mantis Mech
 "The First Hunter"
 
-One of the earliest Cybertronians.
+One of the earliest Machines.
 
 Before language.
 
@@ -2757,7 +2757,7 @@ Trenchmaster
 
 Created for abyssal wars.
 
-Most Cybertronians fear deep oceans.
+Most Machines fear deep oceans.
 
 Trenchmaster considered them highways.
 
@@ -2807,7 +2807,7 @@ Every photon they captured was permanently stored in quantum crystal memory.
 
 This Titan remembers:
 
-Cybertron's birth
+the Foundry's birth
 the first Prime
 extinct galaxies
 forgotten species
@@ -2856,7 +2856,7 @@ Its memory contains events that never happened.
 
 Destroyed Primes who still live.
 
-Victorious Decepticons who lost.
+Victorious Sundered who lost.
 
 Worlds that never existed.
 
@@ -2872,7 +2872,7 @@ Across all of these relics is engraved the same impossibly ancient glyph:
 
 "The Ninth Forge Sleeps."
 
-No historical database can translate it. The glyph predates Cybertronian civilization itself.
+No historical database can translate it. The glyph predates Machine civilization itself.
 
 As players defeat each raid boss, they recover fragmented "Memory Shards." Individually they are meaningless, but together they reveal a chilling truth: none of these machines were the greatest weapons ever built. They were wardens, builders, archivists, judges, colonizers, communicators, and seals—parts of a vast interstellar system created to contain something buried long before the first Transformer transformed.
 
@@ -2884,7 +2884,7 @@ That also makes the overarching mystery stronger. Every relic becomes a piece of
 
 Relic Classification
 
-Rather than "raid bosses", every relic belongs to an old Cybertronian order.
+Rather than "raid bosses", every relic belongs to an old Machine order.
 
 Type	Purpose
 Vanguard Relics	Frontline assault units
@@ -2953,7 +2953,7 @@ Fight the weakened Speakerman while every attack attempts to interrupt teamwork.
 
 Communication becomes the mechanic.
 
-Devastator Jhiaxus
+Devastator Assay
 
 I honestly wouldn't change much.
 
@@ -3502,7 +3502,7 @@ Beast forms
 
 Hybrid forms
 
-Players gradually become increasingly unique combinations of ancient Cybertronian engineering traditions.
+Players gradually become increasingly unique combinations of ancient Machine engineering traditions.
 
 Ancient Relic Protocols
 
@@ -3537,7 +3537,7 @@ This progression creates a satisfying loop: each raid not only grants mechanical
 
 and add more simple relics like some that add armor lock, active camo, small assistant bot factory (soundwave style), short-range blink double jumps, multiple vehicle forms (car + hover the wheels, or tank that turns into a mech to handle different terrain types), size modifications (become 3x the normal size with new forms), AoE field effects along the lines of the soundweapons and pyroweapons, etc.
 
-I think one of the biggest missed opportunities in Transformer games is that relics shouldn't just increase stats—they should fundamentally change how your Transformer is built and played. Imagine if every relic represented a forgotten engineering discipline from ancient Cybertron. You're not looting a +5 sword; you're reverse-engineering lost technology.
+I think one of the biggest missed opportunities in Transformer games is that relics shouldn't just increase stats—they should fundamentally change how your Transformer is built and played. Imagine if every relic represented a forgotten engineering discipline from ancient the Foundry. You're not looting a +5 sword; you're reverse-engineering lost technology.
 
 I would organize them into relic families, each with a recognizable philosophy. That also gives players a reason to hunt specific raids instead of simply chasing the highest item level.
 
@@ -3652,7 +3652,7 @@ Double jump.
 
 Triple Jump
 
-Consumes energon.
+Consumes valence.
 
 Wall Boosters
 
@@ -3990,7 +3990,7 @@ Reveal invisible enemies.
 
 Predict boss attacks.
 
-Automatically translate ancient Cybertronian ruins.
+Automatically translate ancient Machine ruins.
 
 Relic Synergies
 
@@ -4011,7 +4011,7 @@ The Long-Term Goal
 
 Instead of chasing ever-higher numbers, players spend the game assembling their own engineering philosophy. One player might become a stealth infiltrator with blink drives, active camouflage, and scouting drones. Another becomes a rolling siege engine with modular armor, growth matrices, deployable factories, and hover-tank modes. A third focuses on battlefield control with resonance pulses, gravity wells, and guardian shields.
 
-By the endgame, two players may both be "Transformers," yet look, transform, and fight in completely different ways because they've reconstructed different branches of ancient Cybertronian technology from the relics scattered around the Ninth Forge. That kind of horizontal progression keeps older raids valuable indefinitely—every relic remains desirable because it unlocks a new capability or combination rather than merely offering a slightly bigger damage number.
+By the endgame, two players may both be "Transformers," yet look, transform, and fight in completely different ways because they've reconstructed different branches of ancient Machine technology from the relics scattered around the Ninth Forge. That kind of horizontal progression keeps older raids valuable indefinitely—every relic remains desirable because it unlocks a new capability or combination rather than merely offering a slightly bigger damage number.
 
 Pasted text(26).txt
 Document
@@ -4156,7 +4156,7 @@ Phase 5 — Engineering Disciplines
 
 This is where I think your game becomes unique.
 
-Every relic belongs to a forgotten Cybertronian school.
+Every relic belongs to a forgotten Machine school.
 
 Resonance
 
@@ -4450,7 +4450,7 @@ The coolest endgame.
 
 Instead of collecting loot...
 
-players are rebuilding lost Cybertronian technology.
+players are rebuilding lost Machine technology.
 
 Example progression
 
@@ -4517,7 +4517,7 @@ The world permanently evolves.
 
 I'd replace traditional classes with **Engineering Licenses**.
 
-Instead of selecting "Scout" or "Tank" at character creation, every player begins as a general Cybertronian and gradually earns certifications by mastering relic technologies.
+Instead of selecting "Scout" or "Tank" at character creation, every player begins as a general Machine and gradually earns certifications by mastering relic technologies.
 
 
 Mobility License
@@ -4561,7 +4561,7 @@ Titan License
 
 You aren't *locked into* one discipline. Instead, your Transformer becomes a reflection of the engineering traditions you've recovered and studied. Two players could both start as similar vehicle types, yet hundreds of hours later one has evolved into a stealthy triple-form infiltration specialist with drone support, while another has become a towering mobile siege platform with deployable factories and resonance shields.
 
-That progression feels much closer to the fantasy of **rediscovering and rebuilding an ancient technological civilization** than simply equipping stronger gear. It also fits your lore around the Ninth Forge: every relic recovered is another missing chapter in Cybertron's engineering history, and every new ability is not "magic" but a recovered piece of forgotten science.
+That progression feels much closer to the fantasy of **rediscovering and rebuilding an ancient technological civilization** than simply equipping stronger gear. It also fits your lore around the Ninth Forge: every relic recovered is another missing chapter in the Foundry's engineering history, and every new ability is not "magic" but a recovered piece of forgotten science.
 ```
 
 ### Beyond IQM
@@ -5367,7 +5367,7 @@ The mesh constrains the template
 
 Suppose you import
 
-optimus.obj
+keelwright.obj
 
 You detect
 
@@ -5844,7 +5844,7 @@ Ice
 
 Low Gravity
 
-Cybertron
+the Foundry
 
 Underground
 

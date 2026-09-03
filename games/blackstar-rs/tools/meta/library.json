@@ -1343,17 +1343,17 @@
   "path": "./vehicles/spaceships/spaceship--Albatar.zip"
  },
  {
-  "raw": "spaceship--transformers fall of cybertron ark.zip",
+  "raw": "spaceship--transformers fall of foundry ark.zip",
   "modes": [
    "robot"
   ],
   "flags": [],
   "subtype": null,
-  "name": "transformers fall of cybertron ark",
+  "name": "transformers fall of foundry ark",
   "note": null,
   "category": "vehicle",
   "dir": "spaceships",
-  "path": "./vehicles/spaceships/spaceship--transformers fall of cybertron ark.zip"
+  "path": "./vehicles/spaceships/spaceship--transformers fall of foundry ark.zip"
  },
  {
   "raw": "spaceship--darkwing.zip",
@@ -1395,7 +1395,7 @@
   "path": "./vehicles/spaceships/spaceship--supervac.zip"
  },
  {
-  "raw": "3 Decepticon Starships.zip",
+  "raw": "3 Sundered Starships.zip",
   "modes": [
    "robot"
   ],
@@ -1405,7 +1405,7 @@
   "note": null,
   "category": "vehicle",
   "dir": "spaceships",
-  "path": "./vehicles/spaceships/3 Decepticon Starships.zip"
+  "path": "./vehicles/spaceships/3 Sundered Starships.zip"
  },
  {
   "raw": "spaceship--odyssey.zip",
@@ -1774,7 +1774,7 @@
   "path": "./vehicles/flyers/flyer--Sea Harrier FA2 with AIM-9L & AIM-120B.zip"
  },
  {
-  "raw": "flyer-decepticon potential SpaceShip 4.zip",
+  "raw": "flyer-sundered potential SpaceShip 4.zip",
   "modes": [
    "robot"
   ],
@@ -1784,7 +1784,7 @@
   "note": null,
   "category": "vehicle",
   "dir": "flyers",
-  "path": "./vehicles/flyers/flyer-decepticon potential SpaceShip 4.zip"
+  "path": "./vehicles/flyers/flyer-sundered potential SpaceShip 4.zip"
  },
  {
   "raw": "flyer-valkyrie.zip",
@@ -2963,17 +2963,17 @@
   "path": "./raid-bosses/plasmas_mechagodzilla_anime_trilogy.zip"
  },
  {
-  "raw": "devastator-good-for-raid-jhiaxus.zip",
+  "raw": "devastator-good-for-raid-assay.zip",
   "modes": [
    "robot"
   ],
   "flags": [],
   "subtype": null,
-  "name": "devastator good for raid jhiaxus",
+  "name": "devastator good for raid assay",
   "note": null,
   "category": "raid_boss",
   "dir": "raid-bosses",
-  "path": "./raid-bosses/devastator-good-for-raid-jhiaxus.zip"
+  "path": "./raid-bosses/devastator-good-for-raid-assay.zip"
  },
  {
   "raw": "raidboss-hussar_tank.zip",
@@ -3885,7 +3885,7 @@
   "path": "./weapons/hammers/Halo Gravity Hammer.zip"
  },
  {
-  "raw": "transformers_fall_of_cybertron_optimus_prime-animated.zip",
+  "raw": "transformers_fall_of_foundry_keelwright_keelwright-animated.zip",
   "modes": [
    "robot"
   ],
@@ -3893,14 +3893,14 @@
    "animated"
   ],
   "subtype": null,
-  "name": "fall of optimus prime animated",
+  "name": "fall of keelwright animated",
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/transformers_fall_of_cybertron_optimus_prime-animated.zip"
+  "path": "./bots/transformers_fall_of_foundry_keelwright_keelwright-animated.zip"
  },
  {
-  "raw": "transformers_fall_of_cybertron_soldiers.zip",
+  "raw": "transformers_fall_of_foundry_soldiers.zip",
   "modes": [
    "robot"
   ],
@@ -3910,23 +3910,23 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/transformers_fall_of_cybertron_soldiers.zip"
+  "path": "./bots/transformers_fall_of_foundry_soldiers.zip"
  },
  {
-  "raw": "transformers_fall_of_cybertron_megatron-3forms.zip",
+  "raw": "transformers_fall_of_foundry_cleave-3forms.zip",
   "modes": [
    "robot"
   ],
   "flags": [],
   "subtype": null,
-  "name": "fall of megatron 3forms",
+  "name": "fall of cleave 3forms",
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/transformers_fall_of_cybertron_megatron-3forms.zip"
+  "path": "./bots/transformers_fall_of_foundry_cleave-3forms.zip"
  },
  {
-  "raw": "transformers_fall_of_cybertron_starscream-2-forms.zip",
+  "raw": "transformers_fall_of_foundry_starscream-2-forms.zip",
   "modes": [
    "robot"
   ],
@@ -3936,10 +3936,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/transformers_fall_of_cybertron_starscream-2-forms.zip"
+  "path": "./bots/transformers_fall_of_foundry_starscream-2-forms.zip"
  },
  {
-  "raw": "detailed-shockwave_decepticon_transformers.zip",
+  "raw": "detailed-shockwave_sundered_transformers.zip",
   "modes": [
    "robot"
   ],
@@ -3951,7 +3951,7 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/detailed-shockwave_decepticon_transformers.zip"
+  "path": "./bots/detailed-shockwave_sundered_transformers.zip"
  },
  {
   "raw": "hq Shockwave Transformers Human Alliance.zip",
@@ -3967,7 +3967,7 @@
   "path": "./bots/hq Shockwave Transformers Human Alliance.zip"
  },
  {
-  "raw": "Transformers Fall Of Cybertron Menasor.zip",
+  "raw": "Transformers Fall Of the Foundry Menasor.zip",
   "modes": [
    "robot"
   ],
@@ -3977,10 +3977,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/Transformers Fall Of Cybertron Menasor.zip"
+  "path": "./bots/Transformers Fall Of the Foundry Menasor.zip"
  },
  {
-  "raw": "Transformers fall of cybertron Motormaster.zip",
+  "raw": "Transformers fall of foundry Motormaster.zip",
   "modes": [
    "robot"
   ],
@@ -3990,10 +3990,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/Transformers fall of cybertron Motormaster.zip"
+  "path": "./bots/Transformers fall of foundry Motormaster.zip"
  },
  {
-  "raw": "both-Transformers Fall Of Cybertron Swoop.zip",
+  "raw": "both-Transformers Fall Of the Foundry Swoop.zip",
   "modes": [
    "robot",
    "alt"
@@ -4006,10 +4006,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both-Transformers Fall Of Cybertron Swoop.zip"
+  "path": "./bots/both-Transformers Fall Of the Foundry Swoop.zip"
  },
  {
-  "raw": "both-Transformers Fall Of Cybertron Grimlock.zip",
+  "raw": "both-Transformers Fall Of the Foundry Grimlock.zip",
   "modes": [
    "robot",
    "alt"
@@ -4022,10 +4022,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both-Transformers Fall Of Cybertron Grimlock.zip"
+  "path": "./bots/both-Transformers Fall Of the Foundry Grimlock.zip"
  },
  {
-  "raw": "both-Transformers Fall Of Cybertron Slug.zip",
+  "raw": "both-Transformers Fall Of the Foundry Slug.zip",
   "modes": [
    "robot",
    "alt"
@@ -4038,10 +4038,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both-Transformers Fall Of Cybertron Slug.zip"
+  "path": "./bots/both-Transformers Fall Of the Foundry Slug.zip"
  },
  {
-  "raw": "Transformers Fall Of Cybertron Snarl.zip",
+  "raw": "Transformers Fall Of the Foundry Snarl.zip",
   "modes": [
    "robot"
   ],
@@ -4051,10 +4051,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/Transformers Fall Of Cybertron Snarl.zip"
+  "path": "./bots/Transformers Fall Of the Foundry Snarl.zip"
  },
  {
-  "raw": "Transformers Fall Of Cybertron Sludge.zip",
+  "raw": "Transformers Fall Of the Foundry Sludge.zip",
   "modes": [
    "robot"
   ],
@@ -4064,10 +4064,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/Transformers Fall Of Cybertron Sludge.zip"
+  "path": "./bots/Transformers Fall Of the Foundry Sludge.zip"
  },
  {
-  "raw": "Transformers Fall of Cybertron Hound.zip",
+  "raw": "Transformers Fall of the Foundry Hound.zip",
   "modes": [
    "robot"
   ],
@@ -4077,10 +4077,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/Transformers Fall of Cybertron Hound.zip"
+  "path": "./bots/Transformers Fall of the Foundry Hound.zip"
  },
  {
-  "raw": "Transformers Fall Of Cybertron Ultra Magnus.zip",
+  "raw": "Transformers Fall Of the Foundry Ultra Magnus.zip",
   "modes": [
    "robot"
   ],
@@ -4090,10 +4090,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/Transformers Fall Of Cybertron Ultra Magnus.zip"
+  "path": "./bots/Transformers Fall Of the Foundry Ultra Magnus.zip"
  },
  {
-  "raw": "Transformers Fall Of Cybertron Breakdown.zip",
+  "raw": "Transformers Fall Of the Foundry Breakdown.zip",
   "modes": [
    "robot"
   ],
@@ -4103,10 +4103,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/Transformers Fall Of Cybertron Breakdown.zip"
+  "path": "./bots/Transformers Fall Of the Foundry Breakdown.zip"
  },
  {
-  "raw": "Transformers Fall Of Cybertron Deadend.zip",
+  "raw": "Transformers Fall Of the Foundry Deadend.zip",
   "modes": [
    "robot"
   ],
@@ -4116,10 +4116,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/Transformers Fall Of Cybertron Deadend.zip"
+  "path": "./bots/Transformers Fall Of the Foundry Deadend.zip"
  },
  {
-  "raw": "Transformers Fall Of Cybertron Dragstrip.zip",
+  "raw": "Transformers Fall Of the Foundry Dragstrip.zip",
   "modes": [
    "robot"
   ],
@@ -4129,10 +4129,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/Transformers Fall Of Cybertron Dragstrip.zip"
+  "path": "./bots/Transformers Fall Of the Foundry Dragstrip.zip"
  },
  {
-  "raw": "both-Transformers Fall Of Cybertron Warpath.zip",
+  "raw": "both-Transformers Fall Of the Foundry Warpath.zip",
   "modes": [
    "robot",
    "alt"
@@ -4145,10 +4145,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both-Transformers Fall Of Cybertron Warpath.zip"
+  "path": "./bots/both-Transformers Fall Of the Foundry Warpath.zip"
  },
  {
-  "raw": "both-transformers fall of cybertron Demolishor.zip",
+  "raw": "both-transformers fall of foundry Demolishor.zip",
   "modes": [
    "robot",
    "alt"
@@ -4161,10 +4161,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both-transformers fall of cybertron Demolishor.zip"
+  "path": "./bots/both-transformers fall of foundry Demolishor.zip"
  },
  {
-  "raw": "both-Transformers Fall Of Cybertron 3 Insecticons.zip",
+  "raw": "both-Transformers Fall Of the Foundry 3 Insecticons.zip",
   "modes": [
    "robot",
    "alt"
@@ -4177,10 +4177,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both-Transformers Fall Of Cybertron 3 Insecticons.zip"
+  "path": "./bots/both-Transformers Fall Of the Foundry 3 Insecticons.zip"
  },
  {
-  "raw": "both-Transformers Fall Of Cybertron Shockwave.zip",
+  "raw": "both-Transformers Fall Of the Foundry Shockwave.zip",
   "modes": [
    "robot",
    "alt"
@@ -4193,10 +4193,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both-Transformers Fall Of Cybertron Shockwave.zip"
+  "path": "./bots/both-Transformers Fall Of the Foundry Shockwave.zip"
  },
  {
-  "raw": "both-Transformers Fall Of Cybertron Soundwave.zip",
+  "raw": "both-Transformers Fall Of the Foundry Soundwave.zip",
   "modes": [
    "robot",
    "alt"
@@ -4209,10 +4209,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both-Transformers Fall Of Cybertron Soundwave.zip"
+  "path": "./bots/both-Transformers Fall Of the Foundry Soundwave.zip"
  },
  {
-  "raw": "both-Transformers Fall Of Cybertron Scattershot.zip",
+  "raw": "both-Transformers Fall Of the Foundry Scattershot.zip",
   "modes": [
    "robot",
    "alt"
@@ -4225,10 +4225,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both-Transformers Fall Of Cybertron Scattershot.zip"
+  "path": "./bots/both-Transformers Fall Of the Foundry Scattershot.zip"
  },
  {
-  "raw": "pack- decepticon soldiers s Transformers War For Cybertron Soldiers.zip",
+  "raw": "pack- sundered soldiers s Transformers War For the Foundry Soldiers.zip",
   "modes": [
    "robot"
   ],
@@ -4238,10 +4238,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/pack- decepticon soldiers s Transformers War For Cybertron Soldiers.zip"
+  "path": "./bots/pack- sundered soldiers s Transformers War For the Foundry Soldiers.zip"
  },
  {
-  "raw": "transformers fall of cybertron Perceptor.zip",
+  "raw": "transformers fall of foundry Perceptor.zip",
   "modes": [
    "robot"
   ],
@@ -4251,7 +4251,7 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/transformers fall of cybertron Perceptor.zip"
+  "path": "./bots/transformers fall of foundry Perceptor.zip"
  },
  {
   "raw": "both-TRANSFORMERS MIXMASTER.zip",
@@ -4335,7 +4335,7 @@
   "path": "./bots/Transformers Revenge Of The Fallen Game Ratchet.zip"
  },
  {
-  "raw": "both-Transformers Fall of Cybertron Ratchet.zip",
+  "raw": "both-Transformers Fall of the Foundry Ratchet.zip",
   "modes": [
    "robot",
    "alt"
@@ -4348,7 +4348,7 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both-Transformers Fall of Cybertron Ratchet.zip"
+  "path": "./bots/both-Transformers Fall of the Foundry Ratchet.zip"
  },
  {
   "raw": "TRANSFORMER JETFIRE.zip",
@@ -4364,7 +4364,7 @@
   "path": "./bots/TRANSFORMER JETFIRE.zip"
  },
  {
-  "raw": "both--with-transform-animation--Transformers_ Fall of Cybertron Megatron.zip",
+  "raw": "both--with-transform-animation--Transformers_ Fall of the Foundry Cleave.zip",
   "modes": [
    "robot",
    "alt"
@@ -4374,11 +4374,11 @@
    "transform_anim"
   ],
   "subtype": null,
-  "name": "Transformers_ Fall of Cybertron Megatron",
+  "name": "Transformers_ Fall of the Foundry Cleave",
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both--with-transform-animation--Transformers_ Fall of Cybertron Megatron.zip"
+  "path": "./bots/both--with-transform-animation--Transformers_ Fall of the Foundry Cleave.zip"
  },
  {
   "raw": "Trypticon.zip",
@@ -4394,7 +4394,7 @@
   "path": "./bots/Trypticon.zip"
  },
  {
-  "raw": "both-transformers fall of cybertron AirRaid.zip",
+  "raw": "both-transformers fall of foundry AirRaid.zip",
   "modes": [
    "robot",
    "alt"
@@ -4407,10 +4407,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both-transformers fall of cybertron AirRaid.zip"
+  "path": "./bots/both-transformers fall of foundry AirRaid.zip"
  },
  {
-  "raw": "War for cybertron omega.zip",
+  "raw": "War for foundry omega.zip",
   "modes": [
    "robot"
   ],
@@ -4420,10 +4420,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/War for cybertron omega.zip"
+  "path": "./bots/War for foundry omega.zip"
  },
  {
-  "raw": "both-Slipstream_War of Cybertron.zip",
+  "raw": "both-Slipstream_War of the Foundry.zip",
   "modes": [
    "robot",
    "alt"
@@ -4436,10 +4436,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both-Slipstream_War of Cybertron.zip"
+  "path": "./bots/both-Slipstream_War of the Foundry.zip"
  },
  {
-  "raw": "animated idle Transformers_ Fall of Cybertron Soundwave.zip",
+  "raw": "animated idle Transformers_ Fall of the Foundry Soundwave.zip",
   "modes": [
    "robot"
   ],
@@ -4451,10 +4451,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/animated idle Transformers_ Fall of Cybertron Soundwave.zip"
+  "path": "./bots/animated idle Transformers_ Fall of the Foundry Soundwave.zip"
  },
  {
-  "raw": "Transformers_ War For Cybertron Bumblebee.zip",
+  "raw": "Transformers_ War For the Foundry Bumblebee.zip",
   "modes": [
    "robot"
   ],
@@ -4464,10 +4464,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/Transformers_ War For Cybertron Bumblebee.zip"
+  "path": "./bots/Transformers_ War For the Foundry Bumblebee.zip"
  },
  {
-  "raw": "animated - Transformers War For Cybertron Megatron.zip",
+  "raw": "animated - Transformers War For the Foundry Cleave.zip",
   "modes": [
    "robot"
   ],
@@ -4475,14 +4475,14 @@
    "animated"
   ],
   "subtype": null,
-  "name": "Megatron",
+  "name": "Cleave",
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/animated - Transformers War For Cybertron Megatron.zip"
+  "path": "./bots/animated - Transformers War For the Foundry Cleave.zip"
  },
  {
-  "raw": "both-Transformers_ Fall of Cybertron Ironhide.zip",
+  "raw": "both-Transformers_ Fall of the Foundry Ironhide.zip",
   "modes": [
    "robot",
    "alt"
@@ -4495,10 +4495,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both-Transformers_ Fall of Cybertron Ironhide.zip"
+  "path": "./bots/both-Transformers_ Fall of the Foundry Ironhide.zip"
  },
  {
-  "raw": "Transformers Fall Of Cybertron flying soldier.zip",
+  "raw": "Transformers Fall Of the Foundry flying soldier.zip",
   "modes": [
    "robot"
   ],
@@ -4508,10 +4508,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/Transformers Fall Of Cybertron flying soldier.zip"
+  "path": "./bots/Transformers Fall Of the Foundry flying soldier.zip"
  },
  {
-  "raw": "transformers fall of cybertron soldier.zip",
+  "raw": "transformers fall of foundry soldier.zip",
   "modes": [
    "robot"
   ],
@@ -4521,10 +4521,10 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/transformers fall of cybertron soldier.zip"
+  "path": "./bots/transformers fall of foundry soldier.zip"
  },
  {
-  "raw": "both+weapon-Transformers Fall Of Cybertron Megatron.zip",
+  "raw": "both+weapon-Transformers Fall Of the Foundry Cleave.zip",
   "modes": [
    "robot",
    "alt"
@@ -4534,14 +4534,14 @@
    "has_weapon"
   ],
   "subtype": null,
-  "name": "Megatron",
+  "name": "Cleave",
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both+weapon-Transformers Fall Of Cybertron Megatron.zip"
+  "path": "./bots/both+weapon-Transformers Fall Of the Foundry Cleave.zip"
  },
  {
-  "raw": "both--set of 5--Transformers Fall Of Cybertron Combaticons.zip",
+  "raw": "both--set of 5--Transformers Fall Of the Foundry Combaticons.zip",
   "modes": [
    "robot",
    "alt"
@@ -4551,14 +4551,14 @@
    "set"
   ],
   "subtype": null,
-  "name": "Transformers Fall Of Cybertron Combaticons",
+  "name": "Transformers Fall Of the Foundry Combaticons",
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both--set of 5--Transformers Fall Of Cybertron Combaticons.zip"
+  "path": "./bots/both--set of 5--Transformers Fall Of the Foundry Combaticons.zip"
  },
  {
-  "raw": "both-transformers fall of cybertron Jetfire.zip",
+  "raw": "both-transformers fall of foundry Jetfire.zip",
   "modes": [
    "robot",
    "alt"
@@ -4571,7 +4571,7 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both-transformers fall of cybertron Jetfire.zip"
+  "path": "./bots/both-transformers fall of foundry Jetfire.zip"
  },
  {
   "raw": "ROTF Breakaway.zip",
@@ -4616,7 +4616,7 @@
   "path": "./bots/both-TRANSFORMER BULLDOG.zip"
  },
  {
-  "raw": "transformers_fall_of_cybertron_nemesis.zip",
+  "raw": "transformers_fall_of_foundry_nemesis.zip",
   "modes": [
    "robot"
   ],
@@ -4626,7 +4626,7 @@
   "note": null,
   "category": "bot",
   "dir": "vehicles",
-  "path": "./bots/vehicles/transformers_fall_of_cybertron_nemesis.zip"
+  "path": "./bots/vehicles/transformers_fall_of_foundry_nemesis.zip"
  },
  {
   "raw": "Brawl Tank Transformers Human Alliance.zip",
@@ -4642,7 +4642,7 @@
   "path": "./bots/vehicles/Brawl Tank Transformers Human Alliance.zip"
  },
  {
-  "raw": "transformes fall of cybertron Motormaster VH.zip",
+  "raw": "transformes fall of foundry Motormaster VH.zip",
   "modes": [
    "robot"
   ],
@@ -4652,10 +4652,10 @@
   "note": null,
   "category": "bot",
   "dir": "vehicles",
-  "path": "./bots/vehicles/transformes fall of cybertron Motormaster VH.zip"
+  "path": "./bots/vehicles/transformes fall of foundry Motormaster VH.zip"
  },
  {
-  "raw": "Transformers Fall Of Cybertron Barricade.zip",
+  "raw": "Transformers Fall Of the Foundry Barricade.zip",
   "modes": [
    "robot"
   ],
@@ -4665,10 +4665,10 @@
   "note": null,
   "category": "bot",
   "dir": "vehicles",
-  "path": "./bots/vehicles/Transformers Fall Of Cybertron Barricade.zip"
+  "path": "./bots/vehicles/Transformers Fall Of the Foundry Barricade.zip"
  },
  {
-  "raw": "Transformers Fall Of Cybertron Cliffjumper.zip",
+  "raw": "Transformers Fall Of the Foundry Cliffjumper.zip",
   "modes": [
    "robot"
   ],
@@ -4678,10 +4678,10 @@
   "note": null,
   "category": "bot",
   "dir": "vehicles",
-  "path": "./bots/vehicles/Transformers Fall Of Cybertron Cliffjumper.zip"
+  "path": "./bots/vehicles/Transformers Fall Of the Foundry Cliffjumper.zip"
  },
  {
-  "raw": "transformers fall of cybertron Perceptor.zip",
+  "raw": "transformers fall of foundry Perceptor.zip",
   "modes": [
    "robot"
   ],
@@ -4691,20 +4691,20 @@
   "note": null,
   "category": "bot",
   "dir": "vehicles",
-  "path": "./bots/vehicles/transformers fall of cybertron Perceptor.zip"
+  "path": "./bots/vehicles/transformers fall of foundry Perceptor.zip"
  },
  {
-  "raw": "Megatron Tank.zip",
+  "raw": "Cleave Tank.zip",
   "modes": [
    "robot"
   ],
   "flags": [],
   "subtype": null,
-  "name": "Megatron Tank",
+  "name": "Cleave Tank",
   "note": null,
   "category": "bot",
   "dir": "vehicles",
-  "path": "./bots/vehicles/Megatron Tank.zip"
+  "path": "./bots/vehicles/Cleave Tank.zip"
  },
  {
   "raw": "Fall of CyberTron_ Bumble Bee Vehicle.zip",
@@ -4733,33 +4733,33 @@
   "path": "./bots/vehicles/War For CyberTron_ Bumble Bee Vehicle.zip"
  },
  {
-  "raw": "Fall of CyberTron_ Optimus Prime CyberTruck.zip",
+  "raw": "Fall of CyberTron_ Keelwright CyberTruck.zip",
   "modes": [
    "robot"
   ],
   "flags": [],
   "subtype": null,
-  "name": "Optimus Prime CyberTruck",
+  "name": "Keelwright CyberTruck",
   "note": null,
   "category": "bot",
   "dir": "vehicles",
-  "path": "./bots/vehicles/Fall of CyberTron_ Optimus Prime CyberTruck.zip"
+  "path": "./bots/vehicles/Fall of CyberTron_ Keelwright CyberTruck.zip"
  },
  {
-  "raw": "Fall of CyberTron_ DLC G1 Optimus Prime Alt Mode.zip",
+  "raw": "Fall of CyberTron_ DLC G1 Keelwright Alt Mode.zip",
   "modes": [
    "robot"
   ],
   "flags": [],
   "subtype": null,
-  "name": "DLC G1 Optimus Prime Alt Mode",
+  "name": "DLC G1 Keelwright Alt Mode",
   "note": null,
   "category": "bot",
   "dir": "vehicles",
-  "path": "./bots/vehicles/Fall of CyberTron_ DLC G1 Optimus Prime Alt Mode.zip"
+  "path": "./bots/vehicles/Fall of CyberTron_ DLC G1 Keelwright Alt Mode.zip"
  },
  {
-  "raw": "Trasformers Fall Of Cybertron Sideswipe.zip",
+  "raw": "Trasformers Fall Of the Foundry Sideswipe.zip",
   "modes": [
    "robot"
   ],
@@ -4769,20 +4769,20 @@
   "note": null,
   "category": "bot",
   "dir": "vehicles",
-  "path": "./bots/vehicles/Trasformers Fall Of Cybertron Sideswipe.zip"
+  "path": "./bots/vehicles/Trasformers Fall Of the Foundry Sideswipe.zip"
  },
  {
-  "raw": "PlayStation 3 ROTF Megatron.zip",
+  "raw": "PlayStation 3 ROTF Cleave.zip",
   "modes": [
    "robot"
   ],
   "flags": [],
   "subtype": null,
-  "name": "PlayStation 3 ROTF Megatron",
+  "name": "PlayStation 3 ROTF Cleave",
   "note": null,
   "category": "bot",
   "dir": "vehicles",
-  "path": "./bots/vehicles/PlayStation 3 ROTF Megatron.zip"
+  "path": "./bots/vehicles/PlayStation 3 ROTF Cleave.zip"
  },
  {
   "raw": "bot--dragonstrike.zip",
@@ -5360,17 +5360,17 @@
   "path": "./references/reference--smoother design of elegance-aka Laser Turret.zip"
  },
  {
-  "raw": "references--potential Jhiaxus reference not sure yet-aka MIND ALPHA.zip",
+  "raw": "references--potential Assay reference not sure yet-aka MIND ALPHA.zip",
   "modes": [
    "robot"
   ],
   "flags": [],
   "subtype": null,
-  "name": "potential Jhiaxus reference not sure yet",
+  "name": "potential Assay reference not sure yet",
   "note": "MIND ALPHA",
   "category": "reference",
   "dir": "references",
-  "path": "./references/references--potential Jhiaxus reference not sure yet-aka MIND ALPHA.zip"
+  "path": "./references/references--potential Assay reference not sure yet-aka MIND ALPHA.zip"
  },
  {
   "raw": "reference--good body model details-aka Bi-Pedal Heavy Weapons Platform Concept.zip",

@@ -508,10 +508,10 @@ pub const WEAPONS: [WeaponSpec; 7] = [
     // the player, same house rule as every other entry in this table.
     // Two real in-game names were tried and dropped here before landing
     // on a placeholder: "LIGHTSABER" (this entry's first name) is an
-    // outright trademark; "ENERGONEDGE" borrows Transformers' own
-    // "Energon" term, which this project already avoids putting in a
+    // outright trademark; "VALENCEEDGE" borrows Transformers' own
+    // "Valence" term, which this project already avoids putting in a
     // player-visible name for exactly this reason (see the
-    // Cybertronian/raid-boss naming elsewhere, which is inherited
+    // Machine/raid-boss naming elsewhere, which is inherited
     // scope, not a precedent to add to on purpose). Rather than pick a
     // third name and risk the same mistake, the person asked to keep
     // this generic until they've checked their own design notes —

@@ -396,7 +396,7 @@ mod tests {
         // is the general hazard with a test named "round trips": it covers
         // what it was written against and nothing added later.
         let text = "signal The Long Quiet\nresembles speakerman\n\
-                    phase unicron opening\nenc purge standard 0 0\n\
+                    phase unending opening\nenc purge standard 0 0\n\
                     cast billy_the_fire_clone\nend";
         let a = super::parse(text).expect("valid");
         let b = super::parse(&super::render(&a)).expect("re-parse");
@@ -414,7 +414,7 @@ mod tests {
         // not-yet — and the compute is banked instead of spent again later.
         use crate::campaign::CampaignLog;
         let e = super::parse(
-            "signal Held\nresembles speakerman\nphase unicron a\n\
+            "signal Held\nresembles speakerman\nphase unending a\n\
              enc purge standard 0 0\ncast billy_the_fire_clone\nend",
         )
         .expect("valid");
@@ -437,7 +437,7 @@ mod tests {
 
         // an echo with no cast at all is always ready
         let plain = super::parse(
-            "signal Plain\nresembles speakerman\nphase unicron a\nenc purge standard 0 0\nend",
+            "signal Plain\nresembles speakerman\nphase unending a\nenc purge standard 0 0\nend",
         )
         .expect("valid");
         assert_eq!(super::partition(vec![plain], &fresh).0.len(), 1, "a castless echo was held");
@@ -451,7 +451,7 @@ mod tests {
         // same forged raid is legal for one save and a spoiler for another,
         // and `parse` has no campaign log.
         let good = "signal The Long Quiet\nresembles speakerman\n\
-                    phase unicron opening\nenc purge standard 0 0\n\
+                    phase unending opening\nenc purge standard 0 0\n\
                     cast billy_the_fire_clone\nend";
         let r = super::parse(good).expect("a valid echo");
         assert_eq!(r.cast_request, vec!["billy_the_fire_clone".to_string()]);

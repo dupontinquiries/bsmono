@@ -2,18 +2,18 @@
 //!
 //! Source: `TF_DOMINION_SCENE_MINDMAP.md`'s Act 3 and
 //! `TF_DOMINION_SHIELD_HINTS.md`'s beat breakdown of the same scene:
-//! *"LA Hero is running node sabotage between pulse windows. Optimus
+//! *"LA Hero is running node sabotage between pulse windows. Keelwright
 //! is engaging Blackstar directly — timing strikes within the
 //! 12-second paralysis intervals."* Two threads, one clock
 //! (`pulse::Field`), and — confirmed across both docs — the field
-//! only catches Transformers: *"all Autobots in range freeze
+//! only catches Transformers: *"all Enduring in range freeze
 //! briefly"* is `TF_DOMINION_SCENE_MINDMAP.md`'s own wording, and LA
 //! Hero's whole tactical value in the scene is being *"human
 //! scale — too fast for Blackstar to stop."* Nothing here invents a
 //! human immunity; it is stated twice, independently, and this module
 //! just runs the two threads the doc actually describes:
 //!
-//! * **Optimus** can only land a strike during the field's safe
+//! * **Keelwright** can only land a strike during the field's safe
 //!   window — a strike attempted while paralyzed does not fail
 //!   quietly, it REFUSES, same as every mechanic in this game that
 //!   takes `clinch.rs`'s design rule seriously ("random" means "I
@@ -34,7 +34,7 @@
 use crate::pulse::Field;
 
 /// Canon note, from `TF_ADDITIONAL_SCENE_AIDS.md` section 3's own
-/// operational flowchart: Optimus' half of this scene is described as
+/// operational flowchart: Keelwright' half of this scene is described as
 /// "buys LA Hero the seconds needed," and Act 4's resolution has
 /// Blackstar's network "disrupted — not destroyed" while Blackstar
 /// himself retreats rather than falls in single combat. The scene's
@@ -42,7 +42,7 @@ use crate::pulse::Field;
 /// `boss_down` is offered as a real, independently-tested win path
 /// because this module is a general-purpose mechanic rather than a
 /// hard-coded cutscene, but a caller staging THIS specific scene
-/// should treat the sabotage finishing as the actual end, and Optimus'
+/// should treat the sabotage finishing as the actual end, and Keelwright'
 /// strikes as pressure bought for it rather than a kill attempt.
 pub struct Duel {
     pub field: Field,
@@ -68,7 +68,7 @@ impl Duel {
         self.field.tick(dt);
     }
 
-    /// Optimus's half. Only lands inside the safe window; a strike
+    /// Keelwright's half. Only lands inside the safe window; a strike
     /// attempted mid-paralysis refuses outright and says how long
     /// until the window reopens, so a caller (a controller, an AI, a
     /// test) always has something actionable rather than a dead input.
@@ -165,7 +165,7 @@ mod tests {
     #[test]
     fn the_two_threads_run_independently_and_either_can_finish_the_scene() {
         let mut d = Duel::new(5.0, 1);
-        // Optimus lands the kill without any sabotage progress at all
+        // Keelwright lands the kill without any sabotage progress at all
         let mut guard = 0;
         while !d.boss_down() {
             d.tick(0.1);

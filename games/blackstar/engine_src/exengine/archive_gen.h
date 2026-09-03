@@ -8,7 +8,7 @@
 
 static const ex_claim_t ex_gen_claims[21] = {
   { "bridge_predates_coalition", 1, 0, "space-bridge geometry is older than the Coalition that teaches it" },
-  { "unicron_in_earth", 2, 0, "the mass in Earth's mantle is a body, and it is not dead" },
+  { "unending_in_earth", 2, 0, "the mass in Earth's mantle is a body, and it is not dead" },
   { "convergence_was_not_first", 2, 0, "the Blackstar-era contact was not the first time humans handled this technology" },
   { "societies_existed", 3, 0, "human organisations held anomalous technology for decades, in secret, against each other" },
   { "facility_built_2003", 3, 1, "the Directorate's excavation record: the site was constructed in 2003" },
@@ -43,7 +43,7 @@ static const ex_link_t ex_gen_links_station_pointing_log[2] = { { "continuous_ea
 static const ex_link_t ex_gen_links_port_reel[2] = { { "watchers_observed", EX_BEARING_SUPPORTS }, { "convergence_was_not_first", EX_BEARING_SUPPORTS }, };
 static const ex_link_t ex_gen_links_interface_autopsy[3] = { { "human_interface_unstable", EX_BEARING_SUPPORTS }, { "societies_existed", EX_BEARING_SUPPORTS }, { "architecture_is_machine", EX_BEARING_MENTIONS }, };
 static const ex_link_t ex_gen_links_rotation_ledger[2] = { { "human_interface_unstable", EX_BEARING_SUPPORTS }, { "societies_existed", EX_BEARING_SUPPORTS }, };
-static const ex_link_t ex_gen_links_core_resonance[1] = { { "unicron_in_earth", EX_BEARING_SUPPORTS }, };
+static const ex_link_t ex_gen_links_core_resonance[1] = { { "unending_in_earth", EX_BEARING_SUPPORTS }, };
 static const ex_link_t ex_gen_links_buried_twin[2] = { { "two_artifacts", EX_BEARING_SUPPORTS }, { "asteri_existed", EX_BEARING_MENTIONS }, };
 static const ex_link_t ex_gen_links_cold_war_manifest[1] = { { "cold_war_debris", EX_BEARING_SUPPORTS }, };
 static const ex_link_t ex_gen_links_grail_void_seam[2] = { { "asteri_existed", EX_BEARING_SUPPORTS }, { "two_artifacts", EX_BEARING_MENTIONS }, };
@@ -55,16 +55,15 @@ static const ex_link_t ex_gen_links_forge_lattice[2] = { { "architecture_is_mach
 static const ex_link_t ex_gen_links_emptied_vault[1] = { { "archivist_collecting", EX_BEARING_SUPPORTS }, };
 static const ex_link_t ex_gen_links_vault_plate_inventory[2] = { { "vault_plate_is_complete", EX_BEARING_SUPPORTS }, { "archivist_collecting", EX_BEARING_MENTIONS }, };
 static const ex_link_t ex_gen_links_glaciem_rotation_roster[2] = { { "glaciem_was_an_outpost", EX_BEARING_SUPPORTS }, { "vault_plate_is_complete", EX_BEARING_CONTRADICTS }, };
-static const ex_link_t ex_gen_links_glaciem_rotation_plate[2] = { { "glaciem_was_an_outpost", EX_BEARING_SUPPORTS }, { "archivist_collecting", EX_BEARING_MENTIONS }, };
 static const ex_link_t ex_gen_links_glaciem_survey_plate[3] = { { "watchers_observed", EX_BEARING_SUPPORTS }, { "glaciem_was_an_outpost", EX_BEARING_SUPPORTS }, { "vault_plate_is_complete", EX_BEARING_MENTIONS }, };
 static const ex_link_t ex_gen_links_pluto_line_marker[2] = { { "asteri_were_not_first", EX_BEARING_SUPPORTS }, { "bridge_predates_coalition", EX_BEARING_MENTIONS }, };
 static const ex_link_t ex_gen_links_asteri_signal_beacon[1] = { { "later_forgery", EX_BEARING_SUPPORTS }, };
 static const ex_link_t ex_gen_links_bridge_survey[2] = { { "bridge_predates_coalition", EX_BEARING_SUPPORTS }, { "asteri_were_not_first", EX_BEARING_MENTIONS }, };
-static const ex_link_t ex_gen_links_unicron_detection_scan[1] = { { "instrument_artefact", EX_BEARING_SUPPORTS }, };
+static const ex_link_t ex_gen_links_unending_detection_scan[1] = { { "instrument_artefact", EX_BEARING_SUPPORTS }, };
 static const ex_link_t ex_gen_links_undelivered_verdict[3] = { { "asteri_were_not_first", EX_BEARING_SUPPORTS }, { "two_artifacts", EX_BEARING_MENTIONS }, { "archivist_collecting", EX_BEARING_MENTIONS }, };
 static const ex_link_t ex_gen_links_carrion_hull_scar[1] = { { "edge_lattice", EX_BEARING_SUPPORTS }, };
 static const ex_link_t ex_gen_links_array_reading_one[1] = { { "edge_lattice", EX_BEARING_SUPPORTS }, };
-static const ex_link_t ex_gen_links_array_reading_two[2] = { { "edge_lattice", EX_BEARING_SUPPORTS }, { "unicron_in_earth", EX_BEARING_MENTIONS }, };
+static const ex_link_t ex_gen_links_array_reading_two[2] = { { "edge_lattice", EX_BEARING_SUPPORTS }, { "unending_in_earth", EX_BEARING_MENTIONS }, };
 static const ex_link_t ex_gen_links_array_reading_three[2] = { { "edge_lattice", EX_BEARING_SUPPORTS }, { "asteri_were_not_first", EX_BEARING_MENTIONS }, };
 static const ex_link_t ex_gen_links_substrate_sample[2] = { { "architecture_is_machine", EX_BEARING_SUPPORTS }, { "asteri_were_not_first", EX_BEARING_SUPPORTS }, };
 static const ex_link_t ex_gen_links_star_chart_return[3] = { { "asteri_existed", EX_BEARING_SUPPORTS }, { "asteri_orbital_error", EX_BEARING_MENTIONS }, { "two_artifacts", EX_BEARING_MENTIONS }, };
@@ -79,7 +78,7 @@ static const ex_link_t ex_gen_links_undelivered_manifest[2] = { { "convergence_w
 static const ex_link_t ex_gen_links_kesswick_relay_log[2] = { { "watchers_observed", EX_BEARING_SUPPORTS }, { "convergence_was_not_first", EX_BEARING_SUPPORTS }, };
 static const ex_link_t ex_gen_links_far_manifest_wreck[2] = { { "convergence_was_not_first", EX_BEARING_SUPPORTS }, { "societies_existed", EX_BEARING_SUPPORTS }, };
 
-static const ex_finding_t ex_gen_findings[47] = {
+static const ex_finding_t ex_gen_findings[46] = {
   { "bunker_alloy", "earth", "la_bunker", EX_MEDIUM_ARTIFACT, NULL, ex_gen_links_bunker_alloy, 3 },
   { "bunker_roster", "earth", "la_bunker", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_bunker_roster, 2 },
   { "directorate_record", "earth", "the_record", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_directorate_record, 2 },
@@ -104,18 +103,17 @@ static const ex_finding_t ex_gen_findings[47] = {
   { "emptied_vault", "glaciem", "emptied_vaults", EX_MEDIUM_SITE, NULL, ex_gen_links_emptied_vault, 1 },
   { "vault_plate_inventory", "glaciem", "emptied_vaults", EX_MEDIUM_SITE, NULL, ex_gen_links_vault_plate_inventory, 2 },
   { "glaciem_rotation_roster", "glaciem", "outpost_roster", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_glaciem_rotation_roster, 2 },
-  { "glaciem_rotation_plate", "glaciem", "rotation_roster", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_glaciem_rotation_plate, 2 },
   { "glaciem_survey_plate", "glaciem", "survey_plate", EX_MEDIUM_ARTIFACT, NULL, ex_gen_links_glaciem_survey_plate, 3 },
   { "pluto_line_marker", "pluto", "pluto_marker", EX_MEDIUM_SITE, NULL, ex_gen_links_pluto_line_marker, 2 },
   { "asteri_signal_beacon", "pluto", "imitation_beacon", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_asteri_signal_beacon, 1 },
   { "bridge_survey", "outer_rim", "bridge_telemetry", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_bridge_survey, 2 },
-  { "unicron_detection_scan", "outer_rim", "geo_scan", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_unicron_detection_scan, 1 },
+  { "unending_detection_scan", "outer_rim", "geo_scan", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_unending_detection_scan, 1 },
   { "undelivered_verdict", "outer_rim", "judgement_docket", EX_MEDIUM_TERMINAL, "warden:judgementor", ex_gen_links_undelivered_verdict, 3 },
   { "carrion_hull_scar", "carrion", "carrion_wreck", EX_MEDIUM_SITE, NULL, ex_gen_links_carrion_hull_scar, 1 },
   { "array_reading_one", "shield_edge", "array_logs", EX_MEDIUM_TERMINAL, "the_ashes_court", ex_gen_links_array_reading_one, 1 },
   { "array_reading_two", "shield_edge", "array_logs", EX_MEDIUM_TERMINAL, "the_ashes_court", ex_gen_links_array_reading_two, 2 },
   { "array_reading_three", "shield_edge", "array_logs", EX_MEDIUM_TERMINAL, "the_ashes_court", ex_gen_links_array_reading_three, 2 },
-  { "substrate_sample", "cybertron", "cybertron_core", EX_MEDIUM_ARTIFACT, NULL, ex_gen_links_substrate_sample, 2 },
+  { "substrate_sample", "foundry", "foundry_core", EX_MEDIUM_ARTIFACT, NULL, ex_gen_links_substrate_sample, 2 },
   { "star_chart_return", "earth", "asteri_chart", EX_MEDIUM_ARTIFACT, NULL, ex_gen_links_star_chart_return, 3 },
   { "chart_observation_arc", "earth", "asteri_chart", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_chart_observation_arc, 2 },
   { "modern_solution", "earth", "observatory_solution", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_modern_solution, 2 },
@@ -128,10 +126,10 @@ static const ex_finding_t ex_gen_findings[47] = {
   { "kesswick_relay_log", "earth", "kesswick_incident", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_kesswick_relay_log, 2 },
   { "far_manifest_wreck", "mars", "mars_transfer_wreck", EX_MEDIUM_SITE, NULL, ex_gen_links_far_manifest_wreck, 2 },
 };
-#define EX_GEN_FINDING_COUNT 47
+#define EX_GEN_FINDING_COUNT 46
 
 static const ex_received_t ex_gen_received[8] = {
-  { "unicron_in_earth", EX_BEARING_SUPPORTS, "lived_through_it", 0.2000f, "the thing in the mantle -- you were there" },
+  { "unending_in_earth", EX_BEARING_SUPPORTS, "lived_through_it", 0.2000f, "the thing in the mantle -- you were there" },
   { "bridge_predates_coalition", EX_BEARING_SUPPORTS, "lived_through_it", 0.3500f, "bridge geometry is inherited, whatever the Coalition teaches" },
   { "convergence_was_not_first", EX_BEARING_SUPPORTS, "lived_through_it", 0.4500f, "humans had handled this before Blackstar" },
   { "facility_built_2003", EX_BEARING_SUPPORTS, "the_record", 0.5500f, "the official excavation date, on file and uncontested" },

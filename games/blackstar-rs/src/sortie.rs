@@ -61,7 +61,7 @@ use crate::survival::{Body, Bunker, Weather};
 use crate::weapons::{Element, Register};
 
 /// The squad's overland speed for the foothold clock, m/s. The same
-/// Cybertronian figure `raidsim` defaults to — if that number moves, move
+/// Machine figure `raidsim` defaults to — if that number moves, move
 /// both toward a shared home rather than letting them drift. `pub` because
 /// the raid flow paces its footholds with the same legs.
 pub const SQUAD_SPEED_MS: f32 = 14.0;
@@ -125,7 +125,7 @@ pub struct Sortie {
     pub feed: Vec<String>,
     /// lines the shell should toast, drained by `pop_toast`
     toasts: Vec<String>,
-    /// energon at accept time — resolved once, same as the resolved path
+    /// valence at accept time — resolved once, same as the resolved path
     have: u32,
     /// ground height under the drop last step, for the HUD's prediction
     last_gy: f32,
@@ -195,7 +195,7 @@ pub fn sites_for(m: &Mission) -> Vec<Site> {
 }
 
 impl Sortie {
-    /// Accept the order. Loads the save once for the energon standing —
+    /// Accept the order. Loads the save once for the valence standing —
     /// the same read `run_order` does, at the same moment (accept), so the
     /// two paths price the engagement identically — and asks the foothold
     /// question while there is still a choice to make.
@@ -215,7 +215,7 @@ impl Sortie {
         let camp = crate::campaign::CampaignLog::from_line(&sv.missions);
         let raids = crate::raidlog::RaidLog::from_line(&sv.wardens);
         let nf = crate::nightfall::NightfallLog::from_line(&sv.nightfalls);
-        let have = crate::energon::energon(&camp, &raids, nf.count());
+        let have = crate::valence::valence(&camp, &raids, nf.count());
         let g = crate::mapsim::ground_for(d).g;
 
         // THE FOOTHOLD QUESTION, at runtime at last. Assess both sites
@@ -227,9 +227,9 @@ impl Sortie {
         let sites = sites_for(m);
         let plans: Vec<Plan> = sites
             .iter()
-            .map(|s| foothold::assess(Body::Cybertronian, s, weather, window_s, SQUAD_SPEED_MS))
+            .map(|s| foothold::assess(Body::Machine, s, weather, window_s, SQUAD_SPEED_MS))
             .collect();
-        let site_sel = foothold::choose(Body::Cybertronian, &sites, weather, window_s, SQUAD_SPEED_MS)
+        let site_sel = foothold::choose(Body::Machine, &sites, weather, window_s, SQUAD_SPEED_MS)
             .and_then(|p| plans.iter().position(|q| q.site.approach == p.site.approach))
             .unwrap_or(0);
 

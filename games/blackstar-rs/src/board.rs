@@ -4,7 +4,7 @@
 //! line for the board is three words long —
 //!
 //! > AIDEN'S SKATEBOARD: human-scale "vehicle mode" — a salvaged deck with
-//! > energon trucks. Transform (while human-scale) hops on/off; near-double
+//! > valence trucks. Transform (while human-scale) hops on/off; near-double
 //! > pace, board rendered underfoot.
 //!
 //! — and the interesting part is not in that line at all. It is in two

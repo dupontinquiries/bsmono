@@ -27,7 +27,7 @@ of its health, and stall a fold in progress. Fast forms (WATER, METAL,
 WIND) suppress by volume: spread up, advance down, draining when the
 fire stops. A body hit mid-fold is caught between forms and takes
 `MIDFOLD_EXPOSURE` on everything until it is through. This is the
-Dark-of-the-Moon / War-for-Cybertron blend the brief asked for, as
+Dark-of-the-Moon / War-for-the Foundry blend the brief asked for, as
 rules rather than as a tone note.
 
 **The cable** (`cable.rs` is the tether; `field.rs` makes it moves).

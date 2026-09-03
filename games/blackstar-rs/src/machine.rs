@@ -1,21 +1,21 @@
-//! CYBERTRONIAN — a design grammar derived from a world, and frames built to it.
+//! MACHINE — a design grammar derived from a world, and frames built to it.
 //!
 //! ## Why this module exists, and a correction
 //!
-//! The census reported that Cybertron has fifty-six frames and not one of
+//! The census reported that the Foundry has fifty-six frames and not one of
 //! them is anybody, and I read that as characterisation: a place where the
 //! difference between one frame and another stopped mattering. It is not.
 //! The fifty-six are `grimorph_part4` through `grimorph_part88` — **pieces of
 //! a single exploded model**, listed in `bots.json` as if each were a bot.
 //!
-//! So Cybertron does not have fifty-six anonymous residents. It has **none**,
+//! So the Foundry does not have fifty-six anonymous residents. It has **none**,
 //! and a parts bin standing where they should be. That is a better reason to
 //! design some than the one I invented, and `the_parts_bin_is_not_a_population`
 //! keeps the finding from drifting back into lore.
 //!
 //! ## The grammar comes from the planet, not from a mood board
 //!
-//! Every other Cybertronian design starts from "angular and mean". This one
+//! Every other Machine design starts from "angular and mean". This one
 //! starts from what this codebase already knows the planet IS, and the
 //! answers fall out:
 //!
@@ -27,10 +27,10 @@
 //! | nothing erodes it | keeps sharp edges and fine articulation forever |
 //! | 8.5 m tall (`scale::LADDER`) | is measured against that, not against a car |
 //!
-//! Research agrees on the register — Cybertronian alt-modes are angular and
+//! Research agrees on the register — Machine alt-modes are angular and
 //! unconstrained by Earth physics, and at home they carry armour openly
 //! because there is nobody to hide from. It also names the failure mode
-//! plainly: a bad Cybertronian alt-mode "looks like a mishmash of robot
+//! plainly: a bad Machine alt-mode "looks like a mishmash of robot
 //! parts". `alt_mode_is_coherent` is that warning as a test.
 //!
 //! ## What these are not
@@ -44,7 +44,7 @@
 use crate::cling::{surface_grip, Frame as GripFrame, Hold};
 use crate::terrain::Material;
 
-/// Cybertron's surface, from `mapsim`'s own mapping.
+/// the Foundry's surface, from `mapsim`'s own mapping.
 pub const SURFACE: Material = Material::Metal;
 /// No weather at all, per the route table.
 pub const HAS_WEATHER: bool = false;
@@ -89,7 +89,7 @@ impl Gait {
     }
 }
 
-/// An original Cybertronian frame.
+/// An original Machine frame.
 pub struct Frame {
     pub id: &'static str,
     pub name: &'static str,
@@ -242,7 +242,7 @@ pub static FRAMES: &[Frame] = &[
         height_m: 4.6,
         bulk: 0.40,
         role: "none. it assembled itself",
-        hook: "the first thing on Cybertron that nobody built. the parts bin stood up.",
+        hook: "the first thing on the Foundry that nobody built. the parts bin stood up.",
     },
 ];
 
@@ -252,7 +252,7 @@ pub fn frame(id: &str) -> Option<&'static Frame> {
 
 /// Would this frame's alt-mode read as a shape, or as a pile?
 ///
-/// The research names the failure mode exactly — a weak Cybertronian
+/// The research names the failure mode exactly — a weak Machine
 /// alt-mode "looks like a mishmash of robot parts" — so the test for a good
 /// one is that the description names a THING, not a collection of features.
 /// Crude and it catches the actual mistake: an alt line that is a list of
@@ -285,7 +285,7 @@ pub fn suits_the_world(g: Gait) -> bool {
 
 pub fn run() {
     use crate::cling::hang_time_s;
-    println!("CYBERTRONIAN FRAMES — designed from the planet\n");
+    println!("MACHINE FRAMES — designed from the planet\n");
     println!("  the world, as this codebase already describes it:");
     println!("    surface     {:?}, grip {:.2} — handholds everywhere", SURFACE, surface_grip(SURFACE));
     println!("    weather     {}", if HAS_WEATHER { "yes" } else { "none — nothing to seal against" });
@@ -321,7 +321,7 @@ pub fn run() {
         println!("      {}\n", wrap(f.hook, 66, 6));
     }
 
-    println!("  HOW LONG EACH CAN HOLD A CYBERTRONIAN WALL (cling.rs)\n");
+    println!("  HOW LONG EACH CAN HOLD A MACHINE WALL (cling.rs)\n");
     for f in FRAMES.iter().filter(|f| f.gait.climbs()) {
         let gf = GripFrame { bulk: f.bulk, crawler: f.gait == Gait::Clinging };
         let t = hang_time_s(Hold::Underside, gf, SURFACE).unwrap_or(0.0);
@@ -368,17 +368,17 @@ mod tests {
         // THE CORRECTION. The census's "fifty-six frames and not one is
         // anybody" was meaning read into a data artifact: those ids are
         // `grimorph_part4` .. `grimorph_part88`, pieces of one exploded model
-        // listed as if each were a bot. Cybertron has no anonymous residents;
+        // listed as if each were a bot. the Foundry has no anonymous residents;
         // it has NONE, and a parts bin standing where they should be.
         let parts: Vec<&str> = crate::census::CENSUS
             .iter()
-            .filter(|b| b.home == "cybertron")
+            .filter(|b| b.home == "foundry")
             .map(|b| b.id)
             .collect();
         assert!(!parts.is_empty());
         assert!(
             parts.iter().all(|id| id.starts_with("grimorph_part")),
-            "something on cybertron is no longer a model fragment — good, revisit this"
+            "something on foundry is no longer a model fragment — good, revisit this"
         );
         // and that is why the frames below had to be designed rather than found
         assert!(FRAMES.len() >= 8);
@@ -449,7 +449,7 @@ mod tests {
             "the smallest frame is {} m against a {human} m person",
             smallest.height_m
         );
-        // and the biggest is still a Cybertronian, not a building
+        // and the biggest is still a Machine, not a building
         let biggest = FRAMES.iter().map(|f| f.height_m).fold(0.0, f32::max);
         assert!(biggest < 30.0);
     }
@@ -492,8 +492,8 @@ mod tests {
         // The test asserts only the thing that matters here — that no frame
         // borrows a name from that pile.
         let borrowed = [
-            "megatron", "soundwave", "grimlock", "ironhide", "ratchet", "jetfire", "starscream",
-            "optimus", "bumblebee", "shockwave", "warpath", "swoop", "slug", "airraid",
+            "cleave", "soundwave", "grimlock", "ironhide", "ratchet", "jetfire", "starscream",
+            "keelwright", "bumblebee", "shockwave", "warpath", "swoop", "slug", "airraid",
         ];
         for f in FRAMES {
             let low = f.id.to_lowercase();

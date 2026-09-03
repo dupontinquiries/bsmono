@@ -27,7 +27,7 @@
 //! what turns the nineteen warden signals from rumours into a roster.
 
 use crate::content::{hostiles, missions_of, Mission, Objective, Role, MISSIONS};
-use crate::energon;
+use crate::valence;
 use crate::patrol::{self, Faction};
 use crate::raidgen::{strhash, Rng};
 use crate::skirmish::{Casualty, Fight, Fighter, Squad, OPEN_AT};
@@ -43,7 +43,7 @@ use crate::weapons::Element;
 /// The destination's own faction (`patrol::Destination.hostiles`) is now
 /// load-bearing rather than flavor: a mission sited on a Corrupted world
 /// pulls from the Corrupted roster first, same as the treatment's own
-/// Film 2 logic — Jhiaxus' experiment does not politely wait for the
+/// Film 2 logic — Assay' experiment does not politely wait for the
 /// Hijack war to make room for it (see `corruption.rs`).
 pub fn waves_for(m: &Mission) -> Vec<Vec<&'static str>> {
     let mut rng = Rng::new(strhash(m.id));
@@ -147,10 +147,10 @@ pub enum CampEvent {
 }
 
 // The campaign's answering curve used to live here as RENOWN (a flat 4%
-// per mission cleared). It is now ENERGON — see `energon.rs` — because
+// per mission cleared). It is now VALENCE — see `valence.rs` — because
 // the same idea grew more sources (wardens, nightfalls) and a
 // recommendation per film to scale against; one power scalar, one
-// module that owns it, named for what actually fills a Cybertronian.
+// module that owns it, named for what actually fills a Machine.
 
 /// The five machines share one chassis: waves feed a `skirmish::Fight`,
 /// the objective decides what the fighting was FOR.
@@ -163,7 +163,7 @@ pub struct MissionRun {
     /// breather's worth of field repair between them
     squad_ids: Vec<String>,
     doctrine: &'static str,
-    /// the energon multiplier, resolved once against the mission's
+    /// the valence multiplier, resolved once against the mission's
     /// recommendation — the player side scales, the yardstick does not
     power: f32,
     /// nightfall dials: an element that runs hot, and whether the field
@@ -194,7 +194,7 @@ const HOLD_BLEED: f32 = 3.0;
 const ASSET_CHIP: f32 = 1.5;
 
 impl MissionRun {
-    pub fn new(mission: &'static Mission, squad: &[&str], doctrine: &'static str, at_energon: u32) -> MissionRun {
+    pub fn new(mission: &'static Mission, squad: &[&str], doctrine: &'static str, at_valence: u32) -> MissionRun {
         let film = mission.film as f32;
         MissionRun {
             mission,
@@ -203,7 +203,7 @@ impl MissionRun {
             fight: None,
             squad_ids: squad.iter().map(|s| s.to_string()).collect(),
             doctrine,
-            power: energon::scale(at_energon, energon::rec_energon(mission)),
+            power: valence::scale(at_valence, valence::rec_valence(mission)),
             burn: None,
             exposure: false,
             carried: None,
@@ -235,7 +235,7 @@ impl MissionRun {
     /// Arrive weakened. `loss` is 0..1 off the engagement's power.
     ///
     /// A method rather than a public field, because `power` is resolved once
-    /// against the mission's recommended energon and the invariant is that
+    /// against the mission's recommended valence and the invariant is that
     /// nothing moves it afterwards except a NAMED cost — a landing, a burn.
     /// Opening the field would make that invariant a convention.
     pub fn arrived_badly(mut self, loss: f32) -> MissionRun {
@@ -373,7 +373,7 @@ impl MissionRun {
                 self.doctrine,
                 OPEN_AT,
             );
-            // energon lands once, at first muster; the carried squad
+            // valence lands once, at first muster; the carried squad
             // keeps it wave to wave
             for f in s.fighters.iter_mut() {
                 f.hp *= self.power;
@@ -606,7 +606,7 @@ impl CampaignLog {
     }
     /// Slipstream defects at Film 2's close — `TF_DOMINION_SCENE_MINDMAP.md`'s
     /// Act 4 resolution: "Slipstream has defected — carries knowledge the
-    /// Autobots will need in Film 3." The troop entry (`content.rs`,
+    /// Enduring will need in Film 3." The troop entry (`content.rs`,
     /// `Role::Enemy`, `Faction::Hijacks`) is left exactly as it is on
     /// purpose — one named pilot defecting does not retire the airframe,
     /// and `Squad::new` already builds from any id leniently, so a squad
@@ -621,14 +621,14 @@ impl CampaignLog {
         self.is_cleared("the_drowned_approach")
     }
     /// The shield is fully mapped once Slipstream's Film 2 intel and
-    /// Film 3's own Cybertron archive reveal are both in — the exact
+    /// Film 3's own the Foundry archive reveal are both in — the exact
     /// sequence `TF_ADDITIONAL_SCENE_AIDS.md` section 10 lays out:
-    /// "Cybertron archives — first written reference" comes first,
+    /// "The Foundry archives — first written reference" comes first,
     /// then "Slipstream provides missing coordinates — shield fully
     /// mapped." Neither fact alone is the doc's ending; the archive
     /// without the coordinates is a shape with no location, and the
     /// coordinates without the archive are numbers with no context.
-    /// `beneath_the_pacific` (Film 3, sited on Cybertron) is where the
+    /// `beneath_the_pacific` (Film 3, sited on the Foundry) is where the
     /// archive half of that sequence already happens in this campaign.
     pub fn shield_mapped(&self) -> bool {
         self.slipstream_defected() && self.is_cleared("beneath_the_pacific")
@@ -679,7 +679,7 @@ mod tests {
         let note = c.apply_playtest_unlock().expect("all must report");
         assert!(note.contains("PLAYTEST"), "the unlock was quiet: {note}");
         assert!(c.is_cleared("the_beach_opens"), "the Wardeck is still shut");
-        assert!(c.is_cleared("what_jhiaxus_grew"), "the bridge is still dark");
+        assert!(c.is_cleared("what_assay_grew"), "the bridge is still dark");
         assert_eq!(
             c.cleared.len(),
             crate::content::MISSIONS.len(),
@@ -691,7 +691,7 @@ mod tests {
         let mut d = CampaignLog::default();
         assert!(d.apply_playtest_unlock().is_some());
         assert!(d.is_cleared("the_beach_opens") && d.is_cleared("the_pluto_line"));
-        assert!(!d.is_cleared("what_jhiaxus_grew"), "a subset cleared more than asked");
+        assert!(!d.is_cleared("what_assay_grew"), "a subset cleared more than asked");
 
         // a typo is reported rather than silently doing nothing — the failure
         // that costs a playtester an evening wondering why nothing opened
@@ -708,26 +708,26 @@ mod tests {
     #[test]
     fn the_campaign_is_winnable_in_sequence_by_the_default_squad() {
         // THE balance promise, stated the way a campaign is played: each
-        // mission at the energon the road provides — missions alone, no
+        // mission at the valence the road provides — missions alone, no
         // wardens, no nightfalls. Deterministic waves, deterministic
         // fights: if a content edit breaks the sequence, this names the
         // mission it breaks at.
         for (i, m) in MISSIONS.iter().enumerate() {
-            let at = i as u32 * energon::PER_MISSION;
+            let at = i as u32 * valence::PER_MISSION;
             let mut run = MissionRun::new(m, &DEFAULT_SQUAD, DEFAULT_DOCTRINE, at);
             let won = run.resolve(1200.0);
             assert!(
                 won,
-                "{} ({:?}, film {}, energon {} vs rec {}) breaks the campaign: t={:.0} squad={} struct={:.0} asset={:.0} hold={:.0}",
-                m.id, m.objective, m.film, at, energon::rec_energon(m),
+                "{} ({:?}, film {}, valence {} vs rec {}) breaks the campaign: t={:.0} squad={} struct={:.0} asset={:.0} hold={:.0}",
+                m.id, m.objective, m.film, at, valence::rec_valence(m),
                 run.t, run.squad_alive(), run.struct_hp, run.asset_hp, run.hold_pct
             );
         }
     }
 
     #[test]
-    fn low_energon_is_a_wall() {
-        // the counterpart promise: energon is LOAD-BEARING. A dry
+    fn low_valence_is_a_wall() {
+        // the counterpart promise: valence is LOAD-BEARING. A dry
         // default squad must fail somewhere in trilogy two, or the curve
         // is decoration and the campaign is flat — Destiny's recommended
         // number only teaches if being under it actually hurts.
@@ -738,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn the_shield_needs_both_slipstreams_coordinates_and_the_cybertron_archive() {
+    fn the_shield_needs_both_slipstreams_coordinates_and_the_foundry_archive() {
         // TF_ADDITIONAL_SCENE_AIDS.md's own sequence: neither fact
         // alone maps the shield, in either order
         let mut only_archive = CampaignLog::default();
@@ -746,7 +746,7 @@ mod tests {
         only_archive.record("the_scavenger_king");
         only_archive.record("the_red_extraction");
         only_archive.record("the_beach_opens");
-        only_archive.record("what_jhiaxus_grew");
+        only_archive.record("what_assay_grew");
         only_archive.record("the_mantle_dive");
         // note: the_drowned_approach (Slipstream's own mission) is
         // deliberately skipped here
@@ -758,7 +758,7 @@ mod tests {
         let mut only_slipstream = CampaignLog::default();
         only_slipstream.record("the_drowned_approach");
         assert!(only_slipstream.slipstream_defected());
-        assert!(!only_slipstream.shield_mapped(), "the shield mapped without the Cybertron archive");
+        assert!(!only_slipstream.shield_mapped(), "the shield mapped without the Foundry archive");
 
         let mut both = only_archive.clone();
         both.record("the_drowned_approach");
@@ -771,7 +771,7 @@ mod tests {
         assert!(!log.slipstream_defected());
         // clearing an earlier film-2 mission is not the same as clearing
         // the film's actual last one
-        log.record("what_jhiaxus_grew");
+        log.record("what_assay_grew");
         assert!(!log.slipstream_defected());
         log.record("the_drowned_approach");
         assert!(log.slipstream_defected());
@@ -843,7 +843,7 @@ mod tests {
     #[test]
     fn survive_is_won_on_the_clock_not_the_bodycount() {
         let (i, m) = MISSIONS.iter().enumerate().find(|(_, m)| m.objective == Objective::Survive).unwrap();
-        let mut run = MissionRun::new(m, &DEFAULT_SQUAD, DEFAULT_DOCTRINE, i as u32 * energon::PER_MISSION);
+        let mut run = MissionRun::new(m, &DEFAULT_SQUAD, DEFAULT_DOCTRINE, i as u32 * valence::PER_MISSION);
         let won = run.resolve(1200.0);
         assert!(won);
         // the clock is the win condition, so the run lasts at least the
@@ -874,7 +874,7 @@ mod tests {
     #[test]
     fn control_banks_only_uncontested_seconds() {
         let (i, m) = MISSIONS.iter().enumerate().find(|(_, m)| m.objective == Objective::Control).unwrap();
-        let mut run = MissionRun::new(m, &DEFAULT_SQUAD, DEFAULT_DOCTRINE, i as u32 * energon::PER_MISSION);
+        let mut run = MissionRun::new(m, &DEFAULT_SQUAD, DEFAULT_DOCTRINE, i as u32 * valence::PER_MISSION);
         let mut rose_contested = false;
         let mut last = 0.0f32;
         while run.outcome().is_none() && run.t < 1200.0 {

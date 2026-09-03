@@ -23,7 +23,7 @@ line of Coalition outposts hold position past the boundary. The wonder of
 Film 4 has curdled into something closer to vertigo — the crew now
 understands how little of the cosmos they'd ever seen.
 
-**Characters**: Rodimus Prime, Aiden, the Morpher, Meridian, sensor staff
+**Characters**: Halyard Prime, Aiden, the Morpher, Meridian, sensor staff
 
 ---
 
@@ -31,7 +31,7 @@ understands how little of the cosmos they'd ever seen.
 Sensor ghosts on three headings. Nothing that holds a shape long enough to
 call a contact.
 
-**RODIMUS PRIME**
+**HALYARD**
 Hijacks.
 
 **THE MORPHER**
@@ -55,7 +55,7 @@ was hoping I was wrong about needing to.
 **Setting**: A drifting outpost at the sector's edge — scorched, alone,
 clearly the site of an ongoing fight nobody back home knew was happening.
 
-**Characters**: Rodimus Prime, Aiden, Billy
+**Characters**: Halyard Prime, Aiden, Billy
 
 ---
 
@@ -67,15 +67,15 @@ resting, like standing is the only mode he has.*
 *(quiet)*
 Did he do all of this alone?
 
-**RODIMUS PRIME**
+**HALYARD**
 *(over comms, to Billy)*
-This is Rodimus Prime, Coalition fleet. We're inbound to your position.
+This is Halyard Prime, Coalition fleet. We're inbound to your position.
 
 **BILLY**
 *(doesn't turn around)*
 You're thirty-one days late. Not that I asked.
 
-**RODIMUS PRIME**
+**HALYARD**
 We didn't know this position existed until eleven days ago.
 
 **BILLY**
@@ -134,14 +134,14 @@ Ask me after the next one.
 
 ### SCENE 2.1 — THE MORPHER'S PRIVATE ADMISSION
 
-**Setting**: The *Ark's Wake*, a private channel. Rodimus and the Morpher,
+**Setting**: The *Ark's Wake*, a private channel. Halyard and the Morpher,
 alone.
 
-**Characters**: Rodimus Prime, the Morpher
+**Characters**: Halyard Prime, the Morpher
 
 ---
 
-**RODIMUS PRIME**
+**HALYARD**
 Tell me the part you didn't say in front of Aiden.
 
 **THE MORPHER**
@@ -150,14 +150,14 @@ is a thirteenth the Watch has only shown me once — by accident, in a battle
 I do not remember clearly, for perhaps forty seconds. I woke three days
 later with the Watch cold in my hand.
 
-**RODIMUS PRIME**
+**HALYARD**
 And you think we're heading toward needing it deliberately.
 
 **THE MORPHER**
 I think Billy is buying us time to decide whether we're willing to ask him
 to hold the line long enough for me to try.
 
-**RODIMUS PRIME**
+**HALYARD**
 That's not a fair thing to ask of him.
 
 **THE MORPHER**
@@ -171,7 +171,7 @@ because I don't believe Billy would forgive me for *not* asking.
 **Setting**: Sensor bay. The scale of what's actually converging becomes
 visible for the first time.
 
-**Characters**: Rodimus Prime, Meridian, Aiden, tactical staff
+**Characters**: Halyard Prime, Meridian, Aiden, tactical staff
 
 ---
 
@@ -189,7 +189,7 @@ No. That's every ship they have in range, and they are not spreading out.
 They are converging on Billy's position, specifically, like they've decided
 whatever's there is worth the entire investment.
 
-**RODIMUS PRIME**
+**HALYARD**
 *(to himself)*
 They do not conquer. They gather data. Something out here is a big enough
 question that they're willing to lose a fleet to answer it.
@@ -201,7 +201,7 @@ question that they're willing to lose a fleet to answer it.
 **Setting**: Billy's position, under real siege now — the Coalition fleet
 has arrived to reinforce, and it still isn't enough.
 
-**Characters**: Billy, Rodimus Prime, Aiden, Meridian, Coalition fleet
+**Characters**: Billy, Halyard Prime, Aiden, Meridian, Coalition fleet
 
 ---
 
@@ -210,19 +210,19 @@ rate the Coalition cannot sustain indefinitely.*
 
 **BILLY**
 *(over comms, steady even now)*
-Rodimus. However good your math is, it isn't good enough today.
+Halyard. However good your math is, it isn't good enough today.
 
-**RODIMUS PRIME**
+**HALYARD**
 How long can you hold?
 
 **BILLY**
 Long enough to matter. Not long enough to win.
 
 **AIDEN**
-*(to Rodimus, urgent)*
+*(to Halyard, urgent)*
 Tell him. Tell the Morpher.
 
-**RODIMUS PRIME**
+**HALYARD**
 *(a long, heavy beat — this is the decision the whole film has been
 building toward)*
 *(into comms)*
@@ -235,7 +235,7 @@ Morpher. Do it.
 **Setting**: The *Ark's Wake*'s bridge. The Morpher, alone in a sealed
 chamber, prepares. Outside, the siege continues.
 
-**Characters**: The Morpher, Rodimus Prime (observing)
+**Characters**: The Morpher, Halyard Prime (observing)
 
 ---
 

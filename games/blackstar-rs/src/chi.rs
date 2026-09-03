@@ -1,6 +1,6 @@
 //! CHI — what a human body can hold of the seven elements.
 //!
-//! The bots run on energon (`energon.rs`); the WATCH-BEARER does not.
+//! The bots run on valence (`valence.rs`); the WATCH-BEARER does not.
 //! A human ice-clone shapeshifter carrying the Watch levels the way a
 //! monk does, not the way a machine does: attunement is EARNED per
 //! element, in the element, and the body's worthiness to wear serious
@@ -16,7 +16,7 @@
 //! stood watch for a thousand years is not old by their own reckoning.
 //! Each people mostly keeps to its own world or outpost; contact
 //! between them is occasional, not constant. `arena_element` below —
-//! frostline/kuiper/pluto to Ice, emberpit/unicron to Fire, trench to
+//! frostline/kuiper/pluto to Ice, emberpit/unending to Fire, trench to
 //! Water, and so on — is that geography: every arena a suited raid
 //! visits is somebody's home, not a neutral battlefield, and the chi
 //! banked there is the body being taught by the world itself rather
@@ -27,7 +27,7 @@
 //!   attunes to whatever ran hot that week;
 //! * a raid cleared IN A SUIT banks chi in the arena's element — the
 //!   deep sites each have a nature, and standing in it as a human is
-//!   the training. Machines earn energon there instead; a body that
+//!   the training. Machines earn valence there instead; a body that
 //!   walked frostline in a suit earned something else.
 //!
 //! What chi is FOR:
@@ -174,11 +174,11 @@ pub fn worthy(chi: &Chi, m: &Mod) -> Result<(), String> {
 pub fn arena_element(arena: &str) -> Element {
     match arena {
         "frostline" | "kuiper" | "pluto" => Element::Ice,
-        "emberpit" | "unicron" => Element::Fire,
+        "emberpit" | "unending" => Element::Fire,
         "trench" => Element::Water,
         "shield_edge" => Element::Electric,
         "outer_rim" => Element::Air,
-        "cybertron" => Element::Rock,
+        "foundry" => Element::Rock,
         _ => Element::Water,
     }
 }
@@ -334,7 +334,7 @@ mod tests {
             let _ = arena_element(a.id); // total over the roster's arenas
         }
         assert_eq!(arena_element("frostline"), Element::Ice);
-        assert_eq!(arena_element("unicron"), Element::Fire);
+        assert_eq!(arena_element("unending"), Element::Fire);
     }
 }
 

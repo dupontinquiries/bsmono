@@ -198,7 +198,7 @@ impl RaidFlow {
             .iter()
             .map(|s| {
                 foothold::assess(
-                    Body::Cybertronian,
+                    Body::Machine,
                     s,
                     pr.weather,
                     self.window_s,
@@ -207,7 +207,7 @@ impl RaidFlow {
             })
             .collect();
         self.site_sel = foothold::choose(
-            Body::Cybertronian,
+            Body::Machine,
             &pr.sites,
             pr.weather,
             self.window_s,

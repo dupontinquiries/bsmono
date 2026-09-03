@@ -1,0 +1,12 @@
+[package]
+name = "isosurface"
+version = "0.1.0"
+edition = "2021"
+description = """
+Surface nets over a scalar field. Pure geometry, no engine: the smooth-terrain
+extractor from games/unendlich/docs/TERRAIN_RESOLUTION.md, written where it can
+be tested in milliseconds instead of behind a Vulkan build.
+"""
+
+[dependencies]
+glam = "0.28"
