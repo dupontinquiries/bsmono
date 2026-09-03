@@ -111,8 +111,76 @@ impl<T: Send + Sync + Clone + 'static> RegionGrid<T> {
 }
 
 /// Trilinear-blend specialization for fields whose value is `f64`.
+/// A per-thread direct-mapped memo in front of `RegionGrid<f64>::at`.
+///
+/// 2026-09-02: `at_block_blended` fetches 8 region corners per call, and
+/// the generator calls it for temperature, humidity, sea level,
+/// continental and hills — several times per column, tens of thousands
+/// of times per chunk. Each fetch is a `DashMap` get: hash the coord,
+/// lock a shard, clone. Measured, that is 4.48 ms of the 4.54 ms
+/// `biome_def_at` costs per chunk (`biome_pass_breakdown`), i.e. nearly
+/// all of it — the biome search itself is 0.27 ms.
+///
+/// The values are a pure function of (grid seed, coord), so caching them
+/// anywhere is exact: same numbers out, no equality sweep needed (unlike
+/// the per-column biome_def hoist, which the disagreement sweep
+/// rejected). Region sizes are 8-14 chunks, so all 1 024 columns of a
+/// chunk — and all 32 of its layers — fall in ONE region cell: the same
+/// 8 corners answer the whole chunk.
+///
+/// Direct-mapped and per-thread rather than shared, because the rayon
+/// column pass has workers on different chunks at once; a shared 1-entry
+/// memo would thrash and a `Mutex` would contend. `seed_offset`
+/// identifies the grid (each field has a distinct seed), so one table
+/// serves all of them.
+const CORNER_MEMO_SLOTS: usize = 512;
+
+#[derive(Clone, Copy)]
+struct CornerMemoEntry {
+    key: (u32, i32, i32, i32),
+    value: f64,
+    filled: bool,
+}
+
+thread_local! {
+    static CORNER_MEMO: std::cell::RefCell<Vec<CornerMemoEntry>> = std::cell::RefCell::new(
+        vec![CornerMemoEntry { key: (0, 0, 0, 0), value: 0.0, filled: false }; CORNER_MEMO_SLOTS]
+    );
+}
+
+#[inline]
+fn corner_slot(key: (u32, i32, i32, i32)) -> usize {
+    // Cheap mix; the coords of one chunk's 8 corners differ only in the
+    // low bits, so fold all four components.
+    let h = (key.0 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (key.1 as i64 as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+        ^ (key.2 as i64 as u64).wrapping_mul(0x94D0_49BB_1331_11EB)
+        ^ (key.3 as i64 as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    ((h >> 32) as usize) % CORNER_MEMO_SLOTS
+}
+
 /// Numeric fields use this for smooth boundaries between regions.
 impl RegionGrid<f64> {
+    /// `at`, through the per-thread corner memo. Exactly the same value
+    /// the `DashMap` path returns — this only avoids re-fetching it.
+    #[inline]
+    fn at_memo(&self, coord: RegionCoord) -> f64 {
+        let key = (self.seed_offset, coord.x, coord.y, coord.z);
+        let slot = corner_slot(key);
+        if let Some(v) = CORNER_MEMO.with(|m| {
+            let t = m.borrow();
+            let e = t[slot];
+            if e.filled && e.key == key { Some(e.value) } else { None }
+        }) {
+            return v;
+        }
+        let v = self.at(coord);
+        CORNER_MEMO.with(|m| {
+            m.borrow_mut()[slot] = CornerMemoEntry { key, value: v, filled: true };
+        });
+        v
+    }
+
     /// Trilinearly blend the 8 surrounding region centers.
     /// Region centers sit at integer multiples of region_size in world space —
     /// not at the region's geometric center. This is the standard convention
@@ -129,14 +197,14 @@ impl RegionGrid<f64> {
         let ty = fy - fy.floor();
         let tz = fz - fz.floor();
 
-        let v000 = self.at(RegionCoord::new(xi,     yi,     zi));
-        let v100 = self.at(RegionCoord::new(xi + 1, yi,     zi));
-        let v010 = self.at(RegionCoord::new(xi,     yi + 1, zi));
-        let v110 = self.at(RegionCoord::new(xi + 1, yi + 1, zi));
-        let v001 = self.at(RegionCoord::new(xi,     yi,     zi + 1));
-        let v101 = self.at(RegionCoord::new(xi + 1, yi,     zi + 1));
-        let v011 = self.at(RegionCoord::new(xi,     yi + 1, zi + 1));
-        let v111 = self.at(RegionCoord::new(xi + 1, yi + 1, zi + 1));
+        let v000 = self.at_memo(RegionCoord::new(xi,     yi,     zi));
+        let v100 = self.at_memo(RegionCoord::new(xi + 1, yi,     zi));
+        let v010 = self.at_memo(RegionCoord::new(xi,     yi + 1, zi));
+        let v110 = self.at_memo(RegionCoord::new(xi + 1, yi + 1, zi));
+        let v001 = self.at_memo(RegionCoord::new(xi,     yi,     zi + 1));
+        let v101 = self.at_memo(RegionCoord::new(xi + 1, yi,     zi + 1));
+        let v011 = self.at_memo(RegionCoord::new(xi,     yi + 1, zi + 1));
+        let v111 = self.at_memo(RegionCoord::new(xi + 1, yi + 1, zi + 1));
 
         let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
         lerp(
@@ -896,6 +964,63 @@ mod tests {
                         "bedrock y={} at ({}, {}) must be solid", y, x, z);
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod corner_memo_tests {
+    use super::*;
+
+    #[test]
+    fn memo_returns_exactly_what_the_map_returns() {
+        let m = WorldModel::new(20260902);
+        // Blended values must be bit-identical with a cold and a warm
+        // memo, and stable across repeats.
+        let mut first = Vec::new();
+        for i in 0..2000 {
+            let x = (i * 37 % 5000) as f64 - 2500.0;
+            let z = (i * 91 % 5000) as f64 - 2500.0;
+            let y = (i % 200) as f64;
+            first.push((
+                m.temperature(x, y, z, 0.0),
+                m.humidity(x, y, z, 0.0),
+                m.sea_level(x, z, 0.0),
+                m.continental(x, z),
+                m.surface_target(x, z, 0.0),
+            ));
+        }
+        for (i, want) in first.iter().enumerate() {
+            let x = (i * 37 % 5000) as f64 - 2500.0;
+            let z = (i * 91 % 5000) as f64 - 2500.0;
+            let y = (i % 200) as f64;
+            let got = (
+                m.temperature(x, y, z, 0.0),
+                m.humidity(x, y, z, 0.0),
+                m.sea_level(x, z, 0.0),
+                m.continental(x, z),
+                m.surface_target(x, z, 0.0),
+            );
+            assert_eq!(got.0.to_bits(), want.0.to_bits(), "temperature at {} {} {}", x, y, z);
+            assert_eq!(got.1.to_bits(), want.1.to_bits(), "humidity at {} {} {}", x, y, z);
+            assert_eq!(got.2.to_bits(), want.2.to_bits(), "sea_level");
+            assert_eq!(got.3.to_bits(), want.3.to_bits(), "continental");
+            assert_eq!(got.4.to_bits(), want.4.to_bits(), "surface_target");
+        }
+    }
+
+    #[test]
+    fn memo_agrees_with_the_uncached_grid_path() {
+        // Compare at_memo against at() directly, including slot
+        // collisions (the table is direct-mapped, so a collision must
+        // evict, never return a wrong value).
+        let m = WorldModel::new(4242);
+        let grid = &m.temperature_base;
+        for i in -600..600 {
+            let c = RegionCoord::new(i, i % 7, -i);
+            assert_eq!(grid.at_memo(c).to_bits(), grid.at(c).to_bits(), "coord {:?}", c);
+            // Second pass: now warm, still equal.
+            assert_eq!(grid.at_memo(c).to_bits(), grid.at(c).to_bits(), "coord {:?} warm", c);
         }
     }
 }

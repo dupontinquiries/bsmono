@@ -123,6 +123,13 @@ pub fn topmost_standable(solid_at: impl Fn(i32) -> bool, y_min: i32, y_max: i32)
 /// `0.075 * VERTICAL_BIAS_SCALE` = 3 blocks; 6 is twice that.
 const DENSITY_SKIP_MARGIN: f64 = 6.0;
 
+/// `UNENDLICH_SURFACE_SCAN_SEED` (default on). Read once: it used to be
+/// an `std::env::var` on every `surface_y_at` call, i.e. per column.
+fn surface_scan_seed_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("UNENDLICH_SURFACE_SCAN_SEED").map(|v| v != "0").unwrap_or(true))
+}
+
 impl WorldGenerator {
     pub fn new(seed: u32) -> Self {
         Self {
@@ -180,6 +187,34 @@ impl WorldGenerator {
         }
         if multi_scale_caves_enabled() {
             let surface_y = self.model.surface_target(x as f64, z as f64, 0.0);
+            if crate::world::cave_field::cave_at(self.seed(), x as f64, y as f64, z as f64, surface_y) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// [`is_cave`] for a caller that already knows the column's surface
+    /// target — which every per-column loop does, having just computed it.
+    ///
+    /// 2026-09-02: this is THE hot spot of CPU worldgen. `is_cave`
+    /// recomputes `surface_target(x, z)` for every cell, and
+    /// `surface_target` costs ~4.1 us; at 32 768 cells that is ~134 ms of
+    /// the ~225 ms a chunk takes, all of it recomputing 1 024 distinct
+    /// values 32 times each. `surface_target` is a pure function of
+    /// (x, z), so passing the column's value in is exact, not an
+    /// approximation — `is_cave_with_surface_matches_is_cave` checks it
+    /// cell for cell.
+    ///
+    /// (Two earlier guesses at this hot spot were wrong: the density
+    /// noise is 2.2 ms per chunk and the `WorldModel::is_cave` noises
+    /// are 1.9 ms. `hotspot_tests::column_pass_breakdown` is what
+    /// settled it.)
+    pub fn is_cave_with_surface(&self, x: i32, y: i32, z: i32, surface_y: f64) -> bool {
+        if self.model.is_cave(x as f64, y as f64, z as f64) {
+            return true;
+        }
+        if multi_scale_caves_enabled() {
             if crate::world::cave_field::cave_at(self.seed(), x as f64, y as f64, z as f64, surface_y) {
                 return true;
             }
@@ -356,18 +391,30 @@ impl WorldGenerator {
     /// guaranteed-air region above. (Set UNENDLICH_SURFACE_SCAN_SEED=0 to scan
     /// from the raw `y_max`, the pre-r299 behaviour.)
     pub fn surface_y_at(&self, world_x: i32, world_z: i32, y_min: i32, y_max: i32) -> Option<i32> {
+        // 2026-09-02: this scans up to ~130 y values for ONE column, and
+        // every probe recomputed `surface_target(world_x, world_z)` TWICE
+        // — once inside `density`, once inside `is_cave` — while the
+        // function already computes it for the scan seed. That is one
+        // pure function of (x, z) evaluated a few hundred times per
+        // column at ~3.6 us each. Computed once here and threaded into
+        // both. Exact, not an approximation.
+        //
+        // The env read was per call too (a getenv and a String for every
+        // column reaching the shelf branch of `biome_at_3d`); it is a
+        // OnceLock now. UNENDLICH_SURFACE_SCAN_SEED still works, read
+        // once per process.
+        let st = self.model.surface_target(world_x as f64, world_z as f64, 0.0);
         let solid_at = |y: i32| {
-            self.density(world_x, y, world_z) > anchors::DENSITY_THRESHOLD
-                && !self.is_cave(world_x, y, world_z)
+            self.model.density_from_surface(st, world_x as f64, y as f64, world_z as f64)
+                > anchors::DENSITY_THRESHOLD
+                && !self.is_cave_with_surface(world_x, y, world_z, st)
         };
         // Generous margin above the proven +3 boundary, so future tweaks to the
         // detail amplitude can't silently clip a surface. Still typically saves
         // hundreds of blocks vs y_max=512.
         const SURFACE_SCAN_MARGIN: i32 = 16;
-        let seed_enabled = std::env::var("UNENDLICH_SURFACE_SCAN_SEED")
-            .map(|v| v != "0").unwrap_or(true);
+        let seed_enabled = surface_scan_seed_enabled();
         let scan_top = if seed_enabled {
-            let st = self.model.surface_target(world_x as f64, world_z as f64, 0.0);
             // Tighter upper bound, but never above the caller's y_max and never
             // below y_min (a degenerate window still scans correctly → None).
             (st.floor() as i32 + SURFACE_SCAN_MARGIN).min(y_max).max(y_min)
@@ -506,7 +553,7 @@ impl WorldGenerator {
                                 surface_target, wx as f64, wyf, wz as f64,
                             ) > anchors::DENSITY_THRESHOLD
                         };
-                        if dense && !self.is_cave(wx, wy, wz) {
+                        if dense && !self.is_cave_with_surface(wx, wy, wz, surface_target) {
                             mask |= 1u32 << ly;
                         }
                     }
@@ -1533,7 +1580,8 @@ mod tests {
         // be a genuine standable block (solid, with non-solid directly above) —
         // never a cave floor with rock over it. Guards the surface-glitch fix on
         // actual terrain, where caves make columns non-monotonic.
-        let g = WorldGenerator::new(1337);
+        let (g, loaded) = production_like_generator(1337);
+        println!("(standard registry loaded: {} — TerrainGenerator::new loads it in production)", loaded);
         let mut checked = 0;
         for x in -30..30 {
             for z in -30..30 {
@@ -2336,6 +2384,97 @@ mod density_skip_tests {
     }
 }
 
+
+/// A generator configured the way `TerrainGenerator::new` configures the
+/// real one: with the standard biome registry when it loads. Timings
+/// taken WITHOUT it understate production, because `biome_def_at`
+/// short-circuits to `None` and never computes temperature/humidity.
+#[cfg(test)]
+fn production_like_generator(seed: u32) -> (WorldGenerator, bool) {
+    match crate::world::biome_loader::BiomeRegistry::load_standard() {
+        Ok(r) => (WorldGenerator::with_biome_registry(seed, std::sync::Arc::new(r)), true),
+        Err(_) => (WorldGenerator::new(seed), false),
+    }
+}
+
+#[cfg(test)]
+mod cave_surface_tests {
+    use super::*;
+
+    #[test]
+    fn is_cave_with_surface_matches_is_cave() {
+        let g = WorldGenerator::new(20260902);
+        let mut checked = 0u32;
+        for (cx, cy, cz) in [(0i32, 0i32, 0i32), (4, -3, 4), (-31, 1, 62), (400, 0, -250)] {
+            let (ox, oy, oz) = ChunkCoord::new(cx, cy, cz).block_origin();
+            // Every 4th column, every 2nd layer: 8 x 8 x 16 per chunk.
+            for lz in (0..CHUNK_SIZE).step_by(4) {
+                for lx in (0..CHUNK_SIZE).step_by(4) {
+                    let (wx, wz) = (ox + lx, oz + lz);
+                    let st = g.model.surface_target(wx as f64, wz as f64, 0.0);
+                    for ly in (0..CHUNK_SIZE).step_by(2) {
+                        let wy = oy + ly;
+                        assert_eq!(g.is_cave_with_surface(wx, wy, wz, st), g.is_cave(wx, wy, wz),
+                            "cave mismatch at ({}, {}, {})", wx, wy, wz);
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 4 * 8 * 8 * 16);
+    }
+
+    #[test]
+    fn surface_y_at_is_unchanged_by_the_hoist() {
+        // The scan's own result, against a reference that recomputes
+        // surface_target on every probe exactly as the old body did.
+        let g = WorldGenerator::new(20260902);
+        let reference = |wx: i32, wz: i32, y_min: i32, y_max: i32| -> Option<i32> {
+            let solid_at = |y: i32| {
+                g.density(wx, y, wz) > anchors::DENSITY_THRESHOLD && !g.is_cave(wx, y, wz)
+            };
+            let st = g.model.surface_target(wx as f64, wz as f64, 0.0);
+            let scan_top = (st.floor() as i32 + 16).min(y_max).max(y_min);
+            topmost_standable(solid_at, y_min, scan_top)
+        };
+        let mut checked = 0u32;
+        for (x0, z0) in [(0i32, 0i32), (128, 128), (-400, 250), (4096, -4096)] {
+            for dx in (0..32).step_by(2) {
+                for dz in (0..32).step_by(2) {
+                    let (wx, wz) = (x0 + dx, z0 + dz);
+                    assert_eq!(g.surface_y_at(wx, wz, -64, 200), reference(wx, wz, -64, 200),
+                        "surface_y_at differs at ({}, {})", wx, wz);
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 4 * 16 * 16);
+    }
+
+    #[test]
+    #[ignore]
+    fn generate_chunk_after_ab() {
+        use std::time::Instant;
+        let g = WorldGenerator::new(20260902);
+        let rounds = 6;
+        println!("generate_chunk with the column surface_target reused ({} rounds):", rounds);
+        for (name, c) in [
+            ("surface", ChunkCoord::new(4, 0, 4)),
+            ("underground", ChunkCoord::new(4, -3, 4)),
+            ("far surface", ChunkCoord::new(400, 0, -250)),
+        ] {
+            let t = Instant::now();
+            let mut solid = 0usize;
+            for _ in 0..rounds {
+                let ch = g.generate_chunk(c);
+                solid += ch.blocks.iter().filter(|b| !b.is_air()).count();
+            }
+            println!("  {:14} {:8.1} ms   ({} solid cells)",
+                name, t.elapsed().as_secs_f64() * 1e3 / rounds as f64, solid / rounds);
+        }
+    }
+}
+
 #[cfg(test)]
 mod hotspot_tests {
     use super::*;
@@ -2345,6 +2484,167 @@ mod hotspot_tests {
     /// density noise is ~4 % of the column pass and all 32 768 `is_cave`
     /// calls together are under 2 ms — so this splits the column pass
     /// into its two parts and times them separately.
+    /// Split the surface/biome pass. `biome_at_3d` runs once per column
+    /// and is now the biggest remaining piece of a chunk; this times its
+    /// parts so the next change is aimed rather than guessed.
+    #[test]
+    #[ignore]
+    fn biome_pass_breakdown() {
+        use std::time::Instant;
+        let g = WorldGenerator::new(20260902);
+        let (ox, _oy, oz) = ChunkCoord::new(4, 0, 4).block_origin();
+        let cols: Vec<(i32, i32)> = (0..CHUNK_SIZE).flat_map(|lz| (0..CHUNK_SIZE).map(move |lx| (lx, lz)))
+            .map(|(lx, lz)| (ox + lx, oz + lz)).collect();
+        let rounds = 4;
+        let time = |label: &str, f: &dyn Fn() -> f64| {
+            let t = Instant::now();
+            let mut sink = 0.0f64;
+            for _ in 0..rounds { sink += f(); }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / rounds as f64;
+            println!("  {:34} {:8.2} ms   ({:7.2} us/column)  [{}]", label, ms, ms * 1000.0 / 1024.0, sink as i64);
+        };
+        println!("biome pass breakdown, one surface chunk (1024 columns):");
+        time("biome_at_3d (whole)", &|| {
+            cols.iter().map(|&(x, z)| g.biome_at_3d(x, 0, z).temperature).sum()
+        });
+        time("  model.temperature", &|| {
+            cols.iter().map(|&(x, z)| g.model.temperature(x as f64, 0.0, z as f64, 0.0)).sum()
+        });
+        time("  model.humidity", &|| {
+            cols.iter().map(|&(x, z)| g.model.humidity(x as f64, 0.0, z as f64, 0.0)).sum()
+        });
+        time("  fbm_2d erosion", &|| {
+            cols.iter().map(|&(x, z)| super::super::noise::fbm_2d(
+                x as f64 * 0.0008, z as f64 * 0.0008, g.params.seed.wrapping_add(0xE105), 2, 1.0, 1.0)).sum()
+        });
+        time("  sea_level", &|| {
+            cols.iter().map(|&(x, z)| g.model.sea_level(x as f64, z as f64, 0.0)).sum()
+        });
+        time("  continental + hills", &|| {
+            cols.iter().map(|&(x, z)| g.model.continental(x as f64, z as f64)
+                + g.model.hills(x as f64, z as f64)).sum()
+        });
+        time("  surface_y_at (shelf branch)", &|| {
+            cols.iter().map(|&(x, z)| g.surface_y_at(x, z, -60, 140).unwrap_or(0) as f64).sum()
+        });
+        time("  surface_target", &|| {
+            cols.iter().map(|&(x, z)| g.model.surface_target(x as f64, z as f64, 0.0)).sum()
+        });
+    }
+
+    /// Does one `biome_def_at` per column give the same answer as the
+    /// four the surface pass actually makes? The doc
+    /// (`worldgen-hotspots-2026-09-02.md`) asks for a disagreement RATE
+    /// over a wide sweep before anyone collapses those four calls into
+    /// one, because `temperature` moves with `y` and a column on a
+    /// climate boundary could legitimately differ. This is that sweep:
+    /// many columns, several regions, several altitudes, counting
+    /// mismatches rather than asserting none.
+    #[test]
+    #[ignore]
+    fn biome_def_y_disagreement_sweep() {
+        let (g, loaded) = production_like_generator(20260902);
+        if !loaded {
+            println!("standard biome registry did not load — sweep is meaningless, skipping");
+            return;
+        }
+        let mut checked = 0u64;
+        let mut differ = 0u64;
+        let mut examples: Vec<String> = Vec::new();
+        // Regions far apart so different climates are covered, and a
+        // range of surface altitudes.
+        for (x0, z0) in [(0i32, 0i32), (5000, 5000), (-8000, 3000), (120000, -70000),
+                         (-333, 999), (64, -64), (2048, 2048), (-15000, -15000)] {
+            for dx in 0..40 {
+                for dz in 0..40 {
+                    let (x, z) = (x0 + dx * 7, z0 + dz * 11);
+                    // Where the surface actually is for this column, so
+                    // the 4 y values are the ones the pass really uses.
+                    let st = g.model.surface_target(x as f64, z as f64, 0.0);
+                    let sy = st.floor() as i32;
+                    let at = |y: i32| g.biome_def_at(x, y, z).map(|d| d.id.clone());
+                    let top = at(sy);
+                    for d in 1..=3 {
+                        let sub = at(sy - d);
+                        if sub != top {
+                            differ += 1;
+                            if examples.len() < 5 {
+                                examples.push(format!("({}, {}, {}) surface {:?} vs sub-{} {:?}", x, sy, z, top, d, sub));
+                            }
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        println!("biome_def y-disagreement sweep: {} subsurface cells checked, {} differ from their column's surface def ({:.4}%)",
+            checked, differ, differ as f64 * 100.0 / checked as f64);
+        for e in &examples { println!("  e.g. {}", e); }
+    }
+
+    /// The per-cell part of the surface pass: `biome_def_at` and its
+    /// two components. Called 4x per column (pick_surface_block once,
+    /// pick_subsurface_block three times).
+    #[test]
+    #[ignore]
+    fn biome_def_breakdown() {
+        use std::time::Instant;
+        let (g, loaded) = production_like_generator(20260902);
+        let (ox, _oy, oz) = ChunkCoord::new(4, 0, 4).block_origin();
+        let cols: Vec<(i32, i32)> = (0..CHUNK_SIZE).flat_map(|lz| (0..CHUNK_SIZE).map(move |lx| (lx, lz)))
+            .map(|(lx, lz)| (ox + lx, oz + lz)).collect();
+        let rounds = 4;
+        let has_reg = g.biome_registry.is_some();
+        println!("(standard registry loaded: {})", loaded);
+        let n_biomes = g.biome_registry.as_ref().map(|r| r.len()).unwrap_or(0);
+        println!("biome_def breakdown (registry: {}, {} biomes), 1024 columns x 4 calls:", has_reg, n_biomes);
+        let time = |label: &str, f: &dyn Fn() -> f64| {
+            let t = Instant::now();
+            let mut sink = 0.0f64;
+            for _ in 0..rounds { sink += f(); }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / rounds as f64;
+            println!("  {:36} {:8.2} ms   ({:7.3} us/call)  [{}]", label, ms, ms * 1000.0 / (1024.0 * 4.0), sink as i64);
+        };
+        time("biome_def_at x4 (as the loop calls it)", &|| {
+            let mut n = 0.0;
+            for &(x, z) in &cols {
+                for dy in 0..4 {
+                    if g.biome_def_at(x, 40 - dy, z).is_some() { n += 1.0; }
+                }
+            }
+            n
+        });
+        time("  temperature + humidity x4", &|| {
+            let mut a = 0.0;
+            for &(x, z) in &cols {
+                for dy in 0..4 {
+                    let y = (40 - dy) as f64;
+                    a += g.model.temperature(x as f64, y, z as f64, 0.0)
+                       + g.model.humidity(x as f64, y, z as f64, 0.0);
+                }
+            }
+            a
+        });
+        time("  best_fit x4 (fixed climate)", &|| {
+            let mut n = 0.0;
+            if let Some(reg) = &g.biome_registry {
+                for (i, _) in cols.iter().enumerate() {
+                    let t = (i % 100) as f64 / 100.0;
+                    for _ in 0..4 { if reg.best_fit(t * 2.0, 0.5).is_some() { n += 1.0; } }
+                }
+            }
+            n
+        });
+        // Do the 4 y values actually resolve to different defs? If not,
+        // one call per column would do — see the doc note.
+        let mut distinct_per_col = 0u32;
+        for &(x, z) in cols.iter().take(256) {
+            let defs: Vec<Option<&str>> = (0..4).map(|dy| g.biome_def_at(x, 40 - dy, z).map(|d| d.id.as_str())).collect();
+            if defs.iter().any(|d| *d != defs[0]) { distinct_per_col += 1; }
+        }
+        println!("  columns (of 256) where the 4 y values give different defs: {}", distinct_per_col);
+    }
+
     #[test]
     #[ignore]
     fn column_pass_breakdown() {
@@ -2374,18 +2674,34 @@ mod hotspot_tests {
         }
         let t_density = t.elapsed().as_secs_f64();
 
-        // 3. is_cave, 32 cells per column.
+        // 3. is_cave, 32 cells per column — with the column's surface
+        //    target reused, as the generator now does.
         let t = Instant::now();
         let mut caves = 0u32;
-        for lz in 0..CHUNK_SIZE { for lx in 0..CHUNK_SIZE { for ly in 0..CHUNK_SIZE {
-            if g.is_cave(ox + lx, oy + ly, oz + lz) { caves += 1; }
-        }}}
+        for (ci, &st) in targets.iter().enumerate() {
+            let lz = ci as i32 / CHUNK_SIZE;
+            let lx = ci as i32 % CHUNK_SIZE;
+            for ly in 0..CHUNK_SIZE {
+                if g.is_cave_with_surface(ox + lx, oy + ly, oz + lz, st) { caves += 1; }
+            }
+        }
         let t_cave = t.elapsed().as_secs_f64();
+
+        // 4. Everything after the mask: the surface/biome pass. Timed as
+        //    (whole chunk) - (the three above), since it is not callable
+        //    on its own.
+        let t = Instant::now();
+        let ch = g.generate_chunk(ChunkCoord::new(4, 0, 4));
+        let t_whole = t.elapsed().as_secs_f64();
+        std::hint::black_box(&ch);
 
         let ms = |t: f64| t * 1e3;
         println!("column pass breakdown, one surface chunk (1024 columns, 32768 cells):");
         println!("  surface_target  x1024   {:8.1} ms   ({:7.1} us each)", ms(t_surface), t_surface * 1e6 / cols as f64);
         println!("  density         x32768  {:8.1} ms   ({:7.3} us each)  {} solid", ms(t_density), t_density * 1e6 / 32768.0, solid);
         println!("  is_cave         x32768  {:8.1} ms   ({:7.3} us each)  {} caves", ms(t_cave), t_cave * 1e6 / 32768.0, caves);
+        let rest = t_whole - t_surface - t_density - t_cave;
+        println!("  ---- whole chunk        {:8.1} ms", ms(t_whole));
+        println!("  surface/biome pass etc. {:8.1} ms   (whole minus the three above)", ms(rest));
     }
 }
