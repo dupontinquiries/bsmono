@@ -361,12 +361,6 @@ pub struct Snapclone {
     /// ripple survive the redraw they are animating through.
     pub glass_flip: crate::glass::GlassButton,
     pub glass_shutter: crate::glass::GlassButton,
-    /// Paint the capture flash white instead of dark. Off by default — see
-    /// `camera::flash_color` for why the dark one is the right default. A
-    /// session setting, like this app's other toggles: nothing here is
-    /// persisted yet, and pretending otherwise in a doc comment is how the
-    /// next reader loses an afternoon.
-    pub snap_flash_bright: bool,
     /// Seconds since the capture flash started; `None` when not flashing.
     /// Set from `HostEvent::SnapSaved`, so it fires on the file actually
     /// existing rather than on the tap — a flash on the tap would confirm a
@@ -772,7 +766,6 @@ impl Snapclone {
             dialog_form: crate::mobile_dialog::Form::Sheet,
             glass_flip: Default::default(),
             glass_shutter: Default::default(),
-            snap_flash_bright: false,
             snap_flash: None,
             shutter_pressed: false,
             video: None,
@@ -3712,7 +3705,8 @@ impl Snapclone {
             } else {
                 ui.painter_at(vf_rect).rect_filled(
                     vf_rect, 0.0,
-                    crate::camera::flash_color(age, self.snap_flash_bright));
+                    crate::camera::flash_color(
+                        age, self.settings.current.camera.capture_flash_bright));
                 self.snap_flash = Some(age + ui.input(|i| i.stable_dt).min(0.1));
                 ui.ctx().request_repaint();
             }
@@ -4373,8 +4367,11 @@ impl Snapclone {
         // checkbox so the next camera setting has somewhere to go that is not
         // the top of the page.
         ui.collapsing("camera", |ui| {
-            ui.checkbox(&mut self.snap_flash_bright, "bright capture flash");
-            ui.colored_label(c.text_weak, if self.snap_flash_bright {
+            let mut bright = self.settings.current.camera.capture_flash_bright;
+            if ui.checkbox(&mut bright, "bright capture flash").changed() {
+                self.set_capture_flash_bright(bright);
+            }
+            ui.colored_label(c.text_weak, if bright {
                 "white, like a phone screen"
             } else {
                 "dark, like a shutter — easier on the eyes in a dim room"
@@ -4653,6 +4650,28 @@ impl Snapclone {
     /// Revoked is deliberately distinct from NotGiven: the app has to know it
     /// once had crops to delete, and treating the two the same would leave
     /// them on disk.
+    /// Set the flash colour and write it out NOW.
+    ///
+    /// Write-on-change, matching the Qt app: `SettingsPage.cpp` calls
+    /// `setValue` in each toggle's handler rather than batching to a Save. A
+    /// phone app is not closed, it is killed, so a preference written in a
+    /// shutdown path is a preference that is never written.
+    ///
+    /// This bypasses the page's dirty tracking on purpose. That machinery is
+    /// for the settings PAGE, where a user edits several fields and commits
+    /// them together; a switch on a different page has already been committed
+    /// by being flipped, and showing "unsaved changes" for it would be a lie
+    /// about what the app is going to do.
+    pub fn set_capture_flash_bright(&mut self, on: bool) {
+        self.settings.current.camera.capture_flash_bright = on;
+        self.settings.save();
+        if let Err(e) = crate::settings_store::store(&self.settings.current) {
+            // Said, not swallowed. A preference that silently does not stick
+            // is the failure this whole path exists to prevent.
+            self.shutter_note = format!("setting not saved — {e}");
+        }
+    }
+
     pub fn set_face_consent(&mut self, c: crate::face_consent::Consent) -> bool {
         self.face_consent = c;
         c.owes_erase()

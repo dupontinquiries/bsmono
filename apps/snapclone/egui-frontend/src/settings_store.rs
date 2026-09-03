@@ -82,6 +82,7 @@ pub fn render(s: &Settings) -> String {
     out.push_str(&format!("speech_boost = {}\n", c.speech_boost.key()));            // audio/speechBoost
     out.push_str(&format!("speech_boost_auto_only = {}\n", c.speech_boost_auto_only)); // audio/speechBoostAutoOnly
     out.push_str(&format!("face_library = {}\n", c.face_library));                  // face/enabled
+    out.push_str(&format!("capture_flash_bright = {}\n", c.capture_flash_bright));   // no Qt twin — the Qt app flashes white unconditionally
 
     let n = &s.network;
     out.push_str("\n[network]\n");
@@ -161,6 +162,7 @@ pub fn parse(text: &str) -> Settings {
     c.speech_boost_auto_only =
         b(get("camera", "speech_boost_auto_only"), c.speech_boost_auto_only);
     c.face_library = b(get("camera", "face_library"), c.face_library);
+    c.capture_flash_bright = b(get("camera", "capture_flash_bright"), c.capture_flash_bright);
 
     let mut n = Network::default();
     if let Some(v) = get("network", "listen_port").and_then(|x| x.parse().ok()) { n.listen_port = v; }
@@ -382,6 +384,36 @@ mod roundtrip_tests {
         s.about.micro_dht_host = "10.0.0.5:4544".into();
 
         s
+    }
+
+    #[test]
+    fn the_capture_flash_colour_survives_a_round_trip() {
+        // The flash toggle used to be a field on the app struct, set by a
+        // checkbox and thrown away on restart — while this module, a settings
+        // page and a Save that writes the file all already existed and it went
+        // through none of them. The round trip is what proves it does now.
+        let mut s = Settings::default();
+        assert!(!s.camera.capture_flash_bright, "the default is the dark flash");
+        s.camera.capture_flash_bright = true;
+        let back = parse(&render(&s));
+        assert!(back.camera.capture_flash_bright, "the setting did not survive the file");
+        // And the other direction, which a one-way test would miss: an
+        // explicit false must come back false rather than falling to a default
+        // that happens to agree.
+        s.camera.capture_flash_bright = false;
+        assert!(!parse(&render(&s)).camera.capture_flash_bright);
+    }
+
+    #[test]
+    fn a_file_written_before_the_flash_existed_still_loads() {
+        // The compatibility rule this module is built on: a missing key keeps
+        // its default rather than refusing the file. Every user upgrading has
+        // a settings.conf with no `capture_flash_bright` line in it.
+        let older = "[camera]\nshutter_sound = false\nface_library = true\n";
+        let s = parse(older);
+        assert!(!s.camera.shutter_sound, "the old file did not load at all");
+        assert!(s.camera.face_library);
+        assert!(!s.camera.capture_flash_bright, "a missing key did not take its default");
     }
 
     #[test]

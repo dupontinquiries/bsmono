@@ -276,6 +276,14 @@ pub struct Camera {
     pub speech_boost_auto_only: bool,
     // Face library  (`face/enabled`)
     pub face_library: bool,
+    /// Paint the capture flash white instead of dark.
+    ///
+    /// Dark by default — see `camera::flash_color`. Here rather than as a
+    /// field on the app because a preference the user sets and a restart
+    /// discards is worse than no preference: they believe they configured it.
+    /// This app already had a settings page, a store and a Save that writes
+    /// the file; the flash toggle simply was not going through any of it.
+    pub capture_flash_bright: bool,
 }
 
 impl Default for Camera {
@@ -289,6 +297,7 @@ impl Default for Camera {
             speech_boost: SpeechBoost::Off,
             speech_boost_auto_only: true,
             face_library: false,
+            capture_flash_bright: false,
         }
     }
 }
