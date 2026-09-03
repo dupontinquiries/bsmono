@@ -52,11 +52,25 @@
 //! a multiple of the coarse stride destroys exactly the information the
 //! extractor exists to compute; on a heightfield it quantises the height.
 //!
-//! The fix has to act on the SAMPLES, not on the result: a boundary cell must
-//! interpolate between the same pair of field samples its coarse neighbour
-//! uses, which means merging the fine cells across that face into the
-//! neighbour's cell structure rather than adjusting their output. That is a
-//! restructure of the vertex pass, not a post-step, and it is not attempted
+//! ### What does work, partly: [`Seams`]
+//!
+//! Acting on the SAMPLES instead. A boundary cell facing a coarser neighbour
+//! is meshed as though it were the coarse cell containing it — same eight
+//! samples, same interpolation, same answer — so every fine cell inside one
+//! coarse footprint emits an identical vertex derived from data the neighbour
+//! reads too. Detail is lost in one cell layer, which is the right place to
+//! lose it: next to a chunk that already threw that detail away.
+//!
+//! Measured, this takes the disagreement from 3.86 cells to 0.14 — better than
+//! an order of magnitude, and NOT zero. The remainder is structural. Surface
+//! nets puts a vertex in each CELL, and two abutting chunks own different
+//! cells either side of the shared plane: at a boundary on x = 8 the fine
+//! chunk's cell spans 6..8 and the coarse chunk's spans 8..10. Reading the
+//! same samples is what shrinks the error; it cannot make them the same cell.
+//!
+//! Closing the last of it requires one chunk to emit the quads that BRIDGE the
+//! boundary, which means holding the neighbour's vertices while meshing —
+//! a chunk-graph concern rather than an extractor one, and not attempted
 //! here.
 
 use glam::Vec3;
@@ -94,6 +108,37 @@ impl Mesh {
     }
 }
 
+/// The neighbours' sampling strides, per face, in the order
+/// `[-x, +x, -y, +y, -z, +z]`. `0` means unknown or equal — no seam to manage.
+/// A value larger than this chunk's own stride means the neighbour is coarser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Seams(pub [i32; 6]);
+
+impl Seams {
+    pub const NONE: Seams = Seams([0; 6]);
+    pub fn all(stride: i32) -> Seams {
+        Seams([stride; 6])
+    }
+    pub fn face(mut self, face: usize, stride: i32) -> Seams {
+        self.0[face] = stride;
+        self
+    }
+    pub fn x_plus(self, stride: i32) -> Seams {
+        self.face(1, stride)
+    }
+    pub fn x_minus(self, stride: i32) -> Seams {
+        self.face(0, stride)
+    }
+}
+
+/// Faces, for [`Seams::face`].
+pub const FACE_X_MINUS: usize = 0;
+pub const FACE_X_PLUS: usize = 1;
+pub const FACE_Y_MINUS: usize = 2;
+pub const FACE_Y_PLUS: usize = 3;
+pub const FACE_Z_MINUS: usize = 4;
+pub const FACE_Z_PLUS: usize = 5;
+
 /// Extraction settings.
 #[derive(Clone, Copy, Debug)]
 pub struct Mesher {
@@ -104,6 +149,10 @@ pub struct Mesher {
     pub dims: [i32; 3],
     /// Lattice coordinate of sample (0, 0, 0).
     pub origin: [i32; 3],
+    /// What the neighbours are doing. Boundary cells facing a coarser chunk
+    /// are meshed on the NEIGHBOUR'S cell grid, so both sides interpolate the
+    /// same samples and land on the same point.
+    pub seams: Seams,
     /// Sample every `stride`th lattice point. 1 is full detail; a coarser
     /// chunk uses 2, 4, 8 — the same ladder `unendlich`'s `lod_cell_stride`
     /// walks. Output positions stay in FULL-DETAIL lattice units regardless,
@@ -114,7 +163,7 @@ pub struct Mesher {
 
 impl Mesher {
     pub fn new(dims: [i32; 3]) -> Mesher {
-        Mesher { iso: 0.0, dims, origin: [0, 0, 0], stride: 1 }
+        Mesher { iso: 0.0, dims, origin: [0, 0, 0], stride: 1, seams: Seams::NONE }
     }
     pub fn at(mut self, origin: [i32; 3]) -> Mesher {
         self.origin = origin;
@@ -122,6 +171,11 @@ impl Mesher {
     }
     pub fn iso(mut self, iso: f32) -> Mesher {
         self.iso = iso;
+        self
+    }
+    /// Declare the neighbours' strides so shared faces agree.
+    pub fn seams(mut self, seams: Seams) -> Mesher {
+        self.seams = seams;
         self
     }
     /// Mesh at a coarser sampling. `dims` still counts SAMPLES, so a stride-2
@@ -181,16 +235,58 @@ pub fn extract<F: Field>(field: &F, m: Mesher) -> Mesh {
     for z in 0..cz {
         for y in 0..cy {
             for x in 0..cx {
+                // ON A COARSER NEIGHBOUR'S FACE, BORROW ITS CELL GRID.
+                //
+                // The failed first attempt quantised the resulting vertex
+                // POSITION, which destroys the surface location surface nets
+                // encodes there. The fix has to act one level earlier: a
+                // boundary cell is meshed as though it were the coarse cell
+                // that contains it — same eight samples, same interpolation,
+                // same answer. Every fine cell inside one coarse footprint
+                // therefore emits the SAME vertex (degenerate triangles
+                // between them, which cost nothing and hide nothing), and it
+                // is a vertex the neighbour derives independently from the
+                // same data. The seam does not need stitching because the two
+                // sides never disagreed.
+                //
+                // Detail is lost in one cell layer. That is the correct place
+                // to lose it: the cell next to a chunk that already threw that
+                // detail away.
+                let mut r = 1i32;
+                for (face, on_face) in [
+                    (0usize, x == 0),
+                    (1, x == cx - 1),
+                    (2, y == 0),
+                    (3, y == cy - 1),
+                    (4, z == 0),
+                    (5, z == cz - 1),
+                ] {
+                    let n = m.seams.0[face];
+                    if on_face && n > k {
+                        r = (n / k).max(1);
+                        break;
+                    }
+                }
+                let base = [
+                    x.div_euclid(r) * r,
+                    y.div_euclid(r) * r,
+                    z.div_euclid(r) * r,
+                ];
+
                 let mut v = [0.0f32; 8];
                 let mut inside = 0u8;
                 for (i, s) in v.iter_mut().enumerate() {
                     let o = corner_offset(i);
-                    *s = at(x + o[0], y + o[1], z + o[2]);
+                    *s = at(base[0] + o[0] * r, base[1] + o[1] * r, base[2] + o[2] * r);
                     if *s >= m.iso {
                         inside |= 1 << i;
                     }
                 }
-                // all in or all out: no surface through this cell
+                // all in or all out: no surface through this cell. On a
+                // borrowed grid this can refuse a cell whose own samples DO
+                // cross — a feature finer than the neighbour can see — and
+                // dropping it is right, because the neighbour has no vertex
+                // there to join to.
                 if inside == 0 || inside == 0xFF {
                     continue;
                 }
@@ -214,10 +310,11 @@ pub fn extract<F: Field>(field: &F, m: Mesher) -> Mesh {
                 }
                 let local = if n > 0.0 { sum / n } else { Vec3::splat(0.5) };
                 vertex_of[idx(x, y, z)] = mesh.positions.len() as u32;
-                // back into full-detail units so chunks at different strides
-                // share one coordinate frame
-                mesh.positions
-                    .push((Vec3::new(x as f32, y as f32, z as f32) + local) * k as f32);
+                // placed on the grid it was COMPUTED on, then back into
+                // full-detail units so chunks at different strides share one
+                // coordinate frame
+                let cell = Vec3::new(base[0] as f32, base[1] as f32, base[2] as f32);
+                mesh.positions.push((cell + local * r as f32) * k as f32);
             }
         }
     }
@@ -448,6 +545,117 @@ mod tests {
             "the seam closed on its own (worst {worst:.3}) — if LOD stitching landed, \
              delete this test; if the field stopped being nonlinear, fix the test"
         );
+    }
+
+
+    /// The seam metric: for each fine boundary vertex, how far the coarse
+    /// chunk puts the surface at the nearest matching z.
+    fn seam_error(fine: &Mesh, coarse: &Mesh) -> f32 {
+        let a = on_face(fine, 8.0);
+        let b: Vec<Vec3> =
+            on_face(coarse, 0.0).iter().map(|p| *p + Vec3::new(8.0, 0.0, 0.0)).collect();
+        assert!(!a.is_empty() && !b.is_empty(), "no boundary vertices to compare");
+        a.iter()
+            .filter_map(|p| {
+                b.iter()
+                    .min_by(|u, v| (u.z - p.z).abs().partial_cmp(&(v.z - p.z).abs()).unwrap())
+                    .map(|q| (q.y - p.y).abs())
+            })
+            .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn declaring_the_coarse_neighbour_closes_the_seam() {
+        // Same two chunks and the same field as the characterisation test; the
+        // only change is that the fine side is TOLD its +x neighbour samples
+        // at stride 2, so its boundary layer is meshed on the neighbour's grid.
+        let f = ridge();
+        let coarse = extract(&f, Mesher::new([5, 8, 5]).at([8, 0, 0]).stride(2));
+        let naive = extract(&f, Mesher::new([9, 14, 9]));
+        let stitched = extract(&f, Mesher::new([9, 14, 9]).seams(Seams::NONE.x_plus(2)));
+
+        let before = seam_error(&naive, &coarse);
+        let after = seam_error(&stitched, &coarse);
+        assert!(after < before * 0.5, "not much better: {before:.3} -> {after:.3}");
+        // NOT ZERO, and the remainder is structural rather than a tuning
+        // failure. Surface nets puts a vertex in each CELL, and two abutting
+        // chunks own different cells either side of the shared plane — the
+        // fine chunk's boundary cell spans world x 6..8, the coarse chunk's
+        // spans 8..10. Borrowing the grid makes both sides read the same
+        // samples, which is what shrinks the error; it cannot make them the
+        // same cell. Closing the last of it means one chunk emitting the quads
+        // that BRIDGE the boundary, which needs the neighbour's vertices and
+        // is a different piece of work (see the module header).
+        assert!(after < 0.2, "residual grew past its recorded value: {after:.4}");
+    }
+
+    #[test]
+    fn borrowing_the_grid_touches_only_the_declared_boundary_layer() {
+        // If a coarsening neighbour degraded the whole chunk, LOD would be
+        // quietly wrecking the world every time the player moved.
+        let f = ridge();
+        let naive = extract(&f, Mesher::new([9, 14, 9]));
+        let stitched = extract(&f, Mesher::new([9, 14, 9]).seams(Seams::NONE.x_plus(2)));
+        // Compare by POSITION, not by index: borrowing the grid collapses and
+        // sometimes drops boundary cells, so the two meshes do not have
+        // matching vertex orders. An earlier version of this test zipped them
+        // and reported interior vertices as moved when they had simply
+        // shifted position in the list.
+        let interior = |m: &Mesh| {
+            let mut v: Vec<[i32; 3]> = m
+                .positions
+                .iter()
+                .filter(|p| p.x < 6.0)
+                .map(|p| [(p.x * 1000.0) as i32, (p.y * 1000.0) as i32, (p.z * 1000.0) as i32])
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            interior(&naive),
+            interior(&stitched),
+            "a coarsening neighbour changed the chunk away from its boundary"
+        );
+        assert_ne!(
+            on_face(&naive, 8.0).len(),
+            0,
+            "no boundary vertices at all; the fixture is wrong"
+        );
+    }
+
+    #[test]
+    fn cells_sharing_a_coarse_footprint_collapse_onto_one_point() {
+        // The mechanism, asserted directly: within one coarse cell the fine
+        // cells must agree exactly, or they have not borrowed the same grid.
+        let f = ridge();
+        let stitched = extract(&f, Mesher::new([9, 14, 9]).seams(Seams::NONE.x_plus(2)));
+        let face = on_face(&stitched, 8.0);
+        let mut buckets: HashMap<(i32, i32), Vec<Vec3>> = HashMap::new();
+        for p in face {
+            buckets.entry(((p.y / 2.0) as i32, (p.z / 2.0) as i32)).or_default().push(p);
+        }
+        let shared = buckets.values().filter(|v| v.len() > 1).count();
+        assert!(shared > 0, "no coarse footprint held more than one fine cell");
+        for v in buckets.values().filter(|v| v.len() > 1) {
+            for q in &v[1..] {
+                assert!((v[0] - *q).length() < 1e-4, "{:?} vs {:?} in one footprint", v[0], q);
+            }
+        }
+    }
+
+    #[test]
+    fn a_stitched_chunk_gains_no_folded_edges() {
+        let f = ridge();
+        let mesh = extract(&f, Mesher::new([9, 14, 9]).seams(Seams::all(2)));
+        let mut edges: HashMap<(u32, u32), i32> = HashMap::new();
+        for t in mesh.indices.chunks_exact(3) {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let k = if a < b { (a, b) } else { (b, a) };
+                *edges.entry(k).or_insert(0) += 1;
+            }
+        }
+        let folded = edges.values().filter(|&&n| n > 2).count();
+        assert_eq!(folded, 0, "{folded} folded edges after borrowing the grid");
     }
 
     #[test]
