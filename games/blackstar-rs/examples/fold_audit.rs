@@ -52,6 +52,10 @@ struct Finding {
     worst_excursion: f32,
     worst_prim: usize,
     worst_t: f32,
+    /// Largest gap, in body radii, between a prim and its nearest
+    /// neighbour at an endpoint pose. See `island_gap`.
+    island: f32,
+    island_prim: usize,
 }
 
 fn centroid(pts: &[Vec3]) -> Vec3 {
@@ -106,7 +110,13 @@ fn audit(pose_dirs: &[PathBuf]) -> Option<Finding> {
     }
 
     // EXCURSION: how far past its own endpoints a part wanders.
-    let mut worst = Finding { worst_excursion: 0.0, worst_prim: 0, worst_t: 0.0 };
+    let mut worst = Finding {
+        worst_excursion: 0.0,
+        worst_prim: 0,
+        worst_t: 0.0,
+        island: 0.0,
+        island_prim: 0,
+    };
     for (p, row) in offsets.iter().enumerate() {
         let anchor = row[0].max(row[STEPS - 1]);
         for (s, o) in row.iter().enumerate() {
@@ -115,6 +125,56 @@ fn audit(pose_dirs: &[PathBuf]) -> Option<Finding> {
                 worst.worst_excursion = ex;
                 worst.worst_prim = p;
                 worst.worst_t = s as f32 / (STEPS - 1) as f32;
+            }
+        }
+    }
+
+    // ISLANDS: a prim floating free of the body in an ENDPOINT pose.
+    //
+    // Found by rendering `tank_vanquish` and looking at it — a chunk sits
+    // clear of the hull, about half a body away, in the authored f00 pose.
+    // That is not a fold artifact; it is there before the fold starts, and
+    // the excursion metric above cannot see it because excursion is
+    // measured against the endpoints.
+    //
+    // Well defined, unlike the two bleed attempts below: the gap from each
+    // prim's box to the NEAREST other prim's box, in body radii. A body
+    // whose parts touch scores 0. This is the metric those attempts were
+    // reaching for.
+    {
+        let boxes: Vec<(Vec3, Vec3)> = t0_pts
+            .iter()
+            .map(|pts| {
+                let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+                for p in pts {
+                    lo = lo.min(*p);
+                    hi = hi.max(*p);
+                }
+                (lo, hi)
+            })
+            .collect();
+        let live: Vec<usize> = (0..boxes.len()).filter(|i| boxes[*i].1.x >= boxes[*i].0.x).collect();
+        if live.len() > 1 {
+            let (mut blo, mut bhi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for i in &live {
+                blo = blo.min(boxes[*i].0);
+                bhi = bhi.max(boxes[*i].1);
+            }
+            let radius = ((bhi - blo) * 0.5).max_element().max(1e-4);
+            for &i in &live {
+                let mut nearest = f32::MAX;
+                for &j in &live {
+                    if i == j {
+                        continue;
+                    }
+                    // Axis-aligned box separation: zero if they overlap.
+                    let d = (boxes[i].0 - boxes[j].1).max(boxes[j].0 - boxes[i].1).max(Vec3::ZERO);
+                    nearest = nearest.min(d.length());
+                }
+                if nearest < f32::MAX && nearest / radius > worst.island {
+                    worst.island = nearest / radius;
+                    worst.island_prim = i;
+                }
             }
         }
     }
@@ -187,9 +247,19 @@ fn main() {
     // threshold below the median flags half the fleet and tells nobody
     // anything; the point of an audit is to name the outliers.
     const EXCURSION_FLAG: f32 = 0.70;
+    // Above the observed p90 (0.67), NOT a number picked in advance.
+    //
+    // I set this to 0.10 first -- having just written the comment above
+    // about not doing exactly that -- and it flagged 235 of 254. The
+    // median gap in this fleet is 0.37 body radii, because these models
+    // legitimately carry detached prims: greeble, antennae, wheels that
+    // do not touch the hull. A separated part is NORMAL here, and only a
+    // far-separated one is a finding.
+    const ISLAND_FLAG: f32 = 0.75;
 
-    let (mut checked, mut ex_hits) = (0, 0);
+    let (mut checked, mut ex_hits, mut isl_hits) = (0, 0, 0);
     let mut ex_all: Vec<f32> = Vec::new();
+    let mut isl_all: Vec<f32> = Vec::new();
     for name in &names {
         let dir = root.join(name);
         let poses = poses_of(&dir);
@@ -199,11 +269,23 @@ fn main() {
         let Some(f) = audit(&poses) else { continue };
         checked += 1;
         ex_all.push(f.worst_excursion);
-        if f.worst_excursion > EXCURSION_FLAG {
+        isl_all.push(f.island);
+        let fe = f.worst_excursion > EXCURSION_FLAG;
+        let fi = f.island > ISLAND_FLAG;
+        if fe {
             ex_hits += 1;
+        }
+        if fi {
+            isl_hits += 1;
+        }
+        if fe || fi {
             println!(
-                "{name:<52} excursion={:.2}  (prim {} at t={:.2})",
-                f.worst_excursion, f.worst_prim, f.worst_t
+                "{name:<52} excursion={:.2}{} island={:.2} (prim {}){}",
+                f.worst_excursion,
+                if fe { " <" } else { "  " },
+                f.island,
+                f.island_prim,
+                if fi { " <" } else { "" },
             );
         }
     }
@@ -221,5 +303,9 @@ fn main() {
         "\nexcursion  median {:.2}  p90 {:.2}  max {:.2}",
         pct(&mut ex_all, 0.5), pct(&mut ex_all, 0.9), pct(&mut ex_all, 1.0)
     );
-    println!("\n{ex_hits} chassis over the flag, of {checked} checked");
+    println!(
+        "island     median {:.2}  p90 {:.2}  max {:.2}",
+        pct(&mut isl_all, 0.5), pct(&mut isl_all, 0.9), pct(&mut isl_all, 1.0)
+    );
+    println!("\n{ex_hits} with a part leaving the body mid-fold, {isl_hits} with a part floating free at rest, of {checked} checked");
 }
