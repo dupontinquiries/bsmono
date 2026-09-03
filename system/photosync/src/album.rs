@@ -106,7 +106,7 @@ pub struct Album {
 #[derive(Debug, Clone, Default)]
 pub struct Library {
     items: Vec<Item>,
-    albums: BTreeMap<String, Album>,
+    pub(crate) albums: BTreeMap<String, Album>,
 }
 
 impl Library {
@@ -247,6 +247,125 @@ pub fn prepare_share(lib: &Library, paths: &[String]) -> Share {
     Share { paths: ok, requested: paths.len(), missing }
 }
 
+// ── persistence ─────────────────────────────────────────────────────────────
+//
+// The model above is pure; this is the only part that touches SQLite, and it is
+// small on purpose. Everything interesting — grouping, membership, the rules
+// about deletion and sharing — is testable without a database, and this layer
+// is a query and two tables.
+
+/// Create the album tables if they are not there.
+///
+/// Separate from `create_schema` in lib.rs rather than folded into it: albums
+/// are a VIEW concern and the dedup store predates them by a long way. A
+/// daemon that never opens a gallery should not have to carry the migration,
+/// and `IF NOT EXISTS` makes calling this from either side harmless.
+pub fn create_album_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS albums (
+            name TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL
+        )",
+        [],
+    )?;
+    // ON DELETE CASCADE on the album, and deliberately NO foreign key to
+    // `files`. The module's rule is that membership is a reference: a photo
+    // whose row goes away must leave the membership record intact, so that
+    // restoring the file restores the album entry. A foreign key here would
+    // silently delete memberships during a garbage collect.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS album_items (
+            album TEXT NOT NULL,
+            path TEXT NOT NULL,
+            PRIMARY KEY (album, path),
+            FOREIGN KEY (album) REFERENCES albums(name) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Read the library and its albums out of an open database.
+///
+/// `created_at` is the taken-at date. The `files` row also has `modified_at`,
+/// which is when the file last CHANGED on disk — copying a photo between
+/// devices updates it, so grouping by it would file every photo under the day
+/// you synced rather than the day you took it. That is the single most
+/// wrong-looking thing a gallery can do, so the choice is worth naming here
+/// rather than being a column name someone picks later.
+pub fn load(conn: &rusqlite::Connection) -> rusqlite::Result<Library> {
+    let mut st = conn.prepare(
+        "SELECT path, created_at, thumbnail_hash, size, metadata_json FROM files",
+    )?;
+    let items = st
+        .query_map([], |r| {
+            Ok(Item {
+                path: r.get(0)?,
+                taken_at: r.get(1)?,
+                thumbnail: r.get(2)?,
+                bytes: r.get::<_, i64>(3)?.max(0) as u64,
+                metadata_json: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut lib = Library::new(items);
+    // Albums may not exist yet on a database written before this feature; an
+    // absent table is an empty gallery, not an error.
+    if conn
+        .prepare("SELECT name FROM albums ORDER BY name")
+        .and_then(|mut s| {
+            let names = s.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(names)
+        })
+        .map(|names| {
+            for n in names {
+                lib.albums.insert(n.clone(), Album { name: n, ..Default::default() });
+            }
+        })
+        .is_err()
+    {
+        return Ok(lib);
+    }
+    let mut st = conn.prepare("SELECT album, path FROM album_items")?;
+    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (album, path) = row?;
+        if let Some(a) = lib.albums.get_mut(&album) {
+            a.items.insert(path);
+        }
+    }
+    Ok(lib)
+}
+
+/// Write the albums back. The `files` table is NOT touched.
+///
+/// Replace-in-place rather than diffing: the album set is tens of rows, a diff
+/// is more code than the write, and the failure mode of a wrong diff (a
+/// membership silently dropped) is much worse than the cost of rewriting.
+pub fn save_albums(conn: &rusqlite::Connection, lib: &Library) -> rusqlite::Result<()> {
+    create_album_schema(conn)?;
+    // REDUNDANT while foreign keys are on — `DELETE FROM albums` below already
+    // cascades, which is why breaking this line fails no test. Kept, and
+    // `foreign_keys_are_on_and_the_cascade_is_what_clears_memberships` pins the
+    // assumption: if a future rusqlite stops enabling them, that test fails
+    // first and this line becomes the only thing keeping stale memberships out.
+    conn.execute("DELETE FROM album_items", [])?;
+    conn.execute("DELETE FROM albums", [])?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    for a in lib.albums.values() {
+        conn.execute("INSERT INTO albums (name, created_at) VALUES (?1, ?2)", rusqlite::params![a.name, now])?;
+        for p in &a.items {
+            conn.execute("INSERT INTO album_items (album, path) VALUES (?1, ?2)", rusqlite::params![a.name, p])?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +386,118 @@ mod tests {
             item("/p/d.jpg", SEP3 - 2 * DAY),
         ])
     }
+
+    fn memdb() -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute(
+            "CREATE TABLE files (path TEXT PRIMARY KEY, size INTEGER NOT NULL,
+             created_at INTEGER NOT NULL, modified_at INTEGER NOT NULL,
+             thumbnail_hash TEXT, metadata_json TEXT)",
+            [],
+        ).unwrap();
+        for (p, t) in [("/p/a.jpg", SEP3 + 3600), ("/p/b.jpg", SEP3 - DAY)] {
+            c.execute(
+                "INSERT INTO files (path, size, created_at, modified_at, thumbnail_hash, metadata_json)
+                 VALUES (?1, 100, ?2, ?3, 'thumb', NULL)",
+                rusqlite::params![p, t, SEP3 + 99_999],
+            ).unwrap();
+        }
+        c
+    }
+
+    #[test]
+    fn a_library_loads_from_the_files_table_and_dates_by_created_at() {
+        // NOT modified_at. Copying a photo between devices bumps it, so
+        // grouping by it files every photo under the day you synced — the most
+        // wrong-looking thing a gallery can do. The fixture sets modified_at
+        // far away from created_at precisely so a swap fails here.
+        let c = memdb();
+        let lib = load(&c).unwrap();
+        assert_eq!(lib.len(), 2);
+        let grouped = lib.by_day();
+        let days: Vec<&str> = grouped.iter().map(|(d, _)| d.as_str()).collect();
+        assert_eq!(days, vec!["2026-09-03", "2026-09-02"], "dated by the wrong column");
+        assert_eq!(grouped[0].1[0].thumbnail.as_deref(), Some("thumb"));
+    }
+
+    #[test]
+    fn albums_survive_a_save_and_load() {
+        let c = memdb();
+        let mut lib = load(&c).unwrap();
+        lib.create_album("Trip");
+        lib.add_to_album("Trip", &["/p/a.jpg".into()]);
+        save_albums(&c, &lib).unwrap();
+
+        let back = load(&c).unwrap();
+        assert_eq!(back.album_names(), vec!["Trip"]);
+        assert_eq!(back.album_items("Trip").len(), 1);
+        // And an album emptied in memory really empties on disk — the failure
+        // a replace-in-place write exists to avoid getting wrong.
+        let mut back = back;
+        back.remove_from_album("Trip", "/p/a.jpg");
+        save_albums(&c, &back).unwrap();
+        assert_eq!(load(&c).unwrap().album_items("Trip").len(), 0);
+        // And the MEMBERSHIP ROW is gone, not merely the view of it. Asserting
+        // through album_items alone passes when the stale row survives and the
+        // file happens to be absent, which is not the same thing — found by
+        // breaking the DELETE and watching nothing fail.
+        assert!(
+            load(&c).unwrap().album("Trip").unwrap().items.is_empty(),
+            "a removed membership was left behind in album_items"
+        );
+    }
+
+    #[test]
+    fn a_database_with_no_album_tables_loads_as_an_empty_gallery() {
+        // Every existing photosync database is one of these. Treating a
+        // missing table as an error would make the gallery refuse to open on
+        // exactly the libraries it is being added for.
+        let c = memdb();
+        let lib = load(&c).unwrap();
+        assert_eq!(lib.len(), 2, "the photos did not load");
+        assert!(lib.album_names().is_empty());
+    }
+
+    #[test]
+    fn a_membership_outlives_the_file_row() {
+        // No foreign key to `files`, on purpose: the module's rule is that
+        // membership is a reference. A garbage collect that removes a file row
+        // must not silently delete the album entry, so that restoring the file
+        // restores the entry.
+        let c = memdb();
+        let mut lib = load(&c).unwrap();
+        lib.create_album("X");
+        lib.add_to_album("X", &["/p/a.jpg".into()]);
+        save_albums(&c, &lib).unwrap();
+        c.execute("DELETE FROM files WHERE path = '/p/a.jpg'", []).unwrap();
+
+        let back = load(&c).unwrap();
+        assert_eq!(back.album_items("X").len(), 0, "a vanished file still shows in the view");
+        assert!(back.album("X").unwrap().items.contains("/p/a.jpg"),
+                "the membership record was destroyed with the file");
+    }
+
+#[test]
+fn foreign_keys_are_on_and_the_cascade_is_what_clears_memberships() {
+    // Written because breaking `DELETE FROM album_items` in save_albums
+    // failed NO test twice, even after sharpening the assertion. The reason
+    // is that rusqlite enables foreign keys, so `DELETE FROM albums` already
+    // cascades — the explicit delete is redundant, not load-bearing.
+    //
+    // That is worth pinning rather than deleting the line: if a future
+    // rusqlite (or an explicit `PRAGMA foreign_keys = OFF`) changes the
+    // default, the cascade stops and the redundant delete becomes the only
+    // thing keeping stale memberships out. This test fails first and says why.
+    let c = rusqlite::Connection::open_in_memory().unwrap();
+    create_album_schema(&c).unwrap();
+    c.execute("INSERT INTO albums (name, created_at) VALUES ('A', 0)", []).unwrap();
+    c.execute("INSERT INTO album_items (album, path) VALUES ('A', '/p/x.jpg')", []).unwrap();
+    c.execute("DELETE FROM albums", []).unwrap();
+    let left: i64 = c.query_row("SELECT COUNT(*) FROM album_items", [], |r| r.get(0)).unwrap();
+    let fk: i64 = c.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap();
+    assert_eq!(fk, 1, "foreign keys are OFF — the explicit DELETE in save_albums is now the only guard");
+    assert_eq!(left, 0, "the cascade did not fire");
+}
 
     #[test]
     fn the_civil_date_is_right_including_before_1970_and_on_leap_days() {
