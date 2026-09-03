@@ -280,6 +280,102 @@ mod tests {
         e.recognize(Tier::Whisper, text, 1.0, t + 1200)
     }
 
+    /// Deterministic 64-bit LCG. A dependency-free PRNG so the fuzz
+    /// below is reproducible: a failure that only shows up on one
+    /// machine is not a failure anyone will fix.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 11
+        }
+        fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+            &xs[(self.next() % xs.len() as u64) as usize]
+        }
+    }
+
+    #[test]
+    fn random_utterance_streams_never_corrupt_the_buffer() {
+        // The engine does byte-index arithmetic throughout — insert_str,
+        // replace_range, slicing for the spacer and the last unit. Every
+        // hand-written test used ASCII, which is exactly the input that
+        // cannot expose a char-boundary bug. This one deliberately does
+        // not.
+        let corpus = [
+            "let x equals five",
+            "café noir",
+            "Le café était à côté",
+            "日本語のテキスト",
+            "new line",
+            "indent",
+            "dedent",
+            "scratch that",
+            "code mode",
+            "prose mode",
+            "make that snake case",
+            "capitalize that",
+            "uppercase that",
+            "change five to six",
+            "change absent to x",
+            "spell it romeo echo alpha delta",
+            "i said something else",
+            "join that",
+            "read to string open paren close paren",
+            "quote hello quote",
+            "",
+            "   ",
+            "ΑΒΓ δεζ",
+            "emoji 🙂 mid sentence",
+        ];
+        let buffers = ["", "fn read_to_string() {}\n", "café_noir\n日本\n", "  indented"];
+        let tiers = [Tier::Fast, Tier::Whisper];
+
+        let mut rng = Rng(0x5EED);
+        for session in 0..400u64 {
+            let buf = *rng.pick(&buffers);
+            // cursors deliberately include non-boundary and out-of-range
+            let cursor = (rng.next() as usize) % (buf.len() + 4);
+            let mut e = Engine::new(
+                buf,
+                cursor,
+                *rng.pick(&[Mode::Prose, Mode::Code]),
+                Policy { fast_enabled: session % 2 == 0, ..Default::default() },
+                *rng.pick(&[8usize, 20, 40]),
+                *rng.pick(&[1usize, 3]),
+            );
+            let mut now = 0u64;
+            for _ in 0..12 {
+                now += 500;
+                e.capture_start(now);
+                e.level((rng.next() % 300) as f32 / 100.0 - 0.5, now);
+                if rng.next() % 3 == 0 {
+                    e.preview(rng.pick(&corpus), now);
+                }
+                let tier = *rng.pick(&tiers);
+                let conf = (rng.next() % 120) as f32 / 100.0;
+                e.recognize(tier, rng.pick(&corpus), conf, now + 300);
+                e.tick(now + 400);
+
+                // invariants
+                let t = e.text();
+                assert!(t.is_char_boundary(e.cursor()), "cursor split a char: {t:?}");
+                assert!(e.cursor() <= t.len(), "cursor past the end");
+                assert!(e.status().slot_lines >= 1);
+                assert!((0.0..=1.0).contains(&e.status().level), "level escaped its range");
+                let _ = e.status().wire();
+            }
+        }
+    }
+
+    #[test]
+    fn reseed_with_a_hostile_cursor_is_safe() {
+        let mut e = eng("");
+        e.reseed("héllo 日本", 3);
+        assert!(e.text().is_char_boundary(e.cursor()));
+        e.reseed("héllo", 9999);
+        assert_eq!(e.cursor(), "héllo".len());
+    }
+
     #[test]
     fn content_inserts_and_uses_the_buffers_identifiers() {
         let mut e = eng("fn read_to_string() {} struct UserStore {}\n");
