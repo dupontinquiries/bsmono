@@ -60,11 +60,17 @@ pub const TERRAIN_SAMPLES: usize = 64;
 /// valley.
 pub const NO_GROUND: f32 = -1.0e4;
 
-/// The ground profile across the viewport, left edge to right edge.
+/// The ground profile across the viewport, left edge to right edge, with
+/// its baked lighting.
+///
+/// One vec4 per column — `(height, sun, sky, unused)` — rather than three
+/// separate packed arrays. The shader reads all three together at every
+/// column, so interleaving costs one index calculation instead of three,
+/// and a mis-set stride can only ever be wrong in one place.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct TerrainUniforms {
-    pub heights: [[f32; 4]; TERRAIN_SAMPLES / 4],
+    pub columns: [[f32; 4]; TERRAIN_SAMPLES],
 }
 
 impl TerrainUniforms {
@@ -81,18 +87,23 @@ impl TerrainUniforms {
     /// `height_at` also returns None off the ends of the track, but it
     /// clamps to the track bounds first, so those come back as the end
     /// segment's height and never reach the None arm.
-    pub fn sample(track: &road_warrior_core::Track, car_pos_x: f32) -> Self {
-        let mut flat = [0.0f32; TERRAIN_SAMPLES];
-        for (i, slot) in flat.iter_mut().enumerate() {
+    /// `light` is the per-level bake — see `road_warrior_core::lighting`. It
+    /// is a LOOKUP here, not a trace: the rays were cast when the level
+    /// loaded, because with a fixed camera and a fixed sun the answers do
+    /// not change.
+    pub fn sample(
+        track: &road_warrior_core::Track,
+        light: &road_warrior_core::BakedLighting,
+        car_pos_x: f32,
+    ) -> Self {
+        let mut columns = [[0.0f32; 4]; TERRAIN_SAMPLES];
+        for (i, col) in columns.iter_mut().enumerate() {
             let t = i as f32 / (TERRAIN_SAMPLES - 1) as f32;
             let world_x = car_pos_x + (t - CAR_SCREEN_X) * VIEW_SPAN_WORLD;
-            *slot = track.height_at(world_x).unwrap_or(NO_GROUND);
+            let (sun, sky) = light.at(world_x);
+            *col = [track.height_at(world_x).unwrap_or(NO_GROUND), sun, sky, 0.0];
         }
-        let mut heights = [[0.0f32; 4]; TERRAIN_SAMPLES / 4];
-        for (i, chunk) in flat.chunks(4).enumerate() {
-            heights[i].copy_from_slice(chunk);
-        }
-        Self { heights }
+        Self { columns }
     }
 }
 
@@ -248,7 +259,11 @@ mod terrain_tests {
     }
 
     fn flat(t: &TerrainUniforms) -> Vec<f32> {
-        t.heights.iter().flatten().copied().collect()
+        t.columns.iter().map(|c| c[0]).collect()
+    }
+
+    fn baked(track: &Track) -> road_warrior_core::BakedLighting {
+        road_warrior_core::BakedLighting::bake(track, road_warrior_core::Sun::default(), 128)
     }
 
     #[test]
@@ -258,7 +273,7 @@ mod terrain_tests {
         // height_at(car_pos_x).
         let track = dust_bowl();
         for pos in [0.0f32, 12.0, 31.0, 33.0, 60.0] {
-            let s = flat(&TerrainUniforms::sample(&track, pos));
+            let s = flat(&TerrainUniforms::sample(&track, &baked(&track), pos));
             let idx = (CAR_SCREEN_X * (TERRAIN_SAMPLES - 1) as f32).round() as usize;
             let want = track.height_at(pos).unwrap_or(0.0);
             assert!(
@@ -278,13 +293,13 @@ mod terrain_tests {
         let lead = (1.0 - CAR_SCREEN_X) * VIEW_SPAN_WORLD;
         assert!(lead > 20.0, "the viewport should see well ahead; got {lead}");
 
-        let early = flat(&TerrainUniforms::sample(&track, 5.0));
+        let early = flat(&TerrainUniforms::sample(&track, &baked(&track), 5.0));
         assert!(
             early.iter().all(|h| h.abs() < 0.01),
             "at x=5 nothing but flat ground is in view yet"
         );
 
-        let approaching = flat(&TerrainUniforms::sample(&track, 20.0));
+        let approaching = flat(&TerrainUniforms::sample(&track, &baked(&track), 20.0));
         let peak = approaching.iter().cloned().fold(f32::MIN, f32::max);
         assert!(peak > 1.0, "at x=20 the ramp should be visible ahead; peak {peak}");
         // The rise must be AHEAD of the car, not behind. Comparing the last
@@ -310,7 +325,7 @@ mod terrain_tests {
         // appearing at the far edge. A screenshot caught it.
         let track = dust_bowl();
         assert_eq!(track.height_at(42.0), None, "x=42 is inside the gap");
-        let s = flat(&TerrainUniforms::sample(&track, 42.0));
+        let s = flat(&TerrainUniforms::sample(&track, &baked(&track), 42.0));
         let idx = (CAR_SCREEN_X * (TERRAIN_SAMPLES - 1) as f32).round() as usize;
         assert!(s[idx] < -100.0, "the gap must sample as NO_GROUND, got {}", s[idx]);
     }
@@ -321,7 +336,7 @@ mod terrain_tests {
         // so it has to be at x=38 and not somewhere else.
         let track = dust_bowl();
         let car = 38.0; // standing right at the lip
-        let s = flat(&TerrainUniforms::sample(&track, car));
+        let s = flat(&TerrainUniforms::sample(&track, &baked(&track), car));
         for (i, h) in s.iter().enumerate() {
             let t = i as f32 / (TERRAIN_SAMPLES - 1) as f32;
             let world_x = car + (t - CAR_SCREEN_X) * VIEW_SPAN_WORLD;
@@ -343,7 +358,7 @@ mod terrain_tests {
         // test passed while believing it was exercising the None path.
         let track = dust_bowl();
         assert_eq!(track.height_at(-5.0), Some(0.0), "height_at clamps, it does not return None");
-        let s = flat(&TerrainUniforms::sample(&track, 0.0));
+        let s = flat(&TerrainUniforms::sample(&track, &baked(&track), 0.0));
         assert!(s[0].abs() < 0.01, "behind the start it matches the first flat segment");
     }
 
@@ -356,7 +371,7 @@ mod terrain_tests {
             "Ascending",
             vec![Segment::Ramp { length: 100.0, from_height: 0.0, to_height: 50.0 }],
         );
-        let s = flat(&TerrainUniforms::sample(&track, 50.0));
+        let s = flat(&TerrainUniforms::sample(&track, &baked(&track), 50.0));
         for w in s.windows(2) {
             assert!(w[1] >= w[0] - 1e-3, "a monotonic ramp must sample monotonically: {s:?}");
         }

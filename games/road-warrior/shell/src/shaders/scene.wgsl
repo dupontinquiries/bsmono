@@ -43,20 +43,39 @@ var<uniform> u: Uniforms;
 // was invisible, and a screenshot of a running session is what made that
 // obvious.
 struct Terrain {
-    heights: array<vec4<f32>, 16>,
+    // Per viewport column: (height, sun visibility, sky openness, unused).
+    // The last two are BAKED — traced once when the level loaded, because
+    // the camera is fixed and the sun does not move, so they are properties
+    // of the terrain and not of the frame.
+    cols: array<vec4<f32>, 64>,
 };
 @group(0) @binding(1)
 var<uniform> terrain: Terrain;
 
 /// Ground height in world units at a horizontal screen position.
-fn ground_height(x: f32) -> f32 {
+fn ground_column(x: f32) -> vec4<f32> {
     let t = clamp(x, 0.0, 1.0) * 63.0;
     let i0 = u32(floor(t));
     let i1 = min(i0 + 1u, 63u);
-    let f = t - floor(t);
-    let h0 = terrain.heights[i0 / 4u][i0 % 4u];
-    let h1 = terrain.heights[i1 / 4u][i1 % 4u];
-    return mix(h0, h1, f);
+    return mix(terrain.cols[i0], terrain.cols[i1], t - floor(t));
+}
+
+fn ground_height(x: f32) -> f32 {
+    return ground_column(x).x;
+}
+
+/// Terrain surface normal from the height gradient, in screen space.
+///
+/// Finite differences across one column each way. This is what makes a ramp
+/// face read as tilted toward or away from the sun instead of being a flat
+/// wash of colour at the same brightness as the ground beside it.
+fn ground_normal(x: f32) -> vec2<f32> {
+    let d = 1.0 / 63.0;
+    let hl = ground_height(x - d);
+    let hr = ground_height(x + d);
+    // dy/dx in world units per column; the 2*d*span converts to a slope.
+    let slope = (hr - hl) * 0.5;
+    return normalize(vec2<f32>(-slope, 1.0));
 }
 
 struct VertexOut {
@@ -110,6 +129,14 @@ fn dust(uv: vec2<f32>, scroll: f32) -> f32 {
     return v;
 }
 
+/// Direction toward the sun in SCREEN space, matching
+/// `road_warrior_core::lighting::Sun::default` — ahead and to the right of
+/// the driver, so shadows fall back toward the camera where they can be
+/// seen. If one of these changes the other has to.
+const SUN_DIR = vec2<f32>(0.55, 0.84);
+const SUN_COLOR = vec3<f32>(1.05, 0.95, 0.80);
+const SKY_COLOR = vec3<f32>(0.55, 0.62, 0.78);
+
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let uv = in.uv;
@@ -128,7 +155,11 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let base_line = 0.62 - 0.05;
     let v_scale = 0.02;
     // Surface at this column, and at the car's column for the sky split.
-    let raw_h = ground_height(uv.x);
+    let col = ground_column(uv.x);
+    let raw_h = col.x;
+    // Baked, not traced: see the Terrain struct.
+    let sun_vis = col.y;
+    let sky_open = col.z;
     // A Gap samples as NO_GROUND (-1e4) on the CPU side. Drawing it as a
     // surface at that depth would fill the column with ground; drawing no
     // ground at all is what makes the pit read as a pit, with the walls
@@ -140,8 +171,23 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     if (has_ground && uv.y < surface) {
         let ground_t = uv.y / max(surface, 0.001);
         let dirt_noise = noise(uv * vec2<f32>(40.0 * aspect, 40.0) + vec2<f32>(u.car_x * 2.0, 0.0));
-        let base = mix(vec3<f32>(0.20, 0.15, 0.11), vec3<f32>(0.36, 0.28, 0.20), ground_t);
-        color = base + vec3<f32>(dirt_noise * 0.06);
+        let albedo = mix(vec3<f32>(0.20, 0.15, 0.11), vec3<f32>(0.36, 0.28, 0.20), ground_t)
+            + vec3<f32>(dirt_noise * 0.06);
+
+        // Direct sun, gated by the baked visibility and by how the surface
+        // faces. Both matter: a slope can face the sun and still be in the
+        // shadow of the ridge above it.
+        let n = ground_normal(uv.x);
+        let ndotl = max(dot(n, SUN_DIR), 0.0);
+        let direct = SUN_COLOR * (ndotl * sun_vis);
+        // Sky fill, scaled by how much hemisphere this column can see. This
+        // is the term that darkens the floor of a pit at noon.
+        let ambient = SKY_COLOR * (0.35 * sky_open);
+        color = albedo * (direct + ambient);
+
+        // Depth into the ground darkens, so a tall cut face does not read
+        // as uniformly bright rock all the way down.
+        color *= mix(0.45, 1.0, clamp(ground_t, 0.0, 1.0));
     } else {
         // Sky gradient still keys off the FIXED horizon, not the surface:
         // gradients that follow the terrain make the sky appear to slide up

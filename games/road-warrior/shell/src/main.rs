@@ -11,7 +11,7 @@ mod render;
 mod save;
 
 use eframe::egui_wgpu;
-use road_warrior_core::{campaign, encounter, Boss, CarKind, Campaign, SaveState, Track, Vehicle};
+use road_warrior_core::{campaign, encounter, BakedLighting, Boss, CarKind, Campaign, SaveState, Sun, Track, Vehicle};
 use gyro::GyroTilt;
 use render::{SceneCallback, SceneResources, SceneUniforms, TerrainUniforms};
 
@@ -33,6 +33,13 @@ const FIXED_DT: f32 = 1.0 / 60.0;
 /// up. Four means a frame as slow as 66ms still simulates in real time.
 const MAX_STEPS_PER_FRAME: u32 = 4;
 
+/// Samples in the baked lighting field, over the whole track.
+///
+/// 256 across an 88-unit level is a sample every ~0.34 units, finer than
+/// the 64 columns the viewport shows, so the shader's interpolation is
+/// never the limiting factor. The bake is a few milliseconds at level load.
+const LIGHT_SAMPLES: usize = 256;
+
 struct RoadWarriorApp {
     vehicle: Vehicle,
     track: Track,
@@ -41,6 +48,11 @@ struct RoadWarriorApp {
     save: SaveState,
     tilt: GyroTilt,
     throttle: f32,
+    /// Rays traced once when the level loaded. The camera is fixed and the
+    /// sun does not move, so per-column sun visibility and sky openness are
+    /// properties of the terrain alone — tracing them every frame would
+    /// recompute identical numbers sixty times a second.
+    light: BakedLighting,
     /// Unspent real time, carried between frames so slow frames do not lose
     /// it. See the accumulator in `update`.
     accumulator: f32,
@@ -137,6 +149,7 @@ impl RoadWarriorApp {
 
         Self {
             vehicle,
+            light: BakedLighting::bake(&track, Sun::default(), LIGHT_SAMPLES),
             track,
             boss,
             campaign,
@@ -186,6 +199,9 @@ impl RoadWarriorApp {
                     b.max_health = 10.0;
                 }
             }
+            // Trace the level's lighting once, here, where the track
+            // changes — not per frame.
+            self.light = BakedLighting::bake(&track, Sun::default(), LIGHT_SAMPLES);
             self.track = track;
             self.boss = boss;
             self.vehicle.pos_x = 0.0;
@@ -418,7 +434,7 @@ impl eframe::App for RoadWarriorApp {
 
             // Sampled per frame from the live track, so the ground the
             // shader draws is the ground the physics is using.
-            let terrain = TerrainUniforms::sample(&self.track, self.vehicle.pos_x);
+            let terrain = TerrainUniforms::sample(&self.track, &self.light, self.vehicle.pos_x);
 
             ui.painter().add(egui_wgpu::Callback::new_paint_callback(
                 rect,
