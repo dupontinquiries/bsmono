@@ -328,6 +328,38 @@ impl<P: Payload> Workspace<P> {
         }
     }
 
+    /// Build from parts. For an app whose own persistence format
+    /// differs from `snapshot_with` — voiceterm's, for instance, stores
+    /// tree SHAPE only and respawns PTYs on restore, so it reassigns
+    /// ids rather than preserving them.
+    ///
+    /// `next_pane_id` is raised past every id present, so a caller
+    /// cannot accidentally hand back a value that collides with the
+    /// tabs it just built.
+    pub fn from_parts(tabs: Vec<Tab<P>>, active_tab: usize, next_pane_id: u64) -> Option<Self> {
+        if tabs.is_empty() {
+            return None;
+        }
+        let max_id = tabs.iter().flat_map(|t| t.root.pane_ids()).max().unwrap_or(0);
+        Some(Workspace {
+            active_tab: active_tab.min(tabs.len() - 1),
+            next_pane_id: next_pane_id.max(max_id + 1),
+            tabs,
+            order_mode: TabOrderMode::Sticky,
+            fences: BTreeSet::new(),
+            use_tick: 0,
+            undo_stack: Vec::new(),
+        })
+    }
+
+    /// Reserve a pane id without creating a pane. For a caller building
+    /// a tree itself (a restore path, a layout template).
+    pub fn alloc_pane_id(&mut self) -> u64 {
+        let id = self.next_pane_id;
+        self.next_pane_id += 1;
+        id
+    }
+
     pub fn active(&self) -> &Tab<P> {
         &self.tabs[self.active_tab]
     }
@@ -421,13 +453,22 @@ impl<P: Payload> Workspace<P> {
         }
     }
 
-    /// First tab whose name contains `query`, case-insensitively.
+    /// Find a tab by name for "switch to <name>": exact match first,
+    /// then prefix, then substring.
+    ///
+    /// The three-tier order matters. Plain substring would make a tab
+    /// called "log" unreachable whenever "build-logs" sorts earlier, and
+    /// the exact name is the one the user typed or spoke deliberately.
     pub fn find_tab(&self, query: &str) -> Option<usize> {
         let q = query.trim().to_lowercase();
         if q.is_empty() {
             return None;
         }
-        self.tabs.iter().position(|t| t.name.to_lowercase().contains(&q))
+        self.tabs
+            .iter()
+            .position(|t| t.name.to_lowercase() == q)
+            .or_else(|| self.tabs.iter().position(|t| t.name.to_lowercase().starts_with(&q)))
+            .or_else(|| self.tabs.iter().position(|t| t.name.to_lowercase().contains(&q)))
     }
 
     fn stamp_active(&mut self) {
@@ -587,24 +628,45 @@ impl<P: Payload> Workspace<P> {
         id
     }
 
-    /// Close the focused pane. Returns its id if it was removed. Never
-    /// removes a tab's last pane — closing that is `close_tab`.
+    /// Close the focused pane.
+    ///
+    /// When it is the tab's LAST pane the tab closes instead — a tab
+    /// with no panes is not a state the model should be able to reach,
+    /// and "close pane" on a single-pane tab obviously means close the
+    /// tab. The very last pane of the very last tab is refused.
     pub fn close_pane(&mut self) -> Option<u64> {
         let target = self.active().focused_pane;
+        if self.active().root.count() <= 1 {
+            if self.tabs.len() > 1 {
+                self.close_tab();
+                return Some(target);
+            }
+            return None;
+        }
         self.close_pane_id(target).then_some(target)
     }
 
-    /// Close a pane by id, in the active tab.
+    /// Close a pane by id, in ANY tab. Won't remove a tab's last pane —
+    /// use `close_pane` for the cascade to `close_tab`.
+    ///
+    /// Searching every tab rather than the active one is what lets a
+    /// caller close a pane it holds a resource for without first
+    /// navigating to it — a web pane that is never focused, or a
+    /// document another user closed.
     pub fn close_pane_id(&mut self, id: u64) -> bool {
-        let tab = self.active_mut();
-        if !tab.root.remove_leaf(id) {
-            return false;
+        for t in self.tabs.iter_mut() {
+            if t.root.remove_leaf(id) {
+                // Refocus if we just removed the focused pane. The
+                // original left focused_pane dangling at a removed id;
+                // every later focus/resize call then silently no-ops
+                // because the lookup misses.
+                if t.focused_pane == id {
+                    t.focused_pane = t.root.pane_ids().first().copied().unwrap_or(0);
+                }
+                return true;
+            }
         }
-        if tab.focused_pane == id {
-            // focus the first survivor rather than leaving a dangling id
-            tab.focused_pane = tab.root.pane_ids().first().copied().unwrap_or(0);
-        }
-        true
+        false
     }
 
     pub fn payload(&self, id: u64) -> Option<&P> {
@@ -966,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    fn the_last_pane_in_a_tab_cannot_be_closed() {
+    fn the_last_pane_of_the_last_tab_cannot_be_closed() {
         let mut w = ws();
         assert!(!w.close_pane_id(0));
         assert_eq!(w.close_pane(), None);
@@ -1049,6 +1111,59 @@ mod tests {
         let mut w = ws();
         w.split(Dir::Right); // an H split
         assert!(!w.resize(Dir::Up, 0.1), "a vertical resize has no V split to act on");
+    }
+
+    #[test]
+    fn find_tab_prefers_exact_then_prefix_then_substring() {
+        let mut w = ws();
+        w.rename_tab("build-logs");
+        w.new_tab();
+        w.rename_tab("log");
+        w.new_tab();
+        w.rename_tab("logging");
+        // exact beats the earlier substring match
+        assert_eq!(w.find_tab("log"), Some(1));
+        // prefix beats substring
+        assert_eq!(w.find_tab("logg"), Some(2));
+        // substring is the last resort
+        assert_eq!(w.find_tab("build"), Some(0));
+    }
+
+    #[test]
+    fn closing_the_last_pane_of_a_tab_closes_the_tab() {
+        let mut w = ws();
+        w.new_tab();
+        assert_eq!(w.tabs.len(), 2);
+        assert!(w.close_pane().is_some());
+        assert_eq!(w.tabs.len(), 1, "a tab with no panes is unreachable by construction");
+        // but not the very last pane of the very last tab
+        assert_eq!(w.close_pane(), None);
+    }
+
+    #[test]
+    fn close_pane_id_reaches_other_tabs() {
+        let mut w = ws();
+        w.new_tab();
+        let far = w.split(Dir::Right);
+        w.active_tab = 0;
+        assert!(w.close_pane_id(far), "a caller holding a resource should not have to navigate");
+        assert_eq!(w.total_panes(), 2);
+    }
+
+    #[test]
+    fn closing_a_focused_pane_in_another_tab_refocuses_it() {
+        // the original left focused_pane dangling here, so every later
+        // focus/resize on that tab silently no-opped
+        let mut w = ws();
+        w.new_tab();
+        let focused = w.split(Dir::Right);
+        assert_eq!(w.tabs[1].focused_pane, focused);
+        w.active_tab = 0;
+        assert!(w.close_pane_id(focused));
+        assert!(
+            w.tabs[1].root.pane_ids().contains(&w.tabs[1].focused_pane),
+            "focus must point at a pane that exists"
+        );
     }
 
     #[test]
@@ -1242,6 +1357,26 @@ mod tests {
             Some(p) => Kind::Doc(p.into()),
             None => Kind::Blank,
         })
+    }
+
+    #[test]
+    fn from_parts_raises_next_id_past_what_it_was_given() {
+        let tabs = vec![Tab {
+            name: "t".into(),
+            root: Node::Split {
+                orient: Orient::H,
+                ratio: 0.5,
+                a: Box::new(Node::Pane { id: 7, payload: Kind::Blank }),
+                b: Box::new(Node::Pane { id: 9, payload: Kind::Blank }),
+            },
+            focused_pane: 7,
+            pinned: false,
+            last_used: 0,
+        }];
+        // a caller passing a stale next id must not get a collision
+        let mut w = Workspace::from_parts(tabs, 0, 0).unwrap();
+        assert_eq!(w.alloc_pane_id(), 10);
+        assert!(Workspace::<Kind>::from_parts(Vec::new(), 0, 0).is_none());
     }
 
     #[test]

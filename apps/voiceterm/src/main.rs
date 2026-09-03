@@ -235,6 +235,11 @@ mod node_id;
 mod layered_layout;
 // v0.1.743: native terminal tabs + pane split-tree + voice ops.
 mod terminal_workspace;
+// The layout model now lives in shared/pane-kit; voiceterm's own pane
+// operations (web panes, the QML wire format, the shape-only session
+// snapshot) hang off an extension trait, which has to be in scope for
+// them to resolve as methods.
+use terminal_workspace::TermPanes as _;
 // v0.1.750: cheap cross-layer event signaling (lock-free bitmask).
 mod event_signal;
 // v0.1.758: subgraph group bounding boxes for the renderer.
@@ -6247,7 +6252,7 @@ Rectangle {{\nwidth: 220; height: 36; radius: 18\ncolor: _openExtSpaMa.containsM
     fn restore_term_layout(&mut self) {
         let Some(p) = Self::term_layout_path() else { return };
         let Ok(text) = std::fs::read_to_string(&p) else { return };
-        let Some(ws) = crate::terminal_workspace::TermWorkspace::restore(&text) else {
+        let Some(ws) = crate::terminal_workspace::restore(&text) else {
             crate::clog!("workspaces", "term layout restore: malformed, keeping default");
             return;
         };
