@@ -478,6 +478,89 @@ mod tests {
         );
     }
 
+    /// Prose dictation fixtures. The code fixtures said nothing about
+    /// this half, and prose fails differently: whisper's per-utterance
+    /// capitalization, its punctuation guesses, and sentence boundaries
+    /// hidden behind closing marks.
+    ///
+    /// First run scored 10/12 and found a real bug (a closing quote hid
+    /// the period behind it) plus one decision that measuring reversed
+    /// (lowercased proper nouns).
+    #[test]
+    fn prose_dictation_fixtures() {
+        let cases: &[(&str, &[&str], &str)] = &[
+            (
+                "plain continuation",
+                &["the quick brown fox", "Jumped over the lazy dog"],
+                "the quick brown fox jumped over the lazy dog",
+            ),
+            ("sentence boundary", &["She left.", "Then it rained."], "She left. Then it rained."),
+            (
+                "closing quote hides the period",
+                &["He said \"hello.\"", "Then he left."],
+                "He said \"hello.\" Then he left.",
+            ),
+            (
+                "abbreviation mid-sentence",
+                &["We saw Dr.", "Smith at the clinic."],
+                "We saw Dr. Smith at the clinic.",
+            ),
+            (
+                "etc mid-sentence",
+                &["We brought food, drinks, etc.", "And a tent."],
+                "We brought food, drinks, etc. And a tent.",
+            ),
+            (
+                "closing paren then continue",
+                &["It rained (a lot)", "Which ruined the trip."],
+                "It rained (a lot) which ruined the trip.",
+            ),
+            (
+                "comma continuation",
+                &["Because it rained,", "We stayed inside."],
+                "Because it rained, we stayed inside.",
+            ),
+            (
+                "proper noun keeps its capital",
+                &["we flew to", "Paris in the spring"],
+                "we flew to Paris in the spring",
+            ),
+            (
+                "acronym continuation",
+                &["the server uses", "HTTP for everything"],
+                "the server uses HTTP for everything",
+            ),
+            ("question then answer", &["Did it work?", "Yes, mostly."], "Did it work? Yes, mostly."),
+            (
+                "numeric continuation",
+                &["we tried", "3 different approaches"],
+                "we tried 3 different approaches",
+            ),
+            ("the pronoun I", &["yesterday", "I went home"], "yesterday I went home"),
+        ];
+
+        let mut failures = Vec::new();
+        for (name, say, want) in cases {
+            let mut e = Engine::new("", 0, Mode::Prose, Policy::default(), 40, 3);
+            let mut t = 0u64;
+            for u in *say {
+                e.capture_start(t);
+                e.recognize(Tier::Whisper, u, 1.0, t + 300);
+                t += 1000;
+            }
+            if e.text() != *want {
+                failures.push(format!("\n  {}\n    want {:?}\n    got  {:?}", name, want, e.text()));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {} prose fixtures regressed:{}",
+            failures.len(),
+            cases.len(),
+            failures.join("")
+        );
+    }
+
     /// The same fixtures, degraded the way whisper actually degrades
     /// them. This is the robustness half of the measurement: the clean
     /// fixtures say the transform is right, these say whether it

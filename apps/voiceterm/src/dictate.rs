@@ -737,7 +737,8 @@ impl BufferSink {
                     let pos = self.resolve(at);
                     let sep = self.spacer(pos);
                     let body = if self.mode == Mode::Prose {
-                        decapitalize_continuation(text, self.preceding(pos))
+                        let ctx = self.text.clone();
+                        decapitalize_continuation_in(text, self.preceding(pos), &ctx)
                     } else {
                         text.clone()
                     };
@@ -851,7 +852,10 @@ impl BufferSink {
             .chars()
             .rev()
             .take_while(|c| *c != '\n')
-            .find(|c| !c.is_whitespace())
+            // Skip closing marks so the terminator behind them is
+            // found: `He said "hello."` ends in a quote, but the
+            // sentence ended at the period.
+            .find(|c| !c.is_whitespace() && !matches!(c, '"' | '\'' | ')' | ']' | '}' | '»' | '”' | '’'))
     }
 
     fn resolve(&self, at: &Placement) -> usize {
@@ -901,24 +905,77 @@ pub fn floor_char_boundary(s: &str, i: usize) -> usize {
     i
 }
 
+/// Words common enough that a capital on them at the start of a
+/// continuation is whisper's doing, not the speaker's.
+///
+/// Chosen for the position they occupy: the first word of a phrase that
+/// continues a sentence. That is overwhelmingly a pronoun, auxiliary,
+/// preposition, conjunction, determiner, or a very frequent verb.
+const COMMON_LEADING: &[&str] = &[
+    "a", "about", "after", "again", "against", "all", "almost", "along", "already", "also",
+    "although", "always", "among", "an", "and", "another", "any", "anything", "are", "around",
+    "as", "at", "back", "be", "became", "because", "become", "been", "before", "began", "being",
+    "below", "besides", "best", "better", "between", "both", "but", "by", "came", "can", "cannot",
+    "come", "comes", "could", "did", "do", "does", "doing", "done", "down", "during", "each",
+    "either", "else", "enough", "even", "ever", "every", "except", "far", "few", "finally",
+    "first", "for", "found", "from", "further", "gave", "get", "gets", "getting", "give", "given",
+    "go", "goes", "going", "gone", "got", "had", "has", "have", "having", "he", "held", "her",
+    "here", "hers", "him", "his", "how", "however", "if", "in", "instead", "into", "is", "it",
+    "its", "just", "keep", "kept", "knew", "know", "known", "last", "later", "least", "leave",
+    "left", "less", "let", "like", "likely", "made", "make", "makes", "making", "many", "may",
+    "maybe", "me", "meant", "might", "more", "most", "much", "must", "my", "near", "need",
+    "needs", "neither", "never", "next", "no", "none", "nor", "not", "nothing", "now", "of",
+    "off", "often", "on", "once", "one", "only", "onto", "or", "other", "others", "our", "out",
+    "over", "own", "part", "past", "perhaps", "put", "quite", "rather", "really", "right", "run",
+    "said", "same", "saw", "say", "says", "see", "seem", "seemed", "seems", "seen", "several",
+    "shall", "she", "should", "since", "so", "some", "something", "soon", "still", "such",
+    "take", "taken", "takes", "than", "that", "the", "their", "them", "then", "there",
+    "therefore", "these", "they", "thing", "things", "think", "this", "those", "though",
+    "through", "thus", "to", "together", "too", "took", "toward", "towards", "under", "until",
+    "up", "upon", "us", "use", "used", "using", "usually", "very", "want", "wanted", "was",
+    "way", "we", "well", "went", "were", "what", "when", "where", "whether", "which", "while",
+    "who", "whom", "whose", "why", "will", "with", "within", "without", "won", "would", "yet",
+    "you", "your", "yours",
+    // frequent verb forms that plausibly start a continuation
+    "added", "asked", "broke", "brought", "built", "called", "carried", "changed", "closed",
+    "cost", "covered", "cut", "decided", "dropped", "ended", "failed", "fell", "filled",
+    "followed", "grew", "happened", "hit", "jumped", "kicked", "landed", "lay", "led", "lived",
+    "looked", "lost", "moved", "opened", "passed", "played", "pulled", "pushed", "raised",
+    "reached", "read", "returned", "rose", "sat", "sent", "set", "showed", "shut", "sold",
+    "spent", "started", "stayed", "stood", "stopped", "talked", "told", "touched", "tried",
+    "turned", "walked", "wrote",
+];
+
 /// Drop the stray capital whisper puts on every utterance's first word
 /// when the utterance is CONTINUING a sentence.
 ///
-/// Whisper transcribes each burst independently, so "the quick brown
-/// fox" followed by "jumped over" arrives as "Jumped over" and the
-/// buffer reads "the quick brown fox Jumped over". Lowering it is right
-/// far more often than wrong.
+/// Whisper transcribes each burst independently and capitalizes each
+/// one, so "the quick brown fox" followed by "jumped over" arrives as
+/// "Jumped over".
 ///
-/// When it IS wrong the word is a proper noun, and the fix is one short
-/// utterance away — `repair::Repair::Capitalize` acts on exactly this
-/// unit. That asymmetry is the whole argument: a stray capital every
-/// other sentence is a constant tax, a lowered proper noun is
-/// occasional and already has a one-phrase undo.
+/// **Only words that are plausibly whisper's doing get lowered.** An
+/// earlier version lowered ANY leading capital and accepted lowercased
+/// proper nouns as the cost, on the theory that `Repair::Capitalize`
+/// was one phrase away. Measuring prose fixtures changed my mind: "we
+/// flew to Paris" became "we flew to paris", and a lowercased proper
+/// noun is a factual error in the text, while a stray capital on an
+/// uncommon word is cosmetic. The failure mode should be the cosmetic
+/// one.
 ///
-/// Left alone: anything after a sentence terminator or at the start of
-/// a line, all-caps words (acronyms), and words with internal capitals
-/// (`GitHub`, `iPhone`), which are never whisper's doing.
+/// So a capital is dropped only if the word is in `COMMON_LEADING` or
+/// already appears in lowercase elsewhere in `context` — the second
+/// clause catching domain vocabulary no fixed list can know about.
+///
+/// Left alone regardless: anything after a sentence terminator or at the
+/// start of a line, all-caps words (acronyms), internal capitals
+/// (GitHub), and "I".
 pub fn decapitalize_continuation(text: &str, preceding: Option<char>) -> String {
+    decapitalize_continuation_in(text, preceding, "")
+}
+
+/// As above, with the surrounding document available so a capitalized
+/// word can be checked against its own lowercase use elsewhere.
+pub fn decapitalize_continuation_in(text: &str, preceding: Option<char>, context: &str) -> String {
     let continuing = match preceding {
         None => false,
         Some(c) => !matches!(c, '.' | '!' | '?' | ':' | ';'),
@@ -941,10 +998,25 @@ pub fn decapitalize_continuation(text: &str, preceding: Option<char>) -> String 
         return text.to_string();
     }
     let lowered = f.to_lowercase().collect::<String>() + &tail;
+    // Linear scan: ~250 entries, once per utterance, against a ~1200ms
+    // recognizer. Sorting for a binary search would be a false economy
+    // and the list would silently rot out of order.
+    let known =
+        COMMON_LEADING.contains(&lowered.as_str()) || appears_lowercase(context, &lowered);
+    if !known {
+        return text.to_string();
+    }
     match rest {
         Some(r) => format!("{lowered} {r}"),
         None => lowered,
     }
+}
+
+/// Whether `word` occurs, lowercase and whole, in `context`.
+fn appears_lowercase(context: &str, word: &str) -> bool {
+    context
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|t| t == word)
 }
 
 /// Sink B: a modal editor owns the document; we can only send bytes.
@@ -1308,13 +1380,45 @@ mod tests {
     }
 
     #[test]
-    fn a_lowered_proper_noun_is_one_repair_away() {
-        // the acknowledged failure mode, and its escape hatch
+    fn a_proper_noun_keeps_its_capital() {
+        // The reversal. An earlier version lowered any leading capital
+        // and treated "we flew to paris" as an acceptable cost because
+        // Repair::Capitalize was one phrase away. A lowercased proper
+        // noun is a factual error in the text; a stray capital on an
+        // uncommon word is cosmetic. Prefer the cosmetic failure.
         let mut b = BufferSink::new("we flew to", 10).with_mode(Mode::Prose);
         b.apply(&plan(&segment("Paris"), Mode::Prose, Placement::Cursor));
-        assert_eq!(b.text, "we flew to paris");
-        assert!(b.repair(&Repair::Capitalize));
         assert_eq!(b.text, "we flew to Paris");
+    }
+
+    #[test]
+    fn a_common_word_still_loses_it() {
+        let mut b = BufferSink::new("the quick brown fox", 19).with_mode(Mode::Prose);
+        b.apply(&plan(&segment("Jumped over"), Mode::Prose, Placement::Cursor));
+        assert_eq!(b.text, "the quick brown fox jumped over");
+    }
+
+    #[test]
+    fn a_closing_quote_does_not_hide_the_sentence_end() {
+        let mut b = BufferSink::new("He said \"hello.\"", 16).with_mode(Mode::Prose);
+        b.apply(&plan(&segment("Then he left."), Mode::Prose, Placement::Cursor));
+        assert_eq!(b.text, "He said \"hello.\" Then he left.");
+    }
+
+    #[test]
+    fn domain_vocabulary_is_learned_from_the_document() {
+        // no fixed list can know "refactoring" belongs here, but the
+        // document already uses it in lowercase
+        let ctx = "we spent the week refactoring the parser";
+        assert_eq!(
+            decapitalize_continuation_in("Refactoring again", Some('r'), ctx),
+            "refactoring again"
+        );
+        // and without that evidence it keeps the capital
+        assert_eq!(
+            decapitalize_continuation_in("Refactoring again", Some('r'), ""),
+            "Refactoring again"
+        );
     }
 
     #[test]
