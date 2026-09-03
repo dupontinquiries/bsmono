@@ -67,6 +67,10 @@ struct Finding {
     /// the vehicle pose. The question this answers: would running the
     /// stowing machinery the codebase already has actually hide the robot?
     exposure_packed: f32,
+    /// Exposure if each limb's shift is chosen to minimise VISIBLE limb
+    /// samples instead of axis-aligned overhang. An experiment, not a
+    /// shipped path — see `silhouette_shift`.
+    exposure_silhouette: f32,
 }
 
 /// Slab test: does the ray from `o` along `d` meet the box at a positive
@@ -165,6 +169,7 @@ fn audit(pose_dirs: &[PathBuf]) -> Option<Finding> {
         contain_regress: 0.0,
         exposure: 0.0,
         exposure_packed: 0.0,
+        exposure_silhouette: 0.0,
     };
     for (p, row) in offsets.iter().enumerate() {
         let anchor = row[0].max(row[STEPS - 1]);
@@ -328,6 +333,89 @@ fn audit(pose_dirs: &[PathBuf]) -> Option<Finding> {
 
             worst.exposure = measure(&raw);
             worst.exposure_packed = measure(&packed);
+
+            // THE EXPERIMENT: optimise the objective we actually want.
+            //
+            // `fold_pack` minimises each limb's axis-aligned overhang
+            // against an envelope. What the eye judges is whether the limb
+            // sits inside the vehicle's SILHOUETTE. Those differ, and the
+            // difference is why packing trades limbs overlapping the hull
+            // for limbs on the outline — fewer visible samples, more
+            // noticeable ones.
+            //
+            // Here each limb keeps `fold_pack`'s hinge but picks its shift
+            // by direct search: candidates along the direction of the core
+            // centre at several magnitudes, scored by how many of that
+            // limb's samples the depth test still finds visible. Coarse
+            // and slow, and that is fine — the question is whether the
+            // objective is worth changing, not how to implement it well.
+            let hull_depth = {
+                let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+                for i in 0..t0_own.len() {
+                    for p in raw(i) {
+                        lo = lo.min(p);
+                        hi = hi.max(p);
+                    }
+                }
+                (lo, hi)
+            };
+            let mut chosen: Vec<Vec3> = vec![Vec3::ZERO; t0_own.len()];
+            for limb in &sk.limbs {
+                let toward = (sk.core_centre - limb.tip).normalize_or_zero();
+                let reach = limb.reach.max(1e-3);
+                let mut best = (f32::MAX, Vec3::ZERO);
+                for k in 0..9 {
+                    let cand = toward * (reach * k as f32 * 0.125);
+                    // Score: visible samples of THIS limb under that shift.
+                    let mut vis = 0usize;
+                    let (lo, hi) = hull_depth;
+                    let size = (hi - lo).max(Vec3::splat(1e-4));
+                    const G: usize = 48;
+                    for (ua, va, da) in [(0usize, 1usize, 2usize), (2, 1, 0), (0, 2, 1)] {
+                        let mut hull = vec![f32::MAX; G * G];
+                        for i in 0..t0_own.len() {
+                            if limb_prims.contains(&i) {
+                                continue;
+                            }
+                            for p in raw(i) {
+                                let u = (((p[ua] - lo[ua]) / size[ua]) * (G - 1) as f32) as usize;
+                                let v = (((p[va] - lo[va]) / size[va]) * (G - 1) as f32) as usize;
+                                let c = &mut hull[v.min(G - 1) * G + u.min(G - 1)];
+                                *c = c.min(p[da]);
+                            }
+                        }
+                        for i in &limb.prims {
+                            let pts = raw(*i);
+                            let stride = (pts.len() / 24).max(1);
+                            for p0 in pts.iter().step_by(stride) {
+                                let st = steps.get(*i).copied().unwrap_or_default();
+                                let p = st.pivot + st.rot * (*p0 - st.pivot) + cand;
+                                let u = (((p[ua] - lo[ua]) / size[ua]) * (G - 1) as f32) as usize;
+                                let v = (((p[va] - lo[va]) / size[va]) * (G - 1) as f32) as usize;
+                                if hull[v.min(G - 1) * G + u.min(G - 1)] > p[da] - 1e-3 {
+                                    vis += 1;
+                                }
+                            }
+                        }
+                    }
+                    if (vis as f32) < best.0 {
+                        best = (vis as f32, cand);
+                    }
+                }
+                for i in &limb.prims {
+                    if let Some(slot) = chosen.get_mut(*i) {
+                        *slot = best.1;
+                    }
+                }
+            }
+            worst.exposure_silhouette = measure(&|i| {
+                let st = steps.get(i).copied().unwrap_or_default();
+                let extra = chosen.get(i).copied().unwrap_or(Vec3::ZERO);
+                t0_own
+                    .get(i)
+                    .map(|v| v.iter().map(|p| st.pivot + st.rot * (*p - st.pivot) + extra).collect())
+                    .unwrap_or_default()
+            });
         }
     }
 
@@ -479,6 +567,7 @@ fn main() {
     let mut isl_all: Vec<f32> = Vec::new();
     let mut exp_all: Vec<f32> = Vec::new();
     let mut expp_all: Vec<f32> = Vec::new();
+    let mut exps_all: Vec<f32> = Vec::new();
     for name in &names {
         let dir = root.join(name);
         let poses = poses_of(&dir);
@@ -491,6 +580,7 @@ fn main() {
         isl_all.push(f.island);
         exp_all.push(f.exposure);
         expp_all.push(f.exposure_packed);
+        exps_all.push(f.exposure_silhouette);
         let fe = f.worst_excursion > EXCURSION_FLAG;
         let fi = f.island > ISLAND_FLAG;
         let fc = f.contain_regress > CONTAIN_FLAG;
@@ -540,6 +630,10 @@ fn main() {
     println!(
         "packed     median {:.0}%  p10 {:.0}%  min {:.0}%   (exposure after fold_pack)",
         pct(&mut expp_all, 0.5) * 100.0, pct(&mut expp_all, 0.1) * 100.0, pct(&mut expp_all, 0.0) * 100.0
+    );
+    println!(
+        "silhouette median {:.0}%  p10 {:.0}%  min {:.0}%   (shift chosen to minimise visible samples)",
+        pct(&mut exps_all, 0.5) * 100.0, pct(&mut exps_all, 0.1) * 100.0, pct(&mut exps_all, 0.0) * 100.0
     );
     println!(
         "island     median {:.2}  p90 {:.2}  max {:.2}",
