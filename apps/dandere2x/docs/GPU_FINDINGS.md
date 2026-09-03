@@ -283,6 +283,24 @@ elsewhere.
 Both are bit-identical, not approximations: the per-element accumulation order
 is still ic, then ky, then kx, which the exact numpy-reference tests confirm.
 
+**Register-blocking the output columns made it 1.4–1.7x SLOWER** and was
+reverted. The reasoning looked sound — the conv does a load-modify-store per
+output element for each of the 9 x in_ch taps, so accumulating a chunk of the
+row in registers across all taps should remove that traffic. Measured: SRVGG
+671 → 1149 ms, RRDB 7878 → 10752 ms.
+
+Why it loses, and the general shape of the mistake: a `[[f32; 32]; 4]`
+accumulator is 512 bytes. That is not a register file, it is a stack frame, so
+the "registers" were memory anyway — and the chunked inner loop has dynamic
+bounds (`lo..hi` varies with the tap and the chunk), which defeats the
+vectoriser that was happily turning the plain slice `axpy` into packed FMAs.
+The version it replaced streams contiguous slices whose traffic L1 absorbs.
+
+The lesson is the same one the GPU kernels taught in §2, arriving from the
+other direction: **the scarce resource is not the one the arithmetic suggests.**
+On the GPU it was registers rather than multiplies; here it is the vectoriser's
+ability to see a simple contiguous loop, rather than the load-store count.
+
 ## 12. Open questions the next hardware run should answer
 
 - Do `rt2h` / `rt2c8h` (hoisted addressing, single code path) clear rt2f's
