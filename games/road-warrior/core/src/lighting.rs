@@ -171,7 +171,11 @@ impl BakedLighting {
     /// and clamping outside the track.
     pub fn at(&self, x: f32) -> (f32, f32) {
         let n = self.sun.len();
-        if n == 0 || self.length <= 0.0 {
+        // Fully lit and fully open is this lookup's answer for "no bake to
+        // consult"; a position that is not a number is the same situation.
+        // Without this the interpolation below returned (NaN, NaN), which
+        // the shader multiplies straight into the terrain colour.
+        if n == 0 || self.length <= 0.0 || !x.is_finite() {
             return (1.0, 1.0);
         }
         let t = (x / self.length).clamp(0.0, 1.0) * (n - 1) as f32;
@@ -284,6 +288,24 @@ mod tests {
     }
 
     #[test]
+    fn a_non_finite_lookup_reads_as_open_sky() {
+        // Returned (NaN, NaN), which the shader multiplies into the
+        // terrain colour — a black column rather than a wrong one.
+        let baked = BakedLighting::bake(&flat(), Sun::default(), 32);
+        for x in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let (s, k) = baked.at(x);
+            assert!(s.is_finite() && k.is_finite(), "at({x}) = ({s}, {k})");
+        }
+    }
+
+    #[test]
+    fn baking_an_empty_track_does_not_panic() {
+        let baked = BakedLighting::bake(&Track::new("Empty", vec![]), Sun::default(), 16);
+        let (s, k) = baked.at(5.0);
+        assert!(s.is_finite() && k.is_finite());
+    }
+
+    #[test]
     fn lookups_outside_the_track_clamp_instead_of_panicking() {
         let baked = BakedLighting::bake(&flat(), Sun::default(), 32);
         for x in [-100.0f32, 0.0, 1000.0] {
@@ -305,3 +327,5 @@ mod tests {
         assert!(ms < 250.0, "bake took {ms}ms; too slow for level load");
     }
 }
+
+
