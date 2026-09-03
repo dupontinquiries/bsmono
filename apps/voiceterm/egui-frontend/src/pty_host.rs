@@ -272,4 +272,71 @@ mod tests {
         }
         panic!("the shell exited and the host never noticed");
     }
+
+    /// The waker is the difference between output appearing and output
+    /// sitting in a buffer until you move the mouse. It is not a
+    /// decision that can be unit-tested — it is a wiring fact — so the
+    /// only honest check is to spawn a shell and count the calls.
+    #[test]
+    #[ignore = "spawns a real shell; run explicitly"]
+    fn the_reader_wakes_the_ui_when_the_shell_speaks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        std::env::set_var("SHELL", "/bin/sh");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h2 = Arc::clone(&hits);
+        let host = PtyHost::spawn(80, 24, Arc::new(move || {
+            h2.fetch_add(1, Ordering::SeqCst);
+        }))
+        .expect("spawn");
+        // Nothing has been asked of the shell yet beyond its prompt.
+        host.write(b"echo VOICETERM_WAKE\n").expect("write");
+        for _ in 0..100 {
+            if hits.load(Ordering::SeqCst) > 0 {
+                // Drain so the buffer does not grow while we assert.
+                let _ = host.drain();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("the shell produced output and the UI was never woken");
+    }
+
+    /// The UI has been woken by the time the shell is gone.
+    ///
+    /// **This does NOT isolate the EOF wake, and the name says so on
+    /// purpose.** Deleting `wake()` from the EOF arm leaves this test
+    /// passing — verified by mutation — because the prompt and the
+    /// echoed `exit` have already woken it. The count is nonzero either
+    /// way.
+    ///
+    /// Isolating it needs a shell that exits producing no output at all,
+    /// and a pty echoes what you type into it, so there is nothing to
+    /// write that would not also wake. Left as the weaker claim rather
+    /// than dressed up as the stronger one: a test whose name lies is
+    /// worse than a gap you can see.
+    ///
+    /// The EOF wake stays in the code and is argued, not observed — its
+    /// consequence is that "the shell exited" reaches the screen without
+    /// waiting for a mouse move.
+    #[test]
+    #[ignore = "spawns a real shell; run explicitly"]
+    fn the_ui_has_been_woken_by_the_time_the_shell_is_gone() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        std::env::set_var("SHELL", "/bin/sh");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h2 = Arc::clone(&hits);
+        let host = PtyHost::spawn(80, 24, Arc::new(move || {
+            h2.fetch_add(1, Ordering::SeqCst);
+        }))
+        .expect("spawn");
+        host.write(b"exit\n").expect("write");
+        for _ in 0..100 {
+            if host.ended() {
+                assert!(hits.load(Ordering::SeqCst) > 0);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("the shell exited and the host never noticed");
+    }
 }
