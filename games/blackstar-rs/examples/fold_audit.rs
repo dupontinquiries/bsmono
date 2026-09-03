@@ -113,6 +113,13 @@ fn audit(pose_dirs: &[PathBuf]) -> Option<Finding> {
     if strip.iter().any(|p| p.is_empty()) {
         return None;
     }
+    // The pose's own prims, kept alongside the unified strip: the stow the
+    // game applies is derived from these, not from the unified set.
+    let t0_own: Vec<Vec<Vec3>> = model::load_raw_unoriented(&pose_dirs[0])
+        .iter()
+        .map(|p| p.verts.iter().map(|v| Vec3::from_array(v.pos)).collect())
+        .collect();
+
     let u = align::unify(strip)?;
     let mut morph = xform::Morph::build(u.poses.clone(), u.idx.clone())?;
 
@@ -221,97 +228,106 @@ fn audit(pose_dirs: &[PathBuf]) -> Option<Finding> {
         }
     }
 
-    // EXPOSURE: how much of the robot is showing while it is a vehicle?
+    // EXPOSURE: how much of the robot can actually be SEEN in vehicle mode?
     //
-    // This is the question I got wrong twice and then talked myself out of
-    // entirely. I measured "limbs outside the skeleton core box", saw it
-    // fire on 254 of 254 with a median of 3.75 core-radii, and dismissed
-    // it as normal on the reasoning that a limb extending past the core is
-    // what makes it a limb.
+    // Third attempt at this, and the first that agrees with a render.
     //
-    // That reasoning is right for a body and wrong for a TRANSFORMER. In
-    // vehicle mode the robot parts are supposed to be folded away inside
-    // the shell — the whole point is that it reads as a vehicle. A render
-    // of `tank_vanquish` with the exposed parts circled is what settled
-    // it: they are plainly visible, sitting proud of the hull, and the
-    // metric that flagged every chassis was flagging a real fleet-wide
-    // condition rather than crying wolf.
+    // Attempt one asked "are limb points outside the core box". Attempt
+    // two cast six axis rays against prim bounding boxes. Both are
+    // containment tests wearing a visibility costume, and the second one
+    // confidently reported that stowing `tank_vanquish` improved it from
+    // 17% to 9% — while the stowed render is plainly worse, with the limbs
+    // splayed around the hull instead of tucked into it.
     //
-    // Measured as occlusion rather than as a box test, because "outside
-    // the core box" is not the same as "visible". For each limb vertex,
-    // six axis-aligned rays; a ray that escapes without meeting the
-    // bounding box of a NON-limb prim means that vertex can be seen from
-    // outside. Exposure is the fraction of limb vertices with at least one
-    // escaping ray.
-    //
-    // Boxes rather than triangles is deliberately coarse and errs toward
-    // reporting MORE exposure than there is: a box occludes at least as
-    // much as the geometry inside it, so a vertex called hidden really is
-    // hidden, while one called exposed may be occluded by detail the box
-    // test cannot see. Good enough to rank the fleet; not a substitute for
-    // looking at a render.
+    // Visibility is a DEPTH question, so this resolves it with a depth
+    // buffer. Three orthographic views (front, side, top), each a coarse
+    // grid: rasterise the nearest hull depth per cell, then ask of every
+    // limb sample whether anything is in front of it. A limb point that is
+    // nearer to the camera than the hull at that cell is on screen. That
+    // is what "visible" means, and it is why splaying a limb sideways --
+    // which reduces axis overhang -- makes this number go UP rather than
+    // down.
     {
-        let refs: Vec<&[Vec3]> = t0_pts.iter().map(|v| v.as_slice()).collect();
+        // THE POSE'S OWN PRIMS, NOT THE UNIFIED SET.
+        //
+        // `u.poses[0]` is the vehicle pose AFTER unification, which adds
+        // placeholder entries for parts that only exist in later poses —
+        // 64 slots where the pose itself has 57. The GAME computes
+        // `Model::pack` in `load_raw_at` from the model's own prims, so a
+        // stow derived from the unified set is a different transform from
+        // the one that ships: measured on tank_vanquish, 23 limbs and 36
+        // moved prims against the game's 16 and 29.
+        //
+        // That is why this metric disagreed with a render of the stowed
+        // pose. It was not the metric being coarse; it was measuring a
+        // stow nothing applies.
+        let refs: Vec<&[Vec3]> = t0_own.iter().map(|v| v.as_slice()).collect();
         let sk = skeleton::skeletonize(&refs);
         let limb_prims: std::collections::BTreeSet<usize> =
             sk.limbs.iter().flat_map(|l| l.prims.iter().copied()).collect();
-        if !limb_prims.is_empty() && limb_prims.len() < t0_pts.len() {
-            // Occluders: every prim that is NOT part of a limb.
-            let occ: Vec<(Vec3, Vec3)> = (0..t0_pts.len())
-                .filter(|i| !limb_prims.contains(i))
-                .filter_map(|i| {
-                    let pts = &t0_pts[i];
-                    if pts.is_empty() {
-                        return None;
+        if !limb_prims.is_empty() && limb_prims.len() < t0_own.len() {
+            const SLACK: f32 = 0.25;
+            let steps = skeleton::fold_pack(&sk, &refs, SLACK, Vec3::Y);
+            let packed = |i: usize| -> Vec<Vec3> {
+                let st = steps.get(i).copied().unwrap_or_default();
+                t0_own
+                    .get(i)
+                    .map(|v| v.iter().map(|p| st.pivot + st.rot * (*p - st.pivot) + st.shift).collect())
+                    .unwrap_or_default()
+            };
+            let raw = |i: usize| -> Vec<Vec3> { t0_own.get(i).cloned().unwrap_or_default() };
+
+            let measure = |get: &dyn Fn(usize) -> Vec<Vec3>| -> f32 {
+                // Bounds over everything, so all three views share a frame.
+                let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+                for i in 0..t0_own.len() {
+                    for p in get(i) {
+                        lo = lo.min(p);
+                        hi = hi.max(p);
                     }
-                    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-                    for p in pts {
-                        lo = lo.min(*p);
-                        hi = hi.max(*p);
-                    }
-                    Some((lo, hi))
-                })
-                .collect();
-            let dirs = [Vec3::X, Vec3::NEG_X, Vec3::Y, Vec3::NEG_Y, Vec3::Z, Vec3::NEG_Z];
-            let measure = |limb_pts: &dyn Fn(usize) -> Vec<Vec3>| -> f32 {
+                }
+                let size = (hi - lo).max(Vec3::splat(1e-4));
+                const G: usize = 48;
+                // (u, v, depth) axis triples: looking down -Z, -X, -Y.
+                let views: [(usize, usize, usize); 3] = [(0, 1, 2), (2, 1, 0), (0, 2, 1)];
                 let (mut seen, mut total) = (0usize, 0usize);
-                for i in &limb_prims {
-                    let pts = limb_pts(*i);
-                    // Sample rather than test every vertex: these meshes
-                    // carry tens of thousands and the answer does not move.
-                    let stride = (pts.len() / 64).max(1);
-                    for p in pts.iter().step_by(stride) {
-                        total += 1;
-                        if dirs.iter().any(|d| !occ.iter().any(|(lo, hi)| ray_hits_box(*p, *d, *lo, *hi)))
-                        {
-                            seen += 1;
+                for (ua, va, da) in views {
+                    // Nearest hull depth per cell. Points only, so a sparse
+                    // mesh leaves gaps -- accepted, and it errs toward
+                    // calling limbs visible rather than hiding them.
+                    let mut hull = vec![f32::MAX; G * G];
+                    for i in 0..t0_own.len() {
+                        if limb_prims.contains(&i) {
+                            continue;
+                        }
+                        for p in get(i) {
+                            let u = (((p[ua] - lo[ua]) / size[ua]) * (G - 1) as f32) as usize;
+                            let v = (((p[va] - lo[va]) / size[va]) * (G - 1) as f32) as usize;
+                            let cell = &mut hull[v.min(G - 1) * G + u.min(G - 1)];
+                            *cell = cell.min(p[da]);
+                        }
+                    }
+                    for i in &limb_prims {
+                        let pts = get(*i);
+                        let stride = (pts.len() / 48).max(1);
+                        for p in pts.iter().step_by(stride) {
+                            let u = (((p[ua] - lo[ua]) / size[ua]) * (G - 1) as f32) as usize;
+                            let v = (((p[va] - lo[va]) / size[va]) * (G - 1) as f32) as usize;
+                            total += 1;
+                            // Visible if no hull sample in this cell is in
+                            // front of it. A small bias so coincident
+                            // surfaces do not read as exposed.
+                            if hull[v.min(G - 1) * G + u.min(G - 1)] > p[da] - 1e-3 {
+                                seen += 1;
+                            }
                         }
                     }
                 }
                 if total > 0 { seen as f32 / total as f32 } else { 0.0 }
             };
 
-            worst.exposure = measure(&|i| t0_pts.get(i).cloned().unwrap_or_default());
-
-            // AND AGAIN, WITH THE STOWING APPLIED.
-            //
-            // `fold_pack` exists to tuck limbs into an envelope, and the
-            // vehicle pose is loaded as authored without it. If running it
-            // drops exposure, the machinery to hide the robot is already
-            // here and simply is not being used on this pose.
-            const SLACK: f32 = 0.25;
-            let steps = skeleton::fold_pack(&sk, &refs, SLACK, Vec3::Y);
-            worst.exposure_packed = measure(&|i| {
-                let step = steps.get(i).copied().unwrap_or_default();
-                t0_pts
-                    .get(i)
-                    .map(|v| {
-                        v.iter()
-                            .map(|p| step.pivot + step.rot * (*p - step.pivot) + step.shift)
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            });
+            worst.exposure = measure(&raw);
+            worst.exposure_packed = measure(&packed);
         }
     }
 
