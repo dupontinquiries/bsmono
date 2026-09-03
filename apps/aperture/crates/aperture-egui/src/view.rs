@@ -755,6 +755,28 @@ fn mark_span(rail: Rect, line0: usize, line1: usize, total_lines: usize) -> (f32
 }
 
 
+/// How many palette rows are BUILT, at most.
+///
+/// Not a display limit — the list scrolls — but a bound on the work one frame
+/// does. Ranking is already O(files) and cheap; building egui rows is not, and
+/// a fifty-thousand-file monorepo with an empty query would otherwise lay out
+/// fifty thousand of them every frame.
+///
+/// Two hundred rather than ten. Ten was small enough that on a phone, with no
+/// arrow keys, everything past the tenth match was unreachable by ANY means —
+/// which is what "C-o doesn't add more files as you scroll" was describing:
+/// not a paging bug, an absent eleventh row. Two hundred is past the point
+/// where scrolling beats typing another character, so the cap stops being the
+/// thing the user is fighting.
+pub const PALETTE_ROWS_MAX: usize = 200;
+
+/// How tall the palette's result list may grow before it scrolls.
+///
+/// Bounded so the palette does not run off the bottom of a phone — the failure
+/// C13_TODO §24 records for settings panels across the fleet, where a page was
+/// a bare stack with nothing bounding it and a Ui does not scroll, it clips.
+pub const PALETTE_LIST_H: f32 = 360.0;
+
 /// The strip: a palette button that opens on tap-and-hold, then recents
 /// and pinned quick actions.
 ///
@@ -1017,13 +1039,25 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                     match p.mode {
                         Mode::Commands => {
                             let items = palette_ui::matches(&p.input);
-                            let shown = items.len().min(10);
+                            let shown = items.len().min(PALETTE_ROWS_MAX);
                             if up {
                                 p.selected = p.selected.saturating_sub(1);
                             }
                             if down && shown > 0 {
                                 p.selected = (p.selected + 1).min(shown - 1);
                             }
+                            // A SCROLL AREA. There was none, and the list was
+                            // capped at ten — so on a phone, where there is no
+                            // ↑↓, everything past the tenth match was
+                            // unreachable by any means. Reported as "the
+                            // command palette is still not tappable to scroll
+                            // on phone"; the palette was not scrollable at all,
+                            // it just looked like it on a desktop where the ten
+                            // rows fit.
+                            egui::ScrollArea::vertical()
+                                .id_salt("palette_commands")
+                                .max_height(PALETTE_LIST_H)
+                                .show(ui, |ui| {
                             for (i, (label, _)) in items.iter().take(shown).enumerate() {
                                 let selected = i == p.selected;
                                 let bg = if selected { colors.accent.gamma_multiply(0.25) } else { Color32::TRANSPARENT };
@@ -1036,10 +1070,18 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                     })
                                     .response
                                     .interact(Sense::click());
+                                // Keyboard and touch share one list, so the
+                                // keyboard's selection has to drag the view
+                                // with it — otherwise ↓ walks the highlight off
+                                // the bottom and the palette appears frozen.
+                                if selected {
+                                    resp.scroll_to_me(None);
+                                }
                                 if resp.clicked() {
                                     apply = Some((items[i].0.clone(), items[i].1.clone()));
                                 }
                             }
+                                });
                             if enter && shown > 0 {
                                 let pick = &items[p.selected.min(shown - 1)];
                                 apply = Some((pick.0.clone(), pick.1.clone()));
@@ -1049,7 +1091,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                             }
                         }
                         Mode::OpenFile => {
-                            let ranked = crate::file_finder::rank(&p.root, &p.files, &p.input, 10);
+                            let ranked = crate::file_finder::rank(&p.root, &p.files, &p.input, PALETTE_ROWS_MAX);
                             if !ranked.is_empty() {
                                 // Fuzzy matches against the walked file list:
                                 // the TODO.md-named behavior. Typed-path
@@ -1067,6 +1109,15 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 if down {
                                     p.selected = (p.selected + 1).min(ranked.len() - 1);
                                 }
+                                // Same scroll area, same reason — and here the
+                                // ten-row cap was the whole of "C-o doesn't add
+                                // more files as you scroll": there was nothing
+                                // below the tenth match to scroll TO. `rank`
+                                // always took a limit; it was being handed 10.
+                                egui::ScrollArea::vertical()
+                                    .id_salt("palette_open_file")
+                                    .max_height(PALETTE_LIST_H)
+                                    .show(ui, |ui| {
                                 for (i, (full, rel)) in ranked.iter().enumerate() {
                                     let selected = i == p.selected;
                                     let bg = if selected { colors.accent.gamma_multiply(0.25) } else { Color32::TRANSPARENT };
@@ -1079,10 +1130,14 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                         })
                                         .response
                                         .interact(Sense::click());
+                                    if selected {
+                                        resp.scroll_to_me(None);
+                                    }
                                     if resp.clicked() {
                                         open_path = Some(full.to_string_lossy().into_owned());
                                     }
                                 }
+                                    });
                                 if enter {
                                     let i = p.selected.min(ranked.len() - 1);
                                     open_path = Some(ranked[i].0.to_string_lossy().into_owned());
