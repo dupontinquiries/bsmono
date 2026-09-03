@@ -781,7 +781,10 @@ impl<P: Payload> Workspace<P> {
 
     /// Inverse of `snapshot_with`. Returns None on anything malformed —
     /// a half-restored layout is worse than a fresh one.
-    pub fn restore_with(text: &str, dec: impl Fn(&str) -> Option<P>) -> Option<Workspace<P>> {
+    /// `dec` is `FnMut` because a real decoder has state — aperture's
+    /// resolves a path to a document id by opening the file, and tracks
+    /// the highest id it handed out.
+    pub fn restore_with(text: &str, mut dec: impl FnMut(&str) -> Option<P>) -> Option<Workspace<P>> {
         let mut lines = text.lines();
         let head = lines.next()?;
         let mut hp = head.split(';');
@@ -812,7 +815,7 @@ impl<P: Payload> Workspace<P> {
             let focused: u64 = p.next()?.parse().ok()?;
             let pinned = p.next()? == "1";
             let last_used: u64 = p.next()?.parse().ok()?;
-            let (root, _) = dec_node(p.next()?, &dec)?;
+            let (root, _) = dec_node(p.next()?, &mut dec)?;
             for id in root.pane_ids() {
                 max_id = max_id.max(id);
             }
@@ -883,7 +886,7 @@ fn enc_node<P: Payload>(n: &Node<P>, enc: &impl Fn(&P) -> String) -> String {
 /// Parse one node from the front of `s`, returning it and the rest.
 fn dec_node<'a, P: Payload>(
     s: &'a str,
-    dec: &impl Fn(&str) -> Option<P>,
+    dec: &mut impl FnMut(&str) -> Option<P>,
 ) -> Option<(Node<P>, &'a str)> {
     let (tag, rest) = s.split_once('|')?;
     match tag {
