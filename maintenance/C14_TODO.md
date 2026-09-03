@@ -715,7 +715,52 @@ That second point is the interesting one: the manifest says `system/snapclone`
 is the canonical deployed daemon, and the tool that does the deploying cannot
 reach it by name. The `[system.snapclone]` notes are stale, not the tree.
 
-So: `apps/snapclone` survives, `system/snapclone` is archived per §7b, and per
-the table above there is nothing to port first. `manifest/projects.toml`'s
-`[system.snapclone]` entry goes with it, and `font_install_check.py` loses its
-duplicate `system/snapclone/camera-bridge` path.
+### DO NOT ARCHIVE IT. The tier is the design, and I nearly deleted it.
+
+Corrected after the operator pointed out what `system/` is FOR: a daemon tier —
+long-running services on a shared Linux fabric that apps talk to over IPC —
+rather than a second place to keep applications. `system/` holds exactly two
+entries, `photosync` and `snapclone`, and both are `daemon = true` in the
+manifest.
+
+That reframes everything above. The freshness analysis is still correct and
+still says `apps/` has the newer code. It does not follow that `system/`
+should go, because the two trees are not competing copies of one thing — one
+is a GUI application and the other is meant to be the background service it
+talks to.
+
+Deleting it because its Rust crates are ten days behind would have removed an
+architectural tier for a reason that has nothing to do with the tier.
+
+### The actual bug is the FORK, not the directory
+
+`system/snapclone` is supposed to be two daemons. Its own units say so:
+
+    snapclone-bus.service          ExecStart=%h/.local/bin/snapclone-bus
+    snapclone-camera-bridge.service ExecStart=%h/.local/bin/camera-bridge
+
+What it actually contains is 654 files including `src/ui/` — **85 files of Qt
+GUI** — a full `CMakeLists.txt`, the whole 40-crate Rust workspace, resources,
+packaging and a flatpak manifest. It is a fork of the application that happens
+to also build two daemons.
+
+And `apps/snapclone/systemd/` carries copies of the SAME TWO UNIT FILES, so the
+GUI tree also claims to install the daemons. Both trees build a binary called
+`snapclone-bus` from their own `snapclone-databus` crate.
+
+So the question is not "which tree survives" but "what should live in the
+daemon tier". The answer the design implies:
+
+* `system/snapclone` keeps the units, the bus and the camera bridge, and the
+  crates those two binaries actually need.
+* Everything else — Qt UI, the egui frontend's siblings, resources, packaging,
+  the 30-odd crates neither daemon links — comes out.
+* The crates BOTH sides need move to `shared/` or are depended on across the
+  tree, which is the pattern `apps/` has already started: its `gesture`,
+  `group` and `audio` crates now depend on `gesture-kit`, `snapcore` and
+  `audio-kit` instead of holding local copies.
+* `apps/snapclone/systemd/` loses its copy of the two units, since installing a
+  system daemon is not a GUI's job.
+
+That is a real refactor with a clear shape, and it is the opposite of the
+one-commit deletion §16 was heading toward two paragraphs ago.
