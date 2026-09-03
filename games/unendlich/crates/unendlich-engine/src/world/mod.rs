@@ -13,6 +13,7 @@ pub mod block_transform;
 pub mod chunk;
 pub mod chunk_loader;
 pub mod chunk_manager;
+pub mod smooth;
 pub mod block_textures;
 pub mod block_material;
 pub mod texture_mapping;
