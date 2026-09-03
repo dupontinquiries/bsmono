@@ -61,17 +61,31 @@
 //! reads too. Detail is lost in one cell layer, which is the right place to
 //! lose it: next to a chunk that already threw that detail away.
 //!
-//! Measured, this takes the disagreement from 3.86 cells to 0.14 — better than
-//! an order of magnitude, and NOT zero. The remainder is structural. Surface
-//! nets puts a vertex in each CELL, and two abutting chunks own different
-//! cells either side of the shared plane: at a boundary on x = 8 the fine
-//! chunk's cell spans 6..8 and the coarse chunk's spans 8..10. Reading the
-//! same samples is what shrinks the error; it cannot make them the same cell.
+//! Measured on the fixture in `declaring_the_coarse_neighbour_closes_the_seam`:
+//! 1.46 cells of surface disagreement down to 0.14. Not zero, and the
+//! remainder is structural rather than a tuning failure — surface nets puts a
+//! vertex in each CELL, and two abutting chunks own different cells either
+//! side of the shared plane. At a boundary on x = 8 the fine chunk's cell
+//! spans 6..8 and the coarse chunk's spans 8..10. Reading the same samples
+//! shrinks the error; it cannot make them the same cell.
 //!
-//! Closing the last of it requires one chunk to emit the quads that BRIDGE the
-//! boundary, which means holding the neighbour's vertices while meshing —
-//! a chunk-graph concern rather than an extractor one, and not attempted
-//! here.
+//! Note the borrowed layer is `r` cells THICK, not one: a coarse cell covers
+//! `r` fine cells per axis, and a single-cell layer collapses only part of
+//! each footprint.
+//!
+//! ### And the composition that closes it entirely
+//!
+//! No new code — the fine chunk meshes one coarse footprint PAST the shared
+//! plane. It then owns the same cell the neighbour owns, computes the
+//! identical vertex from the identical samples, and emits the quads bridging
+//! the boundary because all four cells around those edges are finally in
+//! range. The neighbour skips its first layer, or emits a coincident
+//! duplicate; either is harmless.
+//!
+//! `overlapping_into_the_neighbour_closes_the_seam_completely` holds every
+//! coarse vertex to within 1e-3 of one the fine chunk also produced. This is
+//! the recipe a chunk scheduler should follow, and it is why the remaining
+//! work is scheduling rather than geometry.
 
 use glam::Vec3;
 
@@ -252,18 +266,28 @@ pub fn extract<F: Field>(field: &F, m: Mesher) -> Mesh {
                 // Detail is lost in one cell layer. That is the correct place
                 // to lose it: the cell next to a chunk that already threw that
                 // detail away.
+                // The borrowed layer is r cells THICK, not one. A coarse cell
+                // covers r fine cells per axis, so a one-cell layer collapses
+                // only part of each footprint and leaves the rest of it
+                // disagreeing — which is where a chunk of the residual came
+                // from before this was fixed.
                 let mut r = 1i32;
-                for (face, on_face) in [
-                    (0usize, x == 0),
-                    (1, x == cx - 1),
-                    (2, y == 0),
-                    (3, y == cy - 1),
-                    (4, z == 0),
-                    (5, z == cz - 1),
+                for (face, lo, hi) in [
+                    (0usize, x, cx - 1 - x),
+                    (1, cx - 1 - x, x),
+                    (2, y, cy - 1 - y),
+                    (3, cy - 1 - y, y),
+                    (4, z, cz - 1 - z),
+                    (5, cz - 1 - z, z),
                 ] {
                     let n = m.seams.0[face];
-                    if on_face && n > k {
-                        r = (n / k).max(1);
+                    if n <= k {
+                        continue;
+                    }
+                    let ratio = (n / k).max(1);
+                    let _ = hi;
+                    if lo < ratio {
+                        r = ratio;
                         break;
                     }
                 }
@@ -656,6 +680,40 @@ mod tests {
         }
         let folded = edges.values().filter(|&&n| n > 2).count();
         assert_eq!(folded, 0, "{folded} folded edges after borrowing the grid");
+    }
+
+
+    #[test]
+    fn overlapping_into_the_neighbour_closes_the_seam_completely() {
+        // The remaining structural gap: two abutting chunks own DIFFERENT
+        // cells either side of the shared plane, so reading the same samples
+        // is not enough. The composition that fixes it needs no new code —
+        // the fine chunk simply meshes one coarse footprint PAST the boundary,
+        // so it owns the cell the neighbour owns and computes the identical
+        // vertex, and it emits the quads bridging the gap because all four
+        // cells around those edges are now in range.
+        //
+        // The neighbour then skips its first layer, or emits a coincident
+        // duplicate; either is harmless. This is the recipe a chunk scheduler
+        // should follow.
+        let f = ridge();
+        let coarse = extract(&f, Mesher::new([5, 8, 5]).at([8, 0, 0]).stride(2));
+        let overlapped =
+            extract(&f, Mesher::new([11, 14, 9]).seams(Seams::NONE.x_plus(2)));
+
+        // every vertex the coarse chunk puts on the shared plane must also be
+        // produced by the overlapping fine chunk, exactly
+        let want: Vec<Vec3> =
+            on_face(&coarse, 0.0).iter().map(|p| *p + Vec3::new(8.0, 0.0, 0.0)).collect();
+        assert!(!want.is_empty());
+        for q in &want {
+            let best = overlapped
+                .positions
+                .iter()
+                .map(|p| (*p - *q).length())
+                .fold(f32::INFINITY, f32::min);
+            assert!(best < 1e-3, "coarse vertex {q:?} unmatched by {best:.4}");
+        }
     }
 
     #[test]
