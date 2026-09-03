@@ -445,6 +445,9 @@ struct VoicetermApp {
     /// shell failed to spawn is a REMEMBERED None rather than a missing
     /// key that the next swap would try to spawn again.
     pane_ptys: std::collections::HashMap<u64, Option<voiceterm_egui::pty_host::PtyHost>>,
+    /// Panes whose shell spawn already failed. Without this a machine
+    /// with no usable shell is asked for one sixty times a second.
+    pty_spawn_failed: std::collections::HashSet<u64>,
     /// One-shot latch so "shell exited" is said once, not every frame.
     pty_ended_noted: bool,
     /// The QML settingsPopup's launcher half — four doors plus voice
@@ -3500,6 +3503,37 @@ impl eframe::App for VoicetermApp {
                 // `PtyHost::drop`), so closing a pane does not leave a
                 // shell running with nothing attached to it.
                 self.pane_ptys.remove(id);
+                // Forget the failure too, or a pane id reused by a later
+                // session would inherit a verdict about a different pane.
+                self.pty_spawn_failed.remove(id);
+            }
+
+            // THE FOCUSED PANE FALLS BETWEEN THE TWO RULES ABOVE.
+            //
+            // `hosted` includes `pane_focus`, so the spawn loop never
+            // considers the focused pane — correct while it HAS a shell.
+            // But `swap_focus` hands a newly focused pane `fresh()`,
+            // which for `Option<PtyHost>` is `None`. So splitting a pane
+            // produced a focused terminal with no shell, permanently:
+            // the next frame has `prev == now`, `swap_focus` is a no-op,
+            // and nothing else ever looks. Keys went to `pty_out`, fell
+            // through to local echo, and no command ever ran.
+            //
+            // Spawning here rather than inside the loop keeps the
+            // background rule intact: parked panes are reconciled by id,
+            // the focused pane is reconciled by whether it actually has
+            // a shell in hand.
+            if voiceterm_egui::pane_host::focused_needs_shell(
+                self.pty.is_some(),
+                self.pty_spawn_failed.contains(&self.pane_focus),
+            ) {
+                match voiceterm_egui::pty_host::PtyHost::spawn(80, 24) {
+                    Ok(h) => self.pty = Some(h),
+                    Err(e) => {
+                        eprintln!("[voiceterm] pane {}: no shell: {e}", self.pane_focus);
+                        self.pty_spawn_failed.insert(self.pane_focus);
+                    }
+                }
             }
 
             // THE PANE GRID. A tab can hold several panes now, so the terminal no longer owns
@@ -3948,6 +3982,7 @@ fn main() -> eframe::Result<()> {
                 },
                 pty_ended_noted: false,
                 pane_ptys: std::collections::HashMap::new(),
+                pty_spawn_failed: std::collections::HashSet::new(),
                 launcher: uikit_egui::quick_launcher::LauncherState::default(),
                 a11y: uikit_egui::a11y::A11yScene::new(),
                 mail: Default::default(),

@@ -310,5 +310,15 @@ mod tests {
             "the input-owner declaration is gone — the widget and the raw \
              path will both encode, and `ls` will run twice."
         );
+        // THE FOCUSED PANE'S SHELL. `hosted` includes pane_focus, so the
+        // reconcile loop never spawns for it, while swap_focus hands a
+        // newly focused pane None. Without this call a split produces a
+        // terminal that echoes locally and never runs anything.
+        assert_eq!(
+            src.matches("pane_host::focused_needs_shell(").count(),
+            1,
+            "the focused-pane shell check is gone — a split pane will have \
+             no shell and no command will run in it."
+        );
     }
 }
