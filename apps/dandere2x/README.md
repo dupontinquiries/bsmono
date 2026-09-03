@@ -223,6 +223,12 @@ structurally — the bounds test and in_scale divide are hoisted out of the
 channel loop into per-thread row bases, column offsets and 0/1 masks, with a
 single copy of the block.
 
+Kernel findings that generalise past this app — the register/multiply
+tradeoff on AGX, why Winograd loses, why in-flight overlap is a no-op on
+unified memory — are written up for the gpu-gemm side in
+[`docs/FOR_LOGSCOPE.md`](docs/FOR_LOGSCOPE.md), along with the two gpu-gemm
+lessons dandere2x has not yet applied.
+
 Dispatch-level lessons come from `apps/logscope/reference-docs/ENGINE_PERF_STATUS.md`,
 which settled the same question for gpu-gemm: dispatch granularity, not
 arithmetic. Params uniforms are created once and (with balanced tiling) have
