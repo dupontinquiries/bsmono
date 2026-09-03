@@ -224,3 +224,52 @@ The branch is fetched and kept as `inc3-dandere-work/main`; nothing is lost.
 3. **Ask which line has actually been RUN.** Both make bit-exactness claims
    neither can be checked here. The one that has upscaled real video recently
    is the trunk, and that is a question about history rather than about code.
+
+## 9. `unendlich-world` does not compile, and nothing was watching that binary
+
+Found while verifying the shader-path conversion against the operator's own
+build line. `cargo check -p unendlich-engine --features render,window,ui-overlay`
+reports **12 errors, all in `src/bin/unendlich_world.rs`** — a declared `[[bin]]`
+(`unendlich-world`) that nobody builds.
+
+They are not from this session's work. The shapes are API drift:
+
+* `input.handle_event(&event)` given a `&WindowEvent` where `&InputEvent` is
+  expected
+* `is_key_just_pressed(Key::Escape)` where a `Keycode` is expected
+
+That is `input.rs` having moved to its own event and key types while this
+binary stayed on winit's. Nothing in the conversion touched either.
+
+**The operator's target is clean**: `cargo check --bin unendlich-fullgame
+--features render,window,ui-overlay` — 0 errors, which is what confirms
+6420767ee fixed the reported `PathBuf`/`String` mismatch.
+
+### Why it is worth an entry rather than a fix
+
+Two things are unclear and both change the answer:
+
+1. Whether `unendlich-world` is still wanted. It may be a superseded shell that
+   `unendlich-fullgame` replaced, in which case CLAUDE.md §7b applies — archive
+   it with provenance, do not repair it.
+2. Whether the drift is one adapter or twelve separate ports. Eleven of the
+   twelve errors are in that one file, which suggests an adapter, but "suggests"
+   is not a reading.
+
+Fixing a binary nobody builds, without knowing whether it should exist, is how
+dead code acquires tests and stops being removable.
+
+### The general point, which cost this session a bad claim
+
+I checked `-p unendlich-engine --lib`, saw it clean, and reported the shader
+conversion verified. The default features do not compile the sparse mesher, so
+the one real error in my own change reached the operator instead of me.
+CLAUDE.md §3 already says this — "check the NON-default configurations before
+believing a crate is green", with clawbound as the precedent — and the entry
+exists because knowing the rule was not enough.
+
+**A crate with feature-gated modules is not verified by its default check.** For
+this crate specifically the line is
+`--features render,window,ui-overlay`, and the two useful invocations are the
+whole package (which surfaces §9) and `--bin unendlich-fullgame` (which is what
+ships).
