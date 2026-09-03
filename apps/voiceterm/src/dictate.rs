@@ -21,6 +21,7 @@
 //! the LLM. Those are callers.
 
 use crate::code_symbols::SymbolTable;
+use crate::repair::{self, Repair};
 
 // ───────────────────────────────────────────────────────────── controls
 
@@ -231,8 +232,10 @@ fn symbol(span: &str) -> Option<Tok> {
 /// Casing directives. Each applies to the run of plain words that
 /// follows, terminated by any symbol, another directive, or the end.
 /// So "let mut snake user count equals five" → `let mut user_count = five`.
+/// Identifier casing conventions. Public so the repair layer can reuse
+/// the same transform rather than growing a second copy of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Casing {
+pub enum Casing {
     Snake,
     Camel,
     Pascal,
@@ -240,7 +243,7 @@ enum Casing {
     Kebab,
 }
 
-fn casing(span: &str) -> Option<Casing> {
+pub fn casing(span: &str) -> Option<Casing> {
     match span {
         "snake" | "snake case" => Some(Casing::Snake),
         "camel" | "camel case" => Some(Casing::Camel),
@@ -251,7 +254,7 @@ fn casing(span: &str) -> Option<Casing> {
     }
 }
 
-fn apply_casing(c: Casing, words: &[&str]) -> String {
+pub fn apply_casing(c: Casing, words: &[&str]) -> String {
     match c {
         Casing::Snake => words.join("_"),
         Casing::Kebab => words.join("-"),
@@ -449,6 +452,8 @@ pub enum Edit {
     Insert { at: Placement, text: String },
     /// Delete the previous dictated unit ("scratch that").
     RetractLast,
+    /// Fix the previous dictated unit in place instead of discarding it.
+    Repair(Repair),
     Newline { count: usize },
     IndentDelta(i32),
     EndSession,
@@ -497,6 +502,11 @@ pub struct BufferSink {
     pub cursor: usize,
     /// byte length of each applied insert, for RetractLast
     trail: Vec<usize>,
+    /// Span of the last Insert: (start, spacer_len, text_len). Repairs
+    /// act on the TEXT part only, so the leading space survives a
+    /// re-case and `Join` has something to remove. Newlines and indents
+    /// insert after it, so the offsets stay valid until the next Insert.
+    last_insert: Option<(usize, usize, usize)>,
     /// Current indent level, carried across Newline. Without this every
     /// dictated line starts at column 0 and the speaker has to say
     /// "indent" after every "new line" — which is how a real editor's
@@ -516,6 +526,7 @@ impl BufferSink {
             cursor: cursor.min(text.len()),
             ended: false,
             trail: Vec::new(),
+            last_insert: None,
             indent: 0,
         }
     }
@@ -530,6 +541,7 @@ impl BufferSink {
                     self.text.insert_str(pos, &ins);
                     self.cursor = pos + ins.len();
                     self.trail.push(ins.len());
+                    self.last_insert = Some((pos, sep.len(), text.len()));
                 }
                 Edit::Newline { count } => {
                     let s = format!(
@@ -572,10 +584,51 @@ impl BufferSink {
                         self.text.replace_range(start..self.cursor, "");
                         self.cursor = start;
                     }
+                    self.last_insert = None;
+                }
+                Edit::Repair(r) => {
+                    self.repair(r);
                 }
                 Edit::EndSession => self.ended = true,
             }
         }
+    }
+
+    /// The text of the last dictated unit, if one is still addressable.
+    pub fn last_unit(&self) -> Option<&str> {
+        let (start, sep, len) = self.last_insert?;
+        self.text.get(start + sep..start + sep + len)
+    }
+
+    /// Apply a repair to the last unit. Returns false when the repair
+    /// does not apply (nothing dictated yet, or a `Change` whose target
+    /// is absent) so the caller can say so instead of leaving the user
+    /// wondering whether it worked.
+    pub fn repair(&mut self, r: &Repair) -> bool {
+        let Some((start, sep, len)) = self.last_insert else { return false };
+        if *r == Repair::Join {
+            if sep == 0 {
+                return false;
+            }
+            self.text.replace_range(start..start + sep, "");
+            self.cursor -= sep;
+            self.last_insert = Some((start, 0, len));
+            if let Some(t) = self.trail.last_mut() {
+                *t -= sep;
+            }
+            return true;
+        }
+        let Some(unit) = self.last_unit().map(|s| s.to_string()) else { return false };
+        let Some(new) = repair::apply(&unit, r) else { return false };
+        let from = start + sep;
+        self.text.replace_range(from..from + len, &new);
+        let delta = new.len() as isize - len as isize;
+        self.cursor = (self.cursor as isize + delta) as usize;
+        self.last_insert = Some((start, sep, new.len()));
+        if let Some(t) = self.trail.last_mut() {
+            *t = (*t as isize + delta) as usize;
+        }
+        true
     }
 
     fn resolve(&self, at: &Placement) -> usize {
@@ -663,6 +716,12 @@ pub fn to_keys(editor: KeyEditor, edits: &[Edit]) -> String {
                     }
                 }
             }
+            // A repair needs to know what the last unit WAS, which a
+            // blind sink does not. Undo-then-retype is the only honest
+            // translation and it is worse than saying so: the caller
+            // gets nothing and should tell the user repairs need the
+            // in-app editor.
+            Edit::Repair(_) => {}
             Edit::EndSession => {}
         }
     }
@@ -856,6 +915,76 @@ mod tests {
             b.apply(&plan(&segment(u), Mode::Code, Placement::Cursor));
         }
         assert_eq!(b.text, "    a\nb\nc");
+    }
+
+    #[test]
+    fn repair_fixes_the_last_unit_in_place() {
+        let mut b = BufferSink::new("let x = ", 8);
+        b.apply(&plan(&segment("read to string"), Mode::Prose, Placement::Cursor));
+        assert_eq!(b.last_unit(), Some("read to string"));
+        assert!(b.repair(&Repair::Recase(crate::dictate::Casing::Snake)));
+        assert_eq!(b.text, "let x = read_to_string");
+        // cursor tracked the shrink
+        assert_eq!(b.cursor, b.text.len());
+    }
+
+    #[test]
+    fn repair_survives_a_following_newline() {
+        let mut b = BufferSink::new("", 0);
+        b.apply(&plan(&segment("path"), Mode::Prose, Placement::Cursor));
+        b.apply(&[Edit::Newline { count: 1 }]);
+        assert!(b.repair(&Repair::Capitalize));
+        assert_eq!(b.text, "Path\n");
+    }
+
+    #[test]
+    fn join_closes_the_leading_space() {
+        let mut b = BufferSink::new("", 0);
+        b.apply(&plan(&segment("foo"), Mode::Prose, Placement::Cursor));
+        b.apply(&plan(&segment("bar"), Mode::Prose, Placement::Cursor));
+        assert_eq!(b.text, "foo bar");
+        assert!(b.repair(&Repair::Join));
+        assert_eq!(b.text, "foobar");
+        assert_eq!(b.cursor, 6);
+        // idempotent: nothing left to join
+        assert!(!b.repair(&Repair::Join));
+    }
+
+    #[test]
+    fn repair_reports_failure_rather_than_mangling() {
+        let mut b = BufferSink::new("", 0);
+        // nothing dictated yet
+        assert!(!b.repair(&Repair::Capitalize));
+        b.apply(&plan(&segment("read to string"), Mode::Prose, Placement::Cursor));
+        assert!(!b.repair(&Repair::Change { from: "absent".into(), to: "x".into() }));
+        assert_eq!(b.text, "read to string", "a failed repair changes nothing");
+    }
+
+    #[test]
+    fn scratch_that_clears_the_repair_target() {
+        let mut b = BufferSink::new("", 0);
+        b.apply(&plan(&segment("oops"), Mode::Prose, Placement::Cursor));
+        b.apply(&[Edit::RetractLast]);
+        assert_eq!(b.last_unit(), None);
+        assert!(!b.repair(&Repair::Capitalize));
+    }
+
+    #[test]
+    fn repairs_chain() {
+        let mut b = BufferSink::new("", 0);
+        b.apply(&plan(&segment("read to string"), Mode::Prose, Placement::Cursor));
+        assert!(b.repair(&Repair::Change { from: "to".into(), to: "into".into() }));
+        assert_eq!(b.text, "read into string");
+        assert!(b.repair(&Repair::Recase(crate::dictate::Casing::Snake)));
+        assert_eq!(b.text, "read_into_string");
+    }
+
+    #[test]
+    fn keysink_cannot_repair_and_says_nothing() {
+        // a blind sink has no idea what the last unit was; emitting a
+        // guess would corrupt the buffer
+        let k = to_keys(KeyEditor::Helix, &[Edit::Repair(Repair::Capitalize)]);
+        assert_eq!(k, "");
     }
 
     #[test]

@@ -176,6 +176,9 @@ mod voice_status;
 // Which buttons the bottom bar shows, keyed on the live voice grammar.
 // Pure; composes bottom_bar + editor_voice + dictate.
 mod bar_pages;
+// Targeted fixes to the last dictated unit (recase, spell, change a
+// word) instead of discarding it. Pure.
+mod repair;
 // v0.1.609: motion-rollback position-history core (TODO_motion_rollback
 // option 1, the testable piece). Status-line parsing stays build-gated.
 mod motion_history;

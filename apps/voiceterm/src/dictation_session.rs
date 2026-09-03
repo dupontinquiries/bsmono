@@ -41,6 +41,7 @@
 //! PURE: std only.
 
 use crate::dictate::{Ctl, Mode};
+use crate::repair::{self, Repair};
 
 /// Which recognizer produced a result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +99,9 @@ pub enum Route {
     Control(Ctl),
     /// Insert as dictated content. Only ever from `Whisper`.
     Content(String),
+    /// Fix the last unit. Whisper-only: most repairs carry an argument,
+    /// and the fast path has no argument to match against.
+    Repair(Repair),
     /// Do nothing.
     Dropped(DropReason),
 }
@@ -265,7 +269,14 @@ impl Session {
                     }
                     self.commit(c)
                 }
-                None => Route::Content(r.text.trim().to_string()),
+                // Controls first, repairs second, content last. Order
+                // matters: "scratch that" is a control and must never be
+                // reached by the repair parser, which would otherwise
+                // have to know about it too.
+                None => match repair::parse(&r.text) {
+                    Some(rep) => Route::Repair(rep),
+                    None => Route::Content(r.text.trim().to_string()),
+                },
             },
         }
     }
@@ -436,6 +447,41 @@ mod tests {
         s.observe_shadow("new line", "new line");
         s.observe_shadow("indent", "indent");
         assert_eq!(s.divergence.agree, 2);
+    }
+
+    #[test]
+    fn whisper_routes_a_repair_verb() {
+        let mut s = sess();
+        assert_eq!(
+            s.route(&Recognition::whisper("make that snake case")),
+            Route::Repair(Repair::Recase(crate::dictate::Casing::Snake))
+        );
+    }
+
+    #[test]
+    fn controls_are_checked_before_repairs() {
+        let mut s = sess();
+        // "scratch that" must stay a control; the repair parser never
+        // sees it
+        assert_eq!(s.route(&Recognition::whisper("scratch that")), Route::Control(Ctl::ScratchThat));
+    }
+
+    #[test]
+    fn the_fast_path_does_not_get_to_repair() {
+        let mut s = sess();
+        assert_eq!(
+            s.route(&Recognition::fast("change foo to bar", 0.99)),
+            Route::Dropped(DropReason::FastPathContent)
+        );
+    }
+
+    #[test]
+    fn content_that_merely_resembles_a_repair_still_inserts() {
+        let mut s = sess();
+        assert_eq!(
+            s.route(&Recognition::whisper("change directory")),
+            Route::Content("change directory".into())
+        );
     }
 
     #[test]

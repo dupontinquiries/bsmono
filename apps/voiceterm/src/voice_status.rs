@@ -59,6 +59,8 @@ pub enum Phase {
 pub enum Note {
     /// A control verb fired.
     Acted,
+    /// The last unit was fixed rather than re-dictated.
+    Repaired,
     /// Heard, deliberately not acted on.
     Ignored(DropReason),
     /// Session finished.
@@ -161,6 +163,15 @@ impl Status {
                         self.dim = false;
                         self.set_note(Note::Acted, now_ms);
                     }
+                    Route::Repair(_) => {
+                        // Show the repair phrase, not the repaired text:
+                        // the buffer already shows the result, and
+                        // echoing it here would say the same thing twice
+                        // in two places that can disagree.
+                        self.set_text(&text);
+                        self.dim = false;
+                        self.set_note(Note::Repaired, now_ms);
+                    }
                     Route::Dropped(r) => {
                         // Still show what was heard. A drop with no text
                         // is indistinguishable from not being heard at
@@ -213,6 +224,7 @@ impl Status {
         let note = match self.note {
             None => String::new(),
             Some(Note::Acted) => "acted".into(),
+            Some(Note::Repaired) => "repaired".into(),
             Some(Note::Ended) => "ended".into(),
             Some(Note::Ignored(r)) => format!("ignored:{}", drop_label(r)),
         };
@@ -394,6 +406,26 @@ mod tests {
     #[test]
     fn the_expected_fast_path_drop_reads_as_waiting() {
         assert_eq!(drop_label(DropReason::FastPathContent), "waiting for transcription");
+    }
+
+    #[test]
+    fn a_repair_is_marked_and_not_dimmed() {
+        use crate::repair::Repair;
+        let mut s = st();
+        s.on(Event::CaptureStart, 0);
+        s.on(
+            Event::Result {
+                tier: Tier::Whisper,
+                text: "make that snake case".into(),
+                route: Route::Repair(Repair::Capitalize),
+            },
+            1200,
+        );
+        assert_eq!(s.note, Some(Note::Repaired));
+        assert!(!s.dim);
+        // the phrase, not the result — the buffer shows the result
+        assert_eq!(s.text, "make that snake case");
+        assert!(s.wire().contains("repaired"));
     }
 
     #[test]
