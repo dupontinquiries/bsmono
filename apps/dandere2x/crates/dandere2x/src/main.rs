@@ -140,6 +140,9 @@ enum Cmd {
         model: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
         tile: u32,
+        /// rt4 | rt2
+        #[arg(long, default_value = "rt4")]
+        kernel: String,
     },
     /// List GPU adapters.
     Probe,
@@ -272,12 +275,12 @@ fn main() -> anyhow::Result<()> {
             let _ = bleed;
             eprintln!("{} frames: {:.1}% of pixels through the main network ({:.1}x fewer than full upscaling), {:.1}% through any network tier", summary.frames, summary.heavy_pixel_fraction * 100.0, 1.0 / summary.heavy_pixel_fraction.max(1e-9), summary.upscaled_pixel_fraction * 100.0);
         }
-        Cmd::Selftest { model, tile } => {
+        Cmd::Selftest { model, tile, kernel } => {
             #[cfg(feature = "gpu")]
             {
                 let (net, path) = job::load_model(model.as_deref())?;
                 eprintln!("model: {} ({:.2} MMAC per input pixel, x{})", path.display(), net.macs_per_input_pixel() / 1e6, net.scale);
-                let r = d2x_wgpu::selftest(net, d2x_wgpu::GpuOptions { tile, ..Default::default() })?;
+                let r = d2x_wgpu::selftest(net, d2x_wgpu::GpuOptions { tile, kernel: kernel.parse()?, ..Default::default() })?;
                 println!("{r}");
                 if !r.pass {
                     std::process::exit(1);
@@ -285,7 +288,7 @@ fn main() -> anyhow::Result<()> {
             }
             #[cfg(not(feature = "gpu"))]
             {
-                let _ = (model, tile);
+                let _ = (model, tile, kernel);
                 anyhow::bail!("built without the `gpu` feature");
             }
         }
