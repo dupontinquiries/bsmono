@@ -155,6 +155,16 @@ struct Shell {
     backend: usize,
     input: String,
     output: String,
+    /// The last value `suggested_output` put in the box.
+    ///
+    /// So a re-pick of the input replaces a suggestion but never a path the
+    /// operator typed. Comparing against this rather than a "was edited" flag
+    /// because the flag gets out of step the moment anything else writes the
+    /// field, and the failure — silently discarding a deliberate output path —
+    /// is one the user only notices after the run finishes somewhere else.
+    output_suggested: String,
+    /// A start held back pending an overwrite answer; the bool is `analyze_only`.
+    pending_start: Option<bool>,
     model: String,
     cascade: bool,
     running: bool,
@@ -179,6 +189,8 @@ impl Default for Shell {
             backend: 0,
             input: String::new(),
             output: String::new(),
+            output_suggested: String::new(),
+            pending_start: None,
             model,
             cascade: false,
             running: false,
@@ -195,12 +207,152 @@ impl Default for Shell {
     }
 }
 
+/// The output path to suggest for a given input.
+///
+/// `clip.mkv` → `clip_upscaled.mkv`; a PNG directory `frames` → `frames_upscaled`.
+///
+/// Beside the input, not in a fixed output folder: the operator picked where
+/// the source lives and the result almost always belongs next to it. A default
+/// that writes somewhere else is a default people have to notice, and this one
+/// should be invisible when it is right.
+///
+/// The suffix goes before the extension because everything downstream reads the
+/// extension — `ffmpeg::open_sink` picks a muxer from it, and `run_segmented`
+/// builds `stem.partNNN.ext` out of both halves. `clip.mkv_upscaled` would be a
+/// file nothing can write.
+pub fn suggested_output(input: &str) -> String {
+    let input = input.trim();
+    if input.is_empty() {
+        return String::new();
+    }
+    // No trailing-slash handling: `Path` already skips empty components, so
+    // `Path::new("/v/frames/").file_stem()` is "frames" and its parent is "/v".
+    // I wrote a `trim_end_matches('/')` for this and then could not break it —
+    // deleting the trim failed no test, because the case it guarded does not
+    // exist. `a_directory_input_suggests_a_directory` still asserts the
+    // behaviour, so it is pinned on `Path` rather than on code of mine.
+    let p2 = std::path::Path::new(input);
+    match (p2.file_stem(), p2.extension()) {
+        (Some(stem), Some(ext)) => {
+            let name = format!("{}_upscaled.{}", stem.to_string_lossy(), ext.to_string_lossy());
+            p2.parent().map(|d| d.join(&name).to_string_lossy().into_owned()).unwrap_or(name)
+        }
+        (Some(stem), None) => {
+            let name = format!("{}_upscaled", stem.to_string_lossy());
+            p2.parent().map(|d| d.join(&name).to_string_lossy().into_owned()).unwrap_or(name)
+        }
+        _ => String::new(),
+    }
+}
+
+/// What an existing output means for a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overwrite {
+    /// Nothing there. Go.
+    Clear,
+    /// A file that would be replaced.
+    File,
+    /// A directory with something in it — the PNG-sequence case, where the run
+    /// writes frames alongside whatever is already there rather than replacing
+    /// it. Worth a different question, because "overwrite?" is the wrong word
+    /// for a mkdir that will merge.
+    NonEmptyDir,
+}
+
+/// Classify `output`, given a predicate for what exists.
+///
+/// Takes the filesystem as arguments so the RULES are testable without one —
+/// which matters here because getting this wrong in either direction is bad:
+/// a prompt that never fires destroys an eight-hour upscale, and one that
+/// always fires trains people to click through it.
+pub fn overwrite_state(
+    output: &str,
+    is_file: &dyn Fn(&std::path::Path) -> bool,
+    dir_entries: &dyn Fn(&std::path::Path) -> Option<usize>,
+) -> Overwrite {
+    let o = output.trim();
+    if o.is_empty() {
+        return Overwrite::Clear;
+    }
+    let p = std::path::Path::new(o);
+    if is_file(p) {
+        return Overwrite::File;
+    }
+    match dir_entries(p) {
+        Some(n) if n > 0 => Overwrite::NonEmptyDir,
+        _ => Overwrite::Clear,
+    }
+}
+
 impl Shell {
     fn push_log(&mut self, level: LogLevel, text: String) {
         self.log_id += 1;
         self.log.push(LogEntry::new(level, text, self.log_id));
         if self.log.len() > 500 {
             self.log.drain(..100);
+        }
+    }
+
+    /// The overwrite confirmation, drawn when `start` held a run back.
+    ///
+    /// A modal Window rather than a toast or an inline warning: the answer
+    /// decides whether an existing file survives, and an upscale is long enough
+    /// that a wrong answer is expensive in both directions — clobbering a
+    /// finished render, or making someone rerun eight hours because they
+    /// dismissed a notification.
+    ///
+    /// The path is shown in full. "A file already exists" without saying WHICH
+    /// is unanswerable when the box was auto-filled and the operator has not
+    /// read it.
+    fn overwrite_dialog(&mut self, ctx: &egui::Context) {
+        let Some(analyze_only) = self.pending_start else { return };
+        let state = overwrite_state(
+            &self.output,
+            &|p| p.is_file(),
+            &|p| std::fs::read_dir(p).ok().map(|d| d.count()),
+        );
+        let mut go = false;
+        let mut cancel = false;
+        egui::Window::new(match state {
+            Overwrite::NonEmptyDir => "Directory is not empty",
+            _ => "Overwrite this file?",
+        })
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label(&self.output);
+            ui.add_space(4.0);
+            ui.label(match state {
+                // Different wording, because it is a different act: a run into
+                // a populated directory writes frames ALONGSIDE what is there
+                // rather than replacing it, and calling that "overwrite" would
+                // describe the wrong risk.
+                Overwrite::NonEmptyDir =>
+                    "The run will write frames into this directory alongside what is already in it.",
+                _ => "This file will be replaced when the run finishes.",
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+                if ui.button(match state {
+                    Overwrite::NonEmptyDir => "Write here",
+                    _ => "Overwrite",
+                }).clicked() {
+                    go = true;
+                }
+            });
+        });
+        if cancel {
+            self.pending_start = None;
+            self.push_log(LogLevel::Info, "cancelled — nothing was written".into());
+        } else if go {
+            // Left SET so `start` sees it and skips the check, then cleared
+            // there. Clearing it here would send the run straight back into
+            // the prompt.
+            self.start(analyze_only);
         }
     }
 
@@ -217,6 +369,24 @@ impl Shell {
             self.push_log(LogLevel::Error, "input (and output) paths are required".into());
             return;
         }
+        // ASK BEFORE CLOBBERING. Only for a real run: analyze writes nothing,
+        // so prompting there would be a dialog that means nothing, and those
+        // are what teach people to click through the ones that matter.
+        //
+        // `pending_start` is cleared by the dialog, so a confirmed start
+        // re-enters here with it already taken and does not loop.
+        if !analyze_only && self.pending_start.is_none() {
+            let state = overwrite_state(
+                &self.output,
+                &|p| p.is_file(),
+                &|p| std::fs::read_dir(p).ok().map(|d| d.count()),
+            );
+            if state != Overwrite::Clear {
+                self.pending_start = Some(analyze_only);
+                return;
+            }
+        }
+        self.pending_start = None;
         self.rows.clear();
         self.summary = None;
         self.frames_total = None;
@@ -286,7 +456,15 @@ impl Shell {
             ui.heading("Job");
             egui::Grid::new("paths").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                 ui.label("Input");
-                ui.add(egui::TextEdit::singleline(&mut self.input).hint_text("video file or PNG directory").desired_width(f32::INFINITY));
+                let changed = ui.add(egui::TextEdit::singleline(&mut self.input)
+                    .hint_text("video file or PNG directory")
+                    .desired_width(f32::INFINITY)).changed();
+                if changed && (self.output.is_empty() || self.output == self.output_suggested) {
+                    // Only over an empty box or over our own last suggestion —
+                    // never over something the operator typed.
+                    self.output_suggested = suggested_output(&self.input);
+                    self.output = self.output_suggested.clone();
+                }
                 ui.end_row();
                 ui.label("Output");
                 ui.add(egui::TextEdit::singleline(&mut self.output).hint_text("out.mkv or a directory").desired_width(f32::INFINITY));
@@ -425,6 +603,7 @@ impl eframe::App for Shell {
     fn ui(&mut self, ui: &mut egui::Ui, _f: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain(&ctx);
+        self.overwrite_dialog(&ctx);
         if self.running {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -453,5 +632,83 @@ impl eframe::App for Shell {
             ui.separator();
             egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| log_view(ui, &self.log));
         });
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn the_suffix_goes_before_the_extension() {
+        // Everything downstream reads the extension — `ffmpeg::open_sink` picks
+        // a muxer from it and `run_segmented` builds `stem.partNNN.ext` out of
+        // both halves — so `clip.mkv_upscaled` would be a file nothing can
+        // write.
+        assert_eq!(suggested_output("/v/clip.mkv"), "/v/clip_upscaled.mkv");
+        assert_eq!(suggested_output("clip.mp4"), "clip_upscaled.mp4");
+    }
+
+    #[test]
+    fn the_suggestion_lands_beside_the_input() {
+        // Not in a fixed output folder: the operator chose where the source
+        // lives, and a default that writes elsewhere is one they have to
+        // notice.
+        assert_eq!(suggested_output("/a/b/c/clip.mkv"), "/a/b/c/clip_upscaled.mkv");
+    }
+
+    #[test]
+    fn a_directory_input_suggests_a_directory() {
+        // The PNG-sequence case. A trailing slash still means a directory, and
+        // must not put the suffix inside the path.
+        assert_eq!(suggested_output("/v/frames"), "/v/frames_upscaled");
+        assert_eq!(suggested_output("/v/frames/"), "/v/frames_upscaled");
+    }
+
+    #[test]
+    fn an_empty_input_suggests_nothing() {
+        // Rather than "_upscaled", which is a real filename and would be
+        // written to the working directory.
+        assert_eq!(suggested_output(""), "");
+        assert_eq!(suggested_output("   "), "");
+    }
+
+    #[test]
+    fn overwrite_is_reported_for_a_file_and_a_populated_directory_only() {
+        // Both directions matter: a prompt that never fires destroys an
+        // eight-hour upscale, and one that always fires trains people to click
+        // through it.
+        let no = |_: &Path| false;
+        let none = |_: &Path| None;
+        assert_eq!(overwrite_state("/v/out.mkv", &no, &none), Overwrite::Clear);
+        assert_eq!(overwrite_state("", &|_| true, &none), Overwrite::Clear,
+                   "an empty path prompted");
+
+        let yes = |_: &Path| true;
+        assert_eq!(overwrite_state("/v/out.mkv", &yes, &none), Overwrite::File);
+
+        // An EMPTY directory is not a conflict — that is the normal case for a
+        // PNG run into a folder the operator just made.
+        assert_eq!(overwrite_state("/v/frames", &no, &|_| Some(0)), Overwrite::Clear);
+        assert_eq!(overwrite_state("/v/frames", &no, &|_| Some(3)), Overwrite::NonEmptyDir);
+    }
+
+    #[test]
+    fn a_suggestion_is_replaced_but_a_typed_path_is_not() {
+        // The rule the whole auto-fill turns on. Silently discarding a
+        // deliberate output path is a failure the operator only discovers after
+        // the run finishes somewhere else.
+        let mut sh = Shell::default();
+        sh.input = "/v/a.mkv".into();
+        sh.output_suggested = suggested_output(&sh.input);
+        sh.output = sh.output_suggested.clone();
+        // Re-picking the input replaces our own suggestion.
+        assert!(sh.output.is_empty() || sh.output == sh.output_suggested);
+
+        // A hand-typed path is not ours, so the guard refuses.
+        sh.output = "/somewhere/else.mkv".into();
+        assert_ne!(sh.output, sh.output_suggested);
+        assert!(!sh.output.is_empty());
     }
 }
