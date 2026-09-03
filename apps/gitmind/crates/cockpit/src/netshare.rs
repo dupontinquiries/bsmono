@@ -341,6 +341,95 @@ pub fn share_ip() -> Option<String> {
         .or_else(|| local_ip().filter(|ip| addr_kind(ip) != AddrKind::Loopback))
 }
 
+/// What a reachability self-check found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reach {
+    /// The advertised address accepted a connection and answered.
+    Ok,
+    /// Connected, but the reply was not this server's.
+    ///
+    /// Something else already holds the port. Distinguished from a refusal
+    /// because the fix is different — stop the other program, do not open a
+    /// firewall — and because "port in use" is invisible when the bind
+    /// succeeded on a DIFFERENT interface.
+    WrongServer,
+    /// Refused or timed out from the host's own LAN address.
+    ///
+    /// The bind succeeded, so the socket is listening; a connection to the
+    /// host's own external address goes through the INPUT chain, so a local
+    /// firewall blocks it here exactly as it would block the phone. This is
+    /// the check that turns "the phone cannot reach it" into "this machine is
+    /// dropping it".
+    Blocked(String),
+}
+
+impl Reach {
+    pub fn is_ok(&self) -> bool {
+        matches!(self, Reach::Ok)
+    }
+
+    /// What to tell the operator. Empty when everything is fine.
+    ///
+    /// Names the port, because the advice is a firewall rule and a rule needs
+    /// a number. "Check your firewall" without one is the kind of message that
+    /// gets read and not acted on.
+    pub fn advice(&self, port: u16) -> String {
+        match self {
+            Reach::Ok => String::new(),
+            Reach::WrongServer => format!(
+                "port {port} is answering, but not with this share — something else is \
+                 already listening. Stop it, or advertise on another port."
+            ),
+            Reach::Blocked(why) => format!(
+                "this machine refused a connection to its own share address ({why}). \
+                 A peer will be refused the same way. Allow tcp/{port} — e.g. \
+                 `sudo ufw allow {port}/tcp` or `sudo firewall-cmd --add-port={port}/tcp`."
+            ),
+        }
+    }
+}
+
+/// Classify a self-check attempt.
+///
+/// Pure over the outcome so the REPORTING is testable without a socket; the
+/// connect is the shell.
+pub fn classify_reach(connected: bool, body: Option<&str>, err: &str) -> Reach {
+    if !connected {
+        return Reach::Blocked(err.to_string());
+    }
+    match body {
+        // The bootstrap page names the product; anything else on this port is
+        // not us.
+        Some(b) if b.contains("gitmind share") => Reach::Ok,
+        _ => Reach::WrongServer,
+    }
+}
+
+/// Connect to the advertised address and see whether it answers.
+///
+/// Deliberately to the host's OWN LAN ADDRESS rather than to `127.0.0.1`: a
+/// loopback connection bypasses the INPUT chain on most setups, so it would
+/// report success on a machine whose firewall drops every LAN packet — which
+/// is the failure this exists to catch.
+pub fn self_check(addr: &str, timeout: Duration) -> Reach {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    let Ok(sa) = addr.parse() else {
+        return Reach::Blocked(format!("{addr} is not a host:port"));
+    };
+    let mut s = match TcpStream::connect_timeout(&sa, timeout) {
+        Ok(s) => s,
+        Err(e) => return classify_reach(false, None, &e.to_string()),
+    };
+    let _ = s.set_read_timeout(Some(timeout));
+    if s.write_all(format!("GET / HTTP/1.0\r\nHost: {addr}\r\n\r\n").as_bytes()).is_err() {
+        return classify_reach(false, None, "write failed");
+    }
+    let mut buf = String::new();
+    let _ = s.take(4096).read_to_string(&mut buf);
+    classify_reach(true, Some(&buf), "")
+}
+
 /// The current user (for the ssh provider url).
 pub fn current_user() -> String {
     std::env::var("USER")
@@ -621,6 +710,50 @@ mod tests {
                 "share_ip no longer ranks the host's addresses — it is guessing again");
         assert!(body.contains("host_ipv4s"),
                 "share_ip no longer enumerates interfaces");
+    }
+
+    #[test]
+    fn a_refused_connection_is_reported_as_blocked_with_the_port_to_open() {
+        // "check your firewall" without a number gets read and not acted on.
+        let r = classify_reach(false, None, "Connection refused (os error 111)");
+        assert!(matches!(r, Reach::Blocked(_)));
+        let a = r.advice(9876);
+        assert!(a.contains("9876"), "the advice does not name the port: {a}");
+        // The COMMANDS have to be copy-pasteable, not just the prose. Dropping
+        // the port from the ufw example left the message still naming 9876
+        // elsewhere, so a `contains("9876")` alone passed — found by breaking
+        // exactly that.
+        assert!(a.contains("ufw allow 9876/tcp"), "the ufw command is not runnable: {a}");
+        assert!(a.contains("--add-port=9876/tcp"), "the firewall-cmd is not runnable: {a}");
+        assert!(!r.is_ok());
+    }
+
+    #[test]
+    fn another_server_on_the_port_is_not_reported_as_a_firewall_problem() {
+        // Different cause, different fix — stop the other program rather than
+        // open a rule. Reporting it as blocked sends the operator to edit
+        // firewall rules that were never the issue.
+        let r = classify_reach(true, Some("HTTP/1.0 200 OK\r\n\r\nnginx"), "");
+        assert_eq!(r, Reach::WrongServer);
+        let a = r.advice(9876);
+        assert!(a.contains("already listening"), "{a}");
+        assert!(!a.contains("ufw"), "wrong advice for a port conflict: {a}");
+    }
+
+    #[test]
+    fn our_own_bootstrap_page_is_recognised() {
+        // The check has to identify THIS server, not merely something that
+        // answered — that is the whole difference between Ok and WrongServer.
+        let page = bootstrap_text("192.168.1.20:9876", "monorepo");
+        assert_eq!(classify_reach(true, Some(&page), ""), Reach::Ok);
+        assert!(Reach::Ok.advice(9876).is_empty(), "a healthy check produced advice");
+    }
+
+    #[test]
+    fn a_malformed_address_does_not_report_success() {
+        let r = self_check("not-an-address", Duration::from_millis(50));
+        assert!(!r.is_ok());
+        assert!(matches!(r, Reach::Blocked(_)));
     }
 
 }

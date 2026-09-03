@@ -2531,7 +2531,20 @@ impl Backend {
             let _ = netshare::serve_loop(listener, card_json, name, adv.clone());
             adv.end();
         });
-        QString::from(json!({"ok": true, "addr": addr, "name": card.name}).to_string())
+        // Self-check from the host's OWN LAN address, not loopback: a
+        // loopback connect bypasses the INPUT chain, so it would report
+        // success on a machine whose firewall drops every LAN packet — the
+        // failure the operator would otherwise discover from the phone, with
+        // nothing to go on.
+        //
+        // Advisory, not fatal. The share IS running; this only says whether a
+        // peer will get through.
+        let reach = netshare::self_check(&addr, std::time::Duration::from_millis(600));
+        QString::from(json!({
+            "ok": true, "addr": addr, "name": card.name,
+            "reachable": reach.is_ok(),
+            "warning": reach.advice(port),
+        }).to_string())
     }
 
     /// Stop advertising.
