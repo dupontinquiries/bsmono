@@ -677,3 +677,4 @@ mod tests {
         assert_eq!(out, Some(1.0), "a genuinely mirrored leg pair should score 1.0");
     }
 }
+
