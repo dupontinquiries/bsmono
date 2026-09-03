@@ -84,6 +84,15 @@ pub struct Job {
     pub block_cache_override: Option<u64>,
     /// Activation sets in flight per GPU upscaler.
     pub inflight: usize,
+    /// Conv kernel variant name (see d2x_wgpu::ConvKernel).
+    pub kernel: String,
+    /// Reuse finished segment parts from an earlier run of the same job
+    /// instead of recomputing them. A multi-hour job that dies at hour three
+    /// then costs one segment, not three hours.
+    pub resume: bool,
+    /// Keep the part files after a successful concat (so a later `--resume`
+    /// can still reuse them).
+    pub keep_parts: bool,
 }
 
 impl Default for Job {
@@ -111,7 +120,10 @@ impl Default for Job {
             vram_budget: None,
             refs_override: None,
             block_cache_override: None,
-            inflight: 2,
+            inflight: 1,
+            kernel: "rt2f".into(),
+            resume: false,
+            keep_parts: false,
         }
     }
 }
@@ -332,7 +344,13 @@ pub fn build_tiers(job: &Job) -> anyhow::Result<Vec<Box<dyn Upscaler>>> {
         let mut tiers: Vec<Box<dyn Upscaler>> = Vec::new();
         for (n, tile) in nets {
             let share = (budget as f64 * n.macs_per_input_pixel() / total_cost.max(1.0)) as u64;
-            let up = d2x_wgpu::WgpuUpscaler::with_context(ctx.clone(), n, d2x_wgpu::GpuOptions { tile, require_hw: job.require_hw, low_power: false, inflight: job.inflight.max(1), vram_budget: share })?;
+            let kernel: d2x_wgpu::ConvKernel = job.kernel.parse()?;
+            // Ask the GPU for the job's scale. When the network's scale is an
+            // exact multiple, the pack pass box-averages down on device and
+            // the host Lanczos wrapper below disappears — for the x4 compact
+            // model serving a x2 job that wrapper resized a 4x image per tile
+            // on one core, plausibly the largest CPU cost in cascade mode.
+            let up = d2x_wgpu::WgpuUpscaler::with_context(ctx.clone(), n, d2x_wgpu::GpuOptions { tile, require_hw: job.require_hw, low_power: false, inflight: job.inflight.max(1), vram_budget: share, target_scale: job.scale, kernel })?;
             let native = up.scale();
             let boxed: Box<dyn Upscaler> = Box::new(up);
             tiers.push(if native == job.scale { boxed } else { Box::new(Resampled { inner: boxed, target: job.scale }) });
@@ -377,7 +395,7 @@ pub fn build_upscaler(job: &Job) -> anyhow::Result<Box<dyn Upscaler>> {
             #[cfg(feature = "gpu")]
             {
                 let (net, _) = load_model(job.model.as_deref())?;
-                Box::new(d2x_wgpu::WgpuUpscaler::new(net, d2x_wgpu::GpuOptions { tile: job.tile, require_hw: job.require_hw, low_power: false, inflight: job.inflight.max(1), vram_budget: job.vram_budget.unwrap_or(0) })?)
+                Box::new(d2x_wgpu::WgpuUpscaler::new(net, d2x_wgpu::GpuOptions { tile: job.tile, require_hw: job.require_hw, low_power: false, inflight: job.inflight.max(1), vram_budget: job.vram_budget.unwrap_or(0), target_scale: job.scale, kernel: job.kernel.parse()? })?)
             }
             #[cfg(not(feature = "gpu"))]
             {
@@ -578,21 +596,39 @@ impl Upscaler for SharedUpscaler {
     }
 }
 
+/// Identifies the settings a part was produced with, so `--resume` never
+/// stitches together segments from different runs. Any change that alters
+/// pixels or timing must appear here.
+fn segment_stamp(job: &Job, scale: u32) -> String {
+    let a = &job.pipeline.analyze;
+    format!(
+        "d2x1 in={} scale={} model={} cascade={} flat={} kernel={} q={} block={} bleed={} noise={} matcher={:?} tier={:?} streak={} refs={:?} codec={} crf={} preset={} tenbit={} jobs={}",
+        job.input.display(),
+        scale,
+        job.model.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+        job.cascade_model.is_some(),
+        job.flat_bypass,
+        job.kernel,
+        job.pipeline.quality,
+        a.block_size,
+        a.bleed,
+        job.pipeline.noise,
+        job.pipeline.matcher,
+        a.tier_std,
+        a.streak_bonus,
+        job.refs_override,
+        job.encode.codec,
+        job.encode.crf,
+        job.encode.preset,
+        job.encode.ten_bit,
+        job.jobs,
+    )
+}
+
 /// Segment-parallel run: `jobs` workers over keyframe-aligned segments of a
 /// video input, one shared upscaler, part files concatenated at the end.
 /// Events carry the segment index as `Event::Started`'s upscaler name prefix
 /// and are delivered on the calling thread.
-/// What a segment worker reports back.
-///
-/// `Progress` was the only case; `Done` is the addition resume needed. The
-/// coordinator learns of success from `join()` too, but only after every
-/// worker has finished — too late to record anything, and precisely the window
-/// a kill lands in.
-enum SegMsg {
-    Progress(PEvent),
-    Done,
-    Failed(String),
-}
 
 pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyhow::Result<Summary> {
     preflight_or_bail(job)?;
@@ -601,6 +637,7 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
     let p = ffmpeg::probe(&job.input)?;
     let keyframes = ffmpeg::keyframe_times(&job.input).unwrap_or_default();
     let segs = ffmpeg::segments(&keyframes, p.duration_s, job.jobs);
+    let wall = std::time::Instant::now();
     let servers: Vec<Arc<BatchServer>> = build_tiers(job)?.into_iter().map(|u| BatchServer::start(u, std::time::Duration::from_millis(15), 4_000_000)).collect();
     let scale = servers[0].scale;
     let plan = mem_plan(job, p.info.width, p.info.height, scale);
@@ -613,60 +650,36 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
     let ext = job.output.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "mkv".into());
     let parts: Vec<PathBuf> = segs.iter().map(|s| job.output.with_file_name(format!("{stem}.part{:03}.{ext}", s.index))).collect();
 
-    // ── resume ───────────────────────────────────────────────────────────
-    //
-    // A segment already encoded on a previous run is skipped entirely: no
-    // worker, no decode, no upscale. See `crate::checkpoint` for why a part
-    // file on disk is not enough on its own to believe that.
-    let ck_path = crate::checkpoint::path_for(&job.output);
-    let fp = {
-        let (size, mtime) = std::fs::metadata(&job.input)
-            .map(|m| (m.len(), m.modified().ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64).unwrap_or(0)))
-            .unwrap_or((0, 0));
-        crate::checkpoint::fingerprint(
-            &job.input, size, mtime,
-            &job.model.as_ref().map(|m| m.display().to_string()).unwrap_or_else(|| "default".into()),
-            job.scale,
-            &format!("{:?}", job.backend),
-        )
-    };
-    let mut ck = std::fs::read_to_string(&ck_path)
-        .map(|t| crate::checkpoint::Checkpoint::parse(&t))
-        .unwrap_or_default();
-    if !ck.matches(&fp, segs.len()) {
-        // A checkpoint for another job, another split, or no checkpoint at
-        // all. Starting fresh is the safe answer; resuming into a different
-        // job produces a full-length output that is half wrong.
-        if !ck.fingerprint.is_empty() {
-            eprintln!("resume: checkpoint does not match this job — starting over");
-        }
-        ck = crate::checkpoint::Checkpoint { fingerprint: fp.clone(), segments: segs.len(), ..Default::default() };
+    // A part counts as finished only if its sidecar records the same job
+    // parameters and frame count; a part file alone could be a truncated
+    // write from a killed run.
+    let done_path = |part: &PathBuf| part.with_extension("done");
+    let stamp = segment_stamp(job, scale);
+    let reusable: Vec<bool> = parts
+        .iter()
+        .map(|part| {
+            if !job.resume || !part.exists() {
+                return false;
+            }
+            match std::fs::read_to_string(done_path(part)) {
+                Ok(t) => t.lines().next() == Some(stamp.as_str()),
+                Err(_) => false,
+            }
+        })
+        .collect();
+    let reused = reusable.iter().filter(|r| **r).count();
+    if job.resume {
+        eprintln!("resume: {reused} of {} segments already done", parts.len());
     }
-    let done = ck.resumable(&parts, &|p: &Path| p.is_file());
-    // Anything the record claimed but cannot back with a file is dropped, so
-    // the checkpoint on disk never grows stale claims.
-    ck.done = done.clone();
-    if !done.is_empty() {
-        eprintln!("resume: {} of {} segments already done — skipping them", done.len(), segs.len());
-    }
-    let write_ck = |c: &crate::checkpoint::Checkpoint| {
-        if let Err(e) = std::fs::write(&ck_path, c.render()) {
-            // Not fatal: the run still produces the right video, it just will
-            // not be resumable. Saying so beats a silent loss of the feature.
-            eprintln!("resume: could not write {}: {e}", ck_path.display());
-        }
-    };
-    write_ck(&ck);
 
-    let (tx, rx) = std::sync::mpsc::channel::<(usize, SegMsg)>();
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<PEvent, String>)>();
     let mut handles = Vec::new();
-    for (seg, part) in segs.iter().zip(&parts) {
-        if done.contains(&seg.index) {
+    for ((seg, part), skip) in segs.iter().zip(&parts).zip(&reusable) {
+        if *skip {
             continue;
         }
         let (seg, part, tx, p, job, servers, all, cache, cfg) = (*seg, part.clone(), tx.clone(), p.clone(), job.clone(), servers.clone(), keyframes.clone(), shared_cache.clone(), cfg);
+        let stamp = stamp.clone();
         handles.push(std::thread::Builder::new().name(format!("d2x-seg{}", seg.index)).spawn(move || -> anyhow::Result<Summary> {
             let src = Box::new(FfmpegSource::open_segment(&job.input, &p, seg)?);
             let mut enc = job.encode.clone();
@@ -676,15 +689,17 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
             let sink = Box::new(FfmpegSink::open(&part, None, &p, w, h, &enc)?);
             let ups: Vec<Box<dyn Upscaler>> = servers.iter().map(|s| Box::new(s.client()) as Box<dyn Upscaler>).collect();
             let r = d2x_core::pipeline::run_tiered_with_cache(src, ups, sink, cfg, cache, |e| {
-                let _ = tx.send((seg.index, SegMsg::Progress(e)));
+                let _ = tx.send((seg.index, Ok(e)));
             });
             match &r {
-                // The completion signal the checkpoint needs. `join()` also
-                // reports success, but only after EVERY worker has finished —
-                // too late to record anything, which is exactly the window a
-                // kill lands in.
-                Ok(_) => { let _ = tx.send((seg.index, SegMsg::Done)); }
-                Err(e) => { let _ = tx.send((seg.index, SegMsg::Failed(format!("{e:#}")))); }
+                Ok(sum) => {
+                    // Written only after the sink finished, so a killed run
+                    // leaves a part with no sidecar and it is recomputed.
+                    let _ = std::fs::write(part.with_extension("done"), format!("{stamp}\n{} frames\n", sum.frames));
+                }
+                Err(e) => {
+                    let _ = tx.send((seg.index, Err(format!("{e:#}"))));
+                }
             }
             r
         })?);
@@ -692,41 +707,50 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
     drop(tx);
     for (i, msg) in rx {
         match msg {
-            SegMsg::Progress(e) => on_event(i, e),
-            SegMsg::Done => {
-                // Written on EVERY completion rather than once at the end: the
-                // whole point is to survive a kill, and a checkpoint flushed
-                // at exit is one that never exists when it is needed.
-                ck.done.insert(i);
-                write_ck(&ck);
-            }
-            SegMsg::Failed(e) => eprintln!("segment {i}: {e}"),
+            Ok(e) => on_event(i, e),
+            Err(e) => eprintln!("segment {i}: {e}"),
         }
     }
     let mut frames = 0;
+    let mut computed_frames = 0u64;
     let mut fraction = 0.0;
     let mut heavy = 0.0;
-    let mut elapsed = std::time::Duration::ZERO;
     for h in handles {
         let s = h.join().map_err(|_| anyhow!("segment worker panicked"))??;
         fraction += s.upscaled_pixel_fraction * s.frames as f64;
         heavy += s.heavy_pixel_fraction * s.frames as f64;
         frames += s.frames;
-        elapsed = elapsed.max(s.elapsed);
+        computed_frames += s.frames;
     }
-    // Concat FIRST, then drop the parts and the checkpoint. If the concat
-    // fails the parts and the record both survive, so the next run resumes
-    // instead of re-upscaling everything to hit the same muxer error.
+    // Reused segments contribute no Summary; count their frames from the
+    // sidecar so the reported total covers the whole clip.
+    for (part, skip) in parts.iter().zip(&reusable) {
+        if !*skip {
+            continue;
+        }
+        if let Some(n) = std::fs::read_to_string(done_path(part)).ok().and_then(|t| t.lines().nth(1).and_then(|l| l.split_whitespace().next().and_then(|n| n.parse::<u64>().ok()))) {
+            frames += n;
+        }
+    }
+    // Concat FIRST, then drop the parts and their sidecars. If the concat
+    // fails, both survive and the next run resumes instead of re-upscaling
+    // everything to hit the same muxer error.
     ffmpeg::concat_parts(&parts, &job.input, &job.output)?;
-    for part in &parts {
-        let _ = std::fs::remove_file(part);
+    if !job.keep_parts {
+        for part in &parts {
+            let _ = std::fs::remove_file(part);
+            let _ = std::fs::remove_file(done_path(part));
+        }
     }
-    let _ = std::fs::remove_file(&ck_path);
-    // NOTE: these totals cover the segments this RUN processed. A resumed run
-    // reports less work than the video contains, because the skipped segments
-    // were measured by the run that did them. Reporting a guess for them would
-    // be worse than reporting the truth about what just happened.
-    Ok(Summary { frames, elapsed, upscaled_pixel_fraction: if frames > 0 { fraction / frames as f64 } else { 0.0 }, heavy_pixel_fraction: if frames > 0 { heavy / frames as f64 } else { 0.0 } })
+    // Wall clock, not the max worker time: with `--resume` some segments do no
+    // work at all, and the pixel fractions describe only the frames actually
+    // computed — averaging them over reused frames would understate them.
+    let elapsed = wall.elapsed();
+    let denom = computed_frames.max(1) as f64;
+    if reused > 0 {
+        eprintln!("resume: {computed_frames} frames computed, {} reused from earlier parts", frames - computed_frames);
+    }
+    Ok(Summary { frames, elapsed, upscaled_pixel_fraction: fraction / denom, heavy_pixel_fraction: heavy / denom })
 }
 
 /// Refuse a run this machine cannot finish, before it starts.

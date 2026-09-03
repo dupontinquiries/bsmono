@@ -357,23 +357,46 @@ impl Network {
         for op in &self.ops {
             match op {
                 Op::Conv(c) => {
-                    let src_t = bufs[c.src].as_ref().expect("conv src");
-                    let (ih, iw) = (src_t.h * c.in_scale as usize, src_t.w * c.in_scale as usize);
-                    let (oh, ow) = (ih + 2 * c.pad as usize - 2, iw + 2 * c.pad as usize - 2);
-                    let residual = c.residual.map(|(b, s)| (bufs[b].as_ref().expect("residual buf").clone(), s));
-                    // A dense-block conv reads [0, src_ch) and writes [dst_off, ..) of
-                    // the same buffer; the ranges are disjoint, so a copy of the
-                    // input channels is the honest reference semantics.
-                    let src_owned: Tensor = {
-                        let mut t = Tensor::zeros(c.src_ch, src_t.h, src_t.w);
-                        for ch in 0..c.src_ch {
-                            t.plane_mut(ch).copy_from_slice(src_t.plane(ch));
-                        }
-                        t
+                    let (sh, sw) = {
+                        let t = bufs[c.src].as_ref().expect("conv src");
+                        (t.h, t.w)
                     };
-                    let mut dst = bufs[c.dst].take().filter(|t| t.h == oh && t.w == ow).unwrap_or_else(|| Tensor::zeros(self.bufs[c.dst].channels, oh, ow));
-                    conv3x3_cpu(c, &src_owned, &mut dst, residual.as_ref());
-                    bufs[c.dst] = Some(dst);
+                    let (ih, iw) = (sh * c.in_scale as usize, sw * c.in_scale as usize);
+                    let (oh, ow) = (ih + 2 * c.pad as usize - 2, iw + 2 * c.pad as usize - 2);
+                    let plane = oh * ow;
+                    if c.src == c.dst {
+                        // A dense block reads the front of a buffer and writes
+                        // further along the same one. The ranges are disjoint,
+                        // so split rather than copy the input — that copy was
+                        // up to 192 planes, ~280 times per RRDB tile.
+                        debug_assert!(c.dst_off >= c.src_ch, "aliased conv must write past what it reads");
+                        let mut buf = bufs[c.dst].take().expect("aliased conv buffer");
+                        let res = c.residual.map(|(b, sc)| (bufs[b].as_ref().expect("residual buf").data.clone(), sc));
+                        let (head, tail) = buf.data.split_at_mut(c.dst_off * plane);
+                        conv3x3_core(c, head, sh, sw, tail, oh, ow, res.as_ref().map(|(d, sc)| (d.as_slice(), *sc)));
+                        bufs[c.dst] = Some(buf);
+                    } else {
+                        // `conv_body` adds its residual from the buffer it also
+                        // writes, so that one has to be copied; every other
+                        // residual (the per-RDB one, which runs 69 times more
+                        // often) reads a different buffer and is borrowed.
+                        let res_owned = match c.residual {
+                            Some((b, sc)) if b == c.dst => Some((bufs[b].as_ref().expect("residual buf").data.clone(), sc)),
+                            _ => None,
+                        };
+                        // Take the destination out first; the source and the
+                        // residual are then plain shared borrows, no clones.
+                        let mut dst = bufs[c.dst].take().filter(|t| t.h == oh && t.w == ow).unwrap_or_else(|| Tensor::zeros(self.bufs[c.dst].channels, oh, ow));
+                        let src = bufs[c.src].as_ref().expect("conv src");
+                        let res = match (&res_owned, c.residual) {
+                            (Some((d, sc)), _) => Some((d.as_slice(), *sc)),
+                            (None, Some((b, sc))) => Some((bufs[b].as_ref().expect("residual buf").data.as_slice(), sc)),
+                            _ => None,
+                        };
+                        let base = c.dst_off * plane;
+                        conv3x3_core(c, &src.data, sh, sw, &mut dst.data[base..], oh, ow, res);
+                        bufs[c.dst] = Some(dst);
+                    }
                 }
                 Op::Deconv(d) => {
                     let src = bufs[d.src].as_ref().expect("deconv src");
@@ -381,21 +404,25 @@ impl Network {
                     bufs[d.dst] = Some(out);
                 }
                 Op::Copy { src, dst, dst_off, ch } => {
-                    let s = bufs[*src].as_ref().expect("copy src").clone();
-                    let mut d = bufs[*dst].take().filter(|t| t.h == s.h && t.w == s.w).unwrap_or_else(|| Tensor::zeros(self.bufs[*dst].channels, s.h, s.w));
+                    let (sh, sw) = {
+                        let t = bufs[*src].as_ref().expect("copy src");
+                        (t.h, t.w)
+                    };
+                    let mut d = bufs[*dst].take().filter(|t| t.h == sh && t.w == sw).unwrap_or_else(|| Tensor::zeros(self.bufs[*dst].channels, sh, sw));
+                    let s = bufs[*src].as_ref().expect("copy src");
                     for c in 0..*ch {
                         d.plane_mut(dst_off + c).copy_from_slice(s.plane(c));
                     }
                     bufs[*dst] = Some(d);
                 }
                 Op::AddScaled { dst, src, ch, scale } => {
-                    let s = bufs[*src].as_ref().expect("add src").clone();
-                    let d = bufs[*dst].as_mut().expect("add dst");
-                    for c in 0..*ch {
-                        for (dv, sv) in d.plane_mut(c).iter_mut().zip(s.plane(c)) {
-                            *dv = *dv * scale + sv;
-                        }
+                    let mut d = bufs[*dst].take().expect("add dst");
+                    let s = bufs[*src].as_ref().expect("add src");
+                    let n = d.h * d.w * *ch;
+                    for (dv, sv) in d.data[..n].iter_mut().zip(&s.data[..n]) {
+                        *dv = *dv * scale + sv;
                     }
+                    bufs[*dst] = Some(d);
                 }
             }
         }
@@ -405,70 +432,101 @@ impl Network {
 
 /// Same/valid 3×3 conv with folded nearest upsampling, residual, activation.
 /// Writes channels `[dst_off, dst_off+out_ch)` of `dst`.
-pub fn conv3x3_cpu(c: &ConvOp, x: &Tensor, dst: &mut Tensor, residual: Option<&(Tensor, f32)>) {
+/// Convolve `src` (`src_ch` planes of `sh` x `sw`) into `out`, which holds
+/// `out_ch` contiguous planes of `oh` x `ow` starting at its own channel 0.
+///
+/// Slice-based rather than `Tensor`-based so a dense block, which reads the
+/// front of a buffer and writes further along the same one, can pass two
+/// disjoint halves instead of copying its input.
+#[allow(clippy::too_many_arguments)]
+pub fn conv3x3_core(c: &ConvOp, src: &[f32], sh: usize, sw: usize, out: &mut [f32], oh: usize, ow: usize, residual: Option<(&[f32], f32)>) {
     let s = c.in_scale as usize;
-    let (ih, iw) = (x.h * s, x.w * s);
+    let (ih, iw) = (sh * s, sw * s);
     let pad = c.pad as usize;
-    let (oh, ow) = (dst.h, dst.w);
     debug_assert_eq!((oh, ow), (ih + 2 * pad - 2, iw + 2 * pad - 2));
     let in_ch = c.src_ch;
     let plane = oh * ow;
-    let base = c.dst_off * plane;
-    dst.data[base..base + c.out_ch * plane].par_chunks_mut(plane).enumerate().for_each(|(oc, out)| {
-        for v in out.iter_mut() {
-            *v = c.bias[oc];
+    let src_plane = sh * sw;
+    // Output channels are handled four at a time so each input row is read
+    // once and used twelve times (4 channels x 3 taps) instead of being
+    // re-read for every channel. Same trade that won on the GPU, and it counts
+    // for more here because memory is the tighter resource on the machines
+    // this path serves.
+    const OCB: usize = 4;
+    out[..c.out_ch * plane].par_chunks_mut(OCB * plane).enumerate().for_each(|(g, outs)| {
+        let oc0 = g * OCB;
+        let nch = OCB.min(c.out_ch - oc0);
+        for j in 0..nch {
+            let b = c.bias[oc0 + j];
+            outs[j * plane..(j + 1) * plane].iter_mut().for_each(|v| *v = b);
         }
-        for ic in 0..in_ch {
-            let xp = x.plane(ic);
-            for ky in 0..3 {
-                for kx in 0..3 {
-                    let wv = c.weight[((oc * in_ch + ic) * 3 + ky) * 3 + kx];
-                    // Output columns whose source column sx = ox + kx - pad is inside [0, iw).
-                    let ox0 = pad.saturating_sub(kx);
-                    let ox1 = (iw + pad - kx).min(ow);
-                    if ox1 <= ox0 {
+        // Row-outermost. The tap loops used to have `oy` innermost, so each of
+        // the 9 x in_ch taps streamed the entire output plane — for an RRDB
+        // layer roughly 1700 passes over 520 KB, past L2 on the small machines
+        // this path exists for, so the output was re-fetched from memory every
+        // tap. With the row hoisted, one output row stays in L1 across all of
+        // them.
+        //
+        // The per-element accumulation order is unchanged (ic, then ky, then
+        // kx), so this is bit-identical, not merely close.
+        for oy in 0..oh {
+            for ic in 0..in_ch {
+                let xp = &src[ic * src_plane..(ic + 1) * src_plane];
+                for ky in 0..3 {
+                    let sy = oy + ky;
+                    if sy < pad || sy - pad >= ih {
                         continue;
                     }
-                    for oy in 0..oh {
-                        let sy = oy + ky;
-                        if sy < pad || sy - pad >= ih {
+                    let row = &xp[((sy - pad) / s) * sw..((sy - pad) / s + 1) * sw];
+                    for kx in 0..3 {
+                        // Output columns whose source column sx = ox + kx - pad is inside [0, iw).
+                        let ox0 = pad.saturating_sub(kx);
+                        let ox1 = (iw + pad - kx).min(ow);
+                        if ox1 <= ox0 {
                             continue;
                         }
-                        let row = &xp[((sy - pad) / s) * x.w..((sy - pad) / s + 1) * x.w];
-                        let out_row = &mut out[oy * ow + ox0..oy * ow + ox1];
                         let sx0 = ox0 + kx - pad;
-                        if s == 1 {
-                            for (o, &i) in out_row.iter_mut().zip(&row[sx0..sx0 + (ox1 - ox0)]) {
-                                *o += wv * i;
-                            }
-                        } else {
-                            for (k, o) in out_row.iter_mut().enumerate() {
-                                *o += wv * row[(sx0 + k) / s];
+                        for j in 0..nch {
+                            let wv = c.weight[(((oc0 + j) * in_ch + ic) * 3 + ky) * 3 + kx];
+                            let off = j * plane + oy * ow;
+                            let seg = &mut outs[off + ox0..off + ox1];
+                            if s == 1 {
+                                for (o, &i) in seg.iter_mut().zip(&row[sx0..sx0 + (ox1 - ox0)]) {
+                                    *o += wv * i;
+                                }
+                            } else {
+                                for (k, o) in seg.iter_mut().enumerate() {
+                                    *o += wv * row[(sx0 + k) / s];
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        if let Some((r, scale)) = residual {
-            for (v, rv) in out.iter_mut().zip(r.plane(oc)) {
-                *v = *v * scale + rv;
-            }
-        }
-        match c.act {
-            Act::None => {}
-            Act::Leaky(slope) => out.iter_mut().for_each(|v| {
-                if *v < 0.0 {
-                    *v *= slope;
+        for j in 0..nch {
+            let oc = oc0 + j;
+            let out = &mut outs[j * plane..(j + 1) * plane];
+            if let Some((r, scale)) = residual {
+                for (v, rv) in out.iter_mut().zip(&r[oc * plane..(oc + 1) * plane]) {
+                    *v = *v * scale + rv;
                 }
-            }),
-            Act::PReLU => {
-                let slope = c.prelu[oc];
-                out.iter_mut().for_each(|v| {
+            }
+            match c.act {
+                Act::None => {}
+                Act::Leaky(slope) => out.iter_mut().for_each(|v| {
                     if *v < 0.0 {
                         *v *= slope;
                     }
-                })
+                }),
+                Act::PReLU => {
+                    let slope = c.prelu[oc];
+                    out.iter_mut().for_each(|v| {
+                        if *v < 0.0 {
+                            *v *= slope;
+                        }
+                    })
+                }
             }
         }
     });
@@ -524,19 +582,23 @@ pub struct TileRect {
     pub h: u32,
 }
 
+/// Split a `width×height` image into tiles of at most `tile` on a side,
+/// balanced: `1920` at `tile = 400` becomes five tiles of 384, not four of
+/// 400 and a 320 remainder. Equal tiles pay the least padding overhead and
+/// the last tile is never a sliver that under-fills the GPU.
 pub fn tiles(width: u32, height: u32, tile: u32) -> Vec<TileRect> {
     assert!(tile > 0);
-    let mut v = Vec::new();
-    let mut y = 0;
-    while y < height {
-        let h = tile.min(height - y);
-        let mut x = 0;
-        while x < width {
-            let w = tile.min(width - x);
+    let nx = width.div_ceil(tile).max(1);
+    let ny = height.div_ceil(tile).max(1);
+    let mut v = Vec::with_capacity((nx * ny) as usize);
+    for j in 0..ny {
+        let y = height * j / ny;
+        let h = height * (j + 1) / ny - y;
+        for i in 0..nx {
+            let x = width * i / nx;
+            let w = width * (i + 1) / nx - x;
             v.push(TileRect { x, y, w, h });
-            x += w;
         }
-        y += h;
     }
     v
 }
@@ -678,6 +740,45 @@ impl Network {
         }
     }
 
+    /// The padded frame as RGBA8 words, the layout a GPU keeps resident so a
+    /// frame costs one upload instead of one per tile.
+    pub fn frame_rgba8(padded: &Frame) -> Vec<u32> {
+        let mut v = Vec::new();
+        Self::frame_rgba8_into(padded, &mut v);
+        v
+    }
+
+    /// [`Network::frame_rgba8`] reusing the caller's allocation: this runs once
+    /// per frame on ~2 M pixels, so the 8 MB Vec should not be rebuilt each time.
+    pub fn frame_rgba8_into(src: &Frame, out: &mut Vec<u32>) {
+        let n = (src.width as usize) * (src.height as usize);
+        out.clear();
+        out.resize(n, 0);
+        // Row-parallel: this is ~2 M independent pixels on the critical path
+        // between GPU submits, and it was running on one core.
+        let w = src.width as usize;
+        out.par_chunks_mut(w).enumerate().for_each(|(y, dst)| {
+            let row = src.row(y as u32, 0, src.width);
+            for (d, p) in dst.iter_mut().zip(row.chunks_exact(3)) {
+                *d = (p[0] as u32) | ((p[1] as u32) << 8) | ((p[2] as u32) << 16) | 0xff00_0000;
+            }
+        });
+    }
+
+    /// The inverse for readback: packed RGBA8 words to an RGB frame, in
+    /// parallel. At 4K this is 8.3 M pixels per frame and was the largest
+    /// single host cost in the GPU path.
+    pub fn rgb_from_rgba8(src: &[u8], out: &mut Frame) {
+        let w = out.width as usize;
+        assert_eq!(src.len(), w * (out.height as usize) * 4, "readback size");
+        out.data.par_chunks_mut(w * 3).enumerate().for_each(|(y, dst)| {
+            let row = &src[y * w * 4..(y + 1) * w * 4];
+            for (d, s) in dst.chunks_exact_mut(3).zip(row.chunks_exact(4)) {
+                d.copy_from_slice(&s[..3]);
+            }
+        });
+    }
+
     /// Whole-frame upscale on the CPU, tiled. The oracle and the no-GPU fallback.
     pub fn upscale_cpu(&self, frame: &Frame, tile: u32) -> Frame {
         let padded = self.pad_frame(frame);
@@ -797,8 +898,10 @@ mod tests {
         let net = Network::load(&p).unwrap();
         assert_eq!((net.scale, net.shuffle), (4, 4));
         eprintln!("srvgg: {:.2} MMAC/px", net.macs_per_input_pixel() / 1e6);
-        let got = net.upscale_cpu(&input, 48);
-        compare(&got, &want, 6, "srvgg vs numpy (tile 48, overlap 10)");
+        // Single tile: exact up to float reordering.
+        compare(&net.upscale_cpu(&input, 256), &want, 3, "srvgg vs numpy (whole)");
+        // Small tiles: the 10-px overlap leaves seam pixels a few LSB off.
+        compare(&net.upscale_cpu(&input, 48), &want, 8, "srvgg vs numpy (tile 48, overlap 10)");
     }
 
     #[test]

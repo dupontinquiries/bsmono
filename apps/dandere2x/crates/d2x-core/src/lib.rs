@@ -28,6 +28,8 @@ pub mod net;
 pub mod pipeline;
 pub mod plan;
 pub mod predict;
+pub mod quality;
+pub mod registry;
 pub mod residual;
 pub mod st;
 pub mod upscale;
@@ -72,5 +74,5 @@ pub(crate) mod testimg {
 pub use frame::Frame;
 pub use pipeline::{run, Event, FrameSink, FrameSource, PipelineConfig, SourceInfo, Summary};
 pub use plan::{FramePlan, FrameStats};
-pub use predict::AnalyzeConfig;
+pub use predict::{AnalyzeConfig, TierMetric};
 pub use upscale::Upscaler;

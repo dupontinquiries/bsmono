@@ -37,6 +37,30 @@ The model is data: `Network::load` builds an op list from
 - `.safetensors` — Real-ESRGAN **RRDBNet** (x2/x4/x8 photo models: `conv_first` … 23 RRDB … `conv_up*`), or **SRVGGNetCompact** (`realesr-animevideov3`). Convert PyTorch checkpoints with `tools/pth2st.py` (numpy only, no torch).
 - `.json` — waifu2x `upconv_7` (nagadomi's format).
 
+`dandere2x models [dir] [--gmac N]` walks a folder and reports every model's
+architecture, cost, parameter count and — the part that matters — whether it
+loads and produces sane output. Verification runs a real forward pass on flat
+grey and checks the result is finite and still grey; a mis-converted or
+mis-ordered weight file passes a load but fails that, and would otherwise only
+show up as a bad picture hours into a job. With `--gmac` (a figure from
+`bench`) the cost becomes seconds per 1080p frame, and the command prints the
+cascade pairing the folder supports, e.g.
+
+```
+    ok  realesr-animevideov3   SRVGG x4 · 0.62 MMAC/px · 0.6M params · 1.3 s/1080p frame
+    ok  RealESRGAN_x2          RRDBNet x2 · 4.48 MMAC/px · 16.7M params · 9.1 s/1080p frame
+
+x2 ladder: --model .../RealESRGAN_x2.safetensors --cascade .../upconv_7...json  (8x)
+```
+
+The shell has the same catalogue as a picker (folder field + Scan, one row per
+model with its badge and cost, cascade tier chosen from the same list),
+modelled on logscope's `logscope-egui/src/model.rs` — including the lesson it
+paid for: **selection is keyed by path, not by list index**, because a rescan
+shifts every index after an added file and a stale index stays in range while
+naming a different model. Unusable models are reported in the log rather than
+offered as choices.
+
 `models/` vendors `realesr-animevideov3.safetensors` (2.5 MB, x4, ~0.62 MMAC
 per input pixel). The RRDB photo models are 67 MB each and are not vendored;
 `RealESRGAN_x2` costs ~4.5 MMAC per input pixel, x4 ~17. `dandere2x model
@@ -76,6 +100,26 @@ metadata are remuxed from the source.
 Before frame 0 a long input costs a probe, a keyframe scan (packet headers
 only, cached in `<input>.<ext>.d2xkf`), the model load, GPU init and one
 full-frame upscale; each is reported as a stage so the shell is never silent.
+
+## Pricing a speed setting
+
+Every throughput number here is a trade, so `compare` reports the other side
+of it. Render once with slow settings as a reference, once with the fast ones,
+then:
+
+```
+dandere2x compare -r ref.mkv -t fast.mkv
+18 frames (0 identical): PSNR mean 43.96 dB, min 40.01 dB @ frame 17;
+SSIM mean 0.9904, min 0.9812 @ frame 17 — very close
+```
+
+That run cost 6x less network work (54.5% of pixels down to 8.9%) for 44 dB /
+0.990 SSIM. Both metrics are reported because they disagree usefully — a flat
+brightness shift wrecks PSNR while SSIM barely moves — and both the mean and
+the **minimum with its frame index** are shown, because a mean hides the one
+frame an eye catches. `--per-frame` prints every frame; `--frames N` bounds a
+trial. A length mismatch is an error rather than a partial comparison, since a
+truncated render would otherwise score well on the frames that exist.
 
 ## Numbers and where the time goes
 
@@ -159,8 +203,14 @@ What is built:
   anyway. On lavapipe this is a net loss (CPU rasterizer, pixel-
   proportional); the gain exists only on a real GPU and is bounded by how
   much time the job spends on tiny residuals.
-- **Keyframe-aligned segments** (`-j`): N encoders, one shared GPU, resumable
-  parts.
+- **Keyframe-aligned segments** (`-j`): N encoders, one shared GPU.
+- **Resume** (`--resume`, with `--keep-parts` on the first run): each finished
+  segment writes a sidecar stamped with every setting that affects pixels or
+  timing — model, kernel, scale, gate, cascade, matcher, codec, crf, segment
+  count. A rerun reuses only parts whose stamp matches, so an interrupted
+  multi-hour job costs one segment rather than the whole night, and changing
+  `--quality` (or anything else) correctly invalidates everything. A part
+  without its sidecar is treated as a truncated write and recomputed.
 - **Difficulty cascade** (`--cascade default|model.safetensors`,
   `--flat-bypass`): missing blocks are classed by luma standard deviation.
   Flat blocks (< `--flat-std`, default 2) get bicubic; smooth blocks
@@ -200,14 +250,68 @@ What is built:
   `1 + b·min(n,8)/8`, so blocks that keep matching stop flickering out at
   the threshold. Drift is bounded at that multiple of the JPEG error.
 
-What would move the big number (RRDB is ~9 TMAC per 1080p frame; the conv
-kernel is all of it):
+**Kernel results on an M2 Ultra (Honeykrisp, RealESRGAN x2, tile 688, f32
+peak ~13.6 TFLOPS).** Every variant is bit-exact against the CPU reference;
+they differ only in how they spend registers and address arithmetic:
+
+| kernel | GMAC/s | shape |
+|---|---|---|
+| rt1 | 661 | 1 px × 4 ch |
+| rt4 | 683 | 4×4 px × 4 ch — pixel axis, ~130 registers |
+| wino | 677 | Winograd F(2,3), 2.25× fewer multiplies |
+| rt2 | 896 | 2×2 px × 4 ch |
+| rt2c8 | 977–988 | 2×2 px × 8 ch — channel axis |
+| **rt2f** | **1022** | rt2 + branch-duplicated interior fast path |
+| rt2f (SRVGG, tile 1024) | 1403 | the compact net reaches 2.8 TFLOPS, ~21% of peak |
+| rt2c8f | 803 | both of the above — the duplication spills |
+| rt2c16f | 495 | 2×2 px × 16 ch — eight copies of the block |
+
+The last two are the instructive failures: each win is real alone, but the
+fast path was implemented as a duplicated branch, so composing it with
+channel blocking put four (then eight) copies of the accumulator block in
+one shader and the register allocator spilled. `rt2h` / `rt2c8h` redo it
+structurally — the bounds test and in_scale divide are hoisted out of the
+channel loop into per-thread row bases, column offsets and 0/1 masks, with a
+single copy of the block.
+
+Kernel findings that generalise past this app — the register/multiply
+tradeoff on AGX, why Winograd loses, why in-flight overlap is a no-op on
+unified memory — are written up for the gpu-gemm side in
+[`docs/FOR_LOGSCOPE.md`](docs/FOR_LOGSCOPE.md), along with the two gpu-gemm
+lessons dandere2x has not yet applied.
+
+Dispatch-level lessons come from `apps/logscope/reference-docs/ENGINE_PERF_STATUS.md`,
+which settled the same question for gpu-gemm: dispatch granularity, not
+arithmetic. Params uniforms are created once and (with balanced tiling) have
+identical dims across tiles; per-tile rewriting is the mistake that doc calls
+the dims-uniform cache.
+
+Winograd cutting multiplies by 2.25× and *losing* is the useful result: the
+kernel is not multiply-bound. The inverted U peaking at 2×2 says registers
+are the binding resource, and the channel axis is the one way to raise
+arithmetic per load without spending input registers. `rt2c8f` (channel
+blocking + a branchless interior path that drops the per-scalar bounds test
+and in_scale divide) is the current default; `rt2c16f` pushes the channel
+axis further. Tile size and in-flight sets are settled: flat from 400 to 688,
+and extra sets only steal VRAM from tile size.
+
+**Measuring the kernel on your GPU** — `dandere2x bench --model X --vram-budget 8G`
+runs both conv kernels on full-size tiles and prints ms/tile, GMAC/s, TFLOPS,
+and the implied seconds per full 1080p frame. That number against the
+device's peak (M2 Max ≈ 13.6, M2 Ultra ≈ 27 TFLOPS f32) is the kernel's
+efficiency; `analyze` gives the reuse fraction; the product of the two is the
+job. Kernels: `rt4` (default: 4×4 px × 4 ch per thread, ~2.9× the FMAs per
+load of `rt2`) and `rt2`; both bit-exact against the CPU reference, pick by
+`bench`. With a VRAM budget the tile auto-sizes up to 1024 (a body conv on a
+400-px tile is ~1.3 waves on 76 cores) and tiles are balanced (1920 →
+5 × 384, never 4 × 400 + 320).
+
+What would move the big number further (RRDB is ~9 TMAC per 1080p frame; the
+conv kernel is all of it):
 
 - **Winograd F(2×2, 3×3)**: 2.25× fewer multiplies for every 3×3 same-pad
   conv, exact in f32. Transform-domain batched GEMM is a kernel the tree
   already has form for (gpu-gemm).
-- **Register tiling**: the kernel does 36 vec4 FMAs per 52 loads per input
-  channel; 4×2 pixels × 8 channels roughly doubles FMA-per-load.
 - **f16 storage** (f32 math) halves activation bandwidth where the adapter
   offers `SHADER_F16`.
 - **Gate**: the JPEG round trip could be replaced by a DCT-domain

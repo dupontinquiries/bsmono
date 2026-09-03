@@ -273,7 +273,10 @@ mod tests {
     #[test]
     fn tiered_residuals_roundtrip() {
         use crate::predict::{analyze_tiered, AnalyzeState};
-        let cfg = AnalyzeConfig { block_size: 16, bleed: 1, tier_std: [2.0, 12.0], ..Default::default() };
+        // Pinned to the std metric: this fixture separates under luma std-dev,
+        // not under the default high-frequency metric (a gentle ramp has no
+        // more HF energy than a flat block, so both would route to bicubic).
+        let cfg = AnalyzeConfig { block_size: 16, bleed: 1, tier_std: [2.0, 12.0], tier_metric: crate::predict::TierMetric::Std, ..Default::default() };
         let prev = smooth(64, 64, 1);
         let mut next = prev.clone();
         for y in 0..16 {

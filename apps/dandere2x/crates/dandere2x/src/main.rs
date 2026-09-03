@@ -10,7 +10,7 @@
 mod app;
 
 use clap::{Parser, Subcommand};
-use d2x_core::pipeline::{Event, MatcherKind};
+use d2x_core::pipeline::{Event, FrameSource, MatcherKind};
 use d2x_job::job::{self, Backend, Job};
 use std::path::PathBuf;
 
@@ -86,9 +86,15 @@ struct Common {
     /// Content-keyed block cache size (e.g. 4G; 0 = off). Default: 20% of the RAM budget.
     #[arg(long)]
     block_cache: Option<String>,
-    /// Activation sets in flight per GPU upscaler (uploads/readbacks overlap compute).
-    #[arg(long, default_value_t = 2)]
+    /// Activation sets in flight per GPU upscaler. On unified memory (Apple/Asahi)
+    /// there is no transfer to hide and each set steals VRAM from tile size:
+    /// measured 27% slower at 4 sets than at 1. Raise only on discrete GPUs.
+    #[arg(long, default_value_t = 1)]
     inflight: usize,
+    /// Conv kernel: rt2 | rt1 | rt4 | wino (Winograd F(2,3), 2.25x fewer multiplies).
+    /// All bit-exact; `bench` compares. rt2 is fastest on AGX among the direct forms.
+    #[arg(long, default_value = "rt2f")]
+    kernel: String,
     /// Frames whose residuals share one GPU call.
     #[arg(long, default_value_t = 4)]
     batch: usize,
@@ -134,6 +140,12 @@ enum Cmd {
         /// Segment workers: cut on source keyframes, one shared GPU, N encoders, parts concatenated.
         #[arg(long, short = 'j', default_value_t = 1)]
         jobs: usize,
+        /// Reuse finished segment parts from an earlier run with identical settings.
+        #[arg(long)]
+        resume: bool,
+        /// Keep segment parts after concat, so a later --resume can reuse them.
+        #[arg(long)]
+        keep_parts: bool,
         /// Start time in seconds (snaps to the previous keyframe).
         #[arg(long, default_value_t = 0.0)]
         start: f64,
@@ -154,12 +166,59 @@ enum Cmd {
         model: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
         tile: u32,
+        /// rt2f (default) | rt2h | rt2c8h | rt2c8 | rt2 | rt1 | rt4 | wino
+        #[arg(long, default_value = "rt2f")]
+        kernel: String,
+    },
+    /// Compare two renders of the same clip: PSNR and SSIM per frame, plus the
+    /// worst frame. This is the other half of every speed number — run the
+    /// slow settings once as a reference, then price a fast setting against it.
+    Compare {
+        /// Reference render (the slow settings).
+        #[arg(short, long)]
+        reference: PathBuf,
+        /// Render under test.
+        #[arg(short, long)]
+        test: PathBuf,
+        /// Stop after N frames (0 = all).
+        #[arg(long, default_value_t = 0)]
+        frames: u64,
+        /// Print a line per frame, not just the summary.
+        #[arg(long)]
+        per_frame: bool,
     },
     /// List GPU adapters.
     Probe,
+    /// Time the network on full-size tiles on this GPU, both kernels.
+    Bench {
+        #[arg(long)]
+        model: Option<PathBuf>,
+        #[arg(long, default_value_t = 0)]
+        tile: u32,
+        #[arg(long, default_value_t = 1)]
+        inflight: usize,
+        #[arg(long, default_value_t = 6)]
+        iters: u32,
+        /// GPU memory budget (e.g. 8G); with it the tile grows up to 1024.
+        #[arg(long)]
+        vram_budget: Option<String>,
+    },
     /// Print a model's architecture and cost.
     Model {
         path: PathBuf,
+    },
+    /// Scan a models folder: architecture, cost, and whether each one loads
+    /// and produces sane output. `--gmac` turns cost into seconds per frame
+    /// using a figure from `bench` on this machine.
+    Models {
+        /// Folder to walk (default: the app's `models/` directory).
+        dir: Option<PathBuf>,
+        /// Skip the verification forward pass (classification only).
+        #[arg(long)]
+        quick: bool,
+        /// GMAC/s from `dandere2x bench`, to report seconds per 1080p frame.
+        #[arg(long)]
+        gmac: Option<f64>,
     },
     /// The GUI.
     #[cfg(feature = "app")]
@@ -190,6 +249,7 @@ fn job_from(common: &Common, input: PathBuf, output: PathBuf) -> anyhow::Result<
     j.vram_budget = common.vram_budget.as_deref().map(d2x_core::budget::parse_bytes).transpose()?;
     j.block_cache_override = common.block_cache.as_deref().map(d2x_core::budget::parse_bytes).transpose()?;
     j.inflight = common.inflight;
+    j.kernel = common.kernel.clone();
     j.pipeline.batch = common.batch;
     j.pipeline.queue_depth = common.batch.max(2) * 2;
     j.pipeline.analyze.tier_std = [common.flat_std, common.smooth_std];
@@ -238,9 +298,11 @@ fn print_event(e: &Event) {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Upscale { input, output, common, codec, crf, preset, eight_bit, jobs, start, end } => {
+        Cmd::Upscale { input, output, common, codec, crf, preset, eight_bit, jobs, start, end, resume, keep_parts } => {
             let mut job = job_from(&common, input, output)?;
             job.jobs = jobs;
+            job.resume = resume;
+            job.keep_parts = keep_parts;
             job.start = start;
             job.end = end;
             job.encode.codec = codec;
@@ -271,12 +333,12 @@ fn main() -> anyhow::Result<()> {
             let _ = bleed;
             eprintln!("{} frames: {:.1}% of pixels through the main network ({:.1}x fewer than full upscaling), {:.1}% through any network tier", summary.frames, summary.heavy_pixel_fraction * 100.0, 1.0 / summary.heavy_pixel_fraction.max(1e-9), summary.upscaled_pixel_fraction * 100.0);
         }
-        Cmd::Selftest { model, tile } => {
+        Cmd::Selftest { model, tile, kernel } => {
             #[cfg(feature = "gpu")]
             {
                 let (net, path) = job::load_model(model.as_deref())?;
                 eprintln!("model: {} ({:.2} MMAC per input pixel, x{})", path.display(), net.macs_per_input_pixel() / 1e6, net.scale);
-                let r = d2x_wgpu::selftest(net, d2x_wgpu::GpuOptions { tile, ..Default::default() })?;
+                let r = d2x_wgpu::selftest(net, d2x_wgpu::GpuOptions { tile, kernel: kernel.parse()?, ..Default::default() })?;
                 println!("{r}");
                 if !r.pass {
                     std::process::exit(1);
@@ -284,9 +346,104 @@ fn main() -> anyhow::Result<()> {
             }
             #[cfg(not(feature = "gpu"))]
             {
-                let _ = (model, tile);
+                let _ = (model, tile, kernel);
                 anyhow::bail!("built without the `gpu` feature");
             }
+        }
+        Cmd::Bench { model, tile, inflight, iters, vram_budget } => {
+            #[cfg(feature = "gpu")]
+            {
+                let (net, path) = job::load_model(model.as_deref())?;
+                let budget = vram_budget.as_deref().map(d2x_core::budget::parse_bytes).transpose()?.unwrap_or(0);
+                eprintln!("model: {} ({:.2} MMAC per input pixel, x{})", path.display(), net.macs_per_input_pixel() / 1e6, net.scale);
+                for kernel in ["rt2f", "rt2h", "rt2c8h", "rt2c8", "rt2c8h"] {
+                    let opts = d2x_wgpu::GpuOptions { tile, inflight, vram_budget: budget, kernel: kernel.parse()?, ..Default::default() };
+                    match d2x_wgpu::bench(net.clone(), opts, iters) {
+                        Ok(r) => println!("{r}"),
+                        Err(e) => println!("kernel {kernel}: {e:#}"),
+                    }
+                }
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                let _ = (model, tile, inflight, iters, vram_budget);
+                anyhow::bail!("built without the `gpu` feature");
+            }
+        }
+        Cmd::Models { dir, quick, gmac } => {
+            let dir = dir.unwrap_or_else(|| {
+                job::default_model_paths()
+                    .into_iter()
+                    .find(|p| p.exists())
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                    .unwrap_or_else(|| PathBuf::from("models"))
+            });
+            // `..` segments from the default-path search make the printed
+            // paths unusable for copy-paste; resolve them.
+            let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+            let found = d2x_core::registry::scan(&dir, !quick);
+            if found.is_empty() {
+                println!("no .safetensors or .json models under {}", dir.display());
+            }
+            for m in &found {
+                let (name, sub, badge) = m.row();
+                let cost = gmac.map(|g| format!(" · {:.1} s/1080p frame", m.secs_per_1080p(g))).unwrap_or_default();
+                println!("{badge:>6}  {name:<34} {sub}{cost}");
+                if let Some(d) = m.status.detail() {
+                    println!("        {d}");
+                }
+            }
+            // The cascade needs two usable models at the same output scale;
+            // say which pair the folder offers rather than making the user work
+            // it out from the list.
+            for scale in [2u32, 3, 4] {
+                if let Some((cheap, dear)) = d2x_core::registry::ladder(&found, scale) {
+                    println!(
+                        "\nx{scale} ladder: --model {} --cascade {}  ({:.2} vs {:.2} MMAC/px, {:.0}x)",
+                        dear.path.display(),
+                        cheap.path.display(),
+                        dear.macs_per_px / 1e6,
+                        cheap.macs_per_px / 1e6,
+                        dear.macs_per_px / cheap.macs_per_px.max(1.0)
+                    );
+                }
+            }
+        }
+        Cmd::Compare { reference, test, frames, per_frame } => {
+            let (pa, pb) = (d2x_job::ffmpeg::probe(&reference)?, d2x_job::ffmpeg::probe(&test)?);
+            anyhow::ensure!(
+                (pa.info.width, pa.info.height) == (pb.info.width, pb.info.height),
+                "different sizes: {}x{} vs {}x{} — compare renders of the same clip at the same scale",
+                pa.info.width,
+                pa.info.height,
+                pb.info.width,
+                pb.info.height
+            );
+            let mut a = d2x_job::ffmpeg::FfmpegSource::open(&reference, &pa)?;
+            let mut b = d2x_job::ffmpeg::FfmpegSource::open(&test, &pb)?;
+            let mut rep = d2x_core::quality::QualityReport::new();
+            let mut i = 0u64;
+            loop {
+                if frames > 0 && i >= frames {
+                    break;
+                }
+                let (fa, fb) = (a.next_frame()?, b.next_frame()?);
+                let (fa, fb) = match (fa, fb) {
+                    (Some(x), Some(y)) => (x, y),
+                    (None, None) => break,
+                    // A length mismatch is worth failing on: comparing a
+                    // truncated render against a full one would report a
+                    // flattering number for the frames that exist.
+                    (x, y) => anyhow::bail!("clips differ in length: reference {} test {} after {i} frames", if x.is_some() { "has more" } else { "ended" }, if y.is_some() { "has more" } else { "ended" }),
+                };
+                rep.push(i, &fa, &fb);
+                if per_frame {
+                    let p = fa.psnr(&fb);
+                    println!("frame {i:6}  psnr {:7.2} dB  ssim {:.4}", p, d2x_core::quality::ssim(&fa, &fb));
+                }
+                i += 1;
+            }
+            println!("{rep}");
         }
         Cmd::Probe => {
             #[cfg(feature = "gpu")]
