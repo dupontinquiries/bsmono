@@ -38,7 +38,16 @@ const MAX_SPEC: f32 = 96.0;
 /// linear in normalised armour; there is no physical basis for a fancier
 /// mapping here, and a monotonic one is what makes the stat legible.
 pub fn for_vehicle(stats: &VehicleStats) -> Material {
-    let a = (stats.armor / ARMOR_FULL).clamp(0.0, 1.0);
+    // `f32::clamp` does not launder a NaN: `NAN.clamp(0.0, 1.0)` is NaN.
+    // This function looked guarded and produced a NaN reflectivity and
+    // specular power, which ride in SceneUniforms and multiply straight
+    // into the car's colour in the shader.
+    //
+    // I wrote this module and this bug in the same session as
+    // games/blackstar-rs/docs/NON_FINITE_INPUTS.md, which names this exact
+    // mechanism as the most common one in that survey.
+    let armor = if stats.armor.is_finite() { stats.armor } else { 0.0 };
+    let a = (armor / ARMOR_FULL).clamp(0.0, 1.0);
     Material {
         // Never zero: a completely non-reflective car loses its silhouette
         // against the ground at dusk, when the sky fill is all there is.
@@ -96,6 +105,20 @@ mod tests {
     }
 
     #[test]
+    fn a_non_finite_armour_still_gives_a_usable_surface() {
+        // These values ride into the shader and multiply into the car's
+        // colour; a NaN there is an unlit car, not a mis-lit one.
+        for armor in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut stats = CarKind::RedSedan.stats();
+            stats.armor = armor;
+            let m = for_vehicle(&stats);
+            assert!(m.reflectivity.is_finite() && m.specular_power.is_finite(), "armor={armor}: {m:?}");
+            assert!(m.reflectivity > 0.05);
+            assert!((MIN_SPEC..=MAX_SPEC).contains(&m.specular_power));
+        }
+    }
+
+    #[test]
     fn zero_armour_is_still_a_valid_surface() {
         let mut stats = CarKind::RedSedan.stats();
         stats.armor = 0.0;
@@ -103,3 +126,4 @@ mod tests {
         assert!(m.reflectivity.is_finite() && m.specular_power >= MIN_SPEC);
     }
 }
+

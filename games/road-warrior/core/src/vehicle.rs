@@ -160,6 +160,26 @@ impl Vehicle {
         gravity: f32,
         ground: Option<GroundContact>,
     ) {
+        // SANITISE BEFORE INTEGRATING.
+        //
+        // Probed, and each of these did something specific and wrong:
+        //
+        // * `dt` NaN put NaN into pos_x, pos_y and rotation — and pos_x
+        //   then feeds `Track::height_at` every tick, so it spreads.
+        // * `dt` NEGATIVE REFUELLED THE CAR. Gas is spent as
+        //   `gas - throttle * rate * dt`, so a backwards clock adds fuel.
+        //   Measured: 80.00 became 80.10.
+        // * `gravity` NaN put NaN into pos_y.
+        // * `throttle` NaN drained the tank to empty in one tick, because
+        //   `NaN.max(0.0)` is 0.0.
+        //
+        // Time only runs forwards, and a control input that is not a
+        // number is no input.
+        let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+        let throttle = if throttle.is_finite() { throttle } else { 0.0 };
+        let tilt = if tilt.is_finite() { tilt } else { 0.0 };
+        let gravity = if gravity.is_finite() { gravity } else { 0.0 };
+
         let effective_throttle = if self.gas > 0.0 { throttle } else { 0.0 };
         self.gas = (self.gas - effective_throttle.abs() * self.stats.gas_burn_rate * dt).max(0.0);
 
@@ -247,6 +267,48 @@ impl Vehicle {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_backwards_clock_does_not_refuel_the_car() {
+        // Gas is spent as `gas - throttle * rate * dt`, so a negative dt
+        // ADDS fuel. Measured before the guard: 80.00 -> 80.10.
+        let mut v = Vehicle::new(CarKind::RedSedan);
+        let before = v.gas;
+        v.step(-0.016, 1.0, 0.0, false, -9.8);
+        assert!(v.gas <= before, "a backwards frame refuelled: {before} -> {}", v.gas);
+        assert_eq!(v.pos_x, 0.0, "and it should not move the car either");
+    }
+
+    #[test]
+    fn non_finite_inputs_do_not_reach_the_vehicle_state() {
+        // pos_x feeds Track::height_at every tick, so a NaN here spreads
+        // into the terrain lookup, the sampler and the lighting bake.
+        for (dt, thr, tilt, g) in [
+            (f32::NAN, 1.0f32, 0.0f32, -9.8f32),
+            (0.016, f32::NAN, 0.0, -9.8),
+            (0.016, 1.0, f32::NAN, -9.8),
+            (0.016, 1.0, 0.0, f32::NAN),
+        ] {
+            let mut v = Vehicle::new(CarKind::RedSedan);
+            v.airborne = true;
+            v.step(dt, thr, tilt, false, g);
+            assert!(v.pos_x.is_finite(), "pos_x from dt={dt} thr={thr} tilt={tilt} g={g}");
+            assert!(v.pos_y.is_finite(), "pos_y from dt={dt} thr={thr} tilt={tilt} g={g}");
+            assert!(v.vel_x.is_finite() && v.vel_y.is_finite());
+            assert!(v.rotation.is_finite());
+            assert!(v.gas.is_finite() && v.health.is_finite());
+        }
+    }
+
+    #[test]
+    fn a_non_finite_throttle_does_not_empty_the_tank() {
+        // `NaN.max(0.0)` is 0.0, so a NaN throttle drained a full tank in
+        // one tick.
+        let mut v = Vehicle::new(CarKind::RedSedan);
+        let before = v.gas;
+        v.step(0.016, f32::NAN, 0.0, false, -9.8);
+        assert!((v.gas - before).abs() < 1e-3, "tank went {before} -> {}", v.gas);
+    }
 
     #[test]
     fn an_empty_tank_at_a_standstill_is_stranded() {
@@ -344,3 +406,4 @@ mod tests {
         assert!(v.vel_x <= speed_before, "empty tank should stop further acceleration");
     }
 }
+
