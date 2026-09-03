@@ -40,6 +40,7 @@
 
 use isosurface::{extract, Field, Mesh, Mesher, Seams};
 
+use crate::world::blocks::BlockId;
 use crate::world::world_model::{anchors, WorldModel};
 
 /// Value handed to the extractor for a carved cell. Large enough that no
@@ -221,5 +222,120 @@ mod tests {
             with.positions.len(),
             without.positions.len()
         );
+    }
+}
+
+
+// -------------------------------------------------------------- materials ---
+//
+// `isosurface` emits geometry and nothing else, on purpose: it knows about a
+// scalar field and must not learn about biomes, block ids or texture atlases.
+// Attaching materials is the engine's half, and it is a separate pass here
+// rather than a callback into the extractor for the same reason — the
+// extractor stays testable in a second, and this stays swappable without
+// touching geometry.
+//
+// The sample point matters. A vertex sits ON the surface, where density is at
+// the threshold, so asking "what block is here" is asking a question right at
+// the boundary and the answer flickers. Sampling one step ALONG THE INWARD
+// NORMAL asks what the surface is made OF, which is the actual question, and
+// it is stable because it is unambiguously inside.
+
+/// How far below the surface to ask what the ground is made of, in blocks.
+/// Half a block is inside the solid at every crossing without reaching the
+/// layer below.
+const MATERIAL_DEPTH: f32 = 0.5;
+
+/// A surface material per vertex, parallel to `mesh.positions`.
+///
+/// `origin` must be the same one the mesh was extracted with — positions are
+/// relative to it.
+pub fn materials_for(
+    model: &WorldModel,
+    mesh: &Mesh,
+    origin: [i32; 3],
+) -> Vec<BlockId> {
+    mesh.positions
+        .iter()
+        .zip(&mesh.normals)
+        .map(|(p, n)| {
+            let inside = *p - *n * MATERIAL_DEPTH;
+            let x = origin[0] as f64 + inside.x as f64;
+            let y = origin[1] as f64 + inside.y as f64;
+            let z = origin[2] as f64 + inside.z as f64;
+            material_at(model, x, y, z)
+        })
+        .collect()
+}
+
+/// What the ground is made of at a point known to be inside it.
+///
+/// The generator's own layering, minus the parts that need a whole chunk:
+/// ores roll per block below sea level and cannot be reconstructed from a
+/// point sample, so this answers with the biome's surface material near the
+/// top and stone below it. A renderer wanting ore veins on a smooth surface
+/// needs the block grid, which is a different question from what a hillside
+/// looks like.
+pub fn material_at(model: &WorldModel, x: f64, y: f64, z: f64) -> BlockId {
+    let target = model.surface_target(x, z, 0.0);
+    let depth = target - y;
+    if depth > 4.0 {
+        BlockId::Stone
+    } else {
+        model.biome_at_2d(x, z).surface_block()
+    }
+}
+
+#[cfg(test)]
+mod material_tests {
+    use super::*;
+
+    fn model() -> WorldModel {
+        WorldModel::new(0xC0FFEE)
+    }
+
+    #[test]
+    fn every_vertex_gets_a_material() {
+        let m = model();
+        let target = m.surface_target(40.0, -24.0, 0.0);
+        let base = target.floor() as i32 - 12;
+        let origin = [36, base, -28];
+        let mesh = mesh_region(&m, origin, [9, 25, 9], 1, Seams::NONE);
+        let mats = materials_for(&m, &mesh, origin);
+        assert_eq!(mats.len(), mesh.positions.len());
+        assert!(!mats.is_empty());
+    }
+
+    #[test]
+    fn a_hillside_is_made_of_its_biome_and_not_of_air() {
+        // The failure this guards: sampling AT the vertex instead of below it
+        // lands on the threshold, where the answer is undefined and half the
+        // surface comes back as whatever the else-branch is.
+        let m = model();
+        let target = m.surface_target(40.0, -24.0, 0.0);
+        let base = target.floor() as i32 - 12;
+        let origin = [36, base, -28];
+        let mesh = mesh_region(&m, origin, [9, 25, 9], 1, Seams::NONE);
+        let mats = materials_for(&m, &mesh, origin);
+        let air = mats.iter().filter(|b| **b == BlockId::Air).count();
+        assert_eq!(air, 0, "{air} of {} vertices are made of air", mats.len());
+    }
+
+    #[test]
+    fn deep_ground_is_stone_and_the_top_is_not() {
+        let m = model();
+        let (x, z) = (40.0, -24.0);
+        let target = m.surface_target(x, z, 0.0);
+        assert_eq!(material_at(&m, x, target - 30.0, z), BlockId::Stone);
+        let top = material_at(&m, x, target - 0.5, z);
+        assert_eq!(top, m.biome_at_2d(x, z).surface_block());
+    }
+
+    #[test]
+    fn materials_are_deterministic() {
+        let m = model();
+        let origin = [0, 40, 0];
+        let mesh = mesh_region(&m, origin, [9, 9, 9], 1, Seams::NONE);
+        assert_eq!(materials_for(&m, &mesh, origin), materials_for(&m, &mesh, origin));
     }
 }
