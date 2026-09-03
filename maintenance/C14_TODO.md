@@ -523,3 +523,57 @@ binary.
 Step 1 is worth doing on its own even if 2 and 3 wait: right now the app claims
 a codec it does not have, and the code that would say otherwise is already
 written and already tested.
+
+## 15. CORRECTION to §13: snapclone HAS an AV1 video pipeline — in Qt
+
+I wrote in §13 and in c8548d85 that video "cannot be done yet" because
+"nothing CAPTURES video". That is true of the egui port and false of the app.
+Corrected after being pointed at the Qt tree, and the correction changes the
+size of the job substantially — it is a PORT, not a feature.
+
+### What already exists
+
+`apps/snapclone/src/ui/video/` is about 4,000 lines of working pipeline:
+
+* `VideoEncoderBackend.cpp` — SVT-AV1 through **two** routes, gstreamer
+  `svtav1enc` and ffmpeg, with element-existence probes before either is used
+  (`gstElementExists("svtav1enc")`), which is the same preflight idea
+  `d2x-job` needed and got later
+* `VideoRecorder.cpp`, `VideoTranscoder.cpp`, `VideoSnapViewerDialog.cpp`,
+  `RecordingMetadata.cpp`
+* `include/ui/video/Av1Policy.hpp` — CRF/bitrate, GOP, hierarchical levels and
+  temporal filtering, chosen per `EncodeTier`
+
+### And the policy is ALREADY IN RUST
+
+`Av1Policy.hpp`'s own header says it: "Mirror of
+`snapclone_av1policy::plan_for`". The Rust crate exists at
+`apps/snapclone/rust/snapclone-av1policy` — 278 lines, **9 tests, all
+passing** — with a C ABI entry point (`plan_for` plus a code-taking wrapper) so
+the C++ side can call it rather than reimplement it.
+
+So the DECISION layer of AV1 encoding is already ported, tested, and shared.
+What is missing in the egui port is everything around it: a capture path that
+produces frames over time rather than one, an encoder invocation, and a
+container writer.
+
+There are two identical copies of the crate (`apps/` and `system/`), byte for
+byte. Worth folding into one before either is depended on, or they will drift
+the way the two `camera-bridge` copies already have.
+
+### What the egui port actually needs
+
+1. **Video capture.** The egui shutter produces one `RawFrame`. Recording needs
+   a frame sequence with timestamps, which the frame pump already delivers —
+   `RawFrame` carries `captured_ms` and `seq` — so this is a sink that
+   accumulates rather than a new capture path.
+2. **An encoder invocation.** Follow the Qt backend's shape: probe for
+   `svtav1enc`, fall back to ffmpeg, report which one honestly. Both are
+   subprocesses, so this is where the "no native encoder on the shutter path"
+   argument from `media_encode` stops applying — a video recording is already
+   a long operation and a process spawn is noise in it.
+3. **`snapclone-av1policy` as a dependency**, not a reimplementation. It is
+   tested and it is what the Qt app uses.
+
+That ordering matters: step 1 is pure and testable here, step 2 needs a device
+with gstreamer or ffmpeg, step 3 is a manifest line.
