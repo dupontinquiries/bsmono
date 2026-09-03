@@ -16,6 +16,7 @@ pub mod chunk_manager;
 pub mod smooth;
 pub mod smooth_plan;
 pub mod smooth_vertex;
+pub mod smooth_chunk;
 pub mod block_textures;
 pub mod block_material;
 pub mod texture_mapping;
