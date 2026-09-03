@@ -68,6 +68,7 @@ pub mod mic_pipeline_fsm;
 pub mod mic_scheduler;
 pub mod mic_topology;
 pub mod util;
+pub mod voice_status;
 pub mod whisper_models;
 
 #[cfg(test)]
@@ -93,7 +94,7 @@ mod purity {
             .filter_map(|l| l.strip_prefix("pub mod "))
             .filter_map(|l| l.strip_suffix(';'))
             .collect();
-        assert_eq!(exposed.len(), 12, "module list changed; update this count deliberately");
+        assert_eq!(exposed.len(), 13, "module list changed; update this count deliberately");
 
         let mut impure = Vec::new();
         for m in &exposed {

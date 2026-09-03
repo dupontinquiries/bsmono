@@ -170,6 +170,9 @@ mod code_symbols;
 // allowed to act on what, plus the shadow record that decides when the
 // acoustic fast path can be trusted. Pure.
 mod dictation_session;
+// The voice-feedback readout model: two-tier transcript display with the
+// anti-reflow slot sizing. Pure.
+mod voice_status;
 // v0.1.609: motion-rollback position-history core (TODO_motion_rollback
 // option 1, the testable piece). Status-line parsing stays build-gated.
 mod motion_history;

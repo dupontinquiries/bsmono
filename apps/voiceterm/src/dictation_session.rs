@@ -74,7 +74,7 @@ impl Recognition {
 
 /// Why a result was not acted on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Drop {
+pub enum DropReason {
     /// Nothing was said.
     Empty,
     /// The fast path returned something outside the control vocabulary.
@@ -99,7 +99,7 @@ pub enum Route {
     /// Insert as dictated content. Only ever from `Whisper`.
     Content(String),
     /// Do nothing.
-    Dropped(Drop),
+    Dropped(DropReason),
 }
 
 /// Router policy.
@@ -235,10 +235,10 @@ impl Session {
     /// Route one recognition result.
     pub fn route(&mut self, r: &Recognition) -> Route {
         if self.ended {
-            return Route::Dropped(Drop::Ended);
+            return Route::Dropped(DropReason::Ended);
         }
         if r.text.trim().is_empty() {
-            return Route::Dropped(Drop::Empty);
+            return Route::Dropped(DropReason::Empty);
         }
         let ctl = classify(&r.text);
 
@@ -247,13 +247,13 @@ impl Session {
                 // The load-bearing restriction: the fast path speaks
                 // only the control vocabulary.
                 let Some(c) = ctl else {
-                    return Route::Dropped(Drop::FastPathContent);
+                    return Route::Dropped(DropReason::FastPathContent);
                 };
                 if !self.policy.fast_enabled {
-                    return Route::Dropped(Drop::FastPathContent);
+                    return Route::Dropped(DropReason::FastPathContent);
                 }
                 if r.confidence < self.policy.fast_control_min {
-                    return Route::Dropped(Drop::LowConfidence);
+                    return Route::Dropped(DropReason::LowConfidence);
                 }
                 self.commit(c)
             }
@@ -261,7 +261,7 @@ impl Session {
                 Some(c) => {
                     if self.acted == Some(c) {
                         // the fast path already handled this burst
-                        return Route::Dropped(Drop::AlreadyActed);
+                        return Route::Dropped(DropReason::AlreadyActed);
                     }
                     self.commit(c)
                 }
@@ -299,7 +299,7 @@ mod tests {
     fn fast_path_never_supplies_content() {
         let mut s = sess();
         let r = s.route(&Recognition::fast("let x equals five", 0.99));
-        assert_eq!(r, Route::Dropped(Drop::FastPathContent));
+        assert_eq!(r, Route::Dropped(DropReason::FastPathContent));
     }
 
     #[test]
@@ -313,7 +313,7 @@ mod tests {
         let mut s = Session::new(Mode::Code, Policy::default());
         assert_eq!(
             s.route(&Recognition::fast("new line", 1.0)),
-            Route::Dropped(Drop::FastPathContent)
+            Route::Dropped(DropReason::FastPathContent)
         );
         // whisper still works with the fast path disabled
         assert_eq!(s.route(&Recognition::whisper("new line")), Route::Control(Ctl::NewLine));
@@ -324,7 +324,7 @@ mod tests {
         let mut s = sess();
         assert_eq!(
             s.route(&Recognition::fast("new line", 0.5)),
-            Route::Dropped(Drop::LowConfidence)
+            Route::Dropped(DropReason::LowConfidence)
         );
     }
 
@@ -344,7 +344,7 @@ mod tests {
         // same burst, whisper catches up 1.2s later
         assert_eq!(
             s.route(&Recognition::whisper("newline")),
-            Route::Dropped(Drop::AlreadyActed)
+            Route::Dropped(DropReason::AlreadyActed)
         );
         // next burst is fair game again
         s.next_utterance();
@@ -356,7 +356,7 @@ mod tests {
         let mut s = sess();
         assert_eq!(
             s.route(&Recognition::fast("scratched hat", 0.9)),
-            Route::Dropped(Drop::FastPathContent)
+            Route::Dropped(DropReason::FastPathContent)
         );
         assert_eq!(
             s.route(&Recognition::whisper("scratch that")),
@@ -370,13 +370,13 @@ mod tests {
         assert_eq!(s.route(&Recognition::whisper("stop dictating")), Route::Control(Ctl::Stop));
         assert!(s.ended());
         s.next_utterance();
-        assert_eq!(s.route(&Recognition::whisper("hello")), Route::Dropped(Drop::Ended));
+        assert_eq!(s.route(&Recognition::whisper("hello")), Route::Dropped(DropReason::Ended));
     }
 
     #[test]
     fn empty_is_dropped_not_inserted() {
         let mut s = sess();
-        assert_eq!(s.route(&Recognition::whisper("   ")), Route::Dropped(Drop::Empty));
+        assert_eq!(s.route(&Recognition::whisper("   ")), Route::Dropped(DropReason::Empty));
     }
 
     #[test]
