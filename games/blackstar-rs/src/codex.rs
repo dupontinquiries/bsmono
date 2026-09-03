@@ -413,7 +413,7 @@ pub static CODEX: &[Entry] = &[
         title: "megatron",
         claim: None,
         lines: &[
-            "drawn to the energon pulse, he returns changed --",
+            "drawn to the valence pulse, he returns changed --",
             "hardened, reflective. he has watched the devourer eat",
             "even his own kind, and for the first time offers a truce.",
         ],
@@ -589,7 +589,7 @@ pub static CODEX: &[Entry] = &[
         lines: &[
             "a fragment, unsigned, found threaded through the watch's code:",
             "'we grew them a body that remembers being both. metal that",
-            "breathes. energon that beats. if you are reading this, archivist,",
+            "breathes. valence that beats. if you are reading this, archivist,",
             "the graft is yours to wake.'",
         ],
     },

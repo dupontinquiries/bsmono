@@ -27,7 +27,7 @@
 //! what turns the nineteen warden signals from rumours into a roster.
 
 use crate::content::{hostiles, missions_of, Mission, Objective, Role, MISSIONS};
-use crate::energon;
+use crate::valence;
 use crate::patrol::{self, Faction};
 use crate::raidgen::{strhash, Rng};
 use crate::skirmish::{Casualty, Fight, Fighter, Squad, OPEN_AT};
@@ -147,7 +147,7 @@ pub enum CampEvent {
 }
 
 // The campaign's answering curve used to live here as RENOWN (a flat 4%
-// per mission cleared). It is now ENERGON — see `energon.rs` — because
+// per mission cleared). It is now VALENCE — see `valence.rs` — because
 // the same idea grew more sources (wardens, nightfalls) and a
 // recommendation per film to scale against; one power scalar, one
 // module that owns it, named for what actually fills a Cybertronian.
@@ -163,7 +163,7 @@ pub struct MissionRun {
     /// breather's worth of field repair between them
     squad_ids: Vec<String>,
     doctrine: &'static str,
-    /// the energon multiplier, resolved once against the mission's
+    /// the valence multiplier, resolved once against the mission's
     /// recommendation — the player side scales, the yardstick does not
     power: f32,
     /// nightfall dials: an element that runs hot, and whether the field
@@ -194,7 +194,7 @@ const HOLD_BLEED: f32 = 3.0;
 const ASSET_CHIP: f32 = 1.5;
 
 impl MissionRun {
-    pub fn new(mission: &'static Mission, squad: &[&str], doctrine: &'static str, at_energon: u32) -> MissionRun {
+    pub fn new(mission: &'static Mission, squad: &[&str], doctrine: &'static str, at_valence: u32) -> MissionRun {
         let film = mission.film as f32;
         MissionRun {
             mission,
@@ -203,7 +203,7 @@ impl MissionRun {
             fight: None,
             squad_ids: squad.iter().map(|s| s.to_string()).collect(),
             doctrine,
-            power: energon::scale(at_energon, energon::rec_energon(mission)),
+            power: valence::scale(at_valence, valence::rec_valence(mission)),
             burn: None,
             exposure: false,
             carried: None,
@@ -235,7 +235,7 @@ impl MissionRun {
     /// Arrive weakened. `loss` is 0..1 off the engagement's power.
     ///
     /// A method rather than a public field, because `power` is resolved once
-    /// against the mission's recommended energon and the invariant is that
+    /// against the mission's recommended valence and the invariant is that
     /// nothing moves it afterwards except a NAMED cost — a landing, a burn.
     /// Opening the field would make that invariant a convention.
     pub fn arrived_badly(mut self, loss: f32) -> MissionRun {
@@ -373,7 +373,7 @@ impl MissionRun {
                 self.doctrine,
                 OPEN_AT,
             );
-            // energon lands once, at first muster; the carried squad
+            // valence lands once, at first muster; the carried squad
             // keeps it wave to wave
             for f in s.fighters.iter_mut() {
                 f.hp *= self.power;
@@ -708,26 +708,26 @@ mod tests {
     #[test]
     fn the_campaign_is_winnable_in_sequence_by_the_default_squad() {
         // THE balance promise, stated the way a campaign is played: each
-        // mission at the energon the road provides — missions alone, no
+        // mission at the valence the road provides — missions alone, no
         // wardens, no nightfalls. Deterministic waves, deterministic
         // fights: if a content edit breaks the sequence, this names the
         // mission it breaks at.
         for (i, m) in MISSIONS.iter().enumerate() {
-            let at = i as u32 * energon::PER_MISSION;
+            let at = i as u32 * valence::PER_MISSION;
             let mut run = MissionRun::new(m, &DEFAULT_SQUAD, DEFAULT_DOCTRINE, at);
             let won = run.resolve(1200.0);
             assert!(
                 won,
-                "{} ({:?}, film {}, energon {} vs rec {}) breaks the campaign: t={:.0} squad={} struct={:.0} asset={:.0} hold={:.0}",
-                m.id, m.objective, m.film, at, energon::rec_energon(m),
+                "{} ({:?}, film {}, valence {} vs rec {}) breaks the campaign: t={:.0} squad={} struct={:.0} asset={:.0} hold={:.0}",
+                m.id, m.objective, m.film, at, valence::rec_valence(m),
                 run.t, run.squad_alive(), run.struct_hp, run.asset_hp, run.hold_pct
             );
         }
     }
 
     #[test]
-    fn low_energon_is_a_wall() {
-        // the counterpart promise: energon is LOAD-BEARING. A dry
+    fn low_valence_is_a_wall() {
+        // the counterpart promise: valence is LOAD-BEARING. A dry
         // default squad must fail somewhere in trilogy two, or the curve
         // is decoration and the campaign is flat — Destiny's recommended
         // number only teaches if being under it actually hurts.
@@ -843,7 +843,7 @@ mod tests {
     #[test]
     fn survive_is_won_on_the_clock_not_the_bodycount() {
         let (i, m) = MISSIONS.iter().enumerate().find(|(_, m)| m.objective == Objective::Survive).unwrap();
-        let mut run = MissionRun::new(m, &DEFAULT_SQUAD, DEFAULT_DOCTRINE, i as u32 * energon::PER_MISSION);
+        let mut run = MissionRun::new(m, &DEFAULT_SQUAD, DEFAULT_DOCTRINE, i as u32 * valence::PER_MISSION);
         let won = run.resolve(1200.0);
         assert!(won);
         // the clock is the win condition, so the run lasts at least the
@@ -874,7 +874,7 @@ mod tests {
     #[test]
     fn control_banks_only_uncontested_seconds() {
         let (i, m) = MISSIONS.iter().enumerate().find(|(_, m)| m.objective == Objective::Control).unwrap();
-        let mut run = MissionRun::new(m, &DEFAULT_SQUAD, DEFAULT_DOCTRINE, i as u32 * energon::PER_MISSION);
+        let mut run = MissionRun::new(m, &DEFAULT_SQUAD, DEFAULT_DOCTRINE, i as u32 * valence::PER_MISSION);
         let mut rose_contested = false;
         let mut last = 0.0f32;
         while run.outcome().is_none() && run.t < 1200.0 {

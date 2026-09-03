@@ -14,7 +14,7 @@
 //!   logic — and it is why the watch-bearer (`chi.rs`, `clones.rs`,
 //!   `watch.rs`) is not a liability against them, structurally,
 //!   regardless of how the fight is going for everyone else.
-//! * **Energon cascade transmission** — "any Transformer struck by it
+//! * **Valence cascade transmission** — "any Transformer struck by it
 //!   risks beginning Stage 1 corruption." A human is never at risk;
 //!   the doc's transmission is a Transformer-to-Transformer problem,
 //!   same as detection.
@@ -149,7 +149,7 @@ impl Corrupted {
         if target_is_human {
             return false;
         }
-        // higher stages bleed more energon, more often
+        // higher stages bleed more valence, more often
         let chance = match self.stage {
             Stage::One => 0.08,
             Stage::Two => 0.16,

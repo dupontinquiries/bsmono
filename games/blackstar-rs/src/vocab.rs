@@ -36,11 +36,20 @@
 //!
 //! ## What is actually mechanical
 //!
-//! `energon` (145) is a live identifier — a module, `energon()`,
-//! `rec_energon()`, `energon_value()`, `at_energon`, several test names — so
-//! the rename is compiler-checked end to end, which makes it the SAFEST of the
-//! large ones despite being the biggest. It needs a replacement word and
-//! nothing else.
+//! ~~`energon` (145) is a live identifier…~~ **DONE.** It was a module,
+//! `energon()`, `rec_energon()`, `energon_value()`, `at_energon` and several
+//! test names, so the rename was compiler-checked end to end — the safest of
+//! the large ones despite being the biggest, and the only one that was blocked
+//! on a word rather than on authoring. It is **`valence`** now: real electron
+//! physics, and what it names is the capacity to combine into something else,
+//! which is what the fuel does for a machine that transforms. It pairs against
+//! `chi.rs` without echoing it — chi is what a body has become, valence is what
+//! a machine has available.
+//!
+//! Note `\b` is useless for this rename: underscores are word characters, so
+//! `\benergon\b` misses `energon_value` and `at_energon` entirely. A plain
+//! substring replace is correct here because the term is not a substring of any
+//! unrelated word.
 //!
 //! `cybertron` (269) is a home-planet name that has become a type
 //! (`Body::Cybertronian`) and a module (`cybertronian.rs`). Also blocked on
@@ -65,8 +74,10 @@ mod tests {
     const CENSUS: &[(&str, usize)] = &[
         ("Cybertron", 152),
         ("cybertron", 117),
-        ("Energon", 8),
-        ("energon", 137),
+        // energon -> valence, done. Kept at zero rather than deleted so a
+        // reintroduction fails instead of passing silently.
+        ("Energon", 0),
+        ("energon", 0),
         ("Optimus", 24),
         ("optimus", 21),
         ("Megatron", 15),
@@ -75,6 +86,20 @@ mod tests {
         ("decepticon", 8),
         ("Autobot", 12),
         ("autobot", 3),
+        // Missed by the first census and all licensed: Rodimus and Unicron are
+        // Hasbro, Jhiaxus is Marvel/IDW. `docs/films/README.md` names Rodimus
+        // in the very sentence that states the vocabulary rule, so the rule has
+        // a hole in its own wording.
+        ("Unicron", 33),
+        ("unicron", 37),
+        ("Jhiaxus", 17),
+        ("jhiaxus", 20),
+        // 24, not 25: this file's own header quotes the allowed-vocabulary
+        // sentence from docs/films/README.md, which contains the word. The
+        // census excludes itself; the hand-grep that seeded these numbers did
+        // not. The guard caught it on its first real use.
+        ("Rodimus", 24),
+        ("rodimus", 15),
         // KEEP. Developer attribution in `compact.rs` and `xform.rs`, not
         // in-fiction vocabulary. Counted so that a well-meaning sweep that
         // deletes them fails and reads this comment.

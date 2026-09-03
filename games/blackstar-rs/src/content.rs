@@ -623,7 +623,7 @@ pub const MISSIONS: &[Mission] = &[
         cast: &[],
         beat: "Hot Rod becomes Rodimus",
         intro: &[
-            "down the ruptured mantle: living-metal corridors, energon rivers, cathedral dark.",
+            "down the ruptured mantle: living-metal corridors, valence rivers, cathedral dark.",
             "hot rod dives beside you -- reckless, loud, terrified of one thing: failing prime.",
             "hold the descent. the avatar is forming out of the magma, and it is looking at optimus.",
         ],

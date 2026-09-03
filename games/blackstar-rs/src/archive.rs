@@ -496,7 +496,7 @@ pub static SOURCES: &[Source] = &[
     Source { id: "port_cctv", what: "a container port's tape, kept for an insurance claim" },
     Source { id: "medical_archive", what: "a medical file with the name cut out" },
     Source { id: "trench_survey", what: "spoil from the ridge cut, layered and datable" },
-    Source { id: "mantle_survey", what: "a deep survey run for energon, not for this" },
+    Source { id: "mantle_survey", what: "a deep survey run for valence, not for this" },
     Source { id: "grail_void", what: "a lunar void GRAIL mapped and nobody entered" },
     Source { id: "luna_scar", what: "a glassed launch strip under four thousand years of regolith" },
     Source { id: "luna_relay", what: "a relay in a tube mouth, still answering a dead network" },
@@ -825,7 +825,7 @@ pub static FINDINGS: &[Finding] = &[
         source: "mantle_survey",
         medium: Medium::Terminal,
         gate: None,
-        blurb: "a deep survey run for energon, not for this. the return from the mantle is not \
+        blurb: "a deep survey run for valence, not for this. the return from the mantle is not \
                 the return of a mass. it has a period.",
         links: &[s("unicron_in_earth")],
     },

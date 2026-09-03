@@ -13,7 +13,7 @@
 //! 105 weeks — two years of distinct Tuesdays from two modular indexes.
 //!
 //! The lockout rides the save as a `nightfalls` line of week numbers:
-//! cleared weeks bank energon (`energon::PER_NIGHTFALL`) and cannot be
+//! cleared weeks bank valence (`valence::PER_NIGHTFALL`) and cannot be
 //! farmed twice. Ids-not-indices does not apply — a week IS its number.
 
 use crate::content::{Mission, MISSIONS};

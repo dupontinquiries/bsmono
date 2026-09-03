@@ -20,7 +20,7 @@
 //! much larger foundation this does not attempt to guess at blind.
 //!
 //! **Escalation's own economy, ported alongside the wave counter**:
-//! kills bank energon credits (by enemy kind); on a wave clear the
+//! kills bank valence credits (by enemy kind); on a wave clear the
 //! whole bank FORGES into a permanent integrity increase, so playing
 //! greedy — banking more before the wave ends — compounds into a
 //! stronger run. `spend` is the buy side (perks, gates), same as the
@@ -38,7 +38,7 @@
 
 /// Which kind of enemy died, for scoring/economy — matches the C
 /// engine's own `enemy.h` kind order (0 grunt, 1 corrupted, 2 hijack,
-/// 3 apex) exactly, since `ex_waves_on_kill`/`energon_value`'s lookup
+/// 3 apex) exactly, since `ex_waves_on_kill`/`valence_value`'s lookup
 /// tables are indexed by that order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EnemyKind {
@@ -94,10 +94,10 @@ pub fn makeup(wave: i32) -> WaveMakeup {
     m
 }
 
-/// Energon credits banked for a kill of this kind: grunt 20 / hijack
+/// Valence credits banked for a kill of this kind: grunt 20 / hijack
 /// 30 / corrupted 40 / apex 120 — the C engine's own numbers, not
 /// re-derived.
-pub fn energon_value(kind: EnemyKind) -> i64 {
+pub fn valence_value(kind: EnemyKind) -> i64 {
     const EV: [i64; 4] = [20, 40, 30, 120];
     EV[kind.index()]
 }
@@ -131,7 +131,7 @@ pub struct Waves {
     /// all waves cleared (win) — never true in endless mode
     pub finished: bool,
     /// currently banked credits (spent on forge or `spend`)
-    pub energon: i64,
+    pub valence: i64,
     /// lifetime forged credits, display only
     pub forged_total: i64,
     /// set the frame a wave-clear forge fires
@@ -152,7 +152,7 @@ impl Waves {
             score: 0,
             kills: 0,
             finished: false,
-            energon: 0,
+            valence: 0,
             forged_total: 0,
             forge_event: false,
             forge_hp_amount: 0.0,
@@ -172,18 +172,18 @@ impl Waves {
         Some(makeup(self.wave))
     }
 
-    /// Award score for a kill of the given kind, and bank energon
+    /// Award score for a kill of the given kind, and bank valence
     /// credits toward the next forge.
     pub fn on_kill(&mut self, kind: EnemyKind) {
         self.score += score_value(kind);
         self.kills += 1;
-        self.energon += energon_value(kind);
+        self.valence += valence_value(kind);
     }
 
     /// Tick the intermission; when a wave is cleared (`alive == 0`
     /// and a wave is active) start the breather, flag
-    /// `pending_spawn`, and fire the forge (banked energon becomes
-    /// `forge_hp_amount`, `forge_event = true`, `energon` resets to
+    /// `pending_spawn`, and fire the forge (banked valence becomes
+    /// `forge_hp_amount`, `forge_event = true`, `valence` resets to
     /// 0, `forged_total` accumulates). `forge_event`/`forge_hp_amount`
     /// are cleared at the start of every call, same as the C original
     /// — they are a one-frame signal, not a sticky flag.
@@ -204,10 +204,10 @@ impl Waves {
         // a wave is active and everything's dead -> clear bonus + breather
         if self.wave >= 1 && alive == 0 && !self.pending_spawn {
             self.score += 500 * self.wave as i64; // wave-clear bonus grows
-            if self.energon > 0 {
-                self.forge_hp_amount = self.energon as f32 * 0.4;
-                self.forged_total += self.energon;
-                self.energon = 0;
+            if self.valence > 0 {
+                self.forge_hp_amount = self.valence as f32 * 0.4;
+                self.forged_total += self.valence;
+                self.valence = 0;
                 self.forge_event = true;
             }
             if self.total_waves > 0 && self.wave >= self.total_waves {
@@ -218,14 +218,14 @@ impl Waves {
         }
     }
 
-    /// Try to spend `cost` banked energon on a mid-run purchase
+    /// Try to spend `cost` banked valence on a mid-run purchase
     /// (perks, gates). Returns whether it succeeded; deducts on
     /// success, leaves the bank unchanged on failure.
     pub fn spend(&mut self, cost: i64) -> bool {
-        if cost < 0 || self.energon < cost {
+        if cost < 0 || self.valence < cost {
             return false;
         }
-        self.energon -= cost;
+        self.valence -= cost;
         true
     }
 }
@@ -264,12 +264,12 @@ mod tests {
         assert_eq!(w.score, s0 + 2350);
         assert_eq!(w.kills, 3);
 
-        assert_eq!(energon_value(EnemyKind::Grunt), 20);
-        assert_eq!(energon_value(EnemyKind::Corrupted), 40);
-        assert_eq!(energon_value(EnemyKind::Hijack), 30);
-        assert_eq!(energon_value(EnemyKind::Apex), 120);
-        assert_eq!(w.energon, 20 + 40 + 120, "banked from the 3 kills above");
-        let banked = w.energon;
+        assert_eq!(valence_value(EnemyKind::Grunt), 20);
+        assert_eq!(valence_value(EnemyKind::Corrupted), 40);
+        assert_eq!(valence_value(EnemyKind::Hijack), 30);
+        assert_eq!(valence_value(EnemyKind::Apex), 120);
+        assert_eq!(w.valence, 20 + 40 + 120, "banked from the 3 kills above");
+        let banked = w.valence;
 
         // clear the wave -> breather + forge
         let before = w.score;
@@ -278,7 +278,7 @@ mod tests {
         assert!(w.intermission > 0.0 && !w.pending_spawn);
         assert!(w.forge_event);
         assert_eq!(w.forge_hp_amount, banked as f32 * 0.4);
-        assert_eq!(w.energon, 0);
+        assert_eq!(w.valence, 0);
         assert_eq!(w.forged_total, banked);
 
         // forge_event is one-shot: clears next tick with nothing new banked
@@ -352,10 +352,10 @@ mod tests {
     #[test]
     fn spend_only_succeeds_when_affordable() {
         let mut s = Waves::new(0);
-        s.energon = 200;
-        assert!(!s.spend(250) && s.energon == 200, "spent more than banked");
-        assert!(s.spend(150) && s.energon == 50, "affordable spend was refused");
-        assert!(s.spend(50) && s.energon == 0, "exact remainder spend was refused");
+        s.valence = 200;
+        assert!(!s.spend(250) && s.valence == 200, "spent more than banked");
+        assert!(s.spend(150) && s.valence == 50, "affordable spend was refused");
+        assert!(s.spend(50) && s.valence == 0, "exact remainder spend was refused");
     }
 
     // small helper the ported tests above use for a slightly more

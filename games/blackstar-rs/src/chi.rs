@@ -1,6 +1,6 @@
 //! CHI — what a human body can hold of the seven elements.
 //!
-//! The bots run on energon (`energon.rs`); the WATCH-BEARER does not.
+//! The bots run on valence (`valence.rs`); the WATCH-BEARER does not.
 //! A human ice-clone shapeshifter carrying the Watch levels the way a
 //! monk does, not the way a machine does: attunement is EARNED per
 //! element, in the element, and the body's worthiness to wear serious
@@ -27,7 +27,7 @@
 //!   attunes to whatever ran hot that week;
 //! * a raid cleared IN A SUIT banks chi in the arena's element — the
 //!   deep sites each have a nature, and standing in it as a human is
-//!   the training. Machines earn energon there instead; a body that
+//!   the training. Machines earn valence there instead; a body that
 //!   walked frostline in a suit earned something else.
 //!
 //! What chi is FOR:

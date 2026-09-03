@@ -8,19 +8,19 @@
 //!
 //! Pure logic, same boundary as the C original states in its own
 //! header: this module owns the gate chain and the arithmetic; the
-//! game supplies the energon wallet (`escalation::Waves::energon`)
+//! game supplies the valence wallet (`escalation::Waves::valence`)
 //! and applies the returned spawn extent to its own arena bounds.
 //! Nothing here places a wall, draws a gate, or knows what an arena
 //! IS — same honest split as `escalation.rs` and `enemy.rs`.
 //!
-//! Numbers are the C engine's own: three gates (300/750/1500 energon,
+//! Numbers are the C engine's own: three gates (300/750/1500 valence,
 //! opening to 100/150/220 m half-extent) over a 60 m starting arena.
 
 pub const GATE_COUNT: usize = 3;
 
 #[derive(Clone, Debug)]
 pub struct Gate {
-    /// energon required to open
+    /// valence required to open
     pub cost: i64,
     /// spawn half-extent once open (replaces the current, if bigger)
     pub extent: f32,
@@ -38,18 +38,18 @@ pub fn init() -> [Gate; GATE_COUNT] {
     ]
 }
 
-/// Spend `gate.cost` from `*energon` if affordable and the gate isn't
-/// already open. Returns whether it opened; `energon` is deducted
+/// Spend `gate.cost` from `*valence` if affordable and the gate isn't
+/// already open. Returns whether it opened; `valence` is deducted
 /// only on success, unchanged otherwise (including the
 /// already-open case — no double-spend).
-pub fn try_open(gate: &mut Gate, energon: &mut i64) -> bool {
+pub fn try_open(gate: &mut Gate, valence: &mut i64) -> bool {
     if gate.opened {
         return false;
     }
-    if *energon < gate.cost {
+    if *valence < gate.cost {
         return false;
     }
-    *energon -= gate.cost;
+    *valence -= gate.cost;
     gate.opened = true;
     true
 }
@@ -132,7 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn insufficient_energon_never_partially_spends() {
+    fn insufficient_valence_never_partially_spends() {
         let mut gates = init();
         let mut wallet: i64 = 299; // one short of gate 0's 300 cost
         assert!(!try_open(&mut gates[0], &mut wallet));

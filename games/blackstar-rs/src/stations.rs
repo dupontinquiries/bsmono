@@ -28,7 +28,7 @@
 use crate::campaign::CampaignLog;
 use crate::chi::Chi;
 use crate::content::MISSIONS;
-use crate::energon;
+use crate::valence;
 use crate::gear::{Gear, Item, Rail};
 use crate::menu::{Event, Menu, Row};
 use crate::menufx::DeployStyle;
@@ -47,7 +47,7 @@ use crate::watch::{Watch, NATIVE, PHOTON};
 /// The rooms with consoles in them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Station {
-    /// sorties, the week's nightfall, the energon ledger
+    /// sorties, the week's nightfall, the valence ledger
     Bridge,
     /// rails, worn armor, the bag — the gear sheet
     Armory,
@@ -270,8 +270,8 @@ impl Shipboard {
         sv.finds = self.dig.line();
         save::store(&sv, &b, &cfg);
     }
-    pub fn energon(&self) -> u32 {
-        energon::energon(&self.camp, &self.raids, self.nf.count())
+    pub fn valence(&self) -> u32 {
+        valence::valence(&self.camp, &self.raids, self.nf.count())
     }
 }
 
@@ -587,8 +587,8 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
         }
         Station::Bridge => {
             rows.push(Row::heading(&format!(
-                "ENERGON {}  ({}m {}w {}n)",
-                sb.energon(),
+                "VALENCE {}  ({}m {}w {}n)",
+                sb.valence(),
                 sb.camp.done(),
                 sb.raids.shards(),
                 sb.nf.count()
@@ -609,8 +609,8 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
             rows.push(Row::heading("SORTIES"));
             match sb.camp.next() {
                 Some(m) => {
-                    let rec = energon::rec_energon(m);
-                    let have = sb.energon();
+                    let rec = valence::rec_valence(m);
+                    let have = sb.valence();
                     // A campaign built on introducing one mechanic per mission
                     // should SAY so on the row that offers it -- that is the
                     // whole shape of the thing (see curriculum.rs), and a
@@ -645,7 +645,7 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
                     let r = Row::action(m.id, &label);
                     let who = if cast.is_empty() { String::new() } else { format!("  |  {}", cast.join(", ")) };
                     rows.push(if have < rec {
-                        r.hint("LOW ENERGON: this will hurt")
+                        r.hint("LOW VALENCE: this will hurt")
                     } else if let Some(k) = teaches.first() {
                         r.hint(leak(format!("{}  |  {}{who}", m.beat, k.note)))
                     } else {
@@ -1296,7 +1296,7 @@ pub fn run_order(order: &Order) -> (String, bool) {
     let camp = CampaignLog::from_line(&sv.missions);
     let raids = crate::raidlog::RaidLog::from_line(&sv.wardens);
     let nf = crate::nightfall::NightfallLog::from_line(&sv.nightfalls);
-    let have = crate::energon::energon(&camp, &raids, nf.count());
+    let have = crate::valence::valence(&camp, &raids, nf.count());
 
     let Some((m, card)) = order_target(order) else {
         return (format!("{order:?}"), false);
@@ -1315,7 +1315,7 @@ pub fn run_order(order: &Order) -> (String, bool) {
     let squad: Vec<&str> = DEFAULT_SQUAD.to_vec();
     let mut run = MissionRun::new(m, &squad, DEFAULT_DOCTRINE, have);
     // SPEND THE PENALTY. `power` is the multiplier the whole engagement runs
-    // on, resolved once against the mission's recommended energon — which is
+    // on, resolved once against the mission's recommended valence — which is
     // exactly where arriving badly belongs. A cost that costs nothing is
     // decoration, and this is the first consequence in the game for getting
     // somewhere badly.

@@ -125,7 +125,7 @@ pub struct Sortie {
     pub feed: Vec<String>,
     /// lines the shell should toast, drained by `pop_toast`
     toasts: Vec<String>,
-    /// energon at accept time — resolved once, same as the resolved path
+    /// valence at accept time — resolved once, same as the resolved path
     have: u32,
     /// ground height under the drop last step, for the HUD's prediction
     last_gy: f32,
@@ -195,7 +195,7 @@ pub fn sites_for(m: &Mission) -> Vec<Site> {
 }
 
 impl Sortie {
-    /// Accept the order. Loads the save once for the energon standing —
+    /// Accept the order. Loads the save once for the valence standing —
     /// the same read `run_order` does, at the same moment (accept), so the
     /// two paths price the engagement identically — and asks the foothold
     /// question while there is still a choice to make.
@@ -215,7 +215,7 @@ impl Sortie {
         let camp = crate::campaign::CampaignLog::from_line(&sv.missions);
         let raids = crate::raidlog::RaidLog::from_line(&sv.wardens);
         let nf = crate::nightfall::NightfallLog::from_line(&sv.nightfalls);
-        let have = crate::energon::energon(&camp, &raids, nf.count());
+        let have = crate::valence::valence(&camp, &raids, nf.count());
         let g = crate::mapsim::ground_for(d).g;
 
         // THE FOOTHOLD QUESTION, at runtime at last. Assess both sites

@@ -12,14 +12,14 @@
 //!     skydribble --campaign all                run the whole campaign, brief
 //!
 //! Steering: `--squad a,b,c` picks player classes, `--doctrine x` the
-//! commander, `--commit` banks a win into the save, `--energon N`
+//! commander, `--commit` banks a win into the save, `--valence N`
 //! overrides the squad's charge for a probe (never banked).
 
 use crate::campaign::{
     foe_doctrine, waves_for, CampEvent, CampaignLog, MissionRun, DEFAULT_DOCTRINE, DEFAULT_SQUAD,
 };
 use crate::content::{commander, film, troop, MISSIONS};
-use crate::energon;
+use crate::valence;
 use crate::nightfall::{self, NightfallLog};
 use crate::raidlog::RaidLog;
 use crate::save;
@@ -35,9 +35,9 @@ pub fn run(argv: &[String]) {
         .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
         .unwrap_or_else(|| DEFAULT_SQUAD.iter().map(|s| s.to_string()).collect());
     let squad_refs: Vec<&str> = squad.iter().map(|s| s.as_str()).collect();
-    let forced_energon: Option<u32> = argv
+    let forced_valence: Option<u32> = argv
         .iter()
-        .position(|a| a == "--energon")
+        .position(|a| a == "--valence")
         .and_then(|p| argv.get(p + 1))
         .and_then(|s| s.parse().ok());
     let doctrine: &'static str = argv
@@ -57,7 +57,7 @@ pub fn run(argv: &[String]) {
                     println!("  {:28} already cleared", m.id);
                     continue;
                 }
-                let at = energon::energon(&walk, &raids, nf.count());
+                let at = valence::valence(&walk, &raids, nf.count());
                 let won = play(m.id, &squad_refs, doctrine, true, at, None);
                 if won {
                     walk.record(m.id);
@@ -78,7 +78,7 @@ pub fn run(argv: &[String]) {
             let (log, raids, nf) = load_logs();
             match log.next() {
                 Some(m) => {
-                    let won = play(m.id, &squad_refs, doctrine, false, energon::energon(&log, &raids, nf.count()), None);
+                    let won = play(m.id, &squad_refs, doctrine, false, valence::valence(&log, &raids, nf.count()), None);
                     if won {
                         settle(m.id, commit);
                     }
@@ -106,7 +106,7 @@ pub fn run(argv: &[String]) {
                 println!("  this week is already banked. it returns at the reset.");
                 return;
             }
-            let at = energon::energon(&log, &raids, nf.count());
+            let at = valence::valence(&log, &raids, nf.count());
             let won = play(card.mission.id, &squad_refs, doctrine, false, at, Some(&card));
             if won {
                 if commit {
@@ -136,8 +136,8 @@ pub fn run(argv: &[String]) {
                         sv.bag = bag_line;
                     }
                     save::store(&sv, &b, &cfg);
-                    let lit = energon::energon(&log, &raids, nf.count());
-                    println!("   week {week} banked -- energon {lit} (+{})", energon::PER_NIGHTFALL);
+                    let lit = valence::valence(&log, &raids, nf.count());
+                    println!("   week {week} banked -- valence {lit} (+{})", valence::PER_NIGHTFALL);
                 } else {
                     println!("   (dry run -- add --commit to bank the week)");
                 }
@@ -149,7 +149,7 @@ pub fn run(argv: &[String]) {
                 return;
             }
             let (log, raids, nf) = load_logs();
-            let at = forced_energon.unwrap_or_else(|| energon::energon(&log, &raids, nf.count()));
+            let at = forced_valence.unwrap_or_else(|| valence::valence(&log, &raids, nf.count()));
             let won = play(id, &squad_refs, doctrine, false, at, None);
             if won {
                 settle(id, commit);
@@ -200,14 +200,14 @@ fn list() {
     let (log, raids, nf) = load_logs();
     println!("THE CAMPAIGN -- six films, {} missions. `--campaign next` to play on.\n", MISSIONS.len());
     println!(
-        "energon {} = {} missions x{} + {} wardens x{} + {} nightfalls x{}\n",
-        energon::energon(&log, &raids, nf.count()),
+        "valence {} = {} missions x{} + {} wardens x{} + {} nightfalls x{}\n",
+        valence::valence(&log, &raids, nf.count()),
         log.done(),
-        energon::PER_MISSION,
+        valence::PER_MISSION,
         raids.shards(),
-        energon::PER_WARDEN,
+        valence::PER_WARDEN,
         nf.count(),
-        energon::PER_NIGHTFALL
+        valence::PER_NIGHTFALL
     );
     let mut cur = 0u8;
     for m in MISSIONS {
@@ -222,7 +222,7 @@ fn list() {
             "{mark}  {:28} {:9} rec{:>3} @{:11} {}",
             m.id,
             format!("{:?}", m.objective),
-            energon::rec_energon(m),
+            valence::rec_valence(m),
             m.dest,
             m.beat
         );
@@ -235,17 +235,17 @@ fn list() {
 }
 
 /// Play one mission, narrated (or one line, brief). Returns victory.
-/// `at_energon` is the squad's charge; `nf` dresses the run as a nightfall.
+/// `at_valence` is the squad's charge; `nf` dresses the run as a nightfall.
 fn play(
     id: &str,
     squad: &[&str],
     doctrine: &'static str,
     brief: bool,
-    at_energon: u32,
+    at_valence: u32,
     nf: Option<&nightfall::Nightfall>,
 ) -> bool {
     let m = MISSIONS.iter().find(|m| m.id == id).unwrap();
-    let mut run = MissionRun::new(m, squad, doctrine, at_energon);
+    let mut run = MissionRun::new(m, squad, doctrine, at_valence);
     if let Some(n) = nf {
         run = run.with_modifiers(Some(n.burn), n.exposure);
     }
@@ -255,15 +255,15 @@ fn play(
         for s in m.intro {
             println!("   | {s}");
         }
-        let rec = energon::rec_energon(m);
+        let rec = valence::rec_valence(m);
         println!(
-            "   objective {:?} -- foe under {} doctrine, {} waves -- energon {} vs rec {}{}",
+            "   objective {:?} -- foe under {} doctrine, {} waves -- valence {} vs rec {}{}",
             m.objective,
             foe_doctrine(m),
             waves_for(m).len(),
-            at_energon,
+            at_valence,
             rec,
-            if at_energon < rec { "  LOW ENERGON: this will hurt" } else { "" }
+            if at_valence < rec { "  LOW VALENCE: this will hurt" } else { "" }
         );
     }
     let mut wave_kills = 0u32;
