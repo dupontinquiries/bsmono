@@ -349,6 +349,17 @@ exactly where that difference gets lost.
   `cargo build` is cheaper than the assumption.
 - Write long messages to a file and use `git commit -F`. Heredocs through a
   `sh -c` wrapper mangle apostrophes and silently truncate.
+- **`cargo test --lib` is not the test suite.** It skips `tests/`, and a
+  signature change to a public function will sit broken there while every run
+  reports green. A session changed `PtyHost::spawn` to take a required
+  argument and reported "1237 tests pass" fifteen times before discovering
+  `tests/real_pty.rs` — the only test that drives a real shell — had not
+  compiled since. Run plain `cargo test` (all targets) before claiming a count,
+  and reach for `--lib` only to go faster mid-loop.
+- **"Nothing references this" is a claim to grep for across the whole repo.**
+  Two of three modules called unreferenced in one commit had callers: one was
+  the Qt app's own file reached by `#[path]`, another was used by an
+  integration test. Impressions from one directory are not an audit.
 
 ## 9. Name output bundles `c9-NNN-<summary>.bundle`
 
