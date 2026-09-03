@@ -42,6 +42,7 @@
 
 pub mod assets;
 pub mod ids;
+pub mod screenplay;
 pub mod session;
 pub mod wav_error;
 pub mod slice;
