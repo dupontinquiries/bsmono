@@ -200,42 +200,47 @@ pub fn apply(unit: &str, r: &Repair) -> Option<String> {
     })
 }
 
-/// Replace `from` as a WHOLE word. Substring replacement would turn
-/// "change path to route" against `parse_path_buf` into
-/// `parse_route_buf`, which is not what anyone means; word boundaries
-/// here include identifier separators so `read_to_string` can have its
-/// `to` changed.
+/// Replace `from` at WORD BOUNDARIES. Plain substring replacement would
+/// turn "change path to route" against `parse_path_buf` into
+/// `parse_route_buf`, which is not what anyone means.
+///
+/// A boundary is any non-alphanumeric character. Underscore counts as a
+/// boundary, which is what lets "change to into" reach the `to` inside
+/// `read_to_string` — the case a person actually hits, since spoken
+/// identifiers arrive as separate words. A target that itself contains
+/// underscores still matches, because only the characters AROUND the
+/// match are tested; a split-into-words implementation could not do
+/// both.
+///
+/// So: `3` matches inside `retries: 3,` (comma is a boundary), `path`
+/// does not match inside `pathological` (`o` is alphanumeric), and
+/// `read_to_string` matches inside `let s = read_to_string();`.
 fn replace_word(unit: &str, from: &str, to: &str) -> Option<String> {
-    let is_sep = |c: char| c == '_' || c == '-' || c.is_whitespace() || c == '.' || c == ':';
-    let mut out = String::with_capacity(unit.len());
-    let mut hit = false;
-    let mut start = 0usize;
-    let bytes: Vec<(usize, char)> = unit.char_indices().collect();
-    let mut i = 0;
-    while i <= bytes.len() {
-        let at_end = i == bytes.len();
-        let sep = at_end || is_sep(bytes[i].1);
-        if sep {
-            let end = if at_end { unit.len() } else { bytes[i].0 };
-            let word = &unit[start..end];
-            if !hit && word.eq_ignore_ascii_case(from) {
-                out.push_str(to);
-                hit = true;
-            } else {
-                out.push_str(word);
-            }
-            if !at_end {
-                out.push(bytes[i].1);
-                start = bytes[i].0 + bytes[i].1.len_utf8();
-            }
+    if from.is_empty() {
+        return None;
+    }
+    let ident = |c: char| c.is_alphanumeric();
+    let lower = unit.to_lowercase();
+    let needle = from.to_lowercase();
+    let mut at = 0usize;
+    while let Some(rel) = lower[at..].find(&needle) {
+        let start = at + rel;
+        let end = start + needle.len();
+        let before_ok = unit[..start].chars().next_back().map(|c| !ident(c)).unwrap_or(true);
+        let after_ok = unit[end..].chars().next().map(|c| !ident(c)).unwrap_or(true);
+        if before_ok && after_ok {
+            let mut out = String::with_capacity(unit.len());
+            out.push_str(&unit[..start]);
+            out.push_str(to);
+            out.push_str(&unit[end..]);
+            return Some(out);
         }
-        i += 1;
+        at = start + 1;
+        if at >= lower.len() {
+            break;
+        }
     }
-    if hit {
-        Some(out)
-    } else {
-        None
-    }
+    None
 }
 
 /// Turn spoken letters into a string. Accepts bare letters ("r e a d",
@@ -357,6 +362,17 @@ mod tests {
         let r2 = Repair::Change { from: "path".into(), to: "route".into() };
         assert_eq!(apply("parse_path_buf", &r2).as_deref(), Some("parse_route_buf"));
         assert_eq!(apply("pathological", &r2), None, "substring must not match");
+    }
+
+    #[test]
+    fn change_matches_across_punctuation_boundaries() {
+        // the code transform has already run, so the buffer holds
+        // "retries: 3," and the target is a bare digit next to a comma
+        let r = Repair::Change { from: "3".into(), to: "5".into() };
+        assert_eq!(apply("retries: 3,", &r).as_deref(), Some("retries: 5,"));
+        // and a target containing separators still matches
+        let r2 = Repair::Change { from: "read_to_string".into(), to: "read_to_end".into() };
+        assert_eq!(apply("let s = read_to_string();", &r2).as_deref(), Some("let s = read_to_end();"));
     }
 
     #[test]

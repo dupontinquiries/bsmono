@@ -384,6 +384,43 @@ pub fn spoken_code_with(text: &str, mode: Mode, syms: Option<&SymbolTable>) -> S
             }
         }
         if !matched {
+            // Rust primitive types, spoken as letter-plus-number. Bounded
+            // closed set, very high frequency, and the numeral pass would
+            // otherwise shred "f sixty four" into "f 60 4". The transform
+            // is already Rust-leaning (-> :: =>), so this is consistent
+            // rather than a new assumption.
+            let upper = 3.min(words.len() - i);
+            for len in (2..=upper).rev() {
+                let span = words[i..i + len].join(" ").to_lowercase();
+                if let Some(t) = primitive_type(&span) {
+                    toks.push(Tok::word(t));
+                    i += len;
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if !matched {
+            // Path position: a single word next to `::` is naming code,
+            // not prose, so the table may resolve it there even though
+            // bare single words are refused everywhere else.
+            if let Some(t) = syms {
+                let after_sep = toks.last().map(|p| p.text == "::").unwrap_or(false);
+                let before_sep = (1..=2.min(words.len() - i - 1)).any(|l| {
+                    words.get(i + 1..i + 1 + l).map(|w| {
+                        symbol(&w.join(" ").to_lowercase()).map(|s| s.text == "::").unwrap_or(false)
+                    }) == Some(true)
+                });
+                if after_sep || before_sep {
+                    if let Some(id) = t.resolve_path_segment(words[i]) {
+                        toks.push(Tok::word(id));
+                        i += 1;
+                        matched = true;
+                    }
+                }
+            }
+        }
+        if !matched {
             if let Some(n) = numeral(&words[i].to_lowercase()) {
                 toks.push(Tok::word(&n.to_string()));
                 i += 1;
@@ -396,6 +433,25 @@ pub fn spoken_code_with(text: &str, mode: Mode, syms: Option<&SymbolTable>) -> S
         }
     }
     join(&toks)
+}
+
+/// Spoken forms of the Rust primitive numeric types.
+fn primitive_type(span: &str) -> Option<&'static str> {
+    Some(match span {
+        "f thirty two" => "f32",
+        "f sixty four" => "f64",
+        "u eight" => "u8",
+        "u sixteen" => "u16",
+        "u thirty two" => "u32",
+        "u sixty four" => "u64",
+        "u one twenty eight" | "u128" => "u128",
+        "i eight" => "i8",
+        "i sixteen" => "i16",
+        "i thirty two" => "i32",
+        "i sixty four" => "i64",
+        "i one twenty eight" => "i128",
+        _ => return None,
+    })
 }
 
 /// Number words → digits. Code mode only, where "thirty" is far more
@@ -581,9 +637,10 @@ const INDENT_WIDTH: usize = 4;
 
 impl BufferSink {
     pub fn new(text: &str, cursor: usize) -> Self {
+        let cursor = floor_char_boundary(text, cursor);
         BufferSink {
             text: text.to_string(),
-            cursor: cursor.min(text.len()),
+            cursor,
             ended: false,
             trail: Vec::new(),
             last_insert: None,
@@ -729,7 +786,9 @@ impl BufferSink {
                 }
                 self.text.len()
             }
-            Placement::Range(a, _) => *a,
+            // Snap: a caller-supplied offset is not guaranteed to be a
+            // char boundary, and slicing at one that is not panics.
+            Placement::Range(a, _) => floor_char_boundary(&self.text, *a),
         }
     }
 
@@ -743,6 +802,22 @@ impl BufferSink {
             _ => " ",
         }
     }
+}
+
+/// Largest char boundary <= `i`, clamped to the string length.
+///
+/// Byte offsets arrive from outside — an editor that counts characters,
+/// a saved cursor position from before the buffer changed, a Placement
+/// the LLM proposed. Slicing at a non-boundary panics, and a panic on
+/// the UI thread is a crash, so every externally-supplied offset gets
+/// snapped rather than trusted. (`str::floor_char_boundary` is still
+/// unstable as of 1.96.)
+pub fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 /// Drop the stray capital whisper puts on every utterance's first word
@@ -1230,6 +1305,57 @@ mod tests {
         );
         // two pairs on one line
         assert_eq!(spoken_code("quote a quote quote b quote", Mode::Code), "\"a\" \"b\"");
+    }
+
+    #[test]
+    fn a_cursor_that_is_not_a_char_boundary_is_snapped_not_trusted() {
+        // 2 lands inside the 'é'. A caller counting characters, or
+        // reusing a stale offset, hits this; panicking is a crash.
+        let mut b = BufferSink::new("héllo", 2);
+        assert_eq!(b.cursor, 1);
+        b.apply(&plan(&segment("x"), Mode::Prose, Placement::Cursor));
+        assert_eq!(b.text, "h x\u{e9}llo", "inserted at the snapped boundary, with the usual spacer");
+    }
+
+    #[test]
+    fn floor_char_boundary_behaves() {
+        let s = "aé日";
+        assert_eq!(floor_char_boundary(s, 0), 0);
+        assert_eq!(floor_char_boundary(s, 1), 1);
+        assert_eq!(floor_char_boundary(s, 2), 1, "inside é");
+        assert_eq!(floor_char_boundary(s, 3), 3);
+        assert_eq!(floor_char_boundary(s, 5), 3, "inside 日");
+        assert_eq!(floor_char_boundary(s, 999), s.len());
+        assert_eq!(floor_char_boundary("", 5), 0);
+    }
+
+    #[test]
+    fn range_placement_snaps_too() {
+        let mut b = BufferSink::new("日本語", 0);
+        b.apply(&[Edit::Insert { at: Placement::Range(2, 2), text: "x".into() }]);
+        assert!(b.text.starts_with('x'), "{}", b.text);
+    }
+
+    #[test]
+    fn multibyte_text_survives_the_whole_pipeline() {
+        let mut b = BufferSink::new("", 0).with_mode(Mode::Prose);
+        for u in ["Le café était", "à côté du jardin"] {
+            b.apply(&plan(&segment(u), Mode::Prose, Placement::Cursor));
+        }
+        assert_eq!(b.text, "Le café était à côté du jardin");
+        assert!(b.repair(&Repair::Uppercase));
+        assert!(b.text.ends_with("À CÔTÉ DU JARDIN"), "{}", b.text);
+        b.apply(&[Edit::RetractLast]);
+        assert_eq!(b.text, "Le café était");
+        assert!(b.text.is_char_boundary(b.cursor));
+    }
+
+    #[test]
+    fn dedent_does_not_cut_a_multibyte_char() {
+        let mut b = BufferSink::new("  é", "  é".len());
+        b.apply(&[Edit::IndentDelta(-1)]);
+        // only spaces are eaten; the é is untouched
+        assert_eq!(b.text, "  é");
     }
 
     #[test]

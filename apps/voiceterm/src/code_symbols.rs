@@ -135,6 +135,26 @@ impl SymbolTable {
         }
     }
 
+    /// Merge only tokens that LOOK like identifiers: containing an
+    /// underscore, an internal capital, or a digit.
+    ///
+    /// This is what the dictation loop should use on its own output.
+    /// Plain lowercase English words are not identifiers, add nothing
+    /// (single words are no longer resolvable), and actively harm:
+    /// dictating "match state {" put a lowercase `state` in the table,
+    /// where it then beat the buffer's `State` in path position and
+    /// produced `state::Idle`. They also waste whisper-prompt budget.
+    pub fn merge_identifiers(&mut self, src: &str) {
+        let kept: String = src
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|t| looks_like_identifier(t))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !kept.is_empty() {
+            self.merge_source(&kept);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.by_spoken.is_empty()
     }
@@ -145,35 +165,47 @@ impl SymbolTable {
 
     /// Resolve a run of spoken words to a real identifier.
     ///
-    /// Multi-word runs resolve freely — "user store" can only plausibly
-    /// mean the `UserStore` in the buffer.
+    /// **Multi-word runs only.** "user store" can only plausibly mean
+    /// the `UserStore` in the buffer, so that rewrite is safe.
     ///
-    /// Single words are restricted to CAPITALIZATION recovery: "vec"
-    /// resolves to `Vec`, but "count" will not silently become a
-    /// `Count` type. A single word is usually just a word, and a
-    /// dictionary that rewrites individual words turns every sentence
-    /// into a guessing game. Say "pascal count" when you mean the type.
+    /// Single words are NOT resolved, and that is a reversal. The
+    /// original rule allowed capitalization recovery — "vec" -> `Vec` —
+    /// restricted to cases where no candidate was spelled exactly as
+    /// spoken. A fixture run over realistic dictation showed why that is
+    /// not enough: a buffer containing `fn read(p: &Path)` has `Path`
+    /// and not `path`, so saying "path" produced `Path`. Same for
+    /// "match state" against a buffer declaring `enum State`. Having the
+    /// TYPE in scope without the lowercase variable is the normal case
+    /// in typed languages, so the rule fired exactly where it was most
+    /// wrong.
+    ///
+    /// `Vec` is still reachable with "pascal vec", which is two words
+    /// and explicit. The convenience was not worth corrupting the
+    /// commonest identifiers in the file.
     pub fn resolve(&self, words: &[&str]) -> Option<&str> {
-        if words.is_empty() {
+        if words.len() < 2 {
             return None;
         }
         let key = words.join(" ").to_lowercase();
-        let cands = self.by_spoken.get(&key)?;
-        if words.len() == 1 {
-            let w = words[0].to_lowercase();
-            // If ANY candidate is spelled exactly as spoken, the word is
-            // a word — leave it. Checking only the top candidate is not
-            // enough: `Count` and `count` share a spoken form, and the
-            // frequency/lexicographic tie-break can put the type first,
-            // which would silently capitalize every "count" you say.
-            if cands.iter().any(|c| c.text == w) {
-                return None;
-            }
-            let best = cands.first()?;
-            if best.text.to_lowercase() == w {
-                return Some(&best.text);
-            }
-            return None;
+        Some(&self.by_spoken.get(&key)?.first()?.text)
+    }
+
+    /// Resolve a SINGLE word, but only in path position — immediately
+    /// before or after a `::`.
+    ///
+    /// The general single-word rule was removed because a buffer holding
+    /// `Path` but not `path` made every spoken "path" wrong. Path
+    /// position is different: `x::y` is unambiguously naming code, not
+    /// prose, so "state double colon idle" against a buffer declaring
+    /// `enum State { Idle }` should give `State::Idle`.
+    ///
+    /// An exact-spelling candidate still wins, so `std::fs` stays
+    /// lowercase.
+    pub fn resolve_path_segment(&self, word: &str) -> Option<&str> {
+        let w = word.to_lowercase();
+        let cands = self.by_spoken.get(&w)?;
+        if let Some(exact) = cands.iter().find(|c| c.text == word) {
+            return Some(&exact.text);
         }
         Some(&cands.first()?.text)
     }
@@ -182,7 +214,7 @@ impl SymbolTable {
     /// spelling. Returns (run_length, identifier).
     pub fn resolve_longest(&self, words: &[&str], max_span: usize) -> Option<(usize, &str)> {
         let upper = max_span.min(words.len());
-        for len in (1..=upper).rev() {
+        for len in (2..=upper).rev() {
             if let Some(id) = self.resolve(&words[..len]) {
                 return Some((len, id));
             }
@@ -285,6 +317,19 @@ pub fn prompt_for(
     }
 }
 
+/// Underscore, an internal capital, or a digit. Any of the three means
+/// someone chose this spelling deliberately.
+fn looks_like_identifier(t: &str) -> bool {
+    if t.chars().count() < 2 {
+        return false;
+    }
+    t.contains('_')
+        || t.chars().any(|c| c.is_ascii_digit())
+        || t.chars().skip(1).any(|c| c.is_uppercase())
+        || (t.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+            && t.chars().skip(1).all(|c| c.is_lowercase()))
+}
+
 fn bump(counts: &mut HashMap<String, usize>, tok: &str) {
     // Pure numbers are not identifiers. Single chars carry no spoken
     // form worth indexing (and `i`/`x` would collide with real words).
@@ -374,13 +419,15 @@ mod tests {
     }
 
     #[test]
-    fn single_word_is_capitalization_recovery_only() {
-        let t = SymbolTable::from_source("let v: Vec<Count> = Vec::new(); let count = 0;");
-        // "vec" → Vec: differs only by capitalization, safe
-        assert_eq!(t.resolve(&["vec"]), Some("Vec"));
-        // "count" is spelled exactly that way in the file → no rewrite,
-        // and must NOT be captured by the `Count` type
-        assert_eq!(t.resolve(&["count"]), None);
+    fn single_words_are_never_resolved() {
+        // The reversal: a buffer holding the TYPE but not the lowercase
+        // variable is the normal case in typed code, so single-word
+        // capitalization recovery fired exactly where it was worst.
+        let t = SymbolTable::from_source("fn read(p: &Path) {} enum State { Idle }");
+        assert_eq!(t.resolve(&["path"]), None, "would have produced Path");
+        assert_eq!(t.resolve(&["state"]), None, "would have produced State");
+        let v = SymbolTable::from_source("let v: Vec<u8> = Vec::new();");
+        assert_eq!(v.resolve(&["vec"]), None, "reachable as \"pascal vec\" instead");
     }
 
     #[test]
@@ -416,6 +463,16 @@ mod tests {
         let t = SymbolTable::from_source("let x = 42; let i = 0;");
         assert!(t.resolve(&["42"]).is_none());
         assert!(t.resolve(&["x"]).is_none());
+    }
+
+    #[test]
+    fn resolve_longest_will_not_fall_back_to_one_word() {
+        let t = SymbolTable::from_source("read_to_string path");
+        assert_eq!(t.resolve_longest(&["path"], 5), None);
+        assert_eq!(
+            t.resolve_longest(&["read", "to", "string"], 5),
+            Some((3, "read_to_string"))
+        );
     }
 
     #[test]
@@ -504,6 +561,32 @@ mod tests {
         let fresh = SymbolTable::from_source(src);
         assert_eq!(merged.len(), fresh.len());
         assert_eq!(merged.prompt(600), fresh.prompt(600));
+    }
+
+    #[test]
+    fn merge_identifiers_ignores_plain_words() {
+        let mut t = SymbolTable::from_source("enum State { Idle }");
+        // the engine's own output, fed back in
+        t.merge_identifiers("match state {");
+        // the lowercase "state" must not have been learned, or it would
+        // beat State in path position
+        assert_eq!(t.resolve_path_segment("state"), Some("State"));
+        // but a real identifier in the output IS learned
+        t.merge_identifiers("let max_retries = 3;");
+        assert_eq!(t.resolve(&["max", "retries"]), Some("max_retries"));
+    }
+
+    #[test]
+    fn identifier_shape_test() {
+        assert!(looks_like_identifier("max_retries"));
+        assert!(looks_like_identifier("userStore"));
+        assert!(looks_like_identifier("UserStore"));
+        assert!(looks_like_identifier("State"));
+        assert!(looks_like_identifier("f64"));
+        assert!(!looks_like_identifier("match"));
+        assert!(!looks_like_identifier("the"));
+        assert!(!looks_like_identifier("x"));
+        assert!(!looks_like_identifier(""));
     }
 
     #[test]
