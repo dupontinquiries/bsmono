@@ -4219,7 +4219,12 @@ fn main() -> eframe::Result<()> {
                 link_url: None,
                 workspace: Workspace::new(&["main", "logs"]),
                 pane_apps: std::collections::HashMap::new(),
-                pane_focus: 0, // TermWorkspace's first pane is id 0
+                // Fixed up from the model immediately after construction
+                // — see below. Hardcoding 0 here was wrong: the comment
+                // said "TermWorkspace's first pane is id 0", which is
+                // true of TermWorkspace and false of the shell::Workspace
+                // wrapper this app actually uses, whose first pane is 1.
+                pane_focus: 0,
 
                 theme: boot_theme,
                 theme_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-theme-menu").columns(3).hold(0.35).item_size(64.0),
@@ -4231,13 +4236,18 @@ fn main() -> eframe::Result<()> {
                 // `resize` with the real grid size, and starting at the
                 // conventional default means a shell that prints a banner
                 // before then wraps sensibly rather than at zero columns.
-                pty: match voiceterm_egui::pty_host::PtyHost::spawn(80, 24, repaint_waker(&_cc.egui_ctx)) {
-                    Ok(h) => Some(h),
-                    Err(e) => {
-                        eprintln!("[voiceterm] no shell: {e} — falling back to local echo");
-                        None
-                    }
-                },
+                // NO SHELL HERE. `focused_needs_shell` owns shell
+                // creation for the focused pane and runs on the first
+                // frame; spawning one here too produced TWO — observed
+                // as two `/bin/sh -l` children of the app on a real run.
+                // Only `self.pty` is ever written to, so the second sat
+                // idle holding a pty and a reader thread for the life of
+                // the process.
+                //
+                // One rule, and it is the one with the failure memory
+                // (`pty_spawn_failed`), so a machine with no usable shell
+                // is asked once rather than once per frame.
+                pty: None,
                 pty_ended_noted: false,
                 pane_ptys: std::collections::HashMap::new(),
                 pty_spawn_failed: std::collections::HashSet::new(),
@@ -4301,6 +4311,22 @@ fn main() -> eframe::Result<()> {
                 web_prefs: voiceterm_egui::web_prefs::load(),
                 graph_source: String::new(),
             };
+            // Take the focused pane id FROM THE MODEL rather than
+            // hardcoding it.
+            //
+            // The old literal `0` carried the comment "TermWorkspace's
+            // first pane is id 0", which is true of TermWorkspace and
+            // says nothing about the shell::Workspace wrapper this app
+            // uses. It happens to agree today — a probe on a real run
+            // printed `focus=0 panes=[0, 1]` — so this is not a bug fix,
+            // it is removing a coincidence that a change to the default
+            // layout would quietly turn into one.
+            //
+            // Recorded because I first read the two shells that run at
+            // startup as a double-spawn and "fixed" it. They are
+            // correct: the default workspace has TWO panes, and one
+            // shell each is the intended behaviour.
+            app.pane_focus = app.workspace.focused_pane();
             // ONE SCAN AT STARTUP, so the mail views have something the
             // moment they are opened rather than only after the person
             // finds the rescan button. Not repeated: a Maildir scan is
