@@ -43,6 +43,19 @@ siblings, get called.
   columns (kept anyway — it is free and exact — but it is not a lever).
   The density field is ~2.6 ms per chunk.
 
+## Caveat on every number above: the biome registry
+
+`TerrainGenerator::new` loads `BiomeRegistry::load_standard()` in
+production; a bare `WorldGenerator::new(seed)` has none, and with no
+registry `biome_def_at` returns `None` immediately and never computes
+temperature or humidity. Timings taken without it therefore understate
+the real generator. The tests now use `production_like_generator`,
+which loads the standard registry (39 biomes) when it can and prints
+which it got — read that line before trusting a number.
+
+With the registry, per chunk: surface 48 ms, underground 33 ms, far
+surface 68 ms.
+
 ## What is left, in order
 
 A surface chunk is now ~44 ms in the breakdown test:
@@ -56,8 +69,8 @@ A surface chunk is now ~44 ms in the breakdown test:
 continental+hills 0.46, temperature 0.42, fbm_2d erosion 0.03, and
 `surface_y_at` 7.15 µs on the columns that reach the shelf branch.
 
-**The next target is the ~22 ms that is NOT `biome_at_3d`** — the
-per-cell surface/subsurface loop. The specific finding:
+**The next target is the per-cell surface/subsurface loop.** The
+specific finding:
 
 > `biome_def_at(x, y, z)` recomputes `model.temperature` and
 > `model.humidity` and re-runs `registry.best_fit`, and it is called
@@ -67,18 +80,34 @@ per-cell surface/subsurface loop. The specific finding:
 > DashMap lookups, recomputing what `biome_at_3d` just computed for the
 > same column.
 
+**Measured with the registry loaded** (`biome_def_breakdown`):
+`biome_def_at` is 1.108 µs per call, 4.54 ms per chunk for the 4 calls
+per column — and of that, temperature+humidity is 4.48 ms while
+`best_fit` over 39 biomes is only 0.27 ms. So the cost is entirely the
+climate recompute, not the biome search.
+
+And the shape of the fix is visible in the data: **in 256 sampled
+columns, the 4 y values resolved to the same `BiomeDef` every time**
+(0 differed). One call per column would give the same answer in every
+case sampled.
+
 It is **not** a free hoist, which is why it is written down instead of
 done: `temperature(x, y, z)` depends on `y` (altitude cooling and the
 3D blend), and `biome_at_3d` samples at `origin_y` while
 `pick_*_block` samples at the cell's `wy`. Reusing the column value
 would change output. The options, cheapest first:
 
-1. Cache `(temp, humid)` per `(column, y)` inside the surface pass — the
-   subsurface loop asks for 3 adjacent y values and the surface block
-   for a 4th, so a 4-entry stack cache per column is exact and removes
-   nothing but repeats. Check whether the 4 y values are actually
-   distinct first; if `best_fit` returns the same def across them, the
-   whole call collapses.
+1. One `biome_def_at` per column, reused for the surface block and the
+   three subsurface blocks. 0 of 256 sampled columns would change — but
+   "0 of 256" is evidence, not a proof: `temperature` moves with `y`
+   (altitude cooling is 0.0045 over 3 blocks, plus the 3D blend), so a
+   column sitting exactly on a climate boundary could in principle pick
+   a different def for a subsurface block than for the surface one. The
+   affected cells are 1-3 blocks under the surface, so the visible
+   difference is what you see after digging. Worth doing as a measured
+   change with a wide equality sweep (thousands of columns across
+   several regions) reporting the disagreement rate, not as a silent
+   hoist. ~4.5 ms of ~48 ms per chunk.
 2. Give `biome_def_at` a variant taking `(temp, humid)` and hoist the
    *per-y* computation to one place in the loop.
 3. Longer term: `at_block_blended` does 8 DashMap gets per call and all

@@ -1580,7 +1580,8 @@ mod tests {
         // be a genuine standable block (solid, with non-solid directly above) —
         // never a cave floor with rock over it. Guards the surface-glitch fix on
         // actual terrain, where caves make columns non-monotonic.
-        let g = WorldGenerator::new(1337);
+        let (g, loaded) = production_like_generator(1337);
+        println!("(standard registry loaded: {} — TerrainGenerator::new loads it in production)", loaded);
         let mut checked = 0;
         for x in -30..30 {
             for z in -30..30 {
@@ -2383,6 +2384,19 @@ mod density_skip_tests {
     }
 }
 
+
+/// A generator configured the way `TerrainGenerator::new` configures the
+/// real one: with the standard biome registry when it loads. Timings
+/// taken WITHOUT it understate production, because `biome_def_at`
+/// short-circuits to `None` and never computes temperature/humidity.
+#[cfg(test)]
+fn production_like_generator(seed: u32) -> (WorldGenerator, bool) {
+    match crate::world::biome_loader::BiomeRegistry::load_standard() {
+        Ok(r) => (WorldGenerator::with_biome_registry(seed, std::sync::Arc::new(r)), true),
+        Err(_) => (WorldGenerator::new(seed), false),
+    }
+}
+
 #[cfg(test)]
 mod cave_surface_tests {
     use super::*;
@@ -2516,6 +2530,69 @@ mod hotspot_tests {
         time("  surface_target", &|| {
             cols.iter().map(|&(x, z)| g.model.surface_target(x as f64, z as f64, 0.0)).sum()
         });
+    }
+
+    /// The per-cell part of the surface pass: `biome_def_at` and its
+    /// two components. Called 4x per column (pick_surface_block once,
+    /// pick_subsurface_block three times).
+    #[test]
+    #[ignore]
+    fn biome_def_breakdown() {
+        use std::time::Instant;
+        let (g, loaded) = production_like_generator(20260902);
+        let (ox, _oy, oz) = ChunkCoord::new(4, 0, 4).block_origin();
+        let cols: Vec<(i32, i32)> = (0..CHUNK_SIZE).flat_map(|lz| (0..CHUNK_SIZE).map(move |lx| (lx, lz)))
+            .map(|(lx, lz)| (ox + lx, oz + lz)).collect();
+        let rounds = 4;
+        let has_reg = g.biome_registry.is_some();
+        println!("(standard registry loaded: {})", loaded);
+        let n_biomes = g.biome_registry.as_ref().map(|r| r.len()).unwrap_or(0);
+        println!("biome_def breakdown (registry: {}, {} biomes), 1024 columns x 4 calls:", has_reg, n_biomes);
+        let time = |label: &str, f: &dyn Fn() -> f64| {
+            let t = Instant::now();
+            let mut sink = 0.0f64;
+            for _ in 0..rounds { sink += f(); }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / rounds as f64;
+            println!("  {:36} {:8.2} ms   ({:7.3} us/call)  [{}]", label, ms, ms * 1000.0 / (1024.0 * 4.0), sink as i64);
+        };
+        time("biome_def_at x4 (as the loop calls it)", &|| {
+            let mut n = 0.0;
+            for &(x, z) in &cols {
+                for dy in 0..4 {
+                    if g.biome_def_at(x, 40 - dy, z).is_some() { n += 1.0; }
+                }
+            }
+            n
+        });
+        time("  temperature + humidity x4", &|| {
+            let mut a = 0.0;
+            for &(x, z) in &cols {
+                for dy in 0..4 {
+                    let y = (40 - dy) as f64;
+                    a += g.model.temperature(x as f64, y, z as f64, 0.0)
+                       + g.model.humidity(x as f64, y, z as f64, 0.0);
+                }
+            }
+            a
+        });
+        time("  best_fit x4 (fixed climate)", &|| {
+            let mut n = 0.0;
+            if let Some(reg) = &g.biome_registry {
+                for (i, _) in cols.iter().enumerate() {
+                    let t = (i % 100) as f64 / 100.0;
+                    for _ in 0..4 { if reg.best_fit(t * 2.0, 0.5).is_some() { n += 1.0; } }
+                }
+            }
+            n
+        });
+        // Do the 4 y values actually resolve to different defs? If not,
+        // one call per column would do — see the doc note.
+        let mut distinct_per_col = 0u32;
+        for &(x, z) in cols.iter().take(256) {
+            let defs: Vec<Option<&str>> = (0..4).map(|dy| g.biome_def_at(x, 40 - dy, z).map(|d| d.id.as_str())).collect();
+            if defs.iter().any(|d| *d != defs[0]) { distinct_per_col += 1; }
+        }
+        println!("  columns (of 256) where the 4 y values give different defs: {}", distinct_per_col);
     }
 
     #[test]
