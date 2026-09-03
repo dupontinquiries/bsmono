@@ -1096,7 +1096,11 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     // beatspace is a CUSTOM entry below (it needs run_flags), so it is not in
     // this simple list — being in both would put it in the group twice.
     let music = ["krapper", "bo-suite", "fao-codec"];
-    let work = ["voiceterm", "ambient-learner", "rusty-board"];
+    // ambient-learner is a CUSTOM entry below: the manifest marks
+    // `ambient-learner-egui` primary, and a bare name here resolves to
+    // `apps/ambient-learner` — the ICED parent, which is not what the fleet
+    // ships. Being in both lists would offer it twice.
+    let work = ["voiceterm", "rusty-board"];
     let all: Vec<&str> = coding.iter().chain(&media).chain(&music).chain(&work).copied().collect();
     // bsettings: crate `bigsilicon-settings` at apps/settings-app, GUI bin needs the `gui` feature.
     // Its path/features differ from the simple apps/<name> convention, so it's a custom entry.
@@ -1189,6 +1193,29 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     // differently-named bin (`unendlich-fullgame`) gated behind render/window/ui-overlay. Without
     // `bin_name` here, the simple-entry default (`--bin unendlich`) matches NONE of the workspace's
     // actual bin targets — exactly the reported "no bin target named `unendlich`" error.
+    // The manifest says `primary = true` on `ambient-learner-egui`, meaning that
+    // port IS the app now and the iced parent is the alternative. A bare
+    // `"ambient-learner"` in the simple list builds the parent, because
+    // `resolve_app_dir` maps a bare name to `apps/<name>` — so the store was
+    // offering the thing the manifest calls secondary.
+    //
+    // Custom rather than renaming the list entry: the display name stays
+    // `ambient-learner` (what the user looks for) while the PATH points at the
+    // port. Renaming to `ambient-learner-egui` would resolve to no directory at
+    // all, since the port lives at `apps/ambient-learner/egui-frontend`.
+    //
+    // Nine other simple-list entries have the same divergence; see
+    // `store_entries_build_the_manifests_primary_port`, which lists them rather
+    // than letting them be discovered one report at a time.
+    let ambient_learner = || crate::suite::SuiteApp {
+        name: "ambient-learner".into(),
+        path: "apps/ambient-learner/egui-frontend".into(),
+        features: vec![],
+        no_default: false,
+        target: String::new(),
+        run_flags: String::new(),
+        bin_name: Some("ambient-learner-egui".into()),
+    };
     let unendlich = || crate::suite::SuiteApp {
         name: "unendlich".into(),
         path: "unendlich".into(),
@@ -1200,6 +1227,7 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     };
     let mut work_group = group("work", "Productivity, comms & input", &work);
     work_group.apps.push(bsettings());
+    work_group.apps.push(ambient_learner());
     let mut media_group = group("media", "Video, camera, imaging & games", &media);
     // Media rather than music: it is a video NLE first, with the audio editor
     // sharing its core — the README's own framing.
@@ -1207,6 +1235,7 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     media_group.apps.push(unendlich());
     let mut all_group = group("bigsilicons-apps", "Every BigSilicon app — build all in one go", &all);
     all_group.apps.push(bsettings());
+    all_group.apps.push(ambient_learner());
     all_group.apps.push(beatspace());
     all_group.apps.push(studio());
     all_group.apps.push(aperture());
@@ -1285,8 +1314,15 @@ mod store_group_tests {
         // catch. Fixed here rather than by relaxing the rule: "any path with a
         // slash is fine" would have let a genuine typo through silently, which
         // is the failure the rule was written against.
-        const EXPLICIT_PATH: [&str; 5] =
-            ["bsettings", "studio", "aperture", "cadscope", "simscope"];
+        // `ambient-learner` joins for a DIFFERENT reason from the other five.
+        // Those are workspaces whose runnable crate is a member. This one is a
+        // package at `apps/ambient-learner` that builds fine — it is just not
+        // the one the manifest calls primary, so the entry points at
+        // `egui-frontend` deliberately. Same exception, different cause, and
+        // worth saying so: the next reader will otherwise assume it is another
+        // workspace.
+        const EXPLICIT_PATH: [&str; 6] =
+            ["bsettings", "studio", "aperture", "cadscope", "simscope", "ambient-learner"];
         for a in &all.apps {
             assert!(!a.path.contains('/') || EXPLICIT_PATH.contains(&a.name.as_str()),
                     "{} has an explicit path {:?} but is not on the exception list",
@@ -2080,4 +2116,55 @@ mod launch_consistency_tests {
             );
         }
     }
+    /// Every store entry should build what the manifest calls PRIMARY.
+    ///
+    /// `primary = true` means "this entry IS the default build of the app it
+    /// ports, not an alternative to opt into". A store entry naming the parent
+    /// therefore offers the thing the manifest calls secondary — which is what
+    /// was reported for ambient-learner: the button built the iced parent while
+    /// `ambient-learner-egui` is what ships.
+    ///
+    /// Reported as a LIST rather than asserted to be empty. Nine other entries
+    /// diverge the same way and each needs its own look — some may be
+    /// deliberate, since a store entry can reasonably offer a native app beside
+    /// a port. What is not defensible is nobody knowing which.
+    #[test]
+    fn store_entries_build_the_manifests_primary_port() {
+        let text = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../manifest/projects.toml"))
+            .expect("the fleet manifest");
+        let entries = crate::appcatalog::parse_manifest(&text);
+        let primary: std::collections::BTreeSet<&str> =
+            entries.iter().filter(|e| e.primary).map(|e| e.app_id.as_str()).collect();
+        assert!(primary.len() > 10, "only {} primary entries — parser broken?", primary.len());
+
+        let groups = store_groups();
+        let mut diverging = Vec::new();
+        for g in &groups {
+            for a in &g.apps {
+                // A custom entry with an explicit path has already made the
+                // choice; only the bare `apps/<name>` shape is in question.
+                if a.path != format!("apps/{}", a.name) {
+                    continue;
+                }
+                if !primary.contains(a.name.as_str())
+                    && primary.contains(format!("{}-egui", a.name).as_str())
+                {
+                    diverging.push(a.name.clone());
+                }
+            }
+        }
+        diverging.sort();
+        diverging.dedup();
+
+        // The one that was reported must be fixed.
+        assert!(!diverging.iter().any(|n| n == "ambient-learner"),
+                "ambient-learner still builds the iced parent");
+
+        if !diverging.is_empty() {
+            eprintln!("store entries building a non-primary parent ({}):\n  {}",
+                      diverging.len(), diverging.join("\n  "));
+        }
+    }
+
 }
