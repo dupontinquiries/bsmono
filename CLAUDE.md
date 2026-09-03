@@ -7,7 +7,9 @@ are.
 Orientation, not rules: [NEWCOMER_DEVELOPER.md](NEWCOMER_DEVELOPER.md) for the
 build system, [LAYOUT.md](LAYOUT.md) for the taxonomy,
 [docs/agents/INDEX.md](docs/agents/INDEX.md) for the doc catalog,
-[maintenance/C12_TODO.md](maintenance/C12_TODO.md) for the newest open threads,
+[maintenance/C14_TODO.md](maintenance/C14_TODO.md) for the newest open threads,
+[maintenance/C13_TODO.md](maintenance/C13_TODO.md) and
+[maintenance/C12_TODO.md](maintenance/C12_TODO.md) for the queues behind it,
 [maintenance/C11_TODO.md](maintenance/C11_TODO.md) for the queue behind it,
 [maintenance/C10_TODO.md](maintenance/C10_TODO.md) for the live egui/GTK parity
 queue behind it (edited in place where c11 moved its status lines)
