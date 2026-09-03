@@ -46,20 +46,26 @@
 //!
 //! A pack — raw Opus packets concatenated with an external index — removes
 //! nearly all of it, and is the right answer eventually. It is not the right
-//! answer first, because it needs a custom demuxer on the playback side, and
-//! `shared/opus-kit` DOES NOT EXIST YET: `audiomix-kit` defers codec work to
-//! it in a doc comment, and there is no such crate in the tree. Adding a
-//! bespoke container before there is a decoder is building the second floor
-//! first. [`Budget::packed`] reports what the pack would save so the decision
-//! can be made on a number.
+//! answer first, because it needs a custom demuxer on the playback side.
+//! `shared/opus-kit` now exists and does the container arithmetic, but it
+//! deliberately does not decode: that still wants libopus. Adding a bespoke
+//! container before there is a decoder is the second floor first.
+//! [`Budget::packed`] reports what the pack would save so the decision can be
+//! made on a number.
 
 /// Measured from this repository's own mono Opus assets. Not a published
 /// figure — `bird_chirp_1.opus` is 4.18 s of mono in 13081 bytes.
 pub const MEASURED_MONO_KBPS: f32 = 25.0;
 
 /// Bytes of Ogg container per file, before audio: an `OpusHead` page and an
-/// `OpusTags` page. Conservative; comment blocks vary with tooling.
-pub const CONTAINER_BYTES: usize = 200;
+/// `OpusTags` page.
+///
+/// MEASURED at 137 in `bird_chirp_1.opus` via `shared/opus-kit`'s
+/// `Stream::header_bytes`, which was built after this constant was first
+/// guessed at 200. Kept slightly above the measurement because the
+/// `OpusTags` comment block carries the encoder name and grows with tooling —
+/// a budget that under-estimates is worse than one that does not.
+pub const CONTAINER_BYTES: usize = 160;
 
 /// Encoder delay every Opus stream declares and every decoder must discard.
 /// 312 samples at 48 kHz in every file measured in this tree.

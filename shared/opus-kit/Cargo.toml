@@ -1,0 +1,12 @@
+[package]
+name = "opus-kit"
+version = "0.1.0"
+edition = "2021"
+description = """
+The Ogg-Opus container arithmetic that three call sites in this monorepo each
+wrote for themselves: OpusHead, pre-skip, and the end-granule trim. Pure Rust,
+no libopus, no ogg crate — the decode call is three lines and was never the
+part anyone got wrong.
+"""
+
+[dependencies]
