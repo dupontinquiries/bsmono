@@ -631,6 +631,31 @@ still has no `uikit-egui` dependency, so it draws boxes for glyphs and cannot
 receive an on-screen keyboard, and `font_install_check.py` lists both paths
 separately without knowing they are the same program.
 
+### VERIFIED per crate: there is almost nothing to harvest
+
+§16's first draft warned the drift was bidirectional and that deleting either
+tree would lose work. I then diffed all eleven, and that warning was mostly
+wrong. Recording the check so nobody repeats it:
+
+| crate | what differs | harvest? |
+|---|---|---|
+| session | system has `let bin = NetworkBin::of(ip)` — UNUSED, plus its two unused imports | **No.** That is literally the "dead duplicate bin" the apps side's own commit title says it removed. The apps side also skips empty relay URLs, which the system comment explicitly declined to decide. apps is the later call. |
+| network-diag, relay, databus | system adds explanatory COMMENTS; apps already declares `chrono`, `base64`, `futures-util` and already has `required-features = ["bin"]` | No |
+| piggyback | system adds `serde-big-array` for a `[u8; 64]`; apps stores the signature as HEX and needs no such dep | No — apps solved it differently and arguably better |
+| storage | `shown_name` vs `display_name`, same logic | No |
+| vcard | `name.to_string()` vs `(*name).to_owned()` | No |
+| gesture, group, audio | apps DEPENDS ON THE SHARED KITS (`gesture-kit`, `snapcore`, `audio-kit`) where system has local copies of the same code | No — apps is ahead; this is the fleet-wide kit extraction |
+| core | comments only | No |
+
+So the apps tree is not merely newer by date; on every drifted crate it is
+newer in substance, and on three it has already been moved onto the shared kits
+that the system copy predates.
+
+The one thing worth reading before archiving is `snapclone-session`'s empty
+relay URL: apps `continue`s past it, system passes it through. Both are
+defensible and the apps side is a deliberate later change, so this is a note
+rather than a blocker.
+
 ### The resolution, and the one question it needs answered
 
 Mechanically: `apps/snapclone` survives, `system/snapclone` is archived per
@@ -673,3 +698,24 @@ deleted:
 
 What is not defensible is leaving it: one copy is now load-bearing for
 `snapclone-egui` and the other is what deploys.
+
+### ANSWERED: the apps tree is what is being used
+
+Two independent confirmations:
+
+1. The operator, directly: "I have been testing what gitmind-egui and apps
+   folder use."
+2. **gitmind resolves it that way regardless of the manifest.**
+   `cockpit::ops::resolve_app_dir` searches `["apps", "games", "system"]` in
+   that order and returns the first hit, so a bare name `snapclone` resolves to
+   `apps/snapclone` and `system/snapclone` is unreachable by name. The build
+   tool has been pointed at `apps/` all along.
+
+That second point is the interesting one: the manifest says `system/snapclone`
+is the canonical deployed daemon, and the tool that does the deploying cannot
+reach it by name. The `[system.snapclone]` notes are stale, not the tree.
+
+So: `apps/snapclone` survives, `system/snapclone` is archived per §7b, and per
+the table above there is nothing to port first. `manifest/projects.toml`'s
+`[system.snapclone]` entry goes with it, and `font_install_check.py` loses its
+duplicate `system/snapclone/camera-bridge` path.
