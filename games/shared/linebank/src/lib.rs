@@ -40,6 +40,8 @@
 //! `the_cost_of_a_carrier_is_multiplicative_and_says_so` exists so nobody
 //! designs a three-slot line and discovers it is 60 reads at the session.
 
+pub mod slice;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 /// What a unit is for, which decides how it may be spliced.
