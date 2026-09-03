@@ -69,6 +69,17 @@ if [[ ! -x "$BIN_SRC" ]]; then
 fi
 
 # ---- 2. Install --------------------------------------------
+# The systemd unit's ReadWritePaths. Created here as well as in install.sh
+# because REDEPLOY IS THE COMMON PATH on a device — install.sh runs once and
+# this runs every time source changes, so a machine that was set up before
+# those directories were created would never get them from install.sh again.
+#
+# systemd fails before ExecStart with "Failed to set up mount namespacing"
+# when a ReadWritePaths entry is missing, naming the directory rather than the
+# cause.
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/rusty-board"
+mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}/rusty-board"
+
 # Determine where to install based on the current .desktop file's
 # Exec= line. install.sh may have put the binary at $HOME/.local/bin
 # (user-install) or /usr/local/bin (system-install). Reusing the

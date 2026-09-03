@@ -74,6 +74,17 @@ APPLICATIONS_DIR="$PREFIX/share/applications"
 SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 ICONS_DIR="$PREFIX/share/icons/hicolor/scalable/apps"
 
+# The runtime directories the systemd unit lists in ReadWritePaths. Created
+# HERE because systemd refuses to set up its mount namespace when a listed
+# path is missing, and fails before ExecStart with "Failed to set up mount
+# namespacing" — an error that names the directory and not the cause.
+#
+# The unit also marks them optional with a leading `-`, so this is belt and
+# braces rather than the only guard. Both are wanted: this makes the normal
+# install correct, the `-` makes an unusual one survivable.
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/rusty-board"
+mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}/rusty-board"
+
 echo "==> RustyBoard install"
 echo "    prefix:       $PREFIX"
 echo "    project root: $PROJECT_ROOT"

@@ -19,7 +19,25 @@ CPUWeight=80
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.config/rusty-board %h/.local/share/rusty-board
+# systemd CREATES this one before the unit starts, so a fresh install does not
+# depend on the installer having made it.
+ConfigurationDirectory=rusty-board
+
+# The leading `-` makes a missing path non-fatal.
+#
+# Without it, systemd refuses to set up the mount namespace when a listed
+# directory does not exist, and the unit dies before ExecStart with
+# "Failed to set up mount namespacing" — which names the DIRECTORY, not the
+# real problem, so it reads like a permissions fault on a path the user can
+# see is fine. That is the reported redeploy failure: neither install.sh nor
+# redeploy.sh created ~/.config/rusty-board or ~/.local/share/rusty-board, and
+# the unit demanded both.
+#
+# `-` and the installer's mkdir are BOTH here on purpose. The mkdir makes the
+# normal path work; the `-` means a user who deletes the directory, or installs
+# by some route these scripts do not cover, gets a keyboard that starts rather
+# than a namespace error.
+ReadWritePaths=-%h/.config/rusty-board -%h/.local/share/rusty-board
 
 [Install]
 WantedBy=graphical-session.target
