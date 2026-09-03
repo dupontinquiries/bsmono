@@ -65,6 +65,7 @@ mod perception;
 mod trainwatch;
 mod tuner;
 mod tuning;
+mod vocab;
 mod valuestruct;
 mod hazard;
 mod helmai;

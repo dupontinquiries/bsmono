@@ -45,8 +45,15 @@ differently. Two of these are not pure renames:
   `docs/films/CANON_DECISIONS.md` §6 the Rodimus replacement also inherits the
   mid-battle "leadership is not the promise of survival" speech. **Do the
   character naming as one decision, not per-file.**
-* `autobot`/`decepticon` map onto vocabulary that already exists and ships:
-  **Coalition** and **Blackstar Clans / Corrupted**. Mostly mechanical.
+* ~~`autobot`/`decepticon` map onto vocabulary that already exists and ships:
+  **Coalition** and **Blackstar Clans / Corrupted**. Mostly mechanical.~~
+  **WRONG — corrected after an audit.** `content.rs` disproves it in one line:
+  *"elites — they are the thing the coalition and the Autobots both"*. The code
+  treats Coalition and Autobots as DIFFERENT factions, and `patrol::Faction`
+  agrees — `Coalition` is annotated "the elemental coalition", i.e. the clone
+  races, not the robots. The robot factions need names of their own, exactly
+  like the two characters do. **The whole prose half is one authoring decision,
+  not four mechanical ones.**
 
 **3. `energon` (152) — the only live-identifier rename.** `src/energon.rs` is a
 module; `energon()`, `rec_energon()`, `energon_value()`, `at_energon`, and
@@ -86,9 +93,20 @@ line. Do not sweep it with the rest.
   `low_energon_is_a_wall`,`storyline_energon_meets_every_recommendation`,
   `the_shield_needs_both_slipstreams_coordinates_and_the_cybertron_archive`).
   These are documentation and should be renamed with the thing they describe.
-* **Re-grep after each commit** and record the new count here, so the file stays
-  a status board rather than a plan that went stale. `docs/films/README.md`
-  should point at this file instead of implying the tree is clean.
-* **Add a guard.** Once a mark reaches zero, a test that greps the tree for it
-  is cheap and stops it coming back through a future content string. This is
-  the only way the rule survives contact with new writing.
+* **The guard exists now: `src/vocab.rs`.** It walks `src/*.rs` and asserts an
+  exact count per term, so a removal FAILS and prompts you to lower the number
+  while an addition fails too. Modelled on `saga.rs`'s
+  `the_inherited_contamination_is_counted_not_hidden`, which had the idea first
+  for one file.
+
+  A count rather than a ban, because the cleanup is blocked on AUTHORING, not
+  on effort, and a test demanding zero would simply get disabled. Update
+  `CENSUS` in `vocab.rs` as terms come down; that edit is the record.
+
+  `nothing_new_has_crept_in_beside_the_terms_being_tracked` covers the failure
+  mode a fixed list has — other marks arriving — for Bumblebee, Starscream,
+  Soundwave and Primus.
+* **`AllSpark` (2) should STAY** and is counted so a well-meaning sweep fails.
+  Both are doc comments citing the reference material as the reason for a
+  rendering technique; deleting them removes the reasoning that makes
+  `compact.rs` reviewable.
