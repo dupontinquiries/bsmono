@@ -71,6 +71,10 @@ struct Finding {
     /// samples instead of axis-aligned overhang. An experiment, not a
     /// shipped path — see `silhouette_shift`.
     exposure_silhouette: f32,
+    /// The single limb contributing the most visible samples, and its
+    /// share of the total. What an artist would look at first.
+    worst_limb_prim: usize,
+    worst_limb_share: f32,
 }
 
 /// Slab test: does the ray from `o` along `d` meet the box at a positive
@@ -170,6 +174,8 @@ fn audit(pose_dirs: &[PathBuf]) -> Option<Finding> {
         exposure: 0.0,
         exposure_packed: 0.0,
         exposure_silhouette: 0.0,
+        worst_limb_prim: 0,
+        worst_limb_share: 0.0,
     };
     for (p, row) in offsets.iter().enumerate() {
         let anchor = row[0].max(row[STEPS - 1]);
@@ -282,7 +288,9 @@ fn audit(pose_dirs: &[PathBuf]) -> Option<Finding> {
             };
             let raw = |i: usize| -> Vec<Vec3> { t0_own.get(i).cloned().unwrap_or_default() };
 
-            let measure = |get: &dyn Fn(usize) -> Vec<Vec3>| -> f32 {
+            let measure_for = |get: &dyn Fn(usize) -> Vec<Vec3>,
+                               only: Option<&std::collections::BTreeSet<usize>>|
+             -> f32 {
                 // Bounds over everything, so all three views share a frame.
                 let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
                 for i in 0..t0_own.len() {
@@ -313,6 +321,9 @@ fn audit(pose_dirs: &[PathBuf]) -> Option<Finding> {
                         }
                     }
                     for i in &limb_prims {
+                        if only.is_some_and(|o| !o.contains(i)) {
+                            continue;
+                        }
                         let pts = get(*i);
                         let stride = (pts.len() / 48).max(1);
                         for p in pts.iter().step_by(stride) {
@@ -330,9 +341,36 @@ fn audit(pose_dirs: &[PathBuf]) -> Option<Finding> {
                 }
                 if total > 0 { seen as f32 / total as f32 } else { 0.0 }
             };
+            let measure = |get: &dyn Fn(usize) -> Vec<Vec3>| measure_for(get, None);
+            let measure_subset =
+                |get: &dyn Fn(usize) -> Vec<Vec3>, only: &std::collections::BTreeSet<usize>| {
+                    measure_for(get, Some(only))
+                };
 
             worst.exposure = measure(&raw);
             worst.exposure_packed = measure(&packed);
+
+            // WHICH LIMB IS THE PROBLEM. A fleet number says "remodel
+            // this chassis"; a prim index says where to start.
+            {
+                let mut per_limb: Vec<(usize, f32)> = Vec::new();
+                let mut total = 0.0f32;
+                for limb in &sk.limbs {
+                    let only: std::collections::BTreeSet<usize> =
+                        limb.prims.iter().copied().collect();
+                    let share = measure_subset(&packed, &only);
+                    total += share;
+                    per_limb.push((*limb.prims.first().unwrap_or(&0), share));
+                }
+                if let Some((p, v)) = per_limb
+                    .iter()
+                    .copied()
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                {
+                    worst.worst_limb_prim = p;
+                    worst.worst_limb_share = if total > 0.0 { v / total } else { 0.0 };
+                }
+            }
 
             // THE EXPERIMENT: optimise the objective we actually want.
             //
@@ -562,6 +600,16 @@ fn main() {
     // distribution is the finding here, not a handful of outliers.
     const EXPOSURE_FLAG: f32 = 0.90;
 
+    // `--worst N` turns the audit into a work queue: the chassis whose
+    // vehicle mode shows the most robot, worst first, with the limb to
+    // look at. "It is art, not code" is only useful with a list attached.
+    let worst_n: Option<usize> = args
+        .iter()
+        .position(|a| a == "--worst")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok());
+    let mut ranked: Vec<(String, Finding)> = Vec::new();
+
     let (mut checked, mut ex_hits, mut isl_hits, mut con_hits) = (0, 0, 0, 0);
     let mut ex_all: Vec<f32> = Vec::new();
     let mut isl_all: Vec<f32> = Vec::new();
@@ -581,6 +629,10 @@ fn main() {
         exp_all.push(f.exposure);
         expp_all.push(f.exposure_packed);
         exps_all.push(f.exposure_silhouette);
+        if worst_n.is_some() {
+            ranked.push((name.clone(), f));
+            continue;
+        }
         let fe = f.worst_excursion > EXCURSION_FLAG;
         let fi = f.island > ISLAND_FLAG;
         let fc = f.contain_regress > CONTAIN_FLAG;
@@ -609,6 +661,32 @@ fn main() {
             );
         }
     }
+    if let Some(n) = worst_n {
+        ranked.sort_by(|a, b| {
+            b.1.exposure_packed
+                .partial_cmp(&a.1.exposure_packed)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        println!("REMODEL FIRST — most robot visible in vehicle mode\n");
+        println!("  NOTE: \"limb\" here is whatever skeleton::skeletonize separates from");
+        println!("  the core, which is not the same as \"robot part\". On a plain car its");
+        println!("  wheels and wings are limbs and are SUPPOSED to be visible, and a");
+        println!("  chassis whose vehicle pose is already a robot scores high by");
+        println!("  definition. Read this list with the render open, not instead of it.\n");
+        for (name, f) in ranked.iter().take(n) {
+            println!(
+                "  {:<52} {:.0}% visible   worst limb: prim {} ({:.0}% of it)",
+                name, f.exposure_packed * 100.0, f.worst_limb_prim, f.worst_limb_share * 100.0
+            );
+        }
+        println!("\nREFERENCES — these already read as vehicles\n");
+        for (name, f) in ranked.iter().rev().take(n) {
+            println!("  {:<52} {:.0}% visible", name, f.exposure_packed * 100.0);
+        }
+        println!("\n{} chassis ranked", ranked.len());
+        return;
+    }
+
     // Percentiles, because a flag count only means something next to the
     // distribution it came from. A threshold picked before seeing the data
     // is a guess.
