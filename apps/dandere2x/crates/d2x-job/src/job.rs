@@ -219,7 +219,14 @@ pub fn build_tiers(job: &Job) -> anyhow::Result<Vec<Box<dyn Upscaler>>> {
         for (n, tile) in nets {
             let share = (budget as f64 * n.macs_per_input_pixel() / total_cost.max(1.0)) as u64;
             let kernel: d2x_wgpu::ConvKernel = job.kernel.parse()?;
-            let up = d2x_wgpu::WgpuUpscaler::with_context(ctx.clone(), n, d2x_wgpu::GpuOptions { tile, require_hw: job.require_hw, low_power: false, inflight: job.inflight.max(1), vram_budget: share, kernel })?;
+            // NOT yet asking for on-device downscale (`target_scale: 0`).
+            // The pack pass can box-average a x4 network down to x2, which
+            // would delete the host Lanczos wrapper below — a per-tile resize
+            // of a 4x image on one core, plausibly the largest remaining CPU
+            // cost in cascade mode. It currently disagrees with the CPU
+            // reference by up to 22 LSB near tile seams, so it stays off until
+            // that is understood; see docs/GPU_FINDINGS.md.
+            let up = d2x_wgpu::WgpuUpscaler::with_context(ctx.clone(), n, d2x_wgpu::GpuOptions { tile, require_hw: job.require_hw, low_power: false, inflight: job.inflight.max(1), vram_budget: share, target_scale: 0, kernel })?;
             let native = up.scale();
             let boxed: Box<dyn Upscaler> = Box::new(up);
             tiers.push(if native == job.scale { boxed } else { Box::new(Resampled { inner: boxed, target: job.scale }) });
@@ -264,7 +271,7 @@ pub fn build_upscaler(job: &Job) -> anyhow::Result<Box<dyn Upscaler>> {
             #[cfg(feature = "gpu")]
             {
                 let (net, _) = load_model(job.model.as_deref())?;
-                Box::new(d2x_wgpu::WgpuUpscaler::new(net, d2x_wgpu::GpuOptions { tile: job.tile, require_hw: job.require_hw, low_power: false, inflight: job.inflight.max(1), vram_budget: job.vram_budget.unwrap_or(0), kernel: job.kernel.parse()? })?)
+                Box::new(d2x_wgpu::WgpuUpscaler::new(net, d2x_wgpu::GpuOptions { tile: job.tile, require_hw: job.require_hw, low_power: false, inflight: job.inflight.max(1), vram_budget: job.vram_budget.unwrap_or(0), target_scale: 0, kernel: job.kernel.parse()? })?)
             }
             #[cfg(not(feature = "gpu"))]
             {

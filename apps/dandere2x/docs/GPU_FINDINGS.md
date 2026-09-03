@@ -176,7 +176,31 @@ grouped by region size, which balanced tiling keeps to one or two shapes.
 
 All three were caught by the bit-exact selftest, not by reading the code.
 
-## 9. Open questions the next hardware run should answer
+## 9. In progress: on-device downscale for the cascade
+
+A x4 network serving a x2 job currently goes through `Resampled`, a host-side
+Lanczos pass over the network's 4x output — per tile, on one core. At tile 504
+that is a 2016² → 1008² resize against roughly 40 ms of GPU work for the same
+tile, which makes it a strong candidate for the largest remaining CPU cost in
+cascade mode (the compact model is x4 and jobs typically run x2).
+
+The pack pass can box-average `d x d` native pixels per output pixel instead,
+deleting the host pass entirely. It is written and behind
+`GpuOptions::target_scale`, but **off everywhere** because it does not yet
+agree with the CPU reference:
+
+- Setting the pack params' `s` field to the *delivered* scale rather than the
+  network's native one mis-addresses the input-skip lookup, which lives in the
+  network's own output space. Worth 240 LSB on its own; fixed.
+- What remains is 22 LSB, concentrated near tile seams. Unexplained. The crop
+  origin is even in native pixels and the tile arithmetic checks out on paper,
+  so the next step is dumping one tile's native output and the two averages
+  side by side rather than reasoning further.
+
+Left off rather than shipped, and its test is `#[ignore]`d rather than red, so
+nothing silently produces a slightly wrong picture.
+
+## 10. Open questions the next hardware run should answer
 
 - Do `rt2h` / `rt2c8h` (hoisted addressing, single code path) clear rt2f's
   1022, and does channel blocking finally compose?
