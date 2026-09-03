@@ -63,6 +63,10 @@ struct Finding {
     /// Fraction of limb geometry that can see open sky in VEHICLE mode.
     /// See `exposure`.
     exposure: f32,
+    /// Exposure after `skeleton::fold_pack`'s containment is applied to
+    /// the vehicle pose. The question this answers: would running the
+    /// stowing machinery the codebase already has actually hide the robot?
+    exposure_packed: f32,
 }
 
 /// Slab test: does the ray from `o` along `d` meet the box at a positive
@@ -153,6 +157,7 @@ fn audit(pose_dirs: &[PathBuf]) -> Option<Finding> {
         island_prim: 0,
         contain_regress: 0.0,
         exposure: 0.0,
+        exposure_packed: 0.0,
     };
     for (p, row) in offsets.iter().enumerate() {
         let anchor = row[0].max(row[STEPS - 1]);
@@ -268,28 +273,45 @@ fn audit(pose_dirs: &[PathBuf]) -> Option<Finding> {
                 })
                 .collect();
             let dirs = [Vec3::X, Vec3::NEG_X, Vec3::Y, Vec3::NEG_Y, Vec3::Z, Vec3::NEG_Z];
-            let (mut seen, mut total) = (0usize, 0usize);
-            for i in &limb_prims {
-                let pts = match t0_pts.get(*i) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                // Sample rather than test every vertex: these meshes carry
-                // tens of thousands and the answer does not change.
-                let stride = (pts.len() / 64).max(1);
-                for p in pts.iter().step_by(stride) {
-                    total += 1;
-                    let escapes = dirs.iter().any(|d| {
-                        !occ.iter().any(|(lo, hi)| ray_hits_box(*p, *d, *lo, *hi))
-                    });
-                    if escapes {
-                        seen += 1;
+            let measure = |limb_pts: &dyn Fn(usize) -> Vec<Vec3>| -> f32 {
+                let (mut seen, mut total) = (0usize, 0usize);
+                for i in &limb_prims {
+                    let pts = limb_pts(*i);
+                    // Sample rather than test every vertex: these meshes
+                    // carry tens of thousands and the answer does not move.
+                    let stride = (pts.len() / 64).max(1);
+                    for p in pts.iter().step_by(stride) {
+                        total += 1;
+                        if dirs.iter().any(|d| !occ.iter().any(|(lo, hi)| ray_hits_box(*p, *d, *lo, *hi)))
+                        {
+                            seen += 1;
+                        }
                     }
                 }
-            }
-            if total > 0 {
-                worst.exposure = seen as f32 / total as f32;
-            }
+                if total > 0 { seen as f32 / total as f32 } else { 0.0 }
+            };
+
+            worst.exposure = measure(&|i| t0_pts.get(i).cloned().unwrap_or_default());
+
+            // AND AGAIN, WITH THE STOWING APPLIED.
+            //
+            // `fold_pack` exists to tuck limbs into an envelope, and the
+            // vehicle pose is loaded as authored without it. If running it
+            // drops exposure, the machinery to hide the robot is already
+            // here and simply is not being used on this pose.
+            const SLACK: f32 = 0.25;
+            let steps = skeleton::fold_pack(&sk, &refs, SLACK, Vec3::Y);
+            worst.exposure_packed = measure(&|i| {
+                let step = steps.get(i).copied().unwrap_or_default();
+                t0_pts
+                    .get(i)
+                    .map(|v| {
+                        v.iter()
+                            .map(|p| step.pivot + step.rot * (*p - step.pivot) + step.shift)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            });
         }
     }
 
@@ -440,6 +462,7 @@ fn main() {
     let mut ex_all: Vec<f32> = Vec::new();
     let mut isl_all: Vec<f32> = Vec::new();
     let mut exp_all: Vec<f32> = Vec::new();
+    let mut expp_all: Vec<f32> = Vec::new();
     for name in &names {
         let dir = root.join(name);
         let poses = poses_of(&dir);
@@ -451,6 +474,7 @@ fn main() {
         ex_all.push(f.worst_excursion);
         isl_all.push(f.island);
         exp_all.push(f.exposure);
+        expp_all.push(f.exposure_packed);
         let fe = f.worst_excursion > EXCURSION_FLAG;
         let fi = f.island > ISLAND_FLAG;
         let fc = f.contain_regress > CONTAIN_FLAG;
@@ -466,8 +490,9 @@ fn main() {
         }
         if fe || fi || fc || fx {
             println!(
-                "{name:<52} exposure={:.0}%{} excursion={:.2}{} island={:.2}{} contain={:+.2}{}",
+                "{name:<52} exposure={:.0}%->{:.0}%{} excursion={:.2}{} island={:.2}{} contain={:+.2}{}",
                 f.exposure * 100.0,
+                f.exposure_packed * 100.0,
                 if fx { " <" } else { "  " },
                 f.worst_excursion,
                 if fe { " <" } else { "  " },
@@ -495,6 +520,10 @@ fn main() {
     println!(
         "exposure   median {:.0}%  p10 {:.0}%  min {:.0}%",
         pct(&mut exp_all, 0.5) * 100.0, pct(&mut exp_all, 0.1) * 100.0, pct(&mut exp_all, 0.0) * 100.0
+    );
+    println!(
+        "packed     median {:.0}%  p10 {:.0}%  min {:.0}%   (exposure after fold_pack)",
+        pct(&mut expp_all, 0.5) * 100.0, pct(&mut expp_all, 0.1) * 100.0, pct(&mut expp_all, 0.0) * 100.0
     );
     println!(
         "island     median {:.2}  p90 {:.2}  max {:.2}",
