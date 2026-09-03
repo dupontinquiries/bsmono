@@ -606,7 +606,7 @@ impl CampaignLog {
     }
     /// Slipstream defects at Film 2's close — `TF_DOMINION_SCENE_MINDMAP.md`'s
     /// Act 4 resolution: "Slipstream has defected — carries knowledge the
-    /// Autobots will need in Film 3." The troop entry (`content.rs`,
+    /// Enduring will need in Film 3." The troop entry (`content.rs`,
     /// `Role::Enemy`, `Faction::Hijacks`) is left exactly as it is on
     /// purpose — one named pilot defecting does not retire the airframe,
     /// and `Squad::new` already builds from any id leniently, so a squad

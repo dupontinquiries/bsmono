@@ -75,7 +75,7 @@ impl Society {
     /// finding. Four dials — aggression, caution, encircle, regroup —
     /// describe how an armed group behaves under pressure, and nothing in
     /// them is Cybertronian. A Directorate strike team surrounds you for the
-    /// same reason a Decepticon squad does: numbers and a doctrine that says
+    /// same reason a Sundered squad does: numbers and a doctrine that says
     /// close the ring.
     ///
     /// So the human campaign gets `skirmish.rs` for free, and the mapping is

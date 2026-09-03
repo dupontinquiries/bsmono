@@ -410,7 +410,7 @@ pub struct Tick {
 pub const ARCHIVE: &[&str] = &[
     "ARCHIVE: the energy signature matches ancient Cybertronian records",
     "ARCHIVE: the Fallen's war fleet seeded an valence cache deep in Earth's mantle",
-    "ARCHIVE: the bunker was built over an ancient site — near Unicron's core",
+    "ARCHIVE: the bunker was built over an ancient site — near the Unending's core",
     "ARCHIVE: before the war there was the Age of Foundries — a thousand cities, one forge-song",
     "ARCHIVE: the First Bridge era — when the gates opened and every world was a doorway",
     "ARCHIVE: the Silent Century — Cybertron went dark; no record says why",

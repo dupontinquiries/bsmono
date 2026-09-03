@@ -1395,7 +1395,7 @@
   "path": "./vehicles/spaceships/spaceship--supervac.zip"
  },
  {
-  "raw": "3 Decepticon Starships.zip",
+  "raw": "3 Sundered Starships.zip",
   "modes": [
    "robot"
   ],
@@ -1405,7 +1405,7 @@
   "note": null,
   "category": "vehicle",
   "dir": "spaceships",
-  "path": "./vehicles/spaceships/3 Decepticon Starships.zip"
+  "path": "./vehicles/spaceships/3 Sundered Starships.zip"
  },
  {
   "raw": "spaceship--odyssey.zip",
@@ -1774,7 +1774,7 @@
   "path": "./vehicles/flyers/flyer--Sea Harrier FA2 with AIM-9L & AIM-120B.zip"
  },
  {
-  "raw": "flyer-decepticon potential SpaceShip 4.zip",
+  "raw": "flyer-sundered potential SpaceShip 4.zip",
   "modes": [
    "robot"
   ],
@@ -1784,7 +1784,7 @@
   "note": null,
   "category": "vehicle",
   "dir": "flyers",
-  "path": "./vehicles/flyers/flyer-decepticon potential SpaceShip 4.zip"
+  "path": "./vehicles/flyers/flyer-sundered potential SpaceShip 4.zip"
  },
  {
   "raw": "flyer-valkyrie.zip",
@@ -3939,7 +3939,7 @@
   "path": "./bots/transformers_fall_of_cybertron_starscream-2-forms.zip"
  },
  {
-  "raw": "detailed-shockwave_decepticon_transformers.zip",
+  "raw": "detailed-shockwave_sundered_transformers.zip",
   "modes": [
    "robot"
   ],
@@ -3951,7 +3951,7 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/detailed-shockwave_decepticon_transformers.zip"
+  "path": "./bots/detailed-shockwave_sundered_transformers.zip"
  },
  {
   "raw": "hq Shockwave Transformers Human Alliance.zip",
@@ -4228,7 +4228,7 @@
   "path": "./bots/both-Transformers Fall Of Cybertron Scattershot.zip"
  },
  {
-  "raw": "pack- decepticon soldiers s Transformers War For Cybertron Soldiers.zip",
+  "raw": "pack- sundered soldiers s Transformers War For Cybertron Soldiers.zip",
   "modes": [
    "robot"
   ],
@@ -4238,7 +4238,7 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/pack- decepticon soldiers s Transformers War For Cybertron Soldiers.zip"
+  "path": "./bots/pack- sundered soldiers s Transformers War For Cybertron Soldiers.zip"
  },
  {
   "raw": "transformers fall of cybertron Perceptor.zip",

@@ -109,7 +109,7 @@ pub const TROOPS: &[Troop] = &[
     // "First Light" / Film 5 "Solar"): a scouting force, not an army --
     // "sending fifty to accomplish what three could do is normal to
     // them," no ideology or strategy in the Transformer sense, and by
-    // Film 5 they are field-testing tech pulled from recovered Unicron
+    // Film 5 they are field-testing tech pulled from recovered the Unending
     // debris in the outer belt. Two roster gaps that left "uncharted"
     // and "shield_edge" (both Faction::Hijacks sites) drawing on the
     // same three troops as the Trilogy One frontier fights: swarmer is
@@ -127,7 +127,7 @@ pub const TROOPS: &[Troop] = &[
     // ---- the Corrupted: Assay' experiment, in three stages ----
     // (see corruption.rs; element is None because the treatment never
     // gives them one, and Role::Enemy because they are not coalition
-    // elites — they are the thing the coalition and the Autobots both
+    // elites — they are the thing the coalition and the Enduring both
     // fear equally)
     Troop { id: "corrupted_drifter", role: Role::Enemy, chassis: "standard", fire: Verb::Push,  element: Element::None, tint: [70, 90, 70],  abilities: &["dash"], faction: patrol::Faction::Corrupted },
     Troop { id: "corrupted_bloom",   role: Role::Enemy, chassis: "bruiser",  fire: Verb::Pool,  element: Element::None, tint: [55, 75, 55],  abilities: &["shield", "pulse"], faction: patrol::Faction::Corrupted },
@@ -158,7 +158,7 @@ pub const TROOPS: &[Troop] = &[
     // caught only by actually running the missions rather than trusting
     // the build. Left as roster entries rather than champions for
     // either mission: both missions' text is already composed around
-    // Unicron's own avatar and the Corrupted converging, and forcing a
+    // The Unending's own avatar and the Corrupted converging, and forcing a
     // named champion into an established wave count is how this
     // session broke campaign balance twice already. Tagged
     // Faction::Corrupted — Earth's own faction — so they surface
@@ -383,7 +383,7 @@ mod tests {
     fn every_theatre_is_a_real_destination() {
         // the check that stops the campaign pointing at a map that does not
         // exist — the same class of bug RAIDS.md records the raid generator
-        // catching when phases referenced kuiper and unicron
+        // catching when phases referenced kuiper and unending
         for f in FILMS {
             for t in f.theatres {
                 assert!(patrol::find(t).is_some(), "film {} names unknown theatre {t}", f.n);
@@ -628,7 +628,7 @@ pub const MISSIONS: &[Mission] = &[
             "hold the descent. the avatar is forming out of the magma, and it is looking at keelwright.",
         ],
         outro: &[
-            "unicron impales prime. hot rod doesn't cause the fall this time -- he catches it.",
+            "unending impales prime. hot rod doesn't cause the fall this time -- he catches it.",
             "the matrix opens for the one who reached without wanting it. halyard rises, burning.",
         ] },
     Mission { order: 7, id: "the_drowned_approach", film: 2, dest: "earth", site: "the trench",
@@ -649,8 +649,8 @@ pub const MISSIONS: &[Mission] = &[
         cast: &[("keelwright", Presence::Playable), ("cleave", Presence::Interactable)],
         beat: "Cleave comes back through the shield; the line has to decide",
         intro: &[
-            "a decepticon signature crosses the shield, transponder open, weapons cold.",
-            "cleave. alone. half his frame is scar. 'the devourer eats decepticons too.'",
+            "a sundered signature crosses the shield, transponder open, weapons cold.",
+            "cleave. alone. half his frame is scar. 'the devourer eats sundered too.'",
             "hold the picket while the line decides whether an old enemy can surrender UP.",
         ],
         outro: &[
@@ -660,9 +660,9 @@ pub const MISSIONS: &[Mission] = &[
     Mission { order: 9, id: "beneath_the_pacific", film: 3, dest: "cybertron", site: "the gravity well",
         objective: Objective::Eliminate, champion: None,
         cast: &[("keelwright", Presence::Playable), ("cleave", Presence::Seen)],
-        beat: "Unicron; the truce; the gravity well",
+        beat: "The Unending; the truce; the gravity well",
         intro: &[
-            "cleave came back changed. harder. quieter. 'the devourer eats decepticons too.'",
+            "cleave came back changed. harder. quieter. 'the devourer eats sundered too.'",
             "the plates begin to close over the only road to the core. someone has to hold them.",
             "he plants himself under the collapsing world. 'go,' he says. nothing else.",
         ],

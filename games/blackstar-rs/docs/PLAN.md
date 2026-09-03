@@ -175,7 +175,7 @@ Only after the above.
    work. Next is secondary motion — panels settling after the body stops —
    and the fold audio.
 3. **Character models.** `src/rig.rs` can already evaluate real skinned
-   glTF; the reference Optimus rig is 83 joints and does what you want the
+   glTF; the reference Keelwright rig is 83 joints and does what you want the
    bots to do. The gap is a runtime skinning path in `render.rs`, which is
    the same gap as gait strips: pose data reaching the GPU.
 

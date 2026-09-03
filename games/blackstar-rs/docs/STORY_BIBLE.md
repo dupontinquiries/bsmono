@@ -134,7 +134,7 @@ SOLAR
 PHOTON
 ```
 
-Trilogy one (DOOMSDAY / DOMINION / DESTINY) is Earth, Unicron, and the shield.
+Trilogy one (DOOMSDAY / DOMINION / DESTINY) is Earth, the Unending, and the shield.
 Trilogy two (FIRST LIGHT / SOLAR / PHOTON) leaves the shield and finds out how
 large the cosmos is. The Watch's ceiling is the climax; `watch.rs` owns the
 mechanic and `chi.rs` owns the attunement.
@@ -290,7 +290,7 @@ find contested. They live in `archive::CLAIMS`.
 
 ```canon:claims
 bridge_predates_coalition
-unicron_in_earth
+unending_in_earth
 convergence_was_not_first
 societies_existed
 facility_built_2003
@@ -314,7 +314,7 @@ instrument_artefact
 
 Three of these are **mundane answers to false leads** — `cold_war_debris`,
 `later_forgery`, `instrument_artefact`. Chasing `satellite_fragment_17`,
-`asteri_signal_beacon` or `unicron_detection_scan` is not punished and not
+`asteri_signal_beacon` or `unending_detection_scan` is not punished and not
 rewarded. It is *answered*. A universe where every glowing object means
 something is a theme park.
 
@@ -502,7 +502,7 @@ costs nothing extra because the evidence was already written.
 `farmhouse_photograph`, `trench_excavation_scar` and `thermal_plate` all
 describe THE RIDGE, and together they date the Directorate's dig to 1998, 1996
 and 1994 against an official record of 2003. The ridge overlooks the shore
-where Unicron's fissure opens.
+where the Unending's fissure opens.
 
 Which answers something the tables raised and never resolved: **the record is
 not falsified to hide a building. It is falsified because somebody was digging

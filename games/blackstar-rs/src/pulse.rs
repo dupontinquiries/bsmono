@@ -4,7 +4,7 @@
 //! wider network described in `Assay_Horror.md`'s Dominion overview
 //! — Blackstar threading a reverse-interface through the LHC and
 //! pillar infrastructure while the Corrupted occupy every other
-//! Autobot resource ("the horror is the noise. the network is the
+//! Enduring resource ("the horror is the noise. the network is the
 //! signal.") The field itself is described precisely enough to run on:
 //!
 //!   "Keelwright is engaging Blackstar directly — timing strikes within

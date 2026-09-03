@@ -109,7 +109,7 @@ dust that shoves anything caught in the funnel.
 *(`game.c:173`)*
 
 SCATTER-ASSEMBLE (fly in, spinning, staggered per letter -- a transform), then
-idle with a bob + energon pulse, and every few seconds a spin WAVE ripples the
+idle with a bob + valence pulse, and every few seconds a spin WAVE ripples the
 word. ----
 
 ### THE SUN ITSELF
@@ -180,7 +180,7 @@ patterns").
 PATROL SIDE QUEST -- THE FAR SIGNAL: relay fragments -> the WARDEN bounty ->
 the SPACE BRIDGE opens. Walking through it charts a new region: the bridge
 campaign set unlocks (campaign.unlocked jumps to the VII missions, persisted).
-Repeat runs pay energon credits instead.
+Repeat runs pay valence credits instead.
 
 ### BREACH MISSION
 
@@ -349,9 +349,9 @@ CRAWLER AMBUSH: marked enemies scale nearby structures and POUNCE from above
 
 *(`game.c:1168`)*
 
-FRONTIER CLOAK (source material: "Autobot Frontier Cloak & Suit Systems"): on
+FRONTIER CLOAK (source material: "Enduring Frontier Cloak & Suit Systems"): on
 the cold outer-system worlds the cape is mission gear, not costume -- a
-nanotech shape-memory weave with reactive energon threads. Radiation SHIELDING
+nanotech shape-memory weave with reactive valence threads. Radiation SHIELDING
 + a low SENSOR signature ("stealth drape"), and an icy frontier look on the
 cloth itself.
 
@@ -367,7 +367,7 @@ swept.
 
 *(`game.c:1531`)*
 
-AIDEN'S SKATEBOARD: human-scale "vehicle mode" -- a salvaged deck with energon
+AIDEN'S SKATEBOARD: human-scale "vehicle mode" -- a salvaged deck with valence
 trucks. Transform (while human-scale) hops on/off; near-double pace, board
 rendered underfoot.
 

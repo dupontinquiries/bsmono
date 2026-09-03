@@ -22,7 +22,7 @@ recognizing, for the first time, something categorically beyond it.
 
 **Setting**: Continuous from Film 5's final image. The sealed chamber.
 
-**Characters**: The Morpher, Rodimus Prime (observing, helpless)
+**Characters**: The Morpher, Halyard Prime (observing, helpless)
 
 ---
 
@@ -172,7 +172,7 @@ Ask me in a minute.
 
 **Setting**: The battle space, aftermath.
 
-**Characters**: Rodimus Prime, Aiden, the Morpher (recovering), Meridian
+**Characters**: Halyard Prime, Aiden, the Morpher (recovering), Meridian
 
 ---
 
@@ -200,7 +200,7 @@ progress looks like out here.
 **Setting**: Medical bay. The Morpher, three days into what everyone
 understands will be a three-day recovery.
 
-**Characters**: Rodimus Prime, Aiden, Billy
+**Characters**: Halyard Prime, Aiden, Billy
 
 ---
 
@@ -227,7 +227,7 @@ expecting to still be alone after today.
 both — drifting in the light of a sun that, for a few seconds today,
 briefly had company.
 
-**Characters**: Rodimus Prime (V.O.)
+**Characters**: Halyard Prime (V.O.)
 
 ---
 

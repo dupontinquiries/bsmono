@@ -25,7 +25,7 @@
 //! `farmhouse_photograph`, `trench_excavation_scar` and `thermal_plate` all
 //! describe THE RIDGE, and together they put the Directorate's dig at 1998,
 //! 1996 and 1994 against an official record of 2003. `the_beach_opens` puts
-//! Unicron's fissure on the shore below that same ridge.
+//! The Unending's fissure on the shore below that same ridge.
 //!
 //! Which answers a question the tables raised and never resolved: the record
 //! is not falsified to hide a building. It is falsified because somebody was
@@ -63,7 +63,7 @@
 pub enum Era {
     /// the human films: secret societies, roughly 1994-2009
     Archive,
-    /// the Blackstar present: Unicron, the shield, the war
+    /// the Blackstar present: the Unending, the shield, the war
     Present,
 }
 
@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn the_dig_looks_down_on_the_fissure() {
         // the load-bearing adjacency. the excavation ladder (1998/1996/1994)
-        // is at the ridge; Unicron's shore opens below it. separate these two
+        // is at the ridge; the Unending's shore opens below it. separate these two
         // and the falsified date stops having a reason.
         let (ridge, beach) = RIDGE_OVERLOOKS_BEACH;
         let r = place(ridge).expect("the ridge");

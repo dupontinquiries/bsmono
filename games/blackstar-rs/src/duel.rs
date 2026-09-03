@@ -6,7 +6,7 @@
 //! is engaging Blackstar directly — timing strikes within the
 //! 12-second paralysis intervals."* Two threads, one clock
 //! (`pulse::Field`), and — confirmed across both docs — the field
-//! only catches Transformers: *"all Autobots in range freeze
+//! only catches Transformers: *"all Enduring in range freeze
 //! briefly"* is `TF_DOMINION_SCENE_MINDMAP.md`'s own wording, and LA
 //! Hero's whole tactical value in the scene is being *"human
 //! scale — too fast for Blackstar to stop."* Nothing here invents a

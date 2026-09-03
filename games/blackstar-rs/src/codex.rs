@@ -153,7 +153,7 @@ pub static CODEX: &[Entry] = &[
         title: "the corrupted",
         claim: None,
         lines: &[
-            "unicron's tissue hijacks the will to transform.",
+            "unending's tissue hijacks the will to transform.",
             "no fixed shape, ever. they hunt by spark resonance,",
             "so stillness will not hide you. only the sparkless walk free.",
         ],
@@ -309,9 +309,9 @@ pub static CODEX: &[Entry] = &[
         ],
     },
     Entry {
-        id: "unicron",
-        title: "unicron",
-        claim: Some("unicron_in_earth"),
+        id: "unending",
+        title: "unending",
+        claim: Some("unending_in_earth"),
         lines: &[
             "not a villain -- an event. a devourer the matrix",
             "drove dormant but never silenced. his neural remnants",
@@ -393,7 +393,7 @@ pub static CODEX: &[Entry] = &[
         title: "cryotek",
         claim: None,
         lines: &[
-            "the cold open: an ice-base decepticon holding the outer rim,",
+            "the cold open: an ice-base sundered holding the outer rim,",
             "ice-plasma and frozen shards, mining cybertron's dead fragments.",
             "sam ends him early -- the first skirmish, and a statement of tone.",
         ],
@@ -429,8 +429,8 @@ pub static CODEX: &[Entry] = &[
         ],
     },
     Entry {
-        id: "the_decepticons",
-        title: "the decepticons",
+        id: "the_sundered",
+        title: "the sundered",
         claim: None,
         lines: &[
             "conquest was the old war. this one is different --",
@@ -453,7 +453,7 @@ pub static CODEX: &[Entry] = &[
         title: "forgeheart",
         claim: None,
         lines: &[
-            "an autobot who fights the terrain itself: flips a spinning",
+            "an enduring who fights the terrain itself: flips a spinning",
             "asteroid to crush an ambush, raises debris into cover.",
             "heavy, deliberate, and hard to move once he sets his feet.",
         ],
@@ -473,7 +473,7 @@ pub static CODEX: &[Entry] = &[
         title: "the reassembler",
         claim: None,
         lines: &[
-            "unicron was never built to destroy. he was built to rebuild --",
+            "unending was never built to destroy. he was built to rebuild --",
             "break dead worlds down, reforge them into living ones.",
             "a god-machine. the makers simply lost the controls.",
         ],
@@ -483,7 +483,7 @@ pub static CODEX: &[Entry] = &[
         title: "sam witwicky",
         claim: None,
         lines: &[
-            "the human who has stood with the autobots longest.",
+            "the human who has stood with the enduring longest.",
             "he builds the interface, keeps the link to old lore,",
             "and mentors the one who will carry it forward.",
         ],

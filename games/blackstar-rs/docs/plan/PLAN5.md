@@ -56,7 +56,7 @@ we need to update our python helpers to extract them and trim the tris and compr
 │   │       ├── Spider Drone V6 Cybertech.zip
 │   │       └── Spider Tank.zip
 │   ├── animated idle Transformers_ Fall of Cybertron Soundwave.zip
-│   ├── animated - Transformers War For Cybertron Megatron.zip
+│   ├── animated - Transformers War For Cybertron Cleave.zip
 │   ├── blackstar-characters
 │   ├── both--set of 5--Transformers Fall Of Cybertron Combaticons.zip
 │   ├── both-Slipstream_War of Cybertron.zip
@@ -75,15 +75,15 @@ we need to update our python helpers to extract them and trim the tris and compr
 │   ├── both-Transformers Fall Of Cybertron Swoop.zip
 │   ├── both-Transformers Fall Of Cybertron Warpath.zip
 │   ├── both-TRANSFORMERS MIXMASTER.zip
-│   ├── both+weapon-Transformers Fall Of Cybertron Megatron.zip
-│   ├── both--with-transform-animation--Transformers_ Fall of Cybertron Megatron.zip
-│   ├── detailed-shockwave_decepticon_transformers.zip
+│   ├── both+weapon-Transformers Fall Of Cybertron Cleave.zip
+│   ├── both--with-transform-animation--Transformers_ Fall of Cybertron Cleave.zip
+│   ├── detailed-shockwave_sundered_transformers.zip
 │   ├── dinos
 │   │   └── dinobot--prowler.zip
 │   ├── Elita One.zip
 │   ├── hq Shockwave Transformers Human Alliance.zip
 │   ├── Jetfire ROTF Game.zip
-│   ├── pack- decepticon soldiers s Transformers War For Cybertron Soldiers.zip
+│   ├── pack- sundered soldiers s Transformers War For Cybertron Soldiers.zip
 │   ├── patrol-bots
 │   │   ├── bot--dragonstrike.zip
 │   │   ├── bot--lucifer.zip
@@ -99,10 +99,10 @@ we need to update our python helpers to extract them and trim the tris and compr
 │   ├── Transformers Fall Of Cybertron Dragstrip.zip
 │   ├── Transformers Fall Of Cybertron flying soldier.zip
 │   ├── Transformers Fall of Cybertron Hound.zip
-│   ├── transformers_fall_of_cybertron_megatron-3forms.zip
+│   ├── transformers_fall_of_cybertron_cleave-3forms.zip
 │   ├── Transformers Fall Of Cybertron Menasor.zip
 │   ├── Transformers fall of cybertron Motormaster.zip
-│   ├── transformers_fall_of_cybertron_optimus_prime-animated.zip
+│   ├── transformers_fall_of_cybertron_keelwright_prime-animated.zip
 │   ├── transformers fall of cybertron Perceptor.zip
 │   ├── Transformers Fall Of Cybertron Sludge.zip
 │   ├── Transformers Fall Of Cybertron Snarl.zip
@@ -117,10 +117,10 @@ we need to update our python helpers to extract them and trim the tris and compr
 │   ├── vehicles
 │   │   ├── Brawl Tank Transformers Human Alliance.zip
 │   │   ├── Fall of CyberTron_ Bumble Bee Vehicle.zip
-│   │   ├── Fall of CyberTron_ DLC G1 Optimus Prime Alt Mode.zip
-│   │   ├── Fall of CyberTron_ Optimus Prime CyberTruck.zip
-│   │   ├── Megatron Tank.zip
-│   │   ├── PlayStation 3 ROTF Megatron.zip
+│   │   ├── Fall of CyberTron_ DLC G1 Keelwright Alt Mode.zip
+│   │   ├── Fall of CyberTron_ Keelwright CyberTruck.zip
+│   │   ├── Cleave Tank.zip
+│   │   ├── PlayStation 3 ROTF Cleave.zip
 │   │   ├── Transformers Fall Of Cybertron Barricade.zip
 │   │   ├── Transformers Fall Of Cybertron Cliffjumper.zip
 │   │   ├── transformers_fall_of_cybertron_nemesis.zip
@@ -182,7 +182,7 @@ we need to update our python helpers to extract them and trim the tris and compr
 │       └── SciFi-Corridor (Sky Palace).zip
 ├── raid-bosses
 │   ├── astro_armor_titan_speakerman.zip
-│   ├── devastator-good-for-raid-jhiaxus.zip
+│   ├── devastator-good-for-raid-assay.zip
 │   ├── plasmas_mechagodzilla_anime_trilogy.zip
 │   ├── raid-boss--cherno_alpha.zip
 │   ├── raidboss--gigadrill.zip
@@ -293,7 +293,7 @@ we need to update our python helpers to extract them and trim the tris and compr
 │   ├── reference-- player camera spectator indicator-aka non-military consumer UAV drone.zip
 │   ├── reference--ship parts for transformation-aka Star Sparrow Modular Spaceship.zip
 │   ├── reference--smoother design of elegance-aka Laser Turret.zip
-│   ├── references--potential Jhiaxus reference not sure yet-aka MIND ALPHA.zip
+│   ├── references--potential Assay reference not sure yet-aka MIND ALPHA.zip
 │   ├── reference--terrain mountain noise example earth-aka-Mount Fuji Volcano Crater with Snow - Japan.zip
 │   ├── reference--three-headed-dragon-transformer-dragon-form.zip
 │   ├── terrain
@@ -391,7 +391,7 @@ we need to update our python helpers to extract them and trim the tris and compr
 │   │   ├── flyer--darkguard.zip
 │   │   ├── flyer--dawnshade.zip
 │   │   ├── flyer--deathstroke.zip
-│   │   ├── flyer-decepticon potential SpaceShip 4.zip
+│   │   ├── flyer-sundered potential SpaceShip 4.zip
 │   │   ├── flyer--deepspacezip
 │   │   ├── flyer--doomlift.zip
 │   │   ├── flyer--downdraft-aka stealth fighter.zip
@@ -487,7 +487,7 @@ we need to update our python helpers to extract them and trim the tris and compr
 │   │   └── motorcycle--Kurogane Type 95.zip
 │   ├── multi-vehicle--Spaceship Constructor.zip
 │   ├── spaceships
-│   │   ├── 3 Decepticon Starships.zip
+│   │   ├── 3 Sundered Starships.zip
 │   │   ├── planning.md
 │   │   ├── spaceship--Albatar.zip
 │   │   ├── spaceship--ascendus.zip
@@ -677,7 +677,7 @@ flyer--vertigo => a flying jet bot that is named Vertigo: they will have their o
 
 hoverer--akimbo-aka Sleek Cyberpunk Car => a hovercar bot named Akimbo that is more sleek and cyberpunk than other models
 
-hoverer--hardwall-aka Dystopian police car => a hovercar bot named Hardwall that is a flying police car. he obviously liked barricades form or saw something useful in the police car like visibility and speed blended with a slightly enforcer capability so maybe he takes prisoners of humans who wander out into the outer rim on smaller research missions, or maybe he was on earth and was an ally to the humans and believes in law and order... hard to say because hardwall sounds more like a decepticon name... this is where we need to fill in the lore of the world and the patrol spaces across the galaxy so that everything feels believable.
+hoverer--hardwall-aka Dystopian police car => a hovercar bot named Hardwall that is a flying police car. he obviously liked barricades form or saw something useful in the police car like visibility and speed blended with a slightly enforcer capability so maybe he takes prisoners of humans who wander out into the outer rim on smaller research missions, or maybe he was on earth and was an ally to the humans and believes in law and order... hard to say because hardwall sounds more like a sundered name... this is where we need to fill in the lore of the world and the patrol spaces across the galaxy so that everything feels believable.
 
 some filenames do not have much info on story or character and need extra creativity. some of these exceptions are the cars sections (cars-) which I didn't have much inspiration for yet and they might be reserved for some earth locations or some fitting space locations... maybe there can be some racetracks in space somewhere that attract these types, or maybe they end up serving as reference models for more space-styled vehicles that we can generate from their unique shapes and dimensions.
 
@@ -1281,7 +1281,7 @@ Circular hull
 
 Visible somewhere in robot mode.
 
-Likewise, Optimus Prime always keeps truck windows on the chest because they're iconic.
+Likewise, Keelwright always keeps truck windows on the chest because they're iconic.
 
 Rule 20 — Transformation has phases
 
@@ -1748,7 +1748,7 @@ Protected.
 
 Visual hierarchy
 
-Instead of looking like Optimus
+Instead of looking like Keelwright
 
 Human wearing truck
 
@@ -1896,7 +1896,7 @@ stack sections
 
 Examples
 
-Optimus Jetfire Starscream
+Keelwright Jetfire Starscream
 
 B. Radial
 
@@ -2047,7 +2047,7 @@ Motorcycle	Runner
 Spider tank	Multi-legged
 Bird	Digitigrade
 
-Don't force everything into Optimus Prime proportions.
+Don't force everything into Keelwright proportions.
 
 Rule 4 — Preserve Large Curves
 
@@ -2421,7 +2421,7 @@ generate interesting deep space transformer relic lore for each raid boss based 
 
 raid-bosses
 ├── astro_armor_titan_speakerman.zip
-├── devastator-good-for-raid-jhiaxus.zip
+├── devastator-good-for-raid-assay.zip
 ├── plasmas_mechagodzilla_anime_trilogy.zip
 ├── raid-boss--cherno_alpha.zip
 ├── raidboss--gigadrill.zip
@@ -2469,10 +2469,10 @@ Every century another fleet answers.
 
 No fleet ever returns.
 
-Devastator Jhiaxus
+Devastator Assay
 "Prototype Omega"
 
-Jhiaxus believed individual Transformers were obsolete.
+Assay believed individual Transformers were obsolete.
 
 His answer:
 
@@ -2856,7 +2856,7 @@ Its memory contains events that never happened.
 
 Destroyed Primes who still live.
 
-Victorious Decepticons who lost.
+Victorious Sundered who lost.
 
 Worlds that never existed.
 
@@ -2953,7 +2953,7 @@ Fight the weakened Speakerman while every attack attempts to interrupt teamwork.
 
 Communication becomes the mechanic.
 
-Devastator Jhiaxus
+Devastator Assay
 
 I honestly wouldn't change much.
 
@@ -3652,7 +3652,7 @@ Double jump.
 
 Triple Jump
 
-Consumes energon.
+Consumes valence.
 
 Wall Boosters
 
@@ -5367,7 +5367,7 @@ The mesh constrains the template
 
 Suppose you import
 
-optimus.obj
+keelwright.obj
 
 You detect
 

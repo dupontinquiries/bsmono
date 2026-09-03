@@ -54,7 +54,7 @@ transformers_blackstar/
 ├── 🎬 TRANSFORMERS BLACKSTAR.md          [Opening storyboard]
 ├── TRANSFORMERS_DOOMSDAY+DOMINION+DESTINY.md  [Films 1–3 outline + treatments]
 ├── TF_TRILOGY_TWO_FRAMEWORK.md           [Films 4–6 framework + character arcs]
-├── Jhiaxus_Horror.md                     [Character study: Jhiaxus]
+├── Assay_Horror.md                     [Character study: Assay]
 ├── TF_JHIAXUS_AND_THE_CORRUPTED.md       [Corrupted faction lore]
 ├── TF_ADDITIONAL_SCENE_AIDS.md           [Optional scenes, deleted material]
 ├── TF_QUANTUM_GRAVITY_LEAP.md            [Physics/lore engine]
@@ -85,10 +85,10 @@ pub static FILM_01_DOOMSDAY: FilmEntry = FilmEntry {
     trilogy: 1,
     position: 1,
     title: "TRANSFORMERS: DOOMSDAY",
-    premise: "Unicron awakens beneath Earth; Hot Rod becomes Rodimus Prime...",
+    premise: "the Unending awakens beneath Earth; Hot Rod becomes Halyard Prime...",
     acts: [...],
     emotional_core: "...",
-    introduces: vec!["Rodimus Prime", "Unicron (dormant)", "Aiden", ...],
+    introduces: vec!["Halyard Prime", "the Unending (dormant)", "Aiden", ...],
     resolves: vec!["Earth's immediate extinction risk"],
     unresolved: vec![...],
 };
@@ -214,7 +214,7 @@ The `codex.rs` now includes the 5 new characters. Wire them into findings:
 ```rust
 Finding {
     id: "morpher_first_contact_video",
-    source: "rodimus_expedition_log",
+    source: "halyard_expedition_log",
     text: "The Morpher emerged from the ice with the Watch \
            on a chain of condensed ice that never melted. \
            His first words: 'The shield has been compromised. \
@@ -390,7 +390,7 @@ From `TF_TRILOGY_TWO_FRAMEWORK.md`:
 
 ### Where We Pick Up
 
-Rodimus Prime leads a small joint fleet...
+Halyard Prime leads a small joint fleet...
 They cross the shield boundary for the first time.
 
 The transition should be a cinematic event in itself — not a gate, 
@@ -400,7 +400,7 @@ of space changes subtly on the other side.
 Sam Witwicky, watching from inside the shield on relay: the signal 
 cuts out for eleven seconds. Then comes back.
 
-Rodimus: *"We're through."*
+Halyard: *"We're through."*
 ```
 
 ### `saga.rs` (game structure)
@@ -411,7 +411,7 @@ pub static FILM_04_FIRST_LIGHT: FilmEntry = FilmEntry {
     title: "TRANSFORMERS: FIRST LIGHT",
     premise: "The heroes breach the shield for the first time...",
     acts: [
-        "Rodimus leads a joint expedition across the shield boundary...",
+        "Halyard leads a joint expedition across the shield boundary...",
         ...
     ],
     ...
@@ -429,10 +429,10 @@ Claim {
 },
 
 Finding {
-    id: "rodimus_log_shield_crossing",
+    id: "halyard_log_shield_crossing",
     source: "first_light_expedition_logs",
     text: "Signal loss: 11 seconds during boundary transit. \
-           Geometry shifted. Instruments recalibrating. Rodimus: \
+           Geometry shifted. Instruments recalibrating. Halyard: \
            'We're through.'",
     supports: &["film_4_shield_geometry_changed"],
     opposes: &[],
@@ -469,7 +469,7 @@ Entry {
 ### Player Experience
 
 1. Player finds the sensor log in a wreckage on the shield boundary
-2. Game displays `Finding { id: "rodimus_log_shield_crossing" }`
+2. Game displays `Finding { id: "halyard_log_shield_crossing" }`
 3. Player checks codex: entry "the morpher" becomes available
 4. In the codex, player sees the entry is annotated with claim "film_4_morpher_identity"
 5. Player opens the archaeology map

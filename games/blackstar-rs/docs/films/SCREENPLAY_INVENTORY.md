@@ -9,7 +9,7 @@
 > (Matter Transformation Planet, 5 mentions), which was replaced precisely
 > because it contradicted the shipped codex.
 >
-> It also carries one instance of "Autobot" — a Paramount/Hasbro mark this
+> It also carries one instance of "Enduring" — a Paramount/Hasbro mark this
 > project does not use — and spells the faction "Hijak" 13 times against the
 > code's `Hijacks`.
 >
@@ -37,19 +37,19 @@ This document shows which screenplay file contains content for each film, what's
 - `TF_DOOMSDAY_FILMMAKER_CHARTS.md` — Visual design, character sheets, sound design
 
 **Beats covered**:
-- Unicron's awakening beneath Earth
-- Hot Rod's descent into Unicron's interior
-- Matrix transformation → Rodimus Prime
-- Megatron's sacrificial death
+- the Unending's awakening beneath Earth
+- Hot Rod's descent into the Unending's interior
+- Matrix transformation → Halyard Prime
+- Cleave's sacrificial death
 - Earth stabilization
 - Pluto Defense Ring established
 
 **Gaps**: None identified for Film 1. Full narrative arc is present.
 
 **Key character arcs**:
-- Hot Rod → Rodimus Prime
-- Optimus Prime (wounded, passes leadership)
-- Megatron (redemption arc, death)
+- Hot Rod → Halyard Prime
+- Keelwright (wounded, passes leadership)
+- Cleave (redemption arc, death)
 - Aiden (human witness introduction)
 
 ---
@@ -80,10 +80,10 @@ This document shows which screenplay file contains content for each film, what's
 **To write**:
 - Act 1: Pluto defense ring expansion montage
 - Act 2: Clone coalition initial contact protocols
-- Act 3: Blackstar negotiation aboard Rodimus' flagship
+- Act 3: Blackstar negotiation aboard Halyard' flagship
 
 **Key character arcs**:
-- Rodimus Prime (first major leadership test)
+- Halyard Prime (first major leadership test)
 - Aiden (becomes human liaison)
 - Blackstar (introduced as unknown quantity)
 - The Morpher (brief appearance, name not yet spoken)
@@ -96,13 +96,13 @@ This document shows which screenplay file contains content for each film, what's
 
 **Source files**:
 - `TRANSFORMERS_DOOMSDAY+DOMINION+DESTINY.md` — Outline and thematic discussion
-- `TF_JHIAXUS_AND_THE_CORRUPTED.md` — Corrupted faction mechanics, Jhiaxus' arc
-- `Jhiaxus_Horror.md` — Character study, psychological depth
+- `TF_JHIAXUS_AND_THE_CORRUPTED.md` — Corrupted faction mechanics, Assay' arc
+- `Assay_Horror.md` — Character study, psychological depth
 - `TF_ADDITIONAL_SCENE_AIDS.md` — Optional scenes (some can be Destiny material)
 
 **Beats covered**:
 - Corrupted outbreak emergence
-- Jhiaxus' archive access and infection
+- Assay' archive access and infection
 - Investigation and containment
 - Blackstar's advance knowledge revelation
 - Blackstar's departure (with data)
@@ -110,18 +110,18 @@ This document shows which screenplay file contains content for each film, what's
 **Gaps**:
 - [ ] Full screenplay for Destiny not written yet
 - [ ] Corrupted combat sequences not detailed
-- [ ] Jhiaxus descent into possession not psychologically explored
+- [ ] Assay descent into possession not psychologically explored
 - [ ] Containment strategy sequences missing
 - [ ] Blackstar's final scene in this film needs expansion
 
 **To write**:
 - Act 1: Corrupted plague discovery and spread
-- Act 2: Jhiaxus' archive infiltration and transformation
+- Act 2: Assay' archive infiltration and transformation
 - Act 3: Containment action sequence + Blackstar departure
 
 **Key character arcs**:
-- Jhiaxus (scientist → corrupted → contained/died)
-- Rodimus Prime (learns cost of incomplete knowledge)
+- Assay (scientist → corrupted → contained/died)
+- Halyard Prime (learns cost of incomplete knowledge)
 - Blackstar (revealed as having other motives)
 - Aiden (realization that internal threats are worst)
 
@@ -160,7 +160,7 @@ This document shows which screenplay file contains content for each film, what's
 
 **Key character arcs**:
 - Aiden (first human outside the shield)
-- Rodimus Prime (accepts guidance from Clone forces)
+- Halyard Prime (accepts guidance from Clone forces)
 - The Morpher (fully introduced, origin hinted at)
 
 ---
@@ -252,7 +252,7 @@ This document shows which screenplay file contains content for each film, what's
 
 **Beats to cover** (from saga.rs):
 - Solar system's architecture beginning to be understood
-- Joint restoration project proposed (Hijak + Autobot + human)
+- Joint restoration project proposed (Hijak + Enduring + human)
 - Blackstar reappears with star-seed artifact
 - Blackstar's demand: transparency when restoration is complete
 - Restoration framework established
@@ -273,7 +273,7 @@ This document shows which screenplay file contains content for each film, what's
 - First restoration phase sequences
 
 **Key character arcs**:
-- Rodimus Prime (shifts from defense to creation mindset)
+- Halyard Prime (shifts from defense to creation mindset)
 - Blackstar (makes his ultimate demand for transparency)
 - Hijaks (collaborate openly)
 
@@ -314,7 +314,7 @@ This document shows which screenplay file contains content for each film, what's
 - Aiden (becomes Watch bearer, begins transformation)
 - The Morpher (passes his role)
 - Billy (resurrected, chooses new mission)
-- Rodimus Prime (watches younger generation rise)
+- Halyard Prime (watches younger generation rise)
 
 ---
 
@@ -332,7 +332,7 @@ This document shows which screenplay file contains content for each film, what's
 - Aiden broadcasts first open message to cosmos
 - Message in 17 languages
 - Reactions from inner colonies
-- Rodimus and Optimus' final reflection
+- Halyard and Keelwright' final reflection
 - Epilogue: what happens next
 
 **Gaps**:
@@ -348,12 +348,12 @@ This document shows which screenplay file contains content for each film, what's
 - Solar system reactivation (visual spectacle)
 - Aiden's message composition and broadcast
 - Multi-perspective reactions (Earth, Mars, Titan, etc.)
-- Rodimus/Optimus epilogue scene
+- Halyard/Keelwright epilogue scene
 
 **Key character arcs**:
 - Aiden (completes transformation, represents new era)
-- Rodimus Prime (watches saga complete, steps back)
-- Optimus Prime (final wisdom scene)
+- Halyard Prime (watches saga complete, steps back)
+- Keelwright (final wisdom scene)
 
 ---
 
@@ -492,7 +492,7 @@ ACT 3: REVELATION & SACRIFICE
 
 For each major scene, draft dialogue in the voices established in Trilogy 1:
 
-- **Rodimus Prime**: Youthful, determined, still learning leadership
+- **Halyard Prime**: Youthful, determined, still learning leadership
 - **Aiden**: Curious, grounded, bridge between human and Transformer
 - **The Morpher**: Calibrated, precise, speaking from vast experience
 - **Billy**: Intense, economic with words, operates on different priorities
@@ -517,7 +517,7 @@ Once screenplay exists:
 - `TF_DOOMSDAY_FILMMAKER_CHARTS.md` — character design, visual direction
 - `TF_DOMINION_SHIELD_HINTS.md` — mechanics, lore depth
 - `TF_DOMINION_SCENE_MINDMAP.md` — emotional beats, scene structure
-- `Jhiaxus_Horror.md` — psychological character study
+- `Assay_Horror.md` — psychological character study
 - `TF_JHIAXUS_AND_THE_CORRUPTED.md` — faction mechanics
 - `Clones.md` — Clone coalition design
 - `TF_QUANTUM_GRAVITY_LEAP.md` — physics + outer cosmos mechanics

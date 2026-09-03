@@ -97,19 +97,34 @@ mod tests {
         // real use.
         ("Rodimus", 0),
         ("rodimus", 0),
-        // Blocked on authoring: the robot factions need names of their own.
-        // `content.rs` proves Coalition is NOT the same thing as the Autobots
-        // ("the thing the coalition and the Autobots both"), so this is not
-        // the mechanical rename RENAME_MAP.md first claimed.
-        ("Decepticon", 7),
-        ("decepticon", 8),
-        ("Autobot", 12),
-        ("autobot", 3),
+        // Renamed once the factions had names of their own: Autobots ->
+        // the Enduring, Decepticons -> the Sundered. `content.rs` had proved
+        // Coalition is NOT the same thing as the Autobots ("the thing the
+        // coalition and the Autobots both"), so this was never the mechanical
+        // rename RENAME_MAP.md first claimed.
+        //
+        // 1 rather than 0 for the same reason as Optimus and Megatron below:
+        // saga.rs's two guards name these words as data, and a guard cannot
+        // detect a word without containing it.
+        ("Decepticon", 1),
+        // 2, not 1: one is the guard needle, the other is an ASSET FILENAME —
+        // `census.rs` carries `tank_incision_aka_decepticon_tank_m1978_koksan
+        // _north_korea`, matched against a real catalogue file on disk.
+        // Renaming it broke `census::the_census_matches_its_source`, which is
+        // the right outcome: a licensed word inside a filename is a different
+        // category from one in prose, and this term can never reach zero while
+        // the file is named that.
+        ("decepticon", 2),
+        ("Autobot", 1),
+        ("autobot", 1),
         // Missed by the first audit. Hasbro, and Jhiaxus was Marvel/IDW.
         // docs/films/README.md names Rodimus in the very sentence that states
         // the vocabulary rule, so the rule has a hole in its own wording.
-        ("Unicron", 33),
-        ("unicron", 37),
+        // Unicron -> the Unending. Identifiers took the bare word (arena
+        // "unending", claim unending_in_earth) because an article inside a key
+        // is wrong; prose took the article.
+        ("Unicron", 0),
+        ("unicron", 0),
         // SURFACED BY THE RENAME rather than by the audit. Substituting the
         // character names left "Halyard Prime" and "Hot Rod" standing in the
         // prose, with the Matrix of Leadership behind them.
@@ -237,7 +252,10 @@ mod tests {
         // every assertion pass. Anchor on something that must exist.
         let now = census();
         let total: usize = now.iter().map(|(_, n)| n).sum();
-        assert!(total > 400, "census total {total} — the walk probably missed the tree");
+        // Lowered from 400 as the debt came down. The anchor exists to catch a
+        // walk that found nothing, not to assert a debt level; Cybertron alone
+        // is still 269 of it.
+        assert!(total > 200, "census total {total} — the walk probably missed the tree");
         let cyber = now.iter().find(|(t, _)| *t == "Cybertron").unwrap().1;
         assert!(cyber > 0, "no occurrences of the most common term; walk is broken");
     }

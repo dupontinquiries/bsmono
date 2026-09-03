@@ -109,7 +109,7 @@ pub struct Arena {
 }
 
 /// The raid map pool. Five hang off patrol worlds so a patrol can FIND a
-/// raid; five are deep sites the bridge reaches. `unicron` is where every
+/// raid; five are deep sites the bridge reaches. `unending` is where every
 /// SYNC finale ends, because the plate mechanic wants the arena where the
 /// horizon curves the wrong way.
 pub const ARENAS: &[Arena] = &[
@@ -149,7 +149,7 @@ pub const ARENAS: &[Arena] = &[
         orbit: Orbit { star: StarClass::K, au: 0.45, albedo: 0.28, air: 0.85 },
         weather: Weather::GiantWave,
         note: "an ocean world; the water rises to meet whatever walks it" },
-    Arena { id: "unicron", name: "THE DEVOURER'S MAW", via: None,
+    Arena { id: "unending", name: "THE DEVOURER'S MAW", via: None,
         orbit: Orbit { star: StarClass::M, au: 0.08, albedo: 0.05, air: 0.1 },
         weather: Weather::FlareFront,
         note: "the horizon curves the wrong way; every SYNC ends here" },
@@ -188,7 +188,7 @@ pub struct Boss {
 
 pub const BOSSES: &[Boss] = &[
     Boss { id: "speakerman", name: "Astro Armor Titan Speakerman", title: "The Last Resonance",
-        mech: Mech::Sync, element: Element::Electric, arena: "unicron", tier: 3,
+        mech: Mech::Sync, element: Element::Electric, arena: "unending", tier: 3,
         premise: "sings across half a galaxy; fractures planets by matching tectonic resonance",
         relic: &[
             "a walking observatory that made moons into transmitters.",
@@ -251,7 +251,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "the charge was never at an enemy. it was AWAY from a place." },
     Boss { id: "judgementor", name: "Judgementor", title: "Executor of Empires",
-        mech: Mech::Sync, element: Element::Electric, arena: "unicron", tier: 3,
+        mech: Mech::Sync, element: Element::Electric, arena: "unending", tier: 3,
         premise: "it did not fight wars, it ended them",
         relic: &[
             "not a tank. a mobile courtroom. civilizations stood trial",
@@ -269,7 +269,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "it was not hunting. it was patrolling a perimeter that predates it." },
     Boss { id: "pyrachnid", name: "Pyrachnid", title: "Forge Widow",
-        mech: Mech::Sync, element: Element::Fire, arena: "unicron", tier: 2,
+        mech: Mech::Sync, element: Element::Fire, arena: "unending", tier: 2,
         premise: "it spins its own foundry around its prey",
         relic: &[
             "born inside stellar furnaces. the web is superconducting",
@@ -314,7 +314,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "the heartbeat is a countermeasure. it is jamming a deeper signal." },
     Boss { id: "trenchmaster", name: "Trenchmaster", title: "The Ocean King",
-        mech: Mech::Sync, element: Element::Water, arena: "unicron", tier: 3,
+        mech: Mech::Sync, element: Element::Water, arena: "unending", tier: 3,
         premise: "the ocean king; the water rises to meet it",
         relic: &[
             "made for abyssal wars. it treats the deep as a highway and",
@@ -350,7 +350,7 @@ pub const BOSSES: &[Boss] = &[
         ],
         shard: "it does not watch events. it watches the thing that causes them." },
     Boss { id: "divergence", name: "Titan Cameraman 3.0 (What If...)", title: "The Divergence",
-        mech: Mech::Sync, element: Element::Electric, arena: "unicron", tier: 3,
+        mech: Mech::Sync, element: Element::Electric, arena: "unending", tier: 3,
         premise: "the recording and the event no longer agree",
         relic: &[
             "not from this timeline. its memory holds events that never",
@@ -738,9 +738,9 @@ mod tests {
     }
 
     #[test]
-    fn every_sync_boss_ends_at_unicron() {
+    fn every_sync_boss_ends_at_unending() {
         for b in BOSSES.iter().filter(|b| b.mech == Mech::Sync) {
-            assert_eq!(b.arena, "unicron", "{} is SYNC and ends elsewhere", b.id);
+            assert_eq!(b.arena, "unending", "{} is SYNC and ends elsewhere", b.id);
         }
     }
 
@@ -867,7 +867,7 @@ mod tests {
     fn the_minimal_json_parser_handles_the_boss_schema() {
         let text = r#"[
             {"id": "test_boss", "name": "Test \"Quoted\" Boss", "title": "T",
-             "mech": "Sync", "element": "Fire", "arena": "unicron", "tier": 2,
+             "mech": "Sync", "element": "Fire", "arena": "unending", "tier": 2,
              "premise": "p", "relic": ["line one", "line two"], "shard": "s"}
         ]"#;
         let v = json::parse(text).expect("valid JSON should parse");

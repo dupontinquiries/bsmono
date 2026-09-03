@@ -138,13 +138,13 @@ rather than derived, but they follow the same instinct — each has one landform
 idea and an atmosphere that agrees with it:
 
     kuiper       void_edge       shepherd moons + a frozen debris braid
-    unicron      devourer_red    the maw; horizon curves the wrong way
+    unending      devourer_red    the maw; horizon curves the wrong way
     trench       abyssal_cyan    rift dais + monoliths
     pluto        far_sun_dark    containment core
     frostline    cold_blue       ice shelves
     emberpit     lava_glow       lava pools
 
-`kuiper` and `unicron` were added late, when a check found the raid plan pointing
+`kuiper` and `unending` were added late, when a check found the raid plan pointing
 at two maps that had never been defined — two of three raid phases were loading an
 undefined theme. Shepherd moons are real: small bodies whose gravity confines a
 ring or debris band into a sharp edge, as at Saturn.

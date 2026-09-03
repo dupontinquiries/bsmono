@@ -5,7 +5,7 @@
     "title": "The Last Resonance",
     "mech": "Sync",
     "element": "Electric",
-    "arena": "unicron",
+    "arena": "unending",
     "tier": 3,
     "premise": "sings across half a galaxy; fractures planets by matching tectonic resonance",
     "relic": [
@@ -117,7 +117,7 @@
     "title": "Executor of Empires",
     "mech": "Sync",
     "element": "Electric",
-    "arena": "unicron",
+    "arena": "unending",
     "tier": 3,
     "premise": "it did not fight wars, it ended them",
     "relic": [
@@ -149,7 +149,7 @@
     "title": "Forge Widow",
     "mech": "Sync",
     "element": "Fire",
-    "arena": "unicron",
+    "arena": "unending",
     "tier": 2,
     "premise": "it spins its own foundry around its prey",
     "relic": [
@@ -229,7 +229,7 @@
     "title": "The Ocean King",
     "mech": "Sync",
     "element": "Water",
-    "arena": "unicron",
+    "arena": "unending",
     "tier": 3,
     "premise": "the ocean king; the water rises to meet it",
     "relic": [
@@ -293,7 +293,7 @@
     "title": "The Divergence",
     "mech": "Sync",
     "element": "Electric",
-    "arena": "unicron",
+    "arena": "unending",
     "tier": 3,
     "premise": "the recording and the event no longer agree",
     "relic": [

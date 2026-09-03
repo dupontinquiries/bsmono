@@ -16,7 +16,7 @@
 //! stood watch for a thousand years is not old by their own reckoning.
 //! Each people mostly keeps to its own world or outpost; contact
 //! between them is occasional, not constant. `arena_element` below —
-//! frostline/kuiper/pluto to Ice, emberpit/unicron to Fire, trench to
+//! frostline/kuiper/pluto to Ice, emberpit/unending to Fire, trench to
 //! Water, and so on — is that geography: every arena a suited raid
 //! visits is somebody's home, not a neutral battlefield, and the chi
 //! banked there is the body being taught by the world itself rather
@@ -174,7 +174,7 @@ pub fn worthy(chi: &Chi, m: &Mod) -> Result<(), String> {
 pub fn arena_element(arena: &str) -> Element {
     match arena {
         "frostline" | "kuiper" | "pluto" => Element::Ice,
-        "emberpit" | "unicron" => Element::Fire,
+        "emberpit" | "unending" => Element::Fire,
         "trench" => Element::Water,
         "shield_edge" => Element::Electric,
         "outer_rim" => Element::Air,
@@ -334,7 +334,7 @@ mod tests {
             let _ = arena_element(a.id); // total over the roster's arenas
         }
         assert_eq!(arena_element("frostline"), Element::Ice);
-        assert_eq!(arena_element("unicron"), Element::Fire);
+        assert_eq!(arena_element("unending"), Element::Fire);
     }
 }
 

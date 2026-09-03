@@ -29,7 +29,7 @@
 //! something somebody chose to write.
 //!
 //! **False leads.** `satellite_fragment_17`, `asteri_signal_beacon` and
-//! `unicron_detection_scan` look exactly as important as anything else on
+//! `unending_detection_scan` look exactly as important as anything else on
 //! this list. They resolve to Cold War debris, a later civilisation's
 //! imitation, and an instrument artefact. Chasing them is not punished and
 //! not rewarded — it is answered. A universe where every glowing object
@@ -56,7 +56,7 @@ pub enum Stratum {
     Present = 0,
     /// Wars, fallen colonies, older factions, the first space bridges.
     Recent = 1,
-    /// Unicron in the Earth, and the first convergence anybody remembers.
+    /// the Unending in the Earth, and the first convergence anybody remembers.
     Blackstar = 2,
     /// The human clandestine societies, the observation network, the Watchers.
     BlackArchive = 3,
@@ -106,7 +106,7 @@ impl Stratum {
 /// MYSTERY ANCHOR — how much of this history the game hands you already
 /// believing.
 ///
-/// The question this exists to answer: the player watched Unicron turn over
+/// The question this exists to answer: the player watched the Unending turn over
 /// in the Earth's mantle during the campaign, so a map that files it under
 /// UNKNOWN TECHNOLOGICAL RELATION is lying about what they know. But a
 /// player who wants the universe strange should be able to have it strange,
@@ -141,7 +141,7 @@ pub struct Received {
 /// a specialist would assert.
 pub static RECEIVED: &[Received] = &[
     Received {
-        claim: "unicron_in_earth",
+        claim: "unending_in_earth",
         bearing: Bearing::Supports,
         source: "lived_through_it",
         at: 0.20,
@@ -544,7 +544,7 @@ pub static CLAIMS: &[Claim] = &[
     },
     // ---- Layer 2 ----
     Claim {
-        id: "unicron_in_earth",
+        id: "unending_in_earth",
         asserted: false,
         layer: Stratum::Blackstar as u8,
         text: "the mass in Earth's mantle is a body, and it is not dead",
@@ -827,7 +827,7 @@ pub static FINDINGS: &[Finding] = &[
         gate: None,
         blurb: "a deep survey run for valence, not for this. the return from the mantle is not \
                 the return of a mass. it has a period.",
-        links: &[s("unicron_in_earth")],
+        links: &[s("unending_in_earth")],
     },
     Finding {
         id: "buried_twin",
@@ -996,12 +996,12 @@ pub static FINDINGS: &[Finding] = &[
         links: &[s("bridge_predates_coalition"), m("asteri_were_not_first")],
     },
     Finding {
-        id: "unicron_detection_scan",
+        id: "unending_detection_scan",
         site: "outer_rim",
         source: "geo_scan",
         medium: Medium::Terminal,
         gate: None,
-        blurb: "a deep scan returning a Unicron-class signature at the rim, which should be \
+        blurb: "a deep scan returning a the Unending-class signature at the rim, which should be \
                 impossible and would change everything. re-running it with the array cooled \
                 returns nothing. the signature was the array.",
         links: &[s("instrument_artefact")],
@@ -1050,8 +1050,8 @@ pub static FINDINGS: &[Finding] = &[
         gate: Some(ARRAY_LOG_GATE),
         blurb: "act two, earth, urban containment: the corrupted stopped hunting for four seconds \
                 and oriented outward -- toward the same edge. something even a broken echo of \
-                unicron recognises as real.",
-        links: &[s("edge_lattice"), m("unicron_in_earth")],
+                unending recognises as real.",
+        links: &[s("edge_lattice"), m("unending_in_earth")],
     },
     Finding {
         id: "array_reading_three",
@@ -1466,7 +1466,7 @@ mod tests {
         }
         // ... and none of them touch the real history
         for f in FINDINGS.iter().filter(|f| {
-            matches!(f.id, "satellite_fragment_17" | "asteri_signal_beacon" | "unicron_detection_scan")
+            matches!(f.id, "satellite_fragment_17" | "asteri_signal_beacon" | "unending_detection_scan")
         }) {
             for l in f.links {
                 let c = claim(l.claim).unwrap();
@@ -1841,7 +1841,7 @@ mod tests {
         assert!(FINDINGS.iter().any(|f| f.gate == Some(ARRAY_LOG_GATE)));
 
         // it names three false leads and three mundane answers
-        for id in ["satellite_fragment_17", "asteri_signal_beacon", "unicron_detection_scan"] {
+        for id in ["satellite_fragment_17", "asteri_signal_beacon", "unending_detection_scan"] {
             assert!(doc.contains(id), "the bible stopped naming false lead {id}");
             assert!(finding(id).is_some(), "the bible names a finding that no longer exists: {id}");
         }

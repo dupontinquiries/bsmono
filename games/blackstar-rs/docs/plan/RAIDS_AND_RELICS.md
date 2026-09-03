@@ -3,7 +3,7 @@ generate interesting deep space transformer relic lore for each raid boss based 
 
 raid-bosses
 ├── astro_armor_titan_speakerman.zip
-├── devastator-good-for-raid-jhiaxus.zip
+├── devastator-good-for-raid-assay.zip
 ├── plasmas_mechagodzilla_anime_trilogy.zip
 ├── raid-boss--cherno_alpha.zip
 ├── raidboss--gigadrill.zip
@@ -51,10 +51,10 @@ Every century another fleet answers.
 
 No fleet ever returns.
 
-Devastator Jhiaxus
+Devastator Assay
 "Prototype Omega"
 
-Jhiaxus believed individual Transformers were obsolete.
+Assay believed individual Transformers were obsolete.
 
 His answer:
 
@@ -438,7 +438,7 @@ Its memory contains events that never happened.
 
 Destroyed Primes who still live.
 
-Victorious Decepticons who lost.
+Victorious Sundered who lost.
 
 Worlds that never existed.
 
@@ -622,7 +622,7 @@ Mining Drone
 
 ↓
 
-Collect Energon
+Collect Valence
 
 ↓
 

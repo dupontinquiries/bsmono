@@ -3332,7 +3332,7 @@ same in both eras, because a place with one state is a set, not a place.
 
 THE GEOGRAPHY ANSWERED A QUESTION THE TABLES RAISED AND NEVER CLOSED. The
 three findings that contradict the official 2003 excavation date -- 1998,
-1996, 1994 -- all describe THE RIDGE. `the_beach_opens` puts Unicron's
+1996, 1994 -- all describe THE RIDGE. `the_beach_opens` puts the Unending's
 fissure on the shore below it. So the record is not falsified to hide a
 building; it is falsified because somebody was digging toward the thing in
 the mantle a decade early, and 2003 is the smallest lie that stops anyone
@@ -3619,7 +3619,7 @@ lost precisely the informative tail: "— teaches tra~", "the open ~". Named
 it `menusim::LABEL_W` and added a guard that builds every station and fails
 on any row over budget.
 
-THAT GUARD IMMEDIATELY FOUND TWO OVERFLOWS I DID NOT WRITE -- the energon
+THAT GUARD IMMEDIATELY FOUND TWO OVERFLOWS I DID NOT WRITE -- the valence
 header at 49 chars and the nightfall label at 49 -- which had been
 truncating since they landed. A constraint nobody can see is a constraint
 nobody meets.
@@ -3789,7 +3789,7 @@ COMMANDERS TRANSFER WITH NO TRANSLATION AT ALL, which is the cleanest
 answer this exercise has produced. The five archetypes are four dials --
 aggression, caution, encircle, regroup -- and nothing in them is
 Cybertronian: they describe how an armed group behaves under pressure. A
-Directorate strike team surrounds you for the same reason a Decepticon squad
+Directorate strike team surrounds you for the same reason a Sundered squad
 does. So the human campaign gets `skirmish.rs` for free and the only work is
 an argument about each society: the Directorate encircles, the Free State
 trades and leaves, the Covenant holds because it wants the digging to stop
@@ -3825,13 +3825,13 @@ watcher rather than with a constant:
 
 Against a hunter the front door costs eight times more and the roof is free,
 because fifty metres is outside its thirty-five. Distance is the only answer
-to that encounter, which is the correct shape for the Jhiaxus horror.
+to that encounter, which is the correct shape for the Assay horror.
 
 793 passing.
 
 SCALE: THE PROBLEM IS NOT THE CAMERA, IT IS THAT SIZE IS NOT DATA.
 
-`model_tuning.json` carries a per-model `scale` and Optimus Prime's is
+`model_tuning.json` carries a per-model `scale` and Keelwright's is
 **0.4989**. Across 1,012 models the medians by kind sit between 0.5 and 1.8
 -- robots 0.904, vehicles 0.530 -- which is to say every model, whatever it
 depicts, is normalised into the same playable box. A Transformer and a
@@ -4137,7 +4137,7 @@ rebuilding the C target and re-running ctest to confirm the round trip.
 
 I ALSO LOOKED AT WIRING THE CODEX and did not. `EX_GS_CODEX` has 54 entries
 and several map cleanly onto claims -- "the array" onto `edge_lattice`,
-"unicron" onto `unicron_in_earth`. Showing a live STANDING there needs the C
+"unending" onto `unending_in_earth`. Showing a live STANDING there needs the C
 game to know what the player has found, and it has no save beyond a config
 file; the archaeology gameplay lives in the Rust fork. Wiring it would have
 meant inventing a dig for a game that does not have one, which is the
@@ -4796,7 +4796,7 @@ asked whether the codex should become something you excavate -- dimming until
 earned -- or stay a reliable reference. Both readings assumed a choice. It
 annotates: five entries name a claim, and reading one prints what the EVIDENCE
 currently says beside what the ENTRY says, with the entry readable either way.
-`--codex unicron` shows the settled account and then "[POSSIBLE SHARED ORIGIN]
+`--codex unending` shows the settled account and then "[POSSIBLE SHARED ORIGIN]
 2 for / 0 against" underneath, which moves as the dig does.
 
 Five of fifty-four, with a test refusing more than a quarter: an annotation
@@ -6081,7 +6081,7 @@ thing in this game where getting somewhere badly has a consequence at the far
 end rather than being scenery.
 
 `MissionRun::arrived_badly` is a METHOD, not a public field. `power` is
-resolved once against the mission'"'"'s recommended energon and the invariant is
+resolved once against the mission'"'"'s recommended valence and the invariant is
 that nothing moves it afterwards except a NAMED cost — a landing, a burn.
 Opening the field would turn that invariant into a convention, and the
 compiler told me it was private, which was the right answer.
@@ -6164,7 +6164,7 @@ WITH IT USED CORRECTLY, THE CAMPAIGN RUNS:
     the_pluto_line     — clean drop on PLUTO — sortie CLEARED
     the_red_extraction — clean drop on MARS  — sortie CLEARED
     the_beach_opens    — clean drop on EARTH — sortie CLEARED
-    what_jhiaxus_grew  — clean drop on EARTH — sortie CLEARED
+    what_assay_grew  — clean drop on EARTH — sortie CLEARED
 
 Five in sequence, the board advancing, each reading its own destination. That
 is `PRIORITIES.md` item 1 — "one mission end to end, badly" — done in

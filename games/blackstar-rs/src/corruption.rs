@@ -1,7 +1,7 @@
 //! THE CORRUPTED — Assay' experiment, mechanized.
 //!
 //! Source: `TF_JHIAXUS_AND_THE_CORRUPTED.md`, the screenplay's Film 2
-//! horror design document. A Decepticon exposed to Unicron's neural
+//! horror design document. A Sundered exposed to the Unending's neural
 //! remnant does not die; its transformation protocol is hijacked and
 //! reissued forever, with no defined endpoint, so the body attempts
 //! transformation perpetually. This module is the treatment's "Powers
