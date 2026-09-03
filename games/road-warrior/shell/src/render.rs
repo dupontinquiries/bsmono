@@ -52,6 +52,13 @@ pub const CAR_SCREEN_X: f32 = 0.32;
 /// alignment (a `array<f32>` in uniform space would stride at 16 bytes and
 /// waste three quarters of the buffer).
 pub const TERRAIN_SAMPLES: usize = 64;
+/// Sentinel for "there is no ground in this column" — a Gap.
+///
+/// A sentinel rather than an Option because this crosses into a shader,
+/// which has no such concept. Far enough below any real terrain that the
+/// shader's `< NO_GROUND_TEST` check cannot collide with a deep-but-real
+/// valley.
+pub const NO_GROUND: f32 = -1.0e4;
 
 /// The ground profile across the viewport, left edge to right edge.
 #[repr(C)]
@@ -63,23 +70,23 @@ pub struct TerrainUniforms {
 impl TerrainUniforms {
     /// Sample `height_at` across the visible span.
     ///
-    /// Off the ends of the track `height_at` returns None; those become the
-    /// nearest in-track height rather than 0.0, so the ground does not fall
-    /// off a cliff at the start line — the first version used 0.0 and drew a
-    /// step down at x=0 that looked like a rendering fault.
+    /// A Gap samples as [`NO_GROUND`], not as the previous height. The first
+    /// version held the last height across gaps, on the reasoning that
+    /// dropping to 0.0 drew a cliff — and a screenshot showed why that was
+    /// the wrong fix: the pit rendered as a solid plateau you could see
+    /// yourself driving onto, with the drop appearing at the FAR edge. The
+    /// car then fell through ground that looked walkable. Hiding the hazard
+    /// a level is built around is worse than any cliff artifact.
+    ///
+    /// `height_at` also returns None off the ends of the track, but it
+    /// clamps to the track bounds first, so those come back as the end
+    /// segment's height and never reach the None arm.
     pub fn sample(track: &road_warrior_core::Track, car_pos_x: f32) -> Self {
         let mut flat = [0.0f32; TERRAIN_SAMPLES];
-        let mut last_known = track.height_at(car_pos_x).unwrap_or(0.0);
         for (i, slot) in flat.iter_mut().enumerate() {
             let t = i as f32 / (TERRAIN_SAMPLES - 1) as f32;
             let world_x = car_pos_x + (t - CAR_SCREEN_X) * VIEW_SPAN_WORLD;
-            match track.height_at(world_x) {
-                Some(h) => {
-                    last_known = h;
-                    *slot = h;
-                }
-                None => *slot = last_known,
-            }
+            *slot = track.height_at(world_x).unwrap_or(NO_GROUND);
         }
         let mut heights = [[0.0f32; 4]; TERRAIN_SAMPLES / 4];
         for (i, chunk) in flat.chunks(4).enumerate() {
@@ -280,32 +287,64 @@ mod terrain_tests {
         let approaching = flat(&TerrainUniforms::sample(&track, 20.0));
         let peak = approaching.iter().cloned().fold(f32::MIN, f32::max);
         assert!(peak > 1.0, "at x=20 the ramp should be visible ahead; peak {peak}");
-        assert!(
-            approaching[0] < approaching[TERRAIN_SAMPLES - 1],
-            "and it should rise toward the right, not the left"
-        );
+        // The rise must be AHEAD of the car, not behind. Comparing the last
+        // sample to the first no longer works now that gaps sample as
+        // NO_GROUND: at x=20 the right edge of the view is inside the pit,
+        // so the last sample is the sentinel. Compare the peak's position
+        // instead, which is what "ahead" actually means.
+        let peak_idx = approaching
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+        let car_idx = (CAR_SCREEN_X * (TERRAIN_SAMPLES - 1) as f32).round() as usize;
+        assert!(peak_idx > car_idx, "the ramp should be ahead of the car, not behind it");
     }
 
     #[test]
-    fn a_gap_holds_the_last_height_instead_of_dropping_to_zero() {
-        // height_at returns None over a Gap. Filling those with 0.0 drew a
-        // cliff down to the baseline in the middle of a jump, which reads
-        // as a rendering fault rather than as a hole.
+    fn a_gap_samples_as_no_ground_so_the_pit_is_visible() {
+        // The reverse of what this test asserted first. Holding the last
+        // height across a gap drew the pit as a solid plateau: you watched
+        // the car drive onto ground that was not there, with the drop
+        // appearing at the far edge. A screenshot caught it.
         let track = dust_bowl();
         assert_eq!(track.height_at(42.0), None, "x=42 is inside the gap");
         let s = flat(&TerrainUniforms::sample(&track, 42.0));
         let idx = (CAR_SCREEN_X * (TERRAIN_SAMPLES - 1) as f32).round() as usize;
-        assert!(s[idx] > 1.0, "the gap should carry the ramp's height forward, got {}", s[idx]);
+        assert!(s[idx] < -100.0, "the gap must sample as NO_GROUND, got {}", s[idx]);
     }
 
     #[test]
-    fn before_the_start_line_does_not_fall_off_a_cliff() {
-        // Sampling starts CAR_SCREEN_X * span behind the car, which at x=0
-        // is off the front of the track where height_at is None.
+    fn the_pit_edges_line_up_with_the_gap_boundaries() {
+        // The near edge is what the player has to judge the jump against,
+        // so it has to be at x=38 and not somewhere else.
         let track = dust_bowl();
+        let car = 38.0; // standing right at the lip
+        let s = flat(&TerrainUniforms::sample(&track, car));
+        for (i, h) in s.iter().enumerate() {
+            let t = i as f32 / (TERRAIN_SAMPLES - 1) as f32;
+            let world_x = car + (t - CAR_SCREEN_X) * VIEW_SPAN_WORLD;
+            let in_gap = (38.0..48.0).contains(&world_x);
+            assert_eq!(
+                *h < -100.0,
+                in_gap,
+                "sample {i} at world x {world_x:.1}: gap={in_gap} but height={h}"
+            );
+        }
+    }
+
+    #[test]
+    fn before_the_start_line_reads_as_the_first_segment() {
+        // Sampling starts CAR_SCREEN_X * span BEHIND the car, which at x=0
+        // is off the front of the track. `height_at` clamps to the track
+        // bounds, so this comes back as the first segment's height rather
+        // than as None — worth pinning, because an earlier version of this
+        // test passed while believing it was exercising the None path.
+        let track = dust_bowl();
+        assert_eq!(track.height_at(-5.0), Some(0.0), "height_at clamps, it does not return None");
         let s = flat(&TerrainUniforms::sample(&track, 0.0));
-        assert!(s.iter().all(|h| h.is_finite()), "no NaNs off the end of the track");
-        assert!(s[0].abs() < 0.01, "behind the start it should match the first flat segment");
+        assert!(s[0].abs() < 0.01, "behind the start it matches the first flat segment");
     }
 
     #[test]

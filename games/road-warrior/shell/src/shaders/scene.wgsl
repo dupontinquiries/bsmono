@@ -128,10 +128,16 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let base_line = 0.62 - 0.05;
     let v_scale = 0.02;
     // Surface at this column, and at the car's column for the sky split.
-    let surface = base_line + ground_height(uv.x) * v_scale;
+    let raw_h = ground_height(uv.x);
+    // A Gap samples as NO_GROUND (-1e4) on the CPU side. Drawing it as a
+    // surface at that depth would fill the column with ground; drawing no
+    // ground at all is what makes the pit read as a pit, with the walls
+    // falling where the gap actually starts and ends.
+    let has_ground = raw_h > -100.0;
+    let surface = base_line + raw_h * v_scale;
     let horizon = 0.62;
     var color: vec3<f32>;
-    if (uv.y < surface) {
+    if (has_ground && uv.y < surface) {
         let ground_t = uv.y / max(surface, 0.001);
         let dirt_noise = noise(uv * vec2<f32>(40.0 * aspect, 40.0) + vec2<f32>(u.car_x * 2.0, 0.0));
         let base = mix(vec3<f32>(0.20, 0.15, 0.11), vec3<f32>(0.36, 0.28, 0.20), ground_t);
@@ -144,8 +150,17 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         color = mix(vec3<f32>(0.82, 0.80, 0.74), vec3<f32>(0.55, 0.62, 0.68), sky_t);
         // A darker lip right at the surface so a ridge against the sky has
         // an edge instead of fading into it.
-        let edge = smoothstep(0.012, 0.0, uv.y - surface);
-        color = mix(color, vec3<f32>(0.16, 0.12, 0.09), edge);
+        if (has_ground) {
+            let edge = smoothstep(0.012, 0.0, uv.y - surface);
+            color = mix(color, vec3<f32>(0.16, 0.12, 0.09), edge);
+        } else if (uv.y < base_line) {
+            // Inside a pit: darken with depth so the hole reads as having a
+            // bottom somewhere below, rather than as a window to the sky.
+            // Without this the gap looked like the ground simply stopped
+            // existing, which is true but does not communicate "fall".
+            let depth = clamp((base_line - uv.y) / base_line, 0.0, 1.0);
+            color = mix(vec3<f32>(0.10, 0.08, 0.07), vec3<f32>(0.02, 0.02, 0.02), depth);
+        }
     }
 
     // --- car: body + cabin + wheels, shaped/colored per car kind ---
