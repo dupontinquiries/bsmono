@@ -35,10 +35,12 @@
 //! Transport. `studio-collab` already owns the carrier, session
 //! negotiation and DHT rendezvous; a second answer to "how do bytes
 //! reach the peer" would be one too many. This crate produces and
-//! consumes [`rga::CrdtOp`] values. Moving them is somebody else's job.
+//! consumes [`rga::CrdtOp`] values and can render them as bytes
+//! ([`wire`]); moving those bytes is somebody else's job.
 
 pub mod presence;
 pub mod rga;
+pub mod wire;
 
 pub use presence::{Caret, Presence, Resolved};
 pub use rga::{CharId, CrdtOp, Effect, Pending, Rga, SiteId};

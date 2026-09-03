@@ -640,6 +640,155 @@ mod tests {
         assert_eq!(a.len(), "héllo →日本".chars().count());
     }
 
+    // ── randomized convergence ──────────────────────────────────────
+    //
+    // The hand-written cases above cover schedules I thought of. A CRDT
+    // is exactly where that is not enough: the failure mode is a
+    // specific interleaving of concurrent inserts at one position, and
+    // the space of interleavings is combinatorial. Deterministic seed so
+    // a failure reproduces — a convergence bug that only shows up on one
+    // machine is a bug nobody fixes.
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 11
+        }
+        fn upto(&mut self, n: usize) -> usize {
+            if n == 0 {
+                0
+            } else {
+                (self.next() % n as u64) as usize
+            }
+        }
+    }
+
+    /// Random concurrent editing across `n_sites` replicas with a lossy,
+    /// reordering, duplicating delivery schedule. Every replica must end
+    /// with identical text and nothing stranded.
+    fn fuzz_round(seed: u64, n_sites: usize, rounds: usize) {
+        let words = ["a", "bc", "def", "\n", "  ", "é", "日", "xyz"];
+        let mut rng = Rng(seed);
+        let mut reps: Vec<Rga> = (0..n_sites).map(|_| Rga::new()).collect();
+
+        // One replica seeds; everyone else replays. (Seeding
+        // independently is the documented way to break this.)
+        let seed_ops = Rga::from_text("start", SiteId(0)).history();
+        for r in reps.iter_mut() {
+            r.apply_all(&seed_ops);
+        }
+
+        // ops each replica has produced but not yet given to peer j
+        let mut outbox: Vec<Vec<CrdtOp>> = vec![Vec::new(); n_sites];
+        let mut all_ops: Vec<CrdtOp> = seed_ops.clone();
+
+        for _ in 0..rounds {
+            // a random replica makes a random local edit
+            let i = rng.upto(n_sites);
+            let len = reps[i].len();
+            let produced = if len > 2 && rng.next() % 3 == 0 {
+                let at = rng.upto(len);
+                let count = 1 + rng.upto((len - at).min(3));
+                reps[i].local_delete(at, count)
+            } else {
+                let at = rng.upto(len + 1);
+                let w = words[rng.upto(words.len())];
+                reps[i].local_insert(at, w, SiteId(i as u64))
+            };
+            all_ops.extend(produced.iter().cloned());
+            outbox[i].extend(produced);
+
+            // deliver a random slice of a random outbox to a random peer,
+            // sometimes reversed, sometimes twice
+            let from = rng.upto(n_sites);
+            let to = rng.upto(n_sites);
+            if from != to && !outbox[from].is_empty() {
+                let take = 1 + rng.upto(outbox[from].len());
+                let mut batch: Vec<CrdtOp> = outbox[from][..take].to_vec();
+                if rng.next() % 2 == 0 {
+                    batch.reverse(); // out-of-order delivery
+                }
+                reps[to].apply_all(&batch);
+                if rng.next() % 4 == 0 {
+                    reps[to].apply_all(&batch); // duplicate delivery
+                }
+            }
+        }
+
+        // settle: everyone eventually sees everything
+        for r in reps.iter_mut() {
+            r.apply_all(&all_ops);
+            r.apply_all(&all_ops);
+        }
+
+        let expect = reps[0].text();
+        for (i, r) in reps.iter().enumerate() {
+            assert_eq!(
+                r.deferred_count(),
+                0,
+                "seed {seed}: replica {i} stranded {} ops",
+                r.deferred_count()
+            );
+            assert_eq!(r.text(), expect, "seed {seed}: replica {i} diverged");
+        }
+    }
+
+    #[test]
+    fn random_schedules_converge_two_sites() {
+        for seed in 0..40 {
+            fuzz_round(seed, 2, 60);
+        }
+    }
+
+    #[test]
+    fn random_schedules_converge_five_sites() {
+        for seed in 100..130 {
+            fuzz_round(seed, 5, 80);
+        }
+    }
+
+    #[test]
+    fn a_partition_that_heals_converges() {
+        // two halves edit in isolation for a while, then reconnect —
+        // the case a lossy-delivery fuzz reaches only by accident
+        let seed_ops = Rga::from_text("shared line", SiteId(0)).history();
+        let mut rng = Rng(7);
+        let mut left: Vec<Rga> = (0..2).map(|_| Rga::new()).collect();
+        let mut right: Vec<Rga> = (0..2).map(|_| Rga::new()).collect();
+        for r in left.iter_mut().chain(right.iter_mut()) {
+            r.apply_all(&seed_ops);
+        }
+        let mut lops = Vec::new();
+        let mut rops = Vec::new();
+        for k in 0..30 {
+            let i = k % 2;
+            let at = rng.upto(left[i].len() + 1);
+            let o = left[i].local_insert(at, "L", SiteId(i as u64));
+            left[1 - i].apply_all(&o);
+            lops.extend(o);
+
+            let at = rng.upto(right[i].len() + 1);
+            let o = right[i].local_insert(at, "R", SiteId((i + 10) as u64));
+            right[1 - i].apply_all(&o);
+            rops.extend(o);
+        }
+        // heal
+        for r in left.iter_mut() {
+            r.apply_all(&rops);
+        }
+        for r in right.iter_mut() {
+            r.apply_all(&lops);
+        }
+        let expect = left[0].text();
+        for r in left.iter().chain(right.iter()) {
+            assert_eq!(r.text(), expect);
+            assert_eq!(r.deferred_count(), 0);
+        }
+        assert_eq!(expect.matches('L').count(), 30);
+        assert_eq!(expect.matches('R').count(), 30);
+    }
+
     #[test]
     fn frontier_by_site_reports_a_version_vector() {
         let mut a = Rga::new();
