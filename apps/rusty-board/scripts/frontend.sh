@@ -31,8 +31,11 @@ FRONTEND_NAME="egui"
 #   layer   — the docked zwlr_layer_shell_v1 surface (bottom edge, exclusive
 #             zone, never focused; falls back to a toplevel window at runtime
 #             if the compositor has no layer shell)
-# `voice` adds whisper-rs dictation (native build + a model); leave it to
-# the person: RUSTY_BOARD_EGUI_FEATURES="wayland,layer,voice".
+# `voice` adds whisper-rs dictation (a native whisper.cpp build: cmake,
+# a C++ compiler, ALSA headers; and a ggml model in ~/models or
+# ~/.local/share/rusty-board/models — ggml-base.en-q5_1.gguf preferred,
+# tiny for speed). Leave it to the person:
+#   RUSTY_BOARD_EGUI_FEATURES="wayland,layer,voice" ./scripts/redeploy.sh
 FRONTEND_EGUI_FEATURES="${RUSTY_BOARD_EGUI_FEATURES:-wayland,layer}"
 
 frontend_select() {

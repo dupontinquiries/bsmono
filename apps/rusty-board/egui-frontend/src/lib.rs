@@ -47,6 +47,9 @@ pub use settings::util;
 #[cfg(feature = "voice")]
 #[path = "../../src/config/mod.rs"]
 pub mod config;
+/// Capture + streaming partials, driving the mounted engine from the frame loop.
+#[cfg(feature = "voice")]
+pub mod voice_host;
 pub mod swipe;
 #[cfg(feature = "app")]
 pub mod demo_app;
@@ -125,6 +128,13 @@ pub struct Row {
 pub struct Layout {
     pub name: String,
     pub rows: Vec<Row>,
+    /// Draw each cardinal key's direction glyphs at rest. True for boards whose compasses are
+    /// the POINT (MessagEase-style grids, the stenotype: the author placed every direction);
+    /// false for qwerty, whose compasses are accents derived from `extended` — four tiny
+    /// glyphs on forty-five keys is clutter. Measured (examples/frame_bench, qwerty): 4% of
+    /// the frame under glass, 11% under the default palette — the clutter is the reason, the
+    /// frame time is a bonus. The per-key cost that remains is egui's own widget overhead.
+    pub hints: bool,
 }
 
 /// Schema for rusty-board's REAL layout files (`resources/layouts/*.json`) — the GTK app's actual
@@ -192,7 +202,7 @@ fn layout_from_json(text: &str) -> Result<Layout, serde_json::Error> {
             key
         }).collect(),
     }).collect();
-    Ok(Layout { name: if parsed.name.is_empty() { "qwerty".into() } else { parsed.name }, rows })
+    Ok(Layout { hints: false, name: if parsed.name.is_empty() { "qwerty".into() } else { parsed.name }, rows })
 }
 
 impl Layout {
@@ -214,6 +224,7 @@ impl Layout {
         }
         let row = |keys: Vec<Key>| Row { keys, weight: 1.0 };
         Layout {
+            hints: true,
             name: "cardinal".into(),
             rows: vec![
                 row(vec![
@@ -260,6 +271,7 @@ impl Layout {
         }
         let row = |keys: Vec<Key>| Row { keys, weight: 1.0 };
         Layout {
+            hints: true,
             name: "cardinal8".into(),
             rows: vec![
                 // centers e t a o i n s h r — the nine highest-frequency letters (tap = no swipe)
@@ -297,6 +309,7 @@ impl Layout {
             Row { keys: keys.iter().map(|k| Key::new(k)).collect(), weight: 1.0 }
         }
         Layout {
+            hints: false,
             name: "symbols".into(),
             rows: vec![
                 row(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]),
@@ -424,7 +437,7 @@ pub fn keyboard_ui(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, palette: &
             ui.add_space(gutter);
             for key in &row.keys {
                 let w = (usable * (key.weight / total_weight)).max(8.0);
-                if let Some(e) = paint_key(ui, key, Vec2::new(w, key_h), gutter, &colors, glass) {
+                if let Some(e) = paint_key(ui, key, Vec2::new(w, key_h), gutter, &colors, glass, layout.hints) {
                     emitted = Some(e);
                 }
             }
@@ -558,7 +571,8 @@ fn key_deadzone(size: Vec2) -> f32 {
     (size.y * 0.25).clamp(9.0, 16.0)
 }
 
-fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors, glass: bool) -> Option<String> {
+#[allow(clippy::too_many_arguments)]
+fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors, glass: bool, hints: bool) -> Option<String> {
     // CLICK AND DRAG. This was `Sense::click()`, which is why cardinal swipes
     // did nothing: a key that only senses clicks never sees a drag, so the
     // direction could not be measured however good the classifier was.
@@ -573,7 +587,7 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
     // experimental keyboards": the classifier, the widget and the layouts
     // were all fine, and none of them was being called. A palette chooses
     // how a key LOOKS; it never gets to decide what a gesture MEANS.
-    paint_key_face(ui, key, rect, size, gutter, c, glass, &resp);
+    paint_key_face(ui, key, rect, size, gutter, c, glass, hints, &resp);
     dispatch_key(ui, key, rect, size, &resp)
 }
 
@@ -603,7 +617,7 @@ fn paint_cap_label(
 
 /// The visual half of a key: glass or carved-tile, pressed/hovered/at-rest. No gesture logic.
 #[allow(clippy::too_many_arguments)]
-fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c: &PaletteColors, glass: bool, resp: &egui::Response) {
+fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c: &PaletteColors, glass: bool, hints: bool, resp: &egui::Response) {
     // What the in-flight swipe (if any) is currently arming. Peeked, not
     // driven: `dispatch_key` still owns the press state, and it runs after
     // this. On the first frame of a press there is nothing to peek yet and the
@@ -651,7 +665,7 @@ fn paint_key_face(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, gutter: f32, c
     // The compass hints, drawn small around the tap label so a cardinal key advertises its
     // swipes at rest (FlickBoard/MessagEase draw every direction's glyph in its corner). Only the
     // four cardinals ride the edges; diagonals sit in their corners.
-    if !key.cardinal.is_empty() {
+    if hints && !key.cardinal.is_empty() {
         let hint = FontId::proportional((size.y * 0.22).clamp(8.0, 13.0));
         let hint_color = c.text.gamma_multiply(0.55);
         let inset = size.y * 0.16;
@@ -691,6 +705,20 @@ fn dispatch_key(ui: &mut Ui, key: &Key, rect: Rect, size: Vec2, resp: &egui::Res
         // key and a desktop key both flick at a quarter of their height (FlickBoard's default
         // swipe threshold is 8dp — short flicks are the point of this layout).
         let deadzone = key_deadzone(size);
+        // ENGAGED = something can come out of this key this frame: it is pressed, dragging,
+        // releasing, or its compass is still open from an earlier frame. A key that is none
+        // of those (thirty-nine of the forty, on any frame) returns here, before the option
+        // strings below are built and before the widget is consulted. This was the
+        // per-frame cost of a cardinal board: nine small allocations per key per frame for
+        // keys nobody was touching.
+        let engaged = resp.is_pointer_button_down_on()
+            || resp.dragged()
+            || resp.drag_stopped()
+            || resp.clicked()
+            || uikit_egui::slide_menu::SlideMenu::is_cardinal_open(ui, id);
+        if !engaged {
+            return None;
+        }
         let thresholds = cardinal_gesture::CardinalThresholds::default()
             .scaled(deadzone as f64 / cardinal_gesture::CardinalThresholds::default().tap_max_excursion_px);
         // Steno keys (L1/L2/R1/R2): the tap/direction resolution is identical to a normal cardinal

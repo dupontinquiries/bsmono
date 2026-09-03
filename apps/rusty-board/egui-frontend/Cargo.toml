@@ -96,3 +96,22 @@ libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"] }
+
+# This package is NOT a member of ../Cargo.toml's workspace, so it did not inherit the GTK
+# app's release profile: `cargo build --release` here ran with cargo's defaults — no LTO,
+# 16 codegen units, unstripped, unwinding. Same settings as the GTK app now, for the same
+# reasons (a phone binary: smaller, faster, and a panic in a keyboard is a restart anyway).
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+
+# Headless frame-cost benchmark; needs no eframe.
+[[example]]
+name = "frame_bench"
+required-features = []

@@ -7,45 +7,83 @@
 use crate::pipeline::Transcriber;
 
 /// A small, fuzzy fingerprint→text cache.
+///
+/// Entries carry the utterance LENGTH (in samples) as well, because the fingerprint is
+/// time-normalised: a one-second "hi" and a three-second "hi there" can land within a few bits of
+/// each other, and for a keyboard a confident wrong word is worse than a slow right one. The
+/// `_len` variants gate a match on the lengths agreeing within `len_tol` (a fraction, default
+/// 0.2); the plain `lookup`/`insert` keep the original behaviour (length unchecked) for callers
+/// that never had one.
 pub struct FingerprintCache {
-    entries: Vec<(u64, String)>,
+    entries: Vec<(u64, u32, String)>,
     cap: usize,
     tol: u32,
+    /// Fractional length tolerance for `lookup_len`; 0.0 = exact, 1.0 = anything.
+    pub len_tol: f32,
 }
 
 impl FingerprintCache {
     pub fn new(cap: usize, tol: u32) -> Self {
-        FingerprintCache { entries: Vec::new(), cap: cap.max(1), tol }
+        FingerprintCache { entries: Vec::new(), cap: cap.max(1), tol, len_tol: 0.2 }
     }
 
-    /// The nearest cached transcription within `tol` bits of `fp` (None if `fp` is the degenerate 0
-    /// or nothing is close enough).
-    pub fn lookup(&self, fp: u64) -> Option<&str> {
+    fn len_ok(&self, a: u32, b: u32) -> bool {
+        if a == 0 || b == 0 {
+            return true; // an entry or query without a length is not length-checked
+        }
+        let (lo, hi) = (a.min(b) as f32, a.max(b) as f32);
+        (hi - lo) / hi <= self.len_tol
+    }
+
+    /// `lookup`, additionally requiring the stored utterance length to agree with `len` (samples)
+    /// within `len_tol`. The nearest by Hamming distance among those wins.
+    pub fn lookup_len(&self, fp: u64, len: u32) -> Option<&str> {
         if fp == 0 {
             return None;
         }
         self.entries
             .iter()
-            .map(|(f, t)| ((f ^ fp).count_ones(), t))
+            .filter(|(_, l, _)| self.len_ok(*l, len))
+            .map(|(f, _, t)| ((f ^ fp).count_ones(), t))
             .filter(|(d, _)| *d <= self.tol)
             .min_by_key(|(d, _)| *d)
             .map(|(_, t)| t.as_str())
     }
 
-    /// Remember `fp → text` (bounded; oldest evicted). A near-duplicate refreshes the existing entry
-    /// rather than growing the table; the degenerate 0 and empty text are ignored.
-    pub fn insert(&mut self, fp: u64, text: String) {
+    /// `insert` with the utterance length recorded, so `lookup_len` can gate on it.
+    pub fn insert_len(&mut self, fp: u64, len: u32, text: String) {
         if fp == 0 || text.is_empty() {
             return;
         }
-        if let Some(pos) = self.entries.iter().position(|(f, _)| (f ^ fp).count_ones() <= self.tol) {
-            self.entries[pos] = (fp, text);
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|(f, l, _)| (f ^ fp).count_ones() <= self.tol && self.len_ok(*l, len))
+        {
+            self.entries[pos] = (fp, len, text);
             return;
         }
-        self.entries.push((fp, text));
+        self.entries.push((fp, len, text));
         if self.entries.len() > self.cap {
             self.entries.remove(0);
         }
+    }
+
+    /// Every entry, oldest first — for persisting the corpus.
+    pub fn entries(&self) -> impl Iterator<Item = (u64, u32, &str)> {
+        self.entries.iter().map(|(f, l, t)| (*f, *l, t.as_str()))
+    }
+
+    /// The nearest cached transcription within `tol` bits of `fp` (None if `fp` is the degenerate 0
+    /// or nothing is close enough).
+    pub fn lookup(&self, fp: u64) -> Option<&str> {
+        self.lookup_len(fp, 0)
+    }
+
+    /// Remember `fp → text` (bounded; oldest evicted). A near-duplicate refreshes the existing entry
+    /// rather than growing the table; the degenerate 0 and empty text are ignored.
+    pub fn insert(&mut self, fp: u64, text: String) {
+        self.insert_len(fp, 0, text)
     }
 
     pub fn len(&self) -> usize {
@@ -88,6 +126,20 @@ impl<T: Transcriber, F: FnMut(&[f32]) -> u64> Transcriber for CachedTranscriber<
 mod tests {
     use super::*;
     use crate::pipeline::Transcriber;
+
+    #[test]
+    fn a_length_mismatch_is_not_a_hit_even_when_the_bits_agree() {
+        let mut c = FingerprintCache::new(8, 4);
+        c.insert_len(0b1111, 16_000, "hi".into());
+        assert_eq!(c.lookup_len(0b1111, 16_000), Some("hi"), "same length: hit");
+        assert_eq!(c.lookup_len(0b1111, 18_000), Some("hi"), "12% longer: within len_tol");
+        assert_eq!(c.lookup_len(0b1111, 48_000), None, "three times longer: the same bits are a different utterance");
+        assert_eq!(c.lookup(0b1111), Some("hi"), "the length-blind lookup still matches");
+        // a different-length near-duplicate is a NEW entry, not a refresh of the old one
+        c.insert_len(0b1110, 48_000, "hi there".into());
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.lookup_len(0b1111, 48_000), Some("hi there"));
+    }
 
     #[test]
     fn cache_exact_fuzzy_and_capacity() {

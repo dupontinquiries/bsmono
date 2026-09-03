@@ -41,6 +41,11 @@ pub struct Feel {
     /// Asking for "everything captured so far" each interval is what makes
     /// partials fall behind the speaker on a phone.
     dictation: crate::voice::DictationService,
+    /// The real capture + whisper driver (feature `voice`); `Err` = why it could not load
+    /// (no model, no mic backend), shown in the status row. Without the feature this field
+    /// does not exist and dictation stays the preview it always was here.
+    #[cfg(feature = "voice")]
+    voice: Result<crate::voice_host::VoiceHost, String>,
     /// What the microphone broker said. Dictation had no audio source at all —
     /// start() set a flag — so a refusal was invisible and the user just saw
     /// dictation do nothing.
@@ -143,6 +148,13 @@ impl Feel {
     /// how the GTK build shipped voice on qwerty only.
     pub fn toggle_dictation(&mut self) {
         if self.dictation.is_active() {
+            // Stop capturing first (no final pass in PartialsOnly), keeping the audio the
+            // last partial was made from for the corpus.
+            #[cfg(feature = "voice")]
+            let last_audio = match &mut self.voice {
+                Ok(v) => v.stop(),
+                Err(_) => Vec::new(),
+            };
             // PartialsOnly: the last partial IS the result, so release commits without a
             // second inference.
             if let Some(text) = self.dictation.release() {
@@ -151,10 +163,32 @@ impl Feel {
                 }
                 self.service.commit_text(&text);
                 self.typed.push_str(&text);
+                // COMMITTED, so it may enter the corpus: the next time this utterance is
+                // said, the fingerprint answers before whisper runs.
+                #[cfg(feature = "voice")]
+                if let Ok(v) = &self.voice {
+                    v.remember(&last_audio, &text);
+                }
             }
             // RELEASED: the keyboard comes back now the voice session is over.
             let _ = self.service.set_suppressed(false);
         } else {
+            #[cfg(feature = "voice")]
+            match &mut self.voice {
+                Ok(v) => match v.start() {
+                    Ok(()) => {
+                        self.mic = crate::mic_source::MicState::Live { mic: "default".into(), also: Vec::new() };
+                    }
+                    Err(e) => {
+                        tracing::warn!("voice start: {e:#}");
+                        self.mic = crate::mic_source::MicState::Refused(crate::mic_source::Denied::Unavailable);
+                        return;
+                    }
+                },
+                Err(why) => {
+                    tracing::warn!("dictation requested but the voice engine is not available: {why}");
+                }
+            }
             self.dictation.start();
             // SUPPRESSED while the voice session runs — keyboard_service's own doc names a
             // voice session as exactly the trigger. The Hidden event is dropped on purpose:
@@ -200,6 +234,10 @@ impl Feel {
             // 16kHz: what the transcriber expects, and what the window maths
             // is computed against.
             dictation: crate::voice::DictationService::new(16_000),
+            #[cfg(feature = "voice")]
+            voice: crate::config::Config::load_or_default()
+                .map_err(|e| format!("config: {e:#}"))
+                .and_then(|cfg| crate::voice_host::VoiceHost::new(&cfg).map_err(|e| format!("{e:#}"))),
             mic: crate::mic_source::MicState::Idle,
             swipe: SwipeState::with_dictionary(
                 include_str!("../demo_words.txt").lines().map(|l| l.trim().to_string())
@@ -367,21 +405,39 @@ impl Feel {
                         // and with none the count stays zero — which yields an
                         // empty window rather than a window over audio that
                         // does not exist.
-                        if let crate::mic_source::MicState::Live { .. } = self.mic {
-                            // No capture backend attached in this build. The
-                            // count is left where the host would set it rather
-                            // than being invented: a fabricated sample count
-                            // would produce plausible-looking windows over
-                            // silence, which is worse than an obvious zero.
+                        #[cfg(feature = "voice")]
+                        let mut level = 0.4;
+                        #[cfg(not(feature = "voice"))]
+                        let level = 0.4;
+                        #[cfg(feature = "voice")]
+                        if let Ok(v) = &mut self.voice {
+                            // Real sample counts from the ring, so the window is bounded
+                            // over audio that exists; then the partial in flight, if done.
+                            self.dictation.captured(v.captured_samples());
+                            let window = self.dictation.next_window();
+                            if let Some(text) = v.poll(window) {
+                                self.dictation.partial(&text);
+                            }
+                            level = v.level().clamp(0.0, 1.0);
+                            ctx.request_repaint_after(std::time::Duration::from_millis(60));
                         }
+                        #[cfg(not(feature = "voice"))]
                         let _window = self.dictation.next_window();
                         // The partial goes to the MICROTERM's voice preview,
                         // which is the surface built for it — showing it in the
                         // toolbar instead would leave that surface unreachable
                         // again by a different route.
                         self.microterm.set_content(crate::microterm::Content::VoicePreview {
-                            partial: self.dictation.preview().to_string(), level: 0.4 });
+                            partial: self.dictation.preview().to_string(), level });
                         self.microterm.show();
+                        // What the last inference cost — the loop is visible, so a slow model
+                        // is a number in the status row, not a feeling.
+                        #[cfg(feature = "voice")]
+                        if let Ok(v) = &self.voice {
+                            if let Some(t) = v.last_timing() {
+                                ui.label(egui::RichText::new(format!("{} · corpus {}", t.describe(), v.corpus_len())).small());
+                            }
+                        }
                     }
                 }
                 // The mic state, including WHY it was refused — the two
@@ -750,7 +806,7 @@ impl Feel {
                     if self.real_active {
                         // the real layout files: render via the projection, feed emissions through
                         // the board's state machine (shift/symbols absorbed), act on the rest
-                        let render = self.real.render();
+                        let render = self.real.render_rc();
                         if let Some(e) = keyboard_ui(ui, &render, &adaptive, self.board.palette()) {
                             // THROUGH THE SINK, not straight into the
                             // preview string. These wrote to `self.typed`
@@ -809,8 +865,15 @@ impl Feel {
                     // ── swipe typing over whichever board is showing ──────────────────
                     let board_rect = egui::Rect::from_min_max(board_top, ui.cursor().min
                         + egui::vec2(ui.available_width(), 0.0));
-                    let render = if self.real_active { self.real.render() } else { self.board.current().clone() };
-                    if self.swipe.update(ui, &render, board_rect, &adaptive).is_some() {
+                    // The swipe overlay reads the same layout the keys were drawn from: the
+                    // cached projection for a real file (no second projection), a borrow of
+                    // the demo board (no clone — `swipe` and `board` are disjoint fields).
+                    let real_render = if self.real_active { Some(self.real.render_rc()) } else { None };
+                    let render: &crate::Layout = match &real_render {
+                        Some(r) => r,
+                        None => self.board.current(),
+                    };
+                    if self.swipe.update(ui, render, board_rect, &adaptive).is_some() {
                         // A completed swipe suppresses nothing: the candidates appear above and
                         // the user picks. Committing automatically would fight the tap that the
                         // same gesture's lift also produces on some touch stacks.

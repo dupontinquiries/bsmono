@@ -31,14 +31,43 @@ pub const MODEL_CANDIDATES: &[&str] = &[
 /// the given order and [`MODEL_CANDIDATES`] in preference order. `None` if nothing
 /// is found.
 pub fn find_model_in(dirs: &[PathBuf], env_override: Option<&str>) -> Option<PathBuf> {
+    find_model_in_preferring(dirs, env_override, prefer_from_env())
+}
+
+/// Which size to reach for first when more than one model is installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Prefer {
+    /// [`MODEL_CANDIDATES`] as written: `base` before `tiny` (accuracy).
+    #[default]
+    Accuracy,
+    /// `tiny` before `base` — roughly 3× faster inference, for a phone that reports its
+    /// partials falling behind, or for the keyboard's streaming loop where the next partial
+    /// corrects the last one anyway.
+    Speed,
+}
+
+/// `WHISPER_PREFER=speed|tiny` → [`Prefer::Speed`]; anything else (or unset) → accuracy.
+/// An env rather than a per-app config because the trade-off is the machine's, not the
+/// app's: every voice surface on a slow phone wants the same answer.
+pub fn prefer_from_env() -> Prefer {
+    match std::env::var("WHISPER_PREFER").ok().as_deref().map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("speed") | Some("tiny") | Some("fast") => Prefer::Speed,
+        _ => Prefer::Accuracy,
+    }
+}
+
+/// [`find_model_in`] with the size preference explicit. An explicit `env_override` file still
+/// wins outright — a person naming a model gets that model.
+pub fn find_model_in_preferring(dirs: &[PathBuf], env_override: Option<&str>, prefer: Prefer) -> Option<PathBuf> {
     if let Some(p) = env_override {
         let p = PathBuf::from(p);
         if p.is_file() {
             return Some(p);
         }
     }
+    let order = candidates_for(prefer);
     for dir in dirs {
-        for cand in MODEL_CANDIDATES {
+        for cand in &order {
             let p = dir.join(cand);
             if p.is_file() {
                 return Some(p);
@@ -46,6 +75,18 @@ pub fn find_model_in(dirs: &[PathBuf], env_override: Option<&str>) -> Option<Pat
         }
     }
     None
+}
+
+/// The candidate list in the order `prefer` wants: for [`Prefer::Speed`], every `tiny`
+/// candidate (in its own quantization-first order) ahead of everything else.
+pub fn candidates_for(prefer: Prefer) -> Vec<&'static str> {
+    match prefer {
+        Prefer::Accuracy => MODEL_CANDIDATES.to_vec(),
+        Prefer::Speed => {
+            let (tiny, rest): (Vec<_>, Vec<_>) = MODEL_CANDIDATES.iter().copied().partition(|c| c.contains("tiny"));
+            tiny.into_iter().chain(rest).collect()
+        }
+    }
 }
 
 /// Find a whisper model in the **canonical model store** (via models-kit), honoring a
@@ -183,5 +224,27 @@ mod tests {
 
         assert_eq!(Variant::from_filename("ggml-large-v3.bin").unwrap().size, ModelSize::Large);
         assert!(Variant::from_filename("not-a-model.txt").is_none());
+    }
+
+    #[test]
+    fn speed_preference_puts_every_tiny_first_and_keeps_quantization_order() {
+        let fast = candidates_for(Prefer::Speed);
+        let n_tiny = fast.iter().take_while(|c| c.contains("tiny")).count();
+        assert!(n_tiny >= 4, "{fast:?}");
+        assert!(fast[n_tiny..].iter().all(|c| !c.contains("tiny")), "no tiny after the first non-tiny");
+        assert!(fast[0].contains("q5_1"), "quantized first within the tinies: {}", fast[0]);
+        assert_eq!(candidates_for(Prefer::Accuracy), MODEL_CANDIDATES.to_vec());
+        // and the explicit file still wins under either preference
+        let dir = std::env::temp_dir().join(format!("vk-prefer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["ggml-base.en-q5_1.gguf", "ggml-tiny.en-q5_1.gguf", "custom.bin"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let dirs = vec![dir.clone()];
+        assert!(find_model_in_preferring(&dirs, None, Prefer::Accuracy).unwrap().ends_with("ggml-base.en-q5_1.gguf"));
+        assert!(find_model_in_preferring(&dirs, None, Prefer::Speed).unwrap().ends_with("ggml-tiny.en-q5_1.gguf"));
+        let custom = dir.join("custom.bin");
+        assert_eq!(find_model_in_preferring(&dirs, custom.to_str(), Prefer::Speed).unwrap(), custom);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
