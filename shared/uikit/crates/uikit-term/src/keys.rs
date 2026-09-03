@@ -178,9 +178,21 @@ pub fn clears_the_line(bytes: &[u8]) -> bool {
 /// Same shape as `widget_handles`: one statement of who owns what, read
 /// by both readers.
 pub fn is_widget_chord(key: Key, m: Mods) -> bool {
-    m.ctrl
-        && !m.alt
-        && matches!(key, Key::Char('f') | Key::Char('F') | Key::Char('p') | Key::Char('P'))
+    // Ctrl+F find, Ctrl+P palette.
+    if m.ctrl && !m.alt && matches!(key, Key::Char('f') | Key::Char('F') | Key::Char('p') | Key::Char('P'))
+    {
+        return true;
+    }
+    // Shift+PageUp/PageDown scroll the SCROLLBACK. `handle_input` has
+    // explicit arms for them and its catch-all excludes them
+    // (`PageUp if !m.shift`), so the widget plainly owns them — but the
+    // host's raw path encoded them anyway and sent `ESC [ 5 ; 2 ~` to
+    // the shell. Seen at the prompt in a screenshot as `^[[5;2~` sitting
+    // in front of a typed command.
+    //
+    // WITHOUT shift they belong to the program: less and vim page with
+    // a bare PageUp, and stealing that would break them.
+    m.shift && !m.ctrl && !m.alt && matches!(key, Key::PageUp | Key::PageDown)
 }
 
 /// Whether the HOST's raw key path should run this frame.
@@ -399,6 +411,16 @@ mod tests {
         assert!(is_widget_chord(Key::Char('f'), ctrl));
         assert!(is_widget_chord(Key::Char('F'), ctrl));
         assert!(is_widget_chord(Key::Char('p'), ctrl));
+    }
+
+    #[test]
+    fn shift_paging_is_scrollback_and_bare_paging_is_the_programs() {
+        let shift = Mods { ctrl: false, alt: false, shift: true };
+        assert!(is_widget_chord(Key::PageUp, shift));
+        assert!(is_widget_chord(Key::PageDown, shift));
+        // bare PageUp belongs to less/vim; stealing it breaks them
+        assert!(!is_widget_chord(Key::PageUp, Mods::none()));
+        assert!(!is_widget_chord(Key::PageDown, Mods::none()));
     }
 
     #[test]
