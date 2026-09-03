@@ -89,6 +89,11 @@ pub enum DropReason {
     Ended,
     /// A duplicate of a control we already acted on this utterance.
     AlreadyActed,
+    /// Understood, but there was nothing for it to do — a repair whose
+    /// target is not in the last unit, most often. The router cannot
+    /// produce this on its own (it never touches the buffer); it exists
+    /// for the composition layer, which can.
+    NotApplicable,
 }
 
 /// What the caller should do with a result.

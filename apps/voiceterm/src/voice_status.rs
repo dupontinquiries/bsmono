@@ -262,6 +262,7 @@ pub fn drop_label(r: DropReason) -> &'static str {
         DropReason::LowConfidence => "not sure",
         DropReason::Ended => "dictation ended",
         DropReason::AlreadyActed => "already done",
+        DropReason::NotApplicable => "nothing to change",
     }
 }
 

@@ -170,6 +170,9 @@ mod code_symbols;
 // allowed to act on what, plus the shadow record that decides when the
 // acoustic fast path can be trusted. Pure.
 mod dictation_session;
+// One object owning session + buffer + symbol table + readout, so the
+// composition lives in one tested place instead of in every caller.
+mod dictation_engine;
 // The voice-feedback readout model: two-tier transcript display with the
 // anti-reflow slot sizing. Pure.
 mod voice_status;
