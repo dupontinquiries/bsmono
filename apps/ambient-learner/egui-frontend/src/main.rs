@@ -193,10 +193,13 @@ fn main() -> eframe::Result<()> {
             .with_title("Ambient Learner"),
         ..Default::default()
     };
-    eframe::run_native("ambient-learner-egui", opts, Box::new(|_cc| {
+    eframe::run_native("ambient-learner-egui", opts, Box::new(|cc| {
         Ok(Box::new(App {
             live: LiveState::demo(),
-            colors: uikit_egui::palette_colors("cloudscape"),
+            // ctx variant, from the CreationContext: same colours, plus the
+            // symbol fonts. Installed once at construction rather than per
+            // frame, which is all this app needs since it never re-themes.
+            colors: uikit_egui::palette_colors_ctx(&cc.egui_ctx, "cloudscape"),
             page: Page::Live,
             // Empty rather than fabricated: the history page says "no readings
             // recorded yet", which is true, instead of drawing invented data.

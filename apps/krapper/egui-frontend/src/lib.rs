@@ -296,7 +296,9 @@ struct Shell {
 #[cfg(feature = "app")]
 impl eframe::App for Shell {
     fn ui(&mut self, ui: &mut egui::Ui, _f: &mut eframe::Frame) {
-        let colors = uikit_egui::palette_colors("midnight");
+        // ctx variant: same colours, plus the symbol fonts. krapper had
+        // colours and no fonts — see maintenance/tools/font_install_check.py.
+        let colors = uikit_egui::palette_colors_ctx(ui.ctx(), "midnight");
         // THE ADAPTIVE LAYER. krapper asks for a 760x620 window, which
         // is wider than a Fairphone's screen, and its suggestion
         // buttons were default-sized — comfortably clickable with a

@@ -83,9 +83,7 @@ KNOWN_MISSES = {
     # every colour on it, which is a bigger change than "install the fonts" and
     # should not be made blind across ten apps in one pass.
     "apps/ambient-learner": "the Qt-era shell; the egui frontend beside it is a separate entry.",
-    "apps/ambient-learner/egui-frontend": "uses PaletteColors for colour but never applies the palette, so no fonts.",
     "apps/beatspace": "no palette call.",
-    "apps/krapper/egui-frontend": "uses PaletteColors but never applies the palette.",
     "apps/settings-app": "bsettings; no palette call.",
     "apps/snapclone/camera-bridge": "a probe UI; low glyph count, low priority.",
     "apps/snapshot-cam": "no palette call.",
@@ -137,8 +135,22 @@ def code_only(text):
 
 
 def reaches_install(crate_dir):
-    for dirpath, dirnames, filenames in os.walk(os.path.join(ROOT, crate_dir)):
-        dirnames[:] = [d for d in dirnames if d != "target"]
+    """Does this crate's OWN source reach the font install?
+
+    Nested crates are excluded, and that is not a detail: `apps/ambient-learner`
+    contains `apps/ambient-learner/egui-frontend`, so a plain walk gave the
+    parent credit for the child's call and reported the parent fixed when
+    nothing in it had changed. The checker's own "FIXED, delete from
+    KNOWN_MISSES" arm is what surfaced that — it fired for a crate I had not
+    touched.
+    """
+    root = os.path.join(ROOT, crate_dir)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            d for d in dirnames
+            if d != "target"
+            and not os.path.exists(os.path.join(dirpath, d, "Cargo.toml"))
+        ]
         for fn in filenames:
             if not fn.endswith(".rs"):
                 continue
