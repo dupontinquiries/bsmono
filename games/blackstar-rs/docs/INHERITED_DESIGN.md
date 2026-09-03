@@ -316,7 +316,7 @@ segments, 40..47 HOLLOW
 
 *(`game.c:1024`)*
 
-LIMB STRUT-FRAMES (paired rails -- robotic, hollow, cybertronian), 48..49
+LIMB STRUT-FRAMES (paired rails -- robotic, hollow, machine), 48..49
 angled CHEST
 
 ### PANELS

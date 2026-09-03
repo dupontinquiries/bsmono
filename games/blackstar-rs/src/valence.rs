@@ -1,7 +1,7 @@
 //! VALENCE — power a bot can point to.
 //!
 //! The Destiny Light loop, adapted and renamed for what it is here: the
-//! squad are Cybertronians, and what a mission banks in their frames is
+//! squad are Machines, and what a mission banks in their frames is
 //! valence. Progression is not a number the game hands you, it is the
 //! sum of what you have actually recovered. Missions bank
 //! a little, wardens bank more (a relic is a relic), the weekly nightfall

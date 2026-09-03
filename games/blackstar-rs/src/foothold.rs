@@ -103,7 +103,7 @@ pub fn assess(body: Body, site: &Site, w: Weather, window_s: f32, speed_ms: f32)
     if !reachable {
         return Plan { site: *site, viable: false, margin_s: spare, note: "cannot reach it in the window" };
     }
-    // The arithmetic from here is not Cybertronian and is shared with the
+    // The arithmetic from here is not Machine and is shared with the
     // detective campaign, which asks the same question with a rival society
     // for weather and a parked car for a grounded ship. See `approach.rs`;
     // what stays HERE is the domain — reaching it, and whether this shelter
@@ -178,7 +178,7 @@ mod tests {
         // nobody garrisons empty rock, so it is the cheap option when the
         // weather is not the problem
         let sites = [lz(300.0, 60.0), fort(300.0, 400.0)];
-        let p = choose(Body::Cybertronian, &sites, Weather::Clear, f32::INFINITY, 14.0).unwrap();
+        let p = choose(Body::Machine, &sites, Weather::Clear, f32::INFINITY, 14.0).unwrap();
         assert_eq!(p.site.approach, Approach::ClearLz);
         // and the cost is a grounded ship for the rest of the raid
         assert!(p.site.approach.pins_the_ship());
@@ -237,7 +237,7 @@ mod tests {
         // same site, same window, different body — which is why you send
         // the machine first
         let sites = [fort(1_500.0, 120.0)];
-        let bot = choose(Body::Cybertronian, &sites, Weather::FlareFront, 300.0, 16.0);
+        let bot = choose(Body::Machine, &sites, Weather::FlareFront, 300.0, 16.0);
         let man = choose(Body::HumanSuited, &sites, Weather::FlareFront, 300.0, 2.5);
         assert!(bot.is_some(), "a bot should make 1.5 km in five minutes");
         assert!(man.is_none(), "a suited human should not");
@@ -248,7 +248,7 @@ mod tests {
         // both work; the fortress leaves the ship free for the rest of the
         // raid, and that outlasts the first phase
         let sites = [lz(100.0, 30.0), fort(120.0, 40.0)];
-        let p = choose(Body::Cybertronian, &sites, Weather::DustStorm, 600.0, 14.0).unwrap();
+        let p = choose(Body::Machine, &sites, Weather::DustStorm, 600.0, 14.0).unwrap();
         assert_eq!(p.site.approach, Approach::SeizeFortress);
         assert!(!p.site.approach.pins_the_ship());
     }

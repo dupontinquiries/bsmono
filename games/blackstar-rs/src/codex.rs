@@ -329,8 +329,8 @@ pub static CODEX: &[Entry] = &[
         ],
     },
     Entry {
-        id: "cybertron",
-        title: "cybertron",
+        id: "foundry",
+        title: "foundry",
         claim: Some("architecture_is_machine"),
         lines: &[
             "it stood for millions of cycles, and mistook",
@@ -343,7 +343,7 @@ pub static CODEX: &[Entry] = &[
         title: "the clone coalition",
         claim: None,
         lines: &[
-            "elemental nations older than cybertron's golden age,",
+            "elemental nations older than foundry's golden age,",
             "each a people of a single power -- ice, fire, metal --",
             "holding the shield's perimeter against the hijacks.",
         ],
@@ -354,7 +354,7 @@ pub static CODEX: &[Entry] = &[
         claim: None,
         lines: &[
             "humans who have lived inside the shield the longest,",
-            "and so read its interior as no cybertronian can.",
+            "and so read its interior as no machine can.",
             "the bearer trusts them a shade more than the rest.",
         ],
     },
@@ -394,7 +394,7 @@ pub static CODEX: &[Entry] = &[
         claim: None,
         lines: &[
             "the cold open: an ice-base sundered holding the outer rim,",
-            "ice-plasma and frozen shards, mining cybertron's dead fragments.",
+            "ice-plasma and frozen shards, mining foundry's dead fragments.",
             "sam ends him early -- the first skirmish, and a statement of tone.",
         ],
     },
@@ -494,7 +494,7 @@ pub static CODEX: &[Entry] = &[
         claim: None,
         lines: &[
             "between mars and jupiter, a belt of broken war --",
-            "cybertron's scattered fragments, dead outposts, drifting hulls.",
+            "foundry's scattered fragments, dead outposts, drifting hulls.",
             "when the devourer woke, the whole belt woke with it.",
         ],
     },
@@ -516,7 +516,7 @@ pub static CODEX: &[Entry] = &[
             "archive enforcement, technocracy era. deep purple",
             "oxidation over hard geometric lines -- no flashy parts.",
             "speaks in clipped logic; never monologues. believes",
-            "cybertron fell when it abandoned purity. he wants the",
+            "foundry fell when it abandoned purity. he wants the",
             "buried cores. everything else is an obstacle.",
         ],
     },
@@ -539,7 +539,7 @@ pub static CODEX: &[Entry] = &[
         lines: &[
             "he helped design the control interface, under the",
             "technocrats, and regrets nothing. not evil -- clinical.",
-            "cybertron failed, he says, because it hesitated. his",
+            "foundry failed, he says, because it hesitated. his",
             "gardens grow bodies perfected past identity. the",
             "crawlers in the roots are his drafts.",
         ],

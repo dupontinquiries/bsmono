@@ -22,14 +22,14 @@
 //!
 //! ## A CORRECTION, kept where it happened
 //!
-//! An earlier version of this module observed that Cybertron has fifty-six
+//! An earlier version of this module observed that the Foundry has fifty-six
 //! frames and not one that stands out, and read it as characterisation: a
 //! place where the difference between one frame and another stopped
 //! mattering. **That was meaning drawn from a data artifact.** The ids are
 //! `grimorph_part4` through `grimorph_part88` — pieces of one exploded model,
-//! listed as if each were a bot. Cybertron does not have fifty-six anonymous
+//! listed as if each were a bot. the Foundry does not have fifty-six anonymous
 //! residents; it has none, and a parts bin standing where they should be.
-//! `cybertronian.rs` is the frames that belong there, and its
+//! `machine.rs` is the frames that belong there, and its
 //! `the_parts_bin_is_not_a_population` pins the correction.
 //!
 //! The rest of the census below survives that, because the other facts are
@@ -37,11 +37,11 @@
 //!
 //! ## What the census says
 //!
-//! **All fifty-six unrecorded shapes are on Cybertron, and every one is
+//! **All fifty-six unrecorded shapes are on the Foundry, and every one is
 //! Corrupted.** The hook they share — *"a shape the coalition has no record
 //! of"* — is already a provenance statement rather than a character note. And
 //! `archive.rs` has the matching claim from the other direction:
-//! `substrate_sample`, sited on Cybertron, says the energy architecture there
+//! `substrate_sample`, sited on the Foundry, says the energy architecture there
 //! is older than the planet's own record of inventing it. Fifty-six frames
 //! nobody can account for, all in one place, all wrong, is that claim seen
 //! from the population side.
@@ -168,62 +168,62 @@ pub static CENSUS: &[Bot] = &[
     B("flyer_wayside","flyer","shield_edge","Hijacks",false),
     B("flyer_whisperwind_aka_f_117_nighthawk_usa","flyer","helix","Coalition",true),
     B("flyer_white_tiger","flyer","shield_edge","Hijacks",false),
-    B("grimorph_part10","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part11","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part12","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part13","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part16","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part17","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part18","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part20","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part21","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part22","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part23","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part24","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part25","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part26","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part27","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part30","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part31","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part32","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part36","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part38","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part4","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part40","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part42","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part43","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part44","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part45","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part48","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part49","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part5","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part50","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part52","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part53","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part54","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part55","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part56","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part58","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part59","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part63","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part64","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part66","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part69","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part7","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part71","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part72","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part73","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part75","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part76","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part77","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part78","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part8","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part80","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part82","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part84","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part85","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part88","grimorph","cybertron","Corrupted",false),
-    B("grimorph_part9","grimorph","cybertron","Corrupted",false),
+    B("grimorph_part10","grimorph","foundry","Corrupted",false),
+    B("grimorph_part11","grimorph","foundry","Corrupted",false),
+    B("grimorph_part12","grimorph","foundry","Corrupted",false),
+    B("grimorph_part13","grimorph","foundry","Corrupted",false),
+    B("grimorph_part16","grimorph","foundry","Corrupted",false),
+    B("grimorph_part17","grimorph","foundry","Corrupted",false),
+    B("grimorph_part18","grimorph","foundry","Corrupted",false),
+    B("grimorph_part20","grimorph","foundry","Corrupted",false),
+    B("grimorph_part21","grimorph","foundry","Corrupted",false),
+    B("grimorph_part22","grimorph","foundry","Corrupted",false),
+    B("grimorph_part23","grimorph","foundry","Corrupted",false),
+    B("grimorph_part24","grimorph","foundry","Corrupted",false),
+    B("grimorph_part25","grimorph","foundry","Corrupted",false),
+    B("grimorph_part26","grimorph","foundry","Corrupted",false),
+    B("grimorph_part27","grimorph","foundry","Corrupted",false),
+    B("grimorph_part30","grimorph","foundry","Corrupted",false),
+    B("grimorph_part31","grimorph","foundry","Corrupted",false),
+    B("grimorph_part32","grimorph","foundry","Corrupted",false),
+    B("grimorph_part36","grimorph","foundry","Corrupted",false),
+    B("grimorph_part38","grimorph","foundry","Corrupted",false),
+    B("grimorph_part4","grimorph","foundry","Corrupted",false),
+    B("grimorph_part40","grimorph","foundry","Corrupted",false),
+    B("grimorph_part42","grimorph","foundry","Corrupted",false),
+    B("grimorph_part43","grimorph","foundry","Corrupted",false),
+    B("grimorph_part44","grimorph","foundry","Corrupted",false),
+    B("grimorph_part45","grimorph","foundry","Corrupted",false),
+    B("grimorph_part48","grimorph","foundry","Corrupted",false),
+    B("grimorph_part49","grimorph","foundry","Corrupted",false),
+    B("grimorph_part5","grimorph","foundry","Corrupted",false),
+    B("grimorph_part50","grimorph","foundry","Corrupted",false),
+    B("grimorph_part52","grimorph","foundry","Corrupted",false),
+    B("grimorph_part53","grimorph","foundry","Corrupted",false),
+    B("grimorph_part54","grimorph","foundry","Corrupted",false),
+    B("grimorph_part55","grimorph","foundry","Corrupted",false),
+    B("grimorph_part56","grimorph","foundry","Corrupted",false),
+    B("grimorph_part58","grimorph","foundry","Corrupted",false),
+    B("grimorph_part59","grimorph","foundry","Corrupted",false),
+    B("grimorph_part63","grimorph","foundry","Corrupted",false),
+    B("grimorph_part64","grimorph","foundry","Corrupted",false),
+    B("grimorph_part66","grimorph","foundry","Corrupted",false),
+    B("grimorph_part69","grimorph","foundry","Corrupted",false),
+    B("grimorph_part7","grimorph","foundry","Corrupted",false),
+    B("grimorph_part71","grimorph","foundry","Corrupted",false),
+    B("grimorph_part72","grimorph","foundry","Corrupted",false),
+    B("grimorph_part73","grimorph","foundry","Corrupted",false),
+    B("grimorph_part75","grimorph","foundry","Corrupted",false),
+    B("grimorph_part76","grimorph","foundry","Corrupted",false),
+    B("grimorph_part77","grimorph","foundry","Corrupted",false),
+    B("grimorph_part78","grimorph","foundry","Corrupted",false),
+    B("grimorph_part8","grimorph","foundry","Corrupted",false),
+    B("grimorph_part80","grimorph","foundry","Corrupted",false),
+    B("grimorph_part82","grimorph","foundry","Corrupted",false),
+    B("grimorph_part84","grimorph","foundry","Corrupted",false),
+    B("grimorph_part85","grimorph","foundry","Corrupted",false),
+    B("grimorph_part88","grimorph","foundry","Corrupted",false),
+    B("grimorph_part9","grimorph","foundry","Corrupted",false),
     B("hawk_flyer_asonia","hawk","helix","Coalition",false),
     B("hawk_flyer_falcontip_aka_hawk_mech_osprey_x_80","hawk","helix","Coalition",true),
     B("heli_eclipse_aka_z_10ag_attack_helicopter","heli","earth","Coalition",true),
@@ -384,7 +384,7 @@ pub fn census_findings() -> Vec<Prior> {
     // every unrecorded shape in one place, and all of it corrupted
     let unrec: Vec<&Bot> = CENSUS.iter().filter(|b| b.class == "grimorph").collect();
     if !unrec.is_empty()
-        && unrec.iter().all(|b| b.home == "cybertron")
+        && unrec.iter().all(|b| b.home == "foundry")
         && unrec.iter().all(|b| b.faction == "Corrupted")
     {
         out.push(Prior {
@@ -458,7 +458,7 @@ pub fn run() {
     println!("\n  WHAT THE DISTRIBUTION SAYS\n");
     let unrec = CENSUS.iter().filter(|b| b.class == "grimorph").count();
     println!("    {unrec} frames share the hook \"a shape the coalition has no record of\".");
-    println!("    every one of them is on cybertron. every one is Corrupted.");
+    println!("    every one of them is on foundry. every one is Corrupted.");
     let earth_classes: Vec<&str> = {
         let mut c: Vec<&str> = at("earth").iter().map(|b| b.class).collect();
         c.sort_unstable();
@@ -485,7 +485,7 @@ pub fn run() {
     // ... but the ones that DO stand out should be reachable by name, or the
     // census is a wall of numbers with no way into it
     println!("\n  THE ONES THAT STAND OUT, on the worlds the map cares about\n");
-    for home in ["earth", "cybertron", "outer_rim"] {
+    for home in ["earth", "foundry", "outer_rim"] {
         let named: Vec<&Bot> = at(home).into_iter().filter(|b| b.distinct).take(3).collect();
         if named.is_empty() {
             println!("    {home:<12} none — every frame there is one of a crowd");
@@ -547,10 +547,10 @@ mod tests {
         // reshuffle of the placement rules cannot quietly dissolve it
         let g: Vec<&Bot> = CENSUS.iter().filter(|b| b.class == "grimorph").collect();
         assert!(g.len() > 20, "only {} unrecorded shapes", g.len());
-        assert!(g.iter().all(|b| b.home == "cybertron"), "they scattered");
+        assert!(g.iter().all(|b| b.home == "foundry"), "they scattered");
         assert!(g.iter().all(|b| b.faction == "Corrupted"), "some are fine");
-        // and nothing else on Cybertron is anything but corrupted
-        assert_eq!(monoculture("cybertron"), Some("Corrupted"));
+        // and nothing else on the Foundry is anything but corrupted
+        assert_eq!(monoculture("foundry"), Some("Corrupted"));
     }
 
     #[test]

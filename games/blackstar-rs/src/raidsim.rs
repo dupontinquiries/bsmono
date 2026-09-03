@@ -36,8 +36,8 @@ pub fn run(argv: &[String]) {
     let i = argv.iter().position(|a| a == "--raid").unwrap();
     let pick = argv.get(i + 1).map(|s| s.as_str()).filter(|s| !s.starts_with("--"));
     let seed: u64 = argv.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(7);
-    let body = if argv.iter().any(|a| a == "--suits") { Body::HumanSuited } else { Body::Cybertronian };
-    let speed = if body == Body::Cybertronian { 14.0 } else { 2.5 };
+    let body = if argv.iter().any(|a| a == "--suits") { Body::HumanSuited } else { Body::Machine };
+    let speed = if body == Body::Machine { 14.0 } else { 2.5 };
     let commit = argv.iter().any(|a| a == "--commit");
     let team_n: usize = argv
         .iter()

@@ -1,4 +1,4 @@
-//! ESCALATION — the War for Cybertron horde mode, as pure logic.
+//! ESCALATION — the War for the Foundry horde mode, as pure logic.
 //!
 //! Ported from the C engine's `exengine/waves.h`/`waves.c`, which is
 //! itself already a "pure logic" module by design — its own header

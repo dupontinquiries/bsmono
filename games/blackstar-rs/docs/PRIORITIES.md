@@ -69,7 +69,7 @@ of it is something you *do* rather than something that *resolves*.
       constants — wiring first produces a 22x car and looks like the scale
       system is broken.
 - [ ] Legged locomotion at all. Everything rolls. `cling.rs` knows five gaits,
-      `cybertronian.rs` names them, the physics has wheels.
+      `machine.rs` names them, the physics has wheels.
 
 ## 3. The ship as a Transformer — not started
 

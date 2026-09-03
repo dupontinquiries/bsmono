@@ -69,12 +69,12 @@
     "title": "The Core Piercer",
     "mech": "Air",
     "element": "Rock",
-    "arena": "cybertron",
+    "arena": "foundry",
     "tier": 2,
     "premise": "it drilled through moons, worlds, dwarf planets",
     "relic": [
       "built to learn why planets have metallic hearts. some worlds",
-      "screamed; some contained machinery older than cybertron.",
+      "screamed; some contained machinery older than foundry.",
       "it vanished under a rogue planet and came back marked."
     ],
     "shard": "it stopped drilling down. the last bore was a way OUT for something."
@@ -135,7 +135,7 @@
     "element": "Vine",
     "arena": "frostline",
     "tier": 1,
-    "premise": "the oldest predator pattern Cybertron ever built",
+    "premise": "the oldest predator pattern the Foundry ever built",
     "relic": [
       "older than language, older than cities, older than elegant",
       "transformation. its nerves evolved rather than being engineered.",
@@ -213,7 +213,7 @@
     "title": "Planetbreaker",
     "mech": "Ground",
     "element": "Rock",
-    "arena": "cybertron",
+    "arena": "foundry",
     "tier": 2,
     "premise": "the ground is its weapon",
     "relic": [
@@ -267,7 +267,7 @@
     "relic": [
       "the camera titans were never soldiers. every photon they",
       "captured is stored in quantum crystal. this one remembers",
-      "cybertron's birth. damaging its armor physically erases history."
+      "foundry's birth. damaging its armor physically erases history."
     ],
     "shard": "the oldest frame in its memory is of the lock being built."
   },

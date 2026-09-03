@@ -50,7 +50,7 @@ mod fx;
 mod gyro;
 mod content;
 mod crawler;
-mod cybertronian;
+mod machine;
 mod curriculum;
 mod corruption;
 mod cyber;
@@ -638,7 +638,7 @@ fn parse_args() -> Opts {
                 println!("  --bench [code] roll, keep and share authored frames");
                 println!("  --voxel        critics for a voxel GAN: skeleton and part matching");
                 println!("  --gravity      the well formula, checked against real physics");
-                println!("  --frames       cybertronian frames, designed from the planet");
+                println!("  --frames       machine frames, designed from the planet");
                 println!("  --space        kuiper as space: angular LOD, gravity, depth, the floor");
                 println!("  --roster       the bot census, and what the distribution implies");
                 println!("  --rip          finishers: the style of the kill is who you are");
@@ -1457,7 +1457,7 @@ fn main() {
         return;
     }
     if argv.iter().any(|a| a == "--frames") {
-        cybertronian::run();
+        machine::run();
         return;
     }
     if argv.iter().any(|a| a == "--space") {
@@ -8735,7 +8735,7 @@ impl Game {
         // ---- TRACERS: every live shot, both pools ----
         // The shot pools flew invisible rounds: `shots::step` landed them
         // and `fx` burst on impact, but nothing drew the flight. War for
-        // Cybertron's whole feel is the stream in the air; a fight where
+        // the Foundry's whole feel is the stream in the air; a fight where
         // you cannot see what is coming reads as nothing happening. A
         // stretched emissive sphere along the velocity, element-tinted;
         // hostile rounds pulled toward a hot red so whose it is reads at a

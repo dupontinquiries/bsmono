@@ -173,8 +173,8 @@ mod tests {
     // for the normal build and left the test target uncompilable.
     use crate::loadout::BodyFit;
 
-    const MACHINE: [Body; 1] = [Body::Cybertronian];
-    const MIXED: [Body; 2] = [Body::Cybertronian, Body::HumanSuited];
+    const MACHINE: [Body; 1] = [Body::Machine];
+    const MIXED: [Body; 2] = [Body::Machine, Body::HumanSuited];
 
     fn world(au: f32, albedo: f32, air: f32, star: StarClass) -> Orbit {
         Orbit { star, au, albedo, air }
@@ -262,17 +262,17 @@ mod tests {
     fn a_drop_the_team_already_outclasses_is_reported_as_such() {
         let base = *MODS
             .iter()
-            .find(|m| m.effect == Effect::Shielding && m.fits.accepts(Body::Cybertronian))
+            .find(|m| m.effect == Effect::Shielding && m.fits.accepts(Body::Machine))
             .unwrap();
         let held = [Mod { magnitude: base.magnitude * 3.0, ..base }];
         let weak = Drop { base, grade: Grade::Salvage, from: "X" };
         let strong = Drop { base, grade: Grade::Relic, from: "X" };
-        assert!(!improves(&weak, &held, Body::Cybertronian));
+        assert!(!improves(&weak, &held, Body::Machine));
         // and a relic of the same mod still loses to something three times
         // its size, because a slot saved is not infinite value
-        assert!(!improves(&strong, &held, Body::Cybertronian));
+        assert!(!improves(&strong, &held, Body::Machine));
         // against nothing, anything wearable improves
-        assert!(improves(&weak, &[], Body::Cybertronian));
+        assert!(improves(&weak, &[], Body::Machine));
         // and it never improves a body that cannot wear it
         assert!(!improves(&weak, &[], Body::HumanBare) || base.fits.accepts(Body::HumanBare));
     }

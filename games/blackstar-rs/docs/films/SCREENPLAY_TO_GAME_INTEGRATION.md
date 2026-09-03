@@ -147,7 +147,7 @@ Claim {
 Claim {
     id: "film_4_morpher_identity",
     text: "The Morpher is an Ice Clone guardian who has \
-           existed longer than recorded Cybertronian history",
+           existed longer than recorded Machine history",
     stratum: Stratum::Ascension,
     prior: Prior::Probable,
 },
@@ -187,7 +187,7 @@ Finding {
     id: "morpher_testimony_age",
     source: "first_contact_transcript",
     text: "\"I have guarded this boundary for longer than \
-           Cybertron's entire recorded history.\"",
+           the Foundry's entire recorded history.\"",
     supports: &["film_4_morpher_identity"],
     opposes: &[],
     medium: Medium::DirectTestimony,

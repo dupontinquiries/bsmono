@@ -211,7 +211,7 @@ Worth spelling out for three, because the mapping is the interesting part:
 
 ### Primitive Mantis Mech — "The First Hunter"
 
-> the oldest predator pattern Cybertron ever built
+> the oldest predator pattern the Foundry ever built
 
 **PURGE**, arena `ambush`. Clear every hostile in the zone.
 
@@ -279,7 +279,7 @@ Worth spelling out for three, because the mapping is the interesting part:
 |---|---|---|
 | The Approach | `pluto` | GROUND, PURGE, PURGE, GROUND |
 | The Gauntlet | `unending` | PURGE, PURGE, PURGE, GROUND |
-| The Planetbreaker | `cybertron` | PURGE, GROUND, PURGE, GROUND |
+| The Planetbreaker | `foundry` | PURGE, GROUND, PURGE, GROUND |
 
 ### Trenchmaster — "The Ocean King"
 
@@ -289,7 +289,7 @@ Worth spelling out for three, because the mapping is the interesting part:
 
 | phase | map | encounter mechanics |
 |---|---|---|
-| The Approach | `cybertron` | PURGE, SYNC, SYNC, SYNC |
+| The Approach | `foundry` | PURGE, SYNC, SYNC, SYNC |
 | The Gauntlet | `vault` | PURGE, PURGE, PURGE, SYNC |
 | The King | `unending` | SYNC, SYNC, PURGE, SYNC |
 
@@ -337,6 +337,6 @@ Worth spelling out for three, because the mapping is the interesting part:
 
 | phase | map | encounter mechanics |
 |---|---|---|
-| The Approach | `cybertron` | PURGE, PURGE, SYNC, SYNC |
+| The Approach | `foundry` | PURGE, PURGE, SYNC, SYNC |
 | The Gauntlet | `foundry` | SYNC, SYNC, PURGE, SYNC |
 | The Divergence | `unending` | SYNC, PURGE, PURGE, SYNC |

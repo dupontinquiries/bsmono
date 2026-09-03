@@ -508,7 +508,7 @@ pub static SOURCES: &[Source] = &[
     Source { id: "carrion_wreck", what: "a hull that came apart on a straight edge" },
     Source { id: "outpost_roster", what: "the vault office's rotation board, and the hand-off note under it" },
     Source { id: "carrier_drift", what: "a carrier nobody transmits, tracked across two seasons of drift" },
-    Source { id: "cybertron_core", what: "core substrate, dated properly for once" },
+    Source { id: "foundry_core", what: "core substrate, dated properly for once" },
     Source { id: "judgement_docket", what: "the Judgementor's open case file" },
     Source { id: "covenant_cache", what: "a tithe-vault, and the one thing in it worth taking" },
     Source { id: "asteri_chart", what: "the Asteri's last astronomical record and its working" },
@@ -695,7 +695,7 @@ pub static FINDINGS: &[Finding] = &[
         medium: Medium::Artifact,
         gate: None,
         blurb: "a Cold War bunker under Los Angeles, four floors of filing and damp. the fifth \
-                floor is not on the plans. a plate down there takes a scan the way cybertronian \
+                floor is not on the plans. a plate down there takes a scan the way machine \
                 hull does, and it was cast before anyone here had seen any.",
         links: &[s("societies_existed"), s("convergence_was_not_first"), m("architecture_is_machine")],
     },
@@ -968,7 +968,7 @@ pub static FINDINGS: &[Finding] = &[
         source: "pluto_marker",
         medium: Medium::Site,
         gate: None,
-        blurb: "a boundary marker on the line, set into the ice. the script is not cybertronian \
+        blurb: "a boundary marker on the line, set into the ice. the script is not machine \
                 and not human. it is warning somebody about something, politely.",
         links: &[s("asteri_were_not_first"), m("bridge_predates_coalition")],
     },
@@ -1067,12 +1067,12 @@ pub static FINDINGS: &[Finding] = &[
     // ================= CYBERTRON =================
     Finding {
         id: "substrate_sample",
-        site: "cybertron",
-        source: "cybertron_core",
+        site: "foundry",
+        source: "foundry_core",
         medium: Medium::Artifact,
         gate: None,
         blurb: "core substrate, dated properly for once. the energy architecture in it is older \
-                than the planet's own record of inventing it. cybertron did not write this \
+                than the planet's own record of inventing it. foundry did not write this \
                 either. it inherited it and stopped asking.",
         links: &[s("architecture_is_machine"), s("asteri_were_not_first")],
     },

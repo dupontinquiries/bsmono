@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn every_phase_of_every_raid_is_plannable() {
         // the content-level promise: whatever arena and weather a phase
-        // landed on, a Cybertronian team can take SOME foothold there.
+        // landed on, a Machine team can take SOME foothold there.
         // This is the check that catches an arena whose sky refuses every
         // site — the class of failure that otherwise shows up as a player
         // staring at REPULSED.
@@ -365,7 +365,7 @@ mod tests {
             for i in 0..p.phases.len() {
                 let r = phase_raid(&p, i);
                 assert!(
-                    takeable(&r.orbit, r.weather, &r.sites, Body::Cybertronian, 14.0),
+                    takeable(&r.orbit, r.weather, &r.sites, Body::Machine, 14.0),
                     "{} phase {} ({}) cannot be entered at all",
                     p.boss.id, i, p.phases[i].arena.id
                 );
@@ -379,7 +379,7 @@ mod tests {
         // roster should be clearable — that is what "authored" means here
         let mut cleared = 0;
         for p in plan_all(2) {
-            let (runs, won) = run_plan(&p, Body::Cybertronian, 14.0, 8, &[Body::Cybertronian; 3]);
+            let (runs, won) = run_plan(&p, Body::Machine, 14.0, 8, &[Body::Machine; 3]);
             if won {
                 cleared += 1;
                 assert_eq!(runs.len(), 3);
@@ -402,7 +402,7 @@ mod tests {
         // The flare arenas do not produce this split (their windows are
         // hours), which is itself worth knowing: the killer is the walk.
         let p = plan_for(boss_by("cherno"), 3, 4);
-        let (_, machine) = run_plan(&p, Body::Cybertronian, 14.0, 4, &[Body::Cybertronian; 3]);
+        let (_, machine) = run_plan(&p, Body::Machine, 14.0, 4, &[Body::Machine; 3]);
         let (runs, suited) = run_plan(&p, Body::HumanSuited, 2.5, 4, &[Body::HumanSuited; 3]);
         assert!(machine, "the machine team should clear the reactor's raid");
         assert!(!suited, "a suited team outran a thermal front on foot");

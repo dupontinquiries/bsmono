@@ -38,7 +38,7 @@
 //! space-rated. Everything else — the wheeled, the walkers, the hollow-body
 //! vehicles this whole game is about — crosses on the ENERGY BRIDGE: a
 //! hard-light span that ASSEMBLES from both ends and meets in the middle,
-//! the way a Cybertronian structure builds itself. The bridge borrows
+//! the way a Machine structure builds itself. The bridge borrows
 //! `airlock.rs`'s size-class lesson verbatim: a personnel span does not
 //! admit a car, so a bridge has a [`Lane`], and a vehicle on a foot lane
 //! is refused with the reason, not wedged. Holding a bridge costs the

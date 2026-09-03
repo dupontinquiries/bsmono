@@ -61,7 +61,7 @@ use crate::survival::{Body, Bunker, Weather};
 use crate::weapons::{Element, Register};
 
 /// The squad's overland speed for the foothold clock, m/s. The same
-/// Cybertronian figure `raidsim` defaults to — if that number moves, move
+/// Machine figure `raidsim` defaults to — if that number moves, move
 /// both toward a shared home rather than letting them drift. `pub` because
 /// the raid flow paces its footholds with the same legs.
 pub const SQUAD_SPEED_MS: f32 = 14.0;
@@ -227,9 +227,9 @@ impl Sortie {
         let sites = sites_for(m);
         let plans: Vec<Plan> = sites
             .iter()
-            .map(|s| foothold::assess(Body::Cybertronian, s, weather, window_s, SQUAD_SPEED_MS))
+            .map(|s| foothold::assess(Body::Machine, s, weather, window_s, SQUAD_SPEED_MS))
             .collect();
-        let site_sel = foothold::choose(Body::Cybertronian, &sites, weather, window_s, SQUAD_SPEED_MS)
+        let site_sel = foothold::choose(Body::Machine, &sites, weather, window_s, SQUAD_SPEED_MS)
             .and_then(|p| plans.iter().position(|q| q.site.approach == p.site.approach))
             .unwrap_or(0);
 

@@ -127,7 +127,7 @@ pub const REFERENCES: &[Reference] = &[
     Reference { what: "the Driller", frame: PRIME, metres: 400.0, kind: Kind::Planetary, note: "length, production estimate; the thing that ate a skyscraper" },
     Reference { what: "the Chicago set piece", frame: PRIME, metres: 2000.0, kind: Kind::Zone, note: "the fought-over stretch of downtown, +/-500 m" },
     Reference { what: "a highway lane (the chase)", frame: PRIME, metres: 3.7, kind: Kind::Intimate, note: "a real lane; the cars are small in it, the robots are not" },
-    Reference { what: "a Cybertron spire", frame: PRIME, metres: 300.0, kind: Kind::Monumental, note: "the space sequence's towers, eyeballed against the Ark" },
+    Reference { what: "a the Foundry spire", frame: PRIME, metres: 300.0, kind: Kind::Monumental, note: "the space sequence's towers, eyeballed against the Ark" },
     Reference { what: "the Ark", frame: PRIME, metres: 300.0, kind: Kind::Monumental, note: "the ship on the moon, +/-100 m" },
     // ---- Interstellar ----
     Reference { what: "the Endurance ring", frame: PERSON, metres: 64.0, kind: Kind::Monumental, note: "diameter, production figure" },

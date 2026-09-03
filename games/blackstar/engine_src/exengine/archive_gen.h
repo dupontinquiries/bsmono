@@ -113,7 +113,7 @@ static const ex_finding_t ex_gen_findings[46] = {
   { "array_reading_one", "shield_edge", "array_logs", EX_MEDIUM_TERMINAL, "the_ashes_court", ex_gen_links_array_reading_one, 1 },
   { "array_reading_two", "shield_edge", "array_logs", EX_MEDIUM_TERMINAL, "the_ashes_court", ex_gen_links_array_reading_two, 2 },
   { "array_reading_three", "shield_edge", "array_logs", EX_MEDIUM_TERMINAL, "the_ashes_court", ex_gen_links_array_reading_three, 2 },
-  { "substrate_sample", "cybertron", "cybertron_core", EX_MEDIUM_ARTIFACT, NULL, ex_gen_links_substrate_sample, 2 },
+  { "substrate_sample", "foundry", "foundry_core", EX_MEDIUM_ARTIFACT, NULL, ex_gen_links_substrate_sample, 2 },
   { "star_chart_return", "earth", "asteri_chart", EX_MEDIUM_ARTIFACT, NULL, ex_gen_links_star_chart_return, 3 },
   { "chart_observation_arc", "earth", "asteri_chart", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_chart_observation_arc, 2 },
   { "modern_solution", "earth", "observatory_solution", EX_MEDIUM_TERMINAL, NULL, ex_gen_links_modern_solution, 2 },

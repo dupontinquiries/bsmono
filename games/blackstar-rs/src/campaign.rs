@@ -150,7 +150,7 @@ pub enum CampEvent {
 // per mission cleared). It is now VALENCE — see `valence.rs` — because
 // the same idea grew more sources (wardens, nightfalls) and a
 // recommendation per film to scale against; one power scalar, one
-// module that owns it, named for what actually fills a Cybertronian.
+// module that owns it, named for what actually fills a Machine.
 
 /// The five machines share one chassis: waves feed a `skirmish::Fight`,
 /// the objective decides what the fighting was FOR.
@@ -621,14 +621,14 @@ impl CampaignLog {
         self.is_cleared("the_drowned_approach")
     }
     /// The shield is fully mapped once Slipstream's Film 2 intel and
-    /// Film 3's own Cybertron archive reveal are both in — the exact
+    /// Film 3's own the Foundry archive reveal are both in — the exact
     /// sequence `TF_ADDITIONAL_SCENE_AIDS.md` section 10 lays out:
-    /// "Cybertron archives — first written reference" comes first,
+    /// "The Foundry archives — first written reference" comes first,
     /// then "Slipstream provides missing coordinates — shield fully
     /// mapped." Neither fact alone is the doc's ending; the archive
     /// without the coordinates is a shape with no location, and the
     /// coordinates without the archive are numbers with no context.
-    /// `beneath_the_pacific` (Film 3, sited on Cybertron) is where the
+    /// `beneath_the_pacific` (Film 3, sited on the Foundry) is where the
     /// archive half of that sequence already happens in this campaign.
     pub fn shield_mapped(&self) -> bool {
         self.slipstream_defected() && self.is_cleared("beneath_the_pacific")
@@ -738,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn the_shield_needs_both_slipstreams_coordinates_and_the_cybertron_archive() {
+    fn the_shield_needs_both_slipstreams_coordinates_and_the_foundry_archive() {
         // TF_ADDITIONAL_SCENE_AIDS.md's own sequence: neither fact
         // alone maps the shield, in either order
         let mut only_archive = CampaignLog::default();
@@ -758,7 +758,7 @@ mod tests {
         let mut only_slipstream = CampaignLog::default();
         only_slipstream.record("the_drowned_approach");
         assert!(only_slipstream.slipstream_defected());
-        assert!(!only_slipstream.shield_mapped(), "the shield mapped without the Cybertron archive");
+        assert!(!only_slipstream.shield_mapped(), "the shield mapped without the Foundry archive");
 
         let mut both = only_archive.clone();
         both.record("the_drowned_approach");

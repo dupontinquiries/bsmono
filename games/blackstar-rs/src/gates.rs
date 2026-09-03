@@ -1,7 +1,7 @@
 //! GATES — buy-a-door map expansion for Escalation, ported from the C
 //! engine's `exengine/gates.h`/`gates.c`.
 //!
-//! Black-Ops-Zombies-style, but Cybertron: the run starts in a small
+//! Black-Ops-Zombies-style, but the Foundry: the run starts in a small
 //! arena, and each gate — once you can afford it — opens permanently
 //! and pushes the playable perimeter outward for the rest of the run,
 //! so the encounter has more room and the spawns range further.

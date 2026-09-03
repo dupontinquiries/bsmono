@@ -199,10 +199,10 @@ pub const FILMS: &[Film] = &[
         theatres: &["earth", "luna", "mars"] },
     Film { n: 2, title: "DOMINION", subtitle: "God of Chaos",
         tone: "occupation; Earth has fallen and the fight is from underneath",
-        theatres: &["earth", "cybertron", "europa"] },
+        theatres: &["earth", "foundry", "europa"] },
     Film { n: 3, title: "DESTINY", subtitle: "The Core",
         tone: "revelation; the shield, the coalition, and why Earth sits at the centre",
-        theatres: &["earth", "cybertron", "shield_edge"] },
+        theatres: &["earth", "foundry", "shield_edge"] },
     Film { n: 4, title: "FIRST LIGHT", subtitle: "Contact and Wonder",
         tone: "exploration; the cosmos is vast and strange and nobody is defending anything",
         theatres: &["glaciem", "helix", "uncharted"] },
@@ -211,7 +211,7 @@ pub const FILMS: &[Film] = &[
         theatres: &["io", "titan", "outer_rim"] },
     Film { n: 6, title: "PHOTON", subtitle: "The Watch's Ceiling",
         tone: "climax; the apex form nobody has fully mapped",
-        theatres: &["shield_edge", "outer_rim", "cybertron"] },
+        theatres: &["shield_edge", "outer_rim", "foundry"] },
 ];
 
 pub fn film(n: u8) -> Option<&'static Film> {
@@ -571,7 +571,7 @@ pub const MISSIONS: &[Mission] = &[
         cast: &[],
         beat: "Blackstar, the Kuiper warlord",
         intro: &[
-            "the frontier is full of cybertron's scattered children -- and their king.",
+            "the frontier is full of foundry's scattered children -- and their king.",
             "blackstar doesn't serve the devourer. he collects what it leaves. he finds hope FUNNY.",
             "his raiders pin the convoy where it drifts. so do not drift.",
         ],
@@ -657,7 +657,7 @@ pub const MISSIONS: &[Mission] = &[
             "prime meets him at the airlock. no speech. two old soldiers, one war left.",
             "the truce is not forgiveness. it is arithmetic. everyone does it silently.",
         ] },
-    Mission { order: 9, id: "beneath_the_pacific", film: 3, dest: "cybertron", site: "the gravity well",
+    Mission { order: 9, id: "beneath_the_pacific", film: 3, dest: "foundry", site: "the gravity well",
         objective: Objective::Eliminate, champion: None,
         cast: &[("keelwright", Presence::Playable), ("cleave", Presence::Seen)],
         beat: "The Unending; the truce; the gravity well",
@@ -738,7 +738,7 @@ pub const MISSIONS: &[Mission] = &[
             "later, alone with aiden: 'i was wrong about one thing. the far-travelers who never came home --",
             "they weren't unprepared because they grew too fast. they were unprepared because they grew alone.'",
         ] },
-    Mission { order: 15, id: "the_heart_of_the_god_machine", film: 6, dest: "cybertron", site: "the spark chamber",
+    Mission { order: 15, id: "the_heart_of_the_god_machine", film: 6, dest: "foundry", site: "the spark chamber",
         objective: Objective::Eliminate, champion: None,
         cast: &[("halyard", Presence::Playable), ("photon", Presence::Seen)],
         beat: "everyone comes; Halyard goes in alone",

@@ -48,7 +48,7 @@
 //! `orbit()` and `survivable()` answer the question this table exists to
 //! ask in the first place: given a real world's real physics, what could
 //! actually stand on it? Not a new model — `survival::habitable_fraction`
-//! already takes a `Body` (Cybertronian / HumanSuited / HumanBare) and a
+//! already takes a `Body` (Machine / HumanSuited / HumanBare) and a
 //! `sun::Orbit` and returns the survivable fraction of the surface; this
 //! only supplies the `Orbit` these four worlds derive to, from real
 //! semi-major axes rather than a generated seed. The bridge is one
@@ -172,7 +172,7 @@ pub fn orbit(w: &ExoWorld) -> Orbit {
 /// What fraction of this world a given body could actually survive on
 /// — `survival::habitable_fraction`, unmodified, fed real orbital
 /// data instead of a generated one. This is the fitness check: whether
-/// a Cybertronian trooper, a suited human, or an unsuited one could
+/// a Machine trooper, a suited human, or an unsuited one could
 /// stand here at all.
 pub fn survivable(w: &ExoWorld, body: Body) -> f32 {
     survival::habitable_fraction(body, &orbit(w))
@@ -266,10 +266,10 @@ mod tests {
         // survival.rs's own headline claim ("a bot stands where a person
         // cannot") checked against real worlds instead of a generated
         // one: every tidally locked, close-in world here should show the
-        // same asymmetry between a Cybertronian's wide thermal band and
+        // same asymmetry between a Machine's wide thermal band and
         // an unsuited human's narrow one
         for w in EXOWORLDS {
-            let bot = survivable(w, Body::Cybertronian);
+            let bot = survivable(w, Body::Machine);
             let bare = survivable(w, Body::HumanBare);
             assert!(bot >= bare, "{}: bot {bot} < bare {bare}, machines should never do worse", w.id);
         }

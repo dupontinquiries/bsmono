@@ -54,7 +54,7 @@ impl BodyFit {
     pub fn accepts(self, b: Body) -> bool {
         match (self, b) {
             (BodyFit::Either, _) => true,
-            (BodyFit::Machine, Body::Cybertronian) => true,
+            (BodyFit::Machine, Body::Machine) => true,
             (BodyFit::Human, Body::HumanSuited | Body::HumanBare) => true,
             _ => false,
         }
@@ -82,7 +82,7 @@ pub const MODS: &[Mod] = &[
 /// How many slots a body has to spend.
 pub fn slot_count(b: Body) -> u8 {
     match b {
-        Body::Cybertronian => 4,
+        Body::Machine => 4,
         Body::HumanSuited => 4,
         Body::HumanBare => 2,
     }
@@ -228,9 +228,9 @@ mod tests {
         let bare = Loadout::default();
         let plated = Loadout { mods: vec![m("ABLATIVE PLATING")] };
         let t = hot.surface_k();
-        assert!(t > bare.envelope(Body::Cybertronian).t_max,
+        assert!(t > bare.envelope(Body::Machine).t_max,
             "{t} K should be past a stock bot's ceiling");
-        assert!(t <= plated.envelope(Body::Cybertronian).t_max,
+        assert!(t <= plated.envelope(Body::Machine).t_max,
             "{t} K should be inside a plated one's");
     }
 
@@ -244,14 +244,14 @@ mod tests {
         ];
         // every legal 4-slot machine loadout
         let mut any_universal = false;
-        let machine: Vec<Mod> = MODS.iter().filter(|x| x.fits.accepts(Body::Cybertronian)).copied().collect();
+        let machine: Vec<Mod> = MODS.iter().filter(|x| x.fits.accepts(Body::Machine)).copied().collect();
         for a in 0..machine.len() {
             for b in a..machine.len() {
                 let l = Loadout { mods: vec![machine[a], machine[b]] };
-                if !l.legal(Body::Cybertronian) {
+                if !l.legal(Body::Machine) {
                     continue;
                 }
-                let e = l.envelope(Body::Cybertronian);
+                let e = l.envelope(Body::Machine);
                 let all = worlds.iter().all(|w| {
                     let t = w.surface_k();
                     t <= e.t_max && t >= e.t_min && w.flare_severity() <= e.flare_tolerance
@@ -269,16 +269,16 @@ mod tests {
         // three mods at two slots each does not fit in four
         let over = Loadout { mods: vec![m("ABLATIVE PLATING"), m("FARADAY LATTICE"), m("OVERRUN GEARING")] };
         assert_eq!(over.slots_used(), 5);
-        assert!(!over.legal(Body::Cybertronian));
+        assert!(!over.legal(Body::Machine));
         // and an illegal loadout gives the BARE envelope rather than a
         // partial fit, so the bug is loud
-        let e = over.envelope(Body::Cybertronian);
-        assert_eq!(e.t_max, Body::Cybertronian.envelope().t_max);
+        let e = over.envelope(Body::Machine);
+        assert_eq!(e.t_max, Body::Machine.envelope().t_max);
     }
 
     #[test]
     fn a_bot_cannot_wear_gene_therapy_and_a_human_cannot_wear_plating() {
-        assert!(!Loadout { mods: vec![m("VASCULAR REWRITE")] }.legal(Body::Cybertronian));
+        assert!(!Loadout { mods: vec![m("VASCULAR REWRITE")] }.legal(Body::Machine));
         assert!(!Loadout { mods: vec![m("ABLATIVE PLATING")] }.legal(Body::HumanSuited));
         assert!(Loadout { mods: vec![m("AEROGEL LINER")] }.legal(Body::HumanSuited));
     }
@@ -300,10 +300,10 @@ mod tests {
     #[test]
     fn mobility_is_reach_in_a_race() {
         let l = Loadout { mods: vec![m("OVERRUN GEARING")] };
-        let fast = l.speed(Body::Cybertronian, 12.0);
+        let fast = l.speed(Body::Machine, 12.0);
         assert!(fast > 12.0);
         // and it does not change what the body can take
-        assert_eq!(l.envelope(Body::Cybertronian).t_max, Body::Cybertronian.envelope().t_max);
+        assert_eq!(l.envelope(Body::Machine).t_max, Body::Machine.envelope().t_max);
     }
 
     #[test]

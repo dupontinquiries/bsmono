@@ -83,7 +83,7 @@ impl Verb {
 
 /// THE TWO REGISTERS a fight is written in. Dark of the Moon's combat is
 /// slow, heavy and consequential — a hit is a stagger, a fall, a section
-/// coming off. War for Cybertron's is fast — a stream of rounds a movie
+/// coming off. War for the Foundry's is fast — a stream of rounds a movie
 /// with plot-armoured leads cannot acknowledge and a game can. The forms
 /// already sit on both ends of that line (PHOTON is 26 impulse every
 /// 2.4 s; WATER is 1.6 every 0.06 s); this names which end each is on,

@@ -59,7 +59,7 @@ pub const CELL_OH: f32 = 60.0;
 pub const BOULEVARD_W_OH: f32 = 8.0;
 /// an archway a Transformer walks under grandly
 pub const ARCH_CLEAR_OH: f32 = 4.0;
-/// spires: Monumental, the Cybertron towers eyeballed at 300 m / 8.5
+/// spires: Monumental, the Foundry towers eyeballed at 300 m / 8.5
 pub const SPIRE_MIN_OH: f32 = 20.0;
 pub const SPIRE_MAX_OH: f32 = 35.0;
 /// a building block: a mass, not a tower

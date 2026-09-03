@@ -178,7 +178,7 @@ pub fn arena_element(arena: &str) -> Element {
         "trench" => Element::Water,
         "shield_edge" => Element::Electric,
         "outer_rim" => Element::Air,
-        "cybertron" => Element::Rock,
+        "foundry" => Element::Rock,
         _ => Element::Water,
     }
 }

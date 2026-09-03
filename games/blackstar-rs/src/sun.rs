@@ -43,7 +43,7 @@ pub fn solar_for(dest: &str) -> Solar {
         "mars" => Solar { day_len: 260.0, max: 0.60, ..Solar::default() },
         "carrion" => Solar { day_len: 200.0, max: 0.58, ..Solar::default() },
         "helix" => Solar { day_len: 280.0, max: 0.55, ..Solar::default() },
-        "cybertron" => Solar { day_len: 220.0, ..Solar::default() },
+        "foundry" => Solar { day_len: 220.0, ..Solar::default() },
         _ => Solar::default(),
     }
 }

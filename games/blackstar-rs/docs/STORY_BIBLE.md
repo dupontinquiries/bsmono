@@ -348,7 +348,7 @@ new evidence table.
 - **VOLTAGE** — charm and electromagnetics; reads rooms and power draw first.
 - **KINETIC** — reads movement, distance, and what left.
 - **THE ARCHIVIST** — the villain campaign. He already knows; he is checking
-  whether you do. (A nod to War for Cybertron / Fall of Cybertron letting you
+  whether you do. (A nod to War for the Foundry / Fall of the Foundry letting you
   run the other side; see `docs/WFC_FOC_RESEARCH.md` in the C tree.)
 
 Reading coverage is **deliberately partial**. Four voices across every finding
@@ -652,10 +652,10 @@ nothing; the distribution means a great deal, because the placement rules were
 written against the film material's geography and reading them back gives
 statements nobody typed.
 
-- **All 56 unrecorded shapes are on Cybertron, and every one is Corrupted.**
+- **All 56 unrecorded shapes are on the Foundry, and every one is Corrupted.**
   Their shared hook — *"a shape the coalition has no record of"* — is already
   a provenance statement. `substrate_sample` says from the other direction
-  that Cybertron's architecture is older than its own record of inventing it.
+  that the Foundry's architecture is older than its own record of inventing it.
 - **All 46 on Earth are Coalition, and all road vehicles.** Cars, trucks,
   racers, a few helicopters. Nothing that could not be parked. Concealment as
   a demographic fact, and the first thing a human investigator notices.

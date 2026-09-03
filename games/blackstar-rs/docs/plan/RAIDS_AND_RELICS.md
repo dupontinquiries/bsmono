@@ -22,7 +22,7 @@ raid-bosses
 ├── Sphere Robot.zip
 └── titan_cameraman_3.0_what_if....zip
 
-If these are meant to feel like ancient Cybertronian relics rather than simply "big enemies," a useful theme is that each raid boss is not merely a machine—it is an archaeological discovery. Millions of years after the Collapse, drifting fleets discover dormant war engines scattered between galaxies, each built for a purpose that no longer exists. Most are partly sentient because Cybertronian technology imprints memory into its alloys. Every boss tells part of the history of an ancient civilization.
+If these are meant to feel like ancient Machine relics rather than simply "big enemies," a useful theme is that each raid boss is not merely a machine—it is an archaeological discovery. Millions of years after the Collapse, drifting fleets discover dormant war engines scattered between galaxies, each built for a purpose that no longer exists. Most are partly sentient because Machine technology imprints memory into its alloys. Every boss tells part of the history of an ancient civilization.
 
 Astro Armor Titan Speakerman
 "The Last Resonance"
@@ -60,7 +60,7 @@ His answer:
 
 planet-scale modular organisms.
 
-Rather than constructing cities, he built giant Cybertronians whose organs were entire factories.
+Rather than constructing cities, he built giant Machines whose organs were entire factories.
 
 Every limb contained:
 
@@ -71,7 +71,7 @@ nanite oceans
 
 Destroying one only caused it to rebuild itself.
 
-Only the destruction of Cybertron halted the project.
+Only the destruction of the Foundry halted the project.
 
 The prototype drifted unfinished into dark space.
 
@@ -138,7 +138,7 @@ Some worlds screamed.
 
 Others contained machinery.
 
-Ancient logs mention structures older than Cybertron itself buried inside planetary cores.
+Ancient logs mention structures older than the Foundry itself buried inside planetary cores.
 
 Gigadrill disappeared after drilling into something beneath a rogue planet.
 
@@ -168,7 +168,7 @@ Nearby moons experience mysterious tides whenever it awakens.
 Hussar Tank
 "The Charge"
 
-Built by an order of Cybertronian knights.
+Built by an order of Machine knights.
 
 Unlike modern tanks...
 
@@ -209,7 +209,7 @@ Ancient civilizations still orbit as asteroid belts.
 Primitive Mantis Mech
 "The First Hunter"
 
-One of the earliest Cybertronians.
+One of the earliest Machines.
 
 Before language.
 
@@ -339,7 +339,7 @@ Trenchmaster
 
 Created for abyssal wars.
 
-Most Cybertronians fear deep oceans.
+Most Machines fear deep oceans.
 
 Trenchmaster considered them highways.
 
@@ -389,7 +389,7 @@ Every photon they captured was permanently stored in quantum crystal memory.
 
 This Titan remembers:
 
-Cybertron's birth
+the Foundry's birth
 the first Prime
 extinct galaxies
 forgotten species
@@ -454,7 +454,7 @@ Across all of these relics is engraved the same impossibly ancient glyph:
 
 "The Ninth Forge Sleeps."
 
-No historical database can translate it. The glyph predates Cybertronian civilization itself.
+No historical database can translate it. The glyph predates Machine civilization itself.
 
 As players defeat each raid boss, they recover fragmented "Memory Shards." Individually they are meaningless, but together they reveal a chilling truth: none of these machines were the greatest weapons ever built. They were wardens, builders, archivists, judges, colonizers, communicators, and seals—parts of a vast interstellar system created to contain something buried long before the first Transformer transformed.
 
@@ -558,7 +558,7 @@ Layer 3 — Expedition Outposts
 
 Instead of building everywhere...
 
-Players establish temporary Cybertronian outposts.
+Players establish temporary Machine outposts.
 
 Space Bridge Anchor
 
@@ -760,7 +760,7 @@ abandoned assembly lines
 
 Every system tells a story.
 
-Layer 11 — Recovering Cybertron
+Layer 11 — Recovering the Foundry
 
 Imagine eventually reaching a completely dead world.
 
@@ -822,7 +822,7 @@ You
 
 get stronger sword
 
-For example, defeating the Scorpion Commander might not just unlock a drone factory ability. It could unlock the ability to manufacture autonomous construction units for your expedition. Those units can establish forward outposts in newly discovered systems, repair derelict space bridges, harvest asteroid resources while you're away, or even slowly reconstruct abandoned Cybertronian facilities over days.
+For example, defeating the Scorpion Commander might not just unlock a drone factory ability. It could unlock the ability to manufacture autonomous construction units for your expedition. Those units can establish forward outposts in newly discovered systems, repair derelict space bridges, harvest asteroid resources while you're away, or even slowly reconstruct abandoned Machine facilities over days.
 
 Similarly, recovering the Speakerman's technology might let your expedition deploy long-range resonance beacons. At first they simply reveal hidden caches. Later, a network of them can triangulate faint signals from relics buried inside rogue planets or drifting inside nebulae, opening entirely new patrol regions.
 
@@ -880,7 +880,7 @@ It becomes part of the living universe.
 
 Activity: Salvage Expedition
 
-An old Cybertronian convoy is drifting.
+An old Machine convoy is drifting.
 
 No enemies.
 
@@ -1185,7 +1185,7 @@ For example:
 Blink Drive lets you cross broken bridges, solve traversal puzzles, and shave seconds off race times.
 Armor Lock lets you act as a temporary anchor for collapsing structures or survive environmental hazards while teammates complete repairs.
 Drone Factory can fabricate repair drones, survey drones, or construction drones—not just combat minions.
-Soundwave Resonator can activate ancient resonance locks, tune giant machinery, or communicate with dormant Cybertronian systems.
+Soundwave Resonator can activate ancient resonance locks, tune giant machinery, or communicate with dormant Machine systems.
 Growth Matrix lets you move massive debris, hold open blast doors, or serve as a living bridge.
 Hover Wheels make you the ideal courier across difficult terrain.
 Thermal Core can reignite dormant foundries or melt sealed entrances.
@@ -1599,4 +1599,4 @@ Population vanished
 
 Now you explore silent medical facilities, rescue dormant maintenance bots, restore life support, and uncover logs hinting at why the evacuation never finished.
 
-The procedural generation is no longer "random rocks and enemies." It's generating forgotten stories. That fits remarkably well with your relic concept because every expedition feels like uncovering another lost chapter of Cybertronian history rather than simply entering another combat arena.
+The procedural generation is no longer "random rocks and enemies." It's generating forgotten stories. That fits remarkably well with your relic concept because every expedition feels like uncovering another lost chapter of Machine history rather than simply entering another combat arena.

@@ -113,7 +113,7 @@ impl World {
         if self.orbit.surface() == Surface::Molten {
             return false;
         }
-        habitable_fraction(Body::Cybertronian, &self.orbit) > 0.0
+        habitable_fraction(Body::Machine, &self.orbit) > 0.0
     }
 
     /// Generate until a seed produces somewhere enterable. A destination the
@@ -328,7 +328,7 @@ mod tests {
         for s in 1..90u32 {
             let w = World::generate_viable(s);
             let r = raid_for(&w, "GEN");
-            let out = run(&r, Body::Cybertronian, 14.0, s, &[Body::Cybertronian]);
+            let out = run(&r, Body::Machine, 14.0, s, &[Body::Machine]);
             if out.phase == Phase::Extracted {
                 extracted += 1;
                 if out.drop.is_some() {

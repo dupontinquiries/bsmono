@@ -511,7 +511,7 @@ pub const WEAPONS: [WeaponSpec; 7] = [
     // outright trademark; "VALENCEEDGE" borrows Transformers' own
     // "Valence" term, which this project already avoids putting in a
     // player-visible name for exactly this reason (see the
-    // Cybertronian/raid-boss naming elsewhere, which is inherited
+    // Machine/raid-boss naming elsewhere, which is inherited
     // scope, not a precedent to add to on purpose). Rather than pick a
     // third name and risk the same mistake, the person asked to keep
     // this generic until they've checked their own design notes —

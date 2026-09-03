@@ -72,8 +72,26 @@ mod tests {
     /// identifier form come down in different commits and collapsing them
     /// would hide which half moved.
     const CENSUS: &[(&str, usize)] = &[
-        ("Cybertron", 152),
-        ("cybertron", 117),
+        // Cybertron was really THREE things and needed three answers.
+        //
+        // `Cybertronian` (126) was an adjective and a type — `Body::Machine`
+        // now, and `machine.rs`. The type system should not take a side in a
+        // naming dispute the fiction is about.
+        //
+        // `Cybertron` the PLACE (137) is `the Foundry` in prose and `foundry`
+        // as a site id: what humans called a dead machine world when they
+        // found it, obviously wrong and obviously evocative, which is the
+        // Directorate's whole habit. The Enduring themselves still just call
+        // it home, lowercase, untranslated.
+        //
+        // The residue is ASSET FILENAMES — `transformers_fall_of_cybertron_ark`
+        // and friends, real files on disk naming a real game. Same category as
+        // the decepticon tank below: shielded from the sweep, and the reason
+        // this term can never reach zero.
+        ("Cybertron", 0),
+        ("cybertron", 3),
+        ("Cybertronian", 0),
+        ("cybertronian", 0),
         // DONE, and held at zero so a reintroduction fails rather than passing
         // silently. energon -> valence; Optimus Prime -> Keelwright;
         // Megatron -> Cleave; Jhiaxus -> Assay; Rodimus -> Halyard.
@@ -249,14 +267,33 @@ mod tests {
     #[test]
     fn the_census_is_measuring_a_real_tree() {
         // A walk that silently found nothing would make every count zero and
-        // every assertion pass. Anchor on something that must exist.
-        let now = census();
-        let total: usize = now.iter().map(|(_, n)| n).sum();
-        // Lowered from 400 as the debt came down. The anchor exists to catch a
-        // walk that found nothing, not to assert a debt level; Cybertron alone
-        // is still 269 of it.
-        assert!(total > 200, "census total {total} — the walk probably missed the tree");
-        let cyber = now.iter().find(|(t, _)| *t == "Cybertron").unwrap().1;
-        assert!(cyber > 0, "no occurrences of the most common term; walk is broken");
+        // every assertion in this module pass.
+        //
+        // The first two versions of this anchored on the DEBT — "total > 400",
+        // then "> 200" — and both were wrong in the same way: they conflate
+        // "the walk works" with "the cleanup is unfinished". The debt fell from
+        // ~680 to 51 and the anchor failed while nothing was broken, which is a
+        // test reporting its own obsolescence as a defect.
+        //
+        // A positive control is the right shape. Count a word that is this
+        // universe's OWN vocabulary, is everywhere, and will never be removed.
+        // It goes to zero only if the walk is broken.
+        let dir = Path::new("src");
+        assert!(dir.is_dir());
+        let mut stack = vec![dir.to_path_buf()];
+        let (mut files, mut control) = (0usize, 0usize);
+        while let Some(p) = stack.pop() {
+            for e in fs::read_dir(&p).expect("read_dir").flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    files += 1;
+                    control += fs::read_to_string(&path).expect("read").matches("Coalition").count();
+                }
+            }
+        }
+        assert!(files > 100, "walked only {files} sources");
+        assert!(control > 20, "found only {control} uses of the game's own vocabulary");
     }
 }

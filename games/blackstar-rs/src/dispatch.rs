@@ -208,7 +208,7 @@ mod tests {
         // "Titan" greyed out teaches nothing; "Titan — out of range" teaches
         // the whole system
         let c = Condition::intact(&ship());
-        let b = board(&worlds(), 1.0, &Drive::default(), &c, &[Body::Cybertronian], &[]);
+        let b = board(&worlds(), 1.0, &Drive::default(), &c, &[Body::Machine], &[]);
         let pluto = b.iter().find(|o| o.dest.name == "PLUTO").unwrap();
         assert!(!pluto.open());
         assert!(!pluto.blocked.unwrap().reason().is_empty());
@@ -225,7 +225,7 @@ mod tests {
         let c = Condition::intact(&ship());
         // just enough to get out to Europa and not back
         let tight = Drive { dv_kms: 15.2, supply_s: 40.0 * 3600.0, ..Drive::default() };
-        let o = assess(&worlds()[1], 1.0, &tight, &c, &[Body::Cybertronian], &[]);
+        let o = assess(&worlds()[1], 1.0, &tight, &c, &[Body::Machine], &[]);
         assert!(o.leg.reachable, "the outbound alone should be fine");
         assert_eq!(o.blocked, Some(Blocked::OneWay));
     }
@@ -243,8 +243,8 @@ mod tests {
                 *cond = 0.0;
             }
         }
-        let a = assess(&worlds()[1], 1.0, &d, &good, &[Body::Cybertronian], &[]);
-        let b = assess(&worlds()[1], 1.0, &d, &holed, &[Body::Cybertronian], &[]);
+        let a = assess(&worlds()[1], 1.0, &d, &good, &[Body::Machine], &[]);
+        let b = assess(&worlds()[1], 1.0, &d, &holed, &[Body::Machine], &[]);
         assert!(a.open(), "an intact ship should reach Europa");
         assert!(!b.open(), "a holed one should not");
     }
@@ -258,7 +258,7 @@ mod tests {
         // and a machine can stand there, so the same world opens for a
         // different crew — which is the campaign's premise showing up in a
         // menu rather than in prose
-        let bot = assess(&worlds()[3], 1.0, &d, &c, &[Body::Cybertronian], &[]);
+        let bot = assess(&worlds()[3], 1.0, &d, &c, &[Body::Machine], &[]);
         assert_ne!(bot.blocked, Some(Blocked::Lethal));
     }
 
@@ -269,10 +269,10 @@ mod tests {
         let mars = worlds()[0];
         let pays = demanded(&mars.orbit);
         let other = if pays == Effect::ColdFloor { Effect::HeatCeiling } else { Effect::ColdFloor };
-        let o = assess(&mars, 1.0, &d, &c, &[Body::Cybertronian], &[other]);
+        let o = assess(&mars, 1.0, &d, &c, &[Body::Machine], &[other]);
         assert_eq!(o.blocked, Some(Blocked::Pointless));
         // and asking for what it pays opens it
-        let want = assess(&mars, 1.0, &d, &c, &[Body::Cybertronian], &[pays]);
+        let want = assess(&mars, 1.0, &d, &c, &[Body::Machine], &[pays]);
         assert!(want.open());
     }
 
@@ -281,7 +281,7 @@ mod tests {
         // a menu should teach: a range problem is one upgrade away, a lethal
         // world is not, so they sort in that order
         let c = Condition::intact(&ship());
-        let b = board(&worlds(), 1.0, &Drive::default(), &c, &[Body::Cybertronian], &[]);
+        let b = board(&worlds(), 1.0, &Drive::default(), &c, &[Body::Machine], &[]);
         let first_closed = b.iter().position(|o| !o.open()).unwrap_or(b.len());
         assert!(b[..first_closed].iter().all(|o| o.open()));
         assert!(b[first_closed..].iter().all(|o| !o.open()));
@@ -297,8 +297,8 @@ mod tests {
         let c = Condition::intact(&ship());
         let fat = Drive { dv_kms: 60.0, supply_s: 200.0 * 3600.0, ..Drive::default() };
         let lean = Drive { supply_s: 2.2 * 3600.0, ..fat };
-        let a = assess(&worlds()[1], 1.0, &fat, &c, &[Body::Cybertronian], &[]);
-        let b = assess(&worlds()[1], 1.0, &lean, &c, &[Body::Cybertronian], &[]);
+        let a = assess(&worlds()[1], 1.0, &fat, &c, &[Body::Machine], &[]);
+        let b = assess(&worlds()[1], 1.0, &lean, &c, &[Body::Machine], &[]);
         assert!(a.value > b.value, "fat {} lean {}", a.value, b.value);
     }
 }

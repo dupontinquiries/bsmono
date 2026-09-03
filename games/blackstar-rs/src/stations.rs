@@ -2059,7 +2059,7 @@ mod tests {
         use crate::patrol::{beyond_sol, ROUTE};
         let named = [
             "earth", "mars", "luna", "europa", "io", "titan", "pluto", "outer_rim",
-            "glaciem", "carrion", "helix", "cybertron", "uncharted", "shield_edge",
+            "glaciem", "carrion", "helix", "foundry", "uncharted", "shield_edge",
             "trappist1e", "trappist1g", "proxima_b", "kepler186f",
         ];
         assert!(!ROUTE.is_empty(), "the route table is empty; this test proves nothing");
@@ -2072,7 +2072,7 @@ mod tests {
         }
         // and the split is real in both directions
         assert!(!beyond_sol("earth") && !beyond_sol("pluto"), "Sol is not in Sol");
-        assert!(beyond_sol("cybertron") && beyond_sol("glaciem"), "the bridge worlds are in Sol");
+        assert!(beyond_sol("foundry") && beyond_sol("glaciem"), "the bridge worlds are in Sol");
     }
 
     #[test]
@@ -2130,7 +2130,7 @@ mod tests {
         let mut sb = board();
         assert!(!sb.unrestricted(), "the master ship is on by default");
         // fresh save: everything shut
-        assert!(!gate_open_for("cybertron", &sb), "precondition");
+        assert!(!gate_open_for("foundry", &sb), "precondition");
         let next = sb.raids.next_up().expect("a ladder").id;
         assert!(
             matches!(apply(Station::Wardeck, &Event::Pressed(next), &mut sb, 4), Some(Order::Did(_))),
@@ -2138,7 +2138,7 @@ mod tests {
         );
 
         sb.debug_ship = true;
-        assert!(gate_open_for("cybertron", &sb), "an extra-solar world stayed shut");
+        assert!(gate_open_for("foundry", &sb), "an extra-solar world stayed shut");
         assert!(gate_open_for("trappist1e", &sb), "an exoworld stayed shut");
         assert!(gate_open_for("earth", &sb), "the master ship closed Sol");
         assert_eq!(
@@ -2154,11 +2154,11 @@ mod tests {
         // leaving Sol needs the bridge, and the bridge was shut because an
         // infestation was loose in the system.
         let mut sb = board();
-        // a mission HAS reached Cybertron, which is what used to be enough
+        // a mission HAS reached the Foundry, which is what used to be enough
         sb.camp.record("beneath_the_pacific");
         assert!(!crate::patrol::bridge_powered(&sb.camp), "the bridge is already powered?");
         assert!(
-            !gate_open_for("cybertron", &sb),
+            !gate_open_for("foundry", &sb),
             "an extra-solar destination opened with the bridge dark"
         );
         // and Sol is unaffected — the gate must not strand the player at home
@@ -2175,7 +2175,7 @@ mod tests {
         sb.camp.record("beneath_the_pacific");
         sb.camp.record(crate::patrol::BRIDGE_SAFE_AFTER);
         assert!(crate::patrol::bridge_powered(&sb.camp));
-        assert!(gate_open_for("cybertron", &sb), "Assay is dead and the bridge is still shut");
+        assert!(gate_open_for("foundry", &sb), "Assay is dead and the bridge is still shut");
         // the bridge alone is not a route: nothing has reached Helix
         assert!(
             !gate_open_for("helix", &sb),

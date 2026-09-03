@@ -112,8 +112,8 @@ pub fn beyond_sol(id: &str) -> bool {
     match id {
         // Sol: Earth and its neighbours, out to the rim
         "earth" | "mars" | "luna" | "europa" | "io" | "titan" | "pluto" | "outer_rim" => false,
-        // the clone homeworlds and Cybertron — reachable only by bridge
-        "glaciem" | "carrion" | "helix" | "cybertron" => true,
+        // the clone homeworlds and the Foundry — reachable only by bridge
+        "glaciem" | "carrion" | "helix" | "foundry" => true,
         // the catalogued exoplanets (exoworlds.rs). Tens of light years out:
         // beyond Sol by a margin nothing else on this list approaches.
         "trappist1e" | "trappist1g" | "proxima_b" | "kepler186f" => true,
@@ -219,9 +219,9 @@ pub const ROUTE: &[Destination] = &[
             "Charon fills a third of the sky"
         ],
     },
-    Destination { id: "cybertron", name: "CYBERTRON", terrain: Terrain::Surface, gravity: 1.15, weather: false,
+    Destination { id: "foundry", name: "CYBERTRON", terrain: Terrain::Surface, gravity: 1.15, weather: false,
         hostiles: Faction::Corrupted,
-        note: "the Silent Century — Cybertron went dark; no record says why",
+        note: "the Silent Century — the Foundry went dark; no record says why",
         sky: Sky::Vacuum, day_len: 0.0, ambient: &[
             "a forge-song, one voice, a thousand cities gone", 
             "the Silent Century left no record of why", 
@@ -408,12 +408,12 @@ pub struct Tick {
 /// The archive drip. Fourteen lines carried over verbatim in spirit — the
 /// war, the older strata, and the clone lines' homeworlds.
 pub const ARCHIVE: &[&str] = &[
-    "ARCHIVE: the energy signature matches ancient Cybertronian records",
+    "ARCHIVE: the energy signature matches ancient Machine records",
     "ARCHIVE: the Fallen's war fleet seeded an valence cache deep in Earth's mantle",
     "ARCHIVE: the bunker was built over an ancient site — near the Unending's core",
     "ARCHIVE: before the war there was the Age of Foundries — a thousand cities, one forge-song",
     "ARCHIVE: the First Bridge era — when the gates opened and every world was a doorway",
-    "ARCHIVE: the Silent Century — Cybertron went dark; no record says why",
+    "ARCHIVE: the Silent Century — the Foundry went dark; no record says why",
     "ARCHIVE: Europa listening post, final log — 'something answered from below the ice'",
     "ARCHIVE: Io's tide-forges never cool; the magma-clone fires burn since before the war",
     "ARCHIVE: Titan tithe-ledger — the clans tax the only world where fuel falls as rain",

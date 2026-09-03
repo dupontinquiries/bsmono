@@ -387,7 +387,7 @@ pub struct Balance {
 /// GRAVITY FEEDBACK, and it is why the same frame is a different design on
 /// two worlds. An inverted pendulum falls in about `sqrt(h/g)`, so on Titan
 /// at a fifth of Earth's pull a top-heavy thing has more than twice as long
-/// to catch itself — a frame that is unusable on Cybertron is fine out on the
+/// to catch itself — a frame that is unusable on the Foundry is fine out on the
 /// rim. `scale.rs` already knows what a frame is; this says whether it can
 /// stand on the world it is standing on.
 pub fn topple_time_s(b: &Balance, gravity_ms2: f32) -> f32 {
@@ -741,7 +741,7 @@ pub fn run() {
 
     println!("  AND GRAVITY DECIDES WHERE A DESIGN IS USABLE\n");
     let b = balance(&topheavy);
-    for (w, g) in [("cybertron", 9.8f32), ("mars", 3.7), ("titan", 1.35)] {
+    for (w, g) in [("foundry", 9.8f32), ("mars", 3.7), ("titan", 1.35)] {
         println!("    {:<10} {:>5.1} m/s^2   {:.2}s to topple", w, g, topple_time_s(&b, g));
     }
     println!("\n    the same top-heavy frame is unusable at home and fine on the rim.");
@@ -910,7 +910,7 @@ mod tests {
     fn no_family_is_purely_anatomical_and_most_are_mostly_guts() {
         // A finding, not a defect. Every one of the fourteen is mostly TORSO
         // or mostly TRIM, because they are SHAPE families and the limbs of a
-        // Cybertronian are shaped like its trunk. That is why a single home
+        // Machine are shaped like its trunk. That is why a single home
         // region was the wrong model: it collapses a many-to-many
         // relationship onto whichever region happened to win.
         // Stated as anatomical SHARE rather than as an argmax, because the
@@ -1182,9 +1182,9 @@ mod tests {
         let mut topheavy = frame();
         topheavy[1].mass_frac = 2.5;
         let b = balance(&topheavy);
-        let cybertron = topple_time_s(&b, 9.8);
+        let foundry = topple_time_s(&b, 9.8);
         let titan = topple_time_s(&b, 1.35);
-        assert!(titan > cybertron * 2.0, "titan {titan:.2}s vs cybertron {cybertron:.2}s");
+        assert!(titan > foundry * 2.0, "titan {titan:.2}s vs foundry {foundry:.2}s");
         // and a steady frame has longer everywhere
         let steady = {
             let mut p = vec![torso()];

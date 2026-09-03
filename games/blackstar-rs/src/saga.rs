@@ -85,7 +85,7 @@ pub static FILM_01_DOOMSDAY: FilmEntry = FilmEntry {
          call to action.",
         "The descent: Halyard enters the Unending's interior through a volcanic fissure. He saves Keelwright. In \
          doing so, he triggers the Matrix transformation and becomes Halyard Prime.",
-        "The core: Humans sheltering in a Cybertronian bunker. Halyard channels the Matrix into the Unending's \
+        "The core: Humans sheltering in a Machine bunker. Halyard channels the Matrix into the Unending's \
          spark, placing the god in dormancy. Earth stabilizes. Cleave dies holding back collapsing plates."
     ],
     emotional_core: "The passing of power from Keelwright (age, wisdom, price of leadership) to Halyard \
@@ -158,7 +158,7 @@ pub static FILM_03_DESTINY: FilmEntry = FilmEntry {
     introduces: &[
         "Assay (corrupted)",
         "The Corrupted faction",
-        "Cybertronian infection mechanics",
+        "Machine infection mechanics",
         "The sealed archives beneath the Unending"
     ],
     resolves: &["Blackstar's intentions become partially visible", "Assay' arc completed"],
@@ -186,7 +186,7 @@ pub static FILM_04_FIRST_LIGHT: FilmEntry = FilmEntry {
          that don't exist inside the shield. Distances that feel wrong. Aiden becomes the first human to witness \
          the outer cosmos.",
         "The Morpher initiates first contact with full transparency: he has guarded this boundary for longer than \
-         Cybertron's entire recorded history. His Watch—an artifact of unknown origin—allows him to embody twelve \
+         the Foundry's entire recorded history. His Watch—an artifact of unknown origin—allows him to embody twelve \
          elemental forms. He demonstrates Water, Fire, Titanium. A thirteenth form exists—Photon Man—but he has \
          only accessed it once, accidentally, and cannot control it.",
         "Hijack scouts appear to test the shield's new weakness. They fight without ideology, only data-gathering. \
@@ -342,7 +342,7 @@ pub static FILM_07_RESTORATION: FilmEntry = FilmEntry {
          The inner planets form a resonant pattern. The outer planets form a different pattern. The asteroid belt \
          and Oort cloud are not debris—they are stabilizers.",
         "Hijack operatives, now understood as non-hostile, propose a joint restoration project. The solar system \
-         was damaged in an ancient conflict—one that predates Cybertron, predates the Asteri, possibly predates \
+         was damaged in an ancient conflict—one that predates the Foundry, predates the Asteri, possibly predates \
          organic life. It can be repaired, but the work requires both Hijack technical knowledge and the moral authority \
          of the Transformers and humans.",
         "Blackstar reappears—he has been on the Matter Transformation Planet the whole time, also searching, also \
@@ -503,7 +503,7 @@ pub static AIDEN_ARC: CharacterArc = CharacterArc {
     arc_complete_film: 9,
     codex_entry_id: "aiden_human_witness",
     key_moments: &[
-        "Film 1: First witness to the Unending's dormancy; shelter in the Cybertronian bunker",
+        "Film 1: First witness to the Unending's dormancy; shelter in the Machine bunker",
         "Film 2: Named as human liaison; begins learning Transformer history",
         "Film 4: First human to cross the shield boundary; existential realization of hidden history",
         "Film 6: Watches the Morpher access Photon Man; accepts that scale matters more than power",
