@@ -295,7 +295,15 @@ python3 maintenance/tools/archive_check.py # maintenance/archive/ provenance hea
 python3 maintenance/tools/aarch64_flags_check.py  # committed CPU flags vs the weakest target
 python3 maintenance/tools/eframe_backend_check.py . # eframe backends chosen, not inherited (glow, or wgpu with visible intent)
 python3 maintenance/tools/voiceprint_parity_check.py . # voiceterm's fingerprint/compute_mfcc vs shared/voiceprint-kit's copy
+python3 maintenance/tools/font_install_check.py . # every egui app reaches uikit-egui's fonts::install, or its symbol glyphs are boxes
 ```
+
+`font_install_check.py` exists because shipping the symbol fonts fleet-wide
+(`7098bc4a`) fixed only the apps that CALL `apply_palette`, and switcheroo did
+not — it was the one egui app with no `uikit-egui` dependency, so `★`, `☆` and
+`↻` rendered as boxes there while working everywhere else. Nothing flagged it;
+it was found by reading that app's colours for an unrelated reason. Ten more
+crates are in the same state and listed in the checker's `KNOWN_MISSES`.
 
 `voiceprint_parity_check.py` exists because voiceprint-kit is a straight copy
 of voiceterm's own fingerprint code (`pub(crate)` widened to `pub`), not a
