@@ -458,3 +458,150 @@ mod tests {
         assert!(!out.collapses_touch_bar, "opening a tab is not typing");
     }
 }
+
+#[cfg(test)]
+mod headless_tests {
+    //! The input path driven by a REAL egui context.
+    //!
+    //! Everything above tests the encoder with synthetic `Key` values.
+    //! Six bugs in this path this session were not in the encoder — they
+    //! were in who reads the events, what mode is passed, and whether
+    //! anyone else read them too. None of that is reachable from a unit
+    //! test on `encode`.
+    //!
+    //! egui needs no window to lay out a frame, so the whole reader can
+    //! run here: build a `RawInput` with the events a keyboard would
+    //! produce, run one frame, and look at the bytes.
+
+    use super::*;
+
+    const PLAIN: TermMode = TermMode { app_cursor: false, bracketed_paste: false };
+    const APP: TermMode = TermMode { app_cursor: true, bracketed_paste: false };
+
+    /// Run one frame with `events` and return what the drain produced.
+    fn drive(events: Vec<egui::Event>, mode: TermMode) -> Vec<Outcome> {
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.events = events;
+        let got = std::cell::RefCell::new(Vec::new());
+        ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                *got.borrow_mut() = drain_egui(ui, mode, false);
+            });
+        });
+        got.into_inner()
+    }
+
+    fn bytes(outs: &[Outcome]) -> Vec<u8> {
+        outs.iter().flat_map(|o| o.bytes.clone()).collect()
+    }
+
+    fn text(s: &str) -> egui::Event {
+        egui::Event::Text(s.into())
+    }
+    fn key(k: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn typing_a_word_produces_each_character_exactly_once() {
+        // The doubling bug's shape: egui delivers BOTH a Text event and
+        // a Key event for a printable character, and taking both sends
+        // every letter twice.
+        let outs = drive(vec![text("l"), key(egui::Key::L), text("s"), key(egui::Key::S)], PLAIN);
+        assert_eq!(bytes(&outs), b"ls", "each character exactly once");
+    }
+
+    #[test]
+    fn enter_sends_carriage_return_not_a_line_feed() {
+        let outs = drive(vec![key(egui::Key::Enter)], PLAIN);
+        assert_eq!(bytes(&outs), b"\r", "a shell sees \\n as a line feed, not a submit");
+    }
+
+    #[test]
+    fn a_whole_command_comes_out_once_through_the_real_reader() {
+        let mut evs = Vec::new();
+        for c in "ls -la".chars() {
+            evs.push(text(&c.to_string()));
+        }
+        evs.push(key(egui::Key::Enter));
+        assert_eq!(bytes(&drive(evs, PLAIN)), b"ls -la\r");
+    }
+
+    #[test]
+    fn the_mode_argument_actually_reaches_the_encoder() {
+        // The bug: the call site passed TermMode::default(), so the
+        // app-cursor branch was correct and unreachable. This drives the
+        // same function the binary calls, with each mode.
+        assert_eq!(bytes(&drive(vec![key(egui::Key::ArrowUp)], PLAIN)), b"\x1b[A");
+        assert_eq!(bytes(&drive(vec![key(egui::Key::ArrowUp)], APP)), b"\x1bOA");
+    }
+
+    #[test]
+    fn backspace_is_del_through_the_real_path() {
+        assert_eq!(bytes(&drive(vec![key(egui::Key::Backspace)], PLAIN)), b"\x7f");
+    }
+
+    #[test]
+    fn ctrl_c_arrives_as_the_interrupt_byte() {
+        let ev = egui::Event::Key {
+            key: egui::Key::C,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        assert_eq!(bytes(&drive(vec![ev], PLAIN)), b"\x03");
+    }
+
+    #[test]
+    fn a_key_release_sends_nothing() {
+        let ev = egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert!(bytes(&drive(vec![ev], PLAIN)).is_empty());
+    }
+
+    #[test]
+    fn a_focused_text_field_takes_the_keyboard() {
+        // The gate that was missing: this reads raw context events, so
+        // without it a search query typed into a TextEdit also went to
+        // the shell.
+        let ctx = egui::Context::default();
+        let mut buf = String::new();
+        let id = egui::Id::new("a-field");
+
+        // Frame 1: create the field and give it focus.
+        let mut raw = egui::RawInput::default();
+        ctx.run(raw.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut buf).id(id));
+                r.request_focus();
+            });
+        });
+
+        // Frame 2: type, with the field still focused.
+        raw.events = vec![text("l"), text("s")];
+        let got = std::cell::RefCell::new(Vec::new());
+        ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut buf).id(id));
+                *got.borrow_mut() = drain_egui(ui, PLAIN, false);
+            });
+        });
+        assert!(
+            bytes(&got.into_inner()).is_empty(),
+            "a focused field owns the keyboard; the shell must not also see it"
+        );
+    }
+}
