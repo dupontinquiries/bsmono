@@ -72,6 +72,9 @@ struct Common {
     /// Activation sets in flight per GPU upscaler (uploads/readbacks overlap compute).
     #[arg(long, default_value_t = 2)]
     inflight: usize,
+    /// Conv kernel: rt4 (4x4 px per thread) | rt2 (2x2). Both bit-exact; `bench` compares speed.
+    #[arg(long, default_value = "rt4")]
+    kernel: String,
     /// Frames whose residuals share one GPU call.
     #[arg(long, default_value_t = 4)]
     batch: usize,
@@ -140,6 +143,20 @@ enum Cmd {
     },
     /// List GPU adapters.
     Probe,
+    /// Time the network on full-size tiles on this GPU, both kernels.
+    Bench {
+        #[arg(long)]
+        model: Option<PathBuf>,
+        #[arg(long, default_value_t = 0)]
+        tile: u32,
+        #[arg(long, default_value_t = 2)]
+        inflight: usize,
+        #[arg(long, default_value_t = 6)]
+        iters: u32,
+        /// GPU memory budget (e.g. 8G); with it the tile grows up to 1024.
+        #[arg(long)]
+        vram_budget: Option<String>,
+    },
     /// Print a model's architecture and cost.
     Model {
         path: PathBuf,
@@ -173,6 +190,7 @@ fn job_from(common: &Common, input: PathBuf, output: PathBuf) -> anyhow::Result<
     j.vram_budget = common.vram_budget.as_deref().map(d2x_core::budget::parse_bytes).transpose()?;
     j.block_cache_override = common.block_cache.as_deref().map(d2x_core::budget::parse_bytes).transpose()?;
     j.inflight = common.inflight;
+    j.kernel = common.kernel.clone();
     j.pipeline.batch = common.batch;
     j.pipeline.queue_depth = common.batch.max(2) * 2;
     j.pipeline.analyze.tier_std = [common.flat_std, common.smooth_std];
@@ -268,6 +286,26 @@ fn main() -> anyhow::Result<()> {
             #[cfg(not(feature = "gpu"))]
             {
                 let _ = (model, tile);
+                anyhow::bail!("built without the `gpu` feature");
+            }
+        }
+        Cmd::Bench { model, tile, inflight, iters, vram_budget } => {
+            #[cfg(feature = "gpu")]
+            {
+                let (net, path) = job::load_model(model.as_deref())?;
+                let budget = vram_budget.as_deref().map(d2x_core::budget::parse_bytes).transpose()?.unwrap_or(0);
+                eprintln!("model: {} ({:.2} MMAC per input pixel, x{})", path.display(), net.macs_per_input_pixel() / 1e6, net.scale);
+                for kernel in ["rt2", "rt4"] {
+                    let opts = d2x_wgpu::GpuOptions { tile, inflight, vram_budget: budget, kernel: kernel.parse()?, ..Default::default() };
+                    match d2x_wgpu::bench(net.clone(), opts, iters) {
+                        Ok(r) => println!("{r}"),
+                        Err(e) => println!("kernel {kernel}: {e:#}"),
+                    }
+                }
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                let _ = (model, tile, inflight, iters, vram_budget);
                 anyhow::bail!("built without the `gpu` feature");
             }
         }

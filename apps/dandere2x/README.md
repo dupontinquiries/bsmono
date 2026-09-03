@@ -200,14 +200,23 @@ What is built:
   `1 + b·min(n,8)/8`, so blocks that keep matching stop flickering out at
   the threshold. Drift is bounded at that multiple of the JPEG error.
 
-What would move the big number (RRDB is ~9 TMAC per 1080p frame; the conv
-kernel is all of it):
+**Measuring the kernel on your GPU** — `dandere2x bench --model X --vram-budget 8G`
+runs both conv kernels on full-size tiles and prints ms/tile, GMAC/s, TFLOPS,
+and the implied seconds per full 1080p frame. That number against the
+device's peak (M2 Max ≈ 13.6, M2 Ultra ≈ 27 TFLOPS f32) is the kernel's
+efficiency; `analyze` gives the reuse fraction; the product of the two is the
+job. Kernels: `rt4` (default: 4×4 px × 4 ch per thread, ~2.9× the FMAs per
+load of `rt2`) and `rt2`; both bit-exact against the CPU reference, pick by
+`bench`. With a VRAM budget the tile auto-sizes up to 1024 (a body conv on a
+400-px tile is ~1.3 waves on 76 cores) and tiles are balanced (1920 →
+5 × 384, never 4 × 400 + 320).
+
+What would move the big number further (RRDB is ~9 TMAC per 1080p frame; the
+conv kernel is all of it):
 
 - **Winograd F(2×2, 3×3)**: 2.25× fewer multiplies for every 3×3 same-pad
   conv, exact in f32. Transform-domain batched GEMM is a kernel the tree
   already has form for (gpu-gemm).
-- **Register tiling**: the kernel does 36 vec4 FMAs per 52 loads per input
-  channel; 4×2 pixels × 8 channels roughly doubles FMA-per-load.
 - **f16 storage** (f32 math) halves activation bandwidth where the adapter
   offers `SHADER_F16`.
 - **Gate**: the JPEG round trip could be replaced by a DCT-domain

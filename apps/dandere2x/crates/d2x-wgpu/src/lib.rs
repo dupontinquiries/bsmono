@@ -26,6 +26,7 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 pub const CONV_WGSL: &str = include_str!("../shaders/conv3x3.wgsl");
+pub const CONV_RT4_WGSL: &str = include_str!("../shaders/conv3x3_rt4.wgsl");
 pub const DECONV_WGSL: &str = include_str!("../shaders/deconv4x4s2.wgsl");
 pub const ADD_WGSL: &str = include_str!("../shaders/add_scaled.wgsl");
 pub const PACK_WGSL: &str = include_str!("../shaders/pack.wgsl");
@@ -44,11 +45,51 @@ pub struct GpuOptions {
     /// GPU-memory budget for this upscaler's activation sets (0 = adapter
     /// limits only). On unified memory this is host RAM.
     pub vram_budget: u64,
+    /// Conv kernel variant; both are bit-exact against the CPU reference,
+    /// they differ only in speed per device. `dandere2x bench` compares.
+    pub kernel: ConvKernel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConvKernel {
+    /// 2x2 pixels × 4 channels per thread, 16x16 workgroups.
+    Rt2,
+    /// 4x4 pixels × 4 channels per thread, 8x8 workgroups: ~2.9x the FMAs
+    /// per load, ~130 live registers.
+    #[default]
+    Rt4,
+}
+
+impl ConvKernel {
+    fn source(self) -> &'static str {
+        match self {
+            ConvKernel::Rt2 => CONV_WGSL,
+            ConvKernel::Rt4 => CONV_RT4_WGSL,
+        }
+    }
+    /// Output pixels covered per workgroup along each axis.
+    fn wg_span(self) -> u32 {
+        match self {
+            ConvKernel::Rt2 => 32,
+            ConvKernel::Rt4 => 32,
+        }
+    }
+}
+
+impl std::str::FromStr for ConvKernel {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "rt2" | "2x2" => Ok(ConvKernel::Rt2),
+            "rt4" | "4x4" => Ok(ConvKernel::Rt4),
+            _ => Err(anyhow!("kernel must be rt2|rt4")),
+        }
+    }
 }
 
 impl Default for GpuOptions {
     fn default() -> Self {
-        GpuOptions { tile: 0, require_hw: false, low_power: false, inflight: 2, vram_budget: 0 }
+        GpuOptions { tile: 0, require_hw: false, low_power: false, inflight: 2, vram_budget: 0, kernel: ConvKernel::default() }
     }
 }
 
@@ -110,8 +151,9 @@ pub fn probe() -> Vec<AdapterReport> {
     pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all())).iter().map(report).collect()
 }
 
-/// Default tile per network: big for the deep same-pad nets (seams shrink
-/// with tile size and the body is the cost either way), exact for valid nets.
+/// Default tile per network when there is no memory budget to size it by:
+/// big for the deep same-pad nets (seams shrink with tile size and the body
+/// is the cost either way), exact for valid nets.
 pub fn default_tile(net: &Network) -> u32 {
     if net.exact {
         240
@@ -121,6 +163,11 @@ pub fn default_tile(net: &Network) -> u32 {
         256
     }
 }
+
+/// With a budget, take the largest tile it allows up to `max` (bigger tiles
+/// mean fewer, fuller dispatches and less padding overhead) — a body conv on
+/// a 400-px tile is ~1.3 waves on a 76-core GPU, most of a wave wasted.
+pub const MAX_AUTO_TILE: u32 = 1024;
 
 /// Bytes of the largest buffer the network needs for a tile of side `t`.
 pub fn max_buffer_bytes(net: &Network, t: u64) -> u64 {
@@ -288,6 +335,7 @@ pub struct WgpuUpscaler {
     pub net: Arc<Network>,
     pub tile: u32,
     pub inflight: usize,
+    pub kernel: ConvKernel,
     conv_pipeline: wgpu::ComputePipeline,
     deconv_pipeline: wgpu::ComputePipeline,
     add_pipeline: wgpu::ComputePipeline,
@@ -330,8 +378,14 @@ impl WgpuUpscaler {
         let device = &ctx.device;
         let rep = &ctx.adapter;
         let inflight = opts.inflight.clamp(1, 8);
-        let requested = if opts.tile == 0 { default_tile(&net) } else { opts.tile };
         let per_set = if opts.vram_budget > 0 { opts.vram_budget / inflight as u64 } else { 0 };
+        let requested = if opts.tile != 0 {
+            opts.tile
+        } else if per_set > 0 && !net.exact {
+            MAX_AUTO_TILE
+        } else {
+            default_tile(&net)
+        };
         let tile = fit_tile_budget(&net, requested, rep.max_storage_binding, rep.max_buffer, per_set);
         if tile != requested {
             eprintln!("note: tile {requested} does not fit this adapter's limits / the VRAM budget with {inflight} sets in flight; using {tile}");
@@ -359,7 +413,7 @@ impl WgpuUpscaler {
             let m = module(label, src);
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(label), layout: Some(&pl), module: &m, entry_point: Some("main"), compilation_options: Default::default(), cache: None })
         };
-        let conv_pipeline = pipeline("conv3x3", CONV_WGSL, &conv_layout);
+        let conv_pipeline = pipeline("conv3x3", opts.kernel.source(), &conv_layout);
         let deconv_pipeline = pipeline("deconv4x4s2", DECONV_WGSL, &deconv_layout);
         let add_pipeline = pipeline("add_scaled", ADD_WGSL, &add_layout);
         let pack_pipeline = pipeline("pack", PACK_WGSL, &pack_layout);
@@ -506,7 +560,7 @@ impl WgpuUpscaler {
             sets.push(ActSet { bufs, steps, pack_params, pack_bind, out, staging });
         }
         let set_bytes_total = set_bytes(&net, tile as u64) * inflight as u64;
-        Ok(WgpuUpscaler { ctx, net, tile, inflight, conv_pipeline, deconv_pipeline, add_pipeline, pack_pipeline, sets, _weights: weights, set_bytes_total })
+        Ok(WgpuUpscaler { ctx, net, tile, inflight, kernel: opts.kernel, conv_pipeline, deconv_pipeline, add_pipeline, pack_pipeline, sets, _weights: weights, set_bytes_total })
     }
 
     /// Encode and submit one tile on activation set `si`; returns the
@@ -539,7 +593,8 @@ impl WgpuUpscaler {
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(&c.name), timestamp_writes: None });
                     pass.set_pipeline(&self.conv_pipeline);
                     pass.set_bind_group(0, bind, &[]);
-                    pass.dispatch_workgroups(ow.div_ceil(32), oh.div_ceil(32), c.out_ch.div_ceil(4) as u32);
+                    let span = self.kernel.wg_span();
+                    pass.dispatch_workgroups(ow.div_ceil(span), oh.div_ceil(span), c.out_ch.div_ceil(4) as u32);
                 }
                 Step::Deconv { op, params, bind } => {
                     let Op::Deconv(d) = &net.ops[*op] else { unreachable!() };
@@ -662,8 +717,66 @@ impl Upscaler for WgpuUpscaler {
         self.upscale_frame(frame)
     }
     fn name(&self) -> String {
-        format!("wgpu [{}] x{} on {} tile {} x{} in flight ({} MiB)", self.net.name, self.net.scale, self.ctx.adapter.name, self.tile, self.inflight, self.set_bytes_total >> 20)
+        format!("wgpu [{}] x{} on {} tile {} x{} in flight ({} MiB) kernel {:?}", self.net.name, self.net.scale, self.ctx.adapter.name, self.tile, self.inflight, self.set_bytes_total >> 20, self.kernel)
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct BenchReport {
+    pub adapter: String,
+    pub network: String,
+    pub kernel: ConvKernel,
+    pub tile: u32,
+    pub region_px: u64,
+    pub ms_per_tile: f64,
+    pub gmac_per_s: f64,
+    /// Full-frame time at 1080p if every pixel went through the network.
+    pub s_per_1080p_frame: f64,
+}
+
+impl std::fmt::Display for BenchReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} | {} | kernel {:?} | tile {} ({} px region) | {:.1} ms/tile | {:.1} GMAC/s ({:.2} TFLOPS) | ≈ {:.2} s per full 1080p frame",
+            self.adapter, self.network, self.kernel, self.tile, self.region_px, self.ms_per_tile, self.gmac_per_s, self.gmac_per_s * 2.0 / 1000.0, self.s_per_1080p_frame
+        )
+    }
+}
+
+/// Time the network on full-size tiles: one warm-up, then `iters` tiles
+/// with the sets in flight, waiting on the last. The number to hunt with.
+pub fn bench(net: Arc<Network>, opts: GpuOptions, iters: u32) -> anyhow::Result<BenchReport> {
+    let mut gpu = WgpuUpscaler::new(net.clone(), opts)?;
+    let side = gpu.tile;
+    let mut frame = Frame::new(side, side);
+    for (i, b) in frame.data.iter_mut().enumerate() {
+        *b = ((i * 31) % 251) as u8;
+    }
+    let padded = net.pad_frame(&frame);
+    let io = net.tile_io(d2x_core::net::TileRect { x: 0, y: 0, w: side, h: side });
+    let input = net.extract_input(&padded, io);
+    let _ = gpu.run_tile(&input)?; // warm-up: pipeline compile, first allocation
+    let t = std::time::Instant::now();
+    let mut pending = std::collections::VecDeque::new();
+    for k in 0..iters {
+        let si = (k as usize) % gpu.inflight;
+        if pending.len() == gpu.inflight {
+            let (s, idx, n) = pending.pop_front().unwrap();
+            let _ = gpu.finish_tile(s, idx, n)?;
+        }
+        let (idx, n) = gpu.submit_tile(si, &input)?;
+        pending.push_back((si, idx, n));
+    }
+    while let Some((s, idx, n)) = pending.pop_front() {
+        let _ = gpu.finish_tile(s, idx, n)?;
+    }
+    let per = t.elapsed().as_secs_f64() / iters as f64;
+    let region_px = (io.region_w as u64) * (io.region_h as u64);
+    let macs = net.macs_per_input_pixel() * region_px as f64;
+    let gmac_per_s = macs / per / 1e9;
+    let s_per_1080p_frame = net.macs_per_input_pixel() * 1920.0 * 1080.0 / (gmac_per_s * 1e9);
+    Ok(BenchReport { adapter: gpu.adapter().name.clone(), network: net.name.clone(), kernel: gpu.kernel, tile: side, region_px, ms_per_tile: per * 1e3, gmac_per_s, s_per_1080p_frame })
 }
 
 #[derive(Debug, Clone)]
@@ -725,7 +838,7 @@ mod tests {
     /// with no GPU at all.
     #[test]
     fn shaders_validate() {
-        for (name, src) in [("conv3x3", CONV_WGSL), ("deconv4x4s2", DECONV_WGSL), ("add_scaled", ADD_WGSL), ("pack", PACK_WGSL)] {
+        for (name, src) in [("conv3x3", CONV_WGSL), ("conv3x3_rt4", CONV_RT4_WGSL), ("deconv4x4s2", DECONV_WGSL), ("add_scaled", ADD_WGSL), ("pack", PACK_WGSL)] {
             let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(src)));
             let mut v = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty());
             v.validate(&module).unwrap_or_else(|e| panic!("{name}: {e:?}"));
@@ -754,19 +867,18 @@ mod tests {
             return;
         }
         let m = d2x_core::waifu2x::Upconv7::synthetic(7);
-        let mut json_like = Vec::new();
-        json_like.push(m); // keep the model alive; build the network directly
-        let net = net_from_upconv7(&json_like[0]);
-        let r = selftest(Arc::new(net), GpuOptions { tile: 32, ..Default::default() }).unwrap();
-        eprintln!("{r}");
-        assert!(r.pass, "{r}");
-
+        let net = Arc::new(net_from_upconv7(&m));
         let p = models_dir().join("realesr-animevideov3.safetensors");
-        if p.exists() {
-            let net = Network::load(&p).unwrap();
-            let r = selftest(Arc::new(net), GpuOptions { tile: 24, ..Default::default() }).unwrap();
+        for kernel in [ConvKernel::Rt2, ConvKernel::Rt4] {
+            let r = selftest(net.clone(), GpuOptions { tile: 32, kernel, ..Default::default() }).unwrap();
             eprintln!("{r}");
-            assert!(r.pass, "{r}");
+            assert!(r.pass, "{kernel:?}: {r}");
+            if p.exists() {
+                let net = Network::load(&p).unwrap();
+                let r = selftest(Arc::new(net), GpuOptions { tile: 24, kernel, ..Default::default() }).unwrap();
+                eprintln!("{r}");
+                assert!(r.pass, "{kernel:?}: {r}");
+            }
         }
         // RRDB x2 (67 MB, not vendored): copies, add-scaled, fused residuals,
         // folded x2 upsampling, pixel-unshuffle. Heavy on a software adapter.

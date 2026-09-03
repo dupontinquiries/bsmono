@@ -84,6 +84,8 @@ pub struct Job {
     pub block_cache_override: Option<u64>,
     /// Activation sets in flight per GPU upscaler.
     pub inflight: usize,
+    /// Conv kernel variant name ("rt2" | "rt4").
+    pub kernel: String,
 }
 
 impl Default for Job {
@@ -112,6 +114,7 @@ impl Default for Job {
             refs_override: None,
             block_cache_override: None,
             inflight: 2,
+            kernel: "rt4".into(),
         }
     }
 }
@@ -206,7 +209,8 @@ pub fn build_tiers(job: &Job) -> anyhow::Result<Vec<Box<dyn Upscaler>>> {
         let mut tiers: Vec<Box<dyn Upscaler>> = Vec::new();
         for (n, tile) in nets {
             let share = (budget as f64 * n.macs_per_input_pixel() / total_cost.max(1.0)) as u64;
-            let up = d2x_wgpu::WgpuUpscaler::with_context(ctx.clone(), n, d2x_wgpu::GpuOptions { tile, require_hw: job.require_hw, low_power: false, inflight: job.inflight.max(1), vram_budget: share })?;
+            let kernel: d2x_wgpu::ConvKernel = job.kernel.parse()?;
+            let up = d2x_wgpu::WgpuUpscaler::with_context(ctx.clone(), n, d2x_wgpu::GpuOptions { tile, require_hw: job.require_hw, low_power: false, inflight: job.inflight.max(1), vram_budget: share, kernel })?;
             let native = up.scale();
             let boxed: Box<dyn Upscaler> = Box::new(up);
             tiers.push(if native == job.scale { boxed } else { Box::new(Resampled { inner: boxed, target: job.scale }) });
@@ -251,7 +255,7 @@ pub fn build_upscaler(job: &Job) -> anyhow::Result<Box<dyn Upscaler>> {
             #[cfg(feature = "gpu")]
             {
                 let (net, _) = load_model(job.model.as_deref())?;
-                Box::new(d2x_wgpu::WgpuUpscaler::new(net, d2x_wgpu::GpuOptions { tile: job.tile, require_hw: job.require_hw, low_power: false, inflight: job.inflight.max(1), vram_budget: job.vram_budget.unwrap_or(0) })?)
+                Box::new(d2x_wgpu::WgpuUpscaler::new(net, d2x_wgpu::GpuOptions { tile: job.tile, require_hw: job.require_hw, low_power: false, inflight: job.inflight.max(1), vram_budget: job.vram_budget.unwrap_or(0), kernel: job.kernel.parse()? })?)
             }
             #[cfg(not(feature = "gpu"))]
             {

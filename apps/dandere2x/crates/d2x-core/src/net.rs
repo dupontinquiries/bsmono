@@ -502,19 +502,23 @@ pub struct TileRect {
     pub h: u32,
 }
 
+/// Split a `width×height` image into tiles of at most `tile` on a side,
+/// balanced: `1920` at `tile = 400` becomes five tiles of 384, not four of
+/// 400 and a 320 remainder. Equal tiles pay the least padding overhead and
+/// the last tile is never a sliver that under-fills the GPU.
 pub fn tiles(width: u32, height: u32, tile: u32) -> Vec<TileRect> {
     assert!(tile > 0);
-    let mut v = Vec::new();
-    let mut y = 0;
-    while y < height {
-        let h = tile.min(height - y);
-        let mut x = 0;
-        while x < width {
-            let w = tile.min(width - x);
+    let nx = width.div_ceil(tile).max(1);
+    let ny = height.div_ceil(tile).max(1);
+    let mut v = Vec::with_capacity((nx * ny) as usize);
+    for j in 0..ny {
+        let y = height * j / ny;
+        let h = height * (j + 1) / ny - y;
+        for i in 0..nx {
+            let x = width * i / nx;
+            let w = width * (i + 1) / nx - x;
             v.push(TileRect { x, y, w, h });
-            x += w;
         }
-        y += h;
     }
     v
 }
@@ -775,8 +779,10 @@ mod tests {
         let net = Network::load(&p).unwrap();
         assert_eq!((net.scale, net.shuffle), (4, 4));
         eprintln!("srvgg: {:.2} MMAC/px", net.macs_per_input_pixel() / 1e6);
-        let got = net.upscale_cpu(&input, 48);
-        compare(&got, &want, 6, "srvgg vs numpy (tile 48, overlap 10)");
+        // Single tile: exact up to float reordering.
+        compare(&net.upscale_cpu(&input, 256), &want, 3, "srvgg vs numpy (whole)");
+        // Small tiles: the 10-px overlap leaves seam pixels a few LSB off.
+        compare(&net.upscale_cpu(&input, 48), &want, 8, "srvgg vs numpy (tile 48, overlap 10)");
     }
 
     #[test]
