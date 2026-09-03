@@ -456,6 +456,18 @@ impl Upscaler for SharedUpscaler {
 /// video input, one shared upscaler, part files concatenated at the end.
 /// Events carry the segment index as `Event::Started`'s upscaler name prefix
 /// and are delivered on the calling thread.
+/// What a segment worker reports back.
+///
+/// `Progress` was the only case; `Done` is the addition resume needed. The
+/// coordinator learns of success from `join()` too, but only after every
+/// worker has finished — too late to record anything, and precisely the window
+/// a kill lands in.
+enum SegMsg {
+    Progress(PEvent),
+    Done,
+    Failed(String),
+}
+
 pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyhow::Result<Summary> {
     anyhow::ensure!(!job.input.is_dir() && job.output.extension().is_some(), "--jobs needs a video input and a video output");
     anyhow::ensure!(job.start == 0.0 && job.end.is_none(), "segment parallelism over a sub-range is not implemented yet; use jobs = 1 for clip bounces");
@@ -474,9 +486,59 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
     let ext = job.output.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "mkv".into());
     let parts: Vec<PathBuf> = segs.iter().map(|s| job.output.with_file_name(format!("{stem}.part{:03}.{ext}", s.index))).collect();
 
-    let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<PEvent, String>)>();
+    // ── resume ───────────────────────────────────────────────────────────
+    //
+    // A segment already encoded on a previous run is skipped entirely: no
+    // worker, no decode, no upscale. See `crate::checkpoint` for why a part
+    // file on disk is not enough on its own to believe that.
+    let ck_path = crate::checkpoint::path_for(&job.output);
+    let fp = {
+        let (size, mtime) = std::fs::metadata(&job.input)
+            .map(|m| (m.len(), m.modified().ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64).unwrap_or(0)))
+            .unwrap_or((0, 0));
+        crate::checkpoint::fingerprint(
+            &job.input, size, mtime,
+            &job.model.as_ref().map(|m| m.display().to_string()).unwrap_or_else(|| "default".into()),
+            job.scale,
+            &format!("{:?}", job.backend),
+        )
+    };
+    let mut ck = std::fs::read_to_string(&ck_path)
+        .map(|t| crate::checkpoint::Checkpoint::parse(&t))
+        .unwrap_or_default();
+    if !ck.matches(&fp, segs.len()) {
+        // A checkpoint for another job, another split, or no checkpoint at
+        // all. Starting fresh is the safe answer; resuming into a different
+        // job produces a full-length output that is half wrong.
+        if !ck.fingerprint.is_empty() {
+            eprintln!("resume: checkpoint does not match this job — starting over");
+        }
+        ck = crate::checkpoint::Checkpoint { fingerprint: fp.clone(), segments: segs.len(), ..Default::default() };
+    }
+    let done = ck.resumable(&parts, &|p: &Path| p.is_file());
+    // Anything the record claimed but cannot back with a file is dropped, so
+    // the checkpoint on disk never grows stale claims.
+    ck.done = done.clone();
+    if !done.is_empty() {
+        eprintln!("resume: {} of {} segments already done — skipping them", done.len(), segs.len());
+    }
+    let write_ck = |c: &crate::checkpoint::Checkpoint| {
+        if let Err(e) = std::fs::write(&ck_path, c.render()) {
+            // Not fatal: the run still produces the right video, it just will
+            // not be resumable. Saying so beats a silent loss of the feature.
+            eprintln!("resume: could not write {}: {e}", ck_path.display());
+        }
+    };
+    write_ck(&ck);
+
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, SegMsg)>();
     let mut handles = Vec::new();
     for (seg, part) in segs.iter().zip(&parts) {
+        if done.contains(&seg.index) {
+            continue;
+        }
         let (seg, part, tx, p, job, servers, all, cache, cfg) = (*seg, part.clone(), tx.clone(), p.clone(), job.clone(), servers.clone(), keyframes.clone(), shared_cache.clone(), cfg);
         handles.push(std::thread::Builder::new().name(format!("d2x-seg{}", seg.index)).spawn(move || -> anyhow::Result<Summary> {
             let src = Box::new(FfmpegSource::open_segment(&job.input, &p, seg)?);
@@ -487,10 +549,15 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
             let sink = Box::new(FfmpegSink::open(&part, None, &p, w, h, &enc)?);
             let ups: Vec<Box<dyn Upscaler>> = servers.iter().map(|s| Box::new(s.client()) as Box<dyn Upscaler>).collect();
             let r = d2x_core::pipeline::run_tiered_with_cache(src, ups, sink, cfg, cache, |e| {
-                let _ = tx.send((seg.index, Ok(e)));
+                let _ = tx.send((seg.index, SegMsg::Progress(e)));
             });
-            if let Err(e) = &r {
-                let _ = tx.send((seg.index, Err(format!("{e:#}"))));
+            match &r {
+                // The completion signal the checkpoint needs. `join()` also
+                // reports success, but only after EVERY worker has finished —
+                // too late to record anything, which is exactly the window a
+                // kill lands in.
+                Ok(_) => { let _ = tx.send((seg.index, SegMsg::Done)); }
+                Err(e) => { let _ = tx.send((seg.index, SegMsg::Failed(format!("{e:#}")))); }
             }
             r
         })?);
@@ -498,8 +565,15 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
     drop(tx);
     for (i, msg) in rx {
         match msg {
-            Ok(e) => on_event(i, e),
-            Err(e) => eprintln!("segment {i}: {e}"),
+            SegMsg::Progress(e) => on_event(i, e),
+            SegMsg::Done => {
+                // Written on EVERY completion rather than once at the end: the
+                // whole point is to survive a kill, and a checkpoint flushed
+                // at exit is one that never exists when it is needed.
+                ck.done.insert(i);
+                write_ck(&ck);
+            }
+            SegMsg::Failed(e) => eprintln!("segment {i}: {e}"),
         }
     }
     let mut frames = 0;
@@ -513,10 +587,18 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
         frames += s.frames;
         elapsed = elapsed.max(s.elapsed);
     }
+    // Concat FIRST, then drop the parts and the checkpoint. If the concat
+    // fails the parts and the record both survive, so the next run resumes
+    // instead of re-upscaling everything to hit the same muxer error.
     ffmpeg::concat_parts(&parts, &job.input, &job.output)?;
     for part in &parts {
         let _ = std::fs::remove_file(part);
     }
+    let _ = std::fs::remove_file(&ck_path);
+    // NOTE: these totals cover the segments this RUN processed. A resumed run
+    // reports less work than the video contains, because the skipped segments
+    // were measured by the run that did them. Reporting a guess for them would
+    // be worse than reporting the truth about what just happened.
     Ok(Summary { frames, elapsed, upscaled_pixel_fraction: if frames > 0 { fraction / frames as f64 } else { 0.0 }, heavy_pixel_fraction: if frames > 0 { heavy / frames as f64 } else { 0.0 } })
 }
 
