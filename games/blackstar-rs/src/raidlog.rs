@@ -116,7 +116,7 @@ mod tests {
         for b in BOSSES {
             log.record(b.id);
         }
-        assert_eq!(log.shards(), 19);
+        assert_eq!(log.shards(), BOSSES.len() as u32);
         assert_eq!(log.seal(), SealState::Open);
         assert!(log.next_up().is_none(), "a full sweep still had a next");
     }
@@ -133,7 +133,7 @@ mod tests {
             last_tier = b.tier;
             log.record(b.id);
         }
-        assert_eq!(log.shards(), 19, "the ladder should walk the whole roster");
+        assert_eq!(log.shards(), BOSSES.len() as u32, "the ladder should walk the whole roster");
     }
 
     #[test]

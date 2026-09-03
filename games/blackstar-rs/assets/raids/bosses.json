@@ -1,5 +1,21 @@
 [
   {
+    "id": "the_anvil",
+    "name": "The Lattice",
+    "title": "The Anvil",
+    "mech": "Sync",
+    "element": "Rock",
+    "arena": "unending",
+    "tier": 3,
+    "premise": "a perfect solid that must open to act, so armour and agency are the same resource",
+    "relic": [
+      "it has no front. closed, it is six identical faces and no way in;",
+      "struck, it does not move -- it shapes what struck it. the crews that",
+      "hit it hardest came back wearing the wrong silhouettes."
+    ],
+    "shard": "you do not damage it. you take cells it no longer governs."
+  },
+  {
     "id": "speakerman",
     "name": "Astro Armor Titan Speakerman",
     "title": "The Last Resonance",

@@ -273,9 +273,13 @@ mod tests {
     use crate::raidcon::BOSSES;
 
     #[test]
-    fn nineteen_plans_of_three_phases() {
+    fn every_boss_gets_a_plan_of_three_phases() {
+        // Was nineteen_plans_of_three_phases; the Lattice made it twenty.
+        // Deriving the count from BOSSES rather than hardcoding it means
+        // raidcon::nineteen_bosses_with_the_recorded_spread stays the single
+        // place a roster change has to be acknowledged, instead of two.
         let all = plan_all(7);
-        assert_eq!(all.len(), 19);
+        assert_eq!(all.len(), BOSSES.len());
         for p in &all {
             assert_eq!(p.phases.len(), 3, "{}", p.boss.id);
             for ph in &p.phases {

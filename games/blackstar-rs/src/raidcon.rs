@@ -187,6 +187,26 @@ pub struct Boss {
 }
 
 pub const BOSSES: &[Boss] = &[
+    // ---- the Lattice (docs/films/CANON_DECISIONS.md §4) ----
+    //
+    // SYNC because the mechanic falls out of the fiction rather than being
+    // assigned: plates that need several bodies standing together IS "the
+    // solid only opens when matter outside it is arranged correctly". Arena
+    // `unending` because `raidgen` makes the finale the boss's own arena and
+    // every SYNC boss's arena is `unending` — a roster fact `raidcon` tests —
+    // and because the Earth-remnant thread is where this belongs anyway.
+    //
+    // Element::Rock: the Anvil is the closed state, and what a closed thing
+    // does is refuse. Nothing else in the ring reads as "will not move".
+    Boss { id: "the_anvil", name: "The Lattice", title: "The Anvil",
+        mech: Mech::Sync, element: Element::Rock, arena: "unending", tier: 3,
+        premise: "a perfect solid that must open to act, so armour and agency are the same resource",
+        relic: &[
+            "it has no front. closed, it is six identical faces and no way in;",
+            "struck, it does not move -- it shapes what struck it. the crews that",
+            "hit it hardest came back wearing the wrong silhouettes.",
+        ],
+        shard: "you do not damage it. you take cells it no longer governs." },
     Boss { id: "speakerman", name: "Astro Armor Titan Speakerman", title: "The Last Resonance",
         mech: Mech::Sync, element: Element::Electric, arena: "unending", tier: 3,
         premise: "sings across half a galaxy; fractures planets by matching tectonic resonance",
@@ -719,13 +739,15 @@ mod tests {
 
     #[test]
     fn nineteen_bosses_with_the_recorded_spread() {
-        // the spread RAIDS.md documents: 5 PURGE, 5 GROUND, 4 AIR, 5 SYNC
-        assert_eq!(BOSSES.len(), 19);
+        // the spread RAIDS.md documents: 5 PURGE, 5 GROUND, 4 AIR, 5 SYNC —
+        // plus the Lattice, which made SYNC 6. Adding a boss is supposed to
+        // fail here; the number is the record that somebody meant to.
+        assert_eq!(BOSSES.len(), 20);
         let n = |m: Mech| BOSSES.iter().filter(|b| b.mech == m).count();
         assert_eq!(n(Mech::Purge), 5);
         assert_eq!(n(Mech::Ground), 5);
         assert_eq!(n(Mech::Air), 4);
-        assert_eq!(n(Mech::Sync), 5);
+        assert_eq!(n(Mech::Sync), 6);
     }
 
     #[test]
