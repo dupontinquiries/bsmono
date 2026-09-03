@@ -30,6 +30,13 @@ pub struct PaneSession {
     pub row_dirty: crate::row_cache::RowCache,
     /// Shaped galleys per row, reused while a row is unchanged.
     pub row_galleys: crate::row_render::RowLayoutCache<String>,
+    /// This pane's VT parser state.
+    ///
+    /// Per-pane because an escape sequence can be split across reads: a
+    /// single app-level parser fed from two panes resumes one pane's
+    /// half-finished CSI with another pane's bytes. It also has to
+    /// travel with focus, which it does for free by living here.
+    pub vt: crate::term_grid::Vt,
 }
 
 impl PaneSession {
@@ -40,7 +47,25 @@ impl PaneSession {
             pty_echoed: 0,
             row_dirty: crate::row_cache::RowCache::new(24), // matches the 80x24 grid above
             row_galleys: crate::row_render::RowLayoutCache::new(),
+            vt: crate::term_grid::Vt::default(),
         }
+    }
+}
+
+impl PaneSession {
+    /// Feed bytes from this pane's shell into ITS OWN grid, through its
+    /// own parser.
+    ///
+    /// The background drain used to write into `pane_apps[id].terminal`
+    /// — the uikit-term widget's grid — while the view renders
+    /// `session.grid`. So an unfocused pane's output went somewhere
+    /// nothing draws, and was still missing when the pane regained
+    /// focus. The drain was added to fix "an unfocused pane looks
+    /// frozen" and moved the output to a second invisible place instead.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        let mut vt = std::mem::take(&mut self.vt);
+        vt.feed(&mut self.grid, bytes);
+        self.vt = vt;
     }
 }
 
@@ -98,6 +123,39 @@ pub fn swap_focus<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_parses_into_its_own_grid() {
+        // the background drain's destination: what gets DRAWN
+        let mut s = PaneSession::new();
+        s.feed(b"hello");
+        assert_eq!(s.grid.row_text(0).trim_end(), "hello");
+    }
+
+    #[test]
+    fn an_escape_sequence_split_across_reads_survives() {
+        // why the parser is per-pane: a shared Vt resumes one pane's
+        // half-finished CSI with another pane's bytes
+        let mut s = PaneSession::new();
+        s.feed(b"a\x1b[");
+        s.feed(b"1;3Hb");
+        // `1;3H` moved the cursor to column 3 (1-based), so 'b' lands in
+        // the third cell: "a b". The point is that the CSI was OBEYED
+        // rather than printed — a parser that dropped its state between
+        // feeds would render the literal text `1;3H`.
+        assert_eq!(s.grid.row_text(0).trim_end(), "a b");
+        assert!(!s.grid.row_text(0).contains("1;3H"), "the sequence was not printed as text");
+    }
+
+    #[test]
+    fn two_sessions_do_not_share_parser_state() {
+        let mut a = PaneSession::new();
+        let mut b = PaneSession::new();
+        a.feed(b"\x1b["); // a leaves a sequence open
+        b.feed(b"1;1Hxy"); // b must not complete it
+        assert_eq!(b.grid.row_text(0).trim_end(), "1;1Hxy");
+    }
+
 
     #[test]
     fn a_freshly_focused_pane_with_no_shell_asks_for_one() {

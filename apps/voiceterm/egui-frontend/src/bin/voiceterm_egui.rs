@@ -148,7 +148,11 @@ impl VoicetermApp {
     /// the part that is genuinely the app's: which grid, and which
     /// parser state goes with it.
     fn feed_pty(&mut self, bytes: &[u8]) {
-        self.vt.feed(&mut self.session.grid, bytes);
+        // The session's own parser, not an app-level one. A single Vt
+        // shared across panes resumes one pane's half-finished escape
+        // sequence with another pane's bytes the moment focus moves
+        // mid-sequence, and `vt` was not in the swap_focus list.
+        self.session.feed(bytes);
     }
 
     /// The connections graph over what this app actually holds.
@@ -417,9 +421,6 @@ struct VoicetermApp {
     /// Command blocks (QML blocksDrawer): tracked from what the demo feeds; the
     /// left-edge drawer shows when `surfaces` says `Surface::Blocks`.
     blocks: uikit_term::blocks::BlockTracker,
-    /// The escape-sequence parser's state. Held across frames because a
-    /// sequence can be split between two pty reads — see `term_grid::Vt`.
-    vt: voiceterm_egui::term_grid::Vt,
     /// Bytes bound for the shell, split into commands as lines complete.
     line_buf: uikit_term::blocks::CommandLines,
     /// One-shot scroll target for the tab bar ("N more" pill taps apply next frame).
@@ -3478,9 +3479,17 @@ impl eframe::App for VoicetermApp {
                 if out.is_empty() {
                     continue;
                 }
-                if let Some(app) = self.pane_apps.get_mut(id) {
-                    let text = String::from_utf8_lossy(&out).into_owned();
-                    app.terminal.feed(&text);
+                // INTO THE PANE'S SESSION, WHICH IS WHAT GETS DRAWN.
+                //
+                // This wrote into `pane_apps[id].terminal` — the
+                // uikit-term widget's grid — while the view renders
+                // `session.grid`. So a background pane's output landed
+                // somewhere nothing draws, and was still missing when
+                // the pane regained focus. The drain exists to stop an
+                // unfocused pane looking frozen; writing to the wrong
+                // grid moved the problem rather than fixing it.
+                if let Some(sess) = self.pane_sessions.get_mut(id) {
+                    sess.feed(&out);
                 }
                 // `h.ended()` (shell exited while backgrounded) is intentionally not surfaced
                 // here: the toast path above is keyed to the single focused-pane pty_ended_noted
@@ -4055,7 +4064,6 @@ fn main() -> eframe::Result<()> {
                 theme_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-theme-menu").columns(3).hold(0.35).item_size(64.0),
                 blocks,
                 line_buf: Default::default(),
-                vt: Default::default(),
                 tabbar_scroll_to: None,
                 toasts: uikit_egui::toast::Toasts::new(),
                 // 80x24 is a placeholder: the first frame calls
