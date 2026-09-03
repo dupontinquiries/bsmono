@@ -187,6 +187,34 @@ impl WorldGenerator {
         false
     }
 
+    /// [`is_cave`] for a caller that already knows the column's surface
+    /// target — which every per-column loop does, having just computed it.
+    ///
+    /// 2026-09-02: this is THE hot spot of CPU worldgen. `is_cave`
+    /// recomputes `surface_target(x, z)` for every cell, and
+    /// `surface_target` costs ~4.1 us; at 32 768 cells that is ~134 ms of
+    /// the ~225 ms a chunk takes, all of it recomputing 1 024 distinct
+    /// values 32 times each. `surface_target` is a pure function of
+    /// (x, z), so passing the column's value in is exact, not an
+    /// approximation — `is_cave_with_surface_matches_is_cave` checks it
+    /// cell for cell.
+    ///
+    /// (Two earlier guesses at this hot spot were wrong: the density
+    /// noise is 2.2 ms per chunk and the `WorldModel::is_cave` noises
+    /// are 1.9 ms. `hotspot_tests::column_pass_breakdown` is what
+    /// settled it.)
+    pub fn is_cave_with_surface(&self, x: i32, y: i32, z: i32, surface_y: f64) -> bool {
+        if self.model.is_cave(x as f64, y as f64, z as f64) {
+            return true;
+        }
+        if multi_scale_caves_enabled() {
+            if crate::world::cave_field::cave_at(self.seed(), x as f64, y as f64, z as f64, surface_y) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Effective sea level at a horizontal world position. Computed from
     /// the model's continental + sea-level + humidity coupling.
     pub fn sea_level_at(&self, x: i32, z: i32) -> f64 {
@@ -506,7 +534,7 @@ impl WorldGenerator {
                                 surface_target, wx as f64, wyf, wz as f64,
                             ) > anchors::DENSITY_THRESHOLD
                         };
-                        if dense && !self.is_cave(wx, wy, wz) {
+                        if dense && !self.is_cave_with_surface(wx, wy, wz, surface_target) {
                             mask |= 1u32 << ly;
                         }
                     }
@@ -2332,6 +2360,57 @@ mod density_skip_tests {
             let ms = |t: f64| t * 1e3 / rounds as f64;
             println!("  {:14} full {:8.1} ms   skip {:8.1} ms   ({:+.1}%)",
                 name, ms(t_old), ms(t_new), (t_new / t_old - 1.0) * 100.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod cave_surface_tests {
+    use super::*;
+
+    #[test]
+    fn is_cave_with_surface_matches_is_cave() {
+        let g = WorldGenerator::new(20260902);
+        let mut checked = 0u32;
+        for (cx, cy, cz) in [(0i32, 0i32, 0i32), (4, -3, 4), (-31, 1, 62), (400, 0, -250)] {
+            let (ox, oy, oz) = ChunkCoord::new(cx, cy, cz).block_origin();
+            // Every 4th column, every 2nd layer: 8 x 8 x 16 per chunk.
+            for lz in (0..CHUNK_SIZE).step_by(4) {
+                for lx in (0..CHUNK_SIZE).step_by(4) {
+                    let (wx, wz) = (ox + lx, oz + lz);
+                    let st = g.model.surface_target(wx as f64, wz as f64, 0.0);
+                    for ly in (0..CHUNK_SIZE).step_by(2) {
+                        let wy = oy + ly;
+                        assert_eq!(g.is_cave_with_surface(wx, wy, wz, st), g.is_cave(wx, wy, wz),
+                            "cave mismatch at ({}, {}, {})", wx, wy, wz);
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 4 * 8 * 8 * 16);
+    }
+
+    #[test]
+    #[ignore]
+    fn generate_chunk_after_ab() {
+        use std::time::Instant;
+        let g = WorldGenerator::new(20260902);
+        let rounds = 6;
+        println!("generate_chunk with the column surface_target reused ({} rounds):", rounds);
+        for (name, c) in [
+            ("surface", ChunkCoord::new(4, 0, 4)),
+            ("underground", ChunkCoord::new(4, -3, 4)),
+            ("far surface", ChunkCoord::new(400, 0, -250)),
+        ] {
+            let t = Instant::now();
+            let mut solid = 0usize;
+            for _ in 0..rounds {
+                let ch = g.generate_chunk(c);
+                solid += ch.blocks.iter().filter(|b| !b.is_air()).count();
+            }
+            println!("  {:14} {:8.1} ms   ({} solid cells)",
+                name, t.elapsed().as_secs_f64() * 1e3 / rounds as f64, solid / rounds);
         }
     }
 }
