@@ -78,6 +78,7 @@ pub mod nat_traversal;
 pub mod face_consent;
 pub mod frame_pump;
 pub mod media_encode;
+pub mod video_backend;
 pub mod video_record;
 pub mod firewall_backend;
 pub mod gossip;
