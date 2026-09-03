@@ -157,6 +157,16 @@ struct Shell {
     output: String,
     model: String,
     cascade: bool,
+    /// The models folder as a catalogue, scanned in the background. Selection
+    /// is held as a PATH, never an index: a rescan rebuilds the list, and a
+    /// stored index then names a different model while still being in range
+    /// (the bug logscope's picker documents).
+    models_dir: String,
+    catalogue: Vec<d2x_core::registry::ModelInfo>,
+    model_key: Option<String>,
+    cascade_key: Option<String>,
+    scanning: bool,
+    scan_rx: Option<Receiver<Vec<d2x_core::registry::ModelInfo>>>,
     running: bool,
     stop: Arc<AtomicBool>,
     rx: Option<Receiver<Msg>>,
@@ -179,6 +189,16 @@ impl Default for Shell {
             backend: 0,
             input: String::new(),
             output: String::new(),
+            models_dir: job::default_model_paths()
+                .into_iter()
+                .find(|p| p.exists())
+                .and_then(|p| p.parent().map(|d| d.display().to_string()))
+                .unwrap_or_else(|| "models".into()),
+            catalogue: Vec::new(),
+            model_key: None,
+            cascade_key: None,
+            scanning: false,
+            scan_rx: None,
             model,
             cascade: false,
             running: false,
@@ -196,6 +216,95 @@ impl Default for Shell {
 }
 
 impl Shell {
+    /// Walk the models folder off the UI thread: verification runs a forward
+    /// pass per model, which is far too slow for a frame.
+    fn rescan_models(&mut self) {
+        if self.scanning {
+            return;
+        }
+        let dir = std::path::PathBuf::from(self.models_dir.trim());
+        let (tx, rx) = mpsc::channel();
+        self.scan_rx = Some(rx);
+        self.scanning = true;
+        std::thread::Builder::new()
+            .name("d2x-scan".into())
+            .spawn(move || {
+                let _ = tx.send(d2x_core::registry::scan(&dir, true));
+            })
+            .ok();
+    }
+
+    fn drain_scan(&mut self) {
+        let Some(rx) = &self.scan_rx else { return };
+        if let Ok(found) = rx.try_recv() {
+            let broken = found.iter().filter(|m| !m.status.usable()).count();
+            self.push_log(LogLevel::Info, format!("{} models in {} ({} unusable)", found.len(), self.models_dir, broken));
+            for m in found.iter().filter(|m| m.status.detail().is_some()) {
+                let (name, _, badge) = m.row();
+                self.push_log(if m.status.usable() { LogLevel::Warn } else { LogLevel::Error }, format!("{badge}: {name} — {}", m.status.detail().unwrap_or("")));
+            }
+            // Restore by key; fall back to the cheapest usable model, and pick
+            // the cheap end of the ladder for the cascade tier.
+            let key = self.model_key.clone();
+            self.model_key = d2x_core::registry::select_by_key(&found, key.as_deref()).map(|m| m.key());
+            if self.cascade_key.is_none() {
+                if let Some(sel) = self.model_key.as_deref().and_then(|k| found.iter().find(|m| m.key() == k)) {
+                    if let Some((cheap, _)) = d2x_core::registry::ladder(&found, sel.scale) {
+                        self.cascade_key = Some(cheap.key());
+                    }
+                }
+            }
+            self.catalogue = found;
+            self.scanning = false;
+            self.scan_rx = None;
+        }
+    }
+
+    /// One row of the picker: name, then a dim subtitle carrying architecture,
+    /// cost and verification badge — the shape logscope's picker uses.
+    fn model_row(m: &d2x_core::registry::ModelInfo) -> egui::text::LayoutJob {
+        use egui::text::{LayoutJob, TextFormat};
+        let (name, sub, badge) = m.row();
+        let col = match m.status {
+            d2x_core::registry::Verify::Ok => egui::Color32::from_rgb(120, 190, 120),
+            d2x_core::registry::Verify::Warn(_) => egui::Color32::from_rgb(220, 180, 90),
+            d2x_core::registry::Verify::Failed(_) => egui::Color32::from_rgb(220, 90, 80),
+        };
+        let mut job = LayoutJob::default();
+        job.append(&name, 0.0, TextFormat { font_id: egui::FontId::monospace(12.0), ..Default::default() });
+        job.append(&format!("\n{badge}"), 0.0, TextFormat { color: col, font_id: egui::FontId::monospace(9.0), ..Default::default() });
+        job.append(&format!(" · {sub}"), 0.0, TextFormat { color: egui::Color32::GRAY, font_id: egui::FontId::monospace(9.0), ..Default::default() });
+        job
+    }
+
+    fn model_combo(&mut self, ui: &mut egui::Ui, label: &str, cascade: bool) {
+        let cur = if cascade { self.cascade_key.clone() } else { self.model_key.clone() };
+        let text = match cur.as_deref().and_then(|k| self.catalogue.iter().find(|m| m.key() == k)) {
+            Some(m) => m.name.clone(),
+            None if self.scanning => "scanning…".into(),
+            None if self.catalogue.is_empty() => "no models".into(),
+            None => "(none)".into(),
+        };
+        let mut picked = cur.clone();
+        egui::ComboBox::from_id_salt(label).selected_text(text).width(260.0).show_ui(ui, |ui| {
+            if cascade {
+                ui.selectable_value(&mut picked, None, "(no cascade)");
+            }
+            // Only usable models are selectable; broken ones are reported in
+            // the log rather than offered as a choice.
+            for m in self.catalogue.iter().filter(|m| m.status.usable()) {
+                ui.selectable_value(&mut picked, Some(m.key()), Self::model_row(m));
+            }
+        });
+        if picked != cur {
+            if cascade {
+                self.cascade_key = picked;
+            } else {
+                self.model_key = picked;
+            }
+        }
+    }
+
     fn push_log(&mut self, level: LogLevel, text: String) {
         self.log_id += 1;
         self.log.push(LogEntry::new(level, text, self.log_id));
@@ -208,11 +317,12 @@ impl Shell {
         let mut job = self.job.clone();
         job.input = self.input.trim().into();
         job.output = self.output.trim().into();
-        job.model = if self.model.trim().is_empty() { None } else { Some(self.model.trim().into()) };
+        let pick = |k: &Option<String>| k.as_deref().and_then(|k| self.catalogue.iter().find(|m| m.key() == k)).map(|m| m.path.clone());
+        job.model = pick(&self.model_key);
+        job.cascade_model = pick(&self.cascade_key).map(Some);
         job.backend = [Backend::Wgpu, Backend::Cpu, Backend::Bicubic, Backend::Nearest][self.backend];
         job.pipeline.matcher = [MatcherKind::Stationary, MatcherKind::Diamond, MatcherKind::Exhaustive { radius: 4 }][self.matcher];
-        job.cascade_model = if self.cascade { Some(None) } else { None };
-        job.pipeline.tiers = 1 + self.cascade as usize + job.flat_bypass as usize;
+        job.pipeline.tiers = 1 + job.cascade_model.is_some() as usize + job.flat_bypass as usize;
         if job.input.as_os_str().is_empty() || (!analyze_only && job.output.as_os_str().is_empty()) {
             self.push_log(LogLevel::Error, "input (and output) paths are required".into());
             return;
@@ -291,8 +401,19 @@ impl Shell {
                 ui.label("Output");
                 ui.add(egui::TextEdit::singleline(&mut self.output).hint_text("out.mkv or a directory").desired_width(f32::INFINITY));
                 ui.end_row();
+                ui.label("Models folder");
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.models_dir).desired_width(200.0));
+                    if ui.add_enabled(!self.scanning, egui::Button::new("Scan")).clicked() {
+                        self.rescan_models();
+                    }
+                });
+                ui.end_row();
                 ui.label("Model");
-                ui.add(egui::TextEdit::singleline(&mut self.model).hint_text(".safetensors / .json").desired_width(f32::INFINITY));
+                self.model_combo(ui, "model", false);
+                ui.end_row();
+                ui.label("Cascade");
+                self.model_combo(ui, "cascade", true);
                 ui.end_row();
             });
             ui.separator();
@@ -338,7 +459,6 @@ impl Shell {
             });
             ui.label("ring depths and block cache follow the memory budget (half of available RAM) unless set on the CLI");
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.cascade, "cascade (smooth → compact net)");
                 ui.checkbox(&mut self.job.flat_bypass, "flat → bicubic");
             });
             ui.horizontal(|ui| {
@@ -418,6 +538,10 @@ impl eframe::App for Shell {
     // The house eframe shape: root-Ui entry point.
     fn ui(&mut self, ui: &mut egui::Ui, _f: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if self.catalogue.is_empty() && !self.scanning && self.scan_rx.is_none() {
+            self.rescan_models();
+        }
+        self.drain_scan();
         self.drain(&ctx);
         if self.running {
             ctx.request_repaint_after(Duration::from_millis(100));

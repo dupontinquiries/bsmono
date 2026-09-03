@@ -37,6 +37,30 @@ The model is data: `Network::load` builds an op list from
 - `.safetensors` — Real-ESRGAN **RRDBNet** (x2/x4/x8 photo models: `conv_first` … 23 RRDB … `conv_up*`), or **SRVGGNetCompact** (`realesr-animevideov3`). Convert PyTorch checkpoints with `tools/pth2st.py` (numpy only, no torch).
 - `.json` — waifu2x `upconv_7` (nagadomi's format).
 
+`dandere2x models [dir] [--gmac N]` walks a folder and reports every model's
+architecture, cost, parameter count and — the part that matters — whether it
+loads and produces sane output. Verification runs a real forward pass on flat
+grey and checks the result is finite and still grey; a mis-converted or
+mis-ordered weight file passes a load but fails that, and would otherwise only
+show up as a bad picture hours into a job. With `--gmac` (a figure from
+`bench`) the cost becomes seconds per 1080p frame, and the command prints the
+cascade pairing the folder supports, e.g.
+
+```
+    ok  realesr-animevideov3   SRVGG x4 · 0.62 MMAC/px · 0.6M params · 1.3 s/1080p frame
+    ok  RealESRGAN_x2          RRDBNet x2 · 4.48 MMAC/px · 16.7M params · 9.1 s/1080p frame
+
+x2 ladder: --model .../RealESRGAN_x2.safetensors --cascade .../upconv_7...json  (8x)
+```
+
+The shell has the same catalogue as a picker (folder field + Scan, one row per
+model with its badge and cost, cascade tier chosen from the same list),
+modelled on logscope's `logscope-egui/src/model.rs` — including the lesson it
+paid for: **selection is keyed by path, not by list index**, because a rescan
+shifts every index after an added file and a stale index stays in range while
+naming a different model. Unusable models are reported in the log rather than
+offered as choices.
+
 `models/` vendors `realesr-animevideov3.safetensors` (2.5 MB, x4, ~0.62 MMAC
 per input pixel). The RRDB photo models are 67 MB each and are not vendored;
 `RealESRGAN_x2` costs ~4.5 MMAC per input pixel, x4 ~17. `dandere2x model

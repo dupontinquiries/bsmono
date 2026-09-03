@@ -173,6 +173,19 @@ enum Cmd {
     Model {
         path: PathBuf,
     },
+    /// Scan a models folder: architecture, cost, and whether each one loads
+    /// and produces sane output. `--gmac` turns cost into seconds per frame
+    /// using a figure from `bench` on this machine.
+    Models {
+        /// Folder to walk (default: the app's `models/` directory).
+        dir: Option<PathBuf>,
+        /// Skip the verification forward pass (classification only).
+        #[arg(long)]
+        quick: bool,
+        /// GMAC/s from `dandere2x bench`, to report seconds per 1080p frame.
+        #[arg(long)]
+        gmac: Option<f64>,
+    },
     /// The GUI.
     #[cfg(feature = "app")]
     App,
@@ -321,6 +334,45 @@ fn main() -> anyhow::Result<()> {
             {
                 let _ = (model, tile, inflight, iters, vram_budget);
                 anyhow::bail!("built without the `gpu` feature");
+            }
+        }
+        Cmd::Models { dir, quick, gmac } => {
+            let dir = dir.unwrap_or_else(|| {
+                job::default_model_paths()
+                    .into_iter()
+                    .find(|p| p.exists())
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                    .unwrap_or_else(|| PathBuf::from("models"))
+            });
+            // `..` segments from the default-path search make the printed
+            // paths unusable for copy-paste; resolve them.
+            let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+            let found = d2x_core::registry::scan(&dir, !quick);
+            if found.is_empty() {
+                println!("no .safetensors or .json models under {}", dir.display());
+            }
+            for m in &found {
+                let (name, sub, badge) = m.row();
+                let cost = gmac.map(|g| format!(" · {:.1} s/1080p frame", m.secs_per_1080p(g))).unwrap_or_default();
+                println!("{badge:>6}  {name:<34} {sub}{cost}");
+                if let Some(d) = m.status.detail() {
+                    println!("        {d}");
+                }
+            }
+            // The cascade needs two usable models at the same output scale;
+            // say which pair the folder offers rather than making the user work
+            // it out from the list.
+            for scale in [2u32, 3, 4] {
+                if let Some((cheap, dear)) = d2x_core::registry::ladder(&found, scale) {
+                    println!(
+                        "\nx{scale} ladder: --model {} --cascade {}  ({:.2} vs {:.2} MMAC/px, {:.0}x)",
+                        dear.path.display(),
+                        cheap.path.display(),
+                        dear.macs_per_px / 1e6,
+                        cheap.macs_per_px / 1e6,
+                        dear.macs_per_px / cheap.macs_per_px.max(1.0)
+                    );
+                }
             }
         }
         Cmd::Probe => {

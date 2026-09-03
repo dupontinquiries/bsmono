@@ -582,7 +582,12 @@ mod tests {
             }
         }
         let out = Arc::new(Mutex::new(Vec::new()));
-        let cfg = PipelineConfig { analyze: AnalyzeConfig { block_size: 16, bleed: 1, tier_std: [2.0, 12.0], ..Default::default() }, noise: 0, ..Default::default() };
+        // Pinned to the std metric: this fixture's three blocks (flat, gentle
+        // ramp, checker) were chosen to separate under luma std-dev. The
+        // default metric is high-frequency energy, under which the ramp is as
+        // blur-free as the flat block and both route to bicubic — correct
+        // behaviour, different fixture.
+        let cfg = PipelineConfig { analyze: AnalyzeConfig { block_size: 16, bleed: 1, tier_std: [2.0, 12.0], tier_metric: crate::predict::TierMetric::Std, ..Default::default() }, noise: 0, ..Default::default() };
         let tiers: Vec<Box<dyn Upscaler>> = (0..3).map(|_| Box::new(NearestUpscaler { scale: 2 }) as Box<dyn Upscaler>).collect();
         let mut stats = Vec::new();
         run_tiered(Box::new(VecSource::new(vec![f0.clone(), f1.clone()], (30, 1))), tiers, Box::new(VecSink { frames: out.clone() }), cfg, |e| {

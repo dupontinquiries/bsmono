@@ -38,8 +38,12 @@ pub struct AnalyzeConfig {
     /// Texture thresholds (luma standard deviation, 0–255 units) for routing
     /// missing blocks to cheaper tiers: below `[0]` → tier 2 (bicubic),
     /// below `[1]` → tier 1 (cheap network), else tier 0. Only tiers the
-    /// pipeline actually has upscalers for are used.
+    /// pipeline actually has upscalers for are used. Units depend on
+    /// `tier_metric`; `dandere2x calibrate` measures the right values for a
+    /// clip instead of guessing them.
     pub tier_std: [f64; 2],
+    /// Which measure `tier_std` is compared against.
+    pub tier_metric: TierMetric,
     /// Gate hysteresis: a block that has been reused for `n` consecutive
     /// frames gets its threshold scaled by `1 + streak_bonus · min(n, 8) / 8`.
     /// Bounds drift at that multiple of the JPEG error. 0 = off.
@@ -48,7 +52,7 @@ pub struct AnalyzeConfig {
 
 impl Default for AnalyzeConfig {
     fn default() -> Self {
-        AnalyzeConfig { block_size: 30, bleed: 1, min_psnr: 5.2, redraw_fraction: 0.90, fade: true, tier_std: [2.0, 8.0], streak_bonus: 0.0 }
+        AnalyzeConfig { block_size: 30, bleed: 1, min_psnr: 5.2, redraw_fraction: 0.90, fade: true, tier_std: [1.0, 4.0], tier_metric: TierMetric::HighFreq, streak_bonus: 0.0 }
     }
 }
 
@@ -65,6 +69,56 @@ pub struct AnalyzeState {
 /// Upscaled bytes for the `Cached` blocks of one plan, attached by the
 /// analysis stage so eviction between the stages cannot lose them.
 pub type CachedBlocks = std::collections::HashMap<u64, std::sync::Arc<Vec<u8>>>;
+
+/// Which measure decides a missing block's tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TierMetric {
+    /// Luma standard deviation. Cheap, but conflates a smooth gradient with
+    /// film grain: both land mid-range while wanting opposite treatment.
+    Std,
+    /// Mean absolute 3x3 Laplacian response — high-frequency energy. This is
+    /// the quantity a super-resolution network can actually act on: bokeh,
+    /// motion blur and defocus have low HF energy no matter how much contrast
+    /// or noise they carry, so the expensive model has nothing to recover
+    /// there and provably cannot beat the cheap one.
+    #[default]
+    HighFreq,
+}
+
+/// Mean absolute 3x3 Laplacian of luma over a block's interior, in 0-255
+/// units. The standard defocus measure, computed on integer luma.
+pub fn block_hf_energy(f: &Frame, x: u32, y: u32, size: u32) -> f64 {
+    if size < 3 {
+        return 0.0;
+    }
+    let luma = |px: &[u8]| (77 * px[0] as i32 + 150 * px[1] as i32 + 29 * px[2] as i32) >> 8;
+    let mut sum: u64 = 0;
+    let mut n: u64 = 0;
+    for j in 1..size - 1 {
+        let above = f.row(y + j - 1, x, x + size);
+        let mid = f.row(y + j, x, x + size);
+        let below = f.row(y + j + 1, x, x + size);
+        for i in 1..(size as usize) - 1 {
+            let c = luma(&mid[i * 3..i * 3 + 3]);
+            let lap = 4 * c
+                - luma(&mid[(i - 1) * 3..(i - 1) * 3 + 3])
+                - luma(&mid[(i + 1) * 3..(i + 1) * 3 + 3])
+                - luma(&above[i * 3..i * 3 + 3])
+                - luma(&below[i * 3..i * 3 + 3]);
+            sum += lap.unsigned_abs() as u64;
+            n += 1;
+        }
+    }
+    sum as f64 / n.max(1) as f64
+}
+
+/// The tier feature for a block under `metric`.
+pub fn block_feature(f: &Frame, x: u32, y: u32, size: u32, metric: TierMetric) -> f64 {
+    match metric {
+        TierMetric::Std => block_luma_std(f, x, y, size),
+        TierMetric::HighFreq => block_hf_energy(f, x, y, size),
+    }
+}
 
 /// Luma standard deviation of a block — the texture measure for tiering.
 fn block_luma_std(f: &Frame, x: u32, y: u32, size: u32) -> f64 {
@@ -308,7 +362,7 @@ pub fn analyze_tiered(
                 return 0;
             }
             let (x, y) = grid.origin(i);
-            let sd = block_luma_std(next, x, y, bs);
+            let sd = block_feature(next, x, y, bs, cfg.tier_metric);
             if tiers >= 3 && sd < cfg.tier_std[0] {
                 2
             } else if tiers >= 2 && sd < cfg.tier_std[1] {
@@ -499,7 +553,7 @@ mod tier_tests {
 
     #[test]
     fn missing_blocks_route_by_texture() {
-        let cfg = AnalyzeConfig { block_size: 16, bleed: 1, tier_std: [2.0, 12.0], ..Default::default() };
+        let cfg = AnalyzeConfig { block_size: 16, bleed: 1, tier_std: [2.0, 12.0], tier_metric: TierMetric::Std, ..Default::default() };
         let prev = smooth(64, 64, 1);
         let mut next = prev.clone();
         // flat block (uniform), smooth block (gentle ramp), textured block (checker)
@@ -599,5 +653,53 @@ mod cache_tests {
         assert_eq!(p2.stats.cached, 1);
         assert_eq!(c2.len(), 1);
         assert!(c2.values().next().unwrap().iter().all(|&b| b == 7));
+    }
+}
+
+#[cfg(test)]
+mod feature_tests {
+    use super::*;
+    use crate::testimg::smooth;
+
+    /// The point of using high-frequency energy: it separates cases that luma
+    /// standard deviation cannot. A blurred edge and a sharp checkerboard can
+    /// carry the same contrast, but only one has detail a network could
+    /// restore.
+    #[test]
+    fn hf_energy_separates_blur_from_detail_where_std_does_not() {
+        let mut sharp = Frame::new(32, 32);
+        let mut blurred = Frame::new(32, 32);
+        let mut grain = Frame::new(32, 32);
+        for y in 0..32u32 {
+            for x in 0..32u32 {
+                // 2x2 checkerboard: maximum high-frequency detail.
+                let c = if ((x / 2) + (y / 2)) % 2 == 0 { 40u8 } else { 210 };
+                sharp.set_px(x, y, [c, c, c]);
+                // A smooth ramp of the same span: same contrast, no detail.
+                let g = (40.0 + 170.0 * (x as f64 / 31.0)) as u8;
+                blurred.set_px(x, y, [g, g, g]);
+            }
+        }
+        grain.data.iter_mut().for_each(|b| *b = 128);
+        grain.add_uniform_noise(30, 4);
+
+        let f = |fr: &Frame| (block_luma_std(fr, 0, 0, 32), block_hf_energy(fr, 0, 0, 32));
+        let (s_sharp, h_sharp) = f(&sharp);
+        let (s_blur, h_blur) = f(&blurred);
+        let (s_grain, h_grain) = f(&grain);
+
+        // Contrast is comparable between the checkerboard and the ramp — as a
+        // ratio, not a difference: a checkerboard's std is half its span (85)
+        // while a linear ramp's is span/sqrt(12) (51), so the same span never
+        // gives the same number, only the same order.
+        assert!(s_sharp < 2.0 * s_blur, "std {s_sharp} vs {s_blur} is not the same order");
+        // ...but high-frequency energy is not, by a wide margin.
+        assert!(h_sharp > 8.0 * h_blur, "hf {h_sharp} vs {h_blur}");
+        // Grain reads as detail on both measures — it is genuinely
+        // high-frequency, so routing it cheap is a choice, not a free lunch.
+        assert!(h_grain > h_blur, "hf grain {h_grain} vs blur {h_blur}");
+        assert!(s_grain > 5.0);
+        // A smooth synthetic frame sits far below the checkerboard.
+        assert!(block_hf_energy(&smooth(32, 32, 1), 0, 0, 32) < h_sharp);
     }
 }
