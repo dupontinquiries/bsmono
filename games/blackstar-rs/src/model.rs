@@ -1228,6 +1228,60 @@ fn bounds_from_extent(lo: Vec3, hi: Vec3, ext_half: Vec3) -> (Vec3, f32) {
 
 #[cfg(test)]
 mod tests {
+
+    /// The orientation search runs on meshes nobody in this repo authored,
+    /// so it meets empty, degenerate and corrupt vertex sets. Probed with
+    /// all of them; unlike anim/orient/skeleton/xform, this path was
+    /// already sound, and these pin why so it stays that way.
+    #[test]
+    fn the_orientation_search_survives_degenerate_meshes() {
+        fn v(p: [f32; 3]) -> Vertex {
+            Vertex { pos: p, nrm: [0.0, 1.0, 0.0], uv: [0.0, 0.0] }
+        }
+        let cases: [(&str, Vec<Vertex>); 5] = [
+            ("empty", vec![]),
+            ("single point", vec![v([1.0, 2.0, 3.0])]),
+            ("collinear", vec![v([0.0; 3]), v([5.0, 0.0, 0.0])]),
+            ("contains NaN", vec![v([0.0; 3]), v([f32::NAN; 3]), v([1.0, 1.0, 1.0])]),
+            ("enormous", vec![v([-1e30; 3]), v([1e30; 3])]),
+        ];
+        for (label, verts) in cases {
+            for (name, q) in [("orientation", find_orientation(&verts)), ("upright", find_upright(&verts))] {
+                assert!(q.is_finite(), "{label}: {name} returned a NaN quaternion");
+                assert!((q.length() - 1.0).abs() < 1e-4, "{label}: {name} is not a unit quaternion");
+            }
+        }
+    }
+
+    #[test]
+    fn a_nan_vertex_does_not_poison_the_bounds() {
+        // LOAD-BEARING AND EASY TO BREAK. `wheel_score` accumulates bounds
+        // with `Vec3::min`/`max`, and f32's min/max return the non-NaN
+        // operand — so a corrupt vertex drops out of the extents instead of
+        // turning them into NaN, and the good vertices still describe the
+        // body.
+        //
+        // Nothing said so. Swapping to a hand-rolled `if a < b` comparison,
+        // which propagates NaN, would silently turn every model containing
+        // one bad vertex into an unscorable one.
+        fn v(p: [f32; 3]) -> Vertex {
+            Vertex { pos: p, nrm: [0.0, 1.0, 0.0], uv: [0.0, 0.0] }
+        }
+        let clean = vec![
+            v([-2.0, -0.5, -4.0]), v([2.0, 0.5, 4.0]),
+            v([-2.0, 0.5, 4.0]), v([2.0, -0.5, -4.0]),
+        ];
+        let mut dirty = clean.clone();
+        dirty.push(v([f32::NAN; 3]));
+
+        let a = wheel_score(&clean, Quat::IDENTITY);
+        let b = wheel_score(&dirty, Quat::IDENTITY);
+        assert!(a.is_finite() && b.is_finite(), "score went non-finite: {a} vs {b}");
+        // The extra vertex shifts the below-centre ratio slightly; the
+        // point is that the score stays in the same neighbourhood rather
+        // than collapsing to f32::MIN.
+        assert!((a - b).abs() < 1.0, "a single NaN vertex changed the score: {a} vs {b}");
+    }
     use super::*;
 
     /// SETTLE MUST NOT LAY A STANDING ROBOT DOWN.
@@ -1606,3 +1660,4 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
             // runtime blend path only; this is the static load path).
             ride_h }
 }
+

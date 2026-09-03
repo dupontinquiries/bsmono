@@ -29,6 +29,7 @@ Probing each module took a couple of minutes.
 | `xform.rs` | NaN in any argument spread through the returned box |
 | `compact.rs` | clean |
 | `partdetect.rs` | clean |
+| `model.rs` (orientation search) | clean |
 
 The panic is the only crash. The rest are quieter and, for a renderer,
 mostly worse to diagnose:
@@ -83,8 +84,28 @@ that cannot swing, the input unchanged for a box that cannot be resized,
 zero for a measurement with nothing to measure. Inventing a new failure
 mode to handle a bad input is how you get two bugs instead of one.
 
+## model.rs, which I expected to be the worst
+
+It is the loader, so a corrupt mesh reaches it before anything else, and
+this note originally predicted it would be the richest target. It was
+not. `find_orientation`, `find_upright` and `wheel_score` return a finite
+unit quaternion for an empty mesh, a single point, a collinear pair, a
+set containing NaN, and coordinates at 1e30. Nothing needed fixing.
+
+One property there is load-bearing and was undocumented: `wheel_score`
+accumulates bounds with `Vec3::min`/`max`, and f32's min/max return the
+non-NaN operand, so a corrupt vertex DROPS OUT of the extents rather
+than turning them into NaN. A model with one bad vertex still scores
+from its good ones.
+
+That is now pinned by a test, and the test has teeth — but only after a
+second attempt. The obvious mutation, `if p.x < lo.x { p.x } else { lo.x }`,
+does not propagate NaN either (`NaN < x` is false, so the accumulator is
+kept) and the test passed against it. Reversing the comparison to
+`if lo.x < p.x { lo.x } else { p.x }` does propagate, and fails it. Worth
+knowing if you are ever checking whether a NaN test actually bites: half
+the plausible mutations are accidentally correct.
+
 ## Where this has not been done
 
-`align.rs`, `meshgen.rs` and `model.rs` have not been probed. `model.rs`
-is the interesting one: it is the loader, so it is where a corrupt mesh
-arrives first, and everything above is downstream of it.
+`align.rs` and `meshgen.rs` have not been probed.
