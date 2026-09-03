@@ -38,6 +38,7 @@ pub const CONV_RT2C8H_WGSL: &str = include_str!("../shaders/conv3x3_rt2c8h.wgsl"
 pub const DECONV_WGSL: &str = include_str!("../shaders/deconv4x4s2.wgsl");
 pub const ADD_WGSL: &str = include_str!("../shaders/add_scaled.wgsl");
 pub const PACK_WGSL: &str = include_str!("../shaders/pack.wgsl");
+pub const EXTRACT_WGSL: &str = include_str!("../shaders/extract.wgsl");
 
 #[derive(Debug, Clone, Copy)]
 pub struct GpuOptions {
@@ -322,6 +323,19 @@ struct AddParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ExtractParams {
+    frame_w: u32,
+    region_x: u32,
+    region_y: u32,
+    region_w: u32,
+    region_h: u32,
+    unshuffle: u32,
+    tw: u32,
+    th: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct PackParams {
     in_w: u32,
     in_h: u32,
@@ -418,6 +432,19 @@ pub struct WgpuUpscaler {
     deconv_pipeline: wgpu::ComputePipeline,
     add_pipeline: wgpu::ComputePipeline,
     pack_pipeline: wgpu::ComputePipeline,
+    extract_pipeline: wgpu::ComputePipeline,
+    extract_layout: wgpu::BindGroupLayout,
+    /// The padded source frame, resident for the whole frame's tiles.
+    frame_buf: Option<wgpu::Buffer>,
+    frame_words: u64,
+    frame_width: u32,
+    /// Per-frame scratch (extract params + bind groups) kept alive until the
+    /// frame's single submit has been waited on.
+    keep: Vec<wgpu::Buffer>,
+    keep_bg: Vec<wgpu::BindGroup>,
+    /// Staging large enough for several tiles' packed output, so a frame can
+    /// be read back once instead of per tile.
+    batch_staging: Option<wgpu::Buffer>,
     sets: Vec<ActSet>,
     _weights: Vec<OpWeights>,
     /// Bytes of GPU memory held by the activation sets.
@@ -495,6 +522,8 @@ impl WgpuUpscaler {
         let deconv_pipeline = pipeline("deconv4x4s2", DECONV_WGSL, &deconv_layout);
         let add_pipeline = pipeline("add_scaled", ADD_WGSL, &add_layout);
         let pack_pipeline = pipeline("pack", PACK_WGSL, &pack_layout);
+        let extract_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("extract"), entries: &[uniform(0), storage(1, true), storage(2, false)] });
+        let extract_pipeline = pipeline("extract", EXTRACT_WGSL, &extract_layout);
 
         // Weights once, in the kernels' layouts.
         let mut weights: Vec<OpWeights> = Vec::with_capacity(net.ops.len());
@@ -675,21 +704,75 @@ impl WgpuUpscaler {
             sets.push(ActSet { conv_cache: vec![None; steps.len()], bufs, steps, pack_params, pack_bind, out, staging });
         }
         let set_bytes_total = set_bytes(&net, tile as u64) * inflight as u64;
-        Ok(WgpuUpscaler { ctx, net, tile, inflight, kernel: opts.kernel, conv_pipeline, deconv_pipeline, add_pipeline, pack_pipeline, sets, _weights: weights, set_bytes_total })
+        Ok(WgpuUpscaler { ctx, net, tile, inflight, kernel: opts.kernel, conv_pipeline, deconv_pipeline, add_pipeline, pack_pipeline, extract_pipeline, extract_layout, frame_buf: None, frame_words: 0, frame_width: 0, keep: Vec::new(), keep_bg: Vec::new(), batch_staging: None, sets, _weights: weights, set_bytes_total })
     }
 
     /// Encode and submit one tile on activation set `si`; returns the
     /// submission to wait for and the packed output byte count.
+    /// Encode one tile's whole chain into `enc`, reading the tile's input from
+    /// the resident frame via the extract pass. Returns the packed byte count.
+    fn encode_tile(&mut self, enc: &mut wgpu::CommandEncoder, si: usize, io: TileIo, staging_off: u64) -> anyhow::Result<u64> {
+        let net = self.net.clone();
+        let u = net.unshuffle;
+        let (tw, th) = (io.region_w / u, io.region_h / u);
+        let frame = self.frame_buf.as_ref().ok_or_else(|| anyhow!("no resident frame"))?;
+        let (fw, params, bind) = {
+            let set = &self.sets[si];
+            // Baked at creation, NOT `write_buffer`: queued writes all land
+            // before any command in the submit, so a per-tile queued write
+            // would give every tile the last tile's parameters.
+            let ep = ExtractParams { frame_w: self.frame_width, region_x: io.region_x, region_y: io.region_y, region_w: io.region_w, region_h: io.region_h, unshuffle: u, tw, th };
+            let params = self.ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("extract params"), contents: bytemuck::bytes_of(&ep), usage: wgpu::BufferUsages::UNIFORM });
+            let bind = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("extract"),
+                layout: &self.extract_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: frame.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: set.bufs[net.input].as_entire_binding() },
+                ],
+            });
+            (self.frame_width, params, bind)
+        };
+        let _ = fw;
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("extract"), timestamp_writes: None });
+            pass.set_pipeline(&self.extract_pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(io.region_w.div_ceil(16), io.region_h.div_ceil(16), 1);
+        }
+        self.keep.push(params);
+        self.keep_bg.push(bind);
+        let n = self.encode_chain(enc, si, th as usize, tw as usize)?;
+        let set = &self.sets[si];
+        enc.copy_buffer_to_buffer(&set.out, 0, self.batch_staging.as_ref().unwrap(), staging_off, n);
+        Ok(n)
+    }
+
     fn submit_tile(&mut self, si: usize, input: &Tensor) -> anyhow::Result<(wgpu::SubmissionIndex, u64)> {
         let net = self.net.clone();
         let set = &mut self.sets[si];
         let (device, queue) = (&self.ctx.device, &self.ctx.queue);
         anyhow::ensure!(input.c == net.bufs[net.input].channels, "input channels");
         queue.write_buffer(&set.bufs[net.input], 0, bytemuck::cast_slice(&input.data));
-
-        let mut dims: Vec<Option<(u32, u32)>> = vec![None; net.bufs.len()];
-        dims[net.input] = Some((input.h as u32, input.w as u32));
+        let (ih, iw) = (input.h, input.w);
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tile") });
+        let out_bytes = self.encode_chain(&mut enc, si, ih, iw)?;
+        let set = &self.sets[si];
+        enc.copy_buffer_to_buffer(&set.out, 0, &set.staging, 0, out_bytes);
+        let idx = self.ctx.queue.submit(Some(enc.finish()));
+        Ok((idx, out_bytes))
+    }
+
+    /// Encode the network's op list plus the pack pass for one tile whose
+    /// input activation buffer is already populated.
+    fn encode_chain(&mut self, enc: &mut wgpu::CommandEncoder, si: usize, ih: usize, iw: usize) -> anyhow::Result<u64> {
+        let net = self.net.clone();
+        let (device, queue) = (&self.ctx.device, &self.ctx.queue);
+        let _ = device;
+        let set = &mut self.sets[si];
+        let mut dims: Vec<Option<(u32, u32)>> = vec![None; net.bufs.len()];
+        dims[net.input] = Some((ih as u32, iw as u32));
         let (steps, conv_cache) = (&set.steps, &mut set.conv_cache);
         for (step_i, step) in steps.iter().enumerate() {
             match step {
@@ -749,17 +832,14 @@ impl WgpuUpscaler {
         }
         let (oh, ow) = dims[net.output].ok_or_else(|| anyhow!("output unsized"))?;
         let (fh, fw) = (oh * net.shuffle, ow * net.shuffle);
-        queue.write_buffer(&set.pack_params, 0, bytemuck::bytes_of(&PackParams { in_w: ow, in_h: oh, r: net.shuffle, s: net.scale, u: net.unshuffle, sk_w: input.w as u32, sk_h: input.h as u32, add_input: net.add_input as u32 }));
+        queue.write_buffer(&set.pack_params, 0, bytemuck::bytes_of(&PackParams { in_w: ow, in_h: oh, r: net.shuffle, s: net.scale, u: net.unshuffle, sk_w: iw as u32, sk_h: ih as u32, add_input: net.add_input as u32 }));
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("pack"), timestamp_writes: None });
             pass.set_pipeline(&self.pack_pipeline);
             pass.set_bind_group(0, &set.pack_bind, &[]);
             pass.dispatch_workgroups(fw.div_ceil(16), fh.div_ceil(16), 1);
         }
-        let out_bytes = (fw as u64) * (fh as u64) * 4;
-        enc.copy_buffer_to_buffer(&set.out, 0, &set.staging, 0, out_bytes);
-        let idx = queue.submit(Some(enc.finish()));
-        Ok((idx, out_bytes))
+        Ok((fw as u64) * (fh as u64) * 4)
     }
 
     /// Wait for a submitted tile and read its packed output.
@@ -793,30 +873,106 @@ impl WgpuUpscaler {
         self.finish_tile(0, idx, n)
     }
 
-    /// Tiles rotate through the activation sets: with `inflight` sets, the
-    /// upload of tile k+1 and the readback of tile k−1 overlap the compute
-    /// of tile k.
+    /// Ensure the resident frame buffer and the batch staging buffer are big
+    /// enough, recreating only when they are not.
+    fn ensure_frame_buffers(&mut self, words: u64, staging_bytes: u64) {
+        if self.frame_words < words {
+            self.frame_buf = Some(self.ctx.device.create_buffer(&wgpu::BufferDescriptor { label: Some("frame"), size: (words * 4).max(16), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }));
+            self.frame_words = words;
+        }
+        let have = self.batch_staging.as_ref().map_or(0, |b| b.size());
+        if have < staging_bytes {
+            self.batch_staging = Some(self.ctx.device.create_buffer(&wgpu::BufferDescriptor { label: Some("batch staging"), size: staging_bytes.max(16), usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }));
+        }
+    }
+
+    /// One upload, one command buffer for every tile, one submit, one map.
+    ///
+    /// Per-tile uploads made this impossible: `queue.write_buffer` writes all
+    /// land before any command in the same submit, so tile 2's input would
+    /// clobber tile 1's before tile 1's passes ran. With the padded frame
+    /// resident and each tile extracted by a pass *inside* the encoder, the
+    /// dependency is expressed in command order, which wgpu barriers
+    /// correctly — so a frame costs one sync instead of one per tile.
     pub fn upscale_frame(&mut self, frame: &Frame) -> anyhow::Result<Frame> {
         let net = self.net.clone();
         let padded = net.pad_frame(frame);
-        let mut out = Frame::new(frame.width * net.scale, frame.height * net.scale);
-        let mut pending: std::collections::VecDeque<(usize, wgpu::SubmissionIndex, TileIo, u64)> = std::collections::VecDeque::new();
-        for (k, rect) in tiles(frame.width, frame.height, self.tile).into_iter().enumerate() {
-            let si = k % self.inflight;
-            if pending.len() == self.inflight {
-                let (s, idx, io, n) = pending.pop_front().unwrap();
-                let rgba = self.finish_tile(s, idx, n)?;
-                net.write_output_rgba8(&mut out, io, &rgba);
+        let rects = tiles(frame.width, frame.height, self.tile);
+        let ios: Vec<TileIo> = rects.iter().map(|r| net.tile_io(*r)).collect();
+        let s = net.scale as u64;
+        // Valid networks (upconv_7) emit exactly the tile; same-pad networks
+        // emit the whole padded region. Mirrors `write_output_rgba8`.
+        let sizes: Vec<u64> = ios
+            .iter()
+            .map(|io| {
+                let (w, h) = if net.exact { (io.rect.w as u64, io.rect.h as u64) } else { (io.region_w as u64, io.region_h as u64) };
+                (w * s) * (h * s) * 4
+            })
+            .collect();
+        // Offsets must satisfy COPY_BUFFER_ALIGNMENT (4) — they are multiples
+        // of 4 by construction, but round anyway to keep that local.
+        let mut offs = Vec::with_capacity(sizes.len());
+        let mut total = 0u64;
+        for n in &sizes {
+            offs.push(total);
+            total += (n + 3) & !3;
+        }
+        let words = (padded.width as u64) * (padded.height as u64);
+        self.ensure_frame_buffers(words, total);
+        self.frame_width = padded.width;
+        let rgba = Network::frame_rgba8(&padded);
+        self.ctx.queue.write_buffer(self.frame_buf.as_ref().unwrap(), 0, bytemuck::cast_slice(&rgba));
+
+        self.keep.clear();
+        self.keep_bg.clear();
+        // Tiles are grouped by region size: the conv params uniforms live in
+        // the activation set and are shared by every tile in an encoder, so
+        // only same-shaped tiles may share one submit. Balanced tiling yields
+        // at most a couple of shapes, so this is still one or two submits per
+        // frame rather than one per tile.
+        let mut groups: Vec<((u32, u32), Vec<usize>)> = Vec::new();
+        for (i, io) in ios.iter().enumerate() {
+            let key = (io.region_w, io.region_h);
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, v)) => v.push(i),
+                None => groups.push((key, vec![i])),
             }
-            let io: TileIo = net.tile_io(rect);
-            let input = net.extract_input(&padded, io);
-            let (idx, n) = self.submit_tile(si, &input)?;
-            pending.push_back((si, idx, io, n));
         }
-        while let Some((s, idx, io, n)) = pending.pop_front() {
-            let rgba = self.finish_tile(s, idx, n)?;
-            net.write_output_rgba8(&mut out, io, &rgba);
+        let mut last_idx = None;
+        for (_, idxs) in &groups {
+            let mut enc = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+            for &i in idxs {
+                // One activation set suffices: compute passes in a single
+                // encoder are ordered against each other, so tiles reuse it.
+                let n = self.encode_tile(&mut enc, 0, ios[i], offs[i])?;
+                anyhow::ensure!(n == sizes[i], "tile {i}: packed {n} bytes, expected {}", sizes[i]);
+            }
+            last_idx = Some(self.ctx.queue.submit(Some(enc.finish())));
         }
+        let idx = last_idx.ok_or_else(|| anyhow!("no tiles"))?;
+
+        let staging = self.batch_staging.as_ref().unwrap();
+        let slice = staging.slice(..total);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.ctx.device.poll(wgpu::PollType::Wait { submission_index: Some(idx), timeout: None }).context("device poll")?;
+        if rx.try_recv().is_err() {
+            self.ctx.device.poll(wgpu::PollType::wait_indefinitely()).context("device poll")?;
+            rx.recv().context("map_async dropped")?.context("map_async")?;
+        }
+        let mut out = Frame::new(frame.width * net.scale, frame.height * net.scale);
+        {
+            let mapped = slice.get_mapped_range();
+            for (i, io) in ios.iter().enumerate() {
+                let a = offs[i] as usize;
+                net.write_output_rgba8(&mut out, *io, &mapped[a..a + sizes[i] as usize]);
+            }
+        }
+        staging.unmap();
+        self.keep.clear();
+        self.keep_bg.clear();
         Ok(out)
     }
 }

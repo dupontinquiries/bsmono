@@ -660,6 +660,17 @@ impl Network {
         }
     }
 
+    /// The padded frame as RGBA8 words, the layout a GPU keeps resident so a
+    /// frame costs one upload instead of one per tile.
+    pub fn frame_rgba8(padded: &Frame) -> Vec<u32> {
+        let mut v = Vec::with_capacity((padded.width * padded.height) as usize);
+        for y in 0..padded.height {
+            let row = padded.row(y, 0, padded.width);
+            v.extend(row.chunks_exact(3).map(|p| (p[0] as u32) | ((p[1] as u32) << 8) | ((p[2] as u32) << 16) | 0xff00_0000));
+        }
+        v
+    }
+
     /// Whole-frame upscale on the CPU, tiled. The oracle and the no-GPU fallback.
     pub fn upscale_cpu(&self, frame: &Frame, tile: u32) -> Frame {
         let padded = self.pad_frame(frame);

@@ -102,7 +102,8 @@ are still open, recorded here so the debt is visible:
   gives every tile identical dims. Same mistake, one level up; now fixed the
   same way (`ActSet::conv_cache`), so after the first tile the writes are
   skipped.
-- **submit granularity.** Still one submit and one wait per tile.
+- **submit granularity.** Now one submit and one wait per *frame* (per
+  distinct tile shape, so one or two), down from one per tile.
 
 ### Why "K steps in one submit" is harder here than it looks
 
