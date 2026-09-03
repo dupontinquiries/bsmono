@@ -35,6 +35,24 @@
 //! take; too slowly and two reads merge. Both defaults here are conservative
 //! toward MERGING, because a merged pair is obvious on the first listen while a
 //! stray breath-take hides in a bank of hundreds.
+//!
+//! ## Detection is on the envelope; cuts are on samples
+//!
+//! An earlier version thresholded raw samples, which meant every duration had
+//! to be converted to a sample count at this call site. `audio-kit`'s
+//! `envelope_ms` is the right domain instead — one value per millisecond, mean
+//! rectified amplitude — so `min_gap_s` and `min_take_s` compare against a
+//! millisecond grid directly and mean the same thing at 44.1 kHz and 48 kHz.
+//! It is also a thousand times fewer comparisons.
+//!
+//! What does NOT move to milliseconds is the OUTPUT. A [`Span`] is handed to an
+//! encoder, and a millisecond boundary would be a rounding error baked into a
+//! shipped asset — so detection runs on the grid and the result converts back
+//! through `hop_samples`, which uses the same integer hop and is therefore
+//! exact. `audio-kit`'s own header records why the ms axis itself is not:
+//! `44100 / 1000` truncates to 44, so that axis runs 0.23% fast. Irrelevant
+//! here, because nothing accumulates — every boundary is converted
+//! independently.
 
 use crate::Kind;
 
@@ -86,30 +104,29 @@ fn db_to_amp(db: f32) -> f32 {
 
 impl Segmenter {
     /// Cut `samples` into spans of sound.
+    ///
+    /// A zero sample rate yields nothing: durations are meaningless without one
+    /// and the nonsense answer looks like a segmenter bug rather than a caller
+    /// one. That refusal now comes from `envelope_ms` returning empty rather
+    /// than being special-cased here.
     pub fn segment(&self, samples: &[f32], sr: u32) -> Vec<Span> {
-        // A zero sample rate makes every duration meaningless: the gap
-        // threshold rounds to zero samples, so ANY quiet sample becomes a
-        // boundary and a clean two-line session comes back as hundreds of
-        // spans. Refusing is right — there is no sensible answer, and the
-        // nonsense answer looks like a segmenter bug rather than a caller one.
-        if sr == 0 || samples.is_empty() {
+        let env = audio_kit::envelope::envelope_ms(samples, sr);
+        if env.is_empty() {
             return Vec::new();
         }
+        let hop = audio_kit::envelope::hop_samples(sr);
         let floor = db_to_amp(self.floor_db);
-        // at least one sample, so a small rate cannot degenerate the same way
-        let gap = ((self.min_gap_s * sr as f32) as usize).max(1);
-        let min_len = ((self.min_take_s * sr as f32) as usize).max(1);
+        // thresholds in MILLISECOND steps, which is what the grid is
+        let gap = ((self.min_gap_s * 1000.0) as usize).max(1);
+        let min_len = ((self.min_take_s * 1000.0) as usize).max(1);
         let pad = (self.pad_s * sr as f32) as usize;
 
-        let mut out: Vec<Span> = Vec::new();
+        let mut steps: Vec<(usize, usize)> = Vec::new();
         let mut run_start: Option<usize> = None;
         let mut quiet_since: Option<usize> = None;
 
-        for (i, s) in samples.iter().enumerate() {
-            // rectified instantaneous level. A window RMS would be smoother,
-            // but the gap requirement already supplies the smoothing and this
-            // keeps the pass single and exact.
-            if s.abs() > floor {
+        for (i, level) in env.iter().enumerate() {
+            if *level > floor {
                 if run_start.is_none() {
                     run_start = Some(i);
                 }
@@ -117,24 +134,24 @@ impl Segmenter {
             } else if run_start.is_some() && quiet_since.is_none() {
                 quiet_since = Some(i);
             }
-
             if let (Some(start), Some(q)) = (run_start, quiet_since) {
                 if i - q >= gap {
-                    out.push(Span { start, end: q });
+                    steps.push((start, q));
                     run_start = None;
                     quiet_since = None;
                 }
             }
         }
         if let Some(start) = run_start {
-            out.push(Span { start, end: quiet_since.unwrap_or(samples.len()) });
+            steps.push((start, quiet_since.unwrap_or(env.len())));
         }
 
-        out.into_iter()
-            .filter(|s| s.len() >= min_len)
-            .map(|s| Span {
-                start: s.start.saturating_sub(pad),
-                end: (s.end + pad).min(samples.len()),
+        steps
+            .into_iter()
+            .filter(|(a, b)| b.saturating_sub(*a) >= min_len)
+            .map(|(a, b)| Span {
+                start: (a * hop).saturating_sub(pad),
+                end: ((b * hop) + pad).min(samples.len()),
             })
             .collect()
     }
@@ -279,6 +296,52 @@ mod tests {
         // samples, so every quiet sample split and a clean session came back
         // as hundreds of spans — nonsense that reads as a segmenter bug.
         assert!(seg.segment(&tone(0.5, 0.6), 0).is_empty());
+    }
+
+
+    #[test]
+    fn the_same_session_at_two_rates_cuts_in_the_same_places() {
+        // THE PROPERTY THE MOVE TO THE ENVELOPE BOUGHT. Thresholds are in
+        // milliseconds now, so a 44.1 kHz session and a 48 kHz one are cut
+        // identically in TIME without the caller converting anything. The old
+        // sample-domain version happened to do this too, but only because
+        // every threshold was multiplied by `sr` at the call site — which is
+        // exactly the conversion that eventually gets forgotten.
+        let at = |sr: u32| -> Vec<f32> {
+            let mut v = Vec::new();
+            for (secs, amp) in [(0.5, 0.0), (0.4, 0.6), (0.6, 0.0), (0.3, 0.6), (0.5, 0.0)] {
+                let n = (secs * sr as f32) as usize;
+                for i in 0..n {
+                    v.push(if amp > 0.0 { amp * (i as f32 * 0.05).sin() } else { 0.0008 });
+                }
+            }
+            v
+        };
+        let seg = Segmenter::default();
+        let a = seg.segment(&at(48_000), 48_000);
+        let b = seg.segment(&at(44_100), 44_100);
+        assert_eq!(a.len(), b.len(), "different take counts: {} vs {}", a.len(), b.len());
+        assert_eq!(a.len(), 2);
+        for (x, y) in a.iter().zip(&b) {
+            let (sa, sb) = (x.seconds(48_000), y.seconds(44_100));
+            assert!((sa - sb).abs() < 0.02, "spans differ in length: {sa:.3}s vs {sb:.3}s");
+        }
+    }
+
+    #[test]
+    fn a_boundary_converts_back_to_an_exact_sample() {
+        // Detection is on the millisecond grid; a cut is handed to an encoder,
+        // so it has to be a sample. Both directions use audio-kit's same
+        // integer hop, which is why the round trip does not drift — and why a
+        // span never starts mid-hop.
+        let hop = audio_kit::envelope::hop_samples(SR) as usize;
+        let s = session(&[(0.5, 0.0), (0.4, 0.6), (0.6, 0.0)]);
+        let spans = Segmenter::default().segment(&s, SR);
+        assert_eq!(spans.len(), 1);
+        // padding is the only thing that moves a boundary off the grid, and it
+        // is a whole number of samples by construction
+        let pad = (Segmenter::default().pad_s * SR as f32) as usize;
+        assert_eq!((spans[0].start + pad) % hop, 0, "start is not on a hop boundary");
     }
 
     fn expected(items: &[(&str, u8)]) -> Vec<Expected> {

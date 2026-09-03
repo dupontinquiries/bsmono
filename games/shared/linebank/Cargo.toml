@@ -5,7 +5,9 @@ edition = "2021"
 description = """
 The recording side of voice: addressable line ids, a script to hand an actor,
 takes mapped back to ids, and the selection policy that makes a small bank
-sound varied. Pure logic, no audio — audio-kit and voiceprint-kit do samples.
+sound varied. Detection borrows audio-kit's millisecond envelope; nothing here
+implements DSP.
 """
 
 [dependencies]
+audio-kit = { path = "../../../shared/audio-kit" }
