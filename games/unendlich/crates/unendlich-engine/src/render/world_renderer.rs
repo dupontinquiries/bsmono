@@ -1412,6 +1412,9 @@ impl WorldRenderer {
         // Indirect drawing infrastructure (v0.20). Owns the chunk metadata
         // SSBO + indirect command buffer + cull pipeline. See
         // chunk_indirect.rs for the design.
+        // Read once, for the error above: a driver that lacks these and a
+        // launcher that lost the assets produce the same symptom otherwise.
+        let features = unsafe { ctx.instance.get_physical_device_features(ctx.physical_device) };
         let indirect = unsafe {
             crate::render::chunk_indirect::IndirectDrawSet::new(
                 &ctx.device, &ctx.instance, ctx.physical_device,
@@ -1419,7 +1422,24 @@ impl WorldRenderer {
                 frames_in_flight,
             )
         }.map_err(|e| WorldRenderError::Other(
-            format!("Failed to create indirect draw set: {}", e)
+            // STILL FATAL, and deliberately so. Indirect drawing is not an
+            // optional path here — it is how chunks are drawn, and there is no
+            // second renderer to fall back to. Making the field an `Option`
+            // would put 27 unwraps behind a capability that, when absent,
+            // leaves nothing to draw with; that is a feature (a second draw
+            // path), not error handling, and pretending otherwise would turn a
+            // clear crash into a black window.
+            //
+            // What WAS wrong is that the message blamed a missing file which
+            // was committed and present. The shader is now resolved at run
+            // time (`assets::shader`) and the error carries what was actually
+            // searched, so a genuine capability problem and a launcher that
+            // moved the working directory no longer read the same.
+            format!(
+                "Failed to create indirect draw set: {e}\n                   device multiDrawIndirect={} drawIndirectFirstInstance={}\n                   (if both are true this is an asset-path problem, not a driver one —                  set UNENDLICH_ASSETS to the directory containing `assets/`)",
+                features.multi_draw_indirect != 0,
+                features.draw_indirect_first_instance != 0,
+            )
         ))?;
 
         // v0.24.20-vertex-pack: bind the chunks-metadata SSBO at

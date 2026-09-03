@@ -693,20 +693,19 @@ unsafe fn create_pipeline_layout(
 unsafe fn create_compute_pipeline(
     device: &Device, layout: vk::PipelineLayout,
 ) -> Result<vk::Pipeline, IndirectError> {
-    let candidates = [
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/shaders/chunk_cull.comp.spv"),
-        "assets/shaders/chunk_cull.comp.spv",
-        "src/shaders/chunk_cull.comp.spv",
-    ];
-    let mut bytes: Option<Vec<u8>> = None;
-    for p in &candidates {
-        if Path::new(p).exists() {
-            bytes = Some(std::fs::read(p)?);
-            break;
-        }
-    }
-    let bytes = bytes.ok_or_else(||
-        IndirectError::ShaderMissing(candidates[0].to_string()))?;
+    // Resolved at RUN time. The old list led with a compile-time absolute path
+    // — `concat!(env!("CARGO_MANIFEST_DIR"), ...)` — which is a string baked
+    // into the binary, not a lookup, and only resolves on the machine that
+    // built it with the tree still in place. A pinned or copied binary failed
+    // on a shader that is committed to the repository.
+    //
+    // The error carries what was actually searched, because "Shader missing"
+    // pointed at a file that had been there the whole time and sent the reader
+    // looking in the wrong place.
+    let path = crate::assets::shader("chunk_cull.comp.spv")
+        .ok_or_else(|| IndirectError::ShaderMissing(
+            crate::assets::miss_report("assets/shaders/chunk_cull.comp.spv")))?;
+    let bytes = std::fs::read(&path)?;
     let words: Vec<u32> = bytes.chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
 

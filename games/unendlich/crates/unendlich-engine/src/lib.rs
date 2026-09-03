@@ -7,6 +7,7 @@
 //! * `player`      - player physics & input handling
 //! * `constants`   - tunable game-wide values
 
+pub mod assets;
 pub mod pngutil;
 pub mod constants;
 pub mod scale;
