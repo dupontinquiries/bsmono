@@ -562,6 +562,10 @@ fn main() {
         eprintln!("usage: fold_audit <bots dir> <chassis>... | <bots dir> --sweep-all");
         std::process::exit(2);
     }
+    if args.get(2).map(|a| a == "--unify").unwrap_or(false) {
+        unify_report(&PathBuf::from(&args[1]));
+        return;
+    }
     if args.get(2).map(|a| a == "--cavity").unwrap_or(false) {
         cavity_report(&PathBuf::from(&args[1]));
         return;
@@ -989,4 +993,50 @@ fn cavity_report(dir: &Path) {
         "DOES NOT FIT — the cavity is smaller than the limbs; no stow can hide them"
     };
     println!("  {verdict}");
+}
+
+/// How many chassis does `align::unify` decline, and therefore fall back
+/// to the popping step-through?
+///
+/// `unify`'s doc records the contract: "On refusal (`None`) the caller
+/// keeps stepping, which is today's behaviour". Stepping means the
+/// transform jumps pose to pose instead of blending, so a refusal is a
+/// visibly worse transform — and nothing reports how often it happens.
+fn unify_report(root: &Path) {
+    let mut names: Vec<String> = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    let (mut ok, mut refused, mut skipped) = (0, 0, 0);
+    let mut refusals: Vec<String> = Vec::new();
+    for name in &names {
+        let poses = poses_of(&root.join(name));
+        if poses.len() < 2 {
+            skipped += 1;
+            continue;
+        }
+        let strip: Vec<Vec<model::RawPrim>> =
+            poses.iter().map(|d| model::load_raw_unoriented(d)).collect();
+        if strip.iter().any(|p| p.is_empty()) {
+            skipped += 1;
+            continue;
+        }
+        if align::unify(strip).is_some() {
+            ok += 1;
+        } else {
+            refused += 1;
+            refusals.push(name.clone());
+        }
+    }
+    println!("unify: {ok} blended, {refused} REFUSED (stepping fallback), {skipped} skipped\n");
+    for r in refusals.iter().take(40) {
+        println!("  refused: {r}");
+    }
+    if refusals.len() > 40 {
+        println!("  ... and {} more", refusals.len() - 40);
+    }
 }
