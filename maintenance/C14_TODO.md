@@ -577,3 +577,99 @@ the way the two `camera-bridge` copies already have.
 
 That ordering matters: step 1 is pure and testable here, step 2 needs a device
 with gstreamer or ffmpeg, step 3 is a manifest line.
+
+## 16. snapclone exists TWICE — `apps/snapclone` and `system/snapclone`
+
+Found while going to fold the two copies of `snapclone-av1policy`. The
+duplication is not one crate; it is the whole application, and the numbers say
+which way it should be resolved.
+
+### Measured
+
+| | apps/snapclone | system/snapclone |
+|---|---|---|
+| files | 784 | 654 |
+| rust crates identical | 29 | 29 |
+| rust crates DIFFERING | 11 | 11 |
+| files present only here | 132 | **2** |
+
+The two files only in `system/` are `log.txt` and `third_party/.gitkeep`.
+Neither is code.
+
+So `apps/snapclone` is a strict superset in content, and on every drifted crate
+but one its side is NEWER:
+
+| crate | apps last touched | system last touched |
+|---|---|---|
+| snapclone-core, databus, network-diag, piggyback, relay, session, storage, vcard | 2026-09-01 | 2026-08-22 |
+| snapclone-gesture | 2026-08-30 | 2026-06-22 |
+| snapclone-audio | 2026-08-22 | 2026-06-22 |
+| snapclone-group | 2026-08-09 | 2026-08-09 |
+
+### The drift is not purely one-directional, which is the catch
+
+`snapclone-session/src/selector.rs` has REAL WORK on the system side that the
+apps side lacks — `NetworkBin::of(ip)`, `scoring::Protocol`, and a long comment
+explaining that an `else if let Some(u) = relay_url` "was a type error and had
+never compiled". Meanwhile the apps side's own last commit is titled "fix
+compile error, dead duplicate bin, unused imports".
+
+Both sides received independent fixes for overlapping problems. Deleting either
+one wholesale loses work, and that is why this is an entry rather than a
+commit.
+
+### Why it matters now rather than later
+
+`snapclone-egui` gained a dependency on `apps/snapclone/rust/snapclone-av1policy`
+in b11806b5. Before that, nothing outside each tree referenced either copy and
+the duplication was inert. Now one copy is load-bearing and the other is not,
+which is how a fix lands in the wrong one.
+
+`system/snapclone/camera-bridge` is also a second copy of a crate this session
+put on the shared kit (ea891613) — I edited the `apps/` one. The `system/` one
+still has no `uikit-egui` dependency, so it draws boxes for glyphs and cannot
+receive an on-screen keyboard, and `font_install_check.py` lists both paths
+separately without knowing they are the same program.
+
+### The resolution, and the one question it needs answered
+
+Mechanically: `apps/snapclone` survives, `system/snapclone` is archived per
+§7b, and the eleven drifted crates are diffed one at a time to carry anything
+the system side has that the apps side does not — `selector.rs` at minimum.
+
+### The manifest answers it, and the answer inverts the conclusion
+
+`manifest/projects.toml` declares them as different things:
+
+    [apps.snapclone-egui]  path = "apps/snapclone/egui-frontend"
+        notes = "...the C++ camera/peer engine (src/, cmake/) is the separate
+                 on-device native app; this is the egui reference/demo surface."
+
+    [system.snapclone]     path = "system/snapclone"
+        role = "system-service"   daemon = true
+        notes = "DHT/identity/relay; canonical Rust<->C++ DataBus FFI;
+                 cross-build to FP5/postmarketOS"
+
+So `system/snapclone` is the DEPLOYED DAEMON — the thing that ships to the
+phone, carrying the "canonical" DataBus FFI — and `apps/snapclone` is
+registered only as the egui reference surface plus a separate native app.
+
+That inverts the file-count conclusion. The newer code is in the tree the
+manifest calls a reference surface, and the older code is in the tree the
+manifest calls canonical. Eight crates were last touched in `apps/` on
+2026-09-01 and in `system/` on 2026-08-22, so **ten days of fixes may be
+sitting outside the tree that deploys.**
+
+This is now a question about which tree is meant to receive fixes, and the
+manifest and the commit dates disagree. Both readings are defensible and they
+lead to opposite merges, so it needs a human answer before anything is
+deleted:
+
+* if `system/` is canonical, the nine days of `apps/` fixes need porting INTO
+  it, and `snapclone-egui`'s new dependency on
+  `apps/snapclone/rust/snapclone-av1policy` points at the wrong copy;
+* if `apps/` has become the working tree in practice, the manifest's
+  `[system.snapclone]` notes are stale and `system/` should be archived.
+
+What is not defensible is leaving it: one copy is now load-bearing for
+`snapclone-egui` and the other is what deploys.
