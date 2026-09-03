@@ -340,16 +340,48 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         let in_chassis = b.x < boss_half_size.x && boss_rel.y > -boss_half_size.y && boss_rel.y < 0.0;
         let in_tower = b.x < boss_half_size.x * 0.55 && boss_rel.y >= 0.0 && boss_rel.y < boss_half_size.y;
         if (in_chassis || in_tower) {
+            // Same cylinder trick as the car, measured against whichever
+            // box the pixel is in — the tower sits above the chassis, and
+            // sharing one half-height is exactly what rendered the car's
+            // cabin black last commit.
+            var boss_across: f32;
+            if (in_tower) {
+                boss_across = clamp(boss_rel.y / boss_half_size.y, -1.0, 1.0);
+            } else {
+                boss_across = clamp((boss_rel.y + boss_half_size.y * 0.5) / (boss_half_size.y * 0.5), -1.0, 1.0);
+            }
+            let boss_n = normalize(vec2<f32>(boss_across * 0.5, sqrt(max(1.0 - boss_across * boss_across, 0.0))));
+            let boss_ndotl = max(dot(boss_n, SUN_DIR), 0.0);
+            // Heavily plated: high reflectivity and a tight highlight,
+            // matching what core::material would give an armour stat well
+            // past any car's. Hardcoded rather than plumbed through a
+            // uniform because the boss has no armour stat to read — adding
+            // one to BossData is a data-format change, not a shading one.
+            let boss_refl = 0.55;
+            let boss_spec = pow(boss_ndotl, 64.0) * boss_refl;
+
             if (u.boss_telegraphing > 0.5) {
                 // Flash between near-white and a saturated amber, not red —
                 // confirmed via an actual screenshot that a red/near-white
                 // flash was close enough to the car's own red body color to
                 // be hard to tell apart at a glance, defeating the point of
                 // a telegraph. Amber has no overlap with the car's palette.
+                // DELIBERATELY UNLIT. The telegraph is a readability
+                // signal, not a surface: an incoming attack has to look the
+                // same whether the boss is standing in sun or in the shadow
+                // of a ridge. Shading it would make the warning dimmer
+                // exactly where the scene is already hard to read.
                 let flash = step(0.5, fract(u.time * 8.0));
                 color = mix(vec3<f32>(0.95, 0.55, 0.05), vec3<f32>(0.98, 0.92, 0.75), flash);
             } else {
-                color = vec3<f32>(0.22, 0.14, 0.30); // muted purple -- idle, distinct from both car and ground
+                // Lit, unlike the flash below. Idle purple, shaded the same
+                // way as everything else in the scene so it sits in the
+                // world rather than on top of it.
+                let boss_albedo = vec3<f32>(0.22, 0.14, 0.30);
+                var boss_lit = boss_albedo * (SUN_COLOR * boss_ndotl + SKY_COLOR * 0.40);
+                boss_lit += SUN_COLOR * boss_spec;
+                boss_lit += SKY_COLOR * pow(1.0 - abs(boss_across), 3.0) * boss_refl * 0.5;
+                color = boss_lit;
             }
         }
     }
