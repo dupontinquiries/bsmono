@@ -438,10 +438,14 @@ pub struct WgpuUpscaler {
     frame_buf: Option<wgpu::Buffer>,
     frame_words: u64,
     frame_width: u32,
-    /// Per-frame scratch (extract params + bind groups) kept alive until the
-    /// frame's single submit has been waited on.
-    keep: Vec<wgpu::Buffer>,
-    keep_bg: Vec<wgpu::BindGroup>,
+    /// Extract uniforms and bind groups, one per tile, reused across frames:
+    /// a video's tile geometry never changes, so rebuilding them per frame was
+    /// pure allocation churn (logscope's buffer-pool lesson, `dc82e03`).
+    /// Invalidated when the tile layout or the frame buffer changes.
+    tile_cache: Vec<(TileIo, wgpu::Buffer, wgpu::BindGroup)>,
+    tile_cache_key: Option<(u32, u32, u32)>,
+    /// Reused staging for the host-side RGBA8 conversion.
+    rgba_scratch: Vec<u32>,
     /// Staging large enough for several tiles' packed output, so a frame can
     /// be read back once instead of per tile.
     batch_staging: Option<wgpu::Buffer>,
@@ -704,45 +708,25 @@ impl WgpuUpscaler {
             sets.push(ActSet { conv_cache: vec![None; steps.len()], bufs, steps, pack_params, pack_bind, out, staging });
         }
         let set_bytes_total = set_bytes(&net, tile as u64) * inflight as u64;
-        Ok(WgpuUpscaler { ctx, net, tile, inflight, kernel: opts.kernel, conv_pipeline, deconv_pipeline, add_pipeline, pack_pipeline, extract_pipeline, extract_layout, frame_buf: None, frame_words: 0, frame_width: 0, keep: Vec::new(), keep_bg: Vec::new(), batch_staging: None, sets, _weights: weights, set_bytes_total })
+        Ok(WgpuUpscaler { ctx, net, tile, inflight, kernel: opts.kernel, conv_pipeline, deconv_pipeline, add_pipeline, pack_pipeline, extract_pipeline, extract_layout, frame_buf: None, frame_words: 0, frame_width: 0, tile_cache: Vec::new(), tile_cache_key: None, rgba_scratch: Vec::new(), batch_staging: None, sets, _weights: weights, set_bytes_total })
     }
 
     /// Encode and submit one tile on activation set `si`; returns the
     /// submission to wait for and the packed output byte count.
     /// Encode one tile's whole chain into `enc`, reading the tile's input from
     /// the resident frame via the extract pass. Returns the packed byte count.
-    fn encode_tile(&mut self, enc: &mut wgpu::CommandEncoder, si: usize, io: TileIo, staging_off: u64) -> anyhow::Result<u64> {
+    fn encode_tile(&mut self, enc: &mut wgpu::CommandEncoder, si: usize, slot: usize, staging_off: u64) -> anyhow::Result<u64> {
         let net = self.net.clone();
+        let (io, _, bind) = &self.tile_cache[slot];
+        let io = *io;
         let u = net.unshuffle;
         let (tw, th) = (io.region_w / u, io.region_h / u);
-        let frame = self.frame_buf.as_ref().ok_or_else(|| anyhow!("no resident frame"))?;
-        let (fw, params, bind) = {
-            let set = &self.sets[si];
-            // Baked at creation, NOT `write_buffer`: queued writes all land
-            // before any command in the submit, so a per-tile queued write
-            // would give every tile the last tile's parameters.
-            let ep = ExtractParams { frame_w: self.frame_width, region_x: io.region_x, region_y: io.region_y, region_w: io.region_w, region_h: io.region_h, unshuffle: u, tw, th };
-            let params = self.ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("extract params"), contents: bytemuck::bytes_of(&ep), usage: wgpu::BufferUsages::UNIFORM });
-            let bind = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("extract"),
-                layout: &self.extract_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: frame.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: set.bufs[net.input].as_entire_binding() },
-                ],
-            });
-            (self.frame_width, params, bind)
-        };
-        let _ = fw;
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("extract"), timestamp_writes: None });
             pass.set_pipeline(&self.extract_pipeline);
-            pass.set_bind_group(0, &bind, &[]);
+            pass.set_bind_group(0, bind, &[]);
             pass.dispatch_workgroups(io.region_w.div_ceil(16), io.region_h.div_ceil(16), 1);
         }
-        self.keep.push(params);
-        self.keep_bg.push(bind);
         let n = self.encode_chain(enc, si, th as usize, tw as usize)?;
         let set = &self.sets[si];
         enc.copy_buffer_to_buffer(&set.out, 0, self.batch_staging.as_ref().unwrap(), staging_off, n);
@@ -875,15 +859,46 @@ impl WgpuUpscaler {
 
     /// Ensure the resident frame buffer and the batch staging buffer are big
     /// enough, recreating only when they are not.
-    fn ensure_frame_buffers(&mut self, words: u64, staging_bytes: u64) {
+    fn ensure_frame_buffers(&mut self, words: u64, staging_bytes: u64) -> bool {
+        let mut frame_new = false;
         if self.frame_words < words {
             self.frame_buf = Some(self.ctx.device.create_buffer(&wgpu::BufferDescriptor { label: Some("frame"), size: (words * 4).max(16), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }));
             self.frame_words = words;
+            frame_new = true;
         }
         let have = self.batch_staging.as_ref().map_or(0, |b| b.size());
         if have < staging_bytes {
             self.batch_staging = Some(self.ctx.device.create_buffer(&wgpu::BufferDescriptor { label: Some("batch staging"), size: staging_bytes.max(16), usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }));
         }
+        frame_new
+    }
+
+    /// One extract uniform + bind group per tile, built once per geometry.
+    fn rebuild_tile_cache(&mut self, ios: &[TileIo]) {
+        let net = self.net.clone();
+        let u = net.unshuffle;
+        let frame = self.frame_buf.as_ref().expect("frame buffer");
+        self.tile_cache = ios
+            .iter()
+            .map(|io| {
+                let (tw, th) = (io.region_w / u, io.region_h / u);
+                // Baked at creation, NOT `write_buffer`: queued writes all land
+                // before any command in the submit, so a per-tile queued write
+                // would give every tile the last tile's parameters.
+                let ep = ExtractParams { frame_w: self.frame_width, region_x: io.region_x, region_y: io.region_y, region_w: io.region_w, region_h: io.region_h, unshuffle: u, tw, th };
+                let params = self.ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("extract params"), contents: bytemuck::bytes_of(&ep), usage: wgpu::BufferUsages::UNIFORM });
+                let bind = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("extract"),
+                    layout: &self.extract_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: frame.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: self.sets[0].bufs[net.input].as_entire_binding() },
+                    ],
+                });
+                (*io, params, bind)
+            })
+            .collect();
     }
 
     /// One upload, one command buffer for every tile, one submit, one map.
@@ -918,13 +933,16 @@ impl WgpuUpscaler {
             total += (n + 3) & !3;
         }
         let words = (padded.width as u64) * (padded.height as u64);
-        self.ensure_frame_buffers(words, total);
+        let frame_realloc = self.ensure_frame_buffers(words, total);
         self.frame_width = padded.width;
-        let rgba = Network::frame_rgba8(&padded);
-        self.ctx.queue.write_buffer(self.frame_buf.as_ref().unwrap(), 0, bytemuck::cast_slice(&rgba));
-
-        self.keep.clear();
-        self.keep_bg.clear();
+        // The bind groups reference the frame buffer, so a reallocation invalidates them.
+        let key = (padded.width, padded.height, self.tile);
+        if frame_realloc || self.tile_cache_key != Some(key) {
+            self.rebuild_tile_cache(&ios);
+            self.tile_cache_key = Some(key);
+        }
+        Network::frame_rgba8_into(&padded, &mut self.rgba_scratch);
+        self.ctx.queue.write_buffer(self.frame_buf.as_ref().unwrap(), 0, bytemuck::cast_slice(&self.rgba_scratch));
         // Tiles are grouped by region size: the conv params uniforms live in
         // the activation set and are shared by every tile in an encoder, so
         // only same-shaped tiles may share one submit. Balanced tiling yields
@@ -944,7 +962,7 @@ impl WgpuUpscaler {
             for &i in idxs {
                 // One activation set suffices: compute passes in a single
                 // encoder are ordered against each other, so tiles reuse it.
-                let n = self.encode_tile(&mut enc, 0, ios[i], offs[i])?;
+                let n = self.encode_tile(&mut enc, 0, i, offs[i])?;
                 anyhow::ensure!(n == sizes[i], "tile {i}: packed {n} bytes, expected {}", sizes[i]);
             }
             last_idx = Some(self.ctx.queue.submit(Some(enc.finish())));
@@ -971,8 +989,6 @@ impl WgpuUpscaler {
             }
         }
         staging.unmap();
-        self.keep.clear();
-        self.keep_bg.clear();
         Ok(out)
     }
 }
