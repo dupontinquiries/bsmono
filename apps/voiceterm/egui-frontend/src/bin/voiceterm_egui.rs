@@ -3111,27 +3111,29 @@ impl eframe::App for VoicetermApp {
             // problem: a modal popup takes focus and the terminal item is
             // simply not delivered keys. (Esc is doubly safe here:
             // Modal::should_close CONSUMES it before this runs.)
-            // ONE DECISION, BOTH CONSUMERS.
+            // THIS HOST ALWAYS ENCODES.
             //
-            // Declared here rather than next to handle_input because BOTH
-            // readers need it and only one was gated: with no shell the
-            // widget owns input, but the raw path still ran, so local
-            // echo showed `lsls` — the same doubling as the PTY case,
-            // just via feed_pty instead of the shell. Gating one side of
-            // a two-reader problem fixes one of the two symptoms.
+            // Not conditional on having a shell, which is what I tried
+            // first and got wrong twice. The widget's fallback IS its
+            // line buffer, `terminal.input` — and this host never draws
+            // it. It renders `session.grid`. So handing input to the
+            // widget when no shell is attached makes typing INVISIBLE
+            // until Enter, which is worse than the doubling it was
+            // meant to fix.
             //
-            // Per frame, from whether a shell is actually in hand: a pane
-            // whose spawn failed, or whose shell exited, falls back to
-            // the widget's line editor, which is the only thing that
-            // makes typing visible there.
-            let input_owner = if self.pty.is_some() {
-                uikit_term::keys::InputOwner::Host
-            } else {
-                uikit_term::keys::InputOwner::Widget
-            };
+            // Whether a shell exists decides where the bytes GO — the
+            // pty, or feed_pty for local echo — not who produces them.
+            // One encoder, two sinks.
+            //
+            // The widget keeps its line buffer running (see
+            // keys::widget_handles): it emits no bytes, and `submitted`
+            // is what the audit chain and the risk gate below are built
+            // on.
+            let input_owner = uikit_term::keys::InputOwner::Host;
             self.app.set_input_owner(input_owner);
-            let host_encodes = input_owner == uikit_term::keys::InputOwner::Host;
-            let key_outs = if self.surfaces.captures_input() || !host_encodes {
+            let host_encodes = uikit_term::keys::host_encodes(input_owner);
+            let _ = host_encodes;
+            let key_outs = if self.surfaces.captures_input() {
                 Vec::new()
             } else {
                 // THE LIVE MODE, NOT THE DEFAULT.
@@ -3172,7 +3174,42 @@ impl eframe::App for VoicetermApp {
                 // the same bytes both reach a future PTY and appear on screen,
                 // through one path rather than two that can disagree.
                 if !out.bytes.is_empty() {
-                    self.session.pty_out.extend_from_slice(&out.bytes);
+                    // HOLD THE ENTER OF A DANGEROUS LINE.
+                    //
+                    // The risk confirmation used to hang off the widget's
+                    // `submitted`, which fires on the SAME keypress whose
+                    // Enter byte the raw path had already sent — so the
+                    // dialog asked whether to run a command that had
+                    // already run. A confirmation you answer afterwards
+                    // is not a confirmation.
+                    //
+                    // Only the Enter byte is withheld. The characters are
+                    // already in the shell's line editor, so confirming
+                    // just sends `\r`, and cancelling leaves the line
+                    // typed and editable rather than silently discarding
+                    // what someone wrote.
+                    let is_enter = out.bytes == b"\r";
+                    let line = self.app.terminal.input.clone();
+                    if is_enter
+                        && self.pending_confirm.is_none()
+                        && !self.password_mode
+                        && voiceterm_egui::cmd_risk::classify(&line)
+                            == voiceterm_egui::cmd_risk::Risk::Mutating
+                    {
+                        use voiceterm_egui::confirm_dialog::{ConfirmDialog, TimeoutAction};
+                        self.pending_confirm = Some((
+                            String::new(), // the line is already typed; only \r is pending
+                            ConfirmDialog::new(
+                                "Run this command?",
+                                format!("`{line}` can modify or delete data."),
+                                "Run",
+                            )
+                            .with_timeout(20.0)
+                            .with_timeout_action(TimeoutAction::Cancel),
+                        ));
+                    } else {
+                        self.session.pty_out.extend_from_slice(&out.bytes);
+                    }
                 }
                 // `out.snap_to_bottom` is deliberately not consumed. This view
                 // draws a fixed grid with no scrollback, so it is always
@@ -3266,33 +3303,16 @@ impl eframe::App for VoicetermApp {
                         self.audit_lines.drain(..cut);
                     }
                 }
-                // A MUTATING COMMAND ASKS FIRST. cmd_risk already classified
-                // every line for the snapshot policy; until now that verdict
-                // never stopped anything. The dialog's timeout action is
-                // Cancel — a confirmation that runs `rm -rf` because nobody
-                // was looking is not a confirmation.
-                use voiceterm_egui::cmd_risk::Risk;
-                use voiceterm_egui::confirm_dialog::{ConfirmDialog, TimeoutAction};
-                if voiceterm_egui::cmd_risk::classify(&line) == Risk::Mutating
-                    && self.pending_confirm.is_none()
-                {
-                    self.pending_confirm = Some((
-                        line.clone(),
-                        ConfirmDialog::new(
-                            "Run this command?",
-                            format!("`{line}` can modify or delete data."),
-                            "Run",
-                        )
-                        .with_timeout(20.0)
-                        .with_timeout_action(TimeoutAction::Cancel),
-                    ));
-                } else {
-                    // A PTY does not distinguish "the user typed a command"
-                    // from "the user typed bytes", and having two paths is how
-                    // they drift.
-                    self.session.pty_out.extend_from_slice(line.as_bytes());
-                    self.session.pty_out.push(b'\r');
-                }
+                // NO BYTES FROM HERE. The raw key path already sent this
+                // line, character by character, as it was typed — that is
+                // what made the shell run everything twice. `submitted`
+                // is now purely a NOTIFICATION that a line was entered:
+                // it feeds the audit chain above, and nothing else.
+                //
+                // The risk confirmation moved to the key path too, where
+                // it can withhold the Enter byte. Asking here was always
+                // too late: `\r` had already gone to the shell on the
+                // same keypress that produced this line.
             }
             // LOCAL ECHO INTO THE SCREEN, since there is no PTY here.
             //

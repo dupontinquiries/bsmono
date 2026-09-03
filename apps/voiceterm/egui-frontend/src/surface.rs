@@ -304,10 +304,21 @@ mod tests {
         // pty_input::drain_egui both read this frame's events; if the
         // widget is not told the host owns encoding, every keystroke
         // reaches the shell twice and every Enter runs the command twice.
+        // THE SUBMITTED LINE IS A NOTIFICATION, NOT A SOURCE OF BYTES.
+        // The raw key path already sent it character by character; a
+        // second append is the doubling bug.
         assert!(
-            src.contains("|| !host_encodes"),
-            "the raw key path is no longer gated on ownership — with no \
-             shell BOTH readers run and the local echo doubles."
+            !src.contains("pty_out.extend_from_slice(line.as_bytes())"),
+            "the submitted line is emitting bytes again — the raw path \
+             already sent them and the shell will run everything twice."
+        );
+        // ONE RISK GATE, IN THE KEY PATH. Asking on `submitted` is too
+        // late: the Enter byte went to the shell on the same keypress.
+        assert_eq!(
+            src.matches("ConfirmDialog::new(").count(),
+            1,
+            "a second risk-confirmation site is back — the one that can \
+             actually withhold Enter lives in the key path."
         );
         assert_eq!(
             src.matches("set_input_owner(").count(),

@@ -125,9 +125,17 @@ pub enum EventClass {
 
 /// Whether the widget should act on this event class.
 ///
-/// Paste stays with the widget in BOTH modes on purpose: voiceterm's raw
-/// path reads `Event::Text` and `Event::Key` and has no paste arm at all,
-/// so handing paste to the host would silently disable pasting into the
+/// Only `Encoded` produces BYTES. `Text` and `LineEdit` maintain the
+/// widget's line buffer, which produces nothing on its own — so they
+/// stay with the widget in both modes, and a host that encodes keys
+/// itself still gets a `submitted` line out of Enter. That line is what
+/// the audit chain and the risk confirmation are built on; gating it off
+/// silently disabled both, which is how the first version of this
+/// function was wrong.
+///
+/// Paste stays with the widget in BOTH modes too: voiceterm's raw path
+/// reads `Event::Text` and `Event::Key` and has no paste arm at all, so
+/// handing paste to the host would silently disable pasting into the
 /// terminal. Bracketing (DEC 2004) also needs the terminal's mode, which
 /// the widget has and a stateless encoder does not.
 /// Whether the HOST's raw key path should run this frame.
@@ -143,8 +151,12 @@ pub fn host_encodes(owner: InputOwner) -> bool {
 pub fn widget_handles(owner: InputOwner, class: EventClass) -> bool {
     match (owner, class) {
         (InputOwner::Widget, _) => true,
-        (InputOwner::Host, EventClass::Text) => false,
-        (InputOwner::Host, EventClass::LineEdit) => false,
+        // The line buffer, which emits no bytes — kept so `submitted`
+        // still fires for the audit chain and the risk gate.
+        (InputOwner::Host, EventClass::Text) => true,
+        (InputOwner::Host, EventClass::LineEdit) => true,
+        // The only byte-producing class, and therefore the only one that
+        // can double.
         (InputOwner::Host, EventClass::Encoded) => false,
         (InputOwner::Host, EventClass::Scrollback) => true,
         (InputOwner::Host, EventClass::WidgetChord) => true,
@@ -333,29 +345,34 @@ mod tests {
     }
 
     #[test]
-    fn a_host_with_a_pty_takes_the_input_classes_and_only_those() {
-        // the doubling bug: these three are what the host also encodes
-        assert!(!widget_handles(InputOwner::Host, EventClass::Text));
-        assert!(!widget_handles(InputOwner::Host, EventClass::LineEdit));
+    fn a_host_takes_only_the_byte_producing_class() {
+        // Encoded is the only class that emits bytes, so it is the only
+        // one that can double.
         assert!(!widget_handles(InputOwner::Host, EventClass::Encoded));
-        // and these are what no host raw path covers
+        // The line buffer emits nothing and must keep running, or the
+        // host loses the `submitted` line the audit chain and the risk
+        // confirmation are built on.
+        assert!(widget_handles(InputOwner::Host, EventClass::Text));
+        assert!(widget_handles(InputOwner::Host, EventClass::LineEdit));
+        // And these are what no host raw path covers.
         assert!(widget_handles(InputOwner::Host, EventClass::Scrollback));
         assert!(widget_handles(InputOwner::Host, EventClass::WidgetChord));
     }
 
     #[test]
-    fn exactly_one_reader_encodes_in_either_mode() {
-        // the invariant both gates exist to hold: for every input class
-        // the host and the widget must never both claim it, and never
-        // both decline it
+    fn exactly_one_reader_produces_bytes() {
+        // The invariant both gates exist to hold, stated over the class
+        // that actually emits bytes. An earlier version asserted it over
+        // Text and LineEdit too, which forced those off in Host mode and
+        // took the audit chain and the risk confirmation with them —
+        // a wrong invariant is worse than none, because it argues for
+        // the bug.
         for owner in [InputOwner::Widget, InputOwner::Host] {
-            for class in [EventClass::Text, EventClass::LineEdit, EventClass::Encoded] {
-                assert_ne!(
-                    host_encodes(owner),
-                    widget_handles(owner, class),
-                    "{owner:?}/{class:?}: both or neither would encode"
-                );
-            }
+            assert_ne!(
+                host_encodes(owner),
+                widget_handles(owner, EventClass::Encoded),
+                "{owner:?}: both or neither would encode"
+            );
         }
     }
 
