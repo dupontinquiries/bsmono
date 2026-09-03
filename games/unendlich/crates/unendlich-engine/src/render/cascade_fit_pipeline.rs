@@ -223,19 +223,15 @@ unsafe fn create_pipeline_layout(
 unsafe fn create_compute_pipeline(
     device: &Device, layout: vk::PipelineLayout,
 ) -> Result<vk::Pipeline, CascadeFitError> {
-    let candidates = [
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/shaders/cascade_fit.comp.spv"),
-        "assets/shaders/cascade_fit.comp.spv",
-        "src/shaders/cascade_fit.comp.spv",
-    ];
+    let candidates = crate::assets::shader_paths("cascade_fit.comp.spv");
     let mut bytes: Option<Vec<u8>> = None;
     for p in &candidates {
-        if Path::new(p).exists() {
+        if p.exists() {
             bytes = Some(std::fs::read(p)?);
             break;
         }
     }
-    let bytes = bytes.ok_or_else(|| CascadeFitError::ShaderMissing(candidates[0].to_string()))?;
+    let bytes = bytes.ok_or_else(|| CascadeFitError::ShaderMissing(candidates[0].display().to_string()))?;
     let words: Vec<u32> = bytes.chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();

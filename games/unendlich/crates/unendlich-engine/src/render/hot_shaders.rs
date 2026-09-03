@@ -27,6 +27,13 @@ pub fn spv_candidates(name: &str) -> Vec<PathBuf> {
     }
     // CARGO_MANIFEST_DIR is the engine crate root at build time:
     // <repo>/crates/unendlich-engine  ->  ../../assets/shaders
+    // The RESOLVED root first, then the compile-time one. Baking
+    // CARGO_MANIFEST_DIR is right on the machine that built the binary and
+    // meaningless on any other, which is how a pinned copy failed on shaders
+    // that ship with the repo (see `crate::assets`).
+    if let Some(p) = crate::assets::shader(name) {
+        v.push(p);
+    }
     v.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/shaders").join(name));
     v.push(PathBuf::from("assets/shaders").join(name));
     v

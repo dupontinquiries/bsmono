@@ -254,11 +254,7 @@ mod parity {
 
     fn load_spv() -> Vec<u8> {
         // Prefer a build.rs-produced asset; fall back to compiling the source.
-        for p in [
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/shaders/field_diffuse.comp.spv"),
-            "assets/shaders/field_diffuse.comp.spv",
-            "src/shaders/field_diffuse.comp.spv",
-        ] {
+        for p in crate::assets::shader_paths("field_diffuse.comp.spv") {
             if std::path::Path::new(p).exists() {
                 return std::fs::read(p).unwrap();
             }

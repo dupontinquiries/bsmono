@@ -22,6 +22,11 @@ fn shaders_src_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/shaders")
 }
 fn spv_dir() -> PathBuf {
+    // Resolved at run time when possible; the compile-time path is the
+    // fallback, not the answer — see `crate::assets`.
+    if let Some(r) = crate::assets::root() {
+        return r.join("assets/shaders");
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/shaders")
 }
 

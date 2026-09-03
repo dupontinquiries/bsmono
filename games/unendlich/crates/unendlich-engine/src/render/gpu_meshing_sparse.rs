@@ -995,14 +995,10 @@ unsafe fn create_compute_pipeline(
 unsafe fn create_compute_pipeline_named(
     device: &Device, layout: vk::PipelineLayout, name: &str,
 ) -> Result<vk::Pipeline> {
-    let candidates = [
-        format!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/shaders/{}.comp.spv"), name),
-        format!("assets/shaders/{}.comp.spv", name),
-        format!("src/shaders/{}.comp.spv", name),
-    ];
+    let candidates = crate::assets::shader_paths(&format!("{name}.comp.spv"));
     let mut bytes: Option<Vec<u8>> = None;
     for p in &candidates {
-        if Path::new(p).exists() {
+        if p.exists() {
             bytes = Some(std::fs::read(p)?);
             break;
         }

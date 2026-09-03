@@ -129,6 +129,27 @@ pub fn shader(name: &str) -> Option<PathBuf> {
     find(&format!("assets/shaders/{name}"))
 }
 
+/// Every place a shader might be, resolver first.
+///
+/// Returned as a list rather than a single answer so the nine call sites that
+/// each own a `candidates` array can adopt this by swapping the array, keeping
+/// their own error types and messages. A uniform rewrite of nine error paths
+/// would be a bigger diff for no more correctness.
+///
+/// The legacy relatives are KEPT after the resolved path. They cost one
+/// `exists` each when the resolver already won, and dropping them would break
+/// any caller running from a directory this resolver does not model — a
+/// regression traded for tidiness.
+pub fn shader_paths(name: &str) -> Vec<PathBuf> {
+    let mut v = Vec::with_capacity(3);
+    if let Some(p) = shader(name) {
+        v.push(p);
+    }
+    v.push(PathBuf::from(format!("assets/shaders/{name}")));
+    v.push(PathBuf::from(format!("src/shaders/{name}")));
+    v
+}
+
 /// What to tell the user when an asset is missing.
 ///
 /// The root that WAS found, or the fact that none was, plus the override to

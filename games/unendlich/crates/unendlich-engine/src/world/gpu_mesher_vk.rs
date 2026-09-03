@@ -511,19 +511,15 @@ fn create_pipeline_layout(device: &Device, set_layout: vk::DescriptorSetLayout)
 
 fn create_compute_pipeline(device: &Device, layout: vk::PipelineLayout) -> Result<vk::Pipeline> {
     // Look in standard places for the SPIR-V.
-    let candidates = [
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/shaders/chunk_mesh.comp.spv"),
-        "assets/shaders/chunk_mesh.comp.spv",
-        "src/shaders/chunk_mesh.comp.spv",
-    ];
+    let candidates = crate::assets::shader_paths("chunk_mesh.comp.spv");
     let mut bytes: Option<Vec<u8>> = None;
     for p in &candidates {
-        if Path::new(p).exists() {
+        if p.exists() {
             bytes = Some(std::fs::read(p)?);
             break;
         }
     }
-    let bytes = bytes.ok_or_else(|| MesherError::ShaderMissing(candidates[0].to_string()))?;
+    let bytes = bytes.ok_or_else(|| MesherError::ShaderMissing(candidates[0].display().to_string()))?;
 
     // SPIR-V is u32-aligned.
     let words: Vec<u32> = bytes.chunks_exact(4)

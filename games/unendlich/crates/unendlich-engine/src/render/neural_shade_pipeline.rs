@@ -173,14 +173,10 @@ unsafe fn create_pipeline_layout(device: &Device, set: vk::DescriptorSetLayout)
 
 unsafe fn create_compute_pipeline(device: &Device, layout: vk::PipelineLayout)
     -> Result<vk::Pipeline, ShadeError> {
-    let candidates = [
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/shaders/neural_shade.comp.spv"),
-        "assets/shaders/neural_shade.comp.spv",
-        "src/shaders/neural_shade.comp.spv",
-    ];
+    let candidates = crate::assets::shader_paths("neural_shade.comp.spv");
     let bytes = candidates.iter().find(|p| Path::new(p).exists())
         .map(|p| std::fs::read(p)).transpose()?
-        .ok_or_else(|| ShadeError::ShaderMissing(candidates[0].to_string()))?;
+        .ok_or_else(|| ShadeError::ShaderMissing(candidates[0].display().to_string()))?;
     let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
     let module = device.create_shader_module(&vk::ShaderModuleCreateInfo::builder().code(&words), None)?;
     let stage = vk::PipelineShaderStageCreateInfo::builder()

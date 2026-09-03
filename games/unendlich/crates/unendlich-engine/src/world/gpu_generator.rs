@@ -695,15 +695,11 @@ fn create_pipeline_layout(device: &Device, set_layout: vk::DescriptorSetLayout) 
 }
 
 fn create_compute_pipeline(device: &Device, layout: vk::PipelineLayout) -> Result<vk::Pipeline> {
-    let candidates = [
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/shaders/chunk_generation.comp.spv"),
-        "assets/shaders/chunk_generation.comp.spv",
-        "src/shaders/chunk_generation.comp.spv",
-    ];
+    let candidates = crate::assets::shader_paths("chunk_generation.comp.spv");
     let bytes = candidates
         .iter()
         .find_map(|p| std::fs::read(p).ok())
-        .ok_or_else(|| GpuGenError::ShaderMissing(candidates[1].to_string()))?;
+        .ok_or_else(|| GpuGenError::ShaderMissing(candidates[1].display().to_string()))?;
 
     let words: Vec<u32> = bytes.chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
