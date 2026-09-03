@@ -38,7 +38,7 @@ pub enum Terrain {
 
 /// Who you meet there. The factions are the script's, not invented:
 /// the Hijacks are the erratic conquerors the elemental shield holds back,
-/// the Corrupted are Jhiaxus' experiment, and Blackstar's clans tax the
+/// the Corrupted are Assay' experiment, and Blackstar's clans tax the
 /// outer rim.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Faction {
@@ -79,7 +79,7 @@ pub struct Destination {
 /// homeworlds Glaciem, Carrion and Helix.
 /// THE MISSION THAT MAKES THE BRIDGE SAFE TO POWER ON.
 ///
-/// Film 2, the vault: Jhiaxus, the architect of the Corrupted. The space
+/// Film 2, the vault: Assay, the architect of the Corrupted. The space
 /// bridge was never off for want of engineering — it was off because turning
 /// it on while an infestation was loose in the system would have handed that
 /// infestation a door, and because the system needed the bridge as a position
@@ -88,7 +88,7 @@ pub struct Destination {
 ///
 /// So the bridge is not gated on arriving somewhere. It is gated on the
 /// reason it was shut.
-pub const BRIDGE_SAFE_AFTER: &str = "what_jhiaxus_grew";
+pub const BRIDGE_SAFE_AFTER: &str = "what_assay_grew";
 
 /// Is the space bridge safe to run?
 ///
@@ -96,7 +96,7 @@ pub const BRIDGE_SAFE_AFTER: &str = "what_jhiaxus_grew";
 /// `the_far_gate` (mission 10, Film 4). These are two stages of one system and
 /// the gap between them is deliberate: from Film 2 the bridge can be powered,
 /// and from Film 4 it has actually been used. A player who has cleared
-/// Jhiaxus but not reached the far gate is looking at a working bridge and
+/// Assay but not reached the far gate is looking at a working bridge and
 /// nowhere charted to send it, which is the correct state for Films 2-4.
 pub fn bridge_powered(log: &crate::campaign::CampaignLog) -> bool {
     log.is_cleared(BRIDGE_SAFE_AFTER)

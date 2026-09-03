@@ -2963,17 +2963,17 @@
   "path": "./raid-bosses/plasmas_mechagodzilla_anime_trilogy.zip"
  },
  {
-  "raw": "devastator-good-for-raid-jhiaxus.zip",
+  "raw": "devastator-good-for-raid-assay.zip",
   "modes": [
    "robot"
   ],
   "flags": [],
   "subtype": null,
-  "name": "devastator good for raid jhiaxus",
+  "name": "devastator good for raid assay",
   "note": null,
   "category": "raid_boss",
   "dir": "raid-bosses",
-  "path": "./raid-bosses/devastator-good-for-raid-jhiaxus.zip"
+  "path": "./raid-bosses/devastator-good-for-raid-assay.zip"
  },
  {
   "raw": "raidboss-hussar_tank.zip",
@@ -3885,7 +3885,7 @@
   "path": "./weapons/hammers/Halo Gravity Hammer.zip"
  },
  {
-  "raw": "transformers_fall_of_cybertron_optimus_prime-animated.zip",
+  "raw": "transformers_fall_of_cybertron_keelwright_prime-animated.zip",
   "modes": [
    "robot"
   ],
@@ -3893,11 +3893,11 @@
    "animated"
   ],
   "subtype": null,
-  "name": "fall of optimus prime animated",
+  "name": "fall of keelwright animated",
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/transformers_fall_of_cybertron_optimus_prime-animated.zip"
+  "path": "./bots/transformers_fall_of_cybertron_keelwright_prime-animated.zip"
  },
  {
   "raw": "transformers_fall_of_cybertron_soldiers.zip",
@@ -3913,17 +3913,17 @@
   "path": "./bots/transformers_fall_of_cybertron_soldiers.zip"
  },
  {
-  "raw": "transformers_fall_of_cybertron_megatron-3forms.zip",
+  "raw": "transformers_fall_of_cybertron_cleave-3forms.zip",
   "modes": [
    "robot"
   ],
   "flags": [],
   "subtype": null,
-  "name": "fall of megatron 3forms",
+  "name": "fall of cleave 3forms",
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/transformers_fall_of_cybertron_megatron-3forms.zip"
+  "path": "./bots/transformers_fall_of_cybertron_cleave-3forms.zip"
  },
  {
   "raw": "transformers_fall_of_cybertron_starscream-2-forms.zip",
@@ -4364,7 +4364,7 @@
   "path": "./bots/TRANSFORMER JETFIRE.zip"
  },
  {
-  "raw": "both--with-transform-animation--Transformers_ Fall of Cybertron Megatron.zip",
+  "raw": "both--with-transform-animation--Transformers_ Fall of Cybertron Cleave.zip",
   "modes": [
    "robot",
    "alt"
@@ -4374,11 +4374,11 @@
    "transform_anim"
   ],
   "subtype": null,
-  "name": "Transformers_ Fall of Cybertron Megatron",
+  "name": "Transformers_ Fall of Cybertron Cleave",
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both--with-transform-animation--Transformers_ Fall of Cybertron Megatron.zip"
+  "path": "./bots/both--with-transform-animation--Transformers_ Fall of Cybertron Cleave.zip"
  },
  {
   "raw": "Trypticon.zip",
@@ -4467,7 +4467,7 @@
   "path": "./bots/Transformers_ War For Cybertron Bumblebee.zip"
  },
  {
-  "raw": "animated - Transformers War For Cybertron Megatron.zip",
+  "raw": "animated - Transformers War For Cybertron Cleave.zip",
   "modes": [
    "robot"
   ],
@@ -4475,11 +4475,11 @@
    "animated"
   ],
   "subtype": null,
-  "name": "Megatron",
+  "name": "Cleave",
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/animated - Transformers War For Cybertron Megatron.zip"
+  "path": "./bots/animated - Transformers War For Cybertron Cleave.zip"
  },
  {
   "raw": "both-Transformers_ Fall of Cybertron Ironhide.zip",
@@ -4524,7 +4524,7 @@
   "path": "./bots/transformers fall of cybertron soldier.zip"
  },
  {
-  "raw": "both+weapon-Transformers Fall Of Cybertron Megatron.zip",
+  "raw": "both+weapon-Transformers Fall Of Cybertron Cleave.zip",
   "modes": [
    "robot",
    "alt"
@@ -4534,11 +4534,11 @@
    "has_weapon"
   ],
   "subtype": null,
-  "name": "Megatron",
+  "name": "Cleave",
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/both+weapon-Transformers Fall Of Cybertron Megatron.zip"
+  "path": "./bots/both+weapon-Transformers Fall Of Cybertron Cleave.zip"
  },
  {
   "raw": "both--set of 5--Transformers Fall Of Cybertron Combaticons.zip",
@@ -4694,17 +4694,17 @@
   "path": "./bots/vehicles/transformers fall of cybertron Perceptor.zip"
  },
  {
-  "raw": "Megatron Tank.zip",
+  "raw": "Cleave Tank.zip",
   "modes": [
    "robot"
   ],
   "flags": [],
   "subtype": null,
-  "name": "Megatron Tank",
+  "name": "Cleave Tank",
   "note": null,
   "category": "bot",
   "dir": "vehicles",
-  "path": "./bots/vehicles/Megatron Tank.zip"
+  "path": "./bots/vehicles/Cleave Tank.zip"
  },
  {
   "raw": "Fall of CyberTron_ Bumble Bee Vehicle.zip",
@@ -4733,30 +4733,30 @@
   "path": "./bots/vehicles/War For CyberTron_ Bumble Bee Vehicle.zip"
  },
  {
-  "raw": "Fall of CyberTron_ Optimus Prime CyberTruck.zip",
+  "raw": "Fall of CyberTron_ Keelwright CyberTruck.zip",
   "modes": [
    "robot"
   ],
   "flags": [],
   "subtype": null,
-  "name": "Optimus Prime CyberTruck",
+  "name": "Keelwright CyberTruck",
   "note": null,
   "category": "bot",
   "dir": "vehicles",
-  "path": "./bots/vehicles/Fall of CyberTron_ Optimus Prime CyberTruck.zip"
+  "path": "./bots/vehicles/Fall of CyberTron_ Keelwright CyberTruck.zip"
  },
  {
-  "raw": "Fall of CyberTron_ DLC G1 Optimus Prime Alt Mode.zip",
+  "raw": "Fall of CyberTron_ DLC G1 Keelwright Alt Mode.zip",
   "modes": [
    "robot"
   ],
   "flags": [],
   "subtype": null,
-  "name": "DLC G1 Optimus Prime Alt Mode",
+  "name": "DLC G1 Keelwright Alt Mode",
   "note": null,
   "category": "bot",
   "dir": "vehicles",
-  "path": "./bots/vehicles/Fall of CyberTron_ DLC G1 Optimus Prime Alt Mode.zip"
+  "path": "./bots/vehicles/Fall of CyberTron_ DLC G1 Keelwright Alt Mode.zip"
  },
  {
   "raw": "Trasformers Fall Of Cybertron Sideswipe.zip",
@@ -4772,17 +4772,17 @@
   "path": "./bots/vehicles/Trasformers Fall Of Cybertron Sideswipe.zip"
  },
  {
-  "raw": "PlayStation 3 ROTF Megatron.zip",
+  "raw": "PlayStation 3 ROTF Cleave.zip",
   "modes": [
    "robot"
   ],
   "flags": [],
   "subtype": null,
-  "name": "PlayStation 3 ROTF Megatron",
+  "name": "PlayStation 3 ROTF Cleave",
   "note": null,
   "category": "bot",
   "dir": "vehicles",
-  "path": "./bots/vehicles/PlayStation 3 ROTF Megatron.zip"
+  "path": "./bots/vehicles/PlayStation 3 ROTF Cleave.zip"
  },
  {
   "raw": "bot--dragonstrike.zip",
@@ -5360,17 +5360,17 @@
   "path": "./references/reference--smoother design of elegance-aka Laser Turret.zip"
  },
  {
-  "raw": "references--potential Jhiaxus reference not sure yet-aka MIND ALPHA.zip",
+  "raw": "references--potential Assay reference not sure yet-aka MIND ALPHA.zip",
   "modes": [
    "robot"
   ],
   "flags": [],
   "subtype": null,
-  "name": "potential Jhiaxus reference not sure yet",
+  "name": "potential Assay reference not sure yet",
   "note": "MIND ALPHA",
   "category": "reference",
   "dir": "references",
-  "path": "./references/references--potential Jhiaxus reference not sure yet-aka MIND ALPHA.zip"
+  "path": "./references/references--potential Assay reference not sure yet-aka MIND ALPHA.zip"
  },
  {
   "raw": "reference--good body model details-aka Bi-Pedal Heavy Weapons Platform Concept.zip",

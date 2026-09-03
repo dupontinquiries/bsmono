@@ -63,7 +63,7 @@ pub static CODEX: &[Entry] = &[
         title: "the under-garden",
         claim: None,
         lines: &[
-            "jhiaxus kept his failures. fed them. below the garden",
+            "assay kept his failures. fed them. below the garden",
             "of helix the roof is alive, and it remembers how to",
             "hold on. do not trust a ceiling you cannot see.",
         ],
@@ -259,8 +259,8 @@ pub static CODEX: &[Entry] = &[
         ],
     },
     Entry {
-        id: "jhiaxus",
-        title: "jhiaxus",
+        id: "assay",
+        title: "assay",
         claim: None,
         lines: &[
             "the signal architect. never afraid, never cruel --",
@@ -279,8 +279,8 @@ pub static CODEX: &[Entry] = &[
         ],
     },
     Entry {
-        id: "optimus",
-        title: "optimus",
+        id: "keelwright",
+        title: "keelwright",
         claim: None,
         lines: &[
             "he stops believing himself eternal, and begins",
@@ -289,8 +289,8 @@ pub static CODEX: &[Entry] = &[
         ],
     },
     Entry {
-        id: "rodimus",
-        title: "rodimus",
+        id: "halyard",
+        title: "halyard",
         claim: None,
         lines: &[
             "the heir who leads as if apologizing for it,",
@@ -405,12 +405,12 @@ pub static CODEX: &[Entry] = &[
         lines: &[
             "a reckless young scout in earth orbit who idolizes prime.",
             "he dives the ruptured mantle, and at the worst moment",
-            "takes up the matrix -- and rises out of it as rodimus.",
+            "takes up the matrix -- and rises out of it as halyard.",
         ],
     },
     Entry {
-        id: "megatron",
-        title: "megatron",
+        id: "cleave",
+        title: "cleave",
         claim: None,
         lines: &[
             "drawn to the valence pulse, he returns changed --",
@@ -533,8 +533,8 @@ pub static CODEX: &[Entry] = &[
         ],
     },
     Entry {
-        id: "dossier_jhiaxus",
-        title: "dossier: jhiaxus",
+        id: "dossier_assay",
+        title: "dossier: assay",
         claim: None,
         lines: &[
             "he helped design the control interface, under the",

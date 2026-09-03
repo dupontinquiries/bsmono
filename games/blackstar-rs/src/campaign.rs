@@ -43,7 +43,7 @@ use crate::weapons::Element;
 /// The destination's own faction (`patrol::Destination.hostiles`) is now
 /// load-bearing rather than flavor: a mission sited on a Corrupted world
 /// pulls from the Corrupted roster first, same as the treatment's own
-/// Film 2 logic — Jhiaxus' experiment does not politely wait for the
+/// Film 2 logic — Assay' experiment does not politely wait for the
 /// Hijack war to make room for it (see `corruption.rs`).
 pub fn waves_for(m: &Mission) -> Vec<Vec<&'static str>> {
     let mut rng = Rng::new(strhash(m.id));
@@ -679,7 +679,7 @@ mod tests {
         let note = c.apply_playtest_unlock().expect("all must report");
         assert!(note.contains("PLAYTEST"), "the unlock was quiet: {note}");
         assert!(c.is_cleared("the_beach_opens"), "the Wardeck is still shut");
-        assert!(c.is_cleared("what_jhiaxus_grew"), "the bridge is still dark");
+        assert!(c.is_cleared("what_assay_grew"), "the bridge is still dark");
         assert_eq!(
             c.cleared.len(),
             crate::content::MISSIONS.len(),
@@ -691,7 +691,7 @@ mod tests {
         let mut d = CampaignLog::default();
         assert!(d.apply_playtest_unlock().is_some());
         assert!(d.is_cleared("the_beach_opens") && d.is_cleared("the_pluto_line"));
-        assert!(!d.is_cleared("what_jhiaxus_grew"), "a subset cleared more than asked");
+        assert!(!d.is_cleared("what_assay_grew"), "a subset cleared more than asked");
 
         // a typo is reported rather than silently doing nothing — the failure
         // that costs a playtester an evening wondering why nothing opened
@@ -746,7 +746,7 @@ mod tests {
         only_archive.record("the_scavenger_king");
         only_archive.record("the_red_extraction");
         only_archive.record("the_beach_opens");
-        only_archive.record("what_jhiaxus_grew");
+        only_archive.record("what_assay_grew");
         only_archive.record("the_mantle_dive");
         // note: the_drowned_approach (Slipstream's own mission) is
         // deliberately skipped here
@@ -771,7 +771,7 @@ mod tests {
         assert!(!log.slipstream_defected());
         // clearing an earlier film-2 mission is not the same as clearing
         // the film's actual last one
-        log.record("what_jhiaxus_grew");
+        log.record("what_assay_grew");
         assert!(!log.slipstream_defected());
         log.record("the_drowned_approach");
         assert!(log.slipstream_defected());

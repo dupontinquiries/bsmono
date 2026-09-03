@@ -74,35 +74,64 @@ mod tests {
     const CENSUS: &[(&str, usize)] = &[
         ("Cybertron", 152),
         ("cybertron", 117),
-        // energon -> valence, done. Kept at zero rather than deleted so a
-        // reintroduction fails instead of passing silently.
+        // DONE, and held at zero so a reintroduction fails rather than passing
+        // silently. energon -> valence; Optimus Prime -> Keelwright;
+        // Megatron -> Cleave; Jhiaxus -> Assay; Rodimus -> Halyard.
         ("Energon", 0),
         ("energon", 0),
-        ("Optimus", 24),
-        ("optimus", 21),
-        ("Megatron", 15),
-        ("megatron", 17),
+        // NOT zero, and cannot be: `saga.rs`'s own two guards name these words
+        // as DATA — `no_licensed_vocabulary`'s banned list and
+        // `the_inherited_contamination_is_counted_not_hidden`'s needles. An
+        // occurrence that exists only to detect reintroduction is a FLOOR, not
+        // debt. Going below it means a guard was deleted.
+        ("Optimus", 1),
+        ("optimus", 1),
+        ("Megatron", 1),
+        ("megatron", 1),
+        ("Jhiaxus", 0),
+        ("jhiaxus", 0),
+        // Rodimus was seeded at 25 from a hand-grep while the census reported
+        // 24: this file's own header quotes the allowed-vocabulary sentence
+        // from docs/films/README.md, which contains the word. The census
+        // excludes itself; the grep did not. The guard caught it on its first
+        // real use.
+        ("Rodimus", 0),
+        ("rodimus", 0),
+        // Blocked on authoring: the robot factions need names of their own.
+        // `content.rs` proves Coalition is NOT the same thing as the Autobots
+        // ("the thing the coalition and the Autobots both"), so this is not
+        // the mechanical rename RENAME_MAP.md first claimed.
         ("Decepticon", 7),
         ("decepticon", 8),
         ("Autobot", 12),
         ("autobot", 3),
-        // Missed by the first census and all licensed: Rodimus and Unicron are
-        // Hasbro, Jhiaxus is Marvel/IDW. `docs/films/README.md` names Rodimus
-        // in the very sentence that states the vocabulary rule, so the rule has
-        // a hole in its own wording.
+        // Missed by the first audit. Hasbro, and Jhiaxus was Marvel/IDW.
+        // docs/films/README.md names Rodimus in the very sentence that states
+        // the vocabulary rule, so the rule has a hole in its own wording.
         ("Unicron", 33),
         ("unicron", 37),
-        ("Jhiaxus", 17),
-        ("jhiaxus", 20),
-        // 24, not 25: this file's own header quotes the allowed-vocabulary
-        // sentence from docs/films/README.md, which contains the word. The
-        // census excludes itself; the hand-grep that seeded these numbers did
-        // not. The guard caught it on its first real use.
-        ("Rodimus", 24),
-        ("rodimus", 15),
-        // KEEP. Developer attribution in `compact.rs` and `xform.rs`, not
-        // in-fiction vocabulary. Counted so that a well-meaning sweep that
-        // deletes them fails and reads this comment.
+        // SURFACED BY THE RENAME rather than by the audit. Substituting the
+        // character names left "Halyard Prime" and "Hot Rod" standing in the
+        // prose, with the Matrix of Leadership behind them.
+        //
+        // `Prime` is a TITLE as well as a name, so replacing it is a further
+        // decision — what the Enduring call the office — and `Hot Rod` is
+        // Halyard before he inherits it, so those two are one decision.
+        // 25 rather than 24: one is inside saga.rs's "Optimus Prime" needle.
+        ("Prime", 25),
+        ("Hot Rod", 4),
+        ("hot rod", 3),
+        ("Matrix", 5),
+        // NOT counted: lowercase `prime` and `matrix`. Both have honest
+        // non-licensed uses here — `prime` is a Troop id and a player class,
+        // `matrix` is linear algebra in a 3D engine — so a raw count would be
+        // mostly false positives and could never reach zero. They need
+        // reading, not counting.
+        //
+        // KEEP: AllSpark. Developer attribution in `compact.rs` and
+        // `xform.rs`, not in-fiction vocabulary — both explain why the
+        // displacement-field fold is shaped as it is. Counted so a
+        // well-meaning sweep that deletes them fails and reads this.
         ("AllSpark", 2),
     ];
 

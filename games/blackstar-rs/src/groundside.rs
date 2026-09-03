@@ -100,7 +100,7 @@ pub static PLACES: &[Place] = &[
     Place {
         id: "the_bunker",
         dest: "earth",
-        reached_by: &["what_jhiaxus_grew"],
+        reached_by: &["what_assay_grew"],
         name: "THE BUNKER",
         then: "an operational site nobody files paperwork about. four floors of \
                filing, and a fifth the plans do not admit to.",
@@ -150,7 +150,7 @@ pub static PLACES: &[Place] = &[
     Place {
         id: "the_ground_station",
         dest: "earth",
-        reached_by: &["what_jhiaxus_grew"],
+        reached_by: &["what_assay_grew"],
         name: "THE GROUND STATION",
         then: "a dish pointed at things that are not in the ephemeris, on a \
                programme that will be terminated in 2009.",
@@ -165,7 +165,7 @@ pub static PLACES: &[Place] = &[
     Place {
         id: "the_museum",
         dest: "earth",
-        reached_by: &["what_jhiaxus_grew"],
+        reached_by: &["what_assay_grew"],
         name: "THE MUSEUM",
         then: "a regional collection with a case near the fire exit and no alarm \
                on it.",
@@ -189,7 +189,7 @@ pub static PLACES: &[Place] = &[
     Place {
         id: "the_clinic",
         dest: "earth",
-        reached_by: &["what_jhiaxus_grew"],
+        reached_by: &["what_assay_grew"],
         name: "THE CLINIC",
         then: "a records room with one filing cabinet that locks separately.",
         now: "the cabinet is still locked. the name has been cut out of the file \

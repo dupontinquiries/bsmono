@@ -2,7 +2,7 @@
 """shape_pairs.py -- build (blob -> detail) training pairs for a 3D upscaler.
 
 The idea is the user's: take the models that already look right (Scorponok,
-Soundwave, Megatron, Laserbeak, Brawl), degrade them into blobs, and learn the
+Soundwave, Cleave, Laserbeak, Brawl), degrade them into blobs, and learn the
 mapping back. Degrading is free and exact, so the pairs are self-supervised -- no
 labelling, and the detail comes from real Transformers geometry rather than
 foreign parts bolted on.

@@ -30,7 +30,7 @@
 //!
 //! Every wave-composition/economy number below is the C engine's own,
 //! not re-derived or re-tuned — this is a port, not a redesign. The
-//! person's own additions (cloakers, a unique "Jhiaxus horror" boss,
+//! person's own additions (cloakers, a unique "Assay horror" boss,
 //! AI-generated mystery rounds) are real, interesting scope but are
 //! NOT in the C reference and are not guessed at here; they belong on
 //! top of this core once the arena/spawn foundation exists to hang

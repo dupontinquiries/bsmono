@@ -1,14 +1,14 @@
 //! THE PARALYSIS FIELD — Blackstar's reverse-interface network, timed.
 //!
 //! Source: `TF_DOMINION_SHIELD_HINTS.md`'s Act 3 LHC showdown, and the
-//! wider network described in `Jhiaxus_Horror.md`'s Dominion overview
+//! wider network described in `Assay_Horror.md`'s Dominion overview
 //! — Blackstar threading a reverse-interface through the LHC and
 //! pillar infrastructure while the Corrupted occupy every other
 //! Autobot resource ("the horror is the noise. the network is the
 //! signal.") The field itself is described precisely enough to run on:
 //!
-//!   "Optimus is engaging Blackstar directly — timing strikes within
-//!   the 12-second paralysis intervals... Blackstar holds Optimus at
+//!   "Keelwright is engaging Blackstar directly — timing strikes within
+//!   the 12-second paralysis intervals... Blackstar holds Keelwright at
 //!   the peak of a pulse window. Three seconds of stillness while the
 //!   paralysis field resets."
 //!
@@ -154,7 +154,7 @@ mod tests {
     fn the_safe_fraction_matches_the_scene_exactly() {
         // three of twelve seconds -- a quarter of the cycle is the
         // window "LA Hero is running node sabotage between," the rest
-        // is what Optimus has to survive
+        // is what Keelwright has to survive
         assert!((SAFE_SEC / PERIOD_SEC - 0.25).abs() < 1e-6);
     }
 }

@@ -112,7 +112,7 @@ pub static CURRICULUM: &[Mechanic] = &[
     },
     Mechanic {
         id: "corruption",
-        taught_by: "what_jhiaxus_grew",
+        taught_by: "what_assay_grew",
         used_in: ALL,
         built: true,
         module: "corruption.rs",

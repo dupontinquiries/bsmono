@@ -41,7 +41,7 @@
 //!
 //! Both were already asking this question and answering it with constants:
 //! `tradecraft` (which door, and is it watched) and the hunted-by-something
-//! preset for the Jhiaxus horror, which is the same arithmetic with a
+//! preset for the Assay horror, which is the same arithmetic with a
 //! watcher that never stops looking.
 
 /// Something that might notice you.

@@ -513,7 +513,7 @@ fn scale_cmd() {
     println!("  a car game and not about cameras. Pointed at an 8.5 m bot that");
     println!("  distance is nearer than the bot is tall.");
     println!("\n  model_tuning.json normalises every model INTO that body:");
-    println!("  Optimus Prime ships at scale 0.4989. At his real height he");
+    println!("  Keelwright ships at scale 0.4989. At his real height he");
     println!("  wants {:.1}.", scale::true_scale(0.4989, 8.5));
     let (d, _) = scale::camera_for(Class::Titan, 228.0);
     println!("\n  a person and Two California Plaza in one shot is a 130:1 span");

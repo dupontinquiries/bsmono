@@ -1,4 +1,4 @@
-//! THE CORRUPTED — Jhiaxus' experiment, mechanized.
+//! THE CORRUPTED — Assay' experiment, mechanized.
 //!
 //! Source: `TF_JHIAXUS_AND_THE_CORRUPTED.md`, the screenplay's Film 2
 //! horror design document. A Decepticon exposed to Unicron's neural

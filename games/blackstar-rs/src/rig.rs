@@ -7,7 +7,7 @@
 //! and the skin.
 //!
 //! What the reference transformations actually need, measured rather than
-//! assumed (Optimus "Change form", 83 joints, 8.33 s):
+//! assumed (Keelwright "Change form", 83 joints, 8.33 s):
 //!
 //!   * 82 of 83 joints are animated, and NO animated node carries a mesh
 //!     directly — every mesh is a child that inherits its motion through the

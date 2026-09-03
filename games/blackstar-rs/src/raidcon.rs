@@ -196,7 +196,7 @@ pub const BOSSES: &[Boss] = &[
             "the weapon. it still broadcasts. no fleet that answers returns.",
         ],
         shard: "it was not singing to anyone. it was holding a note." },
-    Boss { id: "jhiaxus_omega", name: "Devastator Jhiaxus", title: "Prototype Omega",
+    Boss { id: "assay_omega", name: "Devastator Assay", title: "Prototype Omega",
         mech: Mech::Purge, element: Element::Fire, arena: "kuiper", tier: 3,
         premise: "destroying one only caused it to rebuild itself",
         relic: &[

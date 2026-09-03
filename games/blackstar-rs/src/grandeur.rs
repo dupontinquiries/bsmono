@@ -26,7 +26,7 @@
 //!    carries a note. Treat them as the order of magnitude the source
 //!    material asks for, not as canon.
 //! 2. **Puts everything in one unit**: the OCCUPANT HEIGHT (`oh`). A
-//!    guardian is 1 oh in Destiny; Optimus is 1 oh in the films; the car
+//!    guardian is 1 oh in Destiny; Keelwright is 1 oh in the films; the car
 //!    is 1 oh in this engine (`scale::RL_BODY_H_M`). `docs/START_HERE.md`
 //!    already says sizes are in occupant heights, not metres; this gives
 //!    that unit reference values.
@@ -58,7 +58,7 @@ pub struct Frame {
 
 /// Destiny: a guardian. 1.9 m is the usual estimate from door heights.
 pub const GUARDIAN: Frame = Frame { name: "Destiny guardian", body_m: 1.9 };
-/// The films: a mainline Transformer. Optimus is quoted at 28 ft in the
+/// The films: a mainline Transformer. Keelwright is quoted at 28 ft in the
 /// Bay-era production material; 8.5 m.
 pub const PRIME: Frame = Frame { name: "film Transformer (Prime)", body_m: 8.5 };
 /// Interstellar: a person. Its scale is always a person against a thing.
@@ -122,7 +122,7 @@ pub const REFERENCES: &[Reference] = &[
     Reference { what: "a patrol zone across", frame: GUARDIAN, metres: 1000.0, kind: Kind::Zone, note: "Cosmodrome/EDZ sub-zones, +/-300 m" },
     Reference { what: "the Traveler", frame: GUARDIAN, metres: 14_000.0, kind: Kind::Planetary, note: "diameter, lore figure" },
     // ---- Dark of the Moon ----
-    Reference { what: "Optimus", frame: PRIME, metres: 8.5, kind: Kind::Intimate, note: "28 ft, production material" },
+    Reference { what: "Keelwright", frame: PRIME, metres: 8.5, kind: Kind::Intimate, note: "28 ft, production material" },
     Reference { what: "Sentinel Prime", frame: PRIME, metres: 9.8, kind: Kind::Intimate, note: "32 ft" },
     Reference { what: "the Driller", frame: PRIME, metres: 400.0, kind: Kind::Planetary, note: "length, production estimate; the thing that ate a skyscraper" },
     Reference { what: "the Chicago set piece", frame: PRIME, metres: 2000.0, kind: Kind::Zone, note: "the fought-over stretch of downtown, +/-500 m" },
@@ -245,7 +245,7 @@ mod tests {
     fn the_unit_is_the_body_so_a_body_is_one() {
         let car = measured().into_iter().find(|m| m.what.starts_with("car:")).unwrap();
         assert!((car.oh() - 1.0).abs() < 1e-6);
-        let prime = REFERENCES.iter().find(|r| r.what == "Optimus").unwrap();
+        let prime = REFERENCES.iter().find(|r| r.what == "Keelwright").unwrap();
         assert!((prime.oh() - 1.0).abs() < 1e-6);
     }
 

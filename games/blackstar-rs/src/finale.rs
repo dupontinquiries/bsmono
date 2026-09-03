@@ -25,7 +25,7 @@
 //! reluctance about using full force"); choosing it once, in front of
 //! everyone, because the people he would otherwise kill are the
 //! reinforcements arriving to help him, is his version of the
-//! completed arc the treatment already gives Rodimus and Blackstar.
+//! completed arc the treatment already gives Halyard and Blackstar.
 //!
 //! Photon Man's role changes to match. The earlier draft had the two
 //! blasts colliding; the stronger version is a division of labour, and

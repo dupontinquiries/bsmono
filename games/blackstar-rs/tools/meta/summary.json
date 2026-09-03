@@ -13,11 +13,11 @@
   "",
   "  MODES lists 19 models with BOTH robot and alt forms. Those are real",
   "  transform references \u2014 a fold someone authored, against which foldview's",
-  "  fitted one can be compared. Grimlock, Shockwave, Soundwave, Megatron,",
+  "  fitted one can be compared. Grimlock, Shockwave, Soundwave, Cleave,",
   "  Ratchet, Jetfire, Ironhide and the Insecticons among them.",
   "",
   "  FLAGS name six models carrying ANIMATION: `transform_anim` on Fall of",
-  "  Cybertron Megatron, `idle_anim` on Soundwave, `animated` on four more.",
+  "  Cybertron Cleave, `idle_anim` on Soundwave, `animated` on four more.",
   "  Gait strips have been the blocker for walking and running through this",
   "  entire port, and this is the first evidence that authored motion exists",
   "  in the library at all."
@@ -53,7 +53,7 @@
   "Ironhide",
   "Jetfire",
   "MIXMASTER",
-  "Megatron",
+  "Cleave",
   "Ratchet",
   "Scattershot",
   "Shockwave",
@@ -62,16 +62,16 @@
   "Soundwave",
   "Swoop",
   "Transformers Fall Of Cybertron Combaticons",
-  "Transformers_ Fall of Cybertron Megatron",
+  "Transformers_ Fall of Cybertron Cleave",
   "Warpath"
  ],
  "animated": [
   "Mech Constructor  Heavy Spider (Animated) [animated]",
-  "Megatron [animated]",
+  "Cleave [animated]",
   "Realistic Old Russian Guy [animated]",
   "Soundwave [idle_anim]",
-  "Transformers_ Fall of Cybertron Megatron [both_modes,transform_anim]",
-  "fall of optimus prime animated [animated]",
+  "Transformers_ Fall of Cybertron Cleave [both_modes,transform_anim]",
+  "fall of keelwright animated [animated]",
   "spearhead [animated]"
  ],
  "non_humanoid": [

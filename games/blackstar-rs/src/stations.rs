@@ -462,7 +462,7 @@ fn gate_open_for(dest: &str, sb: &Shipboard) -> bool {
     }
     // THE BRIDGE GATES EVERYTHING OUTSIDE SOL. Reaching a world on a mission
     // is not the same as being able to GO there: leaving the system needs the
-    // space bridge, and the bridge stays dark until Jhiaxus is dead. Before
+    // space bridge, and the bridge stays dark until Assay is dead. Before
     // this, an extra-solar destination opened purely because a mission had
     // touched it, so the reason the bridge was shut was nowhere in the game.
     if crate::patrol::beyond_sol(dest) && !crate::patrol::bridge_powered(&sb.camp) {
@@ -634,7 +634,7 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
                     };
                     // WHO IS IN IT. The row said what the mission is and who
                     // opposes you, never who is present with you — so a beat
-                    // that turns on playing as Prime and watching Megatron go
+                    // that turns on playing as Prime and watching Cleave go
                     // read as an anonymous errand until you were in it.
                     let cast: Vec<String> = m
                         .cast
@@ -2149,7 +2149,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bridge_stays_dark_until_jhiaxus_is_dead() {
+    fn the_bridge_stays_dark_until_assay_is_dead() {
         // Reaching a world on a mission is not being able to GO there:
         // leaving Sol needs the bridge, and the bridge was shut because an
         // infestation was loose in the system.
@@ -2168,14 +2168,14 @@ mod tests {
     }
 
     #[test]
-    fn killing_jhiaxus_powers_it() {
+    fn killing_assay_powers_it() {
         // The complement: a gate that never opens is not a gate. Both halves
         // are needed — the bridge AND a mission that reached the world.
         let mut sb = board();
         sb.camp.record("beneath_the_pacific");
         sb.camp.record(crate::patrol::BRIDGE_SAFE_AFTER);
         assert!(crate::patrol::bridge_powered(&sb.camp));
-        assert!(gate_open_for("cybertron", &sb), "Jhiaxus is dead and the bridge is still shut");
+        assert!(gate_open_for("cybertron", &sb), "Assay is dead and the bridge is still shut");
         // the bridge alone is not a route: nothing has reached Helix
         assert!(
             !gate_open_for("helix", &sb),

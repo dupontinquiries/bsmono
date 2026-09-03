@@ -8185,7 +8185,7 @@ impl Game {
         };
         // WHO THE ECHO IS ALLOWED TO CARRY. The model may have asked for
         // anyone; `casting::admit` checks each name against this save's own
-        // campaign, so the same forged raid can legally cast Megatron for a
+        // campaign, so the same forged raid can legally cast Cleave for a
         // player mid-Film-3 and cast nobody for one who has seen the plates
         // close. Parsing deliberately kept the request unvalidated because it
         // has no idea which save it is for.

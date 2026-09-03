@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn the_hunter_is_answered_with_distance_and_nothing_else() {
         use crate::perception::Watcher;
-        // the Jhiaxus case, and the second caller that justifies perception
+        // the Assay case, and the second caller that justifies perception
         // existing. A hunter sees less far than a floodlit sentry and never
         // stops, so cover and patience buy nothing — only being outside its
         // range does.

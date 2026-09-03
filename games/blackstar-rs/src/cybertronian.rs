@@ -492,8 +492,8 @@ mod tests {
         // The test asserts only the thing that matters here — that no frame
         // borrows a name from that pile.
         let borrowed = [
-            "megatron", "soundwave", "grimlock", "ironhide", "ratchet", "jetfire", "starscream",
-            "optimus", "bumblebee", "shockwave", "warpath", "swoop", "slug", "airraid",
+            "cleave", "soundwave", "grimlock", "ironhide", "ratchet", "jetfire", "starscream",
+            "keelwright", "bumblebee", "shockwave", "warpath", "swoop", "slug", "airraid",
         ];
         for f in FRAMES {
             let low = f.id.to_lowercase();
