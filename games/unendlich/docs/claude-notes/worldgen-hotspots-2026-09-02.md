@@ -16,10 +16,15 @@ already had the value.
 
 | chunk | before | after |
 |---|---|---|
-| surface (y=0) | 231 ms | 61 ms |
-| underground (y=-3) | 222 ms | 38 ms |
-| far surface | 267 ms | 81 ms |
-| sky (y=6) | 0.1 ms | 0.1 ms (early-out already existed) |
+| surface (y=0) | 231 ms | **13.9 ms** |
+| underground (y=-3) | 222 ms | **10.2 ms** |
+| far surface | 267 ms | **20.4 ms** |
+| sky (y=6) | 0.1 ms | 0.05 ms (early-out already existed) |
+
+(Those "before" figures are without the biome registry, which was the
+measuring mistake described below; the "after" ones are with it, so the
+real improvement is slightly larger than the ratio shown. 16x on a
+surface chunk either way.)
 
 `surface_target(x, z)` costs ~4–5 µs and is the most expensive primitive
 in the generator. Everything below is about how often it, and its
@@ -113,7 +118,7 @@ would change output. The options, cheapest first:
    free, the cheap sample agreed with it, and it was wrong.
 2. Give `biome_def_at` a variant taking `(temp, humid)` and hoist the
    *per-y* computation to one place in the loop.
-3. **The one to do next**: `at_block_blended` does 8 `DashMap` gets per
+3. **DONE (2026-09-02, the largest win): the corner memo.** `at_block_blended` does 8 `DashMap` gets per
    call, and the climate recompute (4.48 ms of the 4.54 ms) is entirely
    those gets — `best_fit` over 39 biomes is 0.27 ms, so the search is
    not the problem. All 1 024 columns of a chunk fall in one or two
@@ -123,14 +128,34 @@ would change output. The options, cheapest first:
    continental and hills all get close to free, and no equality sweep is
    needed beyond "same values out".
 
-   The implementation problem is where to put it. `RegionField<T>` is
-   generic and shared across rayon workers, so a `Mutex` memo would
-   contend and a plain `thread_local!` cannot name `T`. The two ways
-   that work: (a) pass a caller-owned `CornerCache<T>` down from
-   `generate_chunk`, which is explicit but touches several signatures;
-   (b) a small direct-mapped per-thread cache in front of `at()` keyed
-   by `(field id, RegionCoord)` with the field carrying a `u32` id.
-   Measure with `biome_pass_breakdown` before and after.
+   Shipped as option (b): `RegionGrid<f64>::at_memo`, a 512-slot
+   direct-mapped **per-thread** table keyed by `(seed_offset, coord)`,
+   so one table serves every field and rayon workers on different chunks
+   do not thrash each other. It sits in `impl RegionGrid<f64>`, which
+   sidesteps the "a `thread_local!` cannot name `T`" problem entirely —
+   the blended fields are all `f64`.
+
+   Per-column costs before -> after: temperature 0.42 -> 0.05 us,
+   humidity 0.86 -> 0.10, sea_level 1.67 -> 0.20, continental+hills
+   0.46 -> 0.10, surface_target 5.19 -> 0.70, surface_y_at 7.15 -> 2.72,
+   `biome_at_3d` as a whole 9.37 -> 1.82. Whole chunk 48.5 -> 13.9 ms.
+
+## What is left now
+
+A surface chunk is ~14 ms. Nothing in the generator is obviously
+dominant any more; the next honest step is to re-run
+`column_pass_breakdown` and `biome_pass_breakdown` and see what floats
+to the top, rather than assume. Two things known to remain:
+
+- `surface_y_at` is still 2.72 us/column on shelf columns — it is a
+  linear scan and could be a binary search over the monotone-ish
+  density band, but the band is not strictly monotone so that needs an
+  equality sweep.
+- Worldgen is now roughly the same order as meshing again (14 ms vs
+  ~13 ms greedy / 1.8 ms binary+knobs on a surface chunk), so the
+  streaming bottleneck has moved. Re-measure the whole pipeline on real
+  hardware before picking the next target — every remaining assumption
+  in this document was formed on a 1-core sandbox.
 
 ## Method note
 
