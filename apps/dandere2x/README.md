@@ -159,8 +159,14 @@ What is built:
   anyway. On lavapipe this is a net loss (CPU rasterizer, pixel-
   proportional); the gain exists only on a real GPU and is bounded by how
   much time the job spends on tiny residuals.
-- **Keyframe-aligned segments** (`-j`): N encoders, one shared GPU, resumable
-  parts.
+- **Keyframe-aligned segments** (`-j`): N encoders, one shared GPU.
+- **Resume** (`--resume`, with `--keep-parts` on the first run): each finished
+  segment writes a sidecar stamped with every setting that affects pixels or
+  timing — model, kernel, scale, gate, cascade, matcher, codec, crf, segment
+  count. A rerun reuses only parts whose stamp matches, so an interrupted
+  multi-hour job costs one segment rather than the whole night, and changing
+  `--quality` (or anything else) correctly invalidates everything. A part
+  without its sidecar is treated as a truncated write and recomputed.
 - **Difficulty cascade** (`--cascade default|model.safetensors`,
   `--flat-bypass`): missing blocks are classed by luma standard deviation.
   Flat blocks (< `--flat-std`, default 2) get bicubic; smooth blocks

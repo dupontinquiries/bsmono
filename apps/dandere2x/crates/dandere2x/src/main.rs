@@ -123,6 +123,12 @@ enum Cmd {
         /// Segment workers: cut on source keyframes, one shared GPU, N encoders, parts concatenated.
         #[arg(long, short = 'j', default_value_t = 1)]
         jobs: usize,
+        /// Reuse finished segment parts from an earlier run with identical settings.
+        #[arg(long)]
+        resume: bool,
+        /// Keep segment parts after concat, so a later --resume can reuse them.
+        #[arg(long)]
+        keep_parts: bool,
         /// Start time in seconds (snaps to the previous keyframe).
         #[arg(long, default_value_t = 0.0)]
         start: f64,
@@ -245,9 +251,11 @@ fn print_event(e: &Event) {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Upscale { input, output, common, codec, crf, preset, eight_bit, jobs, start, end } => {
+        Cmd::Upscale { input, output, common, codec, crf, preset, eight_bit, jobs, start, end, resume, keep_parts } => {
             let mut job = job_from(&common, input, output)?;
             job.jobs = jobs;
+            job.resume = resume;
+            job.keep_parts = keep_parts;
             job.start = start;
             job.end = end;
             job.encode.codec = codec;
