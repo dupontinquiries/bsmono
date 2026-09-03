@@ -296,9 +296,17 @@ mod tests {
             "drain_egui is being handed a default mode again — pass \
              self.app.terminal.grid.key_mode(), or app-cursor arrows break."
         );
+        // FROM THE FED GRID. app.terminal.grid is never fed for the
+        // focused pane, so asking it returns the default forever — the
+        // expression looks right and the behaviour does not change.
         assert!(
-            src.contains("self.app.terminal.grid.key_mode()"),
-            "the live key mode is no longer reaching drain_egui."
+            src.contains("self.session.grid.key_mode()"),
+            "the key mode must come from session.grid, the one feed_pty writes."
+        );
+        assert_eq!(
+            src.matches("self.app.terminal.grid.key_mode()").count(),
+            0,
+            "reading the mode from the widget's unfed grid again."
         );
         // ONE INPUT OWNER. uikit_term::App::handle_input and
         // pty_input::drain_egui both read this frame's events; if the

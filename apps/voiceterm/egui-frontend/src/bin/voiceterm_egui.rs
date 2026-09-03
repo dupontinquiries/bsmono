@@ -3184,11 +3184,20 @@ impl eframe::App for VoicetermApp {
                 // symptom (Ctrl+R fzf history, where you cannot move
                 // through the match).
                 //
-                // Third time this chain has been completed at the last
-                // link: uikit-term hit the same thing when its own key
-                // path called `encode` instead of `encode_mode`.
+                // FROM THE GRID THE SHELL ACTUALLY FEEDS.
+                //
+                // There are two grids. `session.grid` is what feed_pty
+                // writes and what this view draws; `app.terminal.grid`
+                // belongs to the uikit-term widget and, for the focused
+                // pane, is never fed at all. Asking the widget's grid
+                // for the mode read a parser with no input — it returned
+                // the default forever, so the previous "fix" here
+                // changed the expression and not the behaviour.
+                //
+                // Fourth link in the same chain: encoder, parser, call
+                // site, and now the right parser.
                 voiceterm_egui::pty_input::drain_egui(
-                    ui, self.app.terminal.grid.key_mode(),
+                    ui, self.session.grid.key_mode(),
                     self.workspace.tabs.len() > 1)
             };
             for out in key_outs

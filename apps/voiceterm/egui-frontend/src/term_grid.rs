@@ -91,9 +91,29 @@ pub struct TermGrid {
     dirty: bool,
     dirty_rows: Option<(usize, usize)>,
     pen: Cell,
+    /// DECCKM (`ESC [ ? 1 h/l`). Set by fzf, vim, less and readline in
+    /// some configurations; while it is on, the arrow keys must be sent
+    /// as SS3 (`ESC O A`) rather than CSI (`ESC [ A`).
+    app_cursor: bool,
+    /// DEC 2004 bracketed paste.
+    bracketed_paste: bool,
 }
 
 impl TermGrid {
+    /// How keys must be encoded right now.
+    ///
+    /// The grid is the only thing that sees the mode-setting sequences,
+    /// so it is the only honest source. Read this at the key-drain call
+    /// site — and read it from the grid the shell's output actually
+    /// reaches, which for the focused pane is `session.grid`, not
+    /// `app.terminal.grid`.
+    pub fn key_mode(&self) -> uikit_term::keys::TermMode {
+        uikit_term::keys::TermMode {
+            app_cursor: self.app_cursor,
+            bracketed_paste: self.bracketed_paste,
+        }
+    }
+
     pub fn new(cols: usize, rows: usize) -> TermGrid {
         // A zero-sized grid is reachable during layout before a size is known,
         // and every index below assumes at least one cell.
@@ -102,6 +122,8 @@ impl TermGrid {
         TermGrid {
             cols, rows,
             cells: vec![vec![Cell::default(); cols]; rows],
+            app_cursor: false,
+            bracketed_paste: false,
             cursor_x: 0, cursor_y: 0,
             dirty: true, dirty_rows: Some((0, rows - 1)),
             pen: Cell::default(),
@@ -256,6 +278,57 @@ impl TermGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fresh_grid_is_in_neither_private_mode() {
+        let g = TermGrid::new(20, 3);
+        assert!(!g.key_mode().app_cursor);
+        assert!(!g.key_mode().bracketed_paste);
+    }
+
+    #[test]
+    fn decckm_is_tracked_so_arrows_can_change_shape() {
+        // The bug this closes: private modes were blanket-ignored, so
+        // the grid could never report app-cursor and the encoder's SS3
+        // branch was unreachable however the call site asked.
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        vt.feed(&mut g, b"\x1b[?1h");
+        assert!(g.key_mode().app_cursor, "fzf/vim/less set this");
+        vt.feed(&mut g, b"\x1b[?1l");
+        assert!(!g.key_mode().app_cursor, "and clear it on exit");
+    }
+
+    #[test]
+    fn bracketed_paste_is_tracked() {
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        vt.feed(&mut g, b"\x1b[?2004h");
+        assert!(g.key_mode().bracketed_paste);
+        vt.feed(&mut g, b"\x1b[?2004l");
+        assert!(!g.key_mode().bracketed_paste);
+    }
+
+    #[test]
+    fn one_sequence_can_set_several_modes() {
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        vt.feed(&mut g, b"\x1b[?1;2004h");
+        assert!(g.key_mode().app_cursor);
+        assert!(g.key_mode().bracketed_paste);
+    }
+
+    #[test]
+    fn the_other_private_modes_are_still_ignored_and_print_nothing() {
+        // ?25 (cursor visibility) and ?1049 (alternate screen) have no
+        // meaning for this grid, and must not land as cell writes
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        vt.feed(&mut g, b"hi\x1b[?25l\x1b[?1049h there");
+        assert_eq!(g.row_text(0).trim_end(), "hi there");
+        assert!(!g.key_mode().app_cursor);
+    }
+
 
     #[test]
     fn printing_advances_and_marks_only_its_own_row() {
@@ -537,9 +610,32 @@ impl Vt {
 /// Apply one CSI sequence. `body` is what sits between `[` and the final byte.
 fn csi(grid: &mut TermGrid, body: &str, final_byte: char) {
     // A private-mode sequence — `[?25l`, `[?1049h` — is addressed to the
-    // terminal, not the screen. Ignored rather than parsed as numbers,
-    // because `?25` parses as nothing and would land as a default.
-    if body.starts_with('?') {
+    // TERMINAL rather than the screen, so none of the cell operations
+    // below apply. Two of them change how KEYS must be encoded, and
+    // those are the reason this is no longer a blanket ignore.
+    //
+    // Blanket-ignoring them meant the grid could never report
+    // application-cursor mode, so the encoder's SS3 branch was
+    // unreachable no matter what the call site passed — arrows stayed
+    // broken inside fzf and vim even after the call site was "fixed" to
+    // ask the grid. Parsing the mode is the half that was missing.
+    //
+    // Everything else stays ignored, including ?25 (cursor visibility)
+    // and ?1049 (alternate screen): this grid has no scrollback swap and
+    // draws its own cursor.
+    if let Some(rest) = body.strip_prefix('?') {
+        let set = final_byte == 'h';
+        if final_byte != 'h' && final_byte != 'l' {
+            return;
+        }
+        // `?1000;1002;1006h` is one sequence setting three modes.
+        for m in rest.split(';') {
+            match m.parse::<u16>() {
+                Ok(1) => grid.app_cursor = set,
+                Ok(2004) => grid.bracketed_paste = set,
+                _ => {}
+            }
+        }
         return;
     }
     let n = |d: usize| body.split(';').next()
