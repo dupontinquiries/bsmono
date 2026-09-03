@@ -764,3 +764,80 @@ daemon tier". The answer the design implies:
 
 That is a real refactor with a clear shape, and it is the opposite of the
 one-commit deletion §16 was heading toward two paragraphs ago.
+
+## 17. NEXT CHAPTER: gitmind as a fleet deployer — what exists and what does not
+
+Scoped after being told this is the next chapter. Surveyed rather than assumed,
+because most of it turns out to be built already and the missing pieces are
+specific.
+
+### Already there, and more than expected
+
+`cockpit/src/deploy.rs` is 1,567 lines and covers the transport end well:
+
+* `scan_ssh` over a /24, `local_subnet24`, device discovery
+* push AND pull, `rsync` first with `scp` fallback, and a legacy `-O` fallback
+  for modern OpenSSH against old devices
+* `remote_capture` for running a command and reading its output
+* `parse_authorized_keys` / `dedupe_authorized_keys` — gitmind-managed key
+  entries with expiry stamps, so key installation is already modelled
+* `rustup_bootstrap_script(target)` and `bootstrap_rustup_remote`
+
+`buildflags.rs` already names the fleet's targets —
+`aarch64-unknown-linux-musl` and `-gnu` — and builds a `cargo build --target`
+argv, with a comment noting no container is needed when the target std is
+installed.
+
+`fleet.rs` has the fleet user, the build repo list and their config files.
+
+So SSH, keys, discovery, transfer and cross-target argv are NOT the gap.
+
+### The gap: nothing installs system integration
+
+`daemons.rs` generates units — `systemd_user_unit(d, exec_path)` and
+`openrc_service(d, exec_path)`, with an `InitSystem::detect_from_os_release` so
+it handles postmarketOS's OpenRC as well as systemd.
+
+**Neither function has a single caller.** `grep -rn systemd_user_unit` outside
+its own module returns nothing. §10's pattern, in exactly the module this
+chapter needs: unit generation is written, tested-adjacent, and unreachable.
+
+### And the daemon registry does not know the real daemons
+
+`daemons::all()` lists five fabric services — voiced, sharemd, coordd,
+settingsd, logscope-fabricd — with the note "adding one here is all that's
+needed for install/start to pick it up".
+
+It does not list `snapclone-bus` or `camera-bridge`, which are real daemons
+with real hand-written unit files in `system/snapclone/systemd/`, nor
+`photosync-daemon`. So the two `system/` projects — the entire daemon tier per
+§16 — are invisible to the daemon machinery.
+
+That is the join between this chapter and §16. `system/` is where daemons live;
+`daemons::all()` is what gitmind can install; the two lists have no overlap.
+
+### The chapter, in dependency order
+
+1. **Teach `daemons::all()` about the `system/` tier.** Either extend the
+   static list or derive it from `manifest/projects.toml`'s `daemon = true`
+   entries — the manifest already marks them, and a second hand-maintained list
+   is how the two disagree.
+2. **Call the unit generators.** `systemd_user_unit` / `openrc_service` exist
+   and nothing invokes them; installation should generate a unit rather than
+   copy a checked-in one, so `X-Fleet-Integration` is always present and
+   `ExecStart` always matches where the binary actually landed. That also fixes
+   the rusty-board class of bug found today (33b48880): a hand-written unit
+   whose `ReadWritePaths` named directories nothing created.
+3. **Cross-build locally.** `buildflags` produces the argv; what is missing is
+   the linker and sysroot story. `bootstrap_rustup_remote` suggests the current
+   answer is "build ON the device", which works and is slow — an FP5 building
+   unendlich is not a short wait. A local `aarch64-unknown-linux-musl` build
+   needs a cross linker, and musl is the easier of the two because it avoids
+   glibc version skew against whatever postmarketOS ships.
+4. **Install units as part of deploy**, with the daemon stopped first and
+   started after, and `daemon-reload` between — the step whose absence made
+   today's rusty-board redeploy report a stale unit.
+
+Steps 1 and 2 are pure and testable here. Step 3 needs a cross toolchain in the
+sandbox, which apt can probably supply (`gcc-aarch64-linux-gnu`,
+`musl-tools`) — untested. Step 4 needs a device.
