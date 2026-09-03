@@ -30,9 +30,36 @@
 //! only way to notice output promptly and `poll` in the UI loop would
 //! either spin or lag. It appends to a shared buffer the UI drains each
 //! frame; the UI never blocks on the child.
+//!
+//! ## Waking the UI
+//!
+//! An immediate-mode GUI only draws when something asks it to. egui
+//! repaints on input events; a shell answering half a frame after you
+//! pressed Enter is not an input event. So output landed in `incoming`
+//! and sat there until the next keystroke or mouse move — you type a
+//! command, press Enter, nothing happens, you wiggle the mouse and the
+//! whole result appears at once.
+//!
+//! [`Waker`] is how the reader tells the UI to draw. It is a REQUIRED
+//! argument to [`PtyHost::spawn`] rather than an optional setter,
+//! because this whole area has produced four bugs of the shape "every
+//! piece correct, one of them not wired", and an optional waker is
+//! exactly that shape again.
+//!
+//! Polling at 60 Hz instead would work and was rejected: it burns a core
+//! on an idle terminal, which on the phone targets this repo builds for
+//! is the difference between an app you leave open and one you close.
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+
+/// Called from the reader thread when the shell produces output, so the
+/// UI can draw it. For eframe this is `move || ctx.request_repaint()`.
+///
+/// A plain callback rather than an `egui::Context` keeps this module
+/// toolkit-neutral, which is the reason it is a module and not a method
+/// on the app.
+pub type Waker = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// A running shell attached to a pty.
 pub struct PtyHost {
@@ -61,7 +88,7 @@ impl PtyHost {
     /// `TERM=xterm-256color` because that is what this grid actually
     /// implements. Claiming more (`xterm-kitty`, say) invites programs to
     /// send sequences the parser will render as garbage.
-    pub fn spawn(cols: u16, rows: u16) -> Result<PtyHost, String> {
+    pub fn spawn(cols: u16, rows: u16, wake: Waker) -> Result<PtyHost, String> {
         use portable_pty::{native_pty_system, CommandBuilder, PtySize};
         let sys = native_pty_system();
         let pair = sys
@@ -86,6 +113,7 @@ impl PtyHost {
         {
             let incoming = Arc::clone(&incoming);
             let ended = Arc::clone(&ended);
+            let wake = Arc::clone(&wake);
             std::thread::spawn(move || {
                 let mut reader = reader;
                 let mut buf = [0u8; 8192];
@@ -93,6 +121,10 @@ impl PtyHost {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => {
                             ended.store(true, std::sync::atomic::Ordering::SeqCst);
+                            // Wake on EXIT too, or the frame that would
+                            // notice `ended` and show the shell died
+                            // never runs.
+                            wake();
                             return;
                         }
                         Ok(n) => {
@@ -105,6 +137,17 @@ impl PtyHost {
                                 Err(e) => e.into_inner(),
                             };
                             g.extend_from_slice(&buf[..n]);
+                            drop(g);
+                            // Outside the lock: the UI thread takes this
+                            // same mutex in `drain`, and waking it while
+                            // holding the lock invites it to spin
+                            // straight into a contended acquire.
+                            //
+                            // Called per read, not per byte. Repeated
+                            // requests within one frame coalesce in
+                            // egui, so a noisy build wakes the UI at
+                            // frame rate rather than at read rate.
+                            wake();
                         }
                     }
                 }
@@ -202,7 +245,7 @@ mod tests {
     #[ignore = "spawns a real shell; run explicitly"]
     fn a_command_runs_and_its_output_comes_back() {
         std::env::set_var("SHELL", "/bin/sh");
-        let host = PtyHost::spawn(80, 24).expect("spawn");
+        let host = PtyHost::spawn(80, 24, std::sync::Arc::new(|| {})).expect("spawn");
         host.write(b"echo VOICETERM_MARKER\n").expect("write");
         let mut seen = String::new();
         for _ in 0..100 {
@@ -219,7 +262,7 @@ mod tests {
     #[ignore = "spawns a real shell; run explicitly"]
     fn an_exited_shell_is_reported_rather_than_looking_alive() {
         std::env::set_var("SHELL", "/bin/sh");
-        let host = PtyHost::spawn(80, 24).expect("spawn");
+        let host = PtyHost::spawn(80, 24, std::sync::Arc::new(|| {})).expect("spawn");
         host.write(b"exit\n").expect("write");
         for _ in 0..100 {
             if host.ended() {

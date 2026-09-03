@@ -3483,7 +3483,7 @@ impl eframe::App for VoicetermApp {
                 // failure is logged and left as None: that pane falls back
                 // to local echo, which is worse than a shell and much
                 // better than a dead rectangle.
-                let host = match voiceterm_egui::pty_host::PtyHost::spawn(80, 24) {
+                let host = match voiceterm_egui::pty_host::PtyHost::spawn(80, 24, repaint_waker(ui.ctx())) {
                     Ok(h) => Some(h),
                     Err(e) => {
                         eprintln!("[voiceterm] pane {id}: no shell: {e}");
@@ -3527,7 +3527,7 @@ impl eframe::App for VoicetermApp {
                 self.pty.is_some(),
                 self.pty_spawn_failed.contains(&self.pane_focus),
             ) {
-                match voiceterm_egui::pty_host::PtyHost::spawn(80, 24) {
+                match voiceterm_egui::pty_host::PtyHost::spawn(80, 24, repaint_waker(ui.ctx())) {
                     Ok(h) => self.pty = Some(h),
                     Err(e) => {
                         eprintln!("[voiceterm] pane {}: no shell: {e}", self.pane_focus);
@@ -3815,6 +3815,17 @@ impl eframe::App for VoicetermApp {
 /// name in the switcher.
 const APP_ID: &str = "org.voiceterm.VoiceTerm";
 
+
+/// A waker for `PtyHost`: the reader thread calls this when the shell
+/// speaks, so the frame that draws its output actually runs.
+///
+/// egui coalesces repeated requests inside one frame, so calling it per
+/// read rather than per byte costs nothing.
+fn repaint_waker(ctx: &egui::Context) -> voiceterm_egui::pty_host::Waker {
+    let ctx = ctx.clone();
+    std::sync::Arc::new(move || ctx.request_repaint())
+}
+
 fn main() -> eframe::Result<()> {
     let mut app = App::new(80, 24);
     // First run (no prefs file yet): voiceterm's Voice identity, NOT settings-kit's generic
@@ -3973,7 +3984,7 @@ fn main() -> eframe::Result<()> {
                 // `resize` with the real grid size, and starting at the
                 // conventional default means a shell that prints a banner
                 // before then wraps sensibly rather than at zero columns.
-                pty: match voiceterm_egui::pty_host::PtyHost::spawn(80, 24) {
+                pty: match voiceterm_egui::pty_host::PtyHost::spawn(80, 24, repaint_waker(&_cc.egui_ctx)) {
                     Ok(h) => Some(h),
                     Err(e) => {
                         eprintln!("[voiceterm] no shell: {e} — falling back to local echo");

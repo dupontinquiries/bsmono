@@ -320,5 +320,19 @@ mod tests {
             "the focused-pane shell check is gone — a split pane will have \
              no shell and no command will run in it."
         );
+        // WAKING THE UI. An immediate-mode GUI draws when asked; a shell
+        // answering half a frame after Enter is not an input event, so
+        // without a waker the output sits in the reader's buffer until
+        // the next keystroke or mouse move.
+        assert!(
+            src.contains("fn repaint_waker("),
+            "the pty waker is gone — shell output will only appear when \
+             something else happens to repaint the UI."
+        );
+        assert_eq!(
+            src.matches("PtyHost::spawn(80, 24)").count(),
+            0,
+            "a PtyHost is being spawned without a waker again."
+        );
     }
 }
