@@ -238,7 +238,36 @@ own 4 output pixels (3 u32 words) to avoid two threads writing the same word,
 and the row stride stops being word-aligned when the width is not a multiple
 of 4 — not obviously worth the edge cases.
 
-## 11. Open questions the next hardware run should answer
+## 11. The CPU upscaler (the compatibility path)
+
+`--backend cpu` is what runs on a machine with no usable Vulkan driver — a
+PinePhone, a Fairphone, anything where Honeykrisp is absent — so its speed is a
+device-support question, not just a fallback nicety. Two loop changes, measured
+on the sandbox box with SRVGG on a 64x64 tile:
+
+| version | ms |
+|---|---|
+| original (`oy` innermost) | 830 |
+| row hoisted out of the tap loops | 672 |
+| + four output channels per task | 659 |
+
+**Row order was the big one (1.23x).** The tap loops had `oy` innermost, so
+each of the 9 x in_ch taps streamed the whole output plane — for an RRDB layer
+about 1700 passes over 520 KB, which is past L2 on exactly the small machines
+this path serves, so the output was re-fetched from memory every tap. Hoisting
+the row keeps one output row in L1 across all of them. Expect a larger win on
+a phone than the 1.23x seen here, since the sandbox has more cache than the
+targets do.
+
+**Channel blocking added only 2%** — four output channels per task so each
+input row is read once and used twelve times. The same trade was worth 9% on
+the GPU; here the input rows were evidently already resident, so the ceiling is
+elsewhere.
+
+Both are bit-identical, not approximations: the per-element accumulation order
+is still ic, then ky, then kx, which the exact numpy-reference tests confirm.
+
+## 12. Open questions the next hardware run should answer
 
 - Do `rt2h` / `rt2c8h` (hoisted addressing, single code path) clear rt2f's
   1022, and does channel blocking finally compose?

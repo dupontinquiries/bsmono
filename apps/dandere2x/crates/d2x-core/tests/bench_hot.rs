@@ -57,6 +57,16 @@ fn hot_paths() {
         out4k.data.len()
     });
 
+    // The CPU upscaler: the fallback path on machines with no usable GPU.
+    {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/realesr-animevideov3.safetensors");
+        if p.exists() {
+            let net = Network::load(&p).unwrap();
+            let tile = frame(64, 64);
+            time("CPU upscale, SRVGG, 64x64 tile", 3, || net.upscale_cpu(&tile, 64));
+        }
+    }
+
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/realesr-animevideov3.safetensors");
     let srvgg = Network::load(&p).unwrap();
     let padded = srvgg.pad_frame(&frame(480, 480));

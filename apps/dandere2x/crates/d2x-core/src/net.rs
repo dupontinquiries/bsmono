@@ -392,61 +392,86 @@ pub fn conv3x3_cpu(c: &ConvOp, x: &Tensor, dst: &mut Tensor, residual: Option<&(
     let in_ch = c.src_ch;
     let plane = oh * ow;
     let base = c.dst_off * plane;
-    dst.data[base..base + c.out_ch * plane].par_chunks_mut(plane).enumerate().for_each(|(oc, out)| {
-        for v in out.iter_mut() {
-            *v = c.bias[oc];
+    // Output channels are handled four at a time so each input row is read
+    // once and used twelve times (4 channels x 3 taps) instead of being
+    // re-read for every channel. Same trade that won on the GPU, and it counts
+    // for more here because memory is the tighter resource on the machines
+    // this path serves.
+    const OCB: usize = 4;
+    dst.data[base..base + c.out_ch * plane].par_chunks_mut(OCB * plane).enumerate().for_each(|(g, outs)| {
+        let oc0 = g * OCB;
+        let nch = OCB.min(c.out_ch - oc0);
+        for j in 0..nch {
+            let b = c.bias[oc0 + j];
+            outs[j * plane..(j + 1) * plane].iter_mut().for_each(|v| *v = b);
         }
-        for ic in 0..in_ch {
-            let xp = x.plane(ic);
-            for ky in 0..3 {
-                for kx in 0..3 {
-                    let wv = c.weight[((oc * in_ch + ic) * 3 + ky) * 3 + kx];
-                    // Output columns whose source column sx = ox + kx - pad is inside [0, iw).
-                    let ox0 = pad.saturating_sub(kx);
-                    let ox1 = (iw + pad - kx).min(ow);
-                    if ox1 <= ox0 {
+        // Row-outermost. The tap loops used to have `oy` innermost, so each of
+        // the 9 x in_ch taps streamed the entire output plane — for an RRDB
+        // layer roughly 1700 passes over 520 KB, past L2 on the small machines
+        // this path exists for, so the output was re-fetched from memory every
+        // tap. With the row hoisted, one output row stays in L1 across all of
+        // them.
+        //
+        // The per-element accumulation order is unchanged (ic, then ky, then
+        // kx), so this is bit-identical, not merely close.
+        for oy in 0..oh {
+            for ic in 0..in_ch {
+                let xp = x.plane(ic);
+                for ky in 0..3 {
+                    let sy = oy + ky;
+                    if sy < pad || sy - pad >= ih {
                         continue;
                     }
-                    for oy in 0..oh {
-                        let sy = oy + ky;
-                        if sy < pad || sy - pad >= ih {
+                    let row = &xp[((sy - pad) / s) * x.w..((sy - pad) / s + 1) * x.w];
+                    for kx in 0..3 {
+                        // Output columns whose source column sx = ox + kx - pad is inside [0, iw).
+                        let ox0 = pad.saturating_sub(kx);
+                        let ox1 = (iw + pad - kx).min(ow);
+                        if ox1 <= ox0 {
                             continue;
                         }
-                        let row = &xp[((sy - pad) / s) * x.w..((sy - pad) / s + 1) * x.w];
-                        let out_row = &mut out[oy * ow + ox0..oy * ow + ox1];
                         let sx0 = ox0 + kx - pad;
-                        if s == 1 {
-                            for (o, &i) in out_row.iter_mut().zip(&row[sx0..sx0 + (ox1 - ox0)]) {
-                                *o += wv * i;
-                            }
-                        } else {
-                            for (k, o) in out_row.iter_mut().enumerate() {
-                                *o += wv * row[(sx0 + k) / s];
+                        for j in 0..nch {
+                            let wv = c.weight[(((oc0 + j) * in_ch + ic) * 3 + ky) * 3 + kx];
+                            let off = j * plane + oy * ow;
+                            let seg = &mut outs[off + ox0..off + ox1];
+                            if s == 1 {
+                                for (o, &i) in seg.iter_mut().zip(&row[sx0..sx0 + (ox1 - ox0)]) {
+                                    *o += wv * i;
+                                }
+                            } else {
+                                for (k, o) in seg.iter_mut().enumerate() {
+                                    *o += wv * row[(sx0 + k) / s];
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        if let Some((r, scale)) = residual {
-            for (v, rv) in out.iter_mut().zip(r.plane(oc)) {
-                *v = *v * scale + rv;
-            }
-        }
-        match c.act {
-            Act::None => {}
-            Act::Leaky(slope) => out.iter_mut().for_each(|v| {
-                if *v < 0.0 {
-                    *v *= slope;
+        for j in 0..nch {
+            let oc = oc0 + j;
+            let out = &mut outs[j * plane..(j + 1) * plane];
+            if let Some((r, scale)) = residual {
+                for (v, rv) in out.iter_mut().zip(r.plane(oc)) {
+                    *v = *v * scale + rv;
                 }
-            }),
-            Act::PReLU => {
-                let slope = c.prelu[oc];
-                out.iter_mut().for_each(|v| {
+            }
+            match c.act {
+                Act::None => {}
+                Act::Leaky(slope) => out.iter_mut().for_each(|v| {
                     if *v < 0.0 {
                         *v *= slope;
                     }
-                })
+                }),
+                Act::PReLU => {
+                    let slope = c.prelu[oc];
+                    out.iter_mut().for_each(|v| {
+                        if *v < 0.0 {
+                            *v *= slope;
+                        }
+                    })
+                }
             }
         }
     });
