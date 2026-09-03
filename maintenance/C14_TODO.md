@@ -462,3 +462,64 @@ payload copied five times is 1.5 MB and nobody would notice.
 Both are real and neither is a two-line fix. Recorded with the numbers so the
 next session does not have to re-derive them, and so the ordering argument —
 compress first, then share the buffer — does not have to be rediscovered.
+
+## 14. snapclone voice: the Opus wrapper exists, compiles, and nothing links it
+
+The same shape as §13 one layer down, and further along than that one — because
+here the replacement is already written.
+
+### What ships today
+
+`snapclone_egui.rs` sends **raw S16LE**, and says so plainly:
+
+> RAW S16LE, NOT OPUS. There is no encoder linked here, and the honest way to
+> say that is to send the samples as they are rather than to claim a codec. It
+> costs ~32 kB/s per peer against Opus's ~2, which is fine on a LAN and is not
+> fine on mobile data — swapping in a real encoder is a change to these two
+> conversions and nothing else, which is why they are the only place bytes and
+> samples meet.
+
+That is a good comment and an honest one. 16x on a cellular link, and in a
+four-person call it is ~96 kB/s up rather than ~6.
+
+### The encoder is already there
+
+`apps/snapclone/rust/snapclone-audio/src/codec.rs` is a complete `audiopus`
+wrapper — encoder, decoder, packet-loss concealment on a NULL packet, bitrate
+and bandwidth control. Feature-gated `opus`, off by default, with its own note
+that it "is validated on the device build, not in the headless test sandbox".
+
+**It builds and its crate's tests pass.** `libopus-dev` installs from apt here
+in one command; `cargo check --features opus` is clean and
+`cargo test --features opus` is 104 green. So the "validated only on device"
+caveat is now out of date: it validates here too, and that should be recorded
+in the module rather than left as a reason not to try.
+
+`snapclone-egui` does not depend on `snapclone-audio` at all. The crate that
+needs the encoder does not link the crate that has it.
+
+### The dead warning
+
+`voice_send::Emit::NoEncoder` and `sender.note_no_encoder()` exist to tell the
+user they are transmitting without a codec, and `note_no_encoder` is carefully
+written to report ONCE rather than at fifty hertz. The binary calls
+`EncoderReady(true)` unconditionally at line 653 — while sending raw PCM — so
+the warning can never fire.
+
+That is the §10 pattern at its largest: a tested state machine, a tested
+one-shot reporter, and a whole codec module, none of it reachable from the
+binary.
+
+### Order of work
+
+1. **Tell the truth first.** `EncoderReady(false)` while the payload is raw
+   PCM, so the existing warning fires and the state matches reality. One line,
+   and it makes the app honest before it makes it fast.
+2. Add `snapclone-audio` with `features = ["opus"]` to `snapclone-egui`.
+3. Swap the two conversions the comment names. The comment is explicit that
+   these are the only place bytes and samples meet, which is why this is a
+   contained change rather than a rewrite.
+
+Step 1 is worth doing on its own even if 2 and 3 wait: right now the app claims
+a codec it does not have, and the code that would say otherwise is already
+written and already tested.
