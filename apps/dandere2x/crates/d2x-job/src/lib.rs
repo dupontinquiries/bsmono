@@ -6,6 +6,7 @@
 //! full-frame upscale of frame 0). Long inputs are not silent any more.
 
 pub mod ffmpeg;
+pub mod checkpoint;
 pub mod job;
 
 pub use d2x_core::pipeline::{Event as PipelineEvent, Summary};
