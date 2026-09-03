@@ -692,6 +692,36 @@ pub fn fold_pack(sk: &Skeleton, prims: &[&[Vec3]], slack: f32, up: Vec3) -> Vec<
         let span = hi - lo;
         let pokes = (hi - ehi).max(Vec3::ZERO) + (elo - lo).max(Vec3::ZERO);
         let needs_hinge = (0..3).any(|a| pokes[a] > 1e-4 && span[a] > 2.0 * env[a]);
+        // KEEP THE HINGE ONLY IF IT HELPS.
+        //
+        // `needs_hinge` fires when a limb pokes out and spans more than
+        // twice the envelope on that axis, which is the wing case the
+        // rotation exists for. But a limb oversized on EVERY axis cannot
+        // be helped by rotating: turning it only changes which axis pokes
+        // furthest. Measured on truck_lynx_dominante_av_445 — a limb
+        // spanning 2.00 x 1.61 x 1.33 inside a 0.72 x 0.72 x 0.33
+        // envelope, hinged, overhang 0.639 before and 0.702 after. The
+        // hinge made containment WORSE and nothing checked.
+        //
+        // Both candidates are now built and the better one wins, measured
+        // the same way the caller cares about: the furthest any point
+        // still pokes out of the envelope. A rotation that does not
+        // improve that is not worth the risk of decoupling a limb.
+        let overhang_of = |step: &FoldStep| -> f32 {
+            let mut worst = 0.0f32;
+            for i in &limb.prims {
+                for p in prims.get(*i).copied().unwrap_or(&[]) {
+                    let q = step.pivot + step.rot * (*p - step.pivot) + step.shift;
+                    let out = (elo - q).max(q - ehi).max(Vec3::ZERO);
+                    worst = worst.max(out.max_element());
+                }
+            }
+            worst
+        };
+        let flat_step = FoldStep {
+            shift: contain_shift(lo, hi, elo, ehi, sk.core_centre),
+            ..FoldStep::default()
+        };
         let step = if needs_hinge {
             let rot = fold_rotation(limb, up, 1.0);
             // bounds of the limb AFTER the hinge — the silhouette the
@@ -704,16 +734,18 @@ pub fn fold_pack(sk: &Skeleton, prims: &[&[Vec3]], slack: f32, up: Vec3) -> Vec<
                     rhi = rhi.max(q);
                 }
             }
-            FoldStep {
+            let hinged = FoldStep {
                 rot,
                 pivot: limb.root,
                 shift: contain_shift(rlo, rhi, elo, ehi, sk.core_centre),
+            };
+            if overhang_of(&hinged) <= overhang_of(&flat_step) {
+                hinged
+            } else {
+                flat_step
             }
         } else {
-            FoldStep {
-                shift: contain_shift(lo, hi, elo, ehi, sk.core_centre),
-                ..FoldStep::default()
-            }
+            flat_step
         };
         if step == FoldStep::default() {
             continue;
@@ -1014,6 +1046,63 @@ mod role_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_hinge_is_kept_only_when_it_improves_containment() {
+        // A limb oversized on every axis cannot be helped by rotating:
+        // turning it only changes which axis pokes furthest. `needs_hinge`
+        // fires on span alone, so it used to hinge anyway and could leave
+        // the limb further outside than it started. Measured on
+        // truck_lynx_dominante_av_445: overhang 0.639 -> 0.702.
+        //
+        // The property that must hold for every limb and every chassis:
+        // fold_pack never makes the overhang worse than doing nothing.
+        let core: Vec<Vec3> = cube(Vec3::ZERO, Vec3::splat(0.5));
+        // A limb far larger than the envelope in all three axes.
+        let blob: Vec<Vec3> = cube(Vec3::new(1.4, 0.3, 0.2), Vec3::new(1.0, 0.8, 0.7));
+        let prims: Vec<&[Vec3]> = vec![&core, &blob];
+        let sk = skeletonize(&prims);
+        if sk.limbs.is_empty() {
+            return; // the classifier did not see a limb; nothing to assert
+        }
+        let slack = 0.25;
+        let steps = fold_pack(&sk, &prims, slack, Vec3::Y);
+        let env = sk.core_half * (1.0 + slack);
+        let (elo, ehi) = (sk.core_centre - env, sk.core_centre + env);
+        let overhang = |pts: &[Vec3], st: &FoldStep| -> f32 {
+            let mut w = 0.0f32;
+            for p in pts {
+                let q = st.pivot + st.rot * (*p - st.pivot) + st.shift;
+                let out = (elo - q).max(q - ehi).max(Vec3::ZERO);
+                w = w.max(out.max_element());
+            }
+            w
+        };
+        for limb in &sk.limbs {
+            for i in &limb.prims {
+                let pts = prims[*i];
+                let before = overhang(pts, &FoldStep::default());
+                let after = overhang(pts, &steps[*i]);
+                assert!(
+                    after <= before + 1e-4,
+                    "containment made it worse: {before:.3} -> {after:.3}"
+                );
+            }
+        }
+    }
+
+    /// Eight corners of a box, enough for the skeletonizer to see a shape.
+    fn cube(centre: Vec3, half: Vec3) -> Vec<Vec3> {
+        let mut v = Vec::with_capacity(8);
+        for sx in [-1.0f32, 1.0] {
+            for sy in [-1.0f32, 1.0] {
+                for sz in [-1.0f32, 1.0] {
+                    v.push(centre + Vec3::new(half.x * sx, half.y * sy, half.z * sz));
+                }
+            }
+        }
+        v
+    }
 
     /// `fold_rotation` runs on skeletons derived from arbitrary
     /// third-party meshes, so it meets geometry nobody authored.

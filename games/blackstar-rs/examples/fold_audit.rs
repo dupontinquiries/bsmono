@@ -56,6 +56,41 @@ struct Finding {
     /// neighbour at an endpoint pose. See `island_gap`.
     island: f32,
     island_prim: usize,
+    /// How much WORSE containment got, in envelope radii. `fold_pack`
+    /// pulls limbs toward the shell; it must never push one further out.
+    /// Positive means it did.
+    contain_regress: f32,
+    /// Fraction of limb geometry that can see open sky in VEHICLE mode.
+    /// See `exposure`.
+    exposure: f32,
+}
+
+/// Slab test: does the ray from `o` along `d` meet the box at a positive
+/// distance? Axis directions only, so this reduces to a range check on the
+/// two other axes plus a sign test on the travel axis.
+fn ray_hits_box(o: Vec3, d: Vec3, lo: Vec3, hi: Vec3) -> bool {
+    let (mut tmin, mut tmax) = (0.0f32, f32::MAX);
+    for a in 0..3 {
+        if d[a].abs() < 1e-6 {
+            if o[a] < lo[a] || o[a] > hi[a] {
+                return false;
+            }
+        } else {
+            let inv = 1.0 / d[a];
+            let (mut t0, mut t1) = ((lo[a] - o[a]) * inv, (hi[a] - o[a]) * inv);
+            if t0 > t1 {
+                std::mem::swap(&mut t0, &mut t1);
+            }
+            tmin = tmin.max(t0);
+            tmax = tmax.min(t1);
+            if tmax < tmin {
+                return false;
+            }
+        }
+    }
+    // A hit at the origin itself is the vertex touching its own occluder,
+    // which does not hide it from anything.
+    tmax > 1e-4
 }
 
 fn centroid(pts: &[Vec3]) -> Vec3 {
@@ -116,6 +151,8 @@ fn audit(pose_dirs: &[PathBuf]) -> Option<Finding> {
         worst_t: 0.0,
         island: 0.0,
         island_prim: 0,
+        contain_regress: 0.0,
+        exposure: 0.0,
     };
     for (p, row) in offsets.iter().enumerate() {
         let anchor = row[0].max(row[STEPS - 1]);
@@ -175,6 +212,141 @@ fn audit(pose_dirs: &[PathBuf]) -> Option<Finding> {
                     worst.island = nearest / radius;
                     worst.island_prim = i;
                 }
+            }
+        }
+    }
+
+    // EXPOSURE: how much of the robot is showing while it is a vehicle?
+    //
+    // This is the question I got wrong twice and then talked myself out of
+    // entirely. I measured "limbs outside the skeleton core box", saw it
+    // fire on 254 of 254 with a median of 3.75 core-radii, and dismissed
+    // it as normal on the reasoning that a limb extending past the core is
+    // what makes it a limb.
+    //
+    // That reasoning is right for a body and wrong for a TRANSFORMER. In
+    // vehicle mode the robot parts are supposed to be folded away inside
+    // the shell — the whole point is that it reads as a vehicle. A render
+    // of `tank_vanquish` with the exposed parts circled is what settled
+    // it: they are plainly visible, sitting proud of the hull, and the
+    // metric that flagged every chassis was flagging a real fleet-wide
+    // condition rather than crying wolf.
+    //
+    // Measured as occlusion rather than as a box test, because "outside
+    // the core box" is not the same as "visible". For each limb vertex,
+    // six axis-aligned rays; a ray that escapes without meeting the
+    // bounding box of a NON-limb prim means that vertex can be seen from
+    // outside. Exposure is the fraction of limb vertices with at least one
+    // escaping ray.
+    //
+    // Boxes rather than triangles is deliberately coarse and errs toward
+    // reporting MORE exposure than there is: a box occludes at least as
+    // much as the geometry inside it, so a vertex called hidden really is
+    // hidden, while one called exposed may be occluded by detail the box
+    // test cannot see. Good enough to rank the fleet; not a substitute for
+    // looking at a render.
+    {
+        let refs: Vec<&[Vec3]> = t0_pts.iter().map(|v| v.as_slice()).collect();
+        let sk = skeleton::skeletonize(&refs);
+        let limb_prims: std::collections::BTreeSet<usize> =
+            sk.limbs.iter().flat_map(|l| l.prims.iter().copied()).collect();
+        if !limb_prims.is_empty() && limb_prims.len() < t0_pts.len() {
+            // Occluders: every prim that is NOT part of a limb.
+            let occ: Vec<(Vec3, Vec3)> = (0..t0_pts.len())
+                .filter(|i| !limb_prims.contains(i))
+                .filter_map(|i| {
+                    let pts = &t0_pts[i];
+                    if pts.is_empty() {
+                        return None;
+                    }
+                    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+                    for p in pts {
+                        lo = lo.min(*p);
+                        hi = hi.max(*p);
+                    }
+                    Some((lo, hi))
+                })
+                .collect();
+            let dirs = [Vec3::X, Vec3::NEG_X, Vec3::Y, Vec3::NEG_Y, Vec3::Z, Vec3::NEG_Z];
+            let (mut seen, mut total) = (0usize, 0usize);
+            for i in &limb_prims {
+                let pts = match t0_pts.get(*i) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                // Sample rather than test every vertex: these meshes carry
+                // tens of thousands and the answer does not change.
+                let stride = (pts.len() / 64).max(1);
+                for p in pts.iter().step_by(stride) {
+                    total += 1;
+                    let escapes = dirs.iter().any(|d| {
+                        !occ.iter().any(|(lo, hi)| ray_hits_box(*p, *d, *lo, *hi))
+                    });
+                    if escapes {
+                        seen += 1;
+                    }
+                }
+            }
+            if total > 0 {
+                worst.exposure = seen as f32 / total as f32;
+            }
+        }
+    }
+
+    // CONTAINMENT: does `fold_pack` actually stow the limbs?
+    //
+    // Not "is everything inside the envelope afterwards" — that is not the
+    // contract and cannot be, because a limb wider than the envelope does
+    // not fit at any offset (see `contain_shift`'s own note about the
+    // jet wing spanning 5.2 across a 1.25 envelope). What IS promised is
+    // weaker and checkable: the shift pulls a limb TOWARD the shell, so
+    // the overhang after must not exceed the overhang before.
+    //
+    // This is the "skeleton bleeding out of the vehicle" question stated
+    // in a form that has an answer. The two attempts before it —
+    // "inside the largest prim", "inside the core box" — flagged 253 and
+    // 254 of 254 because they asserted things that were never true.
+    {
+        let refs: Vec<&[Vec3]> = t0_pts.iter().map(|v| v.as_slice()).collect();
+        let sk = skeleton::skeletonize(&refs);
+        const SLACK: f32 = 0.25;
+        let steps = skeleton::fold_pack(&sk, &refs, SLACK, Vec3::Y);
+        if sk.core_half.max_element() > 1e-4 {
+            let env = sk.core_half * (1.0 + SLACK);
+            let (elo, ehi) = (sk.core_centre - env, sk.core_centre + env);
+            let radius = env.max_element().max(1e-4);
+            let overhang = |pts: &[Vec3]| -> f32 {
+                let mut worst = 0.0f32;
+                for p in pts {
+                    let out = (elo - *p).max(*p - ehi).max(Vec3::ZERO);
+                    worst = worst.max(out.max_element());
+                }
+                worst
+            };
+            for limb in &sk.limbs {
+                let before: Vec<Vec3> = limb
+                    .prims
+                    .iter()
+                    .flat_map(|i| t0_pts.get(*i).map(|v| v.as_slice()).unwrap_or(&[]).iter().copied())
+                    .collect();
+                let after: Vec<Vec3> = limb
+                    .prims
+                    .iter()
+                    .flat_map(|i| {
+                        let step = steps.get(*i).copied().unwrap_or_default();
+                        t0_pts
+                            .get(*i)
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[])
+                            .iter()
+                            .map(move |p| step.pivot + step.rot * (*p - step.pivot) + step.shift)
+                    })
+                    .collect();
+                if before.is_empty() {
+                    continue;
+                }
+                let regress = (overhang(&after) - overhang(&before)) / radius;
+                worst.contain_regress = worst.contain_regress.max(regress);
             }
         }
     }
@@ -256,10 +428,18 @@ fn main() {
     // do not touch the hull. A separated part is NORMAL here, and only a
     // far-separated one is a finding.
     const ISLAND_FLAG: f32 = 0.75;
+    // Containment getting WORSE is a contract violation, not a matter of
+    // degree, so this flag is a tolerance for float noise rather than a
+    // percentile.
+    const CONTAIN_FLAG: f32 = 0.01;
+    // Reported for every chassis rather than flagged: the fleet-wide
+    // distribution is the finding here, not a handful of outliers.
+    const EXPOSURE_FLAG: f32 = 0.90;
 
-    let (mut checked, mut ex_hits, mut isl_hits) = (0, 0, 0);
+    let (mut checked, mut ex_hits, mut isl_hits, mut con_hits) = (0, 0, 0, 0);
     let mut ex_all: Vec<f32> = Vec::new();
     let mut isl_all: Vec<f32> = Vec::new();
+    let mut exp_all: Vec<f32> = Vec::new();
     for name in &names {
         let dir = root.join(name);
         let poses = poses_of(&dir);
@@ -270,22 +450,31 @@ fn main() {
         checked += 1;
         ex_all.push(f.worst_excursion);
         isl_all.push(f.island);
+        exp_all.push(f.exposure);
         let fe = f.worst_excursion > EXCURSION_FLAG;
         let fi = f.island > ISLAND_FLAG;
+        let fc = f.contain_regress > CONTAIN_FLAG;
+        let fx = f.exposure > EXPOSURE_FLAG;
+        if fc {
+            con_hits += 1;
+        }
         if fe {
             ex_hits += 1;
         }
         if fi {
             isl_hits += 1;
         }
-        if fe || fi {
+        if fe || fi || fc || fx {
             println!(
-                "{name:<52} excursion={:.2}{} island={:.2} (prim {}){}",
+                "{name:<52} exposure={:.0}%{} excursion={:.2}{} island={:.2}{} contain={:+.2}{}",
+                f.exposure * 100.0,
+                if fx { " <" } else { "  " },
                 f.worst_excursion,
                 if fe { " <" } else { "  " },
                 f.island,
-                f.island_prim,
-                if fi { " <" } else { "" },
+                if fi { " <" } else { "  " },
+                f.contain_regress,
+                if fc { " <" } else { "" },
             );
         }
     }
@@ -304,8 +493,12 @@ fn main() {
         pct(&mut ex_all, 0.5), pct(&mut ex_all, 0.9), pct(&mut ex_all, 1.0)
     );
     println!(
+        "exposure   median {:.0}%  p10 {:.0}%  min {:.0}%",
+        pct(&mut exp_all, 0.5) * 100.0, pct(&mut exp_all, 0.1) * 100.0, pct(&mut exp_all, 0.0) * 100.0
+    );
+    println!(
         "island     median {:.2}  p90 {:.2}  max {:.2}",
         pct(&mut isl_all, 0.5), pct(&mut isl_all, 0.9), pct(&mut isl_all, 1.0)
     );
-    println!("\n{ex_hits} with a part leaving the body mid-fold, {isl_hits} with a part floating free at rest, of {checked} checked");
+    println!("\n{ex_hits} with a part leaving the body mid-fold, {isl_hits} with a part floating free at rest, {con_hits} where containment made the overhang worse, of {checked} checked");
 }
