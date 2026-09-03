@@ -3131,8 +3131,11 @@ impl eframe::App for VoicetermApp {
             // on.
             let input_owner = uikit_term::keys::InputOwner::Host;
             self.app.set_input_owner(input_owner);
-            let host_encodes = uikit_term::keys::host_encodes(input_owner);
-            let _ = host_encodes;
+            debug_assert!(
+                uikit_term::keys::host_encodes(input_owner),
+                "this host renders session.grid, not the widget's line buffer, \
+                 so it must always be the encoder"
+            );
             let key_outs = if self.surfaces.captures_input() {
                 Vec::new()
             } else {

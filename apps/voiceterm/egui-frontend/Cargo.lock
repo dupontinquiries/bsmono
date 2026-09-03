@@ -1251,6 +1251,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "math-kit"
+version = "0.1.0"
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1713,6 +1717,10 @@ dependencies = [
  "libc",
  "libredox",
 ]
+
+[[package]]
+name = "pane-kit"
+version = "0.1.0"
 
 [[package]]
 name = "parking_lot"
@@ -2494,6 +2502,7 @@ name = "uikit-egui"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "math-kit",
  "settings-kit",
  "snapclone-theme",
  "touchkit",
@@ -2604,6 +2613,7 @@ dependencies = [
  "eframe",
  "egui",
  "nifty-core",
+ "pane-kit",
  "peer-handshake",
  "portable-pty",
  "settings-kit",
