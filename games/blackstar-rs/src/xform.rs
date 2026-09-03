@@ -390,6 +390,22 @@ impl Morph {
 /// a rendered frame — tune `min_overflow` and whether this should
 /// blend with `t` toward the edges once someone can actually look at it.
 pub fn redistribute_length_to_height(actual: Vec3, veh_len: f32, bot_len: f32, t: f32) -> Vec3 {
+    // NON-FINITE IN, UNCHANGED OUT.
+    //
+    // Every argument here reaches a multiply that feeds the vehicle's
+    // dimensions. Measured before this guard: a NaN `t` returned
+    // (1.0, NaN, NaN), a NaN `veh_len` the same, and a NaN in `actual`
+    // spread to the components beside it. A box with NaN extents is not a
+    // mis-sized vehicle, it is one that fails every comparison it is later
+    // used in — including the bounds checks meant to catch it.
+    //
+    // `actual` unchanged is this function's own answer for "nothing to
+    // redistribute", so it is the honest result for "nothing usable to
+    // redistribute with" too. Note `f32::clamp` does not launder a NaN:
+    // `NAN.clamp(0.0, 1.0)` is NaN, which is how `t` got through.
+    if !actual.is_finite() || !veh_len.is_finite() || !bot_len.is_finite() || !t.is_finite() {
+        return actual;
+    }
     let expected_len = veh_len + (bot_len - veh_len) * t.clamp(0.0, 1.0);
     if actual.z <= expected_len || actual.x <= 0.0 || actual.y <= 0.0 {
         return actual; // nothing to redistribute, or a degenerate box
@@ -405,6 +421,39 @@ pub fn redistribute_length_to_height(actual: Vec3, veh_len: f32, bot_len: f32, t
 
 #[cfg(test)]
 mod endpoint_tests {
+
+    #[test]
+    fn non_finite_inputs_leave_the_box_alone() {
+        // A box with NaN extents is not a mis-sized vehicle — it fails
+        // every comparison it is later used in, including the bounds
+        // checks meant to catch it.
+        let good = Vec3::new(1.0, 1.0, 4.0);
+        assert_eq!(redistribute_length_to_height(good, 2.0, 3.0, f32::NAN), good);
+        assert_eq!(redistribute_length_to_height(good, f32::NAN, 3.0, 0.5), good);
+        assert_eq!(redistribute_length_to_height(good, 2.0, f32::INFINITY, 0.5), good);
+        // A NaN that ARRIVED in `actual` comes back out — this function
+        // does not invent geometry — but it must not spread to the
+        // components beside it, which is what happened before.
+        // Compared per-component because NaN != NaN makes assert_eq on the
+        // whole vector fail even when every element matches.
+        let bad = Vec3::new(f32::NAN, 1.0, 4.0);
+        let out = redistribute_length_to_height(bad, 2.0, 3.0, 0.5);
+        assert!(out.x.is_nan());
+        assert_eq!(out.y, 1.0, "the NaN spread into y");
+        assert_eq!(out.z, 4.0, "the NaN spread into z");
+    }
+
+    #[test]
+    fn a_normal_redistribution_still_conserves_volume() {
+        // The guard must not change the working path: length above the
+        // expected value is traded for height at constant volume.
+        let a = Vec3::new(1.0, 1.0, 4.0);
+        let r = redistribute_length_to_height(a, 2.0, 3.0, 1.0);
+        assert_eq!(r.z, 3.0, "length capped to expected");
+        let before = a.x * a.y * a.z;
+        let after = r.x * r.y * r.z;
+        assert!((before - after).abs() < 1e-4, "volume changed: {before} -> {after}");
+    }
     use super::*;
 
     /// Step a fold the way the shell does, recording the `t` values a caller
@@ -762,3 +811,4 @@ mod tests {
         assert!(!x.folding_to_robot(), "direction did not flip on reversal");
     }
 }
+
