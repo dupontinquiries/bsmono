@@ -3868,9 +3868,26 @@ impl eframe::App for VoicetermApp {
                 self.pane_menu.show_detached(ui, &pane_menu())
             {
                 match pane_dispatch(&id, variant) {
-                    Some(PaneAction::Clear) => self.app.terminal.clear(), // the demo has no PTY; Terminal::clear is Ctrl+L's effect
+                    // Onto the grid that is DRAWN. Clearing the widget's
+                    // terminal emptied a grid this view never renders, so
+                    // "Clear" did nothing you could see.
+                    Some(PaneAction::Clear) => self.session.grid.clear(),
                     Some(PaneAction::CopySelection) => {
-                        let text = self.app.selection.take().map(|s| s.text).unwrap_or_else(|| self.app.terminal.screen_text());
+                        // Same reason: `Terminal::screen_text` reads the
+                        // widget's grid, which nothing feeds for the
+                        // focused pane, so "copy screen" copied an empty
+                        // string. Built from the session grid instead —
+                        // the same rows the user is looking at.
+                        let screen = || {
+                            let mut rows: Vec<String> = (0..self.session.grid.rows)
+                                .map(|y| self.session.grid.row_text(y))
+                                .collect();
+                            while rows.last().is_some_and(|r| r.trim().is_empty()) {
+                                rows.pop();
+                            }
+                            rows.join("\n")
+                        };
+                        let text = self.app.selection.take().map(|s| s.text).unwrap_or_else(screen);
                         ctx.copy_text(text);
                         self.toasts.success("Copied", ctx.input(|i| i.time));
                     }
@@ -3886,9 +3903,25 @@ impl eframe::App for VoicetermApp {
                         self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command("new tab".into()));
                     }
                     Some(PaneAction::Mic) => {}
+                    // NOT re-pointed, because there is nothing to point
+                    // at. This paged the widget's grid, which nothing
+                    // feeds — so it did nothing. Pointing it at
+                    // `session.grid` would also do nothing, because
+                    // `term_grid::TermGrid` has NO SCROLLBACK: it scrolls
+                    // the top row off and forgets it.
+                    //
+                    // This is the capability gap that keeping two grids
+                    // was papering over. uikit-term's grid has
+                    // scrollback, search and selection; the frontend's
+                    // has the row caches the renderer is built on. The
+                    // honest state is a menu item that is unimplemented
+                    // rather than one that silently pages an invisible
+                    // buffer, so it says so.
                     Some(PaneAction::PageUpScrollback) => {
-                        let page = self.app.terminal.grid.rows.saturating_sub(1).max(1);
-                        self.app.terminal.grid.page_up(page);
+                        self.toasts.info(
+                            "Scrollback is not implemented in this view yet",
+                            ui.input(|i| i.time),
+                        );
                     }
                     // menu-triggered paste needs a clipboard READ; egui only delivers paste as
                     // an input event (Ctrl+V works today via handle_input's Event::Paste)

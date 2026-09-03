@@ -294,7 +294,7 @@ mod tests {
             src.matches("pty_input::TermMode::default()").count(),
             0,
             "drain_egui is being handed a default mode again — pass \
-             self.app.terminal.grid.key_mode(), or app-cursor arrows break."
+             the session grid's key_mode(), or app-cursor arrows break."
         );
         // FROM THE FED GRID. app.terminal.grid is never fed for the
         // focused pane, so asking it returns the default forever — the
@@ -302,11 +302,6 @@ mod tests {
         assert!(
             src.contains("self.session.grid.key_mode()"),
             "the key mode must come from session.grid, the one feed_pty writes."
-        );
-        assert_eq!(
-            src.matches("self.app.terminal.grid.key_mode()").count(),
-            0,
-            "reading the mode from the widget's unfed grid again."
         );
         // ONE INPUT OWNER. uikit_term::App::handle_input and
         // pty_input::drain_egui both read this frame's events; if the
@@ -401,6 +396,20 @@ mod tests {
         assert!(
             src.contains("fn send_input(") && src.contains("fn show_line("),
             "the input/output split is gone."
+        );
+        // NOTHING MAY READ THE WIDGET'S GRID. It is not fed for the
+        // focused pane, so every read is empty or stale: "Clear" cleared
+        // nothing, "copy screen" copied nothing, page-up paged nothing.
+        assert_eq!(
+            src.matches("self.app.terminal.grid").count(),
+            0,
+            "something reads the widget's grid again — it is unfed for the \
+             focused pane, so the read is empty and the feature looks broken."
+        );
+        assert_eq!(
+            src.matches("self.app.terminal.screen_text()").count(),
+            0,
+            "screen_text reads the unfed grid; build it from session.grid."
         );
     }
 }
