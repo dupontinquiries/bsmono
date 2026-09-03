@@ -164,6 +164,25 @@ pub fn clears_the_line(bytes: &[u8]) -> bool {
     bytes == [0x03] || bytes == [0x15]
 }
 
+/// Chords the WIDGET claims for itself, which the host's raw key path
+/// must therefore not encode.
+///
+/// Ctrl+F opens the find bar and Ctrl+P is reserved for the host's
+/// palette. `App::handle_input` already refuses to turn them into
+/// control bytes — but a host running its OWN encoder over the same
+/// events does not know that, so pressing Ctrl+F both opened the bar
+/// and sent 0x06 to the shell. Observed as a literal `^F` at the prompt
+/// in a screenshot; no unit test was going to catch it, because each
+/// reader was individually correct.
+///
+/// Same shape as `widget_handles`: one statement of who owns what, read
+/// by both readers.
+pub fn is_widget_chord(key: Key, m: Mods) -> bool {
+    m.ctrl
+        && !m.alt
+        && matches!(key, Key::Char('f') | Key::Char('F') | Key::Char('p') | Key::Char('P'))
+}
+
 /// Whether the HOST's raw key path should run this frame.
 ///
 /// The mirror of `widget_handles`, and the half that was missing: gating
@@ -372,6 +391,23 @@ mod tests {
         assert!(!clears_the_line(&[]));
         // a control byte inside a longer sequence is not a discard
         assert!(!clears_the_line(&[0x1b, 0x03]));
+    }
+
+    #[test]
+    fn the_widget_claims_find_and_palette() {
+        let ctrl = Mods { ctrl: true, alt: false, shift: false };
+        assert!(is_widget_chord(Key::Char('f'), ctrl));
+        assert!(is_widget_chord(Key::Char('F'), ctrl));
+        assert!(is_widget_chord(Key::Char('p'), ctrl));
+    }
+
+    #[test]
+    fn an_unclaimed_key_still_reaches_the_shell() {
+        assert!(!is_widget_chord(Key::Char('f'), Mods::none()), "typing f is not a chord");
+        let ctrl = Mods { ctrl: true, alt: false, shift: false };
+        assert!(!is_widget_chord(Key::Char('c'), ctrl), "Ctrl-C must still interrupt");
+        let ctrl_alt = Mods { ctrl: true, alt: true, shift: false };
+        assert!(!is_widget_chord(Key::Char('f'), ctrl_alt), "Ctrl+Alt+F is a different chord");
     }
 
     #[test]

@@ -1025,6 +1025,9 @@ pub struct App {
     /// In-screen find state; `search_open` toggles the search bar.
     pub search: SearchState,
     pub search_open: bool,
+    /// Set when the bar is opened, cleared once the query field has
+    /// taken focus. See `open_search`.
+    search_wants_focus: bool,
     /// Cursor interaction mode + its glide/pulse state — see `CursorMode`/`CursorAnim`.
     pub cursor_mode: CursorMode,
     cursor_anim: CursorAnim,
@@ -1058,6 +1061,7 @@ impl App {
             recognizer: uikit_egui::touch::GestureRecognizer::new(uikit_egui::touch::Config::default()),
             search: SearchState::default(),
             search_open: false,
+            search_wants_focus: false,
             cursor_mode: CursorMode::default(), // Slide, matching the QML's default
             cursor_anim: CursorAnim::default(),
             selection: None,
@@ -1294,6 +1298,16 @@ impl App {
     /// Open the find bar (the compass "search" action / Ctrl+F).
     pub fn open_search(&mut self) {
         self.search_open = true;
+        // AND TAKE THE KEYBOARD. A find bar that opens without focus
+        // sends your query to whatever had it before — for a terminal
+        // host that is the SHELL, so pressing Ctrl+F and typing
+        // "FINDME" ran `FINDME` as a command. Seen in a screenshot: the
+        // field still showed its placeholder while the text appeared at
+        // the prompt.
+        //
+        // Deferred to the next frame rather than done here because the
+        // widget does not exist yet; `search_ui` consumes the flag.
+        self.search_wants_focus = true;
     }
 
     /// Render the search bar when open: a query field, an `n/N` match counter, prev/next, and close.
@@ -1309,6 +1323,9 @@ impl App {
                     .hint_text("find in screen…")
                     .desired_width(180.0),
             );
+            if std::mem::take(&mut self.search_wants_focus) {
+                resp.request_focus();
+            }
             if resp.changed() {
                 self.search.run(&self.terminal.grid);
             }
@@ -1318,15 +1335,21 @@ impl App {
             if resp.changed() || resp.lost_focus() {
                 self.scroll_to_search_active();
             }
-            if ui.button("▲").clicked() {
+            // ASCII labels, not the triangle/cross glyphs. egui's
+            // default font stack does not carry them on every platform:
+            // a screenshot of this bar under a plain X session showed
+            // three empty boxes, and a control you cannot identify is a
+            // control you will not press. Found by looking; no test can
+            // see a missing glyph.
+            if ui.button("prev").clicked() {
                 self.search.prev();
                 self.scroll_to_search_active();
             }
-            if ui.button("▼").clicked() {
+            if ui.button("next").clicked() {
                 self.search.next();
                 self.scroll_to_search_active();
             }
-            if ui.button("✕").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if ui.button("close").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.search_open = false;
                 self.search.query.clear();
                 self.search.matches.clear();

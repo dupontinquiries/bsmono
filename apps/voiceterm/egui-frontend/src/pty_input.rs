@@ -130,6 +130,19 @@ pub struct Outcome {
 /// The whole path for one keypress, in the order the QML handler runs it:
 /// chords first, then encoding.
 pub fn press(key: Key, m: Mods, mode: TermMode, split_visible: bool) -> Outcome {
+    // Chords the WIDGET owns (Ctrl+F find, Ctrl+P palette). It handles
+    // them from the same events, and encoding them here too sent the
+    // control byte to the shell as well: pressing Ctrl+F opened the find
+    // bar AND printed `^F` at the prompt. Each reader was correct on its
+    // own, which is why nothing caught it until a screenshot.
+    if uikit_term::keys::is_widget_chord(key, m) {
+        return Outcome {
+            bytes: Vec::new(),
+            chord: None,
+            snap_to_bottom: false,
+            collapses_touch_bar: false,
+        };
+    }
     if let Some(c) = chord(key, m, split_visible) {
         return Outcome { bytes: Vec::new(), chord: Some(c),
                          snap_to_bottom: false, collapses_touch_bar: false };
@@ -226,6 +239,18 @@ mod tests {
     const PLAIN: TermMode = TermMode { app_cursor: false, bracketed_paste: false };
     const APP: TermMode = TermMode { app_cursor: true, bracketed_paste: false };
     const BRACKET: TermMode = TermMode { app_cursor: false, bracketed_paste: true };
+
+    #[test]
+    fn a_widget_chord_sends_nothing_to_the_shell() {
+        // Ctrl+F opens the find bar; if this path also encodes it, the
+        // shell gets 0x06 and prints ^F at the prompt.
+        let ctrl = Mods { ctrl: true, alt: false, shift: false };
+        assert!(press(Key::Char('f'), ctrl, PLAIN, false).bytes.is_empty());
+        assert!(press(Key::Char('p'), ctrl, PLAIN, false).bytes.is_empty());
+        // and an ordinary ctrl chord is untouched
+        assert_eq!(press(Key::Char('c'), ctrl, PLAIN, false).bytes, b"\x03");
+        assert_eq!(press(Key::Char('f'), Mods::none(), PLAIN, false).bytes, b"f");
+    }
 
     #[test]
     fn arrows_change_shape_in_application_cursor_mode() {
