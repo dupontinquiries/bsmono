@@ -158,6 +158,27 @@ mod model_download;
 mod model_bench;
 mod repl_voice;
 mod editor_voice;
+// Voice *typing* (as opposed to editor_voice's voice *commands*): the
+// headless dictation core. Pure — no Qt, no whisper, no PTY — so it is
+// also exposed from lib.rs and testable without Qt.
+mod dictate;
+// Buffer identifier dictionary: resolves spoken word runs to the real
+// spellings in the open file, and derives the dictation-scoped whisper
+// initial_prompt. Pure.
+mod code_symbols;
+// Per-utterance routing for a dictation session: which recognizer is
+// allowed to act on what, plus the shadow record that decides when the
+// acoustic fast path can be trusted. Pure.
+mod dictation_session;
+// The voice-feedback readout model: two-tier transcript display with the
+// anti-reflow slot sizing. Pure.
+mod voice_status;
+// Which buttons the bottom bar shows, keyed on the live voice grammar.
+// Pure; composes bottom_bar + editor_voice + dictate.
+mod bar_pages;
+// Targeted fixes to the last dictated unit (recase, spell, change a
+// word) instead of discarding it. Pure.
+mod repair;
 // v0.1.609: motion-rollback position-history core (TODO_motion_rollback
 // option 1, the testable piece). Status-line parsing stays build-gated.
 mod motion_history;
