@@ -2658,6 +2658,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "snapclone-av1policy"
+version = "0.1.0"
+
+[[package]]
 name = "snapclone-composer"
 version = "0.1.0"
 
@@ -2676,6 +2680,7 @@ dependencies = [
  "settings-kit",
  "sha2",
  "share-kit",
+ "snapclone-av1policy",
  "snapclone-composer",
  "snapclone-location",
  "snapclone-mailbox",

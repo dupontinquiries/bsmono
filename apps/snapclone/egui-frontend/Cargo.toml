@@ -23,6 +23,10 @@ app = ["dep:eframe"]
 # what takes a 1080p snap from 6.2 MB on the wire to about 300 KB. See
 # src/media_encode.rs for why not AV1 yet.
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# The AV1 encoder PLAN, shared with the Qt app rather than reimplemented.
+# `Av1Policy.hpp` says in its own header that it mirrors this crate's
+# `plan_for`; a third copy of those numbers is how three copies disagree.
+snapclone-av1policy = { path = "../rust/snapclone-av1policy" }
 # The composer tile-strip decision model. A real dependency rather than a
 # #[path] include: it is a standalone crate with an rlib target, and its `ffi`
 # module uses `crate::` paths that break when a lib.rs is pulled in as a
