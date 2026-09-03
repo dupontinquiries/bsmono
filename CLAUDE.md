@@ -335,9 +335,18 @@ exactly where that difference gets lost.
   rewires the build makes it impossible to tell later which changes came from
   upstream and which were integration choices."
 - Say what was verified and what was not, in the message. "Unverified by
-  compilation" is an acceptable state here — GPU, Qt and GTK paths cannot be
-  built in this sandbox — but it has to be *said*, or the next session inherits
-  a claim it cannot audit.
+  compilation" is an acceptable state here — but it has to be *said*, or the
+  next session inherits a claim it cannot audit.
+- **Check what the sandbox can actually do before claiming it cannot.** This
+  rule used to read "GPU, Qt and GTK paths cannot be built in this sandbox".
+  That is true of **Qt** (`qmetaobject` needs headers that are not installable)
+  and **false of egui/eframe/glow**, which build, link, run against software
+  GL, and can be driven with synthetic keystrokes and screenshotted — see
+  [docs/agents/HEADLESS_GUI_TESTING.md](docs/agents/HEADLESS_GUI_TESTING.md).
+  The claim was written for Qt and generalised; a session inherited it and
+  spent sixteen commits reasoning about a UI it could have looked at, then a
+  single screenshot overturned a premise four of those commits rested on. One
+  `cargo build` is cheaper than the assumption.
 - Write long messages to a file and use `git commit -F`. Heredocs through a
   `sh -c` wrapper mangle apostrophes and silently truncate.
 

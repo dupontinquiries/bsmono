@@ -17,6 +17,15 @@ That also settles plan item 4 below for one role: **CLAUDE.md is the directive
 file**, `HANDOFF.md` stays the per-task handover, `TOOLBOX.md` the per-project
 tool list.
 
+## Running a GUI from the sandbox
+
+[**HEADLESS_GUI_TESTING.md**](HEADLESS_GUI_TESTING.md) — how to build, launch,
+type into and screenshot an egui app here: Xvfb **plus a window manager**
+(without one, synthetic keys land nowhere), `xdotool` with a slow enough delay
+that a software-GL app keeps up, and `import` + the image viewer to actually
+look at the result. Also the two ways the measuring instrument produced a
+false alarm, and the rule that follows: probe before patching.
+
 ## Catalog (≈40 docs)
 
 **games/unendlich** — by far the largest cluster. (Moved from `apps/`; the old path was purged, so references to `apps/unendlich` in older notes are historical.)
