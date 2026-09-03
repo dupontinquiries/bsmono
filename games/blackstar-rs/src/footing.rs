@@ -67,10 +67,27 @@
 //! What this does is make the correct query exist and be true, so the
 //! migration is mechanical rather than a design problem, and so the next
 //! system written reaches for the one that works in space.
+//!
+//! ## THROUGH THE SEAM
+//!
+//! This module takes `&dyn WorldHost`, not `&World`. It was the right first
+//! one to move because it asks the world only three things — which way is
+//! down, how high is the ground, how far to the nearest solid — and all three
+//! are questions any engine can answer. It has no callers yet, so moving it
+//! could not break anything, and it is what physics will reach for when it
+//! moves.
+//!
+//! Moving it needed two additions to the trait, and both were gaps rather
+//! than conveniences: `gravity_dir`, because "down" is a property of the
+//! world and the trait could not say it; and `ground_plane`, because
+//! `ground_h` returns an `f32` and so can only say HOW HIGH, never WHETHER —
+//! which is exactly the distinction a field world needs. Both default to the
+//! plane answer, so `Flat`, `Balls` and any future host stay correct without
+//! knowing they exist.
 
 use glam::Vec3;
 
-use crate::world::World;
+use worldhost::WorldHost;
 
 /// A surface found under a point.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -94,14 +111,14 @@ const MAX_STEPS: u32 = 64;
 /// `None` means open space — nothing within reach in the direction gravity
 /// says is down. On a field world that is the common case and the correct
 /// answer; on a grounded world it means you are very high up.
-pub fn below(world: &World, p: Vec3, reach: f32) -> Option<Contact> {
+pub fn below(world: &dyn WorldHost, p: Vec3, reach: f32) -> Option<Contact> {
     let down = world.gravity_dir(p).try_normalize().unwrap_or(Vec3::NEG_Y);
 
     // A FIELD WORLD HAS NO PLANE. `World::kuiper` already records this — the
     // asteroid field's terrain grid exists only because every map gets one,
     // and consulting it here would reproduce the phantom floor in the very
     // query written to see past it.
-    if !world.kuiper {
+    if world.ground_plane() {
         // Grounded world: the heightmap is the answer and down is -Y, which
         // is exactly the case `ground_h` was written for. Use it rather than
         // marching, because it is exact and the march is not.
@@ -119,7 +136,7 @@ pub fn below(world: &World, p: Vec3, reach: f32) -> Option<Contact> {
     let mut t = 0.0f32;
     for _ in 0..MAX_STEPS {
         let at = p + down * t;
-        let d = world.sdf(at);
+        let d = world.clearance(at);
         if !d.is_finite() {
             return None;
         }
@@ -138,16 +155,16 @@ pub fn below(world: &World, p: Vec3, reach: f32) -> Option<Contact> {
 }
 
 /// Is `p` standing on something?
-pub fn grounded(world: &World, p: Vec3, skin: f32) -> bool {
+pub fn grounded(world: &dyn WorldHost, p: Vec3, skin: f32) -> bool {
     below(world, p, skin.max(SKIN)).is_some()
 }
 
-fn sdf_normal(world: &World, p: Vec3) -> Option<Vec3> {
+fn sdf_normal(world: &dyn WorldHost, p: Vec3) -> Option<Vec3> {
     let e = 0.08;
     let n = Vec3::new(
-        world.sdf(p + Vec3::X * e) - world.sdf(p - Vec3::X * e),
-        world.sdf(p + Vec3::Y * e) - world.sdf(p - Vec3::Y * e),
-        world.sdf(p + Vec3::Z * e) - world.sdf(p - Vec3::Z * e),
+        world.clearance(p + Vec3::X * e) - world.clearance(p - Vec3::X * e),
+        world.clearance(p + Vec3::Y * e) - world.clearance(p - Vec3::Y * e),
+        world.clearance(p + Vec3::Z * e) - world.clearance(p - Vec3::Z * e),
     );
     n.try_normalize()
 }

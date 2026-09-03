@@ -65,6 +65,40 @@ pub trait WorldHost {
         true
     }
 
+    /// Velocity of whatever solid is within `reach` of `p`, if that
+    /// solid is under way. `None` means nothing near, or nothing near is
+    /// moving — a body standing here inherits no motion.
+    ///
+    /// A world question, not a physics one: the host knows which of its
+    /// solids move because it moves them. A static world takes the
+    /// default and never thinks about it.
+    fn platform_vel(&self, _p: Vec3, _reach: f32) -> Option<Vec3> {
+        None
+    }
+
+    /// Which way is DOWN at `p`. A world with a plane answers `-Y`
+    /// everywhere; a world made of bodies answers "toward whichever body
+    /// is pulling here". The default is the plane answer, so a host that
+    /// has never thought about it stays correct.
+    ///
+    /// Not normalised by contract — callers normalise, because a host
+    /// summing several attractors would otherwise pay for it twice.
+    fn gravity_dir(&self, _p: Vec3) -> Vec3 {
+        Vec3::NEG_Y
+    }
+
+    /// Does `ground_h` mean anything on this world? False on a field
+    /// world — an asteroid belt, open space — where the terrain grid
+    /// exists only because every map gets one, and consulting it would
+    /// invent a floor that is not there.
+    ///
+    /// This is the one bit `footing` needs that `ground_h`'s signature
+    /// cannot carry: it returns an `f32`, so it can only say HOW HIGH,
+    /// never WHETHER.
+    fn ground_plane(&self) -> bool {
+        true
+    }
+
     /// Where this window sits on the world plane. A host with one fixed
     /// world returns zero.
     fn origin(&self) -> Vec3 {
@@ -90,6 +124,108 @@ pub trait WorldHost {
 pub const LOS_STEP_M: f32 = 1.5;
 /// Below this clearance a point counts as blocked.
 pub const LOS_CLEAR_M: f32 = 0.15;
+
+/// THE CONTRACT, EXECUTABLE — what every host must agree on.
+///
+/// Two engines answering the same trait is only worth something if their
+/// answers mean the same thing. The trait's signatures cannot say that
+/// `clearance` is negative inside a solid, or that looking at yourself is
+/// always clear; those are prose in the doc comments, and prose is not
+/// checked. This module is that prose as functions, so both hosts can run
+/// the same suite and a third host has a definition of "done".
+///
+/// Not `#[cfg(test)]`: it is public API precisely so OTHER crates' tests can
+/// call it. It costs a few hundred bytes in a release build and buys the only
+/// evidence that a swap is safe.
+pub mod conformance {
+    use super::*;
+
+    /// A point the host should consider open sky, and one it should consider
+    /// buried, so the suite can test a host without knowing its terrain.
+    pub struct Probe {
+        /// Somewhere with nothing solid at it.
+        pub open: Vec3,
+        /// Somewhere inside solid matter. `None` if the world has none.
+        pub buried: Option<Vec3>,
+        /// A ground column to sample, as (x, z).
+        pub column: (f32, f32),
+    }
+
+    /// Run every invariant. Panics with the failing rule named, so a caller
+    /// writes one `#[test]` per host and gets a specific failure.
+    pub fn check(host: &dyn WorldHost, p: &Probe) {
+        ground_is_deterministic_and_finite(host, p);
+        clearance_agrees_with_its_own_sign(host, p);
+        looking_at_yourself_is_clear(host, p);
+        sight_is_symmetric(host, p);
+        down_is_a_direction(host, p);
+        landmark_slices_are_readable(host);
+    }
+
+    /// Asking twice must answer twice the same, and never NaN. A streamed
+    /// host can fail this by letting a query mutate a cache.
+    pub fn ground_is_deterministic_and_finite(host: &dyn WorldHost, p: &Probe) {
+        let (x, z) = p.column;
+        let a = host.ground_h(x, z);
+        let b = host.ground_h(x, z);
+        assert!(a.is_finite(), "ground_h returned {a}");
+        assert_eq!(a.to_bits(), b.to_bits(), "ground_h is not deterministic at ({x}, {z})");
+        assert!(host.clearance(p.open).is_finite(), "clearance returned a non-finite value");
+    }
+
+    /// Positive is free, zero or less is inside something. The trait allows a
+    /// step instead of a true distance, but not a sign that lies.
+    pub fn clearance_agrees_with_its_own_sign(host: &dyn WorldHost, p: &Probe) {
+        assert!(host.clearance(p.open) > 0.0, "an open point reported as solid: {:?}", p.open);
+        if let Some(b) = p.buried {
+            assert!(host.clearance(b) <= 0.0, "a buried point reported as free: {b:?}");
+        }
+        if host.ground_plane() {
+            let (x, z) = p.column;
+            let above = Vec3::new(x, host.ground_h(x, z) + 4.0, z);
+            assert!(
+                host.clearance(above) > 0.0,
+                "four metres above this world's own ground is not free space: {above:?}"
+            );
+        }
+    }
+
+    /// Zero-length sight must not consult the world at all.
+    pub fn looking_at_yourself_is_clear(host: &dyn WorldHost, p: &Probe) {
+        assert!(host.line_of_sight(p.open, p.open), "a point cannot see itself");
+    }
+
+    /// Sight is a property of the segment, not of which end asked. A host
+    /// that overrides `line_of_sight` with a one-directional march can fail
+    /// this, which is exactly why it is checked rather than assumed.
+    pub fn sight_is_symmetric(host: &dyn WorldHost, p: &Probe) {
+        let Some(b) = p.buried else { return };
+        let there = host.line_of_sight(p.open, b);
+        let back = host.line_of_sight(b, p.open);
+        assert_eq!(there, back, "sight between {:?} and {b:?} depends on who is asking", p.open);
+    }
+
+    /// Down must be usable as a direction: non-zero and finite. Not
+    /// normalised — the trait says callers normalise.
+    pub fn down_is_a_direction(host: &dyn WorldHost, p: &Probe) {
+        let g = host.gravity_dir(p.open);
+        assert!(g.is_finite(), "gravity_dir returned {g:?}");
+        assert!(g.length_squared() > 1e-6, "gravity_dir has no direction at {:?}", p.open);
+    }
+
+    /// The landmark slices must be callable and internally consistent —
+    /// an obstacle with a negative radius is a host bug that only shows up
+    /// as a steering failure much later.
+    pub fn landmark_slices_are_readable(host: &dyn WorldHost) {
+        for (c, r) in host.obstacles() {
+            assert!(r.is_finite() && *r >= 0.0, "obstacle at {c:?} has radius {r}");
+            assert!(c.is_finite(), "obstacle centre is not finite: {c:?}");
+        }
+        for v in host.plazas().iter().chain(host.cover()) {
+            assert!(v.is_finite(), "landmark is not finite: {v:?}");
+        }
+    }
+}
 
 /// The empty world: flat at `y`, nothing solid, sees everything. For
 /// tests, and for a game system that wants to run with no world at all.
@@ -151,5 +287,27 @@ mod tests {
         assert!(!b.line_of_sight(a, Vec3::new(40.0, 1.0, 0.0)));
         assert!(b.line_of_sight(a, Vec3::new(40.0, 1.0, 10.0)));
         assert_eq!(b.obstacles().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod conformance_tests {
+    use super::conformance::{check, Probe};
+    use super::*;
+
+    #[test]
+    fn the_built_in_hosts_satisfy_their_own_contract() {
+        let flat = Flat { y: 0.0 };
+        check(&flat, &Probe { open: Vec3::new(0.0, 10.0, 0.0), buried: None, column: (3.0, -4.0) });
+
+        let balls = Balls { y: 0.0, balls: vec![(Vec3::new(20.0, 5.0, 0.0), 3.0)] };
+        check(
+            &balls,
+            &Probe {
+                open: Vec3::new(0.0, 10.0, 0.0),
+                buried: Some(Vec3::new(20.0, 5.0, 0.0)),
+                column: (1.0, 1.0),
+            },
+        );
     }
 }

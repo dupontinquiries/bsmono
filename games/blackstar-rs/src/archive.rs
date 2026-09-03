@@ -503,8 +503,12 @@ pub static SOURCES: &[Source] = &[
     Source { id: "europa_post", what: "the listening post's final hour" },
     Source { id: "io_forge", what: "the tide-forges, pouring into moulds nobody cut" },
     Source { id: "emptied_vaults", what: "a lattice pool vault, opened cleanly and emptied" },
+    Source { id: "rotation_roster", what: "a duty roster plate from the ice, and the hand that kept it" },
+    Source { id: "survey_plate", what: "a pre-contact survey of the ice, and its mineral classifications" },
     Source { id: "pluto_marker", what: "a boundary marker set into the ice" },
     Source { id: "carrion_wreck", what: "a hull that came apart on a straight edge" },
+    Source { id: "outpost_roster", what: "the vault office's rotation board, and the hand-off note under it" },
+    Source { id: "carrier_drift", what: "a carrier nobody transmits, tracked across two seasons of drift" },
     Source { id: "cybertron_core", what: "core substrate, dated properly for once" },
     Source { id: "judgement_docket", what: "the Judgementor's open case file" },
     Source { id: "covenant_cache", what: "a tithe-vault, and the one thing in it worth taking" },
@@ -626,6 +630,25 @@ pub static CLAIMS: &[Claim] = &[
         asserted: false,
         layer: Stratum::Machine as u8,
         text: "there is structure at the edge of the heliosphere that predates everyone arguing about it",
+    },
+    Claim {
+        id: "machine_answers_the_watch",
+        asserted: false,
+        layer: Stratum::Machine as u8,
+        text: "the carrier has a source, and the source is what the Watch is answering to",
+    },
+    // ---- Layer 1, the outpost ----
+    Claim {
+        id: "glaciem_was_an_outpost",
+        asserted: false,
+        layer: Stratum::Recent as u8,
+        text: "the ice on Glaciem was a store room somebody rotated through, not a home",
+    },
+    Claim {
+        id: "vault_plate_is_complete",
+        asserted: true,
+        layer: Stratum::Recent as u8,
+        text: "the vault plate accounts for everything the vault held",
     },
     // ---- the mundane answers ----
     Claim {
@@ -906,6 +929,49 @@ pub static FINDINGS: &[Finding] = &[
                 than the vault.",
         links: &[s("archivist_collecting")],
     },
+    Finding {
+        id: "vault_plate_inventory",
+        site: "glaciem",
+        source: "emptied_vaults",
+        medium: Medium::Site,
+        gate: None,
+        blurb: "the plate itself, read line by line. forty-one entries, forty-one strikes, and a \
+                closing mark that means the same in three scripts: nothing further held.",
+        links: &[s("vault_plate_is_complete"), m("archivist_collecting")],
+    },
+    Finding {
+        id: "glaciem_rotation_roster",
+        site: "glaciem",
+        source: "outpost_roster",
+        medium: Medium::Terminal,
+        gate: None,
+        blurb: "a rotation board in the vault office. four names, a return date nobody came back \
+                for, and a hand-off note listing what the next shift should log properly. one \
+                item on that note is not on the plate.",
+        links: &[s("glaciem_was_an_outpost"), c("vault_plate_is_complete")],
+    },
+    Finding {
+        id: "glaciem_rotation_plate",
+        site: "glaciem",
+        source: "rotation_roster",
+        medium: Medium::Terminal,
+        gate: None,
+        blurb: "a duty roster, kept in the same hand for nine hundred years. the same four names \
+                rotate out and back. nobody on it was ever born here and nobody on it ever \
+                retired.",
+        links: &[s("glaciem_was_an_outpost"), m("archivist_collecting")],
+    },
+    Finding {
+        id: "glaciem_survey_plate",
+        site: "glaciem",
+        source: "survey_plate",
+        medium: Medium::Artifact,
+        gate: None,
+        blurb: "an old survey of this ice, from before anyone was talking to anyone. the lattice \
+                pools are on it. they are classified as a mineral formation, with a note that the \
+                growth rate is unusual for the temperature.",
+        links: &[s("watchers_observed"), s("glaciem_was_an_outpost"), m("vault_plate_is_complete")],
+    },
     // ================= PLUTO =================
     Finding {
         id: "pluto_line_marker",
@@ -1054,6 +1120,27 @@ pub static FINDINGS: &[Finding] = &[
                 period at all -- 417 years sits at the optimistic floor of a band with no \
                 ceiling.",
         links: &[s("asteri_orbital_error"), s("asteri_existed")],
+    },
+    Finding {
+        id: "carrier_bearing",
+        site: "uncharted",
+        source: "carrier_drift",
+        medium: Medium::Terminal,
+        gate: None,
+        blurb: "a carrier with no traffic on it, holding a bearing that does not drift with the \
+                sky. whatever is sending has not moved in the time anyone has been listening.",
+        links: &[s("machine_answers_the_watch"), m("edge_lattice")],
+    },
+    Finding {
+        id: "carrier_null",
+        site: "uncharted",
+        source: "carrier_drift",
+        medium: Medium::Terminal,
+        gate: None,
+        blurb: "the same carrier, a season later, from the other side of the sun. the bearing is \
+                unchanged, which rules out most of what it could have been and confirms none of \
+                what it might be.",
+        links: &[s("machine_answers_the_watch")],
     },
     Finding {
         id: "debris_stream",

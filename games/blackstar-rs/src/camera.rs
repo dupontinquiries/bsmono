@@ -9,7 +9,7 @@ use glam::{Mat4, Quat, Vec3};
 
 use crate::config::CamCfg;
 use crate::physics::{Ball, Car};
-use crate::world::World;
+use worldhost::WorldHost;
 
 /// Which camera you are looking through.
 ///
@@ -268,7 +268,7 @@ impl Camera {
         &mut self,
         car: &Car,
         ball: &Ball,
-        world: &World,
+        world: &dyn WorldHost,
         cfg: &CamCfg,
         flipping: bool,
         rear: bool,

@@ -5104,6 +5104,18 @@ impl worldhost::WorldHost for World {
     fn clearance(&self, p: Vec3) -> f32 {
         self.sdf(p)
     }
+    fn gravity_dir(&self, p: Vec3) -> Vec3 {
+        World::gravity_dir(self, p)
+    }
+    fn platform_vel(&self, p: Vec3, reach: f32) -> Option<Vec3> {
+        World::platform_vel(self, p, reach)
+    }
+    fn ground_plane(&self) -> bool {
+        // KUIPER is the asteroid field: its terrain grid exists only
+        // because every map gets one. Saying `false` here is what stops
+        // `footing` reproducing the phantom floor.
+        !self.kuiper
+    }
     fn origin(&self) -> Vec3 {
         self.origin
     }
