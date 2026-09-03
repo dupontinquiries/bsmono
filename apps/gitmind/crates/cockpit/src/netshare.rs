@@ -261,6 +261,86 @@ pub fn pick_share_ip(candidates: &[String]) -> Option<String> {
         .cloned()
 }
 
+/// Parse `ip -o -4 addr` output into addresses.
+///
+/// Lines look like:
+/// `2: eth0    inet 192.168.1.20/24 brd 192.168.1.255 scope global eth0`
+///
+/// Pure, because the interesting part is the parsing and this fleet's devices
+/// disagree about which tool exists — iproute2 on postmarketOS, net-tools on
+/// the desktop — so both parsers need testing without either being installed.
+pub fn parse_ip_addr_output(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        while let Some(tok) = it.next() {
+            if tok == "inet" {
+                if let Some(cidr) = it.next() {
+                    // Strip the prefix length: the address is what a peer
+                    // connects to, and `192.168.1.20/24` is not a valid host.
+                    let ip = cidr.split('/').next().unwrap_or(cidr);
+                    if !ip.is_empty() {
+                        out.push(ip.to_string());
+                    }
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Parse `hostname -I` output — space-separated addresses on one line.
+///
+/// IPv6 entries are dropped: this server binds v4 and the card advertises a
+/// `host:port` that a v6 address would need brackets in. Advertising a bare v6
+/// address produces a URL that curl cannot parse, which is a worse failure than
+/// not offering it.
+pub fn parse_hostname_i_output(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter(|t| t.contains('.') && !t.contains(':'))
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// Every IPv4 address this host has, from whichever tool is installed.
+///
+/// `ip` first because it is what Alpine and postmarketOS ship and it reports
+/// per-interface; `hostname -I` second because it is what a Debian desktop has
+/// when iproute2 is not installed. Both are shelled out to rather than adding a
+/// `getifaddrs` binding — this crate already shells out to git, ssh and rsync,
+/// and one more process on a button press is cheaper than a new dependency
+/// across the fleet's build targets.
+pub fn host_ipv4s() -> Vec<String> {
+    use std::process::Command;
+    if let Ok(o) = Command::new("ip").args(["-o", "-4", "addr"]).output() {
+        if o.status.success() {
+            let v = parse_ip_addr_output(&String::from_utf8_lossy(&o.stdout));
+            if !v.is_empty() {
+                return v;
+            }
+        }
+    }
+    if let Ok(o) = Command::new("hostname").arg("-I").output() {
+        if o.status.success() {
+            return parse_hostname_i_output(&String::from_utf8_lossy(&o.stdout));
+        }
+    }
+    Vec::new()
+}
+
+/// The address to advertise, or `None` when this host has none that can serve
+/// a peer.
+///
+/// Enumeration first, `local_ip`'s default-route guess as the fallback — see
+/// [`pick_share_ip`] for why the guess alone is wrong on a VPN and worse with
+/// no default route. `None` rather than `127.0.0.1`: an address that cannot
+/// work should not be printed as if it can.
+pub fn share_ip() -> Option<String> {
+    pick_share_ip(&host_ipv4s())
+        .or_else(|| local_ip().filter(|ip| addr_kind(ip) != AddrKind::Loopback))
+}
+
 /// The current user (for the ssh provider url).
 pub fn current_user() -> String {
     std::env::var("USER")
@@ -470,6 +550,77 @@ mod tests {
         // `Other` outranks Cgnat, so junk must not beat a real LAN address.
         let c: Vec<String> = vec!["not.an.ip".into(), "192.168.1.5".into()];
         assert_eq!(pick_share_ip(&c).as_deref(), Some("192.168.1.5"));
+    }
+
+    #[test]
+    fn ip_addr_output_parses_and_drops_the_prefix_length() {
+        let text = "1: lo    inet 127.0.0.1/8 scope host lo\n\
+                    2: eth0    inet 192.168.1.20/24 brd 192.168.1.255 scope global eth0\n\
+                    3: tailscale0    inet 100.101.5.7/32 scope global tailscale0\n";
+        let v = parse_ip_addr_output(text);
+        assert_eq!(v, vec!["127.0.0.1", "192.168.1.20", "100.101.5.7"]);
+        // `/24` is not a host. Advertising it gives a URL nothing can connect
+        // to, which looks exactly like the bug this whole path is fixing.
+        assert!(v.iter().all(|ip| !ip.contains('/')), "{v:?}");
+        // And the ranking then does its job on the real shape of the output.
+        assert_eq!(pick_share_ip(&v).as_deref(), Some("192.168.1.20"));
+    }
+
+    #[test]
+    fn an_inet6_line_is_not_mistaken_for_an_address() {
+        // `inet6` must not match `inet`. A v6 address in a `host:port` URL
+        // needs brackets, so advertising one bare produces something curl
+        // cannot parse.
+        let text = "2: eth0    inet6 fe80::1/64 scope link\n\
+                    2: eth0    inet 10.0.0.5/24 scope global eth0\n";
+        assert_eq!(parse_ip_addr_output(text), vec!["10.0.0.5"]);
+        assert_eq!(parse_hostname_i_output("fe80::1 10.0.0.5"), vec!["10.0.0.5"]);
+    }
+
+    #[test]
+    fn hostname_dash_i_output_parses() {
+        assert_eq!(parse_hostname_i_output("192.168.1.20 10.8.0.2 \n"),
+                   vec!["192.168.1.20", "10.8.0.2"]);
+        assert!(parse_hostname_i_output("").is_empty());
+        assert!(parse_hostname_i_output("   \n").is_empty());
+    }
+
+    #[test]
+    fn empty_or_garbage_tool_output_yields_nothing_rather_than_junk() {
+        // A tool that exists and prints an error must not become an address.
+        assert!(parse_ip_addr_output("").is_empty());
+        assert!(parse_ip_addr_output("Command 'ip' not found").is_empty());
+        assert!(parse_ip_addr_output("2: eth0    inet\n").is_empty(),
+                "a truncated line produced an address");
+    }
+
+    #[test]
+    fn share_ip_enumerates_before_it_guesses_and_never_returns_loopback() {
+        // Two halves, and only one is behaviourally testable here.
+        //
+        // BEHAVIOUR: whatever this host has, the answer is never loopback.
+        // That is the property the reported bug turned on — `local_ip()`
+        // failing made the caller advertise 127.0.0.1 and display it as if it
+        // worked.
+        if let Some(ip) = share_ip() {
+            assert_ne!(addr_kind(&ip), AddrKind::Loopback,
+                       "share_ip offered a loopback address: {ip}");
+        }
+
+        // WIRING: that it enumerates first rather than falling back to the
+        // default-route guess. Replacing the body with a bare `local_ip()`
+        // failed no test — it needs a host with a VPN or no default route to
+        // tell the two apart, which this sandbox is not. So this greps the
+        // source, the same way the unendlich consent seed is pinned
+        // (62474b370), and asserts it found the function first: a grep that
+        // matches nothing passes everything below it.
+        let src = include_str!("netshare.rs");
+        let body = src.split_once("pub fn share_ip()").expect("share_ip is gone").1;
+        let body = &body[..body.find("\n}").unwrap_or(body.len())];
+        assert!(body.contains("pick_share_ip"),
+                "share_ip no longer ranks the host's addresses — it is guessing again");
+        assert!(body.contains("host_ipv4s"),
+                "share_ip no longer enumerates interfaces");
     }
 
 }

@@ -2504,7 +2504,16 @@ impl Backend {
         }
         let port: u16 = port.to_string().trim().parse().unwrap_or(9876);
         let r = match repo() { Ok(r) => r, Err(e) => return err_json(&e) };
-        let ip = netshare::local_ip().unwrap_or_else(|| "127.0.0.1".into());
+        // The address a PEER can reach, not the default route's. See
+        // netshare::pick_share_ip: a VPN holding the route advertises a
+        // 100.64/10 the phone cannot reach, and no default route at all made
+        // this fall back to 127.0.0.1 and display it as if it worked.
+        let ip = match netshare::share_ip() {
+            Some(ip) => ip,
+            None => return err_json(
+                "no usable LAN address on this host — every interface is loopback. \
+                 Connect to a network, or check `ip -o -4 addr`."),
+        };
         let card = match netshare::card_for_repo(r.root(), &netshare::current_user(), &ip) {
             Ok(c) => c,
             Err(e) => return err_json(&e),
