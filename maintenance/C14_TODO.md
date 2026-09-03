@@ -151,3 +151,76 @@ with no `/dev/dri` here, `apps/fao-codec`'s numbers were not reproduced and its
 suite (reported 102/0) was not re-run, and rusty-board's wayland/GTK and KWin
 script paths are not buildable in this sandbox. Each merge commit says so in
 its own message.
+
+## 8. dandere2x arrived as a SECOND LINEAGE, not a delta — decide before merging
+
+`aaaa_tar.zst` carried seven bundles. Six merged (four clean, one with a
+resolvable conflict, and two that were ancestors of a third). The seventh,
+`dandere2x-since-59e520e3.bundle`, is not mergeable as it stands and the
+reason is worth writing down rather than rediscovering.
+
+**All 17 conflicts are add/add.** `apps/dandere2x` does not exist at the merge
+base (`59e520e36`). Both sides created the whole app from nothing, and every
+one of the bundle's nine commits collides with files main already has —
+18 of 19 in the first commit, 12 of 12 in the second. There is no additive
+subset to harvest; the two lineages built the same files independently.
+
+### What each side has that the other does not
+
+| | main | bundle |
+|---|---|---|
+| commits | 6 | 9 |
+| .rs files | 17 | 22 |
+| lines | 6,073 | 7,099 |
+| `#[test]` | 61 | 57 |
+
+**Bundle-only:** `d2x-job` as its own crate (ffmpeg, job), plus `batch.rs`,
+`blockcache.rs`, `budget.rs`, a `bench_hot` test, and a checked-in
+upconv_7 model. Its commits claim a generic conv network (RRDBNet/SRVGG as op
+lists), a torch-free pth2st converter, GPU bit-exactness against CPU on
+lavapipe for three networks, keyframe-aligned segment parallelism, a difficulty
+cascade, memory budgets, a content-keyed block cache, and a hot-path audit
+tested bit-identical at 2/3/5/8 threads.
+
+**Main-only:** `crates/dandere2x/src/{ffmpeg,job}.rs` — the same two concerns
+the bundle promoted into `d2x-job` — plus the SEAM WORK. `feather`,
+`overlapped` and `tile_pad` appear in main and in NO bundle file.
+
+### Why that last row is the decision, not a detail
+
+C13_TODO §84 corrected the seam diagnosis twice-over: the flickering seams are
+the residual bleed ring, not the CNN tile grid. Both lineages found the bleed
+ring — the bundle names it in three files, main in one — so that much converges.
+
+But §84 also says, explicitly, that the CNN-tiling work is **not** wasted:
+"`pre_pad` 8->32 and the overlapped blending are real improvements to a real
+(if less visible) artefact, and they are independently tested." Taking the
+bundle wholesale drops that, and drops it silently, because nothing in the
+bundle references it to conflict with.
+
+So neither side is a superset. The bundle is broader in scope; main carries a
+tested fix for a second, real artefact that the bundle never addressed.
+
+### What I did not do, and why
+
+I did not resolve 17 add/add conflicts by hand. Every file is GPU or codec
+code whose correctness claims are bit-exactness against hardware this sandbox
+does not have — no `/dev/dri`, lavapipe only — so a hand-merge would be
+seventeen judgement calls I could not test even once. Picking a winner per file
+on reading alone is how two working implementations become one that compiles.
+
+The branch is fetched and kept as `inc3-dandere-work/main`; nothing is lost.
+
+### The three ways forward, cheapest first
+
+1. **Bundle wins the directory, seam work re-applied on top.** Four commits to
+   port (`3aab45291`, `5ff55cf53`, `030a03100`, `ada7dbfaa`), all small and all
+   about padding and blending, against a `d2x-core` that has moved under them.
+   Recommended if the bundle's author has been the one running this on real
+   footage.
+2. **Main wins, bundle harvested feature by feature.** More work — `d2x-job`,
+   the cascade, budgets and the block cache are each substantial — but it keeps
+   the tested seam behaviour without a port.
+3. **Ask which line has actually been RUN.** Both make bit-exactness claims
+   neither can be checked here. The one that has upscaled real video recently
+   is the trunk, and that is a question about history rather than about code.
