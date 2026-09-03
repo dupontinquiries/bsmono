@@ -176,29 +176,34 @@ grouped by region size, which balanced tiling keeps to one or two shapes.
 
 All three were caught by the bit-exact selftest, not by reading the code.
 
-## 9. In progress: on-device downscale for the cascade
+## 9. On-device downscale for the cascade (done)
 
-A x4 network serving a x2 job currently goes through `Resampled`, a host-side
-Lanczos pass over the network's 4x output — per tile, on one core. At tile 504
+A x4 network serving a x2 job used to go through `Resampled`, a host-side
+Lanczos pass over the network's 4x output, per tile, on one core. At tile 504
 that is a 2016² → 1008² resize against roughly 40 ms of GPU work for the same
-tile, which makes it a strong candidate for the largest remaining CPU cost in
-cascade mode (the compact model is x4 and jobs typically run x2).
+tile — plausibly the largest CPU cost in cascade mode, since the compact model
+is x4 and jobs typically run x2. The pack pass now box-averages `d x d` native
+pixels per output pixel instead, and the wrapper is gone: the upscaler reports
+`x2` directly rather than `x4 -> x2 (lanczos)`.
 
-The pack pass can box-average `d x d` native pixels per output pixel instead,
-deleting the host pass entirely. It is written and behind
-`GpuOptions::target_scale`, but **off everywhere** because it does not yet
-agree with the CPU reference:
+Two bugs on the way, both of which produced a picture rather than an error:
 
-- Setting the pack params' `s` field to the *delivered* scale rather than the
-  network's native one mis-addresses the input-skip lookup, which lives in the
-  network's own output space. Worth 240 LSB on its own; fixed.
-- What remains is 22 LSB, concentrated near tile seams. Unexplained. The crop
-  origin is even in native pixels and the tile arithmetic checks out on paper,
-  so the next step is dumping one tile's native output and the two averages
-  side by side rather than reasoning further.
+1. **The pack params' scale field feeds the input-skip lookup**, which lives in
+   the network's own output space, so it must carry the NATIVE scale even when
+   the pass delivers a smaller one. Setting it to the delivered scale cost
+   240 LSB.
+2. **Each sample must be clamped to [0,1] before averaging, not after.**
+   Network outputs overshoot; averaging raw floats lets an out-of-range sample
+   drag its neighbours down or up. Worth 22 LSB, and it survived every
+   geometric explanation — a single-tile run showed the same error as a
+   multi-tile one, which is what ruled out seams and pointed at per-sample
+   arithmetic.
 
-Left off rather than shipped, and its test is `#[ignore]`d rather than red, so
-nothing silently produces a slightly wrong picture.
+The second is the more general lesson: **whenever a reference quantises before
+combining, a GPU version that combines before quantising is not the same
+function.** Box-averaging is otherwise a slightly different filter from
+Lanczos, which shows as 45.8 dB / 0.995 SSIM between the two renders —
+visually indistinguishable, and softer rather than sharper.
 
 ## 10. Open questions the next hardware run should answer
 

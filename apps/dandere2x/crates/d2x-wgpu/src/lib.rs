@@ -1302,15 +1302,16 @@ mod tests {
         }
     }
 
-    /// A x4 network asked for x2 should match a CPU box-average of its x4
-    /// output. It does not yet: worst |gpu-cpu| is 22 LSB, concentrated near
-    /// tile seams, after fixing the input-skip lookup (which must use the
-    /// NATIVE scale, not the delivered one — that alone was worth 240 LSB).
-    /// The remaining discrepancy is unexplained, so `target_scale` is left at
-    /// 0 everywhere and this stays ignored rather than red. Worth finishing:
-    /// it would delete a per-tile Lanczos resize of a 4x image from the host.
+    /// A x4 network asked for x2 must match a CPU box-average of its x4
+    /// output — the point being that the average happens on device, deleting a
+    /// per-tile Lanczos resize of a 4x image from the host.
+    ///
+    /// Two bugs on the way here, both worth remembering: the pack params'
+    /// scale field feeds the input-skip lookup and must be the NATIVE scale,
+    /// not the delivered one (240 LSB); and each sample must be clamped to
+    /// [0,1] BEFORE averaging, because network outputs overshoot and averaging
+    /// raw floats lets an out-of-range sample pull its neighbours (22 LSB).
     #[test]
-    #[ignore]
     fn gpu_downscale_matches_cpu_box_average() {
         if probe().is_empty() {
             return;
@@ -1330,7 +1331,7 @@ mod tests {
         }
         let got = gpu.upscale_frame(&frame).unwrap();
         assert_eq!((got.width, got.height), (74, 58));
-        let want = box_down(&net.upscale_cpu(&frame, gpu.tile), 2);
+        let want = box_down(&net.upscale_cpu(&frame, 24), 2);
         let worst = got.data.iter().zip(&want.data).map(|(&a, &b)| (a as i16 - b as i16).unsigned_abs()).max().unwrap_or(0);
         assert!(worst <= 1, "worst |gpu-cpu| = {worst} after on-device downscale");
         // A scale the network cannot reach by an integer factor is left alone

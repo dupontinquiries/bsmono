@@ -52,7 +52,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     let ich = c * p.u * p.u + (iy % p.u) * p.u + (ix % p.u);
                     v = v + skip[ich * sk_plane + (iy / p.u) * p.sk_w + (ix / p.u)];
                 }
-                if (c == 0u) { rgb.x = rgb.x + v; } else if (c == 1u) { rgb.y = rgb.y + v; } else { rgb.z = rgb.z + v; }
+                // Clamp EACH sample before averaging, not the average.
+                // Network outputs overshoot [0,1]; averaging raw floats and
+                // clamping once lets an out-of-range sample pull its
+                // neighbours, which is both wrong and a visible difference
+                // (22 LSB against the reference) rather than a rounding one.
+                let cv = clamp(v, 0.0, 1.0);
+                if (c == 0u) { rgb.x = rgb.x + cv; } else if (c == 1u) { rgb.y = rgb.y + cv; } else { rgb.z = rgb.z + cv; }
             }
         }
     }
