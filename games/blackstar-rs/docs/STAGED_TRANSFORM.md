@@ -83,7 +83,10 @@ now a matter of choosing numbers rather than writing machinery.
 
 **Rotation during a segment travels a chord.** The blend is per-vertex
 linear, so a piece that rotates as it moves cuts across the arc instead
-of following it. `fold_audit`'s excursion metric already measures exactly
+of following it. Measured on a fixture: a 90° swing passes at 0.707 of
+its radius at the midpoint, 29% inside the arc. Subdividing into 30°
+steps cuts that under 40%, which is the mitigation available without
+changing the blend. `fold_audit`'s excursion metric already measures exactly
 this and finds 8 of 254 chassis with a part leaving the body mid-fold,
 worst at t=0.50 — the midpoint, which is where a chord deviates most.
 **Stage 4.3 (rotate pieces) will hit this hard**, and the audit is
@@ -121,10 +124,15 @@ choice its shape, and it can be built before any shard physics exists.
    through the real `align::unify` + `Morph`. **All six stages are
    expressible today.** Five tests pin it.
 
-   What that fixture does NOT exercise: rotation within a segment. The
-   cubes translate and scale only, so the chord problem below is still
-   unmeasured on a staged strip. Adding a rotating part to the fixture is
-   the next cheap step.
+   Rotation is now covered too, and **measured**: a part swung 90° about
+   the body passes at 0.707 of its radius mid-segment — it cuts **29% of
+   its radius** inside the arc, straight through wherever the hull is.
+   That is the chord problem as a number rather than an inference, and it
+   is why `fold_audit` finds parts leaving the body worst at t=0.50.
+
+   The workaround available today needs no code: subdividing the swing
+   into 30° steps cuts the error to under 40% of the two-pose case. More
+   intermediate poses buy accuracy directly.
 3. **Watch stage 4.3 with `fold_audit --worst`.** Rotation is where the
    chord problem bites, and there is already a number for it.
 4. **Stage 5's visual language.** The geometry is authorable now; the

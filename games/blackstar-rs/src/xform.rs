@@ -1078,6 +1078,91 @@ mod staged_pipeline {
         assert!(stage_time(0.5, None) < 4.0 / 6.0);
     }
 
+    /// ROTATION TRAVELS A CHORD, measured on a fixture rather than
+    /// inferred from shipped assets.
+    ///
+    /// A part that swings 90 degrees about the body between two poses is
+    /// authored at two positions on a circle. The blend is per-vertex
+    /// linear, so it takes the straight line between them — cutting
+    /// across the inside of the arc, through wherever the body is.
+    ///
+    /// This is stage 4.3 ("rotate pieces") and it is why `fold_audit`
+    /// finds parts leaving the body worst at t=0.50: the midpoint is
+    /// where a chord deviates most from its arc.
+    #[test]
+    fn a_rotating_part_cuts_the_corner_by_a_predictable_amount() {
+        const R: f32 = 2.0;
+        // Same part, swung 90 degrees about Y: +X to +Z, radius R.
+        let a = cube(Vec3::new(R, 0.0, 0.0), 0.3);
+        let b = cube(Vec3::new(0.0, 0.0, R), 0.3);
+        // Built straight from poses rather than through `align::unify`,
+        // which declines a strip this small — the chord is a property of
+        // `Morph`'s blend, so the matcher is not part of the question.
+        let mut m = Morph::build(
+            vec![vec![a.verts.clone()], vec![b.verts.clone()]],
+            vec![a.idx.clone()],
+        )
+        .expect("two poses build");
+
+        let centre_at = |m: &mut Morph, t: f32| -> Vec3 {
+            let s = m.sample(0, t);
+            let sum = s.verts.iter().fold(Vec3::ZERO, |acc, v| acc + Vec3::from_array(v.pos));
+            sum / s.verts.len() as f32
+        };
+
+        let ends = centre_at(&mut m, 0.0).length();
+        let mid = centre_at(&mut m, 0.5).length();
+        // The chord midpoint of a quarter circle sits at cos(45) of the
+        // radius: 0.707. Anything following the arc would stay at 1.0.
+        assert!((ends - R).abs() < 1e-3, "endpoint radius {ends}");
+        assert!(
+            (mid / ends - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.02,
+            "expected the chord's 0.707 of radius, got {:.3}",
+            mid / ends
+        );
+        // Stated as the thing that matters: the part passes ~29% of its
+        // radius closer to the body than it should, which on a real
+        // chassis is the difference between swinging past the hull and
+        // through it.
+        let intrusion = (ends - mid) / ends;
+        assert!(intrusion > 0.28 && intrusion < 0.30, "intrusion {intrusion:.3}");
+    }
+
+    /// The same swing split across more poses shrinks the error, which is
+    /// the workaround available today without touching the blend.
+    #[test]
+    fn more_intermediate_poses_reduce_the_chord_error() {
+        const R: f32 = 2.0;
+        let at = |deg: f32| {
+            let r = deg.to_radians();
+            cube(Vec3::new(R * r.cos(), 0.0, R * r.sin()), 0.3)
+        };
+        let build = |degs: &[f32]| -> Morph {
+            let prims: Vec<RawPrim> = degs.iter().map(|d| at(*d)).collect();
+            let idx = vec![prims[0].idx.clone()];
+            Morph::build(prims.iter().map(|p| vec![p.verts.clone()]).collect(), idx).unwrap()
+        };
+        let coarse = build(&[0.0, 90.0]);
+        let fine = build(&[0.0, 30.0, 60.0, 90.0]);
+
+        let worst = |m: &mut Morph| -> f32 {
+            let mut w = 0.0f32;
+            for i in 0..=40 {
+                let t = i as f32 / 40.0;
+                let s = m.sample(0, t);
+                let c = s.verts.iter().fold(Vec3::ZERO, |a, v| a + Vec3::from_array(v.pos))
+                    / s.verts.len() as f32;
+                w = w.max((R - c.length()) / R);
+            }
+            w
+        };
+
+        let (mut coarse, mut fine) = (coarse, fine);
+        let (wc, wf) = (worst(&mut coarse), worst(&mut fine));
+        assert!(wc > 0.28, "two poses should cut the corner badly: {wc:.3}");
+        assert!(wf < wc * 0.4, "subdividing should help: {wc:.3} -> {wf:.3}");
+    }
+
     #[test]
     fn an_arriving_panel_scales_in_rather_than_appearing() {
         let u = crate::align::unify(strip()).unwrap();
