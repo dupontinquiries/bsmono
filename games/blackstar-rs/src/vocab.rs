@@ -88,7 +88,7 @@ mod tests {
         // and friends, real files on disk naming a real game. Same category as
         // the decepticon tank below: shielded from the sweep, and the reason
         // this term can never reach zero.
-        ("Cybertron", 0),
+        ("Cybertron", 2),
         ("cybertron", 3),
         ("Cybertronian", 0),
         ("cybertronian", 0),
@@ -102,7 +102,12 @@ mod tests {
         // `the_inherited_contamination_is_counted_not_hidden`'s needles. An
         // occurrence that exists only to detect reintroduction is a FLOOR, not
         // debt. Going below it means a guard was deleted.
-        ("Optimus", 1),
+        // 6 rather than 1: five are CITATIONS in grandeur.rs, a table of
+        // measurements from real reference material where the label identifies
+        // the source. A sweep renamed them once and turned a published 28 ft
+        // production figure into a false attribution to a fictional character.
+        // Floors, like AllSpark.
+        ("Optimus", 6),
         ("optimus", 1),
         ("Megatron", 1),
         ("megatron", 1),
@@ -151,7 +156,7 @@ mod tests {
         // decision — what the Enduring call the office — and `Hot Rod` is
         // Halyard before he inherits it, so those two are one decision.
         // 25 rather than 24: one is inside saga.rs's "Optimus Prime" needle.
-        ("Prime", 25),
+        ("Prime", 30),
         ("Hot Rod", 4),
         ("hot rod", 3),
         ("Matrix", 5),
@@ -165,7 +170,15 @@ mod tests {
         // `xform.rs`, not in-fiction vocabulary — both explain why the
         // displacement-field fold is shaped as it is. Counted so a
         // well-meaning sweep that deletes them fails and reads this.
-        ("AllSpark", 2),
+        // 3, not 2. The third is in grandeur.rs's new header, which explains
+        // the keep-citations policy BY NAMING the exemplar. This is the same
+        // phenomenon as the guard floors and it has now appeared four times in
+        // this cleanup: WRITING ABOUT A MARK CREATES AN OCCURRENCE OF IT. The
+        // census cannot distinguish a use from a mention, so every policy note
+        // raises a floor. That is acceptable — the alternative is policy that
+        // cannot name what it is about — but it means a count going up by one
+        // after a documentation commit is expected, not alarming.
+        ("AllSpark", 3),
     ];
 
     /// This file names every term it counts, so counting itself would double
