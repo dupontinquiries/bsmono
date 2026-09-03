@@ -212,6 +212,7 @@ they differ only in how they spend registers and address arithmetic:
 | rt2 | 896 | 2×2 px × 4 ch |
 | rt2c8 | 977–988 | 2×2 px × 8 ch — channel axis |
 | **rt2f** | **1022** | rt2 + branch-duplicated interior fast path |
+| rt2f (SRVGG, tile 1024) | 1403 | the compact net reaches 2.8 TFLOPS, ~21% of peak |
 | rt2c8f | 803 | both of the above — the duplication spills |
 | rt2c16f | 495 | 2×2 px × 16 ch — eight copies of the block |
 

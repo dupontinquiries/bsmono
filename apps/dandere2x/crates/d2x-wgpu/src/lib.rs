@@ -274,7 +274,7 @@ pub fn fit_tile_budget(net: &Network, requested: u32, max_storage_binding: u64, 
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct ConvParams {
     in_w: u32,
     in_h: u32,
@@ -352,6 +352,11 @@ enum OpWeights {
 struct ActSet {
     bufs: Vec<wgpu::Buffer>,
     steps: Vec<Step>,
+    /// Last params written per step. Balanced tiling gives every tile of a
+    /// frame identical dimensions, so after the first tile every one of these
+    /// ~398 `write_buffer` calls is redundant. This is logscope's
+    /// dims-uniform cache (`640c5fa` in ENGINE_PERF_STATUS) one level up.
+    conv_cache: Vec<Option<ConvParams>>,
     pack_params: wgpu::Buffer,
     pack_bind: wgpu::BindGroup,
     out: wgpu::Buffer,
@@ -667,7 +672,7 @@ impl WgpuUpscaler {
                     wgpu::BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
                 ],
             });
-            sets.push(ActSet { bufs, steps, pack_params, pack_bind, out, staging });
+            sets.push(ActSet { conv_cache: vec![None; steps.len()], bufs, steps, pack_params, pack_bind, out, staging });
         }
         let set_bytes_total = set_bytes(&net, tile as u64) * inflight as u64;
         Ok(WgpuUpscaler { ctx, net, tile, inflight, kernel: opts.kernel, conv_pipeline, deconv_pipeline, add_pipeline, pack_pipeline, sets, _weights: weights, set_bytes_total })
@@ -675,9 +680,9 @@ impl WgpuUpscaler {
 
     /// Encode and submit one tile on activation set `si`; returns the
     /// submission to wait for and the packed output byte count.
-    fn submit_tile(&self, si: usize, input: &Tensor) -> anyhow::Result<(wgpu::SubmissionIndex, u64)> {
-        let net = &self.net;
-        let set = &self.sets[si];
+    fn submit_tile(&mut self, si: usize, input: &Tensor) -> anyhow::Result<(wgpu::SubmissionIndex, u64)> {
+        let net = self.net.clone();
+        let set = &mut self.sets[si];
         let (device, queue) = (&self.ctx.device, &self.ctx.queue);
         anyhow::ensure!(input.c == net.bufs[net.input].channels, "input channels");
         queue.write_buffer(&set.bufs[net.input], 0, bytemuck::cast_slice(&input.data));
@@ -685,7 +690,8 @@ impl WgpuUpscaler {
         let mut dims: Vec<Option<(u32, u32)>> = vec![None; net.bufs.len()];
         dims[net.input] = Some((input.h as u32, input.w as u32));
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tile") });
-        for step in &set.steps {
+        let (steps, conv_cache) = (&set.steps, &mut set.conv_cache);
+        for (step_i, step) in steps.iter().enumerate() {
             match step {
                 Step::Conv { op, params, bind } => {
                     let Op::Conv(c) = &net.ops[*op] else { unreachable!() };
@@ -699,7 +705,11 @@ impl WgpuUpscaler {
                         Act::PReLU => (2, 0.0),
                     };
                     let (has_res, res_scale) = c.residual.map_or((0, 0.0), |(_, s)| (1, s));
-                    queue.write_buffer(params, 0, bytemuck::bytes_of(&ConvParams { in_w: iw, in_h: ih, in_ch: c.src_ch as u32, out_ch4: c.out_ch.div_ceil(4) as u32, out_w: ow, out_h: oh, in_scale: c.in_scale, pad: c.pad, dst_off: c.dst_off as u32, act, has_res, _p0: 0, slope, res_scale, _p1: 0.0, _p2: 0.0 }));
+                    let cp = ConvParams { in_w: iw, in_h: ih, in_ch: c.src_ch as u32, out_ch4: c.out_ch.div_ceil(4) as u32, out_w: ow, out_h: oh, in_scale: c.in_scale, pad: c.pad, dst_off: c.dst_off as u32, act, has_res, _p0: 0, slope, res_scale, _p1: 0.0, _p2: 0.0 };
+                    if conv_cache[step_i] != Some(cp) {
+                        queue.write_buffer(params, 0, bytemuck::bytes_of(&cp));
+                        conv_cache[step_i] = Some(cp);
+                    }
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(&c.name), timestamp_writes: None });
                     pass.set_pipeline(&self.conv_pipeline);
                     pass.set_bind_group(0, bind, &[]);

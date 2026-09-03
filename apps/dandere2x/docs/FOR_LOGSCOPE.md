@@ -97,15 +97,30 @@ fusion the right lever there instead.
 Reading ENGINE_PERF_STATUS caught two mistakes in the dandere2x runner that
 are still open, recorded here so the debt is visible:
 
-- **dims-uniform cache (`640c5fa`).** dandere2x creates its ~398 params
-  uniforms once, but rewrites all of them on *every tile* — and with balanced
-  tiling every tile has identical dims. Same mistake, one level up.
-- **submit granularity.** One submit and one wait per tile, where the whole
-  frame's tiles could go in one encoder ("K steps in one submit").
+- **dims-uniform cache (`640c5fa`).** dandere2x created its ~398 params
+  uniforms once but rewrote all of them on *every tile*, when balanced tiling
+  gives every tile identical dims. Same mistake, one level up; now fixed the
+  same way (`ActSet::conv_cache`), so after the first tile the writes are
+  skipped.
+- **submit granularity.** Still one submit and one wait per tile.
 
-Neither is fixed yet. At ~2.5 s per tile they are small here, but they will
-matter for the compact model, where a tile is ~665 ms and 398 dispatches of
-per-dispatch overhead is a larger fraction.
+### Why "K steps in one submit" is harder here than it looks
+
+The obvious version — encode every tile of a frame into one command encoder
+and wait once — is blocked by a `wgpu` ordering rule worth knowing before
+attempting the N×K locked pool: **`queue.write_buffer` writes all land before
+any command in that submit**, not interleaved at their call site. Uploading
+tile 2's input would therefore clobber tile 1's input before tile 1's passes
+run. Compute passes within one encoder *are* correctly ordered against each
+other (wgpu inserts the barriers), so the activation buffers themselves are
+not the obstacle — the uploads are.
+
+The fix is to stop uploading per tile: keep the whole padded frame resident
+in one buffer, add a small extract pass that copies a tile's region into the
+activation input *inside* the encoder, and give each tile a distinct offset
+in a frame-sized staging buffer (a 4K RGBA frame is only ~33 MB). Then one
+upload, one submit, one wait, one map per frame regardless of tile count.
+That is the design; it is not built.
 
 ## 6. Small facts that cost time to learn
 
