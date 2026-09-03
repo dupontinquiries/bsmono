@@ -777,6 +777,23 @@ pub const PALETTE_ROWS_MAX: usize = 200;
 /// a bare stack with nothing bounding it and a Ui does not scroll, it clips.
 pub const PALETTE_LIST_H: f32 = 360.0;
 
+/// How tall the palette's result list should be for `rows` results.
+///
+/// A function of the ROW COUNT, which is the whole point. A ScrollArea given
+/// only a `max_height` inside an auto-sizing Area takes whatever height it is
+/// offered, and what it is offered depends on what the Area measured last
+/// frame — so the box shrinks on a narrow result set and has no way to grow
+/// back. Deriving the height from the results instead breaks that loop.
+///
+/// Padded a little per row for the frame's inner margin, and floored at one
+/// row so an empty list is a thin strip rather than nothing at all — a
+/// zero-height scroll area is indistinguishable from a palette that failed to
+/// open.
+pub fn palette_list_h(ui: &egui::Ui, rows: usize) -> f32 {
+    let row = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+    (row * rows.max(1) as f32).min(PALETTE_LIST_H)
+}
+
 /// The strip: a palette button that opens on tap-and-hold, then recents
 /// and pinned quick actions.
 ///
@@ -1042,9 +1059,11 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                             let shown = items.len().min(PALETTE_ROWS_MAX);
                             if up {
                                 p.selected = p.selected.saturating_sub(1);
+                                p.follow_selection = true;
                             }
                             if down && shown > 0 {
                                 p.selected = (p.selected + 1).min(shown - 1);
+                                p.follow_selection = true;
                             }
                             // A SCROLL AREA. There was none, and the list was
                             // capped at ten — so on a phone, where there is no
@@ -1056,7 +1075,22 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                             // rows fit.
                             egui::ScrollArea::vertical()
                                 .id_salt("palette_commands")
-                                .max_height(PALETTE_LIST_H)
+                                // HEIGHT FROM THE CONTENT, capped — not `max_height` alone.
+                                //
+                                // The palette lives in an auto-sizing Area, so a ScrollArea
+                                // asked only for a MAXIMUM takes whatever height it is
+                                // offered, which in an Area that sizes to its content is
+                                // whatever the last frame happened to be. That latches: the
+                                // box shrinks on a narrow result set and never grows back
+                                // when the results do. Reported as "the window height also
+                                // shrinks and never grows even with ample elements".
+                                //
+                                // Asking for an exact height computed from the row count
+                                // breaks the loop: the size is a function of the results,
+                                // not of the previous size.
+                                .min_scrolled_height(palette_list_h(ui, shown))
+                                .max_height(palette_list_h(ui, shown))
+                                .auto_shrink([false, false])
                                 .show(ui, |ui| {
                             for (i, (label, _)) in items.iter().take(shown).enumerate() {
                                 let selected = i == p.selected;
@@ -1074,7 +1108,11 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 // keyboard's selection has to drag the view
                                 // with it — otherwise ↓ walks the highlight off
                                 // the bottom and the palette appears frozen.
-                                if selected {
+                                // ONLY when the keyboard moved it. Following the
+                                // selection every frame fights a touch drag:
+                                // the list scrolls under the finger and snaps
+                                // home the moment it lifts.
+                                if selected && p.follow_selection {
                                     resp.scroll_to_me(None);
                                 }
                                 if resp.clicked() {
@@ -1105,9 +1143,11 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 );
                                 if up {
                                     p.selected = p.selected.saturating_sub(1);
+                                    p.follow_selection = true;
                                 }
                                 if down {
                                     p.selected = (p.selected + 1).min(ranked.len() - 1);
+                                    p.follow_selection = true;
                                 }
                                 // Same scroll area, same reason — and here the
                                 // ten-row cap was the whole of "C-o doesn't add
@@ -1116,7 +1156,22 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 // always took a limit; it was being handed 10.
                                 egui::ScrollArea::vertical()
                                     .id_salt("palette_open_file")
-                                    .max_height(PALETTE_LIST_H)
+                                    // HEIGHT FROM THE CONTENT, capped — not `max_height` alone.
+                                    //
+                                    // The palette lives in an auto-sizing Area, so a ScrollArea
+                                    // asked only for a MAXIMUM takes whatever height it is
+                                    // offered, which in an Area that sizes to its content is
+                                    // whatever the last frame happened to be. That latches: the
+                                    // box shrinks on a narrow result set and never grows back
+                                    // when the results do. Reported as "the window height also
+                                    // shrinks and never grows even with ample elements".
+                                    //
+                                    // Asking for an exact height computed from the row count
+                                    // breaks the loop: the size is a function of the results,
+                                    // not of the previous size.
+                                    .min_scrolled_height(palette_list_h(ui, ranked.len()))
+                                    .max_height(palette_list_h(ui, ranked.len()))
+                                    .auto_shrink([false, false])
                                     .show(ui, |ui| {
                                 for (i, (full, rel)) in ranked.iter().enumerate() {
                                     let selected = i == p.selected;
@@ -1130,7 +1185,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                         })
                                         .response
                                         .interact(Sense::click());
-                                    if selected {
+                                    if selected && p.follow_selection {
                                         resp.scroll_to_me(None);
                                     }
                                     if resp.clicked() {
@@ -1332,6 +1387,14 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                     }
                 });
         });
+
+    // One frame of follow, then off. Set by the arrow handling above and
+    // cleared here, after the list has been drawn and had its chance to call
+    // `scroll_to_me` — so the view chases the keyboard exactly once per press
+    // and never on a frame the user is dragging.
+    if let Some(p) = state.palette.as_mut() {
+        p.follow_selection = false;
+    }
 
     if let Some(instruction) = submit_edit {
         state.request_edit(&instruction, now_ms);

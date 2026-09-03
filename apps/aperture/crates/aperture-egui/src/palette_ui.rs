@@ -34,6 +34,19 @@ pub struct PaletteState {
     pub mode: Mode,
     pub input: String,
     pub selected: usize,
+    /// Whether `selected` moved on THIS frame, i.e. by the keyboard.
+    ///
+    /// The list has to follow the arrow keys, and it must NOT follow anything
+    /// else. Calling `scroll_to_me` on the selected row unconditionally — which
+    /// is the obvious way to write it, and how it was written — drags the view
+    /// back to the selection on every frame, so a touch drag scrolls and then
+    /// snaps home the instant the finger lifts. Reported exactly that way: "the
+    /// swipe to scroll works but the focus element staying on 1 fights back to
+    /// the top once the gesture stops".
+    ///
+    /// Set by the arrow handling and cleared after the list is drawn, so it is
+    /// true for precisely the frame that needs it.
+    pub follow_selection: bool,
     /// Ctrl+O's and Ctrl+Shift+F's shared candidate pool: walked ONCE on
     /// entering the mode (not per-keystroke — a repo walk is cheap once,
     /// wasteful sixty times a second while typing), then fuzzy-ranked or
@@ -51,32 +64,32 @@ pub struct PaletteState {
 
 impl PaletteState {
     pub fn commands() -> Self {
-        PaletteState { mode: Mode::Commands, input: String::new(), selected: 0, focus_placed: false, root: std::path::PathBuf::new(), files: Vec::new(), symbols: Vec::new() }
+        PaletteState { mode: Mode::Commands, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root: std::path::PathBuf::new(), files: Vec::new(), symbols: Vec::new() }
     }
     pub fn open_file(root: std::path::PathBuf, files: Vec<std::path::PathBuf>) -> Self {
-        PaletteState { mode: Mode::OpenFile, input: String::new(), selected: 0, focus_placed: false, root, files, symbols: Vec::new() }
+        PaletteState { mode: Mode::OpenFile, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root, files, symbols: Vec::new() }
     }
     pub fn project_search(root: std::path::PathBuf, files: Vec<std::path::PathBuf>) -> Self {
-        PaletteState { mode: Mode::ProjectSearch, input: String::new(), selected: 0, focus_placed: false, root, files, symbols: Vec::new() }
+        PaletteState { mode: Mode::ProjectSearch, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root, files, symbols: Vec::new() }
     }
     pub fn workspace_symbol(root: std::path::PathBuf, files: Vec<std::path::PathBuf>) -> Self {
         // Capped at 1500 files, well past the walk cap's typical hit rate
         // for a Rust-only index in a mixed-language monorepo, but still a
         // real bound — see workspace_symbols::index_files's own doc.
         let symbols = aperture_core::workspace_symbols::index_files(&root, &files, 1500);
-        PaletteState { mode: Mode::WorkspaceSymbol, input: String::new(), selected: 0, focus_placed: false, root, files, symbols }
+        PaletteState { mode: Mode::WorkspaceSymbol, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root, files, symbols }
     }
     pub fn go_to_route(root: std::path::PathBuf, files: Vec<std::path::PathBuf>) -> Self {
         // Same symbol index workspace_symbol builds — route::candidates
         // scores against it too, so there's no reason to index twice.
         let symbols = aperture_core::workspace_symbols::index_files(&root, &files, 1500);
-        PaletteState { mode: Mode::GoToRoute, input: String::new(), selected: 0, focus_placed: false, root, files, symbols }
+        PaletteState { mode: Mode::GoToRoute, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root, files, symbols }
     }
     /// A plain text-entry mode: the typed line IS the instruction, sent to
     /// `AppState::request_edit` on Enter. No candidate list, so `root`/
     /// `files`/`symbols` stay empty — nothing in this mode reads them.
     pub fn ai_edit_prompt() -> Self {
-        PaletteState { mode: Mode::AiEditPrompt, input: String::new(), selected: 0, focus_placed: false, root: std::path::PathBuf::new(), files: Vec::new(), symbols: Vec::new() }
+        PaletteState { mode: Mode::AiEditPrompt, input: String::new(), selected: 0, follow_selection: false, focus_placed: false, root: std::path::PathBuf::new(), files: Vec::new(), symbols: Vec::new() }
     }
 }
 
