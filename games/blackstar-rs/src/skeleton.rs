@@ -513,11 +513,22 @@ pub fn compact(sk: &Skeleton, prim_count: usize, factor: f32) -> Vec<Vec3> {
 /// because these skeletons are DERIVED from arbitrary meshes and nobody
 /// is there to author one.
 pub fn fold_rotation(limb: &Limb, up: Vec3, t: f32) -> Quat {
+    // NON-FINITE GEOMETRY IS A LIMB WITH NOTHING TO SWING, not a crash.
+    //
+    // These skeletons come from arbitrary third-party meshes, and a NaN
+    // vertex reaching here used to PANIC — `min_by` below compares
+    // `dir.dot(axis)` with `partial_cmp().unwrap()`, and NaN compares to
+    // nothing, so the unwrap fires. A corrupt model should cost one limb,
+    // not the process.
     let reach = limb.tip - limb.root;
     let len = reach.length();
-    if len < 1e-4 {
+    if !len.is_finite() || len < 1e-4 {
         return Quat::IDENTITY; // a limb with no extent has nothing to swing
     }
+    // A NaN `t` produced a NaN quaternion, which does not fold a limb
+    // wrong — it deletes it, because every point it transforms becomes
+    // NaN. Unfolded is the safe reading of "no usable amount".
+    let t = if t.is_finite() { t } else { 0.0 };
     let dir = reach / len;
     let up = up.normalize_or(Vec3::Y);
     // The axis is perpendicular to the limb AND TO WHERE IT IS GOING, not
@@ -537,7 +548,14 @@ pub fn fold_rotation(limb: &Limb, up: Vec3, t: f32) -> Quat {
         .iter()
         .copied()
         .filter(|c| c.dot(up).abs() < 0.9) // not the up axis: stow flat, not vertical
-        .min_by(|a, b| dir.dot(*a).abs().partial_cmp(&dir.dot(*b).abs()).unwrap())
+        // `unwrap` here was the panic path above; total ordering keeps it
+        // total even if a NaN ever reaches this point by another route.
+        .min_by(|a, b| {
+            dir.dot(*a)
+                .abs()
+                .partial_cmp(&dir.dot(*b).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .unwrap_or(Vec3::Z);
     let axis = {
         let c = dir.cross(along);
@@ -996,6 +1014,53 @@ mod role_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// `fold_rotation` runs on skeletons derived from arbitrary
+    /// third-party meshes, so it meets geometry nobody authored.
+    #[test]
+    fn a_non_finite_limb_costs_one_limb_not_the_process() {
+        // This PANICKED: `min_by` compares `dir.dot(axis)` through
+        // `partial_cmp().unwrap()`, and NaN compares to nothing.
+        let bad = Limb {
+            prims: vec![0],
+            root: Vec3::ZERO,
+            tip: Vec3::splat(f32::NAN),
+            reach: f32::NAN,
+        };
+        let q = fold_rotation(&bad, Vec3::Y, 1.0);
+        assert_eq!(q, Quat::IDENTITY, "a limb with no usable extent stays put");
+    }
+
+    #[test]
+    fn a_non_finite_fold_amount_leaves_the_limb_unfolded() {
+        // A NaN quaternion does not fold a limb wrong, it deletes it:
+        // every point it transforms becomes NaN.
+        let l = Limb {
+            prims: vec![0],
+            root: Vec3::ZERO,
+            tip: Vec3::new(5.0, 0.0, 0.0),
+            reach: 5.0,
+        };
+        for t in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let q = fold_rotation(&l, Vec3::Y, t);
+            assert!(q.is_finite(), "NaN quaternion from t={t}");
+        }
+        assert_eq!(fold_rotation(&l, Vec3::Y, f32::NAN), Quat::IDENTITY);
+    }
+
+    #[test]
+    fn a_non_finite_point_does_not_spread_through_fold_point() {
+        // fold_point is the caller-side half; a bad limb must not turn a
+        // good point into NaN.
+        let bad = Limb {
+            prims: vec![0],
+            root: Vec3::ZERO,
+            tip: Vec3::splat(f32::NAN),
+            reach: f32::NAN,
+        };
+        let p = fold_point(Vec3::new(1.0, 2.0, 3.0), &bad, Vec3::Y, 1.0);
+        assert!(p.is_finite(), "a bad limb leaked NaN into a good point: {p:?}");
+    }
     use super::*;
 
     fn blob(c: Vec3, r: Vec3, n: usize) -> Vec<Vec3> {
@@ -1345,3 +1410,4 @@ mod tests {
         assert!(sk.limbs.len() < 6, "every link stayed its own limb: {}", sk.report());
     }
 }
+
