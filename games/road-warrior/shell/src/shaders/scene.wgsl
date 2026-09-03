@@ -228,10 +228,24 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // there's no real depth/perspective here, just a linear proxy for it.
     if (u.boss_present > 0.5) {
         let boss_distance_scale = 0.025;
-        let boss_screen = vec2<f32>(car_screen.x + u.boss_relative_x * boss_distance_scale, horizon - 0.09);
+        let boss_x = car_screen.x + u.boss_relative_x * boss_distance_scale;
+        // STANDS ON THE TERRAIN, not at a fixed height. This was
+        // `horizon - 0.09`, which was correct while the ground was a flat
+        // line and became wrong the moment the ground followed the
+        // heightfield — the boss floated over dips and sank into rises.
+        // Its feet go on the surface under its own column.
         let boss_half_size = vec2<f32>(0.05, 0.07); // bigger than the car -- reads as a threat
+        let boss_ground = base_line + ground_height(boss_x) * v_scale;
+        let boss_screen = vec2<f32>(boss_x, boss_ground + boss_half_size.y);
         let boss_rel = uv - boss_screen;
-        if (abs(boss_rel.x) < boss_half_size.x && abs(boss_rel.y) < boss_half_size.y) {
+        // Silhouette rather than a bare rectangle: a wide chassis with a
+        // raised superstructure, so it reads as a machine at a glance and
+        // not as a UI element that wandered into the scene. Still blocky —
+        // this matches the car's own deliberately simple shape.
+        let b = abs(boss_rel);
+        let in_chassis = b.x < boss_half_size.x && boss_rel.y > -boss_half_size.y && boss_rel.y < 0.0;
+        let in_tower = b.x < boss_half_size.x * 0.55 && boss_rel.y >= 0.0 && boss_rel.y < boss_half_size.y;
+        if (in_chassis || in_tower) {
             if (u.boss_telegraphing > 0.5) {
                 // Flash between near-white and a saturated amber, not red —
                 // confirmed via an actual screenshot that a red/near-white
