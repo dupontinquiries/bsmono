@@ -78,19 +78,19 @@ pub static FILM_01_DOOMSDAY: FilmEntry = FilmEntry {
     trilogy: 1,
     position: 1,
     title: "TRANSFORMERS: DOOMSDAY",
-    premise: "The Unending awakens beneath Earth; Hot Rod becomes Halyard Prime; Cleave sacrifices himself.",
+    premise: "The Unending awakens beneath Earth; Jib becomes Halyard; Cleave sacrifices himself.",
     acts: [
         "The awakening: the Unending's gravity well begins pulling down satellites. Keelwright realizes this is \
          not Sundered war—it is something older. Halyard (young, reckless, stationbound) receives the \
          call to action.",
-        "The descent: Halyard enters the Unending's interior through a volcanic fissure. He saves Keelwright. In \
-         doing so, he triggers the Matrix transformation and becomes Halyard Prime.",
-        "The core: Humans sheltering in a Machine bunker. Halyard channels the Matrix into the Unending's \
+        "The descent: Jib enters the Unending's interior through a volcanic fissure. He saves Keelwright. In \
+         doing so, he triggers the Charge transformation and becomes Halyard.",
+        "The core: Humans sheltering in a Machine bunker. Halyard channels the Charge into the Unending's \
          spark, placing the god in dormancy. Earth stabilizes. Cleave dies holding back collapsing plates."
     ],
     emotional_core: "The passing of power from Keelwright (age, wisdom, price of leadership) to Halyard \
         (youth, instinct, burden of myth). Cleave's death as the only redemption available to him.",
-    introduces: &["Halyard Prime", "The Unending (dormant)", "Aiden (human witness)", "The Pluto Defense Ring"],
+    introduces: &["Halyard", "The Unending (dormant)", "Aiden (human witness)", "The Pluto Defense Ring"],
     resolves: &["Earth's immediate extinction risk"],
     unresolved: &[
         "Is the Unending truly dormant or just sleeping?",
@@ -483,12 +483,12 @@ pub struct CharacterArc {
 }
 
 pub static RODIMUS_PRIME_ARC: CharacterArc = CharacterArc {
-    name: "Halyard Prime",
+    name: "Halyard",
     introduction_film: 1,
     arc_complete_film: 9,
-    codex_entry_id: "halyard_prime",
+    codex_entry_id: "halyard_keelwright",
     key_moments: &[
-        "Film 1: Hot Rod enters the Unending's interior, gains the Matrix, becomes Halyard Prime",
+        "Film 1: Jib enters the Unending's interior, gains the Charge, becomes Halyard",
         "Film 2: First major leadership test—extending Pluto defense ring",
         "Film 3: Learns to trust Blackstar while suspecting his motives",
         "Films 4–6: Leads exploration beyond the shield; encounters the Clone coalition",
@@ -572,9 +572,9 @@ pub fn roster_changes_for_film(film_number: u32) -> Vec<RosterChange> {
         1 => vec![
             RosterChange {
                 faction: "Enduring",
-                name: "Halyard Prime",
-                form_or_type: "Matrix Bearer",
-                status: "introduced (from Hot Rod)",
+                name: "Halyard",
+                form_or_type: "Charge Bearer",
+                status: "introduced (from Jib)",
             },
             RosterChange {
                 faction: "Sundered",

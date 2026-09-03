@@ -634,7 +634,7 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
                     };
                     // WHO IS IN IT. The row said what the mission is and who
                     // opposes you, never who is present with you — so a beat
-                    // that turns on playing as Prime and watching Cleave go
+                    // that turns on playing as Keelwright and watching Cleave go
                     // read as an anonymous errand until you were in it.
                     let cast: Vec<String> = m
                         .cast

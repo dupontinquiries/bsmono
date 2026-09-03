@@ -48,7 +48,7 @@ pub struct Castable {
     pub written_out_by: Option<&'static str>,
     /// The strongest presence a GENERATED raid may give them. Authored
     /// missions are unconstrained; a forged one should not be handing out
-    /// playable Primes.
+    /// playable Keelwrights.
     pub ceiling: Presence,
 }
 
@@ -239,13 +239,13 @@ mod tests {
     #[test]
     fn presence_has_a_ceiling_and_a_budget() {
         // Two different limits, and both are needed. A ceiling stops a forge
-        // handing out playable Primes; a budget stops it casting everyone
+        // handing out playable Keelwrights; a budget stops it casting everyone
         // available every single time, which is what makes presence stop
         // meaning anything.
         let late = log(&["the_pluto_line", "the_drowned_approach", "the_far_gate", "the_tide_forges"]);
         assert!(available(&late).len() >= 3, "not enough cast to test a budget");
 
-        assert_eq!(castable("keelwright", &late), Some(Presence::Seen), "Prime is not playable in a forge");
+        assert_eq!(castable("keelwright", &late), Some(Presence::Seen), "Keelwright is not playable in a forge");
         assert!(
             !matches!(castable("keelwright", &late), Some(Presence::Playable)),
             "a generated raid can cast a playable lead"

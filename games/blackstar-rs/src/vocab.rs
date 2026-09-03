@@ -156,10 +156,16 @@ mod tests {
         // decision — what the Enduring call the office — and `Hot Rod` is
         // Halyard before he inherits it, so those two are one decision.
         // 25 rather than 24: one is inside saga.rs's "Optimus Prime" needle.
-        ("Prime", 30),
-        ("Hot Rod", 4),
-        ("hot rod", 3),
-        ("Matrix", 5),
+        // Prime was a TITLE as well as a name. The office is now "the Keel"
+        // and the inheritance is a NAME CHANGE -- Jib becomes Halyard -- so
+        // the title stopped being needed in the prose at all. The residue is
+        // grandeur.rs's citations plus policy notes.
+        ("Prime", 8),
+        ("Hot Rod", 0),
+        ("hot rod", 0),
+        // Matrix of Leadership -> the Charge: what you are charged with, and
+        // a word a machine culture would already own.
+        ("Matrix", 0),
         // NOT counted: lowercase `prime` and `matrix`. Both have honest
         // non-licensed uses here — `prime` is a Troop id and a player class,
         // `matrix` is linear algebra in a 3D engine — so a raw count would be
@@ -180,6 +186,26 @@ mod tests {
         // after a documentation commit is expected, not alarming.
         ("AllSpark", 3),
     ];
+
+    /// Files a vocabulary sweep MUST NOT touch, and why.
+    ///
+    /// Every entry here has been damaged by a sweep at least once. They are
+    /// listed rather than remembered because remembering has failed five times
+    /// in one cleanup.
+    ///
+    /// * `saga.rs` — two guards name the licensed words as DATA (a banned-word
+    ///   list and a contamination counter). A sweep rewrites the needles, and
+    ///   the counter then reports the REPLACEMENT names as contamination,
+    ///   which reads exactly like a reintroduction. Caught five times.
+    /// * `grandeur.rs` — a citation table of measurements from real reference
+    ///   material, where the label identifies the source. Renaming it
+    ///   attributed a published 28 ft production figure to a fictional
+    ///   character.
+    /// * `vocab.rs` — this file.
+    ///
+    /// `no_sweep_has_eaten_a_guard` below fails if the needles ever stop being
+    /// the licensed words, which is the mechanical version of this warning.
+    pub const DO_NOT_SWEEP: &[&str] = &["saga.rs", "grandeur.rs", "vocab.rs"];
 
     /// This file names every term it counts, so counting itself would double
     /// every number and make the census meaningless.
@@ -275,6 +301,30 @@ mod tests {
             }
         }
         assert!(hits.is_empty(), "untracked licensed vocabulary appeared:\n  {}", hits.join("\n  "));
+    }
+
+
+    #[test]
+    fn no_sweep_has_eaten_a_guard() {
+        // The recurring failure, mechanised. Five separate times in this
+        // cleanup a blanket rename rewrote the needles inside saga.rs's own
+        // guards, turning a licensed-mark detector into a detector of the
+        // replacement names. Every time, the symptom was a count going UP and
+        // looking like a reintroduction.
+        //
+        // A guard has to contain the word it guards against. So: assert it
+        // still does.
+        let saga = fs::read_to_string("src/saga.rs").expect("saga.rs");
+        for needle in ["\"optimus prime\"", "\"megatron\"", "\"autobot\"", "\"decepticon\""] {
+            assert!(
+                saga.contains(needle),
+                "saga.rs's banned-word list no longer contains {needle} — a sweep \
+                 probably renamed the needle. See DO_NOT_SWEEP."
+            );
+        }
+        for needle in ["count(\"Autobot\")", "count(\"Decepticon\")", "count(\"Megatron\")"] {
+            assert!(saga.contains(needle), "saga.rs's contamination counter lost {needle}");
+        }
     }
 
     #[test]

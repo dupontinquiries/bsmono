@@ -3814,7 +3814,7 @@ impl World {
             route_shapes.push(Vec::new());
         }
         let mut w = World { nrm_cache: std::cell::Cell::new((Vec3::ZERO, Vec3::ZERO)), sdf_calls: std::cell::Cell::new(0), grav, ggrid, gdim, gdyn, mgrid: Vec::new(), sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, parked: None, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, plazas, cover, obstacles, boulevard, origin, seed, t_amp: amp, t_freq: freq };
-        // prime the mover index so the very first frame is already fast
+        // keelwright the mover index so the very first frame is already fast
         w.rebuild_movers();
         w
     }
@@ -4174,9 +4174,9 @@ impl World {
 
     // ------------------------------------------------------------ SDF ----
     /// Bucket the movers by cell. Rebuilt every update because they travel,
-    /// and primed at generation so the very first frame is already fast.
+    /// and keelwrightd at generation so the very first frame is already fast.
     /// Bucket the movers by cell. Rebuilt every update because they travel,
-    /// and primed at generation so the very first frame is already fast.
+    /// and keelwrightd at generation so the very first frame is already fast.
     pub fn rebuild_movers(&mut self) {
         let cells = (self.gdim * self.gdim) as usize;
         if self.mgrid.len() != cells {

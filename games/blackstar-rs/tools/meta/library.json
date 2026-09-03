@@ -3885,7 +3885,7 @@
   "path": "./weapons/hammers/Halo Gravity Hammer.zip"
  },
  {
-  "raw": "transformers_fall_of_foundry_keelwright_prime-animated.zip",
+  "raw": "transformers_fall_of_foundry_keelwright_keelwright-animated.zip",
   "modes": [
    "robot"
   ],
@@ -3897,7 +3897,7 @@
   "note": null,
   "category": "bot",
   "dir": "bots",
-  "path": "./bots/transformers_fall_of_foundry_keelwright_prime-animated.zip"
+  "path": "./bots/transformers_fall_of_foundry_keelwright_keelwright-animated.zip"
  },
  {
   "raw": "transformers_fall_of_foundry_soldiers.zip",

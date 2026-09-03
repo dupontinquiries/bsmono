@@ -97,7 +97,7 @@ pub const TROOPS: &[Troop] = &[
     Troop { id: "reaver",      role: Role::PlayerClass, chassis: "raptor",     fire: Verb::Bank,   element: Element::Rock,     tint: [180, 165, 140], abilities: &["dash", "pulse"] , faction: patrol::Faction::Coalition },
     Troop { id: "warden",      role: Role::PlayerClass, chassis: "bruiser",    fire: Verb::Beam,   element: Element::Ice,      tint: [150, 185, 205], abilities: &["shield", "resonance"] , faction: patrol::Faction::Coalition },
     Troop { id: "pyre",        role: Role::PlayerClass, chassis: "angular",    fire: Verb::Flak,   element: Element::Fire,     tint: [220, 130, 70], abilities: &["overclock", "pulse"] , faction: patrol::Faction::Coalition },
-    Troop { id: "prime",       role: Role::PlayerClass, chassis: "sentinel",   fire: Verb::Shove,  element: Element::Water,    tint: [90, 140, 210], abilities: &["shield", "resonance"] , faction: patrol::Faction::Coalition },
+    Troop { id: "keelwright",       role: Role::PlayerClass, chassis: "sentinel",   fire: Verb::Shove,  element: Element::Water,    tint: [90, 140, 210], abilities: &["shield", "resonance"] , faction: patrol::Faction::Coalition },
     Troop { id: "scout",       role: Role::PlayerClass, chassis: "raptor",     fire: Verb::Pool,   element: Element::Vine,     tint: [120, 180, 120], abilities: &["hover", "dash"] , faction: patrol::Faction::Coalition },
     Troop { id: "siege",       role: Role::PlayerClass, chassis: "juggernaut", fire: Verb::Pool,   element: Element::Rock,     tint: [165, 150, 130], abilities: &["turret", "shield"] , faction: patrol::Faction::Coalition },
     // ---- hostiles: what patrol has been missing ----
@@ -239,7 +239,7 @@ mod tests {
 
         // names the cutscene prose actually uses, and the codex id they map to
         let spoken = [
-            ("prime", "keelwright"),
+            ("keelwright", "keelwright"),
             ("cleave", "cleave"),
             ("halyard", "halyard"),
             ("aiden", "aiden"),
@@ -283,7 +283,7 @@ mod tests {
         let deep = MISSIONS.iter().find(|m| m.id == "beneath_the_pacific").expect("pacific");
         assert!(
             truce.cast.contains(&("keelwright", Presence::Playable)),
-            "the airlock meeting is not played as Prime"
+            "the airlock meeting is not played as Keelwright"
         );
         assert!(
             deep.cast.contains(&("cleave", Presence::Seen)),
@@ -533,8 +533,8 @@ pub struct Mission {
     /// WHO IS THERE, and in what capacity.
     ///
     /// `champion` says who opposes you and there was nothing that said who is
-    /// PRESENT WITH you — so a mission whose prose turns on Prime meeting an
-    /// old enemy at an airlock had no way to record that Prime is in it. That
+    /// PRESENT WITH you — so a mission whose prose turns on Keelwright meeting an
+    /// old enemy at an airlock had no way to record that Keelwright is in it. That
     /// is the failure Destiny spent two expansions correcting: three named
     /// legends with enormous lore who stood still in a social space while the
     /// player did everything, until Forsaken put one of them in the mission
@@ -603,7 +603,7 @@ pub const MISSIONS: &[Mission] = &[
         ],
         outro: &[
             "the civilians are out. aiden is still at the fissure edge, shaking, staying.",
-            "prime hears it through spark, not sound. far away, something old turns toward earth.",
+            "keelwright hears it through spark, not sound. far away, something old turns toward earth.",
         ] },
     Mission { order: 5, id: "what_assay_grew", film: 2, dest: "earth", site: "the vault",
         objective: Objective::Eliminate, champion: None,
@@ -621,14 +621,14 @@ pub const MISSIONS: &[Mission] = &[
     Mission { order: 6, id: "the_mantle_dive", film: 2, dest: "earth", site: "the foundry",
         objective: Objective::Control, champion: None,
         cast: &[],
-        beat: "Hot Rod becomes Halyard",
+        beat: "Jib becomes Halyard",
         intro: &[
             "down the ruptured mantle: living-metal corridors, valence rivers, cathedral dark.",
-            "hot rod dives beside you -- reckless, loud, terrified of one thing: failing prime.",
+            "jib dives beside you -- reckless, loud, terrified of one thing: failing keelwright.",
             "hold the descent. the avatar is forming out of the magma, and it is looking at keelwright.",
         ],
         outro: &[
-            "unending impales prime. hot rod doesn't cause the fall this time -- he catches it.",
+            "unending impales keelwright. jib doesn't cause the fall this time -- he catches it.",
             "the matrix opens for the one who reached without wanting it. halyard rises, burning.",
         ] },
     Mission { order: 7, id: "the_drowned_approach", film: 2, dest: "earth", site: "the trench",
@@ -636,7 +636,7 @@ pub const MISSIONS: &[Mission] = &[
         cast: &[("halyard", Presence::Playable), ("keelwright", Presence::Named)],
         beat: "hold the descent as the Corrupted converge on the wound",
         intro: &[
-            "halyard leads now, and hates how the word sounds. prime recovers in the fleet above.",
+            "halyard leads now, and hates how the word sounds. keelwright recovers in the fleet above.",
             "below the pacific, the corrupted converge on a light that should not be down here.",
             "survive the descent past the vent spires. every one that reaches the rift feeds it.",
         ],
@@ -654,7 +654,7 @@ pub const MISSIONS: &[Mission] = &[
             "hold the picket while the line decides whether an old enemy can surrender UP.",
         ],
         outro: &[
-            "prime meets him at the airlock. no speech. two old soldiers, one war left.",
+            "keelwright meets him at the airlock. no speech. two old soldiers, one war left.",
             "the truce is not forgiveness. it is arithmetic. everyone does it silently.",
         ] },
     Mission { order: 9, id: "beneath_the_pacific", film: 3, dest: "foundry", site: "the gravity well",
@@ -668,7 +668,7 @@ pub const MISSIONS: &[Mission] = &[
         ],
         outro: &[
             "the avatar goes dark. the machine sleeps -- not dead, only denied. the plates settle.",
-            "they never find cleave. prime marks the spot anyway. the war's oldest debt, paid last.",
+            "they never find cleave. keelwright marks the spot anyway. the war's oldest debt, paid last.",
         ] },
     // ============ TRILOGY TWO — the inversion: wonder, scale, light ============
     Mission { order: 10, id: "the_far_gate", film: 4, dest: "uncharted", site: "the dig",
@@ -694,7 +694,7 @@ pub const MISSIONS: &[Mission] = &[
             "the corrupted have come to eat the archive. defend the memory of the dead. all of it.",
         ],
         outro: &[
-            "the archive stands. cryotek prime bows -- glacier-deep, centuries slow -- and opens the vault.",
+            "the archive stands. cryotek keelwright bows -- glacier-deep, centuries slow -- and opens the vault.",
             "inside: a build-record with a keyhole for a heart. the matrix is the key.",
         ] },
     Mission { order: 12, id: "the_tide_forges", film: 5, dest: "io", site: "the forge line",
@@ -745,7 +745,7 @@ pub const MISSIONS: &[Mission] = &[
         intro: &[
             "everyone comes: the fleet, the clans, the mourners, the perfected. even the ashes' king.",
             "witwicky flies the breach run he's rehearsed for twenty years. aiden calls it from the bunker.",
-            "cut a road to the spark chamber. halyard goes in alone -- the way prime once did for him.",
+            "cut a road to the spark chamber. halyard goes in alone -- the way keelwright once did for him.",
         ],
         outro: &[
             "the matrix pours into the heart. not destruction -- QUIET. the god-machine lies down.",

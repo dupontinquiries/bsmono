@@ -335,7 +335,7 @@ pub static CODEX: &[Entry] = &[
         lines: &[
             "it stood for millions of cycles, and mistook",
             "endurance for destiny. rule by restricted data tier;",
-            "only the prime-line held the oldest secret of all.",
+            "only the keelwright-line held the oldest secret of all.",
         ],
     },
     Entry {
@@ -365,7 +365,7 @@ pub static CODEX: &[Entry] = &[
         lines: &[
             "warm gold and noise and life -- pluto's opposite.",
             "beneath the crust, a metallic hand sinking, geological,",
-            "and the sealed truth the prime-line always carried.",
+            "and the sealed truth the keelwright-line always carried.",
         ],
     },
     Entry {
@@ -400,10 +400,10 @@ pub static CODEX: &[Entry] = &[
     },
     Entry {
         id: "hot_rod",
-        title: "hot rod",
+        title: "jib",
         claim: None,
         lines: &[
-            "a reckless young scout in earth orbit who idolizes prime.",
+            "a reckless young scout in earth orbit who idolizes keelwright.",
             "he dives the ruptured mantle, and at the worst moment",
             "takes up the matrix -- and rises out of it as halyard.",
         ],
