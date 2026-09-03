@@ -31,6 +31,7 @@ Probing each module took a couple of minutes.
 | `partdetect.rs` | clean |
 | `model.rs` (orientation search) | clean |
 | `meshgen.rs` | `bake` half-poisoned a mesh; `cbox` clamped a NaN |
+| `align.rs` | a vertex-less prim tripped a `debug_assert!` — and was silent in release |
 
 The panic is the only crash. The rest are quieter and, for a renderer,
 mostly worse to diagnose:
@@ -126,9 +127,29 @@ wrong in a visible way; this is invisible.
 `cbox` was the fifth appearance of the clamp mechanism above:
 `bevel.clamp(0.02, 0.45)` on a NaN is NaN.
 
-## Where this has not been done
+## align.rs, and why a debug_assert was the worst place to state it
 
-`align.rs` has not been probed. Its three entry points all take
-`&[Vec<RawPrim>]` — whole loaded meshes rather than loose scalars — so it
-needs fixtures rather than a two-minute parameter sweep, which is why it
-is still open.
+`align.rs` needed fixtures rather than a scalar sweep — its entry points
+take `&[Vec<RawPrim>]`, whole loaded meshes. Building them took about
+fifteen minutes and found one defect, worth more than the time.
+
+`unify` ends with a `debug_assert!` stating that pose 0's leading
+entries are non-empty, because the draw path writes meshes by that
+mapping. A prim with no vertices breaks it. In debug the assert fires; in
+**release the assert is compiled out**, so the same input produces a
+`Unified` with empty pose entries and hands it to the draw path.
+
+That is the worst of both: a crash in development and silent corruption
+in the build that ships. An invariant a release build does not check is
+not enforced, it is only documented — and this one was documented in the
+one place that reads like enforcement.
+
+Fixed by filtering vertex-less prims at the top of `unify`, which makes
+the invariant true by construction. glTF primitives with an empty
+POSITION accessor are the obvious source.
+
+## Survey complete
+
+Seven modules probed. Five had defects, two were clean. Every defect sat
+in code whose behaviour was already correct and covered by meaningful
+tests, at an input boundary those tests never visit.

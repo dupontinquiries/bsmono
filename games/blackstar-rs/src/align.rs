@@ -394,6 +394,24 @@ pub fn diagnose(strip: &[Vec<RawPrim>]) -> Option<(usize, usize)> {
 /// Align a strip into a union-prim blend input. `None` refuses — the
 /// caller falls back to stepping, exactly today's behaviour.
 pub fn unify(strip: Vec<Vec<RawPrim>>) -> Option<Unified> {
+    // A PRIM WITH NO VERTICES CANNOT BE DRAWN OR MATCHED.
+    //
+    // The `debug_assert!` at the end of this function states the
+    // invariant that pose 0's leading entries are non-empty, because the
+    // draw path writes meshes by that mapping. A vertex-less prim breaks
+    // it — and breaks it in the worst available way: the assert fires in
+    // debug, and in RELEASE it is skipped, so a `Unified` with empty pose
+    // entries reaches the draw path silently.
+    //
+    // glTF primitives with an empty POSITION accessor are the obvious
+    // source. Dropping them here makes the invariant true by construction
+    // rather than by assertion, which is the only version of it that
+    // holds in a release build.
+    let strip: Vec<Vec<RawPrim>> = strip
+        .into_iter()
+        .map(|pose| pose.into_iter().filter(|p| !p.verts.is_empty()).collect())
+        .collect();
+
     let n_poses = strip.len();
     if n_poses < 2 || strip.iter().any(|p| p.is_empty()) {
         return None;
@@ -478,6 +496,50 @@ pub fn unify(strip: Vec<Vec<RawPrim>>) -> Option<Unified> {
 
 #[cfg(test)]
 mod tests {
+
+    fn probe_prim(n: usize) -> RawPrim {
+        let verts: Vec<crate::meshgen::Vertex> = (0..n)
+            .map(|i| crate::meshgen::Vertex {
+                pos: [i as f32, i as f32, i as f32],
+                nrm: [0.0, 1.0, 0.0],
+                uv: [0.0, 0.0],
+            })
+            .collect();
+        RawPrim {
+            verts,
+            idx: (0..n as u32).collect(),
+            color: [1.0; 4],
+            tex_uri: None,
+            tag: crate::model::Tag::Body,
+            pivot: None,
+        }
+    }
+
+    /// A vertex-less prim used to trip the `debug_assert!` at the end of
+    /// `unify` — and that assert is skipped in release, so the same input
+    /// shipped a `Unified` with empty pose entries straight to the draw
+    /// path. Found with fixtures; the scalar probes that caught the rest
+    /// of this class could not reach it.
+    #[test]
+    fn a_strip_of_vertexless_prims_is_rejected_not_asserted() {
+        let strip = vec![vec![probe_prim(0)], vec![probe_prim(0)]];
+        assert!(unify(strip).is_none(), "an all-empty strip has nothing to unify");
+    }
+
+    #[test]
+    fn a_vertexless_prim_is_dropped_rather_than_carried() {
+        // The good prims still unify; the empty one does not become a
+        // slot the draw path would later write nothing into.
+        let strip = vec![
+            vec![probe_prim(3), probe_prim(0)],
+            vec![probe_prim(3), probe_prim(0)],
+        ];
+        let u = unify(strip).expect("the non-empty prims should still unify");
+        assert_eq!(u.base_prims, 1, "the vertex-less prim was counted as a base prim");
+        for pose in &u.poses {
+            assert!(pose.iter().all(|v| !v.is_empty()), "an empty slot reached the draw path");
+        }
+    }
     use super::*;
 
     fn prim(offset: Vec3, uv0: f32, n: usize) -> RawPrim {
@@ -637,3 +699,4 @@ mod tests {
         assert!(u.is_some(), "one pose-specific part must not sink the strip");
     }
 }
+
