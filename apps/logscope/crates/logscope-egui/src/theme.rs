@@ -1576,6 +1576,18 @@ impl Toaster {
 /// Apply the active palette to egui's global Style/Visuals. Call once at startup and again after any
 /// `set_palette` so egui's own widgets (scrollbars, menus, text selection) match the chosen theme.
 pub fn install(ctx: &Context) {
+    // THE SYMBOL FONTS, before anything else here touches the style.
+    //
+    // logscope themes itself completely and correctly through this function
+    // and never calls `uikit_egui::apply_palette` — which is where
+    // `fonts::install` lives (7098bc4a). So it looked exactly right and drew
+    // boxes for every glyph outside egui's bundled coverage, which in this app
+    // is a lot: it has the widest symbol vocabulary in the tree.
+    //
+    // That combination is the reason `font_install_check.py` exists. An app
+    // with no theme at all looks wrong and someone investigates; an app that
+    // looks perfect and boxes gets shrugged at as a font issue on the device.
+    uikit_egui::fonts::install(ctx);
     let pal = active();
     let mut style = (*ctx.global_style()).clone();
     let mut v = if pal.dark { Visuals::dark() } else { Visuals::light() };

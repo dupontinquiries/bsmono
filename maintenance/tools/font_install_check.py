@@ -66,11 +66,6 @@ NOT_A_FRONTEND = {
 # reason — a checker that fails on arrival gets ignored, and then it is not a
 # checker.
 KNOWN_MISSES = {
-    "apps/logscope/crates/logscope-egui":
-        "themes itself through its own `theme::install_palette` rather than the "
-        "kit's, so it has colours and no fonts. The nearest fix is one call, but "
-        "logscope draws the most symbols of anything here (29 surfaces) and the "
-        "change wants looking at on a screen.",
     "apps/av1tuner/av1tuner_app":
         "no uikit-egui dependency and no theming at all — default egui. Same "
         "shape switcheroo was in before 51e910c8.",
