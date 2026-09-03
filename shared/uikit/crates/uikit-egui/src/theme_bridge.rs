@@ -64,6 +64,29 @@ impl PaletteColors {
 
 /// Apply a palette to the whole context: base Visuals + the app's token radius
 /// and spacing. Call when the user picks a theme in Settings ▸ Look.
+/// Touch-sized controls, without touching a single colour.
+///
+/// The third tier of what this kit gives an app, after fonts and IME. Those two
+/// ride `fonts::install` and reach everything; this one cannot, because it
+/// CHANGES LAYOUT — every button gets taller, and a dense panel reflows.
+///
+/// It is the fix for "buttons are still a bit small on mobile", and the number
+/// is the reason: egui's default `interact_size.y` is 24pt, which is a mouse
+/// target. `tokens::TOUCH_MIN` is 40. An app that themes itself by hand and
+/// will never call `apply_palette` still wants this on a phone, and until now
+/// the two were welded together — you took the colours or you took nothing.
+///
+/// Opt-in and separate for the same reason `palette_colors_ctx` is separate
+/// from `apply_palette`: an app should be able to fix one thing without
+/// accepting a change to another. Six apps in this fleet install the fonts and
+/// theme themselves; this is what they can take next, one at a time, with
+/// somebody looking at the screen.
+pub fn touch_targets(ctx: &Context) {
+    ctx.global_style_mut(|s| {
+        s.spacing.interact_size.y = tokens::TOUCH_MIN as f32;
+    });
+}
+
 pub fn apply_palette(ctx: &Context, p: &Palette) -> PaletteColors {
     // The symbol fallbacks, here rather than in every app's startup, because
     // this is the one function a themed app already calls and a font nobody
@@ -75,8 +98,10 @@ pub fn apply_palette(ctx: &Context, p: &Palette) -> PaletteColors {
     ctx.global_style_mut(|s| {
         s.spacing.item_spacing = egui::vec2(tokens::SPACE_SM as f32, tokens::SPACE_SM as f32);
         s.spacing.button_padding = egui::vec2(tokens::SPACE_MD as f32, tokens::SPACE_SM as f32);
-        s.spacing.interact_size.y = tokens::TOUCH_MIN as f32; // touch targets >= 40px
     });
+    // Through the shared function, so a change to the touch floor cannot apply
+    // to themed apps and miss the ones that opted in by hand.
+    touch_targets(ctx);
     c
 }
 
@@ -159,6 +184,40 @@ pub fn filter_color(c: Color32, d: &settings_kit::DisplayPrefs) -> Color32 {
     }
     let (r, g, b) = d.apply((c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0));
     Color32::from_rgba_unmultiplied((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, c.a())
+}
+
+#[cfg(test)]
+mod touch_target_tests {
+    use super::*;
+
+    #[test]
+    fn touch_targets_raises_the_floor_without_touching_colours() {
+        // The whole reason it is its own function: an app that themes itself by
+        // hand can take the 40pt floor without accepting a recolour.
+        let ctx = Context::default();
+        ctx.begin_pass(egui::RawInput::default());
+        let before = ctx.global_style().visuals.panel_fill;
+        let default_h = ctx.global_style().spacing.interact_size.y;
+        assert!(default_h < tokens::TOUCH_MIN as f32,
+                "egui's default is already {default_h} — this function does nothing");
+        touch_targets(&ctx);
+        assert_eq!(ctx.global_style().spacing.interact_size.y, tokens::TOUCH_MIN as f32);
+        assert_eq!(ctx.global_style().visuals.panel_fill, before,
+                   "touch_targets changed a colour");
+        let _ = ctx.end_pass();
+    }
+
+    #[test]
+    fn apply_palette_goes_through_the_same_function() {
+        // So a change to the touch floor cannot reach themed apps and miss the
+        // ones that opted in by hand — which is how two numbers that are meant
+        // to be one number drift apart.
+        let ctx = Context::default();
+        ctx.begin_pass(egui::RawInput::default());
+        apply_palette(&ctx, &snapclone_theme::palette_for(Default::default()));
+        assert_eq!(ctx.global_style().spacing.interact_size.y, tokens::TOUCH_MIN as f32);
+        let _ = ctx.end_pass();
+    }
 }
 
 #[cfg(test)]
