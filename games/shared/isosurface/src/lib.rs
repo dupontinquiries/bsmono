@@ -109,6 +109,24 @@ impl<F: Fn(i32, i32, i32) -> f32> Field for F {
 #[derive(Clone, Debug, Default)]
 pub struct Mesh {
     pub positions: Vec<Vec3>,
+    /// Outward unit normal per position, from the ANALYTIC GRADIENT of the
+    /// trilinear interpolant inside each cell — not from averaging adjacent
+    /// triangle normals.
+    ///
+    /// Face averaging is the usual approach and it is the wrong one here. It
+    /// derives the normal from the mesh, which is a lossy reconstruction of
+    /// the field, so it inherits the reconstruction's error and adds the
+    /// topology's: a vertex with an uneven fan of triangles gets a biased
+    /// normal, and the bias moves when the LOD tier changes. The field knows
+    /// the true surface direction at every point and costs eight values this
+    /// loop has already read.
+    ///
+    /// It also matters for seams. A boundary cell borrowing a coarse grid
+    /// computes its gradient from the coarse corners, so both sides of an LOD
+    /// boundary derive the SAME normal — shading matches across the join for
+    /// the same reason the geometry does. Averaged normals would visibly
+    /// crease there even with the vertices in exactly the right place.
+    pub normals: Vec<Vec3>,
     /// Triangle list. Always a multiple of three.
     pub indices: Vec<u32>,
 }
@@ -220,6 +238,29 @@ const EDGES: [(usize, usize); 12] = [
 
 fn corner_offset(i: usize) -> [i32; 3] {
     [(i & 1) as i32, ((i >> 1) & 1) as i32, ((i >> 2) & 1) as i32]
+}
+
+/// Gradient of the trilinear interpolant through `v` at local position `p`,
+/// with corners indexed `x + 2y + 4z`. Analytic rather than sampled: the
+/// eight values are already in hand and finite differencing them again would
+/// be both slower and blurrier.
+fn trilinear_gradient(v: &[f32; 8], p: Vec3) -> Vec3 {
+    let (a, b, c) = (p.x, p.y, p.z);
+    let (ia, ib, ic) = (1.0 - a, 1.0 - b, 1.0 - c);
+    Vec3::new(
+        (v[1] - v[0]) * ib * ic
+            + (v[3] - v[2]) * b * ic
+            + (v[5] - v[4]) * ib * c
+            + (v[7] - v[6]) * b * c,
+        (v[2] - v[0]) * ia * ic
+            + (v[3] - v[1]) * a * ic
+            + (v[6] - v[4]) * ia * c
+            + (v[7] - v[5]) * a * c,
+        (v[4] - v[0]) * ia * ib
+            + (v[5] - v[1]) * a * ib
+            + (v[6] - v[2]) * ia * b
+            + (v[7] - v[3]) * a * b,
+    )
 }
 
 /// Extract the isosurface.
@@ -339,6 +380,15 @@ pub fn extract<F: Field>(field: &F, m: Mesher) -> Mesh {
                 // coordinate frame
                 let cell = Vec3::new(base[0] as f32, base[1] as f32, base[2] as f32);
                 mesh.positions.push((cell + local * r as f32) * k as f32);
+
+                // Values rise INTO the solid (>= iso is inside), so the
+                // gradient points inward and the outward normal is its
+                // negation. A cell whose eight samples are equal has no
+                // direction to offer; +Y is arbitrary but finite, which is
+                // what a renderer needs more than it needs correctness in a
+                // case that cannot be shaded anyway.
+                let g = trilinear_gradient(&v, local);
+                mesh.normals.push((-g).try_normalize().unwrap_or(Vec3::Y));
             }
         }
     }
@@ -367,7 +417,7 @@ pub fn extract<F: Field>(field: &F, m: Mesher) -> Mesh {
                         vertex_of[idx(x, y, z - 1)],
                         vertex_of[idx(x, y, z)],
                         vertex_of[idx(x, y - 1, z)],
-                        here,
+                        !here,
                         &mut mesh,
                     );
                 }
@@ -377,7 +427,7 @@ pub fn extract<F: Field>(field: &F, m: Mesher) -> Mesh {
                         vertex_of[idx(x, y, z - 1)],
                         vertex_of[idx(x, y, z)],
                         vertex_of[idx(x - 1, y, z)],
-                        !here,
+                        here,
                         &mut mesh,
                     );
                 }
@@ -387,7 +437,7 @@ pub fn extract<F: Field>(field: &F, m: Mesher) -> Mesh {
                         vertex_of[idx(x, y - 1, z)],
                         vertex_of[idx(x, y, z)],
                         vertex_of[idx(x - 1, y, z)],
-                        here,
+                        !here,
                         &mut mesh,
                     );
                 }
@@ -714,6 +764,148 @@ mod tests {
                 .fold(f32::INFINITY, f32::min);
             assert!(best < 1e-3, "coarse vertex {q:?} unmatched by {best:.4}");
         }
+    }
+
+
+    #[test]
+    fn every_vertex_has_a_finite_unit_normal() {
+        let mesh = extract(&sphere(8.0, 8.0, 8.0, 5.0), Mesher::new([17, 17, 17]));
+        assert_eq!(mesh.normals.len(), mesh.positions.len());
+        for n in &mesh.normals {
+            assert!(n.is_finite(), "non-finite normal {n:?}");
+            assert!((n.length() - 1.0).abs() < 1e-4, "normal of length {}", n.length());
+        }
+    }
+
+    /// Normals the conventional way: area-weighted average of the adjacent
+    /// triangle normals. Here only to be beaten.
+    fn face_averaged_normals(mesh: &Mesh) -> Vec<Vec3> {
+        let mut acc = vec![Vec3::ZERO; mesh.positions.len()];
+        for t in mesh.indices.chunks_exact(3) {
+            let (a, b, c) =
+                (mesh.positions[t[0] as usize], mesh.positions[t[1] as usize], mesh.positions[t[2] as usize]);
+            // un-normalised cross product is already area-weighted
+            let fna = (b - a).cross(c - a);
+            for i in t {
+                acc[*i as usize] += fna;
+            }
+        }
+        acc.iter().map(|v| v.try_normalize().unwrap_or(Vec3::Y)).collect()
+    }
+
+    #[test]
+    fn gradient_normals_beat_face_averaged_ones_on_a_known_surface() {
+        // The design claim, measured rather than asserted. A sphere's true
+        // normal is exactly radial, so both methods can be scored against
+        // ground truth on the same mesh.
+        //
+        // The gradient is not exact either — it is the gradient of the
+        // TRILINEAR INTERPOLANT of sampled values, not of the underlying
+        // function — so this is a comparison, not a perfection check. An
+        // earlier version of this test asserted > 0.995 against ground truth
+        // and failed at 0.9903, which is the discretisation error and not a
+        // bug.
+        let c = Vec3::splat(8.0);
+        let mesh = extract(&sphere(8.0, 8.0, 8.0, 5.0), Mesher::new([17, 17, 17]));
+        let averaged = face_averaged_normals(&mesh);
+
+        let score = |ns: &[Vec3]| {
+            let mut worst = 1.0f32;
+            let mut total = 0.0f32;
+            for (p, n) in mesh.positions.iter().zip(ns) {
+                let d = (*p - c).normalize().dot(*n);
+                worst = worst.min(d);
+                total += d;
+            }
+            (worst, total / ns.len() as f32)
+        };
+        let (gw, gm) = score(&mesh.normals);
+        let (aw, am) = score(&averaged);
+
+        // Measured: gradient worst 0.9903 / mean 0.99878, averaged worst
+        // -1.0000 / mean 0.98468. The averaged worst case is a vertex whose
+        // triangle fan cancels to nothing, leaving no direction at all —
+        // exactly the failure the field-based normal cannot have, because it
+        // never consults the topology.
+        assert!(gw > aw, "worst case: gradient {gw:.4} did not beat averaged {aw:.4}");
+        assert!(gm > am, "mean: gradient {gm:.5} did not beat averaged {am:.5}");
+        // and the absolute floor the renderer can rely on
+        assert!(gw > 0.98, "gradient worst case {gw:.4} is poor even so");
+    }
+
+    #[test]
+    fn ground_points_up() {
+        // plane(h) is positive ABOVE h, so the solid is above and the outward
+        // normal is -Y. Written out because the sign convention is the thing
+        // most likely to be wrong and least likely to be noticed until a
+        // renderer lights the underside of the world.
+        let mesh = extract(&plane(4.5), Mesher::new([8, 10, 8]));
+        for n in &mesh.normals {
+            assert!(n.y < -0.99, "normal {n:?} on a field whose solid is above");
+        }
+        // and the inverted field gives the inverted normal
+        let below = |_x: i32, y: i32, _z: i32| 4.5 - y as f32;
+        let mesh = extract(&below, Mesher::new([8, 10, 8]));
+        for n in &mesh.normals {
+            assert!(n.y > 0.99, "normal {n:?} on a field whose solid is below");
+        }
+    }
+
+    #[test]
+    fn normals_agree_across_an_lod_boundary() {
+        // The reason for using the field rather than the triangles: a boundary
+        // cell borrowing the coarse grid computes its gradient from the coarse
+        // corners, so both sides derive the same normal and the shading does
+        // not crease where the geometry already matches.
+        let f = ridge();
+        let coarse = extract(&f, Mesher::new([5, 8, 5]).at([8, 0, 0]).stride(2));
+        let overlapped = extract(&f, Mesher::new([11, 14, 9]).seams(Seams::NONE.x_plus(2)));
+        let mut checked = 0;
+        for (q, nq) in coarse.positions.iter().zip(&coarse.normals) {
+            let want = *q + Vec3::new(8.0, 0.0, 0.0);
+            if let Some((_, np)) = overlapped
+                .positions
+                .iter()
+                .zip(&overlapped.normals)
+                .find(|(p, _)| (**p - want).length() < 1e-3)
+            {
+                assert!(np.dot(*nq) > 0.999, "normals differ at {want:?}: {np:?} vs {nq:?}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no shared vertices found to compare");
+    }
+
+
+    #[test]
+    fn triangle_winding_agrees_with_the_normals() {
+        // FOUND BY THE COMPARISON ABOVE, not by looking: face-averaged normals
+        // scored -0.985 — right magnitude, inverted sign — which meant the
+        // quads were wound so their geometric normals faced INTO the solid. A
+        // back-face-culling renderer would have drawn the world inside out,
+        // and nothing else in this crate would have noticed.
+        let mesh = extract(&sphere(8.0, 8.0, 8.0, 5.0), Mesher::new([17, 17, 17]));
+        let mut agree = 0;
+        let mut total = 0;
+        for t in mesh.indices.chunks_exact(3) {
+            let (a, b, c) = (
+                mesh.positions[t[0] as usize],
+                mesh.positions[t[1] as usize],
+                mesh.positions[t[2] as usize],
+            );
+            let Some(geo) = (b - a).cross(c - a).try_normalize() else { continue };
+            let want = (mesh.normals[t[0] as usize]
+                + mesh.normals[t[1] as usize]
+                + mesh.normals[t[2] as usize])
+                .normalize();
+            total += 1;
+            if geo.dot(want) > 0.0 {
+                agree += 1;
+            }
+        }
+        assert!(total > 100, "only {total} non-degenerate triangles");
+        let frac = agree as f32 / total as f32;
+        assert!(frac > 0.99, "only {:.1}% of triangles wind outward", frac * 100.0);
     }
 
     #[test]
