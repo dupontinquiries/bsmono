@@ -823,6 +823,38 @@ impl VoicetermApp {
     /// One funnel, so a surface cannot add a command path and forget the
     /// mirror. `stage` replaces the buffer rather than appending,
     /// matching what these surfaces do to the shell's line.
+    /// Send bytes to the SHELL, as if typed.
+    ///
+    /// `Terminal::feed` is the OUTPUT path — it parses bytes as terminal
+    /// output into a grid. Several input affordances called it: the
+    /// keycap bar, the pipe menu, the brace menu. Pressing a keycap
+    /// therefore parsed the character into `app.terminal`'s grid, which
+    /// this view does not draw, and sent the shell nothing at all. Wrong
+    /// grid and wrong direction at once.
+    ///
+    /// Printable bytes are mirrored into the widget's line buffer for
+    /// the same reason `stage_command` mirrors: `cmd_risk::withhold_enter`
+    /// reads that buffer, and a `|` or a `{` inserted by a menu is part
+    /// of the line it will classify.
+    fn send_input(&mut self, bytes: &[u8]) {
+        self.session.pty_out.extend_from_slice(bytes);
+        if let Ok(t) = std::str::from_utf8(bytes) {
+            for ch in t.chars().filter(|c| !c.is_control()) {
+                self.app.terminal.input.push(ch);
+            }
+        }
+    }
+
+    /// Show a line on the terminal screen WITHOUT sending it to the
+    /// shell — an answer this app produced itself.
+    ///
+    /// Goes through the session grid, the one that is drawn. Feeding
+    /// `app.terminal` put these lines on a grid nothing renders, so the
+    /// feature looked like it did nothing.
+    fn show_line(&mut self, text: &str) {
+        self.feed_pty(text.as_bytes());
+    }
+
     fn stage_command(&mut self, cmd: &str) {
         // Kill whatever is on the shell's line first. `Terminal::stage`
         // REPLACES the widget's buffer, but appending to the shell only
@@ -1370,7 +1402,7 @@ impl eframe::App for VoicetermApp {
                 let pipe_host = ui.button("|\u{22EF}");
                 if let SlideOutcome::Selected(id, _) = self.pipe_menu.show(ui, &pipe_host, &pipe_menu()) {
                     if let Some(ch) = pipe_char(&id) {
-                        self.app.terminal.feed(ch);
+                        self.send_input(ch.as_bytes());
                     }
                 }
                 // the 🏠 chip opens favorites (QML: home icon in the toolbar)
@@ -1432,7 +1464,7 @@ impl eframe::App for VoicetermApp {
                 let brace_host = ui.button("{\u{22EF}}");
                 if let SlideOutcome::Selected(id, variant) = self.brace_menu.show(ui, &brace_host, &brace_menu()) {
                     if let Some(bytes) = brace_bytes(&id, variant) {
-                        self.app.terminal.feed(&bytes);
+                        self.send_input(bytes.as_bytes());
                     }
                 }
             });
@@ -1541,7 +1573,7 @@ impl eframe::App for VoicetermApp {
                         // user acts on it.
                         None => format!("I do not know the date of {q}"),
                     };
-                    self.app.terminal.feed(&format!("{line}\r\n"));
+                    self.show_line(&format!("{line}\r\n"));
                     self.date_phrase.clear();
                 }
             });
@@ -1695,7 +1727,7 @@ impl eframe::App for VoicetermApp {
             // a keyboard, and a large tablet still does not.
             if adaptive.touch {
                 if let Some(send) = keycap_bar_ui(ui, TERMINAL_KEYCAPS, &self.colors) {
-                    self.app.terminal.feed(send);
+                    self.send_input(send.as_bytes());
                 }
             }
         });
@@ -1904,7 +1936,7 @@ impl eframe::App for VoicetermApp {
                                                 { "unknown command" } else { "mutating" }),
                                         ui.input(|i| i.time));
                                 }
-                                self.app.terminal.feed(&echoed);
+                                self.show_line(&echoed);
                                 self.blocks.submit_command(&cmd, 0);
                             }
                         }

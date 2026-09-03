@@ -387,5 +387,20 @@ mod tests {
             "line discards are no longer mirrored — the risk gate will \
              classify a line the shell has already thrown away."
         );
+        // INPUT IS NOT OUTPUT. `Terminal::feed` PARSES bytes as terminal
+        // output into a grid; the keycap bar, the pipe menu and the
+        // brace menu are input affordances. Calling feed from one of
+        // them draws the character on a grid nothing renders and sends
+        // the shell nothing at all.
+        assert_eq!(
+            src.matches("self.app.terminal.feed(").count(),
+            0,
+            "an input affordance is calling the OUTPUT path again — use \
+             send_input for keys and show_line for text this app produced."
+        );
+        assert!(
+            src.contains("fn send_input(") && src.contains("fn show_line("),
+            "the input/output split is gone."
+        );
     }
 }
