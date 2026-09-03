@@ -288,3 +288,99 @@ mod tests {
         assert_eq!(classify(&long), Risk::ReadOnly);
     }
 }
+
+/// Whether the Enter byte must be held back until the user confirms.
+///
+/// ## Why this is a function and not an `if`
+///
+/// It gates destructive commands, it lives inside a key-event loop that
+/// needs a window to reach, and getting it wrong is silent — either
+/// `rm -rf` runs unconfirmed, or Enter stops working entirely. Pulled
+/// out so it can be tested without a display.
+///
+/// ## Only the Enter byte
+///
+/// The characters are already in the shell's line editor, sent as they
+/// were typed. So confirming sends `\r`, and cancelling leaves the line
+/// typed and editable rather than discarding what someone wrote. The
+/// confirmation used to hang off the widget's submitted line, which
+/// fires on the same keypress whose `\r` had already gone to the shell
+/// — it asked whether to run a command that had already run.
+///
+/// ## Mutating only, not Unknown
+///
+/// [`Risk::Unknown`] triggers a SNAPSHOT (see this module's header:
+/// "better an unnecessary one than a missing one") and must NOT trigger
+/// a dialog. The allowlist is deliberately short, so most commands
+/// classify Unknown; confirming all of them would put a modal in front
+/// of nearly every Enter, and a prompt that always appears is a prompt
+/// people learn to dismiss without reading. A snapshot costs a
+/// deduplicated write nobody sees; a dialog costs attention, and
+/// spending it everywhere is how it stops being spent anywhere.
+///
+/// `password_mode` is exempt: that line is not recorded or audited, and
+/// putting it in a dialog would render on screen the one thing the mode
+/// exists to keep off it.
+pub fn withhold_enter(
+    bytes: &[u8],
+    line: &str,
+    password_mode: bool,
+    confirm_already_open: bool,
+) -> bool {
+    bytes == b"\r"
+        && !password_mode
+        && !confirm_already_open
+        && classify(line) == Risk::Mutating
+}
+
+#[cfg(test)]
+mod withhold_tests {
+    use super::*;
+
+    #[test]
+    fn a_mutating_line_holds_its_enter() {
+        assert!(withhold_enter(b"\r", "rm -rf build", false, false));
+    }
+
+    #[test]
+    fn only_the_enter_byte_is_ever_held() {
+        // the characters are already in the shell's line editor
+        assert!(!withhold_enter(b"r", "rm -rf build", false, false));
+        assert!(!withhold_enter(b"", "rm -rf build", false, false));
+        assert!(!withhold_enter(b"\x03", "rm -rf build", false, false), "Ctrl-C must get through");
+        assert!(!withhold_enter(b"\n", "rm -rf build", false, false), "the shell's Enter is \\r");
+    }
+
+    #[test]
+    fn an_unknown_command_is_not_confirmed() {
+        // Unknown means "snapshot it", not "ask". The allowlist is short
+        // by design, so most commands land here — a dialog on nearly
+        // every Enter is one people learn to dismiss unread.
+        assert_eq!(classify("frobnicate --wibble"), Risk::Unknown);
+        assert!(!withhold_enter(b"\r", "frobnicate --wibble", false, false));
+    }
+
+    #[test]
+    fn a_read_only_command_runs_straight_through() {
+        assert_eq!(classify("ls -la"), Risk::ReadOnly);
+        assert!(!withhold_enter(b"\r", "ls -la", false, false));
+    }
+
+    #[test]
+    fn a_password_line_is_never_put_in_a_dialog() {
+        // the dialog renders the line; password mode exists to keep it
+        // off the screen and out of the audit chain
+        assert!(!withhold_enter(b"\r", "rm -rf build", true, false));
+    }
+
+    #[test]
+    fn a_second_dialog_is_not_stacked() {
+        assert!(!withhold_enter(b"\r", "rm -rf build", false, true));
+    }
+
+    #[test]
+    fn an_empty_line_is_just_a_blank_prompt() {
+        assert!(!withhold_enter(b"\r", "", false, false));
+        assert!(!withhold_enter(b"\r", "   ", false, false));
+    }
+}

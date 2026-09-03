@@ -3191,14 +3191,13 @@ impl eframe::App for VoicetermApp {
                     // just sends `\r`, and cancelling leaves the line
                     // typed and editable rather than silently discarding
                     // what someone wrote.
-                    let is_enter = out.bytes == b"\r";
                     let line = self.app.terminal.input.clone();
-                    if is_enter
-                        && self.pending_confirm.is_none()
-                        && !self.password_mode
-                        && voiceterm_egui::cmd_risk::classify(&line)
-                            == voiceterm_egui::cmd_risk::Risk::Mutating
-                    {
+                    if voiceterm_egui::cmd_risk::withhold_enter(
+                        &out.bytes,
+                        &line,
+                        self.password_mode,
+                        self.pending_confirm.is_some(),
+                    ) {
                         use voiceterm_egui::confirm_dialog::{ConfirmDialog, TimeoutAction};
                         self.pending_confirm = Some((
                             String::new(), // the line is already typed; only \r is pending

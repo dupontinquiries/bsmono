@@ -315,6 +315,12 @@ mod tests {
         // ONE RISK GATE, IN THE KEY PATH. Asking on `submitted` is too
         // late: the Enter byte went to the shell on the same keypress.
         assert_eq!(
+            src.matches("cmd_risk::withhold_enter(").count(),
+            1,
+            "the Enter-withholding decision is inlined again — it gates \
+             destructive commands and belongs in a tested function."
+        );
+        assert_eq!(
             src.matches("ConfirmDialog::new(").count(),
             1,
             "a second risk-confirmation site is back — the one that can \
