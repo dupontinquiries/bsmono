@@ -189,6 +189,78 @@ pub fn local_ip() -> Option<String> {
     Some(s.local_addr().ok()?.ip().to_string())
 }
 
+/// How usable an address is for a peer on the same LAN.
+///
+/// Ordered worst to best so `max_by_key` picks the right one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AddrKind {
+    /// `127.0.0.0/8`. Cannot serve another device, ever.
+    Loopback,
+    /// `169.254.0.0/16` — no DHCP happened. Reachable only if the peer also
+    /// self-assigned, which is rare and not worth advertising over anything
+    /// else.
+    LinkLocal,
+    /// `100.64.0.0/10`. Tailscale's range and carrier-grade NAT. Routable for
+    /// the VPN's members and invisible to a phone on the same wifi, which is
+    /// the case that makes the default-route trick pick the wrong answer.
+    Cgnat,
+    /// Anything else — a public address, or something unrecognised.
+    Other,
+    /// RFC1918: `10/8`, `172.16/12`, `192.168/16`. What a home LAN uses, and
+    /// what the phone is almost certainly on.
+    PrivateLan,
+}
+
+/// Classify a dotted-quad IPv4 address.
+pub fn addr_kind(ip: &str) -> AddrKind {
+    let o: Vec<u8> = ip.split('.').filter_map(|p| p.parse().ok()).collect();
+    if o.len() != 4 {
+        return AddrKind::Other;
+    }
+    match (o[0], o[1]) {
+        (127, _) => AddrKind::Loopback,
+        (169, 254) => AddrKind::LinkLocal,
+        (10, _) => AddrKind::PrivateLan,
+        (192, 168) => AddrKind::PrivateLan,
+        (172, b) if (16..=31).contains(&b) => AddrKind::PrivateLan,
+        (100, b) if (64..=127).contains(&b) => AddrKind::Cgnat,
+        _ => AddrKind::Other,
+    }
+}
+
+/// Choose the address to advertise, given every one this host has.
+///
+/// # Why the default-route trick is not enough on its own
+///
+/// [`local_ip`] connects a UDP socket to 8.8.8.8 and reads back the local
+/// address, which returns whichever interface holds the DEFAULT ROUTE. That is
+/// the LAN interface most of the time and the wrong answer twice:
+///
+/// * **A VPN holds the route.** Tailscale or wireguard puts a `100.64/10`
+///   address there, and the phone on the same wifi cannot reach it. The share
+///   advertises an address that is perfectly valid and completely unreachable.
+/// * **There is no default route at all.** A desktop and a phone on a LAN with
+///   no internet — or a captive portal before sign-in — makes `connect` fail,
+///   `local_ip` return `None`, and the caller fall back to `127.0.0.1`. That
+///   is advertised as if it were fine, and it can never work from another
+///   device.
+///
+/// So: prefer a private-LAN address over everything, and NEVER return loopback
+/// when any other address exists. Returns `None` rather than a loopback-only
+/// answer, so the caller can say "no usable address" instead of printing one
+/// that cannot work.
+pub fn pick_share_ip(candidates: &[String]) -> Option<String> {
+    candidates
+        .iter()
+        .filter(|ip| addr_kind(ip) != AddrKind::Loopback)
+        // `max_by_key` keeps the LAST maximum; iterating in order and taking
+        // the last means a later interface wins a tie, which is arbitrary but
+        // stable — the enumeration order is the OS's and does not change
+        // between calls.
+        .max_by_key(|ip| addr_kind(ip))
+        .cloned()
+}
+
 /// The current user (for the ssh provider url).
 pub fn current_user() -> String {
     std::env::var("USER")
@@ -335,6 +407,69 @@ mod tests {
         let msg = format!("unknown path — this server serves / and {CARD_PATH}\n");
         assert!(msg.contains("/card"));
         assert!(msg.contains("serves /"));
+    }
+
+    #[test]
+    fn a_private_lan_address_beats_everything_else() {
+        // The reported failure: the phone could not reach the advertised
+        // address. A VPN holding the default route is one way that happens.
+        let c: Vec<String> = ["100.101.5.7", "192.168.1.20", "127.0.0.1"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(pick_share_ip(&c).as_deref(), Some("192.168.1.20"));
+
+        // All three RFC1918 blocks, and 172.32 is NOT one of them.
+        assert_eq!(addr_kind("10.0.0.5"), AddrKind::PrivateLan);
+        assert_eq!(addr_kind("172.16.0.1"), AddrKind::PrivateLan);
+        assert_eq!(addr_kind("172.31.255.254"), AddrKind::PrivateLan);
+        assert_eq!(addr_kind("172.32.0.1"), AddrKind::Other);
+        assert_eq!(addr_kind("172.15.0.1"), AddrKind::Other);
+    }
+
+    #[test]
+    fn loopback_is_never_advertised() {
+        // `local_ip()` returning None makes the caller fall back to
+        // 127.0.0.1, which is then shown as if it were a usable address. It
+        // can never serve another device.
+        let only_loop: Vec<String> = vec!["127.0.0.1".into()];
+        assert_eq!(pick_share_ip(&only_loop), None,
+                   "loopback was offered as a share address");
+        let with_lan: Vec<String> = vec!["127.0.0.1".into(), "10.1.2.3".into()];
+        assert_eq!(pick_share_ip(&with_lan).as_deref(), Some("10.1.2.3"));
+        assert_eq!(pick_share_ip(&[]), None);
+    }
+
+    #[test]
+    fn a_tailscale_address_loses_to_a_lan_one_and_wins_over_nothing() {
+        // Both directions. It IS reachable for VPN members, so it is better
+        // than refusing to serve; it is just not what a phone on the wifi
+        // wants.
+        assert_eq!(addr_kind("100.64.0.1"), AddrKind::Cgnat);
+        assert_eq!(addr_kind("100.127.255.255"), AddrKind::Cgnat);
+        // 100.128 is outside the /10 and is a normal public address.
+        assert_eq!(addr_kind("100.128.0.1"), AddrKind::Other);
+        let vpn_only: Vec<String> = vec!["100.101.5.7".into(), "127.0.0.1".into()];
+        assert_eq!(pick_share_ip(&vpn_only).as_deref(), Some("100.101.5.7"));
+    }
+
+    #[test]
+    fn a_link_local_address_is_a_last_resort_but_not_refused() {
+        // 169.254 means no DHCP happened. Worth offering over nothing, and
+        // ranked below anything routable.
+        assert_eq!(addr_kind("169.254.3.4"), AddrKind::LinkLocal);
+        let ll: Vec<String> = vec!["169.254.3.4".into()];
+        assert_eq!(pick_share_ip(&ll).as_deref(), Some("169.254.3.4"));
+        let both: Vec<String> = vec!["169.254.3.4".into(), "192.168.0.9".into()];
+        assert_eq!(pick_share_ip(&both).as_deref(), Some("192.168.0.9"));
+    }
+
+    #[test]
+    fn a_malformed_address_does_not_panic_or_win() {
+        for junk in ["", "not.an.ip", "1.2.3", "1.2.3.4.5", "999.1.1.1"] {
+            let _ = addr_kind(junk);
+        }
+        // `Other` outranks Cgnat, so junk must not beat a real LAN address.
+        let c: Vec<String> = vec!["not.an.ip".into(), "192.168.1.5".into()];
+        assert_eq!(pick_share_ip(&c).as_deref(), Some("192.168.1.5"));
     }
 
 }
