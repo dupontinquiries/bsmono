@@ -25,6 +25,7 @@ pub enum HashAlgorithm {
 }
 
 pub mod album;
+pub mod gallery_grid;
 
 // Configuration
 pub struct DeduplicationConfig {
