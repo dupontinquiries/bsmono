@@ -315,7 +315,13 @@ impl Shell {
                 ui.label("block");
                 ui.add(egui::DragValue::new(&mut self.job.pipeline.analyze.block_size).range(8..=128));
                 ui.label("bleed");
-                ui.add(egui::DragValue::new(&mut self.job.pipeline.analyze.bleed).range(0..=8));
+                // Range widened from 0..=8. 8 is now the DEFAULT (raised from 1
+                // because Real-ESRGAN's receptive field makes a thin ring
+                // useless), so the old cap left no room to turn the dial up —
+                // and turning it up is the first thing to try when block seams
+                // flicker. 24 is where the cost stops being worth it at the
+                // default 30px block: (30+2*24)^2 / 30^2 is ~6.8x the pixels.
+                ui.add(egui::DragValue::new(&mut self.job.pipeline.analyze.bleed).range(0..=24));
             });
             ui.horizontal(|ui| {
                 ui.label("quality");

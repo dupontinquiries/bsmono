@@ -43,7 +43,24 @@ struct Common {
     /// JPEG quality the reuse gate is measured against (higher = stricter = less reuse).
     #[arg(long, short = 'q', default_value_t = 97)]
     quality: u8,
-    #[arg(long, default_value_t = 1)]
+    /// Context ring around each residual block, in input pixels.
+    ///
+    /// This is what the CNN sees AROUND a block it is re-upscaling. Upstream's
+    /// 1 was tuned for waifu2x, whose receptive field is a handful of pixels;
+    /// Real-ESRGAN's RRDB body sees hundreds, so one pixel of context is
+    /// effectively none and the block's own edges come back wrong.
+    ///
+    /// That is the flicker: a seam is DRAWN where a block was re-upscaled and
+    /// ABSENT where the frame was copied from the previous one, so fixed grid
+    /// lines blink on and off as the residual planner changes its mind frame to
+    /// frame. A purely spatial artefact would be steady; a purely motion-driven
+    /// one would slide. Blinking at fixed positions is what points at the
+    /// residual path rather than the CNN tile grid.
+    ///
+    /// 8 costs (block+2*8)^2 / block^2 per residual — at the default 30px block
+    /// that is ~2.4x the pixels through the network per block, which is real but
+    /// bounded, and only for blocks that actually changed.
+    #[arg(long, default_value_t = 8)]
     bleed: u32,
     /// Uniform noise on inputs (upstream 8 for waifu2x; 0 for Real-ESRGAN).
     #[arg(long, default_value_t = 0)]
