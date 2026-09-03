@@ -235,6 +235,23 @@ impl Locomotion {
     /// in progress, which outranks the usual airborne Fall/Boost choice
     /// the same way a deliberate player action should.
     pub fn update(&mut self, dt: f32, speed: f32, vert: f32, grounded: bool, boosting: bool, climbing: bool) -> Pose {
+        // SANITISE THE INPUTS FIRST.
+        //
+        // `Pose` documents `phase` as 0..1 and `weight` as how strongly to
+        // apply the pose. A negative `dt` breaks both: measured, dt=-0.016
+        // produced phase=-0.032 and weight=-0.118, and a negative weight
+        // does not damp a pose, it applies the inverse of one — the body
+        // leans backwards out of its own stride. A non-finite dt or speed
+        // put NaN straight into `bob`, and NaN in a transform is a body
+        // that vanishes rather than one that looks wrong.
+        //
+        // Time only runs forwards here. A caller with a backwards or
+        // stalled clock gets a frame where nothing advances, which is the
+        // honest answer, rather than an inverted one.
+        let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+        let speed = if speed.is_finite() { speed.max(0.0) } else { 0.0 };
+        let vert = if vert.is_finite() { vert } else { 0.0 };
+
         // smooth the speed before it decides anything: a gait chosen from an
         // instantaneous value changes on collision spikes
         self.speed += (speed - self.speed) * (1.0 - (-9.0 * dt).exp());
@@ -517,6 +534,62 @@ mod tests {
         assert_eq!(l.gait, Gait::Walk);
     }
 
+    /// Time only runs forwards, and garbage in does not become garbage out.
+    ///
+    /// These were found by probing `update` with adversarial inputs rather
+    /// than by reading it. A negative `dt` produced phase=-0.032 and
+    /// weight=-0.118 — and a negative weight is not a damped pose, it is
+    /// the inverse of one, so the body leans backwards out of its stride.
+    /// A non-finite `dt` or `speed` put NaN into `bob`, and a NaN in a
+    /// transform is a body that disappears rather than one that looks odd.
+    #[test]
+    fn a_backwards_clock_does_not_invert_the_pose() {
+        let mut l = Locomotion::new();
+        run_for(&mut l, 0.5, 5.0, 0.0, true, false);
+        let before = l.phase;
+        let p = l.update(-0.016, 5.0, 0.0, true, false, false);
+        assert!((0.0..=1.0).contains(&p.phase), "phase left its range: {}", p.phase);
+        assert!(p.weight >= 0.0, "negative weight applies the pose inverted: {}", p.weight);
+        assert_eq!(l.phase, before, "a backwards frame should not advance the cycle");
+    }
+
+    #[test]
+    fn a_stalled_clock_is_a_frame_where_nothing_moves() {
+        let mut l = Locomotion::new();
+        run_for(&mut l, 0.5, 5.0, 0.0, true, false);
+        let before = l.phase;
+        l.update(0.0, 5.0, 0.0, true, false, false);
+        assert_eq!(l.phase, before);
+    }
+
+    #[test]
+    fn non_finite_inputs_do_not_reach_the_pose() {
+        for (dt, speed, vert) in [
+            (f32::NAN, 5.0f32, 0.0f32),
+            (0.016, f32::NAN, 0.0),
+            (0.016, f32::INFINITY, 0.0),
+            (0.016, 5.0, f32::NAN),
+            (f32::INFINITY, 5.0, 0.0),
+        ] {
+            let mut l = Locomotion::new();
+            let p = l.update(dt, speed, vert, true, false, false);
+            assert!(p.phase.is_finite(), "phase NaN from dt={dt} speed={speed} vert={vert}");
+            assert!(p.bob.is_finite(), "bob NaN from dt={dt} speed={speed} vert={vert}");
+            assert!(p.weight.is_finite(), "weight NaN from dt={dt} speed={speed} vert={vert}");
+            assert!(p.lean.is_finite() && p.roll.is_finite() && p.squash.is_finite());
+        }
+    }
+
+    #[test]
+    fn a_negative_speed_is_treated_as_stopped_not_as_reverse_cadence() {
+        // Speed feeds stride_freq, which already guards with max(0.0); this
+        // pins that a caller passing a signed velocity by mistake gets an
+        // idle body rather than a subtly wrong cadence.
+        let mut l = Locomotion::new();
+        run_for(&mut l, 1.0, -12.0, 0.0, true, false);
+        assert_eq!(l.gait, Gait::Idle);
+    }
+
     #[test]
     fn boosting_beats_everything_and_falling_beats_the_ground() {
         let mut l = Locomotion::new();
@@ -660,3 +733,4 @@ mod tests {
         assert!(p.weight < 0.5, "idle applies full body motion");
     }
 }
+
