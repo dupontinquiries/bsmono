@@ -26,8 +26,9 @@ struct Uniforms {
     // (confirmed the hard way: wgpu's validator rejected a 48-byte buffer
     // because the shader, with a trailing vec3 pad, actually expected 64).
     car_kind: f32,
-    _pad1: f32,
-    _pad2: f32,
+    // Surface response from core::material, driven by the car's armour.
+    reflectivity: f32,
+    specular_power: f32,
 };
 
 @group(0) @binding(0)
@@ -255,17 +256,64 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         || (is_six_wheeler && dist_mid_wheel < wheel_radius);
 
     if (in_body || in_cabin || in_wheel) {
+        var albedo: vec3<f32>;
         if (in_wheel) {
-            color = vec3<f32>(0.05, 0.05, 0.05);
+            albedo = vec3<f32>(0.05, 0.05, 0.05);
         } else if (u.car_kind < 0.5) {
-            color = vec3<f32>(0.45, 0.42, 0.40); // Behemoth: gunmetal grey
+            albedo = vec3<f32>(0.45, 0.42, 0.40); // Behemoth: gunmetal grey
         } else if (u.car_kind < 1.5) {
-            color = vec3<f32>(0.35, 0.50, 0.30); // SixWheeler: olive drab
+            albedo = vec3<f32>(0.35, 0.50, 0.30); // SixWheeler: olive drab
         } else if (u.car_kind < 2.5) {
-            color = vec3<f32>(0.75, 0.12, 0.10); // RedSedan
+            albedo = vec3<f32>(0.75, 0.12, 0.10); // RedSedan
         } else {
-            color = vec3<f32>(0.85, 0.65, 0.15); // Pillager: yellow-gold
+            albedo = vec3<f32>(0.85, 0.65, 0.15); // Pillager: yellow-gold
         }
+
+        // MATERIAL. Flat fill made the car read as a sticker on the scene:
+        // the terrain gained normals and sun/sky terms and the car did not,
+        // so it stopped belonging to the same world.
+        //
+        // The body is a 2D silhouette, so there is no real surface normal.
+        // What there IS: the body's own up vector, which rotates with the
+        // car, and the position across the body. Treating the body as a
+        // cylinder lying along its length gives a normal that sweeps from
+        // one edge to the other and rotates with the chassis — enough to
+        // read as a rounded panel catching the light, and it means a car
+        // pitched nose-up on a ramp visibly changes how it catches the sun.
+        // Measured against the region the pixel is actually IN. Using the
+        // body's half-height everywhere put the cabin — which sits ABOVE
+        // body_half.y — permanently at across = 1, tilting its normal fully
+        // away from the sun and rendering it near-black. Caught on the
+        // first screenshot: the car had a hole where its cabin should be.
+        var across = clamp(rel_rot.y / body_half.y, -1.0, 1.0);
+        if (in_cabin) {
+            across = clamp(cabin_rel.y / cabin_half.y, -1.0, 1.0);
+        }
+        let body_up = vec2<f32>(-sin(-u.car_rotation), cos(-u.car_rotation));
+        let body_fwd = vec2<f32>(cos(-u.car_rotation), sin(-u.car_rotation));
+        let n = normalize(body_up * sqrt(max(1.0 - across * across, 0.0)) + body_fwd * across * 0.35);
+
+        let ndotl = max(dot(n, SUN_DIR), 0.0);
+        // The car is above the terrain and sees essentially open sky, so
+        // its ambient uses a constant rather than the baked sky term — the
+        // bake describes points ON the ground, and sampling it here would
+        // dim the car every time it drove past a wall it was not in.
+        let ambient = SKY_COLOR * 0.40;
+        var lit = albedo * (SUN_COLOR * ndotl + ambient);
+
+        // Specular: a view vector is meaningless in an orthographic 2D
+        // scene, so the highlight is placed by the normal alone. Tight for
+        // armour, broad for bodywork.
+        let spec = pow(ndotl, u.specular_power) * u.reflectivity;
+        lit += SUN_COLOR * spec;
+
+        // Sky rim on the up-facing edge, scaled by reflectivity: this is
+        // what separates a plated Behemoth from a painted sedan at a glance
+        // when both are in shadow.
+        let rim = pow(1.0 - abs(across), 3.0) * u.reflectivity * 0.5;
+        lit += SKY_COLOR * rim;
+
+        color = lit;
     }
 
     // --- boss: appears ahead of the car, scaled from world-space distance ---

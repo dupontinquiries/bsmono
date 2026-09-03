@@ -35,8 +35,15 @@ pub struct SceneUniforms {
     /// (48 bytes) already matches what scene.wgsl expects; changing it risks
     /// reintroducing the exact alignment mismatch documented below.
     pub car_kind: f32,
-    pub _pad1: f32,
-    pub _pad2: f32,
+    /// Surface response, from `road_warrior_core::material` — how much sky
+    /// the bodywork mirrors and how tight its highlight is, both driven by
+    /// the car's armour stat.
+    ///
+    /// These occupy the two former padding slots rather than growing the
+    /// struct: the 48-byte size already matches what scene.wgsl expects and
+    /// the comment above records what changing it cost last time.
+    pub reflectivity: f32,
+    pub specular_power: f32,
 }
 
 /// How many world units of track the viewport shows, and where the car sits

@@ -418,6 +418,7 @@ impl eframe::App for RoadWarriorApp {
             let boss_present = self.boss.as_ref().map_or(0.0, |b| if b.phase() != road_warrior_core::BossPhase::Defeated { 1.0 } else { 0.0 });
             let boss_telegraphing = self.boss.as_ref().map_or(0.0, |b| if b.is_telegraphing() { 1.0 } else { 0.0 });
 
+            let material = road_warrior_core::material::for_vehicle(&self.vehicle.stats);
             let uniforms = SceneUniforms {
                 car_x: self.vehicle.pos_x * 0.05, // scale world units into shader's [-1,1]-ish space
                 car_y: self.vehicle.pos_y,
@@ -428,8 +429,8 @@ impl eframe::App for RoadWarriorApp {
                 boss_present,
                 boss_telegraphing,
                 car_kind: car_kind_index(self.vehicle.kind),
-                _pad1: 0.0,
-                _pad2: 0.0,
+                reflectivity: material.reflectivity,
+                specular_power: material.specular_power,
             };
 
             // Sampled per frame from the live track, so the ground the
