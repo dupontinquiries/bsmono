@@ -33,6 +33,8 @@ pub const CONV_RT2C8_WGSL: &str = include_str!("../shaders/conv3x3_rt2c8.wgsl");
 pub const CONV_RT2F_WGSL: &str = include_str!("../shaders/conv3x3_rt2f.wgsl");
 pub const CONV_RT2C8F_WGSL: &str = include_str!("../shaders/conv3x3_rt2c8f.wgsl");
 pub const CONV_RT2C16F_WGSL: &str = include_str!("../shaders/conv3x3_rt2c16f.wgsl");
+pub const CONV_RT2H_WGSL: &str = include_str!("../shaders/conv3x3_rt2h.wgsl");
+pub const CONV_RT2C8H_WGSL: &str = include_str!("../shaders/conv3x3_rt2c8h.wgsl");
 pub const DECONV_WGSL: &str = include_str!("../shaders/deconv4x4s2.wgsl");
 pub const ADD_WGSL: &str = include_str!("../shaders/add_scaled.wgsl");
 pub const PACK_WGSL: &str = include_str!("../shaders/pack.wgsl");
@@ -85,12 +87,18 @@ pub enum ConvKernel {
     /// rt2 with a branchless interior path: no per-scalar bounds test or
     /// in_scale divide for threads whose 4x4 patch is fully inside. Costs no
     /// registers, which the M2 Ultra data says is the binding resource.
-    Rt2f,
-    /// rt2c8 + the interior fast path: the two independent wins composed.
+    /// Measured 1022 GMAC/s on an M2 Ultra — the fastest so far.
     #[default]
+    Rt2f,
+    /// rt2c8 + a branch-duplicated interior fast path. Measured 803 GMAC/s:
+    /// slower than either parent because the duplication spills registers.
     Rt2c8f,
     /// 2x2 px × 16 channels + fast path: the channel axis two steps further.
     Rt2c16f,
+    /// rt2 with addressing hoisted out of the channel loop, single code path.
+    Rt2h,
+    /// Hoisted addressing × 8 output channels: the two measured wins composed.
+    Rt2c8h,
 }
 
 impl ConvKernel {
@@ -104,8 +112,11 @@ impl ConvKernel {
             ConvKernel::Rt2f => CONV_RT2F_WGSL,
             ConvKernel::Rt2c8f => CONV_RT2C8F_WGSL,
             ConvKernel::Rt2c16f => CONV_RT2C16F_WGSL,
+            ConvKernel::Rt2h => CONV_RT2H_WGSL,
+            ConvKernel::Rt2c8h => CONV_RT2C8H_WGSL,
         }
     }
+
 
     /// Transformed weight taps per (out-channel group, in-channel).
     fn taps(self) -> usize {
@@ -116,18 +127,18 @@ impl ConvKernel {
         match self {
             ConvKernel::Rt1 => 16,
             ConvKernel::Rt2 | ConvKernel::Rt4 => 32,
-            ConvKernel::Wino | ConvKernel::Rt2c8 | ConvKernel::Rt2f | ConvKernel::Rt2c8f | ConvKernel::Rt2c16f => 32,
+            ConvKernel::Wino | ConvKernel::Rt2c8 | ConvKernel::Rt2f | ConvKernel::Rt2c8f | ConvKernel::Rt2c16f | ConvKernel::Rt2h | ConvKernel::Rt2c8h => 32,
         }
     }
     /// Output-channel groups (of 4) handled per dispatch z.
     fn groups_per_z(self) -> u32 {
         match self {
-            ConvKernel::Rt2c8 | ConvKernel::Rt2c8f => 2,
+            ConvKernel::Rt2c8 | ConvKernel::Rt2c8f | ConvKernel::Rt2c8h => 2,
             ConvKernel::Rt2c16f => 4,
             _ => 1,
         }
     }
-    pub const ALL: [ConvKernel; 8] = [ConvKernel::Rt1, ConvKernel::Rt2, ConvKernel::Rt4, ConvKernel::Wino, ConvKernel::Rt2c8, ConvKernel::Rt2f, ConvKernel::Rt2c8f, ConvKernel::Rt2c16f];
+    pub const ALL: [ConvKernel; 10] = [ConvKernel::Rt2h, ConvKernel::Rt2c8h, ConvKernel::Rt1, ConvKernel::Rt2, ConvKernel::Rt4, ConvKernel::Wino, ConvKernel::Rt2c8, ConvKernel::Rt2f, ConvKernel::Rt2c8f, ConvKernel::Rt2c16f];
 }
 
 impl std::str::FromStr for ConvKernel {
@@ -142,6 +153,8 @@ impl std::str::FromStr for ConvKernel {
             "rt2f" | "fast" => Ok(ConvKernel::Rt2f),
             "rt2c8f" | "c8f" => Ok(ConvKernel::Rt2c8f),
             "rt2c16f" | "c16f" => Ok(ConvKernel::Rt2c16f),
+            "rt2h" => Ok(ConvKernel::Rt2h),
+            "rt2c8h" => Ok(ConvKernel::Rt2c8h),
             _ => Err(anyhow!("kernel must be rt1|rt2|rt4|wino|rt2c8")),
         }
     }
@@ -531,8 +544,17 @@ impl WgpuUpscaler {
                     if c.act == Act::PReLU {
                         pr[..c.out_ch].copy_from_slice(&c.prelu);
                     }
+                    // f16 weights halve the dominant load stream: this shape reads
+                    // 18 vec4 of weights (288 B) against 16 input scalars (64 B) per
+                    // input channel, so weights are 82% of the traffic.
+                    // f16 weights would halve the dominant load stream (weights are
+                    // 82% of this shape's load bytes), but naga 29 gates
+                    // `unpack2x16float` behind SHADER_FLOAT16_IN_FLOAT32, so it needs
+                    // a device feature rather than being core WGSL as assumed. Left
+                    // out until that is requested and probed for.
+                    let wbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(&c.name), contents: bytemuck::cast_slice(&w), usage: wgpu::BufferUsages::STORAGE });
                     OpWeights::Conv {
-                        w: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(&c.name), contents: bytemuck::cast_slice(&w), usage: wgpu::BufferUsages::STORAGE }),
+                        w: wbuf,
                         b: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("bias"), contents: bytemuck::cast_slice(&b), usage: wgpu::BufferUsages::STORAGE }),
                         prelu: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("prelu"), contents: bytemuck::cast_slice(&pr), usage: wgpu::BufferUsages::STORAGE }),
                     }
@@ -927,7 +949,7 @@ mod tests {
     /// with no GPU at all.
     #[test]
     fn shaders_validate() {
-        for (name, src) in [("conv3x3", CONV_WGSL), ("conv3x3_rt1", CONV_RT1_WGSL), ("conv3x3_rt4", CONV_RT4_WGSL), ("conv3x3_wino", CONV_WINO_WGSL), ("conv3x3_rt2c8", CONV_RT2C8_WGSL), ("conv3x3_rt2f", CONV_RT2F_WGSL), ("conv3x3_rt2c8f", CONV_RT2C8F_WGSL), ("conv3x3_rt2c16f", CONV_RT2C16F_WGSL), ("deconv4x4s2", DECONV_WGSL), ("add_scaled", ADD_WGSL), ("pack", PACK_WGSL)] {
+        for (name, src) in [("conv3x3", CONV_WGSL), ("conv3x3_rt1", CONV_RT1_WGSL), ("conv3x3_rt4", CONV_RT4_WGSL), ("conv3x3_wino", CONV_WINO_WGSL), ("conv3x3_rt2c8", CONV_RT2C8_WGSL), ("conv3x3_rt2f", CONV_RT2F_WGSL), ("conv3x3_rt2c8f", CONV_RT2C8F_WGSL), ("conv3x3_rt2c16f", CONV_RT2C16F_WGSL), ("conv3x3_rt2h", CONV_RT2H_WGSL), ("conv3x3_rt2c8h", CONV_RT2C8H_WGSL), ("deconv4x4s2", DECONV_WGSL), ("add_scaled", ADD_WGSL), ("pack", PACK_WGSL)] {
             let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(src)));
             let mut v = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty());
             v.validate(&module).unwrap_or_else(|e| panic!("{name}: {e:?}"));

@@ -114,7 +114,7 @@ impl Default for Job {
             refs_override: None,
             block_cache_override: None,
             inflight: 1,
-            kernel: "rt2c8f".into(),
+            kernel: "rt2f".into(),
         }
     }
 }

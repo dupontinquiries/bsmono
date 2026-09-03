@@ -210,7 +210,24 @@ they differ only in how they spend registers and address arithmetic:
 | rt4 | 683 | 4×4 px × 4 ch — pixel axis, ~130 registers |
 | wino | 677 | Winograd F(2,3), 2.25× fewer multiplies |
 | rt2 | 896 | 2×2 px × 4 ch |
-| **rt2c8** | **988** | 2×2 px × 8 ch — channel axis |
+| rt2c8 | 977–988 | 2×2 px × 8 ch — channel axis |
+| **rt2f** | **1022** | rt2 + branch-duplicated interior fast path |
+| rt2c8f | 803 | both of the above — the duplication spills |
+| rt2c16f | 495 | 2×2 px × 16 ch — eight copies of the block |
+
+The last two are the instructive failures: each win is real alone, but the
+fast path was implemented as a duplicated branch, so composing it with
+channel blocking put four (then eight) copies of the accumulator block in
+one shader and the register allocator spilled. `rt2h` / `rt2c8h` redo it
+structurally — the bounds test and in_scale divide are hoisted out of the
+channel loop into per-thread row bases, column offsets and 0/1 masks, with a
+single copy of the block.
+
+Dispatch-level lessons come from `apps/logscope/reference-docs/ENGINE_PERF_STATUS.md`,
+which settled the same question for gpu-gemm: dispatch granularity, not
+arithmetic. Params uniforms are created once and (with balanced tiling) have
+identical dims across tiles; per-tile rewriting is the mistake that doc calls
+the dims-uniform cache.
 
 Winograd cutting multiplies by 2.25× and *losing* is the useful result: the
 kernel is not multiply-bound. The inverted U peaking at 2×2 says registers
