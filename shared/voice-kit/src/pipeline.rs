@@ -68,12 +68,36 @@ pub struct VoicePipeline {
     strip: bool,
     drop_hallucinations: bool,
     require_speech: bool,
+    /// Hard ceiling on buffered audio. Above it the OLDEST samples are
+    /// dropped — see [`VoicePipeline::push`].
+    max_samples: usize,
 }
+
+/// How much audio the buffer will hold before it starts dropping the oldest.
+///
+/// 60 seconds at 16 kHz mono, the rate the transcribers here want. Chosen as
+/// "longer than any utterance, shorter than a leak": whisper's own context is
+/// 30 seconds, so audio older than this cannot influence the transcript even
+/// in principle, and keeping it is pure cost.
+pub const DEFAULT_MAX_SAMPLES: usize = 16_000 * 60;
+
+/// Capacity retained after a flush.
+///
+/// `Vec::clear` does NOT release memory — it sets the length to zero and keeps
+/// the allocation. So a buffer that ever reached a gigabyte holds a gigabyte
+/// for the rest of the process, and RSS ratchets to the high-water mark and
+/// stays there. That is the shape of the reported 9.9 GiB on an on-screen
+/// keyboard: not a live leak the whole time, a peak that was never given back.
+///
+/// Shrinking all the way to zero would reallocate on every utterance, so one
+/// second is kept — enough that the common case never allocates, small enough
+/// that the peak does not survive.
+pub const RETAINED_SAMPLES: usize = 16_000;
 
 impl VoicePipeline {
     /// `min_samples` = how much audio makes a flush worthwhile (below it, `ready` is false).
     pub fn new(min_samples: usize) -> VoicePipeline {
-        VoicePipeline { buf: Vec::new(), min_samples, strip: true, drop_hallucinations: true, require_speech: false }
+        VoicePipeline { buf: Vec::new(), min_samples, strip: true, drop_hallucinations: true, require_speech: false, max_samples: DEFAULT_MAX_SAMPLES }
     }
 
     /// Set the filter strength from a settings `VoiceFilter` level's booleans
@@ -84,13 +108,59 @@ impl VoicePipeline {
         self.require_speech = require_speech;
     }
 
+    /// Override the ceiling. Mostly for tests and for a caller that knows its
+    /// sample rate differs from the 16 kHz [`DEFAULT_MAX_SAMPLES`] assumes.
+    pub fn set_max_samples(&mut self, n: usize) {
+        self.max_samples = n.max(1);
+        self.enforce_cap();
+    }
+
     /// Accumulate a chunk of captured audio (typically a `FallbackChain::read` frame).
+    ///
+    /// BOUNDED. This was a bare `extend_from_slice` with no ceiling, and the
+    /// buffer only ever shrank on `flush` or `cancel` — so an open microphone
+    /// that never reaches a flush condition grows it forever. At 16 kHz mono
+    /// that is 64 KB/s, a quarter of a gigabyte an hour; at 48 kHz stereo it is
+    /// six times that. An on-screen keyboard left running with dictation armed
+    /// is exactly the case, and it is also the case nobody tests, because a
+    /// test flushes.
+    ///
+    /// Over the ceiling the OLDEST samples go. A transcriber handed twenty
+    /// minutes of audio produces nothing useful from the first nineteen, and
+    /// whisper's context is thirty seconds regardless — the recent speech is
+    /// the only part that can affect the answer.
     pub fn push(&mut self, audio: &[f32]) {
         self.buf.extend_from_slice(audio);
+        self.enforce_cap();
+    }
+
+    fn enforce_cap(&mut self) {
+        if self.buf.len() > self.max_samples {
+            let over = self.buf.len() - self.max_samples;
+            self.buf.drain(..over);
+        }
+    }
+
+    /// Release the buffer's memory, keeping a working amount.
+    ///
+    /// `clear()` alone keeps the allocation; see [`RETAINED_SAMPLES`].
+    fn release(&mut self) {
+        self.buf.clear();
+        if self.buf.capacity() > RETAINED_SAMPLES {
+            self.buf.shrink_to(RETAINED_SAMPLES);
+        }
     }
 
     pub fn buffered(&self) -> usize {
         self.buf.len()
+    }
+
+    /// Allocated capacity, so a test can tell a cleared buffer from a released
+    /// one — the distinction the whole ratchet turns on, and one `buffered()`
+    /// cannot see.
+    #[doc(hidden)]
+    pub fn capacity_for_test(&self) -> usize {
+        self.buf.capacity()
     }
 
     /// Enough audio buffered to be worth transcribing?
@@ -100,7 +170,7 @@ impl VoicePipeline {
 
     /// Discard accumulated audio without transcribing (e.g. cancelled utterance).
     pub fn cancel(&mut self) {
-        self.buf.clear();
+        self.release();
     }
 
     /// Transcribe the accumulated audio and filter it; clears the buffer. `None` if there was
@@ -110,7 +180,7 @@ impl VoicePipeline {
             return None;
         }
         let raw = transcriber.transcribe(&self.buf);
-        self.buf.clear();
+        self.release();
         let raw = raw?;
         filter_transcript(&raw, self.strip, self.drop_hallucinations, self.require_speech)
     }
@@ -119,6 +189,78 @@ impl VoicePipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_microphone_that_never_flushes_does_not_grow_forever() {
+        // The reported failure: an on-screen keyboard at 9.9 GiB. `push` had no
+        // ceiling and the buffer only shrank on flush or cancel, so an open mic
+        // with dictation armed and no utterance completed grows at 64 KB/s
+        // mono and six times that at 48 kHz stereo.
+        let mut p = VoicePipeline::new(100);
+        p.set_max_samples(1000);
+        for _ in 0..500 {
+            p.push(&[0.5f32; 100]); // 50,000 samples pushed
+        }
+        assert_eq!(p.buffered(), 1000, "the buffer grew past its ceiling");
+    }
+
+    #[test]
+    fn the_ceiling_keeps_the_NEWEST_audio() {
+        // Which end is dropped decides whether the feature still works. A
+        // transcriber handed twenty minutes produces nothing useful from the
+        // first nineteen, and the recent speech is the only part that can
+        // affect the answer — so the OLD samples go.
+        let mut p = VoicePipeline::new(1);
+        p.set_max_samples(4);
+        p.push(&[1.0, 2.0, 3.0, 4.0]);
+        p.push(&[5.0, 6.0]);
+        let mut seen = Vec::new();
+        struct Capture<'a>(&'a mut Vec<f32>);
+        impl Transcriber for Capture<'_> {
+            fn transcribe(&mut self, audio: &[f32]) -> Option<String> {
+                self.0.extend_from_slice(audio);
+                Some("x".into())
+            }
+        }
+        p.flush(&mut Capture(&mut seen));
+        assert_eq!(seen, vec![3.0, 4.0, 5.0, 6.0], "the wrong end was dropped");
+    }
+
+    #[test]
+    fn a_flush_gives_the_memory_back() {
+        // `clear()` keeps the allocation, so a buffer that once peaked holds
+        // that peak for the life of the process and RSS never comes down. That
+        // is a ratchet rather than a leak, and it looks identical from outside.
+        let mut p = VoicePipeline::new(1);
+        p.push(&vec![0.0f32; 400_000]);
+        assert!(p.buffered() > 0);
+        p.flush(&mut Stub("hello"));
+        assert_eq!(p.buffered(), 0);
+        assert!(
+            p.capacity_for_test() <= RETAINED_SAMPLES,
+            "held {} samples of capacity after a flush",
+            p.capacity_for_test()
+        );
+        // Cancel is the other exit and must do the same — it was the one that
+        // looked harmless, since a cancelled utterance sounds like nothing
+        // happened.
+        let mut p = VoicePipeline::new(1);
+        p.push(&vec![0.0f32; 400_000]);
+        p.cancel();
+        assert!(p.capacity_for_test() <= RETAINED_SAMPLES);
+    }
+
+    #[test]
+    fn a_working_amount_is_kept_so_the_common_case_does_not_reallocate() {
+        // Shrinking to zero would reallocate on every utterance. Both
+        // directions matter: the peak must not survive, and the floor must.
+        let mut p = VoicePipeline::new(1);
+        p.push(&vec![0.0f32; 400_000]);
+        p.flush(&mut Stub("x"));
+        let after = p.capacity_for_test();
+        assert!(after > 0, "shrank to nothing — every utterance now reallocates");
+        assert!(after <= RETAINED_SAMPLES);
+    }
 
     struct Stub(&'static str);
     impl Transcriber for Stub {
