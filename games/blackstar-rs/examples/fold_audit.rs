@@ -562,6 +562,10 @@ fn main() {
         eprintln!("usage: fold_audit <bots dir> <chassis>... | <bots dir> --sweep-all");
         std::process::exit(2);
     }
+    if args.get(2).map(|a| a == "--cavity").unwrap_or(false) {
+        cavity_report(&PathBuf::from(&args[1]));
+        return;
+    }
     if args.get(2).map(|a| a == "--colors").unwrap_or(false) {
         dump_colors(&PathBuf::from(&args[1]));
         return;
@@ -741,4 +745,248 @@ fn dump_colors(dir: &Path) {
     let tex: std::collections::BTreeSet<&str> =
         raws.iter().filter_map(|p| p.tex_uri.as_deref()).collect();
     println!("   textures: {:?}", tex);
+}
+
+/// Does this vehicle have somewhere to PUT its robot?
+///
+/// Prompted by the observation that Blackout hides his body inside the
+/// hangar bay and engine housing — the robot is not tucked against the
+/// helicopter, it is inside it. That suggests a different question from
+/// "how much is showing": does the hull enclose enough empty space to
+/// hold the limbs at all?
+///
+/// If the cavity is smaller than the limbs, no stowing algorithm can
+/// work and the asset needs remodelling. If it is larger, hiding is a
+/// PLACEMENT problem and code can help. That is the split this measures,
+/// and it is the one that decides whether `fold_pack` is worth improving
+/// for a given chassis.
+///
+/// ## Frame
+///
+/// Axes come from the running gear, per the suggestion: the wheel prims
+/// give a contact plane (their lowest extent) and an axle direction
+/// (front group to back group), which is a more reliable "which way is
+/// this vehicle standing" than a bounding box. Rotors and thrusters would
+/// serve the same purpose on an aircraft; `hardpoints::find` already
+/// locates thrusters and a cockpit, and this uses the wheel tags the
+/// loader assigns.
+///
+/// ## Cavity
+///
+/// Voxelise the hull, flood-fill the empty cells from the outside, and
+/// whatever empty space the fill cannot reach is enclosed interior. That
+/// is the hangar bay.
+fn cavity_report(dir: &Path) {
+    let (raws, _half) = model::load_raw(dir, 4.2);
+    if raws.is_empty() {
+        println!("no prims");
+        return;
+    }
+    let is_wheel = |t: model::Tag| matches!(t, model::Tag::WheelFront | model::Tag::WheelBack);
+
+    let pts_of = |p: &model::RawPrim| -> Vec<Vec3> {
+        p.verts.iter().map(|v| Vec3::from_array(v.pos)).collect()
+    };
+    let all: Vec<Vec3> = raws.iter().flat_map(|p| pts_of(p)).collect();
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for p in &all {
+        lo = lo.min(*p);
+        hi = hi.max(*p);
+    }
+
+    // Running gear: the contact plane and the axle span.
+    let wheels: Vec<Vec3> = raws.iter().filter(|p| is_wheel(p.tag)).flat_map(pts_of).collect();
+    let ground = if wheels.is_empty() {
+        lo.y
+    } else {
+        wheels.iter().fold(f32::MAX, |a, p| a.min(p.y))
+    };
+    let axle_span = if wheels.is_empty() {
+        hi.z - lo.z
+    } else {
+        let zlo = wheels.iter().fold(f32::MAX, |a, p| a.min(p.z));
+        let zhi = wheels.iter().fold(f32::MIN, |a, p| a.max(p.z));
+        zhi - zlo
+    };
+
+    // Voxelise. 40^3 over the hull is coarse enough to run in a moment
+    // and fine enough that a cabin-sized void survives.
+    const G: usize = 64;
+    let size = (hi - lo).max(Vec3::splat(1e-4));
+    let cell = size / G as f32;
+    let idx = |x: usize, y: usize, z: usize| (z * G + y) * G + x;
+    let mut solid = vec![false; G * G * G];
+    let mut limb_solid = vec![false; G * G * G];
+
+    let refs_pts: Vec<Vec<Vec3>> = raws.iter().map(pts_of).collect();
+    let refs: Vec<&[Vec3]> = refs_pts.iter().map(|v| v.as_slice()).collect();
+    let sk = skeleton::skeletonize(&refs);
+    let limb_prims: std::collections::BTreeSet<usize> =
+        sk.limbs.iter().flat_map(|l| l.prims.iter().copied()).collect();
+
+    // TRIANGLES, NOT VERTICES.
+    //
+    // The first version marked cells containing a vertex. On a coarse
+    // hull that leaves the shell full of holes, the flood fill leaks
+    // inside, and every vehicle reports a cavity of ~15 cells out of
+    // 64000 — "no interior space", which is an artifact of the
+    // voxelisation rather than a fact about the asset. A watertight-ish
+    // shell needs the triangle FACES rasterised.
+    //
+    // Sampled barycentrically at a density set by the triangle's size in
+    // cells, so a large face cannot step over one.
+    let mut mark = |p: Vec3, limb: bool| {
+        let c = ((p - lo) / cell).floor();
+        let (x, y, z) = (
+            (c.x.max(0.0) as usize).min(G - 1),
+            (c.y.max(0.0) as usize).min(G - 1),
+            (c.z.max(0.0) as usize).min(G - 1),
+        );
+        if limb {
+            limb_solid[idx(x, y, z)] = true;
+        } else {
+            solid[idx(x, y, z)] = true;
+        }
+    };
+    for (i, prim) in raws.iter().enumerate() {
+        let limb = limb_prims.contains(&i);
+        let vp: Vec<Vec3> = prim.verts.iter().map(|v| Vec3::from_array(v.pos)).collect();
+        for t in prim.idx.chunks_exact(3) {
+            let (a, b, c) = (
+                vp[t[0] as usize],
+                vp[t[1] as usize],
+                vp[t[2] as usize],
+            );
+            let longest = (b - a).length().max((c - b).length()).max((a - c).length());
+            let steps = ((longest / cell.min_element().max(1e-6)).ceil() as usize).clamp(1, 24);
+            for u in 0..=steps {
+                for v in 0..=(steps - u) {
+                    let (fu, fv) = (u as f32 / steps as f32, v as f32 / steps as f32);
+                    mark(a + (b - a) * fu + (c - a) * fv, limb);
+                }
+            }
+        }
+    }
+
+    // Flood fill the empty space from the boundary. Anything empty the
+    // fill never reaches is enclosed by hull.
+    let mut outside = vec![false; G * G * G];
+    let mut stack: Vec<(usize, usize, usize)> = Vec::new();
+    for a in 0..G {
+        for b in 0..G {
+            for (x, y, z) in [
+                (0, a, b), (G - 1, a, b),
+                (a, 0, b), (a, G - 1, b),
+                (a, b, 0), (a, b, G - 1),
+            ] {
+                if !solid[idx(x, y, z)] && !outside[idx(x, y, z)] {
+                    outside[idx(x, y, z)] = true;
+                    stack.push((x, y, z));
+                }
+            }
+        }
+    }
+    while let Some((x, y, z)) = stack.pop() {
+        let mut push = |nx: usize, ny: usize, nz: usize, st: &mut Vec<_>, out: &mut Vec<bool>| {
+            if !solid[idx(nx, ny, nz)] && !out[idx(nx, ny, nz)] {
+                out[idx(nx, ny, nz)] = true;
+                st.push((nx, ny, nz));
+            }
+        };
+        if x > 0 { push(x - 1, y, z, &mut stack, &mut outside); }
+        if x + 1 < G { push(x + 1, y, z, &mut stack, &mut outside); }
+        if y > 0 { push(x, y - 1, z, &mut stack, &mut outside); }
+        if y + 1 < G { push(x, y + 1, z, &mut stack, &mut outside); }
+        if z > 0 { push(x, y, z - 1, &mut stack, &mut outside); }
+        if z + 1 < G { push(x, y, z + 1, &mut stack, &mut outside); }
+    }
+
+    let mut cavity = 0usize;
+    let mut cavity_above_ground = 0usize;
+    let mut limb_cells = 0usize;
+    let mut limb_in_cavity = 0usize;
+    let gy = (((ground - lo.y) / cell.y).floor() as usize).min(G - 1);
+    for z in 0..G {
+        for y in 0..G {
+            for x in 0..G {
+                let i = idx(x, y, z);
+                let enclosed = !solid[i] && !outside[i];
+                if enclosed {
+                    cavity += 1;
+                    if y >= gy {
+                        cavity_above_ground += 1;
+                    }
+                }
+                if limb_solid[i] {
+                    limb_cells += 1;
+                    if enclosed {
+                        limb_in_cavity += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // LIMB VOLUME, not limb surface.
+    //
+    // `limb_cells` counts rasterised FACES. Comparing that to a cavity
+    // measured as empty enclosed VOLUME is apples to oranges and would
+    // overstate what the limbs need. Fill the limb shells the same way
+    // the hull was filled: flood from the boundary treating limb surfaces
+    // as solid, and anything unreached is limb interior.
+    let mut limb_outside = vec![false; G * G * G];
+    let mut st: Vec<(usize, usize, usize)> = Vec::new();
+    for a in 0..G {
+        for b in 0..G {
+            for (x, y, z) in [
+                (0, a, b), (G - 1, a, b),
+                (a, 0, b), (a, G - 1, b),
+                (a, b, 0), (a, b, G - 1),
+            ] {
+                if !limb_solid[idx(x, y, z)] && !limb_outside[idx(x, y, z)] {
+                    limb_outside[idx(x, y, z)] = true;
+                    st.push((x, y, z));
+                }
+            }
+        }
+    }
+    while let Some((x, y, z)) = st.pop() {
+        let mut push = |nx: usize, ny: usize, nz: usize, s: &mut Vec<_>, o: &mut Vec<bool>| {
+            if !limb_solid[idx(nx, ny, nz)] && !o[idx(nx, ny, nz)] {
+                o[idx(nx, ny, nz)] = true;
+                s.push((nx, ny, nz));
+            }
+        };
+        if x > 0 { push(x - 1, y, z, &mut st, &mut limb_outside); }
+        if x + 1 < G { push(x + 1, y, z, &mut st, &mut limb_outside); }
+        if y > 0 { push(x, y - 1, z, &mut st, &mut limb_outside); }
+        if y + 1 < G { push(x, y + 1, z, &mut st, &mut limb_outside); }
+        if z > 0 { push(x, y, z - 1, &mut st, &mut limb_outside); }
+        if z + 1 < G { push(x, y, z + 1, &mut st, &mut limb_outside); }
+    }
+    let limb_volume = (0..G * G * G)
+        .filter(|i| limb_solid[*i] || !limb_outside[*i])
+        .count();
+
+    let cellv = 1.0 / (G * G * G) as f32;
+    println!("{}", dir.display());
+    println!("  wheels: {} verts, contact plane y={:.3}, axle span {:.3}",
+        wheels.len(), ground, axle_span);
+    println!("  hull cells {}  cavity {} ({:.1}% of the box, {:.1}% of it above the wheels)",
+        solid.iter().filter(|s| **s).count(),
+        cavity,
+        cavity as f32 * cellv * 100.0,
+        if cavity > 0 { cavity_above_ground as f32 / cavity as f32 * 100.0 } else { 0.0 });
+    println!("  limb surface {}  limb VOLUME {}  already inside the cavity: {} ({:.0}%)",
+        limb_cells, limb_volume, limb_in_cavity,
+        if limb_cells > 0 { limb_in_cavity as f32 / limb_cells as f32 * 100.0 } else { 0.0 });
+    println!("  cavity/limb volume ratio: {:.2}", cavity_above_ground as f32 / limb_volume.max(1) as f32);
+    let verdict = if limb_cells == 0 {
+        "no limbs detected"
+    } else if cavity_above_ground >= limb_volume {
+        "FITS — the hull encloses more space than the limbs occupy; hiding is a placement problem"
+    } else {
+        "DOES NOT FIT — the cavity is smaller than the limbs; no stow can hide them"
+    };
+    println!("  {verdict}");
 }
