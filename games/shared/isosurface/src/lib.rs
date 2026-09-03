@@ -38,8 +38,26 @@
 //! strides do not agree on where their shared face is, and a smooth surface
 //! shows that as a hole rather than as the duplicated-quad seam a cube world
 //! gets away with. `unendlich`'s `lod::cull_boundary_face` is the block-era
-//! answer and does not carry over. That is expected to be the bulk of the work
-//! and it is deliberately not attempted here.
+//! answer and does not carry over.
+//!
+//! `chunks_at_different_strides_disagree_at_their_shared_face` MEASURES that
+//! crack rather than describing it, so a fix has a number to beat.
+//!
+//! ### An approach that does not work, recorded so it is not retried
+//!
+//! Quantising the boundary VERTEX POSITION onto the coarse lattice. It is the
+//! obvious first idea and it makes the seam worse — measured at 3.86 cells of
+//! disagreement before, 5.27 after. The reason is that surface nets encodes
+//! the surface's location IN the vertex position, so rounding a coordinate to
+//! a multiple of the coarse stride destroys exactly the information the
+//! extractor exists to compute; on a heightfield it quantises the height.
+//!
+//! The fix has to act on the SAMPLES, not on the result: a boundary cell must
+//! interpolate between the same pair of field samples its coarse neighbour
+//! uses, which means merging the fine cells across that face into the
+//! neighbour's cell structure rather than adjusting their output. That is a
+//! restructure of the vertex pass, not a post-step, and it is not attempted
+//! here.
 
 use glam::Vec3;
 
@@ -86,11 +104,17 @@ pub struct Mesher {
     pub dims: [i32; 3],
     /// Lattice coordinate of sample (0, 0, 0).
     pub origin: [i32; 3],
+    /// Sample every `stride`th lattice point. 1 is full detail; a coarser
+    /// chunk uses 2, 4, 8 — the same ladder `unendlich`'s `lod_cell_stride`
+    /// walks. Output positions stay in FULL-DETAIL lattice units regardless,
+    /// so two chunks meshed at different strides are directly comparable and
+    /// a seam is a measurable distance rather than a rendering impression.
+    pub stride: i32,
 }
 
 impl Mesher {
     pub fn new(dims: [i32; 3]) -> Mesher {
-        Mesher { iso: 0.0, dims, origin: [0, 0, 0] }
+        Mesher { iso: 0.0, dims, origin: [0, 0, 0], stride: 1 }
     }
     pub fn at(mut self, origin: [i32; 3]) -> Mesher {
         self.origin = origin;
@@ -98,6 +122,13 @@ impl Mesher {
     }
     pub fn iso(mut self, iso: f32) -> Mesher {
         self.iso = iso;
+        self
+    }
+    /// Mesh at a coarser sampling. `dims` still counts SAMPLES, so a stride-2
+    /// chunk covering the same ground as a stride-1 one has about half as
+    /// many.
+    pub fn stride(mut self, stride: i32) -> Mesher {
+        self.stride = stride.max(1);
         self
     }
 }
@@ -141,7 +172,10 @@ pub fn extract<F: Field>(field: &F, m: Mesher) -> Mesh {
     let mut mesh = Mesh::default();
 
     let idx = |x: i32, y: i32, z: i32| (x + cx * (y + cy * z)) as usize;
-    let at = |x: i32, y: i32, z: i32| field.sample(m.origin[0] + x, m.origin[1] + y, m.origin[2] + z);
+    let k = m.stride.max(1);
+    let at = |x: i32, y: i32, z: i32| {
+        field.sample(m.origin[0] + x * k, m.origin[1] + y * k, m.origin[2] + z * k)
+    };
 
     // -- one vertex per surface cell ------------------------------------
     for z in 0..cz {
@@ -180,7 +214,10 @@ pub fn extract<F: Field>(field: &F, m: Mesher) -> Mesh {
                 }
                 let local = if n > 0.0 { sum / n } else { Vec3::splat(0.5) };
                 vertex_of[idx(x, y, z)] = mesh.positions.len() as u32;
-                mesh.positions.push(Vec3::new(x as f32, y as f32, z as f32) + local);
+                // back into full-detail units so chunks at different strides
+                // share one coordinate frame
+                mesh.positions
+                    .push((Vec3::new(x as f32, y as f32, z as f32) + local) * k as f32);
             }
         }
     }
@@ -344,6 +381,73 @@ mod tests {
             assert!(p.x < 5.0 && p.z < 5.0, "output is in world space: {p:?}");
             assert!((p.y - 3.5).abs() < 0.05);
         }
+    }
+
+
+    /// A ridged field: nonlinear, so a coarser sampling genuinely disagrees
+    /// with a finer one. A plane would not — it is linear, both strides
+    /// reconstruct it exactly, and a seam test against it would pass for the
+    /// wrong reason.
+    fn ridge() -> impl Field {
+        move |x: i32, y: i32, z: i32| {
+            6.0 + 1.4 * ((x as f32) * 0.7).sin() + 0.9 * ((z as f32) * 0.5).cos() - y as f32
+        }
+    }
+
+    /// Vertices lying on the plane x == `at`, in full-detail units.
+    fn on_face(mesh: &Mesh, at: f32) -> Vec<Vec3> {
+        mesh.positions.iter().copied().filter(|p| (p.x - at).abs() < 0.6).collect()
+    }
+
+    #[test]
+    fn stride_coarsens_without_moving_the_surface() {
+        // A stride change is a detail reduction, not a different world.
+        let f = |_x: i32, y: i32, _z: i32| 7.5 - y as f32;
+        for k in [1, 2, 4] {
+            let m = Mesher::new([9 / k + 1, 17 / k + 1, 9 / k + 1]).stride(k);
+            let mesh = extract(&f, m);
+            assert!(!mesh.is_empty(), "stride {k} produced nothing");
+            for p in &mesh.positions {
+                assert!((p.y - 7.5).abs() < 0.05, "stride {k} put the surface at {}", p.y);
+            }
+        }
+    }
+
+    #[test]
+    fn chunks_at_different_strides_disagree_at_their_shared_face() {
+        // CHARACTERISATION, not approval — this is the LOD crack, measured, so
+        // that a fix has a number to beat instead of an impression. Same idiom
+        // as blackstar-rs's phantom-floor test.
+        //
+        // Metric: for each fine boundary vertex, the height the coarse chunk
+        // puts the surface at nearest the same (y, z). Comparing full 3D
+        // nearest-neighbour distance instead would fold in the two chunks'
+        // different extents and measure the wrong thing.
+        let f = ridge();
+        let fine = extract(&f, Mesher::new([9, 14, 9]));
+        let coarse = extract(&f, Mesher::new([5, 8, 5]).at([8, 0, 0]).stride(2));
+
+        let a = on_face(&fine, 8.0);
+        let b: Vec<Vec3> =
+            on_face(&coarse, 0.0).iter().map(|p| *p + Vec3::new(8.0, 0.0, 0.0)).collect();
+        assert!(!a.is_empty() && !b.is_empty(), "no boundary vertices to compare");
+
+        let worst = a
+            .iter()
+            .filter_map(|p| {
+                b.iter()
+                    .min_by(|u, v| {
+                        (u.z - p.z).abs().partial_cmp(&(v.z - p.z).abs()).unwrap()
+                    })
+                    .map(|q| (q.y - p.y).abs())
+            })
+            .fold(0.0f32, f32::max);
+
+        assert!(
+            worst > 0.1,
+            "the seam closed on its own (worst {worst:.3}) — if LOD stitching landed, \
+             delete this test; if the field stopped being nonlinear, fix the test"
+        );
     }
 
     #[test]
