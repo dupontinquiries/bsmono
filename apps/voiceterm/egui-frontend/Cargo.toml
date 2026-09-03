@@ -49,6 +49,11 @@ config-kit = { path = "../../../shared/config-kit" }
 # in the app crate, which has no [lib] and pulls qmetaobject — so reaching a
 # pure state machine would have dragged Qt into this frontend.
 peer-handshake = { path = "../../../shared/peer-handshake" }
+# The tab + pane layout tree. terminal_workspace.rs is #[path]-included
+# from the app crate and now sits on top of this, so the dependency has
+# to be here too — without it this frontend does not compile, which is
+# exactly what happened when the model was lifted.
+pane-kit = { path = "../../../shared/pane-kit" }
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 # The terminal needs an actual shell: pty_host spawns one. Same crate

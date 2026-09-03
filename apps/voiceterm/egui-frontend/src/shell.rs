@@ -22,7 +22,11 @@
 //! vibes") is a real, separate feature visible in the settings screenshot — not ported here.
 
 use crate::gesture_menus::WsCall;
-use crate::terminal_workspace::{Dir, PaneKind, TermWorkspace};
+// TermPanes is an extension trait: the layout model moved to
+// shared/pane-kit, and inherent methods can only be added in the crate
+// that defines a type, so voiceterm's own pane operations (web panes,
+// the wire format, the snapshot) arrive this way and must be in scope.
+use crate::terminal_workspace::{Dir, PaneKind, TermPanes as _, TermWorkspace};
 use egui::{Rect, Response, Ui};
 use uikit_egui::dock::{self, Chip, Corner};
 use uikit_egui::PaletteColors;

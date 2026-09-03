@@ -1003,6 +1003,10 @@ pub struct App {
     /// control codes, arrows, tab. Distinct from the submitted line, which is
     /// user text the host may echo or log.
     pending_bytes: Vec<u8>,
+    /// Who encodes keyboard input — see `set_input_owner`. Default
+    /// `Widget`, which is the safe side: a host that forgets to declare
+    /// itself gets a working line editor rather than a dead terminal.
+    input_owner: keys::InputOwner,
     pub prefs: settings_kit::Prefs,
     pub cell: (f32, f32),
     pub font_size: f32,
@@ -1037,6 +1041,7 @@ impl App {
     pub fn new(cols: usize, rows: usize) -> App {
         App {
             pending_bytes: Vec::new(),
+            input_owner: keys::InputOwner::default(),
             terminal: Terminal::new(cols, rows),
             prefs: settings_kit::Prefs::default(),
             cell: (DEFAULT_FONT_SIZE * CELL_W_RATIO, DEFAULT_FONT_SIZE * CELL_H_RATIO),
@@ -1105,14 +1110,26 @@ impl App {
         if ui.ctx().egui_wants_keyboard_input() {
             return None;
         }
+        // Who encodes keys. `InputOwner::Host` means the host already
+        // read these events and produced bytes itself, so accumulating a
+        // line and encoding control keys here would send everything
+        // twice — see keys::InputOwner.
+        let owner = self.input_owner;
+        let mine = |c: keys::EventClass| keys::widget_handles(owner, c);
         let mut pending: Vec<u8> = Vec::new();
         let mut submitted = None;
         ui.input(|i| {
             for ev in &i.events {
                 match ev {
                     egui::Event::Text(t) => {
-                        self.terminal.grid.scroll_to_bottom(); // typing returns to live
-                        self.terminal.input.push_str(t);
+                        // Scroll-to-bottom happens in BOTH modes: typing
+                        // returning you to the live tail is the widget's
+                        // job either way, and the host's raw path has no
+                        // access to the scrollback.
+                        self.terminal.grid.scroll_to_bottom();
+                        if mine(keys::EventClass::Text) {
+                            self.terminal.input.push_str(t);
+                        }
                     }
                     egui::Event::Key { key: egui::Key::PageUp, pressed: true, modifiers, .. }
                         if modifiers.shift =>
@@ -1140,10 +1157,14 @@ impl App {
                         pending.extend_from_slice(
                             &keys::paste(t, self.terminal.grid.key_mode()));
                     }
-                    egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                    egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. }
+                        if mine(keys::EventClass::LineEdit) =>
+                    {
                         self.terminal.input.pop();
                     }
-                    egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => {
+                    egui::Event::Key { key: egui::Key::Enter, pressed: true, .. }
+                        if mine(keys::EventClass::LineEdit) =>
+                    {
                         submitted = Some(std::mem::take(&mut self.terminal.input));
                     }
                     // Ctrl/Cmd+F: open the find bar. Must come BEFORE the catch-all key arm
@@ -1172,7 +1193,9 @@ impl App {
                     // parses. Without these the widget is a text field that
                     // submits lines: no Ctrl-C to stop a runaway command, no
                     // up-arrow so every command is retyped, no tab completion.
-                    egui::Event::Key { key: k, pressed: true, modifiers, .. } => {
+                    egui::Event::Key { key: k, pressed: true, modifiers, .. }
+                        if mine(keys::EventClass::Encoded) =>
+                    {
                         let m = keys::Mods {
                             ctrl: modifiers.ctrl || modifiers.command,
                             alt: modifiers.alt,
@@ -1234,6 +1257,20 @@ impl App {
     /// Separate from the submitted line because they are a different thing: a
     /// line is user text the host may echo or log, these are raw terminal
     /// input the shell interprets immediately.
+    /// Declare who encodes keyboard input.
+    ///
+    /// A host that runs its own key encoder over the same egui events
+    /// MUST call this with [`keys::InputOwner::Host`], or every
+    /// keystroke reaches the shell twice. Defaults to `Widget`, which is
+    /// right for a host with no shell at all.
+    pub fn set_input_owner(&mut self, owner: keys::InputOwner) {
+        self.input_owner = owner;
+    }
+
+    pub fn input_owner(&self) -> keys::InputOwner {
+        self.input_owner
+    }
+
     pub fn take_pending_bytes(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending_bytes)
     }

@@ -3201,6 +3201,24 @@ impl eframe::App for VoicetermApp {
                 // the only signal that the line will not be audited.
                 ui.colored_label(self.colors.warning, "password prompt — input hidden, not recorded");
             }
+            // WHO ENCODES THE KEYS. `pty_input::drain_egui` above already
+            // read this frame's events and produced PTY bytes; if the
+            // widget also accumulates a line and encodes control keys,
+            // every keystroke reaches the shell TWICE — `ls` typed once
+            // and executed twice, Ctrl-C sending two SIGINTs, up-arrow
+            // skipping two history entries. uikit-term's own doc said "a
+            // host wires ONE of them"; this one wired both, and nothing
+            // caught it because each path is individually correct.
+            //
+            // Declared per frame rather than once at startup because the
+            // shell can go away: a pane whose spawn failed, or whose
+            // shell exited, falls back to the widget's line editor,
+            // which is the only thing that makes typing visible there.
+            self.app.set_input_owner(if self.pty.is_some() {
+                uikit_term::keys::InputOwner::Host
+            } else {
+                uikit_term::keys::InputOwner::Widget
+            });
             let submitted = if chorded { None } else { self.app.handle_input(ui) };
             let key_bytes = self.app.take_pending_bytes();
             self.session.pty_out.extend_from_slice(&key_bytes);

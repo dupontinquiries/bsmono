@@ -75,6 +75,73 @@ pub struct TermMode {
 
 /// Encode with the default (reset) modes. Kept so existing callers do not have
 /// to thread a mode they do not track.
+/// Who owns keyboard input for a terminal widget.
+///
+/// `uikit_term::App::handle_input` has always had two destinations — a
+/// line buffer for a host with no shell, and raw `pending_bytes` for one
+/// with a PTY — and its own doc says "a host wires ONE of them".
+/// voiceterm-egui wired both AND ran its own `pty_input::drain_egui`
+/// over the same events, so every keystroke reached the shell twice and
+/// every Enter ran the command twice: `ls` typed once, executed twice;
+/// Ctrl-C sending two SIGINTs; up-arrow skipping two history entries.
+///
+/// Nothing detected it because each path is individually correct. This
+/// enum is the missing statement of which one is in charge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputOwner {
+    /// The widget owns input: accumulate a line, submit on Enter, encode
+    /// control keys. Right when there is no shell — a demo, a failed
+    /// spawn — where the line buffer is the only thing making typing
+    /// visible.
+    #[default]
+    Widget,
+    /// The HOST encodes keys itself and the widget must not also. It
+    /// still handles what the host's raw path does not: scrollback keys,
+    /// find, and paste.
+    Host,
+}
+
+/// What a widget should do with one event class under `owner`.
+///
+/// Split out as a predicate rather than left as `if` statements inside
+/// the event loop so the policy is testable without an egui context —
+/// which is the only reason the bug above is now pinned by a test rather
+/// than by someone typing `ls` and watching it run twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventClass {
+    /// Printable text.
+    Text,
+    /// Enter, Backspace — the line editor's keys.
+    LineEdit,
+    /// Arrows, Tab, Escape, Ctrl-letter: encoded to PTY bytes.
+    Encoded,
+    /// Shift+PageUp/PageDown.
+    Scrollback,
+    /// Ctrl+F find, Ctrl+P reserved.
+    WidgetChord,
+    /// Clipboard paste.
+    Paste,
+}
+
+/// Whether the widget should act on this event class.
+///
+/// Paste stays with the widget in BOTH modes on purpose: voiceterm's raw
+/// path reads `Event::Text` and `Event::Key` and has no paste arm at all,
+/// so handing paste to the host would silently disable pasting into the
+/// terminal. Bracketing (DEC 2004) also needs the terminal's mode, which
+/// the widget has and a stateless encoder does not.
+pub fn widget_handles(owner: InputOwner, class: EventClass) -> bool {
+    match (owner, class) {
+        (InputOwner::Widget, _) => true,
+        (InputOwner::Host, EventClass::Text) => false,
+        (InputOwner::Host, EventClass::LineEdit) => false,
+        (InputOwner::Host, EventClass::Encoded) => false,
+        (InputOwner::Host, EventClass::Scrollback) => true,
+        (InputOwner::Host, EventClass::WidgetChord) => true,
+        (InputOwner::Host, EventClass::Paste) => true,
+    }
+}
+
 pub fn encode(key: Key, m: Mods) -> Option<Vec<u8>> {
     encode_mode(key, m, TermMode::default())
 }
@@ -239,6 +306,43 @@ pub fn is_eof(key: Key, m: Mods) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_widget_owns_everything_when_there_is_no_shell() {
+        for c in [
+            EventClass::Text,
+            EventClass::LineEdit,
+            EventClass::Encoded,
+            EventClass::Scrollback,
+            EventClass::WidgetChord,
+            EventClass::Paste,
+        ] {
+            assert!(widget_handles(InputOwner::Widget, c), "{c:?}");
+        }
+        assert_eq!(InputOwner::default(), InputOwner::Widget, "the safe default");
+    }
+
+    #[test]
+    fn a_host_with_a_pty_takes_the_input_classes_and_only_those() {
+        // the doubling bug: these three are what the host also encodes
+        assert!(!widget_handles(InputOwner::Host, EventClass::Text));
+        assert!(!widget_handles(InputOwner::Host, EventClass::LineEdit));
+        assert!(!widget_handles(InputOwner::Host, EventClass::Encoded));
+        // and these are what no host raw path covers
+        assert!(widget_handles(InputOwner::Host, EventClass::Scrollback));
+        assert!(widget_handles(InputOwner::Host, EventClass::WidgetChord));
+    }
+
+    #[test]
+    fn paste_stays_with_the_widget_in_both_modes() {
+        // voiceterm's raw path reads Text and Key events and has NO
+        // paste arm; handing paste to the host would silently break
+        // pasting, and bracketing needs the terminal's DEC 2004 state
+        // that only the widget has
+        assert!(widget_handles(InputOwner::Host, EventClass::Paste));
+        assert!(widget_handles(InputOwner::Widget, EventClass::Paste));
+    }
+
 
     fn enc(k: Key, m: Mods) -> String {
         String::from_utf8_lossy(&encode(k, m).expect("encodes")).into_owned()
