@@ -20,6 +20,7 @@ pub mod chain;
 pub mod assistant;
 pub mod retune;
 pub mod adaptive_sat;
+pub mod voice;
 pub mod psola;
 pub mod realtune;
 pub mod autotune;

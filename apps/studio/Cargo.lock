@@ -778,6 +778,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
+name = "dht-kit"
+version = "0.1.0"
+
+[[package]]
 name = "dispatch"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1799,6 +1803,10 @@ checksum = "d640282b302c0bb0a2a8e0233ead9035e3bed871f0b7e81fe4a1ec829765db44"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "math-kit"
+version = "0.1.0"
 
 [[package]]
 name = "memchr"
@@ -3035,6 +3043,9 @@ dependencies = [
 [[package]]
 name = "snapcore"
 version = "0.1.0"
+dependencies = [
+ "dht-kit",
+]
 
 [[package]]
 name = "stable_deref_trait"
@@ -3590,6 +3601,7 @@ name = "uikit-egui"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "math-kit",
  "settings-kit",
  "snapclone-theme",
  "touchkit",
