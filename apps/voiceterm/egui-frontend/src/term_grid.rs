@@ -340,6 +340,82 @@ impl TermGrid {
         }
     }
 
+    /// Rows in the whole buffer: scrollback plus the live screen.
+    ///
+    /// "Absolute row" below means an index into this, 0 being the oldest
+    /// row still kept.
+    pub fn total_rows(&self) -> usize {
+        self.scrollback.len() + self.rows
+    }
+
+    /// Any row, live or historical, as text.
+    pub fn abs_row_text(&self, abs: usize) -> String {
+        let render = |row: &Vec<Cell>| -> String {
+            row.iter().filter(|c| !c.is_phantom()).map(|c| c.ch).collect()
+        };
+        match self.scrollback.get(abs) {
+            Some(row) => render(row),
+            None => match self.cells.get(abs - self.scrollback.len()) {
+                Some(row) => render(row),
+                None => String::new(),
+            },
+        }
+    }
+
+    /// Every occurrence of `needle`, as (absolute row, char column),
+    /// oldest first.
+    ///
+    /// Searches the WHOLE buffer including scrollback, because the
+    /// reason to search a terminal is almost always to find something
+    /// that has scrolled away. Case-insensitive: a terminal is full of
+    /// mixed-case paths and error text, and an exact-case default makes
+    /// the feature feel broken before it feels precise.
+    ///
+    /// Columns are char offsets into `abs_row_text`, so they line up
+    /// with what is rendered rather than with the cell array — a wide
+    /// glyph occupies one text position and two cells.
+    pub fn find_all(&self, needle: &str) -> Vec<(usize, usize)> {
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let want = needle.to_lowercase();
+        let mut out = Vec::new();
+        for abs in 0..self.total_rows() {
+            let hay = self.abs_row_text(abs).to_lowercase();
+            let mut from = 0usize;
+            while let Some(rel) = hay[from..].find(&want) {
+                let byte = from + rel;
+                // char column, not byte offset
+                out.push((abs, hay[..byte].chars().count()));
+                // Overlapping matches are not reported: advancing by one
+                // CHAR rather than by the needle would report "aa" twice
+                // in "aaa", and a match counter that disagrees with what
+                // is highlighted is worse than missing an overlap.
+                from = byte + want.len();
+                if from >= hay.len() {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Scroll so that absolute row `abs` is on screen, roughly centred.
+    ///
+    /// Clamped at both ends, so jumping to the newest match does not
+    /// leave the view hanging past the live tail.
+    pub fn scroll_to_abs_row(&mut self, abs: usize) {
+        let half = self.rows / 2;
+        let top = abs.saturating_sub(half);
+        // view_offset counts rows ABOVE the live screen's first row.
+        let live_top = self.scrollback.len();
+        let want = live_top.saturating_sub(top).min(self.scrollback.len());
+        if want != self.view_offset {
+            self.view_offset = want;
+            self.mark_all();
+        }
+    }
+
     /// A visible row as text, skipping phantoms so a wide glyph appears
     /// once.
     ///
@@ -374,6 +450,83 @@ impl TermGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_searches_scrollback_not_just_the_screen() {
+        // the reason to search a terminal is usually to find something
+        // that has already scrolled away
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        lines(&mut g, &mut vt, 0, 8);
+        let hits = g.find_all("line1");
+        assert!(!hits.is_empty(), "line1 scrolled off and must still be findable");
+    }
+
+    #[test]
+    fn find_is_case_insensitive() {
+        let mut g = TermGrid::new(30, 3);
+        let mut vt = Vt::default();
+        vt.feed(&mut g, b"Error: NotFound\r\n");
+        assert_eq!(g.find_all("error").len(), 1);
+        assert_eq!(g.find_all("NOTFOUND").len(), 1);
+    }
+
+    #[test]
+    fn find_reports_char_columns_and_every_occurrence_in_a_row() {
+        let mut g = TermGrid::new(30, 3);
+        let mut vt = Vt::default();
+        vt.feed(&mut g, b"ab ab ab\r\n");
+        let cols: Vec<usize> = g.find_all("ab").iter().map(|(_, c)| *c).collect();
+        assert_eq!(cols, vec![0, 3, 6]);
+    }
+
+    #[test]
+    fn overlapping_matches_are_not_double_counted() {
+        // a counter that disagrees with what is highlighted is worse
+        // than missing an overlap
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        vt.feed(&mut g, b"aaaa\r\n");
+        assert_eq!(g.find_all("aa").len(), 2);
+    }
+
+    #[test]
+    fn an_empty_needle_matches_nothing() {
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        vt.feed(&mut g, b"hello\r\n");
+        assert!(g.find_all("").is_empty(), "or every row would be a hit");
+    }
+
+    #[test]
+    fn a_wide_glyph_counts_as_one_column() {
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        vt.feed(&mut g, "日x\r\n".as_bytes());
+        assert_eq!(g.find_all("x"), vec![(0, 1)], "the phantom cell is not a column");
+    }
+
+    #[test]
+    fn jumping_to_a_match_brings_it_on_screen() {
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        lines(&mut g, &mut vt, 0, 20);
+        let (abs, _) = g.find_all("line2")[0];
+        g.scroll_to_abs_row(abs);
+        let view: Vec<String> = (0..3).map(|y| g.row_text(y).trim_end().to_string()).collect();
+        assert!(view.iter().any(|r| r == "line2"), "view was {view:?}");
+    }
+
+    #[test]
+    fn jumping_to_a_live_match_does_not_hang_past_the_tail() {
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        lines(&mut g, &mut vt, 0, 20);
+        let last = g.find_all("line19").last().copied().unwrap();
+        g.scroll_to_abs_row(last.0);
+        assert!(g.view_offset() <= g.scrollback_len());
+    }
+
 
     /// Feed `n` numbered lines so scrolled-off rows are identifiable.
     fn lines(g: &mut TermGrid, vt: &mut Vt, from: usize, to: usize) {

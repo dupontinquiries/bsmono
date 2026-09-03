@@ -449,6 +449,15 @@ struct VoicetermApp {
     /// Panes whose shell spawn already failed. Without this a machine
     /// with no usable shell is asked for one sixty times a second.
     pty_spawn_failed: std::collections::HashSet<u64>,
+    /// Find-in-terminal: the query, and which match we are on.
+    ///
+    /// `uikit_term::App` has a find bar, but it searches ITS grid, which
+    /// nothing feeds here — and nothing in this binary ever called
+    /// `search_ui`, so the menu item set a flag that no frame rendered.
+    /// The state lives with the grid that has the text.
+    find_open: bool,
+    find_query: String,
+    find_at: usize,
     /// One-shot latch so "shell exited" is said once, not every frame.
     pty_ended_noted: bool,
     /// The QML settingsPopup's launcher half — four doors plus voice
@@ -3371,6 +3380,52 @@ impl eframe::App for VoicetermApp {
                     foreground: None,
                     visible: Some(&self.session.grid.row_text(self.session.grid.cursor().1)),
                 });
+            if self.find_open {
+                let hits = self.session.grid.find_all(&self.find_query);
+                ui.horizontal(|ui| {
+                    ui.label("find");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.find_query)
+                            .id_salt("voiceterm-find")
+                            .hint_text("search the screen and scrollback…")
+                            .desired_width(220.0),
+                    );
+                    if resp.changed() {
+                        self.find_at = 0;
+                    }
+                    // Counting from 1 because a match counter is read by
+                    // a person, not indexed by one.
+                    let n = hits.len();
+                    ui.label(if n == 0 && !self.find_query.is_empty() {
+                        "no matches".to_string()
+                    } else if n == 0 {
+                        String::new()
+                    } else {
+                        format!("{}/{}", self.find_at + 1, n)
+                    });
+                    let mut jump = None;
+                    if ui.button("‹").clicked() && n > 0 {
+                        self.find_at = (self.find_at + n - 1) % n;
+                        jump = Some(self.find_at);
+                    }
+                    if ui.button("›").clicked() && n > 0 {
+                        self.find_at = (self.find_at + 1) % n;
+                        jump = Some(self.find_at);
+                    }
+                    if ui.button("✕").clicked() {
+                        self.find_open = false;
+                        // Back to the live tail: leaving the view parked
+                        // in history after closing the bar reads as the
+                        // terminal having stopped.
+                        self.session.grid.scroll_to_bottom();
+                    }
+                    if let Some(i) = jump {
+                        if let Some(&(abs, _)) = hits.get(i) {
+                            self.session.grid.scroll_to_abs_row(abs);
+                        }
+                    }
+                });
+            }
             if self.password_mode {
                 // SAID OUT LOUD. A terminal that silently stops echoing looks
                 // broken; one that says why looks careful — and this is also
@@ -3902,7 +3957,10 @@ impl eframe::App for VoicetermApp {
                         ctx.copy_text(text);
                         self.toasts.success("Copied", ctx.input(|i| i.time));
                     }
-                    Some(PaneAction::CommandPalette) => self.app.open_search(), // nearest on-device affordance today
+                    // Opens THIS find bar, not the widget's: that one
+                    // searches a grid nothing feeds and was never
+                    // rendered by any frame here.
+                    Some(PaneAction::CommandPalette) => self.find_open = true,
                     // Through apply(), the same WsCall path the keyboard chords use —
                     // this arm was `{}` and the 3x3 menu's new-tab/split/close silently
                     // did nothing (field report, c11). Mic remains on-device wiring.
@@ -4142,6 +4200,9 @@ fn main() -> eframe::Result<()> {
                 pty_ended_noted: false,
                 pane_ptys: std::collections::HashMap::new(),
                 pty_spawn_failed: std::collections::HashSet::new(),
+                find_open: false,
+                find_query: String::new(),
+                find_at: 0,
                 launcher: uikit_egui::quick_launcher::LauncherState::default(),
                 a11y: uikit_egui::a11y::A11yScene::new(),
                 mail: Default::default(),

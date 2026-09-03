@@ -411,5 +411,17 @@ mod tests {
             0,
             "screen_text reads the unfed grid; build it from session.grid."
         );
+        // FIND SEARCHES THE GRID WITH THE TEXT. The widget's find bar
+        // searches its own unfed grid, and nothing here ever rendered
+        // it — the menu item set a flag no frame read.
+        assert_eq!(
+            src.matches("self.app.open_search()").count(),
+            0,
+            "the widget's find bar is back — it searches a grid nothing feeds."
+        );
+        assert!(
+            src.contains("self.session.grid.find_all("),
+            "find no longer searches the session grid."
+        );
     }
 }
