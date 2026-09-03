@@ -138,6 +138,32 @@ pub enum EventClass {
 /// handing paste to the host would silently disable pasting into the
 /// terminal. Bracketing (DEC 2004) also needs the terminal's mode, which
 /// the widget has and a stateless encoder does not.
+/// Whether these bytes make the SHELL discard its current input line.
+///
+/// A host that keeps its own copy of the line — voiceterm's does, and
+/// `cmd_risk::withhold_enter` reads it to decide whether a command needs
+/// confirming — has to clear that copy when the shell clears its own, or
+/// the two drift apart.
+///
+/// The drift is not cosmetic. Type `rm -rf build`, press Ctrl-C (the
+/// shell discards it), type `ls`, press Enter: the host's copy reads
+/// `rm -rf buildls`, so a confirmation appears quoting a command that
+/// was never entered — and, worse in the other direction, a stale
+/// harmless prefix can make a real one classify wrong.
+///
+/// `Terminal::interrupt` existed for exactly this and had no caller.
+///
+/// * `0x03` Ctrl-C — SIGINT; readline abandons the line.
+/// * `0x15` Ctrl-U — unix-line-discard; kills it outright.
+///
+/// Ctrl-W (delete word) and Ctrl-K (kill to end) are deliberately absent:
+/// they edit the line rather than discard it, and mirroring a partial
+/// edit needs the host to model readline, which is a much bigger claim
+/// than "these two bytes empty it".
+pub fn clears_the_line(bytes: &[u8]) -> bool {
+    bytes == [0x03] || bytes == [0x15]
+}
+
 /// Whether the HOST's raw key path should run this frame.
 ///
 /// The mirror of `widget_handles`, and the half that was missing: gating
@@ -328,6 +354,25 @@ pub fn is_eof(key: Key, m: Mods) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupt_and_line_discard_clear_the_line() {
+        assert!(clears_the_line(&[0x03]), "Ctrl-C");
+        assert!(clears_the_line(&[0x15]), "Ctrl-U");
+    }
+
+    #[test]
+    fn partial_line_edits_do_not_count() {
+        // mirroring these needs the host to model readline
+        assert!(!clears_the_line(&[0x17]), "Ctrl-W deletes a word");
+        assert!(!clears_the_line(&[0x0b]), "Ctrl-K kills to end of line");
+        assert!(!clears_the_line(&[0x7f]), "backspace");
+        assert!(!clears_the_line(b"\r"));
+        assert!(!clears_the_line(b"ls"));
+        assert!(!clears_the_line(&[]));
+        // a control byte inside a longer sequence is not a discard
+        assert!(!clears_the_line(&[0x1b, 0x03]));
+    }
 
     #[test]
     fn the_widget_owns_everything_when_there_is_no_shell() {

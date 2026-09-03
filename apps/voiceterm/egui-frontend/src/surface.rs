@@ -372,5 +372,12 @@ mod tests {
             "a surface stopped using stage_command — check whether it now \
              appends to pty_out directly."
         );
+        // A LINE DISCARD MUST REACH BOTH COPIES. Ctrl-C/Ctrl-U empty the
+        // shell's line; the widget's copy is what the risk gate reads.
+        assert!(
+            src.contains("keys::clears_the_line("),
+            "line discards are no longer mirrored — the risk gate will \
+             classify a line the shell has already thrown away."
+        );
     }
 }

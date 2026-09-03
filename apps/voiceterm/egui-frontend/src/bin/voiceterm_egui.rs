@@ -823,6 +823,13 @@ impl VoicetermApp {
     /// mirror. `stage` replaces the buffer rather than appending,
     /// matching what these surfaces do to the shell's line.
     fn stage_command(&mut self, cmd: &str) {
+        // Kill whatever is on the shell's line first. `Terminal::stage`
+        // REPLACES the widget's buffer, but appending to the shell only
+        // adds — so staging on top of a half-typed line left the shell
+        // holding `ls rm -rf build` while the mirror said `rm -rf build`.
+        // The mirror has to be exact, not approximate, because a safety
+        // check reads it.
+        self.session.pty_out.push(0x15); // Ctrl-U, unix-line-discard
         self.session.pty_out.extend_from_slice(cmd.as_bytes());
         self.app.terminal.stage(cmd);
     }
@@ -3235,6 +3242,19 @@ impl eframe::App for VoicetermApp {
                             .with_timeout_action(TimeoutAction::Cancel),
                         ));
                     } else {
+                        // MIRROR A LINE DISCARD. Ctrl-C and Ctrl-U empty
+                        // the shell's input line; the widget keeps its
+                        // own copy, and withhold_enter reads that copy to
+                        // decide whether a command needs confirming. Let
+                        // them drift and a confirmation quotes text that
+                        // was never entered — or, worse, a stale prefix
+                        // makes a real command classify wrong.
+                        //
+                        // Terminal::interrupt existed for this and had no
+                        // caller anywhere.
+                        if uikit_term::keys::clears_the_line(&out.bytes) {
+                            self.app.terminal.interrupt();
+                        }
                         self.session.pty_out.extend_from_slice(&out.bytes);
                     }
                 }
