@@ -267,7 +267,8 @@ impl OctreeArray {
         // Root covers the whole chunk: position (0,0,0), depth
         // OCTREE_DEPTH. The build_recursive call returns the index
         // of the root (which we expect to be the last node pushed).
-        let root_idx = build_recursive(chunk, 0, 0, 0, OCTREE_DEPTH, &mut nodes);
+        let pyramid = UniformPyramid::build(chunk);
+        let root_idx = build_recursive_pyramid(chunk, &pyramid, 0, 0, 0, OCTREE_DEPTH, &mut nodes);
         // Convention: root MUST be at index 0. If the recursion
         // didn't end with the root at index 0 (e.g., because of how
         // we pop-and-replace during collapse), rotate it there.
@@ -824,6 +825,156 @@ impl OctreeArray {
 /// Recursive builder. Pushes nodes representing the subtree rooted
 /// at (origin_x, origin_y, origin_z) with edge length 2^depth_remaining.
 /// Returns the array index of the root node of this subtree.
+/// Uniformity pyramid over a 32³ chunk: `levels[k][i]` is `Some(block)`
+/// when the 2^k-cube at that index holds one block id throughout,
+/// `None` otherwise. Built bottom-up in flat arrays — one pass over the
+/// blocks, then three cheap merges — so the tree builder can stop at the
+/// first uniform region instead of recursing to all 32 768 leaves and
+/// collapsing them afterwards.
+///
+/// Why this exists: `build_recursive` pushed a leaf node for EVERY cell
+/// (32 768 pushes plus interiors, with the Vec growing through ~15
+/// reallocations) and then `truncate`d them away wherever the eight
+/// children agreed. On the common chunk — mostly air above, mostly stone
+/// below — nearly all of that work was thrown out. The pyramid answers
+/// "is this region uniform?" in O(1) at the point of the decision.
+struct UniformPyramid {
+    /// Index by level: 0 => 16³ (2-cubes), 1 => 8³ (4-cubes),
+    /// 2 => 4³ (8-cubes), 3 => 2³ (16-cubes), 4 => 1³ (the whole 32-cube
+    /// — without it an all-air chunk builds 9 nodes instead of 1, which
+    /// is what `pyramid_builder_matches_legacy` caught). A 1-cube is the
+    /// block itself, read from the chunk.
+    levels: [Vec<Option<BlockId>>; 5],
+}
+
+impl UniformPyramid {
+    fn build(chunk: &Chunk) -> Self {
+        // Level 0: 16³ cells, each the merge of a 2×2×2 block group.
+        let mut l0: Vec<Option<BlockId>> = Vec::with_capacity(16 * 16 * 16);
+        for y in 0..16 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    let (bx, by, bz) = (x * 2, y * 2, z * 2);
+                    let first = chunk.get(bx, by, bz);
+                    let mut same = true;
+                    'cell: for dy in 0..2 {
+                        for dz in 0..2 {
+                            for dx in 0..2 {
+                                if (dx | dy | dz) == 0 { continue; }
+                                if chunk.get(bx + dx, by + dy, bz + dz) != first { same = false; break 'cell; }
+                            }
+                        }
+                    }
+                    l0.push(if same { Some(first) } else { None });
+                }
+            }
+        }
+        let merge = |src: &Vec<Option<BlockId>>, n: usize| -> Vec<Option<BlockId>> {
+            let half = n / 2;
+            let mut out = Vec::with_capacity(half * half * half);
+            let at = |x: usize, y: usize, z: usize| src[(y * n + z) * n + x];
+            for y in 0..half {
+                for z in 0..half {
+                    for x in 0..half {
+                        let (cx, cy, cz) = (x * 2, y * 2, z * 2);
+                        let first = at(cx, cy, cz);
+                        let mut v = first;
+                        if v.is_some() {
+                            'c: for dy in 0..2 {
+                                for dz in 0..2 {
+                                    for dx in 0..2 {
+                                        if at(cx + dx, cy + dy, cz + dz) != first { v = None; break 'c; }
+                                    }
+                                }
+                            }
+                        }
+                        out.push(v);
+                    }
+                }
+            }
+            out
+        };
+        let l1 = merge(&l0, 16);
+        let l2 = merge(&l1, 8);
+        let l3 = merge(&l2, 4);
+        let l4 = merge(&l3, 2);
+        UniformPyramid { levels: [l0, l1, l2, l3, l4] }
+    }
+
+    /// The uniform block of the `size`-cube whose minimum corner is
+    /// `(ox, oy, oz)`, if it has one. `size` is a power of two, 2..=32.
+    #[inline]
+    fn uniform(&self, ox: i32, oy: i32, oz: i32, size: i32) -> Option<BlockId> {
+        let (level, n) = match size {
+            2 => (0usize, 16usize),
+            4 => (1, 8),
+            8 => (2, 4),
+            16 => (3, 2),
+            32 => (4, 1),
+            _ => return None,
+        };
+        let (x, y, z) = ((ox / size) as usize, (oy / size) as usize, (oz / size) as usize);
+        self.levels[level][(y * n + z) * n + x]
+    }
+}
+
+/// Same tree as [`build_recursive`], built top-down: a region the
+/// pyramid calls uniform becomes one leaf immediately, so no node is
+/// ever pushed and truncated away. Node ORDER is unchanged (children
+/// pushed in octant order before their parent), so the root-swap in
+/// `from_chunk` and every consumer index stay valid.
+fn build_recursive_pyramid(
+    chunk: &Chunk,
+    pyramid: &UniformPyramid,
+    ox: i32, oy: i32, oz: i32,
+    depth_remaining: u32,
+    nodes: &mut Vec<OctreeNode>,
+) -> u32 {
+    if depth_remaining == 0 {
+        nodes.push(OctreeNode::leaf(0, chunk.get(ox, oy, oz)));
+        return (nodes.len() - 1) as u32;
+    }
+    let size = 1i32 << depth_remaining;
+    if let Some(block) = pyramid.uniform(ox, oy, oz, size) {
+        nodes.push(OctreeNode::leaf(depth_remaining, block));
+        return (nodes.len() - 1) as u32;
+    }
+    let half = size >> 1;
+    let mut child_idxs = [0u32; 8];
+    for octant in 0..8u32 {
+        let dx = (octant & 1) as i32 * half;
+        let dy = ((octant >> 1) & 1) as i32 * half;
+        let dz = ((octant >> 2) & 1) as i32 * half;
+        child_idxs[octant as usize] = build_recursive_pyramid(
+            chunk, pyramid, ox + dx, oy + dy, oz + dz, depth_remaining - 1, nodes);
+    }
+    nodes.push(OctreeNode::internal(depth_remaining, child_idxs));
+    (nodes.len() - 1) as u32
+}
+
+/// Build via the original bottom-up path. Test-only: the A/B partner and
+/// the correctness reference for `from_chunk`.
+#[cfg(test)]
+pub fn octree_from_chunk_legacy(chunk: &Chunk) -> OctreeArray {
+    let mut nodes = Vec::with_capacity(1024);
+    let root_idx = build_recursive(chunk, 0, 0, 0, OCTREE_DEPTH, &mut nodes);
+    if root_idx != 0 {
+        let last = nodes.len() - 1;
+        nodes.swap(0, last);
+        for node in nodes.iter_mut() {
+            if node.is_leaf() { continue; }
+            for c in node.children.iter_mut() {
+                if *c == 0 { *c = last as u32; } else if *c == last as u32 { *c = 0; }
+            }
+        }
+    }
+    OctreeArray { coord: chunk.coord, nodes }
+}
+
+/// The original bottom-up builder. Kept because it is the reference the
+/// pyramid builder is tested against (`pyramid_builder_matches_legacy`)
+/// and the A/B partner for its timing.
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_recursive(
     chunk: &Chunk,
     ox: i32, oy: i32, oz: i32,
@@ -1390,5 +1541,94 @@ mod tests {
         oct.set_block(4, 4, 4, BlockId::Stone, 2);
         assert_eq!(oct.node_count(), n, "no-op edit must not allocate nodes");
         assert_eq!(oct.sample(4, 4, 4), BlockId::Stone);
+    }
+}
+
+#[cfg(test)]
+mod pyramid_tests {
+    use super::*;
+    use crate::world::chunk::ChunkCoord;
+
+    fn chunk_from(f: impl Fn(i32, i32, i32) -> BlockId) -> Chunk {
+        let n = 32;
+        let mut blocks = vec![BlockId::Air; (n * n * n) as usize];
+        for y in 0..n { for z in 0..n { for x in 0..n {
+            blocks[Chunk::block_index(x, y, z)] = f(x, y, z);
+        }}}
+        Chunk::from_blocks(ChunkCoord::new(0, 0, 0), blocks)
+    }
+
+    struct Rng(u64);
+    impl Rng { fn next(&mut self) -> u64 { let mut x = self.0; x ^= x << 13; x ^= x >> 7; x ^= x << 17; self.0 = x; x } }
+
+    fn shapes() -> Vec<(&'static str, Chunk)> {
+        let mut r = Rng(0x9E3779B97F4A7C15);
+        vec![
+            ("all air", chunk_from(|_, _, _| BlockId::Air)),
+            ("all stone", chunk_from(|_, _, _| BlockId::Stone)),
+            ("heightfield", chunk_from(|x, y, z| {
+                let h = 6 + ((x * 3 + z * 5) % 13);
+                if y + 1 == h { BlockId::Grass } else if y < h { BlockId::Stone } else { BlockId::Air } })),
+            ("caves", chunk_from(|x, y, z| {
+                if ((x * 7 + y * 13 + z * 5) % 11) < 3 { BlockId::Air } else { BlockId::Stone } })),
+            ("noise", {
+                let mut blocks = vec![BlockId::Air; 32 * 32 * 32];
+                for b in blocks.iter_mut() { *b = if r.next() % 3 == 0 { BlockId::Air } else { BlockId::Stone }; }
+                Chunk::from_blocks(ChunkCoord::new(0, 0, 0), blocks)
+            }),
+            ("one block", chunk_from(|x, y, z| if (x, y, z) == (17, 5, 23) { BlockId::Stone } else { BlockId::Air })),
+        ]
+    }
+
+    #[test]
+    fn pyramid_builder_matches_legacy() {
+        for (name, c) in shapes() {
+            let a = OctreeArray::from_chunk(&c);
+            let b = octree_from_chunk_legacy(&c);
+            assert_eq!(a.nodes.len(), b.nodes.len(), "{}: node count", name);
+            for i in 0..a.nodes.len() {
+                assert_eq!(a.nodes[i].packed_header, b.nodes[i].packed_header, "{}: node {} header", name, i);
+                if !a.nodes[i].is_leaf() {
+                    assert_eq!(a.nodes[i].children, b.nodes[i].children, "{}: node {} children", name, i);
+                }
+            }
+            // And the tree answers the chunk, cell for cell.
+            for y in 0..32 { for z in 0..32 { for x in 0..32 {
+                assert_eq!(a.sample(x, y, z), c.get(x, y, z), "{}: sample ({},{},{})", name, x, y, z);
+            }}}
+        }
+    }
+
+    #[test]
+    fn uniform_regions_collapse_to_one_node() {
+        let air = chunk_from(|_, _, _| BlockId::Air);
+        assert_eq!(OctreeArray::from_chunk(&air).nodes.len(), 1);
+        let stone = chunk_from(|_, _, _| BlockId::Stone);
+        assert_eq!(OctreeArray::from_chunk(&stone).nodes.len(), 1);
+    }
+
+    /// In-process A/B: the pyramid builder against the bottom-up one.
+    #[test]
+    #[ignore]
+    fn octree_build_ab() {
+        use std::time::Instant;
+        let rounds = 40;
+        println!("octree build A/B ({} rounds each, interleaved):", rounds);
+        for (name, c) in shapes() {
+            let (mut t_new, mut t_old) = (0.0f64, 0.0f64);
+            let mut n_nodes = 0usize;
+            for r in 0..rounds {
+                if r % 2 == 0 {
+                    let t = Instant::now(); let a = OctreeArray::from_chunk(&c); t_new += t.elapsed().as_secs_f64(); n_nodes = a.nodes.len();
+                    let t = Instant::now(); let b = octree_from_chunk_legacy(&c); t_old += t.elapsed().as_secs_f64(); std::hint::black_box(b);
+                } else {
+                    let t = Instant::now(); let b = octree_from_chunk_legacy(&c); t_old += t.elapsed().as_secs_f64(); std::hint::black_box(b);
+                    let t = Instant::now(); let a = OctreeArray::from_chunk(&c); t_new += t.elapsed().as_secs_f64(); n_nodes = a.nodes.len();
+                }
+            }
+            let us = |t: f64| t * 1e6 / rounds as f64;
+            println!("  {:14} {:6} nodes   bottom-up {:8.1} us   pyramid {:8.1} us   ({:+.1}%)",
+                name, n_nodes, us(t_old), us(t_new), (t_new / t_old - 1.0) * 100.0);
+        }
     }
 }

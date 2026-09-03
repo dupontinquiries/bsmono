@@ -148,17 +148,49 @@ impl BitChunk {
     ///          ±Y → indexed `x * N + z`, bit y.
     ///          ±Z → indexed `x * N + y`, bit z.
     pub fn face_mask(&self, face: Face, neighbour: NeighbourLayer) -> [u32; NN] {
-        let (cols, positive): (&[u32; NN], bool) = match face {
-            Face::PosX => (&self.x_cols, true),
-            Face::NegX => (&self.x_cols, false),
-            Face::PosY => (&self.y_cols, true),
-            Face::NegY => (&self.y_cols, false),
-            Face::PosZ => (&self.z_cols, true),
-            Face::NegZ => (&self.z_cols, false),
-        };
+        face_mask_between(self, self, face, neighbour)
+    }
+
+    /// Union of two occupancy sets (per column OR), e.g. "opaque or glass".
+    pub fn union(&self, o: &BitChunk) -> BitChunk {
+        let mut r = self.clone();
+        for i in 0..NN { r.y_cols[i] |= o.y_cols[i]; r.x_cols[i] |= o.x_cols[i]; r.z_cols[i] |= o.z_cols[i]; }
+        r
+    }
+
+    /// Boundary layer of `self ∪ o` without materialising the union.
+    pub fn boundary_layer_union(&self, o: &BitChunk, face: Face) -> [u32; N] {
+        let a = self.boundary_layer(face);
+        let b = o.boundary_layer(face);
+        let mut out = [0u32; N];
+        for i in 0..N { out[i] = a[i] | b[i]; }
+        out
+    }
+
+    #[inline]
+    pub fn cols(&self, face: Face) -> &[u32; NN] {
+        match face {
+            Face::PosX | Face::NegX => &self.x_cols,
+            Face::PosY | Face::NegY => &self.y_cols,
+            Face::PosZ | Face::NegZ => &self.z_cols,
+        }
+    }
+}
+
+/// Exposed faces of the cells in `inner` whose neighbour on `face` is not
+/// in `blocker`. `face_mask` is the `inner == blocker` case. The mesher
+/// uses `inner = opaque, blocker = opaque` for solid cubes and
+/// `inner = glass, blocker = opaque ∪ glass` for a transparent type that
+/// does not draw faces against itself (the engine's
+/// `produces_face_against` rule).
+pub fn face_mask_between(inner: &BitChunk, blocker: &BitChunk, face: Face, neighbour: NeighbourLayer) -> [u32; NN] {
+    let positive = matches!(face, Face::PosX | Face::PosY | Face::PosZ);
+    let icols = inner.cols(face);
+    let bcols = blocker.cols(face);
+    {
         let mut out = [0u32; NN];
         for i in 0..NN {
-            let solid = cols[i];
+            let solid = bcols[i];
             // Which (row, bit-in-row) of the neighbour layer covers this
             // column's boundary cell: the column index `i` is `a * N + b`
             // in each layout and the layer row is `a`, bit `b`.
@@ -168,24 +200,45 @@ impl BitChunk {
                 None => false,
             };
             let exposed = if positive {
-                // Cell at bit k is exposed if bit k+1 is air; bit 31's
-                // beyond is the neighbour.
-                let air_above = !(solid >> 1) & !(1 << (N - 1)) | if beyond_solid { 0 } else { 1 << (N - 1) };
-                solid & air_above
+                // Cell at bit k is exposed if bit k+1 is not a blocker;
+                // bit 31's beyond is the neighbour layer.
+                let free_above = !(solid >> 1) & !(1 << (N - 1)) | if beyond_solid { 0 } else { 1 << (N - 1) };
+                icols[i] & free_above
             } else {
-                let air_below = !(solid << 1) & !1 | if beyond_solid { 0 } else { 1 };
-                solid & air_below
+                let free_below = !(solid << 1) & !1 | if beyond_solid { 0 } else { 1 };
+                icols[i] & free_below
             };
             out[i] = exposed;
         }
         out
     }
+}
+
+impl BitChunk {
 
     /// Total exposed faces over all six directions.
     pub fn exposed_face_count(&self, neighbours: [NeighbourLayer; 6]) -> u32 {
         FACES.iter().zip(neighbours.iter())
             .map(|(&f, &n)| self.face_mask(f, n).iter().map(|m| m.count_ones()).sum::<u32>())
             .sum()
+    }
+}
+
+/// Visit every set bit of a face mask as a cell `(x, y, z)` — used for
+/// cells that get a special (non-merged) emit.
+pub fn for_each_cell(mask: &[u32; NN], face: Face, mut f: impl FnMut(usize, usize, usize)) {
+    for i in 0..NN {
+        let mut m = mask[i];
+        let (a, b) = (i / N, i % N);
+        while m != 0 {
+            let s = m.trailing_zeros() as usize;
+            m &= m - 1;
+            match face {
+                Face::PosX | Face::NegX => f(s, a, b),
+                Face::PosY | Face::NegY => f(a, s, b),
+                Face::PosZ | Face::NegZ => f(a, b, s),
+            }
+        }
     }
 }
 
@@ -237,8 +290,15 @@ pub fn greedy_slice(mut rows: [u32; N], slice: u8, mut key: impl FnMut(usize, us
 /// Slice/u/v axes per face: ±X → slice x, u y, v z; ±Y → slice y, u x,
 /// v z; ±Z → slice z, u x, v y.
 pub fn greedy_faces(chunk: &BitChunk, face: Face, neighbour: NeighbourLayer,
-                    mut key: impl FnMut(usize, usize, usize) -> u32, out: &mut Vec<Quad>) {
+                    key: impl FnMut(usize, usize, usize) -> u32, out: &mut Vec<Quad>) {
     let mask = chunk.face_mask(face, neighbour);
+    greedy_mask(&mask, face, key, out)
+}
+
+/// Greedy-merge an already-computed face mask (see `face_mask_between`).
+/// Same axis conventions as `greedy_faces`.
+pub fn greedy_mask(mask: &[u32; NN], face: Face,
+                   mut key: impl FnMut(usize, usize, usize) -> u32, out: &mut Vec<Quad>) {
     // Build per-slice rows: slices[s][u] bit v. Column i = a*N + b with
     // bit s, where (a, b) are (u, v) in every layout (see face_mask).
     let mut slices = vec![[0u32; N]; N];
@@ -447,6 +507,35 @@ mod tests {
         greedy_faces(&c, Face::PosY, NeighbourLayer(None), |x, _, _| x as u32, &mut stripes);
         assert_eq!(stripes.len(), N);
         assert!(stripes.iter().all(|q| q.w == 1 && q.h == 32));
+    }
+
+    #[test]
+    fn two_set_mask_glass_against_glass_and_stone() {
+        // stone at x=0..16, glass at x=16..24, air beyond, all at y=z=5
+        let mut stone = BitChunk::empty();
+        let mut glass = BitChunk::empty();
+        for x in 0..16 { stone.set(x, 5, 5); }
+        for x in 16..24 { glass.set(x, 5, 5); }
+        let both = stone.union(&glass);
+        // Stone's +X faces: only the one at x=15 whose neighbour is glass
+        // (glass is not an opaque blocker) → exposed.
+        let sx = face_mask_between(&stone, &stone, Face::PosX, NeighbourLayer(None));
+        assert_eq!(sx.iter().map(|m| m.count_ones()).sum::<u32>(), 1);
+        // Glass's -X faces against stone: blocked (stone ∈ blocker set);
+        // glass-glass internal faces: blocked; the +X face at x=23: open.
+        let gnx = face_mask_between(&glass, &both, Face::NegX, NeighbourLayer(None));
+        assert_eq!(gnx.iter().map(|m| m.count_ones()).sum::<u32>(), 0);
+        let gpx = face_mask_between(&glass, &both, Face::PosX, NeighbourLayer(None));
+        assert_eq!(gpx.iter().map(|m| m.count_ones()).sum::<u32>(), 1);
+        let mut cells = Vec::new();
+        for_each_cell(&gpx, Face::PosX, |x, y, z| cells.push((x, y, z)));
+        assert_eq!(cells, vec![(23, 5, 5)]);
+        // for_each_cell on the other layouts
+        let mut c = BitChunk::empty(); c.set(3, 7, 11);
+        let mut got = Vec::new();
+        for_each_cell(&c.face_mask(Face::PosY, NeighbourLayer(None)), Face::PosY, |x, y, z| got.push((x, y, z)));
+        for_each_cell(&c.face_mask(Face::NegZ, NeighbourLayer(None)), Face::NegZ, |x, y, z| got.push((x, y, z)));
+        assert_eq!(got, vec![(3, 7, 11), (3, 7, 11)]);
     }
 
     #[test]

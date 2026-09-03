@@ -343,7 +343,7 @@ thread_local! {
 
 /// Invalidate the corner memo — O(1) generation bump.
 #[inline]
-fn corner_cache_reset() {
+pub(crate) fn corner_cache_reset() {
     CORNER_CACHE_GEN.with(|g| {
         g.set(g.get().wrapping_add(1));
         // Avoid generation 0 (the initial value in the cache entries).
@@ -467,7 +467,7 @@ thread_local! {
 
 /// Invalidate the tint memo — O(1) generation bump (see CORNER_CACHE_GEN).
 #[inline]
-fn tint_cache_reset() {
+pub(crate) fn tint_cache_reset() {
     TINT_CACHE_GEN.with(|g| {
         g.set(g.get().wrapping_add(1));
         if g.get() == 0 { g.set(1); }
@@ -479,7 +479,7 @@ fn tint_cache_reset() {
 /// mesh pass). Falls back to direct computation outside chunk-local bounds —
 /// defensive only; every current caller passes an in-chunk block position.
 #[inline]
-fn tint_for_position_cached(block: BlockId, wx: i32, wy: i32, wz: i32, chunk: &Chunk) -> [f32; 3] {
+pub(crate) fn tint_for_position_cached(block: BlockId, wx: i32, wy: i32, wz: i32, chunk: &Chunk) -> [f32; 3] {
     let (ox, oy, oz) = chunk.coord.block_origin();
     let lx = wx - ox;
     let ly = wy - oy;
@@ -489,14 +489,25 @@ fn tint_for_position_cached(block: BlockId, wx: i32, wy: i32, wz: i32, chunk: &C
         && lz >= 0 && (lz as usize) < TINT_CACHE_W
     {
         let idx = (ly as usize * TINT_CACHE_W + lz as usize) * TINT_CACHE_W + lx as usize;
-        let gen = TINT_CACHE_GEN.with(|g| g.get());
-        let hit = TINT_CACHE.with(|c| {
-            let entry = c.borrow()[idx];
-            if entry.1 == gen { Some(entry.0) } else { None }
+        // 2026-09-02: ONE thread-local access on the hit path. This was
+        // three (`GEN.with`, `CACHE.with` to read, `CACHE.with` to write)
+        // plus two RefCell borrows; on a cave chunk the mesher calls this
+        // ~36 K times and the TLS/borrow overhead was a measurable share
+        // of the ~190 ns per quad. Same values, same generation
+        // semantics.
+        // ONE thread-local access on the hit path (was three: gen, read,
+        // and — on a miss — write; plus two RefCell borrows). The miss
+        // computation stays OUTSIDE the closure: an in-process A/B
+        // (`mesher_binary::tests::cache_shape_ab`) showed that folding it
+        // in costs the miss path ~16 % while the hit path gains ~19 %,
+        // so the hit fast-path is folded and the miss is not.
+        let (gen, hit) = TINT_CACHE.with(|c| {
+            let gen = TINT_CACHE_GEN.with(|g| g.get());
+            let cache = c.borrow();
+            let entry = cache[idx];
+            (gen, if entry.1 == gen { Some(entry.0) } else { None })
         });
-        if let Some(v) = hit {
-            return v;
-        }
+        if let Some(v) = hit { return v; }
         let v = tint_for_position(block, wx, wy, wz);
         TINT_CACHE.with(|c| c.borrow_mut()[idx] = (v, gen));
         v
@@ -509,6 +520,33 @@ fn tint_for_position_cached(block: BlockId, wx: i32, wy: i32, wz: i32, chunk: &C
 /// this one for up to SKY_PROBE depth. Returns [0, 1]. Out-of-chunk
 /// reads above count as air (conservative for surface blocks at the
 /// chunk top).
+/// The pre-2026-09-02 cache shape (three thread-local accesses, two
+/// RefCell borrows per hit), kept ONLY so the two can be A/B'd in one
+/// process — across-run timing on a shared vCPU has a ±25 % band, which
+/// is wider than the effect. See `cache_shape_ab` in the tests below.
+#[cfg(test)]
+pub(crate) fn tint_for_position_cached_legacy(block: BlockId, wx: i32, wy: i32, wz: i32, chunk: &Chunk) -> [f32; 3] {
+    let (ox, oy, oz) = chunk.coord.block_origin();
+    let (lx, ly, lz) = (wx - ox, wy - oy, wz - oz);
+    if lx >= 0 && (lx as usize) < TINT_CACHE_W
+        && ly >= 0 && (ly as usize) < TINT_CACHE_W
+        && lz >= 0 && (lz as usize) < TINT_CACHE_W
+    {
+        let idx = (ly as usize * TINT_CACHE_W + lz as usize) * TINT_CACHE_W + lx as usize;
+        let gen = TINT_CACHE_GEN.with(|g| g.get());
+        let hit = TINT_CACHE.with(|c| {
+            let entry = c.borrow()[idx];
+            if entry.1 == gen { Some(entry.0) } else { None }
+        });
+        if let Some(v) = hit { return v; }
+        let v = tint_for_position(block, wx, wy, wz);
+        TINT_CACHE.with(|c| c.borrow_mut()[idx] = (v, gen));
+        v
+    } else {
+        tint_for_position(block, wx, wy, wz)
+    }
+}
+
 const SKY_PROBE: i32 = 12;
 #[inline]
 fn sky_exposure_at(wx: i32, wy: i32, wz: i32, chunk: &Chunk) -> f32 {
@@ -620,7 +658,7 @@ thread_local! {
 
 /// Invalidate the env memo — O(1) generation bump (see CORNER_CACHE_GEN).
 #[inline]
-fn env_cache_reset() {
+pub(crate) fn env_cache_reset() {
     ENV_CACHE_GEN.with(|g| {
         g.set(g.get().wrapping_add(1));
         if g.get() == 0 { g.set(1); }
@@ -650,14 +688,21 @@ fn sample_env_at_cached(
         && lz >= 0 && (lz as usize) < ENV_CACHE_W
     {
         let idx = (ly as usize * ENV_CACHE_W + lz as usize) * ENV_CACHE_W + lx as usize;
-        let gen = ENV_CACHE_GEN.with(|g| g.get());
-        let hit = ENV_CACHE.with(|c| {
-            let entry = c.borrow()[idx];
-            if entry.1 == gen { Some(entry.0) } else { None }
+        // One thread-local access on the hit path — see the note in
+        // `tint_for_position_cached`.
+        // ONE thread-local access on the hit path (was three: gen, read,
+        // and — on a miss — write; plus two RefCell borrows). The miss
+        // computation stays OUTSIDE the closure: an in-process A/B
+        // (`mesher_binary::tests::cache_shape_ab`) showed that folding it
+        // in costs the miss path ~16 % while the hit path gains ~19 %,
+        // so the hit fast-path is folded and the miss is not.
+        let (gen, hit) = ENV_CACHE.with(|c| {
+            let gen = ENV_CACHE_GEN.with(|g| g.get());
+            let cache = c.borrow();
+            let entry = cache[idx];
+            (gen, if entry.1 == gen { Some(entry.0) } else { None })
         });
-        if let Some(v) = hit {
-            return v;
-        }
+        if let Some(v) = hit { return v; }
         let v = sample_env_at(block, wx, wy, wz, chunk, world_model);
         ENV_CACHE.with(|c| c.borrow_mut()[idx] = (v, gen));
         v
@@ -1113,7 +1158,7 @@ const FACE_NORMALS: [[f32; 3]; 6] = [
 
 /// Block face indices, used to index FACE_LIGHT.
 #[allow(dead_code)]
-mod face {
+pub(crate) mod face {
     pub const TOP:    usize = 0;
     pub const BOTTOM: usize = 1;
     pub const EAST:   usize = 2;
@@ -1280,7 +1325,7 @@ fn block_color_per_face(b: BlockId) -> Option<[[f32; 3]; 6]> {
 }
 
 /// Whether this block should be meshed at all (i.e. has visible faces).
-fn is_meshable(b: BlockId) -> bool {
+pub(crate) fn is_meshable(b: BlockId) -> bool {
     // r699: single array load via the compile-time LUT instead of three `matches!`
     // chains (`!is_air() && is_solid() && !is_subvoxel_only()`). The LUT is built
     // from `is_meshable_cube` — the exact same predicate — so this is identical to
@@ -1292,7 +1337,7 @@ fn is_meshable(b: BlockId) -> bool {
 /// Whether a face between `inner` (the meshed block) and `neighbor` should
 /// be emitted. Delegates to the narrow `produces_face_against` predicate
 /// on BlockId so the rule is owned by the block type, not duplicated here.
-fn should_emit_face(inner: BlockId, neighbor: BlockId) -> bool {
+pub(crate) fn should_emit_face(inner: BlockId, neighbor: BlockId) -> bool {
     // r700: single flat 2D-array load via the compile-time LUT instead of four
     // predicate evaluations + a compare in `produces_face_against`. The LUT is
     // built from that exact predicate (parity-tested over BlockId::ALL²), so this
@@ -1886,15 +1931,15 @@ fn idx2d(u: usize, v: usize) -> usize { u + v * N }
 /// Per-face axis configuration: (axis, u, v) indices into a 3-tuple [x, y, z].
 /// The `axis_sign` is +1 for "positive" faces (top, east, south) — we mesh
 /// the face on the *upper* side of the slice — and -1 for "negative" faces.
-struct AxisConfig {
-    axis: usize,
-    u: usize,
-    v: usize,
-    axis_sign: i32,
-    face: usize,
+pub(crate) struct AxisConfig {
+    pub(crate) axis: usize,
+    pub(crate) u: usize,
+    pub(crate) v: usize,
+    pub(crate) axis_sign: i32,
+    pub(crate) face: usize,
 }
 
-const AXIS_CONFIGS: [AxisConfig; 6] = [
+pub(crate) const AXIS_CONFIGS: [AxisConfig; 6] = [
     // TOP (+Y): axis=1 (y), u=0 (x), v=2 (z). Positive face.
     AxisConfig { axis: 1, u: 0, v: 2, axis_sign:  1, face: face::TOP },
     // BOTTOM (-Y): axis=1, u=0, v=2. Negative face.
@@ -2597,6 +2642,32 @@ fn mesh_chunk_greedy_undecorated(chunk: &Chunk, sky: Option<&crate::sky::Sky>) -
     mesh
 }
 
+/// How decoration grass tufts are built. `UNENDLICH_TUFT_STYLE`:
+/// `grid` (default, today's sub-voxel mini-cube grid, ~280 vertices per
+/// tuft), `cross` (two vertical quads in an X, double-sided, 8 vertices),
+/// `none`. The 2026-09-02 timing report found the grid tufts to be
+/// ~127 K of a surface chunk's 236 K vertices — half the mesh — at the
+/// same density a cross-quad gives for 35× fewer vertices. Visual
+/// decision, so a knob; the density gate is unchanged either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TuftStyle { Grid, Cross, None }
+
+impl TuftStyle {
+    pub fn from_env() -> TuftStyle {
+        static V: std::sync::OnceLock<TuftStyle> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            let v = std::env::var("UNENDLICH_TUFT_STYLE").unwrap_or_default().to_ascii_lowercase();
+            let st = match v.as_str() {
+                "cross" => TuftStyle::Cross,
+                "none" | "off" | "0" => TuftStyle::None,
+                _ => TuftStyle::Grid,
+            };
+            if st != TuftStyle::Grid { log::info!("decorate: grass tuft style = {:?} (UNENDLICH_TUFT_STYLE)", st); }
+            st
+        })
+    }
+}
+
 /// Probability that a grass-bearing block spawns a sub-voxel tuft above it.
 /// For dedicated plant blocks (Fern, Flower, TallGrass) the probability is
 /// always 1.0 — the block IS the plant. This constant only gates surface
@@ -2633,6 +2704,17 @@ pub(crate) fn decorate_chunk(
     origin: [i32; 3],
     sky: Option<&crate::sky::Sky>,
     current_tick: Option<u64>,
+) {
+    decorate_chunk_styled(chunk, mesh, origin, sky, current_tick, TuftStyle::from_env())
+}
+
+pub(crate) fn decorate_chunk_styled(
+    chunk: &Chunk,
+    mesh: &mut ChunkMesh,
+    origin: [i32; 3],
+    sky: Option<&crate::sky::Sky>,
+    current_tick: Option<u64>,
+    tuft_style: TuftStyle,
 ) {
     let n = N as i32;
     // Iterate the inverted plant index instead of scanning every cell.
@@ -2764,18 +2846,74 @@ pub(crate) fn decorate_chunk(
         // same plant_hash so visual variation matches across the
         // two paths.
         let (_, hash_int) = crate::world::subvoxel::plant_hash(wx, wy, wz);
-        if let Some(tmpl) = crate::world::subvoxel_templates::template_for(BlockId::Grass, hash_int) {
-            crate::world::subvoxel_templates::stamp_template(
-                &mut mesh.vertices, &mut mesh.indices,
-                tmpl,
-                [wx as f32, (wy + 1) as f32 + corner_avg_offset, wz as f32],
-                sky, color_mul,
-            );
-        } else if let Some(grid) = crate::world::subvoxel::procedural_subgrid(BlockId::Grass, wx, wy, wz) {
-            emit_subvoxel_grid(mesh, &grid,
-                [wx as f32, (wy + 1) as f32 + corner_avg_offset, wz as f32],
-                sky, color_mul);
+        let tuft_origin = [wx as f32, (wy + 1) as f32 + corner_avg_offset, wz as f32];
+        match tuft_style {
+            TuftStyle::None => {}
+            TuftStyle::Cross => {
+                let (_, h2) = hash_for_decoration(wx, wy + 7, wz);
+                emit_grass_cross_quad(mesh, tuft_origin, h2, sky, color_mul);
+            }
+            TuftStyle::Grid => {
+                if let Some(tmpl) = crate::world::subvoxel_templates::template_for(BlockId::Grass, hash_int) {
+                    crate::world::subvoxel_templates::stamp_template(
+                        &mut mesh.vertices, &mut mesh.indices,
+                        tmpl, tuft_origin, sky, color_mul,
+                    );
+                } else if let Some(grid) = crate::world::subvoxel::procedural_subgrid(BlockId::Grass, wx, wy, wz) {
+                    emit_subvoxel_grid(mesh, &grid, tuft_origin, sky, color_mul);
+                }
+            }
         }
+    }
+}
+
+/// A grass tuft as a cross-quad: two vertical quads through the block's
+/// centre at 45° to the axes (an X from above), double-sided by emitting
+/// both windings over the same 8 vertices. `sub_hash` (0..1) varies the
+/// height (0.55–0.95 blocks) and rotates the X by up to 30° so a field
+/// doesn't tile. Bottom vertices carry sway tag 2 (anchor), top 1 (sway),
+/// like the sub-voxel foliage, so `sim::foliage_sway` acts on it.
+fn emit_grass_cross_quad(
+    mesh: &mut ChunkMesh,
+    origin: [f32; 3],
+    sub_hash: f32,
+    sky: Option<&crate::sky::Sky>,
+    color_mul: [f32; 3],
+) {
+    let directional = match sky { Some(sky) => sky.directional_intensity(), None => 1.0 };
+    // Side-face shade: neither top-lit nor bottom-dark; the grid emitter's
+    // vertical faces land near 0.85 of the top brightness.
+    let shade = 0.85 * directional;
+    let base = block_color(BlockId::TallGrass).unwrap_or([0.36, 0.62, 0.22]);
+    let color = [
+        (base[0] * color_mul[0] * shade).clamp(0.0, 1.0),
+        (base[1] * color_mul[1] * shade).clamp(0.0, 1.0),
+        (base[2] * color_mul[2] * shade).clamp(0.0, 1.0),
+    ];
+    let height = 0.55 + 0.40 * sub_hash;
+    let angle = (sub_hash - 0.5) * (std::f32::consts::PI / 3.0); // ±30°
+    let (cx, cz) = (origin[0] + 0.5, origin[2] + 0.5);
+    let (y0, y1) = (origin[1], origin[1] + height);
+    let r = 0.5_f32; // half-diagonal reach from the centre
+    let sway_on = crate::sim::foliage_sway::FOLIAGE_SWAY_ENABLED;
+    let tag_bottom = if sway_on { 2 } else { 0 };
+    let tag_top = if sway_on { 1 } else { 0 };
+    for k in 0..2 {
+        let a = angle + std::f32::consts::FRAC_PI_4 + k as f32 * std::f32::consts::FRAC_PI_2;
+        let (dx, dz) = (a.cos() * r, a.sin() * r);
+        let p0 = [cx - dx, y0, cz - dz];
+        let p1 = [cx + dx, y0, cz + dz];
+        let p2 = [cx + dx, y1, cz + dz];
+        let p3 = [cx - dx, y1, cz - dz];
+        let b = mesh.vertices.len() as u32;
+        mesh.vertices.push(Vertex::with_sway(p0, color, tag_bottom));
+        mesh.vertices.push(Vertex::with_sway(p1, color, tag_bottom));
+        mesh.vertices.push(Vertex::with_sway(p2, color, tag_top));
+        mesh.vertices.push(Vertex::with_sway(p3, color, tag_top));
+        // Front winding…
+        mesh.indices.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+        // …and back, so the quad reads from both sides with cull_mode=BACK.
+        mesh.indices.extend_from_slice(&[b, b + 2, b + 1, b, b + 3, b + 2]);
     }
 }
 
@@ -3092,7 +3230,7 @@ fn bumpy_height(wx: f32, wz: f32, softness: f32, weathering_factor: f32) -> f32 
 /// the subdivided top emission — adjacent blocks have different
 /// weathering and thus different bump intensities.
 #[inline]
-fn weathering_at_world(block: BlockId, wx: i32, wy: i32, wz: i32) -> f32 {
+pub(crate) fn weathering_at_world(block: BlockId, wx: i32, wy: i32, wz: i32) -> f32 {
     let mut s = crate::world::chunk::BlockInstanceState::default();
     s.age_ticks = worldgen_weathering_at(block, wx, wy, wz);
     crate::world::weathering::weathering_value(s)
@@ -3145,7 +3283,7 @@ fn top_subdivision() -> i32 {
 ///
 /// Cost: 81 vertices + 128 triangles per top face vs the previous
 /// 4 vertices + 2 triangles.
-fn emit_subdivided_top(
+pub(crate) fn emit_subdivided_top(
     mesh: &mut ChunkMesh,
     slice: i32,
     u: i32,
@@ -3263,7 +3401,7 @@ fn emit_subdivided_top(
     }
 }
 
-fn emit_jittered_top(
+pub(crate) fn emit_jittered_top(
     mesh: &mut ChunkMesh,
     slice: i32,    // chunk-local Y
     u: i32,        // chunk-local X
@@ -3323,7 +3461,26 @@ fn emit_jittered_top(
 }
 
 
-fn emit_quad(
+/// Brightness of a face direction. Four trig calls through
+/// `Sky::sun_direction` + `directional_intensity`; it depends only on
+/// `face` and the sky, so a mesher that emits many quads should compute
+/// the six values once and pass them (see `face_lights`).
+#[inline]
+pub(crate) fn face_light(face: usize, sky: Option<&crate::sky::Sky>) -> f32 {
+    match sky {
+        Some(sky) => sky.face_brightness(FACE_NORMALS[face]),
+        None => FACE_LIGHT[face],
+    }
+}
+
+/// The six face brightnesses, in `face::*` order.
+pub(crate) fn face_lights(sky: Option<&crate::sky::Sky>) -> [f32; 6] {
+    let mut l = [0.0f32; 6];
+    for (i, slot) in l.iter_mut().enumerate() { *slot = face_light(i, sky); }
+    l
+}
+
+pub(crate) fn emit_quad(
     mesh: &mut ChunkMesh,
     cfg: &AxisConfig,
     slice: i32,
@@ -3336,6 +3493,27 @@ fn emit_quad(
     sky: Option<&crate::sky::Sky>,
     chunk: Option<&Chunk>,
     world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>>,
+) {
+    emit_quad_lit(mesh, cfg, slice, u, v, w, h, block, origin, sky, chunk, world_model, None)
+}
+
+/// `emit_quad` with the face brightness already known. Identical output;
+/// saves four trig calls per quad (36 K quads on a cave chunk).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_quad_lit(
+    mesh: &mut ChunkMesh,
+    cfg: &AxisConfig,
+    slice: i32,
+    u: usize,
+    v: usize,
+    w: usize,
+    h: usize,
+    block: BlockId,
+    origin: [i32; 3],
+    sky: Option<&crate::sky::Sky>,
+    chunk: Option<&Chunk>,
+    world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>>,
+    precomputed_light: Option<f32>,
 ) {
     // For greedy-merged quads (w > 1 or h > 1) we use a single uniform
     // color for the whole quad — by definition merging requires uniform
@@ -3367,10 +3545,7 @@ fn emit_quad(
     // Pick brightness either from the sun (if a Sky was provided) or from
     // the static fallback table. The sky path computes per-face brightness
     // from outward-normal · sun_direction.
-    let light = match sky {
-        Some(sky) => sky.face_brightness(FACE_NORMALS[cfg.face]),
-        None => FACE_LIGHT[cfg.face],
-    };
+    let light = precomputed_light.unwrap_or_else(|| face_light(cfg.face, sky));
     let color = [
         (base_color[0] * light).clamp(0.0, 1.0),
         (base_color[1] * light).clamp(0.0, 1.0),
@@ -3485,7 +3660,7 @@ fn emit_quad(
 ///
 /// `cfg` must be one of EAST/WEST/SOUTH/NORTH (not TOP/BOTTOM); caller is
 /// responsible for that.
-fn emit_soft_side_face(
+pub(crate) fn emit_soft_side_face(
     mesh: &mut ChunkMesh,
     cfg: &AxisConfig,
     slice: i32,

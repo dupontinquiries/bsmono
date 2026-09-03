@@ -169,10 +169,42 @@ pub struct MeshResult {
 }
 
 
+/// `UNENDLICH_MESHER=binary` selects `render::mesher_binary` for Near
+/// chunks on the CPU path. Read once; the value can't change mid-run.
+fn near_mesher_is_binary() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let on = std::env::var("UNENDLICH_MESHER").map(|v| v.eq_ignore_ascii_case("binary")).unwrap_or(false);
+        if on { log::info!("meshing pool: Near-LOD CPU mesher = binary (UNENDLICH_MESHER=binary)"); }
+        on
+    })
+}
+
 /// Pack a finished mesh on the producing thread (see `MeshResult::packed`).
 fn pack_result(coord: ChunkCoord, mesh: &ChunkMesh) -> crate::render::mesher::PackedMesh {
     let (ox, oy, oz) = coord.block_origin();
     mesh.pack([ox as f32, oy as f32, oz as f32], crate::constants::CHUNK_SIZE as f32)
+}
+
+/// Pack, then drop the 28-byte `Vertex` copy unless something on the
+/// main thread still reads it (the `UNENDLICH_OCTREE_MESH_GPU_CMP`
+/// debug compare). Without this every mesh crossed to the render thread
+/// twice — packed AND raw — and the raw one (6.6 MB for a 236 K-vertex
+/// surface chunk) was freed there. Counts the bin needs come from
+/// `packed`.
+fn pack_and_shed(coord: ChunkCoord, mesh: &mut ChunkMesh) -> crate::render::mesher::PackedMesh {
+    let packed = pack_result(coord, mesh);
+    if !keep_raw_vertices() {
+        mesh.vertices = Vec::new();
+        mesh.indices = Vec::new();
+    }
+    packed
+}
+
+fn keep_raw_vertices() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("UNENDLICH_OCTREE_MESH_GPU_CMP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false))
 }
 
 /// A result carrying an empty mesh (failures, placeholders).
@@ -807,17 +839,18 @@ fn worker_loop(
             NEAR_CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
         }
         let mesh = if req.lod == LodLevel::Near {
-            match (&req.world_model, req.current_tick) {
-                (Some(model), Some(tick)) => {
-                    crate::render::mesher::mesh_chunk_greedy_with_neighbors(
-                        &req.chunk, &req.neighbors, Some(&req.sky), Some(model), Some(tick))
-                }
-                (Some(model), None) => {
-                    crate::render::mesher::mesh_chunk_greedy_with_neighbors(
-                        &req.chunk, &req.neighbors, Some(&req.sky), Some(model), None)
-                }
-                (None, _) => crate::render::mesher::mesh_chunk_greedy_with_neighbors(
-                    &req.chunk, &req.neighbors, Some(&req.sky), None, None),
+            // The three arms only differ in which optionals are passed;
+            // `current_tick` is meaningful only with a world model.
+            let tick = if req.world_model.is_some() { req.current_tick } else { None };
+            if near_mesher_is_binary() {
+                // 2026-09-02: UNENDLICH_MESHER=binary — visibility and
+                // merging on world::bitchunk, same emitters. See
+                // render::mesher_binary. Off by default until seen on hardware.
+                crate::render::mesher_binary::mesh_chunk_binary(
+                    &req.chunk, &req.neighbors, Some(&req.sky), req.world_model.as_ref(), tick)
+            } else {
+                crate::render::mesher::mesh_chunk_greedy_with_neighbors(
+                    &req.chunk, &req.neighbors, Some(&req.sky), req.world_model.as_ref(), tick)
             }
         } else if is_virtual_eligible {
             let factor = lod_settings.factor_for(req.lod);
@@ -831,7 +864,8 @@ fn worker_loop(
         let elapsed_us = t0.elapsed().as_micros() as u64;
         mesher_timer.record(req.lod, elapsed_us);
 
-        let packed = pack_result(req.coord, &mesh);
+        let mut mesh = mesh;
+        let packed = pack_and_shed(req.coord, &mut mesh);
         let result = MeshResult {
             coord: req.coord,
             mesh,
@@ -952,7 +986,8 @@ fn gpu_dispatcher_loop(
                     ChunkMesh { vertices: Vec::new(), indices: Vec::new() }
                 }
             };
-            let packed = pack_result(r.coord, &mesh);
+            let mut mesh = mesh;
+            let packed = pack_and_shed(r.coord, &mut mesh);
             if res_tx.send(MeshResult {
                 coord: r.coord, mesh, packed: Some(packed),
                 epoch: r.epoch, version: r.version, lod: r.lod, // r195
@@ -1395,7 +1430,8 @@ fn finish_octree_batch(
             crate::render::mesher::emit_lava_surface(&r.chunk, &mut mesh, origin, Some(&r.sky));
         }
 
-        let packed = pack_result(r.coord, &mesh);
+        let mut mesh = mesh;
+        let packed = pack_and_shed(r.coord, &mut mesh);
         if res_tx.send(MeshResult {
             coord: r.coord, mesh, packed: Some(packed),
             epoch: r.epoch, version: r.version, lod: r.lod, // r195
