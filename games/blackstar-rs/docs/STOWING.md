@@ -98,6 +98,14 @@ That also gives the shard path a reason to exist beyond spectacle. If
 both are implemented, the *same* chassis has two transforms with
 different costs, and the choice is tactical.
 
+## The staged decomposition
+
+Both options above assume a single fold. Breaking the transform into
+explicit stages changes the problem: see
+[STAGED_TRANSFORM.md](STAGED_TRANSFORM.md). The volume gap becomes one
+declared stage rather than something every other stage has to smuggle,
+and the ratio measured here becomes that stage'''s target.
+
 ## What to measure next
 
 1. **Push the cavity grid until the ratio converges.** The verdict for
