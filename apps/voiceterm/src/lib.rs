@@ -58,6 +58,7 @@
 //! the refactor belongs with the feature-gating above.
 
 pub mod dead_air;
+pub mod dictate;
 pub mod dumb_summary;
 pub mod llm_coalesce;
 pub mod llm_scheduler;
@@ -90,7 +91,7 @@ mod purity {
             .filter_map(|l| l.strip_prefix("pub mod "))
             .filter_map(|l| l.strip_suffix(';'))
             .collect();
-        assert_eq!(exposed.len(), 9, "module list changed; update this count deliberately");
+        assert_eq!(exposed.len(), 10, "module list changed; update this count deliberately");
 
         let mut impure = Vec::new();
         for m in &exposed {

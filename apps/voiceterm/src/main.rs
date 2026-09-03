@@ -158,6 +158,10 @@ mod model_download;
 mod model_bench;
 mod repl_voice;
 mod editor_voice;
+// Voice *typing* (as opposed to editor_voice's voice *commands*): the
+// headless dictation core. Pure — no Qt, no whisper, no PTY — so it is
+// also exposed from lib.rs and testable without Qt.
+mod dictate;
 // v0.1.609: motion-rollback position-history core (TODO_motion_rollback
 // option 1, the testable piece). Status-line parsing stays build-gated.
 mod motion_history;
