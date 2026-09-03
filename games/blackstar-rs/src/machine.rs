@@ -1,4 +1,4 @@
-//! CYBERTRONIAN — a design grammar derived from a world, and frames built to it.
+//! MACHINE — a design grammar derived from a world, and frames built to it.
 //!
 //! ## Why this module exists, and a correction
 //!
@@ -285,7 +285,7 @@ pub fn suits_the_world(g: Gait) -> bool {
 
 pub fn run() {
     use crate::cling::hang_time_s;
-    println!("CYBERTRONIAN FRAMES — designed from the planet\n");
+    println!("MACHINE FRAMES — designed from the planet\n");
     println!("  the world, as this codebase already describes it:");
     println!("    surface     {:?}, grip {:.2} — handholds everywhere", SURFACE, surface_grip(SURFACE));
     println!("    weather     {}", if HAS_WEATHER { "yes" } else { "none — nothing to seal against" });
@@ -321,7 +321,7 @@ pub fn run() {
         println!("      {}\n", wrap(f.hook, 66, 6));
     }
 
-    println!("  HOW LONG EACH CAN HOLD A CYBERTRONIAN WALL (cling.rs)\n");
+    println!("  HOW LONG EACH CAN HOLD A MACHINE WALL (cling.rs)\n");
     for f in FRAMES.iter().filter(|f| f.gait.climbs()) {
         let gf = GripFrame { bulk: f.bulk, crawler: f.gait == Gait::Clinging };
         let t = hang_time_s(Hold::Underside, gf, SURFACE).unwrap_or(0.0);

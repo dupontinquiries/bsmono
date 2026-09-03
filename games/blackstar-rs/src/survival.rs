@@ -87,7 +87,7 @@ impl Body {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Body::Machine => "CYBERTRONIAN",
+            Body::Machine => "MACHINE",
             Body::HumanSuited => "SUITED",
             Body::HumanBare => "UNPROTECTED",
         }

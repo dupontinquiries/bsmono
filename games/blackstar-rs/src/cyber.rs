@@ -1,4 +1,4 @@
-//! CYBERTRONIAN JOINTS — not a pin through two plates.
+//! MACHINE JOINTS — not a pin through two plates.
 //!
 //! The measurement that led here: on `racer_grit`, 71 of 78 fitted joints
 //! have a pivot more than a quarter of the smaller joined part away from

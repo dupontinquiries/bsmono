@@ -184,6 +184,26 @@ mod tests {
         // raises a floor. That is acceptable — the alternative is policy that
         // cannot name what it is about — but it means a count going up by one
         // after a documentation commit is expected, not alarming.
+        // SCREAMING_CASE, missed by the first three passes of this cleanup.
+        // The census is case-sensitive on purpose — prose and identifiers come
+        // down in different commits — but nobody enumerated the third case,
+        // and it is exactly where DISPLAY STRINGS and public statics live.
+        // `patrol.rs` had `name: "CYBERTRON"` on a destination the player
+        // reads, `survival.rs` returned "CYBERTRONIAN" as a label, and
+        // `saga.rs` exported RODIMUS_PRIME_ARC. Nine in src/ and thirteen more
+        // in the screenplays, all reported as zero because the census only
+        // ever asked about two of the three cases.
+        ("RODIMUS", 0),
+        ("OPTIMUS", 0),
+        ("MEGATRON", 0),
+        ("UNICRON", 0),
+        ("AUTOBOT", 0),
+        ("DECEPTICON", 0),
+        ("CYBERTRON", 0),
+        ("ENERGON", 0),
+        // 1, not 0: `corruption.rs` cites TF_JHIAXUS_AND_THE_CORRUPTED.md,
+        // which is a real source filename. Same category as the asset names.
+        ("JHIAXUS", 1),
         ("AllSpark", 3),
     ];
 

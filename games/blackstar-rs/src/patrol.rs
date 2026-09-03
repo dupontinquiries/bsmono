@@ -219,7 +219,7 @@ pub const ROUTE: &[Destination] = &[
             "Charon fills a third of the sky"
         ],
     },
-    Destination { id: "foundry", name: "CYBERTRON", terrain: Terrain::Surface, gravity: 1.15, weather: false,
+    Destination { id: "foundry", name: "THE FOUNDRY", terrain: Terrain::Surface, gravity: 1.15, weather: false,
         hostiles: Faction::Corrupted,
         note: "the Silent Century — the Foundry went dark; no record says why",
         sky: Sky::Vacuum, day_len: 0.0, ambient: &[

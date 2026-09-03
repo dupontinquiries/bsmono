@@ -31,7 +31,7 @@ understands how little of the cosmos they'd ever seen.
 Sensor ghosts on three headings. Nothing that holds a shape long enough to
 call a contact.
 
-**RODIMUS PRIME**
+**HALYARD**
 Hijacks.
 
 **THE MORPHER**
@@ -67,7 +67,7 @@ resting, like standing is the only mode he has.*
 *(quiet)*
 Did he do all of this alone?
 
-**RODIMUS PRIME**
+**HALYARD**
 *(over comms, to Billy)*
 This is Halyard Prime, Coalition fleet. We're inbound to your position.
 
@@ -75,7 +75,7 @@ This is Halyard Prime, Coalition fleet. We're inbound to your position.
 *(doesn't turn around)*
 You're thirty-one days late. Not that I asked.
 
-**RODIMUS PRIME**
+**HALYARD**
 We didn't know this position existed until eleven days ago.
 
 **BILLY**
@@ -141,7 +141,7 @@ alone.
 
 ---
 
-**RODIMUS PRIME**
+**HALYARD**
 Tell me the part you didn't say in front of Aiden.
 
 **THE MORPHER**
@@ -150,14 +150,14 @@ is a thirteenth the Watch has only shown me once — by accident, in a battle
 I do not remember clearly, for perhaps forty seconds. I woke three days
 later with the Watch cold in my hand.
 
-**RODIMUS PRIME**
+**HALYARD**
 And you think we're heading toward needing it deliberately.
 
 **THE MORPHER**
 I think Billy is buying us time to decide whether we're willing to ask him
 to hold the line long enough for me to try.
 
-**RODIMUS PRIME**
+**HALYARD**
 That's not a fair thing to ask of him.
 
 **THE MORPHER**
@@ -189,7 +189,7 @@ No. That's every ship they have in range, and they are not spreading out.
 They are converging on Billy's position, specifically, like they've decided
 whatever's there is worth the entire investment.
 
-**RODIMUS PRIME**
+**HALYARD**
 *(to himself)*
 They do not conquer. They gather data. Something out here is a big enough
 question that they're willing to lose a fleet to answer it.
@@ -212,7 +212,7 @@ rate the Coalition cannot sustain indefinitely.*
 *(over comms, steady even now)*
 Halyard. However good your math is, it isn't good enough today.
 
-**RODIMUS PRIME**
+**HALYARD**
 How long can you hold?
 
 **BILLY**
@@ -222,7 +222,7 @@ Long enough to matter. Not long enough to win.
 *(to Halyard, urgent)*
 Tell him. Tell the Morpher.
 
-**RODIMUS PRIME**
+**HALYARD**
 *(a long, heavy beat — this is the decision the whole film has been
 building toward)*
 *(into comms)*

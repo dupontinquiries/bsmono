@@ -482,7 +482,7 @@ pub struct CharacterArc {
     pub key_moments: &'static [&'static str],
 }
 
-pub static RODIMUS_PRIME_ARC: CharacterArc = CharacterArc {
+pub static HALYARD_ARC: CharacterArc = CharacterArc {
     name: "Halyard",
     introduction_film: 1,
     arc_complete_film: 9,

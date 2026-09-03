@@ -1064,7 +1064,7 @@ pub static FINDINGS: &[Finding] = &[
                 and never finished: 'every civilization that reached this far --'",
         links: &[s("edge_lattice"), m("asteri_were_not_first")],
     },
-    // ================= CYBERTRON =================
+    // ================= THE FOUNDRY =================
     Finding {
         id: "substrate_sample",
         site: "foundry",
