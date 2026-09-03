@@ -114,8 +114,17 @@ choice its shape, and it can be built before any shard physics exists.
 ## Suggested order
 
 1. ~~Per-segment durations.~~ Done — `xform::stage_time`.
-2. **A seven-pose test chassis** authoring the six stages, to find what
-   the strip cannot express before building anything for it.
+2. ~~A seven-pose test chassis.~~ Done, generated rather than modelled:
+   `xform::staged_pipeline` builds a seven-pose strip of cubes — body,
+   an arm that folds in, a helper that departs, a shell panel that
+   arrives, and a fusion stage where the body shrinks — and runs it
+   through the real `align::unify` + `Morph`. **All six stages are
+   expressible today.** Five tests pin it.
+
+   What that fixture does NOT exercise: rotation within a segment. The
+   cubes translate and scale only, so the chord problem below is still
+   unmeasured on a staged strip. Adding a rotating part to the fixture is
+   the next cheap step.
 3. **Watch stage 4.3 with `fold_audit --worst`.** Rotation is where the
    chord problem bites, and there is already a number for it.
 4. **Stage 5's visual language.** The geometry is authorable now; the

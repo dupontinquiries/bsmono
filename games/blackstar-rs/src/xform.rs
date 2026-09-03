@@ -947,3 +947,151 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod staged_pipeline {
+    //! A seven-pose chassis, generated rather than modelled, run through
+    //! the real pipeline — `align::unify` then `Morph` — to find what the
+    //! strip can and cannot express. Item 2 of
+    //! `docs/STAGED_TRANSFORM.md`'s suggested order.
+    //!
+    //! The six stages are authored as six segments across seven poses:
+    //!
+    //!   f00 bot form
+    //!   f01 skeleton in position
+    //!   f02 hoist state
+    //!   f03 limbs detached, folded, rotated
+    //!   f04 innards fused small          <- the volume stage
+    //!   f05 vehicle components pulled in, helpers gone
+    //!   f06 shell assembled
+    //!
+    //! Three things the design needs and the assets do not currently
+    //! exercise: a part that DEPARTS (a helper), a part that ARRIVES (a
+    //! shell panel), and a part that SHRINKS without leaving (the fusion).
+
+    use super::*;
+    use crate::meshgen::Vertex;
+    use crate::model::{RawPrim, Tag};
+
+    fn cube(centre: Vec3, half: f32) -> RawPrim {
+        let mut verts = Vec::new();
+        for i in 0..8 {
+            let s = Vec3::new(
+                if i & 1 == 0 { -1.0 } else { 1.0 },
+                if i & 2 == 0 { -1.0 } else { 1.0 },
+                if i & 4 == 0 { -1.0 } else { 1.0 },
+            );
+            let p = centre + s * half;
+            verts.push(Vertex { pos: p.to_array(), nrm: [0.0, 1.0, 0.0], uv: [0.0, 0.0] });
+        }
+        // Indices are not exercised by the blend, but unify and Morph
+        // both carry them, so give it a real (if crude) triangle list.
+        let idx: Vec<u32> = (0..8u32).flat_map(|i| [i, (i + 1) % 8, (i + 2) % 8]).collect();
+        RawPrim { verts, idx, color: [1.0; 4], tex_uri: None, tag: Tag::Body, pivot: None }
+    }
+
+    fn extent(m: &MeshData) -> f32 {
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for v in &m.verts {
+            let p = Vec3::from_array(v.pos);
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
+        (hi - lo).max_element()
+    }
+
+    /// body, an arm that folds in, a helper that departs, a shell panel
+    /// that arrives. Indices are stable where a part is present.
+    fn strip() -> Vec<Vec<RawPrim>> {
+        let body = |h: f32| cube(Vec3::ZERO, h);
+        let arm = |x: f32| cube(Vec3::new(x, 0.0, 0.0), 0.4);
+        let helper = || cube(Vec3::new(0.0, 2.0, 0.0), 0.2);
+        let panel = |h: f32| cube(Vec3::new(0.0, 0.0, 1.2), h);
+        vec![
+            // f00 bot: body + arm out + helper, no shell
+            vec![body(1.0), arm(2.5), helper()],
+            // f01 skeleton positioned
+            vec![body(1.0), arm(2.2), helper()],
+            // f02 hoist
+            vec![body(1.0), arm(1.8), helper()],
+            // f03 arm folded in
+            vec![body(1.0), arm(1.0), helper()],
+            // f04 THE FUSION: body shrinks, arm shrinks with it
+            vec![body(0.45), arm(0.5), helper()],
+            // f05 helper gone, shell panel arrives small
+            vec![body(0.45), arm(0.5), panel(0.2)],
+            // f06 shell assembled
+            vec![body(0.45), arm(0.5), panel(1.0)],
+        ]
+    }
+
+    #[test]
+    fn a_seven_pose_strip_unifies_and_morphs() {
+        // The loader takes any pose count >= 2 (main.rs:1922), so six
+        // stages need no code change. This pins that end to end.
+        let u = crate::align::unify(strip()).expect("seven poses should unify");
+        assert_eq!(u.poses.len(), 7, "one entry per pose");
+        let m = Morph::build(u.poses.clone(), u.idx.clone());
+        assert!(m.is_some(), "Morph should accept a seven-pose strip");
+    }
+
+    #[test]
+    fn a_departing_helper_shrinks_away_instead_of_popping() {
+        // `align::unify` collapses an absent part to its centroid, so the
+        // lerp scales it out. That is stage 6.3, "pop away helpers",
+        // already implemented — this asserts it rather than assuming it.
+        let u = crate::align::unify(strip()).unwrap();
+        let mut m = Morph::build(u.poses.clone(), u.idx.clone()).unwrap();
+        let helper = 2; // third prim in the pose-0 order
+        let before = extent(&m.sample(helper, 4.0 / 6.0));
+        let after = extent(&m.sample(helper, 5.0 / 6.0));
+        assert!(after < before * 0.5, "helper did not shrink away: {before} -> {after}");
+    }
+
+    #[test]
+    fn the_fusion_stage_actually_reduces_volume() {
+        // Stage 5 is where the order of magnitude has to come from (see
+        // STOWING.md). The strip CAN express it: the body is authored
+        // smaller in f04, and the blend carries it there.
+        let u = crate::align::unify(strip()).unwrap();
+        let mut m = Morph::build(u.poses.clone(), u.idx.clone()).unwrap();
+        let body = 0;
+        let before = extent(&m.sample(body, 3.0 / 6.0));
+        let after = extent(&m.sample(body, 4.0 / 6.0));
+        assert!(after < before * 0.6, "fusion did not shrink the body: {before} -> {after}");
+    }
+
+    #[test]
+    fn stage_weights_can_make_the_fusion_stage_slow() {
+        // The point of per-segment durations: give stage 5 more of the
+        // timeline without re-authoring the poses. Six segments, the
+        // fifth (index 4) weighted heavily.
+        let w = [1.0f32, 1.0, 1.0, 1.0, 6.0, 1.0];
+        // Half the transform should still be inside the fusion segment,
+        // which spans strip positions 4/6..5/6.
+        let mid = stage_time(0.5, Some(&w));
+        assert!(
+            (4.0 / 6.0..=5.0 / 6.0).contains(&mid),
+            "t=0.5 should sit inside the weighted stage, got {mid}"
+        );
+        // and uniform weights would have been well past it
+        assert!(stage_time(0.5, None) < 4.0 / 6.0);
+    }
+
+    #[test]
+    fn an_arriving_panel_scales_in_rather_than_appearing() {
+        let u = crate::align::unify(strip()).unwrap();
+        let mut m = Morph::build(u.poses.clone(), u.idx.clone()).unwrap();
+        // The panel is absent from f00..f04, so it occupies a slot after
+        // the base prims; find it by looking for the part that grows.
+        let grew = (0..u.poses[0].len()).find(|p| {
+            let mut mm = Morph::build(u.poses.clone(), u.idx.clone()).unwrap();
+            let a = extent(&mm.sample(*p, 5.0 / 6.0));
+            let b = extent(&mm.sample(*p, 1.0));
+            b > a * 1.5
+        });
+        assert!(grew.is_some(), "no part scaled in across the last segment");
+        let p = grew.unwrap();
+        assert!(extent(&m.sample(p, 4.0 / 6.0)) < extent(&m.sample(p, 1.0)));
+    }
+}
