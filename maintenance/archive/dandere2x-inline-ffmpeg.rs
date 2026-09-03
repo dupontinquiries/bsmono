@@ -1,3 +1,33 @@
+// ARCHIVED: dandere2x's inline ffmpeg layer, and the CODECS PREFLIGHT its
+//           successor does not have.
+// ORIGIN: apps/dandere2x/crates/dandere2x/src/ffmpeg.rs
+// REMOVED: 51fc6e766 2026-09-03 — the d2x-job bundle merge promoted this
+//           concern into its own crate and left this file undeclared in src/.
+//           Found by orphan_check.py, not by anyone reading the merge.
+// SUPERSEDED-BY: apps/dandere2x/crates/d2x-job/src/ffmpeg.rs — same
+//           concat_parts / keyframe_times / open / open_segment / probe /
+//           segments, plus open_ranged.
+// LAST-KNOWN-GOOD: 5 tests passed at 05dd3c87 (2026-09-03), the last suite run
+//           with this file still compiled. Those tests are unit tests over
+//           parsing and segment arithmetic; NOTHING here was confirmed against
+//           a real ffmpeg invocation in that run, because this sandbox has no
+//           ffmpeg. "Its tests passed" and "it drove a real encode" are
+//           different claims and only the first is made.
+//
+// WHY IT IS WORTH KEEPING — three public items the successor does NOT have:
+//
+//   preflight / ok / problem
+//
+// That is commit 8096ba1f3, "preflight the ffmpeg CODECS, not just the binary".
+// The successor checks that ffmpeg EXISTS. This checked that it can actually
+// encode what the job asks for, which is a different question with a different
+// failure: an ffmpeg without the right encoder passes an existence check and
+// then fails an hour into a run.
+//
+// So this is not a clean supersession, and the merge that caused it did not
+// notice. Reinstating the preflight against d2x-job's ffmpeg is a small, real
+// piece of work; this file is what it should be ported from.
+
 //! Video I/O through ffmpeg subprocesses.
 //!
 //! In: `ffmpeg -i src -f rawvideo -pix_fmt rgb24 -` (AV1 decodes via

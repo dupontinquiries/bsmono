@@ -1,3 +1,27 @@
+// ARCHIVED: dandere2x's inline job layer, and the MODEL SEARCH its successor
+//           does not have.
+// ORIGIN: apps/dandere2x/crates/dandere2x/src/job.rs
+// REMOVED: 51fc6e766 2026-09-03 — same merge and same way as the ffmpeg file
+//           beside it.
+// SUPERSEDED-BY: apps/dandere2x/crates/d2x-job/src/job.rs — wider in every
+//           other respect (tiers, memory plans, a batch server, the segment
+//           runner and now resume).
+// LAST-KNOWN-GOOD: compiled at 05dd3c87 (2026-09-03) with no tests of its own.
+//           Never run against a real upscale in this sandbox.
+//
+// WHY IT IS WORTH KEEPING — two public items the successor does NOT have:
+//
+//   model_search_dirs / resolve_model
+//
+// That is commit 57d454753, "land the upscaler, RESHAPED to find models in
+// ~/models". The successor's `default_model_paths` walks the EXECUTABLE's
+// ancestors and the compile-time manifest dir for one hard-coded filename; it
+// does not look in ~/models and does not resolve a model by name.
+//
+// Worth reading beside `games/unendlich/crates/unendlich-engine/src/assets.rs`,
+// which is the same bug in another app: a path baked at build time works only
+// on the machine that built the binary. d2x-job's version has it too.
+
 //! One place that turns settings into a running pipeline, shared by the CLI
 //! subcommands and the egui shell so they cannot drift.
 
