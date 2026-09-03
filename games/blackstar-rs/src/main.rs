@@ -66,6 +66,7 @@ mod perception;
 mod trainwatch;
 mod tuner;
 mod tuning;
+mod vo;
 mod vocab;
 mod valuestruct;
 mod hazard;
@@ -1544,6 +1545,12 @@ fn main() {
     if argv.iter().any(|a| a == "--arch") {
         // the archaeological map: strata, findings, the Asteri arithmetic
         archsim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--vo") {
+        // the voice bank: lines lifted from the screenplays, barks authored,
+        // ids derived, scripts written for the booth
+        vo::run(&argv);
         return;
     }
     if argv.iter().any(|a| a == "--campaign") {
