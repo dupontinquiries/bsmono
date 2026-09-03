@@ -356,5 +356,21 @@ mod tests {
             0,
             "a PtyHost is being spawned without a waker again."
         );
+        // COMMANDS TYPED BY A SURFACE MUST MIRROR INTO THE LINE BUFFER.
+        // cmd_risk::withhold_enter reads app.terminal.input to decide
+        // whether to hold Enter. A surface that appends only to pty_out
+        // leaves the shell holding a command the gate cannot see, and
+        // `rm -rf` dropped from the command sheet then runs unconfirmed.
+        assert!(
+            src.contains("fn stage_command("),
+            "the type-into-shell funnel is gone — surfaces will append \
+             commands the risk gate cannot see."
+        );
+        // Four surfaces stage commands; each must go through the funnel.
+        assert!(
+            src.matches("self.stage_command(").count() >= 4,
+            "a surface stopped using stage_command — check whether it now \
+             appends to pty_out directly."
+        );
     }
 }

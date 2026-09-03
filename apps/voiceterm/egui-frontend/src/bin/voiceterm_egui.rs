@@ -801,6 +801,32 @@ impl VoicetermApp {
     /// they were three fiddly cases (backspace before the control-byte
     /// check, escape sequences rejected, `\r` and `\n` both ending a line)
     /// sitting inline in a frame loop where nothing could test them.
+    /// Type a command into the shell WITHOUT running it, and keep the
+    /// widget's line buffer in step.
+    ///
+    /// ## The hole this closes
+    ///
+    /// Several surfaces "type, not run" a command — the favourites
+    /// pane's `cd`, the command sheet's drop, a clicked search hit, a
+    /// staged card. Each appended to `pty_out` only. The shell's line
+    /// editor then held a command that `app.terminal.input` knew nothing
+    /// about.
+    ///
+    /// That matters because `cmd_risk::withhold_enter` reads
+    /// `app.terminal.input` to decide whether to hold the Enter byte. So
+    /// dropping `rm -rf build` from the command sheet and pressing Enter
+    /// classified the EMPTY string, found it not Mutating, and ran the
+    /// command with no confirmation at all. The gate was not bypassed by
+    /// a clever input; it simply never saw the line.
+    ///
+    /// One funnel, so a surface cannot add a command path and forget the
+    /// mirror. `stage` replaces the buffer rather than appending,
+    /// matching what these surfaces do to the shell's line.
+    fn stage_command(&mut self, cmd: &str) {
+        self.session.pty_out.extend_from_slice(cmd.as_bytes());
+        self.app.terminal.stage(cmd);
+    }
+
     fn record_typed(&mut self, bytes: &[u8]) {
         for cmd in self.line_buf.feed(bytes) {
             // `start_row`: where the block begins in the scrollback. The
@@ -1075,8 +1101,7 @@ impl eframe::App for VoicetermApp {
                             // Typed, not run — consistent with every other
                             // surface in this app that produces a command.
                             fv::Action::Cd(path) => {
-                                self.session.pty_out.extend_from_slice(
-                                    format!("cd {path:?}").as_bytes());
+                                self.stage_command(&format!("cd {path:?}"));
                                 self.surfaces.close();
                             }
                             fv::Action::Close => self.surfaces.close(),
@@ -1133,7 +1158,7 @@ impl eframe::App for VoicetermApp {
                         // these are commands you already ran once, often the
                         // one just before something went wrong.
                         A::Drop(cmd) => {
-                            self.session.pty_out.extend_from_slice(cmd.as_bytes());
+                            self.stage_command(&cmd);
                             self.surfaces.close();
                             self.cmd_sheet.close(); // clears the in-flight drag
                         }
@@ -1173,7 +1198,7 @@ impl eframe::App for VoicetermApp {
                     // clicking a search result is a navigation gesture, and
                     // spawning an editor from one is a surprise.
                     let cmd = format!("${{EDITOR:-vi}} +{} {}", hit.line, hit.path);
-                    self.session.pty_out.extend_from_slice(cmd.as_bytes());
+                    self.stage_command(&cmd);
                     self.fs_search.cancel();
                 }
             });
@@ -2908,7 +2933,7 @@ impl eframe::App for VoicetermApp {
                                 // Typed, not run — same rule as a clicked
                                 // search hit: the operator presses Enter.
                                 P::Stage(body) => {
-                                    self.session.pty_out.extend_from_slice(body.as_bytes());
+                                    self.stage_command(&body);
                                     self.deck.clear_selection();
                                 }
                                 P::OpenSource(url) => {
