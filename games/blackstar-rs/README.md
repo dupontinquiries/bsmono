@@ -28,7 +28,7 @@ RL-style flight physics tuned for keeping the ball on your nose.
 This directory is a distinct, much larger project from `games/skydribble` — an
 engine extension toward a more ambitious, Destiny-style game (108 source files,
 ~65,000 lines, vs. skydribble's 31 files, with dozens of exclusive systems:
-`campaign.rs`, `duel.rs`, `energon.rs`, `exoworlds.rs`, `finale.rs`,
+`campaign.rs`, `duel.rs`, `valence.rs`, `exoworlds.rs`, `finale.rs`,
 `corruption.rs`, vendored `snapcore`/`netcode` crates for networking, and more).
 The text above and the package name (`skydribble`) are copied from the sibling
 project and were never updated to describe what this one actually is. Not

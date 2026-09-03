@@ -24,11 +24,21 @@ against code rather than documentation; for story this is the same rule with
 the reason spelled out.
 
 **Vocabulary is the one hard constraint.** This universe is Coalition /
-Hijacks / Blackstar Clans / Corrupted / Rodimus. It is NOT Autobot, Decepticon,
-Optimus Prime or Cybertron — those are licensed marks belonging to
+Hijacks / Blackstar Clans / Corrupted / the Enduring / the Sundered. It is NOT
+Autobot, Decepticon, Optimus Prime, Rodimus or Cybertron — those are licensed
+marks belonging to
 Paramount/Hasbro, and earlier drafts of every one of the thirteen original
 screenplay files used them. The two files here were checked clean by direct
 grep, and anything added beside them should be.
+
+**Rodimus was in this sentence.** Until the cleanup it read "… / Corrupted /
+Rodimus", which is a Hasbro name sitting inside the rule that bans Hasbro
+names. Two others were never listed at all: Unicron and Jhiaxus, 107
+occurrences between them. A rule that names its own exceptions wrongly is worse
+than no rule, because it certifies the thing it should catch.
+
+The live version of this rule is now `src/vocab.rs`, which counts every mark
+across `src/` and fails when a number moves. Prose cannot enforce itself.
 
 ## The Unicron material is a reference, not a claim
 

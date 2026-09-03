@@ -12,6 +12,44 @@ moved, the code won.
 
 ---
 
+# The cast, named
+
+Settled during the cleanup that removed the licensed vocabulary. Recorded here
+because these are authoring decisions, not renames, and `src/vocab.rs` enforces
+the result mechanically without explaining any of it.
+
+Two registers already existed and both were kept: institutional plain English
+for the human and archive side (Coalition, Corrupted, the Directorate,
+Continuous Earth), and two-part archaic compounds for the clone side
+(veilhorn, cindermaw, arcwrit, cairnback).
+
+| was | is | why |
+|---|---|---|
+| Autobots | **the Enduring** | Their own name, and the prologue's best line is about it — *"we mistook endurance for destiny."* The name is the hubris, stated in minute one. |
+| Decepticons | **the Sundered** | Past-participle plural, matching Corrupted and Hijacks. Names the EVENT rather than a quality: they are defined by the split. |
+| Optimus Prime | **Keelwright** | A keel is what a ship is built around; a wright makes things. An elder thinking in centuries about who follows him. |
+| Halyard | **Halyard** | The line that raises the sail. Pairs with Keelwright without being a diminutive of him. |
+| Hot Rod | **Jib** | A small forward sail: young, quick. He is Jib before he inherits and Halyard after — the NAME CHANGE IS THE INHERITANCE. |
+| Megatron | **Cleave** | A single hard word like Voltage and Blackstar. Means both to split and to cling, which is the right ambiguity for someone who broke a civilisation and never left it alone. |
+| Assay | **Assay** | The act of testing something to find out what it is. Makes his experiment the whole of his identity, which `corruption.rs` already describes. |
+| the Unending | **the Unending** | Literal, not mythological: `corruption.rs` says the remnant reissues a transformation protocol forever WITH NO DEFINED ENDPOINT. Sets against the Enduring exactly — one endures and dies, the other never stops. |
+| the Matrix | **the Charge** | What you are charged with. A word a machine culture already owns. |
+| Prime (the title) | **dropped** | A culture that will not name its own world does not award suffixes. The inheritance is the name change. |
+| Cybertronian | **Machine** (`Body::Machine`) | Neutral on purpose. The type system should not take a side in a naming dispute the fiction is about. |
+| Cybertron | **the Foundry** in the archive; **home** to the Enduring | What humans called a dead machine world when they found it: obviously wrong, obviously evocative, which is the Directorate's whole habit. |
+| energon | **valence** | Real electron physics, and what it names is the capacity to combine into something else. Pairs against `chi.rs` without echoing it: chi is what a body has BECOME, valence is what a machine has AVAILABLE. |
+
+**Two pairs are load-bearing.** Enduring/Unending and Keelwright/Halyard each
+stop working if one is taken and the other left. Jib/Halyard is a third: it
+only reads as an inheritance because both names exist.
+
+**What the cleanup did NOT rename, and must not.** `grandeur.rs` is a citation
+table of real production measurements where the label identifies the source;
+`compact.rs` and `xform.rs` cite the reference material as the reason for a
+rendering technique; three asset filenames name a real game; and `saga.rs`'s
+guards must contain the licensed words to detect them. `vocab.rs` records each
+as a floor with its reason, and `DO_NOT_SWEEP` lists the files.
+
 ## 1. The Watch is a receiver, not an engine
 
 The authority over matter lives in a machine on the makers' world, barren now,
@@ -176,8 +214,8 @@ around everyone popping super in the last phase.**
 the solid only opens when matter outside it is arranged correctly), and
 `raidgen.rs` derives mechanics from lore by design. **OPEN, and it has a
 cost:** `raidgen.rs` says the finale is the boss's own arena and that "SYNC
-finishes at `unicron`" falls out for free because every SYNC boss's arena is
-`unicron` — a roster fact `raidcon` tests. Finishing at `unicron` fits the
+finishes at `unending`" falls out for free because every SYNC boss's arena is
+`unending` — a roster fact `raidcon` tests. Finishing at `unending` fits the
 Earth-remnant thread and needs no changes. Anywhere else breaks that test.
 Phases: The Approach → The Gauntlet → **The Anvil**.
 
@@ -200,11 +238,11 @@ wiring up the arm into the skull, surgical, invasive, period-correct for
 believed the Watch stores a brain. It doesn't. So the replica is a monument to
 a misunderstanding — the archive's own theme (the official record written by
 someone who wasn't there) in hardware. The gore is evidence of an error, not
-shock. Jhiaxus' work is the natural site: a room, a chair, cabling, and
+shock. Assay' work is the natural site: a room, a chair, cabling, and
 something that has been mid-transformation for years.
 
 **Do not state the genealogy as fact in the fiction.** `archive.rs` is built on
-corroboration and on false leads resolving to nothing (`unicron_detection_scan`
+corroboration and on false leads resolving to nothing (`unending_detection_scan`
 is an instrument artefact). "The Corrupted are failed bearers" is exactly the
 grand unification that module distrusts. Enter it as a claim, single-sourced,
 unable to corroborate itself — the shape of `array_reading_one/two/three`
