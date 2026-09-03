@@ -218,6 +218,34 @@ pub fn known(discovered: &[(String, Vec<String>)]) -> Vec<KnownDaemon> {
     out
 }
 
+/// List the units each daemon project ships, ready for [`known`].
+///
+/// `projects` is `(id, path)` for every manifest entry with `daemon = true` —
+/// `appcatalog::parse_manifest` supplies both fields, so the caller filters
+/// rather than this module depending on the catalogue.
+///
+/// The thin shell around [`daemon_names_from_units`]: a `read_dir` each, and
+/// nothing else. A project with no `systemd/` directory yields an empty list
+/// rather than an error — `bo-suite` is `daemon = true` with no units checked
+/// in, and that is a fact about the project, not a failure of the scan.
+pub fn discover_units(root: &std::path::Path, projects: &[(String, String)])
+    -> Vec<(String, Vec<String>)>
+{
+    let mut out = Vec::new();
+    for (id, rel) in projects {
+        let dir = root.join(rel).join("systemd");
+        let names: Vec<String> = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        out.push((id.clone(), daemon_names_from_units(&names)));
+    }
+    out
+}
+
 /// Everything needed to put a daemon on a machine: one file, then some commands.
 ///
 /// Returned as DATA rather than executed, so the same plan drives a local
@@ -628,6 +656,11 @@ mod tests {
         // names with the wrong suffix stripped.
         let only_sockets: Vec<String> = vec!["x.socket".into()];
         assert!(daemon_names_from_units(&only_sockets).is_empty());
+        // Duplicates collapse. A directory listed twice — which a caller
+        // merging two search paths will do — must not offer the same daemon
+        // twice; found by breaking the `dedup` and watching nothing fail.
+        let dupes: Vec<String> = vec!["voiced.service".into(), "voiced.service".into()];
+        assert_eq!(daemon_names_from_units(&dupes), vec!["voiced"]);
     }
 
     #[test]
@@ -673,6 +706,54 @@ mod tests {
         assert!(d.integration.is_empty());
         assert!(!d.registered);
         assert_eq!(d.project, "snapclone");
+    }
+
+    #[test]
+    fn discovery_reads_the_real_tree_and_finds_the_units_that_exist() {
+        // Against the real repository, like the manifest test in appcatalog and
+        // for the same reason: the value of this function is that it agrees
+        // with what is on disk, and a fixture would let the two drift while the
+        // test stayed green.
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../.."));
+        let projects = vec![
+            ("snapclone".to_string(), "apps/snapclone".to_string()),
+            ("photosync".to_string(), "system/photosync".to_string()),
+            ("voiced".to_string(), "apps/voiced".to_string()),
+            // `daemon = true` with NO systemd directory. Must be empty, not an
+            // error — a fact about the project, not a failure of the scan.
+            ("bo-suite".to_string(), "apps/bo-suite".to_string()),
+        ];
+        let found = discover_units(root, &projects);
+        let of = |id: &str| found.iter().find(|(p, _)| p == id).map(|(_, v)| v.clone()).unwrap();
+
+        assert_eq!(of("snapclone"), vec!["snapclone-bus", "snapclone-camera-bridge"]);
+        assert_eq!(of("photosync"), vec!["photosync"]);
+        // voiced ships a .socket beside its .service; only one daemon.
+        assert_eq!(of("voiced"), vec!["voiced"]);
+        assert!(of("bo-suite").is_empty(), "a project with no systemd/ was not empty");
+
+        // A missing project directory is also empty rather than a panic — the
+        // manifest can name a path before the tree exists.
+        let gone = discover_units(root, &[("ghost".into(), "apps/does-not-exist".into())]);
+        assert_eq!(gone, vec![("ghost".to_string(), Vec::<String>::new())]);
+    }
+
+    #[test]
+    fn the_real_tree_feeds_known_and_the_registry_gap_closes() {
+        // End to end over the actual repository: this is the assertion that
+        // C14_TODO §17's finding is fixed, and it will fail again if someone
+        // adds a daemon project without units or removes the discovery.
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../.."));
+        let projects = vec![
+            ("snapclone".to_string(), "apps/snapclone".to_string()),
+            ("photosync".to_string(), "system/photosync".to_string()),
+        ];
+        let k = known(&discover_units(root, &projects));
+        let names: Vec<&str> = k.iter().map(|d| d.name.as_str()).collect();
+        for want in ["snapclone-bus", "snapclone-camera-bridge", "photosync"] {
+            assert!(names.contains(&want), "{want} still invisible: {names:?}");
+        }
+        assert!(names.contains(&"voiced"), "the registry entries were lost");
     }
 
 }

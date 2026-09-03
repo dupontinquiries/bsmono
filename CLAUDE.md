@@ -298,6 +298,24 @@ python3 maintenance/tools/voiceprint_parity_check.py . # voiceterm's fingerprint
 python3 maintenance/tools/font_install_check.py . # every egui app reaches uikit-egui's fonts::install, or its symbol glyphs are boxes
 ```
 
+`maintenance/tools/break-test.sh` is for the §5b break test itself. `source` it,
+set `BRK_BACKUP` to a copy of the file taken BEFORE any edit, and call
+`brk <file> <old> <new> <label> <pkg> <filter>`. It reports four outcomes and
+the distinction between them is the point:
+
+* **caught** — the break failed a test, which is the result you want
+* **NOT CAUGHT** — nothing tests this
+* **DID NOT COMPILE** — inconclusive, and NOT a pass
+* **ANCHOR MISS** — nothing was changed, so the run says nothing
+
+The third and fourth are why it exists. A hand-rolled `grep -c FAILED` reports
+zero failures for a break that did not compile and for one whose anchor never
+matched, and both read as "nothing catches this" — that happened twice in one
+session. Note also that `error: test failed, to rerun pass ...` is cargo
+reporting a TEST failure, so a bare `^error:` match misclassifies a genuine
+catch as a build failure; the script matches `error[E...]` and
+`error: could not compile` only.
+
 `font_install_check.py` exists because shipping the symbol fonts fleet-wide
 (`7098bc4a`) fixed only the apps that CALL `apply_palette`, and switcheroo did
 not — it was the one egui app with no `uikit-egui` dependency, so `★`, `☆` and
