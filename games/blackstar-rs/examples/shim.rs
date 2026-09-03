@@ -27,6 +27,16 @@
 // Discovered the same way as last time: every harness failed to compile
 // against this shim, `cannot find 'turret' in 'crate'`, because the
 // harnesses are not part of the fast edit loop that produced them.
+//
+// HOW TO STOP REDISCOVERING THIS. The pattern is now four for four: a
+// feature lands, `model.rs` or a module it pulls gains a sibling, and the
+// harnesses break silently because nobody builds them. They are not
+// invisible to cargo, though — `cargo test` builds every example target,
+// and so does `cargo build --examples`. `cargo build` alone does not.
+//
+// So the rule is the same one that catches it everywhere else: run the
+// whole suite, not the fast subset. A green `cargo build` here means
+// nothing about whether the harnesses still work.
 #[path = "../src/meshgen.rs"]
 pub mod meshgen;
 #[path = "../src/botpack.rs"]
@@ -41,6 +51,19 @@ pub mod massfilter;
 pub mod cockpit;
 #[path = "../src/skeleton.rs"]
 pub mod skeleton;
+// And three more, the fourth time this has happened: `skeleton.rs` drives
+// poses through `crate::anim`, and `model.rs` now calls
+// `crate::orient::up_score` to pick a model's up axis and
+// `crate::hardpoints::find`. All three are self-contained — `anim.rs`
+// depends on nothing at all, `orient.rs` and `hardpoints.rs` on `glam`,
+// `meshgen` and `model`, which are already here — so they are pulled in
+// for real rather than stubbed, same as the rest.
+#[path = "../src/anim.rs"]
+pub mod anim;
+#[path = "../src/orient.rs"]
+pub mod orient;
+#[path = "../src/hardpoints.rs"]
+pub mod hardpoints;
 #[path = "../src/model.rs"]
 pub mod model;
 

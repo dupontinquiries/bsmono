@@ -24,8 +24,9 @@
 //   silhouette_audit <bots dir> --sweep-all
 include!("shim.rs");
 
-#[path = "../src/orient.rs"]
-pub mod orient;
+// `orient` now comes from shim.rs: `model.rs` calls
+// `crate::orient::up_score`, so every harness needs it, not just this one.
+// Declaring it here as well is a duplicate definition.
 #[path = "../src/partdetect.rs"]
 pub mod partdetect;
 
