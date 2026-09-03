@@ -699,6 +699,7 @@ impl Snapclone {
 
     /// `auto_logged_in` mirrors Qt's construction-time auto-login check.
     pub fn new_with_login(peers: Vec<Peer>, auto_logged_in: bool) -> Snapclone {
+        let mut s =
         Snapclone {
             viewfinder: Default::default(),
             camera: None,
@@ -843,6 +844,12 @@ impl Snapclone {
             active_synthetic: None,
             landmark_prints: std::collections::HashMap::new(),
             trace: Default::default(),
+            // Seeded from the file, not from the default: consent asked for
+            // once and then forgotten on every restart is a consent dialog the
+            // user answers forever, and a REVOCATION forgotten is worse — the
+            // erase it owes never happens because nothing remembers it was
+            // owed. The settings load has already run by here (`settings`, a
+            // few lines up).
             face_consent: crate::face_consent::Consent::NotGiven,
             punch: Default::default(),
             heard: Default::default(),
@@ -943,7 +950,18 @@ impl Snapclone {
                 r
             },
             peers,
-        }
+        };
+        // Consent comes BACK OUT of the settings that were just loaded.
+        //
+        // It cannot be set in the literal above — `settings` is one of the
+        // fields being built there — and it must not be left at the default:
+        // a consent answered once and forgotten on every restart is a dialog
+        // the user answers forever, and a forgotten REVOCATION is worse, since
+        // the erase it owes never happens because nothing remembers it was
+        // owed.
+        s.face_consent =
+            crate::face_consent::Consent::from_key(&s.settings.current.camera.face_consent);
+        s
     }
 
     fn friend_of(p: &Peer) -> crate::friends::Friend {
@@ -4674,6 +4692,13 @@ impl Snapclone {
 
     pub fn set_face_consent(&mut self, c: crate::face_consent::Consent) -> bool {
         self.face_consent = c;
+        // Persisted on change, same rule as the flash: a phone app is killed
+        // rather than closed, so a shutdown-path write never happens.
+        self.settings.current.camera.face_consent = c.as_key().to_string();
+        self.settings.save();
+        if let Err(e) = crate::settings_store::store(&self.settings.current) {
+            self.shutter_note = format!("consent not saved — {e}");
+        }
         c.owes_erase()
     }
 

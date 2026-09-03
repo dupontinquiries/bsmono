@@ -284,6 +284,14 @@ pub struct Camera {
     /// This app already had a settings page, a store and a Save that writes
     /// the file; the flash toggle simply was not going through any of it.
     pub capture_flash_bright: bool,
+    /// Face-detection consent, as a word — `notgiven`, `granted`, `revoked`.
+    ///
+    /// A String rather than the `Consent` enum so this module stays free of
+    /// the face subsystem: `Settings` is a plain data bag that the store
+    /// serialises, and pulling a domain type in here would make the settings
+    /// file's grammar depend on that type's shape. `Consent::as_key` and
+    /// `from_key` are the only translation, in one place.
+    pub face_consent: String,
 }
 
 impl Default for Camera {
@@ -298,6 +306,7 @@ impl Default for Camera {
             speech_boost_auto_only: true,
             face_library: false,
             capture_flash_bright: false,
+            face_consent: "notgiven".to_string(),
         }
     }
 }

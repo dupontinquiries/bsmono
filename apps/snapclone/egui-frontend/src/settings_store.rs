@@ -82,7 +82,8 @@ pub fn render(s: &Settings) -> String {
     out.push_str(&format!("speech_boost = {}\n", c.speech_boost.key()));            // audio/speechBoost
     out.push_str(&format!("speech_boost_auto_only = {}\n", c.speech_boost_auto_only)); // audio/speechBoostAutoOnly
     out.push_str(&format!("face_library = {}\n", c.face_library));                  // face/enabled
-    out.push_str(&format!("capture_flash_bright = {}\n", c.capture_flash_bright));   // no Qt twin — the Qt app flashes white unconditionally
+    out.push_str(&format!("capture_flash_bright = {}\n", c.capture_flash_bright));
+    out.push_str(&format!("face_consent = {}\n", c.face_consent));                  // no Qt twin — the Qt app has no consent gate   // no Qt twin — the Qt app flashes white unconditionally
 
     let n = &s.network;
     out.push_str("\n[network]\n");
@@ -163,6 +164,12 @@ pub fn parse(text: &str) -> Settings {
         b(get("camera", "speech_boost_auto_only"), c.speech_boost_auto_only);
     c.face_library = b(get("camera", "face_library"), c.face_library);
     c.capture_flash_bright = b(get("camera", "capture_flash_bright"), c.capture_flash_bright);
+    if let Some(v) = get("camera", "face_consent") {
+        // Normalised THROUGH the enum on the way in, so a hand-edited file
+        // containing `yes` becomes `notgiven` here rather than sitting in the
+        // struct as a word nothing recognises and being written back out.
+        c.face_consent = crate::face_consent::Consent::from_key(&v).as_key().to_string();
+    }
 
     let mut n = Network::default();
     if let Some(v) = get("network", "listen_port").and_then(|x| x.parse().ok()) { n.listen_port = v; }
@@ -402,6 +409,61 @@ mod roundtrip_tests {
         // that happens to agree.
         s.camera.capture_flash_bright = false;
         assert!(!parse(&render(&s)).camera.capture_flash_bright);
+    }
+
+    /// The constructor must READ consent back, and nothing else can catch it.
+    ///
+    /// Found by breaking it: deleting the seeding line from `new_with_login`
+    /// failed no test at all, while every other part of this path had two
+    /// suites on it. The store round-trips, the enum round-trips, and the
+    /// setter writes — and consent still reset on every restart, because the
+    /// one line that reads it back was untested.
+    ///
+    /// A behavioural test would need `Snapclone::new_with_login` to load a
+    /// settings file, which reads `$HOME`. So this greps the source, which is
+    /// the pattern this tree already uses for wiring that cannot be exercised
+    /// — and like every scan here it asserts it FOUND something first, since a
+    /// grep that matches nothing passes every assertion below it.
+    #[test]
+    fn the_constructor_seeds_consent_from_the_loaded_settings() {
+        let src = include_str!("lib.rs");
+        let ctor = src
+            .split_once("pub fn new_with_login")
+            .expect("new_with_login is gone — this test is measuring nothing")
+            .1;
+        // Bounded to the constructor: the setter also mentions both names, and
+        // matching it would let the read be deleted while this still passed.
+        let body = &ctor[..ctor.find("\n    fn friend_of").unwrap_or(ctor.len())];
+        assert!(
+            body.contains("face_consent") && body.contains("from_key"),
+            "new_with_login does not read consent back from settings — it will \
+             reset on every restart, and a forgotten revocation forgets the \
+             erase it owed"
+        );
+    }
+
+    #[test]
+    fn consent_round_trips_as_three_states_not_two() {
+        // The reason it is a word. A bool would carry Granted and turn Revoked
+        // into NotGiven, and those two are not the same: both stop detection,
+        // only one owes the user an erase of crops already taken. A settings
+        // file that forgets a revocation forgets the debt with it.
+        use crate::face_consent::Consent;
+        for c in [Consent::NotGiven, Consent::Granted, Consent::Revoked] {
+            let mut s = Settings::default();
+            s.camera.face_consent = c.as_key().to_string();
+            let back = parse(&render(&s));
+            assert_eq!(Consent::from_key(&back.camera.face_consent), c, "{c:?} was lost");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_consent_value_loads_as_no_consent() {
+        // A hand-edited or newer-version file must not be read as permission,
+        // and must not be written back out as a word nothing recognises.
+        let s = parse("[camera]\nface_consent = yes\n");
+        assert_eq!(s.camera.face_consent, "notgiven", "junk normalised to {:?}", s.camera.face_consent);
+        assert!(!crate::face_consent::Consent::from_key(&s.camera.face_consent).may_detect());
     }
 
     #[test]

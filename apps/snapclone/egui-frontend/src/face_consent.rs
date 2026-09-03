@@ -104,6 +104,32 @@ impl Consent {
 
     /// Does the library owe an erase?
     pub fn owes_erase(self) -> bool { self == Consent::Revoked }
+
+    /// The word this is stored as, and read back from.
+    ///
+    /// A WORD, not a bool. The three states are not two: `NotGiven` and
+    /// `Revoked` both mean no detection runs, and only one of them owes the
+    /// user an erase of crops already taken. A bool would round-trip the
+    /// first correctly and silently turn every revocation into "never asked",
+    /// which is the difference between a debt discharged and a debt forgotten.
+    pub fn as_key(self) -> &'static str {
+        match self {
+            Consent::NotGiven => "notgiven",
+            Consent::Granted => "granted",
+            Consent::Revoked => "revoked",
+        }
+    }
+
+    /// Read it back. An unrecognised word is `NotGiven` — the state that grants
+    /// nothing and owes nothing, which is the only safe reading of a file this
+    /// app cannot interpret.
+    pub fn from_key(s: &str) -> Consent {
+        match s.trim() {
+            "granted" => Consent::Granted,
+            "revoked" => Consent::Revoked,
+            _ => Consent::NotGiven,
+        }
+    }
 }
 
 /// The opt-in text, kept as data because it is a promise the code must keep.
@@ -323,5 +349,40 @@ mod tests {
                 "the stated purpose is bandwidth, not identity");
         assert!(!OPT_IN_TEXT.to_lowercase().contains("recogni"),
                 "identity framing crept back into the consent text");
+    }
+}
+#[cfg(test)]
+mod key_tests {
+    use super::Consent;
+
+    #[test]
+    fn every_state_round_trips_and_none_collapse() {
+        // The whole reason this is a word: a bool would round-trip Granted and
+        // turn Revoked into NotGiven, losing the erase debt silently.
+        for c in [Consent::NotGiven, Consent::Granted, Consent::Revoked] {
+            assert_eq!(Consent::from_key(c.as_key()), c, "{c:?} did not survive");
+        }
+        let keys: std::collections::BTreeSet<&str> =
+            [Consent::NotGiven, Consent::Granted, Consent::Revoked]
+                .iter().map(|c| c.as_key()).collect();
+        assert_eq!(keys.len(), 3, "two states share a spelling");
+        // And the pair that a bool would merge really is distinguishable here.
+        assert_ne!(Consent::from_key("revoked"), Consent::from_key("notgiven"));
+        assert!(Consent::from_key("revoked").owes_erase());
+        assert!(!Consent::from_key("notgiven").owes_erase());
+    }
+
+    #[test]
+    fn an_unreadable_value_grants_nothing() {
+        // A file this app cannot interpret must not be read as consent.
+        for junk in ["", "yes", "true", "GRANTED", "granted "] {
+            let c = Consent::from_key(junk);
+            if junk == "granted " {
+                assert_eq!(c, Consent::Granted, "surrounding space should be tolerated");
+            } else {
+                assert_eq!(c, Consent::NotGiven, "{junk:?} was read as something");
+                assert!(!c.may_detect());
+            }
+        }
     }
 }
