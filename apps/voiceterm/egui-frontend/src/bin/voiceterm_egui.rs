@@ -466,15 +466,6 @@ struct VoicetermApp {
     /// Panes whose shell spawn already failed. Without this a machine
     /// with no usable shell is asked for one sixty times a second.
     pty_spawn_failed: std::collections::HashSet<u64>,
-    /// Find-in-terminal: the query, and which match we are on.
-    ///
-    /// `uikit_term::App` has a find bar, but it searches ITS grid, which
-    /// nothing feeds here — and nothing in this binary ever called
-    /// `search_ui`, so the menu item set a flag that no frame rendered.
-    /// The state lives with the grid that has the text.
-    find_open: bool,
-    find_query: String,
-    find_at: usize,
     /// One-shot latch so "shell exited" is said once, not every frame.
     pty_ended_noted: bool,
     /// The QML settingsPopup's launcher half — four doors plus voice
@@ -3397,52 +3388,13 @@ impl eframe::App for VoicetermApp {
                     foreground: None,
                     visible: Some(&self.session.grid.row_text(self.session.grid.cursor().1)),
                 });
-            if self.find_open {
-                let hits = self.session.grid.find_all(&self.find_query);
-                ui.horizontal(|ui| {
-                    ui.label("find");
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.find_query)
-                            .id_salt("voiceterm-find")
-                            .hint_text("search the screen and scrollback…")
-                            .desired_width(220.0),
-                    );
-                    if resp.changed() {
-                        self.find_at = 0;
-                    }
-                    // Counting from 1 because a match counter is read by
-                    // a person, not indexed by one.
-                    let n = hits.len();
-                    ui.label(if n == 0 && !self.find_query.is_empty() {
-                        "no matches".to_string()
-                    } else if n == 0 {
-                        String::new()
-                    } else {
-                        format!("{}/{}", self.find_at + 1, n)
-                    });
-                    let mut jump = None;
-                    if ui.button("‹").clicked() && n > 0 {
-                        self.find_at = (self.find_at + n - 1) % n;
-                        jump = Some(self.find_at);
-                    }
-                    if ui.button("›").clicked() && n > 0 {
-                        self.find_at = (self.find_at + 1) % n;
-                        jump = Some(self.find_at);
-                    }
-                    if ui.button("✕").clicked() {
-                        self.find_open = false;
-                        // Back to the live tail: leaving the view parked
-                        // in history after closing the bar reads as the
-                        // terminal having stopped.
-                        self.session.grid.scroll_to_bottom();
-                    }
-                    if let Some(i) = jump {
-                        if let Some(&(abs, _)) = hits.get(i) {
-                            self.session.grid.scroll_to_abs_row(abs);
-                        }
-                    }
-                });
-            }
+            // The widget's own find bar, which searches app.terminal's
+            // grid — fed since feed_pty started mirroring there, so it
+            // has the shell's history for the first time. The
+            // hand-rolled bar that searched session.grid is gone: it
+            // found matches in a buffer nobody was looking at and
+            // scrolled a view nobody could see.
+            self.app.search_ui(ui);
             if self.password_mode {
                 // SAID OUT LOUD. A terminal that silently stops echoing looks
                 // broken; one that says why looks careful — and this is also
@@ -3871,47 +3823,10 @@ impl eframe::App for VoicetermApp {
             if self.app.handle_gestures(ctx, term_rect.min) {
                 ctx.request_repaint(); // fling momentum still gliding
             }
-            // RE-READ THE SELECTION FROM THE GRID THAT HAS THE TEXT.
-            //
-            // handle_gestures does the hit-testing — it owns the cell
-            // metrics, font size and pinch zoom — but then reads the
-            // word or line from `app.terminal.grid`, which nothing feeds
-            // here. So a tap produced `Some(Selection { text: "" })`,
-            // and that is worse than producing nothing: the copy path
-            // takes the selection when present, so an empty one DEFEATED
-            // the fall back to the screen text. Tap a word, press copy,
-            // get an empty clipboard.
-            //
-            // The widget stays the hit-tester and this supplies the
-            // text. `Selection::row` is a VIEWPORT row, so it survives
-            // the swap; abs_row_of_viewport maps it through the scroll
-            // position, which is the off-by-a-scroll bug that would
-            // otherwise appear the moment someone selects while reading
-            // history.
-            if let Some(sel) = self.app.selection.clone() {
-                if let Some(vrow) = sel.row {
-                    let abs = self.session.grid.abs_row_of_viewport(vrow);
-                    // A tap carries its column and means the WORD there;
-                    // a long-press carries none and means the line.
-                    // Reading the line for both would turn every tap into
-                    // a line selection without saying so.
-                    let fixed = match sel.col {
-                        Some(col) => self.session.grid.word_at(abs, col),
-                        None => self.session.grid.abs_row_text(abs).trim_end().to_string(),
-                    };
-                    if !fixed.is_empty() {
-                        self.app.selection = Some(uikit_term::Selection {
-                            row: Some(vrow),
-                            col: sel.col,
-                            text: fixed,
-                        });
-                    } else {
-                        // Nothing on that line — no selection at all, so
-                        // the copy path falls back to the screen.
-                        self.app.selection = None;
-                    }
-                }
-            }
+            // The selection re-read that used to live here is gone:
+            // feed_pty now feeds app.terminal, so handle_gestures reads
+            // a grid with the shell's text in it and its word/line
+            // selection is correct on its own.
             // Long-press on the pane opens the 3x3 marking menu at the press point (detached host:
             // the terminal isn't a widget Response). The line selection the long-press also made is
             // exactly what the menu's "copy" cell copies.
@@ -3995,30 +3910,26 @@ impl eframe::App for VoicetermApp {
                     // Onto the grid that is DRAWN. Clearing the widget's
                     // terminal emptied a grid this view never renders, so
                     // "Clear" did nothing you could see.
-                    Some(PaneAction::Clear) => self.session.grid.clear(),
+                    Some(PaneAction::Clear) => self.app.terminal.clear(),
                     Some(PaneAction::CopySelection) => {
                         // Same reason: `Terminal::screen_text` reads the
                         // widget's grid, which nothing feeds for the
                         // focused pane, so "copy screen" copied an empty
                         // string. Built from the session grid instead —
                         // the same rows the user is looking at.
-                        let screen = || {
-                            let mut rows: Vec<String> = (0..self.session.grid.rows)
-                                .map(|y| self.session.grid.row_text(y))
-                                .collect();
-                            while rows.last().is_some_and(|r| r.trim().is_empty()) {
-                                rows.pop();
-                            }
-                            rows.join("\n")
-                        };
-                        let text = self.app.selection.take().map(|s| s.text).unwrap_or_else(screen);
+                        let text = self
+                            .app
+                            .selection
+                            .take()
+                            .map(|s| s.text)
+                            .unwrap_or_else(|| self.app.terminal.screen_text());
                         ctx.copy_text(text);
                         self.toasts.success("Copied", ctx.input(|i| i.time));
                     }
                     // Opens THIS find bar, not the widget's: that one
                     // searches a grid nothing feeds and was never
                     // rendered by any frame here.
-                    Some(PaneAction::CommandPalette) => self.find_open = true,
+                    Some(PaneAction::CommandPalette) => self.app.open_search(),
                     // Through apply(), the same WsCall path the keyboard chords use —
                     // this arm was `{}` and the 3x3 menu's new-tab/split/close silently
                     // did nothing (field report, c11). Mic remains on-device wiring.
@@ -4030,11 +3941,14 @@ impl eframe::App for VoicetermApp {
                         self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command("new tab".into()));
                     }
                     Some(PaneAction::Mic) => {}
-                    // Now real: `term_grid` keeps scrolled-off rows, so
-                    // this pages the grid the view actually draws.
+                    // Onto app.terminal.grid, which is what render_at
+                    // draws. Paging session.grid moved a buffer nobody
+                    // sees — the mistake this whole area kept making,
+                    // just in the other direction once I learned which
+                    // grid is on screen.
                     Some(PaneAction::PageUpScrollback) => {
-                        let page = self.session.grid.rows.saturating_sub(1).max(1);
-                        self.session.grid.page_up(page);
+                        let page = self.app.terminal.grid.rows.saturating_sub(1).max(1);
+                        self.app.terminal.grid.page_up(page);
                     }
                     // menu-triggered paste needs a clipboard READ; egui only delivers paste as
                     // an input event (Ctrl+V works today via handle_input's Event::Paste)
@@ -4268,9 +4182,6 @@ fn main() -> eframe::Result<()> {
                 pty_ended_noted: false,
                 pane_ptys: std::collections::HashMap::new(),
                 pty_spawn_failed: std::collections::HashSet::new(),
-                find_open: false,
-                find_query: String::new(),
-                find_at: 0,
                 launcher: uikit_egui::quick_launcher::LauncherState::default(),
                 a11y: uikit_egui::a11y::A11yScene::new(),
                 mail: Default::default(),
