@@ -200,6 +200,27 @@ What is built:
   `1 + b·min(n,8)/8`, so blocks that keep matching stop flickering out at
   the threshold. Drift is bounded at that multiple of the JPEG error.
 
+**Kernel results on an M2 Ultra (Honeykrisp, RealESRGAN x2, tile 688, f32
+peak ~13.6 TFLOPS).** Every variant is bit-exact against the CPU reference;
+they differ only in how they spend registers and address arithmetic:
+
+| kernel | GMAC/s | shape |
+|---|---|---|
+| rt1 | 661 | 1 px × 4 ch |
+| rt4 | 683 | 4×4 px × 4 ch — pixel axis, ~130 registers |
+| wino | 677 | Winograd F(2,3), 2.25× fewer multiplies |
+| rt2 | 896 | 2×2 px × 4 ch |
+| **rt2c8** | **988** | 2×2 px × 8 ch — channel axis |
+
+Winograd cutting multiplies by 2.25× and *losing* is the useful result: the
+kernel is not multiply-bound. The inverted U peaking at 2×2 says registers
+are the binding resource, and the channel axis is the one way to raise
+arithmetic per load without spending input registers. `rt2c8f` (channel
+blocking + a branchless interior path that drops the per-scalar bounds test
+and in_scale divide) is the current default; `rt2c16f` pushes the channel
+axis further. Tile size and in-flight sets are settled: flat from 400 to 688,
+and extra sets only steal VRAM from tile size.
+
 **Measuring the kernel on your GPU** — `dandere2x bench --model X --vram-budget 8G`
 runs both conv kernels on full-size tiles and prints ms/tile, GMAC/s, TFLOPS,
 and the implied seconds per full 1080p frame. That number against the

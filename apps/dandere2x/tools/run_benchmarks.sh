@@ -60,7 +60,7 @@ run "$BIN" model "$MODEL_X2"
 run "$BIN" model "$MODEL_FAST"
 
 say "selftest: GPU kernels vs CPU reference on THIS device (both kernels, both models)"
-for k in rt1 rt2 rt4 wino rt2c8; do
+for k in rt2c8f rt2c8 rt2f rt2c16f; do
   run "$BIN" selftest --model "$MODEL_FAST" --tile 40 --kernel "$k"
   run "$BIN" selftest --model "$MODEL_X2" --tile 48 --kernel "$k"
 done
@@ -71,7 +71,7 @@ say "core + gpu test suites (CPU exactness vs numpy references; GPU bit-exact in
 say "CPU hot paths (per-call ms, one core)"
 ( cd apps/dandere2x && cargo test --release -p d2x-core --test bench_hot -- --ignored --nocapture 2>&1 | grep -E ' ms$' ) | tee -a "$LOG"
 
-say "GPU kernel bench: RealESRGAN x2, all four kernels. Tile sweep first (the M2 Ultra data says tile size matters and extra in-flight sets only steal VRAM from it)."
+say "GPU kernel bench: rt2c8f (new default) vs rt2c8 (988 GMAC/s last run) vs rt2f vs rt2c16f vs rt2 (896, the old default)"
 for vb in $BUDGETS; do
   for inf in $INFLIGHTS; do
     run "$BIN" bench --model "$MODEL_X2" --vram-budget "$vb" --inflight "$inf" --iters "$ITERS" $BENCH_TILE

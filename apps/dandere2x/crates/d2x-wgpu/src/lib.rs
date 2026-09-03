@@ -30,6 +30,9 @@ pub const CONV_RT4_WGSL: &str = include_str!("../shaders/conv3x3_rt4.wgsl");
 pub const CONV_RT1_WGSL: &str = include_str!("../shaders/conv3x3_rt1.wgsl");
 pub const CONV_WINO_WGSL: &str = include_str!("../shaders/conv3x3_wino.wgsl");
 pub const CONV_RT2C8_WGSL: &str = include_str!("../shaders/conv3x3_rt2c8.wgsl");
+pub const CONV_RT2F_WGSL: &str = include_str!("../shaders/conv3x3_rt2f.wgsl");
+pub const CONV_RT2C8F_WGSL: &str = include_str!("../shaders/conv3x3_rt2c8f.wgsl");
+pub const CONV_RT2C16F_WGSL: &str = include_str!("../shaders/conv3x3_rt2c16f.wgsl");
 pub const DECONV_WGSL: &str = include_str!("../shaders/deconv4x4s2.wgsl");
 pub const ADD_WGSL: &str = include_str!("../shaders/add_scaled.wgsl");
 pub const PACK_WGSL: &str = include_str!("../shaders/pack.wgsl");
@@ -67,8 +70,7 @@ pub struct GpuOptions {
 pub enum ConvKernel {
     /// 1 pixel × 4 channels per thread: lowest registers, lowest intensity.
     Rt1,
-    /// 2x2 pixels × 4 channels per thread, 16x16 workgroups. Fastest on AGX.
-    #[default]
+    /// 2x2 pixels × 4 channels per thread, 16x16 workgroups.
     Rt2,
     /// 4x4 pixels × 4 channels per thread, 8x8 workgroups: ~2.9x the FMAs
     /// per load, ~130 live registers. Fastest where registers are plentiful.
@@ -80,6 +82,15 @@ pub enum ConvKernel {
     /// 2x2 pixels × 8 output channels: rt2's input footprint, twice the
     /// arithmetic per load, on the channel axis instead of the pixel axis.
     Rt2c8,
+    /// rt2 with a branchless interior path: no per-scalar bounds test or
+    /// in_scale divide for threads whose 4x4 patch is fully inside. Costs no
+    /// registers, which the M2 Ultra data says is the binding resource.
+    Rt2f,
+    /// rt2c8 + the interior fast path: the two independent wins composed.
+    #[default]
+    Rt2c8f,
+    /// 2x2 px × 16 channels + fast path: the channel axis two steps further.
+    Rt2c16f,
 }
 
 impl ConvKernel {
@@ -90,6 +101,9 @@ impl ConvKernel {
             ConvKernel::Rt4 => CONV_RT4_WGSL,
             ConvKernel::Wino => CONV_WINO_WGSL,
             ConvKernel::Rt2c8 => CONV_RT2C8_WGSL,
+            ConvKernel::Rt2f => CONV_RT2F_WGSL,
+            ConvKernel::Rt2c8f => CONV_RT2C8F_WGSL,
+            ConvKernel::Rt2c16f => CONV_RT2C16F_WGSL,
         }
     }
 
@@ -102,14 +116,18 @@ impl ConvKernel {
         match self {
             ConvKernel::Rt1 => 16,
             ConvKernel::Rt2 | ConvKernel::Rt4 => 32,
-            ConvKernel::Wino | ConvKernel::Rt2c8 => 32,
+            ConvKernel::Wino | ConvKernel::Rt2c8 | ConvKernel::Rt2f | ConvKernel::Rt2c8f | ConvKernel::Rt2c16f => 32,
         }
     }
     /// Output-channel groups (of 4) handled per dispatch z.
     fn groups_per_z(self) -> u32 {
-        if self == ConvKernel::Rt2c8 { 2 } else { 1 }
+        match self {
+            ConvKernel::Rt2c8 | ConvKernel::Rt2c8f => 2,
+            ConvKernel::Rt2c16f => 4,
+            _ => 1,
+        }
     }
-    pub const ALL: [ConvKernel; 5] = [ConvKernel::Rt1, ConvKernel::Rt2, ConvKernel::Rt4, ConvKernel::Wino, ConvKernel::Rt2c8];
+    pub const ALL: [ConvKernel; 8] = [ConvKernel::Rt1, ConvKernel::Rt2, ConvKernel::Rt4, ConvKernel::Wino, ConvKernel::Rt2c8, ConvKernel::Rt2f, ConvKernel::Rt2c8f, ConvKernel::Rt2c16f];
 }
 
 impl std::str::FromStr for ConvKernel {
@@ -121,6 +139,9 @@ impl std::str::FromStr for ConvKernel {
             "rt4" | "4x4" => Ok(ConvKernel::Rt4),
             "wino" | "winograd" => Ok(ConvKernel::Wino),
             "rt2c8" | "c8" => Ok(ConvKernel::Rt2c8),
+            "rt2f" | "fast" => Ok(ConvKernel::Rt2f),
+            "rt2c8f" | "c8f" => Ok(ConvKernel::Rt2c8f),
+            "rt2c16f" | "c16f" => Ok(ConvKernel::Rt2c16f),
             _ => Err(anyhow!("kernel must be rt1|rt2|rt4|wino|rt2c8")),
         }
     }
@@ -906,7 +927,7 @@ mod tests {
     /// with no GPU at all.
     #[test]
     fn shaders_validate() {
-        for (name, src) in [("conv3x3", CONV_WGSL), ("conv3x3_rt1", CONV_RT1_WGSL), ("conv3x3_rt4", CONV_RT4_WGSL), ("conv3x3_wino", CONV_WINO_WGSL), ("conv3x3_rt2c8", CONV_RT2C8_WGSL), ("deconv4x4s2", DECONV_WGSL), ("add_scaled", ADD_WGSL), ("pack", PACK_WGSL)] {
+        for (name, src) in [("conv3x3", CONV_WGSL), ("conv3x3_rt1", CONV_RT1_WGSL), ("conv3x3_rt4", CONV_RT4_WGSL), ("conv3x3_wino", CONV_WINO_WGSL), ("conv3x3_rt2c8", CONV_RT2C8_WGSL), ("conv3x3_rt2f", CONV_RT2F_WGSL), ("conv3x3_rt2c8f", CONV_RT2C8F_WGSL), ("conv3x3_rt2c16f", CONV_RT2C16F_WGSL), ("deconv4x4s2", DECONV_WGSL), ("add_scaled", ADD_WGSL), ("pack", PACK_WGSL)] {
             let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(src)));
             let mut v = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty());
             v.validate(&module).unwrap_or_else(|e| panic!("{name}: {e:?}"));

@@ -5,13 +5,11 @@
 // [dst_off, dst_off+out_ch) of the output buffer, so dense concatenation is
 // a channel offset and never a copy.
 //
-// Channel-blocked variant: 2x2 output pixels x EIGHT output channels per
-// thread. The 4x4 input patch is loaded once and applied to two weight
-// groups, so the per-load arithmetic doubles on the channel axis while the
-// input-register footprint stays exactly rt2's — the tradeoff rt4 got wrong
-// by growing the pixel axis instead (16 accumulators + a 6x6 patch).
-// 8 vec4 accumulators + 16 scalars + 9 vec4 weights ~ 90 registers.
-// Dispatch z is ceil(out_ch4 / 2); the odd trailing group is guarded.
+// 2x2 output pixels x EIGHT output channels per thread: the 4x4 input patch
+// is loaded once and applied to two weight groups, doubling arithmetic per
+// load on the channel axis while the input-register footprint stays exactly
+// rt2's. Measured 988 GMAC/s on an M2 Ultra against rt2's 896 — the pixel
+// axis (rt4, 682) lost to register pressure, the channel axis pays.
 //
 // Layouts:
 //   input     [ic][y][x]            f32   (read_write: a dense block reads and
@@ -97,21 +95,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let g1 = g0 + 1u;
     let has_g1 = g1 < p.out_ch4;
+    let s1 = select(g0, g1, has_g1);
     let has_x1 = (ox + 1u) < p.out_w;
     let has_y1 = (oy + 1u) < p.out_h;
     let bA = bias[g0];
-    let bB = select(vec4<f32>(0.0), bias[select(g0, g1, has_g1)], has_g1);
     var A00 = bA;
     var A01 = bA;
     var A10 = bA;
     var A11 = bA;
+    let bB = bias[s1];
     var B00 = bB;
     var B01 = bB;
     var B10 = bB;
     var B11 = bB;
     let in_plane = p.in_w * p.in_h;
-    var wa = g0 * p.in_ch * 9u;
-    var wb = select(g0, g1, has_g1) * p.in_ch * 9u;
+    var wA = g0 * p.in_ch * 9u;
+    var wB = s1 * p.in_ch * 9u;
     let sx0 = i32(ox) - i32(p.pad);
     let sy0 = i32(oy) - i32(p.pad);
     for (var ic = 0u; ic < p.in_ch; ic = ic + 1u) {
@@ -121,21 +120,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let i20 = load(ib, sy0 + 2, sx0 + 0); let i21 = load(ib, sy0 + 2, sx0 + 1); let i22 = load(ib, sy0 + 2, sx0 + 2); let i23 = load(ib, sy0 + 2, sx0 + 3);
         let i30 = load(ib, sy0 + 3, sx0 + 0); let i31 = load(ib, sy0 + 3, sx0 + 1); let i32 = load(ib, sy0 + 3, sx0 + 2); let i33 = load(ib, sy0 + 3, sx0 + 3);
         {
-            let w00 = weights[wa + 0u]; let w01 = weights[wa + 1u]; let w02 = weights[wa + 2u]; let w10 = weights[wa + 3u]; let w11 = weights[wa + 4u]; let w12 = weights[wa + 5u]; let w20 = weights[wa + 6u]; let w21 = weights[wa + 7u]; let w22 = weights[wa + 8u];
+            let w00 = weights[wA + 0u]; let w01 = weights[wA + 1u]; let w02 = weights[wA + 2u]; let w10 = weights[wA + 3u]; let w11 = weights[wA + 4u]; let w12 = weights[wA + 5u]; let w20 = weights[wA + 6u]; let w21 = weights[wA + 7u]; let w22 = weights[wA + 8u];
             A00 = A00 + w00 * i00 + w01 * i01 + w02 * i02 + w10 * i10 + w11 * i11 + w12 * i12 + w20 * i20 + w21 * i21 + w22 * i22;
             A01 = A01 + w00 * i01 + w01 * i02 + w02 * i03 + w10 * i11 + w11 * i12 + w12 * i13 + w20 * i21 + w21 * i22 + w22 * i23;
             A10 = A10 + w00 * i10 + w01 * i11 + w02 * i12 + w10 * i20 + w11 * i21 + w12 * i22 + w20 * i30 + w21 * i31 + w22 * i32;
             A11 = A11 + w00 * i11 + w01 * i12 + w02 * i13 + w10 * i21 + w11 * i22 + w12 * i23 + w20 * i31 + w21 * i32 + w22 * i33;
         }
         {
-            let w00 = weights[wb + 0u]; let w01 = weights[wb + 1u]; let w02 = weights[wb + 2u]; let w10 = weights[wb + 3u]; let w11 = weights[wb + 4u]; let w12 = weights[wb + 5u]; let w20 = weights[wb + 6u]; let w21 = weights[wb + 7u]; let w22 = weights[wb + 8u];
+            let w00 = weights[wB + 0u]; let w01 = weights[wB + 1u]; let w02 = weights[wB + 2u]; let w10 = weights[wB + 3u]; let w11 = weights[wB + 4u]; let w12 = weights[wB + 5u]; let w20 = weights[wB + 6u]; let w21 = weights[wB + 7u]; let w22 = weights[wB + 8u];
             B00 = B00 + w00 * i00 + w01 * i01 + w02 * i02 + w10 * i10 + w11 * i11 + w12 * i12 + w20 * i20 + w21 * i21 + w22 * i22;
             B01 = B01 + w00 * i01 + w01 * i02 + w02 * i03 + w10 * i11 + w11 * i12 + w12 * i13 + w20 * i21 + w21 * i22 + w22 * i23;
             B10 = B10 + w00 * i10 + w01 * i11 + w02 * i12 + w10 * i20 + w11 * i21 + w12 * i22 + w20 * i30 + w21 * i31 + w22 * i32;
             B11 = B11 + w00 * i11 + w01 * i12 + w02 * i13 + w10 * i21 + w11 * i22 + w12 * i23 + w20 * i31 + w21 * i32 + w22 * i33;
         }
-        wa = wa + 9u;
-        wb = wb + 9u;
+        wA = wA + 9u;
+        wB = wB + 9u;
     }
     let out_plane = p.out_w * p.out_h;
     let idx00 = oy * p.out_w + ox;
@@ -143,18 +142,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     store4(baseA + idx00, out_plane, epilogue(A00, g0, idx00, out_plane));
     if (has_x1) { store4(baseA + idx00 + 1u, out_plane, epilogue(A01, g0, idx00 + 1u, out_plane)); }
     if (has_y1) {
-        let idx10 = idx00 + p.out_w;
-        store4(baseA + idx10, out_plane, epilogue(A10, g0, idx10, out_plane));
-        if (has_x1) { store4(baseA + idx10 + 1u, out_plane, epilogue(A11, g0, idx10 + 1u, out_plane)); }
+        let j10 = idx00 + p.out_w;
+        store4(baseA + j10, out_plane, epilogue(A10, g0, j10, out_plane));
+        if (has_x1) { store4(baseA + j10 + 1u, out_plane, epilogue(A11, g0, j10 + 1u, out_plane)); }
     }
     if (has_g1) {
         let baseB = (p.dst_off + g1 * 4u) * out_plane;
         store4(baseB + idx00, out_plane, epilogue(B00, g1, idx00, out_plane));
         if (has_x1) { store4(baseB + idx00 + 1u, out_plane, epilogue(B01, g1, idx00 + 1u, out_plane)); }
         if (has_y1) {
-            let idx10 = idx00 + p.out_w;
-            store4(baseB + idx10, out_plane, epilogue(B10, g1, idx10, out_plane));
-            if (has_x1) { store4(baseB + idx10 + 1u, out_plane, epilogue(B11, g1, idx10 + 1u, out_plane)); }
+            let j10 = idx00 + p.out_w;
+            store4(baseB + j10, out_plane, epilogue(B10, g1, j10, out_plane));
+            if (has_x1) { store4(baseB + j10 + 1u, out_plane, epilogue(B11, g1, j10 + 1u, out_plane)); }
         }
     }
 }

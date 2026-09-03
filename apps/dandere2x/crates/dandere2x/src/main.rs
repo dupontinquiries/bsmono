@@ -76,7 +76,7 @@ struct Common {
     inflight: usize,
     /// Conv kernel: rt2 | rt1 | rt4 | wino (Winograd F(2,3), 2.25x fewer multiplies).
     /// All bit-exact; `bench` compares. rt2 is fastest on AGX among the direct forms.
-    #[arg(long, default_value = "rt2")]
+    #[arg(long, default_value = "rt2c8f")]
     kernel: String,
     /// Frames whose residuals share one GPU call.
     #[arg(long, default_value_t = 4)]
@@ -143,8 +143,8 @@ enum Cmd {
         model: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
         tile: u32,
-        /// rt1 | rt2 | rt4 | wino | rt2c8
-        #[arg(long, default_value = "rt2")]
+        /// rt2c8f (default) | rt2c8 | rt2f | rt2c16f | rt2 | rt1 | rt4 | wino
+        #[arg(long, default_value = "rt2c8f")]
         kernel: String,
     },
     /// List GPU adapters.
@@ -301,7 +301,7 @@ fn main() -> anyhow::Result<()> {
                 let (net, path) = job::load_model(model.as_deref())?;
                 let budget = vram_budget.as_deref().map(d2x_core::budget::parse_bytes).transpose()?.unwrap_or(0);
                 eprintln!("model: {} ({:.2} MMAC per input pixel, x{})", path.display(), net.macs_per_input_pixel() / 1e6, net.scale);
-                for kernel in ["rt2", "rt1", "rt4", "wino", "rt2c8"] {
+                for kernel in ["rt2c8f", "rt2c8", "rt2f", "rt2c16f", "rt2"] {
                     let opts = d2x_wgpu::GpuOptions { tile, inflight, vram_budget: budget, kernel: kernel.parse()?, ..Default::default() };
                     match d2x_wgpu::bench(net.clone(), opts, iters) {
                         Ok(r) => println!("{r}"),
