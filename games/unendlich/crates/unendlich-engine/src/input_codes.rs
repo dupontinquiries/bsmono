@@ -157,6 +157,35 @@ pub enum InputEvent {
     MouseButton { button: MouseBtn, action: KeyAction },
     CursorPos { x: f64, y: f64 },
     Scroll { x: f64, y: f64 },
+    /// One touch contact. `id` is stable for the life of the contact.
+    ///
+    /// Carried as its own variant rather than being folded into `CursorPos`,
+    /// which is what a naive touch port does: a compositor sends touch-down at
+    /// the contact point, and turning that into a cursor move produces a huge
+    /// spurious look delta on every tap. Touch is not a mouse that teleports.
+    Touch { id: u64, x: f32, y: f32, phase: TouchPhase },
+}
+
+/// Where a touch is in its life, mirroring `touch_controls::Phase`.
+///
+/// Duplicated here rather than importing, so `input_codes` stays a leaf that
+/// the platform backends can convert into without depending on the control
+/// model. The `From` below is the single point of translation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchPhase {
+    Start,
+    Move,
+    End,
+}
+
+impl From<TouchPhase> for crate::touch_controls::Phase {
+    fn from(p: TouchPhase) -> Self {
+        match p {
+            TouchPhase::Start => crate::touch_controls::Phase::Start,
+            TouchPhase::Move => crate::touch_controls::Phase::Move,
+            TouchPhase::End => crate::touch_controls::Phase::End,
+        }
+    }
 }
 
 // =============================================================================

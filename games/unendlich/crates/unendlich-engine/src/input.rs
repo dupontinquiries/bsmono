@@ -55,6 +55,13 @@ pub struct InputCache {
 
     pub cursor_pos: (f64, f64),
     pub cursor_delta: (f64, f64),
+    /// Touch contacts and what they mean. See `crate::touch_controls`.
+    ///
+    /// Owned here so a consumer that already reads `InputCache` gets touch for
+    /// free: the look drag is folded into `cursor_delta` by `tick_touch`, so
+    /// every camera in the engine turns with a thumb without knowing touch
+    /// exists.
+    pub touch: crate::touch_controls::TouchState,
     last_cursor_pos: (f64, f64),
     cursor_initialized: bool,
 
@@ -95,6 +102,11 @@ impl InputCache {
             InputEvent::Scroll { y, .. } => {
                 self.scroll_delta += y;
             }
+            InputEvent::Touch { id, x, y, phase } => {
+                self.touch.feed(crate::touch_controls::Touch {
+                    id, x, y, phase: phase.into(),
+                });
+            }
             InputEvent::UnknownKey { .. } => {}
         }
     }
@@ -121,8 +133,16 @@ impl InputCache {
                 }
                 self.mouse_button_states.insert(button, action);
             }
-            // Cursor + scroll: apply now for minimal camera latency.
-            InputEvent::CursorPos { .. } | InputEvent::Scroll { .. } => self.handle_event(event),
+            // Cursor, scroll and TOUCH: apply now for minimal camera latency.
+            //
+            // Touch belongs with the cursor rather than with the keys: a drag
+            // is continuous state, and deferring it to the next frame adds a
+            // frame of lag to every camera movement — which on a phone, where
+            // the thumb IS the camera, is the difference between responsive
+            // and swimmy. There is also no press-edge to lose, which is the
+            // reason keys are deferred at all.
+            InputEvent::CursorPos { .. } | InputEvent::Scroll { .. } | InputEvent::Touch { .. } =>
+                self.handle_event(event),
             InputEvent::UnknownKey { .. } => {}
         }
     }
@@ -133,6 +153,41 @@ impl InputCache {
     /// use PARITY so a double-tap inside one laggy frame still nets out.
     pub fn presses_this_frame(&self, key: Key) -> u8 {
         self.press_counts.get(&key).copied().unwrap_or(0)
+    }
+
+    /// Fold this frame's touch input in. Call ONCE at the top of the frame,
+    /// before any consumer reads.
+    ///
+    /// The look drag is added to `cursor_delta`, the same channel a mouse
+    /// writes, so every camera in the engine turns with a thumb without
+    /// knowing touch exists. That is the whole reason the delta lands here
+    /// rather than being a second thing each camera has to read and add.
+    ///
+    /// Before consumers, because `end_frame` clears `cursor_delta` — folding
+    /// at the end would zero the drag on the same frame it arrived and the
+    /// camera would never move.
+    pub fn tick_touch(&mut self, dt: f32, screen_width: f32) {
+        self.touch.set_width(screen_width);
+        self.touch.tick(dt);
+        let [dx, dy] = self.touch.take_look();
+        self.cursor_delta.0 += dx as f64;
+        self.cursor_delta.1 += dy as f64;
+    }
+
+    /// The virtual stick, `[x, y]` in -1..=1, or zeros when no thumb is down.
+    ///
+    /// Exposed as an AXIS rather than synthesised WASD presses. Faking key
+    /// events would make `is_key_just_pressed(W)` fire on a thumb that has been
+    /// held for a minute, and every toggle keyed off a press edge would
+    /// misbehave. An axis is also what the stick actually is — walking at a
+    /// third speed is not expressible as a key.
+    pub fn move_axes(&self) -> [f32; 2] {
+        self.touch.move_axes()
+    }
+
+    /// Is a touch action being held — mine, keep firing.
+    pub fn touch_held(&self) -> bool {
+        self.touch.look_held()
     }
 
     pub fn end_frame(&mut self) {
@@ -196,5 +251,79 @@ mod tests {
         assert!(c.is_key_just_pressed(Key::Escape), "late edge carried to next frame");
         c.end_frame();
         assert!(!c.is_key_just_pressed(Key::Escape), "carried edge consumed exactly once");
+    }
+}
+
+#[cfg(test)]
+mod touch_integration_tests {
+    use super::*;
+    use crate::input_codes::TouchPhase;
+
+    fn t(id: u64, x: f32, y: f32, phase: TouchPhase) -> InputEvent {
+        InputEvent::Touch { id, x, y, phase }
+    }
+
+    #[test]
+    fn a_thumb_drag_turns_the_camera_through_cursor_delta() {
+        // The integration that makes this worth doing: the look drag lands in
+        // the SAME channel a mouse writes, so every camera in the engine turns
+        // with a thumb without knowing touch exists.
+        let mut c = InputCache::default();
+        c.handle_event(&t(1, 900.0, 500.0, TouchPhase::Start));
+        c.handle_event(&t(1, 940.0, 480.0, TouchPhase::Move));
+        assert_eq!(c.cursor_delta, (0.0, 0.0), "the delta arrived before the tick");
+        c.tick_touch(0.016, 1000.0);
+        assert_eq!(c.cursor_delta, (40.0, -20.0));
+    }
+
+    #[test]
+    fn a_touch_down_does_not_produce_a_look_delta() {
+        // What a naive port gets wrong: a compositor reports touch-down at the
+        // contact point, and folding that into cursor motion snaps the camera
+        // on every single tap. The first frame of a contact must be still.
+        let mut c = InputCache::default();
+        c.handle_event(&t(1, 900.0, 500.0, TouchPhase::Start));
+        c.tick_touch(0.016, 1000.0);
+        assert_eq!(c.cursor_delta, (0.0, 0.0), "touching the screen moved the camera");
+    }
+
+    #[test]
+    fn the_stick_is_an_axis_and_not_a_faked_key() {
+        // Synthesising WASD would make `is_key_just_pressed(W)` fire for a
+        // thumb held a minute, breaking every toggle keyed off a press edge —
+        // and a third-speed walk is not expressible as a key at all.
+        let mut c = InputCache::default();
+        c.handle_event(&t(1, 100.0, 500.0, TouchPhase::Start));
+        c.handle_event(&t(1, 100.0 + crate::touch_controls::STICK_RANGE_PX, 500.0, TouchPhase::Move));
+        c.tick_touch(0.016, 1000.0);
+        assert!((c.move_axes()[0] - 1.0).abs() < 1e-5);
+        assert!(!c.is_key_pressed(Key::W), "the stick faked a key press");
+        assert!(!c.is_key_just_pressed(Key::W));
+    }
+
+    #[test]
+    fn the_camera_does_not_keep_turning_after_the_thumb_stops() {
+        // `tick_touch` takes the delta; a second tick with no movement must add
+        // nothing. `end_frame` clears cursor_delta between frames, so this is
+        // the real sequence.
+        let mut c = InputCache::default();
+        c.handle_event(&t(1, 900.0, 500.0, TouchPhase::Start));
+        c.handle_event(&t(1, 950.0, 500.0, TouchPhase::Move));
+        c.tick_touch(0.016, 1000.0);
+        assert_eq!(c.cursor_delta.0, 50.0);
+        c.end_frame();
+        c.tick_touch(0.016, 1000.0);
+        assert_eq!(c.cursor_delta, (0.0, 0.0), "the view kept turning on a still thumb");
+    }
+
+    #[test]
+    fn lifting_the_stick_stops_the_player() {
+        let mut c = InputCache::default();
+        c.handle_event(&t(1, 100.0, 500.0, TouchPhase::Start));
+        c.handle_event(&t(1, 200.0, 500.0, TouchPhase::Move));
+        c.tick_touch(0.016, 1000.0);
+        assert!(c.move_axes()[0] > 0.9);
+        c.handle_event(&t(1, 200.0, 500.0, TouchPhase::End));
+        assert_eq!(c.move_axes(), [0.0, 0.0], "the player kept walking after the thumb lifted");
     }
 }

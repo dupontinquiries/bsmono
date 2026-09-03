@@ -88,7 +88,19 @@ pub const TAP_SLOP_PX: f32 = 16.0;
 
 #[derive(Debug, Clone, Copy)]
 struct Finger {
-    role: Role,
+    /// `None` until a width is known.
+    ///
+    /// A default-constructed `TouchState` has width 0, and the platform layer
+    /// cannot always set it before the first contact arrives — a tap on the
+    /// very first frame of a session beats the first resize. With an eagerly
+    /// computed role that tap classified against width 0, so `x < 0.0` was
+    /// false for every finger and the player's first thumb-down was always a
+    /// look. Found by a test, and it is exactly the bug that would present as
+    /// "the movement stick doesn't work until you touch the screen twice".
+    ///
+    /// Resolved from the ANCHOR, which never moves, so the role is still fixed
+    /// for the life of the contact once a width exists.
+    role: Option<Role>,
     anchor: (f32, f32),
     at: (f32, f32),
     /// Where it was when the look delta was last taken.
@@ -115,8 +127,25 @@ impl TouchState {
     }
 
     /// The screen can rotate; the split moves with it.
+    ///
+    /// Also resolves any contact that went down before a width was known —
+    /// from its anchor, so a finger already on the glass gets the role it
+    /// would have had, not one based on where it has since dragged.
     pub fn set_width(&mut self, width: f32) {
         self.width = width;
+        if width > 0.0 {
+            for (_, f) in self.fingers.iter_mut() {
+                if f.role.is_none() {
+                    f.role = Some(role_for(f.anchor.0, width));
+                }
+            }
+        }
+    }
+
+    /// A finger's role, resolving against the current width if it went down
+    /// before one was known.
+    fn role_of(&self, f: &Finger) -> Option<Role> {
+        f.role.or_else(|| (self.width > 0.0).then(|| role_for(f.anchor.0, self.width)))
     }
 
     pub fn active_fingers(&self) -> usize {
@@ -128,7 +157,7 @@ impl TouchState {
         match t.phase {
             Phase::Start => {
                 // Role decided HERE and never revisited — see the module note.
-                let role = role_for(t.x, self.width);
+                let role = (self.width > 0.0).then(|| role_for(t.x, self.width));
                 self.fingers.retain(|(id, _)| *id != t.id);
                 self.fingers.push((
                     t.id,
@@ -154,7 +183,8 @@ impl TouchState {
                     let (_, f) = self.fingers.remove(i);
                     // A tap is short AND still. Either alone misfires: a slow
                     // press is a hold, a fast flick is a look.
-                    if f.role == Role::Look && f.age <= TAP_SECS && f.max_travel <= TAP_SLOP_PX {
+                    let role = f.role.or_else(|| (self.width > 0.0).then(|| role_for(f.anchor.0, self.width)));
+                    if role == Some(Role::Look) && f.age <= TAP_SECS && f.max_travel <= TAP_SLOP_PX {
                         self.taps.push((t.x, t.y));
                     }
                 }
@@ -176,7 +206,7 @@ impl TouchState {
     /// player at a crawl instead of jumping straight to a fifth of full speed,
     /// which is what a bare `if d > deadzone { d / range }` does.
     pub fn move_axes(&self) -> [f32; 2] {
-        let Some((_, f)) = self.fingers.iter().find(|(_, f)| f.role == Role::Move) else {
+        let Some((_, f)) = self.fingers.iter().find(|(_, f)| self.role_of(f) == Some(Role::Move)) else {
             return [0.0, 0.0];
         };
         let (dx, dy) = (f.at.0 - f.anchor.0, f.at.1 - f.anchor.1);
@@ -194,7 +224,8 @@ impl TouchState {
     /// Returns AND CLEARS. See the module note: a peek that does not clear
     /// spins the camera forever on a motionless finger.
     pub fn take_look(&mut self) -> [f32; 2] {
-        let Some((_, f)) = self.fingers.iter_mut().find(|(_, f)| f.role == Role::Look) else {
+        let want = self.fingers.iter().position(|(_, f)| self.role_of(f) == Some(Role::Look));
+        let Some((_, f)) = want.map(|i| &mut self.fingers[i]) else {
             return [0.0, 0.0];
         };
         let d = [f.at.0 - f.last_taken.0, f.at.1 - f.last_taken.1];
@@ -214,7 +245,7 @@ impl TouchState {
     pub fn look_held(&self) -> bool {
         self.fingers
             .iter()
-            .any(|(_, f)| f.role == Role::Look && f.age > TAP_SECS && f.max_travel <= TAP_SLOP_PX)
+            .any(|(_, f)| self.role_of(f) == Some(Role::Look) && f.age > TAP_SECS && f.max_travel <= TAP_SLOP_PX)
     }
 
     /// Drop every contact. For a focus loss or a mode change.
@@ -366,6 +397,35 @@ mod tests {
         s.clear();
         assert_eq!(s.move_axes(), [0.0, 0.0]);
         assert_eq!(s.active_fingers(), 0);
+    }
+
+    #[test]
+    fn a_touch_before_the_width_is_known_still_gets_the_right_role() {
+        // A default-constructed state has width 0, and a tap on the first frame
+        // of a session beats the first resize. With an eagerly computed role
+        // that tap classified against width 0 — `x < 0.0` is false for every
+        // finger — so the player's first thumb-down was always a look. It would
+        // have presented as "the stick does not work until you touch the screen
+        // twice", which is not a description anyone would map back to this.
+        let mut s = TouchState::default();
+        s.feed(down(1, 100.0, 500.0));
+        assert_eq!(s.move_axes(), [0.0, 0.0], "no width yet, so no role and no movement");
+        s.set_width(1000.0);
+        s.feed(mv(1, 100.0 + STICK_RANGE_PX, 500.0));
+        assert!(s.move_axes()[0] > 0.9, "the first touch of a session was not a stick");
+    }
+
+    #[test]
+    fn a_late_width_resolves_the_role_from_the_anchor_not_the_current_position() {
+        // Otherwise a finger that went down on the left and has since dragged
+        // right becomes a look finger the moment a resize arrives — the same
+        // mid-stride camera snap the fixed-role rule exists to prevent.
+        let mut s = TouchState::default();
+        s.feed(down(1, 100.0, 500.0));
+        s.feed(mv(1, 900.0, 500.0));
+        s.set_width(1000.0);
+        assert_eq!(s.take_look(), [0.0, 0.0], "a resize handed the stick to the camera");
+        assert!(s.move_axes()[0] > 0.9);
     }
 
     #[test]
