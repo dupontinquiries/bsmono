@@ -416,6 +416,42 @@ impl TermGrid {
         }
     }
 
+    /// The whitespace-delimited word at `col` on absolute row `abs`.
+    ///
+    /// Char indices throughout, matching `find_all` and `abs_row_text`:
+    /// a wide glyph is one column, not two.
+    pub fn word_at(&self, abs: usize, col: usize) -> String {
+        let text = self.abs_row_text(abs);
+        let chars: Vec<char> = text.chars().collect();
+        if col >= chars.len() || chars[col].is_whitespace() {
+            return String::new();
+        }
+        let mut start = col;
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        let mut end = col;
+        while end + 1 < chars.len() && !chars[end + 1].is_whitespace() {
+            end += 1;
+        }
+        chars[start..=end].iter().collect()
+    }
+
+    /// Absolute row for a viewport row, honouring the scroll position.
+    ///
+    /// A tap lands on a VIEWPORT row; while scrolled back that row shows
+    /// a scrollback line, and selecting the live row hidden underneath
+    /// is the classic off-by-a-scroll bug.
+    pub fn abs_row_of_viewport(&self, y: usize) -> usize {
+        if self.view_offset == 0 {
+            return self.scrollback.len() + y;
+        }
+        if y < self.view_offset {
+            return self.scrollback.len() - self.view_offset + y;
+        }
+        self.scrollback.len() + (y - self.view_offset)
+    }
+
     /// A visible row as text, skipping phantoms so a wide glyph appears
     /// once.
     ///
@@ -450,6 +486,43 @@ impl TermGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_at_picks_the_whitespace_delimited_word() {
+        let mut g = TermGrid::new(30, 3);
+        let mut vt = Vt::default();
+        vt.feed(&mut g, b"cargo test --lib\r\n");
+        let abs = g.abs_row_of_viewport(0);
+        assert_eq!(g.word_at(abs, 0), "cargo");
+        assert_eq!(g.word_at(abs, 8), "test");
+        assert_eq!(g.word_at(abs, 5), "", "a space is not a word");
+        assert_eq!(g.word_at(abs, 999), "");
+    }
+
+    #[test]
+    fn word_at_uses_char_columns() {
+        let mut g = TermGrid::new(30, 3);
+        let mut vt = Vt::default();
+        vt.feed(&mut g, "日本 café\r\n".as_bytes());
+        let abs = g.abs_row_of_viewport(0);
+        assert_eq!(g.word_at(abs, 0), "日本", "a wide glyph is one column");
+        assert_eq!(g.word_at(abs, 3), "café");
+    }
+
+    #[test]
+    fn a_viewport_row_maps_to_the_line_it_shows() {
+        // the off-by-a-scroll bug: while scrolled back, the tapped row
+        // shows a scrollback line, not the live row underneath
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        lines(&mut g, &mut vt, 0, 10);
+        let live0 = g.abs_row_text(g.abs_row_of_viewport(0));
+        g.page_up(3);
+        let back0 = g.abs_row_text(g.abs_row_of_viewport(0));
+        assert_ne!(live0, back0, "row 0 shows a different line once scrolled");
+        assert_eq!(back0.trim_end(), g.row_text(0).trim_end(), "and it is what is drawn");
+    }
+
 
     #[test]
     fn find_searches_scrollback_not_just_the_screen() {

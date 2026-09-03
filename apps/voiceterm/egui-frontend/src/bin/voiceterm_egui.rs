@@ -3854,6 +3854,40 @@ impl eframe::App for VoicetermApp {
             if self.app.handle_gestures(ctx, term_rect.min) {
                 ctx.request_repaint(); // fling momentum still gliding
             }
+            // RE-READ THE SELECTION FROM THE GRID THAT HAS THE TEXT.
+            //
+            // handle_gestures does the hit-testing — it owns the cell
+            // metrics, font size and pinch zoom — but then reads the
+            // word or line from `app.terminal.grid`, which nothing feeds
+            // here. So a tap produced `Some(Selection { text: "" })`,
+            // and that is worse than producing nothing: the copy path
+            // takes the selection when present, so an empty one DEFEATED
+            // the fall back to the screen text. Tap a word, press copy,
+            // get an empty clipboard.
+            //
+            // The widget stays the hit-tester and this supplies the
+            // text. `Selection::row` is a VIEWPORT row, so it survives
+            // the swap; abs_row_of_viewport maps it through the scroll
+            // position, which is the off-by-a-scroll bug that would
+            // otherwise appear the moment someone selects while reading
+            // history.
+            if let Some(sel) = self.app.selection.clone() {
+                if let Some(vrow) = sel.row {
+                    let abs = self.session.grid.abs_row_of_viewport(vrow);
+                    let line = self.session.grid.abs_row_text(abs);
+                    let fixed = line.trim_end().to_string();
+                    if !fixed.is_empty() {
+                        self.app.selection = Some(uikit_term::Selection {
+                            row: Some(vrow),
+                            text: fixed,
+                        });
+                    } else {
+                        // Nothing on that line — no selection at all, so
+                        // the copy path falls back to the screen.
+                        self.app.selection = None;
+                    }
+                }
+            }
             // Long-press on the pane opens the 3x3 marking menu at the press point (detached host:
             // the terminal isn't a widget Response). The line selection the long-press also made is
             // exactly what the menu's "copy" cell copies.

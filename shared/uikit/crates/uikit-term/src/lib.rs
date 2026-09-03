@@ -1083,7 +1083,15 @@ impl App {
 
     /// Convert a screen position to a (col, row) in the grid, given the terminal's on-screen
     /// origin. `None` if the position falls outside the grid.
-    fn cell_at(&self, origin: egui::Pos2, pos: egui::Pos2) -> Option<(usize, usize)> {
+    /// Which (column, viewport row) a screen position falls on.
+    ///
+    /// Public because hit-testing needs this widget's cell metrics
+    /// (font size, pinch zoom) while the TEXT may live in a different
+    /// grid — voiceterm renders its own and feeds this one nothing, so
+    /// `handle_gestures` selecting from `self.terminal.grid` there
+    /// returns empty strings. A host in that position uses this to find
+    /// the cell and reads the text from its own grid.
+    pub fn cell_at(&self, origin: egui::Pos2, pos: egui::Pos2) -> Option<(usize, usize)> {
         let rel = pos - origin;
         if rel.x < 0.0 || rel.y < 0.0 { return None; }
         let (col, row) = ((rel.x / self.cell.0) as usize, (rel.y / self.cell.1) as usize);

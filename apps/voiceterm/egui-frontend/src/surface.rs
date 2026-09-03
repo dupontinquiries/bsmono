@@ -423,5 +423,14 @@ mod tests {
             src.contains("self.session.grid.find_all("),
             "find no longer searches the session grid."
         );
+        // A SELECTION MUST COME FROM THE FED GRID. handle_gestures
+        // hit-tests correctly and then reads text from the widget's
+        // unfed grid, so a tap yields Some("") — which DEFEATS the copy
+        // path's fallback to the screen, giving an empty clipboard.
+        assert!(
+            src.contains("abs_row_of_viewport("),
+            "the selection is no longer re-read from the session grid; a tap \
+             will copy an empty string."
+        );
     }
 }
