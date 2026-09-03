@@ -61,6 +61,8 @@ eframe  = { version = "0.34", default-features = false, features = [
     # "accesskit",     # optional — requires libatk; disable if build fails
 ] }
 egui    = "0.34"
+# The shared kit: symbol fonts and the IME request (see shared/uikit's `ime`).
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 
 # Shared frame buffer between GStreamer thread and egui render thread
 # arc-swap gives us lock-free reads on the hot path

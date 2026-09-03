@@ -21,6 +21,8 @@ cad-ref.workspace = true
 cad-tex.workspace = true
 eframe.workspace = true
 egui.workspace = true
+# The shared kit: symbol fonts and the IME request (see shared/uikit's `ime`).
+uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
 egui-wgpu.workspace = true
 wgpu.workspace = true
 glam.workspace = true

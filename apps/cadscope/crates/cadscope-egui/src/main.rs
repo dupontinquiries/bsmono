@@ -1551,6 +1551,10 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
         let ctx = &ctx;
+        // Fonts and the IME request from the shared hook. cadscope was grafted
+        // from a fork (C12-74) and never put on the kit; fonts only, since it
+        // themes itself and recolouring is a separate decision.
+        uikit_egui::fonts::install(ctx);
         // keyboard → cad-motion actions (skip when a text widget wants the keys)
         let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.1);
         if ctx.memory(|m| m.focused().is_none()) {

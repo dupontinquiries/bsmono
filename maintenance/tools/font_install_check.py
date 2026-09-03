@@ -67,20 +67,19 @@ NOT_A_FRONTEND = {
 # checker.
 KNOWN_MISSES = {
     "apps/av1tuner/av1tuner_app":
-        "no uikit-egui dependency and no theming at all — default egui. Same "
-        "shape switcheroo was in before 51e910c8.",
-    "apps/cadscope/crates/cadscope-egui":
-        "no uikit-egui dependency; grafted from a fork (C12-74) and never put on "
-        "the kit.",
+        "BLOCKED ON A VERSION BUMP, not a missing line: this crate is on egui "
+        "0.28 and the kit is on 0.34. Adding the dependency would pull two "
+        "incompatible egui versions into one binary. A real port, and the only "
+        "reason it is not a one-liner like the other seven.",
     # The rest, found by this checker on its first run. Each is one call in the
     # app's startup, but each also needs looking at once on a screen — adding
     # `apply_palette` to an app that currently themes itself by hand changes
     # every colour on it, which is a bigger change than "install the fonts" and
     # should not be made blind across ten apps in one pass.
     "apps/ambient-learner": "the Qt-era shell; the egui frontend beside it is a separate entry.",
-    "apps/snapclone/camera-bridge": "a probe UI; low glyph count, low priority.",
-    "apps/snapshot-cam": "no palette call.",
-    "games/road-warrior/shell": "no palette call.",
+    "games/road-warrior/shell":
+        "BLOCKED ON A VERSION BUMP: egui 0.27 against the kit's 0.34. Same "
+        "situation as av1tuner and further behind.",
     "games/unendlich/crates/unendlich-dash": "telemetry dashboard; also the crate "
         "eframe_backend_check flags (C14_TODO §6).",
 }

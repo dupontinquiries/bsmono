@@ -14,7 +14,7 @@ required-features = ["app"]
 # convention the rest of the fleet uses. The LIBRARY is feature-free, so
 # `--no-default-features` gives a headless core that tests without a display.
 default = ["app"]
-app = ["dep:eframe", "dep:egui"]
+app = ["dep:eframe", "dep:egui", "dep:uikit-egui"]
 
 [dependencies]
 # default-features = false + glow, the fleet pattern (see voiceterm-egui's
@@ -28,3 +28,8 @@ app = ["dep:eframe", "dep:egui"]
 # maintenance/tools/eframe_backend_check.py enforces the pattern tree-wide.
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 egui = { version = "0.34", optional = true }
+# THE SHARED KIT. Optional and in the same feature as egui, so the headless
+# library still tests without a display. Brings the symbol fonts and — the
+# reason it is worth the edge on an app this small — the IME request that lets
+# an on-screen keyboard reach a text field at all. See shared/uikit's `ime`.
+uikit-egui = { path = "../../shared/uikit/crates/uikit-egui", optional = true }

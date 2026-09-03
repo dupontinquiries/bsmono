@@ -1206,6 +1206,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "math-kit"
+version = "0.1.0"
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1990,6 +1994,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
@@ -2010,6 +2015,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "settings-kit"
+version = "0.1.0"
+dependencies = [
+ "uikit-gesture",
 ]
 
 [[package]]
@@ -2144,11 +2156,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "snapclone-theme"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "snapshot-cam"
 version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "uikit-egui",
 ]
 
 [[package]]
@@ -2291,6 +2311,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "touchkit"
+version = "0.1.0"
+dependencies = [
+ "egui",
+]
+
+[[package]]
 name = "tracing"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2315,6 +2342,22 @@ checksum = "cb30dbbd9036155e74adad6812e9898d03ec374946234fbcebd5dfc7b9187b90"
 dependencies = [
  "rustc-hash 2.1.3",
 ]
+
+[[package]]
+name = "uikit-egui"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "math-kit",
+ "settings-kit",
+ "snapclone-theme",
+ "touchkit",
+ "uikit-gesture",
+]
+
+[[package]]
+name = "uikit-gesture"
+version = "0.1.0"
 
 [[package]]
 name = "unicode-ident"

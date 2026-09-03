@@ -52,6 +52,10 @@ impl eframe::App for Cam {
     // gave us, building a second, separately-laid-out CentralPanel instead
     // of reusing the one eframe already provides.
     fn ui(&mut self, ui: &mut egui::Ui, _f: &mut eframe::Frame) {
+        // Fonts and the IME request, from the shared hook. Not `apply_palette`:
+        // this app sets no Visuals, so that would recolour it as well, which is
+        // a separate change. Idempotent, so per-frame is free.
+        uikit_egui::fonts::install(ui.ctx());
         egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.heading("snapshot-cam");
             ui.label(egui::RichText::new(

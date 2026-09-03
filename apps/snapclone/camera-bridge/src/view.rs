@@ -576,6 +576,10 @@ impl eframe::App for CameraApp {
 
     #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Fonts and the IME request from the shared hook. Fonts only, not
+        // `apply_palette`: this app draws a viewfinder rather than chrome and
+        // recolouring it is a separate decision.
+        uikit_egui::fonts::install(ctx);
         if self.no_cursor {
             ctx.set_cursor_icon(egui::CursorIcon::None);
         }

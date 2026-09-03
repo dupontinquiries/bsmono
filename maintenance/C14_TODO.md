@@ -340,7 +340,13 @@ matters.
 * **`cargo check --all-features` is not the build either.** On `beatspace` it
   pulls a macOS-only path and fails on `objc2` before reaching any of the
   crate's own code. Default features are clean.
-* **A break test needs its backup from git, not from disk.** Twice a batched
+* **A break test needs its backup from git, not from disk — and its RESTORE
+  must be as narrow as its edit.** A helper that restored with
+  `git checkout -- shared/.../src/` reverted `lib.rs` along with the file it
+  meant to fix, removing a `pub mod` declaration. The module stopped compiling,
+  its tests silently stopped running, and a break that should have failed three
+  suites reported zero. A restore that touches more than the one file the break
+  touched can turn a real failure into a clean bill. Twice a batched
   break loop failed partway, and the next command's `cp` captured the ALREADY
   BROKEN file as the "clean" backup; the restore then put back a file missing a
   guard, and only a test caught it. `git show HEAD:path > /tmp/backup` has no
