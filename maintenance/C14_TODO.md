@@ -403,3 +403,62 @@ only configuration that ships.** The model's own eleven tests all constructed
 found it in one run, which is an argument for wiring promptly rather than
 banking a tested model — and a counterweight to §10, which is about the
 opposite failure.
+
+## 13. snapclone sends photos as UNCOMPRESSED RGB, and copies them per recipient
+
+Two separate costs on the same path, found reading `HostCommand::SendSnap` in
+`snapclone_egui.rs`. Neither is a bug in the sense of something being broken —
+the send path is complete and careful, with NAT punching, address health,
+real sequence numbers and per-peer sessions. The problem is the payload.
+
+### The wire format is PPM
+
+`frame_pump::ppm_bytes` is a 12-byte header over raw RGB. The comment on the
+capture arm explains the choice and it is a good one FOR DISK: "no encoder
+dependency, and every image tool opens it", explicitly "not the composer flow
+yet — that is its own thread of work".
+
+But the same bytes go on the wire, and there the arithmetic is different:
+
+| frame | on the wire |
+|---|---|
+| 720p | 2.8 MB |
+| 1080p | 6.2 MB |
+| 12 MP phone camera | ~36 MB |
+
+A JPEG of the same 1080p frame is 200–400 KB. That is a 15–30× difference on a
+cellular link, for an app whose entire purpose is sending a photo to someone.
+
+The one property worth preserving is already stated in the code and is right:
+the bytes kept for Send are the same bytes written to disk, "so what a peer
+receives is byte for byte what the local file holds. A second encoding path is
+a second thing that can differ subtly from the photo you looked at." So the fix
+is to change the ONE encode, not to add a second — the disk format and the wire
+format should move together.
+
+Cheapest route, in order:
+1. **Compress the PPM**, no encoder and no format change — zstd is already in
+   the workspace (photosync). Lossless, maybe 2-3× on photographic RGB. Least
+   value, least risk, and does not change what a `.ppm` on disk is.
+2. **JPEG via the `image` crate**, already a dependency of photosync and
+   dandere2x. 15-30×, and `.jpg` is what a user expects a photo to be. Changes
+   the camera roll's file extension, so `save_ppm` and anything reading the
+   directory move with it.
+
+### The payload is cloned per recipient
+
+`SnapFrame::announce` takes `payload: Vec<u8>` and `SnapFrame.payload` owns it,
+so a group send of five allocates five full copies and hands one to each
+sending thread. At 1080p that is 31 MB in flight for one press of a shutter;
+at 12 MP it is 180 MB.
+
+`Arc<[u8]>` on the payload fixes it and the change is structural rather than
+local — `snap_wire`, `snap_transport` and the tests all move together. Worth
+doing WITH the compression change rather than before it, because a 300 KB
+payload copied five times is 1.5 MB and nobody would notice.
+
+### Not started
+
+Both are real and neither is a two-line fix. Recorded with the numbers so the
+next session does not have to re-derive them, and so the ordering argument —
+compress first, then share the buffer — does not have to be rediscovered.
