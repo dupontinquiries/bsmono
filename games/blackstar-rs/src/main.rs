@@ -135,6 +135,7 @@ mod sortie;
 mod stance;
 mod stations;
 mod suitability;
+mod superform;
 mod stealth;
 mod vault;
 mod energon;

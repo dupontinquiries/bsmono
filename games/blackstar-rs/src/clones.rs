@@ -122,7 +122,16 @@ fn silhouette(s: &CloneSpec, t: f32) -> (f32, f32, f32) {
 /// at y = 0. Deterministic per name. Point budget lands inside what the
 /// SDF bake calls affordable (~2,600).
 pub fn model(e: Element) -> Vec<Vec3> {
-    let s = spec(e).expect("every element has a clone");
+    model_from(spec(e).expect("every element has a clone"))
+}
+
+/// The generator, against any spec rather than only the seven in [`CLONES`].
+///
+/// Factored out for `superform.rs`, which derives further specs from these —
+/// a Fragment-of-the-Lattice body is the same anatomy under more authority,
+/// so it must come out of the same generator or it stops being the same
+/// figure.
+pub fn model_from(s: &CloneSpec) -> Vec<Vec3> {
     let mut rng = Rng::new(strhash(s.name));
     let mut pts: Vec<Vec3> = Vec::with_capacity(2200);
     let vox = s.height_m / ICE_REF_HEIGHT_V; // metres per reference voxel
