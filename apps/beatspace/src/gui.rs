@@ -377,6 +377,11 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // FONTS ONLY. beatspace paints with nine hand-picked `Color32`
+        // literals and sets no Visuals, so `apply_palette` would recolour it
+        // — a separate change from giving it its glyphs. Idempotent, so
+        // per-frame costs nothing. See font_install_check.py.
+        uikit_egui::fonts::install(ui.ctx());
         ui.ctx().request_repaint(); // keep animating
 
         // snapshot shared state

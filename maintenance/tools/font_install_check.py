@@ -83,8 +83,6 @@ KNOWN_MISSES = {
     # every colour on it, which is a bigger change than "install the fonts" and
     # should not be made blind across ten apps in one pass.
     "apps/ambient-learner": "the Qt-era shell; the egui frontend beside it is a separate entry.",
-    "apps/beatspace": "no palette call.",
-    "apps/settings-app": "bsettings; no palette call.",
     "apps/snapclone/camera-bridge": "a probe UI; low glyph count, low priority.",
     "apps/snapshot-cam": "no palette call.",
     "games/road-warrior/shell": "no palette call.",

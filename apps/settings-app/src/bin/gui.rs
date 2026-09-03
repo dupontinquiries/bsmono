@@ -33,6 +33,14 @@ impl eframe::App for BSettings {
 
     #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // FONTS ONLY, not `apply_palette`. This app themes itself with egui's
+        // defaults and sets no Visuals; calling `apply_palette` would install
+        // the fonts AND recolour the whole window, which is a bigger change
+        // than "stop drawing boxes" and wants an eye on it. `fonts::install` is
+        // idempotent behind a context flag, so per-frame is free.
+        //
+        // See maintenance/tools/font_install_check.py.
+        uikit_egui::fonts::install(ctx);
         // absorb changes made elsewhere (another app or the CLI) so we don't show stale values
         if let Some(s) = self.settings.as_mut() {
             let _ = s.poll();
