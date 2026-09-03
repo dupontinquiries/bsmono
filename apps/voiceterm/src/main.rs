@@ -173,6 +173,9 @@ mod dictation_session;
 // The voice-feedback readout model: two-tier transcript display with the
 // anti-reflow slot sizing. Pure.
 mod voice_status;
+// Which buttons the bottom bar shows, keyed on the live voice grammar.
+// Pure; composes bottom_bar + editor_voice + dictate.
+mod bar_pages;
 // v0.1.609: motion-rollback position-history core (TODO_motion_rollback
 // option 1, the testable piece). Status-line parsing stays build-gated.
 mod motion_history;
