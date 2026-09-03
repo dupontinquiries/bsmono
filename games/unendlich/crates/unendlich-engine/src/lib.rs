@@ -8,6 +8,7 @@
 //! * `constants`   - tunable game-wide values
 
 pub mod assets;
+pub mod touch_controls;
 pub mod pngutil;
 pub mod constants;
 pub mod scale;
