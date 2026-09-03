@@ -17,28 +17,73 @@ use switcheroo_core::{Device, DeviceId, Power};
 /// without the row growing so tall that only three fit on screen.
 const ROW_H: f32 = 56.0;
 
+/// Colours from the shared palette, resolved once per frame.
+///
+/// switcheroo hardcoded eight `Color32::from_rgb` values and applied no
+/// palette at all — the only egui app in the fleet not on `uikit-egui`. Three
+/// things followed from that, and only the first was obvious:
+///
+/// * it looked like default egui next to nine themed apps, which is most of
+///   what "lackluster" meant;
+/// * the display-accessibility filters (colour-vision, lowered white point)
+///   route through the palette, so none of them reached the one screen whose
+///   entire job is telling green from grey;
+/// * `apply_palette` is where `uikit_egui::fonts::install` runs, so this app
+///   never got the symbol fonts — and its own `★`, `☆` and `↻` are exactly
+///   the glyphs the bundled defaults lack. They were rendering as boxes here
+///   while working everywhere else.
+///
+/// Semantic names rather than raw colours at the call sites: ON is `success`
+/// because it means something, not because it is green.
+struct Colors {
+    inner: uikit_egui::PaletteColors,
+}
+
+impl Colors {
+    fn on(&self) -> egui::Color32 { self.inner.success }
+    fn off(&self) -> egui::Color32 { self.inner.text_weak }
+    fn unknown(&self) -> egui::Color32 { self.inner.warning }
+    fn kind(&self) -> egui::Color32 { self.inner.accent }
+    fn out_of_range(&self) -> egui::Color32 { self.inner.warning }
+    fn error(&self) -> egui::Color32 { self.inner.danger }
+}
+
+/// A touch target that a thumb can hit.
+///
+/// egui's `small_button` is sized for a mouse. This app is catalogued for
+/// `["desktop", "phone"]` and its two small buttons — pin and re-read — are
+/// the controls next to the one big button, which is where a mis-tap toggles
+/// a plug the user did not mean to touch.
+const TAP: f32 = 40.0;
+
 pub fn draw(app: &mut App, ctx: &egui::Context) {
     // `Panel::top`/`Panel::bottom` with `.show(ctx, ..)` is this fleet's egui
     // 0.34 form — `TopBottomPanel` is a deprecated alias. Verified against
     // dialer-egui rather than guessed; writing this crate from remembered API
     // is what produced the missing `eframe::App::ui` that stopped it building.
 
+    // The palette, every frame: it is also what installs the symbol fonts and
+    // applies the accessibility filters, and it is cheap (the font install is
+    // idempotent behind a context flag).
+    let colors = Colors {
+        inner: uikit_egui::apply_palette(ctx, snapclone_theme::palette_for(Default::default())),
+    };
     app.tick(Instant::now());
     // BLE state changes arrive on a background thread, so the UI cannot
     // wait for input to repaint or a toggle would appear to hang.
     ctx.request_repaint_after(std::time::Duration::from_millis(250));
 
-    top_bar(app, ctx);
+    top_bar(app, ctx, &colors);
     bottom_bar(app, ctx);
 
     egui::CentralPanel::default().show(ctx, |ui| match app.tab {
-        Tab::Devices => devices_pane(app, ui),
+        Tab::Devices => devices_pane(app, ui, &colors),
         Tab::Activity => activity_pane(app, ui),
-        Tab::About => about_pane(app, ui),
+        Tab::About => about_pane(app, ui, &colors),
     });
 }
 
-fn top_bar(app: &mut App, ctx: &egui::Context) {
+fn top_bar(app: &mut App, ctx: &egui::Context, colors: &Colors) {
     egui::Panel::top("switcheroo-top").show(ctx, |ui| {
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
@@ -61,7 +106,7 @@ fn top_bar(app: &mut App, ctx: &egui::Context) {
             ui.label(
                 egui::RichText::new(note)
                     .small()
-                    .color(egui::Color32::from_rgb(230, 170, 90)),
+                    .color(colors.out_of_range()),
             );
         }
         ui.add_space(4.0);
@@ -89,7 +134,7 @@ fn bottom_bar(app: &mut App, ctx: &egui::Context) {
     });
 }
 
-fn devices_pane(app: &mut App, ui: &mut egui::Ui) {
+fn devices_pane(app: &mut App, ui: &mut egui::Ui, colors: &Colors) {
     if app.hub.is_empty() {
         ui.vertical_centered(|ui| {
             ui.add_space(24.0);
@@ -115,7 +160,7 @@ fn devices_pane(app: &mut App, ui: &mut egui::Ui) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for d in app.hub.sorted() {
-                let (tog, refr, pin) = device_row(ui, d, now);
+                let (tog, refr, pin) = device_row(ui, d, now, colors);
                 if tog {
                     to_toggle = Some(d.id.clone());
                 }
@@ -141,7 +186,7 @@ fn devices_pane(app: &mut App, ui: &mut egui::Ui) {
 }
 
 /// One outlet. Returns (toggle_clicked, refresh_clicked, pin_clicked).
-fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant) -> (bool, bool, bool) {
+fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant, colors: &Colors) -> (bool, bool, bool) {
     let stale = d.is_stale(now, STALE_AFTER);
     let mut toggled = false;
     let mut refreshed = false;
@@ -154,7 +199,7 @@ fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant) -> (bool, bool, bool)
             ui.horizontal(|ui| {
                 // pin
                 let star = if d.favourite { "★" } else { "☆" };
-                if ui.small_button(star).on_hover_text("pin to top").clicked() {
+                if ui.add_sized([TAP, TAP], egui::Button::new(star)).on_hover_text("pin to top").clicked() {
                     pinned = true;
                 }
 
@@ -168,7 +213,7 @@ fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant) -> (bool, bool, bool)
                         ui.label(
                             egui::RichText::new(d.kind.label())
                                 .small()
-                                .color(egui::Color32::from_rgb(122, 162, 247)),
+                                .color(colors.kind()),
                         );
                         if let Some(r) = d.rssi {
                             ui.label(egui::RichText::new(format!("{r} dBm")).small().weak());
@@ -177,7 +222,7 @@ fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant) -> (bool, bool, bool)
                             ui.label(
                                 egui::RichText::new("out of range")
                                     .small()
-                                    .color(egui::Color32::from_rgb(200, 140, 90)),
+                                    .color(colors.out_of_range()),
                             );
                         }
                     });
@@ -185,7 +230,7 @@ fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant) -> (bool, bool, bool)
                         ui.label(
                             egui::RichText::new(err)
                                 .small()
-                                .color(egui::Color32::from_rgb(230, 110, 110)),
+                                .color(colors.error()),
                         );
                     } else if let Some(why) = d.kind.unsupported_reason() {
                         // Say WHY a plug has no button. An inert row with no
@@ -200,9 +245,9 @@ fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant) -> (bool, bool, bool)
                         ui.spinner();
                     } else if d.kind.is_controllable() {
                         let (label, tint) = match d.power {
-                            Power::On => ("ON", egui::Color32::from_rgb(120, 200, 130)),
-                            Power::Off => ("OFF", egui::Color32::from_rgb(150, 150, 160)),
-                            Power::Unknown => ("—", egui::Color32::from_rgb(180, 170, 110)),
+                            Power::On => ("ON", colors.on()),
+                            Power::Off => ("OFF", colors.off()),
+                            Power::Unknown => ("—", colors.unknown()),
                         };
                         let btn = egui::Button::new(
                             egui::RichText::new(label).strong().color(tint),
@@ -211,7 +256,7 @@ fn device_row(ui: &mut egui::Ui, d: &Device, now: Instant) -> (bool, bool, bool)
                         if ui.add(btn).clicked() {
                             toggled = true;
                         }
-                        if ui.small_button("↻").on_hover_text("re-read state").clicked() {
+                        if ui.add_sized([TAP, TAP], egui::Button::new("↻")).on_hover_text("re-read state").clicked() {
                             refreshed = true;
                         }
                     } else {
@@ -245,7 +290,7 @@ fn activity_pane(app: &mut App, ui: &mut egui::Ui) {
         });
 }
 
-fn about_pane(_app: &mut App, ui: &mut egui::Ui) {
+fn about_pane(_app: &mut App, ui: &mut egui::Ui, colors: &Colors) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -279,7 +324,7 @@ fn about_pane(_app: &mut App, ui: &mut egui::Ui) {
                      hardware yet.",
                 )
                 .small()
-                .color(egui::Color32::from_rgb(230, 170, 90)),
+                .color(colors.out_of_range()),
             );
         });
 }

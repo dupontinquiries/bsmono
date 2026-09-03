@@ -11,6 +11,12 @@ required-features = ["app"]
 
 [dependencies]
 switcheroo-core = { path = "../switcheroo-core" }
+# THE SHARED KIT. switcheroo was the only egui app in the fleet not on it: no
+# palette, eight hardcoded colours, and — because the symbol fonts are
+# installed by `apply_palette` — its own star and refresh glyphs rendering as
+# boxes. See the module note in ui.rs.
+uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
+snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }
 egui = "0.34"
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
 
