@@ -113,7 +113,7 @@ choice its shape, and it can be built before any shard physics exists.
 
 ## Suggested order
 
-1. ~~Per-segment durations.~~ Done — .
+1. ~~Per-segment durations.~~ Done — `xform::stage_time`.
 2. **A seven-pose test chassis** authoring the six stages, to find what
    the strip cannot express before building anything for it.
 3. **Watch stage 4.3 with `fold_audit --worst`.** Rotation is where the
