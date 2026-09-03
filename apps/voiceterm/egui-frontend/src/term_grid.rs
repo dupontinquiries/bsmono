@@ -97,7 +97,23 @@ pub struct TermGrid {
     app_cursor: bool,
     /// DEC 2004 bracketed paste.
     bracketed_paste: bool,
+    /// Rows that have scrolled off the top, oldest first.
+    ///
+    /// The grid used to drop them, which is why the pane menu's page-up
+    /// had nothing to page: `scroll_up` removed row 0 and forgot it.
+    scrollback: std::collections::VecDeque<Vec<Cell>>,
+    /// How many rows back the VIEW is. 0 is live.
+    view_offset: usize,
 }
+
+/// How many scrolled-off rows to keep.
+///
+/// A cell is small but a row is `cols` of them, so 5000 rows of a
+/// 200-column terminal is on the order of a few megabytes — fine on a
+/// desktop and deliberately bounded for the phone targets this repo
+/// builds for, where an unbounded buffer on a long build is a crash
+/// rather than a slowdown.
+pub const SCROLLBACK_ROWS: usize = 5000;
 
 impl TermGrid {
     /// How keys must be encoded right now.
@@ -124,6 +140,8 @@ impl TermGrid {
             cells: vec![vec![Cell::default(); cols]; rows],
             app_cursor: false,
             bracketed_paste: false,
+            scrollback: std::collections::VecDeque::new(),
+            view_offset: 0,
             cursor_x: 0, cursor_y: 0,
             dirty: true, dirty_rows: Some((0, rows - 1)),
             pen: Cell::default(),
@@ -185,10 +203,66 @@ impl TermGrid {
     }
 
     /// Scroll one line. Marks every row, because every row moved.
+    ///
+    /// The departing row goes to scrollback rather than being dropped.
     pub fn scroll_up(&mut self) {
-        self.cells.remove(0);
+        let gone = self.cells.remove(0);
+        self.scrollback.push_back(gone);
+        while self.scrollback.len() > SCROLLBACK_ROWS {
+            self.scrollback.pop_front();
+        }
         self.cells.push(vec![Cell::default(); self.cols]);
+        // Output arriving while scrolled back must NOT drag the view: a
+        // build printing during a scroll-up would otherwise yank you to
+        // the bottom mid-read. The offset counts rows from the live tail,
+        // so it grows with the buffer to keep the same rows on screen —
+        // clamped, because the oldest row eventually falls off the cap.
+        if self.view_offset > 0 {
+            self.view_offset = (self.view_offset + 1).min(self.scrollback.len());
+        }
         self.mark_all();
+    }
+
+    /// Rows available above the live screen.
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    /// How far back the view is; 0 is live.
+    pub fn view_offset(&self) -> usize {
+        self.view_offset
+    }
+
+    /// True when the view is showing history rather than the live tail.
+    pub fn is_scrolled_back(&self) -> bool {
+        self.view_offset > 0
+    }
+
+    /// Scroll the view back by `n` rows, stopping at the oldest kept row.
+    pub fn page_up(&mut self, n: usize) {
+        let want = (self.view_offset + n).min(self.scrollback.len());
+        if want != self.view_offset {
+            self.view_offset = want;
+            self.mark_all();
+        }
+    }
+
+    /// Scroll forward by `n` rows, stopping at the live tail.
+    pub fn page_down(&mut self, n: usize) {
+        let want = self.view_offset.saturating_sub(n);
+        if want != self.view_offset {
+            self.view_offset = want;
+            self.mark_all();
+        }
+    }
+
+    /// Jump back to the live tail. Typing should do this — reading
+    /// history and then typing means you want to see what you typed.
+    pub fn scroll_to_bottom(&mut self) {
+        if self.view_offset != 0 {
+            self.view_offset = 0;
+            self.mark_all();
+        }
     }
 
     pub fn carriage_return(&mut self) { self.cursor_x = 0; }
@@ -266,11 +340,33 @@ impl TermGrid {
         }
     }
 
-    /// A row as text, skipping phantoms so a wide glyph appears once.
+    /// A visible row as text, skipping phantoms so a wide glyph appears
+    /// once.
+    ///
+    /// `y` indexes the VIEW, not the cell buffer. While scrolled back
+    /// the top rows come from scrollback; the renderer and the row cache
+    /// need no notion of history because this hides it.
     pub fn row_text(&self, y: usize) -> String {
-        match self.cells.get(y) {
+        let render = |row: &Vec<Cell>| -> String {
+            row.iter().filter(|c| !c.is_phantom()).map(|c| c.ch).collect()
+        };
+        if self.view_offset == 0 {
+            return match self.cells.get(y) {
+                None => String::new(),
+                Some(row) => render(row),
+            };
+        }
+        // The view starts `view_offset` rows above the live screen.
+        if y < self.view_offset {
+            let idx = self.scrollback.len() - self.view_offset + y;
+            return match self.scrollback.get(idx) {
+                None => String::new(),
+                Some(row) => render(row),
+            };
+        }
+        match self.cells.get(y - self.view_offset) {
             None => String::new(),
-            Some(row) => row.iter().filter(|c| !c.is_phantom()).map(|c| c.ch).collect(),
+            Some(row) => render(row),
         }
     }
 }
@@ -278,6 +374,110 @@ impl TermGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feed `n` numbered lines so scrolled-off rows are identifiable.
+    fn lines(g: &mut TermGrid, vt: &mut Vt, from: usize, to: usize) {
+        for i in from..to {
+            vt.feed(g, format!("line{i}\r\n").as_bytes());
+        }
+    }
+
+    #[test]
+    fn a_scrolled_off_row_is_kept_rather_than_dropped() {
+        // the reason page-up had nothing to page: scroll_up removed row
+        // 0 and forgot it
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        lines(&mut g, &mut vt, 0, 6);
+        assert!(g.scrollback_len() >= 3, "got {}", g.scrollback_len());
+    }
+
+    #[test]
+    fn paging_up_shows_the_older_rows() {
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        lines(&mut g, &mut vt, 0, 6);
+        assert!(!g.is_scrolled_back());
+        g.page_up(2);
+        assert!(g.is_scrolled_back());
+        assert_eq!(g.view_offset(), 2);
+        let view: Vec<String> = (0..3).map(|y| g.row_text(y).trim_end().to_string()).collect();
+        assert!(view.iter().any(|r| r == "line2"), "view was {view:?}");
+    }
+
+    #[test]
+    fn paging_back_down_returns_to_the_live_tail() {
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        lines(&mut g, &mut vt, 0, 6);
+        let live: Vec<String> = (0..3).map(|y| g.row_text(y)).collect();
+        g.page_up(2);
+        g.page_down(2);
+        assert!(!g.is_scrolled_back());
+        assert_eq!((0..3).map(|y| g.row_text(y)).collect::<Vec<_>>(), live);
+    }
+
+    #[test]
+    fn paging_stops_at_both_ends_instead_of_running_off() {
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        lines(&mut g, &mut vt, 0, 6);
+        g.page_up(10_000);
+        assert_eq!(g.view_offset(), g.scrollback_len(), "clamped to the oldest kept row");
+        g.page_down(10_000);
+        assert_eq!(g.view_offset(), 0);
+    }
+
+    #[test]
+    fn output_while_scrolled_back_does_not_yank_the_view() {
+        // a build printing during a scroll-up must not drag you to the
+        // bottom mid-read
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        lines(&mut g, &mut vt, 0, 6);
+        g.page_up(2);
+        let before: Vec<String> = (0..3).map(|y| g.row_text(y)).collect();
+        lines(&mut g, &mut vt, 100, 103);
+        assert!(g.is_scrolled_back(), "still reading history");
+        assert_eq!(
+            (0..3).map(|y| g.row_text(y)).collect::<Vec<_>>(),
+            before,
+            "the same rows stayed on screen"
+        );
+    }
+
+    #[test]
+    fn scroll_to_bottom_returns_to_live() {
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        lines(&mut g, &mut vt, 0, 6);
+        g.page_up(2);
+        g.scroll_to_bottom();
+        assert!(!g.is_scrolled_back());
+    }
+
+    #[test]
+    fn scrollback_is_capped() {
+        let mut g = TermGrid::new(4, 2);
+        let mut vt = Vt::default();
+        for _ in 0..(SCROLLBACK_ROWS + 50) {
+            vt.feed(&mut g, b"x\r\n");
+        }
+        assert_eq!(g.scrollback_len(), SCROLLBACK_ROWS, "an unbounded buffer is a crash on a phone");
+    }
+
+    #[test]
+    fn scrolling_marks_every_row_so_the_cache_rebuilds() {
+        // row_galleys caches by row index; a view shift changes what
+        // every index means
+        let mut g = TermGrid::new(20, 3);
+        let mut vt = Vt::default();
+        lines(&mut g, &mut vt, 0, 6);
+        let _ = g.take_dirty();
+        g.page_up(1);
+        assert!(g.is_dirty(), "the row cache would keep showing the old rows");
+    }
+
 
     #[test]
     fn a_fresh_grid_is_in_neither_private_mode() {

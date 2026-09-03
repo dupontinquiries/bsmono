@@ -837,6 +837,10 @@ impl VoicetermApp {
     /// reads that buffer, and a `|` or a `{` inserted by a menu is part
     /// of the line it will classify.
     fn send_input(&mut self, bytes: &[u8]) {
+        // Reading history and then typing means you want to see what you
+        // typed. Every other terminal does this and its absence reads as
+        // the keyboard being broken.
+        self.session.grid.scroll_to_bottom();
         self.session.pty_out.extend_from_slice(bytes);
         if let Ok(t) = std::str::from_utf8(bytes) {
             for ch in t.chars().filter(|c| !c.is_control()) {
@@ -3297,6 +3301,13 @@ impl eframe::App for VoicetermApp {
                         if uikit_term::keys::clears_the_line(&out.bytes) {
                             self.app.terminal.interrupt();
                         }
+                        // Same rule as send_input: typing returns to the
+                        // live tail. `out.snap_to_bottom` is the
+                        // encoder's own answer to this and had no
+                        // consumer, because there was nothing to scroll.
+                        if out.snap_to_bottom || uikit_term::keys::clears_the_line(&out.bytes) {
+                            self.session.grid.scroll_to_bottom();
+                        }
                         self.session.pty_out.extend_from_slice(&out.bytes);
                     }
                 }
@@ -3903,25 +3914,11 @@ impl eframe::App for VoicetermApp {
                         self.workspace.apply(&voiceterm_egui::gesture_menus::WsCall::Command("new tab".into()));
                     }
                     Some(PaneAction::Mic) => {}
-                    // NOT re-pointed, because there is nothing to point
-                    // at. This paged the widget's grid, which nothing
-                    // feeds — so it did nothing. Pointing it at
-                    // `session.grid` would also do nothing, because
-                    // `term_grid::TermGrid` has NO SCROLLBACK: it scrolls
-                    // the top row off and forgets it.
-                    //
-                    // This is the capability gap that keeping two grids
-                    // was papering over. uikit-term's grid has
-                    // scrollback, search and selection; the frontend's
-                    // has the row caches the renderer is built on. The
-                    // honest state is a menu item that is unimplemented
-                    // rather than one that silently pages an invisible
-                    // buffer, so it says so.
+                    // Now real: `term_grid` keeps scrolled-off rows, so
+                    // this pages the grid the view actually draws.
                     Some(PaneAction::PageUpScrollback) => {
-                        self.toasts.info(
-                            "Scrollback is not implemented in this view yet",
-                            ui.input(|i| i.time),
-                        );
+                        let page = self.session.grid.rows.saturating_sub(1).max(1);
+                        self.session.grid.page_up(page);
                     }
                     // menu-triggered paste needs a clipboard READ; egui only delivers paste as
                     // an input event (Ctrl+V works today via handle_input's Event::Paste)
