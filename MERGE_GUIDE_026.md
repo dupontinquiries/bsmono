@@ -45,9 +45,21 @@ parser (1,478 lines, 60 tests). All verified on a running app.
 lighting, materials, a fixed-timestep accumulator, and an out-of-fuel
 softlock fix. See `games/road-warrior/docs/RENDERING.md`.
 
-**6. `games/blackstar-rs`.** Example harnesses repaired (they had not
-compiled since the animation work landed, so `cargo test` failed before
-running any of 1497 tests), non-finite input guards, and `fold_audit`.
+**6. `games/blackstar-rs`.** Three parts:
+
+- Example harnesses repaired — they had not compiled since the animation
+  work landed, so `cargo test` failed before running any of 1497 tests.
+- Non-finite input guards across nine modules
+  (`docs/NON_FINITE_INPUTS.md`), including one hard crash.
+- The transform investigation: `fold_audit` (see `docs/FOLD_AUDIT.md`),
+  `xform::stage_time` for per-segment stage durations, a generated
+  seven-pose fixture in `xform::staged_pipeline`, and two design notes
+  (`docs/STOWING.md`, `docs/STAGED_TRANSFORM.md`).
+
+  **`stage_time` is the only behaviour change here.** With
+  `stage_weights: None` it reproduces the previous mapping exactly, so no
+  shipped chassis moves; everything else in this part is measurement and
+  documentation.
 
 Streams 4–6 are independent of each other and of 1–3.
 
@@ -66,6 +78,12 @@ Streams 4–6 are independent of each other and of 1–3.
   wiring them replaces the procedural box car, which is an art-direction
   call.
 - **Aperture panes/collab wiring**, as above.
+- **The blackstar transform work is measurement, not change.** `STOWING.md`
+  concludes the gap to the reference silhouette is in the meshes rather
+  than the loader; nothing was remodelled. `STAGED_TRANSFORM.md` specs a
+  six-stage pipeline and finds the strip already expresses it; only
+  per-segment durations were implemented, and they default to the old
+  behaviour.
 
 ## Cross-cutting documents added
 
@@ -76,7 +94,10 @@ Streams 4–6 are independent of each other and of 1–3.
 | `games/road-warrior/docs/RENDERING.md` | why the lighting is baked and the assumption that makes it valid |
 | `games/road-warrior/BACKLOG.md` | menus, LAN via bsgames, procedural maps, with the constraints already known |
 | `apps/aperture/TODO_panes_and_collab.md` | the measured cost of wiring panes and collab |
-| `CLAUDE.md` §8 | two verification rules, both learned by getting them wrong here |
+| `games/blackstar-rs/docs/FOLD_AUDIT.md` | the transform harness, and how far to trust each of its six metrics |
+| `games/blackstar-rs/docs/STOWING.md` | why the robot does not fit in the vehicle, measured |
+| `games/blackstar-rs/docs/STAGED_TRANSFORM.md` | a six-stage transform spec against what the code already does |
+| `CLAUDE.md` §8 | four verification rules, all learned by getting them wrong here |
 
 ## Two rules worth carrying over
 
@@ -89,6 +110,17 @@ while every run reported green.
 **"Nothing references this" is a claim to grep for across the whole
 repo.** Two of three modules called unreferenced in one commit had
 callers — one reached by `#[path]`, invisible to any search for `use`.
+
+**A harness that measures runtime behaviour must load its data the way
+the runtime does.** Three separate wrong answers came from this in one
+session, each internally consistent and reproducible: an audit measuring
+the unified prim set instead of the model's own, a screenshot tool
+rendering a pose the game never draws, and an unoriented loader.
+
+**A grep hit pointing at an existing module is worth two minutes.**
+`src/foldaudit.rs` — 549 lines, nine tests, two callers — appeared in a
+search result that was not followed up, and a second audit got written
+beside it.
 
 ## What was verified how
 
