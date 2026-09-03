@@ -134,6 +134,85 @@ pub fn openrc_service(d: &Daemon, exec_path: &str) -> String {
     )
 }
 
+/// Everything needed to put a daemon on a machine: one file, then some commands.
+///
+/// Returned as DATA rather than executed, so the same plan drives a local
+/// install, an `ssh` one and a dry run — and so the whole of it is testable
+/// without a machine to install onto. `deploy.rs` already knows how to run a
+/// remote command and push a file; this says what to push and what to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallPlan {
+    /// Where the unit or init script goes.
+    pub unit_path: String,
+    pub unit_body: String,
+    /// Whether the file needs to be executable — an OpenRC script does, a
+    /// systemd unit does not, and getting it wrong fails at boot rather than
+    /// at install.
+    pub executable: bool,
+    /// Run in order, after the file is in place.
+    pub commands: Vec<String>,
+}
+
+/// Build the install plan for `d`, whose binary will live at `exec_path`.
+///
+/// # Why generate the unit instead of shipping one
+///
+/// Because a checked-in unit drifts from the machine it lands on, and today's
+/// rusty-board failure is the example: its hand-written unit declared
+/// `ReadWritePaths=%h/.config/rusty-board`, nothing created that directory, and
+/// systemd refused to set up the mount namespace and died before `ExecStart`
+/// with a message naming the directory rather than the cause.
+///
+/// A generated unit cannot have that problem, because the generator knows what
+/// it asked for. It also guarantees `X-Fleet-Integration` is present — the
+/// marker `is_fleet_daemon` scans for — and that `ExecStart` matches where the
+/// binary actually landed rather than where someone assumed it would.
+///
+/// # The order of the commands is the part that matters
+///
+/// Stop, then reload, then enable, then start. Each step is there for a
+/// failure:
+///
+/// * **Stop first** — replacing the binary under a running service leaves the
+///   old one in memory holding its socket, so the new one fails to bind and
+///   the operator sees a crash loop rather than an upgrade.
+/// * **Reload between** — systemd caches unit text. Without it, `start` runs
+///   the OLD unit and the change appears not to have happened, which is
+///   exactly what "I ran the redeploy script and nothing changed" looks like.
+/// * **Enable before start**, so a device that reboots comes back with the
+///   daemon running. A service that works until the phone restarts is a bug
+///   report a week later with no obvious cause.
+pub fn install_plan(d: &Daemon, init: InitSystem, exec_path: &str, home: &str) -> InstallPlan {
+    match init {
+        InitSystem::Systemd => InstallPlan {
+            unit_path: format!("{home}/.config/systemd/user/{}.service", d.name),
+            unit_body: systemd_user_unit(d, exec_path),
+            executable: false,
+            commands: vec![
+                // `|| true` on the stop: a first install has nothing to stop,
+                // and a non-zero exit there must not abort the install.
+                format!("systemctl --user stop {}.service || true", d.name),
+                "systemctl --user daemon-reload".to_string(),
+                format!("systemctl --user enable {}.service", d.name),
+                format!("systemctl --user start {}.service", d.name),
+            ],
+        },
+        InitSystem::OpenRc => InstallPlan {
+            unit_path: format!("/etc/init.d/{}", d.name),
+            unit_body: openrc_service(d, exec_path),
+            // OpenRC EXECUTES the script. A non-executable one fails with
+            // "service does not exist", which sends the reader looking for a
+            // missing file that is right there.
+            executable: true,
+            commands: vec![
+                format!("rc-service {} stop || true", d.name),
+                format!("rc-update add {} default", d.name),
+                format!("rc-service {} start", d.name),
+            ],
+        },
+    }
+}
+
 /// A lifecycle action on a running daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonAction {
@@ -382,4 +461,74 @@ mod tests {
         let got = parse_status(openrc);
         assert_eq!(got, vec![("voiced".into(), true), ("settingsd".into(), false)]);
     }
+    #[test]
+    fn the_plan_reloads_before_it_starts() {
+        // systemd caches unit text. Start without a reload runs the OLD unit
+        // and the change appears not to have happened — which is exactly what
+        // "I ran the redeploy script and nothing changed" looks like from the
+        // outside.
+        let d = &all()[0];
+        let p = install_plan(d, InitSystem::Systemd, "/home/u/.local/bin/voiced", "/home/u");
+        let idx = |needle: &str| p.commands.iter().position(|c| c.contains(needle));
+        let (stop, reload, enable, start) = (
+            idx("stop").expect("no stop"),
+            idx("daemon-reload").expect("no reload"),
+            idx("enable").expect("no enable"),
+            idx("start").expect("no start"),
+        );
+        assert!(stop < reload, "the binary is replaced under a running service");
+        assert!(reload < start, "start would run the cached unit");
+        assert!(enable < start, "a reboot would come back without the daemon");
+    }
+
+    #[test]
+    fn a_first_install_is_not_aborted_by_having_nothing_to_stop() {
+        // The stop runs before anything exists. Without the guard a fresh
+        // device fails at step one.
+        let d = &all()[0];
+        let p = install_plan(d, InitSystem::Systemd, "/x", "/home/u");
+        assert!(p.commands[0].contains("|| true"), "first command: {}", p.commands[0]);
+        let o = install_plan(d, InitSystem::OpenRc, "/x", "/home/u");
+        assert!(o.commands[0].contains("|| true"), "first command: {}", o.commands[0]);
+    }
+
+    #[test]
+    fn the_openrc_script_is_executable_and_the_systemd_unit_is_not() {
+        // OpenRC EXECUTES the script; a non-executable one reports "service
+        // does not exist", which sends the reader looking for a file that is
+        // right there. systemd reads its unit and does not care.
+        let d = &all()[0];
+        assert!(install_plan(d, InitSystem::OpenRc, "/x", "/h").executable);
+        assert!(!install_plan(d, InitSystem::Systemd, "/x", "/h").executable);
+    }
+
+    #[test]
+    fn every_generated_unit_carries_the_fleet_marker_and_the_real_exec_path() {
+        // The marker is what `is_fleet_daemon` scans for, and the exec path is
+        // the thing a hand-written unit gets wrong when a binary moves.
+        for init in [InitSystem::Systemd, InitSystem::OpenRc] {
+            for d in all() {
+                let p = install_plan(d, init, "/opt/fleet/bin/thing", "/home/u");
+                assert!(is_fleet_daemon(&p.unit_body),
+                        "{} on {:?} has no {FLEET_MARKER}", d.name, init.as_str());
+                assert_eq!(fleet_integration(&p.unit_body).as_deref(), Some(d.integration));
+                assert!(p.unit_body.contains("/opt/fleet/bin/thing"),
+                        "{} on {:?} does not reference the exec path", d.name, init.as_str());
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_init_systems_write_to_different_places() {
+        // A systemd unit under /etc/init.d does nothing, and an OpenRC script
+        // in ~/.config/systemd/user does nothing. Both silently.
+        let d = &all()[0];
+        let s = install_plan(d, InitSystem::Systemd, "/x", "/home/u");
+        let o = install_plan(d, InitSystem::OpenRc, "/x", "/home/u");
+        assert!(s.unit_path.starts_with("/home/u/.config/systemd/user/"), "{}", s.unit_path);
+        assert!(s.unit_path.ends_with(".service"));
+        assert!(o.unit_path.starts_with("/etc/init.d/"), "{}", o.unit_path);
+        assert_ne!(s.unit_path, o.unit_path);
+    }
+
 }
