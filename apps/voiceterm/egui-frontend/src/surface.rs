@@ -285,5 +285,30 @@ mod tests {
              while a surface is up, or keys reach the shell through the \
              backdrop."
         );
+        // THE LIVE TERMINAL MODE. Passing TermMode::default() hardcodes
+        // "never in application-cursor mode", which makes the encoder's
+        // SS3 branch and the parser's DECCKM tracking unreachable —
+        // arrows stop working inside fzf, vim and less while every unit
+        // test still passes, because each piece is correct on its own.
+        assert_eq!(
+            src.matches("pty_input::TermMode::default()").count(),
+            0,
+            "drain_egui is being handed a default mode again — pass \
+             self.app.terminal.grid.key_mode(), or app-cursor arrows break."
+        );
+        assert!(
+            src.contains("self.app.terminal.grid.key_mode()"),
+            "the live key mode is no longer reaching drain_egui."
+        );
+        // ONE INPUT OWNER. uikit_term::App::handle_input and
+        // pty_input::drain_egui both read this frame's events; if the
+        // widget is not told the host owns encoding, every keystroke
+        // reaches the shell twice and every Enter runs the command twice.
+        assert_eq!(
+            src.matches("set_input_owner(").count(),
+            1,
+            "the input-owner declaration is gone — the widget and the raw \
+             path will both encode, and `ls` will run twice."
+        );
     }
 }

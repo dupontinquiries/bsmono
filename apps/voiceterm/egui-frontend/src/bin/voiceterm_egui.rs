@@ -3111,8 +3111,24 @@ impl eframe::App for VoicetermApp {
             let key_outs = if self.surfaces.captures_input() {
                 Vec::new()
             } else {
+                // THE LIVE MODE, NOT THE DEFAULT.
+                //
+                // In application-cursor mode (DECCKM — set by fzf, vim,
+                // less, and readline in some configs) arrows are SS3
+                // `ESC O A`, not CSI `ESC [ A`. Passing
+                // TermMode::default() here hardcodes "never in app
+                // mode", so the encoder's app-cursor branch and the
+                // parser's DECCKM tracking were both correct and both
+                // unreachable — arrows did nothing useful inside exactly
+                // the programs pty_input's header names as the reported
+                // symptom (Ctrl+R fzf history, where you cannot move
+                // through the match).
+                //
+                // Third time this chain has been completed at the last
+                // link: uikit-term hit the same thing when its own key
+                // path called `encode` instead of `encode_mode`.
                 voiceterm_egui::pty_input::drain_egui(
-                    ui, voiceterm_egui::pty_input::TermMode::default(),
+                    ui, self.app.terminal.grid.key_mode(),
                     self.workspace.tabs.len() > 1)
             };
             for out in key_outs

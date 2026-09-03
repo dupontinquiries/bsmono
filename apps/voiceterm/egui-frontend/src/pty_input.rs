@@ -148,6 +148,21 @@ pub fn press(key: Key, m: Mods, mode: TermMode, split_visible: bool) -> Outcome 
 /// Kept separate from `press` so the encoding is testable without an egui
 /// context, which is the only reason any of the above has tests at all.
 pub fn drain_egui(ui: &egui::Ui, mode: TermMode, split_visible: bool) -> Vec<Outcome> {
+    // A FOCUSED TEXT WIDGET OWNS THE KEYBOARD.
+    //
+    // This reads raw context events, so it sees keys that were typed
+    // into a TextEdit — egui does not remove an event because a widget
+    // consumed it. The call site gates on voiceterm's own surfaces, but
+    // that does not cover egui widgets: uikit-term's find bar, the
+    // command palette, any inline field. Typing a search query also
+    // typed it into the shell.
+    //
+    // `uikit_term::App::handle_input` has always had this guard. The
+    // asymmetry was the bug — two readers of one event stream, one of
+    // them checking focus.
+    if ui.ctx().egui_wants_keyboard_input() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     ui.input(|i| {
         for ev in &i.events {
