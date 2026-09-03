@@ -496,6 +496,24 @@ fn lists(text: &str, name: &str) -> bool {
     text.lines().any(|l| l.split_whitespace().nth(1) == Some(name))
 }
 
+/// The ffmpeg encoder a set of [`EncodeOptions`] will actually ask for.
+///
+/// One place, so the preflight and the command builder cannot disagree about
+/// what the job needs — a preflight that checks a different encoder than the
+/// run uses is worse than none, because it reports all-clear and then fails.
+pub fn encoder_for(opts: &EncodeOptions) -> &'static str {
+    match opts.codec.as_str() {
+        "x264" => "libx264",
+        "x265" => "libx265",
+        _ => "libsvtav1",
+    }
+}
+
+/// Check that this machine can run this job, before it starts.
+pub fn preflight_for(opts: &EncodeOptions) -> Preflight {
+    preflight(&[encoder_for(opts)], &[])
+}
+
 /// Run the check. `want_encoders`/`want_decoders` are ffmpeg component names.
 pub fn preflight(want_encoders: &[&str], want_decoders: &[&str]) -> Preflight {
     let have = |c: &str| Command::new(c).arg("-version").output()
@@ -522,6 +540,24 @@ pub fn preflight(want_encoders: &[&str], want_decoders: &[&str]) -> Preflight {
 #[cfg(test)]
 mod preflight_tests {
     use super::*;
+
+    #[test]
+    fn the_preflight_checks_the_encoder_the_run_will_actually_use() {
+        // A preflight that checks a DIFFERENT encoder than the command builder
+        // emits is worse than none: it reports all-clear and the run then fails
+        // at the encoder anyway. One function decides, and this is what pins
+        // the two together.
+        let av1 = EncodeOptions { codec: "av1".into(), ..Default::default() };
+        assert_eq!(encoder_for(&av1), "libsvtav1");
+        let x264 = EncodeOptions { codec: "x264".into(), ..Default::default() };
+        assert_eq!(encoder_for(&x264), "libx264");
+        let x265 = EncodeOptions { codec: "x265".into(), ..Default::default() };
+        assert_eq!(encoder_for(&x265), "libx265");
+        // An unknown codec string falls to av1, matching the command builder's
+        // own `_ =>` arm rather than inventing a third behaviour.
+        let odd = EncodeOptions { codec: "wat".into(), ..Default::default() };
+        assert_eq!(encoder_for(&odd), "libsvtav1");
+    }
 
     #[test]
     fn a_clean_preflight_reports_no_problem() {

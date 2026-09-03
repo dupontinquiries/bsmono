@@ -595,6 +595,7 @@ enum SegMsg {
 }
 
 pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyhow::Result<Summary> {
+    preflight_or_bail(job)?;
     anyhow::ensure!(!job.input.is_dir() && job.output.extension().is_some(), "--jobs needs a video input and a video output");
     anyhow::ensure!(job.start == 0.0 && job.end.is_none(), "segment parallelism over a sub-range is not implemented yet; use jobs = 1 for clip bounces");
     let p = ffmpeg::probe(&job.input)?;
@@ -728,8 +729,27 @@ pub fn run_segmented(job: &Job, mut on_event: impl FnMut(usize, PEvent)) -> anyh
     Ok(Summary { frames, elapsed, upscaled_pixel_fraction: if frames > 0 { fraction / frames as f64 } else { 0.0 }, heavy_pixel_fraction: if frames > 0 { heavy / frames as f64 } else { 0.0 } })
 }
 
+/// Refuse a run this machine cannot finish, before it starts.
+///
+/// The ported codec preflight, wired. Checking that ffmpeg EXISTS — which is
+/// all this crate did — passes on a box with a stripped build and no
+/// libsvtav1, and the run then dies at the encoder, which is the LAST step. An
+/// hour of upscaling for an error that was knowable in fifty milliseconds.
+///
+/// A failed PROBE is not a failed check: if `ffmpeg -encoders` cannot be run
+/// at all the preflight reports ffmpeg missing, which is the honest reading.
+/// What it must never do is pass silently because the probe itself broke.
+fn preflight_or_bail(job: &Job) -> anyhow::Result<()> {
+    let p = ffmpeg::preflight_for(&job.encode);
+    match p.problem() {
+        Some(why) => Err(anyhow!("{why}")),
+        None => Ok(()),
+    }
+}
+
 /// Run a job end to end. `on_event` receives pipeline events on the calling thread.
 pub fn run(job: &Job, mut on_event: impl FnMut(Event)) -> anyhow::Result<Summary> {
+    preflight_or_bail(job)?;
     if job.jobs > 1 {
         return run_segmented(job, |i, e| on_event(Event::Segment(i, e)));
     }

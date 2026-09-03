@@ -392,20 +392,13 @@ unsafe fn create_compute_pipeline(
     layout: vk::PipelineLayout,
     stem: &str,
 ) -> Result<vk::Pipeline, GemmError> {
-    let candidates = [
-        format!(
-            "{}/../../assets/shaders/{stem}.comp.spv",
-            env!("CARGO_MANIFEST_DIR")
-        ),
-        format!("assets/shaders/{stem}.comp.spv"),
-        format!("src/shaders/{stem}.comp.spv"),
-    ];
+    let candidates = crate::assets::shader_paths(&format!("{stem}.comp.spv"));
     let bytes = candidates
         .iter()
         .find(|p| Path::new(p).exists())
         .map(std::fs::read)
         .transpose()?
-        .ok_or_else(|| GemmError::ShaderMissing(candidates[0].clone()))?;
+        .ok_or_else(|| GemmError::ShaderMissing(candidates[0].display().to_string()))?;
     let words: Vec<u32> = bytes
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
