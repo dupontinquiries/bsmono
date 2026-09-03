@@ -121,6 +121,23 @@ impl Vehicle {
 
     /// Advance physics by `dt` seconds, on flat ground at height 0. Convenience
     /// wrapper over `step_on_ground` for tests and any non-track use of the model.
+    /// Out of fuel, stopped, and on the ground — the run cannot continue.
+    ///
+    /// Nothing else notices this. `respawn` only fires on `health <= 0`, and
+    /// an empty tank leaves the vehicle alive and motionless: with
+    /// `effective_throttle` gated on `gas > 0`, the car coasts to a halt and
+    /// stays there. Observed in a headless run of level one — the vehicle
+    /// ended at x = -17, velocity zero, health 75, and simply sat there for
+    /// the remaining eighty seconds of simulation. The level cannot
+    /// complete, the player cannot die, and nothing refuels. A softlock.
+    ///
+    /// Grounded is part of the test because mid-air with an empty tank is a
+    /// normal jump you are still going to land; only a stationary car on the
+    /// ground is genuinely stuck.
+    pub fn is_stranded(&self) -> bool {
+        self.gas <= 0.0 && !self.airborne && self.vel_x.abs() < 0.1
+    }
+
     pub fn step(&mut self, dt: f32, throttle: f32, tilt: f32, nitro_active: bool, gravity: f32) {
         self.step_on_ground(dt, throttle, tilt, nitro_active, gravity, Some(GroundContact { height: 0.0, slope: 0.0 }));
     }
@@ -230,6 +247,41 @@ impl Vehicle {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_empty_tank_at_a_standstill_is_stranded() {
+        let mut v = Vehicle::new(CarKind::RedSedan);
+        v.gas = 0.0;
+        v.vel_x = 0.0;
+        assert!(v.is_stranded());
+    }
+
+    #[test]
+    fn still_rolling_is_not_stranded_yet() {
+        // Coasting to a halt is normal; the run is only over once it stops.
+        let mut v = Vehicle::new(CarKind::RedSedan);
+        v.gas = 0.0;
+        v.vel_x = 5.0;
+        assert!(!v.is_stranded());
+    }
+
+    #[test]
+    fn mid_air_with_an_empty_tank_is_not_stranded() {
+        // You are still going to land. Failing the run here would end it in
+        // the middle of a jump the player has already committed to.
+        let mut v = Vehicle::new(CarKind::RedSedan);
+        v.gas = 0.0;
+        v.vel_x = 0.0;
+        v.airborne = true;
+        assert!(!v.is_stranded());
+    }
+
+    #[test]
+    fn a_full_tank_at_a_standstill_is_not_stranded() {
+        // Sitting at the start line before touching the throttle.
+        let v = Vehicle::new(CarKind::RedSedan);
+        assert!(!v.is_stranded());
+    }
     use super::*;
 
     #[test]

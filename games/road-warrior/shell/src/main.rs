@@ -156,6 +156,17 @@ impl RoadWarriorApp {
     /// for this genre, chosen since there was no direction on what death
     /// should do; the alternative (lose a life / restart the whole campaign)
     /// is a bigger design decision I didn't want to guess at silently.
+    fn respawn_out_of_fuel(&mut self) {
+        let kind = self.vehicle.kind;
+        self.vehicle = Vehicle::new(kind);
+        self.load_current_level();
+        self.level_start_time = std::time::Instant::now();
+        self.toasts.push(Toast {
+            message: "Out of fuel! Retrying level...".to_string(),
+            shown_at: std::time::Instant::now(),
+        });
+    }
+
     fn respawn(&mut self) {
         let kind = self.vehicle.kind;
         self.vehicle = Vehicle::new(kind);
@@ -329,6 +340,16 @@ impl eframe::App for RoadWarriorApp {
         // does NOT also count as completing it.
         if self.vehicle.health <= 0.0 {
             self.respawn();
+        } else if self.vehicle.is_stranded() {
+            // An empty tank used to be a SOFTLOCK: the car coasts to a stop,
+            // health is still positive so nothing respawns, the level cannot
+            // complete, and there is no refuel anywhere in the game. The
+            // player sits at a standstill until they quit.
+            //
+            // Retrying the level is the existing recovery path and it
+            // already restores fuel, so this is the same failure as a crash
+            // with an honest message.
+            self.respawn_out_of_fuel();
         }
 
         // Guard against re-triggering every frame forever: once the campaign
