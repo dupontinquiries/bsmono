@@ -539,6 +539,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "d2x-job"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "d2x-core",
+ "d2x-wgpu",
+ "image",
+ "serde_json",
+]
+
+[[package]]
 name = "d2x-wgpu"
 version = "0.1.0"
 dependencies = [
@@ -557,11 +568,10 @@ dependencies = [
  "anyhow",
  "clap",
  "d2x-core",
+ "d2x-job",
  "d2x-wgpu",
  "eframe",
  "egui",
- "image",
- "serde_json",
  "snapclone-theme",
  "uikit-egui",
 ]
@@ -1480,10 +1490,6 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
-
-[[package]]
-name = "math-kit"
-version = "0.1.0"
 
 [[package]]
 name = "memchr"
@@ -2753,7 +2759,6 @@ name = "uikit-egui"
 version = "0.1.0"
 dependencies = [
  "egui",
- "math-kit",
  "settings-kit",
  "snapclone-theme",
  "touchkit",

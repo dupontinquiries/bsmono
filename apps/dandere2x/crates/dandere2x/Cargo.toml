@@ -11,13 +11,12 @@ path = "src/main.rs"
 
 [dependencies]
 d2x-core = { path = "../d2x-core" }
+d2x-job = { path = "../d2x-job", default-features = false }
 # GPU backend behind a default-on feature so a headless box can still build
 # the CLI with --no-default-features (cpu / bicubic backends only).
 d2x-wgpu = { path = "../d2x-wgpu", optional = true }
 anyhow.workspace = true
 clap.workspace = true
-image.workspace = true
-serde_json.workspace = true
 # The shell. Glow renderer stated explicitly (see fao-codec-egui); wgpu's
 # default limits die on phone GPUs.
 egui = { version = "0.34", optional = true }
@@ -27,5 +26,5 @@ snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme", op
 
 [features]
 default = ["gpu", "app"]
-gpu = ["dep:d2x-wgpu"]
+gpu = ["dep:d2x-wgpu", "d2x-job/gpu"]
 app = ["dep:egui", "dep:eframe", "dep:uikit-egui", "dep:snapclone-theme"]

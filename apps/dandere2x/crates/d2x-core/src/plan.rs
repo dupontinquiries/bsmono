@@ -60,18 +60,31 @@ pub enum BlockMatch {
     Stationary,
     /// The block at `(src_x, src_y)` in the previous frame passes the gate.
     Moved { src_x: u32, src_y: u32 },
-    /// Nothing in the previous frame passes; the block must be upscaled.
+    /// Same position in an older reference (`r` indexes the reference
+    /// list: recent frames first, then retained shot starts) passes the gate.
+    Recalled { r: u8 },
+    /// The block's cell content was upscaled before; the block cache holds
+    /// the result under `key`.
+    Cached { key: u64 },
+    /// Nothing in any reference passes; the block must be upscaled.
     Missing,
 }
 
+/// Number of upscaler tiers a plan can route to: 0 = the main network,
+/// 1 = a cheaper network for smooth blocks, 2 = bicubic for flat blocks.
+pub const MAX_TIERS: usize = 3;
+
 /// Maps a missing block at `(frame_x, frame_y)` to cell `(cell_x, cell_y)`
-/// of the residual image.
+/// of the residual image of `tier`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResidualVector {
     pub frame_x: u32,
     pub frame_y: u32,
     pub cell_x: u32,
     pub cell_y: u32,
+    pub tier: u8,
+    /// Content hash of the cell, the block cache key once it is upscaled.
+    pub key: u64,
 }
 
 /// A flat brightness shift applied to a block of the previous frame before
@@ -91,9 +104,25 @@ pub struct FrameStats {
     pub moved: u32,
     pub missing: u32,
     pub fades: u32,
-    /// Side length, in cells, of the square residual image (0 if none).
-    pub residual_dim: u32,
+    /// Blocks recovered from older references.
+    pub recalled: u32,
+    /// Blocks served from the content-keyed block cache.
+    pub cached: u32,
+    /// Residual image size in cells per tier (0×0 if none). Rectangular:
+    /// `cols = ceil(sqrt(n))`, `rows = ceil(n / cols)`, so at most `cols − 1`
+    /// cells are wasted instead of up to `2·sqrt(n)` for a square.
+    pub residual_tiers: [(u32, u32); MAX_TIERS],
     pub redraw: bool,
+}
+
+impl FrameStats {
+    /// Tier-0 residual size in cells.
+    pub fn residual_cols(&self) -> u32 {
+        self.residual_tiers[0].0
+    }
+    pub fn residual_rows(&self) -> u32 {
+        self.residual_tiers[0].1
+    }
 }
 
 impl FrameStats {
@@ -105,9 +134,20 @@ impl FrameStats {
             return 1.0;
         }
         let cell = (grid.block_size + 2 * bleed) as f64;
-        let res_px = (self.residual_dim as f64 * cell).powi(2);
         let frame_px = (grid.width() as f64) * (grid.height() as f64);
+        // Tiers 0 and 1 are networks; tier 2 is bicubic and costs nothing worth counting.
+        let res_px: f64 = self.residual_tiers.iter().take(2).map(|&(c, r)| (c as f64 * cell) * (r as f64 * cell)).sum();
         res_px / frame_px
+    }
+
+    /// Fraction of the frame's pixels that went through the *main* network.
+    pub fn heavy_fraction(&self, grid: &Grid, bleed: u32) -> f64 {
+        if self.redraw {
+            return 1.0;
+        }
+        let cell = (grid.block_size + 2 * bleed) as f64;
+        let (c, r) = self.residual_tiers[0];
+        (c as f64 * cell) * (r as f64 * cell) / ((grid.width() as f64) * (grid.height() as f64))
     }
 }
 
@@ -136,13 +176,13 @@ impl FramePlan {
         }
     }
 
-    /// Side length of the residual image in cells for `n` missing blocks.
-    pub fn residual_dim_for(n: usize) -> u32 {
+    /// Residual image size in cells `(cols, rows)` for `n` missing blocks.
+    pub fn residual_dims_for(n: usize) -> (u32, u32) {
         if n == 0 {
-            0
-        } else {
-            (n as f64).sqrt().ceil() as u32
+            return (0, 0);
         }
+        let cols = (n as f64).sqrt().ceil() as u32;
+        (cols, (n as u32).div_ceil(cols))
     }
 }
 
@@ -161,11 +201,16 @@ mod tests {
     }
 
     #[test]
-    fn residual_dim_is_ceil_sqrt() {
-        assert_eq!(FramePlan::residual_dim_for(0), 0);
-        assert_eq!(FramePlan::residual_dim_for(1), 1);
-        assert_eq!(FramePlan::residual_dim_for(4), 2);
-        assert_eq!(FramePlan::residual_dim_for(5), 3);
-        assert_eq!(FramePlan::residual_dim_for(9), 3);
+    fn residual_dims_are_rectangular() {
+        assert_eq!(FramePlan::residual_dims_for(0), (0, 0));
+        assert_eq!(FramePlan::residual_dims_for(1), (1, 1));
+        assert_eq!(FramePlan::residual_dims_for(4), (2, 2));
+        assert_eq!(FramePlan::residual_dims_for(5), (3, 2));
+        assert_eq!(FramePlan::residual_dims_for(9), (3, 3));
+        assert_eq!(FramePlan::residual_dims_for(50), (8, 7));
+        for n in 1..500usize {
+            let (c, r) = FramePlan::residual_dims_for(n);
+            assert!((c * r) as usize >= n && ((c * r) as usize) < n + c as usize, "n={n}");
+        }
     }
 }

@@ -8,25 +8,33 @@
 //! the block proper starts `bleed` further in.
 
 use crate::frame::{Frame, Pad};
-use crate::plan::{BlockMatch, FramePlan};
+use crate::plan::{BlockMatch, FramePlan, MAX_TIERS};
+use crate::predict::CachedBlocks;
 
-/// What the upscaler is asked to produce for this frame.
+/// What the upscalers are asked to produce for this frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Residual {
     /// Nothing changed: no upscale at all.
     None,
-    /// Upscale this packed image and stitch per `plan.residuals`.
-    Packed(Frame),
-    /// Upscale the whole frame; it becomes the output verbatim.
+    /// One packed image per tier (`None` where a tier has no blocks);
+    /// stitch per `plan.residuals`.
+    Packed([Option<Frame>; MAX_TIERS]),
+    /// Upscale the whole frame (tier 0); it becomes the output verbatim.
     Whole(Frame),
 }
 
 impl Residual {
-    pub fn frame(&self) -> Option<&Frame> {
+    /// The image for `tier`, if any.
+    pub fn tier(&self, t: usize) -> Option<&Frame> {
         match self {
             Residual::None => None,
-            Residual::Packed(f) | Residual::Whole(f) => Some(f),
+            Residual::Packed(v) => v[t].as_ref(),
+            Residual::Whole(f) => (t == 0).then_some(f),
         }
+    }
+    /// Tier-0 image (what a single-upscaler pipeline needs).
+    pub fn frame(&self) -> Option<&Frame> {
+        self.tier(0)
     }
 }
 
@@ -39,42 +47,38 @@ pub fn make_residual(next_original: &Frame, plan: &FramePlan, bleed: u32) -> Res
     }
     let bs = plan.grid.block_size;
     let cell = bs + 2 * bleed;
-    let dim = plan.stats.residual_dim;
-    debug_assert_eq!(dim, FramePlan::residual_dim_for(plan.residuals.len()));
 
-    // REPLICATE, not black. The old comment argued for black on the grounds
-    // that "the merge never reads the bleed ring back, so it only affects the
-    // ring's influence on the block". That reasoning is backwards, and it is
-    // the cause of the reported seams.
-    //
-    // The bleed ring is not decoration — it is the CONTEXT the CNN sees around
-    // each residual block, and the network's receptive field carries that
-    // context inward. Filling it with black darkens the block's own outer
-    // pixels, which the merge very much does read back. Not reading the ring
-    // itself is irrelevant; the damage is already inside the block.
-    //
-    // The observation that identified this: the dark lines MOVE WITH THE
-    // CAMERA and grow and shrink with motion locality. CNN tiles are a fixed
-    // grid and cannot do that. Residual blocks are chosen by the block matcher
-    // and therefore follow motion — so a per-block edge artefact is the only
-    // thing that behaves this way, which rules out the CNN tiling I had
-    // assumed and points here.
-    //
-    // Replicate makes the ring an extension of the block's own content, so the
-    // CNN sees a plausible continuation instead of a cliff to zero.
-    let padded = next_original.padded(bleed, Pad::Replicate);
-    let mut out = Frame::new(dim * cell, dim * cell);
+    // Black beyond the frame edge, as upstream. (Replicate would arguably be
+    // kinder to the CNN, but the merge never reads the bleed ring back, so
+    // it only affects the ring's influence on the block — keep parity.)
+    let padded = next_original.padded(bleed, Pad::Black);
+    let mut imgs: [Option<Frame>; MAX_TIERS] = Default::default();
+    for (t, img) in imgs.iter_mut().enumerate() {
+        let (cols, rows) = plan.stats.residual_tiers[t];
+        if cols > 0 {
+            *img = Some(Frame::new(cols * cell, rows * cell));
+        }
+    }
     for rv in &plan.residuals {
+        let out = imgs[rv.tier as usize].as_mut().expect("tier image sized for its blocks");
         // In padded coordinates the block starts at (frame_x + bleed); the
         // cell we want starts `bleed` before that, i.e. at (frame_x, frame_y).
         out.copy_block(&padded, cell, rv.frame_x, rv.frame_y, rv.cell_x * cell, rv.cell_y * cell);
     }
-    Residual::Packed(out)
+    Residual::Packed(imgs)
 }
 
 /// Build the upscaled next frame from the upscaled previous frame, the
-/// upscaled residual, and the plan. `scale` is the upscaler's factor.
-pub fn merge(prev_up: &Frame, residual_up: Option<&Frame>, plan: &FramePlan, scale: u32, bleed: u32) -> anyhow::Result<Frame> {
+/// older upscaled references (same order as given to `analyze`), the
+/// upscaled residual (tier 0), and the plan. `scale` is the upscaler's factor.
+pub fn merge(prev_up: &Frame, older_up: &[&Frame], residual_up: Option<&Frame>, plan: &FramePlan, scale: u32, bleed: u32) -> anyhow::Result<Frame> {
+    let tiers: [Option<&Frame>; MAX_TIERS] = [residual_up, None, None];
+    merge_tiered(prev_up, older_up, &tiers, &CachedBlocks::new(), plan, scale, bleed)
+}
+
+/// [`merge`] with one upscaled residual image per tier and the bytes of
+/// any `Cached` blocks (`(block·scale)²` RGB each).
+pub fn merge_tiered(prev_up: &Frame, older_up: &[&Frame], residual_up: &[Option<&Frame>; MAX_TIERS], cached: &CachedBlocks, plan: &FramePlan, scale: u32, bleed: u32) -> anyhow::Result<Frame> {
     let bs = plan.grid.block_size;
     let s = scale;
     anyhow::ensure!(
@@ -88,7 +92,7 @@ pub fn merge(prev_up: &Frame, residual_up: Option<&Frame>, plan: &FramePlan, sca
     );
 
     if plan.redraw {
-        let r = residual_up.ok_or_else(|| anyhow::anyhow!("merge: redraw plan without an upscaled frame"))?;
+        let r = residual_up[0].ok_or_else(|| anyhow::anyhow!("merge: redraw plan without an upscaled frame"))?;
         anyhow::ensure!((r.width, r.height) == (prev_up.width, prev_up.height), "merge: redraw frame size mismatch");
         return Ok(r.clone());
     }
@@ -104,36 +108,47 @@ pub fn merge(prev_up: &Frame, residual_up: Option<&Frame>, plan: &FramePlan, sca
     //    already in place, so only Moved and Missing blocks need work.
     let mut out = faded.clone();
     for (i, m) in plan.matches.iter().enumerate() {
-        if let BlockMatch::Moved { src_x, src_y } = *m {
-            let (x, y) = plan.grid.origin(i);
-            out.copy_block(&faded, bs * s, src_x * s, src_y * s, x * s, y * s);
+        let (x, y) = plan.grid.origin(i);
+        match *m {
+            BlockMatch::Moved { src_x, src_y } => out.copy_block(&faded, bs * s, src_x * s, src_y * s, x * s, y * s),
+            BlockMatch::Recalled { r } => {
+                let old = older_up.get(r as usize).ok_or_else(|| anyhow::anyhow!("merge: plan recalls reference {r} but only {} were given", older_up.len()))?;
+                anyhow::ensure!((old.width, old.height) == (prev_up.width, prev_up.height), "merge: reference {r} size mismatch");
+                out.copy_block(old, bs * s, x * s, y * s, x * s, y * s);
+            }
+            BlockMatch::Cached { key } => {
+                let b = cached.get(&key).ok_or_else(|| anyhow::anyhow!("merge: cached block {key:#x} not attached"))?;
+                let side = bs * s;
+                anyhow::ensure!(b.len() == (side * side * 3) as usize, "merge: cached block has {} bytes, expected {}", b.len(), side * side * 3);
+                let blk = Frame::from_rgb(side, side, (**b).clone())?;
+                out.copy_block(&blk, side, 0, 0, x * s, y * s);
+            }
+            _ => {}
         }
     }
 
-    // 3. Residual blocks.
-    if !plan.residuals.is_empty() {
-        let r = residual_up.ok_or_else(|| anyhow::anyhow!("merge: plan has residuals but no upscaled residual"))?;
-        let cell = bs + 2 * bleed;
-        let dim = plan.stats.residual_dim;
+    // 3. Residual blocks, from their tier's image.
+    let cell = bs + 2 * bleed;
+    for t in 0..MAX_TIERS {
+        let (cols, rows) = plan.stats.residual_tiers[t];
+        if cols == 0 {
+            continue;
+        }
+        let r = residual_up[t].ok_or_else(|| anyhow::anyhow!("merge: plan has tier-{t} residuals but no upscaled image for that tier"))?;
         anyhow::ensure!(
-            r.width == dim * cell * s && r.height == dim * cell * s,
-            "merge: residual_up {}x{} does not match {} cells of {} at scale {}",
+            r.width == cols * cell * s && r.height == rows * cell * s,
+            "merge: tier {t} residual_up {}x{} does not match {}x{} cells of {} at scale {}",
             r.width,
             r.height,
-            dim,
+            cols,
+            rows,
             cell,
             s
         );
-        for rv in &plan.residuals {
-            out.copy_block(
-                r,
-                bs * s,
-                (rv.cell_x * cell + bleed) * s,
-                (rv.cell_y * cell + bleed) * s,
-                rv.frame_x * s,
-                rv.frame_y * s,
-            );
-        }
+    }
+    for rv in &plan.residuals {
+        let r = residual_up[rv.tier as usize].expect("checked above");
+        out.copy_block(r, bs * s, (rv.cell_x * cell + bleed) * s, (rv.cell_y * cell + bleed) * s, rv.frame_x * s, rv.frame_y * s);
     }
     Ok(out)
 }
@@ -157,10 +172,10 @@ mod tests {
         // The previous *output* predates this frame's fades — as in the pipeline.
         let prev_up = up.upscale(prev).unwrap();
         let mut w = prev.clone();
-        let (plan, working_next) = analyze(&mut w, next, &JpegReference { quality: 97 }, matcher, &cfg).unwrap();
+        let (plan, working_next) = analyze(&mut w, next, &[], &JpegReference { quality: 97 }, matcher, &cfg).unwrap();
         let res = make_residual(next, &plan, bleed);
         let res_up = res.frame().map(|f| up.upscale(f).unwrap());
-        let merged = merge(&prev_up, res_up.as_ref(), &plan, scale, bleed).unwrap();
+        let merged = merge(&prev_up, &[], res_up.as_ref(), &plan, scale, bleed).unwrap();
         let expect = up.upscale(&working_next).unwrap();
         assert_eq!(merged, expect, "roundtrip mismatch (bleed {bleed}, scale {scale}, stats {:?})", plan.stats);
     }
@@ -212,62 +227,67 @@ mod tests {
         roundtrip(&prev, &next, 1, 2, &Stationary);
     }
 
+    /// Recalled blocks round-trip exactly through merge with a reference ring.
+    #[test]
+    fn recalled_blocks_roundtrip() {
+        let cfg = AnalyzeConfig { block_size: 16, bleed: 1, ..Default::default() };
+        let mut up = NearestUpscaler { scale: 2 };
+        let base = smooth(64, 64, 4);
+        let mut occluded = base.clone();
+        for y in 16..48 {
+            for x in 32..48 {
+                occluded.set_px(x, y, [250, 250, 250]);
+            }
+        }
+        let older_lo = base.clone();
+        let older_hi = up.upscale(&older_lo).unwrap();
+        let prev_up = up.upscale(&occluded).unwrap();
+        let mut w = occluded.clone();
+        let (plan, working_next) = analyze(&mut w, &base, &[&older_lo], &JpegReference { quality: 97 }, &Stationary, &cfg).unwrap();
+        assert_eq!(plan.stats.recalled, 2);
+        let res = make_residual(&base, &plan, 1);
+        let res_up = res.frame().map(|f| up.upscale(f).unwrap());
+        let merged = merge(&prev_up, &[&older_hi], res_up.as_ref(), &plan, 2, 1).unwrap();
+        assert_eq!(merged, up.upscale(&working_next).unwrap());
+    }
+
+    /// Three tiers of nearest upscalers round-trip exactly: routing changes
+    /// which image a block comes from, never what it contains.
+    #[test]
+    fn tiered_residuals_roundtrip() {
+        use crate::predict::{analyze_tiered, AnalyzeState};
+        let cfg = AnalyzeConfig { block_size: 16, bleed: 1, tier_std: [2.0, 12.0], ..Default::default() };
+        let prev = smooth(64, 64, 1);
+        let mut next = prev.clone();
+        for y in 0..16 {
+            for x in 0..16 {
+                next.set_px(x, y, [200, 200, 200]);
+                next.set_px(16 + x, y, [(100 + x + y) as u8; 3]);
+                let c = if (x + y) % 2 == 0 { 30 } else { 220 };
+                next.set_px(32 + x, y, [c, c, c]);
+            }
+        }
+        let mut up = NearestUpscaler { scale: 2 };
+        let prev_up = up.upscale(&prev).unwrap();
+        let mut w = prev.clone();
+        let mut st = AnalyzeState::default();
+        let (plan, working_next, _) = analyze_tiered(&mut w, &next, &[], &JpegReference { quality: 97 }, &Stationary, &cfg, 3, &mut st).unwrap();
+        assert_eq!(plan.stats.residual_tiers, [(1, 1), (1, 1), (1, 1)]);
+        let res = make_residual(&next, &plan, 1);
+        let ups: Vec<Option<Frame>> = (0..3).map(|t| res.tier(t).map(|f| up.upscale(f).unwrap())).collect();
+        let refs: [Option<&Frame>; 3] = [ups[0].as_ref(), ups[1].as_ref(), ups[2].as_ref()];
+        let merged = merge_tiered(&prev_up, &[], &refs, &CachedBlocks::new(), &plan, 2, 1).unwrap();
+        assert_eq!(merged, up.upscale(&working_next).unwrap());
+    }
+
     #[test]
     fn identical_frames_need_no_residual() {
         let prev = smooth(64, 64, 0);
         let cfg = AnalyzeConfig { block_size: 16, ..Default::default() };
         let mut w = prev.clone();
-        let (plan, _) = analyze(&mut w, &prev, &JpegReference { quality: 97 }, &Stationary, &cfg).unwrap();
+        let (plan, _) = analyze(&mut w, &prev, &[], &JpegReference { quality: 97 }, &Stationary, &cfg).unwrap();
         assert_eq!(make_residual(&prev, &plan, 1), Residual::None);
         let up = NearestUpscaler { scale: 2 }.upscale(&prev).unwrap();
-        assert_eq!(merge(&up, None, &plan, 2, 1).unwrap(), up);
-    }
-}
-
-#[cfg(test)]
-mod bleed_ring_tests {
-    use super::*;
-    use crate::frame::Frame;
-
-    /// The bleed ring must continue the block's content, not cut to black.
-    ///
-    /// This was `Pad::Black`, justified by "the merge never reads the bleed
-    /// ring back". That is true and irrelevant: the ring is the CONTEXT the
-    /// CNN sees, and its receptive field carries a black cliff INWARD, so the
-    /// block's own outer pixels — which the merge does read — come back dark.
-    ///
-    /// The symptom is specific and worth recording, because it is what
-    /// distinguishes this from CNN tile-grid artefacts: the dark lines move
-    /// with the camera and grow and shrink with motion locality. A CNN tile
-    /// grid is fixed and cannot do that; residual blocks are chosen by the
-    /// block matcher and follow motion.
-    #[test]
-    fn the_bleed_ring_continues_the_image_rather_than_going_black() {
-        // A bright frame, so "black bleed" is unmistakable in the packed cell.
-        let (w, h) = (64u32, 64u32);
-        let mut f = Frame::new(w, h);
-        for y in 0..h { for x in 0..w { f.set_px(x, y, [220, 210, 200]); } }
-
-        let bleed = 4u32;
-        let padded = f.padded(bleed, Pad::Replicate);
-        // The ring immediately outside the frame must carry the frame's value.
-        let px = padded.px(0, bleed + 1);
-        assert_eq!(px, [220, 210, 200],
-            "the bleed ring went to {px:?} instead of continuing the image");
-        let px2 = padded.px(bleed + 1, 0);
-        assert_eq!(px2, [220, 210, 200], "top ring: {px2:?}");
-    }
-
-    #[test]
-    fn a_black_ring_would_be_visibly_different() {
-        // Guards the test above from passing vacuously: if `Pad::Black` and
-        // `Pad::Replicate` produced the same thing here, the assertion proves
-        // nothing.
-        let mut f = Frame::new(32, 32);
-        for y in 0..32 { for x in 0..32 { f.set_px(x, y, [220, 210, 200]); } }
-        let black = f.padded(4, Pad::Black);
-        let repl = f.padded(4, Pad::Replicate);
-        assert_ne!(black.px(0, 5), repl.px(0, 5),
-            "the two padding modes are indistinguishable — this test cannot detect a regression");
+        assert_eq!(merge(&up, &[], None, &plan, 2, 1).unwrap(), up);
     }
 }

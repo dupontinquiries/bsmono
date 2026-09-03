@@ -6,14 +6,12 @@
 //! `dandere2x probe`                  adapters wgpu can see
 //! `dandere2x app`                    the egui shell (feature `app`)
 
-mod ffmpeg;
-mod job;
 #[cfg(feature = "app")]
 mod app;
 
 use clap::{Parser, Subcommand};
 use d2x_core::pipeline::{Event, MatcherKind};
-use job::{Backend, Job};
+use d2x_job::job::{self, Backend, Job};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -45,24 +43,7 @@ struct Common {
     /// JPEG quality the reuse gate is measured against (higher = stricter = less reuse).
     #[arg(long, short = 'q', default_value_t = 97)]
     quality: u8,
-    /// Context ring around each residual block, in input pixels.
-    ///
-    /// This is what the CNN sees AROUND a block it is re-upscaling. Upstream's
-    /// 1 was tuned for waifu2x, whose receptive field is a handful of pixels;
-    /// Real-ESRGAN's RRDB body sees hundreds, so one pixel of context is
-    /// effectively none and the block's own edges come back wrong.
-    ///
-    /// That is the flicker: a seam is DRAWN where a block was re-upscaled and
-    /// ABSENT where the frame was copied from the previous one, so fixed grid
-    /// lines blink on and off as the residual planner changes its mind frame to
-    /// frame. A purely spatial artefact would be steady; a purely motion-driven
-    /// one would slide. Blinking at fixed positions is what points at the
-    /// residual path rather than the CNN tile grid.
-    ///
-    /// 8 costs (block+2*8)^2 / block^2 per residual — at the default 30px block
-    /// that is ~2.4x the pixels through the network per block, which is real but
-    /// bounded, and only for blocks that actually changed.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 1)]
     bleed: u32,
     /// Uniform noise on inputs (upstream 8 for waifu2x; 0 for Real-ESRGAN).
     #[arg(long, default_value_t = 0)]
@@ -73,6 +54,43 @@ struct Common {
     /// Stop after N frames (settings trials).
     #[arg(long, default_value_t = 0)]
     frames: u64,
+    /// Recent outputs kept as extra references (occlusions, flicker). Default: from --ram-budget.
+    #[arg(long)]
+    refs: Option<usize>,
+    /// Shot-start outputs retained as references (cut-backs). Default: from --ram-budget.
+    #[arg(long)]
+    keyframe_refs: Option<usize>,
+    /// Host memory the job may hold (e.g. 96G). Default: half of MemAvailable.
+    #[arg(long)]
+    ram_budget: Option<String>,
+    /// GPU memory for activation sets (e.g. 8G). Default: a quarter of the RAM budget.
+    #[arg(long)]
+    vram_budget: Option<String>,
+    /// Content-keyed block cache size (e.g. 4G; 0 = off). Default: 20% of the RAM budget.
+    #[arg(long)]
+    block_cache: Option<String>,
+    /// Activation sets in flight per GPU upscaler (uploads/readbacks overlap compute).
+    #[arg(long, default_value_t = 2)]
+    inflight: usize,
+    /// Frames whose residuals share one GPU call.
+    #[arg(long, default_value_t = 4)]
+    batch: usize,
+    /// Difficulty cascade: smooth missing blocks go to a cheaper model. Give a
+    /// model path, or "default" for the vendored realesr-animevideov3.
+    #[arg(long)]
+    cascade: Option<String>,
+    /// Flat missing blocks (luma std below --flat-std) skip the network: bicubic.
+    #[arg(long)]
+    flat_bypass: bool,
+    /// Luma std-dev below which a block is "flat".
+    #[arg(long, default_value_t = 2.0)]
+    flat_std: f64,
+    /// Luma std-dev below which a block is "smooth" (cascade tier).
+    #[arg(long, default_value_t = 8.0)]
+    smooth_std: f64,
+    /// Gate hysteresis for long-reused blocks: threshold × (1 + bonus·min(streak,8)/8). 0 = off.
+    #[arg(long, default_value_t = 0.0)]
+    streak_bonus: f64,
 }
 
 #[derive(Subcommand)]
@@ -99,6 +117,12 @@ enum Cmd {
         /// Segment workers: cut on source keyframes, one shared GPU, N encoders, parts concatenated.
         #[arg(long, short = 'j', default_value_t = 1)]
         jobs: usize,
+        /// Start time in seconds (snaps to the previous keyframe).
+        #[arg(long, default_value_t = 0.0)]
+        start: f64,
+        /// End time in seconds.
+        #[arg(long)]
+        end: Option<f64>,
     },
     /// Stage A only: per-frame reuse statistics, no upscaling.
     Analyze {
@@ -141,7 +165,28 @@ fn job_from(common: &Common, input: PathBuf, output: PathBuf) -> anyhow::Result<
     j.pipeline.quality = common.quality;
     j.pipeline.noise = common.noise;
     j.pipeline.matcher = parse_matcher(&common.matcher)?;
+    j.refs_override = match (common.refs, common.keyframe_refs) {
+        (None, None) => None,
+        (r, k) => Some((r.unwrap_or(3), k.unwrap_or(4))),
+    };
+    j.ram_budget = common.ram_budget.as_deref().map(d2x_core::budget::parse_bytes).transpose()?;
+    j.vram_budget = common.vram_budget.as_deref().map(d2x_core::budget::parse_bytes).transpose()?;
+    j.block_cache_override = common.block_cache.as_deref().map(d2x_core::budget::parse_bytes).transpose()?;
+    j.inflight = common.inflight;
+    j.pipeline.batch = common.batch;
+    j.pipeline.queue_depth = common.batch.max(2) * 2;
+    j.pipeline.analyze.tier_std = [common.flat_std, common.smooth_std];
+    j.pipeline.analyze.streak_bonus = common.streak_bonus;
+    j.cascade_model = common.cascade.as_ref().map(|c| if c == "default" { None } else { Some(PathBuf::from(c)) });
+    j.flat_bypass = common.flat_bypass;
+    j.pipeline.tiers = 1 + j.cascade_model.is_some() as usize + j.flat_bypass as usize;
     Ok(j)
+}
+
+fn tiers_str(s: &d2x_core::plan::FrameStats) -> String {
+    let names = ["main", "cheap", "bicubic"];
+    let parts: Vec<String> = s.residual_tiers.iter().enumerate().filter(|(_, &(c, _))| c > 0).map(|(t, &(c, r))| format!("{}:{c}x{r}", names[t])).collect();
+    if parts.is_empty() { "-".into() } else { parts.join(" ") }
 }
 
 fn print_event(e: &Event) {
@@ -153,20 +198,21 @@ fn print_event(e: &Event) {
         Event::FrameDone { index, stats, analyze_time, upscale_time, merge_time } => {
             let kind = if stats.redraw { "REDRAW" } else { "" };
             eprintln!(
-                "frame {index:6}  psnr {:5.1}  stat {:4} mov {:4} miss {:4} fade {:3}  residual {}x{} {kind}  A {:5.1}ms U {:7.1}ms M {:5.1}ms",
+                "frame {index:6}  psnr {:5.1}  stat {:4} mov {:4} rec {:3} cache {:3} miss {:4} fade {:3}  residual {} {kind}  A {:5.1}ms U {:7.1}ms M {:5.1}ms",
                 stats.psnr,
                 stats.stationary,
                 stats.moved,
+                stats.recalled,
+                stats.cached,
                 stats.missing,
                 stats.fades,
-                stats.residual_dim,
-                stats.residual_dim,
+                tiers_str(stats),
                 analyze_time.as_secs_f64() * 1e3,
                 upscale_time.as_secs_f64() * 1e3,
                 merge_time.as_secs_f64() * 1e3
             );
         }
-        Event::Finished { frames, elapsed, upscaled_pixel_fraction } => {
+        Event::Finished { frames, elapsed, upscaled_pixel_fraction, .. } => {
             eprintln!("done: {frames} frames in {:.1}s ({:.2} fps); {:.1}% of pixels went through the network", elapsed.as_secs_f64(), *frames as f64 / elapsed.as_secs_f64().max(1e-9), upscaled_pixel_fraction * 100.0);
         }
     }
@@ -175,40 +221,27 @@ fn print_event(e: &Event) {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Upscale { input, output, common, codec, crf, preset, eight_bit, jobs } => {
+        Cmd::Upscale { input, output, common, codec, crf, preset, eight_bit, jobs, start, end } => {
             let mut job = job_from(&common, input, output)?;
             job.jobs = jobs;
+            job.start = start;
+            job.end = end;
             job.encode.codec = codec;
             job.encode.crf = crf;
             job.encode.preset = preset;
             job.encode.ten_bit = !eight_bit;
-            // PREFLIGHT BEFORE ANY WORK. The encoder is the last step of the
-            // pipeline, so a missing libsvtav1 surfaces after every frame has
-            // been through the CNN — the whole job wasted to learn something
-            // one `ffmpeg -encoders` call knows up front. Only the encoder
-            // actually selected is required; asking for AV1 support on an
-            // x264 run would be a refusal the operator cannot act on.
-            {
-                let want_enc: &[&str] = match job.encode.codec.as_str() {
-                    "av1" => &["libsvtav1"],
-                    "x265" => &["libx265"],
-                    _ => &["libx264"],
-                };
-                let pf = ffmpeg::preflight(want_enc, &[]);
-                if let Some(msg) = pf.problem() {
-                    anyhow::bail!("{msg}");
-                }
-            }
-            if job.jobs > 1 {
-                let s = job::run_segmented(&job, |seg, e| {
+            let s = job::run(&job, |e| match e {
+                job::Event::Stage(m) => eprintln!("… {m}"),
+                job::Event::Pipeline(e) => print_event(&e),
+                job::Event::Segment(seg, e) => {
                     if !matches!(e, Event::Finished { .. }) {
                         eprint!("[seg {seg}] ");
                         print_event(&e);
                     }
-                })?;
+                }
+            })?;
+            if job.jobs > 1 {
                 eprintln!("done: {} frames in {:.1}s ({:.2} fps); {:.1}% of pixels went through the network", s.frames, s.elapsed.as_secs_f64(), s.frames as f64 / s.elapsed.as_secs_f64().max(1e-9), s.upscaled_pixel_fraction * 100.0);
-            } else {
-                job::run(&job, |e| print_event(&e))?;
             }
         }
         Cmd::Analyze { input, common } => {
@@ -216,17 +249,17 @@ fn main() -> anyhow::Result<()> {
             let (source, _) = job::open_source(&job)?;
             let bleed = job.pipeline.analyze.bleed;
             let summary = d2x_core::pipeline::analyze_only(source, job.pipeline, |i, s, frac, t| {
-                eprintln!("frame {i:6}  psnr {:5.1}  stat {:4} mov {:4} miss {:4} fade {:3}  upscaled {:5.1}%{}  {:.1}ms", s.psnr, s.stationary, s.moved, s.missing, s.fades, frac * 100.0, if s.redraw { " REDRAW" } else { "" }, t.as_secs_f64() * 1e3);
+                eprintln!("frame {i:6}  psnr {:5.1}  stat {:4} mov {:4} rec {:3} miss {:4} fade {:3}  upscaled {:5.1}%{}  {:.1}ms", s.psnr, s.stationary, s.moved, s.recalled, s.missing, s.fades, frac * 100.0, if s.redraw { " REDRAW" } else { "" }, t.as_secs_f64() * 1e3);
             })?;
             let _ = bleed;
-            eprintln!("{} frames, {:.1}% of pixels would go through the network ({:.1}x fewer than full upscaling)", summary.frames, summary.upscaled_pixel_fraction * 100.0, 1.0 / summary.upscaled_pixel_fraction.max(1e-9));
+            eprintln!("{} frames: {:.1}% of pixels through the main network ({:.1}x fewer than full upscaling), {:.1}% through any network tier", summary.frames, summary.heavy_pixel_fraction * 100.0, 1.0 / summary.heavy_pixel_fraction.max(1e-9), summary.upscaled_pixel_fraction * 100.0);
         }
         Cmd::Selftest { model, tile } => {
             #[cfg(feature = "gpu")]
             {
                 let (net, path) = job::load_model(model.as_deref())?;
                 eprintln!("model: {} ({:.2} MMAC per input pixel, x{})", path.display(), net.macs_per_input_pixel() / 1e6, net.scale);
-                let r = d2x_wgpu::selftest(net, d2x_wgpu::GpuOptions { tile, require_hw: false, low_power: false })?;
+                let r = d2x_wgpu::selftest(net, d2x_wgpu::GpuOptions { tile, ..Default::default() })?;
                 println!("{r}");
                 if !r.pass {
                     std::process::exit(1);

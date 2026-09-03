@@ -376,6 +376,9 @@ pub struct CpuWaifu2x {
 }
 
 impl crate::upscale::Upscaler for CpuWaifu2x {
+    fn as_dyn(&mut self) -> &mut dyn crate::upscale::Upscaler {
+        self
+    }
     fn scale(&self) -> u32 {
         2
     }
@@ -445,20 +448,7 @@ mod tests {
 
     #[test]
     fn loads_real_model_if_present() {
-        // NOT VENDORED any more — 10.6 MB of JSON is the largest thing in the
-        // tree and the worst-shaped (text, poor compression, useless diffs).
-        // Put it in ~/models/upscale/ and this test runs; otherwise it skips,
-        // which is honest rather than a red test on every machine that has not
-        // downloaded a model.
-        let p = match std::env::var("HOME").ok().map(|h| {
-            std::path::PathBuf::from(h).join("models/upscale/upconv_7_art_scale2.0x_model.json")
-        }).filter(|p| p.is_file()) {
-            Some(p) => p,
-            None => {
-                eprintln!("skipping: upconv_7_art_scale2.0x_model.json not in ~/models/upscale");
-                return;
-            }
-        };
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/upconv_7_art_scale2.0x_model.json");
         if !p.exists() {
             eprintln!("skipping: {} not present", p.display());
             return;

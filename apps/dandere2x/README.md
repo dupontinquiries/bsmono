@@ -17,7 +17,13 @@ ffmpeg (libdav1d) ─▶ analysis (CPU) ─▶ residual ─▶ wgpu CNN ─▶ m
 |---|---|---|
 | `crates/d2x-core` | the engine, headless: gate, matchers, plan, residual/merge, the `Network` op-list model layer with CPU reference, the two-stage pipeline | image, rayon, serde |
 | `crates/d2x-wgpu` | `Network` on wgpu 29: conv3x3 / deconv / add / pack kernels, tile loop, selftest | wgpu, pollster |
-| `crates/dandere2x` | CLI + egui shell (`app` feature): ffmpeg I/O, AV1 sink, segment parallelism | clap, eframe, uikit-egui |
+| `crates/d2x-job` | the job as a library: ffmpeg I/O, AV1 sink, backends, keyframe-aligned segment parallelism, clip ranges, cancel, stage events | image, serde_json |
+| `crates/dandere2x` | CLI + egui shell (`app` feature) over `d2x-job` | clap, eframe, uikit-egui |
+
+Studio (`apps/studio`) uses `d2x-job` directly: "upscale clip" bounces the
+selected clip's range in the background and lands a new source + clip beside
+the original (autotune's print-side pattern; dandere2x is sequential, so it
+cannot be a chain effect).
 
 Every layer above the engine only sees the traits `FrameSource`, `FrameSink`,
 `Upscaler`. The GPU is one `Upscaler`; the CPU reference is another; tests
@@ -50,6 +56,8 @@ dandere2x selftest --model RealESRGAN_x2.safetensors   # GPU vs CPU, byte-exact
 dandere2x analyze  -i in.mkv                       # what block reuse buys, per frame, no CNN
 dandere2x upscale  -i in.mkv -o out.mkv --model RealESRGAN_x2.safetensors
 dandere2x upscale  -i in.mkv -o out.mkv -j 4      # keyframe-aligned segments, one shared GPU, 4 encoders
+dandere2x upscale  -i in.mkv -o out.mkv --model RealESRGAN_x2.safetensors --cascade default --flat-bypass
+dandere2x upscale  -i in.mkv -o clip.mkv --start 61.5 --end 90   # a range (audio trimmed + re-encoded, opus)
 dandere2x app                                      # the shell
 ```
 
@@ -65,6 +73,10 @@ libsvtav1; ≥ 7 gets the exact list). Colour tags are carried from the source;
 untagged sources are converted and tagged BT.709/tv. Audio, subtitles and
 metadata are remuxed from the source.
 
+Before frame 0 a long input costs a probe, a keyframe scan (packet headers
+only, cached in `<input>.<ext>.d2xkf`), the model load, GPU init and one
+full-frame upscale; each is reported as a stage so the shell is never silent.
+
 ## Numbers and where the time goes
 
 - The engine is 8-bit RGB. 10-bit sources are dithered to 8 on decode; the
@@ -78,6 +90,31 @@ metadata are remuxed from the source.
 - Tile overlap for same-pad nets is counted in *feature* pixels: x2 RRDB
   pixel-unshuffles, so 16 input px of overlap is 8. Big tiles (default 400)
   keep seams around 1 LSB.
+
+## CPU hot paths
+
+Checked in the post-LTO binary (`objdump`), not the pre-LTO `.s` — thin LTO
+inlines `block_sse` into its callers, and there it vectorises (`pmaddwd` on
+SSE2, `smull`/`sabd` on NEON). What did not vectorise were the per-pixel
+index-arithmetic loops around the GPU; those are now row-wise with narrow
+integer reductions. `cargo test --release -p d2x-core --test bench_hot --
+--ignored --nocapture` prints per-call timings; on one SSE2 core:
+
+| path | before | after |
+|---|---|---|
+| `padded_to` replicate, 1080p +16 | 4.4 ms | 1.6 ms |
+| `add_uniform_noise`, 1080p | 13.7 ms | 3.2 ms |
+| `extract_input`, 400-tile (u=1 / u=2) | 1.1 / 1.3 ms | 0.25 / 0.63 ms |
+| `write_output_rgba8`, 400-tile ×4 | 2.0 ms | 1.6 ms |
+| `block_sse` ×2304, `hash_cell` ×2304 | ~2 ms | unchanged (already packed) |
+
+The JPEG gate now encodes the frame in 16-row-aligned strips across the
+rayon pool; JPEG blocks reconstruct independently, so the threshold map is
+bit-identical to the single-strip result (tested at 2/3/5/8 threads) and
+the largest single stage-A cost scales with cores. No `target-cpu` flags:
+NEON is baseline on aarch64, and fleet-wide `fullfp16` is the SIGILL the
+lessons doc warns about; on x86 hosts `RUSTFLAGS=-C target-cpu=native` is
+a per-machine choice that roughly doubles the SSE paths.
 
 ## Asahi / Honeykrisp
 
@@ -99,6 +136,84 @@ refuses them). `mesa-vulkan-drivers` from the asahi COPR; `vulkaninfo
   `-j 2/3`, output frame counts and keyframe cadence checked.
 - Not verified: anything on Honeykrisp / M-series; the egui shell has only
   been compiled and linked, not run (no display here).
+
+## Throughput notes (multi-hour footage)
+
+What is built:
+
+- **Reference ring.** Missing blocks are checked at the same position in the
+  last `--refs` outputs and the last `--keyframe-refs` shot starts before
+  going to the network; a hit is a copy (`rec` in the per-frame line).
+  Occlusions, flicker, and cut-backs stop costing CNN time. One bounded SSE
+  per reference per missing block, so a deep ring is nearly free in CPU and
+  ~25 MB per reference at 4K in memory.
+- **Rectangular residual packing** (`cols = ceil(sqrt(n))`): wastes at most
+  `cols − 1` cells instead of up to `2·sqrt(n)`.
+- **Cross-frame residual batching** (`--batch`, and across `-j` segments via
+  the GPU server): small residuals are packed into one canvas per call. A
+  residual of a few cells is a handful of workgroups; below ~150 px on a side
+  the device is underoccupied and per-dispatch overhead (RRDB is ~400
+  dispatches per tile) dominates. Above that the network already fills the
+  GPU, so only clearly small items (< canvas²/8) are packed — the replicate
+  gutter costs 17–46 % extra pixels and only pays where the GPU is idle
+  anyway. On lavapipe this is a net loss (CPU rasterizer, pixel-
+  proportional); the gain exists only on a real GPU and is bounded by how
+  much time the job spends on tiny residuals.
+- **Keyframe-aligned segments** (`-j`): N encoders, one shared GPU, resumable
+  parts.
+- **Difficulty cascade** (`--cascade default|model.safetensors`,
+  `--flat-bypass`): missing blocks are classed by luma standard deviation.
+  Flat blocks (< `--flat-std`, default 2) get bicubic; smooth blocks
+  (< `--smooth-std`, default 8) get the compact network (~7× cheaper than
+  RRDB x2); only textured blocks pay for the main model. Each tier is its own
+  packed residual image and its own (batched) upscaler; `analyze` reports
+  the main-network share separately, which is what RRDB time follows. On the
+  synthetic partial-motion clip in `tools/` this cut the main-network share
+  from 50 % to 36 % of pixels; photo footage has a far larger smooth share.
+  Seams between tiers are possible on blocks near a threshold — raise
+  `--smooth-std` cautiously and look.
+- **Memory budgets** (`--ram-budget`, `--vram-budget`; default half of
+  `MemAvailable`, a quarter of that for the GPU — gpu-gemm's memplan
+  convention). The RAM budget sizes the reference rings (40 %, split across
+  `-j` workers: up to 32 recent, the rest shot starts up to 4096) and the
+  block cache (20 %), leaving headroom for decoder, encoder and queues.
+  `--refs/--keyframe-refs/--block-cache` override. With 192 GB that is a
+  ring spanning the whole film's shot starts, so any cut-back is a copy.
+- **Block cache** (`cache` column): a cell whose exact bytes (block + bleed
+  ring) were upscaled before — anywhere in the frame, any time in the job —
+  is served from memory: static overlays, letterbox, black, repeated UI,
+  animation cycles, a moving logo. Exact match only; FIFO under its byte
+  budget; shared across `-j` workers. Hits lag the pipeline depth (stage A
+  analyses ahead of stage B's inserts), so a repeat two frames later misses
+  and one twenty frames later hits. On photo footage the hit rate is
+  content-dependent; the column tells you what it is on yours.
+- **In-flight activation sets** (`--inflight N`, default 2): every GPU tier
+  holds N sets of buffers and rotates tiles through them, waiting on each
+  tile's own submission, so upload of tile k+1 and readback of tile k−1
+  overlap compute of tile k. The GPU budget is split across tiers by
+  per-pixel cost and across sets; tiles shrink to fit. All tiers share one
+  device. Bit-exact against the CPU reference with three sets over
+  five-tile frames on lavapipe; the overlap itself only shows on a real
+  GPU.
+- **Gate hysteresis** (`--streak-bonus b`, default 0 = off): a block reused
+  for `n` consecutive frames gets its threshold scaled by
+  `1 + b·min(n,8)/8`, so blocks that keep matching stop flickering out at
+  the threshold. Drift is bounded at that multiple of the JPEG error.
+
+What would move the big number (RRDB is ~9 TMAC per 1080p frame; the conv
+kernel is all of it):
+
+- **Winograd F(2×2, 3×3)**: 2.25× fewer multiplies for every 3×3 same-pad
+  conv, exact in f32. Transform-domain batched GEMM is a kernel the tree
+  already has form for (gpu-gemm).
+- **Register tiling**: the kernel does 36 vec4 FMAs per 52 loads per input
+  channel; 4×2 pixels × 8 channels roughly doubles FMA-per-load.
+- **f16 storage** (f32 math) halves activation bandwidth where the adapter
+  offers `SHADER_F16`.
+- **Gate**: the JPEG round trip could be replaced by a DCT-domain
+  quantisation-error estimate (same number by Parseval, ~10× cheaper,
+  library-independent) if analysis ever becomes the bottleneck under `-j`.
+- **Distillation** of a shallow net from the full RRDB on your own clips.
 
 ## Next
 

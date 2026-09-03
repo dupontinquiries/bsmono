@@ -20,7 +20,7 @@
 
 use anyhow::{anyhow, Context};
 use d2x_core::frame::Frame;
-use d2x_core::net::{tiles, tiles_overlapped, Blender, Act, Network, Op, Tensor, TileIo};
+use d2x_core::net::{tiles, Act, Network, Op, Tensor, TileIo};
 use d2x_core::upscale::Upscaler;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -32,17 +32,23 @@ pub const PACK_WGSL: &str = include_str!("../shaders/pack.wgsl");
 
 #[derive(Debug, Clone, Copy)]
 pub struct GpuOptions {
-    /// Requested tile side in input pixels. Clamped down if the adapter's
-    /// buffer limits can't hold the network's largest buffer for it.
+    /// Requested tile side in input pixels (0 = per-model default). Clamped
+    /// down to what the adapter's limits and `vram_budget` allow.
     pub tile: u32,
     /// Refuse a software adapter (llvmpipe, SwiftShader, …) instead of warning.
     pub require_hw: bool,
     pub low_power: bool,
+    /// Activation sets rotating in flight: tile k+1 uploads and tile k−1 reads
+    /// back while tile k computes. 1 = fully synchronous.
+    pub inflight: usize,
+    /// GPU-memory budget for this upscaler's activation sets (0 = adapter
+    /// limits only). On unified memory this is host RAM.
+    pub vram_budget: u64,
 }
 
 impl Default for GpuOptions {
     fn default() -> Self {
-        GpuOptions { tile: 0, require_hw: false, low_power: false }
+        GpuOptions { tile: 0, require_hw: false, low_power: false, inflight: 2, vram_budget: 0 }
     }
 }
 
@@ -123,11 +129,25 @@ pub fn max_buffer_bytes(net: &Network, t: u64) -> u64 {
     net.bufs.iter().map(|b| (b.channels.max(4) as u64) * (feat * b.level as u64).pow(2) * 4).max().unwrap_or(0)
 }
 
-/// Largest tile whose largest buffer fits the adapter's limits.
+/// Total bytes of one activation set (all buffers, output, staging) for a tile of side `t`.
+pub fn set_bytes(net: &Network, t: u64) -> u64 {
+    let region = t + 2 * net.pre_pad as u64 + net.unshuffle as u64;
+    let feat = region.div_ceil(net.unshuffle as u64);
+    let act: u64 = net.bufs.iter().map(|b| (b.channels.max(4) as u64) * (feat * b.level as u64).pow(2) * 4).sum();
+    let out = (region * net.scale as u64).pow(2) * 4;
+    act + 2 * out
+}
+
+/// Largest tile whose largest buffer fits the adapter's limits and whose
+/// whole set fits `set_budget` (0 = no budget).
 pub fn fit_tile(net: &Network, requested: u32, max_storage_binding: u64, max_buffer: u64) -> u32 {
+    fit_tile_budget(net, requested, max_storage_binding, max_buffer, 0)
+}
+
+pub fn fit_tile_budget(net: &Network, requested: u32, max_storage_binding: u64, max_buffer: u64, set_budget: u64) -> u32 {
     let cap = max_storage_binding.min(max_buffer);
     let mut t = requested.max(16);
-    while max_buffer_bytes(net, t as u64) > cap && t > 16 {
+    while t > 16 && (max_buffer_bytes(net, t as u64) > cap || (set_budget > 0 && set_bytes(net, t as u64) > set_budget)) {
         t -= 8;
     }
     t
@@ -200,51 +220,33 @@ enum Step {
     Add { dst: usize, ch: usize, scale: f32, params: wgpu::Buffer, bind: wgpu::BindGroup },
 }
 
-pub struct WgpuUpscaler {
-    /// Composite overlapping tiles with a feathered ramp instead of a hard
-    /// crop. Default on; `D2X_BLEND=0` or `set_blend(false)` restores the old
-    /// path. A field rather than an env read per frame so a caller — notably
-    /// the GPU/CPU parity test — can control it deterministically, without
-    /// process-wide env mutation racing other tests.
-    pub blend: bool,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    pub adapter: AdapterReport,
-    pub net: Arc<Network>,
-    pub tile: u32,
-    conv_pipeline: wgpu::ComputePipeline,
-    deconv_pipeline: wgpu::ComputePipeline,
-    add_pipeline: wgpu::ComputePipeline,
-    pack_pipeline: wgpu::ComputePipeline,
+/// Weight buffers of one op, shared by every activation set.
+enum OpWeights {
+    Conv { w: wgpu::Buffer, b: wgpu::Buffer, prelu: wgpu::Buffer },
+    Deconv { w: wgpu::Buffer, b: wgpu::Buffer },
+    None,
+}
+
+/// One set of activation buffers + bind groups + readback. Sets rotate so
+/// several tiles are in flight.
+struct ActSet {
     bufs: Vec<wgpu::Buffer>,
     steps: Vec<Step>,
     pack_params: wgpu::Buffer,
     pack_bind: wgpu::BindGroup,
     out: wgpu::Buffer,
     staging: wgpu::Buffer,
-    _weights: Vec<wgpu::Buffer>,
 }
 
-fn storage(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only }, has_dynamic_offset: false, min_binding_size: None },
-        count: None,
-    }
+/// Device + queue shared by every upscaler tier of a job.
+pub struct GpuContext {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub adapter: AdapterReport,
 }
 
-fn uniform(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-        count: None,
-    }
-}
-
-impl WgpuUpscaler {
-    pub fn new(net: Arc<Network>, opts: GpuOptions) -> anyhow::Result<Self> {
+impl GpuContext {
+    pub fn new(opts: &GpuOptions) -> anyhow::Result<Arc<GpuContext>> {
         // wgpu 29: `InstanceDescriptor::default()` is gone (display-handle
         // split); this constructor honours WGPU_BACKEND etc.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
@@ -277,11 +279,62 @@ impl WgpuUpscaler {
             trace: wgpu::Trace::Off,
         }))
         .context("request_device")?;
+        Ok(Arc::new(GpuContext { device, queue, adapter: rep }))
+    }
+}
 
+pub struct WgpuUpscaler {
+    ctx: Arc<GpuContext>,
+    pub net: Arc<Network>,
+    pub tile: u32,
+    pub inflight: usize,
+    conv_pipeline: wgpu::ComputePipeline,
+    deconv_pipeline: wgpu::ComputePipeline,
+    add_pipeline: wgpu::ComputePipeline,
+    pack_pipeline: wgpu::ComputePipeline,
+    sets: Vec<ActSet>,
+    _weights: Vec<OpWeights>,
+    /// Bytes of GPU memory held by the activation sets.
+    pub set_bytes_total: u64,
+}
+
+fn storage(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only }, has_dynamic_offset: false, min_binding_size: None },
+        count: None,
+    }
+}
+
+fn uniform(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+        count: None,
+    }
+}
+
+impl WgpuUpscaler {
+    pub fn new(net: Arc<Network>, opts: GpuOptions) -> anyhow::Result<Self> {
+        let ctx = GpuContext::new(&opts)?;
+        Self::with_context(ctx, net, opts)
+    }
+
+    pub fn adapter(&self) -> &AdapterReport {
+        &self.ctx.adapter
+    }
+
+    pub fn with_context(ctx: Arc<GpuContext>, net: Arc<Network>, opts: GpuOptions) -> anyhow::Result<Self> {
+        let device = &ctx.device;
+        let rep = &ctx.adapter;
+        let inflight = opts.inflight.clamp(1, 8);
         let requested = if opts.tile == 0 { default_tile(&net) } else { opts.tile };
-        let tile = fit_tile(&net, requested, rep.max_storage_binding, rep.max_buffer);
+        let per_set = if opts.vram_budget > 0 { opts.vram_budget / inflight as u64 } else { 0 };
+        let tile = fit_tile_budget(&net, requested, rep.max_storage_binding, rep.max_buffer, per_set);
         if tile != requested {
-            eprintln!("note: tile {requested} does not fit this adapter's buffer limits; using {tile}");
+            eprintln!("note: tile {requested} does not fit this adapter's limits / the VRAM budget with {inflight} sets in flight; using {tile}");
         }
         let region = tile as u64 + 2 * net.pre_pad as u64 + net.unshuffle as u64;
         let feat = region.div_ceil(net.unshuffle as u64);
@@ -311,36 +364,14 @@ impl WgpuUpscaler {
         let add_pipeline = pipeline("add_scaled", ADD_WGSL, &add_layout);
         let pack_pipeline = pipeline("pack", PACK_WGSL, &pack_layout);
 
-        // Activation buffers, one per BufId, sized for the largest tile.
-        let bufs: Vec<wgpu::Buffer> = net
-            .bufs
-            .iter()
-            .enumerate()
-            .map(|(i, b)| {
-                let side = feat * b.level as u64;
-                let bytes = (b.channels.max(4) as u64) * side * side * 4;
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some(&format!("buf{i}")),
-                    size: bytes.max(16),
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-                    mapped_at_creation: false,
-                })
-            })
-            .collect();
-        let dummy = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("dummy"), contents: &[0u8; 64], usage: wgpu::BufferUsages::STORAGE });
-        let out_bytes = out_side * out_side * 4;
-        let out = device.create_buffer(&wgpu::BufferDescriptor { label: Some("out"), size: out_bytes, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
-        let staging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("staging"), size: out_bytes, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-
-        let mut weights = Vec::new();
-        let mut steps = Vec::with_capacity(net.ops.len());
-        let uni = |label: &str, size: usize| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: size as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        // Weights once, in the kernels' layouts.
+        let mut weights: Vec<OpWeights> = Vec::with_capacity(net.ops.len());
         for (i, op) in net.ops.iter().enumerate() {
-            match op {
+            weights.push(match op {
                 Op::Conv(c) => {
                     anyhow::ensure!(c.dst_off % 4 == 0, "{}: dst_off {} not a multiple of 4", c.name, c.dst_off);
                     let oc4 = c.out_ch.div_ceil(4);
-                    let ocp = oc4 * 4; // padded out channels
+                    let ocp = oc4 * 4;
                     let mut w: Vec<f32> = Vec::with_capacity(oc4 * c.src_ch * 9 * 4);
                     for g in 0..oc4 {
                         for ic in 0..c.src_ch {
@@ -358,31 +389,11 @@ impl WgpuUpscaler {
                     if c.act == Act::PReLU {
                         pr[..c.out_ch].copy_from_slice(&c.prelu);
                     }
-                    let wbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(&c.name), contents: bytemuck::cast_slice(&w), usage: wgpu::BufferUsages::STORAGE });
-                    let bbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("bias"), contents: bytemuck::cast_slice(&b), usage: wgpu::BufferUsages::STORAGE });
-                    let pbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("prelu"), contents: bytemuck::cast_slice(&pr), usage: wgpu::BufferUsages::STORAGE });
-                    let params = uni("conv params", std::mem::size_of::<ConvParams>());
-                    let res: &wgpu::Buffer = match c.residual {
-                        Some((rb, _)) => &bufs[rb],
-                        None => &dummy,
-                    };
-                    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some(&c.name),
-                        layout: &conv_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: bufs[c.src].as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 2, resource: wbuf.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 3, resource: bbuf.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 4, resource: bufs[c.dst].as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 5, resource: pbuf.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 6, resource: res.as_entire_binding() },
-                        ],
-                    });
-                    weights.push(wbuf);
-                    weights.push(bbuf);
-                    weights.push(pbuf);
-                    steps.push(Step::Conv { op: i, params, bind });
+                    OpWeights::Conv {
+                        w: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(&c.name), contents: bytemuck::cast_slice(&w), usage: wgpu::BufferUsages::STORAGE }),
+                        b: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("bias"), contents: bytemuck::cast_slice(&b), usage: wgpu::BufferUsages::STORAGE }),
+                        prelu: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("prelu"), contents: bytemuck::cast_slice(&pr), usage: wgpu::BufferUsages::STORAGE }),
+                    }
                 }
                 Op::Deconv(d) => {
                     anyhow::ensure!(d.out_ch == 3, "deconv out_ch {}", d.out_ch);
@@ -395,68 +406,122 @@ impl WgpuUpscaler {
                             w.push(0.0);
                         }
                     }
-                    let wbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("dw"), contents: bytemuck::cast_slice(&w), usage: wgpu::BufferUsages::STORAGE });
-                    let bbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("db"), contents: bytemuck::cast_slice(&[d.bias[0], d.bias[1], d.bias[2], 0.0f32]), usage: wgpu::BufferUsages::UNIFORM });
-                    let params = uni("deconv params", std::mem::size_of::<DeconvParams>());
-                    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("deconv"),
-                        layout: &deconv_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: bufs[d.src].as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 2, resource: wbuf.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 3, resource: bbuf.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 4, resource: bufs[d.dst].as_entire_binding() },
-                        ],
-                    });
-                    weights.push(wbuf);
-                    weights.push(bbuf);
-                    steps.push(Step::Deconv { op: i, params, bind });
+                    OpWeights::Deconv {
+                        w: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("dw"), contents: bytemuck::cast_slice(&w), usage: wgpu::BufferUsages::STORAGE }),
+                        b: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("db"), contents: bytemuck::cast_slice(&[d.bias[0], d.bias[1], d.bias[2], 0.0f32]), usage: wgpu::BufferUsages::UNIFORM }),
+                    }
                 }
-                Op::Copy { src, dst, dst_off, ch } => steps.push(Step::Copy { src: *src, dst: *dst, dst_off: *dst_off, ch: *ch }),
-                Op::AddScaled { dst, src, ch, scale } => {
-                    let params = uni("add params", std::mem::size_of::<AddParams>());
-                    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("add"),
-                        layout: &add_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: bufs[*dst].as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 2, resource: bufs[*src].as_entire_binding() },
-                        ],
-                    });
-                    steps.push(Step::Add { dst: *dst, ch: *ch, scale: *scale, params, bind });
+                _ => {
+                    let _ = i;
+                    OpWeights::None
+                }
+            });
+        }
+        let dummy = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("dummy"), contents: &[0u8; 64], usage: wgpu::BufferUsages::STORAGE });
+        let uni = |label: &str, size: usize| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: size as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+
+        // Activation sets.
+        let mut sets = Vec::with_capacity(inflight);
+        for si in 0..inflight {
+            let bufs: Vec<wgpu::Buffer> = net
+                .bufs
+                .iter()
+                .enumerate()
+                .map(|(i, b)| {
+                    let side = feat * b.level as u64;
+                    let bytes = (b.channels.max(4) as u64) * side * side * 4;
+                    device.create_buffer(&wgpu::BufferDescriptor { label: Some(&format!("s{si}b{i}")), size: bytes.max(16), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false })
+                })
+                .collect();
+            let out_bytes = out_side * out_side * 4;
+            let out = device.create_buffer(&wgpu::BufferDescriptor { label: Some("out"), size: out_bytes, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+            let staging = device.create_buffer(&wgpu::BufferDescriptor { label: Some("staging"), size: out_bytes, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            let mut steps = Vec::with_capacity(net.ops.len());
+            for (i, op) in net.ops.iter().enumerate() {
+                match (op, &weights[i]) {
+                    (Op::Conv(c), OpWeights::Conv { w, b, prelu }) => {
+                        let params = uni("conv params", std::mem::size_of::<ConvParams>());
+                        let res: &wgpu::Buffer = match c.residual {
+                            Some((rb, _)) => &bufs[rb],
+                            None => &dummy,
+                        };
+                        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some(&c.name),
+                            layout: &conv_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 1, resource: bufs[c.src].as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 2, resource: w.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 3, resource: b.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 4, resource: bufs[c.dst].as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 5, resource: prelu.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 6, resource: res.as_entire_binding() },
+                            ],
+                        });
+                        steps.push(Step::Conv { op: i, params, bind });
+                    }
+                    (Op::Deconv(d), OpWeights::Deconv { w, b }) => {
+                        let params = uni("deconv params", std::mem::size_of::<DeconvParams>());
+                        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("deconv"),
+                            layout: &deconv_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 1, resource: bufs[d.src].as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 2, resource: w.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 3, resource: b.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 4, resource: bufs[d.dst].as_entire_binding() },
+                            ],
+                        });
+                        steps.push(Step::Deconv { op: i, params, bind });
+                    }
+                    (Op::Copy { src, dst, dst_off, ch }, _) => steps.push(Step::Copy { src: *src, dst: *dst, dst_off: *dst_off, ch: *ch }),
+                    (Op::AddScaled { dst, src, ch, scale }, _) => {
+                        let params = uni("add params", std::mem::size_of::<AddParams>());
+                        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("add"),
+                            layout: &add_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 1, resource: bufs[*dst].as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 2, resource: bufs[*src].as_entire_binding() },
+                            ],
+                        });
+                        steps.push(Step::Add { dst: *dst, ch: *ch, scale: *scale, params, bind });
+                    }
+                    _ => anyhow::bail!("op {i}: weights/op mismatch"),
                 }
             }
+            let pack_params = uni("pack params", std::mem::size_of::<PackParams>());
+            let pack_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("pack"),
+                layout: &pack_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: pack_params.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: bufs[net.output].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: bufs[net.input].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
+                ],
+            });
+            sets.push(ActSet { bufs, steps, pack_params, pack_bind, out, staging });
         }
-        let pack_params = uni("pack params", std::mem::size_of::<PackParams>());
-        let pack_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("pack"),
-            layout: &pack_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: pack_params.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: bufs[net.output].as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: bufs[net.input].as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
-            ],
-        });
-
-        Ok(WgpuUpscaler { device, queue, adapter: rep, net, tile, blend: std::env::var("D2X_BLEND").map(|v| v.trim() != "0").unwrap_or(true), conv_pipeline, deconv_pipeline, add_pipeline, pack_pipeline, bufs, steps, pack_params, pack_bind, out, staging, _weights: weights })
+        let set_bytes_total = set_bytes(&net, tile as u64) * inflight as u64;
+        Ok(WgpuUpscaler { ctx, net, tile, inflight, conv_pipeline, deconv_pipeline, add_pipeline, pack_pipeline, sets, _weights: weights, set_bytes_total })
     }
 
-    /// Run the network on one tile's input tensor; returns packed RGBA8 for
-    /// the full output region (`scale × region`).
-    pub fn run_tile(&mut self, input: &Tensor) -> anyhow::Result<Vec<u8>> {
-        let net = self.net.clone();
+    /// Encode and submit one tile on activation set `si`; returns the
+    /// submission to wait for and the packed output byte count.
+    fn submit_tile(&self, si: usize, input: &Tensor) -> anyhow::Result<(wgpu::SubmissionIndex, u64)> {
+        let net = &self.net;
+        let set = &self.sets[si];
+        let (device, queue) = (&self.ctx.device, &self.ctx.queue);
         anyhow::ensure!(input.c == net.bufs[net.input].channels, "input channels");
-        self.queue.write_buffer(&self.bufs[net.input], 0, bytemuck::cast_slice(&input.data));
+        queue.write_buffer(&set.bufs[net.input], 0, bytemuck::cast_slice(&input.data));
 
-        // Walk the op list computing each buffer's current spatial size, exactly
-        // as the CPU executor does, and encode.
         let mut dims: Vec<Option<(u32, u32)>> = vec![None; net.bufs.len()];
         dims[net.input] = Some((input.h as u32, input.w as u32));
-        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tile") });
-        for step in &self.steps {
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tile") });
+        for step in &set.steps {
             match step {
                 Step::Conv { op, params, bind } => {
                     let Op::Conv(c) = &net.ops[*op] else { unreachable!() };
@@ -470,7 +535,7 @@ impl WgpuUpscaler {
                         Act::PReLU => (2, 0.0),
                     };
                     let (has_res, res_scale) = c.residual.map_or((0, 0.0), |(_, s)| (1, s));
-                    self.queue.write_buffer(params, 0, bytemuck::bytes_of(&ConvParams { in_w: iw, in_h: ih, in_ch: c.src_ch as u32, out_ch4: c.out_ch.div_ceil(4) as u32, out_w: ow, out_h: oh, in_scale: c.in_scale, pad: c.pad, dst_off: c.dst_off as u32, act, has_res, _p0: 0, slope, res_scale, _p1: 0.0, _p2: 0.0 }));
+                    queue.write_buffer(params, 0, bytemuck::bytes_of(&ConvParams { in_w: iw, in_h: ih, in_ch: c.src_ch as u32, out_ch4: c.out_ch.div_ceil(4) as u32, out_w: ow, out_h: oh, in_scale: c.in_scale, pad: c.pad, dst_off: c.dst_off as u32, act, has_res, _p0: 0, slope, res_scale, _p1: 0.0, _p2: 0.0 }));
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(&c.name), timestamp_writes: None });
                     pass.set_pipeline(&self.conv_pipeline);
                     pass.set_bind_group(0, bind, &[]);
@@ -481,7 +546,7 @@ impl WgpuUpscaler {
                     let (ih, iw) = dims[d.src].ok_or_else(|| anyhow!("deconv: unsized source"))?;
                     let (oh, ow) = (2 * ih - 4, 2 * iw - 4);
                     dims[d.dst] = Some((oh, ow));
-                    self.queue.write_buffer(params, 0, bytemuck::bytes_of(&DeconvParams { in_w: iw, in_h: ih, in_ch: d.in_ch as u32, out_w: ow, out_h: oh, _p0: 0, _p1: 0, _p2: 0 }));
+                    queue.write_buffer(params, 0, bytemuck::bytes_of(&DeconvParams { in_w: iw, in_h: ih, in_ch: d.in_ch as u32, out_w: ow, out_h: oh, _p0: 0, _p1: 0, _p2: 0 }));
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("deconv"), timestamp_writes: None });
                     pass.set_pipeline(&self.deconv_pipeline);
                     pass.set_bind_group(0, bind, &[]);
@@ -493,12 +558,12 @@ impl WgpuUpscaler {
                         dims[*dst] = Some((h, w));
                     }
                     let plane = (h as u64) * (w as u64) * 4;
-                    enc.copy_buffer_to_buffer(&self.bufs[*src], 0, &self.bufs[*dst], (*dst_off as u64) * plane, (*ch as u64) * plane);
+                    enc.copy_buffer_to_buffer(&set.bufs[*src], 0, &set.bufs[*dst], (*dst_off as u64) * plane, (*ch as u64) * plane);
                 }
                 Step::Add { dst, ch, scale, params, bind } => {
                     let (h, w) = dims[*dst].ok_or_else(|| anyhow!("add: unsized dst"))?;
                     let n = (*ch as u32) * h * w;
-                    self.queue.write_buffer(params, 0, bytemuck::bytes_of(&AddParams { n, _p0: 0, _p1: 0, _p2: 0, scale: *scale, _p3: 0.0, _p4: 0.0, _p5: 0.0 }));
+                    queue.write_buffer(params, 0, bytemuck::bytes_of(&AddParams { n, _p0: 0, _p1: 0, _p2: 0, scale: *scale, _p3: 0.0, _p4: 0.0, _p5: 0.0 }));
                     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("add"), timestamp_writes: None });
                     pass.set_pipeline(&self.add_pipeline);
                     pass.set_bind_group(0, bind, &[]);
@@ -508,86 +573,96 @@ impl WgpuUpscaler {
         }
         let (oh, ow) = dims[net.output].ok_or_else(|| anyhow!("output unsized"))?;
         let (fh, fw) = (oh * net.shuffle, ow * net.shuffle);
-        self.queue.write_buffer(&self.pack_params, 0, bytemuck::bytes_of(&PackParams { in_w: ow, in_h: oh, r: net.shuffle, s: net.scale, u: net.unshuffle, sk_w: input.w as u32, sk_h: input.h as u32, add_input: net.add_input as u32 }));
+        queue.write_buffer(&set.pack_params, 0, bytemuck::bytes_of(&PackParams { in_w: ow, in_h: oh, r: net.shuffle, s: net.scale, u: net.unshuffle, sk_w: input.w as u32, sk_h: input.h as u32, add_input: net.add_input as u32 }));
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("pack"), timestamp_writes: None });
             pass.set_pipeline(&self.pack_pipeline);
-            pass.set_bind_group(0, &self.pack_bind, &[]);
+            pass.set_bind_group(0, &set.pack_bind, &[]);
             pass.dispatch_workgroups(fw.div_ceil(16), fh.div_ceil(16), 1);
         }
         let out_bytes = (fw as u64) * (fh as u64) * 4;
-        enc.copy_buffer_to_buffer(&self.out, 0, &self.staging, 0, out_bytes);
-        self.queue.submit(Some(enc.finish()));
+        enc.copy_buffer_to_buffer(&set.out, 0, &set.staging, 0, out_bytes);
+        let idx = queue.submit(Some(enc.finish()));
+        Ok((idx, out_bytes))
+    }
 
-        let slice = self.staging.slice(..out_bytes);
+    /// Wait for a submitted tile and read its packed output.
+    fn finish_tile(&self, si: usize, idx: wgpu::SubmissionIndex, out_bytes: u64) -> anyhow::Result<Vec<u8>> {
+        let set = &self.sets[si];
+        let slice = set.staging.slice(..out_bytes);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        self.device.poll(wgpu::PollType::wait_indefinitely()).context("device poll")?;
-        rx.recv().context("map_async dropped")?.context("map_async")?;
+        // Wait for *this* submission only, so later tiles keep computing.
+        self.ctx.device.poll(wgpu::PollType::Wait { submission_index: Some(idx), timeout: None }).context("device poll")?;
+        let mapped = match rx.try_recv() {
+            Ok(r) => r,
+            Err(_) => {
+                // The map callback fires on a poll that observes the copy; make sure of it.
+                self.ctx.device.poll(wgpu::PollType::wait_indefinitely()).context("device poll")?;
+                rx.recv().context("map_async dropped")?
+            }
+        };
+        mapped.context("map_async")?;
         let bytes = slice.get_mapped_range().to_vec();
-        self.staging.unmap();
+        set.staging.unmap();
         Ok(bytes)
     }
 
+    /// Run the network on one tile's input tensor synchronously; returns
+    /// packed RGBA8 for the full output region (`scale × region`).
+    pub fn run_tile(&mut self, input: &Tensor) -> anyhow::Result<Vec<u8>> {
+        let (idx, n) = self.submit_tile(0, input)?;
+        self.finish_tile(0, idx, n)
+    }
+
+    /// Tiles rotate through the activation sets: with `inflight` sets, the
+    /// upload of tile k+1 and the readback of tile k−1 overlap the compute
+    /// of tile k.
     pub fn upscale_frame(&mut self, frame: &Frame) -> anyhow::Result<Frame> {
         let net = self.net.clone();
         let padded = net.pad_frame(frame);
-
-        // OVERLAP = pre_pad, and that choice is the point.
-        //
-        // Every tile already computes `pre_pad` pixels of context on each side
-        // and then throws them away at the crop. Stepping by `tile - pre_pad`
-        // and blending REUSES that work rather than adding any: the network
-        // runs on the same padded region it always did, and the only extra
-        // cost is the tiles the smaller step introduces.
-        //
-        // `D2X_BLEND=0` restores the hard crop, because this is the change
-        // that fixes a visual defect and the operator needs to be able to A/B
-        // it on their own footage — a fix you cannot turn off is a fix you
-        // cannot verify.
-        let blend = self.blend;
-        let (ow, oh) = (frame.width * net.scale, frame.height * net.scale);
-        if !blend {
-            let mut out = Frame::new(ow, oh);
-            for rect in tiles(frame.width, frame.height, self.tile) {
-                let io: TileIo = net.tile_io(rect);
-                let input = net.extract_input(&padded, io);
-                let rgba = self.run_tile(&input)?;
+        let mut out = Frame::new(frame.width * net.scale, frame.height * net.scale);
+        let mut pending: std::collections::VecDeque<(usize, wgpu::SubmissionIndex, TileIo, u64)> = std::collections::VecDeque::new();
+        for (k, rect) in tiles(frame.width, frame.height, self.tile).into_iter().enumerate() {
+            let si = k % self.inflight;
+            if pending.len() == self.inflight {
+                let (s, idx, io, n) = pending.pop_front().unwrap();
+                let rgba = self.finish_tile(s, idx, n)?;
                 net.write_output_rgba8(&mut out, io, &rgba);
             }
-            return Ok(out);
-        }
-
-        let overlap = net.pre_pad.min(self.tile.saturating_sub(1));
-        let mut b = Blender::new(ow, oh, overlap * net.scale);
-        for rect in tiles_overlapped(frame.width, frame.height, self.tile, overlap) {
             let io: TileIo = net.tile_io(rect);
             let input = net.extract_input(&padded, io);
-            let rgba = self.run_tile(&input)?;
-            // The packed tile is `region * scale` wide for same-pad nets, and
-            // the crop offset says where this tile's own pixels start inside
-            // it — so the blender is handed the cropped view, not the region.
-            let stride = if net.exact { rect.w * net.scale } else { io.region_w * net.scale };
-            let off = (io.crop_y * stride + io.crop_x) as usize * 4;
-            b.add(rect.x * net.scale, rect.y * net.scale,
-                  rect.w * net.scale, rect.h * net.scale, &rgba[off..], stride);
+            let (idx, n) = self.submit_tile(si, &input)?;
+            pending.push_back((si, idx, io, n));
         }
-        debug_assert_eq!(b.uncovered(), 0, "overlapped tiling left uncovered pixels");
-        Ok(b.finish())
+        while let Some((s, idx, io, n)) = pending.pop_front() {
+            let rgba = self.finish_tile(s, idx, n)?;
+            net.write_output_rgba8(&mut out, io, &rgba);
+        }
+        Ok(out)
     }
 }
 
 impl Upscaler for WgpuUpscaler {
+    fn as_dyn(&mut self) -> &mut dyn Upscaler {
+        self
+    }
     fn scale(&self) -> u32 {
         self.net.scale
+    }
+    /// Pack small inputs up to one tile: one tile is one dispatch's worth of
+    /// work, and a residual of a few cells on its own leaves most of the
+    /// device idle.
+    fn canvas(&self) -> u32 {
+        self.tile
     }
     fn upscale(&mut self, frame: &Frame) -> anyhow::Result<Frame> {
         self.upscale_frame(frame)
     }
     fn name(&self) -> String {
-        format!("wgpu [{}] x{} on {} tile {}", self.net.name, self.net.scale, self.adapter.name, self.tile)
+        format!("wgpu [{}] x{} on {} tile {} x{} in flight ({} MiB)", self.net.name, self.net.scale, self.ctx.adapter.name, self.tile, self.inflight, self.set_bytes_total >> 20)
     }
 }
 
@@ -616,15 +691,10 @@ impl std::fmt::Display for SelftestReport {
 /// edge patches, partial workgroups and the tile seam are all exercised.
 pub fn selftest(net: Arc<Network>, opts: GpuOptions) -> anyhow::Result<SelftestReport> {
     let tile = if opts.tile == 0 { 40 } else { opts.tile.min(64) };
-    let mut gpu = WgpuUpscaler::new(net.clone(), GpuOptions { tile, ..opts })?;
-    // KERNEL parity, not compositor parity. The CPU reference composites with a
-    // hard crop; the GPU path now blends overlapping tiles by default. Leaving
-    // blending on here compares two different tiling STRATEGIES and reports
-    // "kernels disagree" — it failed at 93.3% exact, worst delta 3, which is
-    // the blend working, not a kernel bug. Turn it off so this measures the one
-    // thing it is named for.
-    gpu.blend = false;
-    let (w, h) = (gpu.tile + 13, 37u32);
+    // Three sets in flight and a frame of five tiles, so set rotation and
+    // per-submission waits are exercised, not just the kernels.
+    let mut gpu = WgpuUpscaler::new(net.clone(), GpuOptions { tile, inflight: 3, ..opts })?;
+    let (w, h) = (gpu.tile * 2 + 13, gpu.tile + 5);
     let mut frame = Frame::new(w, h);
     for y in 0..h {
         for x in 0..w {
@@ -644,7 +714,7 @@ pub fn selftest(net: Arc<Network>, opts: GpuOptions) -> anyhow::Result<SelftestR
             exact += 1;
         }
     }
-    Ok(SelftestReport { adapter: gpu.adapter.clone(), network: net.name.clone(), frame_px: (w, h), compared: got.data.len(), exact, worst_abs_diff: worst, pass: worst <= 1 })
+    Ok(SelftestReport { adapter: gpu.adapter().clone(), network: net.name.clone(), frame_px: (w, h), compared: got.data.len(), exact, worst_abs_diff: worst, pass: worst <= 1 })
 }
 
 #[cfg(test)]

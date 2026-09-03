@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/d2x-core", "crates/d2x-wgpu", "crates/dandere2x"]
+members = ["crates/d2x-core", "crates/d2x-wgpu", "crates/d2x-job", "crates/dandere2x"]
 
 [workspace.package]
 version = "0.1.0"

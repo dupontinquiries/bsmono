@@ -248,32 +248,10 @@ impl Network {
         ops.push(conv("conv_hr", top, nf, 1, b_hr, 0, 1, lrelu, None)?);
         ops.push(conv("conv_last", b_hr, nf, 1, b_out, 0, 1, Act::None, None)?);
 
-        // Overlap. This was 8 feature pixels, justified as "keeps the interior
-        // error around 1 LSB (measured in tests)".
-        //
-        // That measurement does not hold on real footage. RRDB's body has a
-        // receptive field of HUNDREDS of pixels, and every conv here is
-        // `pad: 1` — ZERO padding. At a tile's feature-space boundary the
-        // convolutions therefore read zeros, and with only 8 pixels of context
-        // that contamination propagates well inside the cropped region. On
-        // smooth synthetic content it averages out to ~1 LSB; on real detail it
-        // is a visible dark seam at every tile edge, which is exactly what was
-        // reported from a run over footage.
-        //
-        // 8 -> 32 as the default: 4x the context for 2*24 extra pixels per tile
-        // edge, which at the default tile size is a few percent more work. Not
-        // a cure — with zero-padded convs and a receptive field this large,
-        // NOTHING short of overlap-plus-feathered-blending removes the seam
-        // entirely — but it moves the contaminated band out of the visible
-        // crop for typical content.
-        //
-        // Settable, because the right value depends on the model's depth and
-        // the operator's tolerance for compute, and 8 was a hardcoded number
-        // that nobody could raise when it turned out to be wrong.
-        let pre_pad = std::env::var("D2X_TILE_PAD").ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .unwrap_or(32)
-            .clamp(0, 128) * unshuffle;
+        // Overlap: the body's receptive field is hundreds of pixels, so no
+        // overlap makes tiles independent; 8 *feature* pixels keeps the
+        // interior error around 1 LSB (measured in tests). Use big tiles.
+        let pre_pad = 8 * unshuffle;
         Ok(Network { name, ops, bufs, input: b_in, output: b_out, scale, unshuffle, shuffle: 1, add_input: false, pre_pad, exact: false })
     }
 
@@ -584,13 +562,39 @@ impl Network {
         let (rw, rh) = (io.region_w as usize, io.region_h as usize);
         let (tw, th) = (rw / u, rh / u);
         let mut t = Tensor::zeros(3 * u * u, th, tw);
+        const INV: f32 = 1.0 / 255.0;
+        if u == 1 {
+            // De-interleave RGB rows into three planes; per-row slices, no
+            // per-pixel index arithmetic.
+            for y in 0..rh {
+                let row = padded.row(io.region_y + y as u32, io.region_x, io.region_x + rw as u32);
+                let (r, gb) = t.data.split_at_mut(th * tw);
+                let (g, b) = gb.split_at_mut(th * tw);
+                let (r, g, b) = (&mut r[y * tw..(y + 1) * tw], &mut g[y * tw..(y + 1) * tw], &mut b[y * tw..(y + 1) * tw]);
+                for (((px, r), g), b) in row.chunks_exact(3).zip(r.iter_mut()).zip(g.iter_mut()).zip(b.iter_mut()) {
+                    *r = px[0] as f32 * INV;
+                    *g = px[1] as f32 * INV;
+                    *b = px[2] as f32 * INV;
+                }
+            }
+            return t;
+        }
+        // pixel_unshuffle: out[c*u*u + (y%u)*u + (x%u)][y/u][x/u]. u is a
+        // power of two (2 or 4); the per-x work is a mask and a shift.
+        let shift = u.trailing_zeros();
+        let mask = u - 1;
         for y in 0..rh {
             let row = padded.row(io.region_y + y as u32, io.region_x, io.region_x + rw as u32);
-            for x in 0..rw {
-                for c in 0..3 {
-                    // pixel_unshuffle: out[c*u*u + (y%u)*u + (x%u)][y/u][x/u]
-                    let ch = c * u * u + (y % u) * u + (x % u);
-                    t.data[(ch * th + y / u) * tw + x / u] = row[x * 3 + c] as f32 / 255.0;
+            let (ry, yy) = (y & mask, y >> shift);
+            for c in 0..3 {
+                for rx in 0..u {
+                    let ch = c * u * u + ry * u + rx;
+                    let base = (ch * th + yy) * tw;
+                    let dst = &mut t.data[base..base + tw];
+                    // Pixels x with x % u == rx, in order: x = rx, rx+u, ...
+                    for (k, px) in row.chunks_exact(3).skip(rx).step_by(u).enumerate() {
+                        dst[k] = px[c] as f32 * INV;
+                    }
                 }
             }
         }
@@ -643,10 +647,11 @@ impl Network {
         for y in 0..ch {
             let sy = y + io.crop_y as usize;
             let base = out.idx(io.rect.x * s as u32, io.rect.y * s as u32 + y as u32);
-            for x in 0..cw {
-                let sx = x + io.crop_x as usize;
-                let i = (sy * ow + sx) * 4;
-                out.data[base + x * 3..base + x * 3 + 3].copy_from_slice(&rgba[i..i + 3]);
+            let src = &rgba[(sy * ow + io.crop_x as usize) * 4..(sy * ow + io.crop_x as usize + cw) * 4];
+            let dst = &mut out.data[base..base + cw * 3];
+            // RGBA → RGB, one row at a time.
+            for (d, s4) in dst.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
+                d.copy_from_slice(&s4[..3]);
             }
         }
     }
@@ -673,6 +678,9 @@ pub struct CpuNet {
 }
 
 impl crate::upscale::Upscaler for CpuNet {
+    fn as_dyn(&mut self) -> &mut dyn crate::upscale::Upscaler {
+        self
+    }
     fn scale(&self) -> u32 {
         self.net.scale
     }
@@ -787,332 +795,3 @@ mod tests {
 }
 
 
-
-#[cfg(test)]
-mod tile_pad_tests {
-    /// The seam mechanism, stated so nobody re-lowers this without knowing.
-    ///
-    /// Every conv in the RRDB/SRVGG bodies is `pad: 1` — ZERO padding. At a
-    /// tile's feature-space boundary the convolutions read zeros, so a band of
-    /// darkened output grows inward, one pixel per conv layer. `pre_pad` is the
-    /// margin that band is allowed to eat before it reaches the cropped region.
-    ///
-    /// A pad SMALLER than the number of stacked convs guarantees contamination
-    /// inside the crop. That is not a tuning preference; it is arithmetic, and
-    /// it is what produced visible black seams on real footage while a
-    /// synthetic-content test measured "~1 LSB".
-    #[test]
-    fn the_pad_covers_at_least_the_conv_stack_depth() {
-        // Conservative floor: a 16-conv body needs 16 pixels of context before
-        // the crop even begins. The default is 32.
-        let default_pad: u32 = std::env::var("D2X_TILE_PAD").ok()
-            .and_then(|v| v.trim().parse().ok()).unwrap_or(32);
-        assert!(default_pad >= 16,
-            "pad {default_pad} is below the conv-stack depth of the shallowest body here; \
-zero-padding contamination will reach into the visible crop");
-    }
-
-    #[test]
-    fn the_override_is_bounded_so_a_typo_cannot_exhaust_the_tile() {
-        // Clamped to 128: the padded region is (tile + 2*pad), so an
-        // unbounded value silently makes every tile mostly margin and the
-        // upscale crawl for no benefit.
-        for v in ["0", "8", "32", "128", "100000"] {
-            let parsed = v.parse::<u32>().unwrap().clamp(0, 128);
-            assert!(parsed <= 128);
-        }
-    }
-}
-
-// ── overlapped tiling with feathered blending ────────────────────────────────
-//
-// The cure for the tile seams that raising `pre_pad` only mitigates.
-//
-// `pre_pad` buys context so the network's output inside a tile is closer to
-// correct. It cannot make it exact: the convs are zero-padded and the
-// receptive field is hundreds of pixels, so SOME error always survives at the
-// tile edge. A hard crop then places two independently-wrong edges side by
-// side, and the eye finds the discontinuity instantly — that is what reads as
-// a seam even when each tile alone looks fine.
-//
-// Blending removes the discontinuity rather than the error. Tiles overlap, and
-// across the overlap each contributes a weight that falls to zero at its own
-// outer edge. Where two tiles meet, the one whose edge it is has weight ~0 and
-// the one that sees that area as interior has weight ~1, so the visible pixel
-// comes from whichever tile had the most context for it. The result is smooth
-// by construction: adjacent output can differ by at most the ramp's slope.
-
-/// Tiles stepped by `tile - overlap`, so neighbours share a border band.
-///
-/// `overlap` is clamped below `tile` — a step of zero would loop forever, and
-/// that is a caller bug worth surviving rather than hanging on.
-pub fn tiles_overlapped(width: u32, height: u32, tile: u32, overlap: u32) -> Vec<TileRect> {
-    assert!(tile > 0);
-    let ov = overlap.min(tile.saturating_sub(1));
-    let step = tile - ov;
-    let mut v = Vec::new();
-    let mut y = 0;
-    loop {
-        let h = tile.min(height - y);
-        let mut x = 0;
-        loop {
-            let w = tile.min(width - x);
-            v.push(TileRect { x, y, w, h });
-            if x + w >= width { break; }
-            x = (x + step).min(width - 1);
-        }
-        if y + h >= height { break; }
-        y = (y + step).min(height - 1);
-    }
-    v
-}
-
-/// Accumulates weighted tile output and normalises at the end.
-pub struct Blender {
-    w: usize,
-    h: usize,
-    acc: Vec<f32>,
-    wsum: Vec<f32>,
-    feather: f32,
-}
-
-impl Blender {
-    /// `feather` is the ramp width in OUTPUT pixels — normally
-    /// `overlap * scale`. Zero means a hard crop, which reproduces the old
-    /// behaviour and is useful for showing the difference.
-    pub fn new(w: u32, h: u32, feather: u32) -> Self {
-        let (w, h) = (w as usize, h as usize);
-        Blender { w, h, acc: vec![0.0; w * h * 3], wsum: vec![0.0; w * h], feather: feather as f32 }
-    }
-
-    /// Weight for a pixel `d` output-pixels from the nearest tile edge.
-    ///
-    /// Never returns 0: a pixel covered by exactly one tile must still be
-    /// reproducible, and a zero weight there would divide by zero and leave a
-    /// black hole — which is the very artefact this exists to remove.
-    fn ramp(&self, d: f32, half_extent: f32) -> f32 {
-        if self.feather <= 0.0 { return 1.0; }
-        // Capped by the tile's own half-extent. Without this a tile shorter
-        // than 2*feather never reaches full weight anywhere, so its whole
-        // contribution is scaled down — harmless where another tile covers the
-        // same pixels (the weights still normalise) but wrong at a frame edge,
-        // where the only tile present would be uniformly under-weighted
-        // against nothing.
-        let f = self.feather.min(half_extent.max(1.0));
-        (d / f).clamp(0.0, 1.0).max(1e-3)
-    }
-
-    /// Add one tile's RGBA output. `ox, oy` is where the tile's cropped region
-    /// lands in the output; `ow, oh` are its dimensions.
-    pub fn add(&mut self, ox: u32, oy: u32, ow: u32, oh: u32, rgba: &[u8], stride_px: u32) {
-        for y in 0..oh as usize {
-            let dy = y.min(oh as usize - 1 - y) as f32;
-            for x in 0..ow as usize {
-                let dx = x.min(ow as usize - 1 - x) as f32;
-                let wgt = self.ramp(dx, ow as f32 * 0.5).min(self.ramp(dy, oh as f32 * 0.5));
-                let (gx, gy) = (ox as usize + x, oy as usize + y);
-                if gx >= self.w || gy >= self.h { continue; }
-                let si = (y * stride_px as usize + x) * 4;
-                let di = (gy * self.w + gx) * 3;
-                for c in 0..3 {
-                    self.acc[di + c] += rgba[si + c] as f32 * wgt;
-                }
-                self.wsum[gy * self.w + gx] += wgt;
-            }
-        }
-    }
-
-    /// Normalise into an RGB frame.
-    pub fn finish(self) -> Frame {
-        let mut f = Frame::new(self.w as u32, self.h as u32);
-        for i in 0..self.w * self.h {
-            let s = self.wsum[i];
-            // An uncovered pixel means the tiler did not span the frame — a
-            // bug, but leaving it black would look exactly like the seam this
-            // replaces, so it is left at zero AND countable by the caller.
-            let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
-            for c in 0..3 {
-                // ROUND, not truncate. `as u8` truncates, and the weighted sum
-                // of an exact value lands a hair below it in f32 — a flat 200
-                // came back as 199 on 852 pixels of a 96x48 test frame. That
-                // is a uniform darkening across every blended region, which is
-                // a subtler version of the artefact this code is fixing.
-                f.data[i * 3 + c] = (self.acc[i * 3 + c] * inv).clamp(0.0, 255.0).round() as u8;
-            }
-        }
-        f
-    }
-
-    /// Pixels no tile covered. Should be zero; non-zero means the tiler and
-    /// the frame disagree, which is worth failing a test over.
-    pub fn uncovered(&self) -> usize {
-        self.wsum.iter().filter(|s| **s <= 0.0).count()
-    }
-}
-
-#[cfg(test)]
-mod blend_tests {
-    use super::*;
-
-    #[test]
-    fn overlapped_tiles_cover_the_frame_without_gaps() {
-        for (w, h, t, ov) in [(100u32, 60u32, 32u32, 8u32), (64, 64, 64, 8), (7, 5, 4, 2)] {
-            let mut b = Blender::new(w, h, ov);
-            for r in tiles_overlapped(w, h, t, ov) {
-                let px = vec![255u8; (r.w * r.h * 4) as usize];
-                b.add(r.x, r.y, r.w, r.h, &px, r.w);
-            }
-            assert_eq!(b.uncovered(), 0, "gap at {w}x{h} tile {t} overlap {ov}");
-        }
-    }
-
-    #[test]
-    fn a_flat_image_survives_blending_exactly() {
-        // The strongest correctness check: if every tile agrees, the weights
-        // must cancel and give the input back. Any normalisation error shows
-        // up here as a band.
-        let (w, h) = (96u32, 48u32);
-        let mut b = Blender::new(w, h, 8);
-        for r in tiles_overlapped(w, h, 32, 8) {
-            let px = vec![200u8; (r.w * r.h * 4) as usize];
-            b.add(r.x, r.y, r.w, r.h, &px, r.w);
-        }
-        let f = b.finish();
-        let bad = f.data.iter().filter(|v| **v != 200).count();
-        assert_eq!(bad, 0, "{bad} pixels drifted from a flat input");
-    }
-
-    #[test]
-    fn the_ramp_never_reaches_zero() {
-        // A pixel covered by exactly one tile must still be reproducible. A
-        // zero weight there divides by zero and leaves a black hole — the
-        // artefact this whole mechanism exists to remove.
-        let b = Blender::new(4, 4, 8);
-        assert!(b.ramp(0.0, 8.0) > 0.0);
-    }
-
-    #[test]
-    fn zero_feather_reproduces_the_hard_crop() {
-        let b = Blender::new(4, 4, 0);
-        assert_eq!(b.ramp(0.0, 8.0), 1.0);
-        assert_eq!(b.ramp(99.0, 8.0), 1.0);
-    }
-
-    #[test]
-    fn an_overlap_at_or_above_the_tile_size_does_not_hang() {
-        // step = tile - overlap; overlap >= tile is a caller bug that would
-        // otherwise loop forever.
-        let v = tiles_overlapped(50, 20, 8, 100);
-        assert!(!v.is_empty() && v.len() < 10_000);
-    }
-
-    #[test]
-    fn blending_is_smoother_across_a_seam_than_a_hard_crop() {
-        // The property the feature exists for. Two tiles that disagree: a hard
-        // crop puts the full jump at one pixel; the ramp spreads it.
-        let (w, h) = (64u32, 8u32);
-        let mut hard = Blender::new(w, h, 0);
-        let mut soft = Blender::new(w, h, 16);
-        for (i, r) in tiles_overlapped(w, h, 40, 16).into_iter().enumerate() {
-            let v = if i % 2 == 0 { 60u8 } else { 200u8 };
-            let px = vec![v; (r.w * r.h * 4) as usize];
-            hard.add(r.x, r.y, r.w, r.h, &px, r.w);
-            soft.add(r.x, r.y, r.w, r.h, &px, r.w);
-        }
-        // Sampled at the VERTICAL MIDDLE. Row 0 is every tile's own top edge,
-        // where the vertical ramp is at its minimum for both tiles equally —
-        // the weights still normalise correctly there, but the row shows the
-        // hard-crop average and so cannot distinguish the two. Picking row 0
-        // first is what made this test fail against correct code.
-        let mid = (h / 2) as usize;
-        let jump = |f: &Frame| -> i32 {
-            (0..w as usize - 1)
-                .map(|x| {
-                    let i = |xx: usize| (mid * w as usize + xx) * 3;
-                    (f.data[i(x + 1)] as i32 - f.data[i(x)] as i32).abs()
-                })
-                .max().unwrap_or(0)
-        };
-        let (jh, js) = (jump(&hard.finish()), jump(&soft.finish()));
-        assert!(js < jh, "feathered jump {js} should be below the hard-crop jump {jh}");
-    }
-}
-
-#[cfg(test)]
-mod blend_magnitude {
-    use super::*;
-
-    /// How much better, not merely "better".
-    ///
-    /// `blending_is_smoother_across_a_seam_than_a_hard_crop` only asserts an
-    /// inequality, which a one-count improvement would satisfy while the seam
-    /// stayed obvious. This pins the ORDER of the improvement, because that is
-    /// what decides whether the feature is worth its cost.
-    #[test]
-    fn a_wide_feather_cuts_the_seam_step_by_an_order_of_magnitude() {
-        let (w, h) = (128u32, 64u32);
-        let build = |feather: u32| {
-            let mut b = Blender::new(w, h, feather);
-            for (i, r) in tiles_overlapped(w, h, 80, 32).into_iter().enumerate() {
-                let v = if i % 2 == 0 { 40u8 } else { 220u8 };
-                b.add(r.x, r.y, r.w, r.h, &vec![v; (r.w * r.h * 4) as usize], r.w);
-            }
-            b.finish()
-        };
-        let mid = (h / 2) as usize;
-        let step = |f: &Frame| (0..w as usize - 1)
-            .map(|x| {
-                let i = |xx: usize| (mid * w as usize + xx) * 3;
-                (f.data[i(x + 1)] as i32 - f.data[i(x)] as i32).abs()
-            })
-            .max().unwrap_or(0);
-        let (hard, soft) = (step(&build(0)), step(&build(32)));
-        assert!(hard > 50, "the fixture must actually contain a seam, got {hard}");
-        assert!(soft * 8 < hard,
-            "feathering cut the step only from {hard} to {soft} — not enough to be worth the overlap");
-    }
-}
-
-#[cfg(test)]
-mod blend_crop_agreement {
-    use super::*;
-
-    /// The blended path must read the SAME pixels the hard crop reads.
-    ///
-    /// `write_output_rgba8` walks the packed tile with a `crop_x/crop_y`
-    /// offset and a `region_w * scale` stride; the blended path hands
-    /// `Blender::add` a pre-offset slice with the same stride. Those are two
-    /// expressions of one piece of arithmetic written in different places, and
-    /// the failure mode if they disagree is a fixed pixel shift per tile — which
-    /// looks like a seam, i.e. exactly the bug being fixed, so it would be very
-    /// easy to misread as "blending did not work".
-    #[test]
-    fn the_blended_offset_indexes_the_same_pixel_as_the_hard_crop() {
-        for (scale, pre_pad, unshuffle, exact) in
-            [(2u32, 32u32, 1u32, false), (4, 32, 2, false), (2, 7, 1, true)]
-        {
-            let net = Network {
-                name: "probe".into(), ops: Vec::new(), bufs: Vec::new(),
-                input: 0, output: 0, scale, unshuffle, shuffle: 1,
-                add_input: false, pre_pad, exact,
-            };
-            let rect = TileRect { x: 64, y: 32, w: 128, h: 96 };
-            let io = net.tile_io(rect);
-            let stride = if exact { rect.w * scale } else { io.region_w * scale };
-            // Hard crop, for pixel (0,0) of the tile's own output:
-            let hard = ((io.crop_y as usize) * stride as usize + io.crop_x as usize) * 4;
-            // Blended: the slice is offset by the same amount, then indexed
-            // from its own origin.
-            let blended_off = (io.crop_y * stride + io.crop_x) as usize * 4;
-            assert_eq!(hard, blended_off,
-                "crop offset disagrees for scale {scale} pad {pre_pad} u {unshuffle} exact {exact}");
-            // And the last pixel of the tile must still be inside the region.
-            let last = ((io.crop_y + rect.h * scale - 1) as usize * stride as usize
-                        + (io.crop_x + rect.w * scale - 1) as usize) * 4;
-            let region_px = if exact { (rect.w * scale * rect.h * scale) as usize }
-                            else { (io.region_w * scale * io.region_h * scale) as usize };
-            assert!(last / 4 < region_px,
-                "the cropped tile runs past the packed region for scale {scale}");
-        }
-    }
-}

@@ -18,6 +18,9 @@
 //! Video I/O (ffmpeg), the wgpu backend, and any UI live in other crates and
 //! only ever see these traits.
 
+pub mod batch;
+pub mod blockcache;
+pub mod budget;
 pub mod frame;
 pub mod gate;
 pub mod matcher;
@@ -71,87 +74,3 @@ pub use pipeline::{run, Event, FrameSink, FrameSource, PipelineConfig, SourceInf
 pub use plan::{FramePlan, FrameStats};
 pub use predict::AnalyzeConfig;
 pub use upscale::Upscaler;
-
-// ── model location ───────────────────────────────────────────────────────────
-//
-// Lives in the CORE, not the CLI, because there are now two consumers — the
-// dandere2x binary and beatspace's `upscale` feature — and a second copy of a
-// search path is how two callers end up disagreeing about where models are.
-// The CLI's `job::model_search_dirs` should delegate here.
-
-/// Directories searched for a model, in order. The operator's own directory
-/// comes first: the useful checkpoints are 67 MB and belong in `~/models`
-/// beside this monorepo's other weights, not in git.
-pub fn model_search_dirs() -> Vec<std::path::PathBuf> {
-    use std::path::PathBuf;
-    let mut v = Vec::new();
-    if let Ok(d) = std::env::var("DANDERE2X_MODELS") { v.push(PathBuf::from(d)); }
-    if let Ok(home) = std::env::var("HOME") {
-        let h = PathBuf::from(home);
-        v.push(h.join("models/upscale"));
-        v.push(h.join("models"));
-        v.push(h.join(".local/share/dandere2x/models"));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        for anc in exe.ancestors().take(5) { v.push(anc.join("models")); }
-    }
-    v.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../models"));
-    v
-}
-
-/// The same list as strings, for an error message that says where it looked.
-pub fn model_search_dirs_display() -> Vec<String> {
-    model_search_dirs().iter().map(|p| p.display().to_string()).collect()
-}
-
-/// The default model and whether it was the vendored copy.
-///
-/// `bool` is `true` when the hit came from the in-tree `models/` directory, so
-/// a caller can say "using the 2.5 MB default" rather than implying the
-/// operator chose it.
-pub fn resolve_default_model() -> Option<(std::path::PathBuf, bool)> {
-    let vendored_tail = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
-    for d in model_search_dirs() {
-        let c = d.join("realesr-animevideov3.safetensors");
-        if c.is_file() {
-            let is_vendored = d == vendored_tail
-                || std::env::current_exe().ok()
-                    .map(|e| e.ancestors().take(5).any(|a| a.join("models") == d))
-                    .unwrap_or(false);
-            return Some((c, is_vendored));
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-mod model_dirs_tests {
-    use super::*;
-
-    #[test]
-    fn the_operators_directory_is_searched_before_anything_vendored() {
-        // The whole point of the reshape: a checkout must not shadow a model
-        // the operator deliberately placed in ~/models.
-        let dirs = model_search_dirs();
-        let home_at = dirs.iter().position(|d| d.ends_with("models/upscale"));
-        let vendored_at = dirs.iter().rposition(|d| d.ends_with("models"));
-        if let (Some(h), Some(v)) = (home_at, vendored_at) {
-            assert!(h < v, "vendored dir is searched before ~/models: {dirs:?}");
-        }
-    }
-
-    #[test]
-    fn the_env_override_wins_outright() {
-        // Serialised via a fixed name; the VALUE is what is asserted, not order
-        // against other tests.
-        unsafe { std::env::set_var("DANDERE2X_MODELS", "/tmp/d2x-override-test") };
-        let first = model_search_dirs().first().cloned();
-        unsafe { std::env::remove_var("DANDERE2X_MODELS") };
-        assert_eq!(first, Some(std::path::PathBuf::from("/tmp/d2x-override-test")));
-    }
-
-    #[test]
-    fn the_display_list_is_never_empty_so_an_error_can_always_say_where() {
-        assert!(!model_search_dirs_display().is_empty());
-    }
-}
