@@ -53,7 +53,6 @@
 use ash::{vk, Device, Instance};
 use std::collections::VecDeque;
 use std::ffi::CStr;
-use std::path::Path;
 
 const ENTRY_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"main\0") };
 

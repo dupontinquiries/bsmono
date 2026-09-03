@@ -46,7 +46,6 @@
 
 use ash::{vk, Device, Instance};
 use std::ffi::CStr;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::render::context::VulkanContext;

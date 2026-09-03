@@ -42,7 +42,6 @@ use crate::world::chunk::ChunkCoord;
 use crate::world::surface::SurfaceRecord;
 use ash::{vk, Device};
 use std::ffi::CStr;
-use std::path::Path;
 use std::sync::Mutex;
 
 const ENTRY_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"main\0") };

@@ -21,7 +21,6 @@
 //!   ─aug→ linear(L2) → [m,3].
 
 use ash::{Device, Instance, vk};
-use std::path::Path;
 use std::sync::Mutex;
 
 const LINEAR_WG: u32 = 8; // linear_q8_0.comp: local_size 8x8
@@ -395,7 +394,7 @@ unsafe fn create_compute_pipeline(
     let candidates = crate::assets::shader_paths(&format!("{stem}.comp.spv"));
     let bytes = candidates
         .iter()
-        .find(|p| Path::new(p).exists())
+        .find(|p| p.exists())
         .map(std::fs::read)
         .transpose()?
         .ok_or_else(|| GemmError::ShaderMissing(candidates[0].display().to_string()))?;
