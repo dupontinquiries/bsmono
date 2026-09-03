@@ -304,6 +304,11 @@ mod tests {
         // pty_input::drain_egui both read this frame's events; if the
         // widget is not told the host owns encoding, every keystroke
         // reaches the shell twice and every Enter runs the command twice.
+        assert!(
+            src.contains("|| !host_encodes"),
+            "the raw key path is no longer gated on ownership — with no \
+             shell BOTH readers run and the local echo doubles."
+        );
         assert_eq!(
             src.matches("set_input_owner(").count(),
             1,

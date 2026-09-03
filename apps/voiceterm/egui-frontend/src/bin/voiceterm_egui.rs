@@ -3111,7 +3111,27 @@ impl eframe::App for VoicetermApp {
             // problem: a modal popup takes focus and the terminal item is
             // simply not delivered keys. (Esc is doubly safe here:
             // Modal::should_close CONSUMES it before this runs.)
-            let key_outs = if self.surfaces.captures_input() {
+            // ONE DECISION, BOTH CONSUMERS.
+            //
+            // Declared here rather than next to handle_input because BOTH
+            // readers need it and only one was gated: with no shell the
+            // widget owns input, but the raw path still ran, so local
+            // echo showed `lsls` — the same doubling as the PTY case,
+            // just via feed_pty instead of the shell. Gating one side of
+            // a two-reader problem fixes one of the two symptoms.
+            //
+            // Per frame, from whether a shell is actually in hand: a pane
+            // whose spawn failed, or whose shell exited, falls back to
+            // the widget's line editor, which is the only thing that
+            // makes typing visible there.
+            let input_owner = if self.pty.is_some() {
+                uikit_term::keys::InputOwner::Host
+            } else {
+                uikit_term::keys::InputOwner::Widget
+            };
+            self.app.set_input_owner(input_owner);
+            let host_encodes = input_owner == uikit_term::keys::InputOwner::Host;
+            let key_outs = if self.surfaces.captures_input() || !host_encodes {
                 Vec::new()
             } else {
                 // THE LIVE MODE, NOT THE DEFAULT.
@@ -3220,24 +3240,6 @@ impl eframe::App for VoicetermApp {
                 // the only signal that the line will not be audited.
                 ui.colored_label(self.colors.warning, "password prompt — input hidden, not recorded");
             }
-            // WHO ENCODES THE KEYS. `pty_input::drain_egui` above already
-            // read this frame's events and produced PTY bytes; if the
-            // widget also accumulates a line and encodes control keys,
-            // every keystroke reaches the shell TWICE — `ls` typed once
-            // and executed twice, Ctrl-C sending two SIGINTs, up-arrow
-            // skipping two history entries. uikit-term's own doc said "a
-            // host wires ONE of them"; this one wired both, and nothing
-            // caught it because each path is individually correct.
-            //
-            // Declared per frame rather than once at startup because the
-            // shell can go away: a pane whose spawn failed, or whose
-            // shell exited, falls back to the widget's line editor,
-            // which is the only thing that makes typing visible there.
-            self.app.set_input_owner(if self.pty.is_some() {
-                uikit_term::keys::InputOwner::Host
-            } else {
-                uikit_term::keys::InputOwner::Widget
-            });
             let submitted = if chorded { None } else { self.app.handle_input(ui) };
             let key_bytes = self.app.take_pending_bytes();
             self.session.pty_out.extend_from_slice(&key_bytes);

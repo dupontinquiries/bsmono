@@ -130,6 +130,16 @@ pub enum EventClass {
 /// so handing paste to the host would silently disable pasting into the
 /// terminal. Bracketing (DEC 2004) also needs the terminal's mode, which
 /// the widget has and a stateless encoder does not.
+/// Whether the HOST's raw key path should run this frame.
+///
+/// The mirror of `widget_handles`, and the half that was missing: gating
+/// only the widget fixed the doubling when a shell was attached and left
+/// it in place when one was not, where the same two readers doubled into
+/// the local echo instead. Two consumers, one decision.
+pub fn host_encodes(owner: InputOwner) -> bool {
+    matches!(owner, InputOwner::Host)
+}
+
 pub fn widget_handles(owner: InputOwner, class: EventClass) -> bool {
     match (owner, class) {
         (InputOwner::Widget, _) => true,
@@ -331,6 +341,22 @@ mod tests {
         // and these are what no host raw path covers
         assert!(widget_handles(InputOwner::Host, EventClass::Scrollback));
         assert!(widget_handles(InputOwner::Host, EventClass::WidgetChord));
+    }
+
+    #[test]
+    fn exactly_one_reader_encodes_in_either_mode() {
+        // the invariant both gates exist to hold: for every input class
+        // the host and the widget must never both claim it, and never
+        // both decline it
+        for owner in [InputOwner::Widget, InputOwner::Host] {
+            for class in [EventClass::Text, EventClass::LineEdit, EventClass::Encoded] {
+                assert_ne!(
+                    host_encodes(owner),
+                    widget_handles(owner, class),
+                    "{owner:?}/{class:?}: both or neither would encode"
+                );
+            }
+        }
     }
 
     #[test]
