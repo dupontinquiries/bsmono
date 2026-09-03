@@ -36,6 +36,10 @@ pub enum Ctl {
     Indent,
     Dedent,
     Stop,
+    /// Switch what the transform does to subsequent content. A comment
+    /// and the code under it are dictated in the same breath; without
+    /// this the speaker has to leave the session to change register.
+    SetMode(Mode),
 }
 
 impl Ctl {
@@ -49,6 +53,8 @@ impl Ctl {
             Ctl::Indent => "indent",
             Ctl::Dedent => "dedent",
             Ctl::Stop => "stop dictating",
+            Ctl::SetMode(Mode::Code) => "code mode",
+            Ctl::SetMode(Mode::Prose) => "prose mode",
         }
     }
 
@@ -72,6 +78,11 @@ impl Ctl {
             ("stop dictating", Ctl::Stop),
             ("stop dictation", Ctl::Stop),
             ("end dictation", Ctl::Stop),
+            ("code mode", Ctl::SetMode(Mode::Code)),
+            ("switch to code", Ctl::SetMode(Mode::Code)),
+            ("prose mode", Ctl::SetMode(Mode::Prose)),
+            ("text mode", Ctl::SetMode(Mode::Prose)),
+            ("switch to prose", Ctl::SetMode(Mode::Prose)),
         ]
     }
 
@@ -95,8 +106,17 @@ pub enum Piece {
 /// line" does. This is the ambiguity that makes dictation hard and it
 /// is not fully solvable by text alone; see `segment_strict`.
 pub fn segment(transcript: &str) -> Vec<Piece> {
-    let norm = normalize(transcript);
-    let words: Vec<&str> = norm.split_whitespace().collect();
+    // Match control phrases case-insensitively, but carry the ORIGINAL
+    // casing into Piece::Text. Lowercasing the content here was a real
+    // bug: whisper's capitalization is the only signal distinguishing
+    // "Paris" from "parris", and a `Vec` dictated in code mode became
+    // `vec`. Only the matcher wants a normalized form.
+    let words: Vec<&str> = transcript.split_whitespace().collect();
+    // Match on a stripped, lowercased view; keep the raw words for text.
+    // Whisper's sentence punctuation is part of PROSE and noise in code,
+    // so the decision of whether to drop it belongs to the mode-aware
+    // transform, not to segmentation.
+    let lower: Vec<String> = words.iter().map(|w| strip_punct(w).to_lowercase()).collect();
     let max_span = Ctl::phrases().iter().map(|(p, _)| p.split_whitespace().count()).max().unwrap_or(1);
     let mut out: Vec<Piece> = Vec::new();
     let mut pending: Vec<&str> = Vec::new();
@@ -105,7 +125,7 @@ pub fn segment(transcript: &str) -> Vec<Piece> {
         let mut hit = None;
         let upper = max_span.min(words.len() - i);
         for len in (1..=upper).rev() {
-            let span = words[i..i + len].join(" ");
+            let span = lower[i..i + len].join(" ");
             if let Some(c) = Ctl::from_phrase(&span) {
                 hit = Some((c, len));
                 break;
@@ -133,11 +153,13 @@ pub fn segment(transcript: &str) -> Vec<Piece> {
 /// utterance". Mixing the two modes is how you get "new line" swallowed
 /// out of the middle of a sentence the user meant literally.
 pub fn segment_strict(transcript: &str) -> Vec<Piece> {
-    let n = normalize(transcript);
-    match Ctl::from_phrase(&n) {
+    let raw = transcript.split_whitespace().collect::<Vec<_>>().join(" ");
+    if raw.is_empty() {
+        return vec![];
+    }
+    match Ctl::from_phrase(&strip_punct(&raw).to_lowercase()) {
         Some(c) => vec![Piece::Control(c)],
-        None if n.is_empty() => vec![],
-        None => vec![Piece::Text(n)],
+        None => vec![Piece::Text(raw)],
     }
 }
 
@@ -148,9 +170,11 @@ fn flush(pending: &mut Vec<&str>, out: &mut Vec<Piece>) {
     }
 }
 
-fn normalize(s: &str) -> String {
+/// Drop sentence punctuation, PRESERVING case. Used for phrase
+/// MATCHING, and for code content where whisper's guess at prose
+/// structure is noise.
+fn strip_punct(s: &str) -> String {
     s.trim()
-        .to_lowercase()
         .chars()
         .filter(|c| !matches!(c, '.' | ',' | '!' | '?' | ';' | ':'))
         .collect::<String>()
@@ -163,8 +187,13 @@ fn normalize(s: &str) -> String {
 
 /// What we are dictating INTO. Governs the symbol vocabulary and the
 /// spacing rules; prose and code want opposite defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
+    /// Whisper's own punctuation and capitalization are already right
+    /// for prose, so the transform is near-passthrough. The default,
+    /// because it is the safe one: a Code-mode misfire turns spoken
+    /// words into symbols.
+    #[default]
     Prose,
     Code,
 }
@@ -296,9 +325,14 @@ pub fn spoken_code(text: &str, mode: Mode) -> String {
 /// so a directive can override a bad table hit.
 pub fn spoken_code_with(text: &str, mode: Mode, syms: Option<&SymbolTable>) -> String {
     if mode == Mode::Prose {
+        // Whisper's punctuation and capitalization are already what
+        // prose wants; the only fix prose needs is the continuation
+        // capital, and that belongs to the sink, which can see what
+        // precedes the insert.
         return text.trim().to_string();
     }
-    let words: Vec<&str> = text.split_whitespace().collect();
+    let stripped = strip_punct(text);
+    let words: Vec<&str> = stripped.split_whitespace().collect();
     let mut toks: Vec<Tok> = Vec::new();
     let mut i = 0;
     while i < words.len() {
@@ -306,7 +340,7 @@ pub fn spoken_code_with(text: &str, mode: Mode, syms: Option<&SymbolTable>) -> S
         let mut matched = false;
         let upper = 3.min(words.len() - i);
         for len in (1..=upper).rev() {
-            let span = words[i..i + len].join(" ");
+            let span = words[i..i + len].join(" ").to_lowercase();
             if let Some(t) = symbol(&span) {
                 toks.push(t);
                 i += len;
@@ -320,7 +354,7 @@ pub fn spoken_code_with(text: &str, mode: Mode, syms: Option<&SymbolTable>) -> S
                 while j < words.len() {
                     let stop = (1..=3.min(words.len() - j))
                         .any(|l| {
-                            let s = words[j..j + l].join(" ");
+                            let s = words[j..j + l].join(" ").to_lowercase();
                             symbol(&s).is_some() || casing(&s).is_some()
                         });
                     if stop {
@@ -350,7 +384,7 @@ pub fn spoken_code_with(text: &str, mode: Mode, syms: Option<&SymbolTable>) -> S
             }
         }
         if !matched {
-            if let Some(n) = numeral(words[i]) {
+            if let Some(n) = numeral(&words[i].to_lowercase()) {
                 toks.push(Tok::word(&n.to_string()));
                 i += 1;
                 matched = true;
@@ -392,8 +426,27 @@ const PAREN_SPACED_AFTER: &[&str] = &[
 
 fn join(toks: &[Tok]) -> String {
     let mut out = String::new();
+    // Quotes are the one symbol whose spacing depends on WHICH of the
+    // pair it is, and the spoken form is identical for both. Parity is
+    // the only signal available: odd occurrence opens (glue right),
+    // even closes (glue left). Wrong only if the speaker leaves a quote
+    // unbalanced, which is a syntax error they will see immediately.
+    let mut open_quotes: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
+    let mut prev_glue_right = false;
     for (n, t) in toks.iter().enumerate() {
         let mut glue_left = t.glue_left;
+        let mut glue_right = t.glue_right;
+        if matches!(t.text.as_str(), "\"" | "'" | "`") {
+            let open = open_quotes.entry(t.text.as_str()).or_insert(false);
+            if *open {
+                glue_left = true;
+                glue_right = false;
+            } else {
+                glue_left = false;
+                glue_right = true;
+            }
+            *open = !*open;
+        }
         // `foo(` / `arr[` — an opening bracket binds to the identifier
         // it follows, which is what makes calls and signatures read
         // right. Only when the previous token is a plain word.
@@ -408,10 +461,11 @@ fn join(toks: &[Tok]) -> String {
                 glue_left = true;
             }
         }
-        if n > 0 && !glue_left && !toks[n - 1].glue_right {
+        if n > 0 && !glue_left && !prev_glue_right {
             out.push(' ');
         }
         out.push_str(&t.text);
+        prev_glue_right = glue_right;
     }
     out
 }
@@ -456,6 +510,7 @@ pub enum Edit {
     Repair(Repair),
     Newline { count: usize },
     IndentDelta(i32),
+    SetMode(Mode),
     EndSession,
 }
 
@@ -487,6 +542,7 @@ pub fn plan_with(
             Piece::Control(Ctl::Indent) => out.push(Edit::IndentDelta(1)),
             Piece::Control(Ctl::Dedent) => out.push(Edit::IndentDelta(-1)),
             Piece::Control(Ctl::Stop) => out.push(Edit::EndSession),
+            Piece::Control(Ctl::SetMode(m)) => out.push(Edit::SetMode(*m)),
         }
     }
     out
@@ -507,6 +563,10 @@ pub struct BufferSink {
     /// re-case and `Join` has something to remove. Newlines and indents
     /// insert after it, so the offsets stay valid until the next Insert.
     last_insert: Option<(usize, usize, usize)>,
+    /// Register for inserted text. Prose gets the continuation-casing
+    /// fix below; Code does not, because whisper's capitalization of a
+    /// code utterance is noise the symbol table already overrides.
+    pub mode: Mode,
     /// Current indent level, carried across Newline. Without this every
     /// dictated line starts at column 0 and the speaker has to say
     /// "indent" after every "new line" — which is how a real editor's
@@ -527,6 +587,7 @@ impl BufferSink {
             ended: false,
             trail: Vec::new(),
             last_insert: None,
+            mode: Mode::Prose,
             indent: 0,
         }
     }
@@ -537,11 +598,16 @@ impl BufferSink {
                 Edit::Insert { at, text } => {
                     let pos = self.resolve(at);
                     let sep = self.spacer(pos);
-                    let ins = format!("{sep}{text}");
+                    let body = if self.mode == Mode::Prose {
+                        decapitalize_continuation(text, self.preceding(pos))
+                    } else {
+                        text.clone()
+                    };
+                    let ins = format!("{sep}{body}");
                     self.text.insert_str(pos, &ins);
                     self.cursor = pos + ins.len();
                     self.trail.push(ins.len());
-                    self.last_insert = Some((pos, sep.len(), text.len()));
+                    self.last_insert = Some((pos, sep.len(), body.len()));
                 }
                 Edit::Newline { count } => {
                     let s = format!(
@@ -589,9 +655,15 @@ impl BufferSink {
                 Edit::Repair(r) => {
                     self.repair(r);
                 }
+                Edit::SetMode(m) => self.mode = *m,
                 Edit::EndSession => self.ended = true,
             }
         }
+    }
+
+    pub fn with_mode(mut self, m: Mode) -> Self {
+        self.mode = m;
+        self
     }
 
     /// The text of the last dictated unit, if one is still addressable.
@@ -631,6 +703,19 @@ impl BufferSink {
         true
     }
 
+    /// Last non-space character before `pos` ON THE SAME LINE.
+    ///
+    /// Stopping at the newline matters: a new line starts a new
+    /// sentence as far as capitalization goes, and scanning past it
+    /// would lowercase the first word of every line after the first.
+    fn preceding(&self, pos: usize) -> Option<char> {
+        self.text[..pos]
+            .chars()
+            .rev()
+            .take_while(|c| *c != '\n')
+            .find(|c| !c.is_whitespace())
+    }
+
     fn resolve(&self, at: &Placement) -> usize {
         match at {
             Placement::Cursor => self.cursor,
@@ -657,6 +742,52 @@ impl BufferSink {
             Some('(') | Some('[') | Some('&') => "",
             _ => " ",
         }
+    }
+}
+
+/// Drop the stray capital whisper puts on every utterance's first word
+/// when the utterance is CONTINUING a sentence.
+///
+/// Whisper transcribes each burst independently, so "the quick brown
+/// fox" followed by "jumped over" arrives as "Jumped over" and the
+/// buffer reads "the quick brown fox Jumped over". Lowering it is right
+/// far more often than wrong.
+///
+/// When it IS wrong the word is a proper noun, and the fix is one short
+/// utterance away — `repair::Repair::Capitalize` acts on exactly this
+/// unit. That asymmetry is the whole argument: a stray capital every
+/// other sentence is a constant tax, a lowered proper noun is
+/// occasional and already has a one-phrase undo.
+///
+/// Left alone: anything after a sentence terminator or at the start of
+/// a line, all-caps words (acronyms), and words with internal capitals
+/// (`GitHub`, `iPhone`), which are never whisper's doing.
+pub fn decapitalize_continuation(text: &str, preceding: Option<char>) -> String {
+    let continuing = match preceding {
+        None => false,
+        Some(c) => !matches!(c, '.' | '!' | '?' | ':' | ';'),
+    };
+    if !continuing {
+        return text.to_string();
+    }
+    let mut words = text.splitn(2, ' ');
+    let Some(first) = words.next() else { return text.to_string() };
+    let rest = words.next();
+    let mut cs = first.chars();
+    let Some(f) = cs.next() else { return text.to_string() };
+    let tail: String = cs.collect();
+    // only a lone leading capital: ALLCAPS and CamelCase stay
+    if !f.is_uppercase() || tail.chars().any(|c| c.is_uppercase()) {
+        return text.to_string();
+    }
+    // "I" is a word, not whisper being helpful
+    if first == "I" {
+        return text.to_string();
+    }
+    let lowered = f.to_lowercase().collect::<String>() + &tail;
+    match rest {
+        Some(r) => format!("{lowered} {r}"),
+        None => lowered,
     }
 }
 
@@ -722,6 +853,8 @@ pub fn to_keys(editor: KeyEditor, edits: &[Edit]) -> String {
             // gets nothing and should tell the user repairs need the
             // in-app editor.
             Edit::Repair(_) => {}
+            // Mode is our own state; the editor has no equivalent.
+            Edit::SetMode(_) => {}
             Edit::EndSession => {}
         }
     }
@@ -985,6 +1118,118 @@ mod tests {
         // guess would corrupt the buffer
         let k = to_keys(KeyEditor::Helix, &[Edit::Repair(Repair::Capitalize)]);
         assert_eq!(k, "");
+    }
+
+    #[test]
+    fn prose_continuation_loses_whispers_stray_capital() {
+        let mut b = BufferSink::new("", 0).with_mode(Mode::Prose);
+        for u in ["the quick brown fox", "Jumped over the lazy dog"] {
+            b.apply(&plan(&segment(u), Mode::Prose, Placement::Cursor));
+        }
+        assert_eq!(b.text, "the quick brown fox jumped over the lazy dog");
+    }
+
+    #[test]
+    fn a_new_sentence_keeps_its_capital() {
+        let mut b = BufferSink::new("She left.", 9).with_mode(Mode::Prose);
+        b.apply(&plan(&segment("Then it rained"), Mode::Prose, Placement::Cursor));
+        assert_eq!(b.text, "She left. Then it rained");
+    }
+
+    #[test]
+    fn a_new_line_starts_a_new_sentence() {
+        let mut b = BufferSink::new("first line", 10).with_mode(Mode::Prose);
+        b.apply(&[Edit::Newline { count: 1 }]);
+        b.apply(&plan(&segment("Second line"), Mode::Prose, Placement::Cursor));
+        assert_eq!(b.text, "first line\nSecond line");
+    }
+
+    #[test]
+    fn acronyms_and_internal_capitals_survive() {
+        assert_eq!(decapitalize_continuation("HTTP is fine", Some('s')), "HTTP is fine");
+        assert_eq!(decapitalize_continuation("GitHub said no", Some('s')), "GitHub said no");
+        assert_eq!(decapitalize_continuation("I went", Some('s')), "I went", "lone I is all-caps");
+    }
+
+    #[test]
+    fn a_lowered_proper_noun_is_one_repair_away() {
+        // the acknowledged failure mode, and its escape hatch
+        let mut b = BufferSink::new("we flew to", 10).with_mode(Mode::Prose);
+        b.apply(&plan(&segment("Paris"), Mode::Prose, Placement::Cursor));
+        assert_eq!(b.text, "we flew to paris");
+        assert!(b.repair(&Repair::Capitalize));
+        assert_eq!(b.text, "we flew to Paris");
+    }
+
+    #[test]
+    fn code_mode_leaves_capitalization_alone() {
+        let mut b = BufferSink::new("let x =", 7).with_mode(Mode::Code);
+        b.apply(&plan(&segment("Vec new"), Mode::Code, Placement::Cursor));
+        assert_eq!(b.text, "let x = Vec new");
+    }
+
+    #[test]
+    fn mode_switches_mid_session() {
+        let mut b = BufferSink::new("", 0).with_mode(Mode::Prose);
+        b.apply(&plan(&segment("this is a comment"), b.mode, Placement::Cursor));
+        b.apply(&plan(&segment("code mode"), b.mode, Placement::Cursor));
+        assert_eq!(b.mode, Mode::Code);
+        b.apply(&plan(&segment("let x equals one semicolon"), b.mode, Placement::Cursor));
+        assert_eq!(b.text, "this is a comment let x = 1;");
+    }
+
+    #[test]
+    fn mode_control_phrases_parse() {
+        assert_eq!(segment("code mode"), vec![Piece::Control(Ctl::SetMode(Mode::Code))]);
+        assert_eq!(segment("prose mode"), vec![Piece::Control(Ctl::SetMode(Mode::Prose))]);
+        assert_eq!(segment_strict("switch to code"), vec![Piece::Control(Ctl::SetMode(Mode::Code))]);
+    }
+
+    #[test]
+    fn segmentation_preserves_case_for_content() {
+        // whisper's capitalization is the only signal separating a
+        // proper noun from a homophone; the matcher may lowercase, the
+        // content may not
+        assert_eq!(segment("we flew to Paris"), vec![Piece::Text("we flew to Paris".into())]);
+        assert_eq!(segment_strict("HTTP and TLS"), vec![Piece::Text("HTTP and TLS".into())]);
+        // ...while controls still match regardless of how whisper cased them
+        assert_eq!(segment("New Line"), vec![Piece::Control(Ctl::NewLine)]);
+        assert_eq!(segment_strict("Scratch that."), vec![Piece::Control(Ctl::ScratchThat)]);
+    }
+
+    #[test]
+    fn code_mode_symbols_match_case_insensitively() {
+        assert_eq!(spoken_code("Open Paren x Close Paren", Mode::Code), "(x)");
+        assert_eq!(spoken_code("timeout equals Thirty", Mode::Code), "timeout = 30");
+        // and a literal capitalized identifier survives
+        assert_eq!(spoken_code("Vec new", Mode::Code), "Vec new");
+    }
+
+    #[test]
+    fn prose_keeps_whispers_sentence_punctuation() {
+        let mut b = BufferSink::new("", 0).with_mode(Mode::Prose);
+        for u in ["We flew to Paris.", "It rained the whole time."] {
+            b.apply(&plan(&segment(u), Mode::Prose, Placement::Cursor));
+        }
+        // the period ends the sentence, so "It" keeps its capital
+        assert_eq!(b.text, "We flew to Paris. It rained the whole time.");
+    }
+
+    #[test]
+    fn code_mode_drops_whispers_sentence_punctuation() {
+        // "let x equals five." must not end with a stray period
+        assert_eq!(spoken_code("let x equals five.", Mode::Code), "let x = 5");
+    }
+
+    #[test]
+    fn quotes_pair_by_parity() {
+        assert_eq!(spoken_code("quote hello quote", Mode::Code), "\"hello\"");
+        assert_eq!(
+            spoken_code("let s equals quote Paris quote semicolon", Mode::Code),
+            "let s = \"Paris\";"
+        );
+        // two pairs on one line
+        assert_eq!(spoken_code("quote a quote quote b quote", Mode::Code), "\"a\" \"b\"");
     }
 
     #[test]

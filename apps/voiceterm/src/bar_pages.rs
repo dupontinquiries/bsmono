@@ -245,6 +245,8 @@ fn dictation_phrases() -> Vec<(String, String)> {
         (Ctl::ScratchThat, "undo the last phrase"),
         (Ctl::Indent, "one level in"),
         (Ctl::Dedent, "one level out"),
+        (Ctl::SetMode(crate::dictate::Mode::Code), "symbols and identifiers"),
+        (Ctl::SetMode(crate::dictate::Mode::Prose), "plain sentences"),
         (Ctl::Stop, "leave dictation"),
     ]
     .into_iter()
@@ -368,7 +370,7 @@ mod tests {
     fn dictation_say_list_collapses_synonyms() {
         let bar = bar_for(&Page::Dictation, &live());
         let n = bar.find("say").unwrap().options.len();
-        assert_eq!(n, 6, "one entry per control, not one per synonym");
+        assert_eq!(n, 8, "one entry per control, not one per synonym");
         assert!(Ctl::phrases().len() > n, "the index list is deliberately longer");
     }
 
@@ -405,6 +407,72 @@ mod tests {
             assert!(o.id.starts_with("say:"), "{}", o.id);
             assert!(!o.id.starts_with("ctl:"));
         }
+    }
+
+    // ── cross-vocabulary audit ──────────────────────────────────────
+    //
+    // Three phrase vocabularies now exist (dictation controls, repair
+    // verbs, editor commands) and they are parsed by three matchers
+    // that do not know about each other. A collision does not fail any
+    // single module's tests — it shows up as a phrase that silently
+    // does the wrong thing in one context. These check the seams.
+
+    #[test]
+    fn control_phrases_are_unique() {
+        let mut seen: Vec<&str> = Ctl::phrases().iter().map(|(p, _)| *p).collect();
+        let n = seen.len();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "a phrase maps to two different controls");
+    }
+
+    #[test]
+    fn no_control_phrase_is_also_a_repair_verb() {
+        for (p, c) in Ctl::phrases() {
+            assert_eq!(
+                crate::repair::parse(p),
+                None,
+                "{p:?} ({c:?}) parses as a repair; routing order hides it today but the \
+                 two vocabularies must not overlap"
+            );
+        }
+    }
+
+    #[test]
+    fn no_repair_verb_is_swallowed_by_control_matching() {
+        for v in [
+            "make that snake case",
+            "capitalize that",
+            "change foo to bar",
+            "spell it r e a d",
+            "i said read to string",
+            "join that",
+        ] {
+            assert!(crate::repair::parse(v).is_some(), "{v}");
+            assert!(
+                crate::dictate::segment_strict(v)
+                    .iter()
+                    .all(|pc| !matches!(pc, crate::dictate::Piece::Control(_))),
+                "{v} was eaten by the control matcher"
+            );
+        }
+    }
+
+    #[test]
+    fn dictation_controls_shadow_editor_commands_and_that_is_documented() {
+        // Both vocabularies contain "undo"-shaped and motion-shaped
+        // phrases. The dictation page outranks the editor page, so
+        // while dictating, the CONTROL wins. This test exists to make
+        // that a decision rather than a surprise: if the overlap grows,
+        // it fails and someone has to look.
+        let editor: Vec<&str> =
+            editor_voice::commands(Editor::Helix).into_iter().map(|(p, _)| p).collect();
+        let overlap: Vec<&str> = Ctl::phrases()
+            .iter()
+            .map(|(p, _)| *p)
+            .filter(|p| editor.contains(p))
+            .collect();
+        assert_eq!(overlap, Vec::<&str>::new(), "new overlap: {overlap:?}");
     }
 
     #[test]
