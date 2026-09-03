@@ -969,12 +969,9 @@ const COMMON_LEADING: &[&str] = &[
 /// Left alone regardless: anything after a sentence terminator or at the
 /// start of a line, all-caps words (acronyms), internal capitals
 /// (GitHub), and "I".
-pub fn decapitalize_continuation(text: &str, preceding: Option<char>) -> String {
-    decapitalize_continuation_in(text, preceding, "")
-}
-
-/// As above, with the surrounding document available so a capitalized
-/// word can be checked against its own lowercase use elsewhere.
+/// `context` is the surrounding document, so a capitalized word can be
+/// checked against its own lowercase use elsewhere. Pass "" when there
+/// is none.
 pub fn decapitalize_continuation_in(text: &str, preceding: Option<char>, context: &str) -> String {
     let continuing = match preceding {
         None => false,
@@ -1374,9 +1371,9 @@ mod tests {
 
     #[test]
     fn acronyms_and_internal_capitals_survive() {
-        assert_eq!(decapitalize_continuation("HTTP is fine", Some('s')), "HTTP is fine");
-        assert_eq!(decapitalize_continuation("GitHub said no", Some('s')), "GitHub said no");
-        assert_eq!(decapitalize_continuation("I went", Some('s')), "I went", "lone I is all-caps");
+        assert_eq!(decapitalize_continuation_in("HTTP is fine", Some('s'), ""), "HTTP is fine");
+        assert_eq!(decapitalize_continuation_in("GitHub said no", Some('s'), ""), "GitHub said no");
+        assert_eq!(decapitalize_continuation_in("I went", Some('s'), ""), "I went", "lone I is all-caps");
     }
 
     #[test]

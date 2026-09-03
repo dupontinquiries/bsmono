@@ -36,6 +36,14 @@
 //!   `#  anything`  comment, ignored
 //!   anything else  a whisper result
 //!
+//! A whisper line immediately following a `fast:` line is treated as the
+//! SAME audio burst, which is how the real pipeline behaves: both tiers
+//! report on one utterance and whisper arrives about a second later.
+//! That is what exercises the duplicate guard, and it is what feeds the
+//! shadow comparison — so a transcript captured with both tiers gives
+//! you a real agreement rate for the fast path, which is the evidence
+//! WEB2QML_TIER1_PROMOTE has been waiting on.
+//!
 //! Flags:
 //!   --mode prose|code   starting mode           (default prose)
 //!   --buffer PATH       seed the buffer and symbol table from a file
@@ -44,12 +52,12 @@
 //!   --prompt LABEL      print the whisper initial_prompt for a grammar
 //!                       label and exit
 
-#[path = "../src/bar_action.rs"]
-mod bar_action;
-#[path = "../src/bar_pages.rs"]
-mod bar_pages;
-#[path = "../src/bottom_bar.rs"]
-mod bottom_bar;
+// These modules are shared with the app, which uses more of their API
+// than this harness does.
+#![allow(dead_code)]
+
+// Only the modules the engine actually needs. The bar and editor-voice
+// modules are part of the same pure set but nothing here drives a UI.
 #[path = "../src/code_symbols.rs"]
 mod code_symbols;
 #[path = "../src/dictate.rs"]
@@ -58,8 +66,6 @@ mod dictate;
 mod dictation_engine;
 #[path = "../src/dictation_session.rs"]
 mod dictation_session;
-#[path = "../src/editor_voice.rs"]
-mod editor_voice;
 #[path = "../src/repair.rs"]
 mod repair;
 #[path = "../src/voice_status.rs"]
@@ -159,6 +165,8 @@ fn main() {
     let stdin = std::io::stdin();
     let mut now = 0u64;
     let mut counts = Counts::default();
+    // Text from a `fast:` line whose burst has not been closed yet.
+    let mut pending_fast: Option<String> = None;
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -186,8 +194,19 @@ fn main() {
             None => (Tier::Whisper, t),
         };
 
-        now += 1000;
-        engine.capture_start(now);
+        // A whisper line right after a fast line is the same burst.
+        let same_burst = tier == Tier::Whisper && pending_fast.is_some();
+        if same_burst {
+            let heard = pending_fast.take().unwrap();
+            engine.observe_shadow(&heard, text);
+        } else {
+            now += 1000;
+            engine.capture_start(now);
+            pending_fast = None;
+        }
+        if tier == Tier::Fast {
+            pending_fast = Some(text.to_string());
+        }
         let out = engine.recognize(tier, text, 1.0, now + 300);
         counts.tally(&out);
 
@@ -223,6 +242,36 @@ fn main() {
             counts.content, counts.control, counts.repair, counts.repair_noop, counts.dropped
         );
         let _ = writeln!(out, "mode {:?}, cursor {}", engine.mode(), engine.cursor());
+        let d = &engine.session().divergence;
+        if d.total() > 0 {
+            let _ = writeln!(
+                out,
+                "\nfast-path shadow: {} agree, {} disagree over {} paired bursts",
+                d.agree,
+                d.disagree,
+                d.total()
+            );
+            match d.promote_safe(20, 0.98) {
+                Some(true) => {
+                    let _ = writeln!(out, "  promote: SUPPORTED at the 0.98 bar");
+                }
+                Some(false) => {
+                    let _ = writeln!(
+                        out,
+                        "  promote: NOT supported ({:.1}% agreement)",
+                        d.rate(20).unwrap_or(0.0) * 100.0
+                    );
+                }
+                // Deliberately distinct from "not supported": an
+                // unmeasured path is not a failing one.
+                None => {
+                    let _ = writeln!(out, "  promote: still gathering (needs 20 paired bursts)");
+                }
+            }
+            for (f, w) in d.samples.iter().take(5) {
+                let _ = writeln!(out, "  disagreement: fast {f:?} vs whisper {w:?}");
+            }
+        }
     }
 }
 
