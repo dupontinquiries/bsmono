@@ -20,6 +20,7 @@ pub mod chain;
 pub mod assistant;
 pub mod retune;
 pub mod adaptive_sat;
+pub mod presets;
 pub mod voice;
 pub mod psola;
 pub mod realtune;
@@ -446,6 +447,16 @@ pub enum Instance {
     Gain(f32),
     Transform(Transform),
     Color(Color),
+    /// A feedback comb whose loop is low-passed — the tuned-comb voice, not a
+    /// room. `mix` is how much of the delayed signal joins the dry, and it is
+    /// what decides whether this reads as timbre or as an echo.
+    Comb(Box<voice::Delay>, f32),
+    /// Weight under a voice. `mix` is deliberately low by default: above about
+    /// -12 dB it stops being weight and becomes a second voice.
+    Sub(Box<voice::SubOctave>, f32),
+    Shift(Box<voice::Shifter>),
+    Crush(voice::Crush),
+    Gate(voice::Gate),
     Retime(Retime),
     /// The trap pair — see `playrate`'s module docs for why they carry
     /// their own per-channel buffers inside a per-sample interface.
@@ -477,6 +488,14 @@ impl Instance {
             Instance::Gain(db) => x * from_db_pub(*db),
             Instance::RealTune(t) => t.process(x),
             Instance::AdaptiveSat(a) => a.process(x),
+            // Comb and Sub are PARALLEL: they add to the dry rather than
+            // replacing it. A serial comb loses the words, and a serial sub is
+            // an octave-down voice rather than weight under one.
+            Instance::Comb(d, mix) => x + d.process(x) * *mix,
+            Instance::Sub(s, mix) => x + s.process(x) * *mix,
+            Instance::Shift(sh) => sh.process(x),
+            Instance::Crush(c) => c.process(x),
+            Instance::Gate(g) => g.process(x),
             Instance::TapeStop(t) => t.process(x),
             Instance::Halftime(h) => h.process(x),
             Instance::Transform(_) | Instance::Color(_) | Instance::Retime(_) => x,
@@ -528,6 +547,36 @@ pub fn instantiate(effect: &studio_core::Effect, rate: f32) -> Option<Instance> 
             c.makeup_db = p(q, "makeup", 0.0);
             Instance::Compressor(c)
         }
+        "comb" => Instance::Comb(
+            Box::new(voice::Delay::new(
+                rate,
+                240.0,
+                p(q, "delay", 70.0),
+                p(q, "feedback", 0.6),
+                p(q, "damp", 1500.0),
+            )),
+            p(q, "mix", 0.35),
+        ),
+        "sub" => Instance::Sub(
+            Box::new(voice::SubOctave::new(rate)),
+            p(q, "mix", 0.25),
+        ),
+        "shift" => Instance::Shift(Box::new(voice::Shifter::new(
+            rate,
+            p(q, "semitones", -3.0),
+            p(q, "grain", 60.0),
+        ))),
+        "crush" => Instance::Crush(voice::Crush::new(
+            rate,
+            p(q, "bits", 16.0).clamp(1.0, 16.0) as u8,
+            p(q, "hold", rate),
+        )),
+        "gate" => Instance::Gate(voice::Gate::new(
+            rate,
+            p(q, "threshold", -40.0),
+            p(q, "hold", 80.0),
+            p(q, "release", 30.0),
+        )),
         "limiter" => Instance::Limiter(Limiter::new(rate, p(q, "ceiling", -0.3),
                                                     p(q, "lookahead", 5.0), p(q, "release", 50.0))),
         "multiband" => {
