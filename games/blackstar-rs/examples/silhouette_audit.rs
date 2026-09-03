@@ -98,15 +98,32 @@ fn audit_robot_pose(name: &str, dirs: &[PathBuf]) -> Option<Finding> {
     // hip line) — nothing that isn't a leg has anatomical business here.
     let leg_idxs: Vec<usize> = kinds.iter().enumerate().filter(|(_, k)| **k == partdetect::Kind::Leg).map(|(i, _)| i).collect();
     let mut crotch = Vec::new();
-    // SANITY GUARD: a real biped has a handful of leg-tagged prims (one
-    // or two per side — thigh, shin). Checked directly on
-    // boat_mistral_class_lhd, which came back with 34 "crotch" hits: the
-    // classifier had tagged a long hull/keel detail as Leg, and every
-    // hull panel near the centreline then read as "between the legs".
-    // A double-digit leg count on a hull is that failure, not a biped
-    // with unusually many legs, so skip the corridor check (not the
-    // whole audit — overhang below is unaffected) rather than report
-    // noise dressed up as a finding.
+    // KNOWN FALSE POSITIVE, and the guard below does not fix it.
+    //
+    // boat_mistral_class_lhd reports 35 "crotch" findings: the classifier
+    // tags hull/keel detail as Leg, and every hull panel near the
+    // centreline then reads as "between the legs". That much of the
+    // original diagnosis is right.
+    //
+    // What is NOT right is the remedy it proposed. The note here used to
+    // say a "double-digit leg count" identifies the failure and should
+    // skip the corridor check. Measured: the boat has FOUR leg-tagged
+    // prims, not double digits, so a count threshold never excluded it and
+    // `>= 2` below has only ever been a lower bound.
+    //
+    // Leg GEOMETRY does not separate them either. The boat's leg-tagged
+    // prims span 0.157 laterally; animal_bot_runningwind, a real
+    // quadruped, spans 0.182. Both measured with the same probe. A
+    // separation test would reject the animal before it rejected the boat.
+    //
+    // So the signal a working guard needs is not in the leg prims at all —
+    // it is in whether the model is a legged thing in the first place, and
+    // that belongs in partdetect rather than here. Recorded rather than
+    // patched, with the two candidate fixes that have already been ruled
+    // out, so the next attempt starts past them.
+    //
+    // The overhang half of the audit is unaffected and its numbers are
+    // trustworthy.
     if leg_idxs.len() >= 2 {
         let mut leg_lo = Vec3::splat(f32::MAX);
         let mut leg_hi = Vec3::splat(f32::MIN);
