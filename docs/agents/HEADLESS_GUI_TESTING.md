@@ -145,6 +145,39 @@ where guessing was wrong twice.
   modules of `apps/voiceterm` compile standalone with
   `rustc --test src/module.rs`; the app crate does not build.
 
+## The cheaper path: offscreen, no display at all
+
+Everything above is for driving a real app. If all you need is a PICTURE
+of some geometry, you do not need X, a window manager, or input
+injection. wgpu will render to a texture with only an adapter, and
+lavapipe provides one in software:
+
+```sh
+apt-get install -y --no-default-features mesa-vulkan-drivers   # lavapipe
+export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json
+env -u DISPLAY -u WAYLAND_DISPLAY ./target/debug/examples/botshot <asset> out.png
+```
+
+Verified with `DISPLAY` and `WAYLAND_DISPLAY` both unset. It prints
+`XDG_RUNTIME_DIR is invalid or not set` and renders anyway — that warning
+comes from a winit/env probe, not from the render path.
+
+`games/blackstar-rs/examples/botshot.rs` is the worked example: it builds
+a device, a pipeline and a depth buffer, draws, and reads the target back
+to a PNG. Roughly 200 lines, no swapchain, no event loop.
+
+**This is the one to reach for first.** Three of the findings in this
+repo's asset work came from looking at such a render, and two of them
+contradicted a metric that had looked convincing. A PNG costs seconds and
+settles arguments that numbers do not.
+
+**And know what it does NOT show.** `botshot` originally rendered the
+authored mesh, while the game applies a stow transform before drawing.
+The still was therefore of geometry the game never displays, and an
+investigation ran a long way on that before anyone noticed. If a harness
+renders assets, make it apply the same transforms the runtime does, or
+say loudly in its `--help` that it does not.
+
 ## Clicking things
 
 `xdotool getwindowgeometry --shell` reports the **client area**, and
