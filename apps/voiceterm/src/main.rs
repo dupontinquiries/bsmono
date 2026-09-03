@@ -162,6 +162,10 @@ mod editor_voice;
 // headless dictation core. Pure — no Qt, no whisper, no PTY — so it is
 // also exposed from lib.rs and testable without Qt.
 mod dictate;
+// Buffer identifier dictionary: resolves spoken word runs to the real
+// spellings in the open file, and derives the dictation-scoped whisper
+// initial_prompt. Pure.
+mod code_symbols;
 // v0.1.609: motion-rollback position-history core (TODO_motion_rollback
 // option 1, the testable piece). Status-line parsing stays build-gated.
 mod motion_history;

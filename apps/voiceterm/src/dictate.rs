@@ -20,6 +20,8 @@
 //! Deliberately NOT here: whisper invocation, the acoustic fast path,
 //! the LLM. Those are callers.
 
+use crate::code_symbols::SymbolTable;
+
 // ───────────────────────────────────────────────────────────── controls
 
 /// The closed vocabulary that must interrupt dictation. Small and fixed
@@ -277,6 +279,19 @@ fn title(w: &str) -> String {
 /// punctuation is fine there). In `Mode::Code` it runs the symbol and
 /// casing vocabulary and applies code spacing.
 pub fn spoken_code(text: &str, mode: Mode) -> String {
+    spoken_code_with(text, mode, None)
+}
+
+/// As `spoken_code`, but resolving bare word runs against the
+/// identifiers actually present in the buffer.
+///
+/// This is what removes the ceremony: with a table built from the open
+/// file, "read to string" becomes `read_to_string` without the speaker
+/// prefixing a casing directive. Resolution order at each position is
+/// symbol, then explicit casing directive, then the table, then a
+/// number word, then the plain word — explicit always beats inferred,
+/// so a directive can override a bad table hit.
+pub fn spoken_code_with(text: &str, mode: Mode, syms: Option<&SymbolTable>) -> String {
     if mode == Mode::Prose {
         return text.trim().to_string();
     }
@@ -320,11 +335,48 @@ pub fn spoken_code(text: &str, mode: Mode) -> String {
             }
         }
         if !matched {
+            // buffer identifiers: longest run that resolves. Bounded at
+            // 5 words because that is already a long name and the scan
+            // is O(span) per position.
+            if let Some(t) = syms {
+                if let Some((n, id)) = t.resolve_longest(&words[i..], 5) {
+                    toks.push(Tok::word(id));
+                    i += n;
+                    matched = true;
+                }
+            }
+        }
+        if !matched {
+            if let Some(n) = numeral(words[i]) {
+                toks.push(Tok::word(&n.to_string()));
+                i += 1;
+                matched = true;
+            }
+        }
+        if !matched {
             toks.push(Tok::word(words[i]));
             i += 1;
         }
     }
     join(&toks)
+}
+
+/// Number words → digits. Code mode only, where "thirty" is far more
+/// likely to be a literal than a variable. Deliberately stops at the
+/// simple cases: compound forms ("twenty five", "three hundred") need
+/// accumulator parsing whose failure mode is silently wrong constants,
+/// which is worse than leaving the words alone for the speaker to fix.
+fn numeral(w: &str) -> Option<u32> {
+    Some(match w {
+        "zero" => 0, "one" => 1, "two" => 2, "three" => 3, "four" => 4,
+        "five" => 5, "six" => 6, "seven" => 7, "eight" => 8, "nine" => 9,
+        "ten" => 10, "eleven" => 11, "twelve" => 12, "thirteen" => 13,
+        "fourteen" => 14, "fifteen" => 15, "sixteen" => 16, "seventeen" => 17,
+        "eighteen" => 18, "nineteen" => 19, "twenty" => 20, "thirty" => 30,
+        "forty" => 40, "fifty" => 50, "sixty" => 60, "seventy" => 70,
+        "eighty" => 80, "ninety" => 90, "hundred" => 100, "thousand" => 1000,
+        _ => return None,
+    })
 }
 
 /// Keywords after which an open paren is NOT a call/signature, so it
@@ -404,11 +456,22 @@ pub enum Edit {
 
 /// Compile a segmented utterance into an edit script.
 pub fn plan(pieces: &[Piece], mode: Mode, at: Placement) -> Vec<Edit> {
+    plan_with(pieces, mode, at, None)
+}
+
+/// As `plan`, with the buffer's identifier table available to the
+/// spoken-code transform.
+pub fn plan_with(
+    pieces: &[Piece],
+    mode: Mode,
+    at: Placement,
+    syms: Option<&SymbolTable>,
+) -> Vec<Edit> {
     let mut out = Vec::new();
     for p in pieces {
         match p {
             Piece::Text(t) => {
-                let s = spoken_code(t, mode);
+                let s = spoken_code_with(t, mode, syms);
                 if !s.is_empty() {
                     out.push(Edit::Insert { at: at.clone(), text: s });
                 }
@@ -434,12 +497,27 @@ pub struct BufferSink {
     pub cursor: usize,
     /// byte length of each applied insert, for RetractLast
     trail: Vec<usize>,
+    /// Current indent level, carried across Newline. Without this every
+    /// dictated line starts at column 0 and the speaker has to say
+    /// "indent" after every "new line" — which is how a real editor's
+    /// auto-indent earns its keep.
+    indent: usize,
     pub ended: bool,
 }
 
+/// One indent level, in spaces. Not configurable yet; when it is, it
+/// belongs with the per-filetype settings, not here.
+const INDENT_WIDTH: usize = 4;
+
 impl BufferSink {
     pub fn new(text: &str, cursor: usize) -> Self {
-        BufferSink { text: text.to_string(), cursor: cursor.min(text.len()), ended: false, trail: Vec::new() }
+        BufferSink {
+            text: text.to_string(),
+            cursor: cursor.min(text.len()),
+            ended: false,
+            trail: Vec::new(),
+            indent: 0,
+        }
     }
 
     pub fn apply(&mut self, edits: &[Edit]) {
@@ -454,25 +532,33 @@ impl BufferSink {
                     self.trail.push(ins.len());
                 }
                 Edit::Newline { count } => {
-                    let s = "\n".repeat(*count);
+                    let s = format!(
+                        "{}{}",
+                        "\n".repeat(*count),
+                        " ".repeat(self.indent * INDENT_WIDTH)
+                    );
                     self.text.insert_str(self.cursor, &s);
                     self.cursor += s.len();
                     self.trail.push(s.len());
                 }
                 Edit::IndentDelta(d) => {
+                    // Adjust both the persistent level (which future
+                    // Newlines inherit) and the current line.
                     if *d > 0 {
-                        let s = "    ".repeat(*d as usize);
+                        self.indent += *d as usize;
+                        let s = " ".repeat(*d as usize * INDENT_WIDTH);
                         self.text.insert_str(self.cursor, &s);
                         self.cursor += s.len();
                         self.trail.push(s.len());
                     } else {
-                        for _ in 0..(-d) {
+                        self.indent = self.indent.saturating_sub(d.unsigned_abs() as usize);
+                        for _ in 0..d.unsigned_abs() {
                             let take = self.text[..self.cursor]
                                 .chars()
                                 .rev()
                                 .take_while(|c| *c == ' ')
                                 .count()
-                                .min(4);
+                                .min(INDENT_WIDTH);
                             if take > 0 {
                                 self.text.replace_range(self.cursor - take..self.cursor, "");
                                 self.cursor -= take;
@@ -636,11 +722,11 @@ mod tests {
     fn casing_run_terminates_at_symbol() {
         assert_eq!(
             spoken_code("let mut snake user count equals five", Mode::Code),
-            "let mut user_count = five"
+            "let mut user_count = 5"
         );
         assert_eq!(spoken_code("pascal my type name", Mode::Code), "MyTypeName");
         assert_eq!(spoken_code("camel read file sync", Mode::Code), "readFileSync");
-        assert_eq!(spoken_code("screaming max size equals ten", Mode::Code), "MAX_SIZE = ten");
+        assert_eq!(spoken_code("screaming max size equals ten", Mode::Code), "MAX_SIZE = 10");
     }
 
     #[test]
@@ -671,7 +757,7 @@ mod tests {
         b.apply(&plan(&segment("fn main open paren close paren open brace"), Mode::Code, Placement::Cursor));
         b.apply(&plan(&segment("new line indent"), Mode::Code, Placement::Cursor));
         b.apply(&plan(&segment("let x equals one semicolon"), Mode::Code, Placement::Cursor));
-        assert_eq!(b.text, "fn main() {\n    let x = one;");
+        assert_eq!(b.text, "fn main() {\n    let x = 1;");
     }
 
     #[test]
@@ -716,6 +802,63 @@ mod tests {
     }
 
     #[test]
+    fn symbol_table_removes_the_casing_ceremony() {
+        let buf = "fn read_to_string(p: &Path) -> Result<String> { UserStore::new() }";
+        let t = SymbolTable::from_source(buf);
+        // no "snake" directive needed — the buffer already knows
+        assert_eq!(
+            spoken_code_with("std double colon fs double colon read to string", Mode::Code, Some(&t)),
+            "std::fs::read_to_string"
+        );
+        assert_eq!(spoken_code_with("user store", Mode::Code, Some(&t)), "UserStore");
+        // and without the table you are back to the literal words
+        assert_eq!(spoken_code("read to string", Mode::Code), "read to string");
+    }
+
+    #[test]
+    fn explicit_directive_overrides_the_table() {
+        let t = SymbolTable::from_source("read_to_string");
+        assert_eq!(
+            spoken_code_with("pascal read to string", Mode::Code, Some(&t)),
+            "ReadToString"
+        );
+    }
+
+    #[test]
+    fn table_never_eats_a_symbol_word() {
+        // a buffer containing an identifier whose spoken form starts
+        // with a symbol word must not shadow the symbol
+        let t = SymbolTable::from_source("comma_separated");
+        assert_eq!(spoken_code_with("a comma b", Mode::Code, Some(&t)), "a, b");
+    }
+
+    #[test]
+    fn number_words_become_digits_in_code_only() {
+        assert_eq!(spoken_code("timeout equals thirty", Mode::Code), "timeout = 30");
+        assert_eq!(spoken_code("thirty birds", Mode::Prose), "thirty birds");
+        // compound forms are deliberately left alone rather than guessed
+        assert_eq!(spoken_code("twenty five", Mode::Code), "20 5");
+    }
+
+    #[test]
+    fn indent_persists_across_newlines() {
+        let mut b = BufferSink::new("", 0);
+        for u in ["open brace", "new line", "indent", "let a equals one semicolon", "new line", "let b equals two semicolon"] {
+            b.apply(&plan(&segment(u), Mode::Code, Placement::Cursor));
+        }
+        assert_eq!(b.text, "{\n    let a = 1;\n    let b = 2;");
+    }
+
+    #[test]
+    fn dedent_lowers_the_level_for_later_lines() {
+        let mut b = BufferSink::new("", 0);
+        for u in ["indent", "a", "new line", "dedent", "b", "new line", "c"] {
+            b.apply(&plan(&segment(u), Mode::Code, Placement::Cursor));
+        }
+        assert_eq!(b.text, "    a\nb\nc");
+    }
+
+    #[test]
     fn end_to_end_code_dictation() {
         let utterances = [
             "pascal user store double colon new open paren close paren",
@@ -726,6 +869,6 @@ mod tests {
         for u in utterances {
             b.apply(&plan(&segment(u), Mode::Code, Placement::Cursor));
         }
-        assert_eq!(b.text, "UserStore::new()\nmax_retries = three;");
+        assert_eq!(b.text, "UserStore::new()\nmax_retries = 3;");
     }
 }
