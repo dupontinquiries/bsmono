@@ -356,6 +356,18 @@ exactly where that difference gets lost.
   `tests/real_pty.rs` — the only test that drives a real shell — had not
   compiled since. Run plain `cargo test` (all targets) before claiming a count,
   and reach for `--lib` only to go faster mid-loop.
+- **A harness that measures runtime behaviour must load its data the way the
+  runtime does, and should name the function it mirrors in a comment.** A
+  self-consistent harness answering a question nobody asked is the hardest kind
+  of wrong to notice: every number it prints is reproducible. In one session a
+  fold audit measured the unified prim set instead of the model's own, a
+  screenshot tool rendered a pose the game never draws, and the same audit used
+  an unoriented, unscaled loader — three separate wrong answers, all internally
+  tidy. The sibling harness had the rule written down already.
+- **A grep hit pointing at an existing module is worth two minutes before you
+  build a parallel one.** `src/foldaudit.rs` — 549 lines, nine tests, wired into
+  two callers — appeared in a search result and was not followed up; a second
+  audit got written beside it.
 - **"Nothing references this" is a claim to grep for across the whole repo.**
   Two of three modules called unreferenced in one commit had callers: one was
   the Qt app's own file reached by `#[path]`, another was used by an

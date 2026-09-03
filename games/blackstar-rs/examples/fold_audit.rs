@@ -912,6 +912,9 @@ fn main() {
 
 #[allow(dead_code)]
 fn dump_colors(dir: &Path) {
+    // Unoriented is FINE here and nowhere else in this file: a prim's
+    // colour does not depend on how the model is turned or scaled. Every
+    // geometric measurement goes through `load_strip`.
     let raws = model::load_raw_unoriented(dir);
     let mut seen: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
     for p in &raws {
