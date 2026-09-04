@@ -13,8 +13,9 @@
 //! stays the popup's baseline either way (see `aperture_lsp`'s crate doc for
 //! why LSP is an ADDITIONAL tier, not a replacement).
 
-use aperture_lsp::{CompletionItem, LspClient};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use aperture_lsp::{CompletionItem, Diagnostic, LspClient};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::time::Duration;
 
 enum Msg {
     Open { uri: String, text: String },
@@ -33,6 +34,7 @@ pub struct LspOutcome {
 pub struct LspWorker {
     tx: Sender<Msg>,
     rx: Receiver<LspOutcome>,
+    diag_rx: Receiver<Vec<Diagnostic>>,
 }
 
 impl LspWorker {
@@ -44,11 +46,12 @@ impl LspWorker {
         let client = LspClient::spawn(cmd, args, root_uri)?;
         let (tx, worker_rx) = channel::<Msg>();
         let (out_tx, rx) = channel::<LspOutcome>();
+        let (diag_tx, diag_rx) = channel::<Vec<Diagnostic>>();
         std::thread::Builder::new()
             .name("aperture-lsp-worker".into())
-            .spawn(move || worker(client, worker_rx, out_tx))
+            .spawn(move || worker(client, worker_rx, out_tx, diag_tx))
             .expect("spawn LSP worker thread");
-        Ok(LspWorker { tx, rx })
+        Ok(LspWorker { tx, rx, diag_rx })
     }
 
     pub fn open(&self, uri: String, text: String) {
@@ -70,9 +73,16 @@ impl LspWorker {
     pub fn poll(&self) -> Option<LspOutcome> {
         self.rx.try_recv().ok()
     }
+
+    /// Non-blocking; the worker pushes a new list only when it actually
+    /// changed (see `worker`'s own loop), so every value received here is
+    /// a real transition, not a repeat of the same diagnostics each frame.
+    pub fn poll_diagnostics(&self) -> Option<Vec<Diagnostic>> {
+        self.diag_rx.try_recv().ok()
+    }
 }
 
-fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>) {
+fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>, diag_tx: Sender<Vec<Diagnostic>>) {
     // Drain-to-newest before acting, same shape as aperture_complete's own
     // worker loop: Open/Change messages all apply in order (each is a real,
     // needed state transition the server must see), but if several
@@ -80,19 +90,28 @@ fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>) {
     // in flight, only the LAST one is worth answering — the caret has
     // moved on.
     let mut pending_complete: Option<(String, u32, u32, u64)> = None;
+    // The URI diagnostics get checked against — whatever the last Open or
+    // Change named. `publishDiagnostics` is a PUSH, not a reply to
+    // anything this worker asked for, so there is no message to drain for
+    // it; the periodic recv_timeout below is what notices a new one.
+    let mut current_uri: Option<String> = None;
+    let mut last_diagnostics: Vec<Diagnostic> = Vec::new();
     loop {
-        let msg = match rx.recv() {
-            Ok(m) => m,
-            Err(_) => return, // sender dropped: the AppState (and its LspWorker) is gone
+        let msg = match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(m) => Some(m),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => return, // AppState (and its LspWorker) is gone
         };
-        let mut msg = Some(msg);
+        let mut msg = msg;
         loop {
             match msg.take() {
                 Some(Msg::Open { uri, text }) => {
                     let _ = client.did_open(&uri, "rust", &text, 1);
+                    current_uri = Some(uri);
                 }
                 Some(Msg::Change { uri, text, version }) => {
                     let _ = client.did_change(&uri, &text, version);
+                    current_uri = Some(uri);
                 }
                 Some(Msg::Complete { uri, line, character, generation }) => {
                     pending_complete = Some((uri, line, character, generation));
@@ -109,6 +128,15 @@ fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>) {
             let items = client.completion(&uri, line, character).unwrap_or_default();
             if tx.send(LspOutcome { generation, items }).is_err() {
                 return; // receiver dropped
+            }
+        }
+        if let Some(uri) = &current_uri {
+            let latest = client.diagnostics(uri);
+            if latest != last_diagnostics {
+                last_diagnostics = latest.clone();
+                if diag_tx.send(latest).is_err() {
+                    return; // receiver dropped
+                }
             }
         }
     }

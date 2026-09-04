@@ -471,6 +471,10 @@ pub struct AppState {
     /// found nothing but LSP answers anyway (a std type invisible to the
     /// local single-file outline, for instance).
     lsp_pending_prefix_start: Option<usize>,
+    /// Latest `publishDiagnostics` for the current file, empty when no LSP
+    /// worker is running or the file is currently clean. Line numbers are
+    /// LSP's own (zero-indexed), matching `git_changed`'s convention.
+    pub lsp_diagnostics: Vec<aperture_lsp::Diagnostic>,
 }
 
 /// The strip as it starts: empty recents, a few pinned quick actions.
@@ -603,6 +607,7 @@ impl AppState {
             lsp_doc_version: 1,
             lsp_gen: 0,
             lsp_pending_prefix_start: None,
+            lsp_diagnostics: Vec::new(),
         };
         if with_engine {
             s.apply_env_provider();
@@ -1960,6 +1965,9 @@ impl AppState {
     /// frame from the view's tick, same shape as `poll_completions`.
     pub fn poll_lsp(&mut self) {
         let Some(lsp) = &self.lsp else { return };
+        while let Some(diags) = lsp.poll_diagnostics() {
+            self.lsp_diagnostics = diags;
+        }
         while let Some(outcome) = lsp.poll() {
             if outcome.generation != self.lsp_gen {
                 continue; // superseded by a later request; the caret moved on

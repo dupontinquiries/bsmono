@@ -505,7 +505,7 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
         }
     }
     // syntax cache can pull line text while we hold the rest of state.
-    let AppState { editor, syntax, find, git_changed, .. } = &mut *state;
+    let AppState { editor, syntax, find, git_changed, lsp_diagnostics, .. } = &mut *state;
     for line in first..last {
         let y = rect.top() - scroll + line as f32 * m.line_h
             + if line >= shift_from { shift_px } else { 0.0 };
@@ -535,6 +535,32 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
                 Rect::from_min_size(Pos2::new(rect.left() + 1.0, y), Vec2::new(3.0, m.line_h)),
                 0.0,
                 Color32::from_rgb(94, 158, 76),
+            );
+        }
+        // LSP diagnostics get a SECOND, separately-positioned gutter bar —
+        // deliberately not sharing the git-diff bar's x position, since an
+        // uncommitted line with a live error is a real, common combination
+        // and the two marks answer different questions ("did I touch this"
+        // vs "is this wrong right now"). Worst severity wins when a line
+        // has more than one diagnostic — a warning shouldn't visually hide
+        // a co-located error.
+        if let Some(d) = lsp_diagnostics.iter()
+            .filter(|d| line as u32 >= d.start_line && line as u32 <= d.end_line)
+            .min_by_key(|d| match d.severity {
+                aperture_lsp::DiagnosticSeverity::Error => 0,
+                aperture_lsp::DiagnosticSeverity::Warning => 1,
+                aperture_lsp::DiagnosticSeverity::Info => 2,
+            })
+        {
+            let color = match d.severity {
+                aperture_lsp::DiagnosticSeverity::Error => Color32::from_rgb(224, 90, 90),
+                aperture_lsp::DiagnosticSeverity::Warning => Color32::from_rgb(224, 180, 90),
+                aperture_lsp::DiagnosticSeverity::Info => Color32::from_rgb(120, 150, 200),
+            };
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(rect.left() + 5.0, y), Vec2::new(3.0, m.line_h)),
+                0.0,
+                color,
             );
         }
         let num = format!("{}", line + 1);
@@ -977,6 +1003,21 @@ fn status_bar(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, now_ms:
                 egui::RichText::new(format!("± {n} uncommitted"))
                     .color(Color32::from_rgb(120, 176, 100)),
             );
+        }
+        if !state.lsp_diagnostics.is_empty() {
+            let errors = state.lsp_diagnostics.iter()
+                .filter(|d| d.severity == aperture_lsp::DiagnosticSeverity::Error).count();
+            let warnings = state.lsp_diagnostics.iter()
+                .filter(|d| d.severity == aperture_lsp::DiagnosticSeverity::Warning).count();
+            ui.separator();
+            let (text, color) = if errors > 0 {
+                (format!("✕ {errors} error{}", if errors == 1 { "" } else { "s" }),
+                 Color32::from_rgb(224, 90, 90))
+            } else {
+                (format!("⚠ {warnings} warning{}", if warnings == 1 { "" } else { "s" }),
+                 Color32::from_rgb(224, 180, 90))
+            };
+            ui.label(egui::RichText::new(text).color(color));
         }
 
         // Measured on the OUTER horizontal, right before the right-aligned
