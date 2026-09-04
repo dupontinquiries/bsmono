@@ -91,6 +91,17 @@ pub struct LspClient {
     /// may not always match byte-for-byte against a URI a caller
     /// constructed itself (see `diagnostics`'s own doc).
     diagnostics: Arc<Mutex<HashMap<String, Vec<Diagnostic>>>>,
+    /// The server's advertised `textDocumentSync.change` kind from its
+    /// `initialize` response: `0` = none, `1` = full-document, `2` =
+    /// incremental (range-based). `None` if the server's response didn't
+    /// have a usable value (some servers omit `textDocumentSync` entirely,
+    /// which per spec means the client shouldn't sync changes at all, but
+    /// every real server this crate has been run against sends SOMETHING).
+    /// `did_change_range` checks this before sending a range delta — a
+    /// server that only understands full-document sync receiving a range
+    /// update would silently desync its copy of the file, which is a far
+    /// worse failure than this client falling back to full sync.
+    sync_kind: Mutex<Option<i64>>,
     _reader: std::thread::JoinHandle<()>,
 }
 
@@ -103,6 +114,20 @@ pub struct LspClient {
 // snappier UI timeout for its own purposes should apply it on top of this
 // one, not assume this constant already reflects the fast path.
 const CALL_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// `capabilities.textDocumentSync` in an `initialize` response is legal in
+/// TWO shapes: a bare integer (the older, simpler convention some servers
+/// still use) or a `TextDocumentSyncOptions` object with a `change` field
+/// carrying that same integer (the modern shape, which also carries
+/// `openClose`/`save` this client doesn't need). Handling only one shape
+/// would silently treat a server using the other as advertising `None`,
+/// falling back to full-document sync unnecessarily rather than actually
+/// missing anything correctness-critical — but "unnecessarily conservative"
+/// is still a bug worth not having when it's this cheap to avoid.
+fn parse_sync_kind(initialize_result: &Value) -> Option<i64> {
+    let sync = initialize_result.get("capabilities")?.get("textDocumentSync")?;
+    sync.as_i64().or_else(|| sync.get("change").and_then(Value::as_i64))
+}
 
 impl LspClient {
     /// Spawn `cmd` and complete the `initialize`/`initialized` handshake.
@@ -135,6 +160,7 @@ impl LspClient {
             next_id: Mutex::new(1),
             pending,
             diagnostics,
+            sync_kind: Mutex::new(None),
             _reader: reader,
         };
 
@@ -156,8 +182,10 @@ impl LspClient {
                 }
             }
         });
-        self.request("initialize", params)
+        let result = self
+            .request("initialize", params)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("initialize failed: {e}")))?;
+        *self.sync_kind.lock().unwrap() = parse_sync_kind(&result);
         self.notify("initialized", json!({}))?;
         Ok(())
     }
@@ -189,6 +217,53 @@ impl LspClient {
             json!({
                 "textDocument": { "uri": uri, "version": version },
                 "contentChanges": [{ "text": text }],
+            }),
+        )
+    }
+
+    /// `true` if the server's `initialize` response advertised
+    /// `TextDocumentSyncKind.Incremental` (`2`) — the only thing
+    /// `did_change_range` checks before a caller relies on it, since
+    /// sending a range delta to a server that only understands
+    /// full-document sync would silently desync its copy of the file.
+    pub fn supports_incremental_sync(&self) -> bool {
+        *self.sync_kind.lock().unwrap() == Some(2)
+    }
+
+    /// Send a RANGE-based incremental change: `new_text` replaces exactly
+    /// `[start, end)` (both zero-indexed `(line, character)` pairs, UTF-16
+    /// code units per LSP convention — same caveat `completion`'s own doc
+    /// states) rather than replacing the whole document. Returns an error
+    /// without sending anything if the server never advertised incremental
+    /// support — see `supports_incremental_sync`'s doc for why silently
+    /// sending one anyway would be worse than refusing.
+    pub fn did_change_range(
+        &self,
+        uri: &str,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        new_text: &str,
+        version: i64,
+    ) -> std::io::Result<()> {
+        if !self.supports_incremental_sync() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "server did not advertise TextDocumentSyncKind.Incremental",
+            ));
+        }
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [{
+                    "range": {
+                        "start": { "line": start_line, "character": start_character },
+                        "end": { "line": end_line, "character": end_character },
+                    },
+                    "text": new_text,
+                }],
             }),
         )
     }
@@ -487,6 +562,24 @@ fn parse_completion_result(result: &Value) -> Vec<CompletionItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_kind_parses_the_modern_object_shape() {
+        let v = json!({ "capabilities": { "textDocumentSync": { "openClose": true, "change": 2 } } });
+        assert_eq!(parse_sync_kind(&v), Some(2));
+    }
+
+    #[test]
+    fn sync_kind_parses_the_older_bare_integer_shape() {
+        let v = json!({ "capabilities": { "textDocumentSync": 1 } });
+        assert_eq!(parse_sync_kind(&v), Some(1));
+    }
+
+    #[test]
+    fn sync_kind_is_none_when_the_server_omits_it_entirely() {
+        let v = json!({ "capabilities": {} });
+        assert_eq!(parse_sync_kind(&v), None);
+    }
 
     #[test]
     fn hover_parses_a_markup_content_object() {

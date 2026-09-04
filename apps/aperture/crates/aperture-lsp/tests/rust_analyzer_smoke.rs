@@ -292,3 +292,60 @@ fn hover_reports_a_type_signature_for_a_real_function_through_rust_analyzer() {
     client.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn incremental_did_change_is_reflected_when_the_server_supports_it() {
+    if !rust_analyzer_available() {
+        eprintln!("SKIPPED: rust-analyzer not on PATH");
+        return;
+    }
+    let dir = scratch_package("incremental");
+    let main_rs = dir.join("src/main.rs");
+    let v1 = "fn main() {\n    let x = 1;\n}\n";
+    std::fs::write(&main_rs, v1).unwrap();
+    let uri = format!("file://{}", main_rs.display());
+    let root_uri = format!("file://{}", dir.display());
+
+    let client = aperture_lsp::LspClient::spawn("rust-analyzer", &[], &root_uri)
+        .expect("spawn rust-analyzer");
+    client.did_open(&uri, "rust", v1, 1).expect("didOpen");
+
+    assert!(
+        client.supports_incremental_sync(),
+        "rust-analyzer is expected to advertise incremental sync"
+    );
+
+    // Insert "freshly_added_function() -> i32 { 0 }\n" as a new line 0,
+    // via a RANGE replace of the empty range at (0,0) — a pure insertion,
+    // the simplest real incremental edit — then check completion sees it,
+    // the same way did_change_is_reflected_in_the_next_completion already
+    // proves full-document sync does.
+    let insertion = "fn freshly_added_function() -> i32 { 0 }\n";
+    client
+        .did_change_range(&uri, 0, 0, 0, 0, insertion, 2)
+        .expect("did_change_range");
+
+    let v2 = format!("{insertion}{v1}");
+    // Also append a call site so there's something to complete against.
+    let v3 = v2.replace("let x = 1;", "let x = 1;\n    let y = freshly_ad");
+    client
+        .did_change_range(&uri, 2, 0, 2, 0, "    let y = freshly_ad\n", 3)
+        .expect("second did_change_range");
+
+    let mut items = Vec::new();
+    for attempt in 0..20 {
+        items = client.completion(&uri, 2, 22).unwrap_or_default(); // end of "freshly_ad"
+        if items.iter().any(|i| i.label.contains("freshly_added_function")) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500 * (attempt + 1).min(4)));
+    }
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(
+        labels.iter().any(|l| l.contains("freshly_added_function")),
+        "the incrementally-inserted function should be completable; got {labels:?}. v3 for reference: {v3:?}"
+    );
+
+    client.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
