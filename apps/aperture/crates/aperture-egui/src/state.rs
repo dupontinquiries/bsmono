@@ -59,6 +59,7 @@ pub enum K {
     G,
     D,
     L,
+    I,
 }
 
 /// Incremental search. Matches are absolute char ranges, kept sorted; the
@@ -476,6 +477,9 @@ pub struct AppState {
     /// `DefinitionOutcome` is applied only if this still matches — same
     /// generation-gate `lsp_gen` already is for completions.
     lsp_definition_gen: u64,
+    /// Bumped on every hover request; an arriving `HoverOutcome` is
+    /// applied only if this still matches.
+    lsp_hover_gen: u64,
     /// Latest `publishDiagnostics` for the current file, empty when no LSP
     /// worker is running or the file is currently clean. Line numbers are
     /// LSP's own (zero-indexed), matching `git_changed`'s convention.
@@ -618,6 +622,7 @@ impl AppState {
             lsp_gen: 0,
             lsp_pending_prefix_start: None,
             lsp_definition_gen: 0,
+            lsp_hover_gen: 0,
             lsp_diagnostics: Vec::new(),
             voice_session: aperture_core::voice::VoiceSession::new(),
         };
@@ -1986,6 +1991,10 @@ impl AppState {
         while let Some(outcome) = lsp.poll_definition() {
             definition_outcomes.push(outcome);
         }
+        let mut hover_outcomes = Vec::new();
+        while let Some(outcome) = lsp.poll_hover() {
+            hover_outcomes.push(outcome);
+        }
         while let Some(diags) = lsp.poll_diagnostics() {
             self.lsp_diagnostics = diags;
         }
@@ -2042,6 +2051,47 @@ impl AppState {
                 None => self.set_status("go to definition: nothing found", now_ms),
             }
         }
+        for outcome in hover_outcomes {
+            if outcome.generation != self.lsp_hover_gen {
+                continue; // superseded by a later lookup; the caret moved on
+            }
+            match outcome.hover {
+                // Status messages are single-line by convention elsewhere
+                // in this shell; a hover's first line (usually the type
+                // signature) is the useful headline, and a real hover
+                // overlay showing the rest is future work, not attempted
+                // in this pass — see TODO.md.
+                Some(h) => {
+                    let headline = Self::hover_headline(&h.contents);
+                    self.set_status(&headline, now_ms);
+                }
+                None => self.set_status("hover: nothing found", now_ms),
+            }
+        }
+    }
+
+    /// Pick the useful line out of a flattened hover text for a single-line
+    /// status message. NOT just the first line: rust-analyzer's own hover
+    /// convention for a function/type commonly puts a bare crate-name
+    /// annotation line first (found by running this exact scenario — a
+    /// hover for a same-crate function came back with the status bar
+    /// showing the crate's own package name, not the signature, because
+    /// the naive "first line" version of this code took it literally).
+    /// Prefers the first line that actually looks like Rust code (a
+    /// keyword or `->` in it); falls back to the first non-empty line if
+    /// nothing matches, so a server with a different convention still
+    /// shows SOMETHING rather than an empty status.
+    fn hover_headline(contents: &str) -> String {
+        const SIGNATURE_MARKERS: &[&str] =
+            &["fn ", "struct ", "enum ", "trait ", "impl ", "type ", "const ", "static ", "let ", "->"];
+        contents
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && *l != "```rust" && *l != "```")
+            .find(|l| SIGNATURE_MARKERS.iter().any(|m| l.contains(m)))
+            .or_else(|| contents.lines().map(str::trim).find(|l| !l.is_empty()))
+            .unwrap_or("")
+            .to_string()
     }
 
     /// Retire cached completions whose context genuinely left the buffer.
@@ -2198,6 +2248,7 @@ impl AppState {
                 } 
             }
             (F12, false) => self.go_to_definition(now_ms),
+            (I, true) => self.request_hover(now_ms),
             (Space, true) if shift => self.trigger_completion_now(now_ms),
             (Space, true) => self.refresh_popup(1),
             (Left, true) => self.moved(|s, sh| s.editor.move_word(-1, sh), shift),
@@ -2470,6 +2521,21 @@ impl AppState {
         let line_text = self.editor.buffer.line(p.line);
         let utf16_col = aperture_core::width::char_col_to_utf16(&line_text, p.col);
         lsp.request_definition(uri.clone(), p.line as u32, utf16_col, self.lsp_definition_gen);
+    }
+
+    /// Ctrl+I: ask the LSP worker for a type signature / doc summary at
+    /// the caret. Same "silently unavailable" handling as go-to-definition
+    /// when no worker is running.
+    fn request_hover(&mut self, now_ms: u64) {
+        let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri) else {
+            self.set_status("hover: no language server running", now_ms);
+            return;
+        };
+        self.lsp_hover_gen += 1;
+        let p = self.editor.caret_pos();
+        let line_text = self.editor.buffer.line(p.line);
+        let utf16_col = aperture_core::width::char_col_to_utf16(&line_text, p.col);
+        lsp.request_hover(uri.clone(), p.line as u32, utf16_col, self.lsp_hover_gen);
     }
 
     /// Apply an arrived go-to-definition answer: jump to the FIRST location
@@ -3591,6 +3657,33 @@ mod tests {
         assert!(s.palette.is_some());
         assert!(s.extra_cursors.is_empty(),
             "voice commands mutate through single-cursor methods; stale extras must not survive");
+    }
+
+    #[test]
+    fn hover_headline_skips_a_leading_bare_crate_name_line() {
+        // The exact bug found interactively: rust-analyzer's hover for a
+        // function commonly starts with a bare crate-name annotation line
+        // before the actual signature.
+        let contents = "my_crate\n\n```rust\nfn compute_total() -> i32\n```";
+        assert_eq!(AppState::hover_headline(contents), "fn compute_total() -> i32");
+    }
+
+    #[test]
+    fn hover_headline_finds_a_signature_line_wherever_it_sits() {
+        let contents = "some preamble\nmore preamble\nlet x: i32";
+        assert_eq!(AppState::hover_headline(contents), "let x: i32");
+    }
+
+    #[test]
+    fn hover_headline_falls_back_to_first_nonblank_line_with_no_signature_marker() {
+        let contents = "\n  \njust some plain doc text\nmore text";
+        assert_eq!(AppState::hover_headline(contents), "just some plain doc text");
+    }
+
+    #[test]
+    fn hover_headline_of_empty_contents_is_an_empty_string() {
+        assert_eq!(AppState::hover_headline(""), "");
+        assert_eq!(AppState::hover_headline("   \n  \n"), "");
     }
 
     #[test]

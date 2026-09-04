@@ -13,7 +13,7 @@
 //! stays the popup's baseline either way (see `aperture_lsp`'s crate doc for
 //! why LSP is an ADDITIONAL tier, not a replacement).
 
-use aperture_lsp::{CompletionItem, Diagnostic, Location, LspClient};
+use aperture_lsp::{CompletionItem, Diagnostic, Hover, Location, LspClient};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::Duration;
 
@@ -22,6 +22,7 @@ enum Msg {
     Change { uri: String, text: String, version: i64 },
     Complete { uri: String, line: u32, character: u32, generation: u64 },
     Definition { uri: String, line: u32, character: u32, generation: u64 },
+    HoverAt { uri: String, line: u32, character: u32, generation: u64 },
 }
 
 /// A completed (or failed-and-empty) completion request, tagged with the
@@ -42,11 +43,18 @@ pub struct DefinitionOutcome {
     pub locations: Vec<Location>,
 }
 
+/// Same shape again, for `textDocument/hover`.
+pub struct HoverOutcome {
+    pub generation: u64,
+    pub hover: Option<Hover>,
+}
+
 pub struct LspWorker {
     tx: Sender<Msg>,
     rx: Receiver<LspOutcome>,
     diag_rx: Receiver<Vec<Diagnostic>>,
     def_rx: Receiver<DefinitionOutcome>,
+    hover_rx: Receiver<HoverOutcome>,
 }
 
 impl LspWorker {
@@ -60,11 +68,12 @@ impl LspWorker {
         let (out_tx, rx) = channel::<LspOutcome>();
         let (diag_tx, diag_rx) = channel::<Vec<Diagnostic>>();
         let (def_tx, def_rx) = channel::<DefinitionOutcome>();
+        let (hover_tx, hover_rx) = channel::<HoverOutcome>();
         std::thread::Builder::new()
             .name("aperture-lsp-worker".into())
-            .spawn(move || worker(client, worker_rx, out_tx, diag_tx, def_tx))
+            .spawn(move || worker(client, worker_rx, out_tx, diag_tx, def_tx, hover_tx))
             .expect("spawn LSP worker thread");
-        Ok(LspWorker { tx, rx, diag_rx, def_rx })
+        Ok(LspWorker { tx, rx, diag_rx, def_rx, hover_rx })
     }
 
     pub fn open(&self, uri: String, text: String) {
@@ -89,6 +98,11 @@ impl LspWorker {
         let _ = self.tx.send(Msg::Definition { uri, line, character, generation });
     }
 
+    /// Queue a hover request. Same coalesce-to-newest rule.
+    pub fn request_hover(&self, uri: String, line: u32, character: u32, generation: u64) {
+        let _ = self.tx.send(Msg::HoverAt { uri, line, character, generation });
+    }
+
     /// Non-blocking; call once per frame.
     pub fn poll(&self) -> Option<LspOutcome> {
         self.rx.try_recv().ok()
@@ -105,17 +119,23 @@ impl LspWorker {
     pub fn poll_definition(&self) -> Option<DefinitionOutcome> {
         self.def_rx.try_recv().ok()
     }
+
+    /// Non-blocking; call once per frame.
+    pub fn poll_hover(&self) -> Option<HoverOutcome> {
+        self.hover_rx.try_recv().ok()
+    }
 }
 
-fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>, diag_tx: Sender<Vec<Diagnostic>>, def_tx: Sender<DefinitionOutcome>) {
+fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>, diag_tx: Sender<Vec<Diagnostic>>, def_tx: Sender<DefinitionOutcome>, hover_tx: Sender<HoverOutcome>) {
     // Drain-to-newest before acting, same shape as aperture_complete's own
     // worker loop: Open/Change messages all apply in order (each is a real,
     // needed state transition the server must see), but if several
-    // Complete or Definition requests piled up while a previous call was
-    // in flight, only the LAST one of each kind is worth answering — the
-    // caret has moved on.
+    // Complete, Definition, or HoverAt requests piled up while a previous
+    // call was in flight, only the LAST one of each kind is worth
+    // answering — the caret has moved on.
     let mut pending_complete: Option<(String, u32, u32, u64)> = None;
     let mut pending_definition: Option<(String, u32, u32, u64)> = None;
+    let mut pending_hover: Option<(String, u32, u32, u64)> = None;
     // The URI diagnostics get checked against — whatever the last Open or
     // Change named. `publishDiagnostics` is a PUSH, not a reply to
     // anything this worker asked for, so there is no message to drain for
@@ -145,6 +165,9 @@ fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>, diag_tx:
                 Some(Msg::Definition { uri, line, character, generation }) => {
                     pending_definition = Some((uri, line, character, generation));
                 }
+                Some(Msg::HoverAt { uri, line, character, generation }) => {
+                    pending_hover = Some((uri, line, character, generation));
+                }
                 None => break,
             }
             match rx.try_recv() {
@@ -162,6 +185,12 @@ fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>, diag_tx:
         if let Some((uri, line, character, generation)) = pending_definition.take() {
             let locations = client.goto_definition(&uri, line, character).unwrap_or_default();
             if def_tx.send(DefinitionOutcome { generation, locations }).is_err() {
+                return; // receiver dropped
+            }
+        }
+        if let Some((uri, line, character, generation)) = pending_hover.take() {
+            let hover = client.hover(&uri, line, character).unwrap_or(None);
+            if hover_tx.send(HoverOutcome { generation, hover }).is_err() {
                 return; // receiver dropped
             }
         }
