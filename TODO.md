@@ -710,8 +710,43 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   tests re-run and still pass, since they all now exercise this path on
   every keystroke.
 
-  Also still not done: a real hover overlay (currently a one-line status
-  message, not a panel showing the full flattened text).
+  ~~Also still not done: a real hover overlay (currently a one-line
+  status message, not a panel showing the full flattened text)~~ **DONE,
+  one commit later — and building its test uncovered a serious
+  pre-existing bug.** `AppState.hover_overlay` holds the full flattened
+  hover text; a new `view.rs` overlay (modeled on `edit_review_overlay`'s
+  shape) renders it in a scrollable panel, cleared on Escape, on the next
+  edit, or when superseded by a newer answer.
+
+  **The bug found building it**: `type_text`'s SINGLE-CURSOR plain-typing
+  path inlined three of `after_edit`'s six responsibilities and silently
+  never ran the other three — including `notify_lsp_changed`. Concretely:
+  `didChange` was NEVER sent to the LSP server for an ordinary keystroke,
+  only for backspace/delete/enter/tab and the multi-cursor fan-out path.
+  Every LSP e2e test in this whole session happened to still pass despite
+  this, because they all ask for completions at a position whose
+  surrounding SCOPE is already correct from `didOpen` alone — an
+  unfiltered "what's in scope here" answer doesn't need the exact typed
+  prefix to have been communicated to look right. Found only because a
+  test for the overlay's "clear on next edit" behavior failed and the
+  failure didn't match the mental model of what should have been true.
+
+  Verified BOTH directions before trusting the fix: `lsp_typing_sync_
+  regression.rs` defines a brand-new local variable by typing its full
+  declaration character-by-character, then asks for completions against
+  that exact name from a different line — answerable ONLY if the
+  keystrokes were actually synced. Confirmed it fails against the
+  pre-fix code (reverted `state.rs` by hand, ran it, watched it fail)
+  and passes against the fix, in that order, before committing either.
+
+  Also found and fixed a SECOND duplicated `#[test]` attribute while
+  writing tests for this — same bug shape as twice before this session,
+  this time caught immediately via `cargo check --all-targets`'s own
+  warning rather than grep-based reasoning, which is the lesson the
+  previous occurrence was supposed to have already taught.
+
+  `cargo test -p aperture-egui --lib`: 108/108 (was 106). Full workspace
+  check clean, no lingering `rust-analyzer` process.
   `workspace_symbols`'s local tree-sitter outline and `route`'s
   keyword-scored candidates stay the fast, dependency-free default tiers;
   LSP is an ADDITIONAL tier alongside them, never a replacement.
