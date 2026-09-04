@@ -112,6 +112,73 @@ pub fn block_hf_energy(f: &Frame, x: u32, y: u32, size: u32) -> f64 {
     sum as f64 / n.max(1) as f64
 }
 
+/// Remove isolated tier assignments — a block whose Missing neighbours all
+/// agree on a different tier joins them.
+///
+/// # Why
+///
+/// Tier is a hard threshold on a per-block texture measure, so two ADJACENT
+/// blocks either side of `tier_std[1]` are upscaled by different networks. A
+/// difference between two models is a larger discontinuity than a difference
+/// between two applications of one model, and `residual::blend_block` feathers
+/// the seam without making the two halves match.
+///
+/// The visible case is a SINGLETON: one block routed to bicubic in the middle
+/// of a network-upscaled region, or the reverse. It reads as a patch, not as a
+/// texture boundary.
+///
+/// # Deliberately conservative
+///
+/// Only a block whose Missing neighbours UNANIMOUSLY disagree with it is
+/// moved. A majority rule would erode genuine texture boundaries — a real
+/// edge between smooth sky and detailed foliage SHOULD change tier, and
+/// smoothing it away spends network time on sky.
+///
+/// Non-Missing blocks are not considered on either side: they carry tier 0 by
+/// default and are not upscaled at all, so counting them as votes would drag
+/// every block beside a stationary region down to tier 0.
+///
+/// One pass, not to convergence. A second pass would let a change propagate,
+/// which is the erosion this avoids.
+pub fn despeckle_tiers(tier_of: &[u8], matches: &[BlockMatch], cols: usize, rows: usize) -> Vec<u8> {
+    let mut out = tier_of.to_vec();
+    for i in 0..tier_of.len() {
+        if matches.get(i) != Some(&BlockMatch::Missing) {
+            continue;
+        }
+        let (cx, cy) = (i % cols, i / cols);
+        let mut agreed: Option<u8> = None;
+        let mut n = 0usize;
+        for (dx, dy) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+            let (nx, ny) = (cx as i64 + dx, cy as i64 + dy);
+            if nx < 0 || ny < 0 || nx >= cols as i64 || ny >= rows as i64 {
+                continue;
+            }
+            let j = ny as usize * cols + nx as usize;
+            if matches.get(j) != Some(&BlockMatch::Missing) {
+                continue;
+            }
+            match agreed {
+                None => { agreed = Some(tier_of[j]); n = 1; }
+                Some(t) if t == tier_of[j] => n += 1,
+                // Neighbours disagree with each other: this is a real
+                // boundary, not a speckle. Leave it alone.
+                Some(_) => { n = 0; break; }
+            }
+        }
+        // At least two agreeing neighbours: a single one is not evidence, and
+        // a block with one Missing neighbour is itself on an edge.
+        if n >= 2 {
+            if let Some(t) = agreed {
+                if t != tier_of[i] {
+                    out[i] = t;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The tier feature for a block under `metric`.
 pub fn block_feature(f: &Frame, x: u32, y: u32, size: u32, metric: TierMetric) -> f64 {
     match metric {
@@ -372,6 +439,12 @@ pub fn analyze_tiered(
             }
         })
         .collect();
+    // Isolated tier singletons are removed before packing. See
+    // `despeckle_tiers` — a lone cheap block inside a field of expensive ones
+    // is upscaled by a DIFFERENT network than everything touching it, and no
+    // amount of edge feathering hides that.
+    let tier_of = despeckle_tiers(&tier_of, &matches, grid.cols as usize, grid.rows as usize);
+
     let mut counts = [0usize; MAX_TIERS];
     for (i, m) in matches.iter().enumerate() {
         if *m == BlockMatch::Missing {
@@ -702,4 +775,84 @@ mod feature_tests {
         // A smooth synthetic frame sits far below the checkerboard.
         assert!(block_hf_energy(&smooth(32, 32, 1), 0, 0, 32) < h_sharp);
     }
+    fn miss(n: usize) -> Vec<BlockMatch> { vec![BlockMatch::Missing; n] }
+
+    #[test]
+    fn a_lone_block_in_a_different_tier_joins_its_neighbours() {
+        // The visible case: one block routed to a different NETWORK in the
+        // middle of a uniform region. It reads as a patch, and feathering the
+        // seam does not make the two halves match.
+        let (cols, rows) = (3, 3);
+        let mut t = vec![0u8; 9];
+        t[4] = 2; // the centre, surrounded by tier 0
+        let out = despeckle_tiers(&t, &miss(9), cols, rows);
+        assert_eq!(out[4], 0, "the singleton was left alone");
+        assert_eq!(out.iter().filter(|&&x| x == 0).count(), 9);
+    }
+
+    #[test]
+    fn a_real_texture_boundary_survives() {
+        // A genuine edge between smooth and detailed SHOULD change tier.
+        // Eroding it spends network time on sky, which is what the cascade
+        // exists to avoid — so a block whose neighbours disagree with EACH
+        // OTHER is left alone.
+        let (cols, rows) = (3, 3);
+        // A block on the boundary with a 2-to-1 majority against it. Under a
+        // MAJORITY rule it flips and the boundary erodes; under unanimity it
+        // stays. My first version used a straight 4x2 split where every block
+        // agreed with its own side, so both rules gave the same answer and the
+        // test could not tell them apart.
+        let t = vec![2, 2, 0,
+                     2, 0, 0,
+                     0, 0, 0];
+        let out = despeckle_tiers(&t, &miss(9), cols, rows);
+        assert_eq!(out[4], 0, "the centre flipped on a 2-1 majority");
+        assert_eq!(out, t, "a diagonal boundary was smoothed away");
+    }
+
+    #[test]
+    fn a_block_needs_two_agreeing_neighbours_not_one() {
+        // A corner block has two Missing neighbours at most; one agreeing
+        // neighbour is not evidence of a field, and acting on it would flip
+        // blocks along every edge of the frame.
+        let (cols, rows) = (2, 1);
+        let t = vec![0u8, 2];
+        let out = despeckle_tiers(&t, &miss(2), cols, rows);
+        assert_eq!(out, t, "a single neighbour was treated as a majority");
+    }
+
+    #[test]
+    fn non_missing_neighbours_do_not_vote() {
+        // Stationary blocks carry tier 0 by default and are never upscaled.
+        // Counting them would drag every block beside a still region down to
+        // tier 0 — the cascade would collapse wherever the picture holds.
+        let (cols, rows) = (3, 3);
+        // The neighbours must carry a DIFFERENT tier from the centre, or the
+        // test passes whether or not they vote — which is how my first version
+        // of it missed the bug entirely.
+        let mut t = vec![0u8; 9];
+        t[4] = 2;
+        let mut m = miss(9);
+        m[1] = BlockMatch::Stationary;
+        m[3] = BlockMatch::Stationary;
+        m[5] = BlockMatch::Stationary;
+        m[7] = BlockMatch::Stationary;
+        let out = despeckle_tiers(&t, &m, cols, rows);
+        assert_eq!(out[4], 2, "stationary neighbours voted the centre down to tier 0");
+    }
+
+    #[test]
+    fn one_pass_only_so_a_change_cannot_propagate() {
+        // A second pass would let each fixed block become evidence for the
+        // next, which is the erosion the unanimity rule is there to prevent.
+        // A 1x5 strip of alternating tiers must not collapse to one tier.
+        let (cols, rows) = (5, 1);
+        let t = vec![0u8, 2, 0, 2, 0];
+        let out = despeckle_tiers(&t, &miss(5), cols, rows);
+        // Interior blocks have two neighbours that agree with each other and
+        // differ from them, so they flip — once.
+        assert_eq!(out, vec![0, 0, 2, 0, 0],
+                   "a single pass did not produce a single-pass result: {out:?}");
+    }
+
 }
