@@ -43,7 +43,7 @@ mkdir -p "$OUT"
 # indistinguishable by name.
 STAMP="$OUT/.${SERIES}-seq"
 last_dir=$(ls "$OUT" 2>/dev/null | sed -n "s/^${SERIES}-\([0-9]\{3\}\)-.*\.bundle$/\1/p" | sort -n | tail -1)
-last_stamp=$(cat "$STAMP" 2>/dev/null | tr -dc '0-9')
+last_stamp=$( (cat "$STAMP" 2>/dev/null || true) | tr -dc '0-9')
 last=$(printf '%s\n%s\n' "${last_dir:-0}" "${last_stamp:-0}" | sort -n | tail -1)
 next=$(printf '%03d' $(( 10#${last:-0} + 1 )))
 printf '%s\n' "$next" > "$STAMP"
@@ -96,7 +96,16 @@ stage="$(mktemp -d)/$(basename "$path")"
 trap 'rm -rf "$(dirname "$stage")"' EXIT
 
 echo "writing $stage"
-git bundle create "$stage" --all refs/notes/toolcalls
+if git rev-parse -q --verify refs/notes/toolcalls >/dev/null; then
+  git bundle create "$stage" --all refs/notes/toolcalls
+else
+  # No capture in this repo's history at all (not the same as "capture ran and
+  # found nothing" — see SKILL_session_capture.md failure mode #3). Ship
+  # without it rather than fail the whole export on a ref that was never
+  # going to exist; --all still carries every branch and tag.
+  echo "no refs/notes/toolcalls in this repo — exporting --all without it" >&2
+  git bundle create "$stage" --all
+fi
 
 echo "verifying…"
 git bundle verify "$stage" | tail -4
