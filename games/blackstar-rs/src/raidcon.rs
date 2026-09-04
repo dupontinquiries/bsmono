@@ -759,6 +759,31 @@ mod tests {
         }
     }
 
+    /// `Arena.note` — ten real, hand-written lore lines (e.g. "the horizon
+    /// curves the wrong way; every SYNC ends here") — had zero UI consumer
+    /// anywhere in the codebase: constructed here, flagged by the compiler
+    /// as dead code, never read again. `main.rs::begin_raid` is the fix,
+    /// but that method lives on the full game struct and isn't cheaply
+    /// callable from a unit test, so this checks the two things that
+    /// matter without constructing one: the data is real prose (not a
+    /// placeholder), and the actual call site's format string really
+    /// includes it — the same call-site-scan shape `hud.rs`'s banner tests
+    /// already use for exactly this failure mode (logic that looks wired
+    /// but nothing calls, or a call site that looks like it reads a field
+    /// but doesn't).
+    #[test]
+    fn every_arena_has_real_lore_and_the_raid_toast_actually_shows_it() {
+        for a in ARENAS {
+            assert!(a.note.len() > 15, "{} has a placeholder-length note: {:?}", a.id, a.note);
+            assert!(a.note.chars().any(|c| c == ' '), "{} note isn't prose: {:?}", a.id, a.note);
+        }
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("\"the signal is answered — {} — {}\", r.boss.name, a.note"),
+            "begin_raid's toast no longer shows the arena's note"
+        );
+    }
+
     #[test]
     fn every_sync_boss_ends_at_unending() {
         for b in BOSSES.iter().filter(|b| b.mech == Mech::Sync) {

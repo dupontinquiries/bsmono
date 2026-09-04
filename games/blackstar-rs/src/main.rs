@@ -8180,7 +8180,13 @@ impl Game {
                 let a = r.arena();
                 self.arena_map(a);
                 self.close_deck();
-                self.toastf(&format!("the signal is answered — {}", r.boss.name));
+                // arena.note is real, authored lore (10 arenas, one line
+                // each — e.g. "the horizon curves the wrong way; every SYNC
+                // ends here") that had zero UI consumer anywhere in the
+                // codebase before this: constructed once in raidcon.rs and
+                // never read again. This is the moment a player is dropped
+                // into that arena, so it's the natural place for it.
+                self.toastf(&format!("the signal is answered — {} — {}", r.boss.name, a.note));
                 self.sortie = None; // one flight at a time
                 self.raid = Some(r);
             }
