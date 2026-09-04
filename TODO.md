@@ -553,10 +553,31 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   or wrong test claiming more than is proven would be worse than naming
   the gap. Follow-up work.
 
+  ~~Still not done: ... wiring diagnostics into the shell at all (no
+  gutter marks, no status count — the client can fetch them, nothing in
+  aperture-egui asks it to yet)~~ **DONE, later commit.** `lsp_worker.rs`
+  wakes on a 200ms `recv_timeout` instead of blocking indefinitely on
+  `rx.recv()` — diagnostics are PUSHED by the server, not requested, and
+  the common case ("type an error, then pause") means the diagnostic
+  arrives AFTER the last edit, exactly when the worker would otherwise
+  have nothing left to wake it. Forwards only when the list actually
+  changed. `AppState.lsp_diagnostics`, a second gutter bar (deliberately
+  not sharing the git-diff bar's x position or color — an uncommitted
+  line with a live error is a common, real combination), and a status-bar
+  error/warning count, measured into the same room-budget check the
+  earlier status-bar overlap fix established so this can't reintroduce
+  that bug. Real proof: `lsp_diagnostics_e2e.rs` opens a genuine
+  `&str`-to-`i32` mismatch against a real `rust-analyzer` and polls
+  `AppState` (not the client) until the error surfaces on the right
+  line — deliberately does NOT test that fixing the error clears it,
+  since the paragraph above already found that unreliable and a second
+  test on the same unstable ground would just be more flakiness, not
+  information. Screenshot-verified afterward too: a real red gutter bar
+  on the mismatched line, "✕ 2 errors" in the status bar, both sourced
+  from a live server process.
+
   Still not done: go-to-definition, hover, incremental sync (`did_change`
-  always sends the whole document), and wiring diagnostics into the shell
-  at all (no gutter marks, no status count — the client can fetch them,
-  nothing in `aperture-egui` asks it to yet).
+  always sends the whole document).
   `workspace_symbols`'s local tree-sitter outline and `route`'s
   keyword-scored candidates stay the fast, dependency-free default tiers;
   LSP is an ADDITIONAL tier alongside them, never a replacement.
