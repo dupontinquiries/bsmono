@@ -457,6 +457,56 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   new tests are both `view.rs`/integration-test-only).
 - **LSP**: still genuinely open. Own crate, behind the same worker pattern
   as the completion `Engine` — this one is real scope, not a stale note.
+- **Voice commands — the text-side half, DONE; the audio half deliberately
+  not attempted.** aperture has no microphone, no ASR, no wake-word
+  detector, and building one from scratch would duplicate `shared/
+  voice-kit` and `apps/voiceterm/egui-frontend/src/voice_routing.rs`'s
+  hallucination-trimming, wake-prefix, and consumer-arbitration work —
+  those own "how do we hear" and "who gets to act"; this session added the
+  piece neither of them does: turning an already-decoded transcript into
+  an EDITOR command.
+
+  `aperture-core/src/voice.rs`: a small, deliberately unforgiving
+  `VoiceCommand` grammar (save, undo/redo, select all, copy/cut/paste,
+  find/search-for, go-to-line, add-cursor/select-all-occurrences, a
+  `type <words>` escape hatch for literal dictated text) — unforgiving
+  because voice_routing.rs's own philosophy is that a near-miss should not
+  execute, and a command vocabulary loose enough to catch every phrasing
+  is also loose enough to fire on ordinary dictated prose. 9 tests.
+
+  `AppState::run_voice_command`: every arm calls an EXISTING method
+  (`save`, `Editor::undo`, `add_next_cursor`, ...) rather than
+  duplicating its logic, so a voice command and its keyboard equivalent
+  can never disagree about what it does. Returns clipboard text for
+  Copy/Cut the same shape `Effects` does from `handle()`, since this
+  headless method has no path to the platform clipboard itself. 10 tests.
+
+  Palette entry "Voice: run command…" — a typed stand-in for what a
+  transcript would say, useful on its own for testing command shapes
+  without a working microphone.
+
+  Two real bugs found by running the actual binary, not by `cargo test`:
+  a first attempt bound this to Ctrl+Shift+V, which silently never fired —
+  traced to egui delivering Ctrl+V-family combos as its own clipboard
+  `Event::Paste`/`Event::Copy` before they become a raw key event, in
+  every environment where that interception applies. Removed the
+  keybinding rather than ship one that quietly does nothing; the palette
+  route is the only entry point now, and it works (verified: "find total"
+  opens the bar seeded and matched, "go to line 3" moves the caret,
+  "save" writes the file and shows "saved" in the status bar). Also found
+  two now-divergent copies of the same "open voice mode, discard stale
+  cursors" logic (the removed keybinding's handler and the palette
+  dispatch) and merged them into one method before they could drift.
+
+  `cargo test -p aperture-core --features tree-sitter`: 143/143 (was
+  134). `cargo test -p aperture-egui --lib`: 98/98 (was 88).
+
+  Not attempted: an actual dictation sink (voice_routing.rs's
+  `Listening::Commands` state is the model to follow — this parser would
+  be the intent matcher it describes as "suspended during dictation," not
+  something that runs on every transcript unconditionally); this needs a
+  real audio pipeline wired to aperture's process model, which is a
+  materially different and larger piece of work than the grammar above.
 
 ## voiceterm — loop-trimmer off-by-one (fixed at source, 2026-08-19)
 

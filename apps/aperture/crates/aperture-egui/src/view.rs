@@ -1054,6 +1054,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
     let mut open_path: Option<String> = None;
     let mut open_hit: Option<(std::path::PathBuf, usize)> = None;
     let mut submit_edit: Option<String> = None;
+    let mut submit_voice: Option<String> = None;
 
     // Go-to-route's AI tier: trigger from a tight, self-contained borrow
     // scope (owned String + Vec) so it doesn't overlap the palette borrow
@@ -1096,6 +1097,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                         Mode::WorkspaceSymbol => "symbol name…",
                         Mode::GoToRoute => "describe what you're looking for…",
                         Mode::AiEditPrompt => "instruction for the selection…",
+                        Mode::VoiceCommand => "say a command — \"save\", \"find total\", \"go to line 12\"…",
                     };
                     let edit = egui::TextEdit::singleline(&mut p.input).id_salt("view-p_input")
                         .hint_text(hint)
@@ -1482,6 +1484,16 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 submit_edit = Some(p.input.trim().to_string());
                             }
                         }
+                        Mode::VoiceCommand => {
+                            ui.label(
+                                egui::RichText::new("type what you'd say, then Enter · Esc cancel")
+                                    .color(colors.text_weak)
+                                    .small(),
+                            );
+                            if enter && !p.input.trim().is_empty() {
+                                submit_voice = Some(p.input.trim().to_string());
+                            }
+                        }
                     }
                 });
         });
@@ -1496,6 +1508,14 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
 
     if let Some(instruction) = submit_edit {
         state.request_edit(&instruction, now_ms);
+        state.palette = None;
+        return;
+    }
+
+    if let Some(utterance) = submit_voice {
+        if let Some(clip) = state.run_voice_command(&utterance, now_ms) {
+            ctx.copy_text(clip);
+        }
         state.palette = None;
         return;
     }

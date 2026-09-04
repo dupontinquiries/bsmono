@@ -64,6 +64,10 @@ pub mod op;
 pub mod project_search;
 pub mod syntax;
 pub mod width;
+/// Text-side voice command grammar: decoded utterance -> structured
+/// [`voice::VoiceCommand`]. No microphone, no ASR — see the module doc for
+/// why that's `shared/voice-kit`'s and voiceterm's job, not this one's.
+pub mod voice;
 #[cfg(feature = "tree-sitter")]
 pub mod ts;
 #[cfg(feature = "tree-sitter")]

@@ -1672,7 +1672,7 @@ impl AppState {
     /// correctly restored, but `extra_cursors` were never told the buffer
     /// changed length — the very next keystroke would have fanned out to
     /// whatever those stale offsets now happened to land on).
-    fn discard_extra_cursors(&mut self) {
+    pub(crate) fn discard_extra_cursors(&mut self) {
         self.extra_cursors.clear();
     }
 
@@ -2669,6 +2669,85 @@ impl AppState {
         self.debounce.cancel();
     }
 
+    pub(crate) fn open_voice_command(&mut self) {
+        // Same reasoning as `open_find_ex`: almost every VoiceCommand arm
+        // mutates through a single-cursor method (undo, Editor::select_all,
+        // goto_line, ...) with no notion of extra_cursors, so this mode
+        // change is the same kind of fan-out-unaware entry point.
+        self.discard_extra_cursors();
+        self.palette = Some(crate::palette_ui::PaletteState::voice_command());
+        self.ghost.dismiss();
+        self.debounce.cancel();
+    }
+
+    /// Palette entry point for a typed stand-in for a voice transcript —
+    /// see `aperture_core::voice`'s module doc for the honest scope (no
+    /// microphone, no ASR; this is the intent-matching half only). Every
+    /// arm calls an EXISTING method rather than duplicating its logic, so
+    /// "voice save" and Ctrl+S can never disagree about what saving means.
+    ///
+    /// Returns clipboard text for Copy, same shape as `Effects::clipboard`
+    /// from `handle()` — the caller is responsible for actually setting the
+    /// platform clipboard (this crate is headless w.r.t. `arboard`/egui's
+    /// own clipboard, same reason `Effects` exists at all).
+    pub fn run_voice_command(&mut self, utterance: &str, now_ms: u64) -> Option<String> {
+        use aperture_core::voice::VoiceCommand as V;
+        match aperture_core::voice::parse(utterance) {
+            V::Save => self.save(now_ms),
+            V::Undo => self.editor.undo(),
+            V::Redo => self.editor.redo(),
+            V::SelectAll => self.editor.select_all(),
+            V::Copy => return self.copy_selection(),
+            V::Cut => {
+                let clip = self.copy_selection();
+                if !self.editor.sel.is_caret() {
+                    let (a, b) = (self.editor.sel.min(), self.editor.sel.max());
+                    self.editor.replace_range(a, b, "");
+                    self.after_edit(now_ms);
+                }
+                return clip;
+            }
+            V::Paste => {
+                // No clipboard SOURCE reaches this entry point (the platform
+                // clipboard is read by the view layer's egui::Event::Paste,
+                // not by anything this headless method can call into) — say
+                // so rather than silently doing nothing, same honesty as
+                // the Unknown arm below.
+                self.set_status("voice: paste needs the palette closed — Ctrl+V works normally", now_ms);
+            }
+            V::NewLine => {
+                self.editor.newline_smart(now_ms);
+                self.after_edit(now_ms);
+            }
+            V::Escape => {
+                self.dismiss_menu();
+                self.ghost.dismiss();
+                self.extra_cursors.clear();
+            }
+            V::Find(q) => {
+                self.open_find();
+                if let Some(f) = &mut self.find {
+                    f.query = q;
+                    f.recompute(&self.editor.buffer, self.editor.version);
+                }
+            }
+            V::GoToLine(n) => {
+                self.editor.goto_line(n.saturating_sub(1)); // spoken "line 1" is index 0
+                self.follow_caret = true;
+            }
+            V::AddNextCursor => self.add_next_cursor(now_ms),
+            V::SelectAllOccurrences => self.select_all_cursor_occurrences(now_ms),
+            V::Type(text) => {
+                self.editor.insert_text(&text, now_ms);
+                self.after_edit(now_ms);
+            }
+            V::Unknown(text) => {
+                self.set_status(&format!("voice: didn't understand \"{text}\""), now_ms);
+            }
+        }
+        None
+    }
+
     /// Open `path` (same as `open_file`) and land the caret at `line` (a
     /// 0-based line index — project search's own convention, matching
     /// `Pos::line`/`goto_line`), then aim the camera at it. Used by project
@@ -3028,6 +3107,113 @@ mod tests {
         assert!(s.popup.is_some(), "a popup should be showing for this setup");
         key(&mut s, K::D, true, 200);
         assert!(s.popup.is_none(), "Ctrl+D must dismiss a stale popup, not just the ghost");
+    }
+
+    // ── voice commands ───────────────────────────────────────────────────
+    //
+    // aperture_core::voice has its own suite for the grammar itself; these
+    // test the SHELL half — that each VoiceCommand actually reaches the
+    // right AppState method, with the right effect on real state.
+
+    #[test]
+    fn voice_save_and_undo_redo_reach_the_real_editor_methods() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("a");
+        s.editor.sel = aperture_core::editor::Selection::caret(1);
+        s.editor.insert_text("b", 0);
+        assert_eq!(s.editor.buffer.to_string(), "ab");
+        s.run_voice_command("undo", 10);
+        assert_eq!(s.editor.buffer.to_string(), "a", "voice undo must call the real Editor::undo");
+        s.run_voice_command("redo", 20);
+        assert_eq!(s.editor.buffer.to_string(), "ab");
+    }
+
+    #[test]
+    fn voice_type_inserts_literal_text_at_the_caret() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("");
+        s.run_voice_command("type hello world", 0);
+        assert_eq!(s.editor.buffer.to_string(), "hello world");
+    }
+
+    #[test]
+    fn voice_go_to_line_is_one_indexed_the_way_a_person_says_it() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("a\nb\nc\n");
+        s.run_voice_command("go to line 2", 0);
+        assert_eq!(s.editor.caret_pos().line, 1, "spoken 'line 2' is index 1");
+    }
+
+    #[test]
+    fn voice_find_opens_the_bar_and_seeds_the_query() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("let total = 1;\n");
+        s.run_voice_command("find total", 0);
+        let f = s.find.as_ref().expect("find bar should be open");
+        assert_eq!(f.query, "total");
+        assert!(!f.matches.is_empty(), "the seeded query should already be matched");
+    }
+
+    #[test]
+    fn voice_add_next_cursor_and_select_all_occurrences_reuse_the_real_gestures() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("x = 1\ny = 2\nx = 3\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        s.run_voice_command("select all occurrences", 0);
+        assert_eq!(s.extra_cursors.len(), 1, "two x's total: one primary, one extra");
+    }
+
+    #[test]
+    fn voice_copy_returns_clipboard_text_without_touching_the_buffer() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("hello world");
+        s.editor.sel = aperture_core::editor::Selection { anchor: 0, head: 5 };
+        let clip = s.run_voice_command("copy", 0);
+        assert_eq!(clip, Some("hello".to_string()));
+        assert_eq!(s.editor.buffer.to_string(), "hello world", "copy must not mutate the buffer");
+    }
+
+    #[test]
+    fn voice_cut_returns_clipboard_text_and_removes_the_selection() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("hello world");
+        s.editor.sel = aperture_core::editor::Selection { anchor: 0, head: 6 };
+        let clip = s.run_voice_command("cut", 0);
+        assert_eq!(clip, Some("hello ".to_string()));
+        assert_eq!(s.editor.buffer.to_string(), "world");
+    }
+
+    #[test]
+    fn voice_escape_clears_extra_cursors_same_as_the_keyboard() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("aa\naa\n");
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(3)];
+        s.run_voice_command("escape", 0);
+        assert!(s.extra_cursors.is_empty());
+    }
+
+    #[test]
+    fn an_unrecognized_voice_command_sets_a_status_and_touches_nothing() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("unchanged\n");
+        let clip = s.run_voice_command("please refactor this", 0);
+        assert_eq!(clip, None);
+        assert_eq!(s.editor.buffer.to_string(), "unchanged\n");
+        let (msg, _) = s.status.clone().expect("a status should explain the no-op");
+        assert!(msg.contains("didn't understand"), "{msg}");
+    }
+
+    #[test]
+    fn opening_voice_command_mode_discards_stale_secondary_cursors() {
+        // Same class of bug as find/popup/typewriter earlier this session:
+        // the palette mode change should not leave extra_cursors dangling
+        // for a voice command that isn't fan-out-aware (most of them aren't).
+        let mut s = AppState::new(None, false);
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(0)];
+        s.open_voice_command();
+        assert!(s.palette.is_some());
+        assert!(s.extra_cursors.is_empty(),
+            "voice commands mutate through single-cursor methods; stale extras must not survive");
     }
 
     #[test]
