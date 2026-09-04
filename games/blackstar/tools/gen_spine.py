@@ -355,6 +355,14 @@ PRESETS = {
      "branch 30 pitch 20 rad 0.3 grow 6 pinch 0.4 grow 3 parent "
      "branch 55 rad 0.22 grow 5"
   ),
+  # a stubby mortar: short octagonal breech flaring hard into a wide bore --
+  # the opposite silhouette from heavy_cannon's long stepped barrel. Total
+  # growth is 5 segments against heavy_cannon's 16; the flare does the work.
+  "mortar": (
+     "sec oct seg 8 rad 0.55 grow 2 node "
+     "sec circle seg 10 rad 0.5 grow 1 "
+     "flare 0.6 grow 2"
+  ),
 }
 
 def main():

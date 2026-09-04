@@ -901,6 +901,89 @@ def deco_dish():
 v,n,uv,t = deco_dish(); write_iqm(os.path.join(DATA,"deco_dish.iqm"), v,n,uv,t, "plate_blue.png")
 print("girder + tank generated")
 
+# ---- deco SLAB: a slumped concrete/metal debris slab -- battlefield rubble ----
+def deco_slab():
+    """A cracked structural slab, tipped and half-buried -- the kind of
+    debris a blast leaves behind, not a clean architectural block."""
+    def comb(parts):
+        v=[];n=[];u=[];t=[]
+        for (vv,nn,uu,tt) in parts:
+            b=len(v); v.extend(vv);n.extend(nn);u.extend(uu)
+            for tr in tt: t.append((tr[0]+b,tr[1]+b,tr[2]+b))
+        return v,n,u,t
+    def sh(m,dx,dy,dz): return ([(x+dx,y+dy,z+dz) for(x,y,z) in m[0]],m[1],m[2],m[3])
+    def tilt(m, ang):
+        import math as _m; ca,sa=_m.cos(ang),_m.sin(ang)
+        return ([(x, y*ca - z*sa, y*sa + z*ca) for (x,y,z) in m[0]],
+                [(nx, ny*ca - nz*sa, ny*sa + nz*ca) for (nx,ny,nz) in m[1]], m[2], m[3])
+    P=[]
+    P.append(tilt(bevel_box(1.2,0.14,0.9,bevel=0.04), 0.18))       # the main slab, tipped
+    P.append(sh(bevel_box(0.30,0.30,0.24,bevel=0.06), -0.6,-0.10,0.1))  # a broken chunk beside it
+    P.append(sh(tapered_cyl(0.05,0.05,0.5,segs=6,rings=1), 0.3,0.30,-0.2))  # a snapped rebar stub
+    return comb(P)
+v,n,uv,t = deco_slab(); write_iqm(os.path.join(DATA,"deco_slab.iqm"), v,n,uv,t, "obsidian.png")
+
+# ---- deco PIPE: a broken industrial conduit, flanged at both ends ----
+def deco_pipe():
+    """A length of pipe with bolted flange collars -- the connective tissue
+    of every foundry/refinery map, usually seen snapped and leaking."""
+    def comb(parts):
+        v=[];n=[];u=[];t=[]
+        for (vv,nn,uu,tt) in parts:
+            b=len(v); v.extend(vv);n.extend(nn);u.extend(uu)
+            for tr in tt: t.append((tr[0]+b,tr[1]+b,tr[2]+b))
+        return v,n,u,t
+    def sh(m,dx,dy,dz): return ([(x+dx,y+dy,z+dz) for(x,y,z) in m[0]],m[1],m[2],m[3])
+    def rotz(m):  # lay the pipe on its side, same trick as deco_pod's hull
+        return ([(y,x,z) for (x,y,z) in m[0]], [(ny,nx,nz) for (nx,ny,nz) in m[1]], m[2], m[3])
+    P=[]
+    P.append(sh(rotz(tapered_cyl(0.22,0.22,2.2,segs=14,rings=6)), 0,0.22,0))          # the run
+    for sx in (-1.05, 1.05):                                                          # flange collars
+        P.append(sh(rotz(tapered_cyl(0.32,0.32,0.10,segs=14,rings=1)), sx,0.22,0))
+    return comb(P)
+v,n,uv,t = deco_pipe(); write_iqm(os.path.join(DATA,"deco_pipe.iqm"), v,n,uv,t, "rust.png")
+
+# ---- deco ANTENNA: a thin radio mast with a crossbar and a stub whip ----
+def deco_antenna():
+    """Not the big dish -- a plain radio mast: guy-wired look via a crossbar,
+    a short whip on top. Cheap set dressing for a rooftop or ridge line."""
+    def comb(parts):
+        v=[];n=[];u=[];t=[]
+        for (vv,nn,uu,tt) in parts:
+            b=len(v); v.extend(vv);n.extend(nn);u.extend(uu)
+            for tr in tt: t.append((tr[0]+b,tr[1]+b,tr[2]+b))
+        return v,n,u,t
+    def sh(m,dx,dy,dz): return ([(x+dx,y+dy,z+dz) for(x,y,z) in m[0]],m[1],m[2],m[3])
+    def rotz(m):
+        return ([(y,x,z) for (x,y,z) in m[0]], [(ny,nx,nz) for (nx,ny,nz) in m[1]], m[2], m[3])
+    P=[]
+    P.append(tapered_cyl(0.06,0.03,2.4,segs=8,rings=4))                    # mast, tapering up
+    P.append(sh(rotz(tapered_cyl(0.015,0.015,0.7,segs=6,rings=1)), 0,1.6,0))  # crossbar
+    P.append(sh(tapered_cyl(0.012,0.004,0.6,segs=6,rings=1), 0,2.4,0))     # whip tip
+    return comb(P)
+v,n,uv,t = deco_antenna(); write_iqm(os.path.join(DATA,"deco_antenna.iqm"), v,n,uv,t, "brushmetal.png")
+
+# ---- deco CRYSTAL: a small energon-style shard cluster, not the big column ----
+def deco_crystal():
+    """`crystal()` already exists for the big architectural column (see
+    column.iqm); this is the small scattered-prop version -- three shards
+    of different heights clustered together, the way real crystal growths
+    read rather than one lone spike."""
+    def comb(parts):
+        v=[];n=[];u=[];t=[]
+        for (vv,nn,uu,tt) in parts:
+            b=len(v); v.extend(vv);n.extend(nn);u.extend(uu)
+            for tr in tt: t.append((tr[0]+b,tr[1]+b,tr[2]+b))
+        return v,n,u,t
+    def sh(m,dx,dy,dz): return ([(x+dx,y+dy,z+dz) for(x,y,z) in m[0]],m[1],m[2],m[3])
+    P=[]
+    P.append(sh(crystal(0.28, 1.4, 6), 0.0, 0.0, 0.0))
+    P.append(sh(crystal(0.18, 0.9, 6), 0.32, 0.0, 0.1))
+    P.append(sh(crystal(0.14, 0.6, 5), -0.22, 0.0, -0.18))
+    return comb(P)
+v,n,uv,t = deco_crystal(); write_iqm(os.path.join(DATA,"deco_crystal.iqm"), v,n,uv,t, "energon.png")
+print("prop set (slab/pipe/antenna/crystal) generated")
+
 # ---- UNICRON'S HORN: a colossal curved tusk breaching the sky. Stacked tapered
 #      sections, each tilted a little further -- a sweep, not a straight spike. ----
 def deco_horn():
