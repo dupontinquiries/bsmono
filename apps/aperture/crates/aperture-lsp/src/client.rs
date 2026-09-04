@@ -35,6 +35,15 @@ pub struct CompletionItem {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Hover {
+    /// Flattened to plain text regardless of which of `hover`'s three legal
+    /// response shapes the server used (see `parse_hover_result`'s own doc)
+    /// — this client has no renderer that would benefit from keeping
+    /// Markdown structure or a per-block language tag separate.
+    pub contents: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Location {
     pub uri: String,
     pub line: u32,
@@ -229,6 +238,24 @@ impl LspClient {
         Ok(parse_definition_result(&result))
     }
 
+    /// `textDocument/hover` at `(line, character)` — usually a type
+    /// signature and/or doc comment for whatever's under the caret.
+    /// `Ok(None)` for a `null` response (nothing hoverable there, a normal
+    /// answer) — distinguished from `Err` (the request itself failed) the
+    /// same way `goto_definition`'s empty `Vec` distinguishes "no
+    /// definition" from a request error, just with `Option` instead of an
+    /// empty collection since at most one `Hover` can ever come back.
+    pub fn hover(&self, uri: &str, line: u32, character: u32) -> std::io::Result<Option<Hover>> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        });
+        let result = self
+            .request("textDocument/hover", params)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("hover failed: {e}")))?;
+        Ok(parse_hover_result(&result))
+    }
+
     fn notify(&self, method: &str, params: Value) -> std::io::Result<()> {
         let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         write_message(&mut *self.stdin.lock().unwrap(), &msg)
@@ -350,6 +377,37 @@ fn parse_diagnostics(params: &Value) -> Vec<Diagnostic> {
         .collect()
 }
 
+/// `textDocument/hover`'s `contents` field is legal in THREE shapes per
+/// spec, none deprecated out of existence yet: a `MarkupContent` object
+/// (`{kind, value}` — the modern shape, `kind` is `"plaintext"` or
+/// `"markdown"`), a single `MarkedString` (either a plain string, or the
+/// older `{language, value}` code-block shape), or an array of
+/// `MarkedString`. All three flatten to plain text here — see `Hover`'s
+/// own doc for why keeping Markdown/language structure isn't worth it
+/// without a renderer that would use it.
+fn parse_hover_result(result: &Value) -> Option<Hover> {
+    let contents = result.get("contents")?;
+    let text = flatten_hover_contents(contents);
+    if text.trim().is_empty() {
+        return None; // an empty MarkupContent value is "nothing to show", not a Hover with blank text
+    }
+    Some(Hover { contents: text })
+}
+
+fn flatten_hover_contents(v: &Value) -> String {
+    if let Some(s) = v.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = v.as_array() {
+        return arr.iter().map(flatten_hover_contents).collect::<Vec<_>>().join("\n\n");
+    }
+    // MarkupContent ({kind, value}) and the older per-block MarkedString
+    // ({language, value}) both carry the text in a "value" field — neither
+    // shape needs `kind`/`language` for a plain-text flatten.
+    v.get("value").and_then(Value::as_str).unwrap_or_default().to_string()
+}
+
+
 /// `textDocument/definition` replies as `null` (nothing found), a single
 /// `Location`, an array of `Location`, or — for a server advertising
 /// `definitionLinkSupport` (not a capability this client declares, but
@@ -429,6 +487,41 @@ fn parse_completion_result(result: &Value) -> Vec<CompletionItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hover_parses_a_markup_content_object() {
+        let v = json!({ "contents": { "kind": "markdown", "value": "```rust\nfn foo() -> i32\n```" } });
+        assert_eq!(parse_hover_result(&v), Some(Hover { contents: "```rust\nfn foo() -> i32\n```".into() }));
+    }
+
+    #[test]
+    fn hover_parses_a_bare_marked_string() {
+        let v = json!({ "contents": "fn foo() -> i32" });
+        assert_eq!(parse_hover_result(&v), Some(Hover { contents: "fn foo() -> i32".into() }));
+    }
+
+    #[test]
+    fn hover_parses_the_older_language_tagged_marked_string() {
+        let v = json!({ "contents": { "language": "rust", "value": "fn foo() -> i32" } });
+        assert_eq!(parse_hover_result(&v), Some(Hover { contents: "fn foo() -> i32".into() }));
+    }
+
+    #[test]
+    fn hover_parses_an_array_of_marked_strings_joined_with_blank_lines() {
+        let v = json!({ "contents": ["fn foo() -> i32", "the foo function"] });
+        assert_eq!(parse_hover_result(&v), Some(Hover { contents: "fn foo() -> i32\n\nthe foo function".into() }));
+    }
+
+    #[test]
+    fn hover_null_result_is_none_not_an_error() {
+        assert_eq!(parse_hover_result(&Value::Null), None);
+    }
+
+    #[test]
+    fn hover_an_empty_value_string_is_none_not_a_blank_hover() {
+        let v = json!({ "contents": { "kind": "plaintext", "value": "" } });
+        assert_eq!(parse_hover_result(&v), None);
+    }
 
     #[test]
     fn definition_parses_a_single_plain_location() {

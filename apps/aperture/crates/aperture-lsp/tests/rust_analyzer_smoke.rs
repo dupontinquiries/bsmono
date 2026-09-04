@@ -255,3 +255,40 @@ fn goto_definition_finds_a_locally_defined_function_through_a_real_rust_analyzer
     client.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn hover_reports_a_type_signature_for_a_real_function_through_rust_analyzer() {
+    if !rust_analyzer_available() {
+        eprintln!("SKIPPED: rust-analyzer not on PATH");
+        return;
+    }
+    let dir = scratch_package("hover");
+    let main_rs = dir.join("src/main.rs");
+    let source = "fn compute_total() -> i32 { 42 }\n\nfn main() {\n    let x = compute_total();\n    let _ = x;\n}\n";
+    std::fs::write(&main_rs, source).unwrap();
+    let uri = format!("file://{}", main_rs.display());
+    let root_uri = format!("file://{}", dir.display());
+
+    let client = aperture_lsp::LspClient::spawn("rust-analyzer", &[], &root_uri)
+        .expect("spawn rust-analyzer");
+    client.did_open(&uri, "rust", source, 1).expect("didOpen");
+
+    // Caret inside "compute_total(" on the call site, line 3, character 14.
+    let mut hover = None;
+    for attempt in 0..20 {
+        hover = client.hover(&uri, 3, 14).unwrap_or(None);
+        if hover.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500 * (attempt + 1).min(4)));
+    }
+    let hover = hover.expect("expected a hover result for compute_total's call site");
+    assert!(
+        hover.contents.contains("i32"),
+        "expected the return type in the hover text; got: {:?}",
+        hover.contents
+    );
+
+    client.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
