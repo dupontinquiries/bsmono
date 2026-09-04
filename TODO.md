@@ -675,12 +675,41 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   over: check the compiler's own warnings before building a case for why
   something odd "must be" benign.
 
-  Still not done: the worker/shell side still calls the full-document
+  ~~Still not done: the worker/shell side still calls the full-document
   `did_change` unconditionally — this is client capability only. Wiring
   the shell to prefer `did_change_range` needs an actual text diff
   between old and new buffer content, which `aperture-core` has no
-  utility for yet (`Op`/`History` exist for undo, not for producing a
-  minimal diff between two arbitrary strings) — real, separate scope.
+  utility for yet~~ **DONE, one commit later.** New `aperture_core::
+  textdiff` module: a common-prefix/common-suffix diff, not a general
+  Myers diff — deliberately, since the one real caller (incremental
+  `didChange`) only ever has ONE contiguous edit to describe at a time
+  (a keystroke, or a single `replace_range`/`replace_many` call), which
+  this finds in O(n). 11 unit tests, including the "middle char of a
+  repeated pattern" case that needs the suffix scan bounded by remaining
+  length rather than by zero, and a multi-byte-codepoint safety test
+  rather than an assumption.
+
+  `lsp_worker.rs`'s `Msg::Change` now carries an optional edit tuple
+  ALREADY UTF-16-converted by the caller (the worker has no line-text
+  access to do that conversion itself); the worker decides whether to
+  actually use it — checking `supports_incremental_sync()`, which only
+  it can call — falling back to full-text sync on any failure.
+  `AppState` tracks `lsp_last_synced_text`, updated unconditionally after
+  every send so the next diff is always against what the server was
+  actually told.
+
+  Real proof: `lsp_incremental_sync_e2e.rs` types a CROSS-FILE symbol
+  character by character (many separate incremental edits), backspaces
+  and retypes part of it, then confirms a real `rust-analyzer` still
+  resolves it via completion. Cross-file specifically — a same-file
+  symbol would let the test pass even if incremental sync silently did
+  nothing, since the local tree-sitter tier alone already knows same-file
+  symbols; caught my own first draft using the weaker same-file version
+  and rewrote it before trusting a pass. `cargo test -p aperture-core
+  --features tree-sitter`: 171/171 (was 160). All four existing LSP e2e
+  tests re-run and still pass, since they all now exercise this path on
+  every keystroke.
+
   Also still not done: a real hover overlay (currently a one-line status
   message, not a panel showing the full flattened text).
   `workspace_symbols`'s local tree-sitter outline and `route`'s
