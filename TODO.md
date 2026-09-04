@@ -386,8 +386,27 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
 
   `cargo test -p aperture-core --features tree-sitter`: 134/134.
   `cargo test -p aperture-egui --lib`: 85/85.
-- **CJK/double-width**: caret x assumes monospace `col * char_w`; wide glyphs
-  need galley-measured x (egui does no full shaping — known engine limit).
+- ~~**CJK/double-width**~~ **DONE, and TODO.md didn't know it.** This entry
+  said "caret x assumes monospace `col * char_w`" — true of the code this
+  entry described, but `aperture-core/src/width.rs` (`char_col_to_visual`,
+  `visual_to_char_col`, the `_clamped` variant for past-EOL selections) landed
+  in a later merge (`0ff2ab17`) and was never wired back into this note.
+  `view.rs` already runs every column→pixel site (primary caret, click→caret,
+  both selection-fill loops, secondary carets and selections) through it —
+  checked by reading the call sites, not assumed. 7 tests in
+  `aperture-core`'s own suite (`common_cjk_ranges_are_double_width`,
+  `visual_to_char_col_is_the_inverse_and_rounds_inside_wide_glyphs`, …).
+  Verified interactively too: a Rust file with a CJK identifier (`你好`),
+  clicking the pixel position after both glyphs landed the caret at the
+  correct CHAR column (11, not the byte or glyph-index equivalent), and
+  Backspace removed exactly one CJK character, not a partial codepoint or
+  both at once.
+  What's still real: this is `char_w`-scaled (each wide glyph costs exactly
+  2 cells), not font-shaped — egui does no full shaping, so a glyph whose
+  true rendered width isn't a clean multiple of `char_w` (some fonts, some
+  emoji) can still be a few px off. That's an engine limit, not a bug in
+  this table, and not worth chasing further without shaping support egui
+  doesn't have.
 - **IME preedit** (`egui::Event::Ime`), **LSP** (own crate behind the same
   worker pattern as the completion Engine), **egui_kittest** snapshots for the
   view layer (state layer is already headless-tested), **minimap** on the
