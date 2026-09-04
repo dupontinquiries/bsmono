@@ -59,8 +59,9 @@ pub fn classify(output: &str) -> Structured {
         }
     }
 
-    // 4. Whitespace-aligned columns (ls -l, ps, df). Most common shell
-    //    output, also the trickiest to get right.
+    // 4. Whitespace-aligned columns (ps, df, headerless listings whose
+    //    columns don't fight the padding convention below). Most common
+    //    shell output, also the trickiest to get right.
     if let Some(t) = parse_whitespace_aligned(trimmed) {
         return Structured::Table(t);
     }
@@ -118,9 +119,34 @@ fn parse_delimited(s: &str, delim: char) -> Option<TableData> {
 
 /// Parse whitespace-aligned columns: split each line on runs of 2+
 /// spaces. Requires consistent column count (≥2) across ≥ 1+MIN_TABLE_ROWS
-/// lines. The 2-space rule is what distinguishes columns from single
-/// spaces inside a field, and matches how most aligned shell output
-/// (ls -l, ps, df) is formatted.
+/// lines (the first line's own split length is the count every other line
+/// must match — which also means there's no meaningful difference between
+/// "the first row is a header" and "the first row is data that happens to
+/// have the same shape as the rest"; a caller can't tell headered output
+/// like `df`/`ps` from a headerless listing whose rows are internally
+/// consistent, and doesn't need to — see `classify`'s own callers, which
+/// treat `headers` as display labels either way).
+///
+/// NOT `ls -l`, despite this crate's own earlier comments having claimed
+/// it since v0.1.608: GNU `ls` right-pads its size and day-of-month
+/// fields to a fixed VISUAL width by varying the separator's space count
+/// inversely with the value's own width (a 1-digit day gets 2 padding
+/// spaces, a 2-digit day gets 1, so both occupy the same column width).
+/// That is exactly backwards from what a "split on 2+ spaces" heuristic
+/// needs — the real column boundary sometimes has enough spaces to split
+/// on and sometimes doesn't, for the SAME logical column, depending on
+/// that row's own content. A genuine `ls -l` listing with varying file
+/// sizes typically fails this function's consistency check outright
+/// (different rows produce different cell counts) and correctly falls
+/// through to `Plain`. A prior version of this comment tried to "fix"
+/// this with a second, headerless-specific pass — reverted on review: its
+/// trigger condition (`all lines agree on a cell count`) was provably
+/// identical to the existing check below, so it could never run
+/// differently and was dead code the moment it was written. The real
+/// fix needs a character-POSITION column detector across all lines, not
+/// a bigger version of this per-line splitter — a different algorithm,
+/// filed as a real gap rather than quietly left as a false claim OR
+/// "fixed" by code that doesn't change anything.
 fn parse_whitespace_aligned(s: &str) -> Option<TableData> {
     let lines: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.len() < 1 + MIN_TABLE_ROWS {
@@ -276,6 +302,40 @@ mod tests {
                 assert_eq!(t.headers[0], "Filesystem");
             }
             other => panic!("expected Table, got {:?}", other),
+        }
+    }
+
+    /// This crate's own comments claimed "ls -l" as a supported case since
+    /// v0.1.608. It isn't, and can't be with this splitting strategy — see
+    /// the long comment on `parse_whitespace_aligned` for the mechanism
+    /// (GNU ls's inverse-width padding on size/day fields defeats a
+    /// split-on-2+-spaces heuristic). A genuine `ls -l` listing with
+    /// varying file sizes produces a different cell count per row and
+    /// correctly falls through to Plain — pinned here so the false claim
+    /// doesn't quietly reappear in a future comment.
+    #[test]
+    fn genuine_ls_minus_l_output_is_not_detected_and_that_is_documented() {
+        let out = "-rw-r--r-- 1 root root    3 Sep  4 16:00 hostname\n\
+                   -rw-r--r-- 1 root root   81 Sep  4 16:00 hosts\n\
+                   -rw-r--r-- 1 root root 1111 Apr 18 18:13 passwd";
+        assert_eq!(classify(out), Structured::Plain);
+    }
+
+    /// What DOES work without a header row: every line — including the
+    /// first — has to agree on a cell count already, per
+    /// `parse_whitespace_aligned`'s existing check (there's no separate
+    /// "headerless" code path; a first row that's data-shaped-like-the-
+    /// rest passes the same test a real header would). `ps` with its
+    /// header line manually stripped is a real example of that shape.
+    #[test]
+    fn a_headerless_listing_whose_rows_are_internally_consistent_still_works() {
+        let out = "1234 pts/0    00:00:01 bash\n5678 pts/0    00:00:00 vim\n9012 pts/1    00:00:03 cargo";
+        match classify(out) {
+            Structured::Table(t) => {
+                assert_eq!(t.n_rows(), 2, "the first row is read as headers, per the doc above");
+                assert_eq!(t.n_cols(), 2);
+            }
+            other => panic!("expected Table, got {other:?}"),
         }
     }
 
