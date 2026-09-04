@@ -1345,6 +1345,12 @@ impl AppState {
     }
 
     fn open_find_ex(&mut self, with_replace: bool) {
+        // `handle_find` intercepts every event while the bar is open, before
+        // `key()`'s multi-cursor arms ever run — `replace_current`/
+        // `replace_all` mutate the buffer through `Editor` directly, with no
+        // notion of `extra_cursors`. Collapsing here, once, is simpler and
+        // safer than making the whole find/replace bar fan-out-aware.
+        self.discard_extra_cursors();
         let seed = if !self.editor.sel.is_caret() {
             let t = self.editor.selected_text();
             if t.contains('\n') { String::new() } else { t }
@@ -2115,6 +2121,7 @@ impl AppState {
                 self.set_cursors(next);
                 self.follow_caret = true;
                 self.ghost.dismiss();
+                self.popup = None; // its accept path isn't fan-out-aware either
             }
             None => self.set_status("Ctrl+D: nothing more to select", now_ms),
         }
@@ -2128,6 +2135,7 @@ impl AppState {
             Some(all) => {
                 self.set_cursors(all);
                 self.ghost.dismiss();
+                self.popup = None;
             }
             None => self.set_status("Ctrl+Shift+L: no other occurrences", now_ms),
         }
@@ -2143,6 +2151,7 @@ impl AppState {
                 self.set_cursors(next);
                 self.follow_caret = true;
                 self.ghost.dismiss();
+                self.popup = None;
             }
             None => {
                 let dir = if dy < 0 { "up" } else { "down" };
@@ -2255,6 +2264,14 @@ impl AppState {
         if act == Act::Pass {
             return false;
         }
+        // The modal engine predates multi-cursor and mutates `Editor`
+        // directly (Delete/Paste/Insert/OpenLine below) with no notion of
+        // `extra_cursors`. Rather than teach every operator to fan out,
+        // collapse once here — pure navigation (`Act::Move`) doesn't
+        // corrupt anything, but there's no user-visible harm in collapsing
+        // for it too, and a narrower "only for mutating acts" condition
+        // would be one more thing to keep in sync as operators are added.
+        self.discard_extra_cursors();
         let extend = self.helix == Mode::Visual;
         match &act {
             Act::Move(m) => match m {
@@ -2966,6 +2983,51 @@ mod tests {
         s.open_file(dir.clone(), 0);
         assert!(s.extra_cursors.is_empty());
         let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn opening_find_discards_secondary_cursors() {
+        // `handle_find` intercepts events before `key()`'s multi-cursor arms
+        // ever run — replace_current/replace_all mutate the buffer with no
+        // notion of extra_cursors, so this has to collapse on the way in.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("aa\naa\n");
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(3)];
+        s.open_find();
+        assert!(s.extra_cursors.is_empty());
+    }
+
+    #[test]
+    fn typewriter_mode_normal_commands_discard_secondary_cursors() {
+        // The modal engine predates multi-cursor and mutates Editor directly
+        // (Delete/Paste/Insert/OpenLine) with no fan-out awareness.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("aa\naa\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(3)];
+        s.typewriter_mode = true;
+        s.helix = aperture_core::helix::Mode::Normal;
+        typed(&mut s, "x", 0); // Normal-mode 'x' = delete-under-caret
+        assert!(s.extra_cursors.is_empty());
+    }
+
+    #[test]
+    fn adding_a_cursor_dismisses_a_shown_symbol_popup() {
+        // The popup's accept path (`popup_accept`) calls `Editor::
+        // replace_range` directly, with no notion of `extra_cursors` — if a
+        // popup opened before Ctrl+D and survived, accepting it afterward
+        // would mutate the buffer at the primary alone while stale
+        // secondary cursors kept whatever offsets they had before.
+        let mut s = AppState::new(None, false);
+        s.lang = aperture_core::syntax::Language::Rust;
+        s.syntax.set_language(s.lang);
+        typed(&mut s, "fn compute_total() {}\nfn main() { ", 0);
+        for ch in "comp".chars() {
+            s.handle(Ev::Text(ch.to_string()), 100);
+        }
+        assert!(s.popup.is_some(), "a popup should be showing for this setup");
+        key(&mut s, K::D, true, 200);
+        assert!(s.popup.is_none(), "Ctrl+D must dismiss a stale popup, not just the ghost");
     }
 
     #[test]
