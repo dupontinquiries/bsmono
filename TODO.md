@@ -616,8 +616,28 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   before assuming a retry was the right fix rather than a symptom of
   something actually broken.
 
-  Still not done: hover, incremental sync (`did_change` always sends the
-  whole document).
+  ~~hover~~ **client-level DONE, one commit later; not wired into the
+  shell.** `LspClient::hover(uri, line, character) -> Option<Hover>`,
+  flattened to plain text regardless of which of the THREE legal response
+  shapes the server used (a `MarkupContent` object, a bare `MarkedString`,
+  the older `{language, value}` per-block shape, or an array of any of
+  those) — no renderer in this client would benefit from keeping Markdown
+  structure separate. `None` for a `null` response (nothing hoverable, a
+  normal answer) and for an empty-string value (a hover with nothing to
+  say is the same as no hover). 8 new unit tests. Found and fixed a
+  genuine copy-paste bug while writing this — a duplicated `#[test]`
+  attribute that made `cargo test -- --list` report the same test twice
+  under an identical path — traced with `--list | grep -c` rather than
+  dismissed once every individual run still said "ok". Real proof: a
+  real `rust-analyzer`'s hover text for a function call, checked for the
+  function's actual return type. `cargo test -p aperture-lsp`: 36/36 (30
+  unit + 6 real-server), ~4s.
+
+  Still not done: incremental sync (`did_change` always sends the whole
+  document), and wiring hover into the shell at all (no hover-on-hover
+  UI, no palette command — client capability only, same
+  client-first-then-shell-wiring split every other LSP feature went
+  through).
   `workspace_symbols`'s local tree-sitter outline and `route`'s
   keyword-scored candidates stay the fast, dependency-free default tiers;
   LSP is an ADDITIONAL tier alongside them, never a replacement.
