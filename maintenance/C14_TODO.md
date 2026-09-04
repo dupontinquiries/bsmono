@@ -1093,6 +1093,52 @@ a plain `cargo test`:
 Both clean, so nothing was hiding. But those three had not run since I started
 changing that crate this morning, and I reported the count as though they had.
 
+
+## 22. The aperture palette, finally looked at — and it took four tries
+
+Closing the loop on a report that took four commits, three of which were aimed
+at the wrong widget.
+
+### What was actually wrong
+
+There are FIVE result lists in that palette, one per `Mode`. The report was
+about `GoToRoute` (`Ctrl+G`). I fixed `Commands` and `OpenFile` twice — the two
+I had read — while screenshotting a third and believing it was the first. The
+hint text is what gave it away: `"describe what you're looking for…"` is
+GoToRoute's, `Commands` says `"command, theme, or :line…"`.
+
+All five now share one shape: `max_height(PALETTE_LIST_H)`,
+`auto_shrink([false, true])`, `VisibleWhenNeeded`, one `id_salt` each.
+
+### Verified by eye, at last
+
+Running the binary against a real file, `Ctrl+O`:
+
+* **Many matches** — eleven rows, capped at `PALETTE_LIST_H`, scrollbar present
+  because there is more below. Correct.
+* **Narrowed to nothing** — the box collapses to the input plus one line of
+  hint text. That is the "responds to the content" behaviour that was missing,
+  and it is the case the old fixed-height version got wrong.
+* **No gutter** when there is nothing to scroll; a bar when there is.
+
+### The method note, because it is the transferable part
+
+`cargo check` was clean for all four attempts. Reading was clean for three. The
+thing that found it was launching the app and reading a string on the screen.
+
+`docs/agents/HEADLESS_GUI_TESTING.md` arrived the same morning and I used it
+three commits late. Costs: ~15 minutes to link aperture's 434 MB debug binary,
+seconds for everything after.
+
+Two harness traps worth knowing:
+
+* **`xdotool type` drops characters.** `type "save"` landed `sa`. Sending keys
+  one at a time with a delay is reliable; `type` is not. Several of my "no
+  matches" results were the harness, not the matcher.
+* **Xvfb dies quietly.** Twice the app failed with `XOpenDisplayFailed` and the
+  server was simply gone. The error names the display, not the dead server, so
+  check `ps aux | grep Xvfb` before believing the app is at fault.
+
 ---
 
 # C14_TODO — open threads from the c14 session (blackstar/voice line)
