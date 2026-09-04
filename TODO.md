@@ -298,9 +298,58 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   parser slots in without touching the renderer. Deferred because grammar
   crates churn their `Language`/`LANGUAGE` symbol and version-pair with the
   runtime crate; pin both when adding.
-- **Streaming ghosts**: ollama `stream:true` + a channel of deltas so long
-  completions paint progressively. Engine already coalesces newest-wins;
-  streaming needs a cancel path (drop the TcpStream) added to `Provider`.
+- ~~**Streaming ghosts**: ollama `stream:true` + a channel of deltas so
+  long completions paint progressively~~ **DONE — provider, engine, and
+  shell all built** (`OllamaProvider::complete_streaming` over a real
+  `TcpStream` with a cancel path, `Engine`'s worker sending one
+  `CompletionOutcome` per delta plus one final, `AppState::note_outcome`
+  updating the ghost on every outcome and logging only the final one to
+  the loop pane) — but **it was silently broken**, found by this session
+  while adding a full-stack test rather than trusting the existing
+  coverage.
+
+  `Ghost::on_outcome`'s guard only ever accepted an outcome while the
+  ghost was `Pending`. The first successful delta transitions it to
+  `Shown` — so every LATER delta for that same request, the final one
+  included, silently failed the guard and did nothing. Streaming ghost
+  completions never actually streamed: one fragment appeared, then
+  froze, no matter how many more deltas the server sent. Undetected
+  because every existing test either fed outcomes one at a time by hand
+  (never two for the SAME generation in sequence) or checked only
+  `is_shown()`, which stays true on a frozen ghost and can't tell the
+  difference — a lesson worth stating plainly: a passing test whose
+  assertion is weaker than the behavior it claims to cover is a false
+  sense of coverage, not real coverage.
+
+  Fixed by giving `Ghost::Shown` its own `generation`, so a later delta
+  for the SAME generation still updates it while a genuinely different
+  or stale one is still correctly rejected. 3 new `ghost.rs` tests (the
+  actual bug; a different generation while `Shown` still rejected; a
+  stale generation with the buffer moved on still rejected), plus a
+  strengthened `state.rs` test that now checks the actual text at each
+  step instead of just `is_shown()`.
+
+  Real proof: `streaming_ghost_e2e.rs` — a real `Engine` thread, a real
+  `OllamaProvider`, a real local TCP server sending genuinely separate
+  HTTP chunks with small delays between them (sending everything as one
+  blob would complete before even one `poll_completions()` call, which
+  drains everything queued per call and would hide the bug by only ever
+  showing the final state). Watches the actual `ghost` field over time,
+  asserts it was observed at more than one length and only grew,
+  confirmed to fail with exactly the described symptom against the
+  pre-fix code before the fix went in.
+
+  Found in passing, named rather than fixed (separate scope):
+  `multipass::make_block` trims each block's text, harmless for a
+  complete final answer but dropping meaningful trailing whitespace on
+  an intermediate streaming delta (`"fn "` → `"fn"` until the next delta
+  arrives) — real, but minor and self-correcting by the time the final
+  delta lands.
+
+  `cargo test -p aperture-egui --lib`: 113/113 (was 108). `cargo test -p
+  aperture-complete`: 97/97, unaffected — the bug was entirely one layer
+  above the already-correct provider/engine streaming. Full workspace
+  check clean.
 - **infer-kit extraction**: `aperture-complete/providers.rs` ollama client is
   adapted from `logscope-fan/src/ollama.rs` (adds FIM suffix + de-chunking).
   Two call sites now exist — next co-change, lift `shared/infer-kit`.
