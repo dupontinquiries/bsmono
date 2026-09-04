@@ -2626,7 +2626,7 @@ static void escalation_do_travel(float *ppos) {
   const char *dest = is_drift ? arenas[ex_drift_base(jump / 3, 12)] : arenas[jump % 12];
   g_esc_arena++;
   for (int i=0;i<NUM_THEMES;i++)
-    g_theme_models[i]->position[1] = (strcmp(dest,g_theme_ids[i])==0) ? 0.0f : -10000.0f;
+    if (g_theme_models[i]) g_theme_models[i]->position[1] = (strcmp(dest,g_theme_ids[i])==0) ? 0.0f : -10000.0f;
   g_cur_mapid = dest;
   g_energon_on = (!strcmp(dest,"pluto")||!strcmp(dest,"core")||!strcmp(dest,"foundry")||
                  !strcmp(dest,"beach")||!strcmp(dest,"emberpit"));
@@ -2683,7 +2683,7 @@ static void raid_start_phase(float *ppos) {
   if (g_raid_phase >= NUM_RAID_PHASES) { g_raid_over = 1; return; }
   const raid_phase_t *ph = &g_raid_phases[g_raid_phase];
   for (int i=0;i<NUM_THEMES;i++)
-    g_theme_models[i]->position[1] = (strcmp(ph->map, g_theme_ids[i])==0) ? 0.0f : -10000.0f;
+    if (g_theme_models[i]) g_theme_models[i]->position[1] = (strcmp(ph->map, g_theme_ids[i])==0) ? 0.0f : -10000.0f;
   g_cur_mapid = ph->map; load_map_colliders(ph->map); load_map_heightmap(ph->map);
   apply_theme_lighting(ph->map, g_menu.gfx.brightness/100.0f);
   for (int i=0;i<8;i++){ g_raid_enc_kills[i]=0; g_raid_enc_done[i]=0; }
@@ -2787,7 +2787,7 @@ static void edef_start_phase(float *ppos) {
   if (g_edef_phase >= 3) { g_edef_over = 1; return; }
   const edef_phase_t *ph = &g_edef_phases[g_edef_phase];
   for (int i=0;i<NUM_THEMES;i++)
-    g_theme_models[i]->position[1] = (strcmp(ph->map, g_theme_ids[i])==0) ? 0.0f : -10000.0f;
+    if (g_theme_models[i]) g_theme_models[i]->position[1] = (strcmp(ph->map, g_theme_ids[i])==0) ? 0.0f : -10000.0f;
   g_cur_mapid = ph->map; load_map_colliders(ph->map); load_map_heightmap(ph->map);
   apply_theme_lighting(ph->map, g_menu.gfx.brightness/100.0f);
   g_edef_kills = 0; g_edef_chan_state = 0; g_edef_chan = 0.0f;
@@ -2935,7 +2935,7 @@ static float g_race_time = 0.0f;
 
 static void race_start(float *ppos) {
   for (int i=0;i<NUM_THEMES;i++)
-    g_theme_models[i]->position[1] = (strcmp(g_race_map, g_theme_ids[i])==0) ? 0.0f : -10000.0f;
+    if (g_theme_models[i]) g_theme_models[i]->position[1] = (strcmp(g_race_map, g_theme_ids[i])==0) ? 0.0f : -10000.0f;
   g_cur_mapid = g_race_map; load_map_colliders(g_race_map); load_map_heightmap(g_race_map);
   apply_theme_lighting(g_race_map, g_menu.gfx.brightness/100.0f);
   g_race_cp = 0; g_race_time = 0.0f; g_race_done = 0;
@@ -3704,6 +3704,7 @@ static void start_match(void)
   const char *mapid = g_menu.in_campaign ? g_campaign.missions[g_menu.mission_index].map
                                          : g_theme_ids[g_menu.map_index % NUM_THEMES];
   for (int i = 0; i < NUM_THEMES; i++) {
+    if (!g_theme_models[i]) continue;
     g_theme_models[i]->position[1] = (strcmp(mapid, g_theme_ids[i]) == 0) ? 0.0f : -10000.0f;
     g_theme_models[i]->scale = THEME_VIS_SCALE;   // fill the 480x480 world
   }
@@ -3780,27 +3781,45 @@ void game_init()
   // moved off-screen so it never renders -- collision is baked at the original
   // y=0 positions, so moving the model doesn't move the collision.
   g_base_hull = ex_iqm_load_model(scene, "data/arena_base.iqm", EX_KEEP_VERTICES);
+  if (!g_base_hull) {
+    fprintf(stderr, "FATAL: could not load data/arena_base.iqm (required base hull)\n");
+    exit(1);
+  }
   g_base_hull->is_shadow = 0;
   ex_scene_add_model(scene, g_base_hull);
   g_base_hull->position[1] = -10000.0f;
   level_model = g_base_hull;
   // themed visual maps (no collision); one shown at a time
+  //
+  // NULL-GUARDED: `ex_iqm_load_model` returns NULL (after printing its own
+  // "Failed to load" line) when a theme's .iqm is missing rather than
+  // corrupt content, and every one of `g_theme_ids`' 32 entries past
+  // "reclaim" is missing in this tree today -- 22 of 32, not a rare edge
+  // case. Skipping a missing theme leaves its slot NULL (already the
+  // convention the render/despawn loops elsewhere in this file use --
+  // `if(g_theme_models[i])` at both existing call sites) instead of
+  // crashing game_init outright the moment any one of them is requested.
   for (int i = 0; i < NUM_THEMES; i++) {
     char path[48]; snprintf(path, sizeof(path), "data/%s.iqm", g_theme_ids[i]);
     g_theme_models[i] = ex_iqm_load_model(scene, path, 0);
+    if (!g_theme_models[i]) continue;
     g_theme_models[i]->is_shadow = 0;
     g_theme_models[i]->position[1] = -10000.0f;
     ex_scene_add_model(scene, g_theme_models[i]);
   }
   // skyboxes: large unlit cubes that follow the camera (one shown per theme)
+  // Same NULL-guard, same reason -- a missing skybox for a missing theme
+  // should not be a second way to crash on top of the first.
   for (int i = 0; i < NUM_SKY; i++) {
     char sp[48]; snprintf(sp, sizeof(sp), "data/%s.iqm", g_sky_ids[i]);
     g_sky_models[i] = ex_iqm_load_model(scene, sp, 0);
+    if (!g_sky_models[i]) continue;
     g_sky_models[i]->is_lit = 0; g_sky_models[i]->is_shadow = 0;
     g_sky_models[i]->scale = 1600.0f;
     g_sky_models[i]->position[1] = -100000.0f;
     ex_scene_add_model(scene, g_sky_models[i]);
   }
+
 
   e = ex_entity_new(scene, (vec3){0.5f, 1.0f, 0.5f});
   e->position[1] = 6.0f; e->position[2] = -20.0f;
