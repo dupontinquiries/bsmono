@@ -158,3 +158,31 @@ either render in milliseconds or reveal the same hang without llvmpipe as a
 confounding variable. Not attempting a fix blind into unsymbolized driver
 code — recording precisely what was checked and where it stopped so the next
 attempt doesn't redo this diagnosis from zero.
+
+**Follow-up, same session: a plausible non-bug explanation, not a fix.**
+Tried forcing lowest settings (`quality=0`, `render_scale=25`) via the
+config file `load_config` reads — identical hang, same line count, so
+whatever this is doesn't scale with those settings, which argues against
+"just a slow frame at full quality." Read the actual call site instead of
+running more experiments: the last log line comes from inside
+`ex_scene_render`'s first pass, right after binding `forward_shader`, about
+to iterate the real per-model render list. `game_init` calls
+`ex_scene_add_model` for every theme (10 present), every sky (6), and every
+prop/spine/part model loaded at startup — unconditionally, positioned
+off-screen (`position[1] = -10000` or `-100000`) rather than left out of the
+scene graph. If nothing culls a model whose Y position is 10,000 units away
+before issuing its draw call, frame one could be doing many hundreds of full
+draw calls through a pure-software rasterizer with no hardware batching —
+which might genuinely take minutes rather than milliseconds, independent of
+`quality`/`render_scale` (which likely only affect resolution/effect
+toggles, not draw-call count). This is a hypothesis from reading the code,
+not a measurement — didn't stop at conjecture, though: grepped
+`renderer.c`/`scene.c` for "frustum"/"cull" and found only backface culling
+(`glCullFace`, a per-triangle winding thing — explicitly disabled anyway,
+per its own comment about mixed-winding procedural meshes). No per-object
+visibility/distance culling of any kind turned up. That's consistent with
+"every loaded model gets a full draw call every frame regardless of
+position," which supports the hypothesis without proving it's the actual
+cause of this specific hang — still didn't add instrumentation to measure
+draw-call count or per-model timing, so it may yet be wrong. More useful
+than "unknown hang" for whoever picks this up next either way.
