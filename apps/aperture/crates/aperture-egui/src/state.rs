@@ -1214,16 +1214,19 @@ impl AppState {
         self.lsp_gen += 1;
         self.lsp_pending_prefix_start = Some(prefix_start);
         let p = self.editor.caret_pos();
-        // KNOWN GAP: LSP's `position.character` is a UTF-16 code-unit
-        // offset, not a char column — `caret_pos().col` is chars (the same
-        // convention `aperture_core::width` exists to convert FROM for
-        // on-screen pixel columns, a different unit again). They agree for
-        // ASCII, which is everything this session's tests use, and diverge
-        // for anything outside the BMP or requiring surrogate pairs. Not
-        // fixed here: it needs the same kind of dedicated conversion table
-        // `width.rs` is for visual columns, and this popup's own tests
-        // don't yet exercise non-ASCII Rust identifiers to catch it.
-        lsp.request_completion(uri.clone(), p.line as u32, p.col as u32, self.lsp_gen);
+        // LSP's `position.character` is a UTF-16 code-unit offset, not a
+        // char column (`caret_pos().col`) — they agree for ASCII and
+        // ordinary BMP text (including CJK, Cyrillic, every script that
+        // isn't specifically astral-plane) and diverge only for
+        // codepoints needing a UTF-16 surrogate pair, which
+        // `char_col_to_utf16` accounts for the same way `width.rs`
+        // already does for on-screen visual columns — a different unit
+        // again, computed by a different function, but the same shape of
+        // fix for the same underlying reason (one char is not always one
+        // unit of whatever the consumer actually counts in).
+        let line_text = self.editor.buffer.line(p.line);
+        let utf16_col = aperture_core::width::char_col_to_utf16(&line_text, p.col);
+        lsp.request_completion(uri.clone(), p.line as u32, utf16_col, self.lsp_gen);
     }
 
     fn popup_accept(&mut self, now_ms: u64) {
