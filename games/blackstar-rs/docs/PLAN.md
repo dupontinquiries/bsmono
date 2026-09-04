@@ -38,7 +38,7 @@ No new modules. Each item is "make an existing, tested thing reachable".
 |---|---|---|
 | `menu` + `ui` | replace one `Mode` screen end to end | the whole menu rewrite depends on this path working |
 | `bigbody` | `physics::step_car` consults it for ground | ships, moving platforms and wrecks are all one hook |
-| `clinch` | air-to-air contact check in `sim` | already tested, needs a caller and a HUD prompt |
+| `clinch` | air-to-air contact check in `sim` | already tested, but a caller can't do much yet — checked (c15unified): neither `main.rs`'s `self.health` (set once to 1.0, never mutated) nor `bots::Bot` (no hp field at all) can take the damage a clinch tick produces. Needs a real player+bot combat-health system FIRST; that's the actual missing piece, not the caller. |
 | `patrol` | a game mode that calls `update` | the loop exists; nothing ticks it |
 | `ship` + `interior` + `airlock` + `drop` | one "leave the planet" flow | they were designed as one chain and should land as one |
 | `terrain` | `World::generate` takes a `Ground` | turns 13 route rows into 13 places |

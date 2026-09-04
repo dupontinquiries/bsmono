@@ -144,7 +144,20 @@ pub static CURRICULUM: &[Mechanic] = &[
         built: false,
         module: "clinch.rs",
         note: "air-to-air grapples. the truce is a standoff, so the mission is the \
-               one place a grapple beats a gun. NOT WIRED -- see docs/PLAN.md.",
+               one place a grapple beats a gun. NOT WIRED -- see docs/PLAN.md. \
+               CHECKED (c15unified): PLAN.md's own \"needs a caller and a HUD \
+               prompt\" undersells this. clinch::Tick::{player_dmg,enemy_dmg} \
+               have nowhere real to go -- grepped both plausible targets: \
+               main.rs's `self.health` is set once to 1.0 and never mutated \
+               anywhere (fed into xf.request() as a fixed value, not a live \
+               HP pool), and bots::Bot has no hp/health field at all. Neither \
+               side of a clinch can take damage in the live game today. The \
+               phase machine, trigger detection, and Car.flight/on_ground \
+               fields it would key off all exist and are real -- what's \
+               missing first is a player+bot combat-health system, which is \
+               its own prerequisite feature, not a caller. Did not wire a \
+               cosmetic version (toasts with no stakes) since that would look \
+               done without being done.",
     },
     Mechanic {
         id: "chi_attunement",
