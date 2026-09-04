@@ -854,6 +854,7 @@ impl AppState {
     pub fn accept_pending_edit(&mut self) {
         let Some(pending) = self.pending_edit.take() else { return };
         let Some(proposed) = pending.proposed else { return };
+        self.discard_extra_cursors(); // replace_range isn't fan-out-aware
         let end = pending.end.min(self.editor.buffer.len_chars());
         let start = pending.start.min(end);
         self.editor.replace_range(start, end, &proposed);
@@ -870,6 +871,7 @@ impl AppState {
     /// fresh parse, caret home, undo stack reset (see `live_text`'s doc).
     fn set_preview_text(&mut self, text: &str) {
         self.editor = Editor::from_str(text);
+        self.discard_extra_cursors(); // a whole new Editor; old offsets mean nothing
         self.syntax = Syntax::new(self.lang);
         self.dirty = false;
         self.popup = None;
@@ -1597,6 +1599,7 @@ impl AppState {
             Ev::Paste(t) => {
                 self.ghost.dismiss();
                 self.debounce.cancel();
+                self.discard_extra_cursors(); // paste isn't fan-out-aware
                 self.editor.insert_text(&t, now_ms);
                 self.after_edit(now_ms);
             }
@@ -1604,6 +1607,7 @@ impl AppState {
             Ev::Cut => {
                 fx.clipboard = self.copy_selection();
                 if !self.editor.sel.is_caret() {
+                    self.discard_extra_cursors(); // cut isn't fan-out-aware
                     let (a, b) = (self.editor.sel.min(), self.editor.sel.max());
                     self.editor.replace_range(a, b, "");
                     self.after_edit(now_ms);
@@ -1642,6 +1646,29 @@ impl AppState {
     // `Cursors` here rather than storing one keeps every pre-existing
     // single-cursor call site correct by construction: they simply never see
     // the rest.
+
+    /// Drop the secondary cursors WITHOUT trying to preserve them.
+    ///
+    /// Every command that mutates or replaces the buffer without going
+    /// through `fan_out_ranges` must call this first. Char offsets in
+    /// `extra_cursors` are only meaningful relative to the buffer they were
+    /// computed against; undo, redo, paste, an AI edit landing, a revision
+    /// preview, or opening a different file all change that buffer without
+    /// telling `extra_cursors` anything shifted, so leaving them in place
+    /// would silently fan a LATER edit out to stale, wrong, or (after undo
+    /// shrinks the buffer) merely coincidentally-valid positions instead of
+    /// failing loudly. Collapsing to the primary is the honest fallback: the
+    /// gesture that triggered one of these commands almost never had
+    /// multi-cursor in mind anyway.
+    ///
+    /// Found by running the binary, not by `cargo test`: Ctrl+Shift+L across
+    /// three lines, type a replacement (fans out correctly), Ctrl+Z (buffer
+    /// correctly restored, but `extra_cursors` were never told the buffer
+    /// changed length — the very next keystroke would have fanned out to
+    /// whatever those stale offsets now happened to land on).
+    fn discard_extra_cursors(&mut self) {
+        self.extra_cursors.clear();
+    }
 
     /// The full cursor set, primary first.
     fn cursors(&self) -> aperture_core::multicursor::Cursors {
@@ -1876,7 +1903,6 @@ impl AppState {
 
     fn key(&mut self, key: K, ctrl: bool, shift: bool, alt: bool, now_ms: u64, fx: &mut Effects) {
         use K::*;
-        let _ = alt;
         // Popup first: an explicit list outranks the speculative ghost.
         if self.popup_key(key, shift, now_ms) {
             return;
@@ -2010,6 +2036,8 @@ impl AppState {
             (End, false) => self.moved(|s, sh| s.editor.move_end(sh), shift),
             (D, true) => self.add_next_cursor(now_ms),
             (L, true) if shift => self.select_all_cursor_occurrences(now_ms),
+            (Up, true) if alt => self.add_column_cursor(-1, now_ms),
+            (Down, true) if alt => self.add_column_cursor(1, now_ms),
             (Backspace, _) => {
                 self.ghost.dismiss();
                 if !self.extra_cursors.is_empty() {
@@ -2105,9 +2133,28 @@ impl AppState {
         }
     }
 
+    /// Ctrl+Alt+Up / Ctrl+Alt+Down: add a caret one line above/below the
+    /// outermost existing cursor in that direction — holding the key grows
+    /// a column instead of fighting over the same gap each press.
+    fn add_column_cursor(&mut self, dy: isize, now_ms: u64) {
+        let c = self.cursors();
+        match aperture_core::multicursor::add_vertical(&self.editor.buffer, &c, dy) {
+            Some(next) => {
+                self.set_cursors(next);
+                self.follow_caret = true;
+                self.ghost.dismiss();
+            }
+            None => {
+                let dir = if dy < 0 { "up" } else { "down" };
+                self.set_status(&format!("no line {dir} of the file to add a cursor on"), now_ms);
+            }
+        }
+    }
+
     fn with_dismiss(&mut self, f: impl FnOnce(&mut Self), _now_ms: u64) {
         self.ghost.dismiss();
         self.debounce.cancel();
+        self.discard_extra_cursors(); // undo/redo change the buffer without fanning out
         f(self);
         self.dirty = true;
         self.syntax.absorb(&mut self.editor.buffer);
@@ -2169,6 +2216,7 @@ impl AppState {
                 self.lang = Language::from_path(&path);
                 self.syntax.set_language(self.lang);
                 self.editor = Editor::from_str(&text);
+                self.discard_extra_cursors(); // a whole new Editor; old offsets mean nothing
                 self.path = Some(path);
                 self.dirty = false;
                 self.ghost.dismiss();
@@ -2537,6 +2585,15 @@ impl AppState {
         if self.ghost.is_shown() && !was_shown {
             self.ghost_since = Some(now_ms);
         }
+        // A completion armed BEFORE Ctrl+D can still land after — `arm_
+        // completion` never fires while multi-cursor typing, but an
+        // already-in-flight request passes the generation gate regardless.
+        // The ghost's own accept path (Tab / Ctrl+Tab / Ctrl+Right) calls
+        // `editor.insert_text` directly, not `fan_out_insert`, so showing it
+        // here would let a later Tab bypass every secondary cursor.
+        if !self.extra_cursors.is_empty() {
+            self.ghost.dismiss();
+        }
         // The loop pane is a history of REQUESTS answered, not a firehose
         // of fragments — a 20-delta streamed completion should read as one
         // row, not twenty near-duplicates burying everything before it.
@@ -2813,6 +2870,102 @@ mod tests {
         s.editor.sel = aperture_core::editor::Selection::caret(0); // the first "x"
         key_shift(&mut s, K::L, true, 0);
         assert_eq!(s.extra_cursors.len(), 1, "one extra cursor: the second x");
+    }
+
+    fn key_alt(s: &mut AppState, k: K, ctrl: bool, alt: bool, t: u64) {
+        s.handle(Ev::Key { key: k, ctrl, shift: false, alt }, t);
+    }
+
+    #[test]
+    fn ctrl_alt_down_adds_a_cursor_one_line_below_the_lowest() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("abcdef\nabcdef\nabcdef\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(3); // line 0, col 3
+        key_alt(&mut s, K::Down, true, true, 0);
+        assert_eq!(s.extra_cursors.len(), 1);
+        // The NEW cursor becomes the primary (`editor.sel`) — the viewport
+        // follows the one just added, same as Ctrl+D — and the original
+        // caret becomes the sole entry in `extra_cursors`.
+        assert_eq!(s.editor.buffer.char_to_pos(s.editor.sel.head),
+            aperture_core::buffer::Pos::new(1, 3));
+        assert_eq!(s.editor.buffer.char_to_pos(s.extra_cursors[0].head),
+            aperture_core::buffer::Pos::new(0, 3));
+
+        // A second press grows from the OUTERMOST cursor (line 1), not back
+        // from the primary — otherwise holding the key just toggles between
+        // two lines instead of building a column.
+        key_alt(&mut s, K::Down, true, true, 10);
+        assert_eq!(s.extra_cursors.len(), 2);
+        let mut lines: Vec<usize> = s.extra_cursors.iter()
+            .map(|c| s.editor.buffer.char_to_pos(c.head).line).collect();
+        lines.push(s.editor.buffer.char_to_pos(s.editor.sel.head).line);
+        lines.sort();
+        assert_eq!(lines, vec![0, 1, 2], "one cursor on each of three consecutive lines");
+    }
+
+    #[test]
+    fn ctrl_alt_up_past_the_first_line_reports_status_and_adds_nothing() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("only one line\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(2);
+        key_alt(&mut s, K::Up, true, true, 0);
+        assert!(s.extra_cursors.is_empty());
+        let (msg, _) = s.status.clone().expect("a status explains the no-op");
+        assert!(msg.contains("no line"), "{msg}");
+    }
+
+    #[test]
+    fn plain_ctrl_up_without_alt_is_unaffected_by_the_column_cursor_binding() {
+        // Regression guard: (Up, true) now has an `if alt` guard ahead of it;
+        // Ctrl+Up alone (no Alt) must fall through to the catch-all, not
+        // silently start adding cursors.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("abc\nabc\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(1);
+        key(&mut s, K::Up, true, 0); // ctrl, no alt
+        assert!(s.extra_cursors.is_empty(), "Ctrl+Up alone must not add a cursor");
+    }
+
+    #[test]
+    fn undo_discards_stale_secondary_cursors_rather_than_leaving_them_dangling() {
+        // The exact bug found interactively: Ctrl+Shift+L across three
+        // lines, type a replacement (fans out correctly), Ctrl+Z restores
+        // the buffer — but with the old code `extra_cursors` was never told
+        // the buffer had changed shape, so it silently carried three now-
+        // meaningless offsets into whatever the NEXT keystroke did.
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("x = 1\ny = 2\nx = 3\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        key_shift(&mut s, K::L, true, 0); // two cursors on "x"
+        assert_eq!(s.extra_cursors.len(), 1);
+        typed(&mut s, "n", 10);
+        key(&mut s, K::Z, true, 20); // undo
+        assert!(s.extra_cursors.is_empty(),
+            "undo must drop secondary cursors, not leave stale offsets");
+    }
+
+    #[test]
+    fn paste_discards_stale_secondary_cursors() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("aa\naa\n");
+        s.editor.sel = aperture_core::editor::Selection::caret(0);
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(3)];
+        s.handle(Ev::Paste("XYZ".into()), 0);
+        assert!(s.extra_cursors.is_empty());
+        assert_eq!(s.editor.buffer.to_string(), "XYZaa\naa\n",
+            "paste still applies at the primary");
+    }
+
+    #[test]
+    fn opening_a_different_file_discards_secondary_cursors() {
+        let mut s = AppState::new(None, false);
+        s.editor = aperture_core::editor::Editor::from_str("aa\naa\n");
+        s.extra_cursors = vec![aperture_core::editor::Selection::caret(3)];
+        let dir = std::env::temp_dir().join(format!("ap_test_{}.rs", std::process::id()));
+        std::fs::write(&dir, "fn f() {}\n").unwrap();
+        s.open_file(dir.clone(), 0);
+        assert!(s.extra_cursors.is_empty());
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
