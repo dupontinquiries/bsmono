@@ -34,6 +34,17 @@ TWO FALSE-POSITIVE LESSONS, both learned the hard way on the first run:
      is a cheaper fix than teaching a regex to lex Rust.
   3. DO READ `[[bin]]` PATHS from Cargo.toml. `gpu-gemm/src/serve.rs` is a
      binary target, not a module, and reporting it as an orphan is noise.
+  4. DO READ `#[path = "..."]` TARGETS, not just the declared mod NAME.
+     `unendlich-engine/src/render_meshref_shim.rs` is reached via
+     `#[path = "render_meshref_shim.rs"] pub mod render;` — the declared name
+     is `render`, which has nothing to do with the file's own stem, so the
+     plain `mod x` scan learned "render is declared" and never connected it
+     to the file that actually provides it. Fixed by also collecting every
+     `#[path]` attribute's target stem as reachable, crate-wide — the same
+     by-stem-not-by-directory simplification this tool already makes
+     everywhere else, so a `#[path]`'s target being reachable from a
+     DIFFERENT file than the one that redirected to it is accepted the same
+     way a `mod` declaration's name already is.
 
 Scope: every crate under the given root. A file is reachable if any `mod <stem>`
 declaration appears in a non-comment position anywhere in its crate, since a
@@ -46,6 +57,15 @@ MOD = re.compile(r'\bmod\s+(\w+)\s*[;{]')
 LINE_COMMENT = re.compile(r'//.*$')
 BLOCK_COMMENT = re.compile(r'/\*.*?\*/', re.S)
 BIN_PATH = re.compile(r'^\s*path\s*=\s*["\']([^"\']+)["\']', re.M)
+# `#[path = "some/file.rs"]` redirects the NEXT mod declaration to a file whose stem need not match
+# the declared name at all — `#[path = "render_meshref_shim.rs"] pub mod render;` makes `render` the
+# declared name while the file on disk is named something else entirely. The plain MOD regex above
+# only ever learns "render" is declared, never that render_meshref_shim.rs is the file that provides
+# it, so that file reported as an orphan (found via unendlich-engine, C14_TODO). This does not need to
+# associate a #[path] with a specific mod statement — any file matching a #[path]'s target stem
+# ANYWHERE in the crate is reachable through that attribute by definition, same simplification the
+# rest of this tool already makes (it compares by file STEM crate-wide, never by directory).
+PATH_ATTR = re.compile(r'#\[\s*path\s*=\s*["\']([^"\']+)["\']\s*\]')
 
 
 def declarations(text: str) -> set:
@@ -57,10 +77,16 @@ def declarations(text: str) -> set:
     modules into false orphans. The one case it would have caught — a Rust
     string containing the phrase `mod kernels;` — was fixed at the source
     instead, by not writing a scannable declaration inside prose.
+
+    Returns declared NAMES (from `mod x`) union `#[path]` TARGET STEMS — the
+    latter because a #[path] redirect can point a mod declaration at a file
+    whose stem has nothing to do with the declared name (`render_meshref_shim`
+    reached via `#[path = "render_meshref_shim.rs"] mod render;`).
     """
     text = BLOCK_COMMENT.sub("", text)
     text = "\n".join(LINE_COMMENT.sub("", ln) for ln in text.splitlines())
-    return set(MOD.findall(text))
+    path_stems = {pathlib.Path(p).stem for p in PATH_ATTR.findall(text)}
+    return set(MOD.findall(text)) | path_stems
 
 
 def crate_dirs(root: pathlib.Path):
