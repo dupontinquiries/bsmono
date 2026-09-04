@@ -1219,7 +1219,28 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 if down {
                                     p.selected = (p.selected + 1).min(hits.len() - 1);
                                 }
-                                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                // THE THIRD LIST. `Ctrl+G` opens this mode, and the
+                                // padding/height report was about it — the two lists
+                                // fixed in 9f4b34b0 are Commands and OpenFile, and this
+                                // one kept the old shape: a bare `max_height`, no
+                                // `auto_shrink`, and a scrollbar gutter reserved whether
+                                // or not it scrolls.
+                                //
+                                // Found by running the app and reading the hint text:
+                                // what I had been screenshotting as "the palette" was
+                                // this mode, not the ones I had changed.
+                                //
+                                // Same treatment: size to the real content, cap it, and
+                                // only show the bar when it is needed. `PALETTE_LIST_H`
+                                // rather than a second hard-coded 320 — one number for
+                                // how tall a palette list may get.
+                                egui::ScrollArea::vertical()
+                                    .id_salt("palette_go_to_route")
+                                    .max_height(PALETTE_LIST_H)
+                                    .auto_shrink([false, true])
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                                    .show(ui, |ui| {
                                     for (i, hit) in hits.iter().enumerate() {
                                         let selected = i == p.selected;
                                         let bg = if selected { colors.accent.gamma_multiply(0.25) } else { Color32::TRANSPARENT };
@@ -1262,7 +1283,13 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 if down {
                                     p.selected = (p.selected + 1).min(ranked.len() - 1);
                                 }
-                                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("palette_workspace_symbol")
+                                    .max_height(PALETTE_LIST_H)
+                                    .auto_shrink([false, true])
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                                    .show(ui, |ui| {
                                     for (i, sym) in ranked.iter().enumerate() {
                                         let selected = i == p.selected;
                                         let bg = if selected { colors.accent.gamma_multiply(0.25) } else { Color32::TRANSPARENT };
@@ -1307,7 +1334,13 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                                 if down {
                                     p.selected = (p.selected + 1).min(cands.len() - 1);
                                 }
-                                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("palette_project_search")
+                                    .max_height(PALETTE_LIST_H)
+                                    .auto_shrink([false, true])
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                                    .show(ui, |ui| {
                                     for (i, c) in cands.iter().enumerate() {
                                         let selected = i == p.selected;
                                         let bg = if selected { colors.accent.gamma_multiply(0.25) } else { Color32::TRANSPARENT };
