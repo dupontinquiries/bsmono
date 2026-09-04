@@ -99,6 +99,31 @@ impl ReliefPolicy {
     }
 }
 
+/// Should an auto-continuing run STOP because a compaction is pending?
+///
+/// # The mechanism behind a 120-turn run that produced nothing
+///
+/// The human-in-the-loop offer already exists — "Summarize & continue" beside
+/// "Keep squeezing" — and `compact_poll` raises it only when the stream has
+/// ended, because taking it mid-stream threw the request away before it could
+/// be shown.
+///
+/// Auto-continue removes the gap. One reply ends and the next turn starts, so
+/// `streaming` is true on essentially every frame and the offer is deferred
+/// forever. A field log shows the result: `COMPACTION REQUESTED` 113 times
+/// across 120 turns, the middle cut out of every prompt, and an offer that
+/// nobody could ever act on.
+///
+/// So `Ask` has to mean something stronger than "show a panel". It means the
+/// run WAITS. That is the only reading under which the setting does what its
+/// name says on an unattended run, which is precisely when it matters.
+///
+/// `Squeeze` and `Summarize` never pause — they are the two answers, and a run
+/// configured with an answer should not stop to be asked the question.
+pub fn should_pause_auto_continue(policy: ReliefPolicy, compaction_pending: bool) -> bool {
+    compaction_pending && policy == ReliefPolicy::Ask
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,4 +190,24 @@ mod tests {
             assert!(!a.label().is_empty() && !a.hover().is_empty());
         }
     }
+    #[test]
+    fn ask_pauses_an_auto_continuing_run_and_the_others_do_not() {
+        // The whole point of the third state. Without the pause, `Ask` shows a
+        // panel that the next turn scrolls past — which is what 113 unanswered
+        // compaction requests in one run looked like.
+        assert!(should_pause_auto_continue(ReliefPolicy::Ask, true));
+        // A run configured with an answer does not stop to be asked.
+        assert!(!should_pause_auto_continue(ReliefPolicy::Squeeze, true));
+        assert!(!should_pause_auto_continue(ReliefPolicy::Summarize, true));
+    }
+
+    #[test]
+    fn nothing_pauses_when_there_is_nothing_to_decide() {
+        // Ask must not stall a run that is under its budget. The pause is
+        // triggered by a pending request, not by the setting.
+        for p in ReliefPolicy::all() {
+            assert!(!should_pause_auto_continue(p, false), "{p:?} paused with no request");
+        }
+    }
+
 }

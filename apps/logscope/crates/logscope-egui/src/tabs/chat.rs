@@ -2058,7 +2058,21 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
     fn params(&self) -> GenParams {
         // Auto-continue → decode a fresh reply continuously up to N chunks in one session; the slider
         // value stays the per-chunk / manual-continue size.
-        let ceiling = if self.auto_continue { self.ctx.max_tokens * (1 + MAX_AUTO_CONTINUE) } else { self.ctx.max_tokens };
+        // A pending compaction under `Ask` collapses the ceiling to a single
+        // chunk, which ends the auto-continue chain at the next boundary and
+        // lets the offer actually be seen.
+        //
+        // The offer already existed; auto-continue made it unreachable.
+        // `compact_poll` only raises it when the stream has ended, and a
+        // continuous run never has that gap — 113 requests across 120 turns,
+        // none of them answerable. See `relief_policy::should_pause_auto_continue`.
+        let paused = crate::relief_policy::should_pause_auto_continue(
+            self.relief_policy, self.compact_offer.is_some());
+        let ceiling = if self.auto_continue && !paused {
+            self.ctx.max_tokens * (1 + MAX_AUTO_CONTINUE)
+        } else {
+            self.ctx.max_tokens
+        };
         GenParams { max_tokens: self.ctx.max_tokens as usize, reply_ceiling: ceiling as usize, n_ctx: self.ctx.n_ctx, n_batch: self.ctx.n_ctx,
             temperature: self.ctx.temperature, repeat_penalty: self.ctx.repeat_penalty, min_p: self.ctx.min_p,
             // Long-horizon relief: only meaningful when auto-continue is on (that is the mode
