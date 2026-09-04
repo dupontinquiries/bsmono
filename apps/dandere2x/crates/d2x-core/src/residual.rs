@@ -165,9 +165,100 @@ pub fn merge_tiered(prev_up: &Frame, older_up: &[&Frame], residual_up: &[Option<
     }
     for rv in &plan.residuals {
         let r = residual_up[rv.tier as usize].expect("checked above");
-        out.copy_block(r, bs * s, (rv.cell_x * cell + bleed) * s, (rv.cell_y * cell + bleed) * s, rv.frame_x * s, rv.frame_y * s);
+        blend_block(
+            &mut out, r, bs * s, bleed * s,
+            (rv.cell_x * cell) * s, (rv.cell_y * cell) * s,
+            rv.frame_x * s, rv.frame_y * s,
+        );
     }
     Ok(out)
+}
+
+/// Write one upscaled block over `out`, feathered across its bleed ring.
+///
+/// # Why not `copy_block`
+///
+/// It used to be one. A hard `bs·s` copy pastes a block the network just
+/// upscaled edge-to-edge against neighbours that came from somewhere else
+/// entirely — the faded previous frame, a moved copy, the block cache, or a
+/// DIFFERENT cascade tier's network. Any difference in tone or detail between
+/// the two lands on a straight line, and the block grid becomes visible.
+/// Reported as "blocky artifacts because of the crossover".
+///
+/// # The ring was already there
+///
+/// `make_residual` gives every block `bleed` pixels of real context and the
+/// network upscales the whole cell, ring included. The old merge read back
+/// only the interior and threw the ring away — so the overlap needed to blend
+/// the seam was computed on every block, at full network cost, and discarded.
+///
+/// This spends it: weight 0 at the ring's outer edge rising to 1 at the block
+/// boundary, so a residual fades into whatever was already there instead of
+/// cutting against it. Inside the block proper the weight is 1 and the result
+/// is byte-identical to the old copy.
+///
+/// `dst_x`/`dst_y` are the BLOCK's position in the frame; the ring is written
+/// at `dst - ring`, clamped at the frame edges — a block on the boundary has
+/// no neighbour to blend with on that side and simply writes less.
+pub fn blend_block(
+    out: &mut Frame,
+    src: &Frame,
+    block: u32,
+    ring: u32,
+    src_cell_x: u32,
+    src_cell_y: u32,
+    dst_x: u32,
+    dst_y: u32,
+) {
+    // NO `ring == 0` SHORTCUT. I wrote one and could not break it: with
+    // `ring = 0` the span is the block, every offset is interior, `ramp`
+    // returns 1.0, and the loop writes each pixel exactly — the same bytes
+    // `copy_block` would. `a_zero_ring_is_the_old_hard_copy` still pins that,
+    // now on the one path that provides it.
+    let span = block + 2 * ring;
+    for j in 0..span {
+        // Frame coordinates, skipping anything off the edge.
+        let fy = (dst_y + j) as i64 - ring as i64;
+        if fy < 0 || fy as u32 >= out.height {
+            continue;
+        }
+        let wy = ramp(j, ring, block);
+        for i in 0..span {
+            let fx = (dst_x + i) as i64 - ring as i64;
+            if fx < 0 || fx as u32 >= out.width {
+                continue;
+            }
+            let w = wy * ramp(i, ring, block);
+            if w <= 0.0 {
+                continue;
+            }
+            let sp = src.px(src_cell_x + i, src_cell_y + j);
+            if w >= 1.0 {
+                out.set_px(fx as u32, fy as u32, sp);
+                continue;
+            }
+            let dp = out.px(fx as u32, fy as u32);
+            let mix = |a: u8, b: u8| ((a as f32) * (1.0 - w) + (b as f32) * w + 0.5) as u8;
+            out.set_px(fx as u32, fy as u32,
+                       [mix(dp[0], sp[0]), mix(dp[1], sp[1]), mix(dp[2], sp[2])]);
+        }
+    }
+}
+
+/// Feather weight at offset `i` across a `ring + block + ring` span.
+///
+/// Linear, and 1.0 across the whole block interior. A smoothstep would be
+/// smoother in the ring and would also make the interior non-uniform at the
+/// boundary, which is where an exact copy matters most — the block proper is
+/// the network's actual output and should arrive unmodified.
+fn ramp(i: u32, ring: u32, block: u32) -> f32 {
+    // Distance to the nearer end of the span, saturating to 1.0 across the
+    // interior. An explicit `if interior { return 1.0 }` was here and could
+    // not be broken either: the clamp already covers it, because the nearest
+    // interior offset is `ring + 1` away from the edge and `(ring+1)/(ring+1)`
+    // is exactly 1.
+    let d = if i < ring { i + 1 } else { ring + block + ring - i };
+    (d as f32 / (ring + 1) as f32).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -358,4 +449,85 @@ mod bleed_ring_tests {
         assert_ne!(black.px(0, 5), repl.px(0, 5),
             "the two padding modes are indistinguishable — this test cannot detect a regression");
     }
+    #[test]
+    fn the_block_interior_is_an_exact_copy() {
+        // The block proper is the network's actual output. Feathering it would
+        // soften the very pixels the upscale produced, which is the opposite of
+        // the point — only the RING blends.
+        let mut out = Frame::new(20, 20);
+        let mut src = Frame::new(12, 12);
+        for y in 0..12 { for x in 0..12 { src.set_px(x, y, [200, 100, 50]); } }
+        blend_block(&mut out, &src, 8, 2, 0, 0, 4, 4);
+        for y in 4..12 { for x in 4..12 {
+            assert_eq!(out.px(x, y), [200, 100, 50], "interior at {x},{y} was blended");
+        }}
+    }
+
+    #[test]
+    fn the_ring_fades_instead_of_cutting() {
+        // The reported artefact: a hard edge where an upscaled block meets a
+        // neighbour from a different source. The ring should be strictly
+        // between the two values, and monotone inward.
+        let mut out = Frame::new(20, 20);
+        for y in 0..20 { for x in 0..20 { out.set_px(x, y, [0, 0, 0]); } }
+        let mut src = Frame::new(12, 12);
+        for y in 0..12 { for x in 0..12 { src.set_px(x, y, [200, 200, 200]); } }
+        blend_block(&mut out, &src, 8, 2, 0, 0, 4, 4);
+
+        // Walking inward along a row: background, then rising, then full.
+        let outer = out.px(2, 8)[0];
+        let inner = out.px(3, 8)[0];
+        let full = out.px(4, 8)[0];
+        assert!(outer < inner, "the outer ring is not lighter than the background: {outer} vs {inner}");
+        assert!(inner < full, "the ring did not rise toward the block: {inner} vs {full}");
+        assert_eq!(full, 200, "the block edge is not the block's own value");
+        // And it is a blend, not a copy — the whole complaint.
+        assert!(outer > 0 && outer < 200, "the ring is a hard edge, not a fade: {outer}");
+    }
+
+    #[test]
+    fn a_block_at_the_frame_edge_writes_less_rather_than_wrapping() {
+        // A block on the boundary has no neighbour to blend with on that side.
+        // Without the clamp the ring wraps to the far edge, which is a bright
+        // line down the opposite side of the picture.
+        let mut out = Frame::new(16, 16);
+        for y in 0..16 { for x in 0..16 { out.set_px(x, y, [10, 10, 10]); } }
+        let mut src = Frame::new(12, 12);
+        for y in 0..12 { for x in 0..12 { src.set_px(x, y, [250, 250, 250]); } }
+        // Block at the very top-left: two rows/cols of ring fall outside.
+        blend_block(&mut out, &src, 8, 2, 0, 0, 0, 0);
+        for y in 0..16 {
+            assert_eq!(out.px(15, y), [10, 10, 10], "the ring wrapped to the right edge at row {y}");
+        }
+        assert_eq!(out.px(4, 4), [250, 250, 250], "the block itself did not land");
+    }
+
+    #[test]
+    fn a_zero_ring_is_the_old_hard_copy() {
+        // `bleed = 0` is a valid configuration and there is no context to
+        // feather across; the result must be byte-identical to `copy_block`.
+        let mut a = Frame::new(16, 16);
+        let mut b = Frame::new(16, 16);
+        let mut src = Frame::new(8, 8);
+        for y in 0..8 { for x in 0..8 { src.set_px(x, y, [7, 8, 9]); } }
+        blend_block(&mut a, &src, 8, 0, 0, 0, 4, 4);
+        b.copy_block(&src, 8, 0, 0, 4, 4);
+        assert_eq!(a.data, b.data, "a zero ring did not reproduce the hard copy");
+    }
+
+    #[test]
+    fn the_ramp_is_one_across_the_whole_interior_and_rises_at_both_ends() {
+        // Both edges, because a ramp that only feathered the leading side
+        // would leave the trailing seam exactly as visible as before.
+        let (ring, block) = (2u32, 8u32);
+        for i in ring..ring + block {
+            assert_eq!(ramp(i, ring, block), 1.0, "interior offset {i} is not 1.0");
+        }
+        assert!(ramp(0, ring, block) < ramp(1, ring, block));
+        let last = ring + block + ring - 1;
+        assert!(ramp(last, ring, block) < ramp(last - 1, ring, block),
+                "the trailing edge does not fall off");
+        assert!(ramp(0, ring, block) > 0.0, "the outermost ring row contributes nothing");
+    }
+
 }
