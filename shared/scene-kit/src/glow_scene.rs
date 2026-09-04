@@ -368,22 +368,19 @@ impl Renderer {
         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(t.scene_fbo));
         gl.viewport(0, 0, t.sw, t.sh);
         gl.enable(glow::DEPTH_TEST); gl.depth_func(glow::LESS);
-        // BACK FACES OFF, behind an env switch.
+        // BACK FACES OFF.
         //
-        // `CULL_FACE` was never enabled here. Depth testing gets the ORDER
-        // right, but every back face is still rasterised and shaded — so an
-        // open mesh, or one whose winding disagrees with the rest, shows its
-        // interior lit as though it were exterior. That is a candidate for the
-        // reported mesh artefacts, and it also doubles fragment work in a
-        // scene this dense.
+        // `CULL_FACE` was never enabled here. Depth testing gets the ORDER right, but every back
+        // face was still rasterised and shaded — doubling fragment work, and (worse) double-
+        // blending every closed surface through the BLEND state enabled below, which is a real
+        // brightness bug on top of the fragment cost.
         //
-        // Behind `LOGSCOPE_CULL=0` rather than unconditional, because
-        // `mesh3d` pushes triangles in ~32 places. The parameterised
-        // primitives derive their topology and will be consistent; the
-        // hand-built quads each spell out `[0,1,2],[0,2,3]` and any one
-        // written against a flipped basis will VANISH under culling rather
-        // than merely shade oddly. A switch turns "some geometry disappeared"
-        // into one environment variable instead of a rebuild.
+        // Verified unconditional, not left behind a switch: `render-scene.sh`-style A/B capture
+        // (Atlantis, fixed camera, LOGSCOPE_CULL=0 vs default) shows NO geometry vanishing — the
+        // 32 hand-built triangle pushes in `mesh3d` do wind consistently with the parameterised
+        // primitives — and the culled shot is visibly less washed out, consistent with the
+        // double-blend theory. `LOGSCOPE_CULL=0` is kept as a one-line escape hatch for bisecting
+        // a *future* winding regression, but the default now matches every other renderer here.
         if std::env::var("LOGSCOPE_CULL").as_deref() != Ok("0") {
             gl.enable(glow::CULL_FACE);
             gl.cull_face(glow::BACK);
