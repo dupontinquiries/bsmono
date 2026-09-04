@@ -495,6 +495,11 @@ struct VoicetermApp {
     /// fetching them — its own header explains why the engine could not be
     /// included here — so the HOST owns which docs exist and the conversion.
     docs: voiceterm_egui::manpage_view::ManpageView,
+    /// `uikit_web::doc::render_page`'s form state for the demo section below
+    /// the manual — see the comment at the call site for why this exists at
+    /// all. Real page state (per open web pane) belongs to whatever fix the
+    /// Web-pane wiring gap gets; this is deliberately not that.
+    page_demo_form: uikit_web::doc::FormState,
     /// The spoken mail phrase, parsed by the selector grammar.
     mail_phrase: String,
     /// A spoken date question — "how many days until christmas". Answered
@@ -634,7 +639,15 @@ struct VoicetermApp {
     /// Document ingest: diagnose a captured page, repair it, confirm or revert.
     ingest: voiceterm_egui::docingest::Ingest,
     mail: voiceterm_egui::mail_view::MailView,
+    /// Global bookmark store, across every page ever opened — not per pane.
+    /// See `browser::Browser`'s doc for why it's this small now.
     browser: voiceterm_egui::browser::Browser,
+    /// Per-open-web-pane transient state (URL, title, actions, filter
+    /// stats), keyed by the pane's id in the tiling model. Used to be
+    /// fields on `Browser` itself, which is why this app could only ever
+    /// show one web page at a time regardless of how many web panes
+    /// existed — every pane read and wrote the same shared state.
+    web_panes: std::collections::HashMap<u64, voiceterm_egui::browser::WebPane>,
     graph: voiceterm_egui::graph_view::GraphView,
     // The real archive surface (archived_view), replacing a bars::ArchiveView
     // that was only ever fed an empty vec — a connected placeholder the
@@ -852,6 +865,19 @@ impl VoicetermApp {
         }
     }
 
+    /// The URL of whichever web pane is FOCUSED right now, or empty.
+    ///
+    /// "Ad filter for this site", "web settings", and note capture's source
+    /// URL all mean "whichever page I'm looking at" — and now that web
+    /// state is per-pane (`web_panes`, keyed by pane id) rather than one
+    /// shared `Browser`, that has to mean the focused pane specifically,
+    /// not just any web pane that happens to be open elsewhere in the tab.
+    fn focused_web_url(&self) -> String {
+        let id = self.workspace.focused_pane();
+        if self.workspace.pane_view(id) != PaneView::Web { return String::new(); }
+        self.web_panes.get(&id).map(|p| p.url.clone()).unwrap_or_default()
+    }
+
     fn run_command(&mut self, cmd: voiceterm_egui::palette::Command) {
         use voiceterm_egui::gesture_menus::WsCall;
         use voiceterm_egui::palette::{Command, Target};
@@ -898,7 +924,8 @@ impl VoicetermApp {
                     FilterLevel::Standard => FilterMode::Standard,
                     FilterLevel::Aggressive => FilterMode::Aggressive,
                 };
-                match voiceterm_egui::web_prefs::host_of(&self.browser.url) {
+                let __focused_web_url = self.focused_web_url();
+                match voiceterm_egui::web_prefs::host_of(&__focused_web_url) {
                     Some(h) => {
                         self.web_prefs.site_mut(&h).filter = Some(mode);
                         self.save_web_prefs();
@@ -912,7 +939,8 @@ impl VoicetermApp {
                 }
             }
             Command::SiteReset => {
-                match voiceterm_egui::web_prefs::host_of(&self.browser.url) {
+                let __focused_web_url = self.focused_web_url();
+                match voiceterm_egui::web_prefs::host_of(&__focused_web_url) {
                     Some(h) => {
                         self.web_prefs.sites.retain(|(p, _)| *p != h);
                         self.save_web_prefs();
@@ -1299,7 +1327,7 @@ impl eframe::App for VoicetermApp {
                                       self.surfaces.is(Surface::WebSettings));
         if web_t > 0.0 {
             let colors = self.colors;
-            let url = self.browser.url.clone();
+            let url = self.focused_web_url();
             let mut dirty = false;
             overlay::show(ctx, Surface::WebSettings, web_t, |ui| {
                 dirty = voiceterm_egui::web_prefs::web_settings_ui(
@@ -2553,6 +2581,34 @@ impl eframe::App for VoicetermApp {
                         }
                     }
                     PaneView::Web => {
+                        // PER-PANE NOW. `self.browser` used to carry url/
+                        // title/actions/etc directly, so every web pane in
+                        // the tiling layout read and wrote the SAME state —
+                        // two open at once showed the same page in both.
+                        // `PaneKind::Web{url}` has been per-pane in the model
+                        // since `split_web` was written; this keys the
+                        // presentation state the same way. `or_default`
+                        // rather than pre-seeding at creation time: a pane
+                        // whose kind is already `Web{url}` (opened via
+                        // `open_web_pane_at`) still needs an entry here on
+                        // first render, and starting blank then loading is
+                        // simpler than threading the initial url through a
+                        // second path.
+                        let web_pane_id = self.workspace.focused_pane();
+                        let pane = self.web_panes.entry(web_pane_id).or_default();
+                        // A freshly-opened pane's `PaneKind::Web{url}` may
+                        // already carry a real url (open_web_pane_at) that
+                        // this per-pane entry hasn't seen yet — seed it once,
+                        // the same "not equal, so (re)load" rule the graph
+                        // view's focus-seeding uses.
+                        if let Some(voiceterm_egui::terminal_workspace::PaneKind::Web { url }) = {
+                            use voiceterm_egui::terminal_workspace::TermPanes as _;
+                            self.workspace.model().pane_kind(web_pane_id)
+                        }{
+                            if *url != pane.url && !url.is_empty() {
+                                pane.load(url);
+                            }
+                        }
                         ui.horizontal(|ui| {
                             // THE ONE-CHARACTER BUG. This used to clone
                             // `self.browser.url` into a local every frame, edit
@@ -2563,12 +2619,12 @@ impl eframe::App for VoicetermApp {
                             //
                             // Edit the field itself; commit on Enter or on
                             // focus loss.
-                            let r = ui.add(egui::TextEdit::singleline(&mut self.browser.url).id_salt("voiceterm_egui-self_browser_url"));
+                            let r = ui.add(egui::TextEdit::singleline(&mut pane.url).id_salt("voiceterm_egui-self_browser_url"));
                             let entered = r.lost_focus()
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
                             if entered || r.lost_focus() {
-                                let u = self.browser.url.clone();
-                                self.browser.load(&u);
+                                let u = pane.url.clone();
+                                pane.load(&u);
                             }
                             // THE STAR. `Browser::is_bookmarked`/`toggle_bookmark`
                             // existed with a doc comment saying "drives the
@@ -2580,12 +2636,12 @@ impl eframe::App for VoicetermApp {
                             // on an empty URL: starring nothing is not a
                             // command, it is a blank bookmark waiting to
                             // confuse the sitemap that reads this list.
-                            let can_star = !self.browser.url.trim().is_empty();
-                            let starred = self.browser.is_bookmarked();
+                            let can_star = !pane.url.trim().is_empty();
+                            let starred = pane.is_bookmarked(&self.browser.bookmarks);
                             let glyph = if starred { "\u{2605}" } else { "\u{2606}" }; // ★ / ☆
                             if ui.add_enabled(can_star, egui::Button::new(glyph)).clicked() {
                                 let now_ms = (ui.input(|i| i.time) * 1000.0) as u64;
-                                self.browser.toggle_bookmark(now_ms);
+                                pane.toggle_bookmark(&mut self.browser.bookmarks, now_ms);
                             }
                         });
                         // THE SITEMAP, under the URL bar. `explore` holds the
@@ -2620,8 +2676,9 @@ impl eframe::App for VoicetermApp {
                                 .weak().small());
                         }
                         let groups = voiceterm_egui::explore::group_rows(&pages);
+                        let pane = self.web_panes.get_mut(&web_pane_id).expect("seeded above");
                         if let Some(path) = voiceterm_egui::explore::sitemap_ui(ui, &groups, &c) {
-                            self.browser.load(&path);
+                            pane.load(&path);
                         }
 
                         // THE WALK PLAYER. explore's header says session_walk's
@@ -2648,15 +2705,16 @@ impl eframe::App for VoicetermApp {
                             .collect();
                         let session = voiceterm_egui::session_walk::last_session(&walk_pages);
                         self.walk.load(session);
+                        let pane = self.web_panes.get_mut(&web_pane_id).expect("seeded above");
                         if let Some(i) = voiceterm_egui::explore::walk_ui(ui, &mut self.walk, &c) {
                             if let Some(pg) = self.walk.pages().get(i) {
-                                self.browser.load(&pg.url.clone());
+                                pane.load(&pg.url.clone());
                             }
                         }
-                        if let Some(why) = self.browser.empty_reason() {
+                        if let Some(why) = pane.empty_reason() {
                             ui.colored_label(c.text_weak, why);
                         }
-                        for a in self.browser.ranked() {
+                        for a in pane.ranked() {
                             let on = a.actionable();
                             ui.add_enabled(on, egui::Button::new(a.label()));
                             if let Some(r) = a.blocked_reason() {
@@ -2990,6 +3048,57 @@ impl eframe::App for VoicetermApp {
                                         .chars().take(16).collect::<String>()));
                         });
                         ui.separator();
+                        // PROOF OF LIFE FOR `doc::render_page`. The module's
+                        // own comment on the function: "doc.rs has had the
+                        // page model... and NO RENDERER... the model that
+                        // exists to replace web2qml has never been on
+                        // screen." The renderer exists now (`render_page`,
+                        // `render_page_with`, `FormState`, `submit` — 30
+                        // tests in the kit) and STILL has zero callers
+                        // anywhere in this app: `browser::page_ui_for`, the
+                        // settings bridge for it, is dead too.
+                        //
+                        // This is deliberately NOT wired into the real Web
+                        // pane. That needs the pane-opening gap fixed first
+                        // (LinkAction::Open is a no-op — see the comment
+                        // where it's handled) and a per-pane state decision
+                        // (self.browser is one shared field; the page model
+                        // is per-document by construction). Both are real
+                        // design calls, not a slot-in.
+                        //
+                        // What this answers instead, narrowly: does the
+                        // renderer actually work. `FORMS`-shaped sample
+                        // (login field, checkbox, select, textarea) so a
+                        // form round-trip is visible without touching any
+                        // of that.
+                        ui.collapsing("page renderer preview (doc.rs, not yet wired to Web)", |ui| {
+                            const SAMPLE: &str = r#"<html><body>
+<form action="/submit"><input type="text" name="q" placeholder="Search"><button type="submit">Go</button></form>
+<div><input type="checkbox" name="agree"><label>I agree</label></div>
+<select><option>One</option><option>Two</option></select>
+<textarea>default text</textarea>
+</body></html>"#;
+                            // Parsed once per frame here — fine for a fixed
+                            // demo string; a real caller would parse on load,
+                            // per the crate's own "flatten once" doc.
+                            let page = uikit_web::doc::parse_page(SAMPLE);
+                            match uikit_web::doc::render_page(
+                                ui, &page, &mut self.page_demo_form, &c)
+                            {
+                                Some(uikit_web::doc::PageAction::Submit(s)) => {
+                                    self.toasts.info(
+                                        format!("{} {} → {}", s.method, s.action, s.query),
+                                        ui.input(|i| i.time));
+                                }
+                                Some(uikit_web::doc::PageAction::Follow(href)) => {
+                                    self.toasts.info(format!("follow: {href}"), ui.input(|i| i.time));
+                                }
+                                Some(uikit_web::doc::PageAction::OpenIsland { tag, src }) => {
+                                    self.toasts.info(format!("island: {tag} {src}"), ui.input(|i| i.time));
+                                }
+                                None => {}
+                            }
+                        });
                         if let Some(name) = voiceterm_egui::manpage_view::manpage_ui(
                             ui, &mut self.docs, &c)
                         {
@@ -3172,7 +3281,7 @@ impl eframe::App for VoicetermApp {
                                 .desired_rows(4).desired_width(f32::INFINITY)).changed();
                         if changed {
                             let src = cv::CardSource {
-                                url: self.browser.url.clone(),
+                                url: self.focused_web_url(),
                                 paragraph_id: String::new(),
                             };
                             self.deck.set_cards(cv::note_cards::split_into_cards(
@@ -3908,7 +4017,18 @@ impl eframe::App for VoicetermApp {
             // background rule intact: parked panes are reconciled by id,
             // the focused pane is reconciled by whether it actually has
             // a shell in hand.
-            if voiceterm_egui::pane_host::focused_needs_shell(
+            //
+            // GUARDED ON PANE KIND. `split_web`'s own comment calls web
+            // panes "never focused" as though that were enforced; it is
+            // only a default — `Workspace::focus_pane` has no restriction,
+            // and the unfocused-pane tile loop below calls it unconditionally
+            // on click. Without this check, clicking a web pane's tile would
+            // focus it and this block would spawn it a real shell it has no
+            // use for, on the next frame, unconditionally. That is the actual
+            // invariant "never focused" was protecting — not focus itself.
+            let focused_is_web = self.workspace.pane_view(self.pane_focus)
+                == voiceterm_egui::shell::PaneView::Web;
+            if !focused_is_web && voiceterm_egui::pane_host::focused_needs_shell(
                 self.pty.is_some(),
                 self.pty_spawn_failed.contains(&self.pane_focus),
             ) {
@@ -4107,36 +4227,27 @@ impl eframe::App for VoicetermApp {
                             ctx.copy_text(u);
                             self.toasts.success("Copied URL", ctx.input(|i| i.time));
                         }
-                        // Open/Read/NewTab drive the web pane / reader — on-device wiring, same
-                        // status as the workspace actions above.
+                        // Open/Read/NewTab all resolve to the same thing right
+                        // now: open a new pane beside the current one, already
+                        // pointed at the url, and focus it. `open_web_pane_at`
+                        // plus the per-pane `web_panes` state (both added this
+                        // session — see their own doc comments) were the two
+                        // pieces this needed; the Web pane's render arm seeds
+                        // its `WebPane` entry from `PaneKind::Web{url}` on
+                        // first draw, so there's exactly one place that turns
+                        // a model url into presentation state, not two.
                         //
-                        // Traced further this session: it is not just this
-                        // match arm. `WsCall::OpenWebPane` (shell.rs) already
-                        // creates the pane via `TermPanes::split_web` — but
-                        // with an EMPTY url, on the documented assumption
-                        // that "the reader fills it in". No public method
-                        // exists to do that: `Workspace::model()` is
-                        // read-only, and there's no `set_pane_web_url(id,
-                        // url)` wrapper over `TermPanes::set_pane_kind`.
-                        //
-                        // Deeper than that: even with such a setter, `self.
-                        // browser: Browser` (this struct) is ONE shared
-                        // field, not keyed by pane id. `PaneKind::Web{url}`
-                        // is per-pane in the tiling model already, but the
-                        // Web view above renders `self.browser` regardless
-                        // of which pane asked for it — so two web panes open
-                        // at once would show the same page in both. Wiring
-                        // this arm needs that design decision made first
-                        // (a HashMap<u64, Browser>, most likely) before the
-                        // dispatch itself is the easy part: find the new
-                        // pane via `active_pane_ids().max()` (the newest-id
-                        // convention `close_newest_web_pane` already uses),
-                        // set its url, seed that pane's `Browser` entry, and
-                        // call `.load()`. Not done here — no network access
-                        // in this sandbox to verify a real page fetch even
-                        // once the plumbing exists, and the per-pane-state
-                        // refactor is its own decision, not a slot-in fix.
-                        Some(LinkAction::Open(_)) | Some(LinkAction::Read(_)) | Some(LinkAction::NewTab(_)) => {}
+                        // Focusing it is new too: `focused_needs_shell`'s
+                        // call site now skips spawning a shell for a focused
+                        // pane whose view is `Web` (see that guard's comment)
+                        // — without it, this would have quietly spawned a
+                        // real shell process for a pane that has no use for
+                        // one, the exact failure `split_web`'s "never
+                        // focused" comment was actually protecting against.
+                        Some(LinkAction::Open(u)) | Some(LinkAction::Read(u)) | Some(LinkAction::NewTab(u)) => {
+                            let new_id = self.workspace.open_web_pane_at(&u);
+                            self.workspace.focus_pane(new_id);
+                        }
                         None => {}
                     }
                 }
@@ -4348,6 +4459,7 @@ fn main() -> eframe::Result<()> {
                     ]);
                     v
                 },
+                page_demo_form: uikit_web::doc::FormState::default(),
                 table_engine: voiceterm_egui::table_ops::TableView::new(
                     voiceterm_egui::table_ops::TableData::new(
                         vec!["name".into(), "size".into(), "modified".into()],
@@ -4424,6 +4536,7 @@ fn main() -> eframe::Result<()> {
                 a11y: uikit_egui::a11y::A11yScene::new(),
                 mail: Default::default(),
                 browser: Default::default(),
+                web_panes: Default::default(),
                 graph: Default::default(),
                 archive: Default::default(),
                 mail_messages: Vec::new(),
