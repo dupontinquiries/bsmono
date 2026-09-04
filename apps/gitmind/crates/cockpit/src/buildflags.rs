@@ -403,6 +403,59 @@ pub fn cargo_build_argv_kind(app: &str, triple: &str, features: &[String], no_de
     a
 }
 
+/// How many cargo jobs to allow, given where the build runs.
+///
+/// # Desktop and phone want opposite answers
+///
+/// On a desktop, cargo's default — one job per core — is right, and capping it
+/// wastes the machine. On a phone it is how a build gets killed: an FP5 has 8
+/// cores and 6-8 GB, and eight concurrent rustc processes on a large crate ask
+/// for more than that. The kernel's OOM killer takes the biggest one, cargo
+/// reports a signal rather than a compile error, and the operator sees a build
+/// that "just stops" — which reads as a toolchain problem rather than memory.
+///
+/// It is memory per job, not cores, that decides this. A phone has plenty of
+/// cores and not enough RAM to feed them, and `unendlich` or `blackstar` link
+/// steps are gigabytes each.
+///
+/// `None` means "say nothing and let cargo decide", which is the desktop
+/// answer: a fixed number would be wrong on both a 4-core laptop and a 32-core
+/// workstation.
+///
+/// Pure over the two facts it needs, so the policy is testable without a
+/// device — which matters, because the device is exactly where it cannot be
+/// experimented with cheaply.
+pub fn job_limit(is_remote_device: bool, device_ram_mb: Option<u64>) -> Option<u32> {
+    if !is_remote_device {
+        return None;
+    }
+    // Roughly 1.5 GB per concurrent rustc on this fleet's larger crates,
+    // measured the hard way: a full-fleet build in a 4 GB tmpfs lost rlibs
+    // and produced `E0463 can't find crate` for one that had compiled
+    // (C14_TODO §21). Memory pressure on a phone fails the same way and
+    // reports even less.
+    let ram = device_ram_mb.unwrap_or(4096);
+    let by_ram = (ram / 1536).max(1) as u32;
+    // Never more than 4 even on a well-provisioned device: past that the
+    // limit stops being memory and starts being thermal, and a phone that
+    // throttles takes longer than one that never did.
+    Some(by_ram.min(4))
+}
+
+/// Append `-j` to a build argv when the target warrants it.
+///
+/// Separate from `cargo_build_argv_kind` rather than folded in, because the
+/// argv builder is used for local builds, remote builds and dry-run display,
+/// and only one of those wants a cap. A caller that forgets is left with
+/// cargo's default, which is the safe direction.
+pub fn with_job_limit(mut argv: Vec<String>, limit: Option<u32>) -> Vec<String> {
+    if let Some(n) = limit {
+        argv.push("-j".into());
+        argv.push(n.to_string());
+    }
+    argv
+}
+
 /// The libc family of a target triple: "musl" or "gnu". Pure.
 pub fn target_libc(triple: &str) -> &'static str {
     if triple.contains("musl") { "musl" } else { "gnu" }
@@ -945,6 +998,60 @@ mod artifact_name_tests {
         // at least names the variable cargo wanted.
         assert_eq!(cross_linker("riscv64gc-unknown-linux-gnu"), None);
         assert!(cross_env("riscv64gc-unknown-linux-gnu").is_empty());
+    }
+
+    #[test]
+    fn a_desktop_build_is_not_capped() {
+        // Cargo's default is one job per core and that is right here. A fixed
+        // number would be wrong on both a 4-core laptop and a 32-core
+        // workstation, which is why the answer is "say nothing".
+        assert_eq!(job_limit(false, None), None);
+        assert_eq!(job_limit(false, Some(65536)), None);
+        let argv = with_job_limit(vec!["cargo".into(), "build".into()], job_limit(false, None));
+        assert!(!argv.contains(&"-j".to_string()), "{argv:?}");
+    }
+
+    #[test]
+    fn a_phone_build_is_capped_by_memory_not_cores() {
+        // An FP5 has 8 cores and 6-8 GB. Eight concurrent rustc processes on a
+        // large crate ask for more than that; the OOM killer takes one, cargo
+        // reports a signal rather than a compile error, and the build "just
+        // stops".
+        assert_eq!(job_limit(true, Some(6144)), Some(4));
+        assert_eq!(job_limit(true, Some(3072)), Some(2));
+        assert_eq!(job_limit(true, Some(1536)), Some(1));
+        // Never zero, whatever it is told — `-j 0` is an error, and a device
+        // reporting a small or absent figure must still build.
+        assert_eq!(job_limit(true, Some(0)), Some(1));
+        assert_eq!(job_limit(true, Some(100)), Some(1));
+    }
+
+    #[test]
+    fn a_large_phone_is_still_capped() {
+        // Past four the limit stops being memory and starts being thermal: a
+        // phone that throttles takes longer than one that never did.
+        assert_eq!(job_limit(true, Some(16384)), Some(4));
+        assert_eq!(job_limit(true, Some(65536)), Some(4));
+    }
+
+    #[test]
+    fn an_unknown_device_ram_is_assumed_small() {
+        // Guessing high on a device that cannot say is how the build dies.
+        // Guessing low costs minutes.
+        assert_eq!(job_limit(true, None), Some(2));
+    }
+
+    #[test]
+    fn the_flag_lands_as_two_arguments_cargo_understands() {
+        let argv = with_job_limit(
+            cargo_build_argv("aperture", "", &[], false),
+            job_limit(true, Some(6144)),
+        );
+        let i = argv.iter().position(|a| a == "-j").expect("no -j");
+        assert_eq!(argv[i + 1], "4");
+        // And it goes at the END, after `-p <app>` — cargo accepts it there
+        // and a caller reading the argv sees the app name where it expects to.
+        assert!(i > argv.iter().position(|a| a == "-p").unwrap());
     }
 
 }
