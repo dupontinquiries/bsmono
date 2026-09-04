@@ -1058,12 +1058,40 @@ with far less in flight.
 | studio | three `studio-video` probes — silent-video audio, thumbnail strip, PNG bytes; all need ffmpeg |
 | gpu-gemm | SIGSEGV, see above |
 
+### I reproduced the tmpfs failure by accident
+
+Re-running this session's crates WITHOUT `--lib`, the sandbox hit
+`No space left on device`:
+
+    error: failed to build archive at `.../libeframe-….rlib`: No space left on device
+    error: could not compile `eframe` (lib)
+
+One rlib fails to write while everything else has already succeeded. Same
+signature as the fleet run's `E0463`, seen from the other end: here the write
+failed loudly, there it presumably failed earlier and left rustdoc looking for
+a file that was never finished. Same cause, different symptom depending on
+which step notices.
+
+Four disk exhaustions in this sandbox today, all with a smaller working set
+than a full fleet build. That is the argument for a disk-backed
+`CARGO_TARGET_DIR`.
+
 ### What this run proves about `--lib`
 
 Both `E0463`s are in the **doctest** target. `cargo test --lib` does not build
 doctests and would report every one of these crates green — which is the
 warning c14unified-026 arrived with, demonstrated on the same day by an
 independent run. I used `-q --lib` throughout this session.
+
+Acted on rather than noted. I re-ran the two crates I changed most today with
+a plain `cargo test`:
+
+* `uikit-egui` — 377 lib, 1 doctest, 2 ignored.
+* `snapclone-egui` — 1644 lib, plus a **3-test integration target** `--lib` had
+  been skipping all day.
+
+Both clean, so nothing was hiding. But those three had not run since I started
+changing that crate this morning, and I reported the count as though they had.
 
 ---
 
