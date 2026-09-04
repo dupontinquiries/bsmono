@@ -613,6 +613,13 @@ impl AppState {
             s.revs = gitspace::history(r, rel, 48);
         }
         s.refresh_git();
+        // `open_file` isn't the only way a file gets loaded — the binary's
+        // CLI-argument path (`aperture some_file.rs`) constructs AppState
+        // with a path directly and never calls `open_file` at all. Found
+        // by launching the real binary this way and watching the popup
+        // never gain an LSP-sourced item: `start_lsp_for_current_file`
+        // needs calling from both places, not just the in-app Open dialog.
+        s.start_lsp_for_current_file(&text);
         s
     }
 
