@@ -678,7 +678,7 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
     }
 
     // Ghost text — at the caret, when the caret sits at its line's end.
-    if let crate::ghost::Ghost::Shown { text } = &state.ghost {
+    if let crate::ghost::Ghost::Shown { text, .. } = &state.ghost {
         if caret.col == state.editor.buffer.line_len(caret.line) {
             let alpha = ghost_alpha(state, now_ms);
             let gcolor = colors.text_weak.gamma_multiply(0.85 * alpha);

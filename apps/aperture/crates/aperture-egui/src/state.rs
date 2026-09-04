@@ -3867,9 +3867,9 @@ mod tests {
     fn typing_through_the_ghost_keeps_it_alive() {
         let mut s = AppState::new(None, false);
         typed(&mut s, "pr", 0);
-        s.ghost = Ghost::Shown { text: "intln!".into() };
+        s.ghost = Ghost::Shown { text: "intln!".into(), generation: 0 };
         typed(&mut s, "i", 10);
-        assert_eq!(s.ghost, Ghost::Shown { text: "ntln!".into() });
+        assert_eq!(s.ghost, Ghost::Shown { text: "ntln!".into(), generation: 0 });
         assert!(!s.debounce.armed(), "consumed keystroke doesn't re-arm");
         typed(&mut s, "x", 20);
         assert_eq!(s.ghost, Ghost::Idle, "divergence dismissed it");
@@ -3896,10 +3896,84 @@ mod tests {
     }
 
     #[test]
+    fn streamed_partial_outcomes_grow_the_ghost_text_progressively() {
+        // The lower layers (aperture_complete's own engine/provider tests)
+        // prove a streaming provider delivers growing partials then one
+        // final outcome. This is the piece that was genuinely untested:
+        // that AppState's own note_outcome, given that exact sequence,
+        // actually shows the growing text rather than only reacting to
+        // the final one — the behavior the code comment above claims
+        // ("Ghost text updates on EVERY outcome, partial or final") but
+        // nothing exercised.
+        //
+        // Checks the actual TEXT at each step, not just is_shown() — the
+        // first version of this test only checked is_shown(), which would
+        // have passed even with the real bug found while building this
+        // (once Shown, on_outcome's guard silently dropped every later
+        // delta for the same generation; is_shown() alone can't see that
+        // the text stayed frozen).
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "fn main", 0);
+        s.ghost.request_sent(s.editor.version);
+        let generation = s.editor.version;
+        for partial in ["(", "() ", "() {", "() {}"] {
+            s.note_outcome(&CompletionOutcome {
+                generation,
+                provider: "test".into(),
+                latency_ms: 5,
+                result: Ok(partial.to_string()),
+                is_final: false,
+            }, 100);
+            assert_eq!(
+                s.ghost.text(), Some(partial.trim()),
+                "each partial should be the CURRENTLY shown text, not frozen at an earlier one"
+            );
+        }
+        s.note_outcome(&CompletionOutcome {
+            generation,
+            provider: "test".into(),
+            latency_ms: 20,
+            result: Ok("() {}".to_string()),
+            is_final: true,
+        }, 200);
+        assert_eq!(s.ghost.text(), Some("() {}"));
+    }
+
+    #[test]
+    fn streamed_partials_do_not_flood_the_loop_pane_only_the_final_one_logs() {
+        // "a 20-delta streamed completion should read as one row, not
+        // twenty near-duplicates burying everything before it" — stated
+        // as the reason for the `if !out.is_final { return; }` early exit,
+        // but never actually driven with more than one outcome before.
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "fn main", 0);
+        s.ghost.request_sent(s.editor.version);
+        let generation = s.editor.version;
+        for partial in ["(", "() ", "() {", "() {}"] {
+            s.note_outcome(&CompletionOutcome {
+                generation,
+                provider: "test".into(),
+                latency_ms: 5,
+                result: Ok(partial.to_string()),
+                is_final: false,
+            }, 100);
+        }
+        assert_eq!(s.loop_log.len(), 0, "no partial should have logged anything yet");
+        s.note_outcome(&CompletionOutcome {
+            generation,
+            provider: "test".into(),
+            latency_ms: 20,
+            result: Ok("() {}".to_string()),
+            is_final: true,
+        }, 200);
+        assert_eq!(s.loop_log.len(), 1, "exactly one row for the whole streamed generation");
+    }
+
+    #[test]
     fn word_accept_inserts_incrementally() {
         let mut s = AppState::new(None, false);
         typed(&mut s, "x", 0);
-        s.ghost = Ghost::Shown { text: " = compute();".into() };
+        s.ghost = Ghost::Shown { text: " = compute();".into(), generation: 0 };
         key(&mut s, K::Right, true, 100);
         assert_eq!(s.editor.buffer.to_string(), "x =");
         key(&mut s, K::Right, true, 200);
@@ -3915,7 +3989,7 @@ mod tests {
         s.editor.select_all();
         s.trigger_completion_now(0);
         assert!(!s.ghost.is_pending(), "no ghost over a selection");
-        s.ghost = Ghost::Shown { text: "zzz".into() };
+        s.ghost = Ghost::Shown { text: "zzz".into(), generation: 0 };
         key(&mut s, K::Escape, false, 0);
         assert_eq!(s.ghost, Ghost::Idle);
     }

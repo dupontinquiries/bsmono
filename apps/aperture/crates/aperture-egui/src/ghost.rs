@@ -20,7 +20,17 @@
 pub enum Ghost {
     Idle,
     Pending { generation: u64 },
-    Shown { text: String },
+    /// `generation` is what makes STREAMING actually work: a completion
+    /// in progress sends several outcomes for the same request, and once
+    /// the first one lands the ghost is already `Shown`, not `Pending`.
+    /// Without tracking which generation is currently showing, `on_outcome`
+    /// had no way to recognize "this is another delta for the SAME
+    /// request" and silently dropped every partial after the first —
+    /// including the final one — because its guard only ever accepted an
+    /// outcome while still `Pending`. Found via an end-to-end test that
+    /// watched the ghost text over a real stream and never saw it grow
+    /// past the first delta.
+    Shown { text: String, generation: u64 },
 }
 
 impl Ghost {
@@ -35,9 +45,12 @@ impl Ghost {
         *self = Ghost::Pending { generation };
     }
 
-    /// Feed an engine outcome. Accepts only a success matching the buffer
-    /// version we're *now* at; everything else quietly returns to Idle (an
-    /// error message is the caller's to log — the loop pane does).
+    /// Feed an engine outcome. Accepts a success matching the buffer
+    /// version we're *now* at, whether the ghost is currently `Pending`
+    /// for this generation (the first delta, or a non-streaming answer)
+    /// OR already `Shown` for this SAME generation (a later delta in the
+    /// same stream) — anything else quietly returns to Idle (an error
+    /// message is the caller's to log — the loop pane does).
     /// Returns the multipass MENU when one was produced: the blocks
     /// beyond the first, plus the model's prose. The caller stores them;
     /// the ghost stays a single string so every existing site — accept,
@@ -57,7 +70,8 @@ impl Ghost {
         // owns the setting rather than the completion layer owning it.
         map: &aperture_complete::keymap::KeyMap,
     ) -> Option<(Vec<aperture_complete::multipass::Block>, Vec<String>)> {
-        let expected = matches!(*self, Ghost::Pending { generation: g } if g == generation);
+        let expected = matches!(*self, Ghost::Pending { generation: g } if g == generation)
+            || matches!(*self, Ghost::Shown { generation: g, .. } if g == generation);
         match result {
             Ok(text) if expected && generation == current_version && !text.is_empty() => {
                 // MULTIPASS, rather than showing the reply verbatim.
@@ -78,7 +92,7 @@ impl Ghost {
                 let (blocks, prose) = aperture_complete::multipass::plan_with(text, map);
                 match blocks.iter().find(|b| b.kind.insertable()) {
                     Some(first) => {
-                        *self = Ghost::Shown { text: first.text.clone() };
+                        *self = Ghost::Shown { text: first.text.clone(), generation };
                     }
                     // Every block was an elision, a stub, or prose. There
                     // is nothing safe to insert, and showing the raw text
@@ -99,7 +113,7 @@ impl Ghost {
     /// The user typed `typed`. Returns true when the ghost consumed it
     /// (i.e. the edit matched the suggestion's own next chars).
     pub fn on_text_inserted(&mut self, typed: &str) -> bool {
-        if let Ghost::Shown { text } = self {
+        if let Ghost::Shown { text, .. } = self {
             if let Some(rest) = text.strip_prefix(typed) {
                 if rest.is_empty() {
                     *self = Ghost::Idle; // typed the whole thing yourself
@@ -126,7 +140,7 @@ impl Ghost {
     /// ahead of the caret while it is being typed out.
     pub fn text(&self) -> Option<&str> {
         match self {
-            Ghost::Shown { text } => Some(text),
+            Ghost::Shown { text, .. } => Some(text),
             _ => None,
         }
     }
@@ -142,7 +156,7 @@ impl Ghost {
     /// edit landed in between — and a ghost that no longer describes what
     /// follows the caret is worse than none.
     pub fn consume(&mut self, typed: &str) {
-        let Ghost::Shown { text } = self else { return };
+        let Ghost::Shown { text, .. } = self else { return };
         match text.strip_prefix(typed) {
             Some(rest) if !rest.is_empty() => *text = rest.to_string(),
             Some(_) => *self = Ghost::Idle, // fully typed out
@@ -152,7 +166,7 @@ impl Ghost {
 
     pub fn accept_all(&mut self) -> Option<String> {
         match std::mem::replace(self, Ghost::Idle) {
-            Ghost::Shown { text } => Some(text),
+            Ghost::Shown { text, .. } => Some(text),
             other => {
                 *self = other; // put a Pending back; taking it would drop a request
                 None
@@ -163,7 +177,8 @@ impl Ghost {
     /// Take just the next word (leading spaces + run of word chars, or a
     /// single newline+indent) — the Ctrl+→ partial accept.
     pub fn accept_word(&mut self) -> Option<String> {
-        let Ghost::Shown { text } = self else { return None };
+        let Ghost::Shown { text, generation } = self else { return None };
+        let generation = *generation;
         let word = next_word(text);
         if word.is_empty() {
             return None;
@@ -173,7 +188,7 @@ impl Ghost {
         if rest.is_empty() {
             *self = Ghost::Idle;
         } else {
-            *self = Ghost::Shown { text: rest };
+            *self = Ghost::Shown { text: rest, generation };
         }
         Some(out)
     }
@@ -223,21 +238,76 @@ mod tests {
         assert_eq!(g, Ghost::Idle, "right request, but the buffer moved on");
         g.request_sent(7);
         g.on_outcome(7, 7, &Ok("println!".into()), &aperture_complete::keymap::KeyMap::new());
-        assert_eq!(g, Ghost::Shown { text: "println!".into() });
+        assert_eq!(g, Ghost::Shown { text: "println!".into(), generation: 7 });
+    }
+
+    #[test]
+    fn a_later_delta_for_the_same_generation_updates_an_already_shown_ghost() {
+        // THE bug: on_outcome's guard originally only accepted an outcome
+        // while still Pending, so the first streamed delta landing turned
+        // the ghost Shown — permanently locking out every later delta for
+        // that same request, the final one included. Found by an
+        // end-to-end test that watched real streamed ghost text and never
+        // saw it grow past the first fragment.
+        //
+        // Deltas here avoid leading/trailing whitespace on purpose:
+        // `multipass::make_block` trims each block's text, which is a
+        // SEPARATE, minor, self-correcting quirk when applied to a
+        // streaming partial (an intermediate delta like "fn " loses its
+        // trailing space until the next delta arrives) — real, but not
+        // what this test is isolating.
+        let mut g = Ghost::Idle;
+        g.request_sent(3);
+        g.on_outcome(3, 3, &Ok("fn".into()), &aperture_complete::keymap::KeyMap::new());
+        assert_eq!(g, Ghost::Shown { text: "fn".into(), generation: 3 });
+        g.on_outcome(3, 3, &Ok("fn main".into()), &aperture_complete::keymap::KeyMap::new());
+        assert_eq!(g, Ghost::Shown { text: "fn main".into(), generation: 3 },
+            "a second delta for the SAME generation must still update the ghost, not be silently dropped");
+        g.on_outcome(3, 3, &Ok("fn main(){}".into()), &aperture_complete::keymap::KeyMap::new());
+        assert_eq!(g, Ghost::Shown { text: "fn main(){}".into(), generation: 3 });
+    }
+
+    #[test]
+    fn a_delta_for_a_different_generation_while_shown_is_still_rejected() {
+        // The fix must not become "accept anything while Shown" — an
+        // outcome for a DIFFERENT (older or stale) generation arriving
+        // while a newer one is already showing must still be ignored,
+        // same as it always was for the Pending case.
+        let mut g = Ghost::Idle;
+        g.request_sent(2);
+        g.on_outcome(2, 2, &Ok("current".into()), &aperture_complete::keymap::KeyMap::new());
+        assert_eq!(g, Ghost::Shown { text: "current".into(), generation: 2 });
+        // A straggler from an OLDER generation (1) arrives after 2 is
+        // already showing — must not overwrite it.
+        g.on_outcome(1, 2, &Ok("stale".into()), &aperture_complete::keymap::KeyMap::new());
+        assert_eq!(g, Ghost::Shown { text: "current".into(), generation: 2 },
+            "an outcome for a generation that doesn't match the one currently Shown must be a no-op, not overwrite it");
+    }
+
+    #[test]
+    fn a_stale_delta_with_the_current_version_moved_on_is_still_rejected_while_shown() {
+        let mut g = Ghost::Idle;
+        g.request_sent(1);
+        g.on_outcome(1, 1, &Ok("old".into()), &aperture_complete::keymap::KeyMap::new());
+        assert_eq!(g, Ghost::Shown { text: "old".into(), generation: 1 });
+        // A late straggler from the SAME generation arrives, but the
+        // CALLER is now on generation 2 (current_version moved on).
+        g.on_outcome(1, 2, &Ok("stale".into()), &aperture_complete::keymap::KeyMap::new());
+        assert_eq!(g, Ghost::Idle, "generation matches self, but current_version moved on");
     }
 
     #[test]
     fn typing_through_consumes_and_divergence_dismisses() {
-        let mut g = Ghost::Shown { text: "intln!(\"hi\")".into() };
+        let mut g = Ghost::Shown { text: "intln!(\"hi\")".into(), generation: 0 };
         assert!(g.on_text_inserted("in"));
-        assert_eq!(g, Ghost::Shown { text: "tln!(\"hi\")".into() });
+        assert_eq!(g, Ghost::Shown { text: "tln!(\"hi\")".into(), generation: 0 });
         assert!(!g.on_text_inserted("x"), "divergent keystroke");
         assert_eq!(g, Ghost::Idle);
     }
 
     #[test]
     fn word_accept_walks_the_suggestion() {
-        let mut g = Ghost::Shown { text: "let mut x = 1;\n    next()".into() };
+        let mut g = Ghost::Shown { text: "let mut x = 1;\n    next()".into(), generation: 0 };
         assert_eq!(g.accept_word().unwrap(), "let");
         assert_eq!(g.accept_word().unwrap(), " mut");
         assert_eq!(g.accept_word().unwrap(), " x");
@@ -246,7 +316,7 @@ mod tests {
         assert_eq!(g.accept_word().unwrap(), ";");
         assert_eq!(g.accept_word().unwrap(), "\n    ");
         assert_eq!(g.accept_word().unwrap(), "next");
-        let mut all = Ghost::Shown { text: "()".into() };
+        let mut all = Ghost::Shown { text: "()".into(), generation: 0 };
         assert_eq!(all.accept_all().unwrap(), "()");
         assert_eq!(all, Ghost::Idle);
     }
