@@ -44,9 +44,10 @@ pub fn run(root: &std::path::Path, p: &Probe) -> Result<Vec<Finding>, ProbeError
         Probe::Slice { path, first, last } => slice(root, path, *first, *last).map(|f| vec![f]),
         Probe::Grep { pattern, glob, max_hits } => grep(root, pattern, glob.as_deref(), *max_hits),
         Probe::Outline { path } => outline(root, path).map(|f| vec![f]),
+        Probe::Symbol { name, path_hint } => symbol(root, name, path_hint.as_deref()),
         // Not yet executable. Returning an empty vec would read as "nothing
         // found", which is a lie the queen would act on.
-        Probe::Symbol { .. } | Probe::Deps { .. } => {
+        Probe::Deps { .. } => {
             Err(ProbeError::Unreadable {
                 path: String::new(),
                 why: "probe kind has no executor yet".into(),
@@ -147,6 +148,64 @@ pub fn outline(root: &std::path::Path, path: &str) -> Result<Finding, ProbeError
         text.push_str("(no items)\n");
     }
     Ok(Finding { path: path.into(), first: 1, last: total, text })
+}
+
+/// One named item's definition, bounded by its own span.
+///
+/// # Why this is not a grep plus a slice
+///
+/// A grep for `fn split_pane` finds the line; a slice around it guesses how
+/// far the body runs and is wrong in both directions — too short on a long
+/// function, and reaching into the next one on a short one. `ast` already
+/// knows where the item ENDS, so the slice is exact.
+///
+/// # Long items are truncated, not refused
+///
+/// A slice wider than the cap is an error because the caller chose the range
+/// and deserves to know it was not honoured. Here the ITEM chose it: a
+/// 400-line function is a fact about the code, and refusing to show any of it
+/// helps nobody. The head is returned with its real span recorded, so the
+/// queen can slice further down if it needs to.
+pub fn symbol(root: &std::path::Path, name: &str, path_hint: Option<&str>)
+    -> Result<Vec<Finding>, ProbeError>
+{
+    let hint = path_hint.ok_or_else(|| ProbeError::Unreadable {
+        path: String::new(),
+        // A repository-wide symbol search is a grep over every file, and the
+        // caller has a cheaper way to get there: grep first, then ask for the
+        // symbol in the file the grep named. Refusing keeps the survey-first
+        // order rather than quietly walking the tree.
+        why: "Symbol needs a path_hint — grep for the name first".into(),
+    })?;
+    let full = root.join(hint);
+    let src = std::fs::read_to_string(&full)
+        .map_err(|e| open_err(e.kind(), hint, &e.to_string()))?;
+    let lines: Vec<&str> = src.lines().collect();
+
+    let mut out = Vec::new();
+    for it in crate::ast::extract(&src) {
+        if it.name != name {
+            continue;
+        }
+        let first = it.start_line as u32 + 1;
+        let true_last = it.end_line as u32 + 1;
+        let last = true_last.min(first + MAX_FINDING_LINES - 1);
+        let body: String = lines
+            .iter()
+            .skip(first as usize - 1)
+            .take((last - first + 1) as usize)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let text = if last < true_last {
+            // Say so IN the finding. A truncated body that looks complete is
+            // how a reader concludes a function does less than it does.
+            format!("{body}// ... truncated at {MAX_FINDING_LINES} lines; item ends at {true_last}\n")
+        } else {
+            body
+        };
+        out.push(Finding { path: hint.into(), first, last, text });
+    }
+    Ok(out)
 }
 
 /// Literal substring search. One finding per matching line.
@@ -393,6 +452,59 @@ mod tests {
         let r = run(&root, &Probe::Outline { path: "f.rs".into() }).expect("outline runs");
         assert_eq!(r.len(), 1);
         assert!(r[0].text.contains("a"), "{}", r[0].text);
+    }
+
+    #[test]
+    fn a_symbol_is_bounded_by_its_own_span_not_a_guess() {
+        // The reason this is not grep-plus-slice: a fixed context window is
+        // too short on a long function and reaches into the next one on a
+        // short one. `ast` knows where the item ends.
+        let body = "fn short() {}\nfn target() {\n    let a = 1;\n    let b = 2;\n}\nfn after() { let poison = 9; }\n";
+        let root = rust_fixture("span", body);
+        let fs = symbol(&root, "target", Some("f.rs")).unwrap();
+        assert_eq!(fs.len(), 1, "{fs:?}");
+        assert!(fs[0].text.contains("let a = 1"), "{}", fs[0].text);
+        assert!(!fs[0].text.contains("poison"), "the symbol ran into the next item:\n{}", fs[0].text);
+        assert!(!fs[0].text.contains("fn short"), "the symbol started too early:\n{}", fs[0].text);
+    }
+
+    #[test]
+    fn a_symbol_with_no_path_hint_is_refused_rather_than_searched_for() {
+        // A repository-wide symbol search is a grep over every file. The
+        // caller has a cheaper route — grep, then ask in the file it named —
+        // and refusing keeps the survey-first order instead of quietly
+        // walking the tree.
+        let root = rust_fixture("nohint", "fn a() {}\n");
+        let e = symbol(&root, "a", None).unwrap_err();
+        assert!(matches!(e, ProbeError::Unreadable { .. }), "{e:?}");
+    }
+
+    #[test]
+    fn an_over_long_item_is_truncated_and_says_so() {
+        // The item chose the length, not the caller, so refusing helps nobody
+        // — but a truncated body that looks complete is how a reader concludes
+        // a function does less than it does.
+        let mut body = String::from("fn huge() {\n");
+        for i in 0..(MAX_FINDING_LINES + 40) {
+            body.push_str(&format!("    let v{i} = {i};\n"));
+        }
+        body.push_str("}\n");
+        let root = rust_fixture("long", &body);
+        let fs = symbol(&root, "huge", Some("f.rs")).unwrap();
+        assert_eq!(fs.len(), 1);
+        assert!(fs[0].lines() <= MAX_FINDING_LINES, "{} lines", fs[0].lines());
+        assert!(fs[0].text.contains("truncated"), "silently cut:\n{}", fs[0].text);
+    }
+
+    #[test]
+    fn a_symbol_that_is_not_there_is_an_empty_result_not_an_error() {
+        // The file was readable and the answer is "not in here" — which is
+        // information. An error would read as a broken probe.
+        let root = rust_fixture("absent", "fn a() {}\n");
+        assert!(symbol(&root, "nonexistent", Some("f.rs")).unwrap().is_empty());
+        // A missing FILE is still an error.
+        assert_eq!(symbol(&root, "a", Some("gone.rs")).unwrap_err(),
+                   ProbeError::NotFound("gone.rs".into()));
     }
 
 }
