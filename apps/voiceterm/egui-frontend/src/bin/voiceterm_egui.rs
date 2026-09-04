@@ -2586,7 +2586,43 @@ impl eframe::App for VoicetermApp {
                             let ids: Vec<String> = doc.nodes.iter().map(|n| n.id.clone()).collect();
                             let edges: Vec<(String, String)> = doc.edges.iter()
                                 .map(|e| (e.from.clone(), e.to.clone())).collect();
+                            // SEED THE FOCUS. `GraphView::layout` returns
+                            // nothing at all while `focus` is empty (see its
+                            // early return), and nothing here ever set it —
+                            // so a freshly typed graph rendered "no graph
+                            // loaded" forever, indistinguishable from a parse
+                            // failure, no matter how many nodes it had. Reset
+                            // rather than route through `focus_on` when the
+                            // current focus isn't even IN this graph (a fresh
+                            // one, or the source changed under it): pushing a
+                            // breadcrumb to a node that doesn't exist in the
+                            // topology being drawn is worse than no
+                            // breadcrumb.
+                            if !ids.iter().any(|id| *id == self.graph.focus) {
+                                if let Some(first) = ids.first() {
+                                    self.graph.focus = first.clone();
+                                    self.graph.trail.clear();
+                                }
+                            }
                             let topo = voiceterm_egui::graph_view::nifty::Topology::new(&ids, &edges);
+                            // DEPTH AND BACK. `GraphView::deeper`/`shallower`/
+                            // `back` have been unit-tested since before this
+                            // pane existed (depth_is_capped_because_a_full_
+                            // graph_is_a_hairball, among others) and the
+                            // module's own header lists "depth control" as
+                            // one of four things this view adds over the
+                            // bare ring layout — but nothing here ever called
+                            // them, so a graph past a couple hops had no way
+                            // to narrow, and wandering into it (breadcrumbs
+                            // were already drawn) had no way back.
+                            ui.horizontal(|ui| {
+                                if ui.small_button("−").clicked() { self.graph.shallower(); }
+                                ui.label(format!("depth {}", self.graph.depth));
+                                if ui.small_button("+").clicked() { self.graph.deeper(); }
+                                if !self.graph.trail.is_empty() && ui.small_button("← back").clicked() {
+                                    self.graph.back();
+                                }
+                            });
                             voiceterm_egui::graph_view::graph_ui(ui, &mut self.graph, &topo, &c);
                         }
                     }
