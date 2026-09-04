@@ -98,7 +98,14 @@ Cycles are possible in principle and the walk needs a visited set.
 
 Not fixed here; the lock itself was refreshed in `8b483653`.
 
-## 6. `eframe_backend_check` fails on unendlich-dash, and the fix is not obvious
+## 6. `eframe_backend_check` fails on unendlich-dash — RESOLVED, see below
+
+**Resolved in `2a6b6563`.** The checker now recognises the dual-backend
+runtime-fallback pattern (both `Renderer::Wgpu` and `Renderer::Glow` named
+explicitly in source) as a legitimate reason to leave `default-features` on,
+rather than flagging it as accidental over-linking. Full rationale in the
+checker's own docstring; the analysis below is left as the record of how
+that shape was found.
 
 `games/unendlich/crates/unendlich-dash/Cargo.toml` declares
 `eframe = { version = "0.34", features = ["glow"] }` with defaults left on.
@@ -125,8 +132,7 @@ test either branch of this in the sandbox, and an unverifiable edit to a feature
 set is how a working GUI stops starting.
 
 Worth considering instead: the checker gaining a case for "both backends, chosen
-at runtime with a fallback", which is a legitimate pattern it currently has no
-way to express.
+at runtime with a fallback" — done, see `2a6b6563` at the top of this entry.
 
 ## 7. Merges taken this session
 
