@@ -3119,11 +3119,14 @@ against the tree. Remaining hits after this pass are ACCURATE and were verified 
     plumbing exists, the shader does not).
   * lib.rs:9528 — MLA down/up projections in that specific arm, still true.
 
-REMAINING SEAM (UI, not stderr): the operator reads the app, and the engine strip never mentions
-speculative decoding. `enginestrip::concerns()` already receives `tok_s` and DISCARDS it
-(`let _ = tok_s;`), which is the hook — but a "decode is starved" concern needs the prefill/decode
-RATIO, not throughput, and concerns() is not given it. Doing this properly means: pass the
-SelfRelative verdict (or its ratio) into concerns(), add `Concern::DecodeStarved { ratio }` to
-logscope::machinery, and render it with the flag to set. Deliberately not faked from tok_s alone —
-a starvation claim derived from throughput without a baseline is exactly the "percentage of a
-number nobody measured" the roofline module refuses to print.
+REMAINING SEAM (UI, not stderr) — ALREADY RESOLVED, note was stale. Found while auditing this
+file: `enginestrip::concerns()` already takes `decode_ratio: Option<f32>` and pushes
+`Concern::DecodeStarved { ratio }` when it clears `DECODE_STARVED_X`; `backend.rs` computes the
+SelfRelative verdict, publishes the ratio through `LAST_DECODE_RATIO` (an atomic, with a comment
+citing exactly this reasoning — a starvation claim needs the baseline, not throughput), and
+`chat.rs:8295` reads it back into the strip. `logscope::machinery::Concern::DecodeStarved` exists
+and is rendered and tested (`enginestrip.rs`'s own test module asserts it does NOT fire below the
+threshold). This paragraph described the fix before it landed; nobody updated it after. Left as
+history of what the gap was, since deleting it would lose the reasoning for why `decode_ratio` is
+a separate parameter from `tok_s` rather than derived from it — but the "remaining" framing was
+wrong and is corrected here rather than left to mislead the next reader into re-doing this.
