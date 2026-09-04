@@ -9623,11 +9623,28 @@ mod tweak_reach_tests {
         // a menu nothing links to is a page nobody can open; the STORY menu
         // was one keystroke from being exactly that
         let reach = reachable_menus();
-        // 1..=9, not 1..=8. The bound was a literal and adding DEBUG as menu
-        // 9 left it silently unchecked — a reachability test that stops one
-        // short of the newest menu is exactly the menu most likely to be
-        // unreachable, because it is the one just added.
-        for m in 1u8..=9 {
+        // DERIVED, not a hand-maintained literal: this test's own comment
+        // used to warn "1..=9, not 1..=8" -- a literal bound left the newest
+        // menu (DEBUG, 9) unchecked when it was added, which is exactly
+        // backwards, since the newest menu is the one most likely to still
+        // be unreachable. A literal bound can silently go stale the same
+        // way again the next time a menu is added. Scanning menu_title's
+        // own match arms for numeric patterns can't drift from what menus
+        // actually exist, because it reads the same source that defines them.
+        let src = include_str!("main.rs");
+        let body = src
+            .split("fn menu_title(menu: u8) -> &'static str {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("menu_title's body");
+        let mut menus: Vec<u8> = body
+            .lines()
+            .filter_map(|l| l.trim().split_once(" =>"))
+            .filter_map(|(pat, _)| pat.trim().parse::<u8>().ok())
+            .collect();
+        menus.sort_unstable();
+        assert!(menus.len() >= 9, "only found {} numbered menus; the scan broke", menus.len());
+        for m in menus {
             assert!(
                 reach.contains(&m),
                 "settings menu {m} ({}) cannot be reached from the root",
