@@ -8123,6 +8123,13 @@ impl Game {
         self.set_medium_for(d);
         // the console belongs to the ship you just left
         self.close_deck();
+        // `d.note` — "what the archive says about it" per Destination's own
+        // doc comment, "surfaced on arrival" — had no consumer anywhere in
+        // the codebase before this. `line` is the landing-quality readout
+        // (gravity, miss distance, impact speed); this is the one place
+        // both a mechanical result and the place itself are known at once.
+        let line = format!("{line} — {}", d.note);
+        let line = line.as_str();
         // YARD TIME: berthing at a dock squares the hull away — the one
         // release for the wear that LZ-pinned sorties accumulate
         // (`stations::ship_wear`), so the loop closes: fight from open
