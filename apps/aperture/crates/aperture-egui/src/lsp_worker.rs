@@ -19,7 +19,27 @@ use std::time::Duration;
 
 enum Msg {
     Open { uri: String, text: String },
-    Change { uri: String, text: String, version: i64 },
+    /// `edit`, when present, is a candidate for incremental sync — the
+    /// worker sends it via `did_change_range` ONLY if the server actually
+    /// advertised support (checked here, not by the caller, since only the
+    /// worker thread has the `LspClient` that knows). `text` is always the
+    /// full current document regardless, used as the fallback when `edit`
+    /// is `None` (no diff could be computed, or the caller chose not to)
+    /// or when the server doesn't support incremental sync.
+    ///
+    /// The edit's positions are ALREADY UTF-16-converted (line, utf16_col)
+    /// pairs — this worker has no line-text access to do that conversion
+    /// itself (it only ever sees a whole document string, not a buffer
+    /// with per-line structure), so the caller (which has the real
+    /// `Buffer`) must convert before sending, the same way `request_
+    /// completion`'s caller in `state.rs` already does for its own
+    /// position.
+    Change {
+        uri: String,
+        text: String,
+        edit: Option<(u32, u32, u32, u32, String)>,
+        version: i64,
+    },
     Complete { uri: String, line: u32, character: u32, generation: u64 },
     Definition { uri: String, line: u32, character: u32, generation: u64 },
     HoverAt { uri: String, line: u32, character: u32, generation: u64 },
@@ -80,8 +100,12 @@ impl LspWorker {
         let _ = self.tx.send(Msg::Open { uri, text });
     }
 
-    pub fn change(&self, uri: String, text: String, version: i64) {
-        let _ = self.tx.send(Msg::Change { uri, text, version });
+    /// `edit`, when `Some`, is `(start_line, start_utf16_col, end_line,
+    /// end_utf16_col, replacement_text)` — see `Msg::Change`'s own doc for
+    /// why the caller must do the UTF-16 conversion, and why the worker
+    /// (not this call site) decides whether the edit is actually usable.
+    pub fn change(&self, uri: String, text: String, edit: Option<(u32, u32, u32, u32, String)>, version: i64) {
+        let _ = self.tx.send(Msg::Change { uri, text, edit, version });
     }
 
     /// Queue a completion request. Never blocks; a request superseded by a
@@ -155,8 +179,25 @@ fn worker(client: LspClient, rx: Receiver<Msg>, tx: Sender<LspOutcome>, diag_tx:
                     let _ = client.did_open(&uri, "rust", &text, 1);
                     current_uri = Some(uri);
                 }
-                Some(Msg::Change { uri, text, version }) => {
-                    let _ = client.did_change(&uri, &text, version);
+                Some(Msg::Change { uri, text, edit, version }) => {
+                    // Incremental IF both the caller offered a computable
+                    // edit AND the server actually advertised support —
+                    // checked here, once, right before sending, since this
+                    // is the only place that has both pieces of
+                    // information at the same time.
+                    let sent = match &edit {
+                        Some((start_line, start_col, end_line, end_col, replacement))
+                            if client.supports_incremental_sync() =>
+                        {
+                            client.did_change_range(
+                                &uri, *start_line, *start_col, *end_line, *end_col, replacement, version,
+                            )
+                        }
+                        _ => Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no incremental edit")),
+                    };
+                    if sent.is_err() {
+                        let _ = client.did_change(&uri, &text, version);
+                    }
                     current_uri = Some(uri);
                 }
                 Some(Msg::Complete { uri, line, character, generation }) => {

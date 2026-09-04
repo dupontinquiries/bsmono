@@ -68,6 +68,9 @@ pub mod width;
 /// [`voice::VoiceCommand`]. No microphone, no ASR — see the module doc for
 /// why that's `shared/voice-kit`'s and voiceterm's job, not this one's.
 pub mod voice;
+/// The minimal old-vs-new text diff LSP incremental sync needs: the
+/// single smallest contiguous edit between two full-document strings.
+pub mod textdiff;
 #[cfg(feature = "tree-sitter")]
 pub mod ts;
 #[cfg(feature = "tree-sitter")]

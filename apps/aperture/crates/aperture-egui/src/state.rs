@@ -457,6 +457,13 @@ pub struct AppState {
     /// is wired up; every other language simply never sets this.
     lsp: Option<crate::lsp_worker::LspWorker>,
     lsp_uri: Option<String>,
+    /// The document text as of the LAST successful sync (`didOpen` or
+    /// `didChange`) — `notify_lsp_changed` diffs against this to compute
+    /// an incremental-sync candidate, then updates it to the new text
+    /// unconditionally (even when the worker ends up falling back to full
+    /// sync) so the NEXT diff is still against what the server was told,
+    /// not against some earlier state.
+    lsp_last_synced_text: String,
     /// LSP's own per-document version counter — required by `didChange`,
     /// and deliberately NOT `editor.version` (that counts every internal
     /// mutation including ones the server was never told about, e.g. before
@@ -618,6 +625,7 @@ impl AppState {
             status: None,
             lsp: None,
             lsp_uri: None,
+            lsp_last_synced_text: String::new(),
             lsp_doc_version: 1,
             lsp_gen: 0,
             lsp_pending_prefix_start: None,
@@ -1974,7 +1982,29 @@ impl AppState {
     fn notify_lsp_changed(&mut self) {
         let (Some(lsp), Some(uri)) = (&self.lsp, &self.lsp_uri) else { return };
         self.lsp_doc_version += 1;
-        lsp.change(uri.clone(), self.editor.buffer.to_string(), self.lsp_doc_version);
+        let new_text = self.editor.buffer.to_string();
+        // Computed against the LAST text the server was actually told
+        // about, not against some other snapshot — the whole point of
+        // incremental sync is describing what changed since THAT point.
+        let edit = aperture_core::textdiff::diff(&self.lsp_last_synced_text, &new_text).map(|e| {
+            // LSP positions are UTF-16 code units; textdiff's Pos is char-
+            // indexed (see width.rs's own doc on why these differ, and
+            // request_lsp_completion for the same conversion applied to a
+            // single position rather than a range). The line text has to
+            // come from OLD_TEXT's own lines, not the current buffer's —
+            // the edit's start/end are positions WITHIN the old text, and
+            // the current buffer may have since diverged further if
+            // several edits landed before this sync point (unlikely given
+            // this runs from after_edit's own choke point, but the
+            // correctness argument shouldn't depend on that).
+            let old_lines: Vec<&str> = self.lsp_last_synced_text.split('\n').collect();
+            let line_text = |line: usize| old_lines.get(line).copied().unwrap_or("");
+            let start_col = aperture_core::width::char_col_to_utf16(line_text(e.start.line), e.start.col);
+            let end_col = aperture_core::width::char_col_to_utf16(line_text(e.end.line), e.end.col);
+            (e.start.line as u32, start_col, e.end.line as u32, end_col, e.text)
+        });
+        self.lsp_last_synced_text = new_text.clone();
+        lsp.change(uri.clone(), new_text, edit, self.lsp_doc_version);
     }
 
     /// Apply an arrived LSP completion outcome to the popup, if it's still
@@ -2493,6 +2523,7 @@ impl AppState {
         }
         self.lsp_doc_version = 1;
         self.lsp_uri = Some(uri.clone());
+        self.lsp_last_synced_text = text.to_string();
         if let Some(lsp) = &self.lsp {
             lsp.open(uri, text.to_string());
         }
