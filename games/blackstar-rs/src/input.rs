@@ -786,7 +786,11 @@ pub fn run(argv: &[String]) {
     if !un.is_empty() {
         let names: Vec<String> = un.iter().map(|a| format!("{a:?}")).collect();
         println!("\n  {} unbound: {}", un.len(), names.join(", "));
-        println!("    (RollL is deliberately unbound; the rest are worth a look)");
+        println!(
+            "    (RollL and Car1/2/3 are deliberately unbound -- see default_scheme()'s own \
+             comments: RollL is a real open choice worth a second look, Car1/2/3 aren't -- \
+             1-9 drive the hotbar now, they're legacy actions kept rebindable, not a gap)"
+        );
     }
     println!("\n  --keys defaults  to compare against the shipped scheme");
 }
