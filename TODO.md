@@ -512,11 +512,18 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   `lsp_popup_e2e` test: 1/1, through the REAL `AppState -> LspWorker ->
   rust-analyzer -> popup` path, reproducible, no lingering process.
 
-  Known limitation left in place, named rather than silently wrong: LSP
-  `position.character` is a UTF-16 code-unit offset; `caret_pos().col` is
-  a char count. They agree for ASCII (everything tested) and diverge
-  outside the BMP — the same class of fix `aperture_core::width.rs`
-  already is for visual columns, not built here.
+  ~~Known limitation~~ **FIXED, one commit later.** LSP `position.
+  character` is a UTF-16 code-unit offset; `caret_pos().col` was a raw
+  char count, wrong for anything needing a UTF-16 surrogate pair
+  (astral-plane codepoints). Added `char_col_to_utf16`/
+  `utf16_col_to_char` to `aperture_core::width` — same module CJK/
+  double-width visual columns live in, same shape of problem (one char
+  isn't always one unit of whatever a consumer counts), different unit.
+  5 new tests. Caught a self-inflicted bug while writing this one too: an
+  earlier `str_replace` had dropped `#[cfg(test)]` off `width.rs`'s test
+  module, so the whole thing was compiling into the production build —
+  found via an "unused import" warning that made no sense for a module
+  whose tests obviously use it, not dismissed as noise.
 
   ~~diagnostics (`publishDiagnostics` — a server-initiated notification
   the reader thread still drops on the floor)~~ **client-level piece
