@@ -350,9 +350,23 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
 
   Not done: no smooth-camera trailing for secondary carets (they're drawn at
   their raw position, no interpolation — fine, since only the primary's
-  position feeds the follow-camera); no visual verification under Xvfb this
-  pass — `cargo test` is real, but nobody has looked at a screenshot of two
-  carets blinking side by side.
+  position feeds the follow-camera).
+
+  Found by running the actual binary under Xvfb, not by `cargo test`:
+  Ctrl+D twice, type "sum" over two selections — both replaced correctly,
+  but Ctrl+Z only undid the last character. `fan_out_*` went through
+  `Editor::replace_many`, which never coalesces (correct for its other
+  caller, find-and-replace-all, wrong for typing). Added `History::
+  record_group_coalescing` / `Editor::replace_many_coalescing` — the
+  multi-cursor analogue of `insert_text`'s single-char coalescing — and
+  wired the three fan-out functions to the same coalesce condition their
+  single-cursor equivalents already use. Also fixed a second bug the same
+  pass turned up: multi-cursor Tab inserted a literal `\t` where the rest
+  of the editor is space-only and tab-stop-aligned per column; now computes
+  each cursor's own stop. Re-verified interactively after the fix: one
+  Ctrl+Z now restores a three-keystroke typed run at both cursors.
+  `cargo test -p aperture-core --features tree-sitter`: 134/134.
+  `cargo test -p aperture-egui --lib`: 79/79.
 - **CJK/double-width**: caret x assumes monospace `col * char_w`; wide glyphs
   need galley-measured x (egui does no full shaping — known engine limit).
 - **IME preedit** (`egui::Event::Ime`), **LSP** (own crate behind the same
