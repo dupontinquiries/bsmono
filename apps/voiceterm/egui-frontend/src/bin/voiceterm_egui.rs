@@ -1555,7 +1555,16 @@ impl eframe::App for VoicetermApp {
             // with the cursor backed between (see gesture_menus::brace_bytes).
             ui.horizontal(|ui| {
                 let pipe_host = ui.button("|\u{22EF}");
-                if let SlideOutcome::Selected(id, _) = self.pipe_menu.show(ui, &pipe_host, &pipe_menu()) {
+                // MOUSE-ACCESSIBLE NOW: `show_hybrid` instead of `show` — a
+                // held press still opens the fan-out exactly as before
+                // (release commits); a plain click ALSO opens it now
+                // (tap-select: a second click confirms), for the mouse
+                // users the hold gesture serves worse than a touchscreen
+                // does. Safe here specifically because a bare click on this
+                // button was already a complete no-op — `show` only ever
+                // reacted to a HELD press, so there was no existing
+                // "quick tap means X" behavior this could silently replace.
+                if let SlideOutcome::Selected(id, _) = self.pipe_menu.show_hybrid(ui, &pipe_host, &pipe_menu()) {
                     if let Some(ch) = pipe_char(&id) {
                         self.send_input(ch.as_bytes());
                     }
@@ -1608,7 +1617,7 @@ impl eframe::App for VoicetermApp {
                 // hold the palette chip to show all vibes (the settings screenshot's theme grid)
                 let theme_host = ui.button("\u{1F3A8}");
                 if let voiceterm_egui::slide_menu::SlideOutcome::Selected(id, _) =
-                    self.theme_menu.show(ui, &theme_host, &theme_menu())
+                    self.theme_menu.show_hybrid(ui, &theme_host, &theme_menu())
                 {
                     self.theme = snapclone_theme::PaletteId::from_str(&id);
                     self.toasts.info(format!("Theme: {}", self.theme.display_name()), ctx.input(|i| i.time));
@@ -1617,7 +1626,7 @@ impl eframe::App for VoicetermApp {
                     let _ = save_prefs(&self.app.prefs);
                 }
                 let brace_host = ui.button("{\u{22EF}}");
-                if let SlideOutcome::Selected(id, variant) = self.brace_menu.show(ui, &brace_host, &brace_menu()) {
+                if let SlideOutcome::Selected(id, variant) = self.brace_menu.show_hybrid(ui, &brace_host, &brace_menu()) {
                     if let Some(bytes) = brace_bytes(&id, variant) {
                         self.send_input(bytes.as_bytes());
                     }
