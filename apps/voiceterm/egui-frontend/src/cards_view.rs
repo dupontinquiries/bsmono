@@ -191,9 +191,18 @@ fn scan_links(text: &str, cards: &[Card]) -> Vec<Segment> {
 /// preview (`code: true`), every token renders literal — a code card
 /// showing a stray `"[[foo]]"` string as a live link would follow a link
 /// the code never meant to make.
+/// Returns `(clicked target, whether at least one resolvable link was
+/// rendered)`. The second value gates whether `deck_ui` may ALSO enable
+/// its whole-row click-catcher for this card: calling `ui.interact()` on
+/// an overlapping rect anywhere later in the SAME frame — even
+/// predicated on "only if the link wasn't clicked" — was proven live to
+/// retroactively break the link's own `.clicked()` resolution. A card
+/// with a resolvable link loses the "click anywhere in this row" convenience;
+/// the link itself working correctly is the more important behavior.
 fn linked_preview_ui(ui: &mut egui::Ui, text: &str, cards: &[Card],
-                     colors: &uikit_egui::PaletteColors, code: bool) -> Option<String> {
+                     colors: &uikit_egui::PaletteColors, code: bool) -> (Option<String>, bool) {
     let mut clicked = None;
+    let mut has_link = false;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         let label = |ui: &mut egui::Ui, s: &str| if !s.is_empty() {
@@ -204,6 +213,7 @@ fn linked_preview_ui(ui: &mut egui::Ui, text: &str, cards: &[Card],
             match seg {
                 Segment::Plain(s) => label(ui, &s),
                 Segment::Link { display, target } if !code => {
+                    has_link = true;
                     if ui.link(egui::RichText::new(&display).small().color(colors.accent))
                         .clicked()
                     {
@@ -216,7 +226,7 @@ fn linked_preview_ui(ui: &mut egui::Ui, text: &str, cards: &[Card],
             }
         }
     });
-    clicked
+    (clicked, has_link)
 }
 
 /// Draw the deck. Returns a card title if one was opened.
@@ -240,18 +250,21 @@ pub fn deck_ui(ui: &mut egui::Ui, d: &mut Deck,
     egui::ScrollArea::vertical().show(ui, |ui| {
         for c in &cards {
             let sel = d.is_selected(c);
-            // Set from INSIDE the block below when a resolved `[[link]]`
-            // is clicked — checked before `row_click` further down, not
-            // instead of it: both are real `Response`s over the same
-            // pointer event (the link sits INSIDE the row `row_click`
-            // hit-tests as a whole), and egui doesn't stop one consuming a
-            // click from also letting another one see it. Without this
-            // ordering, `row_click`'s own assignment — unconditional,
-            // running straight after — silently overwrote the link's
-            // correct target with "whichever row it was clicked in",
-            // confirmed by a test that clicked a link to another card and
-            // got the card the link was WRITTEN in back instead.
+            // `link_opened`/`has_link` come from INSIDE the block below.
+            // `has_link` gates whether `row_click` further down even
+            // RUNS at all this frame, not just whether its result is
+            // used: calling `ui.interact()` on the row's rect later in
+            // the SAME frame — even conditioned on "only if the link
+            // wasn't clicked" — was proven live to retroactively break
+            // the link's own `.clicked()` resolution (confirmed by
+            // adding a diagnostic print and disabling `row_click`
+            // entirely: the exact same click that never registered
+            // started registering the moment `row_click` stopped being
+            // called on that frame). A row with a resolvable link loses
+            // the "click anywhere in this row" convenience click; the
+            // link itself working correctly matters more.
             let mut link_opened = None;
+            let mut has_link = false;
             let resp = ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(&c.title).strong());
@@ -264,7 +277,7 @@ pub fn deck_ui(ui: &mut egui::Ui, d: &mut Deck,
                 // now, when the name resolves — see `linked_preview_ui`'s
                 // own doc for why this reuses backlinks' matching rule
                 // rather than zbrackets' directory-shaped one.
-                link_opened = linked_preview_ui(ui, body, &cards, colors, c.kind == CardKind::Code);
+                (link_opened, has_link) = linked_preview_ui(ui, body, &cards, colors, c.kind == CardKind::Code);
             }).response;
             if sel {
                 ui.painter().rect_stroke(resp.rect, 2.0,
@@ -278,7 +291,7 @@ pub fn deck_ui(ui: &mut egui::Ui, d: &mut Deck,
                     d.select(target);
                 }
                 opened = Some(title);
-            } else if uikit_egui::dock::row_click(ui, resp.rect, &c.title).clicked() {
+            } else if !has_link && uikit_egui::dock::row_click(ui, resp.rect, &c.title).clicked() {
                 d.select(c);
                 opened = Some(c.title.clone());
             }
@@ -325,18 +338,6 @@ mod frame_tests {
     /// tracked correctly in backlinks since that module was written, but
     /// nothing ever rendered one as something a person could actually
     /// click through to the target card.
-    ///
-    /// Tests `scan_links` directly — the pure resolution `linked_preview_ui`
-    /// renders — rather than simulating a click through the widget: this
-    /// crate's frame-probe position capture (`Drawn.placed`) records the
-    /// SAME position for every text run inside one `horizontal_wrapped`
-    /// ("see ", the link, and " for more" all reported an identical
-    /// [8.0, 60.0] when checked directly, confirmed before concluding this
-    /// wasn't a product bug), so a click position derived from it can't
-    /// distinguish the link from its neighbors — the rendering itself
-    /// (does `ui.link()` fire `.clicked()` when actually clicked) is
-    /// standard, already-relied-on egui behavior; what's actually novel
-    /// and worth testing here is the RESOLUTION, and that's pure.
     #[test]
     fn a_wiki_link_resolves_to_its_target_cards_title() {
         let cards = vec![
@@ -351,6 +352,53 @@ mod frame_tests {
             Segment::Link { display: "End".into(), target: "End".into() },
             Segment::Plain(" for more".into()),
         ]);
+    }
+
+    /// The click, end to end, through `deck_ui` itself — not just the pure
+    /// resolution above. Confirmed live under Xvfb before writing this:
+    /// `ui.link()` correctly reported `hovered() == true` at the exact
+    /// click position but `clicked() == false` on the actual click frame,
+    /// while `row_click`'s OWN `ui.interact()` on the row's WIDER rect,
+    /// called later in the SAME frame (predicated on "only if the link
+    /// wasn't clicked"), was retroactively breaking the link's own click
+    /// resolution — disabling `row_click` entirely made the identical
+    /// click register correctly. Fixed by never calling `row_click` at
+    /// all for a row containing a resolvable link (`deck_ui`'s `has_link`
+    /// gate), not just skipping its result. `click_text`'s own left-to-
+    /// right sweep — previously unusable here because `row_click`'s wide
+    /// rect satisfied it at x=4 before ever reaching the link — now works,
+    /// since nothing wider competes for a linked row's clicks anymore.
+    #[test]
+    fn clicking_a_resolved_link_through_deck_ui_opens_the_target_card() {
+        let p = Probe::default();
+        let c = p.colors();
+        let mut d = Deck::default();
+        d.set_cards(vec![
+            Card { title: "Start".into(), body: "see [[End]] for more".into(),
+                   kind: CardKind::Prose,
+                   source: CardSource { url: String::new(), paragraph_id: String::new() } },
+            Card { title: "End".into(), body: "the destination".into(),
+                   kind: CardKind::Prose,
+                   source: CardSource { url: String::new(), paragraph_id: String::new() } },
+        ]);
+        let opened = p.click_text("End", |ui| deck_ui(ui, &mut d, &c));
+        assert_eq!(opened.as_deref(), Some("End"),
+            "clicking the rendered link text must resolve to the TARGET \
+             card's title, not fall through to opening the card the link \
+             happens to be written IN, and not silently do nothing");
+        assert_eq!(d.selected().map(|c| c.title.as_str()), Some("End"));
+    }
+
+    /// A row WITHOUT a resolvable link keeps the ordinary "click anywhere
+    /// in the row" convenience — `has_link` must gate `row_click`
+    /// precisely, not disable it globally.
+    #[test]
+    fn a_row_without_a_link_still_supports_click_anywhere() {
+        let p = Probe::default();
+        let c = p.colors();
+        let mut d = deck(); // "Intro" (prose, no brackets), "fn main" (code)
+        let opened = p.click_text("Some prose.", |ui| deck_ui(ui, &mut d, &c));
+        assert_eq!(opened.as_deref(), Some("Intro"));
     }
 
     /// Same matching rule backlinks already uses: lowercase, `.md` stripped,
