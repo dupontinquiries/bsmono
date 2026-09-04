@@ -634,6 +634,20 @@ impl Workspace {
             let n = self.model.tabs.len();
             self.model.active_mut().name = format!("shell {n}");
             true
+        } else if c == "next tab" {
+            // `Command::NextTab`/`PrevTab` (palette.rs) have called
+            // `apply(&WsCall::Command("next tab"))`/`"previous tab"`
+            // since they were written — this `command()` match had no
+            // arm for either string, so both silently fell to `else {
+            // false }` and the palette entries did nothing at all.
+            // `next_tab`/`prev_tab` already exist on the model
+            // (pane-kit, wrap-around, already used by other callers) —
+            // this was a one-line gap, not a missing feature.
+            self.model.next_tab();
+            true
+        } else if c == "previous tab" {
+            self.model.prev_tab();
+            true
         } else if let Some(n) = c.strip_prefix("go to tab ").and_then(|n| n.parse::<usize>().ok()) {
             // goto_tab rejects out-of-range rather than clamping, so clamp here to keep the
             // QML behaviour the strip relies on ("go to tab 99" lands on the last tab).
@@ -1254,6 +1268,33 @@ mod tests {
             ws.apply(&WsCall::Command("close tab".into()));
         }
         assert_eq!(ws.tabs.len(), 1); // the last tab survives
+    }
+
+    /// `Command::NextTab`/`PrevTab` in the palette have called
+    /// `apply(&WsCall::Command("next tab"))`/`"previous tab"` since they
+    /// were written — `command()`'s match had no arm for either string
+    /// (only "new tab", "go to tab N", "close tab", "split *", "close
+    /// pane"), so both silently fell to `else { false }` and did nothing
+    /// at all, with nothing anywhere reporting the failure. The
+    /// underlying `next_tab`/`prev_tab` (pane-kit, wrap-around) already
+    /// existed and were already used by other callers — this was a
+    /// missing one-line match arm, not a missing feature.
+    #[test]
+    fn next_and_previous_tab_commands_actually_move_and_wrap() {
+        let mut ws = Workspace::new(&["main", "logs", "build"]);
+        assert_eq!(ws.active, 0);
+        assert!(ws.apply(&WsCall::Command("next tab".into())));
+        assert_eq!(ws.active, 1);
+        assert!(ws.apply(&WsCall::Command("next tab".into())));
+        assert_eq!(ws.active, 2);
+        // wraps forward past the last tab
+        assert!(ws.apply(&WsCall::Command("next tab".into())));
+        assert_eq!(ws.active, 0);
+        // and backward past the first
+        assert!(ws.apply(&WsCall::Command("previous tab".into())));
+        assert_eq!(ws.active, 2);
+        assert!(ws.apply(&WsCall::Command("previous tab".into())));
+        assert_eq!(ws.active, 1);
     }
 
     #[test]
