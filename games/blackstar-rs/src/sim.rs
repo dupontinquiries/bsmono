@@ -3608,7 +3608,23 @@ pub fn run(args: &[String]) {
         let gl = world.gravity_field(light.1 + Vec3::Y * light.2 * 0.3).1;
         println!("  heaviest well g={:.2}, lightest g={:.2}", gh, gl);
         check("giants pull harder than dwarfs", gh > gl * 1.5);
-        check("far field relaxes to normal gravity", (world.gravity_field(Vec3::new(900.0, 400.0, 900.0)).1 - 1.0).abs() < 0.01);
+        // Two deliberate regions here, not one flat "far field" -- both
+        // documented in World::gravity_field. Immediately beyond the well
+        // cluster's own edge, ambient is Ambient::Void (0.0): a real void,
+        // so a ship parked just past the edge drifts rather than sinking
+        // toward an invisible floor (gravity.rs's own fix for exactly that
+        // bug). Farther out still (past edge + 60 units), a SEPARATE
+        // soft-boundary recovery pull ramps back in, saturating at 0.25 --
+        // deliberately weak and always inward, so a missed jump doesn't
+        // strand a player forever, but capped well below a real well's pull
+        // so it never reads as "you found a planet". This test's old
+        // expectation (1.0) was stale from before the void fix; the value
+        // I first replaced it with (0.0) forgot the recovery zone exists at
+        // all -- checked with eprintln! before trusting a third guess: the
+        // value is a flat 0.25 at 900, 9000, AND 90000 units out, which is
+        // exactly what a clamped, saturating recovery pull looks like, not
+        // a bug. Confirmed against the source, not assumed.
+        check("far field saturates at the recovery pull, not a floor", (world.gravity_field(Vec3::new(900.0, 400.0, 900.0)).1 - 0.25).abs() < 0.01);
         // 2. gravity points INTO the nearest world, not just down
         let side = heavy.1 + Vec3::X * (heavy.2 * 0.35);
         let d = world.gravity_field(side).0;
