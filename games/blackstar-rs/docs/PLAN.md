@@ -36,10 +36,10 @@ No new modules. Each item is "make an existing, tested thing reachable".
 
 | what | where it plugs in | why first |
 |---|---|---|
-| `menu` + `ui` | replace one `Mode` screen end to end | the whole menu rewrite depends on this path working |
+| `menu` + `ui` | replace one `Mode` screen end to end | the whole menu rewrite depends on this path working — **partially started (c15unified, at time of this check)**: `Mode::Online` is "the first live `menu::Menu` consumer" per its own comment (uses `menu::Menu`/`ui::menu_cmds` for its rows), but the status line and player list stay a bespoke footer underneath — live data, not menu rows — so it's a first step, not yet "one screen end to end" by this row's own criterion. |
 | `bigbody` | `physics::step_car` consults it for ground | ships, moving platforms and wrecks are all one hook |
 | `clinch` | air-to-air contact check in `sim` | already tested, but a caller can't do much yet — checked (c15unified): neither `main.rs`'s `self.health` (set once to 1.0, never mutated) nor `bots::Bot` (no hp field at all) can take the damage a clinch tick produces. Needs a real player+bot combat-health system FIRST; that's the actual missing piece, not the caller. |
-| `patrol` | a game mode that calls `update` | the loop exists; nothing ticks it |
+| `patrol` | a game mode that calls `update` | **DONE (c15unified, at time of this check)** — `tick_patrol` calls `patrol::Patrol::update` every frame (`main.rs`, called from the main loop). Only the ambient/lore-text half is surfaced; the Surge/Hold/Onslaught combat-event half deliberately isn't (own comment: announcing an event with nothing spawning to fight would read as broken, not missing — needs a bot-spawn hook into `Patrol::credit_kill` first, a separate scoped follow-up). Verify this is still current before re-attempting — "nothing ticks it" is no longer true. |
 | `ship` + `interior` + `airlock` + `drop` | one "leave the planet" flow | they were designed as one chain and should land as one |
 | `terrain` | `World::generate` takes a `Ground` | turns 13 route rows into 13 places |
 
