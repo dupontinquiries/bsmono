@@ -3502,6 +3502,62 @@ impl eframe::App for VoicetermApp {
                             }
                         }
                     }
+                    PaneView::Notebook => {
+                        // Step 1 of TODO_notebook_view.md's own sequencing:
+                        // segmented cells, classified, rendered plainly.
+                        // `notebook::classify` has existed since v0.1.608
+                        // with zero UI in either frontend — the pure core
+                        // was built, dogfooding it never happened. Rich
+                        // Table/Map widgets and touch gestures (collapse,
+                        // pin, swipe) are explicitly NOT this step; the
+                        // doc's own advice is "don't build all three before
+                        // dogfooding step 1".
+                        //
+                        // A separate view rather than swapping the live
+                        // terminal's own render/gesture/input loop in place
+                        // (the TODO's original framing) — read-only here,
+                        // over whatever `self.blocks` already has, so there
+                        // is nothing in the terminal's own proven path this
+                        // can regress.
+                        use voiceterm_egui::notebook::Structured;
+                        if self.blocks.blocks.is_empty() {
+                            ui.colored_label(c.text_weak,
+                                "no command blocks yet — run something in the terminal");
+                        }
+                        egui::ScrollArea::vertical().id_salt("notebook").show(ui, |ui| {
+                            for b in &self.blocks.blocks {
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(format!("$ {}", b.command)).strong());
+                                    match b.exit_code {
+                                        Some(0) => { ui.colored_label(
+                                            egui::Color32::from_rgb(90, 180, 100), "●"); }
+                                        Some(code) => { ui.colored_label(c.warning, format!("● {code}")); }
+                                        None => {}
+                                    }
+                                });
+                                match voiceterm_egui::notebook::classify(&b.output) {
+                                    Structured::Plain => {
+                                        ui.label(egui::RichText::new(&b.output).monospace());
+                                    }
+                                    Structured::Table(t) => {
+                                        ui.colored_label(c.text_weak, format!(
+                                            "\u{25A4} table detected — {} rows \u{d7} {} cols",
+                                            t.rows.len(), t.headers.len()));
+                                        ui.label(egui::RichText::new(&b.output).monospace().weak());
+                                    }
+                                    Structured::Map(pairs) => {
+                                        ui.colored_label(c.text_weak,
+                                            format!("key/value — {} pairs", pairs.len()));
+                                        for (k, v) in &pairs {
+                                            ui.label(egui::RichText::new(
+                                                format!("{k}: {v}")).monospace());
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
                     PaneView::Terminal => {}
                 }
                 return;

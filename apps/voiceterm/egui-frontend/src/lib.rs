@@ -296,6 +296,11 @@ pub mod dumb_summary;
 pub mod table_ops;
 #[path = "../../src/table_nlp.rs"]
 pub mod table_nlp;
+/// Structured-output detection for the (still unwired, in this frontend)
+/// notebook view — see TODO_notebook_view.md. Pure and already tested;
+/// depends on table_ops, already above it, so `#[path]` costs nothing new.
+#[path = "../../src/notebook.rs"]
+pub mod notebook;
 // The GestureHost+SlidePopup replacement (grid gesture menus with QML-parity variants) lives in
 // the shared kit; re-exported under a voiceterm-familiar name.
 pub use uikit_egui::slide_menu;

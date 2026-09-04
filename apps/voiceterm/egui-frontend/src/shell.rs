@@ -1007,14 +1007,23 @@ pub enum PaneView {
     Chat,
     Notes,
     Build,
+    /// Read-only, classified view over the terminal's own command blocks —
+    /// TODO_notebook_view.md's "terminal as Jupyter-style cells" idea,
+    /// scoped down: the pure `notebook::classify` core has existed since
+    /// v0.1.608 with zero UI in either frontend. A SEPARATE view rather
+    /// than swapping the live terminal's own render/gesture/input loop in
+    /// place (the TODO's original framing) — that loop is exactly the kind
+    /// of proven, heavily-relied-on path this fleet's own TODOs keep
+    /// warning not to touch for an experimental feature.
+    Notebook,
 }
 
 impl PaneView {
     /// Every view a pane can be given, for a menu.
-    pub const ALL: [PaneView; 11] = [
+    pub const ALL: [PaneView; 12] = [
         PaneView::Terminal, PaneView::Web, PaneView::Mail, PaneView::Graph,
         PaneView::Table, PaneView::Docs, PaneView::Archive, PaneView::Models,
-        PaneView::Chat, PaneView::Notes, PaneView::Build,
+        PaneView::Chat, PaneView::Notes, PaneView::Build, PaneView::Notebook,
     ];
 
     pub fn label(self) -> &'static str {
@@ -1030,6 +1039,7 @@ impl PaneView {
             PaneView::Chat => "Chat",
             PaneView::Notes => "Notes",
             PaneView::Build => "Build",
+            PaneView::Notebook => "Notebook",
         }
     }
 
