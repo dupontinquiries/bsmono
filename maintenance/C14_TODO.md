@@ -74,14 +74,38 @@ terminal" (§20) than everything in §2 combined, and it is its own session: it
 wants a second cell buffer, saved cursor/pen across the switch, and a decision
 about whether the alternate screen contributes to scrollback (it must not).
 
-## 4. The corpus is bash-only; the reported shell was zsh
+## 4. The corpus is bash-only; the reported shell was zsh — TOOL DONE, BLOCKED ON TMUX
 
-`tools/capture_vt.py` records from a real pty, but zsh is not installed in this
-sandbox, so the eight recorded scenarios are bash/readline. The original report
-was a themed zsh, whose zle emits a different redraw shape (reverse-video
-placeholder, run of spaces to the terminal width, `\r`-and-redraw). Capturing
-those on a machine with zsh is cheap — add scenarios to `SCENARIOS` and run the
-two tools — and is the single highest-value addition to the corpus.
+**Progress in `d7e7934b`, not closure.** `capture_vt.py` now supports zsh
+(it needed different plumbing than bash — no `--rcfile` flag, so the rc lives
+in a `ZDOTDIR`-pointed directory as a file literally named `.zshrc`) and has
+four zsh scenarios ready, including `zsh_eol_mark`: zsh's default `PROMPT_SP`
+marks output with no trailing newline via a reverse-video placeholder, pads
+to terminal width, then `\r`-and-redraws — exactly the "themed
+zsh...different redraw shape" this entry describes, and something bash has
+no equivalent of at all.
+
+Caught a real bug in my own first draft before it shipped: I wrote
+`unsetopt PROMPT_SP` believing it was framing around the mark: it's the
+option that PRODUCES the mark, and with it off the mark never appeared —
+found by diffing captured bytes with the option on vs off, not by trusting
+the docs.
+
+**Blocked**: `tmux new-session` reports "server exited unexpectedly" in this
+sandbox before even binding a socket — not a permissions issue (the socket
+dir gets created with correct perms), reproduced across several environments
+and with verbose logging that never even opens its own log file. `pyte`
+alone is not trusted for `.expect` generation (see `render_ref.py`'s own
+docstring — `save_restore` is the worked example of pyte silently encoding a
+bug as correct), so no `.bin`/`.expect` pair was committed. The captured
+bytes were verified by hand against the described defect shape and are very
+likely trustworthy — the pty mechanics are identical to the unchanged bash
+path, confirmed byte-identical to its own checked-in fixture after the
+refactor — but that is not the same as tmux confirming them.
+
+**What unblocks this**: `tools/capture_vt.py zsh_eol_mark zsh_prompt_echo
+zsh_edit_in_place zsh_wrap_long_line` then `tools/render_ref.py`, on a
+machine where tmux actually starts.
 
 ## 5. `lock_check.py` cannot see a lock made stale by a transitive path dep
 
