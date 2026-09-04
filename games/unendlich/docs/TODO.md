@@ -304,3 +304,68 @@ thread sees its prior deliverable's true landing state. Tracked above per-thread
   (landmarks_placed=false) so new worlds get them too. Removed the Launch-arm duplicates.
 - All compile-on-end (bin needs glfw); used only verified APIs (set_block, region_flora_blocks,
   title_structure, SpatialMusic). Lib gates green; lock verified intact post-build.
+
+## 23. Re-running the default `--lib` gate found 3 real failures (not run since r112)
+
+Ran `cargo test --lib` cold, 8679 tests, to check the "lib gates green" claim above was still
+true. It wasn't quite: 8676 passed, 3 failed. Two are a diagnosed, real logic bug; one is likely
+the same bug's fallout, not a separate one — investigated by reading the implementation, not
+assumed from the assertion text.
+
+### `assets::candidate_roots` — the ordering guarantee it exists to provide doesn't hold
+
+`the_executables_directory_is_searched_and_the_manifest_is_last` failed: `c.last()` was
+`/build`, not `/` as asserted. Every input to this test is a literal path (`/tmp`, `/opt/game/bin`,
+`/build/games/unendlich`) — nothing environment-dependent, so this isn't a sandbox artifact.
+
+Root cause, traced by hand: `candidate_roots` walks ancestors of BOTH the cwd/exe_dir (up to 6
+levels) AND the manifest_dir (up to 3 levels), then dedups keeping the FIRST occurrence of each
+path. `/`, the filesystem root, is reachable from almost any shallow cwd/exe_dir (here, `/tmp`'s
+only ancestor) — so it lands EARLY in the raw list, well before the manifest_dir walk reaches it
+too. The dedup then silently drops the manifest_dir's own `/`, because it's already been seen.
+The function's own doc comment promises "the manifest ancestors should trail the list" — that
+promise is the first casualty whenever `/` (or any other shared ancestor) is reachable from more
+than one of the walked bases, which is common, not a corner case.
+
+Confirmed by hand-tracing the exact sequence `candidate_roots` builds for the failing test's
+inputs and matching it byte-for-byte against the actual failure output — not just re-reading the
+assertion and guessing.
+
+**Not fixed here.** Two other tests in the same file (`the_override_wins_over_everything`, and
+presumably others pinning the exe-dir-outranks-manifest ordering) pin specific relative orderings
+that a naive fix — e.g. "last occurrence wins" instead of first — could invert instead of correct.
+This needs someone deciding the actual intended semantics (is de-duplication even the right
+mechanism, or should the manifest-dir ancestors simply be walked and appended AFTER a pass that
+filters out anything already present, preserving their relative order without reordering earlier
+entries?) and re-checking it against every existing ordering test, not a one-line patch.
+
+`assets::root()` — the one real caller of `candidate_roots`, via `shader_artifacts.rs` — is not
+proven broken by this: the bug only bites when `/` (or another shared ancestor) would otherwise be
+a plausible asset-root candidate, and `is_asset_root` checking real project markers under `/`
+almost never succeeds by accident. So this is a real, provable violation of a documented ordering
+guarantee, with no evidence yet that it has caused an actual wrong asset resolution in the field.
+
+### `sim::voxel_model::voxelize_boxes` — the `+1` in `dims` is never actually filled
+
+Two failures, same root cause: `single_box_is_fully_and_only_occupied` (expected `occupied_count()
+== dims³`, got 512 of 729) and `later_box_paints_over_an_earlier_one_at_the_same_cell` (expected
+both colours in the palette, got only the winning one).
+
+`dims` is computed as `ceil(size/cell) + 1` per axis — the comment says this matches "the JS
+tool's ceil(...)+1 overshoot-by-one" — but the fill loop's sample points are `min + (i+0.5)*cell`
+for `i` up to `dims-1`, and `cell` is derived from `resolution` (not from `dims`). For a box that
+exactly fills the bounding box at `resolution=8`, the last sample row's centre point (`i=8`,
+`wx = min + 8.5*cell`) falls OUTSIDE the box's actual extent by construction — so the extra `+1`
+shell that `dims` promises can structurally never be painted by geometry that exactly fits the
+original bbox. `occupied_count()` correctly reports what's actually filled (512 = 8³); the test's
+expectation that the full `dims³` (729 = 9³) would be filled was never achievable given how `cell`
+and the sample points are computed.
+
+**Zero live callers.** Grepped the whole crate: `voxelize_boxes` is called nowhere outside its own
+test module. This is not a currently-wired bug reaching gameplay — the tests are the only thing
+that has ever exercised this function. Left undiagnosed-as-to-intent rather than fixed: whether the
+`+1` overshoot is supposed to represent a genuine extra shell (in which case the sampling math is
+wrong and needs the shell's cell size adjusted to actually reach it) or whether the dims formula
+itself is wrong and should just be `ceil(size/cell)` with no `+1` (in which case the TESTS are
+wrong, not the code) depends on matching an external "JS tool" convention this repo doesn't carry
+a copy of — checked `docs/*.md` for it and found only two unrelated mentions, not the tool itself.
