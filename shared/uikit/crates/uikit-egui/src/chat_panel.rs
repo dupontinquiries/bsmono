@@ -66,6 +66,15 @@ pub struct ChatPanel {
     pub provider: String,
     /// Press-drag picker (shared gesture widget) for choosing the provider.
     provider_menu: SlideMenu,
+    /// Caller-supplied, one-line explanation of what will actually happen
+    /// on send — "no local model attached", "using ollama fallback", etc.
+    /// `None` when there's nothing worth saying (a real backend is
+    /// configured and working). Shown in the header, before the empty
+    /// state or any message, so the limitation is visible on open rather
+    /// than discovered only after sending and getting back a canned
+    /// notice. This panel has no way to know its own backend's state —
+    /// the caller sets this, same separation as `provider`/`busy`.
+    pub backend_status: Option<String>,
 }
 
 impl Default for ChatPanel {
@@ -76,6 +85,7 @@ impl Default for ChatPanel {
             busy: false,
             provider: "llama".into(),
             provider_menu: SlideMenu::new("chat_provider").columns(3).item_size(64.0),
+            backend_status: None,
         }
     }
 }
@@ -127,6 +137,17 @@ impl ChatPanel {
                 }
             });
         });
+        // BACKEND STATUS, under the header, before anything else — visible
+        // on open rather than discovered only after sending a message and
+        // getting back a canned reply (which is what happened here before:
+        // the notice lived only in the assistant's first turn). Inspired
+        // by logscope-egui's inline "backend: stub → fallback because X"
+        // line under its own header, same idea: say what will actually
+        // happen up front, in the app's own voice, not just in a code
+        // comment nobody using the app ever sees.
+        if let Some(status) = &self.backend_status {
+            ui.colored_label(ui.visuals().warn_fg_color, RichText::new(status).small());
+        }
         ui.separator();
 
         // empty state — the QML shows this INSTEAD of an empty list, so a
