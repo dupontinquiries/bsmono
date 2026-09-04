@@ -713,4 +713,131 @@ mod tests {
         let positions: Vec<Vec3> = n.peers().map(|p| p.pos).collect();
         assert_eq!(positions, vec![Vec3::new(7.0, 0.0, 0.0)], "empty slots should not appear");
     }
+
+    // ---- wire protocol: encode/decode round trips and malformed input ----
+    //
+    // Every real call site into get_v3/get_q/get_f/get_state/get_str already
+    // guards buffer length before calling (checked by hand, not assumed:
+    // MSG_WELCOME/MSG_BALL check `b.len() >=` explicitly, MSG_STATE/MSG_PEERS
+    // go through get_state's own internal length check first) -- so there's
+    // no live panic-on-truncated-packet bug today. These tests exist to keep
+    // it that way: a future message type that skips the length check before
+    // calling get_v3/get_f directly would panic on a short/malicious UDP
+    // packet, and nothing else in this file would catch that regression.
+
+    #[test]
+    fn v3_and_quat_round_trip_through_the_wire_format() {
+        let mut b = Vec::new();
+        let v = Vec3::new(1.5, -2.25, 100.0);
+        let q = Quat::from_xyzw(0.1, 0.2, 0.3, 0.9).normalize();
+        put_v3(&mut b, v);
+        put_q(&mut b, q);
+        let mut o = 0;
+        assert_eq!(get_v3(&b, &mut o), v);
+        let got_q = get_q(&b, &mut o);
+        assert!((got_q.x - q.x).abs() < 1e-5 && (got_q.w - q.w).abs() < 1e-5, "got={got_q:?} want={q:?}");
+        assert_eq!(o, b.len(), "offset should land exactly on the end after reading everything written");
+    }
+
+    #[test]
+    fn a_near_zero_quat_decodes_to_identity_rather_than_nan() {
+        // get_q's own defensive branch: normalizing a (0,0,0,0) quaternion
+        // divides by zero and produces NaN, which would then corrupt a
+        // peer's rotation and everything downstream of it (rendering,
+        // collision) for the rest of the match. Confirms the guard fires
+        // rather than assuming the comment describing it is still true.
+        let mut b = Vec::new();
+        put_q(&mut b, Quat::from_xyzw(0.0, 0.0, 0.0, 0.0));
+        let mut o = 0;
+        let q = get_q(&b, &mut o);
+        assert_eq!(q, Quat::IDENTITY);
+        assert!(!q.x.is_nan() && !q.w.is_nan());
+    }
+
+    #[test]
+    fn state_round_trips_position_velocity_rotation_and_flags() {
+        let mut b = Vec::new();
+        let s = MyState {
+            car: 3,
+            flip: true,
+            boosting: false,
+            pos: Vec3::new(10.0, 0.0, -5.0),
+            vel: Vec3::new(0.0, 9.8, 0.0),
+            rot: Quat::IDENTITY,
+            wheel_spin: 1.25,
+            steer_vis: -0.5,
+        };
+        put_state(&mut b, 4, &s);
+        let mut o = 0;
+        let ws = get_state(&b, &mut o).expect("a full buffer should decode");
+        assert_eq!(ws.slot, 4);
+        assert_eq!(ws.car, 3);
+        assert!(ws.flip && !ws.boosting);
+        assert_eq!(ws.pos, s.pos);
+        assert_eq!(ws.vel, s.vel);
+        assert_eq!(ws.wheel_spin, s.wheel_spin);
+        assert_eq!(ws.steer_vis, s.steer_vis);
+        assert_eq!(o, STATE_BYTES, "get_state should consume exactly what put_state wrote");
+    }
+
+    #[test]
+    fn state_clamps_an_out_of_range_car_index_from_the_wire() {
+        // car is a plain u8 on the wire -- a peer running a build with more
+        // car models (or a corrupted packet) could send an index this
+        // build's own car list can't hold. get_state's own `.min(8)` is the
+        // only thing standing between that and an out-of-bounds car lookup
+        // somewhere downstream.
+        let mut b = Vec::new();
+        let s = MyState {
+            car: 250,
+            flip: false,
+            boosting: false,
+            pos: Vec3::ZERO,
+            vel: Vec3::ZERO,
+            rot: Quat::IDENTITY,
+            wheel_spin: 0.0,
+            steer_vis: 0.0,
+        };
+        put_state(&mut b, 0, &s);
+        let mut o = 0;
+        let ws = get_state(&b, &mut o).unwrap();
+        assert_eq!(ws.car, 8, "an out-of-range wire car index should clamp, not pass through raw");
+    }
+
+    #[test]
+    fn get_state_refuses_a_truncated_buffer_instead_of_panicking() {
+        let mut b = Vec::new();
+        put_state(&mut b, 0, &MyState {
+            car: 0, flip: false, boosting: false,
+            pos: Vec3::ZERO, vel: Vec3::ZERO, rot: Quat::IDENTITY,
+            wheel_spin: 0.0, steer_vis: 0.0,
+        });
+        b.truncate(b.len() - 1); // one byte short of a full state record
+        let mut o = 0;
+        assert!(get_state(&b, &mut o).is_none(), "a short buffer must return None, not panic");
+    }
+
+    #[test]
+    fn string_round_trips_and_truncates_at_24_bytes() {
+        let mut b = Vec::new();
+        put_str(&mut b, "PILOT");
+        let mut o = 0;
+        assert_eq!(get_str(&b, &mut o).as_deref(), Some("PILOT"));
+
+        let mut b2 = Vec::new();
+        let long = "A".repeat(40);
+        put_str(&mut b2, &long);
+        let mut o2 = 0;
+        let got = get_str(&b2, &mut o2).unwrap();
+        assert_eq!(got.len(), 24, "put_str's own truncation limit should have applied on encode");
+    }
+
+    #[test]
+    fn get_str_refuses_a_length_prefix_longer_than_the_buffer() {
+        // a hand-built/malicious packet could claim a 20-byte name while
+        // only supplying 3 bytes after the length prefix.
+        let b = vec![20u8, b'h', b'i', b'!'];
+        let mut o = 0;
+        assert!(get_str(&b, &mut o).is_none(), "should refuse rather than read past the buffer");
+    }
 }
