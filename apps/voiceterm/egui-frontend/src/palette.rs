@@ -79,6 +79,15 @@ pub enum Command {
     SiteFilter(FilterLevel),
     /// Forget this site's rules and follow the globals again.
     SiteReset,
+    /// Switch between touch chrome and voice chrome (`chrome_mode.rs`).
+    ///
+    /// `Chrome::toggle` is documented as "the ONLY way the mode changes on
+    /// purpose", but until this command existed its only caller was the
+    /// escape chord's fallback branch — so the deliberate switch the doc
+    /// describes had no deliberate way to reach it. Ctrl+Shift+M now only
+    /// escapes/resumes; this is how you choose voice chrome in the first
+    /// place, from the palette or by voice like every other mode here.
+    ToggleChrome,
 }
 
 /// The three filter levels, as a palette-addressable value.
@@ -173,6 +182,8 @@ pub fn vocabulary() -> Vec<Entry> {
                    keywords: &["rail", "hide", "collapse"] });
     v.push(Entry { command: Command::ToggleSettings, title: "Settings".into(),
                    keywords: &["preferences", "config", "options"] });
+    v.push(Entry { command: Command::ToggleChrome, title: "Toggle voice mode".into(),
+                   keywords: &["chrome", "compact", "hide controls", "minimal"] });
     v.push(Entry { command: Command::ShowPalette, title: "Open command palette".into(),
                    keywords: &["commands"] });
     v
@@ -268,6 +279,9 @@ pub fn parse_phrase(phrase: &str) -> Option<Command> {
     if p.contains("settings") || p.contains("preferences") {
         return Some(Command::ToggleSettings);
     }
+    if p.contains("voice mode") || p.contains("voice chrome") || p.contains("touch mode") {
+        return Some(Command::ToggleChrome);
+    }
     // A view name anywhere in the sentence. Longest label first, so "mail"
     // inside a longer name cannot win over the name itself.
     let mut named: Vec<PaneView> = PaneView::ALL.to_vec();
@@ -349,6 +363,17 @@ mod tests {
         assert_eq!(parse_phrase("new tab"), Some(Command::NewTab));
         assert_eq!(parse_phrase("mail in a new tab"),
                    Some(Command::OpenView { view: PaneView::Mail, target: Target::NewTab }));
+    }
+
+    /// `ToggleChrome` exists precisely because voice mode had no deliberate
+    /// entry point — see the comment on the command. Pin both doors open,
+    /// the same way settings' second door is pinned above.
+    #[test]
+    fn voice_chrome_is_reachable_by_phrase_and_by_palette() {
+        assert_eq!(parse_phrase("switch to voice mode"), Some(Command::ToggleChrome));
+        assert_eq!(parse_phrase("go to touch mode"), Some(Command::ToggleChrome));
+        assert!(vocabulary().iter().any(|e| e.command == Command::ToggleChrome),
+                "voice chrome must appear in the palette list, not only as a phrase");
     }
 
     /// A swipe must reach tabs by the same route as the palette and the voice

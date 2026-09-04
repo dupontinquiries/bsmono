@@ -724,6 +724,10 @@ impl VoicetermApp {
             Command::ToggleRail => { self.tabbar_open = !self.tabbar_open; }
             Command::ToggleSettings => { self.surfaces.toggle(Surface::Settings); }
             Command::ToggleWebSettings => { self.surfaces.toggle(Surface::WebSettings); }
+            // The deliberate switch `Chrome::toggle` was documented as
+            // needing — see the comment on the command itself. The chord
+            // (Ctrl+Shift+M) is now escape/resume only, not entry.
+            Command::ToggleChrome => { self.chrome.toggle(); }
             // A site rule from the palette, without opening a panel: this
             // is what people actually want when a page has eaten its own
             // sidebar or is unreadable through the ads.
@@ -1379,9 +1383,17 @@ impl eframe::App for VoicetermApp {
 
         // The escape chord, checked before anything draws: if the recogniser
         // has stopped working, voice mode must not be a room with no door.
+        //
+        // Escape-or-resume ONLY, not entry. It used to fall through to
+        // `toggle()` when there was nothing to escape from, which made this
+        // chord the sole way to ever reach voice mode in the first place —
+        // a panic hatch standing in for a feature nobody could discover.
+        // `Command::ToggleChrome` is the deliberate switch now; a chord that
+        // also chose to enter the mode it exists to escape was the wrong
+        // control wearing two hats.
         if ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift
                          && i.key_pressed(egui::Key::M)) {
-            if !self.chrome.escape() { self.chrome.toggle(); }
+            if !self.chrome.escape() { self.chrome.resume(); }
         }
         self.apply_compact_defaults(ctx);
         let show_chrome = self.chrome.mode().shows_tab_strip();
