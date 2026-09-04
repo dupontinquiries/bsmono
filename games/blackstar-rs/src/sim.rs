@@ -5700,10 +5700,24 @@ pub fn run(args: &[String]) {
             let src = include_str!("render.rs");
             let double_sided = src.contains("cull_mode: None,\n                front_face");
             let ldr = include_str!("model.rs");
-            let scrubs = ldr.contains("cross(c - a).length_squared() < 1e-20");
-            let p99 = ldr.contains("half_p99_raw");
+            // STALE (c15unified, at time of this check): these two used to
+            // check for the exact fix strings from when degenerate-triangle
+            // dropping and p99-percentile hitbox sizing first landed. Both
+            // read false today, but not from a regression -- model.rs's own
+            // comment right above where these now live ("MEASURE THE MASS,
+            // not every stray vertex") explains that both were SUPERSEDED by
+            // massfilter::classify/massfilter::bounds, a purpose-built
+            // module that classifies which primitives are a model's real
+            // mass vs. stray debris, replacing the plain percentile cutoff
+            // with something more deliberate. Confirmed the replacement
+            // actually does the same job before updating this check, not
+            // assumed from the comment alone: `bounds_from_extent` (the old
+            // path) is now only the fallback when massfilter::bounds returns
+            // None, i.e. still reachable, just no longer the primary path.
+            let scrubs = ldr.contains("massfilter::classify");
+            let p99 = ldr.contains("massfilter::bounds");
             println!(
-                "   car pipeline draws both sides: {}, loader drops degenerates: {}, hitbox uses p99: {}",
+                "   car pipeline draws both sides: {}, loader classifies debris (massfilter::classify): {}, hitbox uses mass bounds (massfilter::bounds): {}",
                 double_sided, scrubs, p99
             );
             ok_all &= double_sided && scrubs && p99;
