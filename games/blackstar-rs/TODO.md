@@ -811,6 +811,46 @@ racer control proposals above, not something to improvise blind.
 
 ---
 
+## `--sim planets`: FAIL, and I'm not confident fixing it is even the right move
+
+Ran a full sweep of every `--sim X` harness in `sim.rs` (c15unified) — ~40
+manual, println!-driven PASS/FAIL checks nobody runs as part of `cargo
+test`. Four came back FAIL: `carsdf`, `glb`, `kuiper`, `planets`. The first
+three were genuine verification-tool staleness (a stale numeric
+expectation after a deliberate gravity fix, a wrong atlas stride in a
+hand-rolled decode, a fix-presence check written against code that was
+later superseded by something better) — fixed all three, confirmed against
+production code before touching anything, full detail in their own commits.
+
+`planets` is different, and I stopped rather than force a fourth
+"corrected" number. The check wants a bouncy Kuiper-field planet to, within
+40 simulated seconds: bounce at least 3 times, squash at least 5%, **return
+to perfectly round** (`squash == 0.0`, which is reachable — `physics.rs`
+resets it to exact zero once 1.4s pass with no new impact — not a float-
+precision bug), and still be moving faster than 1 m/s at the end. Actual
+run: 65 bounces in 40s, 38% peak squash, still moving, but never a full
+1.4s gap between bounces, so `squash` never resets and "returns to round"
+reads false.
+
+What I can't resolve confidently: `physics.rs`'s own comment on this same
+mechanic says "planets keep (almost) everything: **the DVD logo never
+stops**." That reads like perpetual, non-settling bouncing is the
+*intended* behavior for a bouncy planet — in which case a test that
+requires eventual settling within a fixed 40s window may be checking for
+something the feature was deliberately built to never fully do, and 65
+bounces without a quiet gap could be entirely correct physics for this
+seed's particular well arrangement, not a bug. Equally plausible: something
+about the current gravity/collision tuning makes bounces land closer
+together than intended, and a healthy planet should have longer gaps. I
+don't have enough design context to tell those apart, and this feels
+exactly like the trap the process note below already names — so it's
+recorded here, unfixed, rather than guessed at a fourth time in the same
+session.
+
+Repro: `cargo run --bin skydribble --no-default-features -- --sim planets`.
+
+---
+
 ## Process notes for whoever continues this
 
 - This session hit the same failure shape three times: guess a numeric
@@ -826,3 +866,10 @@ racer control proposals above, not something to improvise blind.
   session (no GPU here). Everything above is verified by compiling,
   passing tests, and reproducible CLI tool output — real signal, but not
   a substitute for someone actually looking at and playing the game.
+- Same lesson, different session (c15unified): hit this exact shape again
+  fixing `--sim kuiper` — assumed the far field should read 1.0, wrong;
+  assumed 0.0 next, also wrong; the actual answer (0.25, a documented
+  saturating recovery pull) only showed up after adding `eprintln!`s and
+  reading the real number instead of guessing a third time. Left
+  `--sim planets` unfixed for the same reason rather than repeat it once
+  more — see the section directly above.
