@@ -633,11 +633,26 @@ egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
   function's actual return type. `cargo test -p aperture-lsp`: 36/36 (30
   unit + 6 real-server), ~4s.
 
+  ~~wiring hover into the shell at all (no hover-on-hover UI, no palette
+  command — client capability only)~~ **DONE, Ctrl+I.** Fourth
+  `lsp_worker.rs` outcome channel, same coalesce-to-newest shape as the
+  other three. Shown as a one-line status-bar message, not a full hover
+  overlay (future work). `hover_headline` picks which line of the
+  flattened hover text to show — NOT just the first line: found
+  interactively that rust-analyzer's hover for a same-crate function
+  commonly puts a bare crate-name annotation line first, and a naive
+  first-line version showed the package name instead of the type
+  signature. Prefers the first line that looks like Rust code (a keyword
+  or `->`), falls back to the first non-blank line otherwise. 4 new unit
+  tests including the exact bug scenario. Real proof: `lsp_hover_e2e.rs`
+  drives Ctrl+I through the real path and checks the status bar for the
+  actual return type; retries on "nothing found" the same way completion
+  and go-to-definition's tests already do. `cargo test -p aperture-egui
+  --lib`: 106/106 (was 102).
+
   Still not done: incremental sync (`did_change` always sends the whole
-  document), and wiring hover into the shell at all (no hover-on-hover
-  UI, no palette command — client capability only, same
-  client-first-then-shell-wiring split every other LSP feature went
-  through).
+  document), and a real hover overlay (currently a one-line status
+  message, not a panel showing the full flattened text).
   `workspace_symbols`'s local tree-sitter outline and `route`'s
   keyword-scored candidates stay the fast, dependency-free default tiers;
   LSP is an ADDITIONAL tier alongside them, never a replacement.
